@@ -261,6 +261,9 @@ int main() {
         const int64_t                            ne3s[]       = { 1, 2 };
         const ggml_type                          src0_types[] = { GGML_TYPE_F16, GGML_TYPE_F32 };
         const char *                             names[]      = { "kq-0", "kqv-0" };
+        // the other two arms of the kqv test: src0 named cache_v, src1 named kq_soft_max
+        const char *                             src0_names[] = { "", "cache_v" };
+        const char *                             src1_names[] = { "", "kq_soft_max" };
         std::vector<ggml_sycl_mul_mat_f16_route> seen;
         for (ggml_type t0 : src0_types) {
             for (int l0 = 0; l0 < 4; l0++) {
@@ -273,21 +276,29 @@ int main() {
                                 ggml_tensor * src0    = layout_tensor(ctx, t0, ne_a, l0);
                                 ggml_tensor * src1    = layout_tensor(ctx, GGML_TYPE_F32, ne_b, l1);
                                 for (const char * name : names) {
-                                    ggml_tensor * dst = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 6, ne1, ne2, ne3);
-                                    ggml_set_name(dst, name);
-                                    for (int bits = 0; bits < 8; bits++) {
-                                        const bool split = bits & 1, weight = bits & 2, force = bits & 4;
-                                        const auto want = legacy_chain(src0, src1, dst, split, weight, force);
-                                        const auto got  = ggml_sycl_mul_mat_f16_route_of(
-                                            src0, src1, dst, env(split, weight, force, true));
-                                        CHECK(got == want, "the classifier differs from the removed chain");
-                                        CHECK(ggml_sycl_mul_mat_routes_batched_f16(src0, src1, dst,
-                                                                                   env(split, weight, force, true)) ==
-                                                  (want == GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED ||
-                                                   want == GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED),
-                                              "routes_batched differs from the removed chain's batched branches");
-                                        seen.push_back(want);
-                                        cases++;
+                                    for (const char * n0 : src0_names) {
+                                        for (const char * n1 : src1_names) {
+                                            ggml_set_name(src0, n0);
+                                            ggml_set_name(src1, n1);
+                                            ggml_tensor * dst =
+                                                ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 6, ne1, ne2, ne3);
+                                            ggml_set_name(dst, name);
+                                            for (int bits = 0; bits < 8; bits++) {
+                                                const bool split = bits & 1, weight = bits & 2, force = bits & 4;
+                                                const auto want = legacy_chain(src0, src1, dst, split, weight, force);
+                                                const auto got  = ggml_sycl_mul_mat_f16_route_of(
+                                                    src0, src1, dst, env(split, weight, force, true));
+                                                CHECK(got == want, "the classifier differs from the removed chain");
+                                                CHECK(
+                                                    ggml_sycl_mul_mat_routes_batched_f16(
+                                                        src0, src1, dst, env(split, weight, force, true)) ==
+                                                        (want == GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED ||
+                                                         want == GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED),
+                                                    "routes_batched differs from the removed chain's batched branches");
+                                                seen.push_back(want);
+                                                cases++;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -304,7 +315,7 @@ int main() {
             }
             CHECK(found, "the differential grid never reaches one of the routes");
         }
-        CHECK(cases == 2u * 4 * 4 * 2 * 2 * 2 * 2 * 8, "the grid covers every combination");
+        CHECK(cases == 2u * 4 * 4 * 2 * 2 * 2 * 2 * 2 * 2 * 8, "the grid covers every combination");
     }
 
     // ---- the environment: an operand with no buffer ----
@@ -329,6 +340,7 @@ int main() {
                   ggml_sycl_mul_mat_f16_route_of(w, x, out, e0) == GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED,
               "a bufferless f16 weight of the batched shape is read as an activation");
         // With a buffer, the predicates are asked for each operand.
+        // a placeholder that is never dereferenced: the fake predicates below ignore the buffer
         ggml_backend_buffer_t placed = reinterpret_cast<ggml_backend_buffer_t>(&g_weight_calls);
         w->buffer                    = placed;
         g_weight_calls               = 0;
@@ -346,6 +358,7 @@ int main() {
         g_split_calls   = 0;
         CHECK(!ggml_sycl_mul_mat_src0_is_split(t, split_always_buffer) && g_split_calls == 0,
               "a tensor with no buffer is not split, and the predicate is not asked, whatever it would answer");
+        // a placeholder that is never dereferenced: the fake predicates ignore the buffer
         t->buffer = reinterpret_cast<ggml_backend_buffer_t>(&g_split_calls);
         CHECK(ggml_sycl_mul_mat_src0_is_split(t, split_always_buffer) && g_split_calls == 1,
               "a placed tensor is split when the predicate says so");

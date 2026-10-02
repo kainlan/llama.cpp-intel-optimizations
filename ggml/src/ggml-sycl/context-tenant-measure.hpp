@@ -100,8 +100,10 @@ struct context_measure_view {
     // A tensor with no buffer is in no row-split buffer and is no weight (ggml_sycl_mul_mat_route_env_from). At a
     // load-time MEASURE a weight may not have its buffer yet, and the route would then read it as an activation:
     // an f16 weight that fits the batched shape would be demanded as staging that the runtime never stages. The
-    // walker that sets this callback owns that case. It sets it only where operand buffers are final, or it answers
-    // with `has_weight` set for an operand it knows is a weight; it never leaves the question to the null buffer.
+    // walker that sets this callback owns that case: it sets it only where operand buffers are final. The adapter
+    // context_measure_mul_mat_route_env derives the whole environment from the tensors it is given, so it cannot be
+    // told that a bufferless operand is a weight; a walker that must measure before weights are placed needs its own
+    // callback, and never leaves the question to the null buffer.
     bool (*mul_mat_route_env)(void * sched_ctx, const ggml_tensor * node, ggml_sycl_mul_mat_route_env * env) = nullptr;
 };
 

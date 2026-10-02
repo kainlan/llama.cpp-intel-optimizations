@@ -2893,7 +2893,10 @@ void llama_context::tenant_host_hold_measure_and_fold(const std::vector<ggml_syc
     llama_tenant_host_hold hold;
     llama_tenant_host_hold_fold(hold, current);
 
-    // the set is ascending and holds the rung the context runs at now; that rung is `current`
+    // the set is ascending and holds the rung the context runs at now; that rung is `current`.
+    // A rung that is skipped here and measures fine when the ladder later tries it can carry a host slot above
+    // R_h; the publish applies R_h as a maximum (llama_tenant_section_apply_host_hold), so the section it
+    // publishes still holds the larger slot and stays correct.
     for (const uint32_t rung : tenant_rung_set) {
         if (rung == cparams.n_ubatch) {
             continue;
@@ -2923,7 +2926,8 @@ void llama_context::tenant_host_hold_measure_and_fold(const std::vector<ggml_syc
         }
     }
 
-    // ready only once every rung of the set has been tried: a partial hold is never recorded as the hold
+    // Not recorded, and not ready, before the loop completes. What is recorded after it is the hold of the rungs
+    // that could be measured: a hold missing the skipped rungs.
     tenant_host_hold       = hold;
     tenant_host_hold_ready = true;
 
