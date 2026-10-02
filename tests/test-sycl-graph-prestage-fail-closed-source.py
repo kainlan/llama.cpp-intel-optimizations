@@ -428,11 +428,15 @@ def evaluate(backend, common, memo_hdr):
         re.search(r"wait_and_throw\(\);\s*\}\s*\}\s*catch\s*\(\.\.\.\)\s*\{\s*return false;\s*\}", retire_exact_fn) is not None and \
         re.search(r"if\s*\(rc != ggml_sycl::moe::retention_error::OK && rc != ggml_sycl::moe::retention_error::STALE\)\s*\{\s*return false;\s*\}", retire_exact_fn) is not None and \
         re.fullmatch(r"\{\s*try\s*\{\s*return moe_graph_retention_retire_exact\(ctx\);\s*\}\s*catch\s*\(\.\.\.\)\s*\{\s*return false;\s*\}\s*\}", epoch_fn) is not None
+    # Whitespace-flexible on purpose: a clang-format rewrap of these conditions must not turn the gate red.
     results["every replay gate honors the disabled flag a failed retire sets"] = \
-        "!sycl_ctx->moe_graphs_disabled && !sycl_ctx->moe_direct_dispatch_graphs_disabled &&" in backend and \
-        "sycl_ctx->moe_graphs_disabled || sycl_ctx->moe_sequence_graphs_disabled || node->op != GGML_OP_MUL_MAT_ID" in backend and \
-        "if (sycl_ctx->moe_block_graphs_disabled || g_ggml_sycl_disable_graph || sycl_ctx->graphs_disabled ||\n        sycl_ctx->moe_graphs_disabled) {" in backend and \
-        re.search(r"if\s*\(sycl_ctx->moe_graphs_disabled\)\s*\{", backend) is not None
+        re.search(r"!sycl_ctx->moe_graphs_disabled\s*&&\s*!sycl_ctx->moe_direct_dispatch_graphs_disabled\s*&&", backend) is not None and \
+        re.search(r"sycl_ctx->moe_graphs_disabled\s*\|\|\s*sycl_ctx->moe_sequence_graphs_disabled\s*\|\|\s*node->op\s*!=\s*GGML_OP_MUL_MAT_ID", backend) is not None and \
+        re.search(r"if\s*\(\s*sycl_ctx->moe_block_graphs_disabled\s*\|\|[^{};]*\bsycl_ctx->moe_graphs_disabled\s*\)\s*\{", graphlets) is not None
+    # With the post-gateway checks gone, this entry block is what stops a segment replay after a failed retire
+    # (the segments stay marked valid): it must turn graphs off for the whole compute.
+    results["the compute entry turns graphs off when MoE graphs were disabled by a failed retire"] = \
+        re.search(r"if\s*\(\s*sycl_ctx->moe_graphs_disabled\s*\)\s*\{[^{}]*\buse_sycl_graph\s*=\s*false\s*;[^{}]*\}", compute) is not None
     results["the INPUT arm stages on the backend's own queue"] = \
         re.search(r"if\s*\(graph_tensor_is_input\(tensor\)\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{\s*"
                   r"sycl::queue\s*&\s*q\s*=\s*\*ctx->stream\(\);\s*void \* dev_ptr\s*=\s*ctx->graph_input_stage\(tensor, tensor->data, nbytes, q\);",
@@ -531,6 +535,12 @@ if args.self_test:
 
     mem_ = memo_hdr
     mutants = [
+        # review r10
+        ("the compute entry no longer turns graphs off", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG\([^;]*;\s*use_sycl_graph = false;",
+                    'if (sycl_ctx->moe_graphs_disabled) {\n        GGML_SYCL_DEBUG("x\\n");'), common, mem_)),
+        ("the compute entry's disabled block is dead", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"if \(sycl_ctx->moe_graphs_disabled\) \{", "if (false) {"), common, mem_)),
         # review r9
         ("the displaced handle is moved into retain", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
          (backend, mutate_in_func(common, stage_sig, "retain_handles_until_event({ slot.handle }, retire)", "retain_handles_until_event({ std::move(slot.handle) }, retire)"), mem_)),
@@ -543,11 +553,11 @@ if args.self_test:
         ("the epoch wrapper's catch reports success", "a failed drain or registry retire makes the epoch retire report false",
          (mutate_in_func(backend, r"bool ggml_sycl_retire_moe_graph_epoch\([^)]*\) noexcept\s*\{", "} catch (...) {\n        return false;", "} catch (...) {\n        return true;"), common, mem_)),
         ("the direct-dispatch gate ignores its disabled flag", "every replay gate honors the disabled flag a failed retire sets",
-         (mutate(backend, "!sycl_ctx->moe_graphs_disabled && !sycl_ctx->moe_direct_dispatch_graphs_disabled &&", "!sycl_ctx->moe_graphs_disabled &&"), common, mem_)),
+         (mutate_re(backend, r"direct_moe_graphlet_probe\s*=", r"!sycl_ctx->moe_direct_dispatch_graphs_disabled\s*&&\s*", ""), common, mem_)),
         ("the sequence gate ignores moe_graphs_disabled", "every replay gate honors the disabled flag a failed retire sets",
-         (mutate(backend, "sycl_ctx->moe_graphs_disabled || sycl_ctx->moe_sequence_graphs_disabled || node->op", "sycl_ctx->moe_sequence_graphs_disabled || node->op"), common, mem_)),
+         (mutate_re(backend, r"moe_graph_try_sequence_graphlet_for_node\(", r"sycl_ctx->moe_graphs_disabled\s*\|\|\s*(?=sycl_ctx->moe_sequence_graphs_disabled)", ""), common, mem_)),
         ("the block graphlet gate ignores moe_graphs_disabled", "every replay gate honors the disabled flag a failed retire sets",
-         (mutate(backend, "sycl_ctx->graphs_disabled ||\n        sycl_ctx->moe_graphs_disabled) {", "sycl_ctx->graphs_disabled) {"), common, mem_)),
+         (mutate_re(backend, r"static bool moe_graph_try_block_graphlets\([^)]*\)\s*\{", r"\|\|\s*sycl_ctx->moe_graphs_disabled\)\s*\{", ") {"), common, mem_)),
         # review r8
         ("the handle is moved before the event is taken", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
          (backend, mutate_in_func(common, stage_sig,
