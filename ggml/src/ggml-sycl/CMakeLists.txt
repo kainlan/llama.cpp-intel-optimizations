@@ -2188,6 +2188,31 @@ set_tests_properties(sycl-context-tenant-measure PROPERTIES
     TIMEOUT 30
 )
 
+# The published section of a context and the load's compute-term ledger (llama.cpp-moua
+# L4 step 3): runtime-context-section.hpp reads a runtime-context descriptor once into an
+# owning section, classifies a candidate's coverage and holds the late check's rule. It names
+# only the public ABI structs and the cohort table, so it needs neither -fsycl nor a device.
+# The test also includes src/llama-context-tenant.h to pin the backend's tenant key equal to
+# llama's digest.
+add_executable(test-runtime-context-section
+    tests/test-runtime-context-section.cpp
+    context-tenant-measure.cpp
+)
+target_include_directories(test-runtime-context-section PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../src
+)
+target_link_libraries(test-runtime-context-section PRIVATE ggml-base)
+set_target_properties(test-runtime-context-section PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-runtime-context-section COMMAND test-runtime-context-section)
+set_tests_properties(sycl-runtime-context-section PROPERTIES
+    LABELS "sycl;tenant;hostonly"
+    TIMEOUT 30
+)
+
 # The resolver counter's gating: a host return of a staged source counts only
 # inside the device-dispatch region and not inside a host executor. Synthetic
 # tensors, no device (an F32 tensor never reaches the multi-GPU control-storage
