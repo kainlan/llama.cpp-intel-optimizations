@@ -344,11 +344,9 @@ void zone_onednn_scratch_reserve_target(bool    arena_active,
     }
 }
 
-// RED stub (llama.cpp-8ony): the bound as the helpers used it, the zone's whole capacity.
 size_t zone_onednn_pp_pair_bound(size_t capacity_bytes, size_t bare_plan_bytes, size_t graph_floor_bytes) {
-    (void) bare_plan_bytes;
-    (void) graph_floor_bytes;
-    return capacity_bytes;
+    const size_t slack_bound = capacity_bytes > graph_floor_bytes ? capacity_bytes - graph_floor_bytes : 0;
+    return std::min(capacity_bytes, std::max(bare_plan_bytes, slack_bound));
 }
 
 bool zone_onednn_pp_scratch_type_enabled(int env_mode, bool default_type) {

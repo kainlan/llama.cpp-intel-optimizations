@@ -710,6 +710,23 @@ static std::atomic<size_t>   g_runtime_host_cat_bytes[static_cast<int>(runtime_c
 static std::atomic<size_t>   g_runtime_managed_reserved_host_bytes{};
 static std::atomic<size_t>   g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-8ony: the Graph SDPA floor the current ONEDNN zone was sized to cover, stored by the zone sizing
+// (unified_cache::ensure_planned_arena_zones) at the moment it keeps or builds the zone, never recomputed from the
+// SDPA shape later (that shape is rewritten by runtime plans the zone may not have been rebuilt for).
+static std::atomic<size_t>   g_onednn_zone_graph_floor_bytes[GGML_SYCL_MAX_DEVICES]{};
+
+static void onednn_zone_graph_floor_store(int device_id, size_t bytes) {
+    if (device_id >= 0 && device_id < GGML_SYCL_MAX_DEVICES) {
+        g_onednn_zone_graph_floor_bytes[device_id].store(bytes, std::memory_order_release);
+    }
+}
+
+static size_t onednn_zone_graph_floor_load(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_onednn_zone_graph_floor_bytes[device_id].load(std::memory_order_acquire);
+}
 // llama.cpp-479i: planned bytes of the per-context dense MMQ/MMVQ Q8_1 src1 buffer
 // (n_ubatch * bytes-per-token from the inventory, 256-aligned), folded into the
 // RUNTIME zone requirement so the zone the buffer lives in is sized for it.
@@ -5192,6 +5209,10 @@ bool unified_cache::ensure_planned_arena_zones() {
     // zone, which has to hold both the primitive-API pair and the
     // Graph-scratch allocator's floor.
     const size_t planned_onednn_zone = unified_cache_get_planned_onednn_scratchpad_bytes(dev_id);
+    // The Graph SDPA floor inside that figure (with-floor minus the pair's own stored plan): what this zone covers.
+    const size_t planned_onednn_pair = unified_cache_get_planned_onednn_scratchpad_bytes_stored(dev_id);
+    const size_t planned_onednn_floor =
+        planned_onednn_zone > planned_onednn_pair ? planned_onednn_zone - planned_onednn_pair : 0;
     if (planned_onednn_zone > onednn_zone) {
         onednn_zone = planned_onednn_zone;
         GGML_LOG_INFO("[UNIFIED-CACHE] ONEDNN zone raised to %.1f MB from placement scratch estimate\n",
@@ -5296,6 +5317,7 @@ bool unified_cache::ensure_planned_arena_zones() {
             // which guards every read.
             onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
 #endif
+            onednn_zone_graph_floor_store(dev_id, planned_onednn_floor);
             return true;
         }
 
@@ -5362,6 +5384,7 @@ bool unified_cache::ensure_planned_arena_zones() {
     // std::atomic store -- see that branch's comment.
     onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
 #endif
+    onednn_zone_graph_floor_store(dev_id, planned_onednn_floor);
     return true;
 }
 
@@ -19483,19 +19506,22 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
     return cache->reserve_onednn_scratch(weights_size, activations_size);
 }
 
-// llama.cpp-8ony: the ONEDNN zone's physical capacity, which is the with-floor figure (the primitive-API pair plus the
-// Graph-scratch floor, see unified_cache_get_planned_onednn_scratchpad_bytes). This is the question "does the pair fit
-// the zone the arena was built with", not "does it leave the Graph-scratch floor free": a pair above the planned pair
-// (unified_cache_get_planned_onednn_scratchpad_bytes_stored) and within the capacity is admitted and may push the
-// Graph SDPA scratch onto its DIRECT path, an unplanned (bounded, loud) device allocation. See
-// ggml_sycl_onednn_pp_scratch_planned_bytes for why that window is accepted today.
-bool unified_cache_get_onednn_zone_capacity(int device_id, size_t * capacity) {
+// llama.cpp-8ony: the most an op's f16 pair may be for the ONEDNN zone to count it as planned, from the zone the arena
+// was built with and the two figures it was sized from: the pair's own plan (the bare stored getter) and the Graph SDPA
+// floor the zone sizing stored when it kept or built the zone. Capacity minus the floor is slack nobody else planned
+// for, so a pair inside it cannot push the Graph SDPA scratch onto its DIRECT path (an unplanned device allocation);
+// a pair above it would. The bound never falls below the plan (a clamped zone holds the plan), nor above the
+// capacity. Neither figure is recomputed here: the SDPA shape is rewritten by runtime plans the zone was not rebuilt
+// for, so a floor derived from it now could disagree with the zone that exists.
+bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound) {
     unified_cache * cache = get_existing_unified_cache_for_device(device_id);
     if (!cache || !cache->arena_active()) {
         return false;
     }
-    if (capacity) {
-        *capacity = cache->zone_capacity(vram_zone_id::ONEDNN);
+    if (bound) {
+        *bound = zone_onednn_pp_pair_bound(cache->zone_capacity(vram_zone_id::ONEDNN),
+                                           unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id),
+                                           onednn_zone_graph_floor_load(device_id));
     }
     return true;
 }

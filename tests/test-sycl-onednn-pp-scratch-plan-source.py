@@ -12,8 +12,8 @@ zone, the scratch thrashed through unified-cache direct growth, and the planned 
 had never been sized.
 
 One fact, one source: whether an op's f16 copies are planned into the ONEDNN zone is decided by the zone the arena
-was built with (zone_onednn_pp_scratch_planned over unified_cache_get_onednn_zone_capacity), and the op arm and
-the graph-entry walk must ask that same question. The companion unit test (test-zone-sizing, Cases 14a-14d) proves
+was built with (zone_onednn_pp_scratch_planned over unified_cache_get_onednn_pp_pair_bound), and the op arm and
+the graph-entry walk must ask that same question. The companion unit test (test-zone-sizing, Cases 14a-14f) proves
 the arithmetic; this gate proves both consumers use it.
 
 Two follow-on facts, pinned here too:
@@ -136,27 +136,17 @@ def evaluate(backend, cache, cache_hpp, zone_sizing):
         backend, r"static bool ggml_sycl_onednn_pp_scratch_planned_bytes\([^)]*\)\s*\{")
     op_sycl = function_body(backend, r"inline void ggml_sycl_op_mul_mat_sycl\([^)]*\)\s*try\s*\{")
     dq_walk = function_body(backend, r"static bool ggml_sycl_dequant_f16_ensure_for_graph\([^)]*\)\s*\{")
-    accessor = function_body(
-        cache, r"bool unified_cache_get_onednn_zone_capacity\(int device_id, size_t \* capacity\)\s*\{")
     results["anchor: the by-bytes admission core exists"] = bytes_helper is not None
     results["anchor: op_mul_mat_sycl exists"] = op_sycl is not None
     results["anchor: the dequant graph walk exists"] = dq_walk is not None
-    results["anchor: the zone-capacity accessor is defined"] = accessor is not None
-    results["the zone-capacity accessor is declared"] = \
-        re.search(r"bool unified_cache_get_onednn_zone_capacity\(int device_id, size_t \* capacity\);",
-                  cache_hpp) is not None
-    if None in (bytes_helper, op_sycl, dq_walk, accessor):
+    if None in (bytes_helper, op_sycl, dq_walk):
         return results
 
     # One source: the helper answers from the zone the arena was built with, through the pure predicate.
     results["the helper asks the pure predicate"] = "zone_onednn_pp_scratch_planned(" in bytes_helper
-    results["the helper reads the arena's real ONEDNN zone capacity"] = \
-        "unified_cache_get_onednn_zone_capacity(" in bytes_helper
     # ABSENCE: it must not be answered from the stored planned bytes, which the runtime growth signal rewrites.
     results["the helper does not read the (mutable) planned scratchpad figure"] = \
         "unified_cache_get_planned_onednn_scratchpad_bytes" not in bytes_helper
-    results["the accessor reports the ONEDNN zone"] = \
-        "vram_zone_id::ONEDNN" in accessor and "arena_active()" in accessor
 
     # The choke point: every caller reaches reserve_onednn_scratch through acquire_onednn_pp_scratch, and an op the
     # plan routes elsewhere must be refused there, before the reserve (whose replan attempt also bumps the stored
@@ -205,8 +195,6 @@ def evaluate(backend, cache, cache_hpp, zone_sizing):
         results["the supplies helper asks the type/env enablement"] = \
             "onednn_pp_unified_scratch_enabled(" in supplies_helper
         results["the supplies helper asks the pure verdict"] = "zone_onednn_pp_scratch_supplies(" in supplies_helper
-        results["the supplies helper reads the arena's real ONEDNN zone capacity"] = \
-            "unified_cache_get_onednn_zone_capacity(" in supplies_helper
         results["the supplies helper derives the pair from src0 and the column count"] = \
             "ne[1]" in supplies_helper and "ne[0]" in supplies_helper
     if enabled_fn is not None:
@@ -483,14 +471,49 @@ if args.self_test and not failed:
         ("helper bypasses the pure predicate", "the helper asks the pure predicate",
          (mutate_in_func(backend, helper_sig, "zone_onednn_pp_scratch_planned(", "zone_XXXX("), cache, cache_hpp)),
         ("helper reads the mutable plan", "the helper does not read the (mutable) planned scratchpad figure",
-         (mutate_in_func(backend, helper_sig, "unified_cache_get_onednn_zone_capacity(",
+         (mutate_in_func(backend, helper_sig, "unified_cache_get_onednn_pp_pair_bound(",
                          "unified_cache_get_planned_onednn_scratchpad_bytes_stored("), cache, cache_hpp)),
-        ("helper ignores the zone", "the helper reads the arena's real ONEDNN zone capacity",
-         (mutate_in_func(backend, helper_sig, "unified_cache_get_onednn_zone_capacity(", "XXXX("),
+        ("helper reads the raw capacity again", "the by-bytes core reads the pair bound, not the raw capacity",
+         (mutate_in_func(backend, helper_sig, "unified_cache_get_onednn_pp_pair_bound(",
+                         "unified_cache_get_onednn_zone_capacity("), cache, cache_hpp)),
+        ("helper ignores the zone", "the by-bytes core reads the pair bound, not the raw capacity",
+         (mutate_in_func(backend, helper_sig, "unified_cache_get_onednn_pp_pair_bound(", "XXXX("),
           cache, cache_hpp)),
-        ("accessor reports another zone", "the accessor reports the ONEDNN zone",
-         (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_zone_capacity\(",
+        ("supplies helper reads the raw capacity again", "the supplies helper reads the pair bound, not the raw capacity",
+         (mutate_in_func(backend, r"static bool ggml_sycl_onednn_pp_scratch_supplies\(",
+                         "unified_cache_get_onednn_pp_pair_bound(", "unified_cache_get_onednn_zone_capacity("),
+          cache, cache_hpp)),
+        ("accessor reports another zone", "the accessor reads the arena's real ONEDNN zone capacity",
+         (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
                                   "vram_zone_id::ONEDNN", "vram_zone_id::RUNTIME"), cache_hpp)),
+        ("bound drops the floor term", "the pure bound subtracts the floor from the capacity",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, r"size_t zone_onednn_pp_pair_bound\(",
+                         "capacity_bytes - graph_floor_bytes", "capacity_bytes"))),
+        ("bound swaps max for min", "the pure bound never drops below the plan (max with the plan)",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, r"size_t zone_onednn_pp_pair_bound\(", "std::max(bare_plan_bytes,",
+                         "std::min(bare_plan_bytes,"))),
+        ("bound loses the capacity cap", "the pure bound never exceeds the capacity (min with the capacity)",
+         (backend, cache, cache_hpp,
+          mutate_in_func(zone_sizing, r"size_t zone_onednn_pp_pair_bound\(", "std::min(capacity_bytes,",
+                         "std::max(capacity_bytes,"))),
+        ("accessor recomputes the floor at the site", "the accessor reads the STORED Graph floor",
+         (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
+                                  "onednn_zone_graph_floor_load(device_id)",
+                                  "onednn_graph_scratch_zone_floor_bytes(0, 0, 0, 0, 0)"), cache_hpp)),
+        ("accessor reads the with-floor plan as the floor's source", "the accessor does not recompute the floor or read the with-floor plan",
+         (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
+                                  "onednn_zone_graph_floor_load(device_id)",
+                                  "unified_cache_get_planned_onednn_scratchpad_bytes(device_id)"), cache_hpp)),
+        ("accessor reads the with-floor plan as the pair plan", "the accessor does not recompute the floor or read the with-floor plan",
+         (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_pp_pair_bound\(",
+                                  "unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id)",
+                                  "unified_cache_get_planned_onednn_scratchpad_bytes(device_id)"), cache_hpp)),
+        ("zone sizing stops storing the floor", "both successful zone-sizing exits store the Graph floor they sized the zone with",
+         (backend, mutate_in_func(cache, r"bool unified_cache::ensure_planned_arena_zones\(",
+                                  "onednn_zone_graph_floor_store(dev_id, planned_onednn_floor);\n    return true;\n}",
+                                  "return true;\n}"), cache_hpp)),
         ("acquire without the plan", "acquire asks the plan before it asks for a reserve",
          (mutate_in_func(backend, r"static bool acquire_onednn_pp_scratch\(",
                          "ggml_sycl_onednn_pp_scratch_planned_bytes(", "ggml_sycl_XXXX("), cache, cache_hpp)),
@@ -514,8 +537,8 @@ if args.self_test and not failed:
                             "zone_onednn_scratch_reserve_target(", "zone_XXXX("),
              r"bool unified_cache::reserve_onednn_scratch\(", "direct_attempt = true;",
              "zone_onednn_scratch_reserve_target(); direct_attempt = true;"), cache_hpp)),
-        ("accessor undeclared", "the zone-capacity accessor is declared",
-         (backend, cache, mutate(cache_hpp, "unified_cache_get_onednn_zone_capacity(", "unified_cache_get_XXXX("))),
+        ("accessor undeclared", "the pair-bound accessor is declared",
+         (backend, cache, mutate(cache_hpp, "unified_cache_get_onednn_pp_pair_bound(", "unified_cache_get_XXXX("))),
     ]
     for label, expect, sources in mutants:
         failed += run(label, sources, expect)

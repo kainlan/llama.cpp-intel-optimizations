@@ -1489,18 +1489,16 @@ struct onednn_pp_scratch_guard {
 // bytes, is the choke point every route to the scratch passes; ggml_sycl_onednn_pp_scratch_supplies (below the PP
 // admission) is the same question, with the type enablement, for the op arm and the graph-entry walk.
 //
-// The bound is the zone's physical capacity, which includes the oneDNN Graph-scratch floor, so a pair between the
-// planned pair (unified_cache_get_planned_onednn_scratchpad_bytes_stored) and the capacity counts as planned while
-// it grows into the bytes the floor reserves for the Graph SDPA scratch. That scratch then goes to its DIRECT path
-// (onednn_graph_scratch_alloc), which is itself an unplanned device allocation (bounded by
-// GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB, it can wait for headroom and then abort when exhausted), so the window is not
-// free. It is accepted for now because the strict bound (the planned pair) would also turn away ops the planner's
-// own pair estimate under-sizes (its activations half is a placeholder sized from the largest stored tensor, which
-// a small hidden size at a large -ub exceeds); see llama.cpp-8ony for the open decision.
+// The bound is not the zone's whole capacity and not the pair's own plan: it is max(plan, capacity - Graph floor),
+// capped at the capacity, from the stored figures (unified_cache_get_onednn_pp_pair_bound). The zone is
+// max(256 MiB, plan + floor), so its capacity can sit far above plan + floor. A pair up to capacity - floor uses slack
+// nobody else planned for; a pair above it would grow into the bytes reserved for the oneDNN Graph SDPA scratch, whose
+// DIRECT path is itself an unplanned device allocation. A pair is never refused below the plan (a clamped zone still
+// holds it), so a small model whose head is larger than its largest layer pair keeps its route.
 static bool ggml_sycl_onednn_pp_scratch_planned_bytes(int device, size_t weights_bytes, size_t activations_bytes) {
-    size_t     zone_capacity = 0;
-    const bool arena_active  = ggml_sycl::unified_cache_get_onednn_zone_capacity(device, &zone_capacity);
-    return ggml_sycl::zone_onednn_pp_scratch_planned(arena_active, zone_capacity, weights_bytes, activations_bytes);
+    size_t     pair_bound   = 0;
+    const bool arena_active = ggml_sycl::unified_cache_get_onednn_pp_pair_bound(device, &pair_bound);
+    return ggml_sycl::zone_onednn_pp_scratch_planned(arena_active, pair_bound, weights_bytes, activations_bytes);
 }
 
 static bool acquire_onednn_pp_scratch(int                       device_id,
@@ -28302,10 +28300,10 @@ static bool ggml_sycl_onednn_pp_scratch_supplies(int                 device,
     if (pp_candidate_out) {
         *pp_candidate_out = pp_candidate;
     }
-    size_t     zone_capacity = 0;
-    const bool arena_active  = ggml_sycl::unified_cache_get_onednn_zone_capacity(device, &zone_capacity);
+    size_t     pair_bound   = 0;
+    const bool arena_active = ggml_sycl::unified_cache_get_onednn_pp_pair_bound(device, &pair_bound);
     return ggml_sycl::zone_onednn_pp_scratch_supplies(pp_candidate, onednn_pp_unified_scratch_enabled(src0->type),
-                                                      arena_active, zone_capacity, w_elems * elem_bytes,
+                                                      arena_active, pair_bound, w_elems * elem_bytes,
                                                       a_elems * elem_bytes);
 }
 
