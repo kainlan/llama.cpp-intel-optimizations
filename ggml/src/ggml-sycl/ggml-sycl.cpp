@@ -12282,9 +12282,12 @@ static void ggml_sycl_execution_clear_bindings_for_context(uint64_t context_id) 
     // The reset below zeroes each backend's key, and after it the backend's destructor cannot find the registry
     // entry (host reservation, published section) this id keyed: nothing else would drop it.  So the devices of
     // the bindings that end here are collected under the lock (no allocation, nothing to fail), and the entries
-    // are dropped BY THE ENDED ID after the reset, outside the lock.  A publish on one of those backends finds
-    // no id from the reset on, so it cannot re-create an entry under the dead one; an entry it created before
-    // the reset is dropped here.
+    // are dropped BY THE ENDED ID after the reset, outside the lock.  A publish that reads its backend's id after
+    // the reset finds none, so it cannot key an entry by the dead id; an entry made before the reset is dropped
+    // here.  A publish that had already read the id can still store under the dead one: for the host table the
+    // install guard drops by the id the install used (and attaching the root fails once the context is drained);
+    // for the section it needs the end to land within a few instructions of the store on the same context, a
+    // publish racing the end of its own context, which is unsupported.
     bool devices[GGML_SYCL_MAX_DEVICES] = {};
     {
         std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
@@ -45064,53 +45067,60 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
     if (ctx->claim) {
         // No wait here, on purpose (no host waits; event-chain instead), and the slot goes back with event 0.  That
         // is sound because of a contract that holds on every path to this function, read against the code and
-        // pinned by scripts/check-sycl-l4-proc-registration.py (the paths below, the synchronize before each, the
-        // upstream premises in ggml-backend.cpp, ggml-alloc.c and llama-context.cpp, and the queue aliasing):
-        //   A claimed compute buffer is freed only after a synchronize ATTEMPT of every backend of its scheduler,
-        //   and every SYCL queue that can touch a claimed slot is the device's one execution queue, which that
-        //   synchronize drains.
-        // The one queue: ggml_backend_sycl_context::stream(device, idx) answers ggml_sycl_execution_queue_for_device
-        // (device) for EVERY idx -- the TP queue when TP is on, else the unified cache's own queue.  So stream 0, the
-        // streams "1..N" and the cache's queue are one queue, not several that the synchronize could miss, and the
-        // synchronize's wait on stream 0 (or on the deferred last graph event, plus ggml_sycl_cpu_tg_flush_pending for
-        // the CPU-expert and scatter pipelines, detached threads included) is a wait on all of them.  A second real
-        // queue per device breaks that, and with it this contract: the pins on stream() and on the synchronize's
-        // drain exist so that it cannot happen quietly.
-        // What reads a slot: when the plan has CPU work, or the offload is partial, the CPU backend's compute buft is
-        // the CpuActivation clone, which ggml_backend_sycl_device_supports_buft does not list, so no SYCL op touches
-        // an activation in it.  With no CPU work and every layer offloaded it is the GENERIC SYCL_Host buft
-        // (llama_context_cpu_compute_buft), which supports_buft accepts, and SYCL kernels DO read and write a claimed
-        // slot in place -- on the execution queue above, which is why the synchronize covers them.  A consumer that
-        // puts work for a slot on anything that is not that queue must make the backend synchronize drain it, or chain
-        // on the slot's wait_event (the L6 event ledger); it must not rely on this contract and must not add a wait
-        // here.  Nor does an async copy have a SYCL_Host tensor at either end: set/get_tensor_async assert a SYCL
-        // device, host-compute or cpu-offload buft and cpy_tensor_async is NULL; the scheduler's cross-backend copy is
-        // a blocking ggml_backend_tensor_copy between the two backends' synchronizes, through accessors that wait the
-        // cache and default queues themselves; ggml-cpu's graph_compute is synchronous (its synchronize is NULL); and
-        // the staging the scatter threads touch is their own owner-first host handles.
-        // The paths to here, and the synchronize before each: ggml_backend_sched_reserve and _reserve_size
-        // (ggml_backend_sched_synchronize first); the realloc in ggml_backend_sched_alloc_splits
-        // (ggml_backend_synchronize of every backend before ggml_gallocr_reserve_n -- the other realloc, the
-        // automatic reserve in ggml_gallocr_alloc_graph, needs a single-buffer allocator, which llama.cpp never
-        // builds because the CPU backend is always one of the scheduler's backends, so a SYCL scheduler has two or
-        // more); llama_context's scheduler replacement in sched_reserve_impl (synchronize() before it on the ALLOC
-        // path; the pipeline-parallel retry replaces a scheduler that only failed to reserve, so it never computed)
-        // and in release_rung_buffers (synchronize() first); and ~llama_context (synchronize() first).  Two more
-        // frees run no synchronize and are benign: the MEASURE scheduler's destruction (sched_measure_storage, whose
-        // reserves go through ggml_backend_sched_reserve, which does synchronize, and whose final free does not) and
-        // the unwinding of a constructor that threw.  Nothing runs a kernel on either, and no claim scope is open on
-        // either.  L6 CONSTRAINT: a claim scope must never be opened on the measure scheduler (its reserve is bare,
-        // with no plan scope or hold record around it); a scope that is makes both frees paths of this list, and each
-        // then needs a synchronize before it.  Nothing else frees a compute buffer: ggml_backend_sched_reset only
-        // resets the allocator.
-        // "Synchronize" here is an attempt: ggml_backend_sycl_synchronize swallows its own failure (a throwing drain
-        // goes to ggml_backend_sycl_graph_boundary_exception_cleanup, which logs, and the call returns).  So after a
-        // failed drain (a lost device) the slot goes back with event 0 while the queue may still reference it, and
-        // the contract is void for that device from then on: nothing is submitted to a lost device's context, which is
-        // why that is tolerated, and the synchronize's own ERROR line is the only report.  A caller that needs the
-        // drain to have worked must ask the backend, not infer it from this function having been reached.
-        // A queue-wide wait here would be too much (it waited on, and rethrew, other contexts' work), and the
-        // contract already makes it unneeded.
+        // pinned by scripts/check-sycl-l4-proc-registration.py.  Each paragraph below is one part of it.
+        //
+        // CONTRACT: a claimed compute buffer is freed only after a synchronize ATTEMPT of every backend of its
+        // scheduler, and every SYCL queue that can touch a claimed slot is the device's one execution queue, which
+        // that synchronize drains.
+        //
+        // ONE QUEUE: once the unified cache exists (a claim requires it: its slots are cache carves),
+        // ggml_backend_sycl_context::stream(device, idx) answers ggml_sycl_execution_queue_for_device(device) for
+        // EVERY idx -- the TP queue when TP is on, else the cache's own queue.  Before the cache exists stream() falls
+        // back to the device's default queue, which no claim can outlive or predate.  So stream 0, the streams
+        // "1..N" and the cache's queue are one queue, not several that the synchronize could miss, and the
+        // synchronize's wait on stream 0 (or on the deferred last graph event, plus ggml_sycl_cpu_tg_flush_pending
+        // for the CPU-expert and scatter pipelines, detached threads included) is a wait on all of them.  A second
+        // real queue per device breaks that, and with it this contract: the pins on stream() and on the
+        // synchronize's drain exist so that it cannot happen quietly.
+        //
+        // READERS: when the plan has CPU work, or the offload is partial, the CPU backend's compute buft is the
+        // CpuActivation clone, which ggml_backend_sycl_device_supports_buft does not list, so no SYCL op touches an
+        // activation in it.  With no CPU work and every layer offloaded it is the GENERIC SYCL_Host buft
+        // (llama_context_cpu_compute_buft), which supports_buft accepts, and SYCL kernels DO read and write a
+        // claimed slot in place -- on the execution queue above, which is why the synchronize covers them.  A
+        // consumer that puts work for a slot on anything that is not that queue must make the backend synchronize
+        // drain it, or chain on the slot's wait_event (the L6 event ledger); it must not rely on this contract and
+        // must not add a wait here.  No async copy has a SYCL_Host tensor at either end: set/get_tensor_async assert
+        // a SYCL device, host-compute or cpu-offload buft and cpy_tensor_async is NULL; the scheduler's
+        // cross-backend copy is a blocking ggml_backend_tensor_copy between the two backends' synchronizes, through
+        // accessors that wait the cache and default queues themselves; ggml-cpu's graph_compute is synchronous (its
+        // synchronize is NULL); and the staging the scatter threads touch is their own owner-first host handles.
+        //
+        // PATHS: ggml_backend_sched_reserve and _reserve_size (ggml_backend_sched_synchronize first); the realloc in
+        // ggml_backend_sched_alloc_splits (ggml_backend_synchronize of every backend before ggml_gallocr_reserve_n --
+        // the other realloc, the automatic reserve in ggml_gallocr_alloc_graph, needs a single-buffer allocator,
+        // which llama.cpp never builds because the CPU backend is always one of the scheduler's backends, so a SYCL
+        // scheduler has two or more); llama_context's scheduler replacement in sched_reserve_impl (synchronize()
+        // before it on the ALLOC path; the pipeline-parallel retry replaces a scheduler that only failed to reserve,
+        // so it never computed) and in release_rung_buffers (synchronize() first); and ~llama_context
+        // (synchronize() first).  Nothing else frees a compute buffer: ggml_backend_sched_reset only resets the
+        // allocator.
+        //
+        // BENIGN FREES AND THE L6 CONSTRAINT: two more frees run no synchronize: the MEASURE scheduler's destruction
+        // (sched_measure_storage, whose reserves go through ggml_backend_sched_reserve, which does synchronize, and
+        // whose final free does not) and the unwinding of a constructor that threw.  Nothing runs a kernel on either,
+        // and no claim scope is open on either.  L6 CONSTRAINT: a claim scope must never be opened on the measure
+        // scheduler (its reserve is bare, with no plan scope or hold record around it); a scope that is makes both
+        // frees paths of the list above, and each then needs a synchronize before it.
+        //
+        // A FAILED DRAIN: "synchronize" is an attempt: ggml_backend_sycl_synchronize swallows its own failure (a
+        // throwing drain goes to ggml_backend_sycl_graph_boundary_exception_cleanup, which logs, and the call
+        // returns).  So after a failed drain (a lost device) the slot goes back with event 0 while the queue may
+        // still reference it, and the contract is void for that device from then on: nothing is submitted to a lost
+        // device's context, which is why that is tolerated, and the synchronize's own ERROR line is the only report.
+        // A caller that needs the drain to have worked must ask the backend, not infer it from this function having
+        // been reached.  A queue-wide wait here would be too much (it waited on, and rethrew, other contexts' work),
+        // and the contract already makes it unneeded.
         (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);
         ctx->claim.reset();
     }

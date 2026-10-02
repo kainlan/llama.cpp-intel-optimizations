@@ -512,14 +512,14 @@ def free_path_pins(source, freeb, fails):
     # unified cache's own queue.  This is what makes "the queues the synchronize does not drain" an empty set.
     stream_fn = function_body(source, STREAM_SIG)
     pin(fails, stream_fn,
-        r"if \(sycl::queue \* execution_queue = ggml_sycl_execution_queue_for_device\(device\)\) \{\s*"
+        r"^[^{]*\{\s*if \(sycl::queue \* execution_queue = ggml_sycl_execution_queue_for_device\(device\)\) \{\s*"
         r"if \(qptrs\[device\]\[stream\] != execution_queue\) \{[^}]*\}\s*return execution_queue;\s*\}",
         "L4 free path: ggml_backend_sycl_context::stream(device, idx) no longer answers the device's one execution queue "
         "for every idx (a second queue per device is one the synchronize does not drain)")
     pin(fails, function_body(source, EXEC_QUEUE_SIG),
-        r"if \(sycl::queue \* tp_queue = ggml_sycl_get_tp_queue\(device\)\) \{\s*return tp_queue;\s*\}\s*"
+        r"^[^{]*\{\s*if \(sycl::queue \* tp_queue = ggml_sycl_get_tp_queue\(device\)\) \{\s*return tp_queue;\s*\}\s*"
         r"if \(ggml_sycl::unified_cache \* cache = ggml_sycl::get_existing_unified_cache_for_device\(device\)\) \{\s*"
-        r"return &cache->get_queue\(\);\s*\}\s*return nullptr;",
+        r"return &cache->get_queue\(\);\s*\}\s*return nullptr;\s*\}$",
         "L4 free path: the device's execution queue is no longer the TP queue or the unified cache's own queue")
     # the upstream premises the synchronize-before-free argument rests on.  They are vendored files: a rebase that
     # changes one is the event this catches.
@@ -731,14 +731,20 @@ def check(header_raw, source):
         fails.append("L4 host tier: the drop of the host reservation swallows a failure silently (no ERROR)")
     if "ggml_sycl_context_execution_id(" in herase_fn or "execution_context_id" in herase_fn:
         fails.append("L4 host tier: the host reservation's erase reads a context id itself (it must use the caller's)")
-    pin(fails, herase_fn, r"\.take_tenant_slots\(context_id\)",
+    pin(fails, herase_fn,
+        r"^[^{]*\{\s*try \{\s*if \(context_id == 0 \|\| device < 0 \|\| device >= GGML_SYCL_MAX_DEVICES\) \{\s*return;\s*\}\s*"
+        r"auto previous = ggml_sycl_kv_region_registry\(device\)\.take_tenant_slots\(context_id\);\s*\(void\) previous;\s*"
+        r"\} catch \(\.\.\.\)",
         "L4 host tier: the host reservation's erase does not take the table by the id it was given")
     erase_fn = function_body(source, ERASE_SECTION_SIG) or ""
     if not re.search(r"catch\s*\(\.\.\.\)\s*\{\s*GGML_LOG_ERROR\(", erase_fn):
         fails.append("L4 section: the erase swallows a failed drop silently (no ERROR)")
     if "ggml_sycl_context_execution_id(" in erase_fn or "execution_context_id" in erase_fn:
         fails.append("L4 section: the section's erase reads a context id itself (it must use the caller's)")
-    pin(fails, erase_fn, r"\.drop_published_section\(context_id\)",
+    pin(fails, erase_fn,
+        r"^[^{]*\{\s*try \{\s*if \(context_id == 0 \|\| device < 0 \|\| device >= GGML_SYCL_MAX_DEVICES\) \{\s*return;\s*\}\s*"
+        r"auto previous = ggml_sycl_kv_region_registry\(device\)\.drop_published_section\(context_id\);\s*\(void\) previous;\s*"
+        r"\} catch \(\.\.\.\)",
         "L4 section: the section's erase does not drop the section by the id it was given")
 
     # load_end: guard after the finisher check
@@ -820,6 +826,9 @@ def check(header_raw, source):
             r"[\s\S]*?\}\s*\}\s*ggml_sycl_execution_drop_context_registry_entries\(context_id, devices\);\s*\}$",
             "L4 context end: the clear of an ended context's bindings does not collect the bound devices under the "
             "lock, reset, and drop the entries by the ended id after the lock (devices collected before the reset)")
+        pin(fails, clear_bind, r"for \(auto it = g_execution_backend_bindings\.begin\(\); it != g_execution_backend_bindings\.end\(\);\) \{\s*"
+                               r"if \(it->second && it->second->context_id == context_id\) \{",
+            "L4 context end: the collection loop does not select the bindings of the ended context by its id")
         if re.search(r"for_each_bound_backend|pin_bound_backends|\bpin_count\b", clear_bind):
             fails.append("L4 context end: the clear of an ended context's bindings pins backends again (an allocation that "
                          "can fail, and a failed pin leaves the entries orphaned)")
@@ -1121,7 +1130,7 @@ def mutations(header_raw, source):
         ("the ended context's drop gets a try", "dropped under the binding mutex", DROP_ENTRIES_SIG,
          "    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {\n",
          "    try {} catch (...) {}\n    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {\n"),
-        # ---- the free path, statement-initial and unconditional (rev-moua-c34 Minor 1)
+        # ---- the free path: each synchronize a statement of its own, unconditional
         ("sched_reserve_impl's synchronize conditional", "does not synchronize() unconditionally on the ALLOC path", REIMPL_SIG,
          "    synchronize();\n", "    if (false) synchronize();\n"),
         ("sched_reserve_impl's synchronize moved into the MEASURE branch", "does not synchronize() unconditionally on the ALLOC path", REIMPL_SIG,
@@ -1147,7 +1156,33 @@ def mutations(header_raw, source):
          "use_deferred_decode_event ? CHECK_TRY_ERROR(", "false ? CHECK_TRY_ERROR("),
         ("the backend synchronize returns before the drain", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
          "        auto err = use_deferred_decode_event", "        if (sycl_ctx->has_pending_barrier) {\n            return;\n        }\n        auto err = use_deferred_decode_event"),
-        # ---- the queue aliasing (rev-moua-c34 Important 2)
+        # ---- the queue aliasing: one execution queue per device, answered for every idx
+        ("stream() answers a private queue for idx > 0 ahead of the execution queue", "no longer answers the device's one execution queue for every idx", STREAM_SIG,
+         "if (sycl::queue * execution_queue = ggml_sycl_execution_queue_for_device(device)) {",
+         "if (stream != 0 && qptrs[device][stream] != nullptr) {\n            return qptrs[device][stream];\n        }\n        if (sycl::queue * execution_queue = ggml_sycl_execution_queue_for_device(device)) {"),
+        ("the execution queue of device 1 is a private queue ahead of the TP check", "execution queue is no longer the TP queue or the unified cache's own queue", EXEC_QUEUE_SIG,
+         "    if (sycl::queue * tp_queue = ggml_sycl_get_tp_queue(device)) {",
+         "    if (device == 1) {\n        return &ggml_sycl_get_device(1).default_queue();\n    }\n    if (sycl::queue * tp_queue = ggml_sycl_get_tp_queue(device)) {"),
+        ("the execution queue answers one more queue after the cache", "execution queue is no longer the TP queue or the unified cache's own queue", EXEC_QUEUE_SIG,
+         "    return nullptr;\n}", "    return &ggml_sycl_get_device(device).default_queue();\n}"),
+        ("the section's erase indexes device 0", "does not drop the section by the id it was given", ERASE_SECTION_SIG,
+         "ggml_sycl_kv_region_registry(device)", "ggml_sycl_kv_region_registry(0)"),
+        ("the host reservation's erase indexes device 0", "does not take the table by the id it was given", ERASE_HOST_SIG,
+         "ggml_sycl_kv_region_registry(device)", "ggml_sycl_kv_region_registry(0)"),
+        ("the section's erase drops its id==0 guard", "does not drop the section by the id it was given", ERASE_SECTION_SIG,
+         "context_id == 0 || ", ""),
+        ("the host reservation's erase drops its id==0 guard", "does not take the table by the id it was given", ERASE_HOST_SIG,
+         "context_id == 0 || ", ""),
+        ("the section's erase drops its device bounds", "does not drop the section by the id it was given", ERASE_SECTION_SIG,
+         "context_id == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES", "context_id == 0"),
+        ("the host reservation's erase drops its device bounds", "does not take the table by the id it was given", ERASE_HOST_SIG,
+         "context_id == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES", "context_id == 0"),
+        ("the host reservation's erase keeps the table", "does not take the table by the id it was given", ERASE_HOST_SIG,
+         "(void) previous;", "static std::shared_ptr<ggml_sycl::kv_tenant_slots> h_keep; h_keep = previous;"),
+        ("the section's erase keeps the section", "does not drop the section by the id it was given", ERASE_SECTION_SIG,
+         "(void) previous;", "static auto h_keep = previous; h_keep = previous;"),
+        ("the collection loop selects the other contexts", "does not select the bindings of the ended context by its id", CLEAR_BIND_SIG,
+         "it->second->context_id == context_id", "it->second->context_id != context_id"),
         ("stream(device, idx) answers another queue for idx > 0", "no longer answers the device's one execution queue for every idx", STREAM_SIG,
          "            return execution_queue;\n", "            return stream == 0 ? execution_queue : qptrs[device][stream];\n"),
         ("stream(device, idx) answers by idx under a condition", "no longer answers the device's one execution queue for every idx", STREAM_SIG,
@@ -1157,7 +1192,7 @@ def mutations(header_raw, source):
          "return &cache->get_queue();", "return &ggml_sycl_get_device(device).default_queue();"),
         ("the execution queue ignores the TP queue", "execution queue is no longer the TP queue or the unified cache's own queue", EXEC_QUEUE_SIG,
          "        return tp_queue;\n", "        return nullptr;\n"),
-        # ---- the upstream premises (rev-moua-c34 Minor 2)
+        # ---- the upstream premises: scheduler and allocator synchronize before they free
         ("the scheduler is built over one backend fewer", "no longer built over every backend of the context", REIMPL_SIG,
          re.compile(r"backend_ptrs\.size\(\), max_nodes,"), "backend_ptrs.size() - 1, max_nodes,"),
         ("ggml_backend_sched_reserve does not synchronize", "ggml_backend_sched_reserve no longer synchronizes", SCHED_RESERVE_SIG,
