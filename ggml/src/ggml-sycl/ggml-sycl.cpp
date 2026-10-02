@@ -20601,7 +20601,7 @@ enum ggml_sycl_residency_probe_status ggml_backend_sycl_probe_residency(ggml_bac
                                                                         const ggml_sycl_runtime_context_desc * desc,
                                                                         struct ggml_sycl_residency_probe *     out) {
     (void) model;
-    if (out == nullptr || out->struct_size < sizeof(*out) || out->version != GGML_SYCL_RESIDENCY_PROBE_VERSION) {
+    if (!ggml_sycl::residency_probe_out_declared(out)) {
         GGML_LOG_WARN("[RESIDENCY-PROBE] refused: the result struct is missing, short or of another version\n");
         return GGML_SYCL_RESIDENCY_PROBE_INVALID;
     }

@@ -621,6 +621,12 @@ def probe_pins(source, fails):
     if returns.count("GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED") != 1 or not re.search(
             r"return GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED;\s*\}$", body):
         fails.append("L4 probe: the proc does not end by answering GEOMETRY_NOT_WIRED")
+    # the caller's struct is gated on what it declared, by the one helper the host test pins, before a byte of it is
+    # written: nothing of `out` is touched ahead of the gate, and the gate's refusal is the next thing after it
+    if not re.search(r"\{\s*\(void\)\s*model;\s*if \(!ggml_sycl::residency_probe_out_declared\(out\)\) \{[^{}]*"
+                     r"return GGML_SYCL_RESIDENCY_PROBE_INVALID;\s*\}\s*out->n_layer = 0;", body):
+        fails.append("L4 probe: the proc does not gate the caller's result struct on its declared size and version "
+                     "(residency_probe_out_declared) before it writes any of it")
     if "out->n_layer = (uint32_t) parsed.kv.layers.size();" not in body:
         fails.append("L4 probe: the proc does not write the layer count it was asked about")
     if not re.search(r'GGML_LOG_WARN\(\s*"\[RESIDENCY-PROBE\][^"]*"(?:[^;"]|"[^"]*")*;\s*return GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED;', body):
@@ -1589,6 +1595,17 @@ def mutations(header_raw, source):
         ("the probe answers a lifecycle result", "returns something other than a named refusal enumerator", SIG_PROBE,
          "        return GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND;",
          "        return (ggml_sycl_residency_probe_status) GGML_SYCL_LIFECYCLE_OK;"),
+        ("the probe's struct gate is a bare null test", "does not gate the caller's result struct", SIG_PROBE,
+         "    if (!ggml_sycl::residency_probe_out_declared(out)) {", "    if (out == nullptr) {"),
+        ("the probe's struct gate is an inline size test", "does not gate the caller's result struct", SIG_PROBE,
+         "    if (!ggml_sycl::residency_probe_out_declared(out)) {",
+         "    if (out == nullptr || out->struct_size < sizeof(*out)) {"),
+        ("the probe writes the layer count ahead of its struct gate", "does not gate the caller's result struct", SIG_PROBE,
+         "    (void) model;\n    if (!ggml_sycl::residency_probe_out_declared(out)) {",
+         "    (void) model;\n    out->n_layer = 0;\n    if (!ggml_sycl::residency_probe_out_declared(out)) {"),
+        ("the probe's struct gate no longer refuses", "does not gate the caller's result struct", SIG_PROBE,
+         "        return GGML_SYCL_RESIDENCY_PROBE_INVALID;\n    }\n    out->n_layer = 0;",
+         "        (void) 0;\n    }\n    out->n_layer = 0;"),
         ("the probe no longer writes the layer count", "does not write the layer count", SIG_PROBE,
          "            out->n_layer = (uint32_t) parsed.kv.layers.size();\n", ""),
         ("the probe's not-wired answer says nothing", "does not say why it did not answer",  SIG_PROBE,

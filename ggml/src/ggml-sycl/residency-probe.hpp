@@ -95,6 +95,14 @@ inline const residency_probe_device * find_device(const residency_probe_input & 
 
 }  // namespace residency_probe_detail
 
+// The caller's result struct may be written only if the caller declared one this module knows: a pointer, a struct_size
+// at least the layout the proc writes (n_layer, and host_resident through the pointer the caller owns), the version it
+// understands.  A smaller or older struct is refused, so the proc never writes past what the caller declared; a larger
+// one (a newer caller) is read as the layout this module knows.  The proc asks this before it writes a byte.
+inline bool residency_probe_out_declared(const ggml_sycl_residency_probe * out) {
+    return out != nullptr && out->struct_size >= sizeof(*out) && out->version == GGML_SYCL_RESIDENCY_PROBE_VERSION;
+}
+
 inline residency_probe_result residency_probe_core(const residency_probe_input & in) {
     using namespace residency_probe_detail;
     const auto   INVALID = GGML_SYCL_RESIDENCY_PROBE_INVALID;

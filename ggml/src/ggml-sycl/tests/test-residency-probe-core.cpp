@@ -306,23 +306,25 @@ void case_out_struct_gate() {
     ggml_sycl_residency_probe out{};
     out.struct_size = sizeof(out);
     out.version     = GGML_SYCL_RESIDENCY_PROBE_VERSION;
-    CHECK(residency_probe_out_declared(&out), "control: a correctly declared struct is accepted");
-    CHECK(!residency_probe_out_declared(nullptr), "a null result is refused");
+    CHECK(ggml_sycl::residency_probe_out_declared(&out), "control: a correctly declared struct is accepted");
+    CHECK(!ggml_sycl::residency_probe_out_declared(nullptr), "a null result is refused");
 
     for (uint32_t size = 0; size < sizeof(out); ++size) {
         out.struct_size = size;
-        CHECK(!residency_probe_out_declared(&out), "a struct_size below the layout this module writes is refused");
+        CHECK(!ggml_sycl::residency_probe_out_declared(&out),
+              "a struct_size below the layout this module writes is refused");
     }
     out.struct_size = sizeof(out) - 1;
-    CHECK(!residency_probe_out_declared(&out), "one byte short is refused");
+    CHECK(!ggml_sycl::residency_probe_out_declared(&out), "one byte short is refused");
 
     out.struct_size = sizeof(out) + 8;
-    CHECK(residency_probe_out_declared(&out), "a larger (newer) struct is read as the layout this module knows");
+    CHECK(ggml_sycl::residency_probe_out_declared(&out),
+          "a larger (newer) struct is read as the layout this module knows");
 
     out.struct_size = sizeof(out);
     for (uint32_t version : { 0u, (uint32_t) GGML_SYCL_RESIDENCY_PROBE_VERSION + 1u, 0xFFFFFFFFu }) {
         out.version = version;
-        CHECK(!residency_probe_out_declared(&out), "a version this module does not know is refused");
+        CHECK(!ggml_sycl::residency_probe_out_declared(&out), "a version this module does not know is refused");
     }
 }
 
