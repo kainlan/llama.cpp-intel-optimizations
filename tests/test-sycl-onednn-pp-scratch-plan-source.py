@@ -38,6 +38,14 @@ Three more facts, all gated below:
   * The op arm and the walk pass the pair's arguments to that one helper: the op its column tile (src1_ncols), the
     walk src1->ne[1]; both derive the element counts inside it.
 
+A tensor consumed only by a row gather (token_embd.weight, GET_ROWS) is no MUL_MAT operand and is planned into
+neither the dequant buffers nor the Q8_1 src1 buffer; a Q4_0 Mistral paid a 254 MB RUNTIME zone for it. The model
+loader's own op table says which tensors are gathered, and its tied-embedding rule (an output head the file does not
+carry is token_embd, treated as the output) says when a gathered tensor is also the head. That role travels in
+ggml_sycl_tensor_info::get_rows_only, is copied into the inventory the planner sees, and is honoured by the pure
+classifier; test-zone-sizing Case 14j proves the classifier, this gate proves the producer, the carrier and the
+plumbing.
+
 Run with --self-test to prove every check fires against a mutant of the thing it forbids.
 """
 import argparse
@@ -53,6 +61,8 @@ parser.add_argument("--backend", default=str(sycl / "ggml-sycl.cpp"))
 parser.add_argument("--cache", default=str(sycl / "unified-cache.cpp"))
 parser.add_argument("--cache-hpp", default=str(sycl / "unified-cache.hpp"))
 parser.add_argument("--zone-sizing", default=str(sycl / "zone-sizing.cpp"))
+parser.add_argument("--model", default=str(root / "src/llama-model.cpp"))
+parser.add_argument("--sycl-header", default=str(root / "ggml/include/ggml-sycl.h"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
@@ -130,7 +140,7 @@ HELPER = "ggml_sycl_onednn_pp_scratch_planned_bytes("
 REUSE_TEST = "if (onednn_weights_scratch_ && onednn_activations_scratch_ && onednn_weights_scratch_size_ >= weights_size"
 
 
-def evaluate(backend, cache, cache_hpp, zone_sizing):
+def evaluate(backend, cache, cache_hpp, zone_sizing, model, header):
     results = {}
     bytes_helper = function_body(
         backend, r"static bool ggml_sycl_onednn_pp_scratch_planned_bytes\([^)]*\)\s*\{")
@@ -376,11 +386,58 @@ def evaluate(backend, cache, cache_hpp, zone_sizing):
     if sup is not None:
         results["the supplies helper reads the pair bound, not the raw capacity"] = \
             "unified_cache_get_onednn_pp_pair_bound(" in sup and "unified_cache_get_onednn_zone_capacity(" not in sup
+    # ---- a row-gather tensor is no MUL_MAT operand (llama.cpp-8ony): producer, carrier, plumbing, classifier ----
+    results["the adapter hands the classifier the loader's gather-only role"] = \
+        adapter is not None and re.search(r"desc\.get_rows_only\s*=\s*item\.get_rows_only\s*;", adapter) is not None
+    detail_loop = function_body(backend, r"for \(size_t i = 0; i < inventory->count; i\+\+\)\s*\{")
+    results["anchor: the inventory copy loop exists"] = detail_loop is not None
+    if detail_loop is not None:
+        results["the backend copies the role into the inventory the planner sees"] = \
+            re.search(r"info\.get_rows_only\s*=\s*inventory->tensors\[i\]\.get_rows_only\s*;", detail_loop) is not None
+    results["the planner's tensor description carries the role"] = \
+        re.search(r"struct placement_tensor_info \{[^}]*\bbool\s+get_rows_only\b", cache_hpp, re.S) is not None
+    classifier = function_body(
+        zone_sizing, r"path_scoped_maxima zone_scoped_maxima\([^)]*\)\s*\{")
+    results["anchor: the pure classifier exists"] = classifier is not None
+    if classifier is not None:
+        results["the pure classifier excludes a gather-only tensor from the MUL_MAT-side marks"] = \
+            "get_rows_only" in classifier
+    info_struct = re.search(r"struct ggml_sycl_tensor_info \{(.*?)\};", header, re.S)
+    results["anchor: ggml_sycl_tensor_info exists"] = info_struct is not None
+    if info_struct is not None:
+        body = info_struct.group(1)
+        flag_at = body.find("get_rows_only")
+        results["the role sits in the padding after type, so the array stride does not move"] = \
+            0 <= body.find("type;") < flag_at < body.find("ne[")
+    mark = function_body(model, r"static void llama_model_sycl_mark_get_rows_only\([^)]*\)\s*\{")
+    results["anchor: the loader-side role function exists"] = mark is not None
+    if mark is not None:
+        mark_norm = re.sub(r"\s+", " ", mark)
+        results["the role comes from the loader's op table, not a name list"] = \
+            "llm_tensor_info_for(" in mark and "GGML_OP_GET_ROWS" in mark and "LLM_TENSOR_LAYER_INPUT" in mark
+        results["a tied token embedding stays a MUL_MAT operand when the file carries no head"] = \
+            "tied_head = input == LLM_TENSOR_TOKEN_EMBD && !file_carries_head" in mark_norm and \
+            "tensor.get_rows_only = !tied_head" in mark_norm
+        results["the file's head is the loader's own output name over its own tensor set"] = \
+            "tn(LLM_TENSOR_OUTPUT" in mark and "weights_map" in mark
+    for fname, sig in (("early plan", r"static void llama_model_sycl_compute_early_plan\([^)]*\)\s*\{"),
+                       ("late inventory", r"static void llama_model_sycl_set_late_inventory\([^)]*\)\s*\{")):
+        fbody = function_body(model, sig)
+        results["anchor: the %s exists" % fname] = fbody is not None
+        if fbody is not None:
+            at = fbody.find("llama_model_sycl_mark_get_rows_only(tensors, ml)")
+            results["the %s marks the role before it builds the inventory" % fname] = \
+                0 <= at < fbody.find("llama_model_sycl_populate_inventory(")
     return results
 
 
 def run(label, sources, expect_fail=None):
-    results = evaluate(*sources) if len(sources) == 4 else evaluate(*sources, zone_sizing)
+    srcs = tuple(sources)
+    if len(srcs) == 3:
+        srcs += (zone_sizing,)
+    if len(srcs) == 4:
+        srcs += (model, header)
+    results = evaluate(*srcs)
     bad = [k for k, v in results.items() if not v]
     if expect_fail is None:
         for k, v in results.items():
@@ -422,6 +479,8 @@ zone_sizing = strip_comments(Path(args.zone_sizing).read_text())
 backend = strip_comments(Path(args.backend).read_text())
 cache = strip_comments(Path(args.cache).read_text())
 cache_hpp = strip_comments(Path(args.cache_hpp).read_text())
+model = strip_comments(Path(args.model).read_text())
+header = strip_comments(Path(args.sycl_header).read_text())
 
 failed = run("tree", (backend, cache, cache_hpp, zone_sizing))
 
@@ -629,6 +688,34 @@ if args.self_test and not failed:
                             "zone_onednn_scratch_reserve_target(", "zone_XXXX("),
              r"bool unified_cache::reserve_onednn_scratch\(", "direct_attempt = true;",
              "zone_onednn_scratch_reserve_target(); direct_attempt = true;"), cache_hpp)),
+        ("adapter drops the gather-only role", "the adapter hands the classifier the loader's gather-only role",
+         (backend, mutate_in_func(cache, adapter_sig, "desc.get_rows_only = item.get_rows_only", "desc.get_rows_only = false"),
+          cache_hpp)),
+        ("backend drops the role copy", "the backend copies the role into the inventory the planner sees",
+         (mutate(backend, "info.get_rows_only = inventory->tensors[i].get_rows_only", "info.get_rows_only = false"), cache,
+          cache_hpp)),
+        ("planner description loses the role", "the planner's tensor description carries the role",
+         (backend, cache, mutate(cache_hpp, "bool        get_rows_only", "bool        XXXX"))),
+        ("classifier ignores the role", "the pure classifier excludes a gather-only tensor from the MUL_MAT-side marks",
+         (backend, cache, cache_hpp, mutate(zone_sizing, "get_rows_only", "XXXX"), model, header)),
+        ("role moved past ne", "the role sits in the padding after type, so the array stride does not move",
+         (backend, cache, cache_hpp, zone_sizing, model,
+          mutate(mutate(header, "bool           get_rows_only;", ""), "int64_t        ne[GGML_MAX_DIMS];",
+                 "int64_t        ne[GGML_MAX_DIMS];\n    bool get_rows_only;"))),
+        ("role drops the tied rule", "a tied token embedding stays a MUL_MAT operand when the file carries no head",
+         (backend, cache, cache_hpp, zone_sizing, mutate(model, "&& !file_carries_head", "&& false"), header)),
+        ("role from a name list", "the role comes from the loader's op table, not a name list",
+         (backend, cache, cache_hpp, zone_sizing, mutate(model, "info.op != GGML_OP_GET_ROWS", "false"), header)),
+        ("role reads another tensor set", "the file's head is the loader's own output name over its own tensor set",
+         (backend, cache, cache_hpp, zone_sizing, mutate(model, "weights_map.find(", "XXXX.find("), header)),
+        ("early plan forgets the role", "the early plan marks the role before it builds the inventory",
+         (backend, cache, cache_hpp, zone_sizing,
+          mutate_in_func(model, r"static void llama_model_sycl_compute_early_plan\(",
+                         "llama_model_sycl_mark_get_rows_only(tensors, ml)", "(void) 0"), header)),
+        ("late inventory forgets the role", "the late inventory marks the role before it builds the inventory",
+         (backend, cache, cache_hpp, zone_sizing,
+          mutate_in_func(model, r"static void llama_model_sycl_set_late_inventory\(",
+                         "llama_model_sycl_mark_get_rows_only(tensors, ml)", "(void) 0"), header)),
         ("accessor undeclared", "the pair-bound accessor is declared",
          (backend, cache, mutate(cache_hpp, "unified_cache_get_onednn_pp_pair_bound(", "unified_cache_get_XXXX("))),
     ]

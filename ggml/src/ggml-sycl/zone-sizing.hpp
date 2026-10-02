@@ -100,6 +100,13 @@ struct zone_tensor_desc {
     // The adapter's answer to "is the oneDNN PP scratch enabled for this tensor's type" (environment and the
     // default type set). Only read together with the two fields above.
     bool   pp_scratch_type_enabled                        = false;
+
+    // True for a tensor whose only consumer is a row gather (GET_ROWS: the token / position embedding lookup), so
+    // none of the MUL_MAT-side marks above describe it (llama.cpp-8ony). Supplied by the adapter from the model
+    // loader's own role for the tensor, which makes a tied token embedding that doubles as the output head a
+    // MUL_MAT operand and so NOT gather-only. The marks are the adapter's to set; a gather-only tensor is
+    // excluded from every one of them here, in one place, rather than by each mark's own condition.
+    bool   get_rows_only                                  = false;
 };
 
 struct path_scoped_maxima {

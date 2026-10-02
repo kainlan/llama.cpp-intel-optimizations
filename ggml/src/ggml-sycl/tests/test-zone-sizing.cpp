@@ -926,6 +926,68 @@ int main() {
         CHECK(zone_scoped_maxima(unmarked).dequant_f16_weight_bytes == 0, "no mark, no plan");
     }
 
+    // ---- Case 14j: a row-gather tensor is not a MUL_MAT operand (llama.cpp-8ony) ---------------------------------
+    // token_embd.weight is consumed by GET_ROWS, which draws neither the dequant buffers nor the Q8_1 src1 buffer.
+    // Planned as if it were the head it cost a Q4_0 Mistral a 254 MB RUNTIME zone for nothing. The loader's role for
+    // the tensor decides: a tied embedding that also serves as the output head IS a MUL_MAT operand.
+    {
+        const size_t head_w  = 262144000;  // 4096 x 32000 f16
+        auto         marked  = [&](const char * name, int type, size_t f16_w, bool gather_only) {
+            zone_tensor_desc d                               = desc(name, 1000, type, 4096, 32000, 1, 1);
+            d.dequant_f16_if_unsupplied_weight_bytes         = f16_w;
+            d.dequant_f16_if_unsupplied_src1_bytes_per_token = 4096 * F16_BYTES;
+            d.pp_scratch_type_enabled                        = true;
+            d.mmq_src1_bytes_per_token                       = 4608;
+            d.get_rows_only                                  = gather_only;
+            return d;
+        };
+        std::vector<zone_tensor_desc> layers;
+        for (int i = 0; i < 4; i++) {
+            layers.push_back(desc("blk.0.ffn_gate.weight", 1000, TYPE_Q4_0, 4096, 14336, 1, 1));
+        }
+
+        // (a) Q4_0 token_embd beside a separate Q6_K head: the embedding is gather-only, the head is not a candidate.
+        std::vector<zone_tensor_desc> separate_head = layers;
+        separate_head.push_back(marked("token_embd.weight", TYPE_Q4_0, head_w, true));
+        separate_head.push_back(desc("output.weight", 1000, TYPE_Q6_K, 4096, 32000, 1, 1));
+        const path_scoped_maxima ma = zone_scoped_maxima(separate_head);
+        CHECK(ma.dequant_f16_weight_bytes == 0 && ma.dequant_f16_src1_bytes_per_token == 0,
+              "(a) a gather-only Q4_0 embedding is not planned into the dequant buffers");
+        CHECK(ma.mmq_src1_bytes_per_token == 0, "(a) nor into the Q8_1 src1 buffer");
+
+        // (b) tied: the one token_embd tensor is also the head, so the loader does not call it gather-only.
+        std::vector<zone_tensor_desc> tied = layers;
+        tied.push_back(marked("token_embd.weight", TYPE_Q4_0, head_w, false));
+        const path_scoped_maxima mb = zone_scoped_maxima(tied);
+        CHECK(mb.dequant_f16_weight_bytes == head_w && mb.dequant_f16_src1_bytes_per_token == 4096 * F16_BYTES,
+              "(b) a tied embedding used as the head is planned");
+        CHECK(mb.mmq_src1_bytes_per_token == 4608, "(b) and draws the Q8_1 src1 buffer");
+
+        // (c) a Q4_0 head beside a gather-only Q4_0 embedding: the head alone is the plan.
+        std::vector<zone_tensor_desc> q4_head = layers;
+        q4_head.push_back(marked("token_embd.weight", TYPE_Q4_0, head_w, true));
+        q4_head.push_back(marked("output.weight", TYPE_Q4_0, head_w, false));
+        const path_scoped_maxima mc = zone_scoped_maxima(q4_head);
+        CHECK(mc.dequant_f16_weight_bytes == head_w, "(c) a Q4_0 head is planned");
+
+        // The head's own mark is what carries it: with the head removed, nothing is left to plan.
+        std::vector<zone_tensor_desc> embd_only = layers;
+        embd_only.push_back(marked("token_embd.weight", TYPE_Q4_0, head_w, true));
+        CHECK(zone_scoped_maxima(embd_only).dequant_f16_weight_bytes == 0,
+              "the gather-only embedding alone leaves the plan empty");
+
+        // The unconditional Q8_0 marks are held to the same rule.
+        zone_tensor_desc q8_embd                 = desc("token_embd.weight", 1000, TYPE_Q8_0, 2880, 201088, 1, 1);
+        q8_embd.dequant_f16_weight_bytes         = 1159372800;
+        q8_embd.dequant_f16_src1_bytes_per_token = 2880 * F16_BYTES;
+        q8_embd.get_rows_only                    = true;
+        zone_tensor_desc q8_head                 = q8_embd;
+        q8_head.get_rows_only                    = false;
+        CHECK(zone_scoped_maxima({ q8_embd }).dequant_f16_weight_bytes == 0, "a gather-only Q8_0 embedding is not planned");
+        CHECK(zone_scoped_maxima({ q8_embd, q8_head }).dequant_f16_weight_bytes == 1159372800,
+              "a Q8_0 head beside it still is");
+    }
+
     // ---- Case 14h: the figures a zone is described by outlive a later plan (llama.cpp-8ony) -----------------------
     // A draft model loaded beside the target overwrites the planner's live (bare plan, Graph floor) with its own
     // smaller figures. The arena's zones are found sufficient and kept, so the zone is still the target's: the
