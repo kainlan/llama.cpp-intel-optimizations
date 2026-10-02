@@ -98733,11 +98733,6 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
         sycl_ctx->invalidate_moe_block_graphs();
         return false;
     }
-    if (sycl_ctx->moe_graphs_disabled || sycl_ctx->moe_block_graphs_disabled) {
-        // The gateway's retire failed and disabled MoE graphs: the recorded graphlets are still marked valid.
-        ggml_sycl_moe_aggregation_diag(sycl_ctx, "block-graphlet", "reject", "disabled");
-        return false;
-    }
     graph_refresh_input_tensors(sycl_ctx, cgraph);
 
     try {
@@ -99815,7 +99810,7 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
 // An input's staging buffer was replaced because its size changed (graph_input_stage). Recorded work bakes the
 // staging POINTER, so every recorder that may hold the old one is retired here: the dense range graphs
 // (drop_graphs drains each device it ran on), the MoE epochs (each retire waits for its terminals), and a LIVE exec
-// graph. The displaced handle was already retained on a barrier event at the swap, and the staging map is current,
+// graph. The displaced handle was already retained on a marker event at the swap, and the staging map is current,
 // so nothing is released or re-staged here.
 // Returns false when a MoE epoch could not be retired: that recorder is still marked valid and would replay a graph
 // that baked the freed pointer, so the gateway declines (every caller then runs direct) rather than trust it.
@@ -108049,7 +108044,7 @@ normal_dispatch:
                         // (conservative: a swap is retired at the gateway) and run direct.
                         sycl_ctx->invalidate_moe_segments();
                         compute_impl_unlocked();
-                    } else if (!sycl_ctx->moe_segments_valid || sycl_ctx->moe_graphs_disabled) {
+                    } else if (!sycl_ctx->moe_segments_valid) {
                         // The gateway swapped an input's staging buffer and retired the segments after the match
                         // above was decided: there is nothing recorded to replay. Run this token direct; the next
                         // one records afresh against the new buffer.

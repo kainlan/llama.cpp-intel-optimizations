@@ -6584,12 +6584,13 @@ struct ggml_backend_sycl_context {
         if (slot.handle.valid()) {
             // A replay from the previous token may still read the displaced buffer: hold it until the last work
             // submitted on this queue completes (an event, not a host wait). The event is taken BEFORE the handle
-            // moves, so a throwing submit leaves the entry intact, and it comes from the marker helper that avoids
-            // the Level Zero barrier-event corruption. The recorders that baked the pointer are retired by the
-            // gateway, which consumes the flag.
+            // is touched and retain gets a COPY, so a throwing submit or retain leaves the old entry intact (the
+            // assignment below then drops the map's own reference). The event comes from the marker helper that
+            // avoids the Level Zero barrier-event corruption. The recorders that baked the pointer are retired by
+            // the gateway, which consumes the flag.
             sycl::event retire = ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q);
             graph_input_staging_swapped = true;
-            ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, retire);
+            ggml_sycl::retain_handles_until_event({ slot.handle }, retire);
         }
         slot.handle   = std::move(handle);
         slot.capacity = nbytes;
