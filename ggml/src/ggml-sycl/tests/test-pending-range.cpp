@@ -11,6 +11,16 @@
 //
 // The build is -DNDEBUG, so CHECK is explicit and always runs.
 
+// A TLSF_ASSERT that throws, so the assertion arms of the primitive can be tested.
+struct tlsf_assert_error {};
+
+#define TLSF_ASSERT(cond)              \
+    do {                               \
+        if (!(cond)) {                 \
+            throw tlsf_assert_error{}; \
+        }                              \
+    } while (0)
+
 #include "../pending-range.hpp"
 
 #include <cstdio>
@@ -54,6 +64,30 @@ template <typename Fn> bool misuses(Fn fn) {
     }
     pending_range_misuse_handler() = saved;
     return aborted;
+}
+
+// Run `fn`; true when it tripped a TLSF_ASSERT.
+template <typename Fn> bool asserts(Fn fn) {
+    try {
+        fn();
+    } catch (const tlsf_assert_error &) {
+        return true;
+    }
+    return false;
+}
+
+// Run `fn`; the misuse line it aborted with, or "" when it did not abort.
+template <typename Fn> std::string misuse_line_of(Fn fn) {
+    pending_range_misuse_fn saved  = pending_range_misuse_handler();
+    pending_range_misuse_handler() = throwing_handler;
+    std::string line;
+    try {
+        fn();
+    } catch (const misuse_error & e) {
+        line = e.what();
+    }
+    pending_range_misuse_handler() = saved;
+    return line;
 }
 
 pending_owner load_of(uint64_t id) {
@@ -308,15 +342,217 @@ void case_keyed_draw() {
     // The refusals changed nothing: the free part of the WEIGHT range is what the two draws left.
     CHECK(s.free_bytes(t, o, pending_term_bit(pending_term::WEIGHT)) == 3 * MB + MB, "refusals consume nothing");
     CHECK(count_of(s, o, pending_term::WEIGHT) == 2, "and trim nothing");
-    // A key whose bytes straddle two of the owner's adjacent ranges is covered by their union.
-    pending_range_set u;
-    tlsf_allocator    t2(16 * MB);
-    u.record(ctx_of(1), pending_term::REGION, 0, 2 * MB);
-    u.record(ctx_of(1), pending_term::REGION, 2 * MB, 2 * MB);
-    CHECK(u.allocate_within(t2, ctx_of(1), pending_term::REGION, 3 * MB, 256, 0, false).status ==
-              pending_within_status::MISS,
-          "first fit does not span two ranges' free parts that are separate records");
-    check_ok(t2, "keyed union");
+}
+
+// Adjacent records of one owner and term are not coalesced.  A first-fit draw lies inside ONE
+// record, so it misses a size that only the two together hold, while free_bytes() counts both; the
+// keyed form names its bytes and reads the union of the owner's ranges.
+void case_adjacent_ranges() {
+    pending_range_set   u;
+    tlsf_allocator      t(16 * MB);
+    const pending_owner m = model_of(1);
+    u.record(m, pending_term::WEIGHT, 0, 2 * MB);
+    u.record(m, pending_term::WEIGHT, 2 * MB, 2 * MB);
+    CHECK(u.free_bytes(t, m, pending_term_bit(pending_term::WEIGHT)) == 4 * MB, "free_bytes counts both records");
+    CHECK(u.allocate_within(t, m, pending_term::WEIGHT, 3 * MB, 256, 0, false).status == pending_within_status::MISS,
+          "a first-fit draw does not span two records");
+    CHECK(t.used() == 0, "and the miss carved nothing");
+    const pending_within_result k = u.allocate_within_keyed(t, m, { MB, 2 * MB }, 2 * MB, 7);
+    CHECK(k.ok() && k.offset == MB, "a keyed draw straddling the two records is covered by their union");
+    CHECK(u.free_bytes(t, m, pending_term_bit(pending_term::WEIGHT)) == 2 * MB, "and consumes the bytes from both");
+    check_ok(t, "adjacent ranges");
+}
+
+// The carve rounds the key to the grain, so the range test must too (I1): a 300-byte key in a
+// 300-byte range would carve 512 bytes and swallow the next owner's room.
+void case_keyed_rounding_and_refusals() {
+    pending_range_set   s;
+    tlsf_allocator      t(16 * MB);
+    const pending_owner o = load_of(1);
+    s.record(o, pending_term::WEIGHT, 0, 300);
+    s.record(ctx_of(2), pending_term::REGION, 300, 212);
+    CHECK(s.allocate_within_keyed(t, o, { 0, 300 }, 300, 7).status == pending_within_status::KEY_OUTSIDE_RANGE,
+          "a key whose rounded extent leaves the owner's range is refused");
+    CHECK(t.used() == 0, "the refusal carved nothing");
+    CHECK(count_of(s, ctx_of(2), pending_term::REGION) == 1 && s.all()[1].size == 212, "the foreign range is whole");
+    s.record(o, pending_term::WEIGHT, 0, 512);
+    const pending_within_result fit = s.allocate_within_keyed(t, o, { 0, 300 }, 300, 7);
+    CHECK(fit.ok() && fit.offset == 0 && t.block_size_at(0) == 512, "a range that holds the rounded extent serves it");
+    check_ok(t, "keyed rounding");
+
+    CHECK(s.allocate_within_keyed(t, o, { 2 * K, 0 }, 0, 7).status == pending_within_status::ZERO_SIZE,
+          "a zero-size key is its own result");
+    pending_range_set g;
+    g.record(model_of(3), pending_term::WEIGHT, 0, K);
+    CHECK(g.allocate_within_keyed(t, model_of(3), { 100, 256 }, 256, 7).status == pending_within_status::KEY_OFF_GRAIN,
+          "an off-grain key offset is its own result, not KEY_OCCUPIED");
+    CHECK(g.allocate_within_keyed(t, model_of(3), { 0, SIZE_MAX }, SIZE_MAX, 7).status ==
+              pending_within_status::SIZE_OVERFLOW,
+          "a key whose rounding wraps is its own result");
+    CHECK(g.allocate_within_keyed(t, model_of(3), { 256, SIZE_MAX - 300 }, SIZE_MAX - 300, 7).status ==
+              pending_within_status::SIZE_OVERFLOW,
+          "a key whose end wraps is its own result");
+    CHECK(count_of(g, model_of(3), pending_term::WEIGHT) == 1, "none of them trimmed the range");
+
+    // covered_by is byte for byte: a gap smaller than the grain between two ranges is a gap.
+    pending_range_set   h;
+    tlsf_allocator      t2(16 * K);
+    const pending_owner m = model_of(4);
+    h.record(m, pending_term::WEIGHT, 0, 1000);
+    h.record(m, pending_term::WEIGHT, 1100, 948);
+    CHECK(h.allocate_within_keyed(t2, m, { 0, 2048 }, 2048, 7).status == pending_within_status::KEY_OUTSIDE_RANGE,
+          "a 100-byte gap between two ranges is not covered");
+    CHECK(t2.used() == 0, "and nothing was carved");
+    check_ok(t2, "gap");
+}
+
+// A draw of nothing and a draw that wraps are not plan misses (M5), and an alignment above the
+// grain is a defect rather than a silent clamp (M1).
+void case_allocate_within_bad_requests() {
+    pending_range_set   s;
+    tlsf_allocator      t(16 * MB);
+    const pending_owner o = ctx_of(1);
+    s.record(o, pending_term::REGION, 0, 4 * MB);
+    CHECK(s.allocate_within(t, o, pending_term::REGION, 0, 256, 0, true).status == pending_within_status::ZERO_SIZE,
+          "a zero-size draw");
+    CHECK(s.allocate_within(t, o, pending_term::REGION, SIZE_MAX, 256, 0, true).status ==
+              pending_within_status::SIZE_OVERFLOW,
+          "a size that wraps");
+    CHECK(s.allocate_within(t, o, pending_term::REGION, 5 * MB, 256, 0, true).status == pending_within_status::MISS,
+          "a plain miss is still a miss");
+    CHECK(asserts([&] { s.allocate_within(t, o, pending_term::REGION, MB, 4096, 0, true); }),
+          "an alignment above the grain asserts");
+    CHECK(t.used() == 0 && count_of(s, o, pending_term::REGION) == 1, "none of them drew or trimmed");
+}
+
+// The misuse line names the operation that aborted, so the abort line alone locates it (M4);
+// the accounting reads apply the same filter rules as the fit reads (M2).
+void case_misuse_names_the_operation() {
+    pending_range_set s;
+    tlsf_allocator    t(16 * MB);
+    s.record(ctx_of(1), pending_term::REGION, 0, 4 * K);
+    CHECK(misuse_line_of([&] { s.clear(pending_owner{}, 1); }).find("clear") == 0, "clear names itself");
+    CHECK(misuse_line_of([&] { s.ranges(ctx_of(1), 0); }).find("ranges") == 0, "ranges names itself");
+    CHECK(misuse_line_of([&] { s.retag(ctx_of(1), 1, pending_owner{}); }).find("retag target") == 0,
+          "a NONE retag target names itself");
+    CHECK(misuse_line_of([&] {
+              s.allocate_within(t, pending_owner{}, pending_term::REGION, K, 256, 0, true);
+          }).find("allocate_within") == 0,
+          "allocate_within names itself");
+    CHECK(misuse_line_of([&] {
+              s.allocate_within_keyed(t, pending_owner{}, { 0, K }, K, 0);
+          }).find("allocate_within_keyed") == 0,
+          "the keyed draw names itself");
+    CHECK(misuse_line_of([&] {
+              s.replace_within_block(t, pending_owner{}, pending_term::WEIGHT, 0, 0, K, 0, 0);
+          }).find("replace_within_block") == 0,
+          "replace_within_block names itself");
+    CHECK(misuse_line_of([&] { s.record(ctx_of(1), pending_term::REGION, SIZE_MAX - 10, 100); }).find("record") == 0,
+          "a wrapping record aborts and names itself");
+    CHECK(count_of(s, ctx_of(1), pending_term::REGION) == 1, "the wrapping record left the set alone");
+
+    CHECK(misuses([&] { s.free_bytes(t, ctx_of(1), 0); }), "free_bytes with an empty filter is a defect");
+    CHECK(misuses([&] { s.free_bytes(t, ctx_of(1), PENDING_TERM_ALL); }),
+          "free_bytes with PENDING_TERM_ALL under a CONTEXT owner is a defect");
+    CHECK(misuses([&] { s.free_bytes(t, pending_owner{}, 1); }), "free_bytes for owner NONE is a defect");
+    CHECK(!misuses([&] { s.free_bytes(t, load_of(1), PENDING_TERM_ALL); }),
+          "free_bytes under a LOAD owner may name ALL");
+    const std::vector<pending_range_member> none;
+    CHECK(misuses([&] { pending_bytes(none, ctx_of(1), 0); }), "pending_bytes with an empty filter is a defect");
+    CHECK(misuses([&] { pending_bytes(none, ctx_of(1), PENDING_TERM_ALL); }),
+          "pending_bytes with PENDING_TERM_ALL under a CONTEXT owner is a defect, even over no members");
+    CHECK(misuses([&] { pending_bytes(none, pending_owner{}, 1); }), "pending_bytes for owner NONE is a defect");
+    CHECK(pending_bytes(none, load_of(1), PENDING_TERM_ALL) == 0, "and a LOAD owner may name ALL");
+}
+
+// retag and ranges accept PENDING_TERM_ALL under a LOAD owner, like clear; a retag target of owner
+// NONE is refused.
+void case_all_under_load_and_retag_target() {
+    pending_range_set s;
+    s.record(load_of(1), pending_term::WEIGHT, 0, 4 * K);
+    s.record(load_of(1), pending_term::SCRATCH, 8 * K, 4 * K);
+    CHECK(!misuses([&] { s.ranges(load_of(1), PENDING_TERM_ALL); }), "ranges may name ALL under a LOAD owner");
+    CHECK(s.ranges(load_of(1), PENDING_TERM_ALL).size() == 2, "and returns every term");
+    CHECK(misuses([&] { s.retag(load_of(1), pending_term_bit(pending_term::WEIGHT), pending_owner{}); }),
+          "a retag to owner NONE is a defect");
+    CHECK(count_of(s, load_of(1), pending_term::WEIGHT) == 1, "and moved nothing");
+    CHECK(!misuses([&] { s.retag(load_of(1), PENDING_TERM_ALL, model_of(1)); }),
+          "retag may name ALL under a LOAD owner");
+    CHECK(s.ranges(model_of(1), pending_term::WEIGHT | pending_term::SCRATCH).size() == 2,
+          "retag with ALL moved both terms");
+}
+
+// allocate_excluding's caller contract (M7) and its zero-size excluded range.
+void case_excluding_caller_contract() {
+    tlsf_allocator t(16 * MB);
+    using R = tlsf_allocator::excluded_range;
+    CHECK(asserts([&] {
+              t.allocate_excluding(
+                  {
+                      R{ 4096, SIZE_MAX }
+              },
+                  K, 256, 1);
+          }),
+          "an excluded range whose end wraps asserts");
+    CHECK(t.used() == 0, "and allocated nothing");
+    CHECK(t.allocate_excluding(
+              {
+                  R{ 256, 0 }
+    },
+              1024, 256, 1) == 0,
+          "a zero-size excluded range excludes nothing");
+    CHECK(t.allocate_excluding(
+              {
+                  R{ SIZE_MAX - 100, 100 }
+    },
+              K, 256, 1) == K,
+          "a range ending at the top of the address space excludes only itself");
+    check_ok(t, "excluding contract");
+}
+
+// The pieces of an off-grain region (I2): a tail block that absorbed a sub-grain remainder is
+// restored at its recorded extent, and a replace whose rest is that tail carves it exactly.
+void case_replace_off_grain_tail() {
+    {
+        // The carve fails (the new range reaches past the region end) and old comes back whole.
+        pending_range_set   s;
+        tlsf_allocator      t(1000);
+        const pending_owner o   = model_of(1);
+        const size_t        old = t.allocate_at(0, 768, 3);
+        CHECK(old == 0 && t.block_size_at(0) == 1000, "old is a tail block that absorbed the 232-byte remainder");
+        s.record(o, pending_term::WEIGHT, 0, 1024);
+        const pending_replace_result r = s.replace_within_block(t, o, pending_term::WEIGHT, 0, 256, 768, 4, 6);
+        CHECK(r.status == pending_replace_status::CARVE_FAILED, "the carve past the region end fails without aborting");
+        CHECK(t.block_size_at(0) == 1000 && t.tag_at(0) == 3 && t.used() == 1000, "old is back at its exact extent");
+        CHECK(s.all().size() == 1 && s.all()[0].offset == 0 && s.all()[0].size == 1024, "the record is untouched");
+        check_ok(t, "off-grain restore");
+    }
+    {
+        // A new range whose rounded end wraps the address space is refused before anything is released.
+        pending_range_set   s;
+        tlsf_allocator      t(16 * MB);
+        const pending_owner o   = ctx_of(1);
+        const size_t        old = t.allocate_at(4 * MB, MB, 3);
+        s.record(o, pending_term::ONEDNN_PP_A, 4 * MB, MB);
+        const size_t top = SIZE_MAX - 255;  // on the grain
+        CHECK(s.replace_within_block(t, o, pending_term::ONEDNN_PP_A, old, top, 512, 4, 6).status ==
+                  pending_replace_status::OUTSIDE_RANGE,
+              "a new range that wraps is outside every range");
+        CHECK(t.block_size_at(4 * MB) == MB && t.tag_at(4 * MB) == 3, "and old was never released");
+    }
+    {
+        // Another term: the rest is the 488-byte tail, carved as one remainder block of its exact extent.
+        pending_range_set   s;
+        tlsf_allocator      t(1000);
+        const pending_owner o   = ctx_of(1);
+        const size_t        old = t.allocate_at(0, 768, 3);
+        s.record(o, pending_term::ONEDNN_PP_A, 0, 1000);
+        const pending_replace_result r = s.replace_within_block(t, o, pending_term::ONEDNN_PP_A, old, 0, 512, 4, 6);
+        CHECK(r.ok() && r.new_offset == 0 && t.block_size_at(0) == 512, "the new block is the front 512 bytes");
+        CHECK(r.remainder_offset == 512 && r.remainder_size == 488 && t.block_size_at(512) == 488 && t.tag_at(512) == 6,
+              "the rest is one remainder block of the tail's exact extent");
+        check_ok(t, "off-grain rest");
+    }
 }
 
 // ---- other allocators honour the ranges --------------------------------------
@@ -475,10 +711,6 @@ void case_replace_remainder_mode() {
           "the fragments are exactly before and after the new block, untrimmed");
     CHECK(s.free_bytes(t, o, pending_term_bit(pending_term::WEIGHT)) == 6 * MB, "and they are free bytes");
     // Another owner's allocation of a fragment's size cannot take either.
-    pending_range_set others;
-    for (const pending_range & f : rest) {
-        others.record(model_of(1), pending_term::WEIGHT, f.offset, f.size);
-    }
     const size_t foreign = t.allocate_excluding(s.as_excluded(), 2 * MB, 256, 9);
     CHECK(foreign != SIZE_MAX && (foreign + 2 * MB <= 8 * MB || foreign >= 16 * MB),
           "another owner's allocation lands outside both fragments");
@@ -536,6 +768,12 @@ int main() {
     case_allocate_within_miss();
     case_allocate_within_term_isolation();
     case_keyed_draw();
+    case_adjacent_ranges();
+    case_keyed_rounding_and_refusals();
+    case_allocate_within_bad_requests();
+    case_misuse_names_the_operation();
+    case_all_under_load_and_retag_target();
+    case_excluding_caller_contract();
     case_others_honour_ranges();
     case_device_wide_queries();
     case_replace_empty_rest();
@@ -543,6 +781,7 @@ int main() {
     case_replace_failed_carve_restores_old();
     case_replace_remainder_mode();
     case_replace_other_term_rest();
+    case_replace_off_grain_tail();
     std::printf("test-pending-range: all cases passed\n");
     return 0;
 }

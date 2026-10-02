@@ -118,6 +118,14 @@ inline pending_range_misuse_fn & pending_range_misuse_handler() {
         std::abort(); /* a handler that returns is a bug */ \
     } while (0)
 
+// The same, with the operation's name in front: the abort line is the only diagnostic.
+#define PENDING_RANGE_MISUSE_IN(op, detail)                                    \
+    do {                                                                       \
+        char misuse_line[192];                                                 \
+        std::snprintf(misuse_line, sizeof(misuse_line), "%s: %s", op, detail); \
+        PENDING_RANGE_MISUSE(misuse_line);                                     \
+    } while (0)
+
 // A half-open interval, for the geometry below.
 struct pending_extent {
     size_t offset = 0;
@@ -133,6 +141,9 @@ enum class pending_within_status : uint8_t {
     KEY_SIZE_MISMATCH,  // a keyed draw whose size differs from its key's
     KEY_OUTSIDE_RANGE,  // the key is not inside one of the owner's ranges of that term
     KEY_OCCUPIED,       // the keyed range is not free
+    ZERO_SIZE,          // a draw of no bytes: a caller bug, not a plan miss
+    SIZE_OVERFLOW,      // a size (or key) whose grain rounding wraps the address space
+    KEY_OFF_GRAIN,      // the key's offset is not on the block grain
 };
 
 struct pending_within_result {
@@ -142,9 +153,8 @@ struct pending_within_result {
     bool ok() const { return status == pending_within_status::OK; }
 };
 
-// The placement a load's replay recorded for one WEIGHT item.  The TLSF is the
-// one the caller already holds; the tuple's TLSF component is its choice of
-// which set to call this on.
+// The placement a load's replay recorded for one WEIGHT item.  It names no TLSF:
+// the caller draws on the TLSF it already holds, with the set recorded on it.
 struct pending_key {
     size_t offset = 0;
     size_t size   = 0;
@@ -179,7 +189,7 @@ class pending_range_set {
     void record(pending_owner owner, pending_term term, size_t offset, size_t size) {
         require_owner(owner, "record");
         if (offset > SIZE_MAX - size) {
-            PENDING_RANGE_MISUSE("record: the range wraps");
+            PENDING_RANGE_MISUSE_IN("record", "the range wraps the address space");
         }
         const bool replaces = owner.kind == pending_owner_kind::LOAD ||
                               (owner.kind == pending_owner_kind::DEVICE && term == pending_term::VM_TAIL_SURPLUS);
@@ -241,6 +251,8 @@ class pending_range_set {
     // bytes of those ranges not occupied by an allocated block.  A scalar for
     // accounting; a fit places by the ranges, not by this number.
     size_t free_bytes(const tlsf_allocator & tlsf, pending_owner owner, pending_term_mask filter) const {
+        require_owner(owner, "free_bytes");
+        require_filter(owner, filter, "free_bytes");
         return free_bytes_where(
             tlsf, [&](const pending_range & r) { return r.owner == owner && (pending_term_bit(r.term) & filter); });
     }
@@ -274,6 +286,12 @@ class pending_range_set {
     //   consume == true (weights): the carved part leaves the record.
     // The term keeps a weight draw out of a SCRATCH hold of the same owner and
     // the reverse.  A miss is reported, never retried outside the ranges.
+    // A draw lies inside ONE recorded range: two adjacent records of one owner
+    // and term are not coalesced here, so free_bytes() can report room that no
+    // single draw holds.  The keyed form, which names its bytes, does read the
+    // union of the owner's ranges.  A zero size and a size whose rounding wraps
+    // are reported as such (ZERO_SIZE, SIZE_OVERFLOW), apart from a MISS.  An
+    // alignment over the grain aborts, as it does in the allocator.
     pending_within_result allocate_within(tlsf_allocator & tlsf,
                                           pending_owner    owner,
                                           pending_term     term,
@@ -283,13 +301,12 @@ class pending_range_set {
                                           bool             consume) {
         require_owner(owner, "allocate_within");
         if (size == 0) {
-            return {};
+            return { pending_within_status::ZERO_SIZE, SIZE_MAX };
         }
-        const size_t granularity = alignment > tlsf_allocator::block_grain ? alignment : tlsf_allocator::block_grain;
-        if (size > SIZE_MAX - granularity) {
-            return {};
+        size = tlsf_allocator::round_request(size, alignment);
+        if (size == 0) {
+            return { pending_within_status::SIZE_OVERFLOW, SIZE_MAX };
         }
-        size = (size + granularity - 1) & ~(granularity - 1);
 
         std::vector<pending_range> mine = ranges(owner, pending_term_bit(term));
         std::sort(mine.begin(), mine.end(),
@@ -324,7 +341,12 @@ class pending_range_set {
     // key.size) inside the owner's WEIGHT range, consuming it.  There is no
     // first fit, so the order draws arrive in cannot move an item.  A draw
     // whose size differs from its key's, a key outside the owner's ranges, and
-    // an occupied key are each a distinct plan bug, never a fall-through.
+    // an occupied key are each a distinct plan bug, never a fall-through.  The
+    // key's size is rounded to the grain before it is tested against the
+    // ranges, as the carve rounds it: a range that holds the unrounded bytes
+    // but not the rounded ones would let the carve take another owner's room.
+    // A zero size, a size that wraps and an off-grain offset are refused apart
+    // from the plan-bug results.
     pending_within_result allocate_within_keyed(tlsf_allocator & tlsf,
                                                 pending_owner    owner,
                                                 pending_key      key,
@@ -334,7 +356,17 @@ class pending_range_set {
         if (size != key.size) {
             return { pending_within_status::KEY_SIZE_MISMATCH, SIZE_MAX };
         }
-        if (!covered_by(ranges(owner, pending_term_bit(pending_term::WEIGHT)), {}, key.offset, key.size)) {
+        if (size == 0) {
+            return { pending_within_status::ZERO_SIZE, SIZE_MAX };
+        }
+        const size_t rounded = tlsf_allocator::round_request(size, tlsf_allocator::block_grain);
+        if (rounded == 0 || key.offset > SIZE_MAX - rounded) {
+            return { pending_within_status::SIZE_OVERFLOW, SIZE_MAX };
+        }
+        if (key.offset % tlsf_allocator::block_grain != 0) {
+            return { pending_within_status::KEY_OFF_GRAIN, SIZE_MAX };
+        }
+        if (!covered_by(ranges(owner, pending_term_bit(pending_term::WEIGHT)), {}, key.offset, rounded)) {
             return { pending_within_status::KEY_OUTSIDE_RANGE, SIZE_MAX };
         }
         const size_t got = tlsf.allocate_at(key.offset, key.size, tag);
@@ -363,6 +395,11 @@ class pending_range_set {
     // returns CARVE_FAILED; every refusal before the release changes nothing.
     // The handle half (classifying `old`'s other references, retiring its
     // registration, the HOST_TIER refusal) is the caller's.
+    // A requirement on that handle half (23mk S4a): this core frees `old`
+    // unconditionally and nothing in it counts `old`'s references, so when the
+    // handle-level replace_within lands it must carry an L-CALLER-style latch
+    // that limits the callers of replace_within_block to replace_within and
+    // tests.
     pending_replace_result replace_within_block(tlsf_allocator & tlsf,
                                                 pending_owner    owner,
                                                 pending_term     term,
@@ -378,13 +415,13 @@ class pending_range_set {
             out.status = pending_replace_status::OLD_NOT_FOUND;
             return out;
         }
-        if (new_size == 0 || new_size > SIZE_MAX - tlsf_allocator::block_grain ||
-            new_offset > SIZE_MAX - new_size - tlsf_allocator::block_grain) {
+        const size_t rounded_new = tlsf_allocator::round_request(new_size, tlsf_allocator::block_grain);
+        if (rounded_new == 0 || new_offset > SIZE_MAX - rounded_new) {
             out.status = pending_replace_status::OUTSIDE_RANGE;
             return out;
         }
-        const uint8_t old_tag = tlsf.tag_at(old_offset);
-        new_size              = (new_size + tlsf_allocator::block_grain - 1) & ~(tlsf_allocator::block_grain - 1);
+        const uint8_t old_tag                    = tlsf.tag_at(old_offset);
+        new_size                                 = rounded_new;
         const size_t                     old_end = old_offset + old_size;
         const size_t                     new_end = new_offset + new_size;
         const std::vector<pending_range> mine    = ranges(owner, pending_term_bit(term));
@@ -408,7 +445,9 @@ class pending_range_set {
         tlsf.free(old_offset);
         const size_t got = tlsf.allocate_at(new_offset, new_size, tag);
         if (got == SIZE_MAX) {
-            const size_t back = tlsf.allocate_at(old_offset, old_size, old_tag);
+            // old's recorded extent goes back as it was: allocate_at() would round a tail block that
+            // absorbed a sub-grain remainder up past the region end.
+            const size_t back = tlsf.allocate_extent_at(old_offset, old_size, old_tag);
             TLSF_ASSERT(back == old_offset && "replace_within_block could not restore the block it released");
             out.status = pending_replace_status::CARVE_FAILED;
             return out;
@@ -416,14 +455,12 @@ class pending_range_set {
         size_t       rest_offset = SIZE_MAX;
         const size_t rest_size   = before != 0 ? before : after;
         if (term != pending_term::WEIGHT && rest_size != 0) {
-            rest_offset = before != 0 ? before_lo : after_lo;
-            if (tlsf.allocate_at(rest_offset, rest_size, remainder_tag) == SIZE_MAX) {
-                tlsf.free(got);
-                const size_t back = tlsf.allocate_at(old_offset, old_size, old_tag);
-                TLSF_ASSERT(back == old_offset && "replace_within_block could not restore the block it released");
-                out.status = pending_replace_status::CARVE_FAILED;
-                return out;
-            }
+            rest_offset           = before != 0 ? before_lo : after_lo;
+            // The rest lies inside old's freed extent and outside the new block, so it is free by
+            // construction; its extent is taken exactly (a tail rest may end off the grain).
+            const size_t rest_got = tlsf.allocate_extent_at(rest_offset, rest_size, remainder_tag);
+            TLSF_ASSERT(rest_got == rest_offset &&
+                        "replace_within_block could not carve the rest of the block it freed");
         }
         trim(owner, term, got, tlsf.block_size_at(got));
         if (term == pending_term::WEIGHT) {
@@ -446,23 +483,24 @@ class pending_range_set {
         return out;
     }
 
-  private:
-    std::vector<pending_range> ranges_;
-
-    static void require_owner(pending_owner owner, const char *) {
+    // The misuse checks, public so the device-wide queries apply the same rules.
+    static void require_owner(pending_owner owner, const char * op) {
         if (owner.kind == pending_owner_kind::NONE) {
-            PENDING_RANGE_MISUSE("an operation named owner kind NONE, which matches no range");
+            PENDING_RANGE_MISUSE_IN(op, "an operation named owner kind NONE, which matches no range");
         }
     }
 
-    static void require_filter(pending_owner owner, pending_term_mask filter, const char *) {
+    static void require_filter(pending_owner owner, pending_term_mask filter, const char * op) {
         if (filter == 0) {
-            PENDING_RANGE_MISUSE("an operation named an empty term filter");
+            PENDING_RANGE_MISUSE_IN(op, "an operation named an empty term filter");
         }
         if (filter == PENDING_TERM_ALL && owner.kind != pending_owner_kind::LOAD) {
-            PENDING_RANGE_MISUSE("PENDING_TERM_ALL is legal only under a {LOAD, txn} owner");
+            PENDING_RANGE_MISUSE_IN(op, "PENDING_TERM_ALL is legal only under a {LOAD, txn} owner");
         }
     }
+
+  private:
+    std::vector<pending_range> ranges_;
 
     template <typename Pred> size_t erase_if(Pred pred) {
         const size_t before = ranges_.size();
@@ -568,6 +606,8 @@ struct pending_range_member {
 inline size_t pending_bytes(const std::vector<pending_range_member> & members,
                             pending_owner                             owner,
                             pending_term_mask                         filter) {
+    pending_range_set::require_owner(owner, "pending_bytes");
+    pending_range_set::require_filter(owner, filter, "pending_bytes");
     size_t total = 0;
     for (const pending_range_member & m : members) {
         total += m.set->free_bytes(*m.tlsf, owner, filter);
