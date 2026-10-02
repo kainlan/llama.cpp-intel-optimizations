@@ -283,6 +283,27 @@ extern int               g_ggml_sycl_tp_debug;  // Tensor Parallelism debug outp
 extern int               g_ggml_sycl_prioritize_dmmv;
 extern std::atomic<bool> g_ggml_sycl_debug_forced_off;
 
+// The get_scratchpad_mem call sites that decide a declined scratchpad themselves (llama.cpp-23mk S3-3): the three
+// oneDNN wrappers in dnnl-ops.hpp. The PRIVATE_TESTING seam counts the calls that carry a site and can force a
+// decline on the Nth (ggml_sycl_test_inject_scratchpad_decline, ggml-sycl.h); the ordinary build compiles the hook
+// to false. The other consumers get a tag with the std::optional return (S3-2).
+enum ggml_sycl_scratchpad_site : int {
+    GGML_SYCL_SCRATCHPAD_SITE_DNNL_SOFTMAX = 0,
+    GGML_SYCL_SCRATCHPAD_SITE_DNNL_ELTWISE,
+    GGML_SYCL_SCRATCHPAD_SITE_DNNL_BINARY_ROW,
+    GGML_SYCL_SCRATCHPAD_SITE_COUNT,
+};
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site site);
+#else
+constexpr bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site) {
+    return false;
+}
+#endif
+// Called by a wrapper once it has decided not to decline: it counts under the seam and, once per site per process,
+// says so at WARN when the SYCL debug switch is on (GGML_BACKEND_DEBUG=sycl), since INFO is dropped by default.
+void ggml_sycl_dnnl_note_engaged(ggml_sycl_scratchpad_site site);
+
 // Track when SYCL graph recording is active
 extern thread_local bool g_ggml_sycl_graph_recording;
 extern thread_local bool g_moe_descriptor_dispatch_graph_recording_active;

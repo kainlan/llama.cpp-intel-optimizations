@@ -17,6 +17,19 @@
 // Forward declaration
 struct ggml_backend_sycl_context;
 
+// True when the scratchpad request was declined and the wrapper must return false before it writes anything. The seam
+// hook comes first so that it reaches a wrapper whose scratchpad is 0 B, which every family measured so far is.
+[[nodiscard]] inline bool ggml_sycl_scratchpad_declined(
+    ggml_sycl_scratchpad_site site,
+    const dnnl::memory & scratchpad_mem,
+    const dnnl::memory::desc & scratchpad_md)
+{
+    if (ggml_sycl_scratchpad_site_hook(site)) {
+        return true;
+    }
+    return scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0;
+}
+
 //
 // DnnlSoftmaxWrapper - Softmax primitive using oneDNN
 //
@@ -66,9 +79,10 @@ public:
         // a decline after it would hand the fallback an input that is already scaled.
         auto scratchpad_md = softmax_pd.scratchpad_desc();
         auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
-        if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {
+        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_SOFTMAX, scratchpad_mem, scratchpad_md)) {
             return false;
         }
+        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_SOFTMAX);
 
         // Pre-scale: oneDNN softmax has no built-in pre-op, so when scale != 1.0
         // we write scaled input into dst via SYCL kernel, then softmax in-place.
@@ -185,9 +199,10 @@ public:
 
         auto scratchpad_md = eltwise_pd.scratchpad_desc();
         auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
-        if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {
+        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_ELTWISE, scratchpad_mem, scratchpad_md)) {
             return false;
         }
+        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_ELTWISE);
 
         auto src_mem = dnnl::memory(md, eng, const_cast<void*>(src));
         auto dst_mem = dnnl::memory(md, eng, dst);
@@ -282,9 +297,10 @@ public:
 
         auto scratchpad_md  = binary_pd.scratchpad_desc();
         auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
-        if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {
+        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_BINARY_ROW, scratchpad_mem, scratchpad_md)) {
             return false;
         }
+        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_BINARY_ROW);
 
         auto src0_mem = dnnl::memory(src0_md, eng, const_cast<void *>(src0));
         auto src1_mem = dnnl::memory(src1_md, eng, const_cast<void *>(src1));
