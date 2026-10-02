@@ -760,6 +760,56 @@ int main() {
         ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 1, 1, 2, 2, nullptr, nullptr);
     }
 
+    // ---- Case 14c: the oneDNN scratch supplies an op only when its type is enabled too (llama.cpp-8ony r1) -----
+    // acquire_onednn_pp_scratch also turns away every type but Q4_0 / Q8_0 / MXFP4 (unless the env var forces it),
+    // and every type under GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH=0. The graph-entry walk skipped an op on admission
+    // plus plan alone, so a Q6_K op (Qwen3.5-9B-UD-Q6_K_XL, Mistral Q4_K_M) was skipped by the walk and refused by
+    // acquire, then drew a planned dequant buffer nothing had sized.
+    {
+        const size_t zone_256mib = 256u * 1024u * 1024u;
+        const size_t attn_w      = 23592960;
+        const size_t attn_a      = 2949120;
+
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_type_enabled(-1, true), "unset: Q4_0 / Q8_0 / MXFP4 are enabled");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_type_enabled(-1, false), "unset: a K-quant type is not enabled");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_type_enabled(0, true), "=0 turns the scratch off for every type");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_type_enabled(0, false), "=0: a K-quant stays off");
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_type_enabled(1, false), "=1 enables a K-quant type too");
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_type_enabled(1, true), "=1 keeps the default types on");
+
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_supplies(true, true, true, zone_256mib, attn_w, attn_a),
+              "an admitted, enabled, planned op is supplied by the scratch");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(true, false, true, zone_256mib, attn_w, attn_a),
+              "an op whose type is not enabled is NOT supplied, so the walk must size its planned dequant buffers");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(true, false, false, 0, attn_w, attn_a),
+              "type refusal holds with no arena too");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(false, true, true, zone_256mib, attn_w, attn_a),
+              "an op that fails the PP admission is not supplied");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(true, true, true, zone_256mib, 1158266880, 1474560),
+              "an enabled op whose pair is over the zone is not supplied");
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_supplies(true, true, true, 100, 60, 40),
+              "a pair that exactly fills the zone is supplied");
+    }
+
+    // ---- Case 14d: the unified kernel's oneDNN f16 route draws the planned dequant buffers (llama.cpp-8ony r1) ----
+    // A Q4_0 / MXFP4 dense op the unified kernel serves, outside a layer group (an LM head or tied embedding) with
+    // a pair over the ONEDNN zone: acquire refuses it, the route fell back to a per-op pool copy of the whole
+    // weight, and the walk never counted it (a unified-served node was "not counted").
+    {
+        CHECK(ggml_sycl::zone_unified_pp_draws_dequant(true, true, true, true, false),
+              "an over-zone unified-served op draws the planned dequant buffers");
+        CHECK(!ggml_sycl::zone_unified_pp_draws_dequant(true, true, true, true, true),
+              "a unified-served op the scratch supplies draws nothing from them");
+        CHECK(!ggml_sycl::zone_unified_pp_draws_dequant(false, true, true, true, false),
+              "a node the router did not send to the unified kernel is the legacy route's business");
+        CHECK(!ggml_sycl::zone_unified_pp_draws_dequant(true, false, true, true, false),
+              "a type the unified kernel does not serve never reaches its oneDNN f16 route");
+        CHECK(!ggml_sycl::zone_unified_pp_draws_dequant(true, true, false, true, false),
+              "a non-plain src1 skips the unified route's f16 arm");
+        CHECK(!ggml_sycl::zone_unified_pp_draws_dequant(true, true, true, false, false),
+              "an op that fails the PP admission never takes the f16 arm");
+    }
+
     // ---- Case 14: the planned dense scratch is ONE reservation that follows the runtime n_ubatch (llama.cpp-kpjw) --
     // B70, full card, Qwen3.6-27B perplexity (-c 512 gives n_ctx 2048 with 4 sequences, n_batch 2048): the plan was
     // sized at the load-time n_ubatch (512, 10027264 B), auto-ubatch then chose 2048 (40108288 B), and the compute

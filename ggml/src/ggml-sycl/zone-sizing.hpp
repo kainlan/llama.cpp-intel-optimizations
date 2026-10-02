@@ -283,6 +283,38 @@ void zone_onednn_scratch_reserve_target(bool    arena_active,
                                         size_t * weights_bytes,
                                         size_t * activations_bytes);
 
+// Whether the oneDNN PP scratch is allowed to supply a dense op's f16 copies at all, as a function of the
+// GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH setting and the weight's type (llama.cpp-8ony r1). `env_mode` is the parsed
+// variable: negative when unset, 0 when it turns the scratch off, positive when it turns it on for every type.
+// `default_type` is the type's default (Q4_0, Q8_0 and MXFP4). Unset, only the default types are supplied; set to
+// 0, none; set non-zero, all. Pure.
+bool zone_onednn_pp_scratch_type_enabled(int env_mode, bool default_type);
+
+// "The oneDNN PP scratch supplies this op's f16 copies": the op passes the PP admission, the scratch is enabled for
+// its type, and the pair is planned into the ONEDNN zone (zone_onednn_pp_scratch_planned). This is the ONE question
+// the op arm, acquire_onednn_pp_scratch and the graph-entry walk must answer the same way: an op the scratch does
+// not supply draws the planned dequant buffers, and the walk sizes those only for the ops it also says are not
+// supplied (a K-quant weight, or any op under UNIFIED_SCRATCH=0, was skipped by the walk and refused by acquire).
+// Pure.
+bool zone_onednn_pp_scratch_supplies(bool   pp_candidate,
+                                     bool   type_enabled,
+                                     bool   arena_active,
+                                     size_t zone_capacity_bytes,
+                                     size_t weights_bytes,
+                                     size_t activations_bytes);
+
+// Whether the unified kernel's oneDNN f16 route (the "Route A" of the unified dispatch) draws the planned dequant
+// buffers for a node: the router picked the unified kernel, the type is one the unified kernel serves, src1 is
+// plain (contiguous, not transposed or permuted), the node passes the PP admission, and the oneDNN scratch does
+// NOT supply its pair (zone_onednn_pp_scratch_supplies). That is the over-zone LM head or tied embedding of a
+// Q4_0 / MXFP4 model, which took a per-op pool copy of the whole weight that no plan sized (llama.cpp-8ony r1).
+// Pure.
+bool zone_unified_pp_draws_dequant(bool primary_unified,
+                                   bool unified_type,
+                                   bool src1_plain,
+                                   bool pp_candidate,
+                                   bool scratch_supplies);
+
 // ---------------------------------------------------------------------------
 // The planned dense scratch as ONE reservation (llama.cpp-kpjw)
 // ---------------------------------------------------------------------------

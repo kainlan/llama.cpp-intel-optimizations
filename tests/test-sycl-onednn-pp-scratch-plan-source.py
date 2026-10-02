@@ -13,8 +13,8 @@ had never been sized.
 
 One fact, one source: whether an op's f16 copies are planned into the ONEDNN zone is decided by the zone the arena
 was built with (zone_onednn_pp_scratch_planned over unified_cache_get_onednn_zone_capacity), and the op arm and
-the graph-entry walk must ask that same question. The companion unit test (test-zone-sizing, Case 14) proves the
-arithmetic; this gate proves both consumers use it.
+the graph-entry walk must ask that same question. The companion unit test (test-zone-sizing, Cases 14a-14d) proves
+the arithmetic; this gate proves both consumers use it.
 
 Two follow-on facts, pinned here too:
   * The direct unified_alloc that reserve_onednn_scratch made when the arena replan was refused (the
@@ -25,6 +25,18 @@ Two follow-on facts, pinned here too:
   * A smaller request must never shrink a held scratch: reserve sizes the new pair with
     zone_onednn_scratch_reserve_target (per-component maximum with what is held), so a layer-0 request cannot
     replace the block a later op needed and force the regrowth that failed.
+
+Review r1 added three more (all gated below):
+  * "the scratch supplies this op" is admission AND the type/env enablement (acquire_onednn_pp_scratch refuses
+    every type but Q4_0 / Q8_0 / MXFP4 unless GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH forces it, and every type when it
+    is 0) AND the plan. The walk asked only admission + plan, so a K-quant op was skipped by the walk and refused by
+    acquire, then drew a planned dequant buffer nothing had sized. One helper (ggml_sycl_onednn_pp_scratch_supplies)
+    answers it for the op arm and the walk, from one function of (src0, src1, columns).
+  * The unified kernel's oneDNN f16 route (Route A) fell back to a per-op ctx.pool() copy of the whole weight when
+    acquire refused an over-zone op. It draws the planned dequant buffers instead, and the walk counts such a node
+    (ggml_sycl_mul_mat_unified_pp_dequant_route), so the pair is sized before anything is submitted.
+  * The op arm and the walk pass the pair's arguments to that one helper: the op its column tile (src1_ncols), the
+    walk src1->ne[1]; both derive the element counts inside it.
 
 Run with --self-test to prove every check fires against a mutant of the thing it forbids.
 """
@@ -191,6 +203,57 @@ def evaluate(backend, cache, cache_hpp):
     results["anchor: the walk asks the PP admission"] = len(walk_skips) >= 1
     results["every PP skip in the walk also asks the helper"] = \
         len(walk_skips) >= 1 and all(HELPER in s for s in walk_skips)
+
+    # ---- review r1 I1/M4: ONE helper answers "the scratch supplies this op", for both consumers ----
+    supplies_helper = function_body(
+        backend, r"static bool ggml_sycl_onednn_pp_scratch_supplies\([^)]*\)\s*\{")
+    enabled_fn = function_body(backend, r"static bool onednn_pp_unified_scratch_enabled\([^)]*\)\s*\{")
+    results["anchor: the shared supplies helper exists"] = supplies_helper is not None
+    results["anchor: the type/env enablement function exists"] = enabled_fn is not None
+    if supplies_helper is not None:
+        results["the supplies helper asks the PP admission"] = "ggml_sycl_onednn_pp_candidate(" in supplies_helper
+        results["the supplies helper asks the type/env enablement"] = \
+            "onednn_pp_unified_scratch_enabled(" in supplies_helper
+        results["the supplies helper asks the zone plan"] = \
+            "ggml_sycl_onednn_pp_scratch_planned_bytes(" in supplies_helper
+        results["the supplies helper derives the pair from src0 and the column count"] = \
+            "ne[1]" in supplies_helper and "ne[0]" in supplies_helper
+    if enabled_fn is not None:
+        results["the enablement function asks the pure predicate"] = \
+            "zone_onednn_pp_scratch_type_enabled(" in enabled_fn
+    SUPPLIES = "ggml_sycl_onednn_pp_scratch_supplies("
+    results["the op arm's candidate asks the shared supplies helper with its column tile"] = \
+        bool(op_candidate) and SUPPLIES in op_candidate.group(1) and "src1_ncols" in op_candidate.group(1) and \
+        "ctx.device" in op_candidate.group(1)
+    results["the op arm no longer asks admission and plan separately"] = \
+        bool(op_candidate) and "ggml_sycl_onednn_pp_candidate(" not in op_candidate.group(1) and \
+        HELPER not in op_candidate.group(1)
+    walk_supplies = statements_calling(dq_walk, SUPPLIES)
+    results["the walk skips an op only through the shared supplies helper, with src1->ne[1]"] = \
+        len(walk_supplies) >= 1 and all("src1->ne[1]" in x and "ctx.device" in x for x in walk_supplies)
+    results["the walk no longer skips on admission and plan separately"] = \
+        len(walk_skips) == 0 or all(SUPPLIES in x for x in walk_skips)
+
+    # ---- review r1 I2: Route A draws the planned dequant buffers, and the walk counts such a node ----
+    route_a = function_body(
+        backend, r"static bool ggml_sycl_mul_mat_unified_pp_dequant_route\([^)]*\)\s*\{")
+    results["anchor: the walk's Route A predicate exists"] = route_a is not None
+    if route_a is not None:
+        results["the Route A predicate asks the pure verdict"] = "zone_unified_pp_draws_dequant(" in route_a
+        results["the Route A predicate asks the shared supplies helper"] = SUPPLIES in route_a
+        results["the Route A predicate asks the router"] = ".select(" in route_a
+        results["the Route A predicate names the unified types"] = "should_use_unified(" in route_a
+    results["the walk counts a Route A node"] = \
+        "ggml_sycl_mul_mat_unified_pp_dequant_route(" in dq_walk
+    acq_at = backend.find("using_scratch = acquire_onednn_pp_scratch(")
+    pool_at = backend.find("src0_f16_alloc.alloc(src0_elems)", acq_at) if acq_at >= 0 else -1
+    results["anchor: Route A's acquire and pool fallback exist"] = 0 <= acq_at < pool_at
+    if 0 <= acq_at < pool_at:
+        seg = backend[acq_at:pool_at]
+        results["Route A draws the planned src0 dequant buffer before any pool copy"] = \
+            "ggml_sycl_dequant_f16_scratch(ctx.dequant_f16_src0_scratch" in seg
+        results["Route A draws the planned src1 dequant buffer before any pool copy"] = \
+            "ggml_sycl_dequant_f16_scratch(ctx.dequant_f16_src1_scratch" in seg
     return results
 
 

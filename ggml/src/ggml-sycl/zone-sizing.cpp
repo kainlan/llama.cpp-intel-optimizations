@@ -344,6 +344,37 @@ void zone_onednn_scratch_reserve_target(bool    arena_active,
     }
 }
 
+// RED stubs (llama.cpp-8ony r1): the shapes the callers compile against, answering the way the walk and the op arm
+// did before the fix.
+bool zone_onednn_pp_scratch_type_enabled(int env_mode, bool default_type) {
+    (void) env_mode;
+    return default_type;
+}
+
+bool zone_onednn_pp_scratch_supplies(bool   pp_candidate,
+                                     bool   type_enabled,
+                                     bool   arena_active,
+                                     size_t zone_capacity_bytes,
+                                     size_t weights_bytes,
+                                     size_t activations_bytes) {
+    (void) type_enabled;
+    return pp_candidate && zone_onednn_pp_scratch_planned(arena_active, zone_capacity_bytes, weights_bytes,
+                                                          activations_bytes);
+}
+
+bool zone_unified_pp_draws_dequant(bool primary_unified,
+                                   bool unified_type,
+                                   bool src1_plain,
+                                   bool pp_candidate,
+                                   bool scratch_supplies) {
+    (void) primary_unified;
+    (void) unified_type;
+    (void) src1_plain;
+    (void) pp_candidate;
+    (void) scratch_supplies;
+    return false;
+}
+
 bool zone_dense_scratch_total_bytes(size_t   mmq_bytes_per_token,
                                     size_t   f16_weight_bytes,
                                     size_t   f16_src1_bytes_per_token,
