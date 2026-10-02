@@ -247,8 +247,9 @@ with gate('planned-scratch-ensure-owner-first'):
     owner_first(planned_scratch, "backing  = std::move(replacement)")
     # Both planned callers must keep going through the helper rather than allocating themselves.
     # Callers in common.hpp: the MMQ/MMVQ Q8_1 src1 buffer and the dense f16 dequant buffers.
-    # Comment-blind: a comment naming the helper (or a quoted example in prose) is not a caller.
-    assert _blank_comments(COMMON).count("ggml_sycl_runtime_scratch_ensure<") == 2, \
+    # Comment- and string-blind: a comment or a string literal naming the helper (a quoted example, a log
+    # message) is not a caller.
+    assert _blank_comments(COMMON, keep_strings=False).count("ggml_sycl_runtime_scratch_ensure<") == 2, \
         "a planned scratch caller stopped using the helper"
     print("PASS planned-scratch-owner-first-source-gate")
 
