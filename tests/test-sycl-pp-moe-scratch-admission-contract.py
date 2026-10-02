@@ -566,6 +566,20 @@ ESCAPES = (
     ("ring-depth-grown", [(_RING, "            const uint32_t ring_depth = std::max(pp_moe_onednn_runtime_ring_depth(planned_ring_depth), 4u);")]),
     ("ceiling-raised-before-the-read", [(_DECL_W, "            ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(ctx.device, std::max(weight_bytes, size_t(1)), "
       "act_bytes, out_bytes, 1);\n" + _DECL_W)]),
+    # The whitelist refuses every other use of a pinned name, so none of these needs its own spelling banned.
+    ("c-style-reference-bind", [(_CALL_BATCHED, "            size_t & g = (size_t &) planned_weight;\n            g = std::max(g, weight_bytes);\n" + _CALL_BATCHED)]),
+    ("c-style-pointer-write-through-addressof", [(_CALL_BATCHED, "            *(size_t *) std::addressof(planned_weight) = std::max(planned_weight, weight_bytes);\n" + _CALL_BATCHED)]),
+    ("memcpy-through-addressof", [(_CALL_BATCHED, "            { size_t g = std::max(planned_weight, weight_bytes); std::memcpy((void *) std::addressof(planned_weight), &g, sizeof(g)); }\n" + _CALL_BATCHED)]),
+    ("decltype-shadow", [(_CALL_BATCHED, "            decltype(weight_bytes) planned_weight = std::max(weight_bytes, size_t(1));\n" + _CALL_BATCHED)]),
+    ("structured-binding-shadow", [(_CALL_BATCHED, "            auto [planned_weight, junk_w] = std::pair<size_t, int>(std::max(weight_bytes, size_t(1)), 0);\n" + _CALL_BATCHED)]),
+    ("lambda-parameter-shadows-the-ring-depth", [(_CALL_BATCHED, "            auto f = [&](uint32_t ring_depth) { return cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth); };\n            if (!f(std::max(ring_depth, 4u))) {")]),
+    ("admission-shape-written-through-a-pointer", [(_CALL_BATCHED, "            (&planned_shape)->weight_slot_bytes = std::max(planned_shape.weight_slot_bytes, weight_bytes);\n" + _CALL_BATCHED)]),
+    ("planned-name-passed-to-a-by-reference-helper", [(_CALL_BATCHED, "            grow_in_place(planned_weight, weight_bytes);\n" + _CALL_BATCHED)]),
+    ("setter-through-a-function-pointer", [(_DECL_W, "            auto setter = &ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch;\n            setter(ctx.device, std::max(weight_bytes, size_t(1)), act_bytes, out_bytes, 1);\n" + _DECL_W)]),
+    ("reserve-through-a-member-pointer", [(_CALL_BATCHED, "            auto rsv = &ggml_sycl::unified_cache::reserve_pp_moe_onednn_scratch;\n            (void) (cache->*rsv)(std::max(planned_weight, weight_bytes), planned_act, planned_out, ring_depth);\n" + _CALL_BATCHED)]),
+    ("reserve-token-pasted-in-a-helper", [(_ELSEWHERE, "static bool third(ggml_sycl::unified_cache * c, size_t a, size_t b, size_t d, uint32_t r) { return c->reserve_pp_moe_onednn_ ## scratch(a, b, d, r); }\n" + _ELSEWHERE)]),
+    ("reserve-token-pasted-in-a-macro", [(_ELSEWHERE, "#define RSV(c, ...) (c)->reserve_pp_moe_onednn_##scratch(__VA_ARGS__)\n" + _ELSEWHERE)]),
+    ("reserve-with-a-line-break-before-the-paren", [(_ELSEWHERE, "static bool third(ggml_sycl::unified_cache * c, size_t a, size_t b, size_t d, uint32_t r) { return c->reserve_pp_moe_onednn_scratch\n(a, b, d, r); }\n" + _ELSEWHERE)]),
     ("helper-lambda-around-the-reserve", [(_CALL_BATCHED, "            auto do_reserve = [&](size_t w, size_t a, size_t o, uint32_t d) { return cache->reserve_pp_moe_onednn_"
       "scratch(w, a, o, d); };\n            if (!do_reserve(std::max(planned_weight, weight_bytes), planned_act, planned_out, ring_depth)) {")]),
 )
