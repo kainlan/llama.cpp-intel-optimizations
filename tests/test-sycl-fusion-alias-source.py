@@ -64,7 +64,7 @@ FUNCTION_PINS = {
 
 
 # The three helpers every gate call goes through, pinned whole: the function text with comments stripped,
-# whitespace squashed and the log message's arguments elided must EQUAL the text below. The host test exercises
+# whitespace squashed and the log message's wording elided must EQUAL the text below. The host test exercises
 # the header's predicate; these live in ggml-sycl.cpp next to the process-global counters, so a helper that
 # counted and then answered `true` (an early return, a changed comparison, a resolver lambda that hands the
 # predicate no pointer) would pass the host test and every call-site pin above. Equality, not a substring: any
@@ -83,7 +83,12 @@ static bool ggml_sycl_fusion_alias_account(ggml_sycl_fusion_alias_site site, con
     st.declined[site][r.verdict].fetch_add(1, std::memory_order_relaxed);
     const uint64_t n = st.declined_total.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n <= 4 || (n & (n - 1)) == 0) {
-        GGML_LOG_WARN(...);
+        GGML_LOG_WARN(
+            "[SYCL-FUSION] declined the %s fusion at %s: %s (%s against %s); running the unfused kernels "
+            "(decline %llu)\n",
+            ggml_sycl_fusion_alias_site_name(site), start_name ? start_name : "?",
+            ggml_sycl_fusion_alias_verdict_name(r.verdict), r.write && r.write->name ? r.write->name : "?",
+            r.other && r.other->name ? r.other->name : "?", (unsigned long long) n);
     }
     return false;
 }
@@ -128,17 +133,44 @@ def squash(text: str) -> str:
     return re.sub(r"\s+", "", text)
 
 
-def elide_log_arguments(body: str) -> str:
-    """GGML_LOG_WARN(...) arguments are message wording, not behaviour: replace them so rewording the log does
-    not break the pin. Anything else added next to the call still changes the text."""
-    out = body
-    at = out.find("GGML_LOG_WARN(")
-    while at >= 0:
-        open_idx = at + len("GGML_LOG_WARN")
-        close = matching_paren(out, open_idx)
-        out = out[:open_idx + 1] + "..." + out[close:]
-        at = out.find("GGML_LOG_WARN(", open_idx)
-    return out
+def elide_string_literals(text: str) -> str:
+    """Replace every string literal with `""` (adjacent literals collapse into one), so rewording or re-wrapping
+    the log message is free while every argument expression, and any statement hidden among the arguments, stays
+    in the compared text. Char literals are skipped over, not elided."""
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '"':
+            i += 1
+            while i < len(text) and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+            i += 1
+            out.append('""')
+        elif ch == "'":
+            j = i + 1
+            while j < len(text) and text[j] != "'":
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        else:
+            out.append(ch)
+            i += 1
+    return re.sub(r'(?:""\s*)+""|""', '""', "".join(out))
+
+
+def first_difference(expected: str, actual: str, context: int = 40) -> str:
+    at = next((k for k in range(min(len(expected), len(actual))) if expected[k] != actual[k]), min(len(expected), len(actual)))
+    lo = max(0, at - context)
+    return f"first difference at offset {at}:\n  expected: ...{expected[lo:at + context]}...\n  actual:   ...{actual[lo:at + context]}..."
+
+
+# Macros that would change what a helper body means without touching the body. The gate cannot own other
+# headers, but it owns this file.
+FORBIDDEN_REDEFINITIONS = re.compile(
+    r"^[ \t]*#[ \t]*(?:define|undef)[ \t]+(GGML_LOG_WARN|true|false|return|GGML_SYCL_FUSION_ALIAS_\w+|GGML_SYCL_FUSION_SITE_\w+)\b",
+    re.M,
+)
 
 
 def matching_brace(text: str, open_idx: int) -> int:
@@ -359,19 +391,29 @@ def gate_violations(source: str) -> list[str]:
         if "return false;" not in tail and "return reject(" not in tail:
             found.append(f"{site}: no `return false;` follows the gate call, so a decline would still launch")
 
+    for m in FORBIDDEN_REDEFINITIONS.finditer(code):
+        found.append(f"gate helper: ggml-sycl.cpp redefines `{m.group(1)}` with a preprocessor directive, which changes what the pinned helpers mean")
+
     for signature, expected in WRAPPER_BODIES:
-        body = function(code, signature)
-        if body is None:
-            found.append(f"gate helper: {signature} is missing")
+        defined = code.count(signature)
+        if defined != 1:
+            found.append(
+                f"gate helper: {signature} must be defined exactly once, found {defined}"
+                + (" (an overload could take the calls)" if defined else " (it is missing)")
+            )
             continue
-        if code.count(signature) != 1:
-            found.append(f"gate helper: {signature} must be defined exactly once, found {code.count(signature)} (an overload could take the calls)")
+        try:
+            body = function(code, signature)
+        except AssertionError as e:
+            found.append(f"gate helper: {signature} is unparsable ({e})")
             continue
-        actual = squash(elide_log_arguments(body))
-        if actual != squash(expected):
+        assert body is not None
+        actual = squash(elide_string_literals(body))
+        want = squash(elide_string_literals(expected))
+        if actual != want:
             found.append(
                 f"gate helper: {signature} changed; it must read exactly the pinned text, so every verdict still "
-                f"reaches the account and only SAFE admits.\n  expected: {squash(expected)}\n  actual:   {actual}"
+                f"reaches the account and only SAFE admits.\n  {first_difference(want, actual)}"
             )
 
     return found
@@ -584,6 +626,42 @@ def test_gate_helpers_that_always_admit_are_witnessed() -> None:
             assert any(v.startswith("gate helper:") and signature in v for v in violations), (
                 f"{signature}: the `{name}` mutant survived: {violations}"
             )
+
+
+def test_log_arguments_are_pinned_but_wording_is_free() -> None:
+    """The decline log sits inside the account helper, so a statement hidden among its arguments, a macro that
+    swallows it, or a `//` inside a string must be caught as a gate-helper change (never an exception), while
+    rewording or re-wrapping the message must not be."""
+    source = SOURCE.read_text()
+    account = "static bool ggml_sycl_fusion_alias_account("
+    body = function(source, account)
+    assert body is not None
+    start = body.index("GGML_LOG_WARN(")
+    end = start + len("GGML_LOG_WARN(")
+    last_arg = body.index("(unsigned long long) n);")
+
+    def with_body(new_body: str) -> str:
+        return source.replace(body, new_body, 1)
+
+    reworded = body.replace("[SYCL-FUSION] declined the", "[SYCL-FUSION] REFUSED the", 1).replace(
+        '"(decline %llu)\\n"', '"(decline #%llu)\\n"', 1)
+    assert reworded != body
+    assert gate_violations(with_body(reworded)) == [], "rewording the log message must stay free"
+
+    mutants = {
+        "statement expression returning from the log arguments": body[:end] + '"x", ({ return true; 0; }), ' + body[end:],
+        "statement expression appended as the last argument": body[:last_arg] + "(unsigned long long) n, ({ return true; 0; }));" + body[last_arg + len("(unsigned long long) n);"):],
+        "side effect among the log arguments": body[:end] + '"x", st.declined_total.store(0), ' + body[end:],
+        "// inside a string, then return true": body.replace("    return false;\n}", '    const char * u = "//"; return true;\n    return false;\n}'),
+    }
+    for name, mutated_body in mutants.items():
+        assert mutated_body != body, name
+        violations = gate_violations(with_body(mutated_body))
+        assert any(v.startswith("gate helper:") and account in v for v in violations), f"`{name}` survived: {violations}"
+
+    for macro in ("#undef GGML_LOG_WARN\n#define GGML_LOG_WARN(...) do { return true; } while (0)\n", "#define true false\n"):
+        violations = gate_violations(source.replace(body, macro + body, 1))
+        assert any(v.startswith("gate helper:") and "preprocessor" in v for v in violations), f"`{macro}` survived: {violations}"
 
 
 def test_miswired_bit0_operands_are_witnessed() -> None:
