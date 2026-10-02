@@ -5818,6 +5818,10 @@ struct ggml_backend_sycl_context {
     // was admitted (and is then allocated), so a later same-shape republish
     // keeps the published residency (kv_residency_needs_refit).
     bool                                 runtime_kv_admitted = false;
+    // Identity of this context for the planned dense scratch hold (unified_cache_set_planned_scratch_hold): a
+    // monotonic id minted at construction, never an address, so a later context that reuses this one's address is
+    // not mistaken for it.
+    uint64_t                             planned_scratch_owner = ggml_sycl::unified_cache_mint_planned_scratch_owner();
     // Device capability: does this device support SoA weight layout optimization?
     // This is NOT tensor state - it's a static capability of the GPU.
     // Tensor state is tracked per-tensor in ggml_tensor_extra_gpu::optimized_feature

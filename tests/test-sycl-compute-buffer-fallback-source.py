@@ -974,7 +974,9 @@ def test_refusal_macro_used_at_the_kv_budget_and_ring_and_nonfa_sites():
     # re-plan takes its KV-zone inputs after it (llama.cpp-u1bb).
     assert re.search(r"ggml_sycl_replan_pp_moe_onednn_ring\([^)]*bool\s+probe_mode\s*=\s*false\s*[,)]",
                      GGML_SYCL_CPP_CODE), "ggml_sycl_replan_pp_moe_onednn_ring() must take a probe_mode parameter"
-    assert re.search(r"ggml_sycl_check_nonfa_attn_scratch\([^)]*bool\s+probe_mode\s*=\s*false\s*\)",
+    # probe_mode is no longer the last parameter: llama.cpp-kpjw appended `size_t hold_spill_bytes = 0`
+    # (19046aaf7), so accept a following defaulted parameter like the ring re-plan's check above does.
+    assert re.search(r"ggml_sycl_check_nonfa_attn_scratch\([^)]*bool\s+probe_mode\s*=\s*false\s*[,)]",
                      GGML_SYCL_CPP_CODE), "ggml_sycl_check_nonfa_attn_scratch() must take a probe_mode parameter"
 
 
