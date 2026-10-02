@@ -1547,8 +1547,9 @@ GGML_BACKEND_API size_t ggml_backend_sycl_debug_live_kv_view_extra_count(void);
 // llama.cpp-23mk S3-3 (G6): the scratchpad decline seam. Every get_scratchpad_mem family measured so far asks for 0
 // bytes, so a decline cannot be provoked from outside. After inject(site, n) the n-th call that carries the named
 // site tag is declined (n == 0 disarms) and the site's call counter restarts. Sites: "dnnl_softmax", "dnnl_eltwise",
-// "dnnl_binary_row". Returns false, and changes nothing, for an unknown site or a negative n. Process-global,
-// single-threaded test use only.
+// "dnnl_binary_row", "dnnl_gemm", "dnnl_woq_q8_0", "dnnl_woq_q4_0", "dnnl_gemm_batch", "dnnl_woq_mxfp4_batch" (S3-4). One
+// "dnnl_gemm" call is the dense gemm's pre-query when the caller hoists one, and that pre-query counts as a call. Returns
+// false, and changes nothing, for an unknown site or a negative n. Process-global, single-threaded test use only.
 GGML_BACKEND_API bool ggml_sycl_test_inject_scratchpad_decline(const char * site, int32_t after_n);
 // Zeroes every site's counters and disarms every site.
 GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset(void);

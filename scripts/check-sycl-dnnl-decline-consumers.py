@@ -323,15 +323,23 @@ def check_common(text):
     return errs
 
 
+def ws_pattern(text):
+    """A regex for `text` that matches it however a formatter wrapped it: no whitespace is significant."""
+    return r"\s*".join(re.escape(c) for c in re.sub(r"\s+", "", text))
+
+
 def check_main(main_text, outprod_text):
     errs = []
+    main_text, outprod_text = strip_comments(main_text), strip_comments(outprod_text)
     if OLD_THROW in main_text:
         errs.append("%s: the old oneDNN scratchpad runtime_error is back" % MAIN)
     for text, want in MAIN_PINS:
-        if main_text.count(text) != want:
-            errs.append("%s: expected %d of `%s`, found %d" % (MAIN, want, text, main_text.count(text)))
-    if outprod_text.count(OUTPROD_PIN) != 1:
-        errs.append("%s: a declined gemm in out_prod must fail by name (`%s`), found %d" % (OUTPROD, OUTPROD_PIN, outprod_text.count(OUTPROD_PIN)))
+        found = len(re.findall(ws_pattern(text), main_text))
+        if found != want:
+            errs.append("%s: expected %d of `%s`, found %d" % (MAIN, want, text, found))
+    found = len(re.findall(ws_pattern(OUTPROD_PIN), outprod_text))
+    if found != 1:
+        errs.append("%s: a declined gemm in out_prod must fail by name (`%s`), found %d" % (OUTPROD, OUTPROD_PIN, found))
     return errs
 
 
@@ -468,12 +476,17 @@ def gemm_mutants(files, edit):
     out.append(("the getter's zero-size return is gone", edit(c, zero, "")))
     out.append(("the getter locks before its zero-size return", edit(c, zero + lock, lock + zero)))
     # ggml-sycl.cpp / outprod.cpp: the declared next paths
+    def edit_pin(rel, pin, new, count=1):
+        text = files[rel]
+        assert len(re.findall(ws_pattern(pin), text)) >= 1, "mutant anchor missing: %r in %s" % (pin, rel)
+        return dict(files, **{rel: re.sub(ws_pattern(pin), lambda _: new, text, count=count)})
     for text, want in MAIN_PINS:
-        out.append(("ggml-sycl.cpp loses `%s`" % text[:48], edit(m, text, "/* gone */", want)))
-    out.append(("the dense f16 arm swallows the decline", edit(m, MAIN_PINS[0][0], "return; (void) std::runtime_error(")))
+        out.append(("ggml-sycl.cpp loses `%s`" % text[:48], edit_pin(m, text, "/* gone */", want)))
+    out.append(("the dense f16 arm swallows the decline", edit_pin(m, MAIN_PINS[0][0], "return; (void) std::runtime_error(")))
     out.append(("the old scratchpad error is back in ggml-sycl.cpp",
-                edit(m, MAIN_PINS[0][0], 'throw std::runtime_error("oneDNN scratchpad allocation failed"); (void) std::runtime_error(')))
-    out.append(("out_prod loses its named throw", edit(o, OUTPROD_PIN, "throw 1; // ")))
+                edit_pin(m, MAIN_PINS[0][0], 'throw std::runtime_error("oneDNN scratchpad allocation failed"); (void) std::runtime_error(')))
+    out.append(("the dense f16 throw survives only in a comment", edit_pin(m, MAIN_PINS[0][0], "// " + MAIN_PINS[0][0])))
+    out.append(("out_prod loses its named throw", edit_pin(o, OUTPROD_PIN, "throw 1; // ")))
     return out
 
 

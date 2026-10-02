@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-h, n and q; only N-VOID and N-NODISCARD may be debt). Shrink-only: a violation not listed fails, and a listed entry that no longer violates fails. Every E-RAW and E-LIBC entry carries a fate (deleted-by-*, converted-by-*, sanctioned-internal, sanctioned-vendored or pending-disposition) and a cite, so an entry no step will ever shrink is visible as a mislabelled allowlist entry; the one G-CATCH entry for the CHECK_TRY_ERROR macro carries converted-by-5.4a and no other fate. Regenerate with `python3 scripts/check-sycl-alloc-zone-contract.py --write-debt` (it refuses to add entries); see README.md.",
+  "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-h and q; no clause (i)-(p) finding may be debt). Shrink-only: a violation not listed fails, and a listed entry that no longer violates fails. Every E-RAW and E-LIBC entry carries a fate (deleted-by-*, converted-by-*, sanctioned-internal, sanctioned-vendored or pending-disposition) and a cite, so an entry no step will ever shrink is visible as a mislabelled allowlist entry; the one G-CATCH entry for the CHECK_TRY_ERROR macro carries converted-by-5.4a and no other fate. Regenerate with `python3 scripts/check-sycl-alloc-zone-contract.py --write-debt` (it refuses to add entries); see README.md.",
   "violations": [
     {"code": "B-BRACE", "key": "cpu-expert-pool.cpp::CpuExpertPool::init::declaration:c:49299edc#0"},
     {"code": "B-BRACE", "key": "ggml-sycl.cpp::ggml_sycl_attn_host_staging_get::declaration:c:e2526092#0"},
@@ -834,21 +834,6 @@
     {"code": "G-CATCH", "key": "unified-cache.hpp::placement_plan::rebuild_runtime_per_device_vram::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "unified-kernel.cpp::UnifiedKernel::launch_persistent_kernel::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "unified-kernel.cpp::UnifiedKernel::persistent_num_workgroups::catch_clause:all#0"},
-    {"code": "G-CATCH", "key": "unified-kernel.cpp::UnifiedKernel::record_micro_graph::catch_clause:all#0"},
-    {"code": "N-NODISCARD", "key": "common.hpp::ggml_backend_sycl_context::get_scratchpad_mem::nodiscard:get_scratchpad_mem#0"},
-    {"code": "N-NODISCARD", "key": "ggml-sycl.cpp::ggml_sycl_mul_mat_batched_sycl::nodiscard:ggml_sycl_mul_mat_batched_sycl#0"},
-    {"code": "N-VOID", "key": "ggml-sycl.cpp::ggml_sycl_mul_mat::discard:DnnlGemmWrapper::row_gemm:25fe9681#0"},
-    {"code": "N-VOID", "key": "ggml-sycl.cpp::ggml_sycl_mul_mat::discard:DnnlGemmWrapper::row_gemm:25fe9681#1"},
-    {"code": "N-VOID", "key": "ggml-sycl.cpp::ggml_sycl_mul_mat::discard:DnnlGemmWrapper::row_gemm:41e120f3#0"},
-    {"code": "N-VOID", "key": "ggml-sycl.cpp::ggml_sycl_mul_mat::discard:ggml_sycl_mul_mat_batched_sycl:8ba0022b#0"},
-    {"code": "N-VOID", "key": "ggml-sycl.cpp::ggml_sycl_mul_mat::discard:ggml_sycl_mul_mat_batched_sycl:8ba0022b#1"},
-    {"code": "N-VOID", "key": "ggml-sycl.cpp::ggml_sycl_op_mul_mat_sycl::discard:DnnlGemmWrapper::row_gemm:377e4d02#0"},
-    {"code": "N-VOID", "key": "ggml-sycl.cpp::ggml_sycl_op_mul_mat_sycl::discard:DnnlGemmWrapper::row_gemm:de392b61#0"},
-    {"code": "N-VOID", "key": "ggml-sycl.cpp::lambda in ggml_sycl_mul_mat_batched_sycl::discard:DnnlGemmWrapper::gemm:5337ba47#0"},
-    {"code": "N-VOID", "key": "ggml-sycl.cpp::lambda in ggml_sycl_mul_mat_batched_sycl::discard:DnnlGemmWrapper::gemm:5337ba47#1"},
-    {"code": "N-VOID", "key": "ggml-sycl.cpp::lambda in ggml_sycl_mul_mat_batched_sycl::discard:DnnlGemmWrapper::gemm:a4950782#0"},
-    {"code": "N-VOID", "key": "ggml-sycl.cpp::lambda in ggml_sycl_mul_mat_id::discard:DnnlGemmWrapper::row_gemm:72d1fa74#0"},
-    {"code": "N-VOID", "key": "outprod.cpp::ggml_sycl_op_out_prod::discard:DnnlGemmWrapper::gemm:91f0e014#0"},
-    {"code": "N-VOID", "key": "tests/test-onednn-woq.cpp::test_woq_gemm_q4_0::discard:DnnlGemmWrapper::row_gemm:3861681f#0"}
+    {"code": "G-CATCH", "key": "unified-kernel.cpp::UnifiedKernel::record_micro_graph::catch_clause:all#0"}
   ]
 }
