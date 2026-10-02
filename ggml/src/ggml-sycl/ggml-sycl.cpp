@@ -95,6 +95,7 @@
 #include "ggml-sycl/dispatch-tuning.hpp"
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/fattn.hpp"
+#include "ggml-sycl/fusion-alias.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/graph-recorder-scope.hpp"
@@ -85846,6 +85847,27 @@ static bool ggml_sycl_fusion_chain_accessible_on_device(const ggml_cgraph * cgra
     return true;
 }
 
+// A fused chain kernel reads its external inputs while it writes its outputs, so an output the allocator
+// placed partially over an input (legal for the unfused order) races between workgroups. Decline the fusion
+// and run the unfused kernels; see fusion-alias.hpp (llama.cpp-rb2h).
+static bool ggml_sycl_fusion_chain_alias_safe_on_device(const ggml_cgraph * cgraph,
+                                                        int                 node_idx,
+                                                        int                 count,
+                                                        int                 device) {
+    const bool safe = ggml_sycl_fusion_chain_alias_safe(
+        cgraph, node_idx, count, [device](const ggml_tensor * t) { return ggml_sycl_get_data_ptr(t, device); });
+    if (!safe) {
+        static std::atomic<int> declined{ 0 };
+        if (declined.fetch_add(1, std::memory_order_relaxed) < 4) {
+            GGML_LOG_WARN(
+                "[SYCL-FUSION] declined a %d-node fused chain starting at %s: an output overlaps a chain input at a "
+                "different offset (the fused kernel would race with itself); running the unfused kernels\n",
+                count, cgraph->nodes[node_idx]->name);
+        }
+    }
+    return safe;
+}
+
 // =============================================================================
 // Per-projection fusion helper functions
 // Find all MUL_MAT nodes that consume the given tensor
@@ -94748,7 +94770,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 if (!skip_chain && fusion_site_on(1) &&
                     ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 }) &&
                     ggml_sycl_check_fusion_types(cgraph, i, 3) && ggml_is_contiguous(cgraph->nodes[i + 2]) &&
-                    ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 3, sycl_ctx->device)) {
+                    ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 3, sycl_ctx->device) &&
+                    ggml_sycl_fusion_chain_alias_safe_on_device(cgraph, i, 3, sycl_ctx->device)) {
                     ggml_tensor * mul_node      = cgraph->nodes[i + 1];
                     ggml_tensor * add_node      = cgraph->nodes[i + 2];
                     ggml_tensor * mul_src_check = get_mul_weight(mul_node, node);
@@ -94837,7 +94860,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 if (!skip_chain && fusion_site_on(4) &&
                     ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, { i + 1 }) &&
                     ggml_sycl_check_fusion_types(cgraph, i, 2) &&
-                    ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device)) {
+                    ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device) &&
+                    ggml_sycl_fusion_chain_alias_safe_on_device(cgraph, i, 2, sycl_ctx->device)) {
                     ggml_tensor * mul_node = cgraph->nodes[i + 1];
                     ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, mul_node);
                     gpu_queue_dirty = true;  // D+: GPU fusion submitted work
@@ -94855,7 +94879,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     // Check: next op is RMS_NORM and it uses this ADD's output as input
                     if (next->op == GGML_OP_RMS_NORM && next->src[0] == node &&
                         ggml_sycl_check_fusion_types(cgraph, i, 2) && ggml_is_contiguous(next) &&
-                        ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device)) {
+                        ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device) &&
+                        ggml_sycl_fusion_chain_alias_safe_on_device(cgraph, i, 2, sycl_ctx->device)) {
                         static const bool rb2h_fused_hash = ggml_sycl_rb2h_arm("GGML_SYCL_RB2H_NODE_HASH");
                         const uint64_t        rb2h_fseq   = g_rb2h_last_seq.load(std::memory_order_relaxed);
                         const bool            rb2h_fprint = rb2h_fused_hash && rb2h_seq_in_range(rb2h_fseq);
@@ -94950,7 +94975,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                             }
                         }
                         if (mul_only_used_by_add && scale_ok && bias_ok && operands_offset_safe) {
-                            if (ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device)) {
+                            if (ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device) &&
+                                ggml_sycl_fusion_chain_alias_safe_on_device(cgraph, i, 2, sycl_ctx->device)) {
                                 ggml_sycl_op_mul_add_fused(*sycl_ctx, node, next);
                                 gpu_queue_dirty = true;  // D+: GPU fusion submitted work
                                 i++;                     // Skip the ADD node
