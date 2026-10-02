@@ -19484,10 +19484,11 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
 }
 
 // llama.cpp-8ony: the ONEDNN zone's physical capacity, which is the with-floor figure (the primitive-API pair plus the
-// Graph-scratch floor, see unified_cache_get_planned_onednn_scratchpad_bytes). The question asked here is "does the
-// pair fit the zone the arena was built with", and the whole capacity is the right bound: the pair has no fallback
-// of its own, while a Graph SDPA scratch the zone cannot hold takes the bounded DIRECT path
-// (onednn_graph_scratch_alloc), so a pair that fills the zone costs SDPA speed and never an unplanned allocation.
+// Graph-scratch floor, see unified_cache_get_planned_onednn_scratchpad_bytes). This is the question "does the pair fit
+// the zone the arena was built with", not "does it leave the Graph-scratch floor free": a pair above the planned pair
+// (unified_cache_get_planned_onednn_scratchpad_bytes_stored) and within the capacity is admitted and may push the
+// Graph SDPA scratch onto its DIRECT path, an unplanned (bounded, loud) device allocation. See
+// ggml_sycl_onednn_pp_scratch_planned_bytes for why that window is accepted today.
 bool unified_cache_get_onednn_zone_capacity(int device_id, size_t * capacity) {
     unified_cache * cache = get_existing_unified_cache_for_device(device_id);
     if (!cache || !cache->arena_active()) {

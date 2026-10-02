@@ -1489,11 +1489,14 @@ struct onednn_pp_scratch_guard {
 // bytes, is the choke point every route to the scratch passes; ggml_sycl_onednn_pp_scratch_supplies (below the PP
 // admission) is the same question, with the type enablement, for the op arm and the graph-entry walk.
 //
-// The zone capacity includes the oneDNN Graph-scratch floor, and this compares the pair with all of it, on purpose:
-// the pair has no fallback of its own (an unplanned pair is what this refuses), while a Graph SDPA scratch the
-// zone cannot hold takes the bounded DIRECT path (onednn_graph_scratch_alloc, GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB),
-// slower and loud rather than unplanned, and the zone itself is clamped to leave the pair's own bytes first. A pair
-// that fills the zone therefore costs SDPA speed, never correctness or an unplanned allocation.
+// The bound is the zone's physical capacity, which includes the oneDNN Graph-scratch floor, so a pair between the
+// planned pair (unified_cache_get_planned_onednn_scratchpad_bytes_stored) and the capacity counts as planned while
+// it grows into the bytes the floor reserves for the Graph SDPA scratch. That scratch then goes to its DIRECT path
+// (onednn_graph_scratch_alloc), which is itself an unplanned device allocation (bounded by
+// GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB, it can wait for headroom and then abort when exhausted), so the window is not
+// free. It is accepted for now because the strict bound (the planned pair) would also turn away ops the planner's
+// own pair estimate under-sizes (its activations half is a placeholder sized from the largest stored tensor, which
+// a small hidden size at a large -ub exceeds); see llama.cpp-8ony for the open decision.
 static bool ggml_sycl_onednn_pp_scratch_planned_bytes(int device, size_t weights_bytes, size_t activations_bytes) {
     size_t     zone_capacity = 0;
     const bool arena_active  = ggml_sycl::unified_cache_get_onednn_zone_capacity(device, &zone_capacity);
