@@ -28,6 +28,11 @@ It checks, over ggml/include/ggml-sycl.h and ggml/src/ggml-sycl/ggml-sycl.cpp:
   * a publish for an unbound context is said at WARN, and the destructor's erase says a failed drop at
     WARN; the publish tail drops through the throwing set, not the erase;
   * the recovery path that ends a load without the clear guard clears the load's terms itself;
+  * (step 3c) a context's first publish reserves its host tier before L1 through
+    unified_allocate_owner with the carve's request fields, installs the table only after the inner
+    transaction succeeded, and the destructor drops it after the section and before the unbind; the
+    SYCL_Host buffer type claims inside a claim scope before it reaches any allocation, and its free
+    releases the claim.
 
 Usage:
   check-sycl-l4-proc-registration.py [--root DIR]     check the tree, then run the mutation matrix
@@ -122,6 +127,17 @@ def function_body(text, signature_re):
 
 def header_proc_names(header_raw):
     return re.findall(r'Proc name:\s*"([A-Za-z0-9_]+)"', header_raw)
+
+
+def impl_first_publish_wrong(source):
+    impl = function_body(source, r"\bggml_sycl_set_runtime_context_for_model_impl\s*\(")
+    if impl is None:
+        return True
+    r = impl.find("ggml_sycl_reserve_host_tenants(")
+    l1 = impl.find("std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex)")
+    inner = impl.find("const bool inner_ok = g_runtime_update_succeeded;")
+    inst = impl.find("ggml_sycl_host_tenants_install(")
+    return not (0 <= r < l1 and 0 <= inner < inst)
 
 
 def function_span(text, signature_re):
@@ -261,6 +277,9 @@ def check(header_raw, source):
         fails.append("L4 section: a publish for an unbound context is silent (no WARN)")
     if not re.search(r"if \(id == 0\) \{\s*if \(section\) \{\s*GGML_LOG_WARN\([^;]*;\s*\}\s*return;\s*\}", set_fn):
         fails.append("L4 section: a publish for an unbound context goes on to the registry with key 0")
+    herase_fn = function_body(source, r"\bstatic\s+void\s+ggml_sycl_host_tenants_erase\s*\(") or ""
+    if not re.search(r"catch\s*\(\.\.\.\)\s*\{\s*GGML_LOG_WARN\(", herase_fn):
+        fails.append("L4 host tier: the destructor's drop of the host reservation swallows a failure silently (no WARN)")
     erase_fn = function_body(source, r"\bstatic\s+void\s+ggml_sycl_published_section_erase\s*\(") or ""
     if not re.search(r"catch\s*\(\.\.\.\)\s*\{\s*GGML_LOG_WARN\(", erase_fn):
         fails.append("L4 section: the destructor's erase swallows a failed drop silently (no WARN)")
@@ -293,6 +312,52 @@ def check(header_raw, source):
             fails.append("L4 section: the backend context's destructor does not erase its published section")
         elif u < 0 or e > u:
             fails.append("L4 section: the section is erased after the execution binding is reset (its key is gone)")
+
+    if dtor is not None:
+        h = dtor.find("ggml_sycl_host_tenants_erase(this)")
+        e = dtor.find("ggml_sycl_published_section_erase(this)")
+        u = dtor.find("ggml_sycl_execution_unbind_backend(this)")
+        if h < 0:
+            fails.append("L4 host tier: the backend context's destructor does not drop its held host reservation")
+        elif not (e >= 0 and e < h < u):
+            fails.append("L4 host tier: the host reservation is dropped outside the section-erase to unbind window")
+
+    # the host reservation: owner-first, the carve's request, one installer, one remover
+    reserve = function_body(source, r"\bstatic\s+bool\s+ggml_sycl_reserve_host_tenants\s*\(")
+    if reserve is None:
+        fails.append("L4 host tier: ggml_sycl_reserve_host_tenants not found")
+    else:
+        if "ggml_sycl::unified_allocate_owner(req)" not in reserve:
+            fails.append("L4 host tier: the host carve is not allocated through unified_allocate_owner")
+        for field in ("req.intent.constraints.must_host_pinned = true;", "req.intent.constraints.use_pinned_pool = true;",
+                      "req.intent.category = ggml_sycl::runtime_category::HOST_COMPUTE;",
+                      "req.intent.cohort_id = info->name;"):
+            if field not in reserve:
+                fails.append("L4 host tier: the host carve's request lost `%s`" % field.strip())
+        for bad in ("forbid_host_zone_growth", "require_host_usm_base"):
+            if bad in reserve:
+                fails.append("L4 host tier: the host carve's request sets %s (the first publish may grow the zone)" % bad)
+        if "sycl::malloc_host" in reserve or "unified_alloc(" in reserve:
+            fails.append("L4 host tier: the host carve bypasses the owner-first surface")
+    if source.count("ggml_sycl_reserve_host_tenants(") != 2:
+        fails.append("L4 host tier: ggml_sycl_reserve_host_tenants has more or fewer than one caller")
+    if source.count(".install_tenant_slots(") != 1 or source.count(".take_tenant_slots(") != 1:
+        fails.append("L4 host tier: the registry's slot table has more or fewer than one installer or remover")
+    if impl_first_publish_wrong(source):
+        fails.append("L4 host tier: the first publish does not reserve before L1, or installs before the inner transaction succeeded")
+
+    # the buffer type: claim before any allocation, release on free
+    alloc = function_body(source, r"\bstatic\s+ggml_backend_buffer_t\s+ggml_backend_sycl_host_buffer_type_alloc_buffer\s*\(")
+    if alloc is None:
+        fails.append("L4 host tier: the SYCL_Host alloc_buffer not found")
+    else:
+        c = alloc.find("ggml_sycl::tenant_claim_scope::active()")
+        a = alloc.find("ggml_sycl::unified_alloc(")
+        if c < 0 or a < 0 or c > a:
+            fails.append("L4 host tier: the SYCL_Host alloc_buffer does not claim inside a scope before it allocates")
+    freeb = function_body(source, r"\bstatic\s+void\s+ggml_backend_sycl_host_buffer_free_buffer\s*\(")
+    if freeb is None or "ggml_sycl::tenant_claim_scope::release(*ctx->claim" not in freeb:
+        fails.append("L4 host tier: the SYCL_Host free_buffer does not release its claim")
 
     # transaction tail
     txn = function_body(source, r"\bggml_sycl_txn_result\s+ggml_sycl_run_runtime_context_transaction\s*\(")
@@ -353,8 +418,43 @@ def mutations(header_raw, source):
         ("the destructor's erase dropped", "does not erase its published section",
          "    ggml_sycl_published_section_erase(this);\n", ""),
         ("the destructor's erase after the unbind", "erased after the execution binding",
-         "    ggml_sycl_published_section_erase(this);\n    ggml_sycl_execution_unbind_backend(this);",
-         "    ggml_sycl_execution_unbind_backend(this);\n    ggml_sycl_published_section_erase(this);"),
+         "    ggml_sycl_published_section_erase(this);\n    ggml_sycl_host_tenants_erase(this);\n    ggml_sycl_execution_unbind_backend(this);",
+         "    ggml_sycl_host_tenants_erase(this);\n    ggml_sycl_execution_unbind_backend(this);\n    ggml_sycl_published_section_erase(this);"),
+        ("the host reservation never dropped", "does not drop its held host reservation",
+         "    ggml_sycl_host_tenants_erase(this);\n", ""),
+        ("the host reservation dropped after the unbind", "outside the section-erase to unbind window",
+         "    ggml_sycl_host_tenants_erase(this);\n    ggml_sycl_execution_unbind_backend(this);",
+         "    ggml_sycl_execution_unbind_backend(this);\n    ggml_sycl_host_tenants_erase(this);"),
+        ("the carve through the legacy allocator", "not allocated through unified_allocate_owner",
+         "ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);\n        if (!allocation) {\n            refusal = std::string(\"the host reservation of \")",
+         "ggml_sycl::allocation_result allocation = ggml_sycl::detail::promote_legacy_alloc_owner({});\n        if (!allocation) {\n            refusal = std::string(\"the host reservation of \")"),
+        ("the carve not pinned", "lost `req.intent.constraints.must_host_pinned = true;`",
+         "        req.intent.constraints.must_host_pinned = true;\n        req.intent.constraints.use_pinned_pool = true;\n        ggml_sycl::allocation_result",
+         "        req.intent.constraints.use_pinned_pool = true;\n        ggml_sycl::allocation_result"),
+        ("the carve off the pool", "lost `req.intent.constraints.use_pinned_pool = true;`",
+         "        req.intent.constraints.use_pinned_pool = true;\n        ggml_sycl::allocation_result",
+         "        req.intent.constraints.use_pinned_pool = false;\n        ggml_sycl::allocation_result"),
+        ("the carve in the wrong category", "lost `req.intent.category",
+         "        req.intent.category = ggml_sycl::runtime_category::HOST_COMPUTE;\n        req.intent.cohort_id = info->name;",
+         "        req.intent.category = ggml_sycl::runtime_category::COMPUTE;\n        req.intent.cohort_id = info->name;"),
+        ("the carve's cohort retyped", "lost `req.intent.cohort_id",
+         "        req.intent.cohort_id = info->name;", "        req.intent.cohort_id = \"context-compute-host\";"),
+        ("the carve forbids zone growth", "sets forbid_host_zone_growth",
+         "        req.intent.constraints.use_pinned_pool = true;\n        ggml_sycl::allocation_result",
+         "        req.intent.constraints.use_pinned_pool = true;\n        req.intent.constraints.forbid_host_zone_growth = true;\n        ggml_sycl::allocation_result"),
+        ("a second installer of the table", "more or fewer than one installer or remover",
+         "static size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {",
+         "static void h_second_installer() { ggml_sycl_kv_region_registry(0).install_tenant_slots(1, nullptr, 0); }\nstatic size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {"),
+        ("a second remover of the table", "more or fewer than one installer or remover",
+         "static size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {",
+         "static void h_second_remover() { (void) ggml_sycl_kv_region_registry(0).take_tenant_slots(1); }\nstatic size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {"),
+        ("the first publish reserves under L1", "does not reserve before L1",
+         "                if (!ggml_sycl_reserve_host_tenants(backend_ctx, *section, host_tenants, refusal)) {",
+         "                if (false) {"),
+        ("the table installed on any outcome", "installs before the inner transaction",
+         "            if (host_tenants) {\n                (void) ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key);\n            }\n", ""),
+        ("the free forgets its claim", "does not release its claim",
+         "        (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);\n        ctx->claim.reset();", "        ctx->claim.reset();"),
         ("the transaction tail's drop removed", "does not drop the context's earlier section",
          "    ggml_sycl_published_section_set(ctx, nullptr);\n    return ggml_sycl_txn_result::ACCEPTED;",
          "    return ggml_sycl_txn_result::ACCEPTED;"),
@@ -411,8 +511,14 @@ def mutations(header_raw, source):
          SIG_LATE, "ggml_sycl_load_ledger_log(r);", "GGML_LOG_INFO(\"%s\\n\", r.line.c_str());"),
         ("a publish for an unbound context is silent", "a publish for an unbound context is silent",
          r"\bstatic\s+void\s+ggml_sycl_published_section_set\s*\(", "        if (section) {\n            GGML_LOG_WARN(", "        if (false) {\n            GGML_LOG_WARN("),
+        ("the claim after the allocation", "does not claim inside a scope before it allocates",
+         r"\bstatic\s+ggml_backend_buffer_t\s+ggml_backend_sycl_host_buffer_type_alloc_buffer\s*\(",
+         "    if (ggml_sycl::tenant_claim_scope::active()) {",
+         "    { ggml_sycl::alloc_handle early{}; (void) ggml_sycl::unified_alloc({}, &early); }\n    if (ggml_sycl::tenant_claim_scope::active()) {"),
         ("the unbound-context return dropped from the section set", "goes on to the registry with key 0",
          r"\bstatic\s+void\s+ggml_sycl_published_section_set\s*\(", "        }\n        return;\n    }\n", "        }\n    }\n"),
+        ("the host reservation's drop swallows silently", "drop of the host reservation swallows a failure silently",
+         r"\bstatic\s+void\s+ggml_sycl_host_tenants_erase\s*\(", "    } catch (...) {\n        GGML_LOG_WARN(", "    } catch (...) {\n        (void) ("),
         ("the destructor's erase swallows silently", "swallows a failed drop silently",
          r"\bstatic\s+void\s+ggml_sycl_published_section_erase\s*\(", "    } catch (...) {\n        GGML_LOG_WARN(", "    } catch (...) {\n        (void) ("),
         ("the recovery path no longer clears", "does not clear its terms",
@@ -427,6 +533,18 @@ def mutations(header_raw, source):
             a, b = span
             muts.append((label, msg, header_raw, src[:a] + src[a:b].replace(old, new, 1) + src[b:]))
     for label, msg, old, new in pairs:
+        if label == "the first publish reserves under L1":
+            lock = ("        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);\n"
+                    "        const auto snapshot = ggml_sycl::lifecycle_select_placement_plan(model.model_id")
+            if src.count(old) != 1 or src.count(lock) != 1:
+                muts.append(("PATTERN NOT FOUND: " + label, "PATTERN", header_raw, src))
+            else:
+                moved = src.replace(old, new, 1).replace(
+                    lock, "        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);\n"
+                          "        (void) ggml_sycl_reserve_host_tenants(backend_ctx, *section, host_tenants, refusal_under_l1);\n"
+                          "        const auto snapshot = ggml_sycl::lifecycle_select_placement_plan(model.model_id", 1)
+                muts.append((label, msg, header_raw, moved))
+            continue
         if label == "the clear guard before the finisher check":
             moved = src.replace(old, "", 1).replace("        ticket = registry->prepare_end(", "        ggml_sycl_load_ledger_clear_guard ledger_clear{ txn.id };\n        ticket = registry->prepare_end(", 1)
             muts.append((label, msg, header_raw, moved))

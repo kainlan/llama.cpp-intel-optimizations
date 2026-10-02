@@ -2223,6 +2223,27 @@ set_tests_properties(sycl-runtime-context-section PROPERTIES
     TIMEOUT 30
 )
 
+# The tenant claim scope and the registry entry that holds a context's slot table (llama.cpp-moua L4 step 3c).
+# Host only: the scope and the table name no device.
+add_executable(test-tenant-claim-scope
+    tests/test-tenant-claim-scope.cpp
+    context-tenant-measure.cpp
+)
+target_include_directories(test-tenant-claim-scope PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../src
+)
+target_link_libraries(test-tenant-claim-scope PRIVATE ggml-base Threads::Threads)
+set_target_properties(test-tenant-claim-scope PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-tenant-claim-scope COMMAND test-tenant-claim-scope)
+set_tests_properties(sycl-tenant-claim-scope PROPERTIES
+    LABELS "sycl;tenant;hostonly"
+    TIMEOUT 30
+)
+
 # The resolver counter's gating: a host return of a staged source counts only
 # inside the device-dispatch region and not inside a host executor. Synthetic
 # tensors, no device (an F32 tensor never reaches the multi-GPU control-storage
@@ -6614,6 +6635,25 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         # Keep the inner watchdog 10 s below CTest's hard bound so a real hang
         # is still diagnosed by the backend before CTest terminates the process.
         ENVIRONMENT "GGML_SYCL_OP_TIMEOUT_MS=110000"
+        TIMEOUT 120)
+
+    # llama.cpp-moua L4 step 3c: a context's held host-tier reservation and the claim scope, through the public
+    # entry points on a real backend.  Megabyte-scale allocations only.
+    add_executable(test-sycl-host-tenant-claim
+        tests/test-host-tenant-claim.cpp)
+    target_include_directories(test-sycl-host-tenant-claim PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_link_libraries(test-sycl-host-tenant-claim PRIVATE
+        ggml-sycl-private-fixtures)
+    set_target_properties(test-sycl-host-tenant-claim PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-host-tenant-claim COMMAND test-sycl-host-tenant-claim)
+    set_tests_properties(sycl-host-tenant-claim PROPERTIES
+        LABELS "sycl;tenant;device;B70;B50"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
         TIMEOUT 120)
 
     add_executable(test-sycl-intrusive-allocation-owner

@@ -123,6 +123,7 @@
 #include "ggml-sycl/simple-consumer-route-policy.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
+#include "ggml-sycl/tenant-claim-scope.hpp"
 #include "model-lifecycle.hpp"
 #include "sycl-kernel-profiler.hpp"
 #include "sycl-timeline.hpp"
@@ -13146,6 +13147,112 @@ static void ggml_sycl_published_section_erase(const ggml_backend_sycl_context * 
     }
 }
 
+// A host-tier tenant slot: one owner-first host reservation (moua design 2.3.2, "the host-pinned tier").
+// It is the kv_region_handle of a slot in the table ggml_sycl_reserve_host_tenants builds, and that
+// function is the only builder of a table carrying the host cohort, so a claim of that cohort casts
+// the handle back to this type.
+struct ggml_sycl_host_tenant_slot {
+    ggml_sycl::mem_handle handle;
+    size_t                bytes = 0;
+};
+
+// Reserve one host carve per host-tier element of `section` (device -1) and build the slot table over
+// them: slot (cohort, slot_index) IS carve (cohort, slot_index), contiguous, `slot_bytes` long.  Each is
+// an owner-first allocation through unified_allocate_owner (must_host_pinned, use_pinned_pool, category
+// HOST_COMPUTE, the cohort's own name), never a bare USM call, and it runs before L1 under a
+// TRANSACTION token, so the pool's phase gates take it as planned work.  `out` is null on success when
+// the section carries no host element.  False, with `refusal` naming the slot, when an allocation
+// failed; every carve made so far drops with `table`, with no registry lock held.
+static bool ggml_sycl_reserve_host_tenants(const ggml_backend_sycl_context *             ctx,
+                                           const ggml_sycl::runtime_context_section &    section,
+                                           std::shared_ptr<ggml_sycl::kv_tenant_slots> & out,
+                                           std::string &                                 refusal) {
+    out.reset();
+    std::shared_ptr<ggml_sycl::kv_tenant_slots> table;
+    auto *                                      cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
+    sycl::queue * queue = cache ? &cache->get_queue() : &ggml_sycl_get_device(ctx->device).default_queue();
+    for (const ggml_sycl::runtime_context_tenant & e : section.tenants) {
+        if (e.device != -1) {
+            continue;
+        }
+        const ggml_sycl_context_cohort_info * info = ggml_sycl_context_cohort_lookup(e.cohort);
+        if (info == nullptr || info->tier != GGML_SYCL_CONTEXT_COHORT_TIER_HOST_PINNED) {
+            refusal = "host-tier element " + std::to_string(e.slot_index) + " names cohort " +
+                      std::to_string(e.cohort) + ", which is not a host-pinned cohort";
+            return false;
+        }
+        ggml_sycl::alloc_request req{};
+        req.queue                               = queue;
+        req.device                              = ctx->device;
+        req.size                                = (size_t) e.slot_bytes;
+        req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+        req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+        req.intent.cohort_id                    = info->name;
+        req.intent.constraints.must_host_pinned = true;
+        req.intent.constraints.use_pinned_pool  = true;
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (!allocation) {
+            refusal = std::string("the host reservation of ") + std::to_string(e.slot_bytes) + " B for cohort " +
+                      info->name + " slot " + std::to_string(e.slot_index) + " failed";
+            return false;
+        }
+        ggml_sycl::mem_handle carve =
+            ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = carve.resolve(ctx->device);
+        if (!resolved.ptr || resolved.on_device) {
+            refusal = std::string("the host reservation for cohort ") + info->name + " slot " +
+                      std::to_string(e.slot_index) + " did not resolve to host memory";
+            return false;
+        }
+        if (!table) {
+            table = std::make_shared<ggml_sycl::kv_tenant_slots>();
+        }
+        auto slot    = std::make_shared<ggml_sycl_host_tenant_slot>();
+        slot->handle = std::move(carve);
+        slot->bytes  = (size_t) e.slot_bytes;
+        (void) table->add(info->name, e.slot_index, std::move(slot),
+                          (size_t) e.slot_bytes);  // a fresh table: nothing retained
+    }
+    out = std::move(table);
+    return true;
+}
+
+// The commit of a first publish: the reserved table becomes the entry's held reservation.  `table` is
+// emptied on success; on false (an unbound context, or an entry that already holds a table) the caller
+// still owns it and drops it with no lock held.
+static bool ggml_sycl_host_tenants_install(const ggml_backend_sycl_context *             ctx,
+                                           std::shared_ptr<ggml_sycl::kv_tenant_slots> & table,
+                                           uint64_t                                      tenant_key) {
+    if (!ctx || ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES || !table) {
+        return false;
+    }
+    const uint64_t id = ggml_sycl_context_execution_id(ctx);
+    if (id == 0 || !ggml_sycl_kv_region_registry(ctx->device).install_tenant_slots(id, table, tenant_key)) {
+        return false;
+    }
+    table.reset();
+    return true;
+}
+
+// The backend context is going away: its held host reservation goes with it, after the section.  The
+// last drop of a slot is the last drop of its carve, and a buffer still built over one keeps it
+// through its own copy of the handle.  Never throws.
+static void ggml_sycl_host_tenants_erase(const ggml_backend_sycl_context * ctx) noexcept {
+    try {
+        if (!ctx || ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES) {
+            return;
+        }
+        const uint64_t id = ggml_sycl_context_execution_id(ctx);
+        if (id == 0) {
+            return;
+        }
+        auto previous = ggml_sycl_kv_region_registry(ctx->device).take_tenant_slots(id);
+        (void) previous;  // dropped here, with no registry lock held
+    } catch (...) {
+        GGML_LOG_WARN("[CONTEXT-PLAN] the held host reservation of a backend context could not be dropped\n");
+    }
+}
+
 // Whether `txn` is the open load transaction.  The caller holds the ledger's mutex, so that a clear
 // cannot run between this read and the use of its answer (the lifecycle registry's mutex is taken and
 // released inside, which is the one nesting the block comment above names).
@@ -19994,6 +20101,31 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
         }
     } guard{ registry, std::move(ticket) };
 
+    // The first publish of a context reserves AND HOLDS its host-tier room (moua design 2.3.2): one
+    // owner-first carve per host slot, allocated here, before L1 (g_tensor_inventory_mutex), because a
+    // host-zone allocation can need a new pinned chunk and a USM call must not run under L1.  A republish
+    // never allocates: the entry already holds the table.  A refused allocation is a refusal before
+    // anything was published, and the carves made so far drop with `host_tenants` on every exit that
+    // does not install them, with no registry lock held.
+    std::shared_ptr<ggml_sycl::kv_tenant_slots> host_tenants;
+    if (section && backend_ctx && backend_ctx->device >= 0 && backend_ctx->device < GGML_SYCL_MAX_DEVICES) {
+        const uint64_t exec_id = ggml_sycl_context_execution_id(backend_ctx);
+        if (exec_id != 0 && ggml_sycl_kv_region_registry(backend_ctx->device).tenants(exec_id) == nullptr) {
+            std::string refusal;
+            try {
+                if (!ggml_sycl_reserve_host_tenants(backend_ctx, *section, host_tenants, refusal)) {
+                    GGML_LOG_WARN("[CONTEXT-PLAN] host tenant reservation refused: %s (n_ctx=%u n_ubatch=%u)\n",
+                                  refusal.c_str(), n_ctx, n_ubatch);
+                    return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                }
+            } catch (const ggml_sycl_fallback_error &) {
+                throw;
+            } catch (...) {
+                return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+            }
+        }
+    }
+
     // Retained past the locked scope below so a load_end deferral can be
     // resolved OUTSIDE g_tensor_inventory_mutex. Copying the pointer under the
     // lock is fine; materializing under it is not -- that allocates, and
@@ -20088,6 +20220,9 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
     if (inner_ok && section) {
         try {
             ggml_sycl_published_section_set(backend_ctx, section);
+            if (host_tenants) {
+                (void) ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key);
+            }
         } catch (const ggml_sycl_fallback_error &) {
             throw;
         } catch (...) {
@@ -39902,6 +40037,54 @@ void ggml_backend_sycl_replan_scope_close(void * scope) {
     delete static_cast<ggml_backend_sycl_replan_scope_state *>(scope);
 }
 
+// The claim scope of a context's tenant slots (ggml-sycl.h; tenant-claim-scope.hpp).  Open reads the
+// context's held table from its registry entry and makes it this thread's claim target; the SYCL_Host
+// buffer type's alloc_buffer claims from it until close.
+void * ggml_backend_sycl_claim_scope_open(ggml_backend_t backend) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return nullptr;
+    }
+    if (!backend || !backend->context || !ggml_backend_is_sycl(backend) || !backend->device ||
+        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
+        return nullptr;
+    }
+    try {
+        const auto * ctx = static_cast<const ggml_backend_sycl_context *>(backend->context);
+        if (ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES) {
+            return nullptr;
+        }
+        const uint64_t id = ggml_sycl_context_execution_id(ctx);
+        if (id == 0) {
+            return nullptr;
+        }
+        auto table = ggml_sycl_kv_region_registry(ctx->device).tenants(id);
+        if (!table) {
+            return nullptr;  // no held reservation: no claim scope is in force, the buffer type allocates as before
+        }
+        if (ggml_sycl::tenant_claim_scope::active()) {
+            GGML_LOG_ERROR("[CLAIM-SCOPE] nested open refused: this thread already holds a claim scope\n");
+            return nullptr;
+        }
+        return ggml_sycl::tenant_claim_scope::open(std::move(table));
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void ggml_backend_sycl_claim_scope_close(void * scope) {
+    if (scope == nullptr) {
+        return;
+    }
+    if (!ggml_sycl::tenant_claim_scope::close(static_cast<ggml_sycl::tenant_claim_scope::state *>(scope))) {
+        GGML_LOG_ERROR("[CLAIM-SCOPE] close refused: the scope is not the one open on this thread\n");
+    }
+}
+
+size_t ggml_backend_sycl_claim_scope_claims(void * scope) {
+    return ggml_sycl::tenant_claim_scope::claims_made(static_cast<const ggml_sycl::tenant_claim_scope::state *>(scope));
+}
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 size_t ggml_backend_sycl_plan_caps_freeze_core(ggml_backend_sycl_plan_caps_t caps,
                                                ggml_backend_buffer_type_t    buft,
@@ -44583,6 +44766,10 @@ struct sycl_host_buf_ctx {
     // host-access accessors below can order against the GPU before delegating.
     int                   device = -1;
     ggml_backend_buffer_i cpu_iface{};
+    // Set when the buffer was built over a claimed tenant slot (inside a claim scope); free_buffer
+    // releases it.  `buffer_handle` is then a copy of the slot's own handle, so the memory outlives
+    // the table that carried it.
+    std::unique_ptr<ggml_sycl::tenant_claim> claim;
 };
 
 // llama.cpp-30h4: order host-side access to this pinned USM against the GPU
@@ -44629,6 +44816,13 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
     auto * ctx = static_cast<sycl_host_buf_ctx *>(buffer->context);
     if (!ctx) {
         return;
+    }
+    if (ctx->claim) {
+        // The slot is claimable again once the GPU work that DMAs into and out of this pinned memory is
+        // done: wait the two queues the host accessors wait, then release with no event to chain on.
+        ggml_backend_sycl_host_buffer_sync(ctx);
+        (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);
+        ctx->claim.reset();
     }
     ctx->buffer_handle = {};
     delete ctx;
@@ -44694,6 +44888,96 @@ static bool ggml_backend_sycl_host_buffer_cpy_tensor(ggml_backend_buffer_t buffe
     return ctx->cpu_iface.cpy_tensor(buffer, src, dst);
 }
 
+// Inside a claim scope the host buffer is a claim of a tenant slot, not an allocation (moua design 2.3.2):
+// the lowest free slot of the host compute cohort, checked against its cap, and the buffer is built over
+// the slot's memory.  A request the table cannot serve is a plan bug, never a silent growth and never a
+// fall back to the legacy path: the buffer is refused by name.  On OK `claim` holds the live claim and
+// `ptr`/`handle` the slot's memory; on false nothing is claimed.
+static bool ggml_backend_sycl_host_buffer_claim_slot(size_t                                     size,
+                                                     int                                        device,
+                                                     std::unique_ptr<ggml_sycl::tenant_claim> & claim,
+                                                     void *&                                    ptr,
+                                                     ggml_sycl::mem_handle &                    handle) {
+    const ggml_sycl_context_cohort_info * info = ggml_sycl_context_cohort_lookup(GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST);
+    GGML_ASSERT(info != nullptr);
+    auto                                  made    = std::make_unique<ggml_sycl::tenant_claim>();
+    const ggml_sycl::tenant_claim_outcome outcome = ggml_sycl::tenant_claim_scope::claim(info->name, size, *made);
+    if (outcome.status != ggml_sycl::tenant_claim_status::OK) {
+        if (outcome.status == ggml_sycl::tenant_claim_status::OVER_PLAN) {
+            GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] host buffer claim refused: %zu B over the %zu B slot %u of cohort %s\n",
+                           size, outcome.cap, outcome.index, info->name);
+        } else {
+            GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] host buffer claim refused: no free slot %u of cohort %s for %zu B\n",
+                           outcome.index, info->name, size);
+        }
+        return false;
+    }
+    const auto owner    = std::static_pointer_cast<ggml_sycl_host_tenant_slot>(made->owner);
+    const auto resolved = owner ? owner->handle.resolve(device) : ggml_sycl::resolved_ptr{};
+    if (!owner || !resolved.ptr || resolved.on_device) {
+        (void) ggml_sycl::tenant_claim_scope::release(*made, 0);
+        GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] host buffer claim refused: slot %u of cohort %s holds no host memory\n",
+                       made->index, info->name);
+        return false;
+    }
+    ptr    = resolved.ptr;
+    handle = owner->handle;
+    claim  = std::move(made);
+    return true;
+}
+
+// The buffer over `ptr`: the CPU buffer from the pointer with the host accessors installed.  `claim` is the
+// live tenant claim the memory belongs to, or null for a buffer the buft allocated itself.
+static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap(ggml_backend_buffer_type_t               buft,
+                                                                void *                                   ptr,
+                                                                size_t                                   size,
+                                                                ggml_sycl::mem_handle                    handle,
+                                                                int                                      device,
+                                                                std::unique_ptr<ggml_sycl::tenant_claim> claim) {
+    // Use the wrapper struct as buffer context so free_buffer knows which
+    // deallocation path to take.  Override get_base to extract the raw pointer.
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    if (!buffer) {
+        if (claim) {
+            (void) ggml_sycl::tenant_claim_scope::release(*claim, 0);
+        }
+        return nullptr;
+    }
+
+    // Capture the CPU iface BEFORE overriding it: the accessors below delegate
+    // to these exact implementations after waiting the GPU (llama.cpp-30h4).
+    auto * ctx = new sycl_host_buf_ctx{ ptr, size, std::move(handle), device, buffer->iface };
+    ctx->claim = std::move(claim);
+
+    if (!ggml_backend_buffer_set_type(buffer, buft)) {
+        ggml_backend_buffer_free(buffer);
+        if (ctx->claim) {
+            (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);
+        }
+        delete ctx;
+        return nullptr;
+    }
+    buffer->context           = ctx;
+    buffer->iface.get_base    = ggml_backend_sycl_host_buffer_get_base;
+    buffer->iface.free_buffer = ggml_backend_sycl_host_buffer_free_buffer;
+    buffer->iface.clear       = ggml_backend_sycl_host_buffer_clear;
+    // Only wrap the accessors the CPU buffer actually implements; leaving an
+    // absent one null keeps ggml-backend's own fallbacks reachable.
+    if (ctx->cpu_iface.set_tensor) {
+        buffer->iface.set_tensor = ggml_backend_sycl_host_buffer_set_tensor;
+    }
+    if (ctx->cpu_iface.get_tensor) {
+        buffer->iface.get_tensor = ggml_backend_sycl_host_buffer_get_tensor;
+    }
+    if (ctx->cpu_iface.memset_tensor) {
+        buffer->iface.memset_tensor = ggml_backend_sycl_host_buffer_memset_tensor;
+    }
+    if (ctx->cpu_iface.cpy_tensor) {
+        buffer->iface.cpy_tensor = ggml_backend_sycl_host_buffer_cpy_tensor;
+    }
+    return buffer;
+}
+
 static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                                                              size_t                     size) {
     const bool weights_evictable = ggml_backend_sycl_weights_evictable();
@@ -44704,6 +44988,17 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     const int exact_device = ggml_sycl_device_id_from_backend_dev(buft ? buft->device : nullptr);
     if (exact_device < 0) {
         return nullptr;
+    }
+    // Inside a claim scope the buffer is a claim of a tenant slot, not an allocation.
+    if (ggml_sycl::tenant_claim_scope::active()) {
+        void *                                   claimed_ptr = nullptr;
+        ggml_sycl::mem_handle                    claimed_handle;
+        std::unique_ptr<ggml_sycl::tenant_claim> claim;
+        if (!ggml_backend_sycl_host_buffer_claim_slot(size, exact_device, claim, claimed_ptr, claimed_handle)) {
+            return nullptr;
+        }
+        return ggml_backend_sycl_host_buffer_wrap(buft, claimed_ptr, size, std::move(claimed_handle), exact_device,
+                                                  std::move(claim));
     }
     auto *        exact_cache = ggml_sycl::get_unified_cache_for_device(exact_device);
     sycl::queue * exact_queue =
@@ -44739,41 +45034,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     ggml_sycl::mem_handle buffer_handle =
         ggml_sycl::detail::from_legacy_owned_alloc(std::move(host_buffer_owner), GGML_LAYOUT_AOS);
 
-    // Use the wrapper struct as buffer context so free_buffer knows which
-    // deallocation path to take.  Override get_base to extract the raw pointer.
-    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
-    if (!buffer) {
-        return nullptr;
-    }
-
-    // Capture the CPU iface BEFORE overriding it: the accessors below delegate
-    // to these exact implementations after waiting the GPU (llama.cpp-30h4).
-    auto * ctx = new sycl_host_buf_ctx{ ptr, size, std::move(buffer_handle), exact_device, buffer->iface };
-
-    if (!ggml_backend_buffer_set_type(buffer, buft)) {
-        ggml_backend_buffer_free(buffer);
-        delete ctx;
-        return nullptr;
-    }
-    buffer->context           = ctx;
-    buffer->iface.get_base    = ggml_backend_sycl_host_buffer_get_base;
-    buffer->iface.free_buffer = ggml_backend_sycl_host_buffer_free_buffer;
-    buffer->iface.clear       = ggml_backend_sycl_host_buffer_clear;
-    // Only wrap the accessors the CPU buffer actually implements; leaving an
-    // absent one null keeps ggml-backend's own fallbacks reachable.
-    if (ctx->cpu_iface.set_tensor) {
-        buffer->iface.set_tensor = ggml_backend_sycl_host_buffer_set_tensor;
-    }
-    if (ctx->cpu_iface.get_tensor) {
-        buffer->iface.get_tensor = ggml_backend_sycl_host_buffer_get_tensor;
-    }
-    if (ctx->cpu_iface.memset_tensor) {
-        buffer->iface.memset_tensor = ggml_backend_sycl_host_buffer_memset_tensor;
-    }
-    if (ctx->cpu_iface.cpy_tensor) {
-        buffer->iface.cpy_tensor = ggml_backend_sycl_host_buffer_cpy_tensor;
-    }
-    return buffer;
+    return ggml_backend_sycl_host_buffer_wrap(buft, ptr, size, std::move(buffer_handle), exact_device, nullptr);
 }
 
 ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
@@ -46084,6 +46345,7 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     pp_moe_onednn_drain_scratch_slots(device);
     ggml_sycl_execution_abort_and_release_graph(this);
     ggml_sycl_published_section_erase(this);
+    ggml_sycl_host_tenants_erase(this);
     ggml_sycl_execution_unbind_backend(this);
     {
         std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
@@ -113922,6 +114184,15 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_replan_scope_close") == 0) {
         return (void *) ggml_backend_sycl_replan_scope_close;
+    }
+    if (strcmp(name, "ggml_backend_sycl_claim_scope_open") == 0) {
+        return (void *) ggml_backend_sycl_claim_scope_open;
+    }
+    if (strcmp(name, "ggml_backend_sycl_claim_scope_close") == 0) {
+        return (void *) ggml_backend_sycl_claim_scope_close;
+    }
+    if (strcmp(name, "ggml_backend_sycl_claim_scope_claims") == 0) {
+        return (void *) ggml_backend_sycl_claim_scope_claims;
     }
     if (strcmp(name, "ggml_backend_sycl_plan_scope_open") == 0) {
         return (void *) ggml_backend_sycl_plan_scope_open;

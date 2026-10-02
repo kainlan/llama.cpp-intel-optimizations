@@ -855,6 +855,48 @@ class kv_region_registry {
         return previous;
     }
 
+    // Install the slot table of `ctx` (creating an otherwise empty entry) with the section digest it
+    // was built for.  Installs only over an entry that holds no table: the table is the context's
+    // held reservation, reserved once at its first publish, and a second install would drop the
+    // first's slots under whatever claims them.  False, changing nothing, when a table is
+    // already installed or `slots` is null; the caller keeps its own table and drops it with no
+    // lock held.
+    bool install_tenant_slots(kv_context_id ctx, std::shared_ptr<kv_tenant_slots> slots, uint64_t tenant_key) {
+        if (!slots) {
+            return false;
+        }
+        std::lock_guard<kv_witnessed_mutex> g(mu_);
+        kv_region_entry &                   e = entries_[ctx];
+        if (e.tenants) {
+            return false;
+        }
+        e.tenants    = std::move(slots);
+        e.tenant_key = tenant_key;
+        return true;
+    }
+
+    // Remove the slot table of `ctx`, moved out: its last drop frees the reservation and is the
+    // caller's, with no lock held.  The key then follows the published section (its own
+    // tenant_key, as in set_published_section), or is cleared when there is none.  An entry left
+    // empty is erased.  Null when there was no table.  A template on the section type for the same
+    // reason as set_published_section.
+    template <typename Section = runtime_context_section>
+    std::shared_ptr<kv_tenant_slots> take_tenant_slots(kv_context_id ctx) {
+        std::shared_ptr<kv_tenant_slots>    previous;
+        std::lock_guard<kv_witnessed_mutex> g(mu_);
+        auto                                it = entries_.find(ctx);
+        if (it == entries_.end() || !it->second.tenants) {
+            return previous;
+        }
+        previous                                       = std::move(it->second.tenants);
+        const std::shared_ptr<const Section> published = it->second.published;
+        it->second.tenant_key                          = published ? published->tenant_key : 0;
+        if (it->second.empty()) {
+            entries_.erase(it);
+        }
+        return previous;
+    }
+
     std::shared_ptr<kv_tenant_slots> tenants(kv_context_id ctx) const {
         std::lock_guard<kv_witnessed_mutex> g(mu_);
         auto                                it = entries_.find(ctx);

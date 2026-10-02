@@ -269,6 +269,14 @@
       "reason": "ggml_sycl_published_section_erase is noexcept and runs from ~ggml_backend_sycl_context: its try body is ggml_sycl_published_section_set with a null section (the execution_state_mutex read of the context id and one registry drop_published_section: a map find and an erase, no allocation of device memory and no planned-refusal path), and a rethrow of ggml_sycl_fallback_error out of a destructor would std::terminate. Permanent; llama.cpp-moua L4 step 3."
     },
     {
+      "id": "E-L4-HOST-TENANTS-ERASE",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_host_tenants_erase",
+      "count": 1,
+      "reason": "ggml_sycl_host_tenants_erase is noexcept and runs from ~ggml_backend_sycl_context: its try body takes the context's slot table out of the registry and drops it, which releases carves through their owners' destructors, and nothing in it raises a planned refusal; a rethrow of ggml_sycl_fallback_error out of a destructor would std::terminate. Permanent; llama.cpp-moua L4 step 3c."
+    },
+    {
       "id": "E-L4-LEDGER-CLEAR",
       "code": "G-CATCH",
       "file": "ggml-sycl.cpp",
@@ -291,6 +299,14 @@
       "function": "ggml_backend_sycl_load_late_check",
       "count": 1,
       "reason": "ggml_backend_sycl_load_late_check is a C-ABI comparison of two byte counts through the ledger: its try body reads the open load transaction from the lifecycle registry (admission_diagnostics), takes the ledger mutex and formats a log line, with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and answers NOT_RECORDED, the fail-closed value. Permanent; llama.cpp-moua L4 step 3."
+    },
+    {
+      "id": "E-L4-CLAIM-SCOPE-OPEN",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_backend_sycl_claim_scope_open",
+      "count": 1,
+      "reason": "ggml_backend_sycl_claim_scope_open is a C-ABI constructor for the claim scope: its try body reads the context's slot table from the registry and stores it in a thread_local, with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and reports failure as the null return that means no scope is in force. Permanent; llama.cpp-moua L4 step 3c."
     }
   ]
 }

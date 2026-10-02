@@ -1805,6 +1805,29 @@ GGML_BACKEND_API void * ggml_backend_sycl_replan_scope_open(enum ggml_sycl_repla
                                                             bool                             require_outermost);
 GGML_BACKEND_API void   ggml_backend_sycl_replan_scope_close(void * scope);
 
+// The claim scope of a context's tenant slots.  A context reserves its host-tier slots at its first
+// publish (one owner-first carve per host (cohort, index), sized by the descriptor's slot_bytes) and its
+// registry entry holds them for its life.  Between open and close, on the opening thread, the SYCL_Host
+// buffer type's alloc_buffer does not allocate: it claims the lowest free slot of the host compute
+// cohort, checks the request against that slot's size, and builds the buffer over the slot's memory.  A
+// request the table cannot serve (a slot too small, or none free) is refused by name,
+// "[CONTEXT-PLAN-BUG] host buffer claim refused", and returns a null buffer: it never grows and never
+// falls back to the allocating path.  A buffer's free releases its slot.  Outside a scope the buffer type
+// allocates as before, which is what an output buffer, a control vector and a host-resident LoRA base
+// take, so a caller keeps those out of every scope.
+//
+// open returns NULL, and no scope is in force, for a null or foreign backend, a context not bound to an
+// execution context, a context that holds no host reservation (its descriptor carried no host slot, or
+// it has not published one), and a thread that already holds a scope (nested opens are refused, and
+// logged).  A caller treats NULL as "allocate as before", never as an error.  close must run on the
+// thread that opened; NULL is a no-op.  claims returns how many claims succeeded through the scope.
+// Proc name: "ggml_backend_sycl_claim_scope_open".
+GGML_BACKEND_API void * ggml_backend_sycl_claim_scope_open(ggml_backend_t backend);
+// Proc name: "ggml_backend_sycl_claim_scope_close".
+GGML_BACKEND_API void   ggml_backend_sycl_claim_scope_close(void * scope);
+// Proc name: "ggml_backend_sycl_claim_scope_claims".
+GGML_BACKEND_API size_t ggml_backend_sycl_claim_scope_claims(void * scope);
+
 // A re-plan's per-context steps.  synchronize_for_replan waits every
 // queue that can reach a slice of the context, after llama's synchronize(); it returns
 // false if a wait failed.  graph_invalidate drops this context's own recorded graph
