@@ -316,10 +316,18 @@ def check_common(text):
         errs.append("%s: get_scratchpad_mem must be [[nodiscard]]" % COMMON)
     open_brace = text.index("{", balanced(text, m.end(), "(", ")"))
     body = text[open_brace + 1:balanced(text, open_brace + 1, "{", "}") - 1]
-    zero, lock = body.find("scratchpad_size == 0"), body.find("dnnl_mutex")
-    if zero < 0 or lock < 0 or zero > lock:
-        errs.append("%s: get_scratchpad_mem must return for a 0 B descriptor before it takes dnnl_mutex, so an unconditional "
-                    "request adds no lock to the cached path" % COMMON)
+    # The whole prefix is pinned, not just the order: a 0 B descriptor returns the empty memory and takes no lock, any other
+    # size reaches the lock, and nothing else sits between (a respelled test or a different empty value changes the answer
+    # every unconditional caller decides on).
+    prefix = re.compile(r"\s*size_t\s+scratchpad_size\s*=\s*scratchpad_md\s*\.\s*get_size\s*\(\s*\)\s*;"
+                        r"\s*if\s*\(\s*scratchpad_size\s*==\s*0\s*\)\s*\{\s*return\s+dnnl::memory\s*\(\s*\)\s*;\s*\}"
+                        r"\s*std::lock_guard<std::mutex>\s+lock\s*\(\s*dnnl_mutex\s*\)\s*;")
+    if not prefix.match(body):
+        errs.append("%s: get_scratchpad_mem must open with `size_t scratchpad_size = scratchpad_md.get_size(); if (scratchpad_size "
+                    "== 0) { return dnnl::memory(); }` and only then take dnnl_mutex: the 0 B path returns the empty memory "
+                    "without the lock, every other size takes it" % COMMON)
+    if len(re.findall(r"\bdnnl_mutex\b", body)) != 1:
+        errs.append("%s: get_scratchpad_mem must take dnnl_mutex exactly once" % COMMON)
     return errs
 
 
@@ -475,6 +483,14 @@ def gemm_mutants(files, edit):
     assert ct.count(zero + lock) == 1, "mutant anchor: the getter's zero-size return and lock in " + c
     out.append(("the getter's zero-size return is gone", edit(c, zero, "")))
     out.append(("the getter locks before its zero-size return", edit(c, zero + lock, lock + zero)))
+    for label, new_zero in (("the getter returns early for a nonzero size", zero.replace("== 0", "!= 0")),
+                            ("the getter returns early for every size", zero.replace("scratchpad_size == 0", "true")),
+                            ("the getter's early return is for size > 0", zero.replace("== 0", "> 0")),
+                            ("the getter's early return is for size <= 1", zero.replace("== 0", "<= 1")),
+                            ("the getter's early return builds a memory", zero.replace("dnnl::memory()", "dnnl::memory(scratchpad_md, eng)"))):
+        out.append((label, edit(c, zero, new_zero)))
+    out.append(("the getter never takes the lock", edit(c, zero + lock, zero)))
+    out.append(("the getter takes the lock twice", edit(c, zero + lock, zero + lock + lock.replace("lock(", "lock2("))))
     # ggml-sycl.cpp / outprod.cpp: the declared next paths
     def edit_pin(rel, pin, new, count=1):
         text = files[rel]
