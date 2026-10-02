@@ -2494,9 +2494,11 @@ one of each kind per context is a WARN naming the requester tag and the bytes; t
 printed as `hold_spills_raw` / `hold_spills_kv_zone` / `hold_spills_kv_zone_full` (with bytes) in the `[SCRATCH-STATS]`
 line, whichever of the three is non-zero. The counters restart at every publish, so the figures a finished context
 prints are its own and not the auto-ubatch ladder's (the once-only WARN latches do not restart). Each flagged scheduler compute buffer also prints one line as it is
-allocated, `[SCRATCH-STATS] device=D compute_buffer=<buffer type name> size=<MB> zone=<kv|raw|runtime|...|none>`
+allocated, `[SCRATCH-STATS] device=D compute_buffer=<buffer type name> size=<MB> zone=<kv|runtime|...|raw|host-pinned>`
 (`ggml_sycl_log_compute_buffer_landing`), so a throughput difference between two builds can be attributed to where
-a buffer physically sits. A raw
+a buffer physically sits. A buffer the arena placed is logged where it is placed; one nothing in the arena placed is
+placed by the legacy path in the allocator, which logs the buffer it makes, so the line names the FINAL landing (raw
+device memory, or host-pinned) and never `none` for a buffer that then lives somewhere. A raw
 spill cannot evict weights: the overcommit guard in `unified_alloc` runs for every raw device request, and for a
 hold-induced one it refuses loudly instead of calling `evict_and_flush` (trading a planned buffer's reservation for the
 model's own weights is not a trade the hold may make).
@@ -2541,10 +2543,20 @@ lose with the stop reason "hold spill left no headroom" and the ladder lands low
 constructor, with nobody asking, and the transaction before it ran with this context's KV not yet created. The
 constructor therefore calls the same entry after its reserve, whichever way it was made
 (`llama_context_sycl_hold_spill_fits`), and a refusal is a context-init refusal by name: `the largest -ub that fits is
-about N`, N from `zone_hold_spill_largest_ub` (the rung's raw spill scales about linearly with `n_ubatch`; the entry
-takes the rung's `n_ubatch` and returns the largest that fits, the smallest over the context's devices). A pinned
-`-ub 1024` on the B50 with Qwen is refused there, instead of reaching flash attention with 107.8 MB of headroom and
-hanging.
+about N, a power of two`, N from `zone_hold_spill_largest_ub` (the rung's raw spill scales about linearly with
+`n_ubatch`; the entry takes the rung's `n_ubatch` and returns the largest that fits, the smallest over the context's
+devices). N is snapped DOWN to a power of two, the rung a user passes and the ladder tries: a value landed exactly on
+the headroom is refused again by the next measurement (B50, Qwen: `-ub 1024` was refused and 512 landed where the
+linear scaling said 672). A pinned `-ub 1024` on the B50 with Qwen is refused there, instead of reaching flash attention
+with 107.8 MB of headroom and hanging.
+The constructor's check is skipped when the trial already passed the same check for the sched the constructor is left
+with (`sycl_hold_spill_validated_ub`, set by `try_candidate` for the rung and kept only when the settle step did not
+re-reserve): the two readings of the live free memory can differ at the margin, and the ladder's winner must not be
+overturned by a re-read. A pinned `-ub`, a trial that exited early, a missing hook and a settle that re-reserved leave it
+0 and the check runs. Not covered: a lazy re-reserve later on (an adapter change, a toggled embeddings or causal mode)
+makes buffers nobody checks. The SYCL entry changed arity (`largest_ub`); libllama and the backend library ship from one
+build, so there is no version gate, and an older library called with the extra argument leaves `largest_ub` 0, which
+degrades the advice and not the verdict.
 
 *A rung does not pay for the buffers of the rung before it.* `try_candidate` releases the previous rung's compute
 buffers (the scheduler, the reserve graph) before this rung's transaction. A rung that placed its buffers in the KV

@@ -1971,7 +1971,8 @@ bool unified_cache_release_planned_scratch_hold(int device_id, uint64_t owner) {
     state.request_hwm = 0;  // the largest request seen belongs to the context that is going away
     state.request_hwm_n_ubatch = 0;
     state.epoch_n_ubatch       = 0;
-    // The spill counters are not cleared: the owner's teardown take (after this release) still reports them.
+    // The spill counters are not touched here: the owner's teardown take (log_planned_scratch_stats)
+    // runs BEFORE this release, already reported them, and cleared them with its latches.
     return true;
 }
 

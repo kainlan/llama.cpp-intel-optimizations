@@ -17286,10 +17286,10 @@ static bool ggml_sycl_check_hold_spill_headroom(int device, size_t spill_bytes, 
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: the planned dense scratch holds back the RUNTIME zone and "
         "its worst-case spill outside the arena (%.1f MB: the plan plus the largest compute-buffer request, scaled "
-        "to this n_ubatch, net of the KV-zone room a compute buffer can use) would leave device %d %.1f MB free of "
-        "%.1f MB, under the %.1f MB driver headroom the arena expects; free VRAM on this card (another process, or "
-        "a smaller -ub / -c) before loading\n",
-        spill_bytes / mb, device, free_mem / mb, free_mem / mb, kSyclArenaMinExternalHeadroomBytes / mb);
+        "to this n_ubatch, net of the KV-zone room a compute buffer can use) would leave device %d %.1f MB free (%.1f "
+        "MB free now), under the %.1f MB driver headroom the arena expects; free VRAM on this card (another process, "
+        "or a smaller -ub / -c) before loading\n",
+        spill_bytes / mb, device, free_after / mb, free_mem / mb, kSyclArenaMinExternalHeadroomBytes / mb);
     return false;
 }
 
@@ -17345,6 +17345,12 @@ static bool ggml_sycl_check_hold_spill_realized(int        device,
 // context has no hold-induced spill that pushed the card under the driver headroom. The trial calls it after the
 // rung's sched_reserve() returned. A refusal is logged by name (at INFO: the loss is recoverable, the ladder lands
 // lower). Not a lifecycle transaction: it reads state and the live free memory and changes nothing.
+//
+// ABI: this entry changed arity (r4 added the largest_ub out-parameter) and is reached from libllama through
+// ggml_backend_sycl_get_proc_address on a backend-DL build. libllama and the SYCL DSO ship from one build, so there
+// is no version gate. An older DSO that predates the entry exports nothing and the caller skips it; one that exports
+// the three-argument form is called with a fourth argument it ignores, so largest_ub stays 0 (the caller zeroes it
+// before the call and reads 0 as "no -ub is known to fit"), which degrades the refusal's advice, never its verdict.
 bool ggml_backend_sycl_planned_hold_spill_fits(ggml_backend_t backend, uint32_t n_ubatch, uint32_t * largest_ub) {
     if (largest_ub) {
         *largest_ub = 0;
@@ -37970,35 +37976,41 @@ static const char * ggml_backend_sycl_buffer_type_get_name(ggml_backend_buffer_t
     return ctx->name.c_str();
 }
 
-// llama.cpp-kpjw: one line per scheduler compute buffer that asked for the KV-zone-first placement, naming the zone it
-// actually landed in. The zone is where the buffer's bytes physically are (KV zone: inside the arena; "raw": device
-// memory outside it; "none": nothing placed it here and the legacy path below decides), which a throughput comparison
-// between builds cannot otherwise attribute.
+// llama.cpp-kpjw: one line per scheduler compute buffer that asked for the KV-zone-first placement, naming where it
+// landed. The zone is where the buffer's bytes physically are (a zone name: inside the arena; "raw": device memory
+// outside it; "host-pinned": host memory; "none": nothing placed it), which a throughput comparison between builds
+// cannot otherwise attribute. A buffer the arena placed is logged where it is placed; one nothing in the arena placed
+// goes to the legacy path in the allocator below, which logs the buffer it makes (legacy_landing_pending), so the
+// line never says "none" for a buffer that then lives somewhere.
 static void ggml_sycl_log_compute_buffer_landing(int                             device,
                                                  const std::string &             name,
                                                  size_t                          size,
                                                  const ggml_sycl::alloc_handle & handle) {
     const char * zone = "none";
     if (handle.ptr) {
-        switch (handle.vram_zone) {
-            case ggml_sycl::vram_zone_id::KV:
-                zone = "kv";
-                break;
-            case ggml_sycl::vram_zone_id::WEIGHT:
-                zone = "weight";
-                break;
-            case ggml_sycl::vram_zone_id::ONEDNN:
-                zone = "onednn";
-                break;
-            case ggml_sycl::vram_zone_id::RUNTIME:
-                zone = "runtime";
-                break;
-            case ggml_sycl::vram_zone_id::SCRATCH:
-                zone = "scratch";
-                break;
-            default:
-                zone = "raw";
-                break;
+        if (handle.tier == ggml_sycl::alloc_tier::HOST_PINNED) {
+            zone = "host-pinned";
+        } else {
+            switch (handle.vram_zone) {
+                case ggml_sycl::vram_zone_id::KV:
+                    zone = "kv";
+                    break;
+                case ggml_sycl::vram_zone_id::WEIGHT:
+                    zone = "weight";
+                    break;
+                case ggml_sycl::vram_zone_id::ONEDNN:
+                    zone = "onednn";
+                    break;
+                case ggml_sycl::vram_zone_id::RUNTIME:
+                    zone = "runtime";
+                    break;
+                case ggml_sycl::vram_zone_id::SCRATCH:
+                    zone = "scratch";
+                    break;
+                default:
+                    zone = "raw";
+                    break;
+            }
         }
     }
     GGML_LOG_WARN("[SCRATCH-STATS] device=%d compute_buffer=%s size=%.1f MB zone=%s\n", device, name.c_str(),
@@ -38072,11 +38084,20 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
     // bump allocators).  This is safe because compute buffers are allocated once
     // during graph_reserve and persist for the context lifetime, just like KV
     // caches.  They don't need to be freed until the context is destroyed.
+    // llama.cpp-kpjw: set when a flagged compute buffer was not placed in the arena, so the legacy path below places it
+    // and its landing is logged from the handle that path makes (see ggml_sycl_log_compute_buffer_landing).
+    bool legacy_landing_pending = false;
     if (ggml_sycl::vram_arena_enabled()) {
         auto * cache = ggml_sycl::get_unified_cache_for_device(buft_ctx->device);
         if (cache && cache->arena_active()) {
             const bool should_use_runtime = !is_kv_buft && effective_mem_type == GGML_SYCL_MEM_DEVICE;
             // llama.cpp-kpjw: true for a scheduler compute buffer (see the flag below), false while a model loads.
+            // A process-global timing discriminator, not an identity one: nothing marks a request as a compute
+            // buffer, only that no model is loading right now. So a persistent tensor allocated through this buffer
+            // type after the load (a LoRA adapter, a control vector) is flagged too and gets a landing line, and a
+            // compute reserve that runs while ANOTHER model is loading is not flagged and takes the old KV/SCRATCH
+            // chain. Both are acceptable: the flag only chooses the KV zone over raw memory for a buffer the RUNTIME
+            // zone will not serve, and neither case is wrong about where it may live.
             const bool kv_zone_first      = !g_sycl_in_model_load.load(std::memory_order_acquire);
             if (should_use_runtime) {
                 // Route through RUNTIME zone.  A miss must not reset the zone
@@ -38104,7 +38125,12 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 ggml_sycl::alloc_handle runtime_h{};
                 ggml_sycl::unified_alloc(runtime_req, &runtime_h);
                 if (kv_zone_first) {
-                    ggml_sycl_log_compute_buffer_landing(buft_ctx->device, buft_ctx->name, size, runtime_h);
+                    if (runtime_h.ptr) {
+                        ggml_sycl_log_compute_buffer_landing(buft_ctx->device, buft_ctx->name, size, runtime_h);
+                    } else {
+                        // Nothing in the arena placed it: the legacy path below decides and logs where it landed.
+                        legacy_landing_pending = true;
+                    }
                 }
                 if (runtime_h.ptr) {
                     ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(
@@ -38329,6 +38355,10 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
         return nullptr;
     }
 alloc_succeeded:
+    // llama.cpp-kpjw: a flagged compute buffer the arena did not place lands here (raw device memory or host-pinned).
+    if (legacy_landing_pending) {
+        ggml_sycl_log_compute_buffer_landing(buft_ctx->device, buft_ctx->name, size, main_alloc);
+    }
     // llama.cpp-tsfl round 4 Q1: the oversize site's landing is counted
     // HERE, not where must_host_pinned was forced -- see that site's own
     // comment. Reaching this label at all already proves the allocation

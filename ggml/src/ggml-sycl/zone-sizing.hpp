@@ -345,9 +345,11 @@ size_t zone_kv_room_for_compute(size_t kv_largest_free, size_t kv_pending_bytes)
 // The largest n_ubatch a rung's raw (outside-arena) spill allows. The spill scales about linearly with n_ubatch, so
 // when `spill_bytes` made at `n_ubatch` left `free_after` against `headroom_target` and the hold is to blame
 // (zone_hold_spill_realized_fits refuses), the largest -ub is the share of the spill the card could have taken:
-// n_ubatch * (free_after + spill_bytes - headroom_target) / spill_bytes, rounded down to a multiple of 32. A rung
-// that fits is returned unchanged; 0 means no -ub is known to fit (not even no spill at all clears the headroom),
-// or n_ubatch is unknown. An ESTIMATE: the scaling is the same linear one the bound uses.
+// n_ubatch * (free_after + spill_bytes - headroom_target) / spill_bytes, rounded DOWN TO A POWER OF TWO (at least 32:
+// the rung a user passes and the ladder tries, and the margin the snap leaves is what keeps the advice from being
+// refused again by the next measurement). A rung that fits is returned unchanged; 0 means no -ub is known to fit
+// (not even no spill at all clears the headroom, or the share is under 32), or n_ubatch is unknown. An ESTIMATE:
+// the scaling is the same linear one the bound uses.
 uint32_t zone_hold_spill_largest_ub(uint32_t n_ubatch, size_t spill_bytes, size_t free_after, size_t headroom_target);
 
 // Whether a RUNTIME-zone request goes to the KV zone instead of the zone / raw device memory: only a request the

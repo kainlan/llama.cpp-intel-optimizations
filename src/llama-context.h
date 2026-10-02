@@ -319,6 +319,13 @@ private:
     // candidates fit without changing anything else the key tracks.
     void sycl_select_auto_ubatch(enum ggml_type type_k, enum ggml_type type_v);
 
+    // llama.cpp-kpjw: the n_ubatch whose compute buffers the auto-ubatch trial already passed the realized hold-spill
+    // check for, and which is the sched the constructor is left with (the winner's reserve, not re-made by the
+    // settle step); 0 when nothing was validated (a pinned -ub, a trial that exited early, a settle that
+    // re-reserved, a backend without the check). The constructor's own check runs unless it equals n_ubatch, so
+    // it never re-reads the live free memory at the margin to overturn a rung the ladder just accepted.
+    uint32_t sycl_hold_spill_validated_ub = 0;
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);

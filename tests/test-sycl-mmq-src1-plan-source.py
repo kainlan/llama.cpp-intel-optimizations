@@ -863,7 +863,7 @@ def evaluate(backend, common, cache, zone):
     legacy_move_at = backend.find("set_managed_owner(std::move(main_alloc))", alloc_ok_at) if alloc_ok_at > 0 else -1
     results["a flagged buffer the legacy path places gets its final landing line, from the handle that path made"] = \
         0 < alloc_ok_at < legacy_log_at < legacy_move_at and \
-        re.search(r"if\s*\(\s*legacy_landing_pending\s*\)\s*\{\s*$", backend[:legacy_log_at].rstrip().rsplit("\n", 1)[-1] + "{") is not None and \
+        re.search(r"if\s*\(\s*legacy_landing_pending\s*\)\s*\{\s*$", backend[:legacy_log_at]) is not None and \
         re.search(r"bool\s+legacy_landing_pending\s*=\s*false\s*;", backend[:backend.find('"backend-buffer-runtime-zone"')]) is not None and \
         re.search(r"if\s*\(\s*kv_zone_first\s*\)\s*\{\s*if\s*\(\s*runtime_h\.ptr\s*\)\s*\{\s*ggml_sycl_log_compute_buffer_landing\(\s*"
                   r"buft_ctx->device\s*,\s*buft_ctx->name\s*,\s*size\s*,\s*runtime_h\s*\)\s*;\s*\}\s*else\s*\{\s*legacy_landing_pending\s*=\s*true\s*;",
@@ -1601,7 +1601,7 @@ if args.self_test:
          (mutate_re_in_func(backend, r"static bool ggml_sycl_check_hold_spill_headroom\(",
                             r"free_after\s*/\s*mb\s*,\s*free_mem\s*/\s*mb", "free_mem / mb, free_mem / mb"), common, cache, zone)),
         ("F3 calls the current free what it would leave", "the F3 refusal prints the free memory it would leave and the free memory now, each once",
-         (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_headroom\(", "MB free (%.1f MB free now)", "MB free of %.1f MB"), common, cache, zone)),
+         (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_headroom\(", "MB free now)", "MB total)"), common, cache, zone)),
         ("landing: KV named runtime (F3)", "the landing line names each zone as itself, a buffer outside the arena as raw, host memory as host-pinned",
          (mutate_in_func(backend, r"static void ggml_sycl_log_compute_buffer_landing\(", 'zone = "kv";', 'zone = "runtime";'), common, cache, zone)),
         ("landing: outside the arena named kv (F4)", "the landing line names each zone as itself, a buffer outside the arena as raw, host memory as host-pinned",
@@ -1718,7 +1718,7 @@ if args.self_test:
         ("release comment says after", "the release comment says the teardown take ran BEFORE it (it does: log_planned_scratch_stats, then the release)",
          raw_with(4, "BEFORE this release", "after this release")),
         ("m4 comment lost", "the m4 flag's comment says it is a process-global timing discriminator, not an identity one",
-         raw_with(0, "process-global", "per-buffer")),
+         raw_with(0, "A process-global timing discriminator", "A per-buffer discriminator")),
         ("entry arity comment lost", "the exported entry's comment states the arity change and what an old DSO does",
          raw_with(0, "largest_ub stays 0", "nothing happens")),
         ("lazy re-reserve gap unnamed", "the context-init check's comment names the gap: a later lazy re-reserve is not covered",

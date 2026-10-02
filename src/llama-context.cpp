@@ -1164,8 +1164,16 @@ llama_context::llama_context(
         // outside the arena can leave the card under the driver headroom the arena expects (B50, Qwen, -ub 1024: a
         // 461 MB buffer, flash attention out of resources at the first graph and a hang). Refuse the context here,
         // by name, with the -ub that fits, instead.
+        //
+        // The gap, not covered here: a lazy re-reserve LATER (sched_need_reserve set by an adapter change, a toggled
+        // embeddings or causal mode) makes new compute buffers this check never sees. The hold-induced spill of
+        // those is checked by nobody until the next context-init; tracked separately, not handled here.
+        //
+        // Skipped when the trial just passed the same check for this very sched (sycl_hold_spill_validated_ub): the
+        // two readings of the live free memory can differ at the margin, and the ladder's winner must not be
+        // overturned by a re-read.
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-        if (llama_context_has_sycl_backend(backends)) {
+        if (llama_context_has_sycl_backend(backends) && sycl_hold_spill_validated_ub != cparams.n_ubatch) {
             uint32_t largest_ub = 0;
             if (!llama_context_sycl_hold_spill_fits(backends, cparams.n_ubatch, &largest_ub)) {
                 throw std::runtime_error(format(
@@ -1173,7 +1181,8 @@ llama_context::llama_context(
                     "the VRAM arena and left a card under the driver headroom the arena expects (n_ubatch=%u); %s",
                     cparams.n_ubatch,
                     largest_ub != 0 ?
-                        format("the largest -ub that fits is about %u (or free VRAM on the card, or pass a smaller -c)",
+                        format("the largest -ub that fits is about %u, a power of two (or free VRAM on the card, or "
+                               "pass a smaller -c)",
                                largest_ub)
                             .c_str() :
                         "no -ub is known to fit: free VRAM on the card, or pass a smaller -c"));
@@ -1521,6 +1530,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 // inside the probe itself log at GGML_LOG_INFO, not ERROR (Task 2), so a
 // multi-candidate trial does not print one scary refusal per losing candidate.
 void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) {
+    sycl_hold_spill_validated_ub = 0;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     struct sycl_probe_backend {
         ggml_backend_t backend;
@@ -1626,6 +1636,7 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // `cparams.n_ubatch = std::min(cparams.n_batch, ...)` assignment, above.
     const uint32_t fallback_ubatch         = cparams.n_ubatch;
     uint32_t       last_good               = 0;
+    uint32_t       hold_spill_validated_ub = 0;  // the rung try_candidate last passed the realized hold-spill check for
     bool           sched_matches_last_good = false;
     bool           published_any           = false;
     bool           publish_dirty           = false;  // a candidate publish threw, possibly after landing somewhere
@@ -1668,6 +1679,7 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
         sched.reset();
         sched_need_reserve      = true;
         sched_matches_last_good = false;
+        hold_spill_validated_ub = 0;
 
         for (auto & sb : sycl_backends) {
             ggml_sycl_runtime_context_probe probe{};
@@ -1809,6 +1821,9 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
                 return "hold spill left no headroom";
             }
         }
+        // The check ran for every backend only when the hook exists (a backend-DL SYCL library that predates it
+        // leaves nothing validated, and the constructor's check, which has no hook either, skips it the same way).
+        hold_spill_validated_ub = hold_spill_fn ? c : 0;
         return nullptr;
     };
 
@@ -2109,6 +2124,9 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // when the failed candidate was fallback_ubatch and oversized, never
     // undersized, otherwise. The settle's own publish gate never inspects the
     // ring directly -- it does not need to.
+    // The sched the constructor is left with is the validated one only when the settle below does not re-reserve.
+    sycl_hold_spill_validated_ub =
+        (sched_matches_last_good && cparams.n_ubatch == last_good) ? hold_spill_validated_ub : 0;
     if (!sched_matches_last_good || cparams.n_ubatch != last_good) {
         const bool need_publish =
             llama_auto_ubatch_settle_needs_publish(published_any, publish_dirty, cparams.n_ubatch, fallback_ubatch);

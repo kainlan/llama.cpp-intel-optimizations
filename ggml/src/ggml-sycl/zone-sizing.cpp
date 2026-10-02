@@ -425,7 +425,14 @@ uint32_t zone_hold_spill_largest_ub(uint32_t n_ubatch, size_t spill_bytes, size_
     const double scaled =
         static_cast<double>(n_ubatch) * static_cast<double>(allowed) / static_cast<double>(spill_bytes);
     const uint32_t ub = scaled >= static_cast<double>(n_ubatch) ? n_ubatch : static_cast<uint32_t>(scaled);
-    return ub - ub % 32;
+    // Down to a power of two: the rung a user passes and the ladder tries. A value landed exactly on the headroom
+    // is refused again by the next measurement (B50, Qwen: 1024 was refused and 512 landed where the linear
+    // scaling said 672), so the answer keeps the margin the snap leaves instead of promising a fit it cannot.
+    uint32_t       snapped = 0;
+    for (uint32_t rung = 32; rung != 0 && rung <= ub; rung <<= 1) {
+        snapped = rung;
+    }
+    return snapped;
 }
 
 bool zone_runtime_spill_prefers_kv_zone(bool   compute_spill_flag,
