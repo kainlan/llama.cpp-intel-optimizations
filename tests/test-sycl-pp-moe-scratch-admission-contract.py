@@ -55,10 +55,32 @@ def reserve_call_arguments(source):
     return calls
 
 
-# `std::max(planned...` in any spelling of the whitespace: the pre-ijla upsize and every hoisted variant of it.
-PLANNED_MAX = re.compile(r"std::max\s*\(\s*planned")
+# The pre-ijla upsize and every hoisted variant of it: `std::max(planned...` in any spelling of the whitespace,
+# `std::max<size_t>(...)`, `(std::max)(...)`, the planned value as the second or a cast argument, and the
+# ternary spelling of the same max (`planned_x > y ? planned_x : y`).
+PLANNED_MAX_CALL = re.compile(r"(?:std\s*::\s*max|\(\s*std\s*::\s*max\s*\))\s*(?:<[^>]*>)?\s*\(")
+_OPERAND = r"[\w:.\[\]()]+"
+# `a > b ? a : b` / `a < b ? b : a`: the same two operands compared and then selected from.
+PLANNED_TERNARY = re.compile(r"(%s)\s*[<>]=?\s*(%s)\s*\?\s*(%s)\s*:\s*(%s)" % ((_OPERAND,) * 4))
 # The single legitimate site (llama.cpp-479i): the dense Q8_1 src1 buffer is sized to its graph-entry demand.
 DENSE_Q8_1_SRC1_GROWTH = re.compile(r"std::max\s*\(\s*planned_bytes\s*,\s*demand\s*\[\s*d\s*\]\s*\.bytes\s*\)")
+
+
+def planned_upsizes(source):
+    """Every place `source` takes a max of a planned size with something else (see PLANNED_MAX_CALL)."""
+    sites = []
+    for match in PLANNED_MAX_CALL.finditer(source):
+        depth, index = 1, match.end()
+        while index < len(source) and depth:
+            depth += (source[index] == "(") - (source[index] == ")")
+            index += 1
+        if re.search(r"\bplanned", source[match.end():index - 1]):
+            sites.append(source[match.start():index])
+    for match in PLANNED_TERNARY.finditer(source):
+        left, right, first, second = match.groups()
+        if {first, second} == {left, right} and re.search(r"\bplanned", left + " " + right):
+            sites.append(match.group(0))
+    return sites
 
 
 def strip_comments(source):
@@ -236,7 +258,7 @@ def evaluate(sycl, cache, module, header, doc=""):
         # cohort planned to its own graph-entry demand that logs any in-op growth.
         "no std::max(planned ...) survives outside the one 479i site":
             len(DENSE_Q8_1_SRC1_GROWTH.findall(sycl)) == 1
-            and not PLANNED_MAX.search(DENSE_Q8_1_SRC1_GROWTH.sub("", sycl)),
+            and not planned_upsizes(DENSE_Q8_1_SRC1_GROWTH.sub("", sycl)),
         # ABSENCE: with a general fallback present, refusing costs nothing and
         # the cap is decorative -- the batch simply allocates its own scratch.
         "the batched executor keeps no general temporary fallback":
@@ -379,9 +401,31 @@ ABSENCE_MUTANTS = {
 }
 
 
+# More spellings of the hoisted max, each of which must trip the same check as the plain one.
+PLANNED_MAX_SPELLINGS = (
+    "const size_t h = std::max<size_t>(planned_weight, weight_bytes);",
+    "const size_t h = std::max(weight_bytes, planned_weight);",
+    "const size_t h = std::max(static_cast<size_t>(planned_weight), weight_bytes);",
+    "const size_t h = (std::max)(planned_weight, weight_bytes);",
+    "const size_t h = planned_weight > weight_bytes ? planned_weight : weight_bytes;",
+    "const size_t h = weight_bytes > planned_weight ? weight_bytes : planned_weight;",
+    # a second use of the one exempt spelling is still a second site
+    "const size_t h = std::max(planned_bytes, demand[d].bytes);",
+)
+
+
 def self_test(sycl, cache, module, header, doc):
     """Every absence check must fail once its forbidden construct is injected."""
     problems = []
+    call_site = squeeze("            if (!cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)) {")
+    for spelling in PLANNED_MAX_SPELLINGS:
+        base = squeeze(sycl)
+        if call_site not in base:
+            problems.append("mutation anchor missing for the planned-max spellings")
+            break
+        _, failed, _ = evaluate(base.replace(call_site, squeeze(spelling + "\n" + call_site), 1), cache, module, header, doc)
+        if "no std::max(planned ...) survives outside the one 479i site" not in failed:
+            problems.append("planned-max check did not fire on: " + spelling)
     for name, (target, anchor, replacement) in ABSENCE_MUTANTS.items():
         sources = {"sycl": sycl, "cache": cache, "module": module, "header": header}
         anchor, replacement = squeeze(anchor), squeeze(replacement)
