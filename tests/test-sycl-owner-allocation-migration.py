@@ -150,28 +150,63 @@ RUNTIME_CODE     = _blank_comments(RUNTIME)
 COMMON_CODE      = _blank_comments(COMMON)
 COMMON_IMPL_CODE = _blank_comments(COMMON_IMPL)
 
-# One owner-first site in ggml-sycl.cpp is not production code: cec4a5f10 (zhcn C7a) added the test hook
-# ggml_backend_sycl_test_park_tenant_staging, built only under GGML_SYCL_PRIVATE_TESTING. It is pinned by name
-# below, and the census counts production sites only, so a count of 24 still means 24 reviewed runtime sites and a
-# second hook (or a hook that grows a legacy site) fails instead of being absorbed by a bumped number.
-TEST_HOOK_HEAD = "size_t ggml_backend_sycl_test_park_tenant_staging(ggml_backend_t backend, size_t nbytes) {"
-TEST_HOOK_GUARD = "#if defined(GGML_SYCL_PRIVATE_TESTING)"
-TEST_HOOK = region(RUNTIME_CODE, TEST_HOOK_HEAD, "\n#endif")
-RUNTIME_PRODUCTION_CODE = RUNTIME_CODE.replace(TEST_HOOK, "", 1)
+# unified_allocate_owner( in ggml-sycl.cpp is pinned as a baseline count plus a NAMED-site list. A site that is
+# not one of the baseline runtime sites is added as one (function, reason) line in NAMED_OWNER_FIRST_SITES below,
+# never by raising the baseline: a count says nothing about WHICH site was added or why it is legitimate, and the
+# list is a plain per-line merge when two branches each add a site. The census counts the code with every named
+# function's body cut out, so the baseline stays at the reviewed 24 runtime sites. Each named function must hold
+# exactly one owner-first allocation, refuse on failure, and hand the owner over only through
+# mem_handle::from_owned_alloc, with no legacy unified_alloc( / from_legacy_owned_alloc in it; a function named
+# ggml_backend_sycl_test_* is a PRIVATE_TESTING seam and must sit inside that guard.
+OWNER_FIRST_BASELINE_SITES = 24
+NAMED_OWNER_FIRST_SITES = (
+    ("ggml_backend_sycl_test_park_tenant_staging",
+     "zhcn C7a (cec4a5f10): parks one host-pinned STAGING entry under a tenant cohort for the replay-only-call "
+     "test; owner-first, handed over via from_owned_alloc"),
+)
 
-with gate("test hook ggml_backend_sycl_test_park_tenant_staging is a guarded owner-first site"):
-    hook_at = RUNTIME_CODE.index(TEST_HOOK_HEAD)
-    assert RUNTIME_CODE[:hook_at].rstrip().endswith(TEST_HOOK_GUARD), "the hook is not inside GGML_SYCL_PRIVATE_TESTING"
-    assert TEST_HOOK.count("unified_allocate_owner(") == 1
-    assert "unified_alloc(" not in TEST_HOOK and "from_legacy_owned_alloc" not in TEST_HOOK
-    _allocation = TEST_HOOK.index("unified_allocate_owner(req)")
-    _refused    = TEST_HOOK.index("if (!allocation)", _allocation)
-    _wrapped    = TEST_HOOK.index("from_owned_alloc(std::move(allocation.owner)", _refused)
-    assert _allocation < _refused < _wrapped
-    assert RUNTIME_CODE.count("unified_allocate_owner(") == RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner(") + 1
+
+def function_body_span(code: str, name: str):
+    """(start of the definition, end of its closing brace) of the one function `name` defined in `code`."""
+    heads = list(re.finditer(r"\b%s\([^;{}]*\)\s*(?:noexcept\s*)?\{" % re.escape(name), code))
+    assert len(heads) == 1, "%s: expected one definition, found %d" % (name, len(heads))
+    start = heads[0].start()
+    depth, index = 0, heads[0].end() - 1
+    while True:
+        depth += (code[index] == "{") - (code[index] == "}")
+        index += 1
+        if depth == 0:
+            return start, index
+
+
+RUNTIME_PRODUCTION_CODE = RUNTIME_CODE
+with gate("every named owner-first site in ggml-sycl.cpp is a guarded, owner-first site"):
+    _removed = 0
+    for _function, _reason in NAMED_OWNER_FIRST_SITES:
+        assert _reason, "%s has no reason" % _function
+        _start, _end = function_body_span(RUNTIME_CODE, _function)
+        _body = RUNTIME_CODE[_start:_end]
+        assert _body.count("unified_allocate_owner(") == 1, "%s: not exactly one owner-first allocation" % _function
+        assert "unified_alloc(" not in _body and "from_legacy_owned_alloc" not in _body, _function
+        _allocation = _body.index("unified_allocate_owner(")
+        _refused    = _body.index("if (!allocation)", _allocation)
+        _wrapped    = _body.index("from_owned_alloc(std::move(allocation.owner)", _refused)
+        assert _allocation < _refused < _wrapped, "%s: allocate, refuse-check, from_owned_alloc out of order" % _function
+        if _function.startswith("ggml_backend_sycl_test_"):
+            # Between the guard and the definition there is only the return type: no `;`, `}` or #endif.
+            assert re.search(r"#if defined\(GGML_SYCL_PRIVATE_TESTING\)\s*[\w:<>*&\s]*$", RUNTIME_CODE[:_start]), \
+                "%s is a test seam outside GGML_SYCL_PRIVATE_TESTING" % _function
+        _removed += 1
+    # Cut the named bodies out (back to front, so earlier spans stay valid).
+    for _function, _reason in sorted(NAMED_OWNER_FIRST_SITES,
+                                     key=lambda entry: function_body_span(RUNTIME_CODE, entry[0])[0], reverse=True):
+        _start, _end = function_body_span(RUNTIME_CODE, _function)
+        RUNTIME_PRODUCTION_CODE = RUNTIME_PRODUCTION_CODE[:_start] + RUNTIME_PRODUCTION_CODE[_end:]
+    assert RUNTIME_CODE.count("unified_allocate_owner(") == \
+        RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner(") + _removed
 
 for _label, _code, _pins in (
-    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (54, 42, 24)),
+    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (54, 42, OWNER_FIRST_BASELINE_SITES)),
     ("common.hpp", COMMON_CODE, (3, 4, 3)),
     ("common.cpp", COMMON_IMPL_CODE, (8, 8, 4)),
 ):
