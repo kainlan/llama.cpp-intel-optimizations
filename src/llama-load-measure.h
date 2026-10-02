@@ -262,10 +262,13 @@ inline std::string llama_late_check_not_recorded_text(int32_t device, uint32_t n
 // (the backend has logged its own canonical line). The host tier is skipped: the backend's entry point takes a
 // SYCL device index, and no host term is recorded at the early stage today. That skip is of the late
 // COMPARISON only. A host-tier refusal can still occur at every stage, probe and admitted included, but
-// inside the measure, not in a comparison: the host compute buft's chunk cap is the per-process constant (it
-// has no refusal source), while its chunk plan is refused like any buft's when the peaks need more chunks than
-// allowed, and that comes back as the measure's own failure naming the stage. (llama has no probe or admitted
-// call site yet; those stages are the backend planner's, and they read the host term from the same result.)
+// inside the measure, not in a comparison: the CPU backend's host compute buft (or its activation twin) has
+// no refusal source and its chunk cap is the per-process constant, while its chunk plan is refused like any
+// buft's when the peaks need more chunks than allowed, and that comes back as the measure's own failure
+// naming the stage. (SYCL_CpuOffloadCompute does refuse under a plan scope, by design.) The refusal text's
+// device field is the first SYCL device's, so a host-tier refusal reads "on device N" while its reason names
+// SYCL_Host. (llama has no probe or admitted call site yet; the backend planner's stages will read the host
+// term from the same result.)
 inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs &                    procs,
                                                      struct ggml_sycl_load_txn                      txn,
                                                      const std::vector<llama_load_measure_device> & devices,
