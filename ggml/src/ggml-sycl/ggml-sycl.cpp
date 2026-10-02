@@ -45110,8 +45110,8 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
         // (sched_measure_storage, whose reserves go through ggml_backend_sched_reserve, which does synchronize, and
         // whose final free does not) and the unwinding of a constructor that threw.  Nothing runs a kernel on either,
         // and no claim scope is open on either.  L6 CONSTRAINT: a claim scope must never be opened on the measure
-        // scheduler (its reserve is bare, with no plan scope or hold record around it); a scope that is makes both
-        // frees paths of the list above, and each then needs a synchronize before it.
+        // scheduler (its reserve is bare, with no plan scope or hold record around it); a scope opened there turns both
+        // frees into paths on the list above, and each then needs a synchronize before it.
         //
         // A FAILED DRAIN: "synchronize" is an attempt: ggml_backend_sycl_synchronize swallows its own failure (a
         // throwing drain goes to ggml_backend_sycl_graph_boundary_exception_cleanup, which logs, and the call

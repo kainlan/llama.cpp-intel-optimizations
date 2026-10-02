@@ -513,7 +513,8 @@ def free_path_pins(source, freeb, fails):
     stream_fn = function_body(source, STREAM_SIG)
     pin(fails, stream_fn,
         r"^[^{]*\{\s*if \(sycl::queue \* execution_queue = ggml_sycl_execution_queue_for_device\(device\)\) \{\s*"
-        r"if \(qptrs\[device\]\[stream\] != execution_queue\) \{[^}]*\}\s*return execution_queue;\s*\}",
+        r"if \(qptrs\[device\]\[stream\] != execution_queue\) \{\s*qptrs\[device\]\[stream\] = execution_queue;\s*"
+        r"GGML_SYCL_DEBUG\([^;]*\);\s*\}\s*return execution_queue;\s*\}",
         "L4 free path: ggml_backend_sycl_context::stream(device, idx) no longer answers the device's one execution queue "
         "for every idx (a second queue per device is one the synchronize does not drain)")
     pin(fails, function_body(source, EXEC_QUEUE_SIG),
@@ -734,7 +735,7 @@ def check(header_raw, source):
     pin(fails, herase_fn,
         r"^[^{]*\{\s*try \{\s*if \(context_id == 0 \|\| device < 0 \|\| device >= GGML_SYCL_MAX_DEVICES\) \{\s*return;\s*\}\s*"
         r"auto previous = ggml_sycl_kv_region_registry\(device\)\.take_tenant_slots\(context_id\);\s*\(void\) previous;\s*"
-        r"\} catch \(\.\.\.\)",
+        r"\} catch \(\.\.\.\) \{\s*GGML_LOG_ERROR\(\s*(?:\"[^\"]*\"\s*)+\);\s*\}\s*\}$",
         "L4 host tier: the host reservation's erase does not take the table by the id it was given")
     erase_fn = function_body(source, ERASE_SECTION_SIG) or ""
     if not re.search(r"catch\s*\(\.\.\.\)\s*\{\s*GGML_LOG_ERROR\(", erase_fn):
@@ -744,7 +745,7 @@ def check(header_raw, source):
     pin(fails, erase_fn,
         r"^[^{]*\{\s*try \{\s*if \(context_id == 0 \|\| device < 0 \|\| device >= GGML_SYCL_MAX_DEVICES\) \{\s*return;\s*\}\s*"
         r"auto previous = ggml_sycl_kv_region_registry\(device\)\.drop_published_section\(context_id\);\s*\(void\) previous;\s*"
-        r"\} catch \(\.\.\.\)",
+        r"\} catch \(\.\.\.\) \{\s*GGML_LOG_ERROR\(\s*(?:\"[^\"]*\"\s*)+\);\s*\}\s*\}$",
         "L4 section: the section's erase does not drop the section by the id it was given")
 
     # load_end: guard after the finisher check
@@ -1177,6 +1178,17 @@ def mutations(header_raw, source):
          "context_id == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES", "context_id == 0"),
         ("the host reservation's erase drops its device bounds", "does not take the table by the id it was given", ERASE_HOST_SIG,
          "context_id == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES", "context_id == 0"),
+        ("the stream block returns a second queue from inside the re-point", "no longer answers the device's one execution queue for every idx", STREAM_SIG,
+         "qptrs[device][stream] = execution_queue;",
+         "qptrs[device][stream] = execution_queue;\n                if (stream != 0) return &ggml_sycl_get_device(device).default_queue();"),
+        ("the host reservation's erase rethrows after the log", "does not take the table by the id it was given", ERASE_HOST_SIG,
+         "pinned until the process ends\\n\");", "pinned until the process ends\\n\");\n        throw;"),
+        ("the section's erase rethrows after the log", "does not drop the section by the id it was given", ERASE_SECTION_SIG,
+         "process ends\\n\");", "process ends\\n\");\n        throw;"),
+        ("the section's erase drops again on device 0 after the catch", "does not drop the section by the id it was given", ERASE_SECTION_SIG,
+         "process ends\\n\");\n    }", "process ends\\n\");\n    }\n    (void) ggml_sycl_kv_region_registry(0).drop_published_section(context_id);"),
+        ("the host reservation's erase takes again on device 0 after the catch", "does not take the table by the id it was given", ERASE_HOST_SIG,
+         "pinned until the process ends\\n\");\n    }", "pinned until the process ends\\n\");\n    }\n    (void) ggml_sycl_kv_region_registry(0).take_tenant_slots(context_id);"),
         ("the host reservation's erase keeps the table", "does not take the table by the id it was given", ERASE_HOST_SIG,
          "(void) previous;", "static std::shared_ptr<ggml_sycl::kv_tenant_slots> h_keep; h_keep = previous;"),
         ("the section's erase keeps the section", "does not drop the section by the id it was given", ERASE_SECTION_SIG,
