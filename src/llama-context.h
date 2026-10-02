@@ -648,9 +648,9 @@ private:
     std::vector<uint32_t>  tenant_rung_set;
 
     // Folds R_h: `current` is the section the transaction just built at cparams.n_ubatch, every other rung
-    // of the set is measured here. A rung whose measure fails is left out: it fails the same way when the
-    // ladder tries it.
-    void tenant_host_hold_fold(const std::vector<ggml_sycl_context_tenant_desc> & current);
+    // of the set is measured here. A rung whose measure refuses or throws is left out: it fails the same way
+    // when the ladder tries it. The hold is recorded as ready only after every rung has been tried.
+    void tenant_host_hold_measure_and_fold(const std::vector<ggml_sycl_context_tenant_desc> & current);
 
     bool sched_need_reserve = true;
 

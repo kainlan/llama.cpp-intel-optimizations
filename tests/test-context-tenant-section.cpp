@@ -23,7 +23,11 @@
 //   (10) the host-tier HOLD (design 3.3): R_h[i] is the maximum over the ladder's rungs of the rung
 //       section's COMPUTE_HOST slot i, taken from the section the builder produced (no second
 //       derivation), and the section the publish carries holds R_h[i] at every index. Perturbing one
-//       rung's measurement changes exactly the slots it dominates.
+//       rung's measurement changes exactly the slots it dominates. This case proves the fold
+//       arithmetic only. That the transaction folds the sections its own MEASUREs produced (and
+//       skips a rung whose MEASURE refuses or throws, and marks the hold ready only after the
+//       loop) is pinned by tests/test-sycl-tenant-section-source.py, which a host test cannot
+//       reach because the transaction lives in llama-context.cpp.
 
 #include "../src/llama-context-tenant.h"
 

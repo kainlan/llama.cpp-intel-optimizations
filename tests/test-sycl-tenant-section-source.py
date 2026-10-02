@@ -237,7 +237,7 @@ def test_the_cohort_ids_are_pinned_and_append_only():
 
 # --- the host tier's HOLD: one source for R_h, folded over the rung set ----------------------------------------
 
-_HOLD_FOLD = "void llama_context::tenant_host_hold_fold(const std::vector<ggml_sycl_context_tenant_desc> & current)"
+_HOLD_FOLD = "void llama_context::tenant_host_hold_measure_and_fold(const std::vector<ggml_sycl_context_tenant_desc> & current)"
 _SELECT = "void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v)"
 
 
@@ -245,39 +245,54 @@ def hold_txn_ok(code: str) -> bool:
     """The transaction folds R_h once, from the section it just built, and applies it before the key is taken."""
     b = function_body(code, _TXN)
     build = b.find(z("llama_tenant_section_from_caps("))
-    fold = b.find(z("if (!tenant_host_hold_ready) { tenant_host_hold_fold(tenant_section); }"))
+    fold = b.find(z("if (!tenant_host_hold_ready) { tenant_host_hold_measure_and_fold(tenant_section); }"))
     apply = b.find(z("llama_tenant_section_apply_host_hold(tenant_section, tenant_host_hold);"))
     key = b.find(z("tenant_key = llama_tenant_key_digest(tenant_section);"))
     if min(build, fold, apply, key) == -1 or not (build < fold < apply < key):
         return False
-    return b.count(z("llama_tenant_section_apply_host_hold(")) == 1 and b.count(z("tenant_host_hold_fold(")) == 1
+    return b.count(z("llama_tenant_section_apply_host_hold(")) == 1 and b.count(z("tenant_host_hold_measure_and_fold(")) == 1
 
 
 def hold_fold_ok(code: str) -> bool:
-    """R_h is read from the sections the builder produced: the current rung's, and each other rung's own MEASURE."""
+    """R_h is read from the sections the builder produced: the current rung's, and each other rung's own MEASURE.
+    A rung that refuses or throws is left out, and the hold is ready only after every rung has been tried."""
     b = function_body(code, _HOLD_FOLD)
     needs = [
-        "tenant_host_hold = llama_tenant_host_hold();",
-        "tenant_host_hold_ready = true;",
-        "llama_tenant_host_hold_fold(tenant_host_hold, current);",
+        "llama_tenant_host_hold hold;",
+        "llama_tenant_host_hold_fold(hold, current);",
         "for (const uint32_t rung : tenant_rung_set) {",
         "if (rung == cparams.n_ubatch) { continue; }",
+        "try {",
         "storage.cparams.n_ubatch = rung;",
         "sched_reserve_impl(sched_reserve_mode::MEASURE, state);",
-        "if (measured.status != sched_reserve_status::OK) {",
-        "llama_tenant_section_from_caps(measure_tenant_caps(storage.plan), rung_section, reason)",
-        "llama_tenant_host_hold_fold(tenant_host_hold, rung_section);",
+        # a refused MEASURE is skipped, by name, with its own continue
+        'if (measured.status != sched_reserve_status::OK) { LLAMA_LOG_DEBUG("%s: rung %u left out of the host hold: %s\\n", __func__, rung, measured.reason.c_str()); continue; }',
+        # a section the builder refuses is skipped, with its own continue
+        'if (!llama_tenant_section_from_caps(measure_tenant_caps(storage.plan), rung_section, reason)) { LLAMA_LOG_DEBUG("%s: rung %u left out of the host hold: %s\\n", __func__, rung, reason.c_str()); continue; }',
+        "llama_tenant_host_hold_fold(hold, rung_section);",
+        # a throwing MEASURE is skipped too, at WARN, naming the rung
+        '} catch (const std::exception & err) { LLAMA_LOG_WARN("%s: rung %u left out of the host hold: %s\\n", __func__, rung, err.what()); }',
+        "tenant_host_hold = hold;",
+        "tenant_host_hold_ready = true;",
     ]
-    if not all(z(n) in b for n in needs):
+    if not all(b.count(z(n)) == 1 for n in needs if n not in ("try {",)) or b.count(z("try {")) != 1:
         return False
-    # the measured rung is folded after its measure succeeded, and a failed measure is skipped, not folded
-    if b.index(z("sched_reserve_impl(sched_reserve_mode::MEASURE, state);")) > b.index(
-        z("llama_tenant_host_hold_fold(tenant_host_hold, rung_section);")
-    ):
+    # the rung is folded after its measure succeeded, inside the try, before the catch
+    measure = b.index(z("sched_reserve_impl(sched_reserve_mode::MEASURE, state);"))
+    fold = b.index(z("llama_tenant_host_hold_fold(hold, rung_section);"))
+    catch = b.index(z("} catch (const std::exception & err) {"))
+    if not (b.index(z("try {")) < measure < fold < catch):
         return False
-    # one source: R_h has no writer but the fold
+    # the hold is recorded, and marked ready, only after the loop and its catch: never before a rung is tried
+    record = b.index(z("tenant_host_hold = hold;"))
+    ready = b.index(z("tenant_host_hold_ready = true;"))
+    if not (catch < record < ready):
+        return False
+    # one source: R_h has no writer but the fold, and the context's hold is assigned only from the local
     c = code
     if c.count(z("llama_tenant_host_hold_fold(")) != 2:  # the current rung's fold and each other rung's
+        return False
+    if c.count(z("tenant_host_hold = ")) != 1 or c.count(z("tenant_host_hold_ready = true;")) != 1:
         return False
     return "tenant_host_hold.bytes" not in c and "tenant_host_hold.n_rungs" not in c
 
@@ -308,7 +323,7 @@ def test_the_context_declares_the_hold():
         "llama_tenant_host_hold tenant_host_hold;",
         "bool tenant_host_hold_ready = false;",
         "std::vector<uint32_t> tenant_rung_set;",
-        "void tenant_host_hold_fold(const std::vector<ggml_sycl_context_tenant_desc> & current);",
+        "void tenant_host_hold_measure_and_fold(const std::vector<ggml_sycl_context_tenant_desc> & current);",
     ]:
         assert z(decl) in h, decl
 
@@ -320,9 +335,9 @@ def test_hold_mutants():
         ("the hold never applied", "llama_tenant_section_apply_host_hold(tenant_section, tenant_host_hold);", ""),
         ("the hold applied after the key", "llama_tenant_section_apply_host_hold(tenant_section, tenant_host_hold);",
          ""),
-        ("the hold folded every transaction", "if (!tenant_host_hold_ready) { tenant_host_hold_fold(tenant_section); }",
-         "tenant_host_hold_fold(tenant_section);"),
-        ("the hold never folded", "if (!tenant_host_hold_ready) { tenant_host_hold_fold(tenant_section); }", ""),
+        ("the hold folded every transaction", "if (!tenant_host_hold_ready) { tenant_host_hold_measure_and_fold(tenant_section); }",
+         "tenant_host_hold_measure_and_fold(tenant_section);"),
+        ("the hold never folded", "if (!tenant_host_hold_ready) { tenant_host_hold_measure_and_fold(tenant_section); }", ""),
     ]:
         mutated = mutate(t, old, new)
         if name == "the hold applied after the key":
@@ -332,16 +347,33 @@ def test_hold_mutants():
 
     f = function_body(code, _HOLD_FOLD)
     for name, old, new in [
-        ("the current rung's section never folded", "llama_tenant_host_hold_fold(tenant_host_hold, current);", ""),
+        ("the current rung's section never folded", "llama_tenant_host_hold_fold(hold, current);", ""),
         ("every rung measured at the context's own n_ubatch", "storage.cparams.n_ubatch = rung;", ""),
         ("the current rung measured twice", "if (rung == cparams.n_ubatch) { continue; }", ""),
         ("a failed measure folded anyway", "if (measured.status != sched_reserve_status::OK) {", "if (false) {"),
-        ("the rung's section never folded", "llama_tenant_host_hold_fold(tenant_host_hold, rung_section);", ""),
+        ("a refused measure no longer skipped (continue deleted)",
+         'measured.reason.c_str()); continue; }', 'measured.reason.c_str()); }'),
+        ("a refused section no longer skipped (continue deleted)",
+         'rung, reason.c_str()); continue; }', 'rung, reason.c_str()); }'),
+        ("the rung's section never folded", "llama_tenant_host_hold_fold(hold, rung_section);", ""),
         ("the rung's host bytes derived a second way", "llama_tenant_section_from_caps(measure_tenant_caps(storage.plan), rung_section, reason)",
          "(rung_section.push_back(ggml_sycl_context_tenant_desc()), true)"),
         ("the rung set ignored", "for (const uint32_t rung : tenant_rung_set) {", "for (const uint32_t rung : std::vector<uint32_t>()) {"),
+        ("a throwing rung measure unhandled", "} catch (const std::exception & err) {", "} catch (const std::logic_error & err) {"),
+        ("a throwing rung measure swallowed silently",
+         'LLAMA_LOG_WARN("%s: rung %u left out of the host hold: %s\\n", __func__, rung, err.what());', ""),
+        ("the hold never recorded", "tenant_host_hold = hold;", ""),
     ]:
         assert not hold_fold_ok(code.replace(f, mutate(f, old, new), 1)), f"mutant {name!r} slipped through the fold gate"
+    # ready before the loop: marked ready first, so a throw from a rung leaves ready=true with a partial hold
+    early = mutate(f, "tenant_host_hold_ready = true;", "")
+    early = early.replace(z("llama_tenant_host_hold_fold(hold, current);"),
+                          z("tenant_host_hold_ready = true; llama_tenant_host_hold_fold(hold, current);"), 1)
+    assert not hold_fold_ok(code.replace(f, early, 1)), "mutant 'ready before the loop' slipped through"
+    # recorded straight into the context's hold while the rungs are folded
+    assert not hold_fold_ok(code.replace(f, f.replace(z("llama_tenant_host_hold_fold(hold, rung_section);"),
+                                                      z("llama_tenant_host_hold_fold(hold, rung_section); tenant_host_hold = hold;"), 1), 1)), \
+        "mutant 'a second write of the context hold' slipped through"
     # a second writer of R_h
     assert not hold_fold_ok(code + z("void x() { tenant_host_hold.bytes.push_back(1); }"))
 
