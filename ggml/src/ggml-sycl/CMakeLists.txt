@@ -3204,6 +3204,41 @@ set_tests_properties(test-sycl-compute-buffer-extra-reuse PROPERTIES
     TIMEOUT 120
 )
 
+# llama.cpp-23mk S3-3 (G6): the three oneDNN wrappers outside ggml-sycl.cpp that ask for a scratchpad decline
+# without writing, and their callers fall through to the SYCL kernel. A real decline cannot be provoked (every
+# family asks for 0 B), so the PRIVATE_TESTING seam ggml_sycl_test_inject_scratchpad_decline forces one at each
+# wrapper's decision and counts what the site did. Each arm computes one small graph twice (seam off, seam on) on
+# one backend context and checks the counters (the positive control) and the output against a host reference.
+# The softmax and MUL oneDNN paths are opt-in and skip graph recording, hence the three variables below.
+# Touches the GPU with tiny graphs and loads no model; labelled mem-handle so a sweep leaves it to the lead.
+if (NOT GGML_BACKEND_DL AND GGML_SYCL_DNNL)
+add_executable(test-sycl-dnnl-decline-fallthrough
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-dnnl-decline-fallthrough.cpp
+)
+target_include_directories(test-sycl-dnnl-decline-fallthrough PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-dnnl-decline-fallthrough PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-dnnl-decline-fallthrough PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-dnnl-decline-fallthrough PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-dnnl-decline-fallthrough PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME test-sycl-dnnl-decline-fallthrough COMMAND test-sycl-dnnl-decline-fallthrough)
+set_tests_properties(test-sycl-dnnl-decline-fallthrough PROPERTIES
+    LABELS "sycl;mem-handle;gpu-serial;decline"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_DISABLE_GRAPH=1;GGML_SYCL_ONEDNN_SOFTMAX=1;GGML_SYCL_ONEDNN_MUL=1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77
+    TIMEOUT 180
+)
+endif()
+
 # llama.cpp-asdt (plan task L2b): the tiered KV buffer's per-VIEW-tensor
 # extras must stay bounded across repeated graph rebuilds, the same property
 # test-sycl-compute-buffer-extra-reuse checks for the COMPUTE buffer above.

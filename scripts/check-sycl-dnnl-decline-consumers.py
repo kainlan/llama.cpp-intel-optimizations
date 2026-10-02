@@ -9,8 +9,12 @@ gate's consumption clause (n) proves each result is used; this gate pins what th
 wrappers (comments blanked first):
 
   - the signature is `[[nodiscard]] static bool NAME(`;
-  - the decision is exactly `if (X.get(true) == nullptr && Y.get_size() > 0) { return false; }`, it is the only `return false`,
-    the scratchpad request precedes it, and the wrapper ends by executing the primitive and returning true;
+  - the decision is exactly `if (ggml_sycl_scratchpad_declined(SITE, X, Y)) { return false; }` with the wrapper's own site tag,
+    it is the only `return false`, the scratchpad request precedes it, and the wrapper ends by executing the primitive and
+    returning true. The helper's body is pinned to the hook-first form below, so the test seam reaches every wrapper and the
+    old condition (nullptr and a nonzero size) is the only other way to decline;
+  - `ggml_sycl_dnnl_note_engaged(SITE)` is called once, after the decision and before the primitive is executed, so a run that
+    reached the wrapper can say so;
   - nothing before that decision writes: no parallel_for, memcpy, memset, fill, submit or `.execute(`, no statement that names
     dst or dst_f and assigns, and no dnnl::memory object bound to the output (a decline after a write would hand the fallback
     modified inputs; softmax's pre-scale pass runs in place, so a late decision would apply the scale twice);
@@ -39,15 +43,20 @@ from pathlib import Path
 SYCL = "ggml/src/ggml-sycl"
 HDR = SYCL + "/dnnl-ops.hpp"
 WRAPPERS = (
-    ("DnnlSoftmaxWrapper", "softmax"),
-    ("DnnlEltwiseWrapper", "eltwise"),
-    ("DnnlBinaryWrapper", "binary_broadcast_row"),
+    ("DnnlSoftmaxWrapper", "softmax", "DNNL_SOFTMAX"),
+    ("DnnlEltwiseWrapper", "eltwise", "DNNL_ELTWISE"),
+    ("DnnlBinaryWrapper", "binary_broadcast_row", "DNNL_BINARY_ROW"),
 )
+HELPER = "ggml_sycl_scratchpad_declined"
+HELPER_BODY = ("if (ggml_sycl_scratchpad_site_hook(site)) { return true; } "
+               "return scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0;")
 # file -> (the call, how many calls the file holds). Update the count here when a legitimate caller is added.
 CALLERS = {"softmax.cpp": ("DnnlSoftmaxWrapper::softmax", 1), "element_wise.cpp": ("DnnlEltwiseWrapper::eltwise", 3),
            "binbcast.cpp": ("DnnlBinaryWrapper::binary_broadcast_row", 1)}
 
-DECISION = re.compile(r"if\s*\(\s*\w+\.get\(true\)\s*==\s*nullptr\s*&&\s*\w+\.get_size\(\)\s*>\s*0\s*\)\s*\{\s*return\s+false\s*;\s*\}")
+DECISION = re.compile(r"if\s*\(\s*" + HELPER + r"\s*\(\s*GGML_SYCL_SCRATCHPAD_SITE_(\w+)\s*,\s*\w+\s*,\s*\w+\s*\)\s*\)"
+                      r"\s*\{\s*return\s+false\s*;\s*\}")
+NOTE = re.compile(r"\bggml_sycl_dnnl_note_engaged\s*\(\s*GGML_SYCL_SCRATCHPAD_SITE_(\w+)\s*\)\s*;")
 WRITE = re.compile(r"\bparallel_for\b|\bmemcpy\b|\bmemset\b|\bfill\b|\bsubmit\b|\.\s*execute\s*\(|\bdst(?:_f)?\b[^;{}]*?(?<![=!<>])=(?!=)"
                    r"|\bdnnl::memory\s*\(")
 DEAD = (
@@ -93,7 +102,7 @@ def function_body(cls_text, name):
     return bool(m.group(1)) and m.group(2) == "bool", cls_text[open_brace + 1:balanced(cls_text, open_brace + 1, "{", "}") - 1]
 
 
-def check_wrapper(cls, name, body_cls):
+def check_wrapper(cls, name, site, body_cls):
     errs = []
     where = "%s: %s::%s" % (HDR, cls, name)
     for kw in ("throw", "catch"):
@@ -106,8 +115,10 @@ def check_wrapper(cls, name, body_cls):
         errs.append("%s must be `[[nodiscard]] static bool`: false means the scratchpad request was declined" % where)
     decisions = list(DECISION.finditer(body))
     if len(decisions) != 1:
-        errs.append("%s must carry exactly one decision `if (X.get(true) == nullptr && Y.get_size() > 0) { return false; }`, found %d"
-                    % (where, len(decisions)))
+        errs.append("%s must carry exactly one decision `if (%s(SITE, X, Y)) { return false; }`, found %d"
+                    % (where, HELPER, len(decisions)))
+    if decisions and decisions[0].group(1) != site:
+        errs.append("%s decides under site %s, not its own %s" % (where, decisions[0].group(1), site))
     if len(re.findall(r"\breturn\s+false\b", body)) != 1:
         errs.append("%s must have exactly one `return false`, the scratchpad decision" % where)
     if not re.search(r"\.\s*execute\s*\([^;]*\)\s*;\s*return\s+true\s*;\s*$", body.rstrip()):
@@ -118,18 +129,32 @@ def check_wrapper(cls, name, body_cls):
             errs.append("%s decides before it asks for the scratchpad" % where)
         for m in WRITE.finditer(before):
             errs.append("%s writes or binds the output before the decline decision (`%s`)" % (where, m.group(0).strip()))
+        notes = list(NOTE.finditer(body))
+        execute = re.search(r"\.\s*execute\s*\(", body)
+        if len(notes) != 1 or notes[0].group(1) != site:
+            errs.append("%s must call ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_%s) exactly once, found %d"
+                        % (where, site, len(notes)))
+        elif not decisions[0].end() <= notes[0].start() < (execute.start() if execute else len(body)):
+            errs.append("%s calls ggml_sycl_dnnl_note_engaged outside the span between the decision and the execute" % where)
     return errs
 
 
 def check_header(text):
     errs = []
     text = strip_comments(text)
-    for cls, name in WRAPPERS:
+    helper = re.search(r"\binline\s+bool\s+%s\s*\(\s*ggml_sycl_scratchpad_site\s+site\s*,\s*const\s+dnnl::memory\s*&\s*scratchpad_mem\s*,"
+                       r"\s*const\s+dnnl::memory::desc\s*&\s*scratchpad_md\s*\)\s*\{" % HELPER, text)
+    if helper is None:
+        errs.append("%s: %s(ggml_sycl_scratchpad_site site, const dnnl::memory & scratchpad_mem, const dnnl::memory::desc & "
+                    "scratchpad_md) not found" % (HDR, HELPER))
+    elif " ".join(text[helper.end():balanced(text, helper.end(), "{", "}") - 1].split()) != HELPER_BODY:
+        errs.append("%s: the body of %s is not exactly `%s`" % (HDR, HELPER, HELPER_BODY))
+    for cls, name, site in WRAPPERS:
         body_cls = class_body(text, cls)
         if body_cls is None:
             errs.append("%s: class %s not found" % (HDR, cls))
             continue
-        errs += check_wrapper(cls, name, body_cls)
+        errs += check_wrapper(cls, name, site, body_cls)
     for rx, what in DEAD:
         if rx.search(text):
             errs.append("%s: %s is back" % (HDR, what))
@@ -170,7 +195,17 @@ def run(files):
     return errs
 
 
-DECIDE = "        if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {\n            return false;\n        }\n"
+def decide(site):
+    return ("        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_%s, scratchpad_mem, scratchpad_md)) {\n"
+            "            return false;\n        }\n" % site)
+
+
+def note(site):
+    return "        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_%s);\n" % site
+
+
+HELPER_COND = "scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0"
+HELPER_HOOK = "if (ggml_sycl_scratchpad_site_hook(site)) {\n        return true;\n    }\n"
 
 
 def mutants(files):
@@ -181,8 +216,9 @@ def mutants(files):
         return dict(files, **{rel: text.replace(old, new, count)})
     h = HDR
     ew, bb, sm = SYCL + "/element_wise.cpp", SYCL + "/binbcast.cpp", SYCL + "/softmax.cpp"
-    assert files[h].count(DECIDE) == 3, "mutant anchor: expected the decision three times in " + h
-    first = files[h].index(DECIDE)
+    sd, ed = decide("DNNL_SOFTMAX"), decide("DNNL_ELTWISE")
+    for text in (sd, ed, decide("DNNL_BINARY_ROW"), note("DNNL_SOFTMAX"), HELPER_HOOK, HELPER_COND):
+        assert files[h].count(text) == 1, "mutant anchor: expected exactly one %r in %s" % (text, h)
     out = [
         ("softmax loses [[nodiscard]]", edit(h, "[[nodiscard]] static bool softmax(", "static bool softmax(")),
         ("eltwise returns void", edit(h, "[[nodiscard]] static bool eltwise(", "[[nodiscard]] static void eltwise(")),
@@ -195,8 +231,16 @@ def mutants(files):
         ("DnnlBinaryWrapper::binary comes back", edit(h, "    // Supported binary operations", "    static void binary(int) {}\n    // Supported binary operations")),
         ("DnnlReductionWrapper comes back", edit(h, "#endif // GGML_SYCL_DNNL\n", "class DnnlReductionWrapper {};\n#endif // GGML_SYCL_DNNL\n")),
         ("reduce_last_dim comes back", edit(h, "    // Supported binary operations", "    static void reduce_last_dim() {}\n    // Supported binary operations")),
-        ("the decision returns true", edit(h, "            return false;", "            return true;", 1)),
-        ("the decision drops its size guard", edit(h, "scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0", "scratchpad_mem.get(true) == nullptr")),
+        ("the decision returns true", edit(h, sd, sd.replace("return false", "return true"))),
+        ("the decision negates the helper", edit(h, sd, sd.replace("if (ggml_", "if (!ggml_"))),
+        ("the softmax decision names the eltwise site", edit(h, sd, sd.replace("DNNL_SOFTMAX", "DNNL_ELTWISE"))),
+        ("the helper drops its size guard", edit(h, HELPER_COND, "scratchpad_mem.get(true) == nullptr")),
+        ("the helper inverts its test", edit(h, HELPER_COND, "scratchpad_mem.get(true) != nullptr && scratchpad_md.get_size() > 0")),
+        ("the helper loses the seam hook", edit(h, HELPER_HOOK, "")),
+        ("the helper's hook returns false", edit(h, HELPER_HOOK, HELPER_HOOK.replace("return true", "return false"))),
+        ("the softmax wrapper loses its engaged note", edit(h, note("DNNL_SOFTMAX"), "")),
+        ("the softmax wrapper notes the wrong site", edit(h, note("DNNL_SOFTMAX"), note("DNNL_ELTWISE"))),
+        ("the softmax wrapper notes before it decides", edit(h, sd + note("DNNL_SOFTMAX"), note("DNNL_SOFTMAX") + sd)),
         ("eltwise writes dst before the decision", edit(h, "        auto scratchpad_md = eltwise_pd.scratchpad_desc();",
                                                         "        q->memcpy(dst, src, nelements * sizeof(float));\n        auto scratchpad_md = eltwise_pd.scratchpad_desc();")),
         ("binary_broadcast_row writes dst before the decision", edit(h, "        auto scratchpad_md  = binary_pd.scratchpad_desc();",
@@ -218,11 +262,11 @@ def mutants(files):
         ("an extra unchecked softmax caller", edit(sm, "    if (use_f16) {", "    DnnlSoftmaxWrapper::softmax(ctx, src0_d, dst_d, 1, 1, 1.0f, DnnlSoftmaxWrapper::to_dt<float>(), stream);\n    if (use_f16) {")),
     ]
     # the decision moved after the pre-scale: ask first, decide later (the double-application hazard)
-    moved = files[h].replace(DECIDE, "", 1)
+    moved = files[h].replace(sd + note("DNNL_SOFTMAX"), "", 1)
     anchor = "        auto src_mem = dnnl::memory(src_md, eng, const_cast<void *>(softmax_src));"
     assert anchor in moved, "mutant anchor missing: softmax src_mem in " + h
-    assert first < files[h].index(anchor), "mutant anchor: the first decision is not softmax's"
-    out.append(("softmax decides after the pre-scale pass", dict(files, **{h: moved.replace(anchor, DECIDE + anchor, 1)})))
+    out.append(("softmax decides after the pre-scale pass",
+                dict(files, **{h: moved.replace(anchor, sd + note("DNNL_SOFTMAX") + anchor, 1)})))
     return out
 
 
