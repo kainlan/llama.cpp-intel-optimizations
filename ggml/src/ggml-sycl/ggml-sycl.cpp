@@ -17294,10 +17294,9 @@ static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sy
         return true;
     }
     int                               device    = q.device;
-    // The cache bounds one owner's records at its own limit (and counts what it refuses): never fewer slots than that.
-    constexpr size_t                  kMaxRungs = 32;
-    static_assert(ggml_sycl::kHoldRungRecordLimit <= kMaxRungs,
-                  "the fit's rung buffer must hold every record the cache keeps");
+    // The cache bounds one owner's records at its own limit (and counts what it refuses): the buffer holds exactly
+    // that many, from the one constant.
+    constexpr size_t                  kMaxRungs = ggml_sycl::kHoldRungRecordLimit;
     ggml_sycl::zone_hold_rung_request rungs[kMaxRungs];
     ggml_sycl::zone_hold_fit_inputs   in;
     in.headroom_target      = kSyclArenaMinExternalHeadroomBytes;

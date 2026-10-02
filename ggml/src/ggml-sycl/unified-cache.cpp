@@ -1994,10 +1994,10 @@ bool unified_cache_release_planned_scratch_hold(int device_id, uint64_t owner) {
     state.hold        = 0;
     state.owner       = 0;
     state.rung_requests.clear();  // the records belong to the context that is going away
-    state.epoch_n_ubatch  = 0;
+    state.epoch_n_ubatch       = 0;
     state.epoch_kv_room        = 0;
-    state.baseline_owner  = 0;
-    state.baseline_cold   = 0;
+    state.baseline_owner       = 0;
+    state.baseline_cold        = 0;
     state.rung_record_refusals = 0;
     // The spill counters are not touched here: the owner's teardown take (log_planned_scratch_stats)
     // runs BEFORE this release, already reported them, and cleared them with its latches.
@@ -2043,9 +2043,8 @@ size_t unified_cache_note_runtime_request(int device_id, size_t bytes, bool reco
     }
     if (warn_refused) {
         GGML_LOG_WARN(
-            "[SCRATCH] device %d: more than %zu distinct n_ubatch rungs recorded compute-buffer requests; further "
-            "rungs "
-            "are not recorded and are judged from the records kept (scaled)\n",
+            "[SCRATCH] device %d: more than %zu distinct n_ubatch rungs recorded compute-buffer requests; "
+            "further rungs are not recorded and are judged from the records kept (scaled)\n",
             device_id, kHoldRungRecordLimit);
     }
     return hold;
@@ -2085,8 +2084,7 @@ size_t unified_cache_hold_free_before(int device_id, uint64_t owner, size_t driv
     // time bound: in a long-lived server it runs from the owner's last publish to its next, and the maximum only ever
     // rises, so a tenant that arrived and is still there is read as free memory (it errs toward ADMITTING too). No
     // cheap bound exists, because the baseline cannot tell a driver credit that is merely late from a new tenant. The
-    // cache's own
-    // raw allocations are all in the registry, the cache-entry mallocs ("unified_cache:alloc", through
+    // cache's own raw allocations are all in the registry, the cache-entry mallocs ("unified_cache:alloc", through
     // unified_cache_adopt_raw_device_allocation) included.
     const size_t                 cand = zone_hold_free_cold(driver_free_now, raw_held);
     state.baseline_cold               = zone_hold_cold_update(state.baseline_owner == owner, state.baseline_cold, cand);
