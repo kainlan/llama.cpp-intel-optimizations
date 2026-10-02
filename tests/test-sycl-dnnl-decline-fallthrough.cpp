@@ -186,7 +186,7 @@ struct run_result {
 };
 
 // One compute of the arm's graph on the backend. inject != 0 forces a decline on that call of the site.
-run_result run_arm(ggml_backend_t backend, const arm & a, int inject) {
+run_result run_arm(ggml_backend_t backend, const arm & a, int inject, bool keep_state = false) {
     run_result res;
     ggml_sycl_test_scratchpad_sites_reset();
     if (inject != 0 && !ggml_sycl_test_inject_scratchpad_decline(a.site, inject)) {
@@ -248,7 +248,9 @@ run_result run_arm(ggml_backend_t backend, const arm & a, int inject) {
         fprintf(stderr, "FAIL: %s: the seam does not know the site %s\n", a.name, a.site);
         return res;
     }
-    ggml_sycl_test_inject_scratchpad_decline(a.site, 0);
+    if (!keep_state) {
+        ggml_sycl_test_inject_scratchpad_decline(a.site, 0);
+    }
     res.ok = true;
     return res;
 }
@@ -290,6 +292,26 @@ int main(int, char ** argv) {
         ok = false;
     }
     ggml_sycl_test_scratchpad_sites_reset();
+    {
+        // A refused inject must change no state. Arm the first site, drive one call so the counters are nonzero, make a
+        // refused inject (negative after_n), and expect the counters unchanged: a refusal that cleared them first would
+        // read calls == 0 here.
+        const std::vector<arm> arms0 = make_arms();
+        const arm &            first = arms0.front();
+        const run_result driven = run_arm(backend, first, 1, /*keep_state=*/true);
+        uint64_t c = 0, d = 0, e = 0;
+        const bool refused = !ggml_sycl_test_inject_scratchpad_decline(first.site, -1);
+        const bool read    = ggml_sycl_test_scratchpad_site_counts(first.site, &c, &d, &e);
+        if (!driven.ok || driven.calls != 1 || driven.declined != 1 || !refused || !read || c != 1 || d != 1 || e != 0) {
+            fprintf(stderr,
+                    "FAIL: a refused inject changed the seam's state (driven calls=%llu declined=%llu; after the refusal "
+                    "calls=%llu declined=%llu engaged=%llu, refused=%d)\n",
+                    (unsigned long long) driven.calls, (unsigned long long) driven.declined, (unsigned long long) c,
+                    (unsigned long long) d, (unsigned long long) e, refused ? 1 : 0);
+            ok = false;
+        }
+        ggml_sycl_test_scratchpad_sites_reset();
+    }
     for (const arm & a : make_arms()) {
         const run_result off = run_arm(backend, a, 0);
         const run_result on  = run_arm(backend, a, 1);

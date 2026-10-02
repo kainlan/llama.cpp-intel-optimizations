@@ -228,6 +228,8 @@ def mutants(files):
     h = HDR
     ew, bb, sm = SYCL + "/element_wise.cpp", SYCL + "/binbcast.cpp", SYCL + "/softmax.cpp"
     sd, ed = decide("DNNL_SOFTMAX"), decide("DNNL_ELTWISE")
+    sm_tail = "                stream)) {\n            return;\n        }\n    }\n#else"
+    assert files[sm].count(sm_tail) == 1, "mutant anchor: the softmax caller's tail in " + sm
     for text in (sd, ed, decide("DNNL_BINARY_ROW"), note("DNNL_SOFTMAX"), HELPER_HOOK, HELPER_COND):
         assert files[h].count(text) == 1, "mutant anchor: expected exactly one %r in %s" % (text, h)
     out = [
@@ -276,6 +278,14 @@ def mutants(files):
                                                                        "                stream)) {\n            return;\n        }\n        return;\n    }\n#endif\n    // Fallback")),
         ("the softmax caller returns unconditionally after its block", edit(sm, "                stream)) {\n            return;\n        }\n    }\n#else",
                                                                             "                stream)) {\n            return;\n        }\n    }\n    return;\n#else")),
+        ("the softmax block is followed by a goto", edit(sm, sm_tail, sm_tail.replace("    }\n#else", "    }\n    goto done;\n#else"))),
+        ("the softmax block is followed by a statement and a return", edit(sm, sm_tail, sm_tail.replace("    }\n#else", "    }\n    (void) 0;\n    return;\n#else"))),
+        ("the softmax block is followed by a throw", edit(sm, sm_tail, sm_tail.replace("    }\n#else", "    }\n    throw 1;\n#else"))),
+        ("the softmax block is followed by an abort", edit(sm, sm_tail, sm_tail.replace("    }\n#else", "    }\n    GGML_ABORT(\"x\");\n#else"))),
+        ("the softmax block has an enclosing else that returns", edit(sm, sm_tail, sm_tail.replace("    }\n#else", "    } else {\n        return;\n    }\n#else"))),
+        ("the softmax if has an else that returns", edit(sm, sm_tail, sm_tail.replace("        }\n    }\n#else", "        } else {\n            return;\n        }\n    }\n#else"))),
+        ("softmax writes src through a cast before the decision", edit(h, "        auto scratchpad_md = softmax_pd.scratchpad_desc();",
+                                                                      "        const_cast<float *>((const float *) src)[0] = 0.0f;\n        auto scratchpad_md = softmax_pd.scratchpad_desc();")),
         ("eltwise binds the output before the decision", edit(h, "        auto scratchpad_md = eltwise_pd.scratchpad_desc();",
                                                               "        auto dst_mem = dnnl::memory(md, eng, dst);\n        auto scratchpad_md = eltwise_pd.scratchpad_desc();")),
         ("an eltwise caller drops the test", edit(ew, "if (DnnlEltwiseWrapper::eltwise(", "(void) (DnnlEltwiseWrapper::eltwise(")),
@@ -286,6 +296,14 @@ def mutants(files):
         ("the softmax caller's branch no longer returns", edit(sm, "                stream)) {\n            return;\n        }", "                stream)) {\n            (void) 0;\n        }")),
         ("an extra unchecked softmax caller", edit(sm, "    if (use_f16) {", "    DnnlSoftmaxWrapper::softmax(ctx, src0_d, dst_d, 1, 1, 1.0f, DnnlSoftmaxWrapper::to_dt<float>(), stream);\n    if (use_f16) {")),
     ]
+    # dst renamed inside softmax and written under the new name before the decision: the no-dst rule must not be dodgeable
+    i = files[h].index("[[nodiscard]] static bool softmax(")
+    j = files[h].index("softmax_prim.execute", i)
+    seg = re.sub(r"\bdst\b", "out", files[h][i:j]).replace(
+        "        auto scratchpad_md = softmax_pd.scratchpad_desc();",
+        "        ((float *) out)[0] = 0.0f;\n        auto scratchpad_md = softmax_pd.scratchpad_desc();", 1)
+    assert "((float *) out)[0]" in seg, "mutant anchor missing: softmax scratchpad_md in " + h
+    out.append(("softmax renames dst and writes through the new name", dict(files, **{h: files[h][:i] + seg + files[h][j:]})))
     # the decision moved after the pre-scale: ask first, decide later (the double-application hazard)
     moved = files[h].replace(sd + note("DNNL_SOFTMAX"), "", 1)
     anchor = "        auto src_mem = dnnl::memory(src_md, eng, const_cast<void *>(softmax_src));"
