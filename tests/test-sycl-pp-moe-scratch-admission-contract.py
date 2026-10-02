@@ -40,6 +40,8 @@ parser.add_argument("--cache", default=str(root / "ggml/src/ggml-sycl/unified-ca
 parser.add_argument("--module", default=str(root / "ggml/src/ggml-sycl/moe-scratch-admission.cpp"))
 parser.add_argument("--header", default=str(root / "ggml/src/ggml-sycl/moe-scratch-admission.hpp"))
 parser.add_argument("--doc", default=str(root / "docs/design/sycl-canonical-memory-architecture.md"))
+parser.add_argument("--dir", default=str(root / "ggml/src/ggml-sycl"),
+                    help="the ggml-sycl directory whose other files are scanned for stray reserve/set-planned uses")
 parser.add_argument("--self-test", action="store_true",
                     help="prove the absence-based checks fire when the thing they forbid is present")
 args = parser.parse_args()
@@ -63,15 +65,30 @@ def reserve_call_arguments(source):
 # graph-entry demand). The property is that the ring the planner sized is what gets reserved, so, per executor body:
 #   * the three slot sizes and the raw ring depth are each read ONCE, as `const T NAME = <planner getter>(ctx.device);`,
 #     and the runtime ring depth is derived once from the raw one;
-#   * nothing assigns to, increments, address-takes, casts around or redeclares those names afterwards, and no
-#     preprocessor directive can redefine them;
+#   * every other occurrence of those names (and of the admission shape and the runtime ring depth) is on a short
+#     POSITIVE whitelist of reads: a comparison operand, or a bare argument of one of the calls that legitimately take
+#     them (the reserve itself, admission, claim/rollback/activate, the ring-depth derivation, a log or fprintf).
+#     Nothing else is allowed, so a write needs no spelling to be forbidden: `x = ...`, `+=`, `&x`, a cast, std::addressof,
+#     memcpy, a shadowing declaration (plain, decltype, structured binding, lambda parameter), a macro alias, a pointer
+#     to member all put the name somewhere that is not on the list;
 #   * the admission shape is exactly `{slots..., raw ring depth}` and the executor's only reserve call passes exactly
 #     `slots..., ring depth`, nothing computed from them;
 # and file-wide: the number of reserve_pp_moe_onednn_scratch( and unified_cache_set_planned_pp_moe_onednn_scratch(
-# calls is fixed, and the free unified_cache_reserve_ wrapper is not used, so a new reservation site (or one that
-# raises the ceiling and reads it back) cannot appear without editing this gate.
+# calls in ggml-sycl.cpp is fixed, the free unified_cache_reserve_ wrapper is not called there, and the bare identifier
+# tokens (no `(` needed, so an address-taken or member-pointer form counts) are counted over the whole ggml-sycl
+# directory, with token pasting banned, so a new reservation site (or one that raises the ceiling and reads it back)
+# cannot appear without editing this gate. A count failure says which pin to bump after review.
 RESERVE_CALLS_IN_FILE = 5   # plan, replan x2, the two executors
 SET_PLANNED_CALLS_IN_FILE = 3   # plan, replan x2
+# Whole ggml-sycl directory, comments and strings removed: definition + the wrapper's call + hpp declaration + 5 calls.
+DIRECTORY_TOKENS = {"reserve": 8, "wrapper": 2, "setter": 5}
+_DIRECTORY_TOKEN_PATTERNS = {
+    "reserve": r"(?<!\w)reserve_pp_moe_onednn_scratch\b",
+    "wrapper": r"\bunified_cache_reserve_pp_moe_onednn_scratch\b",
+    "setter": r"\bunified_cache_set_planned_pp_moe_onednn_scratch\b",
+}
+_TOKEN_PASTE = r"(?:reserve|set_planned)_pp_moe_onednn_\w*\s*##|##\s*\w*pp_moe_onednn"
+NOTES = {}
 PLANNED_SITES = (
     dict(slots=(("planned_weight", "weight"), ("planned_act", "activation"), ("planned_out", "output")),
          shape="planned_shape", raw="planned_ring_depth", ring="ring_depth"),
@@ -79,11 +96,6 @@ PLANNED_SITES = (
                 ("planned_output_slot", "output")),
          shape="planned_shape", raw="planned_ring_depth_raw", ring="planned_ring_depth"),
 )
-_WRITES = (r"\b%(n)s\b\s*(?:[-+*/%%&|^]|<<|>>)?=(?!=)", r"(?:\+\+|--)\s*\b%(n)s\b", r"\b%(n)s\b\s*(?:\+\+|--)",
-           r"&\s*%(n)s\b", r"\b%(n)s\b\s*\.\s*\w+\s*(?:[-+*/%%&|^]|<<|>>)?=(?!=)")
-_UNSAFE_IN_REGION = (r"\bconst_cast\b", r"^\s*#\s*define\b")
-
-
 def blank_strings(source):
     """String literals emptied: a log format's `planned_weight=%zu` is not a write to planned_weight."""
     return re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', source)
@@ -109,39 +121,67 @@ def shape_declaration(name, site):
                       % (name, r"\s*,\s*".join(names)))
 
 
-def pinned_once_and_never_written(region, name, declaration):
-    """`name` is declared exactly once, by `declaration`, in this region, and never written after it."""
+_COMPARISON = r"(?:==|!=|<=|>=|(?<![-<])<(?!<)|(?<!-)>(?!>))"
+ALLOWED_CALLEES = {"reserve_pp_moe_onednn_scratch", "pp_moe_onednn_admit_scratch", "pp_moe_onednn_runtime_ring_depth",
+                   "pp_moe_onednn_claim_scratch_slot", "pp_moe_onednn_rollback_unbound_scratch_slot", "activate",
+                   "GGML_LOG_WARN", "GGML_LOG_INFO", "GGML_LOG_DEBUG", "GGML_LOG_ERROR", "fprintf"}
+
+
+def enclosing_opener(text, pos):
+    """Index of the unmatched ( [ { that encloses `pos`, or -1."""
+    depth = 0
+    for index in range(pos - 1, -1, -1):
+        if text[index] in ")]}":
+            depth += 1
+        elif text[index] in "([{":
+            if depth == 0:
+                return index
+            depth -= 1
+    return -1
+
+
+def occurrence_is_allowed(region, match, spans):
+    start, end = match.span()
+    if any(low <= start and end <= high for low, high in spans):
+        return True  # inside one of the pinned declarations
+    before, after = region[:start].rstrip(), region[end:].lstrip()
+    if before.endswith((".", "::")) or before.endswith("->"):
+        return True  # another object's member that happens to share the name
+    if re.search(_COMPARISON + r"$", before) or re.match(_COMPARISON, after):
+        return True
+    if before.endswith(("(", ",")) and after.startswith((",", ")")):
+        opener = enclosing_opener(region, start)
+        if opener >= 0 and region[opener] == "(":
+            callee = re.search(r"([A-Za-z_]\w*)\s*$", region[:opener])
+            return bool(callee) and callee.group(1) in ALLOWED_CALLEES
+    return False
+
+
+def pinned_uses(region, site):
+    """The declarations of the site's pinned names, each exactly once, and every occurrence of those names being a
+    whitelisted one. Returns the offending text (empty list: pinned)."""
     region = blank_strings(region)
-    if len(declaration.findall(region)) != 1:
-        return False
-    rest = declaration.sub("", region)
-    if re.search(r"\b[\w:<>]+\s+%s\b" % name, rest):
-        return False  # a second (shadowing) declaration of the same name
-    return not any(re.search(pattern % {"n": name}, rest) for pattern in _WRITES)
-
-
-def planned_slot_pinned(region, name, kind):
-    return pinned_once_and_never_written(region, name, planned_slot_declaration(name, kind))
-
-
-def region_is_free_of_escapes(region, pinned_names):
-    """No const_cast (it writes a const name), no reinterpret_cast of a pinned name (the same through a type pun) and no
-    #define (it redefines one) inside the executor body. reinterpret_cast of pointers is ordinary kernel code here."""
-    region = blank_strings(region)
-    if any(re.search(pattern, region, re.M) for pattern in _UNSAFE_IN_REGION):
-        return False
-    return not re.search(r"\breinterpret_cast\s*<[^>]*>\s*\(\s*[*&]?\s*(?:%s)\b" % "|".join(pinned_names), region)
+    declarations = [planned_slot_declaration(name, kind) for name, kind in site["slots"]]
+    declarations += [ring_raw_declaration(site["raw"]), ring_declaration(site["ring"], site["raw"]),
+                     shape_declaration(site["shape"], site)]
+    spans = []
+    for declaration in declarations:
+        found = list(declaration.finditer(region))
+        if len(found) != 1:
+            return ["declaration missing or repeated: " + declaration.pattern[:60]]
+        spans.append(found[0].span())
+    names = [slot for slot, _ in site["slots"]] + [site["raw"], site["ring"], site["shape"]]
+    bad = []
+    for name in names:
+        for match in re.finditer(r"\b%s\b" % name, region):
+            if not occurrence_is_allowed(region, match, spans):
+                line_at = region.rfind("\n", 0, match.start()) + 1
+                bad.append(region[line_at:region.find("\n", match.end())].strip()[:100])
+    return bad
 
 
 def site_is_pinned(region, site):
-    names = [slot for slot, _ in site["slots"]]
-    pinned = names + [site["raw"], site["ring"], site["shape"]]
-    return (region_is_free_of_escapes(region, pinned)
-            and all(planned_slot_pinned(region, name, kind) for name, kind in site["slots"])
-            and pinned_once_and_never_written(region, site["raw"], ring_raw_declaration(site["raw"]))
-            and pinned_once_and_never_written(region, site["ring"], ring_declaration(site["ring"], site["raw"]))
-            and pinned_once_and_never_written(region, site["shape"], shape_declaration(site["shape"], site))
-            and len(names) == 3)
+    return not pinned_uses(region, site) and len(site["slots"]) == 3
 
 
 def top_level_arguments(text):
@@ -166,12 +206,37 @@ def reservation_passes_the_plan(region, site):
     return calls == [[name for name, _ in site["slots"]] + [site["ring"]]]
 
 
-def file_wide_call_counts_are_fixed(source):
-    """The reserve / set-planned call counts of the whole file, and no use of the free reserve wrapper."""
-    source = blank_strings(source)
-    return (len(re.findall(r"(?<!unified_cache_)reserve_pp_moe_onednn_scratch\s*\(", source)) == RESERVE_CALLS_IN_FILE
-            and len(re.findall(r"unified_cache_reserve_pp_moe_onednn_scratch\s*\(", source)) == 0
-            and len(re.findall(r"unified_cache_set_planned_pp_moe_onednn_scratch\s*\(", source)) == SET_PLANNED_CALLS_IN_FILE)
+def call_count_problems(source, others=""):
+    """Why the reserve / set-planned sites are not the pinned ones (empty: they are). `source` is ggml-sycl.cpp;
+    `others` is the rest of the ggml-sycl directory (unified-cache.*, the admission module, every other TU)."""
+    clean, everything = blank_strings(source), blank_strings(source) + "\n" + blank_strings(others)
+    problems = []
+
+    def count(text, pattern):
+        return len(re.findall(pattern, text))
+
+    found = count(clean, r"(?<!unified_cache_)reserve_pp_moe_onednn_scratch\s*\(")
+    if found != RESERVE_CALLS_IN_FILE:
+        problems.append("reserve_pp_moe_onednn_scratch calls: found %d, pinned RESERVE_CALLS_IN_FILE=%d; a new site "
+                        "needs review, then bump the pin" % (found, RESERVE_CALLS_IN_FILE))
+    found = count(clean, r"unified_cache_reserve_pp_moe_onednn_scratch\s*\(")
+    if found:
+        problems.append("unified_cache_reserve_pp_moe_onednn_scratch( is called %d time(s) in ggml-sycl.cpp; the free "
+                        "wrapper takes the same sizes, and no call is pinned" % found)
+    found = count(clean, r"unified_cache_set_planned_pp_moe_onednn_scratch\s*\(")
+    if found != SET_PLANNED_CALLS_IN_FILE:
+        problems.append("unified_cache_set_planned_pp_moe_onednn_scratch calls: found %d, pinned "
+                        "SET_PLANNED_CALLS_IN_FILE=%d; a new site needs review, then bump the pin"
+                        % (found, SET_PLANNED_CALLS_IN_FILE))
+    for token, pattern in _DIRECTORY_TOKEN_PATTERNS.items():
+        found = count(everything, pattern)
+        if found != DIRECTORY_TOKENS[token]:
+            problems.append("`%s` identifier tokens across ggml-sycl/: found %d, pinned DIRECTORY_TOKENS[%r]=%d (calls, "
+                            "definitions, declarations and address-taken or member-pointer uses all count); review "
+                            "the new use, then bump the pin" % (token, found, token, DIRECTORY_TOKENS[token]))
+    if count(everything, _TOKEN_PASTE):
+        problems.append("token pasting (##) builds a reserve/set-planned name; it hides a call from every count here")
+    return problems
 
 
 def region_until_matching_endif(source, start):
@@ -291,7 +356,8 @@ def latched_warn(region, latch_name):
     return "_trace" not in region[condition_at:warn_at]
 
 
-def evaluate(sycl, cache, module, header, doc=""):
+def evaluate(sycl, cache, module, header, doc="", others=""):
+    NOTES.clear()
     sycl, cache = squeeze(sycl), squeeze(cache)
     module, header = squeeze(module), squeeze(header)
     # The contract is prose: collapse every run of whitespace so a reflowed
@@ -321,6 +387,15 @@ def evaluate(sycl, cache, module, header, doc=""):
         "moe-scratch-admission module": module,
         "moe-scratch-admission header": header,
     }
+
+    count_problems = call_count_problems(sycl, "\n".join((cache, module, header, others)))
+    uses = [pinned_uses(batched, PLANNED_SITES[0]), pinned_uses(staging, PLANNED_SITES[1])]
+    if count_problems:
+        NOTES["the reserve and set-planned sites are the pinned ones"] = count_problems
+    if any(uses):
+        NOTES["the planned slot sizes are read once, const, and never reassigned"] = [
+            "a use of a pinned name that is not on the whitelist (declaration, comparison, bare argument of a reserve/"
+            "admission/claim/rollback/activate/ring-depth/log call): " + text for use in uses for text in use]
 
     checks = {
         # --- the point of the task: the plan is a cap at both live call sites ---
@@ -360,8 +435,10 @@ def evaluate(sycl, cache, module, header, doc=""):
         # budgeted zone into a high-water mark of every shape ever seen.
         # The reservation's own arguments may not carry a max ...
         "no PP MoE scratch reservation upsizes past the plan":
-            reservation_passes_the_plan(batched, PLANNED_SITES[0]) and reservation_passes_the_plan(staging, PLANNED_SITES[1])
-            and file_wide_call_counts_are_fixed(sycl),
+            reservation_passes_the_plan(batched, PLANNED_SITES[0]) and reservation_passes_the_plan(staging, PLANNED_SITES[1]),
+        # ... and a new site, a free-wrapper call, an address-taken or token-pasted form cannot appear unreviewed.
+        "the reserve and set-planned sites are the pinned ones":
+            not count_problems,
         # ... and what it passes is the planner's own values, read once and never written (see PLANNED_SITES).
         "the planned slot sizes are read once, const, and never reassigned":
             site_is_pinned(batched, PLANNED_SITES[0]) and site_is_pinned(staging, PLANNED_SITES[1]),
@@ -585,7 +662,7 @@ ESCAPES = (
 )
 
 
-def self_test(sycl, cache, module, header, doc):
+def self_test(sycl, cache, module, header, doc, others):
     """Every absence check must fail once its forbidden construct is injected."""
     problems = []
     call_site = squeeze("            if (!cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)) {")
@@ -600,13 +677,13 @@ def self_test(sycl, cache, module, header, doc):
             if unconst:
                 base = base.replace(declaration, declaration.replace("const size_t", "size_t", 1), 1)
             mutated = base.replace(call_site, squeeze("            " + statement + "\n" + call_site), 1)
-            _, failed, _ = evaluate(mutated, cache, module, header, doc)
+            _, failed, _ = evaluate(mutated, cache, module, header, doc, others)
             if check not in failed:
                 problems.append("planned-slot pin did not fire on: %s (%s)" % (label, "const dropped" if unconst else "const kept"))
     # Dropping `const` alone writes nothing, but the declaration is no longer the pinned read-only one.
     base = squeeze(sycl)
     _, failed, _ = evaluate(base.replace(declaration, declaration.replace("const size_t", "size_t", 1), 1), cache, module,
-                            header, doc)
+                            header, doc, others)
     if check not in failed:
         problems.append("planned-slot pin did not fire on: const dropped, nothing written")
     # Computed under another name and passed to the reservation: the planned names are untouched, the call is not.
@@ -614,7 +691,7 @@ def self_test(sycl, cache, module, header, doc):
                          ("alias-then-std-max", "const size_t cap_w = planned_weight; const size_t grown_w = std::max(cap_w, weight_bytes);")):
         mutated = squeeze(sycl).replace(
             call_site, squeeze("            " + hoist + "\n" + call_site.replace("(planned_weight,", "(grown_w,")), 1)
-        _, failed, _ = evaluate(mutated, cache, module, header, doc)
+        _, failed, _ = evaluate(mutated, cache, module, header, doc, others)
         if "no PP MoE scratch reservation upsizes past the plan" not in failed:
             problems.append("reservation pin did not fire on: " + label)
     nested = "a\n#if X\nb\n#if 1\n#endif\nc\n#endif\nd\n"
@@ -627,9 +704,25 @@ def self_test(sycl, cache, module, header, doc):
             continue
         for anchor, replacement in edits:
             mutated = mutated.replace(squeeze(anchor), squeeze(replacement), 1)
-        _, failed, _ = evaluate(mutated, cache, module, header, doc)
+        _, failed, _ = evaluate(mutated, cache, module, header, doc, others)
         if not failed:
             problems.append("no check fired on the escape: " + label)
+    # Another translation unit of the directory: a call, an address-taken use, a paste.
+    for label, extra in (
+            ("a-call-in-another-tu", "bool f(unified_cache * c) { return c->reserve_pp_moe_onednn_scratch(1, 2, 3, 4); }"),
+            ("the-address-in-another-tu", "auto p = &unified_cache::reserve_pp_moe_onednn_scratch;"),
+            ("the-wrapper-in-another-tu", "bool f() { return unified_cache_reserve_pp_moe_onednn_scratch(0, 1, 2, 3, 4); }"),
+            ("the-setter-in-another-tu", "void f() { unified_cache_set_planned_pp_moe_onednn_scratch(0, 1, 2, 3, 4); }"),
+            ("a-paste-in-another-tu", "#define RSV(c) c->reserve_pp_moe_onednn_##scratch")):
+        _, failed, _ = evaluate(sycl, cache, module, header, doc, others + "\n" + extra)
+        if "the reserve and set-planned sites are the pinned ones" not in failed:
+            problems.append("no count failed with " + label)
+    # A legitimate 6th reserve must say what to do, not only fail.
+    _ = evaluate(squeeze(sycl).replace(squeeze(_ELSEWHERE), squeeze("static bool sixth(ggml_sycl::unified_cache * c) { "
+                 "return c->reserve_pp_moe_onednn_scratch(1, 2, 3, 4); }\n" + _ELSEWHERE), 1), cache, module, header, doc, others)
+    if not any("found 6, pinned RESERVE_CALLS_IN_FILE=5" in note and "bump the pin" in note
+               for note in NOTES.get("the reserve and set-planned sites are the pinned ones", [])):
+        problems.append("a 6th reserve call did not produce the actionable pin message")
     for name, (target, anchor, replacement) in ABSENCE_MUTANTS.items():
         sources = {"sycl": sycl, "cache": cache, "module": module, "header": header}
         anchor, replacement = squeeze(anchor), squeeze(replacement)
@@ -637,7 +730,7 @@ def self_test(sycl, cache, module, header, doc):
             problems.append("mutation anchor missing for: " + name)
             continue
         sources[target] = squeeze(sources[target]).replace(anchor, replacement, 1)
-        _, failed, _ = evaluate(sources["sycl"], sources["cache"], sources["module"], sources["header"], doc)
+        _, failed, _ = evaluate(sources["sycl"], sources["cache"], sources["module"], sources["header"], doc, others)
         if name not in failed:
             problems.append("check did not fire on its mutant: " + name)
     return problems
@@ -652,18 +745,36 @@ module, header = read(args.module), read(args.header)
 # The contract is markdown: comment stripping would eat its code fences.
 doc = Path(args.doc).read_text() if Path(args.doc).exists() else ""
 
-missing_anchors, failed, n_checks = evaluate(sycl, cache, module, header, doc)
+def read_others(skip):
+    """Every other code file under the ggml-sycl directory, comments stripped: the TUs that could hold a stray site."""
+    # The four files evaluated explicitly, wherever they came from, and their in-tree defaults (a mutant copy passed
+    # through --sycl must not be counted alongside the real file it replaces).
+    defaults = [root / "ggml/src/ggml-sycl" / name for name in
+                ("ggml-sycl.cpp", "unified-cache.cpp", "moe-scratch-admission.cpp", "moe-scratch-admission.hpp")]
+    skipped = {Path(path).resolve() for path in list(skip) + defaults}
+    directory = Path(args.dir).resolve()
+    texts = []
+    for path in sorted(directory.rglob("*")):
+        if path.is_file() and path.suffix in (".cpp", ".hpp", ".h", ".c", ".inc", ".cuh", ".cu") and path.resolve() not in skipped:
+            texts.append(strip_comments(path.read_text(errors="replace")))
+    return "\n".join(texts)
+
+
+others = read_others((args.sycl, args.cache, args.module, args.header))
+missing_anchors, failed, n_checks = evaluate(sycl, cache, module, header, doc, others)
 
 for name in missing_anchors:
     print("MISSING ANCHOR: " + name)
 for name in failed:
     print("FAIL: " + name)
+    for note in NOTES.get(name, []):
+        print("      " + note)
 
 if missing_anchors or failed:
     sys.exit(1)
 
 if args.self_test:
-    problems = self_test(sycl, cache, module, header, doc)
+    problems = self_test(sycl, cache, module, header, doc, others)
     for problem in problems:
         print("SELF-TEST FAIL: " + problem)
     if problems:
