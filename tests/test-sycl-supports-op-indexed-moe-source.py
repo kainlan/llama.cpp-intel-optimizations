@@ -19,9 +19,13 @@ OP_SWITCH = "switch (op->op) {"
 # indexed-MoE early return. It is pinned verbatim, comments aside, rather than waved through: it may only ever
 # return false (or `continue`) on an operand living in the dedicated KV-host buft, which no ADD_ID/MUL_MAT_ID
 # operand does, and anything else that appears ahead of the early return still fails the equality below.
+# Since zhcn C6k (20684475a) both acceptances ask ggml_sycl_node_is_host_dispatched(op) instead of re-deriving the
+# predicate inline. It is true only for a FLASH_ATTN_EXT with K or V in the KV-host buft and a SET_ROWS into a
+# KV-host dst, so it still cannot hold for ADD_ID/MUL_MAT_ID; the one narrowing (a KV-host Q or mask is declined,
+# as the funnel intercept already did) only removes acceptances.
 KV_HOST_RESIDENCY_BLOCK = """
     if (ggml_sycl_tensor_is_in_kv_host_buft(op)) {
-        if (!(op->op == GGML_OP_SET_ROWS && ggml_sycl_attn_host_dispatch_enabled())) {
+        if (!(op->op == GGML_OP_SET_ROWS && ggml_sycl_node_is_host_dispatched(op))) {
             if (g_ggml_sycl_debug) {
                 g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
                 GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft residency decline (dst): op=%s\\n", ggml_op_name(op->op));
@@ -35,9 +39,7 @@ KV_HOST_RESIDENCY_BLOCK = """
     }
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
-            if ((op->op == GGML_OP_FLASH_ATTN_EXT ||
-                 (op->op == GGML_OP_SET_ROWS && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&
-                ggml_sycl_attn_host_dispatch_enabled()) {
+            if (ggml_sycl_node_is_host_dispatched(op)) {
                 if (g_ggml_sycl_debug) {
                     g_sycl_attn_host_accept_count.fetch_add(1, std::memory_order_relaxed);
                     GGML_SYCL_DEBUG(
@@ -556,6 +558,39 @@ def test_reinserting_later_mul_mat_id_case_is_rejected() -> None:
         "        case GGML_OP_MUL_MAT:\n        case GGML_OP_MUL_MAT_ID:\n",
     )
     assert not contract(mutated)
+
+
+HOST_DISPATCH_PREDICATE = "static bool ggml_sycl_node_is_host_dispatched(const ggml_tensor * node) {"
+EXPECTED_HOST_DISPATCH_BODY = (
+    "if(!node||!ggml_sycl_attn_host_dispatch_enabled()){returnfalse;}"
+    "if(node->op==GGML_OP_FLASH_ATTN_EXT){"
+    "returnggml_sycl_tensor_is_in_kv_host_buft(node->src[1])||ggml_sycl_tensor_is_in_kv_host_buft(node->src[2]);}"
+    "if(node->op==GGML_OP_SET_ROWS){returnggml_sycl_tensor_is_in_kv_host_buft(node);}"
+    "returnfalse;"
+)
+
+
+def host_dispatch_predicate_ok(text: str) -> bool:
+    try:
+        _, _, body = braced_body(text, HOST_DISPATCH_PREDICATE)
+    except ValueError:
+        return False
+    return executable_body(body) == EXPECTED_HOST_DISPATCH_BODY
+
+
+def test_host_dispatch_predicate_cannot_hold_for_indexed_moe() -> None:
+    # The supports_op KV-host acceptances above call this predicate (zhcn C6k). The early-return gate is only
+    # sound while it is true for nothing but FLASH_ATTN_EXT and SET_ROWS, so its body is pinned whole.
+    assert host_dispatch_predicate_ok(SOURCE)
+    widened = SOURCE.replace(
+        "    if (node->op == GGML_OP_SET_ROWS) {\n        return ggml_sycl_tensor_is_in_kv_host_buft(node);\n    }\n    return false;",
+        "    if (node->op == GGML_OP_SET_ROWS) {\n        return ggml_sycl_tensor_is_in_kv_host_buft(node);\n    }\n"
+        "    return node->op == GGML_OP_MUL_MAT_ID;",
+        1,
+    )
+    assert widened != SOURCE and not host_dispatch_predicate_ok(widened)
+    any_slot = SOURCE.replace("ggml_sycl_tensor_is_in_kv_host_buft(node->src[2]);", "ggml_sycl_tensor_is_in_kv_host_buft(node->src[2]) || true;", 1)
+    assert any_slot != SOURCE and not host_dispatch_predicate_ok(any_slot)
 
 
 if __name__ == "__main__":
