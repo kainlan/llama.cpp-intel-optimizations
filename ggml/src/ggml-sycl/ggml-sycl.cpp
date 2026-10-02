@@ -90,6 +90,7 @@
 #include "ggml-sycl/block-exec-gate.hpp"
 #include "ggml-sycl/chunk-cap.hpp"
 #include "ggml-sycl/common.hpp"
+#include "ggml-sycl/compute-alloc-scope.hpp"
 #include "ggml-sycl/convert.hpp"
 #include "ggml-sycl/cpy.hpp"
 #include "ggml-sycl/dispatch-tuning.hpp"
@@ -11015,6 +11016,14 @@ static int64_t get_fused_moe_max_batch() {
 // Model load phase flag - when true, skip weight caching to avoid OOM during load
 static std::atomic<bool> g_sycl_in_model_load{ false };
 
+// llama.cpp-kpjw (kpjw-g7): the scheduler compute scopes open on THIS thread (compute-alloc-scope.hpp, host-tested).
+// The llama context opens one (ggml_backend_sycl_compute_alloc_scope) around every allocation its scheduler makes, so
+// a buffer-type allocation made inside it is positively a scheduler compute buffer. Thread-local on purpose: the
+// scheduler allocates on the calling thread, and another thread's weight or state allocation must not inherit it.
+static bool ggml_sycl_compute_alloc_scope_active() {
+    return ggml_sycl::compute_alloc_scope_active();
+}
+
 // Track backend lifetime for shared host-weight extras cleanup.
 static std::atomic<int> g_sycl_backend_refcount{ 0 };
 
@@ -16303,6 +16312,27 @@ static size_t get_system_memory_bytes() {
 #endif
 }
 
+// llama.cpp-kpjw: whether this build can reach the f16 dequant arm of ggml_sycl_op_mul_mat_sycl at all. Its walk and
+// its dispatch arm are compiled only with oneDNN and GGML_SYCL_F16; without them nothing ever draws the planned f16
+// buffers, so planning them would reserve RUNTIME bytes for nothing. Where it is true, whether a given model draws
+// them is the zone adapter's candidate set (dense Q8_0 weights) and the route at run time.
+// ONE source for that condition: the planning site reads the constexpr below, and the f16 walk and both acquisitions
+// of the planned f16 buffers in the dispatch arm (ggml_sycl_op_mul_mat_sycl) are compiled under the same macro, so
+// they cannot drift apart. (The arm itself is also gated at run time by use_fp16, which is GGML_SYCL_F16.)
+#if GGML_SYCL_DNNL && defined(GGML_SYCL_F16)
+#    define GGML_SYCL_DEQUANT_F16_ARM 1
+#else
+#    define GGML_SYCL_DEQUANT_F16_ARM 0
+#endif
+static constexpr bool ggml_sycl_dequant_f16_scratch_drawable() {
+    return GGML_SYCL_DEQUANT_F16_ARM != 0;
+}
+
+// llama.cpp-kpjw: whether a backend context other than `self` is live on `device`. The plan inputs and the hold are
+// per device, so this (and not the process-wide model registry, which counts models on other devices too) is the
+// question a plan merge asks. Defined with the context list below.
+static bool ggml_sycl_other_backend_context_live(int device, const ggml_backend_sycl_context * self);
+
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
 // snapshot.  Idempotent — safe to call from both the early pre-create_tensor
 // entry point and the late set_tensor_inventory entry.  Caller must hold
@@ -16375,10 +16405,14 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     // llama.cpp-479i: the dense MMQ/MMVQ Q8_1 src1 buffer is a planned byte. Sized here from the
     // same inventory maxima, at the load-time n_ubatch (512 when the loader says 0); the graph-entry
     // check ggml_sycl_mmq_src1_ensure_for_graph() sizes the exact demand at the real n_ubatch.
+    // The plan inputs are per device: another context that is live on THIS device keeps its larger inputs (a draft
+    // loaded beside a target must not under-plan the target); a model live on another device is no reason to merge.
+    // The loading context is already in the device's context list, so it is excluded by identity.
+    const bool other_model_live = ggml_sycl_other_backend_context_live(ctx->device, ctx);
     {
         const uint32_t mmq_src1_n_ubatch = inventory->n_ubatch != 0 ? inventory->n_ubatch : 512;
         const bool     mmq_src1_planned  = ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(
-            ctx->device, inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch);
+            ctx->device, inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch, other_model_live);
         GGML_LOG_INFO("[SYCL-PLAN] dense MMQ src1 Q8_1 scratch: %.1f MB (%zu B/token x n_ubatch=%u, RUNTIME zone)%s\n",
                       ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(ctx->device) / (1024.0 * 1024.0),
                       inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch,
@@ -16386,11 +16420,14 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     }
     // llama.cpp-479i: the dense f16 dequant buffers (src0 and src1 copies) are planned the same way, from
     // the inventory maxima the adapter marked (dense Q8_0 weights), in the same RUNTIME zone.
+    // A build that cannot reach the f16 arm plans nothing for it: the buffers would be a reservation nothing draws,
+    // and the hold, the fit check and the ring would each count it.
     {
         const uint32_t dequant_n_ubatch = inventory->n_ubatch != 0 ? inventory->n_ubatch : 512;
+        const bool     f16_drawable     = ggml_sycl_dequant_f16_scratch_drawable();
         const bool     dequant_planned  = ggml_sycl::unified_cache_set_planned_dequant_f16_scratch(
-            ctx->device, inventory_maxima.dequant_f16_weight_bytes, inventory_maxima.dequant_f16_src1_bytes_per_token,
-            dequant_n_ubatch);
+            ctx->device, f16_drawable ? inventory_maxima.dequant_f16_weight_bytes : 0,
+            f16_drawable ? inventory_maxima.dequant_f16_src1_bytes_per_token : 0, dequant_n_ubatch, other_model_live);
         GGML_LOG_INFO(
             "[SYCL-PLAN] dense f16 dequant scratch: %.1f MB (weights %.1f MB + %zu B/token x n_ubatch=%u, RUNTIME "
             "zone)%s\n",
@@ -17617,15 +17654,250 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
 // already-published shape still fits), or restore anything on refusal --
 // it only asks whether the ALREADY-PUBLISHED shape still fits the device's
 // current outside-arena headroom.
-static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
-                                               uint32_t n_ctx,
-                                               uint32_t n_ubatch,
-                                               uint32_t n_head,
-                                               bool     flash_attn_enabled,
-                                               bool     allow_replan,
-                                               bool     probe_mode = false) {
-    if (flash_attn_enabled) {
+// llama.cpp-kpjw: the driver headroom the arena expects the card to keep OUTSIDE it (and that the graph-entry check
+// reports against). One constant for that figure: the graph-entry check and the hold-spill fit must not name two
+// different numbers.
+static constexpr size_t kSyclArenaMinExternalHeadroomBytes = 256ull * 1024ull * 1024ull;
+
+// llama.cpp-kpjw (kpjw-g7, P4: one fact, one source): the planned dense scratch is held out of the RUNTIME zone's
+// spill-capable requests (the compute buffers), so a request the hold keeps out spills OUTSIDE the arena exactly as
+// one that found the zone full does. Whether a rung's compute buffers can be placed that way without leaving the
+// card under the driver headroom is ONE question, and three consumers ask it: the runtime-context transaction (F3,
+// before the rung's buffers exist), the auto-ubatch trial's realized check (after sched_reserve() made them), and
+// the context-init check on a pinned -ub. They are one function over one set of inputs (zone_hold_fit): the plan at
+// the rung, the rung's own recorded worst-case request (the allocator's per-rung record of scheduler compute
+// requests), the KV-zone room a compute buffer can count on net of the KV the transaction is about to place, and
+// the card's free memory with the rung's own buffers released, taken from the cache's own ledger
+// (unified_cache_hold_free_before: a cold reading plus the live outside-arena bytes) and never from a driver read
+// after a release, whose credit lags (602.7 MB was read where 1097 MB was true). The -ub a refusal names is the
+// largest the same function accepts. Still a worst-case BOUND, not a measurement: the hold is at most the plan, a
+// held-back request spills whole, and the KV-room netting is an estimate (other buffers may take the room first);
+// but one bound, so the three cannot disagree.
+struct ggml_sycl_hold_fit_query {
+    int      device;
+    uint64_t owner;       // the backend context's hold owner
+    uint32_t n_ubatch;    // the rung asked about
+    size_t   kv_pending;  // KV the transaction's plan places that is not live yet (F3); 0 once the context's KV exists
+    bool     rung_live;   // the rung's own compute buffers exist (the realized check)
+};
+
+struct ggml_sycl_hold_fit_answer {
+    size_t   demand      = 0;  // the raw demand the hold can cause at the rung
+    size_t   free_before = 0;  // the ledger's free memory without the rung's own buffers
+    uint32_t largest_ub  = 0;  // when the rung does not fit: the largest -ub the same function accepts (0: none)
+};
+
+// The KV-zone room a compute buffer can count on: the zone's LARGEST FREE BLOCK (a buffer is indivisible), net of the
+// KV the transaction's plan is about to place there (the transaction publishes before a first context's KV exists, so
+// the zone still shows those bytes free).
+static size_t ggml_sycl_hold_kv_room(int device, size_t kv_pending_bytes) {
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+    const size_t               kv_largest =
+        cache && cache->arena_active() ? cache->zone_largest_free(ggml_sycl::vram_zone_id::KV) : 0;
+    return ggml_sycl::zone_kv_room_for_compute(kv_largest, kv_pending_bytes);
+}
+
+static size_t ggml_sycl_hold_plan_at(void * ctx, uint32_t n_ubatch) {
+    size_t plan = 0;
+    if (!ggml_sycl::unified_cache_planned_dense_scratch_bytes_at(*static_cast<int *>(ctx), n_ubatch, &plan)) {
+        return 0;  // no plan, no hold, nothing a hold can push out
+    }
+    return plan;
+}
+
+static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sycl_hold_fit_answer * answer) {
+    ggml_sycl_hold_fit_answer  a;
+    ggml_sycl::unified_cache * cache    = ggml_sycl::get_unified_cache_for_device(q.device);
+    size_t                     free_mem = 0, total_mem = 0;
+    if (!cache || !cache->arena_active() || q.n_ubatch == 0) {
+        if (answer) {
+            *answer = a;
+        }
+        return true;  // no arena, no hold
+    }
+    ggml_backend_sycl_get_device_memory(q.device, &free_mem, &total_mem);
+    if (total_mem == 0) {
+        if (answer) {
+            *answer = a;
+        }
         return true;
+    }
+    int                               device    = q.device;
+    // The cache bounds one owner's records at its own limit (and counts what it refuses): the buffer holds exactly
+    // that many, from the one constant.
+    constexpr size_t                  kMaxRungs = ggml_sycl::kHoldRungRecordLimit;
+    ggml_sycl::zone_hold_rung_request rungs[kMaxRungs];
+    ggml_sycl::zone_hold_fit_inputs   in;
+    in.headroom_target      = kSyclArenaMinExternalHeadroomBytes;
+    in.free_before          = ggml_sycl::unified_cache_hold_free_before(q.device, q.owner, free_mem, q.rung_live);
+    // The realized check judges with the room the publish judged with (the rung's own KV-zone placements have used
+    // the zone since); a transaction asks the zone as it is now.
+    uint32_t epoch_n_ubatch = 0;
+    size_t   epoch_kv_room  = 0;
+    const bool have_epoch =
+        q.rung_live && ggml_sycl::unified_cache_get_hold_epoch(q.device, q.owner, &epoch_n_ubatch, &epoch_kv_room);
+    in.kv_room      = ggml_sycl::zone_hold_pick_kv_room(q.rung_live, have_epoch, epoch_kv_room,
+                                                   have_epoch ? 0 : ggml_sycl_hold_kv_room(q.device, q.kv_pending));
+    in.n_rungs      = ggml_sycl::unified_cache_get_hold_rung_requests(q.device, q.owner, rungs, kMaxRungs);
+    in.rungs        = rungs;
+    in.plan_of      = ggml_sycl_hold_plan_at;
+    in.plan_ctx     = &device;
+    a.demand        = ggml_sycl::zone_hold_fit_demand(in, q.n_ubatch);
+    a.free_before   = in.free_before;
+    const bool fits = ggml_sycl::zone_hold_fit(in, q.n_ubatch);
+    if (!fits) {
+        a.largest_ub = ggml_sycl::zone_hold_fit_largest_ub(in, q.n_ubatch);
+    }
+    if (answer) {
+        *answer = a;
+    }
+    return fits;
+}
+
+// What F3 and the non-FA check add to their own demand: the raw bytes the hold can push outside the arena at the
+// rung, from the one fit function.
+static size_t ggml_sycl_planned_scratch_hold_spill_bound(const ggml_sycl_hold_fit_query & q) {
+    ggml_sycl_hold_fit_answer a;
+    (void) ggml_sycl_hold_spill_fit(q, &a);
+    return a.demand;
+}
+
+// "the largest -ub that fits is about N" for a refusal, or the honest statement that none does.
+static std::string ggml_sycl_hold_fit_advice(uint32_t largest_ub) {
+    char buf[128];
+    if (largest_ub != 0) {
+        snprintf(buf, sizeof(buf), "the largest -ub that fits is about %u, a power of two, estimated by scaling",
+                 largest_ub);
+    } else {
+        snprintf(buf, sizeof(buf), "no -ub is known to fit");
+    }
+    return buf;
+}
+
+// llama.cpp-kpjw: the live outside-arena headroom check for the hold's worst-case spill, run whatever the attention
+// mode. The unified allocator's overcommit guard compares a spill with the device's TOTAL memory minus what the
+// cache itself accounts for; it cannot see another tenant on the card or the driver's own reserve, so on a shared
+// card a spill it admits can fail late as OUT_OF_DEVICE_MEMORY or DEVICE_LOST. This asks the one hold-spill fit
+// (ggml_sycl_hold_spill_fit), once, at the transaction, so the context is refused by name. No non-FA reserve is
+// added: that constant is the empirical outside-arena consumer of the non-FA path and has no bearing on the hold's
+// spill.
+static bool ggml_sycl_check_hold_spill_headroom(const ggml_sycl_hold_fit_query & q, bool probe_mode) {
+    ggml_sycl_hold_fit_answer a;
+    if (ggml_sycl_hold_spill_fit(q, &a)) {
+        return true;
+    }
+    const double mb         = 1024.0 * 1024.0;
+    const size_t free_after = a.demand >= a.free_before ? 0 : a.free_before - a.demand;
+    GGML_SYCL_RUNTIME_TXN_REFUSAL(
+        probe_mode,
+        "[SYCL-PLAN] runtime context update rejected: the planned dense scratch holds back the RUNTIME zone and "
+        "its worst-case spill outside the arena (%.1f MB: the plan plus the rung's largest compute-buffer request, "
+        "net of the KV-zone room a compute buffer can use) would leave device %d %.1f MB free (of %.1f MB free "
+        "before it), under the %.1f MB driver headroom the arena expects; %s; or free VRAM on this card (another "
+        "process, or a smaller -c) before loading\n",
+        a.demand / mb, q.device, free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb,
+        ggml_sycl_hold_fit_advice(a.largest_ub).c_str());
+    return false;
+}
+
+// llama.cpp-kpjw: what the rung's own buffers actually did. The transaction-time check runs before the compute
+// buffers exist; this is run by the auto-ubatch trial AFTER sched_reserve() has returned
+// (ggml_backend_sycl_planned_hold_spill_fits, from llama_context::sycl_select_auto_ubatch's try_candidate), and by
+// the context-init check on a pinned -ub, when every buffer of the rung exists and its own largest request is
+// recorded. It asks the SAME function F3 asks, now with the rung's measured request, the room the publish judged
+// with and the ledger's free memory with the rung's own buffers credited back, so a rung F3 would accept on those
+// inputs is never refused here, nor the reverse. It is not run from the recheck inside the reserve: that runs after
+// a 1-token flash-attention probe reserve and before the worst-case pp/tg reserves that make the large buffers, and
+// only for the first rung under auto_fa. A rung refused here runs the card out of resources at its first graph (B50,
+// Qwen PPL at auto-ub1024: a 461 MB buffer held back, 107.8 MB left, flash attention out of resources).
+static bool ggml_sycl_check_hold_spill_realized(int        device,
+                                                uint64_t   owner,
+                                                bool       probe_mode,
+                                                uint32_t   n_ubatch,
+                                                uint32_t * largest_ub) {
+    ggml_sycl_hold_fit_answer      a;
+    const ggml_sycl_hold_fit_query q = { device, owner, n_ubatch, 0, true };
+    if (ggml_sycl_hold_spill_fit(q, &a)) {
+        return true;
+    }
+    // One device's answer; the caller takes the smallest over its devices.
+    if (largest_ub) {
+        *largest_ub = a.largest_ub;
+    }
+    ggml_sycl::planned_hold_spill_totals spill_totals;
+    ggml_sycl::unified_cache_get_recent_planned_hold_spills(device, owner, &spill_totals);
+    const double mb         = 1024.0 * 1024.0;
+    const size_t free_after = a.demand >= a.free_before ? 0 : a.free_before - a.demand;
+    GGML_SYCL_RUNTIME_TXN_REFUSAL(
+        probe_mode,
+        "[SYCL-PLAN] runtime context update rejected: at n_ubatch=%u the compute buffers the planned dense scratch "
+        "keeps out of the RUNTIME zone (worst case %.1f MB; %llu request(s) totalling %.1f MB were held out and now "
+        "live outside the arena) leave device %d %.1f MB free (of %.1f MB free before them), under the %.1f MB "
+        "driver headroom the arena expects; a smaller -ub or -c keeps those buffers in the zone\n",
+        n_ubatch, a.demand / mb, (unsigned long long) spill_totals.raw_count, spill_totals.raw_bytes / mb, device,
+        free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb);
+    return false;
+}
+
+// The scheduler compute scope (ggml-sycl.h): a buffer-type allocation made while it is open on the calling thread is a
+// scheduler compute buffer. Changes only a thread-local depth.
+void ggml_backend_sycl_compute_alloc_scope(bool enter) {
+    if (enter) {
+        ggml_sycl::compute_alloc_scope_enter();
+    } else {
+        ggml_sycl::compute_alloc_scope_leave();
+    }
+}
+
+// The auto-ubatch trial's per-rung check (see ggml_sycl_check_hold_spill_realized): true when this backend's
+// context fits the one hold-spill function at `n_ubatch` with the rung's compute buffers in place. The trial calls
+// it after the rung's sched_reserve() returned. A refusal is logged by name (at INFO: the loss is recoverable, the
+// ladder lands lower). Not a lifecycle transaction, and not a pure function of the configuration and the request: it
+// reads the live free memory and the cache's ledger, and the ledger's baseline is taken at the first fit of a window
+// (the first call after a publish), so the verdict also depends on when that call happened. It writes that baseline
+// and nothing else.
+//
+// ABI: this entry changed arity (r4 added the largest_ub out-parameter) and is reached from libllama through
+// ggml_backend_sycl_get_proc_address on a backend-DL build. libllama and the SYCL DSO ship from one build, so there
+// is no version gate. An older DSO that predates the entry exports nothing and the caller skips it; one that exports
+// the three-argument form is called with a fourth argument it ignores, so largest_ub stays 0 (the caller zeroes it
+// before the call and reads 0 as "no -ub is known to fit"), which degrades the refusal's advice, never its verdict.
+bool ggml_backend_sycl_planned_hold_spill_fits(ggml_backend_t backend, uint32_t n_ubatch, uint32_t * largest_ub) {
+    if (largest_ub) {
+        *largest_ub = 0;
+    }
+    if (!backend || !backend->context || !ggml_backend_is_sycl(backend)) {
+        return true;
+    }
+    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    return ggml_sycl_check_hold_spill_realized(ctx->device, ctx->planned_scratch_owner, /*probe_mode=*/true, n_ubatch,
+                                               largest_ub);
+}
+
+// Re-reads the KV room the owner's epoch is judged with, from the zone as it is now with the context's KV in place
+// (nothing pending). A pinned -ub publishes once, before the memory module exists, so the room its epoch began with
+// predates the KV cache and the recurrent state; the constructor calls this once they exist and before the compute
+// buffers are reserved. A no-op for a null or foreign backend and when the owner has no epoch.
+void ggml_backend_sycl_planned_hold_epoch_refresh(ggml_backend_t backend) {
+    if (!backend || !backend->context || !ggml_backend_is_sycl(backend)) {
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    ggml_sycl::unified_cache_refresh_hold_epoch_kv_room(ctx->device, ctx->planned_scratch_owner,
+                                                        ggml_sycl_hold_kv_room(ctx->device, 0));
+}
+
+static bool ggml_sycl_check_nonfa_attn_scratch(int                              device,
+                                               uint32_t                         n_ctx,
+                                               uint32_t                         n_ubatch,
+                                               uint32_t                         n_head,
+                                               bool                             flash_attn_enabled,
+                                               bool                             allow_replan,
+                                               bool                             probe_mode = false,
+                                               const ggml_sycl_hold_fit_query * hold_query = nullptr) {
+    if (flash_attn_enabled) {
+        // The non-FA attention scratch does not exist with flash attention on, but the hold's spill does.
+        return !hold_query || ggml_sycl_check_hold_spill_headroom(*hold_query, probe_mode);
     }
     if (ggml_sycl::unified_cache_nonfa_attn_scratch_guard_disabled()) {
         // llama.cpp-pvjr: an explicit GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 is a
@@ -17725,9 +17997,24 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
     // already published still fits the device's current outside-arena
     // headroom, using the free-memory reading taken above.
 
-    const size_t nonfa_demand = ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes(n_head, n_ubatch, n_ctx);
+    // llama.cpp-kpjw: the worst case of a hold-induced spill (ggml_sycl_planned_scratch_hold_spill_bound: the plan
+    // plus the largest spill-capable compute-buffer request, a bound that is a heuristic in r_max) is counted here,
+    // in the check that already asks what the device can take outside the arena; those bytes and the non-FA scratch
+    // compete for the same headroom. (A flash-attention context asks the same live free-memory question without the
+    // non-FA terms, at the top of this function.) Saturating: a wrapped sum must not read as a small demand.
+    const size_t hold_spill_bytes = hold_query ? ggml_sycl_planned_scratch_hold_spill_bound(*hold_query) : 0;
+    const size_t nonfa_scratch_demand =
+        ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes(n_head, n_ubatch, n_ctx);
+    const size_t nonfa_demand = ggml_sycl::zone_hold_nonfa_demand(nonfa_scratch_demand, hold_spill_bytes);
+    // One fact, one source (r7 I1): the card's free memory the demand is compared with is the SAME ledger figure the
+    // hold-spill fit judges its own spill with (the driver's reading taken above, less what the rung does not own),
+    // not a bare driver reading. Inside a reserve (rung_live) the driver reading already counts the rung's buffers
+    // that exist; the demand counts them again, so comparing the two double counts exactly as the hold term did.
+    const size_t free_cmp = hold_query ? ggml_sycl::unified_cache_hold_free_before(device, hold_query->owner, free_mem,
+                                                                                   hold_query->rung_live) :
+                                         free_mem;
 
-    if (ggml_sycl::unified_cache_nonfa_attn_scratch_fits_headroom(nonfa_demand, free_mem)) {
+    if (ggml_sycl::unified_cache_nonfa_attn_scratch_fits_headroom(nonfa_demand, free_cmp)) {
         return true;
     }
 
@@ -17741,7 +18028,7 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
     const double   demand_mb      = nonfa_demand / mb;
     const double   reserve_mb     = reserve / mb;
     const double   needs_mb       = demand_mb + reserve_mb;
-    const double   free_mb        = free_mem / mb;
+    const double   free_mb        = free_cmp / mb;
     // "headroom-limited": this figure is bounded by THIS device's current
     // live outside-arena headroom (free memory minus the empirical
     // reserve), not a whole-device or zone-only guarantee -- another tenant
@@ -17749,15 +18036,15 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
     // unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(), the
     // inverse of fits_headroom()'s own comparison above, rather than
     // re-subtracting the reserve by hand here -- the two must not drift.
-    const size_t   capacity_bytes = ggml_sycl::unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(free_mem);
+    const size_t   capacity_bytes = ggml_sycl::unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(free_cmp);
     const uint32_t fits_headroom_ctx =
         ggml_sycl::unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(capacity_bytes, n_head, n_ubatch);
     GGML_SYCL_RUNTIME_TXN_REFUSAL(
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: non-FA attention scratch exceeds the device's "
-        "outside-arena headroom -- n_ctx=%u n_ubatch=%u n_head=%u needs=%.1f MB (demand %.1f MB + reserve "
-        "%.1f MB) free=%.1f MB over_by=%.1f MB\n",
-        n_ctx, n_ubatch, n_head, needs_mb, demand_mb, reserve_mb, free_mb, needs_mb - free_mb);
+        "outside-arena headroom -- n_ctx=%u n_ubatch=%u n_head=%u needs=%.1f MB (demand %.1f MB, of which %.1f MB "
+        "is the planned dense scratch's worst-case hold spill bound, + reserve %.1f MB) free=%.1f MB over_by=%.1f MB\n",
+        n_ctx, n_ubatch, n_head, needs_mb, demand_mb, hold_spill_bytes / mb, reserve_mb, free_mb, needs_mb - free_mb);
     // GGML_SYCL_NONFA_ATTN_SCRATCH_MB is NOT offered as a remediation here:
     // it only replaces the demand term d, not the reserve or the headroom
     // comparison, so it is an experimentation knob (llama.cpp-k1ev), not a
@@ -18261,6 +18548,96 @@ static std::atomic<uint64_t> g_ggml_sycl_optional_layout_epoch{ 0 };
 static void ggml_sycl_optional_layouts_retired() {
     g_ggml_sycl_optional_layout_epoch.fetch_add(1, std::memory_order_acq_rel);
 }
+
+// llama.cpp-kpjw: publish the RUNTIME-zone bytes a spill-capable allocation must leave free for this context's
+// planned dense scratch (the Q8_1 src1 buffer and the two f16 dequant buffers). Without it the plan is only COUNTED
+// in the zone requirement: the compute buffers of the same context ask the same zone, may spill, and filled it before
+// the first graph materialized the planned buffer (B70, Qwen3.6-27B, "zone has 0.3 MB free"). The figure is the whole
+// plan of every buffer still short of it (zone_planned_scratch_hold_bytes), so it falls to zero as the walks bring
+// each buffer up to its plan, and the transaction recomputes it when a new n_ubatch moves the plan.
+//
+// All three buffers are held from the first plan, by one rule: a buffer short of its plan holds the whole plan.
+// Q8: a decode graph of any quantized dense model draws from it. f16: the plan exists only where something can draw
+// it. The load-time plan is zero for a build without the oneDNN f16 arm and for a model with no dense Q8_0 weight
+// (ggml_sycl_dequant_f16_scratch_drawable and the zone adapter), and where it is not zero the f16 arm is reachable:
+// the oneDNN PP route supplies its own copies from the ONEDNN zone only for a batch at or above its floor, a smaller
+// batch (a short prompt, the last chunk of a long one) and GGML_SYCL_ONEDNN_PP=0 go through the dequant arm, and so
+// does a node the unified kernel declines at run time. The hold, the fit check and the ring's pending RUNTIME demand
+// all read the same planned figures, so they count the same bytes: none of the three counts f16 where the plan is
+// zero, all three count it where it is not. (The previous rule held f16 only once it was backed and so reserved
+// nothing for the first draw, the one that is refused when the zone is full.)
+//
+// The hold is per device, and the context that publishes it is recorded as its owner, a monotonic context id (never
+// an address, which a later context can reuse); teardown releases only its own. Two live contexts on one device are
+// not supported (canonical contract section 5), so the owner is not a queue of holds: it is what stops one context's
+// teardown dropping the hold the other still needs.
+//
+// A hold persists while a buffer is short of its plan, including for a graph that counts no node for it: such a
+// graph proves nothing about the next one (a PP graph can draw what a decode graph does not). The idle part is
+// bounded by the plan, which exists only for a model with dense quantized weights, and it binds only spill-capable
+// RUNTIME requests, which spill (counted, warned about, refused if the device cannot take them) rather than fail.
+// That bound is permanent in two runs that never draw the f16 buffers: a decode-only run (n_batch below every f16
+// route's floor, no prompt batch large enough) and a run whose prompts all take the oneDNN PP route, which brings
+// its own copies from the ONEDNN zone. The f16 plan stays unmet there, so its share of the hold stands for the whole
+// context lifetime. That is deliberate (the first draw is the one that is refused when the zone is full), and it is
+// bounded: the f16 plan only.
+static void ggml_sycl_planned_scratch_hold_refresh(ggml_backend_sycl_context & ctx) {
+    const int                            d         = ctx.device;
+    const ggml_sycl::zone_planned_buffer buffers[] = {
+        { ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(d), ctx.mmvq_q8_activation_cache.capacity(d) },
+        { ggml_sycl::unified_cache_get_planned_dequant_f16_buffer_bytes(d, false),
+         ctx.dequant_f16_src0_scratch.capacity(d) },
+        { ggml_sycl::unified_cache_get_planned_dequant_f16_buffer_bytes(d, true),
+         ctx.dequant_f16_src1_scratch.capacity(d) },
+    };
+    size_t hold = 0;
+    if (!ggml_sycl::zone_planned_scratch_hold_bytes(buffers, 3, &hold)) {
+        hold = 0;  // an overflowing plan was published as zero; there is nothing coherent to hold
+    }
+    ggml_sycl::unified_cache_set_planned_scratch_hold(d, hold, ctx.planned_scratch_owner);
+}
+
+// llama.cpp-kpjw: the runtime-context transaction re-plans the dense scratch at the runtime n_ubatch and drops the
+// hold while it materializes its own pools; this restores both on every exit that is not the success tail. A probe
+// changes nothing, so its guard is inert. The hold is the OWNER's: the guard zeroes it for this context and puts
+// back whatever (hold, owner) pair it found.
+struct ggml_sycl_dense_scratch_txn_guard {
+    int      device;
+    uint64_t owner;
+    bool     active;
+    bool     committed     = false;
+    uint32_t prev_n_ubatch = 0;
+    size_t   prev_hold     = 0;
+    uint64_t prev_owner    = 0;
+
+    ggml_sycl_dense_scratch_txn_guard(ggml_backend_sycl_context & ctx, bool publish) :
+        device(ctx.device),
+        owner(ctx.planned_scratch_owner),
+        active(publish) {
+        if (active) {
+            prev_n_ubatch = ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(device);
+            ggml_sycl::unified_cache_get_planned_scratch_hold_state(device, &prev_hold, &prev_owner);
+            // The transaction places the MoE MMID pools in this zone; they are not the compute buffers the hold
+            // exists to keep out, and the ring admission already counts the plan against the zone.
+            ggml_sycl::unified_cache_set_planned_scratch_hold(device, 0, owner);
+        }
+    }
+
+    void commit() { committed = true; }
+
+    ~ggml_sycl_dense_scratch_txn_guard() {
+        if (active && !committed) {
+            if (prev_n_ubatch != 0) {
+                // A rollback restores an exact earlier plan, not a merge, so it never keeps a larger input.
+                (void) ggml_sycl::unified_cache_replan_planned_dense_scratch(device, prev_n_ubatch, false);
+            }
+            ggml_sycl::unified_cache_set_planned_scratch_hold(device, prev_hold, prev_owner);
+        }
+    }
+
+    ggml_sycl_dense_scratch_txn_guard(const ggml_sycl_dense_scratch_txn_guard &)             = delete;
+    ggml_sycl_dense_scratch_txn_guard & operator=(const ggml_sycl_dense_scratch_txn_guard &) = delete;
+};
 
 // llama.cpp-3aos: kv_unified -- see placement_kv_info::kv_unified
 // / kv_layer_bytes_for_kind() (unified-cache.hpp) for the rationale.
@@ -18915,10 +19292,58 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // n_ubatch/n_head arguments directly, against a fresh live free-memory
     // read that always happens) -- so allow_replan=false gives the identical
     // answer for a probe, just without the zone-growth side effect.
+    // llama.cpp-kpjw: the worst-case outside-arena spill the hold can cause at the n_ubatch this transaction is about
+    // to publish; the check below counts it (with the non-FA scratch when flash attention is off).
+    // The KV this transaction's plan adds on the device and that is not live yet (none of it for a first context, whose
+    // KV cache is created after this publish; only the growth for one that already holds KV): the zone still shows
+    // those bytes free, and they are not room for a compute buffer.
+    const size_t kv_with_slack = ggml_sycl_device_kv_bytes_with_slack(next_plan, ctx->device);
+    const size_t kv_admitted   = admitted_kv ? ggml_sycl_device_kv_bytes_with_slack(*admitted_kv, ctx->device) : 0;
+    const size_t kv_pending    = kv_with_slack > kv_admitted ? kv_with_slack - kv_admitted : 0;
+    const ggml_sycl_hold_fit_query hold_query   = { ctx->device, ctx->planned_scratch_owner, next_kv_info.n_ubatch,
+                                                    kv_pending, /*rung_live=*/false };
+    // The KV room this publish judged with, kept for the epoch it starts (the realized check asks over the same room).
+    const size_t                   hold_kv_room = ggml_sycl_hold_kv_room(ctx->device, kv_pending);
     if (!ggml_sycl_check_nonfa_attn_scratch(ctx->device, n_ctx, next_kv_info.n_ubatch, next_plan.planner_n_head_all_max,
                                             flash_attn_enabled,
-                                            /*allow_replan=*/!probe_mode, probe_mode)) {
+                                            /*allow_replan=*/!probe_mode, probe_mode, &hold_query)) {
         return refuse("non-FA attention scratch exceeds the device's outside-arena headroom");
+    }
+
+    // llama.cpp-kpjw: the dense MMQ/MMVQ Q8_1 src1 buffer and the dense f16 dequant buffers are planned per
+    // n_ubatch, and the load-time plan used the loader's n_ubatch (512). Auto-ubatch picks the real one after load
+    // (this transaction is what its probe runs), so the plan is re-derived here, in the transaction that already
+    // re-plans KV, the non-FA attention scratch and the PP MoE ring, before any graph records: a growth at this
+    // point is not growth while recording. A rung whose plan the RUNTIME zone cannot hold even when empty is refused
+    // HERE, so the ladder keeps the last rung that fits instead of publishing a plan the first graph cannot meet,
+    // and the refusal names the largest -ub that does. The compute-buffer reserve that comes after this is what
+    // the hold (ggml_sycl_planned_scratch_hold_refresh) keeps off the planned bytes.
+    size_t dense_scratch_runtime_bytes = 0;
+    {
+        size_t   needed        = 0;
+        size_t   zone_capacity = 0;
+        uint32_t largest_ub    = 0;
+        if (next_kv_info.n_ubatch != 0 &&
+            !ggml_sycl::unified_cache_dense_scratch_runtime_fit(ctx->device, next_kv_info.n_ubatch, &needed,
+                                                                &zone_capacity, &largest_ub)) {
+            const char * fmt =
+                "[SYCL-PLAN] runtime KV update rejected: the dense MMQ/MMVQ scratch for n_ubatch=%u (%.1f MB: Q8_1 "
+                "src1 and f16 dequant buffers) does not fit the RUNTIME zone (%.1f MB) on device %d; the largest -ub "
+                "that fits is about %u\n";
+            if (probe_mode) {
+                GGML_LOG_INFO(fmt, next_kv_info.n_ubatch, needed / mb, zone_capacity / mb, ctx->device, largest_ub);
+            } else {
+                GGML_LOG_ERROR(fmt, next_kv_info.n_ubatch, needed / mb, zone_capacity / mb, ctx->device, largest_ub);
+            }
+            return refuse("dense MMQ/MMVQ scratch does not fit the RUNTIME zone");
+        }
+        dense_scratch_runtime_bytes = needed;
+    }
+    ggml_sycl_dense_scratch_txn_guard dense_guard(*ctx, !probe_mode);
+    if (!probe_mode && next_kv_info.n_ubatch != 0) {
+        // Another context live on this device keeps the larger n_ubatch in the plan it is running on.
+        (void) ggml_sycl::unified_cache_replan_planned_dense_scratch(
+            ctx->device, next_kv_info.n_ubatch, ggml_sycl_other_backend_context_live(ctx->device, ctx));
     }
 
     // llama.cpp-ibj0: the PP MoE oneDNN scratch ring was sized at model load
@@ -18958,6 +19383,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // below, so the ring's KV-zone part is admitted against the budget it is
     // charged to.
     ring_kv_zone.budget_room_bytes = ggml_sycl_device_vram_budget_room(next_plan, ctx->device);
+    // The dense scratch planned above lives in the RUNTIME zone too (counted twice when this context already
+    // materialized it, like the pools below: conservative), so the ring leaves it that room.
+    ring_kv_zone.runtime_pending_bytes += dense_scratch_runtime_bytes;
     // The current plan's pools, still allocated, are already missing from the
     // RUNTIME zone's free space, so they are counted twice here: conservative,
     // and only in a build where the route is reachable.
@@ -19117,6 +19545,12 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             { current->model_id, current->load_txn_id, current->slot_generation }, current->version);
     }
     g_runtime_update_succeeded = true;
+    // Published: the plan stands, so the hold is recomputed from it (and from what this context already holds).
+    dense_guard.commit();
+    ggml_sycl_planned_scratch_hold_refresh(*ctx);
+    // This plan's own reserve is what the realized-spill check (try_candidate, after sched_reserve()) must see, not a losing rung's.
+    ggml_sycl::unified_cache_begin_planned_hold_epoch(ctx->device, ctx->planned_scratch_owner, next_kv_info.n_ubatch,
+                                                      hold_kv_room);
     announce_kv_host_demotions(*immutable->plan);
 
 #if GGML_SYCL_DNNL
@@ -19547,10 +19981,21 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
     // That refusal surfaces as the std::runtime_error
     // sycl_recheck_runtime_context_flash_attn() throws (llama-context.cpp)
     // when this returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED.
-    const bool ok =
-        ggml_sycl_check_nonfa_attn_scratch(ctx->device, current->plan->planner_n_ctx, current->plan->planner_n_ubatch,
-                                           current->plan->planner_n_head_all_max, flash_attn_enabled,
-                                           /*allow_replan=*/false);
+    // The recheck runs inside this rung's own sched_reserve(): some of the rung's buffers may already exist, so it is
+    // asked as the realized check is (the rung's own bytes credited back, the publish's KV room).
+    const ggml_sycl_hold_fit_query recheck_hold_query = { ctx->device, ctx->planned_scratch_owner,
+                                                          current->plan->planner_n_ubatch, 0, /*rung_live=*/true };
+    const bool                     ok                 = ggml_sycl_check_nonfa_attn_scratch(
+        ctx->device, current->plan->planner_n_ctx, current->plan->planner_n_ubatch,
+        current->plan->planner_n_head_all_max, flash_attn_enabled,
+        /*allow_replan=*/false, /*probe_mode=*/false,
+        // The recheck runs inside sched_reserve(), after this context's KV exists: none of it is pending.
+        &recheck_hold_query);
+    // llama.cpp-kpjw: the exact hold spill is NOT checked here. This recheck runs inside sched_reserve() after a
+    // 1-token flash-attention probe reserve and before the worst-case pp/tg reserves that make the large compute
+    // buffers (and only for the first rung under auto_fa); the auto-ubatch trial asks
+    // ggml_backend_sycl_planned_hold_spill_fits after sched_reserve() returns, for every rung. The bound passed above
+    // is the transaction-time heuristic.
     return ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
 }
 
@@ -26647,6 +27092,19 @@ static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int 
     std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
     const auto & contexts = g_backend_context_by_device[device];
     return contexts.empty() ? nullptr : contexts.back();
+}
+
+static bool ggml_sycl_other_backend_context_live(int device, const ggml_backend_sycl_context * self) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
+    for (const ggml_backend_sycl_context * c : g_backend_context_by_device[device]) {
+        if (c != self) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Check if a tensor's buffer allocation is in device VRAM (not host-pinned fallback).
@@ -38150,6 +38608,51 @@ static const char * ggml_backend_sycl_buffer_type_get_name(ggml_backend_buffer_t
     return ctx->name.c_str();
 }
 
+// llama.cpp-kpjw: one line per scheduler compute buffer that asked for the KV-zone-first placement, naming where it
+// landed. The zone is where the buffer's bytes physically are (a zone name: inside the arena; "raw": device memory
+// outside it; "host-pinned": host memory; "none": nothing placed it), which a throughput comparison between builds
+// cannot otherwise attribute. A buffer the arena placed is logged where it is placed; one nothing in the arena placed
+// goes to the legacy path in the allocator below, which logs the buffer it makes (legacy_landing_pending), so the
+// line never says "none" for a buffer that then lives somewhere. The line is written only once the buffer is
+// PUBLISHED (ggml_backend_sycl_buffer_publish accepted it): a buffer the publish refused was released, lives nowhere,
+// and a line naming a zone for it would be false. So the zone is read from the handle first (the publish consumes
+// it) and logged after.
+static const char * ggml_sycl_compute_buffer_zone(const ggml_sycl::alloc_handle & handle) {
+    const char * zone = "none";
+    if (handle.ptr) {
+        if (handle.tier == ggml_sycl::alloc_tier::HOST_PINNED) {
+            zone = "host-pinned";
+        } else {
+            switch (handle.vram_zone) {
+                case ggml_sycl::vram_zone_id::KV:
+                    zone = "kv";
+                    break;
+                case ggml_sycl::vram_zone_id::WEIGHT:
+                    zone = "weight";
+                    break;
+                case ggml_sycl::vram_zone_id::ONEDNN:
+                    zone = "onednn";
+                    break;
+                case ggml_sycl::vram_zone_id::RUNTIME:
+                    zone = "runtime";
+                    break;
+                case ggml_sycl::vram_zone_id::SCRATCH:
+                    zone = "scratch";
+                    break;
+                default:
+                    zone = "raw";
+                    break;
+            }
+        }
+    }
+    return zone;
+}
+
+static void ggml_sycl_log_compute_buffer_landing(int device, const std::string & name, size_t size, const char * zone) {
+    GGML_LOG_WARN("[SCRATCH-STATS] device=%d compute_buffer=%s size=%.1f MB zone=%s\n", device, name.c_str(),
+                  size / (1024.0 * 1024.0), zone);
+}
+
 static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                                                         size_t                     size) try {
     // The shared invariant: no TRANSACTION token is held at gallocr ALLOC or at
@@ -38223,10 +38726,22 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
     // bump allocators).  This is safe because compute buffers are allocated once
     // during graph_reserve and persist for the context lifetime, just like KV
     // caches.  They don't need to be freed until the context is destroyed.
+    // llama.cpp-kpjw: set when a flagged compute buffer was not placed in the arena, so the legacy path below places it
+    // and its landing is logged from the handle that path makes (see ggml_sycl_log_compute_buffer_landing).
+    bool legacy_landing_pending = false;
     if (ggml_sycl::vram_arena_enabled()) {
         auto * cache = ggml_sycl::get_unified_cache_for_device(buft_ctx->device);
         if (cache && cache->arena_active()) {
             const bool should_use_runtime = !is_kv_buft && effective_mem_type == GGML_SYCL_MEM_DEVICE;
+            // llama.cpp-kpjw (kpjw-g7): true for a scheduler compute buffer, identified POSITIVELY: the llama context
+            // opens a compute scope (ggml_backend_sycl_compute_alloc_scope) around the scheduler's own allocations
+            // (ggml_backend_sched_reserve / ggml_backend_sched_alloc_graph), and only a request made inside it is
+            // flagged. This buffer type also backs every other allocation of the model: its weights, and the
+            // recurrent state (461 MB on a hybrid model, allocated outside a load). The flag used to be "no model is
+            // loading right now", a timing discriminator, which marked that state buffer as compute: it then fed the
+            // per-rung request record and the hold-spill counters. A state-class buffer is no longer flagged and no
+            // longer counted; what it holds live is in the cache's ledger of free memory.
+            const bool kv_zone_first      = ggml_sycl_compute_alloc_scope_active();
             if (should_use_runtime) {
                 // Route through RUNTIME zone.  A miss must not reset the zone
                 // here: backend buffers can be allocated during graph reserve
@@ -38244,9 +38759,22 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 runtime_req.intent.cohort_id                    = "backend-buffer-runtime-zone";
                 runtime_req.intent.constraints.must_device      = true;
                 runtime_req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;
+                // llama.cpp-kpjw: a compute buffer the RUNTIME zone will not serve goes to the arena's KV zone
+                // before raw device memory outside the arena (see alloc_constraints::spill_to_kv_zone_before_raw).
+                // Only a scheduler compute buffer gets it. This buffer type also backs the model's WEIGHT tensors,
+                // and those are allocated during the model load, before any KV cache exists: one sent to the KV zone
+                // would take room this context's KV is about to be placed in. The scheduler's compute scope is the
+                // discriminator (see kv_zone_first above).
+                runtime_req.intent.constraints.spill_to_kv_zone_before_raw = kv_zone_first;
                 ggml_sycl::alloc_handle runtime_h{};
                 ggml_sycl::unified_alloc(runtime_req, &runtime_h);
+                // Nothing in the arena placed it, or the publish below refuses it: the legacy path decides and logs
+                // where it finally landed.
+                if (kv_zone_first && !runtime_h.ptr) {
+                    legacy_landing_pending = true;
+                }
                 if (runtime_h.ptr) {
+                    const char *                       landed_zone = ggml_sycl_compute_buffer_zone(runtime_h);
                     ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(
                         buft_ctx->device, runtime_h.ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
                     ctx->set_managed_owner(std::move(runtime_h));
@@ -38254,11 +38782,17 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                                     buft_ctx->name.c_str());
                     if (ggml_backend_buffer_t published =
                             ggml_backend_sycl_buffer_publish(buft, ctx, size, "arena RUNTIME zone")) {
+                        if (kv_zone_first) {
+                            ggml_sycl_log_compute_buffer_landing(buft_ctx->device, buft_ctx->name, size, landed_zone);
+                        }
                         return published;
                     }
-                    // Refused: the context is gone and its allocation released.
-                    // Fall through to the next tier rather than failing the whole
-                    // allocation -- the tiers below can still serve this buffer.
+                    // Refused: the context is gone and its allocation released, so nothing lives where the line
+                    // would have said. Fall through to the next tier rather than failing the whole allocation --
+                    // the tiers below can still serve this buffer, and the one that does is what is logged.
+                    if (kv_zone_first) {
+                        legacy_landing_pending = true;
+                    }
                 }
 
                 // RUNTIME zone full — for compute buffers, try the shared KV
@@ -38267,7 +38801,15 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 // the fixed-size RUNTIME zone.  Compute buffers persist for the
                 // context lifetime (allocated during graph_reserve), so they
                 // won't fragment or leak between inference steps.
-                if (alloc_role == ggml_sycl::alloc_role::COMPUTE || should_use_runtime) {
+                // llama.cpp-kpjw: NOT for the flagged class (a scheduler compute buffer, kv_zone_first). unified_alloc
+                // has already tried the KV zone for it, with the zone-full and hold-induced cases counted, so a KV
+                // request here would repeat an attempt that just failed; and the SCRATCH step below must stay
+                // unreachable for it, because a compute buffer in the SCRATCH zone is exactly what the graph-entry
+                // headroom check (ggml_sycl_check_graph_scratch_headroom) aborts on. A flagged buffer that nothing
+                // above could place falls through to the legacy allocation path, whose host-pinned retry is the
+                // ladder's "compute buffer fell back to host" signal. These two steps serve the unflagged class (a
+                // model load) exactly as before.
+                if (!kv_zone_first && (alloc_role == ggml_sycl::alloc_role::COMPUTE || should_use_runtime)) {
                     ggml_sycl::alloc_request kv_req{};
                     kv_req.queue                               = buft_ctx->stream;
                     kv_req.device                              = buft_ctx->device;
@@ -38463,6 +39005,9 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
         return nullptr;
     }
 alloc_succeeded:
+    // llama.cpp-kpjw: a flagged compute buffer the arena did not place lands here (raw device memory or host-pinned).
+    // Its zone is read now (the context below takes the handle); the line is written once the publish accepts it.
+    const char * legacy_zone = legacy_landing_pending ? ggml_sycl_compute_buffer_zone(main_alloc) : "none";
     // llama.cpp-tsfl round 4 Q1: the oversize site's landing is counted
     // HERE, not where must_host_pinned was forced -- see that site's own
     // comment. Reaching this label at all already proves the allocation
@@ -38528,7 +39073,11 @@ alloc_succeeded:
         // Restore device context
         ggml_sycl_set_device(buft_ctx->device);
     }
-    return ggml_backend_sycl_buffer_publish(buft, ctx, size, "device");
+    ggml_backend_buffer_t legacy_published = ggml_backend_sycl_buffer_publish(buft, ctx, size, "device");
+    if (legacy_published && legacy_landing_pending) {
+        ggml_sycl_log_compute_buffer_landing(buft_ctx->device, buft_ctx->name, size, legacy_zone);
+    }
+    return legacy_published;
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::exit(1);
@@ -45076,6 +45625,22 @@ void ggml_backend_sycl_context::log_planned_scratch_stats() {
                 dev, c.name, (unsigned long long) c.stats->uses, (unsigned) c.stats->allocs,
                 (unsigned) c.stats->op_growths, c.capacity / 1024.0, c.planned / 1024.0, c.stats->peak_demand / 1024.0);
         }
+        // Spill-capable RUNTIME requests the hold kept out of the zone (compute buffers spilling outside the arena
+        // so the planned scratch could still be materialized). Taken here, so the count is per context.
+        ggml_sycl::planned_hold_spill_totals hold_spills;
+        ggml_sycl::unified_cache_take_planned_hold_spills(dev, planned_scratch_owner, &hold_spills);
+        if (hold_spills.raw_count != 0 || hold_spills.arena_count != 0 || hold_spills.zone_full_count != 0) {
+            // Split by where the buffer landed: RAW is outside the arena (eats the driver headroom), the KV zone is
+            // inside it, either because the hold kept the buffer out of the RUNTIME zone (kv_zone) or because that zone
+            // was full (kv_zone_full). These are the finished context's own counts: a publish restarts them.
+            GGML_LOG_WARN(
+                "[SCRATCH-STATS] device=%d hold_spills_raw=%llu hold_spills_raw_bytes=%.1f KB hold_spills_kv_zone=%llu "
+                "hold_spills_kv_zone_bytes=%.1f KB hold_spills_kv_zone_full=%llu hold_spills_kv_zone_full_bytes=%.1f "
+                "KB\n",
+                dev, (unsigned long long) hold_spills.raw_count, hold_spills.raw_bytes / 1024.0,
+                (unsigned long long) hold_spills.arena_count, hold_spills.arena_bytes / 1024.0,
+                (unsigned long long) hold_spills.zone_full_count, hold_spills.zone_full_bytes / 1024.0);
+        }
     }
 }
 
@@ -45111,6 +45676,9 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     mmvq_q8_activation_cache.release();
     dequant_f16_src0_scratch.release();
     dequant_f16_src1_scratch.release();
+    // The buffers this context was owed are gone with it; nothing is left to hold the zone for. Only a hold this
+    // context published: another live context's hold is not ours to clear.
+    (void) ggml_sycl::unified_cache_release_planned_scratch_hold(device, planned_scratch_owner);
     for (auto & [tensor, extra] : runtime_tensor_extras) {
         (void) tensor;
         release_extra_gpu(extra);
@@ -46832,7 +47400,7 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
         [[maybe_unused]] sycl::half * src0_dq_scratch = src0_pp_scratch;
         [[maybe_unused]] sycl::half * src1_dq_scratch = src1_pp_scratch;
         [[maybe_unused]] const bool   dq_main_stream  = (stream == ctx.stream(id, 0));
-#if GGML_SYCL_DNNL
+#if GGML_SYCL_DEQUANT_F16_ARM
         if (dq_main_stream && src1->type != GGML_TYPE_F16 && !src1_pp_scratch) {
             size_t src1_bytes = 0;
             if (!ggml_sycl::zone_dequant_f16_region_bytes(src1_ncols * ne10, &src1_bytes)) {
@@ -47108,6 +47676,7 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                                                      " : converting src0 to fp16");
                 size_t ne = row_diff * ne00;
                 // Acquired here, not up front: the WoQ arm above may have consumed the weight without a dequant.
+#    if GGML_SYCL_DEQUANT_F16_ARM
                 if (dq_main_stream && !src0_dq_scratch) {
                     size_t src0_bytes = 0;
                     if (!ggml_sycl::zone_dequant_f16_region_bytes(static_cast<int64_t>(ne), &src0_bytes)) {
@@ -47116,6 +47685,7 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                     src0_dq_scratch = static_cast<sycl::half *>(ggml_sycl_dequant_f16_scratch(
                         ctx.dequant_f16_src0_scratch, id, *stream, src0, src0_bytes, false));
                 }
+#    endif
                 if (!src0_dq_scratch) {
                     GGML_ASSERT(src0_as_f16.alloc(ne));
                 }
@@ -65067,6 +65637,19 @@ static bool ggml_sycl_mul_mat_tensor_split(ggml_backend_sycl_context & ctx,
     return true;
 }
 
+// llama.cpp-kpjw: the route the dispatch takes when the unified kernel declines an op at run time (an operand
+// pointer that does not resolve, GGML_SYCL_UNIFIED_FORCE_LEGACY, ...). select() cannot see that decline, so the
+// dispatch re-asks it with the unified kernel switched off. This helper is the ONE place that question is
+// written: the graph-entry walk of the planned Q8_1 src1 buffer asks it too, through
+// ggml_sycl_mul_mat_src1_quantizing_route(), so the walk cannot count a different route than the dispatch takes.
+static ggml_sycl::MatmulDecision ggml_sycl_mul_mat_legacy_fallback_decision(ggml_backend_sycl_context & ctx,
+                                                                            const ggml_tensor *         src0,
+                                                                            const ggml_tensor *         src1,
+                                                                            ggml_tensor *               dst,
+                                                                            const layout_mode *         forced_layout) {
+    return ctx.matmul_orchestrator.select(src0, src1, dst, forced_layout, std::nullopt, false);
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                               const ggml_tensor *         src0,
                               const ggml_tensor *         src1,
@@ -67399,7 +67982,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 trace_decision("dispatched-unified", decision);
                 return;
             }
-            decision = ctx.matmul_orchestrator.select(src0, src1, dst, forced_layout, std::nullopt, false);
+            decision = ggml_sycl_mul_mat_legacy_fallback_decision(ctx, src0, src1, dst, forced_layout);
             trace_decision("selected-no-unified", decision);
         }
 
@@ -67484,7 +68067,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 GGML_SYCL_DEBUG("[MUL_MAT] retrying dispatch with forced AoS for %s\n", src0->name ? src0->name : "?");
             }
             layout_mode retry_layout = GGML_LAYOUT_AOS;
-            auto retry_decision = ctx.matmul_orchestrator.select(src0, src1, dst, &retry_layout, std::nullopt, false);
+            auto retry_decision      = ggml_sycl_mul_mat_legacy_fallback_decision(ctx, src0, src1, dst, &retry_layout);
             trace_decision("selected-retry-aos", retry_decision);
             if (retry_decision.valid && retry_decision.backend == ggml_sycl::MatmulBackend::LegacyKernel) {
                 trace_decision("dispatch-retry-aos", retry_decision);
@@ -91324,6 +91907,26 @@ static void ggml_sycl_block_exec_dense_release(ggml_backend_sycl_context * ctx) 
     }
 }
 
+// Drops the dense range graphs of a context that has a dense state, draining first (drop_graphs). A context that
+// never ran the dense recorder has no state, and asking for one here must not make one.
+static void ggml_sycl_block_exec_dense_drop_graphs(ggml_backend_sycl_context * ctx) {
+#ifdef GGML_SYCL_GRAPH
+    ggml_sycl_block_exec_dense_state * state = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_ggml_sycl_block_exec_dense_states_mutex);
+        auto                        it = g_ggml_sycl_block_exec_dense_states.find(ctx);
+        if (it != g_ggml_sycl_block_exec_dense_states.end()) {
+            state = it->second.get();
+        }
+    }
+    if (state) {
+        state->drop_graphs(*ctx);
+    }
+#else
+    GGML_UNUSED(ctx);
+#endif
+}
+
 static uint64_t ggml_sycl_graph_signature(const ggml_cgraph * cgraph);
 
 // A decode graph: its first MUL_MAT multiplies a single row. The scan stops at
@@ -91339,7 +91942,7 @@ static bool ggml_sycl_graph_is_decode(const ggml_cgraph * cgraph) {
 
 #ifdef GGML_SYCL_GRAPH
 static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph);
-static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph);
+static bool graph_prestage_or_decline(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, uint64_t graph_hash);
 static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph);
 static bool graph_refresh_input_tensor(ggml_backend_sycl_context * ctx, ggml_tensor * tensor, sycl::queue & q);
 
@@ -91803,8 +92406,21 @@ class ggml_sycl_block_exec_dense_run {
         // then this token's values into it -- on the backend's device, which
         // is the only device whose ranges read an input directly: an executor
         // range reads its staged copy.
-        if (any_missing) {
-            graph_prestage_leaf_tensors(&ctx_, cgraph_);
+        // A staging failure declines recording (the ranges would read a host-resident input inside a recording)
+        // and the step runs on the per-op path.
+        if (any_missing &&
+            !graph_prestage_or_decline(&ctx_, cgraph_, graph_prestage_decline_memo::dense_split_key(key))) {
+            graphs_off_ = ggml_sycl::DENSE_GRAPH_OFF_STAGE_FAILED;
+            // Conservative: a decline leaves no recorded range graph to be mistaken for a current one. A staging
+            // swap is retired at the gateway whether or not the pass declined.
+            st.drop_graphs(ctx_);
+            return;
+        }
+        if (st.graphs.size() != ranges_.size()) {
+            // The gateway retired every recorded graph (an input's staging buffer was replaced): record afresh.
+            st.graphs.resize(ranges_.size());
+            st.graphs_key             = key;
+            ctx_.input_tensors_cached = false;
         }
         split_lap(split_.key_us);
         // On a plan-cache hit that records nothing, copy only the inputs
@@ -93516,7 +94132,7 @@ static void ggml_sycl_trace_queue_wait(queue_ptr           q,
 
 static void ggml_sycl_check_graph_scratch_headroom(int device) {
     constexpr size_t non_arena_min_external_headroom = 512ull * 1024ull * 1024ull;
-    constexpr size_t arena_min_external_headroom     = 256ull * 1024ull * 1024ull;
+    constexpr size_t arena_min_external_headroom     = kSyclArenaMinExternalHeadroomBytes;
     constexpr size_t arena_min_scratch_capacity      = 512ull * 1024ull * 1024ull;
 
     size_t free_vram  = 0;
@@ -99048,7 +99664,7 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
     ggml_sycl_sequence_graphlet_summary_report("TG", false);
 }
 
-static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph);
+static bool graph_prestage_or_decline(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, uint64_t graph_hash);
 static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph);
 
 static bool moe_block_graphlet_node_recordable(const ggml_tensor * node) {
@@ -99745,7 +100361,13 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
     ggml_sycl_cpu_quant_cache_new_graph();
     ggml_sycl_moe_ids_cache_new_graph();
     ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);
-    graph_prestage_leaf_tensors(sycl_ctx, cgraph);
+    if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
+        // The graphlets would read a host-resident input inside a recording or a replay; the caller runs direct.
+        // Conservative: retire the recorded ones so a declined graph leaves none to be mistaken for a current one.
+        ggml_sycl_moe_aggregation_diag(sycl_ctx, "block-graphlet", "reject", "stage-failed");
+        sycl_ctx->invalidate_moe_block_graphs();
+        return false;
+    }
     graph_refresh_input_tensors(sycl_ctx, cgraph);
 
     try {
@@ -99901,13 +100523,6 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
         switch (node_op) {
             default:
                 break;
-            case GGML_OP_CONCAT:
-                // ggml_sycl_op_concat() does a blocking host wait after memcpy operations,
-                // but wait() can't be called on the events returned by a queue recording
-                // to a graph.
-                GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
-                              ggml_op_name(node_op));
-                return false;
             case GGML_OP_MUL_MAT_ID:
                 {
                     // MoE MUL_MAT_ID graph compatibility:
@@ -100036,12 +100651,90 @@ static bool ggml_sycl_mul_mat_kernel_quantizes_src1(ggml_sycl_mul_mat_kernel ker
     return false;
 }
 
+// Whether the kernel the router picked draws the planned f16 dequant buffers: the oneDNN legacy kernels, whose
+// f16 arm materializes an f16 copy of the weight and of the activations.
+static bool ggml_sycl_mul_mat_kernel_draws_dequant_f16(ggml_sycl_mul_mat_kernel kernel) {
+    switch (kernel) {
+        case ggml_sycl_mul_mat_kernel::ONEDNN_AOS:
+        case ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED:
+        case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:
+            return true;
+        case ggml_sycl_mul_mat_kernel::MMVQ_COALESCED:
+        case ggml_sycl_mul_mat_kernel::MMVQ_SOA:
+        case ggml_sycl_mul_mat_kernel::MMVQ_AOS:
+        case ggml_sycl_mul_mat_kernel::XMX_GEMM_TILED:
+        case ggml_sycl_mul_mat_kernel::XMX_GEMM_AOS:
+        case ggml_sycl_mul_mat_kernel::MMQ_COALESCED:
+        case ggml_sycl_mul_mat_kernel::MMQ_SOA:
+        case ggml_sycl_mul_mat_kernel::MMQ_AOS:
+        case ggml_sycl_mul_mat_kernel::DMMV_SOA:
+        case ggml_sycl_mul_mat_kernel::DMMV_COALESCED:
+        case ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL:
+            return false;
+    }
+    return false;
+}
+
+// llama.cpp-kpjw: whether the route the dispatch can take for this multi-row node draws a planned scratch, the
+// buffer being named by `draws` (which kernels use it). The router's first answer is not the whole route: when it
+// picks the unified kernel, the dispatch can still decline at run time (an operand pointer that does not resolve,
+// which is what a host-demoted KV vehicle produces, or GGML_SYCL_UNIFIED_FORCE_LEGACY) and re-select a legacy
+// kernel, which is the kernel that then draws. Both answers come from the same two calls the dispatch makes, the
+// second through ggml_sycl_mul_mat_legacy_fallback_decision(), and the verdict from one pure function
+// (zone_route_draws_scratch) that the host test drives. It serves BOTH planned buffers, so the Q8_1 walk and the f16
+// walk cannot disagree about a node: two predicates for one fact eventually do.
+//
+// A node the unified kernel serves is not counted. A node it declines is counted, and that is the cheap side of
+// the error: the demand it adds is bounded by the plan (a dense operand the plan already sized), so counting it
+// reserves nothing the plan did not.
+//
+// Each walk asks this once per multi-row node, so a node the unified kernel declines costs the router two calls
+// per walk and four per graph. The walks run once per graph on the submission thread, not per token. The cost of
+// the repeated select() calls has NOT been measured; a per-node cache was not added because it would have to be
+// sized per graph on this path, and nothing here shows the repeated calls are the larger cost.
+using ggml_sycl_kernel_draws_fn = bool (*)(ggml_sycl_mul_mat_kernel);
+
+static bool ggml_sycl_mul_mat_scratch_route(ggml_backend_sycl_context & ctx,
+                                            const ggml_tensor *         src0,
+                                            const ggml_tensor *         src1,
+                                            ggml_tensor *               node,
+                                            ggml_sycl_kernel_draws_fn   draws) {
+    const ggml_sycl::MatmulDecision primary = ctx.matmul_orchestrator.select(src0, src1, node);
+    const bool primary_legacy  = primary.valid && primary.backend == ggml_sycl::MatmulBackend::LegacyKernel;
+    const bool primary_unified = primary.valid && primary.backend == ggml_sycl::MatmulBackend::UnifiedKernel;
+    ggml_sycl::MatmulDecision fallback{};
+    if (primary_unified) {
+        fallback = ggml_sycl_mul_mat_legacy_fallback_decision(ctx, src0, src1, node, nullptr);
+    }
+    const bool fallback_legacy = fallback.valid && fallback.backend == ggml_sycl::MatmulBackend::LegacyKernel;
+    return ggml_sycl::zone_route_draws_scratch(primary_legacy || primary_unified, primary_unified,
+                                               primary_legacy && draws(primary.kernel), fallback_legacy,
+                                               fallback_legacy && draws(fallback.kernel));
+}
+
+static bool ggml_sycl_mul_mat_src1_quantizing_route(ggml_backend_sycl_context & ctx,
+                                                    const ggml_tensor *         src0,
+                                                    const ggml_tensor *         src1,
+                                                    ggml_tensor *               node) {
+    return ggml_sycl_mul_mat_scratch_route(ctx, src0, src1, node, ggml_sycl_mul_mat_kernel_quantizes_src1);
+}
+
+// The f16 dequant arm's own route: a node the oneDNN legacy kernels serve, after the same decline the dispatch
+// takes. (The caller has already exempted the oneDNN PP route, which supplies its own copies.)
+static bool ggml_sycl_mul_mat_f16_dequant_route(ggml_backend_sycl_context & ctx,
+                                                const ggml_tensor *         src0,
+                                                const ggml_tensor *         src1,
+                                                ggml_tensor *               node) {
+    return ggml_sycl_mul_mat_scratch_route(ctx, src0, src1, node, ggml_sycl_mul_mat_kernel_draws_dequant_f16);
+}
+
 // llama.cpp-479i: ensure the planned dense MMQ/MMVQ Q8_1 src1 buffer holds the demand of this graph, before
 // anything is submitted. Which nodes draw from the buffer is the dispatch's own router decision, asked the same
 // question with the same arguments inside a quiet scope (it would otherwise repeat the "kernel not eligible"
 // WARNs the dispatch logs for the same node): a node the router sends to the unified or oneDNN kernel never
 // touches this buffer, so counting it would reserve RUNTIME-zone bytes nothing draws and could refuse a graph whose
-// real route needs none. A multi-row node is counted only when the router picks a kernel that quantizes src1.
+// real route needs none. A multi-row node is counted only when the route the dispatch ends up taking (the
+// router's pick, or the legacy kernel it falls back to when the unified kernel declines) quantizes src1.
 //
 // A single-row (decode) node is counted WITHOUT asking the router, and that is the dispatch's shape, not a shortcut:
 // the TG fast path in the mul_mat dispatch (the GGML_SYCL_TG_FAST block, batch == 1, quantized, single device) runs
@@ -100050,9 +100743,9 @@ static bool ggml_sycl_mul_mat_kernel_quantizes_src1(ggml_sycl_mul_mat_kernel ker
 // the token-generation hot path.
 //
 // The router is not the dispatch's whole decision: select() does not see GGML_SYCL_UNIFIED_FORCE_LEGACY or the
-// runtime decline for an unresolved weight pointer, so the dispatch's re-select with allow_unified=false can land
-// on a legacy kernel this walk did not count. That case is loud, not silent: the op's in-op growth WARN fires and an
-// underestimate is recorded.
+// runtime decline for an unresolved weight pointer, and the dispatch answers that decline with a re-select
+// (allow_unified=false). The walk asks the same second question through the same helper, via the shared route
+// predicate, so a node the unified kernel declines and a legacy kernel then serves is counted here too.
 //
 // The demand is read from the graph's own quantized MUL_MAT nodes, keyed on op identity, not inferred from tensor
 // shapes in the inventory, so a dense 3-D operand (MLA wk_b / wv_b: nrows1 = n_tokens * n_head) is counted exactly
@@ -100108,9 +100801,7 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
                 continue;
             }
 #    endif
-            const ggml_sycl::MatmulDecision decision = ctx.matmul_orchestrator.select(src0, src1, node);
-            if (!decision.valid || decision.backend != ggml_sycl::MatmulBackend::LegacyKernel ||
-                !ggml_sycl_mul_mat_kernel_quantizes_src1(decision.kernel)) {
+            if (!ggml_sycl_mul_mat_src1_quantizing_route(ctx, src0, src1, node)) {
                 continue;
             }
         }
@@ -100143,6 +100834,9 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
         }
     }
     if (!saw_dense_node) {
+        // Nothing is counted, so nothing is ensured, but the buffers may have reached their plan since the last
+        // refresh (the f16 walk's growth, a sibling graph): the hold is recomputed on EVERY successful exit.
+        ggml_sycl_planned_scratch_hold_refresh(ctx);
         return true;
     }
     for (int d = 0; d < device_count; ++d) {
@@ -100160,15 +100854,18 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
         ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(d);
         GGML_LOG_ERROR(
             "[MMQ-SRC1] graph refused before submission on device %d: the dense MMQ/MMVQ Q8_1 src1 buffer needs %.1f "
-            "MB (%s, rows=%lld ne10=%lld) but the RUNTIME zone cannot hold it (planned %.1f MB at the load-time "
-            "n_ubatch, buffer holds %.1f MB, zone has %.1f MB free). Reduce -ub, or free RUNTIME-zone demand; this is "
-            "a plan-accounting refusal, not a missing kernel (llama.cpp-479i)\n",
+            "MB (%s, rows=%lld ne10=%lld) but the RUNTIME zone cannot hold it (planned %.1f MB at the runtime "
+            "n_ubatch=%u, buffer holds %.1f MB, zone has %.1f MB free). Reduce -ub, or free RUNTIME-zone demand; this "
+            "is a plan-accounting refusal, not a missing kernel (llama.cpp-479i)\n",
             d, target_bytes / (1024.0 * 1024.0), demand[d].node && demand[d].node->name[0] ? demand[d].node->name : "?",
             (long long) demand[d].rows, (long long) demand[d].ne10, planned_bytes / (1024.0 * 1024.0),
+            (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d),
             ctx.mmvq_q8_activation_cache.capacity(d) / (1024.0 * 1024.0),
             (cache ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : 0) / (1024.0 * 1024.0));
         return false;
     }
+    // A buffer that reached its plan no longer needs its bytes held back from the compute buffers.
+    ggml_sycl_planned_scratch_hold_refresh(ctx);
     return true;
 }
 
@@ -100176,8 +100873,10 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
 // is submitted, exactly as ggml_sycl_mmq_src1_ensure_for_graph() does for the Q8_1 buffer. Which nodes reach the
 // f16 arm of ggml_sycl_op_mul_mat_sycl is decided by the dispatch's own router (the orchestrator's select(), asked
 // the same question with the same arguments), not re-derived here: two sources for one fact eventually disagree.
-// A node the router sends elsewhere costs nothing; a node it mispredicts is still served in-op by growth inside the
-// RUNTIME zone (spill forbidden) or refused by name, never by a per-op pool copy of the whole weight.
+// A node the route sends elsewhere costs nothing; a node it mispredicts is still served in-op by growth inside the
+// RUNTIME zone (spill forbidden) or refused by name, never by a per-op pool copy of the whole weight. The route is
+// the dispatch's whole decision, the unified kernel's runtime decline included (ggml_sycl_mul_mat_scratch_route,
+// shared with the Q8 walk), so a decline-served node is counted rather than found by in-op growth.
 //
 // The two buffers are sized by their own maxima (the src0 copy and the src1 copy are separate buffers), which is
 // the shape of the plan figure; each target is max(plan, demand) so a buffer is never smaller than the planner
@@ -100187,7 +100886,7 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
 // a quiet scope: it would otherwise repeat, once per node per graph, the "kernel not eligible" WARNs that the
 // dispatch itself logs for the same node.
 static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
-#    if GGML_SYCL_DNNL && defined(GGML_SYCL_F16)
+#    if GGML_SYCL_DEQUANT_F16_ARM
     struct device_demand_t {
         size_t              src0_bytes = 0;
         size_t              src1_bytes = 0;
@@ -100220,11 +100919,9 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         if (need_src0_f16 && need_src1_f16 && ggml_sycl_onednn_pp_candidate(src0, src1, node, ctx.device)) {
             continue;
         }
-        const ggml_sycl::MatmulDecision decision = ctx.matmul_orchestrator.select(src0, src1, node);
-        if (!decision.valid || decision.backend != ggml_sycl::MatmulBackend::LegacyKernel ||
-            (decision.kernel != ggml_sycl_mul_mat_kernel::ONEDNN_AOS &&
-             decision.kernel != ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED &&
-             decision.kernel != ggml_sycl_mul_mat_kernel::ONEDNN_SOA)) {
+        // The route the dispatch ends up taking, after the same runtime decline of the unified kernel as the Q8
+        // walk (a node the unified kernel declines and a oneDNN legacy kernel then serves draws these buffers).
+        if (!ggml_sycl_mul_mat_f16_dequant_route(ctx, src0, src1, node)) {
             continue;
         }
         size_t src0_bytes = 0;
@@ -100285,16 +100982,18 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
             GGML_LOG_ERROR(
                 "[DEQUANT-F16] graph refused before submission on device %d: the dense f16 dequant %s buffer needs "
                 "%.1f MB (widest op %s) but the RUNTIME zone cannot hold it (planned %.1f MB for both buffers at the "
-                "load-time n_ubatch, buffer holds %.1f MB, zone has %.1f MB free). Reduce -ub, or free RUNTIME-zone "
+                "runtime n_ubatch=%u, buffer holds %.1f MB, zone has %.1f MB free). Reduce -ub, or free RUNTIME-zone "
                 "demand; this is a plan-accounting refusal, not a missing kernel (llama.cpp-479i)\n",
                 d, b.role, target / (1024.0 * 1024.0),
                 demand[d].node && demand[d].node->name[0] ? demand[d].node->name : "?",
                 ggml_sycl::unified_cache_get_planned_dequant_f16_scratch_bytes(d) / (1024.0 * 1024.0),
+                (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d),
                 b.buffer.capacity(d) / (1024.0 * 1024.0),
                 (cache ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : 0) / (1024.0 * 1024.0));
             return false;
         }
     }
+    ggml_sycl_planned_scratch_hold_refresh(ctx);
 #    else
     GGML_UNUSED(ctx);
     GGML_UNUSED(cgraph);
@@ -100543,6 +101242,18 @@ static void ggml_sycl_xmx_moe_pre_allocate_buffers(ggml_backend_sycl_context & c
 
 #endif
 
+// A view of an INPUT tensor is that input. ggml_view_tensor() does not copy flags, so the INPUT flag lives on
+// the root (llama's recurrent-state copy indices are `ggml_view_1d(s_copy, ...)`), and a flag-only test would
+// treat the view as an ordinary host tensor: not staged to a stable device buffer, and never refreshed on replay.
+static bool graph_tensor_is_input(const ggml_tensor * tensor) {
+    for (; tensor; tensor = tensor->view_src) {
+        if (tensor->flags & GGML_TENSOR_FLAG_INPUT) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // What a graph prestage does with one source tensor. The first three classes
 // are decided without copying; COPY is the only class whose bytes the
 // predicate reports. INPUT and KV_HOST are not counted but still reach the
@@ -100579,7 +101290,7 @@ static ggml_sycl_prestage_class ggml_sycl_prestage_classify(const ggml_tensor * 
     if (ggml_sycl_get_alloc_type(tensor->data) == sycl::usm::alloc::device) {
         return ggml_sycl_prestage_class::DEVICE;
     }
-    if ((tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0) {
+    if (graph_tensor_is_input(tensor)) {
         return ggml_sycl_prestage_class::INPUT;
     }
     if (src_buft && src_buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name) {
@@ -100679,12 +101390,16 @@ static size_t ggml_sycl_graph_stage_source_count(const ggml_cgraph * cgraph, int
 // IMPORTANT: The cgraph->leafs array may be empty (scheduler may not populate it),
 // so we must also scan ALL source tensors from ALL nodes in the graph to find
 // non-device memory that needs staging.
-static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph) {
+//
+// Returns false when a tensor that needed staging could not be staged. The caller that is about to RECORD must
+// then decline (graph_prestage_or_decline): a consumer that finds no staged copy falls back to a host path whose
+// wait is illegal inside a recording.
+static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph) {
     GGML_SYCL_DEBUG("[GRAPH-PRESTAGE] Entering: cgraph=%p n_nodes=%d n_leafs=%d\n", (void *) cgraph,
                     cgraph ? cgraph->n_nodes : -1, cgraph ? cgraph->n_leafs : -1);
     if (!cgraph || cgraph->n_nodes == 0) {
         GGML_SYCL_DEBUG("[GRAPH-PRESTAGE] Early exit: no nodes\n");
-        return;
+        return true;
     }
 
     const int device               = ctx->device;
@@ -100694,6 +101409,7 @@ static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
     int       skipped_weight_count = 0;
     int       skipped_host_planned = 0;
     int       skipped_control      = 0;
+    bool      all_staged           = true;
 
     // Check if tiered mode is enabled - if so, weight tensors in HOST need promotion to VRAM
     const bool tiered_enabled = g_tiered_enabled.load(std::memory_order_relaxed);
@@ -100710,7 +101426,7 @@ static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
         sycl_ctx = &ctx_storage.value();
     } catch (...) {
         GGML_LOG_ERROR("[GRAPH-PRESTAGE] Failed to get SYCL context for device %d\n", device);
-        return;
+        return false;
     }
 
     struct graph_prestage_tensor_key {
@@ -100767,6 +101483,12 @@ static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
     // Helper lambda to stage a tensor
     auto stage_tensor = [&](const ggml_tensor * tensor, const char * source_desc) {
         if (!tensor || !tensor->data) {
+            return;
+        }
+        // Nothing to stage: a zero-extent view (e.g. the recurrent-state copy indices beyond the sequences in
+        // this ubatch) reads no bytes, and reporting it as a staging failure would make a real failure
+        // indistinguishable from it.
+        if (ggml_nbytes(tensor) == 0) {
             return;
         }
 
@@ -100838,18 +101560,27 @@ static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
         // INPUT tensors: stage to a STABLE device buffer that persists across graph iterations.
         // The ggml allocator may reassign tensor->data between iterations, but L0 graph replay
         // bakes the pointer at finalize time. The stable staging buffer survives across replays.
+        // Pre-existing exception to "an INPUT failure is terminal": an INPUT with an EMPTY name does not take this arm
+        // and falls through to the cache paths below, which key on its current data address.
         if (source_class == ggml_sycl_prestage_class::INPUT && tensor->name && tensor->name[0] != '\0') {
             sycl::queue & q       = *ctx->stream();
             // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
             // comment on graph_input_staging in common.hpp.
             void * dev_ptr = ctx->graph_input_stage(tensor, tensor->data, nbytes, q);
-            if (dev_ptr) {
-                staged_count++;
-                mark_staged(tensor);
-                GGML_SYCL_DEBUG("[GRAPH-PRESTAGE] INPUT staged %s tensor %s (data=%p, %zu bytes) -> dev %p\n",
-                                source_desc, tensor->name, tensor->data, nbytes, dev_ptr);
+            if (!dev_ptr) {
+                // Terminal for this pass. The cache and staging-cache paths below key on the tensor's current data
+                // address, which an INPUT does not keep across tokens, so a copy they made would not be the one a
+                // replay reads. Declining is the only honest answer.
+                GGML_LOG_WARN("[GRAPH-PRESTAGE] Failed to stage INPUT %s tensor %s (data=%p, %zu bytes)\n",
+                              source_desc, tensor->name, tensor->data, nbytes);
+                all_staged = false;
                 return;
             }
+            staged_count++;
+            mark_staged(tensor);
+            GGML_SYCL_DEBUG("[GRAPH-PRESTAGE] INPUT staged %s tensor %s (data=%p, %zu bytes) -> dev %p\n", source_desc,
+                            tensor->name, tensor->data, nbytes, dev_ptr);
+            return;
         }
 
         // Try unified cache first
@@ -100892,6 +101623,7 @@ static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
         } else {
             GGML_LOG_WARN("[GRAPH-PRESTAGE] Failed to stage %s tensor %s (data=%p, %zu bytes)\n", source_desc,
                           tensor->name, tensor->data, nbytes);
+            all_staged = false;
         }
     };
 
@@ -100924,6 +101656,83 @@ static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
         "(host-planned=%d), %d control skipped\n",
         staged_count, cache_hit_count, already_device_count, skipped_weight_count, skipped_host_planned,
         skipped_control);
+    return all_staged;
+}
+
+// An input's staging buffer was replaced because its size changed (graph_input_stage). Recorded work bakes the
+// staging POINTER, so every recorder that may hold the old one is retired here: the dense range graphs
+// (drop_graphs drains each device it ran on), the MoE epochs (each retire waits for its terminals), and a LIVE exec
+// graph. The displaced handle was already retained on a marker event at the swap, and the staging map is current,
+// so nothing is released or re-staged here.
+// Returns false when a MoE epoch could not be retired: that recorder is still marked valid and would replay a graph
+// that baked the freed pointer, so the gateway declines (every caller then runs direct) rather than trust it.
+// This runs INSIDE a graph_compute that has already pinned weights and experts (graph_preload_weights,
+// graph_preload_moe_experts), so it must not call sycl_exec_graph_clear_active: that unpins those leases, clears
+// the CPU staging cache and the MoE layout cache mid-compute (its header cites a measured gemma regression). The
+// cost of a swap is one drain per retired recorder; a swap is rare (the kq_mask leaf steps with n_kv), and the
+// same step already changes the graph signature, so it adds drains, not a recording.
+static bool graph_staging_swap_retire(ggml_backend_sycl_context * ctx) {
+    ctx->graph_input_staging_swapped = false;
+    if (ggml_sycl_graph_diag_enabled()) {
+        // The gap between two of these lines, in graph computes, is the swap rate (kq_mask steps every n_kv pad).
+        GGML_LOG_WARN("[GRAPH-DIAG] staging swap at graph compute %llu\n", (unsigned long long) ctx->graph_compute_seq);
+    }
+    ggml_sycl_block_exec_dense_drop_graphs(ctx);
+    const bool segments_retired        = ctx->invalidate_moe_segments();
+    const bool block_graphs_retired    = ctx->invalidate_moe_block_graphs();
+    const bool direct_dispatch_retired = ctx->invalidate_moe_direct_dispatch_graphs();
+    const bool sequence_graphs_retired = ctx->invalidate_moe_sequence_graphs();
+    if (ctx->exec_graph) {
+        // llama.cpp-dkw0 defect #4: destroying an executable graph under its own in-flight submission double-frees
+        // the runtime's bookkeeping, so a LIVE graph is drained before it is reset. With no live graph there is
+        // nothing to drain and nothing to reset.
+        ggml_sycl_trace_queue_wait(ctx->stream(), "staging-swapped", ctx->device, -1, nullptr);
+        ctx->exec_graph.reset();
+        sycl_exec_graph_release_pool_retained(ctx);
+        ctx->active_exec_graph.valid = false;
+        ctx->exec_graph_n_nodes      = 0;
+        ctx->exec_graph_hash         = 0;
+    }
+    return segments_retired && block_graphs_retired && direct_dispatch_retired && sequence_graphs_retired;
+}
+
+// Counts this token against a held decline (it MUTATES the memo): true means skip the pre-stage and run direct,
+// and the retry_after-th counted token forgets the decline and answers false so the pass is re-decided. A token
+// counts once per signature however many callers ask (graph_compute_seq is bumped once per graph_compute call).
+static bool graph_prestage_skip_declined(ggml_backend_sycl_context * ctx, uint64_t graph_hash) {
+    return ctx != nullptr && ctx->prestage_decline_memo.skip(graph_hash, ctx->graph_compute_seq);
+}
+
+// Pre-stage for a graph that is about to be RECORDED or REPLAYED. False means the graph must not be recorded or
+// replayed: its inputs are not all on the device, so a consumer would fall back to a host path whose wait is
+// illegal inside a recording (a GET_ROWS CPU fallback aborted llama-bench on qwen35 exactly this way). The caller
+// runs the graph on the direct path instead. The decline is remembered on the context per graph signature, so a
+// graph that cannot be staged is not pre-staged again on every token; a graph with a different signature is judged
+// afresh, and the memo forgets a signature after a bounded number of skipped tokens so a transient failure
+// recovers (graph-prestage-decline-memo.hpp). Every recorder must come through here: calling the pre-stage as a
+// statement ignores its failure.
+static bool graph_prestage_or_decline(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, uint64_t graph_hash) {
+    if (graph_prestage_skip_declined(ctx, graph_hash)) {
+        return false;
+    }
+    const bool staged  = graph_prestage_leaf_tensors(ctx, cgraph);
+    bool       retired = true;
+    if (ctx->graph_input_staging_swapped) {
+        // An input's staging buffer was replaced (its size changed). Whether the pass then succeeded or declined,
+        // every recorded graph that baked the old pointer is stale.
+        retired = graph_staging_swap_retire(ctx);
+    }
+    if (staged && retired) {
+        ctx->prestage_decline_memo.forget(graph_hash);
+        return true;
+    }
+    ctx->prestage_decline_memo.remember(graph_hash, ctx->graph_compute_seq);
+    GGML_LOG_WARN(
+        "[SYCL-GRAPH] graph inputs could not all be staged onto the device (or a staging swap could not retire "
+        "its recorded graphs); not recording this graph (signature "
+        "%llu), running it on the direct path\n",
+        (unsigned long long) graph_hash);
+    return false;
 }
 
 // Refreshes one input tensor's device copy from its host bytes on `q`. True
@@ -101085,7 +101894,11 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
         if (ggml_sycl_tensor_is_weight(tensor)) {
             return;
         }
-        if (!(tensor->flags & GGML_TENSOR_FLAG_INPUT)) {
+        // A zero-extent view has no bytes to refresh (and graph_prestage_leaf_tensors staged nothing for it).
+        if (ggml_nbytes(tensor) == 0) {
+            return;
+        }
+        if (!graph_tensor_is_input(tensor)) {
             if (dkw0_input_list_on && dkw0_skipped_seen.insert(tensor).second) {
                 fprintf(stderr,
                         "[DKW0-INPUT-LIST] SKIPPED name=%s tensor=%p op=%s type=%d ne=[%lld,%lld,%lld,%lld] "
@@ -107373,6 +108186,8 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
     GGML_SYCL_DEBUG("[DEBUG-GRAPH-COMPUTE] sycl_ctx=%p device=%d\n", (void *) sycl_ctx,
                     sycl_ctx ? sycl_ctx->device : -1);
+    // One token per call: the decline memo counts a signature once per token however many recorders ask.
+    ++sycl_ctx->graph_compute_seq;
     const bool offload_stats_active = ggml_sycl::offload_stats_enabled();
     if (offload_stats_active) {
         ggml_sycl::offload_stats_reset();
@@ -109080,6 +109895,15 @@ normal_dispatch:
             return GGML_STATUS_SUCCESS;
         }
 
+        // A graph whose inputs could not be staged onto the device was declined for recording
+        // (graph_prestage_or_decline): keep running it directly without rebuilding the recording state first.
+        // The ask counts this token against the decline (the memo forgets it after retry_after of them).
+        if (!sycl_ctx->exec_graph && graph_prestage_skip_declined(sycl_ctx, graph_hash)) {
+            compute_impl_unlocked();
+            record_completion(false);
+            return GGML_STATUS_SUCCESS;
+        }
+
         // Pre-allocate V2 partition attention buffers before graph recording.
         // This ensures V2 dispatch works during graph recording (malloc/free forbidden during recording).
         if (is_decode_phase && !sycl_ctx->exec_graph) {
@@ -109252,17 +110076,31 @@ normal_dispatch:
 
                 if (segments_match) {
                     // Fast path: replay cached segments + dispatch MoE ops
-                    graph_prestage_leaf_tensors(sycl_ctx, cgraph);
-                    graph_refresh_input_tensors(sycl_ctx, cgraph);
-                    moe_graph_replay_segments(sycl_ctx, cgraph);
-                    graph_executed = true;
-                    GGML_SYCL_DEBUG("[SYCL-SEG] Segmented replay complete\n");
+                    if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
+                        // An input has no staged copy: the recorded segments would read the host one. Retire them
+                        // (conservative: a swap is retired at the gateway) and run direct.
+                        sycl_ctx->invalidate_moe_segments();
+                        compute_impl_unlocked();
+                    } else if (!sycl_ctx->moe_segments_valid) {
+                        // The gateway swapped an input's staging buffer and retired the segments after the match
+                        // above was decided: there is nothing recorded to replay. Run this token direct; the next
+                        // one records afresh against the new buffer.
+                        compute_impl_unlocked();
+                    } else {
+                        graph_refresh_input_tensors(sycl_ctx, cgraph);
+                        moe_graph_replay_segments(sycl_ctx, cgraph);
+                        graph_executed = true;
+                        GGML_SYCL_DEBUG("[SYCL-SEG] Segmented replay complete\n");
+                    }
+                } else if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
+                    // First time or invalidated, but an input cannot be staged onto the device: recording would
+                    // read a host-resident input inside the recording. Run direct.
+                    compute_impl_unlocked();
                 } else {
                     // First time or invalidated: record segments
-                    // Pre-stage and refresh inputs before recording. Recording immediately
+                    // Pre-stage (above) and refresh inputs before recording. Recording immediately
                     // executes the segment path, so dynamic control tensors must reflect
                     // the current graph rather than the previous PP/warmup graph.
-                    graph_prestage_leaf_tensors(sycl_ctx, cgraph);
                     graph_refresh_input_tensors(sycl_ctx, cgraph);
                     sycl_ctx->invalidate_moe_segments();
 
@@ -109302,6 +110140,16 @@ normal_dispatch:
             // or segmented disabled).
             GGML_SYCL_DEBUG("[SYCL-GRAPH] re-record + update (%s)...\n",
                             sycl_ctx->moe_graph_rerecord ? "MoE selective" : "rerecord_mode");
+            // Decide whether the inputs can be staged before any teardown or attempt count. A declined graph runs
+            // on the direct path, and the live exec graph is cleared through the one routine that waits for its
+            // last replay first (conservative: a staging swap is retired at the gateway, whether or not the pass
+            // declined, so this is not what keeps a replay off freed staging).
+            if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
+                sycl_exec_graph_clear_active(sycl_ctx, "prestage-declined");
+                compute_impl_unlocked();
+                record_completion(false);
+                return GGML_STATUS_SUCCESS;
+            }
             g_graph_diag_counters.rerecord_attempts.fetch_add(1, std::memory_order_relaxed);
             sycl_ctx->exec_graph.reset();
             sycl_exec_graph_release_pool_retained(sycl_ctx);
@@ -109327,8 +110175,7 @@ normal_dispatch:
                 sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()),
                                                         { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
 
-                // Pre-stage leaf tensors (ensures input data is on device before recording)
-                graph_prestage_leaf_tensors(sycl_ctx, cgraph);
+                // Input data is already on device (pre-staged above, before the teardown).
                 // Refresh input tensor data (token IDs etc.) on stable device staging
                 graph_refresh_input_tensors(sycl_ctx, cgraph);
 
@@ -109450,7 +110297,11 @@ normal_dispatch:
                 // that will be accessed during graph recording BEFORE recording starts,
                 // since we cannot use .wait() calls during recording.
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] Pre-staging leaf tensors before recording...\n");
-                graph_prestage_leaf_tensors(sycl_ctx, cgraph);
+                if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
+                    compute_impl_unlocked();
+                    record_completion(false);
+                    return GGML_STATUS_SUCCESS;
+                }
                 graph_refresh_input_tensors(sycl_ctx, cgraph);
 
                 // Clear stale eviction guard before recording.  During PP,
@@ -110930,20 +111781,18 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             // OUT_PROD shows NaNs on SYCL for some shapes; disable until fixed.
             return false;
         case GGML_OP_GET_ROWS:
+            // One predicate (get-rows-support.hpp) for the types ggml_sycl_op_get_rows computes. A type declined
+            // here runs in a CPU split whose output a SYCL op reads out of pinned host memory, and a graph with
+            // that read cannot be recorded (llama.cpp-qhfp: qwen35's q4_K token_embd.weight).
+            if (!ggml_sycl_get_rows_type_supported(op->src[0]->type)) {
+                return false;
+            }
             {
-                switch (op->src[0]->type) {
-                    case GGML_TYPE_F16:
-                    case GGML_TYPE_F32:
-                    case GGML_TYPE_Q4_0:
-                    case GGML_TYPE_Q4_1:
-                    case GGML_TYPE_Q5_0:
-                    case GGML_TYPE_Q5_1:
-                    case GGML_TYPE_Q8_0:
-                    case GGML_TYPE_Q6_K:
-                        return true;
-                    default:
-                        return false;
-                }
+                // (type, layout): the kernels read the layout the plan materialised the table in. A pair none
+                // covers is declined here, before placement routes it; the dispatch arm's abort is a backstop.
+                ggml_layout_mode planned_layout = GGML_LAYOUT_AOS;
+                (void) ggml_sycl_get_planned_weight_layout(op->src[0], device, &planned_layout);
+                return ggml_sycl_get_rows_layout_supported(op->src[0]->type, planned_layout);
             }
         case GGML_OP_SET:
             return (op->type == GGML_TYPE_F32) && (op->src[0] && op->src[1]) && (op->src[0]->type == GGML_TYPE_F32) &&
@@ -112725,6 +113574,15 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_compute_buffer_host_fallbacks") == 0) {
         return (void *) ggml_backend_sycl_compute_buffer_host_fallbacks;
+    }
+    if (strcmp(name, "ggml_backend_sycl_planned_hold_spill_fits") == 0) {
+        return (void *) ggml_backend_sycl_planned_hold_spill_fits;
+    }
+    if (strcmp(name, "ggml_backend_sycl_compute_alloc_scope") == 0) {
+        return (void *) ggml_backend_sycl_compute_alloc_scope;
+    }
+    if (strcmp(name, "ggml_backend_sycl_planned_hold_epoch_refresh") == 0) {
+        return (void *) ggml_backend_sycl_planned_hold_epoch_refresh;
     }
     // llama.cpp-xojq (nphx Task 4b, comment c-1mwi): closes the gap the
     // comment above used to name for ggml_backend_sycl_auto_ubatch_enabled

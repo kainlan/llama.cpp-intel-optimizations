@@ -53,6 +53,10 @@ enum class sched_reserve_status { OK, REFUSED, FAILED };
 struct sched_reserve_result {
     sched_reserve_status status = sched_reserve_status::OK;
     std::string          reason;
+    // The reserve ended on a fit verdict: the compute buffers did not fit, or the plan the publish refused. Only
+    // such a verdict lowers the auto n_ubatch ladder's rung (llama_auto_ubatch_fit_refusal); a lifecycle failure, a
+    // scope that would not open or a graph that would not build is no verdict on the rung and must not.
+    bool                 fit_refusal = false;
 };
 
 // MEASURE sizes the worst-case graphs without touching the context's own
@@ -198,6 +202,12 @@ struct llama_context {
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
+
+    // Allocate / reserve a graph on this context's scheduler, inside the SYCL backend's compute-allocation scope
+    // (see sycl_compute_scope_fn below). The only way anything allocates on the scheduler: llama_kv_cache::update's
+    // K-shift graph included.
+    bool sched_alloc_graph(ggml_cgraph * gf);
+    bool sched_reserve_graph(ggml_cgraph * gf);
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -506,6 +516,23 @@ private:
     // drives would_demote_kv, so a shape change there can change which
     // candidates fit without changing anything else the key tracks.
     void sycl_select_auto_ubatch(enum ggml_type type_k, enum ggml_type type_v);
+
+    // llama.cpp-kpjw: the n_ubatch whose compute buffers the auto-ubatch trial already passed the realized hold-spill
+    // check for, and which is the sched the constructor is left with (the winner's reserve, not re-made by the
+    // settle step); 0 when nothing was validated (a pinned -ub, a trial that exited early, a settle that
+    // re-reserved, a backend without the check). The constructor's own check runs unless it equals n_ubatch, so
+    // it never re-reads the live free memory at the margin to overturn a rung the ladder just accepted.
+    uint32_t sycl_hold_spill_validated_ub = 0;
+
+    // llama.cpp-kpjw: the SYCL backend's scheduler-compute scope (ggml_backend_sycl_compute_alloc_scope), resolved once
+    // from the first SYCL backend of this context; null for a context without one or a SYCL library that predates it.
+    // A buffer the backend allocates while the scope is open is positively a scheduler compute buffer (the request
+    // record and the hold-spill counters are fed by those and by nothing else); it is opened around the reserve and
+    // around the graph allocation, never inferred from the absence of a model load.
+    typedef void (*sycl_compute_scope_fn_t)(bool);
+    sycl_compute_scope_fn_t sycl_compute_scope_fn();
+    bool                    sycl_compute_scope_resolved = false;
+    sycl_compute_scope_fn_t sycl_compute_scope_cached   = nullptr;
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);

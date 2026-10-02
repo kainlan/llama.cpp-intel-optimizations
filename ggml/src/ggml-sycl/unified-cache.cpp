@@ -763,6 +763,68 @@ static std::atomic<size_t>   g_planned_mmq_src1_scratch_bytes[GGML_SYCL_MAX_DEVI
 // plus the src1 copy, see zone_dequant_f16_*), folded into the same RUNTIME zone requirement.
 static std::atomic<size_t>   g_planned_dequant_f16_src0_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_dequant_f16_src1_bytes[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-kpjw: the INPUTS the two plan setters were last given (per-token and weight maxima, n_ubatch),
+// kept so the runtime-context transaction can re-derive the plan at the runtime n_ubatch (auto-ubatch picks it
+// after load) without the load-time inventory.
+static std::atomic<size_t>   g_planned_mmq_src1_bytes_per_token[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<size_t>   g_planned_dequant_f16_weight_bytes_max[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<size_t>   g_planned_dequant_f16_src1_bytes_per_token[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<uint32_t> g_planned_dense_scratch_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
+
+// llama.cpp-kpjw: everything about the hold that must move together, per device, behind one mutex: the held bytes and
+// the context that published them (a context id, never an address: an address is reused after a free), the
+// hold-induced spills counted since that context's last take, and the largest spill-capable RUNTIME request seen
+// (what the worst-case outside-arena bound adds to the hold). A set / release / take interleave across threads
+// cannot tear the (bytes, owner) pair, and one context's take cannot reset another context's count. The mutex is a
+// leaf: nothing is called while holding it.
+struct planned_scratch_hold_state {
+    std::mutex mutex;
+    size_t     hold                 = 0;
+    uint64_t   owner                = 0;  // 0: nobody published the hold
+    // The compute buffers the RUNTIME zone did not serve, SINCE THE OWNER'S LAST PUBLISH (a publish restarts them,
+    // unified_cache_begin_planned_hold_epoch: a losing auto-ubatch rung's spills must not decide the next rung, and
+    // the figures the finished context reports at teardown are its own, not the ladder's). By where each landed:
+    // RAW (outside the arena, eats the driver headroom), the arena's KV zone because the hold kept it out
+    // (hold-induced), and the arena's KV zone because the RUNTIME zone was simply full (not the hold's doing).
+    uint64_t   spill_count          = 0;
+    size_t     spill_bytes          = 0;
+    uint64_t   spill_arena_count    = 0;
+    size_t     spill_arena_bytes    = 0;
+    uint64_t   zone_full_count      = 0;
+    size_t     zone_full_bytes      = 0;
+    uint64_t   spill_owner          = 0;  // the hold's owner when the first spill since the last restart was noted
+    // Once-only WARN latches, per landing site. They are the owner's, not the epoch's: a publish does not rearm
+    // them (one WARN per context and site, however many rungs ran); a take, a new owner and a release do.
+    bool       warned_raw           = false;
+    bool       warned_arena         = false;
+    bool       warned_zone_full     = false;
+    // The largest scheduler compute request made under each rung's plan (n_ubatch), kept across publishes: a rung's
+    // verdict is a function of its own measurement, not of the order the rungs ran in. Dropped with the owner.
+    std::vector<zone_hold_rung_request> rung_requests;
+    // The n_ubatch the current epoch's plan was published at (0 before the first publish). Requests before the first
+    // publish are load-time ones, not compute-buffer requests of a rung, and are not recorded.
+    uint32_t   epoch_n_ubatch       = 0;
+    // The epoch's snapshot: the KV room a compute buffer could count on at the publish. (What stays live without the
+    // rung's own buffers is not snapshotted: it is every raw row except the rung's scheduler compute rows, read from
+    // the registry when asked, zone_hold_persistent_raw.)
+    size_t                              epoch_kv_room        = 0;
+    // The ledger baseline of the owner that took it: the free memory the card would show with no outside-arena
+    // cache allocation live (zone_hold_free_cold). It belongs to a WINDOW, the span between two publishes: the first
+    // fit of a window takes it, each later one can only raise it (zone_hold_cold_update), and a publish forgets it.
+    uint64_t                            baseline_owner       = 0;
+    size_t                              baseline_cold        = 0;
+    // Calls to note_runtime_request the cap refused (a new rung beyond kHoldRungRecordLimit; a call, not a rung: one
+    // refused rung asked again counts again), so a truncation is never silent. Only the host test reads it; the
+    // production signal is the one-time WARN.
+    size_t                              rung_record_refusals = 0;
+};
+
+static planned_scratch_hold_state g_planned_scratch_hold_state[GGML_SYCL_MAX_DEVICES];
+static std::atomic<uint64_t>      g_planned_scratch_owner_next{ 1 };
+// llama.cpp-kpjw: the last figure a setter REJECTED (overflow) for each half of the dense scratch plan, [0] the Q8
+// half and [1] the f16 half. A rejected figure leaves the stored inputs untouched, so without this flag a re-plan
+// would quietly re-derive a plan from the previous (stale) inputs.
+static std::atomic<bool>         g_planned_dense_scratch_invalid[GGML_SYCL_MAX_DEVICES][2]{};
 // llama.cpp-0oxf/o3a0: the SDPA shape (max query-head count per attention
 // window class, the SWA window itself, ubatch size, context length) known at
 // the time the oneDNN scratchpad was last planned for this device
@@ -1417,6 +1479,10 @@ struct runtime_alloc_record {
     bool                       uses_pinned_pool = false;
     bool                       zone_managed     = false;
     bool                       from_arena       = false;  // True if sub-allocated from arena (KV/RUNTIME/etc zone)
+    // llama.cpp-kpjw: this row is a scheduler compute buffer, identified by where its request came from (the caller's
+    // compute-scope mark, alloc_constraints::spill_to_kv_zone_before_raw), never by when it was made. The hold-fit
+    // ledger credits back exactly these rows as "the rung's own" (zone_hold_persistent_raw).
+    bool                        scheduler_compute = false;
     // Durable, allocation-free retry state for a consumed legacy promotion
     // token. The exact row itself is the owner until a safe-point retry erases it.
     bool                       promotion_cleanup_pending = false;
@@ -1725,18 +1791,36 @@ moe_control_requirement unified_cache_get_planned_moe_control_requirement(int de
 
 static size_t unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(int device_id);
 
-bool unified_cache_set_planned_mmq_src1_scratch(int device_id, size_t bytes_per_token, uint32_t n_ubatch) {
+bool unified_cache_set_planned_mmq_src1_scratch(int      device_id,
+                                                size_t   bytes_per_token,
+                                                uint32_t n_ubatch,
+                                                bool     other_model_live) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return false;
     }
-    size_t bytes = 0;
-    if (!zone_mmq_src1_scratch_bytes(bytes_per_token, n_ubatch, &bytes)) {
-        // An overflowing figure must not become a SMALL plan. Publish nothing; the graph-entry
-        // check then refuses by name instead of the zone being sized for a wrapped number.
-        g_planned_mmq_src1_scratch_bytes[device_id].store(0, std::memory_order_release);
+    // The inputs are device-global: while another model is live on the device its larger input stays.
+    const size_t merged_bytes_per_token =
+        zone_dense_scratch_merge_input(g_planned_mmq_src1_bytes_per_token[device_id].load(std::memory_order_acquire),
+                                       bytes_per_token, other_model_live);
+    const uint32_t merged_n_ubatch = static_cast<uint32_t>(zone_dense_scratch_merge_input(
+        g_planned_dense_scratch_n_ubatch[device_id].load(std::memory_order_acquire), n_ubatch, other_model_live));
+    size_t         bytes           = 0;
+    // Validate first, store after: a rejected figure must not become the stored inputs a re-plan reads back.
+    if (!zone_mmq_src1_scratch_bytes(merged_bytes_per_token, merged_n_ubatch, &bytes)) {
+        // An overflowing figure must not become a SMALL plan. With no other model live, publish nothing and mark
+        // the plan invalid; the fit check then refuses by name instead of the zone being sized for a wrapped
+        // number. With another model live its plan and inputs are left standing: one model's overflow does not
+        // invalidate the plan of the model that is already running.
+        if (!other_model_live) {
+            g_planned_mmq_src1_scratch_bytes[device_id].store(0, std::memory_order_release);
+            g_planned_dense_scratch_invalid[device_id][0].store(true, std::memory_order_release);
+        }
         return false;
     }
+    g_planned_mmq_src1_bytes_per_token[device_id].store(merged_bytes_per_token, std::memory_order_release);
+    g_planned_dense_scratch_n_ubatch[device_id].store(merged_n_ubatch, std::memory_order_release);
     g_planned_mmq_src1_scratch_bytes[device_id].store(bytes, std::memory_order_release);
+    g_planned_dense_scratch_invalid[device_id][0].store(false, std::memory_order_release);
     return true;
 }
 
@@ -1750,20 +1834,39 @@ size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id) {
 bool unified_cache_set_planned_dequant_f16_scratch(int      device_id,
                                                    size_t   max_weight_bytes,
                                                    size_t   src1_bytes_per_token,
-                                                   uint32_t n_ubatch) {
+                                                   uint32_t n_ubatch,
+                                                   bool     other_model_live) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return false;
     }
-    size_t src0_bytes = 0;
-    size_t src1_bytes = 0;
-    if (!zone_dequant_f16_plan_bytes(max_weight_bytes, src1_bytes_per_token, n_ubatch, &src0_bytes, &src1_bytes)) {
-        // Same rule as the Q8 figure: an overflow must not become a SMALL plan.
-        g_planned_dequant_f16_src0_bytes[device_id].store(0, std::memory_order_release);
-        g_planned_dequant_f16_src1_bytes[device_id].store(0, std::memory_order_release);
+    const size_t merged_weight_bytes = zone_dense_scratch_merge_input(
+        g_planned_dequant_f16_weight_bytes_max[device_id].load(std::memory_order_acquire), max_weight_bytes,
+        other_model_live);
+    const size_t merged_src1_per_token = zone_dense_scratch_merge_input(
+        g_planned_dequant_f16_src1_bytes_per_token[device_id].load(std::memory_order_acquire), src1_bytes_per_token,
+        other_model_live);
+    const uint32_t merged_n_ubatch = static_cast<uint32_t>(zone_dense_scratch_merge_input(
+        g_planned_dense_scratch_n_ubatch[device_id].load(std::memory_order_acquire), n_ubatch, other_model_live));
+    size_t         src0_bytes      = 0;
+    size_t         src1_bytes      = 0;
+    // Validate first, store after (see the Q8 setter).
+    if (!zone_dequant_f16_plan_bytes(merged_weight_bytes, merged_src1_per_token, merged_n_ubatch, &src0_bytes,
+                                     &src1_bytes)) {
+        // Same rule as the Q8 figure: an overflow must not become a SMALL plan, and must not invalidate another
+        // live model's plan.
+        if (!other_model_live) {
+            g_planned_dequant_f16_src0_bytes[device_id].store(0, std::memory_order_release);
+            g_planned_dequant_f16_src1_bytes[device_id].store(0, std::memory_order_release);
+            g_planned_dense_scratch_invalid[device_id][1].store(true, std::memory_order_release);
+        }
         return false;
     }
+    g_planned_dequant_f16_weight_bytes_max[device_id].store(merged_weight_bytes, std::memory_order_release);
+    g_planned_dequant_f16_src1_bytes_per_token[device_id].store(merged_src1_per_token, std::memory_order_release);
+    g_planned_dense_scratch_n_ubatch[device_id].store(merged_n_ubatch, std::memory_order_release);
     g_planned_dequant_f16_src0_bytes[device_id].store(src0_bytes, std::memory_order_release);
     g_planned_dequant_f16_src1_bytes[device_id].store(src1_bytes, std::memory_order_release);
+    g_planned_dense_scratch_invalid[device_id][1].store(false, std::memory_order_release);
     return true;
 }
 
@@ -1780,6 +1883,473 @@ size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id) {
     const size_t src0 = unified_cache_get_planned_dequant_f16_buffer_bytes(device_id, false);
     const size_t src1 = unified_cache_get_planned_dequant_f16_buffer_bytes(device_id, true);
     return src0 > SIZE_MAX - src1 ? SIZE_MAX : src0 + src1;
+}
+
+bool unified_cache_replan_planned_dense_scratch(int device_id, uint32_t n_ubatch, bool other_model_live) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || n_ubatch == 0) {
+        return false;
+    }
+    // A figure a setter rejected left the previous inputs in place; re-deriving from them would publish a plan for
+    // a model that is no longer the one being planned.
+    if (g_planned_dense_scratch_invalid[device_id][0].load(std::memory_order_acquire) ||
+        g_planned_dense_scratch_invalid[device_id][1].load(std::memory_order_acquire)) {
+        return false;
+    }
+    // The same two setters as the load-time plan, fed the inputs they were last given: one formula, two callers.
+    // With another context live on the device the plan's n_ubatch is the larger of the two: a draft context at a
+    // small n_ubatch must not shrink the plan the live target's buffers were sized from.
+    const bool q8 = unified_cache_set_planned_mmq_src1_scratch(
+        device_id, g_planned_mmq_src1_bytes_per_token[device_id].load(std::memory_order_acquire), n_ubatch,
+        other_model_live);
+    const bool f16 = unified_cache_set_planned_dequant_f16_scratch(
+        device_id, g_planned_dequant_f16_weight_bytes_max[device_id].load(std::memory_order_acquire),
+        g_planned_dequant_f16_src1_bytes_per_token[device_id].load(std::memory_order_acquire), n_ubatch,
+        other_model_live);
+    return q8 && f16;
+}
+
+uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_dense_scratch_n_ubatch[device_id].load(std::memory_order_acquire);
+}
+
+bool unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_ubatch, size_t * out) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || !out) {
+        return false;
+    }
+    // A rejected figure left stale inputs behind: no zone can hold a plan nobody could compute.
+    if (g_planned_dense_scratch_invalid[device_id][0].load(std::memory_order_acquire) ||
+        g_planned_dense_scratch_invalid[device_id][1].load(std::memory_order_acquire)) {
+        return false;
+    }
+    return zone_dense_scratch_total_bytes(
+        g_planned_mmq_src1_bytes_per_token[device_id].load(std::memory_order_acquire),
+        g_planned_dequant_f16_weight_bytes_max[device_id].load(std::memory_order_acquire),
+        g_planned_dequant_f16_src1_bytes_per_token[device_id].load(std::memory_order_acquire), n_ubatch, out);
+}
+
+bool unified_cache_dense_scratch_runtime_fit(int        device_id,
+                                             uint32_t   n_ubatch,
+                                             size_t *   needed,
+                                             size_t *   capacity,
+                                             uint32_t * largest_ubatch) {
+    if (needed) {
+        *needed = 0;
+    }
+    if (capacity) {
+        *capacity = 0;
+    }
+    if (largest_ubatch) {
+        *largest_ubatch = n_ubatch;
+    }
+    size_t need = 0;
+    if (!unified_cache_planned_dense_scratch_bytes_at(device_id, n_ubatch, &need)) {
+        // An overflowing figure cannot be held by any zone.
+        if (largest_ubatch) {
+            *largest_ubatch = 0;
+        }
+        return false;
+    }
+    if (needed) {
+        *needed = need;
+    }
+    if (need == 0) {
+        return true;  // nothing planned (no dense quantized operand): nothing to hold
+    }
+    unified_cache * cache = get_unified_cache_for_device(device_id);
+    if (!cache || !cache->arena_active()) {
+        return true;  // no arena, no RUNTIME zone: the buffers are not zone-bound
+    }
+    const size_t zone_bytes = cache->zone_capacity(vram_zone_id::RUNTIME);
+    // The other planned RUNTIME consumers whose size does not follow n_ubatch. The PP MoE ring is NOT here: its
+    // admission runs after this check and is told this figure as pending RUNTIME demand.
+    size_t       other      = 0;
+    if (!moe_checked_runtime_zone_requirement(unified_cache_get_planned_pp_pipeline_scratch_bytes(device_id), 0,
+                                              unified_cache_get_planned_moe_control_requirement(device_id), &other)) {
+        other = 0;  // unanswerable: the zone sizing keeps its default and so does this check
+    }
+    if (capacity) {
+        *capacity = zone_bytes;
+    }
+    const bool fits = other <= zone_bytes && need <= zone_bytes - other;
+    if (largest_ubatch) {
+        *largest_ubatch = fits ?
+                              n_ubatch :
+                              zone_dense_scratch_largest_ubatch(
+                                  g_planned_mmq_src1_bytes_per_token[device_id].load(std::memory_order_acquire),
+                                  g_planned_dequant_f16_weight_bytes_max[device_id].load(std::memory_order_acquire),
+                                  g_planned_dequant_f16_src1_bytes_per_token[device_id].load(std::memory_order_acquire),
+                                  other, zone_bytes, n_ubatch);
+    }
+    return fits;
+}
+
+uint64_t unified_cache_mint_planned_scratch_owner() {
+    return g_planned_scratch_owner_next.fetch_add(1, std::memory_order_relaxed);
+}
+
+void unified_cache_set_planned_scratch_hold(int device_id, size_t bytes, uint64_t owner) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    // A different owner takes the hold over (the unsupported two-context case, or a first publish): it starts with its
+    // own spill counts, so a context is never reported another context's spills.
+    if (owner != 0 && state.owner != owner) {
+        state.spill_count       = 0;
+        state.spill_bytes       = 0;
+        state.spill_arena_count = 0;
+        state.spill_arena_bytes = 0;
+        state.zone_full_count   = 0;
+        state.zone_full_bytes   = 0;
+        state.spill_owner       = 0;
+        state.warned_raw        = false;
+        state.warned_arena      = false;
+        state.warned_zone_full  = false;
+        state.rung_requests.clear();
+        // The previous owner's epoch and baseline are not this owner's: until its own first publish, a request is a
+        // load-time one and the ledger has no window.
+        state.epoch_n_ubatch       = 0;
+        state.epoch_kv_room        = 0;
+        state.baseline_owner       = 0;
+        state.baseline_cold        = 0;
+        state.rung_record_refusals = 0;
+    }
+    state.hold  = bytes;
+    state.owner = owner;
+}
+
+size_t unified_cache_get_planned_scratch_hold(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    return state.hold;
+}
+
+void unified_cache_get_planned_scratch_hold_state(int device_id, size_t * bytes, uint64_t * owner) {
+    if (bytes) {
+        *bytes = 0;
+    }
+    if (owner) {
+        *owner = 0;
+    }
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    if (bytes) {
+        *bytes = state.hold;
+    }
+    if (owner) {
+        *owner = state.owner;
+    }
+}
+
+bool unified_cache_release_planned_scratch_hold(int device_id, uint64_t owner) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
+        return false;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    // Clear only a hold this owner published.
+    if (state.owner != owner) {
+        return false;
+    }
+    state.hold        = 0;
+    state.owner       = 0;
+    state.rung_requests.clear();  // the records belong to the context that is going away
+    state.epoch_n_ubatch       = 0;
+    state.epoch_kv_room        = 0;
+    state.baseline_owner       = 0;
+    state.baseline_cold        = 0;
+    state.rung_record_refusals = 0;
+    // The spill counters are not touched here: the owner's teardown take (log_planned_scratch_stats)
+    // runs BEFORE this release, already reported them, and cleared them with its latches.
+    return true;
+}
+
+size_t unified_cache_note_runtime_request(int device_id, size_t bytes, bool record) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    size_t                       hold         = 0;
+    // The state mutex is a leaf (nothing is called under it, the logger included): the one-time WARN is decided under
+    // the lock and said after it is released.
+    bool                         warn_refused = false;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        // Only a rung's own scheduler compute requests (from the first publish on) are recorded, under the n_ubatch
+        // of the epoch they were made in; a larger request replaces that rung's mark, nothing replaces another's.
+        if (record && state.epoch_n_ubatch != 0) {
+            bool found = false;
+            for (zone_hold_rung_request & r : state.rung_requests) {
+                if (r.n_ubatch == state.epoch_n_ubatch) {
+                    r.bytes = std::max(r.bytes, bytes);
+                    found   = true;
+                    break;
+                }
+            }
+            if (!found) {
+                if (state.rung_requests.size() >= kHoldRungRecordLimit) {
+                    // A ladder plus a descent is a handful of rungs, never this many; a refused record is counted and
+                    // said once, never a silent truncation of the set a verdict is judged from.
+                    warn_refused = state.rung_record_refusals++ == 0;
+                } else {
+                    zone_hold_rung_request r;
+                    r.n_ubatch = state.epoch_n_ubatch;
+                    r.bytes    = bytes;
+                    state.rung_requests.push_back(r);
+                }
+            }
+        }
+        hold = state.hold;
+    }
+    if (warn_refused) {
+        GGML_LOG_WARN(
+            "[SCRATCH] device %d: more than %zu distinct n_ubatch rungs recorded compute-buffer requests; "
+            "further rungs are not recorded and are judged from the records kept (scaled)\n",
+            device_id, kHoldRungRecordLimit);
+    }
+    return hold;
+}
+
+size_t unified_cache_get_hold_rung_requests(int device_id, uint64_t owner, zone_hold_rung_request * out, size_t cap) {
+    if (!out || cap == 0 || device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
+        return 0;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    if (state.owner != owner) {
+        return 0;
+    }
+    const size_t n = std::min(cap, state.rung_requests.size());
+    for (size_t i = 0; i < n; ++i) {
+        out[i] = state.rung_requests[i];
+    }
+    return n;
+}
+
+size_t unified_cache_hold_free_before(int device_id, uint64_t owner, size_t driver_free_now, bool rung_live) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
+        return driver_free_now;
+    }
+    // The registry has its own lock; read it before taking the hold state's (a leaf: nothing is called under it).
+    size_t                       compute_live = 0;
+    const size_t                 raw_held     = unified_cache_raw_device_held_bytes(device_id, &compute_live);
+    planned_scratch_hold_state & state        = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    // A window's baseline: the free memory the card would show with no outside-arena cache allocation held. The
+    // driver's credit for a freed buffer lags and a lag only lowers a reading, so within a window the baseline is the
+    // MAXIMUM reading taken, and a publish opens a new one (zone_hold_cold_update). Everything the registry does not
+    // hold is invisible to it, and each such consumer errs the same way for the check: another tenant arriving
+    // mid-window, the driver's own allocations (graph, JIT, oneDNN) are not subtracted, so the check ADMITS what
+    // the card may no longer have; a stale-low first reading REFUSES until a later one repairs it. A window has no
+    // time bound: in a long-lived server it runs from the owner's last publish to its next, and the maximum only ever
+    // rises, so a tenant that arrived and is still there is read as free memory (it errs toward ADMITTING too). No
+    // cheap bound exists, because the baseline cannot tell a driver credit that is merely late from a new tenant. The
+    // cache's own raw allocations are all in the registry, the cache-entry mallocs ("unified_cache:alloc", through
+    // unified_cache_adopt_raw_device_allocation) included.
+    const size_t                 cand = zone_hold_free_cold(driver_free_now, raw_held);
+    state.baseline_cold               = zone_hold_cold_update(state.baseline_owner == owner, state.baseline_cold, cand);
+    state.baseline_owner              = owner;
+    // A row that is RELEASING is still held (it is in raw_held, in the baseline and in what persists) until its
+    // physical free happened and the row is gone: crediting it earlier is a free the driver has not credited.
+    const size_t persistent           = zone_hold_persistent_raw(raw_held, compute_live, rung_live);
+    return zone_hold_free_before(state.baseline_cold, persistent);
+}
+
+bool unified_cache_get_hold_epoch(int device_id, uint64_t owner, uint32_t * n_ubatch, size_t * kv_room) {
+    if (n_ubatch) {
+        *n_ubatch = 0;
+    }
+    if (kv_room) {
+        *kv_room = 0;
+    }
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
+        return false;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    if (state.owner != owner || state.epoch_n_ubatch == 0) {
+        return false;
+    }
+    if (n_ubatch) {
+        *n_ubatch = state.epoch_n_ubatch;
+    }
+    if (kv_room) {
+        *kv_room = state.epoch_kv_room;
+    }
+    return true;
+}
+
+void unified_cache_note_planned_hold_spill(int          device_id,
+                                           const char * tag,
+                                           size_t       bytes,
+                                           size_t       hold,
+                                           size_t       available,
+                                           bool         in_arena) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    bool                         first = false;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.spill_count + state.spill_arena_count + state.zone_full_count == 0) {
+            state.spill_owner = state.owner;
+        }
+        if (in_arena) {
+            first              = !state.warned_arena;
+            state.warned_arena = true;
+            state.spill_arena_count++;
+            state.spill_arena_bytes += bytes;
+        } else {
+            first            = !state.warned_raw;
+            state.warned_raw = true;
+            state.spill_count++;
+            state.spill_bytes += bytes;
+        }
+    }
+    // Once per device per context and landing site: the owning context's take (at teardown) rearms it.
+    if (first) {
+        GGML_LOG_WARN(
+            "[SCRATCH] device %d: the RUNTIME-zone request '%s' (%.1f MB) was held back so the planned dense "
+            "scratch can still be materialized (hold %.1f MB, zone free %.1f MB) and %s; later ones are counted, "
+            "not logged (see hold_spills_raw / hold_spills_kv_zone in [SCRATCH-STATS])\n",
+            device_id, tag && tag[0] ? tag : "?", bytes / (1024.0 * 1024.0), hold / (1024.0 * 1024.0),
+            available / (1024.0 * 1024.0),
+            in_arena ? "was placed in the arena's KV zone" : "spills outside the arena (raw device memory)");
+    }
+}
+
+void unified_cache_note_zone_full_kv_placement(int device_id, const char * tag, size_t bytes, size_t runtime_free) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    bool                         first = false;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.spill_count + state.spill_arena_count + state.zone_full_count == 0) {
+            state.spill_owner = state.owner;
+        }
+        first                  = !state.warned_zone_full;
+        state.warned_zone_full = true;
+        state.zone_full_count++;
+        state.zone_full_bytes += bytes;
+    }
+    if (first) {
+        GGML_LOG_WARN(
+            "[SCRATCH] device %d: the compute buffer '%s' (%.1f MB) did not fit the RUNTIME zone (%.1f MB free) and "
+            "was placed in the arena's KV zone instead of raw device memory; later ones are counted, not logged "
+            "(see hold_spills_kv_zone_full in [SCRATCH-STATS])\n",
+            device_id, tag && tag[0] ? tag : "?", bytes / (1024.0 * 1024.0), runtime_free / (1024.0 * 1024.0));
+    }
+}
+
+void unified_cache_begin_planned_hold_epoch(int device_id, uint64_t owner, uint32_t n_ubatch, size_t kv_room) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
+        return;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    if (state.owner != owner) {
+        return;
+    }
+    state.epoch_n_ubatch       = n_ubatch;
+    state.epoch_kv_room        = kv_room;
+    // A publish is a quiescent point: the ledger's baseline window ends here (the next fit takes a fresh one).
+    state.baseline_owner       = 0;
+    state.baseline_cold        = 0;
+    // The counters restart; the WARN latches do not (see planned_scratch_hold_state).
+    state.spill_count          = 0;
+    state.spill_bytes          = 0;
+    state.spill_arena_count    = 0;
+    state.spill_arena_bytes    = 0;
+    state.zone_full_count      = 0;
+    state.zone_full_bytes      = 0;
+    state.spill_owner          = 0;
+}
+
+void unified_cache_refresh_hold_epoch_kv_room(int device_id, uint64_t owner, size_t kv_room) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
+        return;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    if (state.owner != owner || state.epoch_n_ubatch == 0) {
+        return;
+    }
+    state.epoch_kv_room = kv_room;
+}
+
+size_t unified_cache_hold_rung_record_refusals(int device_id, uint64_t owner) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
+        return 0;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    return state.owner == owner ? state.rung_record_refusals : 0;
+}
+
+void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out) {
+    if (!out) {
+        return;
+    }
+    *out = {};
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
+        return;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    if (state.owner != owner) {
+        return;
+    }
+    out->raw_count       = state.spill_count;
+    out->raw_bytes       = state.spill_bytes;
+    out->arena_count     = state.spill_arena_count;
+    out->arena_bytes     = state.spill_arena_bytes;
+    out->zone_full_count = state.zone_full_count;
+    out->zone_full_bytes = state.zone_full_bytes;
+}
+
+void unified_cache_take_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out) {
+    if (!out) {
+        return;
+    }
+    *out = {};
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || owner == 0) {
+        return;
+    }
+    planned_scratch_hold_state & state = g_planned_scratch_hold_state[device_id];
+    std::lock_guard<std::mutex>  lock(state.mutex);
+    // Spills noted while another context held the hold are that context's to report.
+    if (state.spill_owner != owner) {
+        return;
+    }
+    out->raw_count          = state.spill_count;
+    out->raw_bytes          = state.spill_bytes;
+    out->arena_count        = state.spill_arena_count;
+    out->arena_bytes        = state.spill_arena_bytes;
+    out->zone_full_count    = state.zone_full_count;
+    out->zone_full_bytes    = state.zone_full_bytes;
+    state.spill_count       = 0;
+    state.spill_bytes       = 0;
+    state.spill_arena_count = 0;
+    state.spill_arena_bytes = 0;
+    state.zone_full_count   = 0;
+    state.zone_full_bytes   = 0;
+    state.spill_owner       = 0;
+    state.warned_raw        = false;
+    state.warned_arena      = false;
+    state.warned_zone_full  = false;
 }
 
 bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out) {
@@ -15708,12 +16278,88 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             return false;
         }
     };
+    // llama.cpp-kpjw: would the hold keep this request out of the RUNTIME zone? A spill-capable RUNTIME request (a
+    // compute buffer) leaves alone the bytes the planned dense scratch buffers still need and spills exactly as it
+    // would if the zone were full. A forbid-spill request is a planned consumer itself (the ring, the planned
+    // scratch), the claimant the hold exists for, and is never held back. Decided before the overcommit guard
+    // below, so that guard can refuse a spill the hold caused instead of evicting cached weights to make room
+    // for it.
+    bool   hold_spill       = false;
+    size_t hold_at_decision = 0;
+    {
+        const vram_zone_id zid = req.intent.constraints.prefer_vram_zone;
+        if (tier == alloc_tier::DEVICE_VRAM && zid == vram_zone_id::RUNTIME && vram_arena_enabled()) {
+            // One take of the hold state per request: it records the largest spill-capable request (what the
+            // worst-case outside-arena bound adds to the hold) and returns the hold the decision below uses.
+            // Only a scheduler compute buffer (the caller marked it: spill_to_kv_zone_before_raw) is recorded. A
+            // state-class buffer reaches this zone through the same buffer type (the recurrent state's, 461 MB on a
+            // hybrid model) and is not the hold's doing: it feeds neither this record nor the spill counters below.
+            hold_at_decision = unified_cache_note_runtime_request(
+                req.device, alloc_size,
+                req.intent.constraints.spill_to_kv_zone_before_raw && !req.intent.constraints.forbid_vram_zone_spill);
+            auto * hold_cache = get_unified_cache_for_device(req.device);
+            hold_spill        = hold_cache && hold_cache->arena_active() &&
+                         zone_runtime_alloc_held_back(zid == vram_zone_id::RUNTIME,
+                                                      req.intent.constraints.forbid_vram_zone_spill,
+                                                      hold_cache->zone_available(zid), hold_at_decision, alloc_size);
+        }
+    }
+    // llama.cpp-kpjw: a compute buffer the RUNTIME zone will not serve (held back by the hold above, or larger than
+    // the zone's free bytes) is placed in the arena's KV zone before anything else is tried. Raw device memory
+    // outside the arena is the last resort: it is what eats the driver headroom (B50 / B70 Qwen at auto-ub1024: a
+    // 460-512 MB buffer). The attempt is ahead of the overcommit guard below on purpose: an in-arena placement is
+    // memory the arena already reserved, so it cannot overcommit the device and must not evict cached weights.
+    // Only a request the caller marked (spill_to_kv_zone_before_raw) takes this path; every other class, and a
+    // compute buffer the KV zone cannot hold whole, falls through to the unchanged code below.
+    bool kv_placed = false;
+    if (tier == alloc_tier::DEVICE_VRAM && req.intent.constraints.spill_to_kv_zone_before_raw &&
+        req.intent.constraints.prefer_vram_zone == vram_zone_id::RUNTIME && vram_arena_enabled()) {
+        auto * kv_cache = get_unified_cache_for_device(req.device);
+        // The zone-miss predicate below restates the zone-full half of zone_runtime_alloc_held_back (the hold half is
+        // `hold_spill`, already decided above): the two are evaluated apart on purpose, because a request the hold did
+        // not hold back can still miss a full zone, and only the second needs the zone's free bytes read again here.
+        if (kv_cache && kv_cache->arena_active() &&
+            zone_runtime_spill_prefers_kv_zone(
+                true, true, req.intent.constraints.forbid_vram_zone_spill,
+                hold_spill || kv_cache->zone_available(vram_zone_id::RUNTIME) < alloc_size,
+                kv_cache->zone_available(vram_zone_id::KV), alloc_size)) {
+            if (!prepare_arena_publication(vram_zone_id::KV)) {
+                return false;
+            }
+            ptr = kv_cache->zone_alloc(vram_zone_id::KV, alloc_size, req.alignment != 0 ? req.alignment : 64,
+                                       reserved_alloc_id, &exact_arena, arena_runtime_registry_commit,
+                                       &arena_publication);
+            if (!ptr && arena_publication.attempted) {
+                return false;
+            }
+            if (ptr) {
+                kv_placed                    = true;
+                from_arena                   = true;
+                output_metadata.zone_managed = true;
+                output_metadata.vram_zone    = vram_zone_id::KV;
+                GGML_SYCL_DEBUG("[UNIFIED-ALLOC] compute buffer placed in the KV zone: dev=%d size=%.1f MB ptr=%p\n",
+                                req.device, alloc_size / (1024.0 * 1024.0), ptr);
+                // Counted by WHY the RUNTIME zone did not serve it: the hold kept it out (a hold-induced in-arena
+                // spill), or the zone simply had no room for it (a zone-full placement). Every KV placement is
+                // counted one way or the other, so a flagged buffer in the KV zone is never silent.
+                if (hold_spill) {
+                    unified_cache_note_planned_hold_spill(req.device, req.intent.cohort_id, alloc_size,
+                                                          hold_at_decision,
+                                                          kv_cache->zone_available(vram_zone_id::RUNTIME),
+                                                          /*in_arena=*/true);
+                } else {
+                    unified_cache_note_zone_full_kv_placement(req.device, req.intent.cohort_id, alloc_size,
+                                                              kv_cache->zone_available(vram_zone_id::RUNTIME));
+                }
+            }
+        }
+    }
     if (tier == alloc_tier::DEVICE_VRAM) {
         // Guard against Level Zero overcommit: if this allocation would exceed
         // the device's total VRAM, fail early so the caller can retry with
         // host-pinned.  Without this check, L0 may return a valid pointer but
         // a subsequent memset/memcpy triggers DEVICE_LOST.
-        if (req.device >= 0 && req.device < GGML_SYCL_MAX_DEVICES) {
+        if (!kv_placed && req.device >= 0 && req.device < GGML_SYCL_MAX_DEVICES) {
             const size_t total_vram   = unified_alloc_total_vram(req.device, *req.queue);
             const size_t runtime_vram = unified_cache_arena_non_weight_used(req.device);
             // Include weight cache usage (SOA entries on device VRAM)
@@ -15724,6 +16370,18 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             }
             size_t used_vram = runtime_vram + cache_vram;
             if (total_vram > 0 && used_vram + alloc_size > total_vram) {
+                if (hold_spill) {
+                    // The hold sent this request outside the arena, where it needs physical VRAM the device does
+                    // not have. Evicting live weights for that would trade a planned buffer's reservation for the
+                    // model's own weights: refuse, loudly, and let the caller pick a smaller shape.
+                    GGML_LOG_ERROR(
+                        "[UNIFIED-ALLOC] device %d: a RUNTIME request of %.1f MB held back for the planned dense "
+                        "scratch would spill outside the arena past the device's VRAM (used %.1f MB of %.1f MB); "
+                        "refusing instead of evicting cached weights\n",
+                        req.device, alloc_size / (1024.0 * 1024.0), used_vram / (1024.0 * 1024.0),
+                        total_vram / (1024.0 * 1024.0));
+                    return false;
+                }
                 // Try evicting cache entries to make room before failing.
                 // This is the key mechanism that lets the 120B model work:
                 // model load fills VRAM with cached weights, then compute
@@ -15761,14 +16419,22 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         // prefer_vram_zone: explicit zone routing for RUNTIME/SCRATCH/ONEDNN/KV zones.
         // Caller sets alloc_constraints::prefer_vram_zone to request a specific TLSF zone.
         // unified_free() calls cache->zone_free(vram_zone, ptr) for TLSF reclaim.
-        if (req.intent.constraints.prefer_vram_zone != vram_zone_id::COUNT && vram_arena_enabled()) {
+        if (!kv_placed && req.intent.constraints.prefer_vram_zone != vram_zone_id::COUNT && vram_arena_enabled()) {
             auto * cache = get_unified_cache_for_device(req.device);
             if (cache && cache->arena_active()) {
                 const vram_zone_id zid = req.intent.constraints.prefer_vram_zone;
                 if (!prepare_arena_publication(zid)) return false;
-                ptr = cache->zone_alloc(zid, alloc_size, req.alignment != 0 ? req.alignment : 64,
-                                        reserved_alloc_id, &exact_arena,
-                                        arena_runtime_registry_commit, &arena_publication);
+                // llama.cpp-kpjw: a request the hold keeps out (hold_spill, decided above) that the KV zone could
+                // not take falls through to the raw device allocation below like one that found the zone full, and
+                // is counted (as a RAW spill) and warned about once.
+                if (!hold_spill) {
+                    ptr = cache->zone_alloc(zid, alloc_size, req.alignment != 0 ? req.alignment : 64, reserved_alloc_id,
+                                            &exact_arena, arena_runtime_registry_commit, &arena_publication);
+                } else if (req.intent.constraints.spill_to_kv_zone_before_raw) {
+                    unified_cache_note_planned_hold_spill(req.device, req.intent.cohort_id, alloc_size,
+                                                          hold_at_decision, cache->zone_available(zid),
+                                                          /*in_arena=*/false);
+                }
                 if (!ptr && arena_publication.attempted) return false;
                 if (ptr) {
                     from_arena                 = true;
@@ -16092,6 +16758,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         rec.zone_managed     = zone_managed;
         rec.from_arena       = from_arena;
         rec.vram_zone        = output_metadata.vram_zone;
+        // The same class the per-rung request record takes (see the note_runtime_request call above).
+        rec.scheduler_compute =
+            req.intent.constraints.spill_to_kv_zone_before_raw && !req.intent.constraints.forbid_vram_zone_spill;
     }
 
     if (!arena_publication.published) {
@@ -17019,6 +17688,34 @@ static size_t process_pending_legacy_promotion_cleanup(int device) noexcept {
     return released;
 }
 
+size_t unified_cache_raw_device_held_bytes(int device_id, size_t * compute_live) {
+    size_t held = 0;
+    size_t comp = 0;
+    try {
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        for (const auto & item : g_runtime_alloc_registry) {
+            const runtime_alloc_record & row = item.second;
+            const alloc_metadata &       h   = row.handle;
+            // Raw device memory the cache holds: a registry row on this device's VRAM tier that is not a sub-allocation
+            // of an arena zone. A RELEASING row is still held (its physical free has not happened), so it is counted: a
+            // free the driver has not credited is not free memory.
+            if (h.device != device_id || h.tier != alloc_tier::DEVICE_VRAM || h.zone_managed || row.from_arena) {
+                continue;
+            }
+            held = h.size > SIZE_MAX - held ? SIZE_MAX : held + h.size;
+            // Only a LIVE scheduler compute buffer is the rung's own to credit back.
+            if (row.scheduler_compute && row.state == runtime_alloc_state::LIVE) {
+                comp = h.size > SIZE_MAX - comp ? SIZE_MAX : comp + h.size;
+            }
+        }
+    } catch (...) {
+    }
+    if (compute_live) {
+        *compute_live = comp;
+    }
+    return held;
+}
+
 static bool has_pending_legacy_promotion_cleanup(int device) noexcept {
     try {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
@@ -17164,6 +17861,33 @@ bool allocation_registry_test_claim_ptr(void * ptr) noexcept {
 void allocation_registry_test_erase(void * ptr) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     g_runtime_alloc_registry.erase(ptr);
+}
+
+bool allocation_registry_test_publish_raw(void * ptr,
+                                          int    device,
+                                          size_t bytes,
+                                          bool   scheduler_compute,
+                                          bool   from_arena,
+                                          bool   releasing) noexcept {
+    if (!ptr || bytes == 0) {
+        return false;
+    }
+    try {
+        runtime_alloc_record rec;
+        rec.handle.ptr               = ptr;
+        rec.handle.size              = bytes;
+        rec.handle.device            = device;
+        rec.handle.tier              = alloc_tier::DEVICE_VRAM;
+        rec.handle.zone_managed      = false;
+        rec.from_arena               = from_arena;
+        rec.scheduler_compute        = scheduler_compute;
+        rec.state                    = releasing ? runtime_alloc_state::RELEASING : runtime_alloc_state::LIVE;
+        rec.test_no_physical_release = true;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        return g_runtime_alloc_registry.emplace(ptr, std::move(rec)).second;
+    } catch (...) {
+        return false;
+    }
 }
 #endif
 

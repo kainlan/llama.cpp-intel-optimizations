@@ -268,16 +268,6 @@ inline void set_scale_min_k4(int j, uint8_t * q, uint8_t d, uint8_t m) {
     }
 }
 
-inline void get_scale_min_k4_local(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
-    if (j < 4) {
-        d = q[j] & 63;
-        m = q[j + 4] & 63;
-    } else {
-        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
-    }
-}
-
 inline void cpy_blck_f32_mxfp4(const char * cxi, char * cdsti) {
     const float *   xi   = (const float *) cxi;
     block_mxfp4 *   dsti = (block_mxfp4 *) cdsti;

@@ -179,7 +179,7 @@ def loop_of(b: str) -> str:
     a = b.find(_LOOP_HEAD)
     if a == -1:
         return ""
-    e = b.find(z("if (last_good == 0) {"), a)
+    e = b.find(z("const bool stop_is_pure_race"), a)
     return b[a:e] if e != -1 else ""
 
 
@@ -200,7 +200,7 @@ def ladder_ok(b: str) -> bool:
     # the resume skip and the stop-on-refusal break stay
     if z("if (c <= cache_resume_above) { continue; }") not in loop:
         return False
-    return z("if (reason != nullptr) { stop = reason; break; }") in loop
+    return z("if (reason != nullptr) { stop = reason; note_loss(c, reason); break; }") in loop
 
 
 def test_ladder_iterates_only_the_rung_set_members():
@@ -215,7 +215,7 @@ def test_ladder_mutants():
     mutants = {
         "direct iteration of the raw ladder": ("for (uint32_t c : rung_ladder) {", "for (uint32_t c : ladder) {"),
         "direct iteration by reference": ("for (uint32_t c : rung_ladder) {", "for (const auto & c : ladder) {"),
-        "break on refusal becomes continue": ("if (reason != nullptr) { stop = reason; break; }", "if (reason != nullptr) { stop = reason; continue; }"),
+        "break on refusal becomes continue": ("if (reason != nullptr) { stop = reason; note_loss(c, reason); break; }", "if (reason != nullptr) { stop = reason; note_loss(c, reason); continue; }"),
         "per-rung cap break restored": ("for (uint32_t c : rung_ladder) {", "for (uint32_t c : rung_ladder) { if (c > cap) { break; }"),
         "per-rung floor skip restored": ("for (uint32_t c : rung_ladder) {", "for (uint32_t c : rung_ladder) { if (c < fallback_ubatch) { continue; }"),
         "resume skip dropped": ("if (c <= cache_resume_above) { continue; }", ""),

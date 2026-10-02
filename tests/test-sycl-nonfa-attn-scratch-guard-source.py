@@ -171,9 +171,25 @@ def test_guard_consults_the_headroom_predicate():
     body = GGML_SYCL_CPP_CODE[func_start:next_func]
     body_norm = _normalize_ws(body)
 
-    assert "if (flash_attn_enabled) { return true; }" in body_norm, (
-        "ggml_sycl_check_nonfa_attn_scratch() must gate the non-FA scratch guard on "
-        "flash_attn_enabled being false"
+    # With flash attention on the non-FA scratch does not exist, so the guard must return BEFORE it sizes or compares
+    # that demand. The FA-on branch is no longer `return true`: llama.cpp-kpjw (92ee94a4f) returns the planned dense
+    # scratch's hold-spill headroom check there, which asks a different question (the hold's worst-case outside-arena
+    # spill, with no non-FA reserve added). That is the only thing the FA-on branch may do, and it is pinned to the
+    # exact call: an argument list that merely CONTAINS the right names accepted `hold_spill_bytes + <non-FA demand>`
+    # (the non-FA scratch sized with FA on, the property this gate protects) and a call that passes `false` for
+    # probe_mode (review r5 I-B, mutants G1 and G6).
+    fa_on = re.search(
+        r"if \(flash_attn_enabled\) \{ return !hold_query \|\| ggml_sycl_check_hold_spill_headroom\(\*hold_query, probe_mode\); \}",
+        body_norm,
+    )
+    assert fa_on is not None, (
+        "ggml_sycl_check_nonfa_attn_scratch() must gate the non-FA scratch guard on flash_attn_enabled being false: "
+        "its FA-on branch may only `return !hold_query || ggml_sycl_check_hold_spill_headroom(*hold_query, probe_mode);`"
+    )
+    demand_at = body_norm.find("unified_cache_nonfa_attn_scratch_demand_bytes(")
+    assert demand_at != -1 and fa_on.end() <= demand_at, (
+        "the FA-on early return must come before the non-FA demand is sized (and the demand must not be sized "
+        "inside the FA-on branch)"
     )
     assert "unified_cache_nonfa_attn_scratch_demand_bytes(" in body_norm, (
         "ggml_sycl_check_nonfa_attn_scratch() must call "
@@ -487,7 +503,11 @@ def test_narrow_recheck_forbids_replan_and_takes_the_lock():
     assert recheck_next != -1
     recheck_body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[recheck_start:recheck_next])
 
-    assert re.search(r"ggml_sycl_check_nonfa_attn_scratch\([^()]*flash_attn_enabled,\s*false\)", recheck_body_norm), (
+    # allow_replan stays the argument right after flash_attn_enabled; llama.cpp-kpjw (19046aaf7) appended probe_mode
+    # and the hold-spill bound after it, and the bound is itself a call, so the argument list is no longer
+    # paren-free.
+    assert re.search(r"ggml_sycl_check_nonfa_attn_scratch\([^;]*flash_attn_enabled,\s*(?:/\*allow_replan=\*/\s*)?false\s*,",
+                     recheck_body_norm), (
         "the narrow re-check must call the shared guard with allow_replan=false (the final positional "
         "argument, after flash_attn_enabled) -- it must not record, re-plan, or restore the plan-time "
         "SCRATCH-zone shape"

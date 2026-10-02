@@ -49,7 +49,7 @@ def txn_ok(code: str) -> bool:
     publish = b.find(z("sycl_publish_runtime_context("))
     if min(measure, caps, build, report, publish) == -1 or not (measure < caps < build < report < publish):
         return False
-    refuse = z("{ sched_reserve_status::REFUSED, tenant_reason }")
+    refuse = z("{ sched_reserve_status::REFUSED, tenant_reason, true }")
     if b.count(refuse) != 1 or not (build < b.find(refuse) < report):
         return False
     return z("tenant_key = llama_tenant_key_digest(tenant_section);") in b
@@ -64,7 +64,7 @@ def test_transaction_mutants():
     b = function_body(code, _TXN)
     for name, old, new in [
         ("the caps never read", "measure_tenant_caps(storage.plan)", "std::vector<llama_tenant_buft_caps>()"),
-        ("the builder refusal ignored", "{ sched_reserve_status::REFUSED, tenant_reason }", "{ sched_reserve_status::OK, \"\" }"),
+        ("the builder refusal ignored", "{ sched_reserve_status::REFUSED, tenant_reason, true }", "{ sched_reserve_status::OK, \"\" }"),
         ("the key not recorded", "tenant_key = llama_tenant_key_digest(tenant_section);", ""),
         ("the plan line never printed", "tenant_plan_report(storage.plan, storage.cparams.n_ubatch);", ""),
     ]:

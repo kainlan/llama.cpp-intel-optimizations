@@ -127,7 +127,12 @@ static void concat_T_sycl_non_cont(
     int64_t ne2, int64_t ne3, uint64_t nb0, uint64_t nb1, uint64_t nb2,
     uint64_t nb3, int32_t dim) {
   sycl::range<3> gridDim(ne3, ne2, ne1);
-  stream->parallel_for(sycl::nd_range<3>(gridDim, sycl::range<3>(1, 1, 1)), [=](sycl::nd_item<3> item_ct1) {
+  // One work-group of SYCL_CONCAT_BLOCK_SIZE lanes per (i3, i2, i1) row; the kernel strides i0 by the local range.
+  // (1,1,1) ran every row on a single lane.
+  stream->parallel_for(
+      sycl::nd_range<3>(gridDim * sycl::range<3>(1, 1, SYCL_CONCAT_BLOCK_SIZE),
+                        sycl::range<3>(1, 1, SYCL_CONCAT_BLOCK_SIZE)),
+      [=](sycl::nd_item<3> item_ct1) {
       int64_t i3 = item_ct1.get_group(0);
       int64_t i2 = item_ct1.get_group(1);
       int64_t i1 = item_ct1.get_group(2);
@@ -176,11 +181,14 @@ void concat_impl_sycl(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor ds
             const size_t size0 = src0.nbytes();
             const size_t size1 = src1.nbytes();
 
+            // No host wait: the compute stream is in-order, so whatever consumes dst is ordered after
+            // both copies. A wait here is what kept CONCAT out of recorded graphs (llama.cpp-qhfp).
+            // The assert keeps that order a checked fact rather than an assumption, the way the planned-scratch
+            // path does it: check_queue_order (ggml-sycl.cpp, the block-exec dense path) aborts unless copies and
+            // kernels share one in-order queue, and that precedent is why a slice may be reused with no wait.
+            GGML_ASSERT(stream->has_property<sycl::property::queue::in_order>());
             SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_graph_safe_memcpy(*stream, dst_d, src0_d, size0)));
             SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_graph_safe_memcpy(*stream, dst_d + size0 / type_size, src1_d, size1)));
-            if (!g_ggml_sycl_graph_recording) {
-                stream->wait();
-            }
         }
     } else {
         concat_T_sycl_non_cont<T>(stream, static_cast<const char *>(src0.resolve_ptr()),

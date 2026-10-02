@@ -281,7 +281,7 @@ def gate3(files, bad):
 # --------------------------------------------------------------------------------------
 GLOBAL_CLEAR_EFFECTS = ("release_graph_retained_handles", "ggml_sycl_cpu_staging_cache_clear", "graph_unpin_moe_experts",
                         "graph_unpin_weights")
-CLEAR_ACTIVE_CALLERS = 12  # the design lists eleven; optional-layouts-retire (dkw0) is the twelfth on this base
+CLEAR_ACTIVE_CALLERS = 13  # the design lists eleven; optional-layouts-retire (dkw0) is the twelfth on this base, and the legacy re-record path's prestage-declined clear (master, with graph_prestage_or_decline) the thirteenth
 
 
 def gate23(files, bad):
