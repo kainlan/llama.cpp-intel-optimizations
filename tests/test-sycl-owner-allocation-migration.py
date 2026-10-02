@@ -200,7 +200,7 @@ CACHE_UNIFIED_ALLOC_SITES = Counter({
     ("if (!", "req, &moe_owner"): 1,  # moe_preallocate_inference_buffers
     # oneDNN Graph-scratch DIRECT path (dded74997, llama.cpp-0oxf): unified_alloc()
     # + detail::from_legacy_owned_alloc() with no fallible step between them. Legacy form,
-    # allowlisted; owner-first (unified_allocate_owner) is the migration target.
+    # allowlisted; owner-first (unified_allocate_owner) is the migration target, tracked by llama.cpp-mrtw.
     ("ph_scratch_test_should_force_direct_fail() &&", "req, &handle"): 2,
 })
 CACHE_FROM_LEGACY_SITES = Counter({
