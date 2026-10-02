@@ -2247,7 +2247,7 @@ if (NOT WIN32)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-resolved-batch-source.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;python;source-assert;moe;retained-route;mutation"
-        # ~150 s on this host (about 130 s at its last green commit): the mutation witnesses re-tokenise the
+        # ~150 s on this host under its ambient load (measured 153 s, 2026-10-01): the mutation witnesses re-tokenise the
         # ~570k-character ggml_sycl_mul_mat_id body once per mutant. 120 s made a green run a timeout failure.
         TIMEOUT 600
     )

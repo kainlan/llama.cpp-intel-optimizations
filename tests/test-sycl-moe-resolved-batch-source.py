@@ -89,6 +89,62 @@ def function_definition(text: str, signature: str) -> str:
     raise ValueError(f"unclosed function: {signature}")
 
 
+def post_mark_vector_violations(post_mark: str, allowed: tuple[str, ...]) -> list[str]:
+    """Where the allowed dependency-vector spellings may sit after mark_possible_submit().
+
+    "Inside the try" is a property of the brace span, not of ordering: a construction hoisted above `try {` or
+    tucked into the catch handler is outside the quarantine, and a plain .replace() cannot tell. So take the try
+    body by its matching brace, require both spellings and the copy inside it, and require that neither spelling
+    (nor any other vector or copy) appears anywhere else after the mark, handler included.
+    """
+    found: list[str] = []
+    try_body = function_definition(post_mark, "try {")
+    outside_try = post_mark.replace(try_body, "", 1)
+    unallowed = try_body
+    for spelling in allowed:
+        if spelling not in try_body:
+            found.append(f"missing from the try body: {spelling}")
+        if spelling in outside_try:
+            found.append(f"outside the try body: {spelling}")
+        unallowed = unallowed.replace(spelling, "")
+    if "std::vector<" in unallowed:
+        found.append("other vector in the try body")
+    if "std::vector<" in outside_try:
+        found.append("a vector outside the try body")
+    if "mem_copy_ptr_async(" not in try_body or "mem_copy_ptr_async(" in outside_try:
+        found.append("mem_copy_ptr_async not confined to the try body")
+    if "} catch (...) {" not in outside_try:
+        found.append("no catch(...) handler after the try body")
+    return found
+
+
+DECODE_PAIR_GUARD = ("if (ne12 == 1 && !g_ggml_sycl_graph_recording && !xmx_moe_forced"
+                     " && src0->type == GGML_TYPE_MXFP4 && blk_layer_id >= 0 && is_gate_subop) {")
+
+
+# The only statements allowed ahead of the guard: the dispatched flag and the 1tjn census timestamp the
+# S4 measurement reads from outside the nested blocks.
+DECODE_PAIR_PRELUDE = ("bool decode_pair_glu_dispatched = false;"
+                       " auto t_s3_end_for_s4 = std::chrono::steady_clock::time_point{};")
+
+
+def decode_pair_block_fully_guarded(block: str) -> bool:
+    """True when the whole excised block is the dispatched flag plus ONE if carrying the ne12 == 1 guard.
+
+    Seeing the guard text somewhere in the block is not enough: everything the caller removes from the
+    prompt-reachable scan must be inside that if, so check the tokens on both sides of its balanced braces.
+    """
+    start = block.find("if (ne12 == 1 && !g_ggml_sycl_graph_recording")
+    if start < 0:
+        return False
+    guarded = function_definition(block, "if (ne12 == 1 && !g_ggml_sycl_graph_recording")
+    before = block[:block.index(guarded)]
+    after = block[block.index(guarded) + len(guarded):]
+    return (has_tokens(guarded, DECODE_PAIR_GUARD)
+            and tokens(before) == tokens(DECODE_PAIR_PRELUDE)
+            and tokens(after) == [])
+
+
 def prompt_ids_snapshotted_once(text: str) -> bool:
     """The prompt admission reads the device IDs exactly once and takes exactly one host snapshot of them.
 
@@ -421,10 +477,12 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     decode_pair_begin = mmid.index("bool decode_pair_glu_dispatched = false;")
     decode_pair_end = mmid.index("if (decode_pair_glu_dispatched) {", decode_pair_begin)
     decode_pair_block = mmid[decode_pair_begin:decode_pair_end]
-    if not has_tokens(decode_pair_block,
-                      "if (ne12 == 1 && !g_ggml_sycl_graph_recording && !xmx_moe_forced"
-                      " && src0->type == GGML_TYPE_MXFP4 && blk_layer_id >= 0 && is_gate_subop) {"):
+    if not decode_pair_block_fully_guarded(decode_pair_block):
         failures.append("decode pair block is not guarded by ne12 == 1")
+    # Positive controls: code on either side of the guarded if would be prompt-reachable yet excised below.
+    if decode_pair_block_fully_guarded(decode_pair_block + "\nnot_guarded();") or decode_pair_block_fully_guarded(
+            "not_guarded();\n" + decode_pair_block):
+        failures.append("decode pair guard scan accepted code outside the guarded if")
     prompt_reachable = prompt_reachable.replace(decode_pair_block, "", 1)
     forbidden_prompt_ownership = (
         "ggml_sycl_resolve_moe_expert_route(",
@@ -518,13 +576,16 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
         "std::vector<sycl::event>{ retained_table.ready_event }",
         "std::vector<sycl::event>{}",
     )
-    post_mark_unallowed = post_mark
-    for spelling in allowed_dependency_vectors:
-        assert spelling in post_mark, spelling
-        post_mark_unallowed = post_mark_unallowed.replace(spelling, "")
-    assert "std::vector<" not in post_mark_unallowed
-    assert "try {" in post_mark and post_mark.index("try {") < post_mark.index("mem_copy_ptr_async(")
-    assert "} catch (...) {" in post_mark
+    assert post_mark_vector_violations(post_mark, allowed_dependency_vectors) == []
+    # Positive controls: the span rule must reject a construction hoisted above the try and one in the handler.
+    first_spelling = allowed_dependency_vectors[0]
+    try_at = post_mark.index("try {")
+    hoisted = post_mark[:try_at] + "const auto hoisted_deps = " + first_spelling + ";\n" + post_mark[try_at:]
+    in_handler_at = post_mark.index("} catch (...) {") + len("} catch (...) {")
+    in_handler = post_mark[:in_handler_at] + "\nconst auto h = " + first_spelling + ";\n" + post_mark[in_handler_at:]
+    for mutant in (hoisted, in_handler):
+        assert mutant != post_mark
+        assert post_mark_vector_violations(mutant, allowed_dependency_vectors), "span rule missed a mutant"
 
     materialize_start = source.index("static bool ggml_sycl_materialize_published_mmid_workspaces(")
     materialize_end = source.index("ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end", materialize_start)
