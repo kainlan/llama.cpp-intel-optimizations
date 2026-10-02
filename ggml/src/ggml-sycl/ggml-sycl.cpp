@@ -353,7 +353,6 @@ using ggml_sycl::GGML_SYCL_REPLAN_KIND_LIFECYCLE;
 using ggml_sycl::GGML_SYCL_REPLAN_KIND_LOAD;
 using ggml_sycl::GGML_SYCL_REPLAN_KIND_TRANSACTION;
 using ggml_sycl::ggml_sycl_replan_token;
-using ggml_sycl::ggml_sycl_replan_token_held;
 using ggml_sycl::moe_gate_up_pair;
 using ggml_sycl::moe_layer_decode_artifact_plan;
 using ggml_sycl::moe_layer_decode_plan;
@@ -34427,7 +34426,7 @@ static void ggml_sycl_preload_model_weights() {
             if (global_plan != nullptr) {
                 // The preload runs inside load_end's LOAD-kind token (it is not a
                 // public entry), so this republish is an L0-held load-path site.
-                GGML_SYCL_WITNESS(ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_LOAD),
+                GGML_SYCL_WITNESS(ggml_sycl::ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_LOAD),
                                   "[REPLAN-TOKEN] preload without a LOAD token");
                 ggml_sycl_republish_current_plan();
             }
@@ -38261,7 +38260,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
     // this function's host-pinned fallback. The planner's own carve is exempt from
     // the pool phase gates only because it runs inside that token; an allocation
     // reached from here is not planner work.
-    GGML_SYCL_WITNESS(!ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_TRANSACTION),
+    GGML_SYCL_WITNESS(!ggml_sycl::ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_TRANSACTION),
                       "[REPLAN-TOKEN] TRANSACTION token held at alloc_buffer entry");
     ggml_backend_sycl_buffer_type_context * buft_ctx = (ggml_backend_sycl_buffer_type_context *) buft->context;
     ggml_sycl_set_device(buft_ctx->device);
@@ -38554,7 +38553,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
             // nullptr is not a fallback -- it falls through to the
             // allocation-failure ERROR just past this block, a hard
             // failure, not a successful landing in host memory).
-            GGML_SYCL_WITNESS(!ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_TRANSACTION),
+            GGML_SYCL_WITNESS(!ggml_sycl::ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_TRANSACTION),
                               "[REPLAN-TOKEN] TRANSACTION token held at alloc_buffer host fallback");
             GGML_LOG_WARN("SYCL: Alloc failed (%zu MB), retrying with host-pinned fallback\n", size / (1024 * 1024));
             req.intent.constraints.must_device      = false;
@@ -38860,7 +38859,7 @@ static size_t ggml_backend_sycl_plan_caps_freeze(ggml_sycl_plan_scope *        s
                                                  ggml_backend_buffer_type_t    buft,
                                                  ggml_sycl_chunk_cap_buft_kind kind) {
     GGML_SYCL_WITNESS(caps->state.load(std::memory_order_acquire) == GGML_SYCL_PLAN_CAPS_FREEZING &&
-                          ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_TRANSACTION),
+                          ggml_sycl::ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_TRANSACTION),
                       "[REPLAN-TOKEN] chunk-cap freeze outside the fixpoint");
     size_t value = 0;
     if (kind == ggml_sycl_chunk_cap_buft_kind::HOST) {
@@ -39019,11 +39018,11 @@ void * ggml_backend_sycl_replan_scope_open(enum ggml_sycl_replan_scope_kind kind
         return nullptr;
     }
     if (require_outermost) {
-        GGML_SYCL_WITNESS(!ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_TRANSACTION),
+        GGML_SYCL_WITNESS(!ggml_sycl::ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_TRANSACTION),
                           "[REPLAN-TOKEN] growth scope not outermost: under TRANSACTION");
-        GGML_SYCL_WITNESS(!ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_LOAD),
+        GGML_SYCL_WITNESS(!ggml_sycl::ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_LOAD),
                           "[REPLAN-TOKEN] growth scope not outermost: under LOAD");
-        GGML_SYCL_WITNESS(!ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_LIFECYCLE),
+        GGML_SYCL_WITNESS(!ggml_sycl::ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_LIFECYCLE),
                           "[REPLAN-TOKEN] growth scope not outermost: under LIFECYCLE");
     }
     try {
@@ -107489,6 +107488,38 @@ static bool should_use_persistent_tg(ggml_backend_sycl_context & ctx, ggml_cgrap
     return true;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Defined ahead of graph_compute_unchecked on purpose: the parse of that function fails, and tree-sitter
+// reads every definition after it as an ERROR region, where the alloc-zone contract cannot trust an
+// alloc_request (finding A-ERROR). A test hook that builds one belongs where the file parses.
+size_t ggml_backend_sycl_test_park_tenant_staging(ggml_backend_t backend, size_t nbytes) {
+    auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+    if (!ctx || nbytes == 0) {
+        return 0;
+    }
+    ggml_sycl::alloc_request req{};
+    req.queue                               = ctx->stream();
+    req.device                              = ctx->device;
+    req.size                                = nbytes;
+    req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+    req.intent.category                     = ggml_sycl::runtime_category::STAGING;
+    // The entry only has to sit in the staging map under a tenant cohort; nothing resolves it on the
+    // device. Host-pinned keeps it out of the VRAM zones, which an unplanned test backend has not carved.
+    req.intent.constraints.must_host_pinned = true;
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
+        return 0;
+    }
+    allocation.owner.set_tenant_cohort("test-tenant-cohort");
+    static ggml_tensor keys[8];
+    static size_t      next_key = 0;
+    ctx->graph_input_staging_adopt_for_test(
+        &keys[next_key++ % 8], ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS),
+        nbytes);
+    return ctx->graph_input_staging_tenant_count();
+}
+#endif
+
 static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t backend, ggml_cgraph * cgraph) {
     // Phase timing: measure each stage of graph_compute to find overhead
     static const bool phase_timing = (std::getenv("GGML_SYCL_PHASE_TIMING") != nullptr);
@@ -109946,31 +109977,6 @@ static ggml_status ggml_sycl_graph_compute_exit_status(ggml_backend_t backend,
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-size_t ggml_backend_sycl_test_park_tenant_staging(ggml_backend_t backend, size_t nbytes) {
-    auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
-    if (!ctx || nbytes == 0) {
-        return 0;
-    }
-    ggml_sycl::alloc_request req{};
-    req.queue                               = ctx->stream();
-    req.device                              = ctx->device;
-    req.size                                = nbytes;
-    req.intent.role                         = ggml_sycl::alloc_role::STAGING;
-    req.intent.category                     = ggml_sycl::runtime_category::STAGING;
-    req.intent.constraints.must_device      = true;
-    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
-    if (!allocation) {
-        return 0;
-    }
-    allocation.owner.set_tenant_cohort("test-tenant-cohort");
-    static ggml_tensor keys[8];
-    static size_t      next_key = 0;
-    ctx->graph_input_staging_adopt_for_test(
-        &keys[next_key++ % 8], ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS),
-        nbytes);
-    return ctx->graph_input_staging_tenant_count();
-}
-
 size_t ggml_backend_sycl_test_tenant_staging_count(ggml_backend_t backend) {
     auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
     return ctx ? ctx->graph_input_staging_tenant_count() : 0;
@@ -110043,7 +110049,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     // Graph compute never runs under L0: a token held here would serialize every
     // other thread's re-plan behind a decode. One load and one branch when the
     // witness is off.
-    GGML_SYCL_WITNESS(!ggml_sycl_replan_token_held(), "[REPLAN-TOKEN] token held in graph compute");
+    GGML_SYCL_WITNESS(!ggml_sycl::ggml_sycl_replan_token_held(), "[REPLAN-TOKEN] token held in graph compute");
     // The root that binds the dispatch owner for every ctx-less MoE route chain below.
     ggml_sycl_dispatch_owner_scope dispatch_owner(
         backend ? static_cast<const ggml_backend_sycl_context *>(backend->context) : nullptr);
