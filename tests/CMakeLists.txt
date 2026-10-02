@@ -385,6 +385,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-context-update-failure.cpp LABEL model)
     # H3i (4): a failed reserve reaches decode and encode as -2; loads a tiny model, so `model` as above.
     llama_build_and_test(test-context-reserve-failure.cpp LABEL model)
+    # L6 of the layer shapes (zhcn C7g): the shapes llama publishes equal the tensors each memory kind
+    # creates, on tiny CPU models. `model` as above.
+    llama_build_and_test(test-layer-shapes.cpp LABEL model)
 
     llama_build(test-fusion.cpp)
 endif()

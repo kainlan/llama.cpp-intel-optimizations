@@ -234,32 +234,35 @@ llama_kv_cache::llama_kv_cache(
     const bool is_mla = hparams.is_mla();
 
     for (uint32_t il = 0; il < n_layer; il++) {
-        if (!hparams.has_kv(il)) {
+        // the one decision for this layer, shared with llama_kv_layer_shapes() (llama-layer-shapes.h)
+        const llama_kv_layer_decision dec =
+            llama_kv_layer_decide(hparams, il, v_trans, filter, share, other != nullptr);
+
+        if (dec.role == LLAMA_KV_LAYER_NO_KV) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
             continue;
         }
 
-        if (filter && !filter(il)) {
+        if (dec.role == LLAMA_KV_LAYER_FILTERED) {
             LLAMA_LOG_DEBUG("%s: layer %3d: filtered\n", __func__, il);
             continue;
         }
 
-        if (share && other) {
-            const int32_t il_share = share(il);
+        if (dec.role == LLAMA_KV_LAYER_SHARED) {
+            const int32_t il_share = dec.il_share;
 
-            if (il_share >= 0) {
-                const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
+            const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
 
-                LLAMA_LOG_WARN("%s: layer %3d: sharing with layer %d. k = %p, v = %p\n", __func__, il, il_share,
-                        layer_share.k->data, layer_share.v->data);
+            LLAMA_LOG_WARN("%s: layer %3d: sharing with layer %d. k = %p, v = %p\n", __func__, il, il_share,
+                           layer_share.k->data, layer_share.v->data);
 
-                map_layer_ids[il] = layers.size();
+            map_layer_ids[il] = layers.size();
 
-                layers.push_back(layer_share);
-                layers.back().il = il;
+            layers.push_back(layer_share);
+            layers.back().il     = il;
+            layers.back().shared = true;
 
-                continue;
-            }
+            continue;
         }
 
         if (n_embd_head_k_all == 0) {
@@ -277,8 +280,8 @@ llama_kv_cache::llama_kv_cache(
         }
 
         // [TAG_V_CACHE_VARIABLE]
-        const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
-        const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+        const uint32_t n_embd_k_gqa = dec.shape.n_embd_k_gqa;
+        const uint32_t n_embd_v_gqa = dec.shape.n_embd_v_gqa;
 
         const char * dev_name = "CPU";
 
@@ -1381,6 +1384,22 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     return layers[ikv].k;
+}
+
+bool llama_kv_cache::get_layer_tensors(int32_t il, const ggml_tensor ** k, const ggml_tensor ** v) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return false;
+    }
+
+    const kv_layer & layer = layers[it->second];
+    if (layer.il != (uint32_t) il || layer.shared) {
+        return false;
+    }
+
+    *k = layer.k;
+    *v = layer.v;
+    return true;
 }
 
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {

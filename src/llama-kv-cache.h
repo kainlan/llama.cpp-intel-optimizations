@@ -169,6 +169,11 @@ public:
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
+    // The K and V tensors this cache itself created for model layer il. False when the layer has
+    // none here: it has no KV, another layer's tensors stand in for it (reuse), or another cache's
+    // do (share). V is null for an MLA layer.
+    bool get_layer_tensors(int32_t il, const ggml_tensor ** k, const ggml_tensor ** v) const;
+
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
     // state_read, plus the cells the restored tokens were placed in
@@ -269,6 +274,9 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // the tensors belong to another cache (layer_share_cb)
+        bool shared = false;
     };
 
     bool v_trans = true;  // the value tensor is transposed
