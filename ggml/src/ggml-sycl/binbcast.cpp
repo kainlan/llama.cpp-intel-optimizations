@@ -1324,11 +1324,13 @@ void ggml_sycl_add1(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst)
 
 // Fused MUL + ADD kernel: dst = x * scale + bias
 // Optimized for the common scale+bias pattern in normalization
+// No __restrict__: the fusion alias gate (fusion-alias.hpp) admits dst identical to x, scale or bias, and each
+// element is read and written by one work-item, which restrict would make formally undefined.
 template <typename T>
-static void k_mul_add_fused(const T * __restrict__ x,
-                            const T * __restrict__ scale,
-                            const T * __restrict__ bias,
-                            T * __restrict__ dst,
+static void k_mul_add_fused(const T *                x,
+                            const T *                scale,
+                            const T *                bias,
+                            T *                      dst,
                             const int64_t            ne0,
                             const int64_t            ne1,
                             const int64_t            ne_scale0,

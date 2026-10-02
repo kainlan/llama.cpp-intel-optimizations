@@ -79,6 +79,10 @@ static sycl::event mmvq_profile_submit_quantize_activation_q8_soa(sycl::queue & 
     }, file, line, function);
 }
 
+// The fused-add MMVQ kernels below take dst and fused_add WITHOUT __restrict__: the fusion alias gate
+// (fusion-alias.hpp) admits an output that is the addend itself (identical address, shape and strides), and
+// each row is read and written by one lane in one expression. A restrict-qualified pair would make that
+// formally undefined and let the compiler reorder the load and the store.
 static __dpct_inline__ float mmvq_fused_add_value(const float * add,
                                                   const int64_t add_ne0,
                                                   const int64_t add_nb0,
@@ -2283,16 +2287,16 @@ template <int qtype> class mmvq_id_kernel_name;
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_reorder(const void * __restrict__ vx,
                                   const void * __restrict__ vy,
-                                  float * __restrict__ dst,
+                                  float *                  dst,
                                   const int                ncols,
                                   const int                nrows,
                                   const int                total_nrows,
                                   const int                row_low,
                                   const sycl::nd_item<3> & nd_item,
-                                  const float * __restrict__ fused_add = nullptr,
-                                  const int64_t fused_add_ne0          = 0,
-                                  const int64_t fused_add_nb0          = sizeof(float),
-                                  const int64_t fused_add_row_base     = 0) {
+                                  const float *            fused_add          = nullptr,
+                                  const int64_t            fused_add_ne0      = 0,
+                                  const int64_t            fused_add_nb0      = sizeof(float),
+                                  const int64_t            fused_add_row_base = 0) {
     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
     using block_traits = typename block_type::traits;
 
@@ -2351,7 +2355,7 @@ static void mul_mat_vec_q_reorder(const void * __restrict__ vx,
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_reorder_slm(const void * __restrict__ vx,
                                       const void * __restrict__ vy,
-                                      float * __restrict__ dst,
+                                      float *                  dst,
                                       const int                ncols,
                                       const int                nrows,
                                       const int                total_nrows,
@@ -2359,10 +2363,10 @@ static void mul_mat_vec_q_reorder_slm(const void * __restrict__ vx,
                                       const sycl::nd_item<3> & nd_item,
                                       int8_t * __restrict__ slm_y_qs,
                                       sycl::half2 * __restrict__ slm_y_ds,
-                                      const float * __restrict__ fused_add = nullptr,
-                                      const int64_t fused_add_ne0          = 0,
-                                      const int64_t fused_add_nb0          = sizeof(float),
-                                      const int64_t fused_add_row_base     = 0) {
+                                      const float * fused_add          = nullptr,
+                                      const int64_t fused_add_ne0      = 0,
+                                      const int64_t fused_add_nb0      = sizeof(float),
+                                      const int64_t fused_add_row_base = 0) {
     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
     using block_traits = typename block_type::traits;
 
@@ -2442,14 +2446,14 @@ static void mul_mat_vec_q_reorder_slm(const void * __restrict__ vx,
 // This achieves 100% cache line utilization (vs 50% with strided access in standard reorder)
 static void mul_mat_vec_q4_0_coalesced(const void * __restrict__ vx,  // Coalesced X weights
                                        const void * __restrict__ vy,  // Reordered Y activations
-                                       float * __restrict__ dst,
+                                       float *                  dst,
                                        const int                ncols,
                                        const int                nrows,
                                        const sycl::nd_item<3> & nd_item,
-                                       const float * __restrict__ fused_add = nullptr,
-                                       const int64_t fused_add_ne0          = 0,
-                                       const int64_t fused_add_nb0          = sizeof(float),
-                                       const int64_t fused_add_row_base     = 0) {
+                                       const float *            fused_add          = nullptr,
+                                       const int64_t            fused_add_ne0      = 0,
+                                       const int64_t            fused_add_nb0      = sizeof(float),
+                                       const int64_t            fused_add_row_base = 0) {
     const auto sg           = nd_item.get_sub_group();
     const int  sg_range     = sg.get_group_linear_range();
     const int  workgroup_id = nd_item.get_group_linear_id();
@@ -2766,14 +2770,14 @@ static void variable_tile_mul_mat_vec_q6_k_q8_1_sycl(const void *  vx,
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
 static void mul_mat_vec_q(const void * __restrict__ vx,
                           const void * __restrict__ vy,
-                          float * __restrict__ dst,
+                          float *                  dst,
                           const int                ncols,
                           const int                nrows,
                           const sycl::nd_item<3> & item_ct1,
-                          const float * __restrict__ fused_add = nullptr,
-                          const int64_t fused_add_ne0          = 0,
-                          const int64_t fused_add_nb0          = sizeof(float),
-                          const int64_t fused_add_row_base     = 0) {
+                          const float *            fused_add          = nullptr,
+                          const int64_t            fused_add_ne0      = 0,
+                          const int64_t            fused_add_nb0      = sizeof(float),
+                          const int64_t            fused_add_row_base = 0) {
     const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
 
     if (row >= nrows) {
@@ -2984,16 +2988,16 @@ template <int qk,
           int nrows_per_wg>
 static void mul_mat_vec_q_multirow(const void * __restrict__ vx,
                                    const void * __restrict__ vy,
-                                   float * __restrict__ dst,
+                                   float *                  dst,
                                    const int                ncols,
                                    const int                nrows,
                                    const sycl::nd_item<3> & item_ct1,
                                    int * __restrict__ slm_y_qs,
                                    sycl::half2 * __restrict__ slm_y_ds,
-                                   const float * __restrict__ fused_add = nullptr,
-                                   const int64_t fused_add_ne0          = 0,
-                                   const int64_t fused_add_nb0          = sizeof(float),
-                                   const int64_t fused_add_row_base     = 0) {
+                                   const float * fused_add          = nullptr,
+                                   const int64_t fused_add_ne0      = 0,
+                                   const int64_t fused_add_nb0      = sizeof(float),
+                                   const int64_t fused_add_row_base = 0) {
     // Work-group layout: (1, nrows_per_wg, WARP_SIZE)
     // Each warp handles one row, all warps share Y-vector in SLM
     const int local_row = item_ct1.get_local_id(1);           // Which row within work-group (0 to nrows_per_wg-1)
@@ -3096,14 +3100,14 @@ template <int qtype> class mmvq_multirow_kernel_name;
 template <int qk, int qi, typename block_q_t, int vdr>
 static void mul_mat_vec_q_iq2_xxs_q8_1(const void * __restrict__ vx,
                                        const void * __restrict__ vy,
-                                       float * __restrict__ dst,
+                                       float *                  dst,
                                        const int                ncols,
                                        const int                nrows,
                                        const sycl::nd_item<3> & item_ct1,
-                                       const float * __restrict__ fused_add = nullptr,
-                                       const int64_t fused_add_ne0          = 0,
-                                       const int64_t fused_add_nb0          = sizeof(float),
-                                       const int64_t fused_add_row_base     = 0) {
+                                       const float *            fused_add          = nullptr,
+                                       const int64_t            fused_add_ne0      = 0,
+                                       const int64_t            fused_add_nb0      = sizeof(float),
+                                       const int64_t            fused_add_row_base = 0) {
     const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
 
     if (row >= nrows) {
@@ -3948,14 +3952,14 @@ static void coalesced_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
 // Thread mapping: threads iterate block_in_tile and process both halves per block
 static void mul_mat_vec_q8_0_coalesced(const void * __restrict__ vx,  // Coalesced X weights
                                        const void * __restrict__ vy,  // Reordered Y activations
-                                       float * __restrict__ dst,
+                                       float *                  dst,
                                        const int                ncols,
                                        const int                nrows,
                                        const sycl::nd_item<3> & nd_item,
-                                       const float * __restrict__ fused_add = nullptr,
-                                       const int64_t fused_add_ne0          = 0,
-                                       const int64_t fused_add_nb0          = sizeof(float),
-                                       const int64_t fused_add_row_base     = 0) {
+                                       const float *            fused_add          = nullptr,
+                                       const int64_t            fused_add_ne0      = 0,
+                                       const int64_t            fused_add_nb0      = sizeof(float),
+                                       const int64_t            fused_add_row_base = 0) {
     const auto sg           = nd_item.get_sub_group();
     const int  sg_range     = sg.get_group_linear_range();
     const int  workgroup_id = nd_item.get_group_linear_id();
@@ -4218,14 +4222,14 @@ static void coalesced_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
 // Same coalesced layout as Q4_0 (16 bytes quants per block)
 static void mul_mat_vec_mxfp4_coalesced(const void * __restrict__ vx,  // Coalesced X weights
                                         const void * __restrict__ vy,  // Reordered Y activations
-                                        float * __restrict__ dst,
+                                        float *                  dst,
                                         const int                ncols,
                                         const int                nrows,
                                         const sycl::nd_item<3> & nd_item,
-                                        const float * __restrict__ fused_add = nullptr,
-                                        const int64_t fused_add_ne0          = 0,
-                                        const int64_t fused_add_nb0          = sizeof(float),
-                                        const int64_t fused_add_row_base     = 0) {
+                                        const float *            fused_add          = nullptr,
+                                        const int64_t            fused_add_ne0      = 0,
+                                        const int64_t            fused_add_nb0      = sizeof(float),
+                                        const int64_t            fused_add_row_base = 0) {
     const auto sg           = nd_item.get_sub_group();
     const int  sg_range     = sg.get_group_linear_range();
     const int  workgroup_id = nd_item.get_group_linear_id();
