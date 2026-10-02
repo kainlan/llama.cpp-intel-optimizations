@@ -46,6 +46,23 @@ It checks, over ggml/include/ggml-sycl.h and ggml/src/ggml-sycl/ggml-sycl.cpp:
     by an RAII record, a table handle is cast only after its deleter is checked, and the claim scope's
     open answers a status for each way it can not open.
 
+  * (the free-path contract) the SYCL_Host free_buffer releases the slot once, through
+    tenant_claim_scope::release with event 0, and never waits on the host; the synchronize that makes
+    that safe is pinned where a compute buffer can be freed (~llama_context first, sched_reserve_impl
+    before it touches the scheduler, release_rung_buffers), the backend's synchronize still drains stream
+    0, the deferred decode event and the CPU-expert flush, set/get_tensor_async accept only the device,
+    host-compute and cpu-offload buffer types, the device does not support the CpuActivation clone, and
+    cpy_tensor_async stays unwired.  llama-context.cpp is read as one text with ggml-sycl.cpp.
+
+Known limits (text-level pins; each is what the named test or review covers instead):
+  * a lambda or macro that hides a release, a synchronize or a clear behind another name: the pins read
+    the shapes named above, not the call graph (covered by the host-tenant-claim device test and review);
+  * a tail-drop or late check inside a function the pin does not name (a statement added after the last
+    pinned one): the pins anchor the first and the terminating statements, not the ones between (covered by
+    the lifecycle device test's order witnesses);
+  * the gate cannot tell a synchronize that is reached from one that is dead code behind a runtime
+    condition other than a literal `if (false)` (covered by the L6 wait_event consumption acceptance).
+
 Usage:
   check-sycl-l4-proc-registration.py [--root DIR]     check the tree, then run the mutation matrix
   check-sycl-l4-proc-registration.py --no-mutations   check the tree only
@@ -69,6 +86,7 @@ SIG_COVERAGE = r"\benum\s+ggml_sycl_tenant_coverage\s+ggml_backend_sycl_tenant_c
 
 HEADER = "ggml/include/ggml-sycl.h"
 SOURCE = "ggml/src/ggml-sycl/ggml-sycl.cpp"
+LLAMA = "src/llama-context.cpp"  # the scheduler's owner: read with SOURCE, as one text, for the free-path contract
 REG_FN = "ggml_backend_sycl_reg_get_proc_address"
 IMPL_SIG = r"\bggml_sycl_set_runtime_context_for_model_impl\s*\("
 CARRY_SIG = r"\bstatic\s+bool\s+ggml_sycl_host_tenants_carry\s*\("
@@ -92,6 +110,13 @@ INSTALL_BLOCK = (
     "                    n_ctx, n_ubatch);\n"
     "                return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\n"
     "            }\n" + SECTION_SET)
+DTOR_SIG = r"\bllama_context::~llama_context\s*\("
+REIMPL_SIG = r"\bsched_reserve_result\s+llama_context::sched_reserve_impl\s*\("
+SYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_synchronize\s*\("
+SET_ASYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_set_tensor_async\s*\("
+SUPPORTS_SIG = r"\bstatic\s+bool\s+ggml_backend_sycl_device_supports_buft\s*\("
+CPY_ASYNC_DEF = "static bool ggml_backend_sycl_cpy_tensor_async("
+GET_ASYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_get_tensor_async\s*\("
 LOAD_END_SIG = r"\bggml_sycl_lifecycle_result\s+ggml_backend_sycl_model_load_end\s*\("
 TXN_SIG = r"\bggml_sycl_txn_result\s+ggml_sycl_run_runtime_context_transaction\s*\("
 CENTRY_SIG = r"\bvoid\s+ggml_backend_sycl_set_runtime_context\s*\("
@@ -185,6 +210,28 @@ def min_depth(text):
             low = min(low, depth)
         i += 1
     return low
+
+
+def net_depth(text):
+    """Opened minus closed braces in `text`; string and character literals are skipped."""
+    depth = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '"' or c == "'":
+            quote = c
+            i += 1
+            while i < n and text[i] != quote:
+                if text[i] == "\\":
+                    i += 1
+                i += 1
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        i += 1
+    return depth
 
 
 def header_proc_names(header_raw):
@@ -337,6 +384,58 @@ def host_tier_pins(source, alloc, freeb, reserve, fails):
         "L4 claim scope: close does not check that the scope is the thread's open one")
 
 
+def free_path_pins(source, freeb, fails):
+    """The free-path contract of the SYCL_Host tenant buffer (llama.cpp-moua, the L4 free_buffer ruling): its free
+    releases the slot with event 0 and never waits on the host, so the synchronize that makes that safe is
+    pinned at each place a scheduler's compute buffer can be freed, and the queues that synchronize drains are
+    pinned at the backend.  llama-context.cpp is read with the backend source as one text.  The pins check the
+    shape the argument rests on; the argument itself is the comment above ggml_backend_sycl_host_buffer_free_buffer.
+
+      * release goes only through tenant_claim_scope::release, once, with event 0
+      * ~llama_context synchronizes (every backend) before its members, the scheduler among them, are destroyed
+      * sched_reserve_impl synchronizes before it first touches the scheduler, and so does release_rung_buffers
+      * ggml_backend_sycl_synchronize drains stream 0 (or the deferred decode event) and the CPU-expert flush
+      * nothing but the SYCL device, host-compute and cpu-offload buffer types reaches set/get_tensor_async, the
+        CpuActivation clone is not a buffer type the device supports, and cpy_tensor_async is not wired
+    """
+    if freeb is not None:
+        if len(re.findall(r"\brelease\(", freeb)) != 1 or re.search(r"unified_free|zone_free|sycl::free|\bfree\(", freeb):
+            fails.append("L4 free path: the SYCL_Host free_buffer releases other than once through tenant_claim_scope::release")
+    dtor = function_body(source, DTOR_SIG)
+    pin(fails, dtor, r"^[^{]*\{\s*synchronize\(\);",
+        "L4 free path: ~llama_context does not synchronize() first, before its scheduler's compute buffers are freed")
+    reimpl = function_body(source, REIMPL_SIG)
+    if reimpl is None:
+        fails.append("L4 free path: llama_context::sched_reserve_impl not found")
+    else:
+        sy = reimpl.find("synchronize();")
+        first = min([i for i in (reimpl.find("sched.reset("), reimpl.find("ggml_backend_sched_")) if i >= 0] or [-1])
+        if sy < 0 or first < 0 or sy > first:
+            fails.append("L4 free path: sched_reserve_impl does not synchronize() before it first touches the scheduler")
+    pin(fails, source, r"auto release_rung_buffers = \[&\]\(\) \{\s*synchronize\(\);\s*for \(auto & res : gf_res_prev\)",
+        "L4 free path: release_rung_buffers does not synchronize() before it frees the rung's buffers")
+    sync = function_body(source, SYNC_SIG)
+    pin(fails, sync, r"CHECK_TRY_ERROR\(stream->wait_and_throw\(\)\)",
+        "L4 free path: the backend synchronize no longer drains stream 0")
+    pin(fails, sync, r"ggml_sycl_cpu_tg_flush_pending\(\);",
+        "L4 free path: the backend synchronize no longer flushes the CPU-expert work")
+    pin(fails, sync, r"sycl_ctx->last_graph_event->wait_and_throw\(\)",
+        "L4 free path: the backend synchronize no longer drains the deferred decode event")
+    for sig, what in ((SET_ASYNC_SIG, "set_tensor_async"), (GET_ASYNC_SIG, "get_tensor_async")):
+        body = function_body(source, sig)
+        pin(fails, body, r"GGML_ASSERT\(\(buf->buft == ggml_backend_sycl_buffer_type\(sycl_ctx->device\) \|\|\s*"
+                         r"buf->buft == ggml_backend_sycl_host_compute_buffer_type\(sycl_ctx->device\) \|\|\s*"
+                         r"buf->buft == ggml_backend_sycl_cpu_offload_compute_buffer_type\(sycl_ctx->device\)\) &&",
+            "L4 free path: %s does not assert exactly the SYCL device, host-compute and cpu-offload buffer types" % what)
+        if body is not None and "cpu_activation_buffer_type" in body:
+            fails.append("L4 free path: %s accepts the CpuActivation buffer type" % what)
+    supports = function_body(source, SUPPORTS_SIG)
+    if supports is None or "cpu_activation_buffer_type" in supports:
+        fails.append("L4 free path: the device supports the CpuActivation buffer type (a SYCL op could read a CPU activation)")
+    if source.count("ggml_backend_sycl_cpy_tensor_async") != 1:
+        fails.append("L4 free path: cpy_tensor_async is referenced beyond its definition (the backend's interface wires it)")
+
+
 def check(header_raw, source):
     """`source` is the comment-stripped, normalized text: a mutation is one edit of it, so the (slow) strip is
     done once, not once per mutant."""
@@ -420,6 +519,8 @@ def check(header_raw, source):
             # held at the use: a lock_guard precedes it and no block that holds the lock closes between the two
             if not before or min_depth(body[before[-1].end():u]) < 0:
                 held = False
+            elif body[:before[-1].start()].rstrip()[-1:] not in (";", "{", "}"):
+                held = False  # the guard is the substatement of an `if`/`for`/`while`/`else`: not unconditional
         if not held:
             fails.append("L4 ledger lock: %s uses the ledger without state.mutex held at the use" % name)
     for name in ("ggml_sycl_load_record_compute_term", "ggml_backend_sycl_load_late_check"):
@@ -492,6 +593,12 @@ def check(header_raw, source):
             fails.append("L4 ledger: model_load_end does not clear the load's compute terms (no guard)")
         elif not (f >= 0 and f < g and (eff < 0 or g < eff)):
             fails.append("L4 ledger: the clear guard must come after the finisher check and before the effects")
+        t = end.find("try {")
+        if g >= 0 and t >= 0:
+            between = end[t + len("try {"):g]
+            if net_depth(between) != 0 or between.rstrip()[-1:] not in (";", "{", "}"):
+                fails.append("L4 ledger: the clear guard is not directly in the try body (a nested block or an `if` ends it "
+                             "before the registry's end)")
         tries = len(re.findall(r"\btry\b", end))
         catches = re.findall(r"\bcatch\s*\(([^)]*)\)", end)
         if tries != 1 or catches != ["..."]:
@@ -503,10 +610,17 @@ def check(header_raw, source):
             fails.append("L4 ledger: model_load_end's handler rethrows")
         if not re.match(r"\s*ggml_sycl_load_ledger_clear_after_end after_end;", handler):
             fails.append("L4 ledger: after_end is not the handler's first statement")
-        if not re.search(r"if \(ticket\.finisher\) \{\s*after_end\.txn = txn\.id;\s*"
-                         r"\(void\) ggml_sycl_abort_owner_effects_noexcept\(ticket\.token, \"load_end/exception-rollback\"\);",
+        if not re.match(r"\s*ggml_sycl_load_ledger_clear_after_end after_end;\s*if \(ticket\.finisher\) \{\s*after_end\.txn = txn\.id;\s*\}"
+                        r"\s*g_sycl_abort_load_exit = false;\s*if \(placement_inserted\) \{", handler):
+            fails.append("L4 ledger: the handler does not arm after_end for the finisher before anything that can throw "
+                         "(or something sits between the declaration, the arming and the first work)")
+        if handler.count("after_end.txn") != 2:
+            fails.append("L4 ledger: after_end.txn is set other than once at the top and once in the recovery arm "
+                         "(the finisher arm must not reset it)")
+        if not re.search(r"if \(ticket\.finisher\) \{\s*\(void\) ggml_sycl_abort_owner_effects_noexcept\(ticket\.token, "
+                         r"\"load_end/exception-rollback\"\);\s*const auto failed = registry->finalize_end\(ticket, false\);",
                          handler):
-            fails.append("L4 ledger: the finisher arm does not set after_end.txn unconditionally before its end call")
+            fails.append("L4 ledger: the finisher arm does not abort the owner effects and then end the transaction")
         if not re.search(r"if \(!recovery\.finisher\) \{\s*return [^;]*;\s*\}\s*after_end\.txn = txn\.id;\s*"
                          r"ggml_sycl_finalize_binding_failure_abort\(\*registry, recovery\);", handler):
             fails.append("L4 ledger: the recovery arm does not set after_end.txn unconditionally before its abort")
@@ -581,6 +695,7 @@ def check(header_raw, source):
     if freeb is None or "ggml_sycl::tenant_claim_scope::release(*ctx->claim" not in freeb:
         fails.append("L4 host tier: the SYCL_Host free_buffer does not release its claim")
     host_tier_pins(source, alloc, freeb, reserve, fails)
+    free_path_pins(source, freeb, fails)
 
     # transaction tail
     txn = function_body(source, r"\bggml_sycl_txn_result\s+ggml_sycl_run_runtime_context_transaction\s*\(")
@@ -625,9 +740,10 @@ def check(header_raw, source):
 
     impl_fn = function_body(source, r"\bggml_sycl_set_runtime_context_for_model_impl\s*\(") or ""
     if "ggml_backend_sycl_set_runtime_context(" in impl_fn or not re.search(
-            r"try \{\s*\(void\) ggml_sycl_run_runtime_context_transaction\(backend,", impl_fn):
+            r"try \{\s*\(void\) ggml_sycl_run_runtime_context_transaction\(backend,[^;]*;\s*\} catch \(\.\.\.\) \{\s*"
+            r"return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;\s*\}\s*const bool inner_ok", impl_fn):
         fails.append("L4 C entry: the descriptor publish must call the transaction in its own try, not the C entry that "
-                     "swallows a failed drop it has to answer EFFECT_FAILED for")
+                     "swallows a failed drop it has to answer EFFECT_FAILED for, and that try's catch answers EFFECT_FAILED")
 
     late = function_body(source, r"\benum\s+ggml_sycl_late_check_result\s+ggml_backend_sycl_load_late_check\s*\(")
     if late is None:
@@ -860,12 +976,6 @@ def mutations(header_raw, source):
         ("the recovery arm's arm under if (false)", "the recovery arm does not set after_end.txn",
          LOAD_END_SIG, "            after_end.txn = txn.id;\n            ggml_sycl_finalize_binding_failure_abort",
          "            if (false) {\n                after_end.txn = txn.id;\n            }\n            ggml_sycl_finalize_binding_failure_abort"),
-        ("the finisher arm no longer arms the clear", "the finisher arm does not set after_end.txn",
-         LOAD_END_SIG, "            after_end.txn = txn.id;\n            (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token, \"load_end/exception-rollback\");",
-         "            (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token, \"load_end/exception-rollback\");"),
-        ("the finisher arm arms the clear after its end", "the finisher arm does not set after_end.txn",
-         LOAD_END_SIG, "            after_end.txn = txn.id;\n            (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token, \"load_end/exception-rollback\");",
-         "            (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token, \"load_end/exception-rollback\");\n            after_end.txn = txn.id;"),
         ("the handler's after_end declaration dropped", "after_end is not the handler's first statement",
          LOAD_END_SIG, "        ggml_sycl_load_ledger_clear_after_end after_end;\n", ""),
         ("the handler rethrows without clearing", "model_load_end's handler rethrows",
@@ -909,17 +1019,87 @@ def mutations(header_raw, source):
          r"\bggml_sycl_set_runtime_context_for_model_impl\s*\(",
          "        (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,",
          "        ggml_backend_sycl_set_runtime_context(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,"),
+        ("the finisher is never armed at the top of the handler", "the handler does not arm after_end for the finisher",
+         LOAD_END_SIG, "        if (ticket.finisher) {\n            after_end.txn = txn.id;", "        if (ticket.finisher) {\n            (void) 0;"),
+        ("the finisher is armed under if (false)", "the handler does not arm after_end for the finisher",
+         LOAD_END_SIG, "        if (ticket.finisher) {\n            after_end.txn = txn.id;", "        if (false) {\n            after_end.txn = txn.id;"),
+        ("an early return before the handler arms", "the handler does not arm after_end for the finisher",
+         LOAD_END_SIG, "        ggml_sycl_load_ledger_clear_after_end after_end;\n",
+         "        ggml_sycl_load_ledger_clear_after_end after_end;\n        if (!registry) {\n            return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;\n        }\n"),
+        ("a goto before the handler arms", "the handler does not arm after_end for the finisher",
+         LOAD_END_SIG, "        ggml_sycl_load_ledger_clear_after_end after_end;\n",
+         "        ggml_sycl_load_ledger_clear_after_end after_end;\n        goto h_out;\n"),
+        ("the finisher arm resets the arming", "after_end.txn is set other than once at the top",
+         LOAD_END_SIG, "            const auto failed = registry->finalize_end(ticket, false);",
+         "            after_end.txn = 0;\n            const auto failed = registry->finalize_end(ticket, false);"),
+        ("the finisher arm skips the owner-effects abort", "the finisher arm does not abort the owner effects and then end",
+         LOAD_END_SIG, "            (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token, \"load_end/exception-rollback\");\n", ""),
+        ("the guard is braced away from the end call", "the clear guard is not directly in the try body",
+         LOAD_END_SIG, "        ggml_sycl_load_ledger_clear_guard ledger_clear{ txn.id };\n",
+         "        { ggml_sycl_load_ledger_clear_guard ledger_clear{ txn.id }; }\n"),
+        ("the guard is conditional", "the clear guard is not directly in the try body",
+         LOAD_END_SIG, "        ggml_sycl_load_ledger_clear_guard ledger_clear{ txn.id };\n",
+         "        if (txn.id != 0) ggml_sycl_load_ledger_clear_guard ledger_clear{ txn.id };\n"),
+        ("the impl's catch answers OK", "that try's catch answers EFFECT_FAILED",
+         IMPL_SIG, "return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;\n    }\n    const bool inner_ok",
+         "return GGML_SYCL_LIFECYCLE_OK;\n    }\n    const bool inner_ok"),
+        ("the record's lock is a substatement of an if", "ggml_sycl_load_record_compute_term uses the ledger without state.mutex held at the use",
+         SIG_RECORD, "    std::lock_guard<std::mutex> lock(state.mutex);\n", "    if (false) std::lock_guard<std::mutex> lock(state.mutex);\n"),
+        ("the clear's lock is a substatement of an if", "ggml_sycl_load_clear_compute_terms uses the ledger without state.mutex held at the use",
+         SIG_CLEAR, "        std::lock_guard<std::mutex> lock(state.mutex);\n", "        if (false) std::lock_guard<std::mutex> lock(state.mutex);\n"),
+        ("the late check's lock is a substatement of an if", "ggml_backend_sycl_load_late_check uses the ledger without state.mutex held at the use",
+         SIG_LATE, "            std::lock_guard<std::mutex> lock(state.mutex);\n", "            if (false) std::lock_guard<std::mutex> lock(state.mutex);\n"),
+        ("the count hook's lock is a substatement of an if", "ggml_backend_sycl_test_compute_term_count uses the ledger without state.mutex held at the use",
+         SIG_COUNT, "    std::lock_guard<std::mutex> lock(state.mutex);\n", "    if (false) std::lock_guard<std::mutex> lock(state.mutex);\n"),
+        ("the free releases with an event", "does not release then drop its claim as the first step", FREE_SIG,
+         "tenant_claim_scope::release(*ctx->claim, 0)", "tenant_claim_scope::release(*ctx->claim, ctx->last_event)"),
+        ("the free drops the release", "does not release its claim", FREE_SIG,
+         "        (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);\n", ""),
+        ("the free releases twice", "releases other than once through tenant_claim_scope::release", FREE_SIG,
+         "        (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);\n",
+         "        (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);\n        (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);\n"),
+        ("the free also frees through the allocator", "releases other than once through tenant_claim_scope::release", FREE_SIG,
+         "    ctx->buffer_handle = {};\n", "    ggml_sycl::unified_free(ctx->buffer_handle);\n    ctx->buffer_handle = {};\n"),
+        ("the destructor's first synchronize dropped", "~llama_context does not synchronize() first", DTOR_SIG,
+         re.compile(r"(?<=\n)    synchronize\(\);\n"), ""),
+        ("the destructor's first synchronize conditional", "~llama_context does not synchronize() first", DTOR_SIG,
+         re.compile(r"(?<=\n)    synchronize\(\);\n"), "    if (false) synchronize();\n"),
+        ("sched_reserve_impl's synchronize dropped", "sched_reserve_impl does not synchronize() before it first touches", REIMPL_SIG,
+         "    synchronize();\n", ""),
+        ("the backend synchronize skips stream 0", "the backend synchronize no longer drains stream 0", SYNC_SIG,
+         "CHECK_TRY_ERROR(stream->wait_and_throw())", "0"),
+        ("the backend synchronize skips the CPU-expert flush", "no longer flushes the CPU-expert work", SYNC_SIG,
+         "            ggml_sycl_cpu_tg_flush_pending();\n", ""),
+        ("the backend synchronize skips the deferred decode event", "no longer drains the deferred decode event", SYNC_SIG,
+         "sycl_ctx->last_graph_event->wait_and_throw()", "0"),
+        ("set_tensor_async takes the CpuActivation buffer type", "set_tensor_async accepts the CpuActivation", SET_ASYNC_SIG,
+         "\"unsupported buffer type\"", "\"unsupported buffer type\" || buf->buft == ggml_backend_sycl_cpu_activation_buffer_type()"),
+        ("get_tensor_async takes the CpuActivation buffer type", "accepts the CpuActivation buffer type", GET_ASYNC_SIG,
+         "    GGML_ASSERT((buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) ||",
+         "    GGML_ASSERT(buf->buft == ggml_backend_sycl_cpu_activation_buffer_type() || (buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) ||"),
+        ("the device supports the CpuActivation buffer type", "the device supports the CpuActivation buffer type", SUPPORTS_SIG,
+         "(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {\n",
+         "(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {\n    if (buft == ggml_backend_sycl_cpu_activation_buffer_type()) {\n        return true;\n    }\n"),
         ("the n_ctx entry stops delegating", "set_runtime_n_ctx does not delegate to the guarded C entry",
          r"\bvoid\s+ggml_backend_sycl_set_runtime_n_ctx\s*\(", "ggml_backend_sycl_set_runtime_context(backend,",
          "(void) ggml_sycl_run_runtime_context_transaction(backend,"),
     ]
     for label, msg, sig, old, new in scoped:
         span = function_span(src, sig)
-        if span is None or src[span[0]:span[1]].count(old) != 1:
+        if isinstance(old, str):
+            found = span is not None and src[span[0]:span[1]].count(old) == 1
+        else:  # a compiled pattern: the first match inside the function (its first statement, say)
+            found = span is not None and old.search(src[span[0]:span[1]]) is not None
+        if not found:
             muts.append(("PATTERN NOT FOUND: " + label, "PATTERN", header_raw, src))
         else:
             a, b = span
-            muts.append((label, msg, header_raw, src[:a] + src[a:b].replace(old, new, 1) + src[b:]))
+            body = src[a:b].replace(old, new, 1) if isinstance(old, str) else old.sub(new, src[a:b], count=1)
+            muts.append((label, msg, header_raw, src[:a] + body + src[b:]))
+    pairs.append(("the rung release's synchronize dropped", "release_rung_buffers does not synchronize()",
+                  "auto release_rung_buffers = [&]() {\n        synchronize();\n", "auto release_rung_buffers = [&]() {\n"))
+    pairs.append(("the backend interface wires cpy_tensor_async", "cpy_tensor_async is referenced beyond its definition",
+                  CPY_ASYNC_DEF, "static void h_wire_cpy() { (void) ggml_backend_sycl_cpy_tensor_async; }\n" + CPY_ASYNC_DEF))
     for label, msg, old, new in pairs:
         if label == "the first publish reserves under L1":
             lock = ("        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);\n"
@@ -957,7 +1137,7 @@ def normalize(text):
 def read(root, rel):
     with open(os.path.join(root, rel), encoding="utf-8") as f:
         text = f.read()
-    return normalize(text) if rel == SOURCE else text
+    return normalize(text) if rel in (SOURCE, LLAMA) else text
 
 
 def main():
@@ -968,7 +1148,8 @@ def main():
     ap.add_argument("--verbose", action="store_true", help="name each mutant and the failure that caught it")
     args = ap.parse_args()
     header_raw = read(args.root, HEADER)
-    source_raw = strip_comments(read(args.root, SOURCE))  # once: a mutation edits this text
+    # once: a mutation edits this text.  The scheduler's owner is appended: the free-path contract names both.
+    source_raw = strip_comments(read(args.root, SOURCE)) + "\n" + strip_comments(read(args.root, LLAMA))
     status = 0
     if not args.mutations_only:
         fails = check(header_raw, source_raw)

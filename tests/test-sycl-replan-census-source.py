@@ -577,7 +577,7 @@ def gate31(files, bad):
         bodies = func_bodies(c, fn)
         if len(bodies) != 1:
             bad("gate 31: %s has %d definitions" % (fn, len(bodies)))
-        elif not re.search(r"\breturn\s+ggml_sycl_set_runtime_context_for_model_impl\(", text_of(c, bodies[0])):
+        elif not re.search(r"[;{}]\s*return\s+ggml_sycl_set_runtime_context_for_model_impl\(", text_of(c, bodies[0])):
             bad("gate 31: %s does not return ggml_sycl_set_runtime_context_for_model_impl(...)" % fn)
     # The witness macro and its sites are always compiled.
     mm = re.search(r"#define\s+GGML_SYCL_WITNESS\s*\(.*?(?:\n(?!\s*#)[^\n]*\\)*\n[^\n]*\n", files[UC_H])
@@ -1452,6 +1452,12 @@ def mutants(files):
            "tests the token with the default kind")
     yield ("a pool gate that drops its site",
            edit(files, POOL, "site=", "where=", "g37b", count=1), "does not name its site")
+    yield ("a wrapper whose impl return sits under an if",
+           edit(files, M, "    return ggml_sycl_set_runtime_context_for_model_impl(backend, model, n_ctx, n_ubatch, n_seq_max, kv_unified,\n"
+                "                                                        swa_full, flash_attn_enabled, nullptr, false);",
+                "    if (false) return ggml_sycl_set_runtime_context_for_model_impl(backend, model, n_ctx, n_ubatch, n_seq_max, kv_unified,\n"
+                "                                                        swa_full, flash_attn_enabled, nullptr, false);", "g31w"),
+           "does not return ggml_sycl_set_runtime_context_for_model_impl")
 
 
 _SWEEP = []

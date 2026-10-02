@@ -135,89 +135,104 @@ assert RUNTIME_CODE.count("unified_alloc(") == 54
 assert RUNTIME_CODE.count("from_legacy_owned_alloc(") == 42
 
 
-# The owner-first call sites of ggml-sycl.cpp are named, not counted: a count says only that the number held,
-# so the base drifted from 24 to 25 unnoticed and the next site made it 26.  Each entry is (enclosing
-# definition, how many sites it holds, why it allocates through unified_allocate_owner).  A site added, moved
-# into another function or removed fails the gate by name, and a reviewer adds the entry with its reason.
-# The enclosing definition is the outermost named scope around the call, a function or a struct: an
-# allocation inside a lambda is its function's.
-OWNER_SITES = (
-    ("struct managed_host_pinned_buffer", 1,
-     "owner-first host-pinned buffer for a managed host allocation (the owner, not a raw pointer, is what the buffer holds)"),
-    ("ggml_sycl_reserve_host_tenants", 1,
-     "the host tier of a context's tenants (llama.cpp-moua L4 step 3c): one owner-first carve per host slot, held by the "
-     "registry entry that carries the table, so no raw pointer or side cache holds the room; must_host_pinned and the "
-     "pinned pool, category HOST_COMPUTE, the cohort's own name"),
-    ("struct ggml_sycl_pool_leg", 3, "the legacy pool's device allocations, owner-first (STAGING role)"),
-    ("struct ggml_sycl_pool_host", 1, "the host pool's pinned allocation, owner-first"),
-    ("ggml_backend_sycl_context::get_staging_buffer", 1, "runtime staging buffer, owner-first"),
-    ("ggml_backend_sycl_context::ensure_mmvq_host_staging", 1, "MMVQ host staging, owner-first"),
-    ("ggml_backend_sycl_context::ensure_readback_staging", 1, "readback staging, owner-first"),
-    ("struct ggml_sycl_scoped_staging_handle", 1, "scoped staging handle, owner-first"),
-    ("ggml_sycl_try_route_mul_mat_weight_owner", 1, "device staging for a weight-owner mul_mat route, owner-first"),
-    ("convert_tensor_layout", 1, "layout-conversion staging, owner-first"),
-    ("ggml_sycl_ensure_moe_ptr_table", 1, "MoE pointer table, owner-first"),
-    ("ggml_sycl_copy_ids_to_host", 1, "MoE ids staging, owner-first"),
-    ("ggml_sycl_get_moe_ids_device_ptr_exact", 1, "MoE ids device staging, owner-first"),
-    ("graph_preload_moe_experts", 1, "expert preload staging, owner-first"),
-    ("ensure_split_persistent_resources", 1, "split-mode persistent resources, owner-first"),
-    ("split_secondary_gpu_ensure", 1, "split secondary-GPU buffers, owner-first"),
-    ("try_xmx_sorted_moe", 1, "sorted-MoE scratch from the SCRATCH zone, owner-first"),
-    ("struct secondary_layer_tg_buffers", 1, "secondary-GPU token-generation buffers, owner-first"),
-    ("dispatch_experts_secondary_gpu_impl", 1, "secondary-GPU expert dispatch buffers, owner-first"),
-    ("ggml_sycl_moe_down_sum_shadow_record", 1, "MoE down-sum shadow record, owner-first"),
-    ("ggml_sycl_block_exec_alloc_host_stage_handle", 1, "block-executor host stage, owner-first"),
-    ("ggml_backend_sycl_graph_compute_impl", 1, "graph-compute RUNTIME-zone staging, owner-first"),
-    ("ggml_sycl_mmvq_soa_pre_allocate_buffers", 1, "MMVQ SOA pre-allocation, owner-first"),
-    ("ggml_backend_sycl_test_park_tenant_staging", 1,
-     "PRIVATE_TESTING seam: parks a host-pinned staging entry under a tenant cohort for a test, owner-first; absent from "
-     "a shipped library"),
+# unified_allocate_owner( in ggml-sycl.cpp is pinned as a baseline count plus a NAMED-site list. A site that is
+# not one of the baseline runtime sites is added as one (function, reason) line in NAMED_OWNER_FIRST_SITES below,
+# never by raising the baseline: a count says nothing about WHICH site was added or why it is legitimate, and the
+# list is a plain per-line merge when two branches each add a site. The census counts the code with every named
+# function's body cut out, so the baseline stays at the reviewed 24 runtime sites. Each named function must hold
+# exactly one owner-first allocation, refuse on failure, and hand the owner over only through
+# mem_handle::from_owned_alloc, with no legacy unified_alloc( / from_legacy_owned_alloc in it; a function named
+# ggml_backend_sycl_test_* is a PRIVATE_TESTING seam and must sit inside that guard.
+OWNER_FIRST_BASELINE_SITES = 24
+NAMED_OWNER_FIRST_SITES = (
+    ("ggml_backend_sycl_test_park_tenant_staging",
+     "zhcn C7a (cec4a5f10): parks one host-pinned STAGING entry under a tenant cohort for the replay-only-call "
+     "test; owner-first, handed over via from_owned_alloc"),
+    ("ggml_sycl_reserve_host_tenants",
+     "moua L4 step 3c: the host tier of a context's tenants -- one owner-first carve per host slot (must_host_pinned, "
+     "pinned pool, category HOST_COMPUTE, the cohort's own name), held by the registry entry that carries the table, "
+     "so no raw pointer or side cache holds the room; refuses on failure, handed over via from_owned_alloc"),
 )
 
 
-def _owner_site_name(code: str, pos: int) -> str:
-    """The outermost named scope around `pos` in comment-blanked source: the header of the outermost enclosing
-    block that is not a namespace or an extern block, reduced to `struct X` or the qualified function name."""
-    headers, depth, index = [], 0, pos
-    while index > 0:
-        index -= 1
-        char = code[index]
-        if char == "}":
-            depth += 1
-        elif char == "{":
-            if depth:
-                depth -= 1
-                continue
-            begin = index
-            while begin > 0 and code[begin - 1] not in ";{}":
-                begin -= 1
-            header = " ".join(
-                line for line in code[begin:index].split("\n") if not line.lstrip().startswith("#")).split()
-            header = " ".join(header)
-            if header and not header.startswith(("namespace", "extern")):
-                headers.append(header)
-    if not headers:
-        return "?"
-    header = headers[-1]
-    match = re.match(r"struct\s+(\w+)", header)
-    if match:
-        return "struct " + match.group(1)
-    match = re.search(r"([\w:~]+)\s*\(", header)
-    return match.group(1) if match else header
+def function_body_span(code: str, name: str):
+    """(start of the definition, end of its closing brace) of the one function `name` defined in `code`."""
+    # A definition is not a call: `if (!name(...)) {` also ends in `) {`, so a head preceded by `!` or `(` is a call.
+    heads = list(re.finditer(r"(?<![!(])\b%s\([^;{}]*\)\s*(?:noexcept\s*)?\{" % re.escape(name), code))
+    assert len(heads) == 1, "%s: expected one definition, found %d" % (name, len(heads))
+    start = heads[0].start()
+    depth, index = 0, heads[0].end() - 1
+    while True:
+        depth += (code[index] == "{") - (code[index] == "}")
+        index += 1
+        if depth == 0:
+            return start, index
 
 
-owner_sites = {}
-for match in re.finditer(r"unified_allocate_owner\(", RUNTIME_CODE):
-    name = _owner_site_name(RUNTIME_CODE, match.start())
-    owner_sites[name] = owner_sites.get(name, 0) + 1
-assert sum(owner_sites.values()) > 0, "the owner-site scan matched nothing"
-named = {name: count for name, count, _reason in OWNER_SITES}
-assert len(named) == len(OWNER_SITES), "a function is named twice in OWNER_SITES"
-assert all(reason.strip() for _name, _count, reason in OWNER_SITES), "an OWNER_SITES entry has no reason"
-assert owner_sites == named, (
-    "unified_allocate_owner( sites changed.  added or more: %s; removed or fewer: %s"
-    % ({k: v for k, v in owner_sites.items() if named.get(k, 0) < v},
-       {k: v for k, v in named.items() if owner_sites.get(k, 0) < v}))
+def inside_private_testing(code: str, position: int) -> bool:
+    """True when `position` sits in an `#if defined(GGML_SYCL_PRIVATE_TESTING)` / `#ifdef` block that no #else/#elif
+    has turned over: the preprocessor conditions open at that point are walked as a stack."""
+    stack = []  # [condition text, turned over by #else/#elif]
+    for line in code[:position].split("\n"):
+        directive = re.match(r"\s*#\s*(\w+)\s*(.*)", line)
+        if not directive:
+            continue
+        kind, rest = directive.group(1), " ".join(directive.group(2).split())
+        if kind in ("if", "ifdef", "ifndef"):
+            stack.append([("defined(%s)" % rest) if kind == "ifdef" else (None if kind == "ifndef" else rest), False])
+        elif kind in ("else", "elif") and stack:
+            stack[-1][1] = True
+        elif kind == "endif" and stack:
+            stack.pop()
+    return any(cond == "defined(GGML_SYCL_PRIVATE_TESTING)" and not turned for cond, turned in stack)
+
+
+def refusal_branch_refuses(body: str, start: int) -> bool:
+    """The `if (!allocation) { ... }` branch that begins at `start` in `body` returns or throws."""
+    open_brace = body.index("{", start)
+    depth, index = 0, open_brace
+    while True:
+        depth += (body[index] == "{") - (body[index] == "}")
+        index += 1
+        if depth == 0:
+            break
+    return re.search(r"\b(return|throw)\b", body[open_brace:index]) is not None
+
+
+RUNTIME_PRODUCTION_CODE = RUNTIME_CODE
+_names      = [name for name, _reason in NAMED_OWNER_FIRST_SITES]
+_duplicates = sorted({name for name in _names if _names.count(name) > 1})
+assert not _duplicates, "NAMED_OWNER_FIRST_SITES lists %s more than once" % ", ".join(_duplicates)
+_spans = []
+for _function, _reason in NAMED_OWNER_FIRST_SITES:
+    assert _reason, "%s has no reason" % _function
+    _start, _end = function_body_span(RUNTIME_CODE, _function)
+    _body = RUNTIME_CODE[_start:_end]
+    assert _body.count("unified_allocate_owner(") == 1, "%s: not exactly one owner-first allocation" % _function
+    assert "unified_alloc(" not in _body and "from_legacy_owned_alloc" not in _body, _function
+    _allocation = _body.index("unified_allocate_owner(")
+    _refused    = _body.index("if (!allocation)", _allocation)
+    _wrapped    = _body.index("from_owned_alloc(std::move(allocation.owner)", _refused)
+    assert _allocation < _refused < _wrapped, "%s: allocate, refuse-check, from_owned_alloc out of order" % _function
+    assert refusal_branch_refuses(_body, _refused), "%s: the `if (!allocation)` branch does not return or throw" % _function
+    if _function.startswith("ggml_backend_sycl_test_"):
+        assert inside_private_testing(RUNTIME_CODE, _start), \
+            "%s is a test seam outside GGML_SYCL_PRIVATE_TESTING" % _function
+    _spans.append((_start, _end))
+# Cut the named bodies out of the ORIGINAL text; each name is unique, so no span is cut twice.
+_kept, _from = [], 0
+for _start, _end in sorted(_spans):
+    assert _start >= _from, "named owner-first functions overlap"
+    _kept.append(RUNTIME_CODE[_from:_start])
+    _from = _end
+_kept.append(RUNTIME_CODE[_from:])
+RUNTIME_PRODUCTION_CODE = "".join(_kept)
+assert RUNTIME_CODE.count("unified_allocate_owner(") == \
+    RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner(") + len(_spans)
+
+assert RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner(") == OWNER_FIRST_BASELINE_SITES, (
+    "ggml-sycl.cpp has %d unified_allocate_owner( call sites outside the named functions, the reviewed inventory is %d"
+    % (RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner("), OWNER_FIRST_BASELINE_SITES))
 print("PASS owner-allocation-sites-are-named")
 assert CACHE.count("unified_alloc(") == 28
 assert CACHE.count("from_legacy_owned_alloc(") == 12

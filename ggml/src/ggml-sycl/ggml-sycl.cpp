@@ -13402,8 +13402,10 @@ struct ggml_sycl_load_ledger_clear_guard {
     }
 };
 
-// The end call's handler arms it (txn non-zero) with the transaction it is about to end, and the clear runs when
-// the handler is left, after the end call: order is end, then clear, on every path.  If finalize_end itself
+// The end call's handler arms it (txn non-zero) with the transaction it is about to end -- as its first act when
+// this call is the finisher, so a throw from anything the handler does before the end still clears -- and the
+// clear runs when the handler is left, after the end call: order is end, then clear, on every path.  If the
+// registry's end call (finalize_end, or ggml_sycl_finalize_binding_failure_abort in the recovery arm) itself
 // throws out of the handler the clear still runs, but the registry never ended the transaction, so a record in
 // that case can still find it open; that residue is the registry's own failure, not one this ordering can close.
 struct ggml_sycl_load_ledger_clear_after_end {
@@ -13973,6 +13975,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         return ggml_sycl_lifecycle_c_result(result.code);
     } catch (...) {
         ggml_sycl_load_ledger_clear_after_end after_end;
+        if (ticket.finisher) {
+            after_end.txn = txn.id;  // armed before anything below that can throw: end, then clear, on every path
+        }
         g_sycl_abort_load_exit = false;
         if (placement_inserted) {
             const auto failed_plan = ggml_sycl::lifecycle_find_placement_plan(
@@ -13985,7 +13990,6 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             ggml_sycl::lifecycle_abort_placement_plan(ticket.token.load.value);
         }
         if (ticket.finisher) {
-            after_end.txn = txn.id;
             (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token, "load_end/exception-rollback");
             const auto failed = registry->finalize_end(ticket, false);
             ggml_sycl_enqueue_quarantined_result(*registry, failed, model);
@@ -44988,14 +44992,35 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
         return;
     }
     if (ctx->claim) {
-        // No wait here, on purpose (no host waits; event-chain instead).  A queue-wide wait_and_throw would
-        // also wait on, and rethrow, other contexts' work on the device, and it covers only the cache queue
-        // and the default queue: the other streams, the split, MoE, CPU-dispatch, tensor-parallel and copy
-        // queues would still be unwaited, so it was never the guarantee it read as.  The contract is the
-        // scheduler's: a compute buffer is freed after ggml_backend_synchronize, so the last event of the
-        // work that used the slot is complete when this runs.  The release records no event, and the slot's
-        // wait_event is carried by the next claim but not consumed: chaining on it needs a GPU consumer of the
-        // buffer, which is the claim scope's caller (llama.cpp-moua L6).
+        // No wait here, on purpose (no host waits; event-chain instead), and the slot goes back with event 0.  That
+        // is sound because of a contract that holds on every path to this function, proven against the code and
+        // pinned by scripts/check-sycl-l4-proc-registration.py:
+        //   A claimed compute buffer is freed only after the backend synchronize of every backend of its
+        //   scheduler, and no queue that outlives that synchronize touches a claimed slot.
+        // The paths to here, and the synchronize before each: ggml_backend_sched_reserve and _reserve_size
+        // (ggml_backend_sched_synchronize first); the realloc in ggml_backend_sched_alloc_splits
+        // (ggml_backend_synchronize of every backend before ggml_gallocr_reserve_n -- the other realloc, the
+        // automatic reserve in ggml_gallocr_alloc_graph, needs a single-buffer allocator, which llama.cpp never
+        // builds because the CPU backend is always one of the scheduler's backends); llama_context's scheduler
+        // replacement in sched_reserve_impl (synchronize() before it; the pipeline-parallel retry replaces a
+        // scheduler that only failed to reserve, so it never computed) and in release_rung_buffers (synchronize()
+        // first); and ~llama_context (synchronize() first).  Nothing else frees a compute buffer:
+        // ggml_backend_sched_reset only resets the allocator.
+        // What the SYCL synchronize drains: stream 0 (or the deferred last graph event) and
+        // ggml_sycl_cpu_tg_flush_pending (the CPU-expert and scatter pipelines, detached threads included).  It
+        // does not drain the other streams, the unified-cache queue, or the shared-context, TP and PP queues, so
+        // the contract also needs those to never touch a slot, and they do not: the CPU backend's compute buft is
+        // the CpuActivation clone, which ggml_backend_sycl_device_supports_buft does not list, so no SYCL op reads
+        // or writes an activation in it and the scheduler's split-input copy lands it in a SYCL device compute
+        // buffer; set/get_tensor_async assert a SYCL device, host-compute or cpu-offload buft and cpy_tensor_async
+        // is NULL, so no async copy has a SYCL_Host tensor at either end; the scheduler's cross-backend copy is a
+        // blocking ggml_backend_tensor_copy between the two backends' synchronizes, through accessors that wait
+        // the cache and default queues themselves; ggml-cpu's graph_compute is synchronous (its synchronize is
+        // NULL); and the staging the scatter threads touch is their own owner-first host handles.
+        // A queue-wide wait here would be both too little (it covered the cache and default queues only) and too
+        // much (it waited on, and rethrew, other contexts' work).  A caller that does put a SYCL queue on a claimed
+        // buffer must make the backend synchronize drain that queue, or chain on the slot's wait_event (the L6
+        // event ledger); it must not add a wait here.
         (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);
         ctx->claim.reset();
     }

@@ -378,14 +378,14 @@ void case_registry_install_and_take() {
     auto               t = table_of({ 10 });
     CHECK(!reg.install_tenant_slots(1, nullptr, 5) && reg.size() == 0,
           "a null table installs nothing and creates no entry");
-    CHECK(reg.install_tenant_slots(1, t, 77), "the first install succeeds");
+    CHECK(reg.install_tenant_slots(1, t, 7001), "the first install succeeds");
     CHECK(reg.tenants(1) == t && reg.size() == 1, "the entry holds the table");
     kv_region_entry seen;
-    CHECK(reg.lookup(1, seen) && seen.tenant_key == 77, "and the key it was built for");
+    CHECK(reg.lookup(1, seen) && seen.tenant_key == 7001, "and the key it was built for");
 
     auto other = table_of({ 20 });
     CHECK(!reg.install_tenant_slots(1, other, 88), "a second install over a held table is refused");
-    CHECK(reg.tenants(1) == t && reg.lookup(1, seen) && seen.tenant_key == 77, "and changes nothing");
+    CHECK(reg.tenants(1) == t && reg.lookup(1, seen) && seen.tenant_key == 7001, "and changes nothing");
     CHECK(reg.install_tenant_slots(2, other, 88) && reg.tenants(2) == other, "another context's entry is separate");
 
     auto taken = reg.take_tenant_slots(1);

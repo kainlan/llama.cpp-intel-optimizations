@@ -1246,11 +1246,11 @@ int case_claim_generation_token() {
     CHECK(slots.claimed("rows", 0), "the claim is still live after every wrong release");
 
     // The stale holder: A releases, B claims, A's late release must not free B's claim.
-    CHECK(slots.release_claim("rows", 0, a.generation, 77), "the live token releases, with an event");
+    CHECK(slots.release_claim("rows", 0, a.generation, 7001), "the live token releases, with an event");
     CHECK(!slots.release_claim("rows", 0, a.generation), "a second release of the same token is a no-op");
     const kv_claim b = slots.claim("rows", 0, 10);
     CHECK(b.result == kv_claim_result::OK && b.generation != a.generation, "the next claim has a new token");
-    CHECK_EQ(b.wait_event, 77, "and receives the previous release's event to chain on");
+    CHECK_EQ(b.wait_event, 7001, "and receives the previous release's event to chain on");
     CHECK(!slots.release_claim("rows", 0, a.generation), "the stale holder's late release is refused");
     CHECK(slots.claimed("rows", 0), "so B's claim survives it");
     CHECK(slots.release_claim("rows", 0, b.generation), "B's own token releases");

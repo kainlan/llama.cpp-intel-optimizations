@@ -1,3 +1,4 @@
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "../kv-runtime-demotion.hpp"
 #include "../tlsf-allocator.hpp"
 #include "kv-region-test-model.hpp"
@@ -2795,7 +2796,7 @@ static int case_i18_refit_misuse_aborts() {
     return 0;
 #else
     std::fprintf(stderr, "SKIP: misuse aborts need fork\n");
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 #endif
 }
 
@@ -3065,7 +3066,7 @@ static int run_case(const char * name, int (*fn)()) {
         return 0;
     }
     const int rc = fn();
-    if (rc == 77) {  // ctest's skip code: say so, so a skipped case is never mistaken for a pass
+    if (rc == LLAMA_TEST_EXIT_SKIP) {  // ctest's skip code: say so, so a skipped case is never mistaken for a pass
         std::fprintf(stderr, "case %s SKIPPED: it proves nothing on this platform\n", name);
         return 0;
     }
