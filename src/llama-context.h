@@ -74,6 +74,7 @@ struct sched_measure_plan {
     std::vector<sched_measure_buft>  bufts;
     uint32_t                         n_measured = 0;
     double                           measure_ms = 0.0;
+    int                              n_splits_max = 0;  // the most splits any measured graph took
 };
 
 // Everything a reserve reads and writes about the scheduler it reserves on:
@@ -129,11 +130,28 @@ struct llama_plan_caps_deleter {
 
 using llama_plan_caps_ptr = std::unique_ptr<ggml_backend_sycl_plan_caps, llama_plan_caps_deleter>;
 
+// What a load-time measure hands the transient measure-only context it builds: the backends it
+// computes on (the non-owning measure backends of the SYCL devices, the CPU backend last), moved into
+// the context, and the stage whose plan the measure reads.
+struct llama_measure_context_args {
+    std::vector<ggml_backend_ptr> backends;
+    enum ggml_sycl_measure_stage  stage = GGML_SYCL_MEASURE_STAGE_PROBE;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
                   llama_context_params params);
+
+    // The measure-only form: a null `measure` is the public constructor. A measure-only context
+    // adopts the backends in `measure`, creates its memory with no allocation, runs one MEASURE on a
+    // scheduler of its own and leaves the result in measure_status and measure_plan. It allocates no
+    // buffer, binds no execution context, publishes nothing and prints nothing.
+    llama_context(
+            const llama_model & model,
+                  llama_context_params params,
+                  llama_measure_context_args * measure);
 
     ~llama_context();
 
@@ -390,6 +408,17 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // The measure-only context's result (see the three-argument constructor): how its MEASURE ended
+    // and what it measured. A context built any other way answers an OK status and an empty plan.
+    bool                         is_measure_only() const;
+    const sched_reserve_result & get_measure_status() const;
+    const sched_measure_plan &   get_measure_plan() const;
+
+    // true when the context holds a SYCL execution context or an output buffer: a measure-only
+    // context holds neither
+    bool holds_exec_context() const;
+    bool holds_output_buffer() const;
+
 private:
     llm_graph_result * get_gf_res_prev();
 
@@ -412,7 +441,9 @@ private:
     // state an ALLOC reserve runs on
     sched_reserve_state member_reserve_state();
 
-    llm_graph_cb graph_get_cb() const;
+    // the graph callback; the scheduler it pins a layer's last op on is the one the graph is built for, which a
+    // reserve on a state of its own does not share with the context's member
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_arg) const;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -575,6 +606,12 @@ private:
     // true for the transient context a load-time measure builds (set by its constructor); such a
     // context prints no resolution
     bool measure_only = false;
+
+    // the measure-only context's result: the stage it measured at, how its MEASURE ended and what it
+    // measured
+    enum ggml_sycl_measure_stage measure_stage  = GGML_SYCL_MEASURE_STAGE_PROBE;
+    sched_reserve_result         measure_status = { sched_reserve_status::OK, "" };
+    sched_measure_plan           measure_plan;
 
     // the text each resolution entry last printed (empty: never), so a retried reserve never
     // prints one twice. Written only on the thread that constructs or reserves the context.

@@ -389,6 +389,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # creates, on tiny CPU models. `model` as above.
     llama_build_and_test(test-layer-shapes.cpp LABEL model)
 
+    # The measure-only llama_context (zhcn C7h): one MEASURE on a scheduler of its own, no allocation, no
+    # log lines, the real context's compute peak. CPU only, tiny synthetic models. `model` as above.
+    llama_build_and_test(test-measure-context.cpp LABEL model)
+
     llama_build(test-fusion.cpp)
 endif()
 
@@ -3756,6 +3760,17 @@ if (Python3_Interpreter_FOUND)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fused-resolution-source.py
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
+endif()
+
+# zhcn C7h-2: the measure-only context prints nothing (design gate 37, the log-silence clauses): every
+# log statement reachable from the constructor body, the destructor and the reserve is guarded, in a
+# function every reached call site of which is guarded, or allow-listed with its reason.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-measure-log-silence-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-measure-log-silence-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 300)
 endif()
 
 # zhcn C7d: the runtime-context publish returns a status and never waits

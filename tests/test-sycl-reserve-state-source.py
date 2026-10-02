@@ -145,7 +145,7 @@ def test_purity_mutants():
         ("graph_reserve resets the member scheduler", "graph_reserve", "ggml_backend_sched_reset(state.sched.get());", "ggml_backend_sched_reset(sched.get());"),
         ("graph_reserve writes this->n_outputs", "graph_reserve", "state.n_outputs = n_outputs;", "this->n_outputs = n_outputs;"),
         ("graph_reserve builds into the member result", "graph_reserve", "auto * res = state.gf_res_reserve.get();", "auto * res = gf_res_reserve.get();"),
-        ("graph_reserve writes the member n_input_tensors", "graph_reserve", "state.n_input_tensors = llama_graph_n_input_tensors(gf);", "n_input_tensors = llama_graph_n_input_tensors(gf);"),
+        ("graph_reserve writes the member n_input_tensors", "graph_reserve", "state.n_input_tensors = llama_graph_n_input_tensors(gf, !measure_only);", "n_input_tensors = llama_graph_n_input_tensors(gf, !measure_only);"),
         ("resolve_fused_ops probes on the member scheduler", "resolve_fused_ops", "ggml_backend_sched_get_tensor_backend(state.sched.get(), node.tensor)", "ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor)"),
         ("resolve_fused_ops writes member cparams", "resolve_fused_ops", "state.cparams.auto_fgdn = false;", "cparams.auto_fgdn = false;"),
     ]
@@ -292,7 +292,7 @@ def test_compute_print_mutants():
 
 _GP_INIT = (
     "return { model.arch, model.hparams, @CP@, ubatch, gtype, @SC@, backend_cpu, cvec.get(), loras.get(), mctx, "
-    "&cross, &model.prec_policy, sampling.samplers, @NO@, graph_get_cb(), res, };"
+    "&cross, &model.prec_policy, sampling.samplers, @NO@, graph_get_cb(@SC@), res, };"
 )
 
 

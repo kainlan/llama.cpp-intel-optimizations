@@ -150,7 +150,7 @@ _TRIAL_START = "void llama_context::sycl_select_auto_ubatch(ggml_type type_k, gg
 # The trial is followed by upstream's llama_graph_n_input_tensors() helper,
 # not by sched_reserve() itself; ending at sched_reserve() would pull that
 # helper's LLAMA_LOG_WARN into the trial body.
-_TRIAL_END = "static int llama_graph_n_input_tensors(ggml_cgraph * gf) {"
+_TRIAL_END = "static int llama_graph_n_input_tensors(ggml_cgraph * gf, bool log) {"
 # llama.cpp-7n6n: the shared per-candidate validator --
 # probe with busy backoff, publish in a try/catch, reserve, host-fallback
 # check -- extracted into one lambda used by BOTH the cache-hit revalidation

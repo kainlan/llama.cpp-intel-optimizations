@@ -1609,8 +1609,8 @@ def test_mutation_publish_after_kv_allocation_is_witnessed() -> None:
     ctor = function(ctx, LLAMA_CONTEXT_CTOR_SIGNATURE)
     first = ctor.index("        sycl_resync_runtime_context_flash_attn();\n")
     moved = ctor[:first] + ctor[first + len("        sycl_resync_runtime_context_flash_attn();\n"):]
-    at = moved.index("        memory.reset(model.create_memory(params_mem, cparams));\n")
-    at += len("        memory.reset(model.create_memory(params_mem, cparams));\n")
+    at = moved.index("        memory.reset(model.create_memory(params_mem, cparams, measure_only));\n")
+    at += len("        memory.reset(model.create_memory(params_mem, cparams, measure_only));\n")
     moved = moved[:at] + "        sycl_resync_runtime_context_flash_attn();\n" + moved[at:]
     _assert_witnessed(ctx, ctx.replace(ctor, moved, 1), kv_publish_order_violations,
                       "a backend's first publish can run after the context's KV is allocated",

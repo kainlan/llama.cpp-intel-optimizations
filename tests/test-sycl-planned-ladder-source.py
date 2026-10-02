@@ -56,7 +56,7 @@ def z(text: str) -> str:
 
 
 _TRIAL_START = z("void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) {")
-_TRIAL_END = z("static int llama_graph_n_input_tensors(ggml_cgraph * gf) {")
+_TRIAL_END = z("static int llama_graph_n_input_tensors(ggml_cgraph * gf, bool log) {")
 _CTOR_START = z("bool sycl_auto_ubatch_trial = false;")
 _CTOR_END = z("if (!cparams.flash_attn) {")
 

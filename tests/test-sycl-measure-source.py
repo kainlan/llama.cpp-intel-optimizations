@@ -78,7 +78,7 @@ def types_ok(header: str) -> bool:
         "llama_cparams & cparams; sched_measure_plan * measure = nullptr; fused_resolution * resolution = nullptr; };",
         # the measure's plan
         "struct sched_measure_buft { ggml_backend_buffer_type_t buft = nullptr; size_t max_chunk_size = 0; std::vector<std::vector<size_t>> peaks; std::vector<size_t> cap; };",
-        "struct sched_measure_plan { std::vector<llama_measure_graph> graphs; std::vector<sched_measure_buft> bufts; uint32_t n_measured = 0; double measure_ms = 0.0; };",
+        "struct sched_measure_plan { std::vector<llama_measure_graph> graphs; std::vector<sched_measure_buft> bufts; uint32_t n_measured = 0; double measure_ms = 0.0; int n_splits_max = 0; };",
         # the storage a MEASURE writes: the scheduler is declared first, so it dies last
         "struct sched_measure_storage { ggml_backend_sched_ptr sched;",
         "return { sched, gf_res_prev, gf_res_reserve, gf_res_prev_active, n_outputs, n_input_tensors, cparams, &plan, &resolution };",
@@ -212,11 +212,20 @@ def test_dispatch_mutants():
 
 
 def scope_ctor(mode: str) -> str:
-    return (
-        "llama_plan_scope plan_scope(plan_procs, (uint32_t) sycl_exec_context.value, GGML_SYCL_PLAN_SCOPE_"
+    planned = (
+        "llama_plan_scope(plan_procs, (uint32_t) sycl_exec_context.value, GGML_SYCL_PLAN_SCOPE_"
         + mode
-        + ", plan_caps.get());"
+        + ", plan_caps.get())"
     )
+    if mode == "MEASURE":
+        # a load-time measure (measure-only context) opens the LOAD_MEASURE scope, which holds no copy; every
+        # other measure opens the context's own
+        return (
+            "llama_plan_scope plan_scope = measure_only ? llama_plan_scope(plan_procs, measure_stage) : "
+            + planned
+            + ";"
+        )
+    return "llama_plan_scope plan_scope" + planned[len("llama_plan_scope"):] + ";"
 
 
 def scopes_ok(code: str) -> bool:
@@ -231,7 +240,11 @@ def scopes_ok(code: str) -> bool:
         if z("const llama_context_sycl_plan_procs plan_procs = llama_context_sycl_plan_procs_for(backends);") not in body:
             return False
     # a planned context whose scope does not open refuses, in both
-    if z('if (!plan_scope.is_open()) { return { sched_reserve_status::FAILED, "the MEASURE plan scope did not open" }; }') not in measure_body(code):
+    if z(
+        "const bool scope_required = plan_caps || (measure_only && llama_context_has_sycl_backend(backends));"
+        ' if (scope_required && !plan_scope.is_open()) { return { sched_reserve_status::FAILED, measure_only ?'
+        ' "the LOAD_MEASURE plan scope did not open" : "the MEASURE plan scope did not open" }; }'
+    ) not in measure_body(code):
         return False
     if z('if (plan_caps && !plan_scope.is_open()) { return { sched_reserve_status::FAILED, "the ALLOC plan scope did not open" }; }') not in function_body(code, _IMPL):
         return False
@@ -254,7 +267,7 @@ def test_scope_mutants():
         ("the alloc scope is a MEASURE scope", a, scope_ctor("ALLOC"), scope_ctor("MEASURE")),
         ("the measure scope takes no copy", m, "GGML_SYCL_PLAN_SCOPE_MEASURE, plan_caps.get());", "GGML_SYCL_PLAN_SCOPE_MEASURE, nullptr);"),
         ("the alloc scope takes no copy", a, "GGML_SYCL_PLAN_SCOPE_ALLOC, plan_caps.get());", "GGML_SYCL_PLAN_SCOPE_ALLOC, nullptr);"),
-        ("a closed measure scope ignored", m, 'if (!plan_scope.is_open()) { return { sched_reserve_status::FAILED, "the MEASURE plan scope did not open" }; }', ""),
+        ("a closed measure scope ignored", m, 'if (scope_required && !plan_scope.is_open()) { return { sched_reserve_status::FAILED, measure_only ? "the LOAD_MEASURE plan scope did not open" : "the MEASURE plan scope did not open" }; }', ""),
         ("a closed alloc scope ignored", a, 'if (plan_caps && !plan_scope.is_open()) { return { sched_reserve_status::FAILED, "the ALLOC plan scope did not open" }; }', ""),
     ]
     for name, body, old, new in mutants:
