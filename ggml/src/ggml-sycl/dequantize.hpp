@@ -14,14 +14,11 @@
 #define GGML_SYCL_DEQUANTIZE_HPP
 
 #include "common.hpp"
+#include "get-rows-kquant.hpp"
 
 typedef void (*dequantize_kernel_t)(const void * vx, const int64_t ib, const int iqs, dfloat2 & v);
 typedef void (*dequantize_kernel_t_reorder)(const void *d, const int64_t ib, const void *qs,
                                             const int iqs, dfloat2 &v);
-
-#if QK_K == 256
-static inline void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m);
-#endif
 
 static __dpct_inline__ void dequantize_q4_0(const void *vx, const int64_t ib,
                                             const int iqs, dfloat2 &v) {
@@ -125,7 +122,7 @@ static __dpct_inline__ void dequantize_q4_K(const void *vx, const int64_t ib,
 
         uint8_t sc;
         uint8_t m;
-        get_scale_min_k4(is, x[ib].scales, sc, m);
+        ggml_sycl_kquant_scale_min_k4(is, x[ib].scales, sc, m);
 
         const uint8_t q = x[ib].qs[qsi];
         const uint8_t qv = (in >= 32) ? (q >> 4) : (q & 0xF);
@@ -225,7 +222,7 @@ static __dpct_inline__ void dequantize_q5_K(const void *vx, const int64_t ib,
 
         uint8_t sc;
         uint8_t m;
-        get_scale_min_k4(is, x[ib].scales, sc, m);
+        ggml_sycl_kquant_scale_min_k4(is, x[ib].scales, sc, m);
 
         const float d = dall * sc;
         const float mn = dmin * m;
@@ -1117,18 +1114,6 @@ static void dequantize_block_q3_K_reorder(const void * __restrict__ vx, dst_t * 
 #endif
 }
 
-#if QK_K == 256
-static inline void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
-    if (j < 4) {
-        d = q[j] & 63;
-        m = q[j + 4] & 63;
-    } else {
-        d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
-        m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
-    }
-}
-#endif
-
 template <typename dst_t>
 inline void dequantize_q4_K_common(dst_t * __restrict__ y, const uint8_t * __restrict__ qs_ptr, const float dall,
                                    const float dmin, uint8_t * __restrict__ scales_local, int il, int ir) {
@@ -1136,11 +1121,11 @@ inline void dequantize_q4_K_common(dst_t * __restrict__ y, const uint8_t * __res
     constexpr int n  = 4;
 
     uint8_t sc, m;
-    get_scale_min_k4(is + 0, scales_local, sc, m);
+    ggml_sycl_kquant_scale_min_k4(is + 0, scales_local, sc, m);
     const float d1 = dall * sc;
     const float m1 = dmin * m;
 
-    get_scale_min_k4(is + 1, scales_local, sc, m);
+    ggml_sycl_kquant_scale_min_k4(is + 1, scales_local, sc, m);
     const float d2 = dall * sc;
     const float m2 = dmin * m;
 
@@ -1239,9 +1224,9 @@ static void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restri
     const uint8_t * qh = x[i].qh + 2*ir;
 
     uint8_t sc, m;
-    get_scale_min_k4(is + 0, x[i].scales, sc, m);
+    ggml_sycl_kquant_scale_min_k4(is + 0, x[i].scales, sc, m);
     const float d1 = dall * sc; const float m1 = dmin * m;
-    get_scale_min_k4(is + 1, x[i].scales, sc, m);
+    ggml_sycl_kquant_scale_min_k4(is + 1, x[i].scales, sc, m);
     const float d2 = dall * sc; const float m2 = dmin * m;
 
     uint8_t   hm  = 1 << (2*il);
