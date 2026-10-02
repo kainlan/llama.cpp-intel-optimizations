@@ -2858,6 +2858,28 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         TIMEOUT 300
     )
 
+    # test-sycl-compute-buffer-kv-zone (llama.cpp-kpjw): a compute buffer the RUNTIME zone will not serve (zone full, or
+    # held back by the planned dense scratch's hold) lands in the arena's KV zone, is accounted against it and returns
+    # every byte to it when freed; an unflagged request never goes there. It allocates a few MB through the real
+    # unified_alloc() path with no model loaded, but it is a GPU allocation test of the mem-handle family, so it
+    # carries `mem-handle` and stays out of the throttled sweep (run it by name, one at a time).
+    llama_build(test-sycl-compute-buffer-kv-zone.cpp)
+    target_include_directories(test-sycl-compute-buffer-kv-zone PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-compute-buffer-kv-zone PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-compute-buffer-kv-zone PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-compute-buffer-kv-zone PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-compute-buffer-kv-zone PRIVATE "-fsycl")
+        target_link_options(test-sycl-compute-buffer-kv-zone PRIVATE "-fsycl")
+    endif()
+    llama_test(test-sycl-compute-buffer-kv-zone LABEL "main")
+    set_tests_properties(test-sycl-compute-buffer-kv-zone PROPERTIES
+        LABELS "sycl;mem-handle;bugfix"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        TIMEOUT 300
+    )
+
     # test-sycl-optional-layout-yield: a yield of optional layout copies must
     # hand their bytes back to the zone KV admission re-reads, pass over a
     # leased copy, and never touch a primary -- on a real device cache, with no
@@ -3672,6 +3694,17 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-auto-ubatch-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-auto-ubatch-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-kpjw (review r7): the hold ledger's wiring -- settle release ordering, the fit-refusal exception type, the
+# pinned -ub's epoch refresh, the non-FA check's ledger free, and the scoped scheduler-allocation helpers (K-shift and
+# the projector included) -- with a mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-hold-ledger-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-hold-ledger-source.py
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()

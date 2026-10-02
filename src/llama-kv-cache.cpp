@@ -1001,7 +1001,8 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             res->reset();
 
             auto * gf = build_graph_shift(res, lctx);
-            if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            // through the context: an allocation on its scheduler is a compute allocation (llama_context::sched_alloc_graph)
+            if (!lctx->sched_alloc_graph(gf)) {
                 LLAMA_LOG_ERROR("%s: failed to allocate compute graph for K-shift\n", __func__);
                 return updated;
             }

@@ -476,6 +476,40 @@ GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backe
 // out-of-range device.
 GGML_BACKEND_API uint64_t ggml_backend_sycl_compute_buffer_host_fallbacks(int device);
 
+// llama.cpp-kpjw: whether `backend`'s context still fits the card once the compute buffers of a rung exist, asked of
+// the SAME function the runtime-context transaction (its worst-case bound) asks: the plan at the rung, the rung's
+// own recorded largest compute-buffer request, the KV room net of what is pending, and the cache's ledger of free
+// memory with the rung's own buffers credited back. False only when the compute buffers the planned dense scratch's
+// hold keeps out of the RUNTIME zone would push the device under the driver headroom the arena expects outside
+// itself (a rung that would exhaust the card at its first graph). True for a null/foreign backend, when no plan
+// holds anything back, and on a card that was short anyway. The auto-ubatch trial
+// (llama_context::sycl_select_auto_ubatch) calls it after a candidate's sched_reserve() returned, when every buffer of
+// the rung exists, and the context constructor calls it after ITS reserve when no ladder made it (a pinned -ub).
+// `n_ubatch` is the shape the reserve ran at. When it returns false and `largest_ub` is non-null, `*largest_ub` is
+// the largest n_ubatch (a power of two) the same function accepts, or 0 when none is known to fit; it is 0 whenever
+// this returns true. It is not a pure function of the configuration and the request: it reads the live free memory
+// and the cache's ledger, whose baseline is taken at the first fit after a publish, and it writes that baseline and
+// nothing else. A rung nobody measured is judged from the measured ones scaled, so the -ub it names is an estimate.
+GGML_BACKEND_API bool ggml_backend_sycl_planned_hold_spill_fits(ggml_backend_t backend,
+                                                                uint32_t       n_ubatch,
+                                                                uint32_t *     largest_ub);
+
+// llama.cpp-kpjw: re-reads the KV room the owner's hold epoch is judged with, from the zone with the context's KV in
+// place. A pinned -ub publishes once, before the memory module (the KV cache, the recurrent state) exists, so the
+// room its epoch began with predates both; the constructor calls this once they exist and before it reserves the
+// compute buffers. A no-op for a null or foreign backend, and before the first publish.
+GGML_BACKEND_API void ggml_backend_sycl_planned_hold_epoch_refresh(ggml_backend_t backend);
+
+// llama.cpp-kpjw (kpjw-g7): open (`enter` true) or close (false) a scheduler compute scope on the calling thread.
+// A buffer-type allocation made inside it is positively a scheduler compute buffer: it asks for the KV-zone-first
+// placement and is counted by the hold-spill record. The llama context wraps ggml_backend_sched_reserve and
+// ggml_backend_sched_alloc_graph in one (the llama context, through llama_context::sched_reserve_graph and
+// sched_alloc_graph, which every allocation on its scheduler goes through, the K-shift graph included; the multimodal
+// projector's scheduler opens the same scope). Allocations outside it (weights, the recurrent state, an adapter) are
+// not compute buffers, however late they are made. Scopes nest; a close with none open is ignored. Changes only a
+// thread-local depth.
+GGML_BACKEND_API void ggml_backend_sycl_compute_alloc_scope(bool enter);
+
 // llama.cpp-nphx: whether the SYCL auto micro-batch selection trial
 // (llama_context::sycl_select_auto_ubatch(), llama.cpp-xojq Task 4b) is
 // enabled -- GGML_SYCL_AUTO_UBATCH, default ON.
