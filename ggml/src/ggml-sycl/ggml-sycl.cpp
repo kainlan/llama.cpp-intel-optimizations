@@ -51911,8 +51911,9 @@ static bool ggml_sycl_batched_f16_use_onemath(const ggml_tensor * src0, const gg
                     .has_value();
             } else {
                 // One descriptor serves every batch of the loops below, so the scratchpad is asked for once, before
-                // the first write: a decline here returns false with dst untouched. (Call 1 of the dnnl_gemm site;
-                // batch b's own query inside gemm is call b + 2.)
+                // the first write: a decline here returns false with dst untouched. (Call 1 of this launch at the
+                // dnnl_gemm site, the counters being cumulative across launches; batch b's own query inside gemm is call
+                // b + 2 of the launch.)
                 if (!DnnlGemmWrapper::gemm(ctx, a1, b1, a0, src0, DnnlGemmWrapper::to_dt<sycl::half>(), sa0, sa1, sa2,
                                               src1, DnnlGemmWrapper::to_dt<sycl::half>(), sb0, sb1, sb2, dst,
                                               DnnlGemmWrapper::to_dt<float>(), queue, 1, 1, /* ldc = */ -1,
