@@ -150,8 +150,28 @@ RUNTIME_CODE     = _blank_comments(RUNTIME)
 COMMON_CODE      = _blank_comments(COMMON)
 COMMON_IMPL_CODE = _blank_comments(COMMON_IMPL)
 
+# One owner-first site in ggml-sycl.cpp is not production code: cec4a5f10 (zhcn C7a) added the test hook
+# ggml_backend_sycl_test_park_tenant_staging, built only under GGML_SYCL_PRIVATE_TESTING. It is pinned by name
+# below, and the census counts production sites only, so a count of 24 still means 24 reviewed runtime sites and a
+# second hook (or a hook that grows a legacy site) fails instead of being absorbed by a bumped number.
+TEST_HOOK_HEAD = "size_t ggml_backend_sycl_test_park_tenant_staging(ggml_backend_t backend, size_t nbytes) {"
+TEST_HOOK_GUARD = "#if defined(GGML_SYCL_PRIVATE_TESTING)"
+TEST_HOOK = region(RUNTIME_CODE, TEST_HOOK_HEAD, "\n#endif")
+RUNTIME_PRODUCTION_CODE = RUNTIME_CODE.replace(TEST_HOOK, "", 1)
+
+with gate("test hook ggml_backend_sycl_test_park_tenant_staging is a guarded owner-first site"):
+    hook_at = RUNTIME_CODE.index(TEST_HOOK_HEAD)
+    assert RUNTIME_CODE[:hook_at].rstrip().endswith(TEST_HOOK_GUARD), "the hook is not inside GGML_SYCL_PRIVATE_TESTING"
+    assert TEST_HOOK.count("unified_allocate_owner(") == 1
+    assert "unified_alloc(" not in TEST_HOOK and "from_legacy_owned_alloc" not in TEST_HOOK
+    _allocation = TEST_HOOK.index("unified_allocate_owner(req)")
+    _refused    = TEST_HOOK.index("if (!allocation)", _allocation)
+    _wrapped    = TEST_HOOK.index("from_owned_alloc(std::move(allocation.owner)", _refused)
+    assert _allocation < _refused < _wrapped
+    assert RUNTIME_CODE.count("unified_allocate_owner(") == RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner(") + 1
+
 for _label, _code, _pins in (
-    ("ggml-sycl.cpp", RUNTIME_CODE, (54, 42, 24)),
+    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (54, 42, 24)),
     ("common.hpp", COMMON_CODE, (3, 4, 3)),
     ("common.cpp", COMMON_IMPL_CODE, (8, 8, 4)),
 ):
