@@ -17,13 +17,19 @@
 //        reference (a fallback that ran over a half-written dst, or scaled a softmax twice, would not).
 //
 // Two further arms cover DnnlGemmWrapper::gemm (site "dnnl_gemm") through the batched f16 KQ mul_mat, which falls to a
-// native GPU kernel on a decline: one with equal K and query head counts (one gemm per dim-3 slice) and one grouped-query
-// arm (K has fewer heads) that takes the non-broadcast launch, whose hoisted pre-query is call 1 of each slice's launch (the counters are cumulative
-// across the graph, so slice s starts at call 5s + 1) and whose per-pair gemm calls follow, so the counting statement "pre-query is call 1, batch b's own query is call b + 2" has a
-// consumer. A decline after a write (a later call of the same launch) throws dnnl_decline_after_write, which an inject with
-// after_n > 1 would reach, but which cannot be driven here until the CHECK_TRY_ERROR handler rethrows a named
-// ggml_sycl_fallback_error out to GGML_STATUS_FAILED (a later step of llama.cpp-23mk, not yet landed); the other sites (MXFP4 PP, unified PP, MoE batched, the
-// dense arms, out_prod) are pinned by scripts/check-sycl-dnnl-decline-consumers.py and have no device arm yet.
+// native GPU kernel on a decline: one with equal K and query head counts (one gemm per dim-3 slice) and one
+// grouped-query arm (K has fewer heads) that takes the non-broadcast launch. That launch's hoisted pre-query is call 1
+// of each slice's launch (the counters are cumulative across the graph, so slice s starts at call 5s + 1) and its
+// per-pair gemm calls follow, so the counting statement "pre-query is call 1, batch b's own query is call b + 2" has a
+// consumer.
+//
+// A decline after a write (a later call of the same launch, an inject with after_n > 1) throws
+// dnnl_decline_after_write:dnnl_gemm, a ggml_sycl_fallback_error. Nothing in the tree stops it: caller 1 rethrows it
+// (ggml-sycl.cpp:66395), ggml_sycl_mul_mat rethrows it (ggml-sycl.cpp:85054) and ggml_backend_sycl_graph_compute turns
+// it into GGML_STATUS_FAILED (ggml-sycl.cpp:109540). This test does not drive it because run_arm below counts any
+// status other than GGML_STATUS_SUCCESS as a failure and no arm expects one; driving it needs an arm that expects
+// GGML_STATUS_FAILED. The other sites (MXFP4 PP, unified PP, MoE batched, the dense arms, out_prod) are pinned by
+// scripts/check-sycl-dnnl-decline-consumers.py and have no device arm yet.
 //
 // The counters are the positive control. An arm whose off-run never reached its site (the env opt-in is missing, a
 // shape fell under a threshold, the graph was recorded) has calls == 0 and FAILS as void; "identical" outputs from a

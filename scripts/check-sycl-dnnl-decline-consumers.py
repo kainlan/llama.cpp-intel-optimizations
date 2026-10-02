@@ -1,69 +1,71 @@
 #!/usr/bin/env python3
 """Source gate for the oneDNN consumers of a declined scratchpad (llama.cpp-23mk S3-3 and S3-4, design 4.8).
 
-`get_scratchpad_mem` can come back empty for a nonzero scratchpad: that is a decline, not an error. The three wrappers outside
-ggml-sycl.cpp that ask for one (softmax, eltwise, binary_broadcast_row) used to throw std::runtime_error on it, which a
-CHECK_TRY_ERROR-wrapped op turned into a process abort. They now return a [[nodiscard]] bool, false meaning declined, decide it
-before their first write to the op's output, and their callers fall through to the path the default takes. The allocation-zone
-gate's consumption clause (n) proves each result is used; this gate pins what that clause cannot see. In each of the three
-wrappers (comments blanked first):
+`get_scratchpad_mem` can come back empty for a nonzero scratchpad: that is a decline, not an error. The three wrappers
+outside ggml-sycl.cpp that ask for one (softmax, eltwise, binary_broadcast_row) used to throw std::runtime_error on it,
+which a CHECK_TRY_ERROR-wrapped op turned into a process abort. They now return a [[nodiscard]] bool, false meaning
+declined, decide it before their first write to the op's output, and their callers fall through to the path the default
+takes. The allocation-zone gate's consumption clause (n) proves each result is used; this gate pins what that clause
+cannot see. In each of the three wrappers (comments blanked first):
 
   - the signature is `[[nodiscard]] static bool NAME(`;
-  - the decision is exactly `if (ggml_sycl_scratchpad_declined(SITE, X, Y)) { return false; }` with the wrapper's own site tag,
-    it is the only `return false`, the scratchpad request precedes it, and the wrapper ends by executing the primitive and
-    returning true. The helper's body is pinned to the hook-first form below, so the test seam reaches every wrapper and the
-    old condition (nullptr and a nonzero size) is the only other way to decline;
-  - `ggml_sycl_dnnl_note_engaged(SITE)` is called once, unconditionally (the statement before it ends in `;` or `}`), after the
-    decision and before the primitive is executed, so a run that reached the wrapper can say so; the decision's arguments are
-    the literal `scratchpad_mem, scratchpad_md`;
-  - nothing before that decision writes (a decline after a write would hand the fallback modified inputs; softmax's pre-scale
-    pass runs in place, so a late decision would apply the scale twice): no parallel_for, single_task, memcpy, memmove, memset,
-    fill, fill_n, copy, copy_n, transform, submit or `.execute(`, no mention of dst or dst_f at all (an alias would be a write
-    the token list cannot see), no const_cast, static_cast or reinterpret_cast, no C-style cast of src, src0, src1 or dst (the
-    input pointers are const only by declaration), and no dnnl::memory object bound to the output. The signature check pins
-    the parameters those names stand for;
+  - the decision is exactly `if (ggml_sycl_scratchpad_declined(SITE, X, Y)) { return false; }` with the wrapper's own
+    site tag, it is the only `return false`, the scratchpad request precedes it, and the wrapper ends by executing the
+    primitive and returning true. The helper's body is pinned to the hook-first form below, so the test seam reaches
+    every wrapper and the old condition (nullptr and a nonzero size) is the only other way to decline;
+  - `ggml_sycl_dnnl_note_engaged(SITE)` is called once, unconditionally (the statement before it ends in `;` or `}`),
+    after the decision and before the primitive is executed, so a run that reached the wrapper can say so; the
+    decision's arguments are the literal `scratchpad_mem, scratchpad_md`;
+  - nothing before that decision writes (a decline after a write would hand the fallback modified inputs; softmax's
+    pre-scale pass runs in place, so a late decision would apply the scale twice): no parallel_for, single_task, memcpy,
+    memmove, memset, fill, fill_n, copy, copy_n, transform, submit or `.execute(`, no mention of dst or dst_f at all (an
+    alias would be a write the token list cannot see), no const_cast, static_cast or reinterpret_cast, no C-style cast
+    of src, src0, src1 or dst (the input pointers are const only by declaration), and no dnnl::memory object bound to
+    the output. The signature check pins the parameters those names stand for;
   - no `throw` and no `catch` anywhere in the class: a decline is a return value, and a catch-all would swallow one.
 
 Outside the wrappers:
 
-  - the deleted names stay deleted: eltwise_inplace and its respellings, DnnlBinaryWrapper::binary, DnnlReductionWrapper and
-    reduce_last_dim (all matched on word boundaries; the first two threw the old runtime_error and had no caller);
-  - each caller's condition is exactly `if (WRAPPER::fn(...))` with a body that is exactly `return;`, so a decline reaches the
-    fallback that follows and a success skips it. A caller count that differs from CALLERS fails; when a legitimate caller is
-    added, add it there.
+  - the deleted names stay deleted: eltwise_inplace and its respellings, DnnlBinaryWrapper::binary, DnnlReductionWrapper
+    and reduce_last_dim (all matched on word boundaries; the first two threw the old runtime_error and had no caller);
+  - each caller's condition is exactly `if (WRAPPER::fn(...))` with a body that is exactly `return;`, so a decline
+    reaches the fallback that follows and a success skips it. A caller count that differs from CALLERS fails; when a
+    legitimate caller is added, add it there.
 
-Before the if, between the caller's `#if GGML_SYCL_DNNL` line and the if, nothing may leave (return, goto, throw, GGML_ABORT,
-GGML_ASSERT, abort, exit, _Exit, quick_exit, terminate or longjmp): such a statement would skip the wrapper and the fallback
-alike.
+Before the if, between the caller's `#if GGML_SYCL_DNNL` line and the if, nothing may leave (return, goto, throw,
+GGML_ABORT, GGML_ASSERT, abort, exit, _Exit, quick_exit, terminate or longjmp): such a statement would skip the wrapper
+and the fallback alike.
 
-Between the if and the `#endif` / `#else` that ends the DNNL section only whitespace and the closing braces of its blocks may
-appear: no statement, goto, throw, abort or else can follow it. When that line is an `#else`, its arm (up to the matching
-`#endif`, nested #if blocks counted) may not contain any of the same leaving words, since the build without DNNL would leave
-before the fallback. That is the shape of all five real callers. Limit: a `return` placed after the `#endif`, in the fallback
-code itself, is not seen; the device test is the only catch for that.
+Between the if and the `#endif` / `#else` that ends the DNNL section only whitespace and the closing braces of its
+blocks may appear: no statement, goto, throw, abort or else can follow it. When that line is an `#else`, its arm (up to
+the matching `#endif`, nested #if blocks counted) may not contain any of the same leaving words, since the build without
+DNNL would leave before the fallback. That is the shape of all five real callers. Limit: a `return` placed after the
+`#endif`, in the fallback code itself, is not seen; the device test is the only catch for that.
 
 Since S3-4 the gate also reads gemm.hpp, common.hpp, ggml-sycl.cpp and outprod.cpp:
 
   - gemm.hpp: the five DnnlGemmWrapper consumers (gemm, woq_gemm_q8_0, woq_gemm_q4_0_impl, gemm_batch_strided,
-    woq_gemm_batch_mxfp4) are `[[nodiscard]] static` returning std::optional<sycl::event> or bool, ask for the scratchpad
-    unconditionally as `auto scratchpad_mem = ctx.get_scratchpad_mem(...)`, decide it with the helper under their own site and
-    `return std::nullopt` / `return false`, and note the engaged call once per request, after the decision (after gemm's
-    query_only exit) and with no `return false` / `return std::nullopt` left after any of its notes (each note is checked,
-    with the consumer's own decisions blanked), so "engaged" means the primitive is about to be submitted. The 2-D MXFP4 arm asks once before its batch loop. The old runtime_error and the deleted forwarders
-    (woq_gemm_q4_0_packed, gemm_batch_array, row_gemm_batch) and woq_gemm_q4_0_impl's dead packed-weights arm (b_is_packed,
-    b_bytes) stay gone;
-  - common.hpp: get_scratchpad_mem is [[nodiscard]] and opens with the size read and the 0 B early return of the empty memory
-    before it takes dnnl_mutex, exactly once;
+    woq_gemm_batch_mxfp4) are `[[nodiscard]] static` returning std::optional<sycl::event> or bool, ask for the
+    scratchpad unconditionally as `auto scratchpad_mem = ctx.get_scratchpad_mem(...)`, decide it with the helper under
+    their own site and `return std::nullopt` / `return false`, and note the engaged call once per request, after the
+    decision (after gemm's query_only exit) and with no bare decline (`return false`, `return std::nullopt`, `return
+    {}`, `return std::optional<...>()`) left after any of its notes (each note is checked, with the consumer's own
+    decisions blanked), so "engaged" means the primitive is about to be submitted. The 2-D MXFP4 arm asks once before
+    its batch loop. The old runtime_error and the deleted forwarders (woq_gemm_q4_0_packed, gemm_batch_array,
+    row_gemm_batch) and woq_gemm_q4_0_impl's dead packed-weights arm (b_is_packed, b_bytes) stay gone;
+  - common.hpp: get_scratchpad_mem is [[nodiscard]] and opens with the size read and the 0 B early return of the empty
+    memory before it takes dnnl_mutex, exactly once;
   - ggml-sycl.cpp and outprod.cpp (comment-stripped, whitespace-insensitive): the statements that carry a decline to its
-    declared next path (MAIN_PINS), among them the named throws of the dense arms and out_prod, the batched f16 fallback and
-    the rethrow of a named error ahead of the resource-exhaustion ladder, the polarity of every `if (!consumer(...))` guard
-    (counted heads), the woq q4_0/q8_0 callers and the dequant arms that follow them, the hoisted pre-query's `return false` and the first
-    slice's `b_a == 0` distinction, the MXFP4 PP and unified PP fall-through, the MoE group break and stage failure, and the
-    mul_mat_id `return false`.
+    declared next path (MAIN_PINS), among them the named throws of the dense arms and out_prod, the batched f16 fallback
+    and the rethrow of a named error ahead of the resource-exhaustion ladder, the polarity of every `if
+    (!consumer(...))` guard and of the `return consumer(...)` / `flag = consumer(...)` consumers (counted heads,
+    out_prod's included), the single push of the MoE group event, the woq q4_0/q8_0 callers and the dequant arms that
+    follow them, the hoisted pre-query's `return false` and the first slice's `b_a == 0` distinction, the MXFP4 PP and
+    unified PP fall-through, the MoE group break and stage failure, and the mul_mat_id `return false`.
 
-Every check is also run against mutants of the same text and each must fail there, so a regex that stopped matching fails the
-gate instead of passing it. A mutant whose anchor text has moved is an assertion error, not a skip. Exit 0 on success, 1 on a
-violation, 2 when a file cannot be read.
+Every check is also run against mutants of the same text and each must fail there, so a regex that stopped matching
+fails the gate instead of passing it. A mutant whose anchor text has moved is an assertion error, not a skip. Exit 0 on
+success, 1 on a violation, 2 when a file cannot be read.
 """
 import argparse
 import functools
@@ -91,16 +93,20 @@ NOTE = re.compile(r"\bggml_sycl_dnnl_note_engaged\s*\(\s*GGML_SYCL_SCRATCHPAD_SI
 WRITE = re.compile(r"\bparallel_for\b|\bsingle_task\b|\bmemcpy\b|\bmemmove\b|\bmemset\b|\bfill\b|\bfill_n\b|\bcopy\b|\bcopy_n\b"
                    r"|\btransform\b|\bsubmit\b|\.\s*execute\s*\(|\bdst(?:_f)?\b|\b(?:const|static|reinterpret)_cast\b"
                    r"|\(\s*[\w:\s]+\*\s*\)\s*(?:src\d?|dst)\b|\bdnnl::memory\s*\(")
-# What may not appear in the #else arm of a caller's `#if GGML_SYCL_DNNL` section: any way to leave before the fallback runs.
+# What may not appear in the #else arm of a caller's `#if GGML_SYCL_DNNL` section: any way to leave before the fallback
+# runs.
 LEAVE = re.compile(r"\breturn\b|\bgoto\b|\bthrow\b|\bGGML_ABORT\b|\bGGML_ASSERT\b|\babort\b|\bexit\b|\b_Exit\b|\bquick_exit\b"
                    r"|\bterminate\b|\blongjmp\b")
+# A decline spelled as a return, in any of the forms an optional- or bool-returning consumer can write it.
+AFTER_NOTE_LEAVE = re.compile(r"\breturn\s+(?:false\b|std::nullopt\b|std::optional\s*<[^;{}]*>\s*(?:\(\s*\)|\{\s*\}))"
+                              r"|\breturn\s*\{\s*\}")
 GEMM = SYCL + "/gemm.hpp"
 COMMON = SYCL + "/common.hpp"
 MAIN = SYCL + "/ggml-sycl.cpp"
 OUTPROD = SYCL + "/outprod.cpp"
-# DnnlGemmWrapper's consumers of get_scratchpad_mem (llama.cpp-23mk S3-4): function -> (site, declined result, the type it
-# returns, how many scratchpad requests it makes). Every request is unconditional, decided by the helper before anything is
-# submitted, and a decline is a return value.
+# DnnlGemmWrapper's consumers of get_scratchpad_mem (llama.cpp-23mk S3-4): function -> (site, declined result, the type
+# it returns, how many scratchpad requests it makes). Every request is unconditional, decided by the helper before
+# anything is submitted, and a decline is a return value.
 GEMM_CONSUMERS = (
     ("gemm", "DNNL_GEMM", "std::nullopt", "std::optional<sycl::event>", 2),
     ("woq_gemm_q8_0", "DNNL_WOQ_Q8_0", "false", "bool", 1),
@@ -139,6 +145,11 @@ MAIN_PINS = (
     # the polarity of every guard: a decline is the falsy result of a consumer, so each reads `if (!consumer(...))`
     ("if (!DnnlGemmWrapper::row_gemm(", 5),
     ("if (!DnnlGemmWrapper::gemm(", 3),
+    # the three consumers whose polarity r2 left unpinned (review r3 Minor-1), one head each
+    ("return DnnlGemmWrapper::gemm(", 1),
+    ("used_onednn_fp16 = DnnlGemmWrapper::row_gemm(", 1),
+    # one push of the group event, after the decline check (review r3 Nit-2)
+    ("gemm_events.push_back(*group_event)", 1),
     ("DnnlGemmWrapper::to_dt<float>(), queue, batcha, batchb) .has_value();", 1),
     ("if (batched_declined && !ggml_sycl_mul_mat_batched_f16_fallback(", 2),
     # the woq consumers: q4_0 and q8_0 results feed the dequant arms that follow
@@ -151,6 +162,7 @@ MAIN_PINS = (
     ("DnnlGemmWrapper::to_dt<float>(), ctx.stream())) { return false; }", 1),
 )
 OUTPROD_PIN = 'throw ggml_sycl_fallback_error("dnnl_gemm declined in out_prod'
+OUTPROD_GUARD = "if (!DnnlGemmWrapper::gemm("
 OLD_THROW = 'std::runtime_error("oneDNN scratchpad allocation failed")'
 DEAD = (
     (re.compile(r"\beltwise_in_?place\b"), "eltwise_inplace (a forwarder with no caller)"),
@@ -339,20 +351,22 @@ def check_gemm(text):
         if len(notes) != want or any(n.group(1) != site for n in notes):
             errs.append("%s must call ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_%s) once per request, found %d"
                         % (where, site, len(notes)))
-        # After each note (not only the last) nothing may leave with a decline: every `return false` / `return std::nullopt`
-        # that follows is one of the consumer's own decisions, which sit before their own notes.
+        # After each note (not only the last) nothing may leave with a decline: every `return false` / `return
+        # std::nullopt` that follows is one of the consumer's own decisions, which sit before their own notes.
         blanked = body
         for d in decisions:
             blanked = blanked[:d.start()] + " " * (d.end() - d.start()) + blanked[d.end():]
         for n in notes:
-            if re.search(r"\breturn\s+(?:false\b|std::nullopt\b)", blanked[n.end():]):
-                errs.append("%s leaves with `return false` / `return std::nullopt` after an engaged note: each note must sit just "
-                            "before the primitive it counts is submitted" % where)
+            if AFTER_NOTE_LEAVE.search(blanked[n.end():]):
+                errs.append("%s leaves with a bare decline (`return false`, `return std::nullopt`, `return {}` or `return "
+                            "std::optional<...>()`) after an engaged note: each note must sit just before the primitive it counts "
+                            "is submitted" % where)
                 break
         for d, n in zip(decisions, notes):
             if name == "woq_gemm_q4_0_impl":
-                # The packed-weights staging (an allocation and a reorder that can still fail) sits between the decision and
-                # the submit, so the note moves down to just before the primitive: at the body's top level, after the decision.
+                # The packed-weights staging (an allocation and a reorder that can still fail) sits between the decision
+                # and the submit, so the note moves down to just before the primitive: at the body's top level, after
+                # the decision.
                 top = body[:n.start()].count("{") == body[:n.start()].count("}")
                 if n.start() < d.end() or not top:
                     errs.append("%s must note the engaged call unconditionally (at the body's top level) after its decision" % where)
@@ -395,9 +409,9 @@ def check_common(text):
         errs.append("%s: get_scratchpad_mem must be [[nodiscard]]" % COMMON)
     open_brace = text.index("{", balanced(text, m.end(), "(", ")"))
     body = text[open_brace + 1:balanced(text, open_brace + 1, "{", "}") - 1]
-    # The whole prefix is pinned, not just the order: a 0 B descriptor returns the empty memory and takes no lock, any other
-    # size reaches the lock, and nothing else sits between (a respelled test or a different empty value changes the answer
-    # every unconditional caller decides on).
+    # The whole prefix is pinned, not just the order: a 0 B descriptor returns the empty memory and takes no lock, any
+    # other size reaches the lock, and nothing else sits between (a respelled test or a different empty value changes
+    # the answer every unconditional caller decides on).
     prefix = re.compile(r"\s*size_t\s+scratchpad_size\s*=\s*scratchpad_md\s*\.\s*get_size\s*\(\s*\)\s*;"
                         r"\s*if\s*\(\s*scratchpad_size\s*==\s*0\s*\)\s*\{\s*return\s+dnnl::memory\s*\(\s*\)\s*;\s*\}"
                         r"\s*std::lock_guard<std::mutex>\s+lock\s*\(\s*dnnl_mutex\s*\)\s*;")
@@ -428,6 +442,9 @@ def check_main(main_text, outprod_text):
     found = len(re.findall(ws_pattern(OUTPROD_PIN), outprod_text))
     if found != 1:
         errs.append("%s: a declined gemm in out_prod must fail by name (`%s`), found %d" % (OUTPROD, OUTPROD_PIN, found))
+    found = len(re.findall(ws_pattern(OUTPROD_GUARD), outprod_text))
+    if found != 1:
+        errs.append("%s: out_prod's guard must read `%s` (a decline is the falsy result), found %d" % (OUTPROD, OUTPROD_GUARD, found))
     return errs
 
 
@@ -479,8 +496,8 @@ def check_caller(rel, text):
         if body.strip() != "return;":
             errs.append("%s: a tested %s call's branch is not exactly `return;`, so the fallback could run after a success"
                         % (rel, sym))
-        # Only whitespace and the closers of the enclosing blocks may sit between the if and the preprocessor line that ends the
-        # DNNL section (`#endif` or `#else`): no statement, jump, throw, abort or else can follow it.
+        # Only whitespace and the closers of the enclosing blocks may sit between the if and the preprocessor line that
+        # ends the DNNL section (`#endif` or `#else`): no statement, jump, throw, abort or else can follow it.
         if not re.match(r"[\s}]*#\s*(?:endif|else)\b", after[end:]):
             errs.append("%s: something other than the closing braces of its blocks follows the if around %s before the end of "
                         "the DNNL section, so the fallback may never run" % (rel, sym))
@@ -763,7 +780,8 @@ def mutants(files):
         ("the softmax caller's branch no longer returns", edit(sm, "                stream)) {\n            return;\n        }", "                stream)) {\n            (void) 0;\n        }")),
         ("an extra unchecked softmax caller", edit(sm, "    if (use_f16) {", "    DnnlSoftmaxWrapper::softmax(ctx, src0_d, dst_d, 1, 1, 1.0f, DnnlSoftmaxWrapper::to_dt<float>(), stream);\n    if (use_f16) {")),
     ]
-    # dst renamed inside softmax and written under the new name before the decision: the no-dst rule must not be dodgeable
+    # dst renamed inside softmax and written under the new name before the decision: the no-dst rule must not be
+    # dodgeable
     i = files[h].index("[[nodiscard]] static bool softmax(")
     j = files[h].index("softmax_prim.execute", i)
     seg = re.sub(r"\bdst\b", "out", files[h][i:j]).replace(
