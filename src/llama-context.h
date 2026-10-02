@@ -518,6 +518,11 @@ private:
     // members
     //
 
+    // Held for the whole life of a measure-only context, and declared first so it is destroyed last: nothing
+    // the context owns (scheduler, memory, backends) can print below ERROR while it unwinds
+    // (llama_log_quiet_scope), the memory modules' size lines included.
+    std::optional<llama_log_quiet_scope> measure_log_quiet;
+
     const llama_model & model;
 
     llama_cparams cparams;
@@ -611,10 +616,6 @@ private:
     // true for the transient context a load-time measure builds (set by its constructor); such a
     // context prints no resolution
     bool measure_only = false;
-
-    // held for the whole life of a measure-only context: its constructors and its reserve print nothing below
-    // ERROR (llama_log_quiet_scope), the memory modules' size lines included
-    std::optional<llama_log_quiet_scope> measure_log_quiet;
 
     // the measure-only context's result: the stage it measured at, how its MEASURE ended and what it
     // measured

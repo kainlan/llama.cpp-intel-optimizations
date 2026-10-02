@@ -19460,10 +19460,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
         }
     }
     // PLAN_REJECTED, not BUSY. The inner refusal is deterministic -- the same
-    // n_ctx against the same budget refuses identically every time -- and
-    // llama_context retries BUSY seven times with backoff, which turned one
-    // decision into eight identical error lines and no different outcome
-    // (llama.cpp-uize). Genuine transients above still return BUSY.
+    // n_ctx against the same budget refuses identically every time -- and a
+    // BUSY is a transient the caller reruns on its next decode (it never loops
+    // on it), so reporting a deterministic refusal as BUSY would have the
+    // caller rerun a decision that cannot change (llama.cpp-uize). Genuine
+    // transients above still return BUSY.
     return inner_ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
 }
 
@@ -19471,8 +19472,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
 // guard only, against the currently PUBLISHED plan's shape -- deliberately
 // not a call into ggml_backend_sycl_set_runtime_context_for_model() above.
 // That full transaction re-runs the KV replan, the MoE MMID
-// reaccount/materialize pass, a plan republish, and (via the caller's own
-// retry loop) a BUSY backoff -- none of which a mere flash_attn_type
+// reaccount/materialize pass, a plan republish, and (when it answers BUSY)
+// a rerun of the whole transaction on the next decode -- none of which a mere flash_attn_type
 // resolution has any business touching, since n_ctx/n_ubatch have not
 // changed. NOT read-only: it takes sycl_module_mutation_guard (so it
 // cannot run past a module shutdown) and g_tensor_inventory_mutex -- the

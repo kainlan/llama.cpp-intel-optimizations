@@ -24,10 +24,14 @@ LLAMA_ATTRIBUTE_FORMAT(2, 3)
 void llama_log_internal        (ggml_log_level level, const char * format, ...);
 void llama_log_callback_default(ggml_log_level level, const char * text, void * user_data);
 
-// While one of these is open on the calling thread, llama_log_internal drops every line below ERROR (a
-// continuation line belongs to the line before it, so it goes too). A measure-only llama_context holds one for
-// its whole life, so the lines the real context's constructors print (the memory modules' buffer and cache
-// sizes among them) are not printed twice; an ERROR still gets through. Scopes nest; other threads are untouched.
+// While one of these is open on the calling thread, llama_log_internal drops every line below ERROR. A
+// continuation line belongs to the line before it: it passes after an ERROR and goes with any other. A
+// measure-only llama_context holds one for its whole life, so the lines the real context's constructors print
+// (the memory modules' buffer and cache sizes among them) are not printed twice; an ERROR still gets through.
+// Scopes nest and are thread-affine: one must end on the thread that opened it, and other threads are
+// untouched. It covers LLAMA_LOG_* only; the backend's GGML_LOG_* lines do not pass through it (the SYCL
+// backend silences its own under a measure plan override). An ERROR inside an `if (!measure_only)` site of
+// llama-context.cpp is still suppressed by that guard, not by this scope.
 struct llama_log_quiet_scope {
     llama_log_quiet_scope();
     ~llama_log_quiet_scope();
