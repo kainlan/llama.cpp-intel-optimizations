@@ -21,10 +21,12 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include "compute-alloc-scope.hpp"
 #include "zone-sizing.hpp"
 
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <vector>
 
 // The build is -DNDEBUG (Release), so assert() would compile away and the
@@ -1079,13 +1081,119 @@ int main() {
         // Evaluated live: the driver sees the rung's buffer, the ledger holds it.
         const size_t cold_live   = ggml_sycl::zone_hold_free_cold(driver_true - own, persistent + own);
         const size_t before_live = ggml_sycl::zone_hold_free_before(cold_live, persistent);
-        // After the release the ledger is not asked the driver again (its credit has not landed: it would read
-        // 602.7 MB where 1097 MB is true); the baseline taken before stands and the rung's bytes are simply not live.
-        const size_t before_released = ggml_sycl::zone_hold_free_before(cold_live, persistent);
         CHECK(before_live == driver_true, "evaluated live, the rung's own bytes are credited back: the true free memory");
-        CHECK(before_released == before_live, "release-then-evaluate equals the pre-release fit with released bytes credited");
+        // The registered-then-released raw row (the real ledger, not this arithmetic) is test-sycl-hold-ledger.
         CHECK(ggml_sycl::zone_hold_free_before(100 * MiB, 300 * MiB) == 0, "never below zero");
         CHECK(ggml_sycl::zone_hold_free_cold(SIZE_MAX, 1) == SIZE_MAX, "saturating");
+    }
+
+    // ---- Case 27 (kpjw-r7 I3, identity by origin): what stays live without the rung is every raw byte the cache
+    // holds except the rung's OWN scheduler compute buffers, and only when the rung's buffers are live. A raw byte
+    // allocated after the epoch began that is not a scheduler compute buffer (the recurrent state, made after a
+    // pinned -ub's one publish) is persistent, however late it came. -----------------------------------------------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_hold_persistent_raw(956 * MiB, 495 * MiB, true) == 461 * MiB,
+              "a live rung: the held raw bytes less its own compute buffers (the 461 MB state stays)");
+        CHECK(ggml_sycl::zone_hold_persistent_raw(956 * MiB, 495 * MiB, false) == 956 * MiB,
+              "a transaction (no live rung): every held raw byte is persistent");
+        CHECK(ggml_sycl::zone_hold_persistent_raw(461 * MiB, 0, true) == 461 * MiB,
+              "no scheduler compute rows live: nothing is credited back");
+        CHECK(ggml_sycl::zone_hold_persistent_raw(100 * MiB, 300 * MiB, true) == 0,
+              "compute rows can never credit more than is held");
+    }
+
+    // ---- Case 28 (kpjw-r7 I2, the baseline): within a window the cold reading is the MAXIMUM of the readings taken
+    // (the driver's lag only ever lowers a reading, never raises it, so a later, healthier read repairs a stale-low
+    // first one and a later, lagged read never lowers it); the first reading of a window is taken as it comes. ------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_hold_cold_update(false, 0, 600 * MiB) == 600 * MiB,
+              "the first reading of a window stands");
+        CHECK(ggml_sycl::zone_hold_cold_update(true, 1097 * MiB, 602 * MiB) == 1097 * MiB,
+              "a later lagged (stale-low) reading does not lower the baseline");
+        CHECK(ggml_sycl::zone_hold_cold_update(true, 602 * MiB, 1097 * MiB) == 1097 * MiB,
+              "a later healthier reading repairs a stale-low first one");
+        CHECK(ggml_sycl::zone_hold_cold_update(false, 5000 * MiB, 100 * MiB) == 100 * MiB,
+              "a new window forgets the previous one (another tenant may have arrived since)");
+    }
+
+    // ---- Case 29 (kpjw-r7 I3, the KV room): a rung that is live is judged with the room its epoch began with; any
+    // other asker (a transaction) reads the zone as it is. An epoch whose room was never stored does not stand in. --
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_hold_pick_kv_room(true, true, 100 * MiB, 40 * MiB) == 100 * MiB,
+              "live rung: the epoch's room");
+        CHECK(ggml_sycl::zone_hold_pick_kv_room(true, false, 100 * MiB, 40 * MiB) == 40 * MiB,
+              "no epoch yet: the zone now");
+        CHECK(ggml_sycl::zone_hold_pick_kv_room(false, true, 100 * MiB, 40 * MiB) == 40 * MiB,
+              "a transaction: the zone now");
+        CHECK(ggml_sycl::zone_hold_pick_kv_room(true, true, 0, 40 * MiB) == 0,
+              "an epoch that stored no room is honoured as stored");
+    }
+
+    // ---- Case 30 (kpjw-r7 I1): the non-FA demand is the non-FA scratch PLUS the hold's worst-case spill, saturating
+    // -- the hold term is never dropped. --------------------------------------------------------------------------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_hold_nonfa_demand(300 * MiB, 200 * MiB) == 500 * MiB, "scratch + hold spill");
+        CHECK(ggml_sycl::zone_hold_nonfa_demand(300 * MiB, 0) == 300 * MiB, "no hold: the scratch alone");
+        CHECK(ggml_sycl::zone_hold_nonfa_demand(SIZE_MAX, 1) == SIZE_MAX,
+              "a wrapped sum must not read as a small demand");
+        CHECK(ggml_sycl::zone_hold_nonfa_demand(1, SIZE_MAX) == SIZE_MAX, "saturating on either term");
+    }
+
+    // ---- Case 31 (kpjw-r7 M6/M8): the -ub a refusal names. N passes and N*2 fails only while N*2 is a rung that
+    // was ever asked (not above n_ubatch); a non-power-of-two n_ubatch names the power of two under it; an N under the
+    // descent floor (64) is still returned (it is the largest the function accepts, not a rung the descent walks). ---
+    {
+        const size_t MiB  = 1024 * 1024;
+        auto         plan = [](void *, uint32_t) -> size_t {
+            return 10 * 1024 * 1024;
+        };
+        ggml_sycl::zone_hold_rung_request rungs[] = {
+            { 600, 600 * MiB }
+        };
+        ggml_sycl::zone_hold_fit_inputs in = {};
+        in.headroom_target                 = 256 * MiB;
+        in.free_before                     = 700 * MiB;
+        in.kv_room                         = 0;
+        in.rungs                           = rungs;
+        in.n_rungs                         = 1;
+        in.plan_of                         = plan;
+        // Plan 10 MB. 600 (600 MB) leaves 90 MB < 256 MB: refused; 512 scales to 512 MB, leaving 178 MB: refused; 256
+        // scales to 256 MB, leaving 434 MB: fits.
+        CHECK(!ggml_sycl::zone_hold_fit(in, 600), "600 does not fit");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 600) == 256,
+              "a non-power-of-two n_ubatch names the power of two under it");
+        in.free_before = 300 * MiB;
+        // Only tiny rungs fit: 64 leaves 226 MB, refused; 32 scales to 32 MB, leaving 258 MB >= 256 MB.
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 600) == 32, "an N under the descent floor is still named");
+        ggml_sycl::zone_hold_rung_request huge[] = {
+            { 600, 6000 * MiB }
+        };
+        in.rungs = huge;
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 600) == 0, "when no rung fits, nothing is named");
+    }
+
+    // ---- Case 32 (kpjw-r7 I5, N4/N5): the compute-allocation scope is a per-thread depth that cannot go negative. A
+    // leave without an enter (a guard destroyed after an exception unwound past its enter) leaves the scope closed,
+    // and one thread's open scope is not another's. ---------------------------------------------------------------
+    {
+        CHECK(!ggml_sycl::compute_alloc_scope_active(), "closed to start with");
+        ggml_sycl::compute_alloc_scope_leave();
+        ggml_sycl::compute_alloc_scope_enter();
+        CHECK(ggml_sycl::compute_alloc_scope_active(),
+              "a stray leave does not push the depth negative: the next enter opens it");
+        bool        other_thread_active = true;
+        std::thread t([&] { other_thread_active = ggml_sycl::compute_alloc_scope_active(); });
+        t.join();
+        CHECK(!other_thread_active, "another thread does not see this thread's open scope");
+        ggml_sycl::compute_alloc_scope_enter();
+        ggml_sycl::compute_alloc_scope_leave();
+        CHECK(ggml_sycl::compute_alloc_scope_active(), "nested: still open after the inner leave");
+        ggml_sycl::compute_alloc_scope_leave();
+        CHECK(!ggml_sycl::compute_alloc_scope_active(), "closed after the matching leaves");
     }
 
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");

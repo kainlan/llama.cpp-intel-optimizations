@@ -769,7 +769,8 @@ _IN_LOOP_RESERVE_WRAP_RE = (
     r"try\s*\{\s*sched_reserve\s*\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*&\s*e\s*\)\s*\{\s*"
     r"LLAMA_LOG_INFO\s*\([^;]*\be\.what\s*\(\s*\)\s*\)\s*;\s*"
     r"cparams\.pipeline_parallel\s*=\s*pipeline_parallel_before_reserve\s*;\s*sched_matches_last_good\s*=\s*"
-    r'false\s*;\s*rung_fit_refused\s*=\s*true\s*;\s*return\s*"compute buffers did not fit"\s*;\s*\}'
+    r'false\s*;\s*rung_fit_refused\s*=\s*dynamic_cast\s*<\s*const\s+llama_auto_ubatch_fit_refusal\s*\*\s*>\s*\(\s*&\s*e\s*\)\s*!=\s*nullptr\s*;'
+    r'\s*return\s*"compute buffers did not fit"\s*;\s*\}'
 )
 
 
@@ -2573,11 +2574,16 @@ def _fit_flag_is_set_only_on_fit_refusals(tc: str) -> bool:
         return False
     fit = [
         'rung_fit_refused = true; return "transaction refused";',
-        'rung_fit_refused = true; return "compute buffers did not fit";',
         'rung_fit_refused = true; return "hold spill left no headroom";',
     ]
     nonfit = ["KV would be demoted", "compute buffer fell back to host", "not the published model", "transaction busy"]
-    if not all(f in tc for f in fit) or tc.count("rung_fit_refused = true;") != 3:
+    if not all(f in tc for f in fit) or tc.count("rung_fit_refused = true;") != 2:
+        return False
+    # the reserve's catch is a fit verdict only for the dedicated exception type, never for any std::exception
+    if not re.search(
+        r"rung_fit_refused = dynamic_cast<const llama_auto_ubatch_fit_refusal \*>\(&e\) != nullptr; return \"compute buffers did not fit\";",
+        tc,
+    ):
         return False
     # the probe's own refusal is a fit refusal only when the probe ran and said no
     if not re.search(r"if \(!probe\.accepted\) \{ rung_fit_refused = true; return \"transaction refused\"; \}", tc):
@@ -2604,6 +2610,8 @@ def test_the_fit_flag_is_set_only_by_real_fit_refusals():
         ('            publish_dirty           = true;\n            return "transaction refused";',
          '            publish_dirty           = true;\n            rung_fit_refused = true;\n            return "transaction refused";'),
         ('            return "hold spill left no headroom" ;', ''),
+        ('rung_fit_refused = dynamic_cast<const llama_auto_ubatch_fit_refusal *>(&e) != nullptr;', 'rung_fit_refused = true;'),
+        ('rung_fit_refused = dynamic_cast<const llama_auto_ubatch_fit_refusal *>(&e) != nullptr;', 'rung_fit_refused = false;'),
     ],
 )
 def test_the_fit_flag_has_a_mutation_witness(old, new):
@@ -2675,9 +2683,15 @@ def test_the_scheduler_scope_is_opened_around_every_compute_buffer_allocation():
     (which also covers a recurrent-state buffer) no longer says so."""
     cpp = _normalize_ws(LLAMA_CONTEXT_CPP_CODE)
     assert "struct sycl_compute_scope_guard" in cpp
-    assert re.search(r"sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); if \(!ggml_backend_sched_alloc_graph\(", cpp)
-    assert re.search(r"sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); if \(!ggml_backend_sched_reserve\(sched\.get\(\), gf\)\)", cpp) or re.search(
-        r"\} else \{ sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); if \(!ggml_backend_sched_reserve\(sched\.get\(\), gf\)\)", cpp
+    assert re.search(
+        r"bool llama_context::sched_alloc_graph\(ggml_cgraph \* gf\) \{ sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); "
+        r"return ggml_backend_sched_alloc_graph\(sched\.get\(\), gf\); \}",
+        cpp,
+    )
+    assert re.search(
+        r"bool llama_context::sched_reserve_graph\(ggml_cgraph \* gf\) \{ sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); "
+        r"return ggml_backend_sched_reserve\(sched\.get\(\), gf\); \}",
+        cpp,
     )
     assert '"ggml_backend_sycl_compute_alloc_scope"' in cpp
     header = _normalize_ws(strip_comments((ROOT / "src/llama-context.h").read_text()))

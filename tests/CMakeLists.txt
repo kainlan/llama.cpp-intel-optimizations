@@ -3614,6 +3614,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-kpjw (review r7): the hold ledger's wiring -- settle release ordering, the fit-refusal exception type, the
+# pinned -ub's epoch refresh, the non-FA check's ledger free, and the scoped scheduler-allocation helpers (K-shift and
+# the projector included) -- with a mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-hold-ledger-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-hold-ledger-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-pyu4: executes the pure helpers in src/llama-auto-ubatch.h --
 # llama_auto_ubatch_ladder_has_candidate(), the predicate behind the trial's
 # early exit before its ladder loop, on the shapes where no rung lies in

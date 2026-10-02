@@ -547,6 +547,7 @@ def evaluate(backend, common, cache, zone):
         re.search(r"if\s*\(\s*!hold_spill\s*\)\s*\{[^}]*zone_alloc\(", unified_alloc_fn) is not None
     results["the outside-arena headroom check is told the worst-case hold spill"] = \
         "hold_query" in nonfa_check and \
+        re.search(r"hold_query\s*\?\s*ggml_sycl_planned_scratch_hold_spill_bound\(\*hold_query\)\s*:\s*0", nonfa_check) is not None and \
         re.search(r"ggml_sycl_check_nonfa_attn_scratch\([^;]*&hold_query", txn) is not None and \
         re.search(r"hold_query\s*=\s*\{[^}]*kv_pending", txn) is not None
 
@@ -674,7 +675,7 @@ def evaluate(backend, common, cache, zone):
         re.search(r"spill_count\s*=\s*0\s*;", epoch_fn) is not None and \
         re.search(r"spill_arena_bytes\s*=\s*0\s*;", epoch_fn) is not None and \
         re.search(r"spill_arena_count\s*=\s*0\s*;", epoch_fn) is not None and "state.owner != owner" in epoch_fn and \
-        re.search(r"epoch_raw_begin\s*=\s*raw_now\s*;", epoch_fn) is not None
+        re.search(r"baseline_owner\s*=\s*0\s*;", epoch_fn) is not None and "unified_cache_raw_device" not in epoch_fn
     results["the driver headroom the realized check uses is the graph-entry check's constant (one source)"] = \
         "kSyclArenaMinExternalHeadroomBytes" in realized_fn and "kSyclArenaMinExternalHeadroomBytes" in graph_headroom_fn and \
         re.search(r"arena_min_external_headroom\s*=\s*256", graph_headroom_fn) is None
@@ -904,7 +905,10 @@ def evaluate(backend, common, cache, zone):
     free_before_fn = function_body(cache, r"size_t unified_cache_hold_free_before\([^)]*\)\s*\{") or ""
     results["the free memory is the cache's ledger: a cold reading plus live outside-arena bytes, never a re-read"] = \
         free_before_fn != "" and all(f in free_before_fn for f in (
-            "unified_cache_raw_device_live_bytes(", "zone_hold_free_cold(", "zone_hold_free_before(")) and \
+            "unified_cache_raw_device_held_bytes(", "zone_hold_free_cold(", "zone_hold_cold_update(",
+            "zone_hold_persistent_raw(", "zone_hold_free_before(")) and \
+        re.search(r"state\.baseline_cold\s*=\s*zone_hold_cold_update\(\s*state\.baseline_owner\s*==\s*owner\s*,\s*state\.baseline_cold\s*,\s*cand\s*\)", free_before_fn) is not None and \
+        re.search(r"zone_hold_persistent_raw\(\s*raw_held\s*,\s*compute_live\s*,\s*rung_live\s*\)", free_before_fn) is not None and \
         "get_device_memory" not in free_before_fn
     results["the request mark is per rung and survives a publish (no history-carrying high-water mark)"] = \
         "request_hwm" not in cache and "rung_requests" in cache and \
@@ -959,12 +963,15 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
     # r4 I2: the previous rung's compute buffers are released BEFORE this rung's transaction, so the KV headroom the
     # transaction (and the probe) measures is not depressed by buffers a rung that already lost left in the KV zone.
     probe_at = try_fn.find("probe_fn(")
-    release_at = try_fn.find("sched.reset();")
+    rel_m = re.search(r"auto release_rung_buffers = \[&\]\(\) \{", context)
+    rel_block = balanced_block(context, rel_m.end() - 1) if rel_m else ""
     results["the previous rung's compute buffers are released before the next rung's transaction"] = \
-        0 <= release_at < probe_at and "synchronize();" in try_fn[:release_at] and \
-        re.search(r"sched_need_reserve\s*=\s*true\s*;", try_fn[release_at:probe_at]) is not None and \
-        re.search(r"sched_matches_last_good\s*=\s*false\s*;", try_fn[release_at:probe_at]) is not None and \
-        re.search(r"gf_res_reserve\.reset\(\)", try_fn[:release_at]) is not None
+        rel_block != "" and "synchronize();" in rel_block and "sched.reset();" in rel_block and \
+        re.search(r"gf_res_reserve\.reset\(\)", rel_block) is not None and \
+        re.search(r"sched_need_reserve\s*=\s*true\s*;", rel_block) is not None and \
+        re.search(r"sched_matches_last_good\s*=\s*false\s*;", rel_block) is not None and \
+        re.search(r"^\{\s*rung_fit_refused\s*=\s*false\s*;\s*release_rung_buffers\(\)\s*;", try_fn) is not None and \
+        0 <= try_fn.find("release_rung_buffers();") < probe_at
     # r4 I1: the realized check also runs after a reserve the ladder did not make (a pinned -ub, a ladder that never
     # ran), by name, with the largest -ub that fits; and it runs after the WHOLE trial/else block.
     trial_at = context.find("sycl_select_auto_ubatch(params.type_k, params.type_v);")
@@ -1020,7 +1027,7 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
                   r"hold_spill_validated_ub\s*:\s*0\s*;", select_fn) is not None and \
         select_fn.find("sycl_hold_spill_validated_ub = (") < select_fn.find("if (!sched_matches_last_good || cparams.n_ubatch != last_good)") and \
         re.search(r"hold_spill_validated_ub\s*=\s*hold_spill_fn\s*\?\s*c\s*:\s*0\s*;\s*return nullptr;", try_fn) is not None and \
-        re.search(r"sched_matches_last_good\s*=\s*false\s*;\s*hold_spill_validated_ub\s*=\s*0\s*;", try_fn[:probe_at]) is not None
+        re.search(r"sched_matches_last_good\s*=\s*false\s*;\s*hold_spill_validated_ub\s*=\s*0\s*;", rel_block) is not None
 
     # kpjw-g6 (item 0) and g7: the default rung refused must not turn a loadable model into an init failure. B50,
     # Qwen3.6-27B, auto n_ubatch: 512 spills 495 MB outside the arena and leaves 107.7 MB against the 256 MB headroom.
@@ -1066,9 +1073,9 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
         re.search(r"fallback_tried\s*=\s*fallback_tried\s*\|\|\s*cached_ubatch\s*==\s*fallback_ubatch\s*;", select_fn) is not None
     results["rung_fit_refused is cleared at the start of every rung and set by exactly the three real fit refusals"] = \
         re.search(r"^\{\s*rung_fit_refused\s*=\s*false\s*;", try_fn) is not None and \
-        len(re.findall(r"rung_fit_refused\s*=\s*true\s*;", try_fn)) == 3 and \
+        len(re.findall(r"rung_fit_refused\s*=\s*true\s*;", try_fn)) == 2 and \
+        re.search(r"rung_fit_refused\s*=\s*dynamic_cast<const\s+llama_auto_ubatch_fit_refusal\s*\*>\(\s*&e\s*\)\s*!=\s*nullptr\s*;\s*return \"compute buffers did not fit\"\s*;", try_fn) is not None and \
         re.search(r"if\s*\(\s*!probe\.accepted\s*\)\s*\{\s*rung_fit_refused\s*=\s*true\s*;\s*return \"transaction refused\"\s*;", try_fn) is not None and \
-        re.search(r"rung_fit_refused\s*=\s*true\s*;\s*return \"compute buffers did not fit\"\s*;", try_fn) is not None and \
         re.search(r"rung_fit_refused\s*=\s*true\s*;\s*return \"hold spill left no headroom\"\s*;", try_fn) is not None
     results["the trial state starts at nothing-happened and every rung asked is named in tried"] = \
         all(re.search(pat, select_fn) is not None for pat in (
@@ -1126,17 +1133,21 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
     ctx_flat = re.sub(r"\s+", " ", context)
     results["the scheduler compute scope is opened around the reserve and the graph allocation, resolved once per context"] = \
         re.search(r"struct sycl_compute_scope_guard \{ void \(\*fn\)\(bool\); explicit sycl_compute_scope_guard\(void \(\*f\)\(bool\)\) : fn\(f\) \{ if \(fn\) \{ fn\(true\); \} \} ~sycl_compute_scope_guard\(\) \{ if \(fn\) \{ fn\(false\); \} \}", ctx_flat) is not None and \
-        re.search(r"sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); if \(!ggml_backend_sched_alloc_graph\(", ctx_flat) is not None and \
-        re.search(r"\} else \{ sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); if \(!ggml_backend_sched_reserve\(sched\.get\(\), gf\)\)", ctx_flat) is not None and \
+        re.search(r"bool llama_context::sched_alloc_graph\(ggml_cgraph \* gf\) \{ sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); return ggml_backend_sched_alloc_graph\(sched\.get\(\), gf\); \}", ctx_flat) is not None and \
+        re.search(r"bool llama_context::sched_reserve_graph\(ggml_cgraph \* gf\) \{ sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); return ggml_backend_sched_reserve\(sched\.get\(\), gf\); \}", ctx_flat) is not None and \
+        "if (!sched_alloc_graph(gf)) {" in ctx_flat and "if (!sched_reserve_graph(gf)) {" in ctx_flat and \
+        ctx_flat.count("ggml_backend_sched_alloc_graph(") == 1 and len(re.findall(r"ggml_backend_sched_reserve\(", ctx_flat)) == 1 and \
         "if (!sycl_compute_scope_resolved) { sycl_compute_scope_resolved = true;" in ctx_flat and \
         "sycl_compute_scope_cached = &ggml_backend_sycl_compute_alloc_scope;" in ctx_flat and \
         '"ggml_backend_sycl_compute_alloc_scope"' in ctx_flat and \
         re.search(r"sycl_compute_scope_fn_t\s+sycl_compute_scope_fn\(\)\s*;", ctx_header) is not None and \
-        re.search(r"bool\s+sycl_compute_scope_resolved\s*=\s*false\s*;", ctx_header) is not None
+        re.search(r"bool\s+sycl_compute_scope_resolved\s*=\s*false\s*;", ctx_header) is not None and \
+        re.search(r"bool\s+sched_alloc_graph\(\s*ggml_cgraph\s*\*\s*gf\s*\)\s*;", ctx_header) is not None and \
+        re.search(r"bool\s+sched_reserve_graph\(\s*ggml_cgraph\s*\*\s*gf\s*\)\s*;", ctx_header) is not None
     # r5 R7/R8: releasing the previous rung's buffers means the cached graph results too, not only the sched.
     results["the release drops every cached graph result and the active pointer, not only the sched"] = \
-        re.search(r"for\s*\(\s*auto\s*&\s*res\s*:\s*gf_res_prev\s*\)\s*\{\s*res\.reset\(\)\s*;\s*\}", try_fn[:probe_at]) is not None and \
-        re.search(r"gf_res_prev_active\s*=\s*nullptr\s*;", try_fn[:probe_at]) is not None
+        re.search(r"for\s*\(\s*auto\s*&\s*res\s*:\s*gf_res_prev\s*\)\s*\{\s*res\.reset\(\)\s*;\s*\}", rel_block) is not None and \
+        re.search(r"gf_res_prev_active\s*=\s*nullptr\s*;", rel_block) is not None
     return results
 
 
@@ -1751,7 +1762,14 @@ if args.self_test:
          (backend, common, mutate_in_func(cache, r"size_t unified_cache_hold_free_before\(", "zone_hold_free_before(",
                                           "ggml_backend_sycl_get_device_memory(0, 0, 0); zone_hold_free_before("), zone)),
         ("ledger ignores the live outside-arena bytes", "the free memory is the cache's ledger: a cold reading plus live outside-arena bytes, never a re-read",
-         (backend, common, mutate_in_func(cache, r"size_t unified_cache_hold_free_before\(", "unified_cache_raw_device_live_bytes(", "unified_cache_XXXX("), zone)),
+         (backend, common, mutate_in_func(cache, r"size_t unified_cache_hold_free_before\(", "unified_cache_raw_device_held_bytes(", "unified_cache_XXXX("), zone)),
+        ("ledger re-baselines on every call", "the free memory is the cache's ledger: a cold reading plus live outside-arena bytes, never a re-read",
+         (backend, common, mutate_re_in_func(cache, r"size_t unified_cache_hold_free_before\(", r"state\.baseline_owner\s*==\s*owner", "false"), zone)),
+        ("ledger credits every raw byte as the rung's own", "the free memory is the cache's ledger: a cold reading plus live outside-arena bytes, never a re-read",
+         (backend, common, mutate_re_in_func(cache, r"size_t unified_cache_hold_free_before\(", r"zone_hold_persistent_raw\(\s*raw_held\s*,\s*compute_live\s*,\s*rung_live\s*\)",
+                                             "zone_hold_persistent_raw(raw_held, compute_live, false)"), zone)),
+        ("ledger takes the maximum of nothing", "the free memory is the cache's ledger: a cold reading plus live outside-arena bytes, never a re-read",
+         (backend, common, mutate_in_func(cache, r"size_t unified_cache_hold_free_before\(", "zone_hold_cold_update(", "zone_XXXX("), zone)),
         ("ledger has no cold baseline", "the free memory is the cache's ledger: a cold reading plus live outside-arena bytes, never a re-read",
          (backend, common, mutate_in_func(cache, r"size_t unified_cache_hold_free_before\(", "zone_hold_free_cold(", "zone_XXXX("), zone)),
         ("request mark is a running maximum again", "the request mark is per rung and survives a publish (no history-carrying high-water mark)",
@@ -1762,9 +1780,9 @@ if args.self_test:
                                           "state.rung_requests.clear(); state.epoch_n_ubatch       = n_ubatch;"), zone)),
         ("a publish keeps no KV-room snapshot", "the request mark is per rung and survives a publish (no history-carrying high-water mark)",
          (backend, common, mutate_in_func(cache, r"void unified_cache_begin_planned_hold_epoch\(", "state.epoch_kv_room", "state.epoch_XXXX"), zone)),
-        ("a publish takes no raw baseline for the epoch", "a publish starts a new spill epoch (a losing rung's spills and mark do not carry to the next rung)",
-         (backend, common, mutate_in_func(cache, r"void unified_cache_begin_planned_hold_epoch\(", "state.epoch_raw_begin      = raw_now;",
-                                          "state.epoch_raw_begin      = 0;"), zone)),
+        ("a publish keeps the previous window's baseline", "a publish starts a new spill epoch (a losing rung's spills and mark do not carry to the next rung)",
+         (backend, common, mutate_re_in_func(cache, r"void unified_cache_begin_planned_hold_epoch\(", r"state\.baseline_owner\s*=\s*0\s*;",
+                                             "(void) 0;"), zone)),
         ("zone header keeps the second -ub walk", "the zone header declares the one fit and the ledger arithmetic, and no second predicate walk",
          (backend, common, cache, zone + "\nuint32_t zone_hold_spill_largest_ub(uint32_t n_ubatch, size_t spill_bytes, size_t free_after, size_t headroom_target);")),
         ("zone header lacks the ledger arithmetic", "the zone header declares the one fit and the ledger arithmetic, and no second predicate walk",
@@ -1865,7 +1883,9 @@ if args.self_test:
         ("header lacks the entry", "the header declares the exported entry",
          (context_src, header_src.replace("ggml_backend_sycl_planned_hold_spill_fits", "ggml_backend_sycl_XXXX"))),
         ("rung buffers kept across rungs", "the previous rung's compute buffers are released before the next rung's transaction",
-         (mutate_after(context_src, "auto try_candidate = [&](uint32_t c) -> const char * {", "sched.reset();", "(void) 0;"), header_src)),
+         (mutate_after(context_src, "auto release_rung_buffers = [&]() {", "sched.reset();", "(void) 0;"), header_src)),
+        ("rung buffers not released by try_candidate", "the previous rung's compute buffers are released before the next rung's transaction",
+         (re.sub(r"(auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{\s*rung_fit_refused\s*=\s*false\s*;\s*)release_rung_buffers\(\)\s*;", r"\1", context_src, count=1), header_src)),
         ("pinned path unchecked", "the realized hold-spill check also runs after a reserve the ladder did not make",
          (context_src.replace("llama_context_sycl_hold_spill_fits(backends", "llama_context_sycl_XXXX(backends", 1), header_src)),
         ("pinned refusal unnamed", "a refusal there is a context-init refusal naming the largest -ub that fits",
@@ -1902,7 +1922,7 @@ if args.self_test:
          (mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{",
                             r"hold_spill_validated_ub\s*=\s*hold_spill_fn\s*\?\s*c\s*:\s*0\s*;", "hold_spill_validated_ub = 0;"), header_src)),
         ("trial keeps a stale validated -ub across rungs", "the context records the -ub its trial validated, for the sched that is final, and nothing else",
-         (mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{",
+         (mutate_re_in_func(context_src, r"auto release_rung_buffers = \[&\]\(\) \{",
                             r"sched_matches_last_good\s*=\s*false\s*;\s*hold_spill_validated_ub\s*=\s*0\s*;", "sched_matches_last_good = false;"), header_src)),
         ("settle publishes the validated -ub unconditionally", "the context records the -ub its trial validated, for the sched that is final, and nothing else",
          (re.sub(r"\(\s*sched_matches_last_good\s*&&\s*cparams\.n_ubatch\s*==\s*last_good\s*\)\s*\?\s*hold_spill_validated_ub\s*:\s*0",
@@ -1912,10 +1932,10 @@ if args.self_test:
         ("header lacks the validated member", "the context records the -ub its trial validated, for the sched that is final, and nothing else",
          (context_src, header_src, ctx_header_src.replace("sycl_hold_spill_validated_ub", "sycl_hold_spill_XXXX"))),
         ("previous rung's graph results kept (R7)", "the release drops every cached graph result and the active pointer, not only the sched",
-         (mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{",
+         (mutate_re_in_func(context_src, r"auto release_rung_buffers = \[&\]\(\) \{",
                             r"for\s*\(\s*auto\s*&\s*res\s*:\s*gf_res_prev\s*\)\s*\{\s*res\.reset\(\)\s*;\s*\}", ""), header_src)),
         ("active graph result pointer kept (R8)", "the release drops every cached graph result and the active pointer, not only the sched",
-         (mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{",
+         (mutate_re_in_func(context_src, r"auto release_rung_buffers = \[&\]\(\) \{",
                             r"gf_res_prev_active\s*=\s*nullptr\s*;", "(void) 0;"), header_src)),
     ]
     # kpjw item 0: the downward continuation. Each mutant removes one property of it and must be caught.
@@ -1994,7 +2014,9 @@ if args.self_test:
         ctx_mut("a probe refusal is not a fit refusal", FLAG,
                 new_ctx=mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{", r"if\s*\(\s*!probe\.accepted\s*\)\s*\{\s*rung_fit_refused\s*=\s*true\s*;", "if (!probe.accepted) {")),
         ctx_mut("a compute buffer that did not fit is not a fit refusal", FLAG,
-                new_ctx=re.sub(r"rung_fit_refused\s*=\s*true\s*;\s*return \"compute buffers did not fit\"", 'return "compute buffers did not fit"', context_src, count=1)),
+                new_ctx=re.sub(r"rung_fit_refused\s*=\s*dynamic_cast<const\s+llama_auto_ubatch_fit_refusal\s*\*>\(\s*&e\s*\)\s*!=\s*nullptr\s*;\s*return \"compute buffers did not fit\"", 'return "compute buffers did not fit"', context_src, count=1)),
+        ctx_mut("every reserve exception is a fit refusal", FLAG,
+                new_ctx=re.sub(r"rung_fit_refused\s*=\s*dynamic_cast<const\s+llama_auto_ubatch_fit_refusal\s*\*>\(\s*&e\s*\)\s*!=\s*nullptr\s*;", "rung_fit_refused = true;", context_src, count=1)),
         ctx_mut("a hold spill is not a fit refusal", FLAG,
                 new_ctx=re.sub(r"rung_fit_refused\s*=\s*true\s*;\s*return \"hold spill left no headroom\"", 'return "hold spill left no headroom"', context_src, count=1)),
         ctx_mut("descent_ran starts true (B1)", INIT, new_ctx=re.sub(r"bool(\s+)descent_ran(\s+)=\s*false\s*;", r"bool\1descent_ran\2= true;", context_src, count=1)),
@@ -2059,9 +2081,13 @@ if args.self_test:
         ctx_mut_h("the guard never opens the scope", SCOPE, new_ctx=context_src.replace("fn(true);", "(void) 0;", 1)),
         ctx_mut_h("the guard never closes the scope", SCOPE, new_ctx=context_src.replace("fn(false);", "(void) 0;", 1)),
         ctx_mut_h("the graph allocation runs outside the scope", SCOPE,
-                  new_ctx=re.sub(r"sycl_compute_scope_guard\s+sycl_scope\(sycl_compute_scope_fn\(\)\)\s*;\s*(if\s*\(\s*!ggml_backend_sched_alloc_graph)", r"\1", context_src, count=1)),
+                  new_ctx=re.sub(r"(bool llama_context::sched_alloc_graph\(ggml_cgraph \* gf\) \{\s*)sycl_compute_scope_guard\s+sycl_scope\(sycl_compute_scope_fn\(\)\)\s*;\s*", r"\1", context_src, count=1)),
         ctx_mut_h("the reserve runs outside the scope", SCOPE,
-                  new_ctx=re.sub(r"\}\s*else\s*\{\s*sycl_compute_scope_guard\s+sycl_scope\(sycl_compute_scope_fn\(\)\)\s*;\s*(if\s*\(\s*!ggml_backend_sched_reserve)", r"} else { \1", context_src, count=1)),
+                  new_ctx=re.sub(r"(bool llama_context::sched_reserve_graph\(ggml_cgraph \* gf\) \{\s*)sycl_compute_scope_guard\s+sycl_scope\(sycl_compute_scope_fn\(\)\)\s*;\s*", r"\1", context_src, count=1)),
+        ctx_mut_h("a bare graph allocation comes back", SCOPE,
+                  new_ctx=context_src.replace("if (!sched_alloc_graph(gf)) {", "if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {", 1)),
+        ctx_mut_h("a bare reserve comes back", SCOPE,
+                  new_ctx=context_src.replace("if (!sched_reserve_graph(gf)) {", "if (!ggml_backend_sched_reserve(sched.get(), gf)) {", 1)),
         ctx_mut_h("the scope is resolved on every call", SCOPE, new_ctx=context_src.replace("sycl_compute_scope_resolved = true;", "(void) 0;", 1)),
         ctx_mut_h("the direct-build scope function is not bound", SCOPE, new_ctx=context_src.replace("sycl_compute_scope_cached = &ggml_backend_sycl_compute_alloc_scope;", "(void) 0;", 1)),
         ctx_mut_h("the backend-DL scope function is not looked up", SCOPE, new_ctx=context_src.replace('"ggml_backend_sycl_compute_alloc_scope"', '"ggml_backend_sycl_XXXX"', 1)),

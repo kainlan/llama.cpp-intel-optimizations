@@ -5337,6 +5337,9 @@ target_include_directories(test-zone-sizing PRIVATE
 # the same arrangement test-gpu-arch uses for GGML_SYCL_DEBUG above. Production
 # builds get the real logging.
 target_compile_definitions(test-zone-sizing PRIVATE ZONE_SIZING_STANDALONE=1)
+# Case 32 (the compute-allocation scope is per thread) starts a std::thread.
+find_package(Threads REQUIRED)
+target_link_libraries(test-zone-sizing PRIVATE Threads::Threads)
 add_test(NAME zone-sizing COMMAND test-zone-sizing)
 set_tests_properties(zone-sizing PROPERTIES
     LABELS "sycl;memory;planner;tdd"
@@ -6112,6 +6115,24 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         # the two device cases did not.  Without SKIP_RETURN_CODE ctest renders
         # that as FAILED rather than Skipped (llama.cpp-ivin).
         SKIP_RETURN_CODE 77)
+
+    # llama.cpp-kpjw: the hold-fit ledger (unified_cache_hold_free_before and the state around it) against real
+    # registry rows.  Host-only seam: the rows are test rows (allocation_registry_test_publish_raw), no device
+    # allocation and no model.  Same labels as the provenance fixture for the same reason: none of the OOM-family
+    # ones, because it loads nothing.  RUN_SERIAL: the registry and the hold state are process-global.
+    add_executable(test-sycl-hold-ledger
+        tests/test-hold-ledger.cpp)
+    target_link_libraries(test-sycl-hold-ledger PRIVATE
+        ggml-sycl-private-fixtures)
+    set_target_properties(test-sycl-hold-ledger PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-hold-ledger
+        COMMAND test-sycl-hold-ledger)
+    set_tests_properties(sycl-hold-ledger PROPERTIES
+        LABELS "sycl;memory;planner;tdd"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        TIMEOUT 60)
 
     # The token half of the same invariant is a COMPILE-TIME guarantee, and no
     # running program can witness one -- so this arm compiles probe TUs and
