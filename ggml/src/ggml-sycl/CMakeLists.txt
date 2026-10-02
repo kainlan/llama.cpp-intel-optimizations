@@ -458,6 +458,29 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mmq-src1-plan-source.py
             --self-test)
     set_tests_properties(sycl-mmq-src1-plan-source PROPERTIES LABELS "sycl;memory;planner;host;source-contract")
+    # llama.cpp-qhfp: no CONCAT rejection in check_graph_compatibility and no host wait in concat.cpp, plus the
+    # graph-safe memcpy helper's alignment. Source facts only: whether a graph replays is the GPU witness's job.
+    # --self-test: most of its checks are absence-based (no host wait, no recording-guarded wait, no allocation,
+    # no CONCAT rejection) and pass on any tree that never had the thing they forbid.
+    add_test(NAME sycl-concat-no-host-wait-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-concat-no-host-wait-source.py
+            --self-test)
+    set_tests_properties(sycl-concat-no-host-wait-source PROPERTIES LABELS "sycl;graph;host;source-contract")
+    # llama.cpp-qhfp: a recorded graph must not read a host-resident input, so every recorder (full graph, dense
+    # split, MoE block graphlets, MoE segments) declines to record or replay when the input pre-stage fails, and a
+    # view of an INPUT counts as that input. --self-test: the flag-only, swallowed-failure and statement-form
+    # pre-stage checks are absence-based.
+    add_test(NAME sycl-graph-prestage-fail-closed-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-graph-prestage-fail-closed-source.py
+            --self-test)
+    set_tests_properties(sycl-graph-prestage-fail-closed-source PROPERTIES LABELS "sycl;graph;host;source-contract")
+    # llama.cpp-qhfp: GET_ROWS runs Q4_K on the device through one shared support predicate, so qwen35's q4_K
+    # token_embd.weight no longer forces a CPU split whose host-memory output cannot be recorded. --self-test:
+    # the private-type-list and missing-arm checks are absence-based.
+    add_test(NAME sycl-get-rows-q4-k-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-get-rows-q4-k-source.py
+            --self-test)
+    set_tests_properties(sycl-get-rows-q4-k-source PROPERTIES LABELS "sycl;graph;host;source-contract")
     # --self-test likewise: eight of this gate's checks are absence-based, and
     # the construct they forbid -- max(planned, required), the general temporary
     # fallback, admission after the lock, a debug-gated refusal warning -- is
@@ -5468,9 +5491,54 @@ target_include_directories(test-zone-sizing PRIVATE
 # the same arrangement test-gpu-arch uses for GGML_SYCL_DEBUG above. Production
 # builds get the real logging.
 target_compile_definitions(test-zone-sizing PRIVATE ZONE_SIZING_STANDALONE=1)
+# Case 32 (the compute-allocation scope is per thread) starts a std::thread.
+find_package(Threads REQUIRED)
+target_link_libraries(test-zone-sizing PRIVATE Threads::Threads)
 add_test(NAME zone-sizing COMMAND test-zone-sizing)
 set_tests_properties(zone-sizing PROPERTIES
     LABELS "sycl;memory;planner;tdd"
+    TIMEOUT 60
+)
+
+# Test: element width of the recording-time copy kernel (llama.cpp-qhfp).
+# Host-only, same arrangement as test-zone-sizing above: graph-safe-memcpy-width.hpp is pure C++ with no SYCL
+# header, so no -fsycl, no device and no libggml-sycl link.
+add_executable(test-graph-safe-memcpy-width
+    tests/test-graph-safe-memcpy-width.cpp
+)
+target_include_directories(test-graph-safe-memcpy-width PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME graph-safe-memcpy-width COMMAND test-graph-safe-memcpy-width)
+set_tests_properties(graph-safe-memcpy-width PROPERTIES
+    LABELS "sycl;graph;host;tdd"
+    TIMEOUT 60
+)
+
+# Test: per-context memo of declined graph signatures (llama.cpp-qhfp). Host-only, same arrangement as
+# test-graph-safe-memcpy-width above: graph-prestage-decline-memo.hpp is pure C++.
+add_executable(test-graph-prestage-decline-memo
+    tests/test-graph-prestage-decline-memo.cpp
+)
+target_include_directories(test-graph-prestage-decline-memo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME graph-prestage-decline-memo COMMAND test-graph-prestage-decline-memo)
+set_tests_properties(graph-prestage-decline-memo PROPERTIES
+    LABELS "sycl;graph;host;tdd"
+    TIMEOUT 60
+)
+
+# Test: SYCL GET_ROWS Q4_K element decode against ggml's reference, plus the support predicate
+# (llama.cpp-qhfp). Host-only: get-rows-kquant.hpp and get-rows-support.hpp include no SYCL header, so the
+# device kernel's decode function runs here unchanged. ggml-base supplies the reference quantiser.
+add_executable(test-get-rows-q4-k
+    tests/test-get-rows-q4-k.cpp
+)
+target_include_directories(test-get-rows-q4-k PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-get-rows-q4-k PRIVATE ggml-base)
+add_test(NAME get-rows-q4-k COMMAND test-get-rows-q4-k)
+set_tests_properties(get-rows-q4-k PROPERTIES
+    LABELS "sycl;graph;host;tdd"
     TIMEOUT 60
 )
 
@@ -6201,6 +6269,24 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         # the two device cases did not.  Without SKIP_RETURN_CODE ctest renders
         # that as FAILED rather than Skipped (llama.cpp-ivin).
         SKIP_RETURN_CODE 77)
+
+    # llama.cpp-kpjw: the hold-fit ledger (unified_cache_hold_free_before and the state around it) against real
+    # registry rows.  Host-only seam: the rows are test rows (allocation_registry_test_publish_raw), no device
+    # allocation and no model.  Same labels as the provenance fixture for the same reason: none of the OOM-family
+    # ones, because it loads nothing.  RUN_SERIAL: the registry and the hold state are process-global.
+    add_executable(test-sycl-hold-ledger
+        tests/test-hold-ledger.cpp)
+    target_link_libraries(test-sycl-hold-ledger PRIVATE
+        ggml-sycl-private-fixtures)
+    set_target_properties(test-sycl-hold-ledger PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-hold-ledger
+        COMMAND test-sycl-hold-ledger)
+    set_tests_properties(sycl-hold-ledger PROPERTIES
+        LABELS "sycl;memory;planner;tdd"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        TIMEOUT 60)
 
     # The token half of the same invariant is a COMPILE-TIME guarantee, and no
     # running program can witness one -- so this arm compiles probe TUs and
