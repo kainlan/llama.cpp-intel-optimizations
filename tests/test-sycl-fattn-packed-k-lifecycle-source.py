@@ -31,6 +31,19 @@ def test_failpoints_are_exact_match_and_reserved_for_gpu_lifecycle_run() -> None
     assert 'std::getenv("GGML_SYCL_TEST_PACKED_K_FAIL_AFTER")' in helper
     assert "std::strcmp(selected, checkpoint) == 0" in helper
     assert "throw sycl::exception" in helper
+    # The profile-error seam is the OTHER env-selected failpoint in this file and sits above the one scored
+    # above, so a compare edited there (a strcmp -> strstr swap hits it first) is invisible to the check on
+    # `helper`. Pin its selector and exact-match compare too.
+    profile_helper = section(
+        FATTN,
+        "void ggml_sycl_fattn_xmx_test_profile_error_after_submit(const char * checkpoint)",
+        "uint64_t ggml_sycl_fattn_xmx_test_profile_error_after_submit_count",
+    )
+    assert 'std::getenv("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT")' in profile_helper
+    assert "std::strcmp(selected, checkpoint) == 0" in profile_helper
+    assert "throw std::bad_alloc{}" in profile_helper
+    for scored in (helper, profile_helper):
+        assert "strstr" not in scored and "strncmp" not in scored
 
 
 def test_sidecar_snapshot_replaces_borrowed_lookup_at_force_path() -> None:
