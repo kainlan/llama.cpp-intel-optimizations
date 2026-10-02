@@ -627,6 +627,29 @@ def probe_pins(source, fails):
                      r"return GGML_SYCL_RESIDENCY_PROBE_INVALID;\s*\}\s*out->n_layer = 0;", body):
         fails.append("L4 probe: the proc does not gate the caller's result struct on its declared size and version "
                      "(residency_probe_out_declared) before it writes any of it")
+    # the proc's own refusal arms, each by name, in the order they run: a foreign backend, a zero shape, a malformed
+    # descriptor, then a buffer smaller than the answer (the cap check needs the layer count the parse wrote)
+    arms = [
+        (r"if \(!backend \|\| !backend->context \|\| !ggml_backend_is_sycl\(backend\) \|\| !backend->device \|\|\s*"
+         r"ggml_backend_dev_backend_reg\(backend->device\) != ggml_backend_sycl_reg\(\)\) \{[^{}]*"
+         r"return GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND;\s*\}", "does not refuse a foreign backend"),
+        (r"if \(n_ctx == 0 \|\| n_ubatch == 0 \|\| n_seq_max == 0\) \{[^{}]*return GGML_SYCL_RESIDENCY_PROBE_INVALID;\s*\}",
+         "does not refuse a zero shape"),
+        (r"if \(desc != nullptr\) \{[^}]*?ggml_sycl::parse_runtime_context_desc\(\s*desc,\s*geometry,[^;]*;\s*"
+         r"if \(status != ggml_sycl::runtime_context_desc_status::OK\) \{[^{}]*return GGML_SYCL_RESIDENCY_PROBE_INVALID;\s*\}",
+         "does not refuse a malformed descriptor"),
+        (r"if \(out->n_layer_cap < out->n_layer\) \{[^{}]*return GGML_SYCL_RESIDENCY_PROBE_N_LAYER_CAP_TOO_SMALL;\s*\}",
+         "does not refuse a buffer smaller than the answer"),
+    ]
+    at = -1
+    for pattern, what in arms:
+        m = re.search(pattern, body)
+        if not m:
+            fails.append("L4 probe: the proc %s" % what)
+        elif m.start() < at:
+            fails.append("L4 probe: the proc %s before an earlier arm has run" % what)
+        else:
+            at = m.start()
     if "out->n_layer = (uint32_t) parsed.kv.layers.size();" not in body:
         fails.append("L4 probe: the proc does not write the layer count it was asked about")
     if not re.search(r'GGML_LOG_WARN\(\s*"\[RESIDENCY-PROBE\][^"]*"(?:[^;"]|"[^"]*")*;\s*return GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED;', body):

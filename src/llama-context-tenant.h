@@ -102,12 +102,13 @@ inline ggml_sycl_late_check_result llama_sycl_l4_late_check(const llama_sycl_l4_
     }
 }
 
-// The residency probe's one door: no other code calls the proc pointer or the symbol (scripts/check-sycl-l4-proc-registration.py
-// pins it). NOT_ANSWERED is the answer to anything this reader cannot vouch for: a null proc, and a value outside the
-// enum (a newer backend's status is not "OK" to an older reader). `out->n_layer` is cleared to 0 for those, so a stale
-// count left in the caller's struct is never read as an answer. Only OK carries a vector, and this door never writes
-// out->host_resident: the backend does, on OK alone. GEOMETRY_NOT_WIRED and every other refusal pass through as
-// themselves, and a caller must treat every status but OK as "no answer", never as "no host layers".
+// The residency probe's one door: no other code calls the proc pointer or the symbol
+// (scripts/check-sycl-l4-proc-registration.py pins it). NOT_ANSWERED is the answer to anything this reader cannot
+// vouch for: a null proc, and a value outside the enum (a newer backend's status is not "OK" to an older reader).
+// `out->n_layer` is cleared to 0 for those, so a stale count left in the caller's struct is never read as an answer.
+// Only OK carries a vector, and this door never writes out->host_resident: the backend does, on OK alone.
+// GEOMETRY_NOT_WIRED and every other refusal pass through as themselves, and a caller must treat every status but OK
+// as "no answer", never as "no host layers".
 inline ggml_sycl_residency_probe_status llama_sycl_l4_probe_residency(const llama_sycl_l4_procs &  procs,
                                                                       ggml_backend_t               backend,
                                                                       struct ggml_sycl_model_token model,

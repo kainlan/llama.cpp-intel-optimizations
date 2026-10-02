@@ -358,13 +358,14 @@ void case_desc_v2_layout_and_parse() {
 
     // The forced set and the flag are not in the tenant key: zhcn owns the digest, and the key is the tenants'.
     forced_desc none({}, 0);
-    CHECK(parse_ok(&none.b.desc, geometry()).tenant_key == s.tenant_key, "the forced set is not part of the tenant key");
+    CHECK(parse_ok(&none.b.desc, geometry()).tenant_key == s.tenant_key,
+          "the forced set is not part of the tenant key");
 
     // Version 1 reads as no forced layers, even over a v2-shaped buffer whose tail holds garbage: the v2 fields
     // are beyond the publisher's struct_size and so absent.
     forced_desc old({ 2 }, 1);
-    old.b.desc.version     = 1;
-    old.b.desc.struct_size = GGML_SYCL_RUNTIME_CONTEXT_DESC_V1_SIZE;
+    old.b.desc.version               = 1;
+    old.b.desc.struct_size           = GGML_SYCL_RUNTIME_CONTEXT_DESC_V1_SIZE;
     const runtime_context_section v1 = parse_ok(&old.b.desc, geometry());
     CHECK(v1.forced_host.empty() && !v1.no_promotion, "a v1 publisher has no forced layers and no flag");
     CHECK(v1.tenants.size() == 4 && v1.kv.layers.size() == 6, "and its older sections are read");

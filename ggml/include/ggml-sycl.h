@@ -1545,9 +1545,11 @@ typedef struct ggml_sycl_runtime_context_desc {
     // forces a layer to the host once an earlier probe demoted it, so a later answer never promotes it back).
     // Each index is a layer id below n_layer and appears once; the array is uint32_t at its own 4-byte stride; a
     // count above 65536, a non-zero count with no array, an index at or past n_layer and a repeated index are
-    // refused.  no_promotion (0 or 1): no layer outside the forced set may become host-resident.  At commit every
-    // forced index must be host-resident and, under no_promotion, no other layer may be.  Neither field is in the
-    // tenant key: the key is the tenants' digest.
+    // refused.  no_promotion (0 or 1): the probe may not demote a layer outside the forced set; layers the plan
+    // already places on the host are inputs, not violations.  From step 1d the commit enforces the same reading (every
+    // forced index host-resident, and under no_promotion no layer the plan placed on a device demoted unforced); until
+    // then the probe is the only place the rule is applied.  Neither field is in the tenant key: the key is the
+    // tenants' digest.
     uint32_t                              n_forced_host;
     uint8_t                               no_promotion;
     uint8_t                               pad1[3];  // must be 0

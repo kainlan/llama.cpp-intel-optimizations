@@ -44,16 +44,16 @@ static int n_failed = 0;
 
 // What the fake procs saw.
 struct call_record {
-    int                                    n_publish  = 0;
-    int                                    n_coverage = 0;
-    int                                    n_late     = 0;
-    int                                    n_probe    = 0;
+    int                                    n_publish   = 0;
+    int                                    n_coverage  = 0;
+    int                                    n_late      = 0;
+    int                                    n_probe     = 0;
     uint32_t                               probe_n_ctx = 0;
-    uint32_t                               n_ubatch   = 0;
-    uint64_t                               late_bytes = 0;
-    int32_t                                late_dev   = -2;
-    uint64_t                               late_id    = 0;
-    const ggml_sycl_runtime_context_desc * desc       = nullptr;
+    uint32_t                               n_ubatch    = 0;
+    uint64_t                               late_bytes  = 0;
+    int32_t                                late_dev    = -2;
+    uint64_t                               late_id     = 0;
+    const ggml_sycl_runtime_context_desc * desc        = nullptr;
 };
 
 static call_record g_calls;
@@ -218,7 +218,8 @@ int main() {
         CHECK(GGML_SYCL_RESIDENCY_PROBE_OK == 1 && GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED == 2 &&
                   GGML_SYCL_RESIDENCY_PROBE_INVALID == 3 && GGML_SYCL_RESIDENCY_PROBE_HEAD_SLOT_REFUSED == 4 &&
                   GGML_SYCL_RESIDENCY_PROBE_NO_PROMOTION_VIOLATED == 5 &&
-                  GGML_SYCL_RESIDENCY_PROBE_N_LAYER_CAP_TOO_SMALL == 6 && GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND == 7,
+                  GGML_SYCL_RESIDENCY_PROBE_N_LAYER_CAP_TOO_SMALL == 6 &&
+                  GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND == 7,
               "the status values are the published ones");
         CHECK((int) GGML_SYCL_RESIDENCY_PROBE_OK != (int) GGML_SYCL_LIFECYCLE_OK,
               "the probe's own enum: its OK is not the lifecycle's OK, which is 0");

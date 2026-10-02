@@ -18,8 +18,9 @@
 //       tenant never un-demotes a layer), checked over a sweep, with a positive control where the tenant
 //       head slot is the sole cause of a demotion so a core that ignored tenants fails;
 //   (7) everything the core cannot vouch for is INVALID by name: a tenant of an unknown cohort, a
-//       tenant or a layer on a device the input has no geometry for, layers that are not numbered 0..n-1.
-//       A host-tier tenant names no zone and changes nothing.
+//       tenant or a layer on a device the input has no geometry for, a geometry named for a device below 0, a byte
+//       count past residency_probe_max_bytes (which the fit's round-up would wrap) and more layers or tenants
+//       than the descriptor reader's cap.  A host-tier tenant names no zone and changes nothing.
 //
 // The build is -DNDEBUG, so CHECK is explicit and always runs.
 
@@ -300,8 +301,8 @@ void case_invalid_input() {
 
 // The caller's result struct is gated on what the caller declared, before the proc writes a byte of it: a pointer, a
 // struct_size at least the one this module was built with and the version it knows.  An older or smaller struct (a
-// caller built against a layout with fewer fields) is refused, never written past its declared size; a larger one
-// (a newer caller) is read as the layout this module knows.
+// caller built against a layout with fewer fields) is refused, never written past its declared size; a larger
+// struct of this version is read as the layout this module knows (a newer caller bumps the version and is refused).
 void case_out_struct_gate() {
     ggml_sycl_residency_probe out{};
     out.struct_size = sizeof(out);
@@ -319,7 +320,7 @@ void case_out_struct_gate() {
 
     out.struct_size = sizeof(out) + 8;
     CHECK(ggml_sycl::residency_probe_out_declared(&out),
-          "a larger (newer) struct is read as the layout this module knows");
+          "a larger struct of this version is read as the layout this module knows");
 
     out.struct_size = sizeof(out);
     for (uint32_t version : { 0u, (uint32_t) GGML_SYCL_RESIDENCY_PROBE_VERSION + 1u, 0xFFFFFFFFu }) {
@@ -334,7 +335,7 @@ void case_out_struct_gate() {
 // the element counts (at most 65536 layers and 65536 tenants, the descriptor reader's cap) keep every sum the fit
 // forms below 2^63.
 void case_byte_counts_at_the_arithmetic_edge() {
-    const size_t max = (size_t) 1 << 46;  // the bound (residency_probe_max_bytes)
+    const size_t max = ggml_sycl::residency_probe_max_bytes;
     const size_t big = (size_t) -1;
     const auto   bad = GGML_SYCL_RESIDENCY_PROBE_INVALID;
 
@@ -349,15 +350,25 @@ void case_byte_counts_at_the_arithmetic_edge() {
     in.layers[3].kv_bytes = max + 1;
     CHECK(residency_probe_core(in).status == bad, "kv_bytes past the bound is INVALID");
 
-    // exactly at the bound is a real (if absurd) size: it fits nowhere, so the layer is host-resident
+    // exactly at the bound is a real (if absurd) size: it fits nowhere, so the layer is host-resident (the ring fit
+    // keeps the layers before it on the device and demotes it and those after)
     in.layers[3].kv_bytes               = max;
     const residency_probe_result at_max = residency_probe_core(in);
-    CHECK(at_max.status == OK && hosts(at_max) == std::vector<uint32_t>({ 3 }),
-          "a layer of exactly the bound is host-resident");
+    CHECK(at_max.status == OK && at_max.host_resident.size() == 8 && at_max.host_resident[3] == 1 &&
+              !at_max.host_resident[0] && !at_max.host_resident[1] && !at_max.host_resident[2],
+          "a layer of exactly the bound is host-resident, the layers before it are not");
 
     in                         = base;
     in.layers[2].sidecar_bytes = big - 5;
     CHECK(residency_probe_core(in).status == bad, "sidecar_bytes within a block of SIZE_MAX is INVALID");
+    // each count is bounded on its own as well: SIZE_MAX + 5 wraps to 4, which the sum's bound alone would admit
+    in                         = base;
+    in.layers[2].kv_bytes      = big;
+    in.layers[2].sidecar_bytes = 5;
+    CHECK(residency_probe_core(in).status == bad, "a kv_bytes whose sum with the sidecar wraps is INVALID");
+    in.layers[2].kv_bytes      = 5;
+    in.layers[2].sidecar_bytes = big;
+    CHECK(residency_probe_core(in).status == bad, "a sidecar_bytes whose sum with the KV wraps is INVALID");
     in.layers[2].sidecar_bytes = max;
     in.layers[2].kv_bytes      = max;
     CHECK(residency_probe_core(in).status == bad, "kv_bytes + sidecar_bytes past the bound is INVALID");

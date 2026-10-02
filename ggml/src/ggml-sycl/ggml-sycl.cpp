@@ -114698,8 +114698,8 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_for_model") == 0) {
         return (void *) ggml_backend_sycl_set_runtime_context_for_model;
     }
-    // The L4 descriptor publish, the coverage read, the late check and the residency probe.  Each name is the "Proc name:"
-    // its declaration in ggml-sycl.h carries; scripts/check-sycl-l4-proc-registration.py pins that
+    // The L4 descriptor publish, the coverage read, the late check and the residency probe.  Each name is the
+    // "Proc name:" its declaration in ggml-sycl.h carries; scripts/check-sycl-l4-proc-registration.py pins that
     // every such name in the header has an arm here.
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_desc") == 0) {
         return (void *) ggml_backend_sycl_set_runtime_context_desc;

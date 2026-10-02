@@ -98,17 +98,36 @@ inline const residency_probe_device * find_device(const residency_probe_input & 
 // The caller's result struct may be written only if the caller declared one this module knows: a pointer, a struct_size
 // at least the layout the proc writes (n_layer, and host_resident through the pointer the caller owns), the version it
 // understands.  A smaller or older struct is refused, so the proc never writes past what the caller declared; a larger
-// one (a newer caller) is read as the layout this module knows.  The proc asks this before it writes a byte.
+// struct of this version is read as the layout this module knows (a newer caller bumps the version and is refused).
+// The proc asks this before it writes a byte.
 inline bool residency_probe_out_declared(const ggml_sycl_residency_probe * out) {
     return out != nullptr && out->struct_size >= sizeof(*out) && out->version == GGML_SYCL_RESIDENCY_PROBE_VERSION;
 }
+
+// The largest byte count the core accepts for one layer's KV (kv_bytes + sidecar_bytes) or one tenant's slot: 64 TiB.
+// kv_region_fit rounds a size up to its slot block, so a size within one block of SIZE_MAX wraps to a small number and
+// the layer would answer "device-resident" on no room at all.  Nothing real is near the bound (no zone holds a slot
+// that large), and with the descriptor reader's element cap (65536 layers, 65536 tenants) every sum the fit forms
+// from values at the bound stays below 2^63, so none of its arithmetic can wrap.  A count past it is a malformed
+// input, INVALID by name, never an answer.
+constexpr size_t residency_probe_max_bytes = (size_t) 1 << 46;
 
 inline residency_probe_result residency_probe_core(const residency_probe_input & in) {
     using namespace residency_probe_detail;
     const auto   INVALID = GGML_SYCL_RESIDENCY_PROBE_INVALID;
     const size_t n_layer = in.layers.size();
 
-    // The devices: each named once.
+    // The element counts the byte bound's arithmetic rests on: the descriptor reader's cap.
+    if (n_layer > RUNTIME_CONTEXT_DESC_MAX_ELEMENTS || in.tenants.size() > RUNTIME_CONTEXT_DESC_MAX_ELEMENTS) {
+        return refuse(INVALID, "more than " + std::to_string(RUNTIME_CONTEXT_DESC_MAX_ELEMENTS) + " layers or tenants");
+    }
+
+    // The devices: each named once, each a real device index (the host's -1 names no geometry).
+    for (const residency_probe_device & d : in.devices) {
+        if (d.device < 0) {
+            return refuse(INVALID, "a geometry is named for device " + std::to_string(d.device));
+        }
+    }
     for (size_t i = 0; i < in.devices.size(); ++i) {
         for (size_t j = i + 1; j < in.devices.size(); ++j) {
             if (in.devices[i].device == in.devices[j].device) {
@@ -126,6 +145,10 @@ inline residency_probe_result residency_probe_core(const residency_probe_input &
         }
         if (layer.kv_bytes == 0) {
             return refuse(INVALID, "layer " + std::to_string(l) + " has KV and no bytes");
+        }
+        if (layer.kv_bytes > residency_probe_max_bytes || layer.sidecar_bytes > residency_probe_max_bytes ||
+            layer.kv_bytes + layer.sidecar_bytes > residency_probe_max_bytes) {
+            return refuse(INVALID, "layer " + std::to_string(l) + " has more KV bytes than the probe can place");
         }
         if (layer.device >= 0 && find_device(in, layer.device) == nullptr) {
             return refuse(INVALID, "layer " + std::to_string(l) + " is planned on device " +
@@ -166,6 +189,10 @@ inline residency_probe_result residency_probe_core(const residency_probe_input &
         }
         if (t.slot_bytes == 0) {
             return refuse(INVALID, std::string("tenant of cohort ") + info->name + " has no bytes");
+        }
+        if (t.slot_bytes > residency_probe_max_bytes) {
+            return refuse(INVALID,
+                          std::string("tenant of cohort ") + info->name + " has more bytes than the probe can place");
         }
         const bool host_tier = info->tier == GGML_SYCL_CONTEXT_COHORT_TIER_HOST_PINNED;
         if (host_tier ? t.device != -1 : t.device < 0) {
