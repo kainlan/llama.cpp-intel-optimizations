@@ -55,6 +55,24 @@ def test_generator_failure_never_blames_a_stale_global() -> None:
     assert "needle=" not in result.stderr
 
 
+def test_lambda_parameter_never_blames_a_stale_global() -> None:
+    """A lambda's parameter is bound inside the lambda, so the module-level name it shadows must not be reported
+    (the assert fails in the caller's frame, where the global of the same name still holds its old value)."""
+    result = run("""
+        from sycl_gate import gate, finish
+        text = "abc"
+        needle = "STALE-LAMBDA-NEEDLE"
+        flag = "STALE-LAMBDA-FLAG"
+        with gate("a lambda check"):
+            assert (lambda needle, *, flag=0: needle in text)("zzz")
+        finish()
+    """)
+    assert result.returncode == 1
+    assert "STALE-LAMBDA-NEEDLE" not in result.stderr
+    assert "STALE-LAMBDA-FLAG" not in result.stderr
+    assert "text='abc'" in result.stderr
+
+
 def test_plain_frame_failure_still_names_its_operands() -> None:
     result = run("""
         from sycl_gate import gate, finish

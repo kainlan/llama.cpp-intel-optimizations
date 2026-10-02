@@ -42,7 +42,8 @@ def _operands(error: BaseException) -> str:
     """A bare `assert token in text` says nothing about WHICH token failed inside a loop, so list the
     short str/int/bool names the failing statement mentions.
 
-    Names bound by a comprehension inside that statement (`all(needle in text for needle in ...)`) are NOT
+    Names bound by a comprehension inside that statement (`all(needle in text for needle in ...)`), or as the
+    parameters of a lambda/def written in it, are NOT
     resolvable: the comprehension has finished by the time the assert fails, and looking the name up in the
     module scope would report whatever a stale module-level variable of the same name last held, blaming the
     wrong needle. Those names are left out rather than guessed.
@@ -60,6 +61,12 @@ def _operands(error: BaseException) -> str:
     bound_here = set()
     for targets in re.findall(r"\bfor\s+([A-Za-z_][A-Za-z_0-9]*(?:\s*,\s*[A-Za-z_][A-Za-z_0-9]*)*)\s+in\b", statement):
         bound_here.update(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", targets))
+    # Parameters of a lambda (or a def) written in the statement are bound inside it too.
+    for params in re.findall(r"\blambda\b([^:]*):", statement) + re.findall(r"\bdef\s+\w+\s*\(([^)]*)\)", statement):
+        for piece in params.split(","):
+            name = re.match(r"\s*\**\s*([A-Za-z_][A-Za-z_0-9]*)", piece)
+            if name:
+                bound_here.add(name.group(1))
     if frame.f_code.co_name.startswith("<") and frame.f_code.co_name != "<module>":
         # A generator-expression / lambda frame: names missing from its own locals live in a scope we cannot
         # see from here, so do not fall back to module globals.
