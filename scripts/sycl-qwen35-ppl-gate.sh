@@ -21,9 +21,16 @@
 #                    PASS needs every run to print the same four chunk values.
 #   oracle           `-b 512 -ub 512`, once. PASS needs the recorded --oracle values (per-device default).
 #
+# Each run must also prove it reached its shape: the log's perplexity header must say n_seq=4 for a
+# multi-ubatch arm and n_seq=1 for the oracle, so an inherited LLAMA_ARG_BATCH cannot turn the gate into a
+# single-ubatch run that passes green. Each log's last "[SYCL-FUSION] alias gate: declined D of C" teardown line
+# is printed, so a B50 run shows the decline path was reached. Only the B50 arm discriminates the fix: the B70
+# layout has no overlapping chain, declines 0, and did not race before it either.
+#
 # Exit status: 0 pass, 1 fail, 77 skipped (a precondition is missing, which proves nothing).
 #
-# --score-logs LOG... scores existing perplexity logs for determinism without running anything.
+# --score-logs LOG... scores existing multi-ubatch logs for shape and determinism without running anything.
+# --score-oracle LOG  scores one existing -b 512 log (shape and the --oracle values) without running anything.
 # --dry-run prints the plan and runs nothing.
 
 set -euo pipefail
@@ -35,18 +42,12 @@ MODEL="/models/Qwen3.6-27B-UD-Q4_K_XL.gguf"
 CORPUS="${QWEN35_GATE_CORPUS:-}"
 DEVICE="1"
 RUNS=3
-# Recorded -b 512 -ub 512 values per device, picked by --device unless --oracle is given.
-#
-# B50 (level_zero:1), after the rb2h fusion alias gate, repeated twice. The pin was 7.4998 5.6263 5.5707 4.9539
-# until the gate declined the fused ADD+RMS_NORM chains whose output partially overlapped an input
-# (attn_residual-47, l_out-47), which changed those layers' RMS_NORM reduction order: the old value came from
-# that overlapping layout running the racy fused kernel. Fused-everywhere and unfused-everywhere differ by more
-# than that move (unfused-everywhere gives 7.4691 5.6202 5.5617 4.9452, and the CPU run of the same shape gives
-# 7.4970 5.6205 5.5956 4.9595), so the pin is a regression tripwire, not a reference.
-ORACLE_B50="7.4953 5.6207 5.5623 4.9452"
-# B70 (level_zero:0): unchanged by the gate. That run declines nothing (no overlapping chain in its layout), and
-# it is bit-identical to the run before the gate existed.
-ORACLE_B70="7.4816 5.6277 5.5713 4.9400"
+# Recorded -b 512 -ub 512 values per device, picked by --device unless --oracle is given. They are a regression
+# tripwire for this build, not a reference: unfused-everywhere and fused-everywhere differ by more than the move
+# a fix can make. Re-derive one by running the oracle arm twice on a build you trust and requiring the two
+# runs to agree exactly.
+ORACLE_B50="7.4953 5.6207 5.5623 4.9452"  # level_zero:1
+ORACLE_B70="7.4816 5.6277 5.5713 4.9400"  # level_zero:0
 ORACLE=""
 LOCK_DIR="${LLAMA_GPU_LOCK:-/Apps/llama.cpp/GPU.lock}"
 TAKE_LOCK=1
@@ -54,6 +55,7 @@ OUT_DIR=""
 DRY_RUN=0
 SCORE_ONLY=0
 SCORE_LOGS=()
+SCORE_ORACLE=""
 BUDGET=900
 
 usage() {
@@ -71,7 +73,8 @@ Options:
                      0 = B70 7.4816 5.6277 5.5713 4.9400; any other device needs --oracle)
   --out-dir DIR     where run logs go (default: a fresh directory under $TMPDIR)
   --no-lock         the caller already holds the GPU lock
-  --score-logs LOG... score existing logs for determinism and exit
+  --score-logs LOG... score existing multi-ubatch logs (n_seq=4, identical chunks) and exit
+  --score-oracle LOG score one existing -b 512 log (n_seq=1, the --oracle values) and exit
   --dry-run         print the plan and exit
 EOF
 }
@@ -105,6 +108,7 @@ while [ $# -gt 0 ]; do
                 shift
             done
             ;;
+        --score-oracle) SCORE_ORACLE="$2"; shift 2 ;;
         -h | --help) usage; exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
@@ -128,7 +132,36 @@ chunk_values() {
     fi
 }
 
-# Every log must hold a finished run, and all of them must hold the same one.
+# The n_seq a run printed in the perplexity header ("... n_ctx=512, batch_size=2048, n_seq=4"), or nothing.
+run_n_seq() {
+    grep -oE 'calculating perplexity over [0-9]+ chunks, n_ctx=[0-9]+, batch_size=[0-9]+, n_seq=[0-9]+' "$1" \
+        2>/dev/null | head -n 1 | sed -E 's/.*n_seq=//' || true
+}
+
+# A run proves its batch shape from its own header. 4 sequences in one batch is the multi-ubatch shape under
+# `-ub 512`; 1 is the single-sequence oracle.
+require_n_seq() { # <log> <want>
+    local got
+    got="$(run_n_seq "$1")"
+    if [ "$got" != "$2" ]; then
+        echo "FAIL: $1 ran n_seq=${got:-none}, expected n_seq=$2: its header does not show the intended batch shape" >&2
+        return 1
+    fi
+}
+
+# The last alias-gate summary a run printed. It is a running process total, so only the last line counts, and
+# it is read from the backend's teardown line rather than counted from the capped per-decline warnings.
+alias_summary() {
+    local line
+    line="$(grep -E '\[SYCL-FUSION\] alias gate: declined [0-9]+ of [0-9]+' "$1" 2>/dev/null | tail -n 1 || true)"
+    if [ -n "$line" ]; then
+        sed -E 's/.*alias gate: declined ([0-9]+) of ([0-9]+).*/alias gate: declined \1 of \2 fused-kernel checks/' <<<"$line"
+    else
+        echo "no alias-gate summary line"
+    fi
+}
+
+# Every log must hold a finished run of the multi-ubatch shape, and all of them must hold the same one.
 score_determinism() {
     local first="" values log
     if [ $# -lt 2 ]; then
@@ -145,7 +178,8 @@ score_determinism() {
             echo "FAIL: $log does not hold chunks [1]..[4]" >&2
             return 1
         fi
-        echo "  $log: $values"
+        require_n_seq "$log" 4 || return 1
+        echo "  $log: $values (n_seq=4; $(alias_summary "$log"))"
         if [ -z "$first" ]; then
             first="$values"
         elif [ "$values" != "$first" ]; then
@@ -156,8 +190,34 @@ score_determinism() {
     echo "PASS: ${#} runs identical: $first"
 }
 
+# One -b 512 log: it must be the single-sequence shape and carry the recorded values.
+score_oracle() { # <log>; returns 1 on a failure
+    local values expected rc=0
+    values="$(chunk_values "$1")"
+    if [ -z "$values" ]; then
+        echo "FAIL: the oracle run did not finish chunks [1]..[4]" >&2
+        return 1
+    fi
+    require_n_seq "$1" 1 || rc=1
+    echo "  $1: $values ($(alias_summary "$1"))"
+    if [ "$ORACLE" != "none" ]; then
+        expected="[1]$(awk '{print $1}' <<<"$ORACLE") [2]$(awk '{print $2}' <<<"$ORACLE") [3]$(awk '{print $3}' <<<"$ORACLE") [4]$(awk '{print $4}' <<<"$ORACLE")"
+        if [ "$values" = "$expected" ]; then
+            echo "PASS: oracle $values"
+        else
+            echo "FAIL: oracle $values, expected $expected" >&2
+            rc=1
+        fi
+    fi
+    return "$rc"
+}
+
 if [ "$SCORE_ONLY" = 1 ]; then
     score_determinism "${SCORE_LOGS[@]}"
+    exit $?
+fi
+if [ -n "$SCORE_ORACLE" ]; then
+    score_oracle "$SCORE_ORACLE"
     exit $?
 fi
 
@@ -236,7 +296,7 @@ run_arm() { # <label> <args...>; prints the label's log path
     set -e
     local aborts
     aborts="$(grep -cE 'ggml-sycl\.cpp:[0-9]+:|unified-cache\.cpp:[0-9]+:|Segmentation|Aborted' "$OUT_DIR/$label.log" || true)"
-    echo "$label rc=$rc aborts=$aborts $(chunk_values "$OUT_DIR/$label.log")"
+    echo "$label rc=$rc aborts=$aborts $(chunk_values "$OUT_DIR/$label.log") ($(alias_summary "$OUT_DIR/$label.log"))"
     sleep 5
     echo "  post: $(mem)"
     [ "$rc" -eq 0 ] && [ "$aborts" -eq 0 ]
@@ -252,19 +312,7 @@ echo "multi-ubatch determinism:"
 score_determinism "${multi_logs[@]}" || status=1
 
 run_arm oracle "${ORACLE_ARGS[@]}" || status=1
-oracle_values="$(chunk_values "$OUT_DIR/oracle.log")"
-if [ -z "$oracle_values" ]; then
-    echo "FAIL: the oracle run did not finish chunks [1]..[4]" >&2
-    status=1
-elif [ "$ORACLE" != "none" ]; then
-    expected="[1]$(awk '{print $1}' <<<"$ORACLE") [2]$(awk '{print $2}' <<<"$ORACLE") [3]$(awk '{print $3}' <<<"$ORACLE") [4]$(awk '{print $4}' <<<"$ORACLE")"
-    if [ "$oracle_values" = "$expected" ]; then
-        echo "PASS: oracle $oracle_values"
-    else
-        echo "FAIL: oracle $oracle_values, expected $expected" >&2
-        status=1
-    fi
-fi
+score_oracle "$OUT_DIR/oracle.log" || status=1
 
 if [ "$status" -eq 0 ]; then
     echo "gate: PASS"

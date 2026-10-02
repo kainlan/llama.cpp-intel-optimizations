@@ -48,6 +48,44 @@ if "$GATE" --score-logs "$work/a.log" >/dev/null 2>&1; then
     fail "one log cannot show determinism and must fail"
 fi
 
+# The gate proves the multi-ubatch shape was reached: a log must carry the n_seq it ran, because an inherited
+# LLAMA_ARG_BATCH or a changed default would run one ubatch per decode and pass green without testing anything.
+single_hdr='perplexity: calculating perplexity over 4 chunks, n_ctx=512, batch_size=512, n_seq=1'
+{ echo "$single_hdr"; sed 1d "$work/a.log"; } >"$work/single.log"
+sed 1d "$work/a.log" >"$work/nohdr.log"
+if "$GATE" --score-logs "$work/a.log" "$work/single.log" >/dev/null 2>&1; then
+    fail "a run that printed n_seq=1 never reached the multi-ubatch shape and must fail"
+fi
+if "$GATE" --score-logs "$work/a.log" "$work/nohdr.log" >/dev/null 2>&1; then
+    fail "a log without the perplexity header cannot show its shape and must fail"
+fi
+# The per-log decline count is read from the teardown summary, not counted from the capped warning lines.
+{
+    cat "$work/a.log"
+    echo '[SYCL-FUSION] declined the ADD+RMS_NORM fusion at l_out-46: partial overlap (a against b); running the unfused kernels (decline 1)'
+    echo '[SYCL-FUSION] alias gate: declined 3 of 190 fused-kernel checks (ADD+RMS_NORM 3/48)'
+    echo '[SYCL-FUSION] alias gate: declined 8 of 380 fused-kernel checks (ADD+RMS_NORM 8/96)'
+} >"$work/declines.log"
+out="$("$GATE" --score-logs "$work/a.log" "$work/declines.log")"
+grep -q 'declined 8 of 380' <<<"$out" || fail "the last alias-gate summary line must be printed per log"
+grep -q 'no alias-gate summary' <<<"$out" || fail "a log with no summary line must say so"
+if grep -q 'declined 1 of\|declined 3 of' <<<"$out"; then
+    fail "only the last summary line counts: it is a running process total"
+fi
+
+# The oracle log is scored the same way: n_seq=1 and the recorded values.
+log "$work/o.log" 7.4953 5.6207 5.5623 4.9452
+sed -i 's/batch_size=2048, n_seq=4/batch_size=512, n_seq=1/' "$work/o.log"
+"$GATE" --score-oracle "$work/o.log" --device 1 >/dev/null || fail "an n_seq=1 log with the B50 oracle values must pass"
+if "$GATE" --score-oracle "$work/a.log" --device 1 >/dev/null 2>&1; then
+    fail "an n_seq=4 log must not pass as the single-sequence oracle"
+fi
+log "$work/o2.log" 7.4998 5.6263 5.5707 4.9539
+sed -i 's/batch_size=2048, n_seq=4/batch_size=512, n_seq=1/' "$work/o2.log"
+if "$GATE" --score-oracle "$work/o2.log" --device 1 >/dev/null 2>&1; then
+    fail "the pre-gate B50 values are not the B50 oracle any more and must fail"
+fi
+
 plan="$("$GATE" --dry-run --corpus /nonexistent/corpus.txt --device 1)"
 multi="$(grep -c -- 'multi-ubatch' <<<"$plan")"
 [ "$multi" -ge 3 ] || fail "dry-run plans fewer than three multi-ubatch runs"
