@@ -64,21 +64,36 @@ _OPERAND = r"[\w:.\[\]()]+"
 PLANNED_TERNARY = re.compile(r"(%s)\s*[<>]=?\s*(%s)\s*\?\s*(%s)\s*:\s*(%s)" % ((_OPERAND,) * 4))
 # The single legitimate site (llama.cpp-479i): the dense Q8_1 src1 buffer is sized to its graph-entry demand.
 DENSE_Q8_1_SRC1_GROWTH = re.compile(r"std::max\s*\(\s*planned_bytes\s*,\s*demand\s*\[\s*d\s*\]\s*\.bytes\s*\)")
+# The other 479i site, which the `planned`-substring match (rev-qeld-final M8) now sees: the graph-entry target of the
+# dense f16 dequant buffers, `max(planned bytes, this graph's widest demand)`, refused before submission when the
+# RUNTIME zone cannot hold it. Same cohort as the site above (a dense dequant buffer sized to its own graph-entry
+# demand), not the PP MoE oneDNN scratch ring this gate protects.
+DENSE_F16_GRAPH_ENTRY_TARGET = re.compile(
+    r"std::max\s*\(\s*ggml_sycl::unified_cache_get_planned_dequant_f16_buffer_bytes\s*\(\s*d\s*,\s*b\.is_src1\s*\)"
+    r"\s*,\s*b\.demand\s*\)")
+EXEMPT_SITES = (DENSE_Q8_1_SRC1_GROWTH, DENSE_F16_GRAPH_ENTRY_TARGET)
+
+
+def without_exempt_sites(source):
+    for exempt in EXEMPT_SITES:
+        source = exempt.sub("", source)
+    return source
 
 
 def planned_upsizes(source):
-    """Every place `source` takes a max of a planned size with something else (see PLANNED_MAX_CALL)."""
+    """Every place `source` takes a max of a planned size with something else (see PLANNED_MAX_CALL). An operand
+    counts as planned when `planned` appears anywhere in its name (`cached_planned_weight`), not only at its start."""
     sites = []
     for match in PLANNED_MAX_CALL.finditer(source):
         depth, index = 1, match.end()
         while index < len(source) and depth:
             depth += (source[index] == "(") - (source[index] == ")")
             index += 1
-        if re.search(r"\bplanned", source[match.end():index - 1]):
+        if re.search(r"planned", source[match.end():index - 1]):
             sites.append(source[match.start():index])
     for match in PLANNED_TERNARY.finditer(source):
         left, right, first, second = match.groups()
-        if {first, second} == {left, right} and re.search(r"\bplanned", left + " " + right):
+        if {first, second} == {left, right} and re.search(r"planned", left + " " + right):
             sites.append(match.group(0))
     return sites
 
@@ -254,11 +269,12 @@ def evaluate(sycl, cache, module, header, doc=""):
         # ... and neither may anything ELSE in the file. Scoping the ban to the call's argument text (the first
         # repair of llama.cpp-479i's dense Q8_1 src1 buffer) let the same max be hoisted to the line before the
         # call, which is the pre-ijla "zone becomes the high-water mark" defect again. So the ban is file-wide
-        # and exempts exactly ONE spelling: 479i's `std::max(planned_bytes, demand[d].bytes)`, a different
-        # cohort planned to its own graph-entry demand that logs any in-op growth.
-        "no std::max(planned ...) survives outside the one 479i site":
-            len(DENSE_Q8_1_SRC1_GROWTH.findall(sycl)) == 1
-            and not planned_upsizes(DENSE_Q8_1_SRC1_GROWTH.sub("", sycl)),
+        # and exempts exactly TWO spellings, each exactly once (EXEMPT_SITES): 479i's
+        # `std::max(planned_bytes, demand[d].bytes)` and its graph-entry `std::max(planned dequant bytes, b.demand)`,
+        # a different cohort planned to its own graph-entry demand that logs or refuses any growth.
+        "no std::max(planned ...) survives outside the two 479i sites":
+            all(len(exempt.findall(sycl)) == 1 for exempt in EXEMPT_SITES)
+            and not planned_upsizes(without_exempt_sites(sycl)),
         # ABSENCE: with a general fallback present, refusing costs nothing and
         # the cap is decorative -- the batch simply allocates its own scratch.
         "the batched executor keeps no general temporary fallback":
@@ -348,7 +364,7 @@ ABSENCE_MUTANTS = {
         "                                                     std::max(planned_act, act_bytes),\n"
         "                                                     std::max(planned_out, out_bytes), ring_depth)) {"),
     # The same max, hoisted to the line before the call so the call's argument text stays clean.
-    "no std::max(planned ...) survives outside the one 479i site": (
+    "no std::max(planned ...) survives outside the two 479i sites": (
         "sycl",
         "            if (!cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)) {",
         "            const size_t hoisted_weight = std::max(planned_weight, weight_bytes);\n"
@@ -411,6 +427,11 @@ PLANNED_MAX_SPELLINGS = (
     "const size_t h = weight_bytes > planned_weight ? weight_bytes : planned_weight;",
     # a second use of the one exempt spelling is still a second site
     "const size_t h = std::max(planned_bytes, demand[d].bytes);",
+    "const size_t h = std::max(ggml_sycl::unified_cache_get_planned_dequant_f16_buffer_bytes(d, b.is_src1), b.demand);",
+    # the planned value under a name that does not START with `planned`
+    "const size_t h = std::max(cached_planned_weight, weight_bytes);",
+    "const size_t h = std::max(weight_bytes, hoisted_planned_weight);",
+    "const size_t h = cached_planned_weight > weight_bytes ? cached_planned_weight : weight_bytes;",
 )
 
 
@@ -424,7 +445,7 @@ def self_test(sycl, cache, module, header, doc):
             problems.append("mutation anchor missing for the planned-max spellings")
             break
         _, failed, _ = evaluate(base.replace(call_site, squeeze(spelling + "\n" + call_site), 1), cache, module, header, doc)
-        if "no std::max(planned ...) survives outside the one 479i site" not in failed:
+        if "no std::max(planned ...) survives outside the two 479i sites" not in failed:
             problems.append("planned-max check did not fire on: " + spelling)
     for name, (target, anchor, replacement) in ABSENCE_MUTANTS.items():
         sources = {"sycl": sycl, "cache": cache, "module": module, "header": header}
