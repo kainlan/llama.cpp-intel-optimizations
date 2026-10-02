@@ -6,7 +6,10 @@
 // be provoked from outside; the PRIVATE_TESTING seam ggml_sycl_test_inject_scratchpad_decline(site, after_n) forces one
 // at the wrapper's decision and counts what each site did.
 //
-// Each arm builds one small graph on one backend context and computes it twice, the seam off and then on:
+// Each arm builds one small graph on one backend context and computes it twice, the seam off and then on. The graph
+// is computed directly on the SYCL backend with every tensor in a SYCL buffer. It must not go through
+// ggml_backend_sched: the scheduler gives graph inputs to its last backend (the CPU), and the ops that consume them
+// follow, so the first version of this test ran every op on the CPU and read calls == 0 at every site.
 //
 //   off  the wrapper must run: calls == 1, declined == 0, engaged == 1, the output matches a host reference;
 //   on   the wrapper must decline: calls == 1, declined == 1, engaged == 0 and the output still matches the host
@@ -28,7 +31,6 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 #include "ggml-sycl-test.hpp"
 #include "ggml-sycl.h"
 #include "ggml.h"
@@ -183,8 +185,8 @@ struct run_result {
     uint64_t           calls = 0, declined = 0, engaged = 0;
 };
 
-// One compute of the arm's graph on the shared scheduler. inject != 0 forces a decline on that call of the site.
-run_result run_arm(ggml_backend_t backend, ggml_backend_sched_t sched, const arm & a, int inject) {
+// One compute of the arm's graph on the backend. inject != 0 forces a decline on that call of the site.
+run_result run_arm(ggml_backend_t backend, const arm & a, int inject) {
     run_result res;
     ggml_sycl_test_scratchpad_sites_reset();
     if (inject != 0 && !ggml_sycl_test_inject_scratchpad_decline(a.site, inject)) {
@@ -196,7 +198,6 @@ run_result run_arm(ggml_backend_t backend, ggml_backend_sched_t sched, const arm
     const size_t         mem_size  = ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false);
     std::vector<uint8_t> mem_buffer(mem_size);
 
-    ggml_backend_sched_reset(sched);
     ggml_init_params iparams = { /*.mem_size   =*/mem_size, /*.mem_buffer =*/mem_buffer.data(), /*.no_alloc   =*/true };
     ggml_context *   ctx     = ggml_init(iparams);
     if (!ctx) {
@@ -207,22 +208,26 @@ run_result run_arm(ggml_backend_t backend, ggml_backend_sched_t sched, const arm
     arm_graph     g  = a.build(ctx);
     ggml_build_forward_expand(gf, g.out);
 
-    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-        fprintf(stderr, "FAIL: %s: ggml_backend_sched_alloc_graph failed\n", a.name);
+    // Every tensor, views included, lands in one SYCL buffer; an in-place op therefore really is in place.
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_sycl_buffer_type(0));
+    if (!buf) {
+        fprintf(stderr, "FAIL: %s: could not allocate the graph's tensors on the SYCL device\n", a.name);
         ggml_free(ctx);
         return res;
     }
-    std::vector<float> x, w, ref;
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    std::vector<float> x, w;
     a.fill(x, w);
     ggml_backend_tensor_set(g.x, x.data(), 0, x.size() * sizeof(float));
     if (g.w) {
         ggml_backend_tensor_set(g.w, w.data(), 0, w.size() * sizeof(float));
     }
 
-    const ggml_status status = ggml_backend_sched_graph_compute(sched, gf);
-    ggml_backend_sched_synchronize(sched);
+    const ggml_status status = ggml_backend_graph_compute(backend, gf);
+    ggml_backend_synchronize(backend);
     if (status != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "FAIL: %s: graph compute returned %d\n", a.name, (int) status);
+        ggml_backend_buffer_free(buf);
         ggml_free(ctx);
         return res;
     }
@@ -230,12 +235,14 @@ run_result run_arm(ggml_backend_t backend, ggml_backend_sched_t sched, const arm
     if (ggml_sycl::test_backend_has_exec_graph(backend)) {
         fprintf(stderr, "FAIL: %s: the backend recorded an executable graph; the arm is void (run with GGML_SYCL_DISABLE_GRAPH=1)\n",
                 a.name);
+        ggml_backend_buffer_free(buf);
         ggml_free(ctx);
         return res;
     }
 
     res.out.resize((size_t) ggml_nelements(g.out));
     ggml_backend_tensor_get(g.out, res.out.data(), 0, res.out.size() * sizeof(float));
+    ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     if (!ggml_sycl_test_scratchpad_site_counts(a.site, &res.calls, &res.declined, &res.engaged)) {
         fprintf(stderr, "FAIL: %s: the seam does not know the site %s\n", a.name, a.site);
@@ -275,25 +282,10 @@ int main(int, char ** argv) {
                 "      source /opt/intel/oneapi/setvars.sh --force and re-run.\n");
         return LLAMA_TEST_EXIT_SKIP;
     }
-    ggml_backend_t cpu = ggml_backend_cpu_init();  // ggml_backend_sched_new requires a CPU backend last
-    if (!cpu) {
-        fprintf(stderr, "FAIL: ggml_backend_cpu_init failed\n");
-        ggml_backend_free(backend);
-        return 1;
-    }
-    ggml_backend_t       backends[2] = { backend, cpu };
-    ggml_backend_sched_t sched       = ggml_backend_sched_new(backends, nullptr, 2, 4096, false, true);
-    if (!sched) {
-        fprintf(stderr, "FAIL: ggml_backend_sched_new failed\n");
-        ggml_backend_free(cpu);
-        ggml_backend_free(backend);
-        return 1;
-    }
-
     bool ok = true;
     for (const arm & a : make_arms()) {
-        const run_result off = run_arm(backend, sched, a, 0);
-        const run_result on  = run_arm(backend, sched, a, 1);
+        const run_result off = run_arm(backend, a, 0);
+        const run_result on  = run_arm(backend, a, 1);
         if (!off.ok || !on.ok) {
             ok = false;
             continue;
@@ -345,8 +337,6 @@ int main(int, char ** argv) {
         ok = ok && arm_ok;
     }
 
-    ggml_backend_sched_free(sched);
-    ggml_backend_free(cpu);
     ggml_backend_free(backend);
 
     if (!ok) {
