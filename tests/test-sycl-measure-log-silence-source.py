@@ -348,6 +348,7 @@ def structural(raw: str):
         "sched_reserve(",
         "sched_reserve_nothrow(",
         "sycl_select_auto_ubatch(",
+        "sycl_auto_ubatch_prepare(",
         "sycl_resync_runtime_context_flash_attn(",
         "llama_set_abort_callback(",
         "set_n_threads_fns.emplace_back(",

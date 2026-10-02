@@ -239,6 +239,9 @@ def test_the_cohort_ids_are_pinned_and_append_only():
 
 _HOLD_FOLD = "void llama_context::tenant_host_hold_measure_and_fold(const std::vector<ggml_sycl_context_tenant_desc> & current)"
 _SELECT = "void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v)"
+# llama.cpp-7gno: the rung set is made, and handed to the hold, by the trial's hoisted block, which the constructor runs
+# before the memory module exists; the ladder half only reads it.
+_PREPARE = "void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v)"
 
 
 def hold_txn_ok(code: str) -> bool:
@@ -298,11 +301,11 @@ def hold_fold_ok(code: str) -> bool:
 
 
 def hold_select_ok(code: str) -> bool:
-    b = function_body(code, _SELECT)
+    b = function_body(code, _PREPARE)
     set_at = b.find(z("llama_auto_ubatch_rung_set("))
     assign = b.find(z("tenant_rung_set.assign(rung_set, rung_set + n_rung_set);"))
-    first_try = b.find(z("try_candidate(cached_ubatch)"))
-    return set_at != -1 and assign != -1 and first_try != -1 and set_at < assign < first_try
+    # one writer: the ladder half does not hand over (or change) the set
+    return set_at != -1 and assign != -1 and set_at < assign and z("tenant_rung_set") not in function_body(code, _SELECT)
 
 
 def test_the_transaction_applies_the_host_hold_before_the_key():
@@ -377,15 +380,13 @@ def test_hold_mutants():
     # a second writer of R_h
     assert not hold_fold_ok(code + z("void x() { tenant_host_hold.bytes.push_back(1); }"))
 
-    s = function_body(code, _SELECT)
-    for name, old, new in [
-        ("the rung set never handed over", "tenant_rung_set.assign(rung_set, rung_set + n_rung_set);", ""),
-    ]:
-        assert not hold_select_ok(code.replace(s, mutate(s, old, new), 1)), f"mutant {name!r} slipped through the select gate"
-    moved = mutate(s, "tenant_rung_set.assign(rung_set, rung_set + n_rung_set);", "")
-    moved = moved.replace(z("try_candidate(cached_ubatch)"), z("tenant_rung_set.assign(rung_set, rung_set + n_rung_set); try_candidate(cached_ubatch)"), 1)
-    # assigned only after the first transaction could have run
-    assert hold_select_ok(code.replace(s, moved, 1)) is True
-    late = mutate(s, "tenant_rung_set.assign(rung_set, rung_set + n_rung_set);", "")
-    late = late + z("tenant_rung_set.assign(rung_set, rung_set + n_rung_set);")
-    assert not hold_select_ok(code.replace(s, late, 1)), "mutant 'the rung set handed over after the first try' slipped through"
+    s = function_body(code, _PREPARE)
+    assign = "tenant_rung_set.assign(rung_set, rung_set + n_rung_set);"
+    assert not hold_select_ok(code.replace(s, mutate(s, assign, ""), 1)), "mutant 'the rung set never handed over' slipped through"
+    # assigned before the set is computed
+    early = mutate(s, assign, "").replace(z("llama_auto_ubatch_rung_set("), z(assign + " llama_auto_ubatch_rung_set("), 1)
+    assert not hold_select_ok(code.replace(s, early, 1)), "mutant 'the rung set handed over before it exists' slipped through"
+    # a second writer in the ladder half
+    sel = function_body(code, _SELECT)
+    assert not hold_select_ok(code.replace(sel, sel.replace(z("sycl_hold_spill_validated_ub=0;"), z("sycl_hold_spill_validated_ub=0;" + assign), 1), 1)), \
+        "mutant 'the ladder half writes the hold's set' slipped through"

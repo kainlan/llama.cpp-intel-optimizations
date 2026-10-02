@@ -4,9 +4,8 @@ The pure decisions live in `src/llama-residency-fixpoint.h` and run in test-resi
 this gate pins where the constructor calls them, on comment-stripped text, because a host test
 cannot reach `llama_context`'s constructor:
 
-- one hoisted block, before `model.create_memory(`, makes the trial decision, the ladder cap, the
-  tuning-cache lookup and the rung set (so the fixpoint can read the rung set), and
-  `sycl_select_auto_ubatch` consumes what that block stored instead of looking the cache up again;
+- the hoisted block (`sycl_auto_ubatch_prepare`, pinned by test-sycl-auto-ubatch-hoist-source.py) runs
+  before everything below, so the rung set exists when the fixpoint runs;
 - the plan_caps decision is `llama_plan_caps_decide` over the context's own facts (a SYCL backend,
   the active-plan predicate, the two cap procs, `l4_procs.available()`), made once;
 - a refusal is the named text of `llama_plan_caps_missing_procs_reason()`, thrown before anything
@@ -57,27 +56,12 @@ def positions(text: str, needles: list) -> list:
     return out
 
 
-def test_hoisted_block_precedes_memory():
-    ctor = ctor_text(code_of(CTX_CPP))
-    pos = positions(
-        ctor,
-        [
-            "llama_auto_ubatch_trial_runs(",
-            "llama_auto_ubatch_cap(",
-            "llama_auto_ubatch_rung_set(",
-            "model.create_memory(",
-            "sycl_select_auto_ubatch(",
-        ],
-    )
-    assert pos == sorted(pos), pos
-
-
 def test_decision_and_acquisition_order():
     ctor = ctor_text(code_of(CTX_CPP))
     pos = positions(
         ctor,
         [
-            "llama_auto_ubatch_rung_set(",
+            "sycl_auto_ubatch_prepare(",
             "llama_plan_caps_decide(",
             "llama_plan_caps_missing_procs_reason()",
             "plan_caps = llama_plan_caps_ptr(",
@@ -118,16 +102,6 @@ def test_acquisition_is_the_only_assignment_under_the_acquire_arm():
     arm = arm[: arm.index("}")]
     assert z("plan_caps = llama_plan_caps_ptr(plan_procs.caps_new(), llama_plan_caps_deleter{ plan_procs.caps_free })") in arm
     assert z("if (!plan_caps)") in arm
-
-
-def test_ladder_consumes_the_hoisted_lookup():
-    code = code_of(CTX_CPP)
-    ctor = ctor_text(code)
-    assert ctor.count(z("cache_lookup_fn(")) == 1
-    start = code.index(z(_SELECT) + "{")
-    end = code.index(z(_CTOR_HEAD.split("(")[0]), start) if z(_CTOR_HEAD.split("(")[0]) in code[start:] else len(code)
-    sel = code[start:end]
-    assert z("cache_lookup_fn(") not in sel
 
 
 def test_mutants():

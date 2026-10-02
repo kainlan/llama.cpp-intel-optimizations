@@ -146,7 +146,10 @@ _CALL_SITE_END = "if (!cparams.flash_attn) {"
 # -- see test_sycl_select_auto_ubatch_takes_type_k_and_type_v below) --
 # updated here since every other check in this file depends on this exact
 # string via _trial_body().
-_TRIAL_START = "void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) {"
+# llama.cpp-7gno: the trial is two functions now. The hoisted block (sycl_auto_ubatch_prepare: the SYCL backends and
+# procs, the cap, the cache key and lookup, the rung set) sits right before sycl_select_auto_ubatch (the per-candidate
+# validator, the ladder, the settle and the outcome lines), so one slice from the first to the end marker is the trial.
+_TRIAL_START = "void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v) {"
 # The trial is followed by upstream's llama_graph_n_input_tensors() helper,
 # not by sched_reserve() itself; ending at sched_reserve() would pull that
 # helper's LLAMA_LOG_WARN into the trial body.
@@ -330,6 +333,18 @@ def test_candidate_cap_uses_n_batch_and_n_ctx():
 # ---------------------------------------------------------------------------
 
 
+def _empty_prep_exit_precedes_the_loop() -> None:
+    """llama.cpp-7gno: every single-reserve exit of the hoisted block leaves the prep empty, and the trial's one answer to
+    an empty prep is the pre-trial path: sched_reserve() then return, before the ladder loop and with no WARN."""
+    body_norm = _normalize_ws(_trial_body())
+    exit_idx = body_norm.find("if (!auto_ubatch_prep) { sched_reserve(); return; }")
+    loop_idx = body_norm.find("for (uint32_t c : rung_ladder)")
+    warn_idx = body_norm.find("[SYCL-PLAN] auto n_ubatch=")
+    assert exit_idx != -1, "an empty prep must take the single reserve: `if (!auto_ubatch_prep) { sched_reserve(); return; }`"
+    assert exit_idx < loop_idx and exit_idx < warn_idx, "the empty-prep exit must precede the ladder loop and the WARN"
+
+
+
 def test_cap_below_first_rung_exits_before_the_loop_with_no_warn():
     """Q2a: when the fully-narrowed cap is below the ladder's first rung
     (any -c below 512, or llama-bench's pp128/tg128 rows), the function
@@ -346,9 +361,10 @@ def test_cap_below_first_rung_exits_before_the_loop_with_no_warn():
     assert cap_check_idx < warn_idx, "the WARN literal must not appear before the cap < ladder[0] check"
 
     early_exit_block = body_norm[cap_check_idx : body_norm.find("}", cap_check_idx) + 1]
-    assert re.search(r"sched_reserve\(\s*\)\s*;\s*return\s*;", early_exit_block), (
-        "the early exit must call sched_reserve() then return, with no publish and no WARN in between"
+    assert re.search(r"\{\s*return\s*;\s*\}", early_exit_block), (
+        "the early exit must return with the prep empty, with no publish and no WARN in between"
     )
+    _empty_prep_exit_precedes_the_loop()
 
 
 def test_cap_below_first_rung_early_exit_has_a_mutation_witness():
@@ -359,7 +375,6 @@ def test_cap_below_first_rung_early_exit_has_a_mutation_witness():
     raw = LLAMA_CONTEXT_CPP
     early_exit_block = (
         "    if (cap < ladder[0]) {\n"
-        "        sched_reserve();\n"
         "        return;\n"
         "    }\n"
     )
@@ -382,7 +397,7 @@ def test_zero_sycl_token_exits_before_the_loop_with_no_warn():
     a model with no SYCL token as "not the published model"."""
     body_norm = _normalize_ws(_trial_body())
     guard_idx = body_norm.find("if (owner.model_id == 0 || owner.load_txn_id == 0) {")
-    token_idx = body_norm.find("const ggml_sycl_model_token token")
+    token_idx = body_norm.find("const ggml_sycl_model_token token")  # the select half builds it after the hoisted guard
     loop_idx = body_norm.find("for (uint32_t c : rung_ladder)")
     warn_idx = body_norm.find("[SYCL-PLAN] auto n_ubatch=")
     assert guard_idx != -1, "the zero-token guard must exist"
@@ -393,9 +408,10 @@ def test_zero_sycl_token_exits_before_the_loop_with_no_warn():
     assert guard_idx < warn_idx, "the WARN literal must not appear before the zero-token guard"
 
     guard_block = body_norm[guard_idx : body_norm.find("}", guard_idx) + 1]
-    assert re.search(r"sched_reserve\(\s*\)\s*;\s*return\s*;", guard_block), (
-        "the zero-token guard must call sched_reserve() then return, with no publish and no WARN in between"
+    assert re.search(r"\{\s*return\s*;\s*\}", guard_block), (
+        "the zero-token guard must return with the prep empty, with no publish and no WARN in between"
     )
+    _empty_prep_exit_precedes_the_loop()
 
 
 def test_zero_sycl_token_guard_has_a_mutation_witness():
@@ -404,7 +420,6 @@ def test_zero_sycl_token_guard_has_a_mutation_witness():
     raw = LLAMA_CONTEXT_CPP
     guard_block = (
         "    if (owner.model_id == 0 || owner.load_txn_id == 0) {\n"
-        "        sched_reserve();\n"
         "        return;\n"
         "    }\n"
     )
@@ -1965,7 +1980,7 @@ def test_cache_devices_list_every_sycl_backend_in_order():
     filled before it is handed to cache_key -- a list of only the first
     backend would name one card for a scheduler-visible split."""
     body_norm = _normalize_ws(_trial_body())
-    decl_idx = body_norm.find("std::vector<int> cache_devices;")
+    decl_idx = body_norm.find("std::vector<int> & cache_devices = prep->cache_devices;")
     assert decl_idx != -1, "could not find the cache_devices declaration"
     loop_idx = body_norm.find("for (auto & sb : sycl_backends)", decl_idx)
     assert loop_idx != -1, "cache_devices must be filled via a loop over sycl_backends"

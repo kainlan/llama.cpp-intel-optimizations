@@ -3801,6 +3801,16 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-7gno: source gate for the auto n_ubatch trial's hoisted block (the decisions the planned ladder's rung set
+# depends on are made before the memory module exists; the [SYCL-PLAN] lines stay in the ladder, byte for byte).
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-auto-ubatch-hoist-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-auto-ubatch-hoist-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-7gno (RED): source gate for the constructor's planned-reserve wiring (hoisted ladder block, the
 # plan_caps decision and acquisition, the fixpoint before create_memory). Production-unreachable until 7gno.
 if (Python3_Interpreter_FOUND)

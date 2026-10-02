@@ -517,6 +517,45 @@ private:
     // candidates fit without changing anything else the key tracks.
     void sycl_select_auto_ubatch(enum ggml_type type_k, enum ggml_type type_v);
 
+    // llama.cpp-7gno: what the trial decides before the memory module exists, so the planned ladder's rung set is known
+    // when the constructor's residency fixpoint runs. sycl_auto_ubatch_prepare() makes every decision the trial's
+    // single-reserve exits and its rung set depend on (the SYCL backends and procs, the cap and its MoE ceiling, the
+    // tuning-cache lookup, the rung set) and stores them here; sycl_select_auto_ubatch() reads them and looks nothing
+    // up again. Empty when the trial takes its single reserve (and after the constructor is done with it).
+    struct sycl_auto_ubatch_probe_backend {
+        ggml_backend_t backend;
+        int            dev_index;
+    };
+    struct sycl_auto_ubatch_prep {
+        std::vector<sycl_auto_ubatch_probe_backend> backends;
+
+        decltype(&ggml_backend_sycl_probe_runtime_context_for_model) probe_fn      = nullptr;
+        decltype(&ggml_backend_sycl_compute_buffer_host_fallbacks)   fallback_fn   = nullptr;
+        decltype(&ggml_backend_sycl_planned_hold_spill_fits)         hold_spill_fn = nullptr;
+
+        decltype(&ggml_backend_sycl_ubatch_cache_enabled)        cache_enabled_fn = nullptr;
+        decltype(&ggml_backend_sycl_ubatch_cache_path)           cache_path_fn    = nullptr;
+        decltype(&ggml_backend_sycl_ubatch_cache_lookup_layout1) cache_lookup_fn  = nullptr;
+        decltype(&ggml_backend_sycl_ubatch_cache_store_layout1)  cache_store_fn   = nullptr;
+        bool have_cache_accessors = false;
+        bool cache_available      = false;
+
+        uint32_t cap       = 0;
+        bool     moe_bound = false;
+
+        // The key points into cache_devices, so the struct is never copied: it lives behind a unique_ptr.
+        std::vector<int>           cache_devices;
+        ggml_sycl_ubatch_cache_key cache_key{};
+        char                       cache_path_buf[512] = { 0 };
+
+        uint32_t              cached_ubatch          = 0;
+        char                  cached_reason_buf[64] = { 0 };
+        bool                  cache_usable           = false;
+        std::vector<uint32_t> rung_ladder;  // the rung set's ladder members, ascending
+    };
+    std::unique_ptr<sycl_auto_ubatch_prep> auto_ubatch_prep;
+    void sycl_auto_ubatch_prepare(enum ggml_type type_k, enum ggml_type type_v);
+
     // llama.cpp-kpjw: the n_ubatch whose compute buffers the auto-ubatch trial already passed the realized hold-spill
     // check for, and which is the sched the constructor is left with (the winner's reserve, not re-made by the
     // settle step); 0 when nothing was validated (a pinned -ub, a trial that exited early, a settle that
