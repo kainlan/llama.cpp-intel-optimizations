@@ -1174,6 +1174,20 @@ int main() {
         };
         in.rungs = huge;
         CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 600) == 0, "when no rung fits, nothing is named");
+        // Below the 32 floor nothing is searched: a refused n_ubatch under 32 names 0, never a rung ABOVE it. The plan
+        // here is deliberately larger for the small n_ubatch, so a search that started at 32 would find a fit and name
+        // 32 for a request of 31.
+        auto plan_small_costs_more = [](void *, uint32_t n_ubatch) -> size_t {
+            return n_ubatch < 32 ? 400 * 1024 * 1024 : 1024 * 1024;
+        };
+        ggml_sycl::zone_hold_rung_request tiny[] = {
+            { 32, 1 * MiB }
+        };
+        in.rungs   = tiny;
+        in.plan_of = plan_small_costs_more;
+        CHECK(!ggml_sycl::zone_hold_fit(in, 31), "31 does not fit under the 400 MB plan");
+        CHECK(ggml_sycl::zone_hold_fit(in, 32), "32 fits under the 1 MB plan");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 31) == 0, "a refused n_ubatch under 32 names nothing above it");
     }
 
     // ---- Case 32 (kpjw-r7 I5, N4/N5): the compute-allocation scope is a per-thread depth that cannot go negative. A
