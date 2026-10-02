@@ -139,35 +139,38 @@ void case_tenant_order_cannot_matter() {
         compute_tenant(1, 1, 120 * MiB),
     };
     std::sort(tenants.begin(), tenants.end(), ggml_sycl::runtime_context_tenant_less);
-    in.tenants                   = tenants;
+    in.tenants                        = tenants;
     const residency_probe_result want = residency_probe_core(in);
     CHECK(want.status == OK, "the two-device case answers OK");
     CHECK(!hosts(want).empty(), "the case demotes something, or the permutations prove nothing");
     size_t n_perm = 0;
     do {
-        in.tenants                          = tenants;
+        in.tenants                       = tenants;
         const residency_probe_result got = residency_probe_core(in);
         CHECK(got.status == want.status && got.host_resident == want.host_resident,
               "a permutation of the tenants changed the answer");
         ++n_perm;
-    } while (std::next_permutation(tenants.begin(), tenants.end(), [](const runtime_context_tenant & a,
-                                                                      const runtime_context_tenant & b) {
-        return ggml_sycl::runtime_context_tenant_less(a, b);
-    }));
+    } while (std::next_permutation(tenants.begin(), tenants.end(),
+                                   [](const runtime_context_tenant & a, const runtime_context_tenant & b) {
+                                       return ggml_sycl::runtime_context_tenant_less(a, b);
+                                   }));
     CHECK(n_perm == 24, "all 24 orders were tried");
 }
 
 void case_forced_host() {
     residency_probe_input in = single_device(2000 * MiB);
     CHECK(hosts(residency_probe_core(in)).empty(), "with room for everything nothing is on the host");
-    in.forced_host = { 2 };
+    in.forced_host           = { 2 };
     residency_probe_result r = residency_probe_core(in);
-    CHECK(r.status == OK && hosts(r) == std::vector<uint32_t>({ 2 }), "a forced layer stays on the host with room for it");
+    CHECK(r.status == OK && hosts(r) == std::vector<uint32_t>({ 2 }),
+          "a forced layer stays on the host with room for it");
 
     in.forced_host = { 3, 3 };
-    CHECK(residency_probe_core(in).status == GGML_SYCL_RESIDENCY_PROBE_INVALID, "the same layer forced twice is INVALID");
+    CHECK(residency_probe_core(in).status == GGML_SYCL_RESIDENCY_PROBE_INVALID,
+          "the same layer forced twice is INVALID");
     in.forced_host = { 8 };
-    CHECK(residency_probe_core(in).status == GGML_SYCL_RESIDENCY_PROBE_INVALID, "a forced index past the model is INVALID");
+    CHECK(residency_probe_core(in).status == GGML_SYCL_RESIDENCY_PROBE_INVALID,
+          "a forced index past the model is INVALID");
     in.layers[5]   = no_kv_layer();
     in.forced_host = { 5 };
     r              = residency_probe_core(in);
@@ -183,7 +186,8 @@ void case_no_promotion() {
 
     in.no_promotion = true;
     r               = residency_probe_core(in);
-    CHECK(r.status == GGML_SYCL_RESIDENCY_PROBE_NO_PROMOTION_VIOLATED, "the same demotion under no_promotion is a violation");
+    CHECK(r.status == GGML_SYCL_RESIDENCY_PROBE_NO_PROMOTION_VIOLATED,
+          "the same demotion under no_promotion is a violation");
     CHECK(r.host_resident.empty() && !r.reason.empty(), "a violation carries a reason and no vector");
 
     // The demotion the caller already forced is inherited, not a violation.
@@ -257,25 +261,29 @@ void case_tenants_only_add_host_layers() {
     residency_probe_input with = none;
     with.tenants.push_back(compute_tenant(0, 0, 150 * MiB));
     CHECK(hosts(residency_probe_core(none)).empty(), "control: nothing is demoted without the tenant");
-    CHECK(hosts(residency_probe_core(with)) == std::vector<uint32_t>({ 7 }), "control: the tenant alone demotes layer 7");
+    CHECK(hosts(residency_probe_core(with)) == std::vector<uint32_t>({ 7 }),
+          "control: the tenant alone demotes layer 7");
 }
 
 void case_invalid_input() {
     residency_probe_input base = single_device(900 * MiB);
 
-    residency_probe_input in = base;
-    runtime_context_tenant t = compute_tenant(0, 0, 10 * MiB);
-    t.cohort                 = 9999;
+    residency_probe_input  in = base;
+    runtime_context_tenant t  = compute_tenant(0, 0, 10 * MiB);
+    t.cohort                  = 9999;
     in.tenants.push_back(t);
-    CHECK(residency_probe_core(in).status == GGML_SYCL_RESIDENCY_PROBE_INVALID, "a tenant of an unknown cohort is INVALID");
+    CHECK(residency_probe_core(in).status == GGML_SYCL_RESIDENCY_PROBE_INVALID,
+          "a tenant of an unknown cohort is INVALID");
 
     in = base;
     in.tenants.push_back(compute_tenant(3, 0, 10 * MiB));
-    CHECK(residency_probe_core(in).status == GGML_SYCL_RESIDENCY_PROBE_INVALID, "a tenant on a device with no geometry is INVALID");
+    CHECK(residency_probe_core(in).status == GGML_SYCL_RESIDENCY_PROBE_INVALID,
+          "a tenant on a device with no geometry is INVALID");
 
-    in = base;
+    in                  = base;
     in.layers[4].device = 5;
-    CHECK(residency_probe_core(in).status == GGML_SYCL_RESIDENCY_PROBE_INVALID, "a layer planned on a device with no geometry is INVALID");
+    CHECK(residency_probe_core(in).status == GGML_SYCL_RESIDENCY_PROBE_INVALID,
+          "a layer planned on a device with no geometry is INVALID");
 
     // A host-tier tenant names no zone: the answer is the one without it.
     in = base;
@@ -290,6 +298,34 @@ void case_invalid_input() {
     CHECK(r.status == OK && r.host_resident == w.host_resident, "a host-tier tenant changed the device answer");
 }
 
+// The caller's result struct is gated on what the caller declared, before the proc writes a byte of it: a pointer, a
+// struct_size at least the one this module was built with and the version it knows.  An older or smaller struct (a
+// caller built against a layout with fewer fields) is refused, never written past its declared size; a larger one
+// (a newer caller) is read as the layout this module knows.
+void case_out_struct_gate() {
+    ggml_sycl_residency_probe out{};
+    out.struct_size = sizeof(out);
+    out.version     = GGML_SYCL_RESIDENCY_PROBE_VERSION;
+    CHECK(residency_probe_out_declared(&out), "control: a correctly declared struct is accepted");
+    CHECK(!residency_probe_out_declared(nullptr), "a null result is refused");
+
+    for (uint32_t size = 0; size < sizeof(out); ++size) {
+        out.struct_size = size;
+        CHECK(!residency_probe_out_declared(&out), "a struct_size below the layout this module writes is refused");
+    }
+    out.struct_size = sizeof(out) - 1;
+    CHECK(!residency_probe_out_declared(&out), "one byte short is refused");
+
+    out.struct_size = sizeof(out) + 8;
+    CHECK(residency_probe_out_declared(&out), "a larger (newer) struct is read as the layout this module knows");
+
+    out.struct_size = sizeof(out);
+    for (uint32_t version : { 0u, (uint32_t) GGML_SYCL_RESIDENCY_PROBE_VERSION + 1u, 0xFFFFFFFFu }) {
+        out.version = version;
+        CHECK(!residency_probe_out_declared(&out), "a version this module does not know is refused");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -301,6 +337,7 @@ int main() {
     case_head_slot_refused();
     case_tenants_only_add_host_layers();
     case_invalid_input();
+    case_out_struct_gate();
     std::printf("test-residency-probe-core: all cases passed\n");
     return 0;
 }

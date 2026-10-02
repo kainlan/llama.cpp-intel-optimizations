@@ -26,6 +26,16 @@
 //       buffer still claims from it, and the last free releases every slot;
 //  (12) the slot's memory is pinned USM, not merely readable host memory.
 //
+// The residency probe's proc, on the same real backend (llama.cpp-moua L4 step 3d, llama.cpp-5cim):
+//
+//  (13) until step 1d wires the zone geometry the proc answers GEOMETRY_NOT_WIRED: it writes out->n_layer (the
+//       layer count the descriptor names; a sentinel pre-set there proves the write) and not one byte of the
+//       caller's host_resident, which is pre-filled with 0xA5 and read back whole, guard bytes either side
+//       included; a buffer too small answers N_LAYER_CAP_TOO_SMALL the same way; a struct the caller declared
+//       short or of another version is refused with nothing written, n_layer included; a larger declared struct
+//       is read as the layout the module knows and its tail is not touched; a backend that is not a SYCL backend
+//       of this module is FOREIGN_BACKEND.  A control proves the checker sees a single changed byte.
+//
 // Tiny allocations only (megabytes).  Run pinned to one discrete card:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:0 build/bin/test-sycl-host-tenant-claim
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
@@ -534,6 +544,215 @@ void case_teardown() {
     }
 }
 
+// ---- (13) the residency probe's proc -------------------------------------------------------------
+
+constexpr uint8_t  probe_fill      = 0xA5;
+constexpr uint32_t probe_n_layer_0 = 0xDEADBEEFu;  // what out->n_layer holds until the proc writes it
+constexpr size_t   probe_guard     = 16;           // bytes either side of the caller's host_resident buffer
+
+// The caller's side of one probe call: the result struct (with a tail after it, for a caller that declares a
+// larger one) and a host_resident buffer with guard bytes either side, every byte of all of it 0xA5 until the proc
+// writes.
+struct probe_call {
+    struct {
+        ggml_sycl_residency_probe out;
+        uint8_t                   tail[32];
+    } s{};
+
+    std::vector<uint8_t> bytes;
+    uint32_t             cap;
+
+    explicit probe_call(uint32_t cap_) : bytes(probe_guard + cap_ + probe_guard, probe_fill), cap(cap_) {
+        std::memset(s.tail, probe_fill, sizeof(s.tail));
+        s.out.struct_size   = sizeof(s.out);
+        s.out.version       = GGML_SYCL_RESIDENCY_PROBE_VERSION;
+        s.out.n_layer_cap   = cap_;
+        s.out.n_layer       = probe_n_layer_0;
+        s.out.host_resident = bytes.data() + probe_guard;
+    }
+
+    // Every byte of the buffer, guards included, is still the fill.
+    bool buffer_untouched() const {
+        for (uint8_t b : bytes) {
+            if (b != probe_fill) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool tail_untouched() const {
+        for (uint8_t b : s.tail) {
+            if (b != probe_fill) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+// A descriptor of `n_layer` KV layers and no tenants.
+struct kv_only_desc {
+    std::vector<ggml_sycl_kv_layer_desc> layers;
+    ggml_sycl_runtime_context_desc       desc{};
+
+    explicit kv_only_desc(uint32_t n_layer) : layers(n_layer) {
+        for (ggml_sycl_kv_layer_desc & l : layers) {
+            l.n_embd_k_gqa  = 1024;
+            l.n_embd_v_gqa  = 1024;
+            l.n_head_kv     = 8;
+            l.n_embd_head_k = 128;
+            l.has_kv        = 1;
+        }
+        desc.struct_size        = sizeof(desc);
+        desc.version            = GGML_SYCL_RUNTIME_CONTEXT_DESC_VERSION;
+        desc.type_k             = GGML_TYPE_F16;
+        desc.type_v             = GGML_TYPE_F16;
+        desc.n_stream           = 1;
+        desc.n_layer            = n_layer;
+        desc.layer_desc_size    = sizeof(ggml_sycl_kv_layer_desc);
+        desc.layers             = layers.data();
+        // no tenants and no recurrent layers, at their element strides
+        desc.tenant_desc_size   = sizeof(ggml_sycl_context_tenant_desc);
+        desc.rs_layer_desc_size = sizeof(ggml_sycl_rs_layer_desc);
+    }
+
+    kv_only_desc(const kv_only_desc &)             = delete;
+    kv_only_desc & operator=(const kv_only_desc &) = delete;
+};
+
+ggml_sycl_residency_probe_status probe(ggml_backend_t                         backend,
+                                       ggml_sycl_model_token                  model,
+                                       probe_call &                           c,
+                                       const ggml_sycl_runtime_context_desc * desc) {
+    return ggml_backend_sycl_probe_residency(backend, model, N_CTX, N_UBATCH, N_SEQ, /*kv_unified=*/false,
+                                             /*swa_full=*/false, /*flash_attn_enabled=*/true, desc, &c.s.out);
+}
+
+void case_probe_residency() {
+    require_slots(0, "slots are alive before the case began");
+    lifecycle_fixture f;
+
+    // The control: the checker sees one changed byte, at the first, a middle and the last position, and in a guard.
+    {
+        probe_call c(8);
+        require(c.buffer_untouched() && c.tail_untouched(), "a fresh call is not all fill");
+        const size_t positions[] = {
+            0, probe_guard, probe_guard + 3, probe_guard + 7, probe_guard + 8, c.bytes.size() - 1
+        };
+        for (size_t at : positions) {
+            c.bytes[at] ^= 0xFF;
+            require(!c.buffer_untouched(), "the untouched check missed a changed byte");
+            c.bytes[at] ^= 0xFF;
+        }
+        c.s.tail[31] ^= 0xFF;
+        require(!c.tail_untouched(), "the tail check missed a changed byte");
+    }
+
+    // A descriptor of 6 layers, a buffer that holds them: not wired, the layer count written, the buffer untouched.
+    {
+        const kv_only_desc d(6);
+        probe_call         c(6);
+        const auto         status = probe(f.backend, f.model, c, &d.desc);
+        require(status == GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED, "the probe did not answer GEOMETRY_NOT_WIRED");
+        require(c.s.out.n_layer == 6, "the probe did not write the layer count the descriptor names");
+        require(c.buffer_untouched(), "the probe wrote host_resident before the geometry is wired");
+        require(c.tail_untouched(), "the probe wrote past the struct it was given");
+        require(c.s.out.n_layer_cap == 6 && c.s.out.struct_size == sizeof(c.s.out) &&
+                    c.s.out.host_resident == c.bytes.data() + probe_guard,
+                "the probe changed a field the caller owns");
+    }
+    // A buffer of 5 for 6 layers: the cap refusal, still only n_layer written.
+    {
+        const kv_only_desc d(6);
+        probe_call         c(5);
+        const auto         status = probe(f.backend, f.model, c, &d.desc);
+        require(status == GGML_SYCL_RESIDENCY_PROBE_N_LAYER_CAP_TOO_SMALL,
+                "a buffer of 5 for 6 layers was not refused");
+        require(c.s.out.n_layer == 6, "the cap refusal did not write the layer count the caller needs");
+        require(c.buffer_untouched(), "the cap refusal wrote host_resident");
+    }
+    // No descriptor: the backend has no layer count, so it writes 0 (a write the sentinel proves), and a zero cap fits it.
+    {
+        probe_call c(0);
+        const auto status = probe(f.backend, f.model, c, nullptr);
+        require(status == GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED,
+                "no descriptor did not answer GEOMETRY_NOT_WIRED");
+        require(c.s.out.n_layer == 0, "no descriptor did not write n_layer = 0");
+        require(c.buffer_untouched(), "the no-descriptor answer wrote host_resident");
+    }
+    // The caller's struct is gated on what it declared: short or of another version, nothing is written at all.
+    {
+        const kv_only_desc d(6);
+        const uint32_t     sizes[] = { 0, 1, 12, 16, 20, (uint32_t) sizeof(ggml_sycl_residency_probe) - 1 };
+        for (uint32_t size : sizes) {
+            probe_call c(6);
+            c.s.out.struct_size = size;
+            require(probe(f.backend, f.model, c, &d.desc) == GGML_SYCL_RESIDENCY_PROBE_INVALID,
+                    "a struct declared shorter than the layout was not refused");
+            require(c.s.out.n_layer == probe_n_layer_0, "a refused short struct was written to (n_layer)");
+            require(c.buffer_untouched() && c.tail_untouched(), "a refused short struct was written past");
+        }
+        for (uint32_t version : { 0u, (uint32_t) GGML_SYCL_RESIDENCY_PROBE_VERSION + 1u }) {
+            probe_call c(6);
+            c.s.out.version = version;
+            require(probe(f.backend, f.model, c, &d.desc) == GGML_SYCL_RESIDENCY_PROBE_INVALID,
+                    "a struct of another version was not refused");
+            require(c.s.out.n_layer == probe_n_layer_0, "a refused version was written to (n_layer)");
+            require(c.buffer_untouched() && c.tail_untouched(), "a refused version was written past");
+        }
+        require(ggml_backend_sycl_probe_residency(f.backend, f.model, N_CTX, N_UBATCH, N_SEQ, false, false, true,
+                                                  &d.desc, nullptr) == GGML_SYCL_RESIDENCY_PROBE_INVALID,
+                "a null result was not refused");
+    }
+    // A caller that declares a larger struct (a newer caller) is read as the layout this module knows: the same
+    // answer, and the bytes after the known layout are not touched.
+    {
+        const kv_only_desc d(6);
+        probe_call         c(6);
+        c.s.out.struct_size = sizeof(c.s.out) + sizeof(c.s.tail);
+        require(probe(f.backend, f.model, c, &d.desc) == GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED,
+                "a larger declared struct did not answer GEOMETRY_NOT_WIRED");
+        require(c.s.out.n_layer == 6 && c.buffer_untouched() && c.tail_untouched(),
+                "a larger declared struct changed more than n_layer");
+    }
+    // A malformed descriptor is INVALID with n_layer written 0 (the proc zeroes it before it reads the descriptor)
+    // and no host_resident byte written.
+    {
+        kv_only_desc d(6);
+        d.desc.version = 99;
+        probe_call c(6);
+        require(probe(f.backend, f.model, c, &d.desc) == GGML_SYCL_RESIDENCY_PROBE_INVALID,
+                "an unknown descriptor version was not refused");
+        require(c.s.out.n_layer == 0 && c.buffer_untouched(), "a refused descriptor wrote more than a zero n_layer");
+    }
+    // A zero shape is refused before the descriptor is read.
+    {
+        const kv_only_desc d(6);
+        probe_call         c(6);
+        require(ggml_backend_sycl_probe_residency(f.backend, f.model, 0, N_UBATCH, N_SEQ, false, false, true, &d.desc,
+                                                  &c.s.out) == GGML_SYCL_RESIDENCY_PROBE_INVALID,
+                "a zero n_ctx was not refused");
+        require(c.buffer_untouched(), "a refused shape wrote host_resident");
+    }
+    // A backend that is not a SYCL backend of this module.
+    {
+        ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        if (cpu != nullptr) {
+            const kv_only_desc d(6);
+            probe_call         c(6);
+            const auto         status = probe(cpu, f.model, c, &d.desc);
+            ggml_backend_free(cpu);
+            require(status == GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND, "a CPU backend was not FOREIGN_BACKEND");
+            require(c.buffer_untouched(), "a foreign backend's refusal wrote host_resident");
+        } else {
+            std::cerr << "note: no CPU backend is registered in this build; the FOREIGN_BACKEND arm did not run\n";
+        }
+    }
+    // A pure plan query: it held and released nothing.
+    require_slots(0, "the probe left a host slot behind");
+}
+
 // A failure names the case it came from.
 void run_case(const char * name, void (*fn)()) {
     try {
@@ -550,6 +769,7 @@ void run() {
     run_case("republish_refused", case_republish_refused);
     run_case("refused_reservation", case_refused_reservation);
     run_case("teardown", case_teardown);
+    run_case("probe_residency", case_probe_residency);
 }
 
 }  // namespace
