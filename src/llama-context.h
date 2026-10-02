@@ -638,6 +638,20 @@ private:
     // The plan line, one per device the section names, at INFO.
     void tenant_plan_report(const sched_measure_plan & plan, uint32_t n_ubatch);
 
+    // The host tier's HOLD (design 3.3): R_h over the auto n_ubatch ladder's rung set, folded once, at the
+    // context's first planned transaction, from the section each rung's own MEASURE produced. Every later
+    // transaction raises its section's COMPUTE_HOST slots to it, so a rung of the set never needs host room
+    // the first publish did not carve. `tenant_rung_set` is the set sycl_select_auto_ubatch computed (empty
+    // for a pinned -ub: the set is then the one rung the context runs at).
+    llama_tenant_host_hold tenant_host_hold;
+    bool                   tenant_host_hold_ready = false;
+    std::vector<uint32_t>  tenant_rung_set;
+
+    // Folds R_h: `current` is the section the transaction just built at cparams.n_ubatch, every other rung
+    // of the set is measured here. A rung whose measure fails is left out: it fails the same way when the
+    // ladder tries it.
+    void tenant_host_hold_fold(const std::vector<ggml_sycl_context_tenant_desc> & current);
+
     bool sched_need_reserve = true;
 
     // true for the transient context a load-time measure builds (set by its constructor); such a

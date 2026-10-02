@@ -2400,6 +2400,8 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     const size_t n_rungs = llama_auto_ubatch_ladder_members(rung_set, n_rung_set, ladder, llama_auto_ubatch_ladder_size,
                                                             rungs, llama_auto_ubatch_rung_set_capacity);
     std::vector<uint32_t> rung_ladder(rungs, rungs + n_rungs);
+    // The set is the host hold's: R_h is folded over every rung the trial may try, at its first transaction.
+    tenant_rung_set.assign(rung_set, rung_set + n_rung_set);
 
     if (cache_available) {
         if (!cache_usable) {
@@ -2850,6 +2852,13 @@ sched_reserve_result llama_context::sched_reserve_transaction() {
             // publish below (PLAN_REJECTED) and carries the fit flag there.
             return { sched_reserve_status::REFUSED, tenant_reason };
         }
+        // The host tier is held at R_h, the largest any rung of the ladder's set needs, so the section carries it
+        // from the first publish on and a rung of the set never grows a host slot.
+        if (!tenant_host_hold_ready) {
+            tenant_host_hold_fold(tenant_section);
+        }
+        llama_tenant_section_apply_host_hold(tenant_section, tenant_host_hold);
+
         tenant_key = llama_tenant_key_digest(tenant_section);
         tenant_plan_report(storage.plan, storage.cparams.n_ubatch);
 
@@ -2878,6 +2887,41 @@ sched_reserve_result llama_context::sched_reserve_transaction() {
     fused_resolution    resolution;
     state.resolution = &resolution;
     return sched_reserve_impl(sched_reserve_mode::ALLOC, state);
+}
+
+void llama_context::tenant_host_hold_fold(const std::vector<ggml_sycl_context_tenant_desc> & current) {
+    tenant_host_hold       = llama_tenant_host_hold();
+    tenant_host_hold_ready = true;
+
+    llama_tenant_host_hold_fold(tenant_host_hold, current);
+
+    // the set is ascending and holds the rung the context runs at now; that rung is `current`
+    for (const uint32_t rung : tenant_rung_set) {
+        if (rung == cparams.n_ubatch) {
+            continue;
+        }
+        sched_measure_storage storage(cparams);
+        storage.cparams.n_ubatch  = rung;
+        sched_reserve_state state = storage.state();
+
+        const sched_reserve_result measured = sched_reserve_impl(sched_reserve_mode::MEASURE, state);
+        if (measured.status != sched_reserve_status::OK) {
+            LLAMA_LOG_DEBUG("%s: rung %u left out of the host hold: %s\n", __func__, rung, measured.reason.c_str());
+            continue;
+        }
+
+        std::vector<ggml_sycl_context_tenant_desc> rung_section;
+        std::string                                reason;
+        if (!llama_tenant_section_from_caps(measure_tenant_caps(storage.plan), rung_section, reason)) {
+            LLAMA_LOG_DEBUG("%s: rung %u left out of the host hold: %s\n", __func__, rung, reason.c_str());
+            continue;
+        }
+        llama_tenant_host_hold_fold(tenant_host_hold, rung_section);
+    }
+
+    if (!measure_only) {
+        LLAMA_LOG_INFO("%s\n", llama_tenant_host_hold_line(tenant_host_hold).c_str());
+    }
 }
 
 std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sched_measure_plan & plan) const {
