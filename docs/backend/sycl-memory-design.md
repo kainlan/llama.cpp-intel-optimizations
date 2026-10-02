@@ -2482,7 +2482,7 @@ spill path unchanged. Raw device memory is the last resort, taken only when the 
 
 Only a scheduler compute buffer is marked. The same buffer type backs the model's WEIGHT tensors, which are allocated
 during the model load, before any KV cache exists; one of them sent to the KV zone would take room this context's KV is
-about to be placed in. The flag is therefore `!g_sycl_in_model_load` at the allocation, and the buffer allocator's own
+about to be placed in. The flag is therefore an explicit scheduler scope around the reserve and graph allocation (see the recorded-request paragraph below), and the buffer allocator's own
 KV-zone and SCRATCH-zone fallback steps are skipped for a flagged request (`unified_alloc` already tried the KV zone for
 it, counted; and a compute buffer in the SCRATCH zone is exactly what the graph-entry headroom check aborts on, so that
 step must stay unreachable for this class). Only the unflagged class (a model load) takes those two steps, as before.
@@ -2502,70 +2502,81 @@ device memory, or host-pinned) and never `none` for a buffer that then lives som
 spill cannot evict weights: the overcommit guard in `unified_alloc` runs for every raw device request, and for a
 hold-induced one it refuses loudly instead of calling `evict_and_flush` (trading a planned buffer's reservation for the
 model's own weights is not a trade the hold may make).
-*The worst case, and why it is a heuristic.* A request the hold keeps out spills whole, so what the hold can push
-out of the zone is not "the hold" but at most **the hold plus the largest spill-capable RUNTIME request**, and of that
-only the part the KV zone cannot take is outside-arena demand (`zone_hold_spill_raw_demand`, an ESTIMATE: the KV zone's
-largest free block net of the KV this transaction is about to place, `zone_kv_room_for_compute`; the transaction
-publishes before a first context's KV exists, so the zone still shows those bytes free, and a buffer is indivisible, so
-the sum of the zone's free bytes is not room. The realized check below is the backstop). The bound: a request r
-is held back only when the zone has less than hold + r free, free only falls while the hold stands, and a run with no
-hold serves at most the zone's free bytes. The hold is at most the plan at the n_ubatch asked about. The transaction does
-not know the compute-buffer sizes (the scheduler reserves them after the plan is published), so the largest request is
-the allocator's own high-water mark of such requests (`unified_cache_note_runtime_request`): exact once the context has
-reserved its compute buffers (the recheck that follows the probe reserve) and only a lower bound before that. Both
-callers ask one function, `ggml_sycl_planned_scratch_hold_spill_bound(device, n_ubatch, kv_pending_bytes)`: the
-transaction passes the KV its plan adds (zero of it is live for a first context), the recheck, which runs inside the
-reserve with KV live, passes none. The bound is checked against
-the live outside-arena headroom whatever the attention mode. A non-FA context counts it together with the non-FA scratch
-in `ggml_sycl_check_nonfa_attn_scratch`. A flash-attention context, the default, asks the same live free-memory question
-without the non-FA reserve (`ggml_sycl_check_hold_spill_headroom`), because the overcommit guard in `unified_alloc` compares
-a spill with the device's total memory minus what the cache itself accounts for: it cannot see another tenant on the card
-or the driver's reserve, so on a shared card a spill it admits can fail late as `OUT_OF_DEVICE_MEMORY` or `DEVICE_LOST`
-instead of being refused by name. The non-FA 928 MB reserve is deliberately not added there: it is the empirical
-outside-arena consumer of the non-FA path and has no bearing on the hold's spill.
+*One fit, asked three times (`llama.cpp-kpjw`).* Whether a rung's hold-induced spill leaves the driver its headroom is a
+single fact, and it has a single function: `ggml_sycl_hold_spill_fit` (ggml-sycl.cpp), the composition of
+`zone_hold_fit_inputs` and `zone_hold_fit` (zone-sizing.hpp, host-tested). It is asked by three callers and by nobody
+else: the transaction-time check that F3 publishes through (`ggml_sycl_check_hold_spill_headroom`, and the non-FA check
+that counts the same bound beside the non-FA scratch), the realized check after a rung's `sched_reserve()`
+(`ggml_sycl_check_hold_spill_realized`), and the constructor's pinned-`-ub` check, which reaches the realized check
+through `ggml_backend_sycl_planned_hold_spill_fits`. None of them keeps a formula, a free-memory read or a history of
+its own. Before this, F3 estimated from a running high-water mark and the driver's reading, the realized check from
+counted spills, and the printed advice from a third walk, so one card could be "fits" to one and "refused" to another
+(B50, Qwen, pinned `-ub 1024`: the refusal named 512, F3 then refused 512).
+The inputs are four facts and nothing else:
+- *The plan* at the rung's `n_ubatch` (`zone_dense_scratch_total_bytes`, the hold).
+- *The rung's worst-case request.* The largest spill-capable scheduler compute request the rung itself made, kept per
+  `n_ubatch` (`unified_cache_get_hold_rung_requests`) and kept across publishes, so a losing rung's request cannot
+  decide another rung and no value carries history from one rung to the next. For a rung nothing has measured it is the
+  largest recorded request scaled linearly to that `n_ubatch` (`zone_hold_scale_request`): the one estimate left, and
+  it is only ever read for a rung that has no measurement of its own.
+- *The KV room.* The largest free block of the KV zone net of the KV the transaction is about to place
+  (`zone_kv_room_for_compute`; a buffer is indivisible, so the sum of the zone's free bytes is not room). A publish
+  snapshots it (`unified_cache_begin_planned_hold_epoch`), and the realized check, which runs after the KV exists, asks
+  over that same room.
+- *The free memory.* One model of it: the unified cache's own ledger (`unified_cache_hold_free_before`), not a driver
+  read. The ledger is a cold driver reading plus the bytes the cache itself holds outside the arena
+  (`zone_hold_free_cold`, taken once per owner at its first fit), less the outside-arena bytes that persist across rungs
+  (`zone_hold_free_before`). A rung's buffers released from the cache are credited the moment they are released, which
+  the driver's own reading is not (it lags a destroy: on the B50 it still read 602.7 MB with about 1097 MB truly
+  free). Asking the same rung twice, with any history in between, therefore gives the same verdict.
+The verdict is `zone_hold_spill_bound_fits(free_before, headroom, demand)`: the hold is blamed only when the card had its
+headroom before the rung and the rung's demand takes it below, i.e. `free_before >= headroom && free_before - demand <
+headroom`. A card that was short already (a full B70 with KB-scale spills) is not blamed, and a rung with no demand is
+never refused. The demand (`zone_hold_fit_demand`) is `zone_hold_spill_raw_demand` of the worst-case spill: a request the
+hold keeps out spills whole, so what the hold can push out of the zone is at most **the hold plus the rung's largest
+spill-capable request**, and of that only the part the KV room cannot take is outside-arena demand. The KV room is
+still an estimate before a context's KV exists, and the request term is exact only for a rung whose buffers have been
+reserved; F3 asked before that is a lower bound for it, and the realized check, asked after the reserve over the same
+function, is the backstop.
+The two askers differ in what they pass, and in nothing else. The transaction passes the KV its plan adds
+(`kv_pending`, zero of it is live for a first context; the KV this context already admitted is not pending), the rung is
+not live yet, and the free memory is the card before this rung. The recheck inside `sched_reserve()` and the realized
+check pass no pending KV and mark the rung live, so the rung's own outside-arena buffers are credited back to the ledger
+before the evaluation (release-then-evaluate equals the pre-release fit, with the released bytes credited). A flash-attention
+context, the default, asks the same live free-memory question without the non-FA reserve; the non-FA 928 MB reserve is not
+added there, being the empirical outside-arena consumer of the non-FA path with no bearing on the hold's spill.
+*Only a scheduler compute buffer is recorded.* The request record and the hold-spill counters are fed by requests the
+unified-cache allocator was told are scheduler compute buffers, by an explicit scope (`ggml_backend_sycl_compute_alloc_scope`,
+opened around `ggml_backend_sched_reserve` and `ggml_backend_sched_alloc_graph` in llama-context), not by the absence of a
+model load. A recurrent-state buffer (`cache_r_l*` / `cache_s_l*`) is allocated from the same buffer type while no model
+load is running; by the old test it counted as compute. On the B50, Qwen3.6-27B, that is the 461.3 MB landing the
+auto-ubatch log printed before the first trial (the buffer is sized by sequences, not `n_ubatch`, and the log does not
+print the rung it was made under): it was fed to the hold-spill counters and the request mark, it inflated every rung's
+worst case, and it is not a compute buffer. State buffers now take the ordinary RUNTIME path and touch neither.
 
-*A rung's own spill is counted in its fit.* The bound above is a transaction-time estimate; the exact figure exists
-only once the rung's buffers do. The auto-ubatch trial (`llama_context::sycl_select_auto_ubatch`) therefore asks
+*The realized check, and the constructor's.* The auto-ubatch trial (`llama_context::sycl_select_auto_ubatch`) asks
 `ggml_backend_sycl_planned_hold_spill_fits` from `try_candidate`, right after the candidate's `sched_reserve()` has
 returned, for every rung, every flash-attention mode and the cached rung. It is not asked from the recheck inside
-`sched_reserve()`: that recheck runs after a 1-token flash-attention probe reserve and before the worst-case pp/tg
-reserves that make the large compute buffers, and only for the first rung under `auto_fa`, so it cannot see them. The
-check (`ggml_sycl_check_hold_spill_realized`) reads the RAW hold-induced spills of this plan since its publish (a buffer
-placed in the KV zone does not touch the driver headroom and is not counted)
-(`unified_cache_get_recent_planned_hold_spills`) and the live free memory, and applies `zone_hold_spill_realized_fits`
-(host-tested): the hold is blamed only when ITS spill is what pushed the card under the driver headroom the arena expects
-outside itself (`kSyclArenaMinExternalHeadroomBytes`, 256 MB, the graph-entry check's one constant), i.e.
-`free < headroom && free + spill >= headroom`. A card that was already short without the spill (a full B70 with
-KB-scale spills) is not blamed, and a rung with no hold-induced spill is never refused. A refusal makes the candidate
-lose with the stop reason "hold spill left no headroom" and the ladder lands lower.
-
-*The same check runs after a reserve the ladder did not make.* A pinned `-ub` reserves once, in the context
-constructor, with nobody asking, and the transaction before it ran with this context's KV not yet created. The
-constructor therefore calls the same entry after its reserve, whichever way it was made
-(`llama_context_sycl_hold_spill_fits`), and a refusal is a context-init refusal by name: `the largest -ub that fits is
-about N, a power of two`, N from `zone_hold_spill_largest_ub` (the rung's raw spill scales about linearly with
-`n_ubatch`; the entry takes the rung's `n_ubatch` and returns the largest that fits, the smallest over the context's
-devices). N is snapped DOWN to a power of two, the rung a user passes and the ladder tries: a value landed exactly on
-the headroom is refused again by the next measurement (B50, Qwen: `-ub 1024` was refused and 512 landed where the
-linear scaling said 672). A pinned `-ub 1024` on the B50 with Qwen is refused there, instead of reaching flash attention
-with 107.8 MB of headroom and hanging.
-The N a refusal prints is one the F3 publish accepts (`llama.cpp-kpjw`, g7). The spill's linear share alone named 512
-for that pinned 1024 while F3, on the same card, refuses 512 (470.0 MB worst case, 132.7 MB left of 602.7 MB, under the
-256 MB headroom), so following the advice died with a bare result code: two predicates over one fact. F3 and the
-refusal now ask one function, `zone_hold_spill_bound_fits(free_before, headroom, bound)` (the realized rule applied to
-the predicted free memory), and the printed N is the smaller of the spill's share and the largest power of two F3's own
-bound accepts (`zone_hold_spill_largest_ub_by_bound`, walked with `ggml_sycl_planned_scratch_hold_spill_bound` for each
-rung). The card it is asked against is the card before this plan's raw buffer: free now plus what is LIVE of it, which
-is the spill counter capped by the largest single request (the counter sums every landing since the publish, including
-buffers a later reserve released, and crediting all of it back would name a -ub F3 then refuses).
+`sched_reserve()` alone: that recheck runs after a 1-token flash-attention probe reserve and before the worst-case pp/tg
+reserves that make the large compute buffers, and only for the first rung under `auto_fa`, so it cannot see them. A
+refusal makes the candidate lose with the stop reason "hold spill left no headroom" and the ladder lands lower.
+A pinned `-ub` reserves once, in the context constructor, with nobody asking, and the transaction before it ran with this
+context's KV not yet created. The constructor therefore asks the same entry after its reserve, whichever way it was
+made (`llama_context_sycl_hold_spill_fits`), and a refusal is a context-init refusal by name: `the largest -ub that fits
+is about N, a power of two`. N is `zone_hold_fit_largest_ub` over the same inputs: the largest power of two the function
+accepts, the smallest over the context's devices, so N passes the F3 publish and the next rung up does not (tested on
+the B50 g7 numbers). A pinned `-ub 1024` on the B50 with Qwen is refused there, instead of reaching flash attention with
+107.8 MB of headroom and hanging; a pinned `-ub 512` there fits, and passes with an oracle-equal perplexity.
 The constructor's check is skipped when the trial already passed the same check for the sched the constructor is left
 with (`sycl_hold_spill_validated_ub`, set by `try_candidate` for the rung and kept only when the settle step did not
-re-reserve): the two readings of the live free memory can differ at the margin, and the ladder's winner must not be
-overturned by a re-read. A pinned `-ub`, a trial that exited early, a missing hook and a settle that re-reserved leave it
-0 and the check runs. Not covered: a lazy re-reserve later on (an adapter change, a toggled embeddings or causal mode)
-makes buffers nobody checks. The SYCL entry changed arity (`largest_ub`); libllama and the backend library ship from one
-build, so there is no version gate, and an older library called with the extra argument leaves `largest_ub` 0, which
-degrades the advice and not the verdict.
+re-reserve): the ladder's winner must not be overturned by a re-read. A pinned `-ub`, a trial that exited early, a
+missing hook and a settle that re-reserved leave it 0 and the check runs. Not covered: a lazy re-reserve later on (an
+adapter change, a toggled embeddings or causal mode) makes buffers nobody checks. The SYCL entry changed arity
+(`largest_ub`); libllama and the backend library ship from one build, so there is no version gate, and an older library
+called with the extra argument leaves `largest_ub` 0, which degrades the advice and not the verdict.
+The ledger has one honest limit: its cold reading is a driver read at the owner's first fit, so it is as stale-low as the
+driver was at that moment (load-time transients just freed read low), and a weight loaded after it is not in the ledger.
+Both err toward refusing a rung, never toward admitting one.
 
 *A rung does not pay for the buffers of the rung before it.* `try_candidate` releases the previous rung's compute
 buffers (the scheduler, the reserve graph) before this rung's transaction. A rung that placed its buffers in the KV
@@ -2578,12 +2589,6 @@ loses at its probe.
 Measured on the B50 (Qwen PPL, auto-ub1024): a 461 MB compute buffer was held back (zone free 512 MB, hold 75.6 MB),
 spilled, left 107.8 MB against 256 MB, and flash attention then ran out of resources at the first graph; the
 ladder had accepted the rung because nothing in its fit saw the spill.
-The transaction-time bound asks the same question of a prediction: `zone_hold_spill_bound` is the plan plus the largest
-spill-capable request observed since the previous publish, scaled to the candidate n_ubatch (the request is recorded
-with the n_ubatch it was made under, from the first publish on, so load-time requests do not count), and the FA-on
-check asks `zone_hold_spill_realized_fits(free - bound, ...)`. The scaling matters on an ascending ladder, where the
-previous rung's request under-estimates the next by the rung ratio. It remains a heuristic in the request term. An
-explicit `-ub` (no trial) is covered by that bound only.
 A publish starts a new epoch (`unified_cache_begin_planned_hold_epoch`), so a losing rung's spills and largest-request
 mark do not decide the next rung. The persisted auto-ubatch cache is not a hole here: a cached rung is re-validated
 by the same per-candidate trial on every start (`try_candidate`), and one that now fails is reported as

@@ -1694,13 +1694,28 @@ void     unified_cache_set_planned_scratch_hold(int device_id, size_t bytes, uin
 size_t   unified_cache_get_planned_scratch_hold(int device_id);
 void     unified_cache_get_planned_scratch_hold_state(int device_id, size_t * bytes, uint64_t * owner);
 bool     unified_cache_release_planned_scratch_hold(int device_id, uint64_t owner);
-// The largest spill-capable RUNTIME request the device has been asked for since the owner's last publish, with the
-// n_ubatch it was made under. A held-back request spills WHOLE, so the most the hold can push outside the arena is
-// the hold plus the largest such request (zone_hold_spill_bound). Requests before the first publish are load-time
-// ones and are not recorded. `note` is the allocator's single take of the hold state per request: it records
-// `bytes` when `record` (a spill-capable request) and returns the hold the caller decides with.
+// The scheduler compute-buffer requests the device has been asked for, PER RUNG (per n_ubatch): the largest one made
+// while that rung's plan was the published one. A held-back request spills WHOLE, so the most the hold can push
+// outside the arena is the hold plus the largest such request (zone_hold_fit_demand). The record is per rung and
+// survives a publish, so a rung's verdict depends on that rung's own measurement and not on which other rungs ran
+// before it; it is dropped with the owner. Requests before the first publish are load-time ones and are not
+// recorded. `note` is the allocator's single take of the hold state per request: it records `bytes` when `record`
+// (a SCHEDULER COMPUTE request, spill-capable: never a state-class buffer such as the recurrent state, which goes
+// through the same buffer type) and returns the hold the caller decides with.
 size_t       unified_cache_note_runtime_request(int device_id, size_t bytes, bool record);
-void         unified_cache_get_runtime_request_hwm(int device_id, size_t * bytes, uint32_t * n_ubatch);
+// The owner's per-rung records, at most `cap` of them; returns how many were written.
+size_t unified_cache_get_hold_rung_requests(int device_id, uint64_t owner, zone_hold_rung_request * out, size_t cap);
+// The cache's ledger of outside-arena bytes: what the cache holds LIVE in raw device memory (not in an arena zone) on
+// the device, from the allocation registry. Synchronous with a release (the driver's credit for a freed buffer is not).
+size_t unified_cache_raw_device_live_bytes(int device_id);
+// The card's free memory WITHOUT the rung's own compute buffers, from the ledger and never a driver read after a
+// release: the first call for an owner takes `driver_free_now` as the cold baseline (plus the raw bytes live then),
+// and every call returns that baseline less the raw bytes that stay live without the rung. `rung_live` is true when
+// the rung's own buffers exist (the realized check): what was live when the owner's epoch began is what stays.
+size_t unified_cache_hold_free_before(int device_id, uint64_t owner, size_t driver_free_now, bool rung_live);
+// The epoch's KV room snapshot (zone_kv_room_for_compute at the publish), and the n_ubatch of the epoch; 0 when the
+// owner has no epoch. The realized check asks the same function the publish did, over the same room.
+bool   unified_cache_get_hold_epoch(int device_id, uint64_t owner, uint32_t * n_ubatch, size_t * kv_room);
 // A spill-capable RUNTIME request that the hold kept out of the zone, counted per device by where the buffer landed:
 // `in_arena` is a placement in the arena's KV zone (the compute-buffer path tries it first), otherwise raw device
 // memory outside the arena, which is what eats the driver headroom. The first one of each kind since the last take
@@ -1724,12 +1739,13 @@ struct planned_hold_spill_totals {
 };
 
 void         unified_cache_take_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out);
-// A publish starts a new epoch for the owner at `n_ubatch`: the spill counters and the largest request seen since the
-// previous publish are forgotten (the once-only WARN latches are not). The runtime-context transaction calls this when
-// it publishes, so what the get below reports is what THIS plan's own reserves did (a losing auto-ubatch rung's
-// spills do not decide the next rung), and the totals the owner's teardown take reports are the finished context's
-// own. A call by anyone but the hold's owner changes nothing.
-void         unified_cache_begin_planned_hold_epoch(int device_id, uint64_t owner, uint32_t n_ubatch);
+// A publish starts a new epoch for the owner at `n_ubatch`: the spill counters since the previous publish are forgotten
+// (the once-only WARN latches and the per-rung request records are not). `kv_room` is the KV-zone room a compute buffer
+// could count on at this publish, kept so the realized check judges with the inputs the publish did. The
+// runtime-context transaction calls this when it publishes, so what the get below reports is what THIS plan's own
+// reserves did (a losing auto-ubatch rung's spills do not decide the next rung), and the totals the owner's teardown
+// take reports are the finished context's own. A call by anyone but the hold's owner changes nothing.
+void         unified_cache_begin_planned_hold_epoch(int device_id, uint64_t owner, uint32_t n_ubatch, size_t kv_room);
 // A compute buffer the RUNTIME zone did not serve for want of room (not because the hold kept it out) and the KV zone
 // took instead of raw device memory: counted, and warned about once per context.
 void unified_cache_note_zone_full_kv_placement(int device_id, const char * tag, size_t bytes, size_t runtime_free);

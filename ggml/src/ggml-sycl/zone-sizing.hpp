@@ -308,16 +308,6 @@ bool zone_runtime_alloc_held_back(bool   runtime_zone,
                                   size_t hold,
                                   size_t alloc_size);
 
-// Whether a rung still fits once the compute buffers the hold kept out of the RUNTIME zone are outside the arena.
-// `free_after` is the card's free memory with those spills in place (the live reading after the rung's reserve, or
-// the prediction `free_before - spill`). The hold is blamed only when ITS spill is what pushed the card under the
-// driver headroom the arena expects outside itself: free_after < headroom_target while free_after + spill_bytes
-// >= headroom_target. A card that was already short without the spill (a full B70 with KB-scale spills) is not
-// the hold's doing, and a rung with no hold-induced spill is never refused. The ladder then lands on a rung that
-// runs instead of one that exhausts the card at its first graph (B50, Qwen PPL at auto-ub1024: a 461 MB spill left
-// 107.8 MB against 256 MB, and flash attention ran out of resources).
-bool zone_hold_spill_realized_fits(size_t free_after, size_t headroom_target, size_t spill_bytes);
-
 // The worst-case bytes the hold can push outside the arena at candidate rung `n_ubatch`: the plan (the most the
 // hold can be) plus the largest spill-capable RUNTIME request, because a held-back request spills whole. The
 // request was observed at `hwm_n_ubatch`; compute buffers scale about linearly with n_ubatch, so it is scaled to
@@ -342,34 +332,67 @@ size_t zone_hold_spill_raw_demand(size_t spill_bound, size_t kv_zone_free);
 // KV already live (the recheck, a settle) passes 0 pending.
 size_t zone_kv_room_for_compute(size_t kv_largest_free, size_t kv_pending_bytes);
 
-// The largest n_ubatch a rung's raw (outside-arena) spill allows. The spill scales about linearly with n_ubatch, so
-// when `spill_bytes` made at `n_ubatch` left `free_after` against `headroom_target` and the hold is to blame
-// (zone_hold_spill_realized_fits refuses), the largest -ub is the share of the spill the card could have taken:
-// n_ubatch * (free_after + spill_bytes - headroom_target) / spill_bytes, rounded DOWN TO A POWER OF TWO (at least 32:
-// the rung a user passes and the ladder tries, and the margin the snap leaves is what keeps the advice from being
-// refused again by the next measurement). A rung that fits is returned unchanged; 0 means no -ub is known to fit
-// (not even no spill at all clears the headroom, or the share is under 32), or n_ubatch is unknown. An ESTIMATE:
-// the scaling is the same linear one the bound uses.
-uint32_t zone_hold_spill_largest_ub(uint32_t n_ubatch, size_t spill_bytes, size_t free_after, size_t headroom_target);
-
-// llama.cpp-kpjw (kpjw-g7): ONE predicate for "does this demand leave the card its headroom". The transaction-time
-// bound (F3) and the -ub a refusal names used to be two computations over one fact (the spill's linear share named 512
-// where F3 refused 512, so following the advice died with a bare result code). `free_before` is the card WITHOUT the
-// demand in place (free memory now when nothing of this plan's is live, free now + the live raw spill when it is),
-// `bound` the demand: this is zone_hold_spill_realized_fits applied to the predicted free memory, the form F3 calls.
+// llama.cpp-kpjw (kpjw-g7, P4: one fact, one source): ONE predicate for "does this demand leave the card its headroom".
+// `free_before` is the card WITHOUT the demand in place, `bound` the demand. The hold is blamed only when ITS demand
+// is what pushes the card under the driver headroom the arena expects outside itself (free_before >= headroom and
+// free_before - bound < headroom): a card already short without the demand (a full B70 with KB-scale spills) is not
+// the hold's doing, and a rung with no demand is never refused. A rung that is refused runs the card out of
+// resources at its first graph (B50, Qwen PPL at auto-ub1024: 107.8 MB left against 256 MB, flash attention out of
+// resources). It is the verdict zone_hold_fit gives.
 bool zone_hold_spill_bound_fits(size_t free_before, size_t headroom_target, size_t bound);
 
-// The worst-case raw demand F3 predicts for a candidate n_ubatch (ggml_sycl_planned_scratch_hold_spill_bound).
-typedef size_t (*zone_hold_spill_bound_fn)(void * ctx, uint32_t n_ubatch);
+// What the hold-spill fit is asked of: the compute buffers of ONE rung (an n_ubatch) are, or would be, placed while
+// the planned dense scratch is held out of the RUNTIME zone. The transaction-time bound (F3), the auto-ubatch
+// trial's per-rung realized check and the context-init check on a pinned -ub all call zone_hold_fit over these
+// inputs, so they cannot disagree about one fact. A pure function of the inputs: it reads nothing and remembers
+// nothing, so the same rung asked twice, with other rungs' history in between, answers the same.
+//
+// One rung's measured compute-buffer request: the largest request the scheduler's compute buffers made while
+// the rung's plan was the published one. Kept per rung (n_ubatch), not as a running maximum, so a rung's verdict
+// does not depend on which other rungs ran before it.
+struct zone_hold_rung_request {
+    uint32_t n_ubatch = 0;
+    size_t   bytes    = 0;
+};
 
-// The largest -ub F3 itself accepts: the largest power of two (at least 32) not above `n_ubatch` whose bound passes
-// zone_hold_spill_bound_fits against `free_before`. 0 when no rung does, or n_ubatch is unknown. A refusal names the
-// smaller of this and zone_hold_spill_largest_ub, so the advice is never a -ub either predicate refuses.
-uint32_t zone_hold_spill_largest_ub_by_bound(uint32_t                 n_ubatch,
-                                             size_t                   free_before,
-                                             size_t                   headroom_target,
-                                             zone_hold_spill_bound_fn bound_of,
-                                             void *                   ctx);
+// The planned dense scratch (the most the hold can be) at a rung.
+typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
+
+struct zone_hold_fit_inputs {
+    size_t                         headroom_target = 0;  // the driver headroom the arena expects outside itself
+    size_t                         free_before = 0;  // the cache's ledger: the card with the rung's own buffers gone
+    size_t                         kv_room     = 0;  // zone_kv_room_for_compute, already net of the KV pending
+    const zone_hold_rung_request * rungs       = nullptr;
+    size_t                         n_rungs     = 0;
+    zone_hold_plan_fn              plan_of     = nullptr;
+    void *                         plan_ctx    = nullptr;
+};
+
+// The worst-case compute-buffer request at `n_ubatch`: the rung's own measured record when it has one (and only
+// that, whatever else is recorded); otherwise the largest record scaled linearly to the rung (compute buffers grow
+// about linearly with n_ubatch), so a set of records gives one answer whatever order it was made in. 0 when nothing
+// is recorded: the demand is then the plan alone, a lower bound.
+size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
+
+// The raw (outside-arena) demand the hold can cause at the rung: zone_hold_spill_raw_demand over
+// zone_hold_spill_bound(plan, the rung's request) and the KV room. 0 for an unknown n_ubatch.
+size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
+
+// Whether the rung fits: zone_hold_spill_bound_fits(free_before, headroom, demand).
+bool zone_hold_fit(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
+
+// The -ub a refusal names: `n_ubatch` itself when it fits, otherwise the largest power of two (at least 32) not above
+// it that zone_hold_fit accepts, over the same inputs. 0 when none does or n_ubatch is unknown. By construction the
+// number printed passes the fit that refused its neighbour, and twice it does not.
+uint32_t zone_hold_fit_largest_ub(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
+
+// The cache's ledger of free memory, in two steps so that no driver read after a release is ever needed (the
+// driver's credit for a freed buffer lags: 602.7 MB was read where 1097 MB was true). `cold` is the free memory the
+// card would show with no outside-arena cache allocation live: the driver's reading plus the bytes the cache holds
+// live outside the arena at that moment (taken once per context). `before` is the free memory with `persistent_raw`
+// of those still live (everything but the rung's own buffers). Saturating; never below zero.
+size_t zone_hold_free_cold(size_t driver_free, size_t raw_live);
+size_t zone_hold_free_before(size_t cold, size_t persistent_raw);
 
 // Whether a RUNTIME-zone request goes to the KV zone instead of the zone / raw device memory: only a request the
 // caller marked as a compute buffer (`compute_spill_flag`), spill-capable (not `forbid_spill`), that the RUNTIME zone

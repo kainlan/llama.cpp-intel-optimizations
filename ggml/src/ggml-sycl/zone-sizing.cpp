@@ -379,27 +379,22 @@ bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size
     return hold <= available && size <= available - hold;
 }
 
-bool zone_hold_spill_realized_fits(size_t free_after, size_t headroom_target, size_t spill_bytes) {
-    if (spill_bytes == 0 || free_after >= headroom_target) {
-        return true;
+static size_t zone_hold_scale_request(size_t request, uint32_t from_n_ubatch, uint32_t to_n_ubatch) {
+    if (from_n_ubatch == 0 || to_n_ubatch == 0 || from_n_ubatch == to_n_ubatch || request == 0) {
+        return request;
     }
-    const size_t free_before = spill_bytes > SIZE_MAX - free_after ? SIZE_MAX : free_after + spill_bytes;
-    return free_before < headroom_target;  // short without the spill too: not the hold's doing
+    if (request > SIZE_MAX / to_n_ubatch) {
+        return SIZE_MAX;
+    }
+    const size_t product = request * to_n_ubatch;
+    return product > SIZE_MAX - (from_n_ubatch - 1) ? SIZE_MAX : (product + from_n_ubatch - 1) / from_n_ubatch;
 }
 
 size_t zone_hold_spill_bound(size_t plan, size_t request_hwm, uint32_t hwm_n_ubatch, uint32_t n_ubatch) {
     if (plan == 0) {
         return 0;
     }
-    size_t request = request_hwm;
-    if (hwm_n_ubatch != 0 && n_ubatch != 0 && hwm_n_ubatch != n_ubatch && request_hwm != 0) {
-        if (request_hwm > SIZE_MAX / n_ubatch) {
-            request = SIZE_MAX;
-        } else {
-            const size_t product = request_hwm * n_ubatch;
-            request = product > SIZE_MAX - (hwm_n_ubatch - 1) ? SIZE_MAX : (product + hwm_n_ubatch - 1) / hwm_n_ubatch;
-        }
-    }
+    const size_t request = zone_hold_scale_request(request_hwm, hwm_n_ubatch, n_ubatch);
     return request > SIZE_MAX - plan ? SIZE_MAX : plan + request;
 }
 
@@ -412,16 +407,58 @@ size_t zone_kv_room_for_compute(size_t kv_largest_free, size_t kv_pending_bytes)
 }
 
 bool zone_hold_spill_bound_fits(size_t free_before, size_t headroom_target, size_t bound) {
-    const size_t free_after = bound >= free_before ? 0 : free_before - bound;
-    return zone_hold_spill_realized_fits(free_after, headroom_target, bound);
+    // The hold is blamed only when ITS demand is what pushes the card under the headroom: the card was above it
+    // without the demand and is below it with. Two comparisons, so that neither a huge bound nor a huge headroom wraps.
+    if (bound == 0 || free_before < headroom_target) {
+        return true;
+    }
+    return bound <= free_before && free_before - bound >= headroom_target;
 }
 
-uint32_t zone_hold_spill_largest_ub_by_bound(uint32_t                 n_ubatch,
-                                             size_t                   free_before,
-                                             size_t                   headroom_target,
-                                             zone_hold_spill_bound_fn bound_of,
-                                             void *                   ctx) {
-    if (n_ubatch < 32 || !bound_of) {
+size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
+    if (!in.rungs || in.n_rungs == 0) {
+        return 0;
+    }
+    bool   own         = false;
+    size_t own_request = 0;
+    for (size_t i = 0; i < in.n_rungs; ++i) {
+        if (in.rungs[i].n_ubatch == n_ubatch) {
+            own         = true;
+            own_request = std::max(own_request, in.rungs[i].bytes);
+        }
+    }
+    if (own) {
+        return own_request;
+    }
+    size_t scaled = 0;
+    for (size_t i = 0; i < in.n_rungs; ++i) {
+        scaled = std::max(scaled, zone_hold_scale_request(in.rungs[i].bytes, in.rungs[i].n_ubatch, n_ubatch));
+    }
+    return scaled;
+}
+
+size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
+    if (n_ubatch == 0 || !in.plan_of) {
+        return 0;
+    }
+    const size_t plan = in.plan_of(in.plan_ctx, n_ubatch);
+    // The request is already the rung's own (or scaled to it), so the bound is asked with it at this n_ubatch.
+    return zone_hold_spill_raw_demand(
+        zone_hold_spill_bound(plan, zone_hold_fit_request(in, n_ubatch), n_ubatch, n_ubatch), in.kv_room);
+}
+
+bool zone_hold_fit(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
+    return zone_hold_spill_bound_fits(in.free_before, in.headroom_target, zone_hold_fit_demand(in, n_ubatch));
+}
+
+uint32_t zone_hold_fit_largest_ub(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
+    if (n_ubatch == 0) {
+        return 0;
+    }
+    if (zone_hold_fit(in, n_ubatch)) {
+        return n_ubatch;
+    }
+    if (n_ubatch < 32) {
         return 0;
     }
     uint32_t rung = 32;
@@ -429,35 +466,19 @@ uint32_t zone_hold_spill_largest_ub_by_bound(uint32_t                 n_ubatch,
         rung <<= 1;
     }
     for (; rung >= 32; rung >>= 1) {
-        if (zone_hold_spill_bound_fits(free_before, headroom_target, bound_of(ctx, rung))) {
+        if (zone_hold_fit(in, rung)) {
             return rung;
         }
     }
     return 0;
 }
 
-uint32_t zone_hold_spill_largest_ub(uint32_t n_ubatch, size_t spill_bytes, size_t free_after, size_t headroom_target) {
-    if (n_ubatch == 0) {
-        return 0;
-    }
-    if (zone_hold_spill_realized_fits(free_after, headroom_target, spill_bytes)) {
-        return n_ubatch;
-    }
-    // Here spill_bytes > 0 and the card would have been above the headroom without the spill: the share of the spill
-    // it could have taken is what was free before it, less the headroom.
-    const size_t free_before = spill_bytes > SIZE_MAX - free_after ? SIZE_MAX : free_after + spill_bytes;
-    const size_t allowed     = free_before > headroom_target ? free_before - headroom_target : 0;
-    const double scaled =
-        static_cast<double>(n_ubatch) * static_cast<double>(allowed) / static_cast<double>(spill_bytes);
-    const uint32_t ub = scaled >= static_cast<double>(n_ubatch) ? n_ubatch : static_cast<uint32_t>(scaled);
-    // Down to a power of two: the rung a user passes and the ladder tries. A value landed exactly on the headroom
-    // is refused again by the next measurement (B50, Qwen: 1024 was refused and 512 landed where the linear
-    // scaling said 672), so the answer keeps the margin the snap leaves instead of promising a fit it cannot.
-    uint32_t       snapped = 0;
-    for (uint32_t rung = 32; rung != 0 && rung <= ub; rung <<= 1) {
-        snapped = rung;
-    }
-    return snapped;
+size_t zone_hold_free_cold(size_t driver_free, size_t raw_live) {
+    return raw_live > SIZE_MAX - driver_free ? SIZE_MAX : driver_free + raw_live;
+}
+
+size_t zone_hold_free_before(size_t cold, size_t persistent_raw) {
+    return persistent_raw >= cold ? 0 : cold - persistent_raw;
 }
 
 bool zone_runtime_spill_prefers_kv_zone(bool   compute_spill_flag,

@@ -10685,6 +10685,15 @@ static int64_t get_fused_moe_max_batch() {
 
 // Model load phase flag - when true, skip weight caching to avoid OOM during load
 static std::atomic<bool> g_sycl_in_model_load{ false };
+// llama.cpp-kpjw (kpjw-g7): depth of the scheduler compute scopes open on THIS thread. The llama context opens one
+// (ggml_backend_sycl_compute_alloc_scope) around ggml_backend_sched_reserve / ggml_backend_sched_alloc_graph, so a
+// buffer-type allocation made inside it is positively a scheduler compute buffer. Thread-local on purpose: the
+// scheduler allocates on the calling thread, and another thread's weight or state allocation must not inherit it.
+static thread_local int  g_sycl_compute_alloc_scope_depth = 0;
+
+static bool ggml_sycl_compute_alloc_scope_active() {
+    return g_sycl_compute_alloc_scope_depth > 0;
+}
 
 // Track backend lifetime for shared host-weight extras cleanup.
 static std::atomic<int> g_sycl_backend_refcount{ 0 };
@@ -17216,166 +17225,206 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
 // already-published shape still fits), or restore anything on refusal --
 // it only asks whether the ALREADY-PUBLISHED shape still fits the device's
 // current outside-arena headroom.
-// llama.cpp-kpjw: the planned dense scratch is held out of the RUNTIME zone's spill-capable requests (the compute
-// buffers), so a request the hold keeps out spills OUTSIDE the arena exactly as one that found the zone full does.
-// How much can that be? For a request r that is held back, the zone has less than hold + r free (it is refused only
-// when free < hold + r), free only falls while the hold stands, and a run with no hold serves at most the zone's free
-// bytes, so the extra spill the hold causes is at most hold + r_max, r_max being the largest spill-capable RUNTIME
-// request. The hold is at most the whole plan at the n_ubatch asked about. The transaction does not know the compute
-// buffer sizes (sched_reserve derives them after the plan is published), so r_max is the allocator's own high-water
-// mark of such requests, recorded since this context's last publish together with the n_ubatch it was made under, and
-// zone_hold_spill_bound scales it to the candidate n_ubatch (compute buffers grow about linearly with it; an
-// ascending ladder otherwise under-estimates every rung by the rung ratio). It is still a HEURISTIC in r_max: it is
-// what a previous rung asked, and a lower bound (the plan alone) before any rung has reserved. The exact figure is
-// the realized check, which runs once a rung's buffers exist (ggml_backend_sycl_planned_hold_spill_fits). One source:
-// the transaction and the recheck both call this. The KV-room netting that turns this bound into raw demand is an
-// ESTIMATE as well (see zone_hold_spill_raw_demand); neither figure is a measurement.
-static size_t ggml_sycl_planned_scratch_hold_spill_bound(int device, uint32_t n_ubatch, size_t kv_pending_bytes) {
-    size_t plan = 0;
-    if (n_ubatch == 0 || !ggml_sycl::unified_cache_planned_dense_scratch_bytes_at(device, n_ubatch, &plan) ||
-        plan == 0) {
-        return 0;  // no plan, no hold, nothing a hold can push out
-    }
-    size_t   r_max    = 0;
-    uint32_t r_max_ub = 0;
-    ggml_sycl::unified_cache_get_runtime_request_hwm(device, &r_max, &r_max_ub);
-    const size_t               bound = ggml_sycl::zone_hold_spill_bound(plan, r_max, r_max_ub, n_ubatch);
-    // A compute buffer the RUNTIME zone will not serve is placed in the arena's KV zone first, so only what that
-    // zone cannot take is outside-arena demand. The room it can count on is the zone's LARGEST FREE BLOCK (a buffer
-    // is indivisible), net of the KV this transaction's plan is about to place there (`kv_pending_bytes`; the
-    // transaction publishes before a first context's KV exists, so the zone still shows those bytes free). Both are
-    // an ESTIMATE of what the spill will find (other buffers may take the room first); the realized check, which
-    // counts the RAW spills a rung actually made, is the backstop.
+// llama.cpp-kpjw: the driver headroom the arena expects the card to keep OUTSIDE it (and that the graph-entry check
+// reports against). One constant for that figure: the graph-entry check and the hold-spill fit must not name two
+// different numbers.
+static constexpr size_t kSyclArenaMinExternalHeadroomBytes = 256ull * 1024ull * 1024ull;
+
+// llama.cpp-kpjw (kpjw-g7, P4: one fact, one source): the planned dense scratch is held out of the RUNTIME zone's
+// spill-capable requests (the compute buffers), so a request the hold keeps out spills OUTSIDE the arena exactly as
+// one that found the zone full does. Whether a rung's compute buffers can be placed that way without leaving the
+// card under the driver headroom is ONE question, and three consumers ask it: the runtime-context transaction (F3,
+// before the rung's buffers exist), the auto-ubatch trial's realized check (after sched_reserve() made them), and
+// the context-init check on a pinned -ub. They are one function over one set of inputs (zone_hold_fit): the plan at
+// the rung, the rung's own recorded worst-case request (the allocator's per-rung record of scheduler compute
+// requests), the KV-zone room a compute buffer can count on net of the KV the transaction is about to place, and
+// the card's free memory with the rung's own buffers released, taken from the cache's own ledger
+// (unified_cache_hold_free_before: a cold reading plus the live outside-arena bytes) and never from a driver read
+// after a release, whose credit lags (602.7 MB was read where 1097 MB was true). The -ub a refusal names is the
+// largest the same function accepts. Still a worst-case BOUND, not a measurement: the hold is at most the plan, a
+// held-back request spills whole, and the KV-room netting is an estimate (other buffers may take the room first);
+// but one bound, so the three cannot disagree.
+struct ggml_sycl_hold_fit_query {
+    int      device;
+    uint64_t owner;       // the backend context's hold owner
+    uint32_t n_ubatch;    // the rung asked about
+    size_t   kv_pending;  // KV the transaction's plan places that is not live yet (F3); 0 once the context's KV exists
+    bool     rung_live;   // the rung's own compute buffers exist (the realized check)
+};
+
+struct ggml_sycl_hold_fit_answer {
+    size_t   demand      = 0;  // the raw demand the hold can cause at the rung
+    size_t   free_before = 0;  // the ledger's free memory without the rung's own buffers
+    uint32_t largest_ub  = 0;  // when the rung does not fit: the largest -ub the same function accepts (0: none)
+};
+
+// The KV-zone room a compute buffer can count on: the zone's LARGEST FREE BLOCK (a buffer is indivisible), net of the
+// KV the transaction's plan is about to place there (the transaction publishes before a first context's KV exists, so
+// the zone still shows those bytes free).
+static size_t ggml_sycl_hold_kv_room(int device, size_t kv_pending_bytes) {
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
     const size_t               kv_largest =
         cache && cache->arena_active() ? cache->zone_largest_free(ggml_sycl::vram_zone_id::KV) : 0;
-    return ggml_sycl::zone_hold_spill_raw_demand(bound,
-                                                 ggml_sycl::zone_kv_room_for_compute(kv_largest, kv_pending_bytes));
+    return ggml_sycl::zone_kv_room_for_compute(kv_largest, kv_pending_bytes);
 }
 
-// llama.cpp-kpjw: the driver headroom the arena expects the card to keep OUTSIDE it (and that the graph-entry check
-// reports against). One constant for that figure: the graph-entry check, and the check that counts a rung's own
-// hold-induced spills against it (ggml_sycl_check_hold_spill_realized), must not name two different numbers.
-static constexpr size_t kSyclArenaMinExternalHeadroomBytes = 256ull * 1024ull * 1024ull;
+static size_t ggml_sycl_hold_plan_at(void * ctx, uint32_t n_ubatch) {
+    size_t plan = 0;
+    if (!ggml_sycl::unified_cache_planned_dense_scratch_bytes_at(*static_cast<int *>(ctx), n_ubatch, &plan)) {
+        return 0;  // no plan, no hold, nothing a hold can push out
+    }
+    return plan;
+}
+
+static bool ggml_sycl_hold_spill_fit(const ggml_sycl_hold_fit_query & q, ggml_sycl_hold_fit_answer * answer) {
+    ggml_sycl_hold_fit_answer  a;
+    ggml_sycl::unified_cache * cache    = ggml_sycl::get_unified_cache_for_device(q.device);
+    size_t                     free_mem = 0, total_mem = 0;
+    if (!cache || !cache->arena_active() || q.n_ubatch == 0) {
+        if (answer) {
+            *answer = a;
+        }
+        return true;  // no arena, no hold
+    }
+    ggml_backend_sycl_get_device_memory(q.device, &free_mem, &total_mem);
+    if (total_mem == 0) {
+        if (answer) {
+            *answer = a;
+        }
+        return true;
+    }
+    int                               device    = q.device;
+    constexpr size_t                  kMaxRungs = 32;
+    ggml_sycl::zone_hold_rung_request rungs[kMaxRungs];
+    ggml_sycl::zone_hold_fit_inputs   in;
+    in.headroom_target      = kSyclArenaMinExternalHeadroomBytes;
+    in.free_before          = ggml_sycl::unified_cache_hold_free_before(q.device, q.owner, free_mem, q.rung_live);
+    // The realized check judges with the room the publish judged with (the rung's own KV-zone placements have used
+    // the zone since); a transaction asks the zone as it is now.
+    uint32_t epoch_n_ubatch = 0;
+    size_t   epoch_kv_room  = 0;
+    in.kv_room =
+        q.rung_live && ggml_sycl::unified_cache_get_hold_epoch(q.device, q.owner, &epoch_n_ubatch, &epoch_kv_room) ?
+            epoch_kv_room :
+            ggml_sycl_hold_kv_room(q.device, q.kv_pending);
+    in.n_rungs      = ggml_sycl::unified_cache_get_hold_rung_requests(q.device, q.owner, rungs, kMaxRungs);
+    in.rungs        = rungs;
+    in.plan_of      = ggml_sycl_hold_plan_at;
+    in.plan_ctx     = &device;
+    a.demand        = ggml_sycl::zone_hold_fit_demand(in, q.n_ubatch);
+    a.free_before   = in.free_before;
+    const bool fits = ggml_sycl::zone_hold_fit(in, q.n_ubatch);
+    if (!fits) {
+        a.largest_ub = ggml_sycl::zone_hold_fit_largest_ub(in, q.n_ubatch);
+    }
+    if (answer) {
+        *answer = a;
+    }
+    return fits;
+}
+
+// What F3 and the non-FA check add to their own demand: the raw bytes the hold can push outside the arena at the
+// rung, from the one fit function.
+static size_t ggml_sycl_planned_scratch_hold_spill_bound(const ggml_sycl_hold_fit_query & q) {
+    ggml_sycl_hold_fit_answer a;
+    (void) ggml_sycl_hold_spill_fit(q, &a);
+    return a.demand;
+}
+
+// "the largest -ub that fits is about N" for a refusal, or the honest statement that none does.
+static std::string ggml_sycl_hold_fit_advice(uint32_t largest_ub) {
+    char buf[96];
+    if (largest_ub != 0) {
+        snprintf(buf, sizeof(buf), "the largest -ub that fits is about %u, a power of two", largest_ub);
+    } else {
+        snprintf(buf, sizeof(buf), "no -ub is known to fit");
+    }
+    return buf;
+}
 
 // llama.cpp-kpjw: the live outside-arena headroom check for the hold's worst-case spill, run whatever the attention
 // mode. The unified allocator's overcommit guard compares a spill with the device's TOTAL memory minus what the
 // cache itself accounts for; it cannot see another tenant on the card or the driver's own reserve, so on a shared
-// card a spill it admits can fail late as OUT_OF_DEVICE_MEMORY or DEVICE_LOST. This asks the live free-memory
-// reading instead, once, at the transaction, so the context is refused by name. No non-FA reserve is added: that
-// constant is the empirical outside-arena consumer of the non-FA path and has no bearing on the hold's spill.
-static bool ggml_sycl_check_hold_spill_headroom(int device, size_t spill_bytes, bool probe_mode) {
-    if (spill_bytes == 0) {
+// card a spill it admits can fail late as OUT_OF_DEVICE_MEMORY or DEVICE_LOST. This asks the one hold-spill fit
+// (ggml_sycl_hold_spill_fit), once, at the transaction, so the context is refused by name. No non-FA reserve is
+// added: that constant is the empirical outside-arena consumer of the non-FA path and has no bearing on the hold's
+// spill.
+static bool ggml_sycl_check_hold_spill_headroom(const ggml_sycl_hold_fit_query & q, bool probe_mode) {
+    ggml_sycl_hold_fit_answer a;
+    if (ggml_sycl_hold_spill_fit(q, &a)) {
         return true;
     }
-    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
-    if (!cache || !cache->arena_active()) {
-        return true;  // no arena, no hold
-    }
-    size_t free_mem = 0, total_mem = 0;
-    ggml_backend_sycl_get_device_memory(device, &free_mem, &total_mem);
-    // The same question the realized check asks after the fact, asked of the prediction: with the worst-case spill
-    // in place, would the hold be what pushed the card under the driver headroom? One predicate
-    // (zone_hold_spill_bound_fits), which is also what the -ub a refusal names is derived from.
-    const size_t free_after = spill_bytes >= free_mem ? 0 : free_mem - spill_bytes;
-    if (total_mem == 0 ||
-        ggml_sycl::zone_hold_spill_bound_fits(free_mem, kSyclArenaMinExternalHeadroomBytes, spill_bytes)) {
-        return true;
-    }
-    const double mb = 1024.0 * 1024.0;
+    const double mb         = 1024.0 * 1024.0;
+    const size_t free_after = a.demand >= a.free_before ? 0 : a.free_before - a.demand;
     GGML_SYCL_RUNTIME_TXN_REFUSAL(
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: the planned dense scratch holds back the RUNTIME zone and "
-        "its worst-case spill outside the arena (%.1f MB: the plan plus the largest compute-buffer request, scaled "
-        "to this n_ubatch, net of the KV-zone room a compute buffer can use) would leave device %d %.1f MB free (%.1f "
-        "MB free now), under the %.1f MB driver headroom the arena expects; free VRAM on this card (another process, "
-        "or a smaller -ub / -c) before loading\n",
-        spill_bytes / mb, device, free_after / mb, free_mem / mb, kSyclArenaMinExternalHeadroomBytes / mb);
+        "its worst-case spill outside the arena (%.1f MB: the plan plus the rung's largest compute-buffer request, "
+        "net of the KV-zone room a compute buffer can use) would leave device %d %.1f MB free (of %.1f MB free "
+        "before it), under the %.1f MB driver headroom the arena expects; %s; or free VRAM on this card (another "
+        "process, or a smaller -c) before loading\n",
+        a.demand / mb, q.device, free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb,
+        ggml_sycl_hold_fit_advice(a.largest_ub).c_str());
     return false;
 }
 
-// llama.cpp-kpjw (kpjw-g7): the bound F3 would predict for a candidate -ub, in the shape
-// zone_hold_spill_largest_ub_by_bound walks. `ctx` is the device index. The KV the transaction would place is not
-// pending here (the context exists and its KV is placed), as for the recheck.
-static size_t ggml_sycl_hold_spill_bound_at(void * ctx, uint32_t n_ubatch) {
-    return ggml_sycl_planned_scratch_hold_spill_bound(*static_cast<int *>(ctx), n_ubatch, 0);
-}
-
-// llama.cpp-kpjw: what the rung's own buffers actually did. The bound above is a transaction-time heuristic (the
-// compute buffers do not exist yet); this is run by the auto-ubatch trial AFTER sched_reserve() has returned
-// (ggml_backend_sycl_planned_hold_spill_fits, from llama_context::sycl_select_auto_ubatch's try_candidate), when
-// every buffer of the rung exists and the hold-induced spills of THIS plan (since its publish) are known exactly. It
-// is not run from the recheck inside the reserve: that runs after a 1-token flash-attention probe reserve and
-// before the worst-case pp/tg reserves that make the large buffers, and only for the first rung under auto_fa.
-// A spill that pushed the card under the driver headroom the arena expects outside itself exhausts it at the first
-// graph (B50, Qwen PPL at auto-ub1024: a 461 MB buffer held back, 107.8 MB left, flash attention out of
-// resources), so the rung does not fit and the ladder lands on a smaller one. Only a spill that CROSSED the
-// headroom is blamed on the hold (zone_hold_spill_realized_fits); with no hold-induced spill nothing is asked.
+// llama.cpp-kpjw: what the rung's own buffers actually did. The transaction-time check runs before the compute
+// buffers exist; this is run by the auto-ubatch trial AFTER sched_reserve() has returned
+// (ggml_backend_sycl_planned_hold_spill_fits, from llama_context::sycl_select_auto_ubatch's try_candidate), and by
+// the context-init check on a pinned -ub, when every buffer of the rung exists and its own largest request is
+// recorded. It asks the SAME function F3 asks, now with the rung's measured request, the room the publish judged
+// with and the ledger's free memory with the rung's own buffers credited back, so a rung F3 would accept on those
+// inputs is never refused here, nor the reverse. It is not run from the recheck inside the reserve: that runs after
+// a 1-token flash-attention probe reserve and before the worst-case pp/tg reserves that make the large buffers, and
+// only for the first rung under auto_fa. A rung refused here runs the card out of resources at its first graph (B50,
+// Qwen PPL at auto-ub1024: a 461 MB buffer held back, 107.8 MB left, flash attention out of resources).
 static bool ggml_sycl_check_hold_spill_realized(int        device,
                                                 uint64_t   owner,
                                                 bool       probe_mode,
                                                 uint32_t   n_ubatch,
                                                 uint32_t * largest_ub) {
-    // Only the RAW spills (outside the arena) eat the driver headroom; a buffer placed in the arena's KV zone does
-    // not, and is not counted here.
+    ggml_sycl_hold_fit_answer      a;
+    const ggml_sycl_hold_fit_query q = { device, owner, n_ubatch, 0, true };
+    if (ggml_sycl_hold_spill_fit(q, &a)) {
+        return true;
+    }
+    // One device's answer; the caller takes the smallest over its devices.
+    if (largest_ub) {
+        *largest_ub = a.largest_ub;
+    }
     ggml_sycl::planned_hold_spill_totals spill_totals;
     ggml_sycl::unified_cache_get_recent_planned_hold_spills(device, owner, &spill_totals);
-    const uint64_t spills      = spill_totals.raw_count;
-    const size_t   spill_bytes = spill_totals.raw_bytes;
-    if (spill_bytes == 0) {
-        return true;
-    }
-    size_t free_mem = 0, total_mem = 0;
-    ggml_backend_sycl_get_device_memory(device, &free_mem, &total_mem);
-    if (total_mem == 0 ||
-        ggml_sycl::zone_hold_spill_realized_fits(free_mem, kSyclArenaMinExternalHeadroomBytes, spill_bytes)) {
-        return true;
-    }
-    // The largest -ub whose raw spill the card could have taken (the spill scales about linearly with n_ubatch): what
-    // a refusal tells the user to pass instead. One device's answer; the caller takes the smallest over its devices.
-    // The -ub a refusal names must be one the F3 publish accepts (kpjw-g7: the spill's linear share named 512 for a
-    // pinned -ub 1024 on the B50 while F3 refused 512 on the same card, 470 MB worst case against 602.7 MB free, so the
-    // advice died with a bare result code). So it is the smaller of that share and the largest rung F3's own predicate
-    // accepts, asked with F3's own bound for each rung and the card as it was before this plan's raw buffer (free now
-    // plus what is live of it). The spill counter sums every raw landing since the publish, including buffers a later
-    // reserve has already released, so what is LIVE is bounded by the largest single request as well: adding back the
-    // whole counter would credit the card with memory it never had, and name a -ub F3 then refuses.
-    if (largest_ub) {
-        int      device_for_bound = device;
-        size_t   request_hwm      = 0;
-        uint32_t request_hwm_ub   = 0;
-        ggml_sycl::unified_cache_get_runtime_request_hwm(device, &request_hwm, &request_hwm_ub);
-        const size_t   live_raw    = request_hwm != 0 ? std::min(spill_bytes, request_hwm) : spill_bytes;
-        const size_t   free_before = free_mem + live_raw;
-        const uint32_t by_spill =
-            ggml_sycl::zone_hold_spill_largest_ub(n_ubatch, spill_bytes, free_mem, kSyclArenaMinExternalHeadroomBytes);
-        const uint32_t by_bound =
-            ggml_sycl::zone_hold_spill_largest_ub_by_bound(n_ubatch, free_before, kSyclArenaMinExternalHeadroomBytes,
-                                                           ggml_sycl_hold_spill_bound_at, &device_for_bound);
-        *largest_ub = std::min(by_spill, by_bound);
-    }
-    const double mb = 1024.0 * 1024.0;
+    const double mb         = 1024.0 * 1024.0;
+    const size_t free_after = a.demand >= a.free_before ? 0 : a.free_before - a.demand;
     GGML_SYCL_RUNTIME_TXN_REFUSAL(
         probe_mode,
-        "[SYCL-PLAN] runtime context update rejected: %llu compute-buffer request(s) totalling %.1f MB were held "
-        "out of the RUNTIME zone for the planned dense scratch and now live outside the arena, leaving device %d "
-        "%.1f MB free against the %.1f MB driver headroom the arena expects (short by %.1f MB); a smaller -ub or -c "
-        "keeps those buffers in the zone\n",
-        (unsigned long long) spills, spill_bytes / mb, device, free_mem / mb, kSyclArenaMinExternalHeadroomBytes / mb,
-        (kSyclArenaMinExternalHeadroomBytes - free_mem) / mb);
+        "[SYCL-PLAN] runtime context update rejected: at n_ubatch=%u the compute buffers the planned dense scratch "
+        "keeps out of the RUNTIME zone (worst case %.1f MB; %llu request(s) totalling %.1f MB were held out and now "
+        "live outside the arena) leave device %d %.1f MB free (of %.1f MB free before them), under the %.1f MB "
+        "driver headroom the arena expects; a smaller -ub or -c keeps those buffers in the zone\n",
+        n_ubatch, a.demand / mb, (unsigned long long) spill_totals.raw_count, spill_totals.raw_bytes / mb, device,
+        free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb);
     return false;
 }
 
 // The auto-ubatch trial's per-rung check (see ggml_sycl_check_hold_spill_realized): true when this backend's
-// context has no hold-induced spill that pushed the card under the driver headroom. The trial calls it after the
-// rung's sched_reserve() returned. A refusal is logged by name (at INFO: the loss is recoverable, the ladder lands
-// lower). Not a lifecycle transaction: it reads state and the live free memory and changes nothing.
+// context fits the one hold-spill function at `n_ubatch` with the rung's compute buffers in place. The trial calls
+// it after the rung's sched_reserve() returned. A refusal is logged by name (at INFO: the loss is recoverable, the
+// ladder lands lower). Not a lifecycle transaction: it reads state and the live free memory and changes nothing.
 //
 // ABI: this entry changed arity (r4 added the largest_ub out-parameter) and is reached from libllama through
 // ggml_backend_sycl_get_proc_address on a backend-DL build. libllama and the SYCL DSO ship from one build, so there
 // is no version gate. An older DSO that predates the entry exports nothing and the caller skips it; one that exports
 // the three-argument form is called with a fourth argument it ignores, so largest_ub stays 0 (the caller zeroes it
 // before the call and reads 0 as "no -ub is known to fit"), which degrades the refusal's advice, never its verdict.
+void ggml_backend_sycl_compute_alloc_scope(bool enter) {
+    if (enter) {
+        g_sycl_compute_alloc_scope_depth++;
+    } else if (g_sycl_compute_alloc_scope_depth > 0) {
+        g_sycl_compute_alloc_scope_depth--;
+    }
+}
+
 bool ggml_backend_sycl_planned_hold_spill_fits(ggml_backend_t backend, uint32_t n_ubatch, uint32_t * largest_ub) {
     if (largest_ub) {
         *largest_ub = 0;
@@ -17388,17 +17437,17 @@ bool ggml_backend_sycl_planned_hold_spill_fits(ggml_backend_t backend, uint32_t 
                                                largest_ub);
 }
 
-static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
-                                               uint32_t n_ctx,
-                                               uint32_t n_ubatch,
-                                               uint32_t n_head,
-                                               bool     flash_attn_enabled,
-                                               bool     allow_replan,
-                                               bool     probe_mode       = false,
-                                               size_t   hold_spill_bytes = 0) {
+static bool ggml_sycl_check_nonfa_attn_scratch(int                              device,
+                                               uint32_t                         n_ctx,
+                                               uint32_t                         n_ubatch,
+                                               uint32_t                         n_head,
+                                               bool                             flash_attn_enabled,
+                                               bool                             allow_replan,
+                                               bool                             probe_mode = false,
+                                               const ggml_sycl_hold_fit_query * hold_query = nullptr) {
     if (flash_attn_enabled) {
         // The non-FA attention scratch does not exist with flash attention on, but the hold's spill does.
-        return ggml_sycl_check_hold_spill_headroom(device, hold_spill_bytes, probe_mode);
+        return !hold_query || ggml_sycl_check_hold_spill_headroom(*hold_query, probe_mode);
     }
     if (ggml_sycl::unified_cache_nonfa_attn_scratch_guard_disabled()) {
         // llama.cpp-pvjr: an explicit GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 is a
@@ -17503,6 +17552,7 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
     // in the check that already asks what the device can take outside the arena; those bytes and the non-FA scratch
     // compete for the same headroom. (A flash-attention context asks the same live free-memory question without the
     // non-FA terms, at the top of this function.) Saturating: a wrapped sum must not read as a small demand.
+    const size_t hold_spill_bytes = hold_query ? ggml_sycl_planned_scratch_hold_spill_bound(*hold_query) : 0;
     const size_t nonfa_scratch_demand =
         ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes(n_head, n_ubatch, n_ctx);
     const size_t nonfa_demand =
@@ -18794,11 +18844,13 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     const size_t kv_with_slack = ggml_sycl_device_kv_bytes_with_slack(next_plan, ctx->device);
     const size_t kv_admitted   = admitted_kv ? ggml_sycl_device_kv_bytes_with_slack(*admitted_kv, ctx->device) : 0;
     const size_t kv_pending    = kv_with_slack > kv_admitted ? kv_with_slack - kv_admitted : 0;
-    const size_t hold_spill_bytes =
-        ggml_sycl_planned_scratch_hold_spill_bound(ctx->device, next_kv_info.n_ubatch, kv_pending);
+    const ggml_sycl_hold_fit_query hold_query   = { ctx->device, ctx->planned_scratch_owner, next_kv_info.n_ubatch,
+                                                    kv_pending, /*rung_live=*/false };
+    // The KV room this publish judged with, kept for the epoch it starts (the realized check asks over the same room).
+    const size_t                   hold_kv_room = ggml_sycl_hold_kv_room(ctx->device, kv_pending);
     if (!ggml_sycl_check_nonfa_attn_scratch(ctx->device, n_ctx, next_kv_info.n_ubatch, next_plan.planner_n_head_all_max,
                                             flash_attn_enabled,
-                                            /*allow_replan=*/!probe_mode, probe_mode, hold_spill_bytes)) {
+                                            /*allow_replan=*/!probe_mode, probe_mode, &hold_query)) {
         return refuse("non-FA attention scratch exceeds the device's outside-arena headroom");
     }
 
@@ -19041,7 +19093,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     dense_guard.commit();
     ggml_sycl_planned_scratch_hold_refresh(*ctx);
     // This plan's own reserve is what the realized-spill check (try_candidate, after sched_reserve()) must see, not a losing rung's.
-    ggml_sycl::unified_cache_begin_planned_hold_epoch(ctx->device, ctx->planned_scratch_owner, next_kv_info.n_ubatch);
+    ggml_sycl::unified_cache_begin_planned_hold_epoch(ctx->device, ctx->planned_scratch_owner, next_kv_info.n_ubatch,
+                                                      hold_kv_room);
     announce_kv_host_demotions(*immutable->plan);
 
 #if GGML_SYCL_DNNL
@@ -19467,12 +19520,16 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
     // That refusal surfaces as the std::runtime_error
     // sycl_recheck_runtime_context_flash_attn() throws (llama-context.cpp)
     // when this returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED.
-    const bool ok = ggml_sycl_check_nonfa_attn_scratch(
+    // The recheck runs inside this rung's own sched_reserve(): some of the rung's buffers may already exist, so it is
+    // asked as the realized check is (the rung's own bytes credited back, the publish's KV room).
+    const ggml_sycl_hold_fit_query recheck_hold_query = { ctx->device, ctx->planned_scratch_owner,
+                                                          current->plan->planner_n_ubatch, 0, /*rung_live=*/true };
+    const bool                     ok                 = ggml_sycl_check_nonfa_attn_scratch(
         ctx->device, current->plan->planner_n_ctx, current->plan->planner_n_ubatch,
         current->plan->planner_n_head_all_max, flash_attn_enabled,
         /*allow_replan=*/false, /*probe_mode=*/false,
         // The recheck runs inside sched_reserve(), after this context's KV exists: none of it is pending.
-        ggml_sycl_planned_scratch_hold_spill_bound(ctx->device, current->plan->planner_n_ubatch, 0));
+        &recheck_hold_query);
     // llama.cpp-kpjw: the exact hold spill is NOT checked here. This recheck runs inside sched_reserve() after a
     // 1-token flash-attention probe reserve and before the worst-case pp/tg reserves that make the large compute
     // buffers (and only for the first rung under auto_fa); the auto-ubatch trial asks
@@ -38006,11 +38063,11 @@ static const char * ggml_backend_sycl_buffer_type_get_name(ggml_backend_buffer_t
 // outside it; "host-pinned": host memory; "none": nothing placed it), which a throughput comparison between builds
 // cannot otherwise attribute. A buffer the arena placed is logged where it is placed; one nothing in the arena placed
 // goes to the legacy path in the allocator below, which logs the buffer it makes (legacy_landing_pending), so the
-// line never says "none" for a buffer that then lives somewhere.
-static void ggml_sycl_log_compute_buffer_landing(int                             device,
-                                                 const std::string &             name,
-                                                 size_t                          size,
-                                                 const ggml_sycl::alloc_handle & handle) {
+// line never says "none" for a buffer that then lives somewhere. The line is written only once the buffer is
+// PUBLISHED (ggml_backend_sycl_buffer_publish accepted it): a buffer the publish refused was released, lives nowhere,
+// and a line naming a zone for it would be false. So the zone is read from the handle first (the publish consumes
+// it) and logged after.
+static const char * ggml_sycl_compute_buffer_zone(const ggml_sycl::alloc_handle & handle) {
     const char * zone = "none";
     if (handle.ptr) {
         if (handle.tier == ggml_sycl::alloc_tier::HOST_PINNED) {
@@ -38038,6 +38095,10 @@ static void ggml_sycl_log_compute_buffer_landing(int                            
             }
         }
     }
+    return zone;
+}
+
+static void ggml_sycl_log_compute_buffer_landing(int device, const std::string & name, size_t size, const char * zone) {
     GGML_LOG_WARN("[SCRATCH-STATS] device=%d compute_buffer=%s size=%.1f MB zone=%s\n", device, name.c_str(),
                   size / (1024.0 * 1024.0), zone);
 }
@@ -38116,14 +38177,15 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
         auto * cache = ggml_sycl::get_unified_cache_for_device(buft_ctx->device);
         if (cache && cache->arena_active()) {
             const bool should_use_runtime = !is_kv_buft && effective_mem_type == GGML_SYCL_MEM_DEVICE;
-            // llama.cpp-kpjw: true for a scheduler compute buffer (see the flag below), false while a model loads.
-            // A process-global timing discriminator, not an identity one: nothing marks a request as a compute
-            // buffer, only that no model is loading right now. So a persistent tensor allocated through this buffer
-            // type after the load (a LoRA adapter, a control vector) is flagged too and gets a landing line, and a
-            // compute reserve that runs while ANOTHER model is loading is not flagged and takes the old KV/SCRATCH
-            // chain. Both are acceptable: the flag only chooses the KV zone over raw memory for a buffer the RUNTIME
-            // zone will not serve, and neither case is wrong about where it may live.
-            const bool kv_zone_first      = !g_sycl_in_model_load.load(std::memory_order_acquire);
+            // llama.cpp-kpjw (kpjw-g7): true for a scheduler compute buffer, identified POSITIVELY: the llama context
+            // opens a compute scope (ggml_backend_sycl_compute_alloc_scope) around the scheduler's own allocations
+            // (ggml_backend_sched_reserve / ggml_backend_sched_alloc_graph), and only a request made inside it is
+            // flagged. This buffer type also backs every other allocation of the model: its weights, and the
+            // recurrent state (461 MB on a hybrid model, allocated outside a load). The flag used to be "no model is
+            // loading right now", a timing discriminator, which marked that state buffer as compute: it then fed the
+            // per-rung request record and the hold-spill counters. A state-class buffer is no longer flagged and no
+            // longer counted; what it holds live is in the cache's ledger of free memory.
+            const bool kv_zone_first      = ggml_sycl_compute_alloc_scope_active();
             if (should_use_runtime) {
                 // Route through RUNTIME zone.  A miss must not reset the zone
                 // here: backend buffers can be allocated during graph reserve
@@ -38145,19 +38207,18 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 // before raw device memory outside the arena (see alloc_constraints::spill_to_kv_zone_before_raw).
                 // Only a scheduler compute buffer gets it. This buffer type also backs the model's WEIGHT tensors,
                 // and those are allocated during the model load, before any KV cache exists: one sent to the KV zone
-                // would take room this context's KV is about to be placed in. The load is the discriminator.
+                // would take room this context's KV is about to be placed in. The scheduler's compute scope is the
+                // discriminator (see kv_zone_first above).
                 runtime_req.intent.constraints.spill_to_kv_zone_before_raw = kv_zone_first;
                 ggml_sycl::alloc_handle runtime_h{};
                 ggml_sycl::unified_alloc(runtime_req, &runtime_h);
-                if (kv_zone_first) {
-                    if (runtime_h.ptr) {
-                        ggml_sycl_log_compute_buffer_landing(buft_ctx->device, buft_ctx->name, size, runtime_h);
-                    } else {
-                        // Nothing in the arena placed it: the legacy path below decides and logs where it landed.
-                        legacy_landing_pending = true;
-                    }
+                // Nothing in the arena placed it, or the publish below refuses it: the legacy path decides and logs
+                // where it finally landed.
+                if (kv_zone_first && !runtime_h.ptr) {
+                    legacy_landing_pending = true;
                 }
                 if (runtime_h.ptr) {
+                    const char *                       landed_zone = ggml_sycl_compute_buffer_zone(runtime_h);
                     ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(
                         buft_ctx->device, runtime_h.ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);
                     ctx->set_managed_owner(std::move(runtime_h));
@@ -38165,11 +38226,17 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                                     buft_ctx->name.c_str());
                     if (ggml_backend_buffer_t published =
                             ggml_backend_sycl_buffer_publish(buft, ctx, size, "arena RUNTIME zone")) {
+                        if (kv_zone_first) {
+                            ggml_sycl_log_compute_buffer_landing(buft_ctx->device, buft_ctx->name, size, landed_zone);
+                        }
                         return published;
                     }
-                    // Refused: the context is gone and its allocation released.
-                    // Fall through to the next tier rather than failing the whole
-                    // allocation -- the tiers below can still serve this buffer.
+                    // Refused: the context is gone and its allocation released, so nothing lives where the line
+                    // would have said. Fall through to the next tier rather than failing the whole allocation --
+                    // the tiers below can still serve this buffer, and the one that does is what is logged.
+                    if (kv_zone_first) {
+                        legacy_landing_pending = true;
+                    }
                 }
 
                 // RUNTIME zone full — for compute buffers, try the shared KV
@@ -38381,9 +38448,8 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
     }
 alloc_succeeded:
     // llama.cpp-kpjw: a flagged compute buffer the arena did not place lands here (raw device memory or host-pinned).
-    if (legacy_landing_pending) {
-        ggml_sycl_log_compute_buffer_landing(buft_ctx->device, buft_ctx->name, size, main_alloc);
-    }
+    // Its zone is read now (the context below takes the handle); the line is written once the publish accepts it.
+    const char * legacy_zone = legacy_landing_pending ? ggml_sycl_compute_buffer_zone(main_alloc) : "none";
     // llama.cpp-tsfl round 4 Q1: the oversize site's landing is counted
     // HERE, not where must_host_pinned was forced -- see that site's own
     // comment. Reaching this label at all already proves the allocation
@@ -38449,7 +38515,11 @@ alloc_succeeded:
         // Restore device context
         ggml_sycl_set_device(buft_ctx->device);
     }
-    return ggml_backend_sycl_buffer_publish(buft, ctx, size, "device");
+    ggml_backend_buffer_t legacy_published = ggml_backend_sycl_buffer_publish(buft, ctx, size, "device");
+    if (legacy_published && legacy_landing_pending) {
+        ggml_sycl_log_compute_buffer_landing(buft_ctx->device, buft_ctx->name, size, legacy_zone);
+    }
+    return legacy_published;
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::exit(1);
@@ -111689,6 +111759,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_planned_hold_spill_fits") == 0) {
         return (void *) ggml_backend_sycl_planned_hold_spill_fits;
+    }
+    if (strcmp(name, "ggml_backend_sycl_compute_alloc_scope") == 0) {
+        return (void *) ggml_backend_sycl_compute_alloc_scope;
     }
     // llama.cpp-xojq (nphx Task 4b, comment c-1mwi): closes the gap the
     // comment above used to name for ggml_backend_sycl_auto_ubatch_enabled
