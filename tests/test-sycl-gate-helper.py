@@ -59,6 +59,26 @@ def test_a_non_assertion_failure_is_recorded_and_the_next_check_still_runs() -> 
     assert "PASS" not in result.stdout.replace("checks passed", "")
 
 
+def test_run_without_source_runs_a_copy_in_a_tree_that_lacks_the_source(tmp_path) -> None:
+    """The missing-source arm of the gates that pin a source file: a copy of the gate, with sycl_gate beside it, run
+    where ../ggml does not exist; the status and the output come back so the caller can check both."""
+    script = tmp_path / "gate.py"
+    script.write_text("import pathlib\nimport sys\n\nimport sycl_gate\n\nroot = pathlib.Path(__file__).resolve().parent.parent\n"
+                      "print('SOURCE_PRESENT=%s' % (root / 'ggml').exists())\nprint('not found: x', file=sys.stderr)\nsys.exit(3)\n")
+    (tmp_path / "ggml").mkdir()  # beside the ORIGINAL gate; the copy must not see it
+    result = run("""
+        from sycl_gate import run_without_source
+        status, output = run_without_source(%r)
+        print(status)
+        print(output)
+    """ % str(script))
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[0] == "3", result.stdout
+    assert "SOURCE_PRESENT=False" in result.stdout
+    assert "not found: x" in result.stdout
+
+
 def test_generator_failure_never_blames_a_stale_global() -> None:
     result = run("""
         from sycl_gate import gate, finish
