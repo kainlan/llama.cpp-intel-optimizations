@@ -644,6 +644,29 @@ def gemm_mutants(files, edit):
     out.append(("woq_gemm_q4_0_impl's note sits under an if", edit(g, q4_late, "        if (b_packed_dev) {\n" + q4_note + "        }\n")))
     out.append(("woq_gemm_q4_0_impl gets its packed-weights flag back",
                 edit(g, "    [[nodiscard]] static bool woq_gemm_q4_0(", "    static void zz(bool b_is_packed) {}\n    [[nodiscard]] static bool woq_gemm_q4_0(")))
+    # review r3 Minor-1: the polarity of the three consumers r2 left unpinned (a decline is the falsy result of each)
+    guard = "if (!DnnlGemmWrapper::gemm("
+    out.append(("M1a: out_prod's guard loses its `!`",
+                edit_pin(o, guard, "if (DnnlGemmWrapper::gemm(")))
+    out.append(("M1b: out_prod's guard is never taken",
+                edit_pin(o, guard, "if (false && !DnnlGemmWrapper::gemm(")))
+    out.append(("M1c: the broadcast launch returns the negated result",
+                edit_pin(m, "return DnnlGemmWrapper::gemm(", "return !DnnlGemmWrapper::gemm(")))
+    out.append(("M1d: the unified PP flag takes the negated result",
+                edit_pin(m, "used_onednn_fp16 = DnnlGemmWrapper::row_gemm(",
+                         "used_onednn_fp16 = !DnnlGemmWrapper::row_gemm(")))
+    # review r3 Nit-1: a return after a note spelled other than `return false` / `return std::nullopt`
+    for name, site in (("gemm", "DNNL_GEMM"), ("gemm_batch_strided", "DNNL_GEMM_BATCH"),
+                       ("woq_gemm_batch_mxfp4", "DNNL_WOQ_MXFP4_BATCH")):
+        first = "ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_%s);\n" % site
+        for tag, spelling in (("N1a", "return {};"), ("N1b", "return std::optional<sycl::event>();")):
+            leave = "            if (m < 0) {\n                %s\n            }\n" % spelling
+            out.append(("%s: %s's first-arm note is followed by `%s`" % (tag, name, spelling),
+                        edit(g, first, first + leave)))
+    # review r3 Nit-2: a second push of the event, ahead of the decline check
+    out.append(("N2a: the MoE group event is pushed once before the decline check as well",
+                edit_pin(m, "if (!group_event) { gemm_declined = true; break; }",
+                         "gemm_events.push_back(*group_event); if (!group_event) { gemm_declined = true; break; }")))
     out.append(("the dense f16 throw survives only in a comment", edit_pin(m, MAIN_PINS[0][0], "// " + MAIN_PINS[0][0])))
     out.append(("out_prod loses its named throw", edit_pin(o, OUTPROD_PIN, "throw 1; // ")))
     return out
