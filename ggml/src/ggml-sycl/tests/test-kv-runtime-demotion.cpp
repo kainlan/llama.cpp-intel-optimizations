@@ -2799,10 +2799,9 @@ static int case_i18_refit_misuse_aborts() {
 #endif
 }
 
-// The allocate_at stand-in leaves the allocator as it found it when a carve fails, so a
-// negative case can be followed by a legitimate carve (and the real allocate_at, which
-// L4 reruns these cases against, owes the same).
-static int case_i19_allocate_at_stand_in_is_atomic() {
+// A carve through the real allocate_at leaves the allocator as it found it when it fails,
+// so a negative case can be followed by a legitimate carve.
+static int case_i19_allocate_at_is_atomic() {
     krt::device_model dev    = gap_zone(100 * MiB);
     krt::zone_model & z      = dev.tlsfs[0];
     const size_t      top    = z.anchor();
@@ -4031,7 +4030,7 @@ int main() {
     if (int rc = run_case("i18_refit_misuse_aborts", case_i18_refit_misuse_aborts)) {
         return rc;
     }
-    if (int rc = run_case("i19_allocate_at_stand_in_is_atomic", case_i19_allocate_at_stand_in_is_atomic)) {
+    if (int rc = run_case("i19_allocate_at_is_atomic", case_i19_allocate_at_is_atomic)) {
         return rc;
     }
     if (int rc = run_case("i20_refit_result_is_an_assignment_only", case_i20_refit_result_is_an_assignment_only)) {
