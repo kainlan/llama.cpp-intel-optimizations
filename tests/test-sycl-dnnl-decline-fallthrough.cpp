@@ -339,6 +339,19 @@ int main(int, char ** argv) {
                     (unsigned long long) call2.engaged);
             ok = false;
         }
+        if (call2.ok) {
+            // The declined second call fell through to the SYCL kernel: its output must match the host reference, as in the
+            // per-arm loop below.
+            std::vector<float> x, w, ref;
+            first.fill(x, w);
+            first.reference(x, w, ref);
+            double worst = 0.0;
+            if (!within(call2.out, ref, first.tol, &worst)) {
+                fprintf(stderr, "FAIL: %s: the call declined after a refused inject differs from the host reference (max abs err %.3g)\n",
+                        first.name, worst);
+                ok = false;
+            }
+        }
         ggml_sycl_test_scratchpad_sites_reset();
     }
     for (const arm & a : make_arms()) {
