@@ -411,6 +411,31 @@ size_t zone_kv_room_for_compute(size_t kv_largest_free, size_t kv_pending_bytes)
     return kv_pending_bytes >= kv_largest_free ? 0 : kv_largest_free - kv_pending_bytes;
 }
 
+bool zone_hold_spill_bound_fits(size_t free_before, size_t headroom_target, size_t bound) {
+    const size_t free_after = bound >= free_before ? 0 : free_before - bound;
+    return zone_hold_spill_realized_fits(free_after, headroom_target, bound);
+}
+
+uint32_t zone_hold_spill_largest_ub_by_bound(uint32_t                 n_ubatch,
+                                             size_t                   free_before,
+                                             size_t                   headroom_target,
+                                             zone_hold_spill_bound_fn bound_of,
+                                             void *                   ctx) {
+    if (n_ubatch < 32 || !bound_of) {
+        return 0;
+    }
+    uint32_t rung = 32;
+    while (rung <= n_ubatch / 2) {
+        rung <<= 1;
+    }
+    for (; rung >= 32; rung >>= 1) {
+        if (zone_hold_spill_bound_fits(free_before, headroom_target, bound_of(ctx, rung))) {
+            return rung;
+        }
+    }
+    return 0;
+}
+
 uint32_t zone_hold_spill_largest_ub(uint32_t n_ubatch, size_t spill_bytes, size_t free_after, size_t headroom_target) {
     if (n_ubatch == 0) {
         return 0;

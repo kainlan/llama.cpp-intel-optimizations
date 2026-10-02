@@ -844,8 +844,10 @@ def evaluate(backend, common, cache, zone):
     # The name is the smaller of that share and the largest rung F3's own predicate accepts, asked with F3's own bound
     # for each rung and the card as it was before this plan's raw buffers (free now + the spill).
     results["the -ub a refusal names is one the F3 publish accepts: the smaller of the spill's share and F3's own answer"] = \
-        re.search(r"by_bound\s*=\s*ggml_sycl::zone_hold_spill_largest_ub_by_bound\(\s*n_ubatch\s*,\s*free_mem\s*\+\s*spill_bytes\s*,\s*"
+        re.search(r"by_bound\s*=\s*ggml_sycl::zone_hold_spill_largest_ub_by_bound\(\s*n_ubatch\s*,\s*free_before\s*,\s*"
                   r"kSyclArenaMinExternalHeadroomBytes\s*,\s*ggml_sycl_hold_spill_bound_at\s*,\s*&device_for_bound\s*\)", realized_fn) is not None and \
+        re.search(r"free_before\s*=\s*free_mem\s*\+\s*live_raw\s*;", realized_fn) is not None and \
+        re.search(r"live_raw\s*=\s*request_hwm\s*!=\s*0\s*\?\s*std::min\(\s*spill_bytes\s*,\s*request_hwm\s*\)\s*:\s*spill_bytes\s*;", realized_fn) is not None and \
         re.search(r"\*largest_ub\s*=\s*std::min\(\s*by_spill\s*,\s*by_bound\s*\)\s*;", realized_fn) is not None and \
         re.search(r"static size_t ggml_sycl_hold_spill_bound_at\(\s*void\s*\*\s*ctx\s*,\s*uint32_t\s+n_ubatch\s*\)\s*\{\s*return\s+ggml_sycl_planned_scratch_hold_spill_bound\(\s*"
                   r"\*static_cast<int\s*\*>\(\s*ctx\s*\)\s*,\s*n_ubatch\s*,\s*0\s*\)\s*;\s*\}", backend) is not None
@@ -1580,8 +1582,11 @@ if args.self_test:
          (mutate_in_func(backend, r"static size_t ggml_sycl_planned_scratch_hold_spill_bound\(", "zone_hold_spill_bound(",
                          "zone_XXXX("), common, cache, zone)),
         ("FA-on check keeps a second criterion", "the FA-on check asks the realized rule (predicted free after the spill), not a second one",
-         (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_headroom\(", "zone_hold_spill_realized_fits(",
+         (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_headroom\(", "zone_hold_spill_bound_fits(",
                          "zone_XXXX("), common, cache, zone)),
+        ("FA-on check carries its own copy of the predicate (g7)", "the FA-on check asks the realized rule (predicted free after the spill), not a second one",
+         (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_headroom\(", "zone_hold_spill_bound_fits(free_mem,",
+                         "zone_hold_spill_realized_fits(free_after, 0 * free_mem + "), common, cache, zone)),
         ("request mark has no n_ubatch", "the largest request is recorded with the n_ubatch it was seen at, from the first publish on",
          (backend, common, mutate_in_func(cache, r"size_t unified_cache_note_runtime_request\(", "request_hwm_n_ubatch",
                                           "request_hwm_XXXX"), zone)),
@@ -1671,6 +1676,21 @@ if args.self_test:
          (mutate_re_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
                             r"admitted_kv\s*=\s*ctx->runtime_kv_admitted\s*\?\s*current->plan\.get\(\)\s*:\s*nullptr",
                             "admitted_kv = current->plan.get()"), common, cache, zone)),
+        ("refusal names only the spill's share (g7)", "the -ub a refusal names is one the F3 publish accepts: the smaller of the spill's share and F3's own answer",
+         (mutate_re_in_func(backend, r"static bool ggml_sycl_check_hold_spill_realized\(",
+                            r"\*largest_ub\s*=\s*std::min\(\s*by_spill\s*,\s*by_bound\s*\)", "*largest_ub = by_spill"), common, cache, zone)),
+        ("refusal names only F3's answer (g7)", "the -ub a refusal names is one the F3 publish accepts: the smaller of the spill's share and F3's own answer",
+         (mutate_re_in_func(backend, r"static bool ggml_sycl_check_hold_spill_realized\(",
+                            r"\*largest_ub\s*=\s*std::min\(\s*by_spill\s*,\s*by_bound\s*\)", "*largest_ub = std::max(by_spill, by_bound)"), common, cache, zone)),
+        ("F3's rung walk is fed the card as it is now, not before the buffer (g7)", "the -ub a refusal names is one the F3 publish accepts: the smaller of the spill's share and F3's own answer",
+         (mutate_re_in_func(backend, r"static bool ggml_sycl_check_hold_spill_realized\(",
+                            r"free_before\s*=\s*free_mem\s*\+\s*live_raw", "free_before = free_mem"), common, cache, zone)),
+        ("the whole spill counter is credited back (g7)", "the -ub a refusal names is one the F3 publish accepts: the smaller of the spill's share and F3's own answer",
+         (mutate_re_in_func(backend, r"static bool ggml_sycl_check_hold_spill_realized\(",
+                            r"request_hwm\s*!=\s*0\s*\?\s*std::min\(\s*spill_bytes\s*,\s*request_hwm\s*\)\s*:\s*spill_bytes", "spill_bytes"), common, cache, zone)),
+        ("the rung walk's bound ignores the rung (g7)", "the -ub a refusal names is one the F3 publish accepts: the smaller of the spill's share and F3's own answer",
+         (mutate_re_in_func(backend, r"static size_t ggml_sycl_hold_spill_bound_at\(",
+                            r"n_ubatch\s*,\s*0\s*\)\s*;", "0, 0);"), common, cache, zone)),
         ("-ub args swapped (T6)", "the realized check computes the -ub from the rung's n_ubatch, its spill and the live free memory",
          (mutate_re_in_func(backend, r"static bool ggml_sycl_check_hold_spill_realized\(",
                             r"zone_hold_spill_largest_ub\(\s*n_ubatch\s*,\s*spill_bytes\s*,\s*free_mem",

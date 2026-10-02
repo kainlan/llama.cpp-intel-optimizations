@@ -17275,10 +17275,11 @@ static bool ggml_sycl_check_hold_spill_headroom(int device, size_t spill_bytes, 
     size_t free_mem = 0, total_mem = 0;
     ggml_backend_sycl_get_device_memory(device, &free_mem, &total_mem);
     // The same question the realized check asks after the fact, asked of the prediction: with the worst-case spill
-    // in place, would the hold be what pushed the card under the driver headroom?
+    // in place, would the hold be what pushed the card under the driver headroom? One predicate
+    // (zone_hold_spill_bound_fits), which is also what the -ub a refusal names is derived from.
     const size_t free_after = spill_bytes >= free_mem ? 0 : free_mem - spill_bytes;
     if (total_mem == 0 ||
-        ggml_sycl::zone_hold_spill_realized_fits(free_after, kSyclArenaMinExternalHeadroomBytes, spill_bytes)) {
+        ggml_sycl::zone_hold_spill_bound_fits(free_mem, kSyclArenaMinExternalHeadroomBytes, spill_bytes)) {
         return true;
     }
     const double mb = 1024.0 * 1024.0;
@@ -17291,6 +17292,13 @@ static bool ggml_sycl_check_hold_spill_headroom(int device, size_t spill_bytes, 
         "or a smaller -ub / -c) before loading\n",
         spill_bytes / mb, device, free_after / mb, free_mem / mb, kSyclArenaMinExternalHeadroomBytes / mb);
     return false;
+}
+
+// llama.cpp-kpjw (kpjw-g7): the bound F3 would predict for a candidate -ub, in the shape
+// zone_hold_spill_largest_ub_by_bound walks. `ctx` is the device index. The KV the transaction would place is not
+// pending here (the context exists and its KV is placed), as for the recheck.
+static size_t ggml_sycl_hold_spill_bound_at(void * ctx, uint32_t n_ubatch) {
+    return ggml_sycl_planned_scratch_hold_spill_bound(*static_cast<int *>(ctx), n_ubatch, 0);
 }
 
 // llama.cpp-kpjw: what the rung's own buffers actually did. The bound above is a transaction-time heuristic (the
@@ -17325,9 +17333,26 @@ static bool ggml_sycl_check_hold_spill_realized(int        device,
     }
     // The largest -ub whose raw spill the card could have taken (the spill scales about linearly with n_ubatch): what
     // a refusal tells the user to pass instead. One device's answer; the caller takes the smallest over its devices.
+    // The -ub a refusal names must be one the F3 publish accepts (kpjw-g7: the spill's linear share named 512 for a
+    // pinned -ub 1024 on the B50 while F3 refused 512 on the same card, 470 MB worst case against 602.7 MB free, so the
+    // advice died with a bare result code). So it is the smaller of that share and the largest rung F3's own predicate
+    // accepts, asked with F3's own bound for each rung and the card as it was before this plan's raw buffer (free now
+    // plus what is live of it). The spill counter sums every raw landing since the publish, including buffers a later
+    // reserve has already released, so what is LIVE is bounded by the largest single request as well: adding back the
+    // whole counter would credit the card with memory it never had, and name a -ub F3 then refuses.
     if (largest_ub) {
-        *largest_ub =
+        int      device_for_bound = device;
+        size_t   request_hwm      = 0;
+        uint32_t request_hwm_ub   = 0;
+        ggml_sycl::unified_cache_get_runtime_request_hwm(device, &request_hwm, &request_hwm_ub);
+        const size_t   live_raw    = request_hwm != 0 ? std::min(spill_bytes, request_hwm) : spill_bytes;
+        const size_t   free_before = free_mem + live_raw;
+        const uint32_t by_spill =
             ggml_sycl::zone_hold_spill_largest_ub(n_ubatch, spill_bytes, free_mem, kSyclArenaMinExternalHeadroomBytes);
+        const uint32_t by_bound =
+            ggml_sycl::zone_hold_spill_largest_ub_by_bound(n_ubatch, free_before, kSyclArenaMinExternalHeadroomBytes,
+                                                           ggml_sycl_hold_spill_bound_at, &device_for_bound);
+        *largest_ub = std::min(by_spill, by_bound);
     }
     const double mb = 1024.0 * 1024.0;
     GGML_SYCL_RUNTIME_TXN_REFUSAL(

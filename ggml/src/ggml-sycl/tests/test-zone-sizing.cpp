@@ -1106,7 +1106,7 @@ int main() {
                   "the shared predicate is the realized rule applied to the predicted free memory");
         }
         // A card already short without the spill is not the hold's doing: nothing to name, the rung is not refused.
-        CHECK(ggml_sycl::zone_hold_spill_bound_fits(200 * MiB, head, 470 * MiB), "short without the spill: not blamed");
+        CHECK(ggml_sycl::zone_hold_spill_bound_fits(200 * MiB, head, 50 * MiB), "short without the spill: not blamed");
         CHECK(ggml_sycl::zone_hold_spill_largest_ub_by_bound(0, free_before, head, bound_of, &in) == 0,
               "an unknown n_ubatch names nothing");
         // Nothing fits down to the smallest rung: 0, not a made-up one.

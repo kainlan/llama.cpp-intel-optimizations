@@ -352,6 +352,25 @@ size_t zone_kv_room_for_compute(size_t kv_largest_free, size_t kv_pending_bytes)
 // the scaling is the same linear one the bound uses.
 uint32_t zone_hold_spill_largest_ub(uint32_t n_ubatch, size_t spill_bytes, size_t free_after, size_t headroom_target);
 
+// llama.cpp-kpjw (kpjw-g7): ONE predicate for "does this demand leave the card its headroom". The transaction-time
+// bound (F3) and the -ub a refusal names used to be two computations over one fact (the spill's linear share named 512
+// where F3 refused 512, so following the advice died with a bare result code). `free_before` is the card WITHOUT the
+// demand in place (free memory now when nothing of this plan's is live, free now + the live raw spill when it is),
+// `bound` the demand: this is zone_hold_spill_realized_fits applied to the predicted free memory, the form F3 calls.
+bool zone_hold_spill_bound_fits(size_t free_before, size_t headroom_target, size_t bound);
+
+// The worst-case raw demand F3 predicts for a candidate n_ubatch (ggml_sycl_planned_scratch_hold_spill_bound).
+typedef size_t (*zone_hold_spill_bound_fn)(void * ctx, uint32_t n_ubatch);
+
+// The largest -ub F3 itself accepts: the largest power of two (at least 32) not above `n_ubatch` whose bound passes
+// zone_hold_spill_bound_fits against `free_before`. 0 when no rung does, or n_ubatch is unknown. A refusal names the
+// smaller of this and zone_hold_spill_largest_ub, so the advice is never a -ub either predicate refuses.
+uint32_t zone_hold_spill_largest_ub_by_bound(uint32_t                 n_ubatch,
+                                             size_t                   free_before,
+                                             size_t                   headroom_target,
+                                             zone_hold_spill_bound_fn bound_of,
+                                             void *                   ctx);
+
 // Whether a RUNTIME-zone request goes to the KV zone instead of the zone / raw device memory: only a request the
 // caller marked as a compute buffer (`compute_spill_flag`), spill-capable (not `forbid_spill`), that the RUNTIME zone
 // will not serve (`zone_misses`: held back by the hold, or larger than the zone's free bytes), and only when the KV

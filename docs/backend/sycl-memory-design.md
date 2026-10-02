@@ -2549,6 +2549,15 @@ devices). N is snapped DOWN to a power of two, the rung a user passes and the la
 the headroom is refused again by the next measurement (B50, Qwen: `-ub 1024` was refused and 512 landed where the
 linear scaling said 672). A pinned `-ub 1024` on the B50 with Qwen is refused there, instead of reaching flash attention
 with 107.8 MB of headroom and hanging.
+The N a refusal prints is one the F3 publish accepts (`llama.cpp-kpjw`, g7). The spill's linear share alone named 512
+for that pinned 1024 while F3, on the same card, refuses 512 (470.0 MB worst case, 132.7 MB left of 602.7 MB, under the
+256 MB headroom), so following the advice died with a bare result code: two predicates over one fact. F3 and the
+refusal now ask one function, `zone_hold_spill_bound_fits(free_before, headroom, bound)` (the realized rule applied to
+the predicted free memory), and the printed N is the smaller of the spill's share and the largest power of two F3's own
+bound accepts (`zone_hold_spill_largest_ub_by_bound`, walked with `ggml_sycl_planned_scratch_hold_spill_bound` for each
+rung). The card it is asked against is the card before this plan's raw buffer: free now plus what is LIVE of it, which
+is the spill counter capped by the largest single request (the counter sums every landing since the publish, including
+buffers a later reserve released, and crediting all of it back would name a -ub F3 then refuses).
 The constructor's check is skipped when the trial already passed the same check for the sched the constructor is left
 with (`sycl_hold_spill_validated_ub`, set by `try_candidate` for the rung and kept only when the settle step did not
 re-reserve): the two readings of the live free memory can differ at the margin, and the ladder's winner must not be
