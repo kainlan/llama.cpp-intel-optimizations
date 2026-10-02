@@ -31,6 +31,7 @@
 
 #include "ggml.h"
 #include "sycl-selector-fallback.hpp"
+#include "test-skip.h"
 #include "unified-cache.hpp"
 
 #include <atomic>
@@ -45,7 +46,6 @@ using namespace ggml_sycl;
 
 namespace {
 
-constexpr int    EXIT_SKIP   = 77;
 constexpr size_t MOCK_BUDGET = 320ULL * 1024 * 1024;
 
 int g_failures = 0;
@@ -170,7 +170,7 @@ unified_cache * make_usm_mock(sycl::queue & q) {
     // above the budget; a smaller cap splits it and the size below differs.
     if (max_alloc / 100 * 95 < MOCK_BUDGET) {
         std::fprintf(stderr, "VOID: max_mem_alloc_size %zu is below the single-chunk precondition\n", max_alloc);
-        std::exit(EXIT_SKIP);
+        std::exit(LLAMA_TEST_EXIT_SKIP);
     }
     return make_mock(q);
 }

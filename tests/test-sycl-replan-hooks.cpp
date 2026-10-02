@@ -20,6 +20,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
+#include "test-skip.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -88,7 +89,7 @@ int main() {
             std::fprintf(stderr, "test-sycl-replan-hooks: %d failure(s)\n", g_failures);
             return 1;
         }
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     ggml_backend_t backend = ggml_backend_sycl_init(0);
