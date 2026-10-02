@@ -34,7 +34,8 @@ def strip_comments(source: str) -> str:
 
 
 def assert_no_waits(source: str) -> None:
-    assert ".wait(" not in source
+    # A wait is a member call through `.` OR `->`: `ctx.stream()->wait()` has no ".wait(" substring.
+    assert not re.search(r"(?:\.|->)\s*wait\s*\(", source)
     assert "wait_and_throw" not in source
 
 
@@ -45,7 +46,12 @@ def assert_no_waits_or_flush(source: str) -> None:
 
 def test_graph_compute_impl_notes_timeline_decode_step_once_without_waits() -> None:
     src = read_source()
-    body = graph_compute_impl_body(src)
+    # Comment-blind BEFORE the window is cut: llama.cpp-os8k (95adb0460) put a ~370-character comment about
+    # flushing the PREVIOUS graph_compute's e2e stage split right after this hook. It is not a flush of anything
+    # here, and cutting the window from the raw text let it spend the whole budget so no code after the hook
+    # was inspected at all. The call it describes, e2e_tg_profile_note_new_graph_compute(), only prints the
+    # host-side stats under its own env gate.
+    body = strip_comments(graph_compute_impl_body(src))
 
     hook = "ggml_sycl::sycl_timeline_note_graph_compute();"
     assert body.count(hook) == 1
@@ -55,10 +61,26 @@ def test_graph_compute_impl_notes_timeline_decode_step_once_without_waits() -> N
     local_hook_window = body[max(0, hook_pos - 200) : min(len(body), hook_pos + 400)]
 
     assert hook_pos < spans_enabled < guard
-    # Comment-blind: llama.cpp-os8k (95adb0460) put a comment about flushing the PREVIOUS graph_compute's e2e
-    # stage split right after this hook, which is not a flush of anything here. The call it describes,
-    # e2e_tg_profile_note_new_graph_compute(), only prints the host-side stats under its own env gate.
-    assert_no_waits_or_flush(strip_comments(local_hook_window))
+    assert "e2e_tg_profile_note_new_graph_compute()" in local_hook_window
+    assert_no_waits_or_flush(local_hook_window)
+
+
+def test_hook_window_rejects_a_wait_or_flush_after_the_hook() -> None:
+    """The window must actually reach code: a flush or wait right after the hook has to be refused."""
+    body = strip_comments(graph_compute_impl_body(read_source()))
+    hook = "ggml_sycl::sycl_timeline_note_graph_compute();"
+    note = "e2e_tg_profile_note_new_graph_compute();"
+    assert note in body
+    for injected in ("e2e_tg_profile_flush_if_ready(stderr);", "ctx.stream()->wait();"):
+        mutant = body.replace(note, note + " " + injected, 1)
+        assert mutant != body
+        hook_pos = mutant.index(hook)
+        window = mutant[max(0, hook_pos - 200) : min(len(mutant), hook_pos + 400)]
+        try:
+            assert_no_waits_or_flush(window)
+        except AssertionError:
+            continue
+        raise AssertionError(f"window missed: {injected}")
 
 
 def test_graph_compute_impl_has_timeline_scope_after_reentry_guard() -> None:
