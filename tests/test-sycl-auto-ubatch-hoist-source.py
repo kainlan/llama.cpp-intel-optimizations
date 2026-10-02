@@ -134,6 +134,28 @@ def exits_ok(code: str) -> bool:
     ) or z("if (!auto_ubatch_prep) { sched_reserve(); return; }") in head[:400]
 
 
+_SINGLE_RESERVE_EXITS = (
+    "if (sycl_backends.empty()) {",
+    "if (!probe_fn || !fallback_fn) {",
+    "if (cap < ladder[0]) {",
+    "if (owner.model_id == 0 || owner.load_txn_id == 0) {",
+)
+
+
+def lookup_after_exits_ok(code: str) -> bool:
+    """The tuning-cache lookup is made nowhere on a single-reserve exit: every exit condition precedes it. And the
+    hoisted block reads no memory-module state, because the memory module does not exist yet when it runs."""
+    prep = function_body(code, _PREPARE)
+    lookup = prep.find(z("cache_lookup_fn(&cache_key,"))
+    if lookup == -1:
+        return False
+    for cond in _SINGLE_RESERVE_EXITS:
+        at = prep.find(z(cond))
+        if at == -1 or at > lookup:
+            return False
+    return re.search(r"\bmemory\b", prep) is None
+
+
 def stored_once_ok(code: str) -> bool:
     prep = function_body(code, _PREPARE)
     store = z("auto_ubatch_prep = std::move(prep);")
@@ -160,6 +182,10 @@ def test_the_block_prints_nothing_and_the_plan_lines_stay_in_the_ladder():
 
 def test_every_single_reserve_condition_leaves_the_prep_empty():
     assert exits_ok(code_of(CTX_CPP))
+
+
+def test_the_lookup_is_after_every_single_reserve_exit():
+    assert lookup_after_exits_ok(code_of(CTX_CPP))
 
 
 def test_the_prep_is_stored_once_last():
@@ -223,3 +249,21 @@ def test_mutants():
         "mutant 'the prep is never stored' slipped through"
     assert not stored_once_ok(with_prep(prep.replace(z("#else"), z("auto_ubatch_prep = std::move(prep); #else"), 1))), \
         "mutant 'the prep is stored twice' slipped through"
+
+    # the lookup comes after every single-reserve exit, and the block reads no memory state
+    def after_lookup(guard: str) -> str:
+        g = z(guard)
+        moved = prep.replace(g, "", 1)
+        assert moved != prep, guard
+        marker = z("const uint32_t cache_set_value")
+        assert moved.count(marker) == 1
+        return moved.replace(marker, g + marker, 1)
+
+    assert not lookup_after_exits_ok(with_prep(after_lookup("if (owner.model_id == 0 || owner.load_txn_id == 0) { return; }"))), \
+        "mutant 'the zero-token exit moved after the lookup' slipped through"
+    assert not lookup_after_exits_ok(with_prep(after_lookup("if (cap < ladder[0]) { return; }"))), \
+        "mutant 'the cap exit moved after the lookup' slipped through"
+    assert not lookup_after_exits_ok(with_prep(after_lookup("if (sycl_backends.empty()) { return; }"))), \
+        "mutant 'the no-backend exit moved after the lookup' slipped through"
+    assert not lookup_after_exits_ok(with_prep(mutate(prep, "const bool cache_available = ", "const bool cache_available = memory != nullptr && "))), \
+        "mutant 'the hoisted block reads the memory module' slipped through"

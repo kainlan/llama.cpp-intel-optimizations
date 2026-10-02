@@ -107,6 +107,31 @@ def acquisition_ok(code: str) -> bool:
     )
 
 
+_GUARD = "if (!hparams.vocab_only && !measure_only)"
+
+
+def guarded_ok(code: str) -> bool:
+    """The decision, the refusal, the acquisition and the fixpoint all sit inside ONE `!vocab_only && !measure_only` block:
+    a measure-only context (the plan override's own transaction) must not be refused, and must not acquire a copy."""
+    ctor = ctor_text(code)
+    head = z(_GUARD)
+    at = ctor.find(head)
+    while at != -1:
+        arm = arm_of(ctor[at:], _GUARD)
+        if all(
+            z(n) in arm
+            for n in (
+                "llama_plan_caps_decide(",
+                "if (plan_decision == LLAMA_PLAN_CAPS_REFUSE_NO_PROCS)",
+                "if (plan_decision == LLAMA_PLAN_CAPS_ACQUIRE)",
+                "sched_residency_fixpoint();",
+            )
+        ):
+            return True
+        at = ctor.find(head, at + 1)
+    return False
+
+
 def inert_ok(code: str) -> bool:
     if z("static constexpr bool llama_context_residency_probe_wired = false;") not in code:
         return False
@@ -132,6 +157,10 @@ def test_refusal_is_named_and_acquires_nothing():
 
 def test_acquisition_is_the_only_assignment_under_the_acquire_arm():
     assert acquisition_ok(code_of(CTX_CPP))
+
+
+def test_the_decision_is_inside_the_not_measure_only_block():
+    assert guarded_ok(code_of(CTX_CPP))
 
 
 def test_the_planned_reserve_is_production_unreachable_until_the_probe_is_wired():
@@ -185,3 +214,11 @@ def test_mutants():
     fix = function_body(code, _FIXPOINT)
     assert not inert_ok(code.replace(fix, fix.replace("throw", "return;", 1), 1)), \
         "mutant 'the fixpoint member returns without running' slipped through"
+
+    # the guard
+    # (the decision's block is the one that opens right after `sycl_auto_ubatch_trial` is declared)
+    opens = "bool sycl_auto_ubatch_trial = false; " + _GUARD
+    assert not guarded_ok(with_ctor(mutate(ctor, opens, "bool sycl_auto_ubatch_trial = false; if (!hparams.vocab_only)"))), \
+        "mutant 'a measure-only context takes the planned decision' slipped through"
+    assert not guarded_ok(with_ctor(mutate(ctor, opens, "bool sycl_auto_ubatch_trial = false; if (!measure_only)"))), \
+        "mutant 'the planned decision is not skipped for a vocab-only context' slipped through"

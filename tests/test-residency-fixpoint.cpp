@@ -21,7 +21,13 @@
 //   (10) the verify: a raw probe over T* that holds fewer host layers than R* re-measures over that
 //        smaller set and the pair replaces (R*, T*) only when the probe over the new tenants keeps it;
 //        when the probe does not keep it, (R*, T*) stands;
-//   (11) a verify answer that holds a host layer R* does not is BUG: R* was not a fixpoint.
+//   (11) a verify answer that holds a host layer R* does not is BUG: R* was not a fixpoint;
+//   (12) a context with no SYCL backend is UNPLANNED even with a plan active, L4 ready and the cap procs
+//        missing: the backend test comes before the proc test, so a CPU-only context in a SYCL build is
+//        never refused for procs it has no use for;
+//   (13) each wrong-length answer is BUG on its own: R0 alone, a verify answer alone;
+//   (14) a MEASURE that fails in the verify (the re-measure over R_v) is MEASURE_FAILED and publishes nothing;
+//   (15) a layerless model (n_layer = 0) is one MEASURE and an empty residency.
 
 #include "../src/llama-residency-fixpoint.h"
 #include "ggml-sycl-cohort.h"  // GGML_SYCL_CONTEXT_COHORT_COMPUTE, named here, not reached transitively
@@ -84,6 +90,7 @@ struct stub {
     std::vector<llama_residency>                          measured_over;
     int                                                   probe_calls = 0;
     bool                                                  measure_ok  = true;
+    int                                                   fail_measure_at = -1;  // the MEASURE (0-based) that fails
 };
 
 static llama_residency_fixpoint_result run(stub & s) {
@@ -95,7 +102,7 @@ static llama_residency_fixpoint_result run(stub & s) {
         },
         [&](const llama_residency & r, llama_tenants & out) {
             s.measured_over.push_back(r);
-            if (!s.measure_ok) {
+            if (!s.measure_ok || (int) s.measured_over.size() - 1 == s.fail_measure_at) {
                 return false;
             }
             out = tenants_for(r);
@@ -118,6 +125,14 @@ static void test_decision() {
     CHECK(llama_plan_caps_decide(true, true, false, false, false) == LLAMA_PLAN_CAPS_UNPLANNED);
     CHECK(llama_plan_caps_decide(true, true, false, true, false) == LLAMA_PLAN_CAPS_UNPLANNED);
     CHECK(llama_plan_caps_decide(true, true, true, false, false) == LLAMA_PLAN_CAPS_UNPLANNED);
+    // (12) no SYCL backend: UNPLANNED for every combination of the other facts, the refusing one included
+    for (bool new_present : { false, true }) {
+        for (bool free_present : { false, true }) {
+            for (bool l4 : { false, true }) {
+                CHECK(llama_plan_caps_decide(false, true, new_present, free_present, l4) == LLAMA_PLAN_CAPS_UNPLANNED);
+            }
+        }
+    }
     // (3)
     CHECK(llama_plan_caps_decide(true, true, true, true, true) == LLAMA_PLAN_CAPS_ACQUIRE);
     CHECK(llama_plan_caps_decide(true, true, false, true, true) == LLAMA_PLAN_CAPS_REFUSE_NO_PROCS);
@@ -314,6 +329,62 @@ static void test_verify_bug() {
     CHECK(run(s).status == LLAMA_RESIDENCY_FIXPOINT_BUG);
 }
 
+static void test_wrong_length_alone() {
+    // (13a): only R0 (the probe over no tenants) is the wrong length
+    stub s;
+    s.n_layer  = 3;
+    s.probe_fn = [](const llama_tenants * t) {
+        return t == nullptr ? llama_residency(2, 0) : llama_residency(3, 0);
+    };
+    CHECK(run(s).status == LLAMA_RESIDENCY_FIXPOINT_BUG);
+
+    // (13b): only the verify's answer is the wrong length (the iteration's probes, calls 1 and 2, are right)
+    stub s2;
+    s2.n_layer = 3;
+    int calls  = 0;
+    s2.probe_fn = [&calls](const llama_tenants *) {
+        calls++;
+        return calls <= 2 ? llama_residency(3, 0) : llama_residency(4, 0);
+    };
+    const auto r = run(s2);
+    CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_BUG);
+    CHECK(calls == 3);
+}
+
+static void test_verify_measure_failed() {
+    // (14): the setup of (10a); MEASURE 0 (over R0) is fine, MEASURE 1 (the verify's, over R_v) fails
+    stub s;
+    s.n_layer         = 3;
+    s.fail_measure_at = 1;
+    s.probe_fn        = [](const llama_tenants * t) {
+        if (t == nullptr) {
+            return llama_residency{ 0, 1, 1 };
+        }
+        const llama_residency over = residency_of(*t, 3);
+        return over == llama_residency{ 0, 1, 1 } ? llama_residency{ 0, 1, 0 } : over;
+    };
+    const auto r = run(s);
+    CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_MEASURE_FAILED);
+    CHECK(!r.reason.empty());
+    CHECK(r.tenants.empty());
+    CHECK(r.residency.empty());
+    REQUIRE(s.measured_over.size() == 2);
+    CHECK((s.measured_over[1] == llama_residency{ 0, 1, 0 }));
+}
+
+static void test_no_layers() {
+    // (15)
+    stub s;
+    s.n_layer  = 0;
+    s.probe_fn = [](const llama_tenants *) {
+        return llama_residency();
+    };
+    const auto r = run(s);
+    CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_OK);
+    CHECK(r.iterations == 1);
+    CHECK(r.residency.empty());
+}
+
 int main() {
     test_decision();
     test_no_demotion();
@@ -324,6 +395,9 @@ int main() {
     test_wrong_length();
     test_verify();
     test_verify_bug();
+    test_wrong_length_alone();
+    test_verify_measure_failed();
+    test_no_layers();
     if (n_failed != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", n_failed);
         return 1;
