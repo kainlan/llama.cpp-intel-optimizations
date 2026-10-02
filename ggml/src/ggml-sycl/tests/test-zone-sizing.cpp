@@ -741,24 +741,24 @@ int main() {
         size_t       w   = 0;
         size_t       a   = 0;
 
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 0, 0, 24 * mib, 3 * mib, &w, &a);
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 0, 0, 0, 0, 24 * mib, 3 * mib, &w, &a);
         CHECK(w == 24 * mib && a == 3 * mib, "nothing held: the request is the target");
 
-        ggml_sycl::zone_onednn_scratch_reserve_target(false, 0, 1105 * mib, 1 * mib, 24 * mib, 3 * mib, &w, &a);
+        ggml_sycl::zone_onednn_scratch_reserve_target(false, 0, 1105 * mib, 1 * mib, 0, 0, 24 * mib, 3 * mib, &w, &a);
         CHECK(w == 1105 * mib, "a smaller weights request never shrinks the held weights block");
         CHECK(a == 3 * mib, "a larger activations request still grows the activations half on its own");
 
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 100 * mib, 2 * mib, 50 * mib, 3 * mib, &w, &a);
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 100 * mib, 2 * mib, 0, 0, 50 * mib, 3 * mib, &w, &a);
         CHECK(w == 100 * mib && a == 3 * mib, "inside the zone the merged pair is the target");
 
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 200 * mib, 2 * mib, 50 * mib, 100 * mib, &w, &a);
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 200 * mib, 2 * mib, 0, 0, 50 * mib, 100 * mib, &w, &a);
         CHECK(w == 50 * mib && a == 100 * mib,
               "a merge that would overflow the zone falls back to the request instead of wedging every op");
 
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, SIZE_MAX, 1, 50 * mib, 3 * mib, &w, &a);
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, SIZE_MAX, 1, 0, 0, 50 * mib, 3 * mib, &w, &a);
         CHECK(w == 50 * mib && a == 3 * mib, "an unrepresentable merged sum is refused, not wrapped");
 
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 1, 1, 2, 2, nullptr, nullptr);
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 1, 1, 0, 0, 2, 2, nullptr, nullptr);
     }
 
     // ---- Case 14c: the oneDNN scratch supplies an op only when its type is enabled too (llama.cpp-8ony) -----
@@ -1017,13 +1017,52 @@ int main() {
         CHECK(none.bare_bytes == draft.bare_bytes && none.graph_floor_bytes == draft.graph_floor_bytes,
               "with nothing held, the live plan is what the zone is described by");
 
+        // The halves are the two components of ONE pair plan and travel with the bare plan they sum into. Maxing
+        // each half on its own builds a pair no plan had: held (weights 100, activations 10) against live (10, 100)
+        // is 110 either way, but the per-half maxima are (100, 100), above the zone's 110, so a bound equal to the bare
+        // plan could not hold the planned pair and the first reservation would regrow after all.
+        {
+            zone_onednn_plan held_plan;
+            held_plan.bare_bytes        = 110 * mib;
+            held_plan.weights_bytes     = 100 * mib;
+            held_plan.activations_bytes = 10 * mib;
+            zone_onednn_plan live_plan;
+            live_plan.bare_bytes        = 110 * mib;
+            live_plan.weights_bytes     = 10 * mib;
+            live_plan.activations_bytes = 100 * mib;
+            const zone_onednn_plan crossed = ggml_sycl::zone_onednn_plan_keep(held_plan, live_plan);
+            CHECK(crossed.weights_bytes + crossed.activations_bytes <= crossed.bare_bytes,
+                  "the kept halves never sum above the kept bare plan");
+            size_t cw = 0, ca = 0;
+            ggml_sycl::zone_onednn_scratch_reserve_target(true, crossed.bare_bytes, 0, 0, crossed.weights_bytes,
+                                                          crossed.activations_bytes, 50 * mib, 5 * mib, &cw, &ca);
+            CHECK(cw == 100 * mib && ca == 10 * mib,
+                  "the kept plan's first reservation is its planned pair, which a bound equal to the bare plan holds");
+
+            zone_onednn_plan big_plan;
+            big_plan.bare_bytes        = 200 * mib;
+            big_plan.weights_bytes     = 120 * mib;
+            big_plan.activations_bytes = 80 * mib;
+            zone_onednn_plan small_plan;
+            small_plan.bare_bytes        = 150 * mib;
+            small_plan.weights_bytes     = 140 * mib;
+            small_plan.activations_bytes = 10 * mib;
+            const zone_onednn_plan larger = ggml_sycl::zone_onednn_plan_keep(small_plan, big_plan);
+            CHECK(larger.bare_bytes == 200 * mib && larger.weights_bytes == 120 * mib &&
+                      larger.activations_bytes == 80 * mib,
+                  "the halves come from the plan with the larger bare plan, whichever side it is on");
+            const zone_onednn_plan smaller = ggml_sycl::zone_onednn_plan_keep(big_plan, small_plan);
+            CHECK(smaller.weights_bytes == 120 * mib && smaller.activations_bytes == 80 * mib,
+                  "a later, smaller plan does not replace the halves of the larger one");
+        }
+
         // The reserve merges per-component maxima, so two ops that each fit the bound can hold a pair above it. The
         // merge is bounded by the PAIR BOUND, not the capacity: the held pair would otherwise eat the Graph floor.
         const size_t bound = 235 * mib;
         size_t       w = 0, a = 0;
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, bound, 200 * mib, 4 * mib, 40 * mib, 40 * mib, &w, &a);
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, bound, 200 * mib, 4 * mib, 0, 0, 40 * mib, 40 * mib, &w, &a);
         CHECK(w == 40 * mib && a == 40 * mib, "a merge above the bound is not held: the request is used as asked");
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 200 * mib, 4 * mib, 40 * mib, 40 * mib, &w, &a);
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 200 * mib, 4 * mib, 0, 0, 40 * mib, 40 * mib, &w, &a);
         CHECK(w == 200 * mib && a == 40 * mib,
               "the same two ops against the raw capacity merge to 240 MiB, past the 235 MiB bound");
     }

@@ -62,6 +62,8 @@ parser.add_argument("--cache", default=str(sycl / "unified-cache.cpp"))
 parser.add_argument("--cache-hpp", default=str(sycl / "unified-cache.hpp"))
 parser.add_argument("--zone-sizing", default=str(sycl / "zone-sizing.cpp"))
 parser.add_argument("--model", default=str(root / "src/llama-model.cpp"))
+parser.add_argument("--placement", default=str(sycl / "onednn-pp-placement.hpp"))
+parser.add_argument("--unified-types", default=str(sycl / "unified-types.hpp"))
 parser.add_argument("--common", default=str(sycl / "common.hpp"))
 parser.add_argument("--dispatch", default=str(sycl / "dispatch.hpp"))
 parser.add_argument("--sycl-header", default=str(root / "ggml/include/ggml-sycl.h"))
@@ -142,7 +144,7 @@ HELPER = "ggml_sycl_onednn_pp_scratch_planned_bytes("
 REUSE_TEST = "if (onednn_weights_scratch_ && onednn_activations_scratch_ && onednn_weights_scratch_size_ >= weights_size"
 
 
-def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, dispatch):
+def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, dispatch, placement, utypes):
     results = {}
     bytes_helper = function_body(
         backend, r"static bool ggml_sycl_onednn_pp_scratch_planned_bytes\([^)]*\)\s*\{")
@@ -222,7 +224,7 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
     results["anchor: the zone-inventory adapter exists"] = adapter is not None
     if adapter is not None:
         results["the adapter marks the unified-kernel types for the conditional dequant plan"] = \
-            "ggml_sycl_should_use_unified_type(" in adapter and "dequant_f16_if_unsupplied_weight_bytes" in adapter and \
+            "unified_kernel_serves_type(" in adapter and "dequant_f16_if_unsupplied_weight_bytes" in adapter and \
             "dequant_f16_if_unsupplied_src1_bytes_per_token" in adapter
         results["the adapter hands the classifier the type/env enablement, not its own copy"] = \
             "pp_scratch_type_enabled" in adapter and "onednn_pp_unified_scratch_enabled(" in adapter
@@ -442,17 +444,46 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
             at = fbody.find("llama_model_sycl_mark_get_rows_only(tensors, ml)")
             results["the %s marks the role before it builds the inventory" % fname] = \
                 0 <= at < fbody.find("llama_model_sycl_populate_inventory(")
-    # ---- one source for "which weight types the unified kernel serves" (llama.cpp-8ony) ----
-    def type_set(body, with_case):
-        pattern = r"case\s+(GGML_TYPE_\w+)\s*:" if with_case else r"(GGML_TYPE_\w+)"
-        return set(re.findall(pattern, body or ""))
-    router_types = function_body(dispatch, r"inline bool should_use_unified\(ggml_type type\)\s*\{")
-    mirror_types = function_body(common, r"inline bool ggml_sycl_should_use_unified_type\(ggml_type type\)\s*\{")
-    results["anchor: the router's unified type set exists"] = router_types is not None
-    results["anchor: the planner's mirror of it exists"] = mirror_types is not None
-    if router_types is not None and mirror_types is not None:
-        results["the planner's unified type set is the router's"] = \
-            type_set(router_types, True) == type_set(mirror_types, False) and len(type_set(mirror_types, False)) > 0
+    # ---- ONE source for "which weight types the unified kernel serves" (llama.cpp-8ony) ----
+    # A shared header holds the one switch; the router and the planner's adapter both call it, and no second list of
+    # the types exists to drift (the planner's hand-kept mirror in common.hpp is gone).
+    serves = function_body(utypes, r"inline bool unified_kernel_serves_type\(ggml_type type\)\s*\{")
+    results["anchor: the shared unified type predicate exists"] = serves is not None
+    if serves is not None:
+        results["the shared predicate lists the types"] = "GGML_TYPE_Q4_0" in serves and "GGML_TYPE_MXFP4" in serves
+    router = function_body(dispatch, r"inline bool should_use_unified\(ggml_type type\)\s*\{")
+    results["anchor: the router's unified type predicate exists"] = router is not None
+    if router is not None:
+        results["the router asks the shared predicate and keeps no list of its own"] = \
+            "unified_kernel_serves_type(type)" in router and "GGML_TYPE_" not in router
+    results["the router includes the shared header"] = '#include "unified-types.hpp"' in dispatch
+    results["the planner includes the shared header"] = \
+        '#include "unified-types.hpp"' in cache or '#include "unified-types.hpp"' in cache_hpp
+    results["the planner's hand-kept mirror of the type set is gone"] = \
+        "ggml_sycl_should_use_unified_type" not in common and "ggml_sycl_should_use_unified_type" not in cache
+
+    # ---- ONE statement of the type-level PP refusal, shared by the pure admission and the planner (llama.cpp-8ony) ----
+    term = function_body(placement, r"inline bool onednn_pp_type_term_refused\(bool enabled, bool skip_type\)\s*\{")
+    results["anchor: the shared type-level refusal term exists"] = term is not None
+    decide = function_body(placement, r"inline onednn_pp_refusal onednn_pp_admission_decide\([^)]*\)\s*\{")
+    results["anchor: the pure admission exists"] = decide is not None
+    if decide is not None:
+        results["the pure admission asks the shared type-level term"] = \
+            "onednn_pp_type_term_refused(in.enabled, in.skip_type)" in decide
+    admitted_fn = function_body(backend, r"bool ggml_sycl_onednn_pp_type_admitted\(ggml_type type\)\s*\{")
+    if admitted_fn is not None:
+        results["the planner's admission asks the same shared term"] = \
+            "onednn_pp_type_term_refused(" in admitted_fn
+
+    # ---- the reserve reads the stored snapshot once, and the bound comes from that read (llama.cpp-8ony) ----
+    reserve_fn = function_body(cache, r"bool unified_cache::reserve_onednn_scratch\([^)]*\)\s*\{")
+    if reserve_fn is not None:
+        first_block = reserve_fn[:reserve_fn.find("zone_onednn_scratch_reserve_target(")]
+        results["the reserve's first bound comes from the snapshot it already loaded"] = \
+            first_block.count("onednn_zone_plan_load(") == 1 and \
+            re.search(r"onednn_pp_pair_bound_for\(\s*zone_plan,", first_block) is not None
+    # ---- the 8-argument reserve-target overload was a test-only shim; one definition remains ----
+    results["one definition of the reserve target"] = zone_sizing.count("void zone_onednn_scratch_reserve_target(") == 1
 
     # ---- the conditional plan follows the same PP admission gates the op takes (llama.cpp-8ony) ----
     admitted = function_body(backend, r"bool ggml_sycl_onednn_pp_type_admitted\(ggml_type type\)\s*\{")
@@ -482,6 +513,8 @@ def run(label, sources, expect_fail=None):
         srcs += (model, header)
     if len(srcs) == 6:
         srcs += (common, dispatch)
+    if len(srcs) == 8:
+        srcs += (placement, utypes)
     results = evaluate(*srcs)
     bad = [k for k, v in results.items() if not v]
     if expect_fail is None:
@@ -526,6 +559,10 @@ cache = strip_comments(Path(args.cache).read_text())
 cache_hpp = strip_comments(Path(args.cache_hpp).read_text())
 common = strip_comments(Path(args.common).read_text())
 dispatch = strip_comments(Path(args.dispatch).read_text())
+placement = strip_comments(Path(args.placement).read_text())
+# The shared header may not exist yet; its absence is a failed check, not a crash.
+utypes_path = Path(args.unified_types)
+utypes = strip_comments(utypes_path.read_text()) if utypes_path.exists() else ""
 model = strip_comments(Path(args.model).read_text())
 header = strip_comments(Path(args.sycl_header).read_text())
 
@@ -563,7 +600,7 @@ if args.self_test and not failed:
         ("enablement bypasses the pure predicate", "the enablement function asks the pure predicate",
          (backend, mutate_in_func(cache, enabled_sig, "zone_onednn_pp_scratch_type_enabled(", "zone_XXXX("), cache_hpp)),
         ("adapter forgets the unified types", "the adapter marks the unified-kernel types for the conditional dequant plan",
-         (backend, mutate_in_func(cache, adapter_sig, "ggml_sycl_should_use_unified_type(", "XXXX("), cache_hpp)),
+         (backend, mutate_in_func(cache, adapter_sig, "unified_kernel_serves_type(", "XXXX("), cache_hpp)),
         ("adapter keeps its own enablement", "the adapter hands the classifier the type/env enablement, not its own copy",
          (backend, mutate_in_func(cache, adapter_sig, "onednn_pp_unified_scratch_enabled(", "XXXX("), cache_hpp)),
         ("adapter marks expert stacks", "the adapter excludes expert stacks from the conditional mark too",
@@ -774,14 +811,34 @@ if args.self_test and not failed:
         ("PP admission undeclared", "the PP type admission is declared for the planner to call",
          (backend, cache, cache_hpp, zone_sizing, model, header,
           mutate(common, "ggml_sycl_onednn_pp_type_admitted(", "ggml_sycl_XXXX("), dispatch)),
-        ("router gains a type", "the planner's unified type set is the router's",
+        ("router keeps its own list", "the router asks the shared predicate and keeps no list of its own",
          (backend, cache, cache_hpp, zone_sizing, model, header, common,
-          mutate_in_func(dispatch, r"inline bool should_use_unified\(", "case GGML_TYPE_MXFP4:",
-                         "case GGML_TYPE_MXFP4:\n        case GGML_TYPE_Q8_0:"))),
-        ("mirror loses a type", "the planner's unified type set is the router's",
+          mutate_in_func(dispatch, r"inline bool should_use_unified\(", "unified_kernel_serves_type(type)",
+                         "type == GGML_TYPE_Q4_0"))),
+        ("router drops the include", "the router includes the shared header",
+         (backend, cache, cache_hpp, zone_sizing, model, header, common,
+          mutate(dispatch, '#include "unified-types.hpp"', "")),),
+        ("planner brings the mirror back", "the planner's hand-kept mirror of the type set is gone",
          (backend, cache, cache_hpp, zone_sizing, model, header,
-          mutate_in_func(common, r"inline bool ggml_sycl_should_use_unified_type\(", "type == GGML_TYPE_Q4_0 || ", ""),
-          dispatch)),
+          common + "\ninline bool ggml_sycl_should_use_unified_type(ggml_type t) { return true; }\n", dispatch)),
+        ("shared predicate loses a type", "the shared predicate lists the types",
+         (backend, cache, cache_hpp, zone_sizing, model, header, common, dispatch, placement,
+          mutate(utypes, "GGML_TYPE_MXFP4", "GGML_TYPE_XXXX"))),
+        ("decide restates the term", "the pure admission asks the shared type-level term",
+         (backend, cache, cache_hpp, zone_sizing, model, header, common, dispatch,
+          mutate_in_func(placement, r"inline onednn_pp_refusal onednn_pp_admission_decide\(",
+                         "onednn_pp_type_term_refused(in.enabled, in.skip_type)", "(!in.enabled || in.skip_type)"),
+          utypes)),
+        ("planner restates the term", "the planner's admission asks the same shared term",
+         (mutate_in_func(backend, r"bool ggml_sycl_onednn_pp_type_admitted\(", "onednn_pp_type_term_refused(",
+                         "XXXX("), cache, cache_hpp)),
+        ("reserve reloads the snapshot for its bound", "the reserve's first bound comes from the snapshot it already loaded",
+         (backend, mutate_in_func(cache, reserve_sig, "onednn_pp_pair_bound_for(zone_plan,",
+                                  "onednn_pp_pair_bound_for(bound_dev,"), cache_hpp)),
+        ("test shim comes back", "one definition of the reserve target",
+         (backend, cache, cache_hpp,
+          zone_sizing + "\nvoid zone_onednn_scratch_reserve_target(bool a, size_t b, size_t c, size_t d, size_t e, size_t f, "
+                        "size_t * g, size_t * h) {}\n")),
         ("refusal after the zone allocation", "reserve refuses a pair above the bound, before it allocates from the zone",
          (backend, mutate_in_func(cache, reserve_sig, "const size_t pair_bound_now",
                                   "void * early_probe = zone_alloc(vram_zone_id::ONEDNN, weights_size); (void) early_probe; "
