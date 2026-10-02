@@ -36,12 +36,9 @@ REGISTRARS = ("add_test", "llama_test_pytest", "llama_test_cmd")
 SKIP_DIRS = {".git", ".llm-wiki", "artifacts", "media", "models", "node_modules", "build"}
 # name -> reason. A gate listed here is deliberately not in ctest; empty means every gate runs.
 UNREGISTERED_ALLOWLIST = {}
-# name -> reason. A registered gate whose file is not in the tree. Remove the entry when the file is committed
-# (the audit then reports it stale).
-MISSING_FILE_ALLOWLIST = {
-    "test-sycl-mmid-admission-source.py": "registered by 64ec60199 but the file was never committed; it exists only as "
-                                          "an untracked file in the main checkout (another lane's work)",
-}
+# name -> reason. A registered gate whose file is not in the tree. Empty: every registered gate is committed.
+# An entry goes stale (and is reported) the moment its file appears.
+MISSING_FILE_ALLOWLIST = {}
 REQUIRE_PYTEST_FOOTER = True
 FOOTER_RE = re.compile(r'if __name__ == "__main__":\s*\n(?:\s+import [A-Za-z_.]+\s*\n)*\s+sys\.exit\(pytest\.main\(\[__file__, "-q"\]\)\)\s*$')
 
