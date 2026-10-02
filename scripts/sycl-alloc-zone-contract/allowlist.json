@@ -171,6 +171,14 @@
       "name": "mmap",
       "count": 1,
       "reason": "cache bookkeeping, guard-page debug mode, no tensor/KV/scratch/pinned/USM bytes: cache_guard_allocator backs the cache's own hash maps when the guard env is set and falls back to std::allocator; the cache cannot allocate its own map nodes through itself. Permanent; canonical contract section 9.1 (the cache_guard_allocator row)"
+    },
+    {
+      "id": "E-KV-RELEASE-CATCH",
+      "code": "G-CATCH",
+      "file": "kv-region-registry.hpp",
+      "function": "kv_region_release",
+      "count": 2,
+      "reason": "kv_region_release is noexcept and runs from the plan guard's destructor (the registry release proc): its two catch-all handlers release the replan token and report through kv_region_abort, a named abort, because a release that cannot finish must not propagate out of a destructor. A rethrow of ggml_sycl_fallback_error there would std::terminate without the named message, and the try bodies (registry take, slot-state take_retentions, the retain callback) never raise a planned refusal. Permanent; design docs/design/sycl-kv-region-segregation.md, the registry release proc and the noexcept destructor."
     }
   ]
 }
