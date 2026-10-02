@@ -383,7 +383,7 @@ def evaluate(backend, common, memo_hdr):
         "drop_graphs(*ctx)" in dense_drop and "find(ctx)" in dense_drop and "state_for(" not in dense_drop
     gw_at = dense.find("graph_prestage_or_decline(")
     results["the dense recorder re-sizes its range graphs after the gateway may have retired them"] = \
-        gw_at >= 0 and re.search(r"if\s*\(st\.graphs\.size\(\)\s*!=\s*ranges_\.size\(\)\)\s*\{\s*st\.graphs\.resize\(ranges_\.size\(\)\);", dense[gw_at:]) is not None
+        gw_at >= 0 and re.search(r"if\s*\(st\.graphs\.size\(\)\s*!=\s*ranges_\.size\(\)\)\s*\{\s*st\.graphs\.resize\(ranges_\.size\(\)\);\s*st\.graphs_key\s*=\s*key;\s*ctx_\.input_tensors_cached\s*=\s*false;", dense[gw_at:]) is not None
 
     # Every release of recorded state waits first, under the guard that says there is something in flight (review r6).
     clear_active = function_body(backend, r"static void sycl_exec_graph_clear_active\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{") or ""
@@ -472,6 +472,9 @@ if args.self_test:
 
     mem_ = memo_hdr
     mutants = [
+        ("dense post-gateway resize forgets the cached-input reset", "the dense recorder re-sizes its range graphs after the gateway may have retired them",
+         (mutate_in_func(backend, r"graph_prestage_decline_memo::dense_split_key\(key\)\)\)\s*\{[^}]*\}\s*if \(st\.graphs\.size\(\) != ranges_\.size\(\)\) \{",
+                         "ctx_.input_tensors_cached = false;", "(void) 0;"), common, mem_)),
         ("flag-only INPUT test in pre-stage", "pre-stage has no flag-only INPUT test left",
          (mutate_in_func(backend, pre_sig, "graph_tensor_is_input(tensor)",
                          "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common, mem_)),

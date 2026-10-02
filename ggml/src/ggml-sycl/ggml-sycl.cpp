@@ -99708,6 +99708,8 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
         // INPUT tensors: stage to a STABLE device buffer that persists across graph iterations.
         // The ggml allocator may reassign tensor->data between iterations, but L0 graph replay
         // bakes the pointer at finalize time. The stable staging buffer survives across replays.
+        // Pre-existing exception to "an INPUT failure is terminal": an INPUT with an EMPTY name does not take this arm
+        // and falls through to the cache paths below, which key on its current data address.
         if (graph_tensor_is_input(tensor) && tensor->name && tensor->name[0] != '\0') {
             sycl::queue & q       = *ctx->stream();
             // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
@@ -99806,12 +99808,15 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
 }
 
 // An input's staging buffer was replaced because its size changed (graph_input_stage). Recorded work bakes the
-// staging POINTER, so every recorder that may hold the old one is retired here, in an order that drains before
-// anything is released: the dense range graphs (drop_graphs drains each device it ran on), then the MoE epochs
-// (each retire waits for its terminals), then the exec graph and the staging map through clear_active, which
-// waits on the stream before it releases the displaced handles. clear_active empties the staging map, so the
-// caller pre-stages again afterwards. The cost is one wait per size change, and a size change is already a
-// re-record (the graph signature mixes every shape), so it adds a wait and a pass, not a recording.
+// staging POINTER, so every recorder that may hold the old one is retired here: the dense range graphs
+// (drop_graphs drains each device it ran on), the MoE epochs (each retire waits for its terminals), and a LIVE exec
+// graph. The displaced handle was already retained on a barrier event at the swap, and the staging map is current,
+// so nothing is released or re-staged here.
+// This runs INSIDE a graph_compute that has already pinned weights and experts (graph_preload_weights,
+// graph_preload_moe_experts), so it must not call sycl_exec_graph_clear_active: that unpins those leases, clears
+// the CPU staging cache and the MoE layout cache mid-compute (its header cites a measured gemma regression). The
+// cost of a swap is one drain per retired recorder; a swap is rare (the kq_mask leaf steps with n_kv), and the
+// same step already changes the graph signature, so it adds drains, not a recording.
 static void graph_staging_swap_retire(ggml_backend_sycl_context * ctx) {
     ctx->graph_input_staging_swapped = false;
     if (ggml_sycl_graph_diag_enabled()) {
@@ -99823,7 +99828,17 @@ static void graph_staging_swap_retire(ggml_backend_sycl_context * ctx) {
     ctx->invalidate_moe_block_graphs();
     ctx->invalidate_moe_direct_dispatch_graphs();
     ctx->invalidate_moe_sequence_graphs();
-    sycl_exec_graph_clear_active(ctx, "staging-swapped");
+    if (ctx->exec_graph) {
+        // llama.cpp-dkw0 defect #4: destroying an executable graph under its own in-flight submission double-frees
+        // the runtime's bookkeeping, so a LIVE graph is drained before it is reset. With no live graph there is
+        // nothing to drain and nothing to reset.
+        ggml_sycl_trace_queue_wait(ctx->stream(), "staging-swapped", ctx->device, -1, nullptr);
+        ctx->exec_graph.reset();
+        sycl_exec_graph_release_pool_retained(ctx);
+        ctx->active_exec_graph.valid = false;
+        ctx->exec_graph_n_nodes      = 0;
+        ctx->exec_graph_hash         = 0;
+    }
 }
 
 // Counts this token against a held decline (it MUTATES the memo): true means skip the pre-stage and run direct,
@@ -99845,12 +99860,11 @@ static bool graph_prestage_or_decline(ggml_backend_sycl_context * ctx, const ggm
     if (graph_prestage_skip_declined(ctx, graph_hash)) {
         return false;
     }
-    bool staged = graph_prestage_leaf_tensors(ctx, cgraph);
+    const bool staged = graph_prestage_leaf_tensors(ctx, cgraph);
     if (ctx->graph_input_staging_swapped) {
         // An input's staging buffer was replaced (its size changed). Whether the pass then succeeded or declined,
         // every recorded graph that baked the old pointer is stale.
         graph_staging_swap_retire(ctx);
-        staged = staged && graph_prestage_leaf_tensors(ctx, cgraph);
     }
     if (staged) {
         ctx->prestage_decline_memo.forget(graph_hash);
@@ -100350,9 +100364,7 @@ static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const 
     // phase-boundary event (once per prompt/generation transition), never a
     // per-token hot path, so an explicit wait here does not touch the "no
     // host waits" performance rule that governs per-op dispatch.
-    // The retired staging handles are released below with the staging map, and a replay of ANY recorded graph
-    // may still be reading them, so they need the same wait as a live exec graph.
-    if (ctx->exec_graph || !ctx->graph_input_staging_retired.empty()) {
+    if (ctx->exec_graph) {
         ggml_sycl_trace_queue_wait(ctx->stream(), reason ? reason : "exec-graph-clear", ctx->device, -1, nullptr);
     }
     ctx->exec_graph.reset();

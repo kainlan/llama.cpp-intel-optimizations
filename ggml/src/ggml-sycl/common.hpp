@@ -6482,14 +6482,13 @@ struct ggml_backend_sycl_context {
     // into it itself, can tell it is still the same entry and still holds
     // those bytes.
     uint64_t                                                           graph_input_staging_generation = 0;
-    // Staging handles a size change displaced. A recorded graph (exec graph, MoE segments, block graphlets, dense
-    // range graphs) bakes the staging POINTER, and a replay from the previous token may still be reading the old
-    // buffer, so the displaced handle is held here instead of freed. graph_input_staging_clear releases it, and
-    // sycl_exec_graph_clear_active reaches that only after a queue wait. No recorder's retained set can hold it:
-    // the buffer is created before any recording starts, and which recorder will bake it is not known then.
-    std::vector<ggml_sycl::mem_handle> graph_input_staging_retired;
-    // Set when a valid handle was displaced. graph_prestage_or_decline consumes it and retires every recorded
-    // graph that may have baked the old pointer.
+    // Set when a size change displaced a live staging handle (graph_input_stage). A recorded graph (exec graph, MoE
+    // segments, block graphlets, dense range graphs) bakes the staging POINTER, so graph_prestage_or_decline consumes
+    // the flag and retires every recorder that may hold the old one. The displaced handle itself is retained on a
+    // barrier event at the swap, not freed, so a replay from the previous token may finish reading it. Whether a
+    // recorded graph also keeps its own copy of the handle depends on the consumer (GET_ROWS indices do, through
+    // terminal_retention_ticket::prepare; a consumer that takes the raw pointer does not), and the map cannot know
+    // which consumers baked it.
     bool                               graph_input_staging_swapped = false;
 
     bool graph_input_stage_lookup(const ggml_tensor *     owner,
@@ -6546,9 +6545,8 @@ struct ggml_backend_sycl_context {
             }
         }
 
-        // The replacement is built into locals and swapped in only once it exists and holds the bytes. A failure
-        // here leaves the old entry live (and whatever recorded graph baked it valid), and the displaced handle is
-        // never freed under a replay that may still be reading it.
+        // The replacement is built into locals and published as the last act, after every failure return. A failure
+        // here leaves the old entry live (and whatever recorded graph baked it valid).
         ggml_sycl::alloc_request req{};
         req.queue                          = &q;
         req.device                         = dev_id;
@@ -6575,7 +6573,10 @@ struct ggml_backend_sycl_context {
         ggml_sycl::mem_copy(handle, src_handle, nbytes, q);
         graph_input_staging_entry & slot = graph_input_staging[owner];
         if (slot.handle.valid()) {
-            graph_input_staging_retired.push_back(std::move(slot.handle));
+            // A replay from the previous token may still read the displaced buffer: hold it until the last work
+            // submitted on this queue completes (an event, not a host wait). The recorders that baked its pointer
+            // are retired by the gateway, which consumes the flag.
+            ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, q.ext_oneapi_submit_barrier());
             graph_input_staging_swapped = true;
         }
         slot.handle   = std::move(handle);
@@ -6614,7 +6615,6 @@ struct ggml_backend_sycl_context {
     void graph_input_staging_clear(sycl::queue & q) {
         GGML_UNUSED(q);
         graph_input_staging.clear();
-        graph_input_staging_retired.clear();
         graph_input_staging_swapped = false;
         graph_input_staging_generation++;
     }
