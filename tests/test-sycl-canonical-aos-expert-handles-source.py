@@ -117,7 +117,9 @@ def violations(source: str) -> list[str]:
         "resolver checks plan before registered handles": route.index("lookup_expert_placement") < route.index("ggml_sycl_try_moe_storage_handle_route"),
         "active plan rejects unnamed tensors": "if (!src0->name || src0->name[0] == '\\0')" in route and "route.plan_missing = true" in route,
         "resolver checks registered handles before requiring key": route.index("ggml_sycl_try_moe_storage_handle_route") < route.index("if (!base_key.valid)"),
-        "resolver requires key only for cache fallback": route.index("if (!base_key.valid)") < route.index("cache->resolve_expert"),
+        "resolver requires key only for cache fallback": route.index("if (!base_key.valid)") < route.index("expert_resolve_result resolved = cache->resolve_expert(req);"),
+        # The call is anchored by its declaration, not by "cache->resolve_expert": the fast-path comment above
+        # the key check (cd374e392, llama.cpp-iikr) names that call in prose and sat before the guard.
         "resolver retains canonical lease": "route.lease" in route and "logical.logical_handle" in storage_route,
         "resolver propagates ready event": "route.has_ready_event = logical.has_ready_event" in storage_route,
         # One definition, read by both the admission and materialization gates.
@@ -467,3 +469,11 @@ def test_mutations_are_witnessed() -> None:
     # A mutation whose target string has drifted away is a silent no-op, which
     # would leave violations() empty and fail here rather than pass vacuously.
     assert all(violations(mutated) for mutated in mutations)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

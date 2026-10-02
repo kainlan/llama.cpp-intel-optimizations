@@ -740,3 +740,11 @@ def test_cli_compare_honours_tolerance():
         b = _write_json(tmp, "b.json", [{"token": 1, "logits": [1.4]}])
         assert _run_cli("compare", str(a), str(b), "--tol", "0.5").returncode == 0
         assert _run_cli("compare", str(a), str(b), "--tol", "0.1").returncode != 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

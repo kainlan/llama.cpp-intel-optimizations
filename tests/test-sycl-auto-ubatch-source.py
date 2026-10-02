@@ -2770,3 +2770,11 @@ def test_the_settle_refusal_record_has_a_mutation_witness(mutation):
         old = "            uint32_t largest_ub = 0;\n            if (llama_context_sycl_hold_spill_fits(backends, last_good, &largest_ub)) {"
         new = "            return;\n" + old
     assert not _settle_catch_only_records(_trial_mutant(old, new))
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

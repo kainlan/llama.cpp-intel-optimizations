@@ -141,9 +141,15 @@ def evaluate(backend, registry):
         "installing a fresh working set clears the per-device hybrid-init guards":
             "g_moe_hybrid_init_success[d].store(false" in live_fresh
             and "g_moe_hybrid_init_done.store(false" in live_fresh,
-        "installing a fresh working set drops the previous owner's expert registries":
-            "g_moe_expert_meta.clear();" in live_fresh and "g_expert_groups.clear();" in live_fresh
-            and "g_moe_layer_seq[d].clear();" in live_fresh,
+        # afe475f74 made the two metadata registries value-owned: install_fresh() no longer clears them.
+        # A reader holding the paired snapshot must never see one registry cleared under it, so the next
+        # model's init replaces both together (swap under both locks) instead of a clear + refill.
+        "installing a fresh working set drops the previous owner's per-device layer sequence":
+            "g_moe_layer_seq[d].clear();" in live_fresh,
+        "installing a fresh working set leaves the value-owned expert registries to the next init's atomic swap":
+            "g_moe_expert_meta.clear();" not in live_fresh and "g_expert_groups.clear();" not in live_fresh
+            and "g_moe_expert_meta.swap(new_expert_meta)" in backend
+            and "g_expert_groups.swap(new_expert_groups)" in backend,
         "installing a fresh working set drops the previous owner's popularity ranks":
             "g_expert_popularity.clear();" in live_fresh
             and "g_expert_popularity_initialized = false;" in live_fresh,

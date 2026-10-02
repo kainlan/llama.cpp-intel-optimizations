@@ -15,11 +15,52 @@ EARLY_GUARD = "if (op->op == GGML_OP_ADD_ID || op->op == GGML_OP_MUL_MAT_ID) {"
 ROUTER_FLAG = "const bool is_multi_gpu_router_logits ="
 PLANNER_GUARD = "if (!is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {"
 OP_SWITCH = "switch (op->op) {"
+# The KV-host-tier residency decline (llama.cpp-uize/h56y, TKV-13 host attention dispatch) runs before the
+# indexed-MoE early return. It is pinned verbatim, comments aside, rather than waved through: it may only ever
+# return false (or `continue`) on an operand living in the dedicated KV-host buft, which no ADD_ID/MUL_MAT_ID
+# operand does, and anything else that appears ahead of the early return still fails the equality below.
+KV_HOST_RESIDENCY_BLOCK = """
+    if (ggml_sycl_tensor_is_in_kv_host_buft(op)) {
+        if (!(op->op == GGML_OP_SET_ROWS && ggml_sycl_attn_host_dispatch_enabled())) {
+            if (g_ggml_sycl_debug) {
+                g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
+                GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft residency decline (dst): op=%s\\n", ggml_op_name(op->op));
+            }
+            return false;
+        }
+        if (g_ggml_sycl_debug) {
+            g_sycl_attn_host_accept_count.fetch_add(1, std::memory_order_relaxed);
+            GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft SET_ROWS accepted for host dispatch (dst)\\n");
+        }
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
+            if ((op->op == GGML_OP_FLASH_ATTN_EXT ||
+                 (op->op == GGML_OP_SET_ROWS && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&
+                ggml_sycl_attn_host_dispatch_enabled()) {
+                if (g_ggml_sycl_debug) {
+                    g_sycl_attn_host_accept_count.fetch_add(1, std::memory_order_relaxed);
+                    GGML_SYCL_DEBUG(
+                        "[SYCL-SUPPORT] KV-host-buft %s accepted for host dispatch "
+                        "(src[%d])\\n",
+                        ggml_op_name(op->op), i);
+                }
+                continue;
+            }
+            if (g_ggml_sycl_debug) {
+                g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
+                GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft residency decline (src[%d]): op=%s\\n", i,
+                                ggml_op_name(op->op));
+            }
+            return false;
+        }
+    }
+"""
 EXPECTED_PRE_INDEXED_GUARD_PREFIX = (
     "ggml_backend_sycl_device_context*sycl_ctx="
     "(ggml_backend_sycl_device_context*)dev->context;"
     "intdevice=sycl_ctx->device;"
-)
+) + re.sub(r"\s+", "", KV_HOST_RESIDENCY_BLOCK)
 TYPE_HELPER_START = "static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {"
 TYPE_HELPER_END = FUNCTION_START
 MUL_MAT_TYPE_ORDER = (
@@ -140,7 +181,13 @@ def expected_pre_guard_decisions():
         ("if", "a_type==GGML_TYPE_Q4_1&&b->ne[1]==1", reject),
         ("if", "a_type==GGML_TYPE_IQ4_NL||a_type==GGML_TYPE_IQ4_XS||a_type==GGML_TYPE_IQ3_XXS||a_type==GGML_TYPE_IQ3_S||a_type==GGML_TYPE_IQ2_XXS||a_type==GGML_TYPE_IQ2_XS||a_type==GGML_TYPE_IQ2_S||a_type==GGML_TYPE_IQ1_S||a_type==GGML_TYPE_IQ1_M", (("if", "b->ne[1]==1&&ggml_nrows(b)>1", reject),)),
         ("statement", "ggml_typesrc0_type=op->src[0]->type"),
-        ("if", "src0_type==GGML_TYPE_BF16", reject),
+        # llama.cpp-kmeq: a BF16 WEIGHT is materialised to F32 once and then runs the supported dense path, so
+        # BF16 is admitted exactly when that route is available for this tensor and refused otherwise. The
+        # admission reuses the dispatch-side predicate (same composed check), so the two cannot drift apart.
+        ("if", "src0_type==GGML_TYPE_BF16", (
+            ("if", "ggml_sycl_bf16_weight_materialize_route_available(op->src[0],device)", (("return", "true"),)),
+            ("return", "false"),
+        )),
         ("if", "ggml_is_permuted(a)&&!ggml_is_contiguous(a)&&a->ne[2]>1&&a->ne[3]>1&&src0_type==GGML_TYPE_F16", reject),
         ("if", "!ggml_is_permuted(a)&&ggml_is_permuted(b)&&b->ne[2]>1&&b->ne[3]>1&&a->ne[0]>128&&a->ne[2]==1&&src0_type==GGML_TYPE_F16", reject),
         ("if", "!ggml_is_transposed(a)&&!ggml_is_transposed(b)&&a_type==GGML_TYPE_F16&&b->type==GGML_TYPE_F32&&b->ne[1]==1&&b->ne[3]>1&&b->ne[3]==a->ne[3]&&b->ne[2]>a->ne[2]&&a->nb[1]>ggml_row_size(a_type,a->ne[0])&&b->nb[1]>ggml_row_size(b->type,b->ne[0])&&(((a->nb[1]/ggml_type_size(a_type))&1)!=0||((b->nb[1]/ggml_type_size(b->type))&1)!=0)", reject),
@@ -212,7 +259,13 @@ def contract(text: str) -> bool:
             "constboolis_multi_gpu_router_logits="
             "ggml_sycl_moe_multi_gpu_for_executor()&&"
             "ggml_sycl_op_is_moe_router_logits_matmul(op);"
-        and planner_control_decisions == (("return", "false"),)
+        # The planner rejection may log under the supports_op debug switch before it returns false; the debug
+        # branch carries no decision of its own (a single logging call), so the only outcome is still `false`.
+        and planner_control_decisions == (
+            ("if", "ggml_sycl_supports_op_debug_enabled()",
+             (("statement", "ggml_sycl_supports_op_debug_log_decline(op,device)"),)),
+            ("return", "false"),
+        )
         and executable_body(function[planner_close + 1 : switch]) == ""
         and later_indexed_case is None
         and len(re.findall(r"\bcase\s+GGML_OP_MUL_MAT\s*:", switch_body)) == 1
@@ -503,3 +556,11 @@ def test_reinserting_later_mul_mat_id_case_is_rejected() -> None:
         "        case GGML_OP_MUL_MAT:\n        case GGML_OP_MUL_MAT_ID:\n",
     )
     assert not contract(mutated)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

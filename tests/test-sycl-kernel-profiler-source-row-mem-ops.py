@@ -119,3 +119,11 @@ def test_mem_ops_fill_submit_is_named_bracketed_and_preserves_deps() -> None:
     assert body.index("queue.submit") < body.index("ggml_sycl_kernel_profile_record_event(")
     assert "catch (...)" in body
     assert "ggml_sycl_profile_record_returned_event" not in body
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

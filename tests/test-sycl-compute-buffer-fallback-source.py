@@ -1078,3 +1078,11 @@ def test_probe_out_is_never_null_and_zero_initialized():
         "the NULL check must precede the zero-init (dereferencing a NULL out to zero-init it would be the "
         "exact bug the NULL check exists to prevent)"
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

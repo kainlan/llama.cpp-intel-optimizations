@@ -775,3 +775,11 @@ def test_mutant_a_measure_state_through_the_helper_fails_the_claim():
     # wrong scheduler
     mutated = _once(CTX, "state.measure ? ggml_backend_sched_reserve(state.sched.get(), gf) : sched_reserve_graph(gf)", "sched_reserve_graph(gf)")
     assert not claim_every_scheduler_allocation_goes_through_the_helpers(mutated, KV, CTX_H)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

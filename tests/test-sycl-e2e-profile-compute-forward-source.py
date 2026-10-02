@@ -29,7 +29,7 @@ def assert_no_waits(source: str) -> None:
 def test_compute_forward_has_e2e_profile_scope_and_flush() -> None:
     src = read_source()
     assert '#include "e2e-profile.hpp"' in src
-    begin = src.index("static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {")
+    begin = src.index("static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {")
     end = src.index("// WEDGE-T4: GGML_SYCL_SAFE_MODE", begin)
     body = src[begin:end]
 
@@ -105,3 +105,11 @@ def test_compute_forward_records_and_flushes_early_handled_routes() -> None:
         return_pos = body.index("return true;", route_pos)
         route_block = body[route_pos:return_pos]
         assert "e2e_record_early_handled_route();" in route_block
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

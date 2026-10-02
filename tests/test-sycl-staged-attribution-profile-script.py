@@ -202,3 +202,11 @@ def test_vtune_source_execute_branch_consumes_matrix_artifacts() -> None:
         "source-line-matrix/vtune-source-lines.csv",
     ):
         assert invented not in text
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

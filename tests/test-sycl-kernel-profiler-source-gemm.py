@@ -120,3 +120,11 @@ def test_ggml_sycl_cpp_passes_src0_type_name_at_the_row_gemm_q8_0_call_sites() -
         if "ggml_type_name(src0->type)" in ggml_sycl[call_start:call_end]:
             type_name_calls += 1
     assert type_name_calls == 2
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

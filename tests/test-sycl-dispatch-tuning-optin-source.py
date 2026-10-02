@@ -386,3 +386,11 @@ def test_readme_no_longer_advertises_the_bare_tmp_path_as_sufficient():
         "tools/sycl-kernel-bench/README.md must mention GGML_SYCL_DISPATCH_TUNING_JSON "
         "now that the loader no longer tries a default path automatically"
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

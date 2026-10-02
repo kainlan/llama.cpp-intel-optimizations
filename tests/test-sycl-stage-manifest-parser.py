@@ -71,3 +71,11 @@ def test_manifest_parser_rejects_metadata_mismatch_without_traceback() -> None:
         assert "failed to parse stage manifests" in result.stdout
         assert "metadata mismatch" in result.stdout
         assert "Traceback" not in result.stdout
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

@@ -114,3 +114,11 @@ def test_staged_profiling_docs_list_stage_artifacts() -> None:
         "`merged/`",
     ):
         assert required in section
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

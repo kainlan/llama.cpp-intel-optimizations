@@ -102,7 +102,11 @@ def test_moe_sequence_graphlet_records_timeline_scopes_around_refresh_record_rep
     assert decl is not None, "moe sequence graphlet ptr_table_reject declaration not found"
     begin = decl.start()
     invalidate_call = "sycl_ctx->invalidate_moe_sequence_graphs();"
-    end = src.index(invalidate_call, begin) + len(invalidate_call)
+    # The region must reach the replay scope, so end at the first invalidate call AFTER it. An earlier
+    # invalidate call now sits on the failed-retention-publish path ahead of the replay (e1c772802, "retain MMID
+    # graph epochs through replay"); ending at the first call after `begin` cut the region short of the scope.
+    replay_at = src.index('"moe_sequence_graphlet_replay"', begin)
+    end = src.index(invalidate_call, replay_at) + len(invalidate_call)
     sequence_graphlet = src[begin:end]
 
     assert 'GGML_SYCL_TIMELINE_SCOPE("sycl.graph", "moe_sequence_pointer_table_refresh"' in sequence_graphlet
@@ -117,3 +121,11 @@ def test_moe_sequence_graphlet_records_timeline_scopes_around_refresh_record_rep
     assert "moe_sequence_graphlet_prepare_pointer_tables" in sequence_graphlet
     assert "moe_graph_record_moe_dispatch_graph" in sequence_graphlet
     assert "ext_oneapi_graph(*exec_graph)" in sequence_graphlet
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

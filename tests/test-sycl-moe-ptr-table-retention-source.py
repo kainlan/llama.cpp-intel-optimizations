@@ -1,4 +1,5 @@
 from pathlib import Path
+from sycl_gate import finish, gate
 
 ROOT = Path(__file__).resolve().parents[1]
 COMMON = (ROOT / "ggml/src/ggml-sycl/common.hpp").read_text(encoding="utf-8")
@@ -18,69 +19,88 @@ def section(source: str, begin: str, end: str) -> str:
     return source[start:source.index(end, start)]
 
 
-assert "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle" in COMMON
-assert "test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing" in TEST_HDR
+with gate('L21 assert "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle" in COMMON'):
+    assert "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle" in COMMON
+with gate('L22 assert "test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing" in TEST_HDR'):
+    assert "test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing" in TEST_HDR
 
-snapshot = section(
-    SYCL,
-    "std::vector<ggml_sycl::mem_handle> ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle",
-    "static void ggml_sycl_set_moe_ptr_table_leases",
-)
+# ggml_tensor_extra_gpu split its weight fields into a lazily allocated weight_ext (h9uv): the const
+# snapshot reads them through weight_ext (and returns empty when it is absent), the mutating lease
+# setter goes through weight().
+with gate('L24 snapshot = section('):
+    snapshot = section(
+        SYCL,
+        "std::vector<ggml_sycl::mem_handle> ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle",
+        "static void ggml_sycl_set_moe_ptr_table_leases",
+    )
 for needle in (
-    "extra->moe_expert_ptrs_leases[device]",
-    "extra->moe_expert_ptrs_handle[device]",
-    "extra->moe_expert_ptrs_compact_handle[device]",
-    "extra->moe_expert_ptrs_missing_handle[device]",
+    "extra->weight_ext->moe_expert_ptrs_leases[device]",
+    "extra->weight_ext->moe_expert_ptrs_handle[device]",
+    "extra->weight_ext->moe_expert_ptrs_compact_handle[device]",
+    "extra->weight_ext->moe_expert_ptrs_missing_handle[device]",
 ):
-    assert needle in snapshot
+    with gate("L29 assert needle in snapshot [%r]" % (needle,)):
+        assert needle in snapshot
 
-set_helper = section(
-    SYCL,
-    "static void ggml_sycl_set_moe_ptr_table_leases",
-    "void ggml_sycl_retain_moe_ptr_table_leases_until_event",
-)
-assert "ggml_sycl_append_moe_dispatch_handle(leases, extra->moe_expert_ptrs_handle[device]);" in set_helper
+with gate('L37 set_helper = section('):
+    set_helper = section(
+        SYCL,
+        "static void ggml_sycl_set_moe_ptr_table_leases",
+        "void ggml_sycl_retain_moe_ptr_table_leases_until_event",
+    )
+with gate('L42 assert "ggml_sycl_append_moe_dispatch_handle(leases, extra->moe_expert_ptrs_handle[device]'):
+    assert "ggml_sycl_append_moe_dispatch_handle(leases, extra->weight().moe_expert_ptrs_handle[device]);" in set_helper
 
-planned_dispatch = section(
-    SYCL,
-    "std::vector<ggml_sycl::mem_handle> ptr_table_dispatch_bundle =",
-    "const std::vector<expert_dispatch_entry>              no_entries;",
-)
-ordered(
-    planned_dispatch,
-    "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device)",
-    "mmvq_moe_batched_dispatch",
-    "ggml_sycl::retain_handles_until_event(std::move(ptr_table_dispatch_bundle)",
-)
+with gate('L44 planned_dispatch = section('):
+    planned_dispatch = section(
+        SYCL,
+        "std::vector<ggml_sycl::mem_handle> ptr_table_dispatch_bundle =",
+        "const std::vector<expert_dispatch_entry>              no_entries;",
+    )
+with gate('L49 ordered('):
+    ordered(
+        planned_dispatch,
+        "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device)",
+        "mmvq_moe_batched_dispatch",
+        "ggml_sycl::retain_handles_until_event(std::move(ptr_table_dispatch_bundle)",
+    )
 
-prompt_down = section(
-    SYCL,
-    "if (use_expert_cache && src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {",
-    "if (release_prompt_down_soa_after_dispatch) {",
-)
-assert "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device)" in prompt_down
-assert "ggml_sycl::retain_handles_until_event(std::move(ptr_table_dispatch_bundle)" in prompt_down
+with gate('L56 prompt_down = section('):
+    prompt_down = section(
+        SYCL,
+        "if (use_expert_cache && src0_extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES) {",
+        "if (release_prompt_down_soa_after_dispatch) {",
+    )
+with gate('L61 assert "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device)" in promp'):
+    assert "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(src0_extra, ctx.device)" in prompt_down
+with gate('L62 assert "ggml_sycl::retain_handles_until_event(std::move(ptr_table_dispatch_bundle)" in pro'):
+    assert "ggml_sycl::retain_handles_until_event(std::move(ptr_table_dispatch_bundle)" in prompt_down
 
-assert "used_compact_dispatch   = false" in MMVQ
-assert "used_compact_missing    = false" in MMVQ
-ordered(
-    MMVQ,
-    "used_compact_dispatch = true;",
-    "used_compact_missing  = missing_device != nullptr;",
-    "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(const_cast<ggml_tensor_extra_gpu *>(src0_extra), ctx.device,",
-    "ggml_sycl::retain_handles_until_event(std::move(ptr_table_dispatch_bundle)",
-)
+with gate('L64 assert "used_compact_dispatch = false" in MMVQ'):
+    assert "used_compact_dispatch   = false" in MMVQ
+with gate('L65 assert "used_compact_missing = false" in MMVQ'):
+    assert "used_compact_missing    = false" in MMVQ
+with gate('L66 ordered('):
+    ordered(
+        MMVQ,
+        "used_compact_dispatch = true;",
+        "used_compact_missing  = missing_device != nullptr;",
+        "ggml_sycl_snapshot_moe_ptr_table_dispatch_bundle(const_cast<ggml_tensor_extra_gpu *>(src0_extra), ctx.device,",
+        "ggml_sycl::retain_handles_until_event(std::move(ptr_table_dispatch_bundle)",
+    )
 
-live_test = section(
-    LIVE,
-    "static bool test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing()",
-    "int main()",
-)
+with gate('L74 live_test = section('):
+    live_test = section(
+        LIVE,
+        "static bool test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing()",
+        "int main(int",
+    )
 for needle in (
     "test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing()",
     "table/compact/missing backing until delayed event",
     "MoE dispatch bundle must retain table, compact list, and missing flag backing independently of extra slots",
 ):
-    assert needle in live_test
+    with gate("L79 assert needle in live_test [%r]" % (needle,)):
+        assert needle in live_test
 
-print("moe ptr-table retention source contract: PASS")
+finish('moe ptr-table retention source contract: PASS', min_checks=21)

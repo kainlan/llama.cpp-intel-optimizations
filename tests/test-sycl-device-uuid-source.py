@@ -50,3 +50,11 @@ def test_proc_address_and_g1_dynamic_path_are_wired() -> None:
     assert 'ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_get_device_uuid")' in G1
     assert "test-sycl-device-uuid-api" in CMAKE
     assert "GGML_BACKEND_DL" in CMAKE
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

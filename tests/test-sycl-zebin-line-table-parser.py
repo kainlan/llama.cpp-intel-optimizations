@@ -107,3 +107,11 @@ Address            Line   Column File   ISA Discriminator Flags
     assert "failed to parse ZEBin line table" in result.stdout
     assert "no source rows found" in result.stdout
     assert "Traceback" not in result.stdout
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

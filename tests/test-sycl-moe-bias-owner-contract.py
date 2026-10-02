@@ -87,6 +87,9 @@ def evaluate(backend, header):
     live_park    = member_body_of(backend, "    std::unique_ptr<ggml_sycl::moe_discovery_parked_state> park(")
     live_restore = member_body_of(backend, "    void restore(std::unique_ptr<ggml_sycl::moe_discovery_parked_state> parked)")
     live_fresh   = member_body_of(backend, "    void install_fresh(")
+    # ggml_sycl_moe_bias_lookup() currently has no caller (dead code, tracked by llama.cpp-prof). The gate still
+    # scores its body because the helper is the one reader the owner contract is stated against; when
+    # llama.cpp-prof deletes it, drop this binding and the "ggml_sycl_moe_bias_lookup" entry below with it.
     lookup       = body_of(backend, "static bool ggml_sycl_moe_bias_lookup(")
     scanned      = body_of(backend, "static bool ggml_sycl_moe_bias_scanned(")
     publish_bias = body_of(backend, "static void ggml_sycl_moe_bias_publish(")
@@ -166,9 +169,12 @@ def evaluate(backend, header):
         ("bias publish installs via adopt_biases, so it cannot roll back the activation half",
          "adopt_biases(std::move(scanned))" in publish_bias),
 
-        # The consumer reads a copy through the helper, never the map directly.
-        ("the fusion path looks biases up through the helper",
-         "ggml_sycl_moe_bias_lookup(cur_layer_fast, &layer_bias)" in backend),
+        # No consumer reads the map directly. The one caller this used to pin
+        # (the retained prompt-fusion route, `ggml_sycl_moe_bias_lookup(cur_layer_fast,
+        # &layer_bias)`) was removed by abecb785d, leaving the copying helper with no
+        # caller; the property that survives is that the helper is the only reader.
+        ("the layer-bias map is read only through the copying helper",
+         backend.count("g_moe_bias_state.find_layer(") == 1 and "g_moe_bias_state.find_layer(layer)" in lookup),
         ("the lookup helper copies the entry out rather than returning a pointer into the map",
          "*out = *entry;" in lookup),
 
