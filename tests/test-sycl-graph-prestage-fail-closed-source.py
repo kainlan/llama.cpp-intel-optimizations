@@ -124,6 +124,34 @@ def strip_comments(source):
     return "".join(out)
 
 
+def mask_strings(source):
+    """Replace the CONTENT of string and char literals with 'x' (same length), so a brace, a semicolon or an
+    assignment inside a message cannot satisfy or confuse a structural check."""
+    out = []
+    i = 0
+    n = len(source)
+    while i < n:
+        ch = source[i]
+        if ch in ('"', "'"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            while i < n and source[i] != quote:
+                if source[i] == "\\" and i + 1 < n:
+                    out.append("xx")
+                    i += 2
+                    continue
+                out.append("x" if source[i] != "\n" else "\n")
+                i += 1
+            if i < n:
+                out.append(quote)
+                i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def read(path):
     return strip_comments(Path(path).read_text())
 
@@ -145,6 +173,29 @@ def function_body(source, signature_regex):
             if depth == 0:
                 return source[start:i + 1]
     return None
+
+
+def entry_blocks_graphs(compute):
+    """The compute entry's `if (moe_graphs_disabled) { use_sycl_graph = false; }` is a top-level statement of the
+    compute body (not under another `if`, not dead), consists of the assignment as a direct statement (plus an
+    optional debug line), comes before every consumer of use_sycl_graph, and nothing but `= false` assigns
+    use_sycl_graph between the block and those consumers. Strings are masked: an assignment in a message is text."""
+    masked = mask_strings(compute or "")
+    m = re.search(r"\bif\s*\(\s*sycl_ctx->moe_graphs_disabled\s*\)\s*\{", masked)
+    if not m:
+        return False
+    depth = masked.count("{", 0, m.start()) - masked.count("}", 0, m.start())
+    if depth != 1:
+        return False
+    end = masked.find("}", m.end())
+    block = masked[m.end() - 1 : end + 1]
+    if re.fullmatch(r"\{\s*(GGML_SYCL_DEBUG\([^;{}]*\);\s*)?use_sycl_graph\s*=\s*false\s*;\s*\}", block) is None:
+        return False
+    consumers = [masked.find(c) for c in ("moe_graphlet_replay_probe =", "model_sycl_graph.begin_recording(", "descriptor_moe_graph_candidates")]
+    if any(c < 0 for c in consumers) or end >= min(consumers):
+        return False
+    between = masked[end + 1 : min(consumers)]
+    return all(re.match(r"\s*false\s*;", between[x.end():]) for x in re.finditer(r"\buse_sycl_graph\s*=(?!=)", between))
 
 
 def evaluate(backend, common, memo_hdr):
@@ -435,11 +486,10 @@ def evaluate(backend, common, memo_hdr):
         re.search(r"if\s*\(\s*sycl_ctx->moe_block_graphs_disabled\s*\|\|[^{};]*\bsycl_ctx->moe_graphs_disabled\s*\)\s*\{", graphlets) is not None
     # With the post-gateway checks gone, this entry block is what stops a segment replay after a failed retire
     # (the segments stay marked valid): it must turn graphs off for the whole compute.
-    results["the compute entry turns graphs off when MoE graphs were disabled by a failed retire"] = \
-        re.search(r"if\s*\(\s*sycl_ctx->moe_graphs_disabled\s*\)\s*\{[^{}]*\buse_sycl_graph\s*=\s*false\s*;[^{}]*\}", compute) is not None
+    results["the compute entry turns graphs off when MoE graphs were disabled by a failed retire"] = entry_blocks_graphs(compute)
     results["the INPUT arm stages on the backend's own queue"] = \
         re.search(r"if\s*\(graph_tensor_is_input\(tensor\)\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{\s*"
-                  r"sycl::queue\s*&\s*q\s*=\s*\*ctx->stream\(\);\s*void \* dev_ptr\s*=\s*ctx->graph_input_stage\(tensor, tensor->data, nbytes, q\);",
+                  r"sycl::queue\s*&\s*q\s*=\s*\*ctx->stream\(\);\s*void\s*\*\s*dev_ptr\s*=\s*ctx->graph_input_stage\(tensor, tensor->data, nbytes, q\);",
                   prestage) is not None
     dense_drop = function_body(backend, r"static void ggml_sycl_block_exec_dense_drop_graphs\(ggml_backend_sycl_context \* ctx\)\s*\{") or ""
     results["the dense drop helper drops a state that exists and does not create one"] = \
@@ -533,8 +583,35 @@ if args.self_test:
         b = re.compile(r"model_sycl_graph\.begin_recording\([^;]*;").search(rest, m.start())
         return rest[:b.end()] + "\n" + block + "\n" + rest[b.end():]
 
+    def move_entry_block_into_later_if(src):
+        """Move the compute entry's moe_graphs_disabled block inside the later `if (use_sycl_graph) {` consumer."""
+        m = re.search(r"if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG\([^;]*;\s*use_sycl_graph = false;\s*\}", src)
+        if not m:
+            print("FAIL: self-test anchor missing: compute entry block")
+            failed.append("self-test anchor compute entry block")
+            return src
+        block = m.group(0)
+        rest = src[:m.start()] + src[m.end():]
+        k = rest.find("\n    if (use_sycl_graph) {\n", m.start())
+        k2 = k + len("\n    if (use_sycl_graph) {\n")
+        return rest[:k2] + block + "\n" + rest[k2:]
+
     mem_ = memo_hdr
     mutants = [
+        # review r11
+        ("the entry block is moved under the later use_sycl_graph test", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (move_entry_block_into_later_if(backend), common, mem_)),
+        ("the entry block is followed by use_sycl_graph = true", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"(if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG\([^;]*;\s*use_sycl_graph = false;\s*\})", r"\1\n    use_sycl_graph = true;"), common, mem_)),
+        ("the entry block is followed by an or-assignment", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"(if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG\([^;]*;\s*use_sycl_graph = false;\s*\})", r"\1\n    use_sycl_graph = use_sycl_graph || g_split_config.enabled;"), common, mem_)),
+        ("the entry assignment is under a dead if", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"if \(sycl_ctx->moe_graphs_disabled\) \{(\s*GGML_SYCL_DEBUG\([^;]*;\s*)use_sycl_graph = false;", r"if (sycl_ctx->moe_graphs_disabled) {\1if (0) use_sycl_graph = false;"), common, mem_)),
+        ("the entry assignment exists only inside a message", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG\([^;]*;\s*use_sycl_graph = false;",
+                    'if (sycl_ctx->moe_graphs_disabled) { GGML_SYCL_DEBUG("use_sycl_graph = false;\\n");'), common, mem_)),
+        ("the entry block is wrapped in a dead if", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
+         (mutate_re(backend, cmp_sig, r"(if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG\([^;]*;\s*use_sycl_graph = false;\s*\})", r"if (false) { \1 }"), common, mem_)),
         # review r10
         ("the compute entry no longer turns graphs off", "the compute entry turns graphs off when MoE graphs were disabled by a failed retire",
          (mutate_re(backend, cmp_sig, r"if \(sycl_ctx->moe_graphs_disabled\) \{\s*GGML_SYCL_DEBUG\([^;]*;\s*use_sycl_graph = false;",
