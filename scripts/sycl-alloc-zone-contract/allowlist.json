@@ -171,6 +171,22 @@
       "name": "mmap",
       "count": 1,
       "reason": "cache bookkeeping, guard-page debug mode, no tensor/KV/scratch/pinned/USM bytes: cache_guard_allocator backs the cache's own hash maps when the guard env is set and falls back to std::allocator; the cache cannot allocate its own map nodes through itself. Permanent; canonical contract section 9.1 (the cache_guard_allocator row)"
+    },
+    {
+      "id": "E-HOLD-LEDGER-HELD-CATCH",
+      "code": "G-CATCH",
+      "file": "unified-cache.cpp",
+      "function": "unified_cache_raw_device_held_bytes",
+      "count": 1,
+      "reason": "unified_cache_raw_device_held_bytes is a read-only accounting query of the runtime allocation registry (the hold ledger's raw-held figure): its try body takes the registry mutex and sums rows, and nothing in it can raise a planned refusal, so there is no refusal for the handler to swallow. It returns the partial sum when the lock fails because a ledger read has no recovery path and must not abort an allocation decision. Permanent; the per-epoch hold ledger design."
+    },
+    {
+      "id": "E-REGISTRY-TEST-PUBLISH-CATCH",
+      "code": "G-CATCH",
+      "file": "unified-cache.cpp",
+      "function": "allocation_registry_test_publish_raw",
+      "count": 1,
+      "reason": "allocation_registry_test_publish_raw is a noexcept PRIVATE_TESTING seam that inserts one synthetic row into the runtime allocation registry for tests: its try body only builds the record and takes the registry mutex, so no planned refusal can reach the handler, and a rethrow in a noexcept function would std::terminate. It reports failure by returning false. Permanent; test-only code absent from the shipped library."
     }
   ]
 }
