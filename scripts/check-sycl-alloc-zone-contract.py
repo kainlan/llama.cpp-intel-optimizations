@@ -3884,6 +3884,9 @@ WITNESSES = {
     "s3f-m4": "dpct_memcpy and async_dpct_memcpy, which reach dpct's host_buffer malloc, are forbidden outside dpct/helper.hpp",
     "s3f-m5": "clause (q) also names mmap64, mremap, valloc, pvalloc, reallocarray, strdup and strndup",
     "s3f-data": "the CHECK_TRY_ERROR pin cannot lapse by a re-key and carries a cite; no allowlist reason names a source line; no cite names a ruling-ledger id",
+    "s3g-kw": "clause (q): a C++ keyword before `::` (return, else, throw, sizeof, ...) leaves the name bare, and a comparison `>` is not a template close",
+    "s3g-q": "clause (q) in text reads the whole scope like the tree does (xstd, pool2, ns::std are scopes; ::std is not), across continuations in both paths",
+    "s3g-data": "a ruling-ledger id is refused in any spelling, and a source line in any file form, in an allowlist reason",
     "s2c-catch": "spellings and placements of the rethrow clause", "s2c-data": "clause-(h) entries that must be refused by validation",
     "9": "a model-shaped *_bytes() function is called by its allocation sites and by the zone sizing; dormant until defined",
     "27": "clause (j): A's fit and W's term read per-model sources only; the eligibility classifier is not called outside the late stage",
@@ -4872,6 +4875,7 @@ def matrix_cases():
     c.extend(matrix_cases_s3q())
     c.extend(matrix_cases_s31())
     c.extend(matrix_cases_s3f())
+    c.extend(matrix_cases_s3g())
     return c
 
 
@@ -5877,11 +5881,90 @@ def matrix_cases_s3f():
     return c
 
 
+def matrix_cases_s3g():
+    """The review fold of the S3-0 fold: keywords before `::`, the whole-scope rule in text, and the spellings of the data rules."""
+    c = []
+    A = c.append
+
+    def lex(body):
+        return append_to("cpu-dispatch.cpp", body)
+
+    # I-1: a keyword before `::` is not a scope, so the name behind it is bare (a libc hit)
+    for lab, body in (("return ::malloc", "#define zz_k(n) return ::malloc(n)\n"),
+                      ("else ::malloc", "#define zz_k(c, n) if (c) {} else ::malloc(n)\n"),
+                      ("throw ::malloc", "#define zz_k(n) throw ::malloc(n)\n"),
+                      ("sizeof ::strdup", "#define zz_k(s) (void) sizeof ::strdup(s)\n"),
+                      ("co_return ::malloc", "#define zz_k(n) co_return ::malloc(n)\n"),
+                      ("do { return ::calloc }", "#define zz_k(n) do { return ::calloc(n, 1); } while (0)\n"),
+                      ("a comparison `a > ::malloc`", "#define zz_k(a, n) (a > ::malloc(n))\n")):
+        A(Case("s3g-kw", "a macro body `%s` is E-LIBC" % lab, plant(body), "FAIL", "E-LIBC", "#define zz_k", planted=False))
+    for lab, body in (("return ::malloc", "void * zzplant_q() {\n    return ::malloc(16);\n}\n"),
+                      ("else ::malloc", "void zzplant_q(int c) {\n    if (c) {} else ::malloc(16);\n}\n"),
+                      ("sizeof ::strdup", "unsigned long zzplant_q() {\n    return sizeof ::strdup(\"x\");\n}\n"),
+                      ("a comparison `a > ::malloc`", "bool zzplant_q(void * a) {\n    return a > ::malloc(16);\n}\n")):
+        A(Case("s3g-kw", "the lexical pass: `%s` is E-LIBC" % lab, lex(body), "FAIL", "E-LIBC", "malloc" if "strdup" not in lab else "strdup"))
+    A(Case("s3g-kw", "a macro body `zz_pool<std::vector<int>>::malloc` is a qualified name, not a hit (control)", plant(
+        "#define zz_k(n) zz_pool<std::vector<int>>::malloc(n)\n"), "PASS", planted=False))
+    A(Case("s3g-kw", "the lexical pass: `zz_pool<int>::malloc` is a qualified name, not a hit (control)", lex(
+        "void zzplant_q() {\n    (void) zz_pool<int>::malloc(16);\n}\n"), "PASS", planted=False))
+
+    # m4/m5: the whole scope is read, as the tree path does, and a continuation is stripped on both text paths
+    A(Case("s3g-q", "a macro body `ns::std::malloc` is qualified by ns, not a hit (control)", plant(
+        "#define zz_q(n) ns::std::malloc(n)\n"), "PASS", planted=False))
+    A(Case("s3g-q", "the lexical pass: `ns::std::malloc` is not a hit (control)", lex(
+        "void zzplant_q() {\n    (void) ns::std::malloc(16);\n}\n"), "PASS", planted=False))
+    A(Case("s3g-q", "the tree path: `ns::std::malloc` is not a hit (control)", plant(
+        "void zzplant_q() {\n    void * p = ns::std::malloc(16);\n    (void) p;\n}\n"), "PASS", planted=False))
+    A(Case("s3g-q", "a macro body `::std::malloc` is E-LIBC", plant("#define zz_q(n) ::std::malloc(n)\n"), "FAIL", "E-LIBC",
+           "#define zz_q", planted=False))
+    A(Case("s3g-q", "a macro body `xstd::malloc` is a scope that merely ends in std, not a hit (control)", plant(
+        "#define zz_q(n) xstd::malloc(n)\n"), "PASS", planted=False))
+    A(Case("s3g-q", "the lexical pass: `xstd::malloc` is not a hit (control)", lex(
+        "void zzplant_q() {\n    (void) xstd::malloc(16);\n}\n"), "PASS", planted=False))
+    A(Case("s3g-q", "the lexical pass: `pool2 :: realloc` (a digit in the scope) is not a hit (control)", lex(
+        "void zzplant_q(void * p) {\n    (void) pool2 :: realloc(p, 1);\n}\n"), "PASS", planted=False))
+    A(Case("s3g-q", "the lexical pass: a continued #define `pool ::<cont> realloc` is not a hit (control)", lex(
+        "#define zz_lx(p, n) pool ::\\\n    realloc(p, n)\n"), "PASS", planted=False))
+    A(Case("s3g-q", "the lexical pass: a continued #define `std ::<cont> malloc` is E-LIBC", lex(
+        "#define zz_lx2(n) std ::\\\n    malloc(n)\n"), "FAIL", "E-LIBC", "malloc"))
+    A(Case("s3g-q", "a macro body `sycl ::<cont> malloc` is clause (e)'s one E-RAW hit and no E-LIBC (control)", plant(
+        "#define zz_sm2(q, n) sycl ::\\\n   malloc(n, q, sycl::usm::alloc::host)\n"), "PASS",
+        allowlist={"id": "E-ZZ-SM2", "code": "E-RAW", "file": PLANT, "function": "#define zz_sm2", "name": "sycl::malloc",
+                   "count": 1, "reason": "mutation-matrix test entry"}, planted=False))
+    A(Case("s3g-q", "a name taken as a value in an ERROR-root file is still E-LIBC, through the tree pass", lex(
+        "void zzplant_q() {\n    auto f = ::malloc;\n    (void) f;\n}\n"), "FAIL", "E-LIBC", "malloc"))
+    A(Case("s3g-q", "the lexical pass is call-shaped, so a declaration `malloc(` in an ERROR-root file fails closed (pinned)", lex(
+        "extern void * malloc(unsigned long n);\nvoid zzplant_q() {\n}\n"), "FAIL", "E-LIBC", "malloc"))
+
+    # m2, m3: the spellings of the data rules
+    def reason(eid, text):
+        return lambda al: dict(al, entries=[dict(e, reason=text) if e["id"] == eid else e for e in al["entries"]])
+
+    def cite(code, text):
+        return lambda d: dict(d, violations=[dict(e, cite=text) if e["code"] == code else e for e in d["violations"]])
+
+    base = "cache bookkeeping with no tensor bytes; canonical contract section 9.1. "
+    for lab, text in (("ruling M265, R2", "ruling M265, R2"), ("a section sign, §M265", "see §M265"), ("a bare M265 R2", "M265 R2"),
+                      ("a lowercase round, ruling M265 r2", "ruling M265 r2"), ("a round-less ruling M247", "rulings M247 second"),
+                      ("a ruling split by a newline", "ruling\nM265\nR2"), ("a bare (R2)", "per ruling (R2)"),
+                      ("a round alone, ruling R2", "ruling R2")):
+        A(Case("s3g-data", "an allowlist reason with %s fails" % lab, lambda f: f, "FAIL", "data", "names a ruling-ledger id",
+               edit_allowlist=reason("E-LIBC-CACHE-GUARD", base + text), planted=False))
+    A(Case("s3g-data", "a debt cite with a round-less section-sign ruling (rulings §M243) fails", lambda f: f, "FAIL", "data",
+           "names a ruling-ledger id", edit_debt=cite("E-LIBC", "design 11 step 7, the dead allocator bullet; rulings §M243"), planted=False))
+    for lab, text in (("a .inl file", "helper.inl:12"), ("a .cu file", "kernels.cu :12"), ("a .py file", "gate.py:5"),
+                      ("a .md file", "design.md:77"), ("a #L anchor", "unified-cache.hpp#L1362"), ("a colon and a space", "common.cpp: 12"),
+                      ("a .cc file", "x.cc:9")):
+        A(Case("s3g-data", "an allowlist reason naming a line in %s fails" % lab, lambda f: f, "FAIL", "data", "names a source line",
+               edit_allowlist=reason("E-LIBC-CACHE-GUARD", base + "see " + text), planted=False))
+    return c
+
+
 def matrix_cases_s31():
     """S3-1: mem_handle::owner_use_count exists, so clause (l) is enforced on the real tree."""
     c = []
     A = c.append
-    A(Case("s31-l", "the real tree declares and defines owner_use_count, so clause (l) is enforced, not dormant", lambda f: f, "PASS",
+    A(Case("s31-l", "the real tree declares and defines owner_use_count, so clause (l) is enforced on the caller half only (replace_within is absent, so L-FREE is vacuous), not dormant", lambda f: f, "PASS",
            active="l", planted=False))
     A(Case("s31-l", "a new caller of owner_use_count outside the allowlist is a finding on the real tree", plant(
         "bool zzplant_l(mem_handle & h) {\n    return h.owner_use_count() > 1;\n}\n"), "FAIL", "L-CALLER", "zzplant_l"))
