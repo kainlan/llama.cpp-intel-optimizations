@@ -22,6 +22,9 @@
 // on some devices, so it must force a republish even when the last candidate
 // tried was fallback_ubatch itself.
 //
+// llama_auto_ubatch_advice() is the -ub a refusal names: the one hold-spill fit function's answer, capped under the
+// lowest rung that already lost, so it never names a refused rung.
+//
 // llama_auto_ubatch_next_lower() / llama_auto_ubatch_descend() are the downward continuation the trial takes
 // when the default rung is refused (llama.cpp-kpjw item 0): the same pure walk the trial runs, driven here by a
 // fake that accepts what the B50 / Qwen arithmetic accepts.
@@ -81,6 +84,17 @@ static void check_lower(const char * name, uint32_t from, uint32_t expect) {
         return;
     }
     std::printf("ok   %s: next_lower(%u)=%u\n", name, from, got);
+}
+
+static void check_advice(const char * name, uint32_t largest_fit, uint32_t lowest_refused, uint32_t expect) {
+    const uint32_t got = llama_auto_ubatch_advice(largest_fit, lowest_refused);
+    if (got != expect) {
+        std::fprintf(stderr, "FAIL %s: advice(%u, %u)=%u, expected %u\n", name, largest_fit, lowest_refused, got,
+                     expect);
+        g_failures++;
+        return;
+    }
+    std::printf("ok   %s: advice(%u, %u)=%u\n", name, largest_fit, lowest_refused, got);
 }
 
 static void check_descend(const char *                  name,
@@ -144,7 +158,8 @@ int main() {
     check_lower("64 is the floor: nothing below it", 64, 0);
     check_lower("a value whose half is under the floor names nothing", 100, 0);
     check_lower("zero names nothing", 0, 0);
-    check_lower("a non-rung value stays a multiple of 32", 600, 288);
+    check_lower("a non-rung value rounds down to a multiple of 64", 600, 256);
+    check_lower("a value under the next multiple of 64 keeps the one below", 700, 320);
     check_lower("1024 halves to 512", 1024, 512);
 
     // The B50 / Qwen3.6-27B auto case (kpjw-g6): -c 512, n_batch 2048, the default 512 spills a 495 MB compute buffer
@@ -203,46 +218,17 @@ int main() {
         check_descend("the first accepted rung wins; nothing smaller is tried", won, 256, tried, { 256 });
     }
 
-    // ---- A refused SETTLE publish (llama.cpp-kpjw, kpjw-g7). The B50 / Qwen run never reached the continuation
-    // above: the default 512 WON the ladder (its realized check read the card before the buffers were touched), 1024
-    // was refused at its probe, and the settle then republished the winner, where the transaction-time bound
-    // (plan + the 495 MB request recorded by 512's own reserve = 470 MB, 132.7 MB left) refused it. last_good was 512,
-    // not 0, so nothing lowered it and the context died with a bare result=19. The refusal of a winner is a refusal
-    // of that rung, and what is below it is tried. ----
-    {
-        std::vector<uint32_t> tried;
-        const uint32_t        won = llama_auto_ubatch_settle_refusal_descend(512, false, 2048, [&](uint32_t c) {
-            tried.push_back(c);
-            return c <= 256;
-        });
-        check_descend("B50 Qwen: the winner 512 is refused at the settle, 256 fits", won, 256, tried, { 256 });
-    }
-    {
-        std::vector<uint32_t> tried;
-        const uint32_t        won = llama_auto_ubatch_settle_refusal_descend(512, false, 2048, [&](uint32_t c) {
-            tried.push_back(c);
-            return false;
-        });
-        check_descend("a refused winner with nothing below it fitting: 0, every rung to the floor tried", won, 0, tried,
-                      { 256, 128, 64 });
-    }
-    {
-        std::vector<uint32_t> tried;
-        const uint32_t        won = llama_auto_ubatch_settle_refusal_descend(512, true, 2048, [&](uint32_t c) {
-            tried.push_back(c);
-            return true;
-        });
-        check_descend("the continuation already ran: it is not run twice", won, 0, tried, {});
-    }
-    {
-        // A ladder winner above the default (1024) that the settle refuses: the rung just under it is asked first.
-        std::vector<uint32_t> tried;
-        const uint32_t        won = llama_auto_ubatch_settle_refusal_descend(1024, false, 2048, [&](uint32_t c) {
-            tried.push_back(c);
-            return c <= 512;
-        });
-        check_descend("a refused 1024 winner lands on 512 before anything smaller", won, 512, tried, { 512 });
-    }
+    // ---- The -ub a refusal names (llama.cpp-kpjw, kpjw-g7 / r6 M4). It comes from the one hold-spill fit function
+    // (the largest -ub it accepts) and is capped under the lowest rung this start already saw lose, so advice never
+    // names a rung that was asked and refused. There is no settle descent: a refused settle is a named error. ----
+    check_advice("nothing refused yet: the function's answer stands", 512, 0, 512);
+    check_advice("the function's answer is under the lowest refused rung", 256, 512, 256);
+    check_advice("the function accepts a rung that was refused for another reason: one rung under it", 512, 512, 256);
+    check_advice("the function accepts more than the refused default: capped under it", 1024, 512, 256);
+    check_advice("a refused non-rung default caps at the power of two under it", 2048, 600, 512);
+    check_advice("nothing known to fit stays nothing", 0, 512, 0);
+    check_advice("the rung under the floor names nothing", 512, 64, 0);
+    check_advice("a refused 1024 with the function accepting it: 512", 1024, 1024, 512);
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d case(s) failed\n", g_failures);

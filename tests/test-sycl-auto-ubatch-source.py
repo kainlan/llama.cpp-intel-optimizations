@@ -2518,3 +2518,232 @@ def test_env_vars_doc_explains_the_moe_512_pin():
     assert "GPT-OSS" in row and "Mistral" in row, (
         "the row must name GPT-OSS (MoE, pinned) and Mistral (dense, not pinned) as the contrasting example"
     )
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp-kpjw (kpjw-g7, one fact one source): the trial has no settle descent, a refused settle is a named error
+# whose -ub comes from the one hold-spill fit function, the downward continuation runs only after a real fit refusal,
+# a refused cached value is not paid for twice, and a scheduler compute buffer is identified by an explicit scope.
+# ---------------------------------------------------------------------------
+
+
+def _trial_norm() -> str:
+    return _normalize_ws(_trial_body())
+
+
+def _try_candidate_norm() -> str:
+    return _normalize_ws(_try_candidate_body())
+
+
+def _trial_mutant(old: str, new: str) -> str:
+    """The normalized trial body of the source with `old` (raw text, once) replaced by `new`."""
+    assert LLAMA_CONTEXT_CPP.count(old) == 1, f"mutation target not unique -- found {LLAMA_CONTEXT_CPP.count(old)}: {old!r}"
+    return _body_of(LLAMA_CONTEXT_CPP.replace(old, new, 1), _TRIAL_START, _TRIAL_END)
+
+
+def _settle_refused_branch(body_norm: str) -> str:
+    settle = body_norm[body_norm.find("if (!sched_matches_last_good") :]
+    at = settle.find("if (settle_error) {")
+    assert at != -1, "the settle's refusal branch is missing"
+    return _balanced_braces(settle, at + len("if (settle_error) "))
+
+
+def test_there_is_no_settle_refusal_descent():
+    """A settle refusal is a named error, not a second walk down the ladder: the helper, its call and the `won` it
+    adopted are gone from the header and the trial."""
+    assert "settle_refusal_descend" not in LLAMA_AUTO_UBATCH_H
+    body = _trial_norm()
+    assert "settle_refusal_descend" not in body
+    refused = _settle_refused_branch(body)
+    assert "try_candidate(" not in refused and "won" not in refused, "the refusal branch must not try rungs"
+
+
+def _settle_refusal_names_the_fit_function(body_norm: str) -> bool:
+    refused = _settle_refused_branch(body_norm)
+    fits_at = refused.find("llama_context_sycl_hold_spill_fits(backends, last_good, &largest_ub)")
+    rethrow_at = refused.find("std::rethrow_exception(settle_error);")
+    advice_at = refused.find("llama_auto_ubatch_advice(largest_ub, lowest_refused)")
+    throw_at = refused.find("throw std::runtime_error(")
+    return (
+        -1 not in (fits_at, rethrow_at, advice_at, throw_at)
+        and fits_at < rethrow_at < advice_at < throw_at
+        and refused.count("throw std::runtime_error(") == 1
+        and "refusal_largest_ub" not in body_norm
+        and "last_stop" in refused[throw_at:]
+    )
+
+
+def test_a_refused_settle_is_a_named_error_with_the_fit_functions_n():
+    """The settle publish's refusal asks the ONE fit function (the entry the realized check uses): when it accepts the
+    rung the refusal is no fit refusal (a race) and leaves as it came; when it refuses, the context fails by name with
+    the -ub that function accepts, capped under every rung this start already lost, and the LAST rung's stop reason."""
+    assert _settle_refusal_names_the_fit_function(_trial_norm())
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("            if (llama_context_sycl_hold_spill_fits(backends, last_good, &largest_ub)) {\n",
+         "            if (false) {\n"),
+        ("llama_auto_ubatch_advice(largest_ub, lowest_refused)", "largest_ub"),
+        ("                throw std::runtime_error(format(\n                    \"auto n_ubatch: no -ub from",
+         "                (void) (format(\n                    \"auto n_ubatch: no -ub from"),
+    ],
+)
+def test_settle_named_error_has_a_mutation_witness(old, new):
+    if LLAMA_CONTEXT_CPP.count(old) != 1:
+        pytest.fail(f"mutation target not found -- update this witness to match the real source: {old!r}")
+    assert not _settle_refusal_names_the_fit_function(_trial_mutant(old, new)), "the mutant must make the pin fail"
+
+
+def test_the_settle_publish_catch_only_records():
+    body = _trial_norm()
+    settle = body[body.find("if (!sched_matches_last_good") :]
+    catch_at = settle.find("} catch (const std::exception & e) {")
+    assert catch_at != -1 and settle.count("catch") == 1
+    catch_body = _balanced_braces(settle, catch_at + len("} catch (const std::exception & e) "))
+    assert catch_body[1:-1].strip() == "settle_error = std::current_exception(); settle_refusal = e.what();"
+    refused = _settle_refused_branch(body)
+    assert "return" not in refused, "a refused settle must throw, never return"
+    tail = settle[settle.find("if (settle_error) {") :]
+    assert "} else { sched_need_reserve = true; sched_reserve(); }" in tail
+
+
+_DESCENT_GATE = "if (last_good == 0 && ladder_needed && fallback_tried && rung_fit_refused) {"
+
+
+def test_the_descent_runs_only_after_a_real_fit_refusal():
+    """`stop_is_pure_race` was the only thing keeping a probe/publish anomaly (a lifecycle failure, a CAS race, a
+    demoted KV, a host fallback) from lowering -ub. The descent now needs the rung that ended the ladder to have been a
+    fit refusal: the probe's own refusal, a compute buffer that did not fit, or the hold spill."""
+    body = _trial_norm()
+    assert _DESCENT_GATE in body
+    assert "stop_is_pure_race" in body  # still the store gate's race term
+
+
+def test_the_descent_stops_at_a_loss_that_is_no_fit_refusal():
+    body = _trial_norm()
+    at = body.find(_DESCENT_GATE)
+    block = _balanced_braces(body, at + len(_DESCENT_GATE) - 1)
+    assert "descent_ran = true;" in block
+    assert "publish_dirty = true;" in block, "a below-default rung ran: the ring must be republished by the settle"
+    assert re.search(r"descent_aborted\s*=\s*!rung_fit_refused", block), "the walk must stop at a non-fit loss"
+    assert "lowest_refused = std::min(lowest_refused, c);" in block
+    assert re.search(r"if \(ended != 0 && !descent_aborted\)", block)
+
+
+def _fit_flag_is_set_only_on_fit_refusals(tc: str) -> bool:
+    if not re.search(r"\[&\]\(uint32_t c\) -> const char \* \{ rung_fit_refused = false;", tc):
+        return False
+    fit = [
+        'rung_fit_refused = true; return "transaction refused";',
+        'rung_fit_refused = true; return "compute buffers did not fit";',
+        'rung_fit_refused = true; return "hold spill left no headroom";',
+    ]
+    nonfit = ["KV would be demoted", "compute buffer fell back to host", "not the published model", "transaction busy"]
+    if not all(f in tc for f in fit) or tc.count("rung_fit_refused = true;") != 3:
+        return False
+    # the probe's own refusal is a fit refusal only when the probe ran and said no
+    if not re.search(r"if \(!probe\.accepted\) \{ rung_fit_refused = true; return \"transaction refused\"; \}", tc):
+        return False
+    for reason in nonfit:
+        at = tc.find(f'return "{reason}";')
+        if at == -1 or "rung_fit_refused = true;" in tc[max(0, at - 60) : at]:
+            return False
+    # the lifecycle failure and the publish throw keep their stop reason and stay non-fit
+    return 'rc != GGML_SYCL_LIFECYCLE_OK' in tc and 'publish_dirty = true; return "transaction refused";' in tc
+
+
+def test_the_fit_flag_is_set_only_by_real_fit_refusals():
+    assert _fit_flag_is_set_only_on_fit_refusals(_try_candidate_norm())
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ('            return "KV would be demoted";', '            rung_fit_refused = true;\n            return "KV would be demoted";'),
+        ('                return "compute buffer fell back to host";',
+         '                rung_fit_refused = true;\n                return "compute buffer fell back to host";'),
+        ('            return "transaction busy";', '            rung_fit_refused = true;\n            return "transaction busy";'),
+        ('            publish_dirty           = true;\n            return "transaction refused";',
+         '            publish_dirty           = true;\n            rung_fit_refused = true;\n            return "transaction refused";'),
+        ('            return "hold spill left no headroom" ;', ''),
+    ],
+)
+def test_the_fit_flag_has_a_mutation_witness(old, new):
+    raw = LLAMA_CONTEXT_CPP
+    if raw.count(old) != 1:
+        pytest.skip("not applicable to this shape")
+    mutated = _body_of(raw.replace(old, new, 1), _TRY_CANDIDATE_START, _TRY_CANDIDATE_END)
+    assert not _fit_flag_is_set_only_on_fit_refusals(mutated)
+
+
+@pytest.mark.parametrize(
+    "decl",
+    [
+        "bool           descent_ran             = false;",
+        "bool           fallback_tried          = false;",
+        "uint32_t       lowered_from            = 0;",
+        "bool           rung_fit_refused        = false;",
+        "uint32_t       lowest_refused          = 0;",
+    ],
+)
+def test_the_trial_state_is_initialised_to_nothing_happened(decl):
+    """Each of these starts false/zero: `descent_ran` true would run the walk for a default nobody refused,
+    `fallback_tried` true would lower a default that was never asked about, `lowered_from` non-zero would suppress the
+    tuning-cache store and print a lowering that did not happen."""
+    pattern = r"\s+".join(re.escape(tok) for tok in decl.split())
+    assert re.search(pattern, LLAMA_CONTEXT_CPP_CODE), decl
+
+
+def test_the_trial_never_writes_the_context_size():
+    """A smaller -ub is not a smaller context: no part of the trial or its settle may assign cparams.n_ctx."""
+    body = _trial_norm()
+    assert not re.search(r"cparams\.n_ctx\s*(?:[-+*/]?=(?!=)|\+\+|--)", body)
+    mutant = _trial_mutant("        cparams.n_ubatch = last_good;\n        // The settle's publish", "        cparams.n_ctx = last_good;\n        // The settle's publish") \
+        if "        cparams.n_ubatch = last_good;\n        // The settle's publish" in LLAMA_CONTEXT_CPP else None
+    if mutant is not None:
+        assert re.search(r"cparams\.n_ctx\s*(?:[-+*/]?=(?!=)|\+\+|--)", mutant)
+
+
+def test_every_rung_asked_is_named_in_tried():
+    body = _trial_norm()
+    assert 'tried += (tried.empty() ? "" : ",") + std::to_string(cached_ubatch);' in body
+    assert 'tried += (tried.empty() ? "" : ",") + std::to_string(c);' in body
+    assert 'tried.append(tried.empty() ? "" : ",").append(std::to_string(c));' in body
+
+
+def test_a_refused_cached_value_is_not_paid_for_twice_and_is_evicted():
+    """A cached rung that fails its revalidation is a loss this start already knows: the ladder stops AT it instead of
+    asking again, and a result that ends up lowered (which is never cached) still overwrites the refused entry."""
+    body = _trial_norm()
+    assert re.search(r"if \(rung_fit_refused\) \{ cache_refused_ub = cached_ubatch; cache_refused_reason = cache_reason; \}", body)
+    assert re.search(r"if \(cache_refused_ub != 0 && c >= cache_refused_ub\) \{ stop = cache_refused_reason; break; \}", body)
+    assert "const bool store_outcome = lowered_from == 0 ? !descent_ran : cache_refused_ub != 0;" in body
+    assert re.search(r"if \(ladder_needed && !stop_is_pure_race && store_outcome && !resumed_outcome_unchanged &&", body)
+
+
+def test_the_header_names_the_advice_and_rounds_the_descent_to_64():
+    code = _normalize_ws(strip_comments(LLAMA_AUTO_UBATCH_H))
+    assert "inline uint32_t llama_auto_ubatch_advice(uint32_t largest_fit, uint32_t lowest_refused)" in code
+    assert "return half >= llama_auto_ubatch_descent_floor ? half - half % 64 : 0;" in code
+
+
+def test_the_scheduler_scope_is_opened_around_every_compute_buffer_allocation():
+    """A buffer the backend places is a scheduler compute buffer only inside this scope; the absence of a model load
+    (which also covers a recurrent-state buffer) no longer says so."""
+    cpp = _normalize_ws(LLAMA_CONTEXT_CPP_CODE)
+    assert "struct sycl_compute_scope_guard" in cpp
+    assert re.search(r"sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); if \(!ggml_backend_sched_alloc_graph\(", cpp)
+    assert re.search(r"sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); if \(!ggml_backend_sched_reserve\(sched\.get\(\), gf\)\)", cpp) or re.search(
+        r"\} else \{ sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); if \(!ggml_backend_sched_reserve\(sched\.get\(\), gf\)\)", cpp
+    )
+    assert '"ggml_backend_sycl_compute_alloc_scope"' in cpp
+    header = _normalize_ws(strip_comments((ROOT / "src/llama-context.h").read_text()))
+    assert "sycl_compute_scope_fn()" in header
+
+
+def test_the_design_doc_describes_the_named_settle_error_not_a_descent():
+    doc = (ROOT / "docs/backend/sycl-memory-design.md").read_text()
+    assert "settle_refusal_descend" not in doc
+    assert "llama_auto_ubatch_advice" in doc
