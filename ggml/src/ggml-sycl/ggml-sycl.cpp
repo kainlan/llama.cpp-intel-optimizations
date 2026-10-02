@@ -37970,6 +37970,41 @@ static const char * ggml_backend_sycl_buffer_type_get_name(ggml_backend_buffer_t
     return ctx->name.c_str();
 }
 
+// llama.cpp-kpjw: one line per scheduler compute buffer that asked for the KV-zone-first placement, naming the zone it
+// actually landed in. The zone is where the buffer's bytes physically are (KV zone: inside the arena; "raw": device
+// memory outside it; "none": nothing placed it here and the legacy path below decides), which a throughput comparison
+// between builds cannot otherwise attribute.
+static void ggml_sycl_log_compute_buffer_landing(int                             device,
+                                                 const std::string &             name,
+                                                 size_t                          size,
+                                                 const ggml_sycl::alloc_handle & handle) {
+    const char * zone = "none";
+    if (handle.ptr) {
+        switch (handle.vram_zone) {
+            case ggml_sycl::vram_zone_id::KV:
+                zone = "kv";
+                break;
+            case ggml_sycl::vram_zone_id::WEIGHT:
+                zone = "weight";
+                break;
+            case ggml_sycl::vram_zone_id::ONEDNN:
+                zone = "onednn";
+                break;
+            case ggml_sycl::vram_zone_id::RUNTIME:
+                zone = "runtime";
+                break;
+            case ggml_sycl::vram_zone_id::SCRATCH:
+                zone = "scratch";
+                break;
+            default:
+                zone = "raw";
+                break;
+        }
+    }
+    GGML_LOG_WARN("[SCRATCH-STATS] device=%d compute_buffer=%s size=%.1f MB zone=%s\n", device, name.c_str(),
+                  size / (1024.0 * 1024.0), zone);
+}
+
 static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                                                         size_t                     size) try {
     ggml_backend_sycl_buffer_type_context * buft_ctx = (ggml_backend_sycl_buffer_type_context *) buft->context;
@@ -38068,6 +38103,9 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 runtime_req.intent.constraints.spill_to_kv_zone_before_raw = kv_zone_first;
                 ggml_sycl::alloc_handle runtime_h{};
                 ggml_sycl::unified_alloc(runtime_req, &runtime_h);
+                if (kv_zone_first) {
+                    ggml_sycl_log_compute_buffer_landing(buft_ctx->device, buft_ctx->name, size, runtime_h);
+                }
                 if (runtime_h.ptr) {
                     ggml_backend_sycl_buffer_context * ctx = new ggml_backend_sycl_buffer_context(
                         buft_ctx->device, runtime_h.ptr, buft_ctx->stream, size, buft_ctx->sycl_ctx);

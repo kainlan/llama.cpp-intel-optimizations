@@ -286,7 +286,9 @@ def evaluate(backend, common, cache, zone):
     results["the shared allocator is RUNTIME-zone and spill-forbidden"] = \
         "vram_zone_id::RUNTIME" in runtime_ensure and "forbid_vram_zone_spill = true" in runtime_ensure
     # Verifiability: a WARN-level line a normal run prints.
-    stats_at = backend.find("[SCRATCH-STATS]")
+    # The per-cohort line specifically: other [SCRATCH-STATS] lines (the hold spills, a compute buffer's landing zone)
+    # print MB and are not cohort stats.
+    stats_at = backend.find("[SCRATCH-STATS] device=%d cohort=")
     results["a WARN-level per-cohort stats line exists"] = \
         stats_at >= 0 and "GGML_LOG_WARN" in backend[max(0, stats_at - 300):stats_at]
     results["the stats are printed at context teardown"] = "log_planned_scratch_stats()" in backend
