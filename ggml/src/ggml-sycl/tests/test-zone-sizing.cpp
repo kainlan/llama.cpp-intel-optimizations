@@ -1056,6 +1056,65 @@ int main() {
               "at 256 the spill is half and leaves 355 MB: the continuation's landing rung fits");
     }
 
+    // ---- Case 23: the -ub a refusal names must be one the F3 publish accepts (kpjw-g7). The realized check and the
+    // transaction-time bound (F3) are two predicates over one fact. The pinned -ub 1024 refusal on the B50 / Qwen
+    // named 512 from the spill's linear share; F3, fed the same card (602.7 MB free once the rung's buffers are
+    // gone), refuses 512 (470.0 MB worst case, 132.7 MB left of the 256 MB headroom), so following the advice died with
+    // result=19. The named -ub is now the smaller of the two answers, and the one F3's own predicate is asked for:
+    // zone_hold_spill_bound_fits is what F3 calls, and the walk below asks it with F3's own bound for each rung. -----
+    {
+        struct bound_inputs {
+            size_t   plan;
+            size_t   hwm;
+            uint32_t hwm_n_ubatch;
+            size_t   kv_room;
+        };
+
+        const size_t MiB      = 1024 * 1024;
+        const size_t head     = 256 * MiB;
+        bound_inputs in       = { 76 * MiB, 990 * MiB, 1024, 100 * MiB };
+        // F3's own composition (ggml_sycl_planned_scratch_hold_spill_bound): the plan plus the largest request scaled
+        // to the candidate rung, net of the KV-zone room.
+        auto         bound_of = [](void * ctx, uint32_t ub) -> size_t {
+            const bound_inputs * b = static_cast<const bound_inputs *>(ctx);
+            return ggml_sycl::zone_hold_spill_raw_demand(
+                ggml_sycl::zone_hold_spill_bound(b->plan, b->hwm, b->hwm_n_ubatch, ub), b->kv_room);
+        };
+        const size_t   free_before = 603 * MiB;  // the card with this plan's raw buffers gone
+        const size_t   spill       = 990 * MiB;
+        // The old answer: the spill's linear share, from the free memory the buffers left (about none).
+        const uint32_t by_spill =
+            ggml_sycl::zone_hold_spill_largest_ub(1024, spill, free_before > spill ? free_before - spill : 0, head);
+        CHECK(by_spill == 512, "the spill's linear share alone names 512 (what the refusal used to print)");
+        CHECK(!ggml_sycl::zone_hold_spill_bound_fits(free_before, head, bound_of(&in, 512)),
+              "F3 refuses that 512: 470 MB worst case leaves 133 MB of the 603 MB card, under 256");
+        const uint32_t by_bound =
+            ggml_sycl::zone_hold_spill_largest_ub_by_bound(1024, free_before, head, bound_of, &in);
+        CHECK(by_bound == 256, "the largest rung F3 accepts is 256");
+        const uint32_t named = by_spill < by_bound ? by_spill : by_bound;
+        CHECK(named == 256, "the printed -ub is the smaller of the two answers");
+        CHECK(ggml_sycl::zone_hold_spill_bound_fits(free_before, head, bound_of(&in, named)),
+              "the -ub the refusal prints passes F3 under the same inputs");
+        CHECK(!ggml_sycl::zone_hold_spill_bound_fits(free_before, head, bound_of(&in, named * 2)),
+              "and it is the largest rung that does");
+        // F3's predicate and the shared one are the same function of the same inputs.
+        for (size_t demand_mb : { 0, 100, 300, 346, 347, 470, 700 }) {
+            const size_t demand = demand_mb * MiB;
+            const size_t after  = demand >= free_before ? 0 : free_before - demand;
+            CHECK(ggml_sycl::zone_hold_spill_bound_fits(free_before, head, demand) ==
+                      ggml_sycl::zone_hold_spill_realized_fits(after, head, demand),
+                  "the shared predicate is the realized rule applied to the predicted free memory");
+        }
+        // A card already short without the spill is not the hold's doing: nothing to name, the rung is not refused.
+        CHECK(ggml_sycl::zone_hold_spill_bound_fits(200 * MiB, head, 470 * MiB), "short without the spill: not blamed");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub_by_bound(0, free_before, head, bound_of, &in) == 0,
+              "an unknown n_ubatch names nothing");
+        // Nothing fits down to the smallest rung: 0, not a made-up one.
+        bound_inputs huge = { 600 * MiB, 990 * MiB, 1024, 0 };
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub_by_bound(1024, free_before, head, bound_of, &huge) == 0,
+              "a plan that alone leaves the card under the headroom at every rung names no -ub");
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }

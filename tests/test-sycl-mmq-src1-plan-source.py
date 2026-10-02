@@ -683,8 +683,11 @@ def evaluate(backend, common, cache, zone):
     # I1: the bound follows the candidate rung, and the FA-on check and the realized check ask ONE question.
     results["the spill bound scales the largest request to the candidate rung"] = \
         "zone_hold_spill_bound(" in bound_fn and "unified_cache_get_runtime_request_hwm(" in bound_fn
+    # kpjw-g7: F3 and the -ub a refusal names must be one computation. F3 asks the shared predicate (the realized rule
+    # applied to the predicted free memory); it keeps no inline copy of it.
     results["the FA-on check asks the realized rule (predicted free after the spill), not a second one"] = \
-        "zone_hold_spill_realized_fits(" in hold_headroom_fn and "spill_bytes <= free_mem" not in hold_headroom_fn
+        re.search(r"zone_hold_spill_bound_fits\(\s*free_mem\s*,\s*kSyclArenaMinExternalHeadroomBytes\s*,\s*spill_bytes\s*\)", hold_headroom_fn) is not None and \
+        "zone_hold_spill_realized_fits(" not in hold_headroom_fn and "spill_bytes <= free_mem" not in hold_headroom_fn
     note_fn = function_body(cache, r"size_t unified_cache_note_runtime_request\([^)]*\)\s*\{") or ""
     results["the largest request is recorded with the n_ubatch it was seen at, from the first publish on"] = \
         "epoch_n_ubatch" in note_fn and "request_hwm_n_ubatch" in note_fn
@@ -834,8 +837,18 @@ def evaluate(backend, common, cache, zone):
     # r5 T6/T7/T8: the -ub a refusal names is computed from what THIS rung measured, with the rung's own n_ubatch, and
     # the out-parameter is zeroed first so a refusal-free call (or a backend that is not SYCL) never reports a stale one.
     results["the realized check computes the -ub from the rung's n_ubatch, its spill and the live free memory"] = \
-        re.search(r"largest_ub\s*=\s*ggml_sycl::zone_hold_spill_largest_ub\(\s*n_ubatch\s*,\s*spill_bytes\s*,\s*free_mem\s*,\s*"
+        re.search(r"by_spill\s*=\s*ggml_sycl::zone_hold_spill_largest_ub\(\s*n_ubatch\s*,\s*spill_bytes\s*,\s*free_mem\s*,\s*"
                   r"kSyclArenaMinExternalHeadroomBytes\s*\)", realized_fn) is not None
+    # kpjw-g7: the -ub the refusal prints must be one F3 accepts. The spill's linear share alone named 512 for a pinned
+    # -ub 1024 on the B50 while F3 refused 512 (470 MB worst case, 132.7 MB left), so the advice died with result=19.
+    # The name is the smaller of that share and the largest rung F3's own predicate accepts, asked with F3's own bound
+    # for each rung and the card as it was before this plan's raw buffers (free now + the spill).
+    results["the -ub a refusal names is one the F3 publish accepts: the smaller of the spill's share and F3's own answer"] = \
+        re.search(r"by_bound\s*=\s*ggml_sycl::zone_hold_spill_largest_ub_by_bound\(\s*n_ubatch\s*,\s*free_mem\s*\+\s*spill_bytes\s*,\s*"
+                  r"kSyclArenaMinExternalHeadroomBytes\s*,\s*ggml_sycl_hold_spill_bound_at\s*,\s*&device_for_bound\s*\)", realized_fn) is not None and \
+        re.search(r"\*largest_ub\s*=\s*std::min\(\s*by_spill\s*,\s*by_bound\s*\)\s*;", realized_fn) is not None and \
+        re.search(r"static size_t ggml_sycl_hold_spill_bound_at\(\s*void\s*\*\s*ctx\s*,\s*uint32_t\s+n_ubatch\s*\)\s*\{\s*return\s+ggml_sycl_planned_scratch_hold_spill_bound\(\s*"
+                  r"\*static_cast<int\s*\*>\(\s*ctx\s*\)\s*,\s*n_ubatch\s*,\s*0\s*\)\s*;\s*\}", backend) is not None
     zero_at = re.search(r"if\s*\(\s*largest_ub\s*\)\s*\{\s*\*largest_ub\s*=\s*0\s*;\s*\}", entry_fn)
     results["the exported entry zeroes the out-parameter first and passes the caller's n_ubatch to the realized check"] = \
         zero_at is not None and zero_at.start() < entry_fn.find("return ggml_sycl_check_hold_spill_realized(") and \
