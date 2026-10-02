@@ -1,4 +1,4 @@
-// GPU test for llama.cpp-23mk S3-3 (design 4.8, G6): a declined oneDNN scratchpad is a decline, not an error.
+// GPU test for llama.cpp-23mk S3-3 and S3-4 (design 4.8, G6): a declined oneDNN scratchpad is a decline, not an error.
 //
 // The three oneDNN wrappers outside ggml-sycl.cpp that ask for a scratchpad (softmax, eltwise, binary_broadcast_row)
 // return false when the request is declined, before they write the op's output, and their callers fall through to the
@@ -6,10 +6,11 @@
 // be provoked from outside; the PRIVATE_TESTING seam ggml_sycl_test_inject_scratchpad_decline(site, after_n) forces one
 // at the wrapper's decision and counts what each site did.
 //
-// Each arm builds one small graph on one backend context and computes it twice, the seam off and then on. The graph
-// is computed directly on the SYCL backend with every tensor in a SYCL buffer. It must not go through
-// ggml_backend_sched: the scheduler gives graph inputs to its last backend (the CPU), and the ops that consume them
-// follow, so the first version of this test ran every op on the CPU and read calls == 0 at every site.
+// Each arm but the last builds one small graph on one backend context and computes it twice, the seam off and then on
+// (the last arm, below, computes once). The graph is computed directly on the SYCL backend with every tensor in a SYCL
+// buffer. It must not go through ggml_backend_sched: the scheduler gives graph inputs to its last backend (the CPU),
+// and the ops that consume them follow, so the first version of this test ran every op on the CPU and read
+// calls == 0 at every site.
 //
 //   off  the wrapper must run: calls and engaged equal the arm's expected counts (1 and 1 for the single-call wrappers;
 //        the KQ arms below count every launch of the graph), declined == 0, the output matches a host reference;
@@ -24,14 +25,16 @@
 // consumer.
 //
 // A decline after a write (a later call of the same launch, an inject with after_n > 1) throws
-// dnnl_decline_after_write:dnnl_gemm, a ggml_sycl_fallback_error. The caller rethrows it (ggml-sycl.cpp:66395),
-// ggml_sycl_mul_mat rethrows it (ggml-sycl.cpp:85054) and ggml_backend_sycl_graph_compute turns it into
-// GGML_STATUS_FAILED (ggml-sycl.cpp:109540). The last arm of main drives it on the grouped-query graph with after_n = 3
-// (call 1 the pre-query, call 2 the first gemm, which wrote dst, call 3 the declined second gemm): graph_compute must
-// return GGML_STATUS_FAILED, never SUCCESS and never a crash, with calls = 3, declined = 1, engaged = 1. Its output is
-// undefined after the failed graph and is not compared; run_arm accepts a non-SUCCESS status only for an arm that sets
-// expect_status. The other sites (MXFP4 PP, unified PP, MoE batched, the dense arms, out_prod) are pinned by
-// scripts/check-sycl-dnnl-decline-consumers.py and have no device arm yet.
+// dnnl_decline_after_write:dnnl_gemm, a ggml_sycl_fallback_error. The batched f16 caller in ggml_sycl_mul_mat_f16
+// rethrows it (its `catch (const ggml_sycl_fallback_error &) { throw; }`), ggml_sycl_mul_mat rethrows it (its
+// function-level catch of the same type) and ggml_backend_sycl_graph_compute turns it into GGML_STATUS_FAILED (its
+// `catch (const ggml_sycl_fallback_error & error)`, which returns GGML_STATUS_FAILED). The last arm of main drives it
+// on the grouped-query graph with after_n = 3 (call 1 the pre-query, call 2 the first gemm, which wrote dst, call 3
+// the declined second gemm): graph_compute must return GGML_STATUS_FAILED, never SUCCESS and never a crash, with
+// calls = 3, declined = 1, engaged = 1. Its output is undefined after the failed graph and is not compared; run_arm
+// accepts a non-SUCCESS status only for an arm that sets expect_status. The other sites (MXFP4 PP, unified PP, MoE
+// batched, the dense arms, out_prod) are pinned by scripts/check-sycl-dnnl-decline-consumers.py and have no device arm
+// yet.
 //
 // The counters are the positive control. An arm whose off-run never reached its site (the env opt-in is missing, a
 // shape fell under a threshold, the graph was recorded) has calls == 0 and FAILS as void; "identical" outputs from a
@@ -330,23 +333,11 @@ run_result run_arm(ggml_backend_t backend, const arm & a, int inject, bool keep_
         ggml_free(ctx);
         return res;
     }
-    if (a.expect_status != GGML_STATUS_SUCCESS) {
-        // An expected failure (a decline after a write): the output is undefined after a failed graph, so it is not
-        // read, and there is no recorded graph to check. Only the seam's counters are read.
-        ggml_backend_buffer_free(buf);
-        ggml_free(ctx);
-        if (!ggml_sycl_test_scratchpad_site_counts(a.site, &res.calls, &res.declined, &res.engaged)) {
-            fprintf(stderr, "FAIL: %s: the seam does not know the site %s\n", a.name, a.site);
-            return res;
-        }
-        if (!keep_state) {
-            ggml_sycl_test_inject_scratchpad_decline(a.site, 0);
-        }
-        res.ok = true;
-        return res;
-    }
+    // An expected failure (a decline after a write): the output is undefined after a failed graph, so it is not read,
+    // and there is no recorded graph to check. Only the seam's counters are read.
+    const bool expected_failure = a.expect_status != GGML_STATUS_SUCCESS;
     // Recording would route the softmax and MUL arms around their sites, so a recorded run is void.
-    if (ggml_sycl::test_backend_has_exec_graph(backend)) {
+    if (!expected_failure && ggml_sycl::test_backend_has_exec_graph(backend)) {
         fprintf(stderr, "FAIL: %s: the backend recorded an executable graph; the arm is void (run with GGML_SYCL_DISABLE_GRAPH=1)\n",
                 a.name);
         ggml_backend_buffer_free(buf);
@@ -354,8 +345,10 @@ run_result run_arm(ggml_backend_t backend, const arm & a, int inject, bool keep_
         return res;
     }
 
-    res.out.resize((size_t) ggml_nelements(g.out));
-    ggml_backend_tensor_get(g.out, res.out.data(), 0, res.out.size() * sizeof(float));
+    if (!expected_failure) {
+        res.out.resize((size_t) ggml_nelements(g.out));
+        ggml_backend_tensor_get(g.out, res.out.data(), 0, res.out.size() * sizeof(float));
+    }
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     if (!ggml_sycl_test_scratchpad_site_counts(a.site, &res.calls, &res.declined, &res.engaged)) {
@@ -533,27 +526,36 @@ int main(int, char ** argv) {
         // The counters are the positive control: calls == 3 (pre-query, first gemm, declined gemm), declined == 1 and
         // engaged == 1 (the one gemm that wrote). The output buffer is NOT compared: after a failed graph it is
         // undefined. This arm runs last because a failed graph quarantines the backend's execution state.
-        arm post = make_arms().back();
-        for (const arm & candidate : make_arms()) {
-            if (strcmp(candidate.name, "batched f16 KQ mul_mat GQA") == 0) {
-                post = candidate;
+        const char *           base_name = "batched f16 KQ mul_mat GQA";
+        const std::vector<arm> base_arms = make_arms();
+        const arm *            base      = nullptr;
+        for (const arm & candidate : base_arms) {
+            if (strcmp(candidate.name, base_name) == 0) {
+                base = &candidate;
             }
         }
-        post.name                = "batched f16 KQ mul_mat GQA, post-write decline";
-        post.expect_status       = GGML_STATUS_FAILED;
-        const int        after_n = 3;
-        const run_result r       = run_arm(backend, post, after_n);
-        printf("%-30s site=%-16s inject=%d: status=%d calls=%llu declined=%llu engaged=%llu (output not compared)\n",
-               post.name, post.site, after_n, (int) r.status, (unsigned long long) r.calls,
-               (unsigned long long) r.declined, (unsigned long long) r.engaged);
-        if (!r.ok || r.status != GGML_STATUS_FAILED || r.calls != 3 || r.declined != 1 || r.engaged != 1) {
-            fprintf(
-                stderr,
-                "FAIL: %s: expected status FAILED with calls=3 declined=1 engaged=1 (got ok=%d status=%d calls=%llu "
-                "declined=%llu engaged=%llu)\n",
-                post.name, r.ok ? 1 : 0, (int) r.status, (unsigned long long) r.calls, (unsigned long long) r.declined,
-                (unsigned long long) r.engaged);
+        if (!base) {
+            // Never run a different arm in its place: its counters would not mean what this arm's expect.
+            fprintf(stderr, "FAIL: arm '%s' not found: the post-write decline arm is built from it\n", base_name);
             ok = false;
+        } else {
+            arm post                 = *base;
+            post.name                = "batched f16 KQ mul_mat GQA, post-write decline";
+            post.expect_status       = GGML_STATUS_FAILED;
+            const int        after_n = 3;
+            const run_result r       = run_arm(backend, post, after_n);
+            printf(
+                "%-30s site=%-16s inject=%d: status=%d calls=%llu declined=%llu engaged=%llu (output not compared)\n",
+                post.name, post.site, after_n, (int) r.status, (unsigned long long) r.calls,
+                (unsigned long long) r.declined, (unsigned long long) r.engaged);
+            if (!r.ok || r.status != GGML_STATUS_FAILED || r.calls != 3 || r.declined != 1 || r.engaged != 1) {
+                fprintf(stderr,
+                        "FAIL: %s: expected status FAILED with calls=3 declined=1 engaged=1 (got ok=%d status=%d "
+                        "calls=%llu declined=%llu engaged=%llu)\n",
+                        post.name, r.ok ? 1 : 0, (int) r.status, (unsigned long long) r.calls,
+                        (unsigned long long) r.declined, (unsigned long long) r.engaged);
+                ok = false;
+            }
         }
     }
 
