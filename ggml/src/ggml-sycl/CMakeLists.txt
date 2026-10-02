@@ -1911,6 +1911,94 @@ set_tests_properties(sycl-kv-region-registry PROPERTIES
     TIMEOUT 60
 )
 
+# The same suite under ThreadSanitizer (llama.cpp-moua L4 1a fold). Three of the
+# registry's guarantees -- the slot table's shared_lock pin in claim(), the slot
+# spin lock's acquire/release ordering and the generation read under that lock --
+# are visible only as data races, so a plain build passes a regression of any of
+# them. The closure is the one header (kv-region-registry.hpp) and the test, both
+# compiled into this target with -fsanitize=thread; nothing prebuilt (ggml-sycl,
+# the SYCL runtime) is linked, so no un-instrumented object can hide a race.
+# detect_deadlocks=0: the suite's descending-order lock controls are deliberate
+# lock-order inversions, which TSan's deadlock detector would report on a clean
+# tree. Data races stay fatal (halt_on_error, exitcode 66).
+# Registered only when the compiler can build and link a threaded TSan program;
+# otherwise nothing is registered (a vacuous pass would read as coverage).
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_FLAGS "-fsanitize=thread")
+set(CMAKE_REQUIRED_LINK_OPTIONS "-fsanitize=thread")
+set(CMAKE_REQUIRED_LIBRARIES Threads::Threads)
+check_cxx_source_compiles("
+#include <thread>
+int main() { int x = 0; std::thread t([&] { x = 1; }); t.join(); return x - 1; }
+" GGML_SYCL_HAVE_TSAN)
+unset(CMAKE_REQUIRED_FLAGS)
+unset(CMAKE_REQUIRED_LINK_OPTIONS)
+unset(CMAKE_REQUIRED_LIBRARIES)
+# GGML_SANITIZE_ADDRESS / GGML_SANITIZE_THREAD add their sanitizer at directory scope
+# (ggml/src/CMakeLists.txt), which the check above does not see: with either set this target
+# would carry two sanitizers (or the same one twice), and ASan and TSan do not combine.
+if (GGML_SYCL_HAVE_TSAN AND NOT GGML_SANITIZE_ADDRESS AND NOT GGML_SANITIZE_THREAD)
+    add_executable(test-sycl-kv-region-registry-tsan
+        tests/test-kv-region-registry.cpp
+    )
+    target_include_directories(test-sycl-kv-region-registry-tsan PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    # The sanitizer runtime owns operator new here; the suite's allocation-counting case runs in the plain target.
+    target_compile_definitions(test-sycl-kv-region-registry-tsan PRIVATE KV_REGISTRY_TEST_NO_ALLOC_DETECTOR)
+    target_compile_options(test-sycl-kv-region-registry-tsan PRIVATE -fsanitize=thread -g -O1)
+    target_link_options(test-sycl-kv-region-registry-tsan PRIVATE -fsanitize=thread)
+    target_link_libraries(test-sycl-kv-region-registry-tsan PRIVATE Threads::Threads)
+    add_test(NAME sycl-kv-region-registry-tsan COMMAND test-sycl-kv-region-registry-tsan)
+    set_tests_properties(sycl-kv-region-registry-tsan PROPERTIES
+        LABELS "sycl;kv;hostonly;tsan"
+        TIMEOUT 300
+        ENVIRONMENT "TSAN_OPTIONS=detect_deadlocks=0:halt_on_error=1:exitcode=66"
+    )
+elseif (NOT GGML_SYCL_HAVE_TSAN)
+    message(STATUS "ggml-sycl: no ThreadSanitizer support in this compiler; "
+                   "sycl-kv-region-registry-tsan is not registered")
+else()
+    message(STATUS "ggml-sycl: GGML_SANITIZE_ADDRESS or GGML_SANITIZE_THREAD is set, which already "
+                   "instruments this build; sycl-kv-region-registry-tsan is not registered")
+endif()
+
+# Production geometry census (llama.cpp-moua L4 1b): kv-geometry-census.hpp reads
+# one shared-zone TLSF (frontier_walk + block_census) into the geometry
+# kv_region_fit consumes. Header-only and SYCL-free like the targets above; the
+# test also drives tests/kv-region-test-model.hpp and pins the two readings equal.
+add_executable(test-kv-geometry-census
+    tests/test-kv-geometry-census.cpp
+    kv-runtime-demotion.cpp
+)
+target_include_directories(test-kv-geometry-census PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME sycl-kv-geometry-census COMMAND test-kv-geometry-census)
+set_tests_properties(sycl-kv-geometry-census PROPERTIES
+    LABELS "sycl;kv;hostonly"
+    TIMEOUT 60
+)
+
+# Host-weight create-set record (llama.cpp-moua L4 1c; th32pre test 1r):
+# host-create-record.hpp is the one wire converter, the thread-local pending slot
+# and the stage-scoped holder. Header-only; it includes ggml-sycl.h for the wire
+# struct and nothing else, so the test needs no -fsycl and links nothing but
+# threads (the slot is per thread, and one arm checks that on a second thread).
+add_executable(test-host-create-record
+    tests/test-host-create-record.cpp
+)
+target_include_directories(test-host-create-record PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-host-create-record PRIVATE Threads::Threads)
+add_test(NAME sycl-host-create-record COMMAND test-host-create-record)
+set_tests_properties(sycl-host-create-record PROPERTIES
+    LABELS "sycl;memory;planner;tdd;hostonly"
+    TIMEOUT 60
+)
+
 # oneDNN PP placement answers (llama.cpp-1d0n): which devices may run oneDNN PP
 # on a multi-device plan, and whether the plan may add WOQ second copies; and
 # the admission predicate plus per-route batch floor (llama.cpp-je3b).
@@ -2037,6 +2125,71 @@ else()
     set_tests_properties(sycl-attn-host-pool PROPERTIES
         DISABLED TRUE
         LABELS "sycl;attn;tkv13;hostonly;not-built")
+endif()
+
+# The measured-tenant section: the tenant element's layout, the cohort table and
+# the visitor accumulator. context-tenant-measure.hpp names only ggml types, so
+# this needs neither -fsycl nor a device; it compiles the .cpp itself (the same
+# file libggml-sycl gets from the file(GLOB) at :83) and links ggml-base alone.
+add_executable(test-context-tenant-measure
+    tests/test-context-tenant-measure.cpp
+    context-tenant-measure.cpp
+)
+target_include_directories(test-context-tenant-measure PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-context-tenant-measure PRIVATE ggml-base)
+set_target_properties(test-context-tenant-measure PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-context-tenant-measure COMMAND test-context-tenant-measure)
+set_tests_properties(sycl-context-tenant-measure PROPERTIES
+    LABELS "sycl;tenant;hostonly"
+    TIMEOUT 30
+)
+
+# The resolver counter's gating: a host return of a staged source counts only
+# inside the device-dispatch region and not inside a host executor. Synthetic
+# tensors, no device (an F32 tensor never reaches the multi-GPU control-storage
+# query), so it carries `hostonly` like test-attn-host-pool above. It links the
+# ordinary ggml-sycl module for the counter's object code, so it is guarded and
+# placeholdered for GGML_BACKEND_DL exactly as that test is.
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-resolver-host-return-count
+        tests/test-resolver-host-return-count.cpp
+    )
+    target_include_directories(test-resolver-host-return-count PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-resolver-host-return-count PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+    target_link_options(test-resolver-host-return-count PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+    target_compile_definitions(test-resolver-host-return-count PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-resolver-host-return-count PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-resolver-host-return-count PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    set_target_properties(test-resolver-host-return-count PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-resolver-host-return-count COMMAND test-resolver-host-return-count)
+    set_tests_properties(sycl-resolver-host-return-count PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        LABELS "sycl;resolver;hostonly"
+        TIMEOUT 30
+    )
+else()
+    add_test(NAME sycl-resolver-host-return-count
+        COMMAND ${CMAKE_COMMAND} -E echo
+                "not built: needs -DGGML_BACKEND_DL=OFF (test links ggml-sycl directly for the resolver counter)")
+    set_tests_properties(sycl-resolver-host-return-count PROPERTIES
+        DISABLED TRUE
+        LABELS "sycl;resolver;hostonly;not-built")
 endif()
 
 # TKV-13 (B2) step 4: identity-case correctness harness
@@ -2804,6 +2957,101 @@ set_tests_properties(test-sycl-retained-reap PROPERTIES
     TIMEOUT 120
 )
 
+# Test: the host pool's inference-phase gate (grow_zone, grow_into) skips only
+# for a TRANSACTION-kind L0 token, and its warning names the calling site. A real
+# pinned_chunk_pool on the OpenCL CPU device with 1 MB chunks, so the selector is
+# pinned to it: no GPU. The assert-mode arms re-exec the binary.
+add_executable(test-sycl-pool-phase-gate
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-pool-phase-gate.cpp
+)
+target_include_directories(test-sycl-pool-phase-gate PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-pool-phase-gate PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-pool-phase-gate PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-pool-phase-gate PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-pool-phase-gate PRIVATE ggml-sycl-private-fixtures Threads::Threads)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-pool-phase-gate PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-pool-phase-gate COMMAND test-sycl-pool-phase-gate)
+set_tests_properties(test-sycl-pool-phase-gate PROPERTIES
+    LABELS "sycl;handle;hostonly;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# Test: mem_handle_identity (the non-owning value a compare-only cache keeps in
+# place of a mem_handle) and the tenant cohort tag.  Real owner controls from the
+# private fixture factory with an injected release backend, so the selector is
+# pinned to the OpenCL CPU device: no GPU.
+add_executable(test-sycl-mem-handle-identity
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mem-handle-identity.cpp
+)
+target_include_directories(test-sycl-mem-handle-identity PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-mem-handle-identity PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-mem-handle-identity PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-mem-handle-identity PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-mem-handle-identity PRIVATE ggml-sycl-private-fixtures Threads::Threads)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-mem-handle-identity PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-mem-handle-identity COMMAND test-sycl-mem-handle-identity)
+set_tests_properties(test-sycl-mem-handle-identity PROPERTIES
+    LABELS "sycl;handle;hostonly;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# Test: L0, the re-plan transaction mutex, and the always-compiled witness
+# (ggml_sycl_replan_token, ggml_sycl_replan_token_held, GGML_SYCL_WITNESS).
+# The real objects of unified-cache.cpp in the private carrier: nesting, kinds,
+# the try and outermost-only forms, threads, and the witness death arms scored
+# by message in re-exec'd children. No queue is created; the selector is pinned
+# to the OpenCL CPU device anyway: no GPU.
+add_executable(test-sycl-replan-token
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-replan-token.cpp
+)
+target_include_directories(test-sycl-replan-token PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-replan-token PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-replan-token PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-replan-token PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-replan-token PRIVATE ggml-sycl-private-fixtures Threads::Threads)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-replan-token PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-replan-token COMMAND test-sycl-replan-token)
+set_tests_properties(test-sycl-replan-token PROPERTIES
+    LABELS "sycl;handle;hostonly;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 # Test: the two device-level arena accessors (ggml_sycl_arena_backing, the
 # lookup that creates; ggml_sycl_device_has_zones, the one that never does) and
 # the committed-side capacity accessors' non-VM bodies. The cache is a real
@@ -3120,6 +3368,94 @@ set_tests_properties(test-sycl-tensor-placement PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+
+# Test: the load-time measure's plan override (llama.cpp-zhcn).  Drives the
+# install/clear procs and the plan accessors, the publish refusal and the
+# plan-derived multi-GPU latch read.  Host code only: no queue or cache is touched.
+# The publish and latch controls it drives are compiled only into the private
+# object backend.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-sycl-measure-plan-override
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-measure-plan-override.cpp
+)
+target_include_directories(test-sycl-measure-plan-override PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-measure-plan-override PRIVATE ${TENSOR_PLACEMENT_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-measure-plan-override PRIVATE ${TENSOR_PLACEMENT_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-measure-plan-override PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-measure-plan-override PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME test-sycl-measure-plan-override COMMAND test-sycl-measure-plan-override)
+set_tests_properties(test-sycl-measure-plan-override PROPERTIES
+    LABELS "sycl;moe;tensor-placement;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# Test: the chunk-cap core, the plan_caps copy and the plan scopes (llama.cpp-zhcn;
+# H6a).  A PRIVATE_TESTING device buft touches no device, so this needs none.
+add_executable(test-sycl-plan-caps
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-plan-caps.cpp
+)
+target_include_directories(test-sycl-plan-caps PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-plan-caps PRIVATE ${TENSOR_PLACEMENT_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-plan-caps PRIVATE ${TENSOR_PLACEMENT_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-plan-caps PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-plan-caps PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME test-sycl-plan-caps COMMAND test-sycl-plan-caps)
+set_tests_properties(test-sycl-plan-caps PROPERTIES
+    LABELS "sycl;h6a;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
+# Test: the re-plan hooks ggml_backend_sycl_synchronize_for_replan and
+# ggml_backend_sycl_graph_invalidate (llama.cpp-zhcn).  Refusals run anywhere; the
+# context arms need a card, so the registration pins level_zero:0,1 and supplies
+# GGML_SYCL_TEST_REPLAN_DEVICE=1; a bare run of the binary without it skips the
+# context arms and exits 77, which ctest reports as skipped.  A registration
+# that left the variable out would report Skipped on a pinned run and prove nothing.
+add_executable(test-sycl-replan-hooks
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-replan-hooks.cpp
+)
+target_include_directories(test-sycl-replan-hooks PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-replan-hooks PRIVATE ${TENSOR_PLACEMENT_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-replan-hooks PRIVATE ${TENSOR_PLACEMENT_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-replan-hooks PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-replan-hooks PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME test-sycl-replan-hooks COMMAND test-sycl-replan-hooks)
+set_tests_properties(test-sycl-replan-hooks PROPERTIES
+    LABELS "sycl;h6a;tdd"
+    ENVIRONMENT "GGML_SYCL_TEST_REPLAN_DEVICE=1;ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
+endif()
 
 # Test: ggml_sycl_get_tensor_usage() (ggml-sycl.cpp) -- the production entry
 # point wrapping infer_tensor_usage() with a name->usage cache -- must
@@ -6465,3 +6801,15 @@ endif()
 
 endif() # BUILD_TESTING (llama.cpp-9goq, opened right after the production
         # GGML_SYCL_DEVICE_ARCH block near the top of this file)
+
+# The runtime witnesses (GGML_SYCL_WITNESS) enforce the L0 lock order and the nesting
+# rules (unified-cache.cpp, the audit above g_replan_txn_mutex).  A PRIVATE_TESTING
+# build turns them on by itself; a test that links the production backend does not,
+# so every lifecycle, replan and plan test sets GGML_SYCL_WITNESS_CHECKS=1 and the
+# order is enforced on every test run.
+get_property(_witness_candidate_tests DIRECTORY PROPERTY TESTS)
+foreach (_witness_test IN LISTS _witness_candidate_tests)
+    if (_witness_test MATCHES "lifecycle|replan|plan")
+        set_property(TEST ${_witness_test} APPEND PROPERTY ENVIRONMENT "GGML_SYCL_WITNESS_CHECKS=1")
+    endif()
+endforeach()

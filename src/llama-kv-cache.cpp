@@ -147,8 +147,9 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
-    model(model), hparams(hparams), v_trans(v_trans),
+             const char *   name_tag,
+                     bool   no_alloc) :
+    model(model), hparams(hparams), v_trans(v_trans), no_alloc(no_alloc || hparams.no_alloc),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
@@ -234,32 +235,35 @@ llama_kv_cache::llama_kv_cache(
     const bool is_mla = hparams.is_mla();
 
     for (uint32_t il = 0; il < n_layer; il++) {
-        if (!hparams.has_kv(il)) {
+        // the one decision for this layer, shared with llama_kv_layer_shapes() (llama-layer-shapes.h)
+        const llama_kv_layer_decision dec =
+            llama_kv_layer_decide(hparams, il, v_trans, filter, share, other != nullptr);
+
+        if (dec.role == LLAMA_KV_LAYER_NO_KV) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
             continue;
         }
 
-        if (filter && !filter(il)) {
+        if (dec.role == LLAMA_KV_LAYER_FILTERED) {
             LLAMA_LOG_DEBUG("%s: layer %3d: filtered\n", __func__, il);
             continue;
         }
 
-        if (share && other) {
-            const int32_t il_share = share(il);
+        if (dec.role == LLAMA_KV_LAYER_SHARED) {
+            const int32_t il_share = dec.il_share;
 
-            if (il_share >= 0) {
-                const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
+            const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
 
-                LLAMA_LOG_WARN("%s: layer %3d: sharing with layer %d. k = %p, v = %p\n", __func__, il, il_share,
-                        layer_share.k->data, layer_share.v->data);
+            LLAMA_LOG_WARN("%s: layer %3d: sharing with layer %d. k = %p, v = %p\n", __func__, il, il_share,
+                           layer_share.k->data, layer_share.v->data);
 
-                map_layer_ids[il] = layers.size();
+            map_layer_ids[il] = layers.size();
 
-                layers.push_back(layer_share);
-                layers.back().il = il;
+            layers.push_back(layer_share);
+            layers.back().il     = il;
+            layers.back().shared = true;
 
-                continue;
-            }
+            continue;
         }
 
         if (n_embd_head_k_all == 0) {
@@ -277,8 +281,8 @@ llama_kv_cache::llama_kv_cache(
         }
 
         // [TAG_V_CACHE_VARIABLE]
-        const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
-        const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+        const uint32_t n_embd_k_gqa = dec.shape.n_embd_k_gqa;
+        const uint32_t n_embd_v_gqa = dec.shape.n_embd_v_gqa;
 
         const char * dev_name = "CPU";
 
@@ -392,7 +396,7 @@ llama_kv_cache::llama_kv_cache(
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
-        if (hparams.no_alloc) {
+        if (this->no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
@@ -818,7 +822,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     for (const auto & [ctx, buf] : ctxs_bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
-        if (hparams.no_alloc) {
+        if (no_alloc) {
             GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
             ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
         } else {
@@ -869,6 +873,10 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 
 llama_memory_context_ptr llama_kv_cache::init_full() {
     return std::make_unique<llama_kv_cache_context>(this);
+}
+
+llama_memory_context_ptr llama_kv_cache::init_reserve(uint32_t n_streams) {
+    return std::make_unique<llama_kv_cache_context>(this, n_streams);
 }
 
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
@@ -945,10 +953,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     return res;
 }
 
-bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+llama_memory_update_result llama_kv_cache::update(
+        llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
-        return true;
+        return LLAMA_MEMORY_UPDATE_DONE;
     }
 
     bool updated = false;
@@ -1003,14 +1012,14 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             auto * gf = build_graph_shift(res, lctx);
             if (!ggml_backend_sched_alloc_graph(sched, gf)) {
                 LLAMA_LOG_ERROR("%s: failed to allocate compute graph for K-shift\n", __func__);
-                return updated;
+                return LLAMA_MEMORY_UPDATE_FAILED;
             }
 
             res->set_inputs(nullptr);
 
             if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
-                return updated;
+                return LLAMA_MEMORY_UPDATE_FAILED;
             }
 
             updated = true;
@@ -1023,7 +1032,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         }
     }
 
-    return updated;
+    return updated ? LLAMA_MEMORY_UPDATE_DONE : LLAMA_MEMORY_UPDATE_NONE;
 }
 
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
@@ -1327,6 +1336,12 @@ bool llama_kv_cache::get_can_shift() const {
     return true;
 }
 
+void llama_kv_cache::get_shift_caches(std::vector<const llama_kv_cache *> & caches) const {
+    if (other == nullptr && get_can_shift() && hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
+        caches.push_back(this);
+    }
+}
+
 uint32_t llama_kv_cache::get_size() const {
     const auto & cells = v_cells[seq_to_stream[0]];
 
@@ -1370,6 +1385,22 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     return layers[ikv].k;
+}
+
+bool llama_kv_cache::get_layer_tensors(int32_t il, const ggml_tensor ** k, const ggml_tensor ** v) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return false;
+    }
+
+    const kv_layer & layer = layers[it->second];
+    if (layer.il != (uint32_t) il || layer.shared) {
+        return false;
+    }
+
+    *k = layer.k;
+    *v = layer.v;
+    return true;
 }
 
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
@@ -2907,18 +2938,26 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
 
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
+// the full-cache context is the reserve context over every stream, by construction
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+        llama_kv_cache * kv) : llama_kv_cache_context(kv, kv->get_n_stream()) {
+}
+
+llama_kv_cache_context::llama_kv_cache_context(
+        llama_kv_cache * kv,
+        uint32_t n_streams) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
 
-    const uint32_t n_stream = kv->get_n_stream();
+    GGML_ASSERT(n_streams >= 1 && n_streams <= kv->get_n_stream());
 
-    // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
+    // create a dummy slot info - the actual data is irrelevant. we just need to build the graph. It spans n_streams
+    // streams, which is what a ubatch of n_streams sequences gets: the K/V views take their stream count from the
+    // slot info and the mask from the ubatch
     sinfos.resize(1);
     sinfos[0].s0 = 0;
-    sinfos[0].s1 = n_stream - 1;
-    sinfos[0].idxs.resize(n_stream);
-    for (uint32_t s = 0; s < n_stream; ++s) {
+    sinfos[0].s1 = n_streams - 1;
+    sinfos[0].idxs.resize(n_streams);
+    for (uint32_t s = 0; s < n_streams; ++s) {
         sinfos[0].strm.push_back(s);
         sinfos[0].idxs[s].resize(1, 0);
     }
@@ -2957,9 +2996,7 @@ bool llama_kv_cache_context::apply() {
 
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
-        kv->update(lctx, do_shift, sc_info);
-
-        return true;
+        return kv->update(lctx, do_shift, sc_info) != LLAMA_MEMORY_UPDATE_FAILED;
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);

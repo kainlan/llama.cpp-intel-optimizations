@@ -27,9 +27,9 @@
 //   * kv_region_release    the teardown proc: idempotent, L0 and no L1, noexcept.
 //
 // Left to later steps, not modelled here: the later-load weight-slot store
-// (H9 (4)'s ledger step, which is L4+L6 work), the per-slot claim spin lock (the
-// model's slot-state lock is one table-wide mutex), and any tie-break between two
-// L5 peers (see kv_lock_witness).
+// (H9 (4)'s ledger step, which is L4+L6 work).  The claim path is modelled as the
+// contract states it: a per-slot leaf spin lock, nothing allocated under it, and a
+// claim's generation token that the matching release must present.
 
 #ifndef GGML_SYCL_KV_REGION_REGISTRY_HPP
 #define GGML_SYCL_KV_REGION_REGISTRY_HPP
@@ -43,8 +43,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -81,12 +83,31 @@ inline void kv_region_abort(const std::string & message) {
 // token L0, the tensor-inventory lock L1, the registry lock L3 (a leaf), then L5,
 // which both the arena group mutexes and the slot-state locks hold (the release
 // proc's step 2 text calls the slot-state lock L5).  Acquiring a lock whose rank
-// is not above every lock the thread holds is an order violation; acquiring
-// anything while holding the registry lock is a leaf violation.  Two L5 peers held
-// together are therefore a violation here: the production witness's instance
-// tie-break between L5 peers is not modelled, and no path in the model needs it.  The witness
-// counts and remembers violations instead of aborting, so a test can assert on
-// them, and a "no lock held" check reads the same stack.
+// is below a lock the thread holds is an order violation; acquiring anything
+// while holding the registry lock is a leaf violation.
+//
+// Two L5 peers are ordered by the L5 tie-break: the subsystem ordinal first
+// (kv_l5_ordinal), then the instance key within one subsystem, both strictly
+// ascending.  Equal is a violation too: two locks of one subsystem and instance
+// are one lock taken twice.  The total order holds only while instances are unique
+// within an ordinal: the table's pin is instance 0 and each table numbers its slot
+// serials from 1, so two tables' slots, or two default-constructed mutexes (instance
+// 0), collide and read as one lock taken twice.  The production instance must be
+// process-unique (the zone id for a group mutex, a mem_handle serial for a slot).  The
+// witness cannot tell a collision from one lock taken twice, so its report for an equal
+// ordinal and instance names both readings; there is no registry of live instances.
+// The ordinal order below is the model's reading of
+// §2.10: the spec fixes group mutex < arena authority < g_runtime_alloc_mutex (the
+// existing nesting of every registered zone_alloc), the slot-state lock before the
+// ledger's writer lock, and the retained-store mutex last; it does not place the
+// slot-state lock against the first three, and the model puts it after them
+// (the dispatch-path claim takes it with none of them held).  L7's §12.5 edit
+// writes the real order.
+//
+// The witness counts and remembers violations instead of aborting, so a test can
+// assert on them, and a "no lock held" check reads the same stack.  The stack is
+// a fixed array: the claim path takes locks under the witness and allocates
+// nothing, so the witness must not either.
 // ---------------------------------------------------------------------------
 enum kv_lock_rank : int {
     KV_LOCK_L0_REPLAN     = 0,
@@ -96,25 +117,54 @@ enum kv_lock_rank : int {
     KV_LOCK_L5_SLOT_STATE = 5,
 };
 
+enum kv_l5_ordinal : int {
+    KV_L5_GROUP           = 0,  // an arena group mutex (instance: the zone)
+    KV_L5_ARENA_AUTHORITY = 1,
+    KV_L5_RUNTIME_ALLOC   = 2,  // g_runtime_alloc_mutex
+    KV_L5_SLOT_STATE      = 3,  // the slot table's pin (instance 0) and each slot's spin lock (its serial)
+    KV_L5_LEDGER_WRITER   = 4,  // last but one
+    KV_L5_RETAINED_STORE  = 5,  // last
+};
+
 class kv_lock_witness {
   public:
-    static void acquired(int rank, const char * name) {
-        std::vector<held> & s = stack();
-        for (const held & h : s) {
+    static void acquired(int          rank,
+                         const char * name,
+                         int          ordinal  = 0,
+                         uint64_t     instance = 0,
+                         const void * id       = nullptr) {
+        stack_t & s = stack();
+        for (size_t i = 0; i < s.n; ++i) {
+            const held & h = s.v[i];
             if (h.rank == KV_LOCK_L3_REGISTRY) {
                 violation(std::string("leaf: ") + name + " acquired while holding " + h.name);
-            } else if (h.rank >= rank) {
-                violation(std::string("order: ") + name + " acquired while holding " + h.name);
+            } else if (h.rank > rank || (h.rank == rank && !ascends(h, ordinal, instance))) {
+                std::string what = std::string("order: ") + name + " acquired while holding " + h.name;
+                if (h.rank == rank && h.ordinal == ordinal && h.instance == instance) {
+                    // Equal ordinal and instance: one lock taken twice, or two locks that were
+                    // given the same instance.  The second is a collision, not an order bug.
+                    what += " (equal ordinal and witness instance " + std::to_string(instance) +
+                            ": the same lock twice, or an instance collision)";
+                }
+                violation(what);
             }
         }
-        s.push_back({ rank, name });
+        if (s.n == kCapacity) {
+            violation(std::string("witness stack overflow at ") + name);
+            return;
+        }
+        s.v[s.n++] = { rank, name, ordinal, instance, id };
     }
 
-    static void released(int rank) {
-        std::vector<held> & s = stack();
-        for (size_t i = s.size(); i-- > 0;) {
-            if (s[i].rank == rank) {
-                s.erase(s.begin() + (long) i);
+    // Releases the lock `id` names, or, with no id, the most recent lock of `rank`.
+    static void released(int rank, const void * id = nullptr) {
+        stack_t & s = stack();
+        for (size_t i = s.n; i-- > 0;) {
+            if (id != nullptr ? s.v[i].id == id : s.v[i].rank == rank) {
+                for (size_t j = i + 1; j < s.n; ++j) {
+                    s.v[j - 1] = s.v[j];
+                }
+                --s.n;
                 return;
             }
         }
@@ -122,22 +172,24 @@ class kv_lock_witness {
     }
 
     static bool holds(int rank) {
-        for (const held & h : stack()) {
-            if (h.rank == rank) {
+        const stack_t & s = stack();
+        for (size_t i = 0; i < s.n; ++i) {
+            if (s.v[i].rank == rank) {
                 return true;
             }
         }
         return false;
     }
 
-    static size_t held_count() { return stack().size(); }
+    static size_t held_count() { return stack().n; }
 
     // The locks held other than `rank`: the release proc holds L0 to its end, so
     // its "no lock held" checks (a drop, the retain call) read this.
     static size_t held_count_besides(int rank) {
-        size_t n = 0;
-        for (const held & h : stack()) {
-            n += h.rank != rank ? 1 : 0;
+        const stack_t & s = stack();
+        size_t          n = 0;
+        for (size_t i = 0; i < s.n; ++i) {
+            n += s.v[i].rank != rank ? 1 : 0;
         }
         return n;
     }
@@ -168,10 +220,25 @@ class kv_lock_witness {
     struct held {
         int          rank;
         const char * name;
+        int          ordinal;
+        uint64_t     instance;
+        const void * id;
     };
 
-    static std::vector<held> & stack() {
-        thread_local std::vector<held> s;
+    static constexpr size_t kCapacity = 32;
+
+    struct stack_t {
+        held   v[kCapacity];
+        size_t n = 0;
+    };
+
+    // Whether a lock of this ordinal and instance may be taken under `h`, both L5.
+    static bool ascends(const held & h, int ordinal, uint64_t instance) {
+        return h.ordinal < ordinal || (h.ordinal == ordinal && h.instance < instance);
+    }
+
+    static stack_t & stack() {
+        thread_local stack_t s;
         return s;
     }
 
@@ -194,7 +261,11 @@ class kv_lock_witness {
 // A mutex that reports to the witness, and counts its lock and unlock calls.
 class kv_witnessed_mutex {
   public:
-    kv_witnessed_mutex(int rank, const char * name) : rank_(rank), name_(name) {}
+    kv_witnessed_mutex(int rank, const char * name, int ordinal = KV_L5_GROUP, uint64_t instance = 0) :
+        rank_(rank),
+        name_(name),
+        ordinal_(ordinal),
+        instance_(instance) {}
 
     void lock() {
         if (fail_next_.exchange(false)) {
@@ -202,7 +273,7 @@ class kv_witnessed_mutex {
             // must name the failure and abort rather than propagate (r4 m14).
             throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
         }
-        kv_lock_witness::acquired(rank_, name_);
+        kv_lock_witness::acquired(rank_, name_, ordinal_, instance_, this);
         m_.lock();
         locks_.fetch_add(1);
     }
@@ -211,7 +282,7 @@ class kv_witnessed_mutex {
         if (!m_.try_lock()) {
             return false;
         }
-        kv_lock_witness::acquired(rank_, name_);
+        kv_lock_witness::acquired(rank_, name_, ordinal_, instance_, this);
         locks_.fetch_add(1);
         return true;
     }
@@ -219,7 +290,7 @@ class kv_witnessed_mutex {
     void unlock() {
         unlocks_.fetch_add(1);
         m_.unlock();
-        kv_lock_witness::released(rank_);
+        kv_lock_witness::released(rank_, this);
     }
 
     size_t lock_count() const { return locks_.load(); }
@@ -233,10 +304,79 @@ class kv_witnessed_mutex {
   private:
     int                 rank_;
     const char *        name_;
+    int                 ordinal_;
+    uint64_t            instance_;
     std::mutex          m_;
     std::atomic<size_t> locks_{ 0 };
     std::atomic<size_t> unlocks_{ 0 };
     std::atomic<bool>   fail_next_{ false };
+};
+
+// A reader/writer lock under the same witness: the slot table's pin.  The claim
+// path holds it shared only to keep the table's structure still (the contract's
+// published table is never mutated in place and each context holds a shared_ptr to
+// it; the model mutates it, so the pin stands for that immutability).  Structural
+// operations take it exclusive.  Nothing is dropped or called back under it.
+class kv_witnessed_shared_mutex {
+  public:
+    kv_witnessed_shared_mutex(int rank, const char * name, int ordinal, uint64_t instance) :
+        rank_(rank),
+        name_(name),
+        ordinal_(ordinal),
+        instance_(instance) {}
+
+    void lock() {
+        kv_lock_witness::acquired(rank_, name_, ordinal_, instance_, this);
+        m_.lock();
+    }
+
+    void unlock() {
+        m_.unlock();
+        kv_lock_witness::released(rank_, this);
+    }
+
+    void lock_shared() {
+        kv_lock_witness::acquired(rank_, name_, ordinal_, instance_, this);
+        m_.lock_shared();
+    }
+
+    void unlock_shared() {
+        m_.unlock_shared();
+        kv_lock_witness::released(rank_, this);
+    }
+
+  private:
+    int               rank_;
+    const char *      name_;
+    int               ordinal_;
+    uint64_t          instance_;
+    std::shared_mutex m_;
+};
+
+// A slot's leaf spin lock (§2.3.2, the `mem_handle_spin_lock` class).  It guards
+// the slot's generation, its last release event and its retention.  Nothing
+// allocates and nothing logs under it: the witness stack is a fixed array, and a
+// claim copies the event out and unlocks.  The instance is the slot's serial, so
+// two slots' locks, were they ever co-held, would have to ascend.
+class kv_slot_spin_lock {
+  public:
+    explicit kv_slot_spin_lock(uint64_t serial) : serial_(serial) {}
+
+    void lock() {
+        kv_lock_witness::acquired(KV_LOCK_L5_SLOT_STATE, "slot spin lock", KV_L5_SLOT_STATE, serial_, this);
+        while (flag_.test_and_set(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }
+
+    void unlock() {
+        flag_.clear(std::memory_order_release);
+        kv_lock_witness::released(KV_LOCK_L5_SLOT_STATE, this);
+    }
+
+  private:
+    uint64_t         serial_;
+    std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
 };
 
 // L0, the process-global re-plan mutex (rulings §E.2, §L0R).  An outermost-only
@@ -333,12 +473,28 @@ class kv_replan_scope {
 // handle, its cap and its claim state.  One shared_ptr per published region; each
 // backend context caches it for claims.  A claim is a slice lease: it changes
 // nothing in the zone, it only checks the size against the cap and marks the slot.
+//
+// A claim is on the dispatch path.  It takes the table's pin shared and the one
+// slot's spin lock, allocates nothing and logs nothing, and hands back a
+// generation token with the slot's last release event, which the claimant chains
+// its work on.  Only the claim that holds the live token can release the slot: the
+// registry's release is keyed by (cohort, index) alone, so without the token a
+// stale holder's late release would silently free a later claim's slot.
 // ---------------------------------------------------------------------------
 enum class kv_claim_result : uint8_t {
     OK,
     NO_SLOT,          // the plan reserved no slot at (cohort, index)
     OVER_PLAN,        // size above the slot's cap
     ALREADY_CLAIMED,  // a previous claim is still live
+};
+
+// What a claim returns.  `generation` is non-zero exactly when `result` is OK and is
+// unique across the table's life (a replaced slot's tokens never match its
+// successor); `wait_event` is the event of the slot's last release, 0 for none.
+struct kv_claim {
+    kv_claim_result result     = kv_claim_result::NO_SLOT;
+    uint64_t        generation = 0;
+    uint64_t        wait_event = 0;
 };
 
 // The slot-state retention of one ring row's last generation: the owner handle
@@ -361,52 +517,70 @@ class kv_tenant_slots {
                                         uint32_t            index,
                                         kv_region_handle    handle,
                                         size_t              cap) {
-        slot replaced;
+        std::unique_ptr<slot> replaced;
+        kv_slot_retention     retention;
         {
-            std::lock_guard<kv_witnessed_mutex> g(mu_);
-            slot &                              s = slots_[{ cohort, index }];
-            replaced                              = std::move(s);
-            s                                     = slot();
-            s.handle                              = std::move(handle);
-            s.cap                                 = cap;
+            std::lock_guard<kv_witnessed_shared_mutex> g(pin_);
+            std::unique_ptr<slot> &                    s = slots_[slot_key{ cohort, index }];
+            replaced                                     = std::move(s);
+            if (replaced) {
+                retention = std::move(replaced->retention);
+            }
+            s         = std::make_unique<slot>(next_serial_++);
+            s->handle = std::move(handle);
+            s->cap    = cap;
         }
-        return std::move(replaced.retention);  // replaced.handle drops here, after the unlock
+        return retention;  // `replaced` and its handle drop here, after the unlock
     }
 
-    kv_claim_result claim(const std::string & cohort, uint32_t index, size_t size) {
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
-        auto                                it = slots_.find({ cohort, index });
+    kv_claim claim(const std::string & cohort, uint32_t index, size_t size) {
+        std::shared_lock<kv_witnessed_shared_mutex> pin(pin_);
+        auto                                        it = slots_.find(slot_key_view{ cohort, index });
         if (it == slots_.end()) {
-            return kv_claim_result::NO_SLOT;
+            return { kv_claim_result::NO_SLOT, 0, 0 };
         }
-        if (size > it->second.cap) {
-            return kv_claim_result::OVER_PLAN;
+        slot & s = *it->second;
+        if (size > s.cap) {
+            return { kv_claim_result::OVER_PLAN, 0, 0 };
         }
-        if (it->second.claimed) {
-            return kv_claim_result::ALREADY_CLAIMED;
+        std::lock_guard<kv_slot_spin_lock> g(s.spin);
+        if (s.claimed.load()) {
+            return { kv_claim_result::ALREADY_CLAIMED, 0, 0 };
         }
-        it->second.claimed = true;
-        return kv_claim_result::OK;
+        s.claimed.store(true);
+        s.generation = next_generation_.fetch_add(1);
+        return { kv_claim_result::OK, s.generation, s.last_event };
     }
 
-    void release_claim(const std::string & cohort, uint32_t index) {
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
-        auto                                it = slots_.find({ cohort, index });
-        if (it != slots_.end()) {
-            it->second.claimed = false;
+    // Release the claim `generation` names, recording `release_event` for the next claim to
+    // chain on.  A token that is not the live claim's (a stale holder, a replaced slot, a
+    // second release) releases nothing and returns false.
+    bool release_claim(const std::string & cohort, uint32_t index, uint64_t generation, uint64_t release_event = 0) {
+        std::shared_lock<kv_witnessed_shared_mutex> pin(pin_);
+        auto                                        it = slots_.find(slot_key_view{ cohort, index });
+        if (it == slots_.end()) {
+            return false;
         }
+        slot &                             s = *it->second;
+        std::lock_guard<kv_slot_spin_lock> g(s.spin);
+        if (!s.claimed.load() || s.generation != generation) {
+            return false;
+        }
+        s.last_event = release_event;
+        s.claimed.store(false);
+        return true;
     }
 
     bool claimed(const std::string & cohort, uint32_t index) const {
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
-        auto                                it = slots_.find({ cohort, index });
-        return it != slots_.end() && it->second.claimed;
+        std::shared_lock<kv_witnessed_shared_mutex> pin(pin_);
+        auto                                        it = slots_.find(slot_key_view{ cohort, index });
+        return it != slots_.end() && it->second->claimed.load();
     }
 
     bool any_claimed() const {
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
+        std::shared_lock<kv_witnessed_shared_mutex> pin(pin_);
         for (const auto & s : slots_) {
-            if (s.second.claimed) {
+            if (s.second->claimed.load()) {
                 return true;
             }
         }
@@ -414,16 +588,16 @@ class kv_tenant_slots {
     }
 
     size_t cap(const std::string & cohort, uint32_t index) const {
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
-        auto                                it = slots_.find({ cohort, index });
-        return it == slots_.end() ? 0 : it->second.cap;
+        std::shared_lock<kv_witnessed_shared_mutex> pin(pin_);
+        auto                                        it = slots_.find(slot_key_view{ cohort, index });
+        return it == slots_.end() ? 0 : it->second->cap;
     }
 
     // The slot's handle, copied out (a refcount increment, never a final drop).
     kv_region_handle handle(const std::string & cohort, uint32_t index) const {
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
-        auto                                it = slots_.find({ cohort, index });
-        return it == slots_.end() ? nullptr : it->second.handle;
+        std::shared_lock<kv_witnessed_shared_mutex> pin(pin_);
+        auto                                        it = slots_.find(slot_key_view{ cohort, index });
+        return it == slots_.end() ? nullptr : it->second->handle;
     }
 
     // Record the row's retention for the generation just recorded and return the
@@ -431,26 +605,29 @@ class kv_tenant_slots {
     // retain_handles_until_event(previous.done_event) before the new record is
     // used, and never drops it under the lock.  A row with no slot keeps nothing.
     kv_slot_retention exchange_retention(const std::string & cohort, uint32_t index, kv_slot_retention next) {
-        kv_slot_retention                   previous;
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
-        auto                                it = slots_.find({ cohort, index });
+        kv_slot_retention                           previous;
+        std::shared_lock<kv_witnessed_shared_mutex> pin(pin_);
+        auto                                        it = slots_.find(slot_key_view{ cohort, index });
         if (it == slots_.end()) {
             return previous;
         }
-        previous             = std::move(it->second.retention);
-        it->second.retention = std::move(next);
-        return previous;  // NRVO'd out: the caller's drop is after the guard's unlock
+        slot &                             s = *it->second;
+        std::lock_guard<kv_slot_spin_lock> g(s.spin);
+        previous    = std::move(s.retention);
+        s.retention = std::move(next);
+        return previous;  // NRVO'd out: the caller's drop is after the guards' unlock
     }
 
     // The release proc's step 2: move out every row's slot-state retention, for
     // the caller to hand to retain_handles_until_event with no lock held.  The
     // slots themselves stay: they drop with the entry's batch.
     void take_retentions(std::vector<kv_slot_retention> & out) {
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
+        std::shared_lock<kv_witnessed_shared_mutex> pin(pin_);
         for (auto & s : slots_) {
-            if (s.second.retention.owner) {
-                out.push_back(std::move(s.second.retention));
-                s.second.retention = kv_slot_retention();
+            std::lock_guard<kv_slot_spin_lock> g(s.second->spin);
+            if (s.second->retention.owner) {
+                out.push_back(std::move(s.second->retention));
+                s.second->retention = kv_slot_retention();
             }
         }
     }
@@ -459,37 +636,80 @@ class kv_tenant_slots {
     // (the tenant-only path's step (i)).  Returns false and moves nothing when a
     // slot is still claimed: that is a [CONTEXT-PLAN-BUG] for the caller.
     bool take_unclaimed(std::vector<kv_region_handle> & out) {
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
+        std::lock_guard<kv_witnessed_shared_mutex> g(pin_);
         for (const auto & s : slots_) {
-            if (s.second.claimed) {
+            if (s.second->claimed.load()) {
                 return false;
             }
         }
         for (auto & s : slots_) {
-            out.push_back(std::move(s.second.handle));
+            out.push_back(std::move(s.second->handle));
         }
         slots_.clear();
         return true;
     }
 
     size_t size() const {
-        std::lock_guard<kv_witnessed_mutex> g(mu_);
+        std::shared_lock<kv_witnessed_shared_mutex> pin(pin_);
         return slots_.size();
     }
 
   private:
+    struct slot_key {
+        std::string cohort;
+        uint32_t    index;
+    };
+
+    // A lookup key that borrows the caller's string, so a claim copies none.
+    struct slot_key_view {
+        const std::string & cohort;
+        uint32_t            index;
+    };
+
+    struct slot_key_less {
+        using is_transparent = void;
+
+        bool operator()(const slot_key & a, const slot_key & b) const {
+            return less(a.cohort, a.index, b.cohort, b.index);
+        }
+
+        bool operator()(const slot_key & a, const slot_key_view & b) const {
+            return less(a.cohort, a.index, b.cohort, b.index);
+        }
+
+        bool operator()(const slot_key_view & a, const slot_key & b) const {
+            return less(a.cohort, a.index, b.cohort, b.index);
+        }
+
+      private:
+        static bool less(const std::string & ca, uint32_t ia, const std::string & cb, uint32_t ib) {
+            const int c = ca.compare(cb);
+            return c < 0 || (c == 0 && ia < ib);
+        }
+    };
+
     struct slot {
-        kv_region_handle  handle;
-        size_t            cap     = 0;
-        bool              claimed = false;
+        explicit slot(uint64_t serial) : spin(serial) {}
+
+        kv_region_handle  handle;            // guarded by the pin (exclusive to write)
+        size_t            cap = 0;           // likewise
+        std::atomic<bool> claimed{ false };  // written under `spin`, read without it
+        kv_slot_spin_lock spin;              // guards the three fields below
+        uint64_t          generation = 0;    // the live claim's token
+        // TWO events, supplied by two different calls, and the registry never assumes they are
+        // the same.  `last_event` is the event the RELEASING caller passes to release_claim():
+        // what the next claimant chains on (claim() returns it as wait_event).
+        // `retention.done_event` is the event the RECORDING caller passes with the retained
+        // owner (exchange_retention()): it fences the drop of that owner.  A caller may pass
+        // one event to both, and the production ring does; nothing here depends on it.
+        uint64_t          last_event = 0;
         kv_slot_retention retention;
     };
 
-    // One table-wide mutex.  The contract's claim path is a per-slot leaf spin
-    // lock; the rank (L5) and the "move out under the lock, drop after it" rule are
-    // the same, and the model has no concurrent-claim arm that needs the finer lock.
-    mutable kv_witnessed_mutex                       mu_{ KV_LOCK_L5_SLOT_STATE, "slot-state lock" };
-    std::map<std::pair<std::string, uint32_t>, slot> slots_;
+    mutable kv_witnessed_shared_mutex pin_{ KV_LOCK_L5_SLOT_STATE, "slot table pin", KV_L5_SLOT_STATE, 0 };
+    std::map<slot_key, std::unique_ptr<slot>, slot_key_less> slots_;
+    uint64_t                                                 next_serial_ = 1;  // guarded by the pin, exclusive
+    std::atomic<uint64_t>                                    next_generation_{ 1 };
 };
 
 // ---------------------------------------------------------------------------

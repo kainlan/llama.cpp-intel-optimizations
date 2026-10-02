@@ -1518,6 +1518,21 @@ std::shared_ptr<const placement_plan> coherent_cache_placement_plan_owner(const 
 placement_cache_read                  cache_placement_coherence(const unified_cache * cache) noexcept;
 uint64_t                              lifecycle_next_plan_publication_id() noexcept;
 
+// The one builder of a candidate-shaped snapshot (model_id 0, the load's transaction,
+// version 0).  Staging calls it and stores the result; the load-time measure's plan
+// override calls it and never stores.
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_make_candidate_snapshot(uint64_t                  load_txn_id,
+                                                                                 placement_plan            plan,
+                                                                                 const placement_kv_info & kv_info = {},
+                                                                                 uint32_t model_n_layer            = 0);
+// The (a)-stage probe placement's plan for a load: the plan the pack would emit if it demoted nothing, owned
+// by the load until aborted, and read by no one outside the measure.
+void                                           lifecycle_stage_probe_placement_plan(uint64_t                  load_txn_id,
+                                                                                    placement_plan            plan,
+                                                                                    const placement_kv_info & kv_info = {},
+                                                                                    uint32_t                  model_n_layer = 0);
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_probe_placement_plan(uint64_t load_txn_id) noexcept;
+void                                           lifecycle_abort_probe_placement_plan(uint64_t load_txn_id) noexcept;
 void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
                                     placement_plan            plan,
                                     const placement_kv_info & kv_info       = {},
@@ -3443,6 +3458,22 @@ class unified_cache {
     std::shared_ptr<const lifecycle_plan_snapshot> get_placement_plan_snapshot() const {
         return std::atomic_load_explicit(&placement_plan_snapshot_, std::memory_order_acquire);
     }
+
+    // A hint in front of the locked republish-into-empty: the key of the owning
+    // load, bound to the plan publication epoch, for which a locked pass found this
+    // cache is not one of the plan's devices (0: none).  It only lets a later call for
+    // the same owner skip the inventory lock; the locked pass stays the authority, a
+    // different owner never matches, and any later publication changes the epoch, so a
+    // re-plan that adds this device cannot be hidden by it.  Written under
+    // g_tensor_inventory_mutex.
+    uint64_t into_empty_skip_key() const { return into_empty_skip_key_.load(std::memory_order_acquire); }
+
+    void set_into_empty_skip_key(uint64_t key) { into_empty_skip_key_.store(key, std::memory_order_release); }
+
+    // The owner a foreign-plan notice was last logged for, so it prints once per owner.
+    uint64_t into_empty_foreign_key() const { return into_empty_foreign_key_.load(std::memory_order_acquire); }
+
+    void set_into_empty_foreign_key(uint64_t key) { into_empty_foreign_key_.store(key, std::memory_order_release); }
 
     // Access the internal SYCL queue (for deferred free of temp allocations
     // made on this queue's context, e.g. GPU-side reorder temp buffers).
@@ -5471,6 +5502,8 @@ class unified_cache {
 
     // === Placement Plan (P4) ===
     mutable std::shared_ptr<const lifecycle_plan_snapshot> placement_plan_snapshot_;
+    std::atomic<uint64_t>                                  into_empty_skip_key_{ 0 };
+    std::atomic<uint64_t>                                  into_empty_foreign_key_{ 0 };
     std::atomic<int>                                       planned_materialization_depth_{ 0 };
 
     bool planned_materialization_allowed(const char *                 op,
@@ -5919,7 +5952,13 @@ class alloc_owner_control final {
     uint32_t use_count() const noexcept { return refs_.load(std::memory_order_acquire); }
     // Minted once per control from a process-wide counter: never 0, never
     // reused, so it cannot name a later control at a recycled address.
-    uint64_t control_id() const noexcept { return control_id_; }
+    uint64_t                 control_id() const noexcept { return control_id_; }
+
+    // The context-tenant cohort this allocation was tagged with by the carve
+    // (null: not a tenant).  Set once, by alloc_owner::set_tenant_cohort, which
+    // aborts on a second set; written before the owner is shared and read
+    // thereafter.
+    const char * tenant_cohort() const noexcept { return tenant_cohort_.load(std::memory_order_acquire); }
 
   private:
     friend class alloc_owner;
@@ -5937,6 +5976,7 @@ class alloc_owner_control final {
     void abandon() noexcept;
 
     std::atomic<uint32_t> refs_{ 1 };
+    std::atomic<const char *>                       tenant_cohort_{ nullptr };
     uint64_t control_id_ = 0;
     alloc_metadata metadata_{};
     allocation_control_class ownership_class_ = allocation_control_class::EXTERNAL_EXACT;
@@ -6401,6 +6441,121 @@ void                   offload_stats_note_host_fallback_attempt(size_t bytes);
 offload_stats_snapshot offload_stats_get();
 void                   offload_stats_log_summary(const char * tag, int device);
 void                   zero_alloc_check(const char * tag, int device);
+
+// ---------------------------------------------------------------------------
+// L0, the process-global re-plan transaction mutex, and the always-compiled
+// witness (llama.cpp-moua's L0 token, defined in this file's companion unified-cache.cpp).
+//
+// Declared here, beside offload_stats_phase(), because pinned-pool.cpp sits
+// below ggml-sycl.cpp in the layering and reaches this header through
+// common.hpp.  Defined in unified-cache.cpp, together with g_replan_txn_mutex
+// and the thread-local held state.  The token's constructor and destructor are
+// the only writers of that state: there is no setter and no hook, so nothing can
+// mark a thread as holding L0 without locking it.
+// ---------------------------------------------------------------------------
+
+// The outermost token's kind.  ANY is a query value only: an acquire names a
+// concrete kind.  The pool phase gates ask for TRANSACTION, the preload's check
+// asks for LOAD, and a caller that only needs to know whether L0 is held asks ANY.
+enum ggml_sycl_replan_kind : int {
+    GGML_SYCL_REPLAN_KIND_ANY         = 0,
+    GGML_SYCL_REPLAN_KIND_TRANSACTION = 1,  // a context's own planned transaction
+    GGML_SYCL_REPLAN_KIND_LOAD        = 2,  // load_begin, stage_inventory_plan, load_end
+    GGML_SYCL_REPLAN_KIND_LIFECYCLE   = 3,  // every other holder
+};
+
+const char * ggml_sycl_replan_kind_name(ggml_sycl_replan_kind kind);
+
+// True when this thread holds L0 and, unless `kind` is ANY, the OUTERMOST token
+// has that kind.  The one accessor: no second flag exists.
+bool ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind = GGML_SYCL_REPLAN_KIND_ANY);
+
+struct ggml_sycl_replan_outermost_only_t {
+    explicit ggml_sycl_replan_outermost_only_t() = default;
+};
+
+constexpr ggml_sycl_replan_outermost_only_t ggml_sycl_replan_outermost_only{};
+
+// RAII holder of L0.  An acquire on a thread that already holds L0 is a nested
+// hold: it does not lock and never changes the outermost kind.  An acquire on
+// another thread blocks.  The outermost token unlocks.
+class ggml_sycl_replan_token {
+  public:
+    // Blocking form.
+    explicit ggml_sycl_replan_token(ggml_sycl_replan_kind kind);
+    // Try-lock form (can_unload): owns() is false, and nothing was changed, when
+    // another thread holds L0.
+    ggml_sycl_replan_token(ggml_sycl_replan_kind kind, std::try_to_lock_t);
+    // Outermost-only form (the teardown release proc): entered with L0 already
+    // held on this thread it fails the witness `[REPLAN-TOKEN] release proc
+    // entered with L0 held`, where a nested acquire would not deadlock.
+    ggml_sycl_replan_token(ggml_sycl_replan_kind kind, ggml_sycl_replan_outermost_only_t);
+
+    ~ggml_sycl_replan_token();
+
+    ggml_sycl_replan_token(const ggml_sycl_replan_token &)             = delete;
+    ggml_sycl_replan_token & operator=(const ggml_sycl_replan_token &) = delete;
+
+    bool owns() const { return owns_; }
+
+  private:
+    void acquire(ggml_sycl_replan_kind kind, bool try_only);
+
+    bool owns_ = false;
+};
+
+// A watchdog for a wait that has no timeout of its own (a queue wait, the L0
+// acquire).  It never abandons or forces anything: after the interval it logs a
+// WARN naming the wait now in progress, and again each further interval, while
+// the wait itself carries on; under GGML_SYCL_STRICT_LEASES=1 it aborts at the first
+// interval instead.  The interval is 60 s, or GGML_SYCL_REPLAN_WAIT_WARN_MS.
+// site() names the wait that follows (a string literal, or storage that outlives
+// the watch).  One watch covers a whole sequence of waits, so a rare path pays
+// for one thread, not one per wait.
+uint32_t ggml_sycl_replan_wait_warn_ms();
+
+class ggml_sycl_wait_watch {
+  public:
+    explicit ggml_sycl_wait_watch(const char * what);
+    ~ggml_sycl_wait_watch();
+
+    ggml_sycl_wait_watch(const ggml_sycl_wait_watch &)             = delete;
+    ggml_sycl_wait_watch & operator=(const ggml_sycl_wait_watch &) = delete;
+
+    void site(const char * where) { site_.store(where, std::memory_order_release); }
+
+    // How many warnings have been logged: a test reads it.
+    uint32_t warnings() const { return warnings_.load(std::memory_order_acquire); }
+
+  private:
+    const char *              what_;
+    std::atomic<const char *> site_{ "" };
+    std::atomic<uint32_t>     warnings_{ 0 };
+    std::mutex                mutex_;
+    std::condition_variable   cv_;
+    bool                      done_ = false;
+    std::thread               thread_;
+};
+
+// GGML_SYCL_WITNESS(cond, message): a check that is compiled in every build and
+// does not depend on NDEBUG (the tests build Release, where an assert compiles
+// out and a test that relies on one passes on the mutant it exists to catch).
+// It is evaluated in a GGML_SYCL_PRIVATE_TESTING build unless the environment
+// sets GGML_SYCL_WITNESS_CHECKS=0, and in any other build only when it sets
+// GGML_SYCL_WITNESS_CHECKS=1.  A failure aborts with `message`, so a death arm
+// scores by message.  The switch is a namespace-scope const bool initialised
+// once at library load and tested before `cond` is evaluated: a disabled check
+// is one plain load and one predictable branch.
+extern const bool g_sycl_witness_enabled;
+
+[[noreturn]] void ggml_sycl_witness_failed(const char * message);
+
+#define GGML_SYCL_WITNESS(cond, message)                      \
+    do {                                                      \
+        if (::ggml_sycl::g_sycl_witness_enabled && !(cond)) { \
+            ::ggml_sycl::ggml_sycl_witness_failed(message);   \
+        }                                                     \
+    } while (0)
 
 bool arena_pp_profile_enabled();
 bool arena_pp_profile_active();
@@ -7511,6 +7666,14 @@ ggml_sycl_arena_backing_type ggml_sycl_arena_backing(int device);
 // The device's zones have backing and zone routing applies. Never creates a
 // cache: a device with none has no zones.
 bool ggml_sycl_device_has_zones(int device);
+
+// The device's compute-arena size: the one source for what the model load
+// reserves in the SCRATCH zone and for what the load-time probe (stage (a))
+// sizes the compute chunks against.  512 MB, or GGML_SYCL_COMPUTE_ARENA_MB
+// (0 turns the reservation off).  A second reader of that variable is a second
+// source for one fact; gate 36 pins that there is none.  moua's accessor of this
+// name replaces this definition.
+size_t ggml_sycl_compute_arena_bytes(int device);
 
 // (ExpertPlacementTable removed — the cache IS the placement.
 //  Use is_expert_resident() / get_expert_device_ptr() for residency,

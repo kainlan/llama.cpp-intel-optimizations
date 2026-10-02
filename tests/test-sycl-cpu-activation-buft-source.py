@@ -54,6 +54,9 @@ PLAN_HELPER = "ggml_sycl_plan_cpu_work_reason"
 CTX_PRED = "llama_context_sycl_plan_has_cpu_work"
 CTX_SELECT = "llama_context_cpu_compute_buft"
 NEW_CALL = "ggml_backend_sched_new(backend_ptrs"
+# The re-selection is one helper over (model, backends, bufts); the allocating and the measuring reserve both
+# call it right before they build their scheduler, so a MEASURE plans against the buft its ALLOC will use.
+RESELECT = "llama_context_cpu_compute_buft_reselect"
 
 
 def function_window(source: str, signature_anchor: str, window: int = 12000) -> str:
@@ -108,7 +111,12 @@ texts = {
         ctx_cpp, "static ggml_backend_buffer_type_t " + CTX_SELECT + "(", window=4000),
     "ctx_pred_fn": function_window(
         ctx_cpp, "static bool " + CTX_PRED + "(ggml_backend_dev_t dev) {", window=3000),
-    "sched_reserve_fn": function_window(ctx_cpp, "void llama_context::sched_reserve() {", window=40000),
+    "sched_reserve_fn": function_window(
+        ctx_cpp, "sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, sched_reserve_state & state) {",
+        window=40000),
+    "sched_measure_fn": function_window(
+        ctx_cpp, "sched_reserve_result llama_context::sched_measure_impl(sched_reserve_state & state) {", window=40000),
+    "reselect_fn": function_window(ctx_cpp, "static void " + RESELECT + "(", window=3000),
 }
 
 
@@ -258,16 +266,22 @@ def witness_vii(t):
 def check_viii_selection_is_gated(t):
     fn = t["ctx_select_fn"]
     sched = t["sched_reserve_fn"]
-    if not fn or not sched:
+    meas = t["sched_measure_fn"]
+    resel = t["reselect_fn"]
+    if not fn or not sched or not meas or not resel:
         return False
     gate = fn.split("llama_context_sycl_cpu_activation_buft(", 1)[0]
     new_idx = sched.find("ggml_backend_sched_new(")
-    sel_idx = sched.find(CTX_SELECT + "(")
+    sel_idx = sched.find(RESELECT + "(")
+    mnew_idx = meas.find("ggml_backend_sched_new(")
+    msel_idx = meas.find(RESELECT + "(")
     return (CTX_PRED + "(" in gate
             and "n_gpu_layers()" in gate
             and "n_layer_all" in gate
             and "||" in gate
-            and 0 <= sel_idx < new_idx)
+            and CTX_SELECT + "(" in resel
+            and 0 <= sel_idx < new_idx
+            and 0 <= msel_idx < mnew_idx)
 
 
 def witness_viii_gate(t):
@@ -276,7 +290,7 @@ def witness_viii_gate(t):
 
 
 def witness_viii_order(t):
-    t["sched_reserve_fn"] = t["sched_reserve_fn"].replace(CTX_SELECT + "(", "unrelated(")
+    t["sched_reserve_fn"] = t["sched_reserve_fn"].replace(RESELECT + "(", "unrelated(")
     return t
 
 
@@ -290,16 +304,21 @@ def check_ix_selection_follows_last_plan_mutation(t):
     ctx = t["ctx_cpp"]
     if not sched:
         return False
-    sel = sched.find(CTX_SELECT + "(")
+    meas = t["sched_measure_fn"]
+    sel = sched.find(RESELECT + "(")
     new = sched.find(NEW_CALL)
     between = sched[sel:new] if 0 <= sel < new else None
-    recheck = sched.find("\n    resolve_fused_ops(mctx")
+    msel = meas.find(RESELECT + "(")
+    mnew = meas.find(NEW_CALL)
+    mbetween = meas[msel:mnew] if 0 <= msel < mnew else None
+    recheck = sched.find("\n    resolve_fused_ops(state, mctx.get(), n_seqs);")
     mutators = ("sycl_resync_runtime_context_flash_attn(", "ggml_backend_sycl_set_runtime_context",
                 "set_runtime_context_for_model")
     return (between is not None
-            and not any(m in between for m in mutators)
+            and mbetween is not None
+            and not any(m in between or m in mbetween for m in mutators)
             and sched.count(NEW_CALL) >= 1
-            and ctx.count(NEW_CALL) == sched.count(NEW_CALL)
+            and ctx.count(NEW_CALL) == sched.count(NEW_CALL) + meas.count(NEW_CALL)
             and recheck > new)
 
 

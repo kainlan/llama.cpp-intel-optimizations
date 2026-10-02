@@ -4029,6 +4029,13 @@ struct ggml_tensor_extra_gpu {
     // review c-z4cf #10).
     uint64_t alloc_generation = 0;
 
+    // Set when the backend minted this extra for a root that had none
+    // (ensure_root_extra), so the root lies outside every SYCL device buffer and
+    // the extra is released only with its backend context.  The persistent
+    // publishers must never leave a tenant-tagged handle in one, which would
+    // outlive its graph.
+    bool runtime_minted = false;
+
     // llama.cpp-asdt (plan task L2b, jemalloc-profile bug fix): set once, at
     // creation, by tiered_kv_buffer_init_tensor's view branch. Lets
     // release_extra_gpu() attribute an actual deletion to the KV-view live
@@ -4616,6 +4623,61 @@ inline void ggml_sycl_refresh_cached_input_ptr(void * dst, const void * src, siz
 // Defined in ggml-sycl.cpp to avoid inlining a 100-line function.
 void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device);
 
+// Bytes a graph prestage copies to `device` for `tensor`, or 0 when it makes no
+// copy: weights, control-vector storage, device USM, INPUT tensors (their own
+// stable staging) and anything in the KV-host buft count 0. `src_buft` is the
+// buffer type the tensor lives in. The prestage and the resolver counter below
+// both read this one predicate.
+size_t ggml_sycl_prestage_needs_device_copy(const ggml_tensor *        tensor,
+                                            ggml_backend_buffer_type_t src_buft,
+                                            int                        device);
+
+// Depth of device-graph dispatch on this thread. A resolver return is only a
+// zero-copy read of a staged source while a device kernel is being dispatched.
+extern thread_local int g_ggml_sycl_device_dispatch_depth;
+
+// Opened at the entry of ggml_backend_sycl_graph_compute_unchecked, so every
+// device kernel that call dispatches runs inside it.
+struct ggml_sycl_device_dispatch_region {
+    ggml_sycl_device_dispatch_region() { ++g_ggml_sycl_device_dispatch_depth; }
+
+    ~ggml_sycl_device_dispatch_region() { --g_ggml_sycl_device_dispatch_depth; }
+
+    ggml_sycl_device_dispatch_region(const ggml_sycl_device_dispatch_region &)             = delete;
+    ggml_sycl_device_dispatch_region & operator=(const ggml_sycl_device_dispatch_region &) = delete;
+};
+
+// Closes the device-dispatch region for its scope. A host executor resolves the
+// pointers of tensors it reads and writes itself on the dispatching thread;
+// those resolutions are not device kernels reading a staged source.
+struct ggml_sycl_host_executor_region {
+    ggml_sycl_host_executor_region() : saved_depth(g_ggml_sycl_device_dispatch_depth) {
+        g_ggml_sycl_device_dispatch_depth = 0;
+    }
+
+    ~ggml_sycl_host_executor_region() { g_ggml_sycl_device_dispatch_depth = saved_depth; }
+
+    ggml_sycl_host_executor_region(const ggml_sycl_host_executor_region &)             = delete;
+    ggml_sycl_host_executor_region & operator=(const ggml_sycl_host_executor_region &) = delete;
+
+  private:
+    const int saved_depth;
+};
+
+// Called from a resolver branch that is about to hand a HOST_PINNED/SHARED
+// pointer to a device kernel. Counts the resolution, in the bucket of the
+// current offload phase, when the calling thread is inside the device-dispatch
+// region and `tensor`, or the root it views, is a source the prestage copies.
+// The branches that call it are the host-returning ones of the inline resolver,
+// the slow resolver (its per-graph cache hit included) and the persistent
+// builder's get_tensor_ptr_fast. A pointer taken from an extra's data_device
+// or the tiered cache is not examined, so the count is a lower bound.
+void ggml_sycl_resolver_count_host_return(const ggml_tensor * tensor, int device);
+
+// The count `ggml_sycl_resolver_count_host_return` accumulated in the bucket
+// `phase` falls in: PP, TG, or every other phase.
+uint64_t ggml_sycl_resolver_host_returns_to_device(ggml_sycl::offload_phase phase);
+
 inline bool ggml_sycl_checked_size_add(size_t a, size_t b, size_t & out) {
     if (b > SIZE_MAX - a) return false;
     out = a + b;
@@ -4808,6 +4870,9 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
                 auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
                 extra->set_data_device(device, ptr, GGML_LAYOUT_AOS, base_on_device);
             }
+            if (!base_on_device) {
+                ggml_sycl_resolver_count_host_return(tensor, device);
+            }
             return ptr;
         }
         return ggml_sycl_get_data_ptr_slow(tensor, device);
@@ -4837,6 +4902,9 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
         const auto * info = ggml_sycl::alloc_registry::instance().lookup(tensor->data);
         if (info && ((info->type == ggml_sycl::alloc_type::DEVICE && info->device_id == device) ||
                      info->type == ggml_sycl::alloc_type::HOST_PINNED || info->type == ggml_sycl::alloc_type::SHARED)) {
+            if (info->type != ggml_sycl::alloc_type::DEVICE) {
+                ggml_sycl_resolver_count_host_return(tensor, device);
+            }
             return tensor->data;
         }
     }
@@ -5841,15 +5909,18 @@ struct ggml_backend_sycl_context {
         }
     };
 
+    // The key names its source by a non-owning mem_handle_identity, never by a
+    // mem_handle: the cache compares a source and never dereferences it, so it
+    // must not keep the activation's slice alive past its graph.  The context member and both thread_local
+    // maps keyed by this type convert with this one change.
     struct moe_ids_cache_key {
-        ggml_sycl_cache_id id{};
-        ggml_sycl::mem_handle handle{};
-        const ggml_tensor *    tensor          = nullptr;
-        size_t                 handle_identity = 0;
-        int                    device          = -1;
-        size_t                 view_offs       = 0;
-        bool                   use_handle      = false;
-        bool                   use_tensor      = false;
+        ggml_sycl_cache_id             id{};
+        ggml_sycl::mem_handle_identity handle{};
+        const ggml_tensor *            tensor     = nullptr;
+        int                            device     = -1;
+        size_t                         view_offs  = 0;
+        bool                           use_handle = false;
+        bool                           use_tensor = false;
 
         bool operator==(const moe_ids_cache_key & other) const {
             if (device != other.device || view_offs != other.view_offs || use_handle != other.use_handle ||
@@ -5860,7 +5931,7 @@ struct ggml_backend_sycl_context {
                 return tensor == other.tensor;
             }
             if (use_handle) {
-                return handle_identity == other.handle_identity && handle.stable_identity_equal(other.handle);
+                return handle == other.handle;
             }
             return ggml_sycl::detail::cache_id_equal(id, other.id);
         }
@@ -5869,7 +5940,8 @@ struct ggml_backend_sycl_context {
     struct moe_ids_cache_key_hash {
         size_t operator()(const moe_ids_cache_key & key) const {
             size_t h = key.use_tensor ? std::hash<const ggml_tensor *>()(key.tensor) :
-                       key.use_handle ? key.handle_identity : ggml_sycl::detail::cache_id_hash{}(key.id);
+                       key.use_handle ? key.handle.hash() :
+                                        ggml_sycl::detail::cache_id_hash{}(key.id);
             h        = ggml_sycl::detail::cache_hash_combine(h, std::hash<int>()(key.device));
             h        = ggml_sycl::detail::cache_hash_combine(h, std::hash<size_t>()(key.view_offs));
             h        = ggml_sycl::detail::cache_hash_combine(h, std::hash<bool>()(key.use_handle));
@@ -6600,6 +6672,53 @@ struct ggml_backend_sycl_context {
         graph_input_staging_generation++;
     }
 
+    // Once an entry's storage is a slice of a tenant
+    // cohort's slot, an owning handle parked here past the graph is a holder
+    // the re-plan reap would have to name.  An EAGER graph_compute drops those
+    // entries on every return path, so no owning tenant handle survives the
+    // exit; the staging is re-claimed from the slot on the next graph.  An entry
+    // that is the context's own allocation (no tenant tag, which is every entry
+    // until a tenant cohort owns this staging) is kept: it is the reuse this map
+    // exists for.  Returns the number of entries dropped.
+    size_t graph_input_staging_release_tenants() {
+        size_t dropped = 0;
+        for (auto it = graph_input_staging.begin(); it != graph_input_staging.end();) {
+            if (it->second.handle.tenant_cohort() != nullptr) {
+                it = graph_input_staging.erase(it);
+                ++dropped;
+            } else {
+                ++it;
+            }
+        }
+        if (dropped != 0) {
+            graph_input_staging_generation++;
+        }
+        return dropped;
+    }
+
+    // How many entries are tenant slices, by the same tag the release above tests.  A
+    // recording or replaying call parks such entries past its exit (the graph has their
+    // addresses baked in), so the re-plan's recorded-state predicate asks has_tenants to
+    // name them.
+    size_t graph_input_staging_tenant_count() const {
+        size_t n = 0;
+        for (const auto & entry : graph_input_staging) {
+            n += entry.second.handle.tenant_cohort() != nullptr ? 1 : 0;
+        }
+        return n;
+    }
+
+    bool graph_input_staging_has_tenants() const { return graph_input_staging_tenant_count() != 0; }
+
+#    if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Parks an entry the production staging path did not build, for a test that needs a tenant
+    // slice in the map.  A writer like the others: it bumps the generation.
+    void graph_input_staging_adopt_for_test(const ggml_tensor * owner, ggml_sycl::mem_handle && handle, size_t nbytes) {
+        graph_input_staging[owner] = { std::move(handle), nbytes };
+        graph_input_staging_generation++;
+    }
+#    endif
+
     // Pre-allocated buffers for MoE graph recording
     // MUL_MAT_ID needs Q8_1 quantization buffers which cannot be allocated during graph recording
     struct moe_graph_buffers {
@@ -6727,29 +6846,30 @@ struct ggml_backend_sycl_context {
             size_t                backing_capacity = 0;
             planned_scratch_stats stats;
 
-            void *                cached_q8_1         = nullptr;
-            const ggml_tensor *   cached_tensor       = nullptr;
-            ggml_sycl::mem_handle cached_src_handle   = {};
-            size_t                cached_src_identity = 0;
-            size_t                cached_src_offset   = 0;
-            int64_t               cached_ne10         = 0;
-            int64_t               cached_rows         = 0;
-            int64_t               cached_padded       = 0;
-            size_t                cached_size         = 0;
-            bool                  cached_soa_y        = false;
-            bool                  valid               = false;
+            // The source is named by a non-owning identity, never held: this cache
+            // only compares it, so it must not keep an activation slice alive
+            // past its graph.
+            void *                         cached_q8_1       = nullptr;
+            const ggml_tensor *            cached_tensor     = nullptr;
+            ggml_sycl::mem_handle_identity cached_src        = {};
+            size_t                         cached_src_offset = 0;
+            int64_t                        cached_ne10       = 0;
+            int64_t                        cached_rows       = 0;
+            int64_t                        cached_padded     = 0;
+            size_t                         cached_size       = 0;
+            bool                           cached_soa_y      = false;
+            bool                           valid             = false;
 
             void invalidate() {
-                cached_tensor       = nullptr;
-                cached_src_handle   = {};
-                cached_src_identity = 0;
-                cached_src_offset   = 0;
-                cached_ne10         = 0;
-                cached_rows         = 0;
-                cached_padded       = 0;
-                cached_size         = 0;
-                cached_soa_y        = false;
-                valid               = false;
+                cached_tensor     = nullptr;
+                cached_src        = {};
+                cached_src_offset = 0;
+                cached_ne10       = 0;
+                cached_rows       = 0;
+                cached_padded     = 0;
+                cached_size       = 0;
+                cached_soa_y      = false;
+                valid             = false;
             }
         };
 
@@ -6815,12 +6935,10 @@ struct ggml_backend_sycl_context {
             if (!src_handle.valid()) {
                 return false;
             }
-            const slot_t & s            = slot(device);
-            const size_t   src_identity = src_handle.stable_identity_hash();
-            return s.valid && s.cached_tensor == tensor && s.cached_src_identity == src_identity &&
-                   s.cached_src_handle.stable_identity_equal(src_handle) && s.cached_src_offset == src_offset &&
-                   s.cached_ne10 == ne10 && s.cached_rows == rows && s.cached_padded == padded &&
-                   s.cached_size >= size && s.cached_soa_y == soa_y;
+            const slot_t & s = slot(device);
+            return s.valid && s.cached_tensor == tensor && src_handle.identity_equal(s.cached_src) &&
+                   s.cached_src_offset == src_offset && s.cached_ne10 == ne10 && s.cached_rows == rows &&
+                   s.cached_padded == padded && s.cached_size >= size && s.cached_soa_y == soa_y;
         }
 
         void store(int                           device,
@@ -6834,14 +6952,16 @@ struct ggml_backend_sycl_context {
                    size_t                        size,
                    bool                          soa_y) {
             slot_t & s = slot(device);
-            if (!src_handle.valid()) {
+            // A source with no allocator identity is not cached: a miss.
+            const ggml_sycl::mem_handle_identity src_id =
+                src_handle.valid() ? src_handle.identity() : ggml_sycl::mem_handle_identity{};
+            if (!src_id.valid()) {
                 s.invalidate();
                 s.cached_q8_1 = nullptr;
                 return;
             }
             s.cached_tensor       = tensor;
-            s.cached_src_handle   = src_handle;
-            s.cached_src_identity = src_handle.stable_identity_hash();
+            s.cached_src          = src_id;
             s.cached_src_offset   = src_offset;
             s.cached_q8_1         = q8_1;
             s.cached_ne10         = ne10;
@@ -7193,45 +7313,45 @@ struct ggml_backend_sycl_context {
     // Q8_1 quantization cache for MoE: avoids re-quantizing same input across gate/up/down
     // In MoE layers, the same input is used for all projections - caching saves 3x quantization
     struct moe_quant_cache {
-        void *                cached_q8_1         = nullptr;  // Cached Q8_1 quantized data
-        ggml_sycl::mem_handle cached_src_handle   = {};       // Stable source allocation identity
-        size_t                cached_src_identity = 0;
-        int64_t               cached_ne10         = 0;        // Input row width
-        int64_t               cached_rows         = 0;        // Number of rows quantized
-        size_t                cached_size         = 0;        // Buffer size
-        bool                  valid               = false;    // Cache entry is valid
+        // The source is a non-owning identity, never a held handle: this cache
+        // only compares it, so it must not keep the activation alive past its graph.
+        void *                         cached_q8_1 = nullptr;  // Cached Q8_1 quantized data
+        ggml_sycl::mem_handle_identity cached_src  = {};       // Source allocation identity
+        int64_t                        cached_ne10 = 0;        // Input row width
+        int64_t                        cached_rows = 0;        // Number of rows quantized
+        size_t                         cached_size = 0;        // Buffer size
+        bool                           valid       = false;    // Cache entry is valid
 
         void invalidate() {
-            cached_src_handle   = {};
-            cached_src_identity = 0;
-            cached_ne10         = 0;
-            cached_rows         = 0;
-            valid               = false;
+            cached_src  = {};
+            cached_ne10 = 0;
+            cached_rows = 0;
+            valid       = false;
             // Note: don't free cached_q8_1 - it's pool memory that gets reused
         }
 
         // Check if cache matches current request
         bool matches(const ggml_sycl::mem_handle & src_handle, int64_t ne10, int64_t rows) const {
-            if (!valid || !src_handle.valid() || !cached_src_handle.valid()) {
+            if (!valid || !src_handle.valid() || !cached_src.valid()) {
                 return false;
             }
-            return cached_src_identity == src_handle.stable_identity_hash() &&
-                   cached_src_handle.stable_identity_equal(src_handle) && cached_ne10 == ne10 && cached_rows == rows;
+            return src_handle.identity_equal(cached_src) && cached_ne10 == ne10 && cached_rows == rows;
         }
 
         void store(const ggml_sycl::mem_handle & src_handle, void * q8_1, int64_t ne10, int64_t rows, size_t size) {
-            if (!src_handle.valid() || q8_1 == nullptr) {
+            const ggml_sycl::mem_handle_identity src_id =
+                src_handle.valid() ? src_handle.identity() : ggml_sycl::mem_handle_identity{};
+            if (!src_id.valid() || q8_1 == nullptr) {
                 invalidate();
                 cached_q8_1 = nullptr;
                 return;
             }
-            cached_src_handle   = src_handle;
-            cached_src_identity = src_handle.stable_identity_hash();
-            cached_q8_1         = q8_1;
-            cached_ne10         = ne10;
-            cached_rows         = rows;
-            cached_size         = size;
-            valid               = true;
+            cached_src  = src_id;
+            cached_q8_1 = q8_1;
+            cached_ne10 = ne10;
+            cached_rows = rows;
+            cached_size = size;
+            valid       = true;
         }
     } moe_q8_cache;
 #endif

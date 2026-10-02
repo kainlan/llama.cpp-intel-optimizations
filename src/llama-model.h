@@ -4,6 +4,7 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hparams.h"
+#include "llama-layer-shapes.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
@@ -768,6 +769,9 @@ struct llama_model {
     void print_info() const;
 
     ggml_backend_dev_t dev_layer(int il) const;
+
+    // whether the device layer il is placed on is a SYCL device
+    bool dev_layer_is_sycl(int il) const;
     ggml_backend_dev_t dev_output() const;
 
     ggml_backend_buffer_type_t select_buft(int il) const;
@@ -781,7 +785,13 @@ struct llama_model {
 
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
 
-    llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
+    // which memory the model gets and which layers its caches hold; create_memory builds from it
+    llama_memory_policy memory_policy(const llama_memory_params & params, const llama_cparams & cparams) const;
+
+    // no_alloc: the memory's tensors sit on size-0 dummy buffers and nothing is allocated, as a load-time
+    // measure needs. A kind with no such form (llama_memory_kind_unsupported) throws, naming it.
+    llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams,
+                                   bool no_alloc = false) const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 

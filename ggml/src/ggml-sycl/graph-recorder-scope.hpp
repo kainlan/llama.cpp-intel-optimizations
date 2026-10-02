@@ -75,8 +75,55 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 
 namespace ggml_sycl {
+
+// How many command-graph recordings this thread has begun, from every recorder
+// the backend has: the scope below (whole-graph and dense-range recording) and
+// the three hand-ordered MoE recorders, which call graph_record_begin_note() at
+// the point they turn their recording flag on. graph_compute reads it before
+// and after a call, and a difference means the call recorded; that is the one
+// fact the exit hooks branch on (a recording call keeps its staging and has no
+// scatter work to wait for). It lives here, beside the code that begins a
+// recording, so a recorder cannot begin one without being counted.
+inline uint64_t & graph_record_begin_slot() {
+    static thread_local uint64_t begins = 0;
+    return begins;
+}
+
+inline uint64_t graph_record_begins() {
+    return graph_record_begin_slot();
+}
+
+inline void graph_record_begin_note() {
+    ++graph_record_begin_slot();
+}
+
+// How many executable command graphs this thread has submitted, from every site the backend
+// has (whole-graph, segment, block, graphlet and dense-range replays, and the submit right
+// after a recording).  A call that only replays a recorded graph begins no recording, so the
+// begin counter above cannot see it; yet the graph it submits has its staging addresses
+// baked in, so graph_compute's exit must not treat it as an eager call.  Every submission goes
+// through graph_exec_submit(), so a site cannot submit one uncounted.
+inline uint64_t & graph_exec_submit_slot() {
+    static thread_local uint64_t submits = 0;
+    return submits;
+}
+
+inline uint64_t graph_exec_submits() {
+    return graph_exec_submit_slot();
+}
+
+inline void graph_exec_note() {
+    ++graph_exec_submit_slot();
+}
+
+// Counts first: a submission that throws still ran on this call.
+template <typename Queue, typename Exec> inline void graph_exec_submit(Queue & q, Exec & exec) {
+    graph_exec_note();
+    q.ext_oneapi_graph(exec);
+}
 
 template <typename Graph, typename Queue, typename Sink, typename Depth = std::atomic<int>>
 struct graph_recording_slots {
@@ -115,6 +162,7 @@ template <typename Graph, typename Queue, typename Sink, typename Depth = std::a
         s_.queue     = queue;
         s_.dispatch  = true;
         active_      = this;
+        graph_record_begin_note();
     }
 
     // Scopes on a thread end in reverse order of construction, so this hands

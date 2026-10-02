@@ -124,6 +124,8 @@ void stamp_pending_owner(unified_cache_entry & entry, const cache_load_effect & 
 
 std::mutex                                                                   g_lifecycle_plan_mutex;
 std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>> g_lifecycle_plan_candidates;
+// Unpublished probe-placement plans (the load-time measure's (a) stage), keyed by the load's transaction.
+std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>> g_lifecycle_probe_plans;
 std::unordered_map<uint64_t, std::unordered_map<uint64_t, std::shared_ptr<const lifecycle_plan_snapshot>>>
     g_lifecycle_plan_models;
 std::atomic<uint64_t> g_lifecycle_plan_next_version{ 1 };
@@ -150,14 +152,16 @@ void lifecycle_set_next_plan_publication_id_for_test(uint64_t next) noexcept {
 }
 #endif
 
-void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
-                                    placement_plan            plan,
-                                    const placement_kv_info & kv_info,
-                                    uint32_t                  model_n_layer) {
-    if (load_txn_id == 0) {
-        return;
-    }
-    auto snapshot         = std::make_shared<lifecycle_plan_snapshot>();
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_make_candidate_snapshot(uint64_t                  load_txn_id,
+                                                                                 placement_plan            plan,
+                                                                                 const placement_kv_info & kv_info,
+                                                                                 uint32_t model_n_layer) {
+    // A candidate's shape: model_id 0, the load's transaction, version 0 and the
+    // slot fields at their defaults.  The load's own token is derived from the
+    // active transaction, so every identity reader sees the same owner whether the
+    // snapshot is staged (and later stored) or only measured against (the measure
+    // builds one and never stores it).
+    auto snapshot                = std::make_shared<lifecycle_plan_snapshot>();
     snapshot->load_txn_id   = load_txn_id;
     snapshot->model_n_layer = model_n_layer;
     snapshot->kv_info       = kv_info;
@@ -169,6 +173,17 @@ void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
     // current-model tiering verdict kept answering from the PREVIOUS model
     // until commit.
     snapshot->planned_host_bytes = snapshot->plan->weight_host_bytes;
+    return snapshot;
+}
+
+void lifecycle_stage_placement_plan(uint64_t                  load_txn_id,
+                                    placement_plan            plan,
+                                    const placement_kv_info & kv_info,
+                                    uint32_t                  model_n_layer) {
+    if (load_txn_id == 0) {
+        return;
+    }
+    auto snapshot = lifecycle_make_candidate_snapshot(load_txn_id, std::move(plan), kv_info, model_n_layer);
     std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
     g_lifecycle_plan_candidates[load_txn_id] = std::move(snapshot);
 }
@@ -195,6 +210,36 @@ std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_candidate_placemen
         return candidate == g_lifecycle_plan_candidates.end() ? nullptr : candidate->second;
     } catch (...) {
         return nullptr;
+    }
+}
+
+void lifecycle_stage_probe_placement_plan(uint64_t                  load_txn_id,
+                                          placement_plan            plan,
+                                          const placement_kv_info & kv_info,
+                                          uint32_t                  model_n_layer) {
+    if (load_txn_id == 0) {
+        return;
+    }
+    auto snapshot = lifecycle_make_candidate_snapshot(load_txn_id, std::move(plan), kv_info, model_n_layer);
+    std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+    g_lifecycle_probe_plans[load_txn_id] = std::move(snapshot);
+}
+
+std::shared_ptr<const lifecycle_plan_snapshot> lifecycle_find_probe_placement_plan(uint64_t load_txn_id) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        const auto                  probe = g_lifecycle_probe_plans.find(load_txn_id);
+        return probe == g_lifecycle_probe_plans.end() ? nullptr : probe->second;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void lifecycle_abort_probe_placement_plan(uint64_t load_txn_id) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
+        g_lifecycle_probe_plans.erase(load_txn_id);
+    } catch (...) {
     }
 }
 
@@ -884,6 +929,26 @@ const alloc_metadata & alloc_owner::metadata() const noexcept {
     static const alloc_metadata empty{};
     return control_ ? control_->metadata() : empty;
 }
+
+// No production code sets a tenant cohort yet.  The two hazards at the graph_compute exit
+// that making it live would have exposed are closed there: a call that recorded OR replayed
+// a graph keeps its tenant staging entries (the graph has their addresses baked in), so the
+// exit's release runs only for a call that did neither; and the entries a recording call
+// parks are named by the re-plan's recorded-state predicate, so its invalidation clears them
+// even when the recording that parked them produced no graph.
+void alloc_owner::set_tenant_cohort(const char * cohort) noexcept {
+    if (!control_ || cohort == nullptr) {
+        return;
+    }
+    // Set once: the tag is read through every copy and slice of the handle, so
+    // a second write would re-classify an allocation other holders already
+    // treat as one cohort's.  A second set is a defect, not an update.
+    const char * expected = nullptr;
+    if (!control_->tenant_cohort_.compare_exchange_strong(expected, cohort, std::memory_order_acq_rel,
+                                                          std::memory_order_acquire)) {
+        GGML_ABORT("[TENANT] allocation already tagged with cohort '%s'; refusing to re-tag it '%s'", expected, cohort);
+    }
+}
 release_attempt alloc_owner::reset() noexcept {
     alloc_owner_control * control = std::exchange(control_, nullptr);
     return control ? control->release_ref() : release_attempt{};
@@ -919,6 +984,10 @@ uint32_t shared_alloc_owner::use_count() const noexcept {
 }
 uint64_t shared_alloc_owner::control_id() const noexcept {
     return control_ ? control_->control_id() : 0;
+}
+
+const char * shared_alloc_owner::tenant_cohort() const noexcept {
+    return control_ ? control_->tenant_cohort() : nullptr;
 }
 release_attempt shared_alloc_owner::reset() noexcept {
     alloc_owner_control * control = std::exchange(control_, nullptr);
@@ -2735,6 +2804,220 @@ offload_phase offload_stats_phase() {
             return offload_phase::TG;
         default:
             return offload_phase::UNKNOWN;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// L0 and the witness.  Declarations and the contract: unified-cache.hpp, beside
+// the offload stats.  The depth and the outermost kind are one thread-local
+// state, written only by ggml_sycl_replan_token's constructor and destructor.
+//
+// The audit of the fourteen public C entries that hold L0 (ggml-sycl.cpp), and
+// the acquisition order every one of them follows.  A lock may be taken only
+// while holding locks that are EARLIER in this list:
+//
+//   1. L0                              g_replan_txn_mutex (this file)
+//   2. the tensor inventory            g_tensor_inventory_mutex
+//   3. the execution-binding locks     g_execution_backend_binding_mutex, then the
+//                                      backend context's execution_state_mutex
+//   4. the unified-cache locks         the allocation registry and the zone locks,
+//                                      then mem_handle's leaf spin lock
+//
+// A wait, a callback, a queue drain or the destruction of an owner happens after
+// the locks of 2-4 are released (the H8 rule at ggml_sycl_execution_backend_binding);
+// L0 alone is held across them, which is the point of L0.
+//
+// Entries by token kind (the outermost kind decides; a nested hold of any kind
+// takes no lock):
+//   TRANSACTION  set_runtime_context, set_runtime_context_for_model (the second
+//                calls the first: a same-kind nested hold)
+//   LOAD         model_load_begin, stage_inventory_plan, model_load_end
+//   LIFECYCLE    model_unloaded_token, activate_model_plan,
+//                probe_runtime_context_for_model,
+//                recheck_runtime_context_flash_attn, can_unload (try-lock: it
+//                reports busy instead of waiting), complete_unload,
+//                commit_reactivate, rollback_reactivate, shutdown
+// Locks the entries take under L0: model_load_end, activate_model_plan,
+// set_runtime_context_for_model and recheck_runtime_context_flash_attn take the
+// inventory lock (2); set_runtime_context_for_model nests the binding lock and
+// then the execution-state lock inside it (2, then 3).  No entry calls an entry
+// of another kind, so the only nesting is that same-kind one.  graph_compute and
+// the backend's execution-bound paths take no L0 (witnessed at graph_compute's
+// entry), so a decode never waits behind a re-plan's L0.
+//
+// Illegal nestings are witnessed (acquire(), below): a TRANSACTION under a LOAD
+// or LIFECYCLE hold, and a LOAD under a TRANSACTION hold.  GGML_SYCL_WITNESS_CHECKS=1
+// is set in the ctest environment of the lifecycle, replan and plan tests, so the
+// order is enforced on every test run.  A static census of the order is
+// llama.cpp-jg25.
+// ---------------------------------------------------------------------------
+static std::timed_mutex g_replan_txn_mutex;
+
+// Who holds L0, for the diagnostic of a long wait.  Written by the holder right
+// after it locks and cleared right before it unlocks; read only to name a holder.
+static std::atomic<int>      g_replan_holder_kind{ GGML_SYCL_REPLAN_KIND_ANY };
+static std::atomic<uint64_t> g_replan_holder_thread{ 0 };
+
+static uint64_t ggml_sycl_this_thread_tag() {
+    return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+uint32_t ggml_sycl_replan_wait_warn_ms() {
+    uint32_t     ms  = 60000;
+    const char * env = std::getenv("GGML_SYCL_REPLAN_WAIT_WARN_MS");
+    if (env != nullptr) {
+        const long v = std::strtol(env, nullptr, 10);
+        if (v > 0) {
+            ms = static_cast<uint32_t>(v);
+        }
+    }
+    return ms;
+}
+
+ggml_sycl_wait_watch::ggml_sycl_wait_watch(const char * what) : what_(what) {
+    thread_ = std::thread([this]() {
+        const auto                   interval = std::chrono::milliseconds(ggml_sycl_replan_wait_warn_ms());
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!cv_.wait_for(lock, interval, [this]() { return done_; })) {
+            const uint32_t n = warnings_.fetch_add(1, std::memory_order_acq_rel) + 1;
+            GGML_LOG_WARN("[REPLAN-WAIT] %s has waited %u x %u ms, now at: %s (the wait continues)\n", what_, n,
+                          static_cast<unsigned>(interval.count()), site_.load(std::memory_order_acquire));
+            if (ggml_sycl_strict_enabled()) {
+                GGML_ABORT("[REPLAN-WAIT] %s exceeded %u ms under GGML_SYCL_STRICT_LEASES=1, now at: %s", what_,
+                           static_cast<unsigned>(interval.count()), site_.load(std::memory_order_acquire));
+            }
+        }
+    });
+}
+
+ggml_sycl_wait_watch::~ggml_sycl_wait_watch() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        done_ = true;
+    }
+    cv_.notify_all();
+    if (thread_.joinable()) {
+        thread_.join();
+    }
+}
+
+static thread_local int                   g_replan_token_depth = 0;
+static thread_local ggml_sycl_replan_kind g_replan_token_outer = GGML_SYCL_REPLAN_KIND_ANY;
+
+static bool ggml_sycl_witness_switch() {
+    const char * env = std::getenv("GGML_SYCL_WITNESS_CHECKS");
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    return !(env != nullptr && std::strcmp(env, "0") == 0);
+#else
+    return env != nullptr && std::strcmp(env, "1") == 0;
+#endif
+}
+
+const bool g_sycl_witness_enabled = ggml_sycl_witness_switch();
+
+void ggml_sycl_witness_failed(const char * message) {
+    GGML_ABORT("%s", message);
+}
+
+const char * ggml_sycl_replan_kind_name(ggml_sycl_replan_kind kind) {
+    switch (kind) {
+        case GGML_SYCL_REPLAN_KIND_TRANSACTION:
+            return "TRANSACTION";
+        case GGML_SYCL_REPLAN_KIND_LOAD:
+            return "LOAD";
+        case GGML_SYCL_REPLAN_KIND_LIFECYCLE:
+            return "LIFECYCLE";
+        default:
+            return "ANY";
+    }
+}
+
+bool ggml_sycl_replan_token_held(ggml_sycl_replan_kind kind) {
+    if (g_replan_token_depth == 0) {
+        return false;
+    }
+    return kind == GGML_SYCL_REPLAN_KIND_ANY || g_replan_token_outer == kind;
+}
+
+void ggml_sycl_replan_token::acquire(ggml_sycl_replan_kind kind, bool try_only) {
+    GGML_SYCL_WITNESS(kind != GGML_SYCL_REPLAN_KIND_ANY, "[REPLAN-TOKEN] acquire without a concrete kind");
+    if (g_replan_token_depth > 0) {
+        // A nested hold: no lock, and the outermost kind stays. Loads never nest
+        // inside a transaction and a transaction never triggers a load, so
+        // either order is a code defect.
+        const ggml_sycl_replan_kind outer   = g_replan_token_outer;
+        const bool                  illegal = (kind == GGML_SYCL_REPLAN_KIND_TRANSACTION &&
+                              (outer == GGML_SYCL_REPLAN_KIND_LOAD || outer == GGML_SYCL_REPLAN_KIND_LIFECYCLE)) ||
+                             (kind == GGML_SYCL_REPLAN_KIND_LOAD && outer == GGML_SYCL_REPLAN_KIND_TRANSACTION);
+        if (g_sycl_witness_enabled && illegal) {
+            char message[128];
+            std::snprintf(message, sizeof(message), "[REPLAN-TOKEN] illegal nesting: %s under %s",
+                          ggml_sycl_replan_kind_name(kind), ggml_sycl_replan_kind_name(outer));
+            ggml_sycl_witness_failed(message);
+        }
+        ++g_replan_token_depth;
+        owns_ = true;
+        return;
+    }
+    if (try_only) {
+        if (!g_replan_txn_mutex.try_lock()) {
+            return;
+        }
+    } else if (!g_replan_txn_mutex.try_lock()) {
+        // Another thread holds L0.  Keep waiting, but say who holds it each
+        // interval, and under STRICT stop at the first one.
+        const auto     interval = std::chrono::milliseconds(ggml_sycl_replan_wait_warn_ms());
+        const uint64_t start    = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        uint32_t waited = 0;
+        while (!g_replan_txn_mutex.try_lock_for(interval)) {
+            ++waited;
+            const uint64_t now    = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                           std::chrono::steady_clock::now().time_since_epoch())
+                                                              .count());
+            const int      holder = g_replan_holder_kind.load(std::memory_order_acquire);
+            GGML_LOG_WARN(
+                "[REPLAN-WAIT] a %s acquire of L0 has waited %llu ms (interval %u): held by a %s token on thread "
+                "%llu; this is thread %llu (the wait continues)\n",
+                ggml_sycl_replan_kind_name(kind), static_cast<unsigned long long>(now - start), waited,
+                ggml_sycl_replan_kind_name(static_cast<ggml_sycl_replan_kind>(holder)),
+                static_cast<unsigned long long>(g_replan_holder_thread.load(std::memory_order_acquire)),
+                static_cast<unsigned long long>(ggml_sycl_this_thread_tag()));
+            if (ggml_sycl_strict_enabled()) {
+                GGML_ABORT("[REPLAN-WAIT] a %s acquire of L0 exceeded %u ms under GGML_SYCL_STRICT_LEASES=1",
+                           ggml_sycl_replan_kind_name(kind), static_cast<unsigned>(interval.count()));
+            }
+        }
+    }
+    g_replan_token_depth = 1;
+    g_replan_token_outer = kind;
+    g_replan_holder_kind.store(kind, std::memory_order_release);
+    g_replan_holder_thread.store(ggml_sycl_this_thread_tag(), std::memory_order_release);
+    owns_ = true;
+}
+
+ggml_sycl_replan_token::ggml_sycl_replan_token(ggml_sycl_replan_kind kind) {
+    acquire(kind, false);
+}
+
+ggml_sycl_replan_token::ggml_sycl_replan_token(ggml_sycl_replan_kind kind, std::try_to_lock_t) {
+    acquire(kind, true);
+}
+
+ggml_sycl_replan_token::ggml_sycl_replan_token(ggml_sycl_replan_kind kind, ggml_sycl_replan_outermost_only_t) {
+    GGML_SYCL_WITNESS(g_replan_token_depth == 0, "[REPLAN-TOKEN] release proc entered with L0 held");
+    acquire(kind, false);
+}
+
+ggml_sycl_replan_token::~ggml_sycl_replan_token() {
+    if (!owns_) {
+        return;
+    }
+    if (--g_replan_token_depth == 0) {
+        g_replan_token_outer = GGML_SYCL_REPLAN_KIND_ANY;
+        g_replan_holder_kind.store(GGML_SYCL_REPLAN_KIND_ANY, std::memory_order_release);
+        g_replan_txn_mutex.unlock();
     }
 }
 
@@ -5099,11 +5382,9 @@ bool unified_cache::ensure_planned_arena_zones() {
         safe_max_alloc = max_alloc;
     }
 
-    size_t       scratch_zone = 512 * 1024 * 1024;
-    const char * arena_mb_env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
-    if (arena_mb_env) {
-        scratch_zone = static_cast<size_t>(std::max(0, std::atoi(arena_mb_env))) * 1024 * 1024;
-    }
+    // The zone is sized by the one function the model-load reservation and the
+    // chunk cap's probe set also call, so the three cannot disagree.
+    size_t scratch_zone = ggml_sycl_compute_arena_bytes(dev_id);
     // llama.cpp-oyfl: raise the SCRATCH zone for the non-FA batched mul_mat
     // floor the same way onednn_zone is raised below for its own planned
     // estimate. Best-effort and, for the standard model-load flow, NOT
@@ -15585,6 +15866,20 @@ ggml_sycl_arena_backing_type ggml_sycl_arena_backing(int device) {
         return GGML_SYCL_ARENA_BACKING_TYPE_NONE;
     }
     return cache->arena_backing();
+}
+
+size_t ggml_sycl_compute_arena_bytes(int device) {
+    (void) device;
+    // Read on every call, not latched: the model-load reservation and the chunk
+    // cap's probe set both come through here, and a test moves the variable
+    // between loads.  GGML_SYCL_COMPUTE_ARENA_MB=0 turns the reservation off, and
+    // then the probe's scratch is 0 as well.
+    size_t       mb  = 512;
+    const char * env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
+    if (env != nullptr) {
+        mb = static_cast<size_t>(std::max(0, std::atoi(env)));
+    }
+    return mb * 1024ULL * 1024ULL;
 }
 
 bool ggml_sycl_device_has_zones(int device) {

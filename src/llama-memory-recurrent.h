@@ -24,7 +24,9 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
-        const layer_filter_cb & filter);
+        const layer_filter_cb & filter,
+        // create the tensors on size-0 dummy buffers: nothing is allocated (a load-time measure's memory)
+                         bool   no_alloc = false);
 
     ~llama_memory_recurrent() = default;
 
@@ -38,6 +40,8 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+
+    llama_memory_context_ptr init_reserve(uint32_t n_streams) override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -60,6 +64,7 @@ public:
     bool find_slot(const llama_ubatch & ubatch);
 
     bool get_can_shift() const override;
+    void get_shift_caches(std::vector<const llama_kv_cache *> & caches) const override;
 
     // state write/load
 
@@ -119,6 +124,9 @@ private:
     const llama_hparams & hparams;
 
     const uint32_t n_seq_max = 1;
+
+    // the tensors sit on size-0 dummy buffers
+    const bool no_alloc = false;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

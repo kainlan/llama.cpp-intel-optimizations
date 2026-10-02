@@ -1492,6 +1492,30 @@ bool mem_handle::has_stable_owner_identity() const {
     return is_weight() || is_arena() || kind_ == mem_handle_kind::CHUNK_LEASE || static_cast<bool>(owned_alloc_);
 }
 
+mem_handle_identity mem_handle::identity() const {
+    mem_handle_lock_guard g(lock_);
+    mem_handle_identity   id;
+    // A weight's canonical id stays 0 (cache WEIGHT constructors do not
+    // populate it), so a weight is "no identity" rather than a key-derived one.
+    id.allocation_id = canonical_allocation_id_;
+    id.generation    = canonical_generation_;
+    id.slice_offset  = offset_;
+    id.size          = size_;
+    if (id.allocation_id == 0) {
+        return mem_handle_identity{};
+    }
+    return id;
+}
+
+bool mem_handle::identity_equal(const mem_handle_identity & id) const {
+    return id == identity();
+}
+
+const char * mem_handle::tenant_cohort() const {
+    mem_handle_lock_guard g(lock_);
+    return owned_alloc_ ? owned_alloc_.tenant_cohort() : nullptr;
+}
+
 void mem_handle::set_debug_owner(const char * owner_tag) {
     debug_owner_tag_ = owner_tag ? owner_tag : "";
 }

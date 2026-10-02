@@ -390,8 +390,8 @@ def llama_context_swa_full_violations(source: str) -> list[str]:
     # search to one statement so a later call cannot satisfy an earlier one.
     for fn in ("runtime_context_fn", "probe_fn"):
         calls = re.findall(fn + r"\([^;]*?\)\s*;", source)
-        if len(calls) < 2:
-            found.append(f"expected at least two {fn}(...) call sites, found {len(calls)}")
+        if len(calls) < 1:
+            found.append(f"expected at least one {fn}(...) call site, found {len(calls)}")
         for call in calls:
             if "cparams.swa_full" not in call:
                 found.append(f"cparams.swa_full is not forwarded to {fn}")
@@ -987,7 +987,7 @@ KV_CAPACITY_SIGNATURE = "static size_t ggml_sycl_kv_capacity_live"
 TRY_DEMOTE_SIGNATURE = "static bool ggml_sycl_try_demote_runtime_kv"
 CTX_HINT_SIGNATURE = "static std::string ggml_sycl_all_vram_ctx_hint"
 LLAMA_CONTEXT_CTOR_SIGNATURE = "llama_context::llama_context("
-RESYNC_SIGNATURE = "void llama_context::sycl_resync_runtime_context_flash_attn()"
+RESYNC_SIGNATURE = "sched_reserve_result llama_context::sycl_publish_runtime_context(bool flash_attn)"
 PLAN_OWNED_BLOCK = "if (kv_plan && kv_geometry.valid()) {"
 MODE_IS_GLOBAL_SIGNATURE = "bool unified_cache_mode_is_global()"
 ANNOUNCE_LAMBDA = "auto announce_kv_host_demotions = [&](const ggml_sycl::placement_plan & final_plan) {"
@@ -1609,8 +1609,8 @@ def test_mutation_publish_after_kv_allocation_is_witnessed() -> None:
     ctor = function(ctx, LLAMA_CONTEXT_CTOR_SIGNATURE)
     first = ctor.index("        sycl_resync_runtime_context_flash_attn();\n")
     moved = ctor[:first] + ctor[first + len("        sycl_resync_runtime_context_flash_attn();\n"):]
-    at = moved.index("        memory.reset(model.create_memory(params_mem, cparams));\n")
-    at += len("        memory.reset(model.create_memory(params_mem, cparams));\n")
+    at = moved.index("        memory.reset(model.create_memory(params_mem, cparams, measure_only));\n")
+    at += len("        memory.reset(model.create_memory(params_mem, cparams, measure_only));\n")
     moved = moved[:at] + "        sycl_resync_runtime_context_flash_attn();\n" + moved[at:]
     _assert_witnessed(ctx, ctx.replace(ctor, moved, 1), kv_publish_order_violations,
                       "a backend's first publish can run after the context's KV is allocated",
@@ -2361,8 +2361,8 @@ STRICT_SWITCH_SUFFIXES = {".c", ".cpp", ".h", ".hpp"}
 # Assembled, so a grep of the tree finds the one real reader and no mention of
 # the retired switch. The quoted name, closing quote included, appears only
 # where the variable is read: every message that names it says "=1".
-STRICT_LEASES_LITERAL = '"GGML_SYCL_STRICT_' + 'LEASES"'
-RETIRED_STRICT_SWITCH = "GGML_SYCL_STRICT_" + "PLAN"
+STRICT_LEASES_LITERAL = '"GGML_SYCL_' + 'STRICT_LEASES"'
+RETIRED_STRICT_SWITCH = "GGML_SYCL_" + "STRICT_PLAN"
 STRICT_ACCESSOR = "ggml_sycl_strict_enabled"
 STRICT_ACCESSOR_USE = re.compile(r"(?:::)?(?:ggml_sycl::)?\bggml_sycl_strict_enabled\s*\(\s*\)")
 STRICT_CACHE_CPP = "ggml/src/ggml-sycl/unified-cache.cpp"

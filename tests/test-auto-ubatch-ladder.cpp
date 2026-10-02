@@ -22,11 +22,25 @@
 // on some devices, so it must force a republish even when the last candidate
 // tried was fallback_ubatch itself.
 //
+// The planned ladder (zhcn design 1188-1197) adds three more pure helpers:
+//   llama_auto_ubatch_trial_runs()   the four-way conjunction deciding whether
+//                                    the trial runs at all;
+//   llama_auto_ubatch_cap()          min(n_batch, n_ctx), narrowed to the MoE
+//                                    routing ceiling when that ceiling binds;
+//   llama_auto_ubatch_rung_set()     fallback, the ladder rungs in
+//                                    [fallback, cap] and a valid cached value,
+//                                    ascending and deduplicated.
+// The ladder loop iterates the set's ladder members, so each case below also
+// replays the loop it replaced (break above cap, skip at or below the resume
+// value, skip below the floor) and requires the same candidate sequence.
+//
 // No device, no model, no allocation.
 
 #include "../src/llama-auto-ubatch.h"
 
 #include <cstdio>
+#include <string>
+#include <vector>
 
 // The trial's own ladder, so the cases below run on the real rungs.
 static const uint32_t * const ladder   = llama_auto_ubatch_ladder;
@@ -68,6 +82,172 @@ static void check_publish(const char * name,
     std::printf("ok   %s: needs_publish=%d\n", name, got);
 }
 
+static void check_trial_runs(const char * name, bool a, bool b, bool c, bool d, bool expect) {
+    const bool got = llama_auto_ubatch_trial_runs(a, b, c, d);
+    if (got != expect) {
+        std::fprintf(stderr, "FAIL %s: trial_runs(%d,%d,%d,%d)=%d, expected %d\n", name, a, b, c, d, got, expect);
+        g_failures++;
+        return;
+    }
+    std::printf("ok   %s: trial_runs=%d\n", name, got);
+}
+
+static void check_cap(const char * name,
+                      uint32_t     n_batch,
+                      uint32_t     n_ctx,
+                      uint32_t     n_expert,
+                      uint32_t     moe_cap,
+                      bool         moe_cap_available,
+                      uint32_t     expect_cap,
+                      bool         expect_moe_bound) {
+    bool           moe_bound = !expect_moe_bound;  // a helper that never writes it fails the case
+    const uint32_t got       = llama_auto_ubatch_cap(n_batch, n_ctx, n_expert, moe_cap, moe_cap_available, &moe_bound);
+    if (got != expect_cap || moe_bound != expect_moe_bound) {
+        std::fprintf(stderr, "FAIL %s: cap=%u moe_bound=%d, expected cap=%u moe_bound=%d\n", name, got, moe_bound,
+                     expect_cap, expect_moe_bound);
+        g_failures++;
+        return;
+    }
+    std::printf("ok   %s: cap=%u moe_bound=%d\n", name, got, moe_bound);
+}
+
+static std::vector<uint32_t> rung_set_of(uint32_t fallback, uint32_t cap, uint32_t cached) {
+    uint32_t     out[llama_auto_ubatch_rung_set_capacity];
+    const size_t n =
+        llama_auto_ubatch_rung_set(ladder, n_ladder, fallback, cap, cached, out, llama_auto_ubatch_rung_set_capacity);
+    return std::vector<uint32_t>(out, out + n);
+}
+
+static std::vector<uint32_t> members_of(const std::vector<uint32_t> & set) {
+    uint32_t     out[llama_auto_ubatch_rung_set_capacity];
+    const size_t n = llama_auto_ubatch_ladder_members(set.data(), set.size(), ladder, n_ladder, out,
+                                                      llama_auto_ubatch_rung_set_capacity);
+    return std::vector<uint32_t>(out, out + n);
+}
+
+// The loop sycl_select_auto_ubatch ran before the planned ladder, as pure
+// integers: the candidates it reaches before its first refusal.
+static std::vector<uint32_t> old_loop_candidates(uint32_t fallback, uint32_t cap, uint32_t resume_above) {
+    std::vector<uint32_t> r;
+    for (size_t i = 0; i < n_ladder; ++i) {
+        const uint32_t c = ladder[i];
+        if (c > cap) {
+            break;
+        }
+        if (c <= resume_above) {
+            continue;
+        }
+        if (c < fallback) {
+            continue;
+        }
+        r.push_back(c);
+    }
+    return r;
+}
+
+static std::vector<uint32_t> new_loop_candidates(uint32_t fallback,
+                                                 uint32_t cap,
+                                                 uint32_t cached,
+                                                 uint32_t resume_above) {
+    std::vector<uint32_t>       r;
+    const std::vector<uint32_t> rungs = members_of(rung_set_of(fallback, cap, cached));
+    for (size_t i = 0; i < rungs.size(); ++i) {
+        if (rungs[i] <= resume_above) {
+            continue;
+        }
+        r.push_back(rungs[i]);
+    }
+    return r;
+}
+
+static std::string fmt(const std::vector<uint32_t> & v) {
+    std::string s = "{";
+    for (size_t i = 0; i < v.size(); ++i) {
+        s += (i ? "," : "") + std::to_string(v[i]);
+    }
+    return s + "}";
+}
+
+static void check_set(const char *                  name,
+                      uint32_t                      fallback,
+                      uint32_t                      cap,
+                      uint32_t                      cached,
+                      const std::vector<uint32_t> & expect) {
+    const std::vector<uint32_t> got = rung_set_of(fallback, cap, cached);
+    if (got != expect) {
+        std::fprintf(stderr, "FAIL %s: rung_set(fallback=%u cap=%u cached=%u)=%s, expected %s\n", name, fallback, cap,
+                     cached, fmt(got).c_str(), fmt(expect).c_str());
+        g_failures++;
+        return;
+    }
+    std::printf("ok   %s: rung_set=%s\n", name, fmt(got).c_str());
+}
+
+// The set's ladder members, run through the loop's remaining skip, must be the
+// candidate sequence the old loop reached; cached_valid marks the cache value
+// the trial revalidates first, which resumes the ladder above it.
+static void check_equivalence(const char * name, uint32_t fallback, uint32_t cap, uint32_t cached, bool quiet = false) {
+    const bool                  cached_valid = llama_auto_ubatch_cached_valid(ladder, n_ladder, cached, fallback, cap);
+    const uint32_t              resume       = cached_valid ? cached : 0;
+    const std::vector<uint32_t> a            = old_loop_candidates(fallback, cap, resume);
+    const std::vector<uint32_t> b            = new_loop_candidates(fallback, cap, cached_valid ? cached : 0, resume);
+    if (a != b) {
+        std::fprintf(stderr, "FAIL %s: old loop %s, planned loop %s\n", name, fmt(a).c_str(), fmt(b).c_str());
+        g_failures++;
+        return;
+    }
+    if (!quiet) {
+        std::printf("ok   %s: candidates=%s\n", name, fmt(b).c_str());
+    }
+}
+
+static void run_planned_ladder_cases() {
+    check_trial_runs("all four hold", true, true, true, true, true);
+    check_trial_runs("pinned -ub", false, true, true, true, false);
+    check_trial_runs("non-causal", true, false, true, true, false);
+    check_trial_runs("no SYCL backend", true, true, false, true, false);
+    check_trial_runs("trial disabled", true, true, true, false, false);
+
+    check_cap("dense, batch under ctx", 2048, 4096, 0, 512, true, 2048, false);
+    check_cap("dense, ctx under batch", 2048, 1000, 0, 512, true, 1000, false);
+    // A dense model never consults the ceiling, whatever it says.
+    check_cap("dense ignores the ceiling", 2048, 4096, 0, 256, true, 2048, false);
+    check_cap("MoE, ceiling narrows", 2048, 4096, 32, 512, true, 512, true);
+    check_cap("MoE, ceiling equals cap still binds", 512, 4096, 32, 512, true, 512, true);
+    check_cap("MoE, ceiling above cap does not bind", 512, 4096, 32, 1024, true, 512, false);
+    check_cap("MoE, accessor absent", 2048, 4096, 32, 2048, false, 2048, false);
+
+    check_set("dense three rungs", 512, 2048, 0, { 512, 1024, 2048 });
+    check_set("MoE single rung", 512, 512, 0, { 512 });
+    check_set("fallback between rungs joins the set", 600, 2048, 0, { 600, 1024, 2048 });
+    check_set("fallback above every rung", 8192, 8192, 0, { 8192 });
+    check_set("cap below the first rung", 256, 256, 0, { 256 });
+    check_set("cached rung is deduplicated", 512, 2048, 1024, { 512, 1024, 2048 });
+    check_set("cached non-rung value is added", 512, 2048, 768, { 512, 768, 1024, 2048 });
+    check_set("cached below fallback is dropped", 1024, 2048, 600, { 1024, 2048 });
+    check_set("cached above cap is dropped", 512, 1024, 2048, { 512, 1024 });
+    check_set("cached below the first rung is dropped", 256, 2048, 300, { 256, 512, 1024, 2048 });
+    check_set("fallback equal to cap", 1024, 1024, 0, { 1024 });
+    check_set("fallback above cap is excluded", 1024, 512, 0, {});
+
+    check_equivalence("equiv default dense", 512, 2048, 0);
+    check_equivalence("equiv fallback between rungs", 600, 1000, 0);
+    check_equivalence("equiv floor above MoE cap", 1024, 512, 0);
+    check_equivalence("equiv floor above the ladder", 8192, 8192, 0);
+    check_equivalence("equiv cap below the first rung", 256, 256, 0);
+    check_equivalence("equiv resume above a cached rung", 512, 4096, 1024);
+    check_equivalence("equiv cached non-rung resumes above it", 512, 4096, 768);
+    check_equivalence("equiv cached at the cap", 512, 2048, 2048);
+    check_equivalence("equiv cached invalid below floor", 1024, 4096, 512);
+    for (uint32_t fallback = 1; fallback <= 8192; fallback = fallback * 2 + (fallback % 3)) {
+        for (uint32_t cap = 1; cap <= 8192; cap = cap * 2 + (cap % 5)) {
+            for (uint32_t cached = 0; cached <= 8192; cached = cached * 2 + 256) {
+                check_equivalence("equiv sweep", fallback, cap, cached, true);
+            }
+        }
+    }
+}
+
 int main() {
     // Defaults: n_ctx=4096, n_batch=2048, n_ubatch=512 -> 512, 1024 and 2048 are candidates.
     check_case("default dense context", 512, 2048, true);
@@ -106,6 +286,8 @@ int main() {
     // cparams.n_ubatch is 512 again and published_any is still false. dev0
     // still holds the 1024 plan, so the settle must republish.
     check_publish("earlier partial publish above fallback, last candidate at fallback", false, true, 512, 512, true);
+
+    run_planned_ladder_cases();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d case(s) failed\n", g_failures);

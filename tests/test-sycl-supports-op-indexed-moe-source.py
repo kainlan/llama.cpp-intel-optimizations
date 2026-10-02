@@ -56,6 +56,25 @@ def executable_body(body: str) -> str:
     return re.sub(r"\s+", "", without_comments)
 
 
+EXECUTOR_HELPER_HEADER = "static bool ggml_sycl_moe_multi_gpu_for_executor() {"
+EXECUTOR_HELPER_BODY = (
+    "if(g_measure_plan_override){"
+    "returng_measure_plan_override->plan&&"
+    "ggml_sycl_moe_multi_gpu_wanted(*g_measure_plan_override->plan);}"
+    "returng_moe_multi_gpu_active.load(std::memory_order_acquire);"
+)
+
+
+def executor_helper_reads_the_latch(text: str) -> bool:
+    """The call in supports_op is only as good as what the helper reads: the measure
+    override's plan under a measure, the process latch otherwise, and nothing else."""
+    try:
+        _, _, body = braced_body(text, EXECUTOR_HELPER_HEADER)
+    except (ValueError):
+        return False
+    return text.count(EXECUTOR_HELPER_HEADER) == 1 and executable_body(body) == EXECUTOR_HELPER_BODY
+
+
 def matching_delimiter(text: str, opening: int, open_char: str, close_char: str) -> int:
     depth = 0
     for position in range(opening, len(text)):
@@ -183,14 +202,15 @@ def contract(text: str) -> bool:
     router_residency_exception = executable_body(function[early_close + 1 : planner])
     later_indexed_case = re.search(r"\bcase\s+GGML_OP_MUL_MAT_ID\s*:", switch_body)
     return (
-        function_body_open < early < early_close < router_flag < planner < planner_close < switch
+        executor_helper_reads_the_latch(text)
+        and function_body_open < early < early_close < router_flag < planner < planner_close < switch
         and executable_body(function[function_body_open + 1 : early]) == EXPECTED_PRE_INDEXED_GUARD_PREFIX
         and executable_body(early_body) == "constggml_typeindexed_a_type=op->src[0]->type;if(op->op==GGML_OP_MUL_MAT_ID){if(!moe_mmvq_admission_supports_type(indexed_a_type)){returnfalse;}}elseif(indexed_a_type!=GGML_TYPE_Q1_0&&indexed_a_type!=GGML_TYPE_NVFP4&&!ggml_sycl_mul_mat_type_supported(indexed_a_type)){returnfalse;}returntrue;"
         and "GGML_OP_ADD_ID" in function[early : early_close + 1]
         and "GGML_OP_MUL_MAT_ID" in function[early : early_close + 1]
         and router_residency_exception ==
             "constboolis_multi_gpu_router_logits="
-            "g_moe_multi_gpu_active.load(std::memory_order_acquire)&&"
+            "ggml_sycl_moe_multi_gpu_for_executor()&&"
             "ggml_sycl_op_is_moe_router_logits_matmul(op);"
         and planner_control_decisions == (("return", "false"),)
         and executable_body(function[planner_close + 1 : switch]) == ""
@@ -284,11 +304,11 @@ def test_planner_guard_rejects_non_boolean_spelled_early_successes() -> None:
 def test_router_logits_control_flow_mutations_are_rejected() -> None:
     declaration = (
         "    const bool is_multi_gpu_router_logits =\n"
-        "        g_moe_multi_gpu_active.load(std::memory_order_acquire) && "
+        "        ggml_sycl_moe_multi_gpu_for_executor() && "
         "ggml_sycl_op_is_moe_router_logits_matmul(op);\n\n"
     )
     old_early_success = (
-        "    if (g_moe_multi_gpu_active.load(std::memory_order_acquire) && "
+        "    if (ggml_sycl_moe_multi_gpu_for_executor() && "
         "ggml_sycl_op_is_moe_router_logits_matmul(op)) {\n"
         "        return true;\n"
         "    }\n\n"
@@ -304,11 +324,31 @@ def test_router_logits_control_flow_mutations_are_rejected() -> None:
 
     all_ops_bypass_planner = replace_in_supports_function(
         SOURCE,
-        "const bool is_multi_gpu_router_logits =\n        g_moe_multi_gpu_active.load(std::memory_order_acquire) && "
+        "const bool is_multi_gpu_router_logits =\n        ggml_sycl_moe_multi_gpu_for_executor() && "
         "ggml_sycl_op_is_moe_router_logits_matmul(op);",
         "const bool is_multi_gpu_router_logits = true;",
     )
     assert not contract(all_ops_bypass_planner)
+
+
+def test_executor_helper_reads_are_pinned() -> None:
+    # Asserted on the clause itself, not through contract(): contract() carries an
+    # unrelated pre-existing prefix clause that is already false on this tree, so a
+    # "not contract(mutant)" here would pass whether or not the helper pin works.
+    assert executor_helper_reads_the_latch(SOURCE)
+    # the process latch read replaced by a constant, so every host answers "multi-GPU"
+    constant_latch = SOURCE.replace("return g_moe_multi_gpu_active.load(std::memory_order_acquire);",
+                                    "return true;", 1)
+    assert constant_latch != SOURCE and not executor_helper_reads_the_latch(constant_latch)
+    # the measure override's plan ignored: a measure would read the process latch
+    no_override = SOURCE.replace("if (g_measure_plan_override) {\n        return g_measure_plan_override->plan && "
+                                 "ggml_sycl_moe_multi_gpu_wanted(*g_measure_plan_override->plan);\n    }\n"
+                                 "    return g_moe_multi_gpu_active", "    return g_moe_multi_gpu_active", 1)
+    assert no_override != SOURCE and not executor_helper_reads_the_latch(no_override)
+    # the override answered with the raw request instead of the plan's own condition
+    raw_request = SOURCE.replace("ggml_sycl_moe_multi_gpu_wanted(*g_measure_plan_override->plan);",
+                                 "ggml_sycl_moe_multi_gpu_requested();", 1)
+    assert raw_request != SOURCE and not executor_helper_reads_the_latch(raw_request)
 
 
 def test_dense_mul_mat_type_policy_fails_closed() -> None:

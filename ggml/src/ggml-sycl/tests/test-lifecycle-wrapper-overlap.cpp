@@ -1,6 +1,9 @@
 #include "ggml-sycl.h"
 
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <future>
 
 extern "C" void ggml_backend_sycl_test_fail_next_candidate_binding_allocation();
@@ -129,6 +132,19 @@ int main() {
         return 1;
     }
 
+    // A second load_end of the same transaction cannot overlap the first: the LOAD
+    // token (L0) serialises them.  The first
+    // call parks inside candidate binding holding L0; the second must still be
+    // waiting when we look, and runs only after the first has finished.  The
+    // first one's binding allocation then fails, which durably aborts the
+    // transaction, so the second replays the abort: POISONED, and a token that
+    // names the aborted model (a replay exports the terminal token, the same as
+    // every other abort path) but commits nothing -- the registry has no live
+    // model under it, so tearing it down reports NOT_FOUND.
+    //
+    // Neither half may hang if the design regresses: the second call is bounded
+    // by a probe, and both joins are bounded by a deadline that FAILs with a
+    // message instead of leaving the test to the ctest timeout.
     ggml_sycl_load_txn race_load{};
     if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&race_load) != GGML_SYCL_LIFECYCLE_OK) {
         std::fprintf(stderr, "binding/commit race fixture failed\n");
@@ -141,17 +157,33 @@ int main() {
     });
     CALL_SYCL(ggml_backend_sycl_test_wait_for_candidate_binding_failure)();
     ggml_sycl_model_token canonical{};
-    const auto            canonical_rc = CALL_SYCL(ggml_backend_sycl_model_load_end)(race_load, true, &canonical);
+    auto                  canonical_end = std::async(
+        std::launch::async, [&] { return CALL_SYCL(ggml_backend_sycl_model_load_end)(race_load, true, &canonical); });
+    const bool second_waited = canonical_end.wait_for(std::chrono::milliseconds(300)) == std::future_status::timeout;
     CALL_SYCL(ggml_backend_sycl_test_release_candidate_binding_failure)();
-    if (canonical_rc != GGML_SYCL_LIFECYCLE_OK || raced_end.get() != GGML_SYCL_LIFECYCLE_OK ||
-        canonical.model_id == 0 || raced_replay.model_id != canonical.model_id ||
-        raced_replay.load_txn_id != canonical.load_txn_id || raced_replay.slot != canonical.slot ||
-        raced_replay.slot_generation != canonical.slot_generation) {
-        std::fprintf(stderr, "binding failure raced canonical commit into a noncanonical result\n");
+    const auto deadline = std::chrono::seconds(30);
+    if (raced_end.wait_for(deadline) != std::future_status::ready ||
+        canonical_end.wait_for(deadline) != std::future_status::ready) {
+        // A thread is still stuck: the futures' destructors would join it and
+        // hang, so leave through _Exit with the message already written.
+        std::fprintf(stderr, "a load_end did not return within %lld s of the release: LOAD token deadlock\n",
+                     (long long) deadline.count());
+        std::fflush(stderr);
+        std::_Exit(1);
+    }
+    const auto raced_rc     = raced_end.get();
+    const auto canonical_rc = canonical_end.get();
+    if (!second_waited) {
+        std::fprintf(stderr, "a second load_end overlapped a parked one: the LOAD token did not serialise them\n");
         return 1;
     }
-    if (CALL_SYCL(ggml_backend_sycl_model_unloaded_token)(canonical) != GGML_SYCL_LIFECYCLE_OK) {
-        std::fprintf(stderr, "binding/commit race fixture teardown failed\n");
+    if (raced_rc != GGML_SYCL_LIFECYCLE_EFFECT_FAILED || canonical_rc != GGML_SYCL_LIFECYCLE_POISONED ||
+        canonical.model_id == 0 ||
+        CALL_SYCL(ggml_backend_sycl_model_unloaded_token)(canonical) != GGML_SYCL_LIFECYCLE_NOT_FOUND) {
+        std::fprintf(stderr,
+                     "serialised binding failure did not abort the transaction durably: raced_rc=%d "
+                     "canonical_rc=%d canonical_model=%llu\n",
+                     (int) raced_rc, (int) canonical_rc, (unsigned long long) canonical.model_id);
         return 1;
     }
 

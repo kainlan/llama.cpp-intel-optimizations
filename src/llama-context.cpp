@@ -7,22 +7,28 @@
 #endif
 #include "llama-arch.h"
 #include "llama-auto-ubatch.h"
+#include "llama-batch.h"
+#include "llama-context-tenant.h"
+#include "llama-ext.h"
+#include "llama-fused-resolution.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
-#include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
+#include "llama-load-measure.h"
+#include "llama-measure-plan.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
-#include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
-#include <cinttypes>
+#include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -80,6 +86,23 @@ static ggml_backend_reg_t llama_context_sycl_reg_from_dev(ggml_backend_dev_t dev
 
 static bool llama_context_dev_is_sycl(ggml_backend_dev_t dev) {
     return llama_context_sycl_reg_from_dev(dev) != nullptr;
+}
+
+// llama.cpp-xojq (quality round 1 Q4): the null-dev and null-reg checks
+// below were duplicated verbatim across six proc-address lookups (the two
+// pre-existing ones, runtime_proc/recheck_proc, folded into this helper in
+// the same edit that added the four new ones for Task 4b). Every lookup is
+// now one reinterpret_cast wrapping this call with its own symbol name and
+// return type -- no template, since each caller's decltype differs.
+static void * llama_context_sycl_proc_addr(ggml_backend_dev_t dev, const char * name) {
+    if (!dev) {
+        return nullptr;
+    }
+    auto * reg = llama_context_sycl_reg_from_dev(dev);
+    if (!reg) {
+        return nullptr;
+    }
+    return ggml_backend_reg_get_proc_address(reg, name);
 }
 
 static bool llama_context_backend_is_sycl(ggml_backend_t backend) {
@@ -300,23 +323,6 @@ static llama_context_sycl_exec_hooks llama_context_sycl_exec_procs(ggml_backend_
     return hooks;
 }
 
-// llama.cpp-xojq (quality round 1 Q4): the null-dev and null-reg checks
-// below were duplicated verbatim across six proc-address lookups (the two
-// pre-existing ones, runtime_proc/recheck_proc, folded into this helper in
-// the same edit that added the four new ones for Task 4b). Every lookup is
-// now one reinterpret_cast wrapping this call with its own symbol name and
-// return type -- no template, since each caller's decltype differs.
-static void * llama_context_sycl_proc_addr(ggml_backend_dev_t dev, const char * name) {
-    if (!dev) {
-        return nullptr;
-    }
-    auto * reg = llama_context_sycl_reg_from_dev(dev);
-    if (!reg) {
-        return nullptr;
-    }
-    return ggml_backend_reg_get_proc_address(reg, name);
-}
-
 static decltype(&ggml_backend_sycl_set_runtime_context_for_model) llama_context_sycl_runtime_proc(
     ggml_backend_dev_t dev) {
     return reinterpret_cast<decltype(&ggml_backend_sycl_set_runtime_context_for_model)>(
@@ -451,7 +457,8 @@ static bool llama_context_sycl_plan_has_cpu_work(ggml_backend_dev_t dev) {
 // re-publish after the constructor enumerates the backends, so sched_reserve()
 // calls this again right before it builds each scheduler.
 static ggml_backend_buffer_type_t llama_context_cpu_compute_buft(const llama_model &        model,
-                                                                 ggml_backend_buffer_type_t buft) {
+                                                                 ggml_backend_buffer_type_t buft,
+                                                                 bool                       log) {
     if (model.devices.empty()) {
         return buft;
     }
@@ -467,9 +474,31 @@ static ggml_backend_buffer_type_t llama_context_cpu_compute_buft(const llama_mod
         }
     }
     // One line per selection; the backend logs which plan clause fired just above it.
+    if (!log) {
+        return buft;
+    }
     LLAMA_LOG_DEBUG("[SYCL-CPU-ACT] CPU compute buft '%s': plan_cpu_work=%d partial_offload=%d\n",
                     ggml_backend_buft_name(buft), plan_cpu_work, partial_offload);
     return buft;
+}
+
+// llama.cpp-38af: re-select the CPU backend's compute buft against the placement plan as it stands NOW.
+// The auto-ubatch candidate and settle resyncs re-plan after the constructor chose it, and no plan
+// mutation happens between a reserve's call here and its scheduler's construction (the narrow flash-attn
+// recheck in resolve_fused_ops() runs with allow_replan=false), so this is the final answer for that
+// scheduler; the pipeline-parallel retry reuses it. The MEASURE and the ALLOC of one reserve both call it
+// so they plan against the same buft.
+static void llama_context_cpu_compute_buft_reselect(const llama_model &                       model,
+                                                    const std::vector<ggml_backend_t> &       backend_ptrs,
+                                                    std::vector<ggml_backend_buffer_type_t> & backend_buft,
+                                                    bool                                      log) {
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        if (!model.devices.empty() &&
+            ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            backend_buft[i] =
+                llama_context_cpu_compute_buft(model, ggml_backend_get_default_buffer_type(backend_ptrs[i]), log);
+        }
+    }
 }
 
 // llama.cpp-7n6n (wires nphx Task 5): a cheap, deterministic FNV-1a hash
@@ -538,6 +567,142 @@ static const char * sycl_recheck_lifecycle_result_name(ggml_sycl_lifecycle_resul
 }
 #endif
 
+// The backend's plan-scope entry points. A SYCL DSO that does not export them leaves
+// every proc null; a planned context cannot exist without them, because the copy that
+// owns the scopes is acquired through the same table.
+struct llama_context_sycl_plan_procs {
+    decltype(&ggml_backend_sycl_plan_scope_open)              scope_open              = nullptr;
+    decltype(&ggml_backend_sycl_plan_scope_open_load_measure) scope_open_load_measure = nullptr;
+    decltype(&ggml_backend_sycl_plan_scope_failure)           scope_failure           = nullptr;
+    decltype(&ggml_backend_sycl_plan_scope_close)             scope_close             = nullptr;
+};
+
+static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std::vector<ggml_backend_ptr> & backends) {
+    llama_context_sycl_plan_procs procs;
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (!llama_context_dev_is_sycl(dev)) {
+            continue;
+        }
+#ifdef GGML_USE_SYCL
+        procs.scope_open              = &ggml_backend_sycl_plan_scope_open;
+        procs.scope_open_load_measure = &ggml_backend_sycl_plan_scope_open_load_measure;
+        procs.scope_failure           = &ggml_backend_sycl_plan_scope_failure;
+        procs.scope_close             = &ggml_backend_sycl_plan_scope_close;
+#elif defined(GGML_BACKEND_DL)
+        procs.scope_open = reinterpret_cast<decltype(procs.scope_open)>(
+            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_plan_scope_open"));
+        procs.scope_open_load_measure = reinterpret_cast<decltype(procs.scope_open_load_measure)>(
+            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_plan_scope_open_load_measure"));
+        procs.scope_failure = reinterpret_cast<decltype(procs.scope_failure)>(
+            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_plan_scope_failure"));
+        procs.scope_close = reinterpret_cast<decltype(procs.scope_close)>(
+            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_plan_scope_close"));
+#endif
+        break;
+    }
+    return procs;
+}
+
+// The L4 entry points (the tenant publish, coverage query and load-time late check). The backend
+// declares them in ggml-sycl.h; a backend that does not define them answers a null proc address
+// and the readers in llama-context-tenant.h then fail closed. Every link mode resolves them the
+// same way, through the SYCL reg's proc address by the names ggml-sycl-l4-procs.h pins, from the
+// first SYCL backend of the context. No weak reference, no direct reference: one path.
+[[maybe_unused]] static llama_sycl_l4_procs llama_context_sycl_l4_procs_for_dev(ggml_backend_dev_t dev) {
+    llama_sycl_l4_procs procs;
+    if (!llama_context_dev_is_sycl(dev)) {
+        return procs;
+    }
+    procs.publish = reinterpret_cast<decltype(procs.publish)>(
+        llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_SET_RUNTIME_CONTEXT_DESC));
+    procs.coverage =
+        reinterpret_cast<decltype(procs.coverage)>(llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_TENANT_COVERAGE));
+    procs.late_check =
+        reinterpret_cast<decltype(procs.late_check)>(llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_LATE_CHECK));
+    return procs;
+}
+
+[[maybe_unused]] static llama_sycl_l4_procs llama_context_sycl_l4_procs_for(
+    const std::vector<ggml_backend_ptr> & backends) {
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (llama_context_dev_is_sycl(dev)) {
+            return llama_context_sycl_l4_procs_for_dev(dev);
+        }
+    }
+    return {};
+}
+
+// A plan scope open on the calling thread for one MEASURE or ALLOC of one context,
+// closed when it leaves scope. While it is open the compute bufts' get_max_size answer
+// from the context's chunk-cap copy. It opens only for a context that owns that copy
+// (`caps` non-null): for any other it stays closed, and the caller does not ask.
+struct llama_plan_scope {
+    llama_plan_scope(const llama_context_sycl_plan_procs & procs,
+                     uint32_t                              context_id,
+                     enum ggml_sycl_plan_scope_mode        mode,
+                     ggml_backend_sycl_plan_caps_t         caps) :
+        failure_fn(procs.scope_failure),
+        close_fn(procs.scope_close) {
+        if (caps != nullptr && procs.scope_open != nullptr && close_fn != nullptr) {
+            scope = procs.scope_open(context_id, mode, caps);
+        }
+    }
+
+    // The load-time measure's scope: it holds no copy and freezes nothing, and reads the plan override
+    // the measure function installed.
+    llama_plan_scope(const llama_context_sycl_plan_procs & procs, enum ggml_sycl_measure_stage stage) :
+        failure_fn(procs.scope_failure),
+        close_fn(procs.scope_close) {
+        if (procs.scope_open_load_measure != nullptr && close_fn != nullptr) {
+            scope = procs.scope_open_load_measure(stage);
+        }
+    }
+
+    ~llama_plan_scope() {
+        if (scope != nullptr) {
+            close_fn(scope);
+        }
+    }
+
+    llama_plan_scope(const llama_plan_scope &)             = delete;
+    llama_plan_scope & operator=(const llama_plan_scope &) = delete;
+
+    bool is_open() const { return scope != nullptr; }
+
+    // The first failed read in the scope (a cap the copy could not answer), or null.
+    const char * failure() const { return scope != nullptr && failure_fn != nullptr ? failure_fn(scope) : nullptr; }
+
+  private:
+    decltype(&ggml_backend_sycl_plan_scope_failure) failure_fn = nullptr;
+    decltype(&ggml_backend_sycl_plan_scope_close)   close_fn   = nullptr;
+    void *                                          scope      = nullptr;
+};
+
+// The sink the resolution report prints through, and the trampolines the unwind guard calls.
+static void fused_resolution_sink(fused_resolution_level level, const char * text) {
+    if (level == FUSED_RESOLUTION_LEVEL_WARN) {
+        LLAMA_LOG_WARN("%s\n", text);
+    } else {
+        LLAMA_LOG_INFO("%s\n", text);
+    }
+}
+
+struct fused_resolution_guard_arg {
+    llama_context *          ctx;
+    const fused_resolution * record;
+};
+
+static void fused_resolution_report_trampoline(void * arg) {
+    auto * a = static_cast<fused_resolution_guard_arg *>(arg);
+    a->ctx->fused_resolution_report(*a->record);
+}
+
+static void fused_resolution_lost_trampoline(void * arg) noexcept {
+    static_cast<fused_resolution_guard_arg *>(arg)->ctx->fused_resolution_report_lost();
+}
+
 static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
     /*.name             =*/ "Lightning Indexer",
@@ -564,14 +729,31 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
+              llama_context_params params,
+              llama_measure_context_args * measure) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
+    measure_only = measure != nullptr;
+    if (measure_only) {
+        measure_log_quiet.emplace();
+    }
+
+    // A model the measure cannot walk is refused by name, before anything is built. llama_load_measure
+    // asks the same question first and returns it as `unsupported`; this is the constructor's own guard.
+    if (measure_only) {
+        const std::string unsupported = llama_measure_unsupported_reason(model);
+        if (!unsupported.empty()) {
+            throw llama_measure_unsupported(unsupported);
+        }
+    }
+
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
-    LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+    if (!measure_only) {
+        LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+    }
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -585,8 +767,10 @@ llama_context::llama_context(
 
     cparams.n_rs_seq = params.n_rs_seq;
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
-        LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
-                        __func__, cparams.n_rs_seq);
+        if (!measure_only) {
+            LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
+                            __func__, cparams.n_rs_seq);
+        }
         cparams.n_rs_seq = 0;
     }
 
@@ -624,23 +808,13 @@ llama_context::llama_context(
 
     cparams.ctx_other = nullptr;
 
-    // TODO: more generic
-    if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+    if (llama_model_needs_ctx_other(model)) {
         if (params.ctx_other == nullptr) {
             // TODO: change from runtime_error to llama_exception to avoid printing error message
-            throw std::runtime_error("Gemma4Assistant requires ctx_other to be set (this warning is normal during memory fitting)");
+            throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
         }
 
         cparams.ctx_other = params.ctx_other;
-    }
-
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
-        if (model.tok_embd == nullptr || model.output == nullptr) {
-            if (params.ctx_other == nullptr) {
-                throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
-            }
-            cparams.ctx_other = params.ctx_other;
-        }
     }
 
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
@@ -678,8 +852,10 @@ llama_context::llama_context(
 
             cparams.yarn_attn_factor = get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dims);
 
-            LLAMA_LOG_WARN("%s: setting new yarn_attn_factor = %.4f (mscale == %.1f, mscale_all_dim = %.1f)\n",
-                    __func__, cparams.yarn_attn_factor, mscale, mscale_all_dims);
+            if (!measure_only) {
+                LLAMA_LOG_WARN("%s: setting new yarn_attn_factor = %.4f (mscale == %.1f, mscale_all_dim = %.1f)\n",
+                        __func__, cparams.yarn_attn_factor, mscale, mscale_all_dims);
+            }
         } else {
             cparams.yarn_attn_factor = get_mscale(factor, 1.0f);
         }
@@ -735,7 +911,8 @@ llama_context::llama_context(
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
-    if (params.samplers != nullptr && params.n_samplers > 0) {
+    // (a measure-only context sizes no sampling graph)
+    if (!measure_only && params.samplers != nullptr && params.n_samplers > 0) {
         for (size_t i = 0; i < params.n_samplers; ++i) {
             const auto & config = params.samplers[i];
 
@@ -746,7 +923,9 @@ llama_context::llama_context(
             if (set_sampler(config.seq_id, config.sampler)) {
                 const int n_samplers = llama_sampler_chain_n(config.sampler);
 
-                LLAMA_LOG_INFO("%s: setting backend sampler for seq_id %d (n = %d)\n", __func__, config.seq_id, n_samplers);
+                if (!measure_only) {
+                    LLAMA_LOG_INFO("%s: setting backend sampler for seq_id %d (n = %d)\n", __func__, config.seq_id, n_samplers);
+                }
             }
         }
     }
@@ -763,7 +942,9 @@ llama_context::llama_context(
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
 
         if (graph_reuse_disable) {
-            LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
+            if (!measure_only) {
+                LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
+            }
         }
     }
 
@@ -782,33 +963,41 @@ llama_context::llama_context(
 
         if (cparams.n_ctx != cparams.n_ctx_seq * cparams.n_seq_max) {
             cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
-            LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
+            if (!measure_only) {
+                LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
+            }
         }
     }
 
-    LLAMA_LOG_INFO("%s: n_seq_max             = %u\n",   __func__, cparams.n_seq_max);
-    LLAMA_LOG_INFO("%s: n_ctx                 = %u\n",   __func__, cparams.n_ctx);
-    LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
-    LLAMA_LOG_INFO("%s: n_batch               = %u\n",   __func__, cparams.n_batch);
-    LLAMA_LOG_INFO("%s: n_ubatch              = %u\n",   __func__, cparams.n_ubatch);
-    LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
-    LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
-    LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
-    LLAMA_LOG_INFO("%s: swa_full              = %s\n",   __func__, cparams.swa_full ? "true" : "false");
-    LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
-    LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
-    LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
-    LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
-    LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
+    if (!measure_only) {
+        LLAMA_LOG_INFO("%s: n_seq_max             = %u\n",   __func__, cparams.n_seq_max);
+        LLAMA_LOG_INFO("%s: n_ctx                 = %u\n",   __func__, cparams.n_ctx);
+        LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
+        LLAMA_LOG_INFO("%s: n_batch               = %u\n",   __func__, cparams.n_batch);
+        LLAMA_LOG_INFO("%s: n_ubatch              = %u\n",   __func__, cparams.n_ubatch);
+        LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
+        LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
+        LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+        LLAMA_LOG_INFO("%s: swa_full              = %s\n",   __func__, cparams.swa_full ? "true" : "false");
+        LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
+        LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
+        LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
+        LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
+        LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
+    }
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
-        LLAMA_LOG_INFO("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
-                __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
+        if (!measure_only) {
+            LLAMA_LOG_INFO("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
+                    __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
+        }
     }
 
     if (cparams.n_ctx_seq > hparams.n_ctx_train) {
-        LLAMA_LOG_WARN("%s: n_ctx_seq (%u) > n_ctx_train (%u) -- possible training context overflow\n",
-                __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
+        if (!measure_only) {
+            LLAMA_LOG_WARN("%s: n_ctx_seq (%u) > n_ctx_train (%u) -- possible training context overflow\n",
+                    __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
+        }
     }
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
@@ -839,7 +1028,21 @@ llama_context::llama_context(
     } sycl_exec_scope{ sycl_exec_close_if_idle, nullptr, false };
 #endif
 
-    if (!hparams.vocab_only) {
+    if (!hparams.vocab_only && measure_only) {
+        // The measure backends are the caller's: no device init, no execution context, no threadpool
+        // and no output buffer. The CPU backend is the last of them.
+        measure_stage = measure->stage;
+        backends      = std::move(measure->backends);
+        if (backends.empty()) {
+            throw std::runtime_error("a measure-only context needs its backends");
+        }
+        backend_cpu = backends.back().get();
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend_cpu)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            throw std::runtime_error("the last backend of a measure-only context must be the CPU backend");
+        }
+    }
+
+    if (!hparams.vocab_only && !measure_only) {
         // GPU backends
         for (const auto & dev : model.devices) {
             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
@@ -924,28 +1127,22 @@ llama_context::llama_context(
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
 
-            LLAMA_LOG_INFO("%s: %10s  output buffer size = %8.2f MiB\n", __func__,
-                    ggml_backend_buffer_name    (buf_output.get()),
-                    ggml_backend_buffer_get_size(buf_output.get()) / 1024.0 / 1024.0);
+            if (!measure_only) {
+                LLAMA_LOG_INFO("%s: %10s  output buffer size = %8.2f MiB\n", __func__,
+                        ggml_backend_buffer_name    (buf_output.get()),
+                        ggml_backend_buffer_get_size(buf_output.get()) / 1024.0 / 1024.0);
+            }
         }
     }
 
-    // init the memory module
-    if (!hparams.vocab_only) {
-        llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
-        };
-
-        memory.reset(model.create_memory(params_mem, cparams));
-    }
-
     // init backends
+    // The backend enumeration and the pipeline-parallel decision read the model, cparams and the backends, never
+    // the memory module, so they run first: whatever measures the compute buffers during construction needs the
+    // bufts and the final pipeline_parallel flag.
     if (!hparams.vocab_only) {
-        LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
+        if (!measure_only) {
+            LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
+        }
 
         backend_buft.clear();
         backend_ptrs.clear();
@@ -963,16 +1160,27 @@ llama_context::llama_context(
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
                 // (llama.cpp-38af: or its activation twin when the CPU produces activations; re-selected in
                 // sched_reserve() once the placement plan is final)
-                buft = llama_context_cpu_compute_buft(model, buft);
+                buft = llama_context_cpu_compute_buft(model, buft, !measure_only);
             }
 #ifdef GGML_USE_SYCL
             else if (backend_type == GGML_BACKEND_DEVICE_TYPE_GPU && llama_context_dev_is_sycl(dev)) {
                 const int sycl_dev = llama_context_sycl_device_index(dev, sycl_gpu_idx);
 
+                const bool plan_active =
+                    llama_context_sycl_hooks_enabled() && ggml_backend_sycl_has_active_placement_plan();
+
                 if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                    if (plan_active) {
+                        // Its alloc_buffer takes a direct host-pinned allocation before any scope
+                        // check: an unscoped GPU compute buffer in host memory.
+                        throw std::runtime_error(
+                            "tensor-split host compute buffer under an active SYCL placement plan");
+                    }
                     buft = ggml_backend_sycl_host_compute_buffer_type(sycl_dev);
-                    LLAMA_LOG_DEBUG("%s: using SYCL host compute buffer for GPU %d in tensor split mode\n",
-                                    __func__, sycl_dev);
+                    if (!measure_only) {
+                        LLAMA_LOG_DEBUG("%s: using SYCL host compute buffer for GPU %d in tensor split mode\n",
+                                        __func__, sycl_dev);
+                    }
                 } else {
                     bool use_host_compute = false;
                     const char * env_host_compute = std::getenv("GGML_SYCL_HOST_COMPUTE");
@@ -984,23 +1192,45 @@ llama_context::llama_context(
                             if (!ggml_backend_sycl_cpu_offload_available()) {
                                 static bool warned_cpu_offload_unavailable = false;
                                 if (!warned_cpu_offload_unavailable) {
-                                    LLAMA_LOG_WARN("%s: GGML_SYCL_CPU_OFFLOAD=1 but no SYCL CPU device is available; "
-                                                   "keeping GPU compute buffers device-local\n", __func__);
+                                    if (!measure_only) {
+                                        LLAMA_LOG_WARN("%s: GGML_SYCL_CPU_OFFLOAD=1 but no SYCL CPU device is available; "
+                                                       "keeping GPU compute buffers device-local\n", __func__);
+                                    }
                                     warned_cpu_offload_unavailable = true;
                                 }
                             } else {
                                 static bool warned_host_compute_opt_in = false;
                                 if (!warned_host_compute_opt_in) {
-                                    LLAMA_LOG_INFO("%s: GGML_SYCL_CPU_OFFLOAD=1 active; host-pinned compute buffers "
-                                                   "remain opt-in (set GGML_SYCL_HOST_COMPUTE=1 to force)\n", __func__);
+                                    if (!measure_only) {
+                                        LLAMA_LOG_INFO("%s: GGML_SYCL_CPU_OFFLOAD=1 active; host-pinned compute buffers "
+                                                       "remain opt-in (set GGML_SYCL_HOST_COMPUTE=1 to force)\n", __func__);
+                                    }
                                     warned_host_compute_opt_in = true;
                                 }
                             }
                         }
                     }
+                    if (use_host_compute && plan_active) {
+                        // D12: a GPU op's compute buffer in host memory is the forbidden GPU
+                        // zero-copy read of host memory, so the device buft stays.
+                        static bool warned_host_compute_plan = false;
+                        if (!warned_host_compute_plan) {
+                            if (!measure_only) {
+                                LLAMA_LOG_WARN(
+                                    "%s: GGML_SYCL_HOST_COMPUTE=1 is not honoured under an active SYCL "
+                                    "placement plan: a GPU op's compute buffer in host memory is a GPU "
+                                    "zero-copy read of host memory; keeping the device compute buffer\n",
+                                    __func__);
+                            }
+                            warned_host_compute_plan = true;
+                        }
+                        use_host_compute = false;
+                    }
                     if (use_host_compute) {
                         buft = ggml_backend_sycl_cpu_offload_compute_buffer_type(sycl_dev);
-                        LLAMA_LOG_INFO("%s: using SYCL host-pinned compute buffer for GPU %d\n", __func__, sycl_dev);
+                        if (!measure_only) {
+                            LLAMA_LOG_INFO("%s: using SYCL host-pinned compute buffer for GPU %d\n", __func__, sycl_dev);
+                        }
                     }
                 }
 
@@ -1011,10 +1241,29 @@ llama_context::llama_context(
                 const auto hooks = llama_context_sycl_compute_procs(dev);
                 if (hooks.host_compute && hooks.cpu_compute && hooks.cpu_available) {
                     const int sycl_dev = hooks.device_index;
+                    const bool plan_active = hooks.has_active_plan && hooks.has_active_plan();
                     if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                        if (plan_active) {
+                            throw std::runtime_error(
+                                "tensor-split host compute buffer under an active SYCL placement plan");
+                        }
                         buft = hooks.host_compute(sycl_dev);
                     } else if (const char * env = std::getenv("GGML_SYCL_HOST_COMPUTE"); env && std::atoi(env) != 0) {
-                        buft = hooks.cpu_compute(sycl_dev);
+                        if (plan_active) {
+                            static bool warned_host_compute_plan = false;
+                            if (!warned_host_compute_plan) {
+                                if (!measure_only) {
+                                    LLAMA_LOG_WARN(
+                                        "%s: GGML_SYCL_HOST_COMPUTE=1 is not honoured under an active SYCL "
+                                        "placement plan: a GPU op's compute buffer in host memory is a GPU "
+                                        "zero-copy read of host memory; keeping the device compute buffer\n",
+                                        __func__);
+                                }
+                                warned_host_compute_plan = true;
+                            }
+                        } else {
+                            buft = hooks.cpu_compute(sycl_dev);
+                        }
                     } else if (const char * env = std::getenv("GGML_SYCL_CPU_OFFLOAD"); env && std::atoi(env) != 0) {
                         (void) hooks.cpu_available();
                     }
@@ -1027,7 +1276,9 @@ llama_context::llama_context(
             backend_buf_exp_size.push_back(0);
         }
 
-        LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
+        if (!measure_only) {
+            LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
+        }
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
@@ -1077,9 +1328,46 @@ llama_context::llama_context(
         cparams.pipeline_parallel = pipeline_parallel;
 
         if (cparams.pipeline_parallel) {
-            LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+            if (!measure_only) {
+                LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+            }
         }
+    }
 
+    // init the memory module
+    if (!hparams.vocab_only) {
+        llama_memory_params params_mem = {
+            /*.type_k    =*/ params.type_k,
+            /*.type_v    =*/ params.type_v,
+            /*.swa_full  =*/ params.swa_full,
+            /*.ctx_type  =*/ cparams.ctx_type,
+            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+        };
+
+        memory.reset(model.create_memory(params_mem, cparams, measure_only));
+    }
+
+    // the measure-only context's one MEASURE, on a scheduler of its own: no ALLOC, no ladder, no publish
+    if (!hparams.vocab_only && measure_only) {
+        if (cparams.pipeline_parallel) {
+            measure_status = { sched_reserve_status::FAILED,
+                               "pipeline parallelism is on for the measured placement (no plan override is active)" };
+        } else {
+            sched_measure_storage storage(cparams);
+            sched_reserve_state   measure_state = storage.state();
+
+            measure_status = sched_reserve_impl(sched_reserve_mode::MEASURE, measure_state);
+            if (measure_status.status == sched_reserve_status::OK && !storage.cparams.flash_attn &&
+                ggml_is_quantized(params.type_v)) {
+                measure_status = { sched_reserve_status::REFUSED,
+                                   "quantized V cache was requested, but this requires Flash Attention" };
+            }
+            measure_plan = std::move(storage.plan);
+        }
+    }
+
+    // reserve the compute buffers
+    if (!hparams.vocab_only && !measure_only) {
         // llama.cpp-xojq (nphx Task 4b, c-wgxn): run the SYCL auto
         // micro-batch selection trial IN PLACE OF the unconditional
         // sched_reserve() below, when all four conditions hold: the caller
@@ -1090,9 +1378,14 @@ llama_context::llama_context(
         // falls through to today's single sched_reserve() call, unchanged.
         bool sycl_auto_ubatch_trial = false;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-        if (params.n_ubatch_auto && cparams.causal_attn && llama_context_has_sycl_backend(backends)) {
+        const bool sycl_backend_present     = llama_context_has_sycl_backend(backends);
+        bool       sycl_auto_ubatch_enabled = false;
+        // The accessor is consulted only once the cheap conditions hold, so an
+        // older SYCL DSO's proc lookup does not run for a pinned -ub or a
+        // non-causal model.
+        if (params.n_ubatch_auto && cparams.causal_attn && sycl_backend_present) {
 #    ifdef GGML_USE_SYCL
-            sycl_auto_ubatch_trial = ggml_backend_sycl_auto_ubatch_enabled();
+            sycl_auto_ubatch_enabled = ggml_backend_sycl_auto_ubatch_enabled();
 #    else
             ggml_backend_dev_t sycl_dev = nullptr;
             for (auto & backend : backends) {
@@ -1103,9 +1396,11 @@ llama_context::llama_context(
                 }
             }
             auto auto_ubatch_enabled_fn = llama_context_sycl_auto_ubatch_enabled_proc(sycl_dev);
-            sycl_auto_ubatch_trial      = auto_ubatch_enabled_fn && auto_ubatch_enabled_fn();
+            sycl_auto_ubatch_enabled    = auto_ubatch_enabled_fn && auto_ubatch_enabled_fn();
 #    endif
         }
+        sycl_auto_ubatch_trial = llama_auto_ubatch_trial_runs(params.n_ubatch_auto, cparams.causal_attn,
+                                                              sycl_backend_present, sycl_auto_ubatch_enabled);
 #endif
         if (sycl_auto_ubatch_trial) {
             sycl_select_auto_ubatch(params.type_k, params.type_v);
@@ -1121,7 +1416,7 @@ llama_context::llama_context(
     }
 
     // Initialize the full vocabulary token ids for backend samplers.
-    {
+    if (!measure_only) {
         const int n_vocab = model.vocab.n_tokens();
 
         sampling.token_ids_full_vocab.resize(n_vocab);
@@ -1134,12 +1429,19 @@ llama_context::llama_context(
 #endif
 }
 
+llama_context::llama_context(
+        const llama_model & model,
+              llama_context_params params) :
+    llama_context(model, params, nullptr) {
+}
+
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
-    if (!model.hparams.no_alloc && !opt_ctx) {
+    // (a measure-only context ran no ALLOC and has nothing to compare)
+    if (!measure_only && !model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -1147,22 +1449,30 @@ llama_context::~llama_context() {
             const size_t size_exp = backend_buf_exp_size[i];
             const size_t size_act = ggml_backend_sched_get_buffer_size(sched.get(), backend);
             if (size_exp == size_act) {
-                LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
-                    __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
+                if (!measure_only) {
+                    LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
+                        __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
+                }
             } else {
-                LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB, does not match expectation of %8.4f MiB\n",
-                    __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
+                if (!measure_only) {
+                    LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB, does not match expectation of %8.4f MiB\n",
+                        __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
+                }
             }
         }
     }
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-    if (sycl_exec_context_bound && sycl_exec_context.value != 0) {
+    if (!measure_only && sycl_exec_context_bound && sycl_exec_context.value != 0) {
         try {
             synchronize();
         } catch (const std::exception & e) {
-            LLAMA_LOG_ERROR("%s: failed to synchronize before SYCL execution drain: %s\n", __func__, e.what());
+            if (!measure_only) {
+                LLAMA_LOG_ERROR("%s: failed to synchronize before SYCL execution drain: %s\n", __func__, e.what());
+            }
         } catch (...) {
-            LLAMA_LOG_ERROR("%s: failed to synchronize before SYCL execution drain\n", __func__);
+            if (!measure_only) {
+                LLAMA_LOG_ERROR("%s: failed to synchronize before SYCL execution drain\n", __func__);
+            }
         }
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -1177,24 +1487,17 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
-#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-// llama.cpp-xojq (quality round 1 Q5): shared by this function's own BUSY
-// retry below and sycl_select_auto_ubatch()'s per-candidate probe retry --
-// previously each declared its own local `constexpr int max_busy_waits = 7;`
-// with only a comment tying the two together.
-static constexpr int llama_context_sycl_max_busy_waits = 7;
-#endif
-
-// llama.cpp-oyfl: the constructor's own call, right after model activation,
-// before any auto flash_attn_type is resolved -- the FULL runtime-context
-// transaction (KV replan, MoE MMID reaccount/materialize, plan republish),
-// since this is where n_ctx/n_ubatch are established for the context in the
-// first place. See the declaration in llama-context.h. resolve_fused_ops()
-// does NOT call this: once an AUTO flash_attn_type resolves, only
-// flash_attn_enabled has changed, so it calls the narrow
-// sycl_recheck_runtime_context_flash_attn() below instead, rather than
-// re-running this whole transaction for no reason.
-void llama_context::sycl_resync_runtime_context_flash_attn() {
+// The publish: the FULL runtime-context transaction (KV replan, MoE MMID
+// reaccount/materialize, plan republish) on every SYCL backend this context
+// has, since this is where n_ctx/n_ubatch are established for the context in
+// the first place. It returns what happened instead of throwing, and it never
+// waits: a result that is not OK is mapped by value, not retried.
+//   - every non-OK result is a REFUSED naming the result code, BUSY included;
+//     BUSY is also named a [CONTEXT-PLAN-BUG], since under the replan scope
+//     the backend answers a non-ACTIVE module with PLAN_REJECTED instead.
+// sycl_resync_runtime_context_flash_attn() below is the throwing form for the
+// callers that still run before a reserve of their own.
+sched_reserve_result llama_context::sycl_publish_runtime_context(bool flash_attn) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     for (auto & backend : backends) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -1218,23 +1521,41 @@ void llama_context::sycl_resync_runtime_context_flash_attn() {
             // declaration comment, ggml-sycl.h). llama.cpp-uajm:
             // cparams.swa_full likewise -- with it set llama_kv_cache_iswa
             // allocates SWA layers at full n_ctx and the planner must too.
-            auto rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
-                                         cparams.kv_unified, cparams.swa_full, cparams.flash_attn);
-            // Context construction may overlap enough live updates to
-            // exhaust the model's finite ticket pool transiently. Wait
-            // with bounded exponential backoff instead of spinning three
-            // immediate calls; preserve BUSY if capacity never frees.
-            for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < llama_context_sycl_max_busy_waits; ++wait) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
-                rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
-                                        cparams.kv_unified, cparams.swa_full, cparams.flash_attn);
+            const auto rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
+                                               cparams.kv_unified, cparams.swa_full, flash_attn);
+            // Under the process-global replan scope (L0) the backend's module
+            // guard is the single emission site for "the module is not
+            // ACTIVE": it logs, aborts under strict and answers PLAN_REJECTED,
+            // never BUSY. A BUSY that still reaches this call means the guard
+            // drifted, so say so; the REFUSED below carries the result code.
+            if (rc == GGML_SYCL_LIFECYCLE_BUSY) {
+                LLAMA_LOG_ERROR(
+                    "[CONTEXT-PLAN-BUG] publish answered BUSY under the replan scope: module guard drifted\n");
             }
+            // Not OK is mapped by value and never waited on. The caller (sched_reserve_nothrow) leaves
+            // sched_need_reserve set, so the next decode or encode runs the whole transaction again,
+            // this publish included; until one succeeds no graph is computed (decode and encode return -2).
             if (rc != GGML_SYCL_LIFECYCLE_OK) {
-                throw std::runtime_error(format("failed to activate exact SYCL model plan: result=%d", (int) rc));
+                return { sched_reserve_status::REFUSED,
+                         format("failed to activate exact SYCL model plan: result=%d", (int) rc) };
             }
         }
     }
 #endif
+    return { sched_reserve_status::OK, "" };
+}
+
+// llama.cpp-oyfl: the constructor's own call, right after model activation,
+// before any auto flash_attn_type is resolved. See the declaration in
+// llama-context.h. resolve_fused_ops() does NOT call this: once an AUTO
+// flash_attn_type resolves, only flash_attn_enabled has changed, so it calls
+// the narrow sycl_recheck_runtime_context_flash_attn() below instead, rather
+// than re-running this whole transaction for no reason.
+void llama_context::sycl_resync_runtime_context_flash_attn() {
+    const sched_reserve_result result = sycl_publish_runtime_context(cparams.flash_attn);
+    if (result.status != sched_reserve_status::OK) {
+        throw std::runtime_error(result.reason);
+    }
 }
 
 // llama.cpp-oyfl: the narrow re-check, called ONLY by resolve_fused_ops()
@@ -1245,8 +1566,7 @@ void llama_context::sycl_resync_runtime_context_flash_attn() {
 // read-only: it takes the same module-admission guard and tensor-inventory
 // lock the full transaction does) -- no BUSY retry here: BUSY from this
 // call means the module admission guard refused because a shutdown is in
-// progress, not the lock contention the full transaction's own backoff
-// exists for, so retrying would not help.
+// progress, which a second try would not change.
 void llama_context::sycl_recheck_runtime_context_flash_attn() {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     for (auto & backend : backends) {
@@ -1276,33 +1596,38 @@ void llama_context::sycl_recheck_runtime_context_flash_attn() {
 #endif
 }
 
-void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
-    const char * func = __func__;
-    auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
+void llama_context::resolve_fused_ops(sched_reserve_state &          state,
+                                      const llama_memory_context_i * mctx,
+                                      uint32_t                       n_seqs) {
+    GGML_ASSERT(state.resolution != nullptr);
+    fused_resolution & resolution = *state.resolution;
+
+    auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled, fused_resolution_entry id) {
         if (!enabled) {
             return;
         }
 
         const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs;
 
-        auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
+        auto * gf = graph_reserve(state, n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
         if (!gf) {
             throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
         }
 
-        bool               device_mismatch = false;
-        uint32_t           n_cpu_landings  = 0;
-        int                cpu_landing_il  = -1;
+        fused_resolution_entry_data entry;
+        entry.present    = true;
+        entry.probe_name = probe.name;
+
         ggml_backend_dev_t cpu_landing_dev = nullptr;
 
-        for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
+        for (const auto & node : static_cast<llm_graph_result *>(state.gf_res_reserve.get())->get_fused_nodes()) {
             if (node.op != probe.op) {
                 continue;
             }
 
             GGML_ASSERT(node.il >= 0);
 
-            ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
+            ggml_backend_t     backend_fused = ggml_backend_sched_get_tensor_backend(state.sched.get(), node.tensor);
             ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
 
             // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
@@ -1322,42 +1647,37 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                 // compute-buffer request at n_ctx=131072 on GPT-OSS 20B traced to exactly
                 // this codepath).
                 if (!device_fused || ggml_backend_dev_type(device_fused) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    LLAMA_LOG_WARN(
-                        "%s: layer %d is assigned to device %s but %s "
-                                "is assigned to device %s (usually due to missing support)\n",
-                        func, node.il, device_layer ? ggml_backend_dev_name(device_layer) : "none", probe.name,
-                        device_fused ? ggml_backend_dev_name(device_fused) : "none");
-                    device_mismatch = true;
+                    entry.mismatch           = true;
+                    entry.mismatch_layer     = node.il;
+                    entry.mismatch_layer_dev = device_layer ? ggml_backend_dev_name(device_layer) : "none";
+                    entry.mismatch_probe_dev = device_fused ? ggml_backend_dev_name(device_fused) : "none";
                     break;
                 }
 
-                n_cpu_landings++;
-                cpu_landing_il  = node.il;
-                cpu_landing_dev = device_fused;
+                entry.n_cpu_landings++;
+                entry.cpu_landing_layer = node.il;
+                cpu_landing_dev         = device_fused;
             }
         }
 
-        if (device_mismatch) {
-            enabled = false;
-            LLAMA_LOG_WARN("%s: %s not supported, set to disabled\n", func, probe.name);
-        } else {
-            enabled = true;
-            if (n_cpu_landings > 0) {
-                LLAMA_LOG_WARN(
-                    "%s: %s executes on %s for %u layer(s) (e.g. layer %d) -- "
-                            "the executor follows data placement, not a capability gap\n",
-                    func, probe.name, cpu_landing_dev ? ggml_backend_dev_name(cpu_landing_dev) : "CPU", n_cpu_landings,
-                    cpu_landing_il);
-            }
-            LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
-        }
+        entry.enabled         = !entry.mismatch;
+        entry.cpu_landing_dev = cpu_landing_dev ? ggml_backend_dev_name(cpu_landing_dev) : "CPU";
+        enabled               = entry.enabled;
+        resolution.entry[id]  = entry;
     };
 
-    if (cparams.auto_fa) {
-        resolve(llm_fused_op_flash_attn_probe, cparams.flash_attn);
-        cparams.auto_fa = false;
+    // A group's header is recorded when its group starts, so a throw in the group's first probe
+    // still has it.
+    auto start_group = [&](fused_resolution_entry id, const char * header) {
+        resolution.entry[id].present = true;
+        resolution.entry[id].header  = header;
+    };
 
-        // llama.cpp-oyfl: cparams.flash_attn just went from "not yet
+    if (state.cparams.auto_fa) {
+        resolve(llm_fused_op_flash_attn_probe, state.cparams.flash_attn, FUSED_RESOLUTION_ENTRY_FA);
+        state.cparams.auto_fa = false;
+
+        // llama.cpp-oyfl: state.cparams.flash_attn just went from "not yet
         // resolved" (defaulted true for AUTO, see its init above) to its
         // real, hardware-resolved value. The SYCL non-FA attention scratch
         // guard threaded through the constructor's runtime-context call saw
@@ -1368,28 +1688,31 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         // not a mid-prefill abort. Narrow re-check only: n_ctx/n_ubatch
         // have not changed, only flash_attn_enabled has, so this does not
         // need the full runtime-context transaction.
-        sycl_recheck_runtime_context_flash_attn();
+        // A MEASURE publishes nothing, so there is nothing for the re-check to check.
+        if (state.measure == nullptr) {
+            sycl_recheck_runtime_context_flash_attn();
+        }
     }
 
-    if (cparams.auto_fgdn) {
-        LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
-        resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
-        resolve(llm_fused_op_gdn_ch_probe, cparams.fused_gdn_ch);
-        cparams.auto_fgdn = false;
+    if (state.cparams.auto_fgdn) {
+        start_group(FUSED_RESOLUTION_ENTRY_GDN_HEADER, "resolving fused Gated Delta Net support:");
+        resolve(llm_fused_op_gdn_ar_probe, state.cparams.fused_gdn_ar, FUSED_RESOLUTION_ENTRY_GDN_AR);
+        resolve(llm_fused_op_gdn_ch_probe, state.cparams.fused_gdn_ch, FUSED_RESOLUTION_ENTRY_GDN_CH);
+        state.cparams.auto_fgdn = false;
     }
 
-    if (cparams.auto_flid) {
-        LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
-        resolve(llm_fused_op_lid_probe, cparams.fused_lid);
-        cparams.auto_flid = false;
+    if (state.cparams.auto_flid) {
+        start_group(FUSED_RESOLUTION_ENTRY_LID_HEADER, "resolving fused Lightning Indexer support:");
+        resolve(llm_fused_op_lid_probe, state.cparams.fused_lid, FUSED_RESOLUTION_ENTRY_LID);
+        state.cparams.auto_flid = false;
     }
 
-    if (cparams.auto_fhc) {
-        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
-        resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
-        resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
-        resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
-        cparams.auto_fhc = false;
+    if (state.cparams.auto_fhc) {
+        start_group(FUSED_RESOLUTION_ENTRY_HC_HEADER, "resolving fused DeepSeek V4 HC support:");
+        resolve(llm_fused_op_dsv4_hc_pre_probe, state.cparams.fused_dsv4_hc_pre, FUSED_RESOLUTION_ENTRY_HC_PRE);
+        resolve(llm_fused_op_dsv4_hc_comb_probe, state.cparams.fused_dsv4_hc_comb, FUSED_RESOLUTION_ENTRY_HC_COMB);
+        resolve(llm_fused_op_dsv4_hc_post_probe, state.cparams.fused_dsv4_hc_post, FUSED_RESOLUTION_ENTRY_HC_POST);
+        state.cparams.auto_fhc = false;
     }
 }
 
@@ -1405,9 +1728,8 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 // silently falls off the GPU path is not a win. Per candidate, on every
 // SYCL backend this context has: Task 2's non-publishing probe
 // (ggml_backend_sycl_probe_runtime_context_for_model) must accept it without
-// demoting KV, with the same bounded exponential BUSY backoff
-// sycl_resync_runtime_context_flash_attn() uses just above (transient
-// lease/lock contention, not a candidate-shape refusal); only then is it
+// demoting KV (a BUSY answer is not retried: the candidate loses with
+// "transaction busy"); only then is it
 // published (sycl_resync_runtime_context_flash_attn(), which every SYCL
 // backend's probe already accepted) and given a full sched_reserve() cycle
 // -- a fresh sched+galloc every call (sched_reserve()'s own
@@ -1437,7 +1759,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 // "ladder exhausted" (no candidate lost -- either the cap stopped the ladder or
 // all four rungs were accepted), "MoE GPU routing ceiling" (the MoE cap bound,
 // whether it narrowed a larger batch/ctx cap or merely matched it),
-// "transaction refused", "transaction busy" (BUSY persisted past the backoff),
+// "transaction refused", "transaction busy" (BUSY: the probe is not retried),
 // "not the published model" (GGML_SYCL_LIFECYCLE_STALE_IDENTITY -- a second
 // model published after this one loaded), "KV would be demoted", "compute
 // buffer fell back to host", "compute buffers did not fit" (the in-loop
@@ -1490,36 +1812,29 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
 
     const auto & ladder = llama_auto_ubatch_ladder;
 
-    uint32_t     cap  = std::min(cparams.n_batch, cparams.n_ctx);
-    const char * stop = "ladder exhausted";
-    if (model.hparams.n_expert > 0) {
-        // A direct GGML_USE_SYCL build's accessor is a real, always-defined
-        // function -- called unconditionally, no null check (there is
-        // nothing to be null). The DL-without-SYCL lookup genuinely can
-        // return nullptr on an older SYCL DSO, so it degrades to `cap`
-        // (no MoE-specific narrowing) rather than dereferencing one.
+    // A direct GGML_USE_SYCL build's accessor is a real, always-defined
+    // function -- called unconditionally, no null check (there is nothing to
+    // be null). The DL-without-SYCL lookup genuinely can return nullptr on an
+    // older SYCL DSO, so it reports the ceiling unavailable and the cap gets
+    // no MoE-specific narrowing. A dense model never consults the ceiling.
 #    ifdef GGML_USE_SYCL
-        const uint32_t moe_cap           = ggml_backend_sycl_moe_gpu_ubatch_max();
-        const bool     moe_cap_available = true;
+    const uint32_t moe_cap           = model.hparams.n_expert > 0 ? ggml_backend_sycl_moe_gpu_ubatch_max() : 0;
+    const bool     moe_cap_available = true;
 #    else
-        const uint32_t moe_cap           = moe_cap_fn ? moe_cap_fn() : cap;
-        const bool     moe_cap_available = moe_cap_fn != nullptr;
+    const uint32_t moe_cap           = (model.hparams.n_expert > 0 && moe_cap_fn) ? moe_cap_fn() : 0;
+    const bool     moe_cap_available = moe_cap_fn != nullptr;
 #    endif
-        // Report the MoE ceiling reason whenever it is the BINDING cap,
-        // not only when it strictly narrows a larger batch/ctx cap -- a MoE
-        // context whose batch/ctx cap already equals moe_cap (e.g. cap ==
-        // 512) is bound by the ceiling exactly as much as one where moe_cap
-        // is smaller, so "ladder exhausted" would misreport why the ladder
-        // stopped. Gated on moe_cap_available: the DL-without-SYCL branch
-        // above degrades moe_cap to `cap` itself (no MoE-specific narrowing)
-        // when the accessor is absent, which would otherwise satisfy
-        // `moe_cap <= cap` trivially and report the ceiling reason for every
-        // such MoE model even though no ceiling was ever consulted.
-        if (moe_cap_available && moe_cap <= cap) {
-            cap  = moe_cap;
-            stop = "MoE GPU routing ceiling";
-        }
-    }
+    // The MoE ceiling is the binding cap whenever it does not exceed the
+    // batch/ctx cap, not only when it strictly narrows it -- a context whose
+    // batch/ctx cap already equals moe_cap is bound by the ceiling exactly as
+    // much as one where moe_cap is smaller, so "ladder exhausted" would
+    // misreport why the ladder stopped. The helper gates on
+    // moe_cap_available so a DSO without the accessor never reports a ceiling
+    // that was never consulted.
+    bool           moe_bound = false;
+    const uint32_t cap       = llama_auto_ubatch_cap(cparams.n_batch, cparams.n_ctx, model.hparams.n_expert, moe_cap,
+                                                     moe_cap_available, &moe_bound);
+    const char *   stop      = moe_bound ? "MoE GPU routing ceiling" : "ladder exhausted";
 
     // llama.cpp-xojq (quality round 1 Q2a): the smallest ladder rung does
     // not fit at all -- any -c below 512, or llama-bench's own pp128/tg128
@@ -1560,7 +1875,7 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // llama.cpp-7n6n: ONE per-candidate validator,
     // shared by the cache-hit revalidation below and the ladder loop -- the
     // two call sites used to carry independently-maintained copies of this
-    // exact sequence (probe with busy backoff -> publish in a try/catch ->
+    // exact sequence (probe, a BUSY losing the candidate -> publish in a try/catch ->
     // sched_reserve -> host-fallback check), which is also where a bug used
     // to live: the cache copy wrote a losing reason into the SAME `stop`
     // variable the ladder's own vocabulary owns, so a cache miss could leave
@@ -1584,20 +1899,11 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
             // actually publish with, or its accept/reject answer is for the
             // wrong KV shape (ggml-sycl.h, this probe's declaration).
             // llama.cpp-uajm: and the same swa_full, for the same reason.
-            auto rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.kv_unified,
-                               cparams.swa_full, cparams.flash_attn, &probe);
+            const auto rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.kv_unified,
+                                     cparams.swa_full, cparams.flash_attn, &probe);
 
-            // Same bounded exponential backoff as
-            // sycl_resync_runtime_context_flash_attn()'s own BUSY retry
-            // above -- transient lease/lock contention, not a
-            // candidate-shape refusal. Shares llama_context_sycl_max_busy_
-            // waits with that retry (quality round 1 Q5).
-            for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < llama_context_sycl_max_busy_waits; ++wait) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
-                rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.kv_unified,
-                              cparams.swa_full, cparams.flash_attn, &probe);
-            }
-
+            // BUSY is the module-admission refusal, not lock contention, so
+            // the probe is not retried: the candidate simply loses.
             if (rc == GGML_SYCL_LIFECYCLE_BUSY) {
                 return "transaction busy";
             }
@@ -1799,15 +2105,34 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     uint32_t     cache_resume_ubatch = 0;  // the validated value the resume started from
     std::string  cache_resume_reason;      // its stored reason, for the "unchanged outcome" compare at the store gate
 
+    // The one tuning-cache lookup. A cached value below fallback_ubatch must
+    // not win either (the "never silently shrink" contract applies to a cached
+    // hit exactly as much as to a fresh ladder rung), so the value counts only
+    // when llama_auto_ubatch_cached_valid accepts it; that same value feeds
+    // the rung set, so a cache candidate is always a member of it.
+    uint32_t   cached_ubatch         = 0;
+    char       cached_reason_buf[64] = { 0 };
+    const bool cache_found =
+        cache_available && cache_lookup_fn(&cache_key, &cached_ubatch, cached_reason_buf, sizeof(cached_reason_buf));
+    const bool     cache_usable = cache_found && llama_auto_ubatch_cached_valid(ladder, llama_auto_ubatch_ladder_size,
+                                                                                cached_ubatch, fallback_ubatch, cap);
+    const uint32_t cache_set_value = cache_usable ? cached_ubatch : 0;
+
+    // The candidates this trial may try: fallback_ubatch, the ladder rungs in
+    // [fallback_ubatch, cap] and the usable cached value, ascending. The loop
+    // below iterates the set's ladder members, so it carries no bound checks
+    // of its own -- a rung outside [fallback_ubatch, cap] is not in the set.
+    uint32_t     rung_set[llama_auto_ubatch_rung_set_capacity];
+    uint32_t     rungs[llama_auto_ubatch_rung_set_capacity];
+    const size_t n_rung_set =
+        llama_auto_ubatch_rung_set(ladder, llama_auto_ubatch_ladder_size, fallback_ubatch, cap, cache_set_value,
+                                   rung_set, llama_auto_ubatch_rung_set_capacity);
+    const size_t n_rungs = llama_auto_ubatch_ladder_members(rung_set, n_rung_set, ladder, llama_auto_ubatch_ladder_size,
+                                                            rungs, llama_auto_ubatch_rung_set_capacity);
+    std::vector<uint32_t> rung_ladder(rungs, rungs + n_rungs);
+
     if (cache_available) {
-        uint32_t cached_ubatch         = 0;
-        char     cached_reason_buf[64] = { 0 };
-        // A cached value below fallback_ubatch must not win either -- see the
-        // ladder loop's own floor-skip comment below for why (the "never
-        // silently shrink" contract applies to a cached hit exactly as much as
-        // to a fresh ladder rung).
-        if (!cache_lookup_fn(&cache_key, &cached_ubatch, cached_reason_buf, sizeof(cached_reason_buf)) ||
-            cached_ubatch < ladder[0] || cached_ubatch > cap || cached_ubatch < fallback_ubatch) {
+        if (!cache_usable) {
             cache_state = "miss";
         } else {
             // The cached candidate was actually validated here (whether it
@@ -1877,30 +2202,24 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
         return;
     }
 
-    for (uint32_t c : ladder) {
+    // Never let the ladder pick something SMALLER than the caller's own
+    // explicit n_ubatch (fallback_ubatch) -- a raw-API caller can set
+    // llama_context_params.n_ubatch above the ladder's first rung together
+    // with n_ubatch_auto=true, and the "never silently shrink" gotcha
+    // (docs/plans/2026-09-10-auto-ubatch.md) applies to that value too, not
+    // only to a rung the trial itself already accepted. rung_ladder holds no
+    // rung under fallback_ubatch or over cap, so a rung the ladder never tries
+    // can never become last_good; if nothing wins, last_good falls through to
+    // fallback_ubatch itself below, which was always safe -- it is exactly
+    // today's pre-trial default.
+    for (uint32_t c : rung_ladder) {
         if (!ladder_needed) {
-            break;
-        }
-        if (c > cap) {
             break;
         }
         // llama.cpp-7n6n: a non-terminal cache hit
         // already validated `cache_resume_above` (0 when there was no such
         // hit) -- do not re-try rungs at or below it.
         if (c <= cache_resume_above) {
-            continue;
-        }
-        // Never let the ladder pick something SMALLER than the caller's own
-        // explicit n_ubatch (fallback_ubatch) -- a raw-API caller can set
-        // llama_context_params.n_ubatch above the ladder's first rung together
-        // with n_ubatch_auto=true, and the "never silently shrink" gotcha
-        // (docs/plans/2026-09-10-auto-ubatch.md) applies to that value too,
-        // not only to a rung the trial itself already accepted. A rung the
-        // ladder never tries can never become last_good, so this cannot
-        // introduce a value BELOW fallback_ubatch; if nothing at or above it
-        // wins, last_good falls through to fallback_ubatch itself below, which
-        // was always safe -- it is exactly today's pre-trial default.
-        if (c < fallback_ubatch) {
             continue;
         }
         tried += (tried.empty() ? "" : ",") + std::to_string(c);
@@ -2027,7 +2346,8 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
 #endif
 }
 
-static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+// `log` is false for a measure-only context, which prints nothing
+static int llama_graph_n_input_tensors(ggml_cgraph * gf, bool log) {
     std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> users;
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         ggml_tensor * node = ggml_graph_node(gf, i);
@@ -2043,6 +2363,10 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
                 users[src].push_back(node);
             }
         }
+    }
+
+    if (!log) {
+        return (int) users.size();
     }
 
     for (const auto & [tensor, nodes] : users) {
@@ -2061,6 +2385,10 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
+sched_reserve_state llama_context::member_reserve_state() {
+    return { sched, gf_res_prev, gf_res_reserve, gf_res_prev_active, n_outputs, n_input_tensors, cparams };
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -2068,58 +2396,242 @@ void llama_context::sched_reserve() {
 
     sched_need_reserve = false;
 
-    LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
+    const sched_reserve_result result = sched_reserve_transaction();
+    if (result.status != sched_reserve_status::OK) {
+        throw std::runtime_error(result.reason);
+    }
+}
+
+bool llama_context::sched_reserve_nothrow() {
+    if (!sched_need_reserve) {
+        return true;
+    }
+
+    sched_need_reserve = false;
+
+    try {
+        const sched_reserve_result result = sched_reserve_transaction();
+        if (result.status == sched_reserve_status::OK) {
+            return true;
+        }
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, result.reason.c_str());
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception\n", __func__);
+    }
+
+    // The scheduler is no longer reserved for the graphs decode builds, so the
+    // next decode or encode reserves again from the start.
+    sched_need_reserve = true;
+    return false;
+}
+
+void llama_context::fused_resolution_report(const fused_resolution & record) {
+    if (!measure_only) {
+        fused_resolution_emit(record, fused_resolution_printed, "resolve_fused_ops", fused_resolution_sink);
+    }
+}
+
+void llama_context::fused_resolution_report_lost() noexcept {
+    if (!measure_only) {
+        LLAMA_LOG_WARN("resolve_fused_ops: resolution lines lost: exception while unwinding\n");
+    }
+}
+
+// The reserve transaction. A planned context measures first, publishes what the measure
+// resolved, and only then allocates; any other context allocates, as it always has. The
+// measure's resolved fused-op flags reach the context's own cparams only after the publish
+// has succeeded, so a refused publish leaves the context as it found it.
+sched_reserve_result llama_context::sched_reserve_transaction() {
+    if (plan_caps) {
+        sched_measure_storage storage(cparams);
+        sched_reserve_state   measure_state = storage.state();
+
+        const sched_reserve_result measured = sched_reserve_impl(sched_reserve_mode::MEASURE, measure_state);
+        if (measured.status != sched_reserve_status::OK) {
+            return measured;
+        }
+
+        // the tenant section: the measured compute caps, per tier
+        const std::vector<llama_tenant_buft_caps> tenant_caps = measure_tenant_caps(storage.plan);
+        std::string                               tenant_reason;
+        if (!llama_tenant_section_from_caps(tenant_caps, tenant_section, tenant_reason)) {
+            return { sched_reserve_status::REFUSED, tenant_reason };
+        }
+        tenant_key = llama_tenant_key_digest(tenant_section);
+        tenant_plan_report(storage.plan, storage.cparams.n_ubatch);
+
+        // the resolution is printed at the publish attempt, whether it commits or is refused
+        fused_resolution_report(storage.resolution);
+
+        const sched_reserve_result published = sycl_publish_runtime_context(storage.cparams.flash_attn);
+        if (published.status != sched_reserve_status::OK) {
+            return published;
+        }
+
+        cparams.flash_attn         = storage.cparams.flash_attn;
+        cparams.auto_fa            = storage.cparams.auto_fa;
+        cparams.fused_gdn_ar       = storage.cparams.fused_gdn_ar;
+        cparams.fused_gdn_ch       = storage.cparams.fused_gdn_ch;
+        cparams.auto_fgdn          = storage.cparams.auto_fgdn;
+        cparams.fused_lid          = storage.cparams.fused_lid;
+        cparams.auto_flid          = storage.cparams.auto_flid;
+        cparams.fused_dsv4_hc_pre  = storage.cparams.fused_dsv4_hc_pre;
+        cparams.fused_dsv4_hc_comb = storage.cparams.fused_dsv4_hc_comb;
+        cparams.fused_dsv4_hc_post = storage.cparams.fused_dsv4_hc_post;
+        cparams.auto_fhc           = storage.cparams.auto_fhc;
+    }
+
+    sched_reserve_state state = member_reserve_state();
+    fused_resolution    resolution;
+    state.resolution = &resolution;
+    return sched_reserve_impl(sched_reserve_mode::ALLOC, state);
+}
+
+std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sched_measure_plan & plan) const {
+    std::vector<llama_tenant_buft_caps> out;
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    for (const auto & entry : plan.bufts) {
+        for (size_t i = 0, sycl_ordinal = 0; i < backend_ptrs.size(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+            if (llama_context_dev_is_sycl(dev)) {
+                // the device index its name carries; the position among SYCL backends is the fallback
+                if (entry.buft == backend_buft[i]) {
+                    llama_tenant_buft_caps c;
+                    c.device = llama_context_sycl_device_index(dev, (int) sycl_ordinal);
+                    c.host   = false;
+                    c.cap    = entry.cap;
+                    c.max_chunk_size = entry.max_chunk_size;
+                    llama_tenant_caps_set_peaks(c, entry.peaks);
+                    out.push_back(c);
+                    break;
+                }
+                sycl_ordinal++;
+                continue;
+            }
+            // The CPU backend computes in the host buffer type of the first model device, or in that
+            // buffer's activation twin when the CPU produces activations a SYCL op consumes
+            // (llama_context_cpu_compute_buft): the same pinned host memory under two identities.
+            if (entry.buft == backend_buft[i] && !model.devices.empty() &&
+                llama_context_dev_is_sycl(model.devices[0].dev) &&
+                (entry.buft == ggml_backend_dev_host_buffer_type(model.devices[0].dev) ||
+                 entry.buft == llama_context_sycl_cpu_activation_buft(model.devices[0].dev))) {
+                llama_tenant_buft_caps c;
+                c.device = -1;
+                c.host   = true;
+                c.cap    = entry.cap;
+                c.max_chunk_size = entry.max_chunk_size;
+                llama_tenant_caps_set_peaks(c, entry.peaks);
+                out.push_back(c);
+                break;
+            }
+        }
+    }
+#else
+    GGML_UNUSED(plan);
+#endif
+    return out;
+}
+
+void llama_context::tenant_plan_report(const sched_measure_plan & plan, uint32_t n_ubatch) {
+    // the devices the section names a compute slot on, in section order
+    std::vector<int32_t> devices;
+    for (const auto & e : tenant_section) {
+        if (e.cohort == GGML_SYCL_CONTEXT_COHORT_COMPUTE &&
+            std::find(devices.begin(), devices.end(), e.device) == devices.end()) {
+            devices.push_back(e.device);
+        }
+    }
+    for (const int32_t dev : devices) {
+        llama_tenant_plan_line_fields f;
+        f.ctx_id     = (uint32_t) sycl_exec_context.value;
+        f.device     = dev;
+        f.n_ubatch   = n_ubatch;
+        f.n_measured = plan.n_measured;
+        f.measure_ms = plan.measure_ms;
+        f.republish  = tenant_republish;
+        f.covered    = tenant_covered;
+        for (const auto & e : tenant_section) {
+            if (e.cohort == GGML_SYCL_CONTEXT_COHORT_COMPUTE && e.device == dev) {
+                f.compute_load += e.slot_bytes;
+                if (e.slot_index == 0) {
+                    f.cap0 = e.slot_bytes;
+                }
+            }
+        }
+        f.compute_delta          = (int64_t) f.compute_load - (int64_t) tenant_compute_load[dev];
+        tenant_compute_load[dev] = f.compute_load;
+        LLAMA_LOG_INFO("%s\n", llama_tenant_plan_line(f).c_str());
+    }
+}
+
+sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, sched_reserve_state & state) {
+    // An exception leaving this reserve (a throw inside resolve_fused_ops, say) still prints what the
+    // record holds; a normal return prints nothing here.
+    GGML_ASSERT(state.resolution != nullptr);
+    fused_resolution_guard_arg    guard_arg = { this, state.resolution };
+    fused_resolution_unwind_guard unwind_guard(fused_resolution_report_trampoline, fused_resolution_lost_trampoline,
+                                               &guard_arg);
+
+    if (mode == sched_reserve_mode::MEASURE) {
+        return sched_measure_impl(state);
+    }
+
+    LLAMA_LOG_INFO("%s: reserving ...\n", "sched_reserve");
 
     synchronize();
 
     const int64_t t_start_us = ggml_time_us();
 
-    const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_seqs   = state.cparams.n_seq_max;
+    const uint32_t n_tokens = std::min(state.cparams.n_ctx, state.cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
-    LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
+    LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", "sched_reserve", max_nodes);
 
-    for (auto & res : gf_res_prev) {
+    for (auto & res : state.gf_res_prev) {
         res.reset();
     }
-    gf_res_reserve.reset(new llm_graph_result(max_nodes));
-    gf_res_prev_active = nullptr;
+    state.gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    state.gf_res_prev_active = nullptr;
 
-    // llama.cpp-38af: re-select the CPU backend's compute buft against the placement plan as it
-    // stands NOW. The auto-ubatch candidate and settle resyncs re-plan after the constructor chose
-    // it, and no plan mutation happens between here and the scheduler's construction (the narrow
-    // flash-attn recheck in resolve_fused_ops() runs with allow_replan=false), so this is the final
-    // answer for this scheduler; the pipeline-parallel retry below reuses it.
-    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-        if (!model.devices.empty() &&
-            ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            backend_buft[i] =
-                llama_context_cpu_compute_buft(model, ggml_backend_get_default_buffer_type(backend_ptrs[i]));
-        }
+    // llama.cpp-38af: the CPU compute buft as the plan stands now (see the helper).
+    llama_context_cpu_compute_buft_reselect(model, backend_ptrs, backend_buft, true);
+
+    // The scheduler is created inside the scope, so its allocator reads the context's frozen
+    // chunk caps. Only a context that owns the copy opens one.
+    const llama_context_sycl_plan_procs plan_procs = llama_context_sycl_plan_procs_for(backends);
+    llama_plan_scope plan_scope(plan_procs, (uint32_t) sycl_exec_context.value, GGML_SYCL_PLAN_SCOPE_ALLOC,
+                                plan_caps.get());
+    if (plan_caps && !plan_scope.is_open()) {
+        return { sched_reserve_status::FAILED, "the ALLOC plan scope did not open" };
     }
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
+                                             state.cparams.pipeline_parallel, state.cparams.op_offload));
 #ifdef GGML_USE_SYCL
-    llama_context_sycl_attach_sched_plan(sched.get(), backends);
+    llama_context_sycl_attach_sched_plan(state.sched.get(), backends);
 #endif
 
     llama_memory_context_ptr mctx;
     if (memory) {
-        LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
+        LLAMA_LOG_DEBUG("%s: reserving full memory module\n", "sched_reserve");
         mctx = memory->init_full();
         if (!mctx) {
-            throw std::runtime_error("failed to initialize memory module");
+            return { sched_reserve_status::FAILED, "failed to initialize memory module" };
         }
     }
 
     // avoid reserving graphs with zero outputs - assume one output per sequence
     const int n_outputs = n_seqs;
 
-    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
+    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", "sched_reserve", n_tokens, n_seqs,
+                    n_outputs);
 
-    resolve_fused_ops(mctx.get(), n_seqs);
+    resolve_fused_ops(state, mctx.get(), n_seqs);
+    fused_resolution_report(*state.resolution);
 
     // reserve worst-case graph
     int n_splits_pp        = -1;
@@ -2132,44 +2644,50 @@ void llama_context::sched_reserve() {
     int n_inputs_tg        = -1;
     int n_input_tensors_tg = -1;
 
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    const uint32_t n_outputs_pp = std::min(n_tokens, state.cparams.n_outputs_max);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+        auto * gf = graph_reserve(state, n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc,
+                                  model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
-            if (cparams.pipeline_parallel) {
-                LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
-                cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+            if (state.cparams.pipeline_parallel) {
+                // A planned context never has pipeline parallelism (the constructor turns it
+                // off under a plan), so this retry cannot rebuild a scheduler the scope has
+                // already handed its caps to.
+                GGML_ASSERT(!plan_caps);
+                LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n",
+                               "sched_reserve");
+                state.cparams.pipeline_parallel = false;
+                state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                                                         max_nodes, false, state.cparams.op_offload));
 #ifdef GGML_USE_SYCL
-                llama_context_sycl_attach_sched_plan(sched.get(), backends);
+                llama_context_sycl_attach_sched_plan(state.sched.get(), backends);
 #endif
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                gf = graph_reserve(state, n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
-                throw std::runtime_error("failed to allocate compute pp buffers");
+                return { sched_reserve_status::FAILED, "failed to allocate compute pp buffers" };
             }
         }
 
-        n_splits_pp        = ggml_backend_sched_get_n_splits(sched.get());
+        n_splits_pp        = ggml_backend_sched_get_n_splits(state.sched.get());
         n_nodes_pp         = ggml_graph_n_nodes(gf);
-        n_inputs_pp        = get_gf_res_reserve()->inputs.size();
-        n_input_tensors_pp = this->n_input_tensors;
+        n_inputs_pp        = static_cast<llm_graph_result *>(state.gf_res_reserve.get())->inputs.size();
+        n_input_tensors_pp = state.n_input_tensors;
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
     {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(state, n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
-            throw std::runtime_error("failed to allocate compute tg buffers");
+            return { sched_reserve_status::FAILED, "failed to allocate compute tg buffers" };
         }
 
-        n_splits_tg        = ggml_backend_sched_get_n_splits(sched.get());
+        n_splits_tg        = ggml_backend_sched_get_n_splits(state.sched.get());
         n_nodes_tg         = ggml_graph_n_nodes(gf);
-        n_inputs_tg        = get_gf_res_reserve()->inputs.size();
-        n_input_tensors_tg = this->n_input_tensors;
+        n_inputs_tg        = static_cast<llm_graph_result *>(state.gf_res_reserve.get())->inputs.size();
+        n_input_tensors_tg = state.n_input_tensors;
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -2183,14 +2701,14 @@ void llama_context::sched_reserve() {
                 // [TAG_RESERVE_DIAG_DECAY]
                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(state, n_tokens, 1, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(state, n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         };
 
         if (!gf) {
-            throw std::runtime_error("failed to allocate compute pp buffers");
+            return { sched_reserve_status::FAILED, "failed to allocate compute pp buffers" };
         }
     }
 
@@ -2198,12 +2716,11 @@ void llama_context::sched_reserve() {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
         if (!model.hparams.no_alloc) {
-            backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(state.sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
-            LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
-                    ggml_backend_buft_name(buft),
-                    backend_buf_exp_size[i] / 1024.0 / 1024.0);
+            LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", "sched_reserve", ggml_backend_buft_name(buft),
+                           backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
     }
 
@@ -2216,18 +2733,212 @@ void llama_context::sched_reserve() {
         };
 
         LLAMA_LOG_INFO("%s: graph%s: nodes = %s, splits = %s, input objects = %s, input tensors = %s\n",
-                __func__,
-                diff ? format(" (pp bs=%d, tg bs=%d)", n_tokens, n_seqs).c_str() : "",
-                val(n_nodes_pp, n_nodes_tg).c_str(),
-                val(n_splits_pp, n_splits_tg).c_str(),
-                val(n_inputs_pp, n_inputs_tg).c_str(),
-                val(n_input_tensors_pp, n_input_tensors_tg).c_str());
+                       "sched_reserve", diff ? format(" (pp bs=%d, tg bs=%d)", n_tokens, n_seqs).c_str() : "",
+                       val(n_nodes_pp, n_nodes_tg).c_str(), val(n_splits_pp, n_splits_tg).c_str(),
+                       val(n_inputs_pp, n_inputs_tg).c_str(), val(n_input_tensors_pp, n_input_tensors_tg).c_str());
     }
 
     const int64_t t_end_us = ggml_time_us();
 
-    LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
-            __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+    LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n", "sched_reserve", (t_end_us - t_start_us) / 1000.0,
+                   ggml_backend_sched_get_n_copies(state.sched.get()));
+
+    // A cap the copy could not answer during this reserve leaves chunks the plan did not size.
+    if (const char * failure = plan_scope.failure()) {
+        return { sched_reserve_status::REFUSED, failure };
+    }
+
+    return { sched_reserve_status::OK, "" };
+}
+
+sched_reserve_result llama_context::sched_measure_impl(sched_reserve_state & state) {
+    GGML_ASSERT(state.measure != nullptr);
+    GGML_ASSERT(!state.cparams.pipeline_parallel);
+
+    if (!plan_caps && !measure_only) {
+        return { sched_reserve_status::FAILED, "a measure needs the context's chunk-cap copy" };
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+
+    // The scheduler below is created inside the scope, so its allocator reads the frozen caps. A
+    // load-time measure holds no copy: its LOAD_MEASURE scope reads the stage's caps, and a measure
+    // over no SYCL backend (a CPU-only host) has no scope to open.
+    llama_context_cpu_compute_buft_reselect(model, backend_ptrs, backend_buft, !measure_only);
+
+    const llama_context_sycl_plan_procs plan_procs = llama_context_sycl_plan_procs_for(backends);
+    llama_plan_scope plan_scope = measure_only ? llama_plan_scope(plan_procs, measure_stage) :
+                                                 llama_plan_scope(plan_procs, (uint32_t) sycl_exec_context.value,
+                                                                  GGML_SYCL_PLAN_SCOPE_MEASURE, plan_caps.get());
+    const bool scope_required = plan_caps || (measure_only && llama_context_has_sycl_backend(backends));
+    if (scope_required && !plan_scope.is_open()) {
+        return { sched_reserve_status::FAILED, measure_only ? "the LOAD_MEASURE plan scope did not open" :
+                                                              "the MEASURE plan scope did not open" };
+    }
+
+    const uint32_t n_seqs   = state.cparams.n_seq_max;
+    const uint32_t n_tokens = std::min(state.cparams.n_ctx, state.cparams.n_ubatch);
+
+    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+
+    state.gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    state.gf_res_prev_active = nullptr;
+
+    state.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
+                                             false, state.cparams.op_offload));
+#ifdef GGML_USE_SYCL
+    llama_context_sycl_attach_sched_plan(state.sched.get(), backends);
+#endif
+
+    llama_memory_context_ptr mctx;
+    if (memory) {
+        mctx = memory->init_full();
+        if (!mctx) {
+            return { sched_reserve_status::FAILED, "failed to initialize memory module" };
+        }
+    }
+
+    resolve_fused_ops(state, mctx.get(), n_seqs);
+
+    llama_measure_set_params params;
+    params.n_tokens            = n_tokens;
+    params.n_seq_max           = n_seqs;
+    params.n_outputs_max       = state.cparams.n_outputs_max;
+    params.kv_unified          = state.cparams.kv_unified;
+    params.n_layer_nextn       = model.hparams.n_layer_nextn;
+    params.warmup              = state.cparams.warmup;
+    params.pp_again_single_seq = model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01;
+
+    const std::vector<llama_measure_graph> graphs = llama_measure_graph_set(params);
+
+    const int           max_chunks = ggml_gallocr_max_chunks();
+    std::vector<size_t> sizes(backend_ptrs.size(), 0);
+    std::vector<size_t> peak(max_chunks, 0);
+
+    sched_measure_plan & plan = *state.measure;
+    plan.graphs.clear();
+    plan.bufts.clear();
+    plan.n_splits_max = 0;
+
+    // Two backends of one buffer type share an allocator and report the same layout, so each buffer type
+    // is read once per graph.
+    std::string layout_failure;
+
+    auto read_layout = [&](size_t gi) -> bool {
+        plan.n_splits_max = std::max(plan.n_splits_max, ggml_backend_sched_get_n_splits(state.sched.get()));
+
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            sched_measure_buft * entry = nullptr;
+            for (auto & e : plan.bufts) {
+                if (e.buft == backend_buft[i]) {
+                    entry = &e;
+                    break;
+                }
+            }
+            if (entry == nullptr) {
+                plan.bufts.emplace_back();
+                entry       = &plan.bufts.back();
+                entry->buft = backend_buft[i];
+            }
+            if (entry->peaks.size() > gi) {
+                continue;
+            }
+
+            size_t    max_chunk_size = 0;
+            const int n_chunks       = ggml_backend_sched_get_reserved_chunk_peaks(state.sched.get(), backend_ptrs[i],
+                                                                                   peak.data(), max_chunks, &max_chunk_size);
+            if (gi > 0 && max_chunk_size != entry->max_chunk_size) {
+                layout_failure =
+                    format("the chunk size of %s changed between measured graphs", ggml_backend_buft_name(entry->buft));
+                return false;
+            }
+            entry->max_chunk_size = max_chunk_size;
+            entry->peaks.emplace_back(peak.begin(), peak.begin() + std::max(0, std::min(n_chunks, max_chunks)));
+        }
+        return true;
+    };
+
+    size_t gi = 0;
+    for (; gi < graphs.size(); ++gi) {
+        const llama_measure_graph & g = graphs[gi];
+
+        state.cparams.embeddings = g.embeddings;
+        state.cparams.warmup     = g.warmup;
+        if (model.hparams.n_layer_nextn > 0) {
+            state.cparams.embeddings_nextn        = g.nextn;
+            state.cparams.embeddings_nextn_masked = g.nextn_masked;
+            state.cparams.nextn_layer_offset      = g.nextn_offset;
+        }
+
+        // A stream graph is built on a memory context that spans exactly its streams.
+        llama_memory_context_ptr       stream_mctx;
+        const llama_memory_context_i * graph_mctx = mctx.get();
+        if (g.n_streams != 0 && memory) {
+            stream_mctx = memory->init_reserve(g.n_streams);
+            if (!stream_mctx) {
+                return { sched_reserve_status::FAILED,
+                         format("failed to initialize the %u-stream reserve memory", g.n_streams) };
+            }
+            graph_mctx = stream_mctx.get();
+        }
+
+        auto * gf = graph_reserve(state, g.n_tokens, g.n_seqs, g.n_outputs, graph_mctx, true, sizes.data());
+        if (!gf) {
+            return { sched_reserve_status::FAILED, format("failed to measure graph %zu of %zu", gi, graphs.size()) };
+        }
+
+        if (!read_layout(gi)) {
+            return { sched_reserve_status::FAILED, layout_failure };
+        }
+    }
+
+    // The K-shift graph of each sub-cache that can shift: update() allocates it on the context's scheduler,
+    // so its compute buffer is part of the plan. It is built with the ALLOC reserve's own cparams.
+    std::vector<const llama_kv_cache *> shift_caches;
+    if (memory) {
+        memory->get_shift_caches(shift_caches);
+    }
+
+    for (const llama_kv_cache * kv : shift_caches) {
+        ggml_cgraph * gf = graph_reserve_shift(state, kv, sizes.data());
+        if (!gf) {
+            return { sched_reserve_status::FAILED, format("failed to measure the K-shift graph %zu of %zu",
+                                                          gi - graphs.size(), shift_caches.size()) };
+        }
+
+        if (!read_layout(gi)) {
+            return { sched_reserve_status::FAILED, layout_failure };
+        }
+        gi++;
+    }
+
+    // A cap the copy could not answer during this measure leaves peaks nobody sized.
+    if (const char * failure = plan_scope.failure()) {
+        return { sched_reserve_status::REFUSED, failure };
+    }
+
+    for (auto & entry : plan.bufts) {
+        std::string reason;
+        if (!llama_measure_chunk_plan(entry.peaks, entry.max_chunk_size, (size_t) max_chunks, entry.cap, reason)) {
+            return { sched_reserve_status::REFUSED,
+                     format("%s (compute buffer type %s)", reason.c_str(), ggml_backend_buft_name(entry.buft)) };
+        }
+    }
+
+    plan.graphs = graphs;
+    for (size_t k = 0; k < shift_caches.size(); ++k) {
+        llama_measure_graph shift;
+        shift.kind = LLAMA_MEASURE_KIND_SHIFT;
+        plan.graphs.push_back(shift);
+    }
+    plan.n_measured = (uint32_t) (graphs.size() + shift_caches.size());
+    plan.measure_ms = (ggml_time_us() - t_start_us) / 1000.0;
+
+    if (!measure_only) {
+        LLAMA_LOG_DEBUG("%s: measured %u graphs in %.2f ms\n", __func__, plan.n_measured, plan.measure_ms);
+    }
+
+    return { sched_reserve_status::OK, "" };
 }
 
 void llama_context::synchronize() {
@@ -2272,6 +2983,251 @@ const llama_cparams & llama_context::get_cparams() const {
     return cparams;
 }
 
+bool llama_context::is_measure_only() const {
+    return measure_only;
+}
+
+const sched_reserve_result & llama_context::get_measure_status() const {
+    return measure_status;
+}
+
+const sched_measure_plan & llama_context::get_measure_plan() const {
+    return measure_plan;
+}
+
+bool llama_context::holds_exec_context() const {
+    return sycl_exec_context_bound || sycl_exec_context.value != 0;
+}
+
+bool llama_context::holds_output_buffer() const {
+    return buf_output != nullptr;
+}
+
+std::vector<llama_tenant_buft_caps> llama_context::get_measure_tenant_caps() const {
+    return measure_tenant_caps(measure_plan);
+}
+
+static decltype(&ggml_backend_sycl_measure_plan_override_install) g_measure_install_override = nullptr;
+static decltype(&ggml_backend_sycl_measure_plan_override_clear)   g_measure_clear_override   = nullptr;
+
+llama_measure_override_procs llama_context_sycl_measure_override_procs(ggml_backend_dev_t dev) {
+    llama_measure_override_procs procs;
+#ifdef LLAMA_PRIVATE_TEST_OBJECTS
+    if (g_measure_install_override != nullptr || g_measure_clear_override != nullptr) {
+        procs.install = g_measure_install_override;
+        procs.clear   = g_measure_clear_override;
+        return procs;
+    }
+#endif
+    if (!llama_context_dev_is_sycl(dev)) {
+        return procs;
+    }
+#ifdef GGML_USE_SYCL
+    procs.install = &ggml_backend_sycl_measure_plan_override_install;
+    procs.clear   = &ggml_backend_sycl_measure_plan_override_clear;
+#elif defined(GGML_BACKEND_DL)
+    procs.install = reinterpret_cast<decltype(procs.install)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_plan_override_install"));
+    procs.clear = reinterpret_cast<decltype(procs.clear)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_plan_override_clear"));
+#endif
+    return procs;
+}
+
+#ifdef LLAMA_PRIVATE_TEST_OBJECTS
+void llama_context_sycl_measure_override_procs_override_for_testing(
+    decltype(&ggml_backend_sycl_measure_plan_override_install) install_fn,
+    decltype(&ggml_backend_sycl_measure_plan_override_clear)   clear_fn) {
+    g_measure_install_override = install_fn;
+    g_measure_clear_override   = clear_fn;
+}
+#endif
+
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+// The measure backend of one SYCL device: non-owning, no SYCL context (ggml-sycl.h).
+static ggml_backend_t llama_context_sycl_measure_backend_init(ggml_backend_dev_t dev, int device) {
+#    ifdef GGML_USE_SYCL
+    GGML_UNUSED(dev);
+    return ggml_backend_sycl_measure_backend_init(device);
+#    else
+    auto fn = reinterpret_cast<decltype(&ggml_backend_sycl_measure_backend_init)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_backend_init"));
+    return fn != nullptr ? fn(device) : nullptr;
+#    endif
+}
+#endif
+
+bool llama_model_needs_ctx_other(const llama_model & model) {
+    return model.arch == LLM_ARCH_GEMMA4_ASSISTANT ||
+           ((model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) &&
+            (model.tok_embd == nullptr || model.output == nullptr));
+}
+
+std::string llama_measure_unsupported_reason(const llama_model & model) {
+    if (llama_model_has_encoder(&model)) {
+        return format("%s has an encoder graph the load-time measure does not walk", model.arch_name().c_str());
+    }
+    if (llama_model_needs_ctx_other(model)) {
+        return format("%s needs ctx_other, which a load-time measure has none of", model.arch_name().c_str());
+    }
+    return "";
+}
+
+llama_load_measure_result llama_load_measure_run(const llama_model &                  model,
+                                                 llama_measure_context_args &         args,
+                                                 const llama_measure_override_procs & procs,
+                                                 uint32_t                             n_ctx,
+                                                 uint64_t                             load_txn,
+                                                 enum ggml_sycl_measure_stage         stage,
+                                                 int                                  first_device) {
+    llama_load_measure_result out;
+
+    if (const std::string why = llama_measure_unsupported_reason(model); !why.empty()) {
+        out.unsupported = true;
+        out.refusal     = llama_load_measure_refusal_text(stage, first_device, why);
+        return out;
+    }
+
+    // Declaration order is the unwind order: the override is declared after the holder, so on a normal
+    // exit it clears first and the context (which owns the backends once its constructor has taken them
+    // from `args`) goes after; on a throw from the constructor the context has already unwound, and the
+    // override clears next.
+    std::unique_ptr<llama_context> holder;
+    llama_measure_plan_override    guard(procs, load_txn, stage);
+    if (!guard.installed()) {
+        out.refusal = llama_load_measure_refusal_text(stage, first_device, guard.failure());
+        return out;
+    }
+
+    args.stage = stage;
+
+    const llama_context_params params = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train);
+    try {
+        holder.reset(new llama_context(model, params, &args));
+    } catch (const llama_measure_unsupported & e) {
+        out.unsupported = true;
+        out.refusal     = llama_load_measure_refusal_text(stage, first_device, e.what());
+        return out;
+    } catch (const std::exception & e) {
+        out.refusal = llama_load_measure_refusal_text(stage, first_device, e.what());
+        return out;
+    }
+
+    const sched_reserve_result & status = holder->get_measure_status();
+    if (status.status != sched_reserve_status::OK) {
+        out.refusal = llama_load_measure_refusal_text(stage, first_device, status.reason);
+        return out;
+    }
+
+    for (const auto & c : holder->get_measure_tenant_caps()) {
+        llama_load_measure_device d;
+        d.device      = c.device;
+        d.host        = c.host;
+        d.chunk_bytes = c.chunk_bytes;
+        d.total       = c.total;
+        d.cap         = c.max_chunk_size;
+        out.devices.push_back(std::move(d));
+    }
+    out.n_splits = holder->get_measure_plan().n_splits_max;
+    out.ok       = true;
+    return out;
+}
+
+llama_load_measure_result llama_load_measure(const llama_model &          model,
+                                             uint32_t                     n_ctx,
+                                             uint64_t                     load_txn,
+                                             enum ggml_sycl_measure_stage stage) {
+    llama_load_measure_result out;
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    std::vector<ggml_backend_dev_t> sycl_devs;
+    for (const auto & d : model.devices) {
+        if (llama_context_dev_is_sycl(d.dev)) {
+            sycl_devs.push_back(d.dev);
+        }
+    }
+    if (sycl_devs.empty()) {
+        out.ok = true;  // nothing on a SYCL device: no compute-slot term to measure
+        return out;
+    }
+    const int first_device = llama_context_sycl_device_index(sycl_devs[0], 0);
+
+    // a model the measure cannot walk is told so before any backend is created for it
+    if (const std::string why = llama_measure_unsupported_reason(model); !why.empty()) {
+        out.unsupported = true;
+        out.refusal     = llama_load_measure_refusal_text(stage, first_device, why);
+        return out;
+    }
+
+    llama_measure_context_args args;
+    for (size_t i = 0; i < sycl_devs.size(); ++i) {
+        const int      device  = llama_context_sycl_device_index(sycl_devs[i], (int) i);
+        ggml_backend_t backend = llama_context_sycl_measure_backend_init(sycl_devs[i], device);
+        if (backend == nullptr) {
+            out.refusal = llama_load_measure_refusal_text(stage, device, "measure backend init failed");
+            return out;
+        }
+        args.backends.emplace_back(backend);
+    }
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (cpu == nullptr) {
+        out.refusal = llama_load_measure_refusal_text(stage, first_device, "no CPU backend");
+        return out;
+    }
+    args.backends.emplace_back(cpu);
+
+    return llama_load_measure_run(model, args, llama_context_sycl_measure_override_procs(sycl_devs[0]), n_ctx, load_txn,
+                                  stage, first_device);
+#else
+    GGML_UNUSED(model);
+    GGML_UNUSED(n_ctx);
+    GGML_UNUSED(load_txn);
+    GGML_UNUSED(stage);
+    out.ok = true;
+    return out;
+#endif
+}
+
+llama_late_check_result llama_load_late_check(const llama_model &                            model,
+                                              uint32_t                                       n_ctx,
+                                              struct ggml_sycl_load_txn                      txn,
+                                              const std::vector<llama_measure_dummy_entry> & weights) {
+    llama_late_check_result out;
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    llama_sycl_l4_procs procs;
+    for (const auto & d : model.devices) {
+        if (llama_context_dev_is_sycl(d.dev)) {
+            procs = llama_context_sycl_l4_procs_for_dev(d.dev);
+            break;
+        }
+    }
+    if (!procs.available()) {
+        return out;  // no c(P) can have been recorded without the L4 entry points
+    }
+
+    llama_measure_dummy_scope dummies(weights);
+    if (dummies.failed()) {
+        out.refusal = llama_load_measure_refusal_text(GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, -1,
+                                                      "a weight stand-in buffer was refused");
+        return out;
+    }
+    const llama_load_measure_result measured =
+        llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C);
+    if (!measured.ok) {
+        (measured.unsupported ? out.unsupported : out.refusal) = measured.refusal;
+        return out;
+    }
+
+    const uint32_t n_ubatch = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train).n_ubatch;
+    return llama_late_check_fold(procs, txn, measured.devices, n_ubatch);
+#else
+    GGML_UNUSED(model);
+    GGML_UNUSED(n_ctx);
+    GGML_UNUSED(txn);
+    GGML_UNUSED(weights);
+    return out;
+#endif
+}
+
 ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
@@ -2308,9 +3264,9 @@ llama_memory_t llama_context::get_memory() const {
     return memory.get();
 }
 
-bool llama_context::memory_update(bool optimize) {
+llama_memory_update_result llama_context::memory_update(bool optimize) {
     if (!memory) {
-        return false;
+        return LLAMA_MEMORY_UPDATE_NONE;
     }
 
     {
@@ -2323,13 +3279,13 @@ bool llama_context::memory_update(bool optimize) {
             case LLAMA_MEMORY_STATUS_NO_UPDATE:
                 {
                     // no updates need to be performed
-                    return false;
+                    return LLAMA_MEMORY_UPDATE_NONE;
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
             case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
                 {
                     LLAMA_LOG_ERROR("%s: failed to prepare memory update\n", __func__);
-                    return false;
+                    return LLAMA_MEMORY_UPDATE_NONE;
                 }
         }
 
@@ -2343,15 +3299,24 @@ bool llama_context::memory_update(bool optimize) {
         gf_res_prev_active = nullptr;
 
         if (!mctx->apply()) {
+            // a failed update stays pending (the K-shift is not marked done), and decode must not run over it.
+            // The K-shift has already reset the scheduler, and a refused allocation lost its buffers, so the next
+            // decode reserves again even if the pending update is dropped before it is retried
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+            sched_need_reserve = true;
+            return LLAMA_MEMORY_UPDATE_FAILED;
         }
     }
 
     // if the memory module did any computation, we have to reserve a new worst-case graph
-    {
+    // a failure here (a refusal, or a throw from the memory or the graph build) must not cross decode: the scheduler
+    // is no longer reserved for this graph, so the next decode reserves again
+    try {
         const auto mctx = memory->init_full();
         if (!mctx) {
-            throw std::runtime_error("failed to initialize memory context");
+            LLAMA_LOG_ERROR("%s: failed to initialize memory context\n", __func__);
+            sched_need_reserve = true;
+            return LLAMA_MEMORY_UPDATE_FAILED;
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
@@ -2362,10 +3327,16 @@ bool llama_context::memory_update(bool optimize) {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
+            sched_need_reserve = true;
+            return LLAMA_MEMORY_UPDATE_FAILED;
         }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update: %s\n", __func__, err.what());
+        sched_need_reserve = true;
+        return LLAMA_MEMORY_UPDATE_FAILED;
     }
 
-    return true;
+    return LLAMA_MEMORY_UPDATE_DONE;
 }
 
 enum llama_pooling_type llama_context::pooling_type() const {
@@ -2687,8 +3658,8 @@ void llama_context::set_embeddings(bool value) {
 
     cparams.embeddings = value;
 
-    // TODO: not sure yet if we want to reserve here
-    //sched_need_reserve = true;
+    // Both values are in every measured graph set (llama_measure_graph_set), so a toggle needs no
+    // reserve; reserving per toggle would republish per batch on the server.
 }
 
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
@@ -2696,6 +3667,8 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // Measured, like set_embeddings: with n_layer_nextn > 0 every variant is in the graph set.
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -2711,6 +3684,8 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
+
+    // Measured: with n_layer_nextn > 0 every offset is in the graph set.
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -2726,6 +3701,11 @@ void llama_context::set_causal_attn(bool value) {
 }
 
 void llama_context::set_warmup(bool value) {
+    // a measure-only context measures one fixed graph set and never reserves again
+    if (measure_only) {
+        return;
+    }
+
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     if (cparams.warmup == value) {
@@ -2734,8 +3714,9 @@ void llama_context::set_warmup(bool value) {
 
     cparams.warmup = value;
 
-    // warmups are usually with small batches, so no need to reserve
-    //sched_need_reserve = true;
+    // Fork-local, both directions, only on a change: a planned context measures the warmup graph
+    // (n_expert_used := n_expert) while it is on, and the toggle back is reused in place.
+    sched_need_reserve = true;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -2972,7 +3953,10 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
 
-    sched_reserve();
+    if (!sched_reserve_nothrow()) {
+        LLAMA_LOG_ERROR("%s: failed to reserve the compute buffers\n", __func__);
+        return -2;
+    }
 
     n_queued_tokens += n_tokens;
 
@@ -3255,16 +4239,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
-    n_queued_tokens += n_tokens_all;
-
     output_swaps.clear();
 
-    sched_reserve();
+    if (!sched_reserve_nothrow()) {
+        LLAMA_LOG_ERROR("%s: failed to reserve the compute buffers\n", __func__);
+        return -2;
+    }
+
+    // counted only once the reserve succeeded: a -2 here processed nothing
+    n_queued_tokens += n_tokens_all;
 
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    memory_update(false);
+    if (memory_update(false) == LLAMA_MEMORY_UPDATE_FAILED) {
+        LLAMA_LOG_ERROR("%s: failed to update the memory\n", __func__);
+
+        return -2;
+    }
 
     llama_memory_context_ptr mctx;
 
@@ -3289,7 +4281,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     if (!did_optimize) {
                         did_optimize = true;
 
-                        if (memory_update(true)) {
+                        const auto update_res = memory_update(true);
+                        if (update_res == LLAMA_MEMORY_UPDATE_FAILED) {
+                            LLAMA_LOG_ERROR("%s: failed to update the memory\n", __func__);
+
+                            return -2;
+                        }
+                        if (update_res == LLAMA_MEMORY_UPDATE_DONE) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
 
                             continue;
@@ -3948,56 +4946,101 @@ static void ubatch_prepare_reserve(
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
-    LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
-    GGML_ASSERT(n_outputs >= 1);
+    sched_reserve_state state = member_reserve_state();
+    return graph_reserve(state, n_tokens, n_seqs, n_outputs, mctx, split_only, sizes);
+}
 
-    if (n_tokens % n_seqs != 0) {
-        n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
-        LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
-    }
+ggml_cgraph * llama_context::graph_reserve_shift(sched_reserve_state &  state,
+                                                 const llama_kv_cache * kv,
+                                                 size_t *               sizes) {
+    GGML_ASSERT(kv != nullptr);
 
-    ggml_backend_sched_reset(sched.get());
+    ggml_backend_sched_reset(state.sched.get());
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
-    for (auto & res : gf_res_prev) {
+    for (auto & res : state.gf_res_prev) {
         if (res) {
             res->reset();
         }
     }
-    gf_res_prev_active = nullptr;
+    state.gf_res_prev_active = nullptr;
+
+    auto * res = state.gf_res_reserve.get();
+
+    res->reset();
+
+    auto * gf = kv->build_graph_shift(res, this);
+
+    GGML_ASSERT(sizes != nullptr);
+    ggml_backend_sched_reserve_size(state.sched.get(), gf, sizes);
+
+    return gf;
+}
+
+ggml_cgraph * llama_context::graph_reserve(sched_reserve_state &          state,
+                                           uint32_t                       n_tokens,
+                                           uint32_t                       n_seqs,
+                                           uint32_t                       n_outputs,
+                                           const llama_memory_context_i * mctx,
+                                           bool                           split_only,
+                                           size_t *                       sizes) {
+    if (!measure_only) {
+        LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
+    }
+    GGML_ASSERT(n_outputs >= 1);
+
+    if (n_tokens % n_seqs != 0) {
+        n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
+        if (!measure_only) {
+            LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
+        }
+    }
+
+    ggml_backend_sched_reset(state.sched.get());
+
+    // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
+    for (auto & res : state.gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    state.gf_res_prev_active = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
-    const auto save_n_outputs = this->n_outputs;
+    const auto save_n_outputs = state.n_outputs;
 
-    this->n_outputs = n_outputs;
+    state.n_outputs = n_outputs;
 
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
-    ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
+    ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, state.cparams.n_outputs_max_per_seq);
 
-    auto * res = gf_res_reserve.get();
+    auto * res = state.gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(state.cparams.ctx_type),
+                                      state.sched.get(), state.cparams, state.n_outputs);
 
     res->reset();
 
     auto * gf = model.build_graph(gparams);
 
-    this->n_input_tensors = llama_graph_n_input_tensors(gf);
-    this->n_outputs = save_n_outputs;
+    state.n_input_tensors = llama_graph_n_input_tensors(gf, !measure_only);
+    state.n_outputs       = save_n_outputs;
 
     // initialize scheduler with the specified graph
     if (split_only) {
         if (sizes) {
-            ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
+            ggml_backend_sched_reserve_size(state.sched.get(), gf, sizes);
         } else {
-            ggml_backend_sched_split_graph(sched.get(), gf);
+            ggml_backend_sched_split_graph(state.sched.get(), gf);
         }
-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+    } else if (!ggml_backend_sched_reserve(state.sched.get(), gf)) {
         GGML_ASSERT(!sizes);
-        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+        if (!measure_only) {
+            LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+        }
         return nullptr;
     }
 
@@ -4009,23 +5052,33 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    return graph_params(res, ubatch, mctx, gtype, sched.get(), cparams, n_outputs);
+}
+
+llm_graph_params llama_context::graph_params(llm_graph_result *             res,
+                                             const llama_ubatch &           ubatch,
+                                             const llama_memory_context_i * mctx,
+                                             llm_graph_type                 gtype,
+                                             ggml_backend_sched_t           sched_arg,
+                                             const llama_cparams &          cparams_arg,
+                                             uint32_t                       n_outputs_arg) const {
     return {
-        /*.arch        =*/ model.arch,
-        /*.hparams     =*/ model.hparams,
-        /*.cparams     =*/ cparams,
-        /*.ubatch      =*/ ubatch,
-        /*.gtype       =*/ gtype,
-        /*.sched       =*/ sched.get(),
-        /*.backend_cpu =*/ backend_cpu,
-        /*.cvec        =*/ cvec.get(),
-        /*.loras       =*/ loras.get(),
-        /*.mctx        =*/ mctx,
-        /*.cross       =*/ &cross,
-        /*.prec_policy =*/ &model.prec_policy,
-        /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
-        /*.res         =*/ res,
+        /*.arch        =*/model.arch,
+        /*.hparams     =*/model.hparams,
+        /*.cparams     =*/cparams_arg,
+        /*.ubatch      =*/ubatch,
+        /*.gtype       =*/gtype,
+        /*.sched       =*/sched_arg,
+        /*.backend_cpu =*/backend_cpu,
+        /*.cvec        =*/cvec.get(),
+        /*.loras       =*/loras.get(),
+        /*.mctx        =*/mctx,
+        /*.cross       =*/&cross,
+        /*.prec_policy =*/&model.prec_policy,
+        /*.samplers    =*/sampling.samplers,
+        /*.n_outputs   =*/n_outputs_arg,
+        /*.cb          =*/graph_get_cb(sched_arg),
+        /*.res         =*/res,
     };
 }
 
@@ -4058,8 +5111,8 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
-llm_graph_cb llama_context::graph_get_cb() const {
-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_arg) const {
+    return [this, sched_arg](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
@@ -4076,7 +5129,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                            ggml_backend_sched_set_tensor_backend(sched_arg, cur, backend.get());
                         }
                     }
                 }
@@ -4954,6 +6007,12 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter 
 }
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
+    if (plan_caps) {
+        GGML_ABORT(
+            "training is not supported while a SYCL placement plan is active: ggml-opt would reallocate this "
+            "context's planned scheduler outside its claim scope; llama.cpp-q64b");
+    }
+
     GGML_ASSERT(!opt_ctx);
     model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
     const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);

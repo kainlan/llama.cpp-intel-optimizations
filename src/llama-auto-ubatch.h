@@ -47,3 +47,115 @@ inline bool llama_auto_ubatch_settle_needs_publish(bool     published_any,
                                                    uint32_t fallback_ubatch) {
     return published_any || publish_dirty || n_ubatch != fallback_ubatch;
 }
+
+// True iff the trial runs at all: the caller did not pin -ub (n_ubatch_auto),
+// the model is causal (a non-causal model's n_ubatch == n_batch semantics are
+// never shrunk), the context has a SYCL backend, and GGML_SYCL_AUTO_UBATCH
+// allows it. The constructor passes the four evaluated results, so the trial
+// decision and anything that plans for the trial's rungs cannot disagree.
+inline bool llama_auto_ubatch_trial_runs(bool n_ubatch_auto,
+                                         bool causal_attn,
+                                         bool has_sycl_backend,
+                                         bool auto_ubatch_enabled) {
+    return n_ubatch_auto && causal_attn && has_sycl_backend && auto_ubatch_enabled;
+}
+
+// The trial's cap: min(n_batch, n_ctx), narrowed to the GPU MoE routing
+// ceiling for a MoE model whenever that ceiling does not exceed it. A ceiling
+// equal to the cap still binds, so the stop reason names the ceiling.
+// `moe_cap_available` is false when the backend does not export the ceiling
+// (an older SYCL DSO); the caller then passes any moe_cap and no narrowing
+// happens. *moe_bound is set to whether the ceiling is the binding cap.
+inline uint32_t llama_auto_ubatch_cap(uint32_t n_batch,
+                                      uint32_t n_ctx,
+                                      uint32_t n_expert,
+                                      uint32_t moe_cap,
+                                      bool     moe_cap_available,
+                                      bool *   moe_bound) {
+    uint32_t cap = n_batch < n_ctx ? n_batch : n_ctx;
+    *moe_bound   = false;
+    if (n_expert > 0 && moe_cap_available && moe_cap <= cap) {
+        cap        = moe_cap;
+        *moe_bound = true;
+    }
+    return cap;
+}
+
+// True iff a tuning-cache value may win: not below the first rung, not above
+// the cap, and not below the caller's own n_ubatch (the trial never shrinks it).
+inline bool llama_auto_ubatch_cached_valid(const uint32_t * ladder,
+                                           size_t           n_ladder,
+                                           uint32_t         cached_ubatch,
+                                           uint32_t         fallback_ubatch,
+                                           uint32_t         cap) {
+    return n_ladder > 0 && cached_ubatch >= ladder[0] && cached_ubatch <= cap && cached_ubatch >= fallback_ubatch;
+}
+
+// Room for the largest rung set: every rung, plus the fallback, plus a cached
+// value that is not itself a rung.
+static const size_t llama_auto_ubatch_rung_set_capacity = llama_auto_ubatch_ladder_size + 2;
+
+// Inserts v into the ascending array out[0..n) unless already present, and
+// returns the new length. A full array is left unchanged.
+inline size_t llama_auto_ubatch_set_insert(uint32_t * out, size_t n, size_t max_out, uint32_t v) {
+    size_t pos = 0;
+    while (pos < n && out[pos] < v) {
+        ++pos;
+    }
+    if ((pos < n && out[pos] == v) || n >= max_out) {
+        return n;
+    }
+    for (size_t k = n; k > pos; --k) {
+        out[k] = out[k - 1];
+    }
+    out[pos] = v;
+    return n + 1;
+}
+
+// The micro-batch sizes a trial may settle on or revalidate, ascending and
+// deduplicated: fallback_ubatch, every rung in [fallback_ubatch, cap], and the
+// tuning-cache value when it passes llama_auto_ubatch_cached_valid (0 means
+// none). Writes at most max_out entries and returns how many. fallback_ubatch
+// above cap is left out, as a value the trial cannot try.
+inline size_t llama_auto_ubatch_rung_set(const uint32_t * ladder,
+                                         size_t           n_ladder,
+                                         uint32_t         fallback_ubatch,
+                                         uint32_t         cap,
+                                         uint32_t         cached_ubatch,
+                                         uint32_t *       out,
+                                         size_t           max_out) {
+    size_t n = 0;
+    if (fallback_ubatch <= cap) {
+        n = llama_auto_ubatch_set_insert(out, n, max_out, fallback_ubatch);
+    }
+    for (size_t i = 0; i < n_ladder; ++i) {
+        if (ladder[i] >= fallback_ubatch && ladder[i] <= cap) {
+            n = llama_auto_ubatch_set_insert(out, n, max_out, ladder[i]);
+        }
+    }
+    if (cached_ubatch != 0 && llama_auto_ubatch_cached_valid(ladder, n_ladder, cached_ubatch, fallback_ubatch, cap)) {
+        n = llama_auto_ubatch_set_insert(out, n, max_out, cached_ubatch);
+    }
+    return n;
+}
+
+// The members of `set` that are rungs of `ladder`, in the set's order. The
+// ladder loop iterates these: a fallback or cached value that is not a rung
+// is in the set for planning only and is never a candidate of its own.
+inline size_t llama_auto_ubatch_ladder_members(const uint32_t * set,
+                                               size_t           n_set,
+                                               const uint32_t * ladder,
+                                               size_t           n_ladder,
+                                               uint32_t *       out,
+                                               size_t           max_out) {
+    size_t n = 0;
+    for (size_t i = 0; i < n_set && n < max_out; ++i) {
+        for (size_t k = 0; k < n_ladder; ++k) {
+            if (set[i] == ladder[k]) {
+                out[n++] = set[i];
+                break;
+            }
+        }
+    }
+    return n;
+}

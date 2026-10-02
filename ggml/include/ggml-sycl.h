@@ -357,6 +357,21 @@ struct ggml_sycl_placement_envelope {
     int32_t  flash_attn_type;  // -1 = AUTO, 0 = DISABLED, 1 = ENABLED
 };
 
+// The host-resident weight create set (llama.cpp-moua L4, th32pre D-R8): per
+// tensor, the SYCL ordinal of the host buffer type it was created in and the
+// allocation size on that buffer type, in create order.  It is its own
+// size-prefixed struct, passed by pointer and never in an array, so a later
+// field is a new trailing member and a short or absent struct reads as ABSENT
+// rather than as stack garbage.  Zero-init means absent.  The two arrays are
+// parallel so a later field is a new array and never a changed stride.
+typedef struct ggml_sycl_host_create_record {
+    uint32_t         struct_size;  // sizeof(*this); FIRST.  Below the v1 size reads as ABSENT; above is read to v1
+    uint32_t         present;      // 1: published for this inventory (count may be 0); 0: absent
+    uint64_t         count;        // entries in both arrays
+    const int32_t *  device;       // [count] SYCL ordinal of the host buft each tensor was created in, create order
+    const uint64_t * alloc_bytes;  // [count] the tensor's allocation size on that buft, same order
+} ggml_sycl_host_create_record;
+
 // Set tensor inventory for tiered memory placement.
 // Must be called after model metadata parsing, before tensor allocation.
 // This enables automatic VRAM/host placement based on tensor priority.
@@ -1224,6 +1239,10 @@ enum ggml_sycl_lifecycle_result {
     // `result=%d` and are quoted in tickets and logs (BUSY is 17), so inserting
     // mid-enum would silently renumber every recorded value.
     GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
+    // Synthesised by a CALLER that resolved no proc address for an entry point
+    // the backend predates (see ggml_backend_sycl_set_runtime_context_desc).
+    // The backend never returns it. Appended last for the same reason.
+    GGML_SYCL_LIFECYCLE_UNSUPPORTED,
 };
 
 // Registry-resolved static/DL parity entry point. Applies the exact inventory
@@ -1339,8 +1358,12 @@ struct ggml_sycl_runtime_context_probe {
 // between this entry check and that in-lock re-check), returns
 // GGML_SYCL_LIFECYCLE_BUSY, not STALE_IDENTITY -- it is a race a caller's
 // retry can resolve, unlike the entry check's own refusal.
-// GGML_SYCL_LIFECYCLE_BUSY (round 1 F6; round 4 Q3) means the caller MAY
-// retry: a live-update lease could not be acquired, the plan changed while
+// GGML_SYCL_LIFECYCLE_BUSY (round 1 F6; round 4 Q3) means this call did not
+// take effect and the caller re-attempts it at its NEXT boundary, never by
+// waiting in place (llama: the reserve transaction runs again, publish
+// included, at the next decode or encode, which returns -2 meanwhile and
+// never computes without a published runtime context): a live-update lease
+// could not be acquired, the plan changed while
 // acquiring the transaction lock, the module mutation guard refused, the
 // published plan's identity changed between this probe's entry check and
 // the transaction's in-lock re-check (the STALE_IDENTITY-shaped race just
@@ -1369,16 +1392,15 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime
 // llama.cpp-oyfl: re-evaluates ONLY the non-FA attention scratch guard,
 // against the CURRENTLY PUBLISHED plan's shape --
 // no KV replan, no MoE MMID reaccount/materialize, no plan republish, no
-// BUSY retry. For a caller whose n_ctx/n_ubatch have not changed and only
+// BUSY re-attempt. For a caller whose n_ctx/n_ubatch have not changed and only
 // flash_attn_enabled has (an AUTO llama_flash_attn_type resolving after
 // ggml_backend_sycl_set_runtime_context_for_model()'s own initial call
 // above already ran with an unresolved, optimistic `true`): re-running the
 // full transaction would touch KV/MMID state that has no reason to change
-// and would retry the same deterministic decision under BUSY backoff for
-// no benefit. GGML_SYCL_LIFECYCLE_STALE_IDENTITY if the model token does
-// not match the currently published plan; GGML_SYCL_LIFECYCLE_PLAN_REJECTED
-// if the guard refuses (same message and arithmetic as the full
-// transaction's own check).
+// and would re-run the same deterministic decision for no benefit.
+// GGML_SYCL_LIFECYCLE_STALE_IDENTITY if the model token does not match the
+// currently published plan; GGML_SYCL_LIFECYCLE_PLAN_REJECTED if the guard
+// refuses (same message and arithmetic as the full transaction's own check).
 //
 // llama.cpp-rqak: an asymmetry worth knowing before touching either path.
 // An explicit -fa 0 context goes through the FULL transaction above, which
@@ -1397,6 +1419,184 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runti
     ggml_backend_t               backend,
     struct ggml_sycl_model_token model,
     bool                         flash_attn_enabled);
+
+// ---------------------------------------------------------------------------
+// The measured-tenant publish, its coverage query and the load-time late check
+// (llama.cpp-moua L4, doc 2.4.2 and 2.4.4).  DECLARATIONS ONLY: no export in
+// this tree defines them yet and no proc address answers to their names.
+// A null proc address means the backend predates the entry point; the caller
+// then treats it as GROWTH (coverage), NOT_RECORDED (late check) and
+// GGML_SYCL_LIFECYCLE_UNSUPPORTED (publish).  Resolve them with
+// ggml_backend_reg_get_proc_address() under the exact names below.
+//
+// Layout rules, which moua owns: fields are only appended; a reader treats a
+// field beyond the publisher's struct_size as absent and refuses a version it
+// does not know; every array is read at its own element stride and each
+// element is gated by its own struct_size.  Zone, lifetime, scope and tier of
+// a tenant are NOT carried by the element: they are functions of its cohort,
+// from one static cohort table (a later commit adds it beside these types).
+// ---------------------------------------------------------------------------
+
+#define GGML_SYCL_RUNTIME_CONTEXT_DESC_VERSION 1
+
+// One measured tenant slot.  device is the SYCL device index, or -1 for the
+// host-pinned tier (a tier, not an owner: its slots are held by the registry
+// entry of the SYCL_Host buft's device).  slot_index is the claim index.
+typedef struct ggml_sycl_context_tenant_desc {
+    uint32_t struct_size;  // sizeof(*this) as the publisher built it; the element stride gate
+    uint32_t cohort;       // the cohort id; zone, lifetime, scope and tier are fixed per cohort
+    uint32_t slot_index;   // the claim index
+    int32_t  device;       // SYCL device index; -1 for the host-pinned tier
+    uint64_t slot_bytes;   // the slot's cap
+} ggml_sycl_context_tenant_desc;
+
+// One KV layer, exactly the widths llama passes to ggml_new_tensor_3d for its
+// K and V cache tensors.  n_embd_v_gqa is taken after the V-cache padding and
+// is 0 for a model with no V (MLA).  has_kv == 0 marks a filtered, shared or
+// reused layer.
+typedef struct ggml_sycl_kv_layer_desc {
+    uint32_t n_embd_k_gqa;
+    uint32_t n_embd_v_gqa;
+    uint32_t n_head_kv;
+    uint32_t n_embd_head_k;
+    uint8_t  has_kv;
+    uint8_t  is_swa;
+} ggml_sycl_kv_layer_desc;
+
+// One recurrent-state layer, exactly the arguments llama_memory_recurrent
+// passes to ggml_new_tensor_2d for r_l / s_l (n_rows = mem_size * (1 + n_rs_seq)).
+typedef struct ggml_sycl_rs_layer_desc {
+    uint32_t il;
+    int32_t  type_r;
+    int32_t  type_s;
+    uint32_t n_embd_r;
+    uint32_t n_embd_s;
+    uint32_t n_rows;
+} ggml_sycl_rs_layer_desc;
+
+// The one publish descriptor.  pad0 is the byte the compiler would otherwise
+// insert after sidecar; it is named so the layout is visible and must be 0.
+// The tenants array is zhcn's section (n_tenants == 0 for a publisher that
+// has none), the layers array is moua's, and so is the recurrent-state one.
+typedef struct ggml_sycl_runtime_context_desc {
+    uint32_t struct_size;  // sizeof(*this) as the publisher built it; the reader gates every field on it
+    uint32_t version;      // GGML_SYCL_RUNTIME_CONTEXT_DESC_VERSION; bumped on any change of meaning
+    // KV-shape section
+    int32_t  type_k;
+    int32_t  type_v;
+    uint8_t  v_trans;
+    uint8_t  no_alloc;
+    uint8_t  sidecar;  // persistent packed-K sidecar enabled
+    uint8_t  pad0;     // must be 0
+    uint32_t n_stream;
+    uint32_t n_layer;
+    uint32_t layer_desc_size;  // element stride of layers
+    const ggml_sycl_kv_layer_desc *       layers;
+    // measured-tenant section
+    uint32_t                              n_tenants;
+    uint32_t                              tenant_desc_size;  // element stride of tenants
+    const ggml_sycl_context_tenant_desc * tenants;
+    // recurrent-state section; n_rs_layer == 0 for a model with no recurrent state
+    uint32_t                              n_rs_layer;
+    uint32_t                              rs_layer_desc_size;  // element stride of rs_layers
+    const ggml_sycl_rs_layer_desc *       rs_layers;
+} ggml_sycl_runtime_context_desc;
+
+// The layout is pinned here so a changed field fails to compile instead of
+// shifting every publisher's view of the next one.  The 8-byte-pointer sizes
+// are asserted only where pointers are 8 bytes.
+#if defined(__cplusplus)
+#    define GGML_SYCL_ABI_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+#    define GGML_SYCL_ABI_ASSERT(cond, msg) _Static_assert(cond, msg)
+#endif
+GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_context_tenant_desc) == 24, "tenant desc layout changed");
+GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_kv_layer_desc) == 20, "kv layer desc layout changed");
+GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_rs_layer_desc) == 24, "rs layer desc layout changed");
+GGML_SYCL_ABI_ASSERT(sizeof(void *) != 8 || sizeof(ggml_sycl_runtime_context_desc) == 72,
+                     "runtime context desc layout changed");
+
+// Coverage of a candidate publish by this context's own published entry.
+// GROWTH is 0 on purpose: a zero-initialised or unwritten answer must read as
+// "needs a transaction", never as "nothing to do".
+enum ggml_sycl_tenant_coverage {
+    GGML_SYCL_TENANT_COVERAGE_GROWTH  = 0,  // some slot is new or larger: the caller runs a full transaction
+    GGML_SYCL_TENANT_COVERAGE_EQUAL   = 1,  // every slot is byte-equal to the published one
+    GGML_SYCL_TENANT_COVERAGE_COVERED = 2,  // every slot fits in the published slot at the same index
+};
+
+// Outcome of the load-time late check.  NOT_RECORDED is 0: with nothing
+// recorded at the early stage nothing was checked, and the caller must not
+// read it as a pass.
+enum ggml_sycl_late_check_result {
+    GGML_SYCL_LATE_CHECK_NOT_RECORDED    = 0,  // no c(P) was recorded for this load; nothing was checked
+    GGML_SYCL_LATE_CHECK_EQUAL           = 1,  // the late measure equals the term the early stage admitted
+    GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED = 2,  // smaller than admitted: accepted, WARN logged, zones unchanged
+    GGML_SYCL_LATE_CHECK_REFUSED         = 3,  // larger than admitted: the load is refused by name
+};
+
+// Publish the context's runtime shape together with its measured tenants.
+// The same contract as ggml_backend_sycl_set_runtime_context_for_model()
+// (model-bound, one transaction, deterministic refusals are PLAN_REJECTED and
+// are not retried) with the descriptor carrying the KV, tenant and
+// recurrent-state sections.  desc is read once, under its struct_size and
+// version gates; an unknown version is refused, a null desc is refused, and
+// the descriptor is not retained after the call returns.  The older entry
+// point stays and publishes no tenants.
+// Returns GGML_SYCL_LIFECYCLE_UNSUPPORTED only from a caller that found no
+// proc address; the backend itself never answers it.
+// Proc name: "ggml_backend_sycl_set_runtime_context_desc".
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_desc(
+    ggml_backend_t                         backend,
+    struct ggml_sycl_model_token           model,
+    uint32_t                               n_ctx,
+    uint32_t                               n_ubatch,
+    uint32_t                               n_seq_max,
+    bool                                   kv_unified,
+    bool                                   swa_full,
+    bool                                   flash_attn_enabled,
+    const ggml_sycl_runtime_context_desc * desc);
+
+// Would publishing this geometry and candidate need a transaction?  Read-only:
+// it publishes nothing, prepares no live update and takes no replan lock.  It
+// reads, in one section under the registry's leaf mutex, this context's own
+// entry: its published geometry, its tenant key, its slots and whether the
+// table is installed.  The geometry arguments are the publish's own and mean
+// the same: KV coverage depends on n_ctx, n_seq_max, kv_unified and swa_full,
+// and the compute and tenant demand on n_ubatch and flash_attn_enabled, so an
+// answer that could not see them would be about a different shape.  There is
+// no model token: the entry already names its model, and a read has nothing
+// to bind.  Fail-closed: a null or non-SYCL backend, a null candidate, an
+// unknown version, a context with no published entry, a geometry that
+// differs from the published one in any way that raises a demand, and any
+// malformed element all answer GROWTH.  COVERED is answered only when the
+// geometry demands no more than the published one and every candidate slot
+// has a published slot at the same (device, cohort, slot_index) with at
+// least its bytes.  EQUAL is answered only when geometry and every slot are
+// byte-equal.
+// Proc name: "ggml_backend_sycl_tenant_coverage".
+GGML_BACKEND_API enum ggml_sycl_tenant_coverage ggml_backend_sycl_tenant_coverage(
+    ggml_backend_t                         backend,
+    uint32_t                               n_ctx,
+    uint32_t                               n_ubatch,
+    uint32_t                               n_seq_max,
+    bool                                   kv_unified,
+    bool                                   swa_full,
+    bool                                   flash_attn_enabled,
+    const ggml_sycl_runtime_context_desc * candidate);
+
+// The late measure of a load, handed to the backend after the dev_layer sync
+// and before the mappings are initialised.  compute_bytes is the measured
+// compute term for device in the load's final placement.  The backend compares
+// it with the term the early stage recorded for txn and returns the result
+// above; REFUSED and SHRINK_ADMITTED have already logged their line.  A load
+// that recorded nothing at the early stage returns NOT_RECORDED.  Fail-closed:
+// a txn that is not the open load transaction returns NOT_RECORDED and logs;
+// it never returns EQUAL for something it did not compare.
+// Proc name: "ggml_backend_sycl_load_late_check".
+GGML_BACKEND_API enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check(struct ggml_sycl_load_txn txn,
+                                                                                    int32_t                   device,
+                                                                                    uint64_t compute_bytes);
 
 // Execution-lifecycle context identity is separate from the model lifecycle.
 // One ContextId is allocated per llama_context and then bound to each SYCL
@@ -1487,8 +1687,123 @@ GGML_BACKEND_API void ggml_backend_sycl_release_host_weight_extras(void);
 GGML_BACKEND_API void ggml_backend_sycl_set_sched_placement_plan(ggml_backend_sched_t sched);
 GGML_BACKEND_API bool ggml_backend_sycl_has_active_placement_plan(void);
 
+// The load-time measure's plan override.  While installed, every plan accessor on the
+// calling thread answers from the plan named by `stage` for the load `load_txn`,
+// and nothing is published.  Written only by these two functions; llama reaches them
+// through one RAII guard.  Install returns false (and installs nothing) when an
+// override is already installed on this thread or no plan is staged for the load.
+enum ggml_sycl_measure_stage {
+    GGML_SYCL_MEASURE_STAGE_PROBE       = 0,  // (a): the probe placement's unpublished plan
+    GGML_SYCL_MEASURE_STAGE_CANDIDATE_B = 1,  // (b): the load's candidate plan
+    GGML_SYCL_MEASURE_STAGE_CANDIDATE_C = 2,  // (c): the load's candidate plan, after the sync
+};
+
+GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_override_install(uint64_t                     load_txn,
+                                                                      enum ggml_sycl_measure_stage stage);
+GGML_BACKEND_API void ggml_backend_sycl_measure_plan_override_clear(void);
+
+// === Per-context chunk-cap copy and plan scopes ===
+//
+// A context that runs the placement fixpoint owns one `ggml_backend_sycl_plan_caps`.
+// It freezes, once, the largest buffer each compute buft may report to ggml-alloc, so
+// every MEASURE and ALLOC of the context splits chunks alike.  Its state moves
+// UNARMED -> FREEZING (the fixpoint's entry) -> FROZEN (its publish commit); there is
+// no transition back, and set_state refuses any other move.
+struct ggml_backend_sycl_plan_caps;
+typedef struct ggml_backend_sycl_plan_caps * ggml_backend_sycl_plan_caps_t;
+
+enum ggml_sycl_plan_caps_state {
+    GGML_SYCL_PLAN_CAPS_UNARMED  = 0,
+    GGML_SYCL_PLAN_CAPS_FREEZING = 1,
+    GGML_SYCL_PLAN_CAPS_FROZEN   = 2,
+};
+
+GGML_BACKEND_API ggml_backend_sycl_plan_caps_t ggml_backend_sycl_plan_caps_new(void);
+GGML_BACKEND_API void                          ggml_backend_sycl_plan_caps_free(ggml_backend_sycl_plan_caps_t caps);
+GGML_BACKEND_API bool                          ggml_backend_sycl_plan_caps_set_state(ggml_backend_sycl_plan_caps_t  caps,
+                                                                                     enum ggml_sycl_plan_caps_state state);
+
+// A plan scope is thread-local and open for one MEASURE or ALLOC of one context.
+// While open, the compute bufts' get_max_size answer from the context's copy.
+// LOAD_MEASURE is the load-time measure's kind: it holds no copy and freezes nothing.
+enum ggml_sycl_plan_scope_mode {
+    GGML_SYCL_PLAN_SCOPE_MEASURE      = 0,
+    GGML_SYCL_PLAN_SCOPE_ALLOC        = 1,
+    GGML_SYCL_PLAN_SCOPE_LOAD_MEASURE = 2,
+};
+
+// Returns an opaque scope, or NULL when one is already open on this thread or the
+// arguments do not fit the mode (MEASURE and ALLOC need `caps`, LOAD_MEASURE none).
+GGML_BACKEND_API void *       ggml_backend_sycl_plan_scope_open(uint32_t                       exec_context_id,
+                                                                enum ggml_sycl_plan_scope_mode mode,
+                                                                ggml_backend_sycl_plan_caps_t  caps);
+// LOAD_MEASURE at one of the measure stages: (a) probes at cap_min, (b) and (c) at the
+// load's to-commit capacities.
+GGML_BACKEND_API void *       ggml_backend_sycl_plan_scope_open_load_measure(enum ggml_sycl_measure_stage stage);
+// NULL when every read in the scope succeeded, else the first failure's text (valid
+// until close).  A reserve ends in a named refusal when this is non-NULL.
+GGML_BACKEND_API const char * ggml_backend_sycl_plan_scope_failure(void * scope);
+GGML_BACKEND_API void         ggml_backend_sycl_plan_scope_close(void * scope);
+
+// The load-time measure's backend: non-owning, no SYCL context, no
+// refcount, no lifecycle registration, its own interface with every slot but get_name and
+// free NULL.  ggml_backend_free on it deletes the object only.  NULL on a bad device index.
+GGML_BACKEND_API ggml_backend_t ggml_backend_sycl_measure_backend_init(int device);
+
+// L0, the process-global re-plan transaction mutex, held by a caller outside the backend.
+// A context's own transaction (the placement fixpoint at construction, and the growth
+// path of a re-plan) holds it for its whole extent so that no other load, publish or
+// re-plan interleaves.  Only the TRANSACTION kind is open to a caller: the backend's own
+// holders (loads, lifecycle entries) take their kinds themselves.  The hold is
+// thread-local, so close must run on the thread that opened.  A nested open on the
+// holding thread is a no-op hold and the outermost close unlocks.  `require_outermost`
+// asserts, through the always-compiled witness, that no token is held on entry:
+// `[REPLAN-TOKEN] growth scope not outermost: under <kind>`.  Returns NULL for a kind
+// other than TRANSACTION.
+enum ggml_sycl_replan_scope_kind {
+    GGML_SYCL_REPLAN_SCOPE_TRANSACTION = 1,
+};
+
+GGML_BACKEND_API void * ggml_backend_sycl_replan_scope_open(enum ggml_sycl_replan_scope_kind kind,
+                                                            bool                             require_outermost);
+GGML_BACKEND_API void   ggml_backend_sycl_replan_scope_close(void * scope);
+
+// A re-plan's per-context steps.  synchronize_for_replan waits every
+// queue that can reach a slice of the context, after llama's synchronize(); it returns
+// false if a wait failed.  graph_invalidate drops this context's own recorded graph
+// state, only when it has some, and reaches no process-global effect.
+GGML_BACKEND_API bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend);
+GGML_BACKEND_API void ggml_backend_sycl_graph_invalidate(ggml_backend_t backend, const char * reason);
+
 // === Test-only debug accessors (llama.cpp-dfo0, plan task L2) ===
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+// The freeze's store through the production core, for a host with no SYCL device.  `buft` is stored with the core's value and the copy's
+// per-buft freeze counter is incremented.  Returns the stored value.
+GGML_BACKEND_API size_t                     ggml_backend_sycl_plan_caps_freeze_core(ggml_backend_sycl_plan_caps_t caps,
+                                                                                    ggml_backend_buffer_type_t    buft,
+                                                                                    bool                          is_vm,
+                                                                                    size_t                        runtime,
+                                                                                    size_t                        kv,
+                                                                                    size_t                        scratch,
+                                                                                    size_t                        safe_alloc,
+                                                                                    size_t                        max_alloc);
+// The graph_compute exit's staging step on a real context, with the call's classification
+// chosen by the caller, and the tenant staging the exit and the re-plan's invalidation act on.
+// park_tenant_staging allocates through the production staging path, tags the slice as a
+// tenant cohort's, and parks it in the context's graph_input_staging; it returns the number
+// of tenant entries now parked (0 when it could not allocate).  graph_exit runs the exit hooks
+// as a call that recorded and/or replayed a graph would, and returns the exit's success.
+GGML_BACKEND_API size_t ggml_backend_sycl_test_park_tenant_staging(ggml_backend_t backend, size_t nbytes);
+GGML_BACKEND_API size_t ggml_backend_sycl_test_tenant_staging_count(ggml_backend_t backend);
+GGML_BACKEND_API bool   ggml_backend_sycl_test_graph_exit(ggml_backend_t backend, bool recorded, bool replayed);
+GGML_BACKEND_API uint32_t                   ggml_backend_sycl_plan_caps_freeze_count(ggml_backend_sycl_plan_caps_t caps,
+                                                                                     ggml_backend_buffer_type_t    buft);
+GGML_BACKEND_API int                        ggml_backend_sycl_plan_caps_live(void);
+// A device buft that touches no device: the production interface over a context naming
+// `device`.  The in-scope get_max_size branch reads only the thread's scope and the buft.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type_make_for_testing(int device);
+// The SYCL_Host buft with no device behind it: the production host interface, device NULL.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_make_for_testing(void);
 // Process-global by design: ggml_backend_sched does not hand test code the
 // compute buffer it allocates internally, so this reads the last COMPUTE-usage
 // ggml_backend_sycl_buffer_reset's post-release tensor_extras vector size,
