@@ -16,7 +16,10 @@ Rules, per tests/test-sycl-*.py:
   R1  it is named, in COMMAND position (add_test COMMAND, llama_test_pytest SCRIPT, llama_test_cmd ARGS), by a
       registration in a CMakeLists.txt, or it is in UNREGISTERED_ALLOWLIST with a reason. Comments, an argument of
       some other script, a longer file name that ends in the gate's name, a `.pyc`, and a registration inside
-      `if(FALSE)` / `if(0)` / the dead branch of `if(TRUE)` do not count;
+      `if(FALSE)` / `if(0)` / `if(NOT TRUE)` / the dead branch of `if(TRUE)` do not count, nor does a registration
+      whose program is not an interpreter (`cat gate.py`, `cmake -E echo gate.py` name the file and never run it), nor
+      one that a test property turns off or reinterprets (DISABLED, WILL_FAIL, PASS_REGULAR_EXPRESSION,
+      SKIP_REGULAR_EXPRESSION; SKIP_RETURN_CODE, LABELS and TIMEOUT are fine);
   R2  if pytest or unittest would collect something from it (a module-level `test*` function, a `Test*` class, a
       unittest.TestCase subclass, `test_x = lambda ...`, also nested under `if`/`try`), every registration is
       llama_test_pytest. Exception: a file holding only unittest.TestCase classes whose own `__main__` calls
@@ -24,19 +27,24 @@ Rules, per tests/test-sycl-*.py:
   R3  such a gate can run itself, so `python3 tests/test-sycl-x.py` executes its tests or fails loudly instead of
       passing vacuously. That takes a real top-level `if __name__ == "__main__":` statement (not text in a comment,
       docstring or string, not a guard inside a function) whose block either exits with
-      pytest.main([__file__, ...]) (no -k/-m/--deselect/--ignore/--co selection, status not dropped), or calls
-      unittest.main() for a file of TestCase classes, or loops over every `test_` name in globals() and exits
-      non-zero on failure with no test called by hand outside the loop. The footer scripts/sycl-add-pytest-footer.py
-      appends is the first form;
+      pytest.main([__file__, ...]) (no -k/-m/-o/-p/--pyargs/--deselect/--ignore/--co selection, status not dropped), or
+      calls unittest.main() for a file of TestCase classes (no defaultTest, no argv selector, no exit=False), or
+      loops over every `test_` name in globals() and then exits non-zero when the loop recorded a failure, with no
+      test called by hand outside the loop. The exit (or the loop) must be a DIRECT statement of the guard body, with
+      no exit before it: an exit under `if False`, behind a CLI condition, inside a `try` that swallows SystemExit,
+      or after an unconditional `sys.exit(0)` does not count. The footer scripts/sycl-add-pytest-footer.py appends is
+      the first form;
   R4  UNREGISTERED_ALLOWLIST holds no stale entry (a file that is registered, or no longer exists);
   R5  every test-sycl-*.py a registration names exists under tests/ (a registration of a file that was never
       committed fails at ctest time with "file not found", or worse, only passes on the one checkout that has the
       file), unless it is in MISSING_FILE_ALLOWLIST with a reason; an allowlisted name whose file now exists is
-      stale.
+      stale;
+  R6  at least MIN_GATES gates exist (a tests/ that moved would otherwise be audited as empty and pass).
 
 Known limit: this reads every CMakeLists.txt under the tree statically, so it does not know whether CMake reaches a
 registration. A registration in an uncalled function()/macro(), behind a non-constant if(), or in a directory no
-add_subdirectory() visits still counts as registered. `ctest -N` in a configured tree is the reachability check.
+add_subdirectory() visits still counts as registered, and a test property reaching the test through a CMake
+variable (`set_tests_properties(${NAME} ...)`) is not resolved. `ctest -N` in a configured tree is the reachability check.
 
 `--self-test` also proves the audit can fail: it plants each escape above (and the shapes that must stay clean) into
 temp trees, synthetic and a copy of the real tree (every CMakeLists.txt this audit scans), and requires each to be
@@ -62,11 +70,21 @@ UNREGISTERED_ALLOWLIST = {}
 # An entry goes stale (and is reported) the moment its file appears.
 MISSING_FILE_ALLOWLIST = {}
 REQUIRE_PYTEST_FOOTER = True
+# The audit refuses a tests/ that has lost most of its gates (a moved directory would otherwise audit nothing and PASS).
+MIN_GATES = 100
+# The programs a registration may run a gate with: python itself, or a CMake variable that names it.
+INTERPRETER = re.compile(r"(?:.*/)?python[0-9.]*|\$\{\w*python\w*\}", re.I)
+# Test properties that make a registered gate not count: it never runs, its exit status is inverted, or its output
+# decides the verdict instead of the exit code. SKIP_RETURN_CODE, LABELS, TIMEOUT, FAIL_REGULAR_EXPRESSION are fine.
+DEFECT_PROPERTIES = {"DISABLED", "WILL_FAIL", "PASS_REGULAR_EXPRESSION", "SKIP_REGULAR_EXPRESSION"}
 # What scripts/sycl-add-pytest-footer.py appends (two blank lines before the guard: flake8 E305).
 FOOTER = '\n\nif __name__ == "__main__":\n    import sys\n\n    import pytest\n\n    sys.exit(pytest.main([__file__, "-q"]))\n'
 EXIT_CALLS = {"sys.exit", "exit", "quit", "SystemExit", "os._exit"}
 # pytest.main arguments that select a subset (or none) of the module's tests.
-PYTEST_SELECTION_FLAGS = ("--co", "--deselect", "--ignore", "--lf", "--last-failed", "--sw", "--stepwise")
+PYTEST_SELECTION_FLAGS = ("--co", "--deselect", "--ignore", "--lf", "--last-failed", "--sw", "--stepwise", "--pyargs")
+# Short pytest options (matched as a prefix, since `-kexpr` is legal) that select tests out, or whose value can:
+# -k/-m select, -o addopts=... injects options, -p no:python switches the collector off.
+PYTEST_SELECTION_SHORT = ("-k", "-m", "-o", "-p")
 STATIC_TRUE = {"1", "on", "yes", "y", "true"}
 STATIC_FALSE = {"0", "off", "no", "n", "false", "ignore", "notfound"}
 
@@ -170,35 +188,66 @@ def cmake_tokens(args):
     return tokens
 
 
-def registered_gate(command, args):
-    """The tests/test-sycl-*.py file a registrar command runs, or None.
+def registration_target(command, args):
+    """(gate file name, registered test name) for a registrar command that runs a tests/test-sycl-*.py gate, or
+    (None, None).
 
     Only the COMMAND/SCRIPT/ARGS position counts: the first .py file from that keyword on (for add_test without a
     COMMAND keyword, the first .py file anywhere). A gate named as an argument of some other script, a longer
-    file name ending in the gate's, or a .pyc does not register it."""
+    file name ending in the gate's, or a .pyc does not register it. The program in front of the gate must be an
+    interpreter (python3, ${Python3_EXECUTABLE}, ${LLAMA_PYTHON3}): `cat gate.py` or `cmake -E echo gate.py`
+    names the file without running it."""
     tokens = cmake_tokens(args)
     keyword = COMMAND_KEYWORD[command]
+    whole = tokens
     if keyword in tokens:
         tokens = tokens[tokens.index(keyword) + 1:]
     elif command != "add_test":
-        return None
+        return None, None
     if command == "llama_test_pytest":
         candidate = tokens[0] if tokens else ""
+        program = whole[0] if whole else ""
     else:
         candidate = next((tok for tok in tokens if tok.endswith(".py")), "")
+        if command == "llama_test_cmd":
+            program = whole[0] if whole else ""
+        else:
+            program = tokens[0] if tokens else ""
     m = re.fullmatch(r"(?:.*/)?(test-sycl-[A-Za-z0-9_.-]+\.py)", candidate)
-    return m.group(1) if m else None
+    if not m or not INTERPRETER.fullmatch(program):
+        return None, None
+    gate = m.group(1)
+    name = None
+    if command == "add_test":
+        if "NAME" in whole and whole.index("NAME") + 1 < len(whole):
+            name = whole[whole.index("NAME") + 1]
+        elif whole:
+            name = whole[0]
+    elif "NAME" in whole and whole.index("NAME") + 1 < len(whole):
+        name = whole[whole.index("NAME") + 1]
+    elif command == "llama_test_pytest":
+        name = gate.split(".")[0]  # get_filename_component(... NAME_WE): everything before the first dot
+    else:
+        name = whole[0] if whole else None
+    return gate, name
+
+
+def registered_gate(command, args):
+    return registration_target(command, args)[0]
 
 
 def static_condition(args):
     """True / False for a constant if() condition, None when it is not one (then both branches are live)."""
     tokens = cmake_tokens(args)
+    negate = len(tokens) == 2 and tokens[0].upper() == "NOT"
+    if negate:
+        tokens = tokens[1:]
     if len(tokens) == 1:
         value = tokens[0].lower()
         if value in STATIC_TRUE:
-            return True
+            return not negate
         if value in STATIC_FALSE or value.endswith("-notfound"):
-            return False
+            return negate
     return None
 
 
@@ -234,17 +283,48 @@ def cmake_files(root):
             yield Path(dirpath) / "CMakeLists.txt"
 
 
-def registrations(root):
-    """gate file name -> sorted list of the registering command names that run it."""
-    found = {}
+def _property_defects(name, args):
+    """(test names, [(property, value)]) of a live set_tests_properties()/set_property(TEST ...) command."""
+    tokens = cmake_tokens(args)
+    if name == "set_tests_properties" and "PROPERTIES" in tokens:
+        at = tokens.index("PROPERTIES")
+        names, rest = tokens[:at], tokens[at + 1:]
+        return names, list(zip(rest[0::2], rest[1::2]))
+    if name == "set_property" and tokens[:1] == ["TEST"] and "PROPERTY" in tokens:
+        at = tokens.index("PROPERTY")
+        names = [tok for tok in tokens[1:at] if tok not in ("APPEND", "APPEND_STRING")]
+        return names, [(tokens[at + 1], tokens[at + 2])] if len(tokens) > at + 2 else []
+    return [], []
+
+
+def scan_registrations(root):
+    """(gate file name -> sorted list of the registering command names that run it,
+        problems for gates whose registration a test property turns off, inverts or reinterprets)."""
+    found, tests, properties = {}, {}, []
     for path in cmake_files(root):
         for name, args in live_commands(path.read_text(errors="replace")):
-            if name not in REGISTRARS:
-                continue
-            gate = registered_gate(name, args)
-            if gate:
-                found.setdefault(gate, []).append(name)
-    return {gate: sorted(forms) for gate, forms in found.items()}
+            if name in REGISTRARS:
+                gate, test = registration_target(name, args)
+                if gate:
+                    found.setdefault(gate, []).append(name)
+                    tests.setdefault(test, set()).add(gate)
+            elif name in ("set_tests_properties", "set_property"):
+                properties.append(_property_defects(name, args))
+    defects = []
+    for names, pairs in properties:
+        for test in names:
+            for gate in sorted(tests.get(test, ())):
+                for key, value in pairs:
+                    key = key.upper()
+                    if key in DEFECT_PROPERTIES and value.lower() not in STATIC_FALSE:
+                        defects.append("R1 %s is registered (as test %s) but not run as a test: %s is set on it"
+                                       % (gate, test, key))
+    return {gate: sorted(forms) for gate, forms in found.items()}, defects
+
+
+def registrations(root):
+    """gate file name -> sorted list of the registering command names that run it."""
+    return scan_registrations(root)[0]
 
 
 def parse(text):
@@ -318,34 +398,98 @@ def _pytest_main_runs_the_file(call):
     for item in items:
         if isinstance(item, ast.Constant) and isinstance(item.value, str):
             flag = item.value
-            if flag[:2] in ("-k", "-m") or flag.startswith(PYTEST_SELECTION_FLAGS):
+            if flag.startswith(PYTEST_SELECTION_SHORT) or flag.startswith(PYTEST_SELECTION_FLAGS):
+                return False
+    return True
+
+
+def _exit_statement(stmt):
+    """The exit call when stmt is itself `sys.exit(...)` / `raise SystemExit(...)`, else None."""
+    call = None
+    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+        call = stmt.value
+    elif isinstance(stmt, ast.Raise) and isinstance(stmt.exc, ast.Call):
+        call = stmt.exc
+    return call if call is not None and _call_name(call) in EXIT_CALLS else None
+
+
+def _names(node):
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _recorded_names(loop):
+    """Names the loop body writes: assigned, augmented, or grown with .append()/.add()/... (the failure record)."""
+    out = set()
+    for node in ast.walk(loop):
+        if isinstance(node, ast.AugAssign):
+            out |= _names(node.target)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                out |= _names(target)
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr in ("append", "add", "extend", "update", "insert", "setdefault")):
+            out |= _names(node.func.value)
+    return out
+
+
+def _nonzero_exit(call):
+    if not call.args:
+        return False
+    arg = call.args[0]
+    return not (isinstance(arg, ast.Constant) and arg.value in (0, None))
+
+
+def _loop_reports_failure(body, loop_at, recorded):
+    """After the loop: a direct exit that depends on what the loop recorded, or `if <recorded>:` whose body exits
+    non-zero. `sys.exit(0)`, or an exit that never reads the record, swallows every failure."""
+    for stmt in body[loop_at + 1:]:
+        call = _exit_statement(stmt)
+        if call is not None:
+            return bool(call.args) and bool(_names(call.args[0]) & recorded)
+        if isinstance(stmt, ast.If) and _names(stmt.test) & recorded:
+            if any(_exit_statement(inner) is not None and _nonzero_exit(_exit_statement(inner)) for inner in stmt.body):
+                return True
+    return False
+
+
+def _unittest_main_selects_nothing_out(call):
+    if len(call.args) > 1 or any(kw.arg in ("exit", "defaultTest") or kw.arg is None for kw in call.keywords):
+        return False
+    for kw in call.keywords:
+        if kw.arg == "argv":
+            argv = kw.value
+            ok = isinstance(argv, ast.List) and argv.elts and ast.unparse(argv.elts[0]) == "sys.argv[0]" and all(
+                isinstance(e, ast.Starred) for e in argv.elts[1:])
+            if not ok and ast.unparse(argv) not in ("sys.argv", "sys.argv[:]"):
                 return False
     return True
 
 
 def _guard_runs_every_test(guard, kinds):
-    nodes = list(ast.walk(guard))
-    calls = [node for node in nodes if isinstance(node, ast.Call)]
-    for call in calls:
-        if (_call_name(call) in EXIT_CALLS and call.args and isinstance(call.args[0], ast.Call)
-                and _call_name(call.args[0]) == "pytest.main" and _pytest_main_runs_the_file(call.args[0])):
+    """The guard body, statement by statement: the exit has to be one of its direct statements, so nothing
+    conditional, `try`-wrapped or already-exited can stand in for it."""
+    body = guard.body
+    calls = [node for node in ast.walk(guard) if isinstance(node, ast.Call)]
+    for at, stmt in enumerate(body):
+        call = _exit_statement(stmt)
+        if call is not None:
+            # A direct exit that is not the one we are looking for ends the block: nothing after it runs.
+            return (bool(call.args) and isinstance(call.args[0], ast.Call) and _call_name(call.args[0]) == "pytest.main"
+                    and _pytest_main_runs_the_file(call.args[0]))
+        # unittest.main() only runs TestCase classes: next to module-level test_ functions it would run nothing of them.
+        if (kinds <= {"unittest"} and isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+                and _call_name(stmt.value) == "unittest.main" and _unittest_main_selects_nothing_out(stmt.value)):
             return True
-    # unittest.main() only runs TestCase classes: next to module-level test_ functions it would run nothing of them.
-    if kinds <= {"unittest"}:
-        for call in calls:
-            if _call_name(call) == "unittest.main" and not any(kw.arg == "exit" for kw in call.keywords):
+        if isinstance(stmt, ast.For) and "globals()" in ast.unparse(stmt.iter):
+            inside = {id(node) for node in ast.walk(stmt)}
+            selects_tests = any(
+                isinstance(node, ast.Call) and _call_name(node).endswith(".startswith") and node.args
+                and isinstance(node.args[0], ast.Constant) and str(node.args[0].value).startswith("test")
+                for node in ast.walk(stmt))
+            by_hand = any(isinstance(call.func, ast.Name) and call.func.id.startswith("test")
+                          for call in calls if id(call) not in inside)
+            if selects_tests and not by_hand and _loop_reports_failure(body, at, _recorded_names(stmt)):
                 return True
-    exits = any(_call_name(call) in EXIT_CALLS for call in calls)
-    for loop in (node for node in nodes if isinstance(node, ast.For) and "globals()" in ast.unparse(node.iter)):
-        inside = {id(node) for node in ast.walk(loop)}
-        selects_tests = any(
-            isinstance(node, ast.Call) and _call_name(node).endswith(".startswith") and node.args
-            and isinstance(node.args[0], ast.Constant) and str(node.args[0].value).startswith("test")
-            for node in ast.walk(loop))
-        by_hand = any(isinstance(call.func, ast.Name) and call.func.id.startswith("test")
-                      for call in calls if id(call) not in inside)
-        if selects_tests and exits and not by_hand:
-            return True
     return False
 
 
@@ -363,13 +507,15 @@ def has_main_guard(text):
     return tree is not None and any(is_main_guard(node) for node in tree.body)
 
 
-def audit(root, require_footer=REQUIRE_PYTEST_FOOTER, allowlist=None, missing_allowlist=None):
+def audit(root, require_footer=REQUIRE_PYTEST_FOOTER, allowlist=None, missing_allowlist=None, min_gates=0):
     root = Path(root)
     allowlist = UNREGISTERED_ALLOWLIST if allowlist is None else allowlist
     missing_allowlist = MISSING_FILE_ALLOWLIST if missing_allowlist is None else missing_allowlist
-    registered = registrations(root)
-    problems = []
+    registered, problems = scan_registrations(root)
     gates = sorted((root / "tests").glob("test-sycl-*.py"))
+    if len(gates) < min_gates:
+        problems.append("R6 only %d tests/test-sycl-*.py gates found under %s (floor %d): the tests directory moved, or "
+                        "gates were deleted, and the audit would otherwise pass over nothing" % (len(gates), root, min_gates))
     names = {gate.name for gate in gates}
     for gate in gates:
         text = gate.read_text(errors="replace")
@@ -389,7 +535,8 @@ def audit(root, require_footer=REQUIRE_PYTEST_FOOTER, allowlist=None, missing_al
                                 % (gate.name, "/".join(forms)))
             if require_footer and not self_running:
                 problems.append("R3 %s is pytest-style but cannot run itself: no top-level __main__ block that runs every "
-                                "test and exits with its status (run scripts/sycl-add-pytest-footer.py)" % gate.name)
+                                "test and exits with its status (run scripts/sycl-add-pytest-footer.py, or fix the "
+                                "existing __main__ block)" % gate.name)
     for name in sorted(allowlist):
         if name not in names:
             problems.append("R4 %s is allowlisted but does not exist" % name)
@@ -463,6 +610,14 @@ R3_CASES = [
      REG_P_PYTEST, "R3 test-sycl-p.py"),
     ("r3-unittest-main-default-test", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main(defaultTest="T.test_x")\n',
      REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-loop-failure-branch-exits-0", PYTEST_GATE + '\nif __name__ == "__main__":\n    import sys\n\n    failures = 0\n'
+     '    for name, fn in list(globals().items()):\n        if name.startswith("test_") and callable(fn):\n'
+     '            try:\n                fn()\n            except AssertionError:\n                failures += 1\n'
+     '    if failures:\n        sys.exit(0)\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-loop-failure-branch-bare-exit", PYTEST_GATE + '\nif __name__ == "__main__":\n    import sys\n\n    failures = 0\n'
+     '    for name, fn in list(globals().items()):\n        if name.startswith("test_") and callable(fn):\n'
+     '            try:\n                fn()\n            except AssertionError:\n                failures += 1\n'
+     '    if failures:\n        sys.exit()\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
     ("r3-ok-loop-exits-only-on-failure", PYTEST_GATE + '\nif __name__ == "__main__":\n    import sys\n\n    failures = 0\n'
      '    for name, fn in list(globals().items()):\n        if name.startswith("test_") and callable(fn):\n'
      '            try:\n                fn()\n            except AssertionError:\n                failures += 1\n'
@@ -600,6 +755,18 @@ llama_test_pytest(${Python3_EXECUTABLE}
              clean_cmake + "add_test(NAME m COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-m.v2.py)\n", None)
         for label, registration in MATCH_OK_CASES:
             case(label, dict(clean_gates, **{"test-sycl-m.py": SCRIPT_GATE}), clean_cmake + registration, None)
+        # The floor: a tree with (almost) no gates must not pass, and one at the floor must.
+        tree = base / "floor"
+        write_tree(tree, clean_gates, clean_cmake)
+        if not any("R6" in p for p in audit(tree, allowlist={}, missing_allowlist={}, min_gates=3)):
+            failures.append("floor: a tree below the gate floor was not reported")
+        if any("R6" in p for p in audit(tree, allowlist={}, missing_allowlist={}, min_gates=2)):
+            failures.append("floor: a tree at the gate floor was reported")
+        tree = base / "floor-moved"
+        (tree / "tests").mkdir(parents=True)
+        (tree / "tests" / "CMakeLists.txt").write_text(clean_cmake)
+        if not any("R6" in p for p in audit(tree, allowlist={}, missing_allowlist={}, min_gates=MIN_GATES)):
+            failures.append("floor-moved: an empty tests/ passed the audit")
         # A registration naming a file that is not in tests/ (R5), and the matching allowlist rules.
         tree = base / "missing-file"
         write_tree(tree, clean_gates, clean_cmake + "add_test(NAME g COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-ghost.py)\n")
@@ -631,7 +798,7 @@ llama_test_pytest(${Python3_EXECUTABLE}
             rel = path.relative_to(root)
             (real / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(path, real / rel)
-        baseline = audit(real)
+        baseline = audit(real, min_gates=MIN_GATES)
         if baseline:
             failures.append("real-tree copy is not clean before planting: %s" % baseline)
         (real / "tests" / "test-sycl-zz-planted-unregistered.py").write_text(SCRIPT_GATE)
@@ -653,7 +820,7 @@ def main():
     parser.add_argument("--self-test", action="store_true", help="also prove the audit fails on planted violations")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    problems = audit(root)
+    problems = audit(root, min_gates=MIN_GATES)
     for problem in problems:
         print("FAIL " + problem)
     if args.self_test:
