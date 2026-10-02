@@ -1043,8 +1043,9 @@ int main() {
                   "the kept plan's first reservation is its planned pair, which a bound equal to the bare plan holds");
             // An op of the OTHER plan, whose pair the kept one is not: the halves it needs are not the kept pair's,
             // so the kept pair is replaced by the request as asked. That is a regrow, but only for an op the kept plan
-            // never provisioned; the superseded reservation is freed before the new one is allocated, and the request
-            // fits the bound alone, which is what acquire admitted it against.
+            // never provisioned. The superseded reservation's release is event-deferred, so the old and new blocks can
+            // briefly both be in the zone, and a failed zone allocation falls back to the unified-cache direct path;
+            // the request fits the bound alone, which is what acquire admitted it against.
             size_t xw = 0, xa = 0;
             ggml_sycl::zone_onednn_scratch_reserve_target(true, crossed.bare_bytes, cw, ca, crossed.weights_bytes,
                                                           crossed.activations_bytes, 10 * mib, 100 * mib, &xw, &xa);

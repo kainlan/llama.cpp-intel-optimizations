@@ -317,9 +317,10 @@ bool zone_onednn_pp_scratch_planned(bool   arena_active,
 // (a regrow needs the superseded reservation and the new one in the zone at once, which a zone sized for one pair plus
 // the Graph floor cannot hold). That holds only for the ops of the plan whose pair is kept: an op that needs the other
 // plan's halves (kept (100, 10) at a bound of 110, request (10, 100)) fits neither the planned pair nor the merge, so
-// the target is the request as asked and the held pair is replaced. The superseded block is freed before the new one
-// is allocated, so the two are never in the zone together, and the request fits the bound alone, which acquire has
-// already admitted it against.
+// the target is the request as asked and the held pair is replaced. The held pair's release is event-deferred, so for
+// a moment the superseded block and the new one can both occupy the zone; if the zone allocation then fails, the
+// request is served through the unified-cache direct path (the transient old-plus-new case in
+// reserve_onednn_scratch). The request fits the bound alone, which acquire has already admitted it against.
 // Used only with an arena, where the planned pair exists; without one the planned halves are ignored. When that pair
 // does not fit `pair_bound_bytes` (a zone clamped below its plan) the target is the held-and-requested merge. Pass 0, 0
 // for no planned pair. Pure; a null out is ignored.
