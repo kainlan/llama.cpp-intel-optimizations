@@ -274,7 +274,7 @@
       "file": "ggml-sycl.cpp",
       "function": "ggml_sycl_published_section_erase",
       "count": 1,
-      "reason": "ggml_sycl_published_section_erase is noexcept and runs from ~ggml_backend_sycl_context: its try body is ggml_sycl_published_section_set with a null section (the execution_state_mutex read of the context id and one registry drop_published_section: a map find and an erase, no allocation of device memory and no planned-refusal path), and a rethrow of ggml_sycl_fallback_error out of a destructor would std::terminate. Permanent; llama.cpp-moua L4 step 3."
+      "reason": "ggml_sycl_published_section_erase is noexcept and runs from ~ggml_backend_sycl_context and from the clear of an ended execution context's bindings (finish_drain, close_if_idle), which answer a C status and cannot let an exception out: its try body is one registry drop_published_section by the id the caller names (a map find and an erase, no allocation of device memory and no planned-refusal path), so the only thing it can raise is the registry lock's std::system_error; a rethrow of ggml_sycl_fallback_error out of a destructor would std::terminate. The handler says the failed drop at ERROR (the entry then stays until the process ends). Permanent; llama.cpp-moua L4 step 3."
     },
     {
       "id": "E-L4-HOST-TENANTS-ERASE",
@@ -282,7 +282,7 @@
       "file": "ggml-sycl.cpp",
       "function": "ggml_sycl_host_tenants_erase",
       "count": 1,
-      "reason": "ggml_sycl_host_tenants_erase is noexcept and runs from ~ggml_backend_sycl_context: its try body takes the context's slot table out of the registry and drops it, which releases carves through their owners' destructors, and nothing in it raises a planned refusal; a rethrow of ggml_sycl_fallback_error out of a destructor would std::terminate. Permanent; llama.cpp-moua L4 step 3c."
+      "reason": "ggml_sycl_host_tenants_erase is noexcept and runs from ~ggml_backend_sycl_context, from the clear of an ended execution context's bindings and from the publish's install guard: its try body takes the slot table the caller's id keyed out of the registry and drops it, which releases carves through their owners' destructors, and nothing in it raises a planned refusal; a rethrow of ggml_sycl_fallback_error out of a destructor would std::terminate. The handler says the failed drop at ERROR (the carves then stay pinned until the process ends). Permanent; llama.cpp-moua L4 step 3c."
     },
     {
       "id": "E-L4-TENANT-CLAIM-DROP",
@@ -291,14 +291,6 @@
       "function": "tenant_claim::drop",
       "count": 1,
       "reason": "tenant_claim::drop is noexcept and runs from the claim record's destructor: its try body is one kv_tenant_slots::release_claim, which takes the registry's leaf lock and marks a slot free, so the only thing it can throw is that lock's std::system_error and it has no planned-refusal path; a rethrow out of a destructor would std::terminate. The handler says the failed release on stderr (WARN) rather than staying silent. Permanent; llama.cpp-moua L4 step 3c."
-    },
-    {
-      "id": "E-L4-CONTEXT-END-DROP",
-      "code": "G-CATCH",
-      "file": "ggml-sycl.cpp",
-      "function": "ggml_sycl_execution_drop_context_registry_entries",
-      "count": 1,
-      "reason": "ggml_sycl_execution_drop_context_registry_entries is noexcept and runs from the clear of an ended execution context's bindings (finish_drain, close_if_idle), which answer a C status and cannot let an exception out: its try body pins the context's bound backends and calls the two noexcept erase helpers on each, so what it can raise is the binding mutex's std::system_error or bad_alloc from the pin snapshot, with no planned-refusal path. The handler logs at WARN. Permanent; llama.cpp-moua L4 step 3c."
     },
     {
       "id": "E-L4-LEDGER-CLEAR",

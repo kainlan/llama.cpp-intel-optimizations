@@ -17,8 +17,9 @@ It checks, over ggml/include/ggml-sycl.h and ggml/src/ggml-sycl/ggml-sycl.cpp:
     guard created after the finisher check clears on a normal exit and skips while unwinding, and the
     one catch (...) arms `after_end` as its first statement, sets its transaction before the end call
     on the finisher arm and on the recovery arm, and clears when the handler is left;
-  * the backend context's destructor erases its published section before it resets its execution
-    binding (which zeroes the registry key);
+  * the backend context's destructor reads its context id once and erases its published section and then
+    its held host reservation by that id before it resets its execution binding (which zeroes the registry
+    key); the erase helpers take the id from their caller and never read a backend's;
   * the runtime-context transaction drops the published section on its success tail, and the
     descriptor publish stores a section only after the inner transaction succeeded;
   * the late check and the record read the open transaction (ggml_sycl_load_txn_is_open) only after the
@@ -33,12 +34,15 @@ It checks, over ggml/include/ggml-sycl.h and ggml/src/ggml-sycl/ggml-sycl.cpp:
   * the fail-closed values: the late check answers NOT_RECORDED, the coverage query GROWTH and the clear 0
     on a closed module or an exception, a coverage query of an unbound context answers GROWTH, and a
     refusal logs at ERROR, a shrink and a not-open transaction at WARN (through ggml_sycl_load_ledger_log);
-  * a publish for an unbound context is said at WARN, and the destructor's erase says a failed drop at
-    WARN; the publish tail drops through the throwing set, not the erase;
+  * a publish for an unbound context is said at WARN, and an erase that fails says so at ERROR (the entry
+    then stays until the process ends: its key is gone); the publish tail drops through the throwing set, not
+    the erase;
   * (step 3c) a context's first publish reserves its host tier before L1 through
     unified_allocate_owner with the carve's request fields, installs the table once before the inner
     transaction (a rollback guard takes it back unless the section was stored), and the destructor drops
-    it after the section and before the unbind; an ended execution context drops its entries first; the
+    it after the section and before the unbind; an ended execution context collects its devices under the
+    binding mutex, resets the bindings, and then drops its entries BY THE ENDED ID outside the lock (no backend
+    is pinned, so nothing can fail to pin and a publish after the reset finds no id to key an entry by); the
     SYCL_Host buffer type claims inside a claim scope before it reaches any allocation, and its free
     releases the claim without waiting on the host.  The pins also name each refusal the device test
     exercises: a refused or part-way reservation and a republish the held slots cannot carry are
@@ -48,12 +52,22 @@ It checks, over ggml/include/ggml-sycl.h and ggml/src/ggml-sycl/ggml-sycl.cpp:
     open answers a status for each way it can not open.
 
   * (the free-path contract) the SYCL_Host free_buffer releases the slot once, through
-    tenant_claim_scope::release with event 0, and never waits on the host; the synchronize that makes
-    that safe is pinned where a compute buffer can be freed (~llama_context first, sched_reserve_impl
-    before it touches the scheduler, release_rung_buffers), the backend's synchronize still drains stream
-    0, the deferred decode event and the CPU-expert flush, set/get_tensor_async accept only the device,
-    host-compute and cpu-offload buffer types, the device does not support the CpuActivation clone, and
-    cpy_tensor_async stays unwired.  llama-context.cpp is read as one text with ggml-sycl.cpp.
+    tenant_claim_scope::release with event 0, and never waits on the host.  That is safe because every path
+    that frees a claimed compute buffer runs a synchronize attempt of the scheduler's backends first, and
+    every queue that can touch a slot is the device's one execution queue, which that synchronize drains.
+    Pinned: the synchronize before each path (~llama_context first; sched_reserve_impl as a statement of
+    its own on the ALLOC path, after the MEASURE branch; release_rung_buffers), the backend synchronize's
+    contiguous sequence (stream, CPU-expert flush, deferred-event choice, drain), the aliasing that
+    ggml_backend_sycl_context::stream(device, idx) answers the device's one execution queue (the TP queue
+    or the unified cache's own) for every idx, the scheduler-level premises in the vendored ggml-backend.cpp
+    and ggml-alloc.c (reserve and reserve_size synchronize first, the alloc_splits realloc synchronizes
+    every backend before reserving, the automatic reserve in ggml_gallocr_alloc_graph is single-buffer only,
+    the allocator has one buffer per backend) and in llama-context.cpp (the CPU backend is always appended, a
+    measure-only context requires it last, the scheduler is built over every backend), set/get_tensor_async
+    accepting only the device, host-compute and cpu-offload buffer types, the device not supporting the
+    CpuActivation clone, and cpy_tensor_async staying unwired.  Each is pinned as a whole statement or
+    sequence, so a statement under an `if`, behind a ternary arm or in another branch no longer matches.
+    The contract text itself is the comment above ggml_backend_sycl_host_buffer_free_buffer.
 
 Known limits (text-level pins; each is what the named test or review covers instead):
   * a lambda or macro that hides a release, a synchronize or a clear behind another name: the pins read
@@ -61,8 +75,13 @@ Known limits (text-level pins; each is what the named test or review covers inst
   * a tail-drop or late check inside a function the pin does not name (a statement added after the last
     pinned one): the pins anchor the first and the terminating statements, not the ones between (covered by
     the lifecycle device test's order witnesses);
-  * the gate cannot tell a synchronize that is reached from one that is dead code behind a runtime
-    condition other than a literal `if (false)` (covered by the L6 wait_event consumption acceptance).
+  * the gate cannot tell a pinned statement that is reached from one that is dead behind a condition the
+    pinned shape does not contain, such as a guard added in a caller or a function that never runs (a
+    literal `if (false)`, a ternary arm and a branch move on the pinned statements ARE caught: the pin matches
+    the statement's neighbours too, and these are in the mutation matrix); covered by the L6 wait_event
+    consumption acceptance;
+  * which scheduler a claim scope is opened on: the contract says never on the MEASURE scheduler, and
+    nothing opens a scope in production yet, so there is nothing to pin (L6's constraint).
 
 Usage:
   check-sycl-l4-proc-registration.py [--root DIR]     check the tree, then run the mutation matrix
@@ -89,6 +108,11 @@ HEADER = "ggml/include/ggml-sycl.h"
 SOURCE = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 CLAIM_HPP = "ggml/src/ggml-sycl/tenant-claim-scope.hpp"  # the claim record's destructor and the lowest-free walk
 LLAMA = "src/llama-context.cpp"  # the scheduler's owner: read with SOURCE, as one text, for the free-path contract
+COMMON_HPP = "ggml/src/ggml-sycl/common.hpp"  # stream(device, idx): the one execution queue per device
+BACKEND_CPP = "ggml/src/ggml-backend.cpp"  # the scheduler's synchronize-before-free premises (vendored upstream)
+ALLOC_C = "ggml/src/ggml-alloc.c"  # the allocator's automatic reserve (single-buffer only)
+# One text: the free-path contract names all of them, and a mutation is one edit of it.
+SOURCE_FILES = (SOURCE, LLAMA, CLAIM_HPP, COMMON_HPP, BACKEND_CPP, ALLOC_C)
 REG_FN = "ggml_backend_sycl_reg_get_proc_address"
 IMPL_SIG = r"\bggml_sycl_set_runtime_context_for_model_impl\s*\("
 CARRY_SIG = r"\bstatic\s+bool\s+ggml_sycl_host_tenants_carry\s*\("
@@ -106,7 +130,7 @@ CLOSE_SIG = r"\bvoid\s+ggml_backend_sycl_claim_scope_close\s*\("
 INSTALL_REFUSAL_TAIL = (
     "                        return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\n"
     "                    }\n"
-    "                    host_tenants_installed.ctx = backend_ctx;\n")
+    "                    host_tenants_installed.device = backend_ctx->device;\n")
 DTOR_SIG = r"\bllama_context::~llama_context\s*\("
 REIMPL_SIG = r"\bsched_reserve_result\s+llama_context::sched_reserve_impl\s*\("
 SYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_synchronize\s*\("
@@ -120,7 +144,18 @@ DROP_SIG = r"\bvoid\s+drop\s*\(\s*\)\s*noexcept\s*\{"
 CLAIM_WALK_SIG = r"\bstatic\s+tenant_claim_outcome\s+claim\s*\(const std::string & cohort"
 CARRY_FN_SIG = r"\bstatic\s+bool\s+ggml_sycl_host_tenants_carry\s*\("
 CLEAR_BIND_SIG = r"\bstatic\s+void\s+ggml_sycl_execution_clear_bindings_for_context\s*\("
-DROP_ENTRIES_SIG = r"\bstatic\s+void\s+ggml_sycl_execution_drop_context_registry_entries\s*\(uint64_t context_id\)\s*noexcept\s*\{"
+DROP_ENTRIES_SIG = (r"\bstatic\s+void\s+ggml_sycl_execution_drop_context_registry_entries\s*\(uint64_t context_id,\s*"
+                    r"const bool \(&devices\)\[GGML_SYCL_MAX_DEVICES\]\)\s*noexcept")
+DTOR_BACKEND_SIG = r"ggml_backend_sycl_context::~ggml_backend_sycl_context\s*\("
+ERASE_SECTION_SIG = r"\bstatic\s+void\s+ggml_sycl_published_section_erase\s*\("
+ERASE_HOST_SIG = r"\bstatic\s+void\s+ggml_sycl_host_tenants_erase\s*\("
+STREAM_SIG = r"\bqueue_ptr\s+stream\s*\(int device, int stream\)"
+EXEC_QUEUE_SIG = r"\binline\s+sycl::queue \* ggml_sycl_execution_queue_for_device\s*\(int device\)"
+SCHED_RESERVE_SIG = r"\bbool\s+ggml_backend_sched_reserve\s*\(ggml_backend_sched_t sched, struct ggml_cgraph \* measure_graph\)"
+SCHED_RESERVE_SIZE_SIG = r"\bvoid\s+ggml_backend_sched_reserve_size\s*\(ggml_backend_sched_t sched,"
+SCHED_ALLOC_SPLITS_SIG = r"\bstatic\s+bool\s+ggml_backend_sched_alloc_splits\s*\(ggml_backend_sched_t sched\)"
+SCHED_SYNC_SIG = r"\bvoid\s+ggml_backend_sched_synchronize\s*\(ggml_backend_sched_t sched\)"
+GALLOC_ALLOC_GRAPH_SIG = r"\bbool\s+ggml_gallocr_alloc_graph\s*\(ggml_gallocr_t galloc, struct ggml_cgraph \* graph\)"
 CENTRY_SIG = r"\bvoid\s+ggml_backend_sycl_set_runtime_context\s*\("
 
 
@@ -299,31 +334,34 @@ def host_tier_pins(source, alloc, freeb, reserve, fails):
         "L4 host tier: the publish does not reserve only without a held table, or does not refuse a refused reservation or "
         "a republish the held slots cannot carry")
     pin(fails, impl,
-        r"if \(host_tenants\) \{\s*if \(!ggml_sycl_host_tenants_install\(backend_ctx, host_tenants, section->tenant_key\)\) \{"
+        r"if \(host_tenants\) \{\s*uint64_t installed_id = 0;\s*"
+        r"if \(!ggml_sycl_host_tenants_install\(backend_ctx, host_tenants, section->tenant_key, installed_id\)\) \{"
         r"\s*GGML_LOG_ERROR\([\s\S]*?\);\s*return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\s*\}\s*"
-        r"host_tenants_installed\.ctx = backend_ctx;\s*\}",
+        r"host_tenants_installed\.device = backend_ctx->device;\s*host_tenants_installed\.id = installed_id;\s*\}",
         "L4 host tier: the install result is not a refusal with nothing published, or the table it installed does not arm "
-        "the rollback guard")
+        "the rollback guard by the device and the id it was keyed with")
     pin(fails, impl, r"ggml_sycl_published_section_set\(backend_ctx, section\);\s*host_tenants_installed\.keep\(\);",
         "L4 host tier: the section is stored without keeping the installed table (or the table is kept before the store)")
     pin(fails, impl, r"std::shared_ptr<ggml_sycl::kv_tenant_slots> host_tenants;\s*ggml_sycl_host_tenants_install_guard host_tenants_installed;",
         "L4 host tier: the publish holds no rollback guard for the table it installs")
     guard_fn = function_body(source, r"\bstruct\s+ggml_sycl_host_tenants_install_guard\b")
-    pin(fails, guard_fn, r"~ggml_sycl_host_tenants_install_guard\(\) \{\s*if \(ctx\) \{\s*ggml_sycl_host_tenants_erase\(ctx\);\s*\}\s*\}"
-                         r"\s*void keep\(\) \{ ctx = nullptr; \}",
+    pin(fails, guard_fn, r"~ggml_sycl_host_tenants_install_guard\(\) \{\s*if \(id != 0\) \{\s*ggml_sycl_host_tenants_erase\(device, id\);\s*\}\s*\}"
+                         r"\s*void keep\(\) \{ id = 0; \}",
         "L4 host tier: the install guard does not take the table back unless it was kept")
     install_fn = function_body(source, r"\bstatic\s+bool\s+ggml_sycl_host_tenants_install\s*\(")
     if install_fn is not None and install_fn.count("table.reset()") != 1:
         fails.append("L4 host tier: the table is dropped from the caller before the registry took it")
     pin(fails, install_fn,
         r"if \(id == 0 \|\| !ggml_sycl_kv_region_registry\(ctx->device\)\.install_tenant_slots\(id, table, tenant_key\)\) \{"
-        r"\s*return false;\s*\}\s*table\.reset\(\);\s*return true;",
+        r"\s*return false;\s*\}\s*table\.reset\(\);\s*installed_id = id;\s*return true;",
         "L4 host tier: the table is dropped from the caller before the registry took it")
     pin(fails, function_body(source, r"\bstatic\s+bool\s+ggml_sycl_host_tenants_carry\s*\("),
         r"held_bytes == 0\) \{[^}]*return false;\s*\}\s*if \(\(size_t\) e\.slot_bytes > held_bytes\) \{[^}]*return false;",
         "L4 host tier: a republish is carried by a missing or smaller held slot")
-    if not re.search(r"\bstatic\s+void\s+ggml_sycl_host_tenants_erase\s*\(const ggml_backend_sycl_context \* ctx\) noexcept \{", source):
-        fails.append("L4 host tier: the destructor's drop of the host reservation may throw (not noexcept)")
+    if not re.search(r"\bstatic\s+void\s+ggml_sycl_host_tenants_erase\s*\(int device, uint64_t context_id\) noexcept \{", source):
+        fails.append("L4 host tier: the drop of the host reservation may throw (not noexcept) or does not take its id")
+    if not re.search(r"\bstatic\s+void\s+ggml_sycl_published_section_erase\s*\(int device, uint64_t context_id\) noexcept \{", source):
+        fails.append("L4 section: the drop of the published section may throw (not noexcept) or does not take its id")
     # the slot's identity: a handle of any other type is refused, not reinterpreted
     pin(fails, function_body(source, r"\bstatic\s+ggml_sycl_host_tenant_slot\s*\*\s*ggml_sycl_host_tenant_slot_of\s*\("),
         r"std::get_deleter<ggml_sycl_host_tenant_slot_deleter>\(handle\) == nullptr\) \{\s*return nullptr;",
@@ -427,8 +465,12 @@ def free_path_pins(source, freeb, fails):
 
       * release goes only through tenant_claim_scope::release, once, with event 0
       * ~llama_context synchronizes (every backend) before its members, the scheduler among them, are destroyed
-      * sched_reserve_impl synchronizes before it first touches the scheduler, and so does release_rung_buffers
-      * ggml_backend_sycl_synchronize drains stream 0 (or the deferred decode event) and the CPU-expert flush
+      * sched_reserve_impl synchronizes as a statement of its own on the ALLOC path (not under an `if`, not in the
+        MEASURE branch) before it touches the scheduler, and so does release_rung_buffers
+      * ggml_backend_sycl_synchronize's contiguous sequence: stream 0, the CPU-expert flush, the deferred-event
+        choice, the drain
+      * ggml_backend_sycl_context::stream(device, idx) answers the one execution queue for every idx
+      * the scheduler's own premises (ggml-backend.cpp, ggml-alloc.c, llama-context.cpp), see check()
       * nothing but the SYCL device, host-compute and cpu-offload buffer types reaches set/get_tensor_async, the
         CpuActivation clone is not a buffer type the device supports, and cpy_tensor_async is not wired
     """
@@ -438,23 +480,97 @@ def free_path_pins(source, freeb, fails):
     dtor = function_body(source, DTOR_SIG)
     pin(fails, dtor, r"^[^{]*\{\s*synchronize\(\);",
         "L4 free path: ~llama_context does not synchronize() first, before its scheduler's compute buffers are freed")
+    # sched_reserve_impl: the call is a statement of the function (not under an `if`, not in the MEASURE branch), it
+    # follows the MEASURE branch and the progress line directly, and nothing touches the scheduler before it.
     reimpl = function_body(source, REIMPL_SIG)
-    if reimpl is None:
-        fails.append("L4 free path: llama_context::sched_reserve_impl not found")
-    else:
+    pin(fails, reimpl,
+        r"\n    if \(mode == sched_reserve_mode::MEASURE\) \{\s*return sched_measure_impl\(state\);\s*\}\s*"
+        r"(?:LLAMA_LOG_INFO\([^;]*\);\s*)?synchronize\(\);\s*const int64_t t_start_us",
+        "L4 free path: sched_reserve_impl does not synchronize() unconditionally on the ALLOC path (a statement of its own, "
+        "after the MEASURE branch and before anything else), where it replaces the scheduler")
+    if reimpl is not None:
         sy = reimpl.find("synchronize();")
         first = min([i for i in (reimpl.find("sched.reset("), reimpl.find("ggml_backend_sched_")) if i >= 0] or [-1])
         if sy < 0 or first < 0 or sy > first:
             fails.append("L4 free path: sched_reserve_impl does not synchronize() before it first touches the scheduler")
     pin(fails, source, r"auto release_rung_buffers = \[&\]\(\) \{\s*synchronize\(\);\s*for \(auto & res : gf_res_prev\)",
         "L4 free path: release_rung_buffers does not synchronize() before it frees the rung's buffers")
+    # the backend's synchronize: the one contiguous sequence is pinned whole, so no statement of it can sit under a
+    # condition, in a ternary arm or behind another name and still match: the stream, the CPU-expert flush (unless
+    # the test flag skips it), the deferred-event choice, the drain
     sync = function_body(source, SYNC_SIG)
-    pin(fails, sync, r"CHECK_TRY_ERROR\(stream->wait_and_throw\(\)\)",
-        "L4 free path: the backend synchronize no longer drains stream 0")
-    pin(fails, sync, r"ggml_sycl_cpu_tg_flush_pending\(\);",
-        "L4 free path: the backend synchronize no longer flushes the CPU-expert work")
-    pin(fails, sync, r"sycl_ctx->last_graph_event->wait_and_throw\(\)",
-        "L4 free path: the backend synchronize no longer drains the deferred decode event")
+    pin(fails, sync,
+        r"const queue_ptr stream = sycl_ctx->stream\(sycl_ctx->device, 0\);\s*"
+        r"if \(!ggml_sycl_cpu_tg_synchronize_flush_skipped_for_test\(\)\) \{\s*ggml_sycl_cpu_tg_flush_pending\(\);\s*\}\s*"
+        r"const bool use_deferred_decode_event =\s*"
+        r"sycl_ctx->last_graph_event\.has_value\(\) && sycl_ctx->last_graph_event_deferred_decode;\s*"
+        r"auto err = use_deferred_decode_event \? CHECK_TRY_ERROR\(sycl_ctx->last_graph_event->wait_and_throw\(\)\) :\s*"
+        r"CHECK_TRY_ERROR\(stream->wait_and_throw\(\)\);",
+        "L4 free path: the backend synchronize no longer drains, in sequence and unconditionally, stream 0 or the deferred "
+        "decode event after the CPU-expert flush")
+    # one execution queue per device: stream(device, idx) answers it for EVERY idx, and it is the TP queue or the
+    # unified cache's own queue.  This is what makes "the queues the synchronize does not drain" an empty set.
+    stream_fn = function_body(source, STREAM_SIG)
+    pin(fails, stream_fn,
+        r"if \(sycl::queue \* execution_queue = ggml_sycl_execution_queue_for_device\(device\)\) \{\s*"
+        r"if \(qptrs\[device\]\[stream\] != execution_queue\) \{[^}]*\}\s*return execution_queue;\s*\}",
+        "L4 free path: ggml_backend_sycl_context::stream(device, idx) no longer answers the device's one execution queue "
+        "for every idx (a second queue per device is one the synchronize does not drain)")
+    pin(fails, function_body(source, EXEC_QUEUE_SIG),
+        r"if \(sycl::queue \* tp_queue = ggml_sycl_get_tp_queue\(device\)\) \{\s*return tp_queue;\s*\}\s*"
+        r"if \(ggml_sycl::unified_cache \* cache = ggml_sycl::get_existing_unified_cache_for_device\(device\)\) \{\s*"
+        r"return &cache->get_queue\(\);\s*\}\s*return nullptr;",
+        "L4 free path: the device's execution queue is no longer the TP queue or the unified cache's own queue")
+    # the upstream premises the synchronize-before-free argument rests on.  They are vendored files: a rebase that
+    # changes one is the event this catches.
+    pin(fails, function_body(source, SCHED_SYNC_SIG),
+        r"GGML_ASSERT\(sched\);\s*for \(int i = 0; i < sched->n_backends; i\+\+\) \{\s*ggml_backend_synchronize\(sched->backends\[i\]\);\s*\}",
+        "L4 free path: ggml_backend_sched_synchronize no longer synchronizes every backend of the scheduler")
+    pin(fails, function_body(source, SCHED_RESERVE_SIG),
+        r"GGML_ASSERT\(\(int\)sched->hash_set\.size >= measure_graph->n_nodes \+ measure_graph->n_leafs\);\s*"
+        r"ggml_backend_sched_synchronize\(sched\);\s*ggml_backend_sched_split_graph\(sched, measure_graph\);\s*"
+        r"if \(!ggml_gallocr_reserve_n\(sched->galloc,",
+        "L4 free path: ggml_backend_sched_reserve no longer synchronizes the scheduler before ggml_gallocr_reserve_n frees "
+        "the old buffers")
+    pin(fails, function_body(source, SCHED_RESERVE_SIZE_SIG),
+        r"ggml_backend_sched_reset\(sched\);\s*ggml_backend_sched_synchronize\(sched\);\s*"
+        r"ggml_backend_sched_split_graph\(sched, measure_graph\);\s*ggml_gallocr_reserve_n_size\(",
+        "L4 free path: ggml_backend_sched_reserve_size no longer synchronizes the scheduler before it reserves")
+    splits = function_body(source, SCHED_ALLOC_SPLITS_SIG)
+    pin(fails, splits,
+        r"\}\s*for \(int i = 0; i < sched->n_backends; i\+\+\) \{\s*ggml_backend_synchronize\(sched->backends\[i\]\);\s*\}\s*"
+        r"if \(!ggml_gallocr_reserve_n\(sched->galloc,",
+        "L4 free path: the reallocation in ggml_backend_sched_alloc_splits no longer synchronizes every backend before "
+        "ggml_gallocr_reserve_n")
+    if splits is not None and splits.count("ggml_gallocr_reserve_n(") != 1:
+        fails.append("L4 free path: ggml_backend_sched_alloc_splits reserves in more than one place")
+    pin(fails, function_body(source, GALLOC_ALLOC_GRAPH_SIG),
+        r"if \(ggml_gallocr_needs_realloc\(galloc, graph\)\) \{\s*if \(galloc->n_buffers == 1\) \{[^}]*?"
+        r"if \(!ggml_gallocr_reserve\(galloc, graph\)\) \{\s*return false;\s*\}\s*\} else \{[^}]*?return false;\s*\}\s*\}",
+        "L4 free path: the automatic reserve in ggml_gallocr_alloc_graph is no longer single-buffer only (it reallocates "
+        "without a synchronize)")
+    pin(fails, source, r"sched->galloc = ggml_gallocr_new_n\(sched->bufts, n_backends\);",
+        "L4 free path: the scheduler's allocator is no longer built with one buffer per backend")
+    # llama_context always appends the CPU backend, so a SYCL scheduler has two or more buffers and the single-buffer
+    # automatic reserve above is unreachable for it: a normal context appends it, a measure-only one requires it last
+    pin(fails, source,
+        r"backend_cpu = ggml_backend_init_by_type\(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr\);\s*"
+        r"if \(backend_cpu == nullptr\) \{\s*throw std::runtime_error\(\"failed to initialize CPU backend\"\);\s*\}\s*"
+        r"backends\.emplace_back\(backend_cpu\);",
+        "L4 free path: llama_context no longer appends the CPU backend to a normal context's backends")
+    pin(fails, source,
+        r"backend_cpu = backends\.back\(\)\.get\(\);\s*"
+        r"if \(ggml_backend_dev_type\(ggml_backend_get_device\(backend_cpu\)\) != GGML_BACKEND_DEVICE_TYPE_CPU\) \{\s*"
+        r"throw std::runtime_error\(\"the last backend of a measure-only context must be the CPU backend\"\);",
+        "L4 free path: a measure-only context no longer requires the CPU backend last")
+    if reimpl is not None:
+        built = len(re.findall(r"ggml_backend_sched_new\(", reimpl))
+        over_all = len(re.findall(
+            r"state\.sched\.reset\(ggml_backend_sched_new\(backend_ptrs\.data\(\), backend_buft\.data\(\), backend_ptrs\.size\(\),\s*max_nodes,",
+            reimpl))
+        if built == 0 or built != over_all:
+            fails.append("L4 free path: a scheduler sched_reserve_impl builds is no longer built over every backend of the "
+                         "context (backend_ptrs)")
     for sig, what in ((SET_ASYNC_SIG, "set_tensor_async"), (GET_ASYNC_SIG, "get_tensor_async")):
         body = function_body(source, sig)
         pin(fails, body, r"GGML_ASSERT\(\(buf->buft == ggml_backend_sycl_buffer_type\(sycl_ctx->device\) \|\|\s*"
@@ -608,12 +724,22 @@ def check(header_raw, source):
         fails.append("L4 section: a publish for an unbound context is silent (no WARN)")
     if not re.search(r"if \(id == 0\) \{\s*if \(section\) \{\s*GGML_LOG_WARN\([^;]*;\s*\}\s*return;\s*\}", set_fn):
         fails.append("L4 section: a publish for an unbound context goes on to the registry with key 0")
-    herase_fn = function_body(source, r"\bstatic\s+void\s+ggml_sycl_host_tenants_erase\s*\(") or ""
-    if not re.search(r"catch\s*\(\.\.\.\)\s*\{\s*GGML_LOG_WARN\(", herase_fn):
-        fails.append("L4 host tier: the destructor's drop of the host reservation swallows a failure silently (no WARN)")
-    erase_fn = function_body(source, r"\bstatic\s+void\s+ggml_sycl_published_section_erase\s*\(") or ""
-    if not re.search(r"catch\s*\(\.\.\.\)\s*\{\s*GGML_LOG_WARN\(", erase_fn):
-        fails.append("L4 section: the destructor's erase swallows a failed drop silently (no WARN)")
+    # a failed drop is said at ERROR (the entry then stays until the process ends: its key is gone), and an erase
+    # takes its id from the caller -- it never reads a backend's id itself, so one drop has one id
+    herase_fn = function_body(source, ERASE_HOST_SIG) or ""
+    if not re.search(r"catch\s*\(\.\.\.\)\s*\{\s*GGML_LOG_ERROR\(", herase_fn):
+        fails.append("L4 host tier: the drop of the host reservation swallows a failure silently (no ERROR)")
+    if "ggml_sycl_context_execution_id(" in herase_fn or "execution_context_id" in herase_fn:
+        fails.append("L4 host tier: the host reservation's erase reads a context id itself (it must use the caller's)")
+    pin(fails, herase_fn, r"\.take_tenant_slots\(context_id\)",
+        "L4 host tier: the host reservation's erase does not take the table by the id it was given")
+    erase_fn = function_body(source, ERASE_SECTION_SIG) or ""
+    if not re.search(r"catch\s*\(\.\.\.\)\s*\{\s*GGML_LOG_ERROR\(", erase_fn):
+        fails.append("L4 section: the erase swallows a failed drop silently (no ERROR)")
+    if "ggml_sycl_context_execution_id(" in erase_fn or "execution_context_id" in erase_fn:
+        fails.append("L4 section: the section's erase reads a context id itself (it must use the caller's)")
+    pin(fails, erase_fn, r"\.drop_published_section\(context_id\)",
+        "L4 section: the section's erase does not drop the section by the id it was given")
 
     # load_end: guard after the finisher check
     end = function_body(source, r"\bggml_sycl_lifecycle_result\s+ggml_backend_sycl_model_load_end\s*\(")
@@ -671,49 +797,67 @@ def check(header_raw, source):
             r"if \(txn != 0\) \{\s*\(void\) ggml_sycl_load_clear_compute_terms\(txn\);\s*\}", after):
         fails.append("L4 ledger: after_end does not clear only a transaction it was armed with")
 
-    # the end of an execution context drops the entries its id keyed, before the id is zeroed: the backend's
-    # destructor cannot find them afterwards (finish_drain and close_if_idle reset the id first)
+    # the end of an execution context drops the entries its id keyed, BY THAT ID, after the binding's id is
+    # zeroed: the backend's destructor cannot find them afterwards (finish_drain and close_if_idle reset the id
+    # first), and a drop that re-read a backend's id would have to run before the reset, leaving a window in
+    # which a publish re-creates an entry under the dead id.  The devices are collected under the binding mutex
+    # (nothing to pin, no allocation that can fail); the drop runs outside it.
     clear_bind = function_body(source, CLEAR_BIND_SIG)
     if clear_bind is None:
         fails.append("L4 context end: ggml_sycl_execution_clear_bindings_for_context not found")
     else:
-        call = clear_bind.find("ggml_sycl_execution_drop_context_registry_entries(context_id);")
+        call_text = "ggml_sycl_execution_drop_context_registry_entries(context_id, devices);"
+        call = clear_bind.find(call_text)
         reset = clear_bind.find("ggml_sycl_execution_reset_backend_binding_state(")
-        locked = clear_bind.find("g_execution_backend_binding_mutex")
-        if call < 0 or reset < 0 or call > reset or (locked >= 0 and call > locked) or net_depth(clear_bind[:call]) != 1 or \
-                clear_bind[:call].rstrip()[-1:] not in (";", "{"):
-            fails.append("L4 context end: the clear of an ended context's bindings does not first drop its registry entries "
-                         "(the backend's id is zeroed before the destructor can drop them)")
+        if call < 0 or reset < 0 or call < reset or clear_bind.count(call_text) != 1 or net_depth(clear_bind[:call]) != 1 or \
+                clear_bind[:call].rstrip()[-1:] not in (";", "{", "}"):
+            fails.append("L4 context end: the clear of an ended context's bindings does not drop its registry entries by the "
+                         "ended id after it has reset the bindings, once, outside the lock (statement-initial)")
+        pin(fails, clear_bind,
+            r"\{\s*bool devices\[GGML_SYCL_MAX_DEVICES\] = \{\};\s*\{\s*std::lock_guard<std::mutex> lock\(g_execution_backend_binding_mutex\);"
+            r"[\s\S]*?if \(it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES\) \{\s*"
+            r"devices\[it->first->device\] = true;\s*\}\s*ggml_sycl_execution_reset_backend_binding_state\(it->first\);"
+            r"[\s\S]*?\}\s*\}\s*ggml_sycl_execution_drop_context_registry_entries\(context_id, devices\);\s*\}$",
+            "L4 context end: the clear of an ended context's bindings does not collect the bound devices under the "
+            "lock, reset, and drop the entries by the ended id after the lock (devices collected before the reset)")
+        if re.search(r"for_each_bound_backend|pin_bound_backends|\bpin_count\b", clear_bind):
+            fails.append("L4 context end: the clear of an ended context's bindings pins backends again (an allocation that "
+                         "can fail, and a failed pin leaves the entries orphaned)")
     drop_entries = function_body(source, DROP_ENTRIES_SIG)
     pin(fails, drop_entries,
-        r"ggml_sycl_execution_for_each_bound_backend\(\s*context_id, \[\]\(ggml_backend_sycl_context \* backend, "
-        r"const ggml_sycl_execution_backend_binding &\) \{\s*ggml_sycl_published_section_erase\(backend\);\s*"
-        r"ggml_sycl_host_tenants_erase\(backend\);\s*\}\);",
+        r"noexcept\s*\{\s*for \(int device = 0; device < GGML_SYCL_MAX_DEVICES; \+\+device\) \{\s*if \(devices\[device\]\) \{\s*"
+        r"ggml_sycl_published_section_erase\(device, context_id\);\s*ggml_sycl_host_tenants_erase\(device, context_id\);"
+        r"\s*\}\s*\}\s*\}$",
         "L4 context end: the drop of an ended context's registry entries does not erase the section then the host "
-        "reservation of each bound backend")
-    if drop_entries is not None and "g_execution_backend_binding_mutex" in drop_entries:
-        fails.append("L4 context end: the registry entries of an ended context are dropped under the binding mutex")
+        "reservation, by the ended id, on each device the ended bindings were on")
+    if drop_entries is not None and re.search(r"g_execution_backend_binding_mutex|\btry\b|\bcatch\b|ggml_sycl_context_execution_id", drop_entries):
+        fails.append("L4 context end: the registry entries of an ended context are dropped under the binding mutex, or "
+                     "through a try, or by a re-read id")
 
-    # destructor order
-    dtor = function_body(source, r"ggml_backend_sycl_context::~ggml_backend_sycl_context\s*\(")
+    # destructor order, and one read of the id for both drops
+    dtor = function_body(source, DTOR_BACKEND_SIG)
     if dtor is None:
         fails.append("L4 section: ~ggml_backend_sycl_context not found")
     else:
-        e = dtor.find("ggml_sycl_published_section_erase(this)")
+        e = dtor.find("ggml_sycl_published_section_erase(device, context_id)")
         u = dtor.find("ggml_sycl_execution_unbind_backend(this)")
         if e < 0:
             fails.append("L4 section: the backend context's destructor does not erase its published section")
         elif u < 0 or e > u:
             fails.append("L4 section: the section is erased after the execution binding is reset (its key is gone)")
-
-    if dtor is not None:
-        h = dtor.find("ggml_sycl_host_tenants_erase(this)")
-        e = dtor.find("ggml_sycl_published_section_erase(this)")
-        u = dtor.find("ggml_sycl_execution_unbind_backend(this)")
+        h = dtor.find("ggml_sycl_host_tenants_erase(device, context_id)")
         if h < 0:
             fails.append("L4 host tier: the backend context's destructor does not drop its held host reservation")
         elif not (e >= 0 and e < h < u):
             fails.append("L4 host tier: the host reservation is dropped outside the section-erase to unbind window")
+        pin(fails, dtor,
+            r"\n    const uint64_t context_id = ggml_sycl_context_execution_id\(this\);\n"
+            r"    ggml_sycl_published_section_erase\(device, context_id\);\n"
+            r"    ggml_sycl_host_tenants_erase\(device, context_id\);\n"
+            r"    ggml_sycl_execution_unbind_backend\(this\);",
+            "L4 section: the destructor does not read its context id once, statement-initial, for both drops before the unbind")
+        if dtor.count("ggml_sycl_context_execution_id(") != 1:
+            fails.append("L4 section: the destructor reads its context id more than once (two sources for one drop)")
 
     # the host reservation: owner-first, the carve's request, one installer, one remover
     reserve = function_body(source, r"\bstatic\s+bool\s+ggml_sycl_reserve_host_tenants\s*\(")
@@ -837,16 +981,6 @@ def mutations(header_raw, source):
          "        ggml_sycl_load_ledger_clear_guard ledger_clear{ txn.id };\n", ""),
         ("the clear guard before the finisher check", "after the finisher check",
          "        ggml_sycl_load_ledger_clear_guard ledger_clear{ txn.id };\n", ""),
-        ("the destructor's erase dropped", "does not erase its published section",
-         "    ggml_sycl_published_section_erase(this);\n", ""),
-        ("the destructor's erase after the unbind", "erased after the execution binding",
-         "    ggml_sycl_published_section_erase(this);\n    ggml_sycl_host_tenants_erase(this);\n    ggml_sycl_execution_unbind_backend(this);",
-         "    ggml_sycl_host_tenants_erase(this);\n    ggml_sycl_execution_unbind_backend(this);\n    ggml_sycl_published_section_erase(this);"),
-        ("the host reservation never dropped", "does not drop its held host reservation",
-         "    ggml_sycl_host_tenants_erase(this);\n", ""),
-        ("the host reservation dropped after the unbind", "outside the section-erase to unbind window",
-         "    ggml_sycl_host_tenants_erase(this);\n    ggml_sycl_execution_unbind_backend(this);",
-         "    ggml_sycl_execution_unbind_backend(this);\n    ggml_sycl_host_tenants_erase(this);"),
         ("the carve through the legacy allocator", "not allocated through unified_allocate_owner",
          "ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);\n        if (!allocation) {\n            refusal = std::string(\"the host reservation of \")",
          "ggml_sycl::allocation_result allocation = ggml_sycl::detail::promote_legacy_alloc_owner({});\n        if (!allocation) {\n            refusal = std::string(\"the host reservation of \")"),
@@ -873,17 +1007,11 @@ def mutations(header_raw, source):
         ("the first publish reserves under L1", "does not reserve before L1",
          "                if (!ggml_sycl_reserve_host_tenants(backend_ctx, *section, host_tenants, refusal)) {",
          "                if (false) {"),
-        ("the host reservation's drop may throw", "may throw (not noexcept)",
-         "ggml_sycl_host_tenants_erase(const ggml_backend_sycl_context * ctx) noexcept {",
-         "ggml_sycl_host_tenants_erase(const ggml_backend_sycl_context * ctx) {"),
         ("the free forgets its claim", "does not release its claim",
          "        (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);\n        ctx->claim.reset();", "        ctx->claim.reset();"),
         ("the transaction tail's drop removed", "does not drop the context's earlier section",
          "    ggml_sycl_published_section_set(ctx, nullptr);\n    return ggml_sycl_txn_result::ACCEPTED;",
          "    return ggml_sycl_txn_result::ACCEPTED;"),
-        ("the transaction tail through the swallowing erase", "does not drop the context's earlier section",
-         "    ggml_sycl_published_section_set(ctx, nullptr);\n    return ggml_sycl_txn_result::ACCEPTED;",
-         "    ggml_sycl_published_section_erase(ctx);\n    return ggml_sycl_txn_result::ACCEPTED;"),
         ("the section stored on any outcome", "without a successful inner transaction",
          "    if (inner_ok && section) {", "    if (section) {"),
         ("the shrink counter dropped", "does not count an admitted shrink",
@@ -892,16 +1020,170 @@ def mutations(header_raw, source):
     # One edit inside one named function: (label, expected message, signature, old, new).  Several of the
     # lines these touch recur in the other ledger functions, so the edit is scoped to the function it names.
     scoped = [
+        # ---- the one id of a drop: the erase helpers take it, the end of a context passes the ended one, the
+        # ---- destructor reads its own once, the install guard carries the id the install used
+        ("the destructor's erase dropped", "does not erase its published section", DTOR_BACKEND_SIG,
+         "    ggml_sycl_published_section_erase(device, context_id);\n", ""),
+        ("the destructor's erase after the unbind", "erased after the execution binding", DTOR_BACKEND_SIG,
+         "    ggml_sycl_published_section_erase(device, context_id);\n    ggml_sycl_host_tenants_erase(device, context_id);\n    ggml_sycl_execution_unbind_backend(this);",
+         "    ggml_sycl_host_tenants_erase(device, context_id);\n    ggml_sycl_execution_unbind_backend(this);\n    ggml_sycl_published_section_erase(device, context_id);"),
+        ("the host reservation never dropped", "does not drop its held host reservation", DTOR_BACKEND_SIG,
+         "    ggml_sycl_host_tenants_erase(device, context_id);\n", ""),
+        ("the host reservation dropped after the unbind", "outside the section-erase to unbind window", DTOR_BACKEND_SIG,
+         "    ggml_sycl_host_tenants_erase(device, context_id);\n    ggml_sycl_execution_unbind_backend(this);",
+         "    ggml_sycl_execution_unbind_backend(this);\n    ggml_sycl_host_tenants_erase(device, context_id);"),
+        ("the destructor reads its id twice", "does not read its context id once", DTOR_BACKEND_SIG,
+         "    ggml_sycl_host_tenants_erase(device, context_id);\n",
+         "    ggml_sycl_host_tenants_erase(device, ggml_sycl_context_execution_id(this));\n"),
+        ("the destructor drops by another id", "does not read its context id once", DTOR_BACKEND_SIG,
+         "    ggml_sycl_published_section_erase(device, context_id);\n", "    ggml_sycl_published_section_erase(device, 0);\n"),
+        ("the host reservation's drop may throw", "may throw (not noexcept)", ERASE_HOST_SIG,
+         "(int device, uint64_t context_id) noexcept {", "(int device, uint64_t context_id) {"),
+        ("the section's drop may throw", "the drop of the published section may throw", ERASE_SECTION_SIG,
+         "(int device, uint64_t context_id) noexcept {", "(int device, uint64_t context_id) {"),
+        ("the host reservation's drop swallows silently", "drop of the host reservation swallows a failure silently",
+         ERASE_HOST_SIG, "    } catch (...) {\n        GGML_LOG_ERROR(", "    } catch (...) {\n        (void) ("),
+        ("the section's drop swallows silently", "swallows a failed drop silently", ERASE_SECTION_SIG,
+         "    } catch (...) {\n        GGML_LOG_ERROR(", "    } catch (...) {\n        (void) ("),
+        ("the host reservation's drop says a failure at WARN", "drop of the host reservation swallows a failure silently",
+         ERASE_HOST_SIG, "GGML_LOG_ERROR(", "GGML_LOG_WARN("),
+        ("the section's drop says a failure at WARN", "swallows a failed drop silently", ERASE_SECTION_SIG,
+         "GGML_LOG_ERROR(", "GGML_LOG_WARN("),
+        ("the host reservation's erase re-reads an id", "erase reads a context id itself", ERASE_HOST_SIG,
+         "    try {\n", "    try {\n        (void) ggml_sycl_context_execution_id(nullptr);\n"),
+        ("the section's erase re-reads an id", "erase reads a context id itself", ERASE_SECTION_SIG,
+         "    try {\n", "    try {\n        (void) ggml_sycl_context_execution_id(nullptr);\n"),
+        ("the host reservation's erase takes another table", "does not take the table by the id it was given", ERASE_HOST_SIG,
+         ".take_tenant_slots(context_id)", ".take_tenant_slots(0)"),
+        ("the section's erase drops another section", "does not drop the section by the id it was given", ERASE_SECTION_SIG,
+         ".drop_published_section(context_id)", ".drop_published_section(0)"),
         ("a second install after the inner transaction", "does not install once before the inner transaction",
          IMPL_SIG, "    const bool inner_ok = g_runtime_update_succeeded;",
-         "    (void) ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key);\n    const bool inner_ok = g_runtime_update_succeeded;"),
+         "    uint64_t h_id = 0;\n    (void) ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key, h_id);\n    const bool inner_ok = g_runtime_update_succeeded;"),
         ("the install result discarded", "the install result is not a refusal with nothing published", IMPL_SIG,
-         "if (!ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key)) {",
-         "if ((ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key), false)) {"),
+         "if (!ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key, installed_id)) {",
+         "if ((ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key, installed_id), false)) {"),
+        ("the installed table never arms the guard", "the install result is not a refusal with nothing published", IMPL_SIG,
+         "                    host_tenants_installed.device = backend_ctx->device;\n                    host_tenants_installed.id = installed_id;\n", ""),
+        ("the installed table arms the guard with a re-read id", "by the device and the id it was keyed with", IMPL_SIG,
+         "host_tenants_installed.id = installed_id;", "host_tenants_installed.id = ggml_sycl_context_execution_id(backend_ctx);"),
+        ("the install reports a re-read id", "the table is dropped from the caller before the registry took it", INSTALL_SIG,
+         "    installed_id = id;\n", "    installed_id = ggml_sycl_context_execution_id(ctx);\n"),
+        ("the install guard never takes the table back", "the install guard does not take the table back",
+         r"\bstruct\s+ggml_sycl_host_tenants_install_guard\b", "            ggml_sycl_host_tenants_erase(device, id);\n", "            (void) device;\n"),
+        ("the install guard takes the table back even when kept", "the install guard does not take the table back",
+         r"\bstruct\s+ggml_sycl_host_tenants_install_guard\b", "    void keep() { id = 0; }", "    void keep() {}"),
+        ("the install guard takes back another id", "the install guard does not take the table back",
+         r"\bstruct\s+ggml_sycl_host_tenants_install_guard\b", "ggml_sycl_host_tenants_erase(device, id);", "ggml_sycl_host_tenants_erase(device, 0);"),
+        # ---- the end of an execution context
+        ("the ended context's entries are never dropped", "does not drop its registry entries by the ended id", CLEAR_BIND_SIG,
+         "    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n", ""),
+        ("the ended context's entries are dropped before the reset", "does not drop its registry entries by the ended id", CLEAR_BIND_SIG,
+         "    bool devices[GGML_SYCL_MAX_DEVICES] = {};\n",
+         "    bool devices[GGML_SYCL_MAX_DEVICES] = {};\n    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n"),
+        ("the ended context's entries are dropped conditionally", "does not drop its registry entries by the ended id", CLEAR_BIND_SIG,
+         "    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n",
+         "    if (context_id != 0) ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n"),
+        ("the ended context's entries are dropped under the binding mutex", "does not drop its registry entries by the ended id", CLEAR_BIND_SIG,
+         "    }\n    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n}",
+         "    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n    }\n}"),
+        ("the ended context's entries are dropped by another id", "does not drop its registry entries by the ended id", CLEAR_BIND_SIG,
+         "drop_context_registry_entries(context_id, devices);", "drop_context_registry_entries(0, devices);"),
+        ("the ended context's devices are not collected", "does not collect the bound devices under the lock", CLEAR_BIND_SIG,
+         "                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {\n                    devices[it->first->device] = true;\n                }\n", ""),
+        ("the ended context's devices are collected after the reset", "does not collect the bound devices under the lock", CLEAR_BIND_SIG,
+         "                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {\n                    devices[it->first->device] = true;\n                }\n                ggml_sycl_execution_reset_backend_binding_state(it->first);\n",
+         "                ggml_sycl_execution_reset_backend_binding_state(it->first);\n                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {\n                    devices[it->first->device] = true;\n                }\n"),
+        ("the ended context's drop pins backends again", "pins backends again", CLEAR_BIND_SIG,
+         "    bool devices[GGML_SYCL_MAX_DEVICES] = {};\n",
+         "    bool devices[GGML_SYCL_MAX_DEVICES] = {};\n    ggml_sycl_execution_for_each_bound_backend(context_id, [](ggml_backend_sycl_context *, const ggml_sycl_execution_backend_binding &) {});\n"),
+        ("the ended context's entries are dropped inside the loop, under the lock", "does not drop its registry entries by the ended id", CLEAR_BIND_SIG,
+         "                it = g_execution_backend_bindings.erase(it);\n",
+         "                ggml_sycl_execution_drop_context_registry_entries(context_id, devices);\n                it = g_execution_backend_bindings.erase(it);\n"),
+        ("the ended context's drop returns first", "does not erase the section then the host", DROP_ENTRIES_SIG,
+         "    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {\n",
+         "    return;\n    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {\n"),
+        ("the ended context's drop erases another id as well", "does not erase the section then the host", DROP_ENTRIES_SIG,
+         "    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {\n",
+         "    ggml_sycl_published_section_erase(0, 1);\n    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {\n"),
+        ("the ended context's host reservation is kept", "does not erase the section then the host", DROP_ENTRIES_SIG,
+         "            ggml_sycl_host_tenants_erase(device, context_id);\n", ""),
+        ("the ended context's section is kept", "does not erase the section then the host", DROP_ENTRIES_SIG,
+         "            ggml_sycl_published_section_erase(device, context_id);\n", ""),
+        ("the ended context's erases run in the other order", "does not erase the section then the host", DROP_ENTRIES_SIG,
+         "            ggml_sycl_published_section_erase(device, context_id);\n            ggml_sycl_host_tenants_erase(device, context_id);\n",
+         "            ggml_sycl_host_tenants_erase(device, context_id);\n            ggml_sycl_published_section_erase(device, context_id);\n"),
+        ("the ended context's drop covers every device", "does not erase the section then the host", DROP_ENTRIES_SIG,
+         "if (devices[device]) {", "if (true) {"),
+        ("the ended context's entries are dropped under the binding mutex in the helper", "dropped under the binding mutex", DROP_ENTRIES_SIG,
+         "    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {\n",
+         "    std::lock_guard<std::mutex> h_lock(g_execution_backend_binding_mutex);\n    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {\n"),
+        ("the ended context's drop gets a try", "dropped under the binding mutex", DROP_ENTRIES_SIG,
+         "    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {\n",
+         "    try {} catch (...) {}\n    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {\n"),
+        # ---- the free path, statement-initial and unconditional (rev-moua-c34 Minor 1)
+        ("sched_reserve_impl's synchronize conditional", "does not synchronize() unconditionally on the ALLOC path", REIMPL_SIG,
+         "    synchronize();\n", "    if (false) synchronize();\n"),
+        ("sched_reserve_impl's synchronize moved into the MEASURE branch", "does not synchronize() unconditionally on the ALLOC path", REIMPL_SIG,
+         re.compile(r"(if \(mode == sched_reserve_mode::MEASURE\) \{\n)(\s*return sched_measure_impl\(state\);\s*\}\s*(?:LLAMA_LOG_INFO\([^;]*\);\s*))synchronize\(\);"),
+         r"\1        synchronize();\n\2"),
+        ("sched_reserve_impl's synchronize after the first statement of the ALLOC path", "does not synchronize() unconditionally on the ALLOC path", REIMPL_SIG,
+         re.compile(r"synchronize\(\);(\s*)(const int64_t t_start_us = ggml_time_us\(\);)"), r"\2\1synchronize();"),
+        ("sched_reserve_impl's synchronize behind a condition on a flag", "does not synchronize() unconditionally on the ALLOC path", REIMPL_SIG,
+         "    synchronize();\n", "    if (state.cparams.n_ctx != 0) { synchronize(); }\n"),
+        ("the backend synchronize skips stream 0", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+         "CHECK_TRY_ERROR(stream->wait_and_throw())", "0"),
+        ("the backend synchronize skips the stream's wait under a ternary", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+         "CHECK_TRY_ERROR(stream->wait_and_throw())", "(false ? 0 : CHECK_TRY_ERROR(stream->wait_and_throw()))"),
+        ("the backend synchronize skips the CPU-expert flush", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+         "            ggml_sycl_cpu_tg_flush_pending();\n", ""),
+        ("the backend synchronize's CPU-expert flush under if (false)", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+         "            ggml_sycl_cpu_tg_flush_pending();\n", "            if (false) ggml_sycl_cpu_tg_flush_pending();\n"),
+        ("the backend synchronize's CPU-expert flush behind a false condition", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+         "if (!ggml_sycl_cpu_tg_synchronize_flush_skipped_for_test()) {", "if (false) {"),
+        ("the backend synchronize skips the deferred decode event", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+         "sycl_ctx->last_graph_event->wait_and_throw()", "0"),
+        ("the backend synchronize's deferred-event arm is never chosen", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+         "use_deferred_decode_event ? CHECK_TRY_ERROR(", "false ? CHECK_TRY_ERROR("),
+        ("the backend synchronize returns before the drain", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+         "        auto err = use_deferred_decode_event", "        if (sycl_ctx->has_pending_barrier) {\n            return;\n        }\n        auto err = use_deferred_decode_event"),
+        # ---- the queue aliasing (rev-moua-c34 Important 2)
+        ("stream(device, idx) answers another queue for idx > 0", "no longer answers the device's one execution queue for every idx", STREAM_SIG,
+         "            return execution_queue;\n", "            return stream == 0 ? execution_queue : qptrs[device][stream];\n"),
+        ("stream(device, idx) answers by idx under a condition", "no longer answers the device's one execution queue for every idx", STREAM_SIG,
+         "if (sycl::queue * execution_queue = ggml_sycl_execution_queue_for_device(device)) {",
+         "if (sycl::queue * execution_queue = stream == 0 ? ggml_sycl_execution_queue_for_device(device) : nullptr) {"),
+        ("the execution queue is the device's default queue", "execution queue is no longer the TP queue or the unified cache's own queue", EXEC_QUEUE_SIG,
+         "return &cache->get_queue();", "return &ggml_sycl_get_device(device).default_queue();"),
+        ("the execution queue ignores the TP queue", "execution queue is no longer the TP queue or the unified cache's own queue", EXEC_QUEUE_SIG,
+         "        return tp_queue;\n", "        return nullptr;\n"),
+        # ---- the upstream premises (rev-moua-c34 Minor 2)
+        ("the scheduler is built over one backend fewer", "no longer built over every backend of the context", REIMPL_SIG,
+         re.compile(r"backend_ptrs\.size\(\), max_nodes,"), "backend_ptrs.size() - 1, max_nodes,"),
+        ("ggml_backend_sched_reserve does not synchronize", "ggml_backend_sched_reserve no longer synchronizes", SCHED_RESERVE_SIG,
+         "    ggml_backend_sched_synchronize(sched);\n", ""),
+        ("ggml_backend_sched_reserve synchronizes under if (false)", "ggml_backend_sched_reserve no longer synchronizes", SCHED_RESERVE_SIG,
+         "    ggml_backend_sched_synchronize(sched);\n", "    if (false) ggml_backend_sched_synchronize(sched);\n"),
+        ("ggml_backend_sched_reserve_size does not synchronize", "ggml_backend_sched_reserve_size no longer synchronizes", SCHED_RESERVE_SIZE_SIG,
+         "    ggml_backend_sched_synchronize(sched);\n", ""),
+        ("the realloc in alloc_splits does not synchronize", "the reallocation in ggml_backend_sched_alloc_splits no longer synchronizes", SCHED_ALLOC_SPLITS_SIG,
+         "            ggml_backend_synchronize(sched->backends[i]);\n", ""),
+        ("the realloc in alloc_splits synchronizes only the first backend", "the reallocation in ggml_backend_sched_alloc_splits no longer synchronizes", SCHED_ALLOC_SPLITS_SIG,
+         "for (int i = 0; i < sched->n_backends; i++) {\n            ggml_backend_synchronize",
+         "for (int i = 0; i < 1; i++) {\n            ggml_backend_synchronize"),
+        ("alloc_splits reserves a second time", "reserves in more than one place", SCHED_ALLOC_SPLITS_SIG,
+         "        if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {\n            GGML_LOG_ERROR(\"%s: failed to allocate graph\\n\", __func__);",
+         "        (void) ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);\n        if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {\n            GGML_LOG_ERROR(\"%s: failed to allocate graph\\n\", __func__);"),
+        ("ggml_backend_sched_synchronize skips a backend", "no longer synchronizes every backend", SCHED_SYNC_SIG,
+         "        ggml_backend_synchronize(sched->backends[i]);\n", ""),
+        ("ggml_backend_sched_synchronize stops at the first backend", "no longer synchronizes every backend", SCHED_SYNC_SIG,
+         "for (int i = 0; i < sched->n_backends; i++) {", "for (int i = 0; i < 1; i++) {"),
+        ("the allocator reallocates multi-buffer graphs automatically", "no longer single-buffer only", GALLOC_ALLOC_GRAPH_SIG,
+         "if (galloc->n_buffers == 1) {", "if (galloc->n_buffers >= 1) {"),
+        ("the allocator never refuses a multi-buffer realloc", "no longer single-buffer only", GALLOC_ALLOC_GRAPH_SIG,
+         "        } else {\n", "        } else if (false) {\n"),
         ("the install refusal answers EFFECT_FAILED", "the install result is not a refusal with nothing published", IMPL_SIG,
          INSTALL_REFUSAL_TAIL, INSTALL_REFUSAL_TAIL.replace("PLAN_REJECTED", "EFFECT_FAILED")),
-        ("the installed table never arms the guard", "the install result is not a refusal with nothing published", IMPL_SIG,
-         "                    host_tenants_installed.ctx = backend_ctx;\n", ""),
         ("the section stored without keeping the table", "is stored without keeping the installed table", IMPL_SIG,
          "            host_tenants_installed.keep();\n", ""),
         ("the table kept before the section store", "is stored without keeping the installed table", IMPL_SIG,
@@ -909,10 +1191,6 @@ def mutations(header_raw, source):
          "            host_tenants_installed.keep();\n            ggml_sycl_published_section_set(backend_ctx, section);\n"),
         ("the publish holds no rollback guard", "holds no rollback guard", IMPL_SIG,
          "    ggml_sycl_host_tenants_install_guard host_tenants_installed;\n", ""),
-        ("the install guard never takes the table back", "the install guard does not take the table back", r"\bstruct\s+ggml_sycl_host_tenants_install_guard\b",
-         "            ggml_sycl_host_tenants_erase(ctx);\n", "            (void) ctx;\n"),
-        ("the install guard takes the table back even when kept", "the install guard does not take the table back", r"\bstruct\s+ggml_sycl_host_tenants_install_guard\b",
-         "    void keep() { ctx = nullptr; }", "    void keep() {}"),
         ("a refused reservation is ignored", "does not reserve only without a held table, or does not refuse", IMPL_SIG,
          "                        return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\n                    }\n                } else if",
          "                    }\n                } else if"),
@@ -1031,10 +1309,6 @@ def mutations(header_raw, source):
          "    { ggml_sycl::alloc_handle early{}; (void) ggml_sycl::unified_alloc({}, &early); }\n    if (ggml_sycl::tenant_claim_scope::active()) {"),
         ("the unbound-context return dropped from the section set", "goes on to the registry with key 0",
          r"\bstatic\s+void\s+ggml_sycl_published_section_set\s*\(", "        }\n        return;\n    }\n", "        }\n    }\n"),
-        ("the host reservation's drop swallows silently", "drop of the host reservation swallows a failure silently",
-         r"\bstatic\s+void\s+ggml_sycl_host_tenants_erase\s*\(", "    } catch (...) {\n        GGML_LOG_WARN(", "    } catch (...) {\n        (void) ("),
-        ("the destructor's erase swallows silently", "swallows a failed drop silently",
-         r"\bstatic\s+void\s+ggml_sycl_published_section_erase\s*\(", "    } catch (...) {\n        GGML_LOG_WARN(", "    } catch (...) {\n        (void) ("),
         ("the recovery arm no longer arms the clear", "the recovery arm does not set after_end.txn",
          LOAD_END_SIG, "            after_end.txn = txn.id;\n            ggml_sycl_finalize_binding_failure_abort", "            ggml_sycl_finalize_binding_failure_abort"),
         ("the recovery arm arms the clear after the abort", "the recovery arm does not set after_end.txn",
@@ -1133,12 +1407,6 @@ def mutations(header_raw, source):
          re.compile(r"(?<=\n)    synchronize\(\);\n"), "    if (false) synchronize();\n"),
         ("sched_reserve_impl's synchronize dropped", "sched_reserve_impl does not synchronize() before it first touches", REIMPL_SIG,
          "    synchronize();\n", ""),
-        ("the backend synchronize skips stream 0", "the backend synchronize no longer drains stream 0", SYNC_SIG,
-         "CHECK_TRY_ERROR(stream->wait_and_throw())", "0"),
-        ("the backend synchronize skips the CPU-expert flush", "no longer flushes the CPU-expert work", SYNC_SIG,
-         "            ggml_sycl_cpu_tg_flush_pending();\n", ""),
-        ("the backend synchronize skips the deferred decode event", "no longer drains the deferred decode event", SYNC_SIG,
-         "sycl_ctx->last_graph_event->wait_and_throw()", "0"),
         ("set_tensor_async takes the CpuActivation buffer type", "set_tensor_async accepts the CpuActivation", SET_ASYNC_SIG,
          "\"unsupported buffer type\"", "\"unsupported buffer type\" || buf->buft == ggml_backend_sycl_cpu_activation_buffer_type()"),
         ("get_tensor_async takes the CpuActivation buffer type", "accepts the CpuActivation buffer type", GET_ASYNC_SIG,
@@ -1168,20 +1436,6 @@ def mutations(header_raw, source):
          "ctx->device >= GGML_SYCL_MAX_DEVICES) {\n            return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;"),
         ("open answers FAILED for an unbound context", "not bound to an execution context", OPEN_SIG,
          "if (id == 0) {\n            return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;", "if (id == 0) {\n            return GGML_SYCL_CLAIM_SCOPE_FAILED;"),
-        ("the ended context's entries are never dropped", "does not first drop its registry entries", CLEAR_BIND_SIG,
-         "    ggml_sycl_execution_drop_context_registry_entries(context_id);\n", ""),
-        ("the ended context's entries are dropped after the id is zeroed", "does not first drop its registry entries", CLEAR_BIND_SIG,
-         "    ggml_sycl_execution_drop_context_registry_entries(context_id);\n    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);\n",
-         "    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);\n    ggml_sycl_execution_drop_context_registry_entries(context_id);\n"),
-        ("the ended context's entries are dropped conditionally", "does not first drop its registry entries", CLEAR_BIND_SIG,
-         "    ggml_sycl_execution_drop_context_registry_entries(context_id);\n",
-         "    if (context_id != 0) ggml_sycl_execution_drop_context_registry_entries(context_id);\n"),
-        ("the ended context's host reservation is kept", "does not erase the section then the host", DROP_ENTRIES_SIG,
-         "                ggml_sycl_host_tenants_erase(backend);\n", ""),
-        ("the ended context's section is kept", "does not erase the section then the host", DROP_ENTRIES_SIG,
-         "                ggml_sycl_published_section_erase(backend);\n", ""),
-        ("the ended context's entries are dropped under the binding mutex", "dropped under the binding mutex", DROP_ENTRIES_SIG,
-         "    try {\n", "    try {\n        std::lock_guard<std::mutex> h_lock(g_execution_backend_binding_mutex);\n"),
         ("the n_ctx entry stops delegating", "set_runtime_n_ctx does not delegate to the guarded C entry",
          r"\bvoid\s+ggml_backend_sycl_set_runtime_n_ctx\s*\(", "ggml_backend_sycl_set_runtime_context(backend,",
          "(void) ggml_sycl_run_runtime_context_transaction(backend,"),
@@ -1198,6 +1452,18 @@ def mutations(header_raw, source):
             a, b = span
             body = src[a:b].replace(old, new, 1) if isinstance(old, str) else old.sub(new, src[a:b], count=1)
             muts.append((label, msg, header_raw, src[:a] + body + src[b:]))
+    pairs.append(("the scheduler's allocator is built with one buffer", "allocator is no longer built with one buffer per backend",
+                  "sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);",
+                  "sched->galloc = ggml_gallocr_new_n(sched->bufts, 1);"))
+    pairs.append(("a normal context does not append the CPU backend", "no longer appends the CPU backend",
+                  "        backends.emplace_back(backend_cpu);\n", ""))
+    pairs.append(("a measure-only context no longer requires the CPU backend last", "no longer requires the CPU backend last",
+                  "\"the last backend of a measure-only context must be the CPU backend\"", "\"x\""))
+    pairs.append(("the transaction tail through the swallowing erase", "does not drop the context's earlier section",
+                  "    ggml_sycl_published_section_set(ctx, nullptr);\n    return ggml_sycl_txn_result::ACCEPTED;",
+                  "    ggml_sycl_published_section_erase(ctx->device, 1);\n    return ggml_sycl_txn_result::ACCEPTED;"))
+    pairs.append(("the rung release's synchronize conditional", "release_rung_buffers does not synchronize()",
+                  "auto release_rung_buffers = [&]() {\n        synchronize();\n", "auto release_rung_buffers = [&]() {\n        if (false) synchronize();\n"))
     pairs.append(("the rung release's synchronize dropped", "release_rung_buffers does not synchronize()",
                   "auto release_rung_buffers = [&]() {\n        synchronize();\n", "auto release_rung_buffers = [&]() {\n"))
     pairs.append(("the backend interface wires cpy_tensor_async", "cpy_tensor_async is referenced beyond its definition",
@@ -1239,7 +1505,12 @@ def normalize(text):
 def read(root, rel):
     with open(os.path.join(root, rel), encoding="utf-8") as f:
         text = f.read()
-    return normalize(text) if rel in (SOURCE, LLAMA, CLAIM_HPP) else text
+    return normalize(text) if rel in SOURCE_FILES else text
+
+
+def load_source(root):
+    """The comment-stripped, normalized text every pin and mutation reads: the files of SOURCE_FILES as one text."""
+    return "\n".join(strip_comments(read(root, rel)) for rel in SOURCE_FILES)
 
 
 def main():
@@ -1250,9 +1521,8 @@ def main():
     ap.add_argument("--verbose", action="store_true", help="name each mutant and the failure that caught it")
     args = ap.parse_args()
     header_raw = read(args.root, HEADER)
-    # once: a mutation edits this text.  The scheduler's owner is appended: the free-path contract names both.
-    source_raw = strip_comments(read(args.root, SOURCE)) + "\n" + strip_comments(read(args.root, LLAMA)) + \
-        "\n" + strip_comments(read(args.root, CLAIM_HPP))
+    # once: a mutation edits this text
+    source_raw = load_source(args.root)
     status = 0
     if not args.mutations_only:
         fails = check(header_raw, source_raw)

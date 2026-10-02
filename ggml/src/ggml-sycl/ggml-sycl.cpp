@@ -12176,7 +12176,8 @@ static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
 static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) noexcept;
 static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id);
-static void                        ggml_sycl_execution_drop_context_registry_entries(uint64_t context_id) noexcept;
+static void                        ggml_sycl_execution_drop_context_registry_entries(uint64_t context_id,
+                                                                                     const bool (&devices)[GGML_SYCL_MAX_DEVICES]) noexcept;
 static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const char * reason);
 static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl_context * cleanup_ctx,
                                                                const char *                stage,
@@ -12278,18 +12279,28 @@ static void ggml_sycl_execution_sync_binding_devices_locked(ggml_sycl_execution_
 }
 
 static void ggml_sycl_execution_clear_bindings_for_context(uint64_t context_id) {
-    // Before the reset below zeroes each backend's key: after it, the backend's destructor cannot find the
-    // registry entry (host reservation, published section) this id keyed, and nothing else would drop it.
-    ggml_sycl_execution_drop_context_registry_entries(context_id);
-    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
-    for (auto it = g_execution_backend_bindings.begin(); it != g_execution_backend_bindings.end();) {
-        if (it->second && it->second->context_id == context_id) {
-            ggml_sycl_execution_reset_backend_binding_state(it->first);
-            it = g_execution_backend_bindings.erase(it);
-        } else {
-            ++it;
+    // The reset below zeroes each backend's key, and after it the backend's destructor cannot find the registry
+    // entry (host reservation, published section) this id keyed: nothing else would drop it.  So the devices of
+    // the bindings that end here are collected under the lock (no allocation, nothing to fail), and the entries
+    // are dropped BY THE ENDED ID after the reset, outside the lock.  A publish on one of those backends finds
+    // no id from the reset on, so it cannot re-create an entry under the dead one; an entry it created before
+    // the reset is dropped here.
+    bool devices[GGML_SYCL_MAX_DEVICES] = {};
+    {
+        std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
+        for (auto it = g_execution_backend_bindings.begin(); it != g_execution_backend_bindings.end();) {
+            if (it->second && it->second->context_id == context_id) {
+                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {
+                    devices[it->first->device] = true;
+                }
+                ggml_sycl_execution_reset_backend_binding_state(it->first);
+                it = g_execution_backend_bindings.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
+    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);
 }
 
 template<typename F>
@@ -13139,16 +13150,24 @@ static void ggml_sycl_published_section_set(const ggml_backend_sycl_context *   
     (void) previous;  // dropped here, with no registry lock held
 }
 
-// The backend context is going away: its entry's section goes with it.  Runs before the execution
-// binding is reset, which is what clears the context id.  Never throws, because a destructor cannot
-// let one out; the registry's lock failing is the only way the drop can, and it is said at WARN.  The
-// publish tail does NOT use this: it calls ggml_sycl_published_section_set directly and lets such a
-// failure out, so a section describing the replaced shape is never kept silently.
-static void ggml_sycl_published_section_erase(const ggml_backend_sycl_context * ctx) noexcept {
+// A context's entry loses its section: the one erase of a section by the id that keyed it.  The caller
+// names the id and the device (the backend destructor reads its own once, the end of an execution context
+// passes the ended id), and nothing here reads a backend's id again, so one drop has one id.  Never throws,
+// because a destructor cannot let one out; the registry's lock failing is the only way the drop can, and a
+// drop that fails leaves the entry to the process's end (its key is gone with the context), which is why it is
+// said at ERROR.  The publish tail does NOT use this: it calls ggml_sycl_published_section_set directly and
+// lets such a failure out, so a section describing the replaced shape is never kept silently.
+static void ggml_sycl_published_section_erase(int device, uint64_t context_id) noexcept {
     try {
-        ggml_sycl_published_section_set(ctx, nullptr);
+        if (context_id == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+            return;
+        }
+        auto previous = ggml_sycl_kv_region_registry(device).drop_published_section(context_id);
+        (void) previous;  // dropped here, with no registry lock held
     } catch (...) {
-        GGML_LOG_WARN("[CONTEXT-PLAN] the published section of a backend context could not be dropped\n");
+        GGML_LOG_ERROR(
+            "[CONTEXT-PLAN] the published section of an execution context could not be dropped; it stays until the "
+            "process ends\n");
     }
 }
 
@@ -13295,10 +13314,12 @@ static bool ggml_sycl_host_tenants_carry(const ggml_sycl::kv_tenant_slots &     
 
 // The commit of a first publish: the reserved table becomes the entry's held reservation.  `table` is
 // emptied on success; on false (an unbound context, or an entry that already holds a table) the caller
-// still owns it and drops it with no lock held.
+// still owns it and drops it with no lock held.  `installed_id` is the id the table was keyed by, read once
+// here: the rollback guard drops by it, so the install and its rollback cannot name different ids.
 static bool ggml_sycl_host_tenants_install(const ggml_backend_sycl_context *             ctx,
                                            std::shared_ptr<ggml_sycl::kv_tenant_slots> & table,
-                                           uint64_t                                      tenant_key) {
+                                           uint64_t                                      tenant_key,
+                                           uint64_t &                                    installed_id) {
     if (!ctx || ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES || !table) {
         return false;
     }
@@ -13307,58 +13328,59 @@ static bool ggml_sycl_host_tenants_install(const ggml_backend_sycl_context *    
         return false;
     }
     table.reset();
+    installed_id = id;
     return true;
 }
 
-// The backend context is going away: its held host reservation goes with it, after the section.  The
-// last drop of a slot is the last drop of its carve, and a buffer still built over one keeps it
-// through its own copy of the handle.  Never throws.
-static void ggml_sycl_host_tenants_erase(const ggml_backend_sycl_context * ctx) noexcept {
+// A context's entry loses its held host reservation, after its section: the one erase of a table by the id
+// that keyed it, named by the caller as the section's erase is.  The last drop of a slot is the last drop of
+// its carve, and a buffer still built over one keeps it through its own copy of the handle.  Never throws; a
+// drop that fails leaves the carves pinned to the process's end, and is said at ERROR.
+static void ggml_sycl_host_tenants_erase(int device, uint64_t context_id) noexcept {
     try {
-        if (!ctx || ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES) {
+        if (context_id == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
             return;
         }
-        const uint64_t id = ggml_sycl_context_execution_id(ctx);
-        if (id == 0) {
-            return;
-        }
-        auto previous = ggml_sycl_kv_region_registry(ctx->device).take_tenant_slots(id);
+        auto previous = ggml_sycl_kv_region_registry(device).take_tenant_slots(context_id);
         (void) previous;  // dropped here, with no registry lock held
     } catch (...) {
-        GGML_LOG_WARN("[CONTEXT-PLAN] the held host reservation of a backend context could not be dropped\n");
+        GGML_LOG_ERROR(
+            "[CONTEXT-PLAN] the held host reservation of an execution context could not be dropped; its carves stay "
+            "pinned until the process ends\n");
     }
 }
 
 // A table installed ahead of the inner transaction is taken back unless the section that describes it was stored: a
 // publish that fails after the install (the inner transaction refused or threw, the plan could not be bound, the
 // section's store threw) leaves the context holding no host reservation, as a refused first publish always did.
-// Only a table this publish installed arms it, so a republish never takes back the held one.
+// Only a table this publish installed arms it, so a republish never takes back the held one.  It holds the device
+// and the id the install keyed the table by.
 struct ggml_sycl_host_tenants_install_guard {
-    const ggml_backend_sycl_context * ctx = nullptr;
+    int      device = -1;
+    uint64_t id     = 0;
 
     ~ggml_sycl_host_tenants_install_guard() {
-        if (ctx) {
-            ggml_sycl_host_tenants_erase(ctx);
+        if (id != 0) {
+            ggml_sycl_host_tenants_erase(device, id);
         }
     }
 
-    void keep() { ctx = nullptr; }
+    void keep() { id = 0; }
 };
 
 // The end of an execution context is the end of its id, and the registry entries it keyed (the host
 // reservation and the published section) go with it: the backend destructor drops them too, but only
-// while the backend still carries the id, and finish_drain / close_if_idle reset that first.  The drops
-// run on pinned backends outside the binding mutex (they free memory through the unified cache), in the
-// destructor's order.  Never throws: a failure to pin is said at WARN, as the destructor's drops are.
-static void ggml_sycl_execution_drop_context_registry_entries(uint64_t context_id) noexcept {
-    try {
-        ggml_sycl_execution_for_each_bound_backend(
-            context_id, [](ggml_backend_sycl_context * backend, const ggml_sycl_execution_backend_binding &) {
-                ggml_sycl_published_section_erase(backend);
-                ggml_sycl_host_tenants_erase(backend);
-            });
-    } catch (...) {
-        GGML_LOG_WARN("[CONTEXT-PLAN] the registry entries of an ended execution context could not be dropped\n");
+// while the backend still carries the id, and finish_drain / close_if_idle reset that first.  The drop is
+// by the ENDED id and the devices the ended bindings were on, so it needs no backend (nothing to pin, no
+// allocation that can fail) and runs outside the binding mutex (it frees memory through the unified cache),
+// in the destructor's order.  Never throws; each erase says its own failure at ERROR.
+static void ggml_sycl_execution_drop_context_registry_entries(uint64_t context_id,
+                                                              const bool (&devices)[GGML_SYCL_MAX_DEVICES]) noexcept {
+    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {
+        if (devices[device]) {
+            ggml_sycl_published_section_erase(device, context_id);
+            ggml_sycl_host_tenants_erase(device, context_id);
+        }
     }
 }
 
@@ -13443,8 +13465,10 @@ struct ggml_sycl_load_ledger_clear_guard {
 // this call is the finisher, so a throw from anything the handler does before the end still clears -- and the
 // clear runs when the handler is left, after the end call: order is end, then clear, on every path.  If the
 // registry's end call (finalize_end, or ggml_sycl_finalize_binding_failure_abort in the recovery arm) itself
-// throws out of the handler the clear still runs, but the registry never ended the transaction, so a record in
-// that case can still find it open; that residue is the registry's own failure, not one this ordering can close.
+// throws out of the handler, or anything the handler does before the end call throws (the placement cleanup, on
+// the finisher arm, which the top arming exists to survive), the clear still runs, but the registry never ended
+// the transaction, so a record in that case can still find it open; that residue is a failure this ordering
+// cannot close, whoever's it is.
 struct ggml_sycl_load_ledger_clear_after_end {
     uint64_t txn = 0;
 
@@ -20294,14 +20318,16 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
                 // context ended since its id was read, or its entry already holds a table) is a refusal with
                 // nothing published, as PLAN_REJECTED says.  The guard takes the table back on any later failure.
                 if (host_tenants) {
-                    if (!ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key)) {
+                    uint64_t installed_id = 0;
+                    if (!ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key, installed_id)) {
                         GGML_LOG_ERROR(
                             "[CONTEXT-PLAN-BUG] the host reservation could not be installed on its context; the "
                             "descriptor publish is refused and nothing is published (n_ctx=%u n_ubatch=%u)\n",
                             n_ctx, n_ubatch);
                         return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
                     }
-                    host_tenants_installed.ctx = backend_ctx;
+                    host_tenants_installed.device = backend_ctx->device;
+                    host_tenants_installed.id     = installed_id;
                 }
             } catch (const ggml_sycl_fallback_error &) {
                 throw;
@@ -45037,34 +45063,54 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
     }
     if (ctx->claim) {
         // No wait here, on purpose (no host waits; event-chain instead), and the slot goes back with event 0.  That
-        // is sound because of a contract that holds on every path to this function, proven against the code and
-        // pinned by scripts/check-sycl-l4-proc-registration.py:
-        //   A claimed compute buffer is freed only after the backend synchronize of every backend of its
-        //   scheduler, and no queue that outlives that synchronize touches a claimed slot.
+        // is sound because of a contract that holds on every path to this function, read against the code and
+        // pinned by scripts/check-sycl-l4-proc-registration.py (the paths below, the synchronize before each, the
+        // upstream premises in ggml-backend.cpp, ggml-alloc.c and llama-context.cpp, and the queue aliasing):
+        //   A claimed compute buffer is freed only after a synchronize ATTEMPT of every backend of its scheduler,
+        //   and every SYCL queue that can touch a claimed slot is the device's one execution queue, which that
+        //   synchronize drains.
+        // The one queue: ggml_backend_sycl_context::stream(device, idx) answers ggml_sycl_execution_queue_for_device
+        // (device) for EVERY idx -- the TP queue when TP is on, else the unified cache's own queue.  So stream 0, the
+        // streams "1..N" and the cache's queue are one queue, not several that the synchronize could miss, and the
+        // synchronize's wait on stream 0 (or on the deferred last graph event, plus ggml_sycl_cpu_tg_flush_pending for
+        // the CPU-expert and scatter pipelines, detached threads included) is a wait on all of them.  A second real
+        // queue per device breaks that, and with it this contract: the pins on stream() and on the synchronize's
+        // drain exist so that it cannot happen quietly.
+        // What reads a slot: when the plan has CPU work, or the offload is partial, the CPU backend's compute buft is
+        // the CpuActivation clone, which ggml_backend_sycl_device_supports_buft does not list, so no SYCL op touches
+        // an activation in it.  With no CPU work and every layer offloaded it is the GENERIC SYCL_Host buft
+        // (llama_context_cpu_compute_buft), which supports_buft accepts, and SYCL kernels DO read and write a claimed
+        // slot in place -- on the execution queue above, which is why the synchronize covers them.  A consumer that
+        // puts work for a slot on anything that is not that queue must make the backend synchronize drain it, or chain
+        // on the slot's wait_event (the L6 event ledger); it must not rely on this contract and must not add a wait
+        // here.  Nor does an async copy have a SYCL_Host tensor at either end: set/get_tensor_async assert a SYCL
+        // device, host-compute or cpu-offload buft and cpy_tensor_async is NULL; the scheduler's cross-backend copy is
+        // a blocking ggml_backend_tensor_copy between the two backends' synchronizes, through accessors that wait the
+        // cache and default queues themselves; ggml-cpu's graph_compute is synchronous (its synchronize is NULL); and
+        // the staging the scatter threads touch is their own owner-first host handles.
         // The paths to here, and the synchronize before each: ggml_backend_sched_reserve and _reserve_size
         // (ggml_backend_sched_synchronize first); the realloc in ggml_backend_sched_alloc_splits
         // (ggml_backend_synchronize of every backend before ggml_gallocr_reserve_n -- the other realloc, the
         // automatic reserve in ggml_gallocr_alloc_graph, needs a single-buffer allocator, which llama.cpp never
-        // builds because the CPU backend is always one of the scheduler's backends); llama_context's scheduler
-        // replacement in sched_reserve_impl (synchronize() before it; the pipeline-parallel retry replaces a
-        // scheduler that only failed to reserve, so it never computed) and in release_rung_buffers (synchronize()
-        // first); and ~llama_context (synchronize() first).  Nothing else frees a compute buffer:
-        // ggml_backend_sched_reset only resets the allocator.
-        // What the SYCL synchronize drains: stream 0 (or the deferred last graph event) and
-        // ggml_sycl_cpu_tg_flush_pending (the CPU-expert and scatter pipelines, detached threads included).  It
-        // does not drain the other streams, the unified-cache queue, or the shared-context, TP and PP queues, so
-        // the contract also needs those to never touch a slot, and they do not: the CPU backend's compute buft is
-        // the CpuActivation clone, which ggml_backend_sycl_device_supports_buft does not list, so no SYCL op reads
-        // or writes an activation in it and the scheduler's split-input copy lands it in a SYCL device compute
-        // buffer; set/get_tensor_async assert a SYCL device, host-compute or cpu-offload buft and cpy_tensor_async
-        // is NULL, so no async copy has a SYCL_Host tensor at either end; the scheduler's cross-backend copy is a
-        // blocking ggml_backend_tensor_copy between the two backends' synchronizes, through accessors that wait
-        // the cache and default queues themselves; ggml-cpu's graph_compute is synchronous (its synchronize is
-        // NULL); and the staging the scatter threads touch is their own owner-first host handles.
-        // A queue-wide wait here would be both too little (it covered the cache and default queues only) and too
-        // much (it waited on, and rethrew, other contexts' work).  A caller that does put a SYCL queue on a claimed
-        // buffer must make the backend synchronize drain that queue, or chain on the slot's wait_event (the L6
-        // event ledger); it must not add a wait here.
+        // builds because the CPU backend is always one of the scheduler's backends, so a SYCL scheduler has two or
+        // more); llama_context's scheduler replacement in sched_reserve_impl (synchronize() before it on the ALLOC
+        // path; the pipeline-parallel retry replaces a scheduler that only failed to reserve, so it never computed)
+        // and in release_rung_buffers (synchronize() first); and ~llama_context (synchronize() first).  Two more
+        // frees run no synchronize and are benign: the MEASURE scheduler's destruction (sched_measure_storage, whose
+        // reserves go through ggml_backend_sched_reserve, which does synchronize, and whose final free does not) and
+        // the unwinding of a constructor that threw.  Nothing runs a kernel on either, and no claim scope is open on
+        // either.  L6 CONSTRAINT: a claim scope must never be opened on the measure scheduler (its reserve is bare,
+        // with no plan scope or hold record around it); a scope that is makes both frees paths of this list, and each
+        // then needs a synchronize before it.  Nothing else frees a compute buffer: ggml_backend_sched_reset only
+        // resets the allocator.
+        // "Synchronize" here is an attempt: ggml_backend_sycl_synchronize swallows its own failure (a throwing drain
+        // goes to ggml_backend_sycl_graph_boundary_exception_cleanup, which logs, and the call returns).  So after a
+        // failed drain (a lost device) the slot goes back with event 0 while the queue may still reference it, and
+        // the contract is void for that device from then on: nothing is submitted to a lost device's context, which is
+        // why that is tolerated, and the synchronize's own ERROR line is the only report.  A caller that needs the
+        // drain to have worked must ask the backend, not infer it from this function having been reached.
+        // A queue-wide wait here would be too much (it waited on, and rethrew, other contexts' work), and the
+        // contract already makes it unneeded.
         (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);
         ctx->claim.reset();
     }
@@ -46589,8 +46635,11 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     }
     pp_moe_onednn_drain_scratch_slots(device);
     ggml_sycl_execution_abort_and_release_graph(this);
-    ggml_sycl_published_section_erase(this);
-    ggml_sycl_host_tenants_erase(this);
+    // One read of the id for both drops: zero once an execution context's end has reset it, which dropped the
+    // entries by the ended id already.
+    const uint64_t context_id = ggml_sycl_context_execution_id(this);
+    ggml_sycl_published_section_erase(device, context_id);
+    ggml_sycl_host_tenants_erase(device, context_id);
     ggml_sycl_execution_unbind_backend(this);
     {
         std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);

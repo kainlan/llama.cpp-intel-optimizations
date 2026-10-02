@@ -167,6 +167,13 @@ struct lifecycle_fixture {
             (void) ggml_backend_sycl_model_load_end(load, false, nullptr);
             load_open = false;
         }
+        free_backends();
+    }
+
+    // Frees the backends and nothing else: the execution context stays open and still names its id on them, so
+    // each backend's destructor is the only thing left to drop the entries that id keyed (no drain ran to drop
+    // them first, which is what finish_drain / close_if_idle do).
+    void free_backends() noexcept {
         for (auto it = retained_backends.rbegin(); it != retained_backends.rend(); ++it) {
             ggml_backend_free(*it);
         }
@@ -501,7 +508,16 @@ void case_teardown() {
         require(publish(f, first) == GGML_SYCL_LIFECYCLE_OK, "the first descriptor publish failed");
         require_slots(2, "the publish did not hold its slots");
         f.cleanup();
-        require_slots(0, "freeing the backend did not release the held slots");
+        require_slots(0, "ending the context (the drain, then the backend's free) did not release the held slots");
+    }
+    {
+        // a backend freed with no drain: its destructor still holds the context's id, and drops the entries that
+        // id keyed itself (the drain's drop finds nothing left to take afterwards)
+        lifecycle_fixture f;
+        require(publish(f, first) == GGML_SYCL_LIFECYCLE_OK, "the first descriptor publish failed");
+        require_slots(2, "the publish did not hold its slots");
+        f.free_backends();
+        require_slots(0, "freeing the backend with no drain did not release the held slots");
     }
     {
         // a buffer that still claims from the table keeps it, and the last free releases every slot
