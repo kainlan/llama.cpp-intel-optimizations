@@ -56,6 +56,7 @@ UBATCH_H = read("src/llama-auto-ubatch.h")
 SYCL_CPP = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 CACHE_CPP = read("ggml/src/ggml-sycl/unified-cache.cpp")
 SYCL_H = read("ggml/include/ggml-sycl.h")
+CACHE_H = read("ggml/src/ggml-sycl/unified-cache.hpp")
 
 
 def _balanced(text: str, open_at: int) -> str:
@@ -202,9 +203,17 @@ def claim_unmodelled_consumers_name_their_direction(cache_cpp: str) -> bool:
 
 def claim_rung_record_truncation_is_loud(cache_cpp: str) -> bool:
     k = norm(cache_cpp)
-    m = re.search(r"if \(state\.rung_requests\.size\(\) >= kMaxHoldRungRecords\) \{(.*?)\} ", k)
+    m = re.search(r"if \(state\.rung_requests\.size\(\) >= kHoldRungRecordLimit\) \{(.*?)\} else \{", k)
     body = m.group(1) if m else ""
-    return "state.rung_records_dropped++" in body and "LOG" in body.upper()
+    # counted under the lock; the WARN itself is said after the lock is released (the mutex is a leaf)
+    warn_at = k.find("GGML_LOG_WARN(", k.find("size_t unified_cache_note_runtime_request("))
+    unlock_at = k.find("hold = state.hold; }", k.find("size_t unified_cache_note_runtime_request("))
+    return (
+        "state.rung_record_refusals++" in body
+        and "GGML_LOG" not in body
+        and 0 <= unlock_at < warn_at
+        and "if (warn_refused) {" in k
+    )
 
 
 def claim_every_scheduler_allocation_goes_through_the_helpers(ctx: str, kv: str, ctx_h: str) -> bool:
@@ -239,6 +248,71 @@ def claim_clip_opens_the_exported_scope(clip: str) -> bool:
         '"ggml_backend_sycl_compute_alloc_scope"' in c
         and "{ clip_sycl_compute_scope sycl_scope(ctx_clip.backend); ggml_backend_sched_reserve(ctx_clip.sched.get(), gf); }" in c
         and "{ clip_sycl_compute_scope sycl_scope(ctx->backend); alloc_ok = ggml_backend_sched_alloc_graph(ctx->sched.get(), gf); }" in c
+    )
+
+
+def claim_fit_picks_the_kv_room_at_the_call_site(sycl_cpp: str) -> bool:
+    """The fit's KV room: the realized check (rung live) judges with its epoch's snapshot, a transaction with the zone as
+    it is now. The helper's arithmetic is host-tested; this pins that the fit calls it with the live-rung flag, the
+    epoch lookup and the live room only when there is no epoch."""
+    s = norm(sycl_cpp)
+    return bool(
+        re.search(
+            r"const bool have_epoch = q\.rung_live && ggml_sycl::unified_cache_get_hold_epoch\(q\.device, q\.owner, "
+            r"&epoch_n_ubatch, &epoch_kv_room\); "
+            r"in\.kv_room = ggml_sycl::zone_hold_pick_kv_room\(q\.rung_live, have_epoch, epoch_kv_room, "
+            r"have_epoch \? 0 : ggml_sycl_hold_kv_room\(q\.device, q\.kv_pending\)\);",
+            s,
+        )
+    )
+
+
+def claim_non_fa_check_counts_the_hold_term(sycl_cpp: str) -> bool:
+    """The non-FA check's demand is the non-FA scratch PLUS the hold's worst-case spill bound, both compared with the
+    ledger's free memory."""
+    s = norm(sycl_cpp)
+    return bool(
+        re.search(
+            r"const size_t hold_spill_bytes = hold_query \? ggml_sycl_planned_scratch_hold_spill_bound\(\*hold_query\) : 0; "
+            r"const size_t nonfa_scratch_demand = ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes\(n_head, n_ubatch, n_ctx\); "
+            r"const size_t nonfa_demand = ggml_sycl::zone_hold_nonfa_demand\(nonfa_scratch_demand, hold_spill_bytes\);",
+            s,
+        )
+        and "unified_cache_nonfa_attn_scratch_fits_headroom(nonfa_demand, free_cmp)" in s
+    )
+
+
+def claim_dl_refresh_lookup_names_the_exported_entry(ctx: str, sycl_cpp: str, sycl_h: str) -> bool:
+    """Under GGML_BACKEND_DL the context finds the refresh by name. A typo there silently skips the refresh (the proc
+    lookup returns null and the backend is skipped), so the string must be the one the backend registers and declares."""
+    c = norm(ctx)
+    m = re.search(
+        r"llama_context_sycl_hold_epoch_refresh_proc\( ?ggml_backend_dev_t dev\) \{ return reinterpret_cast<decltype\(&ggml_backend_sycl_planned_hold_epoch_refresh\)>\( "
+        r'llama_context_sycl_proc_addr\(dev, "([A-Za-z0-9_]+)"\)\); \}',
+        c,
+    )
+    if not m:
+        return False
+    name = m.group(1)
+    s = norm(sycl_cpp)
+    h = norm(sycl_h)
+    return (
+        name == "ggml_backend_sycl_planned_hold_epoch_refresh"
+        and f'strcmp(name, "{name}") == 0) {{ return (void *) {name}; }}' in s
+        and f"{name}(ggml_backend_t backend);" in h
+    )
+
+
+def claim_record_cap_is_a_compile_time_relation_and_one_filter_remains(sycl_cpp: str, cache_cpp: str, cache_h: str) -> bool:
+    """The fit's rung buffer is static_assert-ed against the cache's record cap (a header constant), and the raw-row
+    filter exists once: the dead live-bytes duplicate is gone."""
+    s = norm(sycl_cpp)
+    return (
+        "static_assert(ggml_sycl::kHoldRungRecordLimit <= kMaxRungs" in s
+        and "GGML_ASSERT(ggml_sycl::unified_cache_hold_rung_record_limit" not in s
+        and "constexpr size_t kHoldRungRecordLimit = 32;" in norm(cache_h)
+        and "unified_cache_raw_device_live_bytes" not in cache_cpp
+        and "unified_cache_raw_device_live_bytes" not in cache_h
     )
 
 
@@ -299,14 +373,34 @@ def test_every_scheduler_allocation_goes_through_the_scoped_helpers():
     assert claim_no_bare_scheduler_allocation_elsewhere()
 
 
+def test_the_fit_picks_its_kv_room_at_the_call_site():
+    assert claim_fit_picks_the_kv_room_at_the_call_site(SYCL_CPP)
+
+
+def test_the_non_fa_check_counts_the_hold_term():
+    assert claim_non_fa_check_counts_the_hold_term(SYCL_CPP)
+
+
+def test_the_record_cap_is_a_compile_time_relation_and_one_raw_filter_remains():
+    assert claim_record_cap_is_a_compile_time_relation_and_one_filter_remains(SYCL_CPP, CACHE_CPP, CACHE_H)
+
+
+def test_the_dl_refresh_lookup_names_the_exported_entry():
+    assert claim_dl_refresh_lookup_names_the_exported_entry(CTX, SYCL_CPP, SYCL_H)
+
+
 # ---------------------------------------------------------------------------
 # mutants: each edit of the raw source must make its claim fail
 # ---------------------------------------------------------------------------
 
 
 def _once(raw: str, old: str, new: str) -> str:
-    assert raw.count(old) == 1, f"mutation target not unique/found: {old[:60]!r}"
-    return raw.replace(old, new, 1)
+    """Replace `old` once, ignoring every whitespace difference in the match: a clang-format run must not turn a
+    mutant into a vacuous 'target not found' failure."""
+    pat = re.compile(r"\s*".join(re.escape(ch) for ch in old if not ch.isspace()))
+    found = len(pat.findall(raw))
+    assert found == 1, f"mutation target not unique/found ({found}): {old[:60]!r}"
+    return pat.sub(lambda _m: new, raw, count=1)
 
 
 def _settle_release_line(raw: str) -> str:
@@ -458,9 +552,16 @@ def test_mutant_undocumented_direction_fails_the_claim():
 
 
 def test_mutant_silent_truncation_fails_the_claim():
-    m = re.search(r"if \(state\.rung_records_dropped\+\+ == 0\) \{", CACHE_CPP)
-    assert m
-    mutated = CACHE_CPP.replace("state.rung_records_dropped++ == 0", "state.rung_records_dropped == 0", 1)
+    mutated = _once(CACHE_CPP, "warn_refused = state.rung_record_refusals++ == 0;", "warn_refused = state.rung_record_refusals == 0;")
+    assert not claim_rung_record_truncation_is_loud(mutated)
+
+
+def test_mutant_warn_under_the_state_lock_fails_the_claim():
+    mutated = _once(
+        CACHE_CPP,
+        "warn_refused = state.rung_record_refusals++ == 0;",
+        'warn_refused = state.rung_record_refusals++ == 0; if (warn_refused) { GGML_LOG_WARN("x"); }',
+    )
     assert not claim_rung_record_truncation_is_loud(mutated)
 
 
@@ -504,3 +605,71 @@ def test_mutant_clip_reserve_outside_the_scope_fails_the_claim():
         "            ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);",
     )
     assert not claim_clip_opens_the_exported_scope(mutated)
+
+
+def test_mutant_fit_always_uses_the_live_kv_room_fails_the_claim():
+    mutated = _once(
+        SYCL_CPP,
+        "in.kv_room      = ggml_sycl::zone_hold_pick_kv_room(q.rung_live, have_epoch, epoch_kv_room,\n                                                   have_epoch ? 0 : ggml_sycl_hold_kv_room(q.device, q.kv_pending));",
+        "in.kv_room = ggml_sycl_hold_kv_room(q.device, q.kv_pending);",
+    )
+    assert not claim_fit_picks_the_kv_room_at_the_call_site(mutated)
+
+
+def test_mutant_fit_ignores_the_epoch_flag_fails_the_claim():
+    mutated = _once(
+        SYCL_CPP,
+        "q.rung_live && ggml_sycl::unified_cache_get_hold_epoch(q.device, q.owner, &epoch_n_ubatch, &epoch_kv_room);",
+        "ggml_sycl::unified_cache_get_hold_epoch(q.device, q.owner, &epoch_n_ubatch, &epoch_kv_room);",
+    )
+    assert not claim_fit_picks_the_kv_room_at_the_call_site(mutated)
+
+
+def test_mutant_non_fa_drops_the_hold_term_fails_the_claim():
+    mutated = _once(
+        SYCL_CPP,
+        "ggml_sycl::zone_hold_nonfa_demand(nonfa_scratch_demand, hold_spill_bytes);",
+        "nonfa_scratch_demand;",
+    )
+    assert not claim_non_fa_check_counts_the_hold_term(mutated)
+
+
+def test_mutant_non_fa_hold_bound_is_always_zero_fails_the_claim():
+    mutated = _once(
+        SYCL_CPP,
+        "hold_query ? ggml_sycl_planned_scratch_hold_spill_bound(*hold_query) : 0;",
+        "0;",
+    )
+    assert not claim_non_fa_check_counts_the_hold_term(mutated)
+
+
+def test_mutant_dl_refresh_lookup_typo_fails_the_claim():
+    mutated = _once(
+        CTX,
+        'llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_planned_hold_epoch_refresh")',
+        'llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_planned_hold_epoch_refesh")',
+    )
+    assert not claim_dl_refresh_lookup_names_the_exported_entry(mutated, SYCL_CPP, SYCL_H)
+
+
+def test_mutant_dl_refresh_registration_typo_fails_the_claim():
+    mutated = _once(
+        SYCL_CPP,
+        'if (strcmp(name, "ggml_backend_sycl_planned_hold_epoch_refresh") == 0) {',
+        'if (strcmp(name, "ggml_backend_sycl_planned_hold_epoch_refresh_") == 0) {',
+    )
+    assert not claim_dl_refresh_lookup_names_the_exported_entry(CTX, mutated, SYCL_H)
+
+
+def test_mutant_runtime_assert_on_the_record_cap_fails_the_claim():
+    mutated = _once(
+        SYCL_CPP,
+        "static_assert(ggml_sycl::kHoldRungRecordLimit <= kMaxRungs",
+        "GGML_ASSERT(ggml_sycl::unified_cache_hold_rung_record_limit() <= kMaxRungs); static_assert(true",
+    )
+    assert not claim_record_cap_is_a_compile_time_relation_and_one_filter_remains(mutated, CACHE_CPP, CACHE_H)
+
+
+def test_mutant_second_raw_filter_returns_fails_the_claim():
+    mutated = CACHE_CPP + "\nsize_t unified_cache_raw_device_live_bytes(int device_id) { return 0; }\n"
+    assert not claim_record_cap_is_a_compile_time_relation_and_one_filter_remains(SYCL_CPP, mutated, CACHE_H)

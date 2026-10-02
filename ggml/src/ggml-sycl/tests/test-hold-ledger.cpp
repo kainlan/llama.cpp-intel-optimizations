@@ -130,7 +130,9 @@ int main() {
         check(allocation_registry_test_publish_raw(fake(5), dev, 300 * MiB, false, true, false), "arena row");
         check(allocation_registry_test_publish_raw(fake(6), dev + 1, 300 * MiB, false, false, false),
               "other device row");
-        check(unified_cache_raw_device_live_bytes(dev) == 0, "neither counts as raw device memory on this device");
+        size_t compute_live = 1;
+        check(unified_cache_raw_device_held_bytes(dev, &compute_live) == 0 && compute_live == 0,
+              "neither counts as raw device memory on this device");
         check(unified_cache_hold_free_before(dev, o.owner, 500 * MiB, false) == 500 * MiB,
               "the ledger reads the driver");
         allocation_registry_test_erase(fake(5));
@@ -183,9 +185,9 @@ int main() {
         }
         zone_hold_rung_request recs[64];
         const size_t           n = unified_cache_get_hold_rung_requests(dev, o.owner, recs, 64);
-        check(n == unified_cache_hold_rung_record_limit(), "the records are capped at the documented limit");
-        check(unified_cache_hold_rung_records_dropped(dev, o.owner) == 40 - n,
-              "every record the cap refused is counted, so the truncation is never silent");
+        check(n == kHoldRungRecordLimit, "the records are capped at the documented limit");
+        check(unified_cache_hold_rung_record_refusals(dev, o.owner) == 40 - n,
+              "every call the cap refused is counted, so the truncation is never silent");
     }
 
     printf("PASS: hold ledger\n");

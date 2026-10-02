@@ -2472,10 +2472,18 @@ def _try_candidate_norm() -> str:
     return _normalize_ws(_try_candidate_body())
 
 
+def _ws_tolerant(old: str) -> "re.Pattern":
+    """`old` as a pattern that ignores every whitespace difference, so a clang-format run cannot make a mutation
+    target stop matching (the mutant is then a vacuous 'target not found' failure, or worse a silent skip)."""
+    return re.compile(r"\s*".join(re.escape(ch) for ch in old if not ch.isspace()))
+
+
 def _trial_mutant(old: str, new: str) -> str:
-    """The normalized trial body of the source with `old` (raw text, once) replaced by `new`."""
-    assert LLAMA_CONTEXT_CPP.count(old) == 1, f"mutation target not unique -- found {LLAMA_CONTEXT_CPP.count(old)}: {old!r}"
-    return _body_of(LLAMA_CONTEXT_CPP.replace(old, new, 1), _TRIAL_START, _TRIAL_END)
+    """The normalized trial body of the source with `old` (raw text, whitespace-insensitive, once) replaced by `new`."""
+    pat = _ws_tolerant(old)
+    found = len(pat.findall(LLAMA_CONTEXT_CPP))
+    assert found == 1, f"mutation target not unique -- found {found}: {old!r}"
+    return _body_of(pat.sub(lambda _m: new, LLAMA_CONTEXT_CPP, count=1), _TRIAL_START, _TRIAL_END)
 
 
 def _settle_refused_branch(body_norm: str) -> str:
@@ -2528,8 +2536,6 @@ def test_a_refused_settle_is_a_named_error_with_the_fit_functions_n():
     ],
 )
 def test_settle_named_error_has_a_mutation_witness(old, new):
-    if LLAMA_CONTEXT_CPP.count(old) != 1:
-        pytest.fail(f"mutation target not found -- update this witness to match the real source: {old!r}")
     assert not _settle_refusal_names_the_fit_function(_trial_mutant(old, new)), "the mutant must make the pin fail"
 
 
@@ -2616,9 +2622,10 @@ def test_the_fit_flag_is_set_only_by_real_fit_refusals():
 )
 def test_the_fit_flag_has_a_mutation_witness(old, new):
     raw = LLAMA_CONTEXT_CPP
-    if raw.count(old) != 1:
-        pytest.skip("not applicable to this shape")
-    mutated = _body_of(raw.replace(old, new, 1), _TRY_CANDIDATE_START, _TRY_CANDIDATE_END)
+    pat = _ws_tolerant(old)
+    found = len(pat.findall(raw))
+    assert found == 1, f"mutation target not unique/found ({found}) -- update this witness: {old!r}"
+    mutated = _body_of(pat.sub(lambda _m: new, raw, count=1), _TRY_CANDIDATE_START, _TRY_CANDIDATE_END)
     assert not _fit_flag_is_set_only_on_fit_refusals(mutated)
 
 
