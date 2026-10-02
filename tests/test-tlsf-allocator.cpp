@@ -1152,6 +1152,227 @@ static void test_block_census_degenerate() {
 }
 
 // ---------------------------------------------------------------------------
+// allocate_at / allocate_excluding (llama.cpp-moua L4 pending-range primitive)
+// ---------------------------------------------------------------------------
+
+// allocate_at carves exactly the asked range out of the one free block that
+// holds it, and the front and back remainders stay whole free blocks.
+static void test_allocate_at_carves_exact() {
+    test_arena       arena(16 * ONE_MB);
+    tlsf_allocator & t = *arena.alloc;
+
+    REQUIRE(t.allocate_at(4 * ONE_MB, ONE_MB, 3) == 4 * ONE_MB);
+    REQUIRE(t.check_invariants());
+    REQUIRE(t.block_size_at(4 * ONE_MB) == ONE_MB && t.tag_at(4 * ONE_MB) == 3);
+    auto census = t.block_census();
+    REQUIRE(census.size() == 3 && census[0].free && census[0].size == 4 * ONE_MB);
+    REQUIRE(!census[1].free && census[2].free && census[2].offset == 5 * ONE_MB);
+
+    // Both ends of the region and the whole block.
+    REQUIRE(t.allocate_at(0, ONE_MB, 4) == 0);
+    REQUIRE(t.allocate_at(16 * ONE_MB - ONE_MB, ONE_MB, 5) == 16 * ONE_MB - ONE_MB);
+    REQUIRE(t.check_invariants());
+    t.reset();
+    REQUIRE(t.allocate_at(0, 16 * ONE_MB, 6) == 0 && t.used() == 16 * ONE_MB);
+    REQUIRE(t.check_invariants());
+
+    // The size rounds up to the block grain like allocate()'s.
+    t.reset();
+    REQUIRE(t.allocate_at(2 * ONE_MB, 300, 1) == 2 * ONE_MB && t.block_size_at(2 * ONE_MB) == 512);
+    REQUIRE(t.check_invariants());
+    t.reset();
+    REQUIRE(t.allocate_at(0, 16 * ONE_MB, 6) == 0);
+
+    // The block it carved frees and coalesces like any other.
+    t.free(0);
+    REQUIRE(t.block_census().size() == 1 && t.check_invariants());
+
+    std::cout << "test_allocate_at_carves_exact: PASSED\n";
+}
+
+// Every refusal returns SIZE_MAX and changes nothing.
+static void test_allocate_at_refusals() {
+    test_arena       arena(16 * ONE_MB);
+    tlsf_allocator & t = *arena.alloc;
+    REQUIRE(t.allocate_at(4 * ONE_MB, ONE_MB, 3) == 4 * ONE_MB);
+    REQUIRE(t.allocate_at(8 * ONE_MB, ONE_MB, 3) == 8 * ONE_MB);
+    const auto   before = t.block_census();
+    const size_t used   = t.used();
+
+    REQUIRE(t.allocate_at(3 * ONE_MB, 2 * ONE_MB, 1) == SIZE_MAX && "a range reaching into an allocated block");
+    REQUIRE(t.allocate_at(4 * ONE_MB, ONE_MB, 1) == SIZE_MAX && "an allocated range");
+    REQUIRE(t.allocate_at(5 * ONE_MB - 256, 512, 1) == SIZE_MAX && "a range straddling a free and an allocated block");
+    REQUIRE(t.allocate_at(2 * ONE_MB, 8 * ONE_MB, 1) == SIZE_MAX &&
+            "a range across two free blocks and the one between");
+    REQUIRE(t.allocate_at(6 * ONE_MB + 100, 256, 1) == SIZE_MAX && "an off-grain offset");
+    REQUIRE(t.allocate_at(6 * ONE_MB, 0, 1) == SIZE_MAX && "a zero size");
+    REQUIRE(t.allocate_at(16 * ONE_MB, 256, 1) == SIZE_MAX && "an offset at the region end");
+    REQUIRE(t.allocate_at(16 * ONE_MB - 256, 512, 1) == SIZE_MAX && "a range past the region end");
+    REQUIRE(t.allocate_at(SIZE_MAX - 255, 512, 1) == SIZE_MAX && "an offset that wraps");
+    REQUIRE(t.allocate_at(6 * ONE_MB, SIZE_MAX, 1) == SIZE_MAX && "a size that wraps");
+
+    const auto after = t.block_census();
+    REQUIRE(after.size() == before.size() && t.used() == used);
+    for (size_t i = 0; i < before.size(); ++i) {
+        REQUIRE(before[i].offset == after[i].offset && before[i].size == after[i].size &&
+                before[i].free == after[i].free);
+    }
+    REQUIRE(t.check_invariants());
+    std::cout << "test_allocate_at_refusals: PASSED\n";
+}
+
+// A back remainder under MIN_BLOCK_SIZE (an off-grid region end) is absorbed
+// into the carved block, as carve_gap does, and the sizes still tile.
+static void test_allocate_at_absorbs_sub_min_remainder() {
+    tlsf_allocator t(1000);
+    REQUIRE(t.block_census().size() == 1);
+    REQUIRE(t.allocate_at(256, 512, 2) == 256);
+    REQUIRE(t.check_invariants());
+    // 1000 - 256 - 512 = 232 < 256: absorbed into the carved block.
+    REQUIRE(t.block_size_at(256) == 744);
+    REQUIRE(t.used() == 744);
+    const auto c = t.block_census();
+    REQUIRE(c.size() == 2 && c[0].free && c[0].size == 256 && !c[1].free);
+    t.free(256);
+    REQUIRE(t.block_census().size() == 1 && t.check_invariants());
+    std::cout << "test_allocate_at_absorbs_sub_min_remainder: PASSED\n";
+}
+
+// allocate_excluding is first fit by offset over the parts of free blocks that
+// lie outside every excluded range.
+static void test_allocate_excluding_geometry() {
+    test_arena       arena(16 * ONE_MB);
+    tlsf_allocator & t = *arena.alloc;
+    using R            = tlsf_allocator::excluded_range;
+
+    // A range at the low end: the first fit starts above it.
+    REQUIRE(t.allocate_excluding(
+                {
+                    R{ 0, 4 * ONE_MB }
+    },
+                ONE_MB, 256, 1) == 4 * ONE_MB);
+    REQUIRE(t.check_invariants());
+    // A gap whose top is a range still serves below it, and the free block the
+    // range cuts is not split at its boundary.
+    REQUIRE(t.allocate_excluding(
+                {
+                    R{ 0,          4 * ONE_MB },
+                    R{ 6 * ONE_MB, 2 * ONE_MB }
+    },
+                ONE_MB, 256, 1) == 5 * ONE_MB);
+    REQUIRE(t.check_invariants());
+    // A request that fits only across a range misses.
+    REQUIRE(t.allocate_excluding(
+                {
+                    R{ 0,          4 * ONE_MB },
+                    R{ 6 * ONE_MB, 2 * ONE_MB }
+    },
+                2 * ONE_MB, 256, 1) == 8 * ONE_MB);
+    REQUIRE(t.allocate_excluding(
+                {
+                    R{ 0,           4 * ONE_MB },
+                    R{ 10 * ONE_MB, 6 * ONE_MB }
+    },
+                3 * ONE_MB, 256, 1) == SIZE_MAX);
+    REQUIRE(t.check_invariants());
+    t.reset();
+
+    // A free block a range cuts keeps its remainders whole: the carve below the
+    // range leaves one free block that STRADDLES it, so no two free blocks are
+    // adjacent.
+    REQUIRE(t.allocate_excluding(
+                {
+                    R{ 8 * ONE_MB, 4 * ONE_MB }
+    },
+                ONE_MB, 256, 1) == 0);
+    auto c = t.block_census();
+    REQUIRE(c.size() == 2 && !c[0].free && c[1].free && c[1].offset == ONE_MB && c[1].size == 15 * ONE_MB);
+    REQUIRE(t.check_invariants());
+
+    // Overlapping, unsorted, off-grain ranges: the end of the union decides.
+    t.reset();
+    REQUIRE(t.allocate_excluding(
+                {
+                    R{ 3 * ONE_MB, ONE_MB           },
+                    R{ 0,          2 * ONE_MB + 100 },
+                    R{ ONE_MB,     3 * ONE_MB       }
+    },
+                256, 256, 1) == 4 * ONE_MB);
+    // An off-grain range end rounds UP to the next grain: that offset is the candidate.
+    t.reset();
+    REQUIRE(t.allocate_excluding(
+                {
+                    R{ 0, 2 * ONE_MB + 100 }
+    },
+                256, 256, 1) == 2 * ONE_MB + 256);
+    // No exclusion is plain first fit; an empty size is refused.
+    t.reset();
+    REQUIRE(t.allocate_excluding({}, ONE_MB, 256, 1) == 0);
+    REQUIRE(t.allocate_excluding({}, 0, 256, 1) == SIZE_MAX);
+    REQUIRE(t.check_invariants());
+
+    std::cout << "test_allocate_excluding_geometry: PASSED\n";
+}
+
+// allocate_excluding against an interval model: the offset it returns is the
+// lowest one a brute-force scan over the grain finds, over random layouts.
+static void test_allocate_excluding_interval_model() {
+    uint32_t seed = 4242u;
+    auto     rnd  = [&]() {
+        seed = seed * 1664525u + 1013904223u;
+        return seed >> 8;
+    };
+    constexpr size_t grain = 256;
+    constexpr size_t nblk  = 256;  // a 64 KB region
+    for (int round = 0; round < 200; ++round) {
+        tlsf_allocator    t(nblk * grain);
+        std::vector<bool> used(nblk, false);
+        for (int i = 0; i < 12; ++i) {
+            const size_t at = rnd() % nblk;
+            const size_t n  = 1 + rnd() % 8;
+            if (at + n > nblk) {
+                continue;
+            }
+            bool clear = true;
+            for (size_t k = at; k < at + n; ++k) {
+                clear = clear && !used[k];
+            }
+            const size_t got = t.allocate_at(at * grain, n * grain, 1);
+            REQUIRE((got != SIZE_MAX) == clear && "allocate_at succeeds exactly when the range is free");
+            if (clear) {
+                for (size_t k = at; k < at + n; ++k) {
+                    used[k] = true;
+                }
+            }
+        }
+        std::vector<tlsf_allocator::excluded_range> ex;
+        std::vector<bool>                           barred = used;
+        for (int i = 0; i < 4; ++i) {
+            const size_t at = rnd() % nblk;
+            const size_t n  = 1 + rnd() % 40;
+            ex.push_back({ at * grain, n * grain });
+            for (size_t k = at; k < at + n && k < nblk; ++k) {
+                barred[k] = true;
+            }
+        }
+        const size_t n    = 1 + rnd() % 10;
+        size_t       want = SIZE_MAX;
+        for (size_t at = 0; at + n <= nblk && want == SIZE_MAX; ++at) {
+            bool ok = true;
+            for (size_t k = at; k < at + n; ++k) {
+                ok = ok && !barred[k];
+            }
+            if (ok) {
+                want = at * grain;
+            }
+        }
+        REQUIRE(t.allocate_excluding(ex, n * grain, 256, 2) == want && "the lowest offset outside every range");
+        REQUIRE(t.check_invariants());
+    }
+    std::cout << "test_allocate_excluding_interval_model: PASSED\n";
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 int main() {
@@ -1183,6 +1404,11 @@ int main() {
     test_block_census_random_mix();
     test_block_census_is_read_only();
     test_block_census_degenerate();
+    test_allocate_at_carves_exact();
+    test_allocate_at_refusals();
+    test_allocate_at_absorbs_sub_min_remainder();
+    test_allocate_excluding_geometry();
+    test_allocate_excluding_interval_model();
 
     std::cout << "\nAll tlsf_allocator tests PASSED!\n";
     return 0;

@@ -2003,6 +2003,22 @@ set_tests_properties(sycl-kv-geometry-census PROPERTIES
     TIMEOUT 60
 )
 
+# Pending-range primitive (llama.cpp-moua L4): pending-range.hpp is the
+# term-filtered record/clear/retag set, the draws inside an owner's ranges, the
+# keyed WEIGHT draw, replace_within's block core and the device-wide queries,
+# over tlsf_allocator's allocate_at / allocate_excluding. Header-only, SYCL-free.
+add_executable(test-pending-range
+    tests/test-pending-range.cpp
+)
+target_include_directories(test-pending-range PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME sycl-pending-range COMMAND test-pending-range)
+set_tests_properties(sycl-pending-range PROPERTIES
+    LABELS "sycl;kv;hostonly"
+    TIMEOUT 60
+)
+
 # Host-weight create-set record (llama.cpp-moua L4 1c; th32pre test 1r):
 # host-create-record.hpp is the one wire converter, the thread-local pending slot
 # and the stage-scoped holder. Header-only; it includes ggml-sycl.h for the wire

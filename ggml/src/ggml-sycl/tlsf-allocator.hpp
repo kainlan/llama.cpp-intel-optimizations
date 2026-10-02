@@ -171,6 +171,158 @@ class tlsf_allocator {
         return census;
     }
 
+    // ------------------------------------------------------------------
+    // Exact and range-excluding placement (llama.cpp-moua L4, pending-range
+    // primitive; moua design 2.3.3).
+    //
+    // The planner chooses offsets and the carve must take exactly those
+    // offsets, so fit == carve is a property of the primitive and not of two
+    // search policies agreeing.  Both calls round the size like allocate()
+    // (a multiple of MIN_BLOCK_SIZE), require every offset to sit on the
+    // block grain, and return SIZE_MAX, changing nothing, on any failure.
+    // Group-mutex-only, like every member.  A host-tier caller never reaches
+    // them: they place device-zone blocks.
+    //
+    // allocate_at(offset, size, tag): the block [offset, offset + size).  The
+    // range must lie wholly inside ONE free block (a range across two blocks
+    // is refused: free blocks are never adjacent, so a range that spans two
+    // spans an allocated block).  The free block's front and back remainders
+    // go back on the free lists as whole blocks; a remainder under
+    // MIN_BLOCK_SIZE (only possible at an off-grid region end) is absorbed
+    // into the carved block, by the rule carve_gap() uses.
+    //
+    // allocate_excluding(excluded, size, alignment, tag): the lowest offset at
+    // which a block of `size` lies inside one free block and is disjoint from
+    // every excluded range, carved with allocate_at() semantics.  It excludes
+    // RANGES, not blocks: a free block an excluded range cuts is usable in its
+    // parts outside the ranges, and its remainders stay whole free blocks that
+    // may straddle a range (the exclusion is enforced at allocation time, and
+    // splitting a free block at the boundary would leave two adjacent free
+    // blocks, which check_invariants() rejects).  Excluded ranges may overlap
+    // each other and need not be sorted or on the grain.
+    // ------------------------------------------------------------------
+    struct excluded_range {
+        size_t offset;
+        size_t size;
+    };
+
+    size_t allocate_at(size_t offset, size_t size, uint8_t tag = 0) {
+        if (size == 0 || (offset % MIN_BLOCK_SIZE) != 0 || size > SIZE_MAX - MIN_BLOCK_SIZE) {
+            return SIZE_MAX;
+        }
+        size = (size + MIN_BLOCK_SIZE - 1) & ~(MIN_BLOCK_SIZE - 1);
+        if (offset > SIZE_MAX - size) {
+            return SIZE_MAX;
+        }
+        int id = last_block_;
+        while (id >= 0 && blocks_[id].offset > offset) {
+            id = blocks_[id].prev_block;
+        }
+        if (id < 0 || !blocks_[id].free || offset + size > blocks_[id].offset + blocks_[id].size) {
+            return SIZE_MAX;
+        }
+        remove_free(id);
+        const size_t front = offset - blocks_[id].offset;
+        if (front > 0) {
+            // Read values before alloc_block_id(): it may reallocate blocks_.
+            const size_t block_offset = blocks_[id].offset;
+            const size_t block_size   = blocks_[id].size;
+            const int    block_next   = blocks_[id].next_block;
+            const int    mid_id       = alloc_block_id();
+            auto &       mid          = blocks_[mid_id];
+            mid.offset                = block_offset + front;
+            mid.size                  = block_size - front;
+            mid.free                  = true;
+            mid.prev_block            = id;
+            mid.next_block            = block_next;
+            mid.prev_free             = -1;
+            mid.next_free             = -1;
+            mid.tag                   = 0;
+            if (block_next >= 0) {
+                blocks_[block_next].prev_block = mid_id;
+            } else {
+                last_block_ = mid_id;
+            }
+            blocks_[id].size       = front;
+            blocks_[id].next_block = mid_id;
+            insert_free(id);
+            id = mid_id;
+        }
+        blocks_[id].free = false;
+        blocks_[id].tag  = tag;
+        split_block(id, size);
+        used_ += blocks_[id].size;
+        offset_to_block_[blocks_[id].offset] = id;
+        TLSF_ASSERT(blocks_[id].offset == offset && "allocate_at moved the block it was asked to place");
+        return offset;
+    }
+
+    size_t allocate_excluding(const std::vector<excluded_range> & excluded,
+                              size_t                              size,
+                              size_t                              alignment = 256,
+                              uint8_t                             tag       = 0) {
+        if (size == 0) {
+            return SIZE_MAX;
+        }
+        const size_t granularity = alignment > MIN_BLOCK_SIZE ? alignment : MIN_BLOCK_SIZE;
+        if (size > SIZE_MAX - granularity) {
+            return SIZE_MAX;
+        }
+        size = (size + granularity - 1) & ~(granularity - 1);
+        TLSF_ASSERT(alignment <= MIN_BLOCK_SIZE && "TLSF only supports alignment <= MIN_BLOCK_SIZE (256)");
+        std::vector<int> free_ids;
+        for (int id = last_block_; id >= 0; id = blocks_[id].prev_block) {
+            if (blocks_[id].free) {
+                free_ids.push_back(id);
+            }
+        }
+        // free_ids is highest first; the first fit is the lowest offset.
+        for (size_t i = free_ids.size(); i-- > 0;) {
+            const size_t        begin = blocks_[free_ids[i]].offset;
+            const size_t        end   = begin + blocks_[free_ids[i]].size;
+            // The candidate offsets are the block's start and the grain-rounded end of each excluded range
+            // that lies inside it; anything between two of them is covered by the earlier candidate's check.
+            std::vector<size_t> starts;
+            starts.push_back(begin);
+            for (const excluded_range & r : excluded) {
+                if (r.size == 0 || r.offset > SIZE_MAX - r.size) {
+                    continue;
+                }
+                const size_t r_end = r.offset + r.size;
+                if (r_end > SIZE_MAX - (MIN_BLOCK_SIZE - 1)) {
+                    continue;
+                }
+                const size_t s = (r_end + MIN_BLOCK_SIZE - 1) & ~(MIN_BLOCK_SIZE - 1);
+                if (s > begin && s < end) {
+                    starts.push_back(s);
+                }
+            }
+            std::sort(starts.begin(), starts.end());
+            for (const size_t s : starts) {
+                if (s + size > end) {
+                    break;
+                }
+                bool clear = true;
+                for (const excluded_range & r : excluded) {
+                    if (r.size != 0 && r.offset < s + size && s < r.offset + r.size) {
+                        clear = false;
+                        break;
+                    }
+                }
+                if (clear) {
+                    return allocate_at(s, size, tag);
+                }
+            }
+        }
+        return SIZE_MAX;
+    }
+
+    // Size of the allocated block at `offset`; 0 for a free or unknown offset.
+    size_t block_size_at(size_t offset) const {
+        auto it = offset_to_block_.find(offset);
+        return it != offset_to_block_.end() ? blocks_[it->second].size : 0;
+    }
+
     // No header overhead in the managed region (metadata is external).
     static constexpr size_t header_overhead() { return 0; }
 
