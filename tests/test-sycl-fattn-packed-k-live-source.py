@@ -550,7 +550,14 @@ def cmake_contract(source: str) -> bool:
     # The guard must close right after the registration loop. Without this, deleting that `endif()` leaves
     # the guard open and guarded_cmake_block() runs on to whichever later `endif()` balances the count, so
     # every needle above is still found in an over-long block and the mutation survives.
+    # The private seams the test drives (failpoints, fill/profile error injection) compile in only under
+    # GGML_SYCL_PRIVATE_TESTING, so the live target must carry it in its own compile definitions: without it
+    # the checkpoints are silently inert and the test skips or passes without reaching them.
+    private_testing = re.search(
+        r"target_compile_definitions\(test-fattn-packed-k-lifecycle PRIVATE [^)]*\bGGML_SYCL_PRIVATE_TESTING=1\b",
+        block)
     return (all(needle in block for needle in required) and
+            private_testing is not None and
             all(cp in block for cp in CHECKPOINTS) and
             block.endswith("endforeach() endif()") and
             source.count("find_library(LEVEL_ZERO_LOADER") == 1)
@@ -794,3 +801,7 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
     assert not cmake_contract(
         replace_unique(CMAKE, "find_library(LEVEL_ZERO_LOADER", "find_library(MUTATED_LOADER"))
     assert not cmake_contract(replace_in_packed_k_block(CMAKE, " ${LEVEL_ZERO_LOADER})", ")"))
+    # L4: the live target no longer compiles the private seams in.
+    assert not cmake_contract(
+        replace_in_packed_k_block(CMAKE, "GGML_SYCL_PRIVATE_TESTING=1", "GGML_SYCL_PRIVATE_TESTING=0"))
+    assert not cmake_contract(replace_in_packed_k_block(CMAKE, "    GGML_SYCL_PRIVATE_TESTING=1\n", ""))
