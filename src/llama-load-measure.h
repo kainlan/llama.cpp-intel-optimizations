@@ -3,9 +3,14 @@
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
+#include "llama-auto-ubatch.h"
+#include "llama-context-tenant.h"
+#include "llama.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -19,6 +24,15 @@
 // The measure itself and the late check are in llama-context.cpp.
 
 struct llama_model;
+struct llama_measure_context_args;
+
+// A model the load-time measure cannot measure, by name: a memory kind with no no_alloc form, an
+// architecture that needs a second context, a model with an encoder graph. It is not a failure and not a
+// refusal of the load: the measure returns it as `unsupported`, and the load goes on the unplanned path with
+// one WARN that names it. Anything else a measure throws is a failure of the measure and refuses the load.
+struct llama_measure_unsupported : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 // The two backend entry points the plan-override guard calls, taken together from one function so a
 // missing one is a named refusal and an override can never be installed without its clear.
@@ -144,40 +158,131 @@ class llama_measure_dummy_scope {
     bool                               failed_ = false;
 };
 
+// The text of every refusal of a load-time measure, in one place:
+//   [LOAD-PLAN] compute-slot measure failed at <probe|admitted|late> on device %d: <reason> (refused)
+inline const char * llama_load_measure_stage_name(enum ggml_sycl_measure_stage stage) {
+    switch (stage) {
+        case GGML_SYCL_MEASURE_STAGE_PROBE:
+            return "probe";
+        case GGML_SYCL_MEASURE_STAGE_CANDIDATE_B:
+            return "admitted";
+        case GGML_SYCL_MEASURE_STAGE_CANDIDATE_C:
+            return "late";
+    }
+    return "unknown";
+}
+
+inline std::string llama_load_measure_refusal_text(enum ggml_sycl_measure_stage stage,
+                                                   int                          device,
+                                                   const std::string &          reason) {
+    return std::string("[LOAD-PLAN] compute-slot measure failed at ") + llama_load_measure_stage_name(stage) +
+           " on device " + std::to_string(device) + ": " + reason + " (refused)";
+}
+
+// The shape a load-time measure uses: n_ubatch is the auto ladder's bottom rung (the smallest ubatch any
+// context of this load can end up with, from the helper the real context's trial reads), and the caller's
+// n_ctx, the training context for 0; every other parameter is the default.
+inline llama_context_params llama_load_measure_context_params(uint32_t n_ctx, uint32_t n_ctx_train) {
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx                = n_ctx != 0 ? n_ctx : n_ctx_train;
+    params.n_ubatch             = llama_auto_ubatch_ladder[0];
+    params.n_batch              = std::max(params.n_batch, params.n_ubatch);
+    return params;
+}
+
 // The measured compute term of one device buft (or of the host buft, `host`): the chunk cap the
 // scope answered, each chunk's planned size, and their total.
 struct llama_load_measure_device {
     int32_t             device = -1;  // the post-selector SYCL device index; -1 for the host buft
     bool                host   = false;
-    std::vector<size_t> chunk_bytes;  // one per gallocr chunk
-    size_t              total = 0;
+    std::vector<size_t> chunk_bytes;  // llama_measure_peak_per_chunk(): the peak of each gallocr chunk
+    size_t              total = 0;    // llama_measure_peak_total(chunk_bytes)
     size_t              cap   = 0;    // the largest chunk the scope allowed
 };
 
 struct llama_load_measure_result {
-    bool                                   ok = false;
-    std::string                            refusal;       // the named refusal when !ok
+    bool                                   ok          = false;
+    bool                                   unsupported = false;  // !ok because the model cannot be measured
+    std::string                            refusal;              // the named refusal when !ok
     std::vector<llama_load_measure_device> devices;
-    int                                    n_splits = 0;  // the most splits any measured graph took
+    int                                    n_splits = 0;         // the most splits any measured graph took
 };
 
+// Why this model cannot be measured by a measure-only context, or "": an encoder graph is not walked, and
+// an architecture that needs ctx_other has none to read. (A memory kind with no no_alloc form is named by
+// create_memory, which throws llama_measure_unsupported for it.)
+std::string llama_measure_unsupported_reason(const llama_model & model);
+
+// The measure over a caller-built set of backends. The backends are in `args` until the context's
+// constructor takes them (a model refused by shape never gets that far, and the caller keeps them); from
+// then on the context owns them and frees them with itself. The plan override (installed before the context
+// is constructed) is declared after the context's holder, so on a normal exit it clears first and the
+// context, backends included, goes after; on a throw from the constructor the context has already unwound
+// and the override clears next. A throw from the constructor, a status that is not OK and a missing proc
+// come back as the one refusal text; a llama_measure_unsupported comes back as `unsupported`.
+llama_load_measure_result llama_load_measure_run(const llama_model &                  model,
+                                                 llama_measure_context_args &         args,
+                                                 const llama_measure_override_procs & procs,
+                                                 uint32_t                             n_ctx,
+                                                 uint64_t                             load_txn,
+                                                 enum ggml_sycl_measure_stage         stage,
+                                                 int                                  first_device);
+
 // The measure at `stage` for the load `load_txn`, over `model`'s placement (the plan override names the
-// plan; the model's dev_layer and weight buffers are what the placement is). `n_ctx` is the envelope's
-// (0: the model's training context), n_ubatch is the auto ladder's bottom rung and every other cparam is
-// the default. A throw from the measure or a refusal of any kind comes back as
-//   [LOAD-PLAN] compute-slot measure failed at <probe|admitted|late> on device %d: <reason> (refused)
-// and never as a missing term. A model with no SYCL device measures nothing and is ok with no devices.
+// plan; the model's dev_layer and weight buffers are what the placement is). A model with no SYCL device
+// measures nothing and is ok with no devices.
 llama_load_measure_result llama_load_measure(const llama_model &          model,
                                              uint32_t                     n_ctx,
                                              uint64_t                     load_txn,
                                              enum ggml_sycl_measure_stage stage);
 
+// What the backend said of each device's term at the late stage, and what the load does with it.
+struct llama_late_check_result {
+    std::string          refusal;           // non-empty: the load is refused, by this named text
+    std::string          unsupported;       // non-empty: the model cannot be measured; the load goes on, with a WARN
+    bool                 checked  = false;  // the L4 entry points exist and a measure ran
+    uint32_t             n_ubatch = 0;      // the measure's ubatch
+    std::vector<int32_t> not_recorded;      // devices with no early term to compare: NOT a pass
+    std::vector<int32_t> shrunk;            // devices admitted at a smaller term than the early stage's
+};
+
+// Folds the measured devices through the backend's late check. A device the backend recorded nothing for
+// stays in `not_recorded`; it is never read as EQUAL. The first REFUSED ends the fold with the named refusal
+// (the backend has logged its own canonical line). The host tier is skipped: the backend's entry point takes a
+// SYCL device index, and no host term is recorded at the early stage today.
+inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs &                    procs,
+                                                     struct ggml_sycl_load_txn                      txn,
+                                                     const std::vector<llama_load_measure_device> & devices) {
+    llama_late_check_result out;
+    out.checked = true;
+    for (const auto & d : devices) {
+        if (d.host) {
+            continue;
+        }
+        switch (llama_sycl_l4_late_check(procs, txn, d.device, d.total)) {
+            case GGML_SYCL_LATE_CHECK_EQUAL:
+                break;
+            case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED:
+                out.shrunk.push_back(d.device);
+                break;
+            case GGML_SYCL_LATE_CHECK_REFUSED:
+                out.refusal =
+                    llama_load_measure_refusal_text(GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, d.device,
+                                                    "the final placement needs more compute than the admitted term");
+                return out;
+            case GGML_SYCL_LATE_CHECK_NOT_RECORDED:
+                out.not_recorded.push_back(d.device);
+                break;
+        }
+    }
+    return out;
+}
+
 // The late check (stage (c)): after the dev_layer sync and before the mappings are initialised, measure
 // the load's final placement over the real weights' dummies and hand each device's term to the backend.
-// Returns "" when the load may go on and the named refusal when it may not. It measures only when the
-// backend exports all three L4 entry points: without them no c(P) was recorded and there is nothing to
-// compare, so the call is inert.
-std::string llama_load_late_check(const llama_model &                            model,
-                                  uint32_t                                       n_ctx,
-                                  struct ggml_sycl_load_txn                      txn,
-                                  const std::vector<llama_measure_dummy_entry> & weights);
+// It measures only when the backend exports all three L4 entry points: without them no c(P) was recorded
+// and there is nothing to compare, so the call is inert (checked == false).
+llama_late_check_result llama_load_late_check(const llama_model &                            model,
+                                              uint32_t                                       n_ctx,
+                                              struct ggml_sycl_load_txn                      txn,
+                                              const std::vector<llama_measure_dummy_entry> & weights);

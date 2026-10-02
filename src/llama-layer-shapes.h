@@ -9,14 +9,23 @@
 #include <string>
 #include <vector>
 
-// The one source of the memory's layer layout (zhcn C7g, moua L4 "On the llama side, one function
+// The shapes the memory's layer layout is published as (zhcn C7g, moua L4 "On the llama side, one function
 // produces the shape").
 //
 // Which memory a model gets, and which layers each of its caches holds, is decided once, by
-// llama_model::memory_policy(). llama_model::create_memory builds from that policy and the caches decide
-// each layer through llama_kv_layer_decide(), and llama_kv_layer_shapes() / llama_rs_layer_shapes() read
-// the same two, so the shapes handed to the SYCL backend at publish cannot differ from what the memory
-// creates. tests/test-layer-shapes.cpp compares them against the tensors of every kind it can build.
+// llama_model::memory_policy(). llama_model::create_memory builds from that policy.
+//
+//   KV layers         one source: the caches decide each layer through llama_kv_layer_decide(), and
+//                     llama_kv_layer_shapes() reads the same function, so the two cannot differ.
+//   recurrent layers  two statements of one rule: llama_memory_recurrent's constructor writes its own
+//                     ggml_new_tensor_2d(type, hparams.n_embd_r() / n_embd_s(), n_rows) calls, and
+//                     llama_rs_layer_shapes_for() restates the policy filter, the row count and the
+//                     widths. Nothing in the build ties them; tests/test-layer-shapes.cpp does, by
+//                     comparing every published layer with the r/s tensors the memory created
+//                     (extent, element type and row count), and it counts the layers it compared so a run
+//                     that compared none fails.
+//
+// tests/test-layer-shapes.cpp compares both against the tensors of every kind it can build.
 
 struct llama_model;
 

@@ -2699,10 +2699,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
             late_weights.push_back({ ctx_key.buft, ctx_ptr.get() });
         }
-        const std::string late_refusal = llama_load_late_check(*this, llama_model_sycl_make_placement_envelope().n_ctx,
-                                                               sycl_model_loading_guard.txn, late_weights);
-        if (!late_refusal.empty()) {
-            throw std::runtime_error(late_refusal);
+        const llama_late_check_result late = llama_load_late_check(
+            *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, late_weights);
+        if (!late.unsupported.empty()) {
+            // not a refusal of the load: this model cannot be measured, so it goes on the unplanned path
+            LLAMA_LOG_WARN("%s: late compute-slot check skipped, the load continues on the unplanned path: %s\n",
+                           __func__, late.unsupported.c_str());
+        }
+        for (const int32_t device : late.not_recorded) {
+            // nothing was compared for this device, which is not a pass
+            LLAMA_LOG_WARN(
+                "%s: [LOAD-PLAN] late check on device %d: no early compute term was recorded for this load, "
+                "nothing was compared (ubatch %u)\n",
+                __func__, (int) device, late.n_ubatch);
+        }
+        if (!late.refusal.empty()) {
+            throw std::runtime_error(late.refusal);
         }
     }
     if (sycl_model_backend && ml.use_mmap) {
@@ -3517,7 +3529,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
     if (no_alloc) {
         if (const char * name = llama_memory_kind_unsupported(pol.kind)) {
-            throw std::runtime_error(format("memory kind %s has no no_alloc form (refused)", name));
+            throw llama_measure_unsupported(
+                format("memory kind %s has no no_alloc form (arch %s; refused)", name, arch_name().c_str()));
         }
     }
 

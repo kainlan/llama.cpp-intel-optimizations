@@ -1358,8 +1358,12 @@ struct ggml_sycl_runtime_context_probe {
 // between this entry check and that in-lock re-check), returns
 // GGML_SYCL_LIFECYCLE_BUSY, not STALE_IDENTITY -- it is a race a caller's
 // retry can resolve, unlike the entry check's own refusal.
-// GGML_SYCL_LIFECYCLE_BUSY (round 1 F6; round 4 Q3) means the caller MAY
-// retry: a live-update lease could not be acquired, the plan changed while
+// GGML_SYCL_LIFECYCLE_BUSY (round 1 F6; round 4 Q3) means this call did not
+// take effect and the caller re-attempts it at its NEXT boundary, never by
+// waiting in place (llama: the reserve transaction runs again, publish
+// included, at the next decode or encode, which returns -2 meanwhile and
+// never computes without a published runtime context): a live-update lease
+// could not be acquired, the plan changed while
 // acquiring the transaction lock, the module mutation guard refused, the
 // published plan's identity changed between this probe's entry check and
 // the transaction's in-lock re-check (the STALE_IDENTITY-shaped race just
@@ -1388,14 +1392,13 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime
 // llama.cpp-oyfl: re-evaluates ONLY the non-FA attention scratch guard,
 // against the CURRENTLY PUBLISHED plan's shape --
 // no KV replan, no MoE MMID reaccount/materialize, no plan republish, no
-// BUSY retry. For a caller whose n_ctx/n_ubatch have not changed and only
+// BUSY re-attempt. For a caller whose n_ctx/n_ubatch have not changed and only
 // flash_attn_enabled has (an AUTO llama_flash_attn_type resolving after
 // ggml_backend_sycl_set_runtime_context_for_model()'s own initial call
 // above already ran with an unresolved, optimistic `true`): re-running the
 // full transaction would touch KV/MMID state that has no reason to change
-// and would retry the same deterministic decision under BUSY backoff for
-// no benefit. GGML_SYCL_LIFECYCLE_STALE_IDENTITY if the model token does
-// not match the currently published plan; GGML_SYCL_LIFECYCLE_PLAN_REJECTED
+// and would re-run the same deterministic decision for no benefit.
+// GGML_SYCL_LIFECYCLE_STALE_IDENTITY if the model token does not match the currently published plan; GGML_SYCL_LIFECYCLE_PLAN_REJECTED
 // if the guard refuses (same message and arithmetic as the full
 // transaction's own check).
 //

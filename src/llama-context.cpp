@@ -737,6 +737,15 @@ llama_context::llama_context(
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
     measure_only = measure != nullptr;
 
+    // A model the measure cannot walk is refused by name, before anything is built. llama_load_measure
+    // asks the same question first and returns it as `unsupported`; this is the constructor's own guard.
+    if (measure_only) {
+        const std::string unsupported = llama_measure_unsupported_reason(model);
+        if (!unsupported.empty()) {
+            throw llama_measure_unsupported(unsupported);
+        }
+    }
+
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     if (!measure_only) {
@@ -1530,6 +1539,9 @@ sched_reserve_result llama_context::sycl_publish_runtime_context(bool flash_attn
                 LLAMA_LOG_ERROR(
                     "[CONTEXT-PLAN-BUG] publish answered BUSY under the replan scope: module guard drifted\n");
             }
+            // Not OK is mapped by value and never waited on. The caller (sched_reserve_nothrow) leaves
+            // sched_need_reserve set, so the next decode or encode runs the whole transaction again,
+            // this publish included; until one succeeds no graph is computed (decode and encode return -2).
             if (rc != GGML_SYCL_LIFECYCLE_OK) {
                 return { sched_reserve_status::REFUSED,
                          format("failed to activate exact SYCL model plan: result=%d", (int) rc) };
@@ -2414,6 +2426,8 @@ bool llama_context::sched_reserve_nothrow() {
         LLAMA_LOG_ERROR("%s: %s\n", __func__, result.reason.c_str());
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown exception\n", __func__);
     }
 
     // The scheduler is no longer reserved for the graphs decode builds, so the
@@ -2484,19 +2498,11 @@ sched_reserve_result llama_context::sched_reserve_transaction() {
     return sched_reserve_impl(sched_reserve_mode::ALLOC, state);
 }
 
-// The planned sizes of the chunks of the measured graph that needed the most, which is the
-// compute term a slot of this buft has to cover.
-static void llama_context_worst_chunks(const sched_measure_buft & entry, llama_tenant_buft_caps & c) {
-    for (const auto & graph : entry.peaks) {
-        size_t sum = 0;
-        for (size_t p : graph) {
-            sum += p;
-        }
-        if (sum >= c.total) {
-            c.chunk_bytes = graph;
-            c.total       = sum;
-        }
-    }
+// The compute term of one buft: the peak of each chunk over the measured graphs, from the one helper
+// every consumer reads (llama-measure-plan.h), and their sum.
+static void llama_context_peak_chunks(const sched_measure_buft & entry, llama_tenant_buft_caps & c) {
+    c.chunk_bytes = llama_measure_peak_per_chunk(entry.peaks);
+    c.total       = llama_measure_peak_total(c.chunk_bytes);
 }
 
 std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sched_measure_plan & plan) const {
@@ -2513,7 +2519,7 @@ std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sch
                     c.host   = false;
                     c.cap    = entry.cap;
                     c.max_chunk_size = entry.max_chunk_size;
-                    llama_context_worst_chunks(entry, c);
+                    llama_context_peak_chunks(entry, c);
                     out.push_back(c);
                     break;
                 }
@@ -2532,7 +2538,7 @@ std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sch
                 c.host   = true;
                 c.cap    = entry.cap;
                 c.max_chunk_size = entry.max_chunk_size;
-                llama_context_worst_chunks(entry, c);
+                llama_context_peak_chunks(entry, c);
                 out.push_back(c);
                 break;
             }
@@ -3067,23 +3073,77 @@ static ggml_backend_t llama_context_sycl_measure_backend_init(ggml_backend_dev_t
 }
 #endif
 
-static const char * llama_load_measure_stage_name(enum ggml_sycl_measure_stage stage) {
-    switch (stage) {
-        case GGML_SYCL_MEASURE_STAGE_PROBE:
-            return "probe";
-        case GGML_SYCL_MEASURE_STAGE_CANDIDATE_B:
-            return "admitted";
-        case GGML_SYCL_MEASURE_STAGE_CANDIDATE_C:
-            return "late";
+std::string llama_measure_unsupported_reason(const llama_model & model) {
+    if (llama_model_has_encoder(&model)) {
+        return format("%s has an encoder graph the load-time measure does not walk", model.arch_name().c_str());
     }
-    return "unknown";
+    const bool needs_other =
+        model.arch == LLM_ARCH_GEMMA4_ASSISTANT || ((model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) &&
+                                                    (model.tok_embd == nullptr || model.output == nullptr));
+    if (needs_other) {
+        return format("%s needs ctx_other, which a load-time measure has none of", model.arch_name().c_str());
+    }
+    return "";
 }
 
-static std::string llama_load_measure_refusal(enum ggml_sycl_measure_stage stage,
-                                              int                          device,
-                                              const std::string &          reason) {
-    return format("[LOAD-PLAN] compute-slot measure failed at %s on device %d: %s (refused)",
-                  llama_load_measure_stage_name(stage), device, reason.c_str());
+llama_load_measure_result llama_load_measure_run(const llama_model &                  model,
+                                                 llama_measure_context_args &         args,
+                                                 const llama_measure_override_procs & procs,
+                                                 uint32_t                             n_ctx,
+                                                 uint64_t                             load_txn,
+                                                 enum ggml_sycl_measure_stage         stage,
+                                                 int                                  first_device) {
+    llama_load_measure_result out;
+
+    if (const std::string why = llama_measure_unsupported_reason(model); !why.empty()) {
+        out.unsupported = true;
+        out.refusal     = llama_load_measure_refusal_text(stage, first_device, why);
+        return out;
+    }
+
+    // Declaration order is the unwind order: the override is declared after the holder, so on a normal
+    // exit it clears first and the context (which owns the backends once its constructor has taken them
+    // from `args`) goes after; on a throw from the constructor the context has already unwound, and the
+    // override clears next.
+    std::unique_ptr<llama_context> holder;
+    llama_measure_plan_override    guard(procs, load_txn, stage);
+    if (!guard.installed()) {
+        out.refusal = llama_load_measure_refusal_text(stage, first_device, guard.failure());
+        return out;
+    }
+
+    args.stage = stage;
+
+    const llama_context_params params = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train);
+    try {
+        holder.reset(new llama_context(model, params, &args));
+    } catch (const llama_measure_unsupported & e) {
+        out.unsupported = true;
+        out.refusal     = llama_load_measure_refusal_text(stage, first_device, e.what());
+        return out;
+    } catch (const std::exception & e) {
+        out.refusal = llama_load_measure_refusal_text(stage, first_device, e.what());
+        return out;
+    }
+
+    const sched_reserve_result & status = holder->get_measure_status();
+    if (status.status != sched_reserve_status::OK) {
+        out.refusal = llama_load_measure_refusal_text(stage, first_device, status.reason);
+        return out;
+    }
+
+    for (const auto & c : holder->get_measure_tenant_caps()) {
+        llama_load_measure_device d;
+        d.device      = c.device;
+        d.host        = c.host;
+        d.chunk_bytes = c.chunk_bytes;
+        d.total       = c.total;
+        d.cap         = c.max_chunk_size;
+        out.devices.push_back(std::move(d));
+    }
+    out.n_splits = holder->get_measure_plan().n_splits_max;
+    out.ok       = true;
+    return out;
 }
 
 llama_load_measure_result llama_load_measure(const llama_model &          model,
@@ -3104,75 +3164,40 @@ llama_load_measure_result llama_load_measure(const llama_model &          model,
     }
     const int first_device = llama_context_sycl_device_index(sycl_devs[0], 0);
 
-    // Declaration order is the unwind order: the backends outlive the context, which outlives the
-    // override, so on every exit the override clears first, then the context goes, then the backends.
     llama_measure_context_args args;
-    args.stage = stage;
     for (size_t i = 0; i < sycl_devs.size(); ++i) {
         const int      device  = llama_context_sycl_device_index(sycl_devs[i], (int) i);
         ggml_backend_t backend = llama_context_sycl_measure_backend_init(sycl_devs[i], device);
         if (backend == nullptr) {
-            out.refusal = llama_load_measure_refusal(stage, device, "measure backend init failed");
+            out.refusal = llama_load_measure_refusal_text(stage, device, "measure backend init failed");
             return out;
         }
         args.backends.emplace_back(backend);
     }
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (cpu == nullptr) {
-        out.refusal = llama_load_measure_refusal(stage, first_device, "no CPU backend");
+        out.refusal = llama_load_measure_refusal_text(stage, first_device, "no CPU backend");
         return out;
     }
     args.backends.emplace_back(cpu);
 
-    std::unique_ptr<llama_context> holder;
-    llama_measure_plan_override    guard(llama_context_sycl_measure_override_procs(sycl_devs[0]), load_txn, stage);
-    if (!guard.installed()) {
-        out.refusal = llama_load_measure_refusal(stage, first_device, guard.failure());
-        return out;
-    }
-
-    llama_context_params params = llama_context_default_params();
-    params.n_ctx                = n_ctx != 0 ? n_ctx : model.hparams.n_ctx_train;
-    params.n_batch              = 512;
-    params.n_ubatch             = 512;
-    try {
-        holder.reset(new llama_context(model, params, &args));
-    } catch (const std::exception & e) {
-        out.refusal = llama_load_measure_refusal(stage, first_device, e.what());
-        return out;
-    }
-
-    const sched_reserve_result & status = holder->get_measure_status();
-    if (status.status != sched_reserve_status::OK) {
-        out.refusal = llama_load_measure_refusal(stage, first_device, status.reason);
-        return out;
-    }
-
-    for (const auto & c : holder->get_measure_tenant_caps()) {
-        llama_load_measure_device d;
-        d.device      = c.device;
-        d.host        = c.host;
-        d.chunk_bytes = c.chunk_bytes;
-        d.total       = c.total;
-        d.cap         = c.max_chunk_size;
-        out.devices.push_back(std::move(d));
-    }
-    out.n_splits = holder->get_measure_plan().n_splits_max;
-    out.ok       = true;
+    return llama_load_measure_run(model, args, llama_context_sycl_measure_override_procs(sycl_devs[0]), n_ctx, load_txn,
+                                  stage, first_device);
 #else
     GGML_UNUSED(model);
     GGML_UNUSED(n_ctx);
     GGML_UNUSED(load_txn);
     GGML_UNUSED(stage);
     out.ok = true;
-#endif
     return out;
+#endif
 }
 
-std::string llama_load_late_check(const llama_model &                            model,
-                                  uint32_t                                       n_ctx,
-                                  struct ggml_sycl_load_txn                      txn,
-                                  const std::vector<llama_measure_dummy_entry> & weights) {
+llama_late_check_result llama_load_late_check(const llama_model &                            model,
+                                              uint32_t                                       n_ctx,
+                                              struct ggml_sycl_load_txn                      txn,
+                                              const std::vector<llama_measure_dummy_entry> & weights) {
+    llama_late_check_result out;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     llama_sycl_l4_procs procs;
     for (const auto & d : model.devices) {
@@ -3182,39 +3207,31 @@ std::string llama_load_late_check(const llama_model &                           
         }
     }
     if (!procs.available()) {
-        return "";  // no c(P) can have been recorded without the L4 entry points
+        return out;  // no c(P) can have been recorded without the L4 entry points
     }
 
     llama_measure_dummy_scope dummies(weights);
     if (dummies.failed()) {
-        return llama_load_measure_refusal(GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, -1,
-                                          "a weight stand-in buffer was refused");
+        out.refusal = llama_load_measure_refusal_text(GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, -1,
+                                                      "a weight stand-in buffer was refused");
+        return out;
     }
     const llama_load_measure_result measured =
         llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C);
     if (!measured.ok) {
-        return measured.refusal;
+        (measured.unsupported ? out.unsupported : out.refusal) = measured.refusal;
+        return out;
     }
-    for (const auto & d : measured.devices) {
-        if (d.host) {
-            // Assumption: no host-tier term is recorded at the early stage today, and the backend's
-            // late check takes a SYCL device index, so only SYCL devices are compared. A host term
-            // recorded later needs its own entry point, not a guessed device index.
-            continue;
-        }
-        if (llama_sycl_l4_late_check(procs, txn, d.device, d.total) == GGML_SYCL_LATE_CHECK_REFUSED) {
-            // the backend has logged its canonical line; this is the load's refusal
-            return llama_load_measure_refusal(GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, d.device,
-                                              "the final placement needs more compute than the admitted term");
-        }
-    }
-    return "";
+
+    out          = llama_late_check_fold(procs, txn, measured.devices);
+    out.n_ubatch = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train).n_ubatch;
+    return out;
 #else
     GGML_UNUSED(model);
     GGML_UNUSED(n_ctx);
     GGML_UNUSED(txn);
     GGML_UNUSED(weights);
-    return "";
+    return out;
 #endif
 }
 
@@ -3691,6 +3708,11 @@ void llama_context::set_causal_attn(bool value) {
 }
 
 void llama_context::set_warmup(bool value) {
+    // a measure-only context measures one fixed graph set and never reserves again
+    if (measure_only) {
+        return;
+    }
+
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     if (cparams.warmup == value) {
@@ -4224,14 +4246,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
-    n_queued_tokens += n_tokens_all;
-
     output_swaps.clear();
 
     if (!sched_reserve_nothrow()) {
         LLAMA_LOG_ERROR("%s: failed to reserve the compute buffers\n", __func__);
         return -2;
     }
+
+    // counted only once the reserve succeeded: a -2 here processed nothing
+    n_queued_tokens += n_tokens_all;
 
     bool did_optimize = false;
 
