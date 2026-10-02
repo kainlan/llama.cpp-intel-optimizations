@@ -24,11 +24,13 @@
 // consumer.
 //
 // A decline after a write (a later call of the same launch, an inject with after_n > 1) throws
-// dnnl_decline_after_write:dnnl_gemm, a ggml_sycl_fallback_error. Nothing in the tree stops it: caller 1 rethrows it
-// (ggml-sycl.cpp:66395), ggml_sycl_mul_mat rethrows it (ggml-sycl.cpp:85054) and ggml_backend_sycl_graph_compute turns
-// it into GGML_STATUS_FAILED (ggml-sycl.cpp:109540). This test does not drive it because run_arm below counts any
-// status other than GGML_STATUS_SUCCESS as a failure and no arm expects one; driving it needs an arm that expects
-// GGML_STATUS_FAILED. The other sites (MXFP4 PP, unified PP, MoE batched, the dense arms, out_prod) are pinned by
+// dnnl_decline_after_write:dnnl_gemm, a ggml_sycl_fallback_error. The caller rethrows it (ggml-sycl.cpp:66395),
+// ggml_sycl_mul_mat rethrows it (ggml-sycl.cpp:85054) and ggml_backend_sycl_graph_compute turns it into
+// GGML_STATUS_FAILED (ggml-sycl.cpp:109540). The last arm of main drives it on the grouped-query graph with after_n = 3
+// (call 1 the pre-query, call 2 the first gemm, which wrote dst, call 3 the declined second gemm): graph_compute must
+// return GGML_STATUS_FAILED, never SUCCESS and never a crash, with calls = 3, declined = 1, engaged = 1. Its output is
+// undefined after the failed graph and is not compared; run_arm accepts a non-SUCCESS status only for an arm that sets
+// expect_status. The other sites (MXFP4 PP, unified PP, MoE batched, the dense arms, out_prod) are pinned by
 // scripts/check-sycl-dnnl-decline-consumers.py and have no device arm yet.
 //
 // The counters are the positive control. An arm whose off-run never reached its site (the env opt-in is missing, a
@@ -320,10 +322,27 @@ run_result run_arm(ggml_backend_t backend, const arm & a, int inject, bool keep_
 
     const ggml_status status = ggml_backend_graph_compute(backend, gf);
     ggml_backend_synchronize(backend);
-    if (status != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "FAIL: %s: graph compute returned %d\n", a.name, (int) status);
+    res.status = status;
+    if (status != a.expect_status) {
+        fprintf(stderr, "FAIL: %s: graph compute returned %d, expected %d\n", a.name, (int) status,
+                (int) a.expect_status);
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);
+        return res;
+    }
+    if (a.expect_status != GGML_STATUS_SUCCESS) {
+        // An expected failure (a decline after a write): the output is undefined after a failed graph, so it is not
+        // read, and there is no recorded graph to check. Only the seam's counters are read.
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        if (!ggml_sycl_test_scratchpad_site_counts(a.site, &res.calls, &res.declined, &res.engaged)) {
+            fprintf(stderr, "FAIL: %s: the seam does not know the site %s\n", a.name, a.site);
+            return res;
+        }
+        if (!keep_state) {
+            ggml_sycl_test_inject_scratchpad_decline(a.site, 0);
+        }
+        res.ok = true;
         return res;
     }
     // Recording would route the softmax and MUL arms around their sites, so a recorded run is void.
