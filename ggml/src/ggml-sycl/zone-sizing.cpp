@@ -198,7 +198,7 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
 }
 
 zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone_onednn_plan & live) {
-    zone_onednn_plan kept;
+    zone_onednn_plan kept = live;  // RED stub: the pair halves are not merged yet (llama.cpp-8ony)
     kept.bare_bytes        = std::max(held.bare_bytes, live.bare_bytes);
     kept.graph_floor_bytes = std::max(held.graph_floor_bytes, live.graph_floor_bytes);
     return kept;
@@ -361,6 +361,24 @@ void zone_onednn_scratch_reserve_target(bool     arena_active,
     if (activations_bytes) {
         *activations_bytes = merged_fits ? merged_activations : requested_activations_bytes;
     }
+}
+
+void zone_onednn_scratch_reserve_target(bool     arena_active,
+                                        size_t   pair_bound_bytes,
+                                        size_t   held_weights_bytes,
+                                        size_t   held_activations_bytes,
+                                        size_t   planned_weights_bytes,
+                                        size_t   planned_activations_bytes,
+                                        size_t   requested_weights_bytes,
+                                        size_t   requested_activations_bytes,
+                                        size_t * weights_bytes,
+                                        size_t * activations_bytes) {
+    // RED stub: the planned pair is ignored (llama.cpp-8ony).
+    (void) planned_weights_bytes;
+    (void) planned_activations_bytes;
+    zone_onednn_scratch_reserve_target(arena_active, pair_bound_bytes, held_weights_bytes, held_activations_bytes,
+                                       requested_weights_bytes, requested_activations_bytes, weights_bytes,
+                                       activations_bytes);
 }
 
 size_t zone_onednn_pp_pair_bound(size_t capacity_bytes, size_t bare_plan_bytes, size_t graph_floor_bytes) {

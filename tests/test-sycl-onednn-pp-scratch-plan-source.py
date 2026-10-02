@@ -354,6 +354,21 @@ def evaluate(backend, cache, cache_hpp, zone_sizing):
             "onednn_pp_pair_bound_for(" in reserve and \
             re.search(r"zone_onednn_scratch_reserve_target\(arena_on,\s*pair_bound,", reserve) is not None
         results["reserve refuses a pair above the bound"] = "total_needed > pair_bound_now" in reserve
+        # The first reservation is the planned pair, from the SAME snapshot the bound reads, only with an arena.
+        results["reserve sizes the first reservation to the snapshot's planned pair"] = \
+            re.search(r"zone_onednn_scratch_reserve_target\(arena_on,\s*pair_bound,\s*held_w,\s*held_a,\s*"
+                      r"zone_plan\.weights_bytes,\s*zone_plan\.activations_bytes,", reserve) is not None
+        results["reserve reads the planned pair from the stored snapshot, only with an arena"] = \
+            re.search(r"zone_plan\s*=\s*arena_on\s*\?\s*onednn_zone_plan_load\(", reserve) is not None
+    pair_reader = function_body(cache, r"static zone_onednn_plan onednn_planned_pair_and_floor\(int device_id\)\s*\{")
+    results["anchor: the planned pair-and-floor reader exists"] = pair_reader is not None
+    if pair_reader is not None:
+        results["the planned pair reader carries both pair halves into the plan"] = \
+            "g_planned_onednn_pair_weights_bytes" in pair_reader and \
+            "g_planned_onednn_pair_activations_bytes" in pair_reader
+    results["the inventory planner stores the pair's two halves, not only their sum"] = \
+        re.search(r"unified_cache_set_planned_onednn_scratchpad_pair\(\s*ctx->device,\s*"
+                  r"inventory_maxima\.onednn_reorder,\s*inventory_maxima\.onednn_eligible\)", backend) is not None
     for name, body in (("by-bytes core", bytes_helper),):
         results["the %s reads the pair bound, not the raw capacity" % name] = \
             "unified_cache_get_onednn_pp_pair_bound(" in body and "unified_cache_get_onednn_zone_capacity(" not in body
@@ -577,6 +592,18 @@ if args.self_test and not failed:
         ("reserve merges against the raw capacity", "reserve bounds the never-shrink merge by the pair bound, not the raw capacity",
          (backend, mutate_in_func(cache, reserve_sig, "zone_onednn_scratch_reserve_target(arena_on, pair_bound,",
                                   "zone_onednn_scratch_reserve_target(arena_on, arena_on ? zone_capacity(vram_zone_id::ONEDNN) : 0,"),
+          cache_hpp)),
+        ("reserve forgets the planned pair", "reserve sizes the first reservation to the snapshot's planned pair",
+         (backend, mutate_in_func(cache, reserve_sig, "zone_plan.weights_bytes, zone_plan.activations_bytes,",
+                                  "0, 0,"), cache_hpp)),
+        ("reserve reads the planned pair without an arena", "reserve reads the planned pair from the stored snapshot, only with an arena",
+         (backend, mutate_in_func(cache, reserve_sig, "arena_on ? onednn_zone_plan_load(",
+                                  "true ? onednn_zone_plan_load("), cache_hpp)),
+        ("pair reader drops the weights half", "the planned pair reader carries both pair halves into the plan",
+         (backend, mutate_in_func(cache, r"static zone_onednn_plan onednn_planned_pair_and_floor\(",
+                                  "g_planned_onednn_pair_weights_bytes", "0"), cache_hpp)),
+        ("planner stores only the sum", "the inventory planner stores the pair's two halves, not only their sum",
+         (mutate(backend, "unified_cache_set_planned_onednn_scratchpad_pair(", "unified_cache_set_XXXX("), cache,
           cache_hpp)),
         ("reserve serves a pair above the bound", "reserve refuses a pair above the bound",
          (backend, mutate_in_func(cache, reserve_sig, "total_needed > pair_bound_now", "false"), cache_hpp)),

@@ -308,6 +308,23 @@ void zone_onednn_scratch_reserve_target(bool     arena_active,
                                         size_t * weights_bytes,
                                         size_t * activations_bytes);
 
+// The same target with the zone's PLANNED pair as a floor (llama.cpp-8ony): the first reservation is sized to
+// max(held, requested, planned) per component, so the pair the plan provisioned is reserved once and never regrows
+// (a regrow needs the superseded reservation and the new one in the zone at once, which a zone sized for one pair plus
+// the Graph floor cannot hold). Used only with an arena, where the planned pair exists; without one the planned halves
+// are ignored. When that pair does not fit `pair_bound_bytes` (a zone clamped below its plan) the target is the
+// held-and-requested merge of the overload above. Pure; a null out is ignored.
+void zone_onednn_scratch_reserve_target(bool     arena_active,
+                                        size_t   pair_bound_bytes,
+                                        size_t   held_weights_bytes,
+                                        size_t   held_activations_bytes,
+                                        size_t   planned_weights_bytes,
+                                        size_t   planned_activations_bytes,
+                                        size_t   requested_weights_bytes,
+                                        size_t   requested_activations_bytes,
+                                        size_t * weights_bytes,
+                                        size_t * activations_bytes);
+
 // The most an op's f16 pair may be for the ONEDNN zone to count it as planned there (the `pair_bound_bytes` that
 // zone_onednn_pp_scratch_planned and zone_onednn_scratch_reserve_target take). The zone is sized as the primitive-API pair's own plan plus a
 // floor for the oneDNN Graph SDPA scratch that shares it, and the zone is never smaller than a fixed minimum, so
@@ -326,6 +343,10 @@ size_t zone_onednn_pp_pair_bound(size_t capacity_bytes, size_t bare_plan_bytes, 
 struct zone_onednn_plan {
     size_t bare_bytes        = 0;
     size_t graph_floor_bytes = 0;
+    // The two halves of the pair plan: the weights half (the largest dequantized per-layer weight) and the
+    // activations half. The first reservation is sized to them, so the pair never regrows (llama.cpp-8ony).
+    size_t weights_bytes     = 0;
+    size_t activations_bytes = 0;
 };
 
 // The snapshot to keep when the arena's zones were found sufficient for `live` and the zone is NOT rebuilt: the zone
