@@ -390,10 +390,10 @@ void case_desc_v2_layout_and_parse() {
 
 void case_desc_v2_refusals() {
     using st = runtime_context_desc_status;
-    {
+    for (size_t i = 0; i < sizeof(ggml_sycl_runtime_context_desc::pad1); ++i) {
         forced_desc f({ 1 }, 0);
-        f.b.desc.pad1[1] = 1;
-        expect_refused(f.b, st::BAD_PAD, "pad1 is not 0");
+        f.b.desc.pad1[i] = 1;
+        expect_refused(f.b, st::BAD_PAD, "a pad1 byte is not 0");
     }
     {
         forced_desc f({ 1 }, 2);

@@ -328,6 +328,72 @@ void case_out_struct_gate() {
     }
 }
 
+// A byte count the fit would wrap on is INVALID before the fit runs: kv_region_fit rounds a size up to its slot
+// block, so a size within one block of SIZE_MAX wraps to a small number and the layer would answer "device-resident"
+// on no room at all.  The bound is residency_probe_max_bytes (1 << 46, 64 TiB): no zone holds a slot that large, and
+// the element counts (at most 65536 layers and 65536 tenants, the descriptor reader's cap) keep every sum the fit
+// forms below 2^63.
+void case_byte_counts_at_the_arithmetic_edge() {
+    const size_t max = (size_t) 1 << 46;  // the bound (residency_probe_max_bytes)
+    const size_t big = (size_t) -1;
+    const auto   bad = GGML_SYCL_RESIDENCY_PROBE_INVALID;
+
+    residency_probe_input base = single_device(900 * MiB);
+
+    residency_probe_input in = base;
+    in.layers[3].kv_bytes    = big - 5;
+    CHECK(residency_probe_core(in).status == bad,
+          "kv_bytes within a block of SIZE_MAX is INVALID, not device-resident");
+    in.layers[3].kv_bytes = big;
+    CHECK(residency_probe_core(in).status == bad, "kv_bytes of SIZE_MAX is INVALID");
+    in.layers[3].kv_bytes = max + 1;
+    CHECK(residency_probe_core(in).status == bad, "kv_bytes past the bound is INVALID");
+
+    // exactly at the bound is a real (if absurd) size: it fits nowhere, so the layer is host-resident
+    in.layers[3].kv_bytes               = max;
+    const residency_probe_result at_max = residency_probe_core(in);
+    CHECK(at_max.status == OK && hosts(at_max) == std::vector<uint32_t>({ 3 }),
+          "a layer of exactly the bound is host-resident");
+
+    in                         = base;
+    in.layers[2].sidecar_bytes = big - 5;
+    CHECK(residency_probe_core(in).status == bad, "sidecar_bytes within a block of SIZE_MAX is INVALID");
+    in.layers[2].sidecar_bytes = max;
+    in.layers[2].kv_bytes      = max;
+    CHECK(residency_probe_core(in).status == bad, "kv_bytes + sidecar_bytes past the bound is INVALID");
+
+    in = base;
+    in.tenants.push_back(compute_tenant(0, 0, (size_t) UINT64_MAX));
+    CHECK(residency_probe_core(in).status == bad, "slot_bytes of UINT64_MAX is INVALID, not OK");
+    in.tenants[0].slot_bytes = (uint64_t) max + 1;
+    CHECK(residency_probe_core(in).status == bad, "slot_bytes past the bound is INVALID");
+    in.tenants[0].slot_bytes = (uint64_t) max;
+    CHECK(residency_probe_core(in).status == GGML_SYCL_RESIDENCY_PROBE_HEAD_SLOT_REFUSED,
+          "a head slot of exactly the bound fits no zone: refused by name, not wrapped");
+
+    // the element counts the bound's arithmetic rests on
+    in = base;
+    in.layers.assign(65537, no_kv_layer());
+    CHECK(residency_probe_core(in).status == bad, "more layers than the descriptor reader's cap is INVALID");
+    in = base;
+    for (uint32_t i = 0; i < 65537; ++i) {
+        in.tenants.push_back(compute_tenant(0, i, 1));
+    }
+    CHECK(residency_probe_core(in).status == bad, "more tenants than the descriptor reader's cap is INVALID");
+}
+
+void case_device_below_zero() {
+    residency_probe_input in = single_device(900 * MiB);
+    in.devices.push_back({ -1, gap_zone(900 * MiB).snapshot() });
+    CHECK(residency_probe_core(in).status == GGML_SYCL_RESIDENCY_PROBE_INVALID,
+          "a geometry named for device -1 (the host's id) is INVALID");
+    in                   = single_device(900 * MiB);
+    in.devices[0].device = -7;
+    in.layers.clear();
+    CHECK(residency_probe_core(in).status == GGML_SYCL_RESIDENCY_PROBE_INVALID,
+          "a geometry named for device -7 is INVALID");
+}
+
 }  // namespace
 
 int main() {
@@ -340,6 +406,8 @@ int main() {
     case_tenants_only_add_host_layers();
     case_invalid_input();
     case_out_struct_gate();
+    case_byte_counts_at_the_arithmetic_edge();
+    case_device_below_zero();
     std::printf("test-residency-probe-core: all cases passed\n");
     return 0;
 }
