@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """Source gate for owner-first staging and w295 transactional growth contracts."""
-import contextlib
 import os
 import re
 import shutil
-import sys
-import traceback
 from collections import Counter
 from pathlib import Path
 
@@ -19,32 +16,10 @@ COMMON = (SYCL / "common.hpp").read_text()
 COMMON_IMPL = (SYCL / "common.cpp").read_text()
 
 
-GATE_RESULTS = []
-
-
-@contextlib.contextmanager
-def gate(name: str):
-    """Run one independent check. The previous layout was one bare-assert chain, so the first stale
-    pin aborted the module and every later check in the file silently never ran (llama.cpp-gsb9).
-    A failure is recorded with its source line and the run continues; report_gates() decides the
-    exit status once every check has had its turn."""
-    try:
-        yield
-    except Exception as error:  # noqa: BLE001 -- any failure, including a missing anchor, fails this check
-        frame = traceback.extract_tb(error.__traceback__)[-1]
-        location = "line %d: %s" % (frame.lineno, (frame.line or "").strip())
-        detail = str(error) or type(error).__name__
-        GATE_RESULTS.append((name, "%s -- %s: %s" % (location, type(error).__name__, detail)))
-    else:
-        GATE_RESULTS.append((name, None))
-
-
-def report_gates() -> None:
-    failed = [(name, why) for name, why in GATE_RESULTS if why is not None]
-    for name, why in failed:
-        print("FAIL %s\n     %s" % (name, why.replace("\n", "\n     ")))
-    print("%d/%d checks passed" % (len(GATE_RESULTS) - len(failed), len(GATE_RESULTS)))
-    sys.exit(1 if failed else 0)
+# One independent-check helper for every pure-Python SYCL gate (tests/sycl_gate.py). This file used to
+# carry its own copy of gate()/report_gates(); two copies drift (the copy here lacked min_checks and the
+# operand annotation), so there is one.
+from sycl_gate import finish, gate  # noqa: E402
 
 
 def region(source: str, start: str, end: str) -> str:
@@ -272,7 +247,9 @@ with gate('planned-scratch-ensure-owner-first'):
     owner_first(planned_scratch, "backing  = std::move(replacement)")
     # Both planned callers must keep going through the helper rather than allocating themselves.
     # Callers in common.hpp: the MMQ/MMVQ Q8_1 src1 buffer and the dense f16 dequant buffers.
-    assert COMMON.count("ggml_sycl_runtime_scratch_ensure<") == 2, "a planned scratch caller stopped using the helper"
+    # Comment-blind: a comment naming the helper (or a quoted example in prose) is not a caller.
+    assert _blank_comments(COMMON).count("ggml_sycl_runtime_scratch_ensure<") == 2, \
+        "a planned scratch caller stopped using the helper"
     print("PASS planned-scratch-owner-first-source-gate")
 
 runtime_regions = (
@@ -701,4 +678,4 @@ with gate('internal-backing-mint-stays-private'):
     problems = check_internal_backing_mint_stays_private(CACHE)
     assert not problems, "\n".join(problems)
 
-report_gates()
+finish()
