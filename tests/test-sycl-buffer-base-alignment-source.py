@@ -302,9 +302,12 @@ def test_tlsf_and_fallthrough_mutations_are_witnessed() -> None:
 
     source = SOURCE.read_text()
     fallthrough_mutations = [
+        # The guarded RUNTIME-zone publish becomes a bare `return publish(...)`: a refusal then ends the allocation
+        # instead of falling through. The success branch is no longer just `return published;` (it logs the landing
+        # first), so the pattern runs through the block's `return published;` and its closing brace.
         re.sub(r"if \(ggml_backend_buffer_t published =\s*\n?\s*" + PUBLISH +
-               r"\(buft, ctx, size, \"arena RUNTIME zone\"\)\) \{\s*\n\s*return published;\s*\n\s*\}",
-               f"return {PUBLISH}(buft, ctx, size, \"arena RUNTIME zone\");", source, count=1),
+               r"\(buft, ctx, size, \"arena RUNTIME zone\"\)\) \{.*?return published;\s*\n\s*\}",
+               f"return {PUBLISH}(buft, ctx, size, \"arena RUNTIME zone\");", source, count=1, flags=re.S),
     ]
     for index, mutated in enumerate(fallthrough_mutations):
         assert mutated != source, f"fallthrough mutation {index} did not change the source"
@@ -327,8 +330,11 @@ def test_mutations_are_witnessed() -> None:
         _drop_alignment(source, "runtime_req"),
         _drop_alignment(source, "kv_req"),
         _drop_alignment(source, "scratch_req"),
-        source.replace(f"return {PUBLISH}(buft, ctx, size, \"device\");",
-                       "return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);", 1),
+        # The device (legacy) path publishes through the guard and keeps the result: a bare buffer_init here is the
+        # unguarded publish `violations` refuses. The call is the initialiser of `legacy_published`, which the
+        # landing log reads, so the mutant replaces the call and keeps the declaration.
+        source.replace(f"legacy_published = {PUBLISH}(buft, ctx, size, \"device\");",
+                       "legacy_published = ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);", 1),
         source.replace(f"% {CONSTANT}) != 0", "% 1) != 0", 1),
         re.sub(r"GGML_LOG_WARN\(\s*\n\s*\"\[SYCL\] refusing", "GGML_LOG_INFO(\n            \"[SYCL] refusing",
                source, count=1),
