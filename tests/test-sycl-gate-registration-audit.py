@@ -11,8 +11,9 @@ Rules, per tests/test-sycl-*.py:
   R1  it is named by an add_test / llama_test_pytest / llama_test_cmd in a CMakeLists.txt (comments do not count),
       or it is in UNREGISTERED_ALLOWLIST with a reason;
   R2  if it has module-level `def test_...`, every such registration is llama_test_pytest;
-  R3  (REQUIRE_PYTEST_FOOTER) if it has module-level `def test_...`, it ends with the pytest footer, so running it
-      directly (`python3 tests/test-sycl-x.py`) runs its tests instead of passing vacuously;
+  R3  if it has module-level `def test_...`, it can run itself: it ends with the pytest footer that
+      scripts/sycl-add-pytest-footer.py appends, or it carries its own `__main__` block, so running it directly
+      (`python3 tests/test-sycl-x.py`) executes its tests or fails loudly instead of passing vacuously;
   R4  UNREGISTERED_ALLOWLIST holds no stale entry (a file that is registered, or no longer exists).
 
 `--self-test` also proves the audit can fail: it plants an unregistered gate, a pytest-style module registered with
@@ -31,7 +32,7 @@ REGISTRARS = ("add_test", "llama_test_pytest", "llama_test_cmd")
 SKIP_DIRS = {".git", ".llm-wiki", "artifacts", "media", "models", "node_modules", "build"}
 # name -> reason. A gate listed here is deliberately not in ctest; empty means every gate runs.
 UNREGISTERED_ALLOWLIST = {}
-REQUIRE_PYTEST_FOOTER = False
+REQUIRE_PYTEST_FOOTER = True
 FOOTER_RE = re.compile(r'if __name__ == "__main__":\s*\n(?:\s+import [A-Za-z_.]+\s*\n)*\s+sys\.exit\(pytest\.main\(\[__file__, "-q"\]\)\)\s*$')
 
 
@@ -138,8 +139,9 @@ def audit(root, require_footer=REQUIRE_PYTEST_FOOTER, allowlist=None):
             if set(forms) != {"llama_test_pytest"}:
                 problems.append("R2 %s is pytest-style but registered via %s; plain python3 runs none of its tests"
                                 % (gate.name, "/".join(forms)))
-            if require_footer and not FOOTER_RE.search(text):
-                problems.append("R3 %s is pytest-style but lacks the pytest footer" % gate.name)
+            if require_footer and not FOOTER_RE.search(text) and "__main__" not in text:
+                problems.append("R3 %s is pytest-style but cannot run itself: no pytest footer and no __main__ block "
+                                "(run scripts/sycl-add-pytest-footer.py)" % gate.name)
     for name in sorted(allowlist):
         if name not in names:
             problems.append("R4 %s is allowlisted but does not exist" % name)
@@ -149,6 +151,7 @@ def audit(root, require_footer=REQUIRE_PYTEST_FOOTER, allowlist=None):
 # --- positive controls --------------------------------------------------------------------------------------------
 
 FOOTER = '\nif __name__ == "__main__":\n    import sys\n\n    import pytest\n\n    sys.exit(pytest.main([__file__, "-q"]))\n'
+OWN_MAIN = '\nif __name__ == "__main__":\n    test_x()\n'
 SCRIPT_GATE = "print('ok')\n"
 PYTEST_GATE = "def test_x():\n    assert True\n"
 
@@ -190,6 +193,9 @@ llama_test_pytest(${Python3_EXECUTABLE}
         case("pytest-via-add_test", dict(clean_gates, **{"test-sycl-d.py": PYTEST_GATE + FOOTER}),
              clean_cmake + "add_test(NAME d COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-d.py)\n",
              "R2 test-sycl-d.py")
+        case("pytest-with-own-main", dict(clean_gates, **{"test-sycl-f.py": PYTEST_GATE + OWN_MAIN}),
+             clean_cmake + "llama_test_pytest(${Python3_EXECUTABLE} SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-f.py)\n",
+             None)
         case("pytest-without-footer", dict(clean_gates, **{"test-sycl-e.py": PYTEST_GATE}),
              clean_cmake + "llama_test_pytest(${Python3_EXECUTABLE} SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-e.py)\n",
              "R3 test-sycl-e.py")
