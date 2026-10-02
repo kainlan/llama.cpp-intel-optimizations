@@ -14,7 +14,11 @@ Rules, per tests/test-sycl-*.py:
   R3  if it has module-level `def test_...`, it can run itself: it ends with the pytest footer that
       scripts/sycl-add-pytest-footer.py appends, or it carries its own `__main__` block, so running it directly
       (`python3 tests/test-sycl-x.py`) executes its tests or fails loudly instead of passing vacuously;
-  R4  UNREGISTERED_ALLOWLIST holds no stale entry (a file that is registered, or no longer exists).
+  R4  UNREGISTERED_ALLOWLIST holds no stale entry (a file that is registered, or no longer exists);
+  R5  every test-sycl-*.py a registration names exists under tests/ (a registration of a file that was never
+      committed fails at ctest time with "file not found", or worse, only passes on the one checkout that has the
+      file), unless it is in MISSING_FILE_ALLOWLIST with a reason; an allowlisted name whose file now exists is
+      stale.
 
 `--self-test` also proves the audit can fail: it plants an unregistered gate, a pytest-style module registered with
 add_test, and a pytest-style module without the footer into temp trees (synthetic, and a copy of the real tree) and
@@ -32,6 +36,12 @@ REGISTRARS = ("add_test", "llama_test_pytest", "llama_test_cmd")
 SKIP_DIRS = {".git", ".llm-wiki", "artifacts", "media", "models", "node_modules", "build"}
 # name -> reason. A gate listed here is deliberately not in ctest; empty means every gate runs.
 UNREGISTERED_ALLOWLIST = {}
+# name -> reason. A registered gate whose file is not in the tree. Remove the entry when the file is committed
+# (the audit then reports it stale).
+MISSING_FILE_ALLOWLIST = {
+    "test-sycl-mmid-admission-source.py": "registered by 64ec60199 but the file was never committed; it exists only as "
+                                          "an untracked file in the main checkout (another lane's work)",
+}
 REQUIRE_PYTEST_FOOTER = True
 FOOTER_RE = re.compile(r'if __name__ == "__main__":\s*\n(?:\s+import [A-Za-z_.]+\s*\n)*\s+sys\.exit\(pytest\.main\(\[__file__, "-q"\]\)\)\s*$')
 
@@ -118,9 +128,10 @@ def is_pytest_style(text):
     return re.search(r"^(?:async )?def test_", text, re.M) is not None
 
 
-def audit(root, require_footer=REQUIRE_PYTEST_FOOTER, allowlist=None):
+def audit(root, require_footer=REQUIRE_PYTEST_FOOTER, allowlist=None, missing_allowlist=None):
     root = Path(root)
     allowlist = UNREGISTERED_ALLOWLIST if allowlist is None else allowlist
+    missing_allowlist = MISSING_FILE_ALLOWLIST if missing_allowlist is None else missing_allowlist
     registered = registrations(root)
     problems = []
     gates = sorted((root / "tests").glob("test-sycl-*.py"))
@@ -145,6 +156,14 @@ def audit(root, require_footer=REQUIRE_PYTEST_FOOTER, allowlist=None):
     for name in sorted(allowlist):
         if name not in names:
             problems.append("R4 %s is allowlisted but does not exist" % name)
+    for name in sorted(registered):
+        if name not in names and name not in missing_allowlist:
+            problems.append("R5 %s is named by a registration (%s) but is not in tests/" % (name, "/".join(registered[name])))
+    for name in sorted(missing_allowlist):
+        if name in names:
+            problems.append("R5 %s is allowlisted as missing but exists; drop the entry" % name)
+        elif name not in registered:
+            problems.append("R5 %s is allowlisted as missing but nothing registers it" % name)
     return problems
 
 
@@ -179,7 +198,7 @@ llama_test_pytest(${Python3_EXECUTABLE}
         def case(label, gates, cmake, expect, require_footer=True):
             tree = base / label
             write_tree(tree, gates, cmake)
-            problems = audit(tree, require_footer=require_footer, allowlist={})
+            problems = audit(tree, require_footer=require_footer, allowlist={}, missing_allowlist={})
             if expect is None and problems:
                 failures.append("%s: clean tree reported %s" % (label, problems))
             if expect is not None and not any(expect in problem for problem in problems):
@@ -202,10 +221,23 @@ llama_test_pytest(${Python3_EXECUTABLE}
         case("pytest-without-footer-not-required", dict(clean_gates, **{"test-sycl-e.py": PYTEST_GATE}),
              clean_cmake + "llama_test_pytest(${Python3_EXECUTABLE} SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-e.py)\n",
              None, require_footer=False)
+        # A registration naming a file that is not in tests/ (R5), and the matching allowlist rules.
+        tree = base / "missing-file"
+        write_tree(tree, clean_gates, clean_cmake + "add_test(NAME g COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-ghost.py)\n")
+        problems = audit(tree, allowlist={}, missing_allowlist={})
+        if not any("R5 test-sycl-ghost.py" in p for p in problems):
+            failures.append("missing-file: registration of an absent file not reported: %s" % problems)
+        problems = audit(tree, allowlist={}, missing_allowlist={"test-sycl-ghost.py": "reason"})
+        if problems:
+            failures.append("missing-file: allowlisted ghost still reported: %s" % problems)
+        problems = audit(tree, allowlist={}, missing_allowlist={"test-sycl-ghost.py": "r", "test-sycl-a.py": "r"})
+        if not any("R5 test-sycl-a.py is allowlisted as missing but exists" in p for p in problems):
+            failures.append("missing-file: stale missing-allowlist entry not reported: %s" % problems)
         # Stale allowlist entries are reported both ways.
         tree = base / "allowlist"
         write_tree(tree, clean_gates, clean_cmake)
-        problems = audit(tree, allowlist={"test-sycl-a.py": "registered", "test-sycl-gone.py": "missing"})
+        problems = audit(tree, allowlist={"test-sycl-a.py": "registered", "test-sycl-gone.py": "missing"},
+                         missing_allowlist={})
         if not (any("R4 test-sycl-a.py" in p for p in problems) and any("R4 test-sycl-gone.py" in p for p in problems)):
             failures.append("allowlist: stale entries not reported: %s" % problems)
 
