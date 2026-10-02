@@ -53,6 +53,10 @@ enum class sched_reserve_status { OK, REFUSED, FAILED };
 struct sched_reserve_result {
     sched_reserve_status status = sched_reserve_status::OK;
     std::string          reason;
+    // The reserve ended on a fit verdict: the compute buffers did not fit, or the plan the publish refused. Only
+    // such a verdict lowers the auto n_ubatch ladder's rung (llama_auto_ubatch_fit_refusal); a lifecycle failure, a
+    // scope that would not open or a graph that would not build is no verdict on the rung and must not.
+    bool                 fit_refusal = false;
 };
 
 // MEASURE sizes the worst-case graphs without touching the context's own
@@ -198,6 +202,12 @@ struct llama_context {
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
+
+    // Allocate / reserve a graph on this context's scheduler, inside the SYCL backend's compute-allocation scope
+    // (see sycl_compute_scope_fn below). The only way anything allocates on the scheduler: llama_kv_cache::update's
+    // K-shift graph included.
+    bool sched_alloc_graph(ggml_cgraph * gf);
+    bool sched_reserve_graph(ggml_cgraph * gf);
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -499,13 +509,76 @@ private:
     // largest candidate whose compute buffers land fully on-device (no
     // host-pinned fallback). See its definition in llama-context.cpp (right
     // before sched_reserve()) for the loop and its exact stop-reason
-    // vocabulary. `type_k`/`type_v` are the constructor's own
-    // llama_context_params fields, passed in because they are constructor
-    // locals this member function cannot otherwise see -- they feed the
-    // persisted tuning-cache key (llama.cpp-7n6n): the KV element type
-    // drives would_demote_kv, so a shape change there can change which
-    // candidates fit without changing anything else the key tracks.
-    void sycl_select_auto_ubatch(enum ggml_type type_k, enum ggml_type type_v);
+    // vocabulary. It reads what sycl_auto_ubatch_prepare() stored; the KV
+    // element types (the constructor's own llama_context_params fields) feed
+    // the persisted tuning-cache key (llama.cpp-7n6n) there, so a shape change
+    // in them is a different key, not an argument of this function.
+    void sycl_select_auto_ubatch();
+
+    // llama.cpp-7gno: what the trial decides before the memory module exists, so the planned ladder's rung set is known
+    // when the constructor's residency fixpoint runs. sycl_auto_ubatch_prepare() makes every decision the trial's
+    // single-reserve exits and its rung set depend on (the SYCL backends and procs, the cap and its MoE ceiling, the
+    // tuning-cache lookup, the rung set) and stores them here; sycl_select_auto_ubatch() reads them and looks nothing
+    // up again. Empty when the trial takes its single reserve (and after the constructor is done with it).
+    struct sycl_auto_ubatch_probe_backend {
+        ggml_backend_t backend;
+        int            dev_index;
+    };
+    struct sycl_auto_ubatch_prep {
+        // The key below points into cache_devices, so the struct is copied and moved nowhere: it lives behind a
+        // unique_ptr, and the deleted copy operations leave no implicit move either.
+        sycl_auto_ubatch_prep()                                          = default;
+        sycl_auto_ubatch_prep(const sycl_auto_ubatch_prep &)             = delete;
+        sycl_auto_ubatch_prep & operator=(const sycl_auto_ubatch_prep &) = delete;
+
+        std::vector<sycl_auto_ubatch_probe_backend> backends;
+
+        decltype(&ggml_backend_sycl_probe_runtime_context_for_model) probe_fn      = nullptr;
+        decltype(&ggml_backend_sycl_compute_buffer_host_fallbacks)   fallback_fn   = nullptr;
+        decltype(&ggml_backend_sycl_planned_hold_spill_fits)         hold_spill_fn = nullptr;
+
+        // only what the ladder half uses: the lookup and the path are the hoisted block's alone
+        decltype(&ggml_backend_sycl_ubatch_cache_enabled)       cache_enabled_fn     = nullptr;
+        decltype(&ggml_backend_sycl_ubatch_cache_store_layout1) cache_store_fn       = nullptr;
+        bool have_cache_accessors = false;
+        bool cache_available      = false;
+
+        uint32_t cap             = 0;
+        bool     moe_bound       = false;
+        uint32_t fallback_ubatch = 0;  // cparams.n_ubatch when the block ran: the rung set's floor, and the default
+
+        // The key points into cache_devices.
+        std::vector<int>           cache_devices;
+        ggml_sycl_ubatch_cache_key cache_key{};
+        char                       cache_path_buf[512] = { 0 };
+
+        uint32_t              cached_ubatch          = 0;
+        char                  cached_reason_buf[64] = { 0 };
+        bool                  cache_usable           = false;
+        std::vector<uint32_t> rung_ladder;  // the rung set's ladder members, ascending
+    };
+    std::unique_ptr<sycl_auto_ubatch_prep> auto_ubatch_prep;
+    // `type_k`/`type_v` are the constructor's own llama_context_params fields, passed in because they are constructor
+    // locals this member function cannot otherwise see: they feed the tuning-cache key (the KV element type drives
+    // would_demote_kv, so a shape change there can change which candidates fit).
+    void sycl_auto_ubatch_prepare(enum ggml_type type_k, enum ggml_type type_v);
+
+    // llama.cpp-kpjw: the n_ubatch whose compute buffers the auto-ubatch trial already passed the realized hold-spill
+    // check for, and which is the sched the constructor is left with (the winner's reserve, not re-made by the
+    // settle step); 0 when nothing was validated (a pinned -ub, a trial that exited early, a settle that
+    // re-reserved, a backend without the check). The constructor's own check runs unless it equals n_ubatch, so
+    // it never re-reads the live free memory at the margin to overturn a rung the ladder just accepted.
+    uint32_t sycl_hold_spill_validated_ub = 0;
+
+    // llama.cpp-kpjw: the SYCL backend's scheduler-compute scope (ggml_backend_sycl_compute_alloc_scope), resolved once
+    // from the first SYCL backend of this context; null for a context without one or a SYCL library that predates it.
+    // A buffer the backend allocates while the scope is open is positively a scheduler compute buffer (the request
+    // record and the hold-spill counters are fed by those and by nothing else); it is opened around the reserve and
+    // around the graph allocation, never inferred from the absence of a model load.
+    typedef void (*sycl_compute_scope_fn_t)(bool);
+    sycl_compute_scope_fn_t sycl_compute_scope_fn();
+    bool                    sycl_compute_scope_resolved = false;
+    sycl_compute_scope_fn_t sycl_compute_scope_cached   = nullptr;
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
@@ -610,6 +683,24 @@ private:
 
     // The plan line, one per device the section names, at INFO.
     void tenant_plan_report(const sched_measure_plan & plan, uint32_t n_ubatch);
+
+    // The host tier's HOLD (design 3.3): R_h over the auto n_ubatch ladder's rung set, folded once, at the
+    // context's first planned transaction, from the section each rung's own MEASURE produced. Every later
+    // transaction raises its section's COMPUTE_HOST slots to it, so a rung of the set never needs host room
+    // the first publish did not carve. `tenant_rung_set` is the set sycl_select_auto_ubatch computed (empty
+    // for a pinned -ub: the set is then the one rung the context runs at).
+    llama_tenant_host_hold tenant_host_hold;
+    bool                   tenant_host_hold_ready = false;
+    std::vector<uint32_t>  tenant_rung_set;
+
+    // Folds R_h: `current` is the section the transaction just built at cparams.n_ubatch, every other rung
+    // of the set is measured here. A rung whose measure refuses or throws is left out: it fails the same way
+    // when the ladder tries it. The hold is recorded as ready only after every rung has been tried.
+    void tenant_host_hold_measure_and_fold(const std::vector<ggml_sycl_context_tenant_desc> & current);
+
+    // llama.cpp-7gno: the constructor's residency fixpoint, run once by a context that owns plan_caps, before its
+    // memory module exists (design 2.7). Throws by name until the backend's tenant-aware residency probe exists.
+    [[noreturn]] void sched_residency_fixpoint();  // drop [[noreturn]] with the throw, when the probe is wired
 
     bool sched_need_reserve = true;
 

@@ -20,10 +20,10 @@ const ggml_sycl_context_cohort_info k_cohorts[GGML_SYCL_CONTEXT_COHORT_COUNT] = 
      GGML_SYCL_CONTEXT_COHORT_SCOPE_CONTEXT, GGML_SYCL_CONTEXT_COHORT_LIFETIME_CONTEXT },
 };
 
-// No visitor is registered yet; the first producer adds its row before the
-// terminator.
+// A producer adds its row before the terminator.
 const ggml_sycl::context_measure_visitor k_visitors[] = {
-    { nullptr, nullptr },
+    { "nonfa-stage", ggml_sycl::context_nonfa_stage_visit },
+    { nullptr,       nullptr                              },
 };
 
 }  // namespace
@@ -102,6 +102,25 @@ std::vector<ggml_sycl_context_tenant_desc> context_demand_accum::tenants() const
         out.push_back(desc);
     }
     return out;
+}
+
+void context_nonfa_stage_visit(const ggml_tensor *          node,
+                               const context_measure_view & view,
+                               context_demand_accum &       acc) {
+    if (node->op != GGML_OP_MUL_MAT || node->src[0] == nullptr || node->src[1] == nullptr ||
+        node->src[0]->type != GGML_TYPE_F16) {
+        return;
+    }
+    ggml_sycl_mul_mat_route_env env;
+    if (view.mul_mat_route_env == nullptr || !view.mul_mat_route_env(view.sched_ctx, node, &env)) {
+        acc.fail(std::string("context-nonfa-stage: no route environment for the f16 mul_mat ") + node->name);
+        return;
+    }
+    if (!ggml_sycl_mul_mat_routes_batched_f16(node->src[0], node->src[1], node, env)) {
+        return;
+    }
+    const size_t elems = ggml_sycl_batched_f16_src1_stage_elems(node->src[1], env.stage_strided);
+    acc.demand(view, GGML_SYCL_CONTEXT_COHORT_NONFA_STAGE, 0, (uint64_t) elems * GGML_SYCL_NONFA_STAGE_ELEM_BYTES);
 }
 
 const context_measure_visitor * context_measure_visitors() {

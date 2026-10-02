@@ -14,6 +14,7 @@
 #define GGML_SYCL_GETROWS_HPP
 
 #include "common.hpp"
+#include "get-rows-support.hpp"
 #include "ggml-common.h"
 
 void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst);

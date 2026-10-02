@@ -182,13 +182,17 @@ def test_every_staging_writer_bumps_the_generation():
     reuse = stage.find("mem_copy(it->second.handle")
     assert reuse >= 0, "graph_input_stage no longer reuses an entry in place"
     assert GENERATION + "++" in stage[reuse : stage.find("return", reuse)], "reusing an entry must bump the generation"
-    # The create/replace path resets any old entry, then may give up (the
-    # allocation or its resolve fails) before it stores a new one. The bump
-    # must come between the reset and the first way out after it.
-    reset = re.search(r"it->second\.handle\s*=\s*ggml_sycl::mem_handle\{\}", stage)
-    assert reset, "graph_input_stage no longer resets the entry it replaces"
-    first_exit = stage.find("return", reset.end())
-    assert first_exit > 0 and GENERATION + "++" in stage[reset.end() : first_exit], (
+    # The create/replace path builds its replacement into locals and PUBLISHES it as the last act (review r6/r7: a
+    # failure must leave the old entry live, and the displaced handle is retained on an event rather than reset
+    # here). The bump must follow the publish, and no way out may sit between the publish and the bump.
+    publish = re.search(r"slot\.capacity\s*=\s*nbytes\s*;", stage)
+    assert publish, "graph_input_stage no longer publishes the entry it creates or replaces"
+    # ... and no reset of an entry is restored ahead of it: the displaced handle is retained, never dropped first.
+    assert re.search(r"\.handle\s*=\s*(ggml_sycl::)?mem_handle\s*\{\s*\}", stage[: publish.start()]) is None, (
+        "graph_input_stage resets an entry before it publishes the replacement (drop-then-allocate)"
+    )
+    first_exit = stage.find("return", publish.end())
+    assert first_exit > 0 and GENERATION + "++" in stage[publish.end() : first_exit], (
         "replacing or creating an entry must bump the generation before any return"
     )
 

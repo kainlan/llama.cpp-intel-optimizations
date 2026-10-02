@@ -143,6 +143,35 @@ static void clip_image_convert_f32_to_u8(const clip_image_f32& src, clip_image_u
 }
 #endif
 
+// llama.cpp-kpjw: the SYCL backend's scheduler compute scope (ggml_backend_sycl_compute_alloc_scope, ggml-sycl.h) for
+// the lifetime of this object. The projector's scheduler allocates its graph on the same buffer type as a language
+// model's, and a buffer that type places outside the scope is not recognized as a compute buffer: it is not planned for
+// or counted by the SYCL backend's hold-spill fit. Looked up through the backend's registry, so no SYCL header is
+// needed and a backend without the entry (every other one) opens nothing.
+struct clip_sycl_compute_scope {
+    void (*fn)(bool) = nullptr;
+
+    explicit clip_sycl_compute_scope(ggml_backend_t backend) {
+        ggml_backend_dev_t dev = backend ? ggml_backend_get_device(backend) : nullptr;
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg) {
+            fn = reinterpret_cast<void (*)(bool)>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_compute_alloc_scope"));
+        }
+        if (fn) {
+            fn(true);
+        }
+    }
+
+    ~clip_sycl_compute_scope() {
+        if (fn) {
+            fn(false);
+        }
+    }
+
+    clip_sycl_compute_scope(const clip_sycl_compute_scope &)             = delete;
+    clip_sycl_compute_scope & operator=(const clip_sycl_compute_scope &) = delete;
+};
 
 struct clip_ctx {
     clip_model model;
@@ -3787,7 +3816,10 @@ struct clip_model_loader {
     // only initialize backend buffers, but do not allocate them yet
     static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
-        ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
+        {
+            clip_sycl_compute_scope sycl_scope(ctx_clip.backend);
+            ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
+        }
 
         ctx_clip.mem_compute.clear();
         for (size_t i = 0; i < ctx_clip.backend_ptrs.size(); ++i) {
@@ -4464,7 +4496,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
-    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+    bool          alloc_ok = false;
+    {
+        clip_sycl_compute_scope sycl_scope(ctx->backend);
+        alloc_ok = ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    }
+    if (!alloc_ok) {
         LOG_ERR("%s: failed to allocate compute graph\n", __func__);
         return false;
     }

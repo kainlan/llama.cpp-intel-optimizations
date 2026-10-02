@@ -2907,6 +2907,28 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         TIMEOUT 300
     )
 
+    # test-sycl-compute-buffer-kv-zone (llama.cpp-kpjw): a compute buffer the RUNTIME zone will not serve (zone full, or
+    # held back by the planned dense scratch's hold) lands in the arena's KV zone, is accounted against it and returns
+    # every byte to it when freed; an unflagged request never goes there. It allocates a few MB through the real
+    # unified_alloc() path with no model loaded, but it is a GPU allocation test of the mem-handle family, so it
+    # carries `mem-handle` and stays out of the throttled sweep (run it by name, one at a time).
+    llama_build(test-sycl-compute-buffer-kv-zone.cpp)
+    target_include_directories(test-sycl-compute-buffer-kv-zone PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-compute-buffer-kv-zone PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-compute-buffer-kv-zone PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-compute-buffer-kv-zone PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-compute-buffer-kv-zone PRIVATE "-fsycl")
+        target_link_options(test-sycl-compute-buffer-kv-zone PRIVATE "-fsycl")
+    endif()
+    llama_test(test-sycl-compute-buffer-kv-zone LABEL "main")
+    set_tests_properties(test-sycl-compute-buffer-kv-zone PROPERTIES
+        LABELS "sycl;mem-handle;bugfix"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        TIMEOUT 300
+    )
+
     # test-sycl-optional-layout-yield: a yield of optional layout copies must
     # hand their bytes back to the zone KV admission re-reads, pass over a
     # leased copy, and never touch a primary -- on a real device cache, with no
@@ -3808,6 +3830,46 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# zhcn step 4 (inert prep): source gate for the non-FA staging route and size shared by the dispatch and the
+# measure visitor, and for the visitor's row (host test: test-context-nonfa-stage).
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-nonfa-stage-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-nonfa-stage-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-7gno: source gate for the auto n_ubatch trial's hoisted block (the decisions the planned ladder's rung set
+# depends on are made before the memory module exists; the [SYCL-PLAN] lines stay in the ladder, byte for byte).
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-auto-ubatch-hoist-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-auto-ubatch-hoist-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-txho: llama-context.cpp must compile with neither GGML_USE_SYCL nor GGML_BACKEND_DL (syntax-only, no build
+# directory needed), and the SYCL-only helper the shared code calls keeps a non-SYCL definition.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-llama-context-cpu-only-compile
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-llama-context-cpu-only-compile.py
+        LABEL "python;source-assert"
+        TIMEOUT 300)
+endif()
+
+# llama.cpp-7gno (RED): source gate for the constructor's planned-reserve wiring (hoisted ladder block, the
+# plan_caps decision and acquisition, the fixpoint before create_memory). Production-unreachable until 7gno.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-fixpoint-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fixpoint-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # zhcn C7h-3: source gate for the load-time measure (the unwind order of its locals, the CPU backend last,
 # the one refusal text) and the loader's single late-check call between the dev_layer sync and the mappings.
 if (Python3_Interpreter_FOUND)
@@ -3864,6 +3926,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-kpjw (review r7): the hold ledger's wiring -- settle release ordering, the fit-refusal exception type, the
+# pinned -ub's epoch refresh, the non-FA check's ledger free, and the scoped scheduler-allocation helpers (K-shift and
+# the projector included) -- with a mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-hold-ledger-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-hold-ledger-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-pyu4: executes the pure helpers in src/llama-auto-ubatch.h --
 # llama_auto_ubatch_ladder_has_candidate(), the predicate behind the trial's
 # early exit before its ladder loop, on the shapes where no rung lies in
@@ -3891,6 +3964,10 @@ llama_build_and_test(test-fused-resolution-report.cpp)
 # measured compute caps and merged with the backend's demands, the tenant key digest and
 # the plan line's head. Header-only over ggml-sycl.h's wire structs: no device.
 llama_build_and_test(test-context-tenant-section.cpp)
+
+# llama.cpp-7gno (RED): the plan_caps decision and the demote-only residency fixpoint, pure host over stubs
+# (src/llama-residency-fixpoint.h). No model, no device.
+llama_build_and_test(test-residency-fixpoint.cpp)
 
 # zhcn C7h-3: the load-time measure's plan-override guard (installs once, clears once on every exit, names a
 # missing or refused install) and its size-0 weight stand-ins (set on the tensors that have no buffer,

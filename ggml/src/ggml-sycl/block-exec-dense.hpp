@@ -232,7 +232,7 @@ enum dense_graph_off {
     DENSE_GRAPH_OFF_HOST_INPUTS,    // GGML_SYCL_DISABLE_DECODE_GRAPH_HOST_INPUTS and the graph has host inputs
     DENSE_GRAPH_OFF_FA_UNVERIFIED,  // the whole-graph FA gate refuses
     DENSE_GRAPH_OFF_INCOMPATIBLE,   // check_graph_compatibility refuses
-    DENSE_GRAPH_OFF_STAGE_FAILED,   // the executor fell back to the per-op path
+    DENSE_GRAPH_OFF_STAGE_FAILED,   // the executor fell back to the per-op path, or the input pre-stage declined
     DENSE_GRAPH_OFF_LAST = DENSE_GRAPH_OFF_STAGE_FAILED,
 };
 

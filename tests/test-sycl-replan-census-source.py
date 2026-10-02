@@ -281,7 +281,7 @@ def gate3(files, bad):
 # --------------------------------------------------------------------------------------
 GLOBAL_CLEAR_EFFECTS = ("release_graph_retained_handles", "ggml_sycl_cpu_staging_cache_clear", "graph_unpin_moe_experts",
                         "graph_unpin_weights")
-CLEAR_ACTIVE_CALLERS = 12  # the design lists eleven; optional-layouts-retire (dkw0) is the twelfth on this base
+CLEAR_ACTIVE_CALLERS = 13  # the design lists eleven; optional-layouts-retire (dkw0) is the twelfth on this base, and the legacy re-record path's prestage-declined clear (master, with graph_prestage_or_decline) the thirteenth
 
 
 def gate23(files, bad):
@@ -1118,11 +1118,11 @@ def mutants(files):
            edit(files, M, "    graph_unpin_moe_experts(ctx);\n    graph_unpin_weights(ctx);\n}\n\n// Owner-targeted",
                 "    graph_unpin_weights(ctx);\n}\n\n// Owner-targeted", "g23d"),
            "does not call graph_unpin_moe_experts exactly once")
-    yield ("a twelfth clear_active caller",
+    yield ("a fourteenth clear_active caller (one past the thirteen listed)",
            edit(files, M, "static void ggml_sycl_release_graph_leases_for_owner(ggml_sycl::lifecycle::ModelToken owner) noexcept {",
                 "static void ggml_sycl_stray_clear(ggml_backend_sycl_context * c) { sycl_exec_graph_clear_active(c, \"stray\"); }\n"
                 "static void ggml_sycl_release_graph_leases_for_owner(ggml_sycl::lifecycle::ModelToken owner) noexcept {", "g23e"),
-           "has 13 callers")
+           "has 14 callers")
 
     yield ("an unlisted host_task",
            edit(files, M, "static size_t ggml_sycl_host_chunk_cap_constant() {",

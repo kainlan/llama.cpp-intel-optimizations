@@ -157,7 +157,11 @@ _DRIFT_ARM = z(
     'if (rc == GGML_SYCL_LIFECYCLE_BUSY) { LLAMA_LOG_ERROR("[CONTEXT-PLAN-BUG] publish answered BUSY under the '
     'replan scope: module guard drifted\\n"); }'
 )
-_REFUSED_RETURN = z('return { sched_reserve_status::REFUSED, format("failed to activate exact SYCL model plan: result=%d", (int) rc) };')
+# the third member is the fit verdict (llama.cpp-kpjw): only a plan the transaction refused lowers the auto -ub rung
+_REFUSED_RETURN = z(
+    'return { sched_reserve_status::REFUSED, format("failed to activate exact SYCL model plan: result=%d", (int) rc), '
+    "rc == GGML_SYCL_LIFECYCLE_PLAN_REJECTED };"
+)
 _REFUSED_ARM = z('if (rc != GGML_SYCL_LIFECYCLE_OK) { ') + _REFUSED_RETURN + "}"
 _OK_RETURN = z('return { sched_reserve_status::OK, "" };')
 

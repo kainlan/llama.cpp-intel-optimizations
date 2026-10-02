@@ -309,6 +309,236 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
     return true;
 }
 
+bool zone_dense_scratch_total_bytes(size_t   mmq_bytes_per_token,
+                                    size_t   f16_weight_bytes,
+                                    size_t   f16_src1_bytes_per_token,
+                                    uint32_t n_ubatch,
+                                    size_t * out) {
+    if (!out) {
+        return false;
+    }
+    size_t q8   = 0;
+    size_t src0 = 0;
+    size_t src1 = 0;
+    if (!zone_mmq_src1_scratch_bytes(mmq_bytes_per_token, n_ubatch, &q8) ||
+        !zone_dequant_f16_plan_bytes(f16_weight_bytes, f16_src1_bytes_per_token, n_ubatch, &src0, &src1)) {
+        return false;
+    }
+    if (q8 > SIZE_MAX - src0 || q8 + src0 > SIZE_MAX - src1) {
+        return false;
+    }
+    *out = q8 + src0 + src1;
+    return true;
+}
+
+uint32_t zone_dense_scratch_largest_ubatch(size_t   mmq_bytes_per_token,
+                                           size_t   f16_weight_bytes,
+                                           size_t   f16_src1_bytes_per_token,
+                                           size_t   other_runtime_bytes,
+                                           size_t   capacity_bytes,
+                                           uint32_t search_max) {
+    constexpr uint32_t k_row_group = 32;
+    if (other_runtime_bytes >= capacity_bytes) {
+        return 0;
+    }
+    const size_t avail = capacity_bytes - other_runtime_bytes;
+    uint32_t     ub    = search_max / k_row_group * k_row_group;
+    // The total is monotonic in n_ubatch, so step down from the bound until it fits. A hopeless zone (the weight
+    // copy alone is too big) walks the whole range, at most search_max / 32 cheap steps, once per transaction.
+    for (; ub >= k_row_group; ub -= k_row_group) {
+        size_t total = 0;
+        if (zone_dense_scratch_total_bytes(mmq_bytes_per_token, f16_weight_bytes, f16_src1_bytes_per_token, ub,
+                                           &total) &&
+            total <= avail) {
+            return ub;
+        }
+    }
+    return 0;
+}
+
+bool zone_planned_scratch_hold_bytes(const zone_planned_buffer * buffers, size_t count, size_t * out) {
+    if (!out || (count != 0 && !buffers)) {
+        return false;
+    }
+    size_t hold = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (buffers[i].capacity >= buffers[i].plan) {
+            continue;
+        }
+        if (buffers[i].plan > SIZE_MAX - hold) {
+            return false;
+        }
+        hold += buffers[i].plan;
+    }
+    *out = hold;
+    return true;
+}
+
+bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size) {
+    // Written as two comparisons so that neither a huge hold nor a huge size can wrap into "fits".
+    return hold <= available && size <= available - hold;
+}
+
+static size_t zone_hold_scale_request(size_t request, uint32_t from_n_ubatch, uint32_t to_n_ubatch) {
+    if (from_n_ubatch == 0 || to_n_ubatch == 0 || from_n_ubatch == to_n_ubatch || request == 0) {
+        return request;
+    }
+    if (request > SIZE_MAX / to_n_ubatch) {
+        return SIZE_MAX;
+    }
+    const size_t product = request * to_n_ubatch;
+    return product > SIZE_MAX - (from_n_ubatch - 1) ? SIZE_MAX : (product + from_n_ubatch - 1) / from_n_ubatch;
+}
+
+size_t zone_hold_spill_bound(size_t plan, size_t request_hwm, uint32_t hwm_n_ubatch, uint32_t n_ubatch) {
+    if (plan == 0) {
+        return 0;
+    }
+    const size_t request = zone_hold_scale_request(request_hwm, hwm_n_ubatch, n_ubatch);
+    return request > SIZE_MAX - plan ? SIZE_MAX : plan + request;
+}
+
+size_t zone_hold_spill_raw_demand(size_t spill_bound, size_t kv_zone_free) {
+    return spill_bound > kv_zone_free ? spill_bound - kv_zone_free : 0;
+}
+
+size_t zone_kv_room_for_compute(size_t kv_largest_free, size_t kv_pending_bytes) {
+    return kv_pending_bytes >= kv_largest_free ? 0 : kv_largest_free - kv_pending_bytes;
+}
+
+bool zone_hold_spill_bound_fits(size_t free_before, size_t headroom_target, size_t bound) {
+    // The hold is blamed only when ITS demand is what pushes the card under the headroom: the card was above it
+    // without the demand and is below it with. Two comparisons, so that neither a huge bound nor a huge headroom wraps.
+    if (bound == 0 || free_before < headroom_target) {
+        return true;
+    }
+    return bound <= free_before && free_before - bound >= headroom_target;
+}
+
+size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
+    if (!in.rungs || in.n_rungs == 0) {
+        return 0;
+    }
+    bool   own         = false;
+    size_t own_request = 0;
+    for (size_t i = 0; i < in.n_rungs; ++i) {
+        if (in.rungs[i].n_ubatch == n_ubatch) {
+            own         = true;
+            own_request = std::max(own_request, in.rungs[i].bytes);
+        }
+    }
+    if (own) {
+        return own_request;
+    }
+    size_t scaled = 0;
+    for (size_t i = 0; i < in.n_rungs; ++i) {
+        scaled = std::max(scaled, zone_hold_scale_request(in.rungs[i].bytes, in.rungs[i].n_ubatch, n_ubatch));
+    }
+    return scaled;
+}
+
+size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
+    if (n_ubatch == 0 || !in.plan_of) {
+        return 0;
+    }
+    const size_t plan = in.plan_of(in.plan_ctx, n_ubatch);
+    // The request is already the rung's own (or scaled to it), so the bound is asked with it at this n_ubatch.
+    return zone_hold_spill_raw_demand(
+        zone_hold_spill_bound(plan, zone_hold_fit_request(in, n_ubatch), n_ubatch, n_ubatch), in.kv_room);
+}
+
+bool zone_hold_fit(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
+    return zone_hold_spill_bound_fits(in.free_before, in.headroom_target, zone_hold_fit_demand(in, n_ubatch));
+}
+
+uint32_t zone_hold_fit_largest_ub(const zone_hold_fit_inputs & in, uint32_t n_ubatch) {
+    if (n_ubatch == 0) {
+        return 0;
+    }
+    if (zone_hold_fit(in, n_ubatch)) {
+        return n_ubatch;
+    }
+    if (n_ubatch < 32) {
+        return 0;
+    }
+    uint32_t rung = 32;
+    while (rung <= n_ubatch / 2) {
+        rung <<= 1;
+    }
+    for (; rung >= 32; rung >>= 1) {
+        if (zone_hold_fit(in, rung)) {
+            return rung;
+        }
+    }
+    return 0;
+}
+
+size_t zone_hold_free_cold(size_t driver_free, size_t raw_live) {
+    return raw_live > SIZE_MAX - driver_free ? SIZE_MAX : driver_free + raw_live;
+}
+
+size_t zone_hold_free_before(size_t cold, size_t persistent_raw) {
+    return persistent_raw >= cold ? 0 : cold - persistent_raw;
+}
+
+size_t zone_hold_persistent_raw(size_t raw_held, size_t compute_live, bool rung_live) {
+    if (!rung_live) {
+        return raw_held;
+    }
+    return compute_live >= raw_held ? 0 : raw_held - compute_live;
+}
+
+size_t zone_hold_cold_update(bool have_baseline, size_t baseline, size_t candidate) {
+    return have_baseline && baseline > candidate ? baseline : candidate;
+}
+
+size_t zone_hold_pick_kv_room(bool rung_live, bool have_epoch, size_t epoch_kv_room, size_t live_kv_room) {
+    return rung_live && have_epoch ? epoch_kv_room : live_kv_room;
+}
+
+size_t zone_hold_nonfa_demand(size_t nonfa_scratch, size_t hold_spill) {
+    return hold_spill > SIZE_MAX - nonfa_scratch ? SIZE_MAX : nonfa_scratch + hold_spill;
+}
+
+bool zone_runtime_spill_prefers_kv_zone(bool   compute_spill_flag,
+                                        bool   runtime_zone,
+                                        bool   forbid_spill,
+                                        bool   zone_misses,
+                                        size_t kv_zone_free,
+                                        size_t alloc_size) {
+    return compute_spill_flag && runtime_zone && !forbid_spill && zone_misses && alloc_size <= kv_zone_free;
+}
+
+bool zone_runtime_alloc_held_back(bool   runtime_zone,
+                                  bool   forbid_spill,
+                                  size_t zone_available,
+                                  size_t hold,
+                                  size_t alloc_size) {
+    // Held back means the zone ALONE would have served the request and the hold is what keeps it out. A request
+    // larger than the free bytes spills with or without a hold (an ordinary zone-full spill, which the allocator
+    // handles exactly as it did before the hold existed), and with no hold there is nothing to keep it out.
+    return runtime_zone && !forbid_spill && hold > 0 && alloc_size <= zone_available &&
+           !zone_runtime_alloc_respects_hold(zone_available, hold, alloc_size);
+}
+
+bool zone_route_draws_scratch(bool decision_valid,
+                              bool primary_is_unified,
+                              bool primary_draws,
+                              bool fallback_valid,
+                              bool fallback_draws) {
+    if (!decision_valid) {
+        return false;
+    }
+    if (!primary_is_unified) {
+        return primary_draws;
+    }
+    return fallback_valid && fallback_draws;
+}
+
+size_t zone_dense_scratch_merge_input(size_t prev, size_t next, bool other_model_live) {
+    return other_model_live && prev > next ? prev : next;
+}
+
 namespace {
 
 struct underestimate_record {

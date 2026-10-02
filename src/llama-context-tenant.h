@@ -183,6 +183,60 @@ inline bool llama_tenant_section_from_caps(const std::vector<llama_tenant_buft_c
     return true;
 }
 
+// The host tier's HOLD (design 3.3): R_h[i] is the largest COMPUTE_HOST slot i any rung of the auto
+// n_ubatch ladder's rung set needs, so the first publish can carve one reservation per host index that
+// every candidate the ladder can try fits in. The value of a rung's slot is read from the section the
+// builder produced for that rung (llama_tenant_section_from_caps above) and from nowhere else, so the
+// hold and the section a publish carries cannot disagree about what a slot's bytes are.
+struct llama_tenant_host_hold {
+    std::vector<uint64_t> bytes;        // R_h by host slot index; 0 where no rung needs the slot
+    uint32_t              n_rungs = 0;  // the rungs folded in
+};
+
+// Folds one rung's section into the hold: the maximum of each COMPUTE_HOST element's slot_bytes, by index.
+inline void llama_tenant_host_hold_fold(llama_tenant_host_hold &                           hold,
+                                        const std::vector<ggml_sycl_context_tenant_desc> & rung_section) {
+    for (const auto & e : rung_section) {
+        if (e.cohort != GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST) {
+            continue;
+        }
+        if (hold.bytes.size() <= e.slot_index) {
+            hold.bytes.resize((size_t) e.slot_index + 1, 0);
+        }
+        hold.bytes[e.slot_index] = std::max(hold.bytes[e.slot_index], e.slot_bytes);
+    }
+    hold.n_rungs++;
+}
+
+// Raises the section's COMPUTE_HOST slots to the hold: every index the hold carries gets an element of at
+// least R_h[i] bytes. A slot the section already needs above R_h[i] keeps the live measurement, which is
+// the backend's to refuse against the reservation. Device elements are not touched.
+inline void llama_tenant_section_apply_host_hold(std::vector<ggml_sycl_context_tenant_desc> & section,
+                                                 const llama_tenant_host_hold &               hold) {
+    for (size_t i = 0; i < hold.bytes.size(); ++i) {
+        if (hold.bytes[i] == 0) {
+            continue;
+        }
+        ggml_sycl_context_tenant_desc e = {};
+        e.struct_size                   = sizeof(e);
+        e.cohort                        = GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST;
+        e.slot_index                    = (uint32_t) i;
+        e.device                        = -1;
+        e.slot_bytes                    = hold.bytes[i];
+        llama_tenant_section_add(section, e);
+    }
+}
+
+// The line replay (viii) reads R_h from.
+inline std::string llama_tenant_host_hold_line(const llama_tenant_host_hold & hold) {
+    std::string list;
+    for (size_t i = 0; i < hold.bytes.size(); ++i) {
+        list += (i == 0 ? "" : ",") + std::to_string((unsigned long long) hold.bytes[i]);
+    }
+    return "[CONTEXT-PLAN] host hold: rungs=" + std::to_string(hold.n_rungs) +
+           " slots=" + std::to_string(hold.bytes.size()) + " bytes=" + list;
+}
+
 // The tenant key (design 2.2): a digest of each element's (device, cohort, slot_index,
 // slot_bytes), in that order and in section order. Tier, zone, lifetime and scope are functions
 // of the cohort and struct_size is the publisher's layout, so none of them enter it. FNV-1a, 64

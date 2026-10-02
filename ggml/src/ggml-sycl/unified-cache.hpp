@@ -1242,6 +1242,12 @@ struct placement_plan {
 
     bool has_dense_entry(const std::string & name) const { return name_index_.find(name) != name_index_.end(); }
 
+    // The dense-weight entry for `name`, or nullptr. Same name index as has_dense_entry.
+    const placement_entry * find_dense_entry(const std::string & name) const {
+        auto it = name_index_.find(name);
+        return it != name_index_.end() ? &entries[it->second] : nullptr;
+    }
+
     // Multi-device query: is this tensor on a specific device?
     // Returns true if the tensor is assigned to device_id.
     bool is_on_device(const std::string & name, int dev_id) const {
@@ -1639,19 +1645,133 @@ size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
 // llama.cpp-479i: plan the per-context dense MMQ/MMVQ Q8_1 src1 buffer from the inventory's
 // bytes-per-token (zone_scoped_maxima().mmq_src1_bytes_per_token) at n_ubatch. Folded into
 // unified_cache_get_planned_runtime_zone_requirement(). False on overflow (nothing published).
-bool   unified_cache_set_planned_mmq_src1_scratch(int device_id, size_t bytes_per_token, uint32_t n_ubatch);
+// `other_model_live`: the inputs are device-global, so while another model is live on the device the larger of
+// the old and the new input is kept (a draft loaded beside a target must not shrink the target's plan). The
+// figure is validated BEFORE anything is stored: a rejected one leaves the stored inputs alone, publishes a zero
+// plan and marks the dense scratch invalid, so the fit check refuses instead of trusting stale inputs.
+bool         unified_cache_set_planned_mmq_src1_scratch(int      device_id,
+                                                        size_t   bytes_per_token,
+                                                        uint32_t n_ubatch,
+                                                        bool     other_model_live = false);
 size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id);
 // llama.cpp-479i: plan the per-context dense f16 dequant buffers (src0 copy + src1 copy) from
 // the inventory maxima (zone_scoped_maxima().dequant_f16_weight_bytes / _src1_bytes_per_token) at
 // n_ubatch. Folded into unified_cache_get_planned_runtime_zone_requirement(). False on overflow.
-bool   unified_cache_set_planned_dequant_f16_scratch(int      device_id,
-                                                     size_t   max_weight_bytes,
-                                                     size_t   src1_bytes_per_token,
-                                                     uint32_t n_ubatch);
+bool         unified_cache_set_planned_dequant_f16_scratch(int      device_id,
+                                                           size_t   max_weight_bytes,
+                                                           size_t   src1_bytes_per_token,
+                                                           uint32_t n_ubatch,
+                                                           bool     other_model_live = false);
 // Both buffers' bytes together (what the RUNTIME zone requirement folds in), and each alone: the graph walk
 // ensures each buffer at max(its own plan, the graph's demand).
 size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id);
 size_t unified_cache_get_planned_dequant_f16_buffer_bytes(int device_id, bool src1);
+// llama.cpp-kpjw: re-derive both dense scratch plans at `n_ubatch` from the inputs the load-time setters were last
+// given. The runtime-context transaction calls it with the runtime n_ubatch (auto-ubatch picks it after load).
+// False when nothing was planned for the device or a figure overflowed.
+// `other_model_live`: another context is live on THIS device, so the plan's n_ubatch is the larger of the stored
+// and the new one (a rollback that restores an exact earlier value passes false).
+bool     unified_cache_replan_planned_dense_scratch(int device_id, uint32_t n_ubatch, bool other_model_live = false);
+uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id);
+// The plan's total bytes at `n_ubatch` without changing the published plan (a probe asks this).
+bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_ubatch, size_t * out);
+// Whether the dense scratch at `n_ubatch` fits the RUNTIME zone's CAPACITY beside the other n_ubatch-independent
+// planned consumers. Capacity, not free space: free space depends on which compute buffers are live, capacity is
+// the fact the plan can be held to. `largest_ubatch` (optional) receives n_ubatch when it fits, else the largest
+// multiple of 32 below it that does (0 when none). `needed` / `capacity` are optional diagnostics.
+bool     unified_cache_dense_scratch_runtime_fit(int        device_id,
+                                                 uint32_t   n_ubatch,
+                                                 size_t *   needed,
+                                                 size_t *   capacity,
+                                                 uint32_t * largest_ubatch);
+// RUNTIME-zone bytes a spill-capable allocation must leave free for the planned dense scratch
+// (zone_planned_scratch_hold_bytes). Published by the backend context that owns the buffers; zero when every
+// planned buffer holds its plan. Forbid-spill requests are the claimants and are never held back.
+// The hold records WHICH backend context published it, as a monotonic context id (unified_cache_mint_planned_
+// scratch_owner; never an address, which a later context can reuse). A context that goes away releases only its
+// own hold (unified_cache_release_planned_scratch_hold returns false and changes nothing for any other owner), so
+// the teardown of one context cannot drop the hold another live context still depends on. The (bytes, owner) pair
+// moves as one unit behind a mutex.
+uint64_t unified_cache_mint_planned_scratch_owner();
+void     unified_cache_set_planned_scratch_hold(int device_id, size_t bytes, uint64_t owner);
+size_t   unified_cache_get_planned_scratch_hold(int device_id);
+void     unified_cache_get_planned_scratch_hold_state(int device_id, size_t * bytes, uint64_t * owner);
+bool     unified_cache_release_planned_scratch_hold(int device_id, uint64_t owner);
+// The scheduler compute-buffer requests the device has been asked for, PER RUNG (per n_ubatch): the largest one made
+// while that rung's plan was the published one. A held-back request spills WHOLE, so the most the hold can push
+// outside the arena is the hold plus the largest such request (zone_hold_fit_demand). The record is per rung and
+// survives a publish, so a rung's verdict depends on that rung's own measurement and not on which other rungs ran
+// before it; it is dropped with the owner. Requests before the first publish are load-time ones and are not
+// recorded. `note` is the allocator's single take of the hold state per request: it records `bytes` when `record`
+// (a SCHEDULER COMPUTE request, spill-capable: never a state-class buffer such as the recurrent state, which goes
+// through the same buffer type) and returns the hold the caller decides with.
+size_t       unified_cache_note_runtime_request(int device_id, size_t bytes, bool record);
+// The most per-rung compute-request records the hold keeps for one owner (a ladder plus a descent is a handful). A
+// constant of the header so a caller that sizes a buffer for them can static_assert against it.
+constexpr size_t kHoldRungRecordLimit = 32;
+// The owner's per-rung records, at most `cap` of them; returns how many were written.
+size_t unified_cache_get_hold_rung_requests(int device_id, uint64_t owner, zone_hold_rung_request * out, size_t cap);
+// The same ledger as the hold-fit sees it: every raw device row held on the device, a row still RELEASING included
+// (its physical free has not happened, so it is not free memory), and in `*compute_live` the LIVE ones that are
+// scheduler compute buffers (rows made by a request flagged as one, by origin: the rung's own bytes, which the
+// realized check credits back). One registry pass, so the two figures are consistent with each other.
+size_t       unified_cache_raw_device_held_bytes(int device_id, size_t * compute_live);
+// The card's free memory WITHOUT the rung's own compute buffers, from the ledger and never a driver read after a
+// release. A window's baseline (the free memory with no raw cache allocation held: `driver_free_now` plus the raw
+// bytes held) is the MAXIMUM reading taken since the owner's last publish (a driver's credit for a freed buffer lags,
+// and a lag only lowers a reading), and a publish opens a new window. The result is that baseline less the raw bytes
+// that stay held without the rung: every raw row, a RELEASING one included, except (when `rung_live`, the realized
+// check) the LIVE scheduler compute rows, which are the rung's own. Identity is by origin, so a raw row made after
+// the epoch began that is not a scheduler compute buffer (the recurrent state) is persistent.
+// Everything the registry does not hold is invisible to the ledger and each such consumer errs toward ADMITTING
+// (another tenant arriving mid-window, the driver's own graph/JIT/oneDNN allocations); a stale-low first reading errs
+// toward refusing until a later one repairs it.
+size_t unified_cache_hold_free_before(int device_id, uint64_t owner, size_t driver_free_now, bool rung_live);
+// The epoch's KV room snapshot (zone_kv_room_for_compute at the publish), and the n_ubatch of the epoch; 0 when the
+// owner has no epoch. The realized check asks the same function the publish did, over the same room.
+bool   unified_cache_get_hold_epoch(int device_id, uint64_t owner, uint32_t * n_ubatch, size_t * kv_room);
+// Replaces the epoch's KV room and nothing else. A pinned -ub publishes once, BEFORE the memory module (the KV cache,
+// the recurrent state) exists, so the room its epoch began with predates both; the context re-reads it once they exist
+// and before the compute buffers are reserved. A no-op for another owner or before the first publish.
+void         unified_cache_refresh_hold_epoch_kv_room(int device_id, uint64_t owner, size_t kv_room);
+// How many calls of unified_cache_note_runtime_request the per-rung record cap (kHoldRungRecordLimit) refused for this
+// owner: a call count, not a rung count, read by the host test only (production reports the first refusal as a WARN).
+size_t       unified_cache_hold_rung_record_refusals(int device_id, uint64_t owner);
+// A spill-capable RUNTIME request that the hold kept out of the zone, counted per device by where the buffer landed:
+// `in_arena` is a placement in the arena's KV zone (the compute-buffer path tries it first), otherwise raw device
+// memory outside the arena, which is what eats the driver headroom. The first one of each kind since the last take
+// is a WARN naming the requester `tag` and the bytes: a hold-induced spill was silent. The owning context takes
+// (and so resets) the counts at teardown and reports them with its [SCRATCH-STATS] lines; a take by any other
+// context leaves them alone.
+void         unified_cache_note_planned_hold_spill(int          device_id,
+                                                   const char * tag,
+                                                   size_t       bytes,
+                                                   size_t       hold,
+                                                   size_t       available,
+                                                   bool         in_arena);
+
+struct planned_hold_spill_totals {
+    uint64_t raw_count   = 0;  // outside the arena
+    size_t   raw_bytes   = 0;
+    uint64_t arena_count     = 0;  // in the arena's KV zone, kept out of the RUNTIME zone by the hold
+    size_t   arena_bytes = 0;
+    uint64_t zone_full_count = 0;  // in the arena's KV zone because the RUNTIME zone was simply full
+    size_t   zone_full_bytes = 0;
+};
+
+void         unified_cache_take_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out);
+// A publish starts a new epoch for the owner at `n_ubatch`: the spill counters since the previous publish are forgotten
+// (the once-only WARN latches and the per-rung request records are not). `kv_room` is the KV-zone room a compute buffer
+// could count on at this publish, kept so the realized check judges with the inputs the publish did. The
+// runtime-context transaction calls this when it publishes, so what the get below reports is what THIS plan's own
+// reserves did (a losing auto-ubatch rung's spills do not decide the next rung), and the totals the owner's teardown
+// take reports are the finished context's own. A call by anyone but the hold's owner changes nothing.
+void         unified_cache_begin_planned_hold_epoch(int device_id, uint64_t owner, uint32_t n_ubatch, size_t kv_room);
+// A compute buffer the RUNTIME zone did not serve for want of room (not because the hold kept it out) and the KV zone
+// took instead of raw device memory: counted, and warned about once per context.
+void unified_cache_note_zone_full_kv_placement(int device_id, const char * tag, size_t bytes, size_t runtime_free);
+void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out);
+
 void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
 // The primitive-API weights+activations pair's own planned requirement,
 // WITHOUT the Graph-scratch allocator's additive floor (llama.cpp-gwno
@@ -5810,6 +5930,13 @@ struct alloc_constraints {
     //                       interim-floor miss reported against that ticket.
     bool         cascade_step               = false;
     const char * unconverted_ticket         = nullptr;
+    // llama.cpp-kpjw: a compute buffer (the scheduler's backend buffers) that the RUNTIME zone will not serve --
+    // held back by the planned dense scratch's hold, or larger than the zone's free bytes -- is placed in the arena's
+    // KV zone first, and falls to raw device memory outside the arena only when that has no room. Raw spill eats the
+    // driver headroom the arena expects the card to keep outside itself; the KV zone is the in-arena home for the
+    // request class (it was the caller's own fallback, reached only when the allocator refused outright). Set by
+    // the buffer allocator alone; every other request class keeps the pre-existing spill path.
+    bool         spill_to_kv_zone_before_raw = false;
 };
 
 // Construction-site label. Each type a site builds and hands to an allocator
@@ -6224,6 +6351,15 @@ bool allocation_registry_test_claim_reached() noexcept;
 // (erased); false for a LIVE row (llama.cpp-93tw).
 bool                      allocation_registry_test_claim_ptr(void * ptr) noexcept;
 void allocation_registry_test_erase(void * ptr) noexcept;
+// llama.cpp-kpjw: a host-only registry row for the hold-fit ledger tests (tests/test-hold-ledger.cpp): a raw
+// device-VRAM row of `bytes` on `device`, LIVE or RELEASING, optionally flagged as a scheduler compute buffer or as an
+// arena sub-allocation. No physical allocation, no physical release. False if `ptr` already has a row.
+bool                      allocation_registry_test_publish_raw(void * ptr,
+                                                               int    device,
+                                                               size_t bytes,
+                                                               bool   scheduler_compute,
+                                                               bool   from_arena,
+                                                               bool   releasing) noexcept;
 #endif
 
 // Foundation owner path. The intrusive control is allocated before any physical

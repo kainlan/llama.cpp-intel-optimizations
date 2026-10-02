@@ -165,7 +165,7 @@ def wrapper_ok(code: str) -> bool:
     w = function_body(code, _WRAPPER)
     return (
         z("const sched_reserve_result result = sched_reserve_transaction();") in w
-        and z("if (result.status != sched_reserve_status::OK) { throw std::runtime_error(result.reason); }") in w
+        and z("if (result.status != sched_reserve_status::OK) { if (result.fit_refusal) { throw llama_auto_ubatch_fit_refusal(result.reason); } throw std::runtime_error(result.reason); }") in w
         and z("if (!sched_need_reserve) { return; }") in w
     )
 
@@ -202,7 +202,7 @@ def types_ok(header: str) -> bool:
         return False
     if z("enum class sched_reserve_mode { MEASURE, ALLOC };") not in h:
         return False
-    if z("struct sched_reserve_result { sched_reserve_status status = sched_reserve_status::OK; std::string reason; };") not in h:
+    if z("struct sched_reserve_result { sched_reserve_status status = sched_reserve_status::OK; std::string reason; bool fit_refusal = false; };") not in h:
         return False
     # the impl's declaration names the result type
     return z("sched_reserve_result sched_reserve_impl(sched_reserve_mode mode, sched_reserve_state & state);") in h
@@ -223,7 +223,7 @@ def test_type_mutants():
         return (
             z("enum class sched_reserve_status { OK, REFUSED, FAILED };") in text
             and z("enum class sched_reserve_mode { MEASURE, ALLOC };") in text
-            and z("struct sched_reserve_result { sched_reserve_status status = sched_reserve_status::OK; std::string reason; };") in text
+            and z("struct sched_reserve_result { sched_reserve_status status = sched_reserve_status::OK; std::string reason; bool fit_refusal = false; };") in text
             and z("sched_reserve_result sched_reserve_impl(sched_reserve_mode mode, sched_reserve_state & state);") in text
         )
 

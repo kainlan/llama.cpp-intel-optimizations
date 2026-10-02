@@ -55,7 +55,11 @@ def z(text: str) -> str:
     return re.sub(r"(?<!\w) | (?!\w)", "", re.sub(r"\s+", " ", text))
 
 
-_TRIAL_START = z("void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) {")
+# llama.cpp-7gno: the trial is two functions. The hoisted block (sycl_auto_ubatch_prepare) makes the cap, the cache
+# lookup and the rung set once, before the memory module exists, and sits right before sycl_select_auto_ubatch (the
+# ladder, the settle, the outcome lines), which reads them from the prep. One slice from the first to the end marker is
+# the trial.
+_TRIAL_START = z("void llama_context::sycl_auto_ubatch_prepare(ggml_type type_k, ggml_type type_v) {")
 _TRIAL_END = z("static int llama_graph_n_input_tensors(ggml_cgraph * gf, bool log) {")
 _CTOR_START = z("bool sycl_auto_ubatch_trial = false;")
 _CTOR_END = z("if (!cparams.flash_attn) {")
@@ -136,8 +140,11 @@ def cap_ok(b: str) -> bool:
              "moe_cap, moe_cap_available, &moe_bound);")
     if init not in b:
         return False
-    # exactly one write to `cap`, and it is the initializer
-    if len(_CAP_WRITE_RE.findall(b)) != 1:
+    # exactly one write to `cap`, and it is the initializer: the ladder half only reads the hoisted block's value
+    read = z("const uint32_t cap = prep.cap;")
+    if b.count(read) != 1:
+        return False
+    if len(_CAP_WRITE_RE.findall(b.replace(read, "", 1))) != 1:
         return False
     # no inline min left beside the helper
     return "std::min(cparams.n_batch" not in b
@@ -145,7 +152,7 @@ def cap_ok(b: str) -> bool:
 
 def test_cap_is_written_once_by_the_helper():
     assert cap_ok(trial()), (
-        "sycl_select_auto_ubatch's cap must be written exactly once, by its initializer "
+        "the trial's cap must be written exactly once, by the hoisted block's initializer "
         "`= llama_auto_ubatch_cap(cparams.n_batch, cparams.n_ctx, model.hparams.n_expert, moe_cap, "
         "moe_cap_available, &moe_bound)`, with no inline std::min"
     )
@@ -179,7 +186,7 @@ def loop_of(b: str) -> str:
     a = b.find(_LOOP_HEAD)
     if a == -1:
         return ""
-    e = b.find(z("if (last_good == 0) {"), a)
+    e = b.find(z("const bool stop_is_pure_race"), a)
     return b[a:e] if e != -1 else ""
 
 
@@ -200,7 +207,7 @@ def ladder_ok(b: str) -> bool:
     # the resume skip and the stop-on-refusal break stay
     if z("if (c <= cache_resume_above) { continue; }") not in loop:
         return False
-    return z("if (reason != nullptr) { stop = reason; break; }") in loop
+    return z("if (reason != nullptr) { stop = reason; note_loss(c, reason); break; }") in loop
 
 
 def test_ladder_iterates_only_the_rung_set_members():
@@ -215,7 +222,7 @@ def test_ladder_mutants():
     mutants = {
         "direct iteration of the raw ladder": ("for (uint32_t c : rung_ladder) {", "for (uint32_t c : ladder) {"),
         "direct iteration by reference": ("for (uint32_t c : rung_ladder) {", "for (const auto & c : ladder) {"),
-        "break on refusal becomes continue": ("if (reason != nullptr) { stop = reason; break; }", "if (reason != nullptr) { stop = reason; continue; }"),
+        "break on refusal becomes continue": ("if (reason != nullptr) { stop = reason; note_loss(c, reason); break; }", "if (reason != nullptr) { stop = reason; note_loss(c, reason); continue; }"),
         "per-rung cap break restored": ("for (uint32_t c : rung_ladder) {", "for (uint32_t c : rung_ladder) { if (c > cap) { break; }"),
         "per-rung floor skip restored": ("for (uint32_t c : rung_ladder) {", "for (uint32_t c : rung_ladder) { if (c < fallback_ubatch) { continue; }"),
         "resume skip dropped": ("if (c <= cache_resume_above) { continue; }", ""),

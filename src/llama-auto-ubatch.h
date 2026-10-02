@@ -2,16 +2,73 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 
 // Pure helpers behind the SYCL auto micro-batch trial
 // (llama_context::sycl_select_auto_ubatch). They take plain integers and
 // touch no context or backend state, so tests/test-auto-ubatch-ladder.cpp
 // executes them on the host.
 
+// The one exception a compute-buffer reserve throws when the rung's compute buffers did not fit: a fit verdict, the
+// kind of loss that lets the auto-ubatch trial descend. Everything else a reserve throws (a lifecycle result such as
+// BUSY or STALE_IDENTITY, a memory module that would not initialize) is no verdict on the rung and never lowers -ub.
+struct llama_auto_ubatch_fit_refusal : public std::runtime_error {
+    explicit llama_auto_ubatch_fit_refusal(const std::string & what) : std::runtime_error(what) {}
+};
+
 // The trial's candidate micro-batch sizes, ascending.
 static const uint32_t llama_auto_ubatch_ladder[] = { 512, 1024, 2048, 4096 };
 static const size_t   llama_auto_ubatch_ladder_size =
     sizeof(llama_auto_ubatch_ladder) / sizeof(llama_auto_ubatch_ladder[0]);
+
+// The smallest n_ubatch the trial lowers itself to (llama.cpp-kpjw).
+static const uint32_t llama_auto_ubatch_descent_floor = 64;
+
+// The next rung of the trial's downward continuation: half of `from`, rounded down to a multiple of 64, or 0 when
+// that is under llama_auto_ubatch_descent_floor (nothing below it) or `from` is 0. When the default rung, and so
+// every rung above it, is refused, the trial lowers n_ubatch rather than refusing the context: a smaller -ub is not
+// a smaller context (B50, Qwen3.6-27B auto: 512 spilled a 495 MB compute buffer outside the arena and left 107.7 MB
+// against the 256 MB driver headroom; 256 spills half of that and fits).
+inline uint32_t llama_auto_ubatch_next_lower(uint32_t from) {
+    const uint32_t half = from / 2;
+    return half >= llama_auto_ubatch_descent_floor ? half - half % 64 : 0;
+}
+
+// The downward continuation itself: `try_rung(c)` is asked about each rung below `fallback` in turn (largest
+// first, rungs above `cap` skipped, not asked) and answers true for a rung that fits. Returns the first rung that
+// fits, or 0 when none does. The trial runs this only after the ascending ladder found nothing at or above the
+// default, so the answer is the largest rung under it, never a smaller one than needed.
+template <typename F> inline uint32_t llama_auto_ubatch_descend(uint32_t fallback, uint32_t cap, F try_rung) {
+    for (uint32_t c = llama_auto_ubatch_next_lower(fallback); c != 0; c = llama_auto_ubatch_next_lower(c)) {
+        if (c > cap) {
+            continue;
+        }
+        if (try_rung(c)) {
+            return c;
+        }
+    }
+    return 0;
+}
+
+// The -ub a refusal names (llama.cpp-kpjw, kpjw-g7). `largest_fit` is the answer of the one hold-spill fit function (the
+// largest -ub it accepts, 0 when none is known to fit); `lowest_refused` is the smallest rung this start already asked
+// and lost (0: none yet). The advice is never a rung that was refused: an answer under `lowest_refused` stands, and
+// one at or above it (the fit function accepts a rung that lost for another reason) is capped to the largest power of
+// two strictly under it. Under the descent floor there is nothing to name, so the answer is 0.
+inline uint32_t llama_auto_ubatch_advice(uint32_t largest_fit, uint32_t lowest_refused) {
+    if (largest_fit == 0) {
+        return 0;
+    }
+    if (lowest_refused == 0 || largest_fit < lowest_refused) {
+        return largest_fit;
+    }
+    uint32_t p = 1;
+    while (p <= lowest_refused / 2 && p * 2 < lowest_refused) {
+        p *= 2;
+    }
+    return lowest_refused > 1 && p >= llama_auto_ubatch_descent_floor ? p : 0;
+}
 
 // True iff some rung of `ladder` lies in [ubatch_floor, ubatch_cap]. The
 // trial's ladder loop skips every rung below `ubatch_floor` (the caller's own

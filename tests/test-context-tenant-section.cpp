@@ -18,7 +18,16 @@
 //   (6) a device-tier buft with no device index is a named refusal, not a guess;
 //   (7) the tenant key is a digest of (device, cohort, slot_index, slot_bytes) in section
 //       order: equal sections give equal keys and any one field changes it;
-//   (8) the plan line's text begins with the fields the scorer matches.
+//   (8) the plan line's text begins with the fields the scorer matches;
+//   (9) the compute term over several chunks is the per-chunk peak, summed;
+//   (10) the host-tier HOLD (design 3.3): R_h[i] is the maximum over the ladder's rungs of the rung
+//       section's COMPUTE_HOST slot i, taken from the section the builder produced (no second
+//       derivation), and the section the publish carries holds R_h[i] at every index. Perturbing one
+//       rung's measurement changes exactly the slots it dominates. This case proves the fold
+//       arithmetic only. That the transaction folds the sections its own MEASUREs produced (and
+//       skips a rung whose MEASURE refuses or throws, and marks the hold ready only after the
+//       loop) is pinned by tests/test-sycl-tenant-section-source.py, which a host test cannot
+//       reach because the transaction lives in llama-context.cpp.
 
 #include "../src/llama-context-tenant.h"
 
@@ -309,6 +318,134 @@ int main() {
         // no measured graph, no term
         llama_tenant_caps_set_peaks(c, {});
         CHECK(c.chunk_bytes.empty() && c.total == 0, "no graphs gave total %zu", c.total);
+    }
+
+    // (10) the host-tier HOLD
+    {
+        // the host caps one rung measured: chunk c of the host buft is host slot c
+        auto host_caps = [](std::vector<size_t> cap) {
+            llama_tenant_buft_caps c;
+            c.device = -1;
+            c.host   = true;
+            c.cap    = std::move(cap);
+            return c;
+        };
+        auto dev_caps = [](int32_t device, std::vector<size_t> cap) {
+            llama_tenant_buft_caps c;
+            c.device = device;
+            c.host   = false;
+            c.cap    = std::move(cap);
+            return c;
+        };
+        // a rung's section, built exactly as the transaction builds it
+        auto rung_section = [&](const std::vector<llama_tenant_buft_caps> & caps) {
+            std::vector<ggml_sycl_context_tenant_desc> s;
+            std::string                                reason;
+            CHECK(llama_tenant_section_from_caps(caps, s, reason), "the builder refused: %s", reason.c_str());
+            return s;
+        };
+        auto host_bytes = [](const std::vector<ggml_sycl_context_tenant_desc> & s, uint32_t index) -> uint64_t {
+            for (const auto & e : s) {
+                if (e.cohort == GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST && e.slot_index == index) {
+                    return e.slot_bytes;
+                }
+            }
+            return 0;
+        };
+        // R_h over a rung set, the way the transaction folds it
+        auto hold_of = [&](const std::vector<std::vector<llama_tenant_buft_caps>> & rungs) {
+            llama_tenant_host_hold hold;
+            for (const auto & caps : rungs) {
+                llama_tenant_host_hold_fold(hold, rung_section(caps));
+            }
+            return hold;
+        };
+
+        // three rungs: 512 < 1024 < 2048. Slot 0 grows with the rung, slot 1 peaks at the middle one, and slot 2
+        // exists only at the top rung.
+        std::vector<std::vector<llama_tenant_buft_caps>> rungs = {
+            { dev_caps(0, { 100 }), host_caps({ 152, 40 })     },
+            { dev_caps(0, { 200 }), host_caps({ 304, 90 })     },
+            { dev_caps(0, { 400 }), host_caps({ 608, 60, 25 }) },
+        };
+        llama_tenant_host_hold hold = hold_of(rungs);
+        CHECK(hold.n_rungs == 3, "three rungs folded, got %u", hold.n_rungs);
+        CHECK(hold.bytes == std::vector<uint64_t>({ 608, 90, 25 }), "R_h is the per-index maximum, got %zu entries",
+              hold.bytes.size());
+
+        // the section the publish carries: the first rung's own section raised to R_h at every host index; the
+        // device slots stay the rung's own measurement
+        std::vector<ggml_sycl_context_tenant_desc> section = rung_section(rungs[0]);
+        llama_tenant_section_apply_host_hold(section, hold);
+        CHECK(host_bytes(section, 0) == 608 && host_bytes(section, 1) == 90 && host_bytes(section, 2) == 25,
+              "slots are %llu %llu %llu", (unsigned long long) host_bytes(section, 0),
+              (unsigned long long) host_bytes(section, 1), (unsigned long long) host_bytes(section, 2));
+        size_t n_dev = 0;
+        for (const auto & e : section) {
+            if (e.cohort == GGML_SYCL_CONTEXT_COHORT_COMPUTE) {
+                CHECK(e.slot_bytes == 100, "a device slot is its own rung's measure, got %llu",
+                      (unsigned long long) e.slot_bytes);
+                n_dev++;
+            }
+        }
+        CHECK(n_dev == 1, "the device slots are not the hold's to change");
+        for (size_t i = 1; i < section.size(); ++i) {
+            CHECK(!llama_tenant_element_less(section[i], section[i - 1]), "the section stays ordered");
+        }
+
+        // one source: the key a rung's section gets does not depend on which rung it was built at, once the hold is
+        // applied to the host slots (the same host slots, the device slot the rung's own)
+        std::vector<ggml_sycl_context_tenant_desc> top = rung_section(rungs[2]);
+        llama_tenant_section_apply_host_hold(top, hold);
+        std::vector<ggml_sycl_context_tenant_desc> mid = rung_section(rungs[1]);
+        llama_tenant_section_apply_host_hold(mid, hold);
+        for (uint32_t i = 0; i < 3; ++i) {
+            CHECK(host_bytes(top, i) == host_bytes(mid, i) && host_bytes(mid, i) == host_bytes(section, i),
+                  "host slot %u differs between rungs under the hold", i);
+        }
+
+        // perturb one rung's measurement: the slot it dominates changes, the others do not
+        auto perturbed             = rungs;
+        perturbed[1].back().cap[1] = 91;  // slot 1, dominated by the middle rung
+        llama_tenant_host_hold p1  = hold_of(perturbed);
+        CHECK(p1.bytes == std::vector<uint64_t>({ 608, 91, 25 }), "slot 1 follows the middle rung, got %llu",
+              (unsigned long long) (p1.bytes.size() > 1 ? p1.bytes[1] : 0));
+        std::vector<ggml_sycl_context_tenant_desc> s1 = rung_section(rungs[0]);
+        llama_tenant_section_apply_host_hold(s1, p1);
+        CHECK(host_bytes(s1, 1) == 91 && host_bytes(s1, 0) == 608 && host_bytes(s1, 2) == 25,
+              "the carried slot changed with the measurement");
+
+        perturbed                  = rungs;
+        perturbed[0].back().cap[1] = 1000;  // a rung that now dominates slot 1
+        CHECK(hold_of(perturbed).bytes[1] == 1000, "a rung's perturbation reaches the slot");
+        perturbed                  = rungs;
+        perturbed[2].back().cap[0] = 50;  // the top rung no longer dominates slot 0: the middle one does
+        CHECK(hold_of(perturbed).bytes[0] == 304, "R_h is a maximum, not the last rung's value");
+
+        // a live need above the hold at an index is the live measurement, left for the backend to refuse
+        std::vector<ggml_sycl_context_tenant_desc> live = rung_section({ dev_caps(0, { 1 }), host_caps({ 700 }) });
+        llama_tenant_section_apply_host_hold(live, hold);
+        CHECK(host_bytes(live, 0) == 700, "a need above R_h is not clipped to it, got %llu",
+              (unsigned long long) host_bytes(live, 0));
+        CHECK(host_bytes(live, 1) == 90 && host_bytes(live, 2) == 25, "the other indices are held at R_h");
+
+        // no host tier: nothing to hold, and an empty hold adds nothing
+        std::vector<ggml_sycl_context_tenant_desc> devonly = rung_section({ dev_caps(0, { 100 }) });
+        llama_tenant_host_hold                     none    = hold_of({ { dev_caps(0, { 100 }) } });
+        CHECK(none.bytes.empty() && none.n_rungs == 1, "a device-only rung holds no host slot");
+        llama_tenant_section_apply_host_hold(devonly, none);
+        CHECK(devonly.size() == 1, "an empty hold adds no element");
+
+        // a zero host slot is no element and no hold
+        llama_tenant_host_hold z = hold_of({ { host_caps({ 0, 5 }) } });
+        CHECK(z.bytes == std::vector<uint64_t>({ 0, 5 }), "a zero cap holds nothing");
+        std::vector<ggml_sycl_context_tenant_desc> zs = rung_section({ host_caps({ 0, 5 }) });
+        llama_tenant_section_apply_host_hold(zs, z);
+        CHECK(zs.size() == 1 && zs[0].slot_index == 1, "a zero hold index makes no element");
+
+        // the line the replay reads
+        const std::string line = llama_tenant_host_hold_line(hold);
+        CHECK(line == "[CONTEXT-PLAN] host hold: rungs=3 slots=3 bytes=608,90,25", "hold line was '%s'", line.c_str());
     }
 
     if (n_failed != 0) {
