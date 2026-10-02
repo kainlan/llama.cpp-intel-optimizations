@@ -26,7 +26,7 @@ Two follow-on facts, pinned here too:
     zone_onednn_scratch_reserve_target (per-component maximum with what is held), so a layer-0 request cannot
     replace the block a later op needed and force the regrowth that failed.
 
-Review r1 added three more (all gated below):
+Three more facts, all gated below:
   * "the scratch supplies this op" is admission AND the type/env enablement (acquire_onednn_pp_scratch refuses
     every type but Q4_0 / Q8_0 / MXFP4 unless GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH forces it, and every type when it
     is 0) AND the plan. The walk asked only admission + plan, so a K-quant op was skipped by the walk and refused by
@@ -229,21 +229,52 @@ def evaluate(backend, cache, cache_hpp):
         backend, r"static bool ggml_sycl_mul_mat_unified_pp_dequant_route\([^)]*\)\s*\{")
     results["anchor: the walk's Route A predicate exists"] = route_a is not None
     if route_a is not None:
+        route_a_norm = re.sub(r"\s+", " ", route_a)
         results["the Route A predicate asks the pure verdict"] = "zone_unified_pp_draws_dequant(" in route_a
-        results["the Route A predicate asks the shared supplies helper"] = SUPPLIES in route_a
-        results["the Route A predicate asks the router"] = ".select(" in route_a
+        results["the Route A predicate reads the router's unified answer"] = \
+            "MatmulBackend::UnifiedKernel" in route_a
         results["the Route A predicate names the unified types"] = "should_use_unified(" in route_a
-    results["the walk counts a Route A node"] = \
-        "ggml_sycl_mul_mat_unified_pp_dequant_route(" in dq_walk
+        results["the Route A predicate keeps the unified-dispatch gate"] = \
+            "ggml_sycl_unified_dispatch_enabled()" in route_a
+        results["the Route A predicate keeps every plain-src1 term"] = \
+            all(t in route_a_norm for t in ("ggml_is_contiguous(src1)", "!ggml_is_transposed(src1)",
+                                            "!ggml_is_permuted(src1)")) and "src1_plain = true" not in route_a_norm
+        results["the Route A predicate passes the pure verdict its own inputs"] = \
+            "(primary_unified, unified_type, src1_plain, pp_candidate, scratch_supplies)" in route_a_norm
+    dq_walk_norm = re.sub(r"\s+", " ", dq_walk)
+    results["the walk counts a Route A node with the answers it already has"] = \
+        "ggml_sycl_mul_mat_unified_pp_dequant_route(src0, src1, primary, pp_candidate, supplied)" in dq_walk_norm
+    results["the walk takes the PP admission from its one supplies call"] = "&pp_candidate)" in dq_walk_norm
     acq_at = backend.find("using_scratch = acquire_onednn_pp_scratch(")
     pool_at = backend.find("src0_f16_alloc.alloc(src0_elems)", acq_at) if acq_at >= 0 else -1
     results["anchor: Route A's acquire and pool fallback exist"] = 0 <= acq_at < pool_at
     if 0 <= acq_at < pool_at:
         seg = backend[acq_at:pool_at]
+        seg_norm = re.sub(r"\s+", " ", seg)
         results["Route A draws the planned src0 dequant buffer before any pool copy"] = \
             re.search(r"ggml_sycl_dequant_f16_scratch\(\s*ctx\.dequant_f16_src0_scratch", seg) is not None
         results["Route A draws the planned src1 dequant buffer before any pool copy"] = \
             re.search(r"ggml_sycl_dequant_f16_scratch\(\s*ctx\.dequant_f16_src1_scratch", seg) is not None
+        # The consumers run on the context's own in-order queue; a planned buffer is race-free on that queue only.
+        results["Route A draws both planned buffers on the context's own queue"] = \
+            "ctx.dequant_f16_src0_scratch, ctx.device, *ctx.stream(), src0," in seg_norm and \
+            "ctx.dequant_f16_src1_scratch, ctx.device, *ctx.stream(), src0," in seg_norm
+        arm_at = seg.find("GGML_SYCL_DEQUANT_F16_ARM")
+        else_at = seg.find("#    else")
+        results["Route A's planned draws sit inside the dequant-arm scope, the pool copy in its #else"] = \
+            0 <= arm_at < seg.find("ggml_sycl_dequant_f16_scratch(") < else_at < pool_at - acq_at
+        # Route A's acquire asks for exactly the helper's pair: N*K and M*K f16 elements.
+        acq_end = backend.find(";", acq_at)
+        acq_norm = re.sub(r"\s+", " ", backend[acq_at:acq_end])
+        results["Route A's acquire asks for the pair the supplies helper derives"] = \
+            "acquire_onednn_pp_scratch(ctx.device, src0->type, weights_bytes, activations_bytes, &weights_scratch, " \
+            "&activations_scratch, pp_scratch_guard)" in acq_norm
+        before = re.sub(r"\s+", " ", backend[max(0, acq_at - 3500):acq_at])
+        results["Route A's pair is N*K and M*K f16 elements"] = \
+            "src0_elems = static_cast<size_t>(N) * static_cast<size_t>(K);" in before and \
+            "src1_elems = static_cast<size_t>(M) * static_cast<size_t>(K);" in before and \
+            "weights_bytes = src0_elems * sizeof(sycl::half);" in before and \
+            "activations_bytes = src1_elems * sizeof(sycl::half);" in before
 
     # ---- m1: Route A has no precision check, so the walk asks it before filtering on precision ----
     pre = dq_walk.find("const ggml_tensor * src1 = node->src[1];")
@@ -289,6 +320,15 @@ def mutate(text, old, new, count=1):
     return text.replace(old, new, count)
 
 
+def mutate_arm_scope(text):
+    """Turn Route A's `#if GGML_SYCL_DEQUANT_F16_ARM` into `#if 1` (comments are already stripped)."""
+    at = text.find("size_t src0_region_bytes = 0;")
+    start = text.rfind("#    if GGML_SYCL_DEQUANT_F16_ARM", 0, at)
+    if at < 0 or start < 0:
+        raise SystemExit("self-test mutation anchor missing: Route A's dequant-arm scope")
+    return text[:start] + "#    if 1" + text[start + len("#    if GGML_SYCL_DEQUANT_F16_ARM"):]
+
+
 def mutate_in_func(text, signature_regex, old, new):
     body = function_body(text, signature_regex)
     if body is None or old not in body:
@@ -321,8 +361,6 @@ if args.self_test and not failed:
                          "ctx.device, src0, src1, dst, ne11)"), cache, cache_hpp)),
         ("walk skips on admission alone", "the walk skips an op only through the shared supplies helper, with src1->ne[1]",
          (mutate_in_func(backend, walk_sig, SUPPLIES_NAME, "ggml_sycl_onednn_pp_candidate("), cache, cache_hpp)),
-        ("walk passes the whole batch", "the walk skips an op only through the shared supplies helper, with src1->ne[1]",
-         (mutate_in_func(backend, walk_sig, "node, src1->ne[1])", "node, ggml_nrows(src1))"), cache, cache_hpp)),
         ("supplies drops the type enablement", "the supplies helper asks the type/env enablement",
          (mutate_in_func(backend, supplies_sig, "onednn_pp_unified_scratch_enabled(", "XXXX("), cache, cache_hpp)),
         ("supplies drops the admission", "the supplies helper asks the PP admission",
@@ -331,13 +369,65 @@ if args.self_test and not failed:
          (mutate_in_func(backend, supplies_sig, "zone_onednn_pp_scratch_supplies(", "zone_XXXX("), cache, cache_hpp)),
         ("enablement bypasses the pure predicate", "the enablement function asks the pure predicate",
          (mutate_in_func(backend, enabled_sig, "zone_onednn_pp_scratch_type_enabled(", "zone_XXXX("), cache, cache_hpp)),
-        ("walk forgets Route A", "the walk counts a Route A node",
+        ("walk forgets Route A", "the walk counts a Route A node with the answers it already has",
          (mutate_in_func(backend, walk_sig, "ggml_sycl_mul_mat_unified_pp_dequant_route(", "ggml_sycl_XXXX("),
           cache, cache_hpp)),
-        ("Route A predicate ignores the router", "the Route A predicate asks the router",
-         (mutate_in_func(backend, route_a_sig, ".select(", ".XXXX("), cache, cache_hpp)),
-        ("Route A predicate skips the supplies question", "the Route A predicate asks the shared supplies helper",
-         (mutate_in_func(backend, route_a_sig, SUPPLIES_NAME, "ggml_sycl_XXXX("), cache, cache_hpp)),
+        ("Route A predicate ignores the router", "the Route A predicate reads the router's unified answer",
+         (mutate_in_func(backend, route_a_sig, "MatmulBackend::UnifiedKernel", "MatmulBackend::LegacyKernel"),
+          cache, cache_hpp)),
+        ("Route A predicate drops the unified-dispatch gate", "the Route A predicate keeps the unified-dispatch gate",
+         (mutate_in_func(backend, route_a_sig, "ggml_sycl_unified_dispatch_enabled() && ", ""), cache, cache_hpp)),
+        ("Route A predicate forces src1 plain", "the Route A predicate keeps every plain-src1 term",
+         (mutate_in_func(backend, route_a_sig,
+                         "ggml_is_contiguous(src1) && !ggml_is_transposed(src1) && !ggml_is_permuted(src1)",
+                         "true"), cache, cache_hpp)),
+        ("Route A predicate drops a plain-src1 term", "the Route A predicate keeps every plain-src1 term",
+         (mutate_in_func(backend, route_a_sig, "&& !ggml_is_permuted(src1)", ""), cache, cache_hpp)),
+        ("Route A predicate swaps the verdict's inputs", "the Route A predicate passes the pure verdict its own inputs",
+         (mutate_in_func(backend, route_a_sig, "pp_candidate,\n                                                    scratch_supplies);",
+                         "scratch_supplies,\n                                                    pp_candidate);"),
+          cache, cache_hpp)),
+        ("walk passes the whole batch to the supplies call", "the walk skips an op only through the shared supplies helper, with src1->ne[1]",
+         (mutate_in_func(backend, walk_sig, "node, src1->ne[1], &pp_candidate)", "node, ggml_nrows(src1), &pp_candidate)"),
+          cache, cache_hpp)),
+        ("walk hands the predicate a constant", "the walk counts a Route A node with the answers it already has",
+         (mutate_in_func(backend, walk_sig, "primary, pp_candidate, supplied)", "primary, true, supplied)"),
+          cache, cache_hpp)),
+        ("walk forgets the admission out-param", "the walk takes the PP admission from its one supplies call",
+         (mutate_in_func(backend, walk_sig, "&pp_candidate)", "nullptr)"), cache, cache_hpp)),
+        ("walk filters on precision again", "the walk's pre-filter does not drop a node on precision",
+         (mutate_in_func(backend, walk_sig, "!ggml_is_contiguous(src0) || ggml_nrows(src1) <= 1",
+                         "!ggml_is_contiguous(src0) || node->op_params[0] != GGML_PREC_DEFAULT || ggml_nrows(src1) <= 1"),
+          cache, cache_hpp)),
+        ("walk ignores the pure arm combination", "the walk combines the two arms through the pure verdict",
+         (mutate_in_func(backend, walk_sig, "zone_walk_f16_node_draws(", "zone_XXXX("), cache, cache_hpp)),
+        ("walk asks the router twice", "the walk asks the router once per node",
+         (mutate_in_func(backend, walk_sig, "const ggml_sycl::MatmulDecision primary      = ctx.matmul_orchestrator.select(src0, src1, node);",
+                         "const ggml_sycl::MatmulDecision primary      = ctx.matmul_orchestrator.select(src0, src1, node);\n        (void) ctx.matmul_orchestrator.select(src0, src1, node);"),
+          cache, cache_hpp)),
+        ("walk asks the admission itself", "the walk asks the PP admission only through the supplies helper",
+         (mutate_in_func(backend, walk_sig, "const bool                      prec_default",
+                         "const bool pp_again = ggml_sycl_onednn_pp_candidate(src0, src1, node, ctx.device); (void) pp_again;\n        const bool                      prec_default"),
+          cache, cache_hpp)),
+        ("Route A predicate asks the router again", "the Route A predicate reuses the walk's answers instead of asking again",
+         (mutate_in_func(backend, route_a_sig, "const bool primary_unified",
+                         "(void) ctx_XXXX.matmul_orchestrator.select(src0, src1, nullptr); const bool primary_unified"),
+          cache, cache_hpp)),
+        ("Route A draws on another queue", "Route A draws both planned buffers on the context's own queue",
+         (mutate(backend, "ctx.dequant_f16_src0_scratch, ctx.device, *ctx.stream(), src0,",
+                 "ctx.dequant_f16_src0_scratch, ctx.device, *ctx.stream(ctx.device, 1), src0,"), cache, cache_hpp)),
+        ("Route A src1 draws on another queue", "Route A draws both planned buffers on the context's own queue",
+         (mutate(backend, "ctx.dequant_f16_src1_scratch, ctx.device, *ctx.stream(), src0,",
+                 "ctx.dequant_f16_src1_scratch, ctx.device, *ctx.stream(ctx.device, 1), src0,"), cache, cache_hpp)),
+        ("Route A draws outside the arm scope", "Route A's planned draws sit inside the dequant-arm scope, the pool copy in its #else",
+         (mutate_arm_scope(backend), cache, cache_hpp)),
+        ("Route A asks acquire for one byte more", "Route A's acquire asks for the pair the supplies helper derives",
+         (mutate(backend, "using_scratch = acquire_onednn_pp_scratch(ctx.device, src0->type, weights_bytes,\n                                                                              activations_bytes,",
+                 "using_scratch = acquire_onednn_pp_scratch(ctx.device, src0->type, weights_bytes,\n                                                                              activations_bytes + 1,"),
+          cache, cache_hpp)),
+        ("Route A's activations lose a factor", "Route A's pair is N*K and M*K f16 elements",
+         (mutate(backend, "const size_t activations_bytes = src1_elems * sizeof(sycl::half);",
+                 "const size_t activations_bytes = src1_elems;"), cache, cache_hpp)),
         ("Route A predicate loses the pure verdict", "the Route A predicate asks the pure verdict",
          (mutate_in_func(backend, route_a_sig, "zone_unified_pp_draws_dequant(", "zone_XXXX("), cache, cache_hpp)),
         ("Route A falls back to the pool again", "Route A draws the planned src0 dequant buffer before any pool copy",

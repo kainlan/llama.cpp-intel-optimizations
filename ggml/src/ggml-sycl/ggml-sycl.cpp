@@ -28273,22 +28273,37 @@ static bool ggml_sycl_onednn_pp_candidate(
 // asks it with its column tile (src1_ncols) and the graph-entry walk with src1->ne[1]; both pairs are derived here,
 // from src0's rows x ne[0] and the columns x src1->ne[0], so the two consumers cannot pass different numbers for
 // the same op. An op it does not supply draws the planned dequant buffers, and the walk sizes exactly those.
-static bool ggml_sycl_onednn_pp_scratch_supplies(
-    int device, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int64_t src1_cols) {
+//
+// `pp_candidate_out` (may be null) receives the PP admission this asked, so a caller that also needs it (the walk's
+// unified-route predicate) does not ask it a second time: the admission traces into a shared budget and the walk
+// runs it for every multi-row node.
+static bool ggml_sycl_onednn_pp_scratch_supplies(int                 device,
+                                                 const ggml_tensor * src0,
+                                                 const ggml_tensor * src1,
+                                                 const ggml_tensor * dst,
+                                                 int64_t             src1_cols,
+                                                 bool *              pp_candidate_out = nullptr) {
+    if (pp_candidate_out) {
+        *pp_candidate_out = false;
+    }
     if (!src0 || !src1 || src1_cols < 0 || src0->ne[0] < 0 || src0->ne[1] < 0 || src1->ne[0] < 0) {
         return false;
     }
     constexpr size_t elem_bytes = sizeof(sycl::half);
     const size_t     w_elems    = static_cast<size_t>(src0->ne[1]) * static_cast<size_t>(src0->ne[0]);
     const size_t     a_elems    = static_cast<size_t>(src1_cols) * static_cast<size_t>(src1->ne[0]);
-    size_t           zone_capacity = 0;
-    const bool       arena_active  = ggml_sycl::unified_cache_get_onednn_zone_capacity(device, &zone_capacity);
     if (w_elems > SIZE_MAX / elem_bytes || a_elems > SIZE_MAX / elem_bytes) {
         return false;
     }
-    return ggml_sycl::zone_onednn_pp_scratch_supplies(
-        ggml_sycl_onednn_pp_candidate(src0, src1, dst, device), onednn_pp_unified_scratch_enabled(src0->type),
-        arena_active, zone_capacity, w_elems * elem_bytes, a_elems * elem_bytes);
+    const bool pp_candidate = ggml_sycl_onednn_pp_candidate(src0, src1, dst, device);
+    if (pp_candidate_out) {
+        *pp_candidate_out = pp_candidate;
+    }
+    size_t     zone_capacity = 0;
+    const bool arena_active  = ggml_sycl::unified_cache_get_onednn_zone_capacity(device, &zone_capacity);
+    return ggml_sycl::zone_onednn_pp_scratch_supplies(pp_candidate, onednn_pp_unified_scratch_enabled(src0->type),
+                                                      arena_active, zone_capacity, w_elems * elem_bytes,
+                                                      a_elems * elem_bytes);
 }
 
 static moe_route_capability ggml_sycl_moe_query_route_capability(
@@ -66494,8 +66509,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                     bool                    using_scratch       = false;
                                     onednn_pp_scratch_guard pp_scratch_guard;
 
+#    if !GGML_SYCL_DEQUANT_F16_ARM
                                     ggml_sycl_pool_alloc<sycl::half> src0_f16_alloc(ctx.pool());
                                     ggml_sycl_pool_alloc<sycl::half> src1_f16_alloc(ctx.pool());
+#    endif
                                     using_scratch = acquire_onednn_pp_scratch(ctx.device, src0->type, weights_bytes,
                                                                               activations_bytes, &weights_scratch,
                                                                               &activations_scratch, pp_scratch_guard);
@@ -66506,6 +66523,15 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                         // buffers like the legacy arm, sized at graph entry by the walk
                                         // (ggml_sycl_mul_mat_unified_pp_dequant_route). Route A runs on the context's
                                         // own in-order queue, the one queue a shared planned buffer is race-free on.
+                                        //
+                                        // Two consequences are deliberate. First, an op the walk counted as SUPPLIED can
+                                        // still reach this draw when acquire refuses it at run time (another context
+                                        // holds the scratch token, or the zone is fragmented and direct growth also
+                                        // fails): the buffers were not sized for it, so the draw grows them inside the
+                                        // RUNTIME zone or, while recording or with the zone full, aborts naming the
+                                        // plan (ggml_sycl_dequant_f16_plan_breach). Second, there is no catch-and-fall
+                                        // back to the unified kernel proper here any more: a capacity failure of a
+                                        // planned buffer is reported, not hidden behind a per-op pool copy.
                                         size_t src0_region_bytes = 0;
                                         size_t src1_region_bytes = 0;
                                         if (!ggml_sycl::zone_dequant_f16_region_bytes(static_cast<int64_t>(src0_elems),
@@ -66523,6 +66549,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                             src1_region_bytes, true));
                                         using_scratch = true;
 #    else
+                                        // The one remaining unplanned per-op pool copy of a whole weight. It exists only
+                                        // for a build without GGML_SYCL_DEQUANT_F16_ARM (oneDNN without GGML_SYCL_F16),
+                                        // a compile-time choice, not an environment variable.
                                         try {
                                             src0_f16_alloc.alloc(src0_elems);
                                             src1_f16_alloc.alloc(src1_elems);
@@ -99718,12 +99747,12 @@ static bool ggml_sycl_mul_mat_kernel_draws_dequant_f16(ggml_sycl_mul_mat_kernel 
 // sized per graph on this path, and nothing here shows the repeated calls are the larger cost.
 using ggml_sycl_kernel_draws_fn = bool (*)(ggml_sycl_mul_mat_kernel);
 
-static bool ggml_sycl_mul_mat_scratch_route(ggml_backend_sycl_context & ctx,
-                                            const ggml_tensor *         src0,
-                                            const ggml_tensor *         src1,
-                                            ggml_tensor *               node,
-                                            ggml_sycl_kernel_draws_fn   draws) {
-    const ggml_sycl::MatmulDecision primary = ctx.matmul_orchestrator.select(src0, src1, node);
+static bool ggml_sycl_mul_mat_scratch_route_decided(ggml_backend_sycl_context &       ctx,
+                                                    const ggml_tensor *               src0,
+                                                    const ggml_tensor *               src1,
+                                                    ggml_tensor *                     node,
+                                                    const ggml_sycl::MatmulDecision & primary,
+                                                    ggml_sycl_kernel_draws_fn         draws) {
     const bool primary_legacy  = primary.valid && primary.backend == ggml_sycl::MatmulBackend::LegacyKernel;
     const bool primary_unified = primary.valid && primary.backend == ggml_sycl::MatmulBackend::UnifiedKernel;
     ggml_sycl::MatmulDecision fallback{};
@@ -99736,6 +99765,15 @@ static bool ggml_sycl_mul_mat_scratch_route(ggml_backend_sycl_context & ctx,
                                                fallback_legacy && draws(fallback.kernel));
 }
 
+static bool ggml_sycl_mul_mat_scratch_route(ggml_backend_sycl_context & ctx,
+                                            const ggml_tensor *         src0,
+                                            const ggml_tensor *         src1,
+                                            ggml_tensor *               node,
+                                            ggml_sycl_kernel_draws_fn   draws) {
+    return ggml_sycl_mul_mat_scratch_route_decided(ctx, src0, src1, node, ctx.matmul_orchestrator.select(src0, src1, node),
+                                                   draws);
+}
+
 static bool ggml_sycl_mul_mat_src1_quantizing_route(ggml_backend_sycl_context & ctx,
                                                     const ggml_tensor *         src0,
                                                     const ggml_tensor *         src1,
@@ -99744,35 +99782,36 @@ static bool ggml_sycl_mul_mat_src1_quantizing_route(ggml_backend_sycl_context & 
 }
 
 // The f16 dequant arm's own route: a node the oneDNN legacy kernels serve, after the same decline the dispatch
-// takes. (The caller has already exempted the oneDNN PP route, which supplies its own copies.)
-static bool ggml_sycl_mul_mat_f16_dequant_route(ggml_backend_sycl_context & ctx,
-                                                const ggml_tensor *         src0,
-                                                const ggml_tensor *         src1,
-                                                ggml_tensor *               node) {
-    return ggml_sycl_mul_mat_scratch_route(ctx, src0, src1, node, ggml_sycl_mul_mat_kernel_draws_dequant_f16);
+// takes. (The caller has already exempted the oneDNN PP route, which supplies its own copies.) `primary` is the
+// router's answer the walk already has for this node.
+static bool ggml_sycl_mul_mat_f16_dequant_route(ggml_backend_sycl_context &       ctx,
+                                                const ggml_tensor *               src0,
+                                                const ggml_tensor *               src1,
+                                                ggml_tensor *                     node,
+                                                const ggml_sycl::MatmulDecision & primary) {
+    return ggml_sycl_mul_mat_scratch_route_decided(ctx, src0, src1, node, primary,
+                                                   ggml_sycl_mul_mat_kernel_draws_dequant_f16);
 }
 
 // llama.cpp-8ony: the unified kernel's own oneDNN f16 route (Route A: the dequant + oneDNN GEMM branch of the unified
 // dispatch) draws the planned f16 dequant buffers when the oneDNN scratch does not supply the op (an over-zone
-// Q4_0 / MXFP4 head or tied embedding), exactly as the legacy arm does. ggml_sycl_mul_mat_scratch_route counts a
-// node the unified kernel serves as not drawing, which is true of the unified kernel proper and false of this branch,
-// so the walk asks this as well: the same router decision and the same gates as the dispatch (unified dispatch
-// enabled, a type it serves, a plain src1), then the one supplies question. A node it over-counts (the branch's
-// own later declines, such as a missing dequant function) reserves bytes bounded by the plan.
-static bool ggml_sycl_mul_mat_unified_pp_dequant_route(ggml_backend_sycl_context & ctx,
-                                                       const ggml_tensor *         src0,
-                                                       const ggml_tensor *         src1,
-                                                       ggml_tensor *               node) {
-    const ggml_sycl::MatmulDecision primary = ctx.matmul_orchestrator.select(src0, src1, node);
+// Q4_0 / MXFP4 head or tied embedding), as the legacy arm does. ggml_sycl_mul_mat_scratch_route counts a node the
+// unified kernel serves as not drawing, which is true of the unified kernel proper and false of this branch, so the
+// walk asks this as well, with the answers it already has for the node (the router's `primary`, the PP admission and
+// the supplies verdict from one ggml_sycl_onednn_pp_scratch_supplies call): the same router decision and the same
+// gates as the dispatch (unified dispatch enabled, a type it serves, a plain src1). The dispatch has no precision
+// check on this branch, so the walk must not filter on precision before asking it. A node it over-counts (the
+// branch's own later declines, such as a missing dequant function) reserves bytes bounded by the plan.
+static bool ggml_sycl_mul_mat_unified_pp_dequant_route(const ggml_tensor *               src0,
+                                                       const ggml_tensor *               src1,
+                                                       const ggml_sycl::MatmulDecision & primary,
+                                                       bool                              pp_candidate,
+                                                       bool                              scratch_supplies) {
     const bool primary_unified = primary.valid && primary.backend == ggml_sycl::MatmulBackend::UnifiedKernel;
-    if (!primary_unified) {
-        return false;
-    }
-    const bool unified_type = ggml_sycl_unified_dispatch_enabled() && ggml_sycl::should_use_unified(src0->type);
-    const bool src1_plain = ggml_is_contiguous(src1) && !ggml_is_transposed(src1) && !ggml_is_permuted(src1);
-    return ggml_sycl::zone_unified_pp_draws_dequant(
-        primary_unified, unified_type, src1_plain, ggml_sycl_onednn_pp_candidate(src0, src1, node, ctx.device),
-        ggml_sycl_onednn_pp_scratch_supplies(ctx.device, src0, src1, node, src1->ne[1]));
+    const bool unified_type    = ggml_sycl_unified_dispatch_enabled() && ggml_sycl::should_use_unified(src0->type);
+    const bool src1_plain      = ggml_is_contiguous(src1) && !ggml_is_transposed(src1) && !ggml_is_permuted(src1);
+    return ggml_sycl::zone_unified_pp_draws_dequant(primary_unified, unified_type, src1_plain, pp_candidate,
+                                                    scratch_supplies);
 }
 
 // llama.cpp-479i: ensure the planned dense MMQ/MMVQ Q8_1 src1 buffer holds the demand of this graph, before
@@ -99953,8 +99992,10 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         }
         const ggml_tensor * src0 = node->src[0];
         const ggml_tensor * src1 = node->src[1];
+        // Precision is NOT filtered here: only the legacy f16 arm requires GGML_PREC_DEFAULT, the unified kernel's
+        // oneDNN f16 route has none, so each arm's own condition is applied below.
         if (!src0 || !src1 || !(src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) ||
-            !ggml_is_contiguous(src0) || node->op_params[0] != GGML_PREC_DEFAULT || ggml_nrows(src1) <= 1) {
+            !ggml_is_contiguous(src0) || ggml_nrows(src1) <= 1) {
             continue;
         }
         const bool need_src0_f16 = src0->type != GGML_TYPE_F16;
@@ -99967,15 +100008,23 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
         // ONEDNN zone (the one question the op arm asks too). The LM head is not planned there, and a K-quant op is
         // not enabled for it, so those draw these buffers and they must be sized here, at the first graph, not left
         // empty for the op to find the RUNTIME zone full (llama.cpp-8ony).
-        if (need_src0_f16 && need_src1_f16 &&
-            ggml_sycl_onednn_pp_scratch_supplies(ctx.device, src0, src1, node, src1->ne[1])) {
+        bool       pp_candidate = false;
+        const bool supplied     = need_src0_f16 && need_src1_f16 &&
+                              ggml_sycl_onednn_pp_scratch_supplies(ctx.device, src0, src1, node, src1->ne[1], &pp_candidate);
+        if (supplied) {
             continue;
         }
         // The route the dispatch ends up taking, after the same runtime decline of the unified kernel as the Q8
         // walk (a node the unified kernel declines and a oneDNN legacy kernel then serves draws these buffers).
-        // The unified kernel's own oneDNN f16 route (Route A) draws them too for an op the scratch does not supply.
-        if (!ggml_sycl_mul_mat_f16_dequant_route(ctx, src0, src1, node) &&
-            !ggml_sycl_mul_mat_unified_pp_dequant_route(ctx, src0, src1, node)) {
+        // The unified kernel's own oneDNN f16 route (Route A) draws them too for an op the scratch does not supply,
+        // whatever its precision. The router is asked once per node and its answer shared by both arms.
+        const ggml_sycl::MatmulDecision primary      = ctx.matmul_orchestrator.select(src0, src1, node);
+        const bool                      prec_default = node->op_params[0] == GGML_PREC_DEFAULT;
+        const bool                      legacy_draws =
+            prec_default && ggml_sycl_mul_mat_f16_dequant_route(ctx, src0, src1, node, primary);
+        const bool unified_draws =
+            ggml_sycl_mul_mat_unified_pp_dequant_route(src0, src1, primary, pp_candidate, supplied);
+        if (!ggml_sycl::zone_walk_f16_node_draws(prec_default, legacy_draws, unified_draws)) {
             continue;
         }
         size_t src0_bytes = 0;
