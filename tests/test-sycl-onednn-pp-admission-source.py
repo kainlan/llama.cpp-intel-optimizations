@@ -151,9 +151,10 @@ def matching(text, open_idx, open_ch, close_ch):
 
 def function_span(text, name):
     """(start, end) of the body of the single DEFINITION of `name`: a
-    `static <ret> name(` whose parameter list is followed by `{`."""
+    `[static] <ret> name(` at the start of a line whose parameter list is
+    followed by `{`. The line anchor keeps `return name(...)` out."""
     spans = []
-    for m in re.finditer(r"\bstatic\s+[\w:<>]+\s+" + re.escape(name) + r"\s*\(", text):
+    for m in re.finditer(r"^(?:static\s+)?[\w:<>]+\s+" + re.escape(name) + r"\s*\(", text, re.M):
         close = matching(text, m.end() - 1, "(", ")")
         rest = text[close + 1 :].lstrip()
         if rest.startswith("{"):
@@ -346,20 +347,37 @@ def test_executable_on_device_is_only_an_ingredient_of_the_candidate():
 
 def test_admission_inputs_are_read_only_where_the_question_is_answered():
     cand = function_span(backend, "ggml_sycl_onednn_pp_candidate")
-    woq = function_span(backend, "ggml_sycl_dense_woq_alternate_eligible_impl")
+    admitted = function_span(backend, "ggml_sycl_onednn_pp_type_admitted")
 
     def inside(s, spans):
         return any(lo < s < hi for lo, hi in spans)
 
-    for name, allowed in (
-        ("ggml_sycl_onednn_pp_min_batch", [cand]),
-        ("ggml_sycl_onednn_pp_enabled", [cand, woq]),
-        ("ggml_sycl_onednn_pp_skip_type", [cand, woq]),
+    # The batch floor is read by the candidate alone. The two environment-level terms (enabled, skip_type) are read
+    # by ONE function, ggml_sycl_onednn_pp_type_admitted, which the candidate, the dense WOQ second-copy predicate and
+    # the zone planner all ask (llama.cpp-8ony): a reader beside it is a second statement of the term.
+    for name, allowed, reader in (
+        ("ggml_sycl_onednn_pp_min_batch", [cand], cand),
+        ("ggml_sycl_onednn_pp_enabled", [admitted], admitted),
+        ("ggml_sycl_onednn_pp_skip_type", [admitted], admitted),
     ):
         sites = call_sites(backend, name)
-        assert any(inside(s, [cand]) for s in sites), f"the candidate no longer reads {name}()"
+        assert any(inside(s, [reader]) for s in sites), f"the answer no longer reads {name}()"
         stray = [line_of(backend, s) for s in sites if not inside(s, allowed)]
         assert not stray, f"{name}() is read outside the admission answer at line(s) {stray}"
+
+
+def test_type_level_terms_come_from_the_one_type_admission():
+    cand_lo, cand_hi = function_span(backend, "ggml_sycl_onednn_pp_candidate")
+    woq_lo, woq_hi = function_span(backend, "ggml_sycl_dense_woq_alternate_eligible_impl")
+    cand = backend[cand_lo:cand_hi]
+    woq = backend[woq_lo:woq_hi]
+    assert len(re.findall(r"\bggml_sycl_onednn_pp_type_admitted\s*\(\s*src0\s*->\s*type\s*\)", cand)) == 1, (
+        "the candidate must take its type-level answer from ggml_sycl_onednn_pp_type_admitted(src0->type), once"
+    )
+    assert len(re.findall(r"\bggml_sycl_onednn_pp_type_admitted\s*\(\s*type\s*\)", woq)) == 1, (
+        "the dense WOQ second-copy predicate must take its type-level answer from "
+        "ggml_sycl_onednn_pp_type_admitted(type), once"
+    )
 
 
 def test_every_mxfp4_direct_onednn_gemm_is_admitted_by_the_candidate():

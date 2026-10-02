@@ -471,12 +471,15 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
     decide = function_body(placement, r"inline onednn_pp_refusal onednn_pp_admission_decide\([^)]*\)\s*\{")
     results["anchor: the pure admission exists"] = decide is not None
     if decide is not None:
-        results["the pure admission asks the shared type-level term"] = \
-            "onednn_pp_type_term_refused(in.enabled, in.skip_type)" in decide
+        results["the pure admission takes the type-level answer as an input, not the two environment terms"] = \
+            "in.type_admitted" in decide and "in.enabled" not in decide and "in.skip_type" not in decide and \
+            "onednn_pp_type_term_refused" not in decide
     admitted_fn = function_body(backend, r"bool ggml_sycl_onednn_pp_type_admitted\(ggml_type type\)\s*\{")
     if admitted_fn is not None:
         results["the planner's admission asks the same shared term"] = \
             "onednn_pp_type_term_refused(" in admitted_fn
+        results["the type admission is the only caller of the shared term"] = \
+            len(re.findall(r"\bonednn_pp_type_term_refused\s*\(", backend)) == 1
 
     # ---- the reserve reads the stored snapshot once, and the bound comes from that read (llama.cpp-8ony) ----
     reserve_fn = function_body(cache, r"bool unified_cache::reserve_onednn_scratch\([^)]*\)\s*\{")
@@ -499,9 +502,9 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
     cand = function_body(backend, r"static bool ggml_sycl_onednn_pp_candidate\([^)]*route = [^)]*\)\s*\{")
     results["anchor: the PP candidate exists"] = cand is not None
     if cand is not None:
-        results["the PP candidate takes its gates from the same two functions"] = \
-            "admission.enabled" in cand and "ggml_sycl_onednn_pp_enabled()" in cand and \
-            "ggml_sycl_onednn_pp_skip_type(src0->type)" in cand
+        results["the PP candidate takes its type-level answer from the one type admission"] = \
+            "admission.type_admitted = ggml_sycl_onednn_pp_type_admitted(src0->type)" in " ".join(cand.split()) and \
+            "ggml_sycl_onednn_pp_enabled()" not in cand and "ggml_sycl_onednn_pp_skip_type(" not in cand
     if adapter is not None:
         results["the adapter plans the conditional mark only for a type the PP admission serves"] = \
             "ggml_sycl_onednn_pp_type_admitted(item.type)" in adapter
@@ -827,11 +830,23 @@ if args.self_test and not failed:
         ("shared predicate loses a type", "the shared predicate lists the types",
          (backend, cache, cache_hpp, zone_sizing, model, header, common, dispatch, placement,
           mutate(utypes, "GGML_TYPE_MXFP4", "GGML_TYPE_XXXX"))),
-        ("decide restates the term", "the pure admission asks the shared type-level term",
+        ("decide restates the term", "the pure admission takes the type-level answer as an input, not the two environment terms",
          (backend, cache, cache_hpp, zone_sizing, model, header, common, dispatch,
           mutate_in_func(placement, r"inline onednn_pp_refusal onednn_pp_admission_decide\(",
-                         "onednn_pp_type_term_refused(in.enabled, in.skip_type)", "(!in.enabled || in.skip_type)"),
+                         "!in.type_admitted", "onednn_pp_type_term_refused(true, false)"),
           utypes)),
+        ("decide ignores the type answer", "the pure admission takes the type-level answer as an input, not the two environment terms",
+         (backend, cache, cache_hpp, zone_sizing, model, header, common, dispatch,
+          mutate_in_func(placement, r"inline onednn_pp_refusal onednn_pp_admission_decide\(",
+                         "!in.type_admitted", "false"),
+          utypes)),
+        ("candidate reads the environment itself", "the PP candidate takes its type-level answer from the one type admission",
+         (mutate_in_func(backend, r"static bool ggml_sycl_onednn_pp_candidate\(",
+                         "ggml_sycl_onednn_pp_type_admitted(src0->type)", "ggml_sycl_onednn_pp_enabled()"),
+          cache, cache_hpp)),
+        ("second caller of the shared term", "the type admission is the only caller of the shared term",
+         (backend + "\nstatic bool x() { return !ggml_sycl::onednn_pp_type_term_refused(true, false); }\n",
+          cache, cache_hpp)),
         ("planner restates the term", "the planner's admission asks the same shared term",
          (mutate_in_func(backend, r"bool ggml_sycl_onednn_pp_type_admitted\(", "onednn_pp_type_term_refused(",
                          "XXXX("), cache, cache_hpp)),
