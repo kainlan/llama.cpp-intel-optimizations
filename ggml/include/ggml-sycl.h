@@ -1282,6 +1282,124 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_c
     bool                         swa_full,
     bool                         flash_attn_enabled);
 
+// llama.cpp-tsfl (nphx comment c-wgxn): result of
+// ggml_backend_sycl_probe_runtime_context_for_model() below -- a
+// NON-PUBLISHING dry run of the same admission logic
+// ggml_backend_sycl_set_runtime_context_for_model() uses to decide whether a
+// candidate (n_ctx, n_ubatch, n_seq_max, flash_attn_enabled) fits, without
+// publishing a new plan or materializing MoE MMID workspaces. `reason` is
+// always a static string literal (a moe_mmid_runtime_reason name, or one of
+// the probe's own refusal tags) -- never owned by the caller, and never
+// NULL.
+//
+// llama.cpp-tsfl (round 1 F1): the "leaves no planned zone/ring changed"
+// guarantee holds whenever `accepted` is true, OR whenever `reason` names a
+// CANDIDATE refusal (the fit-or-not decision itself, unmet by this n_ctx/
+// n_ubatch) -- both cases roll their own transient PP MoE oneDNN scratch
+// ring re-plan back before returning. There are two exceptions; in each
+// the ANOMALY line is logged at GGML_LOG_ERROR unconditionally (probe or
+// not), even where the refusal the probe then returns still follows the
+// probe's INFO policy:
+//   1. reason=="probe rollback failed: ring left at candidate size": the
+//      probe's OWN rollback attempt (rolling the ring back to the
+//      pre-transaction n_ubatch) itself failed, and the ring is left at the
+//      candidate size. Names both the candidate and the pre-transaction
+//      n_ubatch it could not be restored to (llama.cpp-jumy: raised from
+//      GGML_LOG_WARN to GGML_LOG_ERROR to match this policy).
+//   2. A candidate refusal whose own internal restore also fails:
+//      ggml_sycl_replan_pp_moe_onednn_ring()'s refuse_and_restore() closure
+//      re-reserves the OLD ring on any refusal, and that re-reserve can
+//      itself fail ("... restore FAILED ...", ggml-sycl.cpp) -- handled
+//      (that line logged at GGML_LOG_ERROR), not asserted, but the probe
+//      then returns the plain candidate refusal (logged at INFO in probe
+//      mode like any candidate refusal) with the ring left unbacked by
+//      any physical allocation rather than restored to its pre-candidate
+//      state.
+struct ggml_sycl_runtime_context_probe {
+    bool         accepted;
+    bool         would_demote_kv;
+    size_t       host_kv_bytes;
+    const char * reason;
+};
+
+// See ggml_sycl_runtime_context_probe above. `out` must not be NULL; it is
+// zero-initialized on entry. Candidate refusals log at GGML_LOG_INFO, not
+// the publishing path's GGML_LOG_ERROR, because a probe exists to be tried
+// repeatedly and rejected quietly (Task 4b's ascending micro-batch trial).
+// Two return values are argument-validation failures rather than a decision
+// about the candidate itself: GGML_SYCL_LIFECYCLE_NULL_OUTPUT when `out` is
+// NULL, or when `backend`/`backend->context` is NULL or n_ctx==0; and
+// GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND when `backend` is not a SYCL backend
+// (ggml_backend_is_sycl() false, no device, or registered against a
+// different backend registry).
+// Refuses with GGML_SYCL_LIFECYCLE_STALE_IDENTITY when `model` does not
+// identify the CURRENTLY PUBLISHED plan AT THIS FUNCTION'S OWN ENTRY CHECK
+// -- unlike ggml_backend_sycl_set_runtime_context_for_model(), this probe
+// does not itself select or publish a different model's plan; it only
+// evaluates candidates against whichever plan is already current. The SAME
+// condition, detected instead under the transaction's own lock (a race
+// between this entry check and that in-lock re-check), returns
+// GGML_SYCL_LIFECYCLE_BUSY, not STALE_IDENTITY -- it is a race a caller's
+// retry can resolve, unlike the entry check's own refusal.
+// GGML_SYCL_LIFECYCLE_BUSY (round 1 F6; round 4 Q3) means the caller MAY
+// retry: a live-update lease could not be acquired, the plan changed while
+// acquiring the transaction lock, the module mutation guard refused, the
+// published plan's identity changed between this probe's entry check and
+// the transaction's in-lock re-check (the STALE_IDENTITY-shaped race just
+// above), or the PP MoE oneDNN scratch ring's release refused because it is
+// still claimed by an in-flight dispatch (llama.cpp-jumy: transient, unlike
+// a ring re-plan that refuses because the requested size does not fit,
+// which stays PLAN_REJECTED below). It is distinct from
+// GGML_SYCL_LIFECYCLE_PLAN_REJECTED, which callers must NOT retry (see that
+// enum value's own comment).
+// llama.cpp-3aos: kv_unified -- see ggml_backend_sycl_set_runtime_context_for_model()'s
+// declaration above for the full rationale. The probe must be given the
+// SAME kv_unified the candidate would actually publish with, or its
+// accept/reject decision (and would_demote_kv/host_kv_bytes) answers for
+// the wrong KV shape. llama.cpp-uajm: the same holds for swa_full.
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(
+    ggml_backend_t                           backend,
+    struct ggml_sycl_model_token             model,
+    uint32_t                                 n_ctx,
+    uint32_t                                 n_ubatch,
+    uint32_t                                 n_seq_max,
+    bool                                     kv_unified,
+    bool                                     swa_full,
+    bool                                     flash_attn_enabled,
+    struct ggml_sycl_runtime_context_probe * out);
+
+// llama.cpp-oyfl: re-evaluates ONLY the non-FA attention scratch guard,
+// against the CURRENTLY PUBLISHED plan's shape --
+// no KV replan, no MoE MMID reaccount/materialize, no plan republish, no
+// BUSY retry. For a caller whose n_ctx/n_ubatch have not changed and only
+// flash_attn_enabled has (an AUTO llama_flash_attn_type resolving after
+// ggml_backend_sycl_set_runtime_context_for_model()'s own initial call
+// above already ran with an unresolved, optimistic `true`): re-running the
+// full transaction would touch KV/MMID state that has no reason to change
+// and would retry the same deterministic decision under BUSY backoff for
+// no benefit. GGML_SYCL_LIFECYCLE_STALE_IDENTITY if the model token does
+// not match the currently published plan; GGML_SYCL_LIFECYCLE_PLAN_REJECTED
+// if the guard refuses (same message and arithmetic as the full
+// transaction's own check).
+//
+// llama.cpp-rqak: an asymmetry worth knowing before touching either path.
+// An explicit -fa 0 context goes through the FULL transaction above, which
+// records its real runtime shape via
+// unified_cache_set_planned_nonfa_attn_scratch_shape() (and restores the
+// previous shape if the guard refuses); an AUTO context that resolves OFF
+// goes through THIS narrow re-check instead, which deliberately does not
+// record anything (see ggml_sycl_check_nonfa_attn_scratch()'s allow_replan
+// parameter in ggml-sycl.cpp). So an AUTO-resolved-OFF context is checked
+// against the shape recorded at load time (or by an earlier explicit -fa 0
+// context), never its own. This has no practical effect today: the
+// plan-time raise this shape feeds is a no-op once weights hold live
+// leases (see the "Where this can and cannot help" discussion in
+// docs/backend/sycl-memory-design.md).
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
+    ggml_backend_t               backend,
+    struct ggml_sycl_model_token model,
+    bool                         flash_attn_enabled);
+
 // ---------------------------------------------------------------------------
 // The measured-tenant publish, its coverage query and the load-time late check
 // (llama.cpp-moua L4, doc 2.4.2 and 2.4.4).  DECLARATIONS ONLY: no export in
@@ -1459,124 +1577,6 @@ GGML_BACKEND_API enum ggml_sycl_tenant_coverage ggml_backend_sycl_tenant_coverag
 GGML_BACKEND_API enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check(struct ggml_sycl_load_txn txn,
                                                                                     int32_t                   device,
                                                                                     uint64_t compute_bytes);
-
-// llama.cpp-tsfl (nphx comment c-wgxn): result of
-// ggml_backend_sycl_probe_runtime_context_for_model() below -- a
-// NON-PUBLISHING dry run of the same admission logic
-// ggml_backend_sycl_set_runtime_context_for_model() uses to decide whether a
-// candidate (n_ctx, n_ubatch, n_seq_max, flash_attn_enabled) fits, without
-// publishing a new plan or materializing MoE MMID workspaces. `reason` is
-// always a static string literal (a moe_mmid_runtime_reason name, or one of
-// the probe's own refusal tags) -- never owned by the caller, and never
-// NULL.
-//
-// llama.cpp-tsfl (round 1 F1): the "leaves no planned zone/ring changed"
-// guarantee holds whenever `accepted` is true, OR whenever `reason` names a
-// CANDIDATE refusal (the fit-or-not decision itself, unmet by this n_ctx/
-// n_ubatch) -- both cases roll their own transient PP MoE oneDNN scratch
-// ring re-plan back before returning. There are two exceptions; in each
-// the ANOMALY line is logged at GGML_LOG_ERROR unconditionally (probe or
-// not), even where the refusal the probe then returns still follows the
-// probe's INFO policy:
-//   1. reason=="probe rollback failed: ring left at candidate size": the
-//      probe's OWN rollback attempt (rolling the ring back to the
-//      pre-transaction n_ubatch) itself failed, and the ring is left at the
-//      candidate size. Names both the candidate and the pre-transaction
-//      n_ubatch it could not be restored to (llama.cpp-jumy: raised from
-//      GGML_LOG_WARN to GGML_LOG_ERROR to match this policy).
-//   2. A candidate refusal whose own internal restore also fails:
-//      ggml_sycl_replan_pp_moe_onednn_ring()'s refuse_and_restore() closure
-//      re-reserves the OLD ring on any refusal, and that re-reserve can
-//      itself fail ("... restore FAILED ...", ggml-sycl.cpp) -- handled
-//      (that line logged at GGML_LOG_ERROR), not asserted, but the probe
-//      then returns the plain candidate refusal (logged at INFO in probe
-//      mode like any candidate refusal) with the ring left unbacked by
-//      any physical allocation rather than restored to its pre-candidate
-//      state.
-struct ggml_sycl_runtime_context_probe {
-    bool         accepted;
-    bool         would_demote_kv;
-    size_t       host_kv_bytes;
-    const char * reason;
-};
-
-// See ggml_sycl_runtime_context_probe above. `out` must not be NULL; it is
-// zero-initialized on entry. Candidate refusals log at GGML_LOG_INFO, not
-// the publishing path's GGML_LOG_ERROR, because a probe exists to be tried
-// repeatedly and rejected quietly (Task 4b's ascending micro-batch trial).
-// Two return values are argument-validation failures rather than a decision
-// about the candidate itself: GGML_SYCL_LIFECYCLE_NULL_OUTPUT when `out` is
-// NULL, or when `backend`/`backend->context` is NULL or n_ctx==0; and
-// GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND when `backend` is not a SYCL backend
-// (ggml_backend_is_sycl() false, no device, or registered against a
-// different backend registry).
-// Refuses with GGML_SYCL_LIFECYCLE_STALE_IDENTITY when `model` does not
-// identify the CURRENTLY PUBLISHED plan AT THIS FUNCTION'S OWN ENTRY CHECK
-// -- unlike ggml_backend_sycl_set_runtime_context_for_model(), this probe
-// does not itself select or publish a different model's plan; it only
-// evaluates candidates against whichever plan is already current. The SAME
-// condition, detected instead under the transaction's own lock (a race
-// between this entry check and that in-lock re-check), returns
-// GGML_SYCL_LIFECYCLE_BUSY, not STALE_IDENTITY -- it is a race a caller's
-// retry can resolve, unlike the entry check's own refusal.
-// GGML_SYCL_LIFECYCLE_BUSY (round 1 F6; round 4 Q3) means the caller MAY
-// retry: a live-update lease could not be acquired, the plan changed while
-// acquiring the transaction lock, the module mutation guard refused, the
-// published plan's identity changed between this probe's entry check and
-// the transaction's in-lock re-check (the STALE_IDENTITY-shaped race just
-// above), or the PP MoE oneDNN scratch ring's release refused because it is
-// still claimed by an in-flight dispatch (llama.cpp-jumy: transient, unlike
-// a ring re-plan that refuses because the requested size does not fit,
-// which stays PLAN_REJECTED below). It is distinct from
-// GGML_SYCL_LIFECYCLE_PLAN_REJECTED, which callers must NOT retry (see that
-// enum value's own comment).
-// llama.cpp-3aos: kv_unified -- see ggml_backend_sycl_set_runtime_context_for_model()'s
-// declaration above for the full rationale. The probe must be given the
-// SAME kv_unified the candidate would actually publish with, or its
-// accept/reject decision (and would_demote_kv/host_kv_bytes) answers for
-// the wrong KV shape. llama.cpp-uajm: the same holds for swa_full.
-GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(
-    ggml_backend_t                           backend,
-    struct ggml_sycl_model_token             model,
-    uint32_t                                 n_ctx,
-    uint32_t                                 n_ubatch,
-    uint32_t                                 n_seq_max,
-    bool                                     kv_unified,
-    bool                                     swa_full,
-    bool                                     flash_attn_enabled,
-    struct ggml_sycl_runtime_context_probe * out);
-
-// llama.cpp-oyfl: re-evaluates ONLY the non-FA attention scratch guard,
-// against the CURRENTLY PUBLISHED plan's shape --
-// no KV replan, no MoE MMID reaccount/materialize, no plan republish, no
-// BUSY retry. For a caller whose n_ctx/n_ubatch have not changed and only
-// flash_attn_enabled has (an AUTO llama_flash_attn_type resolving after
-// ggml_backend_sycl_set_runtime_context_for_model()'s own initial call
-// above already ran with an unresolved, optimistic `true`): re-running the
-// full transaction would touch KV/MMID state that has no reason to change
-// and would retry the same deterministic decision under BUSY backoff for
-// no benefit. GGML_SYCL_LIFECYCLE_STALE_IDENTITY if the model token does
-// not match the currently published plan; GGML_SYCL_LIFECYCLE_PLAN_REJECTED
-// if the guard refuses (same message and arithmetic as the full
-// transaction's own check).
-//
-// llama.cpp-rqak: an asymmetry worth knowing before touching either path.
-// An explicit -fa 0 context goes through the FULL transaction above, which
-// records its real runtime shape via
-// unified_cache_set_planned_nonfa_attn_scratch_shape() (and restores the
-// previous shape if the guard refuses); an AUTO context that resolves OFF
-// goes through THIS narrow re-check instead, which deliberately does not
-// record anything (see ggml_sycl_check_nonfa_attn_scratch()'s allow_replan
-// parameter in ggml-sycl.cpp). So an AUTO-resolved-OFF context is checked
-// against the shape recorded at load time (or by an earlier explicit -fa 0
-// context), never its own. This has no practical effect today: the
-// plan-time raise this shape feeds is a no-op once weights hold live
-// leases (see the "Where this can and cannot help" discussion in
-// docs/backend/sycl-memory-design.md).
-GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
-    ggml_backend_t               backend,
-    struct ggml_sycl_model_token model,
-    bool                         flash_attn_enabled);
 
 // Execution-lifecycle context identity is separate from the model lifecycle.
 // One ContextId is allocated per llama_context and then bound to each SYCL
