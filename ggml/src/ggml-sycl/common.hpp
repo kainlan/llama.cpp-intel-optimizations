@@ -16,6 +16,8 @@
 #include "alloc-registry.hpp"
 #include "dpct/helper.hpp"
 #include "ggml-sycl.h"
+#include "graph-prestage-decline-memo.hpp"
+#include "graph-safe-memcpy-width.hpp"
 #include "kv-offload.hpp"
 #include "layer-streaming.hpp"
 #include "mem-handle.hpp"
@@ -402,30 +404,36 @@ inline sycl::event ggml_sycl_graph_safe_memcpy(sycl::queue & q, void * dst, cons
             profile_label.device     = ggml_sycl_get_device_id_from_queue(q);
         }
 
-        const size_t n_i32 = nbytes / sizeof(int32_t);
-        auto *       d     = static_cast<int32_t *>(dst);
-        const auto * s     = static_cast<const int32_t *>(src);
-        if (n_i32 > 0) {
-            sycl::event body_event = q.parallel_for(sycl::range<1>(n_i32), [=](sycl::id<1> i) { d[i] = s[i]; });
-            if (profile_enabled) {
-                profile_label.bytes = n_i32 * sizeof(int32_t);
-                ggml_sycl_kernel_profile_record_event(profile_label, body_event);
-            }
+        // One kernel at the widest element every operand allows. dst and src come from callers that place copies at
+        // arbitrary byte offsets (dim==3 CONCAT puts the second copy at dst + src0 bytes), so alignment is a property
+        // of the operands, not of nbytes, and an int32 body with a byte tail would misalign the body.
+        const size_t width = ggml_sycl_graph_safe_memcpy_width(dst, src, nbytes);
+        sycl::event  copy_event;
+        if (width == 4) {
+            auto *       d = static_cast<int32_t *>(dst);
+            const auto * s = static_cast<const int32_t *>(src);
+            copy_event     = q.parallel_for(sycl::range<1>(nbytes / 4), [=](sycl::id<1> i) { d[i] = s[i]; });
+        } else if (width == 2) {
+            auto *       d = static_cast<int16_t *>(dst);
+            const auto * s = static_cast<const int16_t *>(src);
+            copy_event     = q.parallel_for(sycl::range<1>(nbytes / 2), [=](sycl::id<1> i) { d[i] = s[i]; });
+        } else {
+            auto *       d = static_cast<char *>(dst);
+            const auto * s = static_cast<const char *>(src);
+            copy_event     = q.parallel_for(sycl::range<1>(nbytes), [=](sycl::id<1> i) { d[i] = s[i]; });
         }
-        const size_t tail = nbytes % sizeof(int32_t);
-        if (tail > 0) {
-            auto *       dc         = static_cast<char *>(dst) + n_i32 * sizeof(int32_t);
-            const auto * sc         = static_cast<const char *>(src) + n_i32 * sizeof(int32_t);
-            sycl::event  tail_event = q.parallel_for(sycl::range<1>(tail), [=](sycl::id<1> i) { dc[i] = sc[i]; });
-            if (profile_enabled) {
-                profile_label.bytes = tail;
-                ggml_sycl_kernel_profile_record_event(profile_label, tail_event);
-            }
+        if (profile_enabled) {
+            profile_label.bytes = nbytes;
+            ggml_sycl_kernel_profile_record_event(profile_label, copy_event);
         }
         return sycl::event{};
     }
 #endif
 
+    // Outside recording this goes through mem_copy_async. For same-device USM operands that is a plain queue
+    // memcpy with no host wait, which is what op code relies on (CONCAT dim==3 drops its wait on that basis).
+    // It is NOT wait-free in general: a non-USM host operand or a cross-device copy stages through a path that
+    // does wait_and_throw, so a caller that may see such operands must not read "no host wait" off this helper.
     const int             queue_device = ggml_sycl_get_device_id_from_queue(q);
     // This raw-pointer API's nbytes contract is the authority for this one
     // operation; generic mem_handle consumers still reject unknown extents.
@@ -5664,6 +5672,31 @@ inline bool ggml_sycl_weight_is_planned_on_device(const ggml_tensor * tensor, in
     return ggml_sycl_get_planned_weight_residency(tensor, device) == ggml_sycl_planned_weight_residency::DEVICE;
 }
 
+// The layout the placement plan materialises a dense weight in. False when the tensor is not a planned dense
+// weight (no plan, no entry), in which case it is read as stored. Layout follows residency: an op's supports_op
+// asks this before it admits a (type, layout) pair, so a pair no kernel covers is declined before placement
+// routes it.
+inline bool ggml_sycl_get_planned_weight_layout(const ggml_tensor * tensor, int device, ggml_layout_mode * layout) {
+    if (tensor && tensor->view_src) {
+        tensor = tensor->view_src;
+    }
+    if (!tensor || !layout || !ggml_sycl_tensor_is_weight(tensor) || tensor->name[0] == '\0' ||
+        !ggml_sycl_valid_device_index(device)) {
+        return false;
+    }
+    auto *     cache      = ggml_sycl::get_unified_cache_for_device(device);
+    const auto plan_owner = ggml_sycl::coherent_placement_plan_owner(cache);
+    if (!plan_owner || plan_owner->entries.empty()) {
+        return false;
+    }
+    const auto * entry = plan_owner->find_dense_entry(std::string(tensor->name));
+    if (entry == nullptr) {
+        return false;
+    }
+    *layout = entry->layout;
+    return true;
+}
+
 // True when a multi-device plan places this dense weight on a DIFFERENT device.
 // Placement decides the executor: `device` never executes that weight (the
 // dense weight-owner route runs the op on the owner), so no path may stream,
@@ -5856,6 +5889,9 @@ inline void * ggml_sycl_runtime_scratch_ensure(ggml_sycl::mem_handle & backing,
     return resolved.ptr;
 }
 
+// Kernel name of the marker that gates the release of a staging buffer a size change displaced.
+struct graph_input_staging_retire_marker {};
+
 struct ggml_backend_sycl_context {
     // Retained by MMID queue capabilities so an exact queue binding cannot
     // outlive the backend context that selected it.
@@ -5879,6 +5915,10 @@ struct ggml_backend_sycl_context {
     // was admitted (and is then allocated), so a later same-shape republish
     // keeps the published residency (kv_residency_needs_refit).
     bool                                 runtime_kv_admitted = false;
+    // Identity of this context for the planned dense scratch hold (unified_cache_set_planned_scratch_hold): a
+    // monotonic id minted at construction, never an address, so a later context that reuses this one's address is
+    // not mistaken for it.
+    uint64_t                             planned_scratch_owner = ggml_sycl::unified_cache_mint_planned_scratch_owner();
     // Device capability: does this device support SoA weight layout optimization?
     // This is NOT tensor state - it's a static capability of the GPU.
     // Tensor state is tracked per-tensor in ggml_tensor_extra_gpu::optimized_feature
@@ -6434,34 +6474,38 @@ struct ggml_backend_sycl_context {
     bool                            moe_default_fast_path_quarantined = false;
     const char *                    moe_default_fast_path_quarantine_reason = nullptr;
 
-    void invalidate_moe_segments() {
+    // Each retire below reports whether it retired the epoch. A failure leaves the recorded graphs valid, so the
+    // caller (the staging-swap gateway) must not trust them and declines; the failure also sets the disabled flag.
+    bool invalidate_moe_segments() {
         if (!ggml_sycl_retire_moe_graph_epoch(this)) {
             moe_graphs_disabled = true;
-            return;
+            return false;
         }
         moe_segments.clear();
         moe_dispatch_graphs.clear();
         moe_node_indices.clear();
         moe_segments_n_nodes = 0;
         moe_segments_valid   = false;
+        return true;
     }
 
-    void invalidate_moe_direct_dispatch_graphs() {
+    bool invalidate_moe_direct_dispatch_graphs() {
         if (!ggml_sycl_retire_moe_graph_epoch(this)) {
             moe_direct_dispatch_graphs_disabled = true;
-            return;
+            return false;
         }
         moe_direct_dispatch_graphs.clear();
         moe_direct_dispatch_graphs_n_nodes   = 0;
         moe_direct_dispatch_graphs_hash      = 0;
         moe_direct_dispatch_graphs_is_decode = false;
         moe_direct_dispatch_graphs_disabled  = false;
+        return true;
     }
 
-    void invalidate_moe_block_graphs() {
+    bool invalidate_moe_block_graphs() {
         if (!ggml_sycl_retire_moe_graph_epoch(this)) {
             moe_block_graphs_disabled = true;
-            return;
+            return false;
         }
         moe_block_graphs.clear();
         moe_block_graphs_n_nodes    = 0;
@@ -6471,12 +6515,13 @@ struct ggml_backend_sycl_context {
         moe_block_graphs_block_size = 0;
         moe_block_graphs_valid      = false;
         moe_block_graphs_dispatch_identities.clear();
+        return true;
     }
 
-    void invalidate_moe_sequence_graphs() {
+    bool invalidate_moe_sequence_graphs() {
         if (!ggml_sycl_retire_moe_graph_epoch(this)) {
             moe_sequence_graphs_disabled = true;
-            return;
+            return false;
         }
         moe_sequence_graphs.clear();
         moe_sequence_graph_failed_nodes.clear();
@@ -6486,6 +6531,7 @@ struct ggml_backend_sycl_context {
         moe_sequence_graphs_mode_hash = 0;
         moe_sequence_graphs_is_decode = false;
         moe_sequence_graphs_valid     = false;
+        return true;
     }
 
     // === Cached per-graph computations (reset when n_nodes changes) ===
@@ -6550,6 +6596,14 @@ struct ggml_backend_sycl_context {
     // into it itself, can tell it is still the same entry and still holds
     // those bytes.
     uint64_t                                                           graph_input_staging_generation = 0;
+    // Set when a size change displaced a live staging handle (graph_input_stage). A recorded graph (exec graph, MoE
+    // segments, block graphlets, dense range graphs) bakes the staging POINTER, so graph_prestage_or_decline consumes
+    // the flag and retires every recorder that may hold the old one. The displaced handle itself is retained on a
+    // marker event at the swap, not freed, so a replay from the previous token may finish reading it. Whether a
+    // recorded graph also keeps its own copy of the handle depends on the consumer (GET_ROWS indices do, through
+    // terminal_retention_ticket::prepare; a consumer that takes the raw pointer does not), and the map cannot know
+    // which consumers baked it.
+    bool                               graph_input_staging_swapped = false;
 
     bool graph_input_stage_lookup(const ggml_tensor *     owner,
                                   size_t                  nbytes,
@@ -6605,12 +6659,8 @@ struct ggml_backend_sycl_context {
             }
         }
 
-        if (it != graph_input_staging.end()) {
-            it->second.handle   = ggml_sycl::mem_handle{};
-            it->second.capacity = 0;
-        }
-        graph_input_staging_generation++;
-
+        // The replacement is built into locals and published as the last act, after every failure return. A failure
+        // here leaves the old entry live (and whatever recorded graph baked it valid).
         ggml_sycl::alloc_request req{};
         req.queue                          = &q;
         req.device                         = dev_id;
@@ -6635,8 +6685,22 @@ struct ggml_backend_sycl_context {
         ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
             const_cast<void *>(host_data), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, nbytes);
         ggml_sycl::mem_copy(handle, src_handle, nbytes, q);
-        graph_input_staging[owner] = { std::move(handle), nbytes };
-        return graph_input_staging[owner].handle.resolve(dev_id).ptr;
+        graph_input_staging_entry & slot = graph_input_staging[owner];
+        if (slot.handle.valid()) {
+            // A replay from the previous token may still read the displaced buffer: hold it until the last work
+            // submitted on this queue completes (an event, not a host wait). The event is taken BEFORE the handle
+            // is touched and retain gets a COPY, so a throwing submit or retain leaves the old entry intact (the
+            // assignment below then drops the map's own reference). The event comes from the marker helper that
+            // avoids the Level Zero barrier-event corruption. The recorders that baked the pointer are retired by
+            // the gateway, which consumes the flag.
+            sycl::event retire = ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q);
+            graph_input_staging_swapped = true;
+            ggml_sycl::retain_handles_until_event({ slot.handle }, retire);
+        }
+        slot.handle   = std::move(handle);
+        slot.capacity = nbytes;
+        graph_input_staging_generation++;
+        return slot.handle.resolve(dev_id).ptr;
     }
 
     bool graph_input_refresh(const ggml_tensor * owner, const void * host_data, size_t nbytes, sycl::queue & q) {
@@ -6669,6 +6733,7 @@ struct ggml_backend_sycl_context {
     void graph_input_staging_clear(sycl::queue & q) {
         GGML_UNUSED(q);
         graph_input_staging.clear();
+        graph_input_staging_swapped = false;
         graph_input_staging_generation++;
     }
 
@@ -7505,6 +7570,12 @@ struct ggml_backend_sycl_context {
         }
     };
     fa_decode_kernel_observation fa_decode_kernel_obs;
+
+    // Graph signatures this context declined to record because their inputs could not all be staged onto the
+    // device (graph_prestage_or_decline). Per context so it dies with it; see graph-prestage-decline-memo.hpp.
+    graph_prestage_decline_memo prestage_decline_memo;
+    // Bumped once per ggml_backend_sycl_graph_compute call; the decline memo counts a token once by it.
+    uint64_t                    graph_compute_seq = 0;
 
     // Flag to disable graphs when weight streaming is active
     bool                                                    weight_streaming_graphs_disabled = false;

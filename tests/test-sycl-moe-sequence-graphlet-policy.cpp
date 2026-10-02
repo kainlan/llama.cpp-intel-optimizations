@@ -299,12 +299,12 @@ static int test_sequence_graphlet_has_retention_and_identity() {
     const std::string mmvq   = read_required_file("ggml/src/ggml-sycl/mmvq.cpp");
 
     const std::string sequence_record =
-        required_region(common, "struct moe_sequence_graph {", "void invalidate_moe_segments()",
+        required_region(common, "struct moe_sequence_graph {", "invalidate_moe_segments() {",
                         "moe_sequence_graph context record");
     CHECK(contains(sequence_record, "std::vector<ggml_sycl::mem_handle> retained_handles"),
           "sequence graph records must retain mem_handles in their own record type");
     const std::string sequence_state = required_region(common, "std::vector<moe_sequence_graph>",
-                                                       "void invalidate_moe_segments()",
+                                                       "invalidate_moe_segments() {",
                                                        "moe sequence graphlet context state");
     CHECK(contains(sequence_state, "moe_sequence_graph_failed_nodes"),
           "sequence context must track real per-node record failures for fail-closed replay safety");
@@ -525,11 +525,11 @@ static int test_sequence_graphlet_residual_overhead_counters_and_safe_metadata()
           "sequence graphlet cache metadata must include mode hash in addition to graph hash/n_nodes/decode");
 
     const std::string sequence_state = required_region(common, "std::vector<moe_sequence_graph>",
-                                                       "void invalidate_moe_segments()",
+                                                       "invalidate_moe_segments() {",
                                                        "moe sequence graphlet context state");
     CHECK(contains(sequence_state, "moe_sequence_graphs_mode_hash = 0"),
           "sequence graphlet context metadata must store mode hash as part of the safe cache key");
-    const std::string invalidate_sequence = required_region(common, "void invalidate_moe_sequence_graphs() {",
+    const std::string invalidate_sequence = required_region(common, "invalidate_moe_sequence_graphs() {",
                                                             "// === Cached per-graph computations",
                                                             "sequence graphlet invalidation");
     CHECK(contains(invalidate_sequence, "moe_sequence_graphs_mode_hash = 0"),
@@ -1079,8 +1079,18 @@ static int test_sequence_graphlet_segmented_replay_uses_sequence_graphlets() {
     const std::string sycl = read_required_file("ggml/src/ggml-sycl/ggml-sycl.cpp");
 
     const std::string replay_segments = required_region(sycl, "static void moe_graph_replay_segments",
-                                                        "static void graph_prestage_leaf_tensors",
+                                                        "static void graph_refresh_input_tensors(",
                                                         "segmented replay sequence graphlet bridge");
+    {
+        // The region must be exactly this one function: a region that ran on into later functions would let the
+        // needles below match code that is not part of the replay bridge.
+        size_t closes = 0;
+        for (size_t pos = replay_segments.find("\n}\n"); pos != std::string::npos;
+             pos = replay_segments.find("\n}\n", pos + 1)) {
+            closes++;
+        }
+        CHECK(closes == 1, "the segmented replay bridge region must hold exactly one function (its end marker drifted)");
+    }
     CHECK(contains(replay_segments, "try_sequence_graphlet_for_segmented_moe"),
           "segmented replay must try sequence graphlets for MoE dispatch gaps");
     CHECK(contains(replay_segments, "moe_graph_try_sequence_graphlet_for_node") &&
@@ -1976,7 +1986,7 @@ static int test_default_ready_block_graphlet_safety_contract() {
     CHECK(!contains(before_profile_matrix, "GGML_SYCL_MOE_AGGREGATION_DECISION"),
           "promotion-suite/default-candidate harness must not set the aggregation override outside profile-matrix comparisons");
     const size_t decision_pos = try_fn.find("moe_aggregation_selected_decision");
-    const size_t prestage_pos = try_fn.find("graph_prestage_leaf_tensors");
+    const size_t prestage_pos = try_fn.find("graph_prestage_or_decline(");
     CHECK(decision_pos != std::string::npos && prestage_pos != std::string::npos && decision_pos < prestage_pos,
           "decision-none gate must run before graph prestage/recording can mutate runtime state");
     CHECK(contains(descriptor_capture, "moe_aggregation_decision_allows_block_graphlets"),
