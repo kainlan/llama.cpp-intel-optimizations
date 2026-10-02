@@ -55,6 +55,12 @@ def reserve_call_arguments(source):
     return calls
 
 
+# `std::max(planned...` in any spelling of the whitespace: the pre-ijla upsize and every hoisted variant of it.
+PLANNED_MAX = re.compile(r"std::max\s*\(\s*planned")
+# The single legitimate site (llama.cpp-479i): the dense Q8_1 src1 buffer is sized to its graph-entry demand.
+DENSE_Q8_1_SRC1_GROWTH = re.compile(r"std::max\s*\(\s*planned_bytes\s*,\s*demand\s*\[\s*d\s*\]\s*\.bytes\s*\)")
+
+
 def strip_comments(source):
     """Remove C and C++ comments, preserving string literals and line count.
 
@@ -220,11 +226,17 @@ def evaluate(sycl, cache, module, header, doc=""):
                 for region in (batched, staging)),
         # ABSENCE: the bug this task exists for. max(planned, required) turns a
         # budgeted zone into a high-water mark of every shape ever seen.
-        # Scoped to the arguments of the PP MoE reservation itself. A file-wide `std::max(planned` ban
-        # also hit llama.cpp-479i's dense Q8_1 src1 buffer (`std::max(planned_bytes, demand[d].bytes)`),
-        # a different cohort that is planned to its own graph-entry demand and logs any in-op growth.
+        # The reservation's own arguments may not carry a max ...
         "no PP MoE scratch reservation upsizes past the plan":
             reserve_call_arguments(sycl) != [] and not any("std::max(" in call for call in reserve_call_arguments(sycl)),
+        # ... and neither may anything ELSE in the file. Scoping the ban to the call's argument text (the first
+        # repair of llama.cpp-479i's dense Q8_1 src1 buffer) let the same max be hoisted to the line before the
+        # call, which is the pre-ijla "zone becomes the high-water mark" defect again. So the ban is file-wide
+        # and exempts exactly ONE spelling: 479i's `std::max(planned_bytes, demand[d].bytes)`, a different
+        # cohort planned to its own graph-entry demand that logs any in-op growth.
+        "no std::max(planned ...) survives outside the one 479i site":
+            len(DENSE_Q8_1_SRC1_GROWTH.findall(sycl)) == 1
+            and not PLANNED_MAX.search(DENSE_Q8_1_SRC1_GROWTH.sub("", sycl)),
         # ABSENCE: with a general fallback present, refusing costs nothing and
         # the cap is decorative -- the batch simply allocates its own scratch.
         "the batched executor keeps no general temporary fallback":
@@ -313,6 +325,12 @@ ABSENCE_MUTANTS = {
         "            if (!cache->reserve_pp_moe_onednn_scratch(std::max(planned_weight, weight_bytes),\n"
         "                                                     std::max(planned_act, act_bytes),\n"
         "                                                     std::max(planned_out, out_bytes), ring_depth)) {"),
+    # The same max, hoisted to the line before the call so the call's argument text stays clean.
+    "no std::max(planned ...) survives outside the one 479i site": (
+        "sycl",
+        "            if (!cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)) {",
+        "            const size_t hoisted_weight = std::max(planned_weight, weight_bytes);\n"
+        "            if (!cache->reserve_pp_moe_onednn_scratch(hoisted_weight, planned_act, planned_out, ring_depth)) {"),
     "the batched executor keeps no general temporary fallback": (
         "sycl",
         "            pp_moe_onednn_scratch_claim batched_scratch_claim;\n\n"
