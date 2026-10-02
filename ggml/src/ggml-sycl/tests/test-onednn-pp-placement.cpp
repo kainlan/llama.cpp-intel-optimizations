@@ -34,6 +34,7 @@ using ggml_sycl::onednn_pp_placement_decide;
 using ggml_sycl::onednn_pp_placement_inputs;
 using ggml_sycl::onednn_pp_refusal;
 using ggml_sycl::onednn_pp_route;
+using ggml_sycl::onednn_pp_type_term_refused;
 using ggml_sycl::onednn_pp_woq_alternates_allowed;
 
 // An op with every admission input favourable (oneDNN PP on, not a skipped
@@ -41,8 +42,7 @@ using ggml_sycl::onednn_pp_woq_alternates_allowed;
 // the route's floor is left to the caller.
 static onednn_pp_admission_inputs admitted_inputs(onednn_pp_route route, int64_t batch) {
     onednn_pp_admission_inputs in;
-    in.enabled                     = true;
-    in.skip_type                   = false;
+    in.type_admitted               = true;
     in.batch                       = batch;
     in.min_batch                   = onednn_pp_min_batch_for(route, /*dense_min_batch=*/16);
     in.f32_operands                = true;
@@ -160,15 +160,11 @@ int main() {
         onednn_pp_admission_inputs in = admitted_inputs(route, 512);
         CHECK(onednn_pp_admission_decide(in) == onednn_pp_refusal::NONE, "case 7: baseline admitted");
 
-        in.enabled = false;
-        CHECK(onednn_pp_admission_decide(in) == onednn_pp_refusal::DISABLED_OR_SKIP_TYPE, "case 7: disabled");
+        in.type_admitted = false;
+        CHECK(onednn_pp_admission_decide(in) == onednn_pp_refusal::DISABLED_OR_SKIP_TYPE, "case 7: type refused");
         in.batch = 1;
         CHECK(onednn_pp_admission_decide(in) == onednn_pp_refusal::DISABLED_OR_SKIP_TYPE,
               "case 7: disabled wins over the batch floor");
-
-        in           = admitted_inputs(route, 512);
-        in.skip_type = true;
-        CHECK(onednn_pp_admission_decide(in) == onednn_pp_refusal::DISABLED_OR_SKIP_TYPE, "case 7: skip type");
 
         in              = admitted_inputs(route, 512);
         in.f32_operands = false;
@@ -179,6 +175,13 @@ int main() {
         CHECK(onednn_pp_admission_decide(in) == onednn_pp_refusal::NOT_CONTIGUOUS_QUANT,
               "case 7: non-contiguous or unquantized weight");
     }
+
+    // 8. The type-level term (GGML_SYCL_ONEDNN_PP, GGML_SYCL_SKIP_ONEDNN_Q4_0), which ggml_sycl_onednn_pp_type_admitted
+    //    alone evaluates and hands to the pure admission as `type_admitted` (llama.cpp-8ony).
+    CHECK(!onednn_pp_type_term_refused(true, false), "case 8: enabled, type not skipped: admitted");
+    CHECK(onednn_pp_type_term_refused(false, false), "case 8: oneDNN PP off: refused");
+    CHECK(onednn_pp_type_term_refused(true, true), "case 8: type skipped: refused");
+    CHECK(onednn_pp_type_term_refused(false, true), "case 8: off and skipped: refused");
 
     std::printf("test-onednn-pp-placement: all cases passed\n");
     return 0;

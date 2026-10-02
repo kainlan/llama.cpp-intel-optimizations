@@ -28143,10 +28143,11 @@ static bool ggml_sycl_onednn_pp_skip_type(ggml_type type) {
     return skip_q4_0 && type == GGML_TYPE_Q4_0;
 }
 
-// llama.cpp-8ony: the environment-level terms of the oneDNN PP admission, for a weight of `type`: the same two gates
-// ggml_sycl_onednn_pp_candidate hands the pure admission (GGML_SYCL_ONEDNN_PP, GGML_SYCL_SKIP_ONEDNN_Q4_0). The zone
-// adapter asks it at plan time, where there is no graph node for the router, so that a type no PP route can draw is
-// not reserved a dequant copy; non-static and declared in common.hpp because the planner cannot see this TU's statics.
+// llama.cpp-8ony: the environment-level terms of the oneDNN PP admission, for a weight of `type`
+// (GGML_SYCL_ONEDNN_PP, GGML_SYCL_SKIP_ONEDNN_Q4_0). The ONE reader of both: ggml_sycl_onednn_pp_candidate hands its
+// answer to the pure admission, the dense WOQ second-copy predicate asks it, and the zone adapter asks it at plan
+// time, where there is no graph node for the router, so that a type no PP route can draw is not reserved a dequant
+// copy. Non-static and declared in common.hpp because the planner cannot see this TU's statics.
 bool ggml_sycl_onednn_pp_type_admitted(ggml_type type) {
     return !ggml_sycl::onednn_pp_type_term_refused(ggml_sycl_onednn_pp_enabled(), ggml_sycl_onednn_pp_skip_type(type));
 }
@@ -28181,8 +28182,8 @@ static bool ggml_sycl_dense_woq_alternates_enabled() {
 }
 
 static bool ggml_sycl_dense_woq_alternate_eligible_impl(ggml_type type, bool is_contiguous, bool placement_safe) {
-    return ggml_sycl_dense_woq_alternates_enabled() && is_contiguous && ggml_sycl_onednn_pp_enabled() &&
-           !ggml_sycl_onednn_pp_skip_type(type) && placement_safe && ggml_sycl_onednn_woq_supported_type(type);
+    return ggml_sycl_dense_woq_alternates_enabled() && is_contiguous && ggml_sycl_onednn_pp_type_admitted(type) &&
+           placement_safe && ggml_sycl_onednn_woq_supported_type(type);
 }
 
 bool ggml_sycl_dense_woq_alternate_eligible(ggml_type type, bool is_contiguous) {
@@ -28233,8 +28234,7 @@ static bool ggml_sycl_onednn_pp_candidate(
         return false;
     }
     ggml_sycl::onednn_pp_admission_inputs admission;
-    admission.enabled                     = ggml_sycl_onednn_pp_enabled();
-    admission.skip_type                   = ggml_sycl_onednn_pp_skip_type(src0->type);
+    admission.type_admitted               = ggml_sycl_onednn_pp_type_admitted(src0->type);
     admission.batch                       = src1->ne[1];
     admission.min_batch                   = ggml_sycl::onednn_pp_min_batch_for(route, ggml_sycl_onednn_pp_min_batch());
     admission.f32_operands                = src1->type == GGML_TYPE_F32 && (!dst || dst->type == GGML_TYPE_F32);
