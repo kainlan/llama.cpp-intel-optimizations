@@ -143,3 +143,11 @@ def test_mxfp4_inline_dot_probe_mode_avoids_backend_helpers_and_uses_cpu_referen
     assert "validate_pair_glu_cpu_reference" in probe_pair_glu
     assert "ggml_sycl_mxfp4_pair_glu_bench_launch(ref_args)" not in probe_pair_glu
     assert "ggml_sycl_mxfp4_pair_glu_bench_launch(ref_args)" in normal_pair_glu
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

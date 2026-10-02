@@ -89,3 +89,11 @@ def test_mutations_are_rejected() -> None:
         "ggml_backend_buffer_has_sycl_context(tensor->buffer)",
         "false",
     ))
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

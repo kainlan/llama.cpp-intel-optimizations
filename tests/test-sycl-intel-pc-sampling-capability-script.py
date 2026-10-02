@@ -64,3 +64,11 @@ def test_pc_sampling_probe_refuses_execute_without_ack(tmp_path: pathlib.Path) -
     )
     assert result.returncode == 2
     assert "--i-understand-this-probes-intel-gpu-pc-sampling" in result.stdout
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

@@ -153,3 +153,11 @@ def test_mutation_is_witnessed() -> None:
     assert any("round-9 owner-approved default flip" in v for v in violations), (
         f"revert mutation was not witnessed: {violations}"
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

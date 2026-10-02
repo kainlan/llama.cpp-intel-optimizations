@@ -276,11 +276,14 @@ if (BUILD_TESTING)
                     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-module-dependencies.py
                     $<TARGET_FILE:ggml-sycl>)
         set_tests_properties(sycl-module-no-cpu-dependency PROPERTIES LABELS "sycl;module;host")
-        add_test(NAME sycl-module-nodelete-source
-            COMMAND ${Python3_EXECUTABLE}
-                    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-module-nodelete-source.py)
-        set_tests_properties(sycl-module-nodelete-source PROPERTIES LABELS "sycl;module;host")
     endif()
+    # Pure text over the loader, registry, probe and backend sources, so it needs no module and no DL build: it was
+    # registered inside the GGML_BACKEND_DL guard and never ran in the default configuration.
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME sycl-module-nodelete-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-module-nodelete-source.py)
+    set_tests_properties(sycl-module-nodelete-source PROPERTIES LABELS "sycl;module;host;python")
 
     add_executable(test-sycl-lifecycle-runtime-wrapper
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-runtime-wrapper.cpp)
@@ -455,7 +458,7 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-pp-moe-scratch-admission-contract.py
             --self-test)
-    set_tests_properties(sycl-pp-moe-scratch-admission-contract PROPERTIES LABELS "sycl;moe;host;source-contract")
+    set_tests_properties(sycl-pp-moe-scratch-admission-contract PROPERTIES LABELS "sycl;moe;host;source-contract;python")
     # The MMVQ launch geometry contract (llama.cpp-99ke). --self-test for the
     # same reason: the check that matters most is absence-based -- no launch
     # site still submits the raw row count -- and it passes on every tree
@@ -536,6 +539,14 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-fallback-propagation.py)
     add_test(NAME sycl-fallback-exception-safety
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-fallback-exception-safety.py)
+    # llama.cpp-gsb9.  Owner-first allocation migration census.  This gate sat
+    # unregistered, so nothing noticed when a stale count pin aborted it at line
+    # 137 and silenced every later check; it is registered now, and each check runs
+    # independently.  Text-only, allocates nothing, opens no device.
+    add_test(NAME sycl-owner-allocation-migration
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-owner-allocation-migration.py)
+    set_tests_properties(sycl-owner-allocation-migration PROPERTIES
+        LABELS "sycl;host;source-contract")
 endif()
 
 # Enable AVX2 + VNNI for CPU vec_dot kernels in tensor split / CPU offload.
@@ -5934,8 +5945,7 @@ if (Python3_Interpreter_FOUND)
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-layer-stream-owner-contract.py
             --self-test)
     set_tests_properties(sycl-layer-stream-owner-contract PROPERTIES
-        LABELS "sycl;lifecycle;cross-model;host-only;source-contract"
-        SKIP_RETURN_CODE 77
+        LABELS "sycl;lifecycle;cross-model;host-only;source-contract;python"
         TIMEOUT 120
     )
 else()
@@ -5953,8 +5963,7 @@ if (Python3_Interpreter_FOUND)
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mmid-deferral-contract.py
             --self-test)
     set_tests_properties(sycl-mmid-deferral-contract PROPERTIES
-        LABELS "sycl;moe;lifecycle;host-only;source-contract"
-        SKIP_RETURN_CODE 77
+        LABELS "sycl;moe;lifecycle;host-only;source-contract;python"
         TIMEOUT 120
     )
 else()

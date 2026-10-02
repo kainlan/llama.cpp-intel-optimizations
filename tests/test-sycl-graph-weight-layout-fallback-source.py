@@ -371,3 +371,11 @@ def test_mutations_are_witnessed() -> None:
     assert any("does not GGML_ABORT" in v for v in log_violations), (
         f"abort-to-log-and-return mutation did not produce the expected violation: {log_violations}"
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

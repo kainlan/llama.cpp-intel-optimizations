@@ -31,6 +31,19 @@ def test_failpoints_are_exact_match_and_reserved_for_gpu_lifecycle_run() -> None
     assert 'std::getenv("GGML_SYCL_TEST_PACKED_K_FAIL_AFTER")' in helper
     assert "std::strcmp(selected, checkpoint) == 0" in helper
     assert "throw sycl::exception" in helper
+    # The profile-error seam is the OTHER env-selected failpoint in this file and sits above the one scored
+    # above, so a compare edited there (a strcmp -> strstr swap hits it first) is invisible to the check on
+    # `helper`. Pin its selector and exact-match compare too.
+    profile_helper = section(
+        FATTN,
+        "void ggml_sycl_fattn_xmx_test_profile_error_after_submit(const char * checkpoint)",
+        "uint64_t ggml_sycl_fattn_xmx_test_profile_error_after_submit_count",
+    )
+    assert 'std::getenv("GGML_SYCL_TEST_PACKED_K_PROFILE_ERROR_AFTER_SUBMIT")' in profile_helper
+    assert "std::strcmp(selected, checkpoint) == 0" in profile_helper
+    assert "throw std::bad_alloc{}" in profile_helper
+    for scored in (helper, profile_helper):
+        assert "strstr" not in scored and "strncmp" not in scored
 
 
 def test_sidecar_snapshot_replaces_borrowed_lookup_at_force_path() -> None:
@@ -55,7 +68,7 @@ def test_initial_fill_throw_erases_owner_before_retry() -> None:
     new_alloc = section(update, "if (!reuse_alloc) {", "} else {")
     ordered(
         new_alloc,
-        'ggml_sycl_fattn_xmx_test_failpoint("sidecar-before-initial-fill")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("sidecar-before-initial-fill")',
         "zero_event = ggml_sycl::mem_fill_async",
         "catch (const sycl::exception & e)",
         'GGML_LOG_WARN("[SYCL] packed-K sidecar initial fill submit failed:',
@@ -87,7 +100,7 @@ def test_new_sidecar_publishes_retry_identity_before_injected_throw() -> None:
         "packed.batch       = batch",
         "packed.n_blocks    = n_blocks",
         "packed.total_bytes = total_bytes",
-        'ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("sidecar-zero-to-update")',
     )
 
     # These are the exact production predicates a retry uses to rediscover and reuse the surviving owner.
@@ -126,7 +139,7 @@ def test_sidecar_propagates_prior_event_and_replaces_each_accepted_submit() -> N
         update,
         "zero_event = ggml_sycl::mem_fill_async",
         "packed.ready_event = zero_event",
-        'ggml_sycl_fattn_xmx_test_failpoint("sidecar-zero-to-update")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("sidecar-zero-to-update")',
         "ggml_sycl_fattn_xmx_submit_set_rows_update",
     )
     assert update.count("&packed.ready_event") == 2
@@ -145,7 +158,7 @@ def test_forced_materializer_propagates_prior_event_and_replaces_success() -> No
         "zero_deps.push_back(previous_use)",
         "ggml_sycl::mem_fill_async(out->handle, 0, desc.total_packed_bytes, *stream, zero_deps)",
         "out->ready_event = zero_event",
-        'ggml_sycl_fattn_xmx_test_failpoint("materializer-zero-to-pack")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("materializer-zero-to-pack")',
         "cgh.depends_on(zero_event)",
         "out->ready_event = pack_event",
     )
@@ -164,7 +177,7 @@ def test_packed_consumer_propagates_prior_event_then_replaces_first_and_merge() 
         "ggml_sycl_should_add_dependency(packed_ready_event)",
         "cgh.depends_on(packed_ready_event)",
         "*packed_k_ready_event = first_event",
-        'ggml_sycl_fattn_xmx_test_failpoint("packed-first-to-merge")',
+        'GGML_SYCL_FATTN_PRIVATE_FAILPOINT("packed-first-to-merge")',
         "cgh.depends_on(first_event)",
         "return merge_event",
     )
@@ -329,3 +342,11 @@ def test_cache_clear_paths_cannot_erase_sidecars_and_teardown_is_range_scoped() 
     # unified_cache_reset_scratch_pool before llama.cpp-37ba's rename.
     assert "unified_cache_scratch_pool_epoch_boundary" in graph_clear
     assert "ggml_sycl_fattn_xmx_unregister_packed_k_range" not in graph_clear
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

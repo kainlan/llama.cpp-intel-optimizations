@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,8 +29,15 @@ def graph_compute_impl_body(src: str) -> str:
     return src[open_brace:close_brace]
 
 
+def strip_comments(source: str) -> str:
+    return re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.DOTALL)
+
+
 def assert_no_waits(source: str) -> None:
-    assert ".wait(" not in source
+    # A wait is a member call through `.` OR `->` (`ctx.stream()->wait()` has no ".wait(" substring), or a
+    # qualified one (`sycl::event::wait(...)`), and a stream synchronisation helper is one too.
+    assert not re.search(r"(?:\.|->|::)\s*wait\s*\(", source)
+    assert not re.search(r"synchronize\s*\(", source)
     assert "wait_and_throw" not in source
 
 
@@ -38,9 +46,28 @@ def assert_no_waits_or_flush(source: str) -> None:
     assert "flush" not in source
 
 
+GUARD_STRUCT = "struct compute_impl_guard {"
+GUARD_INSTANCE = "compute_impl_guard _reentry_guard"
+
+
+def pre_guard_regions(body: str) -> list[str]:
+    """Everything between the timeline hook and the re-entry guard's instantiation except the guard struct itself
+    (whose constructor legitimately drains the bcs/dma queues): nothing there may wait or flush, wherever it sits
+    relative to the 400-character window around the hook."""
+    hook_pos = body.index("ggml_sycl::sycl_timeline_note_graph_compute();")
+    struct_open = body.index("{", body.index(GUARD_STRUCT))
+    struct_close = matching_brace(body, struct_open)
+    return [body[hook_pos:body.index(GUARD_STRUCT)], body[struct_close:body.index(GUARD_INSTANCE)]]
+
+
 def test_graph_compute_impl_notes_timeline_decode_step_once_without_waits() -> None:
     src = read_source()
-    body = graph_compute_impl_body(src)
+    # Comment-blind BEFORE the window is cut: llama.cpp-os8k (95adb0460) put a ~370-character comment about
+    # flushing the PREVIOUS graph_compute's e2e stage split right after this hook. It is not a flush of anything
+    # here, and cutting the window from the raw text let it spend the whole budget so no code after the hook
+    # was inspected at all. The call it describes, e2e_tg_profile_note_new_graph_compute(), only prints the
+    # host-side stats under its own env gate.
+    body = strip_comments(graph_compute_impl_body(src))
 
     hook = "ggml_sycl::sycl_timeline_note_graph_compute();"
     assert body.count(hook) == 1
@@ -50,7 +77,47 @@ def test_graph_compute_impl_notes_timeline_decode_step_once_without_waits() -> N
     local_hook_window = body[max(0, hook_pos - 200) : min(len(body), hook_pos + 400)]
 
     assert hook_pos < spans_enabled < guard
+    assert "e2e_tg_profile_note_new_graph_compute()" in local_hook_window
     assert_no_waits_or_flush(local_hook_window)
+    for region in pre_guard_regions(body):
+        assert_no_waits_or_flush(region)
+
+
+def test_hook_window_rejects_a_wait_or_flush_after_the_hook() -> None:
+    """The window must actually reach code: a flush or wait right after the hook has to be refused."""
+    body = strip_comments(graph_compute_impl_body(read_source()))
+    hook = "ggml_sycl::sycl_timeline_note_graph_compute();"
+    note = "e2e_tg_profile_note_new_graph_compute();"
+    assert note in body
+    for injected in ("e2e_tg_profile_flush_if_ready(stderr);", "ctx.stream()->wait();"):
+        mutant = body.replace(note, note + " " + injected, 1)
+        assert mutant != body
+        hook_pos = mutant.index(hook)
+        window = mutant[max(0, hook_pos - 200) : min(len(mutant), hook_pos + 400)]
+        try:
+            assert_no_waits_or_flush(window)
+        except AssertionError:
+            continue
+        raise AssertionError(f"window missed: {injected}")
+
+
+def test_pre_guard_regions_reject_a_wait_or_flush_past_the_window() -> None:
+    """A wait after timeline_graph_span_flag_guard sits beyond the hook window; the regions must still catch it,
+    both before the guard struct and between the struct and its instantiation."""
+    body = strip_comments(graph_compute_impl_body(read_source()))
+    for anchor in ("} timeline_graph_span_flag_guard_(timeline_spans_enabled);", "const auto t_impl_entry"):
+        assert anchor in body
+        for injected in ("sycl::event::wait(deps);", "ctx.stream()->wait();", "ggml_sycl_stream_synchronize(ctx);",
+                         "e2e_tg_profile_flush_if_ready(stderr);"):
+            mutant = body.replace(anchor, anchor + " " + injected, 1) if anchor.startswith("}") else \
+                body.replace(anchor, injected + " " + anchor, 1)
+            assert mutant != body
+            try:
+                for region in pre_guard_regions(mutant):
+                    assert_no_waits_or_flush(region)
+            except AssertionError:
+                continue
+            raise AssertionError(f"regions missed {injected!r} at {anchor!r}")
 
 
 def test_graph_compute_impl_has_timeline_scope_after_reentry_guard() -> None:
@@ -92,7 +159,8 @@ def test_compute_forward_early_handled_route_has_timeline_scope_metadata() -> No
 
 def test_compute_forward_switch_has_timeline_scope_metadata() -> None:
     src = read_source()
-    begin = src.index("static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {")
+    # The dispatch body lives in ggml_sycl_compute_forward_impl since 2c3367985 (2gag/sbky); the old name is a wrapper.
+    begin = src.index("static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {")
     switch = src.index("switch (dst->op)", begin)
     preceding_window = src[max(0, switch - 2500) : switch]
 
@@ -140,3 +208,11 @@ def test_node_loop_compute_forward_has_timeline_scope_metadata() -> None:
         assert "node->name" in preceding_window
         assert "ggml_op_name(node->op)" in preceding_window
         assert_no_waits(preceding_window)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

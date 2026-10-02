@@ -1568,3 +1568,11 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
         "because the continue is still inside the catch's own braces; the positional search from the store is "
         "what requires the continue to FOLLOW the store, and it is what actually catches this mutant"
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

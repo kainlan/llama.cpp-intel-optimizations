@@ -63,3 +63,11 @@ def test_sycl_docs_describe_named_kernel_profiler_contract() -> None:
     assert "GGML_SYCL_KERNEL_PROFILE_FLUSH" in doc
     assert "SYCL event profiling timestamps" in doc
     assert "VTune computing-task attribution is not the source of truth" in doc
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

@@ -174,3 +174,11 @@ def test_parser_omits_cost_rows_when_top_kernels_option_is_absent() -> None:
         assert result.returncode == 0, result.stdout
         assert "cost.top1_kernel" not in result.stdout
         assert "cost.kernel.rank." not in result.stdout
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

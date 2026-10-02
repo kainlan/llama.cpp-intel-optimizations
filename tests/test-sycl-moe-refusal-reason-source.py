@@ -105,3 +105,11 @@ def test_mutations_are_witnessed() -> None:
     for index, mutated in enumerate(sycl_mutations):
         assert mutated != sycl, f"log mutation {index} did not change the source"
         assert violations(batch, mutated), f"log mutation {index} was not witnessed"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

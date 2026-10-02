@@ -69,3 +69,11 @@ def test_unified_matmul_profile_labels_remain_unchanged() -> None:
         "unified.matmul.scalar",
     ]:
         assert label in src
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

@@ -107,3 +107,11 @@ def test_parser_reads_explicit_text_pc_rows() -> None:
         rows = list(csv.DictReader(io.StringIO(result.stdout)))
         assert [row["pc"] for row in rows] == ["64", "80"]
         assert rows[1]["opcode"] == "send.ugm"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

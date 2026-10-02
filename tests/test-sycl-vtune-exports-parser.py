@@ -40,3 +40,11 @@ def test_vtune_parser_reports_malformed_csv_without_traceback() -> None:
         assert result.returncode == 2
         assert "failed to parse VTune exports" in result.stdout
         assert "Traceback" not in result.stdout
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

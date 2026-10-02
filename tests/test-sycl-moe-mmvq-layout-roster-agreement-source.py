@@ -708,13 +708,17 @@ def test_advertisement_and_refusal_sites_decide_layout_via_roster_only():
 
 
 if __name__ == "__main__":
-    test_find_decision_condition_prefers_innermost_nested_if()
-    test_find_decision_condition_raises_on_sibling_ambiguity()
-    test_find_decision_condition_uses_offsets_not_text_for_containment()
-    test_positive_control_regex_is_sensitive()
-    test_regex_does_not_over_match_longer_or_chains()
-    test_no_hand_maintained_carveout_survives_outside_the_named_exception()
-    test_deliberately_unfixed_site_still_exists_and_is_named_correctly()
-    test_advertisement_and_refusal_sites_consult_the_roster()
-    test_advertisement_and_refusal_sites_decide_layout_via_roster_only()
-    print("test-sycl-moe-mmvq-layout-roster-agreement-source: OK")
+    import sys
+
+    # Every module-level test_ function runs, so a test added later cannot be skipped on a direct run.
+    failures = 0
+    for name, fn in list(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"ok   {name}")
+            except AssertionError as exc:
+                failures += 1
+                print(f"FAIL {name}: {exc}")
+    print("test-sycl-moe-mmvq-layout-roster-agreement-source: " + ("OK" if failures == 0 else f"FAILED ({failures})"))
+    sys.exit(1 if failures else 0)

@@ -2,7 +2,6 @@
 """Structural regression gate for exception-safe async MoE stage handoffs."""
 
 from pathlib import Path
-import argparse
 
 
 def function_body(source: str, name: str) -> str:
@@ -115,13 +114,9 @@ def test_async_stage_handoff_source_contract() -> None:
     verify((root / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text())
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--source", required=True)
-    args = parser.parse_args()
-    verify(Path(args.source).read_text())
-    print("PASS: async stage owners publish with tickets or drain their exact queue")
-
-
 if __name__ == "__main__":
-    main()
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
