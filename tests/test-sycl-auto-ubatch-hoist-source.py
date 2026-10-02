@@ -177,7 +177,19 @@ def prep_members_ok(code: str, header: str) -> bool:
     # `header` is code_of(llama-context.h); the struct runs to the unique_ptr member declared right after it
     struct = header[header.index(z("struct sycl_auto_ubatch_prep {")) :]
     body = struct[: struct.index(z("std::unique_ptr<sycl_auto_ubatch_prep> auto_ubatch_prep;"))]
-    if re.search(r"\bcache_(path|lookup)_fn\b", body):
+    # every declared member, by name: the statements that are not the struct's own constructor and copy operations,
+    # cut at the initialiser, the brace or the array bound, name last
+    declared = set()
+    for stmt in body[body.index("{") + 1 :].split(";"):
+        if stmt in ("", "}") or stmt.startswith("sycl_auto_ubatch_prep"):
+            continue
+        stmt = re.split(r"[=\[{]", stmt, maxsplit=1)[0]
+        name = re.search(r"(\w+)$", stmt)
+        if name is None:
+            return False
+        declared.add(name.group(1))
+    # each is stored by the hoisted block, so none is declared and never filled
+    if declared != written:
         return False
     return (
         z("sycl_auto_ubatch_prep(const sycl_auto_ubatch_prep &) = delete;") in body
@@ -318,3 +330,11 @@ def test_mutants():
         "mutant 'the prep is copy-assignable' slipped through"
     assert not prep_members_ok(code, header.replace(z("cache_store_fn = nullptr;"), z("cache_store_fn = nullptr; void * cache_lookup_fn = nullptr;"), 1)), \
         "mutant 'the prep declares the dead lookup member again' slipped through"
+
+    # a declared member the block never stores, of any name, and one it stores that nothing reads
+    assert not prep_members_ok(code, header.replace(z("cache_store_fn = nullptr;"), z("cache_store_fn = nullptr; bool dead_member = false;"), 1)), \
+        "mutant 'a member is declared and never stored or read' slipped through"
+    assert not prep_members_ok(
+        with_prep(mutate(prep, "prep->cap = cap;", "prep->cap = cap; prep->dead_member = true;")),
+        header.replace(z("cache_store_fn = nullptr;"), z("cache_store_fn = nullptr; bool dead_member = false;"), 1),
+    ), "mutant 'a member is stored and never read' slipped through"

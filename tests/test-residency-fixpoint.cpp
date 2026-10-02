@@ -27,7 +27,10 @@
 //        never refused for procs it has no use for;
 //   (13) each wrong-length answer is BUG on its own: R0 alone, a verify answer alone;
 //   (14) a MEASURE that fails in the verify (the re-measure over R_v) is MEASURE_FAILED and publishes nothing;
-//   (15) a layerless model (n_layer = 0) is one MEASURE and an empty residency.
+//   (15) a layerless model (n_layer = 0) is one MEASURE and an empty residency;
+//   (16) a probe byte other than 0/1 is read as host-resident (non-zero) and normalised before anything compares
+//        or measures it: R0 = {2,0,0} is measured over {1,0,0} and converges in one MEASURE, not two;
+//   (17) the verify asks the probe nothing more: the last round's answer is the raw probe over T*.
 
 #include "../src/llama-residency-fixpoint.h"
 #include "ggml-sycl-cohort.h"  // GGML_SYCL_CONTEXT_COHORT_COMPUTE, named here, not reached transitively
@@ -156,6 +159,7 @@ static void test_no_demotion() {
     CHECK(r.residency == llama_residency(4, 0));
     CHECK(r.tenants.empty());
     CHECK(!r.verify_shrunk);
+    CHECK(s.probe_calls == 2);  // (17) R0, and the one round's answer: the verify reuses it
 }
 
 static void test_one_demotion() {
@@ -385,6 +389,21 @@ static void test_no_layers() {
     CHECK(r.residency.empty());
 }
 
+static void test_non_binary_probe_byte() {
+    // (16): the probe holds layer 0 with a byte 2, and answers its own residency back over any tenants
+    stub s;
+    s.n_layer  = 3;
+    s.probe_fn = [](const llama_tenants * t) {
+        return t == nullptr ? llama_residency{ 2, 0, 0 } : residency_of(*t, 3);
+    };
+    const auto r = run(s);
+    CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_OK);
+    CHECK(r.iterations == 1);
+    REQUIRE(!s.measured_over.empty());
+    CHECK((s.measured_over[0] == llama_residency{ 1, 0, 0 }));
+    CHECK((r.residency == llama_residency{ 1, 0, 0 }));
+}
+
 int main() {
     test_decision();
     test_no_demotion();
@@ -398,6 +417,7 @@ int main() {
     test_wrong_length_alone();
     test_verify_measure_failed();
     test_no_layers();
+    test_non_binary_probe_byte();
     if (n_failed != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", n_failed);
         return 1;
