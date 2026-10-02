@@ -52648,17 +52648,18 @@ static_assert(GGML_SYCL_NONFA_STAGE_ELEM_BYTES == sizeof(sycl::half),
 
 // The facts ggml_sycl_mul_mat's f16 attention chain routes on that are not a function of the tensors. The
 // dispatch and the measure pass's context-nonfa-stage visitor (ggml_sycl::context_measure_mul_mat_route_env)
-// both read them here, so the route and the staged size are derived once. A null src0 buffer is not row-split.
+// both read them here, so the route and the staged size are derived once. A tensor with no buffer is not row-split
+// and not a weight (ggml_sycl_mul_mat_route_env_from).
 static ggml_sycl_mul_mat_route_env ggml_sycl_mul_mat_route_env_of(const ggml_tensor * src0, const ggml_tensor * src1) {
-    ggml_sycl_mul_mat_route_env env;
-    env.split            = src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer);
-    env.has_weight       = ggml_sycl_tensor_is_weight(src0) || ggml_sycl_tensor_is_weight(src1);
-    env.kqv_force_simple = g_ggml_sycl_kqv_force_simple || g_ggml_sycl_kqv_disable_fp16;
 #if GGML_SYCL_DNNL
     // oneDNN handles strided data; the oneMath path converts the elements.
-    env.stage_strided = !ggml_sycl_batched_f16_use_onemath(src0, src1);
+    const bool stage_strided = !ggml_sycl_batched_f16_use_onemath(src0, src1);
+#else
+    const bool stage_strided = false;
 #endif
-    return env;
+    return ggml_sycl_mul_mat_route_env_from(src0, src1, ggml_backend_buffer_is_sycl_split, ggml_sycl_tensor_is_weight,
+                                            g_ggml_sycl_kqv_force_simple || g_ggml_sycl_kqv_disable_fp16,
+                                            stage_strided);
 }
 
 namespace ggml_sycl {

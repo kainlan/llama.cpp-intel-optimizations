@@ -156,18 +156,29 @@ def test_batched_mutants():
 
 
 # ---- the environment is one function ----
+_ENV_FROM_CALL = (
+    "return ggml_sycl_mul_mat_route_env_from(src0, src1, ggml_backend_buffer_is_sycl_split, ggml_sycl_tensor_is_weight, "
+    "g_ggml_sycl_kqv_force_simple || g_ggml_sycl_kqv_disable_fp16, stage_strided);"
+)
+_ENV_FROM = (
+    "inline ggml_sycl_mul_mat_route_env ggml_sycl_mul_mat_route_env_from(const ggml_tensor * src0, const ggml_tensor * src1, "
+    "bool (*is_split_buffer)(ggml_backend_buffer_t), bool (*is_weight_tensor)(const ggml_tensor *), "
+    "bool kqv_force_simple, bool stage_strided)"
+)
+
+
 def env_ok(code: str) -> bool:
     e = function_body(code, _ENV_OF)
     pins = [
-        "env.split = src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer);",
-        "env.has_weight = ggml_sycl_tensor_is_weight(src0) || ggml_sycl_tensor_is_weight(src1);",
-        "env.kqv_force_simple = g_ggml_sycl_kqv_force_simple || g_ggml_sycl_kqv_disable_fp16;",
-        "env.stage_strided = !ggml_sycl_batched_f16_use_onemath(src0, src1);",
+        _ENV_FROM_CALL,
+        "const bool stage_strided = !ggml_sycl_batched_f16_use_onemath(src0, src1);",
+        "const bool stage_strided = false;",
     ]
     if any(e.count(z(p)) != 1 for p in pins):
         return False
-    # the strided path exists only where the oneDNN staging is compiled
-    if not re.search(r"#\s*if\s+GGML_SYCL_DNNL[^#]*env\.stage_strided", strip_ws(SYCL_CPP_ENV_REGION)):
+    # the strided path exists only where the oneDNN staging is compiled: the #if / #else on the raw text
+    region = strip_ws(SYCL_CPP_ENV_REGION)
+    if not re.search(r"#\s*if GGML_SYCL_DNNL [^#]*stage_strided = !ggml_sycl_batched_f16_use_onemath\(src0, src1\); #\s*else [^#]*stage_strided = false; #\s*endif", region):
         return False
     a = function_body(code, "namespace ggml_sycl { " + _ADAPTER)
     return a.count(z("*env = ggml_sycl_mul_mat_route_env_of(node->src[0], node->src[1]);")) == 1 and \
@@ -178,34 +189,65 @@ def strip_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s)
 
 
-# The #if around env.stage_strided is a preprocessor line the comment-stripped text keeps, so it is checked
+# The #if around stage_strided is a preprocessor line the comment-stripped text keeps, so it is checked
 # on the raw region of the function instead.
 _env_start = SYCL_CPP.index("static ggml_sycl_mul_mat_route_env ggml_sycl_mul_mat_route_env_of")
-SYCL_CPP_ENV_REGION = SYCL_CPP[_env_start : SYCL_CPP.index("return env;", _env_start)]
+SYCL_CPP_ENV_REGION = SYCL_CPP[_env_start : SYCL_CPP.index("stage_strided);", _env_start) + len("stage_strided);")]
 
 
 def test_the_environment_is_one_function_both_sites_call():
     code = code_of(SYCL_CPP)
-    e = function_body(code, _ENV_OF)
-    assert e.count(z("env.split")) == 1
+    assert env_ok(code)
     a = "namespace ggml_sycl { " + _ADAPTER
     assert z(a) in code
-    adapter = function_body(code, a)
-    assert z("*env = ggml_sycl_mul_mat_route_env_of(node->src[0], node->src[1]);") in adapter
     # the two environment readers are the only callers
     assert code.count(z("ggml_sycl_mul_mat_route_env_of(")) == 3  # definition, dispatch, adapter
+    assert code.count(z("ggml_sycl_mul_mat_route_env_from(")) == 1  # only the one function builds it
 
 
 def test_environment_mutants():
     code = code_of(SYCL_CPP)
     e = function_body(code, _ENV_OF)
     for name, old, new in [
-        ("split without the null check", "src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer)", "ggml_backend_buffer_is_sycl_split(src0->buffer)"),
-        ("only src0's weight", "ggml_sycl_tensor_is_weight(src0) || ggml_sycl_tensor_is_weight(src1)", "ggml_sycl_tensor_is_weight(src0)"),
+        ("split from the wrong predicate", "ggml_backend_buffer_is_sycl_split, ggml_sycl_tensor_is_weight", "ggml_backend_buffer_is_sycl_split, nullptr"),
         ("only one override", "g_ggml_sycl_kqv_force_simple || g_ggml_sycl_kqv_disable_fp16", "g_ggml_sycl_kqv_force_simple"),
-        ("the staging path inverted", "!ggml_sycl_batched_f16_use_onemath(src0, src1)", "ggml_sycl_batched_f16_use_onemath(src0, src1)"),
+        ("the staging path inverted", "const bool stage_strided = !ggml_sycl_batched_f16_use_onemath(src0, src1);", "const bool stage_strided = ggml_sycl_batched_f16_use_onemath(src0, src1);"),
+        ("the staging path fixed", "const bool stage_strided = !ggml_sycl_batched_f16_use_onemath(src0, src1);", "const bool stage_strided = true;"),
     ]:
         assert not env_ok(code.replace(e, mutate(e, old, new), 1)), f"mutant {name!r} slipped through"
+
+
+def env_from_ok(hpp: str) -> bool:
+    h = code_of(hpp)
+    if z(_ENV_FROM) not in h:
+        return False
+    b = function_body(h, _ENV_FROM)
+    pins = [
+        "env.split = src0->buffer != nullptr && is_split_buffer(src0->buffer);",
+        "env.has_weight = (src0->buffer != nullptr && is_weight_tensor(src0)) || (src1->buffer != nullptr && is_weight_tensor(src1));",
+        "env.kqv_force_simple = kqv_force_simple;",
+        "env.stage_strided = stage_strided;",
+    ]
+    return all(b.count(z(p)) == 1 for p in pins)
+
+
+def test_the_environment_builder_treats_an_unplaced_operand_as_neither_split_nor_weight():
+    assert env_from_ok(STAGE_HPP)
+
+
+def test_environment_builder_mutants():
+    h = code_of(STAGE_HPP)
+    b = function_body(h, _ENV_FROM)
+    for name, old, new in [
+        ("split asked of a null buffer", "src0->buffer != nullptr && is_split_buffer(src0->buffer)", "is_split_buffer(src0->buffer)"),
+        ("src0's weight asked of a null buffer", "(src0->buffer != nullptr && is_weight_tensor(src0))", "is_weight_tensor(src0)"),
+        ("src1's weight asked of a null buffer", "(src1->buffer != nullptr && is_weight_tensor(src1))", "is_weight_tensor(src1)"),
+        ("only src0's weight", " || (src1->buffer != nullptr && is_weight_tensor(src1))", ""),
+        ("the override dropped", "env.kqv_force_simple = kqv_force_simple;", "env.kqv_force_simple = false;"),
+    ]:
+        mutated = h.replace(b, mutate(b, old, new), 1)
+        # env_from_ok takes raw header text; the mutated text is already comment-stripped, which code_of leaves unchanged
+        assert not env_from_ok(mutated), f"mutant {name!r} slipped through"
 
 
 # ---- the visitor ----

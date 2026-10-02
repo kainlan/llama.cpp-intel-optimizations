@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 // Release builds define NDEBUG, which would compile assert() away and let this
@@ -88,6 +89,88 @@ uint64_t visit_bytes(const ggml_tensor * node, const ggml_sycl_mul_mat_route_env
     return t[0].slot_bytes;
 }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Waddress"
+
+// The chain ggml_sycl_mul_mat walked before the classifier existed (8fa214a79), copied literally: the
+// differential grid below holds the shared classifier to it on every combination of the terms.
+ggml_sycl_mul_mat_f16_route legacy_chain(const ggml_tensor * src0,
+                                         const ggml_tensor * src1,
+                                         const ggml_tensor * dst,
+                                         bool                split,
+                                         bool                batched_has_weight,
+                                         bool                kqv_debug_flags) {
+    auto is_kqv_matmul = [](const ggml_tensor * a, const ggml_tensor * b, const ggml_tensor * c) -> bool {
+        if (c && c->name && std::strstr(c->name, "kqv") != nullptr) {
+            return true;
+        }
+        if (a && a->name && std::strstr(a->name, "cache_v") != nullptr) {
+            return true;
+        }
+        if (b && b->name && std::strstr(b->name, "kq_soft_max") != nullptr) {
+            return true;
+        }
+        return false;
+    };
+    const bool kqv_matmul       = is_kqv_matmul(src0, src1, dst);
+    const bool force_simple_kqv = kqv_debug_flags && kqv_matmul;
+
+    if (!split && !batched_has_weight && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) &&
+        ggml_is_permuted(src1) && src1->ne[1] == 1) {
+        if (src0->ne[3] == 1 && src1->ne[3] == 1) {
+            return GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_P021;
+        }
+        return GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED;
+    } else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) &&
+               src1->ne[1] == 1 && src1->ne[3] == 1) {
+        return GGML_SYCL_MUL_MAT_F16_ROUTE_VEC_NC;
+    } else if (!split && !batched_has_weight && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) &&
+               !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1) {
+        if (!force_simple_kqv) {
+            return GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED;
+        }
+        return GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_SCALAR;
+    }
+    return GGML_SYCL_MUL_MAT_F16_ROUTE_NONE;
+}
+
+#pragma GCC diagnostic pop
+
+// A 4-d tensor whose strides are a layout of the shape: 0 contiguous, 1 transposed (dims 0 and 1 swapped), 2
+// permuted (dims 1 and 2 swapped), 3 a padded view (non-contiguous, not permuted).
+ggml_tensor * layout_tensor(ggml_context * ctx, ggml_type type, const int64_t * ne, int layout) {
+    ggml_tensor * t = ggml_new_tensor_4d(ctx, type, ne[0], ne[1], ne[2], ne[3]);
+    switch (layout) {
+        case 1:
+            std::swap(t->nb[0], t->nb[1]);
+            break;
+        case 2:
+            std::swap(t->nb[1], t->nb[2]);
+            break;
+        case 3:
+            t->nb[1] *= 2;
+            t->nb[2] *= 2;
+            t->nb[3] *= 2;
+            break;
+        default:
+            break;
+    }
+    return t;
+}
+
+int g_split_calls  = 0;
+int g_weight_calls = 0;
+
+bool dummy_split_buffer(ggml_backend_buffer_t) {
+    g_split_calls++;
+    return false;
+}
+
+bool counting_weight_tensor(const ggml_tensor *) {
+    g_weight_calls++;
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -163,6 +246,93 @@ int main() {
         ggml_tensor * out = ggml_mul_mat(ctx, w, x);
         CHECK(ggml_sycl_mul_mat_f16_route_of(w, x, out, plain) == GGML_SYCL_MUL_MAT_F16_ROUTE_NONE,
               "a quantized src0 is not an f16 route");
+    }
+
+    // ---- the differential grid: the shared classifier equals the removed chain on every combination ----
+    {
+        size_t                                   cases        = 0;
+        const int64_t                            ne1s[]       = { 1, 4 };
+        const int64_t                            ne2s[]       = { 1, 3 };
+        const int64_t                            ne3s[]       = { 1, 2 };
+        const ggml_type                          src0_types[] = { GGML_TYPE_F16, GGML_TYPE_F32 };
+        const char *                             names[]      = { "kq-0", "kqv-0" };
+        std::vector<ggml_sycl_mul_mat_f16_route> seen;
+        for (ggml_type t0 : src0_types) {
+            for (int l0 = 0; l0 < 4; l0++) {
+                for (int l1 = 0; l1 < 4; l1++) {
+                    for (int64_t ne1 : ne1s) {
+                        for (int64_t ne2 : ne2s) {
+                            for (int64_t ne3 : ne3s) {
+                                const int64_t ne_a[4] = { 8, 6, ne2, ne3 };
+                                const int64_t ne_b[4] = { 8, ne1, ne2, ne3 };
+                                ggml_tensor * src0    = layout_tensor(ctx, t0, ne_a, l0);
+                                ggml_tensor * src1    = layout_tensor(ctx, GGML_TYPE_F32, ne_b, l1);
+                                for (const char * name : names) {
+                                    ggml_tensor * dst = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 6, ne1, ne2, ne3);
+                                    ggml_set_name(dst, name);
+                                    for (int bits = 0; bits < 8; bits++) {
+                                        const bool split = bits & 1, weight = bits & 2, force = bits & 4;
+                                        const auto want = legacy_chain(src0, src1, dst, split, weight, force);
+                                        const auto got  = ggml_sycl_mul_mat_f16_route_of(
+                                            src0, src1, dst, env(split, weight, force, true));
+                                        CHECK(got == want, "the classifier differs from the removed chain");
+                                        CHECK(ggml_sycl_mul_mat_routes_batched_f16(src0, src1, dst,
+                                                                                   env(split, weight, force, true)) ==
+                                                  (want == GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED ||
+                                                   want == GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED),
+                                              "routes_batched differs from the removed chain's batched branches");
+                                        seen.push_back(want);
+                                        cases++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // the grid reaches every route, or a missing one would pass vacuously
+        for (int r = 0; r <= GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_SCALAR; r++) {
+            bool found = false;
+            for (auto x : seen) {
+                found = found || x == (ggml_sycl_mul_mat_f16_route) r;
+            }
+            CHECK(found, "the differential grid never reaches one of the routes");
+        }
+        CHECK(cases == 2u * 4 * 4 * 2 * 2 * 2 * 2 * 8, "the grid covers every combination");
+    }
+
+    // ---- the environment: an operand with no buffer ----
+    {
+        // A tensor with no buffer is in no row-split buffer and is no weight, and the buffer predicates are not asked.
+        const int64_t ne_a[4] = { 128, 256, 8, 1 };
+        const int64_t ne_b[4] = { 128, 16, 8, 1 };
+        ggml_tensor * w       = layout_tensor(ctx, GGML_TYPE_F16, ne_a, 0);
+        ggml_tensor * x       = layout_tensor(ctx, GGML_TYPE_F32, ne_b, 0);
+        CHECK(w->buffer == nullptr && x->buffer == nullptr, "the tensors are unplaced");
+        g_weight_calls = 0;
+        g_split_calls  = 0;
+        const auto e0  = ggml_sycl_mul_mat_route_env_from(w, x, dummy_split_buffer, counting_weight_tensor, true, true);
+        CHECK(!e0.split && !e0.has_weight && g_weight_calls == 0 && g_split_calls == 0,
+              "an unplaced operand is neither split nor a weight");
+        CHECK(e0.kqv_force_simple && e0.stage_strided, "the flags pass through");
+        // The consequence, stated: a bufferless f16 weight of the batched shape classifies as an activation, so a walker
+        // that measures before weights have buffers would demand its staging. The route says batched here.
+        ggml_tensor * out = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, 16, 8, 1);
+        ggml_set_name(out, "weight-mul");
+        CHECK(ggml_sycl_mul_mat_f16_route_of(w, x, out, e0) == GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_SCALAR ||
+                  ggml_sycl_mul_mat_f16_route_of(w, x, out, e0) == GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED,
+              "a bufferless f16 weight of the batched shape is read as an activation");
+        // With a buffer, the predicates are asked for each operand.
+        ggml_backend_buffer_t placed = reinterpret_cast<ggml_backend_buffer_t>(&g_weight_calls);
+        w->buffer                    = placed;
+        g_weight_calls               = 0;
+        const auto e1 =
+            ggml_sycl_mul_mat_route_env_from(w, x, dummy_split_buffer, counting_weight_tensor, false, false);
+        CHECK(e1.has_weight && !e1.split && g_weight_calls == 1,
+              "a placed src0 asks the weight predicate once; the unplaced src1 never");
+        CHECK(!ggml_sycl_mul_mat_routes_batched_f16(w, x, out, e1), "a placed weight never routes batched");
+        w->buffer = nullptr;
     }
 
     // ---- the staging size: what alloc() receives at the site ----

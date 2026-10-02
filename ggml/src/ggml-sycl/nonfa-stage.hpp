@@ -6,15 +6,17 @@
 // ggml_sycl_mul_mat walks the route chain and the batched op sizes its staging
 // buffer; the measure pass's context-nonfa-stage visitor sizes the slot a
 // planned context carves for that staging. All three call the functions below,
-// so the slot and the site cannot count one shape two ways (contract (a)).
+// so the slot and the site cannot count one shape two ways (zhcn design 2.8: the
+// measure sizes a demand with the runtime site's own function, never a second derivation).
 //
 // This header names only ggml types, so a host test builds it without a device.
 // The facts that are not a function of the tensors -- whether src0 is in a
 // row-split buffer, whether an operand is a weight, the debug overrides and
 // which staging path is compiled -- arrive in `ggml_sycl_mul_mat_route_env`,
 // which ggml-sycl.cpp fills in one function for the dispatch and for the measure
-// view alike.
+// view alike, through ggml_sycl_mul_mat_route_env_from below.
 
+#include "ggml-backend.h"
 #include "ggml.h"
 
 #include <cstddef>
@@ -31,6 +33,26 @@ struct ggml_sycl_mul_mat_route_env {
     bool kqv_force_simple = false;  // GGML_SYCL_KQV_FORCE_SIMPLE or GGML_SYCL_KQV_DISABLE_FP16
     bool stage_strided    = false;  // the oneDNN-strided staging path, not the oneMath element-count one
 };
+
+// The environment of `mul_mat(src0, src1)`. A tensor with no buffer is in no row-split buffer and is no weight:
+// the buffer predicates are never asked about it. That is the answer for an operand the scheduler has not placed
+// yet, which includes a weight at a load-time MEASURE; the route then reads such a weight as an activation, so a
+// walker that measures before weights have buffers must set `has_weight` itself (see context_measure_view).
+// `is_split_buffer` and `is_weight_tensor` are the backend's own predicates, passed so this header needs no device.
+inline ggml_sycl_mul_mat_route_env ggml_sycl_mul_mat_route_env_from(const ggml_tensor * src0,
+                                                                    const ggml_tensor * src1,
+                                                                    bool (*is_split_buffer)(ggml_backend_buffer_t),
+                                                                    bool (*is_weight_tensor)(const ggml_tensor *),
+                                                                    bool kqv_force_simple,
+                                                                    bool stage_strided) {
+    ggml_sycl_mul_mat_route_env env;
+    env.split = src0->buffer != nullptr && is_split_buffer(src0->buffer);
+    env.has_weight =
+        (src0->buffer != nullptr && is_weight_tensor(src0)) || (src1->buffer != nullptr && is_weight_tensor(src1));
+    env.kqv_force_simple = kqv_force_simple;
+    env.stage_strided    = stage_strided;
+    return env;
+}
 
 // The branch of the f16 attention chain a MUL_MAT node takes. The values are the
 // chain's own branches, in the order it tests them.
