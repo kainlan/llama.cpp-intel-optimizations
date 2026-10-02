@@ -62,6 +62,8 @@ parser.add_argument("--cache", default=str(sycl / "unified-cache.cpp"))
 parser.add_argument("--cache-hpp", default=str(sycl / "unified-cache.hpp"))
 parser.add_argument("--zone-sizing", default=str(sycl / "zone-sizing.cpp"))
 parser.add_argument("--model", default=str(root / "src/llama-model.cpp"))
+parser.add_argument("--common", default=str(sycl / "common.hpp"))
+parser.add_argument("--dispatch", default=str(sycl / "dispatch.hpp"))
 parser.add_argument("--sycl-header", default=str(root / "ggml/include/ggml-sycl.h"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
@@ -140,7 +142,7 @@ HELPER = "ggml_sycl_onednn_pp_scratch_planned_bytes("
 REUSE_TEST = "if (onednn_weights_scratch_ && onednn_activations_scratch_ && onednn_weights_scratch_size_ >= weights_size"
 
 
-def evaluate(backend, cache, cache_hpp, zone_sizing, model, header):
+def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, dispatch):
     results = {}
     bytes_helper = function_body(
         backend, r"static bool ggml_sycl_onednn_pp_scratch_planned_bytes\([^)]*\)\s*\{")
@@ -349,9 +351,16 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header):
     ensure_zones = function_body(cache, r"bool unified_cache::ensure_planned_arena_zones\([^)]*\)\s*\{")
     results["anchor: ensure_planned_arena_zones exists"] = ensure_zones is not None
     if ensure_zones is not None:
-        results["the kept-zone exit stores the larger of the held and live plan"] = \
-            re.search(r"onednn_zone_plan_store\(dev_id,\s*zone_onednn_plan_keep\(onednn_zone_plan_load\(dev_id\),\s*"
-                      r"live_plan\)\);\s*return true;", ensure_zones) is not None
+        results["the kept-zone exit stores the larger of the held and live plan, in one critical section"] = \
+            re.search(r"onednn_zone_plan_keep_and_store\(dev_id,\s*live_plan\);\s*return true;", ensure_zones) is not None
+        keep_store = function_body(
+            cache, r"static void onednn_zone_plan_keep_and_store\(int device_id,\s*const zone_onednn_plan & plan\)\s*\{")
+        results["anchor: the locked keep-and-store helper exists"] = keep_store is not None
+        if keep_store is not None:
+            # ABSENCE: calling the public load or store from inside would take the same mutex twice.
+            results["the keep-and-store helper keeps under one lock and calls neither accessor"] = \
+                keep_store.count("lock_guard") == 1 and "zone_onednn_plan_keep(" in keep_store and \
+                "onednn_zone_plan_load(" not in keep_store and "onednn_zone_plan_store(" not in keep_store
         results["the rebuilt-zone exit stores the live plan the zone was built from"] = \
             re.search(r"onednn_zone_plan_store\(dev_id,\s*live_plan\);\s*return true;", ensure_zones) is not None
         results["zone sizing reads the planned pair and floor once, as one pair"] = \
@@ -363,7 +372,11 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header):
         results["reserve bounds the never-shrink merge by the pair bound, not the raw capacity"] = \
             "onednn_pp_pair_bound_for(" in reserve and \
             re.search(r"zone_onednn_scratch_reserve_target\(arena_on,\s*pair_bound,", reserve) is not None
-        results["reserve refuses a pair above the bound"] = "total_needed > pair_bound_now" in reserve
+        # The refusal is only a refusal if it runs before the zone allocation it guards (a refusal after it is
+        # unreachable for the case it exists for).
+        results["reserve refuses a pair above the bound, before it allocates from the zone"] = \
+            0 <= reserve.find("total_needed > pair_bound_now") < \
+            reserve.find("zone_alloc(vram_zone_id::ONEDNN, weights_size)")
         # The first reservation is the planned pair, from the SAME snapshot the bound reads, only with an arena.
         results["reserve sizes the first reservation to the snapshot's planned pair"] = \
             re.search(r"zone_onednn_scratch_reserve_target\(arena_on,\s*pair_bound,\s*held_w,\s*held_a,\s*"
@@ -429,6 +442,35 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header):
             at = fbody.find("llama_model_sycl_mark_get_rows_only(tensors, ml)")
             results["the %s marks the role before it builds the inventory" % fname] = \
                 0 <= at < fbody.find("llama_model_sycl_populate_inventory(")
+    # ---- one source for "which weight types the unified kernel serves" (llama.cpp-8ony) ----
+    def type_set(body, with_case):
+        pattern = r"case\s+(GGML_TYPE_\w+)\s*:" if with_case else r"(GGML_TYPE_\w+)"
+        return set(re.findall(pattern, body or ""))
+    router_types = function_body(dispatch, r"inline bool should_use_unified\(ggml_type type\)\s*\{")
+    mirror_types = function_body(common, r"inline bool ggml_sycl_should_use_unified_type\(ggml_type type\)\s*\{")
+    results["anchor: the router's unified type set exists"] = router_types is not None
+    results["anchor: the planner's mirror of it exists"] = mirror_types is not None
+    if router_types is not None and mirror_types is not None:
+        results["the planner's unified type set is the router's"] = \
+            type_set(router_types, True) == type_set(mirror_types, False) and len(type_set(mirror_types, False)) > 0
+
+    # ---- the conditional plan follows the same PP admission gates the op takes (llama.cpp-8ony) ----
+    admitted = function_body(backend, r"bool ggml_sycl_onednn_pp_type_admitted\(ggml_type type\)\s*\{")
+    results["anchor: the shared PP type admission exists"] = admitted is not None
+    if admitted is not None:
+        results["the PP type admission asks the environment gate and the type skip"] = \
+            "ggml_sycl_onednn_pp_enabled()" in admitted and "ggml_sycl_onednn_pp_skip_type(type)" in admitted
+    results["the PP type admission is declared for the planner to call"] = \
+        re.search(r"bool\s+ggml_sycl_onednn_pp_type_admitted\(ggml_type type\);", common) is not None
+    cand = function_body(backend, r"static bool ggml_sycl_onednn_pp_candidate\([^)]*route = [^)]*\)\s*\{")
+    results["anchor: the PP candidate exists"] = cand is not None
+    if cand is not None:
+        results["the PP candidate takes its gates from the same two functions"] = \
+            "admission.enabled" in cand and "ggml_sycl_onednn_pp_enabled()" in cand and \
+            "ggml_sycl_onednn_pp_skip_type(src0->type)" in cand
+    if adapter is not None:
+        results["the adapter plans the conditional mark only for a type the PP admission serves"] = \
+            "ggml_sycl_onednn_pp_type_admitted(item.type)" in adapter
     return results
 
 
@@ -438,6 +480,8 @@ def run(label, sources, expect_fail=None):
         srcs += (zone_sizing,)
     if len(srcs) == 4:
         srcs += (model, header)
+    if len(srcs) == 6:
+        srcs += (common, dispatch)
     results = evaluate(*srcs)
     bad = [k for k, v in results.items() if not v]
     if expect_fail is None:
@@ -480,6 +524,8 @@ zone_sizing = strip_comments(Path(args.zone_sizing).read_text())
 backend = strip_comments(Path(args.backend).read_text())
 cache = strip_comments(Path(args.cache).read_text())
 cache_hpp = strip_comments(Path(args.cache_hpp).read_text())
+common = strip_comments(Path(args.common).read_text())
+dispatch = strip_comments(Path(args.dispatch).read_text())
 model = strip_comments(Path(args.model).read_text())
 header = strip_comments(Path(args.sycl_header).read_text())
 
@@ -640,9 +686,9 @@ if args.self_test and not failed:
                                   "unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id)"), cache_hpp)),
         ("helper ignores the snapshot's bare plan", "the helper reads the stored zone-plan snapshot, bare plan and floor together",
          (backend, mutate_in_func(cache, bound_sig, "plan.bare_bytes", "0"), cache_hpp)),
-        ("kept-zone exit describes the zone by the live plan", "the kept-zone exit stores the larger of the held and live plan",
-         (backend, mutate_in_func(cache, ensure_sig, "zone_onednn_plan_keep(onednn_zone_plan_load(dev_id), live_plan)",
-                                  "live_plan"), cache_hpp)),
+        ("kept-zone exit describes the zone by the live plan", "the kept-zone exit stores the larger of the held and live plan, in one critical section",
+         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_keep_and_store(dev_id, live_plan)",
+                                  "onednn_zone_plan_store(dev_id, live_plan)"), cache_hpp)),
         ("rebuilt-zone exit stops storing", "the rebuilt-zone exit stores the live plan the zone was built from",
          (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_store(dev_id, live_plan);\n    return true;\n}",
                                   "return true;\n}"), cache_hpp)),
@@ -664,7 +710,7 @@ if args.self_test and not failed:
         ("planner stores only the sum", "the inventory planner stores the pair's two halves, not only their sum",
          (mutate(backend, "unified_cache_set_planned_onednn_scratchpad_pair(", "unified_cache_set_XXXX("), cache,
           cache_hpp)),
-        ("reserve serves a pair above the bound", "reserve refuses a pair above the bound",
+        ("reserve serves a pair above the bound", "reserve refuses a pair above the bound, before it allocates from the zone",
          (backend, mutate_in_func(cache, reserve_sig, "total_needed > pair_bound_now", "false"), cache_hpp)),
         ("acquire without the plan", "acquire asks the plan before it asks for a reserve",
          (mutate_in_func(backend, r"static bool acquire_onednn_pp_scratch\(",
@@ -717,6 +763,35 @@ if args.self_test and not failed:
          (backend, cache, cache_hpp, zone_sizing,
           mutate_in_func(model, r"static void llama_model_sycl_set_late_inventory\(",
                          "llama_model_sycl_mark_get_rows_only(tensors, ml)", "(void) 0"), header)),
+        ("adapter ignores the PP gates", "the adapter plans the conditional mark only for a type the PP admission serves",
+         (backend, mutate_in_func(cache, adapter_sig, "ggml_sycl_onednn_pp_type_admitted(", "XXXX("), cache_hpp)),
+        ("PP admission drops the env gate", "the PP type admission asks the environment gate and the type skip",
+         (mutate_in_func(backend, r"bool ggml_sycl_onednn_pp_type_admitted\(", "ggml_sycl_onednn_pp_enabled()", "true"),
+          cache, cache_hpp)),
+        ("PP admission drops the type skip", "the PP type admission asks the environment gate and the type skip",
+         (mutate_in_func(backend, r"bool ggml_sycl_onednn_pp_type_admitted\(", "ggml_sycl_onednn_pp_skip_type(type)", "false"),
+          cache, cache_hpp)),
+        ("PP admission undeclared", "the PP type admission is declared for the planner to call",
+         (backend, cache, cache_hpp, zone_sizing, model, header,
+          mutate(common, "ggml_sycl_onednn_pp_type_admitted(", "ggml_sycl_XXXX("), dispatch)),
+        ("router gains a type", "the planner's unified type set is the router's",
+         (backend, cache, cache_hpp, zone_sizing, model, header, common,
+          mutate(dispatch, "case GGML_TYPE_MXFP4:", "case GGML_TYPE_MXFP4:\n        case GGML_TYPE_Q8_0:"))),
+        ("mirror loses a type", "the planner's unified type set is the router's",
+         (backend, cache, cache_hpp, zone_sizing, model, header,
+          mutate(common, "type == GGML_TYPE_Q4_0 || ", ""), dispatch)),
+        ("refusal after the zone allocation", "reserve refuses a pair above the bound, before it allocates from the zone",
+         (backend, mutate_in_func(cache, reserve_sig, "const size_t pair_bound_now",
+                                  "void * early_probe = zone_alloc(vram_zone_id::ONEDNN, weights_size); (void) early_probe; "
+                                  "const size_t pair_bound_now"), cache_hpp)),
+        ("kept exit loads then stores", "the kept-zone exit stores the larger of the held and live plan, in one critical section",
+         (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_keep_and_store(dev_id, live_plan)",
+                                  "onednn_zone_plan_store(dev_id, zone_onednn_plan_keep(onednn_zone_plan_load(dev_id), "
+                                  "live_plan))"), cache_hpp)),
+        ("keep-and-store takes two locks", "the keep-and-store helper keeps under one lock and calls neither accessor",
+         (backend, mutate_in_func(cache, r"static void onednn_zone_plan_keep_and_store\(",
+                                  "zone_onednn_plan_keep(", "zone_onednn_plan_keep(onednn_zone_plan_load(device_id), "),
+          cache_hpp)),
         ("accessor undeclared", "the pair-bound accessor is declared",
          (backend, cache, mutate(cache_hpp, "unified_cache_get_onednn_pp_pair_bound(", "unified_cache_get_XXXX("))),
     ]
