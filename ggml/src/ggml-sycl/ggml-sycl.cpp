@@ -52501,13 +52501,65 @@ static bool rb2h_hash_tensor(ggml_backend_sycl_context & ctx, const ggml_tensor 
     }
 }
 
+// GGML_SYCL_RB2H_NODE_SRC_RANGE=<lo>-<hi>: for compute_forward seq numbers in [lo, hi) also print the hash of EVERY
+// source (not just split-copy ones; weights above 1 MB are skipped) plus a [RB2H-PTR] line with where each tensor
+// resolved, and report the fused ADD+RMS_NORM site that bypasses compute_forward. Seq numbers are the same as without
+// the range, so a first-divergence seq found by NODE_HASH can be re-run with its neighbourhood fully described.
+static std::atomic<uint64_t> g_rb2h_last_seq{ 0 };
+
+static bool rb2h_seq_in_range(uint64_t seq) {
+    static const char * env = std::getenv("GGML_SYCL_RB2H_NODE_SRC_RANGE");
+    static unsigned long long lo = 0, hi = 0;
+    static const bool parsed = [&]() {
+        return env && std::sscanf(env, "%llu-%llu", &lo, &hi) == 2;
+    }();
+    return parsed && seq >= lo && seq < hi;
+}
+
+static void rb2h_print_tensor(ggml_backend_sycl_context & ctx, uint64_t seq, const char * tag, int idx,
+                              const ggml_tensor * t) {
+    if (!t) {
+        return;
+    }
+    if (t->buffer && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ggml_nbytes(t) > (1u << 20)) {
+        fprintf(stderr, "[RB2H-NODE] seq=%llu %s%d=%s weight-skipped bytes=%zu\n", (unsigned long long) seq, tag, idx,
+                t->name, ggml_nbytes(t));
+        return;
+    }
+    uint64_t h  = 0;
+    size_t   nb = 0;
+    if (rb2h_hash_tensor(ctx, t, &h, &nb)) {
+        fprintf(stderr, "[RB2H-NODE] seq=%llu %s%d=%s op=%s bytes=%zu hash=%016llx\n", (unsigned long long) seq, tag, idx,
+                t->name, ggml_op_name(t->op), nb, (unsigned long long) h);
+    }
+    auto resolved = ggml_sycl_resolve(t, ctx.device);
+    const ggml_tensor * base = t;
+    while (base->view_src) {
+        base = base->view_src;
+    }
+    fprintf(stderr, "[RB2H-PTR] seq=%llu %s%d=%s data=%p resolved=%p on_device=%d view_off=%zu base=%s buft=%s\n",
+            (unsigned long long) seq, tag, idx, t->name, t->data, resolved.ptr, (int) resolved.on_device,
+            (size_t) ((const char *) t->data - (const char *) base->data), base->name,
+            base->buffer ? ggml_backend_buffer_name(base->buffer) : "(none)");
+}
+
 static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) {
     static const bool            rb2h_node_hash = ggml_sycl_rb2h_arm("GGML_SYCL_RB2H_NODE_HASH");
     static std::atomic<uint64_t> rb2h_seq{ 0 };
     uint64_t                     rb2h_seq_this = 0;
     if (rb2h_node_hash && dst) {
         rb2h_seq_this = rb2h_seq.fetch_add(1, std::memory_order_relaxed);
-        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        g_rb2h_last_seq.store(rb2h_seq_this, std::memory_order_relaxed);
+        const bool rb2h_all_src = rb2h_seq_in_range(rb2h_seq_this);
+        if (rb2h_all_src) {
+            fprintf(stderr, "[RB2H-NODE] seq=%llu BEGIN op=%s dst=%s\n", (unsigned long long) rb2h_seq_this,
+                    ggml_op_name(dst->op), dst->name);
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                rb2h_print_tensor(ctx, rb2h_seq_this, "allsrc", i, dst->src[i]);
+            }
+        }
+        for (int i = 0; i < GGML_MAX_SRC && !rb2h_all_src; ++i) {
             const ggml_tensor * s = dst->src[i];
             if (s && s->name[0] != '\0' && std::strchr(s->name, '#') != nullptr) {
                 uint64_t h  = 0;
@@ -94804,7 +94856,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     if (next->op == GGML_OP_RMS_NORM && next->src[0] == node &&
                         ggml_sycl_check_fusion_types(cgraph, i, 2) && ggml_is_contiguous(next) &&
                         ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device)) {
+                        static const bool rb2h_fused_hash = ggml_sycl_rb2h_arm("GGML_SYCL_RB2H_NODE_HASH");
+                        const uint64_t        rb2h_fseq   = g_rb2h_last_seq.load(std::memory_order_relaxed);
+                        const bool            rb2h_fprint = rb2h_fused_hash && rb2h_seq_in_range(rb2h_fseq);
+                        if (rb2h_fprint) {
+                            fprintf(stderr, "[RB2H-NODE] seq=%llu FUSED-ADD-RMS add=%s rms=%s\n",
+                                    (unsigned long long) rb2h_fseq, node->name, next->name);
+                            rb2h_print_tensor(*sycl_ctx, rb2h_fseq, "fused_in", 0, node->src[0]);
+                            rb2h_print_tensor(*sycl_ctx, rb2h_fseq, "fused_in", 1, node->src[1]);
+                        }
                         ggml_sycl_op_add_rms_norm_fused(*sycl_ctx, node, next);
+                        if (rb2h_fprint) {
+                            rb2h_print_tensor(*sycl_ctx, rb2h_fseq, "fused_out_add", 0, node);
+                            rb2h_print_tensor(*sycl_ctx, rb2h_fseq, "fused_out_rms", 0, next);
+                        }
                         gpu_queue_dirty = true;  // D+: GPU fusion submitted work
                         i++;                     // Skip the RMS_NORM node
                         continue;
