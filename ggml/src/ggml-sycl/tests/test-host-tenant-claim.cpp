@@ -257,6 +257,15 @@ size_t slots_live() {
     return ggml_backend_sycl_test_host_tenant_slots_live();
 }
 
+// The live-slot count is a fact about the process, so a mismatch says what it read and what it wanted.
+void require_slots(size_t wanted, const char * message) {
+    const size_t live = slots_live();
+    if (live != wanted) {
+        throw std::runtime_error(std::string(message) + " (slots_live=" + std::to_string(live) + ", wanted " +
+                                 std::to_string(wanted) + ")");
+    }
+}
+
 // Whether `ptr` is pinned host USM of one of the unified caches' contexts: sycl::usm::alloc::host there, not
 // the unknown a plain host pointer answers.
 bool is_pinned_host_usm(const void * ptr) {
@@ -283,7 +292,7 @@ void touch(ggml_backend_buffer_t buffer, size_t bytes, unsigned char value) {
 }
 
 void case_claims() {
-    require(slots_live() == 0, "slots are alive before the case began");
+    require_slots(0, "slots are alive before the case began");
     lifecycle_fixture          f;
     ggml_backend_buffer_type_t host = ggml_backend_sycl_host_buffer_type();
     require(host != nullptr, "no SYCL_Host buffer type");
@@ -299,7 +308,7 @@ void case_claims() {
     // (2) the first publish reserves, a covered republish does not, a larger one is growth
     const host_desc first(1 * MiB, 2 * MiB);
     require(publish(f, first) == GGML_SYCL_LIFECYCLE_OK, "the first descriptor publish failed");
-    require(slots_live() == 2, "the first publish did not hold exactly its two slots");
+    require_slots(2, "the first publish did not hold exactly its two slots");
     require(coverage(f, first) == GGML_SYCL_TENANT_COVERAGE_EQUAL, "an identical candidate was not EQUAL");
     const host_desc smaller(512 * 1024, 1 * MiB);
     require(coverage(f, smaller) == GGML_SYCL_TENANT_COVERAGE_COVERED, "a smaller candidate was not COVERED");
@@ -396,7 +405,7 @@ slot_addresses claim_addresses(lifecycle_fixture & f, size_t bytes0, size_t byte
 
 // (8) a republish the held table cannot carry is refused and changes nothing
 void case_republish_refused() {
-    require(slots_live() == 0, "slots are alive before the case began");
+    require_slots(0, "slots are alive before the case began");
     lifecycle_fixture f;
     const host_desc   first(1 * MiB, 2 * MiB);
     require(publish(f, first) == GGML_SYCL_LIFECYCLE_OK, "the first descriptor publish failed");
@@ -420,7 +429,7 @@ void case_republish_refused() {
             "the first shape is no longer the published one after a refused republish");
     require(coverage(f, larger) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
             "a refused republish changed the published section");
-    require(slots_live() == 2, "a refused republish changed the held slots");
+    require_slots(2, "a refused republish changed the held slots");
     const slot_addresses after = claim_addresses(f, 1 * MiB, 2 * MiB);
     require(after.slot0 == before.slot0 && after.slot1 == before.slot1, "a refused republish replaced the held carves");
 
@@ -429,12 +438,12 @@ void case_republish_refused() {
         { 1, 1 * MiB }
     });
     require(publish(f, subset) == GGML_SYCL_LIFECYCLE_OK, "a republish the held slots carry was refused");
-    require(slots_live() == 2, "a covered republish changed the held slots");
+    require_slots(2, "a covered republish changed the held slots");
 }
 
 // (9) a reservation refused part-way publishes nothing and keeps nothing
 void case_refused_reservation() {
-    require(slots_live() == 0, "slots are alive before the case began");
+    require_slots(0, "slots are alive before the case began");
     const host_desc good(1 * MiB, 2 * MiB);
     {
         // The second carve cannot be served (a 4 TiB pinned request exceeds the host), after the first was made:
@@ -446,14 +455,14 @@ void case_refused_reservation() {
         });
         require(publish(f, oversize) == GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
                 "a descriptor whose second host slot cannot be carved was not refused");
-        require(slots_live() == 0, "a refused reservation kept a slot");
+        require_slots(0, "a refused reservation kept a slot");
         require_scope_status(f.backend, GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION,
                              "a refused reservation left a table behind");
         require(publish(f, good) == GGML_SYCL_LIFECYCLE_OK, "a good publish after a refused one failed");
-        require(slots_live() == 2, "the good publish after a refusal did not hold its slots");
+        require_slots(2, "the good publish after a refusal did not hold its slots");
         (void) claim_addresses(f, 1 * MiB, 2 * MiB);
     }
-    require(slots_live() == 0, "slots outlived their context");
+    require_slots(0, "slots outlived their context");
     {
         // The first carve itself refused (an owner-control allocation failure injected for it alone)
         lifecycle_fixture f;
@@ -461,25 +470,25 @@ void case_refused_reservation() {
         const auto refused = publish(f, good);
         ggml_sycl::allocation_owner_test_fail_next_control_allocations(0);
         require(refused == GGML_SYCL_LIFECYCLE_PLAN_REJECTED, "a refused first carve did not refuse the publish");
-        require(slots_live() == 0, "a refused first carve kept a slot");
+        require_slots(0, "a refused first carve kept a slot");
         require_scope_status(f.backend, GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION,
                              "a refused first carve left a table behind");
         require(publish(f, good) == GGML_SYCL_LIFECYCLE_OK, "a good publish after a refused first carve failed");
     }
-    require(slots_live() == 0, "slots outlived their context");
+    require_slots(0, "slots outlived their context");
 }
 
 // (11) the carves go back with the context
 void case_teardown() {
-    require(slots_live() == 0, "slots are alive before the case began");
+    require_slots(0, "slots are alive before the case began");
     ggml_backend_buffer_type_t host = ggml_backend_sycl_host_buffer_type();
     const host_desc            first(1 * MiB, 2 * MiB);
     {
         lifecycle_fixture f;
         require(publish(f, first) == GGML_SYCL_LIFECYCLE_OK, "the first descriptor publish failed");
-        require(slots_live() == 2, "the publish did not hold its slots");
+        require_slots(2, "the publish did not hold its slots");
         f.cleanup();
-        require(slots_live() == 0, "freeing the backend did not release the held slots");
+        require_slots(0, "freeing the backend did not release the held slots");
     }
     {
         // a buffer that still claims from the table keeps it, and the last free releases every slot
@@ -490,17 +499,28 @@ void case_teardown() {
         ggml_backend_sycl_claim_scope_close(scope);
         require(b0 != nullptr, "a claim was refused");
         f.cleanup();
-        require(slots_live() == 2, "the table was released while a buffer still claims from it");
+        require_slots(2, "the table was released while a buffer still claims from it");
         ggml_backend_buffer_free(b0);
-        require(slots_live() == 0, "the last free did not release every slot");
+        require_slots(0, "the last free did not release every slot");
+    }
+}
+
+// A failure names the case it came from.
+void run_case(const char * name, void (*fn)()) {
+    try {
+        fn();
+    } catch (const sycl::exception &) {
+        throw;  // main() tells a skip (feature not supported) from a failure by its code
+    } catch (const std::exception & e) {
+        throw std::runtime_error(std::string("case ") + name + ": " + e.what());
     }
 }
 
 void run() {
-    case_claims();
-    case_republish_refused();
-    case_refused_reservation();
-    case_teardown();
+    run_case("claims", case_claims);
+    run_case("republish_refused", case_republish_refused);
+    run_case("refused_reservation", case_refused_reservation);
+    run_case("teardown", case_teardown);
 }
 
 }  // namespace

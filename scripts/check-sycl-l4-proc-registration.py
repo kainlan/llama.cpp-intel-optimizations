@@ -119,6 +119,8 @@ CPY_ASYNC_DEF = "static bool ggml_backend_sycl_cpy_tensor_async("
 GET_ASYNC_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_get_tensor_async\s*\("
 LOAD_END_SIG = r"\bggml_sycl_lifecycle_result\s+ggml_backend_sycl_model_load_end\s*\("
 TXN_SIG = r"\bggml_sycl_txn_result\s+ggml_sycl_run_runtime_context_transaction\s*\("
+CLEAR_BIND_SIG = r"\bstatic\s+void\s+ggml_sycl_execution_clear_bindings_for_context\s*\("
+DROP_ENTRIES_SIG = r"\bstatic\s+void\s+ggml_sycl_execution_drop_context_registry_entries\s*\(uint64_t context_id\)\s*noexcept\s*\{"
 CENTRY_SIG = r"\bvoid\s+ggml_backend_sycl_set_runtime_context\s*\("
 
 
@@ -637,6 +639,29 @@ def check(header_raw, source):
             r"if \(txn != 0\) \{\s*\(void\) ggml_sycl_load_clear_compute_terms\(txn\);\s*\}", after):
         fails.append("L4 ledger: after_end does not clear only a transaction it was armed with")
 
+    # the end of an execution context drops the entries its id keyed, before the id is zeroed: the backend's
+    # destructor cannot find them afterwards (finish_drain and close_if_idle reset the id first)
+    clear_bind = function_body(source, CLEAR_BIND_SIG)
+    if clear_bind is None:
+        fails.append("L4 context end: ggml_sycl_execution_clear_bindings_for_context not found")
+    else:
+        call = clear_bind.find("ggml_sycl_execution_drop_context_registry_entries(context_id);")
+        reset = clear_bind.find("ggml_sycl_execution_reset_backend_binding_state(")
+        locked = clear_bind.find("g_execution_backend_binding_mutex")
+        if call < 0 or reset < 0 or call > reset or (locked >= 0 and call > locked) or net_depth(clear_bind[:call]) != 1 or \
+                clear_bind[:call].rstrip()[-1:] not in (";", "{"):
+            fails.append("L4 context end: the clear of an ended context's bindings does not first drop its registry entries "
+                         "(the backend's id is zeroed before the destructor can drop them)")
+    drop_entries = function_body(source, DROP_ENTRIES_SIG)
+    pin(fails, drop_entries,
+        r"ggml_sycl_execution_for_each_bound_backend\(\s*context_id, \[\]\(ggml_backend_sycl_context \* backend, "
+        r"const ggml_sycl_execution_backend_binding &\) \{\s*ggml_sycl_published_section_erase\(backend\);\s*"
+        r"ggml_sycl_host_tenants_erase\(backend\);\s*\}\);",
+        "L4 context end: the drop of an ended context's registry entries does not erase the section then the host "
+        "reservation of each bound backend")
+    if drop_entries is not None and "g_execution_backend_binding_mutex" in drop_entries:
+        fails.append("L4 context end: the registry entries of an ended context are dropped under the binding mutex")
+
     # destructor order
     dtor = function_body(source, r"ggml_backend_sycl_context::~ggml_backend_sycl_context\s*\(")
     if dtor is None:
@@ -1080,6 +1105,20 @@ def mutations(header_raw, source):
         ("the device supports the CpuActivation buffer type", "the device supports the CpuActivation buffer type", SUPPORTS_SIG,
          "(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {\n",
          "(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {\n    if (buft == ggml_backend_sycl_cpu_activation_buffer_type()) {\n        return true;\n    }\n"),
+        ("the ended context's entries are never dropped", "does not first drop its registry entries", CLEAR_BIND_SIG,
+         "    ggml_sycl_execution_drop_context_registry_entries(context_id);\n", ""),
+        ("the ended context's entries are dropped after the id is zeroed", "does not first drop its registry entries", CLEAR_BIND_SIG,
+         "    ggml_sycl_execution_drop_context_registry_entries(context_id);\n    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);\n",
+         "    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);\n    ggml_sycl_execution_drop_context_registry_entries(context_id);\n"),
+        ("the ended context's entries are dropped conditionally", "does not first drop its registry entries", CLEAR_BIND_SIG,
+         "    ggml_sycl_execution_drop_context_registry_entries(context_id);\n",
+         "    if (context_id != 0) ggml_sycl_execution_drop_context_registry_entries(context_id);\n"),
+        ("the ended context's host reservation is kept", "does not erase the section then the host", DROP_ENTRIES_SIG,
+         "                ggml_sycl_host_tenants_erase(backend);\n", ""),
+        ("the ended context's section is kept", "does not erase the section then the host", DROP_ENTRIES_SIG,
+         "                ggml_sycl_published_section_erase(backend);\n", ""),
+        ("the ended context's entries are dropped under the binding mutex", "dropped under the binding mutex", DROP_ENTRIES_SIG,
+         "    try {\n", "    try {\n        std::lock_guard<std::mutex> h_lock(g_execution_backend_binding_mutex);\n"),
         ("the n_ctx entry stops delegating", "set_runtime_n_ctx does not delegate to the guarded C entry",
          r"\bvoid\s+ggml_backend_sycl_set_runtime_n_ctx\s*\(", "ggml_backend_sycl_set_runtime_context(backend,",
          "(void) ggml_sycl_run_runtime_context_transaction(backend,"),

@@ -12176,6 +12176,7 @@ static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
 static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) noexcept;
 static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id);
+static void                        ggml_sycl_execution_drop_context_registry_entries(uint64_t context_id) noexcept;
 static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const char * reason);
 static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl_context * cleanup_ctx,
                                                                const char *                stage,
@@ -12277,6 +12278,9 @@ static void ggml_sycl_execution_sync_binding_devices_locked(ggml_sycl_execution_
 }
 
 static void ggml_sycl_execution_clear_bindings_for_context(uint64_t context_id) {
+    // Before the reset below zeroes each backend's key: after it, the backend's destructor cannot find the
+    // registry entry (host reservation, published section) this id keyed, and nothing else would drop it.
+    ggml_sycl_execution_drop_context_registry_entries(context_id);
     std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
     for (auto it = g_execution_backend_bindings.begin(); it != g_execution_backend_bindings.end();) {
         if (it->second && it->second->context_id == context_id) {
@@ -13322,6 +13326,23 @@ static void ggml_sycl_host_tenants_erase(const ggml_backend_sycl_context * ctx) 
         (void) previous;  // dropped here, with no registry lock held
     } catch (...) {
         GGML_LOG_WARN("[CONTEXT-PLAN] the held host reservation of a backend context could not be dropped\n");
+    }
+}
+
+// The end of an execution context is the end of its id, and the registry entries it keyed (the host
+// reservation and the published section) go with it: the backend destructor drops them too, but only
+// while the backend still carries the id, and finish_drain / close_if_idle reset that first.  The drops
+// run on pinned backends outside the binding mutex (they free memory through the unified cache), in the
+// destructor's order.  Never throws: a failure to pin is said at WARN, as the destructor's drops are.
+static void ggml_sycl_execution_drop_context_registry_entries(uint64_t context_id) noexcept {
+    try {
+        ggml_sycl_execution_for_each_bound_backend(
+            context_id, [](ggml_backend_sycl_context * backend, const ggml_sycl_execution_backend_binding &) {
+                ggml_sycl_published_section_erase(backend);
+                ggml_sycl_host_tenants_erase(backend);
+            });
+    } catch (...) {
+        GGML_LOG_WARN("[CONTEXT-PLAN] the registry entries of an ended execution context could not be dropped\n");
     }
 }
 
