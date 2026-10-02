@@ -24,8 +24,7 @@
 //   (11) a verify answer that holds a host layer R* does not is BUG: R* was not a fixpoint.
 
 #include "../src/llama-residency-fixpoint.h"
-
-#include "ggml-sycl-cohort.h"   // GGML_SYCL_CONTEXT_COHORT_COMPUTE, named here, not reached transitively
+#include "ggml-sycl-cohort.h"  // GGML_SYCL_CONTEXT_COHORT_COMPUTE, named here, not reached transitively
 
 #include <cstdio>
 #include <cstring>
@@ -35,22 +34,22 @@
 
 static int n_failed = 0;
 
-#define CHECK(cond)                                                                \
-    do {                                                                           \
-        if (!(cond)) {                                                             \
-            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);   \
-            n_failed++;                                                            \
-        }                                                                          \
+#define CHECK(cond)                                                              \
+    do {                                                                         \
+        if (!(cond)) {                                                           \
+            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+            n_failed++;                                                          \
+        }                                                                        \
     } while (0)
 
 // a failed precondition is counted and ends the case, so a missing result reads as FAIL, not a crash
-#define REQUIRE(cond)                                                              \
-    do {                                                                           \
-        if (!(cond)) {                                                             \
-            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);   \
-            n_failed++;                                                            \
-            return;                                                                \
-        }                                                                          \
+#define REQUIRE(cond)                                                            \
+    do {                                                                         \
+        if (!(cond)) {                                                           \
+            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+            n_failed++;                                                          \
+            return;                                                              \
+        }                                                                        \
     } while (0)
 
 // a tenant section that names the residency it was measured over: one element per host layer
@@ -59,11 +58,11 @@ static llama_tenants tenants_for(const llama_residency & r) {
     for (size_t i = 0; i < r.size(); i++) {
         if (r[i]) {
             ggml_sycl_context_tenant_desc d = {};
-            d.struct_size = sizeof(d);
-            d.cohort      = GGML_SYCL_CONTEXT_COHORT_COMPUTE;
-            d.slot_index  = (uint32_t) i;
-            d.device      = 0;
-            d.slot_bytes  = 1000 + i;
+            d.struct_size                   = sizeof(d);
+            d.cohort                        = GGML_SYCL_CONTEXT_COHORT_COMPUTE;
+            d.slot_index                    = (uint32_t) i;
+            d.device                        = 0;
+            d.slot_bytes                    = 1000 + i;
             out.push_back(d);
         }
     }
@@ -80,11 +79,11 @@ static llama_residency residency_of(const llama_tenants & t, size_t n_layer) {
 }
 
 struct stub {
-    size_t                                                   n_layer = 0;
-    std::function<llama_residency(const llama_tenants *)>    probe_fn;
-    std::vector<llama_residency>                             measured_over;
-    int                                                      probe_calls = 0;
-    bool                                                     measure_ok  = true;
+    size_t                                                n_layer = 0;
+    std::function<llama_residency(const llama_tenants *)> probe_fn;
+    std::vector<llama_residency>                          measured_over;
+    int                                                   probe_calls = 0;
+    bool                                                  measure_ok  = true;
 };
 
 static llama_residency_fixpoint_result run(stub & s) {
@@ -132,7 +131,9 @@ static void test_no_demotion() {
     // (4)
     stub s;
     s.n_layer  = 4;
-    s.probe_fn = [](const llama_tenants *) { return llama_residency(4, 0); };
+    s.probe_fn = [](const llama_tenants *) {
+        return llama_residency(4, 0);
+    };
     const auto r = run(s);
     CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_OK);
     CHECK(r.iterations == 1);
@@ -197,13 +198,13 @@ static void test_worst_chain() {
     s.probe_fn = [n_layer](const llama_tenants * t) {
         llama_residency r(n_layer, 0);
         if (t != nullptr) {
-            r = residency_of(*t, n_layer);
+            r        = residency_of(*t, n_layer);
             size_t n = 0;
             for (uint8_t b : r) {
                 n += b;
             }
             if (n < n_layer) {
-                r[n] = 1;   // one more host layer than the tenants were measured over
+                r[n] = 1;  // one more host layer than the tenants were measured over
             }
         }
         return r;
@@ -219,7 +220,9 @@ static void test_measure_failed() {
     stub s;
     s.n_layer    = 3;
     s.measure_ok = false;
-    s.probe_fn   = [](const llama_tenants *) { return llama_residency(3, 0); };
+    s.probe_fn   = [](const llama_tenants *) {
+        return llama_residency(3, 0);
+    };
     const auto r = run(s);
     CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_MEASURE_FAILED);
     CHECK(!r.reason.empty());
@@ -230,12 +233,16 @@ static void test_wrong_length() {
     // (9)
     stub s;
     s.n_layer  = 3;
-    s.probe_fn = [](const llama_tenants *) { return llama_residency(2, 0); };
+    s.probe_fn = [](const llama_tenants *) {
+        return llama_residency(2, 0);
+    };
     CHECK(run(s).status == LLAMA_RESIDENCY_FIXPOINT_BUG);
 
     stub s2;
     s2.n_layer  = 3;
-    s2.probe_fn = [](const llama_tenants * t) { return t == nullptr ? llama_residency(3, 0) : llama_residency(4, 0); };
+    s2.probe_fn = [](const llama_tenants * t) {
+        return t == nullptr ? llama_residency(3, 0) : llama_residency(4, 0);
+    };
     CHECK(run(s2).status == LLAMA_RESIDENCY_FIXPOINT_BUG);
 }
 
@@ -250,13 +257,13 @@ static void test_verify() {
         s.n_layer  = 3;
         s.probe_fn = [](const llama_tenants * t) {
             if (t == nullptr) {
-                return llama_residency{ 0, 1, 1 };   // R0
+                return llama_residency{ 0, 1, 1 };  // R0
             }
             const llama_residency over = residency_of(*t, 3);
             if (over == llama_residency{ 0, 1, 1 }) {
-                return llama_residency{ 0, 1, 0 };   // raw: the third layer would stay on device
+                return llama_residency{ 0, 1, 0 };  // raw: the third layer would stay on device
             }
-            return over;                              // keeps whatever it was measured over
+            return over;                            // keeps whatever it was measured over
         };
         const auto r = run(s);
         CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_OK);

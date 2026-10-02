@@ -376,9 +376,11 @@ def structural(raw: str):
     if calls != ["llama_graph_n_input_tensors(gf, !measure_only"]:
         bad.append("llama_graph_n_input_tensors must have one caller, passing !measure_only: %s" % calls)
 
-    # the measure-only context never gets a chunk-cap copy: nothing in the constructor sets it
-    if re.search(r"\bplan_caps\s*(?:=|\.reset|\.swap)", body):
-        bad.append("the measure-only constructor must not acquire plan_caps")
+    # the measure-only context never gets a chunk-cap copy: the constructor sets it only inside a !measure_only block
+    # (llama.cpp-7gno: the acquisition beside the hoisted block)
+    for mt in re.finditer(r"\bplan_caps\s*(?:=|\.reset|\.swap)", body):
+        if not in_any(g, ctor.body_start + mt.start()):
+            bad.append("the measure-only constructor must not acquire plan_caps")
     return bad
 
 
@@ -620,6 +622,9 @@ def test_mutants_each_clause_fails():
             "llama_graph_n_input_tensors(gf, !measure_only)", "llama_graph_n_input_tensors(gf, true)"),
         "the n_input_tensors early return removed": _mut(
             "    if (!log) {\n        return (int) users.size();\n    }\n", ""),
+        "the measure context acquires a chunk-cap copy": _mut(
+            "    // init the memory module\n    if (!hparams.vocab_only) {",
+            "    plan_caps.reset();\n    // init the memory module\n    if (!hparams.vocab_only) {"),
         "the measure context creates real memory": _mut(
             "create_memory(params_mem, cparams, measure_only)", "create_memory(params_mem, cparams, false)"),
         "the ladder runs in a measure-only context": _mut(

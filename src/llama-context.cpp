@@ -20,6 +20,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-residency-fixpoint.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
@@ -769,6 +770,51 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
     return {};
 }
 
+// llama.cpp-7gno: what the constructor's planned-reserve decision reads. The chunk-cap copy's two procs come the way the
+// scope's own do (the symbols in a direct build, the reg's proc address under GGML_BACKEND_DL), from the first SYCL backend
+// of the context. `plan_active` is the process-global active-plan predicate at construction.
+struct llama_context_sycl_plan_caps_procs {
+    decltype(&ggml_backend_sycl_plan_caps_new)  caps_new    = nullptr;
+    decltype(&ggml_backend_sycl_plan_caps_free) caps_free   = nullptr;
+    bool                                        plan_active = false;
+};
+
+[[maybe_unused]] static llama_context_sycl_plan_caps_procs llama_context_sycl_plan_caps_procs_for(
+    const std::vector<ggml_backend_ptr> & backends) {
+    llama_context_sycl_plan_caps_procs procs;
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (!llama_context_dev_is_sycl(dev)) {
+            continue;
+        }
+#ifdef GGML_USE_SYCL
+        procs.caps_new    = &ggml_backend_sycl_plan_caps_new;
+        procs.caps_free   = &ggml_backend_sycl_plan_caps_free;
+        procs.plan_active = llama_context_sycl_hooks_enabled() && ggml_backend_sycl_has_active_placement_plan();
+#elif defined(GGML_BACKEND_DL)
+        procs.caps_new = reinterpret_cast<decltype(procs.caps_new)>(
+            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_plan_caps_new"));
+        procs.caps_free = reinterpret_cast<decltype(procs.caps_free)>(
+            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_plan_caps_free"));
+        const auto hooks  = llama_context_sycl_compute_procs(dev);
+        procs.plan_active = hooks.has_active_plan && hooks.has_active_plan();
+#endif
+        break;
+    }
+    return procs;
+}
+
+// llama.cpp-7gno: whether the L4 surface the planned reserve needs is all there. moua's three procs
+// (llama_sycl_l4_procs::available()) are not enough by themselves: the residency fixpoint also needs the tenant-aware
+// residency probe, which L4 does not define yet. Until that probe is looked up here, and this flag flips with it, no
+// context is planned whatever the backend exports, so the three procs landing cannot turn the legacy publish path
+// into a construction failure.
+static constexpr bool llama_context_residency_probe_wired = false;
+
+[[maybe_unused]] static bool llama_context_l4_ready(const std::vector<ggml_backend_ptr> & backends) {
+    return llama_context_residency_probe_wired && llama_context_sycl_l4_procs_for(backends).available();
+}
+
 // A plan scope open on the calling thread for one MEASURE or ALLOC of one context,
 // closed when it leaves scope. While it is open the compute bufts' get_max_size answer
 // from the context's chunk-cap copy. It opens only for a context that owns that copy
@@ -1510,6 +1556,27 @@ llama_context::llama_context(
         if (sycl_auto_ubatch_trial) {
             sycl_auto_ubatch_prepare(params.type_k, params.type_v);
         }
+
+        // llama.cpp-7gno: a context under an active SYCL placement plan owns a chunk-cap copy and runs the residency
+        // fixpoint before its memory module exists. Production-unreachable until the residency probe is wired
+        // (llama_context_l4_ready): every context stays unplanned and takes the legacy publish path. The copy is
+        // acquired straight into the member, so a fixpoint refusal frees it while the constructor unwinds.
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        const llama_context_sycl_plan_caps_procs plan_procs    = llama_context_sycl_plan_caps_procs_for(backends);
+        const llama_plan_caps_decision           plan_decision = llama_plan_caps_decide(
+            llama_context_has_sycl_backend(backends), plan_procs.plan_active, plan_procs.caps_new != nullptr,
+            plan_procs.caps_free != nullptr, llama_context_l4_ready(backends));
+        if (plan_decision == LLAMA_PLAN_CAPS_REFUSE_NO_PROCS) {
+            throw std::runtime_error(llama_plan_caps_missing_procs_reason());
+        }
+        if (plan_decision == LLAMA_PLAN_CAPS_ACQUIRE) {
+            plan_caps = llama_plan_caps_ptr(plan_procs.caps_new(), llama_plan_caps_deleter{ plan_procs.caps_free });
+            if (!plan_caps) {
+                throw std::runtime_error("ggml_backend_sycl_plan_caps_new failed to create the chunk-cap copy");
+            }
+            sched_residency_fixpoint();
+        }
+#endif
     }
 
     // init the memory module
@@ -2909,6 +2976,15 @@ void llama_context::fused_resolution_report_lost() noexcept {
     if (!measure_only) {
         LLAMA_LOG_WARN("resolve_fused_ops: resolution lines lost: exception while unwinding\n");
     }
+}
+
+// llama.cpp-7gno: the constructor's residency fixpoint (design 2.7), reached only by a context that acquired its
+// chunk-cap copy, which needs the residency probe (llama_context_l4_ready). The pure iteration is
+// llama_residency_fixpoint (llama-residency-fixpoint.h); what is missing is the backend's tenant-aware probe, which L4
+// does not define yet, so this refuses by name instead of publishing a plan nobody checked.
+void llama_context::sched_residency_fixpoint() {
+    throw std::runtime_error(
+        "the SYCL residency fixpoint has no tenant-aware residency probe to run (llama.cpp-7gno, moua L4 step 3)");
 }
 
 // The reserve transaction. A planned context measures first, publishes what the measure

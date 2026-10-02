@@ -691,6 +691,10 @@ private:
     // when the ladder tries it. The hold is recorded as ready only after every rung has been tried.
     void tenant_host_hold_measure_and_fold(const std::vector<ggml_sycl_context_tenant_desc> & current);
 
+    // llama.cpp-7gno: the constructor's residency fixpoint, run once by a context that owns plan_caps, before its
+    // memory module exists (design 2.7). Throws by name until the backend's tenant-aware residency probe exists.
+    void sched_residency_fixpoint();
+
     bool sched_need_reserve = true;
 
     // true for the transient context a load-time measure builds (set by its constructor); such a

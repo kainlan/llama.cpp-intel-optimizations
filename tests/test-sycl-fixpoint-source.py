@@ -1,20 +1,17 @@
 """Source gate for the constructor's planned-reserve wiring (llama.cpp-7gno, zhcn design 2.4, 2.7).
 
-The pure decisions live in `src/llama-residency-fixpoint.h` and run in test-residency-fixpoint;
-this gate pins where the constructor calls them, on comment-stripped text, because a host test
-cannot reach `llama_context`'s constructor:
+The pure decisions live in `src/llama-residency-fixpoint.h` and run in test-residency-fixpoint; this gate pins where the
+constructor calls them, on comment-stripped text, because a host test cannot reach `llama_context`'s constructor:
 
-- the hoisted block (`sycl_auto_ubatch_prepare`, pinned by test-sycl-auto-ubatch-hoist-source.py) runs
-  before everything below, so the rung set exists when the fixpoint runs;
-- the plan_caps decision is `llama_plan_caps_decide` over the context's own facts (a SYCL backend,
-  the active-plan predicate, the two cap procs, `l4_procs.available()`), made once;
-- a refusal is the named text of `llama_plan_caps_missing_procs_reason()`, thrown before anything
-  is acquired;
-- the copy is acquired straight into the member, once, after the decision and before the
-  fixpoint, with the looked-up `_free` in the deleter, and the fixpoint comes before
-  `model.create_memory(`;
-- the planned transaction stays production-unreachable until the L4 procs are all present: the
-  acquisition is under the decision's ACQUIRE arm only, and nothing else assigns `plan_caps`.
+- after the hoisted block (`sycl_auto_ubatch_prepare`, pinned by test-sycl-auto-ubatch-hoist-source.py) and before
+  `model.create_memory(`, the constructor decides once with `llama_plan_caps_decide` over the context's own facts (a SYCL
+  backend, the active-plan predicate, the two cap procs, `llama_context_l4_ready`);
+- a refusal is the named text of `llama_plan_caps_missing_procs_reason()`, thrown before anything is acquired;
+- the copy is acquired straight into the member, once in the whole file, under the ACQUIRE arm, with the looked-up `_free`
+  in the deleter and a null result refused by name; the fixpoint follows it, still under that arm;
+- the planned transaction stays production-unreachable: `llama_context_l4_ready` needs the residency probe to be wired
+  (`llama_context_residency_probe_wired`, false until moua's L4 probe exists and is looked up) AND moua's three L4 procs,
+  and the fixpoint member refuses by name rather than publishing an unchecked plan.
 
 Every clause has a mutant that must fail it. Host-only; collected by pytest.
 """
@@ -24,8 +21,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-CTX_CPP = (SRC / "llama-context.cpp").read_text()
+CTX_CPP = (ROOT / "src/llama-context.cpp").read_text()
 
 _spec = importlib.util.spec_from_file_location("reserve_state_gate", ROOT / "tests/test-sycl-reserve-state-source.py")
 _gate = importlib.util.module_from_spec(_spec)
@@ -34,13 +30,21 @@ _spec.loader.exec_module(_gate)
 z = _gate.z
 code_of = _gate.code_of
 mutate = _gate.mutate
+function_body = _gate.function_body
 
 _CTOR_HEAD = (
     "llama_context::llama_context(const llama_model & model, llama_context_params params, "
     "llama_measure_context_args * measure) :"
 )
 _CTOR_END = "llama_context::~llama_context()"
-_SELECT = "void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v)"
+_FIXPOINT = "void llama_context::sched_residency_fixpoint()"
+_L4_READY = "static bool llama_context_l4_ready(const std::vector<ggml_backend_ptr> & backends)"
+
+_DECIDE = (
+    "llama_plan_caps_decide(llama_context_has_sycl_backend(backends), plan_procs.plan_active, "
+    "plan_procs.caps_new != nullptr, plan_procs.caps_free != nullptr, llama_context_l4_ready(backends));"
+)
+_ACQUIRE = "plan_caps = llama_plan_caps_ptr(plan_procs.caps_new(), llama_plan_caps_deleter{ plan_procs.caps_free });"
 
 
 def ctor_text(code: str) -> str:
@@ -48,83 +52,136 @@ def ctor_text(code: str) -> str:
     return code[start : code.index(z(_CTOR_END), start)]
 
 
-def positions(text: str, needles: list) -> list:
-    out = []
+def arm_of(text: str, head: str) -> str:
+    """The braced block that follows `head` (z-spelled), through its matching brace."""
+    at = text.index(z(head))
+    i = text.index("{", at)
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[i : j + 1]
+    raise AssertionError(f"unbalanced braces after {head!r}")
+
+
+def order_ok(code: str) -> bool:
+    ctor = ctor_text(code)
+    needles = [
+        "sycl_auto_ubatch_prepare(params.type_k, params.type_v);",
+        "llama_plan_caps_decide(",
+        "llama_plan_caps_missing_procs_reason()",
+        _ACQUIRE,
+        "sched_residency_fixpoint();",
+        "model.create_memory(",
+    ]
+    pos = []
     for n in needles:
-        assert text.count(z(n)) >= 1, f"{n!r} missing"
-        out.append(text.index(z(n)))
-    return out
+        if ctor.count(z(n)) != 1:
+            return False
+        pos.append(ctor.index(z(n)))
+    return pos == sorted(pos)
+
+
+def decision_ok(code: str) -> bool:
+    ctor = ctor_text(code)
+    return ctor.count(z("llama_plan_caps_decide(")) == 1 and z("plan_decision = " + _DECIDE) in ctor
+
+
+def refusal_ok(code: str) -> bool:
+    arm = arm_of(ctor_text(code), "if (plan_decision == LLAMA_PLAN_CAPS_REFUSE_NO_PROCS)")
+    return z("throw std::runtime_error(llama_plan_caps_missing_procs_reason());") in arm and "plan_caps=" not in arm
+
+
+def acquisition_ok(code: str) -> bool:
+    # the member is assigned once in the whole file, and never reset anywhere else
+    if len(re.findall(r"(?<![\w.>])plan_caps\s*=\s*llama_plan_caps_ptr\(", code)) != 1 or "plan_caps.reset(" in code:
+        return False
+    arm = arm_of(ctor_text(code), "if (plan_decision == LLAMA_PLAN_CAPS_ACQUIRE)")
+    return (
+        z(_ACQUIRE) in arm
+        and z("if (!plan_caps) { throw std::runtime_error(") in arm
+        and arm.index(z(_ACQUIRE)) < arm.index(z("sched_residency_fixpoint();"))
+    )
+
+
+def inert_ok(code: str) -> bool:
+    if z("static constexpr bool llama_context_residency_probe_wired = false;") not in code:
+        return False
+    ready = function_body(code, _L4_READY)
+    if z("return llama_context_residency_probe_wired && llama_context_sycl_l4_procs_for(backends).available();") not in ready:
+        return False
+    # the fixpoint member refuses by name; it publishes nothing and returns nothing
+    body = function_body(code, _FIXPOINT)
+    return body.count("throw") == 1 and "publish" not in body and "return" not in body
 
 
 def test_decision_and_acquisition_order():
-    ctor = ctor_text(code_of(CTX_CPP))
-    pos = positions(
-        ctor,
-        [
-            "sycl_auto_ubatch_prepare(",
-            "llama_plan_caps_decide(",
-            "llama_plan_caps_missing_procs_reason()",
-            "plan_caps = llama_plan_caps_ptr(",
-            "sched_residency_fixpoint(",
-            "model.create_memory(",
-        ],
-    )
-    assert pos == sorted(pos), pos
+    assert order_ok(code_of(CTX_CPP))
 
 
 def test_decision_reads_the_contexts_own_facts():
-    ctor = ctor_text(code_of(CTX_CPP))
-    assert z(
-        "llama_plan_caps_decide(llama_context_has_sycl_backend(backends), plan_active, "
-        "plan_procs.caps_new != nullptr, plan_procs.caps_free != nullptr, l4_procs.available())"
-    ) in ctor
-    assert ctor.count(z("llama_plan_caps_decide(")) == 1
+    assert decision_ok(code_of(CTX_CPP))
 
 
-def test_refusal_is_named_and_precedes_acquisition():
-    ctor = ctor_text(code_of(CTX_CPP))
-    refuse = z("LLAMA_PLAN_CAPS_REFUSE_NO_PROCS")
-    assert refuse in ctor
-    arm = ctor[ctor.index(refuse) :]
-    arm = arm[: arm.index("}")]
-    assert z("throw std::runtime_error(llama_plan_caps_missing_procs_reason())") in arm
+def test_refusal_is_named_and_acquires_nothing():
+    assert refusal_ok(code_of(CTX_CPP))
 
 
 def test_acquisition_is_the_only_assignment_under_the_acquire_arm():
-    code = code_of(CTX_CPP)
-    # the member is assigned once in the whole file, and never reset anywhere else
-    assert len(re.findall(r"(?<![\w.>])plan_caps\s*=\s*llama_plan_caps_ptr\(", code)) == 1
-    assert "plan_caps.reset(" not in code
-    ctor = ctor_text(code)
-    acquire = z("LLAMA_PLAN_CAPS_ACQUIRE")
-    assert acquire in ctor
-    arm = ctor[ctor.index(acquire) :]
-    arm = arm[: arm.index("}")]
-    assert z("plan_caps = llama_plan_caps_ptr(plan_procs.caps_new(), llama_plan_caps_deleter{ plan_procs.caps_free })") in arm
-    assert z("if (!plan_caps)") in arm
+    assert acquisition_ok(code_of(CTX_CPP))
+
+
+def test_the_planned_reserve_is_production_unreachable_until_the_probe_is_wired():
+    assert inert_ok(code_of(CTX_CPP))
 
 
 def test_mutants():
     code = code_of(CTX_CPP)
-    # reordering the fixpoint after the memory module
-    m = mutate(code, "sched_residency_fixpoint();", "")
-    try:
-        _order_claim(m)
-    except (AssertionError, ValueError):
-        pass
-    else:
-        raise AssertionError("dropping the fixpoint call must fail the order claim")
-
-
-def _order_claim(code: str):
     ctor = ctor_text(code)
-    pos = positions(
-        ctor,
-        [
-            "llama_plan_caps_decide(",
-            "plan_caps = llama_plan_caps_ptr(",
-            "sched_residency_fixpoint(",
-            "model.create_memory(",
-        ],
-    )
-    assert pos == sorted(pos), pos
+
+    def with_ctor(new: str) -> str:
+        return code.replace(ctor, new, 1)
+
+    # order: the fixpoint call dropped, the acquisition after the memory module, a second decision
+    assert not order_ok(with_ctor(mutate(ctor, "sched_residency_fixpoint();", ""))), "mutant 'no fixpoint call' slipped through"
+    moved = mutate(ctor, _ACQUIRE, "").replace(z("if (!plan_caps)"), z("if (false)"), 1)
+    moved = moved.replace(z("model.create_memory("), z(_ACQUIRE + " model.create_memory("), 1)
+    assert not order_ok(with_ctor(moved)), "mutant 'acquired after the memory module' slipped through"
+
+    # the decision
+    assert not decision_ok(with_ctor(mutate(ctor, "plan_procs.plan_active,", "true,"))), \
+        "mutant 'the plan predicate is a constant' slipped through"
+    assert not decision_ok(with_ctor(mutate(ctor, "llama_context_l4_ready(backends));", "true);"))), \
+        "mutant 'L4 readiness is a constant' slipped through"
+    assert not decision_ok(with_ctor(mutate(ctor, "plan_procs.caps_new != nullptr,", "true,"))), \
+        "mutant 'the new proc is not consulted' slipped through"
+
+    # the refusal
+    assert not refusal_ok(with_ctor(mutate(ctor, "throw std::runtime_error(llama_plan_caps_missing_procs_reason());",
+                                           'throw std::runtime_error("no caps");'))), \
+        "mutant 'the refusal text is reworded' slipped through"
+    assert not refusal_ok(with_ctor(mutate(ctor, "throw std::runtime_error(llama_plan_caps_missing_procs_reason());",
+                                           "LLAMA_LOG_WARN(\"x\");"))), "mutant 'the refusal does not throw' slipped through"
+
+    # the acquisition
+    assert not acquisition_ok(with_ctor(mutate(ctor, "llama_plan_caps_deleter{ plan_procs.caps_free }", "llama_plan_caps_deleter{}"))), \
+        "mutant 'the deleter has no free' slipped through"
+    assert not acquisition_ok(code + z("void x() { plan_caps = llama_plan_caps_ptr(nullptr, llama_plan_caps_deleter{}); }")), \
+        "mutant 'a second acquisition site' slipped through"
+    assert not acquisition_ok(with_ctor(ctor.replace(z("if (!plan_caps) {"), z("if (false) {"), 1))), \
+        "mutant 'a null copy is not refused' slipped through"
+
+    # inertness
+    assert not inert_ok(code.replace(z("llama_context_residency_probe_wired = false;"),
+                                     z("llama_context_residency_probe_wired = true;"), 1)), \
+        "mutant 'the probe is declared wired' slipped through"
+    ready = function_body(code, _L4_READY)
+    assert not inert_ok(code.replace(ready, mutate(ready, "return llama_context_residency_probe_wired && llama_context_sycl_l4_procs_for(backends).available();",
+                                                   "return llama_context_sycl_l4_procs_for(backends).available();"), 1)), \
+        "mutant 'readiness ignores the probe' slipped through"
+    fix = function_body(code, _FIXPOINT)
+    assert not inert_ok(code.replace(fix, fix.replace("throw", "return;", 1), 1)), \
+        "mutant 'the fixpoint member returns without running' slipped through"
