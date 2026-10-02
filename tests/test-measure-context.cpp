@@ -106,13 +106,14 @@ static bool build_model(fixture & fx, llm_arch arch) {
     return fx.model != nullptr;
 }
 
-static llama_context_params make_params(bool flash_attn) {
+static llama_context_params make_params(bool flash_attn, uint32_t n_outputs_max = 0) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx                = 512;
     cp.flash_attn_type      = flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cp.n_batch              = 64;
     cp.n_ubatch             = 64;
     cp.n_seq_max            = 1;
+    cp.n_outputs_max        = n_outputs_max;
     cp.kv_unified           = true;
     cp.n_threads            = 2;
     cp.n_threads_batch      = 2;
@@ -141,7 +142,7 @@ static size_t worst_total_peak(const sched_measure_buft & entry) {
     return worst;
 }
 
-static void check_arch(llm_arch arch, bool flash_attn) {
+static void check_arch(llm_arch arch, bool flash_attn, uint32_t n_outputs_max) {
     const char * name = llm_arch_name(arch);
 
     fixture fx;
@@ -150,7 +151,7 @@ static void check_arch(llm_arch arch, bool flash_attn) {
         return;
     }
 
-    const llama_context_params cp = make_params(flash_attn);
+    const llama_context_params cp = make_params(flash_attn, n_outputs_max);
 
     // the real context, under the capture: the positive control
     log_capture real_log;
@@ -277,13 +278,19 @@ int main() {
     static const llm_arch archs[] = { LLM_ARCH_LLAMA, LLM_ARCH_GEMMA3, LLM_ARCH_MAMBA, LLM_ARCH_QWEN35 };
     for (llm_arch arch : archs) {
         for (bool fa : { false, true }) {
-            check_arch(arch, fa);
+            // 0: every token yields an output. 1: the output gather leaves one row, so the last layer
+            // runs on a single row -- the shape a ubatch with few outputs gives, which on SYCL is where a
+            // zero-row node (a dispatch no-op, llama.cpp-479i) appears. The measure must still bound the
+            // real compute buffer there.
+            for (uint32_t n_outputs_max : { 0u, 1u }) {
+                check_arch(arch, fa, n_outputs_max);
+            }
         }
     }
     check_refusal();
 
     // a run that compared no plan with a real context proved nothing about the plan
-    CHECK(n_peak_checked >= 6, "only %d measured plans were compared with a real context", n_peak_checked);
+    CHECK(n_peak_checked >= 12, "only %d measured plans were compared with a real context", n_peak_checked);
 
     if (n_failed != 0) {
         fprintf(stderr, "%d check(s) failed\n", n_failed);

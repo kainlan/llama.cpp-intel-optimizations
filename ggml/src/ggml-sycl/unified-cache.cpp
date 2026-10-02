@@ -755,6 +755,14 @@ static std::atomic<size_t>   g_runtime_host_cat_bytes[static_cast<int>(runtime_c
 static std::atomic<size_t>   g_runtime_managed_reserved_host_bytes{};
 static std::atomic<size_t>   g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-479i: planned bytes of the per-context dense MMQ/MMVQ Q8_1 src1 buffer
+// (n_ubatch * bytes-per-token from the inventory, 256-aligned), folded into the
+// RUNTIME zone requirement so the zone the buffer lives in is sized for it.
+static std::atomic<size_t>   g_planned_mmq_src1_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-479i: planned bytes of the per-context dense f16 dequant buffers (the src0 copy
+// plus the src1 copy, see zone_dequant_f16_*), folded into the same RUNTIME zone requirement.
+static std::atomic<size_t>   g_planned_dequant_f16_src0_bytes[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<size_t>   g_planned_dequant_f16_src1_bytes[GGML_SYCL_MAX_DEVICES]{};
 // llama.cpp-0oxf/o3a0: the SDPA shape (max query-head count per attention
 // window class, the SWA window itself, ubatch size, context length) known at
 // the time the oneDNN scratchpad was last planned for this device
@@ -1417,6 +1425,7 @@ struct runtime_alloc_record {
     // Monotonic identity of the current LIVE -> RELEASING claim. Rollback and
     // erase must match this as well as the complete allocation key.
     uint64_t                   release_generation = 0;
+    uint64_t                    release_tid        = 0;  // releasing thread, trace only
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     bool                       test_no_physical_release = false;
     size_t                     test_exact_leases = 0;
@@ -1448,6 +1457,76 @@ static std::atomic<bool> g_test_pause_arena_registry_commit{ false };
 static std::atomic<bool> g_test_arena_registry_commit_reached{ false };
 #endif
 
+static bool unified_alloc_lifetime_trace_enabled();
+
+static uint64_t alloc_trace_thread_id() noexcept {
+    return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+// What runtime_registry_claim_ptr_locked saw when it displaced a stale row.  It is filled while
+// g_runtime_alloc_mutex is held and logged by the destructor, so a caller declares it BEFORE its
+// lock guard and the line is emitted after the mutex is dropped.  Filled only while
+// GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE=1.
+struct stale_claim_report {
+    bool        claimed     = false;
+    void *      ptr         = nullptr;
+    uint64_t    id          = 0;
+    size_t      size        = 0;
+    int         role        = 0;
+    uint64_t    release_tid = 0;
+    std::string cohort;
+
+    ~stale_claim_report() {
+        if (!claimed) {
+            return;
+        }
+        GGML_LOG_WARN(
+            "[UNIFIED-ALLOC-STALE-CLAIM] allocation at ptr=%p displaced a RELEASING row (id=%llu size=%zu role=%d "
+            "cohort=%s); releaser_tid=%llu claimer_tid=%llu (llama.cpp-93tw)\n",
+            ptr, (unsigned long long) id, size, role, cohort.empty() ? "(none)" : cohort.c_str(),
+            (unsigned long long) release_tid, (unsigned long long) alloc_trace_thread_id());
+    }
+};
+
+// Claim `ptr` for a registry row that is about to be inserted.  Caller holds g_runtime_alloc_mutex.
+//
+// Observed cause (llama.cpp-93tw) of the intermittent metadata_publication_failed / "Failed to
+// allocate pinned host memory" on a small staging request with ample free memory; run with
+// GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE=1 and look for [UNIFIED-ALLOC-STALE-CLAIM] to see it.
+// A release on another thread marks its row RELEASING, drops the mutex, frees the physical block
+// (a host zone returns it to the TLSF immediately) and only then re-locks to erase the row.  In that window an allocation on another thread can be handed the recycled address.
+// The row found there is not live authority: the allocator just handed the address out, so the
+// block it described is already free.  Failing the allocation on it (the old behaviour) surfaced
+// as alloc_err=4 (metadata_publication_failed).  The releaser's later erase and rollback both
+// match the complete allocation key (id included) and the claim's release generation, so they
+// leave a row that replaced the stale one alone.
+//
+// A LIVE row at the address is a different matter: two live allocations sharing an address is
+// corruption, and that still refuses.
+static bool runtime_registry_claim_ptr_locked(void * ptr, stale_claim_report & report) noexcept {
+    const auto it = g_runtime_alloc_registry.find(ptr);
+    if (it == g_runtime_alloc_registry.end()) {
+        return true;
+    }
+    if (it->second.state != runtime_alloc_state::RELEASING) {
+        return false;
+    }
+    if (unified_alloc_lifetime_trace_enabled()) {
+        report.claimed     = true;
+        report.ptr         = ptr;
+        report.id          = it->second.handle.id;
+        report.size        = it->second.handle.size;
+        report.role        = static_cast<int>(it->second.handle.role);
+        report.release_tid = it->second.release_tid;
+        try {
+            report.cohort = it->second.cohort_id;
+        } catch (...) {
+        }
+    }
+    g_runtime_alloc_registry.erase(it);
+    return true;
+}
+
 static bool arena_runtime_registry_commit(void * ptr, const arena_authority::allocation_record & exact,
                                           void * opaque) noexcept {
     auto & context = *static_cast<arena_runtime_publication_context *>(opaque);
@@ -1470,10 +1549,14 @@ static bool arena_runtime_registry_commit(void * ptr, const arena_authority::all
         rec.handle.arena_extent          = exact.extent;
         if (!allocation_owner_internal_access::publish(context.control, rec.handle)) return false;
         if (context.control) rec.handle = context.control->metadata();
+        stale_claim_report          stale_claim;  // declared before the lock: logs after it is dropped
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         // A live pointer row is authority. Never replace it with an allocation
-        // from a recycled TLSF address; failure rolls this allocation back.
-        if (g_runtime_alloc_registry.find(ptr) != g_runtime_alloc_registry.end()) return false;
+        // from a recycled TLSF address; failure rolls this allocation back. A row
+        // already RELEASING is stale by construction (llama.cpp-93tw).
+        if (!runtime_registry_claim_ptr_locked(ptr, stale_claim)) {
+            return false;
+        }
         auto inserted = g_runtime_alloc_registry.emplace(ptr, rec);
         if (!inserted.second) return false;
         try {
@@ -1642,13 +1725,83 @@ moe_control_requirement unified_cache_get_planned_moe_control_requirement(int de
 
 static size_t unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(int device_id);
 
+bool unified_cache_set_planned_mmq_src1_scratch(int device_id, size_t bytes_per_token, uint32_t n_ubatch) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    size_t bytes = 0;
+    if (!zone_mmq_src1_scratch_bytes(bytes_per_token, n_ubatch, &bytes)) {
+        // An overflowing figure must not become a SMALL plan. Publish nothing; the graph-entry
+        // check then refuses by name instead of the zone being sized for a wrapped number.
+        g_planned_mmq_src1_scratch_bytes[device_id].store(0, std::memory_order_release);
+        return false;
+    }
+    g_planned_mmq_src1_scratch_bytes[device_id].store(bytes, std::memory_order_release);
+    return true;
+}
+
+size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_mmq_src1_scratch_bytes[device_id].load(std::memory_order_acquire);
+}
+
+bool unified_cache_set_planned_dequant_f16_scratch(int      device_id,
+                                                   size_t   max_weight_bytes,
+                                                   size_t   src1_bytes_per_token,
+                                                   uint32_t n_ubatch) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    size_t src0_bytes = 0;
+    size_t src1_bytes = 0;
+    if (!zone_dequant_f16_plan_bytes(max_weight_bytes, src1_bytes_per_token, n_ubatch, &src0_bytes, &src1_bytes)) {
+        // Same rule as the Q8 figure: an overflow must not become a SMALL plan.
+        g_planned_dequant_f16_src0_bytes[device_id].store(0, std::memory_order_release);
+        g_planned_dequant_f16_src1_bytes[device_id].store(0, std::memory_order_release);
+        return false;
+    }
+    g_planned_dequant_f16_src0_bytes[device_id].store(src0_bytes, std::memory_order_release);
+    g_planned_dequant_f16_src1_bytes[device_id].store(src1_bytes, std::memory_order_release);
+    return true;
+}
+
+size_t unified_cache_get_planned_dequant_f16_buffer_bytes(int device_id, bool src1) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return (src1 ? g_planned_dequant_f16_src1_bytes : g_planned_dequant_f16_src0_bytes)[device_id].load(
+        std::memory_order_acquire);
+}
+
+size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id) {
+    // The two buffers are planned together; a sum that wrapped would be a SMALLER zone.
+    const size_t src0 = unified_cache_get_planned_dequant_f16_buffer_bytes(device_id, false);
+    const size_t src1 = unified_cache_get_planned_dequant_f16_buffer_bytes(device_id, true);
+    return src0 > SIZE_MAX - src1 ? SIZE_MAX : src0 + src1;
+}
+
 bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out) {
     // Ring slots placed in the shared KV zone are not RUNTIME demand.
     const size_t ring_bytes    = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device_id);
     const size_t ring_kv_bytes = unified_cache_get_planned_pp_moe_onednn_kv_zone_bytes(device_id);
-    return moe_checked_runtime_zone_requirement(unified_cache_get_planned_pp_pipeline_scratch_bytes(device_id),
-                                                ring_bytes > ring_kv_bytes ? ring_bytes - ring_kv_bytes : 0,
-                                                unified_cache_get_planned_moe_control_requirement(device_id), out);
+    size_t       base          = 0;
+    if (!moe_checked_runtime_zone_requirement(unified_cache_get_planned_pp_pipeline_scratch_bytes(device_id),
+                                              ring_bytes > ring_kv_bytes ? ring_bytes - ring_kv_bytes : 0,
+                                              unified_cache_get_planned_moe_control_requirement(device_id), &base)) {
+        return false;
+    }
+    // The dense MMQ/MMVQ Q8_1 src1 buffer lives in this zone (llama.cpp-479i). Checked like
+    // the terms above: a wrapped sum would be a SMALLER zone, not a refusal.
+    const size_t mmq_src1 = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);
+    // The dense f16 dequant buffer lives in this zone too (llama.cpp-479i), checked the same way.
+    const size_t dequant_f16 = unified_cache_get_planned_dequant_f16_scratch_bytes(device_id);
+    if (mmq_src1 > SIZE_MAX - base || dequant_f16 > SIZE_MAX - base - mmq_src1) {
+        return false;
+    }
+    *out = base + mmq_src1 + dequant_f16;
+    return true;
 }
 
 void unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes) {
@@ -11376,7 +11529,7 @@ bool unified_cache::onednn_graph_scratch_ensure_flag_slab_locked() {
     if (onednn_graph_scratch_flag_slab_ != nullptr) {
         return true;
     }
-    if (onednn_graph_scratch_flag_slab_alloc_warned_) {
+    if (onednn_graph_scratch_flag_slab_warned_) {
         // Already failed once this process; do not retry (and re-log) on
         // every subsequent park -- a process-wide degradation to the
         // blocking fallback, not a per-entry one.
@@ -11385,7 +11538,7 @@ bool unified_cache::onednn_graph_scratch_ensure_flag_slab_locked() {
     const size_t bytes = kOnednnGraphScratchFlagSlabCapacity * sizeof(int32_t);
     void *       raw = unified_cache_malloc_host_tracked(bytes, queue_, "unified_cache:onednn_graph_scratch_flag_slab");
     if (!raw) {
-        onednn_graph_scratch_flag_slab_alloc_warned_ = true;
+        onednn_graph_scratch_flag_slab_warned_ = true;
         GGML_LOG_WARN(
             "[UNIFIED-CACHE] Failed to allocate the oneDNN Graph-scratch pool's completion-flag slab (%zu "
             "bytes); falling back to blocking completion checks for every pooled entry\n",
@@ -11407,7 +11560,7 @@ bool unified_cache::onednn_graph_scratch_ensure_flag_slab_locked() {
         // control (the pre-teardown census admits it, unable to tell it
         // apart from a real, in-use slab) for the rest of the process.
         onednn_graph_scratch_flag_slab_owner_        = {};
-        onednn_graph_scratch_flag_slab_alloc_warned_ = true;
+        onednn_graph_scratch_flag_slab_warned_       = true;
         GGML_LOG_WARN(
             "[UNIFIED-CACHE] Failed to resolve the oneDNN Graph-scratch pool's completion-flag slab owner; "
             "falling back to blocking completion checks for every pooled entry\n");
@@ -15950,7 +16103,8 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             return false;
         }
         if (owner_control) rec.handle = owner_control->metadata();
-        bool registered = false;
+        bool               registered = false;
+        stale_claim_report stale_claim;  // declared before the lock: logs after it is dropped
         {
             std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
             // Epoch and row publication share this mutex with host settle.
@@ -15959,7 +16113,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     g_host_zone_epoch[static_cast<size_t>(rec.handle.host_zone)].load(std::memory_order_relaxed);
             }
             try {
-                if (g_runtime_alloc_registry.find(ptr) == g_runtime_alloc_registry.end()) {
+                if (runtime_registry_claim_ptr_locked(ptr, stale_claim)) {
                     auto inserted = g_runtime_alloc_registry.emplace(ptr, rec);
                     if (inserted.second) {
                         try {
@@ -16784,9 +16938,18 @@ static registered_release_status release_registered_allocation_owned(
 #endif
         it->second.promotion_cleanup_pending = false;
         it->second.state = runtime_alloc_state::RELEASING;
+        if (unified_alloc_lifetime_trace_enabled()) {
+            it->second.release_tid = alloc_trace_thread_id();
+        }
         // Release-only adjuncts have a single claimant and are never copied to
         // lookup output or another concurrent releaser.
         detached.owned_segments = std::move(it->second.owned_segments);
+    }
+
+    if (unified_alloc_lifetime_trace_enabled()) {
+        GGML_LOG_WARN("[UNIFIED-ALLOC-LIFE] release-begin ptr=%p id=%llu size=%zu role=%d tid=%llu\n",
+                      detached.handle.ptr, (unsigned long long) detached.handle.id, detached.handle.size,
+                      static_cast<int>(detached.handle.role), (unsigned long long) alloc_trace_thread_id());
     }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -16990,6 +17153,12 @@ void allocation_registry_test_pause_claim(bool pause) noexcept {
 
 bool allocation_registry_test_claim_reached() noexcept {
     return g_test_registry_claim_reached.load(std::memory_order_acquire);
+}
+
+bool allocation_registry_test_claim_ptr(void * ptr) noexcept {
+    stale_claim_report          report;
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return runtime_registry_claim_ptr_locked(ptr, report);
 }
 
 void allocation_registry_test_erase(void * ptr) noexcept {
@@ -27199,6 +27368,13 @@ static size_t zone_onednn_reorder_bytes(const placement_tensor_info & item) {
     return elements * sizeof(sycl::half);
 }
 
+// The pure Q8_1 src1 arithmetic in zone-sizing.hpp restates three backend constants because that TU
+// links nothing; pin each to its source so the planner cannot drift from the dispatch's required_size.
+static_assert(k_zone_mmq_src1_row_padding == MATRIX_ROW_PADDING, "zone-sizing.hpp Q8_1 row padding drifted");
+static_assert(k_zone_mmq_src1_block_elems == QK8_1, "zone-sizing.hpp Q8_1 block width drifted");
+static_assert(k_zone_mmq_src1_block_bytes == sizeof(block_q8_1), "zone-sizing.hpp Q8_1 block size drifted");
+static_assert(k_zone_dequant_f16_elem_bytes == sizeof(sycl::half), "zone-sizing.hpp f16 element size drifted");
+
 std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vector<placement_tensor_info> & inventory) {
     std::vector<zone_tensor_desc> zone_inventory;
     zone_inventory.reserve(inventory.size());
@@ -27212,6 +27388,43 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         }
         desc.name         = item.name;
         desc.reorder_size = zone_onednn_reorder_bytes(item);
+        // llama.cpp-479i: Q8_1 bytes a dense quantized MUL_MAT quantizes its activations into, per
+        // token. Operand-ness is decided HERE, where the traits and the name are, not in the pure
+        // classifier: a quantized weight that is not an expert stack (MUL_MAT_ID keeps its own
+        // moe_q8 workspace). Experts are recognised by the planner's own role function, the same
+        // authority plan_moe_mmid_workspaces uses -- NOT by ne[2] > 1, which also matches dense 3-D
+        // operands such as the MLA wk_b / wv_b (llama.cpp-8xbt). A mis-prediction is survivable:
+        // ggml_sycl_mmq_src1_ensure_for_graph() ensures max(plan, demand) for every device that has a
+        // node drawing from the buffer, the demand taken from the graph's own nodes (the ones the
+        // dispatch's router sends to a kernel that quantizes src1, plus the single-row decode nodes), so
+        // a plan of zero (a quantized K cache with no quantized weights) is covered by the demand. It
+        // does so before anything is submitted, and refuses by name if the zone cannot hold it.
+        if (item.has_shape() && ggml_is_quantized(item.type) &&
+            expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
+            size_t bytes_per_token = 0;
+            if (zone_mmq_src1_bytes_per_token(item.ne[0], item.ne[2] > 0 ? item.ne[2] : 1,
+                                              item.ne[3] > 0 ? item.ne[3] : 1, &bytes_per_token)) {
+                desc.mmq_src1_bytes_per_token = bytes_per_token;
+            }
+        }
+        // llama.cpp-479i: f16 bytes the f16 dequant arm materializes for a dense weight. The
+        // planned candidate set is Q8_0: ONEDNN_SOA / ONEDNN_COALESCED are the planned route for its
+        // materialized layouts and are selected whatever GGML_SYCL_ONEDNN_PP says, so they are the
+        // consumer that was observed minting per-op copies. Another type reaching the arm (an AOS-layout
+        // fallback) is not planned here: the graph-entry walk finds it from the graph's own nodes and
+        // grows the buffer inside the RUNTIME zone, or refuses by name. Experts are excluded by the same
+        // role function as above.
+        if (item.has_shape() && item.type == GGML_TYPE_Q8_0 &&
+            expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
+            size_t weight_bytes = 0;
+            size_t src1_bytes   = 0;
+            if (zone_dequant_f16_weight_bytes(item.ne[0], item.ne[1] > 0 ? item.ne[1] : 1, &weight_bytes) &&
+                zone_dequant_f16_src1_bytes_per_token(item.ne[0], item.ne[2] > 0 ? item.ne[2] : 1,
+                                                      item.ne[3] > 0 ? item.ne[3] : 1, &src1_bytes)) {
+                desc.dequant_f16_weight_bytes         = weight_bytes;
+                desc.dequant_f16_src1_bytes_per_token = src1_bytes;
+            }
+        }
         zone_inventory.push_back(std::move(desc));
     }
     return zone_inventory;

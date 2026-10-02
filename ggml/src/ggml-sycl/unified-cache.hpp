@@ -1636,6 +1636,22 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
 
 void   unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
 size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
+// llama.cpp-479i: plan the per-context dense MMQ/MMVQ Q8_1 src1 buffer from the inventory's
+// bytes-per-token (zone_scoped_maxima().mmq_src1_bytes_per_token) at n_ubatch. Folded into
+// unified_cache_get_planned_runtime_zone_requirement(). False on overflow (nothing published).
+bool   unified_cache_set_planned_mmq_src1_scratch(int device_id, size_t bytes_per_token, uint32_t n_ubatch);
+size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id);
+// llama.cpp-479i: plan the per-context dense f16 dequant buffers (src0 copy + src1 copy) from
+// the inventory maxima (zone_scoped_maxima().dequant_f16_weight_bytes / _src1_bytes_per_token) at
+// n_ubatch. Folded into unified_cache_get_planned_runtime_zone_requirement(). False on overflow.
+bool   unified_cache_set_planned_dequant_f16_scratch(int      device_id,
+                                                     size_t   max_weight_bytes,
+                                                     size_t   src1_bytes_per_token,
+                                                     uint32_t n_ubatch);
+// Both buffers' bytes together (what the RUNTIME zone requirement folds in), and each alone: the graph walk
+// ensures each buffer at max(its own plan, the graph's demand).
+size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id);
+size_t unified_cache_get_planned_dequant_f16_buffer_bytes(int device_id, bool src1);
 void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
 // The primitive-API weights+activations pair's own planned requirement,
 // WITHOUT the Graph-scratch allocator's additive floor (llama.cpp-gwno
@@ -4515,7 +4531,7 @@ class unified_cache {
     int32_t *                    onednn_graph_scratch_flag_slab_ = nullptr;
     std::vector<uint32_t>        onednn_graph_scratch_flag_slot_free_list_;
     uint32_t                     onednn_graph_scratch_flag_generation_counter_     = 0;
-    bool                         onednn_graph_scratch_flag_slab_alloc_warned_      = false;
+    bool                         onednn_graph_scratch_flag_slab_warned_            = false;
     bool                         onednn_graph_scratch_flag_slots_exhausted_warned_ = false;
     // llama.cpp-c6ah: see the public accessor's own comment above.
     // Incremented only in onednn_graph_scratch_clear_pool_locked(), the one
@@ -6160,6 +6176,9 @@ registered_release_status allocation_registry_test_release_exact(
 registered_release_status allocation_registry_test_claim(const alloc_metadata & metadata, bool intrusive) noexcept;
 void allocation_registry_test_pause_claim(bool pause) noexcept;
 bool allocation_registry_test_claim_reached() noexcept;
+// Claim `ptr` for a new registry row: true when no row is there or the row is a stale RELEASING one
+// (erased); false for a LIVE row (llama.cpp-93tw).
+bool                      allocation_registry_test_claim_ptr(void * ptr) noexcept;
 void allocation_registry_test_erase(void * ptr) noexcept;
 #endif
 

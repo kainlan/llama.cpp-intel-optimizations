@@ -116,12 +116,23 @@ void PinnedBufferPool::shutdown() {
     out_handle_ = {};
     act_pool_   = nullptr;
     out_pool_   = nullptr;
+    next_entry_ = 0;
 }
 
 PinnedBufferPool::BufferPair PinnedBufferPool::acquire(size_t n_experts) {
     GGML_ASSERT(n_experts <= max_experts_ && "Expert count exceeds pool capacity");
     GGML_ASSERT(act_pool_ && out_pool_ && "Pool not initialized");
     return { act_pool_, out_pool_ };
+}
+
+size_t PinnedBufferPool::reserve(size_t n_experts) {
+    GGML_ASSERT(n_experts <= max_experts_ && "Expert count exceeds pool capacity");
+    if (next_entry_ + n_experts > max_experts_) {
+        next_entry_ = 0;
+    }
+    const size_t first = next_entry_;
+    next_entry_        = (first + n_experts) % max_experts_;
+    return first;
 }
 
 void PinnedBufferPool::release(BufferPair) {

@@ -184,6 +184,8 @@ DIRECT_ALLOC_OWNER_LEGACY_PATTERN='(std::shared_ptr<alloc_handle>[[:space:]]+(ne
 MOE_PRESTAGE_CPU_REORDER_LEGACY_PATTERN='reorder_alloc'
 SET_TENSOR_REORDER_FALLBACK_LEGACY_PATTERN='reorder_fallback_alloc'
 EXPERT_PREFETCH_LEGACY_PATTERN='scores_alloc_'
+# Deliberate substring guard: any identifier containing it trips the check.
+# Rename the identifier rather than loosening the pattern.
 FP16_CACHE_LEGACY_PATTERN='slab_alloc'
 PINNED_BUFFER_POOL_LEGACY_PATTERN='(act_alloc_|out_alloc_)'
 PINNED_BUFFER_POOL_LEGACY_OWNER_PATTERN='(alloc_handle[[:space:]]+(act_owner|out_owner)|from_owned_alloc\([^\n]*(act_owner|out_owner))'

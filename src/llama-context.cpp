@@ -405,6 +405,102 @@ static decltype(&ggml_backend_sycl_ubatch_cache_store_layout1) llama_context_syc
 }
 #endif
 
+// llama.cpp-38af: the compute-buffer buft for the CPU backend when the first
+// device is a SYCL device. It is the generic host buft's pinned memory under a
+// distinct identity that the SYCL backend never reports as supported, so
+// ggml-backend-sched copies every CPU-produced activation into the SYCL
+// backend's device compute buffer instead of a SYCL op reading pinned host
+// memory in place. Returns nullptr for a non-SYCL device, or a SYCL module that
+// predates the export; the caller then keeps the device's generic host buft.
+static ggml_backend_buffer_type_t llama_context_sycl_cpu_activation_buft(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_SYCL)
+    return llama_context_dev_is_sycl(dev) ? ggml_backend_sycl_cpu_activation_buffer_type() : nullptr;
+#elif defined(GGML_BACKEND_DL)
+    auto proc = reinterpret_cast<decltype(&ggml_backend_sycl_cpu_activation_buffer_type)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_cpu_activation_buffer_type"));
+    return proc ? proc() : nullptr;
+#else
+    GGML_UNUSED(dev);
+    return nullptr;
+#endif
+}
+
+// llama.cpp-38af: the backend's own answer to "will the CPU execute any part of
+// this graph", read from its published placement plan (host-planned dense layer,
+// host-planned KV, or a fully host-planned expert tensor). False for a non-SYCL
+// device, no active plan, or a SYCL module that predates the export, in which
+// case the caller keeps the generic host buft.
+static bool llama_context_sycl_plan_has_cpu_work(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_SYCL)
+    return llama_context_dev_is_sycl(dev) && ggml_backend_sycl_plan_has_cpu_work(dev);
+#elif defined(GGML_BACKEND_DL)
+    auto proc = reinterpret_cast<decltype(&ggml_backend_sycl_plan_has_cpu_work)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_plan_has_cpu_work"));
+    return proc && proc(dev);
+#else
+    GGML_UNUSED(dev);
+    return false;
+#endif
+}
+
+// llama.cpp-38af: the compute-buffer buft for the CPU backend. `buft` is the
+// backend's default. The first device's host buft is used for faster transfer of
+// the intermediate state; when the CPU will actually produce activations a SYCL
+// op consumes -- the backend's plan has CPU work, or this is a partial offload
+// (n_gpu_layers does not cover every layer and the output) -- it gets the
+// dedicated activation buft instead, so the scheduler copies those activations to
+// the device. With no CPU work every input is read out of the host buft in place,
+// and the dedicated identity would only add split-copy names to the graph (the
+// dkw0 replay-futility detector disables command-graph replay on a '#' name).
+//
+// The answer depends on the placement plan, which the auto-ubatch resyncs
+// re-publish after the constructor enumerates the backends, so sched_reserve()
+// calls this again right before it builds each scheduler.
+static ggml_backend_buffer_type_t llama_context_cpu_compute_buft(const llama_model &        model,
+                                                                 ggml_backend_buffer_type_t buft,
+                                                                 bool                       log) {
+    if (model.devices.empty()) {
+        return buft;
+    }
+    const auto & dev = model.devices[0];
+    if (auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev)) {
+        buft = host_buft;
+    }
+    const bool plan_cpu_work   = llama_context_sycl_plan_has_cpu_work(dev.dev);
+    const bool partial_offload = model.n_gpu_layers() <= model.hparams.n_layer_all;
+    if (plan_cpu_work || partial_offload) {
+        if (auto * activation_buft = llama_context_sycl_cpu_activation_buft(dev.dev)) {
+            buft = activation_buft;
+        }
+    }
+    // One line per selection; the backend logs which plan clause fired just above it.
+    if (!log) {
+        return buft;
+    }
+    LLAMA_LOG_DEBUG("[SYCL-CPU-ACT] CPU compute buft '%s': plan_cpu_work=%d partial_offload=%d\n",
+                    ggml_backend_buft_name(buft), plan_cpu_work, partial_offload);
+    return buft;
+}
+
+// llama.cpp-38af: re-select the CPU backend's compute buft against the placement plan as it stands NOW.
+// The auto-ubatch candidate and settle resyncs re-plan after the constructor chose it, and no plan
+// mutation happens between a reserve's call here and its scheduler's construction (the narrow flash-attn
+// recheck in resolve_fused_ops() runs with allow_replan=false), so this is the final answer for that
+// scheduler; the pipeline-parallel retry reuses it. The MEASURE and the ALLOC of one reserve both call it
+// so they plan against the same buft.
+static void llama_context_cpu_compute_buft_reselect(const llama_model &                       model,
+                                                    const std::vector<ggml_backend_t> &       backend_ptrs,
+                                                    std::vector<ggml_backend_buffer_type_t> & backend_buft,
+                                                    bool                                      log) {
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        if (!model.devices.empty() &&
+            ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            backend_buft[i] =
+                llama_context_cpu_compute_buft(model, ggml_backend_get_default_buffer_type(backend_ptrs[i]), log);
+        }
+    }
+}
+
 // llama.cpp-7n6n (wires nphx Task 5): a cheap, deterministic FNV-1a hash
 // over every loaded tensor's (name, byte size) -- a proxy for "this exact
 // set of quantized weights", used only to invalidate the persisted auto
@@ -1060,11 +1156,9 @@ llama_context::llama_context(
 
             if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
-                const auto & dev = model.devices[0];
-                auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
-                if (host_buft) {
-                    buft = host_buft;
-                }
+                // (llama.cpp-38af: or its activation twin when the CPU produces activations; re-selected in
+                // sched_reserve() once the placement plan is final)
+                buft = llama_context_cpu_compute_buft(model, buft, !measure_only);
             }
 #ifdef GGML_USE_SYCL
             else if (backend_type == GGML_BACKEND_DEVICE_TYPE_GPU && llama_context_dev_is_sycl(dev)) {
@@ -2426,10 +2520,13 @@ std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sch
                 sycl_ordinal++;
                 continue;
             }
-            // the CPU backend computes in the host buffer type of the first model device
+            // The CPU backend computes in the host buffer type of the first model device, or in that
+            // buffer's activation twin when the CPU produces activations a SYCL op consumes
+            // (llama_context_cpu_compute_buft): the same pinned host memory under two identities.
             if (entry.buft == backend_buft[i] && !model.devices.empty() &&
                 llama_context_dev_is_sycl(model.devices[0].dev) &&
-                entry.buft == ggml_backend_dev_host_buffer_type(model.devices[0].dev)) {
+                (entry.buft == ggml_backend_dev_host_buffer_type(model.devices[0].dev) ||
+                 entry.buft == llama_context_sycl_cpu_activation_buft(model.devices[0].dev))) {
                 llama_tenant_buft_caps c;
                 c.device = -1;
                 c.host   = true;
@@ -2509,6 +2606,9 @@ sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, 
     }
     state.gf_res_reserve.reset(new llm_graph_result(max_nodes));
     state.gf_res_prev_active = nullptr;
+
+    // llama.cpp-38af: the CPU compute buft as the plan stands now (see the helper).
+    llama_context_cpu_compute_buft_reselect(model, backend_ptrs, backend_buft, true);
 
     // The scheduler is created inside the scope, so its allocator reads the context's frozen
     // chunk caps. Only a context that owns the copy opens one.
@@ -2674,6 +2774,8 @@ sched_reserve_result llama_context::sched_measure_impl(sched_reserve_state & sta
     // The scheduler below is created inside the scope, so its allocator reads the frozen caps. A
     // load-time measure holds no copy: its LOAD_MEASURE scope reads the stage's caps, and a measure
     // over no SYCL backend (a CPU-only host) has no scope to open.
+    llama_context_cpu_compute_buft_reselect(model, backend_ptrs, backend_buft, !measure_only);
+
     const llama_context_sycl_plan_procs plan_procs = llama_context_sycl_plan_procs_for(backends);
     llama_plan_scope plan_scope = measure_only ? llama_plan_scope(plan_procs, measure_stage) :
                                                  llama_plan_scope(plan_procs, (uint32_t) sycl_exec_context.value,

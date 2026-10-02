@@ -102,6 +102,52 @@ inline bool moe_mmvq_pair_glu_dispatch_supports_layout(enum ggml_type type, enum
     return layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_XMX_TILED || layout == GGML_LAYOUT_XMX_TILED_BUNDLE4;
 }
 
+// Whether the grouped MXFP4 XMX_TILED executor in mmvq_moe_batched_dispatch() can take a
+// route whose device entries cover n_gpu_entries slots.
+//
+// It always could for FULL cover. It must also for PARTIAL cover: a hybrid decode
+// (some experts device-resident, the rest on the host) routes the device slots here
+// and the host slots to the CPU arm, whose scatter writes them afterwards. The kernel is
+// driven by the per-slot route arrays (expert id, token, slot), so it needs no
+// all-slots cover -- only that those arrays exist when cover is partial. Refusing
+// partial cover sent the op to a per-expert fallback that did not read this layout
+// at all (llama.cpp-4hg7): a support gap closed here rather than routed around.
+inline bool moe_mmvq_xmx_tiled_grouped_accepts_cover(bool full_cover, int n_gpu_entries, bool route_arrays_present) {
+    return n_gpu_entries > 0 && (full_cover || route_arrays_present);
+}
+
+// Layouts the per-expert MXFP4 "direct" dispatch in ggml_sycl_mul_mat can read from the
+// bytes it is handed. Its kernels decode exactly these three; every other layout
+// (XMX_TILED, XMX_TILED_BUNDLE4, MXFP4_I8, MXFP4_DPAS, ...) is a different byte format and
+// reading it as one of these is garbage from the first element out. A caller handed any
+// other layout must refuse, never map it onto AOS (llama.cpp-4hg7).
+inline bool moe_mmvq_mxfp4_direct_reads_layout(enum ggml_layout_mode layout) {
+    return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED;
+}
+
+// Whether a prompt-phase MoE layout is executable over a tensor whose probe at that layout found
+// `local` device entries, `secondary` entries on another device, `host` host-planned entries and
+// `missing` unresolved ones, out of n_experts.
+//
+// Placement decides the executor: a device entry runs on the device at the layout it is loaded in,
+// a host entry runs on the CPU. So every expert is covered when nothing is missing, nothing sits on
+// a secondary device (the secondary prompt executor is unvalidated), and at least one entry is on
+// the device. Requiring host == 0 -- "all experts on the device" -- turned a mixed tensor (a few
+// experts in VRAM, the rest on the host) into an abort that asked for a SOA copy the single-layout
+// planner never builds (llama.cpp-f6zo).
+//
+// local > 0 only separates the two outcomes for an all-host tensor: its route layout stays SOA with
+// host operands, because a host entry needs no device layout. local + host == n_experts is a defence
+// of the probe's invariant (each expert is counted exactly once), not a condition production can
+// reach with missing == 0 and secondary == 0; it fails closed if the probe ever double counts.
+inline bool moe_mmvq_prompt_layout_cover_executable(size_t local,
+                                                    size_t secondary,
+                                                    size_t host,
+                                                    size_t missing,
+                                                    size_t n_experts) {
+    return missing == 0 && secondary == 0 && local > 0 && local + host == n_experts;
+}
+
 inline bool moe_mmvq_any_dispatch_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     return moe_mmvq_batched_dispatch_supports_layout(type, layout) ||
            moe_mmvq_pair_glu_dispatch_supports_layout(type, layout);

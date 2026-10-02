@@ -17393,15 +17393,16 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     log_xmx_reject("tile-n-total");
                     return false;
                 }
-                const bool grouped_decode_shape = full_gpu_cover;
+                // Partial cover is a normal hybrid decode shape: the device owns some of the
+                // (id, token) slots and the host experts own the rest (their rows are the
+                // CPU arm's scatter, and this kernel never writes them). The kernel works
+                // from the per-slot route arrays, so it needs no all-slots cover. Refusing
+                // partial cover here used to drop the op onto a per-expert fallback that
+                // read the xmx_tiled bytes as AOS (llama.cpp-4hg7).
+                const bool grouped_decode_shape =
+                    moe_mmvq_xmx_tiled_grouped_accepts_cover(full_gpu_cover, n_gpu_entries, xmx_route_arrays_ok);
                 if (!grouped_decode_shape) {
                     log_xmx_reject("coverage");
-                    return false;
-                }
-                if (!full_gpu_cover || !xmx_capabilities_match_int8_tile(caps, repeat, exec_n, k_per) ||
-                    !xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG) ||
-                    caps.optimal_tiles_n <= 0) {
-                    log_xmx_reject(!full_gpu_cover ? "coverage" : "caps");
                     return false;
                 }
                 if (device_grouped_xmx_shape && !xmx_route_arrays_ok) {
@@ -17484,10 +17485,12 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     }
                     grouped_slots[static_cast<size_t>(group_index)].push_back(static_cast<int32_t>(slot64));
                 }
-                for (uint8_t seen : seen_slots) {
-                    if (!seen) {
-                        log_xmx_reject("slot-missing");
-                        return false;
+                if (full_gpu_cover) {
+                    for (uint8_t seen : seen_slots) {
+                        if (!seen) {
+                            log_xmx_reject("slot-missing");
+                            return false;
+                        }
                     }
                 }
 
@@ -17509,19 +17512,21 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
 
                 grouped_n_groups = static_cast<int>(grouped_experts_host.size());
                 grouped_n_chunks = static_cast<int>(grouped_chunk_groups_host.size());
-                if (grouped_n_groups <= 0 || grouped_n_chunks <= 0 ||
-                    grouped_rows_host.size() != static_cast<size_t>(total_batches)) {
+                if (grouped_n_groups <= 0 || grouped_n_chunks <= 0) {
                     log_xmx_reject("group-empty");
                     return false;
                 }
+                // Every device entry owns a distinct slot (the slot-duplicate test above), and
+                // each contributes exactly one row, so this holds by construction.
+                GGML_ASSERT(grouped_rows_host.size() == static_cast<size_t>(n_gpu_entries) &&
+                            "one grouped row per device entry");
                 const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
                 const auto   occupancy = ggml_sycl_select_mxfp4_grouped_dpas_occupancy(
                     caps, grouped_counts_host.data(), grouped_counts_host.size(), row_limit);
                 bool                             chunked_row_limit = false;
                 std::vector<std::pair<int, int>> chunk_passes;
-                const bool                       sparse_xmx_batch =
-                    full_gpu_cover && (std::strcmp(occupancy.reason, "rows-per-expert") == 0 ||
-                                       std::strcmp(occupancy.reason, "occupancy") == 0);
+                const bool sparse_xmx_batch = std::strcmp(occupancy.reason, "rows-per-expert") == 0 ||
+                                              std::strcmp(occupancy.reason, "occupancy") == 0;
                 if (!occupancy.dispatch_ready && !sparse_xmx_batch) {
                     if (mxfp4_grouped_chunk_row_limit_enabled() &&
                         std::strcmp(occupancy.reason, "kernel-row-limit") == 0 && row_limit >= exec_n) {

@@ -9,6 +9,7 @@
 #include "zone-sizing.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -178,8 +179,134 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
         if (zone_is_dma_streamed(tensor, cardinality)) {
             maxima.dma_streamed = std::max(maxima.dma_streamed, tensor.size);
         }
+        // Not gated on a per-layer family or on the expert predicate: the adapter
+        // already said whether this is a dense MUL_MAT operand (non-zero).
+        maxima.mmq_src1_bytes_per_token = std::max(maxima.mmq_src1_bytes_per_token, tensor.mmq_src1_bytes_per_token);
+        maxima.dequant_f16_weight_bytes = std::max(maxima.dequant_f16_weight_bytes, tensor.dequant_f16_weight_bytes);
+        maxima.dequant_f16_src1_bytes_per_token =
+            std::max(maxima.dequant_f16_src1_bytes_per_token, tensor.dequant_f16_src1_bytes_per_token);
     }
     return maxima;
+}
+
+bool zone_mmq_src1_row_bytes(int64_t ne10, size_t * out) {
+    if (!out || ne10 <= 0) {
+        return false;
+    }
+    const int64_t pad    = k_zone_mmq_src1_row_padding;
+    const int64_t padded = ne10 > INT64_MAX - (pad - 1) ? 0 : (ne10 + pad - 1) / pad * pad;
+    if (padded <= 0) {
+        return false;
+    }
+    const size_t blocks = static_cast<size_t>(padded / k_zone_mmq_src1_block_elems);
+    if (blocks > SIZE_MAX / k_zone_mmq_src1_block_bytes) {
+        return false;
+    }
+    *out = blocks * k_zone_mmq_src1_block_bytes;
+    return true;
+}
+
+bool zone_mmq_src1_required_bytes(int64_t nrows, int64_t ne10, bool with_overflow_pad, size_t * out) {
+    size_t row = 0;
+    if (!out || nrows <= 0 || !zone_mmq_src1_row_bytes(ne10, &row)) {
+        return false;
+    }
+    if (static_cast<size_t>(nrows) > (SIZE_MAX - k_zone_mmq_src1_overflow_pad) / row) {
+        return false;
+    }
+    *out = static_cast<size_t>(nrows) * row + (with_overflow_pad ? k_zone_mmq_src1_overflow_pad : 0);
+    return true;
+}
+
+bool zone_mmq_src1_bytes_per_token(int64_t ne0, int64_t ne2, int64_t ne3, size_t * out) {
+    size_t row = 0;
+    if (!out || ne2 <= 0 || ne3 <= 0 || !zone_mmq_src1_row_bytes(ne0, &row)) {
+        return false;
+    }
+    const size_t batch = static_cast<size_t>(ne2);
+    if (batch > SIZE_MAX / row || static_cast<size_t>(ne3) > SIZE_MAX / (row * batch)) {
+        return false;
+    }
+    *out = row * batch * static_cast<size_t>(ne3);
+    return true;
+}
+
+bool zone_mmq_src1_scratch_bytes(size_t bytes_per_token, uint32_t n_ubatch, size_t * out) {
+    if (!out) {
+        return false;
+    }
+    if (bytes_per_token == 0 || n_ubatch == 0) {
+        *out = 0;
+        return true;
+    }
+    const size_t slack = k_zone_mmq_src1_overflow_pad + (k_zone_mmq_src1_align - 1);
+    if (bytes_per_token > (SIZE_MAX - slack) / n_ubatch) {
+        return false;
+    }
+    const size_t raw = bytes_per_token * n_ubatch + k_zone_mmq_src1_overflow_pad;
+    *out             = (raw + k_zone_mmq_src1_align - 1) / k_zone_mmq_src1_align * k_zone_mmq_src1_align;
+    return true;
+}
+
+bool zone_dequant_f16_weight_bytes(int64_t ne0, int64_t ne1, size_t * out) {
+    if (!out || ne0 <= 0 || ne1 <= 0) {
+        return false;
+    }
+    const size_t cols = static_cast<size_t>(ne0);
+    const size_t rows = static_cast<size_t>(ne1);
+    if (cols > SIZE_MAX / rows || cols * rows > SIZE_MAX / k_zone_dequant_f16_elem_bytes) {
+        return false;
+    }
+    *out = cols * rows * k_zone_dequant_f16_elem_bytes;
+    return true;
+}
+
+bool zone_dequant_f16_src1_bytes_per_token(int64_t ne0, int64_t ne2, int64_t ne3, size_t * out) {
+    if (!out || ne0 <= 0 || ne2 <= 0 || ne3 <= 0) {
+        return false;
+    }
+    const size_t row   = static_cast<size_t>(ne0);
+    const size_t batch = static_cast<size_t>(ne2);
+    if (row > SIZE_MAX / batch || row * batch > SIZE_MAX / static_cast<size_t>(ne3) ||
+        row * batch * static_cast<size_t>(ne3) > SIZE_MAX / k_zone_dequant_f16_elem_bytes) {
+        return false;
+    }
+    *out = row * batch * static_cast<size_t>(ne3) * k_zone_dequant_f16_elem_bytes;
+    return true;
+}
+
+bool zone_dequant_f16_region_bytes(int64_t elems, size_t * out) {
+    if (!out || elems < 0) {
+        return false;
+    }
+    const size_t n = static_cast<size_t>(elems);
+    if (n > (SIZE_MAX - (k_zone_dequant_f16_align - 1)) / k_zone_dequant_f16_elem_bytes) {
+        return false;
+    }
+    const size_t raw = n * k_zone_dequant_f16_elem_bytes;
+    *out             = (raw + k_zone_dequant_f16_align - 1) / k_zone_dequant_f16_align * k_zone_dequant_f16_align;
+    return true;
+}
+
+bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
+                                 size_t   src1_bytes_per_token,
+                                 uint32_t n_ubatch,
+                                 size_t * src0_bytes,
+                                 size_t * src1_bytes) {
+    if (!src0_bytes || !src1_bytes) {
+        return false;
+    }
+    const size_t align = k_zone_dequant_f16_align;
+    if (max_weight_bytes > SIZE_MAX - (align - 1)) {
+        return false;
+    }
+    if (src1_bytes_per_token != 0 && n_ubatch != 0 && src1_bytes_per_token > (SIZE_MAX - (align - 1)) / n_ubatch) {
+        return false;
+    }
+    const size_t acts_raw = src1_bytes_per_token * n_ubatch;
+    *src0_bytes           = (max_weight_bytes + align - 1) / align * align;
+    *src1_bytes           = (acts_raw + align - 1) / align * align;
+    return true;
 }
 
 namespace {
@@ -257,6 +384,15 @@ void zone_sizing_record_observation(const char * path) {
     underestimate_state &       state = underestimates();
     std::lock_guard<std::mutex> lock(state.mutex);
     state.table[path_key(path)].observations += 1;
+}
+
+void zone_sizing_record_observations(const char * path, size_t count) {
+    if (count == 0) {
+        return;
+    }
+    underestimate_state &       state = underestimates();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.table[path_key(path)].observations += count;
 }
 
 size_t zone_sizing_observation_count(const char * path) {

@@ -136,7 +136,10 @@ struct retained_store_lock {
 struct graph_recording_sink_state {
     std::vector<mem_handle> * sink     = nullptr;
     uint64_t                  epoch_id = 0;
+    uint64_t                  token    = 0;  // process-unique per attachment; 0 while detached
 };
+
+std::atomic<uint64_t>                   g_graph_retention_token_counter{ 0 };
 thread_local graph_recording_sink_state g_graph_recording_sink;
 // Compatibility alias used only inside this translation unit; epoch identity is
 // always checked by terminal_retention_ticket before publication.
@@ -2617,7 +2620,13 @@ void set_graph_retained_handle_sink(std::vector<mem_handle> * sink) {
     // ticket into that new graph lifetime.
     ++g_graph_recording_sink.epoch_id;
     if (g_graph_recording_sink.epoch_id == 0) ++g_graph_recording_sink.epoch_id;
+    g_graph_recording_sink.token =
+        sink ? g_graph_retention_token_counter.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
     g_graph_retained_handle_sink = sink;
+}
+
+uint64_t graph_retention_token() {
+    return g_graph_recording_sink.token;
 }
 
 }  // namespace ggml_sycl
