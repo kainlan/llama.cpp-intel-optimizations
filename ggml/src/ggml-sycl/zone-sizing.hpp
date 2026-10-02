@@ -325,12 +325,30 @@ bool zone_hold_spill_realized_fits(size_t free_after, size_t headroom_target, si
 // request term is a heuristic (it is what a previous rung asked), a lower bound before any rung has reserved.
 size_t zone_hold_spill_bound(size_t plan, size_t request_hwm, uint32_t hwm_n_ubatch, uint32_t n_ubatch);
 
-// The part of a worst-case spill (zone_hold_spill_bound) that lands OUTSIDE the arena. A compute buffer the RUNTIME
-// zone will not serve is placed in the arena's KV zone first (zone_runtime_spill_prefers_kv_zone), so only what the
-// KV zone cannot take is raw device memory, the thing that eats the driver headroom. `kv_zone_free` is the KV
-// zone's free bytes now; it is an estimate (other buffers may take it before the spill does), which is why the
-// realized check stays the backstop.
+// An ESTIMATE of the part of a worst-case spill (zone_hold_spill_bound) that lands OUTSIDE the arena. A compute
+// buffer the RUNTIME zone will not serve is placed in the arena's KV zone first
+// (zone_runtime_spill_prefers_kv_zone), so only what the KV zone cannot take is raw device memory, the thing that
+// eats the driver headroom. `kv_zone_free` is what a compute buffer can count on in that zone NOW
+// (zone_kv_room_for_compute: its largest free block, net of the KV this context has yet to place). It is an
+// estimate in three ways: other buffers may take that room before the spill does, a spill is several buffers and the
+// room is one block, and the spill figure it is subtracted from is itself a heuristic. The realized check, which
+// counts the RAW spills a rung actually made, is the backstop; this is the transaction-time prediction only.
 size_t zone_hold_spill_raw_demand(size_t spill_bound, size_t kv_zone_free);
+
+// The KV-zone room a compute buffer can count on. The runtime-context transaction publishes BEFORE this context's KV
+// cache exists (a pinned -ub, the first rung), so the zone still shows free the bytes its own KV is about to take:
+// `kv_pending_bytes`, the KV this transaction's plan places that is not live yet, is not room. A buffer is
+// indivisible, so the room is a block, `kv_largest_free`, never the sum of the zone's free bytes. Clamped at 0;
+// KV already live (the recheck, a settle) passes 0 pending.
+size_t zone_kv_room_for_compute(size_t kv_largest_free, size_t kv_pending_bytes);
+
+// The largest n_ubatch a rung's raw (outside-arena) spill allows. The spill scales about linearly with n_ubatch, so
+// when `spill_bytes` made at `n_ubatch` left `free_after` against `headroom_target` and the hold is to blame
+// (zone_hold_spill_realized_fits refuses), the largest -ub is the share of the spill the card could have taken:
+// n_ubatch * (free_after + spill_bytes - headroom_target) / spill_bytes, rounded down to a multiple of 32. A rung
+// that fits is returned unchanged; 0 means no -ub is known to fit (not even no spill at all clears the headroom),
+// or n_ubatch is unknown. An ESTIMATE: the scaling is the same linear one the bound uses.
+uint32_t zone_hold_spill_largest_ub(uint32_t n_ubatch, size_t spill_bytes, size_t free_after, size_t headroom_target);
 
 // Whether a RUNTIME-zone request goes to the KV zone instead of the zone / raw device memory: only a request the
 // caller marked as a compute buffer (`compute_spill_flag`), spill-capable (not `forbid_spill`), that the RUNTIME zone

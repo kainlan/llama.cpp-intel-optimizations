@@ -407,6 +407,27 @@ size_t zone_hold_spill_raw_demand(size_t spill_bound, size_t kv_zone_free) {
     return spill_bound > kv_zone_free ? spill_bound - kv_zone_free : 0;
 }
 
+size_t zone_kv_room_for_compute(size_t kv_largest_free, size_t kv_pending_bytes) {
+    return kv_pending_bytes >= kv_largest_free ? 0 : kv_largest_free - kv_pending_bytes;
+}
+
+uint32_t zone_hold_spill_largest_ub(uint32_t n_ubatch, size_t spill_bytes, size_t free_after, size_t headroom_target) {
+    if (n_ubatch == 0) {
+        return 0;
+    }
+    if (zone_hold_spill_realized_fits(free_after, headroom_target, spill_bytes)) {
+        return n_ubatch;
+    }
+    // Here spill_bytes > 0 and the card would have been above the headroom without the spill: the share of the spill
+    // it could have taken is what was free before it, less the headroom.
+    const size_t free_before = spill_bytes > SIZE_MAX - free_after ? SIZE_MAX : free_after + spill_bytes;
+    const size_t allowed     = free_before > headroom_target ? free_before - headroom_target : 0;
+    const double scaled =
+        static_cast<double>(n_ubatch) * static_cast<double>(allowed) / static_cast<double>(spill_bytes);
+    const uint32_t ub = scaled >= static_cast<double>(n_ubatch) ? n_ubatch : static_cast<uint32_t>(scaled);
+    return ub - ub % 32;
+}
+
 bool zone_runtime_spill_prefers_kv_zone(bool   compute_spill_flag,
                                         bool   runtime_zone,
                                         bool   forbid_spill,

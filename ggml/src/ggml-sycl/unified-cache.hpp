@@ -1717,16 +1717,22 @@ void         unified_cache_note_planned_hold_spill(int          device_id,
 struct planned_hold_spill_totals {
     uint64_t raw_count   = 0;  // outside the arena
     size_t   raw_bytes   = 0;
-    uint64_t arena_count = 0;  // in the arena's KV zone
+    uint64_t arena_count     = 0;  // in the arena's KV zone, kept out of the RUNTIME zone by the hold
     size_t   arena_bytes = 0;
+    uint64_t zone_full_count = 0;  // in the arena's KV zone because the RUNTIME zone was simply full
+    size_t   zone_full_bytes = 0;
 };
 
 void         unified_cache_take_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out);
-// A publish starts a new epoch for the owner at `n_ubatch`: the hold spills and the largest request seen since the
-// previous publish are forgotten (teardown's counters are not). The runtime-context transaction calls this when it publishes,
-// so what the get below reports is what THIS plan's own reserve did: a losing auto-ubatch rung's spills do not
-// decide the next rung. A call by anyone but the hold's owner changes nothing.
+// A publish starts a new epoch for the owner at `n_ubatch`: the spill counters and the largest request seen since the
+// previous publish are forgotten (the once-only WARN latches are not). The runtime-context transaction calls this when
+// it publishes, so what the get below reports is what THIS plan's own reserves did (a losing auto-ubatch rung's
+// spills do not decide the next rung), and the totals the owner's teardown take reports are the finished context's
+// own. A call by anyone but the hold's owner changes nothing.
 void         unified_cache_begin_planned_hold_epoch(int device_id, uint64_t owner, uint32_t n_ubatch);
+// A compute buffer the RUNTIME zone did not serve for want of room (not because the hold kept it out) and the KV zone
+// took instead of raw device memory: counted, and warned about once per context.
+void unified_cache_note_zone_full_kv_placement(int device_id, const char * tag, size_t bytes, size_t runtime_free);
 void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out);
 
 void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);

@@ -17228,8 +17228,9 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
 // ascending ladder otherwise under-estimates every rung by the rung ratio). It is still a HEURISTIC in r_max: it is
 // what a previous rung asked, and a lower bound (the plan alone) before any rung has reserved. The exact figure is
 // the realized check, which runs once a rung's buffers exist (ggml_backend_sycl_planned_hold_spill_fits). One source:
-// the transaction and the recheck both call this.
-static size_t ggml_sycl_planned_scratch_hold_spill_bound(int device, uint32_t n_ubatch) {
+// the transaction and the recheck both call this. The KV-room netting that turns this bound into raw demand is an
+// ESTIMATE as well (see zone_hold_spill_raw_demand); neither figure is a measurement.
+static size_t ggml_sycl_planned_scratch_hold_spill_bound(int device, uint32_t n_ubatch, size_t kv_pending_bytes) {
     size_t plan = 0;
     if (n_ubatch == 0 || !ggml_sycl::unified_cache_planned_dense_scratch_bytes_at(device, n_ubatch, &plan) ||
         plan == 0) {
@@ -17240,11 +17241,16 @@ static size_t ggml_sycl_planned_scratch_hold_spill_bound(int device, uint32_t n_
     ggml_sycl::unified_cache_get_runtime_request_hwm(device, &r_max, &r_max_ub);
     const size_t               bound = ggml_sycl::zone_hold_spill_bound(plan, r_max, r_max_ub, n_ubatch);
     // A compute buffer the RUNTIME zone will not serve is placed in the arena's KV zone first, so only what that
-    // zone cannot take is outside-arena demand. Its free bytes now are an estimate (other buffers may take them
-    // first); the realized check, which counts the RAW spills a rung actually made, is the backstop.
+    // zone cannot take is outside-arena demand. The room it can count on is the zone's LARGEST FREE BLOCK (a buffer
+    // is indivisible), net of the KV this transaction's plan is about to place there (`kv_pending_bytes`; the
+    // transaction publishes before a first context's KV exists, so the zone still shows those bytes free). Both are
+    // an ESTIMATE of what the spill will find (other buffers may take the room first); the realized check, which
+    // counts the RAW spills a rung actually made, is the backstop.
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
-    const size_t kv_free = cache && cache->arena_active() ? cache->zone_available(ggml_sycl::vram_zone_id::KV) : 0;
-    return ggml_sycl::zone_hold_spill_raw_demand(bound, kv_free);
+    const size_t               kv_largest =
+        cache && cache->arena_active() ? cache->zone_largest_free(ggml_sycl::vram_zone_id::KV) : 0;
+    return ggml_sycl::zone_hold_spill_raw_demand(bound,
+                                                 ggml_sycl::zone_kv_room_for_compute(kv_largest, kv_pending_bytes));
 }
 
 // llama.cpp-kpjw: the driver headroom the arena expects the card to keep OUTSIDE it (and that the graph-entry check
@@ -17280,8 +17286,9 @@ static bool ggml_sycl_check_hold_spill_headroom(int device, size_t spill_bytes, 
         probe_mode,
         "[SYCL-PLAN] runtime context update rejected: the planned dense scratch holds back the RUNTIME zone and "
         "its worst-case spill outside the arena (%.1f MB: the plan plus the largest compute-buffer request, scaled "
-        "to this n_ubatch) would leave device %d %.1f MB free of %.1f MB, under the %.1f MB driver headroom the "
-        "arena expects; free VRAM on this card (another process, or a smaller -ub / -c) before loading\n",
+        "to this n_ubatch, net of the KV-zone room a compute buffer can use) would leave device %d %.1f MB free of "
+        "%.1f MB, under the %.1f MB driver headroom the arena expects; free VRAM on this card (another process, or "
+        "a smaller -ub / -c) before loading\n",
         spill_bytes / mb, device, free_mem / mb, free_mem / mb, kSyclArenaMinExternalHeadroomBytes / mb);
     return false;
 }
@@ -17296,7 +17303,11 @@ static bool ggml_sycl_check_hold_spill_headroom(int device, size_t spill_bytes, 
 // graph (B50, Qwen PPL at auto-ub1024: a 461 MB buffer held back, 107.8 MB left, flash attention out of
 // resources), so the rung does not fit and the ladder lands on a smaller one. Only a spill that CROSSED the
 // headroom is blamed on the hold (zone_hold_spill_realized_fits); with no hold-induced spill nothing is asked.
-static bool ggml_sycl_check_hold_spill_realized(int device, uint64_t owner, bool probe_mode) {
+static bool ggml_sycl_check_hold_spill_realized(int        device,
+                                                uint64_t   owner,
+                                                bool       probe_mode,
+                                                uint32_t   n_ubatch,
+                                                uint32_t * largest_ub) {
     // Only the RAW spills (outside the arena) eat the driver headroom; a buffer placed in the arena's KV zone does
     // not, and is not counted here.
     ggml_sycl::planned_hold_spill_totals spill_totals;
@@ -17311,6 +17322,12 @@ static bool ggml_sycl_check_hold_spill_realized(int device, uint64_t owner, bool
     if (total_mem == 0 ||
         ggml_sycl::zone_hold_spill_realized_fits(free_mem, kSyclArenaMinExternalHeadroomBytes, spill_bytes)) {
         return true;
+    }
+    // The largest -ub whose raw spill the card could have taken (the spill scales about linearly with n_ubatch): what
+    // a refusal tells the user to pass instead. One device's answer; the caller takes the smallest over its devices.
+    if (largest_ub) {
+        *largest_ub =
+            ggml_sycl::zone_hold_spill_largest_ub(n_ubatch, spill_bytes, free_mem, kSyclArenaMinExternalHeadroomBytes);
     }
     const double mb = 1024.0 * 1024.0;
     GGML_SYCL_RUNTIME_TXN_REFUSAL(
@@ -17328,12 +17345,16 @@ static bool ggml_sycl_check_hold_spill_realized(int device, uint64_t owner, bool
 // context has no hold-induced spill that pushed the card under the driver headroom. The trial calls it after the
 // rung's sched_reserve() returned. A refusal is logged by name (at INFO: the loss is recoverable, the ladder lands
 // lower). Not a lifecycle transaction: it reads state and the live free memory and changes nothing.
-bool ggml_backend_sycl_planned_hold_spill_fits(ggml_backend_t backend) {
+bool ggml_backend_sycl_planned_hold_spill_fits(ggml_backend_t backend, uint32_t n_ubatch, uint32_t * largest_ub) {
+    if (largest_ub) {
+        *largest_ub = 0;
+    }
     if (!backend || !backend->context || !ggml_backend_is_sycl(backend)) {
         return true;
     }
     auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
-    return ggml_sycl_check_hold_spill_realized(ctx->device, ctx->planned_scratch_owner, /*probe_mode=*/true);
+    return ggml_sycl_check_hold_spill_realized(ctx->device, ctx->planned_scratch_owner, /*probe_mode=*/true, n_ubatch,
+                                               largest_ub);
 }
 
 static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
@@ -18736,7 +18757,14 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // answer for a probe, just without the zone-growth side effect.
     // llama.cpp-kpjw: the worst-case outside-arena spill the hold can cause at the n_ubatch this transaction is about
     // to publish; the check below counts it (with the non-FA scratch when flash attention is off).
-    const size_t hold_spill_bytes = ggml_sycl_planned_scratch_hold_spill_bound(ctx->device, next_kv_info.n_ubatch);
+    // The KV this transaction's plan adds on the device and that is not live yet (none of it for a first context, whose
+    // KV cache is created after this publish; only the growth for one that already holds KV): the zone still shows
+    // those bytes free, and they are not room for a compute buffer.
+    const size_t kv_with_slack = ggml_sycl_device_kv_bytes_with_slack(next_plan, ctx->device);
+    const size_t kv_admitted   = admitted_kv ? ggml_sycl_device_kv_bytes_with_slack(*admitted_kv, ctx->device) : 0;
+    const size_t kv_pending    = kv_with_slack > kv_admitted ? kv_with_slack - kv_admitted : 0;
+    const size_t hold_spill_bytes =
+        ggml_sycl_planned_scratch_hold_spill_bound(ctx->device, next_kv_info.n_ubatch, kv_pending);
     if (!ggml_sycl_check_nonfa_attn_scratch(ctx->device, n_ctx, next_kv_info.n_ubatch, next_plan.planner_n_head_all_max,
                                             flash_attn_enabled,
                                             /*allow_replan=*/!probe_mode, probe_mode, hold_spill_bytes)) {
@@ -19412,7 +19440,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
         ctx->device, current->plan->planner_n_ctx, current->plan->planner_n_ubatch,
         current->plan->planner_n_head_all_max, flash_attn_enabled,
         /*allow_replan=*/false, /*probe_mode=*/false,
-        ggml_sycl_planned_scratch_hold_spill_bound(ctx->device, current->plan->planner_n_ubatch));
+        // The recheck runs inside sched_reserve(), after this context's KV exists: none of it is pending.
+        ggml_sycl_planned_scratch_hold_spill_bound(ctx->device, current->plan->planner_n_ubatch, 0));
     // llama.cpp-kpjw: the exact hold spill is NOT checked here. This recheck runs inside sched_reserve() after a
     // 1-token flash-attention probe reserve and before the worst-case pp/tg reserves that make the large compute
     // buffers (and only for the first rung under auto_fa); the auto-ubatch trial asks
@@ -38012,6 +38041,8 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
         auto * cache = ggml_sycl::get_unified_cache_for_device(buft_ctx->device);
         if (cache && cache->arena_active()) {
             const bool should_use_runtime = !is_kv_buft && effective_mem_type == GGML_SYCL_MEM_DEVICE;
+            // llama.cpp-kpjw: true for a scheduler compute buffer (see the flag below), false while a model loads.
+            const bool kv_zone_first      = !g_sycl_in_model_load.load(std::memory_order_acquire);
             if (should_use_runtime) {
                 // Route through RUNTIME zone.  A miss must not reset the zone
                 // here: backend buffers can be allocated during graph reserve
@@ -38031,7 +38062,10 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 runtime_req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;
                 // llama.cpp-kpjw: a compute buffer the RUNTIME zone will not serve goes to the arena's KV zone
                 // before raw device memory outside the arena (see alloc_constraints::spill_to_kv_zone_before_raw).
-                runtime_req.intent.constraints.spill_to_kv_zone_before_raw = true;
+                // Only a scheduler compute buffer gets it. This buffer type also backs the model's WEIGHT tensors,
+                // and those are allocated during the model load, before any KV cache exists: one sent to the KV zone
+                // would take room this context's KV is about to be placed in. The load is the discriminator.
+                runtime_req.intent.constraints.spill_to_kv_zone_before_raw = kv_zone_first;
                 ggml_sycl::alloc_handle runtime_h{};
                 ggml_sycl::unified_alloc(runtime_req, &runtime_h);
                 if (runtime_h.ptr) {
@@ -38055,7 +38089,15 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 // the fixed-size RUNTIME zone.  Compute buffers persist for the
                 // context lifetime (allocated during graph_reserve), so they
                 // won't fragment or leak between inference steps.
-                if (alloc_role == ggml_sycl::alloc_role::COMPUTE || should_use_runtime) {
+                // llama.cpp-kpjw: NOT for the flagged class (a scheduler compute buffer, kv_zone_first). unified_alloc
+                // has already tried the KV zone for it, with the zone-full and hold-induced cases counted, so a KV
+                // request here would repeat an attempt that just failed; and the SCRATCH step below must stay
+                // unreachable for it, because a compute buffer in the SCRATCH zone is exactly what the graph-entry
+                // headroom check (ggml_sycl_check_graph_scratch_headroom) aborts on. A flagged buffer that nothing
+                // above could place falls through to the legacy allocation path, whose host-pinned retry is the
+                // ladder's "compute buffer fell back to host" signal. These two steps serve the unflagged class (a
+                // model load) exactly as before.
+                if (!kv_zone_first && (alloc_role == ggml_sycl::alloc_role::COMPUTE || should_use_runtime)) {
                     ggml_sycl::alloc_request kv_req{};
                     kv_req.queue                               = buft_ctx->stream;
                     kv_req.device                              = buft_ctx->device;
@@ -44363,14 +44405,17 @@ void ggml_backend_sycl_context::log_planned_scratch_stats() {
         // so the planned scratch could still be materialized). Taken here, so the count is per context.
         ggml_sycl::planned_hold_spill_totals hold_spills;
         ggml_sycl::unified_cache_take_planned_hold_spills(dev, planned_scratch_owner, &hold_spills);
-        if (hold_spills.raw_count != 0 || hold_spills.arena_count != 0) {
-            // Split by where the buffer landed: RAW is outside the arena (eats the driver headroom), KV zone is
-            // inside it.
+        if (hold_spills.raw_count != 0 || hold_spills.arena_count != 0 || hold_spills.zone_full_count != 0) {
+            // Split by where the buffer landed: RAW is outside the arena (eats the driver headroom), the KV zone is
+            // inside it, either because the hold kept the buffer out of the RUNTIME zone (kv_zone) or because that zone
+            // was full (kv_zone_full). These are the finished context's own counts: a publish restarts them.
             GGML_LOG_WARN(
                 "[SCRATCH-STATS] device=%d hold_spills_raw=%llu hold_spills_raw_bytes=%.1f KB hold_spills_kv_zone=%llu "
-                "hold_spills_kv_zone_bytes=%.1f KB\n",
+                "hold_spills_kv_zone_bytes=%.1f KB hold_spills_kv_zone_full=%llu hold_spills_kv_zone_full_bytes=%.1f "
+                "KB\n",
                 dev, (unsigned long long) hold_spills.raw_count, hold_spills.raw_bytes / 1024.0,
-                (unsigned long long) hold_spills.arena_count, hold_spills.arena_bytes / 1024.0);
+                (unsigned long long) hold_spills.arena_count, hold_spills.arena_bytes / 1024.0,
+                (unsigned long long) hold_spills.zone_full_count, hold_spills.zone_full_bytes / 1024.0);
         }
     }
 }

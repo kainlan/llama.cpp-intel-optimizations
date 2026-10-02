@@ -406,6 +406,44 @@ static decltype(&ggml_backend_sycl_ubatch_cache_store_layout1) llama_context_syc
 }
 #endif
 
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+// llama.cpp-kpjw: the realized hold-spill check over every SYCL backend of a context, for a reserve that ran at
+// `n_ubatch` (see ggml_backend_sycl_planned_hold_spill_fits in ggml-sycl.h). False when ANY backend's compute buffers
+// the planned dense scratch kept out of the RUNTIME zone spilled outside the arena and left its card under the driver
+// headroom; `*largest_ub` is then the smallest -ub the refusing backends say still fits (0: none known to). A SYCL
+// DSO that predates the entry exports nothing and is skipped, never dereferenced.
+static bool llama_context_sycl_hold_spill_fits(const std::vector<ggml_backend_ptr> & backends,
+                                               uint32_t                              n_ubatch,
+                                               uint32_t *                            largest_ub) {
+    if (largest_ub) {
+        *largest_ub = 0;
+    }
+    bool fits = true;
+    for (auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (!llama_context_dev_is_sycl(dev)) {
+            continue;
+        }
+#    ifdef GGML_USE_SYCL
+        auto hold_spill_fn = &ggml_backend_sycl_planned_hold_spill_fits;
+#    else
+        auto hold_spill_fn = llama_context_sycl_hold_spill_proc(dev);
+        if (!hold_spill_fn) {
+            continue;
+        }
+#    endif
+        uint32_t backend_largest = 0;
+        if (!hold_spill_fn(backend.get(), n_ubatch, &backend_largest)) {
+            if (largest_ub) {
+                *largest_ub = fits ? backend_largest : std::min(*largest_ub, backend_largest);
+            }
+            fits = false;
+        }
+    }
+    return fits;
+}
+#endif
+
 // llama.cpp-38af: the compute-buffer buft for the CPU backend when the first
 // device is a SYCL device. It is the generic host buft's pinned memory under a
 // distinct identity that the SYCL backend never reports as supported, so
@@ -1120,6 +1158,29 @@ llama_context::llama_context(
             sched_reserve();
         }
 
+        // llama.cpp-kpjw: the realized hold-spill check, for the reserve that is final whichever way it was made. The
+        // ladder asks it per rung (try_candidate); a pinned -ub, or a ladder that never ran, reserves once with nobody
+        // asking, and a compute buffer the planned dense scratch's hold kept out of the RUNTIME zone that then lives
+        // outside the arena can leave the card under the driver headroom the arena expects (B50, Qwen, -ub 1024: a
+        // 461 MB buffer, flash attention out of resources at the first graph and a hang). Refuse the context here,
+        // by name, with the -ub that fits, instead.
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        if (llama_context_has_sycl_backend(backends)) {
+            uint32_t largest_ub = 0;
+            if (!llama_context_sycl_hold_spill_fits(backends, cparams.n_ubatch, &largest_ub)) {
+                throw std::runtime_error(format(
+                    "compute buffers held out of the SYCL RUNTIME zone for the planned dense scratch spilled outside "
+                    "the VRAM arena and left a card under the driver headroom the arena expects (n_ubatch=%u); %s",
+                    cparams.n_ubatch,
+                    largest_ub != 0 ?
+                        format("the largest -ub that fits is about %u (or free VRAM on the card, or pass a smaller -c)",
+                               largest_ub)
+                            .c_str() :
+                        "no -ub is known to fit: free VRAM on the card, or pass a smaller -c"));
+            }
+        }
+#endif
+
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
@@ -1590,6 +1651,24 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // after a losing call, since the probe stage can already have set it
     // via the publish before the host-fallback stage fails.
     auto try_candidate = [&](uint32_t c) -> const char * {
+        // llama.cpp-kpjw: release the previous rung's compute buffers BEFORE this rung's transaction. They are still
+        // alive here (sched_reserve() only replaces them when the next rung reserves), and the ones a rung placed in
+        // the arena's KV zone sit in exactly the room the transaction measures its KV headroom against
+        // (ggml_sycl_kv_capacity_live reads the zone's free bytes), so a rung that already lost, or a smaller winner,
+        // would depress the next, larger rung's KV capacity and refuse it for room it is about to be given back. The
+        // settle step re-reserves last_good whenever this rung does not end up the winner (sched_matches_last_good is
+        // false from here until this rung's own reserve succeeds), which costs one extra reserve when a rung loses at
+        // its probe and nothing otherwise: a rung that reserves replaces the sched anyway.
+        synchronize();
+        for (auto & res : gf_res_prev) {
+            res.reset();
+        }
+        gf_res_reserve.reset();
+        gf_res_prev_active = nullptr;
+        sched.reset();
+        sched_need_reserve      = true;
+        sched_matches_last_good = false;
+
         for (auto & sb : sycl_backends) {
             ggml_sycl_runtime_context_probe probe{};
             // llama.cpp-3aos: cparams.kv_unified -- the probe
@@ -1719,7 +1798,12 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
         // ladder lands lower. The recheck inside sched_reserve() cannot do this: it runs after a 1-token probe
         // reserve, before the worst-case reserves, and only for the first rung under auto_fa.
         for (auto & sb : sycl_backends) {
-            if (hold_spill_fn && !hold_spill_fn(sb.backend)) {
+            uint32_t rung_largest_ub = 0;
+            if (hold_spill_fn && !hold_spill_fn(sb.backend, c, &rung_largest_ub)) {
+                LLAMA_LOG_INFO(
+                    "[SYCL-PLAN] auto n_ubatch candidate %u: hold spill left no headroom (the largest -ub that fits is "
+                    "about %u)\n",
+                    c, rung_largest_ub);
                 cparams.pipeline_parallel = pipeline_parallel_before_reserve;
                 sched_matches_last_good   = false;
                 return "hold spill left no headroom";

@@ -509,8 +509,10 @@ def evaluate(backend, common, cache, zone):
         "unified_cache_note_planned_hold_spill(" in unified_alloc_fn and "GGML_LOG_WARN" in note_spill_fn and \
         "state.spill_count++" in note_spill_fn
     results["the warning is once per device per context (the take resets the count)"] = \
-        re.search(r"first\s*=\s*state\.spill_count\s*==\s*0", note_spill_fn) is not None and \
-        re.search(r"state\.spill_count\s*=\s*0\s*;", take_spill_fn) is not None
+        re.search(r"first\s*=\s*!\s*state\.warned_raw", note_spill_fn) is not None and \
+        re.search(r"first\s*=\s*!\s*state\.warned_arena", note_spill_fn) is not None and \
+        re.search(r"state\.spill_count\s*=\s*0\s*;", take_spill_fn) is not None and \
+        re.search(r"state\.warned_raw\s*=\s*false\s*;", take_spill_fn) is not None
     results["the warning names the requester and the bytes"] = \
         "tag" in note_spill_fn and re.search(r"GGML_LOG_WARN\([^;]*%\.1f MB", note_spill_fn) is not None
     results["teardown reports the hold spills with the scratch stats"] = \
@@ -700,14 +702,15 @@ def evaluate(backend, common, cache, zone):
         len(re.findall(r"!\s*kv_placed", ua)) >= 2 and "kv_placed" in ua
     kv_flag_site = backend.find('"backend-buffer-runtime-zone"')
     results["the runtime buffer allocator asks for the KV-zone-first placement"] = \
-        kv_flag_site > 0 and "spill_to_kv_zone_before_raw = true" in backend[kv_flag_site:kv_flag_site + 900]
+        kv_flag_site > 0 and "spill_to_kv_zone_before_raw = kv_zone_first" in backend[kv_flag_site:kv_flag_site + 1400]
     results["the hold-spill counters are split by where the buffer landed (raw outside the arena, KV zone)"] = \
         "in_arena" in note_spill_fn and "spill_arena_bytes" in cache and \
         "hold_spills_raw=" in stats_fn and "hold_spills_kv_zone=" in stats_fn
     results["the realized check counts only the raw outside-arena portion"] = \
-        "raw_bytes" in realized_fn and "arena_bytes" not in realized_fn
+        "raw_bytes" in realized_fn and "arena_bytes" not in realized_fn and "arena_count" not in realized_fn and \
+        "zone_full" not in realized_fn
     results["the transaction-time bound is the part of the worst-case spill the KV zone cannot take"] = \
-        "zone_hold_spill_raw_demand(" in bound_fn and "zone_available(ggml_sycl::vram_zone_id::KV)" in bound_fn
+        "zone_hold_spill_raw_demand(" in bound_fn and "zone_largest_free(ggml_sycl::vram_zone_id::KV)" in bound_fn
 
     # ---- review r4 ---------------------------------------------------------------------------------------------
     # I3: the KV pre-placement block, window by window. A block-wide "contains" check is how mutants that change what
@@ -720,6 +723,10 @@ def evaluate(backend, common, cache, zone):
         "spill_to_kv_zone_before_raw" in kvb and \
         re.search(r"prefer_vram_zone\s*==\s*vram_zone_id::RUNTIME", kvb) is not None and \
         re.search(r"kv_cache\s*&&\s*kv_cache->arena_active\(\)", kvb) is not None
+    results["the KV pre-placement is told the request's forbid-spill flag"] = \
+        re.search(r"zone_runtime_spill_prefers_kv_zone\(\s*true\s*,\s*true\s*,\s*req\.intent\.constraints\.forbid_vram_zone_spill\s*,", kvb) is not None
+    results["the KV-zone-first flag is set by exactly one request, the scheduler compute buffer's"] = \
+        len(re.findall(r"spill_to_kv_zone_before_raw", backend)) == 1
     results["the KV pre-placement reads the zone-full arm as well as the hold"] = \
         re.search(r"hold_spill\s*\|\|\s*kv_cache->zone_available\(\s*vram_zone_id::RUNTIME\s*\)\s*<\s*alloc_size", kvb) is not None
     results["the KV pre-placement publishes through the KV zone (record, allocation, metadata)"] = \
@@ -739,11 +746,11 @@ def evaluate(backend, common, cache, zone):
     results["anchor: the zone-full KV placement note exists"] = zone_full_fn != ""
     results["the zone-full KV placement has its own counter and a once-only WARN, separate from the hold spills"] = \
         "zone_full_count++" in zone_full_fn and "GGML_LOG_WARN" in zone_full_fn and "warned_zone_full" in zone_full_fn and \
-        "spill_count" not in zone_full_fn and "spill_arena_count" not in zone_full_fn
+        "spill_count++" not in zone_full_fn and "spill_arena_count++" not in zone_full_fn
     results["the landing-site counters stay separate (the KV-zone counter is not the raw one)"] = \
         re.search(r"if\s*\(\s*in_arena\s*\)\s*\{[^{}]*spill_arena_count\+\+\s*;[^{}]*\}\s*else\s*\{[^{}]*spill_count\+\+\s*;", note_spill_fn) is not None
     results["a take hands every counter to the owner and clears every one"] = all(
-        re.search(rf"{f}\s*=\s*0\s*;", take_fn) is not None
+        re.search(rf"state\.{f}\s*=\s*(0|false)\s*;", take_fn) is not None
         for f in ("spill_count", "spill_bytes", "spill_arena_count", "spill_arena_bytes", "zone_full_count", "zone_full_bytes",
                   "spill_owner", "warned_raw", "warned_arena", "warned_zone_full"))
     results["the stats line is printed whatever landed, not only for raw spills"] = \
@@ -781,7 +788,8 @@ def evaluate(backend, common, cache, zone):
         "zone_kv_room_for_compute(" in bound_fn and "zone_largest_free(ggml_sycl::vram_zone_id::KV)" in bound_fn and \
         "zone_available(ggml_sycl::vram_zone_id::KV)" not in bound_fn and "cache->arena_active()" in bound_fn
     results["the transaction passes the KV bytes its plan adds; the recheck, which runs with KV live, passes none"] = \
-        re.search(r"const size_t\s+kv_pending\s*=[^;]*ggml_sycl_device_kv_bytes_with_slack\(\s*next_plan", txn) is not None and \
+        re.search(r"const size_t\s+kv_with_slack\s*=\s*ggml_sycl_device_kv_bytes_with_slack\(\s*next_plan", txn) is not None and \
+        re.search(r"const size_t\s+kv_pending\s*=[^;]*kv_with_slack[^;]*kv_admitted", txn) is not None and \
         re.search(r"ggml_sycl_planned_scratch_hold_spill_bound\([^;]*kv_pending\s*\)", txn) is not None and \
         re.search(r"ggml_sycl_planned_scratch_hold_spill_bound\([^;]*,\s*0\s*\)", recheck_fn) is not None
     results["the realized check names the largest -ub that fits, through the exported entry"] = \
@@ -1152,8 +1160,8 @@ if args.self_test:
          (backend, common, mutate_all_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
                                               "unified_cache_note_planned_hold_spill(", "unified_cache_XXXX(", 2), zone)),
         ("hold spill warned every time", "the warning is once per device per context (the take resets the count)",
-         (backend, common, mutate_in_func(cache, r"void unified_cache_note_planned_hold_spill\(",
-                                          "spill_count == 0;", "spill_count >= 0;"), zone)),
+         (backend, common, mutate_re_in_func(cache, r"void unified_cache_note_planned_hold_spill\(",
+                                             r"first\s*= !state\.warned_raw;", "first = true;"), zone)),
         ("take does not reset", "the warning is once per device per context (the take resets the count)",
          (backend, common, mutate_in_func(cache, r"void unified_cache_take_planned_hold_spills\(",
                                           "state.spill_count       = 0;", "state.spill_count       += 0;"), zone)),
@@ -1285,8 +1293,8 @@ if args.self_test:
          (backend, common, mutate_in_func(cache, r"void unified_cache_begin_planned_hold_epoch\(",
                                           "state.request_hwm          = 0;", "state.request_hwm          += 0;"), zone)),
         ("epoch keeps the spilled bytes", "a publish starts a new spill epoch (a losing rung's spills and mark do not carry to the next rung)",
-         (backend, common, mutate_in_func(cache, r"void unified_cache_begin_planned_hold_epoch\(",
-                                          "state.spill_bytes          = 0;", "state.spill_bytes          += 0;"), zone)),
+         (backend, common, mutate_re_in_func(cache, r"void unified_cache_begin_planned_hold_epoch\(",
+                                             r"state\.spill_bytes\s*= 0;", "state.spill_bytes += 0;"), zone)),
         ("graph-entry check keeps its own 256", "the driver headroom the realized check uses is the graph-entry check's constant (one source)",
          (mutate_in_func(backend, r"static void ggml_sycl_check_graph_scratch_headroom\(",
                          "= kSyclArenaMinExternalHeadroomBytes;", "= 256ull * 1024ull * 1024ull;"), common, cache, zone)),
@@ -1308,7 +1316,7 @@ if args.self_test:
         ("KV placement counted as raw", "a placement in the KV zone is skipped by the guard and the zone routing, and counts as an in-arena hold spill",
          (backend, common, mutate_after(cache, "bool kv_placed = false;", "true);", "false);"), zone)),
         ("buffer allocator does not ask for the KV zone", "the runtime buffer allocator asks for the KV-zone-first placement",
-         (mutate(backend, "spill_to_kv_zone_before_raw = true", "spill_to_kv_zone_before_raw = false"), common, cache, zone)),
+         (mutate(backend, "spill_to_kv_zone_before_raw = kv_zone_first", "spill_to_kv_zone_before_raw = false"), common, cache, zone)),
         ("stats do not split the landing site", "the hold-spill counters are split by where the buffer landed (raw outside the arena, KV zone)",
          (mutate_in_func(backend, r"void ggml_backend_sycl_context::log_planned_scratch_stats\(\)",
                          "hold_spills_kv_zone=", "hold_XXXX="), common, cache, zone)),
@@ -1316,8 +1324,8 @@ if args.self_test:
          (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_realized\(", "spill_totals.raw_bytes;",
                          "spill_totals.raw_bytes + spill_totals.arena_bytes;"), common, cache, zone)),
         ("bound ignores the KV room", "the transaction-time bound is the part of the worst-case spill the KV zone cannot take",
-         (mutate_in_func(backend, r"static size_t ggml_sycl_planned_scratch_hold_spill_bound\(", "zone_hold_spill_raw_demand(bound, kv_free)",
-                         "zone_hold_spill_XXXX(bound, kv_free)"), common, cache, zone)),
+         (mutate_in_func(backend, r"static size_t ggml_sycl_planned_scratch_hold_spill_bound\(", "zone_hold_spill_raw_demand(",
+                         "zone_hold_spill_XXXX("), common, cache, zone)),
         ("replan trusts stale inputs", "a rejected figure is flagged, so no plan is derived from the stale inputs",
          (backend, common, mutate_in_func(mutate_in_func(cache, r"bool unified_cache_replan_planned_dense_scratch\(",
                                                          "g_planned_dense_scratch_invalid", "g_planned_XXXX"),
@@ -1389,6 +1397,17 @@ if args.self_test:
         ("bound sums the KV zone", "the spill bound nets out the KV this transaction will place, against the KV zone's largest free block",
          (mutate_in_func(backend, r"static size_t ggml_sycl_planned_scratch_hold_spill_bound\(", "zone_largest_free(ggml_sycl::vram_zone_id::KV)", "zone_available(ggml_sycl::vram_zone_id::KV)"),
           common, cache, zone)),
+        ("KV pre-placement ignores forbid-spill", "the KV pre-placement is told the request's forbid-spill flag",
+         (backend, common, mutate_re_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)", r"true, true, req\.intent\.constraints\.forbid_vram_zone_spill,", "true, true, false,"), zone)),
+        ("realized check counts the KV-zone count", "the realized check counts only the raw outside-arena portion",
+         (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_realized\(", "spill_totals.raw_count;",
+                         "spill_totals.raw_count + spill_totals.arena_count;"), common, cache, zone)),
+        ("a second request carries the flag", "the KV-zone-first flag is set by exactly one request, the scheduler compute buffer's",
+         (mutate(backend, "kv_req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::KV;",
+                 "kv_req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::KV;\n"
+                 "                    kv_req.intent.constraints.spill_to_kv_zone_before_raw = true;"), common, cache, zone)),
+        ("bound reads the KV zone without the arena", "the spill bound nets out the KV this transaction will place, against the KV zone's largest free block",
+         (mutate_in_func(backend, r"static size_t ggml_sycl_planned_scratch_hold_spill_bound\(", "cache && cache->arena_active() ?", "cache ?"), common, cache, zone)),
         ("bound ignores the pending KV", "the spill bound nets out the KV this transaction will place, against the KV zone's largest free block",
          (mutate_in_func(backend, r"static size_t ggml_sycl_planned_scratch_hold_spill_bound\(", "zone_kv_room_for_compute(", "zone_XXXX("), common, cache, zone)),
         ("transaction passes no pending KV", "the transaction passes the KV bytes its plan adds; the recheck, which runs with KV live, passes none",
@@ -1411,7 +1430,7 @@ if args.self_test:
          (mutate_after(context_src, "auto try_candidate = [&](uint32_t c) -> const char * {", "sched_reserve();",
                        "(void) hold_spill_fn(nullptr); sched_reserve();"), header_src)),
         ("hook dropped", "the hold-spill check runs in try_candidate, after sched_reserve() and before the rung is accepted",
-         (context_src.replace("hold_spill_fn(", "hold_XXXX(", 1), header_src)),
+         (mutate_after(context_src, "auto try_candidate = [&](uint32_t c) -> const char * {", "hold_spill_fn(", "hold_XXXX("), header_src)),
         ("refusal keeps the rung", "a rung whose hold spill pushed the card under its headroom loses with its own stop reason",
          (context_src.replace("return \"hold spill left no headroom\";", "(void) 0;", 1), header_src)),
         ("no DL resolution", "the hook is resolved for a direct build and for a backend-DL build",

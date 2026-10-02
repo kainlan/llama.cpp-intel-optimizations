@@ -481,8 +481,14 @@ GGML_BACKEND_API uint64_t ggml_backend_sycl_compute_buffer_host_fallbacks(int de
 // device under the driver headroom the arena expects outside itself (a rung that would exhaust the card at its first
 // graph). True when the hold spilled nothing, for a null/foreign backend, and on a card that was short anyway. The
 // auto-ubatch trial (llama_context::sycl_select_auto_ubatch) calls it after a candidate's sched_reserve() returned,
-// when every buffer of the rung exists. Reads state and the live free memory; changes nothing.
-GGML_BACKEND_API bool ggml_backend_sycl_planned_hold_spill_fits(ggml_backend_t backend);
+// when every buffer of the rung exists, and the context constructor calls it after ITS reserve when no ladder made it
+// (a pinned -ub). `n_ubatch` is the shape the reserve ran at. When it returns false and `largest_ub` is non-null,
+// `*largest_ub` is the largest n_ubatch whose raw spill the card could have taken (an estimate: the spill scales
+// about linearly with n_ubatch), or 0 when none is known to fit; it is 0 whenever this returns true. Reads state and
+// the live free memory; changes nothing.
+GGML_BACKEND_API bool ggml_backend_sycl_planned_hold_spill_fits(ggml_backend_t backend,
+                                                                uint32_t       n_ubatch,
+                                                                uint32_t *     largest_ub);
 
 // llama.cpp-nphx: whether the SYCL auto micro-batch selection trial
 // (llama_context::sycl_select_auto_ubatch(), llama.cpp-xojq Task 4b) is
