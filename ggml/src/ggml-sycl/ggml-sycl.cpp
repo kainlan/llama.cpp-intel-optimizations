@@ -52473,8 +52473,62 @@ static void ggml_sycl_node_checksum_detail_dump_src(const char * label, const gg
             (unsigned long long) cksum);
 }
 
+// llama.cpp-rb2h diagnostic (GGML_SYCL_RB2H_NODE_HASH): an exact byte hash of every computed node's dst and of every
+// source that crossed a backend split (its name carries the scheduler's '#' marker), drained and read back around
+// each op, so two runs of a nondeterministic workload can be diffed for the FIRST node whose bytes differ. Unlike
+// GGML_SYCL_NODE_CHECKSUM it prints the byte hash for float tensors too. Removed with the fix.
+static bool rb2h_hash_tensor(ggml_backend_sycl_context & ctx, const ggml_tensor * t, uint64_t * hash, size_t * nbytes_out) {
+    const size_t nbytes = ggml_nbytes(t);
+    *nbytes_out         = nbytes;
+    if (nbytes == 0) {
+        return false;
+    }
+    auto resolved = ggml_sycl_resolve(t, ctx.device);
+    if (!resolved.ptr) {
+        return false;
+    }
+    if (!resolved.on_device) {
+        *hash = ggml_sycl_fnv1a(resolved.ptr, nbytes);
+        return true;
+    }
+    try {
+        std::vector<uint8_t> buf(nbytes);
+        ggml_sycl::mem_copy_ptr_async(buf.data(), resolved.ptr, nbytes, *ctx.stream()).wait();
+        *hash = ggml_sycl_fnv1a(buf.data(), nbytes);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) {
+    static const bool            rb2h_node_hash = ggml_sycl_rb2h_arm("GGML_SYCL_RB2H_NODE_HASH");
+    static std::atomic<uint64_t> rb2h_seq{ 0 };
+    uint64_t                     rb2h_seq_this = 0;
+    if (rb2h_node_hash && dst) {
+        rb2h_seq_this = rb2h_seq.fetch_add(1, std::memory_order_relaxed);
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            const ggml_tensor * s = dst->src[i];
+            if (s && s->name[0] != '\0' && std::strchr(s->name, '#') != nullptr) {
+                uint64_t h  = 0;
+                size_t   nb = 0;
+                if (rb2h_hash_tensor(ctx, s, &h, &nb)) {
+                    fprintf(stderr, "[RB2H-NODE] seq=%llu src%d=%s bytes=%zu hash=%016llx\n",
+                            (unsigned long long) rb2h_seq_this, i, s->name, nb, (unsigned long long) h);
+                }
+            }
+        }
+    }
     const bool ok = ggml_sycl_compute_forward_impl(ctx, dst);
+    if (rb2h_node_hash && ok && dst && dst->op != GGML_OP_NONE && dst->op != GGML_OP_VIEW &&
+        dst->op != GGML_OP_RESHAPE && dst->op != GGML_OP_PERMUTE && dst->op != GGML_OP_TRANSPOSE) {
+        uint64_t h  = 0;
+        size_t   nb = 0;
+        if (rb2h_hash_tensor(ctx, dst, &h, &nb)) {
+            fprintf(stderr, "[RB2H-NODE] seq=%llu op=%s dst=%s bytes=%zu hash=%016llx\n",
+                    (unsigned long long) rb2h_seq_this, ggml_op_name(dst->op), dst->name, nb, (unsigned long long) h);
+        }
+    }
     if (ok && dst && ggml_sycl_node_checksum_enabled()) {
         static std::atomic<uint64_t> g_node_checksum_seq{ 0 };
         const uint64_t       seq     = g_node_checksum_seq.fetch_add(1, std::memory_order_relaxed);
