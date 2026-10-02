@@ -261,10 +261,10 @@ def evaluate(backend, common, memo_hdr):
     site = r"if\s*\(!" + call % r"sycl_ctx,\s*cgraph,\s*graph_hash" + r"\)\s*\{\s*"
     results["site 3, MoE segment replay: declines, invalidates the segments, runs direct, else replays"] = re.search(
         site + r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\}\s*else\s*"
-        r"(if\s*\(!sycl_ctx->moe_segments_valid\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*)?\{\s*"
+        r"(if\s*\(!sycl_ctx->moe_segments_valid \|\| sycl_ctx->moe_graphs_disabled\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*)?\{\s*"
         r"graph_refresh_input_tensors\(sycl_ctx, cgraph\);\s*moe_graph_replay_segments\(", compute) is not None
     results["site 3: segments a staging swap retired run the token direct instead of replaying nothing"] = re.search(
-        site + r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\}\s*else if\s*\(!sycl_ctx->moe_segments_valid\)\s*\{\s*"
+        site + r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\}\s*else if\s*\(!sycl_ctx->moe_segments_valid \|\| sycl_ctx->moe_graphs_disabled\)\s*\{\s*"
         r"compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*graph_refresh_input_tensors\(sycl_ctx, cgraph\);\s*moe_graph_replay_segments\(", compute) is not None
     results["site 4, MoE segment record: declines and runs direct, else records"] = re.search(
         r"\}\s*else\s*" + site + r"compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*graph_refresh_input_tensors\(sycl_ctx, cgraph\);\s*"
@@ -367,7 +367,7 @@ def evaluate(backend, common, memo_hdr):
                   r"graph_input_stage\([^;]*;\s*if\s*\(\s*!dev_ptr\s*\)\s*\{[^{}]*\}\s*staged_count\+\+;\s*mark_staged\(tensor\);\s*"
                   r"GGML_SYCL_DEBUG\([^;]*;\s*return;\s*\}", prestage) is not None
     results["the gateway consumes the swapped flag and retires the recorders, with no second pass"] = \
-        re.search(r"const bool staged = graph_prestage_leaf_tensors\(ctx, cgraph\);\s*bool retired = true;\s*"
+        re.search(r"const bool staged\s*=\s*graph_prestage_leaf_tensors\(ctx, cgraph\);\s*bool\s+retired\s*=\s*true;\s*"
                   r"if\s*\(ctx->graph_input_staging_swapped\)\s*\{\s*retired = graph_staging_swap_retire\(ctx\);\s*\}\s*"
                   r"if\s*\(staged && retired\)\s*\{", decline) is not None and \
         len(re.findall(r"graph_prestage_leaf_tensors\(", decline)) == 1
@@ -379,15 +379,6 @@ def evaluate(backend, common, memo_hdr):
                  "input_tensors_cached", "cached_input_tensors"]
     results["the gateway and the swap retire leave leases, pins, the CPU staging cache and the MoE layout cache alone"] = \
         bool(swap_fn) and all(t not in swap_fn and t not in decline for t in forbidden)
-    exec_block = re.search(r"if\s*\(ctx->exec_graph\)\s*\{\s*ggml_sycl_trace_queue_wait\(ctx->stream\(\), \"staging-swapped\", ctx->device, -1, nullptr\);\s*"
-                           r"ctx->exec_graph\.reset\(\);\s*sycl_exec_graph_release_pool_retained\(ctx\);\s*"
-                           r"ctx->active_exec_graph\.valid\s*=\s*false;\s*ctx->exec_graph_n_nodes\s*=\s*0;\s*ctx->exec_graph_hash\s*=\s*0;\s*\}", swap_fn)
-    order = ["ctx->graph_input_staging_swapped = false;", "ggml_sycl_block_exec_dense_drop_graphs(ctx);",
-             "ctx->invalidate_moe_segments();", "ctx->invalidate_moe_block_graphs();",
-             "ctx->invalidate_moe_direct_dispatch_graphs();", "ctx->invalidate_moe_sequence_graphs();"]
-    at = [stmt_at(swap_fn, t) for t in order] + [exec_block.start() if exec_block else -1]
-    results["the swap retire clears the flag, drops dense, retires every MoE epoch, then resets a live exec graph"] = \
-        bool(swap_fn) and all(x >= 0 for x in at) and at == sorted(at)
     # Review r8 M3: statement ORDER is not enough (a brace-wrapped dead call, a host wait, a stray release or a stray
     # signature-cache reset all keep every anchored statement in order). The retire is pinned as its exact token
     # sequence, so nothing may be added, wrapped, reordered or dropped; the only conditional is the live exec block.
@@ -558,8 +549,8 @@ if args.self_test:
         ("the swap retire resets the signature cache", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
          (mutate_in_func(backend, swap_sig, "if (ctx->exec_graph) {", "ctx->cached_graph_sig_n_nodes = -1;\n    if (ctx->exec_graph) {"), common, mem_)),
         ("the swap retire short-circuits its retires", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
-         (mutate_in_func(backend, swap_sig, "const bool block_graphs_retired = ctx->invalidate_moe_block_graphs();",
-                         "const bool block_graphs_retired = segments_retired && ctx->invalidate_moe_block_graphs();"), common, mem_)),
+         (mutate_in_func(backend, swap_sig, "ctx->invalidate_moe_block_graphs();",
+                         "segments_retired && ctx->invalidate_moe_block_graphs();"), common, mem_)),
         ("the swap retire returns true unconditionally", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
          (mutate_in_func(backend, swap_sig, "return segments_retired", "return true || segments_retired"), common, mem_)),
         ("the INPUT arm stages on another queue", "the INPUT arm stages on the backend's own queue",
@@ -693,8 +684,8 @@ if args.self_test:
                     r"if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{[^{}]*\}",
                     "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) { return false; }"), common, mem_)),
         ("segment replay decline keeps its segments", "site 3, MoE segment replay: declines, invalidates the segments, runs direct, else replays",
-         (mutate_re(backend, cmp_sig, r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\} else if \(!sycl_ctx->moe_segments_valid\)",
-                    "compute_impl_unlocked();\n } else if (!sycl_ctx->moe_segments_valid)"), common, mem_)),
+         (mutate_re(backend, cmp_sig, r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\} else if \(!sycl_ctx->moe_segments_valid \|\| sycl_ctx->moe_graphs_disabled\)",
+                    "compute_impl_unlocked();\n } else if (!sycl_ctx->moe_segments_valid || sycl_ctx->moe_graphs_disabled)"), common, mem_)),
         ("first-record decline moves past begin_recording",
          "the recording sites keep their order, each decline between its neighbours (and before its recording)",
          (move_first_record_decline(backend), common, mem_)),
@@ -711,11 +702,11 @@ if args.self_test:
          (mutate_re(backend, pre_sig, r"if \(!dev_ptr\) \{", "if (false) {"), common, mem_)),
         ("the gateway ignores the swapped flag", "the gateway consumes the swapped flag and retires the recorders, with no second pass",
          (mutate_in_func(backend, dec_sig, "if (ctx->graph_input_staging_swapped) {", "if (false) {"), common, mem_)),
-        ("the swap retire forgets dense", "the swap retire clears the flag, drops dense, retires every MoE epoch, then resets a live exec graph",
+        ("the swap retire forgets dense", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
          (mutate_in_func(backend, swap_sig, "ggml_sycl_block_exec_dense_drop_graphs(ctx);", ""), common, mem_)),
-        ("the swap retire forgets the direct-dispatch graphs", "the swap retire clears the flag, drops dense, retires every MoE epoch, then resets a live exec graph",
+        ("the swap retire forgets the direct-dispatch graphs", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
          (mutate_in_func(backend, swap_sig, "ctx->invalidate_moe_direct_dispatch_graphs();", ""), common, mem_)),
-        ("the swap retire forgets the sequence graphs", "the swap retire clears the flag, drops dense, retires every MoE epoch, then resets a live exec graph",
+        ("the swap retire forgets the sequence graphs", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
          (mutate_in_func(backend, swap_sig, "ctx->invalidate_moe_sequence_graphs();", ""), common, mem_)),
         ("the dense drop helper creates a state", "the dense drop helper drops a state that exists and does not create one",
          (mutate_in_func(backend, dense_drop_sig, "find(ctx)", "find(ctx); (void) ggml_sycl_block_exec_dense_state_for(*ctx)"), common, mem_)),
@@ -760,13 +751,13 @@ if args.self_test:
          (mutate_in_func(backend, swap_sig, "ctx->invalidate_moe_sequence_graphs();", "ctx->invalidate_moe_sequence_graphs();\n    graph_unpin_weights(ctx);"), common, mem_)),
         ("the swap retire releases the staging map", "the gateway and the swap retire leave leases, pins, the CPU staging cache and the MoE layout cache alone",
          (mutate_in_func(backend, swap_sig, "ctx->graph_input_staging_swapped = false;", "ctx->graph_input_staging_swapped = false;\n    ctx->graph_input_staging_clear(*ctx->stream());"), common, mem_)),
-        ("the swap retire's exec-graph reset loses its drain", "the swap retire clears the flag, drops dense, retires every MoE epoch, then resets a live exec graph",
+        ("the swap retire's exec-graph reset loses its drain", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
          (mutate_in_func(backend, swap_sig, "ggml_sycl_trace_queue_wait(ctx->stream(), \"staging-swapped\", ctx->device, -1, nullptr);", ""), common, mem_)),
-        ("the swap retire's exec-graph reset is unconditional", "the swap retire clears the flag, drops dense, retires every MoE epoch, then resets a live exec graph",
+        ("the swap retire's exec-graph reset is unconditional", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
          (mutate_in_func(backend, swap_sig, "if (ctx->exec_graph) {", "if (true) {"), common, mem_)),
-        ("the swap retire's segments invalidate is dead", "the swap retire clears the flag, drops dense, retires every MoE epoch, then resets a live exec graph",
+        ("the swap retire's segments invalidate is dead", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
          (mutate_in_func(backend, swap_sig, "ctx->invalidate_moe_segments();", "if (false) ctx->invalidate_moe_segments();"), common, mem_)),
-        ("the swap retire's dense drop is dead", "the swap retire clears the flag, drops dense, retires every MoE epoch, then resets a live exec graph",
+        ("the swap retire's dense drop is dead", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
          (mutate_in_func(backend, swap_sig, "ggml_sycl_block_exec_dense_drop_graphs(ctx);", "if (false) ggml_sycl_block_exec_dense_drop_graphs(ctx);"), common, mem_)),
         ("clear_active's wait guard goes dead", "clear_active waits on the queue before it resets the exec graph or releases the staging",
          (mutate_in_func(backend, clear_sig, "if (ctx->exec_graph) {", "if (false) {"), common, mem_)),
@@ -793,9 +784,9 @@ if args.self_test:
         ("the token number is bumped after an early return", "the token number is bumped unconditionally, at top level, before any early return",
          (mutate_in_func(backend, cmp_sig, "++sycl_ctx->graph_compute_seq;", "if (cgraph->n_nodes == 0) { return GGML_STATUS_SUCCESS; }\n ++sycl_ctx->graph_compute_seq;"), common, mem_)),
         ("segments retired by a swap are replayed", "site 3: segments a staging swap retired run the token direct instead of replaying nothing",
-         (mutate_in_func(backend, cmp_sig, "else if (!sycl_ctx->moe_segments_valid) {", "else if (false) {"), common, mem_)),
+         (mutate_in_func(backend, cmp_sig, "else if (!sycl_ctx->moe_segments_valid || sycl_ctx->moe_graphs_disabled) {", "else if (false) {"), common, mem_)),
         ("the retired-segments branch is gone", "site 3: segments a staging swap retired run the token direct instead of replaying nothing",
-         (mutate_re(backend, cmp_sig, r"\s*else if \(!sycl_ctx->moe_segments_valid\) \{\s*compute_impl_unlocked\(\);\s*\}", ""), common, mem_)),
+         (mutate_re(backend, cmp_sig, r"\s*else if \(!sycl_ctx->moe_segments_valid \|\| sycl_ctx->moe_graphs_disabled\) \{\s*compute_impl_unlocked\(\);\s*\}", ""), common, mem_)),
         ("a seventh recorder appears", "no unnamed pre-stage consumer: the six recording sites below are all there are",
          (backend + "\nstatic bool new_recorder(ggml_backend_sycl_context * c, const ggml_cgraph * g) "
                     "{ if (!graph_prestage_or_decline(c, g, 1)) { return false; } return true; }\n", common, mem_)),

@@ -5792,6 +5792,9 @@ inline void * ggml_sycl_runtime_scratch_ensure(ggml_sycl::mem_handle & backing,
     return resolved.ptr;
 }
 
+// Kernel name of the marker that gates the release of a staging buffer a size change displaced.
+struct graph_input_staging_retire_marker {};
+
 struct ggml_backend_sycl_context {
     // Retained by MMID queue capabilities so an exact queue binding cannot
     // outlive the backend context that selected it.
@@ -6366,34 +6369,38 @@ struct ggml_backend_sycl_context {
     bool                            moe_default_fast_path_quarantined = false;
     const char *                    moe_default_fast_path_quarantine_reason = nullptr;
 
-    void invalidate_moe_segments() {
+    // Each retire below reports whether it retired the epoch. A failure leaves the recorded graphs valid, so the
+    // caller (the staging-swap gateway) must not trust them and declines; the failure also sets the disabled flag.
+    bool invalidate_moe_segments() {
         if (!ggml_sycl_retire_moe_graph_epoch(this)) {
             moe_graphs_disabled = true;
-            return;
+            return false;
         }
         moe_segments.clear();
         moe_dispatch_graphs.clear();
         moe_node_indices.clear();
         moe_segments_n_nodes = 0;
         moe_segments_valid   = false;
+        return true;
     }
 
-    void invalidate_moe_direct_dispatch_graphs() {
+    bool invalidate_moe_direct_dispatch_graphs() {
         if (!ggml_sycl_retire_moe_graph_epoch(this)) {
             moe_direct_dispatch_graphs_disabled = true;
-            return;
+            return false;
         }
         moe_direct_dispatch_graphs.clear();
         moe_direct_dispatch_graphs_n_nodes   = 0;
         moe_direct_dispatch_graphs_hash      = 0;
         moe_direct_dispatch_graphs_is_decode = false;
         moe_direct_dispatch_graphs_disabled  = false;
+        return true;
     }
 
-    void invalidate_moe_block_graphs() {
+    bool invalidate_moe_block_graphs() {
         if (!ggml_sycl_retire_moe_graph_epoch(this)) {
             moe_block_graphs_disabled = true;
-            return;
+            return false;
         }
         moe_block_graphs.clear();
         moe_block_graphs_n_nodes    = 0;
@@ -6403,12 +6410,13 @@ struct ggml_backend_sycl_context {
         moe_block_graphs_block_size = 0;
         moe_block_graphs_valid      = false;
         moe_block_graphs_dispatch_identities.clear();
+        return true;
     }
 
-    void invalidate_moe_sequence_graphs() {
+    bool invalidate_moe_sequence_graphs() {
         if (!ggml_sycl_retire_moe_graph_epoch(this)) {
             moe_sequence_graphs_disabled = true;
-            return;
+            return false;
         }
         moe_sequence_graphs.clear();
         moe_sequence_graph_failed_nodes.clear();
@@ -6418,6 +6426,7 @@ struct ggml_backend_sycl_context {
         moe_sequence_graphs_mode_hash = 0;
         moe_sequence_graphs_is_decode = false;
         moe_sequence_graphs_valid     = false;
+        return true;
     }
 
     // === Cached per-graph computations (reset when n_nodes changes) ===
@@ -6485,7 +6494,7 @@ struct ggml_backend_sycl_context {
     // Set when a size change displaced a live staging handle (graph_input_stage). A recorded graph (exec graph, MoE
     // segments, block graphlets, dense range graphs) bakes the staging POINTER, so graph_prestage_or_decline consumes
     // the flag and retires every recorder that may hold the old one. The displaced handle itself is retained on a
-    // barrier event at the swap, not freed, so a replay from the previous token may finish reading it. Whether a
+    // marker event at the swap, not freed, so a replay from the previous token may finish reading it. Whether a
     // recorded graph also keeps its own copy of the handle depends on the consumer (GET_ROWS indices do, through
     // terminal_retention_ticket::prepare; a consumer that takes the raw pointer does not), and the map cannot know
     // which consumers baked it.
@@ -6574,10 +6583,13 @@ struct ggml_backend_sycl_context {
         graph_input_staging_entry & slot = graph_input_staging[owner];
         if (slot.handle.valid()) {
             // A replay from the previous token may still read the displaced buffer: hold it until the last work
-            // submitted on this queue completes (an event, not a host wait). The recorders that baked its pointer
-            // are retired by the gateway, which consumes the flag.
-            ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, q.ext_oneapi_submit_barrier());
+            // submitted on this queue completes (an event, not a host wait). The event is taken BEFORE the handle
+            // moves, so a throwing submit leaves the entry intact, and it comes from the marker helper that avoids
+            // the Level Zero barrier-event corruption. The recorders that baked the pointer are retired by the
+            // gateway, which consumes the flag.
+            sycl::event retire = ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q);
             graph_input_staging_swapped = true;
+            ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, retire);
         }
         slot.handle   = std::move(handle);
         slot.capacity = nbytes;

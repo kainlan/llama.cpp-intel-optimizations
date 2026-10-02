@@ -98733,6 +98733,11 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
         sycl_ctx->invalidate_moe_block_graphs();
         return false;
     }
+    if (sycl_ctx->moe_graphs_disabled || sycl_ctx->moe_block_graphs_disabled) {
+        // The gateway's retire failed and disabled MoE graphs: the recorded graphlets are still marked valid.
+        ggml_sycl_moe_aggregation_diag(sycl_ctx, "block-graphlet", "reject", "disabled");
+        return false;
+    }
     graph_refresh_input_tensors(sycl_ctx, cgraph);
 
     try {
@@ -99812,22 +99817,24 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
 // (drop_graphs drains each device it ran on), the MoE epochs (each retire waits for its terminals), and a LIVE exec
 // graph. The displaced handle was already retained on a barrier event at the swap, and the staging map is current,
 // so nothing is released or re-staged here.
+// Returns false when a MoE epoch could not be retired: that recorder is still marked valid and would replay a graph
+// that baked the freed pointer, so the gateway declines (every caller then runs direct) rather than trust it.
 // This runs INSIDE a graph_compute that has already pinned weights and experts (graph_preload_weights,
 // graph_preload_moe_experts), so it must not call sycl_exec_graph_clear_active: that unpins those leases, clears
 // the CPU staging cache and the MoE layout cache mid-compute (its header cites a measured gemma regression). The
 // cost of a swap is one drain per retired recorder; a swap is rare (the kq_mask leaf steps with n_kv), and the
 // same step already changes the graph signature, so it adds drains, not a recording.
-static void graph_staging_swap_retire(ggml_backend_sycl_context * ctx) {
+static bool graph_staging_swap_retire(ggml_backend_sycl_context * ctx) {
     ctx->graph_input_staging_swapped = false;
     if (ggml_sycl_graph_diag_enabled()) {
         // The gap between two of these lines, in graph computes, is the swap rate (kq_mask steps every n_kv pad).
         GGML_LOG_WARN("[GRAPH-DIAG] staging swap at graph compute %llu\n", (unsigned long long) ctx->graph_compute_seq);
     }
     ggml_sycl_block_exec_dense_drop_graphs(ctx);
-    ctx->invalidate_moe_segments();
-    ctx->invalidate_moe_block_graphs();
-    ctx->invalidate_moe_direct_dispatch_graphs();
-    ctx->invalidate_moe_sequence_graphs();
+    const bool segments_retired        = ctx->invalidate_moe_segments();
+    const bool block_graphs_retired    = ctx->invalidate_moe_block_graphs();
+    const bool direct_dispatch_retired = ctx->invalidate_moe_direct_dispatch_graphs();
+    const bool sequence_graphs_retired = ctx->invalidate_moe_sequence_graphs();
     if (ctx->exec_graph) {
         // llama.cpp-dkw0 defect #4: destroying an executable graph under its own in-flight submission double-frees
         // the runtime's bookkeeping, so a LIVE graph is drained before it is reset. With no live graph there is
@@ -99839,6 +99846,7 @@ static void graph_staging_swap_retire(ggml_backend_sycl_context * ctx) {
         ctx->exec_graph_n_nodes      = 0;
         ctx->exec_graph_hash         = 0;
     }
+    return segments_retired && block_graphs_retired && direct_dispatch_retired && sequence_graphs_retired;
 }
 
 // Counts this token against a held decline (it MUTATES the memo): true means skip the pre-stage and run direct,
@@ -99860,19 +99868,21 @@ static bool graph_prestage_or_decline(ggml_backend_sycl_context * ctx, const ggm
     if (graph_prestage_skip_declined(ctx, graph_hash)) {
         return false;
     }
-    const bool staged = graph_prestage_leaf_tensors(ctx, cgraph);
+    const bool staged  = graph_prestage_leaf_tensors(ctx, cgraph);
+    bool       retired = true;
     if (ctx->graph_input_staging_swapped) {
         // An input's staging buffer was replaced (its size changed). Whether the pass then succeeded or declined,
         // every recorded graph that baked the old pointer is stale.
-        graph_staging_swap_retire(ctx);
+        retired = graph_staging_swap_retire(ctx);
     }
-    if (staged) {
+    if (staged && retired) {
         ctx->prestage_decline_memo.forget(graph_hash);
         return true;
     }
     ctx->prestage_decline_memo.remember(graph_hash, ctx->graph_compute_seq);
     GGML_LOG_WARN(
-        "[SYCL-GRAPH] graph inputs could not all be staged onto the device; not recording this graph (signature "
+        "[SYCL-GRAPH] graph inputs could not all be staged onto the device (or a staging swap could not retire "
+        "its recorded graphs); not recording this graph (signature "
         "%llu), running it on the direct path\n",
         (unsigned long long) graph_hash);
     return false;
@@ -108039,7 +108049,7 @@ normal_dispatch:
                         // (conservative: a swap is retired at the gateway) and run direct.
                         sycl_ctx->invalidate_moe_segments();
                         compute_impl_unlocked();
-                    } else if (!sycl_ctx->moe_segments_valid) {
+                    } else if (!sycl_ctx->moe_segments_valid || sycl_ctx->moe_graphs_disabled) {
                         // The gateway swapped an input's staging buffer and retired the segments after the match
                         // above was decided: there is nothing recorded to replay. Run this token direct; the next
                         // one records afresh against the new buffer.
