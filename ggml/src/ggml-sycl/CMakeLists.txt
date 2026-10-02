@@ -2125,6 +2125,28 @@ set_tests_properties(sycl-context-tenant-measure PROPERTIES
     TIMEOUT 30
 )
 
+# The non-FA staging cohort: the route classifier and the staging size the
+# dispatch and the measure visitor share, and the visitor itself. nonfa-stage.hpp
+# names only ggml types, so this is host-only like the test above, and it
+# compiles the same context-tenant-measure.cpp the library gets.
+add_executable(test-context-nonfa-stage
+    tests/test-context-nonfa-stage.cpp
+    context-tenant-measure.cpp
+)
+target_include_directories(test-context-nonfa-stage PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-context-nonfa-stage PRIVATE ggml-base)
+set_target_properties(test-context-nonfa-stage PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-context-nonfa-stage COMMAND test-context-nonfa-stage)
+set_tests_properties(sycl-context-nonfa-stage PROPERTIES
+    LABELS "sycl;tenant;hostonly"
+    TIMEOUT 30
+)
+
 # The resolver counter's gating: a host return of a staged source counts only
 # inside the device-dispatch region and not inside a host executor. Synthetic
 # tensors, no device (an F32 tensor never reaches the multi-GPU control-storage
