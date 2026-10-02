@@ -2493,7 +2493,10 @@ the hold kept it out (`unified_cache_note_planned_hold_spill`, in-arena), in the
 one of each kind per context is a WARN naming the requester tag and the bytes; the counts are taken at teardown and
 printed as `hold_spills_raw` / `hold_spills_kv_zone` / `hold_spills_kv_zone_full` (with bytes) in the `[SCRATCH-STATS]`
 line, whichever of the three is non-zero. The counters restart at every publish, so the figures a finished context
-prints are its own and not the auto-ubatch ladder's (the once-only WARN latches do not restart). A raw
+prints are its own and not the auto-ubatch ladder's (the once-only WARN latches do not restart). Each flagged scheduler compute buffer also prints one line as it is
+allocated, `[SCRATCH-STATS] device=D compute_buffer=<buffer type name> size=<MB> zone=<kv|raw|runtime|...|none>`
+(`ggml_sycl_log_compute_buffer_landing`), so a throughput difference between two builds can be attributed to where
+a buffer physically sits. A raw
 spill cannot evict weights: the overcommit guard in `unified_alloc` runs for every raw device request, and for a
 hold-induced one it refuses loudly instead of calling `evict_and_flush` (trading a planned buffer's reservation for the
 model's own weights is not a trade the hold may make).
