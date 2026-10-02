@@ -284,6 +284,206 @@ void zone_onednn_scratch_reserve_target(bool    arena_active,
                                         size_t * activations_bytes);
 
 // ---------------------------------------------------------------------------
+// The planned dense scratch as ONE reservation (llama.cpp-kpjw)
+// ---------------------------------------------------------------------------
+//
+// The three buffers above (Q8_1 src1, f16 src0, f16 src1) live in the RUNTIME zone. Two things were
+// missing when they were only COUNTED in the zone requirement:
+//
+//   * They were sized at the load-time n_ubatch. The runtime n_ubatch (auto-ubatch picks it at context
+//     creation) can be 4x larger, so the plan is a function of n_ubatch and the runtime-context
+//     transaction must re-derive it. These helpers are the pure arithmetic of that re-derivation.
+//   * Nothing RESERVED them. A compute buffer asks the same zone, may spill, and fills it before the first
+//     graph materializes the planned buffer, which is then refused with 0.3 MB free. The hold is the part of
+//     the plan a spill-capable allocation must leave alone.
+//
+// Pure: no state, no log.
+
+// Total bytes of the three planned buffers at `n_ubatch`: exactly the sum of zone_mmq_src1_scratch_bytes and
+// both zone_dequant_f16_plan_bytes figures. False on overflow.
+bool zone_dense_scratch_total_bytes(size_t   mmq_bytes_per_token,
+                                    size_t   f16_weight_bytes,
+                                    size_t   f16_src1_bytes_per_token,
+                                    uint32_t n_ubatch,
+                                    size_t * out);
+
+// Largest n_ubatch, a multiple of 32 no larger than `search_max`, whose planned dense scratch plus
+// `other_runtime_bytes` fits `capacity_bytes`. Zero when not even 32 rows fit.
+uint32_t zone_dense_scratch_largest_ubatch(size_t   mmq_bytes_per_token,
+                                           size_t   f16_weight_bytes,
+                                           size_t   f16_src1_bytes_per_token,
+                                           size_t   other_runtime_bytes,
+                                           size_t   capacity_bytes,
+                                           uint32_t search_max);
+
+// One planned buffer: its plan figure and the bytes its backing holds now.
+struct zone_planned_buffer {
+    size_t plan     = 0;
+    size_t capacity = 0;
+};
+
+// Bytes of the RUNTIME zone a spill-capable allocation must leave free: the whole plan of every buffer whose
+// backing is still short of it. The whole plan, not the shortfall, because growth allocates the replacement
+// while the old backing is still live (it retires behind a queue marker). Zero once every buffer holds its plan.
+// False on overflow.
+bool zone_planned_scratch_hold_bytes(const zone_planned_buffer * buffers, size_t count, size_t * out);
+
+// Whether a spill-capable RUNTIME request of `size` bytes may take the zone's `available` bytes while `hold`
+// bytes are held. A request that does not may spill exactly as one does when the zone is full.
+bool zone_runtime_alloc_respects_hold(size_t available, size_t hold, size_t size);
+
+// The decision unified_alloc takes for a request that prefers a zone: true when the request must NOT be served
+// from the zone although the zone could serve it, because the hold keeps those bytes for the planned scratch.
+// Only a spill-capable request for the RUNTIME zone is ever held back; a forbid-spill request is one of the
+// planned consumers the hold exists for, and no other zone has a hold. A request larger than the zone's free
+// bytes is NOT held back: it spills as it always did and the allocator's overcommit guard may evict for it. The
+// zone's free bytes come first, then the hold, then the request size: swapped, the same numbers answer a
+// different question.
+bool zone_runtime_alloc_held_back(bool   runtime_zone,
+                                  bool   forbid_spill,
+                                  size_t zone_available,
+                                  size_t hold,
+                                  size_t alloc_size);
+
+// The worst-case bytes the hold can push outside the arena at candidate rung `n_ubatch`: the plan (the most the
+// hold can be) plus the largest spill-capable RUNTIME request, because a held-back request spills whole. The
+// request was observed at `hwm_n_ubatch`; compute buffers scale about linearly with n_ubatch, so it is scaled to
+// the candidate (up or down) when both are known. No plan means no hold and the bound is 0. Saturating. The
+// request term is a heuristic (it is what a previous rung asked), a lower bound before any rung has reserved.
+size_t zone_hold_spill_bound(size_t plan, size_t request_hwm, uint32_t hwm_n_ubatch, uint32_t n_ubatch);
+
+// An ESTIMATE of the part of a worst-case spill (zone_hold_spill_bound) that lands OUTSIDE the arena. A compute
+// buffer the RUNTIME zone will not serve is placed in the arena's KV zone first
+// (zone_runtime_spill_prefers_kv_zone), so only what the KV zone cannot take is raw device memory, the thing that
+// eats the driver headroom. `kv_zone_free` is what a compute buffer can count on in that zone NOW
+// (zone_kv_room_for_compute: its largest free block, net of the KV this context has yet to place). It is an
+// estimate in three ways: other buffers may take that room before the spill does, a spill is several buffers and the
+// room is one block, and the spill figure it is subtracted from is itself a heuristic. The realized check, which
+// counts the RAW spills a rung actually made, is the backstop; this is the transaction-time prediction only.
+size_t zone_hold_spill_raw_demand(size_t spill_bound, size_t kv_zone_free);
+
+// The KV-zone room a compute buffer can count on. The runtime-context transaction publishes BEFORE this context's KV
+// cache exists (a pinned -ub, the first rung), so the zone still shows free the bytes its own KV is about to take:
+// `kv_pending_bytes`, the KV this transaction's plan places that is not live yet, is not room. A buffer is
+// indivisible, so the room is a block, `kv_largest_free`, never the sum of the zone's free bytes. Clamped at 0;
+// KV already live (the recheck, a settle) passes 0 pending.
+size_t zone_kv_room_for_compute(size_t kv_largest_free, size_t kv_pending_bytes);
+
+// llama.cpp-kpjw (kpjw-g7, P4: one fact, one source): ONE predicate for "does this demand leave the card its headroom".
+// `free_before` is the card WITHOUT the demand in place, `bound` the demand. The hold is blamed only when ITS demand
+// is what pushes the card under the driver headroom the arena expects outside itself (free_before >= headroom and
+// free_before - bound < headroom): a card already short without the demand (a full B70 with KB-scale spills) is not
+// the hold's doing, and a rung with no demand is never refused. A rung that is refused runs the card out of
+// resources at its first graph (B50, Qwen PPL at auto-ub1024: 107.8 MB left against 256 MB, flash attention out of
+// resources). It is the verdict zone_hold_fit gives.
+bool zone_hold_spill_bound_fits(size_t free_before, size_t headroom_target, size_t bound);
+
+// What the hold-spill fit is asked of: the compute buffers of ONE rung (an n_ubatch) are, or would be, placed while
+// the planned dense scratch is held out of the RUNTIME zone. The transaction-time bound (F3), the auto-ubatch
+// trial's per-rung realized check and the context-init check on a pinned -ub all call zone_hold_fit over these
+// inputs, so they cannot disagree about one fact. A pure function of the inputs: it reads nothing and remembers
+// nothing, so the same rung asked twice, with other rungs' history in between, answers the same.
+//
+// One rung's measured compute-buffer request: the largest request the scheduler's compute buffers made while
+// the rung's plan was the published one. Kept per rung (n_ubatch), not as a running maximum, so a rung's verdict
+// does not depend on which other rungs ran before it.
+struct zone_hold_rung_request {
+    uint32_t n_ubatch = 0;
+    size_t   bytes    = 0;
+};
+
+// The planned dense scratch (the most the hold can be) at a rung.
+typedef size_t (*zone_hold_plan_fn)(void * ctx, uint32_t n_ubatch);
+
+struct zone_hold_fit_inputs {
+    size_t                         headroom_target = 0;  // the driver headroom the arena expects outside itself
+    size_t                         free_before = 0;  // the cache's ledger: the card with the rung's own buffers gone
+    size_t                         kv_room     = 0;  // zone_kv_room_for_compute, already net of the KV pending
+    const zone_hold_rung_request * rungs       = nullptr;
+    size_t                         n_rungs     = 0;
+    zone_hold_plan_fn              plan_of     = nullptr;
+    void *                         plan_ctx    = nullptr;
+};
+
+// The worst-case compute-buffer request at `n_ubatch`: the rung's own measured record when it has one (and only
+// that, whatever else is recorded); otherwise the largest record scaled linearly to the rung (compute buffers grow
+// about linearly with n_ubatch), so a set of records gives one answer whatever order it was made in. 0 when nothing
+// is recorded: the demand is then the plan alone, a lower bound.
+size_t zone_hold_fit_request(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
+
+// The raw (outside-arena) demand the hold can cause at the rung: zone_hold_spill_raw_demand over
+// zone_hold_spill_bound(plan, the rung's request) and the KV room. 0 for an unknown n_ubatch.
+size_t zone_hold_fit_demand(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
+
+// Whether the rung fits: zone_hold_spill_bound_fits(free_before, headroom, demand).
+bool zone_hold_fit(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
+
+// The -ub a refusal names: `n_ubatch` itself when it fits, otherwise the largest power of two (at least 32) not above
+// it that zone_hold_fit accepts, over the same inputs. 0 when none does or n_ubatch is unknown. By construction the
+// number printed passes the fit, and twice it does not whenever twice it is a rung that was asked (not above
+// `n_ubatch`; a non-power-of-two n_ubatch such as 600 names 512 or lower and never asks 1024). It can be under the
+// auto-ubatch descent's floor of 64: it is the largest the function accepts, not a rung the descent walks.
+uint32_t zone_hold_fit_largest_ub(const zone_hold_fit_inputs & in, uint32_t n_ubatch);
+
+// The cache's ledger of free memory, in two steps so that no driver read after a release is ever needed (the
+// driver's credit for a freed buffer lags: 602.7 MB was read where 1097 MB was true). `cold` is the free memory the
+// card would show with no outside-arena cache allocation live: the driver's reading plus the bytes the cache holds
+// live outside the arena at that moment (taken once per context). `before` is the free memory with `persistent_raw`
+// of those still live (everything but the rung's own buffers). Saturating; never below zero.
+size_t zone_hold_free_cold(size_t driver_free, size_t raw_live);
+size_t zone_hold_free_before(size_t cold, size_t persistent_raw);
+
+// llama.cpp-kpjw (r7 I3: identity by ORIGIN, not by timing): what stays live without the rung is every raw byte the
+// cache holds except the rung's OWN scheduler compute buffers (rows registered by a request flagged
+// scheduler_compute), and only when the rung's buffers are live (the realized check). A raw byte allocated after an
+// epoch began that is not one of those (the recurrent state, made after a pinned -ub's one publish) is persistent
+// however late it came; a transaction (no live rung) counts every held raw byte. `compute_live` is clamped to
+// `raw_held`.
+size_t zone_hold_persistent_raw(size_t raw_held, size_t compute_live, bool rung_live);
+
+// llama.cpp-kpjw (r7 I2): the baseline `cold` reading of a window (the span between two publishes). The first reading
+// of a window stands; each later one can only RAISE it: the driver's credit for a freed buffer lags, and a lag only
+// ever lowers a reading, so the maximum is the reading with the least lag. A new window (a publish, a quiescent
+// point) forgets the previous one: another tenant may have arrived since.
+size_t zone_hold_cold_update(bool have_baseline, size_t baseline, size_t candidate);
+
+// llama.cpp-kpjw (r7 I3): the KV room the fit judges with. A rung that is live is judged with the room its own epoch
+// began with (the rung's own KV-zone placements have used the zone since); any other asker, and a live rung with no
+// epoch yet, reads the zone as it is now.
+size_t zone_hold_pick_kv_room(bool rung_live, bool have_epoch, size_t epoch_kv_room, size_t live_kv_room);
+
+// llama.cpp-kpjw (r7 I1): the demand the non-FA headroom check compares with the card: the non-FA attention scratch
+// plus the hold's worst-case spill (zone_hold_fit_demand). Saturating, so a wrapped sum never reads as a small demand.
+size_t zone_hold_nonfa_demand(size_t nonfa_scratch, size_t hold_spill);
+
+// Whether a RUNTIME-zone request goes to the KV zone instead of the zone / raw device memory: only a request the
+// caller marked as a compute buffer (`compute_spill_flag`), spill-capable (not `forbid_spill`), that the RUNTIME zone
+// will not serve (`zone_misses`: held back by the hold, or larger than the zone's free bytes), and only when the KV
+// zone can hold it whole. Any other request class keeps the pre-existing path unchanged.
+bool zone_runtime_spill_prefers_kv_zone(bool   compute_spill_flag,
+                                        bool   runtime_zone,
+                                        bool   forbid_spill,
+                                        bool   zone_misses,
+                                        size_t kv_zone_free,
+                                        size_t alloc_size);
+
+// Whether a multi-row MUL_MAT draws a given planned scratch (the Q8_1 src1 buffer, the f16 dequant buffers),
+// from the two answers the dispatch can give. `primary_*` is the router's first decision; when it picks the
+// unified kernel the dispatch can still decline at run time and re-select a legacy kernel, which is
+// `fallback_*`. A node the unified kernel serves draws neither buffer; a node it declines draws what the
+// legacy kernel draws. One function for both buffers: two predicates for one fact eventually disagree.
+bool zone_route_draws_scratch(bool decision_valid,
+                              bool primary_is_unified,
+                              bool primary_draws,
+                              bool fallback_valid,
+                              bool fallback_draws);
+
+// The planned dense scratch's inputs are device-global, so a second model loaded on a device while another is
+// live must not shrink the first one's plan (a draft and a target on one card). The larger input survives
+// while another model is live; with none live the new input replaces the old, so a model swap shrinks the plan.
+size_t zone_dense_scratch_merge_input(size_t prev, size_t next, bool other_model_live);
+
+// ---------------------------------------------------------------------------
 // Mispredict accounting
 // ---------------------------------------------------------------------------
 //

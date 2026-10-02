@@ -21,10 +21,12 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include "compute-alloc-scope.hpp"
 #include "zone-sizing.hpp"
 
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <vector>
 
 // The build is -DNDEBUG (Release), so assert() would compile away and the
@@ -704,7 +706,7 @@ int main() {
               "an empty inventory plans no dequant scratch");
     }
 
-    // ---- Case 14: oneDNN PP scratch admission (llama.cpp-8ony) ---------------
+    // ---- Case 14a: oneDNN PP scratch admission (llama.cpp-8ony) ---------------
     // GPT-OSS 20B on the B50, perplexity -c 512 -ub 512: the ONEDNN zone is 256 MiB and the LM head
     // (output.weight, Q8_0 2880 x 201088) wants a 1104.6 MiB f16 weight copy plus 256 x 2880 f16 activations.
     // The head is outside the ONEDNN zone's sizing and inside the RUNTIME dequant plan, so it must not be
@@ -729,7 +731,7 @@ int main() {
               "an overflowing pair is refused, not wrapped into a small sum");
     }
 
-    // ---- Case 15: a smaller request never shrinks a held oneDNN scratch (llama.cpp-8ony) ----
+    // ---- Case 14b: a smaller request never shrinks a held oneDNN scratch (llama.cpp-8ony) ----
     // Perplexity chunk 2, layer 0: a 512-row attention op (weights 23.6 MB, activations 2.9 MB) arrived while the
     // cache held the LM head's pair (weights 1104.6 MiB, activations 1.4 MB for 256 rows). Replacing the pair by
     // the request freed the big weights block; the head then had to regrow it and could not.
@@ -756,6 +758,510 @@ int main() {
         CHECK(w == 50 * mib && a == 3 * mib, "an unrepresentable merged sum is refused, not wrapped");
 
         ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 1, 1, 2, 2, nullptr, nullptr);
+    }
+
+    // ---- Case 14: the planned dense scratch is ONE reservation that follows the runtime n_ubatch (llama.cpp-kpjw) --
+    // B70, full card, Qwen3.6-27B perplexity (-c 512 gives n_ctx 2048 with 4 sequences, n_batch 2048): the plan was
+    // sized at the load-time n_ubatch (512, 10027264 B), auto-ubatch then chose 2048 (40108288 B), and the compute
+    // buffers of the 2048 rung had already filled the RUNTIME zone ("zone has 0.3 MB free"), so the planned buffer
+    // was never allocated and the first graph was refused.
+    {
+        // The plan is a function of n_ubatch: the same figure the three buffers' own helpers give, summed.
+        size_t q8 = 0, src0 = 0, src1 = 0, total = 0;
+        CHECK(ggml_sycl::zone_dense_scratch_total_bytes(19584, 0, 0, 512, &total) && total == 10027264,
+              "the incident's load-time plan: 512 rows of K=17408");
+        CHECK(ggml_sycl::zone_dense_scratch_total_bytes(19584, 0, 0, 2048, &total) && total == 40108288,
+              "the runtime rung the incident chose plans 4x the load-time figure");
+        CHECK(ggml_sycl::zone_mmq_src1_scratch_bytes(19584, 2048, &q8) &&
+                  ggml_sycl::zone_dequant_f16_plan_bytes(104857600, 20480, 2048, &src0, &src1) &&
+                  ggml_sycl::zone_dense_scratch_total_bytes(19584, 104857600, 20480, 2048, &total) &&
+                  total == q8 + src0 + src1,
+              "the total is exactly the three buffers' own plan figures");
+        CHECK(ggml_sycl::zone_dense_scratch_total_bytes(0, 0, 0, 2048, &total) && total == 0,
+              "a model with no dense candidate plans nothing at any n_ubatch");
+        CHECK(!ggml_sycl::zone_dense_scratch_total_bytes(SIZE_MAX / 2, 0, 0, 2048, &total),
+              "an overflowing total is refused, not wrapped into a small size");
+        CHECK(!ggml_sycl::zone_dense_scratch_total_bytes(19584, 0, 0, 512, nullptr), "a null out is refused");
+
+        // The runtime-context transaction refuses a rung the zone cannot hold, and names the largest that fits.
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 0, 0, 0, 512 * MiB, 4096) == 4096,
+              "a 512 MiB RUNTIME zone holds every rung the ladder can try");
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 0, 0, 0, 36 * MiB, 4096) == 1920,
+              "a 36 MiB zone holds 1920 rows of K=17408, a multiple of 32");
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 0, 0, 0, 36 * MiB, 1000) == 992,
+              "the search bound is honoured and rounded down to a multiple of 32");
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 0, 0, 20 * MiB, 36 * MiB, 4096) == 832,
+              "other planned RUNTIME consumers come off the capacity first");
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 104857600, 20480, 0, 100 * MiB, 4096) == 0,
+              "a weight copy larger than the zone fits no n_ubatch at all");
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 0, 0, 40 * MiB, 36 * MiB, 4096) == 0,
+              "other consumers larger than the zone leave nothing");
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 0, 0, 0, 512 * MiB, 31) == 0,
+              "a search bound under one row group finds nothing");
+        CHECK(ggml_sycl::zone_dense_scratch_largest_ubatch(0, 0, 0, 0, 512 * MiB, 4096) == 4096,
+              "with nothing planned every searched rung fits");
+        {
+            // The answer is a fixed point of the total: it fits, and the next row group does not.
+            const uint32_t ub = ggml_sycl::zone_dense_scratch_largest_ubatch(19584, 0, 0, 0, 36 * MiB, 4096);
+            size_t         fits = 0, over = 0;
+            CHECK(ggml_sycl::zone_dense_scratch_total_bytes(19584, 0, 0, ub, &fits) && fits <= 36 * MiB &&
+                      ggml_sycl::zone_dense_scratch_total_bytes(19584, 0, 0, ub + 32, &over) && over > 36 * MiB,
+                  "the largest rung fits and the next row group does not");
+        }
+
+        // The hold: the whole plan of every buffer still short of it.
+        using ggml_sycl::zone_planned_buffer;
+        size_t hold = 1;
+        {
+            const zone_planned_buffer fresh[] = { { 10027264, 0 }, { 0, 0 }, { 0, 0 } };
+            CHECK(ggml_sycl::zone_planned_scratch_hold_bytes(fresh, 3, &hold) && hold == 10027264,
+                  "an unmaterialized plan is held in full: the incident's 9.6 MB");
+        }
+        {
+            const zone_planned_buffer met[] = { { 10027264, 10027264 }, { 4096, 8192 } };
+            CHECK(ggml_sycl::zone_planned_scratch_hold_bytes(met, 2, &hold) && hold == 0,
+                  "a buffer at or above its plan holds nothing back");
+        }
+        {
+            // Growth allocates the replacement while the old backing is live, so the shortfall is not enough.
+            const zone_planned_buffer growing[] = { { 40108288, 10027264 }, { 1048576, 1048576 } };
+            CHECK(ggml_sycl::zone_planned_scratch_hold_bytes(growing, 2, &hold) && hold == 40108288,
+                  "a buffer short of a larger plan holds the whole new plan, not the difference");
+        }
+        {
+            const zone_planned_buffer mixed[] = { { 100, 0 }, { 200, 200 }, { 300, 1 } };
+            CHECK(ggml_sycl::zone_planned_scratch_hold_bytes(mixed, 3, &hold) && hold == 400,
+                  "only the buffers still short of their plan are summed");
+        }
+        {
+            const zone_planned_buffer huge[] = { { SIZE_MAX, 0 }, { 1, 0 } };
+            CHECK(!ggml_sycl::zone_planned_scratch_hold_bytes(huge, 2, &hold), "an overflowing hold is refused");
+        }
+        CHECK(ggml_sycl::zone_planned_scratch_hold_bytes(nullptr, 0, &hold) && hold == 0, "no buffers hold nothing");
+        CHECK(!ggml_sycl::zone_planned_scratch_hold_bytes(nullptr, 0, nullptr), "a null out is refused");
+
+        // A spill-capable request cannot take the held bytes.
+        CHECK(!ggml_sycl::zone_runtime_alloc_respects_hold(64 * MiB, 10027264, 64 * MiB),
+              "a request that would leave less than the hold free spills");
+        CHECK(!ggml_sycl::zone_runtime_alloc_respects_hold(300 * 1024, 10027264, 300 * 1024),
+              "the incident: 0.3 MB free, a 9.6 MB hold, nothing may take the 0.3 MB");
+        CHECK(ggml_sycl::zone_runtime_alloc_respects_hold(100 * MiB, 10027264, 64 * MiB),
+              "a request that leaves the hold free is served from the zone");
+        CHECK(ggml_sycl::zone_runtime_alloc_respects_hold(64 * MiB + 10027264, 10027264, 64 * MiB),
+              "the boundary is inclusive: exactly the hold is left");
+        CHECK(!ggml_sycl::zone_runtime_alloc_respects_hold(64 * MiB + 10027263, 10027264, 64 * MiB),
+              "one byte under the boundary spills");
+        CHECK(ggml_sycl::zone_runtime_alloc_respects_hold(64 * MiB, 0, 64 * MiB),
+              "with no hold the whole zone is available, as before");
+        CHECK(!ggml_sycl::zone_runtime_alloc_respects_hold(64 * MiB, 0, 64 * MiB + 1),
+              "a request larger than the zone never fits");
+        CHECK(!ggml_sycl::zone_runtime_alloc_respects_hold(SIZE_MAX, SIZE_MAX, 1),
+              "a hold that wraps must not read as no hold");
+    }
+
+    // ---- Case 15: review r1 of llama.cpp-kpjw: the held-back branch, the route a decline serves, merged inputs --
+    {
+        const size_t MiB  = 1024 * 1024;
+        const size_t hold = 10027264;
+
+        // The branch unified_alloc takes. Only a spill-capable request for the RUNTIME zone can be held back.
+        CHECK(ggml_sycl::zone_runtime_alloc_held_back(true, false, 300 * 1024, hold, 300 * 1024),
+              "the incident: a compute buffer asking a 0.3 MB-free zone is held back and spills");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 100 * MiB, hold, 64 * MiB),
+              "a request that leaves the hold free is served from the zone");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, true, 300 * 1024, hold, 300 * 1024),
+              "a forbid-spill request is a claimant of the plan and is never held back");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(false, false, 300 * 1024, hold, 300 * 1024),
+              "the hold is a RUNTIME-zone fact: no other zone's request is held back");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 300 * 1024, 0, 300 * 1024),
+              "with no hold nothing is held back");
+        CHECK(ggml_sycl::zone_runtime_alloc_held_back(true, false, SIZE_MAX, SIZE_MAX, 1),
+              "a hold that wraps must not read as no hold");
+        // Review r2 F1: held back means the ZONE ALONE would have served the request and the hold is what keeps it
+        // out. A request the zone cannot hold anyway spills exactly as it always did, with no hold involved, and
+        // the overcommit guard keeps evicting for it as it did before the hold existed.
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 50, 0, 100),
+              "an ordinary zone-full spill with no hold is not held back");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 50, 10, 100),
+              "a request larger than the zone's free bytes spills with or without a hold: not held back");
+        CHECK(ggml_sycl::zone_runtime_alloc_held_back(true, false, 100, 10, 95),
+              "a request the zone could serve that would eat into the hold is held back");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 100, 0, 95),
+              "the same request with no hold is served from the zone");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 100, 10, 90),
+              "a request that leaves exactly the hold is served from the zone");
+        CHECK(ggml_sycl::zone_runtime_alloc_held_back(true, false, 100, 10, 91),
+              "one byte into the hold is held back");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 300 * 1024, hold, 300 * 1024 + 1),
+              "the incident's zone-full request one byte over the free bytes is an ordinary spill");
+        // The B70 / Qwen3.6-27B run at auto-ub2048 (hardware, review r2): three compute-buffer requests of about
+        // 1 GiB each asked a RUNTIME zone with 0.3 MB free while the hold was 9.6 MB. They are ordinary zone-full
+        // spills, 2.9 GB in all; none of them is held back by the hold.
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 300 * 1024, 10027264, 1003413 * 1024),
+              "a ~1 GiB compute buffer asking a 0.3 MB-free zone is an ordinary spill, not held back");
+        CHECK(!ggml_sycl::zone_runtime_alloc_held_back(true, false, 300 * 1024, 10027264, (size_t) 3 << 30),
+              "a multi-GB request larger than the free bytes is never held back");
+        // Argument order is part of the contract: (runtime, forbid, available, hold, size). The zone's free bytes
+        // are the first of the three sizes; swapped with the request, the same numbers answer another question.
+        CHECK(ggml_sycl::zone_runtime_alloc_held_back(true, false, 100, 10, 95) &&
+                  !ggml_sycl::zone_runtime_alloc_held_back(true, false, 95, 10, 100),
+              "available is the zone's free bytes and size is the request, not the other way round");
+
+        // The route a node takes: the walks and the dispatch must agree, including after a runtime decline.
+        // (valid, unified, primary draws, fallback valid, fallback draws)
+        CHECK(ggml_sycl::zone_route_draws_scratch(true, false, true, false, false),
+              "a legacy kernel that draws the scratch is counted");
+        CHECK(!ggml_sycl::zone_route_draws_scratch(true, false, false, true, true),
+              "a legacy kernel that does not draw it is not counted, whatever the fallback would be");
+        CHECK(!ggml_sycl::zone_route_draws_scratch(true, true, false, false, false),
+              "a unified kernel the dispatch does not decline draws nothing");
+        CHECK(ggml_sycl::zone_route_draws_scratch(true, true, false, true, true),
+              "a node the unified kernel declines and a drawing legacy kernel then serves is counted: the f16 gap");
+        CHECK(!ggml_sycl::zone_route_draws_scratch(true, true, true, false, true),
+              "a decline with no valid legacy fallback draws nothing");
+        CHECK(!ggml_sycl::zone_route_draws_scratch(false, false, true, true, true), "an invalid decision draws nothing");
+
+        // Plan inputs are device-global. A second model on the device must not shrink the first one's plan.
+        CHECK(ggml_sycl::zone_dense_scratch_merge_input(19584, 4096, true) == 19584,
+              "another live model's larger plan input survives the load of a smaller one (draft + target)");
+        CHECK(ggml_sycl::zone_dense_scratch_merge_input(4096, 19584, true) == 19584,
+              "the larger of two live models wins either way");
+        CHECK(ggml_sycl::zone_dense_scratch_merge_input(19584, 4096, false) == 4096,
+              "with no other live model the new inputs replace the old: a model swap shrinks the plan");
+        CHECK(ggml_sycl::zone_dense_scratch_merge_input(0, 0, true) == 0, "nothing planned stays nothing");
+    }
+
+    // ---- Case 16: review r2/r3 (hardware): a rung is refused for its hold-induced spill only when that spill is
+    // what pushed the card under the driver headroom. B50, Qwen PPL at auto-ub1024: a 461 MB compute buffer was
+    // held back, spilled outside the arena, the card was left with 107.8 MB free against the 256 MB the arena
+    // expects outside it, and flash attention then ran out of resources. A card that was ALREADY under the headroom
+    // for another reason (a full B70, KB-scale spills) is not blamed on the hold. -----------------------------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(!ggml_sycl::zone_hold_spill_bound_fits(569 * MiB, 256 * MiB, 461 * MiB),
+              "the B50 ub1024 rung: 569 MB free before a 461 MB spill, 108 MB after: the spill pushed it under");
+        CHECK(ggml_sycl::zone_hold_spill_bound_fits(0, 256 * MiB, 0),
+              "no hold-induced spill: the check asks nothing, whatever the free memory is");
+        CHECK(ggml_sycl::zone_hold_spill_bound_fits(256 * MiB + 1, 256 * MiB, 1),
+              "a spill that leaves exactly the headroom fits");
+        CHECK(!ggml_sycl::zone_hold_spill_bound_fits(256 * MiB, 256 * MiB, 1),
+              "one byte below the headroom, and the spill's one byte is what crossed it: blamed");
+        CHECK(ggml_sycl::zone_hold_spill_bound_fits(4096 * MiB + 461 * MiB, 256 * MiB, 461 * MiB),
+              "a spill the card can take with its headroom intact fits: the hold costs a rung only when it must");
+        CHECK(ggml_sycl::zone_hold_spill_bound_fits(100 * MiB + 300 * 1024, 256 * MiB, 300 * 1024),
+              "a full card with a KB-scale spill was under the headroom before the spill: not blamed on the hold");
+        CHECK(ggml_sycl::zone_hold_spill_bound_fits(1, 256 * MiB, 1),
+              "a spill too small to have crossed the headroom is not what made the card short");
+        CHECK(ggml_sycl::zone_hold_spill_bound_fits(200 * MiB, 256 * MiB, 100 * MiB),
+              "the card was short without the hold: its spill is not what made it so");
+        CHECK(ggml_sycl::zone_hold_spill_bound_fits(200 * MiB, 256 * MiB, 966 * MiB),
+              "a demand larger than the card, on a card already under the headroom, is not the hold's doing either");
+        CHECK(!ggml_sycl::zone_hold_spill_bound_fits(300 * MiB, 256 * MiB, SIZE_MAX),
+              "an overflowing spill must not read as a small one");
+    }
+
+    // ---- Case 17: the spill bound follows the candidate rung (review r3 I1). The largest compute-buffer request
+    // is observed at one n_ubatch; a rung above it asks for proportionally more, so the bound scales with the rung. --
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_hold_spill_bound(76 * MiB, 230 * MiB, 512, 1024) == 536 * MiB,
+              "B50: a 230 MB request seen at ub512 scales to 460 MB at ub1024, plus the 76 MB plan");
+        CHECK(ggml_sycl::zone_hold_spill_bound(76 * MiB, 230 * MiB, 512, 512) == 306 * MiB,
+              "the rung the request was seen at needs no scaling");
+        CHECK(ggml_sycl::zone_hold_spill_bound(76 * MiB, 460 * MiB, 1024, 512) == 306 * MiB,
+              "a smaller rung than the one observed scales down (the settle re-publish of last_good)");
+        CHECK(ggml_sycl::zone_hold_spill_bound(76 * MiB, 230 * MiB, 0, 1024) == 306 * MiB,
+              "a request seen at an unknown n_ubatch is not scaled");
+        CHECK(ggml_sycl::zone_hold_spill_bound(76 * MiB, 0, 512, 1024) == 76 * MiB,
+              "nothing observed yet: the bound is the plan alone, and the comments say it is a lower bound");
+        CHECK(ggml_sycl::zone_hold_spill_bound(0, 230 * MiB, 512, 1024) == 0,
+              "no plan, no hold, nothing a hold can push out");
+        CHECK(ggml_sycl::zone_hold_spill_bound(76 * MiB, SIZE_MAX, 1, 2) == SIZE_MAX,
+              "a scaled request that overflows saturates");
+        CHECK(ggml_sycl::zone_hold_spill_bound(SIZE_MAX - 1, 230 * MiB, 512, 512) == SIZE_MAX,
+              "a plan plus a request that overflows saturates");
+        CHECK(ggml_sycl::zone_hold_spill_bound(76 * MiB, 230 * MiB, 512, 0) == 306 * MiB,
+              "an unknown candidate n_ubatch is not scaled");
+    }
+
+    // ---- Case 18: only the part of the worst-case spill that the arena's KV zone cannot take is OUTSIDE-arena
+    // demand (kpjw r3 design change). A compute buffer the RUNTIME zone will not serve is placed in the KV zone
+    // first; raw device memory is the last resort. -------------------------------------------------------------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_hold_spill_raw_demand(536 * MiB, 600 * MiB) == 0,
+              "a bound the KV zone can hold entirely is no outside-arena demand");
+        CHECK(ggml_sycl::zone_hold_spill_raw_demand(536 * MiB, 300 * MiB) == 236 * MiB,
+              "the KV zone takes what it can, the rest is raw");
+        CHECK(ggml_sycl::zone_hold_spill_raw_demand(536 * MiB, 0) == 536 * MiB,
+              "a full KV zone leaves the whole bound outside the arena");
+        CHECK(ggml_sycl::zone_hold_spill_raw_demand(536 * MiB, 536 * MiB) == 0,
+              "an exact fit is not a spill");
+        CHECK(ggml_sycl::zone_hold_spill_raw_demand(0, 100 * MiB) == 0, "no bound, no demand");
+        CHECK(ggml_sycl::zone_hold_spill_raw_demand(SIZE_MAX, 1) == SIZE_MAX - 1,
+              "a saturated bound minus the KV room stays huge, never wraps small");
+    }
+
+    // ---- Case 19: which RUNTIME-zone requests go to the KV zone before raw memory. Only a compute-buffer
+    // request (the caller's flag), spill-capable, that the RUNTIME zone will not serve, and only when the KV zone
+    // can hold it whole. Every other request class keeps today's path. -------------------------------------------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_runtime_spill_prefers_kv_zone(true, true, false, true, 600 * MiB, 460 * MiB),
+              "a held-back or zone-full compute buffer that the KV zone can hold goes there");
+        CHECK(!ggml_sycl::zone_runtime_spill_prefers_kv_zone(true, true, false, true, 400 * MiB, 460 * MiB),
+              "a KV zone too small for it is no placement: the raw path decides");
+        CHECK(!ggml_sycl::zone_runtime_spill_prefers_kv_zone(true, true, false, false, 600 * MiB, 460 * MiB),
+              "a request the RUNTIME zone serves stays in the RUNTIME zone");
+        CHECK(!ggml_sycl::zone_runtime_spill_prefers_kv_zone(false, true, false, true, 600 * MiB, 460 * MiB),
+              "a request that is not a compute buffer keeps the pre-existing spill path");
+        CHECK(!ggml_sycl::zone_runtime_spill_prefers_kv_zone(true, false, false, true, 600 * MiB, 460 * MiB),
+              "only the RUNTIME zone's misses are redirected");
+        CHECK(!ggml_sycl::zone_runtime_spill_prefers_kv_zone(true, true, true, true, 600 * MiB, 460 * MiB),
+              "a forbid-spill claimant is refused, never placed elsewhere");
+        CHECK(ggml_sycl::zone_runtime_spill_prefers_kv_zone(true, true, false, true, 460 * MiB, 460 * MiB),
+              "an exact fit in the KV zone is a fit");
+    }
+
+    // ---- Case 20: the KV room a compute buffer can count on (review r4 I1). The runtime transaction publishes
+    // BEFORE the context's KV exists, so the zone still shows free the bytes this context's own KV is about to
+    // take; and a buffer is indivisible, so only the largest free block counts. -----------------------------------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_kv_room_for_compute(600 * MiB, 0) == 600 * MiB,
+              "KV already live (the recheck, a settle): the whole largest block is room");
+        CHECK(ggml_sycl::zone_kv_room_for_compute(600 * MiB, 400 * MiB) == 200 * MiB,
+              "the KV this transaction will place is not room for a compute buffer");
+        CHECK(ggml_sycl::zone_kv_room_for_compute(300 * MiB, 400 * MiB) == 0,
+              "a KV that takes more than the largest block leaves nothing, never a wrapped huge figure");
+        CHECK(ggml_sycl::zone_kv_room_for_compute(0, 0) == 0, "an empty zone is no room");
+        CHECK(ggml_sycl::zone_kv_room_for_compute(SIZE_MAX, SIZE_MAX) == 0, "an exact consumption is no room");
+        // The F3 estimate with the netting: B50 shape, a 536 MB worst-case spill, KV zone showing 900 MB of which
+        // this context's KV will take 600 MB.
+        CHECK(ggml_sycl::zone_hold_spill_raw_demand(536 * MiB, ggml_sycl::zone_kv_room_for_compute(900 * MiB, 600 * MiB)) ==
+                  236 * MiB,
+              "un-netted the same bound reads as 0 raw demand and F3 checks nothing");
+    }
+
+    // ---- Case 24 (kpjw-g7 unification, P4: one fact, one source): ONE fit function answers the transaction-time
+    // bound (F3), the ladder's realized check and the pinned -ub check, over the same inputs: the plan at the rung,
+    // the rung's recorded worst-case request, the KV room net of what is pending, and the card's free memory with
+    // the rung's own buffers released. The B50 / Qwen3.6-27B case of g7 (-c 512): plan 75.6 MB, request 495.0 MB at
+    // 512 (990.0 MB at 1024), 100.6 MB of KV-zone room, 1097 MB free once the rung's buffers are gone. -------------
+    {
+        const size_t MiB  = 1024 * 1024;
+        const size_t head = 256 * MiB;
+        auto         plan = [](void *, uint32_t) -> size_t { return 76 * 1024 * 1024; };
+        ggml_sycl::zone_hold_rung_request rungs[] = { { 512, 495 * MiB }, { 1024, 990 * MiB } };
+        ggml_sycl::zone_hold_fit_inputs   in      = {};
+        in.headroom_target                        = head;
+        in.free_before                            = 1097 * MiB;
+        in.kv_room                                = 100 * MiB;
+        in.rungs                                  = rungs;
+        in.n_rungs                                = 2;
+        in.plan_of                                = plan;
+        CHECK(ggml_sycl::zone_hold_fit(in, 512), "512 fits the B50 once its own buffers are released (pinned 512 runs)");
+        CHECK(!ggml_sycl::zone_hold_fit(in, 1024), "1024 does not: 966 MB of demand leaves 131 MB of a 1097 MB card");
+        const uint32_t named = ggml_sycl::zone_hold_fit_largest_ub(in, 1024);
+        CHECK(named == 512, "the -ub a refusal at 1024 prints is 512, the same function's largest accepted rung");
+        CHECK(ggml_sycl::zone_hold_fit(in, named), "the printed N passes F3 under the same inputs");
+        CHECK(!ggml_sycl::zone_hold_fit(in, named * 2), "and N*2 fails");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 512) == 512, "a rung that fits is returned unchanged");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 0) == 0, "an unknown n_ubatch names nothing");
+        // The demand the function judges is the plan plus the rung's request net of the KV room, whatever consumer asks.
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 1024) == 76 * MiB + 990 * MiB - 100 * MiB,
+              "demand = plan + the rung's own recorded request - KV room");
+        // The refusal is the hold's doing only when the card was above the headroom without it.
+        in.free_before = 200 * MiB;
+        CHECK(ggml_sycl::zone_hold_fit(in, 1024), "short without the demand too: not the hold's doing");
+        // No rung fits: 0, never a made-up -ub.
+        in.free_before = 1097 * MiB;
+        in.kv_room     = 0;
+        ggml_sycl::zone_hold_rung_request big[] = { { 1024, 1200 * MiB } };
+        in.rungs                                = big;
+        in.n_rungs                              = 1;
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 1024) != 1024, "a rung whose own request cannot fit is not named");
+    }
+
+    // ---- Case 25 (kpjw-g7 B, order independence): the verdict for a rung is a function of the configuration and
+    // THAT rung's measured request, not of which other rungs ran before it or in what order. A rung with its own
+    // record uses it and only it; a rung without one is scaled from the SET of records (order never matters). -----
+    {
+        const size_t MiB  = 1024 * 1024;
+        auto         plan = [](void *, uint32_t) -> size_t { return 76 * 1024 * 1024; };
+        ggml_sycl::zone_hold_fit_inputs in = {};
+        in.headroom_target                 = 256 * MiB;
+        in.free_before                     = 1097 * MiB;
+        in.kv_room                         = 100 * MiB;
+        in.plan_of                         = plan;
+        ggml_sycl::zone_hold_rung_request own[]   = { { 512, 495 * MiB } };
+        ggml_sycl::zone_hold_rung_request other[] = { { 512, 495 * MiB }, { 1024, 990 * MiB }, { 2048, 4000 * MiB } };
+        ggml_sycl::zone_hold_rung_request rev[]   = { { 2048, 4000 * MiB }, { 1024, 990 * MiB }, { 512, 495 * MiB } };
+        in.rungs = own;
+        in.n_rungs = 1;
+        const bool first = ggml_sycl::zone_hold_fit(in, 512);
+        const size_t d1  = ggml_sycl::zone_hold_fit_demand(in, 512);
+        in.rungs = other;
+        in.n_rungs = 3;
+        CHECK(ggml_sycl::zone_hold_fit(in, 512) == first && ggml_sycl::zone_hold_fit_demand(in, 512) == d1,
+              "the same rung twice, with other rungs' history in between, gives the same demand and verdict");
+        in.rungs = rev;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 512) == d1, "the order the records were made in does not matter");
+        // A rung nobody measured is scaled from the set, the same way whatever order the set is in.
+        ggml_sycl::zone_hold_rung_request sparse_a[] = { { 512, 495 * MiB }, { 2048, 1980 * MiB } };
+        ggml_sycl::zone_hold_rung_request sparse_b[] = { { 2048, 1980 * MiB }, { 512, 495 * MiB } };
+        in.rungs = sparse_a;
+        in.n_rungs = 2;
+        const size_t scaled_a = ggml_sycl::zone_hold_fit_demand(in, 1024);
+        in.rungs = sparse_b;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 1024) == scaled_a, "an unmeasured rung is scaled order-independently");
+        in.n_rungs = 0;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 1024) == 0, "with no record the demand is the plan alone, less the room");
+        in.kv_room = 0;
+        CHECK(ggml_sycl::zone_hold_fit_demand(in, 1024) == 76 * MiB, "and the plan alone when there is no room (a lower bound)");
+    }
+
+    // ---- Case 26 (kpjw-g7 C, one model of free memory): the card's free memory is the cache's own ledger, never a
+    // driver read taken after a release (credit lags: 602.7 MB read where 1097 MB was true). cold = the driver's
+    // reading plus the outside-arena bytes the cache holds live; free_before = cold less what stays live without the
+    // rung. Releasing the rung's buffers and evaluating gives the answer evaluating before releasing gives, with the
+    // released bytes credited. -----------------------------------------------------------------------------------
+    {
+        const size_t MiB        = 1024 * 1024;
+        const size_t persistent = 461 * MiB;  // the recurrent-state buffer: live before the ladder, and after it
+        const size_t own        = 495 * MiB;  // the rung's raw compute landing
+        const size_t driver_true = 1097 * MiB;
+        // Evaluated live: the driver sees the rung's buffer, the ledger holds it.
+        const size_t cold_live   = ggml_sycl::zone_hold_free_cold(driver_true - own, persistent + own);
+        const size_t before_live = ggml_sycl::zone_hold_free_before(cold_live, persistent);
+        CHECK(before_live == driver_true, "evaluated live, the rung's own bytes are credited back: the true free memory");
+        // The registered-then-released raw row (the real ledger, not this arithmetic) is test-sycl-hold-ledger.
+        CHECK(ggml_sycl::zone_hold_free_before(100 * MiB, 300 * MiB) == 0, "never below zero");
+        CHECK(ggml_sycl::zone_hold_free_cold(SIZE_MAX, 1) == SIZE_MAX, "saturating");
+    }
+
+    // ---- Case 27 (kpjw-r7 I3, identity by origin): what stays live without the rung is every raw byte the cache
+    // holds except the rung's OWN scheduler compute buffers, and only when the rung's buffers are live. A raw byte
+    // allocated after the epoch began that is not a scheduler compute buffer (the recurrent state, made after a
+    // pinned -ub's one publish) is persistent, however late it came. -----------------------------------------------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_hold_persistent_raw(956 * MiB, 495 * MiB, true) == 461 * MiB,
+              "a live rung: the held raw bytes less its own compute buffers (the 461 MB state stays)");
+        CHECK(ggml_sycl::zone_hold_persistent_raw(956 * MiB, 495 * MiB, false) == 956 * MiB,
+              "a transaction (no live rung): every held raw byte is persistent");
+        CHECK(ggml_sycl::zone_hold_persistent_raw(461 * MiB, 0, true) == 461 * MiB,
+              "no scheduler compute rows live: nothing is credited back");
+        CHECK(ggml_sycl::zone_hold_persistent_raw(100 * MiB, 300 * MiB, true) == 0,
+              "compute rows can never credit more than is held");
+    }
+
+    // ---- Case 28 (kpjw-r7 I2, the baseline): within a window the cold reading is the MAXIMUM of the readings taken
+    // (the driver's lag only ever lowers a reading, never raises it, so a later, healthier read repairs a stale-low
+    // first one and a later, lagged read never lowers it); the first reading of a window is taken as it comes. ------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_hold_cold_update(false, 0, 600 * MiB) == 600 * MiB,
+              "the first reading of a window stands");
+        CHECK(ggml_sycl::zone_hold_cold_update(true, 1097 * MiB, 602 * MiB) == 1097 * MiB,
+              "a later lagged (stale-low) reading does not lower the baseline");
+        CHECK(ggml_sycl::zone_hold_cold_update(true, 602 * MiB, 1097 * MiB) == 1097 * MiB,
+              "a later healthier reading repairs a stale-low first one");
+        CHECK(ggml_sycl::zone_hold_cold_update(false, 5000 * MiB, 100 * MiB) == 100 * MiB,
+              "a new window forgets the previous one (another tenant may have arrived since)");
+    }
+
+    // ---- Case 29 (kpjw-r7 I3, the KV room): a rung that is live is judged with the room its epoch began with; any
+    // other asker (a transaction) reads the zone as it is. An epoch whose room was never stored does not stand in. --
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_hold_pick_kv_room(true, true, 100 * MiB, 40 * MiB) == 100 * MiB,
+              "live rung: the epoch's room");
+        CHECK(ggml_sycl::zone_hold_pick_kv_room(true, false, 100 * MiB, 40 * MiB) == 40 * MiB,
+              "no epoch yet: the zone now");
+        CHECK(ggml_sycl::zone_hold_pick_kv_room(false, true, 100 * MiB, 40 * MiB) == 40 * MiB,
+              "a transaction: the zone now");
+        CHECK(ggml_sycl::zone_hold_pick_kv_room(true, true, 0, 40 * MiB) == 0,
+              "an epoch that stored no room is honoured as stored");
+    }
+
+    // ---- Case 30 (kpjw-r7 I1): the non-FA demand is the non-FA scratch PLUS the hold's worst-case spill, saturating
+    // -- the hold term is never dropped. --------------------------------------------------------------------------
+    {
+        const size_t MiB = 1024 * 1024;
+        CHECK(ggml_sycl::zone_hold_nonfa_demand(300 * MiB, 200 * MiB) == 500 * MiB, "scratch + hold spill");
+        CHECK(ggml_sycl::zone_hold_nonfa_demand(300 * MiB, 0) == 300 * MiB, "no hold: the scratch alone");
+        CHECK(ggml_sycl::zone_hold_nonfa_demand(SIZE_MAX, 1) == SIZE_MAX,
+              "a wrapped sum must not read as a small demand");
+        CHECK(ggml_sycl::zone_hold_nonfa_demand(1, SIZE_MAX) == SIZE_MAX, "saturating on either term");
+    }
+
+    // ---- Case 31 (kpjw-r7 M6/M8): the -ub a refusal names. N passes and N*2 fails only while N*2 is a rung that
+    // was ever asked (not above n_ubatch); a non-power-of-two n_ubatch names the power of two under it; an N under the
+    // descent floor (64) is still returned (it is the largest the function accepts, not a rung the descent walks). ---
+    {
+        const size_t MiB  = 1024 * 1024;
+        auto         plan = [](void *, uint32_t) -> size_t {
+            return 10 * 1024 * 1024;
+        };
+        ggml_sycl::zone_hold_rung_request rungs[] = {
+            { 600, 600 * MiB }
+        };
+        ggml_sycl::zone_hold_fit_inputs in = {};
+        in.headroom_target                 = 256 * MiB;
+        in.free_before                     = 700 * MiB;
+        in.kv_room                         = 0;
+        in.rungs                           = rungs;
+        in.n_rungs                         = 1;
+        in.plan_of                         = plan;
+        // Plan 10 MB. 600 (600 MB) leaves 90 MB < 256 MB: refused; 512 scales to 512 MB, leaving 178 MB: refused; 256
+        // scales to 256 MB, leaving 434 MB: fits.
+        CHECK(!ggml_sycl::zone_hold_fit(in, 600), "600 does not fit");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 600) == 256,
+              "a non-power-of-two n_ubatch names the power of two under it");
+        in.free_before = 300 * MiB;
+        // Only tiny rungs fit: 64 leaves 226 MB, refused; 32 scales to 32 MB, leaving 258 MB >= 256 MB.
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 600) == 32, "an N under the descent floor is still named");
+        ggml_sycl::zone_hold_rung_request huge[] = {
+            { 600, 6000 * MiB }
+        };
+        in.rungs = huge;
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 600) == 0, "when no rung fits, nothing is named");
+        // Below the 32 floor nothing is searched: a refused n_ubatch under 32 names 0, never a rung ABOVE it. The plan
+        // here is deliberately larger for the small n_ubatch, so a search that started at 32 would find a fit and name
+        // 32 for a request of 31.
+        auto plan_small_costs_more = [](void *, uint32_t n_ubatch) -> size_t {
+            return n_ubatch < 32 ? 400 * 1024 * 1024 : 1024 * 1024;
+        };
+        ggml_sycl::zone_hold_rung_request tiny[] = {
+            { 32, 1 * MiB }
+        };
+        in.rungs   = tiny;
+        in.plan_of = plan_small_costs_more;
+        CHECK(!ggml_sycl::zone_hold_fit(in, 31), "31 does not fit under the 400 MB plan");
+        CHECK(ggml_sycl::zone_hold_fit(in, 32), "32 fits under the 1 MB plan");
+        CHECK(ggml_sycl::zone_hold_fit_largest_ub(in, 31) == 0, "a refused n_ubatch under 32 names nothing above it");
+    }
+
+    // ---- Case 32 (kpjw-r7 I5, N4/N5): the compute-allocation scope is a per-thread depth that cannot go negative. A
+    // leave without an enter (a guard destroyed after an exception unwound past its enter) leaves the scope closed,
+    // and one thread's open scope is not another's. ---------------------------------------------------------------
+    {
+        CHECK(!ggml_sycl::compute_alloc_scope_active(), "closed to start with");
+        ggml_sycl::compute_alloc_scope_leave();
+        ggml_sycl::compute_alloc_scope_enter();
+        CHECK(ggml_sycl::compute_alloc_scope_active(),
+              "a stray leave does not push the depth negative: the next enter opens it");
+        bool        other_thread_active = true;
+        std::thread t([&] { other_thread_active = ggml_sycl::compute_alloc_scope_active(); });
+        t.join();
+        CHECK(!other_thread_active, "another thread does not see this thread's open scope");
+        ggml_sycl::compute_alloc_scope_enter();
+        ggml_sycl::compute_alloc_scope_leave();
+        CHECK(ggml_sycl::compute_alloc_scope_active(), "nested: still open after the inner leave");
+        ggml_sycl::compute_alloc_scope_leave();
+        CHECK(!ggml_sycl::compute_alloc_scope_active(), "closed after the matching leaves");
     }
 
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
