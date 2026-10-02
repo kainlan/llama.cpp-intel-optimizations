@@ -55,47 +55,63 @@ def reserve_call_arguments(source):
     return calls
 
 
-# The pre-ijla upsize and every hoisted variant of it: `std::max(planned...` in any spelling of the whitespace,
-# `std::max<size_t>(...)`, `(std::max)(...)`, the planned value as the second or a cast argument, and the
-# ternary spelling of the same max (`planned_x > y ? planned_x : y`).
-PLANNED_MAX_CALL = re.compile(r"(?:std\s*::\s*max|\(\s*std\s*::\s*max\s*\))\s*(?:<[^>]*>)?\s*\(")
-_OPERAND = r"[\w:.\[\]()]+"
-# `a > b ? a : b` / `a < b ? b : a`: the same two operands compared and then selected from.
-PLANNED_TERNARY = re.compile(r"(%s)\s*[<>]=?\s*(%s)\s*\?\s*(%s)\s*:\s*(%s)" % ((_OPERAND,) * 4))
-# The single legitimate site (llama.cpp-479i): the dense Q8_1 src1 buffer is sized to its graph-entry demand.
-DENSE_Q8_1_SRC1_GROWTH = re.compile(r"std::max\s*\(\s*planned_bytes\s*,\s*demand\s*\[\s*d\s*\]\s*\.bytes\s*\)")
-# The other 479i site, which the `planned`-substring match (rev-qeld-final M8) now sees: the graph-entry target of the
-# dense f16 dequant buffers, `max(planned bytes, this graph's widest demand)`, refused before submission when the
-# RUNTIME zone cannot hold it. Same cohort as the site above (a dense dequant buffer sized to its own graph-entry
-# demand), not the PP MoE oneDNN scratch ring this gate protects.
-DENSE_F16_GRAPH_ENTRY_TARGET = re.compile(
-    r"std::max\s*\(\s*ggml_sycl::unified_cache_get_planned_dequant_f16_buffer_bytes\s*\(\s*d\s*,\s*b\.is_src1\s*\)"
-    r"\s*,\s*b\.demand\s*\)")
-EXEMPT_SITES = (DENSE_Q8_1_SRC1_GROWTH, DENSE_F16_GRAPH_ENTRY_TARGET)
+# The planned slot sizes are pinned POSITIVELY, not by a blacklist of the spellings of max(planned, required): a
+# blacklist (std::max, ternary, GGML_MAX, sycl::max, `using std::max`, an alias) is always one spelling behind, and it
+# collides with the legitimate maxima elsewhere in the file (479i's dense dequant buffers are sized to their own
+# graph-entry demand). The property is that the ring the planner sized is what gets reserved, so:
+#   * each call site reads its three slot sizes ONCE, as `const size_t NAME = <planner getter>(ctx.device);`;
+#   * nothing assigns to, increments or takes the address of those names afterwards;
+#   * the reservation's first three arguments ARE those names, nothing computed from them.
+PLANNED_SITES = (
+    (("planned_weight", "weight"), ("planned_act", "activation"), ("planned_out", "output")),
+    (("planned_weight_slot", "weight"), ("planned_activation_slot", "activation"), ("planned_output_slot", "output")),
+)
 
 
-def without_exempt_sites(source):
-    for exempt in EXEMPT_SITES:
-        source = exempt.sub("", source)
-    return source
+def blank_strings(source):
+    """String literals emptied: a log format's `planned_weight=%zu` is not a write to planned_weight."""
+    return re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', source)
 
 
-def planned_upsizes(source):
-    """Every place `source` takes a max of a planned size with something else (see PLANNED_MAX_CALL). An operand
-    counts as planned when `planned` appears anywhere in its name (`cached_planned_weight`), not only at its start."""
-    sites = []
-    for match in PLANNED_MAX_CALL.finditer(source):
-        depth, index = 1, match.end()
-        while index < len(source) and depth:
-            depth += (source[index] == "(") - (source[index] == ")")
-            index += 1
-        if re.search(r"planned", source[match.end():index - 1]):
-            sites.append(source[match.start():index])
-    for match in PLANNED_TERNARY.finditer(source):
-        left, right, first, second = match.groups()
-        if {first, second} == {left, right} and re.search(r"planned", left + " " + right):
-            sites.append(match.group(0))
-    return sites
+def planned_slot_declaration(name, kind):
+    return re.compile(r"\bconst\s+size_t\s+%s\s*=\s*ggml_sycl::unified_cache_get_planned_pp_moe_onednn_%s_slot_bytes"
+                      r"\s*\(\s*ctx\s*\.\s*device\s*\)\s*;" % (name, kind))
+
+
+def planned_slot_pinned(region, name, kind):
+    """In this executor's body `name` is declared exactly once, as the const planner read, and never written."""
+    region = blank_strings(region)
+    declaration = planned_slot_declaration(name, kind)
+    if len(declaration.findall(region)) != 1:
+        return False
+    rest = declaration.sub("", region)
+    if re.search(r"\b[\w:<>]+\s+%s\b" % name, rest):
+        return False  # a second (shadowing) declaration of the same name
+    writes = (r"\b%(n)s\b\s*(?:[-+*/%%&|^]|<<|>>)?=(?!=)", r"(?:\+\+|--)\s*\b%(n)s\b", r"\b%(n)s\b\s*(?:\+\+|--)",
+              r"&\s*%(n)s\b")
+    return not any(re.search(pattern % {"n": name}, rest) for pattern in writes)
+
+
+def top_level_arguments(text):
+    out, depth, current = [], 0, []
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    out.append("".join(current).strip())
+    return out
+
+
+def reservation_passes_the_plan(region, site):
+    """The executor's only reserve call passes the site's three planned names, verbatim and in order."""
+    calls = [top_level_arguments(call)[:3] for call in reserve_call_arguments(region)]
+    return calls == [[name for name, _ in site]]
 
 
 def strip_comments(source):
@@ -265,16 +281,11 @@ def evaluate(sycl, cache, module, header, doc=""):
         # budgeted zone into a high-water mark of every shape ever seen.
         # The reservation's own arguments may not carry a max ...
         "no PP MoE scratch reservation upsizes past the plan":
-            reserve_call_arguments(sycl) != [] and not any("std::max(" in call for call in reserve_call_arguments(sycl)),
-        # ... and neither may anything ELSE in the file. Scoping the ban to the call's argument text (the first
-        # repair of llama.cpp-479i's dense Q8_1 src1 buffer) let the same max be hoisted to the line before the
-        # call, which is the pre-ijla "zone becomes the high-water mark" defect again. So the ban is file-wide
-        # and exempts exactly TWO spellings, each exactly once (EXEMPT_SITES): 479i's
-        # `std::max(planned_bytes, demand[d].bytes)` and its graph-entry `std::max(planned dequant bytes, b.demand)`,
-        # a different cohort planned to its own graph-entry demand that logs or refuses any growth.
-        "no std::max(planned ...) survives outside the two 479i sites":
-            all(len(exempt.findall(sycl)) == 1 for exempt in EXEMPT_SITES)
-            and not planned_upsizes(without_exempt_sites(sycl)),
+            reservation_passes_the_plan(batched, PLANNED_SITES[0]) and reservation_passes_the_plan(staging, PLANNED_SITES[1]),
+        # ... and the names it passes are the planner's own values, read once and never written (see PLANNED_SITES).
+        "the planned slot sizes are read once, const, and never reassigned":
+            all(planned_slot_pinned(region, name, kind)
+                for region, site in ((batched, PLANNED_SITES[0]), (staging, PLANNED_SITES[1])) for name, kind in site),
         # ABSENCE: with a general fallback present, refusing costs nothing and
         # the cap is decorative -- the batch simply allocates its own scratch.
         "the batched executor keeps no general temporary fallback":
@@ -363,12 +374,6 @@ ABSENCE_MUTANTS = {
         "            if (!cache->reserve_pp_moe_onednn_scratch(std::max(planned_weight, weight_bytes),\n"
         "                                                     std::max(planned_act, act_bytes),\n"
         "                                                     std::max(planned_out, out_bytes), ring_depth)) {"),
-    # The same max, hoisted to the line before the call so the call's argument text stays clean.
-    "no std::max(planned ...) survives outside the two 479i sites": (
-        "sycl",
-        "            if (!cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)) {",
-        "            const size_t hoisted_weight = std::max(planned_weight, weight_bytes);\n"
-        "            if (!cache->reserve_pp_moe_onednn_scratch(hoisted_weight, planned_act, planned_out, ring_depth)) {"),
     "the batched executor keeps no general temporary fallback": (
         "sycl",
         "            pp_moe_onednn_scratch_claim batched_scratch_claim;\n\n"
@@ -417,21 +422,23 @@ ABSENCE_MUTANTS = {
 }
 
 
-# More spellings of the hoisted max, each of which must trip the same check as the plain one.
-PLANNED_MAX_SPELLINGS = (
-    "const size_t h = std::max<size_t>(planned_weight, weight_bytes);",
-    "const size_t h = std::max(weight_bytes, planned_weight);",
-    "const size_t h = std::max(static_cast<size_t>(planned_weight), weight_bytes);",
-    "const size_t h = (std::max)(planned_weight, weight_bytes);",
-    "const size_t h = planned_weight > weight_bytes ? planned_weight : weight_bytes;",
-    "const size_t h = weight_bytes > planned_weight ? weight_bytes : planned_weight;",
-    # a second use of the one exempt spelling is still a second site
-    "const size_t h = std::max(planned_bytes, demand[d].bytes);",
-    "const size_t h = std::max(ggml_sycl::unified_cache_get_planned_dequant_f16_buffer_bytes(d, b.is_src1), b.demand);",
-    # the planned value under a name that does not START with `planned`
-    "const size_t h = std::max(cached_planned_weight, weight_bytes);",
-    "const size_t h = std::max(weight_bytes, hoisted_planned_weight);",
-    "const size_t h = cached_planned_weight > weight_bytes ? cached_planned_weight : weight_bytes;",
+# Ways to grow the planned slot size before the reservation, each of which must trip the positive pin. Every one is
+# applied twice: with the declaration's `const` dropped (so it would compile) and with `const` kept (the write
+# check, not the compiler, has to refuse it). The last two never write the planned name at all: the grown value is
+# passed to the reservation under another name.
+PLANNED_W = "ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(ctx.device);"
+PLANNED_REWRITES = (
+    ("if-assign", "if (weight_bytes > planned_weight) { planned_weight = weight_bytes; }"),
+    ("paren-ternary", "planned_weight = (weight_bytes > planned_weight) ? weight_bytes : planned_weight;"),
+    ("GGML_MAX", "planned_weight = GGML_MAX(planned_weight, weight_bytes);"),
+    ("sycl-max", "planned_weight = sycl::max(planned_weight, weight_bytes);"),
+    ("using-std-max", "using std::max; planned_weight = max(planned_weight, weight_bytes);"),
+    ("alias-then-max", "{ const size_t w0 = planned_weight; planned_weight = std::max(w0, weight_bytes); }"),
+    ("compound-assign", "planned_weight += weight_bytes;"),
+    ("increment", "++planned_weight;"),
+    ("address-taken", "grow_in_place(&planned_weight, weight_bytes);"),
+    ("shadowing-redeclaration", "{ size_t planned_weight = weight_bytes; (void) planned_weight; }"),
+    ("shadowing-brace-init", "{ size_t planned_weight{weight_bytes}; (void) planned_weight; }"),
 )
 
 
@@ -439,14 +446,34 @@ def self_test(sycl, cache, module, header, doc):
     """Every absence check must fail once its forbidden construct is injected."""
     problems = []
     call_site = squeeze("            if (!cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)) {")
-    for spelling in PLANNED_MAX_SPELLINGS:
-        base = squeeze(sycl)
-        if call_site not in base:
-            problems.append("mutation anchor missing for the planned-max spellings")
-            break
-        _, failed, _ = evaluate(base.replace(call_site, squeeze(spelling + "\n" + call_site), 1), cache, module, header, doc)
-        if "no std::max(planned ...) survives outside the two 479i sites" not in failed:
-            problems.append("planned-max check did not fire on: " + spelling)
+    check = "the planned slot sizes are read once, const, and never reassigned"
+    declaration = squeeze("            const size_t planned_weight =\n                " + PLANNED_W)
+    for label, statement in PLANNED_REWRITES:
+        for unconst in (True, False):
+            base = squeeze(sycl)
+            if call_site not in base or declaration not in base:
+                problems.append("mutation anchor missing for the planned-slot rewrites")
+                break
+            if unconst:
+                base = base.replace(declaration, declaration.replace("const size_t", "size_t", 1), 1)
+            mutated = base.replace(call_site, squeeze("            " + statement + "\n" + call_site), 1)
+            _, failed, _ = evaluate(mutated, cache, module, header, doc)
+            if check not in failed:
+                problems.append("planned-slot pin did not fire on: %s (%s)" % (label, "const dropped" if unconst else "const kept"))
+    # Dropping `const` alone writes nothing, but the declaration is no longer the pinned read-only one.
+    base = squeeze(sycl)
+    _, failed, _ = evaluate(base.replace(declaration, declaration.replace("const size_t", "size_t", 1), 1), cache, module,
+                            header, doc)
+    if check not in failed:
+        problems.append("planned-slot pin did not fire on: const dropped, nothing written")
+    # Computed under another name and passed to the reservation: the planned names are untouched, the call is not.
+    for label, hoist in (("std-max-under-another-name", "const size_t grown_w = std::max(planned_weight, weight_bytes);"),
+                         ("alias-then-std-max", "const size_t cap_w = planned_weight; const size_t grown_w = std::max(cap_w, weight_bytes);")):
+        mutated = squeeze(sycl).replace(
+            call_site, squeeze("            " + hoist + "\n" + call_site.replace("(planned_weight,", "(grown_w,")), 1)
+        _, failed, _ = evaluate(mutated, cache, module, header, doc)
+        if "no PP MoE scratch reservation upsizes past the plan" not in failed:
+            problems.append("reservation pin did not fire on: " + label)
     for name, (target, anchor, replacement) in ABSENCE_MUTANTS.items():
         sources = {"sycl": sycl, "cache": cache, "module": module, "header": header}
         anchor, replacement = squeeze(anchor), squeeze(replacement)
