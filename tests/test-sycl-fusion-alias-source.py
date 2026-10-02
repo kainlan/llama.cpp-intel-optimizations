@@ -44,6 +44,24 @@ FUNCTION_SITES = [
 ]
 
 
+# What each bit0 site must hand to the gate, whitespace-insensitive: the output it writes (and, for the router,
+# the argsort), the operands it reads, whether each may be in place, and the counts. A different tensor, a
+# dropped operand or `in_place_ok` flipped on the router activation (read by every subgroup) is a wiring bug the
+# host test cannot see.
+FUNCTION_PINS = {
+    "GGML_SYCL_FUSION_SITE_MUL_MAT_ADD": [
+        "constggml_sycl_fusion_operandwrites={add,out_ptr,true};",
+        "constggml_sycl_fusion_operandreads={addend,addend_ptr,true};",
+        "ggml_sycl_fusion_alias_admit(GGML_SYCL_FUSION_SITE_MUL_MAT_ADD,add->name,&writes,1,&reads,1)",
+    ],
+    "GGML_SYCL_FUSION_SITE_ROUTER": [
+        "constggml_sycl_fusion_operandwrites[2]={{add,probs_ptr,true},{sort,sort_ptr,true}};",
+        "constggml_sycl_fusion_operandreads[2]={{act,act_ptr,false},{addend,bias_ptr,true}};",
+        "ggml_sycl_fusion_alias_admit(GGML_SYCL_FUSION_SITE_ROUTER,add->name,writes,2,reads,2)",
+    ],
+}
+
+
 def matching_brace(text: str, open_idx: int) -> int:
     """Comment/string/char-literal-aware brace match. A self-contained copy of the walker in this fork's
     other source-gate tests -- the convention is one self-contained file per check, not a shared import."""
@@ -106,6 +124,105 @@ def gate_call(site: str) -> re.Pattern:
     return re.compile(r"ggml_sycl_fusion_alias_admit(?:_chain)?\(\s*" + re.escape(site) + r"\b")
 
 
+def matching_paren(text: str, open_idx: int) -> int:
+    """Index of the ')' matching the '(' at open_idx. The text has had comments blanked; string and char
+    literals are skipped."""
+    assert text[open_idx] == "("
+    depth = 0
+    i = open_idx
+    quote = ""
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    raise AssertionError("unclosed paren")
+
+
+def top_level_split(cond: str) -> tuple[list[str], bool]:
+    """Split a condition at its depth-0 `&&`; the bool says whether a depth-0 `||` is present."""
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    has_or = False
+    i = 0
+    while i < len(cond):
+        ch = cond[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0 and cond.startswith("&&", i):
+            parts.append(cond[start:i].strip())
+            start = i + 2
+            i += 1
+        elif depth == 0 and cond.startswith("||", i):
+            has_or = True
+            i += 1
+        i += 1
+    parts.append(cond[start:].strip())
+    return parts, has_or
+
+
+CONSTANT_CONJUNCTS = {"true", "false", "0", "1", "(true)", "(false)", "(0)", "(1)"}
+
+
+def chain_wiring_violations(graph: str, site: str, gate_at: int, launch_at: int) -> list[str]:
+    """The gate call must be a top-level `&&` conjunct, verbatim, of the `if (...)` condition whose body holds
+    the launch: not negated, not OR'd, not behind a constant, not given another node index or device."""
+    found: list[str] = []
+    exact = re.compile(
+        r"ggml_sycl_fusion_alias_admit_chain\(\s*" + re.escape(site) + r"\s*,\s*cgraph\s*,\s*i\s*,\s*sycl_ctx->device\s*\)"
+    )
+    call = exact.match(graph, gate_at)
+    if call is None:
+        return [f"{site}: the gate call must read exactly (SITE, cgraph, i, sycl_ctx->device): a different node index or device guards another chain"]
+
+    # The condition that contains the call: the nearest `if (` whose paren is still open at the call.
+    cond_open = -1
+    for m in reversed(list(re.finditer(r"\bif\s*\(", graph[:gate_at]))):
+        open_idx = m.end() - 1
+        if matching_paren(graph, open_idx) > gate_at:
+            cond_open = open_idx
+            break
+    if cond_open < 0:
+        return [f"{site}: the gate call is not inside an `if (...)` condition guarding the launch"]
+    cond_close = matching_paren(graph, cond_open)
+    cond = graph[cond_open + 1:cond_close]
+    conjuncts, has_or = top_level_split(cond)
+    if has_or:
+        found.append(f"{site}: the guarding condition contains a top-level `||`, so the gate need not hold")
+    if not any(exact.fullmatch(c) for c in conjuncts):
+        found.append(
+            f"{site}: the gate call is not a bare top-level `&&` conjunct of the guarding condition "
+            "(negated, parenthesised, behind `0 &&`, or combined with another expression)"
+        )
+    for c in conjuncts:
+        if c in CONSTANT_CONJUNCTS:
+            found.append(f"{site}: the guarding condition has a constant conjunct `{c}`")
+    # The launch lives in the body this condition guards.
+    rest = graph[cond_close + 1:]
+    body_open = cond_close + 1 + (len(rest) - len(rest.lstrip()))
+    if graph[body_open:body_open + 1] != "{":
+        found.append(f"{site}: the guarding `if` has no braced body")
+    else:
+        body_close = matching_brace(graph, body_open)
+        if not body_open < launch_at < body_close:
+            found.append(f"{site}: the launch is not inside the body the gate guards")
+    return found
+
+
 def gate_violations(source: str) -> list[str]:
     found: list[str] = []
     code = strip_comments(source)
@@ -130,15 +247,7 @@ def gate_violations(source: str) -> list[str]:
         if not gates[0] < launches[0]:
             found.append(f"{site}: the gate call must precede the launch `{launch}`")
             continue
-        # The gate must be part of the condition that guards the launch: no `continue;` or closing of the
-        # enclosing statement between them, and the call must sit inside an `if (` ... `)` condition.
-        between = graph[gates[0]:launches[0]]
-        if "continue;" in between:
-            found.append(f"{site}: a `continue;` sits between the gate call and the launch")
-        head = graph[max(0, gates[0] - 1200):gates[0]]
-        last_if = head.rfind("if (")
-        if last_if < 0 or head[last_if:].count("(") - head[last_if:].count(")") < 1:
-            found.append(f"{site}: the gate call is not inside an `if (...)` condition guarding the launch")
+        found.extend(chain_wiring_violations(graph, site, gates[0], launches[0]))
 
     for site, signature, markers in FUNCTION_SITES:
         body = function(code, signature)
@@ -155,6 +264,10 @@ def gate_violations(source: str) -> list[str]:
                 found.append(f"{site}: `{marker}` is missing from {signature}; update this gate with the launch")
             elif not gates[0] < at:
                 found.append(f"{site}: the gate call must precede `{marker}` in {signature}")
+        squashed = re.sub(r"\s+", "", body)
+        for pin in FUNCTION_PINS[site]:
+            if pin not in squashed:
+                found.append(f"{site}: the operands handed to the gate changed; expected `{pin}` in {signature}")
         # A declined fusion must return false (the router's `reject` helper returns false) so the unfused
         # kernels run.
         tail = body[gates[0]:gates[0] + 700]
@@ -240,6 +353,77 @@ def test_an_ignored_decline_is_witnessed() -> None:
         assert any(v.startswith(site + ":") and "return false" in v for v in violations), (
             f"an ignored {site} decline was not witnessed: {violations}"
         )
+
+
+def chain_call_regex(site: str) -> re.Pattern:
+    return re.compile(
+        r"ggml_sycl_fusion_alias_admit_chain\(\s*" + re.escape(site) + r"\s*,\s*cgraph\s*,\s*i\s*,\s*sycl_ctx->device\s*\)"
+    )
+
+
+def test_neutralised_chain_gates_are_witnessed() -> None:
+    """Valid C++ that keeps the call but throws its answer away, or points it at the wrong chain, must die at
+    every chain site: `|| true`, `0 &&`, a negation, a constant conjunct, a discarded result, a wrong node
+    index, a wrong site."""
+    source = SOURCE.read_text()
+    other = {
+        "GGML_SYCL_FUSION_SITE_RMS_NORM_MUL_ADD": "GGML_SYCL_FUSION_SITE_MUL_ADD",
+        "GGML_SYCL_FUSION_SITE_RMS_NORM_MUL": "GGML_SYCL_FUSION_SITE_MUL_ADD",
+        "GGML_SYCL_FUSION_SITE_ADD_RMS_NORM": "GGML_SYCL_FUSION_SITE_MUL_ADD",
+        "GGML_SYCL_FUSION_SITE_MUL_ADD": "GGML_SYCL_FUSION_SITE_ADD_RMS_NORM",
+    }
+    for site, _ in CHAIN_SITES:
+        m = chain_call_regex(site).search(source)
+        assert m is not None, f"no gate call to mutate for {site}"
+        call = m.group(0)
+        mutants = {
+            "|| true (parenthesised)": f"({call} || true)",
+            "|| true (top level)": f"{call} || true",
+            "0 &&": f"(0 && {call})",
+            "negated": f"!{call}",
+            "&& true": f"{call} && true",
+            "result discarded": f"(void) {call}, true",
+            "wrong node index": call.replace("cgraph, i,", "cgraph, i + 1,", 1),
+            "wrong device": call.replace("sycl_ctx->device", "0", 1),
+            "wrong site": call.replace(site, other[site], 1),
+        }
+        for name, replacement in mutants.items():
+            assert replacement != call, f"{name} did not change the call"
+            mutated = source[:m.start()] + replacement + source[m.end():]
+            violations = gate_violations(mutated)
+            assert any(v.startswith(site + ":") or v.startswith(other[site] + ":") for v in violations), (
+                f"{site}: the `{name}` mutant survived or died for another reason: {violations}"
+            )
+
+
+def test_miswired_bit0_operands_are_witnessed() -> None:
+    """The bit0 sites keep their gate call but hand it the wrong tensor, a flipped in-place flag or a short list."""
+    source = SOURCE.read_text()
+
+    def mutate(signature: str, old: str, new: str) -> str:
+        body = function(source, signature)
+        assert body is not None
+        # Whitespace-insensitive: the source is clang-formatted and the alignment moves.
+        pattern = r"\s*".join(re.escape(t) for t in re.findall(r"\w+|[^\w\s]", old))
+        mutated_body, n = re.subn(pattern, lambda _: new, body, count=1)
+        assert n == 1, f"could not find `{old}` in {signature}"
+        return source.replace(body, mutated_body, 1)
+
+    cases = [
+        ("static bool ggml_sycl_try_fuse_tg_mul_mat_add(", "GGML_SYCL_FUSION_SITE_MUL_MAT_ADD",
+         "writes  = { add, out_ptr, true }", "writes  = { addend, addend_ptr, true }"),
+        ("static bool ggml_sycl_try_fuse_tg_mul_mat_add(", "GGML_SYCL_FUSION_SITE_MUL_MAT_ADD",
+         "&writes, 1, &reads, 1)", "&writes, 1, &reads, 0)"),
+        ("static bool ggml_sycl_try_fuse_tg_router_f32_add_argsort(", "GGML_SYCL_FUSION_SITE_ROUTER",
+         "{ act, act_ptr, false }", "{ act, act_ptr, true }"),
+        ("static bool ggml_sycl_try_fuse_tg_router_f32_add_argsort(", "GGML_SYCL_FUSION_SITE_ROUTER",
+         "writes, 2, reads, 2)", "writes, 1, reads, 2)"),
+        ("static bool ggml_sycl_try_fuse_tg_router_f32_add_argsort(", "GGML_SYCL_FUSION_SITE_ROUTER",
+         "{ sort, sort_ptr, true }", "{ sort, sort_ptr, true }, { add, probs_ptr, true }"),
+    ]
+    for signature, site, old, new in cases:
+        violations = gate_violations(mutate(signature, old, new))
+        assert any(v.startswith(site + ":") for v in violations), f"`{old}` -> `{new}` survived: {violations}"
 
 
 if __name__ == "__main__":

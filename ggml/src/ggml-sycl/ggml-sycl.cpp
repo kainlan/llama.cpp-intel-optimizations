@@ -86822,7 +86822,9 @@ static bool ggml_sycl_try_fuse_tg_router_f32_add_argsort(ggml_backend_sycl_conte
     }
     // llama.cpp-rb2h: the kernel reads act and bias while it writes probs and argsort. The activation is read
     // by every subgroup, so it is never in place with the probabilities; the bias is read and written by the
-    // same lane. Each pointer below is the one the kernel is about to receive.
+    // same lane. The weight is not checked: it lives in the unified cache, never in the compute buffer gallocr
+    // places graph outputs in, so it cannot overlap an output. Each pointer below is the one the kernel is
+    // about to receive.
     {
         const ggml_sycl_fusion_operand writes[2] = {
             { add,  probs_ptr, true },
@@ -86929,9 +86931,15 @@ static bool ggml_sycl_try_fuse_tg_mul_mat_add(ggml_backend_sycl_context & ctx,
     }
     // llama.cpp-rb2h: the MMVQ epilogue reads addend[row] while it writes the output row, so an output the
     // allocator placed partially over the addend races. The activation is quantised to scratch by a separate
-    // kernel before the MMVQ kernel runs, so it cannot race. The output resolves as ggml_sycl_op_mul_mat does.
+    // kernel before the MMVQ kernel runs, so it cannot race. The weight is not checked: it lives in the unified
+    // cache (or the model's weight buffer), never in the compute buffer gallocr places graph outputs in, so it
+    // cannot overlap an output. The output resolves in the order of ggml_sycl_op_mul_mat's dst_on_device
+    // branch: ggml_sycl_resolve first, then ggml_sycl_resolve_tensor_ptr.
     {
-        const void *                   out_ptr = ggml_sycl_resolve_tensor_ptr(add, ctx.device);
+        const auto                     out_resolved = ggml_sycl_resolve(add, ctx.device);
+        const void *                   out_ptr      = (out_resolved && out_resolved.on_device) ?
+                                                          static_cast<const void *>(out_resolved.ptr) :
+                                                          static_cast<const void *>(ggml_sycl_resolve_tensor_ptr(add, ctx.device));
         const ggml_sycl_fusion_operand writes  = { add, out_ptr, true };
         const ggml_sycl_fusion_operand reads   = { addend, addend_ptr, true };
         if (!ggml_sycl_fusion_alias_admit(GGML_SYCL_FUSION_SITE_MUL_MAT_ADD, add->name, &writes, 1, &reads, 1)) {

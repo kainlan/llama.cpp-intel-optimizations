@@ -22,6 +22,10 @@
 //
 // The addresses are the caller's: every operand is resolved once, with the resolver the fused kernel
 // itself uses for that operand, so the gate and the kernel cannot disagree about where a tensor lives.
+//
+// A kernel that can be handed an admitted identical pair must not declare those pointers __restrict__: the
+// load and the store of one element then alias, which restrict makes undefined. The fused-add MMVQ kernels
+// (dst, fused_add) and k_mul_add_fused (x, scale, bias, dst) are the ones that are qualified accordingly.
 
 #include "ggml-impl.h"
 #include "ggml.h"

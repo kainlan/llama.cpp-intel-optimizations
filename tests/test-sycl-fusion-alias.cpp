@@ -245,7 +245,7 @@ int main() {
         CHECK(admits(gf, GGML_SYCL_FUSION_SITE_RMS_NORM_MUL), "a disjoint MUL output must fuse");
         ggml_free(ctx);
     }
-    // M1: the RMS_NORM intermediate straddles the input but is never written, so the chain still fuses.
+    // The RMS_NORM intermediate straddles the input but is never written, so the chain still fuses.
     {
         ggml_context * ctx = ggml_init(params);
         ggml_cgraph *  gf  = build_rms_mul(ctx, hi, vec, hi - 0x2000, far);
@@ -304,7 +304,7 @@ int main() {
         CHECK(admits(gf, GGML_SYCL_FUSION_SITE_RMS_NORM_MUL_ADD), "the ADD in place on the input must fuse");
         ggml_free(ctx);
     }
-    // M1: neither intermediate is written, so both may straddle the input.
+    // Neither intermediate is written, so both may straddle the input.
     {
         ggml_context * ctx = ggml_init(params);
         ggml_cgraph *  gf  = build_rms_mul_add(ctx, hi, vec, vec + 0x4000, hi - 0x2000, hi + 0x1000, far);
