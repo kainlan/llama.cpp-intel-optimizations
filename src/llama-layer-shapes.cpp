@@ -46,7 +46,7 @@ llama_kv_layer_decision llama_kv_layer_decide(const llama_hparams &             
 
 // The kinds whose caches hold tensors the shape structs have no place for (an indexer key cache, the DSV4
 // compressor state). Named, so a publisher refuses by the name instead of publishing a guess.
-static const char * llama_memory_kind_unsupported(llama_memory_kind kind) {
+const char * llama_memory_kind_unsupported(llama_memory_kind kind) {
     switch (kind) {
         case LLAMA_MEMORY_KIND_MSA:
             return "llama_kv_cache_msa (indexer key cache)";

@@ -3496,8 +3496,15 @@ llama_memory_policy llama_model::memory_policy(const llama_memory_params & param
     return pol;
 }
 
-llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams,
+                                            bool no_alloc) const {
     const llama_memory_policy pol = memory_policy(params, cparams);
+
+    if (no_alloc) {
+        if (const char * name = llama_memory_kind_unsupported(pol.kind)) {
+            throw std::runtime_error(format("memory kind %s has no no_alloc form (refused)", name));
+        }
+    }
 
     llama_memory_i * res = nullptr;
 
@@ -3588,7 +3595,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         std::max((uint32_t) 1, cparams.n_seq_max),
                         cparams.n_seq_max,
                         cparams.n_rs_seq,
-                        nullptr);
+                        nullptr,
+                        no_alloc);
             } break;
         case LLAMA_MEMORY_KIND_HYBRID_ISWA:
             {
@@ -3610,7 +3618,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* offload           */ cparams.offload_kqv,
                     /* unified           */ cparams.kv_unified,
                     /* filter_attn       */ pol.filter,
-                    /* filter_recr       */ pol.filter_aux);
+                    /* filter_recr       */ pol.filter_aux,
+                    /* no_alloc          */ no_alloc);
             } break;
         case LLAMA_MEMORY_KIND_HYBRID_IDX:
             {
@@ -3654,7 +3663,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* offload           */ cparams.offload_kqv,
                     /* unified           */ cparams.kv_unified,
                     /* filter_attn       */ pol.filter,
-                    /* filter_recr       */ pol.filter_aux);
+                    /* filter_recr       */ pol.filter_aux,
+                    /* no_alloc          */ no_alloc);
             } break;
         case LLAMA_MEMORY_KIND_ISWA:
             {
@@ -3673,7 +3683,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         pol.mem_other,
                         pol.filter,
                         pol.reuse,
-                        pol.share);
+                        pol.share,
+                        no_alloc);
             } break;
         case LLAMA_MEMORY_KIND_KV:
             {
@@ -3693,7 +3704,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         nullptr,
                         pol.filter,
                         nullptr,
-                        nullptr);
+                        nullptr,
+                        "",
+                        no_alloc);
             } break;
     }
 

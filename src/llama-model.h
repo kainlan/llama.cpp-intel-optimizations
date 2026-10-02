@@ -788,7 +788,10 @@ struct llama_model {
     // which memory the model gets and which layers its caches hold; create_memory builds from it
     llama_memory_policy memory_policy(const llama_memory_params & params, const llama_cparams & cparams) const;
 
-    llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
+    // no_alloc: the memory's tensors sit on size-0 dummy buffers and nothing is allocated, as a load-time
+    // measure needs. A kind with no such form (llama_memory_kind_unsupported) throws, naming it.
+    llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams,
+                                   bool no_alloc = false) const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 

@@ -55,6 +55,10 @@ struct llama_memory_policy {
     llama_memory_t                  mem_other = nullptr;
 };
 
+// Non-null for a kind the shape structs cannot describe, and that create_memory cannot build without
+// allocating (no_alloc): the name a refusal quotes. Null for every kind that has both forms.
+const char * llama_memory_kind_unsupported(llama_memory_kind kind);
+
 // One layer of one llama_kv_cache.
 struct llama_kv_layer_shape {
     uint32_t n_embd_k_gqa  = 0;

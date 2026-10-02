@@ -24,7 +24,9 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
-        const layer_filter_cb & filter);
+        const layer_filter_cb & filter,
+        // create the tensors on size-0 dummy buffers: nothing is allocated (a load-time measure's memory)
+                         bool   no_alloc = false);
 
     ~llama_memory_recurrent() = default;
 
@@ -122,6 +124,9 @@ private:
     const llama_hparams & hparams;
 
     const uint32_t n_seq_max = 1;
+
+    // the tensors sit on size-0 dummy buffers
+    const bool no_alloc = false;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

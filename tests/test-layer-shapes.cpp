@@ -32,6 +32,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -255,7 +257,7 @@ static void check_shapes(const char * arch_name, const config & cfg, llama_conte
     llama_memory_params pm    = {
         /*.type_k    =*/cfg.type_kv,
         /*.type_v    =*/cfg.type_kv,
-        /*.swa_full  =*/false,
+        /*.swa_full  =*/ctx->get_cparams().swa_full,
         /*.ctx_type  =*/ctx->get_cparams().ctx_type,
         /*.mem_other =*/llama_get_memory(ctx->get_cparams().ctx_other),
     };
@@ -361,6 +363,100 @@ static void check_shapes(const char * arch_name, const config & cfg, llama_conte
     }
 }
 
+// create_memory(no_alloc) builds the same tensors as the real memory, on size-0 dummy buffers: nothing
+// is allocated, which is what a load-time measure needs. A kind with no such form throws, naming it.
+static int n_no_alloc_cases   = 0;
+static int n_no_alloc_refused = 0;
+
+static void check_no_alloc(const char * arch_name, const config & cfg, llama_context * ctx, const memory_view & mv) {
+    const llama_model &   model = ctx->get_model();
+    const llama_cparams & cp    = ctx->get_cparams();
+    llama_memory_params   pm    = {
+        /*.type_k    =*/cfg.type_kv,
+        /*.type_v    =*/cfg.type_kv,
+        /*.swa_full  =*/ctx->get_cparams().swa_full,
+        /*.ctx_type  =*/cp.ctx_type,
+        /*.mem_other =*/llama_get_memory(cp.ctx_other),
+    };
+    const llama_memory_policy pol = model.memory_policy(pm, cp);
+
+    if (llama_memory_kind_unsupported(pol.kind) != nullptr) {
+        bool        threw = false;
+        std::string what;
+        try {
+            delete model.create_memory(pm, cp, true);
+        } catch (const std::exception & e) {
+            threw = true;
+            what  = e.what();
+        }
+        CHECK(threw && what.find("no no_alloc form") != std::string::npos,
+              "%s/%s: kind '%s' must refuse no_alloc by name (%s)", arch_name, cfg.name, mv.kind.c_str(),
+              threw ? what.c_str() : "it built");
+        n_no_alloc_refused++;
+        return;
+    }
+
+    std::unique_ptr<llama_memory_i> dummy(model.create_memory(pm, cp, true));
+    if (mv.kind == "none") {
+        CHECK(dummy == nullptr, "%s/%s: no memory, yet no_alloc built one", arch_name, cfg.name);
+        return;
+    }
+    CHECK(dummy != nullptr, "%s/%s: no_alloc built no memory", arch_name, cfg.name);
+    if (!dummy) {
+        return;
+    }
+    n_no_alloc_cases++;
+    const memory_view dv = view_of(dummy.get());
+    CHECK(dv.kind == mv.kind, "%s/%s: no_alloc built a '%s', the real memory is a '%s'", arch_name, cfg.name,
+          dv.kind.c_str(), mv.kind.c_str());
+
+    const int n_layer = (int) model.hparams.n_layer_all;
+    for (int il = 0; il < n_layer; ++il) {
+        bool                 amb  = false;
+        const realised_layer real = realise_kv(mv, il, amb);
+        const realised_layer dumb = realise_kv(dv, il, amb);
+        CHECK(real.owned == dumb.owned, "%s/%s: layer %d owned %d (real) vs %d (no_alloc)", arch_name, cfg.name, il,
+              (int) real.owned, (int) dumb.owned);
+        if (real.owned && dumb.owned) {
+            CHECK(
+                real.k->ne[0] == dumb.k->ne[0] && real.k->ne[1] == dumb.k->ne[1] && real.k->ne[2] == dumb.k->ne[2] &&
+                    real.k->type == dumb.k->type && real.swa == dumb.swa,
+                "%s/%s: layer %d K differs: real %lld/%lld/%lld type %d swa %d, no_alloc %lld/%lld/%lld type %d swa %d",
+                arch_name, cfg.name, il, (long long) real.k->ne[0], (long long) real.k->ne[1],
+                (long long) real.k->ne[2], (int) real.k->type, (int) real.swa, (long long) dumb.k->ne[0],
+                (long long) dumb.k->ne[1], (long long) dumb.k->ne[2], (int) dumb.k->type, (int) dumb.swa);
+            CHECK(real.k->buffer != nullptr && ggml_backend_buffer_get_size(real.k->buffer) > 0,
+                  "%s/%s: layer %d: the real memory has no allocated K", arch_name, cfg.name, il);
+            CHECK(dumb.k->buffer != nullptr && ggml_backend_buffer_get_size(dumb.k->buffer) == 0,
+                  "%s/%s: layer %d: no_alloc K is not on a size-0 buffer", arch_name, cfg.name, il);
+            CHECK((real.v == nullptr) == (dumb.v == nullptr), "%s/%s: layer %d V presence", arch_name, cfg.name, il);
+            if (real.v != nullptr && dumb.v != nullptr) {
+                CHECK(real.v->ne[0] == dumb.v->ne[0] && real.v->ne[1] == dumb.v->ne[1] &&
+                          real.v->type == dumb.v->type && dumb.v->buffer != nullptr &&
+                          ggml_backend_buffer_get_size(dumb.v->buffer) == 0,
+                      "%s/%s: layer %d V differs or is allocated", arch_name, cfg.name, il);
+            }
+        }
+        if (mv.rs != nullptr && dv.rs != nullptr) {
+            const ggml_tensor * rr = rs_r(mv.rs, il);
+            const ggml_tensor * dr = rs_r(dv.rs, il);
+            const ggml_tensor * rs = rs_s(mv.rs, il);
+            const ggml_tensor * ds = rs_s(dv.rs, il);
+            CHECK((rr == nullptr) == (dr == nullptr) && (rs == nullptr) == (ds == nullptr),
+                  "%s/%s: layer %d RS presence", arch_name, cfg.name, il);
+            if (rr && dr && rs && ds) {
+                CHECK(rr->ne[0] == dr->ne[0] && rr->ne[1] == dr->ne[1] && rs->ne[0] == ds->ne[0] &&
+                          rs->ne[1] == ds->ne[1] && dr->buffer != nullptr &&
+                          ggml_backend_buffer_get_size(dr->buffer) == 0 && ds->buffer != nullptr &&
+                          ggml_backend_buffer_get_size(ds->buffer) == 0,
+                      "%s/%s: layer %d RS differs or is allocated", arch_name, cfg.name, il);
+            }
+        }
+    }
+    CHECK((mv.rs == nullptr) == (dv.rs == nullptr), "%s/%s: recurrent half present in one memory only", arch_name,
+          cfg.name);
+}
+
 int main() {
     FILE *       dump      = nullptr;
     const char * dump_path = getenv("LLAMA_LAYER_SHAPES_DUMP");
@@ -392,6 +488,7 @@ int main() {
             n_rs_cases += mv.rs != nullptr ? 1 : 0;
             dump_arch(dump, arch_name, cfg, mv, (int) ctx->get_model().hparams.n_layer_all);
             check_shapes(arch_name, cfg, ctx, mv);
+            check_no_alloc(arch_name, cfg, ctx, mv);
         }
     }
     if (dump != nullptr) {
@@ -400,6 +497,8 @@ int main() {
 
     // a run that built nothing checked nothing
     CHECK(n_built >= 21, "only %d (arch, config) cases built; the must-cover set alone is 21", n_built);
+    CHECK(n_no_alloc_cases >= 39 && n_no_alloc_refused > 0, "VOID: %d no_alloc builds and %d refusals",
+          n_no_alloc_cases, n_no_alloc_refused);
     CHECK(n_kv_cases > 0 && n_rs_cases > 0, "VOID: %d KV and %d recurrent cases", n_kv_cases, n_rs_cases);
 
     if (n_failed != 0) {

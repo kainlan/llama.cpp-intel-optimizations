@@ -114,7 +114,9 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // create the tensors on size-0 dummy buffers: nothing is allocated (a load-time measure's memory)
+                         bool   no_alloc = false);
 
     ~llama_kv_cache() = default;
 
@@ -280,6 +282,9 @@ private:
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    // the tensors sit on size-0 dummy buffers: the model's no_alloc, or the caller's (a measure)
+    bool no_alloc = false;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
