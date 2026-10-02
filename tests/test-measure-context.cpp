@@ -14,11 +14,19 @@
 //     capture over its whole life holds no line of any of their prefixes, and the same capture over a real
 //     context holds many (the positive control that the capture sees them);
 //   - the real cparams are not written: a context's own flags are what the caller passed;
-//   - a memory kind with no no_alloc form refuses by name, as a status-free throw from the constructor.
+//   - a model the measure cannot walk is refused by name with llama_measure_unsupported, for every memory
+//     kind that has no no_alloc form, for a model with an encoder graph and for a ctx_other arch; the load-time
+//     measure turns that into `unsupported`, not a failure, and clears its plan override on that path too;
+//   - the plan's K-shift graphs are the memory's shift sub-caches, the compute term is the per-chunk peak
+//     over the measured graphs (the real compute buffer is its sum), set_warmup is a no-op on a measure-only
+//     context, and the memory modules' own constructor logs are silent under no_alloc.
 
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../src/llama-context.h"
 #include "../src/llama-kv-cache.h"
+#include "../src/llama-layer-shapes.h"
+#include "../src/llama-load-measure.h"
+#include "../src/llama-measure-plan.h"
 #include "../src/llama-model.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
@@ -32,11 +40,13 @@
 #include <cstring>
 #include <exception>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
 static int n_failed       = 0;
 static int n_peak_checked = 0;
+static int n_shift_checked = 0;
 
 #define CHECK(cond, ...)                                                      \
     do {                                                                      \
@@ -51,9 +61,23 @@ static int n_peak_checked = 0;
 // the lines the measure-only context must not print: the prefixes of the shared constructor body,
 // the destructor, the reserve and the graph build
 static const char * const k_silent_prefixes[] = {
-    "llama_context:",      "~llama_context:",    "sched_reserve:", "sched_reserve_impl:",
-    "sched_measure_impl:", "resolve_fused_ops:", "graph_reserve:", "llama_graph_n_input_tensors:",
+    "llama_context:",
+    "~llama_context:",
+    "sched_reserve:",
+    "sched_reserve_impl:",
+    "sched_measure_impl:",
+    "resolve_fused_ops:",
+    "graph_reserve:",
+    "llama_graph_n_input_tensors:",
+    // the memory modules' constructors, which log buffer and cache sizes
+    "llama_kv_cache:",
+    "llama_kv_cache_iswa:",
+    "llama_memory_recurrent:",
 };
+
+// the lines the memory modules print for a real context: the positive control that the capture sees them
+static const char * const k_memory_prefixes[] = { "llama_kv_cache:", "llama_kv_cache_iswa:",
+                                                  "llama_memory_recurrent:" };
 
 struct log_capture {
     std::vector<std::string> lines;
@@ -71,6 +95,19 @@ struct log_capture {
     }
 
     void stop() { llama_log_set(old_cb, old_data); }
+
+    size_t n_memory_lines() const {
+        size_t n = 0;
+        for (const auto & line : lines) {
+            for (const char * prefix : k_memory_prefixes) {
+                if (line.compare(0, strlen(prefix), prefix) == 0) {
+                    n++;
+                    break;
+                }
+            }
+        }
+        return n;
+    }
 
     size_t n_silent_violations() const {
         size_t n = 0;
@@ -129,17 +166,10 @@ static llama_measure_context_args cpu_args() {
     return args;
 }
 
-// the largest sum over a graph's chunk peaks, across the measured graphs of a compute buffer type
-static size_t worst_total_peak(const sched_measure_buft & entry) {
-    size_t worst = 0;
-    for (const auto & graph : entry.peaks) {
-        size_t sum = 0;
-        for (size_t p : graph) {
-            sum += p;
-        }
-        worst = std::max(worst, sum);
-    }
-    return worst;
+// the compute term of a buft: the peak of each chunk over the measured graphs, summed -- the quantity
+// llama-measure-plan.h defines once and the tenant caps, the chunk plan and the late check all read
+static size_t chunk_peak_total(const sched_measure_buft & entry) {
+    return llama_measure_peak_total(llama_measure_peak_per_chunk(entry.peaks));
 }
 
 static void check_arch(llm_arch arch, bool flash_attn, uint32_t n_outputs_max) {
@@ -171,6 +201,7 @@ static void check_arch(llm_arch arch, bool flash_attn, uint32_t n_outputs_max) {
     }
     CHECK(real_log.n_silent_violations() > 10, "%s: the capture saw only %zu lines a real context prints", name,
           real_log.n_silent_violations());
+    CHECK(real_log.n_memory_lines() > 0, "%s: the capture saw no line a real context's memory module prints", name);
 
     // the measure-only context
     const size_t live_before = ggml_backend_test_live_buffer_count();
@@ -202,6 +233,11 @@ static void check_arch(llm_arch arch, bool flash_attn, uint32_t n_outputs_max) {
             CHECK(!measure.holds_output_buffer(), "%s: a measure-only context reserved an output buffer", name);
             CHECK(measure.get_sched() == nullptr, "%s: a measure-only context kept a scheduler", name);
             CHECK(measure.is_measure_only(), "%s: the flag is not set", name);
+
+            // a measure-only context measures one fixed graph set: warmup never re-reserves it
+            const bool warmup_before = measure.get_cparams().warmup;
+            measure.set_warmup(!warmup_before);
+            CHECK(measure.get_cparams().warmup == warmup_before, "%s: set_warmup changed a measure-only context", name);
         }
     } catch (const std::exception & e) {
         measure_log.stop();
@@ -220,6 +256,27 @@ static void check_arch(llm_arch arch, bool flash_attn, uint32_t n_outputs_max) {
         CHECK(entry.max_chunk_size > 0, "%s: no chunk size for %s", name, ggml_backend_buft_name(entry.buft));
     }
     CHECK(flags_untouched, "%s: the caller's cparams were written", name);
+
+    // the K-shift graphs of the plan are the shift sub-caches of the memory, and come last
+    {
+        std::vector<const llama_kv_cache *> shift_caches;
+        if (real->get_memory() != nullptr) {
+            real->get_memory()->get_shift_caches(shift_caches);
+        }
+        size_t n_shift = 0;
+        bool   tail    = true;
+        for (size_t i = 0; i < plan.graphs.size(); ++i) {
+            const bool is_shift = plan.graphs[i].kind == LLAMA_MEASURE_KIND_SHIFT;
+            n_shift += is_shift ? 1 : 0;
+            tail = tail && (!is_shift || i + shift_caches.size() >= plan.graphs.size());
+        }
+        CHECK(n_shift == shift_caches.size(), "%s: %zu K-shift graphs measured for %zu shift sub-caches", name, n_shift,
+              shift_caches.size());
+        CHECK(tail, "%s: a K-shift graph is not among the last", name);
+        CHECK(plan.n_measured == plan.graphs.size(), "%s: n_measured %u for %zu graphs", name, plan.n_measured,
+              plan.graphs.size());
+        n_shift_checked += shift_caches.empty() ? 0 : 1;
+    }
 
     // the memory it measured held size-0 dummies, and nothing is left after it
     CHECK(ggml_backend_test_live_buffer_count() == live_before, "%s: live buffers %zu before, %zu after", name,
@@ -245,33 +302,190 @@ static void check_arch(llm_arch arch, bool flash_attn, uint32_t n_outputs_max) {
             ggml_backend_sched_get_buffer_size(real->get_sched(), ggml_backend_sched_get_backend(real->get_sched(), 0));
         size_t measured = 0;
         for (const auto & entry : plan.bufts) {
-            measured = std::max(measured, worst_total_peak(entry));
+            measured = std::max(measured, chunk_peak_total(entry));
         }
         n_peak_checked++;
         CHECK(measured > 0, "%s: measured nothing", name);
         CHECK(measured <= real_size && real_size <= measured + 1024 * 1024,
-              "%s: the measured worst peak %zu B is not the real context's compute buffer %zu B", name, measured,
-              real_size);
+              "%s: the measured per-chunk peak total %zu B is not the real context's compute buffer %zu B", name,
+              measured, real_size);
     }
 }
 
-static void check_refusal() {
-    // a memory kind with no no_alloc form refuses by name; DEEPSEEK32 has an indexer key cache
+// --- a model the measure cannot walk (I5, I6) -------------------------------------------------------------
+
+static int g_run_installs = 0;
+static int g_run_clears   = 0;
+
+static bool fake_install_ok(uint64_t, enum ggml_sycl_measure_stage) {
+    g_run_installs++;
+    return true;
+}
+
+static void fake_clear_counted() {
+    g_run_clears++;
+}
+
+// the memory kinds (llama_memory_kind_unsupported names) the fixtures' refusals named
+static std::set<std::string> g_unsupported_kinds_seen;
+
+// An architecture the measure refuses by name: the constructor throws llama_measure_unsupported, the
+// load-time measure returns `unsupported` (never a failure), and the plan override it installed is cleared
+// exactly as often as it was installed. `by_memory_kind`: the refusal comes from create_memory, inside the
+// constructor, after the override was installed; otherwise from the model's own shape, before anything is built.
+static bool check_unsupported_arch(llm_arch arch, bool by_memory_kind) {
+    const char * name = llm_arch_name(arch);
+
     fixture fx;
-    if (!build_model(fx, LLM_ARCH_DEEPSEEK32)) {
-        return;  // the fixture is optional here
+    if (!build_model(fx, arch)) {
+        fprintf(stderr, "  SKIP %s: fixture did not build\n", name);
+        return false;
     }
-    llama_measure_context_args args  = cpu_args();
-    bool                       threw = false;
-    std::string                what;
-    try {
-        llama_context measure(*fx.model, make_params(true), &args);
-    } catch (const std::exception & e) {
-        threw = true;
-        what  = e.what();
+    const llama_model & model = *fx.model;
+
+    // the constructor's own refusal, by type and by name
+    {
+        llama_measure_context_args args  = cpu_args();
+        bool                       typed = false;
+        std::string                what;
+        try {
+            llama_context measure(model, make_params(true), &args);
+        } catch (const llama_measure_unsupported & e) {
+            typed = true;
+            what  = e.what();
+        } catch (const std::exception & e) {
+            what = std::string("untyped: ") + e.what();
+        }
+        CHECK(typed, "%s: the constructor did not throw llama_measure_unsupported (%s)", name, what.c_str());
+        CHECK(what.find(name) != std::string::npos, "%s: the refusal does not name the architecture (%s)", name,
+              what.c_str());
+        if (by_memory_kind) {
+            CHECK(what.find("no no_alloc form") != std::string::npos, "%s: the refusal does not name the reason (%s)",
+                  name, what.c_str());
+            static const llama_memory_kind kinds[] = { LLAMA_MEMORY_KIND_MSA, LLAMA_MEMORY_KIND_DSA,
+                                                       LLAMA_MEMORY_KIND_DSA_ISWA, LLAMA_MEMORY_KIND_DSV4,
+                                                       LLAMA_MEMORY_KIND_HYBRID_IDX };
+            for (llama_memory_kind k : kinds) {
+                if (what.find(llama_memory_kind_unsupported(k)) != std::string::npos) {
+                    g_unsupported_kinds_seen.insert(llama_memory_kind_unsupported(k));
+                }
+            }
+        }
     }
-    CHECK(threw, "a memory kind with no no_alloc form built a measure-only context");
-    CHECK(what.find("no no_alloc form") != std::string::npos, "the refusal does not name the reason: %s", what.c_str());
+
+    // the load-time measure: `unsupported`, not ok, the named text, the override cleared as often as it was
+    // installed, nothing left behind, and the caller's backends still its own
+    {
+        g_run_installs                                 = 0;
+        g_run_clears                                   = 0;
+        const size_t                       live_before = ggml_backend_test_live_buffer_count();
+        llama_measure_context_args         args        = cpu_args();
+        const llama_measure_override_procs procs       = { &fake_install_ok, &fake_clear_counted };
+        const llama_load_measure_result    r =
+            llama_load_measure_run(model, args, procs, 512, 7, GGML_SYCL_MEASURE_STAGE_PROBE, 0);
+        CHECK(!r.ok && r.unsupported, "%s: the measure did not come back unsupported (ok=%d unsupported=%d)", name,
+              (int) r.ok, (int) r.unsupported);
+        CHECK(r.refusal.rfind("[LOAD-PLAN] compute-slot measure failed at probe on device 0: ", 0) == 0,
+              "%s: refusal text: %s", name, r.refusal.c_str());
+        CHECK(g_run_installs == g_run_clears, "%s: the override was installed %d times and cleared %d", name,
+              g_run_installs, g_run_clears);
+        if (by_memory_kind) {
+            // the throw came out of the constructor, with the override installed: the unwind cleared it
+            CHECK(g_run_installs == 1, "%s: the constructor's refusal ran with %d installs", name, g_run_installs);
+        } else {
+            CHECK(g_run_installs == 0, "%s: a model refused by shape installed the override %d times", name,
+                  g_run_installs);
+        }
+        CHECK(ggml_backend_test_live_buffer_count() == live_before, "%s: the unsupported measure left buffers behind",
+              name);
+        // the constructor takes the backends out of `args` when it gets that far: a model refused by shape never
+        // reaches it and the caller keeps them, a refusal from create_memory unwound a context that had them
+        CHECK(args.backends.empty() == by_memory_kind, "%s: %zu backends left in args after a %s refusal", name,
+              args.backends.size(), by_memory_kind ? "memory-kind" : "shape");
+    }
+
+    if (!by_memory_kind) {
+        CHECK(!llama_measure_unsupported_reason(model).empty(), "%s: llama_measure_unsupported_reason is empty", name);
+    } else {
+        CHECK(llama_measure_unsupported_reason(model).empty(),
+              "%s: a memory-kind refusal is reported before the memory is built", name);
+    }
+    return true;
+}
+
+// M1: a measure that fails after the override went in unwinds it. The model builds, the override is
+// installed and cleared exactly once on a good run, a refused install is a named refusal with no clear, and a
+// missing proc is a named refusal that never builds the context.
+static void check_run_paths() {
+    fixture fx;
+    if (!build_model(fx, LLM_ARCH_LLAMA)) {
+        CHECK(false, "the llama fixture did not build");
+        return;
+    }
+    const llama_model & model = *fx.model;
+
+    {
+        g_run_installs                           = 0;
+        g_run_clears                             = 0;
+        llama_measure_context_args         args  = cpu_args();
+        const llama_measure_override_procs procs = { &fake_install_ok, &fake_clear_counted };
+        const llama_load_measure_result    r =
+            llama_load_measure_run(model, args, procs, 512, 7, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, 0);
+        CHECK(r.ok && !r.unsupported && r.refusal.empty(), "a good measure refused: %s", r.refusal.c_str());
+        CHECK(g_run_installs == 1 && g_run_clears == 1, "a good run: %d installs, %d clears", g_run_installs,
+              g_run_clears);
+        // (a CPU-only measure has no SYCL device or host-tier term to return; the terms it does return add up)
+        for (const auto & d : r.devices) {
+            size_t sum = 0;
+            for (size_t c : d.chunk_bytes) {
+                sum += c;
+            }
+            CHECK(d.total == sum && d.total > 0, "the term %zu is not the sum %zu of its chunks", d.total, sum);
+        }
+        CHECK(r.n_splits >= 1, "split count %d", r.n_splits);
+    }
+    {
+        g_run_installs                           = 0;
+        g_run_clears                             = 0;
+        llama_measure_context_args         args  = cpu_args();
+        const llama_measure_override_procs procs = { [](uint64_t, enum ggml_sycl_measure_stage) {
+                                                        g_run_installs++;
+                                                        return false;
+                                                    },
+                                                     &fake_clear_counted };
+        const llama_load_measure_result r =
+            llama_load_measure_run(model, args, procs, 512, 7, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, 3);
+        CHECK(!r.ok && !r.unsupported, "a refused install is not a plain refusal");
+        CHECK(
+            r.refusal == "[LOAD-PLAN] compute-slot measure failed at late on device 3: plan override nested (refused)",
+            "refusal text: %s", r.refusal.c_str());
+        CHECK(g_run_installs == 1 && g_run_clears == 0, "refused install: %d installs, %d clears", g_run_installs,
+              g_run_clears);
+    }
+    {
+        g_run_installs                       = 0;
+        g_run_clears                         = 0;
+        llama_measure_context_args      args = cpu_args();
+        const llama_load_measure_result r = llama_load_measure_run(model, args, { nullptr, &fake_clear_counted }, 512,
+                                                                   7, GGML_SYCL_MEASURE_STAGE_PROBE, 0);
+        CHECK(!r.ok && !r.unsupported && r.refusal.find("plan override proc missing") != std::string::npos,
+              "a missing proc: %s", r.refusal.c_str());
+        CHECK(g_run_clears == 0, "a missing proc cleared %d times", g_run_clears);
+    }
+    {
+        // a constructor that throws a plain error (an n_ctx the model cannot hold) is a failure, not unsupported
+        g_run_installs                           = 0;
+        g_run_clears                             = 0;
+        llama_measure_context_args         args  = cpu_args();
+        const llama_measure_override_procs procs = { &fake_install_ok, &fake_clear_counted };
+        args.backends.clear();  // no backend at all: the constructor cannot build a scheduler
+        const llama_load_measure_result r =
+            llama_load_measure_run(model, args, procs, 512, 7, GGML_SYCL_MEASURE_STAGE_PROBE, 0);
+        CHECK(!r.ok && !r.unsupported, "a backend-less measure was not a plain failure (unsupported=%d)",
+              (int) r.unsupported);
+        CHECK(g_run_installs == g_run_clears, "a failed construction: %d installs, %d clears", g_run_installs,
+              g_run_clears);
+    }
 }
 
 int main() {
@@ -287,9 +501,30 @@ int main() {
             }
         }
     }
-    check_refusal();
+    check_run_paths();
+
+    // every memory kind without a no_alloc form: the architectures that reach one. A kind no fixture
+    // reaches is covered by test-layer-shapes' by-kind table; this arm shows the measure's own mapping.
+    int n_memory_refused = 0;
+    for (llm_arch arch : { LLM_ARCH_DEEPSEEK32, LLM_ARCH_DEEPSEEK4, LLM_ARCH_MINIMAX_M3, LLM_ARCH_QWEN4EXP,
+                           LLM_ARCH_DOTS3NOTE, LLM_ARCH_HY_V4, LLM_ARCH_GLM_DSA }) {
+        n_memory_refused += check_unsupported_arch(arch, true) ? 1 : 0;
+    }
+    CHECK(n_memory_refused >= 1 && !g_unsupported_kinds_seen.empty(), "VOID: %d memory-kind refusals, %zu kinds named",
+          n_memory_refused, g_unsupported_kinds_seen.size());
+    for (const auto & k : g_unsupported_kinds_seen) {
+        fprintf(stderr, "  unsupported kind refused by the measure: %s\n", k.c_str());
+    }
+
+    // an encoder graph and a ctx_other arch are refused by name before anything is built
+    int n_shape_refused = 0;
+    for (llm_arch arch : { LLM_ARCH_T5, LLM_ARCH_GEMMA4_ASSISTANT }) {
+        n_shape_refused += check_unsupported_arch(arch, false) ? 1 : 0;
+    }
+    CHECK(n_shape_refused >= 1, "VOID: no encoder or ctx_other architecture was refused by shape");
 
     // a run that compared no plan with a real context proved nothing about the plan
+    CHECK(n_shift_checked >= 1, "no plan was compared with a memory that has a K-shift sub-cache");
     CHECK(n_peak_checked >= 12, "only %d measured plans were compared with a real context", n_peak_checked);
 
     if (n_failed != 0) {

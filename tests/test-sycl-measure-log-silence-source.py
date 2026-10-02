@@ -95,6 +95,9 @@ ALLOW = {
         "the nothrow reserve is decode's and encode's; a measure-only context never decodes and its "
         "constructor does not call it (the constructor-body census below refuses the call)"
     ),
+    ("llama_context::sched_reserve_nothrow", "%s: unknown exception\\n"): (
+        "the catch-all arm of the same nothrow reserve; reached only by decode and encode"
+    ),
 }
 
 

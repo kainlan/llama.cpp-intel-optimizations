@@ -321,3 +321,99 @@ def test_e_predicate_controls():
 def test_busy_arm_tracks_e():
     e = e_is_true(SYCL_CPP)
     assert publish_ok(publish_body(), e), f"E is {e}: the publish's BUSY arm must be in its {'second' if e else 'first'} form"
+
+
+# --- I1: a BUSY (any non-OK) publish is re-attempted at the next boundary, never waited on ---
+
+SYCL_H = (ROOT / "ggml/include/ggml-sycl.h").read_text()
+
+
+def reattempt_ok(context_src: str) -> bool:
+    """sched_reserve_nothrow leaves sched_need_reserve set on every way out but OK, and decode and
+    encode answer -2 for a false return, so the next call runs the transaction (publish included) again."""
+    code = z(strip_comments(context_src))
+    at = code.find(z("bool llama_context::sched_reserve_nothrow()") + "{")
+    if at == -1:
+        return False
+    body = brace_body(code, at)
+    # the flag is cleared once, before the attempt, and set again on the single fall-through return false
+    if body.count(z("sched_need_reserve = false;")) != 1 or body.count(z("sched_need_reserve = true;")) != 1:
+        return False
+    if not body.endswith(z("sched_need_reserve = true; return false; }")):
+        return False
+    # the only early return true is the OK arm of the attempt and the clean-flag fast path
+    if len(re.findall(r"\breturn true;", body)) != 2:
+        return False
+    # every catch arm falls through to the flag: a catch that returned would skip it
+    if re.search(r"catch\([^)]*\)\{[^}]*\breturn\b", body):
+        return False
+    if "catch(...)" not in body:
+        return False
+    for caller in ("llama_context::encode(", "llama_context::decode("):
+        c = z(strip_comments(context_src))
+        i = c.find(z("int llama_context::" + caller[len("llama_context::") :]))
+        if i == -1:
+            return False
+        cb = brace_body(c, i)
+        if z("if (!sched_reserve_nothrow()) {") not in cb:
+            return False
+        arm = cb[cb.index(z("if (!sched_reserve_nothrow()) {")) :]
+        arm = arm[: arm.index("}") + 1]
+        if "return-2;" not in arm:
+            return False
+        # work is counted once the reserve succeeded: a -2 processed nothing
+        counted = cb.find("n_queued_tokens+=")
+        if counted == -1 or counted < cb.index(z("if (!sched_reserve_nothrow()) {")):
+            return False
+    return True
+
+
+def test_a_failed_publish_is_reattempted_at_the_next_boundary():
+    assert reattempt_ok(CONTEXT_CPP)
+
+
+def test_reattempt_mutants():
+    anchor = "    sched_need_reserve = true;\n    return false;\n}"
+    assert CONTEXT_CPP.count(anchor) == 1
+    mutants = {
+        "the flag not set on failure": anchor.replace("    sched_need_reserve = true;\n", ""),
+        "a catch that returns": None,
+    }
+    assert not reattempt_ok(CONTEXT_CPP.replace(anchor, mutants["the flag not set on failure"], 1))
+    ret = CONTEXT_CPP.replace(
+        'LLAMA_LOG_ERROR("%s: unknown exception\\n", __func__);', 'LLAMA_LOG_ERROR("%s: unknown exception\\n", __func__); return false;', 1
+    )
+    assert ret != CONTEXT_CPP and not reattempt_ok(ret)
+    dec = CONTEXT_CPP.replace(
+        'LLAMA_LOG_ERROR("%s: failed to reserve the compute buffers\\n", __func__);\n        return -2;',
+        'LLAMA_LOG_ERROR("%s: failed to reserve the compute buffers\\n", __func__);\n        return 0;',
+        1,
+    )
+    assert dec != CONTEXT_CPP and not reattempt_ok(dec)
+    # the decode counts its tokens before the reserve again
+    early = CONTEXT_CPP.replace(
+        "    // counted only once the reserve succeeded: a -2 here processed nothing\n    n_queued_tokens += n_tokens_all;\n", "", 1
+    ).replace("    output_swaps.clear();\n\n    if (!sched_reserve_nothrow()) {", "    n_queued_tokens += n_tokens_all;\n    output_swaps.clear();\n\n    if (!sched_reserve_nothrow()) {", 1)
+    assert early != CONTEXT_CPP and not reattempt_ok(early)
+
+
+def header_busy_text_ok(h: str) -> bool:
+    """The BUSY contract in ggml-sycl.h names the next-boundary re-attempt and promises no wait."""
+    flat = re.sub(r"\s*//\s*", " ", h)
+    i = flat.find("GGML_SYCL_LIFECYCLE_BUSY (round 1 F6; round 4 Q3)")
+    if i == -1:
+        return False
+    para = flat[i : i + 600]
+    if "MAY retry" in para or "BUSY backoff" in flat or "BUSY retry" in flat:
+        return False
+    return "NEXT boundary" in para and "never by waiting" in para
+
+
+def test_header_says_next_boundary_not_retry():
+    assert header_busy_text_ok(SYCL_H)
+
+
+def test_header_mutants():
+    assert not header_busy_text_ok(SYCL_H.replace("never by\n// waiting", "by\n// waiting", 1))
+    assert not header_busy_text_ok(SYCL_H.replace("NEXT boundary", "next call", 1))
+    assert not header_busy_text_ok(SYCL_H + "\n// BUSY backoff\n")

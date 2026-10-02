@@ -9,7 +9,11 @@
 //     types, stream count and byte size, in the cache the shape's is_swa names;
 //   - a layer the shapes do not call has_kv owns no tensor in any cache (filtered, reused, shared);
 //   - the recurrent layers are exactly the offloaded layers, with the published row widths and rows;
-//   - the memory kinds llama does not model report themselves unsupported by name, and publish nothing.
+//   - the memory kinds llama does not model report themselves unsupported by name, and publish nothing;
+//     create_memory(no_alloc) refuses each of them with llama_measure_unsupported, which the load-time
+//     measure maps to "unsupported" (a WARN and the unplanned path, never a failed load);
+//   - the K-shift sub-caches a memory reports (get_shift_caches) are exactly the leaf caches that can shift
+//     under a memory that can shift, kind by kind.
 //
 // LLAMA_LAYER_SHAPES_DUMP=<path> writes the realised per-layer tensors as text, so a refactor of how the
 // memory is built can be diffed against the tree before it.
@@ -18,6 +22,7 @@
 #include "../src/llama-kv-cache-iswa.h"
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-layer-shapes.h"
+#include "../src/llama-load-measure.h"
 #include "../src/llama-memory-hybrid-idx.h"
 #include "../src/llama-memory-hybrid-iswa.h"
 #include "../src/llama-memory-hybrid.h"
@@ -29,11 +34,13 @@
 #include "llama.h"
 #include "test-tiny-model.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -252,6 +259,8 @@ static bool all_on_arena(const llama_model &, uint32_t) {
     return true;
 }
 
+static int n_rs_layers_equal = 0;
+
 static void check_shapes(const char * arch_name, const config & cfg, llama_context * ctx, const memory_view & mv) {
     const llama_model & model = ctx->get_model();
     llama_memory_params pm    = {
@@ -359,6 +368,7 @@ static void check_shapes(const char * arch_name, const config & cfg, llama_conte
             CHECK(
                 (int64_t) l.n_embd_s == st->ne[0] && (int64_t) l.n_rows == st->ne[1] && l.type_s == (int32_t) st->type,
                 "%s/%s: RS layer %u s", arch_name, cfg.name, l.il);
+            n_rs_layers_equal++;
         }
     }
 }
@@ -367,6 +377,7 @@ static void check_shapes(const char * arch_name, const config & cfg, llama_conte
 // is allocated, which is what a load-time measure needs. A kind with no such form throws, naming it.
 static int n_no_alloc_cases   = 0;
 static int n_no_alloc_refused = 0;
+static std::set<int> refused_kinds;
 
 static void check_no_alloc(const char * arch_name, const config & cfg, llama_context * ctx, const memory_view & mv) {
     const llama_model &   model = ctx->get_model();
@@ -381,10 +392,15 @@ static void check_no_alloc(const char * arch_name, const config & cfg, llama_con
     const llama_memory_policy pol = model.memory_policy(pm, cp);
 
     if (llama_memory_kind_unsupported(pol.kind) != nullptr) {
-        bool        threw = false;
+        bool        threw       = false;
+        bool        unsupported = false;
         std::string what;
         try {
             delete model.create_memory(pm, cp, true);
+        } catch (const llama_measure_unsupported & e) {
+            threw       = true;
+            unsupported = true;
+            what        = e.what();
         } catch (const std::exception & e) {
             threw = true;
             what  = e.what();
@@ -392,7 +408,14 @@ static void check_no_alloc(const char * arch_name, const config & cfg, llama_con
         CHECK(threw && what.find("no no_alloc form") != std::string::npos,
               "%s/%s: kind '%s' must refuse no_alloc by name (%s)", arch_name, cfg.name, mv.kind.c_str(),
               threw ? what.c_str() : "it built");
+        // the load-time measure maps this type, and only this type, to "unsupported": a plain runtime_error
+        // would be a failed measure and a refused load
+        CHECK(unsupported, "%s/%s: the refusal is not a llama_measure_unsupported (%s)", arch_name, cfg.name,
+              what.c_str());
+        CHECK(what.find(arch_name) != std::string::npos, "%s/%s: the refusal does not name the architecture (%s)",
+              arch_name, cfg.name, what.c_str());
         n_no_alloc_refused++;
+        refused_kinds.insert((int) pol.kind);
         return;
     }
 
@@ -457,6 +480,87 @@ static void check_no_alloc(const char * arch_name, const config & cfg, llama_con
           cfg.name);
 }
 
+// The K-shift sub-caches. Each memory kind reports the llama_kv_cache objects whose K the context re-ropes on
+// a shift: a leaf cache that can shift and has a rope, under a memory that can shift. The expectation is
+// derived here from the realised caches and the memory's own get_can_shift(), not from get_shift_caches():
+// a composite that forgets its own gate, a leaf that forgets the rope test and a kind that reports a cache it
+// does not hold each fail it. (A mirror cache, `other != nullptr`, is not among the caches view_of reaches.)
+static std::set<std::string> shift_kinds_nonempty;
+static std::set<std::string> shift_kinds_checked;
+static int                   n_shift_gated_off = 0;
+
+static void check_shift_caches(const char *        arch_name,
+                               const config &      cfg,
+                               llama_context *     ctx,
+                               const memory_view & mv) {
+    llama_memory_t mem = ctx->get_memory();
+    if (mem == nullptr || mv.kind == "other") {
+        return;  // no memory, or a kind view_of does not walk (the unsupported ones)
+    }
+    std::vector<const llama_kv_cache *> got;
+    mem->get_shift_caches(got);
+
+    std::vector<const llama_kv_cache *> want;
+    if (mem->get_can_shift()) {
+        for (const auto & part : mv.kvs) {
+            if (part.kv != nullptr && part.kv->get_can_shift() &&
+                ctx->get_model().hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
+                want.push_back(part.kv);
+            }
+        }
+    } else {
+        n_shift_gated_off++;
+    }
+
+    std::sort(got.begin(), got.end());
+    std::sort(want.begin(), want.end());
+    CHECK(got == want, "%s/%s kind=%s: get_shift_caches reports %zu caches, the realised memory has %zu that shift",
+          arch_name, cfg.name, mv.kind.c_str(), got.size(), want.size());
+    for (const llama_kv_cache * kv : got) {
+        const bool held = std::any_of(mv.kvs.begin(), mv.kvs.end(), [&](const kv_part & p) { return p.kv == kv; });
+        CHECK(held, "%s/%s: a shift cache is not one of the memory's caches", arch_name, cfg.name);
+    }
+    if (mv.kind == "recurrent") {
+        CHECK(got.empty(), "%s/%s: a pure recurrent memory reports %zu shift caches", arch_name, cfg.name, got.size());
+    }
+    shift_kinds_checked.insert(mv.kind);
+    if (!got.empty()) {
+        shift_kinds_nonempty.insert(mv.kind);
+    }
+}
+
+// Which kinds have no no_alloc form is one fact, in llama_memory_kind_unsupported. This is its table by kind:
+// the five kinds whose caches hold tensors the shape structs have no place for, and every other kind.
+static void check_unsupported_table() {
+    static const struct {
+        llama_memory_kind kind;
+        bool              unsupported;
+    } k_table[] = {
+        { LLAMA_MEMORY_KIND_NONE,        false },
+        { LLAMA_MEMORY_KIND_KV,          false },
+        { LLAMA_MEMORY_KIND_ISWA,        false },
+        { LLAMA_MEMORY_KIND_MSA,         true  },
+        { LLAMA_MEMORY_KIND_DSA,         true  },
+        { LLAMA_MEMORY_KIND_DSA_ISWA,    true  },
+        { LLAMA_MEMORY_KIND_DSV4,        true  },
+        { LLAMA_MEMORY_KIND_RECURRENT,   false },
+        { LLAMA_MEMORY_KIND_HYBRID,      false },
+        { LLAMA_MEMORY_KIND_HYBRID_ISWA, false },
+        { LLAMA_MEMORY_KIND_HYBRID_IDX,  true  },
+    };
+
+    static_assert(sizeof(k_table) / sizeof(k_table[0]) == 11, "a new memory kind needs a row here and a decision");
+    std::set<std::string> names;
+    for (const auto & row : k_table) {
+        const char * name = llama_memory_kind_unsupported(row.kind);
+        CHECK((name != nullptr) == row.unsupported, "kind %d: unsupported=%d, expected %d", (int) row.kind,
+              name != nullptr, (int) row.unsupported);
+        if (name != nullptr) {
+            CHECK(names.insert(name).second, "kind %d: the name '%s' repeats", (int) row.kind, name);
+        }
+    }
+}
+
 int main() {
     FILE *       dump      = nullptr;
     const char * dump_path = getenv("LLAMA_LAYER_SHAPES_DUMP");
@@ -464,6 +568,7 @@ int main() {
         dump = fopen(dump_path, "w");
     }
 
+    check_unsupported_table();
     int n_built    = 0;
     int n_kv_cases = 0;
     int n_rs_cases = 0;
@@ -489,6 +594,7 @@ int main() {
             dump_arch(dump, arch_name, cfg, mv, (int) ctx->get_model().hparams.n_layer_all);
             check_shapes(arch_name, cfg, ctx, mv);
             check_no_alloc(arch_name, cfg, ctx, mv);
+            check_shift_caches(arch_name, cfg, ctx, mv);
         }
     }
     if (dump != nullptr) {
@@ -500,6 +606,15 @@ int main() {
     CHECK(n_no_alloc_cases >= 39 && n_no_alloc_refused > 0, "VOID: %d no_alloc builds and %d refusals",
           n_no_alloc_cases, n_no_alloc_refused);
     CHECK(n_kv_cases > 0 && n_rs_cases > 0, "VOID: %d KV and %d recurrent cases", n_kv_cases, n_rs_cases);
+    // the recurrent equality compared real layers, and the shift check saw a memory that shifts
+    CHECK(n_rs_layers_equal >= 20, "VOID: only %d recurrent layers were compared with the realised r/s tensors",
+          n_rs_layers_equal);
+    CHECK(shift_kinds_nonempty.count("kv") == 1 && shift_kinds_nonempty.count("iswa") == 1,
+          "VOID: the shift check found no shifting cache in a plain or an iSWA memory");
+    CHECK(shift_kinds_checked.count("recurrent") == 1 && shift_kinds_checked.count("hybrid") == 1,
+          "VOID: the shift check never saw a recurrent and a hybrid memory");
+    fprintf(stderr, "  %zu kinds refused no_alloc through create_memory; %zu kinds with shift caches; %d gated off\n",
+            refused_kinds.size(), shift_kinds_nonempty.size(), n_shift_gated_off);
 
     if (n_failed != 0) {
         fprintf(stderr, "%d check(s) failed\n", n_failed);
