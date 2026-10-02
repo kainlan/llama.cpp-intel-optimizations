@@ -121,27 +121,32 @@ def evaluate(backend, cache, cache_hpp):
     results = {}
     helper = function_body(
         backend, r"static bool ggml_sycl_onednn_pp_scratch_planned\([^)]*\)\s*\{")
+    bytes_helper = function_body(
+        backend, r"static bool ggml_sycl_onednn_pp_scratch_planned_bytes\([^)]*\)\s*\{")
     op_sycl = function_body(backend, r"inline void ggml_sycl_op_mul_mat_sycl\([^)]*\)\s*try\s*\{")
     dq_walk = function_body(backend, r"static bool ggml_sycl_dequant_f16_ensure_for_graph\([^)]*\)\s*\{")
     accessor = function_body(
         cache, r"bool unified_cache_get_onednn_zone_capacity\(int device_id, size_t \* capacity\)\s*\{")
     results["anchor: the shared admission helper exists"] = helper is not None
+    results["anchor: the by-bytes admission core exists"] = bytes_helper is not None
     results["anchor: op_mul_mat_sycl exists"] = op_sycl is not None
     results["anchor: the dequant graph walk exists"] = dq_walk is not None
     results["anchor: the zone-capacity accessor is defined"] = accessor is not None
     results["the zone-capacity accessor is declared"] = \
         re.search(r"bool unified_cache_get_onednn_zone_capacity\(int device_id, size_t \* capacity\);",
                   cache_hpp) is not None
-    if None in (helper, op_sycl, dq_walk, accessor):
+    if None in (helper, bytes_helper, op_sycl, dq_walk, accessor):
         return results
 
     # One source: the helper answers from the zone the arena was built with, through the pure predicate.
-    results["the helper asks the pure predicate"] = "zone_onednn_pp_scratch_planned(" in helper
+    results["the element-count helper delegates to the by-bytes core"] = \
+        "ggml_sycl_onednn_pp_scratch_planned_bytes(" in helper
+    results["the helper asks the pure predicate"] = "zone_onednn_pp_scratch_planned(" in bytes_helper
     results["the helper reads the arena's real ONEDNN zone capacity"] = \
-        "unified_cache_get_onednn_zone_capacity(" in helper
+        "unified_cache_get_onednn_zone_capacity(" in bytes_helper
     # ABSENCE: it must not be answered from the stored planned bytes, which the runtime growth signal rewrites.
     results["the helper does not read the (mutable) planned scratchpad figure"] = \
-        "unified_cache_get_planned_onednn_scratchpad_bytes" not in helper
+        "unified_cache_get_planned_onednn_scratchpad_bytes" not in bytes_helper
     results["the accessor reports the ONEDNN zone"] = \
         "vram_zone_id::ONEDNN" in accessor and "arena_active()" in accessor
 
@@ -229,7 +234,8 @@ if args.self_test and not failed:
     print("\n--- mutants ---")
     op_sig = r"inline void ggml_sycl_op_mul_mat_sycl\("
     walk_sig = r"static bool ggml_sycl_dequant_f16_ensure_for_graph\("
-    helper_sig = r"static bool ggml_sycl_onednn_pp_scratch_planned\("
+    helper_sig = r"static bool ggml_sycl_onednn_pp_scratch_planned_bytes\("
+    elems_sig = r"static bool ggml_sycl_onednn_pp_scratch_planned\("
     mutants = [
         ("op arm ignores the plan", "the op arm's candidate asks the helper",
          (mutate_in_func(backend, op_sig, HELPER, "ggml_sycl_XXXX("), cache, cache_hpp)),
@@ -237,6 +243,9 @@ if args.self_test and not failed:
          (mutate_in_func(backend, op_sig, "ggml_sycl_onednn_pp_candidate(", "ggml_sycl_XXXX("), cache, cache_hpp)),
         ("walk skips on admission alone", "every PP skip in the walk also asks the helper",
          (mutate_in_func(backend, walk_sig, HELPER, "ggml_sycl_XXXX("), cache, cache_hpp)),
+        ("elems helper stops delegating", "the element-count helper delegates to the by-bytes core",
+         (mutate_in_func(backend, elems_sig, "ggml_sycl_onednn_pp_scratch_planned_bytes(", "ggml_sycl_XXXX("),
+          cache, cache_hpp)),
         ("helper bypasses the pure predicate", "the helper asks the pure predicate",
          (mutate_in_func(backend, helper_sig, "zone_onednn_pp_scratch_planned(", "zone_XXXX("), cache, cache_hpp)),
         ("helper reads the mutable plan", "the helper does not read the (mutable) planned scratchpad figure",
@@ -252,21 +261,25 @@ if args.self_test and not failed:
          (mutate_in_func(backend, r"static bool acquire_onednn_pp_scratch\(",
                          "ggml_sycl_onednn_pp_scratch_planned_bytes(", "ggml_sycl_XXXX("), cache, cache_hpp)),
         ("acquire gate after the reserve", "acquire asks the plan before it asks for a reserve",
-         (mutate_in_func(backend, r"static bool acquire_onednn_pp_scratch\(",
-                         "unified_cache_reserve_onednn_scratch(",
-                         "ggml_sycl_onednn_pp_scratch_planned_bytes(0,0,0); ggml_sycl::unified_cache_reserve_onednn_scratch("),
+         (mutate_in_func(
+             mutate_in_func(backend, r"static bool acquire_onednn_pp_scratch\(",
+                            "ggml_sycl_onednn_pp_scratch_planned_bytes(", "ggml_sycl_XXXX("),
+             r"static bool acquire_onednn_pp_scratch\(", "scratch = ggml_sycl::unified_cache_get_onednn_scratch(",
+             "ggml_sycl_onednn_pp_scratch_planned_bytes(0, 0, 0); scratch = ggml_sycl::unified_cache_get_onednn_scratch("),
           cache, cache_hpp)),
         ("reserve grows around the plan", "reserve refuses an over-zone request after its replan attempt",
          (backend, mutate_in_func(cache, r"bool unified_cache::reserve_onednn_scratch\(",
-                                  "return finish(false);\n        }\n        if (total_needed <= zone_cap)",
-                                  "}\n        if (total_needed <= zone_cap)"), cache_hpp)),
+                                  "zone_cap / (1024.0f * 1024.0f));\n            return finish(false);",
+                                  "zone_cap / (1024.0f * 1024.0f));"), cache_hpp)),
         ("reserve shrinks a held scratch", "reserve sizes the pair with the never-shrink target",
          (backend, mutate_in_func(cache, r"bool unified_cache::reserve_onednn_scratch\(",
                                   "zone_onednn_scratch_reserve_target(", "zone_XXXX("), cache_hpp)),
         ("target after the reuse test", "the never-shrink target runs before the already-reserved test",
-         (backend, mutate_in_func(cache, r"bool unified_cache::reserve_onednn_scratch\(",
-                                  REUSE_TEST, "zone_onednn_scratch_reserve_target(" + REUSE_TEST),
-          cache_hpp)),
+         (backend, mutate_in_func(
+             mutate_in_func(cache, r"bool unified_cache::reserve_onednn_scratch\(",
+                            "zone_onednn_scratch_reserve_target(", "zone_XXXX("),
+             r"bool unified_cache::reserve_onednn_scratch\(", "direct_attempt = true;",
+             "zone_onednn_scratch_reserve_target(); direct_attempt = true;"), cache_hpp)),
         ("accessor undeclared", "the zone-capacity accessor is declared",
          (backend, cache, mutate(cache_hpp, "unified_cache_get_onednn_zone_capacity(", "unified_cache_get_XXXX("))),
     ]

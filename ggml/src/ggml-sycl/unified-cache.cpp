@@ -17910,6 +17910,19 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         return resolved.ptr;
     };
 
+    // A smaller request must never shrink what is held (llama.cpp-8ony). The two halves are separate blocks and
+    // different ops are largest in different halves, so replacing the held pair by the latest request shrinks one
+    // half every time and forces a regrowth the plan never provisioned: a 512-row layer op freed the LM head's weights
+    // block and the head could not get it back. Size the pair to the per-component maximum with what is held (bounded
+    // by the ONEDNN zone when an arena is active); a request the held pair already covers is then reused below.
+    {
+        const bool   arena_on = arena_active();
+        const size_t held_w   = onednn_weights_scratch_ ? onednn_weights_scratch_size_ : 0;
+        const size_t held_a   = onednn_activations_scratch_ ? onednn_activations_scratch_size_ : 0;
+        zone_onednn_scratch_reserve_target(arena_on, arena_on ? zone_capacity(vram_zone_id::ONEDNN) : 0, held_w, held_a,
+                                           weights_size, activations_size, &weights_size, &activations_size);
+    }
+
     // Already reserved with sufficient size?
     if (onednn_weights_scratch_ && onednn_activations_scratch_ && onednn_weights_scratch_size_ >= weights_size &&
         onednn_activations_scratch_size_ >= activations_size) {
@@ -18029,7 +18042,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             GGML_LOG_WARN(
                 "[UNIFIED-CACHE] oneDNN scratch request %.1f MB (weights %.1f MB + activations %.1f MB) exceeds the "
                 "planned ONEDNN zone %.1f MB: a path-scoped sizing predicate under-estimated the oneDNN scratchpad; "
-                "growing through the unified cache\n",
+                "attempting an arena replan (refused once allocations are live)\n",
                 total_needed / (1024.0f * 1024.0f), weights_size / (1024.0f * 1024.0f),
                 activations_size / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
 
@@ -18111,37 +18124,33 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
                 zone_free(vram_zone_id::ONEDNN, w);
             }
         }
-        // Two distinct causes reach this point and they must not be conflated:
-        //
-        //   * total_needed > zone_cap — the planned zone is genuinely too small, i.e.
-        //     a path-scoped sizing predicate under-estimated. Warned about above, and
-        //     the in-place re-plan was attempted and refused (ensure_planned_arena_zones()
-        //     logs the live allocations that blocked the rebuild).
-        //   * total_needed <= zone_cap — the zone was large enough but zone_alloc could
-        //     not hand out both buffers, so the partial allocation was individually freed
-        //     above. That is fragmentation, allocator rounding, or (since
-        //     llama.cpp-ndn9) a superseded reservation whose barrier has not drained
-        //     yet, so its bytes are still occupied. None of the three is a sizing miss,
-        //     and no re-plan was attempted for any of them. Counting them as an
-        //     under-estimate would blame the predicate for an allocator condition.
-        //
-        // Either way, grow through the unified-cache allocation path below rather than
-        // failing the reservation.
-        const bool zone_undersized = total_needed > zone_cap;
-        if (!zone_undersized) {
-            GGML_LOG_WARN(
-                "[UNIFIED-CACHE] oneDNN scratch sub-allocation failed with sufficient ONEDNN zone capacity "
-                "(need %.1f MB, zone %.1f MB): the zone is fragmented or still holds a superseded "
-                "reservation awaiting its release barrier, not under-sized; growing through the unified cache\n",
-                total_needed / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
+        // An over-zone request that the replan did not make fit ends here, and it is REFUSED, not served around
+        // the plan (llama.cpp-8ony). The direct unified_alloc this used to fall through to is an unplanned
+        // allocation: once weights were resident it was the only way a 1104.6 MiB LM-head pair got built against a
+        // 256 MiB zone, and it thrashed against the planned bytes around it. acquire_onednn_pp_scratch turns an op
+        // the plan routes elsewhere away before it asks, so a request reaching this refusal is a caller that skipped
+        // that question; it falls back to the planned RUNTIME dequant buffers, never to a larger scratch here.
+        if (total_needed > zone_cap) {
+            GGML_LOG_ERROR(
+                "[UNIFIED-CACHE] refusing oneDNN scratch request %.1f MB (weights %.1f MB + activations %.1f MB): "
+                "it is not planned into the ONEDNN zone (%.1f MB) and the arena replan did not make it fit; "
+                "callers must ask the plan first (acquire_onednn_pp_scratch)\n",
+                total_needed / (1024.0f * 1024.0f), weights_size / (1024.0f * 1024.0f),
+                activations_size / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
+            return finish(false);
         }
-        // The not-undersized label must carry BOTH of its causes. It is the only
-        // form most readers see -- the detailed WARN above fires on just one of
-        // the two paths -- so a bare "zone fragmented" here tells the stale
-        // pre-llama.cpp-ndn9 story and sends the reader hunting for
-        // fragmentation that may not exist.
-        arena_grow_cause =
-            zone_undersized ? "planned zone under-estimated" : "zone fragmented or awaiting a release barrier";
+        // Only a request the zone is large enough for reaches this point, so the zone_alloc above failed for one of
+        // the causes the under-estimate counter must NOT be charged for: allocator fragmentation, allocator
+        // rounding, or (since llama.cpp-ndn9) a superseded reservation whose barrier has not drained yet, so its
+        // bytes are still occupied. None is a sizing miss, and no re-plan was attempted for any of them. Grow
+        // through the unified-cache allocation path below rather than failing the reservation: this is the
+        // transient old+new case of a PLANNED op, not an op the plan routes elsewhere.
+        GGML_LOG_WARN(
+            "[UNIFIED-CACHE] oneDNN scratch sub-allocation failed with sufficient ONEDNN zone capacity "
+            "(need %.1f MB, zone %.1f MB): the zone is fragmented or still holds a superseded "
+            "reservation awaiting its release barrier, not under-sized; growing through the unified cache\n",
+            total_needed / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
+        arena_grow_cause     = "zone fragmented or awaiting a release barrier";
         arena_zone_exhausted = true;
     }
     direct_attempt = true;

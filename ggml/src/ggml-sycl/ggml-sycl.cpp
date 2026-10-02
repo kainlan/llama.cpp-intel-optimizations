@@ -1480,6 +1480,31 @@ struct onednn_pp_scratch_guard {
     onednn_pp_scratch_guard & operator=(const onednn_pp_scratch_guard &) = delete;
 };
 
+// llama.cpp-8ony: whether the f16 weight + activation copies of one dense op are PLANNED into the ONEDNN zone. The
+// planner keeps tensors it does not size that zone for (the LM head) out of it and puts their f16 dequant in the
+// RUNTIME-zone dense buffers instead, so "the op passes the oneDNN PP admission" is not enough to send it to the
+// oneDNN scratch: the arena refuses to grow that zone once weights are resident. Every route to the scratch asks
+// this (acquire_onednn_pp_scratch, by bytes, is the choke point) and the graph-entry walk asks it with the same
+// numbers (by element count), so the scratch decision and the buffer sizing cannot disagree.
+static bool ggml_sycl_onednn_pp_scratch_planned_bytes(int device, size_t weights_bytes, size_t activations_bytes) {
+    size_t     zone_capacity = 0;
+    const bool arena_active  = ggml_sycl::unified_cache_get_onednn_zone_capacity(device, &zone_capacity);
+    return ggml_sycl::zone_onednn_pp_scratch_planned(arena_active, zone_capacity, weights_bytes, activations_bytes);
+}
+
+static bool ggml_sycl_onednn_pp_scratch_planned(int device, int64_t weight_elems, int64_t activation_elems) {
+    if (weight_elems < 0 || activation_elems < 0) {
+        return false;
+    }
+    constexpr size_t elem_bytes = sizeof(sycl::half);
+    if (static_cast<size_t>(weight_elems) > SIZE_MAX / elem_bytes ||
+        static_cast<size_t>(activation_elems) > SIZE_MAX / elem_bytes) {
+        return false;
+    }
+    return ggml_sycl_onednn_pp_scratch_planned_bytes(device, static_cast<size_t>(weight_elems) * elem_bytes,
+                                                     static_cast<size_t>(activation_elems) * elem_bytes);
+}
+
 static bool acquire_onednn_pp_scratch(int                       device_id,
                                       ggml_type                 type,
                                       size_t                    weights_bytes,
@@ -1488,6 +1513,12 @@ static bool acquire_onednn_pp_scratch(int                       device_id,
                                       sycl::half **             activations_scratch,
                                       onednn_pp_scratch_guard & scratch_guard) {
     if (!weights_scratch || !activations_scratch || !onednn_pp_unified_scratch_enabled(type)) {
+        return false;
+    }
+    // An op the plan did not put in the ONEDNN zone is turned away HERE, before the reserve (llama.cpp-8ony): the
+    // reserve's replan attempt rewrites the stored plan upward and, refused, used to allocate the pair directly,
+    // which is an unplanned allocation. The caller falls back to the planned dequant buffers (or its pool copy).
+    if (!ggml_sycl_onednn_pp_scratch_planned_bytes(device_id, weights_bytes, activations_bytes)) {
         return false;
     }
     ggml_sycl::onednn_scratch_result scratch =
@@ -1502,27 +1533,6 @@ static bool acquire_onednn_pp_scratch(int                       device_id,
     *activations_scratch = static_cast<sycl::half *>(scratch.activations);
     scratch_guard.arm(device_id, scratch.token);
     return true;
-}
-
-// llama.cpp-8ony: whether the f16 weight + activation copies of one dense op are PLANNED into the ONEDNN zone. The
-// planner keeps tensors it does not size that zone for (the LM head) out of it and puts their f16 dequant in the
-// RUNTIME-zone dense buffers instead, so "the op passes the oneDNN PP admission" is not enough to send it to the
-// oneDNN scratch: the arena refuses to grow that zone once weights are resident. The op arm and the graph-entry
-// walk both ask this, with element counts, so the scratch decision and the buffer sizing cannot disagree.
-static bool ggml_sycl_onednn_pp_scratch_planned(int device, int64_t weight_elems, int64_t activation_elems) {
-    if (weight_elems < 0 || activation_elems < 0) {
-        return false;
-    }
-    constexpr size_t elem_bytes = sizeof(sycl::half);
-    if (static_cast<size_t>(weight_elems) > SIZE_MAX / elem_bytes ||
-        static_cast<size_t>(activation_elems) > SIZE_MAX / elem_bytes) {
-        return false;
-    }
-    size_t     zone_capacity = 0;
-    const bool arena_active  = ggml_sycl::unified_cache_get_onednn_zone_capacity(device, &zone_capacity);
-    return ggml_sycl::zone_onednn_pp_scratch_planned(arena_active, zone_capacity,
-                                                     static_cast<size_t>(weight_elems) * elem_bytes,
-                                                     static_cast<size_t>(activation_elems) * elem_bytes);
 }
 
 struct pp_moe_onednn_scratch_release_marker;

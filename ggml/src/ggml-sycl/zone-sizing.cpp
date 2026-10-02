@@ -330,15 +330,17 @@ void zone_onednn_scratch_reserve_target(bool    arena_active,
                                         size_t  requested_activations_bytes,
                                         size_t * weights_bytes,
                                         size_t * activations_bytes) {
-    (void) arena_active;
-    (void) zone_capacity_bytes;
-    (void) held_weights_bytes;
-    (void) held_activations_bytes;
+    const size_t merged_weights     = std::max(held_weights_bytes, requested_weights_bytes);
+    const size_t merged_activations = std::max(held_activations_bytes, requested_activations_bytes);
+    // A merged pair that cannot exist inside the zone (or whose sum is unrepresentable) is not a target: the
+    // request is used as asked, so a stale oversized held pair never wedges every later request.
+    const bool merged_fits = !arena_active || (merged_weights <= SIZE_MAX - merged_activations &&
+                                               merged_weights + merged_activations <= zone_capacity_bytes);
     if (weights_bytes) {
-        *weights_bytes = requested_weights_bytes;  // RED stub: replaces the held pair, which is the defect
+        *weights_bytes = merged_fits ? merged_weights : requested_weights_bytes;
     }
     if (activations_bytes) {
-        *activations_bytes = requested_activations_bytes;
+        *activations_bytes = merged_fits ? merged_activations : requested_activations_bytes;
     }
 }
 
