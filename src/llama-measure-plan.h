@@ -13,6 +13,8 @@
 //
 //   llama_measure_graph_set()  the graphs a context can reach at allocation,
 //                              in the order the pass measures them;
+//   llama_measure_peak_per_chunk() the one quantity every consumer reads: the peak of each gallocr
+//                              chunk over the measured graphs (and llama_measure_peak_total, its sum);
 //   llama_measure_chunk_plan() the per-chunk slot caps from the chunk peaks
 //                              the measured graphs left in the scheduler.
 
@@ -122,6 +124,32 @@ inline std::vector<llama_measure_graph> llama_measure_graph_set(const llama_meas
     return out;
 }
 
+// The peak of each chunk over the measured graphs: `peaks[g][c]` is graph g's peak in chunk c, and a
+// graph with fewer chunks than c contributes nothing to c. This is what each chunk's buffer has to hold
+// once every measured graph has run, so the compute term a slot must cover, the late check's comparison and
+// the chunk plan below all read this one vector, produced here and nowhere else.
+inline std::vector<size_t> llama_measure_peak_per_chunk(const std::vector<std::vector<size_t>> & peaks) {
+    size_t n_chunks = 0;
+    for (const auto & g : peaks) {
+        n_chunks = std::max(n_chunks, g.size());
+    }
+    std::vector<size_t> hi(n_chunks, 0);
+    for (const auto & g : peaks) {
+        for (size_t c = 0; c < g.size(); ++c) {
+            hi[c] = std::max(hi[c], g[c]);
+        }
+    }
+    return hi;
+}
+
+inline size_t llama_measure_peak_total(const std::vector<size_t> & hi) {
+    size_t total = 0;
+    for (size_t p : hi) {
+        total += p;
+    }
+    return total;
+}
+
 // The slot caps of one compute buft from the chunk layouts the measured graphs
 // left in the scheduler. `peaks[g][c]` is graph g's peak in chunk c (a graph
 // with fewer chunks than c contributes nothing to c), and `max_chunk_size` is
@@ -143,10 +171,9 @@ inline bool llama_measure_chunk_plan(const std::vector<std::vector<size_t>> & pe
     cap.clear();
     reason.clear();
 
-    size_t n_chunks = 0;
-    for (const auto & g : peaks) {
-        n_chunks = std::max(n_chunks, g.size());
-    }
+    const std::vector<size_t> hi = llama_measure_peak_per_chunk(peaks);
+
+    const size_t n_chunks = hi.size();
     if (n_chunks == 0) {
         return true;
     }
@@ -157,13 +184,6 @@ inline bool llama_measure_chunk_plan(const std::vector<std::vector<size_t>> & pe
     if (n_chunks > 1 && max_chunk_size == SIZE_MAX) {
         reason = "several gallocr chunks with no chunk size";
         return false;
-    }
-
-    std::vector<size_t> hi(n_chunks, 0);
-    for (const auto & g : peaks) {
-        for (size_t c = 0; c < g.size(); ++c) {
-            hi[c] = std::max(hi[c], g[c]);
-        }
     }
 
     cap.resize(n_chunks);

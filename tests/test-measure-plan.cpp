@@ -250,12 +250,48 @@ static void test_chunk_plan() {
     expect(ok && cap.empty(), "no measured chunk: an empty plan");
 }
 
+// The one quantity every consumer reads: the peak of each chunk over the measured graphs. The chunk plan
+// derives its caps from it, and the late check and the tenant section read the same vector and its sum.
+static void test_peak_per_chunk() {
+    std::vector<size_t> hi = llama_measure_peak_per_chunk(peaks({ { 700 }, { 300 }, { 900 } }));
+    expect(hi.size() == 1 && hi[0] == 900, "the peak of a one-chunk layout is the largest graph's");
+    expect(llama_measure_peak_total(hi) == 900, "its total is that peak");
+
+    hi = llama_measure_peak_per_chunk(peaks({
+        { 100, 50 },
+        { 80, 200, 10 }
+    }));
+    expect(hi.size() == 3 && hi[0] == 100 && hi[1] == 200 && hi[2] == 10,
+           "each chunk takes its own maximum, and a shorter graph contributes nothing to a later chunk");
+    expect(llama_measure_peak_total(hi) == 310, "the total is the sum over chunks, not the largest graph's sum");
+
+    hi = llama_measure_peak_per_chunk(peaks({}));
+    expect(hi.empty() && llama_measure_peak_total(hi) == 0, "no graph, no peak");
+
+    // the chunk plan reads exactly this vector: below the last chunk MAX(chunk size, peak), the last its peak
+    const auto          layout = peaks({
+        { 100, 50 },
+        { 80, 200, 10 }
+    });
+    std::vector<size_t> cap;
+    std::string         reason;
+    const bool          ok = llama_measure_chunk_plan(layout, 150, 16, cap, reason);
+    hi                     = llama_measure_peak_per_chunk(layout);
+    expect(ok && cap.size() == hi.size(), "the plan has one cap per peak chunk");
+    bool agree = ok && cap.size() == hi.size();
+    for (size_t c = 0; agree && c < cap.size(); ++c) {
+        agree = cap[c] == (c + 1 < cap.size() ? std::max<size_t>(150, hi[c]) : hi[c]);
+    }
+    expect(agree, "the caps derive from the shared per-chunk peak");
+}
+
 int main() {
     test_counts();
     test_shapes();
     test_streams();
     test_nextn();
     test_chunk_plan();
+    test_peak_per_chunk();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "%d case(s) failed\n", g_failures);
