@@ -23,12 +23,30 @@
 // count; a free out of order frees its own index, which the next claim takes again, and the count
 // never names a slot another buffer still holds.
 //
+// That is a deliberate departure from moua design 2.3.2, which claims by the live-object index and
+// reports an order like 0,2 or 1,0 as a [CONTEXT-PLAN-BUG]: here an out-of-order sequence is served
+// at the lowest free slot and not reported, because it cannot hand out a held slot and the plan
+// that sized the slots does not depend on the order.  The slots a cohort holds need not be contiguous
+// (llama makes no element for a zero cap, so a set like {0, 2} is real): a claim walks the indices
+// that exist, lowest first, so no reserved slot is unreachable, and the k-th live buffer takes the
+// k-th slot.
+//
+// A claim record releases its slot when it is dropped (its destructor), so no exit of a function
+// that holds one can leave the slot claimed; `release` is the same release with an event to record.
+//
+// A scope is a thread_local and has to be closed.  One that is still open when its thread exits is a
+// leak (it pins the table and its carves until then): the destructor counts it in leaked_scopes()
+// and says so on stderr.  llama's guard at the C boundary (L6) is the sanctioned caller of
+// open/close, and does not leave one open.
+//
 // This header names no device and no SYCL type, so a host test builds it.
 
 #include "kv-region-registry.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <utility>
@@ -46,7 +64,49 @@ struct tenant_claim {
     uint64_t                         wait_event = 0;  // the slot's last release event, for the claimant to chain on
     kv_region_handle                 owner;
 
+    tenant_claim()                                 = default;
+    tenant_claim(const tenant_claim &)             = delete;
+    tenant_claim & operator=(const tenant_claim &) = delete;
+
+    tenant_claim(tenant_claim && o) noexcept :
+        slots(std::move(o.slots)),
+        cohort(std::move(o.cohort)),
+        index(o.index),
+        generation(o.generation),
+        wait_event(o.wait_event),
+        owner(std::move(o.owner)) {
+        o.generation = 0;
+    }
+
+    tenant_claim & operator=(tenant_claim && o) noexcept {
+        if (this != &o) {
+            drop();
+            slots        = std::move(o.slots);
+            cohort       = std::move(o.cohort);
+            index        = o.index;
+            generation   = o.generation;
+            wait_event   = o.wait_event;
+            owner        = std::move(o.owner);
+            o.generation = 0;
+        }
+        return *this;
+    }
+
+    ~tenant_claim() { drop(); }
+
     bool live() const { return generation != 0; }
+
+  private:
+    // A record dropped while it still holds its slot gives the slot back, with no event to chain on.
+    void drop() noexcept {
+        if (live() && slots) {
+            try {
+                (void) slots->release_claim(cohort, index, generation, 0);
+            } catch (...) {
+            }
+        }
+        generation = 0;
+    }
 };
 
 enum class tenant_claim_status : uint8_t {
@@ -64,25 +124,53 @@ struct tenant_claim_outcome {
 
 class tenant_claim_scope {
   public:
-    // The state `open` returns an opaque pointer to.  One per thread.
+    // The state `open` hands back a pointer to.  One per thread.
     struct state {
         bool                             open = false;
         std::shared_ptr<kv_tenant_slots> slots;
         size_t                           claims = 0;  // claims that succeeded through this scope
+
+        state()                          = default;
+        state(const state &)             = delete;
+        state & operator=(const state &) = delete;
+
+        // A scope still open as its thread exits was never closed.
+        ~state() {
+            if (open) {
+                leaked_counter().fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr, "[CLAIM-SCOPE] a claim scope was left open at thread exit (%zu claim(s) made)\n",
+                             claims);
+            }
+        }
     };
 
-    // Opens the scope on this thread over `slots`.  Null, and nothing changed, when a scope is
-    // already open or `slots` is null.
-    static state * open(std::shared_ptr<kv_tenant_slots> slots) {
+    // Why an open did not open: three different answers that a bare null would have conflated.
+    enum class open_status : uint8_t {
+        OPENED,    // `out` is the scope, to be closed
+        NO_TABLE,  // `slots` is null: nothing to claim from, no scope in force, nothing changed
+        NESTED,  // this thread already holds a scope: refused, nothing changed, and the scope in force is NOT this one
+    };
+
+    // Opens the scope on this thread over `slots`.  `out` is null unless OPENED.  A nested open is
+    // refused before a missing table is considered, so a caller inside a scope always learns that.
+    static open_status open(std::shared_ptr<kv_tenant_slots> slots, state *& out) {
+        out       = nullptr;
         state & s = tls();
-        if (s.open || !slots) {
-            return nullptr;
+        if (s.open) {
+            return open_status::NESTED;
+        }
+        if (!slots) {
+            return open_status::NO_TABLE;
         }
         s.open   = true;
         s.slots  = std::move(slots);
         s.claims = 0;
-        return &s;
+        out      = &s;
+        return open_status::OPENED;
     }
+
+    // Scopes that were still open when their thread exited.
+    static size_t leaked_scopes() { return leaked_counter().load(std::memory_order_relaxed); }
 
     // Closes the scope `scope` names.  False, and nothing changed, for anything but this thread's
     // open scope (a stale pointer, another thread's, null).  The table's last drop, if the scope
@@ -100,7 +188,17 @@ class tenant_claim_scope {
 
     static bool active() { return tls().open; }
 
-    static size_t claims_made(const state * scope) { return scope == nullptr ? 0 : scope->claims; }
+    // The claims made through `scope`, which must be this thread's open scope: another thread's scope
+    // or a finished thread's is not read.  False, with `out` 0, for anything else.
+    static bool claims_made(const state * scope, size_t & out) {
+        const state & s = tls();
+        if (scope == nullptr || scope != &s || !s.open) {
+            out = 0;
+            return false;
+        }
+        out = s.claims;
+        return true;
+    }
 
     // Claims the lowest free slot of `cohort` for `bytes`, on the scope this thread has open.
     // `out` is replaced only on OK.
@@ -109,11 +207,15 @@ class tenant_claim_scope {
         if (!s.open) {
             return { tenant_claim_status::NO_SCOPE, 0, 0 };
         }
-        for (uint32_t index = 0;; ++index) {
+        uint32_t index = 0;
+        uint32_t last  = 0;  // the index the refusal names when no slot is left
+        while (s.slots->next_index(cohort, index, index)) {
+            last = index;
             // The table checks a size against the cap before it checks the claim state, so a held slot
             // that is too small for the request would answer OVER_PLAN for a slot that is not free to
             // be checked at all.  Only a free slot is asked.
             if (s.slots->claimed(cohort, index)) {
+                ++index;
                 continue;
             }
             const kv_claim c = s.slots->claim(cohort, index, bytes);
@@ -132,6 +234,7 @@ class tenant_claim_scope {
                         return { tenant_claim_status::OK, index, 0 };
                     }
                 case kv_claim_result::ALREADY_CLAIMED:
+                    ++index;
                     continue;
                 case kv_claim_result::OVER_PLAN:
                     return { tenant_claim_status::OVER_PLAN, index, s.slots->cap(cohort, index) };
@@ -139,6 +242,7 @@ class tenant_claim_scope {
                     return { tenant_claim_status::NO_SLOT, index, 0 };
             }
         }
+        return { tenant_claim_status::NO_SLOT, last == 0 ? 0 : last + 1, 0 };
     }
 
     // Releases a live claim, recording `release_event` for the next claimant to chain on, and
@@ -148,13 +252,19 @@ class tenant_claim_scope {
         if (!claim.live() || !claim.slots) {
             return false;
         }
-        tenant_claim moved = std::move(claim);
-        claim              = tenant_claim{};
-        return moved.slots->release_claim(moved.cohort, moved.index, moved.generation, release_event);
+        const bool   released = claim.slots->release_claim(claim.cohort, claim.index, claim.generation, release_event);
+        tenant_claim moved    = std::move(claim);
+        moved.generation      = 0;  // released above: its destructor must not release again
+        return released;
         // `moved` drops here: the table and the slot handle go with no slot lock held
     }
 
   private:
+    static std::atomic<size_t> & leaked_counter() {
+        static std::atomic<size_t> n{ 0 };
+        return n;
+    }
+
     static state & tls() {
         thread_local state s;
         return s;

@@ -593,6 +593,19 @@ class kv_tenant_slots {
         return false;
     }
 
+    // The lowest index >= `from` at which `cohort` has a slot, or false when it has none.  The slot
+    // set of a cohort need not be contiguous (llama makes no element for a zero cap), so a claim walks
+    // the indices that exist instead of counting.
+    bool next_index(const std::string & cohort, uint32_t from, uint32_t & out) const {
+        std::shared_lock<kv_witnessed_shared_mutex> pin(pin_);
+        auto                                        it = slots_.lower_bound(slot_key{ cohort, from });
+        if (it == slots_.end() || it->first.cohort != cohort) {
+            return false;
+        }
+        out = it->first.index;
+        return true;
+    }
+
     size_t cap(const std::string & cohort, uint32_t index) const {
         std::shared_lock<kv_witnessed_shared_mutex> pin(pin_);
         auto                                        it = slots_.find(slot_key_view{ cohort, index });

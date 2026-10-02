@@ -13,7 +13,18 @@
 //   (4) the buffer's memory is real, pinned host memory: the whole slot reads back what was written;
 //   (5) a nested scope is refused;
 //   (6) outside the scope the buffer type allocates for itself and claims nothing;
-//   (7) a covered republish allocates nothing: the slots held from the first publish still serve.
+//   (7) a covered republish allocates nothing: the slots held from the first publish still serve;
+//   (8) a republish the held table cannot carry -- a larger slot, or a slot index the table never held -- is
+//       refused (PLAN_REJECTED), publishes nothing, and leaves the published section and the held slots as
+//       they were;
+//   (9) a refused reservation is a refusal before anything is published: a descriptor whose second host slot
+//       cannot be carved leaves no table, no scope and no live slot (the first slot's carve dropped), and a
+//       later good publish succeeds; the same for an injected refusal of the first carve;
+//  (10) the slot status answers: a scope that did not open says why (no reservation, nested, invalid
+//       backend, unwritten out pointer), and a nested refusal is not the answer of a context with no table;
+//  (11) the carves go back with the context: after the backend is freed the table lives only as long as a
+//       buffer still claims from it, and the last free releases every slot;
+//  (12) the slot's memory is pinned USM, not merely readable host memory.
 //
 // Tiny allocations only (megabytes).  Run pinned to one discrete card:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:0 build/bin/test-sycl-host-tenant-claim
@@ -25,7 +36,9 @@
 #include "unified-cache.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -33,6 +46,9 @@
 #include <sycl/sycl.hpp>
 #include <unordered_set>
 #include <vector>
+
+// The slot count the backend's host tier holds alive (PRIVATE_TESTING).
+extern "C" size_t ggml_backend_sycl_test_host_tenant_slots_live();
 
 namespace {
 
@@ -161,27 +177,44 @@ struct lifecycle_fixture {
     ~lifecycle_fixture() { cleanup(); }
 };
 
-// A descriptor carrying two host slots (cohort context-compute-host, indices 0 and 1) and nothing else.
-struct host_desc {
-    ggml_sycl_context_tenant_desc  tenants[2]{};
-    ggml_sycl_runtime_context_desc desc{};
+struct host_slot_spec {
+    uint32_t index;
+    uint64_t bytes;
+};
 
-    host_desc(uint64_t slot0, uint64_t slot1) {
-        for (uint32_t i = 0; i < 2; ++i) {
-            tenants[i].struct_size = sizeof(ggml_sycl_context_tenant_desc);
-            tenants[i].cohort      = GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST;
-            tenants[i].slot_index  = i;
-            tenants[i].device      = -1;
-            tenants[i].slot_bytes  = i == 0 ? slot0 : slot1;
+// A descriptor carrying host slots of the context-compute-host cohort and nothing else.  The tenants array
+// is pointed at by `desc`, so a host_desc is not copyable.
+struct host_desc {
+    std::vector<ggml_sycl_context_tenant_desc> tenants;
+    ggml_sycl_runtime_context_desc             desc{};
+
+    host_desc(std::initializer_list<host_slot_spec> slots) {
+        for (const host_slot_spec & slot : slots) {
+            ggml_sycl_context_tenant_desc t{};
+            t.struct_size = sizeof(ggml_sycl_context_tenant_desc);
+            t.cohort      = GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST;
+            t.slot_index  = slot.index;
+            t.device      = -1;
+            t.slot_bytes  = slot.bytes;
+            tenants.push_back(t);
         }
         desc.struct_size      = sizeof(ggml_sycl_runtime_context_desc);
         desc.version          = GGML_SYCL_RUNTIME_CONTEXT_DESC_VERSION;
         desc.type_k           = GGML_TYPE_F16;
         desc.type_v           = GGML_TYPE_F16;
-        desc.n_tenants        = 2;
+        desc.n_tenants        = (uint32_t) tenants.size();
         desc.tenant_desc_size = sizeof(ggml_sycl_context_tenant_desc);
-        desc.tenants          = tenants;
+        desc.tenants          = tenants.data();
     }
+
+    host_desc(uint64_t slot0, uint64_t slot1) :
+        host_desc({
+            { 0, slot0 },
+            { 1, slot1 }
+    }) {}
+
+    host_desc(const host_desc &)             = delete;
+    host_desc & operator=(const host_desc &) = delete;
 };
 
 constexpr uint32_t N_CTX = 2, N_UBATCH = 2, N_SEQ = 1;
@@ -196,10 +229,52 @@ ggml_sycl_tenant_coverage coverage(lifecycle_fixture & f, const host_desc & d) {
     return ggml_backend_sycl_tenant_coverage(f.backend, N_CTX, N_UBATCH, N_SEQ, false, false, true, &d.desc);
 }
 
-// The whole buffer reads back what was written: real host memory, not a stand-in.
+// The scope open's answer is written to `*scope` (NULL unless OPENED), so a sentinel pre-set there proves a
+// refusal overwrote it.  An open that succeeded when it should not have is closed before the test fails.
+void * const unwritten_scope = reinterpret_cast<void *>(static_cast<uintptr_t>(1));
+
+void require_scope_status(ggml_backend_t backend, ggml_sycl_claim_scope_status expected, const char * message) {
+    void *     scope  = unwritten_scope;
+    const auto status = ggml_backend_sycl_claim_scope_open(backend, &scope);
+    if (status == GGML_SYCL_CLAIM_SCOPE_OPENED) {
+        ggml_backend_sycl_claim_scope_close(scope);
+    }
+    require(status == expected, message);
+    if (status != GGML_SYCL_CLAIM_SCOPE_OPENED) {
+        require(scope == nullptr, "a scope that did not open left something in the out pointer");
+    }
+}
+
+void * open_scope(ggml_backend_t backend) {
+    void *     scope  = unwritten_scope;
+    const auto status = ggml_backend_sycl_claim_scope_open(backend, &scope);
+    require(status == GGML_SYCL_CLAIM_SCOPE_OPENED && scope != nullptr && scope != unwritten_scope,
+            "the scope did not open on a context holding a host reservation");
+    return scope;
+}
+
+size_t slots_live() {
+    return ggml_backend_sycl_test_host_tenant_slots_live();
+}
+
+// Whether `ptr` is pinned host USM of one of the unified caches' contexts: sycl::usm::alloc::host there, not
+// the unknown a plain host pointer answers.
+bool is_pinned_host_usm(const void * ptr) {
+    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {
+        if (auto * cache = ggml_sycl::get_unified_cache_for_device(device)) {
+            if (sycl::get_pointer_type(ptr, cache->get_queue().get_context()) == sycl::usm::alloc::host) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The whole buffer reads back what was written, and it is pinned host USM: real host memory, not a stand-in.
 void touch(ggml_backend_buffer_t buffer, size_t bytes, unsigned char value) {
     auto * base = static_cast<unsigned char *>(ggml_backend_buffer_get_base(buffer));
     require(base != nullptr, "a buffer has no base");
+    require(is_pinned_host_usm(base), "a slot is not pinned host USM");
     std::memset(base, value, bytes);
     for (size_t i = 0; i < bytes; i += 4096) {
         require(base[i] == value, "a slot did not read back what was written");
@@ -207,18 +282,24 @@ void touch(ggml_backend_buffer_t buffer, size_t bytes, unsigned char value) {
     require(base[bytes - 1] == value, "the last byte of a slot did not read back");
 }
 
-void run() {
+void case_claims() {
+    require(slots_live() == 0, "slots are alive before the case began");
     lifecycle_fixture          f;
     ggml_backend_buffer_type_t host = ggml_backend_sycl_host_buffer_type();
     require(host != nullptr, "no SYCL_Host buffer type");
 
     // (1) the control: no published table, no scope
-    require(ggml_backend_sycl_claim_scope_open(f.backend) == nullptr,
-            "a scope opened on a context with no host reservation");
+    require_scope_status(f.backend, GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION,
+                         "a context with no host reservation did not answer NO_RESERVATION");
+    require_scope_status(nullptr, GGML_SYCL_CLAIM_SCOPE_INVALID_BACKEND,
+                         "a null backend did not answer INVALID_BACKEND");
+    require(ggml_backend_sycl_claim_scope_open(f.backend, nullptr) == GGML_SYCL_CLAIM_SCOPE_FAILED,
+            "a null out pointer did not answer FAILED");
 
     // (2) the first publish reserves, a covered republish does not, a larger one is growth
     const host_desc first(1 * MiB, 2 * MiB);
     require(publish(f, first) == GGML_SYCL_LIFECYCLE_OK, "the first descriptor publish failed");
+    require(slots_live() == 2, "the first publish did not hold exactly its two slots");
     require(coverage(f, first) == GGML_SYCL_TENANT_COVERAGE_EQUAL, "an identical candidate was not EQUAL");
     const host_desc smaller(512 * 1024, 1 * MiB);
     require(coverage(f, smaller) == GGML_SYCL_TENANT_COVERAGE_COVERED, "a smaller candidate was not COVERED");
@@ -226,9 +307,11 @@ void run() {
     require(coverage(f, larger) == GGML_SYCL_TENANT_COVERAGE_GROWTH, "a larger candidate was not GROWTH");
 
     // (3) inside the scope a buffer is a claim
-    void * scope = ggml_backend_sycl_claim_scope_open(f.backend);
-    require(scope != nullptr, "the scope did not open on a context holding a host reservation");
-    require(ggml_backend_sycl_claim_scope_open(f.backend) == nullptr, "a nested scope opened");  // (5)
+    void * scope = open_scope(f.backend);
+    // (5) a nested open is refused by name, whatever the second backend would hold
+    require_scope_status(f.backend, GGML_SYCL_CLAIM_SCOPE_NESTED, "a nested scope did not answer NESTED");
+    require_scope_status(nullptr, GGML_SYCL_CLAIM_SCOPE_INVALID_BACKEND,
+                         "a null backend inside a scope did not answer INVALID_BACKEND");
     require(ggml_backend_sycl_claim_scope_claims(scope) == 0, "a fresh scope has claims");
 
     ggml_backend_buffer_t b0 = ggml_backend_buft_alloc_buffer(host, 512 * 1024);
@@ -281,9 +364,143 @@ void run() {
     ggml_backend_buffer_free(outside);
 
     // the scope is closed: a new open starts at zero claims
-    scope = ggml_backend_sycl_claim_scope_open(f.backend);
-    require(scope != nullptr && ggml_backend_sycl_claim_scope_claims(scope) == 0, "a reopened scope kept its claims");
+    scope = open_scope(f.backend);
+    require(ggml_backend_sycl_claim_scope_claims(scope) == 0, "a reopened scope kept its claims");
     ggml_backend_sycl_claim_scope_close(scope);
+}
+
+// Slot 0 and slot 1's addresses, read by claiming them in a scope and handing them back.
+struct slot_addresses {
+    void * slot0 = nullptr;
+    void * slot1 = nullptr;
+};
+
+slot_addresses claim_addresses(lifecycle_fixture & f, size_t bytes0, size_t bytes1) {
+    ggml_backend_buffer_type_t host  = ggml_backend_sycl_host_buffer_type();
+    void *                     scope = open_scope(f.backend);
+    ggml_backend_buffer_t      b0    = ggml_backend_buft_alloc_buffer(host, bytes0);
+    ggml_backend_buffer_t      b1    = ggml_backend_buft_alloc_buffer(host, bytes1);
+    slot_addresses             out;
+    if (b0) {
+        out.slot0 = ggml_backend_buffer_get_base(b0);
+        ggml_backend_buffer_free(b0);
+    }
+    if (b1) {
+        out.slot1 = ggml_backend_buffer_get_base(b1);
+        ggml_backend_buffer_free(b1);
+    }
+    ggml_backend_sycl_claim_scope_close(scope);
+    require(out.slot0 != nullptr && out.slot1 != nullptr, "a held slot could not be claimed");
+    return out;
+}
+
+// (8) a republish the held table cannot carry is refused and changes nothing
+void case_republish_refused() {
+    require(slots_live() == 0, "slots are alive before the case began");
+    lifecycle_fixture f;
+    const host_desc   first(1 * MiB, 2 * MiB);
+    require(publish(f, first) == GGML_SYCL_LIFECYCLE_OK, "the first descriptor publish failed");
+    const slot_addresses before = claim_addresses(f, 1 * MiB, 2 * MiB);
+
+    // a larger slot: the held 2 MiB cannot be 3 MiB, and a republish allocates nothing
+    const host_desc larger(1 * MiB, 3 * MiB);
+    require(publish(f, larger) == GGML_SYCL_LIFECYCLE_PLAN_REJECTED, "a growing republish was not refused");
+    // a slot index the table never held
+    const host_desc new_index({
+        { 0, 1 * MiB },
+        { 1, 2 * MiB },
+        { 2, 1 * MiB }
+    });
+    require(publish(f, new_index) == GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
+            "a republish naming a slot the table never held was not refused");
+
+    // the refusals published nothing: the section still says what the table backs, and the slots are the
+    // same carves
+    require(coverage(f, first) == GGML_SYCL_TENANT_COVERAGE_EQUAL,
+            "the first shape is no longer the published one after a refused republish");
+    require(coverage(f, larger) == GGML_SYCL_TENANT_COVERAGE_GROWTH,
+            "a refused republish changed the published section");
+    require(slots_live() == 2, "a refused republish changed the held slots");
+    const slot_addresses after = claim_addresses(f, 1 * MiB, 2 * MiB);
+    require(after.slot0 == before.slot0 && after.slot1 == before.slot1, "a refused republish replaced the held carves");
+
+    // a sparse subset the table does carry is not a refusal (the held slots serve it; slot 0 stays held)
+    const host_desc subset({
+        { 1, 1 * MiB }
+    });
+    require(publish(f, subset) == GGML_SYCL_LIFECYCLE_OK, "a republish the held slots carry was refused");
+    require(slots_live() == 2, "a covered republish changed the held slots");
+}
+
+// (9) a reservation refused part-way publishes nothing and keeps nothing
+void case_refused_reservation() {
+    require(slots_live() == 0, "slots are alive before the case began");
+    const host_desc good(1 * MiB, 2 * MiB);
+    {
+        // The second carve cannot be served (a 4 TiB pinned request exceeds the host), after the first was made:
+        // the first drops with the table, and the context ends up as it began.
+        lifecycle_fixture f;
+        const host_desc   oversize({
+            { 0, 1 * MiB           },
+            { 1, uint64_t(4) << 40 }
+        });
+        require(publish(f, oversize) == GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
+                "a descriptor whose second host slot cannot be carved was not refused");
+        require(slots_live() == 0, "a refused reservation kept a slot");
+        require_scope_status(f.backend, GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION,
+                             "a refused reservation left a table behind");
+        require(publish(f, good) == GGML_SYCL_LIFECYCLE_OK, "a good publish after a refused one failed");
+        require(slots_live() == 2, "the good publish after a refusal did not hold its slots");
+        (void) claim_addresses(f, 1 * MiB, 2 * MiB);
+    }
+    require(slots_live() == 0, "slots outlived their context");
+    {
+        // The first carve itself refused (an owner-control allocation failure injected for it alone)
+        lifecycle_fixture f;
+        ggml_sycl::allocation_owner_test_fail_next_control_allocations(1);
+        const auto refused = publish(f, good);
+        ggml_sycl::allocation_owner_test_fail_next_control_allocations(0);
+        require(refused == GGML_SYCL_LIFECYCLE_PLAN_REJECTED, "a refused first carve did not refuse the publish");
+        require(slots_live() == 0, "a refused first carve kept a slot");
+        require_scope_status(f.backend, GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION,
+                             "a refused first carve left a table behind");
+        require(publish(f, good) == GGML_SYCL_LIFECYCLE_OK, "a good publish after a refused first carve failed");
+    }
+    require(slots_live() == 0, "slots outlived their context");
+}
+
+// (11) the carves go back with the context
+void case_teardown() {
+    require(slots_live() == 0, "slots are alive before the case began");
+    ggml_backend_buffer_type_t host = ggml_backend_sycl_host_buffer_type();
+    const host_desc            first(1 * MiB, 2 * MiB);
+    {
+        lifecycle_fixture f;
+        require(publish(f, first) == GGML_SYCL_LIFECYCLE_OK, "the first descriptor publish failed");
+        require(slots_live() == 2, "the publish did not hold its slots");
+        f.cleanup();
+        require(slots_live() == 0, "freeing the backend did not release the held slots");
+    }
+    {
+        // a buffer that still claims from the table keeps it, and the last free releases every slot
+        lifecycle_fixture f;
+        require(publish(f, first) == GGML_SYCL_LIFECYCLE_OK, "the first descriptor publish failed");
+        void *                scope = open_scope(f.backend);
+        ggml_backend_buffer_t b0    = ggml_backend_buft_alloc_buffer(host, 1 * MiB);
+        ggml_backend_sycl_claim_scope_close(scope);
+        require(b0 != nullptr, "a claim was refused");
+        f.cleanup();
+        require(slots_live() == 2, "the table was released while a buffer still claims from it");
+        ggml_backend_buffer_free(b0);
+        require(slots_live() == 0, "the last free did not release every slot");
+    }
+}
+
+void run() {
+    case_claims();
+    case_republish_refused();
+    case_refused_reservation();
+    case_teardown();
 }
 
 }  // namespace
@@ -302,8 +519,14 @@ int main() {
         std::cout << "host tenant reservation and claim scope: PASS\n";
         return 0;
     } catch (const sycl::exception & e) {
-        std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n';
-        return LLAMA_TEST_EXIT_SKIP;
+        // Only "this build or device cannot do it" skips; any other SYCL error is a failure of the thing
+        // under test and must not read as a skip.
+        if (e.code() == sycl::errc::feature_not_supported) {
+            std::cerr << "SKIP: unsupported on this device: " << e.what() << '\n';
+            return LLAMA_TEST_EXIT_SKIP;
+        }
+        std::cerr << "FAIL: sycl::exception: " << e.what() << '\n';
+        return 1;
     } catch (const std::exception & e) {
         std::cerr << "FAIL: " << e.what() << '\n';
         return 1;

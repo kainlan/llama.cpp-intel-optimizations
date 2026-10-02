@@ -39,7 +39,12 @@ It checks, over ggml/include/ggml-sycl.h and ggml/src/ggml-sycl/ggml-sycl.cpp:
     unified_allocate_owner with the carve's request fields, installs the table only after the inner
     transaction succeeded, and the destructor drops it after the section and before the unbind; the
     SYCL_Host buffer type claims inside a claim scope before it reaches any allocation, and its free
-    releases the claim.
+    releases the claim without waiting on the host.  The pins also name each refusal the device test
+    exercises: a refused or part-way reservation and a republish the held slots cannot carry are
+    PLAN_REJECTED before anything is published, the table is installed (and refused by name) before the
+    section is stored, a refused claim never falls through to the allocator, the claim in flight is owned
+    by an RAII record, a table handle is cast only after its deleter is checked, and the claim scope's
+    open answers a status for each way it can not open.
 
 Usage:
   check-sycl-l4-proc-registration.py [--root DIR]     check the tree, then run the mutation matrix
@@ -65,6 +70,28 @@ SIG_COVERAGE = r"\benum\s+ggml_sycl_tenant_coverage\s+ggml_backend_sycl_tenant_c
 HEADER = "ggml/include/ggml-sycl.h"
 SOURCE = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 REG_FN = "ggml_backend_sycl_reg_get_proc_address"
+IMPL_SIG = r"\bggml_sycl_set_runtime_context_for_model_impl\s*\("
+CARRY_SIG = r"\bstatic\s+bool\s+ggml_sycl_host_tenants_carry\s*\("
+INSTALL_SIG = r"\bstatic\s+bool\s+ggml_sycl_host_tenants_install\s*\("
+RESERVE_SIG = r"\bstatic\s+bool\s+ggml_sycl_reserve_host_tenants\s*\("
+SLOT_OF_SIG = r"\bstatic\s+ggml_sycl_host_tenant_slot\s*\*\s*ggml_sycl_host_tenant_slot_of\s*\("
+SLOT_MAKE_SIG = r"\bstatic\s+ggml_sycl::kv_region_handle\s+ggml_sycl_host_tenant_slot_make\s*\("
+ALLOC_SIG = r"\bstatic\s+ggml_backend_buffer_t\s+ggml_backend_sycl_host_buffer_type_alloc_buffer\s*\("
+CLAIM_SLOT_SIG = r"\bstatic\s+bool\s+ggml_backend_sycl_host_buffer_claim_slot\s*\("
+WRAP_SIG = r"\bstatic\s+ggml_backend_buffer_t\s+ggml_backend_sycl_host_buffer_wrap\s*\("
+FREE_SIG = r"\bstatic\s+void\s+ggml_backend_sycl_host_buffer_free_buffer\s*\("
+OPEN_SIG = r"\benum\s+ggml_sycl_claim_scope_status\s+ggml_backend_sycl_claim_scope_open\s*\("
+CLAIMS_SIG = r"\bsize_t\s+ggml_backend_sycl_claim_scope_claims\s*\("
+CLOSE_SIG = r"\bvoid\s+ggml_backend_sycl_claim_scope_close\s*\("
+SECTION_SET = "            ggml_sycl_published_section_set(backend_ctx, section);\n"
+INSTALL_BLOCK = (
+    "            if (host_tenants && !ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key)) {\n"
+    "                GGML_LOG_ERROR(\n"
+    "                    \"[CONTEXT-PLAN-BUG] the host reservation could not be installed on its context; the descriptor \"\n"
+    "                    \"publish is refused and the earlier section is kept (n_ctx=%u n_ubatch=%u)\\n\",\n"
+    "                    n_ctx, n_ubatch);\n"
+    "                return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\n"
+    "            }\n" + SECTION_SET)
 LOAD_END_SIG = r"\bggml_sycl_lifecycle_result\s+ggml_backend_sycl_model_load_end\s*\("
 TXN_SIG = r"\bggml_sycl_txn_result\s+ggml_sycl_run_runtime_context_transaction\s*\("
 CENTRY_SIG = r"\bvoid\s+ggml_backend_sycl_set_runtime_context\s*\("
@@ -182,6 +209,132 @@ def function_span(text, signature_re):
         return None
     start = text.find(body)
     return (start, start + len(body))
+
+
+def pin(fails, text, regex, message):
+    """One required shape: `regex` must match `text` (None counts as no match)."""
+    if text is None or not re.search(regex, text):
+        fails.append(message)
+
+
+def host_tier_pins(source, alloc, freeb, reserve, fails):
+    """What the host tier's behaviour rests on, at the text level (the device test runs it; this is what keeps
+    a refactor from quietly removing the shape the test's answers depend on).  Each pin names the refusal or
+    ownership claim it guards."""
+    impl = function_body(source, r"\bggml_sycl_set_runtime_context_for_model_impl\s*\(")
+    # the reservation: a refused allocation, a wrong tier, memory that is not host memory, and an
+    # exception are all refusals of the publish -- never an ignored failure and never a published section
+    if reserve is not None:
+        pin(fails, reserve, r"req\.size = \(size_t\) e\.slot_bytes;",
+            "L4 host tier: the host carve is not the slot's full byte count")
+        pin(fails, reserve, r"info == nullptr \|\| info->tier != GGML_SYCL_CONTEXT_COHORT_TIER_HOST_PINNED\) \{[^}]*return false;",
+            "L4 host tier: the reservation does not refuse a cohort that is not host-pinned")
+        pin(fails, reserve, r"if \(!allocation\) \{[^}]*return false;\s*\}",
+            "L4 host tier: a refused carve does not refuse the reservation")
+        pin(fails, reserve, r"if \(!resolved\.ptr \|\| resolved\.on_device\) \{[^}]*return false;\s*\}",
+            "L4 host tier: the reservation accepts a carve that did not resolve to host memory")
+        pin(fails, reserve, r"table->add\(info->name, e\.slot_index,\s",
+            "L4 host tier: the reservation does not add its carves to the table")
+        pin(fails, reserve, r"\n    out = std::move\(table\);\n    return true;\n\}$",
+            "L4 host tier: the reservation does not hand the table out only on success")
+        if re.search(r"\b(try|catch)\b", reserve):
+            fails.append("L4 host tier: the reservation swallows or converts an exception itself (the publish's catch answers "
+                         "EFFECT_FAILED, with the table dropped)")
+    # the publish: reserve only when no table is held, carry check otherwise, both refusals are PLAN_REJECTED
+    pin(fails, impl,
+        r"if \(held == nullptr\) \{\s*if \(!ggml_sycl_reserve_host_tenants\(backend_ctx, \*section, host_tenants, refusal\)\) \{"
+        r"[^}]*return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\s*\}\s*\} else if \(!ggml_sycl_host_tenants_carry\(\*held, \*section, refusal\)\) \{"
+        r"[^}]*return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\s*\}",
+        "L4 host tier: the publish does not reserve only without a held table, or does not refuse a refused reservation or "
+        "a republish the held slots cannot carry")
+    pin(fails, impl,
+        r"if \(host_tenants && !ggml_sycl_host_tenants_install\(backend_ctx, host_tenants, section->tenant_key\)\) \{"
+        r"\s*GGML_LOG_ERROR\([\s\S]*?\);\s*return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\s*\}\s*"
+        r"ggml_sycl_published_section_set\(backend_ctx, section\);",
+        "L4 host tier: the install result is not a refusal that keeps the earlier section, or the section is stored "
+        "before the table is installed")
+    install_fn = function_body(source, r"\bstatic\s+bool\s+ggml_sycl_host_tenants_install\s*\(")
+    if install_fn is not None and install_fn.count("table.reset()") != 1:
+        fails.append("L4 host tier: the table is dropped from the caller before the registry took it")
+    pin(fails, install_fn,
+        r"if \(id == 0 \|\| !ggml_sycl_kv_region_registry\(ctx->device\)\.install_tenant_slots\(id, table, tenant_key\)\) \{"
+        r"\s*return false;\s*\}\s*table\.reset\(\);\s*return true;",
+        "L4 host tier: the table is dropped from the caller before the registry took it")
+    pin(fails, function_body(source, r"\bstatic\s+bool\s+ggml_sycl_host_tenants_carry\s*\("),
+        r"held_bytes == 0\) \{[^}]*return false;\s*\}\s*if \(\(size_t\) e\.slot_bytes > held_bytes\) \{[^}]*return false;",
+        "L4 host tier: a republish is carried by a missing or smaller held slot")
+    if not re.search(r"\bstatic\s+void\s+ggml_sycl_host_tenants_erase\s*\(const ggml_backend_sycl_context \* ctx\) noexcept \{", source):
+        fails.append("L4 host tier: the destructor's drop of the host reservation may throw (not noexcept)")
+    # the slot's identity: a handle of any other type is refused, not reinterpreted
+    pin(fails, function_body(source, r"\bstatic\s+ggml_sycl_host_tenant_slot\s*\*\s*ggml_sycl_host_tenant_slot_of\s*\("),
+        r"std::get_deleter<ggml_sycl_host_tenant_slot_deleter>\(handle\) == nullptr\) \{\s*return nullptr;",
+        "L4 host tier: a table handle is cast to a slot without checking that the slot's deleter made it")
+    pin(fails, function_body(source, r"\bstatic\s+ggml_sycl::kv_region_handle\s+ggml_sycl_host_tenant_slot_make\s*\("),
+        r"return ggml_sycl::kv_region_handle\(slot, ggml_sycl_host_tenant_slot_deleter\{\}\);",
+        "L4 host tier: a slot is made without the deleter its reader checks")
+    # the buffer type: a refused claim is a refusal, never a fall-through to the allocator; the claim is owned
+    if alloc is not None:
+        pin(fails, alloc,
+            r"if \(ggml_sycl::tenant_claim_scope::active\(\)\) \{[^}]*if \(!ggml_backend_sycl_host_buffer_claim_slot\([^)]*\)\) \{"
+            r"\s*return nullptr;\s*\}\s*return ggml_backend_sycl_host_buffer_wrap\([^;]*std::move\(claim\)\);\s*\}\s*auto \* exact_cache",
+            "L4 host tier: a refused claim in a scope falls through to the legacy allocator (or the claim branch no longer "
+            "ends in its own return)")
+    claim_slot = function_body(source, r"\bstatic\s+bool\s+ggml_backend_sycl_host_buffer_claim_slot\s*\(")
+    if claim_slot is None:
+        fails.append("L4 host tier: ggml_backend_sycl_host_buffer_claim_slot not found")
+    else:
+        pin(fails, claim_slot, r"auto made = std::make_unique<ggml_sycl::tenant_claim>\(\);",
+            "L4 host tier: the claim in flight is not owned by an RAII record (a refusal or an exception would leak the slot)")
+        pin(fails, claim_slot, r"if \(!slot \|\| !resolved\.ptr \|\| resolved\.on_device\) \{[^}]*return false;\s*\}",
+            "L4 host tier: a claim over memory that is not host memory is served")
+        pin(fails, claim_slot, r"claim = std::move\(made\);\s*return true;\s*\}$",
+            "L4 host tier: the claim is handed to the buffer other than as the last step before success")
+        if re.search(r"\brelease\(", claim_slot):
+            fails.append("L4 host tier: claim_slot releases a claim by hand (the RAII record does it)")
+    wrap = function_body(source, r"\bstatic\s+ggml_backend_buffer_t\s+ggml_backend_sycl_host_buffer_wrap\s*\(")
+    if wrap is None:
+        fails.append("L4 host tier: ggml_backend_sycl_host_buffer_wrap not found")
+    else:
+        pin(fails, wrap, r"std::unique_ptr<ggml_sycl::tenant_claim> claim\) \{",
+            "L4 host tier: wrap does not take its claim by value (an early return would leave it live)")
+        pin(fails, wrap, r"new \(std::nothrow\) sycl_host_buf_ctx\{[^;]*\};\s*if \(!ctx\) \{\s*ggml_backend_buffer_free\(buffer\);\s*return nullptr;",
+            "L4 host tier: a failed context allocation does not free the CPU buffer it built and answer null")
+        pin(fails, wrap, r"if \(!ggml_backend_buffer_set_type\(buffer, buft\)\) \{\s*ggml_backend_buffer_free\(buffer\);\s*delete ctx;\s*return nullptr;",
+            "L4 host tier: a refused set_type does not free the buffer and the context that owns the claim")
+        if re.search(r"\brelease\(", wrap):
+            fails.append("L4 host tier: wrap releases a claim by hand (the context's destructor does it)")
+    # free: no host wait (event chain), and the claim goes back through the tenant release
+    if freeb is not None:
+        if re.search(r"wait_and_throw|\.wait\(|\bwait\(|ggml_backend_sycl_host_buffer_sync", freeb):
+            fails.append("L4 host tier: the SYCL_Host free_buffer waits on the host (a queue wait is not the slot's last event)")
+        pin(fails, freeb, r"if \(ctx->claim\) \{\s*\(void\) ggml_sycl::tenant_claim_scope::release\(\*ctx->claim, 0\);\s*ctx->claim\.reset\(\);\s*\}",
+            "L4 host tier: the SYCL_Host free_buffer does not release then drop its claim as the first step")
+    # the claim scope's C entries: every refusal is a named status, and a nested refusal is the first answer
+    open_fn = function_body(source, r"\benum\s+ggml_sycl_claim_scope_status\s+ggml_backend_sycl_claim_scope_open\s*\(")
+    if open_fn is None:
+        fails.append("L4 claim scope: ggml_backend_sycl_claim_scope_open not found")
+    else:
+        pin(fails, open_fn, r"^[^{]*\{\s*if \(scope == nullptr\) \{\s*return GGML_SYCL_CLAIM_SCOPE_FAILED;\s*\}\s*\*scope = nullptr;",
+            "L4 claim scope: open does not refuse a null out pointer first and clear it before anything else")
+        pin(fails, open_fn,
+            r"ggml_backend_dev_backend_reg\(backend->device\) != ggml_backend_sycl_reg\(\)\) \{\s*return GGML_SYCL_CLAIM_SCOPE_INVALID_BACKEND;",
+            "L4 claim scope: open does not refuse a foreign backend")
+        pin(fails, open_fn,
+            r"if \(ggml_sycl::tenant_claim_scope::active\(\)\) \{[^}]*return GGML_SYCL_CLAIM_SCOPE_NESTED;\s*\}\s*const uint64_t id =",
+            "L4 claim scope: open does not answer NESTED before it reads the context's table")
+        pin(fails, open_fn,
+            r"open_status::OPENED:\s*\*scope = opened;\s*return GGML_SYCL_CLAIM_SCOPE_OPENED;\s*case \S*open_status::NO_TABLE:\s*"
+            r"return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;\s*case \S*open_status::NESTED:\s*return GGML_SYCL_CLAIM_SCOPE_NESTED;",
+            "L4 claim scope: open does not map its three outcomes to OPENED, NO_RESERVATION and NESTED")
+        pin(fails, open_fn, r"catch \(\.\.\.\) \{\s*return GGML_SYCL_CLAIM_SCOPE_FAILED;\s*\}\s*\}$",
+            "L4 claim scope: open's catch does not answer FAILED")
+    claims_fn = function_body(source, r"\bsize_t\s+ggml_backend_sycl_claim_scope_claims\s*\(")
+    pin(fails, claims_fn,
+        r"if \(scope == nullptr\) \{\s*return 0;\s*\}\s*size_t claims = 0;\s*if \(!ggml_sycl::tenant_claim_scope::claims_made\(",
+        "L4 claim scope: claims reads the scope without the thread's open-scope check")
+    close_fn = function_body(source, r"\bvoid\s+ggml_backend_sycl_claim_scope_close\s*\(")
+    pin(fails, close_fn, r"if \(!ggml_sycl::tenant_claim_scope::close\(",
+        "L4 claim scope: close does not check that the scope is the thread's open one")
 
 
 def check(header_raw, source):
@@ -427,6 +580,7 @@ def check(header_raw, source):
     freeb = function_body(source, r"\bstatic\s+void\s+ggml_backend_sycl_host_buffer_free_buffer\s*\(")
     if freeb is None or "ggml_sycl::tenant_claim_scope::release(*ctx->claim" not in freeb:
         fails.append("L4 host tier: the SYCL_Host free_buffer does not release its claim")
+    host_tier_pins(source, alloc, freeb, reserve, fails)
 
     # transaction tail
     txn = function_body(source, r"\bggml_sycl_txn_result\s+ggml_sycl_run_runtime_context_transaction\s*\(")
@@ -546,8 +700,9 @@ def mutations(header_raw, source):
         ("the first publish reserves under L1", "does not reserve before L1",
          "                if (!ggml_sycl_reserve_host_tenants(backend_ctx, *section, host_tenants, refusal)) {",
          "                if (false) {"),
-        ("the table installed on any outcome", "installs before the inner transaction",
-         "            if (host_tenants) {\n                (void) ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key);\n            }\n", ""),
+        ("the host reservation's drop may throw", "may throw (not noexcept)",
+         "ggml_sycl_host_tenants_erase(const ggml_backend_sycl_context * ctx) noexcept {",
+         "ggml_sycl_host_tenants_erase(const ggml_backend_sycl_context * ctx) {"),
         ("the free forgets its claim", "does not release its claim",
          "        (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);\n        ctx->claim.reset();", "        ctx->claim.reset();"),
         ("the transaction tail's drop removed", "does not drop the context's earlier section",
@@ -564,6 +719,87 @@ def mutations(header_raw, source):
     # One edit inside one named function: (label, expected message, signature, old, new).  Several of the
     # lines these touch recur in the other ledger functions, so the edit is scoped to the function it names.
     scoped = [
+        ("the install moved before the inner transaction", "installs before the inner transaction",
+         IMPL_SIG, "    const bool inner_ok = g_runtime_update_succeeded;",
+         "    (void) ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key);\n    const bool inner_ok = g_runtime_update_succeeded;"),
+        ("the install stored after the section", "the section is stored before the table is installed", IMPL_SIG,
+         INSTALL_BLOCK, SECTION_SET + INSTALL_BLOCK.replace(SECTION_SET, "")),
+        ("the install result discarded", "the install result is not a refusal", IMPL_SIG,
+         "if (host_tenants && !ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key)) {",
+         "if (host_tenants && (ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key), false)) {"),
+        ("the install refusal answers EFFECT_FAILED", "the install result is not a refusal", IMPL_SIG,
+         "                    n_ctx, n_ubatch);\n                return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\n            }\n            ggml_sycl_published_section_set",
+         "                    n_ctx, n_ubatch);\n                return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;\n            }\n            ggml_sycl_published_section_set"),
+        ("a refused reservation is ignored", "does not reserve only without a held table, or does not refuse", IMPL_SIG,
+         "                        return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;\n                    }\n                } else if",
+         "                    }\n                } else if"),
+        ("a republish allocates again", "does not reserve only without a held table, or does not refuse", IMPL_SIG,
+         "if (held == nullptr) {", "if (true) {"),
+        ("the republish carry check dropped", "does not reserve only without a held table, or does not refuse", IMPL_SIG,
+         "} else if (!ggml_sycl_host_tenants_carry(*held, *section, refusal)) {", "} else if (false) {"),
+        ("the carry accepts a larger slot", "a republish is carried by a missing or smaller held slot", CARRY_SIG,
+         "if ((size_t) e.slot_bytes > held_bytes) {", "if (false) {"),
+        ("the carry accepts a slot never held", "a republish is carried by a missing or smaller held slot", CARRY_SIG,
+         "if (held_bytes == 0) {", "if (false) {"),
+        ("the table reset before the registry took it", "the table is dropped from the caller before the registry took it", INSTALL_SIG,
+         "    const uint64_t id = ggml_sycl_context_execution_id(ctx);\n", "    table.reset();\n    const uint64_t id = ggml_sycl_context_execution_id(ctx);\n"),
+        ("the carve halved", "the host carve is not the slot's full byte count", RESERVE_SIG,
+         "req.size = (size_t) e.slot_bytes;", "req.size = (size_t) e.slot_bytes / 2;"),
+        ("a refused carve returns true", "a refused carve does not refuse the reservation", RESERVE_SIG,
+         "\" failed\";\n            return false;", "\" failed\";\n            return true;"),
+        ("the reservation swallows an exception", "swallows or converts an exception itself", RESERVE_SIG,
+         "    out.reset();\n", "    out.reset();\n    try {\n    } catch (...) {\n    }\n"),
+        ("the tier check dropped", "does not refuse a cohort that is not host-pinned", RESERVE_SIG,
+         "info == nullptr || info->tier != GGML_SYCL_CONTEXT_COHORT_TIER_HOST_PINNED", "info == nullptr"),
+        ("the on-device check dropped from the reservation", "accepts a carve that did not resolve to host memory", RESERVE_SIG,
+         "if (!resolved.ptr || resolved.on_device) {", "if (!resolved.ptr) {"),
+        ("the carve never added to the table", "does not add its carves to the table", RESERVE_SIG,
+         "(void) table->add(info->name, e.slot_index,", "(void) (info->name, e.slot_index,"),
+        ("the slot's deleter check dropped", "without checking that the slot's deleter made it", SLOT_OF_SIG,
+         "std::get_deleter<ggml_sycl_host_tenant_slot_deleter>(handle) == nullptr", "false"),
+        ("a slot made without its deleter", "without the deleter its reader checks", SLOT_MAKE_SIG,
+         "ggml_sycl::kv_region_handle(slot, ggml_sycl_host_tenant_slot_deleter{})", "ggml_sycl::kv_region_handle(slot)"),
+        ("a refused claim falls through to the allocator", "falls through to the legacy allocator", ALLOC_SIG,
+         "        if (!ggml_backend_sycl_host_buffer_claim_slot(size, exact_device, claim, claimed_ptr, claimed_handle)) {\n            return nullptr;\n        }\n", ""),
+        ("the claim branch no longer returns", "falls through to the legacy allocator", ALLOC_SIG,
+         "        return ggml_backend_sycl_host_buffer_wrap(buft, claimed_ptr,", "        (void) ggml_backend_sycl_host_buffer_wrap(buft, claimed_ptr,"),
+        ("the claim in flight owned by a raw pointer", "not owned by an RAII record", CLAIM_SLOT_SIG,
+         "auto made = std::make_unique<ggml_sycl::tenant_claim>();", "ggml_sycl::tenant_claim * made = new ggml_sycl::tenant_claim();"),
+        ("the on-device check dropped from the claim", "a claim over memory that is not host memory is served", CLAIM_SLOT_SIG,
+         "if (!slot || !resolved.ptr || resolved.on_device) {", "if (!slot || !resolved.ptr) {"),
+        ("the claim released by hand in claim_slot", "claim_slot releases a claim by hand", CLAIM_SLOT_SIG,
+         "        return false;\n    }\n    const ggml_sycl_host_tenant_slot * slot",
+         "        (void) ggml_sycl::tenant_claim_scope::release(*made, 0);\n        return false;\n    }\n    const ggml_sycl_host_tenant_slot * slot"),
+        ("wrap takes the claim by reference", "wrap does not take its claim by value", WRAP_SIG,
+         "std::unique_ptr<ggml_sycl::tenant_claim> claim) {", "std::unique_ptr<ggml_sycl::tenant_claim> & claim) {"),
+        ("wrap's failed context allocation leaks the CPU buffer", "a failed context allocation does not free the CPU buffer", WRAP_SIG,
+         "    if (!ctx) {\n        ggml_backend_buffer_free(buffer);\n        return nullptr;\n    }", "    if (!ctx) {\n        return nullptr;\n    }"),
+        ("wrap's refused set_type leaks the context", "a refused set_type does not free the buffer", WRAP_SIG,
+         "        delete ctx;", ""),
+        ("the free waits on the host", "free_buffer waits on the host", FREE_SIG,
+         "    if (ctx->claim) {\n", "    if (ctx->claim) {\n        ggml_backend_sycl_host_buffer_sync(ctx);\n"),
+        ("the free waits on a queue", "free_buffer waits on the host", FREE_SIG,
+         "    if (ctx->claim) {\n", "    if (ctx->claim) {\n        ggml_sycl_get_device(ctx->device).default_queue().wait_and_throw();\n"),
+        ("open's nested check dropped", "does not answer NESTED before it reads", OPEN_SIG,
+         "if (ggml_sycl::tenant_claim_scope::active()) {", "if (false) {"),
+        ("open's foreign-backend check dropped", "does not refuse a foreign backend", OPEN_SIG,
+         "        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {", "        false) {"),
+        ("open answers FAILED for no reservation", "does not map its three outcomes", OPEN_SIG,
+         "open_status::NO_TABLE:\n                return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;",
+         "open_status::NO_TABLE:\n                return GGML_SYCL_CLAIM_SCOPE_FAILED;"),
+        ("open answers NO_RESERVATION for a nested open", "does not map its three outcomes", OPEN_SIG,
+         "open_status::NESTED:\n                return GGML_SYCL_CLAIM_SCOPE_NESTED;",
+         "open_status::NESTED:\n                return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;"),
+        ("open leaves the out pointer unwritten", "refuse a null out pointer first and clear it", OPEN_SIG,
+         "    *scope = nullptr;\n", ""),
+        ("open does not check its out pointer", "refuse a null out pointer first and clear it", OPEN_SIG,
+         "    if (scope == nullptr) {\n        return GGML_SYCL_CLAIM_SCOPE_FAILED;\n    }\n", ""),
+        ("open's catch answers NO_RESERVATION", "open's catch does not answer FAILED", OPEN_SIG,
+         "} catch (...) {\n        return GGML_SYCL_CLAIM_SCOPE_FAILED;", "} catch (...) {\n        return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;"),
+        ("claims dereferences an unchecked scope", "claims reads the scope without", CLAIMS_SIG,
+         "    if (scope == nullptr) {\n        return 0;\n    }\n", ""),
+        ("close skips the open-scope check", "close does not check that the scope", CLOSE_SIG,
+         "if (!ggml_sycl::tenant_claim_scope::close(", "if (false && !ggml_sycl::tenant_claim_scope::close("),
         ("the lock dropped from the record", "ggml_sycl_load_record_compute_term uses the ledger without state.mutex",
          SIG_RECORD, "    std::lock_guard<std::mutex> lock(state.mutex);\n", ""),
         ("the lock dropped from the clear", "ggml_sycl_load_clear_compute_terms uses the ledger without state.mutex",

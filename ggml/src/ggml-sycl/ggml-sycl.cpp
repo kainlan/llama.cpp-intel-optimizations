@@ -13155,7 +13155,45 @@ static void ggml_sycl_published_section_erase(const ggml_backend_sycl_context * 
 struct ggml_sycl_host_tenant_slot {
     ggml_sycl::mem_handle handle;
     size_t                bytes = 0;
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    ggml_sycl_host_tenant_slot() { live_count().fetch_add(1, std::memory_order_relaxed); }
+
+    ~ggml_sycl_host_tenant_slot() { live_count().fetch_sub(1, std::memory_order_relaxed); }
+
+    ggml_sycl_host_tenant_slot(const ggml_sycl_host_tenant_slot &)             = delete;
+    ggml_sycl_host_tenant_slot & operator=(const ggml_sycl_host_tenant_slot &) = delete;
+
+    // Slots alive in the process: a test reads it to see a refused reservation's carves and a torn-down
+    // context's carves go back.
+    static std::atomic<size_t> & live_count() {
+        static std::atomic<size_t> n{ 0 };
+        return n;
+    }
+#endif
 };
+
+// The slot's handle is a shared_ptr<void> in the registry's table, which carries no type.  A slot is made only
+// by this deleter's factory, and a reader checks the deleter before it casts, so a handle of any other type --
+// a test's, or a future producer's -- is refused rather than reinterpreted.
+struct ggml_sycl_host_tenant_slot_deleter {
+    void operator()(void * p) const noexcept { delete static_cast<ggml_sycl_host_tenant_slot *>(p); }
+};
+
+static ggml_sycl::kv_region_handle ggml_sycl_host_tenant_slot_make(ggml_sycl::mem_handle handle, size_t bytes) {
+    auto * slot  = new ggml_sycl_host_tenant_slot();
+    slot->handle = std::move(handle);
+    slot->bytes  = bytes;
+    return ggml_sycl::kv_region_handle(slot, ggml_sycl_host_tenant_slot_deleter{});
+}
+
+// The slot a table handle holds, or null when the handle was not made by ggml_sycl_host_tenant_slot_make.
+static ggml_sycl_host_tenant_slot * ggml_sycl_host_tenant_slot_of(const ggml_sycl::kv_region_handle & handle) {
+    if (!handle || std::get_deleter<ggml_sycl_host_tenant_slot_deleter>(handle) == nullptr) {
+        return nullptr;
+    }
+    return static_cast<ggml_sycl_host_tenant_slot *>(handle.get());
+}
 
 // Reserve one host carve per host-tier element of `section` (device -1) and build the slot table over
 // them: slot (cohort, slot_index) IS carve (cohort, slot_index), contiguous, `slot_bytes` long.  Each is
@@ -13208,13 +13246,46 @@ static bool ggml_sycl_reserve_host_tenants(const ggml_backend_sycl_context *    
         if (!table) {
             table = std::make_shared<ggml_sycl::kv_tenant_slots>();
         }
-        auto slot    = std::make_shared<ggml_sycl_host_tenant_slot>();
-        slot->handle = std::move(carve);
-        slot->bytes  = (size_t) e.slot_bytes;
-        (void) table->add(info->name, e.slot_index, std::move(slot),
+        (void) table->add(info->name, e.slot_index,
+                          ggml_sycl_host_tenant_slot_make(std::move(carve), (size_t) e.slot_bytes),
                           (size_t) e.slot_bytes);  // a fresh table: nothing retained
     }
     out = std::move(table);
+    return true;
+}
+
+// A republish while a table is held reuses it in place and never allocates (moua design 2.4.2, "reuse in
+// place"), so the held slots have to carry the candidate: every host-tier element of `section` needs a held
+// slot at the same (cohort, slot_index) with at least its bytes.  A section the table cannot carry is
+// refused, not published: storing it would make the section say what the table cannot back (coverage would
+// answer EQUAL for a slot whose claim is then refused), and a table that is still the old one is the fact the
+// published shape has to follow.  A smaller candidate is carried; a host cohort the table has never held, or
+// a slot index it has not, is not.  `refusal` names the first element that is not carried.
+static bool ggml_sycl_host_tenants_carry(const ggml_sycl::kv_tenant_slots &         held,
+                                         const ggml_sycl::runtime_context_section & section,
+                                         std::string &                              refusal) {
+    for (const ggml_sycl::runtime_context_tenant & e : section.tenants) {
+        if (e.device != -1) {
+            continue;
+        }
+        const ggml_sycl_context_cohort_info * info = ggml_sycl_context_cohort_lookup(e.cohort);
+        if (info == nullptr || info->tier != GGML_SYCL_CONTEXT_COHORT_TIER_HOST_PINNED) {
+            refusal = "host-tier element " + std::to_string(e.slot_index) + " names cohort " +
+                      std::to_string(e.cohort) + ", which is not a host-pinned cohort";
+            return false;
+        }
+        const size_t held_bytes = held.cap(info->name, e.slot_index);
+        if (held_bytes == 0) {
+            refusal = std::string("the held reservation has no slot ") + std::to_string(e.slot_index) + " of cohort " +
+                      info->name + " (a republish reuses the held slots and allocates none)";
+            return false;
+        }
+        if ((size_t) e.slot_bytes > held_bytes) {
+            refusal = std::string("slot ") + std::to_string(e.slot_index) + " of cohort " + info->name + " needs " +
+                      std::to_string(e.slot_bytes) + " B and the held slot is " + std::to_string(held_bytes) + " B";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -20155,17 +20226,25 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
     // The first publish of a context reserves AND HOLDS its host-tier room (moua design 2.3.2): one
     // owner-first carve per host slot, allocated here, before L1 (g_tensor_inventory_mutex), because a
     // host-zone allocation can need a new pinned chunk and a USM call must not run under L1.  A republish
-    // never allocates: the entry already holds the table.  A refused allocation is a refusal before
-    // anything was published, and the carves made so far drop with `host_tenants` on every exit that
-    // does not install them, with no registry lock held.
+    // never allocates: the entry already holds the table, and a section that table cannot carry is refused
+    // here, before anything is published, so the published section never says more than the table backs.  A
+    // refused allocation is likewise a refusal before anything was published, and the carves made so far drop
+    // with `host_tenants` on every exit that does not install them, with no registry lock held.
     std::shared_ptr<ggml_sycl::kv_tenant_slots> host_tenants;
     if (section && backend_ctx && backend_ctx->device >= 0 && backend_ctx->device < GGML_SYCL_MAX_DEVICES) {
         const uint64_t exec_id = ggml_sycl_context_execution_id(backend_ctx);
-        if (exec_id != 0 && ggml_sycl_kv_region_registry(backend_ctx->device).tenants(exec_id) == nullptr) {
+        if (exec_id != 0) {
             std::string refusal;
             try {
-                if (!ggml_sycl_reserve_host_tenants(backend_ctx, *section, host_tenants, refusal)) {
-                    GGML_LOG_WARN("[CONTEXT-PLAN] host tenant reservation refused: %s (n_ctx=%u n_ubatch=%u)\n",
+                const auto held = ggml_sycl_kv_region_registry(backend_ctx->device).tenants(exec_id);
+                if (held == nullptr) {
+                    if (!ggml_sycl_reserve_host_tenants(backend_ctx, *section, host_tenants, refusal)) {
+                        GGML_LOG_WARN("[CONTEXT-PLAN] host tenant reservation refused: %s (n_ctx=%u n_ubatch=%u)\n",
+                                      refusal.c_str(), n_ctx, n_ubatch);
+                        return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                    }
+                } else if (!ggml_sycl_host_tenants_carry(*held, *section, refusal)) {
+                    GGML_LOG_WARN("[CONTEXT-PLAN] host tenant republish refused: %s (n_ctx=%u n_ubatch=%u)\n",
                                   refusal.c_str(), n_ctx, n_ubatch);
                     return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
                 }
@@ -20274,10 +20353,18 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
     // shape that never went live.
     if (inner_ok && section) {
         try {
-            ggml_sycl_published_section_set(backend_ctx, section);
-            if (host_tenants) {
-                (void) ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key);
+            // The table first and the section last: the section is the cheap step and the one a reader trusts,
+            // so it is stored only once the table it describes is held.  An install that is refused (an
+            // unbound context, an entry that already holds a table) refuses the publish and keeps the earlier
+            // section; `host_tenants` is still ours and drops with no lock held.
+            if (host_tenants && !ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key)) {
+                GGML_LOG_ERROR(
+                    "[CONTEXT-PLAN-BUG] the host reservation could not be installed on its context; the descriptor "
+                    "publish is refused and the earlier section is kept (n_ctx=%u n_ubatch=%u)\n",
+                    n_ctx, n_ubatch);
+                return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
             }
+            ggml_sycl_published_section_set(backend_ctx, section);
         } catch (const ggml_sycl_fallback_error &) {
             throw;
         } catch (...) {
@@ -40094,36 +40181,51 @@ void ggml_backend_sycl_replan_scope_close(void * scope) {
 
 // The claim scope of a context's tenant slots (ggml-sycl.h; tenant-claim-scope.hpp).  Open reads the
 // context's held table from its registry entry and makes it this thread's claim target; the SYCL_Host
-// buffer type's alloc_buffer claims from it until close.
-void * ggml_backend_sycl_claim_scope_open(ggml_backend_t backend) {
+// buffer type's alloc_buffer claims from it until close.  The status says why a scope did not open: a
+// context with no reservation (allocate as before) is not a nested open (do not allocate: the scope in force
+// is another context's) and neither is a failure.
+enum ggml_sycl_claim_scope_status ggml_backend_sycl_claim_scope_open(ggml_backend_t backend, void ** scope) {
+    if (scope == nullptr) {
+        return GGML_SYCL_CLAIM_SCOPE_FAILED;
+    }
+    *scope = nullptr;
     sycl_module_mutation_guard module_guard;
     if (!module_guard) {
-        return nullptr;
+        return GGML_SYCL_CLAIM_SCOPE_FAILED;
     }
     if (!backend || !backend->context || !ggml_backend_is_sycl(backend) || !backend->device ||
         ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
-        return nullptr;
+        return GGML_SYCL_CLAIM_SCOPE_INVALID_BACKEND;
     }
     try {
         const auto * ctx = static_cast<const ggml_backend_sycl_context *>(backend->context);
         if (ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES) {
-            return nullptr;
+            return GGML_SYCL_CLAIM_SCOPE_INVALID_BACKEND;
+        }
+        // A nested open is refused before the table is read, so a caller inside a scope always learns that,
+        // whatever its own context holds.
+        if (ggml_sycl::tenant_claim_scope::active()) {
+            GGML_LOG_ERROR("[CLAIM-SCOPE] nested open refused: this thread already holds a claim scope\n");
+            return GGML_SYCL_CLAIM_SCOPE_NESTED;
         }
         const uint64_t id = ggml_sycl_context_execution_id(ctx);
         if (id == 0) {
-            return nullptr;
+            return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;
         }
         auto table = ggml_sycl_kv_region_registry(ctx->device).tenants(id);
-        if (!table) {
-            return nullptr;  // no held reservation: no claim scope is in force, the buffer type allocates as before
+        ggml_sycl::tenant_claim_scope::state * opened = nullptr;
+        switch (ggml_sycl::tenant_claim_scope::open(std::move(table), opened)) {
+            case ggml_sycl::tenant_claim_scope::open_status::OPENED:
+                *scope = opened;
+                return GGML_SYCL_CLAIM_SCOPE_OPENED;
+            case ggml_sycl::tenant_claim_scope::open_status::NO_TABLE:
+                return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;
+            case ggml_sycl::tenant_claim_scope::open_status::NESTED:
+                return GGML_SYCL_CLAIM_SCOPE_NESTED;
         }
-        if (ggml_sycl::tenant_claim_scope::active()) {
-            GGML_LOG_ERROR("[CLAIM-SCOPE] nested open refused: this thread already holds a claim scope\n");
-            return nullptr;
-        }
-        return ggml_sycl::tenant_claim_scope::open(std::move(table));
+        return GGML_SYCL_CLAIM_SCOPE_FAILED;
     } catch (...) {
-        return nullptr;
+        return GGML_SYCL_CLAIM_SCOPE_FAILED;
     }
 }
 
@@ -40137,10 +40239,23 @@ void ggml_backend_sycl_claim_scope_close(void * scope) {
 }
 
 size_t ggml_backend_sycl_claim_scope_claims(void * scope) {
-    return ggml_sycl::tenant_claim_scope::claims_made(static_cast<const ggml_sycl::tenant_claim_scope::state *>(scope));
+    if (scope == nullptr) {
+        return 0;
+    }
+    size_t claims = 0;
+    if (!ggml_sycl::tenant_claim_scope::claims_made(static_cast<const ggml_sycl::tenant_claim_scope::state *>(scope),
+                                                    claims)) {
+        GGML_LOG_ERROR("[CLAIM-SCOPE] claims read refused: the scope is not the one open on this thread\n");
+    }
+    return claims;
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+// Host-tier slots alive in the process (a test's view of a reservation's carves).
+extern "C" size_t ggml_backend_sycl_test_host_tenant_slots_live() {
+    return ggml_sycl_host_tenant_slot::live_count().load(std::memory_order_relaxed);
+}
+
 size_t ggml_backend_sycl_plan_caps_freeze_core(ggml_backend_sycl_plan_caps_t caps,
                                                ggml_backend_buffer_type_t    buft,
                                                bool                          is_vm,
@@ -44873,9 +44988,14 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
         return;
     }
     if (ctx->claim) {
-        // The slot is claimable again once the GPU work that DMAs into and out of this pinned memory is
-        // done: wait the two queues the host accessors wait, then release with no event to chain on.
-        ggml_backend_sycl_host_buffer_sync(ctx);
+        // No wait here, on purpose (no host waits; event-chain instead).  A queue-wide wait_and_throw would
+        // also wait on, and rethrow, other contexts' work on the device, and it covers only the cache queue
+        // and the default queue: the other streams, the split, MoE, CPU-dispatch, tensor-parallel and copy
+        // queues would still be unwaited, so it was never the guarantee it read as.  The contract is the
+        // scheduler's: a compute buffer is freed after ggml_backend_synchronize, so the last event of the
+        // work that used the slot is complete when this runs.  The release records no event, and the slot's
+        // wait_event is carried by the next claim but not consumed: chaining on it needs a GPU consumer of the
+        // buffer, which is the claim scope's caller (llama.cpp-moua L6).
         (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);
         ctx->claim.reset();
     }
@@ -44955,6 +45075,8 @@ static bool ggml_backend_sycl_host_buffer_claim_slot(size_t                     
                                                      ggml_sycl::mem_handle &                    handle) {
     const ggml_sycl_context_cohort_info * info = ggml_sycl_context_cohort_lookup(GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST);
     GGML_ASSERT(info != nullptr);
+    // `made` releases its slot when it is dropped, so every refusal below and an exception from here on leave
+    // the slot free: there is no explicit release to forget.
     auto                                  made    = std::make_unique<ggml_sycl::tenant_claim>();
     const ggml_sycl::tenant_claim_outcome outcome = ggml_sycl::tenant_claim_scope::claim(info->name, size, *made);
     if (outcome.status != ggml_sycl::tenant_claim_status::OK) {
@@ -44967,22 +45089,22 @@ static bool ggml_backend_sycl_host_buffer_claim_slot(size_t                     
         }
         return false;
     }
-    const auto owner    = std::static_pointer_cast<ggml_sycl_host_tenant_slot>(made->owner);
-    const auto resolved = owner ? owner->handle.resolve(device) : ggml_sycl::resolved_ptr{};
-    if (!owner || !resolved.ptr || resolved.on_device) {
-        (void) ggml_sycl::tenant_claim_scope::release(*made, 0);
+    const ggml_sycl_host_tenant_slot * slot     = ggml_sycl_host_tenant_slot_of(made->owner);
+    const auto                         resolved = slot ? slot->handle.resolve(device) : ggml_sycl::resolved_ptr{};
+    if (!slot || !resolved.ptr || resolved.on_device) {
         GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] host buffer claim refused: slot %u of cohort %s holds no host memory\n",
                        made->index, info->name);
         return false;
     }
     ptr    = resolved.ptr;
-    handle = owner->handle;
+    handle = slot->handle;
     claim  = std::move(made);
     return true;
 }
 
 // The buffer over `ptr`: the CPU buffer from the pointer with the host accessors installed.  `claim` is the
-// live tenant claim the memory belongs to, or null for a buffer the buft allocated itself.
+// live tenant claim the memory belongs to, or null for a buffer the buft allocated itself.  The claim is
+// released by its own destructor on every refusal here, so none of them has a release to forget.
 static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap(ggml_backend_buffer_type_t               buft,
                                                                 void *                                   ptr,
                                                                 size_t                                   size,
@@ -44993,23 +45115,22 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap(ggml_backend_buf
     // deallocation path to take.  Override get_base to extract the raw pointer.
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     if (!buffer) {
-        if (claim) {
-            (void) ggml_sycl::tenant_claim_scope::release(*claim, 0);
-        }
         return nullptr;
     }
 
     // Capture the CPU iface BEFORE overriding it: the accessors below delegate
-    // to these exact implementations after waiting the GPU (llama.cpp-30h4).
-    auto * ctx = new sycl_host_buf_ctx{ ptr, size, std::move(handle), device, buffer->iface };
+    // to these exact implementations after waiting the GPU (llama.cpp-30h4).  nothrow: a failed allocation
+    // frees the CPU buffer built above and answers null, rather than leaving it, and its claim, to an unwind.
+    auto * ctx = new (std::nothrow) sycl_host_buf_ctx{ ptr, size, std::move(handle), device, buffer->iface };
+    if (!ctx) {
+        ggml_backend_buffer_free(buffer);
+        return nullptr;
+    }
     ctx->claim = std::move(claim);
 
     if (!ggml_backend_buffer_set_type(buffer, buft)) {
         ggml_backend_buffer_free(buffer);
-        if (ctx->claim) {
-            (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);
-        }
-        delete ctx;
+        delete ctx;  // its claim, if any, releases with it
         return nullptr;
     }
     buffer->context           = ctx;

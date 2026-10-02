@@ -65,13 +65,38 @@ std::shared_ptr<kv_tenant_slots> table_of(const std::vector<size_t> & caps, cons
     return t;
 }
 
+// The scope an open returned, null when it did not open.
+tenant_claim_scope::state * open_scope(std::shared_ptr<kv_tenant_slots> t) {
+    tenant_claim_scope::state * out = nullptr;
+    (void) tenant_claim_scope::open(std::move(t), out);
+    return out;
+}
+
+size_t claims_of(const tenant_claim_scope::state * s) {
+    size_t n = 12345;
+    CHECK(tenant_claim_scope::claims_made(s, n), "claims_made refused this thread's open scope");
+    return n;
+}
+
+// A second record of a claim `a` holds: what a stale holder keeps after the slot was released and claimed again.
+tenant_claim copy_of(const tenant_claim & a) {
+    tenant_claim c;
+    c.slots      = a.slots;
+    c.cohort     = a.cohort;
+    c.index      = a.index;
+    c.generation = a.generation;
+    c.wait_event = a.wait_event;
+    c.owner      = a.owner;
+    return c;
+}
+
 void case_scope_is_per_thread() {
     CHECK(!tenant_claim_scope::active(), "no scope before an open");
-    CHECK(tenant_claim_scope::open(nullptr) == nullptr && !tenant_claim_scope::active(), "a null table opens nothing");
+    CHECK(open_scope(nullptr) == nullptr && !tenant_claim_scope::active(), "a null table opens nothing");
     auto                        t = table_of({ 100 });
-    tenant_claim_scope::state * s = tenant_claim_scope::open(t);
+    tenant_claim_scope::state * s = open_scope(t);
     CHECK(s != nullptr && tenant_claim_scope::active(), "an open with a table opens the scope");
-    CHECK(tenant_claim_scope::open(t) == nullptr, "a nested open is refused");
+    CHECK(open_scope(t) == nullptr, "a nested open is refused");
     CHECK(tenant_claim_scope::active(), "and the outer scope stays open");
 
     bool other_thread_active = true, other_close = true, other_own_open = false, other_close_ours = true,
@@ -80,7 +105,7 @@ void case_scope_is_per_thread() {
         other_thread_active = tenant_claim_scope::active();
         other_close         = tenant_claim_scope::close(s);
         // a thread with a scope of its own still cannot close ours, and its own is untouched by the try
-        auto * mine         = tenant_claim_scope::open(table_of({ 5 }));
+        auto * mine         = open_scope(table_of({ 5 }));
         other_own_open      = mine != nullptr;
         other_close_ours    = tenant_claim_scope::close(s);
         other_own_closed    = !tenant_claim_scope::active() ? false : tenant_claim_scope::close(mine);
@@ -100,24 +125,148 @@ void case_scope_is_per_thread() {
     CHECK(tenant_claim_scope::claim(HOST, 1, claim).status == tenant_claim_status::NO_SCOPE && !claim.live(),
           "a claim with no scope answers NO_SCOPE and takes nothing");
     CHECK(t->claimed(HOST, 0) == false, "and no slot is marked");
-    CHECK(tenant_claim_scope::claims_made(nullptr) == 0, "claims_made of null is 0");
+    size_t none = 7;
+    CHECK(!tenant_claim_scope::claims_made(nullptr, none) && none == 0, "claims_made of null is refused and 0");
 
     // a new open starts from zero claims, also after a scope that made some
-    s = tenant_claim_scope::open(t);
-    CHECK(s != nullptr && tenant_claim_scope::claims_made(s) == 0, "an opened scope starts at zero claims");
+    s = open_scope(t);
+    CHECK(s != nullptr && claims_of(s) == 0, "an opened scope starts at zero claims");
     tenant_claim made;
-    CHECK(tenant_claim_scope::claim(HOST, 1, made).status == tenant_claim_status::OK &&
-              tenant_claim_scope::claims_made(s) == 1,
+    CHECK(tenant_claim_scope::claim(HOST, 1, made).status == tenant_claim_status::OK && claims_of(s) == 1,
           "a claim is counted");
     CHECK(tenant_claim_scope::release(made) && tenant_claim_scope::close(s), "release and close");
-    s = tenant_claim_scope::open(t);
-    CHECK(s != nullptr && tenant_claim_scope::claims_made(s) == 0, "a reopened scope starts at zero claims again");
+    s = open_scope(t);
+    CHECK(s != nullptr && claims_of(s) == 0, "a reopened scope starts at zero claims again");
     CHECK(tenant_claim_scope::close(s), "and closes");
+}
+
+void case_open_status_names_why() {
+    auto                        t   = table_of({ 10 });
+    tenant_claim_scope::state * out = reinterpret_cast<tenant_claim_scope::state *>(0x1);
+    CHECK(tenant_claim_scope::open(nullptr, out) == tenant_claim_scope::open_status::NO_TABLE && out == nullptr,
+          "no table: NO_TABLE, and `out` is cleared");
+    CHECK(tenant_claim_scope::open(t, out) == tenant_claim_scope::open_status::OPENED && out != nullptr, "OPENED");
+    tenant_claim_scope::state * scope = out;
+    tenant_claim_scope::state * again = reinterpret_cast<tenant_claim_scope::state *>(0x1);
+    CHECK(tenant_claim_scope::open(t, again) == tenant_claim_scope::open_status::NESTED && again == nullptr,
+          "a second open on the thread: NESTED, and `out` is cleared");
+    CHECK(tenant_claim_scope::open(nullptr, again) == tenant_claim_scope::open_status::NESTED,
+          "NESTED wins over a missing table: a caller inside a scope always learns it");
+    CHECK(tenant_claim_scope::active() && tenant_claim_scope::close(scope), "the refusals left the first scope intact");
+}
+
+void case_claims_made_is_validated() {
+    auto   t = table_of({ 10 });
+    auto * s = open_scope(t);
+    size_t n = 99;
+    CHECK(tenant_claim_scope::claims_made(s, n) && n == 0, "this thread's open scope is read");
+    bool   other_ok = true;
+    size_t other_n  = 99;
+    std::thread([&] { other_ok = tenant_claim_scope::claims_made(s, other_n); }).join();
+    CHECK(!other_ok && other_n == 0, "another thread's scope is not read");
+    CHECK(tenant_claim_scope::close(s), "close");
+    CHECK(!tenant_claim_scope::claims_made(s, n) && n == 0, "a closed scope is not read");
+}
+
+void case_a_scope_left_open_is_counted() {
+    const size_t before = tenant_claim_scope::leaked_scopes();
+    std::thread([&] {
+        auto * s = open_scope(table_of({ 4 }));
+        CHECK(s != nullptr, "the thread's scope opens");
+        // never closed: the thread exits with it open
+    }).join();
+    CHECK(tenant_claim_scope::leaked_scopes() == before + 1, "a scope open at thread exit is counted as a leak");
+    std::thread([&] {
+        auto * s = open_scope(table_of({ 4 }));
+        CHECK(s != nullptr && tenant_claim_scope::close(s), "a closed scope opens and closes");
+    }).join();
+    CHECK(tenant_claim_scope::leaked_scopes() == before + 1, "a closed scope is not a leak");
+}
+
+void case_a_dropped_record_releases_its_slot() {
+    auto   t = table_of({ 10, 10 });
+    auto * s = open_scope(t);
+    {
+        tenant_claim a;
+        CHECK(tenant_claim_scope::claim(HOST, 5, a).status == tenant_claim_status::OK && t->claimed(HOST, 0), "claim");
+    }
+    CHECK(!t->claimed(HOST, 0), "a record dropped while live gives its slot back");
+
+    // a moved record is the one live record: the moved-from does not release, the destination does
+    tenant_claim a;
+    CHECK(tenant_claim_scope::claim(HOST, 5, a).status == tenant_claim_status::OK, "claim again");
+    {
+        tenant_claim moved = std::move(a);
+        CHECK(!a.live() && moved.live(), "a move transfers the claim");
+        CHECK(t->claimed(HOST, 0), "and the slot is still held");
+    }
+    CHECK(!t->claimed(HOST, 0), "the destination's drop released it");
+    CHECK(!tenant_claim_scope::release(a), "the moved-from record releases nothing");
+
+    // an assignment over a live record releases what that record held
+    tenant_claim x, y;
+    CHECK(tenant_claim_scope::claim(HOST, 5, x).status == tenant_claim_status::OK && x.index == 0, "x holds slot 0");
+    CHECK(tenant_claim_scope::claim(HOST, 5, y).status == tenant_claim_status::OK && y.index == 1, "y holds slot 1");
+    x = std::move(y);
+    CHECK(!t->claimed(HOST, 0) && t->claimed(HOST, 1),
+          "the assignment released the record it replaced, not the new one");
+
+    // an explicit release is not repeated by the destructor
+    CHECK(tenant_claim_scope::release(x, 4) && !t->claimed(HOST, 1), "explicit release");
+    tenant_claim z;
+    CHECK(tenant_claim_scope::claim(HOST, 5, z).status == tenant_claim_status::OK && z.wait_event == 0 && z.index == 0,
+          "claim slot 0 again");
+    tenant_claim w;
+    CHECK(tenant_claim_scope::claim(HOST, 5, w).status == tenant_claim_status::OK && w.index == 1 && w.wait_event == 4,
+          "slot 1 carries the explicit release's event: the destructor did not overwrite it with 0");
+    CHECK(tenant_claim_scope::close(s), "close");
+}
+
+void case_out_of_order_is_served_not_reported() {
+    // The design reports 0,2 / 1,0 as plan bugs; this table serves them at the lowest free slot (see the header).
+    auto         t = table_of({ 10, 10, 10 });
+    auto *       s = open_scope(t);
+    tenant_claim a, b, c;
+    CHECK(tenant_claim_scope::claim(HOST, 1, a).index == 0 && tenant_claim_scope::claim(HOST, 1, b).index == 1 &&
+              tenant_claim_scope::claim(HOST, 1, c).index == 2,
+          "in order");
+    CHECK(tenant_claim_scope::release(a) && tenant_claim_scope::release(c), "free 0 then 2: out of order");
+    tenant_claim d, e, f;
+    auto         od = tenant_claim_scope::claim(HOST, 1, d);
+    auto         oe = tenant_claim_scope::claim(HOST, 1, e);
+    auto         of = tenant_claim_scope::claim(HOST, 1, f);
+    CHECK(od.status == tenant_claim_status::OK && od.index == 0 && oe.status == tenant_claim_status::OK &&
+              oe.index == 2 && of.status == tenant_claim_status::NO_SLOT,
+          "the free slots are served lowest first and nothing is reported as a plan violation");
+    CHECK(tenant_claim_scope::close(s), "close");
+}
+
+void case_a_sparse_slot_set_is_fully_reachable() {
+    // llama makes no element for a zero cap, so a cohort can hold indices {0, 2}: both slots are claimable.
+    auto t = std::make_shared<kv_tenant_slots>();
+    (void) t->add(HOST, 0, plain_handle(), 10);
+    (void) t->add(HOST, 2, plain_handle(), 30);
+    (void) t->add("context-compute", 1, plain_handle(), 99);  // another cohort's slot is never this cohort's
+    auto *       s = open_scope(t);
+    tenant_claim a, b, c;
+    auto         oa = tenant_claim_scope::claim(HOST, 10, a);
+    auto         ob = tenant_claim_scope::claim(HOST, 30, b);
+    CHECK(
+        oa.status == tenant_claim_status::OK && oa.index == 0 && ob.status == tenant_claim_status::OK && ob.index == 2,
+        "the second slot of {0, 2} is reached, at index 2");
+    CHECK(tenant_claim_scope::claim(HOST, 1, c).status == tenant_claim_status::NO_SLOT && !c.live(),
+          "with both claimed there is no slot, and the gap at 1 is not one");
+    CHECK(tenant_claim_scope::release(a) && tenant_claim_scope::release(b), "release");
+    tenant_claim d;
+    auto         od = tenant_claim_scope::claim(HOST, 31, d);
+    CHECK(od.status == tenant_claim_status::OVER_PLAN && od.index == 0 && od.cap == 10,
+          "the lowest free slot is checked, as before");
+    CHECK(tenant_claim_scope::close(s), "close");
 }
 
 void case_claim_takes_the_lowest_free_slot() {
     auto   t = table_of({ 100, 200, 300 });
-    auto * s = tenant_claim_scope::open(t);
+    auto * s = open_scope(t);
     CHECK(s != nullptr, "scope opens");
     tenant_claim a, b, c, d;
     auto         oa = tenant_claim_scope::claim(HOST, 50, a);
@@ -127,7 +276,7 @@ void case_claim_takes_the_lowest_free_slot() {
     CHECK(ob.status == tenant_claim_status::OK && ob.index == 1 && b.index == 1, "second claim takes index 1");
     CHECK(a.generation != b.generation, "each claim has its own generation");
     CHECK(t->claimed(HOST, 0) && t->claimed(HOST, 1) && !t->claimed(HOST, 2), "slots 0 and 1 are marked, 2 is not");
-    CHECK(tenant_claim_scope::claims_made(s) == 2, "the scope counts its two claims");
+    CHECK(claims_of(s) == 2, "the scope counts its two claims");
 
     // free out of order: index 0 goes, index 1 stays; the next claim takes index 0 again, not 2
     CHECK(tenant_claim_scope::release(a, 11) && !a.live() && a.slots == nullptr, "release empties the record");
@@ -141,7 +290,7 @@ void case_claim_takes_the_lowest_free_slot() {
     tenant_claim e;
     auto         oe = tenant_claim_scope::claim(HOST, 1, e);
     CHECK(oe.status == tenant_claim_status::NO_SLOT && !e.live(), "every slot claimed: NO_SLOT, nothing taken");
-    CHECK(tenant_claim_scope::claims_made(s) == 4, "a refused claim is not counted");
+    CHECK(claims_of(s) == 4, "a refused claim is not counted");
     CHECK(tenant_claim_scope::release(b) && tenant_claim_scope::release(c) && tenant_claim_scope::release(d),
           "releases");
     CHECK(!t->any_claimed(), "nothing is claimed after every release");
@@ -150,7 +299,7 @@ void case_claim_takes_the_lowest_free_slot() {
 
 void case_claim_refusals() {
     auto         t = table_of({ 100, 40 });
-    auto *       s = tenant_claim_scope::open(t);
+    auto *       s = open_scope(t);
     tenant_claim a, b, miss;
     CHECK(tenant_claim_scope::claim(HOST, 101, a).status == tenant_claim_status::OVER_PLAN,
           "a request over the cap is OVER_PLAN");
@@ -172,7 +321,7 @@ void case_claim_refusals() {
 
     // a claim that is refused leaves a previous record untouched
     auto         t2 = table_of({ 10 });
-    auto *       s2 = tenant_claim_scope::open(t2);
+    auto *       s2 = open_scope(t2);
     tenant_claim keep;
     CHECK(tenant_claim_scope::claim(HOST, 5, keep).status == tenant_claim_status::OK, "claim");
     const uint64_t gen = keep.generation;
@@ -184,10 +333,10 @@ void case_claim_refusals() {
 
 void case_release_is_exact() {
     auto         t = table_of({ 10 });
-    auto *       s = tenant_claim_scope::open(t);
+    auto *       s = open_scope(t);
     tenant_claim a;
     CHECK(tenant_claim_scope::claim(HOST, 5, a).status == tenant_claim_status::OK, "claim");
-    tenant_claim stale = a;  // a second record of the same claim
+    tenant_claim stale = copy_of(a);  // a second record of the same claim
     CHECK(tenant_claim_scope::release(a, 3), "release");
     CHECK(!tenant_claim_scope::release(a), "a released record releases nothing");
     CHECK(!tenant_claim_scope::release(stale), "a stale copy of the claim releases nothing");
@@ -213,7 +362,7 @@ void case_claim_keeps_the_memory() {
     bool dropped = false, under = true;
     auto t = std::make_shared<kv_tenant_slots>();
     (void) t->add(HOST, 0, std::make_shared<watched>(&dropped, &under), 64);
-    auto *       s = tenant_claim_scope::open(t);
+    auto *       s = open_scope(t);
     tenant_claim a;
     CHECK(tenant_claim_scope::claim(HOST, 8, a).status == tenant_claim_status::OK && a.owner != nullptr,
           "a claim carries the slot's handle");
@@ -308,6 +457,12 @@ void case_registry_drops_outside_the_lock() {
 
 int main() {
     case_scope_is_per_thread();
+    case_open_status_names_why();
+    case_claims_made_is_validated();
+    case_a_scope_left_open_is_counted();
+    case_a_dropped_record_releases_its_slot();
+    case_out_of_order_is_served_not_reported();
+    case_a_sparse_slot_set_is_fully_reachable();
     case_claim_takes_the_lowest_free_slot();
     case_claim_refusals();
     case_release_is_exact();

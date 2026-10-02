@@ -314,7 +314,7 @@
       "file": "ggml-sycl.cpp",
       "function": "ggml_backend_sycl_claim_scope_open",
       "count": 1,
-      "reason": "ggml_backend_sycl_claim_scope_open is a C-ABI constructor for the claim scope: its try body reads the context's slot table from the registry and stores it in a thread_local, with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and reports failure as the null return that means no scope is in force. Permanent; llama.cpp-moua L4 step 3c."
+      "reason": "ggml_backend_sycl_claim_scope_open is a C-ABI constructor for the claim scope: its try body reads the context's slot table from the registry and stores it in a thread_local, with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and reports failure as the FAILED status, which is distinct from the NO_RESERVATION answer a caller may read as allocate-as-before. Permanent; llama.cpp-moua L4 step 3c."
     }
   ]
 }

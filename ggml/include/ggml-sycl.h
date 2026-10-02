@@ -1816,13 +1816,34 @@ GGML_BACKEND_API void   ggml_backend_sycl_replan_scope_close(void * scope);
 // allocates as before, which is what an output buffer, a control vector and a host-resident LoRA base
 // take, so a caller keeps those out of every scope.
 //
-// open returns NULL, and no scope is in force, for a null or foreign backend, a context not bound to an
-// execution context, a context that holds no host reservation (its descriptor carried no host slot, or
-// it has not published one), and a thread that already holds a scope (nested opens are refused, and
-// logged).  A caller treats NULL as "allocate as before", never as an error.  close must run on the
-// thread that opened; NULL is a no-op.  claims returns how many claims succeeded through the scope.
+// open answers a status, and writes the scope to `*scope` (NULL unless OPENED), so the situations a
+// bare NULL would have conflated stay apart:
+//   OPENED          a scope is in force; `*scope` is it, and close must run;
+//   NO_RESERVATION  the context holds no host reservation (its descriptor carried no host slot, it has
+//                   not published one, or it is not bound to an execution context): no scope is in
+//                   force and the buffer type allocates as before -- the one answer a caller may treat
+//                   as "allocate as before";
+//   NESTED          this thread already holds a scope: refused and logged, nothing changed.  The scope
+//                   in force is the OUTER one, so a SYCL_Host allocation made now would claim from
+//                   ANOTHER context's slots -- the caller must not allocate on this answer;
+//   INVALID_BACKEND a null or foreign backend, or a device out of range;
+//   FAILED          nothing opened and nothing is known: a closed module, a null `scope`, or a
+//                   caught exception.  FAILED is 0, so an unwritten answer reads as a failure.
+// close must run on the thread that opened; NULL is a no-op, and anything but the thread's open scope is
+// refused and logged.  A scope still open when its thread exits is a leak, reported on stderr.  claims
+// returns how many claims succeeded through the scope, 0 for NULL and, logged, for anything that is not
+// this thread's open scope.
+enum ggml_sycl_claim_scope_status {
+    GGML_SYCL_CLAIM_SCOPE_FAILED          = 0,
+    GGML_SYCL_CLAIM_SCOPE_OPENED          = 1,
+    GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION  = 2,
+    GGML_SYCL_CLAIM_SCOPE_NESTED          = 3,
+    GGML_SYCL_CLAIM_SCOPE_INVALID_BACKEND = 4,
+};
+
 // Proc name: "ggml_backend_sycl_claim_scope_open".
-GGML_BACKEND_API void * ggml_backend_sycl_claim_scope_open(ggml_backend_t backend);
+GGML_BACKEND_API enum ggml_sycl_claim_scope_status ggml_backend_sycl_claim_scope_open(ggml_backend_t backend,
+                                                                                      void **        scope);
 // Proc name: "ggml_backend_sycl_claim_scope_close".
 GGML_BACKEND_API void   ggml_backend_sycl_claim_scope_close(void * scope);
 // Proc name: "ggml_backend_sycl_claim_scope_claims".
