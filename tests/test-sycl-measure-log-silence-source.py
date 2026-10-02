@@ -23,6 +23,12 @@ in the constructor body sits in a guarded block; the destructor's buffer-size
 comparison and SYCL drain block carry `!measure_only` in their own `if`; the one
 caller of `llama_graph_n_input_tensors` passes `!measure_only`.
 
+The same rule holds for the memory modules a measure-only context builds. Their constructors
+(llama_kv_cache, llama_kv_cache_iswa, llama_memory_recurrent) print, at INFO, the buffer sizes and the
+cache sizes of every cache; a measure-only context builds the same caches on size-0 dummies and must not
+repeat those lines. Every non-ERROR log statement in a constructor of those three files sits in a block
+whose `if` tests `!no_alloc` (the flag the measure sets, and the model's own no_alloc too).
+
 The walk is textual, so a call reached through a function pointer is seen only as a
 reference to the name, and a log that a callee prints on behalf of a guarded call site
 is checked at the callee. Every clause has a mutant of the real source that must fail
@@ -64,7 +70,12 @@ def mask(src: str) -> str:
 
 
 # the log sinks of llama-context.cpp: the macros, and the raw writers that bypass them
-_LOG_RE = re.compile(r"\b(?:LLAMA_LOG(?:_[A-Z]+)?|fprintf|printf|puts|llama_log_internal)\s*\(")
+# (a sink is matched wherever it appears, `std::` or `::` qualified included: \b sees through the scope operator)
+_LOG_RE = re.compile(
+    r"\b(?:(?:LLAMA|GGML)_LOG(?:_[A-Z]+)?|fprintf|fputs|fputc|fwrite|printf|puts|putchar|perror|"
+    r"llama_log_internal|ggml_log_internal)\s*\("
+    r"|\bstd::(?:cerr|cout|clog)\b"
+)
 
 # a function whose body is a pure struct or enum is not a function
 _NOT_FUNCTION = re.compile(r"^\s*(?:typedef|using|struct|class|enum|union|namespace|extern)\b|\btemplate\b")
@@ -360,6 +371,81 @@ def structural(raw: str):
     return bad
 
 
+# --- the memory modules' constructors -------------------------------------------------------
+
+MEMORY_FILES = ("llama-kv-cache.cpp", "llama-kv-cache-iswa.cpp", "llama-memory-recurrent.cpp")
+
+
+def memory_findings(raw: str, label: str):
+    """Every non-ERROR log in a constructor body is inside an `if (!no_alloc ...)` block."""
+    m = mask(raw)
+    out = []
+    n_logs = 0
+    for f in parse_functions(m):
+        parts = f.name.split("::")
+        if len(parts) < 2 or parts[-1] != parts[-2]:
+            continue
+        parse_blocks(m, f)
+        ranges = []
+        for o, c, hdr in f.blocks:
+            h = _IF_RE.match(hdr)
+            if h and not h.group("else"):
+                cond = " ".join(h.group("cond").split())
+                if "||" not in cond and "!no_alloc" in [t.strip() for t in cond.split("&&")]:
+                    ranges.append((o, c))
+        body = m[f.body_start:f.end + 1]
+        for mt in _LOG_RE.finditer(body):
+            pos = f.body_start + mt.start()
+            stmt = " ".join(raw[pos:raw.index(";", pos)].split())
+            n_logs += 1
+            if "_LOG_ERROR" in stmt[:24]:
+                continue
+            if not in_any(ranges, pos):
+                out.append("%s %s: a log a measure-only context repeats: %s" % (label, f.name, stmt[:90]))
+    return out, n_logs
+
+
+def _memory_sources():
+    return {f: (ROOT / "src" / f).read_text() for f in MEMORY_FILES}
+
+
+def test_memory_constructors_are_silent_under_no_alloc():
+    total = 0
+    findings = []
+    for f, raw in _memory_sources().items():
+        got, n = memory_findings(raw, f)
+        findings += got
+        total += n
+    assert total >= 20, "the census of memory-constructor logs is implausibly small: %d" % total
+    assert not findings, "\n".join(findings)
+
+
+def test_memory_gate_mutants():
+    srcs = _memory_sources()
+    kv = srcs["llama-kv-cache.cpp"]
+    anchor = "    const bool is_mla = hparams.is_mla();\n"
+    assert kv.count(anchor) == 1, "mutant anchor not found"
+    muts = {
+        "an unguarded INFO added to the kv constructor": 'LLAMA_LOG_INFO("x\\n");\n',
+        "an unguarded WARN added to the kv constructor": 'LLAMA_LOG_WARN("x\\n");\n',
+        "a std::cerr write": 'std::cerr << "x";\n',
+        "an fputs write": 'fputs("x", stderr);\n',
+        "a GGML_LOG_INFO write": 'GGML_LOG_INFO("x\\n");\n',
+    }
+    for name, line in muts.items():
+        got, _ = memory_findings(kv.replace(anchor, "    " + line + anchor, 1), "mutant")
+        assert got, "mutant %r slipped through" % name
+    # an ERROR-level line is exempt by rule: it accompanies a failure, not a successful build
+    got, _ = memory_findings(kv.replace(anchor, '    LLAMA_LOG_ERROR("x\\n");\n' + anchor, 1), "mutant")
+    assert not got
+    # a guard on the wrong flag does not count
+    guarded = 'if (!no_alloc) {\n        LLAMA_LOG_INFO("x\\n");\n    }\n'
+    got, _ = memory_findings(kv.replace(anchor, "    " + guarded.replace("!no_alloc", "no_alloc") + anchor, 1), "mutant")
+    assert got
+    got, _ = memory_findings(kv.replace(anchor, "    " + guarded + anchor, 1), "mutant")
+    assert not got
+
+
 # --- the tree as it is --------------------------------------------------------------------
 
 
@@ -451,6 +537,17 @@ def test_mutants_each_clause_fails():
         "a backend sampler is set in a measure-only context": _mut(
             "if (!measure_only && params.samplers != nullptr && params.n_samplers > 0) {",
             "if (params.samplers != nullptr && params.n_samplers > 0) {"),
+        "a GGML_LOG_ERROR write in the measure-only path": _mut(
+            "    measure_only = measure != nullptr;\n",
+            '    measure_only = measure != nullptr;\n    GGML_LOG_ERROR("%s: hello\\n", __func__);\n'),
+        "an fputs to stderr in the measure-only path": _mut(
+            "    measure_only = measure != nullptr;\n",
+            '    measure_only = measure != nullptr;\n    fputs("hello\\n", stderr);\n'),
+        "a std::cerr write in the measure-only path": _mut(
+            "    measure_only = measure != nullptr;\n",
+            '    measure_only = measure != nullptr;\n    std::cerr << "hello";\n'),
+        "a perror in the measure-only path": _mut(
+            "    measure_only = measure != nullptr;\n", '    measure_only = measure != nullptr;\n    perror("hello");\n'),
         "the constructor acquires a chunk-cap copy": _mut(
             "    measure_only = measure != nullptr;\n",
             "    measure_only = measure != nullptr;\n    plan_caps.reset();\n"),
