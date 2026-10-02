@@ -1041,6 +1041,16 @@ int main() {
                                                           crossed.activations_bytes, 50 * mib, 5 * mib, &cw, &ca);
             CHECK(cw == 100 * mib && ca == 10 * mib,
                   "the kept plan's first reservation is its planned pair, which a bound equal to the bare plan holds");
+            // An op of the OTHER plan, whose pair the kept one is not: the halves it needs are not the kept pair's,
+            // so the kept pair is replaced by the request as asked. That is a regrow, but only for an op the kept plan
+            // never provisioned; the superseded reservation is freed before the new one is allocated, and the request
+            // fits the bound alone, which is what acquire admitted it against.
+            size_t xw = 0, xa = 0;
+            ggml_sycl::zone_onednn_scratch_reserve_target(true, crossed.bare_bytes, cw, ca, crossed.weights_bytes,
+                                                          crossed.activations_bytes, 10 * mib, 100 * mib, &xw, &xa);
+            CHECK(xw == 10 * mib && xa == 100 * mib,
+                  "a crossed request the kept pair does not hold is used as asked, not merged above the bound");
+            CHECK(xw + xa <= crossed.bare_bytes, "the crossed request stays within the bound");
 
             zone_onednn_plan big_plan;
             big_plan.bare_bytes        = 200 * mib;

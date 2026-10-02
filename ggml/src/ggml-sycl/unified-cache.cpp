@@ -738,7 +738,7 @@ static zone_onednn_plan onednn_zone_plan_load(int device_id) {
     return g_onednn_zone_plan[device_id];
 }
 
-// Raise the stored figures to the component-wise maximum with `plan`, in ONE critical section. A load, a keep and a
+// Keep the larger plan (zone_onednn_plan_keep) as the stored snapshot, in ONE critical section. A load, a keep and a
 // store taken separately would let two contexts planning on one device each read the same snapshot and the later store
 // drop the other's larger figure. Takes the mutex itself, so it must not call the accessors above.
 static void onednn_zone_plan_keep_and_store(int device_id, const zone_onednn_plan & plan) {
@@ -5367,8 +5367,9 @@ bool unified_cache::ensure_planned_arena_zones() {
             // which guards every read.
             onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
 #endif
-            // The zone is kept as it was built, so it stays described by the larger of the figures it was built from
-            // and this plan's: a later, smaller plan (a draft model beside the target) must not shrink them.
+            // The zone is kept as it was built, so it stays described by the larger plan it was built from (its whole
+            // pair, with the Graph floor's own maximum): a later, smaller plan (a draft model beside the target) must
+            // not shrink it.
             onednn_zone_plan_keep_and_store(dev_id, live_plan);
             return true;
         }

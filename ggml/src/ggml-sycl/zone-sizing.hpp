@@ -313,8 +313,13 @@ bool zone_onednn_pp_scratch_planned(bool   arena_active,
 // request, so the request is used as asked.
 //
 // The zone's PLANNED pair is a floor (llama.cpp-8ony): the first reservation is sized to max(held, requested, planned)
-// per component, so the pair the plan provisioned is reserved once and never regrows (a regrow needs the superseded
-// reservation and the new one in the zone at once, which a zone sized for one pair plus the Graph floor cannot hold).
+// per component, so the pair the plan provisioned is reserved once and does not regrow for the ops that plan sized
+// (a regrow needs the superseded reservation and the new one in the zone at once, which a zone sized for one pair plus
+// the Graph floor cannot hold). That holds only for the ops of the plan whose pair is kept: an op that needs the other
+// plan's halves (kept (100, 10) at a bound of 110, request (10, 100)) fits neither the planned pair nor the merge, so
+// the target is the request as asked and the held pair is replaced. The superseded block is freed before the new one
+// is allocated, so the two are never in the zone together, and the request fits the bound alone, which acquire has
+// already admitted it against.
 // Used only with an arena, where the planned pair exists; without one the planned halves are ignored. When that pair
 // does not fit `pair_bound_bytes` (a zone clamped below its plan) the target is the held-and-requested merge. Pass 0, 0
 // for no planned pair. Pure; a null out is ignored.
@@ -358,8 +363,10 @@ struct zone_onednn_plan {
 // stays the size an earlier plan built it to, so it must still be described by the larger plan, never by a later,
 // smaller one's. The pair is kept whole (its halves sum into its bare plan): the pair of whichever plan has the larger
 // bare plan, the held one on a tie. Maxing each half on its own would build a pair no plan had, above what the zone
-// holds. The Graph floor is a separate requirement on the same zone and keeps its own maximum. A rebuilt zone is
-// described by the live plan outright (the caller stores it directly). Pure.
+// holds. Keeping one pair means an op sized by the other plan's halves is reserved as asked (see
+// zone_onednn_scratch_reserve_target), not from the kept pair. The Graph floor is a separate requirement on the same
+// zone and keeps its own maximum. A rebuilt zone is described by the live plan outright (the caller stores it
+// directly). Pure.
 zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone_onednn_plan & live);
 
 // Whether the oneDNN PP scratch is allowed to supply a dense op's f16 copies at all, as a function of the

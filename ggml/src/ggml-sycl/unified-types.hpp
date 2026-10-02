@@ -10,7 +10,7 @@
 
 namespace ggml_sycl {
 
-// Unified kernel supports quantized integer types. FP16/BF16 use oneDNN.
+// Unified kernel supports the block-quantized types Q4_0 and MXFP4. FP16/BF16 use oneDNN.
 inline bool unified_kernel_serves_type(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
