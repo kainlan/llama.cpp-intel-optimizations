@@ -2460,7 +2460,8 @@ if (NOT WIN32)
         COMMAND ${LLAMA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-public-wrappers.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     set_tests_properties(test-sycl-lifecycle-public-wrappers PROPERTIES
-        LABELS "sycl;python;source-assert;host" TIMEOUT 120)
+        LABELS "sycl;python;source-assert;host" TIMEOUT 120
+        SKIP_RETURN_CODE 77)
 
     # DECLINED, with reasons (llama.cpp-0igs).  Sibling .py gates in this
     # directory that are deliberately left unregistered.  Registering them would
