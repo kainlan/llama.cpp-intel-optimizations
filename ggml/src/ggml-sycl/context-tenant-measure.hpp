@@ -2,9 +2,9 @@
 
 // The measured-tenant section of a context's published plan: the cohort table
 // and the visitor contract that fill the section while the measure pass walks a
-// graph. The element and the cohort ids are in context-tenant-desc.h, a header
-// C can include, so the extern "C" backend header can name the element without
-// a second definition.
+// graph. The element is defined once in the public backend header (ggml-sycl.h)
+// and the cohort ids in ggml-sycl-cohort.h; context-tenant-desc.hpp gathers both
+// for the backend's own sources.
 //
 // The tier, scope and lifetime of a cohort come from the table below; the zone
 // is added with the allocator's zone vocabulary, not here.
@@ -14,7 +14,7 @@
 // surface; libggml-sycl exports them only because nothing hides symbols, and a
 // caller across the dlopen boundary needs a proc-address export first.
 
-#include "context-tenant-desc.h"
+#include "context-tenant-desc.hpp"
 #include "ggml-backend.h"
 #include "ggml.h"
 
