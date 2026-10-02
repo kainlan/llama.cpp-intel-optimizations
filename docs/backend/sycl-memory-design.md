@@ -2580,6 +2580,19 @@ mark do not decide the next rung. The persisted auto-ubatch cache is not a hole 
 by the same per-candidate trial on every start (`try_candidate`), and one that now fails is reported as
 "cached N refused" and the ladder runs from the bottom; only the rungs ABOVE a non-terminal cached value are
 re-attempted ("resuming"), never trusted.
+*An auto `-ub` does not turn a loadable model into an init failure (`llama.cpp-kpjw`).* The ladder only ascends from the
+default, so a default that itself lost left nothing to settle on but the default, and the settle's transaction then
+refused it (B50, Qwen3.6-27B, `-c 512`, auto: 512 spills a 495 MB compute buffer outside the arena, leaves 107.7 MB
+against the 256 MB headroom, and the context died with `result=19` and no guidance). A smaller `-ub` is not a smaller
+context: `n_ctx` and the KV placement are unchanged. When nothing at or above the default won (the default was itself a
+rung the ladder asked about, and the stop was not a race), the trial continues DOWNWARD (`llama_auto_ubatch_descend`,
+`src/llama-auto-ubatch.h`: halve to a multiple of 32, skip rungs above the cap, floor 64), settles on the first rung that
+fits and says so (`auto n_ubatch lowered from %u to %u`). A lowered result is not written to the tuning cache: the
+lookup refuses any value under the ladder's first rung, so it could only be a miss. A pinned `-ub` never reaches the
+trial and still refuses by name. When no rung down to the floor fits, the settle's own refusal is rethrown as a named
+error (`no -ub from %u down to %u fits this context`) carrying the `largest -ub that fits is about N` the last spill
+refusal computed (or saying none is known), not a bare result code.
+
 Two defects found on the way are tickets, not part of this change: the process hang after a graph fails with
 "CPU fallback also failed" (`llama.cpp-8dd9`, inside the cleanup block of the `ggml_sycl_fallback_error` handler in
 `ggml_backend_sycl_graph_compute`), and the f16 buffers never being planned for non-Q8_0 dense weights below the f16

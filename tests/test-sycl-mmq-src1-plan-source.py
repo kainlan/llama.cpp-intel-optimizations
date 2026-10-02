@@ -974,6 +974,7 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
     results["the pure downward walk exists: halves to a multiple of 32, floor 64, rungs above the cap skipped"] = \
         re.search(r"llama_auto_ubatch_descent_floor\s*=\s*64\s*;", auto_header) is not None and \
         re.search(r"uint32_t\s+llama_auto_ubatch_next_lower\(\s*uint32_t\s+from\s*\)", auto_header) is not None and \
+        re.search(r"const uint32_t\s+half\s*=\s*from\s*/\s*2\s*;\s*return\s+half\s*>=\s*llama_auto_ubatch_descent_floor\s*\?\s*half\s*-\s*half\s*%\s*32\s*:\s*0\s*;", auto_header) is not None and \
         re.search(r"uint32_t\s+llama_auto_ubatch_descend\(\s*uint32_t\s+fallback\s*,\s*uint32_t\s+cap\s*,\s*F\s+try_rung\s*\)", auto_header) is not None and \
         re.search(r"if\s*\(\s*c\s*>\s*cap\s*\)\s*\{\s*continue\s*;", auto_header) is not None and \
         re.search(r"if\s*\(\s*try_rung\(\s*c\s*\)\s*\)\s*\{\s*return c\s*;", auto_header) is not None
@@ -1728,6 +1729,45 @@ if args.self_test:
         ("active graph result pointer kept (R8)", "the release drops every cached graph result and the active pointer, not only the sched",
          (mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{",
                             r"gf_res_prev_active\s*=\s*nullptr\s*;", "(void) 0;"), header_src)),
+    ]
+    # kpjw item 0: the downward continuation. Each mutant removes one property of it and must be caught.
+    def ctx_mut(label, expect, new_ctx=None, new_auto=None):
+        return (label, expect, (new_ctx if new_ctx is not None else context_src, header_src, ctx_header_src,
+                                new_auto if new_auto is not None else auto_header_src))
+
+    descent_cond = r"if\s*\(\s*last_good\s*==\s*0\s*&&\s*ladder_needed\s*&&\s*fallback_tried\s*&&\s*!stop_is_pure_race\s*\)"
+    ctx_mutants += [
+        ctx_mut("descent floor lowered below 64", "the pure downward walk exists: halves to a multiple of 32, floor 64, rungs above the cap skipped", new_auto=re.sub(r"descent_floor\s*=\s*64", "descent_floor = 16", auto_header_src, count=1)),
+        ctx_mut("descent rungs not snapped to 32", "the pure downward walk exists: halves to a multiple of 32, floor 64, rungs above the cap skipped", new_auto=re.sub(r"half\s*-\s*half\s*%\s*32", "half", auto_header_src, count=1)),
+        ctx_mut("descent ignores the cap", "the pure downward walk exists: halves to a multiple of 32, floor 64, rungs above the cap skipped", new_auto=re.sub(r"if\s*\(\s*c\s*>\s*cap\s*\)\s*\{\s*continue\s*;\s*\}", "", auto_header_src, count=1)),
+        ctx_mut("descent accepts a refused rung", "the pure downward walk exists: halves to a multiple of 32, floor 64, rungs above the cap skipped", new_auto=re.sub(r"if\s*\(\s*try_rung\(\s*c\s*\)\s*\)", "if (!try_rung(c))", auto_header_src, count=1)),
+        ctx_mut("descent never runs", "the trial continues downward when the default rung and everything above it lost, and not for a race", new_ctx=re.sub(descent_cond, "if (false)", context_src, count=1)),
+        ctx_mut("descent runs after a pure race", "the trial continues downward when the default rung and everything above it lost, and not for a race",
+                new_ctx=re.sub(descent_cond, "if (last_good == 0 && ladder_needed && fallback_tried)", context_src, count=1)),
+        ctx_mut("descent runs without a ladder", "the trial continues downward when the default rung and everything above it lost, and not for a race",
+                new_ctx=re.sub(descent_cond, "if (last_good == 0 && fallback_tried && !stop_is_pure_race)", context_src, count=1)),
+        ctx_mut("descent ignores whether the default was tried", "a rung that lost is only lowered from when the default itself was tried (a non-rung default is not skipped)",
+                new_ctx=re.sub(r"fallback_tried\s*&&\s*!stop_is_pure_race", "!stop_is_pure_race", context_src, count=1)),
+        ctx_mut("fallback_tried never set", "a rung that lost is only lowered from when the default itself was tried (a non-rung default is not skipped)",
+                new_ctx=re.sub(r"fallback_tried\s*=\s*true\s*;", "(void) 0;", context_src, count=1)),
+        ctx_mut("descent starts from the wrong rung", "the trial continues downward when the default rung and everything above it lost, and not for a race",
+                new_ctx=re.sub(r"llama_auto_ubatch_descend\(\s*fallback_ubatch\s*,", "llama_auto_ubatch_descend(cparams.n_ubatch,", context_src, count=1)),
+        ctx_mut("descent winner not adopted", "the trial continues downward when the default rung and everything above it lost, and not for a race",
+                new_ctx=re.sub(r"last_good\s*=\s*won\s*;", "(void) won;", context_src, count=1)),
+        ctx_mut("descent loser counted as a winner", "the trial continues downward when the default rung and everything above it lost, and not for a race",
+                new_ctx=re.sub(r"return try_candidate\(c\)\s*==\s*nullptr\s*;", "return try_candidate(c) != nullptr;", context_src, count=1)),
+        ctx_mut("lowered result stored in the tuning cache", "a lowered result is announced and is not persisted as a tuning-cache entry",
+                new_ctx=re.sub(r"lowered_from\s*==\s*0\s*&&\s*", "", context_src, count=1)),
+        ctx_mut("lowered result not announced", "a lowered result is announced and is not persisted as a tuning-cache entry",
+                new_ctx=context_src.replace("auto n_ubatch lowered from %u to %u", "auto n_ubatch XXXX", 1)),
+        ctx_mut("settle refusal swallowed when the descent did not run", "when no rung down to the floor fits the settle's refusal names the largest -ub that does, not a bare result code",
+                new_ctx=re.sub(r"if\s*\(\s*!descent_ran\s*\)\s*\{\s*throw\s*;\s*\}", "", context_src, count=1)),
+        ctx_mut("settle refusal unnamed", "when no rung down to the floor fits the settle's refusal names the largest -ub that does, not a bare result code",
+                new_ctx=context_src.replace("no -ub from %u down to %u fits this context", "XXXX", 1)),
+        ctx_mut("settle refusal names no -ub", "when no rung down to the floor fits the settle's refusal names the largest -ub that does, not a bare result code",
+                new_ctx=mutate_after(context_src, "no -ub from %u down to", "the largest -ub that fits is about", "XXXX")),
+        ctx_mut("refusal's -ub never recorded", "when no rung down to the floor fits the settle's refusal names the largest -ub that does, not a bare result code",
+                new_ctx=re.sub(r"refusal_largest_ub\s*=\s*rung_largest_ub\s*;", "(void) 0;", context_src, count=1)),
     ]
     for label, expect, sources in ctx_mutants:
         failed += run_context(label, sources, expect)

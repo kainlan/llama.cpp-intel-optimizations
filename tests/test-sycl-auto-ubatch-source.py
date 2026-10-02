@@ -830,8 +830,14 @@ def _settle_block(body_norm: str) -> str:
 
 
 def _settle_reserve_is_unguarded(body_norm: str) -> bool:
+    # llama.cpp-kpjw: the settle PUBLISH now carries a catch (see _settle_publish_catch_never_swallows), so the
+    # reserve is judged on what follows its own `sched_need_reserve = true;`, which must hold no try/catch at all.
     settle = _settle_block(body_norm)
-    return "sched_reserve();" in settle and "try" not in settle and "catch" not in settle
+    flag_at = settle.rfind("sched_need_reserve = true;")
+    if flag_at == -1:
+        return False
+    tail = settle[flag_at:]
+    return "sched_reserve();" in tail and "try" not in tail and "catch" not in tail
 
 
 def test_settle_reserve_is_not_wrapped_in_try_catch():
@@ -1349,20 +1355,74 @@ def test_candidate_publish_try_catch_has_a_mutation_witness(mutation):
     ), "mutation witness is broken: the mutant should make the wrapped-publish check fail"
 
 
-def test_settle_publish_is_not_wrapped_in_try_catch():
-    """Unlike the candidate publish inside try_candidate(), the SETTLE
-    publish must let a refusal propagate -- today's behaviour for a
-    context that does not fit at all (Task 2 final review addendum item 1:
-    only the candidate publish gets the try/catch)."""
-    body_norm = _normalize_ws(_trial_body())
-    settle_start = body_norm.find("if (!sched_matches_last_good")
-    assert settle_start != -1, "could not find the settle step's own gate"
-    settle_block = body_norm[settle_start:]
-    settle_publish_idx = settle_block.find("sycl_resync_runtime_context_flash_attn();")
-    assert settle_publish_idx != -1, "could not find the settle step's own publish call"
-    assert "try {" not in settle_block[:settle_publish_idx + 40], (
-        "the settle publish must NOT be wrapped in try/catch -- its refusal must propagate, matching today's "
-        "behaviour for a context that does not fit"
+def _balanced_braces(text: str, open_at: int) -> str:
+    """The `{ ... }` block whose opening brace is text[open_at]."""
+    assert text[open_at] == "{"
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_at : i + 1]
+    raise AssertionError("unbalanced braces")
+
+
+def _settle_publish_catch_never_swallows(body_norm: str) -> bool:
+    """The settle publish's refusal must still propagate (today's behaviour for a context that does not fit at all).
+    llama.cpp-kpjw lets exactly one catch exist around it, and only to NAME the refusal when the downward
+    continuation already ran and found nothing: the catch rethrows unchanged unless descent_ran, and otherwise
+    throws a runtime_error. It must hold no return and no other way to swallow the exception."""
+    settle_at = body_norm.find("if (!sched_matches_last_good")
+    if settle_at == -1:
+        return False
+    settle = body_norm[settle_at:]
+    publish_at = settle.find("sycl_resync_runtime_context_flash_attn();")
+    if publish_at == -1 or "try {" not in settle[:publish_at + 1]:
+        return False
+    catch_marker = "} catch (const std::exception & e) {"
+    catch_at = settle.find(catch_marker, publish_at)
+    if catch_at == -1 or settle.count("catch") != 1:
+        return False
+    catch_body = _balanced_braces(settle, catch_at + len("} catch (const std::exception & e) ") )
+    inner = catch_body[1:-1].strip()
+    return (
+        inner.startswith("if (!descent_ran) { throw; }")
+        and "throw std::runtime_error(" in inner
+        and inner.count("throw") == 2
+        and "return" not in inner
+    )
+
+
+def test_settle_publish_catch_never_swallows():
+    """The settle publish may carry one catch, and only to name the refusal (llama.cpp-kpjw); any swallow would turn
+    a context that does not fit into a silent success, so the catch must rethrow (unchanged unless the descent ran)
+    or throw, and hold no return."""
+    assert _settle_publish_catch_never_swallows(_normalize_ws(_trial_body())), (
+        "the settle publish's catch must rethrow unless descent_ran, otherwise throw a named runtime_error, "
+        "and hold no return -- its refusal must propagate"
+    )
+
+
+@pytest.mark.parametrize("mutation", ["swallow-when-no-descent", "swallow-always", "return-instead-of-throw"])
+def test_settle_publish_catch_has_a_mutation_witness(mutation):
+    """Mutation witness for the check above: a catch that stops rethrowing when the descent did not run, a catch that
+    swallows, or one that returns, must each make it fail."""
+    raw = LLAMA_CONTEXT_CPP
+    rethrow = "                if (!descent_ran) {\n                    throw;\n                }\n"
+    assert raw.count(rethrow) == 1, "mutation target not found -- update this witness to match the real source"
+    if mutation == "swallow-when-no-descent":
+        mutated_raw = raw.replace(rethrow, "", 1)
+    elif mutation == "swallow-always":
+        mutated_raw = raw.replace(rethrow, "                if (!descent_ran) {\n                    return;\n                }\n", 1)
+    else:
+        marker = "                throw std::runtime_error(format(\n                    \"auto n_ubatch: no -ub from"
+        assert raw.count(marker) == 1, "mutation target not found -- update this witness to match the real source"
+        mutated_raw = raw.replace(marker, marker.replace("throw std::runtime_error(format(", "return (void) (format("), 1)
+    assert mutated_raw != raw
+    assert not _settle_publish_catch_never_swallows(_body_of(mutated_raw, _TRIAL_START, _TRIAL_END)), (
+        "mutation witness is broken: the mutant should make the settle publish catch check fail"
     )
 
 
@@ -1478,20 +1538,17 @@ def test_settle_publish_gate_has_a_mutation_witness():
     below it -- a mutant the ordering assertion alone cannot see (ordering
     is satisfied textually either way)."""
     raw = LLAMA_CONTEXT_CPP
-    original_settle = (
-        "    if (!sched_matches_last_good || cparams.n_ubatch != last_good) {\n"
-        "        const bool need_publish =\n"
-        "            llama_auto_ubatch_settle_needs_publish(published_any, publish_dirty, cparams.n_ubatch, "
-        "fallback_ubatch);\n"
-        "        cparams.n_ubatch = last_good;\n"
-        "        if (need_publish) {\n"
-        "            sycl_resync_runtime_context_flash_attn();\n"
-        "        }\n"
-        "        sched_need_reserve = true;\n"
-        "        sched_reserve();\n"
-        "    }\n"
+    # The settle block as it stands (its publish carries the kpjw catch, which is the part of the text this witness
+    # does not care about), cut out of the source rather than copied so the witness follows the real shape.
+    settle_open = "    if (!sched_matches_last_good || cparams.n_ubatch != last_good) {\n"
+    settle_close = "        sched_need_reserve = true;\n        sched_reserve();\n    }\n"
+    trial_at = raw.find(_TRIAL_START)
+    open_at = raw.find(settle_open, trial_at)
+    close_at = raw.find(settle_close, open_at)
+    assert -1 not in (trial_at, open_at, close_at), (
+        "mutation target not found -- update this witness to match the real source"
     )
-    assert original_settle in raw, "mutation target not found -- update this witness to match the real source"
+    original_settle = raw[open_at : close_at + len(settle_close)]
     mutated_settle = (
         "    if (!sched_matches_last_good || cparams.n_ubatch != last_good) {\n"
         "        cparams.n_ubatch = last_good;\n"
@@ -1813,8 +1870,8 @@ def test_ubatch_cache_store_follows_the_ladder_has_a_mutation_witness():
     # resumed_outcome_unchanged declarations are not part of what this
     # witness is testing (this mutation is not meant to compile).
     store_block = (
-        "    if (ladder_needed && !stop_is_pure_race && !resumed_outcome_unchanged && have_cache_accessors &&\n"
-        "        cache_enabled_fn()) {\n"
+        "    if (ladder_needed && !stop_is_pure_race && lowered_from == 0 && !resumed_outcome_unchanged &&\n"
+        "        have_cache_accessors && cache_enabled_fn()) {\n"
         "        if (!cache_store_fn(&cache_key, last_good, stop)) {\n"
         '            LLAMA_LOG_WARN("[SYCL-PLAN] tuning cache store failed: %s\\n", cache_path_buf);\n'
         "        }\n"
@@ -1848,11 +1905,13 @@ def test_ubatch_cache_store_is_gated_on_ladder_needed():
     the pre-existing have_cache_accessors/cache_enabled_fn() gate."""
     body_norm = _normalize_ws(_trial_body())
     assert re.search(
-        r"if\s*\(\s*ladder_needed\s*&&\s*!stop_is_pure_race\s*&&\s*!resumed_outcome_unchanged\s*&&\s*"
+        r"if\s*\(\s*ladder_needed\s*&&\s*!stop_is_pure_race\s*&&\s*lowered_from\s*==\s*0\s*&&\s*"
+        r"!resumed_outcome_unchanged\s*&&\s*"
         r"have_cache_accessors\s*&&\s*cache_enabled_fn\s*\(\s*\)\s*\)\s*\{",
         body_norm,
     ), (
-        "the store must be gated on ladder_needed && !stop_is_pure_race && !resumed_outcome_unchanged && "
+        "the store must be gated on ladder_needed && !stop_is_pure_race && lowered_from == 0 && "
+        "!resumed_outcome_unchanged && "
         "have_cache_accessors && cache_enabled_fn()"
     )
 
@@ -1863,19 +1922,16 @@ def test_ubatch_cache_store_ladder_needed_gate_has_a_mutation_witness():
     gate (which would re-store an identical entry after every TERMINAL
     cache hit, not just after a real ladder run)."""
     raw = LLAMA_CONTEXT_CPP
-    guard_line = (
-        "    if (ladder_needed && !stop_is_pure_race && !resumed_outcome_unchanged && have_cache_accessors &&\n"
-    )
+    guard_line = "    if (ladder_needed && !stop_is_pure_race && lowered_from == 0 && !resumed_outcome_unchanged &&\n"
     assert guard_line in raw, "mutation target not found -- update this witness to match the real source"
-    mutated_guard_line = (
-        "    if (!stop_is_pure_race && !resumed_outcome_unchanged && have_cache_accessors &&\n"
-    )
+    mutated_guard_line = "    if (!stop_is_pure_race && lowered_from == 0 && !resumed_outcome_unchanged &&\n"
     mutated_raw = raw.replace(guard_line, mutated_guard_line, 1)
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
     assert not re.search(
-        r"if\s*\(\s*ladder_needed\s*&&\s*!stop_is_pure_race\s*&&\s*!resumed_outcome_unchanged\s*&&\s*"
+        r"if\s*\(\s*ladder_needed\s*&&\s*!stop_is_pure_race\s*&&\s*lowered_from\s*==\s*0\s*&&\s*"
+        r"!resumed_outcome_unchanged\s*&&\s*"
         r"have_cache_accessors\s*&&\s*cache_enabled_fn\s*\(\s*\)\s*\)\s*\{",
         mutated_body_norm,
     ), "mutation witness is broken: dropping ladder_needed from the guard should make the gate check fail"
@@ -2335,7 +2391,9 @@ def test_store_skips_an_unchanged_resumed_outcome():
         r"cache_resume_reason\s*==\s*stop\s*;",
         body_norm,
     ), "resumed_outcome_unchanged must compare last_good and the reason against the resumed-from hit"
-    store_gate_idx = body_norm.find("if (ladder_needed && !stop_is_pure_race && !resumed_outcome_unchanged")
+    store_gate_idx = body_norm.find(
+        "if (ladder_needed && !stop_is_pure_race && lowered_from == 0 && !resumed_outcome_unchanged"
+    )
     assert store_gate_idx != -1, "the store gate must check !resumed_outcome_unchanged"
 
 
@@ -2371,15 +2429,15 @@ def test_store_failure_warn_has_a_mutation_witness():
     )
 
 
-def test_at_most_three_llama_log_warn_call_sites_in_the_body():
-    """quality round 1, Q3: this function's own docstring was updated to
-    say AT MOST THREE GGML_LOG_WARN lines report the outcome (the
-    tuning-cache lookup outcome, an optional store-failure WARN, and the
-    pre-existing auto n_ubatch outcome) -- pin the literal call-site count
-    in the source, not just the docstring's prose."""
+def test_at_most_four_llama_log_warn_call_sites_in_the_body():
+    """quality round 1, Q3: this function's own docstring says AT MOST FOUR
+    GGML_LOG_WARN lines report the outcome (the tuning-cache lookup
+    outcome, an optional store-failure WARN, llama.cpp-kpjw's "lowered
+    from" WARN, and the pre-existing auto n_ubatch outcome) -- pin the
+    literal call-site count in the source, not just the docstring's prose."""
     body_norm = _normalize_ws(_trial_body())
     count = len(re.findall(r"LLAMA_LOG_WARN\(", body_norm))
-    assert count == 3, f"expected exactly 3 LLAMA_LOG_WARN( call sites in the trial body -- found {count}"
+    assert count == 4, f"expected exactly 4 LLAMA_LOG_WARN( call sites in the trial body -- found {count}"
 
 
 def test_cache_path_return_is_checked_and_substituted():

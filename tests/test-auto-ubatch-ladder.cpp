@@ -183,13 +183,14 @@ int main() {
         check_descend("a default already at the floor has nothing to lower to", won, 0, tried, {});
     }
     {
-        // A MoE routing ceiling under the default: rungs above the cap are not tried, only what the cap allows.
+        // A MoE routing ceiling under the default: rungs above the cap (1024 and 512 here) are not tried, only
+        // what the cap allows.
         std::vector<uint32_t> tried;
-        const uint32_t        won = llama_auto_ubatch_descend(2048, 512, [&](uint32_t c) {
+        const uint32_t        won = llama_auto_ubatch_descend(2048, 256, [&](uint32_t c) {
             tried.push_back(c);
             return c <= 256;
         });
-        check_descend("rungs above the cap are skipped, not tried", won, 256, tried, { 512, 256 });
+        check_descend("rungs above the cap are skipped, not tried", won, 256, tried, { 256 });
     }
     {
         // Ascending first: the continuation is the answer to "nothing at or above the default won", so the

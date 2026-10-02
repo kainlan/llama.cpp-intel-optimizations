@@ -1503,13 +1503,16 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 // settle-down transaction cannot introduce a new KV demotion (its demand is
 // never larger than one already accepted).
 //
-// At most THREE GGML_LOG_WARN lines report the outcome (llama.cpp-7n6n,
+// At most FOUR GGML_LOG_WARN lines report the outcome (llama.cpp-7n6n,
 // Task 5, wires the persisted auto n_ubatch cache into this trial). The
 // first, `[SYCL-PLAN] tuning cache %s: n_ubatch=%u (%s)`, reports the CACHE
 // lookup's own outcome (hit/miss/disabled) before the ladder decision below
 // it. The second, `[SYCL-PLAN] tuning cache store failed: %s`, is emitted
 // only when the cache store below actually runs and returns false --
-// not on every start. The third (the pre-existing one) is
+// not on every start. The third, `[SYCL-PLAN] auto n_ubatch lowered from %u to
+// %u: ...` (llama.cpp-kpjw), is emitted only when the default itself lost and
+// the downward continuation found a smaller rung that fits. The fourth (the
+// pre-existing one) is
 // `[SYCL-PLAN] auto n_ubatch=...`, with one of these ten stop reasons:
 // "ladder exhausted" (no candidate lost -- either the cap stopped the ladder or
 // all four rungs were accepted), "MoE GPU routing ceiling" (the MoE cap bound,
@@ -1637,6 +1640,10 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     const uint32_t fallback_ubatch         = cparams.n_ubatch;
     uint32_t       last_good               = 0;
     uint32_t       hold_spill_validated_ub = 0;  // the rung try_candidate last passed the realized hold-spill check for
+    uint32_t       refusal_largest_ub      = 0;  // the -ub the last hold-spill refusal said still fits (0: unknown)
+    uint32_t       lowered_from            = 0;  // the default the downward continuation lowered from (0: it did not)
+    bool           fallback_tried          = false;  // the default itself was a rung the ladder asked about
+    bool           descent_ran             = false;  // the downward continuation ran (and may have found nothing)
     bool           sched_matches_last_good = false;
     bool           published_any           = false;
     bool           publish_dirty           = false;  // a candidate publish threw, possibly after landing somewhere
@@ -1816,6 +1823,7 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
                     "[SYCL-PLAN] auto n_ubatch candidate %u: hold spill left no headroom (the largest -ub that fits is "
                     "about %u)\n",
                     c, rung_largest_ub);
+                refusal_largest_ub        = rung_largest_ub;
                 cparams.pipeline_parallel = pipeline_parallel_before_reserve;
                 sched_matches_last_good   = false;
                 return "hold spill left no headroom";
@@ -2028,6 +2036,9 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
         if (c < fallback_ubatch) {
             continue;
         }
+        if (c == fallback_ubatch) {
+            fallback_tried = true;
+        }
         tried += (tried.empty() ? "" : ",") + std::to_string(c);
 
         const char * reason = try_candidate(c);
@@ -2036,6 +2047,32 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
             break;
         }
         last_good = c;
+    }
+
+    // A pure race is no shape limit; everything else that ends the ladder is one (this is read again below).
+    const bool stop_is_pure_race =
+        std::strcmp(stop, "transaction busy") == 0 || std::strcmp(stop, "not the published model") == 0;
+
+    // llama.cpp-kpjw: the default rung itself lost, so nothing at or above it won. The trial must not turn a loadable
+    // model into an init failure: a smaller -ub is not a smaller context (n_ctx and the KV placement are unchanged).
+    // It continues DOWNWARD (256, 128, 64 from a default of 512) and settles on the first rung that fits, announced
+    // loud; when none does the settle below refuses by name. Not after a race, and only when the default was itself
+    // tried (a default that is not a rung was never asked, so lowering past it would skip the one value that was
+    // always safe to reserve). A pinned -ub never reaches this function.
+    if (last_good == 0 && ladder_needed && fallback_tried && !stop_is_pure_race) {
+        descent_ran        = true;
+        const uint32_t won = llama_auto_ubatch_descend(fallback_ubatch, cap, [&](uint32_t c) {
+            tried.append(tried.empty() ? "" : ",").append(std::to_string(c));
+            return try_candidate(c) == nullptr;
+        });
+        if (won != 0) {
+            last_good    = won;
+            lowered_from = fallback_ubatch;
+            LLAMA_LOG_WARN(
+                "[SYCL-PLAN] auto n_ubatch lowered from %u to %u: the default did not fit (%s); a smaller -ub is not a "
+                "smaller context; pass -ub N to override\n",
+                fallback_ubatch, won, stop);
+        }
     }
 
     if (last_good == 0) {
@@ -2058,12 +2095,12 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // block above). The store's own return is now checked -- a false
     // (e.g. an unwritable cache directory) logs exactly one WARN; it is
     // still never fatal to this trial's own outcome either way.
-    const bool stop_is_pure_race =
-        std::strcmp(stop, "transaction busy") == 0 || std::strcmp(stop, "not the published model") == 0;
     const bool resumed_outcome_unchanged =
         cache_resumed && last_good == cache_resume_ubatch && cache_resume_reason == stop;
-    if (ladder_needed && !stop_is_pure_race && !resumed_outcome_unchanged && have_cache_accessors &&
-        cache_enabled_fn()) {
+    // A LOWERED result is not stored: the lookup refuses any value under the ladder's first rung, so it could only
+    // ever be a miss, and the next start runs the ladder again.
+    if (ladder_needed && !stop_is_pure_race && lowered_from == 0 && !resumed_outcome_unchanged &&
+        have_cache_accessors && cache_enabled_fn()) {
         if (!cache_store_fn(&cache_key, last_good, stop)) {
             LLAMA_LOG_WARN("[SYCL-PLAN] tuning cache store failed: %s\n", cache_path_buf);
         }
@@ -2132,7 +2169,25 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
             llama_auto_ubatch_settle_needs_publish(published_any, publish_dirty, cparams.n_ubatch, fallback_ubatch);
         cparams.n_ubatch = last_good;
         if (need_publish) {
-            sycl_resync_runtime_context_flash_attn();
+            try {
+                sycl_resync_runtime_context_flash_attn();
+            } catch (const std::exception & e) {
+                if (!descent_ran) {
+                    throw;
+                }
+                // The default lost, every rung down to the floor lost, and the settle at the default is refused too:
+                // refuse the context by name, with the -ub the last spill refusal said still fits.
+                throw std::runtime_error(format(
+                    "auto n_ubatch: no -ub from %u down to %u fits this context (tried %s; %s), and the settle at %u "
+                    "was refused (%s); %s",
+                    fallback_ubatch, llama_auto_ubatch_descent_floor, tried.c_str(), stop, fallback_ubatch, e.what(),
+                    refusal_largest_ub != 0 ?
+                        format("the largest -ub that fits is about %u, a power of two (or free VRAM on the card, or "
+                               "pass a smaller -c)",
+                               refusal_largest_ub)
+                            .c_str() :
+                        "no -ub is known to fit: free VRAM on the card, or pass a smaller -c"));
+            }
         }
         sched_need_reserve = true;
         sched_reserve();
