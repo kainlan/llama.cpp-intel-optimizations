@@ -7493,19 +7493,20 @@ bool   unified_cache_raw_free_device(void * ptr, const sycl::queue & queue);
     X(weight_planned_device_bytes_load_2, "weight_planned_device_bytes{load_2}@last_load_end") \
     X(weight_live_bytes_last_load_end, "weight_live_bytes@last_load_end")
 
-enum class dump_counter : uint8_t {
+// The enumerator lists are one object-like macro each, defined and undefined OUTSIDE the braces, so the enum body is a
+// single identifier: the static-storage audit's parser proves that shape, and fails closed on a macro call (or a
+// directive) between the braces (llama.cpp-y8w5).
 #define GGML_SYCL_DUMP_COUNTER_ENUM(name) name,
-    GGML_SYCL_DUMP_COUNTERS(GGML_SYCL_DUMP_COUNTER_ENUM)
+#define GGML_SYCL_DUMP_COUNTER_ENUMERATORS GGML_SYCL_DUMP_COUNTERS(GGML_SYCL_DUMP_COUNTER_ENUM) COUNT
+enum class dump_counter : uint8_t { GGML_SYCL_DUMP_COUNTER_ENUMERATORS };
+#undef GGML_SYCL_DUMP_COUNTER_ENUMERATORS
 #undef GGML_SYCL_DUMP_COUNTER_ENUM
-        COUNT
-};
 
-enum class dump_snapshot : uint8_t {
 #define GGML_SYCL_DUMP_SNAPSHOT_ENUM(id, printed) id,
-    GGML_SYCL_DUMP_SNAPSHOTS(GGML_SYCL_DUMP_SNAPSHOT_ENUM)
+#define GGML_SYCL_DUMP_SNAPSHOT_ENUMERATORS       GGML_SYCL_DUMP_SNAPSHOTS(GGML_SYCL_DUMP_SNAPSHOT_ENUM) COUNT
+enum class dump_snapshot : uint8_t { GGML_SYCL_DUMP_SNAPSHOT_ENUMERATORS };
+#undef GGML_SYCL_DUMP_SNAPSHOT_ENUMERATORS
 #undef GGML_SYCL_DUMP_SNAPSHOT_ENUM
-        COUNT
-};
 
 // Lock-free, relaxed; safe under any caller's lock. `dev` is the in-process
 // index after ONEAPI_DEVICE_SELECTOR filtering; an index outside the table is
