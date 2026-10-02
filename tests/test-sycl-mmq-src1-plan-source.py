@@ -781,6 +781,14 @@ def evaluate(backend, common, cache, zone):
         guard_re is not None and kvreq_at > 0 and scratch_at > kvreq_at and \
         flag_site + guard_re.start() < kvreq_at < scratch_at
 
+    # Which zone each flagged compute buffer landed in is printed per buffer, by name and size (a throughput
+    # difference between zones would otherwise be invisible).
+    landing_fn = function_body(backend, r"static void ggml_sycl_log_compute_buffer_landing\([^)]*\)\s*\{") or ""
+    results["each flagged compute buffer's landing zone is printed by name and size"] = \
+        "[SCRATCH-STATS]" in landing_fn and "compute_buffer=%s" in landing_fn and "size=%.1f MB" in landing_fn and \
+        "zone=%s" in landing_fn and "GGML_LOG_WARN" in landing_fn and \
+        re.search(r"if\s*\(\s*kv_zone_first\s*\)\s*\{\s*ggml_sycl_log_compute_buffer_landing\(\s*buft_ctx->device\s*,\s*buft_ctx->name",
+                  backend[flag_site:flag_site + 2600]) is not None
     # I1: the transaction's bound is net of the KV the same transaction is about to place, and works with the
     # largest free block (a buffer is indivisible), not the sum of the zone's free bytes.
     results["the spill bound nets out the KV this transaction will place, against the KV zone's largest free block"] = \
@@ -1406,6 +1414,10 @@ if args.self_test:
          (mutate(backend, "kv_req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::KV;",
                  "kv_req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::KV;\n"
                  "                    kv_req.intent.constraints.spill_to_kv_zone_before_raw = true;"), common, cache, zone)),
+        ("landing line dropped", "each flagged compute buffer's landing zone is printed by name and size",
+         (mutate(backend, "ggml_sycl_log_compute_buffer_landing(buft_ctx->device,", "ggml_sycl_XXXX(buft_ctx->device,"), common, cache, zone)),
+        ("landing line without the zone", "each flagged compute buffer's landing zone is printed by name and size",
+         (mutate_in_func(backend, r"static void ggml_sycl_log_compute_buffer_landing\(", "zone=%s", "zone=?"), common, cache, zone)),
         ("bound reads the KV zone without the arena", "the spill bound nets out the KV this transaction will place, against the KV zone's largest free block",
          (mutate_in_func(backend, r"static size_t ggml_sycl_planned_scratch_hold_spill_bound\(", "cache && cache->arena_active() ?", "cache ?"), common, cache, zone)),
         ("bound ignores the pending KV", "the spill bound nets out the KV this transaction will place, against the KV zone's largest free block",
