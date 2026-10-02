@@ -489,9 +489,6 @@ void failure_accounting_and_metadata_nonownership() {
     std::cout << "PASS allocation-failure-live-count-zero\n"
                  "PASS metadata-cannot-own\n";
 }
-} // namespace
-
-static_assert(std::is_copy_constructible_v<alloc_metadata>);
 // H12 (design 4.5a): mem_handle::owner_use_count() is an exact, non-destructive snapshot of the references that share one
 // handle's intrusive owner. A copy, a copy-assignment and a slice each count; a moved-from handle reports 0, and so does a
 // handle with no intrusive owner. Reading it releases nothing.
@@ -573,6 +570,7 @@ void owner_use_count_concurrent_readers_and_copiers() {
     std::atomic<int> ready{0};
     std::atomic<bool> go{false};
     std::atomic<bool> bad{false};
+    std::atomic<bool> over{false};
     std::vector<std::thread> threads;
     for (int i = 0; i < thread_count; ++i) {
         threads.emplace_back([own = root, &ready, &go, &bad]() mutable {
@@ -598,17 +596,21 @@ void owner_use_count_concurrent_readers_and_copiers() {
     go.store(true, std::memory_order_release);
     while (!stop.load(std::memory_order_acquire)) {
         // root + 16 workers' copies + 16 transient copies + the assigner's fresh + the shared object is the most that can be live
-        if (shared_object.owner_use_count() > 1 + 2 * thread_count + 2) bad.store(true);
+        if (shared_object.owner_use_count() > 1 + 2 * thread_count + 2) over.store(true);
     }
     assigner.join();
     for (auto & t : threads) t.join();
     check(!bad.load(), "a reader that holds a reference saw a count below 1");
+    check(!over.load(), "a snapshot exceeded the references that can be live at once (root, workers' copies and transients, assigner, shared object)");
     shared_object = mem_handle{};
     check(root.owner_use_count() == 1 && backend.attempts == 0, "concurrent copiers left the count off 1 or released early");
     root = mem_handle{};
     check(backend.attempts == 1 && backend.releases == 1, "concurrent copiers broke exactly-once release");
     std::cout << "PASS owner-use-count-concurrent-readers-and-copiers\n";
 }
+} // namespace
+
+static_assert(std::is_copy_constructible_v<alloc_metadata>);
 
 static_assert(std::is_trivially_destructible_v<alloc_metadata>);
 static_assert(!std::is_constructible_v<alloc_owner, alloc_metadata>);
