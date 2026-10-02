@@ -54,7 +54,9 @@ exactly how test-sycl-module-nodelete-source.py went unrun in a default build (r
 GGML_BACKEND_DL block): only the census, run against a configured build, catches that class. The ctest registration of
 the census covers GGML_SYCL=ON with GGML_BACKEND_DL=OFF only; other configurations are not censused. R3's reading of a
 guard is also bounded: a loop narrowed by something other than a comparison or a constant (a helper call that always
-returns False) still counts as running every test.
+returns False) still counts as running every test, and a main() status handed to another function (`report(main())`),
+or an exit built from a helper that ignores its argument, counts as consumed: dropped_status_calls follows direct
+statements, `if`/`with`/`try` nesting, assignments, `rc = main(); print(rc)` and `main() and 0`, not calls into helpers.
 
 `--self-test` also proves the audit can fail: it plants each escape above (and the shapes that must stay clean) into
 temp trees, synthetic and a copy of the real tree (every CMakeLists.txt this audit scans), and requires each to be
@@ -100,6 +102,10 @@ SKIP_RETURN_CODE_OK = "77"
 # Interpreter flags that leave "python runs this file" intact. Anything else in front of the gate (-m py_compile,
 # -c pass, -h, -V, ...) makes python do something other than run it.
 SAFE_INTERPRETER_FLAGS = {"-B", "-u", "-s", "-E", "-I", "-O", "-OO", "-P"}
+# What llama_test_pytest expands to in a configured build: `python -c <stub> gate.py`, the stub running the gate under
+# pytest and returning its status (tests/CMakeLists.txt). It is the one `-c` that still runs the gate; compare
+# `python -c pass gate.py`.
+PYTEST_STUB = "sys.exit(pytest.main(['-q', sys.argv[1]]))"
 # What scripts/sycl-add-pytest-footer.py appends (two blank lines before the guard: flake8 E305).
 FOOTER = '\n\nif __name__ == "__main__":\n    import sys\n\n    import pytest\n\n    sys.exit(pytest.main([__file__, "-q"]))\n'
 EXIT_CALLS = {"sys.exit", "exit", "quit", "SystemExit", "os._exit"}
@@ -211,15 +217,30 @@ def cmake_tokens(args):
     return tokens
 
 
+def command_gate(command_tokens):
+    """The tests/test-sycl-*.py file a test command [program, args...] runs, or None.
+
+    The program must be an interpreter (python3, ${Python3_EXECUTABLE}, ${LLAMA_PYTHON3}): `cat gate.py` or
+    `cmake -E echo gate.py` name the file without running it. The gate is the first .py argument, and only the flags in
+    SAFE_INTERPRETER_FLAGS may sit in front of it (`-m py_compile`, `-c pass`, `-h`, `-V` make python do something
+    else). A gate that is an argument of another script, a longer file name ending in the gate's, or a .pyc is not it.
+    Shared by the static audit (CMakeLists.txt) and the census (a configured build's CTestTestfile.cmake)."""
+    if not command_tokens or not INTERPRETER.fullmatch(command_tokens[0]):
+        return None
+    rest = command_tokens[1:]
+    if len(rest) > 2 and rest[0] == "-c" and PYTEST_STUB in rest[1]:
+        rest = rest[2:]
+    at = next((i for i, tok in enumerate(rest) if tok.endswith(".py")), None)
+    if at is None or any(tok not in SAFE_INTERPRETER_FLAGS for tok in rest[:at]):
+        return None
+    m = re.fullmatch(r"(?:.*/)?(test-sycl-[A-Za-z0-9_.-]+\.py)", rest[at])
+    return m.group(1) if m else None
+
+
 def registration_target(command, args):
     """(gate file name, registered test name) for a registrar command that runs a tests/test-sycl-*.py gate, or
-    (None, None).
-
-    Only the COMMAND/SCRIPT/ARGS position counts: the first .py file from that keyword on (for add_test without a
-    COMMAND keyword, the first .py file anywhere). A gate named as an argument of some other script, a longer
-    file name ending in the gate's, or a .pyc does not register it. The program in front of the gate must be an
-    interpreter (python3, ${Python3_EXECUTABLE}, ${LLAMA_PYTHON3}): `cat gate.py` or `cmake -E echo gate.py`
-    names the file without running it."""
+    (None, None). Only the COMMAND/SCRIPT/ARGS position counts (see command_gate); for add_test without a COMMAND
+    keyword, the arguments after the test name."""
     tokens = cmake_tokens(args)
     keyword = COMMAND_KEYWORD[command]
     whole = tokens
@@ -227,28 +248,19 @@ def registration_target(command, args):
         tokens = tokens[tokens.index(keyword) + 1:]
     elif command != "add_test":
         return None, None
-    if command == "llama_test_pytest":
-        candidate = tokens[0] if tokens else ""
-        program = whole[0] if whole else ""
     else:
-        candidate = next((tok for tok in tokens if tok.endswith(".py")), "")
-        if command == "llama_test_cmd":
-            program = whole[0] if whole else ""
-        else:
-            program = tokens[0] if tokens else ""
-    m = re.fullmatch(r"(?:.*/)?(test-sycl-[A-Za-z0-9_.-]+\.py)", candidate)
-    if not m or not INTERPRETER.fullmatch(program):
+        tokens = tokens[1:]
+    if command == "llama_test_pytest":
+        command_tokens = [whole[0], tokens[0]] if whole and tokens else []
+    elif command == "llama_test_cmd":
+        command_tokens = [whole[0]] + tokens if whole else []
+    else:
+        command_tokens = tokens
+    gate = command_gate(command_tokens)
+    if gate is None:
         return None, None
     if command == "add_test" and "CONFIGURATIONS" in whole:
         return None, None  # only runs in the named build configurations
-    if command != "llama_test_pytest":
-        # what sits between the interpreter and the gate must be flags that still run the file
-        ahead = tokens[:tokens.index(candidate)]
-        if command == "add_test":
-            ahead = ahead[1:]
-        if any(tok not in SAFE_INTERPRETER_FLAGS for tok in ahead):
-            return None, None
-    gate = m.group(1)
     name = None
     if command == "add_test":
         if "NAME" in whole and whole.index("NAME") + 1 < len(whole):
@@ -329,6 +341,24 @@ def _property_defects(name, args):
     return [], []
 
 
+def property_defects(tests, properties, rule):
+    """Problems for registered tests (name -> gates) that a property turns off, inverts or reinterprets."""
+    defects = []
+    for names, pairs in properties:
+        for test in names:
+            for gate in sorted(tests.get(test, ())):
+                for key, value in pairs:
+                    key = key.upper()
+                    if key in DEFECT_PROPERTIES and value.lower() not in STATIC_FALSE:
+                        defects.append("%s %s is registered (as test %s) but not run as a test: %s is set on it"
+                                       % (rule, gate, test, key))
+                    if key == "SKIP_RETURN_CODE" and value != SKIP_RETURN_CODE_OK:
+                        defects.append("%s %s is registered (as test %s) but not run as a test: SKIP_RETURN_CODE %s "
+                                       "reports exit status %s as a skip (only %s is allowed)"
+                                       % (rule, gate, test, value, value, SKIP_RETURN_CODE_OK))
+    return defects
+
+
 def scan_registrations(root):
     """(gate file name -> sorted list of the registering command names that run it,
         problems for gates whose registration a test property turns off, inverts or reinterprets)."""
@@ -342,20 +372,7 @@ def scan_registrations(root):
                     tests.setdefault(test, set()).add(gate)
             elif name in ("set_tests_properties", "set_property"):
                 properties.append(_property_defects(name, args))
-    defects = []
-    for names, pairs in properties:
-        for test in names:
-            for gate in sorted(tests.get(test, ())):
-                for key, value in pairs:
-                    key = key.upper()
-                    if key in DEFECT_PROPERTIES and value.lower() not in STATIC_FALSE:
-                        defects.append("R1 %s is registered (as test %s) but not run as a test: %s is set on it"
-                                       % (gate, test, key))
-                    if key == "SKIP_RETURN_CODE" and value != SKIP_RETURN_CODE_OK:
-                        defects.append("R1 %s is registered (as test %s) but not run as a test: SKIP_RETURN_CODE %s "
-                                       "reports exit status %s as a skip (only %s is allowed)"
-                                       % (gate, test, value, value, SKIP_RETURN_CODE_OK))
-    return {gate: sorted(forms) for gate, forms in found.items()}, defects
+    return {gate: sorted(forms) for gate, forms in found.items()}, property_defects(tests, properties, "R1")
 
 
 def registrations(root):
@@ -488,9 +505,13 @@ def _loop_reports_failure(body, loop_at, recorded):
     return False
 
 
+UNITTEST_MAIN_KEYWORDS = {"argv", "verbosity", "failfast", "catchbreak", "buffer", "warnings"}
+
+
 def _unittest_main_selects_nothing_out(call):
-    """unittest.main() over this module: no defaultTest, exit=, module=, another module's name or an argv selector."""
-    if any(kw.arg in ("exit", "defaultTest", "module") or kw.arg is None for kw in call.keywords):
+    """unittest.main() over this module: no defaultTest, exit=, module=, testLoader=, testRunner= or other keyword that
+    changes what runs or whether the process exits with the result; the module (when named) is this one; no argv selector."""
+    if any(kw.arg not in UNITTEST_MAIN_KEYWORDS for kw in call.keywords):
         return False
     if len(call.args) > 1:
         return False
@@ -509,17 +530,45 @@ def _unittest_main_selects_nothing_out(call):
     return True
 
 
+_PLAIN_CALLS = {"callable", "isinstance"}
+_PLAIN_NAMES = {"callable", "isinstance", "type", "types", "inspect", "FunctionType", "isfunction", "isroutine"}
+
+
+def _plain_test(test, loop_names):
+    """A selector condition built only from `.startswith(...)`, callable()/isinstance(), and/or/not over the loop's own
+    names: no comparison, no constant False, no length/endswith/membership narrowing."""
+    for node in ast.walk(test):
+        if isinstance(node, ast.Compare):
+            return False
+        if isinstance(node, ast.Constant) and not isinstance(node.value, str):
+            return False
+        if isinstance(node, ast.Call):
+            name = _call_name(node)
+            if not (name.endswith(".startswith") or name in _PLAIN_CALLS or name.endswith(("isfunction", "isroutine"))):
+                return False
+        if isinstance(node, ast.Name) and node.id not in loop_names and node.id not in _PLAIN_NAMES:
+            return False
+    return True
+
+
 def _selector_is_plain(loop):
-    """The test selection in a globals() loop is `name.startswith("test...")` plus at most callable()/isinstance()
-    conjuncts: a comparison (`name == "test_x"`, `name in (...)`) or a constant False narrows the loop to a subset."""
+    """The loop runs every test_ name: it iterates the whole globals() (no slice, no islice), never breaks out, and every
+    condition that selects (`name.startswith("test...")`) or skips (an `if` around a `continue`) is a plain one."""
+    if any(isinstance(sub, ast.Slice) for sub in ast.walk(loop.iter)):
+        return False
+    if any(isinstance(sub, ast.Call) and _call_name(sub).endswith("islice") for sub in ast.walk(loop.iter)):
+        return False
+    loop_names = _names(loop.target)
+    nested = [n for n in ast.walk(loop) if n is not loop and isinstance(n, (ast.For, ast.While))]
+    inside_nested = {id(sub) for n in nested for sub in ast.walk(n)}
     for node in ast.walk(loop):
-        if isinstance(node, ast.If) and any(
-                isinstance(sub, ast.Call) and _call_name(sub).endswith(".startswith") for sub in ast.walk(node.test)):
-            for sub in ast.walk(node.test):
-                if isinstance(sub, ast.Compare):
-                    return False
-                if isinstance(sub, ast.Constant) and not isinstance(sub.value, str) and not sub.value:
-                    return False
+        if isinstance(node, ast.Break) and id(node) not in inside_nested:
+            return False
+        if isinstance(node, ast.If):
+            selects = any(isinstance(sub, ast.Call) and _call_name(sub).endswith(".startswith") for sub in ast.walk(node.test))
+            skips = any(isinstance(sub, (ast.Continue, ast.Break)) for stmt in node.body + node.orelse for sub in ast.walk(stmt))
+            if (selects or skips) and not _plain_test(node.test, loop_names):
+                return False
     return True
 
 
@@ -588,9 +637,10 @@ def _returns_a_status(func):
 
 
 def dropped_status_calls(text):
-    """Names f such that a top-level `__main__` guard calls `f()` as a bare statement (or assigns the result to a name
-    it never reads again) although f returns a status: `main()` instead of `sys.exit(main())` turns every failure
-    the function reports into exit 0. Applies to any gate, script-style included."""
+    """Names f such that a top-level `__main__` guard (anywhere inside it: under if/with/try too) calls `f()` although f
+    returns a status, and does not pass that status to an exit: as a bare statement, assigned to a name that neither an
+    exit call nor the condition of an `if` that exits reads, or exit(f() and 0)-style with a constant that discards it. `main()` instead of `sys.exit(main())` turns every
+    failure the function reports into exit 0. Applies to any gate, script-style included."""
     tree = parse(text)
     if tree is None:
         return []
@@ -598,17 +648,31 @@ def dropped_status_calls(text):
                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _returns_a_status(node)}
     dropped = []
     for guard in (node for node in tree.body if is_main_guard(node)):
-        for at, stmt in enumerate(guard.body):
+        exit_args = [call.args[0] for call in ast.walk(guard)
+                     if isinstance(call, ast.Call) and _call_name(call) in EXIT_CALLS and call.args]
+        exit_names = set().union(*(_names(arg) for arg in exit_args)) if exit_args else set()
+        for branch in (n for n in ast.walk(guard) if isinstance(n, ast.If)):
+            if any(isinstance(c, ast.Call) and _call_name(c) in EXIT_CALLS or isinstance(c, ast.Raise)
+                   for stmt in branch.body + branch.orelse for c in ast.walk(stmt)):
+                exit_names |= _names(branch.test)  # `if rc: sys.exit(rc)` / `if missing: raise SystemExit(77)` decide on it
+        for node in ast.walk(guard):
             call, name = None, None
-            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-                call = stmt.value
-            elif (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name)
-                  and isinstance(stmt.value, ast.Call)):
-                call, name = stmt.value, stmt.targets[0].id
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                call = node.value
+            elif (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                  and isinstance(node.value, ast.Call)):
+                call, name = node.value, node.targets[0].id
             if call is None or not isinstance(call.func, ast.Name) or call.func.id not in returning:
                 continue
-            if name is None or not any(name in _names(later) for later in guard.body[at + 1:]):
+            if name is None or name not in exit_names:
                 dropped.append(call.func.id)
+        for arg in exit_args:
+            for boolop in (n for n in ast.walk(arg) if isinstance(n, ast.BoolOp)):
+                calls_f = any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in returning
+                              for v in boolop.values for c in ast.walk(v))
+                discards = any(isinstance(v, ast.Constant) and not v.value for v in boolop.values)
+                if calls_f and discards:
+                    dropped.append("(status discarded in an exit argument)")
     return dropped
 
 
@@ -793,6 +857,14 @@ R3_CASES = [
         'if name.startswith("test_") and name.endswith("_never"):', *RUN_AND_RECORD_IN_IF]), REG_P_PYTEST, "R3 test-sycl-p.py"),
     ("r3-loop-records-then-exits-0", PYTEST_GATE + loop_main("list(globals().items())", [
         'if name.startswith("test_"):', *RUN_AND_RECORD_IN_IF], tail="sys.exit(0)"), REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-loop-records-then-exits-a-constant", PYTEST_GATE + loop_main("list(globals().items())", [
+        'if name.startswith("test_"):', *RUN_AND_RECORD_IN_IF], tail="status = 0\n    sys.exit(status)"), REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-loop-records-prints-then-exits-0", PYTEST_GATE + loop_main("list(globals().items())", [
+        'if name.startswith("test_"):', *RUN_AND_RECORD_IN_IF], tail="print(failures)\n    sys.exit(0)"), REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-loop-islice-to-nothing", PYTEST_GATE + "import itertools\n" + loop_main("itertools.islice(list(globals().items()), 0)", [
+        'if name.startswith("test_"):', *RUN_AND_RECORD_IN_IF]), REG_P_PYTEST, "R3 test-sycl-p.py"),
+    ("r3-loop-selector-reads-a-flag", PYTEST_GATE + "ENABLED = False\n" + loop_main("list(globals().items())", [
+        'if name.startswith("test_") and ENABLED:', *RUN_AND_RECORD_IN_IF]), REG_P_PYTEST, "R3 test-sycl-p.py"),
     ("r3-unittest-main-test-loader", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main(testLoader=object())\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
     ("r3-unittest-main-test-runner", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main(testRunner=object())\n', REG_P_PYTEST, "R3 test-sycl-p.py"),
     ("r3-ok-unittest-main-verbosity", UNITTEST_GATE + '\n\nif __name__ == "__main__":\n    unittest.main(verbosity=2, failfast=True)\n', REG_P_ADD, None),
@@ -909,6 +981,14 @@ def write_tree(tmp, gates, cmake):
     (tmp / "tests" / "CMakeLists.txt").write_text(cmake)
 
 
+def min_gates_band_problem(min_gates, real_count):
+    """The R6 floor must track the real gate count: far below it and many gates could vanish silently, above it and the
+    audit would fail on a healthy tree. Returns the problem text, or None when MIN_GATES is within 10% below the count."""
+    if 0.9 * real_count <= min_gates <= real_count:
+        return None
+    return "MIN_GATES is %d but %d gates exist: keep the floor within 10%% below the real count" % (min_gates, real_count)
+
+
 def self_test():
     failures = []
     clean_cmake = """
@@ -973,8 +1053,11 @@ llama_test_pytest(${Python3_EXECUTABLE}
             failures.append("floor-moved: an empty tests/ passed the audit")
         # The floor tracks the real count: a floor far below it would let many gates vanish silently.
         real_count = len(list((Path(__file__).resolve().parents[1] / "tests").glob("test-sycl-*.py")))
-        if not (0.9 * real_count <= MIN_GATES <= real_count):
-            failures.append("MIN_GATES is %d but %d gates exist: keep the floor within 10%% below the real count" % (MIN_GATES, real_count))
+        if min_gates_band_problem(MIN_GATES, real_count):
+            failures.append(min_gates_band_problem(MIN_GATES, real_count))
+        for floor, count, wants_problem in ((100, 168, True), (168, 168, False), (152, 168, False), (151, 168, True), (170, 168, True)):
+            if bool(min_gates_band_problem(floor, count)) != wants_problem:
+                failures.append("min_gates_band_problem(%d, %d) %s a problem" % (floor, count, "missed" if wants_problem else "invented"))
         # A registration naming a file that is not in tests/ (R5), and the matching allowlist rules.
         tree = base / "missing-file"
         write_tree(tree, clean_gates, clean_cmake + "add_test(NAME g COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-ghost.py)\n")
@@ -1023,14 +1106,31 @@ llama_test_pytest(${Python3_EXECUTABLE}
     return failures
 
 
-def configured_test_text(build_dir):
-    """The text of every CTestTestfile.cmake under a configured build (what ctest would actually run)."""
-    chunks = []
+def configured_gates(build_dir):
+    """(gates a configured build RUNS, problems for ones it only names).
+
+    Every add_test of every CTestTestfile.cmake under the build is parsed: the program must be an interpreter and the gate
+    the first .py argument behind safe flags (command_gate), and no DISABLED / WILL_FAIL / regex / SKIP_RETURN_CODE-not-77
+    property may sit on the test. A substring match would count `old-gate.py`, a `.orig`, an echo of the path or a
+    py_compile of it as the gate being configured."""
+    tests, properties, seen = {}, [], False
     for dirpath, dirnames, filenames in os.walk(build_dir):
         dirnames[:] = [d for d in dirnames if d != "CMakeFiles"]
-        if "CTestTestfile.cmake" in filenames:
-            chunks.append((Path(dirpath) / "CTestTestfile.cmake").read_text(errors="replace"))
-    return "\n".join(chunks)
+        if "CTestTestfile.cmake" not in filenames:
+            continue
+        seen = True
+        for name, args in cmake_commands((Path(dirpath) / "CTestTestfile.cmake").read_text(errors="replace")):
+            if name == "add_test":
+                tokens = cmake_tokens(args)
+                gate = command_gate(tokens[1:]) if tokens else None
+                if gate:
+                    tests.setdefault(tokens[0], set()).add(gate)
+            elif name == "set_tests_properties":
+                properties.append(_property_defects(name, args))
+    if not seen:
+        return None, []
+    ran = {gate for gates in tests.values() for gate in gates}
+    return ran, property_defects(tests, properties, "R7")
 
 
 def census(root, build_dir, absent_allowlist=None):
@@ -1042,13 +1142,14 @@ def census(root, build_dir, absent_allowlist=None):
     This compares against what the build actually configured, with no GPU and no ctest run."""
     root = Path(root)
     absent_allowlist = CENSUS_ABSENT_ALLOWLIST if absent_allowlist is None else absent_allowlist
-    text = configured_test_text(build_dir)
-    if not text:
+    configured = configured_gates(build_dir)
+    if configured[0] is None:
         return ["R7 no CTestTestfile.cmake under %s: not a configured build, so the census proves nothing" % build_dir]
-    problems = []
+    ran, problems = configured
+    problems = list(problems)
     registered, _ = scan_registrations(root)
     for gate in sorted(registered):
-        present = ("/" + gate) in text
+        present = gate in ran
         if not present and gate not in absent_allowlist:
             problems.append("R7 %s is registered in a CMakeLists.txt but is not in the configured build %s: behind a "
                             "configuration guard or in an uncalled function, so it never runs here (add it to "
@@ -1123,6 +1224,11 @@ def census_self_test(base):
     if census(tree, build, {}):
         failures.append("census: a configured gate with flags, arguments and harmless properties was reported: %s"
                         % census(tree, build, {}))
+    (build / "tests" / "CTestTestfile.cmake").write_text(
+        'add_test([=[a]=] "/usr/bin/python3" "/x/tests/test-sycl-a.py")\n'
+        'add_test([=[b]=] "/usr/bin/python3" "-c" "import pytest\\n' + PYTEST_STUB + '\\n" "/x/tests/test-sycl-b.py")\n')
+    if census(tree, build, {}):
+        failures.append("census: llama_test_pytest's `-c <pytest stub>` form was reported: %s" % census(tree, build, {}))
     # main() must act on the census: run the script itself against a build dir that cannot pass.
     done = subprocess.run([sys.executable, os.path.abspath(__file__), "--census", str(empty)], capture_output=True, text=True,
                           timeout=120)
