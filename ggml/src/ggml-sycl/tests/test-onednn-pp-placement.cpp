@@ -164,7 +164,7 @@ int main() {
         CHECK(onednn_pp_admission_decide(in) == onednn_pp_refusal::DISABLED_OR_SKIP_TYPE, "case 7: type refused");
         in.batch = 1;
         CHECK(onednn_pp_admission_decide(in) == onednn_pp_refusal::DISABLED_OR_SKIP_TYPE,
-              "case 7: disabled wins over the batch floor");
+              "case 7: a refused type wins over the batch floor");
 
         in              = admitted_inputs(route, 512);
         in.f32_operands = false;

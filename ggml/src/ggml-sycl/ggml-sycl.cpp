@@ -28144,10 +28144,12 @@ static bool ggml_sycl_onednn_pp_skip_type(ggml_type type) {
 }
 
 // llama.cpp-8ony: the environment-level terms of the oneDNN PP admission, for a weight of `type`
-// (GGML_SYCL_ONEDNN_PP, GGML_SYCL_SKIP_ONEDNN_Q4_0). The ONE reader of both: ggml_sycl_onednn_pp_candidate hands its
-// answer to the pure admission, the dense WOQ second-copy predicate asks it, and the zone adapter asks it at plan
-// time, where there is no graph node for the router, so that a type no PP route can draw is not reserved a dequant
-// copy. Non-static and declared in common.hpp because the planner cannot see this TU's statics.
+// (GGML_SYCL_ONEDNN_PP, GGML_SYCL_SKIP_ONEDNN_Q4_0). The ONE reader of both within the admission:
+// ggml_sycl_onednn_pp_candidate hands its answer to the pure admission, the dense WOQ second-copy predicate asks it,
+// and the zone adapter asks it at plan time, where there is no graph node for the router, so that a type no PP route
+// can draw is not reserved a dequant copy. layout_policy (common.hpp) also reads GGML_SYCL_SKIP_ONEDNN_Q4_0, for a
+// different question (which layout a Q4_0 weight is loaded in; see there). Non-static and declared in common.hpp
+// because the planner cannot see this TU's statics.
 bool ggml_sycl_onednn_pp_type_admitted(ggml_type type) {
     return !ggml_sycl::onednn_pp_type_term_refused(ggml_sycl_onednn_pp_enabled(), ggml_sycl_onednn_pp_skip_type(type));
 }

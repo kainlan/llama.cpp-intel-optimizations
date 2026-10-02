@@ -114,8 +114,8 @@ enum class onednn_pp_refusal {
 
 struct onednn_pp_admission_inputs {
     bool    type_admitted               = false;  // ggml_sycl_onednn_pp_type_admitted(src0->type)
-    int64_t batch                       = 0;  // src1->ne[1]
-    int64_t min_batch                   = 0;  // onednn_pp_min_batch_for(route, ...)
+    int64_t batch                       = 0;      // src1->ne[1]
+    int64_t min_batch                   = 0;      // onednn_pp_min_batch_for(route, ...)
     bool    f32_operands                = false;
     bool    contiguous_quantized_weight = false;
 };

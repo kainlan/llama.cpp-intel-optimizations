@@ -169,8 +169,8 @@ def call_sites(text, name):
     sites = []
     for m in re.finditer(r"\b" + re.escape(name) + r"\s*\(", text):
         before = text[max(0, m.start() - 80) : m.start()]
-        if re.search(r"\bstatic\s+[\w:<>]+\s*$", before):
-            continue  # the definition (or a forward declaration)
+        if re.search(r"(?:^|\n)(?:static\s+)?[\w:<>]+\s+$", before):
+            continue  # the definition (or a forward declaration), static or not: column 0, so `    return f(` is a call
         sites.append(m.start())
     return sites
 

@@ -1679,6 +1679,10 @@ struct layout_policy {
         // unified kernel dispatch guard at ggml-sycl.cpp:31236 does not skip them.
         // TG path still works via MMVQ/DMMV SOA kernels (~77 t/s, slightly under
         // COALESCED's 81 t/s — acceptable cost for unlocking unified XMX PP).
+        // This reads GGML_SYCL_SKIP_ONEDNN_Q4_0 for a LAYOUT question and is not the PP admission's term: the
+        // admission (ggml_sycl_onednn_pp_type_admitted, ggml-sycl.cpp) is "enabled && !skip", this is the knob alone,
+        // so with GGML_SYCL_ONEDNN_PP=0 and no skip the admission refuses and the layout is untouched. The opt-in
+        // stays one variable parsed the same way at both sites (non-zero integer).
         static int skip_onednn_q4_0_cached = -1;
         if (skip_onednn_q4_0_cached < 0) {
             const char * env        = std::getenv("GGML_SYCL_SKIP_ONEDNN_Q4_0");

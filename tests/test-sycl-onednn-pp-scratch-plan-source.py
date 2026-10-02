@@ -478,8 +478,14 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
     if admitted_fn is not None:
         results["the planner's admission asks the same shared term"] = \
             "onednn_pp_type_term_refused(" in admitted_fn
+        # Every SYCL source, not this TU alone: a caller in the planner, the zone sizing or a header would be a
+        # second reader of the term the admission exists to hold once. The fixed files are the ones this gate is
+        # handed (so a mutant of any of them is seen); rest_sycl is everything else under ggml/src/ggml-sycl.
+        every_sycl = "\n".join((backend, cache, cache_hpp, zone_sizing, common, dispatch, placement, utypes, rest_sycl))
+        term_uses = len(re.findall(r"\bonednn_pp_type_term_refused\s*\(", every_sycl))
+        term_defs = len(re.findall(r"\binline\s+bool\s+onednn_pp_type_term_refused\s*\(", every_sycl))
         results["the type admission is the only caller of the shared term"] = \
-            len(re.findall(r"\bonednn_pp_type_term_refused\s*\(", backend)) == 1
+            term_uses - term_defs == 1 and len(re.findall(r"\bonednn_pp_type_term_refused\s*\(", backend)) == 1
 
     # ---- the reserve reads the stored snapshot once, and the bound comes from that read (llama.cpp-8ony) ----
     reserve_fn = function_body(cache, r"bool unified_cache::reserve_onednn_scratch\([^)]*\)\s*\{")
@@ -571,6 +577,14 @@ utypes_path = Path(args.unified_types)
 utypes = strip_comments(utypes_path.read_text()) if utypes_path.exists() else ""
 model = strip_comments(Path(args.model).read_text())
 header = strip_comments(Path(args.sycl_header).read_text())
+# Every other SYCL source (tests excluded: they call the pure term on purpose).
+_named = {Path(p).resolve() for p in (args.backend, args.cache, args.cache_hpp, args.zone_sizing, args.common,
+                                      args.dispatch, args.placement, args.unified_types)}
+rest_sycl = "\n".join(
+    strip_comments(p.read_text())
+    for p in sorted(Path(args.backend).resolve().parent.rglob("*"))
+    if p.suffix in (".cpp", ".hpp", ".h", ".inc", ".cuh") and "tests" not in p.relative_to(
+        Path(args.backend).resolve().parent).parts and p.resolve() not in _named)
 
 failed = run("tree", (backend, cache, cache_hpp, zone_sizing))
 
@@ -847,6 +861,12 @@ if args.self_test and not failed:
         ("second caller of the shared term", "the type admission is the only caller of the shared term",
          (backend + "\nstatic bool x() { return !ggml_sycl::onednn_pp_type_term_refused(true, false); }\n",
           cache, cache_hpp)),
+        ("caller of the shared term in the zone sizing TU", "the type admission is the only caller of the shared term",
+         (backend, cache, cache_hpp,
+          zone_sizing + "\nstatic bool y() { return !ggml_sycl::onednn_pp_type_term_refused(true, false); }\n")),
+        ("caller of the shared term in the planner TU", "the type admission is the only caller of the shared term",
+         (backend, cache + "\nstatic bool z() { return !ggml_sycl::onednn_pp_type_term_refused(true, false); }\n",
+          cache_hpp)),
         ("planner restates the term", "the planner's admission asks the same shared term",
          (mutate_in_func(backend, r"bool ggml_sycl_onednn_pp_type_admitted\(", "onednn_pp_type_term_refused(",
                          "XXXX("), cache, cache_hpp)),
