@@ -156,8 +156,9 @@ COMMON_IMPL_CODE = _blank_comments(COMMON_IMPL)
 # list is a plain per-line merge when two branches each add a site. The census counts the code with every named
 # function's body cut out, so the baseline stays at the reviewed 24 runtime sites. Each name must be listed once.
 # Each named function must hold exactly one owner-first allocation, refuse on failure (the `if (!allocation)` branch
-# must return or throw, an empty one does not count), and hand the owner over only through
-# mem_handle::from_owned_alloc, with no legacy unified_alloc( / from_legacy_owned_alloc in it. A function named
+# must contain a return or throw token -- textual, so a return in a nested lambda or a string literal satisfies it --
+# or, braceless, be a return or throw statement itself; an empty one does not count), and hand the owner over only
+# through mem_handle::from_owned_alloc, with no legacy unified_alloc( / from_legacy_owned_alloc in it. A function named
 # ggml_backend_sycl_test_* is a PRIVATE_TESTING seam and must sit inside an `#if defined(GGML_SYCL_PRIVATE_TESTING)`
 # block; several hooks may share one block. A function with any other name is production code, needs no guard, and
 # is not required to have one. The next adder is the L4 lane (impl/moua-l4).
@@ -201,15 +202,28 @@ def inside_private_testing(code: str, position: int) -> bool:
 
 
 def refusal_branch_refuses(body: str, start: int) -> bool:
-    """The `if (!allocation) { ... }` branch that begins at `start` in `body` returns or throws."""
-    open_brace = body.index("{", start)
-    depth, index = 0, open_brace
-    while True:
-        depth += (body[index] == "{") - (body[index] == "}")
-        index += 1
-        if depth == 0:
-            break
-    return re.search(r"\b(return|throw)\b", body[open_brace:index]) is not None
+    """The statement `if (!allocation)` that begins at `start` in `body` refuses. Either a braced block (matched from
+    its own `{`) that contains a return or throw TOKEN, or a braceless single statement, up to its `;`, that is itself
+    a return or throw. Textual: a return inside a nested lambda or a string literal in the block also satisfies it.
+    Anything that does not parse as one of those two shapes is False, never an exception."""
+    head = re.compile(r"if\s*\(\s*!\s*allocation\s*\)\s*").match(body, start)
+    if head is None:
+        return False
+    index = head.end()
+    if index >= len(body):
+        return False
+    if body[index] == "{":
+        depth, end = 0, index
+        while end < len(body):
+            depth += (body[end] == "{") - (body[end] == "}")
+            end += 1
+            if depth == 0:
+                return re.search(r"\b(return|throw)\b", body[index:end]) is not None
+        return False
+    semicolon = body.find(";", index)
+    if semicolon < 0:
+        return False
+    return re.match(r"(return|throw)\b", body[index:semicolon]) is not None
 
 
 RUNTIME_PRODUCTION_CODE = RUNTIME_CODE
@@ -224,9 +238,11 @@ with gate("every named owner-first site in ggml-sycl.cpp is a guarded, owner-fir
         _body = RUNTIME_CODE[_start:_end]
         assert _body.count("unified_allocate_owner(") == 1, "%s: not exactly one owner-first allocation" % _function
         assert "unified_alloc(" not in _body and "from_legacy_owned_alloc" not in _body, _function
-        _allocation = _body.index("unified_allocate_owner(")
-        _refused    = _body.index("if (!allocation)", _allocation)
-        _wrapped    = _body.index("from_owned_alloc(std::move(allocation.owner)", _refused)
+        _allocation = _body.find("unified_allocate_owner(")
+        _refused    = _body.find("if (!allocation)", max(_allocation, 0))
+        assert _refused >= 0, "%s: no `if (!allocation)` refusal after the allocation" % _function
+        _wrapped    = _body.find("from_owned_alloc(std::move(allocation.owner)", _refused)
+        assert _wrapped >= 0, "%s: the owner is not handed over via from_owned_alloc after the refusal check" % _function
         assert _allocation < _refused < _wrapped, "%s: allocate, refuse-check, from_owned_alloc out of order" % _function
         assert refusal_branch_refuses(_body, _refused), "%s: the `if (!allocation)` branch does not return or throw" % _function
         if _function.startswith("ggml_backend_sycl_test_"):
