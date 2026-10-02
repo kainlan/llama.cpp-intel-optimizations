@@ -987,22 +987,44 @@ int main() {
     }
 
     // ---- Case 21: the largest -ub that keeps a rung's raw spill from crossing the driver headroom (review r4
-    // I1, the pinned -ub refusal names it). The raw spill scales about linearly with n_ubatch. ---------------------
+    // I1, the pinned -ub refusal names it; review r5 minor 3: it is a power of two, the rung the ladder and the user
+    // actually pass, because a value landed exactly on the headroom is refused again by the next measurement). The
+    // raw spill scales about linearly with n_ubatch. -------------------------------------------------------------
     {
         const size_t MiB = 1024 * 1024;
-        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 461 * MiB, 108 * MiB, 256 * MiB) == 672,
-              "B50 Qwen ub1024: 461 MB spilled, 108 MB left of the 256 MB headroom: about 695, rounded down to 32");
-        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 1000 * MiB, 0, 256 * MiB) == 736,
-              "a spill that left nothing: the share of it the headroom allows");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 461 * MiB, 108 * MiB, 256 * MiB) == 512,
+              "B50 Qwen ub1024: 461 MB spilled, 108 MB left of the 256 MB headroom: about 695, down to a power of two "
+              "(1024 was refused and 512 landed on the card)");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 1000 * MiB, 0, 256 * MiB) == 512,
+              "a spill that left nothing: the share of it the headroom allows (736), down to a power of two");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 400 * MiB, 0, 256 * MiB) == 256,
+              "a smaller share (368) snaps to the power of two below it");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 512 * MiB, 0, 256 * MiB) == 512,
+              "a share that is exactly a power of two is kept, not stepped below");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1000, 1000 * MiB, 0, 256 * MiB) == 512,
+              "an n_ubatch that is not a power of two refused: the answer is still a power of two below it");
         CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 461 * MiB, 300 * MiB, 256 * MiB) == 1024,
               "a rung that already fits needs no reduction");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1000, 461 * MiB, 300 * MiB, 256 * MiB) == 1000,
+              "a rung that fits is returned as it is, not snapped");
         CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 0, 0, 256 * MiB) == 1024, "no spill, no reduction");
         CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 100 * MiB, 100 * MiB, 256 * MiB) == 1024,
               "a card already short without the spill is not the hold's doing: not refused, so not reduced");
         CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 156 * MiB, 100 * MiB, 256 * MiB) == 0,
               "free before the spill exactly the headroom: no spill at all is allowed, nothing is known to fit");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 1000 * MiB, 0, 1000 * MiB - 20 * MiB) == 0,
+              "a share under the smallest rung (20 of 1024) names nothing");
+        CHECK(ggml_sycl::zone_hold_spill_largest_ub(1024, 1000 * MiB, 0, 1000 * MiB - 40 * MiB) == 32,
+              "the smallest rung a share can name is 32");
         CHECK(ggml_sycl::zone_hold_spill_largest_ub(0, 461 * MiB, 108 * MiB, 256 * MiB) == 0,
               "an unknown n_ubatch names nothing");
+        for (uint32_t share = 1; share <= 1024; share++) {
+            const size_t   spill = 1024 * MiB;
+            const size_t   head  = spill - spill / 1024 * share;  // the card could take `share`/1024 of the spill
+            const uint32_t ub    = ggml_sycl::zone_hold_spill_largest_ub(1024, spill, 0, head);
+            CHECK(ub == 0 || ((ub & (ub - 1)) == 0 && ub >= 32 && ub <= share),
+                  "every answer is 0 or a power of two of at least 32, never above the share the card allows");
+        }
     }
 
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");

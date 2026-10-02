@@ -17,6 +17,10 @@
 //                    zone, and is counted as an in-arena hold spill, never a raw one.
 //   4. CONTROL    -- the same requests WITHOUT the flag never land in the KV zone (the flag is the only thing that
 //                    sends a request there), so a pass above is the flag's doing and not a coincidence of routing.
+//                    The unflagged held-back request is the RAW spill the flag exists to avoid: it is counted as one
+//                    raw spill (the only kind the realized check blames on the hold) and warned about once.
+//   5. FREE       -- every unified_free() returns true: a free the allocator refused would leave the zone numbers
+//                    below comparing against a leak.
 //
 // A precondition that cannot be established (no arena, no KV room) FAILS the test rather than skipping it: a vacuous
 // pass is the failure mode this repository keeps hitting.
@@ -29,6 +33,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #if !defined(GGML_USE_SYCL)
 int main() {
@@ -63,17 +68,40 @@ void check(bool ok, const char * what) {
 // compute buffer; `kv_first` is the flag under test.
 bool alloc_compute(int device, sycl::queue * queue, size_t size, bool kv_first, alloc_handle * out) {
     alloc_request req;
-    req.queue                                      = queue;
-    req.device                                     = device;
-    req.size                                       = size;
-    req.alignment                                  = 64;
-    req.intent.role                                = alloc_role::COMPUTE;
-    req.intent.category                            = runtime_category::COMPUTE;
-    req.intent.cohort_id                           = "kpjw_kv_zone_probe";
-    req.intent.constraints.must_device             = true;
-    req.intent.constraints.prefer_vram_zone        = vram_zone_id::RUNTIME;
+    req.queue                                          = queue;
+    req.device                                         = device;
+    req.size                                           = size;
+    req.alignment                                      = 64;
+    req.intent.role                                    = alloc_role::COMPUTE;
+    req.intent.category                                = runtime_category::COMPUTE;
+    req.intent.cohort_id                               = "kpjw_kv_zone_probe";
+    req.intent.constraints.must_device                 = true;
+    req.intent.constraints.prefer_vram_zone            = vram_zone_id::RUNTIME;
     req.intent.constraints.spill_to_kv_zone_before_raw = kv_first;
     return unified_alloc(req, out);
+}
+
+// The WARN lines the spill counters print once per landing site, counted so the test can assert the log as well as the
+// counters (a counter that moves without the line is a silent spill; the line without the counter is a lie).
+int g_warn_raw       = 0;
+int g_warn_arena     = 0;
+int g_warn_zone_full = 0;
+
+void count_warnings(enum ggml_log_level level, const char * text, void *) {
+    if (level == GGML_LOG_LEVEL_WARN && text != nullptr && std::strstr(text, "[SCRATCH] device") != nullptr) {
+        if (std::strstr(text, "spills outside the arena (raw device memory)") != nullptr) {
+            g_warn_raw++;
+        } else if (std::strstr(text, "was placed in the arena's KV zone") != nullptr) {
+            if (std::strstr(text, "did not fit the RUNTIME zone") != nullptr) {
+                g_warn_zone_full++;
+            } else {
+                g_warn_arena++;
+            }
+        }
+    }
+    if (text != nullptr) {
+        fputs(text, stderr);
+    }
 }
 
 }  // namespace
@@ -83,6 +111,9 @@ int main(int, char ** argv) {
     sycl_test_selector_fallback(argv, "level_zero:1");
 
     const int device = 0;  // in-process index after selector filtering
+
+    // Installed before the backend exists, like the sibling log-capturing gates.
+    ggml_log_set(count_warnings, nullptr);
 
     ggml_backend_t backend = ggml_backend_sycl_init(device);
     if (backend == nullptr) {
@@ -136,7 +167,9 @@ int main(int, char ** argv) {
               "counted as one zone-full KV placement of at least the request");
         check(totals.arena_count == 0 && totals.raw_count == 0, "not counted as a hold spill of either kind");
 
-        unified_free(handle);
+        check(g_warn_zone_full == 1 && g_warn_arena == 0 && g_warn_raw == 0,
+              "warned once, as a zone-full KV placement, and no other WARN fired");
+        check(unified_free(handle), "unified_free accepted the handle");
         check(cache->zone_used(vram_zone_id::KV) == kv_before, "freeing returned KV zone_used to where it started");
         check(cache->zone_used(vram_zone_id::RUNTIME) == run_before, "freeing left RUNTIME zone_used untouched");
     }
@@ -149,7 +182,7 @@ int main(int, char ** argv) {
         check(!ok || handle.vram_zone != vram_zone_id::KV, "an unflagged request is never placed in the KV zone");
         check(cache->zone_used(vram_zone_id::KV) == kv_before, "KV zone_used did not move");
         if (ok) {
-            unified_free(handle);
+            check(unified_free(handle), "unified_free accepted the handle");
         }
     }
 
@@ -170,19 +203,29 @@ int main(int, char ** argv) {
               "counted as one in-arena hold spill of at least the request");
         check(totals.raw_count == 0 && totals.zone_full_count == 0,
               "not counted as a raw spill or a zone-full placement");
-        unified_free(handle);
+        check(g_warn_arena == 1 && g_warn_raw == 0, "warned once, as an in-arena hold spill");
+        check(unified_free(handle), "unified_free accepted the handle");
         check(cache->zone_used(vram_zone_id::KV) == kv_before, "freeing returned KV zone_used to where it started");
     }
 
     printf("held-back request, not flagged (control):\n");
+    ggml_sycl::unified_cache_begin_planned_hold_epoch(device, owner, 512);
     {
         const size_t kv_before = cache->zone_used(vram_zone_id::KV);
         alloc_handle handle;
         const bool   ok = alloc_compute(device, queue, small, /*kv_first=*/false, &handle);
-        check(!ok || handle.vram_zone != vram_zone_id::KV, "an unflagged held-back request is never placed in the KV zone");
+        check(ok && handle.ptr != nullptr, "the unflagged held-back request was served (outside the arena)");
+        check(handle.vram_zone != vram_zone_id::KV, "an unflagged held-back request is never placed in the KV zone");
         check(cache->zone_used(vram_zone_id::KV) == kv_before, "KV zone_used did not move");
+        planned_hold_spill_totals totals;
+        ggml_sycl::unified_cache_get_recent_planned_hold_spills(device, owner, &totals);
+        check(totals.raw_count == 1 && totals.raw_bytes >= small,
+              "counted as one raw hold spill of at least the request: the spill the flag exists to avoid");
+        check(totals.arena_count == 0 && totals.zone_full_count == 0,
+              "not counted as an in-arena spill or a zone-full placement");
+        check(g_warn_raw == 1, "warned once, as a spill outside the arena (raw device memory)");
         if (ok) {
-            unified_free(handle);
+            check(unified_free(handle), "unified_free accepted the handle");
         }
     }
 

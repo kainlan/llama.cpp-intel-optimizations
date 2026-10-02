@@ -41,6 +41,7 @@ parser.add_argument("--cache", default=str(sycl / "unified-cache.cpp"))
 parser.add_argument("--zone", default=str(sycl / "zone-sizing.hpp"))
 parser.add_argument("--context", default=str(root / "src/llama-context.cpp"))
 parser.add_argument("--header", default=str(root / "ggml/include/ggml-sycl.h"))
+parser.add_argument("--context-header", default=str(root / "src/llama-context.h"))
 parser.add_argument("--cmake", default=str(root / "tests/CMakeLists.txt"))
 parser.add_argument("--gpu-test", default=str(root / "tests/test-sycl-compute-buffer-kv-zone.cpp"))
 parser.add_argument("--self-test", action="store_true")
@@ -106,6 +107,24 @@ def function_body(source, signature_regex):
             if depth == 0:
                 return source[start:i + 1]
     return None
+
+
+def balanced_block(source, open_at):
+    """The brace-balanced block whose '{' is at `open_at` (None when it never closes)."""
+    depth = 0
+    for i in range(open_at, len(source)):
+        if source[i] == "{":
+            depth += 1
+        elif source[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[open_at:i + 1]
+    return None
+
+
+def join_literals(source):
+    """Adjacent C string literals are one string: join them so a message split over lines can be searched."""
+    return re.sub(r'"\s*"', "", source)
 
 
 def evaluate(backend, common, cache, zone):
@@ -789,7 +808,7 @@ def evaluate(backend, common, cache, zone):
     results["each flagged compute buffer's landing zone is printed by name and size"] = \
         "[SCRATCH-STATS]" in landing_fn and "compute_buffer=%s" in landing_fn and "size=%.1f MB" in landing_fn and \
         "zone=%s" in landing_fn and "GGML_LOG_WARN" in landing_fn and \
-        re.search(r"if\s*\(\s*kv_zone_first\s*\)\s*\{\s*ggml_sycl_log_compute_buffer_landing\(\s*buft_ctx->device\s*,\s*buft_ctx->name",
+        re.search(r"if\s*\(\s*kv_zone_first\s*\)\s*\{\s*if\s*\(\s*runtime_h\.ptr\s*\)\s*\{\s*ggml_sycl_log_compute_buffer_landing\(\s*buft_ctx->device\s*,\s*buft_ctx->name",
                   backend[flag_site:flag_site + 2600]) is not None
     # I1: the transaction's bound is net of the KV the same transaction is about to place, and works with the
     # largest free block (a buffer is indivisible), not the sum of the zone's free bytes.
@@ -806,15 +825,61 @@ def evaluate(backend, common, cache, zone):
         "zone_hold_spill_largest_ub(" in realized_fn and "largest_ub" in entry_fn and \
         re.search(r"bool ggml_backend_sycl_planned_hold_spill_fits\(\s*ggml_backend_t\s+backend\s*,\s*uint32_t\s+n_ubatch\s*,\s*uint32_t\s*\*\s*largest_ub", backend) is not None
     results["the F3 refusal says its figure is net of the KV-zone room"] = "net of the KV" in hold_headroom_fn
+    # r5 T1: the KV this context already admitted is not pending. Forcing it to 0 makes every rung above the first
+    # look like it is about to place all of its KV again, which shrinks the room and over-refuses it.
+    results["the transaction nets out the KV already admitted, so a rung above the first is not over-refused"] = \
+        re.search(r"admitted_kv\s*=\s*ctx->runtime_kv_admitted\s*\?\s*current->plan\.get\(\)\s*:\s*nullptr", txn) is not None and \
+        re.search(r"const size_t\s+kv_admitted\s*=\s*admitted_kv\s*\?\s*ggml_sycl_device_kv_bytes_with_slack\(\s*\*admitted_kv\s*,\s*ctx->device\s*\)\s*:\s*0\s*;", txn) is not None
+    # r5 T6/T7/T8: the -ub a refusal names is computed from what THIS rung measured, with the rung's own n_ubatch, and
+    # the out-parameter is zeroed first so a refusal-free call (or a backend that is not SYCL) never reports a stale one.
+    results["the realized check computes the -ub from the rung's n_ubatch, its spill and the live free memory"] = \
+        re.search(r"largest_ub\s*=\s*ggml_sycl::zone_hold_spill_largest_ub\(\s*n_ubatch\s*,\s*spill_bytes\s*,\s*free_mem\s*,\s*"
+                  r"kSyclArenaMinExternalHeadroomBytes\s*\)", realized_fn) is not None
+    zero_at = re.search(r"if\s*\(\s*largest_ub\s*\)\s*\{\s*\*largest_ub\s*=\s*0\s*;\s*\}", entry_fn)
+    results["the exported entry zeroes the out-parameter first and passes the caller's n_ubatch to the realized check"] = \
+        zero_at is not None and zero_at.start() < entry_fn.find("return ggml_sycl_check_hold_spill_realized(") and \
+        re.search(r"return ggml_sycl_check_hold_spill_realized\(\s*ctx->device\s*,\s*ctx->planned_scratch_owner\s*,\s*true\s*,\s*"
+                  r"n_ubatch\s*,\s*largest_ub\s*\)", entry_fn) is not None
+    # r5 minor 1: the F3 message printed the same number twice and called the CURRENT free memory what the spill
+    # "would leave". It names the free memory after the worst-case spill and, separately, the free memory now.
+    results["the F3 refusal prints the free memory it would leave and the free memory now, each once"] = \
+        re.search(r"spill_bytes\s*/\s*mb\s*,\s*device\s*,\s*free_after\s*/\s*mb\s*,\s*free_mem\s*/\s*mb\s*,\s*"
+                  r"kSyclArenaMinExternalHeadroomBytes\s*/\s*mb\s*\)", hold_headroom_fn) is not None and \
+        "would leave device %d %.1f MB free (%.1f MB free now)" in join_literals(hold_headroom_fn)
+    # r5 F3/F4: the landing line names the zone the bytes physically are in. A swapped name sends a reader to the wrong
+    # allocator (KV printed as "runtime", a buffer outside the arena printed as "kv").
+    zone_names = {"KV": "kv", "WEIGHT": "weight", "ONEDNN": "onednn", "RUNTIME": "runtime", "SCRATCH": "scratch"}
+    results["the landing line names each zone as itself, a buffer outside the arena as raw, host memory as host-pinned"] = \
+        landing_fn != "" and 'const char * zone = "none";' in landing_fn and \
+        all(re.search(rf'case ggml_sycl::vram_zone_id::{k}:\s*zone = "{v}";\s*break;', landing_fn) is not None
+            for k, v in zone_names.items()) and \
+        re.search(r'default:\s*zone = "raw";\s*break;', landing_fn) is not None and \
+        re.search(r'if\s*\(\s*handle\.tier\s*==\s*ggml_sycl::alloc_tier::HOST_PINNED\s*\)\s*\{\s*zone = "host-pinned";', landing_fn) is not None
+    # r5 minor 7: a flagged buffer nothing in the arena placed is placed by the legacy path below, and ITS landing (raw
+    # device memory or host-pinned) is the one that matters; the first line must not say "none" and stop there.
+    alloc_ok_at = backend.find("alloc_succeeded:")
+    legacy_log_at = backend.find("ggml_sycl_log_compute_buffer_landing(buft_ctx->device, buft_ctx->name, size, main_alloc)", alloc_ok_at) \
+        if alloc_ok_at > 0 else -1
+    legacy_move_at = backend.find("set_managed_owner(std::move(main_alloc))", alloc_ok_at) if alloc_ok_at > 0 else -1
+    results["a flagged buffer the legacy path places gets its final landing line, from the handle that path made"] = \
+        0 < alloc_ok_at < legacy_log_at < legacy_move_at and \
+        re.search(r"if\s*\(\s*legacy_landing_pending\s*\)\s*\{\s*$", backend[:legacy_log_at].rstrip().rsplit("\n", 1)[-1] + "{") is not None and \
+        re.search(r"bool\s+legacy_landing_pending\s*=\s*false\s*;", backend[:backend.find('"backend-buffer-runtime-zone"')]) is not None and \
+        re.search(r"if\s*\(\s*kv_zone_first\s*\)\s*\{\s*if\s*\(\s*runtime_h\.ptr\s*\)\s*\{\s*ggml_sycl_log_compute_buffer_landing\(\s*"
+                  r"buft_ctx->device\s*,\s*buft_ctx->name\s*,\s*size\s*,\s*runtime_h\s*\)\s*;\s*\}\s*else\s*\{\s*legacy_landing_pending\s*=\s*true\s*;",
+                  backend[backend.find('"backend-buffer-runtime-zone"'):backend.find('"backend-buffer-runtime-zone"') + 2600]) is not None
     return results
 
 
-def evaluate_context(context, header):
+def evaluate_context(context, header, ctx_header=None):
+    ctx_header = ctx_header_src if ctx_header is None else ctx_header
     """r3 C1: WHERE the hold-spill fit check runs in the auto-ubatch trial. A rung's compute buffers exist only once
     sched_reserve() has returned, so the check belongs in try_candidate, after it, for every rung, every
     flash-attention mode and the cached rung -- not in the recheck inside the reserve."""
     results = {}
     try_fn = function_body(context, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{") or ""
+    select_fn = function_body(context, r"void llama_context::sycl_select_auto_ubatch\([^)]*\)\s*\{") or ""
+    results["anchor: sycl_select_auto_ubatch exists"] = select_fn != ""
     results["anchor: try_candidate exists"] = try_fn != ""
     reserve_at = try_fn.find("sched_reserve();")
     hook_at = try_fn.find("hold_spill_fn(")
@@ -852,10 +917,60 @@ def evaluate_context(context, header):
     results["a refusal there is a context-init refusal naming the largest -ub that fits"] = \
         call_at > 0 and "largest -ub that fits is about" in context[call_at:call_at + 1600] and \
         "throw std::runtime_error(" in context[call_at:call_at + 1600]
+
+    # r5 I-A: the context-init refusal is the only thing standing between a pinned -ub and the first graph's hang, and
+    # a position check cannot see it neutered. Pin the helper (any refusing backend refuses; the -ub named is the
+    # smallest the refusers name; the rung's own n_ubatch goes down), the call (taken for any SYCL backend, with
+    # cparams.n_ubatch), and the throw (INSIDE the refusing branch, not borrowed from the unrelated quantized-V throw
+    # a character window further on).
+    helper = function_body(context, r"static bool llama_context_sycl_hold_spill_fits\([^)]*\)\s*\{") or ""
+    results["anchor: the hold-spill helper exists"] = helper != ""
+    refuse_m = re.search(r"if\s*\(\s*!hold_spill_fn\(\s*backend\.get\(\)\s*,\s*n_ubatch\s*,\s*&backend_largest\s*\)\s*\)\s*\{", helper)
+    refuse_block = balanced_block(helper, refuse_m.end() - 1) if refuse_m else ""
+    merge_m = re.search(r"\*largest_ub\s*=\s*fits\s*\?\s*backend_largest\s*:\s*std::min\(\s*\*largest_ub\s*,\s*backend_largest\s*\)\s*;", refuse_block or "")
+    fits_false_m = re.search(r"\bfits\s*=\s*false\s*;", refuse_block or "")
+    results["the helper refuses when ANY backend's check refuses, and passes the rung's own n_ubatch down"] = \
+        refuse_m is not None and fits_false_m is not None and re.search(r"bool\s+fits\s*=\s*true\s*;", helper) is not None and \
+        re.search(r"return\s+fits\s*;\s*\}\s*$", helper) is not None
+    results["the helper keeps the smallest -ub the refusing backends name (the first refuser's, then the minimum)"] = \
+        merge_m is not None and fits_false_m is not None and merge_m.start() < fits_false_m.start()
+    results["the helper skips a backend that is not SYCL and zeroes the out-parameter first"] = \
+        re.search(r"if\s*\(\s*!llama_context_dev_is_sycl\(dev\)\s*\)\s*\{\s*continue\s*;", helper) is not None and \
+        re.search(r"^\{\s*if\s*\(\s*largest_ub\s*\)\s*\{\s*\*largest_ub\s*=\s*0\s*;\s*\}", helper) is not None
+    ctor_m = re.compile(r"if\s*\(\s*llama_context_has_sycl_backend\(backends\)\s*&&\s*sycl_hold_spill_validated_ub\s*!=\s*"
+                        r"cparams\.n_ubatch\s*\)\s*\{").search(context, max(trial_at, 0))
+    ctor_block = balanced_block(context, ctor_m.end() - 1) if ctor_m else ""
+    inner_m = re.search(r"if\s*\(\s*!llama_context_sycl_hold_spill_fits\(\s*backends\s*,\s*cparams\.n_ubatch\s*,\s*&largest_ub\s*\)\s*\)\s*\{",
+                        ctor_block or "")
+    inner_block = balanced_block(ctor_block, inner_m.end() - 1) if inner_m else ""
+    results["the context-init check runs for any SYCL backend unless the trial already validated this -ub"] = \
+        ctor_m is not None and else_reserve_at < ctor_m.start() < guard_at and ctor_block != "" and \
+        "quantized V cache" not in ctor_block
+    results["the context-init check asks with cparams.n_ubatch and its refusal is a throw inside the refusing branch"] = \
+        inner_m is not None and "throw std::runtime_error(" in inner_block and \
+        "largest -ub that fits is about" in inner_block and "LLAMA_LOG" not in inner_block
+
+    # r5 minor 4: the ctor check re-reads live free memory after the ladder's own per-rung check passed, and the two
+    # readings can disagree at the margin and refuse a winner the ladder just validated. The trial records the -ub it
+    # validated for the sched that is final; anything else (a pinned -ub, an early exit, a settle that re-reserved,
+    # a missing hook) leaves 0 and the ctor check runs.
+    results["the context records the -ub its trial validated, for the sched that is final, and nothing else"] = \
+        re.search(r"uint32_t\s+sycl_hold_spill_validated_ub\s*=\s*0\s*;", ctx_header) is not None and \
+        re.search(r"^\{\s*sycl_hold_spill_validated_ub\s*=\s*0\s*;", select_fn) is not None and \
+        re.search(r"sycl_hold_spill_validated_ub\s*=\s*\(\s*sched_matches_last_good\s*&&\s*cparams\.n_ubatch\s*==\s*last_good\s*\)\s*\?\s*"
+                  r"hold_spill_validated_ub\s*:\s*0\s*;", select_fn) is not None and \
+        select_fn.find("sycl_hold_spill_validated_ub = (") < select_fn.find("if (!sched_matches_last_good || cparams.n_ubatch != last_good)") and \
+        re.search(r"hold_spill_validated_ub\s*=\s*hold_spill_fn\s*\?\s*c\s*:\s*0\s*;\s*return nullptr;", try_fn) is not None and \
+        re.search(r"sched_matches_last_good\s*=\s*false\s*;\s*hold_spill_validated_ub\s*=\s*0\s*;", try_fn[:probe_at]) is not None
+
+    # r5 R7/R8: releasing the previous rung's buffers means the cached graph results too, not only the sched.
+    results["the release drops every cached graph result and the active pointer, not only the sched"] = \
+        re.search(r"for\s*\(\s*auto\s*&\s*res\s*:\s*gf_res_prev\s*\)\s*\{\s*res\.reset\(\)\s*;\s*\}", try_fn[:probe_at]) is not None and \
+        re.search(r"gf_res_prev_active\s*=\s*nullptr\s*;", try_fn[:probe_at]) is not None
     return results
 
 
-def evaluate_raw(backend_raw, zone_hpp_raw, cmake_text, gpu_test_text):
+def evaluate_raw(backend_raw, zone_hpp_raw, cmake_text, gpu_test_text, cache_raw="", context_raw=""):
     """Claims that live in comments, strings the stripper keeps out, and the build registration."""
     results = {}
     flat = re.sub(r"\s*\n\s*//\s*", " ", backend_raw)
@@ -874,6 +989,32 @@ def evaluate_raw(backend_raw, zone_hpp_raw, cmake_text, gpu_test_text):
     results["the GPU test asserts the landing zone, the zone-used delta and the return to the baseline"] = \
         "handle.vram_zone == vram_zone_id::KV" in gpu_test_text and "zone_used(vram_zone_id::KV) >= kv_before + big" in gpu_test_text and \
         "zone_used(vram_zone_id::KV) == kv_before" in gpu_test_text and "kv_first=*/false" in gpu_test_text
+    # r5 minor 10: a free the allocator refused would leave every zone number below comparing against a leak, and the
+    # unflagged held-back control is the raw spill the flag exists to avoid: it must be counted and warned about.
+    results["the GPU test checks every unified_free, and asserts the raw spill and its WARN on the unflagged control"] = \
+        len(re.findall(r"check\(unified_free\(handle\)", gpu_test_text)) >= 4 and \
+        not re.search(r"^\s*unified_free\(handle\);", gpu_test_text, re.M) and \
+        "totals.raw_count == 1 && totals.raw_bytes >= small" in gpu_test_text and "g_warn_raw == 1" in gpu_test_text and \
+        "g_warn_arena == 1" in gpu_test_text and "g_warn_zone_full == 1" in gpu_test_text and \
+        "ggml_log_set(count_warnings" in gpu_test_text
+    # Comments the stripped sources cannot see. Each was a statement a reader acted on or a claim the code does not make.
+    cflat = re.sub(r"\s*\n\s*//\s*", " ", cache_raw)
+    results["the release comment says the teardown take ran BEFORE it (it does: log_planned_scratch_stats, then the release)"] = \
+        "(after this release)" not in cflat and "BEFORE this release" in cflat
+    bflat = re.sub(r"\s*\n\s*//\s*", " ", backend_raw)
+    kv_at = bflat.find("const bool kv_zone_first")
+    results["the m4 flag's comment says it is a process-global timing discriminator, not an identity one"] = \
+        kv_at > 0 and "process-global" in bflat[max(0, kv_at - 1800):kv_at] and "LoRA" in bflat[max(0, kv_at - 1800):kv_at] and \
+        "control vector" in bflat[max(0, kv_at - 1800):kv_at]
+    entry_at = bflat.find("bool ggml_backend_sycl_planned_hold_spill_fits(")
+    results["the exported entry's comment states the arity change and what an old DSO does"] = \
+        entry_at > 0 and "arity" in bflat[max(0, entry_at - 2200):entry_at] and "largest_ub stays 0" in bflat[max(0, entry_at - 2200):entry_at] and \
+        "no version gate" in bflat[max(0, entry_at - 2200):entry_at]
+    xflat = re.sub(r"\s*\n\s*//\s*", " ", context_raw)
+    ctor_at = xflat.find("if (llama_context_has_sycl_backend(backends) && sycl_hold_spill_validated_ub")
+    results["the context-init check's comment names the gap: a later lazy re-reserve is not covered"] = \
+        ctor_at > 0 and "lazy" in xflat[max(0, ctor_at - 2400):ctor_at] and "not covered" in xflat[max(0, ctor_at - 2400):ctor_at] and \
+        "sched_need_reserve" in xflat[max(0, ctor_at - 2400):ctor_at]
     return results
 
 
@@ -908,10 +1049,12 @@ backend, common, cache, zone = (read(args.backend), read(args.common), read(args
                                 read(args.zone) + "\n" + (read(zone_impl) if Path(zone_impl).exists() else ""))
 context_src = read(args.context)
 header_src = read(args.header)
+ctx_header_src = read(args.context_header)
 failed = run("tree", (backend, common, cache, zone))
 failed += run_context("tree", (context_src, header_src))
 raw_inputs = (Path(args.backend).read_text(), Path(args.zone).read_text(), Path(args.cmake).read_text(),
-              Path(args.gpu_test).read_text() if Path(args.gpu_test).exists() else "")
+              Path(args.gpu_test).read_text() if Path(args.gpu_test).exists() else "", Path(args.cache).read_text(),
+              Path(args.context).read_text())
 for k, v in sorted(evaluate_raw(*raw_inputs).items()):
     print(("PASS: " if v else "FAIL: ") + k)
     if not v:
@@ -1436,6 +1579,46 @@ if args.self_test:
           common, cache, zone)),
         ("F3 text not net of KV", "the F3 refusal says its figure is net of the KV-zone room",
          (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_headroom\(", "net of the KV", "net of the XX"), common, cache, zone)),
+        # review r5: each of these survived every gate and every unit test.
+        ("kv_admitted forced to 0 (T1)", "the transaction nets out the KV already admitted, so a rung above the first is not over-refused",
+         (mutate_re_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
+                            r"kv_admitted\s*=\s*admitted_kv\s*\?[^;]*;", "kv_admitted = 0;"), common, cache, zone)),
+        ("admitted_kv always the live plan (T1b)", "the transaction nets out the KV already admitted, so a rung above the first is not over-refused",
+         (mutate_re_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
+                            r"admitted_kv\s*=\s*ctx->runtime_kv_admitted\s*\?\s*current->plan\.get\(\)\s*:\s*nullptr",
+                            "admitted_kv = current->plan.get()"), common, cache, zone)),
+        ("-ub args swapped (T6)", "the realized check computes the -ub from the rung's n_ubatch, its spill and the live free memory",
+         (mutate_re_in_func(backend, r"static bool ggml_sycl_check_hold_spill_realized\(",
+                            r"zone_hold_spill_largest_ub\(\s*n_ubatch\s*,\s*spill_bytes\s*,\s*free_mem",
+                            "zone_hold_spill_largest_ub(n_ubatch, free_mem, spill_bytes"), common, cache, zone)),
+        ("entry drops the caller's n_ubatch (T7)", "the exported entry zeroes the out-parameter first and passes the caller's n_ubatch to the realized check",
+         (mutate_re_in_func(backend, r"bool ggml_backend_sycl_planned_hold_spill_fits\(",
+                            r"planned_scratch_owner\s*,\s*true\s*,\s*n_ubatch", "planned_scratch_owner, true, 0"), common, cache, zone)),
+        ("entry leaves the out-parameter unset (T8)", "the exported entry zeroes the out-parameter first and passes the caller's n_ubatch to the realized check",
+         (mutate_re_in_func(backend, r"bool ggml_backend_sycl_planned_hold_spill_fits\(",
+                            r"if\s*\(\s*largest_ub\s*\)\s*\{\s*\*largest_ub\s*=\s*0\s*;\s*\}", ""), common, cache, zone)),
+        ("F3 prints free_mem twice", "the F3 refusal prints the free memory it would leave and the free memory now, each once",
+         (mutate_re_in_func(backend, r"static bool ggml_sycl_check_hold_spill_headroom\(",
+                            r"free_after\s*/\s*mb\s*,\s*free_mem\s*/\s*mb", "free_mem / mb, free_mem / mb"), common, cache, zone)),
+        ("F3 calls the current free what it would leave", "the F3 refusal prints the free memory it would leave and the free memory now, each once",
+         (mutate_in_func(backend, r"static bool ggml_sycl_check_hold_spill_headroom\(", "MB free (%.1f MB free now)", "MB free of %.1f MB"), common, cache, zone)),
+        ("landing: KV named runtime (F3)", "the landing line names each zone as itself, a buffer outside the arena as raw, host memory as host-pinned",
+         (mutate_in_func(backend, r"static void ggml_sycl_log_compute_buffer_landing\(", 'zone = "kv";', 'zone = "runtime";'), common, cache, zone)),
+        ("landing: outside the arena named kv (F4)", "the landing line names each zone as itself, a buffer outside the arena as raw, host memory as host-pinned",
+         (mutate_in_func(backend, r"static void ggml_sycl_log_compute_buffer_landing\(", 'zone = "raw";', 'zone = "kv";'), common, cache, zone)),
+        ("landing: host memory named raw", "the landing line names each zone as itself, a buffer outside the arena as raw, host memory as host-pinned",
+         (mutate_in_func(backend, r"static void ggml_sycl_log_compute_buffer_landing\(", 'zone = "host-pinned";', 'zone = "raw";'), common, cache, zone)),
+        ("landing: nothing placed named raw", "the landing line names each zone as itself, a buffer outside the arena as raw, host memory as host-pinned",
+         (mutate_in_func(backend, r"static void ggml_sycl_log_compute_buffer_landing\(", 'const char * zone = "none";', 'const char * zone = "raw";'), common, cache, zone)),
+        ("legacy placement not logged", "a flagged buffer the legacy path places gets its final landing line, from the handle that path made",
+         (mutate(backend, "ggml_sycl_log_compute_buffer_landing(buft_ctx->device, buft_ctx->name, size, main_alloc)",
+                 "ggml_sycl_XXXX(buft_ctx->device, buft_ctx->name, size, main_alloc)"), common, cache, zone)),
+        ("legacy placement never pending", "a flagged buffer the legacy path places gets its final landing line, from the handle that path made",
+         (mutate_re_in_func(backend, r"static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer\(",
+                            r"legacy_landing_pending\s*=\s*true\s*;", "(void) 0;"), common, cache, zone)),
+        ("legacy landing logged for every buffer", "a flagged buffer the legacy path places gets its final landing line, from the handle that path made",
+         (mutate_re_in_func(backend, r"static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer\(",
+                            r"if\s*\(\s*legacy_landing_pending\s*\)\s*\{", "if (true) {"), common, cache, zone)),
     ]
     for label, expect, sources in mutants:
         failed += run(label, sources, expect)
@@ -1459,6 +1642,51 @@ if args.self_test:
          (context_src.replace("largest -ub that fits is about", "largest -ub XXXX", 1), header_src)),
         ("hook asked without the rung", "the trial asks the entry with the rung's n_ubatch",
          (re.sub(r"hold_spill_fn\(\s*sb\.backend\s*,\s*c\s*,", "hold_spill_fn(sb.backend, 0,", context_src, count=1), header_src)),
+        # review r5 I-A / R7 / R8 / minor 4: every one survived all gates.
+        ("ctor passes n_ubatch 0 (R1)", "the context-init check asks with cparams.n_ubatch and its refusal is a throw inside the refusing branch",
+         (re.sub(r"llama_context_sycl_hold_spill_fits\(\s*backends\s*,\s*cparams\.n_ubatch\s*,\s*&largest_ub\s*\)",
+                 "llama_context_sycl_hold_spill_fits(backends, 0, &largest_ub)", context_src, count=1), header_src)),
+        ("merge is last-wins (R2)", "the helper keeps the smallest -ub the refusing backends name (the first refuser's, then the minimum)",
+         (re.sub(r"std::min\(\s*\*largest_ub\s*,\s*backend_largest\s*\)", "backend_largest", context_src, count=1), header_src)),
+        ("merge is max (R2b)", "the helper keeps the smallest -ub the refusing backends name (the first refuser's, then the minimum)",
+         (re.sub(r"std::min\(\s*\*largest_ub\s*,\s*backend_largest\s*\)", "std::max(*largest_ub, backend_largest)", context_src, count=1), header_src)),
+        ("helper never refuses (R3)", "the helper refuses when ANY backend's check refuses, and passes the rung's own n_ubatch down",
+         (mutate_re_in_func(context_src, r"static bool llama_context_sycl_hold_spill_fits\(", r"\bfits\s*=\s*false\s*;", "(void) 0;"), header_src)),
+        ("helper hands the backend 0 (R3b)", "the helper refuses when ANY backend's check refuses, and passes the rung's own n_ubatch down",
+         (mutate_re_in_func(context_src, r"static bool llama_context_sycl_hold_spill_fits\(", r"hold_spill_fn\(\s*backend\.get\(\)\s*,\s*n_ubatch",
+                            "hold_spill_fn(backend.get(), 0"), header_src)),
+        ("helper does not zero the out-parameter", "the helper skips a backend that is not SYCL and zeroes the out-parameter first",
+         (mutate_re_in_func(context_src, r"static bool llama_context_sycl_hold_spill_fits\(", r"\*largest_ub\s*=\s*0\s*;", "(void) 0;"), header_src)),
+        ("ctor throw becomes a log (R4)", "the context-init check asks with cparams.n_ubatch and its refusal is a throw inside the refusing branch",
+         (re.sub(r"throw std::runtime_error\(format\(\s*\"compute buffers held out", "LLAMA_LOG_ERROR(\"%s\", format(\"compute buffers held out",
+                 context_src, count=1), header_src)),
+        ("ctor check only for the pinned path (R6)", "the context-init check runs for any SYCL backend unless the trial already validated this -ub",
+         (re.sub(r"llama_context_has_sycl_backend\(backends\)\s*&&\s*sycl_hold_spill_validated_ub\s*!=\s*cparams\.n_ubatch",
+                 "llama_context_has_sycl_backend(backends) && !sycl_auto_ubatch_trial", context_src, count=1), header_src)),
+        ("ctor check never skipped (minor 4)", "the context-init check runs for any SYCL backend unless the trial already validated this -ub",
+         (re.sub(r"llama_context_has_sycl_backend\(backends\)\s*&&\s*sycl_hold_spill_validated_ub\s*!=\s*cparams\.n_ubatch",
+                 "llama_context_has_sycl_backend(backends)", context_src, count=1), header_src)),
+        ("ctor check skips on any recorded -ub", "the context-init check runs for any SYCL backend unless the trial already validated this -ub",
+         (re.sub(r"sycl_hold_spill_validated_ub\s*!=\s*cparams\.n_ubatch", "sycl_hold_spill_validated_ub == 0", context_src, count=1), header_src)),
+        ("trial never records the validated -ub", "the context records the -ub its trial validated, for the sched that is final, and nothing else",
+         (mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{",
+                            r"hold_spill_validated_ub\s*=\s*hold_spill_fn\s*\?\s*c\s*:\s*0\s*;", "hold_spill_validated_ub = 0;"), header_src)),
+        ("trial keeps a stale validated -ub across rungs", "the context records the -ub its trial validated, for the sched that is final, and nothing else",
+         (mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{",
+                            r"sched_matches_last_good\s*=\s*false\s*;\s*hold_spill_validated_ub\s*=\s*0\s*;", "sched_matches_last_good = false;"), header_src)),
+        ("settle publishes the validated -ub unconditionally", "the context records the -ub its trial validated, for the sched that is final, and nothing else",
+         (re.sub(r"\(\s*sched_matches_last_good\s*&&\s*cparams\.n_ubatch\s*==\s*last_good\s*\)\s*\?\s*hold_spill_validated_ub\s*:\s*0",
+                 "hold_spill_validated_ub", context_src, count=1), header_src)),
+        ("validated -ub not reset at the start", "the context records the -ub its trial validated, for the sched that is final, and nothing else",
+         (mutate_re_in_func(context_src, r"void llama_context::sycl_select_auto_ubatch\(", r"sycl_hold_spill_validated_ub\s*=\s*0\s*;", "(void) 0;"), header_src)),
+        ("header lacks the validated member", "the context records the -ub its trial validated, for the sched that is final, and nothing else",
+         (context_src, header_src, ctx_header_src.replace("sycl_hold_spill_validated_ub", "sycl_hold_spill_XXXX"))),
+        ("previous rung's graph results kept (R7)", "the release drops every cached graph result and the active pointer, not only the sched",
+         (mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{",
+                            r"for\s*\(\s*auto\s*&\s*res\s*:\s*gf_res_prev\s*\)\s*\{\s*res\.reset\(\)\s*;\s*\}", ""), header_src)),
+        ("active graph result pointer kept (R8)", "the release drops every cached graph result and the active pointer, not only the sched",
+         (mutate_re_in_func(context_src, r"auto try_candidate = \[&\]\(uint32_t c\) -> const char \* \{",
+                            r"gf_res_prev_active\s*=\s*nullptr\s*;", "(void) 0;"), header_src)),
     ]
     for label, expect, sources in ctx_mutants:
         failed += run_context(label, sources, expect)
@@ -1470,6 +1698,31 @@ if args.self_test:
          (raw_inputs[0], raw_inputs[1], raw_inputs[2], raw_inputs[3].replace("zone_used(vram_zone_id::KV) == kv_before", "true"))),
         ("estimate comment reverted", "the spill bound's comment says the KV-room netting is an estimate",
          (raw_inputs[0].replace("ESTIMATE", "figure"), raw_inputs[1], raw_inputs[2], raw_inputs[3])),
+    ]
+    def raw_with(index, old, new):
+        out = list(raw_inputs)
+        if old not in out[index]:
+            print(f"FAIL: self-test anchor missing: raw[{index}] {old!r}")
+            failed.append("self-test anchor " + old)
+            return tuple(out)
+        out[index] = out[index].replace(old, new, 1)
+        return tuple(out)
+
+    raw_mutants += [
+        ("GPU test ignores unified_free", "the GPU test checks every unified_free, and asserts the raw spill and its WARN on the unflagged control",
+         raw_with(3, 'check(unified_free(handle), "unified_free accepted the handle");', "unified_free(handle);")),
+        ("GPU test asserts no raw spill", "the GPU test checks every unified_free, and asserts the raw spill and its WARN on the unflagged control",
+         raw_with(3, "totals.raw_count == 1 && totals.raw_bytes >= small", "true")),
+        ("GPU test asserts no raw WARN", "the GPU test checks every unified_free, and asserts the raw spill and its WARN on the unflagged control",
+         raw_with(3, "g_warn_raw == 1, ", "true, ")),
+        ("release comment says after", "the release comment says the teardown take ran BEFORE it (it does: log_planned_scratch_stats, then the release)",
+         raw_with(4, "BEFORE this release", "after this release")),
+        ("m4 comment lost", "the m4 flag's comment says it is a process-global timing discriminator, not an identity one",
+         raw_with(0, "process-global", "per-buffer")),
+        ("entry arity comment lost", "the exported entry's comment states the arity change and what an old DSO does",
+         raw_with(0, "largest_ub stays 0", "nothing happens")),
+        ("lazy re-reserve gap unnamed", "the context-init check's comment names the gap: a later lazy re-reserve is not covered",
+         raw_with(5, "not covered", "covered")),
     ]
     for label, expect, inputs in raw_mutants:
         results_raw = evaluate_raw(*inputs)
