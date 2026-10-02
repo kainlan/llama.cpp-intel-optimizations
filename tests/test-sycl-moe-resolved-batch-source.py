@@ -113,8 +113,11 @@ def post_mark_vector_violations(post_mark: str, allowed: tuple[str, ...]) -> lis
         found.append("a vector outside the try body")
     if "mem_copy_ptr_async(" not in try_body or "mem_copy_ptr_async(" in outside_try:
         found.append("mem_copy_ptr_async not confined to the try body")
-    if "} catch (...) {" not in outside_try:
-        found.append("no catch(...) handler after the try body")
+    # The handler must be THE one of this try: the text right after the try body's closing brace begins with
+    # `catch (...)`. A catch(...) somewhere later in the function does not make the allowance sound.
+    after_try = post_mark[post_mark.index(try_body) + len(try_body):]
+    if not re.match(r"\s*catch\s*\(\.\.\.\)\s*\{", after_try):
+        found.append("the try body is not followed by catch(...)")
     return found
 
 
@@ -583,7 +586,8 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
     hoisted = post_mark[:try_at] + "const auto hoisted_deps = " + first_spelling + ";\n" + post_mark[try_at:]
     in_handler_at = post_mark.index("} catch (...) {") + len("} catch (...) {")
     in_handler = post_mark[:in_handler_at] + "\nconst auto h = " + first_spelling + ";\n" + post_mark[in_handler_at:]
-    for mutant in (hoisted, in_handler):
+    narrowed_catch = post_mark.replace("} catch (...) {", "} catch (const std::exception &) {", 1)
+    for mutant in (hoisted, in_handler, narrowed_catch):
         assert mutant != post_mark
         assert post_mark_vector_violations(mutant, allowed_dependency_vectors), "span rule missed a mutant"
 
