@@ -41,7 +41,14 @@ def strip_comments(src: str) -> str:
 
 
 def norm(text: str) -> str:
-    return re.sub(r"\s+", " ", strip_comments(text))
+    """Comment-stripped, whitespace-canonical text: runs collapse to one space, and a re-wrap at a bracket or comma
+    (`f(\\n a, b)`, `f(a ,b )`) reads the same as `f(a, b)`, so a clang-format run cannot turn a claim red."""
+    t = re.sub(r"\s+", " ", strip_comments(text))
+    t = re.sub(r"\( ", "(", t)
+    t = re.sub(r" \)", ")", t)
+    t = re.sub(r" ,", ",", t)
+    t = re.sub(r",(?! )", ", ", t)
+    return t
 
 
 def read(rel: str) -> str:
@@ -287,7 +294,7 @@ def claim_dl_refresh_lookup_names_the_exported_entry(ctx: str, sycl_cpp: str, sy
     lookup returns null and the backend is skipped), so the string must be the one the backend registers and declares."""
     c = norm(ctx)
     m = re.search(
-        r"llama_context_sycl_hold_epoch_refresh_proc\( ?ggml_backend_dev_t dev\) \{ return reinterpret_cast<decltype\(&ggml_backend_sycl_planned_hold_epoch_refresh\)>\( "
+        r"llama_context_sycl_hold_epoch_refresh_proc\(ggml_backend_dev_t dev\) \{ return reinterpret_cast<decltype\(&ggml_backend_sycl_planned_hold_epoch_refresh\)>\("
         r'llama_context_sycl_proc_addr\(dev, "([A-Za-z0-9_]+)"\)\); \}',
         c,
     )
@@ -303,18 +310,19 @@ def claim_dl_refresh_lookup_names_the_exported_entry(ctx: str, sycl_cpp: str, sy
     )
 
 
-def claim_record_cap_is_a_compile_time_relation_and_one_filter_remains(sycl_cpp: str, cache_cpp: str, cache_h: str) -> bool:
-    """The fit's rung buffer is static_assert-ed against the cache's record cap (a header constant), and the raw-row
-    filter exists once: the dead live-bytes duplicate is gone."""
+def claim_record_cap_is_one_constant_and_one_raw_filter_remains(sycl_cpp: str, cache_cpp: str, cache_h: str) -> bool:
+    """The fit's rung buffer takes its size from the cache's record cap (one header constant, no second literal), and
+    the raw-row filter exists once: the dead live-bytes duplicate is gone."""
     s = norm(sycl_cpp)
     return (
-        "static_assert(ggml_sycl::kHoldRungRecordLimit <= kMaxRungs" in s
+        "constexpr size_t kMaxRungs = ggml_sycl::kHoldRungRecordLimit;" in s
+        and "zone_hold_rung_request rungs[kMaxRungs];" in s
+        and "kMaxRungs = 32" not in s
         and "GGML_ASSERT(ggml_sycl::unified_cache_hold_rung_record_limit" not in s
         and "constexpr size_t kHoldRungRecordLimit = 32;" in norm(cache_h)
         and "unified_cache_raw_device_live_bytes" not in cache_cpp
         and "unified_cache_raw_device_live_bytes" not in cache_h
     )
-
 
 def claim_no_bare_scheduler_allocation_elsewhere() -> bool:
     """Every other source that includes the ggml-backend scheduler API: no bare alloc/reserve outside the two helpers
@@ -381,8 +389,8 @@ def test_the_non_fa_check_counts_the_hold_term():
     assert claim_non_fa_check_counts_the_hold_term(SYCL_CPP)
 
 
-def test_the_record_cap_is_a_compile_time_relation_and_one_raw_filter_remains():
-    assert claim_record_cap_is_a_compile_time_relation_and_one_filter_remains(SYCL_CPP, CACHE_CPP, CACHE_H)
+def test_the_record_cap_is_one_constant_and_one_raw_filter_remains():
+    assert claim_record_cap_is_one_constant_and_one_raw_filter_remains(SYCL_CPP, CACHE_CPP, CACHE_H)
 
 
 def test_the_dl_refresh_lookup_names_the_exported_entry():
@@ -661,15 +669,57 @@ def test_mutant_dl_refresh_registration_typo_fails_the_claim():
     assert not claim_dl_refresh_lookup_names_the_exported_entry(CTX, mutated, SYCL_H)
 
 
-def test_mutant_runtime_assert_on_the_record_cap_fails_the_claim():
-    mutated = _once(
-        SYCL_CPP,
-        "static_assert(ggml_sycl::kHoldRungRecordLimit <= kMaxRungs",
-        "GGML_ASSERT(ggml_sycl::unified_cache_hold_rung_record_limit() <= kMaxRungs); static_assert(true",
-    )
-    assert not claim_record_cap_is_a_compile_time_relation_and_one_filter_remains(mutated, CACHE_CPP, CACHE_H)
+def test_mutant_second_literal_for_the_record_cap_fails_the_claim():
+    mutated = _once(SYCL_CPP, "kMaxRungs = ggml_sycl::kHoldRungRecordLimit;", "kMaxRungs = 32;")
+    assert not claim_record_cap_is_one_constant_and_one_raw_filter_remains(mutated, CACHE_CPP, CACHE_H)
 
+
+def test_mutant_header_cap_constant_gone_fails_the_claim():
+    mutated = _once(CACHE_H, "constexpr size_t kHoldRungRecordLimit = 32;", "constexpr size_t kHoldRungRecordLimitX = 32;")
+    assert not claim_record_cap_is_one_constant_and_one_raw_filter_remains(SYCL_CPP, CACHE_CPP, mutated)
 
 def test_mutant_second_raw_filter_returns_fails_the_claim():
     mutated = CACHE_CPP + "\nsize_t unified_cache_raw_device_live_bytes(int device_id) { return 0; }\n"
-    assert not claim_record_cap_is_a_compile_time_relation_and_one_filter_remains(SYCL_CPP, mutated, CACHE_H)
+    assert not claim_record_cap_is_one_constant_and_one_raw_filter_remains(SYCL_CPP, mutated, CACHE_H)
+
+
+def _rewrap(raw: str, old: str, new: str) -> str:
+    """Re-wrap `old` the way clang-format might (a break after every opening bracket and comma), without changing its
+    meaning, so a claim over the result must still hold."""
+    return _once(raw, old, new)
+
+
+def test_a_rewrapped_dl_lookup_still_satisfies_its_claim():
+    rewrapped = _rewrap(
+        CTX,
+        'llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_planned_hold_epoch_refresh")',
+        'llama_context_sycl_proc_addr(\n            dev,\n            "ggml_backend_sycl_planned_hold_epoch_refresh" )',
+    )
+    assert claim_dl_refresh_lookup_names_the_exported_entry(rewrapped, SYCL_CPP, SYCL_H)
+
+
+def test_a_rewrapped_kv_room_call_still_satisfies_its_claim():
+    rewrapped = _rewrap(
+        SYCL_CPP,
+        "ggml_sycl::zone_hold_pick_kv_room(q.rung_live, have_epoch, epoch_kv_room,",
+        "ggml_sycl::zone_hold_pick_kv_room(\n        q.rung_live ,have_epoch,\n        epoch_kv_room,",
+    )
+    assert claim_fit_picks_the_kv_room_at_the_call_site(rewrapped)
+
+
+def test_a_rewrapped_non_fa_demand_still_satisfies_its_claim():
+    rewrapped = _rewrap(
+        SYCL_CPP,
+        "ggml_sycl::zone_hold_nonfa_demand(nonfa_scratch_demand, hold_spill_bytes);",
+        "ggml_sycl::zone_hold_nonfa_demand(\n        nonfa_scratch_demand,\n        hold_spill_bytes );",
+    )
+    assert claim_non_fa_check_counts_the_hold_term(rewrapped)
+
+
+def test_a_rewrapped_credit_filter_still_satisfies_its_claim():
+    rewrapped = _rewrap(
+        CACHE_CPP,
+        "if (row.scheduler_compute && row.state == runtime_alloc_state::LIVE) {",
+        "if (\n                row.scheduler_compute && row.state == runtime_alloc_state::LIVE ) {",
+    )
+    assert claim_raw_rows_are_credited_by_origin(rewrapped)
