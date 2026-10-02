@@ -19,7 +19,7 @@
 # Arms:
 #   multi-ubatch-N   `-c 512 --chunks 4 --seed 42 -ub 512` at the DEFAULT -b, run --runs times (default 3).
 #                    PASS needs every run to print the same four chunk values.
-#   oracle           `-b 512 -ub 512`, once. PASS needs the recorded --oracle values (B50 default).
+#   oracle           `-b 512 -ub 512`, once. PASS needs the recorded --oracle values (per-device default).
 #
 # Exit status: 0 pass, 1 fail, 77 skipped (a precondition is missing, which proves nothing).
 #
@@ -35,11 +35,19 @@ MODEL="/models/Qwen3.6-27B-UD-Q4_K_XL.gguf"
 CORPUS="${QWEN35_GATE_CORPUS:-}"
 DEVICE="1"
 RUNS=3
-# B50 -b 512 -ub 512 values after the rb2h fusion alias gate, repeated twice. The pin was 7.4998 5.6263 5.5707
-# 4.9539 until the gate declined the fused ADD+RMS_NORM chains whose output overlapped an input, which changed
-# those layers' RMS_NORM reduction order. Fused-everywhere and unfused-everywhere differ by more than that move
-# (unfused-everywhere gives 7.4691 5.6202 5.5617 4.9452), so the pin is a regression tripwire, not a reference.
-ORACLE="7.4953 5.6207 5.5623 4.9452"
+# Recorded -b 512 -ub 512 values per device, picked by --device unless --oracle is given.
+#
+# B50 (level_zero:1), after the rb2h fusion alias gate, repeated twice. The pin was 7.4998 5.6263 5.5707 4.9539
+# until the gate declined the fused ADD+RMS_NORM chains whose output partially overlapped an input
+# (attn_residual-47, l_out-47), which changed those layers' RMS_NORM reduction order: the old value came from
+# that overlapping layout running the racy fused kernel. Fused-everywhere and unfused-everywhere differ by more
+# than that move (unfused-everywhere gives 7.4691 5.6202 5.5617 4.9452, and the CPU run of the same shape gives
+# 7.4970 5.6205 5.5956 4.9595), so the pin is a regression tripwire, not a reference.
+ORACLE_B50="7.4953 5.6207 5.5623 4.9452"
+# B70 (level_zero:0): unchanged by the gate. That run declines nothing (no overlapping chain in its layout), and
+# it is bit-identical to the run before the gate existed.
+ORACLE_B70="7.4816 5.6277 5.5713 4.9400"
+ORACLE=""
 LOCK_DIR="${LLAMA_GPU_LOCK:-/Apps/llama.cpp/GPU.lock}"
 TAKE_LOCK=1
 OUT_DIR=""
@@ -59,7 +67,8 @@ Options:
   --device N        ONEAPI_DEVICE_SELECTOR=level_zero:N (default 1, the B50)
   --runs N          multi-ubatch repeats (default 3, minimum 2)
   --oracle "a b c d"  expected -b 512 -ub 512 chunk values, or "none" to only require four values
-                    (default is the B50 oracle 7.4953 5.6207 5.5623 4.9452)
+                    (default by --device: 1 = B50 7.4953 5.6207 5.5623 4.9452,
+                     0 = B70 7.4816 5.6277 5.5713 4.9400; any other device needs --oracle)
   --out-dir DIR     where run logs go (default: a fresh directory under $TMPDIR)
   --no-lock         the caller already holds the GPU lock
   --score-logs LOG... score existing logs for determinism and exit
@@ -100,6 +109,14 @@ while [ $# -gt 0 ]; do
         *) die "unknown option: $1" ;;
     esac
 done
+
+if [ -z "$ORACLE" ]; then
+    case "$DEVICE" in
+        0) ORACLE="$ORACLE_B70" ;;
+        1) ORACLE="$ORACLE_B50" ;;
+        *) die "no recorded -b 512 oracle for device $DEVICE: pass --oracle \"a b c d\" or --oracle none" ;;
+    esac
+fi
 
 # The four chunk values a finished run printed, "[1]7.4997 [2]5.6433 [3]5.5693 [4]4.9430", or nothing.
 # Anything other than exactly chunks 1..4 in order is not a finished run.
