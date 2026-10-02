@@ -33,8 +33,16 @@ def dl_view(source):
         if directive:
             kind, rest = directive.group(1), directive.group(2).strip()
             if kind in ("ifndef", "ifdef", "if"):
-                dl = rest.split("//")[0].strip() == "GGML_BACKEND_DL" and kind in ("ifndef", "ifdef")
-                visible = (kind == "ifdef") if dl else True
+                condition = rest.split("//")[0].strip()
+                # The three spellings of "is GGML_BACKEND_DL defined": `#ifdef X`, `#ifndef X` and
+                # `#if [!]defined(X)` / `#if [!]defined X`. A compound condition is not decided here.
+                defined_form = re.fullmatch(r"(!\s*)?defined\s*(?:\(\s*GGML_BACKEND_DL\s*\)|\s+GGML_BACKEND_DL)",
+                                            condition) if kind == "if" else None
+                dl = condition == "GGML_BACKEND_DL" and kind in ("ifndef", "ifdef") or defined_form is not None
+                if kind == "if" and defined_form is not None:
+                    visible = defined_form.group(1) is None
+                else:
+                    visible = (kind == "ifdef") if dl else True
                 stack.append([dl, emitting, visible])
                 emitting = emitting and visible
             elif kind in ("else", "elif") and stack:
@@ -49,6 +57,23 @@ def dl_view(source):
             continue
         out.append(line if emitting else "")
     return "\n".join(out)
+
+
+def dl_view_spelling_control():
+    """Positive control, independent of the tree: the same non-DL-only reference, guarded each of the ways a
+    conditional can say "not a DL build", must be gone from the DL view, and the DL-only branch must stay."""
+    for open_guard in ("#ifndef GGML_BACKEND_DL", "#if !defined(GGML_BACKEND_DL)", "#if !defined GGML_BACKEND_DL",
+                       "#if ! defined( GGML_BACKEND_DL )"):
+        view = dl_view(open_guard + "\n  non_dl_only();\n#else\n  dl_only();\n#endif\n")
+        if "non_dl_only" in view or "dl_only" not in view:
+            return False
+    for open_guard in ("#ifdef GGML_BACKEND_DL", "#if defined(GGML_BACKEND_DL)", "#if defined GGML_BACKEND_DL"):
+        view = dl_view(open_guard + "\n  dl_only();\n#else\n  non_dl_only();\n#endif\n")
+        if "non_dl_only" in view or "dl_only" not in view:
+            return False
+    # An unrelated conditional keeps both branches.
+    view = dl_view("#if defined(OTHER)\n  a();\n#else\n  b();\n#endif\n")
+    return "a();" in view and "b();" in view
 
 
 sycl_dir_sources = [
@@ -97,8 +122,15 @@ checks = {
     # Positive control for the DL view above: ggml_backend_graph_compute IS still named in the non-DL
     # code, so a clean DL view proves the guards are doing the excluding. Without it, an all-comments
     # or empty view would pass the check above for the wrong reason.
+    # MAINTENANCE: this control reads the real tree. If a cleanup deletes the last non-DL-guarded
+    # ggml_backend_graph_compute reference (the TKV-13 host attention dispatch), `module_sources_flat` stops
+    # containing it and this check FAILS with nothing wrong in the DL view; retarget it at another
+    # guarded reference then. The synthetic check below does not depend on the tree and keeps covering the
+    # spellings of the guard itself.
     "the DL view really excludes the guarded non-DL references":
         "ggml_backend_graph_compute" in module_sources_flat and "ggml_backend_graph_compute" not in module_sources,
+    "dl_view treats every spelling of the DL guard alike":
+        dl_view_spelling_control(),
     "DL fallback propagates recoverable status": "throw ggml_sycl_fallback_error(reason)" in sycl_cpp
         and "catch (const ggml_sycl_fallback_error & error)" in sycl_cpp
         and "return GGML_STATUS_FAILED" in sycl_cpp,
