@@ -26,7 +26,11 @@ def dl_view(source):
     conditionals are left alone, both branches kept. The TKV-13 host attention dispatch (c099dbc1c) names
     ggml_backend_graph_compute behind exactly such a guard, so a flat text scan of the file cannot tell a
     DL-reachable reference from one the DL module never compiles."""
-    out, stack = [], []  # stack entries: [is_dl_conditional, currently_emitting_parent, active_branch_is_dl_visible]
+    # stack entries: [is_dl_conditional, currently_emitting_parent, active_branch_is_dl_visible, first_branch_visible].
+    # After the first branch of a DL conditional, every `#elif`/`#else` branch is visible exactly when the first
+    # one was not: `#ifdef DL` taken means the rest are dead, `#ifndef DL` skipped means a later `#elif cond`
+    # is undecided (kept) and so is the `#else` behind it.
+    out, stack = [], []
     emitting = True
     for line in strip_comments(source).split("\n"):
         directive = re.match(r"\s*#\s*(ifndef|ifdef|if|else|elif|endif)\b\s*(.*)", line)
@@ -43,15 +47,15 @@ def dl_view(source):
                     visible = defined_form.group(1) is None
                 else:
                     visible = (kind == "ifdef") if dl else True
-                stack.append([dl, emitting, visible])
+                stack.append([dl, emitting, visible, visible])
                 emitting = emitting and visible
             elif kind in ("else", "elif") and stack:
-                dl, parent, visible = stack[-1]
+                dl, parent, _, first_visible = stack[-1]
                 if dl:
-                    stack[-1][2] = not visible
+                    stack[-1][2] = not first_visible
                     emitting = parent and stack[-1][2]
             elif kind == "endif" and stack:
-                _, parent, _ = stack.pop()
+                _, parent, _, _ = stack.pop()
                 emitting = parent
             out.append("")
             continue
@@ -71,6 +75,14 @@ def dl_view_spelling_control():
         view = dl_view(open_guard + "\n  dl_only();\n#else\n  non_dl_only();\n#endif\n")
         if "non_dl_only" in view or "dl_only" not in view:
             return False
+    # An `#elif` behind a DL conditional: after `#ifndef DL` skipped, the elif condition is undecided and the
+    # `#else` behind it is reachable, so neither may be dropped; after `#ifdef DL` taken, both are dead.
+    view = dl_view("#ifndef GGML_BACKEND_DL\n  a_branch();\n#elif defined(FOO)\n  b_branch();\n#else\n  c_branch();\n#endif\n")
+    if "a_branch" in view or "b_branch" not in view or "c_branch" not in view:
+        return False
+    view = dl_view("#ifdef GGML_BACKEND_DL\n  a_branch();\n#elif defined(FOO)\n  b_branch();\n#else\n  c_branch();\n#endif\n")
+    if "a_branch" not in view or "b_branch" in view or "c_branch" in view:
+        return False
     # An unrelated conditional keeps both branches.
     view = dl_view("#if defined(OTHER)\n  a();\n#else\n  b();\n#endif\n")
     return "a();" in view and "b();" in view
