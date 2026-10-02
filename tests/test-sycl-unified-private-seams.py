@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Audit mutable SYCL cache/MMID/streaming seams and ordinary artifact payload."""
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -40,6 +41,34 @@ for name, needles in checks.items():
     missing = [needle for needle in needles if needle not in text]
     if missing:
         raise SystemExit(f"{name}: missing private seam contract: {missing}")
+
+# The needles above say the guard exists somewhere in the file. These say each seam definition or declaration sits inside one:
+# the nearest `#if defined(GGML_SYCL_PRIVATE_TESTING)` before it opens a region with no other preprocessor line before the
+# target, so a seam moved outside its guard (or a guard closed early) fails here.
+GUARD = "#if defined(GGML_SYCL_PRIVATE_TESTING)"
+guarded = {
+    SYCL / "common.cpp": (
+        "bool ggml_sycl_scratchpad_site_hook(",
+        "GGML_BACKEND_API bool ggml_sycl_test_inject_scratchpad_decline",
+        "GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset",
+        "GGML_BACKEND_API bool ggml_sycl_test_scratchpad_site_counts",
+    ),
+    SYCL / "common.hpp": ("bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site site);",),
+    ROOT / "ggml/include/ggml-sycl.h": (
+        "GGML_BACKEND_API bool ggml_sycl_test_inject_scratchpad_decline",
+        "GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset",
+        "GGML_BACKEND_API bool ggml_sycl_test_scratchpad_site_counts",
+    ),
+}
+for path, targets in guarded.items():
+    text = path.read_text(encoding="utf-8")
+    for target in targets:
+        at = text.find(target)
+        if at < 0:
+            raise SystemExit(f"{path.name}: seam `{target}` not found")
+        opened = text.rfind(GUARD, 0, at)
+        if opened < 0 or re.search(r"^\s*#\s*(?:if|ifdef|ifndef|elif|else|endif)\b", text[opened + len(GUARD):at], re.M):
+            raise SystemExit(f"{path.name}: seam `{target}` is not directly inside a `{GUARD}` region")
 
 if len(sys.argv) > 1:
     artifact = Path(sys.argv[1])

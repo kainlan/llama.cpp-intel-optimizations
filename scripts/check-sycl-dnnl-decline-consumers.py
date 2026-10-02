@@ -17,8 +17,8 @@ wrappers (comments blanked first):
     decision and before the primitive is executed, so a run that reached the wrapper can say so; the decision's arguments are
     the literal `scratchpad_mem, scratchpad_md`;
   - nothing before that decision writes: no parallel_for, single_task, memcpy, memset, fill, copy, submit or `.execute(`, no
-    mention of dst or dst_f at all (an alias would be a write the token list cannot see), and no dnnl::memory object bound to
-    the output (a decline after a write would hand the fallback
+    mention of dst or dst_f at all (an alias would be a write the token list cannot see), no const_cast, static_cast or
+    reinterpret_cast, and no dnnl::memory object bound to the output; the signature keeps the parameters those names stand for (a decline after a write would hand the fallback
     modified inputs; softmax's pre-scale pass runs in place, so a late decision would apply the scale twice);
   - no `throw` and no `catch` anywhere in the class: a decline is a return value, and a catch-all would swallow one.
 
@@ -30,9 +30,9 @@ Outside the wrappers:
     fallback that follows and a success skips it. A caller count that differs from CALLERS fails; when a legitimate caller is
     added, add it there.
 
-The if must also be the last statement of its block, and no `return` may follow once its enclosing blocks close, so an
-unconditional `return;` right after it cannot swallow the fallback. Limit: a `return` placed deeper in the fallback code, or
-reached through another construct, is not seen; the device test is the only catch for that.
+Between the if and the `#endif` / `#else` that ends the DNNL section only whitespace and the closing braces of its blocks may
+appear: no statement, goto, throw, abort or else can follow it. That is the shape of all five real callers. Limit: a `return`
+placed deeper in the fallback code, after that preprocessor line, is not seen; the device test is the only catch for that.
 
 Every check is also run against mutants of the same text and each must fail there, so a regex that stopped matching fails the
 gate instead of passing it. A mutant whose anchor text has moved is an assertion error, not a skip. Exit 0 on success, 1 on a
@@ -61,7 +61,7 @@ DECISION = re.compile(r"if\s*\(\s*" + HELPER + r"\s*\(\s*GGML_SYCL_SCRATCHPAD_SI
                       r"\s*\{\s*return\s+false\s*;\s*\}")
 NOTE = re.compile(r"\bggml_sycl_dnnl_note_engaged\s*\(\s*GGML_SYCL_SCRATCHPAD_SITE_(\w+)\s*\)\s*;")
 WRITE = re.compile(r"\bparallel_for\b|\bsingle_task\b|\bmemcpy\b|\bmemset\b|\bfill\b|\bcopy\b|\bsubmit\b|\.\s*execute\s*\("
-                   r"|\bdst(?:_f)?\b|\bdnnl::memory\s*\(")
+                   r"|\bdst(?:_f)?\b|\b(?:const|static|reinterpret)_cast\b|\bdnnl::memory\s*\(")
 DEAD = (
     (re.compile(r"\beltwise_in_?place\b"), "eltwise_inplace (a forwarder with no caller)"),
     (re.compile(r"\bDnnlReductionWrapper\b"), "DnnlReductionWrapper (an emptied class, deleted by design 4.8)"),
@@ -105,6 +105,17 @@ def function_body(cls_text, name):
     return bool(m.group(1)) and m.group(2) == "bool", cls_text[open_brace + 1:balanced(cls_text, open_brace + 1, "{", "}") - 1]
 
 
+PARAMS = {"softmax": ("const void * src", "void * dst"), "eltwise": ("const void * src", "void * dst"),
+          "binary_broadcast_row": ("const void * src0", "const void * src1", "void * dst")}
+
+
+def function_params(cls_text, name):
+    m = re.search(r"static\s+\w+\s+%s\s*\(" % re.escape(name), cls_text)
+    if m is None:
+        return None
+    return " ".join(re.sub(r"\s*\*\s*", " * ", cls_text[m.end():balanced(cls_text, m.end(), "(", ")") - 1]).split())
+
+
 def check_wrapper(cls, name, site, body_cls):
     errs = []
     where = "%s: %s::%s" % (HDR, cls, name)
@@ -116,6 +127,10 @@ def check_wrapper(cls, name, site, body_cls):
         return errs + ["%s not found" % where]
     if not shaped:
         errs.append("%s must be `[[nodiscard]] static bool`: false means the scratchpad request was declined" % where)
+    params = [p.strip() for p in (function_params(body_cls, name) or "").split(",")]
+    for want in PARAMS[name]:
+        if want not in params:
+            errs.append("%s must keep the parameter `%s`: the no-write rule is stated over those names" % (where, want))
     decisions = list(DECISION.finditer(body))
     if len(decisions) != 1:
         errs.append("%s must carry exactly one decision `if (%s(SITE, X, Y)) { return false; }`, found %d"
@@ -191,11 +206,11 @@ def check_caller(rel, text):
         if body.strip() != "return;":
             errs.append("%s: a tested %s call's branch is not exactly `return;`, so the fallback could run after a success"
                         % (rel, sym))
-        tail = after[end:]
-        if not re.match(r"\s*\}", tail):
-            errs.append("%s: the if around %s is not the last statement of its block" % (rel, sym))
-        elif re.match(r"(?:\s|\}|#[^\n]*\n)*return\b", tail):
-            errs.append("%s: a `return` follows the if around %s once its blocks close, so the fallback would never run" % (rel, sym))
+        # Only whitespace and the closers of the enclosing blocks may sit between the if and the preprocessor line that ends the
+        # DNNL section (`#endif` or `#else`): no statement, jump, throw, abort or else can follow it.
+        if not re.match(r"[\s}]*#\s*(?:endif|else)\b", after[end:]):
+            errs.append("%s: something other than the closing braces of its blocks follows the if around %s before the end of "
+                        "the DNNL section, so the fallback may never run" % (rel, sym))
     return errs
 
 
