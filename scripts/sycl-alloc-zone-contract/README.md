@@ -142,7 +142,7 @@ pointer to member) is an `X-LATCH` failure, so a respelling cannot keep a clause
 Gaps stated rather than hidden (the gate prints a `TODO j`, `TODO l` and `TODO p-route` line for the narrowings, so they are visible
 in its output):  the names of (j)'s fit function, reserve target and selector bit reads are not fixed yet, so only
 the two `*_bytes` names are covered; (l)'s five count-caller functions do not exist, so the allowlist entries are added as each
-lands. Today's 24 N-* debt entries were seeded once with `--write-debt --allow-growth` (834 to 858 entries).
+lands. Today's 24 N-* debt entries were seeded once with `--write-debt --allow-growth` (834 to 858 entries). S3-3 retired the nine oneDNN softmax / eltwise / binary wrapper entries (860 to 851): the wrappers return a `[[nodiscard]] bool` and their callers test it, pinned by `scripts/check-sycl-dnnl-decline-consumers.py`.
 
 ## Clause (p): one routed predicate, one home for the support decision
 

@@ -34,7 +34,9 @@ public:
 
     // Softmax along the last dimension (axis = -1)
     // src/dst shape: [batch, features] or [n3, n2, n1, n0] with softmax on n0
-    static void softmax(
+    // Returns false when the scratchpad request was declined: nothing was written to dst, so the caller
+    // falls through to its default path. true means the primitive was submitted.
+    [[nodiscard]] static bool softmax(
         ggml_backend_sycl_context & ctx,
         const void * src,
         void * dst,
@@ -55,6 +57,19 @@ public:
         dnnl::primitive_attr attr;
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
+        auto softmax_pd = dnnl::softmax_forward::primitive_desc(
+            eng, dnnl::prop_kind::forward_inference,
+            dnnl::algorithm::softmax_accurate,
+            src_md, dst_md, 1, attr);  // axis = 1 (features dimension)
+
+        // Decide the scratchpad before the first write to dst: the pre-scale pass below runs in place, so
+        // a decline after it would hand the fallback an input that is already scaled.
+        auto scratchpad_md = softmax_pd.scratchpad_desc();
+        auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
+        if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {
+            return false;
+        }
+
         // Pre-scale: oneDNN softmax has no built-in pre-op, so when scale != 1.0
         // we write scaled input into dst via SYCL kernel, then softmax in-place.
         const void * softmax_src = src;
@@ -68,19 +83,8 @@ public:
             softmax_src = dst;  // softmax reads from pre-scaled dst (in-place)
         }
 
-        auto softmax_pd = dnnl::softmax_forward::primitive_desc(
-            eng, dnnl::prop_kind::forward_inference,
-            dnnl::algorithm::softmax_accurate,
-            src_md, dst_md, 1, attr);  // axis = 1 (features dimension)
-
         auto src_mem = dnnl::memory(src_md, eng, const_cast<void *>(softmax_src));
         auto dst_mem = dnnl::memory(dst_md, eng, dst);
-
-        auto scratchpad_md = softmax_pd.scratchpad_desc();
-        auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
-        if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {
-            throw std::runtime_error("oneDNN scratchpad allocation failed");
-        }
 
         auto softmax_prim = dnnl::softmax_forward(softmax_pd);
 
@@ -90,6 +94,7 @@ public:
         args.insert({DNNL_ARG_SCRATCHPAD, scratchpad_mem});
 
         softmax_prim.execute(stream, args);
+        return true;
     }
 };
 
@@ -149,8 +154,9 @@ public:
         }
     }
 
-    // Element-wise unary operation
-    static void eltwise(
+    // Element-wise unary operation. Returns false when the scratchpad request was declined: nothing was
+    // written to dst, so the caller falls through to its default path. true means the primitive was submitted.
+    [[nodiscard]] static bool eltwise(
         ggml_backend_sycl_context & ctx,
         op operation,
         const void * src,
@@ -183,7 +189,7 @@ public:
         auto scratchpad_md = eltwise_pd.scratchpad_desc();
         auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
         if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {
-            throw std::runtime_error("oneDNN scratchpad allocation failed");
+            return false;
         }
 
         auto eltwise_prim = dnnl::eltwise_forward(eltwise_pd);
@@ -194,18 +200,7 @@ public:
         args.insert({DNNL_ARG_SCRATCHPAD, scratchpad_mem});
 
         eltwise_prim.execute(stream, args);
-    }
-
-    // In-place element-wise (src == dst)
-    static void eltwise_inplace(
-        ggml_backend_sycl_context & ctx,
-        op operation,
-        void * data,
-        int64_t nelements,
-        dt data_type,
-        const queue_ptr & q)
-    {
-        eltwise(ctx, operation, data, data, nelements, data_type, q);
+        return true;
     }
 };
 
@@ -297,7 +292,9 @@ public:
 
     // Broadcast binary op: src0=[batch, features], src1=[1, features] (row vector broadcast)
     // oneDNN handles broadcasting natively via memory descriptors.
-    static void binary_broadcast_row(
+    // Returns false when the scratchpad request was declined: nothing was written to dst, so the caller
+    // falls through to its default path. true means the primitive was submitted.
+    [[nodiscard]] static bool binary_broadcast_row(
         ggml_backend_sycl_context & ctx,
         op operation,
         const void * src0,    // [batch, features] matrix
@@ -337,7 +334,7 @@ public:
         auto scratchpad_md  = binary_pd.scratchpad_desc();
         auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
         if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {
-            throw std::runtime_error("oneDNN scratchpad allocation failed");
+            return false;
         }
 
         auto binary_prim = dnnl::binary(binary_pd);
@@ -349,6 +346,7 @@ public:
         args.insert({DNNL_ARG_SCRATCHPAD, scratchpad_mem});
 
         binary_prim.execute(stream, args);
+        return true;
     }
 };
 
