@@ -2268,6 +2268,13 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert"
         TIMEOUT 60
     )
+    # Every tests/test-sycl-*.py gate is registered, and pytest-style ones through llama_test_pytest. Run with
+    # --self-test: it plants violations in temp trees and requires the audit to report each.
+    add_test(NAME test-sycl-gate-registration-audit
+        COMMAND ${LLAMA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-gate-registration-audit.py --self-test
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-sycl-gate-registration-audit PROPERTIES
+        LABELS "sycl;python;source-assert" TIMEOUT 120)
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-canonical-aos-expert-handles-source.py
@@ -2415,6 +2422,45 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120
     )
+    # Registered by llama.cpp-qeld: both were declined as red (see the DECLINED note below), were repaired,
+    # and then sat unregistered. Host-only text scans.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-multirhs-gateup-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;moe"
+        TIMEOUT 60
+    )
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-staged-profiling-docs.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;profiling"
+        TIMEOUT 60
+    )
+    # Registered by llama.cpp-qeld: script-style gates (they run their checks at import, so plain python3 is
+    # the right form) that never had a registration. The first three read sources as text; the last compiles
+    # tests/test-sycl-lifecycle-public-api.cpp with the host compiler ($CXX, default c++) and runs it.
+    add_test(NAME test-sycl-intrusive-allocation-owner-foundation
+        COMMAND ${LLAMA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-intrusive-allocation-owner-foundation.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-sycl-intrusive-allocation-owner-foundation PROPERTIES
+        LABELS "sycl;python;source-assert;host" TIMEOUT 60)
+    add_test(NAME test-sycl-lock-audit-source
+        COMMAND ${LLAMA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lock-audit-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-sycl-lock-audit-source PROPERTIES
+        LABELS "sycl;python;source-assert;host" TIMEOUT 60)
+    add_test(NAME test-sycl-onednn-scratch-source
+        COMMAND ${LLAMA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-onednn-scratch-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-sycl-onednn-scratch-source PROPERTIES
+        LABELS "sycl;python;source-assert;host" TIMEOUT 60)
+    add_test(NAME test-sycl-lifecycle-public-wrappers
+        COMMAND ${LLAMA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-public-wrappers.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-sycl-lifecycle-public-wrappers PROPERTIES
+        LABELS "sycl;python;source-assert;host" TIMEOUT 120)
 
     # DECLINED, with reasons (llama.cpp-0igs).  Sibling .py gates in this
     # directory that are deliberately left unregistered.  Registering them would
@@ -2432,21 +2478,14 @@ if (NOT WIN32)
     #       rather than registered; the deletion commit carries the reasoning.
     #
     #   test-sycl-moe-multirhs-gateup-source.py
-    #       Asserts the literal "multi_rhs_gateup = false".  The field IS
-    #       present at HEAD -- ggml-sycl-bench.hpp reads
-    #       `bool  multi_rhs_gateup         = false;`.  The gate is red purely
-    #       because of VERTICAL ALIGNMENT, which CLAUDE.md mandates as a house
-    #       convention.  This is the brittleness the batch-2 header warns about,
-    #       caught in the wild: a whitespace-insensitive assertion fixes it.
-    #
     #   test-sycl-staged-profiling-docs.py
-    #       Asserts "Exact source-line attribution"; docs/backend/SYCL.md now
-    #       reads "Exact sampled source-line attribution" (ca3bbca3e, "align
-    #       source-line closure statuses" -- an intentional rewording), and the
-    #       strings moved out of the section the test slices.
+    #       Were declined here as red (a vertical-alignment-brittle literal; a reworded docs
+    #       heading). Both gates were repaired since and pass, so they are registered above
+    #       (llama.cpp-qeld); a gate left unregistered only because it was red is exactly how
+    #       stale gates went unnoticed, and test-sycl-gate-registration-audit.py now fails on
+    #       any unregistered gate.
     #
-    # All four were RUN, not guessed: 62 of the 66 unregistered pytest-style
-    # files in tests/ passed, and these were the 4 that did not.
+    # The two deleted gates above were RUN, not guessed: they asserted on files that never existed.
 endif()
 
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)
