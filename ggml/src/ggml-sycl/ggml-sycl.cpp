@@ -15995,8 +15995,8 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         g_tensor_inventory_onednn_scratchpad_bytes / (1024.0 * 1024.0),
         inventory_maxima.onednn_reorder / (1024.0 * 1024.0), inventory_maxima.onednn_eligible / (1024.0 * 1024.0),
         max_tensor_bytes / (1024.0 * 1024.0));
-    ggml_sycl::unified_cache_set_planned_onednn_scratchpad_bytes(ctx->device,
-                                                                 g_tensor_inventory_onednn_scratchpad_bytes);
+    ggml_sycl::unified_cache_set_planned_onednn_scratchpad_pair(ctx->device, inventory_maxima.onednn_reorder,
+                                                                inventory_maxima.onednn_eligible);
     // llama.cpp-479i: the dense MMQ/MMVQ Q8_1 src1 buffer is a planned byte. Sized here from the
     // same inventory maxima, at the load-time n_ubatch (512 when the loader says 0); the graph-entry
     // check ggml_sycl_mmq_src1_ensure_for_graph() sizes the exact demand at the real n_ubatch.

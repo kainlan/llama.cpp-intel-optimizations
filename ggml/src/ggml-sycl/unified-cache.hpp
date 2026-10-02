@@ -1776,6 +1776,10 @@ void unified_cache_note_zone_full_kv_placement(int device_id, const char * tag, 
 void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out);
 
 void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
+// The same plan stated as its two halves (the largest dequantized per-layer weight, and the activations half), which
+// also sets the stored sum to their total. The halves are what the first reservation is sized to (llama.cpp-8ony);
+// the reserve's own upward rewrite of the sum leaves them alone.
+void   unified_cache_set_planned_onednn_scratchpad_pair(int device_id, size_t weights_bytes, size_t activations_bytes);
 // The primitive-API weights+activations pair's own planned requirement,
 // WITHOUT the Graph-scratch allocator's additive floor (llama.cpp-gwno
 // round 3, spec-review finding 3). Two getters exist because they answer

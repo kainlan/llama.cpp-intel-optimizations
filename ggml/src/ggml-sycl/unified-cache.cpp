@@ -710,6 +710,8 @@ static std::atomic<size_t>   g_runtime_host_cat_bytes[static_cast<int>(runtime_c
 static std::atomic<size_t>   g_runtime_managed_reserved_host_bytes{};
 static std::atomic<size_t>   g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<size_t>   g_planned_onednn_pair_weights_bytes[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<size_t>   g_planned_onednn_pair_activations_bytes[GGML_SYCL_MAX_DEVICES]{};
 // llama.cpp-8ony: the two figures the current ONEDNN zone was sized from -- the pair's own plan and the Graph SDPA floor
 // that shares the zone -- kept together as ONE snapshot, written by unified_cache::ensure_planned_arena_zones when it
 // keeps or builds the zone. The planner's live figures are overwritten by every model's plan (and the pair's upward by
@@ -2343,6 +2345,15 @@ void unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t byt
     g_planned_onednn_scratchpad_bytes[device_id].store(bytes, std::memory_order_release);
 }
 
+void unified_cache_set_planned_onednn_scratchpad_pair(int device_id, size_t weights_bytes, size_t activations_bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_onednn_pair_weights_bytes[device_id].store(weights_bytes, std::memory_order_release);
+    g_planned_onednn_pair_activations_bytes[device_id].store(activations_bytes, std::memory_order_release);
+    unified_cache_set_planned_onednn_scratchpad_bytes(device_id, weights_bytes + activations_bytes);
+}
+
 // llama.cpp-0oxf/o3a0: record the SDPA shape (n_head_ctx_max, n_head_swa_max,
 // n_swa, n_ubatch, n_ctx) alongside the scratchpad bytes above so
 // onednn_graph_scratch_zone_floor_bytes_swa() can derive its floor from the
@@ -2914,7 +2925,9 @@ static zone_onednn_plan onednn_planned_pair_and_floor(int device_id) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return plan;
     }
-    plan.bare_bytes = unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id);
+    plan.bare_bytes        = unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id);
+    plan.weights_bytes     = g_planned_onednn_pair_weights_bytes[device_id].load(std::memory_order_acquire);
+    plan.activations_bytes = g_planned_onednn_pair_activations_bytes[device_id].load(std::memory_order_acquire);
 #if GGML_SYCL_DNNL
     if (ggml_sycl::onednn_graph_allocator_enabled()) {
         const onednn_graph_scratch_planned_shape shape =
@@ -18691,12 +18704,17 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         const size_t held_w   = onednn_weights_scratch_ ? onednn_weights_scratch_size_ : 0;
         const size_t held_a   = onednn_activations_scratch_ ? onednn_activations_scratch_size_ : 0;
         // Bounded by the pair bound, not the raw capacity: two ops that each fit the bound can merge, per component,
-        // into a pair above it, and a held pair above it eats the bytes reserved for the Graph SDPA scratch.
-        const size_t pair_bound = arena_on ? onednn_pp_pair_bound_for(ggml_sycl_get_device_id_from_queue(queue_),
-                                                                      zone_capacity(vram_zone_id::ONEDNN)) :
-                                             0;
-        zone_onednn_scratch_reserve_target(arena_on, pair_bound, held_w, held_a, weights_size, activations_size,
-                                           &weights_size, &activations_size);
+        // into a pair above it, and a held pair above it eats the bytes reserved for the Graph SDPA scratch. The
+        // first reservation is the pair the zone was planned for, from the same stored snapshot as the bound: a
+        // pair that starts at the first op's size and grows stepwise needs the superseded block and the new one in
+        // the zone at once, which a zone sized for one pair plus the Graph floor cannot hold.
+        const int              bound_dev = ggml_sycl_get_device_id_from_queue(queue_);
+        const zone_onednn_plan zone_plan = arena_on ? onednn_zone_plan_load(bound_dev) : zone_onednn_plan();
+        const size_t           pair_bound =
+            arena_on ? onednn_pp_pair_bound_for(bound_dev, zone_capacity(vram_zone_id::ONEDNN)) : 0;
+        zone_onednn_scratch_reserve_target(arena_on, pair_bound, held_w, held_a, zone_plan.weights_bytes,
+                                           zone_plan.activations_bytes, weights_size, activations_size, &weights_size,
+                                           &activations_size);
     }
 
     // Already reserved with sufficient size?
@@ -27913,6 +27931,8 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // one of those is decided by the pure classifier, which alone sees the group cardinality the zone's own
         // eligibility rule needs; the adapter supplies the sizes and the type/env enablement. Experts are excluded
         // by the same role function as above.
+        // The reservation is unconditional until llama.cpp-fkpg delivers n_outputs to the planner: whether the head
+        // runs on many rows (perplexity, embeddings) or on the last row only (chat, llama-bench) is not known here.
         if (item.has_shape() && ggml_sycl_should_use_unified_type(item.type) &&
             expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
             size_t weight_bytes = 0;

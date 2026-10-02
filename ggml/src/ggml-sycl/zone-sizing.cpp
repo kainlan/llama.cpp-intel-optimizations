@@ -198,9 +198,11 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
 }
 
 zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone_onednn_plan & live) {
-    zone_onednn_plan kept = live;  // RED stub: the pair halves are not merged yet (llama.cpp-8ony)
+    zone_onednn_plan kept;
     kept.bare_bytes        = std::max(held.bare_bytes, live.bare_bytes);
     kept.graph_floor_bytes = std::max(held.graph_floor_bytes, live.graph_floor_bytes);
+    kept.weights_bytes     = std::max(held.weights_bytes, live.weights_bytes);
+    kept.activations_bytes = std::max(held.activations_bytes, live.activations_bytes);
     return kept;
 }
 
@@ -345,21 +347,36 @@ void zone_onednn_scratch_reserve_target(bool     arena_active,
                                         size_t   pair_bound_bytes,
                                         size_t   held_weights_bytes,
                                         size_t   held_activations_bytes,
+                                        size_t   planned_weights_bytes,
+                                        size_t   planned_activations_bytes,
                                         size_t   requested_weights_bytes,
                                         size_t   requested_activations_bytes,
                                         size_t * weights_bytes,
                                         size_t * activations_bytes) {
+    // A pair that cannot exist inside the bound (or whose sum is unrepresentable) is not a target.
+    const auto fits = [&](size_t w, size_t a) {
+        return !arena_active || (w <= SIZE_MAX - a && w + a <= pair_bound_bytes);
+    };
     const size_t merged_weights     = std::max(held_weights_bytes, requested_weights_bytes);
     const size_t merged_activations = std::max(held_activations_bytes, requested_activations_bytes);
-    // A merged pair that cannot exist inside the zone (or whose sum is unrepresentable) is not a target: the
-    // request is used as asked, so a stale oversized held pair never wedges every later request.
-    const bool   merged_fits        = !arena_active || (merged_weights <= SIZE_MAX - merged_activations &&
-                                               merged_weights + merged_activations <= pair_bound_bytes);
+    // With an arena the planned pair is a floor: reserving it up front is what keeps the pair from ever regrowing.
+    const size_t planned_w          = arena_active ? std::max(merged_weights, planned_weights_bytes) : merged_weights;
+    const size_t planned_a =
+        arena_active ? std::max(merged_activations, planned_activations_bytes) : merged_activations;
+    size_t target_w = requested_weights_bytes;  // used as asked when nothing merged fits
+    size_t target_a = requested_activations_bytes;
+    if (fits(planned_w, planned_a)) {
+        target_w = planned_w;
+        target_a = planned_a;
+    } else if (fits(merged_weights, merged_activations)) {
+        target_w = merged_weights;
+        target_a = merged_activations;
+    }
     if (weights_bytes) {
-        *weights_bytes = merged_fits ? merged_weights : requested_weights_bytes;
+        *weights_bytes = target_w;
     }
     if (activations_bytes) {
-        *activations_bytes = merged_fits ? merged_activations : requested_activations_bytes;
+        *activations_bytes = target_a;
     }
 }
 
@@ -367,16 +384,11 @@ void zone_onednn_scratch_reserve_target(bool     arena_active,
                                         size_t   pair_bound_bytes,
                                         size_t   held_weights_bytes,
                                         size_t   held_activations_bytes,
-                                        size_t   planned_weights_bytes,
-                                        size_t   planned_activations_bytes,
                                         size_t   requested_weights_bytes,
                                         size_t   requested_activations_bytes,
                                         size_t * weights_bytes,
                                         size_t * activations_bytes) {
-    // RED stub: the planned pair is ignored (llama.cpp-8ony).
-    (void) planned_weights_bytes;
-    (void) planned_activations_bytes;
-    zone_onednn_scratch_reserve_target(arena_active, pair_bound_bytes, held_weights_bytes, held_activations_bytes,
+    zone_onednn_scratch_reserve_target(arena_active, pair_bound_bytes, held_weights_bytes, held_activations_bytes, 0, 0,
                                        requested_weights_bytes, requested_activations_bytes, weights_bytes,
                                        activations_bytes);
 }

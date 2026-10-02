@@ -976,20 +976,28 @@ int main() {
         size_t       w = 0, a = 0;
         const size_t plan_w = 112 * mib;  // the largest dequantized per-layer weight
         const size_t plan_a = 32 * mib;   // the activations half
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, 192 * mib, 0, 0, plan_w, plan_a, 80 * mib, 14 * mib, &w, &a);
-        CHECK(w == plan_w && a == plan_a, "nothing held: the first reservation is the planned pair, not the first op's");
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 192 * mib, 0, 0, plan_w, plan_a, 80 * mib, 14 * mib, &w,
+                                                      &a);
+        CHECK(w == plan_w && a == plan_a,
+              "nothing held: the first reservation is the planned pair, not the first op's");
         const size_t first_w = w, first_a = a;
         ggml_sycl::zone_onednn_scratch_reserve_target(true, 192 * mib, first_w, first_a, plan_w, plan_a, 112 * mib,
                                                       28 * mib, &w, &a);
         CHECK(w == first_w && a == first_a, "a later planned op, even the widest, is covered by what is held");
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, 192 * mib, 0, 0, plan_w, plan_a, 120 * mib, 14 * mib, &w, &a);
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 192 * mib, 0, 0, plan_w, plan_a, 120 * mib, 14 * mib, &w,
+                                                      &a);
         CHECK(w == 120 * mib && a == plan_a, "a request above the plan in one half still grows that half");
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, 100 * mib, 0, 0, plan_w, plan_a, 40 * mib, 10 * mib, &w, &a);
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 100 * mib, 0, 0, plan_w, plan_a, 40 * mib, 10 * mib, &w,
+                                                      &a);
         CHECK(w == 40 * mib && a == 10 * mib, "a zone clamped below its plan reserves what is asked, not the plan");
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 100 * mib, 60 * mib, 5 * mib, plan_w, plan_a, 50 * mib,
+                                                      12 * mib, &w, &a);
+        CHECK(w == 60 * mib && a == 12 * mib,
+              "a clamped zone still never shrinks what is held: the held-and-requested merge, without the plan");
         ggml_sycl::zone_onednn_scratch_reserve_target(false, 0, 0, 0, plan_w, plan_a, 40 * mib, 10 * mib, &w, &a);
         CHECK(w == 40 * mib && a == 10 * mib, "without an arena there is no planned pair to reserve");
-        ggml_sycl::zone_onednn_scratch_reserve_target(true, 192 * mib, 0, 0, plan_w, plan_a, 40 * mib, 10 * mib, nullptr,
-                                                      nullptr);
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 192 * mib, 0, 0, plan_w, plan_a, 40 * mib, 10 * mib,
+                                                      nullptr, nullptr);
         // the pair halves are part of the snapshot a kept zone is described by
         const zone_onednn_plan big   = { 144 * mib, 64 * mib, plan_w, plan_a };
         const zone_onednn_plan small = { 30 * mib, 10 * mib, 20 * mib, 4 * mib };
