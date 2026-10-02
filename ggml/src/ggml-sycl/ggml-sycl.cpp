@@ -101,6 +101,7 @@
 #include "ggml-sycl/graph-recorder-scope.hpp"
 #include "ggml-sycl/host-weight-alias.hpp"
 #include "ggml-sycl/kernel-selection.hpp"
+#include "ggml-sycl/kv-region-registry.hpp"
 #include "ggml-sycl/l144i-probe.hpp"
 #include "ggml-sycl/mem-ops.hpp"
 #include "ggml-sycl/mmq.hpp"
@@ -115,6 +116,7 @@
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
+#include "ggml-sycl/runtime-context-section.hpp"
 #include "ggml-sycl/set.hpp"
 #include "ggml-sycl/set_rows.hpp"
 #include "ggml-sycl/set_rows_paged.hpp"
@@ -13070,6 +13072,118 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
     return clean;
 }
 
+// ---------------------------------------------------------------------------
+// The published section of a context and the load's compute-term ledger
+// (llama.cpp-moua L4 step 3; moua design 2.4.2).
+//
+// Both are leaf state.  A context's section lives in its entry of the device's KV region
+// registry, under the registry's own leaf mutex (L3); the ledger lives under its own leaf
+// mutex.  Neither lock is held across a call out, a log line, or the last drop of a section.
+// Both are allocated once and never destroyed, so a backend freed during static destruction
+// still finds them; they hold no device memory.
+// ---------------------------------------------------------------------------
+static ggml_sycl::kv_region_registry & ggml_sycl_kv_region_registry(int device) {
+    static ggml_sycl::kv_region_registry * const registries = new ggml_sycl::kv_region_registry[GGML_SYCL_MAX_DEVICES];
+    return registries[device];
+}
+
+struct ggml_sycl_load_ledger_state {
+    std::mutex                     mutex;
+    ggml_sycl::load_compute_ledger ledger;
+};
+
+static ggml_sycl_load_ledger_state & ggml_sycl_load_ledger() {
+    static ggml_sycl_load_ledger_state * const state = new ggml_sycl_load_ledger_state;
+    return *state;
+}
+
+// The execution context id of a backend context: the registry key of its entry, 0 while unbound.
+static uint64_t ggml_sycl_context_execution_id(const ggml_backend_sycl_context * ctx) {
+    std::lock_guard<std::mutex> lock(ctx->execution_state_mutex);
+    return ctx->execution_context_id;
+}
+
+// Replace this context's published section; null drops it.  A context that was never bound to an
+// execution context has no registry key, so it publishes nothing and a coverage query about it
+// answers GROWTH.  The replaced section is released after the registry lock.
+static void ggml_sycl_published_section_set(const ggml_backend_sycl_context *                         ctx,
+                                            std::shared_ptr<const ggml_sycl::runtime_context_section> section) {
+    if (!ctx || ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    const uint64_t id = ggml_sycl_context_execution_id(ctx);
+    if (id == 0) {
+        return;
+    }
+    auto & registry = ggml_sycl_kv_region_registry(ctx->device);
+    auto   previous =
+        section ? registry.set_published_section(id, std::move(section)) : registry.drop_published_section(id);
+    (void) previous;  // dropped here, with no registry lock held
+}
+
+// The backend context is going away: its entry's section goes with it.  Runs before the execution
+// binding is reset, which is what clears the context id.  Never throws.
+static void ggml_sycl_published_section_erase(const ggml_backend_sycl_context * ctx) noexcept {
+    try {
+        ggml_sycl_published_section_set(ctx, nullptr);
+    } catch (...) {
+    }
+}
+
+// The one writer of the compute-term ledger's terms: c(P) for (load transaction, device), the term
+// the early inventory stage admitted (zhcn measure call site (b)).  False, recording nothing, when
+// the load carries no n_ctx: an envelope with no shape has no c(P) to measure, and the late check
+// then answers NOT_RECORDED.
+//
+// NO PRODUCTION CALLER UNTIL L6.  llama.cpp-moua L6 (moua design 2.4.2 (b)) adds the llama-side
+// early measure call site that reaches this; until fkpg(a) puts a non-zero n_ctx in the envelope the
+// only caller is the private test hook below.  It is the single entry on purpose and is not dead
+// code to delete: scripts/check-sycl-l4-proc-registration.py pins that no other function writes the
+// ledger.
+bool ggml_sycl_load_record_compute_term(uint64_t txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
+    ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+    std::lock_guard<std::mutex>   lock(state.mutex);
+    return state.ledger.record(txn, device, bytes, n_ctx);
+}
+
+// A load's commit or rollback drops its terms.  Returns how many.
+static size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {
+    try {
+        ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+        std::lock_guard<std::mutex>   lock(state.mutex);
+        return state.ledger.clear(txn);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Clears the finisher's terms on every exit of the end call: commit, rollback and exception alike.
+struct ggml_sycl_load_ledger_clear_guard {
+    uint64_t txn;
+
+    ~ggml_sycl_load_ledger_clear_guard() { (void) ggml_sycl_load_clear_compute_terms(txn); }
+};
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+extern "C" bool ggml_backend_sycl_test_record_compute_term(ggml_sycl_load_txn txn,
+                                                           int32_t            device,
+                                                           uint64_t           bytes,
+                                                           uint32_t           n_ctx) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return false;
+    }
+    return ggml_sycl_load_record_compute_term(txn.id, device, bytes, n_ctx);
+}
+
+// How many terms the ledger holds in all; a cleared load leaves none behind.
+extern "C" size_t ggml_backend_sycl_test_compute_term_count() {
+    ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+    std::lock_guard<std::mutex>   lock(state.mutex);
+    return state.ledger.size();
+}
+#endif
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
     ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LOAD);
     sycl_module_mutation_guard module_guard;
@@ -13477,6 +13591,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             return ggml_sycl_load_end_replay_result(ticket, model);
         }
 
+        // This call finishes the load: whatever way it ends, the load's early terms are done.
+        ggml_sycl_load_ledger_clear_guard           ledger_clear{ txn.id };
         ggml_sycl::lifecycle::finisher_effect_scope finisher_effect;
         if (ticket.commit) {
             finisher_effect = registry->acquire_finisher_effect(ticket);
@@ -19600,6 +19716,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // next = ...` even runs, so this point is never reached with a non-NULL
     // out.
     ctx->runtime_kv_admitted = true;
+    // Any publish changes the context's shape, so a section published earlier no longer describes it.
+    // The descriptor path publishes its own section after this returns.
+    ggml_sycl_published_section_erase(ctx);
     return ggml_sycl_txn_result::ACCEPTED;
 }
 
@@ -19749,14 +19868,22 @@ uint32_t ggml_backend_sycl_moe_gpu_ubatch_max() {
     return ggml_sycl::MOE_GPU_UBATCH_MAX;
 }
 
-ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_backend_t        backend,
-                                                                           ggml_sycl_model_token model,
-                                                                           uint32_t              n_ctx,
-                                                                           uint32_t              n_ubatch,
-                                                                           uint32_t              n_seq_max,
-                                                                           bool                  kv_unified,
-                                                                           bool                  swa_full,
-                                                                           bool                  flash_attn_enabled) {
+// The model-bound publish both entry points share.  `has_desc` selects the descriptor entry point:
+// `desc` is then read once, here, under its gates (a refusal is deterministic, so PLAN_REJECTED, the
+// same answer the inner transaction gives), and the section it yields is stored in the context's
+// registry entry once the transaction has published.  The older entry point passes has_desc == false
+// and publishes no section (its inner transaction drops any earlier one).
+static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
+    ggml_backend_t                         backend,
+    ggml_sycl_model_token                  model,
+    uint32_t                               n_ctx,
+    uint32_t                               n_ubatch,
+    uint32_t                               n_seq_max,
+    bool                                   kv_unified,
+    bool                                   swa_full,
+    bool                                   flash_attn_enabled,
+    const ggml_sycl_runtime_context_desc * desc,
+    bool                                   has_desc) {
     ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_TRANSACTION);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
@@ -19769,6 +19896,31 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
     if (!ggml_backend_is_sycl(backend) || !backend->device ||
         ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
         return GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND;
+    }
+    std::shared_ptr<const ggml_sycl::runtime_context_section> section;
+    if (has_desc) {
+        try {
+            ggml_sycl::runtime_context_geometry geometry;
+            geometry.n_ctx      = n_ctx;
+            geometry.n_ubatch   = n_ubatch;
+            geometry.n_seq_max  = n_seq_max;
+            geometry.kv_unified = kv_unified;
+            geometry.swa_full   = swa_full;
+            geometry.flash_attn = flash_attn_enabled;
+            ggml_sycl::runtime_context_section parsed;
+            const auto                         status = ggml_sycl::parse_runtime_context_desc(
+                desc, geometry, std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES), parsed);
+            if (status != ggml_sycl::runtime_context_desc_status::OK) {
+                GGML_LOG_WARN("[CONTEXT-PLAN] runtime context descriptor refused: %s (n_ctx=%u n_ubatch=%u)\n",
+                              ggml_sycl::runtime_context_desc_status_text(status), n_ctx, n_ubatch);
+                return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+            }
+            section = std::make_shared<const ggml_sycl::runtime_context_section>(std::move(parsed));
+        } catch (const ggml_sycl_fallback_error &) {
+            throw;
+        } catch (...) {
+            return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+        }
     }
     const ggml_sycl::lifecycle::ModelToken token{
         { model.model_id },
@@ -19880,6 +20032,18 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
     const bool inner_ok = g_runtime_update_succeeded;
+    // The descriptor's section is the context's published shape from here on.  Only when the inner
+    // transaction published: a refused one changed nothing, and the section it was given describes a
+    // shape that never went live.
+    if (inner_ok && section) {
+        try {
+            ggml_sycl_published_section_set(backend_ctx, section);
+        } catch (const ggml_sycl_fallback_error &) {
+            throw;
+        } catch (...) {
+            return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+        }
+    }
     // Resolve a load_end deferral now that a backend context exists. Idempotent:
     // the MMID registry answers ALREADY_PUBLISHED when a pool is already live,
     // so the registry itself is the deferred-state record and no parallel
@@ -19910,6 +20074,119 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
     // caller rerun a decision that cannot change (llama.cpp-uize). Genuine
     // transients above still return BUSY.
     return inner_ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+}
+
+ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_backend_t        backend,
+                                                                           ggml_sycl_model_token model,
+                                                                           uint32_t              n_ctx,
+                                                                           uint32_t              n_ubatch,
+                                                                           uint32_t              n_seq_max,
+                                                                           bool                  kv_unified,
+                                                                           bool                  swa_full,
+                                                                           bool                  flash_attn_enabled) {
+    return ggml_sycl_set_runtime_context_for_model_impl(backend, model, n_ctx, n_ubatch, n_seq_max, kv_unified,
+                                                        swa_full, flash_attn_enabled, nullptr, false);
+}
+
+ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_desc(ggml_backend_t        backend,
+                                                                      ggml_sycl_model_token model,
+                                                                      uint32_t              n_ctx,
+                                                                      uint32_t              n_ubatch,
+                                                                      uint32_t              n_seq_max,
+                                                                      bool                  kv_unified,
+                                                                      bool                  swa_full,
+                                                                      bool                  flash_attn_enabled,
+                                                                      const ggml_sycl_runtime_context_desc * desc) {
+    return ggml_sycl_set_runtime_context_for_model_impl(backend, model, n_ctx, n_ubatch, n_seq_max, kv_unified,
+                                                        swa_full, flash_attn_enabled, desc, true);
+}
+
+// Would publishing this candidate need a transaction?  Read-only: it publishes nothing, takes no
+// replan lock and no lifecycle lease.  It reads this context's own entry in one section under the
+// registry's leaf mutex.  Every doubt answers GROWTH (the zero value): a null or foreign backend, a
+// closed module, a candidate that does not parse, a context with no execution identity, and a
+// context with no published section.
+enum ggml_sycl_tenant_coverage ggml_backend_sycl_tenant_coverage(ggml_backend_t backend,
+                                                                 uint32_t       n_ctx,
+                                                                 uint32_t       n_ubatch,
+                                                                 uint32_t       n_seq_max,
+                                                                 bool           kv_unified,
+                                                                 bool           swa_full,
+                                                                 bool           flash_attn_enabled,
+                                                                 const ggml_sycl_runtime_context_desc * candidate) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard || !backend || !backend->context || !candidate) {
+        return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+    }
+    if (!ggml_backend_is_sycl(backend) || !backend->device ||
+        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
+        return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+    }
+    try {
+        const auto * ctx = static_cast<const ggml_backend_sycl_context *>(backend->context);
+        if (ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES) {
+            return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+        }
+        ggml_sycl::runtime_context_geometry geometry;
+        geometry.n_ctx      = n_ctx;
+        geometry.n_ubatch   = n_ubatch;
+        geometry.n_seq_max  = n_seq_max;
+        geometry.kv_unified = kv_unified;
+        geometry.swa_full   = swa_full;
+        geometry.flash_attn = flash_attn_enabled;
+        ggml_sycl::runtime_context_section parsed;
+        if (ggml_sycl::parse_runtime_context_desc(candidate, geometry,
+                                                  std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES),
+                                                  parsed) != ggml_sycl::runtime_context_desc_status::OK) {
+            return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+        }
+        const uint64_t id = ggml_sycl_context_execution_id(ctx);
+        if (id == 0) {
+            return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+        }
+        const auto published = ggml_sycl_kv_region_registry(ctx->device).published_section(id);
+        return ggml_sycl::classify_tenant_coverage(published.get(), parsed);
+    } catch (...) {
+        return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+    }
+}
+
+// The late measure of a load against the term the early stage recorded (zhcn call site (c)).  The
+// rule and the strings are load_compute_ledger's; this adds the open-transaction read, the log at the
+// level the line is for, and the shrink counter.  Fail-closed: NOT_RECORDED is the zero value and is
+// the answer to everything this cannot compare, and it never reads as a pass.
+enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check(ggml_sycl_load_txn txn,
+                                                                   int32_t            device,
+                                                                   uint64_t           compute_bytes) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
+    try {
+        const bool open =
+            txn.id != 0 && ggml_sycl::lifecycle::global_registry().admission_diagnostics().active_txn == txn.id;
+        ggml_sycl::load_compute_ledger::check_result r;
+        {
+            ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+            std::lock_guard<std::mutex>   lock(state.mutex);
+            r = state.ledger.check(txn.id, device, compute_bytes, open);
+        }
+        if (!r.line.empty()) {
+            if (r.result == GGML_SYCL_LATE_CHECK_REFUSED) {
+                GGML_LOG_ERROR("%s\n", r.line.c_str());
+            } else if (r.shrink_counted) {
+                GGML_LOG_WARN("%s\n", r.line.c_str());
+            } else {
+                GGML_LOG_INFO("%s\n", r.line.c_str());
+            }
+        }
+        if (r.shrink_counted) {
+            ggml_sycl::unified_cache_dump_counter_add(ggml_sycl::dump_counter::late_term_shrink_admitted, device);
+        }
+        return r.result;
+    } catch (...) {
+        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
 }
 
 // llama.cpp-oyfl: a NARROW re-evaluation of the non-FA attention scratch
@@ -45766,6 +46043,7 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     }
     pp_moe_onednn_drain_scratch_slots(device);
     ggml_sycl_execution_abort_and_release_graph(this);
+    ggml_sycl_published_section_erase(this);
     ggml_sycl_execution_unbind_backend(this);
     {
         std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
@@ -113703,6 +113981,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_test_allocate_predictor_scores") == 0) {
         return (void *) ggml_backend_sycl_test_allocate_predictor_scores;
     }
+    if (strcmp(name, "ggml_backend_sycl_test_record_compute_term") == 0) {
+        return (void *) ggml_backend_sycl_test_record_compute_term;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_compute_term_count") == 0) {
+        return (void *) ggml_backend_sycl_test_compute_term_count;
+    }
 #endif
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_candidate_binding_allocation") == 0) {
@@ -113723,6 +114007,18 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_for_model") == 0) {
         return (void *) ggml_backend_sycl_set_runtime_context_for_model;
+    }
+    // The L4 descriptor publish, the coverage read and the late check.  Each name is the "Proc name:"
+    // its declaration in ggml-sycl.h carries; scripts/check-sycl-l4-proc-registration.py pins that
+    // every such name in the header has an arm here.
+    if (strcmp(name, "ggml_backend_sycl_set_runtime_context_desc") == 0) {
+        return (void *) ggml_backend_sycl_set_runtime_context_desc;
+    }
+    if (strcmp(name, "ggml_backend_sycl_tenant_coverage") == 0) {
+        return (void *) ggml_backend_sycl_tenant_coverage;
+    }
+    if (strcmp(name, "ggml_backend_sycl_load_late_check") == 0) {
+        return (void *) ggml_backend_sycl_load_late_check;
     }
     if (strcmp(name, "ggml_backend_sycl_recheck_runtime_context_flash_attn") == 0) {
         return (void *) ggml_backend_sycl_recheck_runtime_context_flash_attn;

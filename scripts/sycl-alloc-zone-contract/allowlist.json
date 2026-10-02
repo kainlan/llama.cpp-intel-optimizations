@@ -259,6 +259,38 @@
       "function": "allocation_registry_test_publish_raw",
       "count": 1,
       "reason": "allocation_registry_test_publish_raw is a noexcept PRIVATE_TESTING seam that inserts one synthetic row into the runtime allocation registry for tests: its try body only builds the record and takes the registry mutex, so no planned refusal can reach the handler, and a rethrow in a noexcept function would std::terminate. It reports failure by returning false. Permanent; test-only code absent from the shipped library."
+    },
+    {
+      "id": "E-L4-SECTION-ERASE",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_published_section_erase",
+      "count": 1,
+      "reason": "ggml_sycl_published_section_erase is noexcept and runs from ~ggml_backend_sycl_context: its try body is one registry set_published_section with a null section (a map find and an erase, no allocation of device memory and no planned-refusal path), and a rethrow of ggml_sycl_fallback_error out of a destructor would std::terminate. Permanent; llama.cpp-moua L4 step 3."
+    },
+    {
+      "id": "E-L4-LEDGER-CLEAR",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_sycl_load_clear_compute_terms",
+      "count": 1,
+      "reason": "ggml_sycl_load_clear_compute_terms is noexcept and runs from the clear guard's destructor at every exit of the load's end call: its try body is a mutex lock and a map erase, with no planned-refusal path, and a rethrow out of a destructor would std::terminate. Permanent; llama.cpp-moua L4 step 3."
+    },
+    {
+      "id": "E-L4-TENANT-COVERAGE",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_backend_sycl_tenant_coverage",
+      "count": 1,
+      "reason": "ggml_backend_sycl_tenant_coverage is a read-only C-ABI query: its try body parses a descriptor and compares it with the published section, with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and answers GROWTH, the fail-closed value. Permanent; llama.cpp-moua L4 step 3."
+    },
+    {
+      "id": "E-L4-LATE-CHECK",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_backend_sycl_load_late_check",
+      "count": 1,
+      "reason": "ggml_backend_sycl_load_late_check is a C-ABI comparison of two byte counts through the ledger: its try body takes a mutex and formats a log line, with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and answers NOT_RECORDED, the fail-closed value. Permanent; llama.cpp-moua L4 step 3."
     }
   ]
 }

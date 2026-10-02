@@ -132,6 +132,16 @@ if (BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-counter-dump.py
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
     set_tests_properties(test-sycl-counter-dump-gate PROPERTIES LABELS "sycl;source-contract;host")
+    # llama.cpp-moua L4: every "Proc name:" in ggml-sycl.h has an unconditional registration arm and a definition,
+    # the load-compute ledger has one writer and one clearer, and the txn-end clear guard, the destructor erase
+    # and the success-tail drop keep their order. Pure Python over source text, with its own mutation matrix.
+    add_test(NAME test-sycl-l4-proc-registration-gate
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-l4-proc-registration.py
+                --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
+    set_tests_properties(test-sycl-l4-proc-registration-gate PROPERTIES LABELS "sycl;source-contract;host" TIMEOUT 1200)
+    # 1200 s: the gate takes ~23 s alone, but its mutation matrix compiles nothing and still ran ~10 min under this host's
+    # permanent load (60+), where the previous 60 s limit timed out a passing run.
     # llama.cpp-23mk S3-3: the three oneDNN wrappers that ask get_scratchpad_mem (softmax, eltwise,
     # binary_broadcast_row) return a [[nodiscard]] bool, make the `return false` decision on a declined scratchpad
     # before anything writes to or binds the output, and never throw or catch. The deleted wrappers (binary,

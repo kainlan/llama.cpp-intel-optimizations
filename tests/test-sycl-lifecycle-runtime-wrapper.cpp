@@ -26,6 +26,12 @@ extern "C" void ggml_backend_sycl_test_fail_next_abort_owner_effects_cleanup();
 extern "C" bool ggml_backend_sycl_test_hold_live_update(ggml_sycl_model_token model);
 extern "C" void ggml_backend_sycl_test_release_live_update();
 
+extern "C" bool   ggml_backend_sycl_test_record_compute_term(ggml_sycl_load_txn txn,
+                                                             int32_t            device,
+                                                             uint64_t           bytes,
+                                                             uint32_t           n_ctx);
+extern "C" size_t ggml_backend_sycl_test_compute_term_count();
+
 extern "C" uint32_t ggml_backend_sycl_test_pop_kv_layer_mask(int device, uint8_t * out, uint32_t capacity);
 extern "C" uint32_t ggml_backend_sycl_test_pending_kv_layer_mask_count(int device);
 extern "C" void     ggml_backend_sycl_test_kv_layer_mask_identity(uint64_t out[4]);
@@ -1094,6 +1100,9 @@ int main() {
     LOAD_SYCL(ggml_backend_sycl_model_quarantine_token)
     LOAD_SYCL(ggml_backend_sycl_model_load_begin)
     LOAD_SYCL(ggml_backend_sycl_model_load_end)
+    LOAD_SYCL(ggml_backend_sycl_load_late_check)
+    LOAD_SYCL(ggml_backend_sycl_test_record_compute_term)
+    LOAD_SYCL(ggml_backend_sycl_test_compute_term_count)
     LOAD_SYCL(ggml_backend_sycl_model_unloaded_token)
 #    define CALL_SYCL(name) name##_fn
 #else
@@ -1458,6 +1467,92 @@ int main() {
     if (CALL_SYCL(ggml_backend_sycl_model_load_end)(stage_fail, false, nullptr) == GGML_SYCL_LIFECYCLE_WRONG_TRANSACTION) {
         std::fprintf(stderr, "late stage failure left txn unrecoverable\n");
         return 1;
+    }
+
+    // llama.cpp-moua L4 step 3: the load's compute-term ledger.  An early c(P) is recorded for the open load,
+    // the late check compares against it, and BOTH exits of the load (commit and rollback) clear it.  The
+    // ledger is process-global, so the count after each end must be back to what it was before the load.
+    phase("compute-term ledger: record, late check, commit clear");
+    {
+        const size_t          terms_before = CALL_SYCL(ggml_backend_sycl_test_compute_term_count)();
+        ggml_sycl_load_txn    l4_commit{};
+        ggml_sycl_model_token l4_token{};
+        if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&l4_commit) != GGML_SYCL_LIFECYCLE_OK || l4_commit.id == 0) {
+            std::fprintf(stderr, "L4 ledger: begin failed\n");
+            return 1;
+        }
+        // The envelope carries no n_ctx until fkpg(a): nothing is recorded, and the late check says so.
+        if (CALL_SYCL(ggml_backend_sycl_test_record_compute_term)(l4_commit, 0, 1000, 0) ||
+            CALL_SYCL(ggml_backend_sycl_test_compute_term_count)() != terms_before ||
+            CALL_SYCL(ggml_backend_sycl_load_late_check)(l4_commit, 0, 1000) != GGML_SYCL_LATE_CHECK_NOT_RECORDED) {
+            std::fprintf(stderr, "L4 ledger: an n_ctx of 0 recorded a term or the late check compared it\n");
+            return 1;
+        }
+        if (!CALL_SYCL(ggml_backend_sycl_test_record_compute_term)(l4_commit, 0, 1000, 8192) ||
+            CALL_SYCL(ggml_backend_sycl_test_compute_term_count)() != terms_before + 1) {
+            std::fprintf(stderr, "L4 ledger: a term with an n_ctx was not recorded\n");
+            return 1;
+        }
+        // One rule: larger than admitted is refused, smaller is admitted, equal is equal; a device with no term and a
+        // transaction that is not the open one compare nothing.
+        if (CALL_SYCL(ggml_backend_sycl_load_late_check)(l4_commit, 0, 1000) != GGML_SYCL_LATE_CHECK_EQUAL ||
+            CALL_SYCL(ggml_backend_sycl_load_late_check)(l4_commit, 0, 1001) != GGML_SYCL_LATE_CHECK_REFUSED ||
+            CALL_SYCL(ggml_backend_sycl_load_late_check)(l4_commit, 0, 999) != GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED ||
+            CALL_SYCL(ggml_backend_sycl_load_late_check)(l4_commit, 1, 1000) != GGML_SYCL_LATE_CHECK_NOT_RECORDED) {
+            std::fprintf(stderr, "L4 ledger: the late check broke the equal/refused/shrink/not-recorded rule\n");
+            return 1;
+        }
+        ggml_sycl_load_txn other_txn = l4_commit;
+        other_txn.id += 1000;
+        if (CALL_SYCL(ggml_backend_sycl_load_late_check)(other_txn, 0, 1000) != GGML_SYCL_LATE_CHECK_NOT_RECORDED) {
+            std::fprintf(stderr,
+                         "L4 ledger: a transaction that is not the open load compared against another load's term\n");
+            return 1;
+        }
+        if (CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, true) != GGML_SYCL_LIFECYCLE_OK ||
+            CALL_SYCL(ggml_backend_sycl_stage_inventory_plan)(&inventory, &envelope, false) != GGML_SYCL_LIFECYCLE_OK ||
+            CALL_SYCL(ggml_backend_sycl_model_load_end)(l4_commit, true, &l4_token) != GGML_SYCL_LIFECYCLE_OK ||
+            l4_token.model_id == 0) {
+            std::fprintf(stderr, "L4 ledger: the commit failed\n");
+            return 1;
+        }
+        if (CALL_SYCL(ggml_backend_sycl_test_compute_term_count)() != terms_before) {
+            std::fprintf(stderr, "L4 ledger: the commit left the load's terms behind\n");
+            return 1;
+        }
+        // After the end the transaction is no longer open, so a late check against it compares nothing.
+        if (CALL_SYCL(ggml_backend_sycl_load_late_check)(l4_commit, 0, 1000) != GGML_SYCL_LATE_CHECK_NOT_RECORDED) {
+            std::fprintf(stderr, "L4 ledger: a late check after the commit still compared\n");
+            return 1;
+        }
+        if (CALL_SYCL(ggml_backend_sycl_model_unloaded_token)(l4_token) != GGML_SYCL_LIFECYCLE_OK) {
+            std::fprintf(stderr, "L4 ledger: teardown of the committed load failed\n");
+            return 1;
+        }
+    }
+    phase("compute-term ledger: rollback clear");
+    {
+        const size_t       terms_before = CALL_SYCL(ggml_backend_sycl_test_compute_term_count)();
+        ggml_sycl_load_txn l4_abort{};
+        if (CALL_SYCL(ggml_backend_sycl_model_load_begin)(&l4_abort) != GGML_SYCL_LIFECYCLE_OK) {
+            std::fprintf(stderr, "L4 ledger: begin failed (rollback case)\n");
+            return 1;
+        }
+        if (!CALL_SYCL(ggml_backend_sycl_test_record_compute_term)(l4_abort, 0, 2000, 4096) ||
+            !CALL_SYCL(ggml_backend_sycl_test_record_compute_term)(l4_abort, 1, 3000, 4096) ||
+            CALL_SYCL(ggml_backend_sycl_test_compute_term_count)() != terms_before + 2) {
+            std::fprintf(stderr, "L4 ledger: terms for two devices were not recorded\n");
+            return 1;
+        }
+        const auto rollback_rc = CALL_SYCL(ggml_backend_sycl_model_load_end)(l4_abort, false, nullptr);
+        if (rollback_rc != GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && rollback_rc != GGML_SYCL_LIFECYCLE_POISONED) {
+            std::fprintf(stderr, "L4 ledger: the rollback returned %d\n", (int) rollback_rc);
+            return 1;
+        }
+        if (CALL_SYCL(ggml_backend_sycl_test_compute_term_count)() != terms_before) {
+            std::fprintf(stderr, "L4 ledger: the rollback left the load's terms behind\n");
+            return 1;
+        }
     }
 
     phase("empty early and late planning commit");
