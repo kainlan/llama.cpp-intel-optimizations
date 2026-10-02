@@ -38,6 +38,27 @@ def test_finish_honours_min_checks() -> None:
     assert run(script % 2).returncode == 1
 
 
+def test_a_non_assertion_failure_is_recorded_and_the_next_check_still_runs() -> None:
+    """A missing anchor surfaces as ValueError (str.index), not AssertionError: that must fail its own check and
+    leave the checks after it running, or one stale pin hides the rest again."""
+    result = run("""
+        from sycl_gate import gate, finish
+        with gate("first block raises ValueError"):
+            "abc".index("zzz")
+        with gate("second block still runs"):
+            assert 1 + 1 == 3
+        with gate("third block passes"):
+            assert True
+        finish("PASS", min_checks=3)
+    """)
+    assert result.returncode == 1, result.stdout
+    assert "FAIL first block raises ValueError" in result.stderr
+    assert "ValueError" in result.stderr
+    assert "FAIL second block still runs" in result.stderr
+    assert "1/3 checks passed" in result.stdout
+    assert "PASS" not in result.stdout.replace("checks passed", "")
+
+
 def test_generator_failure_never_blames_a_stale_global() -> None:
     result = run("""
         from sycl_gate import gate, finish
