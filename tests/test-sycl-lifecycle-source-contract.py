@@ -473,6 +473,13 @@ OWNING_READER_SITES = {
 }
 
 
+def _site_key(line):
+    """The census key of one code line: whitespace-normalised, and with the padding a stripped inline comment
+    leaves just inside parentheses removed too, so `f( /* why */ x)` and `f(x)` are the same statement."""
+    key = " ".join(line.split())
+    return re.sub(r"\(\s+", "(", re.sub(r"\s+\)", ")", key))
+
+
 def _owning_reader_sites():
     sites = {}
     for path, text in placement_sources.items():
@@ -482,7 +489,7 @@ def _owning_reader_sites():
             for match in re.finditer(re.escape(name) + r"\(", code):
                 start = code.rfind("\n", 0, match.start()) + 1
                 end = code.find("\n", match.start())
-                lines[" ".join(code[start:end if end >= 0 else len(code)].split())] += 1
+                lines[_site_key(code[start:end if end >= 0 else len(code)])] += 1
         if lines:
             sites[path] = lines
     return sites
@@ -621,7 +628,7 @@ def _wrapper_sites():
         for match in re.finditer(re.escape(name) + r"\(", code):
             start = code.rfind("\n", 0, match.start()) + 1
             end = code.find("\n", match.start())
-            lines[" ".join(code[start:end if end >= 0 else len(code)].split())] += 1
+            lines[_site_key(code[start:end if end >= 0 else len(code)])] += 1
         sites[name] = lines
     return sites
 
