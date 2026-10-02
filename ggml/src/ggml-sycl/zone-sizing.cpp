@@ -180,6 +180,11 @@ path_scoped_maxima zone_scoped_maxima(const std::vector<zone_tensor_desc> & inve
         if (zone_is_dma_streamed(tensor, cardinality)) {
             maxima.dma_streamed = std::max(maxima.dma_streamed, tensor.size);
         }
+        // A tensor the loader says is only ever gathered (GET_ROWS) is no MUL_MAT operand whatever marks the adapter
+        // set on it; the three marks below are the MUL_MAT-side plans (llama.cpp-8ony).
+        if (tensor.get_rows_only) {
+            continue;
+        }
         // Not gated on a per-layer family or on the expert predicate: the adapter
         // already said whether this is a dense MUL_MAT operand (non-zero).
         maxima.mmq_src1_bytes_per_token = std::max(maxima.mmq_src1_bytes_per_token, tensor.mmq_src1_bytes_per_token);

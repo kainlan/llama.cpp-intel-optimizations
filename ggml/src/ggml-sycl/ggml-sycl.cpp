@@ -15963,6 +15963,7 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
                     info.ne[d] = inventory->tensors[i].ne[d];
                 }
             }
+            info.get_rows_only = inventory->tensors[i].get_rows_only;
             g_tensor_inventory_detail.push_back(std::move(info));
             g_tensor_inventory_index[name] = idx;
             g_tensor_inventory_total_size += inventory->tensors[i].size;

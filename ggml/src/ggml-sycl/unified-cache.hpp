@@ -440,6 +440,9 @@ struct placement_tensor_info {
     // Declared capacities copied into the immutable inventory; never live values.
     uint32_t    planner_n_ubatch  = 0;
     uint32_t    planner_n_seq_max = 0;
+    // The model loader's role for the tensor: consumed only by a row gather (GET_ROWS), so no MUL_MAT scratch is
+    // planned for it (ggml_sycl_tensor_info::get_rows_only).
+    bool        get_rows_only     = false;
 
     placement_tensor_info() = default;
 

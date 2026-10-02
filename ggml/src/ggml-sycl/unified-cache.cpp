@@ -27888,6 +27888,10 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         }
         desc.name         = item.name;
         desc.reorder_size = zone_onednn_reorder_bytes(item);
+        // llama.cpp-8ony: the marks below describe a MUL_MAT operand. The loader's role says whether this tensor is one
+        // (a token embedding looked up by GET_ROWS is not, unless it is also the tied output head); the pure classifier
+        // honours it for all of them at once.
+        desc.get_rows_only = item.get_rows_only;
         // llama.cpp-479i: Q8_1 bytes a dense quantized MUL_MAT quantizes its activations into, per
         // token. Operand-ness is decided HERE, where the traits and the name are, not in the pure
         // classifier: a quantized weight that is not an expert stack (MUL_MAT_ID keeps its own

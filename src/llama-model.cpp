@@ -622,6 +622,40 @@ static void llama_model_sycl_add_tensor_info(std::vector<ggml_sycl_tensor_info> 
     }
 }
 
+// llama.cpp-8ony: the tensors the planner must not charge MUL_MAT scratch for. The loader's own op table
+// (llm_tensor_info_for) says which input-layer tensors are consumed by a row gather (GET_ROWS); a tied token embedding
+// is the one case where such a tensor is ALSO a MUL_MAT operand, and the loader's rule for that is the same one used
+// here: an output head the file does not carry is created as TENSOR_DUPLICATED token_embd and treated as
+// LLM_TENSOR_OUTPUT (llama_model_loader::create_tensor). The file's tensor set (weights_map) is the loader's fact for
+// "the file carries the head", and it is known before any tensor is created, so the early plan sees it too.
+// A false answer is the safe direction: it only keeps the tensor in the plan.
+static void llama_model_sycl_mark_get_rows_only(std::vector<ggml_sycl_tensor_info> & tensors,
+                                                const llama_model_loader &           ml) {
+    const LLM_TN tn(ml.get_arch());
+    const bool   file_carries_head = ml.weights_map.find(tn(LLM_TENSOR_OUTPUT, "weight").str()) != ml.weights_map.end();
+    static const llm_tensor input_tensors[] = {
+        LLM_TENSOR_TOKEN_EMBD,
+        LLM_TENSOR_POS_EMBD,
+        LLM_TENSOR_TOKEN_TYPES,
+        LLM_TENSOR_PER_LAYER_TOKEN_EMBD,
+    };
+    for (ggml_sycl_tensor_info & tensor : tensors) {
+        tensor.get_rows_only = false;
+        if (tensor.name == nullptr) {
+            continue;
+        }
+        for (const llm_tensor input : input_tensors) {
+            const llm_tensor_info & info = llm_tensor_info_for(input);
+            if (info.layer != LLM_TENSOR_LAYER_INPUT || info.op != GGML_OP_GET_ROWS ||
+                tn(input, "weight").str() != tensor.name) {
+                continue;
+            }
+            const bool tied_head = input == LLM_TENSOR_TOKEN_EMBD && !file_carries_head;
+            tensor.get_rows_only = !tied_head;
+        }
+    }
+}
+
 static void llama_model_sycl_compute_early_plan(llama_model_loader &  ml,
                                                 const llama_hparams & hparams,
                                                 const char *          log_func) {
@@ -642,6 +676,8 @@ static void llama_model_sycl_compute_early_plan(llama_model_loader &  ml,
     if (tensors.empty()) {
         return;
     }
+
+    llama_model_sycl_mark_get_rows_only(tensors, ml);
 
     const uint32_t n_layer = hparams.n_layer();
     std::unique_ptr<bool[]> swa_layer_mask(new bool[n_layer]);
@@ -694,6 +730,8 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader &  ml,
     if (tensors.empty()) {
         return;
     }
+
+    llama_model_sycl_mark_get_rows_only(tensors, ml);
 
     const uint32_t n_layer = hparams.n_layer();
     std::unique_ptr<bool[]> swa_layer_mask(new bool[n_layer]);

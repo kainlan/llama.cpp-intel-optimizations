@@ -395,7 +395,8 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header):
         results["the backend copies the role into the inventory the planner sees"] = \
             re.search(r"info\.get_rows_only\s*=\s*inventory->tensors\[i\]\.get_rows_only\s*;", detail_loop) is not None
     results["the planner's tensor description carries the role"] = \
-        re.search(r"struct placement_tensor_info \{[^}]*\bbool\s+get_rows_only\b", cache_hpp, re.S) is not None
+        re.search(r"struct placement_tensor_info \{.*?\bbool\s+get_rows_only\b.*?placement_tensor_info\(\) = default", cache_hpp,
+                  re.S) is not None
     classifier = function_body(
         zone_sizing, r"path_scoped_maxima zone_scoped_maxima\([^)]*\)\s*\{")
     results["anchor: the pure classifier exists"] = classifier is not None
@@ -419,7 +420,7 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header):
             "tied_head = input == LLM_TENSOR_TOKEN_EMBD && !file_carries_head" in mark_norm and \
             "tensor.get_rows_only = !tied_head" in mark_norm
         results["the file's head is the loader's own output name over its own tensor set"] = \
-            "tn(LLM_TENSOR_OUTPUT" in mark and "weights_map" in mark
+            re.search(r"ml\.weights_map\.find\(\s*tn\(LLM_TENSOR_OUTPUT", mark) is not None
     for fname, sig in (("early plan", r"static void llama_model_sycl_compute_early_plan\([^)]*\)\s*\{"),
                        ("late inventory", r"static void llama_model_sycl_set_late_inventory\([^)]*\)\s*\{")):
         fbody = function_body(model, sig)
