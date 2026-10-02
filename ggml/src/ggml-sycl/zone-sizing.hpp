@@ -265,6 +265,24 @@ bool zone_onednn_pp_scratch_planned(bool   arena_active,
                                     size_t weights_bytes,
                                     size_t activations_bytes);
 
+// The pair reserve_onednn_scratch should size a reservation to, given what the cache already holds and what the
+// op now asks for. Never smaller than what is held, per component: the weights and activations halves are separate
+// blocks and different ops are largest in different halves (a 512-row layer op needs a wider activations half than
+// the 256-row LM-head op, which needs the wider weights half), so replacing the held pair by the latest request
+// shrinks one half every time and forces the regrowth that the plan never provisioned (llama.cpp-8ony).
+//
+// With an arena the merged pair is still bounded by the ONEDNN zone. A held pair that cannot be merged inside the
+// zone (left over from a smaller or rebuilt arena) must not wedge every later request, so the request is used as
+// asked. Pure; a null out is ignored.
+void zone_onednn_scratch_reserve_target(bool    arena_active,
+                                        size_t  zone_capacity_bytes,
+                                        size_t  held_weights_bytes,
+                                        size_t  held_activations_bytes,
+                                        size_t  requested_weights_bytes,
+                                        size_t  requested_activations_bytes,
+                                        size_t * weights_bytes,
+                                        size_t * activations_bytes);
+
 // ---------------------------------------------------------------------------
 // Mispredict accounting
 // ---------------------------------------------------------------------------

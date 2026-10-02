@@ -322,6 +322,26 @@ bool zone_onednn_pp_scratch_planned(bool   arena_active,
     return weights_bytes + activations_bytes <= zone_capacity_bytes;
 }
 
+void zone_onednn_scratch_reserve_target(bool    arena_active,
+                                        size_t  zone_capacity_bytes,
+                                        size_t  held_weights_bytes,
+                                        size_t  held_activations_bytes,
+                                        size_t  requested_weights_bytes,
+                                        size_t  requested_activations_bytes,
+                                        size_t * weights_bytes,
+                                        size_t * activations_bytes) {
+    (void) arena_active;
+    (void) zone_capacity_bytes;
+    (void) held_weights_bytes;
+    (void) held_activations_bytes;
+    if (weights_bytes) {
+        *weights_bytes = requested_weights_bytes;  // RED stub: replaces the held pair, which is the defect
+    }
+    if (activations_bytes) {
+        *activations_bytes = requested_activations_bytes;
+    }
+}
+
 namespace {
 
 struct underestimate_record {

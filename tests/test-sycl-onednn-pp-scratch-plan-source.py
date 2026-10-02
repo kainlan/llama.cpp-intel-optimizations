@@ -16,6 +16,16 @@ was built with (zone_onednn_pp_scratch_planned over unified_cache_get_onednn_zon
 the graph-entry walk must ask that same question. The companion unit test (test-zone-sizing, Case 14) proves the
 arithmetic; this gate proves both consumers use it.
 
+Two follow-on facts, pinned here too:
+  * The direct unified_alloc that reserve_onednn_scratch made when the arena replan was refused (the
+    "growing through the unified cache" path) is itself an unplanned allocation. An op the plan routes elsewhere
+    is turned away at the one choke point every caller shares (acquire_onednn_pp_scratch), BEFORE reserve is
+    asked, and reserve refuses a request that still exceeds the zone after its replan attempt instead of
+    allocating around the plan.
+  * A smaller request must never shrink a held scratch: reserve sizes the new pair with
+    zone_onednn_scratch_reserve_target (per-component maximum with what is held), so a layer-0 request cannot
+    replace the block a later op needed and force the regrowth that failed.
+
 Run with --self-test to prove every check fires against a mutant of the thing it forbids.
 """
 import argparse
@@ -103,6 +113,8 @@ def statements_calling(body, callee):
 
 
 HELPER = "ggml_sycl_onednn_pp_scratch_planned("
+# The already-reserved reuse test in reserve_onednn_scratch (its first code line).
+REUSE_TEST = "if (onednn_weights_scratch_ && onednn_activations_scratch_ && onednn_weights_scratch_size_ >= weights_size"
 
 
 def evaluate(backend, cache, cache_hpp):
@@ -132,6 +144,37 @@ def evaluate(backend, cache, cache_hpp):
         "unified_cache_get_planned_onednn_scratchpad_bytes" not in helper
     results["the accessor reports the ONEDNN zone"] = \
         "vram_zone_id::ONEDNN" in accessor and "arena_active()" in accessor
+
+    # The choke point: every caller reaches reserve_onednn_scratch through acquire_onednn_pp_scratch, and an op the
+    # plan routes elsewhere must be refused there, before the reserve (whose replan attempt also bumps the stored
+    # plan upward) is ever asked.
+    acquire = function_body(backend, r"static bool acquire_onednn_pp_scratch\([^)]*\)\s*\{")
+    results["anchor: acquire_onednn_pp_scratch exists"] = acquire is not None
+    if acquire is not None:
+        gate_at = acquire.find("ggml_sycl_onednn_pp_scratch_planned_bytes(")
+        reserve_at = acquire.find("unified_cache_reserve_onednn_scratch(")
+        results["acquire asks the plan before it asks for a reserve"] = 0 <= gate_at < reserve_at
+        results["acquire turns an unplanned op away"] = \
+            gate_at >= 0 and "return false" in acquire[gate_at:reserve_at if reserve_at > 0 else len(acquire)]
+
+    reserve = function_body(cache, r"bool unified_cache::reserve_onednn_scratch\([^)]*\)\s*\{")
+    results["anchor: reserve_onednn_scratch exists"] = reserve is not None
+    if reserve is not None:
+        starts = [m.start() for m in re.finditer(re.escape("if (total_needed > zone_cap) {"), reserve)]
+        results["anchor: reserve compares the request with the zone"] = len(starts) >= 2
+        if len(starts) >= 2:
+            # The second comparison is the one AFTER the replan attempt; the first is the replan trigger itself.
+            after_replan = function_body(reserve[starts[-1]:], r"if \(total_needed > zone_cap\) \{") or ""
+            results["reserve refuses an over-zone request after its replan attempt"] = \
+                "return finish(false)" in after_replan
+            results["reserve does not allocate around the plan for an over-zone request"] = \
+                "arena_zone_exhausted" not in after_replan
+        results["reserve no longer labels an over-zone request a direct-growth cause"] = \
+            "zone_undersized" not in reserve
+        results["reserve sizes the pair with the never-shrink target"] = \
+            "zone_onednn_scratch_reserve_target(" in reserve
+        results["the never-shrink target runs before the already-reserved test"] = \
+            0 <= reserve.find("zone_onednn_scratch_reserve_target(") < reserve.find(REUSE_TEST)
 
     # Both consumers ask it, every time they ask whether oneDNN PP supplies the f16 copies.
     op_candidate = re.search(r"const bool legacy_pp_scratch_candidate\s*=([^;]*);", op_sycl)
@@ -205,6 +248,25 @@ if args.self_test and not failed:
         ("accessor reports another zone", "the accessor reports the ONEDNN zone",
          (backend, mutate_in_func(cache, r"bool unified_cache_get_onednn_zone_capacity\(",
                                   "vram_zone_id::ONEDNN", "vram_zone_id::RUNTIME"), cache_hpp)),
+        ("acquire without the plan", "acquire asks the plan before it asks for a reserve",
+         (mutate_in_func(backend, r"static bool acquire_onednn_pp_scratch\(",
+                         "ggml_sycl_onednn_pp_scratch_planned_bytes(", "ggml_sycl_XXXX("), cache, cache_hpp)),
+        ("acquire gate after the reserve", "acquire asks the plan before it asks for a reserve",
+         (mutate_in_func(backend, r"static bool acquire_onednn_pp_scratch\(",
+                         "unified_cache_reserve_onednn_scratch(",
+                         "ggml_sycl_onednn_pp_scratch_planned_bytes(0,0,0); ggml_sycl::unified_cache_reserve_onednn_scratch("),
+          cache, cache_hpp)),
+        ("reserve grows around the plan", "reserve refuses an over-zone request after its replan attempt",
+         (backend, mutate_in_func(cache, r"bool unified_cache::reserve_onednn_scratch\(",
+                                  "return finish(false);\n        }\n        if (total_needed <= zone_cap)",
+                                  "}\n        if (total_needed <= zone_cap)"), cache_hpp)),
+        ("reserve shrinks a held scratch", "reserve sizes the pair with the never-shrink target",
+         (backend, mutate_in_func(cache, r"bool unified_cache::reserve_onednn_scratch\(",
+                                  "zone_onednn_scratch_reserve_target(", "zone_XXXX("), cache_hpp)),
+        ("target after the reuse test", "the never-shrink target runs before the already-reserved test",
+         (backend, mutate_in_func(cache, r"bool unified_cache::reserve_onednn_scratch\(",
+                                  REUSE_TEST, "zone_onednn_scratch_reserve_target(" + REUSE_TEST),
+          cache_hpp)),
         ("accessor undeclared", "the zone-capacity accessor is declared",
          (backend, cache, mutate(cache_hpp, "unified_cache_get_onednn_zone_capacity(", "unified_cache_get_XXXX("))),
     ]

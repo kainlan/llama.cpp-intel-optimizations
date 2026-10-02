@@ -729,6 +729,35 @@ int main() {
               "an overflowing pair is refused, not wrapped into a small sum");
     }
 
+    // ---- Case 15: a smaller request never shrinks a held oneDNN scratch (llama.cpp-8ony) ----
+    // Perplexity chunk 2, layer 0: a 512-row attention op (weights 23.6 MB, activations 2.9 MB) arrived while the
+    // cache held the LM head's pair (weights 1104.6 MiB, activations 1.4 MB for 256 rows). Replacing the pair by
+    // the request freed the big weights block; the head then had to regrow it and could not.
+    {
+        const size_t mib = 1024u * 1024u;
+        size_t       w   = 0;
+        size_t       a   = 0;
+
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 0, 0, 24 * mib, 3 * mib, &w, &a);
+        CHECK(w == 24 * mib && a == 3 * mib, "nothing held: the request is the target");
+
+        ggml_sycl::zone_onednn_scratch_reserve_target(false, 0, 1105 * mib, 1 * mib, 24 * mib, 3 * mib, &w, &a);
+        CHECK(w == 1105 * mib, "a smaller weights request never shrinks the held weights block");
+        CHECK(a == 3 * mib, "a larger activations request still grows the activations half on its own");
+
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 100 * mib, 2 * mib, 50 * mib, 3 * mib, &w, &a);
+        CHECK(w == 100 * mib && a == 3 * mib, "inside the zone the merged pair is the target");
+
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 200 * mib, 2 * mib, 50 * mib, 100 * mib, &w, &a);
+        CHECK(w == 50 * mib && a == 100 * mib,
+              "a merge that would overflow the zone falls back to the request instead of wedging every op");
+
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, SIZE_MAX, 1, 50 * mib, 3 * mib, &w, &a);
+        CHECK(w == 50 * mib && a == 3 * mib, "an unrepresentable merged sum is refused, not wrapped");
+
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 1, 1, 2, 2, nullptr, nullptr);
+    }
+
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");
     return 0;
 }
