@@ -739,7 +739,7 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
     return procs;
 }
 
-// The L4 entry points (the tenant publish, coverage query and load-time late check). The backend
+// The L4 entry points (the tenant publish, coverage query, load-time late check and residency probe). The backend
 // declares them in ggml-sycl.h; a backend that does not define them answers a null proc address
 // and the readers in llama-context-tenant.h then fail closed. Every link mode resolves them the
 // same way, through the SYCL reg's proc address by the names ggml-sycl-l4-procs.h pins, from the
@@ -755,6 +755,8 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
         reinterpret_cast<decltype(procs.coverage)>(llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_TENANT_COVERAGE));
     procs.late_check =
         reinterpret_cast<decltype(procs.late_check)>(llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_LATE_CHECK));
+    procs.probe_residency = reinterpret_cast<decltype(procs.probe_residency)>(
+        llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_PROBE_RESIDENCY));
     return procs;
 }
 

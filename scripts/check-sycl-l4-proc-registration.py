@@ -621,14 +621,14 @@ def probe_pins(source, fails):
     if returns.count("GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED") != 1 or not re.search(
             r"return GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED;\s*\}$", body):
         fails.append("L4 probe: the proc does not end by answering GEOMETRY_NOT_WIRED")
-    if "out->n_layer =" not in body:
+    if "out->n_layer = (uint32_t) parsed.kv.layers.size();" not in body:
         fails.append("L4 probe: the proc does not write the layer count it was asked about")
-    if body.count('GGML_LOG_WARN("[RESIDENCY-PROBE]') < 1:
+    if not re.search(r'GGML_LOG_WARN\(\s*"\[RESIDENCY-PROBE\][^"]*"(?:[^;"]|"[^"]*")*;\s*return GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED;', body):
         fails.append("L4 probe: the proc does not say why it did not answer, at WARN")
     # the llama side: one table entry through the reg, one door
     fill = ("procs.probe_residency = reinterpret_cast<decltype(procs.probe_residency)>("
             "llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_PROBE_RESIDENCY));")
-    if source.count(fill) != 1:
+    if re.sub(r"\s+", "", source).count(re.sub(r"\s+", "", fill)) != 1:
         fails.append("L4 probe: the llama table does not resolve the probe through the reg by its macro, once")
     calls = re.findall(r"(?:\.|->)\s*probe_residency\s*\)?\s*\(", source)
     if len(calls) != 1:
@@ -1572,6 +1572,44 @@ def mutations(header_raw, source):
          r"\bvoid\s+ggml_backend_sycl_set_runtime_n_ctx\s*\(", "ggml_backend_sycl_set_runtime_context(backend,",
          "(void) ggml_sycl_run_runtime_context_transaction(backend,"),
     ]
+    # (step 3d) the residency probe's body and its one door
+    scoped.extend([
+        ("the probe writes host_resident before step 1d", "touches host_resident", SIG_PROBE,
+         "    out->n_layer = 0;\n    sycl_module_mutation_guard module_guard;",
+         "    out->n_layer = 0;\n    out->host_resident[0] = 0;\n    sycl_module_mutation_guard module_guard;"),
+        ("the probe answers OK where it answers not-wired", "returns something other than a named refusal enumerator", SIG_PROBE,
+         "    return GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED;\n}",
+         "    return GGML_SYCL_RESIDENCY_PROBE_OK;\n}"),
+        ("the probe's not-wired answer is a bare number", "returns something other than a named refusal enumerator", SIG_PROBE,
+         "    return GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED;\n}",
+         "    return (ggml_sycl_residency_probe_status) 2;\n}"),
+        ("the probe answers OK for a foreign backend", "returns something other than a named refusal enumerator", SIG_PROBE,
+         "        return GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND;",
+         "        return GGML_SYCL_RESIDENCY_PROBE_OK;"),
+        ("the probe answers a lifecycle result", "returns something other than a named refusal enumerator", SIG_PROBE,
+         "        return GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND;",
+         "        return (ggml_sycl_residency_probe_status) GGML_SYCL_LIFECYCLE_OK;"),
+        ("the probe no longer writes the layer count", "does not write the layer count", SIG_PROBE,
+         "            out->n_layer = (uint32_t) parsed.kv.layers.size();\n", ""),
+        ("the probe's not-wired answer says nothing", "does not say why it did not answer",  SIG_PROBE,
+         re.compile(r'    GGML_LOG_WARN\(\n\s*"\[RESIDENCY-PROBE\] no answer: the zone geometry[^"]*"(?:[^;"]|"[^"]*")*;\n'), ""),
+        ("the probe's not-wired answer is not the last statement", "does not end by answering GEOMETRY_NOT_WIRED", SIG_PROBE,
+         "    return GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED;\n}",
+         "    return GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED;\n    return GGML_SYCL_RESIDENCY_PROBE_INVALID;\n}"),
+        ("the probe names the OK enumerator in a dead branch", "names OK or a lifecycle result", SIG_PROBE,
+         "    (void) model;\n", "    (void) model;\n    if (false) { (void) GGML_SYCL_RESIDENCY_PROBE_OK; }\n"),
+    ])
+    pairs.append(("the llama table resolves the probe by a string literal", "does not resolve the probe through the reg by its macro",
+                  "llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_PROBE_RESIDENCY)",
+                  "llama_context_sycl_proc_addr(dev, \"ggml_backend_sycl_probe_residency\")"))
+    pairs.append(("the door calls the proc twice", "the proc pointer is called 2 times",
+                  "    const ggml_sycl_residency_probe_status r = procs.probe_residency(",
+                  "    (void) procs.probe_residency(nullptr, ggml_sycl_model_token{}, 0, 0, 0, false, false, false, nullptr, nullptr);\n"
+                  "    const ggml_sycl_residency_probe_status r = procs.probe_residency("))
+    pairs.append(("a second door in the context's own file", "the proc pointer is called 2 times",
+                  "    procs.probe_residency = reinterpret_cast<decltype(procs.probe_residency)>(",
+                  "    (void) procs.probe_residency(nullptr, ggml_sycl_model_token{}, 0, 0, 0, false, false, false, nullptr, nullptr);\n"
+                  "    procs.probe_residency = reinterpret_cast<decltype(procs.probe_residency)>("))
     for label, msg, sig, old, new in scoped:
         span = function_span(src, sig)
         if isinstance(old, str):
@@ -1622,6 +1660,32 @@ def mutations(header_raw, source):
         else:
             muts.append((label, msg, header_raw, src.replace(old, new, 1)))
     return muts
+
+
+def door_mutations(texts):
+    """Each entry: (label, expected message fragment, texts).  The door's files are separate from the pinned source text,
+    so its mutants edit these."""
+    muts = []
+    victim = next(iter(texts))
+    for label, msg, tail in (
+            ("a file under src/ calls the probe pointer", "calls the probe proc pointer",
+             "\nstatic void h_door1(llama_sycl_l4_procs & procs) { procs.probe_residency(nullptr); }\n"),
+            ("a file under src/ calls it through a pointer", "calls the probe proc pointer",
+             "\nstatic void h_door2(llama_sycl_l4_procs * p) { p->probe_residency(nullptr); }\n"),
+            ("a file under src/ calls it through a parenthesised pointer", "calls the probe proc pointer",
+             "\nstatic void h_door3(llama_sycl_l4_procs & procs) { (procs.probe_residency)(nullptr); }\n"),
+            ("a file under src/ names the symbol", "names ggml_backend_sycl_probe_residency",
+             "\nstatic void * h_door4 = (void *) ggml_backend_sycl_probe_residency;\n"),
+            ("a file under src/ calls the symbol", "names ggml_backend_sycl_probe_residency",
+             "\nstatic void h_door5() { ggml_backend_sycl_probe_residency(nullptr); }\n")):
+        mutated = dict(texts)
+        mutated[victim] = texts[victim] + tail
+        muts.append((label, msg, mutated))
+    muts.append(("the scan reads nothing", "the scan is void", {}))
+    # the table field's type names the symbol and is allowed
+    allowed = dict(texts)
+    allowed[victim] = texts[victim] + "\nstatic decltype(&ggml_backend_sycl_probe_residency) h_ok = nullptr;\n"
+    return muts, allowed
 
 
 def normalize(text):
@@ -1676,6 +1740,17 @@ def main():
                 status = 1
                 continue
             got = check(h, s)
+            if not any(msg in g for g in got):
+                print("FAIL: mutation survived: %s (wanted a failure containing %r, got %s)" % (label, msg, got[:2]))
+                status = 1
+            elif args.verbose:
+                print("DIED: %s -> %s" % (label, next(g for g in got if msg in g)))
+        door_muts, door_allowed = door_mutations(door_texts(args.root))
+        if door_check(door_allowed):
+            print("FAIL: the table field's decltype is refused by the door scan: %s" % door_check(door_allowed)[:1])
+            status = 1
+        for label, msg, texts in door_muts:
+            got = door_check(texts)
             if not any(msg in g for g in got):
                 print("FAIL: mutation survived: %s (wanted a failure containing %r, got %s)" % (label, msg, got[:2]))
                 status = 1

@@ -102,21 +102,27 @@ struct runtime_context_section {
     std::vector<runtime_context_tenant> tenants;
     uint64_t                            tenant_key      = 0;
     bool                                tenants_planned = false;
+    // The forced-host section of a version-2 descriptor (a version-1 publisher has none): layer ids sorted and
+    // duplicate-free, and the no_promotion flag.  They are not in tenant_key, which is the tenants' digest.
+    std::vector<uint32_t>               forced_host;
+    bool                                no_promotion = false;
 };
 
 enum class runtime_context_desc_status : uint8_t {
     OK = 0,
     NULL_DESC,
-    SHORT_STRUCT,     // struct_size below the version-1 layout
-    UNKNOWN_VERSION,  // a version this reader does not know
-    BAD_PAD,          // pad0 is not 0
-    BAD_FLAG,         // a flag byte other than 0 or 1
-    BAD_ARRAY,        // a count with no array, a stride below the element, or a count above the cap
-    BAD_ELEMENT,      // an element whose own struct_size is below the element layout
-    UNKNOWN_COHORT,   // a cohort id the table does not know
-    BAD_DEVICE,       // a device-tier element off the device range, or a host-tier one not on -1
-    ZERO_SLOT,        // an element with no bytes: there is nothing to carve or to claim
-    DUPLICATE_SLOT,   // two elements at one (device, cohort, slot_index)
+    SHORT_STRUCT,        // struct_size below the version-1 layout
+    UNKNOWN_VERSION,     // a version this reader does not know
+    BAD_PAD,             // pad0 is not 0
+    BAD_FLAG,            // a flag byte other than 0 or 1
+    BAD_ARRAY,           // a count with no array, a stride below the element, or a count above the cap
+    BAD_ELEMENT,         // an element whose own struct_size is below the element layout
+    UNKNOWN_COHORT,      // a cohort id the table does not know
+    BAD_DEVICE,          // a device-tier element off the device range, or a host-tier one not on -1
+    ZERO_SLOT,           // an element with no bytes: there is nothing to carve or to claim
+    DUPLICATE_SLOT,      // two elements at one (device, cohort, slot_index)
+    FORCED_INDEX_RANGE,  // a forced-host index at or past n_layer
+    DUPLICATE_FORCED,    // one layer forced twice
 };
 
 inline const char * runtime_context_desc_status_text(runtime_context_desc_status s) {
@@ -126,11 +132,11 @@ inline const char * runtime_context_desc_status_text(runtime_context_desc_status
         case runtime_context_desc_status::NULL_DESC:
             return "null descriptor";
         case runtime_context_desc_status::SHORT_STRUCT:
-            return "descriptor struct_size is below the version-1 layout";
+            return "descriptor struct_size is below its version's layout";
         case runtime_context_desc_status::UNKNOWN_VERSION:
             return "descriptor version is not known to this backend";
         case runtime_context_desc_status::BAD_PAD:
-            return "descriptor pad0 is not 0";
+            return "descriptor pad is not 0";
         case runtime_context_desc_status::BAD_FLAG:
             return "descriptor flag byte is not 0 or 1";
         case runtime_context_desc_status::BAD_ARRAY:
@@ -145,6 +151,10 @@ inline const char * runtime_context_desc_status_text(runtime_context_desc_status
             return "tenant element has no bytes";
         case runtime_context_desc_status::DUPLICATE_SLOT:
             return "two tenant elements share one (device, cohort, slot_index)";
+        case runtime_context_desc_status::FORCED_INDEX_RANGE:
+            return "forced-host index is at or past n_layer";
+        case runtime_context_desc_status::DUPLICATE_FORCED:
+            return "one layer is forced to the host twice";
     }
     return "unknown";
 }
@@ -195,11 +205,12 @@ inline bool array_ok(const void * base, uint32_t count, uint32_t stride, size_t 
 // Reads `desc` once into `out`.  `n_devices` is the number of SYCL devices a device-tier
 // element may name.  On any refusal `out` is left empty and the status says which gate.
 //
-// The gates, in order: null; struct_size below the version-1 layout (a reader treats a field
-// beyond the publisher's struct_size as absent, and version 1 has no absent field); an unknown
-// version; pad0; the flag bytes; each array's count, stride and base; then every element
-// under its own struct_size and the cohort table.  A struct_size above this build's is read
-// as far as this build's layout goes.
+// The gates, in order: null; struct_size below the version-1 layout; an unknown version (1 and 2 are
+// known); struct_size below version 2's layout for a version-2 descriptor (a version-1 publisher's
+// fields beyond its struct_size are absent: no forced layers, no_promotion off); the pads; the flag
+// bytes; each array's count, stride and base; then every element under its own struct_size and the
+// cohort table, and last the forced-host indices (each below n_layer, none twice).  A struct_size
+// above this build's is read as far as this build's layout goes.
 inline runtime_context_desc_status parse_runtime_context_desc(const ggml_sycl_runtime_context_desc * desc,
                                                               const runtime_context_geometry &       geometry,
                                                               int                                    n_devices,
@@ -209,16 +220,22 @@ inline runtime_context_desc_status parse_runtime_context_desc(const ggml_sycl_ru
     if (desc == nullptr) {
         return status::NULL_DESC;
     }
-    if (desc->struct_size < sizeof(ggml_sycl_runtime_context_desc)) {
+    // A version-1 publisher is read as far as its own struct_size goes: the forced-host section is beyond it and
+    // so absent.  Version 2 needs the whole struct.  An unknown version is refused whatever its size.
+    if (desc->struct_size < GGML_SYCL_RUNTIME_CONTEXT_DESC_V1_SIZE) {
         return status::SHORT_STRUCT;
     }
-    if (desc->version != GGML_SYCL_RUNTIME_CONTEXT_DESC_VERSION) {
+    if (desc->version != 1 && desc->version != GGML_SYCL_RUNTIME_CONTEXT_DESC_VERSION) {
         return status::UNKNOWN_VERSION;
     }
-    if (desc->pad0 != 0) {
+    const bool has_forced = desc->version >= 2;
+    if (has_forced && desc->struct_size < sizeof(ggml_sycl_runtime_context_desc)) {
+        return status::SHORT_STRUCT;
+    }
+    if (desc->pad0 != 0 || (has_forced && (desc->pad1[0] != 0 || desc->pad1[1] != 0 || desc->pad1[2] != 0))) {
         return status::BAD_PAD;
     }
-    if (desc->v_trans > 1 || desc->no_alloc > 1 || desc->sidecar > 1) {
+    if (desc->v_trans > 1 || desc->no_alloc > 1 || desc->sidecar > 1 || (has_forced && desc->no_promotion > 1)) {
         return status::BAD_FLAG;
     }
     if (!runtime_context_detail::array_ok(desc->layers, desc->n_layer, desc->layer_desc_size,
@@ -226,7 +243,9 @@ inline runtime_context_desc_status parse_runtime_context_desc(const ggml_sycl_ru
         !runtime_context_detail::array_ok(desc->tenants, desc->n_tenants, desc->tenant_desc_size,
                                           sizeof(ggml_sycl_context_tenant_desc)) ||
         !runtime_context_detail::array_ok(desc->rs_layers, desc->n_rs_layer, desc->rs_layer_desc_size,
-                                          sizeof(ggml_sycl_rs_layer_desc))) {
+                                          sizeof(ggml_sycl_rs_layer_desc)) ||
+        (has_forced && !runtime_context_detail::array_ok(desc->forced_host, desc->n_forced_host, sizeof(uint32_t),
+                                                         sizeof(uint32_t)))) {
         return status::BAD_ARRAY;
     }
 
@@ -272,6 +291,19 @@ inline runtime_context_desc_status parse_runtime_context_desc(const ggml_sycl_ru
         if (!runtime_context_tenant_less(s.tenants[i - 1], s.tenants[i])) {
             return status::DUPLICATE_SLOT;
         }
+    }
+    if (has_forced) {
+        for (uint32_t i = 0; i < desc->n_forced_host; ++i) {
+            if (desc->forced_host[i] >= desc->n_layer) {
+                return status::FORCED_INDEX_RANGE;
+            }
+            s.forced_host.push_back(desc->forced_host[i]);
+        }
+        std::sort(s.forced_host.begin(), s.forced_host.end());
+        if (std::adjacent_find(s.forced_host.begin(), s.forced_host.end()) != s.forced_host.end()) {
+            return status::DUPLICATE_FORCED;
+        }
+        s.no_promotion = desc->no_promotion != 0;
     }
     s.tenant_key      = runtime_context_tenant_key(s.tenants);
     s.tenants_planned = !s.tenants.empty();
@@ -320,8 +352,9 @@ inline bool runtime_context_kv_shape_equal(const runtime_context_kv_shape & a, c
 // has a published slot at the same (device, cohort, slot_index) with at least its bytes.  The
 // shape demands no more when the KV and recurrent-state sections are the same, kv_unified,
 // swa_full and flash_attn are the same (a flip changes the cell count or adds the non-FA staging
-// in a direction this reader does not model), the plan state (tenants_planned) is the same,
-// and each of n_ctx, n_ubatch and n_seq_max is at most the published value.  A candidate with
+// in a direction this reader does not model), the plan state (tenants_planned) is the same, the forced-host set
+// and no_promotion are the same (a different forced set changes the residency the committed plan must keep, so
+// it is growth either way), and each of n_ctx, n_ubatch and n_seq_max is at most the published value.  A candidate with
 // a zero n_ctx, n_ubatch or n_seq_max has no shape to compare (the ledger refuses a zero n_ctx
 // for the same reason), so it is GROWTH, never coverage.
 // EQUAL only when the geometry, the shape and every slot are byte-equal.
@@ -334,9 +367,9 @@ inline ggml_sycl_tenant_coverage classify_tenant_coverage(const runtime_context_
     const runtime_context_geometry & c = candidate.geometry;
     if (c.n_ctx == 0 || c.n_ubatch == 0 || c.n_seq_max == 0 ||
         !runtime_context_kv_shape_equal(published->kv, candidate.kv) ||
-        published->tenants_planned != candidate.tenants_planned || c.kv_unified != p.kv_unified ||
-        c.swa_full != p.swa_full || c.flash_attn != p.flash_attn || c.n_ctx > p.n_ctx || c.n_ubatch > p.n_ubatch ||
-        c.n_seq_max > p.n_seq_max) {
+        published->tenants_planned != candidate.tenants_planned || published->forced_host != candidate.forced_host ||
+        published->no_promotion != candidate.no_promotion || c.kv_unified != p.kv_unified || c.swa_full != p.swa_full ||
+        c.flash_attn != p.flash_attn || c.n_ctx > p.n_ctx || c.n_ubatch > p.n_ubatch || c.n_seq_max > p.n_seq_max) {
         return GGML_SYCL_TENANT_COVERAGE_GROWTH;
     }
     for (const runtime_context_tenant & e : candidate.tenants) {

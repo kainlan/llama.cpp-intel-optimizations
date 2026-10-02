@@ -117,6 +117,7 @@
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
+#include "ggml-sycl/residency-probe.hpp"
 #include "ggml-sycl/runtime-context-section.hpp"
 #include "ggml-sycl/set.hpp"
 #include "ggml-sycl/set_rows.hpp"
@@ -20581,6 +20582,80 @@ enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check(ggml_sycl_loa
     } catch (...) {
         return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
     }
+}
+
+// The residency probe (llama.cpp-moua L4 step 3d, llama.cpp-5cim): which layers would this context's plan leave in host
+// memory?  The core that answers is residency-probe.hpp's; what it needs and this entry cannot yet give it is the live
+// shared-zone geometry of each device and the planned device of each layer, which step 1d wires.  Until then the proc
+// validates what it is handed and answers GEOMETRY_NOT_WIRED: a status of its own that is not OK, carries no vector and
+// is not "zero host layers".  It writes the layer count and nothing else of the answer, and says why at WARN on every
+// refusal.  Pure plan query: it takes no replan lock and no lifecycle lease and changes nothing.
+enum ggml_sycl_residency_probe_status ggml_backend_sycl_probe_residency(ggml_backend_t        backend,
+                                                                        ggml_sycl_model_token model,
+                                                                        uint32_t              n_ctx,
+                                                                        uint32_t              n_ubatch,
+                                                                        uint32_t              n_seq_max,
+                                                                        bool                  kv_unified,
+                                                                        bool                  swa_full,
+                                                                        bool                  flash_attn_enabled,
+                                                                        const ggml_sycl_runtime_context_desc * desc,
+                                                                        struct ggml_sycl_residency_probe *     out) {
+    (void) model;
+    if (out == nullptr || out->struct_size < sizeof(*out) || out->version != GGML_SYCL_RESIDENCY_PROBE_VERSION) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] refused: the result struct is missing, short or of another version\n");
+        return GGML_SYCL_RESIDENCY_PROBE_INVALID;
+    }
+    out->n_layer = 0;
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] no answer: the SYCL module is closing\n");
+        return GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED;
+    }
+    if (!backend || !backend->context || !ggml_backend_is_sycl(backend) || !backend->device ||
+        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] refused: not a SYCL backend of this module\n");
+        return GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND;
+    }
+    if (n_ctx == 0 || n_ubatch == 0 || n_seq_max == 0) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] refused: the shape has a zero n_ctx, n_ubatch or n_seq_max (%u, %u, %u)\n",
+                      n_ctx, n_ubatch, n_seq_max);
+        return GGML_SYCL_RESIDENCY_PROBE_INVALID;
+    }
+    try {
+        if (desc != nullptr) {
+            ggml_sycl::runtime_context_geometry geometry;
+            geometry.n_ctx      = n_ctx;
+            geometry.n_ubatch   = n_ubatch;
+            geometry.n_seq_max  = n_seq_max;
+            geometry.kv_unified = kv_unified;
+            geometry.swa_full   = swa_full;
+            geometry.flash_attn = flash_attn_enabled;
+            ggml_sycl::runtime_context_section parsed;
+            const auto                         status = ggml_sycl::parse_runtime_context_desc(
+                desc, geometry, std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES), parsed);
+            if (status != ggml_sycl::runtime_context_desc_status::OK) {
+                GGML_LOG_WARN("[RESIDENCY-PROBE] refused: the descriptor is malformed: %s\n",
+                              ggml_sycl::runtime_context_desc_status_text(status));
+                return GGML_SYCL_RESIDENCY_PROBE_INVALID;
+            }
+            out->n_layer = (uint32_t) parsed.kv.layers.size();
+        }
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (...) {
+        out->n_layer = 0;
+        GGML_LOG_WARN("[RESIDENCY-PROBE] no answer: reading the descriptor threw\n");
+        return GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED;
+    }
+    if (out->n_layer_cap < out->n_layer) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] refused: the answer covers %u layers and the caller's buffer holds %u\n",
+                      out->n_layer, out->n_layer_cap);
+        return GGML_SYCL_RESIDENCY_PROBE_N_LAYER_CAP_TOO_SMALL;
+    }
+    GGML_LOG_WARN(
+        "[RESIDENCY-PROBE] no answer: the zone geometry is not wired to the probe yet (step 1d); n_layer=%u\n",
+        out->n_layer);
+    return GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED;
 }
 
 // llama.cpp-oyfl: a NARROW re-evaluation of the non-FA attention scratch
@@ -114623,7 +114698,7 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_for_model") == 0) {
         return (void *) ggml_backend_sycl_set_runtime_context_for_model;
     }
-    // The L4 descriptor publish, the coverage read and the late check.  Each name is the "Proc name:"
+    // The L4 descriptor publish, the coverage read, the late check and the residency probe.  Each name is the "Proc name:"
     // its declaration in ggml-sycl.h carries; scripts/check-sycl-l4-proc-registration.py pins that
     // every such name in the header has an arm here.
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_desc") == 0) {
@@ -114634,6 +114709,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_load_late_check") == 0) {
         return (void *) ggml_backend_sycl_load_late_check;
+    }
+    if (strcmp(name, "ggml_backend_sycl_probe_residency") == 0) {
+        return (void *) ggml_backend_sycl_probe_residency;
     }
     if (strcmp(name, "ggml_backend_sycl_recheck_runtime_context_flash_attn") == 0) {
         return (void *) ggml_backend_sycl_recheck_runtime_context_flash_attn;
