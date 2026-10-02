@@ -203,6 +203,47 @@ int main() {
         check_descend("the first accepted rung wins; nothing smaller is tried", won, 256, tried, { 256 });
     }
 
+    // ---- A refused SETTLE publish (llama.cpp-kpjw, kpjw-g7). The B50 / Qwen run never reached the continuation
+    // above: the default 512 WON the ladder (its realized check read the card before the buffers were touched), 1024
+    // was refused at its probe, and the settle then republished the winner, where the transaction-time bound
+    // (plan + the 495 MB request recorded by 512's own reserve = 470 MB, 132.7 MB left) refused it. last_good was 512,
+    // not 0, so nothing lowered it and the context died with a bare result=19. The refusal of a winner is a refusal
+    // of that rung, and what is below it is tried. ----
+    {
+        std::vector<uint32_t> tried;
+        const uint32_t        won = llama_auto_ubatch_settle_refusal_descend(512, false, 2048, [&](uint32_t c) {
+            tried.push_back(c);
+            return c <= 256;
+        });
+        check_descend("B50 Qwen: the winner 512 is refused at the settle, 256 fits", won, 256, tried, { 256 });
+    }
+    {
+        std::vector<uint32_t> tried;
+        const uint32_t        won = llama_auto_ubatch_settle_refusal_descend(512, false, 2048, [&](uint32_t c) {
+            tried.push_back(c);
+            return false;
+        });
+        check_descend("a refused winner with nothing below it fitting: 0, every rung to the floor tried", won, 0, tried,
+                      { 256, 128, 64 });
+    }
+    {
+        std::vector<uint32_t> tried;
+        const uint32_t        won = llama_auto_ubatch_settle_refusal_descend(512, true, 2048, [&](uint32_t c) {
+            tried.push_back(c);
+            return true;
+        });
+        check_descend("the continuation already ran: it is not run twice", won, 0, tried, {});
+    }
+    {
+        // A ladder winner above the default (1024) that the settle refuses: the rung just under it is asked first.
+        std::vector<uint32_t> tried;
+        const uint32_t        won = llama_auto_ubatch_settle_refusal_descend(1024, false, 2048, [&](uint32_t c) {
+            tried.push_back(c);
+            return c <= 512;
+        });
+        check_descend("a refused 1024 winner lands on 512 before anything smaller", won, 512, tried, { 512 });
+    }
+
     if (g_failures != 0) {
         std::fprintf(stderr, "%d case(s) failed\n", g_failures);
         return 1;

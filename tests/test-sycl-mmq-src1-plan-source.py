@@ -1004,6 +1004,35 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
         "throw std::runtime_error(" in settle_catch and "no -ub from %u down to %u fits this context" in settle_catch and \
         "largest -ub that fits is about" in settle_catch and "llama_auto_ubatch_descent_floor" in settle_catch and \
         re.search(r"refusal_largest_ub\s*=\s*rung_largest_ub\s*;", try_fn) is not None
+    # kpjw-g7: the descent above only runs when NOTHING at or above the default won. The B50 run never got there: the
+    # default 512 won the ladder (the realized check reads the card before the buffers are touched), 1024 was refused
+    # at its probe, and the SETTLE then republished the winner, where the transaction-time bound (plan + the 495 MB
+    # request 512's own reserve recorded) refused it. last_good was 512, so nothing lowered it: a bare result=19.
+    # A refusal of the settle's publish is a refusal of that rung: it is recorded, and what lies below the refused
+    # rung is tried through the same try_candidate; only when nothing fits does the named error leave.
+    settle_gate = "if (!sched_matches_last_good || cparams.n_ubatch != last_good) {"
+    settle_at = select_fn.find(settle_gate)
+    settle_blk = balanced_block(select_fn, settle_at + len(settle_gate) - 1) if settle_at >= 0 else ""
+    refused_m = re.search(r"if\s*\(\s*settle_error\s*\)\s*\{", settle_blk)
+    refused_blk = balanced_block(settle_blk, refused_m.end() - 1) if refused_m else ""
+    store_at = select_fn.find("cache_store_fn(&cache_key")
+    results["a refused settle publish is recorded and routes into the descent from the refused rung, not out of the trial"] = \
+        settle_at > 0 and refused_m is not None and \
+        re.search(r"std::exception_ptr\s+settle_error\s*;", settle_blk) is not None and \
+        re.search(r"try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\)\s*;\s*\}\s*catch\s*\(\s*const std::exception\s*&\s*\)\s*\{\s*"
+                  r"settle_error\s*=\s*std::current_exception\(\)\s*;\s*\}", settle_blk) is not None and \
+        re.search(r"const uint32_t\s+refused_ub\s*=\s*last_good\s*;", refused_blk) is not None and \
+        re.search(r"llama_auto_ubatch_settle_refusal_descend\(\s*refused_ub\s*,\s*descent_ran\s*,\s*cap\s*,", refused_blk) is not None and \
+        re.search(r"return try_candidate\(c\)\s*==\s*nullptr\s*;", refused_blk) is not None and \
+        re.search(r"last_good\s*=\s*won\s*;", refused_blk) is not None and \
+        re.search(r"lowered_from\s*=\s*refused_ub\s*;", refused_blk) is not None and \
+        re.search(r"sycl_hold_spill_validated_ub\s*=\s*hold_spill_validated_ub\s*;", refused_blk) is not None and \
+        re.search(r"std::rethrow_exception\(\s*settle_error\s*\)", refused_blk) is not None and \
+        "throw std::runtime_error(" in refused_blk and "no -ub from %u down to %u fits this context" in refused_blk and \
+        "largest -ub that fits is about" in refused_blk and \
+        re.search(r"\}\s*else\s*\{\s*sched_need_reserve\s*=\s*true\s*;\s*sched_reserve\(\)\s*;\s*\}", settle_blk) is not None
+    results["the tuning-cache store runs after the settle, so a rung the settle refused is never persisted"] = \
+        settle_at > 0 and store_at > settle_at
     # r5 R7/R8: releasing the previous rung's buffers means the cached graph results too, not only the sched.
     results["the release drops every cached graph result and the active pointer, not only the sched"] = \
         re.search(r"for\s*\(\s*auto\s*&\s*res\s*:\s*gf_res_prev\s*\)\s*\{\s*res\.reset\(\)\s*;\s*\}", try_fn[:probe_at]) is not None and \
