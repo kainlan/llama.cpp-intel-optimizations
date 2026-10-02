@@ -52,11 +52,19 @@ behind a non-constant if(), or in a directory no add_subdirectory() visits still
 test property reaching the test through a CMake variable (`set_tests_properties(${NAME} ...)`) is not resolved. That is
 exactly how test-sycl-module-nodelete-source.py went unrun in a default build (registered inside the
 GGML_BACKEND_DL block): only the census, run against a configured build, catches that class. The ctest registration of
-the census covers GGML_SYCL=ON with GGML_BACKEND_DL=OFF only; other configurations are not censused. R3's reading of a
-guard is also bounded: a loop narrowed by something other than a comparison or a constant (a helper call that always
-returns False) still counts as running every test, and a main() status handed to another function (`report(main())`),
-or an exit built from a helper that ignores its argument, counts as consumed: dropped_status_calls follows direct
-statements, `if`/`with`/`try` nesting, assignments, `rc = main(); print(rc)` and `main() and 0`, not calls into helpers.
+the census covers GGML_SYCL=ON with GGML_BACKEND_DL=OFF only; other configurations are not censused. The census
+requires the gate's path to resolve into the source tree's tests/ directory, and `-c` to be exactly the pytest stub
+llama_test_pytest writes.
+
+R3's selector rule: a globals() loop is "plain" only when its
+selecting and skipping conditions are built from `.startswith(...)`, callable()/isinstance()/inspect.isfunction-style
+calls, the loop's own names and string constants. Any comparison, non-string constant, other call (a helper that
+always returns False included) or global name makes the loop not plain, and the gate is reported as unable to run
+itself. R3's reading of an exit is what stays bounded. dropped_status_calls follows a main()-style status through
+direct statements, `if`/`with`/`try` nesting, assignments, `rc = main(); print(rc)`, `main() and 0` and `if rc:` (which
+counts only when a branch exits with a failure status). It does not follow it through a helper (`report(main())`), a
+conditional expression with a constant on both sides (`0 if main() else 0`), arithmetic that zeroes it
+(`main() * 0`), a walrus, asyncio.run, or a method call (`G().main()`); a gate like that needs a reviewer.
 
 `--self-test` also proves the audit can fail: it plants each escape above (and the shapes that must stay clean) into
 temp trees, synthetic and a copy of the real tree (every CMakeLists.txt this audit scans), and requires each to be
@@ -219,8 +227,14 @@ def cmake_tokens(args):
     return tokens
 
 
-def command_gate(command_tokens):
-    """The tests/test-sycl-*.py file a test command [program, args...] runs, or None.
+def _is_pytest_stub(text):
+    """The `-c` script llama_test_pytest writes, line for line (trailing whitespace aside): a script that merely contains
+    its last line, or has a statement in front of it, is something else."""
+    return [line.rstrip() for line in text.strip().splitlines()] == [line.rstrip() for line in PYTEST_STUB_TEXT.strip().splitlines()]
+
+
+def command_gate_path(command_tokens):
+    """The path token of the tests/test-sycl-*.py file a test command [program, args...] runs, or None.
 
     The program must be an interpreter (python3, ${Python3_EXECUTABLE}, ${LLAMA_PYTHON3}): `cat gate.py` or
     `cmake -E echo gate.py` name the file without running it. The gate is the first .py argument, and only the flags in
@@ -230,13 +244,18 @@ def command_gate(command_tokens):
     if not command_tokens or not INTERPRETER.fullmatch(command_tokens[0]):
         return None
     rest = command_tokens[1:]
-    if len(rest) > 2 and rest[0] == "-c" and PYTEST_STUB in rest[1]:
+    if len(rest) > 2 and rest[0] == "-c" and _is_pytest_stub(rest[1]):
         rest = rest[2:]
     at = next((i for i, tok in enumerate(rest) if tok.endswith(".py")), None)
     if at is None or any(tok not in SAFE_INTERPRETER_FLAGS for tok in rest[:at]):
         return None
-    m = re.fullmatch(r"(?:.*/)?(test-sycl-[A-Za-z0-9_.-]+\.py)", rest[at])
-    return m.group(1) if m else None
+    return rest[at] if re.fullmatch(r"(?:.*/)?test-sycl-[A-Za-z0-9_.-]+\.py", rest[at]) else None
+
+
+def command_gate(command_tokens):
+    """The gate's file name: command_gate_path without the directory."""
+    path = command_gate_path(command_tokens)
+    return path.rsplit("/", 1)[-1] if path else None
 
 
 def registration_target(command, args):
@@ -638,6 +657,21 @@ def _returns_a_status(func):
     return False
 
 
+def _exits_with_failure(node):
+    """An exit call with a non-constant-0 status, or a raise that is not SystemExit(0)/SystemExit()/SystemExit(None).
+    `if rc: sys.exit(0)` decides on rc and still reports success, so it does not vindicate the status."""
+    if isinstance(node, ast.Call):
+        return _call_name(node) in EXIT_CALLS and _nonzero_exit(node)
+    if isinstance(node, ast.Raise):
+        exc = node.exc
+        if isinstance(exc, ast.Call) and _call_name(exc) == "SystemExit":
+            return _nonzero_exit(exc)
+        if isinstance(exc, ast.Name) and exc.id == "SystemExit":
+            return False  # a bare `raise SystemExit` exits 0
+        return True
+    return False
+
+
 def dropped_status_calls(text):
     """Names f such that a top-level `__main__` guard (anywhere inside it: under if/with/try too) calls `f()` although f
     returns a status, and does not pass that status to an exit: as a bare statement, assigned to a name that neither an
@@ -654,8 +688,7 @@ def dropped_status_calls(text):
                      if isinstance(call, ast.Call) and _call_name(call) in EXIT_CALLS and call.args]
         exit_names = set().union(*(_names(arg) for arg in exit_args)) if exit_args else set()
         for branch in (n for n in ast.walk(guard) if isinstance(n, ast.If)):
-            if any(isinstance(c, ast.Call) and _call_name(c) in EXIT_CALLS or isinstance(c, ast.Raise)
-                   for stmt in branch.body + branch.orelse for c in ast.walk(stmt)):
+            if any(_exits_with_failure(c) for stmt in branch.body + branch.orelse for c in ast.walk(stmt)):
                 exit_names |= _names(branch.test)  # `if rc: sys.exit(rc)` / `if missing: raise SystemExit(77)` decide on it
         for node in ast.walk(guard):
             call, name = None, None
@@ -700,7 +733,8 @@ def audit(root, require_footer=REQUIRE_PYTEST_FOOTER, allowlist=None, missing_al
     gates = sorted((root / "tests").glob("test-sycl-*.py"))
     if len(gates) < min_gates:
         problems.append("R6 only %d tests/test-sycl-*.py gates found under %s (floor %d): the tests directory moved, or "
-                        "gates were deleted, and the audit would otherwise pass over nothing" % (len(gates), root, min_gates))
+                        "gates were deleted, and the audit would otherwise pass over nothing (a deliberate removal: lower "
+                        "MIN_GATES, suggested floor %d)" % (len(gates), root, min_gates, suggested_min_gates(len(gates))))
     names = {gate.name for gate in gates}
     for gate in gates:
         text = gate.read_text(errors="replace")
@@ -888,6 +922,7 @@ R3_CASES = [
     ("r3-script-main-if-rc-prints-else-exits-0", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        print("failed")\n    else:\n        sys.exit(0)\n', REG_P_ADD, "R3 test-sycl-p.py"),
     ("r3-script-main-if-rc-only-prints", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        print("failed")\n', REG_P_ADD, "R3 test-sycl-p.py"),
     ("r3-script-main-if-rc-raises-system-exit-0", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        raise SystemExit(0)\n', REG_P_ADD, "R3 test-sycl-p.py"),
+    ("r3-script-main-if-rc-raises-bare-system-exit", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        raise SystemExit\n', REG_P_ADD, "R3 test-sycl-p.py"),
     ("r3-ok-script-main-if-not-rc-else-exit", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if not rc:\n        print("ok")\n    else:\n        sys.exit(rc)\n', REG_P_ADD, None),
     ("r3-ok-script-main-if-rc-raises-failure", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        raise SystemExit(77)\n', REG_P_ADD, None),
     ("r3-ok-script-main-if-rc-exits-nonzero-else-exits-0", MAIN_FN + '\nif __name__ == "__main__":\n    rc = main()\n    if rc:\n        sys.exit(rc)\n    else:\n        sys.exit(0)\n', REG_P_ADD, None),
@@ -996,12 +1031,18 @@ def write_tree(tmp, gates, cmake):
     (tmp / "tests" / "CMakeLists.txt").write_text(cmake)
 
 
+def suggested_min_gates(real_count):
+    """A floor inside the band: the real count rounded down to a multiple of 5 (never below 90% of it)."""
+    return min(real_count, max(-(-9 * real_count // 10), real_count // 5 * 5))
+
+
 def min_gates_band_problem(min_gates, real_count):
     """The R6 floor must track the real gate count: far below it and many gates could vanish silently, above it and the
     audit would fail on a healthy tree. Returns the problem text, or None when MIN_GATES is within 10% below the count."""
     if 0.9 * real_count <= min_gates <= real_count:
         return None
-    return "MIN_GATES is %d but %d gates exist: keep the floor within 10%% below the real count" % (min_gates, real_count)
+    return ("MIN_GATES is %d but %d gates exist: keep the floor within 10%% below the real count (suggested floor %d)"
+            % (min_gates, real_count, suggested_min_gates(real_count)))
 
 
 def self_test():
@@ -1059,6 +1100,8 @@ llama_test_pytest(${Python3_EXECUTABLE}
         write_tree(tree, clean_gates, clean_cmake)
         if not any("R6" in p for p in audit(tree, allowlist={}, missing_allowlist={}, min_gates=3)):
             failures.append("floor: a tree below the gate floor was not reported")
+        if not any("R6" in p and "suggested floor 2" in p for p in audit(tree, allowlist={}, missing_allowlist={}, min_gates=3)):
+            failures.append("floor: the R6 message does not name the suggested floor")
         if any("R6" in p for p in audit(tree, allowlist={}, missing_allowlist={}, min_gates=2)):
             failures.append("floor: a tree at the gate floor was reported")
         tree = base / "floor-moved"
@@ -1124,13 +1167,15 @@ llama_test_pytest(${Python3_EXECUTABLE}
     return failures
 
 
-def configured_gates(build_dir):
+def configured_gates(build_dir, tests_dir):
     """(gates a configured build RUNS, problems for ones it only names).
 
     Every add_test of every CTestTestfile.cmake under the build is parsed: the program must be an interpreter and the gate
     the first .py argument behind safe flags (command_gate), and no DISABLED / WILL_FAIL / regex / SKIP_RETURN_CODE-not-77
-    property may sit on the test. A substring match would count `old-gate.py`, a `.orig`, an echo of the path or a
+    property may sit on the test, and the gate's path must resolve into `tests_dir` (a same-named file elsewhere, such as
+    a stale copy, is not the gate). A substring match would count `old-gate.py`, a `.orig`, an echo of the path or a
     py_compile of it as the gate being configured."""
+    tests_real = os.path.realpath(str(tests_dir))
     tests, properties, seen = {}, [], False
     for dirpath, dirnames, filenames in os.walk(build_dir):
         dirnames[:] = [d for d in dirnames if d != "CMakeFiles"]
@@ -1140,7 +1185,10 @@ def configured_gates(build_dir):
         for name, args in cmake_commands((Path(dirpath) / "CTestTestfile.cmake").read_text(errors="replace")):
             if name == "add_test":
                 tokens = cmake_tokens(args)
-                gate = command_gate(tokens[1:]) if tokens else None
+                path = command_gate_path(tokens[1:]) if tokens else None
+                gate = None
+                if path and os.path.realpath(os.path.dirname(path) or ".") == tests_real:
+                    gate = os.path.basename(path)
                 if gate:
                     tests.setdefault(tokens[0], set()).add(gate)
             elif name == "set_tests_properties":
@@ -1160,7 +1208,7 @@ def census(root, build_dir, absent_allowlist=None, tests_dir=None):
     This compares against what the build actually configured, with no GPU and no ctest run."""
     root = Path(root)
     absent_allowlist = CENSUS_ABSENT_ALLOWLIST if absent_allowlist is None else absent_allowlist
-    configured = configured_gates(build_dir)
+    configured = configured_gates(build_dir, root / "tests" if tests_dir is None else tests_dir)
     if configured[0] is None:
         return ["R7 no CTestTestfile.cmake under %s: not a configured build, so the census proves nothing" % build_dir]
     ran, problems = configured
