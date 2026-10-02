@@ -15,6 +15,7 @@
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-kv-cache.h"
+#include "llama-load-measure.h"
 #include "llama-measure-plan.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -512,23 +513,29 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
 // and the readers in llama-context-tenant.h then fail closed. Every link mode resolves them the
 // same way, through the SYCL reg's proc address by the names ggml-sycl-l4-procs.h pins, from the
 // first SYCL backend of the context. No weak reference, no direct reference: one path.
+[[maybe_unused]] static llama_sycl_l4_procs llama_context_sycl_l4_procs_for_dev(ggml_backend_dev_t dev) {
+    llama_sycl_l4_procs procs;
+    if (!llama_context_dev_is_sycl(dev)) {
+        return procs;
+    }
+    procs.publish = reinterpret_cast<decltype(procs.publish)>(
+        llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_SET_RUNTIME_CONTEXT_DESC));
+    procs.coverage =
+        reinterpret_cast<decltype(procs.coverage)>(llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_TENANT_COVERAGE));
+    procs.late_check =
+        reinterpret_cast<decltype(procs.late_check)>(llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_LATE_CHECK));
+    return procs;
+}
+
 [[maybe_unused]] static llama_sycl_l4_procs llama_context_sycl_l4_procs_for(
     const std::vector<ggml_backend_ptr> & backends) {
-    llama_sycl_l4_procs procs;
     for (const auto & backend : backends) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-        if (!llama_context_dev_is_sycl(dev)) {
-            continue;
+        if (llama_context_dev_is_sycl(dev)) {
+            return llama_context_sycl_l4_procs_for_dev(dev);
         }
-        procs.publish = reinterpret_cast<decltype(procs.publish)>(
-            llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_SET_RUNTIME_CONTEXT_DESC));
-        procs.coverage = reinterpret_cast<decltype(procs.coverage)>(
-            llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_TENANT_COVERAGE));
-        procs.late_check = reinterpret_cast<decltype(procs.late_check)>(
-            llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_LATE_CHECK));
-        break;
     }
-    return procs;
+    return {};
 }
 
 // A plan scope open on the calling thread for one MEASURE or ALLOC of one context,
@@ -2383,6 +2390,21 @@ sched_reserve_result llama_context::sched_reserve_transaction() {
     return sched_reserve_impl(sched_reserve_mode::ALLOC, state);
 }
 
+// The planned sizes of the chunks of the measured graph that needed the most, which is the
+// compute term a slot of this buft has to cover.
+static void llama_context_worst_chunks(const sched_measure_buft & entry, llama_tenant_buft_caps & c) {
+    for (const auto & graph : entry.peaks) {
+        size_t sum = 0;
+        for (size_t p : graph) {
+            sum += p;
+        }
+        if (sum >= c.total) {
+            c.chunk_bytes = graph;
+            c.total       = sum;
+        }
+    }
+}
+
 std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sched_measure_plan & plan) const {
     std::vector<llama_tenant_buft_caps> out;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
@@ -2396,6 +2418,8 @@ std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sch
                     c.device = llama_context_sycl_device_index(dev, (int) sycl_ordinal);
                     c.host   = false;
                     c.cap    = entry.cap;
+                    c.max_chunk_size = entry.max_chunk_size;
+                    llama_context_worst_chunks(entry, c);
                     out.push_back(c);
                     break;
                 }
@@ -2410,6 +2434,8 @@ std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sch
                 c.device = -1;
                 c.host   = true;
                 c.cap    = entry.cap;
+                c.max_chunk_size = entry.max_chunk_size;
+                llama_context_worst_chunks(entry, c);
                 out.push_back(c);
                 break;
             }
@@ -2883,6 +2909,208 @@ bool llama_context::holds_exec_context() const {
 
 bool llama_context::holds_output_buffer() const {
     return buf_output != nullptr;
+}
+
+std::vector<llama_tenant_buft_caps> llama_context::get_measure_tenant_caps() const {
+    return measure_tenant_caps(measure_plan);
+}
+
+static decltype(&ggml_backend_sycl_measure_plan_override_install) g_measure_install_override = nullptr;
+static decltype(&ggml_backend_sycl_measure_plan_override_clear)   g_measure_clear_override   = nullptr;
+
+llama_measure_override_procs llama_context_sycl_measure_override_procs(ggml_backend_dev_t dev) {
+    llama_measure_override_procs procs;
+#ifdef LLAMA_PRIVATE_TEST_OBJECTS
+    if (g_measure_install_override != nullptr || g_measure_clear_override != nullptr) {
+        procs.install = g_measure_install_override;
+        procs.clear   = g_measure_clear_override;
+        return procs;
+    }
+#endif
+    if (!llama_context_dev_is_sycl(dev)) {
+        return procs;
+    }
+#ifdef GGML_USE_SYCL
+    procs.install = &ggml_backend_sycl_measure_plan_override_install;
+    procs.clear   = &ggml_backend_sycl_measure_plan_override_clear;
+#elif defined(GGML_BACKEND_DL)
+    procs.install = reinterpret_cast<decltype(procs.install)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_plan_override_install"));
+    procs.clear = reinterpret_cast<decltype(procs.clear)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_plan_override_clear"));
+#endif
+    return procs;
+}
+
+#ifdef LLAMA_PRIVATE_TEST_OBJECTS
+void llama_context_sycl_measure_override_procs_override_for_testing(
+    decltype(&ggml_backend_sycl_measure_plan_override_install) install_fn,
+    decltype(&ggml_backend_sycl_measure_plan_override_clear)   clear_fn) {
+    g_measure_install_override = install_fn;
+    g_measure_clear_override   = clear_fn;
+}
+#endif
+
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+// The measure backend of one SYCL device: non-owning, no SYCL context (ggml-sycl.h).
+static ggml_backend_t llama_context_sycl_measure_backend_init(ggml_backend_dev_t dev, int device) {
+#    ifdef GGML_USE_SYCL
+    GGML_UNUSED(dev);
+    return ggml_backend_sycl_measure_backend_init(device);
+#    else
+    auto fn = reinterpret_cast<decltype(&ggml_backend_sycl_measure_backend_init)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_backend_init"));
+    return fn != nullptr ? fn(device) : nullptr;
+#    endif
+}
+#endif
+
+static const char * llama_load_measure_stage_name(enum ggml_sycl_measure_stage stage) {
+    switch (stage) {
+        case GGML_SYCL_MEASURE_STAGE_PROBE:
+            return "probe";
+        case GGML_SYCL_MEASURE_STAGE_CANDIDATE_B:
+            return "admitted";
+        case GGML_SYCL_MEASURE_STAGE_CANDIDATE_C:
+            return "late";
+    }
+    return "unknown";
+}
+
+static std::string llama_load_measure_refusal(enum ggml_sycl_measure_stage stage,
+                                              int                          device,
+                                              const std::string &          reason) {
+    return format("[LOAD-PLAN] compute-slot measure failed at %s on device %d: %s (refused)",
+                  llama_load_measure_stage_name(stage), device, reason.c_str());
+}
+
+llama_load_measure_result llama_load_measure(const llama_model &          model,
+                                             uint32_t                     n_ctx,
+                                             uint64_t                     load_txn,
+                                             enum ggml_sycl_measure_stage stage) {
+    llama_load_measure_result out;
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    std::vector<ggml_backend_dev_t> sycl_devs;
+    for (const auto & d : model.devices) {
+        if (llama_context_dev_is_sycl(d.dev)) {
+            sycl_devs.push_back(d.dev);
+        }
+    }
+    if (sycl_devs.empty()) {
+        out.ok = true;  // nothing on a SYCL device: no compute-slot term to measure
+        return out;
+    }
+    const int first_device = llama_context_sycl_device_index(sycl_devs[0], 0);
+
+    // Declaration order is the unwind order: the backends outlive the context, which outlives the
+    // override, so on every exit the override clears first, then the context goes, then the backends.
+    llama_measure_context_args args;
+    args.stage = stage;
+    for (size_t i = 0; i < sycl_devs.size(); ++i) {
+        const int      device  = llama_context_sycl_device_index(sycl_devs[i], (int) i);
+        ggml_backend_t backend = llama_context_sycl_measure_backend_init(sycl_devs[i], device);
+        if (backend == nullptr) {
+            out.refusal = llama_load_measure_refusal(stage, device, "measure backend init failed");
+            return out;
+        }
+        args.backends.emplace_back(backend);
+    }
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (cpu == nullptr) {
+        out.refusal = llama_load_measure_refusal(stage, first_device, "no CPU backend");
+        return out;
+    }
+    args.backends.emplace_back(cpu);
+
+    std::unique_ptr<llama_context> holder;
+    llama_measure_plan_override    guard(llama_context_sycl_measure_override_procs(sycl_devs[0]), load_txn, stage);
+    if (!guard.installed()) {
+        out.refusal = llama_load_measure_refusal(stage, first_device, guard.failure());
+        return out;
+    }
+
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx                = n_ctx != 0 ? n_ctx : model.hparams.n_ctx_train;
+    params.n_batch              = 512;
+    params.n_ubatch             = 512;
+    try {
+        holder.reset(new llama_context(model, params, &args));
+    } catch (const std::exception & e) {
+        out.refusal = llama_load_measure_refusal(stage, first_device, e.what());
+        return out;
+    }
+
+    const sched_reserve_result & status = holder->get_measure_status();
+    if (status.status != sched_reserve_status::OK) {
+        out.refusal = llama_load_measure_refusal(stage, first_device, status.reason);
+        return out;
+    }
+
+    for (const auto & c : holder->get_measure_tenant_caps()) {
+        llama_load_measure_device d;
+        d.device      = c.device;
+        d.host        = c.host;
+        d.chunk_bytes = c.chunk_bytes;
+        d.total       = c.total;
+        d.cap         = c.max_chunk_size;
+        out.devices.push_back(std::move(d));
+    }
+    out.n_splits = holder->get_measure_plan().n_splits_max;
+    out.ok       = true;
+#else
+    GGML_UNUSED(model);
+    GGML_UNUSED(n_ctx);
+    GGML_UNUSED(load_txn);
+    GGML_UNUSED(stage);
+    out.ok = true;
+#endif
+    return out;
+}
+
+std::string llama_load_late_check(const llama_model &                            model,
+                                  uint32_t                                       n_ctx,
+                                  struct ggml_sycl_load_txn                      txn,
+                                  const std::vector<llama_measure_dummy_entry> & weights) {
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    llama_sycl_l4_procs procs;
+    for (const auto & d : model.devices) {
+        if (llama_context_dev_is_sycl(d.dev)) {
+            procs = llama_context_sycl_l4_procs_for_dev(d.dev);
+            break;
+        }
+    }
+    if (!procs.available()) {
+        return "";  // no c(P) can have been recorded without the L4 entry points
+    }
+
+    llama_measure_dummy_scope dummies(weights);
+    if (dummies.failed()) {
+        return llama_load_measure_refusal(GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, -1,
+                                          "a weight stand-in buffer was refused");
+    }
+    const llama_load_measure_result measured =
+        llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C);
+    if (!measured.ok) {
+        return measured.refusal;
+    }
+    for (const auto & d : measured.devices) {
+        if (d.host) {
+            continue;  // the late check compares a SYCL device's term
+        }
+        if (llama_sycl_l4_late_check(procs, txn, d.device, d.total) == GGML_SYCL_LATE_CHECK_REFUSED) {
+            // the backend has logged its canonical line; this is the load's refusal
+            return llama_load_measure_refusal(GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, d.device,
+                                              "the final placement needs more compute than the admitted term");
+        }
+    }
+    return "";
+#else
+    GGML_UNUSED(model);
+    GGML_UNUSED(n_ctx);
+    GGML_UNUSED(txn);
+    GGML_UNUSED(weights);
+    return "";
+#endif
 }
 
 ggml_backend_sched_t llama_context::get_sched() const {

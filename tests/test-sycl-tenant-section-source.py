@@ -153,7 +153,7 @@ def test_the_context_holds_the_section_and_its_counters():
 
 # --- the L4 procs table: one resolution path, no weak symbols ----------------
 
-_L4 = "static llama_sycl_l4_procs llama_context_sycl_l4_procs_for(const std::vector<ggml_backend_ptr> & backends)"
+_L4 = "static llama_sycl_l4_procs llama_context_sycl_l4_procs_for_dev(ggml_backend_dev_t dev)"
 _L4_NAMES = {
     "publish": "GGML_SYCL_PROC_SET_RUNTIME_CONTEXT_DESC",
     "coverage": "GGML_SYCL_PROC_TENANT_COVERAGE",
@@ -177,6 +177,9 @@ def l4_ok(code: str) -> bool:
     for field, name in _L4_NAMES.items():
         if z(f"procs.{field} = reinterpret_cast<decltype(procs.{field})>(llama_context_sycl_proc_addr(dev, {name}));") not in b:
             return False
+    # the per-context table is that same one path, over the first SYCL backend's device
+    if z("return llama_context_sycl_l4_procs_for_dev(dev);") not in code:
+        return False
     return "#if" not in b and "&ggml_backend_sycl_" not in b and '"ggml_backend_sycl_' not in b
 
 

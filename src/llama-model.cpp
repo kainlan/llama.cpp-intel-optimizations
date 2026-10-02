@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-load-measure.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -2688,6 +2689,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     "restores the pre-fix stale behaviour)\n",
                     __func__, corrected_layers, corrected_output ? " + output" : "");
             }
+        }
+    }
+    if (sycl_model_backend) {
+        // (c) the late measure: the final placement's compute term, over stand-ins for the weights
+        // that are not yet allocated, handed to the backend to compare with the term it admitted.
+        // Inert until the backend exports the L4 entry points; a refusal is the load's.
+        std::vector<llama_measure_dummy_entry> late_weights;
+        for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+            late_weights.push_back({ ctx_key.buft, ctx_ptr.get() });
+        }
+        const std::string late_refusal = llama_load_late_check(*this, llama_model_sycl_make_placement_envelope().n_ctx,
+                                                               sycl_model_loading_guard.txn, late_weights);
+        if (!late_refusal.empty()) {
+            throw std::runtime_error(late_refusal);
         }
     }
     if (sycl_model_backend && ml.use_mmap) {

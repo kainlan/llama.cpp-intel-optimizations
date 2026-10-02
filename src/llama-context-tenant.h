@@ -104,6 +104,9 @@ struct llama_tenant_buft_caps {
     int32_t             device = -1;
     bool                host   = false;
     std::vector<size_t> cap;
+    size_t              max_chunk_size = 0;  // the largest chunk the buft's allocator allowed
+    std::vector<size_t> chunk_bytes;         // the worst measured graph's planned size of each chunk
+    size_t              total = 0;           // their sum
 };
 
 inline bool llama_tenant_element_less(const ggml_sycl_context_tenant_desc & a,

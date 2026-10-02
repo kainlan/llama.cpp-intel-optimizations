@@ -419,6 +419,10 @@ public:
     bool holds_exec_context() const;
     bool holds_output_buffer() const;
 
+    // the measured chunk caps of the SYCL tiers of the measure-only context's plan, as the tenant
+    // section reads them
+    std::vector<llama_tenant_buft_caps> get_measure_tenant_caps() const;
+
 private:
     llm_graph_result * get_gf_res_prev();
 

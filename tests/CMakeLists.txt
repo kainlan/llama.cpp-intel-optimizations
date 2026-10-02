@@ -3739,6 +3739,16 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# zhcn C7h-3: source gate for the load-time measure (the unwind order of its locals, the CPU backend last,
+# the one refusal text) and the loader's single late-check call between the dev_layer sync and the mappings.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-load-measure-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-load-measure-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # zhcn C7f: setter classification (design gate 16, section 2.3). Every
 # llama_context::set_* definition is classified as reserving, measured or none,
 # and the row's contract is pinned on its body; set_warmup reserves on change.
@@ -3812,6 +3822,11 @@ llama_build_and_test(test-fused-resolution-report.cpp)
 # measured compute caps and merged with the backend's demands, the tenant key digest and
 # the plan line's head. Header-only over ggml-sycl.h's wire structs: no device.
 llama_build_and_test(test-context-tenant-section.cpp)
+
+# zhcn C7h-3: the load-time measure's plan-override guard (installs once, clears once on every exit, names a
+# missing or refused install) and its size-0 weight stand-ins (set on the tensors that have no buffer,
+# removed again, a real buffer left alone). Header-only over src/llama-load-measure.h: no device, no model.
+llama_build_and_test(test-load-measure-guards.cpp)
 
 # llama.cpp-9goq: source gate over ggml/src/ggml-sycl/CMakeLists.txt itself --
 # (A) every target_link_libraries(...) naming the bare `ggml-sycl` MODULE
