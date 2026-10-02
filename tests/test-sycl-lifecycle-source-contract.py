@@ -488,20 +488,143 @@ def _owning_reader_sites():
     return sites
 
 
-# The wrapper reads in ggml-sycl.cpp are too numerous to list one by one (~170), so they stay counts, but
-# comment-blind: the previous raw count moved with prose alone (ggml_sycl_global_plan_owner( appears in two
-# comments). Each unit change still needs a reviewer, who reads the delta against docs/design/
-# sycl-canonical-memory-architecture.md section 5. History of the pins, so the next delta is easy to
-# explain: abecb785/90a3f2a/75883a6 (127+1-6-2 readers), f5f0d3758 (+1, kv_layer_on_device), oyfl (+2,
-# AUTO-FA re-check), tsfl (+1, probe entry), glkg 8c8a0afae (-1), nsl3 reconciliation, y2zx (+1, dense
-# overflow filter). 64ec60199 left the pins one reader away from the tree and later work moved them
-# further (119/14/12/26 at a882b9c2a, the last green tree, against 117/13/14/25 now).
-INTERNAL_WRAPPER_COUNTS = {
-    "ggml_sycl_cache_plan_owner": 117,
-    "ggml_sycl_global_plan_owner": 13,
-    "ggml_sycl_global_plan_snapshot": 14,
-    "ggml_sycl_has_global_plan": 25,
+# The wrapper reads in ggml-sycl.cpp (~170 call sites) are pinned as explicit per-statement site lists, like
+# OWNING_READER_SITES above, and comment-blind (the previous raw count moved with prose alone:
+# ggml_sycl_global_plan_owner( appears in two comments). The old pins were bare totals (117/13/14/25), so a
+# reader swapped for another one in the same statement shape kept its count; per name, a changed statement
+# or a moved call now fails here and is reviewed against docs/design/sycl-canonical-memory-architecture.md
+# section 5 before the list is edited. A statement line that holds two wrapper names is counted once under
+# each. History of the totals, for explaining the next delta: abecb785/90a3f2a/75883a6 (127+1-6-2 readers),
+# f5f0d3758 (+1, kv_layer_on_device), oyfl (+2, AUTO-FA re-check), tsfl (+1, probe entry), glkg 8c8a0afae (-1),
+# nsl3 reconciliation, y2zx (+1, dense overflow filter); 119/14/12/26 at a882b9c2a, the last green tree
+# before 64ec60199's pins drifted.
+INTERNAL_WRAPPER_SITES = {
+    "ggml_sycl_cache_plan_owner": Counter({
+        "(*ggml_sycl_cache_plan_owner(cache))": 4,
+        "(*ggml_sycl_cache_plan_owner(cache)).lookup_expert_placement(layer_id, static_cast<int>(e), role);": 1,
+        "(*ggml_sycl_cache_plan_owner(cache)).lookup_expert_placement(tname, static_cast<int>(e));": 1,
+        "(*ggml_sycl_cache_plan_owner(cache)).moe_pp_soa_promoted;": 1,
+        "(*ggml_sycl_cache_plan_owner(plan_cache)).lookup_expert_placement(std::string(src0->name), expert_id);": 2,
+        "(*ggml_sycl_cache_plan_owner(plan_cache)).multi_device;": 1,
+        "(*ggml_sycl_cache_plan_owner(sec_cache)).lookup_expert_placement(tname, meta->expert_idx);": 1,
+        "(plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty());": 1,
+        "auto cache_plan = ggml_sycl_cache_plan_owner(cache);": 1,
+        "cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 4,
+        "cache && ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 2,
+        "const auto placement = (*ggml_sycl_cache_plan_owner(cache))": 5,
+        "const auto plan_hybrid_owner = ggml_sycl_cache_plan_owner(plan_cache_hybrid);": 1,
+        "const auto plan_owner = cache ? ggml_sycl_cache_plan_owner(cache) : nullptr;": 1,
+        "const auto plan_owner = ggml_sycl_cache_plan_owner(cache);": 13,
+        "const auto plan_owner = ggml_sycl_cache_plan_owner(plan_cache);": 3,
+        "const auto plan_owner = ggml_sycl_cache_plan_owner(route_cache);": 1,
+        "const auto plan_ref_owner = ggml_sycl_cache_plan_owner(plan_cache);": 1,
+        "const auto pp_owner = ggml_sycl_cache_plan_owner(cache);": 1,
+        "const bool active_plan = plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty();": 1,
+        "const bool has_placement_plan = route_cache && !ggml_sycl_cache_plan_owner(route_cache)->entries.empty();": 1,
+        "const bool have_plan = !ggml_sycl_cache_plan_owner(cache)->entries.empty() && !tname.empty();": 2,
+        "const bool plan_active = cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();": 1,
+        "const bool plan_preloaded = cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();": 1,
+        "const bool use_planner = plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() &&": 1,
+        "const int layer_dev = (*ggml_sycl_cache_plan_owner(cache)).get_layer_device(layer_id);": 1,
+        "const int planned_device = (*ggml_sycl_cache_plan_owner(cache)).get_layer_device(layer_id);": 1,
+        "ggml_sycl_cache_plan_owner(cache)->is_on_device(dense_name, device);": 1,
+        "ggml_sycl_configure_host_zones_for_plan(cache, ggml_sycl_cache_plan_owner(cache));": 1,
+        "if (!(*ggml_sycl_cache_plan_owner(cache)).expert_on_device(meta.tensor_name, expert_idx, device_id)) {": 1,
+        "if (!actual_weights && cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 1,
+        "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty() || tensor->name[0] == '\\0') {": 1,
+        "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 14,
+        "if (!cgraph || !cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 2,
+        "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() &&": 2,
+        "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !dense_name.empty()) {": 2,
+        "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !meta.tensor_name.empty()) {": 1,
+        "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !tname.empty()) {": 1,
+        "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 3,
+        "if (!plan_cache || ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() || !src0 || !src0->name ||": 2,
+        "if (!plan_cache || ggml_sycl_cache_plan_owner(plan_cache)->entries.empty()) {": 1,
+        "if (!route_cache || ggml_sycl_cache_plan_owner(route_cache)->entries.empty()) {": 1,
+        "if (!sec_cache || ggml_sycl_cache_plan_owner(sec_cache)->entries.empty()) {": 1,
+        "if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 4,
+        "if (ggml_sycl_cache_plan_owner(cache)->entries.empty() && ggml_sycl_has_global_plan()) {": 1,
+        "if (ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 1,
+        "if (ggml_sycl_cache_plan_owner(plan_cache)->has_host_experts(tname, n_exp, ctx.device)) {": 2,
+        "if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() && src0->name && src0->name[0] != '\\0') {": 1,
+        "if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty()) {": 3,
+        "if (route_cache && ggml_sycl_cache_plan_owner(route_cache)->entries.empty() && ggml_sycl_has_global_plan()) {": 1,
+        "if (sec_budgets[i].cache && ggml_sycl_cache_plan_owner(sec_budgets[i].cache)->entries.empty()) {": 1,
+        "in.has_placement_plan = cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();": 1,
+        "plan_cache_hybrid && !ggml_sycl_cache_plan_owner(plan_cache_hybrid)->entries.empty();": 1,
+        "plan_has_cpu_experts = ggml_sycl_cache_plan_owner(route_cache)->has_host_experts(tname, n_exp, ctx.device);": 1,
+        "return !ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_cache_plan_owner(cache)), current_device);": 1,
+        "return cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty() &&": 1,
+        "return cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();": 1,
+        "return ggml_sycl_cache_plan_owner(cache)->has_host_experts(src0->name ? src0->name : \"\", n_experts, device);": 1,
+        "return ggml_sycl_has_global_plan() || (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty());": 1,
+        "return ggml_sycl_placement_plan_moe_needs_other_device((*ggml_sycl_cache_plan_owner(plan_cache)),": 1,
+        "return ggml_sycl_placement_plan_needs_secondary_devices((*ggml_sycl_cache_plan_owner(plan_cache)));": 1,
+        "return ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_cache_plan_owner(cache)), current_device);": 1,
+        "static std::shared_ptr<const ggml_sycl::placement_plan> ggml_sycl_cache_plan_owner(": 2,
+        "stream_plan_owner = cache ? ggml_sycl_cache_plan_owner(cache) : nullptr;": 1,
+    }),
+    "ggml_sycl_global_plan_owner": Counter({
+        "!ggml_sycl_placement_plan_uses_device((*ggml_sycl_global_plan_owner()), d)) {": 1,
+        "!ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_global_plan_owner()), current_device);": 1,
+        "const auto plan_owner = ggml_sycl_global_plan_owner();": 3,
+        "ggml_sycl_placement_plan_moe_needs_other_device((*ggml_sycl_global_plan_owner()), ctx.device);": 1,
+        "ggml_sycl_placement_plan_needs_moe_secondary_devices((*ggml_sycl_global_plan_owner())))) {": 1,
+        "ggml_sycl_placement_plan_needs_secondary_devices((*ggml_sycl_global_plan_owner()));": 1,
+        "ggml_sycl_placement_plan_uses_other_device((*ggml_sycl_global_plan_owner()), current_device);": 1,
+        "plan_known && ggml_sycl_placement_plan_needs_moe_secondary_devices((*ggml_sycl_global_plan_owner()));": 1,
+        "return !ggml_sycl_global_plan_owner()->entries.empty();": 1,
+        "return ggml_sycl_global_plan_owner();": 1,
+        "static std::shared_ptr<const ggml_sycl::placement_plan> ggml_sycl_global_plan_owner() {": 1,
+    }),
+    "ggml_sycl_global_plan_snapshot": Counter({
+        "const auto active = ggml_sycl_global_plan_snapshot();": 1,
+        "const auto current = ggml_sycl_global_plan_snapshot();": 3,
+        "const auto lifecycle_owner = ggml_sycl_global_plan_snapshot();": 1,
+        "const auto published = ggml_sycl_global_plan_snapshot();": 1,
+        "const auto snapshot = ggml_sycl_global_plan_snapshot();": 2,
+        "ggml_sycl_publish_plan_locked(ggml_sycl_global_plan_snapshot());": 1,
+        "if (ggml_sycl_global_plan_snapshot().get() != current.get()) {": 3,
+        "return candidate ? candidate : ggml_sycl_global_plan_snapshot();": 1,
+        "static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_global_plan_snapshot() {": 1,
+    }),
+    "ggml_sycl_has_global_plan": Counter({
+        "((ggml_sycl_has_global_plan() || ggml_sycl_planner_authoritative_residency_active(sycl_ctx->device)) &&": 1,
+        "(ggml_sycl_has_global_plan() &&": 1,
+        "const bool has_host_inputs = ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph);": 1,
+        "const bool plan_known = ggml_sycl_has_global_plan();": 1,
+        "gpu_prefix_end < 0 && !(ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph)) &&": 1,
+        "if (!ggml_sycl_has_global_plan() || !plan_owner->has_dense_entry(tensor_name)) {": 1,
+        "if (ggml_sycl_cache_plan_owner(cache)->entries.empty() && ggml_sycl_has_global_plan()) {": 1,
+        "if (ggml_sycl_has_global_plan() &&": 1,
+        "if (ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph) &&": 1,
+        "if (ggml_sycl_has_global_plan() || has_runtime_plan() || g_moe_multi_gpu_active.load(std::memory_order_acquire)) {": 1,
+        "if (ggml_sycl_has_global_plan()) {": 4,
+        "if (route_cache && ggml_sycl_cache_plan_owner(route_cache)->entries.empty() && ggml_sycl_has_global_plan()) {": 1,
+        "if (use_sycl_graph && cached_is_decode && ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph)) {": 1,
+        "return ggml_sycl_has_global_plan() &&": 4,
+        "return ggml_sycl_has_global_plan() ||": 1,
+        "return ggml_sycl_has_global_plan() || (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty());": 1,
+        "return ggml_sycl_has_global_plan();": 1,
+        "return ggml_sycl_onednn_pp_placement_for(ggml_sycl_has_global_plan() ? plan_owner.get() : nullptr);": 1,
+        "static bool ggml_sycl_has_global_plan() {": 1,
+    }),
 }
+
+
+def _wrapper_sites():
+    code = _strip_cpp_comments(backend)
+    sites = {}
+    for name in INTERNAL_WRAPPER_SITES:
+        lines = Counter()
+        for match in re.finditer(re.escape(name) + r"\(", code):
+            start = code.rfind("\n", 0, match.start()) + 1
+            end = code.find("\n", match.start())
+            lines[" ".join(code[start:end if end >= 0 else len(code)].split())] += 1
+        sites[name] = lines
+    return sites
+
 
 checks = {
     "full slot token": re.search(r"struct SlotToken\s*\{\s*uint32_t\s+slot", hpp) is not None
@@ -593,11 +716,7 @@ checks = {
     == 2,
     "cache census positive control": len(legacy_cache_re.findall(census_fixture)) == 1,
     "exact owning reader call census": _owning_reader_sites() == OWNING_READER_SITES,
-    "exact internal wrapper census": {
-        name: len(re.findall(re.escape(name) + r"\(", _strip_cpp_comments(backend)))
-        for name in INTERNAL_WRAPPER_COUNTS
-    }
-    == INTERNAL_WRAPPER_COUNTS,
+    "exact internal wrapper census": _wrapper_sites() == INTERNAL_WRAPPER_SITES,
     "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"
     in backend
     and "authority.get() == cache.get()" in cache_hpp
