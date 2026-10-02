@@ -577,8 +577,8 @@ def gate31(files, bad):
         bodies = func_bodies(c, fn)
         if len(bodies) != 1:
             bad("gate 31: %s has %d definitions" % (fn, len(bodies)))
-        elif "ggml_sycl_set_runtime_context_for_model_impl(" not in text_of(c, bodies[0]):
-            bad("gate 31: %s does not delegate to ggml_sycl_set_runtime_context_for_model_impl" % fn)
+        elif not re.search(r"\breturn\s+ggml_sycl_set_runtime_context_for_model_impl\(", text_of(c, bodies[0])):
+            bad("gate 31: %s does not return ggml_sycl_set_runtime_context_for_model_impl(...)" % fn)
     # The witness macro and its sites are always compiled.
     mm = re.search(r"#define\s+GGML_SYCL_WITNESS\s*\(.*?(?:\n(?!\s*#)[^\n]*\\)*\n[^\n]*\n", files[UC_H])
     macro = files[UC_H][files[UC_H].find("#define GGML_SYCL_WITNESS"):files[UC_H].find("#define GGML_SYCL_WITNESS") + 400]

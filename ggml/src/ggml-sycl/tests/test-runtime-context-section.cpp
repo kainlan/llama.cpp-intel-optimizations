@@ -641,16 +641,16 @@ void case_ledger_record_needs_an_open_txn() {
 // level is the ledger's decision, not the proc's, so that a host test can pin it.
 void case_ledger_log_levels() {
     load_compute_ledger l;
-    CHECK(l.check(7, 0, 1000, false).level == load_log_level::WARN,
+    CHECK(l.check(7, 0, 1000, false).level == LOAD_LOG_LEVEL_WARN,
           "a transaction that is not the open load is a caller defect: WARN");
-    CHECK(l.check(7, 0, 1000, true).level == load_log_level::INFO,
+    CHECK(l.check(7, 0, 1000, true).level == LOAD_LOG_LEVEL_INFO,
           "no early term recorded is the expected answer until L6: INFO, once");
-    CHECK(l.check(7, 0, 1000, true).level == load_log_level::NONE, "and silent the second time");
+    CHECK(l.check(7, 0, 1000, true).level == LOAD_LOG_LEVEL_NONE, "and silent the second time");
     CHECK(l.record(7, 0, 1000, 8192, true), "recorded");
-    CHECK(l.check(7, 0, 1000, true).level == load_log_level::NONE, "equal: no line");
-    CHECK(l.check(7, 0, 1001, true).level == load_log_level::ERROR, "a refusal is ERROR");
-    CHECK(l.check(7, 0, 999, true).level == load_log_level::WARN, "the first shrink is WARN");
-    CHECK(l.check(7, 0, 998, true).level == load_log_level::NONE, "and the second is silent");
+    CHECK(l.check(7, 0, 1000, true).level == LOAD_LOG_LEVEL_NONE, "equal: no line");
+    CHECK(l.check(7, 0, 1001, true).level == LOAD_LOG_LEVEL_ERROR, "a refusal is ERROR");
+    CHECK(l.check(7, 0, 999, true).level == LOAD_LOG_LEVEL_WARN, "the first shrink is WARN");
+    CHECK(l.check(7, 0, 998, true).level == LOAD_LOG_LEVEL_NONE, "and the second is silent");
 }
 
 void case_ledger_clear() {

@@ -43,6 +43,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <type_traits>
 #include <typeinfo>
@@ -13286,16 +13287,16 @@ static void ggml_sycl_load_ledger_log(const ggml_sycl::load_compute_ledger::chec
         return;
     }
     switch (r.level) {
-        case ggml_sycl::load_log_level::ERROR:
+        case ggml_sycl::LOAD_LOG_LEVEL_ERROR:
             GGML_LOG_ERROR("%s\n", r.line.c_str());
             break;
-        case ggml_sycl::load_log_level::WARN:
+        case ggml_sycl::LOAD_LOG_LEVEL_WARN:
             GGML_LOG_WARN("%s\n", r.line.c_str());
             break;
-        case ggml_sycl::load_log_level::INFO:
+        case ggml_sycl::LOAD_LOG_LEVEL_INFO:
             GGML_LOG_INFO("%s\n", r.line.c_str());
             break;
-        case ggml_sycl::load_log_level::NONE:
+        case ggml_sycl::LOAD_LOG_LEVEL_NONE:
             break;
     }
 }
@@ -13311,11 +13312,37 @@ static size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {
     }
 }
 
-// Clears the finisher's terms on every exit of the end call: commit, rollback and exception alike.
+// Clears the finisher's terms when the end call's try scope is left normally: the registry has ended the
+// transaction by then, so no record for it can still find it open.  An exit by exception does NOT clear here:
+// the handler has yet to end the transaction, and a clear before that end would leave a window in which a
+// record still finds the transaction open and inserts after the clear.  The handler's
+// ggml_sycl_load_ledger_clear_after_end clears after the end instead.
 struct ggml_sycl_load_ledger_clear_guard {
     uint64_t txn;
+    int      uncaught;
 
-    ~ggml_sycl_load_ledger_clear_guard() { (void) ggml_sycl_load_clear_compute_terms(txn); }
+    explicit ggml_sycl_load_ledger_clear_guard(uint64_t t) : txn(t), uncaught(std::uncaught_exceptions()) {}
+
+    ~ggml_sycl_load_ledger_clear_guard() {
+        if (std::uncaught_exceptions() > uncaught) {
+            return;
+        }
+        (void) ggml_sycl_load_clear_compute_terms(txn);
+    }
+};
+
+// The end call's handler arms it (txn non-zero) with the transaction it is about to end, and the clear runs when
+// the handler is left, after the end call: order is end, then clear, on every path.  If finalize_end itself
+// throws out of the handler the clear still runs, but the registry never ended the transaction, so a record in
+// that case can still find it open; that residue is the registry's own failure, not one this ordering can close.
+struct ggml_sycl_load_ledger_clear_after_end {
+    uint64_t txn = 0;
+
+    ~ggml_sycl_load_ledger_clear_after_end() {
+        if (txn != 0) {
+            (void) ggml_sycl_load_clear_compute_terms(txn);
+        }
+    }
 };
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -13745,8 +13772,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             return ggml_sycl_load_end_replay_result(ticket, model);
         }
 
-        // This call finishes the load: whatever way it ends from here, the load's early terms are done.  The
-        // recovery path below, which ends a load whose finisher was not reserved here, clears them itself.
+        // This call finishes the load: when it ends normally from here, the load's early terms are done and the
+        // guard clears them after the registry ended the transaction.  The handler clears them after its own end
+        // call instead (ggml_sycl_load_ledger_clear_after_end), and so does the recovery arm.
         ggml_sycl_load_ledger_clear_guard           ledger_clear{ txn.id };
         ggml_sycl::lifecycle::finisher_effect_scope finisher_effect;
         if (ticket.commit) {
@@ -13873,6 +13901,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         }
         return ggml_sycl_lifecycle_c_result(result.code);
     } catch (...) {
+        ggml_sycl_load_ledger_clear_after_end after_end;
         g_sycl_abort_load_exit = false;
         if (placement_inserted) {
             const auto failed_plan = ggml_sycl::lifecycle_find_placement_plan(
@@ -13885,6 +13914,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             ggml_sycl::lifecycle_abort_placement_plan(ticket.token.load.value);
         }
         if (ticket.finisher) {
+            after_end.txn = txn.id;
             (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token, "load_end/exception-rollback");
             const auto failed = registry->finalize_end(ticket, false);
             ggml_sycl_enqueue_quarantined_result(*registry, failed, model);
@@ -13899,7 +13929,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             if (!recovery.finisher) {
                 return ggml_sycl_load_end_replay_result(recovery, model);
             }
-            (void) ggml_sycl_load_clear_compute_terms(txn.id);
+            after_end.txn = txn.id;
             ggml_sycl_finalize_binding_failure_abort(*registry, recovery);
         }
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
@@ -19874,7 +19904,11 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     ctx->runtime_kv_admitted = true;
     // Any publish changes the context's shape, so a section published earlier no longer describes it.
     // The descriptor path publishes its own section after this returns.
-    // Not the swallowing helper: a drop that fails must reach the caller, not leave this section behind.
+    // Not the swallowing helper: a drop that fails must reach the caller, which answers EFFECT_FAILED.  The new
+    // plan is already live and nothing rolls it back, so when the drop's lock fails the OLD section stays in
+    // the registry while the new plan is live, and a coverage query could answer EQUAL against the dead shape
+    // until the next publish.  The failure is a mutex lock's std::system_error, practically unreachable; it is
+    // reported, not repaired.
     ggml_sycl_published_section_set(ctx, nullptr);
     return ggml_sycl_txn_result::ACCEPTED;
 }
@@ -19892,9 +19926,26 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                            bool           swa_full,
                                            bool           flash_attn_enabled) {
     ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_TRANSACTION);
-    (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
-                                                     flash_attn_enabled,
-                                                     /*probe_mode=*/false, /*out=*/nullptr);
+    // C ABI boundary: no exception of any type crosses this entry.  The publish tail's drop of the earlier section
+    // takes the registry lock and may throw; the state is left as the failed path leaves it (the new plan is live,
+    // the old section may remain), and the entry only reports.
+    try {
+        (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
+                                                         flash_attn_enabled,
+                                                         /*probe_mode=*/false, /*out=*/nullptr);
+    } catch (const std::system_error & e) {
+        GGML_LOG_ERROR(
+            "[SYCL] ggml_backend_sycl_set_runtime_context: a lock failed after the plan was published (%s); the "
+            "earlier descriptor section may remain\n",
+            e.what());
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("[SYCL] ggml_backend_sycl_set_runtime_context: the runtime context update threw (%s)\n",
+                       e.what());
+    } catch (...) {
+        GGML_LOG_ERROR(
+            "[SYCL] ggml_backend_sycl_set_runtime_context: the runtime context update threw a non-standard "
+            "exception\n");
+    }
 }
 
 // llama.cpp-tsfl (nphx comment c-wgxn): see ggml_sycl_runtime_context_probe
@@ -20207,9 +20258,13 @@ static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
     g_runtime_expected_model_set = true;
     g_runtime_external_lease     = true;
     g_runtime_update_succeeded   = false;
+    // The transaction, not the C entry: that entry catches what the publish tail's drop of the earlier section
+    // can throw so none crosses the C ABI, and this caller must see it to answer EFFECT_FAILED.  The token
+    // held above is the one the transaction needs.
     try {
-        ggml_backend_sycl_set_runtime_context(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
-                                              flash_attn_enabled);
+        (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
+                                                         flash_attn_enabled,
+                                                         /*probe_mode=*/false, /*out=*/nullptr);
     } catch (...) {
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }

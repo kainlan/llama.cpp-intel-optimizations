@@ -13,21 +13,28 @@ It checks, over ggml/include/ggml-sycl.h and ggml/src/ggml-sycl/ggml-sycl.cpp:
   * the compute-term ledger has one writer: `.record(` is called only in
     ggml_sycl_load_record_compute_term, `.clear(` only in ggml_sycl_load_clear_compute_terms, and
     the ledger accessor is named only by those two, the late check and the test count hook;
-  * the load's end call clears the ledger through a guard created after the finisher check, so
-    commit, rollback and exception all clear;
+  * the load's end call clears the ledger after the registry ended the transaction, on every path: a
+    guard created after the finisher check clears on a normal exit and skips while unwinding, and the
+    one catch (...) arms `after_end` as its first statement, sets its transaction before the end call
+    on the finisher arm and on the recovery arm, and clears when the handler is left;
   * the backend context's destructor erases its published section before it resets its execution
     binding (which zeroes the registry key);
   * the runtime-context transaction drops the published section on its success tail, and the
     descriptor publish stores a section only after the inner transaction succeeded;
   * the late check and the record read the open transaction (ggml_sycl_load_txn_is_open) only after the
-    ledger's mutex is taken, and every function that names the ledger takes that mutex before its first
-    use of it; late_term_shrink_admitted has one producer;
+    ledger's mutex is taken, and every function that names the ledger holds that mutex at each use of it
+    (no block closes between the lock and the use); late_term_shrink_admitted has one producer;
+  * the late check ends `return r.result;`; no try or catch sits between the transaction's
+    runtime_kv_admitted store and its end, so a failed drop of the earlier section is not swallowed there;
+    the C entry ggml_backend_sycl_set_runtime_context catches system_error, std::exception and
+    everything, logs each at ERROR and rethrows none, ggml_backend_sycl_set_runtime_n_ctx delegates
+    to it, and the descriptor publish calls the transaction itself (it answers EFFECT_FAILED for a
+    failed drop, which the C entry swallows);
   * the fail-closed values: the late check answers NOT_RECORDED, the coverage query GROWTH and the clear 0
     on a closed module or an exception, a coverage query of an unbound context answers GROWTH, and a
     refusal logs at ERROR, a shrink and a not-open transaction at WARN (through ggml_sycl_load_ledger_log);
   * a publish for an unbound context is said at WARN, and the destructor's erase says a failed drop at
     WARN; the publish tail drops through the throwing set, not the erase;
-  * the recovery path that ends a load without the clear guard clears the load's terms itself;
   * (step 3c) a context's first publish reserves its host tier before L1 through
     unified_allocate_owner with the carve's request fields, installs the table only after the inner
     transaction succeeded, and the destructor drops it after the section and before the unbind; the
@@ -58,6 +65,9 @@ SIG_COVERAGE = r"\benum\s+ggml_sycl_tenant_coverage\s+ggml_backend_sycl_tenant_c
 HEADER = "ggml/include/ggml-sycl.h"
 SOURCE = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 REG_FN = "ggml_backend_sycl_reg_get_proc_address"
+LOAD_END_SIG = r"\bggml_sycl_lifecycle_result\s+ggml_backend_sycl_model_load_end\s*\("
+TXN_SIG = r"\bggml_sycl_txn_result\s+ggml_sycl_run_runtime_context_transaction\s*\("
+CENTRY_SIG = r"\bvoid\s+ggml_backend_sycl_set_runtime_context\s*\("
 
 
 def strip_comments(text):
@@ -123,6 +133,31 @@ def function_body(text, signature_re):
                 return text[m.start():i + 1]
         i += 1
     return None
+
+
+def min_depth(text):
+    """The lowest running brace depth reached while reading `text` from depth 0: a `}` that closes a block the text
+    did not open takes it below 0.  String and character literals are skipped."""
+    depth = 0
+    low = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '"' or c == "'":
+            quote = c
+            i += 1
+            while i < n and text[i] != quote:
+                if text[i] == "\\":
+                    i += 1
+                i += 1
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            low = min(low, depth)
+        i += 1
+    return low
 
 
 def header_proc_names(header_raw):
@@ -224,10 +259,16 @@ def check(header_raw, source):
     lock_re = r"std::lock_guard<std::mutex> lock\(state\.mutex\);"
     for name, (a, b) in spans.items():
         body = source[a:b]
-        use = body.find(".ledger.")
-        lk = re.search(lock_re, body)
-        if use < 0 or lk is None or lk.start() > use:
-            fails.append("L4 ledger lock: %s uses the ledger without state.mutex held first" % name)
+        uses = [m.start() for m in re.finditer(r"\.ledger\.", body)]
+        locks = [m for m in re.finditer(lock_re, body)]
+        held = bool(uses)
+        for u in uses:
+            before = [m for m in locks if m.end() <= u]
+            # held at the use: a lock_guard precedes it and no block that holds the lock closes between the two
+            if not before or min_depth(body[before[-1].end():u]) < 0:
+                held = False
+        if not held:
+            fails.append("L4 ledger lock: %s uses the ledger without state.mutex held at the use" % name)
     for name in ("ggml_sycl_load_record_compute_term", "ggml_backend_sycl_load_late_check"):
         if name in spans:
             body = source[spans[name][0]:spans[name][1]]
@@ -253,6 +294,8 @@ def check(header_raw, source):
     if not re.search(r"sycl_module_mutation_guard module_guard;\s*if \(!module_guard\) \{\s*return GGML_SYCL_LATE_CHECK_NOT_RECORDED;",
                      late_body):
         fails.append("L4 fail-closed: the late check lost its module guard (a closed module answers NOT_RECORDED)")
+    if not re.search(r"return r\.result;\s*\}\s*catch\s*\(\.\.\.\)", late_body):
+        fails.append("L4 late: the late check does not answer the ledger's result (it must end `return r.result;`)")
     if "ggml_sycl_load_ledger_log(r);" not in late_body:
         fails.append("L4 log level: the late check does not log through the ledger's level")
     cov_body = function_body(source, r"\benum\s+ggml_sycl_tenant_coverage\s+ggml_backend_sycl_tenant_coverage\s*\(") or ""
@@ -270,7 +313,7 @@ def check(header_raw, source):
         fails.append("L4 fail-closed: the ledger clear's catch does not answer 0")
     log_fn = function_body(source, r"\bstatic\s+void\s+ggml_sycl_load_ledger_log\s*\(") or ""
     for lvl, macro in (("ERROR", "GGML_LOG_ERROR"), ("WARN", "GGML_LOG_WARN"), ("INFO", "GGML_LOG_INFO")):
-        if not re.search(r"case ggml_sycl::load_log_level::" + lvl + r":\s*" + macro + r"\(", log_fn):
+        if not re.search(r"case ggml_sycl::LOAD_LOG_LEVEL_" + lvl + r":\s*" + macro + r"\(", log_fn):
             fails.append("L4 log level: a ledger line of level %s is not logged through %s" % (lvl, macro))
     set_fn = function_body(source, r"\bstatic\s+void\s+ggml_sycl_published_section_set\s*\(") or ""
     if not re.search(r"if \(id == 0\) \{\s*if \(section\) \{\s*GGML_LOG_WARN\(", set_fn):
@@ -296,10 +339,36 @@ def check(header_raw, source):
             fails.append("L4 ledger: model_load_end does not clear the load's compute terms (no guard)")
         elif not (f >= 0 and f < g and (eff < 0 or g < eff)):
             fails.append("L4 ledger: the clear guard must come after the finisher check and before the effects")
-        rc = end.find("(void) ggml_sycl_load_clear_compute_terms(txn.id);")
-        fa = end.find("ggml_sycl_finalize_binding_failure_abort(*registry, recovery);")
-        if fa < 0 or rc < 0 or rc > fa:
-            fails.append("L4 ledger: the recovery path that ends a load without the clear guard does not clear its terms")
+        tries = len(re.findall(r"\btry\b", end))
+        catches = re.findall(r"\bcatch\s*\(([^)]*)\)", end)
+        if tries != 1 or catches != ["..."]:
+            fails.append("L4 ledger: model_load_end must have exactly one try and one catch (...) (found %d try, catches %s)"
+                         % (tries, catches))
+        h = re.search(r"\bcatch\s*\(\.\.\.\)\s*\{", end)
+        handler = end[h.end():] if h else ""
+        if re.search(r"\bthrow\s*;", handler):
+            fails.append("L4 ledger: model_load_end's handler rethrows")
+        if not re.match(r"\s*ggml_sycl_load_ledger_clear_after_end after_end;", handler):
+            fails.append("L4 ledger: after_end is not the handler's first statement")
+        if not re.search(r"if \(ticket\.finisher\) \{\s*after_end\.txn = txn\.id;\s*"
+                         r"\(void\) ggml_sycl_abort_owner_effects_noexcept\(ticket\.token, \"load_end/exception-rollback\"\);",
+                         handler):
+            fails.append("L4 ledger: the finisher arm does not set after_end.txn unconditionally before its end call")
+        if not re.search(r"if \(!recovery\.finisher\) \{\s*return [^;]*;\s*\}\s*after_end\.txn = txn\.id;\s*"
+                         r"ggml_sycl_finalize_binding_failure_abort\(\*registry, recovery\);", handler):
+            fails.append("L4 ledger: the recovery arm does not set after_end.txn unconditionally before its abort")
+        if "ggml_sycl_load_clear_compute_terms(" in end:
+            fails.append("L4 ledger: model_load_end clears the ledger itself, not through the guard and after_end")
+    guard = function_body(source, r"\bstruct\s+ggml_sycl_load_ledger_clear_guard") or ""
+    if not re.search(r"if \(std::uncaught_exceptions\(\) > uncaught\) \{\s*return;\s*\}\s*"
+                     r"\(void\) ggml_sycl_load_clear_compute_terms\(txn\);", guard):
+        fails.append("L4 ledger: the try-scope guard clears during unwinding (no uncaught_exceptions skip)")
+    if "uncaught(std::uncaught_exceptions())" not in guard:
+        fails.append("L4 ledger: the try-scope guard does not snapshot uncaught_exceptions at construction")
+    after = function_body(source, r"\bstruct\s+ggml_sycl_load_ledger_clear_after_end") or ""
+    if not re.search(r"uint64_t txn = 0;", after) or not re.search(
+            r"if \(txn != 0\) \{\s*\(void\) ggml_sycl_load_clear_compute_terms\(txn\);\s*\}", after):
+        fails.append("L4 ledger: after_end does not clear only a transaction it was armed with")
 
     # destructor order
     dtor = function_body(source, r"ggml_backend_sycl_context::~ggml_backend_sycl_context\s*\(")
@@ -368,6 +437,9 @@ def check(header_raw, source):
         b = txn.find("ggml_sycl_published_section_set(ctx, nullptr);")
         if a < 0 or b < 0 or b < a:
             fails.append("L4 section: a successful publish does not drop the context's earlier section")
+        elif re.search(r"\btry\b|\bcatch\b", txn[a:]):
+            fails.append("L4 section: a try or catch sits between the runtime_kv_admitted store and the end of the transaction "
+                         "(a failed drop would be swallowed)")
 
     impl = function_body(source, r"\bggml_sycl_set_runtime_context_for_model_impl\s*\(")
     if impl is None:
@@ -379,6 +451,29 @@ def check(header_raw, source):
             fails.append("L4 section: the descriptor's section is stored without a successful inner transaction")
         if not re.search(r"parse_runtime_context_desc\s*\(", impl):
             fails.append("L4 section: the descriptor publish no longer reads the descriptor through parse_runtime_context_desc")
+
+    cent = function_body(source, r"\bvoid\s+ggml_backend_sycl_set_runtime_context\s*\(")
+    if cent is None:
+        fails.append("L4 C entry: ggml_backend_sycl_set_runtime_context not found")
+    else:
+        arms = [m.group(1).strip() for m in re.finditer(r"\bcatch\s*\(([^)]*)\)", cent)]
+        if arms != ["const std::system_error & e", "const std::exception & e", "..."]:
+            fails.append("L4 C entry: ggml_backend_sycl_set_runtime_context must catch system_error, then std::exception, "
+                         "then everything (found %s)" % arms)
+        elif not re.search(r"try \{\s*\(void\) ggml_sycl_run_runtime_context_transaction\(", cent):
+            fails.append("L4 C entry: the runtime context transaction is called outside the C entry's try")
+        elif cent.count("GGML_LOG_ERROR(") != 3 or re.search(r"\bthrow\b", cent):
+            fails.append("L4 C entry: every arm of the C entry must log at ERROR and none may rethrow")
+    nctx = function_body(source, r"\bvoid\s+ggml_backend_sycl_set_runtime_n_ctx\s*\(")
+    if nctx is None or "ggml_backend_sycl_set_runtime_context(backend," not in nctx or \
+            "ggml_sycl_run_runtime_context_transaction" in nctx:
+        fails.append("L4 C entry: ggml_backend_sycl_set_runtime_n_ctx does not delegate to the guarded C entry")
+
+    impl_fn = function_body(source, r"\bggml_sycl_set_runtime_context_for_model_impl\s*\(") or ""
+    if "ggml_backend_sycl_set_runtime_context(" in impl_fn or not re.search(
+            r"try \{\s*\(void\) ggml_sycl_run_runtime_context_transaction\(backend,", impl_fn):
+        fails.append("L4 C entry: the descriptor publish must call the transaction in its own try, not the C entry that "
+                     "swallows a failed drop it has to answer EFFECT_FAILED for")
 
     late = function_body(source, r"\benum\s+ggml_sycl_late_check_result\s+ggml_backend_sycl_load_late_check\s*\(")
     if late is None:
@@ -503,10 +598,10 @@ def mutations(header_raw, source):
          SIG_CLEAR, "    } catch (...) {\n        return 0;", "    } catch (...) {\n        return 1;"),
         ("the refusal logged at INFO", "a ledger line of level ERROR is not logged through GGML_LOG_ERROR",
          r"\bstatic\s+void\s+ggml_sycl_load_ledger_log\s*\(",
-         "case ggml_sycl::load_log_level::ERROR:\n            GGML_LOG_ERROR(", "case ggml_sycl::load_log_level::ERROR:\n            GGML_LOG_INFO("),
+         "case ggml_sycl::LOAD_LOG_LEVEL_ERROR:\n            GGML_LOG_ERROR(", "case ggml_sycl::LOAD_LOG_LEVEL_ERROR:\n            GGML_LOG_INFO("),
         ("the not-open line logged at INFO", "a ledger line of level WARN is not logged through GGML_LOG_WARN",
          r"\bstatic\s+void\s+ggml_sycl_load_ledger_log\s*\(",
-         "case ggml_sycl::load_log_level::WARN:\n            GGML_LOG_WARN(", "case ggml_sycl::load_log_level::WARN:\n            GGML_LOG_INFO("),
+         "case ggml_sycl::LOAD_LOG_LEVEL_WARN:\n            GGML_LOG_WARN(", "case ggml_sycl::LOAD_LOG_LEVEL_WARN:\n            GGML_LOG_INFO("),
         ("the late check bypasses the ledger's level", "does not log through the ledger's level",
          SIG_LATE, "ggml_sycl_load_ledger_log(r);", "GGML_LOG_INFO(\"%s\\n\", r.line.c_str());"),
         ("a publish for an unbound context is silent", "a publish for an unbound context is silent",
@@ -521,9 +616,66 @@ def mutations(header_raw, source):
          r"\bstatic\s+void\s+ggml_sycl_host_tenants_erase\s*\(", "    } catch (...) {\n        GGML_LOG_WARN(", "    } catch (...) {\n        (void) ("),
         ("the destructor's erase swallows silently", "swallows a failed drop silently",
          r"\bstatic\s+void\s+ggml_sycl_published_section_erase\s*\(", "    } catch (...) {\n        GGML_LOG_WARN(", "    } catch (...) {\n        (void) ("),
-        ("the recovery path no longer clears", "does not clear its terms",
-         r"\bggml_sycl_lifecycle_result\s+ggml_backend_sycl_model_load_end\s*\(",
-         "            (void) ggml_sycl_load_clear_compute_terms(txn.id);\n", ""),
+        ("the recovery arm no longer arms the clear", "the recovery arm does not set after_end.txn",
+         LOAD_END_SIG, "            after_end.txn = txn.id;\n            ggml_sycl_finalize_binding_failure_abort", "            ggml_sycl_finalize_binding_failure_abort"),
+        ("the recovery arm arms the clear after the abort", "the recovery arm does not set after_end.txn",
+         LOAD_END_SIG, "            after_end.txn = txn.id;\n            ggml_sycl_finalize_binding_failure_abort(*registry, recovery);\n",
+         "            ggml_sycl_finalize_binding_failure_abort(*registry, recovery);\n            after_end.txn = txn.id;\n"),
+        ("the recovery arm's arm under if (false)", "the recovery arm does not set after_end.txn",
+         LOAD_END_SIG, "            after_end.txn = txn.id;\n            ggml_sycl_finalize_binding_failure_abort",
+         "            if (false) {\n                after_end.txn = txn.id;\n            }\n            ggml_sycl_finalize_binding_failure_abort"),
+        ("the finisher arm no longer arms the clear", "the finisher arm does not set after_end.txn",
+         LOAD_END_SIG, "            after_end.txn = txn.id;\n            (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token, \"load_end/exception-rollback\");",
+         "            (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token, \"load_end/exception-rollback\");"),
+        ("the finisher arm arms the clear after its end", "the finisher arm does not set after_end.txn",
+         LOAD_END_SIG, "            after_end.txn = txn.id;\n            (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token, \"load_end/exception-rollback\");",
+         "            (void) ggml_sycl_abort_owner_effects_noexcept(ticket.token, \"load_end/exception-rollback\");\n            after_end.txn = txn.id;"),
+        ("the handler's after_end declaration dropped", "after_end is not the handler's first statement",
+         LOAD_END_SIG, "        ggml_sycl_load_ledger_clear_after_end after_end;\n", ""),
+        ("the handler rethrows without clearing", "model_load_end's handler rethrows",
+         LOAD_END_SIG, "        ggml_sycl_load_ledger_clear_after_end after_end;\n",
+         "        ggml_sycl_load_ledger_clear_after_end after_end;\n        throw;\n"),
+        ("a second catch in the end call", "must have exactly one try and one catch",
+         LOAD_END_SIG, "        return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;\n    }\n}",
+         "        return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;\n    } catch (const std::bad_alloc &) {\n        return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;\n    }\n}"),
+        ("the end call clears the ledger itself", "model_load_end clears the ledger itself",
+         LOAD_END_SIG, "        ggml_sycl_load_ledger_clear_after_end after_end;\n",
+         "        ggml_sycl_load_ledger_clear_after_end after_end;\n        (void) ggml_sycl_load_clear_compute_terms(txn.id);\n"),
+        ("the try-scope guard clears while unwinding", "the try-scope guard clears during unwinding",
+         r"\bstruct\s+ggml_sycl_load_ledger_clear_guard", "        if (std::uncaught_exceptions() > uncaught) {\n            return;\n        }\n", ""),
+        ("the try-scope guard's snapshot dropped", "does not snapshot uncaught_exceptions",
+         r"\bstruct\s+ggml_sycl_load_ledger_clear_guard", "uncaught(std::uncaught_exceptions())", "uncaught(0)"),
+        ("after_end clears a transaction it was never armed with", "after_end does not clear only a transaction it was armed with",
+         r"\bstruct\s+ggml_sycl_load_ledger_clear_after_end", "        if (txn != 0) {\n            (void) ggml_sycl_load_clear_compute_terms(txn);\n        }\n",
+         "        (void) ggml_sycl_load_clear_compute_terms(txn);\n"),
+        ("the lock scoped away in the late check", "ggml_backend_sycl_load_late_check uses the ledger without state.mutex held at the use",
+         SIG_LATE, "            std::lock_guard<std::mutex> lock(state.mutex);\n", "            { std::lock_guard<std::mutex> lock(state.mutex); }\n"),
+        ("the lock scoped away in the record", "ggml_sycl_load_record_compute_term uses the ledger without state.mutex held at the use",
+         SIG_RECORD, "    std::lock_guard<std::mutex> lock(state.mutex);\n", "    { std::lock_guard<std::mutex> lock(state.mutex); }\n"),
+        ("the lock scoped away in the clear", "ggml_sycl_load_clear_compute_terms uses the ledger without state.mutex held at the use",
+         SIG_CLEAR, "        std::lock_guard<std::mutex> lock(state.mutex);\n", "        { std::lock_guard<std::mutex> lock(state.mutex); }\n"),
+        ("the lock scoped away in the count hook", "ggml_backend_sycl_test_compute_term_count uses the ledger without state.mutex held at the use",
+         SIG_COUNT, "    std::lock_guard<std::mutex> lock(state.mutex);\n", "    { std::lock_guard<std::mutex> lock(state.mutex); }\n"),
+        ("the late check answers EQUAL for every result", "the late check does not answer the ledger's result",
+         SIG_LATE, "        return r.result;\n", "        return GGML_SYCL_LATE_CHECK_EQUAL;\n"),
+        ("the publish tail's drop swallowed in place", "a try or catch sits between the runtime_kv_admitted store",
+         TXN_SIG, "    ggml_sycl_published_section_set(ctx, nullptr);\n    return ggml_sycl_txn_result::ACCEPTED;",
+         "    try {\n        ggml_sycl_published_section_set(ctx, nullptr);\n    } catch (...) {\n    }\n    return ggml_sycl_txn_result::ACCEPTED;"),
+        ("the C entry lets a system_error out", "must catch system_error, then std::exception",
+         CENTRY_SIG, "    } catch (const std::system_error & e) {", "    } catch (const std::logic_error & e) {"),
+        ("the C entry lets a non-standard exception out", "must catch system_error, then std::exception",
+         CENTRY_SIG, "    } catch (...) {", "    } catch (const std::bad_alloc &) {"),
+        ("the C entry's arm rethrows", "every arm of the C entry must log at ERROR and none may rethrow",
+         CENTRY_SIG, "    } catch (const std::exception & e) {", "    } catch (const std::exception & e) {\n        throw;"),
+        ("the C entry's transaction called outside the try", "the runtime context transaction is called outside the C entry's try",
+         CENTRY_SIG, "    try {\n        (void) ggml_sycl_run_runtime_context_transaction(", "    {\n        (void) ggml_sycl_run_runtime_context_transaction("),
+        ("the descriptor publish calls the swallowing C entry", "the descriptor publish must call the transaction in its own try",
+         r"\bggml_sycl_set_runtime_context_for_model_impl\s*\(",
+         "        (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,",
+         "        ggml_backend_sycl_set_runtime_context(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,"),
+        ("the n_ctx entry stops delegating", "set_runtime_n_ctx does not delegate to the guarded C entry",
+         r"\bvoid\s+ggml_backend_sycl_set_runtime_n_ctx\s*\(", "ggml_backend_sycl_set_runtime_context(backend,",
+         "(void) ggml_sycl_run_runtime_context_transaction(backend,"),
     ]
     for label, msg, sig, old, new in scoped:
         span = function_span(src, sig)

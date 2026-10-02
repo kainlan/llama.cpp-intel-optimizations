@@ -356,6 +356,15 @@ inline ggml_sycl_tenant_coverage classify_tenant_coverage(const runtime_context_
     return equal ? GGML_SYCL_TENANT_COVERAGE_EQUAL : GGML_SYCL_TENANT_COVERAGE_COVERED;
 }
 
+// The level a ledger line is for.  INFO is dropped at default verbosity in every tool, so a line a caller
+// must see in a normal run is WARN or ERROR, and the ledger picks the level so a host test can pin it.
+enum load_log_level {
+    LOAD_LOG_LEVEL_NONE  = 0,
+    LOAD_LOG_LEVEL_INFO  = 1,
+    LOAD_LOG_LEVEL_WARN  = 2,
+    LOAD_LOG_LEVEL_ERROR = 3,
+};
+
 // The compute term the early stage admitted, per (load transaction, device): c(P) of zhcn's
 // measure (zhcn design 2.10, call site (b)).  The late check (call site (c)) compares the
 // late measure with it under the one late-check rule moua and 23mk share.
@@ -366,10 +375,6 @@ inline ggml_sycl_tenant_coverage classify_tenant_coverage(const runtime_context_
 //
 // The strings are canonical (moua design 2.4.2 (b), step 3; ruling Z13.1); zhcn and
 // 23mk mirror them by citation.
-// The level a ledger line is for.  INFO is dropped at default verbosity in every tool, so a line a caller
-// must see in a normal run is WARN or ERROR, and the ledger picks the level so a host test can pin it.
-enum class load_log_level : uint8_t { NONE, INFO, WARN, ERROR };
-
 class load_compute_ledger {
   public:
     static constexpr const char * TERM = "compute";
@@ -383,9 +388,9 @@ class load_compute_ledger {
 
     struct check_result {
         ggml_sycl_late_check_result result = GGML_SYCL_LATE_CHECK_NOT_RECORDED;
-        std::string                 line;  // the line to log, empty for none
-        load_log_level              level = load_log_level::NONE;  // the level of `line`; NONE exactly when it is empty
-        bool shrink_counted = false;       // an admitted shrink: the line is the WARN and the counter takes +1
+        std::string                 line;                         // the line to log, empty for none
+        load_log_level              level = LOAD_LOG_LEVEL_NONE;  // the level of `line`; NONE exactly when it is empty
+        bool shrink_counted               = false;  // an admitted shrink: the line is the WARN and the counter takes +1
     };
 
     // Records c(P) = `bytes` for (txn, device).  False, recording nothing, when `n_ctx` is 0, `txn` is 0, or
@@ -424,7 +429,7 @@ class load_compute_ledger {
                 "compared",
                 (int) device, (unsigned long long) txn);
             r.line  = line;
-            r.level = load_log_level::WARN;
+            r.level = LOAD_LOG_LEVEL_WARN;
             return r;
         }
         auto it = terms_.find(key{ txn, device });
@@ -438,7 +443,7 @@ class load_compute_ledger {
                 "compared",
                 (int) device, (unsigned long long) txn);
             r.line  = line;
-            r.level = load_log_level::INFO;
+            r.level = LOAD_LOG_LEVEL_INFO;
             return r;
         }
         entry & e = it->second;
@@ -450,7 +455,7 @@ class load_compute_ledger {
                 TERM, zone(), (int) device, (size_t) e.admitted, (size_t) late_bytes);
             r.result = GGML_SYCL_LATE_CHECK_REFUSED;
             r.line   = line;
-            r.level  = load_log_level::ERROR;
+            r.level  = LOAD_LOG_LEVEL_ERROR;
             return r;
         }
         if (late_bytes < e.admitted) {
@@ -463,7 +468,7 @@ class load_compute_ledger {
                     "(admitted; the early reservation stands)",
                     TERM, (int) device, (size_t) e.admitted, (size_t) late_bytes);
                 r.line           = line;
-                r.level          = load_log_level::WARN;
+                r.level          = LOAD_LOG_LEVEL_WARN;
                 r.shrink_counted = true;
             }
             return r;

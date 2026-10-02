@@ -261,6 +261,14 @@
       "reason": "allocation_registry_test_publish_raw is a noexcept PRIVATE_TESTING seam that inserts one synthetic row into the runtime allocation registry for tests: its try body only builds the record and takes the registry mutex, so no planned refusal can reach the handler, and a rethrow in a noexcept function would std::terminate. It reports failure by returning false. Permanent; test-only code absent from the shipped library."
     },
     {
+      "id": "E-L4-CABI-SET-RUNTIME-CONTEXT",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_backend_sycl_set_runtime_context",
+      "count": 2,
+      "reason": "C ABI boundary: ggml_backend_sycl_set_runtime_context is a void GGML_BACKEND_API entry and no exception of any type may cross it. Its try body is the runtime-context transaction, which reports a planned refusal through its return value (the result is discarded: the entry has always been fire-and-forget) and names no ggml_sycl_fallback_error, so a rethrow-first clause would guard nothing; the one failure it can raise is the registry lock's std::system_error from the publish tail's drop of the earlier section. The std::exception and catch-all arms log at ERROR with the entry's name and leave the state as the failed path leaves it. Permanent; llama.cpp-moua L4 step 3."
+    },
+    {
       "id": "E-L4-SECTION-ERASE",
       "code": "G-CATCH",
       "file": "ggml-sycl.cpp",
