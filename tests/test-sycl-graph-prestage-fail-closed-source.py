@@ -39,8 +39,11 @@ each pinned below:
   * graph_input_stage allocates the replacement into LOCALS and publishes into the map as its last act, after
     every failure return, so a failure leaves the old entry live;
   * the displaced handle is RETAINED until the last work submitted so far completes
-    (retain_handles_until_event on q.ext_oneapi_submit_barrier()), never freed and never released by a host wait.
-    The swap sets graph_input_staging_swapped (the one record of the fact) and bumps the staging generation;
+    (retain_handles_until_event on a ggml_sycl_submit_marker event, taken before the handle is touched), never freed
+    and never released by a host wait.
+    The swap passes a COPY of the handle to retain and only then publishes the replacement, so a throwing retain
+    leaves the old entry intact. It sets graph_input_staging_swapped (the one record of the fact) and bumps the staging
+    generation. Reuse requires `capacity >= nbytes`;
   * a staging failure for an INPUT tensor is terminal for the pass (all_staged = false). It no longer falls
     through to the cache or staging-cache paths, which could succeed and let the pre-stage report true with the
     entry already displaced. Pre-existing exception, NOT closed here: an INPUT with an empty name does not take
@@ -49,7 +52,9 @@ each pinned below:
     pass succeeded or declined, and retires every recorder that may have baked the old pointer
     (graph_staging_swap_retire): dense range graphs (drop_graphs drains), the MoE segment, block, direct-dispatch
     and sequence epochs (each retire waits for its terminals), and a LIVE exec graph. The staging map is not
-    touched, so there is no second pre-stage.
+    touched, so there is no second pre-stage. The retire reports success; a failed MoE retire fails the gateway closed
+    (it declines), and what makes a failure a failure is pinned: the retire's catch and non-OK paths return false, each
+    invalidator disables its own recorder, and each replay gate honors that disabled flag.
 The gateway runs INSIDE a graph_compute that has already pinned weights and experts (graph_preload_weights,
 graph_preload_moe_experts), so it must NOT call sycl_exec_graph_clear_active: that unpins the leases, clears the
 CPU staging cache and the MoE layout cache mid-compute (its own header cites a measured gemma regression). The gate
@@ -261,10 +266,10 @@ def evaluate(backend, common, memo_hdr):
     site = r"if\s*\(!" + call % r"sycl_ctx,\s*cgraph,\s*graph_hash" + r"\)\s*\{\s*"
     results["site 3, MoE segment replay: declines, invalidates the segments, runs direct, else replays"] = re.search(
         site + r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\}\s*else\s*"
-        r"(if\s*\(!sycl_ctx->moe_segments_valid \|\| sycl_ctx->moe_graphs_disabled\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*)?\{\s*"
+        r"(if\s*\(!sycl_ctx->moe_segments_valid\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*)?\{\s*"
         r"graph_refresh_input_tensors\(sycl_ctx, cgraph\);\s*moe_graph_replay_segments\(", compute) is not None
     results["site 3: segments a staging swap retired run the token direct instead of replaying nothing"] = re.search(
-        site + r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\}\s*else if\s*\(!sycl_ctx->moe_segments_valid \|\| sycl_ctx->moe_graphs_disabled\)\s*\{\s*"
+        site + r"sycl_ctx->invalidate_moe_segments\(\);\s*compute_impl_unlocked\(\);\s*\}\s*else if\s*\(!sycl_ctx->moe_segments_valid\)\s*\{\s*"
         r"compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*graph_refresh_input_tensors\(sycl_ctx, cgraph\);\s*moe_graph_replay_segments\(", compute) is not None
     results["site 4, MoE segment record: declines and runs direct, else records"] = re.search(
         r"\}\s*else\s*" + site + r"compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*graph_refresh_input_tensors\(sycl_ctx, cgraph\);\s*"
@@ -336,7 +341,7 @@ def evaluate(backend, common, memo_hdr):
         re.search(r"if\s*\(\s*slot\.handle\.valid\(\)\s*\)\s*\{\s*"
                   r"sycl::event\s+retire\s*=\s*ggml_sycl_submit_marker<graph_input_staging_retire_marker>\(q\);\s*"
                   r"graph_input_staging_swapped\s*=\s*true;\s*"
-                  r"ggml_sycl::retain_handles_until_event\(\s*\{\s*std::move\(slot\.handle\)\s*\}\s*,\s*retire\s*\);\s*\}\s*"
+                  r"ggml_sycl::retain_handles_until_event\(\s*\{\s*slot\.handle\s*\}\s*,\s*retire\s*\);\s*\}\s*"
                   r"slot\.handle\s*=\s*std::move\(handle\);\s*slot\.capacity\s*=\s*nbytes;\s*graph_input_staging_generation\+\+;",
                   stage_fn) is not None
     # Review r8 M1/M2: the event is taken FIRST, before the slot is touched (an argument-evaluation order that moved the
@@ -346,7 +351,7 @@ def evaluate(backend, common, memo_hdr):
         re.search(r"struct\s+graph_input_staging_retire_marker\s*\{\s*\}\s*;", common) is not None and \
         "ext_oneapi_submit_barrier" not in stage_fn and \
         stage_fn.find("ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q)") >= 0 and \
-        stage_fn.find("ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q)") < stage_fn.find("std::move(slot.handle)")
+        stage_fn.find("ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q)") < stage_fn.find("retain_handles_until_event")
     # One fact, one source, and the only mutation sites: the swap itself publishes and retains; nothing else resets,
     # erases or releases an entry, and the swap waits on nothing (retention is by event, not by host wait).
     results["the staging map's only mutation sites are the swap and the clear, and the swap waits on nothing"] = \
@@ -413,11 +418,21 @@ def evaluate(backend, common, memo_hdr):
     results["the gateway declines when the staging swap could not retire every recorder"] = \
         re.search(r"if\s*\(staged && retired\)\s*\{\s*ctx->prestage_decline_memo\.forget\(graph_hash\);\s*return true;\s*\}\s*"
                   r"ctx->prestage_decline_memo\.remember\(graph_hash, ctx->graph_compute_seq\);", decline) is not None
-    results["site 3 runs direct when MoE graphs were disabled by a failed retire"] = \
-        re.search(r"else if\s*\(!sycl_ctx->moe_segments_valid \|\| sycl_ctx->moe_graphs_disabled\)\s*\{\s*compute_impl_unlocked\(\);", compute) is not None
-    results["the block graphlet site rejects when the gateway left MoE graphs disabled"] = \
-        re.search(r"if\s*\(!" + (r"graph_prestage_or_decline\(" ) + r"sycl_ctx,\s*cgraph,\s*graph_hash\)\)\s*\{[^{}]*\}\s*"
-                  r"if\s*\(sycl_ctx->moe_graphs_disabled \|\| sycl_ctx->moe_block_graphs_disabled\)\s*\{[^{}]*return false;\s*\}", graphlets) is not None
+    results["graph_input_stage reuses an entry only when it is large enough (capacity >= nbytes)"] = \
+        re.search(r"auto it = graph_input_staging\.find\(owner\);\s*if\s*\(it != graph_input_staging\.end\(\) && it->second\.capacity >= nbytes\)\s*\{", stage_fn) is not None
+    # Review r9: what makes a failure a failure. The retire's drain and registry paths report false, and every replay
+    # gate honors the disabled flag the failure sets, so a failed retire cannot be walked past.
+    retire_exact_fn = function_body(backend, r"static bool moe_graph_retention_retire_exact\(ggml_backend_sycl_context \* ctx\)\s*\{") or ""
+    epoch_fn = function_body(backend, r"bool ggml_sycl_retire_moe_graph_epoch\(ggml_backend_sycl_context \* ctx\) noexcept\s*\{") or ""
+    results["a failed drain or registry retire makes the epoch retire report false"] = \
+        re.search(r"wait_and_throw\(\);\s*\}\s*\}\s*catch\s*\(\.\.\.\)\s*\{\s*return false;\s*\}", retire_exact_fn) is not None and \
+        re.search(r"if\s*\(rc != ggml_sycl::moe::retention_error::OK && rc != ggml_sycl::moe::retention_error::STALE\)\s*\{\s*return false;\s*\}", retire_exact_fn) is not None and \
+        re.fullmatch(r"\{\s*try\s*\{\s*return moe_graph_retention_retire_exact\(ctx\);\s*\}\s*catch\s*\(\.\.\.\)\s*\{\s*return false;\s*\}\s*\}", epoch_fn) is not None
+    results["every replay gate honors the disabled flag a failed retire sets"] = \
+        "!sycl_ctx->moe_graphs_disabled && !sycl_ctx->moe_direct_dispatch_graphs_disabled &&" in backend and \
+        "sycl_ctx->moe_graphs_disabled || sycl_ctx->moe_sequence_graphs_disabled || node->op != GGML_OP_MUL_MAT_ID" in backend and \
+        "if (sycl_ctx->moe_block_graphs_disabled || g_ggml_sycl_disable_graph || sycl_ctx->graphs_disabled ||\n        sycl_ctx->moe_graphs_disabled) {" in backend and \
+        re.search(r"if\s*\(sycl_ctx->moe_graphs_disabled\)\s*\{", backend) is not None
     results["the INPUT arm stages on the backend's own queue"] = \
         re.search(r"if\s*\(graph_tensor_is_input\(tensor\)\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{\s*"
                   r"sycl::queue\s*&\s*q\s*=\s*\*ctx->stream\(\);\s*void \* dev_ptr\s*=\s*ctx->graph_input_stage\(tensor, tensor->data, nbytes, q\);",
@@ -516,21 +531,38 @@ if args.self_test:
 
     mem_ = memo_hdr
     mutants = [
+        # review r9
+        ("the displaced handle is moved into retain", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
+         (backend, mutate_in_func(common, stage_sig, "retain_handles_until_event({ slot.handle }, retire)", "retain_handles_until_event({ std::move(slot.handle) }, retire)"), mem_)),
+        ("the reuse test loses its size bound", "graph_input_stage reuses an entry only when it is large enough (capacity >= nbytes)",
+         (backend, mutate_in_func(common, stage_sig, "it->second.capacity >= nbytes", "it->second.capacity > 0"), mem_)),
+        ("the retire drain's catch reports success", "a failed drain or registry retire makes the epoch retire report false",
+         (mutate_in_func(backend, retire_sig, "} catch (...) {\n        return false;", "} catch (...) {\n        return true;"), common, mem_)),
+        ("the registry retire's failure is ignored", "a failed drain or registry retire makes the epoch retire report false",
+         (mutate_in_func(backend, retire_sig, "rc != ggml_sycl::moe::retention_error::OK && rc != ggml_sycl::moe::retention_error::STALE", "false"), common, mem_)),
+        ("the epoch wrapper's catch reports success", "a failed drain or registry retire makes the epoch retire report false",
+         (mutate_in_func(backend, r"bool ggml_sycl_retire_moe_graph_epoch\([^)]*\) noexcept\s*\{", "} catch (...) {\n        return false;", "} catch (...) {\n        return true;"), common, mem_)),
+        ("the direct-dispatch gate ignores its disabled flag", "every replay gate honors the disabled flag a failed retire sets",
+         (mutate(backend, "!sycl_ctx->moe_graphs_disabled && !sycl_ctx->moe_direct_dispatch_graphs_disabled &&", "!sycl_ctx->moe_graphs_disabled &&"), common, mem_)),
+        ("the sequence gate ignores moe_graphs_disabled", "every replay gate honors the disabled flag a failed retire sets",
+         (mutate(backend, "sycl_ctx->moe_graphs_disabled || sycl_ctx->moe_sequence_graphs_disabled || node->op", "sycl_ctx->moe_sequence_graphs_disabled || node->op"), common, mem_)),
+        ("the block graphlet gate ignores moe_graphs_disabled", "every replay gate honors the disabled flag a failed retire sets",
+         (mutate(backend, "sycl_ctx->graphs_disabled ||\n        sycl_ctx->moe_graphs_disabled) {", "sycl_ctx->graphs_disabled) {"), common, mem_)),
         # review r8
         ("the handle is moved before the event is taken", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
          (backend, mutate_in_func(common, stage_sig,
                                   "sycl::event retire = ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q);\n"
                                   "            graph_input_staging_swapped = true;\n"
-                                  "            ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, retire);",
+                                  "            ggml_sycl::retain_handles_until_event({ slot.handle }, retire);",
                                   "graph_input_staging_swapped = true;\n"
-                                  "            ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q));"), mem_)),
+                                  "            ggml_sycl::retain_handles_until_event({ slot.handle }, ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q));"), mem_)),
         ("the swap uses a bare barrier", "the staging swap takes its event from the marker helper before it moves the handle, never a bare barrier",
          (backend, mutate_in_func(common, stage_sig, "ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q)", "q.ext_oneapi_submit_barrier()"), mem_)),
         ("the swap flags after it retains", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
          (backend, mutate_in_func(common, stage_sig,
                                   "graph_input_staging_swapped = true;\n"
-                                  "            ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, retire);",
-                                  "ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, retire);\n"
+                                  "            ggml_sycl::retain_handles_until_event({ slot.handle }, retire);",
+                                  "ggml_sycl::retain_handles_until_event({ slot.handle }, retire);\n"
                                   "            graph_input_staging_swapped = true;"), mem_)),
         ("the dense drop hides in a dead brace", "the swap retire is exactly: flag, dense drop, four MoE retires, a drained live-exec reset, and their conjunction",
          (mutate_in_func(backend, swap_sig, "ggml_sycl_block_exec_dense_drop_graphs(ctx);",
@@ -563,13 +595,6 @@ if args.self_test:
          (backend, mutate_in_func(common, r"bool invalidate_moe_segments\(\)\s*\{", "return false;\n        }", "return true;\n        }"), mem_)),
         ("an invalidator stops reporting success", "each MoE invalidator reports whether it retired the epoch (false on failure)",
          (backend, mutate_in_func(common, r"bool invalidate_moe_sequence_graphs\(\)\s*\{", "return true;\n    }", "return false;\n    }"), mem_)),
-        ("site 3 ignores the disabled flag", "site 3 runs direct when MoE graphs were disabled by a failed retire",
-         (mutate_in_func(backend, cmp_sig, "else if (!sycl_ctx->moe_segments_valid || sycl_ctx->moe_graphs_disabled) {",
-                         "else if (!sycl_ctx->moe_segments_valid) {"), common, mem_)),
-        ("the graphlet site ignores a disabled flag after the gateway", "the block graphlet site rejects when the gateway left MoE graphs disabled",
-         (mutate_re(backend, r"static bool moe_graph_try_block_graphlets\([^)]*\)\s*\{",
-                    r"if \(sycl_ctx->moe_graphs_disabled \|\| sycl_ctx->moe_block_graphs_disabled\) \{\s*ggml_sycl_moe_aggregation_diag\([^;]*;\s*return false;\s*\}\s*graph_refresh_input_tensors",
-                    "graph_refresh_input_tensors"), common, mem_)),
         ("dense post-gateway resize forgets the cached-input reset", "the dense recorder re-sizes its range graphs after the gateway may have retired them",
          (mutate_in_func(backend, r"graph_prestage_decline_memo::dense_split_key\(key\)\)\)\s*\{[^}]*\}\s*if \(st\.graphs\.size\(\) != ranges_\.size\(\)\) \{",
                          "ctx_.input_tensors_cached = false;", "(void) 0;"), common, mem_)),
@@ -714,7 +739,7 @@ if args.self_test:
          (mutate(backend, "if (st.graphs.size() != ranges_.size()) {", "if (false) {"), common, mem_)),
         # staging swap (review r6, r7)
         ("the displaced handle is freed at the swap", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
-         (backend, mutate_in_func(common, stage_sig, "ggml_sycl::retain_handles_until_event({ std::move(slot.handle) }, retire);",
+         (backend, mutate_in_func(common, stage_sig, "ggml_sycl::retain_handles_until_event({ slot.handle }, retire);",
                                   "slot.handle = ggml_sycl::mem_handle{};"), mem_)),
         ("the displaced handle is retained on an empty event", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
          (backend, mutate_in_func(common, stage_sig, "ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q)", "sycl::event{}"), mem_)),

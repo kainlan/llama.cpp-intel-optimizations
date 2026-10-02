@@ -299,12 +299,12 @@ static int test_sequence_graphlet_has_retention_and_identity() {
     const std::string mmvq   = read_required_file("ggml/src/ggml-sycl/mmvq.cpp");
 
     const std::string sequence_record =
-        required_region(common, "struct moe_sequence_graph {", "void invalidate_moe_segments()",
+        required_region(common, "struct moe_sequence_graph {", "invalidate_moe_segments() {",
                         "moe_sequence_graph context record");
     CHECK(contains(sequence_record, "std::vector<ggml_sycl::mem_handle> retained_handles"),
           "sequence graph records must retain mem_handles in their own record type");
     const std::string sequence_state = required_region(common, "std::vector<moe_sequence_graph>",
-                                                       "void invalidate_moe_segments()",
+                                                       "invalidate_moe_segments() {",
                                                        "moe sequence graphlet context state");
     CHECK(contains(sequence_state, "moe_sequence_graph_failed_nodes"),
           "sequence context must track real per-node record failures for fail-closed replay safety");
@@ -525,11 +525,11 @@ static int test_sequence_graphlet_residual_overhead_counters_and_safe_metadata()
           "sequence graphlet cache metadata must include mode hash in addition to graph hash/n_nodes/decode");
 
     const std::string sequence_state = required_region(common, "std::vector<moe_sequence_graph>",
-                                                       "void invalidate_moe_segments()",
+                                                       "invalidate_moe_segments() {",
                                                        "moe sequence graphlet context state");
     CHECK(contains(sequence_state, "moe_sequence_graphs_mode_hash = 0"),
           "sequence graphlet context metadata must store mode hash as part of the safe cache key");
-    const std::string invalidate_sequence = required_region(common, "void invalidate_moe_sequence_graphs() {",
+    const std::string invalidate_sequence = required_region(common, "invalidate_moe_sequence_graphs() {",
                                                             "// === Cached per-graph computations",
                                                             "sequence graphlet invalidation");
     CHECK(contains(invalidate_sequence, "moe_sequence_graphs_mode_hash = 0"),

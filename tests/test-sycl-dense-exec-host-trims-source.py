@@ -177,6 +177,10 @@ def test_every_staging_writer_bumps_the_generation():
     # here). The bump must follow the publish, and no way out may sit between the publish and the bump.
     publish = re.search(r"slot\.capacity\s*=\s*nbytes\s*;", stage)
     assert publish, "graph_input_stage no longer publishes the entry it creates or replaces"
+    # ... and no reset of an entry is restored ahead of it: the displaced handle is retained, never dropped first.
+    assert re.search(r"\.handle\s*=\s*(ggml_sycl::)?mem_handle\s*\{\s*\}", stage[: publish.start()]) is None, (
+        "graph_input_stage resets an entry before it publishes the replacement (drop-then-allocate)"
+    )
     first_exit = stage.find("return", publish.end())
     assert first_exit > 0 and GENERATION + "++" in stage[publish.end() : first_exit], (
         "replacing or creating an entry must bump the generation before any return"
