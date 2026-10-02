@@ -244,3 +244,10 @@ def test_existing_cli_is_unchanged_without_new_flags(tmp_path):
     # geometry annotations stay off unless asked for
     assert "kernel.mxfp4.soa.batched.geometry_bytes_per_call" not in found
     assert "kernel.mxfp4.soa.batched.achieved_gbps_x1000" not in found
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

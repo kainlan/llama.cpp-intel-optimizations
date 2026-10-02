@@ -74,3 +74,10 @@ def test_layer_ledger_reports_missing_optional_layers() -> None:
         assert "coverage.missing_layer l0" in result.stdout
         assert "coverage.missing_layer ur" in result.stdout
         assert "coverage.missing_layer vtune" in result.stdout
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

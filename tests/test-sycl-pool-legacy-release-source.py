@@ -333,3 +333,10 @@ def test_second_call_with_template_arguments_is_witnessed() -> None:
     assert violations == ["free() calls pool_legacy_release 2 times, expected once"], (
         f"mutation was not witnessed: {violations}"
     )
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

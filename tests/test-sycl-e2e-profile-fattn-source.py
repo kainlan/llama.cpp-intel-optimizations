@@ -89,3 +89,10 @@ def test_packed_k_sidecar_records_kv_bytes_without_ownership_change() -> None:
     assert "total_bytes" in body[record:record_gate_close]
     assert ".wait(" not in body
     assert ".wait_and_throw(" not in body
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

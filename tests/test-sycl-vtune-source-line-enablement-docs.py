@@ -82,3 +82,10 @@ def test_sycl_docs_describe_iga_pc_static_source_line_path() -> None:
     assert "-Xprint-pc" in section
     assert "asm-line-static-cost" in section
     assert "not sampled VTune exact" in section
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

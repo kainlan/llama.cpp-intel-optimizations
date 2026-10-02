@@ -2348,3 +2348,10 @@ def test_mutation_report_ungated_is_witnessed() -> None:
                      "            \"[CONTEXT-PLAN-BUG] retained-reap backstop",
                      "    if (false) {\n        GGML_ABORT(\n            \"[CONTEXT-PLAN-BUG] retained-reap backstop",
                      "report_retained_reap_backstop", "backstop abort ungated")
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

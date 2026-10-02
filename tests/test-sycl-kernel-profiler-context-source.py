@@ -49,3 +49,10 @@ def test_graph_loop_wraps_compute_forward_in_profiler_node_scope() -> None:
         assert window.index("ggml_sycl_kernel_profile_node_scope") < window.index(
             "ggml_sycl_compute_forward(*sycl_ctx, node)"
         )
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

@@ -516,3 +516,10 @@ def test_reinserting_later_mul_mat_id_case_is_rejected() -> None:
         "        case GGML_OP_MUL_MAT:\n        case GGML_OP_MUL_MAT_ID:\n",
     )
     assert not contract(mutated)
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

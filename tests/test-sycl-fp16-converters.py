@@ -213,3 +213,10 @@ def test_source_contract_mutations_fail_closed() -> None:
         1,
     )
     assert not _contract(SOURCE, mmid_closed)
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

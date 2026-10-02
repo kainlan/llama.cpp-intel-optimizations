@@ -154,3 +154,10 @@ def test_l2_norm_is_intentionally_out_of_scope_and_left_raw() -> None:
     )
     assert body.count("stream->submit(") == 2
     assert "ggml_sycl_profile_submit(" not in body
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

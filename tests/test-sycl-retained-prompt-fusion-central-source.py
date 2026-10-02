@@ -161,3 +161,10 @@ def test_prompt_receipt_prevents_post_boundary_q8_growth_and_retains_owner() -> 
     allocator = mmvq[allocator_start:allocator_end]
     assert "retired_owner = cache.q8_handle" in allocator
     assert "retain_handles_until_event" in allocator
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

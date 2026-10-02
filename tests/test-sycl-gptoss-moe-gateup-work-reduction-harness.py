@@ -63,3 +63,10 @@ def test_dry_run_forbids_probe_commands(tmp_path: pathlib.Path) -> None:
     forbidden = ("sycl-ls", "/dev/dri", "fdinfo", "lsof", "direct P2P")
     for needle in forbidden:
         assert needle not in result.stdout
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

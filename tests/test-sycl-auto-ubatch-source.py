@@ -2445,3 +2445,10 @@ def test_env_vars_doc_explains_the_moe_512_pin():
     assert "GPT-OSS" in row and "Mistral" in row, (
         "the row must name GPT-OSS (MoE, pinned) and Mistral (dense, not pinned) as the contrasting example"
     )
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

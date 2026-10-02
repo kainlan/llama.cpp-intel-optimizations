@@ -35,3 +35,10 @@ def test_zone_alloc_failed_e2e_sites_also_record_timeline_cache_spans() -> None:
 
     assert len(e2e_records) >= 2
     assert len(timeline_records) == len(e2e_records)
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

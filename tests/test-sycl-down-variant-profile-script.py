@@ -232,3 +232,10 @@ def test_row_and_atomic_variant_envs_do_not_leak_between_rows(tmp_path: Path) ->
     assert "GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT=row2" in _section(out, "row2")
     assert "GGML_SYCL_MOE_DOWN_SUM_Q8_SOA_TG_VARIANT=row4" in _section(out, "row4")
     assert "GGML_SYCL_MOE_DOWN_SUM_DIRECT_ATOMIC=1" in _section(out, "atomic")
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

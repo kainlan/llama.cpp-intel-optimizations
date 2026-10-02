@@ -185,3 +185,10 @@ def test_debug_matrix_execute_branch_writes_expected_artifacts() -> None:
         "set -u",
     ):
         assert required in text
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

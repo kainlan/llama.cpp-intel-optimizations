@@ -839,3 +839,10 @@ def test_contract_and_mutation_witnesses() -> None:
         assert (mutant_header, mutant_source, mutant_test, mutant_mem) != (header, source, host_test, mem_source), (
             f"semantic mutation changed nothing: {name}")
         assert violations(mutant_header, mutant_source, mutant_test, mutant_mem), f"semantic mutation survived: {name}"
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

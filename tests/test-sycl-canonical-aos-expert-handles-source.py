@@ -463,3 +463,10 @@ def test_mutations_are_witnessed() -> None:
     # A mutation whose target string has drifted away is a silent no-op, which
     # would leave violations() empty and fail here rather than pass vacuously.
     assert all(violations(mutated) for mutated in mutations)
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

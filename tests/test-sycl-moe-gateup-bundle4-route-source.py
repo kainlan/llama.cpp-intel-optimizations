@@ -30,3 +30,10 @@ def test_bundle4_non_bias_route_uses_existing_bundle4_parser_without_bias_or_spa
     assert "const bool use_bias                 = config.kernel_name.find(\"_bias\") != std::string::npos" in harness
     assert "_bias" not in route
     assert "_sparse32" not in route
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

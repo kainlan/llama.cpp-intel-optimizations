@@ -209,3 +209,10 @@ def test_gate_mutations_cover_alias_ternary_helper_and_offset_extent():
     }
     for name, source in mutations.items():
         assert violations(f"{name}.cpp", source), f"gate accepted {name} mutation"
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

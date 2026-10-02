@@ -805,3 +805,10 @@ def test_live_gate_sidecar_boundaries_and_guard_mutations_are_killed() -> None:
     assert not cmake_contract(
         replace_in_packed_k_block(CMAKE, "GGML_SYCL_PRIVATE_TESTING=1", "GGML_SYCL_PRIVATE_TESTING=0"))
     assert not cmake_contract(replace_in_packed_k_block(CMAKE, "    GGML_SYCL_PRIVATE_TESTING=1\n", ""))
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

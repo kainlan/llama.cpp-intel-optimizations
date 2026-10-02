@@ -140,3 +140,10 @@ def test_binbcast_file_has_no_unprofiled_stream_parallel_for_submits() -> None:
     assert "stream->parallel_for(" not in src
     assert "sycl.binbcast.add1" in src
     assert "sycl.binbcast.mul_add_fused" in src
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

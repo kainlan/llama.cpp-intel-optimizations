@@ -220,3 +220,10 @@ def test_decode_timeline_profiler_documents_supported_parser_callsite_option() -
     text = _doc_text()
     assert "--top-callsites" in text
     assert "--top " not in text
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

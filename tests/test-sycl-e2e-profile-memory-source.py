@@ -96,3 +96,10 @@ def test_peer_host_bounce_measure_records_transfer_stage() -> None:
     assert "link.host_bounce_d2h_us" in body[:record]
     assert "link.host_bounce_h2d_us" in body[:record]
     assert_no_waits(body[host_us:gate_close])
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

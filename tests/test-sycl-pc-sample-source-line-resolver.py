@@ -164,3 +164,10 @@ def test_sample_resolver_rejects_zero_sample_count() -> None:
         assert result.returncode == 2
         assert "sample_count must be positive" in result.stdout
         assert "Traceback" not in result.stdout
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

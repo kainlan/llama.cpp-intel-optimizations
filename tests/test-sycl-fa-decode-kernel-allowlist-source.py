@@ -194,3 +194,10 @@ def test_mutations_are_witnessed() -> None:
     assert any("no longer requires other_kernel_count == 0" in v for v in opened_violations), (
         f"open-allowlist mutation was not witnessed: {opened_violations}"
     )
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

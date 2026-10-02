@@ -105,3 +105,10 @@ def test_compute_forward_records_and_flushes_early_handled_routes() -> None:
         return_pos = body.index("return true;", route_pos)
         route_block = body[route_pos:return_pos]
         assert "e2e_record_early_handled_route();" in route_block
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

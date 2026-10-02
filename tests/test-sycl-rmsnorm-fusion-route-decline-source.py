@@ -149,3 +149,10 @@ def test_mutation_is_witnessed() -> None:
     assert any("no longer declines via ggml_sycl_onednn_pp_candidate" in v for v in violations), (
         f"route-decline-removal mutation was not witnessed: {violations}"
     )
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

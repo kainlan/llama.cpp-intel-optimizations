@@ -175,3 +175,10 @@ def test_pending_entries_retire_themselves() -> None:
         assert entry in still_broken, (
             f"{entry} now sets {SETTING} -- remove it from PENDING in this file."
         )
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

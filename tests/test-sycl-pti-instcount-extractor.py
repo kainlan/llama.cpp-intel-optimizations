@@ -138,3 +138,10 @@ def test_reports_no_matching_kernel_without_synthesizing_rows() -> None:
         text = summary.read_text(encoding="utf-8")
         assert "pti_instcount.status no_matching_kernel" in text
         assert "pti_instcount.blocker no_matching_kernel" in text
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

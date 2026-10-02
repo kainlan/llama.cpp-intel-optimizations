@@ -459,3 +459,10 @@ def test_review_mutations_are_detected() -> None:
     mutated_concat = concat[:dispatch_start] + concat[dispatch_start:].replace("case GGML_TYPE_I8:", "", 1)
     helper_cases, dispatch_cases = _concat_case_sets(mutated_concat)
     assert helper_cases != dispatch_cases
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

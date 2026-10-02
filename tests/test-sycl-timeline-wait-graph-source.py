@@ -121,3 +121,10 @@ def test_moe_sequence_graphlet_records_timeline_scopes_around_refresh_record_rep
     assert "moe_sequence_graphlet_prepare_pointer_tables" in sequence_graphlet
     assert "moe_graph_record_moe_dispatch_graph" in sequence_graphlet
     assert "ext_oneapi_graph(*exec_graph)" in sequence_graphlet
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

@@ -41,3 +41,10 @@ def test_private_route_watchdog_is_explicit_bounded_and_isolated() -> None:
     # AOT choice in a comment that names the variable, and that prose is not a setting.
     code = re.sub(r"(?m)^\s*#.*$", "", cmake)
     assert code.count(WATCHDOG_ENV) == 1
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

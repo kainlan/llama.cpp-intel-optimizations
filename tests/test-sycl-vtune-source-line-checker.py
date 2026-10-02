@@ -878,3 +878,10 @@ def test_checker_does_not_promote_contradictory_sampled_pc_row_to_asm_static() -
         assert "source_line.asm_source_line_rows 0" in result.stdout
         assert "source_line.source_attribution_mode none" in result.stdout
         assert "source_line.status fail" in result.stdout
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

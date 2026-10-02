@@ -230,3 +230,10 @@ def test_source_line_feasibility_execute_branch_writes_expected_artifacts() -> N
     assert "! grep -Eq \"^source_line.status (pass|asm-line-static-cost|dwarf-line-table-only)$\" \"${REQUIRE_MATRIX_PASS}\"" in text
     assert "MXFP4 source-line matrix gate failed" in text
     assert "source_line.status pass (VTune sampled exact), source_line.status asm-line-static-cost" in text
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
