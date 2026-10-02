@@ -8,6 +8,7 @@
 #include "llama-arch.h"
 #include "llama-auto-ubatch.h"
 #include "llama-batch.h"
+#include "llama-context-tenant.h"
 #include "llama-ext.h"
 #include "llama-fused-resolution.h"
 #include "llama-graph.h"
@@ -495,6 +496,42 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
             llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_plan_scope_failure"));
         procs.scope_close = reinterpret_cast<decltype(procs.scope_close)>(
             llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_plan_scope_close"));
+#endif
+        break;
+    }
+    return procs;
+}
+
+// The L4 entry points (the tenant publish, coverage query and load-time late check). The backend
+// declares them in ggml-sycl.h; a backend that does not define them leaves each proc null and the
+// readers in llama-context-tenant.h then fail closed. A direct GGML_USE_SYCL build names them as
+// weak references so it links against a backend without them; a GGML_BACKEND_DL build looks each
+// up by its own function name. Every proc comes from the first SYCL backend of the context.
+#if defined(GGML_USE_SYCL) && defined(__GNUC__)
+#    pragma weak ggml_backend_sycl_set_runtime_context_desc
+#    pragma weak ggml_backend_sycl_tenant_coverage
+#    pragma weak ggml_backend_sycl_load_late_check
+#endif
+
+[[maybe_unused]] static llama_sycl_l4_procs llama_context_sycl_l4_procs_for(
+    const std::vector<ggml_backend_ptr> & backends) {
+    llama_sycl_l4_procs procs;
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (!llama_context_dev_is_sycl(dev)) {
+            continue;
+        }
+#if defined(GGML_USE_SYCL) && defined(__GNUC__)
+        procs.publish    = &ggml_backend_sycl_set_runtime_context_desc;
+        procs.coverage   = &ggml_backend_sycl_tenant_coverage;
+        procs.late_check = &ggml_backend_sycl_load_late_check;
+#elif defined(GGML_BACKEND_DL)
+        procs.publish = reinterpret_cast<decltype(procs.publish)>(
+            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_set_runtime_context_desc"));
+        procs.coverage = reinterpret_cast<decltype(procs.coverage)>(
+            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_tenant_coverage"));
+        procs.late_check = reinterpret_cast<decltype(procs.late_check)>(
+            llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_load_late_check"));
 #endif
         break;
     }

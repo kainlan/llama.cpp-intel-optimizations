@@ -1,0 +1,292 @@
+// zhcn C7g-1: the llama side of the measured-tenant publish. Pure host: it links only
+// src/llama-context-tenant.h and the public backend header, so no model, no device and no
+// scheduler are involved.
+//
+// Cases:
+//   (1) one header: the public backend header and the cohort ids compile in one translation
+//       unit, and the tenant element is the 24-byte wire layout both headers agree on;
+//   (2) the L4 procs fail closed: a null publish proc reads UNSUPPORTED, a null coverage proc
+//       reads GROWTH, a null late-check proc reads NOT_RECORDED, and an answer outside the
+//       enum's range reads as the same closed value instead of being passed on;
+//   (3) a non-null proc is called with exactly the caller's arguments and its answer is
+//       returned unchanged;
+//   (4) the section builder: a device buft's chunk caps become COMPUTE elements indexed by
+//       chunk, a host buft's become COMPUTE_HOST elements on device -1 merged by their maximum
+//       across devices, a zero cap makes no element, and the result is ordered by
+//       (device, cohort, slot_index);
+//   (5) the backend's own visitor demands merge into the same section by maximum;
+//   (6) a device-tier buft with no device index is a named refusal, not a guess;
+//   (7) the tenant key is a digest of (device, cohort, slot_index, slot_bytes) in section
+//       order: equal sections give equal keys and any one field changes it;
+//   (8) the plan line's text begins with the fields the scorer matches.
+
+#include "../src/llama-context-tenant.h"
+
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+static int n_failed = 0;
+
+#define CHECK(cond, ...)                                                      \
+    do {                                                                      \
+        if (!(cond)) {                                                        \
+            n_failed++;                                                       \
+            fprintf(stderr, "FAIL %s:%d: %s -- ", __FILE__, __LINE__, #cond); \
+            fprintf(stderr, __VA_ARGS__);                                     \
+            fprintf(stderr, "\n");                                            \
+        }                                                                     \
+    } while (0)
+
+// What the fake procs saw.
+struct call_record {
+    int                                    n_publish  = 0;
+    int                                    n_coverage = 0;
+    int                                    n_late     = 0;
+    uint32_t                               n_ubatch   = 0;
+    uint64_t                               late_bytes = 0;
+    int32_t                                late_dev   = -2;
+    uint64_t                               late_id    = 0;
+    const ggml_sycl_runtime_context_desc * desc       = nullptr;
+};
+
+static call_record g_calls;
+
+static ggml_sycl_lifecycle_result fake_publish(ggml_backend_t,
+                                               struct ggml_sycl_model_token,
+                                               uint32_t,
+                                               uint32_t n_ubatch,
+                                               uint32_t,
+                                               bool,
+                                               bool,
+                                               bool,
+                                               const ggml_sycl_runtime_context_desc * desc) {
+    g_calls.n_publish++;
+    g_calls.n_ubatch = n_ubatch;
+    g_calls.desc     = desc;
+    return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+}
+
+static ggml_sycl_tenant_coverage fake_coverage(ggml_backend_t,
+                                               uint32_t,
+                                               uint32_t n_ubatch,
+                                               uint32_t,
+                                               bool,
+                                               bool,
+                                               bool,
+                                               const ggml_sycl_runtime_context_desc *) {
+    g_calls.n_coverage++;
+    g_calls.n_ubatch = n_ubatch;
+    return GGML_SYCL_TENANT_COVERAGE_COVERED;
+}
+
+static ggml_sycl_tenant_coverage
+wild_coverage(ggml_backend_t, uint32_t, uint32_t, uint32_t, bool, bool, bool, const ggml_sycl_runtime_context_desc *) {
+    return (ggml_sycl_tenant_coverage) 77;
+}
+
+static ggml_sycl_late_check_result fake_late(struct ggml_sycl_load_txn txn, int32_t device, uint64_t bytes) {
+    g_calls.n_late++;
+    g_calls.late_id    = txn.id;
+    g_calls.late_dev   = device;
+    g_calls.late_bytes = bytes;
+    return GGML_SYCL_LATE_CHECK_REFUSED;
+}
+
+static ggml_sycl_late_check_result wild_late(struct ggml_sycl_load_txn, int32_t, uint64_t) {
+    return (ggml_sycl_late_check_result) 99;
+}
+
+static ggml_sycl_context_tenant_desc make_element(int32_t device, uint32_t cohort, uint32_t index, uint64_t bytes) {
+    ggml_sycl_context_tenant_desc e = {};
+    e.struct_size                   = sizeof(e);
+    e.cohort                        = cohort;
+    e.slot_index                    = index;
+    e.device                        = device;
+    e.slot_bytes                    = bytes;
+    return e;
+}
+
+int main() {
+    // (1) one header
+    CHECK(sizeof(ggml_sycl_context_tenant_desc) == 24, "tenant element is %zu bytes",
+          sizeof(ggml_sycl_context_tenant_desc));
+    CHECK(GGML_SYCL_CONTEXT_COHORT_COMPUTE == 0 && GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST == 1,
+          "the compute cohort ids are the published ones");
+
+    // (2) null procs fail closed
+    {
+        llama_sycl_l4_procs            none;
+        ggml_sycl_model_token          model = {};
+        ggml_sycl_runtime_context_desc desc  = {};
+        CHECK(!none.available(), "an empty table reports no L4");
+        CHECK(llama_sycl_l4_publish(none, nullptr, model, 1, 1, 1, true, false, false, &desc) ==
+                  GGML_SYCL_LIFECYCLE_UNSUPPORTED,
+              "null publish proc must read UNSUPPORTED");
+        CHECK(llama_sycl_l4_coverage(none, nullptr, 1, 1, 1, true, false, false, &desc) ==
+                  GGML_SYCL_TENANT_COVERAGE_GROWTH,
+              "null coverage proc must read GROWTH");
+        CHECK(llama_sycl_l4_late_check(none, ggml_sycl_load_txn{ 5 }, 0, 123) == GGML_SYCL_LATE_CHECK_NOT_RECORDED,
+              "null late-check proc must read NOT_RECORDED");
+
+        llama_sycl_l4_procs wild;
+        wild.coverage   = &wild_coverage;
+        wild.late_check = &wild_late;
+        CHECK(llama_sycl_l4_coverage(wild, nullptr, 1, 1, 1, true, false, false, &desc) ==
+                  GGML_SYCL_TENANT_COVERAGE_GROWTH,
+              "an out-of-range coverage answer must read GROWTH");
+        CHECK(llama_sycl_l4_late_check(wild, ggml_sycl_load_txn{ 5 }, 0, 123) == GGML_SYCL_LATE_CHECK_NOT_RECORDED,
+              "an out-of-range late-check answer must read NOT_RECORDED");
+    }
+
+    // (3) non-null procs are called through
+    {
+        llama_sycl_l4_procs procs;
+        procs.publish    = &fake_publish;
+        procs.coverage   = &fake_coverage;
+        procs.late_check = &fake_late;
+        CHECK(procs.available(), "a full table reports L4");
+        ggml_sycl_model_token          model = {};
+        ggml_sycl_runtime_context_desc desc  = {};
+        g_calls                              = {};
+        CHECK(llama_sycl_l4_publish(procs, nullptr, model, 4096, 512, 1, true, false, false, &desc) ==
+                  GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
+              "the proc's own answer is returned");
+        CHECK(g_calls.n_publish == 1 && g_calls.n_ubatch == 512 && g_calls.desc == &desc,
+              "publish arguments forwarded");
+        CHECK(llama_sycl_l4_coverage(procs, nullptr, 4096, 256, 1, true, false, false, &desc) ==
+                  GGML_SYCL_TENANT_COVERAGE_COVERED,
+              "the coverage answer is returned");
+        CHECK(g_calls.n_coverage == 1 && g_calls.n_ubatch == 256, "coverage arguments forwarded");
+        CHECK(llama_sycl_l4_late_check(procs, ggml_sycl_load_txn{ 41 }, 1, 987654) == GGML_SYCL_LATE_CHECK_REFUSED,
+              "the late-check answer is returned");
+        CHECK(g_calls.n_late == 1 && g_calls.late_id == 41 && g_calls.late_dev == 1 && g_calls.late_bytes == 987654,
+              "late-check arguments forwarded");
+
+        // The table is half-filled: availability needs all three.
+        llama_sycl_l4_procs half;
+        half.publish = &fake_publish;
+        CHECK(!half.available(), "a half table is not L4");
+    }
+
+    // (4) the section builder
+    {
+        std::vector<llama_tenant_buft_caps> bufts;
+        bufts.push_back({
+  /*device*/ 1, /*host*/ false, { 300, 0, 50 }
+        });
+        bufts.push_back({ /*device*/ 0, /*host*/ false, { 700 } });
+        bufts.push_back({
+  /*device*/ 0, /*host*/ true, { 40, 10 }
+        });
+        bufts.push_back({ /*device*/ 1, /*host*/ true, { 60 } });
+        std::vector<ggml_sycl_context_tenant_desc> out;
+        std::string                                reason;
+        CHECK(llama_tenant_section_from_caps(bufts, out, reason), "builder refused: %s", reason.c_str());
+        // Expected order: (-1, HOST, 0)=60 (max of 40,60), (-1, HOST, 1)=10, (0, COMPUTE, 0)=700,
+        // (1, COMPUTE, 0)=300, (1, COMPUTE, 2)=50. The zero cap at chunk 1 of device 1 is absent.
+        CHECK(out.size() == 5, "section holds %zu elements", out.size());
+        if (out.size() == 5) {
+            CHECK(out[0].device == -1 && out[0].cohort == GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST &&
+                      out[0].slot_index == 0 && out[0].slot_bytes == 60,
+                  "element 0");
+            CHECK(out[1].device == -1 && out[1].slot_index == 1 && out[1].slot_bytes == 10, "element 1");
+            CHECK(out[2].device == 0 && out[2].cohort == GGML_SYCL_CONTEXT_COHORT_COMPUTE && out[2].slot_bytes == 700,
+                  "element 2");
+            CHECK(out[3].device == 1 && out[3].slot_index == 0 && out[3].slot_bytes == 300, "element 3");
+            CHECK(out[4].device == 1 && out[4].slot_index == 2 && out[4].slot_bytes == 50, "element 4");
+            for (const auto & e : out) {
+                CHECK(e.struct_size == sizeof(e), "every element carries its own struct_size");
+            }
+        }
+
+        // (5) the backend's demands merge by maximum
+        std::vector<ggml_sycl_context_tenant_desc> extra;
+        extra.push_back(make_element(0, GGML_SYCL_CONTEXT_COHORT_FATTN_MATERIALIZE, 0, 4096));
+        extra.push_back(make_element(0, GGML_SYCL_CONTEXT_COHORT_COMPUTE, 0, 900));  // above the buft's 700
+        extra.push_back(make_element(1, GGML_SYCL_CONTEXT_COHORT_COMPUTE, 0, 100));  // below the buft's 300
+        llama_tenant_section_merge(out, extra);
+        CHECK(out.size() == 6, "merged section holds %zu elements", out.size());
+        if (out.size() == 6) {
+            // (0, COMPUTE, 0)=900 stays at its place, (0, FATTN, 0) follows it.
+            CHECK(out[2].device == 0 && out[2].cohort == GGML_SYCL_CONTEXT_COHORT_COMPUTE && out[2].slot_bytes == 900,
+                  "the larger demand wins");
+            CHECK(out[3].device == 0 && out[3].cohort == GGML_SYCL_CONTEXT_COHORT_FATTN_MATERIALIZE &&
+                      out[3].slot_bytes == 4096,
+                  "a new element is inserted in order");
+            CHECK(out[4].device == 1 && out[4].slot_index == 0 && out[4].slot_bytes == 300, "the smaller demand loses");
+        }
+    }
+
+    // (6) a device-tier buft with no device index refuses
+    {
+        std::vector<llama_tenant_buft_caps> bufts = {
+            { -1, false, { 10 } }
+        };
+        std::vector<ggml_sycl_context_tenant_desc> out = { make_element(0, 0, 0, 1) };
+        std::string                                reason;
+        CHECK(!llama_tenant_section_from_caps(bufts, out, reason), "negative device on a device buft must refuse");
+        CHECK(!reason.empty() && out.empty(), "a refusal names itself and leaves no elements");
+    }
+
+    // (7) the tenant key
+    {
+        std::vector<ggml_sycl_context_tenant_desc> a = { make_element(0, 0, 0, 100), make_element(1, 0, 0, 50) };
+        std::vector<ggml_sycl_context_tenant_desc> b = a;
+        CHECK(llama_tenant_key_digest(a) == llama_tenant_key_digest(b), "equal sections, equal keys");
+        const uint64_t base = llama_tenant_key_digest(a);
+        for (int field = 0; field < 4; ++field) {
+            std::vector<ggml_sycl_context_tenant_desc> c = a;
+            switch (field) {
+                case 0:
+                    c[1].device += 1;
+                    break;
+                case 1:
+                    c[1].cohort += 1;
+                    break;
+                case 2:
+                    c[1].slot_index += 1;
+                    break;
+                default:
+                    c[1].slot_bytes += 1;
+                    break;
+            }
+            CHECK(llama_tenant_key_digest(c) != base, "field %d must change the key", field);
+        }
+        std::vector<ggml_sycl_context_tenant_desc> shorter = { a[0] };
+        CHECK(llama_tenant_key_digest(shorter) != base, "a shorter section must change the key");
+        CHECK(llama_tenant_key_digest({}) != base, "an empty section has its own key");
+        // struct_size is not a measured fact and does not enter the key.
+        std::vector<ggml_sycl_context_tenant_desc> d = a;
+        d[0].struct_size += 8;
+        CHECK(llama_tenant_key_digest(d) == base, "struct_size is not part of the key");
+    }
+
+    // (8) the plan line
+    {
+        llama_tenant_plan_line_fields f;
+        f.ctx_id               = 7;
+        f.device               = 1;
+        f.n_ubatch             = 512;
+        f.compute_load         = 123456;
+        f.compute_delta        = -4096;
+        f.cap0                 = 99;
+        f.n_measured           = 7;
+        f.measure_ms           = 12.5;
+        f.republish            = 0;
+        f.covered              = 1;
+        const std::string line = llama_tenant_plan_line(f);
+        const std::string want =
+            "[CONTEXT-PLAN] tenant plan: ctx=7 dev=1 n_ubatch=512 compute_load=123456 compute_delta=-4096 cap0=99 "
+            "n_measured=7 measure_ms=12.500 republish=0 covered=1";
+        CHECK(line == want, "plan line was '%s'", line.c_str());
+    }
+
+    if (n_failed != 0) {
+        fprintf(stderr, "%d check(s) failed\n", n_failed);
+        return 1;
+    }
+    printf("ok\n");
+    return 0;
+}

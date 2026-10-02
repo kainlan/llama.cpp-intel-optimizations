@@ -3778,6 +3778,12 @@ llama_build_and_test(test-measure-plan.cpp)
 # that reports only while an exception leaves its scope. Header-only: no device.
 llama_build_and_test(test-fused-resolution-report.cpp)
 
+# zhcn C7g-1: executes the pure helpers in src/llama-context-tenant.h -- the L4 procs'
+# fail-closed readers (null and out-of-range answers), the tenant section built from the
+# measured compute caps and merged with the backend's demands, the tenant key digest and
+# the plan line's head. Header-only over ggml-sycl.h's wire structs: no device.
+llama_build_and_test(test-context-tenant-section.cpp)
+
 # llama.cpp-9goq: source gate over ggml/src/ggml-sycl/CMakeLists.txt itself --
 # (A) every target_link_libraries(...) naming the bare `ggml-sycl` MODULE
 # target must sit under a guard that guarantees GGML_BACKEND_DL is off (the
