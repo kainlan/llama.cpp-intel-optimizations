@@ -832,6 +832,7 @@ struct llama_mlock::impl {
         target_size = (target_size + granularity - 1) & ~(granularity - 1);
         if (target_size > size) {
             if (raw_lock((uint8_t *) addr + size, target_size - size)) {
+                note_locked(size, target_size);
                 size = target_size;
             } else {
                 failed_already = true;
@@ -839,10 +840,87 @@ struct llama_mlock::impl {
         }
     }
 
+    // does the page [page_begin, page_end) hold a byte of a deferred range?
+    static bool page_holds_deferred(const llama_mmap::ranges & deferred, size_t page_begin, size_t page_end) {
+        for (const auto & r : deferred) {
+            if (r.first < page_end && r.second > page_begin) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Locks the tensor's own range [offs, offs + len): outward to pages, except inward at an end whose page holds a
+    // deferred byte, so a lock never faults a lazy page in. Pages this lock already holds are not locked twice.
+    void lock_range(size_t offs, size_t len, const llama_mmap::ranges & deferred) {
+        GGML_ASSERT(addr);
+        if (failed_already || len == 0) {
+            return;
+        }
+        const size_t granularity = lock_granularity();
+        const size_t end         = offs + len;
+        size_t       lo          = offs / granularity * granularity;
+        size_t       hi          = (end + granularity - 1) / granularity * granularity;
+        if (page_holds_deferred(deferred, lo, lo + granularity)) {
+            lo = (offs + granularity - 1) / granularity * granularity;
+        }
+        const size_t last_page = (end - 1) / granularity * granularity;
+        if (page_holds_deferred(deferred, last_page, last_page + granularity)) {
+            hi = end / granularity * granularity;
+        }
+        if (lo >= hi) {
+            return;
+        }
+        // the gaps of [lo, hi) that are not locked yet, in order
+        size_t                                 at = lo;
+        std::vector<std::pair<size_t, size_t>> gaps;
+        for (const auto & r : locked) {
+            if (r.second <= at) {
+                continue;
+            }
+            if (r.first >= hi) {
+                break;
+            }
+            if (r.first > at) {
+                gaps.emplace_back(at, r.first);
+            }
+            at = std::max(at, r.second);
+        }
+        if (at < hi) {
+            gaps.emplace_back(at, hi);
+        }
+        for (const auto & g : gaps) {
+            if (!raw_lock((uint8_t *) addr + g.first, g.second - g.first)) {
+                failed_already = true;
+                return;
+            }
+            size += g.second - g.first;
+            note_locked(g.first, g.second);
+        }
+    }
+
+    // keeps `locked` sorted and merged
+    void note_locked(size_t first, size_t last) {
+        locked.emplace_back(first, last);
+        std::sort(locked.begin(), locked.end());
+        std::vector<std::pair<size_t, size_t>> merged;
+        for (const auto & r : locked) {
+            if (!merged.empty() && r.first <= merged.back().second) {
+                merged.back().second = std::max(merged.back().second, r.second);
+            } else {
+                merged.push_back(r);
+            }
+        }
+        locked.swap(merged);
+    }
+
     void * addr;
     size_t size;
 
     bool failed_already;
+
+    // the [first, last) mapping offsets this object has locked, sorted and merged
+    std::vector<std::pair<size_t, size_t>> locked;
 };
 
 llama_mlock::llama_mlock() : pimpl(std::make_unique<impl>()) {}
@@ -850,10 +928,8 @@ llama_mlock::~llama_mlock() = default;
 
 void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
-// RED stand-in (llama.cpp-5efe C3c): the prefix lock this replaces.
 void llama_mlock::lock_range(size_t offs, size_t size, const llama_mmap::ranges & deferred) {
-    (void) deferred;
-    pimpl->grow_to(offs + size);
+    pimpl->lock_range(offs, size, deferred);
 }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)

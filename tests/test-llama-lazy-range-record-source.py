@@ -28,6 +28,10 @@ Windows) or that a rebase of upstream code would silently restore:
    row before buft_for_tensor() can make it an ordinary weight;
 7. the early plan's weights_map loop consults the record.
 
+8. load_all_data() locks each tensor with llama_mlock::lock_range, passing the record's excluded ranges, and never with the
+   prefix lock grow_to (which locks contiguously from the mapping's base, so a tensor after a lazy range locks the range
+   too and faults all of it in).
+
 Plain file I/O, comment-stripped text.
 """
 
@@ -208,6 +212,16 @@ def test_create_tensor_checks_the_record_and_refuses_storage_before_buft_for_ten
 
 
 # ---- 7. the early plan ----
+
+
+def test_the_per_tensor_lock_is_ranged_and_reads_the_record():
+    body = function_body(read_code(LOADER_CPP), r"bool\s+llama_model_loader::load_all_data\s*\((?:[^()]|\([^()]*\))*\)")
+    assert "grow_to" not in body, "load_all_data() locks with grow_to, the whole-prefix lock"
+    call = re.search(r"lock_range\s*\(", body)
+    assert call, "load_all_data() does not lock a tensor with lock_range"
+    args = balanced(body, call.end() - 1, "(", ")")
+    assert "weight->offs" in args and "n_size" in args, f"lock_range is not given the tensor's own range: {args}"
+    assert "lazy_record.excluded_for_file" in body, "the ranged lock does not read the record's excluded ranges"
 
 
 def test_early_plan_consults_the_record():

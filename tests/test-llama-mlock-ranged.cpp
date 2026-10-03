@@ -24,9 +24,11 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -97,12 +99,38 @@ static bool evict(int fd) {
     return left >= 0 && left <= 64;
 }
 
+// 1 if the VMA containing `p` is VM_LOCKED, 0 if not, -1 if no VmFlags line was found for it
+static int vma_locked(const void * p) {
+    const uintptr_t target = (uintptr_t) p;
+    std::ifstream   smaps("/proc/self/smaps");
+    std::string     line;
+    bool            in_vma = false;
+    while (std::getline(smaps, line)) {
+        uintptr_t beg = 0, end = 0;
+        if (std::sscanf(line.c_str(), "%" SCNxPTR "-%" SCNxPTR " ", &beg, &end) == 2 &&
+            line.find(':') > line.find(' ')) {
+            in_vma = target >= beg && target < end;
+            continue;
+        }
+        if (in_vma && line.rfind("VmFlags:", 0) == 0) {
+            return (line.substr(8) + " ").find(" lo ") != std::string::npos ? 1 : 0;
+        }
+    }
+    return -1;
+}
+
 struct run_result {
-    int64_t interior = -1;
-    int64_t a_mid    = -1;
-    int64_t b_mid    = -1;
-    bool    evicted  = false;
-    bool    locked   = false;
+    int64_t interior        = -1;
+    int64_t a_mid           = -1;
+    int64_t b_mid           = -1;
+    // VM_LOCKED ("lo" in VmFlags) of the VMA holding: the page shared by A's end and the lazy start, the page shared by
+    // the lazy end and B's start, and a page inside A. A page's residency cannot say this (a neighbouring page's
+    // fault reads around into it), so the lock is read from the kernel's own record of it. -1 when unreadable.
+    int     shared_a_locked = -1;
+    int     shared_b_locked = -1;
+    int     a_mid_locked    = -1;
+    bool    evicted         = false;
+    bool    locked          = false;
 };
 
 // Maps the file, locks with `lock`, and reads back the residency of the file's pages. The mapping and the lock are
@@ -121,10 +149,13 @@ template <typename F> static run_result run(int fd, F lock) {
         llama_mlock m;
         m.init(addr);
         lock(m);
-        res.locked   = true;
-        res.interior = resident_pages(fd, LAZY_BEGIN + GUARD, (LAZY_END - GUARD) - (LAZY_BEGIN + GUARD));
-        res.a_mid    = resident_pages(fd, A_BEGIN + 4 * MiB, 1 * MiB);
-        res.b_mid    = resident_pages(fd, B_BEGIN + 4 * MiB, 1 * MiB);
+        res.locked          = true;
+        res.interior        = resident_pages(fd, LAZY_BEGIN + GUARD, (LAZY_END - GUARD) - (LAZY_BEGIN + GUARD));
+        res.a_mid           = resident_pages(fd, A_BEGIN + 4 * MiB, 1 * MiB);
+        res.b_mid           = resident_pages(fd, B_BEGIN + 4 * MiB, 1 * MiB);
+        res.shared_a_locked = vma_locked((char *) addr + LAZY_BEGIN / g_page * g_page);
+        res.shared_b_locked = vma_locked((char *) addr + LAZY_END / g_page * g_page);
+        res.a_mid_locked    = vma_locked((char *) addr + A_BEGIN + 4 * MiB);
     }
     munmap(addr, FILE_SIZE);
     return res;
@@ -183,6 +214,17 @@ int main() {
                     (long long) ranged.interior, (long long) ranged.a_mid, (long long) ranged.b_mid);
         if (ranged.interior != 0) {
             std::fprintf(stderr, "FAIL: the ranged lock faulted the lazy interior in\n");
+            ++fail;
+        }
+        std::printf(
+            "ranged: VM_LOCKED of the A-end/lazy page %d, the lazy/B-start page %d, a page of A %d (want 0 0 1)\n",
+            ranged.shared_a_locked, ranged.shared_b_locked, ranged.a_mid_locked);
+        if (ranged.a_mid_locked != 1) {
+            std::fprintf(stderr, "FAIL: the lock did not lock a tensor page (or VmFlags was unreadable)\n");
+            ++fail;
+        }
+        if (ranged.shared_a_locked != 0 || ranged.shared_b_locked != 0) {
+            std::fprintf(stderr, "FAIL: the ranged lock locked a page that holds lazy bytes\n");
             ++fail;
         }
         if (ranged.a_mid < 256 || ranged.b_mid < 256) {

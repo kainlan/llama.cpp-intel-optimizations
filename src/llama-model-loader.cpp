@@ -1997,6 +1997,9 @@ bool llama_model_loader::load_all_data(
 
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
+    // the record's deferred ranges per file, for the ranged lock below
+    std::map<uint32_t, llama_mmap::ranges> lock_deferred;
+
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
     // NVMe raid configurations might require more / larger buffers.
     constexpr size_t n_buffers = 4;
@@ -2149,9 +2152,15 @@ bool llama_model_loader::load_all_data(
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
 
                 // locking a lazy tensor would fault all of it in, which is what lazy avoids
+                // The tensor's own range, never the prefix up to it: a lazy range before this tensor must stay unlocked,
+                // and so must the page of it that this tensor shares.
                 if (lmlocks && !lazy.has(cur)) {
                     const auto & lmlock = lmlocks->at(weight->idx);
-                    lmlock->grow_to(weight->offs + n_size);
+                    auto         found  = lock_deferred.find(weight->idx);
+                    if (found == lock_deferred.end()) {
+                        found = lock_deferred.emplace(weight->idx, lazy_record.excluded_for_file(weight->idx)).first;
+                    }
+                    lmlock->lock_range(weight->offs, n_size, found->second);
                 }
 
                 auto & mmap_used = mmaps_used[weight->idx];
