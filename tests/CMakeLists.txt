@@ -122,6 +122,11 @@ function(llama_test_pytest target)
     if (NOT DEFINED LLAMA_TEST_LABEL)
         set(LLAMA_TEST_LABEL "main")
     endif()
+    # Every pytest-run script is a python gate: `ctest -L python` is the census of them, and a registration without the
+    # label is invisible to it (llama.cpp-gogg). test-sycl-gate-registration-audit.py --census enforces it.
+    if (NOT "python" IN_LIST LLAMA_TEST_LABEL)
+        list(APPEND LLAMA_TEST_LABEL python)
+    endif()
     if (NOT DEFINED LLAMA_TEST_WORKING_DIRECTORY)
         set(LLAMA_TEST_WORKING_DIRECTORY .)
     endif()
@@ -687,7 +692,7 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-backend-count-get-null-census
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-backend-count-get-null-census.py)
     set_tests_properties(test-backend-count-get-null-census PROPERTIES
-        LABELS "backend;lifecycle;source;host" TIMEOUT 30)
+        LABELS "backend;lifecycle;source;host;python" TIMEOUT 30)
     # llama.cpp-ttws: the host-weight registry must classify a name collision
     # (tied token_embd/output alias vs a genuine conflict) before it warns.
     # Structural gate on the print site in ggml-sycl.cpp; the classifier's own
@@ -695,41 +700,41 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-sycl-host-weight-alias-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-host-weight-alias-source.py)
     set_tests_properties(test-sycl-host-weight-alias-source PROPERTIES
-        LABELS "sycl;registry;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;registry;source;source-contract;hostonly;python" TIMEOUT 30)
     # llama.cpp-qeld: this gate sat unregistered, so nothing noticed when the h9uv
     # weight_ext split (ed8ef61b3) moved the fields it pins. Text-only, no device.
     add_test(NAME test-sycl-moe-ptr-table-retention-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-ptr-table-retention-source.py)
     set_tests_properties(test-sycl-moe-ptr-table-retention-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # An over-capacity CPU expert dispatch must fall back, not abort (llama.cpp-sfal).
     # Run WITH --self-test: a text-only check whose anchors stop matching real code
     # passes vacuously, and --self-test requires its 5 mutants to still be caught.
     add_test(NAME test-sycl-cpu-expert-pool-capacity-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-capacity-source.py --self-test)
     set_tests_properties(test-sycl-cpu-expert-pool-capacity-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # Host MoE experts must read the activation row of their own slot, not row 0
     # (llama.cpp-4hg7: GPT-OSS down-projection decode garbage under host-tiered
     # experts). Run WITH --self-test so each anchor is proven load-bearing.
     add_test(NAME test-sycl-moe-cpu-activation-row-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-activation-row-source.py --self-test)
     set_tests_properties(test-sycl-moe-cpu-activation-row-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # A hybrid MoE CPU-expert dispatch must never drop host-expert rows when its
     # staging allocation fails, and the registry must not fail an allocation on a
     # stale RELEASING row at a recycled address (llama.cpp-93tw). WITH --self-test.
     add_test(NAME test-sycl-moe-cpu-dispatch-fail-closed-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-dispatch-fail-closed-source.py --self-test)
     set_tests_properties(test-sycl-moe-cpu-dispatch-fail-closed-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # A hybrid MXFP4 xmx_tiled expert must be decoded by a kernel that reads
     # xmx_tiled: the grouped executor accepts partial cover, and the per-expert
     # direct path refuses layouts it cannot decode (llama.cpp-4hg7). WITH --self-test.
     add_test(NAME test-sycl-xmx-tiled-partial-cover-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-xmx-tiled-partial-cover-source.py --self-test)
     set_tests_properties(test-sycl-xmx-tiled-partial-cover-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # A prompt-phase MoE layout over a MIXED tensor (a few experts in VRAM, the
     # rest host-planned) is admitted by the loaded layout plus the host entries
     # the CPU runs, at every prompt admission site (llama.cpp-f6zo: the
@@ -738,7 +743,7 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-sycl-moe-prompt-hybrid-layout-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-prompt-hybrid-layout-source.py --self-test)
     set_tests_properties(test-sycl-moe-prompt-hybrid-layout-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # A MoE host-expert dispatch must bridge a storage-handle miss, not kill the
     # graph (llama.cpp-srti). Also runs WITH --self-test: the per-site checks are
     # anchored on refusal-message text, so a renamed site would silently stop
@@ -746,7 +751,7 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-sycl-moe-cpu-dispatch-storage-bridge-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-dispatch-storage-bridge-source.py --self-test)
     set_tests_properties(test-sycl-moe-cpu-dispatch-storage-bridge-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # Consumer-side half of the MMVQ coverage invariant (llama.cpp-gx30). The C++
     # gate checks capability against the launchers that EXIST; this checks it
     # against what each consumer's own switch ENUMERATES. Census 9b died in the
@@ -754,7 +759,7 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-sycl-moe-mmvq-consumer-coverage
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-mmvq-consumer-coverage.py)
     set_tests_properties(test-sycl-moe-mmvq-consumer-coverage PROPERTIES
-        LABELS "sycl;moe;source;hostonly" TIMEOUT 30)
+        LABELS "sycl;moe;source;hostonly;python" TIMEOUT 30)
     add_test(NAME test-sycl-lifecycle-g1-harness
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-g1-harness.py)
     set_tests_properties(test-sycl-lifecycle-g1-harness PROPERTIES
@@ -785,7 +790,7 @@ if (Python3_Interpreter_FOUND)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-woq-slot-formula-source.py
     )
     set_tests_properties(test-sycl-woq-slot-formula-source PROPERTIES
-        LABELS "sycl;moe;woq;source;hostonly"
+        LABELS "sycl;moe;woq;source;hostonly;python"
         TIMEOUT 30)
 endif()
 
@@ -1107,7 +1112,7 @@ if (GGML_SYCL AND NOT WIN32 AND CMAKE_GENERATOR MATCHES "Ninja" AND Python3_Inte
     add_test(NAME test-sycl-device-link-routing
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-link-routing.py ${CMAKE_BINARY_DIR})
     set_tests_properties(test-sycl-device-link-routing PROPERTIES
-        LABELS "sycl;build;hostonly"
+        LABELS "sycl;build;hostonly;python"
         SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
@@ -1117,7 +1122,7 @@ if (GGML_SYCL AND NOT WIN32 AND CMAKE_GENERATOR MATCHES "Ninja" AND Python3_Inte
     add_test(NAME test-sycl-source-root-anchor
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-source-root-anchor.py ${CMAKE_BINARY_DIR})
     set_tests_properties(test-sycl-source-root-anchor PROPERTIES
-        LABELS "sycl;build;hostonly;source-contract"
+        LABELS "sycl;build;hostonly;source-contract;python"
         SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
@@ -1130,7 +1135,7 @@ if (CMAKE_GENERATOR STREQUAL "Ninja" AND NOT LLAMA_USE_SYSTEM_GGML AND Python3_I
     add_test(NAME test-build-info-scope
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-build-info-scope.py ${CMAKE_BINARY_DIR})
     set_tests_properties(test-build-info-scope PROPERTIES
-        LABELS "build;hostonly"
+        LABELS "build;hostonly;python"
         SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
@@ -1429,7 +1434,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-static-storage-audit.py
     )
     set_tests_properties(test-sycl-static-storage-audit PROPERTIES
-        LABELS "sycl;policy;audit"
+        LABELS "sycl;policy;audit;python"
         SKIP_RETURN_CODE 77
         TIMEOUT 3600
     )
@@ -1459,7 +1464,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-zone-reset-audit-source.py --self-test
     )
     set_tests_properties(test-sycl-zone-reset-audit-source PROPERTIES
-        LABELS "sycl;policy;audit"
+        LABELS "sycl;policy;audit;python"
         SKIP_RETURN_CODE 77
         TIMEOUT 120
     )
@@ -1483,7 +1488,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-execution-abort-source.py
     )
     set_tests_properties(test-sycl-execution-abort-source PROPERTIES
-        LABELS "sycl;execution;policy"
+        LABELS "sycl;execution;policy;python"
         TIMEOUT 120
     )
 
@@ -1606,7 +1611,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-timeline-gap-class-conservation.py
     )
     set_tests_properties(test-sycl-timeline-gap-class-conservation PROPERTIES
-        LABELS "sycl;profiling;tdd"
+        LABELS "sycl;profiling;tdd;python"
         TIMEOUT 120
     )
 
@@ -1622,7 +1627,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-gap-causes.py
     )
     set_tests_properties(test-sycl-gap-causes PROPERTIES
-        LABELS "sycl;profiling;tdd"
+        LABELS "sycl;profiling;tdd;python"
         TIMEOUT 120
     )
 
@@ -1647,7 +1652,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-gap-device-split.py
     )
     set_tests_properties(test-sycl-gap-device-split PROPERTIES
-        LABELS "sycl;profiling;tdd"
+        LABELS "sycl;profiling;tdd;python"
         TIMEOUT 120
     )
 
@@ -1665,7 +1670,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-sched-census.py
     )
     set_tests_properties(test-sycl-sched-census PROPERTIES
-        LABELS "sycl;profiling;tdd"
+        LABELS "sycl;profiling;tdd;python"
         TIMEOUT 120
     )
 
@@ -1681,7 +1686,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-qwen4exp-vehicle-rewrite.py
     )
     set_tests_properties(test-sycl-qwen4exp-vehicle-rewrite PROPERTIES
-        LABELS "sycl;profiling;tdd"
+        LABELS "sycl;profiling;tdd;python"
         TIMEOUT 120
         SKIP_RETURN_CODE 77
     )
