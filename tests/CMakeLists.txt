@@ -443,6 +443,15 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-vram-headroom PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# KV cache tensor name -> layer id (llama.cpp-4ot7): the tiered KV buffer remaps each tensor onto its
+# layer's allocation by this id, and a name-tagged cache ("cache_idx_k_l3") used to parse as no layer.
+# ggml-sycl/kv-cache-tensor-name.hpp includes only <climits>/<cstring>: no SYCL, no ggml, no device.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-kv-cache-tensor-name.cpp)
+    set_tests_properties(test-sycl-kv-cache-tensor-name PROPERTIES LABELS "sycl;kv;hostonly")
+    target_include_directories(test-sycl-kv-cache-tensor-name PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
 # WOQ-MXFP4 capability spike: does this device's oneDNN build a matmul with
 # f16 src, f4_e2m1 weights, and e8m0 grouped-{32,1} scales directly (perf-
 # recovery epic, track C gate, llama.cpp-4m9p)? Unlike test-sycl-route-table-

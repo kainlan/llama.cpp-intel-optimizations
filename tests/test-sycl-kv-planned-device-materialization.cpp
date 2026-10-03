@@ -124,6 +124,36 @@ int main(int, char ** argv) {
     TEST_ASSERT(info->device_id == 1, "cache_k_l1 registry owner must be device 1");
 
     ggml_backend_buffer_free(buf);
+
+    // A name-tagged cache (qwen4exp's indexer cache, "cache_idx_k_l<N>") must be remapped onto its
+    // layer's allocation exactly like the untagged one; before llama.cpp-4ot7 it kept the buffer's synthetic
+    // host span, and the first SET_ROWS into it aborted. A base tensor whose layer cannot be resolved must
+    // fail the allocation rather than keep that span.
+    ggml_tensor * idx0  = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, layer_bytes / sizeof(ggml_fp16_t));
+    ggml_tensor * idx1  = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, layer_bytes / sizeof(ggml_fp16_t));
+    ggml_tensor * stray = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 64);
+    ggml_set_name(idx0, "cache_idx_k_l0");
+    ggml_set_name(idx1, "cache_idx_v_l1");
+    ggml_set_name(stray, "not_a_kv_layer_tensor");
+
+    ggml_backend_buffer_t buf_tag = ggml_backend_buft_alloc_buffer(buft, total_bytes);
+    TEST_ASSERT(buf_tag != nullptr, "tagged KV buffer allocation failed");
+    uint8_t * tag_base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buf_tag));
+    TEST_ASSERT(ggml_backend_tensor_alloc(buf_tag, idx0, tag_base) == GGML_STATUS_SUCCESS,
+                "cache_idx_k_l0 allocation failed");
+    TEST_ASSERT(ggml_backend_tensor_alloc(buf_tag, idx1, tag_base + layer_bytes) == GGML_STATUS_SUCCESS,
+                "cache_idx_v_l1 allocation failed");
+    TEST_ASSERT(idx0->data != tag_base, "cache_idx_k_l0 must be remapped off the synthetic alloc_base span");
+    TEST_ASSERT(idx1->data != tag_base + layer_bytes, "cache_idx_v_l1 must be remapped off the synthetic span");
+    TEST_ASSERT(idx1->extra != nullptr, "cache_idx_v_l1 extra must be populated");
+    auto * idx1_extra = static_cast<ggml_tensor_extra_gpu *>(idx1->extra);
+    auto   idx1_dev1  = idx1_extra->data_handle[1].resolve();
+    TEST_ASSERT(idx1_dev1 && idx1_dev1.on_device && idx1_dev1.ptr == idx1->data,
+                "cache_idx_v_l1 must resolve to the planned device-1 allocation");
+    TEST_ASSERT(ggml_backend_tensor_alloc(buf_tag, stray, tag_base) == GGML_STATUS_ALLOC_FAILED,
+                "a base tensor with no resolvable KV layer must fail the allocation");
+    ggml_backend_buffer_free(buf_tag);
+
     ggml_free(ctx);
     ggml_sycl::test_clear_kv_placement_plan();
 

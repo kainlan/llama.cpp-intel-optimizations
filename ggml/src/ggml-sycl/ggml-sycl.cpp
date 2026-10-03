@@ -156,6 +156,7 @@
 #include "ggml-sycl/fused-ffn.hpp"
 #include "ggml-sycl/fused-moe-esimd.hpp"
 #include "ggml-sycl/fused-norm-gemm.hpp"
+#include "ggml-sycl/kv-cache-tensor-name.hpp"
 #include "ggml-sycl/kv-runtime-demotion.hpp"
 #include "ggml-sycl/kv-tier-manager.hpp"
 #include "ggml-sycl/l2-prefetch.hpp"
@@ -39242,15 +39243,10 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
     // Per-layer remapping: parse layer ID from tensor name and remap to the
     // actual per-layer allocation pointer (device VRAM or host-pinned).
     // The allocator placed tensors at offsets from alloc_base (synthetic).
-    int          layer_id = -1;
+    // llama_kv_cache tags the names of its auxiliary caches ("cache_idx_k_l<N>"), so the id is
+    // parsed for any tag; a prefix-only parse left those tensors on the synthetic host span.
     const char * name     = tensor->name;
-    const char * prefix_k = "cache_k_l";
-    const char * prefix_v = "cache_v_l";
-    if (strncmp(name, prefix_k, 9) == 0) {
-        layer_id = atoi(name + 9);
-    } else if (strncmp(name, prefix_v, 9) == 0) {
-        layer_id = atoi(name + 9);
-    }
+    const int    layer_id = ggml_sycl::kv_cache_tensor_layer_id(name);
 
     if (layer_id >= 0 && static_cast<uint32_t>(layer_id) < ctx->n_layers &&
         static_cast<uint32_t>(layer_id) < ctx->layer_allocs.size()) {
@@ -39334,13 +39330,16 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
         }
     }
 
-    // Fallback for tensors that don't match layer naming: leave pointer as-is
-    // (will point into alloc_base which is host-accessible).
-    if (layer_id >= 0) {
-        GGML_LOG_WARN("[KV-REMAP] FALLBACK: %s layer_id=%d not remapped (n_layers=%u, allocs=%zu)\n", name, layer_id,
-                      ctx->n_layers, ctx->layer_allocs.size());
-    }
-    return GGML_STATUS_SUCCESS;
+    // A base tensor that reaches here still points into alloc_base, a synthetic host span with no
+    // device mapping and no extra.  The buffer is a SYCL KV buffer, so SYCL owns the ops on it and
+    // would read or write that span as if it were the layer's cache (SET_ROWS aborts on it,
+    // llama.cpp-4ot7).  Fail the allocation instead of keeping the pointer, as the overflow check
+    // above does.  llama_kv_cache puts only per-layer k/v base tensors here.
+    GGML_LOG_ERROR(
+        "[KV-REMAP] ERROR: %s cannot be placed: layer_id=%d has no per-layer allocation "
+        "(n_layers=%u, allocs=%zu)\n",
+        name, layer_id, ctx->n_layers, ctx->layer_allocs.size());
+    return GGML_STATUS_ALLOC_FAILED;
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
