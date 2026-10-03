@@ -3607,6 +3607,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
+# llama.cpp-s36q: source gate -- the legacy standard-PP MUL_MAT_ID route's
+# device_weight_cpu_fallback flag (ggml-sycl.cpp) must not name a type the MoE MMVQ
+# capability table advertises (it D2H-streams device-resident experts to the CPU per
+# dispatch and makes the _id kernel unreachable), except the ticketed exemptions.
+# Host-only, reads the sources as text.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-device-weight-cpu-fallback-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-device-weight-cpu-fallback-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
 # llama.cpp-2lxw: source gate for the dense split executor's host-side trims
 # (moved-only input refresh on a plan-cache hit and the staging generation it
 # relies on). Host-only, reads the sources as text.
