@@ -28,6 +28,7 @@ import importlib.util
 import os
 import pathlib
 import subprocess
+import sys
 
 import pytest
 
@@ -38,6 +39,7 @@ SCRIPT = ROOT / "scripts" / "moe-cache-sim.py"
 def load():
     spec = importlib.util.spec_from_file_location("moe_cache_sim", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
+    sys.modules["moe_cache_sim"] = mod   # dataclasses resolve annotations through it
     spec.loader.exec_module(mod)
     return mod
 
@@ -220,7 +222,7 @@ def test_adaptive_swap_cap_is_global_and_ranked_by_gain():
     # gain 4. layer 1: cand e1 usage 2 vs victim e0 usage 0, gain 2.
     l0 = [[1], [1], [1], [1]]
     l1 = [[1], [1], [2], [3]]
-    steps = [sim.Step(index=i, phase=1, n_tokens=1, layers={0: l0[i], 1: l1[i]})
+    steps = [sim.Step(index=i, phase=1, n_tokens=1, layers={0: [l0[i]], 1: [l1[i]]})
              for i in range(4)]
     t = sim.Trace(header={}, steps=steps)
     kw = dict(every=4, decay=1.0, min_count=2.0, margin=1.5, land_delay=0)
@@ -297,6 +299,33 @@ def test_leave_one_set_out_splits_by_header_set():
     assert oracle["code"]["hit_rate"] == 1.0
 
 
+def test_trace_summary_counts_and_prefill_coverage():
+    steps = [
+        sim.Step(index=0, phase=0, n_tokens=2,
+                 layers={0: [[0, 1], [1, 2]], 1: [[0, 1], [0, 1]]}),
+        sim.Step(index=1, phase=1, n_tokens=1, layers={0: [[3, 0]]}),
+    ]
+    summary = sim.trace_summary(sim.Trace({"set": "s"}, steps), n_expert=4)
+    assert summary["prefill_tokens"] == 2 and summary["decode_tokens"] == 1
+    assert summary["layers"] == 2
+    # layer 0 touches {0,1,2} = 3/4, layer 1 {0,1} = 2/4
+    assert summary["prefill_expert_coverage"] == pytest.approx(0.625)
+
+
+def test_cli_loo_writes_csv(tmp_path, capsys):
+    a, b = tmp_path / "a.moetrace", tmp_path / "b.moetrace"
+    sim.write_trace(a, {"set": "code"}, [(i, 0, 1, [[0, 1]]) for i in range(8)])
+    sim.write_trace(b, {"set": "chat"}, [(i, 0, 1, [[2, 3]]) for i in range(8)])
+    rc = sim.main(["--loo", str(a), str(b),
+                   "--uniform-expert-bytes", f"f={GIB}:1:4",
+                   "--budget-mib-per-layer", "1024,2048"])
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("format,test_set,policy,budget_mib_per_layer")
+    # 2 held-out sets x 2 budgets x 4 policies
+    assert len(lines) == 1 + 2 * 2 * 4
+
+
 # ---------------------------------------------------------------------------
 # trace file format
 # ---------------------------------------------------------------------------
@@ -364,7 +393,6 @@ def test_cxx_tool_selftest_writes_a_trace_the_simulator_reads(tmp_path):
 def test_expert_sizes_from_gguf_shards(tmp_path):
     np = pytest.importorskip("numpy")
     sys_path_gguf = ROOT / "gguf-py"
-    import sys
     sys.path.insert(0, str(sys_path_gguf))
     try:
         gguf = pytest.importorskip("gguf")

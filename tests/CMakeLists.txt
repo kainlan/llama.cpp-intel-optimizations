@@ -1686,6 +1686,19 @@ if (NOT WIN32)
         SKIP_RETURN_CODE 77
     )
 
+    # Arithmetic gate for scripts/moe-cache-sim.py (llama.cpp-05mh), the
+    # expert-routing cache simulator fed by examples/moe-trace. Pytest-style, so
+    # it goes through llama_test_pytest. Hand-built synthetic traces only: no
+    # model, no device. Two of its tests skip on their own (the gguf-py size
+    # reader without numpy, the C++ trace cross-check without the built tool).
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-moe-cache-sim.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "python"
+        TIMEOUT 120
+    )
+
     # ---------------------------------------------------------------------
     # RESTORED COVERAGE, batch 1/N (llama.cpp-0igs): 37 pytest-style gates for
     # the scripts/ profiling toolchain that were in-tree and UNREGISTERED.
