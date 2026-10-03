@@ -1,0 +1,10 @@
+<|im_start|>user
+A train leaves city A at 9:00 travelling at 60 km/h toward city B, which is 300 km away. A second train leaves city B at 10:00 travelling at 90 km/h toward city A. At what time do they meet, and how far from city A? Work it out step by step.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+Here is the step-by-step solution to the problem.
+
+### Step 1: Analyze the situation before the second train departs
