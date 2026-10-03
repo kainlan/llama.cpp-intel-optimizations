@@ -3,7 +3,7 @@
 // Links ggml-sycl/file-mapping.cpp alone: no SYCL header, no device, no model. It checks the reservation shape (one
 // PROT_NONE reservation with MAP_FIXED file segments at the right offsets, the bytes read back equal to the file's),
 // dup fd ownership, the size-mismatch refusal, the argument refusals, the ranged lock, and the private munmap counter:
-// exactly one munmap, of the whole reservation, at release.
+// exactly one munmap, of the whole reservation, at release, and the unwind of a segment that fails to map.
 
 #include "../ggml/src/ggml-sycl/file-mapping.hpp"
 
@@ -371,6 +371,32 @@ static int test_munmap_counter() {
     return 0;
 }
 
+// A segment that cannot be mapped unwinds the reservation: nothing stays mapped, no fd stays open, and the
+// output is untouched. A write-only descriptor makes the first PROT_READ segment fail (EACCES) after the dup
+// and the PROT_NONE reservation exist, so the unwind has something to release.
+static int test_segment_map_failure_unwinds() {
+    fixture        f(8);
+    const uint64_t P  = g_page;
+    const int      wo = open(f.path.c_str(), O_WRONLY);
+    CHECK(wo >= 0, "open write-only");
+
+    file_mapping          m;
+    const int             fds_before     = open_fd_count();
+    const uint64_t        munmaps_before = unified_cache_file_mapping_munmap_count_for_test();
+    const file_map_status st             = unified_cache_raw_map_file(wo, f.size,
+                                                                      {
+                                                              0, 8 * P
+    },
+                                                                      { { 0, P }, { 4 * P, P } }, &m);
+    CHECK(st == file_map_status::SEGMENT_MAP_FAILED, "a write-only descriptor did not fail the segment map");
+    CHECK(m.base == nullptr && m.fd == -1, "a failed map wrote its output");
+    CHECK(open_fd_count() == fds_before, "the failed map leaked its dup of the fd");
+    CHECK(unified_cache_file_mapping_munmap_count_for_test() == munmaps_before + 1,
+          "the failed map did not unmap its reservation exactly once");
+    close(wo);
+    return 0;
+}
+
 // The ranged lock locks the segments it is given and nothing else; a range outside the reservation or off a page
 // is refused before any mlock. Skips (and says so) where RLIMIT_MEMLOCK is too small to lock.
 static int test_ranged_lock() {
@@ -425,6 +451,7 @@ int main() {
     rc |= test_size_mismatch_refused();
     rc |= test_argument_refusals();
     rc |= test_munmap_counter();
+    rc |= test_segment_map_failure_unwinds();
     rc |= test_ranged_lock();
     if (rc == 0) {
         std::printf("PASS: test-sycl-file-mapping-host\n");
