@@ -24,7 +24,7 @@ end-to-end token rate.
 
 | tool | what it does |
 |------|--------------|
-| `tools/cpu-expert-bench/bench-host-stream.cpp` | STREAM-style copy/scale/triad plus a pure-read kernel, 3 GiB total (three 1 GiB arrays, far above the 36 MB L3), threads 1..24, optional pinning, best and median of N 20-40 ms trials. No SYCL or ggml dependency; target `bench-host-stream` in any configuration, or plain `g++ -O3 -mavx2 -std=c++17 -pthread`. |
+| `tools/cpu-expert-bench/bench-host-stream.cpp` | STREAM-style copy/scale/triad plus a pure-read kernel, 3 GiB total (three 1 GiB arrays, far above the 36 MB L3), threads 1..24, optional pinning, best and median of N 20-40 ms trials. No SYCL or ggml dependency; target `bench-host-stream` in any x86-64 configuration (AVX2 kernels), or plain `g++ -O3 -mavx2 -std=c++17 -pthread`. |
 | `tools/cpu-expert-bench/bench-cpu-expert-matvec.cpp` | `prod` calls the real `ggml_sycl_cpu_expert_mul_mat_batched()` (the function a CpuExpertPool worker runs) on expert-shaped weights at batch 1. Other variants run the same cold weights through an in-process thread team: `read` (loads only), `vecdot` (ggml-cpu row `vec_dot`), `r8` (ggml's 8x8 repack gemv), `mx8`/`mx16`, `q2`, `q8_4row[_pf]` (prototypes). Each variant takes a pin suffix (`+pin`, `+pinE`, `+pinS`). Opens no SYCL queue. |
 | `tools/cpu-expert-bench/run_expert_sweep.py` | One process per thread count (`GGML_SYCL_CPU_THREADS` is read once), rounds shuffled, summary with best/p90/median/p10/min, burst aggregate and paired `ratio_read`; `--pairs A:B,...` adds per-burst paired ratios of any two variants (median and interquartile range), `--from-csv` re-summarises a saved run; saves each run's stderr (oracle, pin and CPU samples). |
 
@@ -33,7 +33,7 @@ to `test-sycl-cpu-dispatch` (it needs that scope's `GGML_SYCL_DNNL` and links th
 static `ggml-sycl`), so it exists only with `-DGGML_SYCL=ON
 -DGGML_BACKEND_DL=OFF -DLLAMA_BUILD_TESTS=ON` (it sits inside `BUILD_TESTING`).
 `bench-host-stream` is in `tools/cpu-expert-bench/CMakeLists.txt` and needs none
-of that. The matvec target is compiled with `-mavx2 -mfma -mf16c -mavxvnni
+of that beyond an x86-64 target. The matvec target is compiled with `-mavx2 -mfma -mf16c -mavxvnni
 -mavxvnniint8`, as `cpu-dispatch.cpp` is (minus F16C); at start it checks cpuid
 for all five and exits 77 ("SKIP") instead of faulting on a CPU without them.
 
@@ -71,8 +71,9 @@ for k in 1 2 3; do
       --types q8_0,mxfp4,q2_0 --shapes qwen38 --mats gate --variants prod,prod+pin,read,read+pin \
       --bursts 16 --burst-calls 4 --pool-mb 256 --topk $k > topk$k.summary 2> topk$k.log
 done
-# paired ratios (pairs-8-24-threads.csv) from a saved raw CSV; the pair names are those in that file:
-python3 $S --from-csv hi-qwen.csv --pairs prod+pin:prod,prod+pinE:prod,prod+pinS:prod,prod:vecdot,prod+pin:vecdot+pin,prod+pin:read,prod+pin:read+pin,vecdot+pin:vecdot,read+pin:read,r8+pin:prod+pin,mx8+pin:prod+pin,q2+pin:prod+pin,mx8:vecdot,q2:prod
+# paired ratios (pairs-8-24-threads.csv) from a saved raw CSV, once per CSV (hi-qwen.csv and hi-gptoss.csv);
+# the pair names are those in that file:
+for c in hi-qwen hi-gptoss; do python3 $S --from-csv $c.csv --pairs prod+pin:prod,prod+pinE:prod,prod+pinS:prod,prod:vecdot,prod+pin:vecdot+pin,prod+pin:read,prod+pin:read+pin,vecdot+pin:vecdot,read+pin:read,r8+pin:prod+pin,mx8+pin:prod+pin,q2+pin:prod+pin,mx8:vecdot,q2:prod; done
 ```
 
 The raw call CSVs are not committed (large); the summaries, pairs, pin-sample totals
@@ -165,12 +166,13 @@ Effective weight GB/s, Qwen3.8 gate shape (N=640 K=2560, k=10 experts per call),
 median (best) over 3 rounds x 8 bursts x 3 calls of the interleaved 1-thread run.
 No arena scheduling and no pinning effect worth separating at one thread
 (`prod+pin` and `prod` agree except where a load tail intervenes: Qwen IQ4_NL
-gate `prod` 3.0 against `prod+pin` 6.8 median, both with best 9.6, is such a
-tail artifact): this isolates the kernel. A single core pulls 14-16 GB/s median. The p10 of every
-cell is 2-5 GB/s (load tail); ratios are the better comparison.
+gate `prod` 3.0 against `prod+pin` 6.8 median, both with best 9.6, and GPT-OSS
+Q8_0 down `prod` 7.4 against `prod+pin` 5.7, best 11 for both, are such tail
+artifacts): this isolates the kernel. A single core pulls 14-16 GB/s median. The
+p10 of every cell is 2-5 GB/s (load tail); ratios are the better comparison.
 Raw: `sycl-cpu-expert-bandwidth-data/expert-1-2-4-threads.summary.csv`.
 
-| type | `read` | `prod` | ggml `vecdot` | ggml 8x8 repack (`r8`) | `mx8` | `mx16` | prototype `q2` | `q8_4row` / `_pf` | `prod` / `read` |
+| type | `read` | `prod` | ggml `vecdot` | ggml 8x8 repack (`r8`) | `mx8` | `mx16` | prototype `q2` | `q8_4row` / `_pf` | `prod` / `read` (paired `ratio_read`, not a ratio of the medians) |
 |---|---|---|---|---|---|---|---|---|---|
 | Q8_0   | 15.5 (19.5) | 9.1 (12.9) | 9.0 (12.7) | -- | -- | -- | -- | 5.8 (11.4) / 9.6 (12.5) | 0.58 |
 | MXFP4  | 14.5 (18.3) | 2.3 (4.8)  | 7.6 (9.9)  | 8.6 (12.5) | 8.0 (9.8) | 1.8 (4.9) | -- | -- | 0.17 |
@@ -235,8 +237,8 @@ config above the 37 GB/s Strata-equivalent target (46.7); GPT-OSS Q8_0 down
 
 **Scaling.** The pooled median over the 13 configs of `prod` is 13.3 / 19.9 /
 18.2 / 19.9 / 24.9 / 19.8 GB/s at 8 / 12 / 16 / 20 / 22 / 24 threads
-(`prod+pin`: 13.8 / 21.0 / 17.0 / 21.2 / 25.0 / 24.8). `prod` roughly doubles
-from 8 to 12-22 threads and is flat within noise from 12 threads on; 24 threads
+(`prod+pin`: 13.8 / 21.0 / 17.0 / 21.2 / 25.0 / 24.8). `prod` rises 1.4-1.9x
+from 8 to 12-22 threads (pooled medians) and is flat within noise from 12 on; 24 threads
 is above 22 in only 3 of the 13 `prod` configs. Each thread count is a separate
 process at a different moment of the ambient load, so single cells jump by up to
 2x between neighbours (Qwen Q8_0 down `prod`: 43 at 22 threads, 23 at 24);
@@ -269,13 +271,15 @@ per config per thread count:
 | paired ratio (arm : base) | 8 | 12 | 16 | 20 | 22 | 24 threads |
 |---|---|---|---|---|---|---|
 | `prod+pin` : `prod` (P-first, 1 worker per CPU) | 1.04 | 1.03 | 0.96 | 1.04 | 1.01 | 1.11 |
+| same, excluding the 8 over-counted config-runs (below) | 1.12 | 1.03 | 0.95 | 1.04 | 1.01 | 1.11 |
 | `prod+pinS` : `prod` (fixed shuffled order, all CPUs) | 1.00 | 0.99 | 1.02 | 1.03 | 1.00 | 1.04 |
 | `prod+pinE` : `prod` (E-cores only, control) | 0.97 | 0.97 | 1.00 | 1.08 | 0.90 | 0.86 |
 | `vecdot+pin` : `vecdot` (own team) | 1.34 | 1.28 | 1.38 | 1.22 | 1.09 | 1.09 |
 | `read+pin` : `read` (own team) | 1.20 | 1.16 | 1.18 | 1.13 | 1.09 | 1.10 |
 
-The pooled `prod+pin : prod` ratio is **0.96-1.11** (1.11 at 24 threads,
-0.96-1.04 elsewhere, i.e. within noise of 1.0), a shuffled pin does as well as
+The pooled `prod+pin : prod` ratio is **0.95-1.12** (1.12 at 8 and 1.11 at 24
+threads after the exclusion below, 0.95-1.04 elsewhere, i.e. within about 10 % of
+1.0), a shuffled pin does as well as
 the P-first pin, and the E-core-only pin matches up to 16 threads (0.97-1.00;
 see the next section for 20-24). By contrast the
 same pin applied to the in-process own team is worth 1.1-1.4x. So the pin itself
@@ -316,11 +320,34 @@ at those counts is an oversubscribed control, not a like-for-like one (at 8-16
 threads no CPU is shared). At 22 and
 24 threads P-first and shuffled pin occupy (almost) the same set of CPUs and
 differ only in which worker is on which core, and they measure the same.
-The pin is in effect; it just does not move `prod`. At 22 threads for the large
+The pin is in effect (with the over-count caveat below); it just does not move
+`prod`. At 22 threads for the large
 calls 21 active arena workers were found and pinned (IQ3_XXS: 21 found, 23 other
 idle threads left alone); in the `--topk 1` runs the number found varies by
 round and type from 4 to 21 (`run-digest-8-24-threads.txt`; a 640-row call has
 at most 10 chunks at the 64-row grain floor).
+
+**Worker over-count in 8 of the 234 config-runs (found after the sweep).** The
+discovery counts every thread of the process that burned CPU during 12 `prod`
+calls, but the arena has at most `threads - 1` workers besides the calling
+thread. In 8 config-runs it found more: Qwen Q8_0 down 8 threads round 0 (14
+found), Qwen MXFP4 down 12 threads round 1 (17), GPT-OSS Q8_0 gate 8 threads
+round 0 (14), GPT-OSS MXFP4 down 8 threads rounds 0 and 2 (14, 11), GPT-OSS
+MXFP4 gate 8 threads round 1 (9) and 16 threads round 1 (23), GPT-OSS Q8_0 down
+12 threads round 1 (15). Those counts include non-arena threads or workers
+replaced during the window, so `prod+pin` there pinned extra threads onto shared
+CPUs. That explains the 250 E-core samples in the 8-thread `prod+pin` cell above:
+220 of them come from the five over-counted 8-thread runs; the other 34 runs
+have 2146 P / 30 E. Recomputing the pooled paired ratios without those 8
+config-runs (the rounds are dropped from those configs only; recomputed from
+the raw per-call CSVs, which are not committed; the result is
+`pin-discovery-overcount.csv`) changes one cell: `prod+pin : prod` at 8 threads
+goes 1.04 -> 1.12, 16 threads 0.96 -> 0.95; 12, 20, 22 and 24 threads, the
+shuffled and E-only controls, `prod : vecdot` and `prod+pin : vecdot+pin` are
+unchanged to two decimals. The conclusion stands (no robust benefit of pinning
+`prod` above 8 threads; at most ~1.1x anywhere), with the 8-thread figure
+higher than first reported. The bench now caps discovery at `threads - 1`
+(busiest first) and logs when it does; the committed data predate that.
 
 ### Why `prod` loses to the same kernel in a persistent team
 
@@ -338,9 +365,11 @@ the ratio is **dispatch path only**. Median over configs, per type, 8 / 12 / 16 
 | IQ3_XXS (n=1)        | 0.70 / 0.85 / 1.00 / 0.50 / 0.87 / 0.67 | 0.42 / 0.69 / 0.72 / 0.65 / 0.72 / 0.63 |
 | MXFP4 (n=4; kernel differs: 16-row tile vs ggml VNNI row) | 0.66 / 0.69 / 0.58 / 0.54 / 0.62 / 0.56 | 0.43 / 0.56 / 0.39 / 0.54 / 0.59 / 0.57 |
 
-So for the same instructions, production reaches about 0.66-0.97 (typically
-0.8) of a dynamic team unpinned and 0.56-0.99 of a *pinned* dynamic team (0.56-0.74
-for Q8_0). That also revises the
+So for the same instructions, production reaches 0.50-1.00 of a dynamic
+team unpinned (0.66-0.97 for Q8_0, IQ4_NL and Q2_0; IQ3_XXS, one config, gives
+both extremes, 0.50 at 20 and 1.00 at 16 threads) and 0.42-1.06 of a *pinned*
+dynamic team (Q8_0 0.56-0.74, IQ4_NL 0.68-0.99, Q2_0 0.62-1.06 with 1.06 at 20
+threads, IQ3_XXS 0.42-0.72). That also revises the
 earlier Q8_0 statement that its headroom is "per-call overhead": it is, but
 the overhead is path-level, up to 25-45 % of throughput at 8-24 threads, not a
 few microseconds of activation quantisation (which the bench `prod` call also
@@ -377,7 +406,7 @@ the kernel section.)
   access pattern allows; the remaining headroom is **dispatch**, not the dot
   loop: at 22 threads production Q8_0 is 0.76 of the same `vec_dot` in a dynamic
   team (see "Why `prod` loses ..." above), and the pinned team's `vecdot+pin` is
-  45 GB/s median against 51 for the pure read.
+  44.9 GB/s median against 50.5 for the pure read (Qwen Q8_0 gate).
 * **MXFP4, production 16-row kernel** (`simd_mxfp4_q8_0_16row`): objdump of
   `cpu-dispatch.cpp.o` (icpx -O3, Release) shows the `for r<16` loop is **not
   unrolled** (3 `vpdpbssd` in the function, not 48): the 16 accumulators are a
@@ -499,8 +528,9 @@ does not transfer to 22 threads, where the 16-row loop is no longer the limit.
    `ceil(rows/64)` chunks (10 for a Qwen gate at top-1; see item 7).
 2. **Pinning the arena workers one per core, P-cores first: downgraded.** The
    earlier 1.4-3.5x is not reproduced (see "Correction" above): paired,
-   in-process, at load ~33 the effect on `prod` is 0-10 % and a shuffled pin does
-   as well. The same pin is worth 1.1-1.4x to the finer-grained own team, and
+   in-process, at load ~33 the pooled `prod+pin : prod` ratio is 0.95-1.12
+   (within a few percent of 1.0 except 1.12 at 8 and 1.11 at 24 threads) and a
+   shuffled pin does as well. The same pin is worth 1.1-1.4x to the finer-grained own team, and
    STREAM gains 10-20 %, so it is plausible that pinning pays once the dispatch is
    fixed (item 1); it should be re-measured then, with the same E-only and
    shuffled controls, and at a heavier load than 33 as well. It needs a
@@ -553,7 +583,7 @@ does not transfer to 22 threads, where the 16-row loop is no longer the limit.
    IQ4_NL is the same question with a smaller measured gain: `r8+pin` is 1.2x
    `prod+pin` (2 configs) and 1.2x the same-team `vecdot+pin` (41/34, 43/34), for
    the same layout costs.
-5. **Q2_0: add an AVX-VNNI kernel.** Prototype `q2` (per core 1.7-2.3x the scalar
+5. **Q2_0: add an AVX-VNNI kernel.** Prototype `q2` (per core 1.7-2.1x the scalar
    kernel, packed weights, no repack). In the pinned team at 22 threads `q2+pin`
    is 34/29 against `vecdot+pin` (the same scalar kernel) 25/15 and `prod+pin`
    16/22, paired 1.33x (22 threads) / 2.2x (24) over `prod+pin` on 2 configs. The
@@ -581,11 +611,11 @@ does not transfer to 22 threads, where the 16-row loop is no longer the limit.
    | Q2_0  | 3 | 136 (10.2) | 125 (11.0) | 41 (33.6) |
 
    A top-1 call moves 0.45-1.7 MB and takes 67-128 us in production, 2.3-3.9x a
-   pure read in the team (19-51 us); the throughput is 7-14 GB/s, a fifth of the
-   large-call figure. Per-call overhead, not bandwidth, bounds small calls: for
+   pure read in the team (19-51 us); the throughput is 6.2-13.9 GB/s, well below the
+   large-call figures (14-47). Per-call overhead, not bandwidth, bounds small calls: for
    Q8_0 the production-over-team excess is ~65-75 us at k=1 and ~90-100 us at k=3
    (the earlier single observation of ~50-70 us was the right order). Pinning
-   shortens the median call time by 1.1-1.35x for MXFP4 and Q2_0 (MXFP4 128 ->
+   shortens the median call time by 1.09-1.40x for MXFP4 and Q2_0 (MXFP4 128 ->
    96, 157 -> 116, 161 -> 144 us; Q2_0 74 -> 67, 120 -> 86, 136 -> 125 us); for
    Q8_0 it is 7 % faster at k=1 and 9 % and 4 % **slower** at k=2 and 3 (medians
    over the same interleaved bursts, no paired interval, so weak evidence). The statement that production batches only 1-3
@@ -634,6 +664,9 @@ does not transfer to 22 threads, where the 16-row loop is no longer the limit.
   --pairs`: median and interquartile range of arm/base per burst, 24 bursts per
   config) behind every ratio quoted above.
 * `pin-samples-8-24-threads.csv`: the last-run-CPU sample totals per arm.
+* `pin-discovery-overcount.csv`: the pooled paired ratios with and without the 8
+  over-counted config-runs, and those 8 runs (threads, round, workers found,
+  `prod+pin : prod` over all rounds and without that round).
 * `topk-{1,2,3}.summary.csv`: the small-call runs (item 7).
 * `run-digest-8-24-threads.txt`: from each run's stderr, the oracle verdict
   counts (all `ok`: 1404 + 720 for the 8-24 thread sweeps, 18 per top-k run),
