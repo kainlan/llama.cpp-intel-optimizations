@@ -3365,6 +3365,14 @@ set_tests_properties(test-moe-profile-stride PROPERTIES LABELS "main;moe")
 set_property(TEST test-moe-profile-stride PROPERTY
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
 
+# The one eligibility rule for a TENSOR_READ_LAZY tensor (llama.cpp-th32 T6a):
+# a pure function of the lazy mode, the tensor size and mmap support. Host-only.
+llama_build_and_test(test-llama-lazy-eligible.cpp)
+target_include_directories(test-llama-lazy-eligible PRIVATE ${PROJECT_SOURCE_DIR}/src)
+set_tests_properties(test-llama-lazy-eligible PROPERTIES LABELS "main;lazy")
+set_property(TEST test-llama-lazy-eligible PROPERTY
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
+
 # llama_mmap keeps MADV_HUGEPAGE off the lazily read ranges (llama.cpp-n77l),
 # checked through the VmFlags in /proc/self/smaps. Linux-only; exits 77 when
 # THP is unavailable, and fails when no VmFlags line can be read.

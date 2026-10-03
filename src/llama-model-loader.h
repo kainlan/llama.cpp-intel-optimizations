@@ -31,6 +31,13 @@ enum llama_fver {
 
 const char * llama_file_version_name(llama_fver version);
 
+// Whether a TENSOR_READ_LAZY tensor of `nbytes` is read lazily, as a function of
+// the lazy mode and of whether mmap is supported (llama.cpp-th32 T6a, design
+// DLM (a)). It is the one eligibility rule: nothing is eligible without mmap,
+// OFF never is, AUTO only above 4 GiB, ON always. Callers pass the answer on;
+// none restates the rule.
+bool llama_lazy_eligible(enum llama_lazy_mode mode, size_t nbytes, bool mmap_supported);
+
 struct llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {

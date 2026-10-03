@@ -1237,6 +1237,12 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
+bool llama_lazy_eligible(enum llama_lazy_mode mode, size_t nbytes, bool mmap_supported) {
+    GGML_UNUSED(nbytes);
+    GGML_UNUSED(mmap_supported);
+    return mode != LLAMA_LAZY_MODE_OFF;
+}
+
 bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
     if (mode == LLAMA_LAZY_MODE_OFF) {
         return false;
