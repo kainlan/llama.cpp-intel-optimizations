@@ -3393,6 +3393,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-5efe C1: one source for the lazy-range decision. Pins in text what a
+# runtime test cannot tell apart on Linux (llama_mmap::SUPPORTED is a constant
+# true) and what a rebase of upstream's lazy_read would silently restore.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-llama-lazy-range-record-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-llama-lazy-range-record-source.py
+        LABEL "sycl;host;lazy;python;source-contract"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-5efe C1: the per-model lazy-range record and its pre-fill, driven over
 # a two-file GGUF fixture whose tables are sparse holes. Host-only: no backend,
 # device or model.

@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-arch.h"
 #include "llama-hparams.h"
+#include "llama-lazy-range-record.h"
 #include "llama-mmap.h"
 
 #include "ggml-cpp.h"
@@ -93,11 +94,20 @@ struct llama_model_loader {
     bool no_alloc;
     bool load_mtp;
 
+    // The rows of every TENSOR_READ_LAZY tensor the architecture declares and the file
+    // carries, filled once by load_tensors() before the early plan (llama.cpp-5efe C1).
+    // Whether a table is lazy, who reads it and where it sits in its file are read from
+    // here; no consumer keeps a copy.
+    llama_lazy_range_record lazy_record;
+
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
     struct lazy_read {
         // set by the caller before the create_tensor() calls
         enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
+
+        // the record whose LAZY_READ rows this reads (set by the loader)
+        const llama_lazy_range_record * record = nullptr;
 
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
