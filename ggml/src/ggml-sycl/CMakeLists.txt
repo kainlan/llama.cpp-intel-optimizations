@@ -162,6 +162,18 @@ if (BUILD_TESTING)
     add_test(NAME sycl-fusion-alias COMMAND test-sycl-fusion-alias)
     set_tests_properties(sycl-fusion-alias PROPERTIES LABELS "sycl;fusion;host")
 
+    # The FILE_MAPPED tier's raw file-mapping primitives (llama.cpp-5efe C2). file-mapping.cpp includes no SYCL
+    # header, so this target links it alone: no device, no model, no ggml.
+    add_executable(test-sycl-file-mapping-host
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-file-mapping-host.cpp
+        file-mapping.cpp)
+    target_include_directories(test-sycl-file-mapping-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test-sycl-file-mapping-host PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+    set_target_properties(test-sycl-file-mapping-host PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-file-mapping-host COMMAND test-sycl-file-mapping-host)
+    set_tests_properties(test-sycl-file-mapping-host PROPERTIES LABELS "sycl;host" SKIP_RETURN_CODE 77 TIMEOUT 60)
+
     add_executable(test-sycl-lifecycle-load-txn
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-load-txn.cpp
         model-lifecycle.cpp)
