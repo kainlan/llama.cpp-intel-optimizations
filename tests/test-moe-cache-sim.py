@@ -318,7 +318,7 @@ def test_same_trace_in_train_and_test_is_refused(tmp_path):
     # a copy of the capture under another name: same id, same routing
     q = tmp_path / "copy.moetrace"
     sim.write_trace(q, {"set": "a", "id": "a", "n_expert": 4}, [(0, 0, 1, [[0, 1]])])
-    with pytest.raises(ValueError, match="rename --trace-id"):
+    with pytest.raises(ValueError, match="step-prefix"):
         sim.check_disjoint([sim.read_trace(p)], [sim.read_trace(q)])
 
 
@@ -369,6 +369,41 @@ def test_empty_traces_never_match():
     c = sim.Trace(header={"id": "q"}, steps=[])
     sim.check_disjoint([a], [b])
     sim.check_disjoint([a], [c])
+    # one empty, one non-empty, same id: an empty list is a vacuous prefix of
+    # anything, which is the case the guard exists for. Either way round.
+    full = decode_trace([[0, 1]], set_name="p")
+    sim.check_disjoint([a], [full])
+    sim.check_disjoint([full], [a])
+    assert sim._same_trace(a, full) is None
+    assert sim._same_trace(full, a) is None
+
+
+def refusal(train, test):
+    with pytest.raises(ValueError) as e:
+        sim.check_disjoint([train], [test])
+    return str(e.value)
+
+
+def test_each_duplicate_branch_reports_only_its_own_reason(tmp_path):
+    # one scenario per branch of _same_trace; each message must carry its own
+    # marker and neither of the other two, so a test matching one marker fails
+    # if it is handed another branch's message
+    markers = {"file": "same object or file", "prefix": "step-prefix",
+               "renamed": "identical routing under different ids"}
+    p = tmp_path / "a.moetrace"
+    sim.write_trace(p, {"set": "a", "id": "a", "n_expert": 4},
+                    [(0, 0, 1, [[0, 1]]), (1, 0, 1, [[2, 3]])])
+    scenarios = {
+        "file": (sim.read_trace(p), sim.read_trace(p)),
+        "prefix": (decode_trace([[0, 1], [2, 3]], set_name="x"),
+                   decode_trace([[0, 1]], set_name="x")),
+        "renamed": (decode_trace([[0, 1], [2, 3]], set_name="x"),
+                    decode_trace([[0, 1], [2, 3]], set_name="y")),
+    }
+    for branch, (train, test) in scenarios.items():
+        msg = refusal(train, test)
+        for name, marker in markers.items():
+            assert (marker in msg) == (name == branch), (branch, name, msg)
 
 
 def test_leave_one_out_rejects_a_wrong_n_expert_trace():
