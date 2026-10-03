@@ -9,18 +9,24 @@
 
 const char * llama_lazy_deferral_name(enum llama_lazy_deferral deferral) {
     switch (deferral) {
-        case LLAMA_LAZY_DEFERRAL_EAGER:     return "EAGER";
-        case LLAMA_LAZY_DEFERRAL_LAZY_READ: return "LAZY_READ";
-        case LLAMA_LAZY_DEFERRAL_STORAGE:   return "STORAGE";
+        case LLAMA_LAZY_DEFERRAL_EAGER:
+            return "EAGER";
+        case LLAMA_LAZY_DEFERRAL_LAZY_READ:
+            return "LAZY_READ";
+        case LLAMA_LAZY_DEFERRAL_STORAGE:
+            return "STORAGE";
     }
     return "?";
 }
 
 static const char * llama_lazy_mode_name(enum llama_lazy_mode mode) {
     switch (mode) {
-        case LLAMA_LAZY_MODE_OFF:  return "off";
-        case LLAMA_LAZY_MODE_AUTO: return "auto";
-        case LLAMA_LAZY_MODE_ON:   return "on";
+        case LLAMA_LAZY_MODE_OFF:
+            return "off";
+        case LLAMA_LAZY_MODE_AUTO:
+            return "auto";
+        case LLAMA_LAZY_MODE_ON:
+            return "on";
     }
     return "?";
 }
@@ -31,8 +37,9 @@ static const char * llama_lazy_mode_name(enum llama_lazy_mode mode) {
 
 void llama_lazy_range_record::fill(std::vector<llama_lazy_range_row> rows) {
     if (filled_) {
-        GGML_ABORT("lazy-range record: written twice; rows, the eligibility bit, `deferral` and the attributes are "
-                   "set once, by the pre-fill");
+        GGML_ABORT(
+            "lazy-range record: written twice; rows, the eligibility bit, `deferral` and the attributes are "
+            "set once, by the pre-fill");
     }
     rows_   = std::move(rows);
     filled_ = true;
@@ -117,7 +124,8 @@ llama_mmap::ranges llama_lazy_range_record::excluded_for_file(uint32_t file_idx)
 // the load-mode fallback, the pre-fill, the early-plan filter and the create_tensor check
 //
 
-enum llama_lazy_mode llama_lazy_mode_resolve(enum llama_lazy_mode mode, const std::vector<ggml_backend_dev_caps> & caps) {
+enum llama_lazy_mode llama_lazy_mode_resolve(enum llama_lazy_mode                       mode,
+                                             const std::vector<ggml_backend_dev_caps> & caps) {
     if (mode != LLAMA_LAZY_MODE_AUTO) {
         return mode;
     }
@@ -151,12 +159,13 @@ void llama_lazy_range_record_prefill(llama_lazy_range_record &        record,
                                      enum llama_lazy_mode             mode_post,
                                      bool                             taker,
                                      bool                             mmap_supported) {
-    // RED stand-in (llama.cpp-5efe C1): every caller reads the post-fallback mode, the
-    // defect the witness cell exists to catch for the taker
-    const enum llama_lazy_mode mode = mode_post;
+    // the taker reads the mode as requested: its reads go through its own O_DIRECT fd,
+    // and the load-mode fallback exists because the CPU lazy path needs a mapping, so
+    // it must not disengage the taker. Off the taker, lazy_read reads with mode_post.
+    const enum llama_lazy_mode mode = taker ? mode_pre : mode_post;
 
-    LLAMA_LOG_INFO("%s: lazy-range record: mode_pre=%s mode_post=%s taker=%d\n", __func__, llama_lazy_mode_name(mode_pre),
-                   llama_lazy_mode_name(mode_post), taker ? 1 : 0);
+    LLAMA_LOG_INFO("%s: lazy-range record: mode_pre=%s mode_post=%s taker=%d\n", __func__,
+                   llama_lazy_mode_name(mode_pre), llama_lazy_mode_name(mode_post), taker ? 1 : 0);
 
     std::vector<llama_lazy_range_row> rows;
     for (const std::string & pattern : declared) {
@@ -185,8 +194,8 @@ void llama_lazy_range_record_prefill(llama_lazy_range_record &        record,
             row.attrs                = llama_model_lazy_tensor_attrs(arch, hparams, name);
 
             LLAMA_LOG_INFO("%s: lazy-range record: %s (%zu MiB) eligible=%d deferral=%s taker=%d mode=%s\n", __func__,
-                           name.c_str(), src.size / 1024 / 1024, eligible ? 1 : 0, llama_lazy_deferral_name(row.deferral),
-                           taker ? 1 : 0, llama_lazy_mode_name(mode));
+                           name.c_str(), src.size / 1024 / 1024, eligible ? 1 : 0,
+                           llama_lazy_deferral_name(row.deferral), taker ? 1 : 0, llama_lazy_mode_name(mode));
 
             rows.push_back(std::move(row));
         }
@@ -200,14 +209,15 @@ bool llama_lazy_early_plan_excludes(const llama_lazy_range_record & record, cons
 }
 
 void llama_lazy_range_check_create(const llama_lazy_range_record & record,
-                                   enum llm_arch                    arch,
-                                   const std::string &              name,
-                                   bool                             flagged) {
+                                   enum llm_arch                   arch,
+                                   const std::string &             name,
+                                   bool                            flagged) {
     const bool declared = record.has(name);
     if (flagged && !declared) {
-        GGML_ABORT("lazy-range record: tensor %s of arch %s is created with TENSOR_READ_LAZY but has no row; "
-                   "llama_model_lazy_tensor_names() does not declare it",
-                   name.c_str(), llm_arch_name(arch));
+        GGML_ABORT(
+            "lazy-range record: tensor %s of arch %s is created with TENSOR_READ_LAZY but has no row; "
+            "llama_model_lazy_tensor_names() does not declare it",
+            name.c_str(), llm_arch_name(arch));
     }
     if (!flagged && declared) {
         GGML_ABORT("lazy-range record: tensor %s of arch %s has a row but is created without TENSOR_READ_LAZY",

@@ -12,7 +12,6 @@
 
 #include "../src/llama-lazy-range-record.h"
 #include "../src/llama-model-loader.h"
-
 #include "ggml.h"
 #include "gguf.h"
 
@@ -27,16 +26,17 @@
 #include <vector>
 
 struct lazy_fixture {
-    using weights_t = std::map<std::string, llama_model_loader::llama_tensor_weight, llama_model_loader::weight_name_comparer>;
+    using weights_t =
+        std::map<std::string, llama_model_loader::llama_tensor_weight, llama_model_loader::weight_name_comparer>;
 
     static constexpr size_t GIB = 1024ull * 1024 * 1024;
 
-    std::vector<std::string>               paths;
+    std::vector<std::string>                 paths;
     std::vector<std::unique_ptr<llama_file>> files;
-    std::vector<gguf_context *>            ggufs;
-    std::vector<ggml_context *>            ctxs;
-    weights_t                              weights;
-    std::filesystem::path                  dir;
+    std::vector<gguf_context *>              ggufs;
+    std::vector<ggml_context *>              ctxs;
+    weights_t                                weights;
+    std::filesystem::path                    dir;
 
     struct spec {
         const char * name;
@@ -48,11 +48,15 @@ struct lazy_fixture {
         char tmpl[] = "/tmp/lazy-range-fixture-XXXXXX";
         dir         = mkdtemp(tmpl);
 
-        add_file({ { "lz_plus1", GGML_TYPE_I8, (int64_t) (4 * GIB + 1) },
-                   { "lz_exact", GGML_TYPE_I8, (int64_t) (4 * GIB) },
-                   { "plain", GGML_TYPE_F32, 16 } });
-        add_file({ { "lz_sparse", GGML_TYPE_I8, (int64_t) (6 * GIB) },
-                   { "per_layer_token_embd.weight", GGML_TYPE_I8, (int64_t) (5 * GIB) } });
+        add_file({
+            { "lz_plus1", GGML_TYPE_I8,  (int64_t) (4 * GIB + 1) },
+            { "lz_exact", GGML_TYPE_I8,  (int64_t) (4 * GIB)     },
+            { "plain",    GGML_TYPE_F32, 16                      }
+        });
+        add_file({
+            { "lz_sparse",                   GGML_TYPE_I8, (int64_t) (6 * GIB) },
+            { "per_layer_token_embd.weight", GGML_TYPE_I8, (int64_t) (5 * GIB) }
+        });
     }
 
     ~lazy_fixture() {
@@ -84,13 +88,13 @@ struct lazy_fixture {
         };
     }
 
-private:
+  private:
     void add_file(const std::vector<spec> & specs) {
-        const uint16_t idx  = (uint16_t) files.size();
+        const uint16_t    idx  = (uint16_t) files.size();
         const std::string path = (dir / ("f" + std::to_string(idx) + ".gguf")).string();
 
         // the tensors the writer sees; their data is never touched
-        ggml_init_params ip = { ggml_tensor_overhead() * (specs.size() + 1), nullptr, true };
+        ggml_init_params ip   = { ggml_tensor_overhead() * (specs.size() + 1), nullptr, true };
         ggml_context *   wctx = ggml_init(ip);
         gguf_context *   w    = gguf_init_empty();
         size_t           data = 0;

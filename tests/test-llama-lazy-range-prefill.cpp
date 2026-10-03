@@ -16,9 +16,8 @@
 //
 // Host-only: no backend, device or model.
 
-#include "lazy-range-fixture.h"
-
 #include "../src/llama-model.h"
+#include "lazy-range-fixture.h"
 
 #include <sys/prctl.h>
 #include <sys/wait.h>
@@ -61,8 +60,8 @@ static bool aborts_naming(const check_args & a, const char * arch_name) {
     fflush(nullptr);
     const pid_t pid = fork();
     if (pid == 0) {
-        setenv("GGML_NO_BACKTRACE", "1", 1); // the abort path would otherwise attach a debugger
-        prctl(PR_SET_DUMPABLE, 0);           // and a core dump, which apport would write for a deliberate abort
+        setenv("GGML_NO_BACKTRACE", "1", 1);  // the abort path would otherwise attach a debugger
+        prctl(PR_SET_DUMPABLE, 0);            // and a core dump, which apport would write for a deliberate abort
         close(fds[0]);
         dup2(fds[1], STDERR_FILENO);
         run_check((void *) &a);
@@ -97,10 +96,10 @@ static bool passes(const check_args & a) {
 int main() {
     lazy_fixture fx;
 
-    const llm_arch    arch     = LLM_ARCH_QWEN4EXP;
-    const char *      arch_str = llm_arch_name(arch);
-    const std::string lazy     = "per_layer_token_embd.weight"; // declared by qwen4exp
-    const std::string unflagged = "lz_exact";                    // a tensor of the file the arch does not declare
+    const llm_arch    arch      = LLM_ARCH_QWEN4EXP;
+    const char *      arch_str  = llm_arch_name(arch);
+    const std::string lazy      = "per_layer_token_embd.weight";  // declared by qwen4exp
+    const std::string unflagged = "lz_exact";                     // a tensor of the file the arch does not declare
     llama_hparams     hp;
     hp.n_layer_all = 8;
     hp.ple_n_heads = 16;
@@ -118,11 +117,13 @@ int main() {
         // filled before any create_tensor() call, with the attributes the function returns
         CHECK(rec.filled() && rec.has(lazy), "mode %d: the declared name has no row after the pre-fill", (int) mode);
         const llama_lazy_tensor_attrs want = llama_model_lazy_tensor_attrs(arch, hp, lazy);
-        CHECK(rec.attrs(lazy).rows_per_token == want.rows_per_token && rec.attrs(lazy).consumer_layer == want.consumer_layer,
+        CHECK(rec.attrs(lazy).rows_per_token == want.rows_per_token &&
+                  rec.attrs(lazy).consumer_layer == want.consumer_layer,
               "the row's attributes are not llama_model_lazy_tensor_attrs()'s");
-        const auto & w = fx.weights.at(lazy);
+        const auto &                 w = fx.weights.at(lazy);
         const llama_lazy_range_value v = rec.value(lazy);
-        CHECK(v.file_idx == w.idx && v.offs == w.offs && v.size == ggml_nbytes(w.tensor), "value() is not the weight's place");
+        CHECK(v.file_idx == w.idx && v.offs == w.offs && v.size == ggml_nbytes(w.tensor),
+              "value() is not the weight's place");
 
         // 1. declared and flagged: passes
         CHECK(passes({ &rec, arch, lazy, true }), "mode %d: a declared, flagged tensor was refused", (int) mode);
@@ -139,13 +140,16 @@ int main() {
     // the unflagged case is EAGER under OFF and under AUTO at 4 GiB, and still aborts
     {
         llama_lazy_range_record off;
-        llama_lazy_range_record_prefill(off, arch, hp, declared, fx.finder(), LLAMA_LAZY_MODE_OFF, LLAMA_LAZY_MODE_OFF, false, true);
+        llama_lazy_range_record_prefill(off, arch, hp, declared, fx.finder(), LLAMA_LAZY_MODE_OFF, LLAMA_LAZY_MODE_OFF,
+                                        false, true);
         CHECK(off.deferral(unflagged) == LLAMA_LAZY_DEFERRAL_EAGER, "OFF: lz_exact is not EAGER");
         llama_lazy_range_record at4;
-        llama_lazy_range_record_prefill(at4, arch, hp, declared, fx.finder(), LLAMA_LAZY_MODE_AUTO, LLAMA_LAZY_MODE_AUTO, false, true);
+        llama_lazy_range_record_prefill(at4, arch, hp, declared, fx.finder(), LLAMA_LAZY_MODE_AUTO,
+                                        LLAMA_LAZY_MODE_AUTO, false, true);
         CHECK(at4.deferral(unflagged) == LLAMA_LAZY_DEFERRAL_EAGER, "AUTO at 4 GiB: lz_exact is not EAGER");
         CHECK(aborts_naming({ &off, arch, unflagged, false }, arch_str), "OFF: the EAGER row's drift went unnoticed");
-        CHECK(aborts_naming({ &at4, arch, unflagged, false }, arch_str), "AUTO at 4 GiB: the EAGER row's drift went unnoticed");
+        CHECK(aborts_naming({ &at4, arch, unflagged, false }, arch_str),
+              "AUTO at 4 GiB: the EAGER row's drift went unnoticed");
     }
 
     // the early plan, with the taker: ineligible rows stay in, the eligible one is out
