@@ -3300,6 +3300,11 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # test drifting -- which is exactly why a restored block has to be built
     # and not just pasted back. Same remedy as test-alloc below.
     target_include_directories(test-q4-0-q8-0-vec-dot-regression PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    # llama.cpp-tjg8: ggml_vec_dot_q2_0_q8_0 against an independent oracle, plus a
+    # check that on x86 AVX2 the registered kernel is not the scalar reference.
+    # Same include-path remedy as above (the source includes ggml-cpu/quants.h).
+    llama_build_and_test(test-q2-0-q8-0-vec-dot.cpp)
+    target_include_directories(test-q2-0-q8-0-vec-dot PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 endif()
 
 # libmtmd
