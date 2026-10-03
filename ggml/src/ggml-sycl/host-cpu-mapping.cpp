@@ -34,6 +34,8 @@ const char * host_cpu_status_name(host_cpu_status status) {
             return "host-cpu-map-failed";
         case host_cpu_status::LOCK_FAILED:
             return "host-cpu-lock-failed";
+        case host_cpu_status::UNSUPPORTED:
+            return "unsupported-platform";
     }
     return "?";
 }

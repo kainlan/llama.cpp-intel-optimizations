@@ -191,15 +191,31 @@ if (BUILD_TESTING)
 
     # The HOST_CPU tier's raw wrapper (llama.cpp-th32 T1): anonymous, MADV_HUGEPAGE, mlocked in full. host-cpu-mapping.cpp
     # includes no SYCL header, so this target links it alone.
-    add_executable(test-sycl-host-cpu-mapping
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-host-cpu-mapping.cpp
+    # The test needs POSIX (mmap, /proc/self/smaps, RLIMIT_MEMLOCK), so it is Linux-only; the stub the other platforms get
+    # is run by test-sycl-host-cpu-unsupported below.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test-sycl-host-cpu-mapping
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-host-cpu-mapping.cpp
+            host-cpu-mapping.cpp)
+        target_include_directories(test-sycl-host-cpu-mapping PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(test-sycl-host-cpu-mapping PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+        set_target_properties(test-sycl-host-cpu-mapping PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME test-sycl-host-cpu-mapping COMMAND test-sycl-host-cpu-mapping)
+        set_tests_properties(test-sycl-host-cpu-mapping PROPERTIES LABELS "sycl;host" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    endif()
+
+    # The tier on a build without it (llama.cpp-th32 T1a): host-cpu-mapping.cpp and the test are compiled with _WIN32
+    # defined, so the refusing stub Windows gets is built and run on the host. Both are portable C++.
+    add_executable(test-sycl-host-cpu-unsupported
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-host-cpu-unsupported.cpp
         host-cpu-mapping.cpp)
-    target_include_directories(test-sycl-host-cpu-mapping PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_definitions(test-sycl-host-cpu-mapping PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
-    set_target_properties(test-sycl-host-cpu-mapping PROPERTIES
+    target_include_directories(test-sycl-host-cpu-unsupported PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test-sycl-host-cpu-unsupported PRIVATE _WIN32=1)
+    set_target_properties(test-sycl-host-cpu-unsupported PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-    add_test(NAME test-sycl-host-cpu-mapping COMMAND test-sycl-host-cpu-mapping)
-    set_tests_properties(test-sycl-host-cpu-mapping PROPERTIES LABELS "sycl;host" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_test(NAME test-sycl-host-cpu-unsupported COMMAND test-sycl-host-cpu-unsupported)
+    set_tests_properties(test-sycl-host-cpu-unsupported PROPERTIES LABELS "sycl;host" TIMEOUT 60)
 
     # The segment plan: a pure function of byte ranges, so this target links file-mapping.cpp alone (llama.cpp-5efe C3).
     # The planner sits outside file-mapping.cpp's POSIX guard and the test uses no POSIX header, so it builds everywhere.

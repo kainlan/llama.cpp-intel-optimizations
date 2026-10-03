@@ -3423,6 +3423,12 @@ if (Python3_Interpreter_FOUND)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-file-mapped-tier-source.py
         LABEL "sycl;host;python;source-contract"
         TIMEOUT 120)
+    # llama.cpp-th32 T1a: the HOST_CPU wrapper compiles everywhere and has one munmap.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-host-cpu-mapping-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-host-cpu-mapping-source.py
+        LABEL "sycl;host;python;source-contract"
+        TIMEOUT 120)
 endif()
 
 # llama.cpp-5efe C1: the per-model lazy-range record and its pre-fill, driven over

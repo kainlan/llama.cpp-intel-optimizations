@@ -28,9 +28,21 @@ enum class host_cpu_status : uint8_t {
     INVALID_ARGUMENT,  // a zero request, or one whose mapped size overflows
     MMAP_FAILED,       // the anonymous mmap failed (errno names why)
     LOCK_FAILED,       // mlock failed: refused as host-cpu-lock-failed (errno names why)
+    UNSUPPORTED,       // this build has no POSIX mapping (Windows): the tier is absent, nothing is mapped
 };
 
-// "ok", "invalid-argument", "host-cpu-map-failed" or "host-cpu-lock-failed".
+// Whether this build has the tier. host-cpu-mapping.cpp is compiled on every platform (the backend globs its sources),
+// but anonymous mmap, MADV_HUGEPAGE and mlock need POSIX, so on Windows the wrapper is a refusing stub and this is
+// false; the caller then refuses a must_host_cpu request by name instead of reaching a missing hook.
+constexpr bool host_cpu_supported() {
+#if defined(_WIN32)
+    return false;
+#else
+    return true;
+#endif
+}
+
+// "ok", "invalid-argument", "host-cpu-map-failed", "host-cpu-lock-failed" or "unsupported-platform".
 const char * host_cpu_status_name(host_cpu_status status);
 
 struct host_cpu_mapping {

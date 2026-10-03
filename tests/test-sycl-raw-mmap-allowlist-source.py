@@ -28,10 +28,11 @@ ROOT = Path(__file__).resolve().parents[1]
 SYCL_DIR = ROOT / "ggml/src/ggml-sycl"
 CONTRACT = ROOT / "docs/design/sycl-canonical-memory-architecture.md"
 
-# the wrapper translation units: any call in host-cpu-mapping.cpp; file-mapping.cpp is pinned to the calls of its four
-# wrappers, so a second release (or a second map) cannot be added unseen
-WRAPPER_TUS = {"host-cpu-mapping.cpp"}
+# the wrapper translation units, each pinned to the calls of its wrappers, so a second release (or a second map) cannot
+# be added unseen
 PINNED_WRAPPER_TUS = {
+    # the anonymous map, the advice, the lock, and the one munmap wrapper both the lock-failure unwind and the release use
+    "host-cpu-mapping.cpp": {"mmap": 1, "munmap": 1, "mlock": 1, "madvise": 1},
     # reserve + segment map, the one munmap wrapper, the lock, the advise
     "file-mapping.cpp": {"mmap": 2, "munmap": 1, "mlock": 1, "madvise": 1},
 }
@@ -85,7 +86,7 @@ def violations(files: dict) -> list:
     out = []
     for rel, src in sorted(files.items()):
         counts = calls_in(src)
-        if not counts or rel in WRAPPER_TUS:
+        if not counts:
             continue
         allowed = ALLOWED.get(rel, PINNED_WRAPPER_TUS.get(rel))
         if allowed is None:
@@ -137,6 +138,12 @@ def test_the_other_raw_page_calls_are_policed_too():
         files = tree_files()
         files["some-new-file.cpp"] = "void h() { %s(p, 0, 0); }\n" % call
         assert any(v.startswith("some-new-file.cpp") for v in violations(files)), call
+
+
+def test_a_second_munmap_in_the_host_cpu_tu_is_a_violation():
+    files = tree_files()
+    files["host-cpu-mapping.cpp"] += "\nvoid second_release(void * p) { munmap(p, 4096); }\n"
+    assert any(v.startswith("host-cpu-mapping.cpp") for v in violations(files)), violations(files)
 
 
 def test_an_extra_call_in_a_listed_file_is_a_violation():
