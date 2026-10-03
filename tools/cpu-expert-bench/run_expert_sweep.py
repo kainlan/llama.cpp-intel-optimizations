@@ -46,6 +46,9 @@ def parse_args():
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--from-csv", help="re-summarise an existing --out CSV instead of running")
+    ap.add_argument("--pairs", help="comma list of A:B variant pairs; prints a second CSV with the median over "
+                    "(round,burst) of A's burst median divided by B's burst median in the same burst, "
+                    "plus the 25th/75th percentile of that ratio, e.g. prod+pin:prod,prod+pin:vecdot+pin")
     ap.add_argument("extra", nargs="*", help="args after -- go to the bench binary")
     return ap.parse_args()
 
@@ -119,6 +122,28 @@ def summarise(rows):
               f"{statistics.median(g):.1f},{pct(g, 0.1):.1f},{g[0]:.1f},{bg:.1f},{ratio},{us:.0f},{len(g)}")
 
 
+def pair_ratios(rows, pairs):
+    recs = [dict(zip(HDR, r)) for r in rows]
+    cell = {}  # (shape,mat,type,threads,variant) -> {(round,burst): [gbps]}
+    for x in recs:
+        k = (x["shape"], x["mat"], x["type"], int(x["threads"]), x["variant"])
+        cell.setdefault(k, {}).setdefault((x["round"], x["burst"]), []).append(float(x["gbps"]))
+    med = {k: {b: statistics.median(v) for b, v in d.items()} for k, d in cell.items()}
+    print("shape,mat,type,threads,pair,ratio_median,ratio_p25,ratio_p75,n_bursts")
+    for k in sorted(med):
+        for pr in pairs:
+            va, vb = pr.split(":")
+            if k[4] != va:
+                continue
+            kb = k[:4] + (vb,)
+            if kb not in med:
+                continue
+            rs = sorted(med[k][b] / med[kb][b] for b in med[k] if b in med[kb])
+            if rs:
+                print(f"{k[0]},{k[1]},{k[2]},{k[3]},{pr},{statistics.median(rs):.2f},{pct(rs, 0.25):.2f},"
+                      f"{pct(rs, 0.75):.2f},{len(rs)}")
+
+
 def main():
     a = parse_args()
     if a.from_csv:
@@ -127,6 +152,9 @@ def main():
     else:
         rows = run_sweep(a)
     summarise(rows)
+    if a.pairs:
+        print()
+        pair_ratios(rows, a.pairs.split(","))
 
 
 if __name__ == "__main__":
