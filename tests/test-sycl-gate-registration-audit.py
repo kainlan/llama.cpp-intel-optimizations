@@ -44,7 +44,11 @@ Rules, per tests/test-sycl-*.py:
   R7  (only with --census BUILD_DIR) every registered gate is in the ctest files of that configured build, so a
       registration behind a configuration guard, in an uncalled function()/macro(), in an empty foreach() or in an
       unvisited directory cannot hide. Gates a default configuration legitimately lacks are in
-      CENSUS_ABSENT_ALLOWLIST with a reason.
+      CENSUS_ABSENT_ALLOWLIST with a reason;
+  R8  (only with --census BUILD_DIR) every ctest registration of that build whose command runs a .py file carries the
+      `python` label, as a whole member of its LABELS list. `ctest -L python` is the python census, and a registration
+      without the label is invisible to it (llama.cpp-gogg: 67 were, one of them red on master). This reads the
+      build's ctest files, so it covers .py files that are not tests/test-sycl-*.py and every registrar.
 
 Known limit: without --census this reads every CMakeLists.txt under the tree statically, so it does not know whether
 CMake reaches a registration. A registration in an uncalled function()/macro(), in a foreach() over an empty list,
@@ -1234,6 +1238,41 @@ def census(root, build_dir, absent_allowlist=None, tests_dir=None):
     return problems
 
 
+def label_census(build_dir):
+    """R8: every ctest registration of a configured build whose command runs a .py file carries the `python` label.
+
+    `ctest -L python` is the census of the host-only python gates; a registration without the label is invisible to it
+    (llama.cpp-gogg: 67 were, among them sycl-lifecycle-source-contract, which sat red on master while a merge claimed
+    "ctest -L python 116/116"). Read from the configured build's ctest files, so every registrar counts (add_test,
+    llama_test_pytest, llama_test_cmd, a function that calls one) and not only the spellings a CMakeLists.txt scan knows.
+    A .py command is any test with a .py token after the program; the label must be a whole member of the LABELS list
+    (`python-extra` is not `python`), and APPENDed or set_property labels count."""
+    scripts, labels, seen = {}, {}, False
+    for dirpath, dirnames, filenames in os.walk(build_dir):
+        dirnames[:] = [d for d in dirnames if d != "CMakeFiles"]
+        if "CTestTestfile.cmake" not in filenames:
+            continue
+        seen = True
+        for name, args in cmake_commands((Path(dirpath) / "CTestTestfile.cmake").read_text(errors="replace")):
+            if name == "add_test":
+                tokens = cmake_tokens(args)
+                script = next((tok for tok in tokens[1:] if tok.endswith(".py")), None)
+                if tokens and script:
+                    scripts[tokens[0]] = script
+            elif name in ("set_tests_properties", "set_property"):
+                names, pairs = _property_defects(name, args)
+                for test in names:
+                    for key, value in pairs:
+                        if key.upper() == "LABELS":
+                            labels.setdefault(test, set()).update(part for part in value.split(";") if part)
+    if not seen:
+        return ["R8 no CTestTestfile.cmake under %s: not a configured build, so the label census proves nothing" % build_dir]
+    return ["R8 %s runs %s but does not carry the `python` label (labels: %s): `ctest -L python` skips it, so a red there "
+            "is invisible to the python census (add python to its LABELS)"
+            % (test, script.rsplit("/", 1)[-1], ";".join(sorted(labels.get(test, ()))) or "none")
+            for test, script in sorted(scripts.items()) if "python" not in labels.get(test, ())]
+
+
 def _b(text):
     return 'add_test([=[b]=] ' + text + ')\n'
 
@@ -1350,6 +1389,67 @@ def census_self_test(base):
     return failures
 
 
+def label_census_self_test(base):
+    """The label census reports every shape of a .py registration without the `python` label, and nothing else."""
+    failures = []
+    build = base / "label-build"
+    ctest_file = build / "tests" / "CTestTestfile.cmake"
+    ctest_file.parent.mkdir(parents=True)
+
+    def run(text):
+        ctest_file.write_text(text)
+        return label_census(build)
+
+    py = '"/usr/bin/python3" "/x/tests/test-sycl-b.py"'
+    stub = '"/usr/bin/python3" "-c" "' + PYTEST_STUB_TEXT + '" "/x/tests/test-sycl-b.py"'
+    # Each of these runs a .py file and must be named.
+    for label, text in (
+            ("no LABELS at all", 'add_test([=[b]=] %s)\n' % py),
+            ("LABELS without python", 'add_test([=[b]=] %s)\nset_tests_properties([=[b]=] PROPERTIES  LABELS "sycl;host")\n' % py),
+            ("a label that merely contains python", 'add_test([=[b]=] %s)\nset_tests_properties([=[b]=] PROPERTIES  LABELS "python-extra;mypython")\n' % py),
+            ("llama_test_pytest's default `main` label", 'add_test([=[b]=] %s)\nset_tests_properties([=[b]=] PROPERTIES  LABELS "main" SKIP_RETURN_CODE "77")\n' % stub),
+            ("python labelled on another test only", 'add_test([=[b]=] %s)\nadd_test([=[c]=] %s)\nset_tests_properties([=[c]=] PROPERTIES  LABELS "python")\n' % (py, py.replace("sycl-b", "sycl-c"))),
+            ("a script run with a flag and an argument", 'add_test([=[b]=] "/usr/bin/python3" "-B" "/x/tests/test-sycl-b.py" "--self-test")\n'),
+            ("a script that is not a test-sycl gate", 'add_test([=[b]=] "/usr/bin/python3" "/x/scripts/some-audit.py")\n')):
+        problems = run(text)
+        if not any(p.startswith("R8 b ") for p in problems):
+            failures.append("label census: %s was not reported: %s" % (label, problems))
+    # And these must stay clean.
+    for label, text in (
+            ("LABELS python", 'add_test([=[b]=] %s)\nset_tests_properties([=[b]=] PROPERTIES  LABELS "python")\n' % py),
+            ("python among other labels", 'add_test([=[b]=] %s)\nset_tests_properties([=[b]=] PROPERTIES  LABELS "sycl;python;cache" TIMEOUT "60")\n' % py),
+            ("the pytest stub, python-labelled", 'add_test([=[b]=] %s)\nset_tests_properties([=[b]=] PROPERTIES  LABELS "sycl;python" SKIP_RETURN_CODE "77")\n' % stub),
+            ("python through set_property APPEND", 'add_test([=[b]=] %s)\nset_property(TEST b APPEND PROPERTY LABELS python)\n' % py),
+            ("a plain name for a bracketed test name", 'add_test([=[b]=] %s)\nset_tests_properties(b PROPERTIES  LABELS "python")\n' % py),
+            ("a test that runs no .py file", 'add_test([=[b]=] "/x/bin/test-mem-ops")\nadd_test([=[c]=] "/usr/bin/bash" "/x/tests/test-sycl-c.sh")\n')):
+        problems = run(text)
+        if problems:
+            failures.append("label census: %s was reported: %s" % (label, problems))
+    # Each unlabelled registration is named, and only those.
+    problems = run('add_test([=[a]=] %s)\nset_tests_properties([=[a]=] PROPERTIES  LABELS "python")\n'
+                   'add_test([=[b]=] %s)\nadd_test([=[c]=] %s)\n' % (py.replace("sycl-b", "sycl-a"), py, py.replace("sycl-b", "sycl-c")))
+    if len(problems) != 2 or any(p.startswith("R8 a ") for p in problems):
+        failures.append("label census: wanted exactly b and c reported, got %s" % problems)
+    # A registration in a nested directory's ctest file is read as well.
+    ctest_file.write_text('add_test([=[a]=] %s)\nset_tests_properties([=[a]=] PROPERTIES  LABELS "python")\n' % py.replace("sycl-b", "sycl-a"))
+    nested = build / "ggml" / "src"
+    nested.mkdir(parents=True)
+    (nested / "CTestTestfile.cmake").write_text('add_test([=[n]=] %s)\n' % py)
+    if not any(p.startswith("R8 n ") for p in label_census(build)):
+        failures.append("label census: an unlabelled registration in a nested ctest file was not reported")
+    empty = base / "label-empty"
+    empty.mkdir()
+    if not any("not a configured build" in p for p in label_census(empty)):
+        failures.append("label census: an empty build directory passed")
+    # main() must act on it: the script itself exits 1 on a build whose registration lacks the label.
+    done = subprocess.run([sys.executable, os.path.abspath(__file__), "--census", str(build)], capture_output=True, text=True,
+                          timeout=120)
+    if done.returncode != 1 or "R8 n " not in done.stdout:
+        failures.append("label census: `--census <build with an unlabelled .py test>` exited %d (want 1) with output %r"
+                        % (done.returncode, done.stdout[-200:]))
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true", help="also prove the audit fails on planted violations")
@@ -1359,13 +1459,15 @@ def main():
     root = Path(__file__).resolve().parents[1]
     problems = audit(root, min_gates=MIN_GATES)
     if args.census:
-        problems = problems + census(root, args.census)
+        problems = problems + census(root, args.census) + label_census(args.census)
     for problem in problems:
         print("FAIL " + problem)
     if args.self_test:
         failures = self_test()
         with tempfile.TemporaryDirectory(prefix="gate-census-") as raw:
             failures += census_self_test(Path(raw))
+        with tempfile.TemporaryDirectory(prefix="gate-labels-") as raw:
+            failures += label_census_self_test(Path(raw))
         for failure in failures:
             print("SELF-TEST FAIL " + failure)
         problems = problems + failures
