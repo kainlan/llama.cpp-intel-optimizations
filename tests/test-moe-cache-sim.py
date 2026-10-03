@@ -315,11 +315,43 @@ def test_same_trace_in_train_and_test_is_refused(tmp_path):
             "--uniform-expert-bytes", f"f={GIB}:1:4", "--budget-mib-per-layer", "1024"]
     with pytest.raises(SystemExit):
         sim.main(argv)
-    # by id, with the files differing: the same capture id is still the same trace
+    # a copy of the capture under another name: same id, same routing
     q = tmp_path / "copy.moetrace"
-    sim.write_trace(q, {"set": "a", "id": "a", "n_expert": 4}, [(0, 0, 1, [[2, 3]])])
-    with pytest.raises(ValueError, match="both train and test"):
+    sim.write_trace(q, {"set": "a", "id": "a", "n_expert": 4}, [(0, 0, 1, [[0, 1]])])
+    with pytest.raises(ValueError, match="rename --trace-id"):
         sim.check_disjoint([sim.read_trace(p)], [sim.read_trace(q)])
+
+
+def test_same_id_in_two_capture_directories_is_not_the_same_trace(tmp_path):
+    # capture.sh takes the id from the prompt file name, so the IQ3 and Q8 runs
+    # of one prompt, or two capture directories, share it. Different routing.
+    one = tmp_path / "iq3" / "code-0.moetrace"
+    two = tmp_path / "q8" / "code-0.moetrace"
+    one.parent.mkdir()
+    two.parent.mkdir()
+    sim.write_trace(one, {"set": "code", "id": "code-0", "n_expert": 4},
+                    [(0, 0, 1, [[0, 1]]), (1, 0, 1, [[0, 2]])])
+    sim.write_trace(two, {"set": "code", "id": "code-0", "n_expert": 4},
+                    [(0, 0, 1, [[0, 1]]), (1, 0, 1, [[1, 3]])])
+    sim.check_disjoint([sim.read_trace(one)], [sim.read_trace(two)])   # no raise
+    # and a different number of steps is trivially different
+    three = tmp_path / "q8" / "code-1.moetrace"
+    sim.write_trace(three, {"set": "code", "id": "code-0", "n_expert": 4},
+                    [(0, 0, 1, [[0, 1]])])
+    sim.check_disjoint([sim.read_trace(one)], [sim.read_trace(three)])
+
+
+def test_leave_one_out_validates_the_traces_once(monkeypatch):
+    calls = []
+    real = sim.validate_traces
+    monkeypatch.setattr(sim, "validate_traces",
+                        lambda traces, sizes_by_format: (calls.append(len(traces)),
+                                                          real(traces, sizes_by_format))[1])
+    traces = [decode_trace([[0, 1]], set_name=n) for n in ("a", "b", "c")]
+    sim.sweep_loo({"f": sizes({0: GIB})}, traces, [2 * GIB], "decode",
+                  dict(swap_n=96, every=4, decay=0.7, min_count=2.0,
+                       margin=1.5, land_delay=1))
+    assert calls == [3]
 
 
 def test_leave_one_out_refuses_missing_unset_and_duplicate_keys():

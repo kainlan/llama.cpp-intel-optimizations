@@ -11,6 +11,8 @@
 # never run two copies at once. A failing prompt is reported with its real exit code
 # and the loop goes on; the script exits 1 if any prompt failed.
 #
+# ----- notes below are not part of the usage text -----
+#
 # This is a thin loop and starts no GPU work itself: whether the run is CPU-only or
 # SYCL is decided by the build the binary came from and by the extra arguments
 # (-ngl, ONEAPI_DEVICE_SELECTOR in the environment).
@@ -23,7 +25,7 @@
 set -o pipefail
 
 usage() {
-    awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0" >&2
+    awk 'NR > 1 && /^# ----- notes/ { exit } NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0" >&2
 }
 
 if [ $# -lt 3 ]; then

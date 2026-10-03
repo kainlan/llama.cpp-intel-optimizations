@@ -180,8 +180,12 @@ def _same_trace(a, b):
         return True
     if a.path and b.path and os.path.realpath(a.path) == os.path.realpath(b.path):
         return True
+    # A capture id comes from the prompt file name (capture.sh), so two capture
+    # directories, or the IQ3 and Q8 runs of one prompt, legitimately share it.
+    # Equal ids only mean the same trace when the routing is identical too.
     ia, ib = a.header.get("id"), b.header.get("id")
-    return ia is not None and str(ia) not in ("", "unset") and ia == ib
+    return (ia is not None and str(ia) not in ("", "unset") and ia == ib
+            and a.steps == b.steps)
 
 
 def check_disjoint(train, test):
@@ -189,9 +193,11 @@ def check_disjoint(train, test):
         for r in train:
             if _same_trace(r, t):
                 raise ValueError(
-                    f"trace {t.path or trace_id(t)} is in both train and test: "
-                    "a profile scored on its own training data is the oracle, "
-                    "not a held-out result")
+                    f"trace {t.path or trace_id(t)} is in both train and test "
+                    f"(same object, same file, or same --trace-id "
+                    f"{trace_id(t)!r} with identical routing: rename --trace-id "
+                    "if these are different captures): a profile scored on its "
+                    "own training data is the oracle, not a held-out result")
 
 
 def validate_traces(traces, sizes_by_format):
@@ -437,9 +443,13 @@ def _budget_label(budget_bytes):
 
 
 def sweep(sizes_by_format, train, test, budgets_bytes_per_layer, phase, adapt,
-          test_set=None):
+          test_set=None, validate=True):
+    """validate=False: the caller has already run validate_traces (sweep_loo
+    does, once, instead of once per group over traces that can hold millions of
+    ids)."""
     check_disjoint(train, test)
-    validate_traces(list(train) + list(test), sizes_by_format)
+    if validate:
+        validate_traces(list(train) + list(test), sizes_by_format)
     rows = []
     if test_set is None:
         test_set = "+".join(sorted({trace_set(t) for t in test}))
@@ -485,6 +495,7 @@ def sweep_loo(sizes_by_format, traces, budgets_bytes_per_layer, phase, adapt,
     by="set" holds out a whole prompt set (code vs chat vs long: does a profile
     transfer across kinds of text); by="id" holds out one trace (Strata's
     leave-one-prompt-out, where the other traces of the same set stay in)."""
+    validate_traces(traces, sizes_by_format)
     keys = [_group_key(t, by) for t in traces]
     if by == "id" and len(set(keys)) != len(keys):
         dup = sorted({k for k in keys if keys.count(k) > 1})
@@ -494,7 +505,7 @@ def sweep_loo(sizes_by_format, traces, budgets_bytes_per_layer, phase, adapt,
         test = [t for t, k in zip(traces, keys) if k == held]
         train = [t for t, k in zip(traces, keys) if k != held]
         rows += sweep(sizes_by_format, train, test, budgets_bytes_per_layer,
-                      phase, adapt, test_set=held)
+                      phase, adapt, test_set=held, validate=False)
     return rows
 
 
