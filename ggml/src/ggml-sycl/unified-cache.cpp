@@ -16016,6 +16016,12 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         GGML_LOG_ERROR("[UNIFIED-ALLOC] invalid request: must_host_cpu is set with must_device or must_host_pinned\n");
         return false;
     }
+    // an anonymous mapping is page aligned and no more: refuse what it cannot give, never hand back a mismatch
+    if (req.intent.constraints.must_host_cpu && req.alignment > HOST_CPU_MAX_ALIGNMENT) {
+        GGML_LOG_ERROR("[UNIFIED-ALLOC] invalid request: must_host_cpu with alignment=%zu (a mapping gives %zu)\n",
+                       req.alignment, HOST_CPU_MAX_ALIGNMENT);
+        return false;
+    }
 
     // Phase gate: block new unified_alloc() calls during steady-state inference.
     // All memory must be pre-allocated during LOAD/WARMUP phases.
@@ -17122,7 +17128,8 @@ static allocation_result unified_allocate_owner_impl(const alloc_request & req, 
             (req.alignment != 0 && (req.alignment & (req.alignment - 1)) != 0) ||
             (req.intent.constraints.must_device && req.intent.constraints.must_host_pinned) ||
             (req.intent.constraints.must_host_cpu &&
-             (req.intent.constraints.must_device || req.intent.constraints.must_host_pinned)) ||
+             (req.intent.constraints.must_device || req.intent.constraints.must_host_pinned ||
+              req.alignment > HOST_CPU_MAX_ALIGNMENT)) ||
             (internal_cache_backing &&
              (!req.intent.constraints.require_host_usm_base || !req.intent.constraints.must_host_pinned))) {
             result.error = allocation_error::INVALID_REQUEST;

@@ -1198,8 +1198,9 @@ only the CPU reads.
   release coordinator); `unified_free_record` releases it ahead of every other branch,
   sized by `host_cpu_mapped_size(handle.size)`. The owner entry keeps the class
   `EXTERNAL_EXACT` whatever role rides with the request and refuses `must_host_cpu`
-  beside `must_device` or `must_host_pinned` as `INVALID_REQUEST`; that refusal table
-  is partial and T2-pending: T2 widens it to every listed routing constraint and adds
+  beside `must_device` or `must_host_pinned`, or with an `alignment` past
+  `HOST_CPU_MAX_ALIGNMENT` (one page: a mapping gives no more), as `INVALID_REQUEST`;
+  that refusal table is partial and T2-pending: T2 widens it to every listed routing constraint and adds
   the charge. The census: every switch that
   names `FILE_MAPPED` names `HOST_CPU` (ten sites over `alloc_tier` and `alloc_type`),
   `mem_handle::resolve(device)` is empty for a `HOST_CPU` owner, and the sites that hand

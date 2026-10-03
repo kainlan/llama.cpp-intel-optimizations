@@ -1070,11 +1070,11 @@ resolved_ptr mem_handle::resolve(int device_id) const {
         // DEVICE_VRAM on_device), so the dispatched device weights, the hot case, take no second lock round. A slice
         // shares its owner.
         mem_handle_lock_guard g(lock_);
-        if (owned_alloc_ && owned_alloc_.metadata().tier == alloc_tier::FILE_MAPPED) {
-            return {};
-        }
-        if (owned_alloc_ && owned_alloc_.metadata().tier == alloc_tier::HOST_CPU) {
-            return {};
+        if (owned_alloc_) {
+            const alloc_tier tier = owned_alloc_.metadata().tier;
+            if (tier == alloc_tier::FILE_MAPPED || tier == alloc_tier::HOST_CPU) {
+                return {};
+            }
         }
         return r;
     }

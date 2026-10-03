@@ -24,6 +24,11 @@
 
 namespace ggml_sycl {
 
+// The largest alignment a HOST_CPU request may ask for: one 4 KiB page, which is all an anonymous mmap guarantees
+// (2 MiB only by the kernel >= 6.7 behaviour above, which no request may count on). The front doors refuse a request
+// that asks for more as INVALID_REQUEST rather than hand back a pointer that is not aligned as asked.
+constexpr size_t HOST_CPU_MAX_ALIGNMENT = 4096;
+
 // The one sizing function: the bytes the wrapper maps, the owner entry charges and the plan's HOST terms count for a
 // request of `request_bytes`. Rounded up to whole 2 MiB huge pages (which are whole pages), at least one. 0 on
 // overflow, which no caller may pass on.

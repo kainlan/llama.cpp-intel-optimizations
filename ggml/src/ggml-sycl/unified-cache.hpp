@@ -5885,7 +5885,7 @@ struct alloc_constraints {
     bool         must_host_pinned           = false;
     // HOST_CPU (llama.cpp-th32 T1): host memory only the CPU reads, locked. Selects the tier and nothing else: the
     // owner entry refuses it beside must_device or must_host_pinned, and no tier falls into or out of it.
-    bool         must_host_cpu               = false;
+    bool         must_host_cpu              = false;
     bool         prefer_same_tier_as_cohort = false;
     bool         use_pinned_pool            = false;
     // Refuse dynamic host-zone growth for planner-bounded staging pools. A

@@ -372,8 +372,9 @@ of it: a request that cannot be mapped or locked is refused by name
 (`host-cpu-lock-failed`), never served from another tier. The owner is classified
 `EXTERNAL_EXACT` whatever role or placement field rides with it, so the two-site
 `CACHE_BACKING` allowlist of §3.1 is untouched; `must_host_cpu` beside `must_device` or
-`must_host_pinned` is `INVALID_REQUEST` before any control is minted. `unified_alloc`
-calls `unified_cache_raw_alloc_host_cpu` once and takes no queue; `unified_free_record`
+`must_host_pinned`, or an `alignment` above `HOST_CPU_MAX_ALIGNMENT` (one 4 KiB page,
+all an anonymous mapping guarantees), is `INVALID_REQUEST` before any control is minted.
+`unified_alloc` calls `unified_cache_raw_alloc_host_cpu` once and takes no queue; `unified_free_record`
 calls `unified_cache_raw_free_host_cpu` once, ahead of every other branch, sized by
 `host_cpu_mapped_size(handle.size)`. No lock is held across either call: the lock
 faults every page in before it returns. The tier is host-accessible and not

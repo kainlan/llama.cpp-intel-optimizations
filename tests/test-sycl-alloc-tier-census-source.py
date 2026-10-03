@@ -362,14 +362,25 @@ def test_the_lock_scope_reader_sees_an_open_lock_and_ignores_a_closed_one():
 def test_host_cpu_refuses_an_alignment_beyond_a_page_at_both_entries():
     hpp = strip_comments((SYCL_DIR / "host-cpu-mapping.hpp").read_text())
     assert re.search(r"HOST_CPU_MAX_ALIGNMENT\s*=\s*4096\b", hpp), "no HOST_CPU alignment cap of one 4 KiB page"
+    # the check stands alone as a condition, so nothing short-circuits it
+    sites = (
+        (
+            "unified_alloc",
+            r"bool\s+unified_alloc\s*\(\s*const\s+alloc_request\s*&\s+req_in,",
+            r"\bif\s*\(\s*[\w.]*must_host_cpu\s*&&\s*[\w.]*\balignment\s*>\s*HOST_CPU_MAX_ALIGNMENT\s*\)",
+        ),
+        (
+            "the owner entry",
+            r"static\s+allocation_result\s+unified_allocate_owner_impl\s*\(",
+            r"\(\s*[\w.]*must_host_cpu\s*&&\s*\([^;{]*?\|\|\s*[\w.]*\balignment\s*>\s*"
+            r"HOST_CPU_MAX_ALIGNMENT\s*\)\s*\)",
+        ),
+    )
     cache = sources_text("unified-cache.cpp")
-    pattern = r"must_host_cpu\s*&&\s*[\w.]*alignment\s*>\s*HOST_CPU_MAX_ALIGNMENT"
-    for name, header in (
-        ("unified_alloc", r"bool\s+unified_alloc\s*\(\s*const\s+alloc_request\s*&\s+req_in,"),
-        ("the owner entry", r"static\s+allocation_result\s+unified_allocate_owner_impl\s*\("),
-    ):
-        body = function_body(cache, header)
-        assert re.search(pattern, body), f"{name} does not refuse a HOST_CPU alignment beyond the cap"
+    for name, header, pattern in sites:
+        assert re.search(pattern, function_body(cache, header)), (
+            f"{name} does not refuse a HOST_CPU alignment beyond the cap"
+        )
 
 
 def test_the_owner_entry_refuses_the_combination_and_keeps_the_class_exact():
