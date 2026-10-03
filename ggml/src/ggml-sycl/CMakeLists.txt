@@ -190,10 +190,10 @@ if (BUILD_TESTING)
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-file-mapping-residency.cpp
         file-mapping.cpp)
     target_include_directories(test-sycl-file-mapping-residency PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_definitions(test-sycl-file-mapping-residency PRIVATE RESIDENCY_FIXTURE_DIR=\"${CMAKE_BINARY_DIR}\")
     set_target_properties(test-sycl-file-mapping-residency PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-    add_test(NAME test-sycl-file-mapping-residency COMMAND test-sycl-file-mapping-residency)
+    # the fixture directory is the build directory, passed as argv[1]
+    add_test(NAME test-sycl-file-mapping-residency COMMAND test-sycl-file-mapping-residency ${CMAKE_BINARY_DIR})
     set_tests_properties(test-sycl-file-mapping-residency PROPERTIES
         LABELS "sycl;host"
         SKIP_RETURN_CODE 77

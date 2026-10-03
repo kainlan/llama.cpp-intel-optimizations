@@ -3441,9 +3441,8 @@ endforeach()
 # (not tmpfs); the test measures the page cache of the file with cachestat(2) and exits 77
 # when it cannot evict or RLIMIT_MEMLOCK is too small. Host-only: no backend, no device.
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    llama_build_and_test(test-llama-mlock-ranged.cpp)
+    llama_build_and_test(test-llama-mlock-ranged.cpp ARGS ${CMAKE_BINARY_DIR})
     target_include_directories(test-llama-mlock-ranged PRIVATE ${PROJECT_SOURCE_DIR}/src)
-    target_compile_definitions(test-llama-mlock-ranged PRIVATE RESIDENCY_FIXTURE_DIR=\"${CMAKE_BINARY_DIR}\")
     set_tests_properties(test-llama-mlock-ranged PROPERTIES
         LABELS "host;lazy"
         SKIP_RETURN_CODE 77

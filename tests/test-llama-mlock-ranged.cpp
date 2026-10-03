@@ -32,9 +32,6 @@
 #include <string>
 #include <vector>
 
-#ifndef RESIDENCY_FIXTURE_DIR
-#    define RESIDENCY_FIXTURE_DIR "."
-#endif
 #ifndef __NR_cachestat
 #    define __NR_cachestat 451
 #endif
@@ -64,6 +61,9 @@ struct cs_stat {
 };
 
 static uint64_t g_page = 0;
+
+// the fixture directory: argv[1], the build directory under ctest (never tmpfs)
+static const char * g_fixture_dir = ".";
 
 // Resident pages of [off, off + len) of the FILE; -1 if no probe works.
 static int64_t resident_pages(int fd, uint64_t off, uint64_t len) {
@@ -161,7 +161,10 @@ template <typename F> static run_result run(int fd, F lock) {
     return res;
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    if (argc > 1) {
+        g_fixture_dir = argv[1];
+    }
     g_page = (uint64_t) sysconf(_SC_PAGESIZE);
 
     struct rlimit rl = {};
@@ -170,12 +173,12 @@ int main() {
         return 77;
     }
 
-    std::string       path = std::string(RESIDENCY_FIXTURE_DIR) + "/llama-mlock-ranged-XXXXXX";
+    std::string       path = std::string(g_fixture_dir) + "/llama-mlock-ranged-XXXXXX";
     std::vector<char> tmpl(path.begin(), path.end());
     tmpl.push_back('\0');
     const int w = mkstemp(tmpl.data());
     if (w < 0) {
-        std::fprintf(stderr, "SKIP: cannot create the fixture under %s\n", RESIDENCY_FIXTURE_DIR);
+        std::fprintf(stderr, "SKIP: cannot create the fixture under %s\n", g_fixture_dir);
         return 77;
     }
     path = tmpl.data();

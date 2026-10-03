@@ -37,9 +37,6 @@
 
 using namespace ggml_sycl;
 
-#ifndef RESIDENCY_FIXTURE_DIR
-#    define RESIDENCY_FIXTURE_DIR "."
-#endif
 #ifndef __NR_cachestat
 #    define __NR_cachestat 451
 #endif
@@ -49,6 +46,9 @@ namespace {
 constexpr uint64_t MiB = 1024ull * 1024;
 
 uint64_t g_page = 0;
+
+// the fixture directory: argv[1], the build directory under ctest (never tmpfs)
+const char * g_fixture_dir = ".";
 
 // ---- results ----
 
@@ -90,7 +90,7 @@ struct fixture {
     fixture & operator=(const fixture &) = delete;
 
     bool create() {
-        path = std::string(RESIDENCY_FIXTURE_DIR) + "/file-mapping-residency-XXXXXX";
+        path = std::string(g_fixture_dir) + "/file-mapping-residency-XXXXXX";
         std::vector<char> tmpl(path.begin(), path.end());
         tmpl.push_back('\0');
         const int w = mkstemp(tmpl.data());
@@ -524,11 +524,14 @@ void arm4_pread_control(const fixture & f) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    if (argc > 1) {
+        g_fixture_dir = argv[1];
+    }
     g_page = (uint64_t) sysconf(_SC_PAGESIZE);
     fixture f;
     if (!f.create()) {
-        std::fprintf(stderr, "SKIP: cannot create the fixture under %s\n", RESIDENCY_FIXTURE_DIR);
+        std::fprintf(stderr, "SKIP: cannot create the fixture under %s\n", g_fixture_dir);
         return 77;
     }
     std::printf("fixture %s, read_ahead = %llu KiB, page = %llu\n", f.path.c_str(),
