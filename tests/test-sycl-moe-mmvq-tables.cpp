@@ -261,7 +261,7 @@ int main() {
     //    type, and admitting everything are all CAUGHT by the checks above.
     //    Dropping the predicate's capability axis entirely is NOT caught, and
     //    cannot be, because moe_mmvq_batched_dispatch_supports_type and the
-    //    capability table cover exactly the same 13 types today -- so the two
+    //    capability table cover exactly the same 14 types today -- so the two
     //    axes are indistinguishable by population. The second axis is therefore
     //    defensive, not gated here; what keeps the sets coinciding is the subset
     //    invariant in section 3. Do not add a control that "proves" the axis by

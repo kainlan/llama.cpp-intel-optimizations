@@ -17320,6 +17320,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
             }
             have_kernel_event = true;
             break;
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -22128,6 +22129,7 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             }
             have_kernel_event = true;
             break;
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -23395,6 +23397,17 @@ bool mmvq_submit_quant_aos_id(sycl::queue &                    q,
 
     sycl::event event;
     switch (weight_type) {
+        case GGML_TYPE_IQ4_NL:
+            // Same body as the dense mul_mat_vec_q_iq4_nl_q8_1 (QK4_NL, QI4_NL, vdr 2): the generic
+            // _id kernel with the IQ4_NL vec_dot, which has the generic vec_dot_q_sycl_t signature.
+            if (ncols % QK4_NL != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ4_NL, QK4_NL, QI4_NL, block_iq4_nl, VDR_Q4_0_Q8_1_MMVQ,
+                                            vec_dot_iq4_nl_q8_1>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
         case GGML_TYPE_Q4_1:
             if (ncols % QK4_1 != 0) {
                 return false;
