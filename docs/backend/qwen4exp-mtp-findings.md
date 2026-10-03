@@ -21,8 +21,10 @@ not our placement.
 **Neither local GGUF has an MTP head.**
 - Unsloth Q8_0 (6 splits): 1224 tensors, `blk.0` to `blk.47` only, no `nextn.*`, no
   `qwen4exp.nextn_predict_layers` key. `n_layer_all == n_layer`, so the loader's MTP path stays inert.
-- ISTA-DASLab GSQ-RCO IQ3_XXS: the repo's allocation file lists 1223 tensors, `blk.0` to `blk.47`, no
-  nextn/mtp (re-checked on the real file once the download landed; see the end of this document).
+- ISTA-DASLab GSQ-RCO IQ3_XXS (2 splits, 47.0 + 28.8 GB, downloaded 2026-10-03): dumped from the real
+  files, 1224 tensors (`split.tensors.count` = 1224), `blk.0` to `blk.47`, zero nextn/mtp/eh_proj/enorm/
+  hnorm/shared_head matches, `block_count = 48`, no `nextn_predict_layers`. Mixed per-tensor types (BF16 dense
+  tensors, IQ2/IQ3/IQ4 and 38 Q2_0 tensors, Q4_K/Q5_K/Q6_K); `general.file_type = 23`.
 
 **The head is a separate sidecar GGUF**, not embedded: ggml-org/Qwen3.8-Flash-Next-GGUF
 `mtp-Qwen3.8-Flash-Next-{Q8_0 (4.14 GB), Q4_0 (2.20 GB), BF16 (7.77 GB)}.gguf`. Self-contained: it carries
@@ -30,6 +32,15 @@ not our placement.
 projection; the merged code does not support borrowing ("needs requants" per the PR thread), so use the
 ggml-org files. They work with any quant of the target: the head consumes only the trunk's residual and the
 next token.
+
+**What the head file contains** (dumped, ggml-org `mtp-...-Q8_0.gguf`, 4,137,429,280 B, 34 tensors):
+`general.architecture = qwen4exp`, `block_count = 49`, `nextn_predict_layers = 1`, `compress_ratios` and
+`recurrent_layers` with 49 entries (block 48: ratio 4, not recurrent, so QSA full attention). Tensors:
+`token_embd` and `output` (635.7 M elements each, Q8_0), and `blk.48.*` only: attention q/k/v/o and norms, the
+indexer (BF16), MoE `ffn_{gate,up,down}_exps` (512 experts, 2.5 G elements together), the shared expert, the
+two hc modules, and `blk.48.nextn.{eh_proj,enorm,hnorm,hc_head_norm,hc_head_down,hc_head_up}` -- exactly the
+names the port registers. The Q4_0 head has the same 34 tensors. Downloaded to
+`/models/Qwen3.8-Flash-Next-MTP/`.
 
 **Architecture** (from the port): one block, `n_layer_nextn == 1`: a full-attention QSA layer with its own
 indexer cache, plus a MoE FFN (512 experts, top 10, like a trunk layer), fed by `eh_proj([enorm(tok_embd);
