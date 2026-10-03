@@ -23900,6 +23900,16 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx,
             }
         }
         if (!result.ok) {
+            // llama.cpp-5efe C4: stream_dma refused a file-mapped source (a host-tier weight, which executes on the
+            // CPU, never streams to a device). Routed explicitly, not through mmap_direct_failed.
+            if (result.refused_file_mapped) {
+                GGML_LOG_WARN("[MMVQ] stream_dma refused a file-mapped weight, running on the CPU (%s)\n",
+                              src0->name ? src0->name : "unknown");
+                if (ggml_sycl_cpu_fallback_graph(ctx, dst, "mmvq streaming refused")) {
+                    return;
+                }
+                GGML_ABORT("MMVQ streaming refused a file-mapped weight and the CPU fallback failed");
+            }
             if (result.mmap_direct_failed) {
                 GGML_LOG_WARN("[MMVQ] DMA from mmap failed, falling back to CPU (%s)\n",
                               src0->name ? src0->name : "unknown");

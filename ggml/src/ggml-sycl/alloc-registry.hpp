@@ -162,6 +162,14 @@ class alloc_registry {
         return info && info->type == alloc_type::DEVICE;
     }
 
+    // Convenience: is this pointer (or an interior pointer of it) a file mapping? A file mapping is CPU-only and no
+    // device may read it (llama.cpp-5efe C4; unified_cache::stream_dma refuses it). Returns false for a null or an
+    // unregistered pointer.
+    bool is_file_mapped(const void * ptr) const {
+        const auto info = lookup_copy(ptr);
+        return info && info->type == alloc_type::FILE_MAPPED;
+    }
+
     // Convenience: get the sycl::usm::alloc equivalent for compatibility with existing code.
     // Note: this header does NOT include sycl.hpp — callers must convert.
     alloc_type get_alloc_type(const void * ptr) const {

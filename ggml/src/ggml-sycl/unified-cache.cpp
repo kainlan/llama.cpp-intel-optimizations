@@ -14833,6 +14833,13 @@ bool unified_cache::get_dma_staging_buffers(size_t slice_bytes, size_t count, dm
     return true;
 }
 
+// llama.cpp-5efe C4: stream_dma's refusals of a file-mapped source, process-wide.
+static std::atomic<uint64_t> g_stream_dma_file_mapped_refusals{ 0 };
+
+uint64_t unified_cache_stream_dma_file_mapped_refusals() noexcept {
+    return g_stream_dma_file_mapped_refusals.load(std::memory_order_relaxed);
+}
+
 unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view &           src,
                                                            size_t                           total_bytes,
                                                            size_t                           slice_bytes,
@@ -14844,6 +14851,16 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
     dma_stream_result result{};
     result.queue = &queue_;
     if (!src.ptr || !slice_fn) {
+        return result;
+    }
+
+    // A file mapping is never read by a device: a mapped page is not USM, so a device read is at best a slow
+    // driver-staged copy and at worst a device loss, and streaming host-tier weights is forbidden outright (design 5efe
+    // §5.3, P3). A typed, counted refusal, checked before everything else so a custom copy_fn is covered too. The
+    // caller routes it to the CPU executor.
+    if (alloc_registry::instance().is_file_mapped(src.ptr)) {
+        result.refused_file_mapped = true;
+        g_stream_dma_file_mapped_refusals.fetch_add(1, std::memory_order_relaxed);
         return result;
     }
 

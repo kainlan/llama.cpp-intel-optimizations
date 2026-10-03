@@ -107,7 +107,8 @@ def test_stream_dma_refuses_a_file_mapped_source_at_entry():
     ):
         hit = re.search(later, body)
         assert hit and refuse.start() < hit.start(), f"the refusal is not before {later!r}"
-    block = body[refuse.start() : refuse.start() + 600]
+    # the `if (...) { ... }` whose condition is the registry test: its own block, not whatever follows it
+    block = balanced(body, body.index("{", refuse.end()))
     assert re.search(
         r"result\s*\.\s*refused_file_mapped\s*=\s*true\s*;", block
     ), "the refusal does not set the typed flag"
@@ -194,9 +195,11 @@ def test_the_loop_breaks_on_a_refusal_before_its_retry_test():
     src = loop_header()
     body = function_body(src, r"get_rows_dma_retry\s*\([^)]*\)")
     refused = re.search(r"\.\s*refused_file_mapped", body)
-    retry = re.search(r"should_retry|device_oom|next_slice", body)
+    retry = re.search(r"min_slice_bytes|next_slice", body)
     assert refused and retry and refused.start() < retry.start(), "the refusal is not tested before the retry decision"
-    block = body[refused.start() : refused.start() + 300]
+    cond = re.compile(r"if\s*\(\s*result\s*\.\s*refused_file_mapped\s*\)\s*\{").search(body)
+    assert cond, "the loop has no `if (result.refused_file_mapped) {` of its own"
+    block = balanced(body, cond.end() - 1)
     assert re.search(r"\bbreak\s*;", block), "a refusal does not break the loop"
 
 

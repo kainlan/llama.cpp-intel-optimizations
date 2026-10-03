@@ -3842,6 +3842,10 @@ class unified_cache {
         bool          submitted          = false;
         bool          used_mmap_direct   = false;
         bool          mmap_direct_failed = false;
+        // llama.cpp-5efe C4: the source is a file mapping (alloc_registry::is_file_mapped), which no device may read
+        // (design 5efe §5.3, P3). A typed, counted refusal checked at entry, before copy_fn: it is deterministic, so a
+        // caller never retries it at a smaller slice, and routes it to the CPU executor (a host-tier weight runs there).
+        bool          refused_file_mapped = false;
         size_t        slices             = 0;
         size_t        slice_bytes        = 0;
         size_t        buffer_count       = 0;
@@ -7169,6 +7173,10 @@ void zone_reset_audit_report(const char * where);
 // The returned pointer is VRAM (device-local) and must NOT be freed individually —
 // it is owned by the arena and released when the arena is destroyed.
 void * unified_cache_kv_arena_alloc(int device_id, size_t size);
+
+// llama.cpp-5efe C4: how many times stream_dma refused a file-mapped source (design 5efe §5.3). A refusal means
+// dispatch routed a host-tier weight to a device kernel, so a correct build reads 0.
+uint64_t unified_cache_stream_dma_file_mapped_refusals() noexcept;
 
 // Reserve the inference scratch pool on a device.
 bool unified_cache_reserve_scratch_pool(int device_id, size_t pool_bytes);

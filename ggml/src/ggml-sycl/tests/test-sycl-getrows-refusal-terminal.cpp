@@ -93,12 +93,6 @@ static get_rows_dma_attempt ok() {
     return a;
 }
 
-static get_rows_dma_attempt oom() {
-    get_rows_dma_attempt a;
-    a.device_oom = true;
-    return a;
-}
-
 static void test_a_refusal_is_one_call_one_count_no_retry_line() {
     printf("(a) a refusal: one stream_dma call, one counted refusal, no retry line\n");
     fake_stream_dma dma;
@@ -133,7 +127,8 @@ static void test_ordinary_failures_still_halve_and_retry() {
     retry_log log;
     const get_rows_dma_outcome out = run(dma, log, 64 * MiB, 1 * MiB, 2);
     check_eq("stream_dma calls", dma.calls, 3);
-    check_eq("retry lines", log.lines, 2);
+    // the loop logs before it learns the limit is spent, so three failed attempts print three lines (as it always did)
+    check_eq("retry lines", log.lines, 3);
     check_true("not refused, not streamed", !out.refused_file_mapped && !out.streamed_ok);
     check_eq("first slice", dma.slices[0], 64 * MiB);
     check_eq("second slice", dma.slices[1], 32 * MiB);
@@ -143,15 +138,30 @@ static void test_ordinary_failures_still_halve_and_retry() {
 }
 
 static void test_a_classified_device_oom_retries_and_success_ends_the_loop() {
-    printf("(d) a device out-of-memory retries at a smaller slice, and success ends the loop\n");
+    printf("(d) an attempt that did not stream (a classified device out-of-memory) retries smaller; success ends it\n");
     fake_stream_dma dma;
-    dma.script = { oom(), ok() };
+    dma.script = { failed(), ok() };
     retry_log log;
     const get_rows_dma_outcome out = run(dma, log, 64 * MiB, 1 * MiB, 2);
     check_eq("stream_dma calls", dma.calls, 2);
     check_eq("retry lines", log.lines, 1);
     check_true("streamed", out.streamed_ok && !out.refused_file_mapped);
     check_eq("final slice", out.final_slice_bytes, 32 * MiB);
+}
+
+// The loop's own floor test, independent of the caller's clamp: with a clamp that does not floor, a failure at the
+// minimum slice would otherwise retry at half of it.
+static void test_the_floor_is_the_loops_own() {
+    printf("(e2) a failure at the minimum slice ends the loop even under a clamp that does not floor\n");
+    fake_stream_dma dma;
+    dma.script                       = { failed() };
+    size_t                     lines = 0;
+    const get_rows_dma_outcome out   = get_rows_dma_retry(
+        1 * MiB, 2, 1 * MiB, 2, [&](size_t s, size_t b) { return dma(s, b); }, [](size_t bytes) { return bytes; },
+        [&](size_t, size_t, size_t) { lines++; });
+    check_eq("stream_dma calls", dma.calls, 1);
+    check_eq("retry lines", lines, 0);
+    check_true("neither streamed nor refused", !out.streamed_ok && !out.refused_file_mapped);
 }
 
 static void test_a_failure_at_the_floor_ends_the_loop() {
@@ -197,6 +207,7 @@ int main() {
     test_ordinary_failures_still_halve_and_retry();
     test_a_classified_device_oom_retries_and_success_ends_the_loop();
     test_a_failure_at_the_floor_ends_the_loop();
+    test_the_floor_is_the_loops_own();
     test_the_registry_predicate_stream_dma_reads();
     printf("=== %d checks, %d failures ===\n", g_checks, g_fail);
     if (g_fail > 0) {

@@ -15,6 +15,7 @@
 #include "common.hpp"
 #include "dequantize.hpp"
 #include "get-rows-kquant.hpp"
+#include "getrows-dma-retry.hpp"
 #include "ggml-backend.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu/ops.h"
@@ -2834,7 +2835,6 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
                         const size_t min_slice_bytes = get_rows_min_slice_bytes(stream_ctx.row_total_bytes);
                         size_t       try_slice_bytes = slice_bytes;
                         size_t       try_buffers     = buffer_count;
-                        size_t       retry_count     = 0;
                         size_t       retry_limit     = 2;
                         (void) get_rows_parse_env_count_value("GGML_SYCL_GET_ROWS_DMA_RETRIES", retry_limit);
                         auto clamp_slice = [&](size_t bytes) {
@@ -2851,41 +2851,34 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
                             return bytes;
                         };
                         try_slice_bytes  = clamp_slice(try_slice_bytes);
-                        bool streamed_ok = false;
-                        for (; retry_count <= retry_limit; ++retry_count) {
-                            bool should_retry = false;
-                            try {
-                                result = cache->stream_dma(cache_view, total_bytes, try_slice_bytes, try_buffers,
-                                                           get_rows_stream_slice, &stream_ctx, stream_deps,
-                                                           get_rows_stream_copy);
-                            } catch (const sycl::exception & e) {
-                                if (get_rows_is_device_oom(e) && try_slice_bytes > min_slice_bytes) {
-                                    should_retry = true;
-                                } else {
+                        // llama.cpp-5efe C4: the slice loop is the shared get_rows_dma_retry (getrows-dma-retry.hpp), which
+                        // ends on a stream_dma refusal of a file-mapped source before its retry test: a refusal is
+                        // deterministic, so halving the slice would only repeat it (and log it) log2(slice / min) times.
+                        const ggml_sycl::get_rows_dma_outcome outcome = ggml_sycl::get_rows_dma_retry(
+                            try_slice_bytes, try_buffers, min_slice_bytes, retry_limit,
+                            [&](size_t slice, size_t buffers) {
+                                ggml_sycl::get_rows_dma_attempt attempt;
+                                try {
+                                    result = cache->stream_dma(cache_view, total_bytes, slice, buffers,
+                                                               get_rows_stream_slice, &stream_ctx, stream_deps,
+                                                               get_rows_stream_copy);
+                                } catch (const sycl::exception & e) {
+                                    if (get_rows_is_device_oom(e) && slice > min_slice_bytes) {
+                                        return attempt;  // did not stream: a smaller slice may cure it
+                                    }
                                     cache->unpin(cache_key, layout);
                                     throw;
                                 }
-                            }
-                            if (!should_retry && result.ok) {
-                                streamed_ok = true;
-                                break;
-                            }
-                            if (!should_retry && !result.ok && try_slice_bytes > min_slice_bytes) {
-                                should_retry = true;
-                            }
-                            if (!should_retry) {
-                                break;
-                            }
-                            const size_t next_slice = clamp_slice(try_slice_bytes / 2);
-                            if (next_slice == try_slice_bytes) {
-                                break;
-                            }
-                            GGML_LOG_WARN("[GET_ROWS] DMA retry: slice %.1f MB -> %.1f MB (buffers=%zu)\n",
-                                          try_slice_bytes / (1024.0 * 1024.0), next_slice / (1024.0 * 1024.0),
-                                          try_buffers);
-                            try_slice_bytes = next_slice;
-                            try_buffers     = 1;
-                        }
+                                attempt.ok                  = result.ok;
+                                attempt.refused_file_mapped = result.refused_file_mapped;
+                                return attempt;
+                            },
+                            clamp_slice,
+                            [&](size_t slice, size_t next_slice, size_t buffers) {
+                                GGML_LOG_WARN("[GET_ROWS] DMA retry: slice %.1f MB -> %.1f MB (buffers=%zu)\n",
+                                              slice / (1024.0 * 1024.0), next_slice / (1024.0 * 1024.0), buffers);
+                            });
+                        const bool streamed_ok = outcome.streamed_ok;
                         if (streamed_ok) {
                             std::vector<sycl::event> done_deps{ result.event };
                             result.event = ggml_sycl_get_rows_profile_marker<ggml_sycl_get_rows_marker_kernel>(
@@ -2897,6 +2890,18 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
                         }
                         if (!streamed_ok) {
                             bool fallback_ok = false;
+                            if (outcome.refused_file_mapped) {
+                                // The source is a file mapping: a host-tier weight executes on the CPU and never
+                                // streams to a device. Terminal, not an mmap_direct_failed.
+                                GGML_LOG_WARN(
+                                    "[GET_ROWS] stream_dma refused a file-mapped weight, running on the CPU (%s)\n",
+                                    dst->name ? dst->name : "unknown");
+                                if (ggml_sycl_cpu_fallback_graph(ctx, dst, "get_rows streaming refused")) {
+                                    return;
+                                }
+                                GGML_ABORT(
+                                    "GET_ROWS streaming refused a file-mapped weight and the CPU fallback failed");
+                            }
                             if (result.mmap_direct_failed) {
                                 GGML_LOG_WARN("[GET_ROWS] DMA from mmap failed, falling back to CPU (%s)\n",
                                               dst->name ? dst->name : "unknown");
