@@ -55,6 +55,11 @@ def balanced(text: str, open_idx: int) -> str:
     raise AssertionError("unbalanced braces")
 
 
+def block_end(text: str, open_idx: int) -> int:
+    """Index just past the brace that closes the one at `open_idx`."""
+    return open_idx + len(balanced(text, open_idx)) + 2
+
+
 def function_body(text: str, signature_re: str) -> str:
     hits = list(re.finditer(signature_re, text))
     assert len(hits) == 1, f"{signature_re!r} matched {len(hits)} times"
@@ -186,12 +191,13 @@ def test_the_record_function_refuses_a_context_that_still_holds_segments():
 def test_the_record_loop_moves_its_executables_into_the_context_before_the_throw_leaves():
     body = function_body(code(), RECORD)
     locals_end = body.index("recorded_moe_graphs.reserve")
-    loop = body.index("for (size_t seg_idx = 0;")
-    try_at = [m.start() for m in re.finditer(r"\btry\s*\{", body[locals_end:loop])]
-    assert try_at, "the record loop is not wrapped in a try after the locals are declared"
-    handler = re.search(r"\}\s*catch\s*\(\s*\.\.\.\s*\)\s*\{", body[loop:])
-    assert handler, "the record loop has no catch (...) handler"
-    handler_text = balanced(body, body.index("{", loop + handler.start() + 1))
+    wrapped = re.search(r"\btry\s*\{\s*for\s*\(\s*size_t\s+seg_idx\s*=\s*0\s*;", body[locals_end:])
+    assert wrapped, "the record loop is not wrapped in a try right after the locals are declared"
+    try_open = body.index("{", locals_end + wrapped.start())
+    after = body[block_end(body, try_open) :]
+    handler = re.match(r"\s*catch\s*\(\s*\.\.\.\s*\)\s*\{", after)
+    assert handler, "the record loop's try has no catch (...) handler"
+    handler_text = balanced(after, handler.end() - 1)
     assert re.search(
         r"sycl_ctx\s*->\s*moe_segments\s*=\s*std::move\s*\(\s*recorded_segments\s*\)", handler_text
     ), "the handler does not move the recorded segments into the context"
@@ -237,14 +243,15 @@ def test_the_catch_cleanup_runs_after_every_wait_and_in_its_own_guard():
     for wait in ("wait_and_throw", "wait_pending_secondary_scatter_events", "ggml_sycl_cpu_staging_drain"):
         assert body.index(wait) < clear, f"the cleanup step runs before {wait}: an executable could still be in flight"
     # its own try { ... } catch (...) {}: an exception inside a handler is not caught by the same try's other handlers
-    before = body[:clear]
-    last_try = before.rindex("try {")
-    assert "}" not in before[last_try:], "the cleanup step is not inside its own try block"
-    after = body[clear:]
+    tries = [m.start() for m in re.finditer(r"\btry\s*\{", body[:clear])]
+    assert tries, "the cleanup step is not inside a try block"
+    try_open = body.index("{", tries[-1])
+    end = block_end(body, try_open)
+    assert end > clear, "the cleanup step is not inside its own try block"
     assert re.match(
-        r"[^}]*\}[^}]*\}\s*catch\s*\(\s*\.\.\.\s*\)\s*\{\s*\}", after, flags=re.DOTALL
+        r"\s*catch\s*\(\s*\.\.\.\s*\)\s*\{\s*\}", body[end:]
     ), "the cleanup step's try has no catch (...) {}"
-    cond = before[last_try:]
+    cond = body[try_open:clear]
     assert re.search(
         r"exec_graph\b[^;{]*\|\|[^;{]*active_exec_graph\s*\.\s*valid", cond
     ), "the step does not clear the active graph when an execution graph is live or marked valid"

@@ -98381,10 +98381,35 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
 // Record segmented graphs for a MoE compute graph.
 // Called after warmup when we know the graph topology is stable.
 // Returns true on success, false on failure (caller should fall back).
+// A node the backend refuses inside the segmented record and replay paths fails the graph, as the ordinary node loop's
+// GGML_ASSERT does. It throws rather than asserting or returning: a refusal is a capability refusal, not a terminal
+// plan bug, and a return from a recording site would destroy the local command graph while the queue still records into
+// it. The throw reaches graph_compute's fallback catch, which drains, releases the cached graph state and returns
+// GGML_STATUS_FAILED. The argument is a string literal because the exception stores the pointer and the catch prints
+// what() after the unwind; the node is named in the line above it.
+static void ggml_sycl_segment_forward_or_throw(ggml_backend_sycl_context & ctx, ggml_tensor * node, const char * role) {
+    if (ggml_sycl_compute_forward(ctx, node)) {
+        return;
+    }
+    fprintf(stderr, "[SYCL] graph compute unsupported node name=%s op=%s type=%s (segmented %s)\n",
+            node && node->name ? node->name : "", node ? ggml_op_name(node->op) : "(null)",
+            node ? ggml_type_name(node->type) : "(null)", role);
+    throw ggml_sycl_fallback_error("segmented graph node refused");
+}
+
 static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
                                       ggml_cgraph *               cgraph,
                                       bool                        is_decode_phase,
                                       bool                        direct_fa_segments_once) {
+    // invalidate_moe_segments keeps the vectors and sets the disabled flag when its retire fails, because it will not
+    // destroy an executable whose submission may be outstanding. Recording over them would destroy those executables in
+    // the success path's move, and the failure handler below moves into vectors that must be empty: refuse here.
+    if (!sycl_ctx->moe_segments.empty() || !sycl_ctx->moe_dispatch_graphs.empty()) {
+        GGML_LOG_WARN("[SYCL-SEG] record refused: the context still holds %zu segment(s) after a failed retire\n",
+                      sycl_ctx->moe_segments.size());
+        g_graph_diag_counters.seg_record_failures.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     g_graph_diag_counters.seg_record_attempts.fetch_add(1, std::memory_order_relaxed);
     GGML_LOG_INFO("[SYCL-SEG] Recording segmented graphs (%d nodes, %s phase)...\n", cgraph->n_nodes,
                   is_decode_phase ? "decode" : "prompt");
@@ -98486,152 +98511,176 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
         }
     };
 
-    for (size_t seg_idx = 0; seg_idx < segments.size(); seg_idx++) {
-        const auto &  seg                  = segments[seg_idx];
-        const int     seg_size             = seg.end - seg.start;
-        int           recording_node_index = -1;
-        ggml_tensor * recording_node       = nullptr;
-        const bool    segment_has_fa = ggml_sycl_graph_range_has_op(cgraph, seg.start, seg.end, GGML_OP_FLASH_ATTN_EXT);
+    // The executables recorded so far are moved into the context when a segment throws, not destroyed in the unwind:
+    // destroying one while its submission is outstanding is the heap corruption sycl_exec_graph_clear_active records
+    // (llama.cpp-dkw0 defect #4). graph_compute's fallback catch destroys them after its queue waits. The vectors
+    // are empty here (the entry guard), so the moves destroy nothing. No wait at the throw site: it would precede
+    // that catch's own drain and cleanup ordering.
+    try {
+        for (size_t seg_idx = 0; seg_idx < segments.size(); seg_idx++) {
+            const auto &  seg                  = segments[seg_idx];
+            const int     seg_size             = seg.end - seg.start;
+            int           recording_node_index = -1;
+            ggml_tensor * recording_node       = nullptr;
+            const bool    segment_has_fa =
+                ggml_sycl_graph_range_has_op(cgraph, seg.start, seg.end, GGML_OP_FLASH_ATTN_EXT);
 
-        // Skip very small segments (not worth graph overhead).  During the
-        // first segmented record after PP this was already required because
-        // attention reads dynamic KV/mask state across the PP->TG boundary.
-        // The same FA graph-capture path has also produced B50 device loss on
-        // GPT-OSS decode diagnostics, so FA-containing segments direct-dispatch
-        // by default unless an explicit unsafe diagnostic override is set.
-        const bool direct_fa_segment =
-            segment_has_fa && (!ggml_sycl_flash_attn_graph_allow_enabled() || direct_fa_segments_once);
-        if (seg_size < MIN_SEGMENT_NODES || direct_fa_segment) {
-            GGML_SYCL_DEBUG(
-                "[SYCL-SEG] Segment %zu [%d-%d) direct-dispatch "
-                "(nodes=%d, has_fa=%d, post_prompt=%d)\n",
-                seg_idx, seg.start, seg.end, seg_size, segment_has_fa ? 1 : 0, direct_fa_segment ? 1 : 0);
-            // Store with null exec_graph to signal direct dispatch
-            recorded_segments.push_back({ seg.start, seg.end, nullptr });
-            // Dispatch nodes directly (first token needs their output)
-            for (int i = seg.start; i < seg.end; i++) {
-                ggml_tensor * node = cgraph->nodes[i];
-                if (node && !ggml_sycl_is_noop(node)) {
-                    ggml_sycl_compute_forward(*sycl_ctx, node);
+            // Skip very small segments (not worth graph overhead).  During the
+            // first segmented record after PP this was already required because
+            // attention reads dynamic KV/mask state across the PP->TG boundary.
+            // The same FA graph-capture path has also produced B50 device loss on
+            // GPT-OSS decode diagnostics, so FA-containing segments direct-dispatch
+            // by default unless an explicit unsafe diagnostic override is set.
+            const bool direct_fa_segment =
+                segment_has_fa && (!ggml_sycl_flash_attn_graph_allow_enabled() || direct_fa_segments_once);
+            if (seg_size < MIN_SEGMENT_NODES || direct_fa_segment) {
+                GGML_SYCL_DEBUG(
+                    "[SYCL-SEG] Segment %zu [%d-%d) direct-dispatch "
+                    "(nodes=%d, has_fa=%d, post_prompt=%d)\n",
+                    seg_idx, seg.start, seg.end, seg_size, segment_has_fa ? 1 : 0, direct_fa_segment ? 1 : 0);
+                // Store with null exec_graph to signal direct dispatch
+                recorded_segments.push_back({ seg.start, seg.end, nullptr });
+                // Dispatch nodes directly (first token needs their output)
+                for (int i = seg.start; i < seg.end; i++) {
+                    ggml_tensor * node = cgraph->nodes[i];
+                    if (node && !ggml_sycl_is_noop(node)) {
+                        ggml_sycl_segment_forward_or_throw(*sycl_ctx, node, "direct segment");
+                    }
                 }
-            }
-            if (seg.moe_after >= 0) {
-                ggml_tensor * moe_node = cgraph->nodes[seg.moe_after];
-                if (moe_node) {
-                    ggml_sycl_compute_forward(*sycl_ctx, moe_node);
-                    record_moe_dispatch_graph_if_identified(seg.moe_after, moe_node);
+                if (seg.moe_after >= 0) {
+                    ggml_tensor * moe_node = cgraph->nodes[seg.moe_after];
+                    if (moe_node) {
+                        ggml_sycl_segment_forward_or_throw(*sycl_ctx, moe_node, "moe_after of a direct segment");
+                        record_moe_dispatch_graph_if_identified(seg.moe_after, moe_node);
+                    }
                 }
+                continue;
             }
-            continue;
+
+            const size_t retained_baseline = sycl_ctx->graph_retained_handles.size();
+            bool         segment_submitted = false;
+
+            struct recording_depth_owner {
+                bool owned = false;
+
+                void acquire() {
+                    g_ggml_sycl_graph_recording_depth.fetch_add(1, std::memory_order_acq_rel);
+                    owned = true;
+                }
+
+                void release() noexcept {
+                    if (owned) {
+                        g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
+                        owned = false;
+                    }
+                }
+
+                ~recording_depth_owner() noexcept { release(); }
+            } depth_owner;
+
+            try {
+                sycl_ex::command_graph seg_graph(*stream, { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
+
+                depth_owner.acquire();
+                ggml_sycl::set_graph_retained_handle_sink(&sycl_ctx->graph_retained_handles);
+                g_ggml_sycl_graph_recording = true;
+                g_recording_graph_ptr       = &seg_graph;
+                g_recording_queue_ptr       = stream;
+                seg_graph.begin_recording(*stream);
+
+                for (int i = seg.start; i < seg.end; i++) {
+                    ggml_tensor * node = cgraph->nodes[i];
+                    if (!node || ggml_sycl_is_noop(node)) {
+                        continue;
+                    }
+                    if (node->op == GGML_OP_MUL_MAT_ID &&
+                        !ggml_sycl_moe_precomputed_mmid_skip_pending(node, sycl_ctx->device)) {
+                        GGML_LOG_WARN("[SYCL-SEG] Unexpected unfused MoE node %d in graph segment, falling back\n", i);
+                        throw std::runtime_error("unexpected unfused MoE segment node");
+                    }
+                    recording_node_index = i;
+                    recording_node       = node;
+                    ggml_sycl_segment_forward_or_throw(*sycl_ctx, node, "recording");
+                }
+
+                seg_graph.end_recording();
+                g_recording_graph_ptr = nullptr;
+                g_recording_queue_ptr = nullptr;
+                ggml_sycl::set_graph_retained_handle_sink(nullptr);
+                g_ggml_sycl_graph_recording = false;
+                depth_owner.release();
+
+                // Finalize as immutable (segments never change!)
+                auto exec     = seg_graph.finalize();
+                auto exec_ptr = std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec);
+
+                GGML_SYCL_DEBUG(
+                    "[SYCL-SEG] Segment %zu [%d-%d) recorded "
+                    "(%d nodes)\n",
+                    seg_idx, seg.start, seg.end, seg_size);
+
+                recorded_segments.push_back({ seg.start, seg.end, std::move(exec_ptr) });
+
+                // Execute this segment immediately (first token output)
+                // Submission failure is ambiguous: work may already be queued.
+                // Mark first so exception cleanup retains handles unless completion
+                // is successfully drained by a higher-level cleanup path.
+                segment_submitted = true;
+                stream->ext_oneapi_graph(*recorded_segments.back().exec_graph);
+                if (seg.moe_after >= 0) {
+                    ggml_tensor * moe_node = cgraph->nodes[seg.moe_after];
+                    if (moe_node) {
+                        ggml_sycl_segment_forward_or_throw(*sycl_ctx, moe_node, "moe_after of a recorded segment");
+                        record_moe_dispatch_graph_if_identified(seg.moe_after, moe_node);
+                    }
+                }
+
+            } catch (const sycl::exception & exc) {
+                if (!segment_submitted) {
+                    try {
+                        sycl_ctx->graph_retained_handles.resize(retained_baseline);
+                    } catch (...) {
+                    }
+                }
+                g_ggml_sycl_graph_recording = false;
+                g_recording_graph_ptr       = nullptr;
+                g_recording_queue_ptr       = nullptr;
+                ggml_sycl::set_graph_retained_handle_sink(nullptr);
+                depth_owner.release();
+                GGML_LOG_WARN("[SYCL-SEG] Segment %zu recording failed at node %d op=%s name=%s: %s\n", seg_idx,
+                              recording_node_index, recording_node ? ggml_op_name(recording_node->op) : "?",
+                              recording_node ? recording_node->name : "?", exc.what());
+                g_graph_diag_counters.seg_record_failures.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            } catch (const std::exception & exc) {
+                if (!segment_submitted) {
+                    try {
+                        sycl_ctx->graph_retained_handles.resize(retained_baseline);
+                    } catch (...) {
+                    }
+                }
+                g_ggml_sycl_graph_recording = false;
+                g_recording_graph_ptr       = nullptr;
+                g_recording_queue_ptr       = nullptr;
+                ggml_sycl::set_graph_retained_handle_sink(nullptr);
+                depth_owner.release();
+                GGML_LOG_WARN("[SYCL-SEG] Segment %zu recording failed at node %d op=%s name=%s: %s\n", seg_idx,
+                              recording_node_index, recording_node ? ggml_op_name(recording_node->op) : "?",
+                              recording_node ? recording_node->name : "?", exc.what());
+                g_graph_diag_counters.seg_record_failures.fetch_add(1, std::memory_order_relaxed);
+                if (dynamic_cast<const ggml_sycl_fallback_error *>(&exc)) {
+                    throw;
+                }
+                return false;
+            }
         }
 
-        const size_t retained_baseline = sycl_ctx->graph_retained_handles.size();
-        bool segment_submitted = false;
-        struct recording_depth_owner {
-            bool owned = false;
-            void acquire() {
-                g_ggml_sycl_graph_recording_depth.fetch_add(1, std::memory_order_acq_rel);
-                owned = true;
-            }
-            void release() noexcept {
-                if (owned) {
-                    g_ggml_sycl_graph_recording_depth.fetch_sub(1, std::memory_order_acq_rel);
-                    owned = false;
-                }
-            }
-            ~recording_depth_owner() noexcept { release(); }
-        } depth_owner;
-        try {
-            sycl_ex::command_graph seg_graph(*stream, { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
-
-            depth_owner.acquire();
-            ggml_sycl::set_graph_retained_handle_sink(&sycl_ctx->graph_retained_handles);
-            g_ggml_sycl_graph_recording = true;
-            g_recording_graph_ptr       = &seg_graph;
-            g_recording_queue_ptr       = stream;
-            seg_graph.begin_recording(*stream);
-
-            for (int i = seg.start; i < seg.end; i++) {
-                ggml_tensor * node = cgraph->nodes[i];
-                if (!node || ggml_sycl_is_noop(node)) {
-                    continue;
-                }
-                if (node->op == GGML_OP_MUL_MAT_ID &&
-                    !ggml_sycl_moe_precomputed_mmid_skip_pending(node, sycl_ctx->device)) {
-                    GGML_LOG_WARN("[SYCL-SEG] Unexpected unfused MoE node %d in graph segment, falling back\n", i);
-                    throw std::runtime_error("unexpected unfused MoE segment node");
-                }
-                recording_node_index = i;
-                recording_node       = node;
-                ggml_sycl_compute_forward(*sycl_ctx, node);
-            }
-
-            seg_graph.end_recording();
-            g_recording_graph_ptr = nullptr;
-            g_recording_queue_ptr = nullptr;
-            ggml_sycl::set_graph_retained_handle_sink(nullptr);
-            g_ggml_sycl_graph_recording = false;
-            depth_owner.release();
-
-            // Finalize as immutable (segments never change!)
-            auto exec     = seg_graph.finalize();
-            auto exec_ptr = std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec);
-
-            GGML_SYCL_DEBUG(
-                "[SYCL-SEG] Segment %zu [%d-%d) recorded "
-                "(%d nodes)\n",
-                seg_idx, seg.start, seg.end, seg_size);
-
-            recorded_segments.push_back({ seg.start, seg.end, std::move(exec_ptr) });
-
-            // Execute this segment immediately (first token output)
-            // Submission failure is ambiguous: work may already be queued.
-            // Mark first so exception cleanup retains handles unless completion
-            // is successfully drained by a higher-level cleanup path.
-            segment_submitted = true;
-            stream->ext_oneapi_graph(*recorded_segments.back().exec_graph);
-            if (seg.moe_after >= 0) {
-                ggml_tensor * moe_node = cgraph->nodes[seg.moe_after];
-                if (moe_node) {
-                    ggml_sycl_compute_forward(*sycl_ctx, moe_node);
-                    record_moe_dispatch_graph_if_identified(seg.moe_after, moe_node);
-                }
-            }
-
-        } catch (const sycl::exception & exc) {
-            if (!segment_submitted) {
-                try { sycl_ctx->graph_retained_handles.resize(retained_baseline); } catch (...) {}
-            }
-            g_ggml_sycl_graph_recording = false;
-            g_recording_graph_ptr       = nullptr;
-            g_recording_queue_ptr       = nullptr;
-            ggml_sycl::set_graph_retained_handle_sink(nullptr);
-            depth_owner.release();
-            GGML_LOG_WARN("[SYCL-SEG] Segment %zu recording failed at node %d op=%s name=%s: %s\n", seg_idx,
-                          recording_node_index, recording_node ? ggml_op_name(recording_node->op) : "?",
-                          recording_node ? recording_node->name : "?", exc.what());
-            g_graph_diag_counters.seg_record_failures.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        } catch (const std::exception & exc) {
-            if (!segment_submitted) {
-                try { sycl_ctx->graph_retained_handles.resize(retained_baseline); } catch (...) {}
-            }
-            g_ggml_sycl_graph_recording = false;
-            g_recording_graph_ptr       = nullptr;
-            g_recording_queue_ptr       = nullptr;
-            ggml_sycl::set_graph_retained_handle_sink(nullptr);
-            depth_owner.release();
-            GGML_LOG_WARN("[SYCL-SEG] Segment %zu recording failed at node %d op=%s name=%s: %s\n", seg_idx,
-                          recording_node_index, recording_node ? ggml_op_name(recording_node->op) : "?",
-                          recording_node ? recording_node->name : "?", exc.what());
-            g_graph_diag_counters.seg_record_failures.fetch_add(1, std::memory_order_relaxed);
-            if (dynamic_cast<const ggml_sycl_fallback_error *>(&exc)) {
-                throw;
-            }
-            return false;
-        }
+    } catch (...) {
+        sycl_ctx->moe_segments        = std::move(recorded_segments);
+        sycl_ctx->moe_dispatch_graphs = std::move(recorded_moe_graphs);
+        sycl_ctx->moe_segments_valid  = false;
+        throw;
     }
-
     // 4. Store in context
     sycl_ctx->moe_segments           = std::move(recorded_segments);
     sycl_ctx->moe_dispatch_graphs    = std::move(recorded_moe_graphs);
@@ -98829,7 +98878,7 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
                 for (int i = seg.start_node; i < seg.end_node; i++) {
                     ggml_tensor * node = cgraph->nodes[i];
                     if (node && !ggml_sycl_is_noop(node)) {
-                        ggml_sycl_compute_forward(*sycl_ctx, node);
+                        ggml_sycl_segment_forward_or_throw(*sycl_ctx, node, "replay direct segment");
                     }
                 }
                 GGML_SYCL_DEBUG(
@@ -98873,7 +98922,7 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
                     moe_graph_mark_fused_pair_skips_for_node(node, sycl_ctx->device);
                     GGML_SYCL_DEBUG("[SYCL-SEG-MOE] Replayed descriptor MoE graph at node %d\n", node_idx);
                 } else {
-                    ggml_sycl_compute_forward(*sycl_ctx, node);
+                    ggml_sycl_segment_forward_or_throw(*sycl_ctx, node, "replay moe node");
                 }
             }
             GGML_SYCL_DEBUG("[SYCL-SEG] Dispatched MoE at node %d\n", node_idx);
@@ -109632,6 +109681,20 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             try { wait_pending_secondary_scatter_events(flush_pending_secondary_scatter()); } catch (...) {}
             try { ggml_sycl_cpu_staging_drain(); } catch (...) {}
             try { ggml_sycl_recover_exact_mmid_after_drain(cleanup_ctx); } catch (...) {}
+            // A failed graph leaves the cached whole-graph and segment state untrusted, and the transient leases are
+            // not released while an execution graph is live (the unpin below returns early), so clear it here: after
+            // every wait and drain above, which is what makes destroying the executables safe, and before the unpin.
+            // Its own try, like each sibling: an exception inside a handler is not caught by the same try's other
+            // handlers and would cross the backend boundary. Without a live execution graph only the segments the
+            // record function handed over need to go.
+            try {
+                if (cleanup_ctx->exec_graph || cleanup_ctx->active_exec_graph.valid) {
+                    sycl_exec_graph_clear_active(cleanup_ctx, "fallback-error");
+                } else {
+                    cleanup_ctx->invalidate_moe_segments();
+                }
+            } catch (...) {
+            }
             try { graph_unpin_transient_leases_after_direct_execution(cleanup_ctx); } catch (...) {}
             try { (void) ggml_sycl_execution_release_graph(cleanup_ctx); } catch (...) {}
             cleanup_ctx->last_graph_event.reset();
