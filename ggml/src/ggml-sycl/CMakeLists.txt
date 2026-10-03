@@ -1985,6 +1985,31 @@ set_tests_properties(sycl-kv-demand-idx PROPERTIES
     TIMEOUT 60
 )
 
+# llama.cpp-5efe C4 (part c): the planner's host-weight accounting is split by host backing.  The real placement_plan
+# (charge_host_weight, the four terms, update_expert_placement); header-only plan, so no libggml-sycl, like
+# test-sycl-kv-demand-idx above.
+add_executable(test-sycl-host-backing-accounting
+    tests/test-sycl-host-backing-accounting.cpp
+)
+target_include_directories(test-sycl-host-backing-accounting PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-sycl-host-backing-accounting PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-host-backing-accounting PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-sycl-host-backing-accounting PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-host-backing-accounting PRIVATE ggml-base)
+add_test(NAME sycl-host-backing-accounting COMMAND test-sycl-host-backing-accounting)
+set_tests_properties(sycl-host-backing-accounting PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    LABELS "sycl;host;placement;hostonly"
+    TIMEOUT 60
+)
+
 # llama.cpp-5efe C4 (part b): a stream_dma refusal of a file-mapped source is terminal in get_rows' slice loop (the real
 # loop over a fake stream_dma) and the registry predicate stream_dma reads.  getrows-dma-retry.hpp and alloc-registry.hpp
 # are header-only and SYCL-free, so this target builds without -fsycl or ggml-base, like test-kv-runtime-demotion below.

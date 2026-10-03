@@ -3448,6 +3448,13 @@ if (Python3_Interpreter_FOUND)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-stream-dma-refusal-source.py
         LABEL "sycl;host;python;source-contract"
         TIMEOUT 120)
+    # llama.cpp-5efe C4 (part c): every writer of the host weight terms goes through the helper that tests the backing,
+    # and every reader reads the meaning design 5efe section 4.4 assigns it.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-host-backing-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-host-backing-source.py
+        LABEL "sycl;host;python;source-contract"
+        TIMEOUT 120)
 endif()
 
 # llama.cpp-5efe C1: the per-model lazy-range record and its pre-fill, driven over
