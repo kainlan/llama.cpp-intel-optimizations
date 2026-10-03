@@ -145,22 +145,137 @@ file_map_status unified_cache_raw_lock_file_segments(const file_mapping &       
     return file_map_status::OK;
 }
 
-// RED stand-in (llama.cpp-5efe C3a): an empty plan.
+// Sorts and merges ranges that overlap or touch. Empty ranges are dropped.
+static std::vector<file_map_range> merge_ranges(std::vector<file_map_range> in) {
+    in.erase(std::remove_if(in.begin(), in.end(), [](const file_map_range & r) { return r.length == 0; }), in.end());
+    std::sort(in.begin(), in.end(),
+              [](const file_map_range & a, const file_map_range & b) { return a.file_offset < b.file_offset; });
+    std::vector<file_map_range> out;
+    for (const file_map_range & r : in) {
+        if (!out.empty() && r.file_offset <= out.back().file_end()) {
+            out.back().length = std::max(out.back().file_end(), r.file_end()) - out.back().file_offset;
+        } else {
+            out.push_back(r);
+        }
+    }
+    return out;
+}
+
+// `a` minus `b`, both sorted and merged.
+static std::vector<file_map_range> subtract_ranges(const std::vector<file_map_range> & a,
+                                                   const std::vector<file_map_range> & b) {
+    std::vector<file_map_range> out;
+    for (const file_map_range & r : a) {
+        uint64_t at = r.file_offset;
+        for (const file_map_range & cut : b) {
+            if (cut.file_end() <= at || cut.file_offset >= r.file_end()) {
+                continue;
+            }
+            if (cut.file_offset > at) {
+                out.push_back({ at, cut.file_offset - at });
+            }
+            at = std::max(at, cut.file_end());
+        }
+        if (at < r.file_end()) {
+            out.push_back({ at, r.file_end() - at });
+        }
+    }
+    return out;
+}
+
+// `a` intersected with `b`, both sorted and merged.
+static std::vector<file_map_range> intersect_ranges(const std::vector<file_map_range> & a,
+                                                    const std::vector<file_map_range> & b) {
+    std::vector<file_map_range> out;
+    for (const file_map_range & x : a) {
+        for (const file_map_range & y : b) {
+            const uint64_t lo = std::max(x.file_offset, y.file_offset);
+            const uint64_t hi = std::min(x.file_end(), y.file_end());
+            if (lo < hi) {
+                out.push_back({ lo, hi - lo });
+            }
+        }
+    }
+    return merge_ranges(out);
+}
+
 file_segment_plan file_mapping_segments(const std::vector<file_tensor_range> & tensor_ranges,
                                         const std::vector<file_map_range> &    lazy_ranges,
                                         uint64_t                               page,
                                         uint64_t                               random_window) {
-    (void) tensor_ranges;
-    (void) lazy_ranges;
-    (void) page;
-    (void) random_window;
-    return {};
+    file_segment_plan plan;
+    if (page == 0 || (page & (page - 1)) != 0) {
+        plan.error = "the page size is not a power of two";
+        return plan;
+    }
+    const std::vector<file_map_range> lazy = merge_ranges(lazy_ranges);
+
+    std::vector<file_map_range> all;
+    std::vector<file_map_range> host;
+    for (const file_tensor_range & t : tensor_ranges) {
+        if (t.length == 0) {
+            continue;
+        }
+        for (const file_map_range & z : lazy) {
+            if (t.file_offset < z.file_end() && z.file_offset < t.file_offset + t.length) {
+                plan.error = "a tensor range overlaps a lazy range";
+                return plan;
+            }
+        }
+        all.push_back({ t.file_offset, t.length });
+        if (t.host_executed) {
+            host.push_back({ t.file_offset, t.length });
+        }
+    }
+
+    // Map segments: outward, merged, never a complement.
+    std::vector<file_map_range> outward;
+    for (const file_map_range & r : all) {
+        const uint64_t lo = page_floor(r.file_offset, page);
+        outward.push_back({ lo, page_ceil(r.file_end(), page) - lo });
+    }
+    plan.map = merge_ranges(outward);
+
+    // WILLNEED / lock segments: host-executed bytes first merged exactly (a page two touching host tensors share
+    // holds no lazy byte and may be advised), then rounded inward, then every page holding a lazy byte removed.
+    std::vector<file_map_range> inward;
+    for (const file_map_range & r : merge_ranges(host)) {
+        const uint64_t lo = page_ceil(r.file_offset, page);
+        const uint64_t hi = page_floor(r.file_end(), page);
+        if (lo < hi) {
+            inward.push_back({ lo, hi - lo });
+        }
+    }
+    std::vector<file_map_range> lazy_pages;
+    for (const file_map_range & z : lazy) {
+        const uint64_t lo = page_floor(z.file_offset, page);
+        lazy_pages.push_back({ lo, page_ceil(z.file_end(), page) - lo });
+    }
+    plan.willneed = subtract_ranges(merge_ranges(inward), merge_ranges(lazy_pages));
+
+    // MADV_RANDOM windows at both edges of every lazy range, the shared pages inside, kept to what is mapped.
+    std::vector<file_map_range> windows;
+    for (const file_map_range & z : lazy) {
+        const uint64_t before = z.file_offset > random_window ? z.file_offset - random_window : 0;
+        const uint64_t lo     = page_floor(before, page);
+        const uint64_t hi     = page_ceil(z.file_offset, page);
+        if (lo < hi) {
+            windows.push_back({ lo, hi - lo });
+        }
+        const uint64_t after_lo = page_floor(z.file_end(), page);
+        const uint64_t after_hi = page_ceil(z.file_end() + random_window, page);
+        if (after_lo < after_hi) {
+            windows.push_back({ after_lo, after_hi - after_lo });
+        }
+    }
+    plan.random_windows = intersect_ranges(merge_ranges(windows), plan.map);
+    return plan;
 }
 
 uint64_t file_mapping_random_window(uint64_t read_ahead_bytes, uint64_t page) {
-    (void) read_ahead_bytes;
-    (void) page;
-    return 0;
+    const uint64_t floor_bytes = 2ull * 1024 * 1024;
+    const uint64_t w           = std::max(2 * read_ahead_bytes, floor_bytes);
+    return page == 0 ? w : page_ceil(w, page);
 }
 
 void unified_cache_raw_unmap_file(file_mapping * mapping) {

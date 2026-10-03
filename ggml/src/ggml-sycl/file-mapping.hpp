@@ -86,7 +86,7 @@ struct file_segment_plan {
     std::vector<file_map_range> random_windows;
     // Empty on success. A tensor range that overlaps a lazy range is refused (the plan is then empty): a deferred
     // table is never a SYCL_Mapped tensor.
-    const char * error = "";
+    const char *                error = "";
 
     bool ok() const { return error[0] == '\0'; }
 };

@@ -72,7 +72,7 @@ static int test_back_to_back_lazy_ranges() {
     const file_segment_plan one =
         file_mapping_segments({ T(0, 40000, true), T(100000, 140000, true) }, { R(40000, 100000) }, P, W);
     const file_segment_plan two = file_mapping_segments({ T(0, 40000, true), T(100000, 140000, true) },
-                                                         { R(40000, 60000), R(60000, 100000) }, P, W);
+                                                        { R(40000, 60000), R(60000, 100000) }, P, W);
     CHECK(two.ok(), "back-to-back lazy ranges were refused");
     CHECK(same(two.map, one.map, "back-to-back map"), "back-to-back map");
     CHECK(same(two.willneed, one.willneed, "back-to-back willneed"), "back-to-back willneed");
@@ -104,8 +104,7 @@ static int test_sub_page_lazy_range() {
 
 // Bytes that belong to no tensor of the buffer are never mapped, and a device-only source is mapped but not advised.
 static int test_bytes_of_no_tensor_are_never_mapped() {
-    const file_segment_plan p =
-        file_mapping_segments({ T(0, 10000, true), T(200000, 210000, false) }, {}, P, W);
+    const file_segment_plan p = file_mapping_segments({ T(0, 10000, true), T(200000, 210000, false) }, {}, P, W);
     CHECK(p.ok(), "no lazy ranges was refused");
     CHECK(same(p.map, { R(0, 12288), R(196608, 212992) }, "map"), "the bytes between the tensors were mapped");
     CHECK(same(p.willneed, { R(0, 8192) }, "willneed"), "a device-only source was advised");
@@ -132,7 +131,8 @@ static int test_overlap_is_refused() {
 }
 
 static int test_random_window_width() {
-    CHECK(file_mapping_random_window(128 * 1024, P) == 2 * 1024 * 1024, "W is not max(2 x read_ahead, 2 MiB) at 128 KiB");
+    CHECK(file_mapping_random_window(128 * 1024, P) == 2 * 1024 * 1024,
+          "W is not max(2 x read_ahead, 2 MiB) at 128 KiB");
     CHECK(file_mapping_random_window(4 * 1024 * 1024, P) == 8 * 1024 * 1024, "W does not follow a large read_ahead");
     CHECK(file_mapping_random_window(0, P) == 2 * 1024 * 1024, "W has no 2 MiB floor");
     CHECK(file_mapping_random_window(1048577, P) % P == 0, "W is not whole pages");
