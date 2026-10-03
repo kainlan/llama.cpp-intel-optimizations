@@ -1,4 +1,5 @@
 #!/bin/bash
+# provenance copy of a one-off run; paths are session-local; the reproducible form is scripts/qwen4exp-mtp-divergence-probe.sh (disc2: scripts/qwen4exp-mtp-acceptance.sh)
 # disc3 part 2: chat and reasoning prefixes at -ub 2/3 over a fresh context (X: ' This' / '\n', Y: '\n\n')
 S=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/7ae9d4f4-385e-452e-a3e4-e47c7bad0f2a/scratchpad
 D=$S/0rhb/disc; O=$S/0rhb/disc3

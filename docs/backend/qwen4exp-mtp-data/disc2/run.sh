@@ -1,4 +1,5 @@
 #!/bin/bash
+# provenance copy of a one-off run; paths are session-local; the reproducible form is scripts/qwen4exp-mtp-divergence-probe.sh (disc2: scripts/qwen4exp-mtp-acceptance.sh)
 # follow-up to the ub discriminator: (a) MTP n_max 1 vs greedy, (b) n_max 2 with -v for per-step accept lines
 S=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/7ae9d4f4-385e-452e-a3e4-e47c7bad0f2a/scratchpad
 WT=$S/wt-0rhb; B=$WT/build-cpu/bin; O=$S/0rhb/disc2

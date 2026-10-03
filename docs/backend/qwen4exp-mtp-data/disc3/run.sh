@@ -1,4 +1,5 @@
 #!/bin/bash
+# provenance copy of a one-off run; paths are session-local; the reproducible form is scripts/qwen4exp-mtp-divergence-probe.sh (disc2: scripts/qwen4exp-mtp-acceptance.sh)
 # disc3: code prompt only. (1) prefill at -ub 2/3/4 over a fresh context: same small-batch kernel shape as the
 # 2-/3-token verify, no accept/reject history. (2) margin: logit bias on ' all' (660) at ub 512.
 S=/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/7ae9d4f4-385e-452e-a3e4-e47c7bad0f2a/scratchpad

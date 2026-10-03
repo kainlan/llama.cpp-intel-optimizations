@@ -7,9 +7,12 @@
 # batched pass, like a verify batch) and at -ub 1 (batch-1, the decode shape).
 #   X = what the no-MTP baseline emitted there, Y = what the MTP run emitted there
 #   code: X=' any' Y=' all'   chat: X=' This' Y='\n\n'   reasoning: X='\n' Y='\n\n'
-# The -ub 1 run is the positive control and must print X.  -ub 512 printing Y would mean batch-width
-# numerics explain the divergence; printing X means they do not (result in
-# docs/backend/qwen4exp-mtp-findings.md, "Output equivalence").
+# The -ub 1 run is the positive control and must print X.  Printing Y at some width shows that batch-width
+# numerics are sufficient to produce MTP's token without MTP or rollback; it does not show they caused it in the
+# MTP run.  Printing X at a width proves little: the discriminating widths turned out to be 2 and 3 (the
+# verify-batch widths; 1, 4 and 512 agreed with the baseline), so run UBS="2 3 4" as well.  Varying -ub also
+# changes the chunk partition, not only the width.  Result: docs/backend/qwen4exp-mtp-findings.md, "Output
+# equivalence".
 #
 # It IS a model load (47 GB RSS each, ~2-3 min per run, 6 serial runs): run it by hand, one process at a
 # time, and never from a subagent.  It takes no lock itself.
