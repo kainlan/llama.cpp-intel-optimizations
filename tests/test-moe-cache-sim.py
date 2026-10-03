@@ -326,6 +326,25 @@ def test_cli_loo_writes_csv(tmp_path, capsys):
     assert len(lines) == 1 + 2 * 2 * 4
 
 
+def test_leave_one_id_out_keeps_the_same_set_in_training():
+    a = decode_trace([[0, 1], [0, 1]], set_name="code")
+    a.header["id"] = "code-0"
+    b = decode_trace([[0, 1]] * 4, set_name="code")
+    b.header["id"] = "code-1"
+    c = decode_trace([[2, 3], [2, 3]], set_name="chat")
+    c.header["id"] = "chat-0"
+    kw = dict(sizes_by_format={"f": sizes({0: GIB})}, traces=[a, b, c],
+              budgets_bytes_per_layer=[2 * GIB], phase="decode",
+              adapt=dict(swap_n=96, every=4, decay=0.7, min_count=2.0,
+                         margin=1.5, land_delay=1))
+    by_id = {r["test_set"]: r for r in sim.sweep_loo(**kw, by="id")
+             if r["policy"] == "static"}
+    assert by_id["code-0"]["hit_rate"] == 1.0   # counts: e0,e1 = 4 (code-1) beat e2,e3 = 2
+    by_set = {r["test_set"]: r for r in sim.sweep_loo(**kw, by="set")
+              if r["policy"] == "static"}
+    assert by_set["code"]["hit_rate"] == 0.0    # trained on chat alone
+
+
 # ---------------------------------------------------------------------------
 # trace file format
 # ---------------------------------------------------------------------------

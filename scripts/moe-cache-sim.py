@@ -150,6 +150,10 @@ def trace_set(trace):
     return str(trace.header.get("set", trace.header.get("id", "?")))
 
 
+def trace_id(trace):
+    return str(trace.header.get("id", trace.header.get("set", "?")))
+
+
 def _phase_ok(step_phase, phase):
     if phase == "all":
         return True
@@ -422,12 +426,17 @@ def sweep(sizes_by_format, train, test, budgets_bytes_per_layer, phase, adapt,
     return rows
 
 
-def sweep_loo(sizes_by_format, traces, budgets_bytes_per_layer, phase, adapt):
-    """Leave one prompt set out: train on every other set, test on that one."""
+def sweep_loo(sizes_by_format, traces, budgets_bytes_per_layer, phase, adapt,
+              by="set"):
+    """Leave one group out: train on every other group, test on that one.
+    by="set" holds out a whole prompt set (code vs chat vs long: does a profile
+    transfer across kinds of text); by="id" holds out one trace (Strata's
+    leave-one-prompt-out, where the other traces of the same set stay in)."""
+    key = {"set": trace_set, "id": trace_id}[by]
     rows = []
-    for held in sorted({trace_set(t) for t in traces}):
-        test = [t for t in traces if trace_set(t) == held]
-        train = [t for t in traces if trace_set(t) != held]
+    for held in sorted({key(t) for t in traces}):
+        test = [t for t in traces if key(t) == held]
+        train = [t for t in traces if key(t) != held]
         rows += sweep(sizes_by_format, train, test, budgets_bytes_per_layer,
                       phase, adapt, test_set=held)
     return rows
@@ -539,7 +548,9 @@ def main(argv=None):
     ap.add_argument("--train", nargs="+", default=[], metavar="TRACE")
     ap.add_argument("--test", nargs="+", default=[], metavar="TRACE")
     ap.add_argument("--loo", nargs="+", default=[], metavar="TRACE",
-                    help="leave one prompt set (header 'set') out")
+                    help="leave one group out (see --loo-by)")
+    ap.add_argument("--loo-by", choices=["set", "id"], default="set",
+                    help="group by header 'set' (cross-domain) or 'id' (one trace)")
     ap.add_argument("--gguf", action="append", default=[], metavar="LABEL=PATH",
                     help="expert sizes from this GGUF (first shard is enough); repeatable")
     ap.add_argument("--uniform-expert-bytes", action="append", default=[],
@@ -582,7 +593,7 @@ def main(argv=None):
     first_sizes = next(iter(sizes.values()))
     if a.loo:
         traces = [read_trace(p) for p in a.loo]
-        rows = sweep_loo(sizes, traces, budgets, a.phase, adapt)
+        rows = sweep_loo(sizes, traces, budgets, a.phase, adapt, by=a.loo_by)
         shown = traces
     else:
         if not a.test:
