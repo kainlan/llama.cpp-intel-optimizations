@@ -342,21 +342,33 @@ def test_every_onednn_soa_selection_site_consults_the_env_gate():
     classifiers = [
         (
             "static bool ggml_sycl_mul_mat_kernel_quantizes_src1(ggml_sycl_mul_mat_kernel kernel) {",
-            r"case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:\s*case ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL:\s*return false;",
+            "false",
             "ONEDNN_SOA must not be a src1-quantizing kernel",
         ),
         (
             "static bool ggml_sycl_mul_mat_kernel_draws_dequant_f16(ggml_sycl_mul_mat_kernel kernel) {",
-            r"case ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED:\s*case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:\s*return true;",
+            "true",
             "ONEDNN_SOA must be a dequant-f16-drawing kernel (its f16 arm materializes the weight)",
         ),
     ]
     classifier_spans = []
-    for classifier_sig, verdict_re, message in classifiers:
+    for classifier_sig, verdict, message in classifiers:
         classifier_start = ws_find(backend, classifier_sig)
         assert classifier_start >= 0, f"missing definition: {classifier_sig}"
         classifier_end = matching_brace(backend, backend.find("{", classifier_start)) + 1
-        assert re.search(verdict_re, backend[classifier_start:classifier_end]), message
+        span = backend[classifier_start:classifier_end]
+        # Exactly one label: the span exclusion below hides every ONEDNN_SOA label inside a classifier, so a
+        # second one (a nested switch, an appended case) must fail here instead of passing as "classifier".
+        n_labels = len(re.findall(r"case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:", span))
+        assert n_labels == 1, f"{classifier_sig} must carry exactly one `case ONEDNN_SOA:`, found {n_labels}"
+        # The label's fall-through group ends in `return <verdict>;`; other labels may sit on either side of
+        # it, so reordering the group is not a failure.
+        label_group = (
+            r"case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:\s*(?:case\s+[\w:]+:\s*)*return "
+            + verdict
+            + ";"
+        )
+        assert re.search(label_group, span), message
         classifier_spans.append((classifier_start, classifier_end))
     case_sites = [
         m.start()
