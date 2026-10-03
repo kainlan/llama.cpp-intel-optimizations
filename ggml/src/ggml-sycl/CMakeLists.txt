@@ -2404,7 +2404,7 @@ if (Python3_Interpreter_FOUND)
             ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-repeat-clean-exit.py
             3 $<TARGET_FILE:test-mem-handle-eviction>)
     set_tests_properties(mem-handle-eviction-b70-repeat-clean-exit PROPERTIES
-        LABELS "sycl;handle;eviction;B70;repeat;clean-exit"
+        LABELS "sycl;handle;eviction;B70;repeat;clean-exit;mem-handle"
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         RUN_SERIAL TRUE
         TIMEOUT 360
