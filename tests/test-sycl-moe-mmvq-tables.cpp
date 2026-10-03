@@ -181,14 +181,16 @@ int main() {
     // 5. The types with no _id kernel family must stay unadvertised. This is the
     //    half that keeps a future coverage pass honest: widening capability for
     //    these without adding the kernel turns a clean refusal into a wrong answer.
-    // The two families that remain refused, for different reasons. iq* has no
-    // generic mul_mat_vec_q<> tuple to transcribe (it uses per-type kernels), and
-    // the float types cannot use MMVQ at all -- it quantizes the activation to
-    // Q8_1 and dispatches vec_dot_*_q8_1, meaningless for float weights. Covering
-    // either must move this list in the same change, which is the point.
+    // The two families that remain refused, for different reasons. The iq* types
+    // other than IQ4_NL (covered since s36q: its dense kernel is the generic
+    // mul_mat_vec_q<> body with vec_dot_iq4_nl_q8_1) use per-type grid-lookup
+    // kernels with adjusted qi and no vec_dot parameter, so there is no generic
+    // tuple to transcribe; they are covered phase by phase. The float types cannot
+    // use MMVQ at all -- it quantizes the activation to Q8_1 and dispatches
+    // vec_dot_*_q8_1, meaningless for float weights. Covering either must move
+    // this list in the same change, which is the point.
     const ggml_type uncovered[] = { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_S,
                                     GGML_TYPE_F16,    GGML_TYPE_F32,     GGML_TYPE_BF16 };
-    // (IQ4_NL left this list with s36q; the rest of the iq* family follows phase by phase.)
     for (const ggml_type type : uncovered) {
         for (const ggml_layout_mode layout : all_layouts()) {
             if (moe_mmvq_capability_supports_layout(type, layout)) {

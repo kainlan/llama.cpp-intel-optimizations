@@ -22109,12 +22109,16 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 }
             }
             break;
-        // Second MMID consumer for the types llama.cpp-gx30 admitted. This switch is
-        // narrower than the set of _id launchers that exist, which is the gap the
-        // census hit at the sibling switch in ggml_sycl_mmvq_dispatch: a type the
-        // capability query admits can reach a consumer whose own switch never
-        // enumerated it. All of these are AoS-only per moe_mmvq_capability_supports_layout;
-        // the submit helpers re-check that and refuse rather than assume it.
+        // Second MMID consumer for the types llama.cpp-gx30 admitted. It sits in
+        // ggml_sycl_mul_mat_id_vec_q, which returns false at "type_unsupported" for
+        // every type outside {Q4_0, Q8_0, MXFP4} before it reaches this switch, so
+        // the Q1_0/NVFP4 and quant-AoS arms below are NOT reachable today: the live
+        // consumer of mmvq_submit_quant_aos_id / mmvq_submit_q1_nvfp4_aos_id is the
+        // first switch, in mmvq_moe_batched_dispatch. The arms are kept enumerated so
+        // the consumer-coverage gate holds both switches to the capability set, but
+        // that gate's coverage of this switch is not evidence the path runs. All of
+        // these are AoS-only per moe_mmvq_capability_supports_layout; the submit
+        // helpers re-check that and refuse rather than assume it.
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_NVFP4:
             if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||

@@ -622,10 +622,10 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
 // for llama.cpp-gx30: Q4_1, Q4_K, Q5_K, Q6_K, Q5_0, Q5_1, Q2_K, Q3_K -- every
 // type that has a generic mul_mat_vec_q<> instantiation to transcribe -- plus
 // IQ4_NL (llama.cpp-s36q), whose dense kernel is that generic body with
-// vec_dot_iq4_nl_q8_1. The rest of the iq* family is deliberately absent: those use per-type kernels
-// (mul_mat_vec_q_iq2_xxs_q8_1<> and friends, a different template with no
-// vec_dot parameter and adjusted qi), so there is no tuple to carry over and
-// covering them is separate work. Each dispatches the same
+// vec_dot_iq4_nl_q8_1. The rest of the iq* family is deliberately absent: those
+// use per-type kernels (mul_mat_vec_q_iq2_xxs_q8_1<> and friends, a different
+// template with no vec_dot parameter and adjusted qi), so there is no tuple to
+// carry over and covering them is separate work. Each dispatches the same
 // generic mmvq_submit_aos_id_impl<> that Q1_0/NVFP4 use; the per-type template
 // tuple is transcribed verbatim from the already-shipped non-indexed launcher
 // (mul_mat_vec_<t>_q8_1_sycl), because the two kernels share identical block
