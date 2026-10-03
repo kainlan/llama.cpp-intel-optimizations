@@ -27209,8 +27209,7 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
                                 extra->data_device_ptr(dev_id));
             }
         }
-    } else if ((tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q4_K || tensor->type == GGML_TYPE_Q6_K ||
-                tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_MXFP4) &&
+    } else if (ggml_sycl_soa_reorder_supported_type(tensor->type) &&
                (ggml_sycl_reorder_enabled() || ggml_sycl_unified_kernel_requires_aos(tensor->type))) {
         // Reuse an existing extra if present.  Do NOT overwrite it or we lose the
         // model_id for unified cache lookups.
@@ -36705,10 +36704,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // 2. GET_ROWS for Q4_0/Q8_0 already handles SoA layout via is_soa() check
     // 3. GET_ROWS for Q6_K is now supported on GPU (SoA and coalesced layouts)
     bool do_reorder = false;
-    bool type_ok =
-        (tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_Q4_K ||
-
-         tensor->type == GGML_TYPE_Q6_K || tensor->type == GGML_TYPE_MXFP4);
+    bool type_ok     = ggml_sycl_soa_reorder_supported_type(tensor->type);
     bool dims_ok     = tensor->ne[0] > 0 && tensor->ne[1] > 0;
     bool full_tensor = (offset == 0 && size == ggml_nbytes(tensor));
     if (type_ok && ggml_sycl_reorder_allowed_for_type(tensor->type) && ctx->supports_soa_reorder && dims_ok &&
@@ -55393,9 +55389,7 @@ static void reorder_mxfp4_dpas_cpu(void * dst_dpas, size_t dst_size, const void 
 // Check if tensor is eligible for CPU-side SoA reorder during upload
 static bool should_cpu_reorder(const ggml_tensor * tensor, const ggml_backend_sycl_buffer_context * ctx) {
     // Supported quantized types for CPU-side SoA reorder
-    if (tensor->type != GGML_TYPE_Q4_0 && tensor->type != GGML_TYPE_Q8_0 && tensor->type != GGML_TYPE_Q4_K &&
-
-        tensor->type != GGML_TYPE_Q6_K && tensor->type != GGML_TYPE_MXFP4) {
+    if (!ggml_sycl_soa_reorder_supported_type(tensor->type)) {
         return false;
     }
     // Check if reordering is allowed for this type (unified kernel requires AoS)
@@ -55844,17 +55838,10 @@ bool reorder_tensor_to_soa(const ggml_tensor * tensor, dpct::queue_ptr stream, c
         return false;
     }
     // Check if type is supported
-    switch (tensor->type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q6_K:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_MXFP4:
-            break;  // Supported
-        default:
-            fprintf(stderr, "[REORDER-UNIFIED] ERROR: tensor '%s' type %d not supported for SoA\n", tensor->name,
-                    tensor->type);
-            return false;
+    if (!ggml_sycl_soa_reorder_supported_type(tensor->type)) {
+        fprintf(stderr, "[REORDER-UNIFIED] ERROR: tensor '%s' type %d not supported for SoA\n", tensor->name,
+                tensor->type);
+        return false;
     }
     // DO THE REORDER - transform data from AoS to SoA
 
@@ -67152,9 +67139,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         // Only enforce layout choices for quantized types that support reordering.
         // Float types (F32, F16, BF16) don't have reordered layouts and should
         // always use their default kernel paths regardless of layout finalization.
-        const bool type_has_reorder_support =
-            (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K ||
-             src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_MXFP4);
+        const bool type_has_reorder_support = ggml_sycl_soa_reorder_supported_type(src0->type);
         // Use resolve().layout — no finalization gate needed.
         bool enforce_layout_choice = !has_override && ggml_sycl_tensor_is_weight(src0) && type_has_reorder_support;
         layout_mode chosen_layout  = GGML_LAYOUT_AOS;

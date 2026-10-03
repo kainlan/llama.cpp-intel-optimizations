@@ -1672,7 +1672,8 @@ struct layout_policy {
         }
 
         // Attention/FFN weights: COALESCED for best TG performance (tile-based warp-aligned access).
-        // Types that don't support coalesced fall through to the default SOA path below.
+        // Types that don't support coalesced fall through to the default path below (SOA when the type has
+        // an AOS->SOA reorder, AOS otherwise).
         //
         // Phase E (XMX-RESIZE): when GGML_SYCL_SKIP_ONEDNN_Q4_0=1 is set, Q4_0 PP
         // is routed through the unified XMX kernel which expects SOA or AOS weights
