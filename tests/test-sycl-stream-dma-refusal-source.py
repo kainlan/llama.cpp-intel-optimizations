@@ -208,3 +208,11 @@ def test_the_loop_header_includes_no_sycl_header():
     assert not re.search(
         r"#\s*include\s*[<\"][^>\"]*(sycl|unified-cache|ggml-sycl)", src
     ), "getrows-dma-retry.hpp must stay host-linkable"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

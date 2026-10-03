@@ -218,3 +218,11 @@ def test_planted_size_reader_is_seen():
     assert (
         len(hits) == 1 and "kv_size_for_layer" in hits[0]
     ), "the site reader cannot see a planted kv_size_for_layer read"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
