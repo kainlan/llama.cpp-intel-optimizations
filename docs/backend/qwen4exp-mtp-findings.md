@@ -109,7 +109,7 @@ Acceptance and tokens per round depend on the target and the prompts, not the ba
 
     scripts/qwen4exp-mtp-acceptance.sh --dry-run      # print the 24 commands
     scripts/qwen4exp-mtp-acceptance.sh                # run them, serially (SETS=base or SETS=p05 for 12)
-    # THREADS defaults to 16 (-t/-tb/-td/-tbd); the binary's own default of 4 ran 0.225 t/s.  WARM=1 pre-reads every shard.
+    # THREADS defaults to 16 (-t/-tb/-td/-tbd); the binary's own default of 4 ran 0.225 t/s.  WARM=1 reads every shard through dd and prints fincore.
 
 Target: the IQ3_XXS pair (76 GB, fits in page cache; the 177 GB Q8_0 would thrash it). Heads: ggml-org Q8_0
 and Q4_0, in `/models/Qwen3.8-Flash-Next-MTP/`. Arms: n-max {2, 3} x prompts {code, chat, reasoning},

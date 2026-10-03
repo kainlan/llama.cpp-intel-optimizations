@@ -29,8 +29,9 @@
 #   SETS [base p05], N_PREDICT, CTX, UBATCH
 #   THREADS  CPU threads, passed as -t/-tb and -td/-tbd [16].  The binary's own default
 #            was 4 threads on this 24-core host: 0.225 t/s, ~20 min per arm.
-#   WARM     1 = once, before the first arm, cat every shard of the target and the
-#            heads to /dev/null so the page cache is warm [0]
+#   WARM     1 = once, before the first arm, dd every shard of the target and the
+#            heads to /dev/null (userspace reads) and print fincore, so the page
+#            cache is warm and the log proves it [0]
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -116,11 +117,18 @@ echo "start:  $(meminfo)"
 
 mkdir -p "$OUT"
 if [ "$WARM" = 1 ]; then
-    # every shard of the split target (<stem>-NNNNN-of-MMMMM.gguf) plus both heads
+    # every shard of the split target (<stem>-NNNNN-of-MMMMM.gguf) plus both heads.
+    # dd, not `cat f > /dev/null`: coreutils cat can splice/copy_file_range straight to
+    # /dev/null without populating the page cache (measured: 70 GB in 43 s, 0 B resident
+    # on bcachefs).  dd read()s through userspace, so the pages do land in the cache.
     shards=("${TARGET%-*-of-*.gguf}"-*-of-*.gguf "$HEAD_Q8" "$HEAD_Q4")
     echo "warming page cache: ${#shards[@]} files ($(date +%H:%M:%S))"
-    cat "${shards[@]}" > /dev/null || { echo "warm-up read failed" >&2; exit 1; }
+    for f in "${shards[@]}"; do
+        dd if="$f" of=/dev/null bs=16M status=none || { echo "warm-up read failed: $f" >&2; exit 1; }
+    done
     echo "warmed ($(date +%H:%M:%S)): $(meminfo)"
+    # proof for the run log: resident bytes per file (a warm file shows its full size)
+    fincore -b "${shards[@]}" || echo "fincore unavailable or failed; warm state not proven" >&2
 fi
 logs=()
 for arm in $ARMS; do
