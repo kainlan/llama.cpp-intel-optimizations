@@ -108,8 +108,10 @@ inline bool residency_probe_out_declared(const ggml_sycl_residency_probe * out) 
 // kv_region_fit rounds a size up to its slot block, so a size within one block of SIZE_MAX wraps to a small number and
 // the layer would answer "device-resident" on no room at all.  Nothing real is near the bound (no zone holds a slot
 // that large), and with the descriptor reader's element cap (65536 layers, 65536 tenants) every sum the fit forms
-// from values at the bound stays below 2^63, so none of its arithmetic can wrap.  A count past it is a malformed
-// input, INVALID by name, never an answer.
+// from values at the bound stays below 2^63, so none of its arithmetic can wrap.  2^63 is the limit that matters:
+// kv_region_fit accumulates the slot totals in a signed `long long` (kv_charge in kv-runtime-demotion.cpp), so a change
+// to that accumulator, or a raise of the bound or the caps, must keep caps * (bound + round-up) below it.  A count
+// past the bound is a malformed input, INVALID by name, never an answer.
 constexpr size_t residency_probe_max_bytes = (size_t) 1 << 46;
 
 inline residency_probe_result residency_probe_core(const residency_probe_input & in) {

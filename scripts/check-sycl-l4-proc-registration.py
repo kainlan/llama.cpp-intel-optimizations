@@ -633,11 +633,11 @@ def probe_pins(source, fails):
         (r"if \(!backend \|\| !backend->context \|\| !ggml_backend_is_sycl\(backend\) \|\| !backend->device \|\|\s*"
          r"ggml_backend_dev_backend_reg\(backend->device\) != ggml_backend_sycl_reg\(\)\) \{[^{}]*"
          r"return GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND;\s*\}", "does not refuse a foreign backend"),
-        (r"if \(n_ctx == 0 \|\| n_ubatch == 0 \|\| n_seq_max == 0\) \{[^{}]*return GGML_SYCL_RESIDENCY_PROBE_INVALID;\s*\}",
-         "does not refuse a zero shape"),
+        (r"if \(n_ctx == 0 \|\| n_ubatch == 0 \|\| n_seq_max == 0\) \{[^{}]*"
+         r"return GGML_SYCL_RESIDENCY_PROBE_INVALID;\s*\}", "does not refuse a zero shape"),
         (r"if \(desc != nullptr\) \{[^}]*?ggml_sycl::parse_runtime_context_desc\(\s*desc,\s*geometry,[^;]*;\s*"
-         r"if \(status != ggml_sycl::runtime_context_desc_status::OK\) \{[^{}]*return GGML_SYCL_RESIDENCY_PROBE_INVALID;\s*\}",
-         "does not refuse a malformed descriptor"),
+         r"if \(status != ggml_sycl::runtime_context_desc_status::OK\) \{[^{}]*"
+         r"return GGML_SYCL_RESIDENCY_PROBE_INVALID;\s*\}", "does not refuse a malformed descriptor"),
         (r"if \(out->n_layer_cap < out->n_layer\) \{[^{}]*return GGML_SYCL_RESIDENCY_PROBE_N_LAYER_CAP_TOO_SMALL;\s*\}",
          "does not refuse a buffer smaller than the answer"),
     ]
@@ -1629,7 +1629,8 @@ def mutations(header_raw, source):
         ("the probe's struct gate no longer refuses", "does not gate the caller's result struct", SIG_PROBE,
          "        return GGML_SYCL_RESIDENCY_PROBE_INVALID;\n    }\n    out->n_layer = 0;",
          "        (void) 0;\n    }\n    out->n_layer = 0;"),
-        ("the probe's cap check admits an equal buffer's refusal", "does not refuse a buffer smaller than the answer", SIG_PROBE,
+        ("the probe's cap check refuses an equal buffer", "does not refuse a buffer smaller than the answer",
+         SIG_PROBE,
          "    if (out->n_layer_cap < out->n_layer) {", "    if (out->n_layer_cap <= out->n_layer) {"),
         ("the probe's cap check is removed", "does not refuse a buffer smaller than the answer", SIG_PROBE,
          "    if (out->n_layer_cap < out->n_layer) {", "    if (false) {"),
@@ -1639,8 +1640,17 @@ def mutations(header_raw, source):
          "        if (desc != nullptr) {\n            ggml_sycl::runtime_context_geometry geometry;",
          "        if (desc != nullptr && false) {\n            ggml_sycl::runtime_context_geometry geometry;"),
         ("the probe's foreign-backend check is removed", "does not refuse a foreign backend", SIG_PROBE,
-         "        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {\n        GGML_LOG_WARN(\"[RESIDENCY-PROBE]",
+         "        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {\n"
+         "        GGML_LOG_WARN(\"[RESIDENCY-PROBE]",
          "        false) {\n        GGML_LOG_WARN(\"[RESIDENCY-PROBE]"),
+        # the arms must run in order: each of these moves one arm above one that has to run first
+        ("the probe checks the shape before the backend", "before an earlier arm has run", SIG_PROBE,
+         re.compile(r"(    if \(!backend \|\| !backend->context[^{]*\{\n[^}]*FOREIGN_BACKEND;\n    \}\n)"
+                    r"(    if \(n_ctx == 0 \|\|[^{]*\{\n[^}]*\n    \}\n)"), r"\2\1"),
+        ("the probe checks the cap before the descriptor parse", "before an earlier arm has run", SIG_PROBE,
+         re.compile(r"(    try \{\n        if \(desc != nullptr\) \{[\s\S]*?\n    \}\n)"
+                    r"(?=    if \(out->n_layer_cap < out->n_layer\) \{\n)"
+                    r"(    if \(out->n_layer_cap < out->n_layer\) \{\n[^}]*\n    \}\n)"), r"\2\1"),
         ("the probe no longer writes the layer count", "does not write the layer count", SIG_PROBE,
          "            out->n_layer = (uint32_t) parsed.kv.layers.size();\n", ""),
         ("the probe's not-wired answer says nothing", "does not say why it did not answer",  SIG_PROBE,

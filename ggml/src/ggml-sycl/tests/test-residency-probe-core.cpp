@@ -332,8 +332,8 @@ void case_out_struct_gate() {
 // A byte count the fit would wrap on is INVALID before the fit runs: kv_region_fit rounds a size up to its slot
 // block, so a size within one block of SIZE_MAX wraps to a small number and the layer would answer "device-resident"
 // on no room at all.  The bound is residency_probe_max_bytes (1 << 46, 64 TiB): no zone holds a slot that large, and
-// the element counts (at most 65536 layers and 65536 tenants, the descriptor reader's cap) keep every sum the fit
-// forms below 2^63.
+// the element counts (at most 65536 layers and 65536 tenants, the descriptor reader's cap) keep the sums the fit
+// forms below 2^63 -- the limit that matters is the signed `long long` kv_charge accumulator in kv_region_fit.
 void case_byte_counts_at_the_arithmetic_edge() {
     const size_t max = ggml_sycl::residency_probe_max_bytes;
     const size_t big = (size_t) -1;
@@ -382,14 +382,29 @@ void case_byte_counts_at_the_arithmetic_edge() {
     CHECK(residency_probe_core(in).status == GGML_SYCL_RESIDENCY_PROBE_HEAD_SLOT_REFUSED,
           "a head slot of exactly the bound fits no zone: refused by name, not wrapped");
 
-    // the element counts the bound's arithmetic rests on
-    in = base;
-    in.layers.assign(65537, no_kv_layer());
+    // the element counts the bound's arithmetic rests on: exactly the cap is accepted, one past it is not
+    const uint32_t cap = ggml_sycl::RUNTIME_CONTEXT_DESC_MAX_ELEMENTS;
+    in                 = base;
+    in.layers.assign(cap, no_kv_layer());
+    CHECK(residency_probe_core(in).status == OK, "exactly the descriptor reader's cap of layers is accepted");
+    in.layers.assign(cap + 1, no_kv_layer());
     CHECK(residency_probe_core(in).status == bad, "more layers than the descriptor reader's cap is INVALID");
+
+    // (host-tier tenants name no zone, so the accepted case costs no fit)
+    auto host_tenant = [](uint32_t index) {
+        runtime_context_tenant t;
+        t.device     = -1;
+        t.cohort     = GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST;
+        t.slot_index = index;
+        t.slot_bytes = 1;
+        return t;
+    };
     in = base;
-    for (uint32_t i = 0; i < 65537; ++i) {
-        in.tenants.push_back(compute_tenant(0, i, 1));
+    for (uint32_t i = 0; i < cap; ++i) {
+        in.tenants.push_back(host_tenant(i));
     }
+    CHECK(residency_probe_core(in).status == OK, "exactly the descriptor reader's cap of tenants is accepted");
+    in.tenants.push_back(host_tenant(cap));
     CHECK(residency_probe_core(in).status == bad, "more tenants than the descriptor reader's cap is INVALID");
 }
 
