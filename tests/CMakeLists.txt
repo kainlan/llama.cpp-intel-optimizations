@@ -3393,6 +3393,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-5efe C1: the per-model lazy-range record and its pre-fill, driven over
+# a two-file GGUF fixture whose tables are sparse holes. Host-only: no backend,
+# device or model.
+foreach (lazy_range_test test-llama-lazy-range-record test-llama-lazy-range-prefill)
+    llama_build_and_test(${lazy_range_test}.cpp)
+    target_include_directories(${lazy_range_test} PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    set_tests_properties(${lazy_range_test} PROPERTIES LABELS "sycl;host;lazy")
+    set_property(TEST ${lazy_range_test} PROPERTY
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
+endforeach()
+
 # llama_mmap keeps MADV_HUGEPAGE off the lazily read ranges (llama.cpp-n77l),
 # checked through the VmFlags in /proc/self/smaps. Linux-only; exits 77 when
 # THP is unavailable, and fails when no VmFlags line can be read.

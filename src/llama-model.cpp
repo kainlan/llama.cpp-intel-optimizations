@@ -752,6 +752,51 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader &  ml,
 }
 #endif  // GGML_USE_SYCL || GGML_BACKEND_DL
 
+const std::vector<std::string> & llama_model_lazy_tensor_names(llm_arch arch) {
+    // the two architectures that create a table with TENSOR_READ_LAZY: qwen4exp
+    // (src/models/qwen4exp.cpp) and gemma4 (src/models/gemma4.cpp)
+    static const std::vector<std::string> qwen4exp = { LLM_TN(LLM_ARCH_QWEN4EXP)(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str() };
+    static const std::vector<std::string> gemma4   = { LLM_TN(LLM_ARCH_GEMMA4)(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str() };
+    static const std::vector<std::string> none;
+
+    switch (arch) {
+        case LLM_ARCH_QWEN4EXP: return qwen4exp;
+        case LLM_ARCH_GEMMA4:   return gemma4;
+        default:                return none;
+    }
+}
+
+llama_lazy_tensor_attrs llama_model_lazy_tensor_attrs(llm_arch arch, const llama_hparams & hparams, const std::string & name) {
+    const llama_lazy_tensor_attrs unknown = { 0, -1 };
+
+    switch (arch) {
+        case LLM_ARCH_QWEN4EXP:
+            if (name == LLM_TN(arch)(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str()) {
+                // the one layer that consumes the table comes from hparams, never a literal:
+                // the loader refuses more than one PLE layer (src/models/qwen4exp.cpp)
+                int32_t  consumer_layer = -1;
+                uint32_t n_set          = 0;
+                for (uint32_t il = 0; il < LLAMA_MAX_LAYERS; ++il) {
+                    if (hparams.is_ple_impl.test(il) && n_set++ == 0) {
+                        consumer_layer = (int32_t) il;
+                    }
+                }
+                if (n_set != 1) {
+                    consumer_layer = -1;
+                }
+                return { hparams.ple_n_heads, consumer_layer };
+            }
+            return unknown;
+        case LLM_ARCH_GEMMA4:
+            if (name == LLM_TN(arch)(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str()) {
+                return { 1, 0 };
+            }
+            return unknown;
+        default:
+            return unknown;
+    }
+}
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_CLIP:

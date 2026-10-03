@@ -4,6 +4,7 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hparams.h"
+#include "llama-lazy-range-record.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
@@ -884,6 +885,19 @@ const char * llm_type_name(llm_type type);
     const int64_t n_expert       = hparams.n_expert;         GGML_UNUSED(n_expert); \
     const int64_t n_expert_used  = hparams.n_expert_used();  GGML_UNUSED(n_expert_used); \
     const int64_t n_ctx_train    = hparams.n_ctx_train;      GGML_UNUSED(n_ctx_train);
+
+// The GGUF names, or name patterns with one "%d" standing for the block index, that
+// `arch` creates with TENSOR_READ_LAZY (llama.cpp-5efe C1). Static and immutable:
+// names only, no hparams-valued field. Keyed by arch: gemma3n creates the same
+// "per_layer_token_embd.weight" without the flag, so a name-only key would give
+// every gemma3n load a row. tests/test-llama-lazy-declaration-source.py pins every
+// entry to a flagged create_tensor() call in src/models/ and back.
+const std::vector<std::string> & llama_model_lazy_tensor_names(llm_arch arch);
+
+// One per-arch function, next to the declaration, reading the loaded hparams. The
+// pre-fill stores its result on that model's record entry; nothing is cached in a
+// static, because two loaded models may have different hparams.
+llama_lazy_tensor_attrs llama_model_lazy_tensor_attrs(llm_arch arch, const llama_hparams & hparams, const std::string & name);
 
 // For internal test use
 // TODO: remove
