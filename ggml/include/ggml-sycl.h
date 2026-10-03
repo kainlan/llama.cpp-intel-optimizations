@@ -1527,6 +1527,13 @@ GGML_BACKEND_API void ggml_backend_sycl_release_host_weight_extras(void);
 GGML_BACKEND_API void ggml_backend_sycl_set_sched_placement_plan(ggml_backend_sched_t sched);
 GGML_BACKEND_API bool ggml_backend_sycl_has_active_placement_plan(void);
 
+// The live bytes the unified cache's runtime-allocation registry holds under `role` (an ggml_sycl::alloc_role value) on
+// `device` (llama.cpp-th32 T1b), written to *out. Exported unconditionally, outside any GGML_SYCL_PRIVATE_TESTING block
+// and reachable through ggml_backend_reg_get_proc_address, so a test that links libllama and not ggml-sycl reads it
+// under GGML_BACKEND_DL=ON. Returns false, with *out zero, when the device has no cache, the role is out of range or
+// the arguments are invalid: a VOID reading, never a zero that could be mistaken for "nothing allocated".
+GGML_BACKEND_API bool ggml_backend_sycl_role_bytes_for_testing(int device, int role, uint64_t * out);
+
 // === Test-only debug accessors (llama.cpp-dfo0, plan task L2) ===
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // Process-global by design: ggml_backend_sched does not hand test code the

@@ -7478,6 +7478,11 @@ bool unified_cache_shutdown_state_clean() noexcept;
 bool unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept;
 bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[8]) noexcept;
 bool unified_cache_shutdown_allocation_control_census_for_test(uint64_t out[3]) noexcept;
+// The live bytes the runtime-allocation registry holds under `role` on `device` (llama.cpp-th32 T1b), written to
+// *out. Unconditional like the census accessors beside it, so a vehicle test that links libllama can read it through
+// ggml_backend_sycl_role_bytes_for_testing. Returns false, with *out zero, when the device has no cache or the
+// arguments are invalid: the reading is VOID, never a zero that could be mistaken for "nothing allocated".
+bool unified_cache_role_bytes_for_testing(int device, alloc_role role, uint64_t * out) noexcept;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void unified_cache_test_fail_next_arena_free();
 void unified_cache_test_fail_next_shutdown_clean();

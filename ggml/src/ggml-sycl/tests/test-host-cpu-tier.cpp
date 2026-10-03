@@ -283,6 +283,77 @@ void a_cohort_cannot_inherit_host_cpu() {
     std::cout << "PASS a-cohort-cannot-inherit-host-cpu\n";
 }
 
+// The role-bytes reading (llama.cpp-th32 T1b): the live bytes the registry holds under a role on a device, read through
+// the C++ accessor and through the exported wrapper that takes the role as an int. VOID (false, *out zero) when the
+// device has no cache, the role is out of range or an argument is invalid.
+void role_bytes_reading() {
+    uint64_t out = 123;
+    check(!unified_cache_role_bytes_for_testing(-1, alloc_role::LAZY_ROW_CACHE, &out) && out == 0,
+          "a negative device gave a reading");
+    out = 123;
+    check(!unified_cache_role_bytes_for_testing(0, alloc_role::LAZY_ROW_CACHE, nullptr), "a null out gave a reading");
+    out = 123;
+    check(!ggml_backend_sycl_role_bytes_for_testing(0, -1, &out) && out == 0, "a negative role gave a reading");
+    out = 123;
+    check(!ggml_backend_sycl_role_bytes_for_testing(0, (int) alloc_role::LAZY_OUTPUT + 1, &out) && out == 0,
+          "an out-of-range role gave a reading");
+
+    // no cache has been created in this process, so a reading for a valid device and role is VOID
+    uint64_t owners[4] = {};
+    check(unified_cache_shutdown_owner_census_for_test(owners), "the owner census is unavailable");
+    check(owners[0] == 0, "a device cache exists before the VOID arm: that arm would prove nothing");
+    out = 123;
+    check(!unified_cache_role_bytes_for_testing(0, alloc_role::LAZY_ROW_CACHE, &out) && out == 0,
+          "a device with no cache gave a reading");
+    out = 123;
+    check(!ggml_backend_sycl_role_bytes_for_testing(0, (int) alloc_role::LAZY_ROW_CACHE, &out) && out == 0,
+          "the export gave a reading for a device with no cache");
+
+    // the export is in the backend's proc-address table, which is how a test that links libllama reaches it
+    void * entry =
+        ggml_backend_reg_get_proc_address(ggml_backend_sycl_reg(), "ggml_backend_sycl_role_bytes_for_testing");
+    check(entry == (void *) ggml_backend_sycl_role_bytes_for_testing, "the proc-address table has no such entry");
+    std::cout << "PASS role-bytes-reading\n";
+}
+
+// The positive reading. It needs a device cache, which a host with no SYCL device cannot create, so ctest does not
+// run it: run the binary with --device-cache under a device selector (for example ONEAPI_DEVICE_SELECTOR=level_zero:1).
+// HOST_CPU allocations in two roles read back, through the C++ accessor and the exported wrapper, as exactly their
+// own sizes, a third role reads zero, and the readings return to where they were when the allocations are released.
+void role_bytes_with_a_device_cache() {
+    check(get_unified_cache_for_device(0) != nullptr, "no device cache for device 0");
+    const size_t row_bytes     = 64u * 1024u;
+    const size_t staging_bytes = 192u * 1024u;
+
+    auto read = [](alloc_role role) {
+        uint64_t cxx = 1;
+        uint64_t c   = 2;
+        check(unified_cache_role_bytes_for_testing(0, role, &cxx), "the reading is VOID with a device cache");
+        check(ggml_backend_sycl_role_bytes_for_testing(0, (int) role, &c), "the export is VOID with a device cache");
+        check(cxx == c, "the export and the C++ accessor disagree");
+        return cxx;
+    };
+    const uint64_t row_before     = read(alloc_role::LAZY_ROW_CACHE);
+    const uint64_t staging_before = read(alloc_role::LAZY_STAGING);
+    const uint64_t output_before  = read(alloc_role::LAZY_OUTPUT);
+
+    allocation_result row     = unified_allocate_owner(host_cpu_request(row_bytes, alloc_role::LAZY_ROW_CACHE));
+    allocation_result staging = unified_allocate_owner(host_cpu_request(staging_bytes, alloc_role::LAZY_STAGING));
+    skip_if_unlockable(row, host_cpu_mapped_size(row_bytes));
+    check(static_cast<bool>(row) && static_cast<bool>(staging), "the front door refused a valid HOST_CPU request");
+    check(read(alloc_role::LAZY_ROW_CACHE) == row_before + row_bytes,
+          "the row-cache role is not the allocation's size");
+    check(read(alloc_role::LAZY_STAGING) == staging_before + staging_bytes, "the staging role is not its size");
+    check(read(alloc_role::LAZY_OUTPUT) == output_before, "a role nothing allocated under moved");
+
+    row = {};
+    check(read(alloc_role::LAZY_ROW_CACHE) == row_before, "the row-cache reading did not return after the release");
+    check(read(alloc_role::LAZY_STAGING) == staging_before + staging_bytes, "the release moved another role");
+    staging = {};
+    check(read(alloc_role::LAZY_STAGING) == staging_before, "the staging reading did not return after the release");
+    std::cout << "PASS role-bytes-with-a-device-cache\n";
+}
+
 void device_mappable_by_tier() {
     memory_location loc{};
     loc.ptr  = (void *) 0x1000;
@@ -298,12 +369,17 @@ void device_mappable_by_tier() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "--device-cache") == 0) {
+        role_bytes_with_a_device_cache();
+        return 0;
+    }
     tier_selection_maps_must_host_cpu();
     tier_identity_registry_census_and_release();
     owner_class_does_not_follow_the_role();
     refusals_leave_nothing_behind();
     a_cohort_cannot_inherit_host_cpu();
     device_mappable_by_tier();
+    role_bytes_reading();
     return 0;
 }

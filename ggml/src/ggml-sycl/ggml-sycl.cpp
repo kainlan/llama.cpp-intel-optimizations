@@ -111844,6 +111844,16 @@ extern "C" bool ggml_backend_sycl_test_allocate_predictor_scores() {
 
 #endif
 
+extern "C" bool ggml_backend_sycl_role_bytes_for_testing(int device, int role, uint64_t * out) {
+    if (out) {
+        *out = 0;
+    }
+    if (role < 0 || role > static_cast<int>(ggml_sycl::alloc_role::LAZY_OUTPUT)) {
+        return false;
+    }
+    return ggml_sycl::unified_cache_role_bytes_for_testing(device, static_cast<ggml_sycl::alloc_role>(role), out);
+}
+
 extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
     // Taken before the meta lock and released immediately: g_moe_bias_state_mutex
     // is strictly leaf (canonical §12.5), so it is never held across another.
@@ -112233,6 +112243,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
 #endif
     if (strcmp(name, "ggml_backend_sycl_test_moe_module_state_clean") == 0) {
         return (void *) ggml_backend_sycl_test_moe_module_state_clean;
+    }
+    if (strcmp(name, "ggml_backend_sycl_role_bytes_for_testing") == 0) {
+        return (void *) ggml_backend_sycl_role_bytes_for_testing;
     }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_backend_sycl_test_hold_live_update") == 0) {

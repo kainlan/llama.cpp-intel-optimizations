@@ -20854,6 +20854,39 @@ bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[8]) noexc
     }
 }
 
+bool unified_cache_role_bytes_for_testing(int device, alloc_role role, uint64_t * out) noexcept {
+    if (!out) {
+        return false;
+    }
+    *out = 0;
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    try {
+        {
+            // Observational, like the validator: never create a cache merely to read it.
+            std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+            const auto                          it = g_device_caches.find(device);
+            if (it == g_device_caches.end() || !it->second) {
+                return false;
+            }
+        }
+        uint64_t                    sum = 0;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        for (const auto & kv : g_runtime_alloc_registry) {
+            const alloc_metadata & h = kv.second.handle;
+            if (h.ptr && h.device == device && h.role == role) {
+                sum += h.size;
+            }
+        }
+        *out = sum;
+        return true;
+    } catch (...) {
+        *out = 0;
+        return false;
+    }
+}
+
 static const char * allocation_control_class_name(allocation_control_class ownership_class) noexcept {
     switch (ownership_class) {
         case allocation_control_class::CACHE_BACKING: return "cache-backing";
