@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next (qwen4exp) MTP: feasibility findings
 
-Tracker: `llama.cpp-0rhb`. Written 2026-10-03. Status: **acceptance not yet measured; SYCL wiring on hold.**
+Tracker: `llama.cpp-0rhb`. Written 2026-10-03. Status: **CPU-only acceptance and decode speedup measured 2026-10-03 (24 arms + 3 interleaved baseline pairs); SYCL/hybrid not measured; SYCL wiring on hold.**
 
 Question: can we draft with the model's MTP head and verify with the trunk (Strata's "verify window",
 1.6-1.8x at 2-bit), and is it worth wiring on the SYCL backend given our per-token expert-read cost?
@@ -57,11 +57,12 @@ with no target here were dropped. Also fixed in the same series: the one-line `s
 the draft model was loaded from `params.model.path` instead of the draft path (`4679665af` separately guards
 a pre-existing `-DGGML_SYCL=OFF` compile break in `llama-model-loader.cpp`).
 
-Verified: a CPU-only build compiles and links `llama-speculative-simple`. **Not verified**: any model load
-(the lead runs those), the converter (`conversion/qwen4exp.py`, needs the BF16 checkpoint), and anything
-on SYCL.
+Verified: a CPU-only build compiles and links `llama-speculative-simple`, and the lead ran it on the IQ3_XXS
+target with both heads (see "Measured results"): output is accepted-token-exact greedy decoding with real
+draft acceptance. **Not verified**: the converter (`conversion/qwen4exp.py`, needs the BF16 checkpoint) and
+anything on SYCL.
 
-## Expected speedup at our expert-read cost (estimate, not a measurement)
+## Expected speedup at our expert-read cost (Phase-1 estimate; superseded for CPU decode by the measurements below)
 
 Per-token decode `t1 = A + E`, where `A` is everything that is not the expert reads (GPU dense, GDN, QSA,
 launch) and `E` is the host expert-read time. A round with `k` drafts verifies `n = k + 1` tokens:
@@ -120,11 +121,144 @@ and `--target llama-speculative-simple`. It is a model load: run it by hand, one
 parser (`scripts/parse-qwen4exp-mtp-acceptance.py`, gate `test-qwen4exp-mtp-acceptance-parser`) rejects a
 log with `n_drafted = 0` instead of reporting 0% acceptance, because that is speculation that never ran.
 
-To turn the table above into a number, two more measurements are needed: a `llama-bench` decode baseline on
-the SYCL build, and the GPU-busy versus CPU-expert-pool-busy split per token (that gives `A` and `E`).
+To turn the estimate table above into a number for SYCL, two more measurements are needed: a `llama-bench`
+decode baseline on the SYCL build, and the GPU-busy versus CPU-expert-pool-busy split per token (that gives
+`A` and `E`).
+
+## Measured results (CPU-only, IQ3_XXS target, 2026-10-03)
+
+Setup. Binary: CPU-only `build-cpu` at `b8fedecc7`. Target: ISTA-DASLab GSQ-RCO IQ3_XXS. Settings of every
+arm: `-t/-tb/-td/-tbd 16`, `-lm none -lzm on` (RSS 47 GB), `-c 4096 -ub 512 -ngl 0`, 256 new tokens, greedy,
+seed 42, prompts = the three pre-rendered files in `scripts/qwen4exp-mtp-prompts/`. Host load average was
+~36-57 during the arm sets and ~28-38 during the pairs (a codescout re-index plus ambient load). Logs: scratchpad `mtp-arms/out/*.log` (24 arms),
+`mtp-arms/run-base.out` and `run-p05.out` (the parser tables below), `mtp-arms/pairs/*.log` with
+`run-pairs.sh`/`run-pairs.out` (baseline pairs). Acceptance is deterministic (the same config run twice gave
+identical `n_drafted`/`n_accept`); decode t/s is not (see Caveats).
+
+**Terms.** `accept%` = `n_accept / n_drafted`. `mean_len` = tokens produced per verify round, i.e. 1 + accepted
+drafts (a round is one verify batch; for `q4_n3_code`: 189 accepted / 71 rounds + 1 = 3.66, matching the
+`#mean acc len` line). Pooled rows are token-weighted for accept% and a plain mean over the 3 prompts for
+`mean_len`.
+
+Per arm, base set (p-min 0.00, never filtered; from `run-base.out`):
+
+| arm | n_drafted | n_accept | accept% | mean_len | acc/pos | decode t/s |
+|---|---:|---:|---:|---:|---|---:|
+| q8_n2_code | 180 | 169 | 93.89 | 2.88 | 0.98, 0.90 | 1.92 |
+| q8_n2_chat | 230 | 143 | 62.17 | 2.24 | 0.73, 0.51 | 1.57 |
+| q8_n2_reasoning | 185 | 166 | 89.73 | 2.78 | 0.94, 0.85 | 1.93 |
+| q8_n3_code | 210 | 189 | 90.00 | 3.70 | 0.96, 0.91, 0.83 | 2.29 |
+| q8_n3_chat | 311 | 155 | 49.84 | 2.49 | 0.75, 0.48, 0.26 | 1.30 |
+| q8_n3_reasoning | 213 | 189 | 88.73 | 3.66 | 0.94, 0.90, 0.82 | 1.73 |
+| q4_n2_code | 178 | 170 | 95.51 | 2.91 | 0.98, 0.93 | 2.01 |
+| q4_n2_chat | 222 | 147 | 66.22 | 2.32 | 0.78, 0.54 | 1.51 |
+| q4_n2_reasoning | 188 | 165 | 87.77 | 2.76 | 0.92, 0.84 | 2.06 |
+| q4_n3_code | 211 | 189 | 89.57 | 3.66 | 0.96, 0.89, 0.82 | 2.30 |
+| q4_n3_chat | 311 | 155 | 49.84 | 2.49 | 0.77, 0.46, 0.26 | 1.33 |
+| q4_n3_reasoning | 225 | 185 | 82.22 | 3.47 | 0.92, 0.84, 0.71 | 1.95 |
+
+Per arm, p-min 0.5 set (`--spec-draft-p-min 0.5`; from `run-p05.out`):
+
+| arm | n_drafted | n_accept | accept% | mean_len | acc/pos | decode t/s (unreliable) |
+|---|---:|---:|---:|---:|---|---:|
+| q8_n2_p05_code | 177 | 169 | 95.48 | 2.88 | 0.98, 0.90 | 1.75 |
+| q8_n2_p05_chat | 189 | 136 | 71.96 | 2.11 | 0.68, 0.43 | 1.77 |
+| q8_n2_p05_reasoning | 177 | 164 | 92.66 | 2.74 | 0.90, 0.84 | 1.82 |
+| q8_n3_p05_code | 205 | 190 | 92.68 | 3.71 | 0.97, 0.91, 0.83 | 2.20 |
+| q8_n3_p05_chat | 227 | 148 | 65.20 | 2.35 | 0.69, 0.40, 0.26 | 1.71 |
+| q8_n3_p05_reasoning | 202 | 188 | 93.07 | 3.61 | 0.96, 0.86, 0.79 | 2.37 |
+| q4_n2_p05_code | 178 | 170 | 95.51 | 2.91 | 0.98, 0.93 | 2.33 |
+| q4_n2_p05_chat | 190 | 140 | 73.68 | 2.19 | 0.73, 0.46 | 2.00 |
+| q4_n2_p05_reasoning | 179 | 163 | 91.06 | 2.70 | 0.93, 0.77 | 2.89 |
+| q4_n3_p05_code | 211 | 189 | 89.57 | 3.66 | 0.96, 0.89, 0.82 | 2.33 |
+| q4_n3_p05_chat | 217 | 152 | 70.05 | 2.45 | 0.70, 0.49, 0.25 | 1.96 |
+| q4_n3_p05_reasoning | 202 | 187 | 92.57 | 3.56 | 0.94, 0.86, 0.75 | 2.46 |
+
+Pooled per head x n-max x p-min (3 prompts each, from the parser's group rows):
+
+| head | n-max | p-min none: accept% / mean_len | p-min 0.5: accept% / mean_len |
+|---|---:|---|---|
+| q8 | 2 | 80.34 / 2.63 | 86.37 / 2.58 |
+| q4 | 2 | 81.97 / 2.66 | 86.47 / 2.60 |
+| q8 | 3 | 72.62 / 3.28 | 82.97 / 3.22 |
+| q4 | 3 | 70.82 / 3.21 | 83.81 / 3.22 |
+
+**Findings.**
+- **The Q4_0 head equals the Q8_0 head within noise; use Q4_0 (2.2 GB against 4.1 GB).** Pooled accept% differs by
+  at most 1.8 points (n2 base 81.97 vs 80.34; n3 base 70.82 vs 72.62; p05 86.47 vs 86.37 and 83.81 vs 82.97) and the
+  sign flips between rows. The largest single-arm gap is 6.5 points (n3 reasoning, 88.73 for Q8 vs 82.22 for Q4);
+  the n3 chat arms are identical (155/311 for both heads).
+- **p-min 0.5 raises acceptance and does not lengthen rounds.** Pooled accept% goes 80-82% to ~86% at n2 and
+  71-73% to ~83-84% at n3, while pooled `mean_len` stays at 2.58-2.66 (n2) and 3.21-3.28 (n3); at n2 it is a
+  little lower (-0.05 to -0.06). The gain is wasted drafts removed, not more accepted tokens: `n_drafted`
+  for the n3 chat arms falls from 311 to 227 (Q8) and 217 (Q4), about -27% to -30%, with `n_accept` 155 to 148/152.
+  So it saves draft compute, and nothing else. Chat benefits most (accept% n2 62-66 to 72-74; n3 50 to 65-70).
+  Whether the saved draft steps show up as t/s is not measured, because the p05 decode t/s is unreliable (Caveats).
+- **Acceptance depends strongly on the prompt.** At n2: code 93.9-95.5% and reasoning 87.8-89.7% (base), 91.1-95.5%
+  (p05), against chat 62.2-66.2% (base), 72.0-73.7% (p05). At n3 chat is the outlier, 49.8% base and 65.2-70.1%
+  with p-min 0.5; code and reasoning stay at 82-93%. Position 1 accepts 0.90-0.98 on code and reasoning;
+  chat is 0.68-0.78 at position 1 and falls to 0.25-0.26 at position 3.
+- **n3 buys longer rounds only where acceptance is high.** `mean_len` n3 over n2: code 3.66-3.70 vs 2.88-2.91,
+  reasoning 3.47-3.66 vs 2.76-2.78, chat 2.49 vs 2.24-2.32 (base). Base-set decode t/s agrees (code n3 2.29-2.30
+  against n2 1.92-2.01; chat n3 1.30-1.33 against n2 1.51-1.57, so n3 is slower on chat), but under load; see
+  Caveats.
+
+**Decode speedup against no MTP (CPU decode, Q4_0 head, n-max 2).** One interleaved pair per prompt on the same
+host state (order AB for code, BA for chat, AB for reasoning), same flags, target loaded identically. Baseline:
+`llama-completion -no-cnv`, t/s from `common_perf_print` "eval time"; MTP: `llama-speculative-simple`, t/s from
+"decoded ... speed". Logs: `pairs/base_<prompt>_1.log`, `pairs/mtp_<prompt>_1.log`.
+
+| prompt | baseline t/s (ms/token) | MTP t/s | speedup (this pair) | MTP t/s, same config in the arm run | speedup using that |
+|---|---|---:|---:|---:|---:|
+| code | 1.28 (782.8) | 2.24 | 1.75x | 2.01 | 1.57x |
+| chat | 1.39 (717.4) | 2.13 | 1.53x | 1.51 | 1.09x |
+| reasoning | 1.39 (719.1) | 2.06 | 1.48x | 2.06 | 1.48x |
+
+The pair figures, 1.48-1.75x, are what the interleaved protocol produced. The last two columns are the same MTP
+configuration (q4_n2, base) as measured in the arm set under a different load phase: identical acceptance (170,
+147, 165 accepted), but a decode rate that differs by 11% for code, **41% for chat**, and 0% for reasoning. So one
+run's t/s carries roughly that much load noise, and the chat speedup in particular could be anywhere from 1.1x to
+1.5x on this evidence; the lower number is the one to quote if only one is quoted. All of these are well above the
+Phase-1 estimate for IQ3_XXS (0.72-1.24x).
+
+*Hypothesis for the gap (not tested):* the estimate assumed the verify batch reads `m(n)` x the experts of one
+token. On this CPU path the baseline decodes at ~0.75 s/token for roughly 0.75 GiB of expert reads per token, about
+1 GB/s, so decode is limited by compute and per-token overhead (IQ3 dequant, many small expert matmuls, thread
+sync), not by DRAM bandwidth. A 2-3 token batch can reuse dequantized expert rows across tokens that route to the
+same expert and pays the per-layer overhead once, so it costs much less than 2-3 single-token steps. If so, the
+estimate's `E` term was pessimistic for this path and it says nothing about a GPU or hybrid path, where the
+cost structure differs.
+
+**Compared with upstream's report** (PR #29761: 0.640 acceptance, 1.55x, IQ4_XS, n-max 3, all-VRAM DGX Spark, 24
+prompts over 7 categories): our pooled n3 acceptance without p-min is 70.8-72.6% over 3 prompts only, higher than
+0.640, but the spread is large (chat 49.8%, code and reasoning 82-90%) and the target quant, prompts and head
+differ, so this is not a like-for-like confirmation. Our 1.48-1.75x is at n-max 2 on CPU and the PR's 1.55x is at
+n-max 3 on VRAM-resident weights: similar magnitude, different configuration, no direct comparison.
+
+**Caveats.**
+- CPU-only, IQ3_XXS target, no GPU involved. Hybrid (device-resident dense + host experts) and SYCL are not measured.
+- One pair per prompt for the speedup; the run-to-run spread above (up to 41% on chat) is larger than the
+  differences between most arms. Acceptance is exact and repeatable; decode t/s is not.
+- Load average ~28-57 over the campaign. A build ran concurrently with the p05 set, so p05 decode t/s is
+  not comparable with the base set and is marked unreliable above. The base-set t/s are also load-affected.
+- The pair baseline and the MTP arm are different binaries (`llama-completion` vs `llama-speculative-simple`)
+  and take t/s from different timers; the same flags and the same host state, not the same code path, make them
+  comparable.
+- Three prompts, 256 tokens each, one seed, pre-rendered chat-template prompts fed raw; pooled figures
+  inherit that sample size.
 
 ## Decision
 
-Hold the SYCL wiring until measured acceptance and measured `A`/`E` give `S > ~1.2x`. On the estimate that
-happens for IQ3_XXS with a hot VRAM expert cache or a mostly-resident configuration, not for Q8_0 as it
-stands.
+Acceptance is no longer the open question: at n-max 2 it is 62-96% depending on the prompt (80-82% pooled,
+~86% with p-min 0.5) and the Q4_0 head is as good as the Q8_0 head. The CPU decode speedup measured here is
+1.48-1.75x (single interleaved pairs, load-affected; chat as low as 1.1x on a repeat), well above the Phase-1
+estimate for this target.
+
+Still holding the SYCL wiring, because the measurement does not cover the placement we run. What is left to
+establish, and where the hold is decided: (1) the GPU-busy versus CPU-expert-pool-busy split per token (`A` and
+`E`) on the SYCL build; (2) whether the host-resident-expert verify batch (k+1 tokens through the CpuExpertPool
+path) is cheaper than k+1 single-token steps, which is the hypothesis above and is what the CPU result implies
+for the hybrid path; (3) the SYCL risks listed above (second model and context on one device, draft-context
+compute buffer). If the CPU-pool batching holds, the working recommendation for a first SYCL attempt is the
+Q4_0 head, n-max 2, `--spec-draft-p-min 0.5` for chat-like workloads. Keep the `S > ~1.2x` bar for deciding
+whether to wire it.
