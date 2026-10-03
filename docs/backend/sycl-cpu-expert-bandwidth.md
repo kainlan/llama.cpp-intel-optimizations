@@ -5,9 +5,10 @@ CPUs (P-cores = CPUs 0-7, E-cores = 8-23), AVX2 + AVX-VNNI + AVX-VNNI-INT8, **no
 AVX-512**, 2 DDR5 channels. `dmidecode` reports 4 x 64 GB Micron DDR5, configured
 speed 5600 MT/s (2 DIMMs per channel), so the theoretical peak is
 5600 MT/s x 8 B x 2 channels = 89.6 GB/s. L2 40 MB, L3 36 MB. Measured
-2026-10-03 under the permanent ambient load: load average 45-70 for the STREAM
-and 1-4 thread runs, 32-41 for the 8-24 thread runs (snapshots in the data
-directory).
+2026-10-03 under the permanent ambient load: 1-minute load average 45-70 for the
+STREAM and 1-4 thread runs (read from `uptime` at the time; **no snapshot of
+those runs was saved**), 32-34 for the 8-24 thread runs (five snapshots in the
+data directory).
 
 "Placement decides the executor" puts host-resident experts on the CPU, so the
 CPU expert matvec is the decode path for every expert that does not fit in VRAM.
@@ -53,6 +54,31 @@ python3 tools/cpu-expert-bench/run_expert_sweep.py --bin build/bin/bench-cpu-exp
     --bursts 8 --burst-calls 3 --pool-mb 256
 ```
 
+The 8-24 thread runs, the paired ratios and the top-k runs (one process at a time;
+`V` is the variant list, `S`/`B` the script and binary):
+
+```bash
+V=prod,prod+pin,prod+pinE,prod+pinS,vecdot,vecdot+pin,read,read+pin,r8,r8+pin,mx8,mx8+pin,mx16,mx16+pin,q2,q2+pin,q8_4row,q8_4row_pf
+S=tools/cpu-expert-bench/run_expert_sweep.py; B=build/bin/bench-cpu-expert-matvec
+python3 $S --bin $B --rounds 3 --threads 8,12,16,20,22,24 --out hi-qwen.csv -- \
+    --types q8_0,mxfp4,iq4_nl,iq3_xxs,q2_0 --shapes qwen38 --mats gate,down --variants $V \
+    --bursts 8 --burst-calls 3 --pool-mb 256 > hi-qwen.summary 2> hi-qwen.log
+python3 $S --bin $B --rounds 3 --threads 8,12,16,20,22,24 --out hi-gptoss.csv -- \
+    --types q8_0,mxfp4 --shapes gptoss --mats gate,down --variants $V \
+    --bursts 8 --burst-calls 3 --pool-mb 256 > hi-gptoss.summary 2> hi-gptoss.log
+for k in 1 2 3; do
+  python3 $S --bin $B --rounds 3 --threads 22 --out topk$k.csv -- \
+      --types q8_0,mxfp4,q2_0 --shapes qwen38 --mats gate --variants prod,prod+pin,read,read+pin \
+      --bursts 16 --burst-calls 4 --pool-mb 256 --topk $k > topk$k.summary 2> topk$k.log
+done
+# paired ratios (pairs-8-24-threads.csv) from a saved raw CSV; the pair names are those in that file:
+python3 $S --from-csv hi-qwen.csv --pairs prod+pin:prod,prod+pinE:prod,prod+pinS:prod,prod:vecdot,prod+pin:vecdot+pin,prod+pin:read,prod+pin:read+pin,vecdot+pin:vecdot,read+pin:read,r8+pin:prod+pin,mx8+pin:prod+pin,q2+pin:prod+pin,mx8:vecdot,q2:prod
+```
+
+The raw call CSVs are not committed (large); the summaries, pairs, pin-sample totals
+and a digest of the stderr are (see Data), so the committed files reproduce every
+number in this document except the per-call distributions.
+
 Shapes (experts, batch 1, one MUL_MAT_ID worth of rows per call): GPT-OSS 20B =
 2880x2880 gate/up/down, MXFP4, top-4; Qwen3.8-Flash-Next = hidden 2560,
 intermediate 640 (gate/up N=640 K=2560, down N=2560 K=640), top-10. The
@@ -95,10 +121,12 @@ row NaN, one row off by 1.0) and requires the oracle to reject it; it did, for
 all five types, so the check can fail. All 13 configs of the 1-4 thread sweep
 passed.
 
-## STREAM baseline (GB/s, best / median over 15 trials, mean of 2 runs' medians)
+## STREAM baseline (GB/s, best / median over 15 trials)
 
-STREAM convention for copy/scale/triad (bytes read + written). `read` = weight
-bytes read, which is what a matvec moves. Pinned = thread i on CPU i (P-cores
+Cells are best / median: *best* is the fastest single trial of either of the 2
+runs (the maximum of the 2 runs' bests), *median* is the mean of the 2 runs'
+medians over their 15 trials. STREAM convention for copy/scale/triad (bytes read
++ written). `read` = weight bytes read, which is what a matvec moves. Pinned = thread i on CPU i (P-cores
 first). Raw rows: `sycl-cpu-expert-bandwidth-data/stream.csv`.
 
 Pinned:
@@ -121,11 +149,13 @@ Unpinned (scheduler free to migrate):
 
 The read median is **45-48 GB/s at 16-24 pinned threads** (about half the 89.6
 GB/s peak), and flat from ~16 threads (the median rises 40 -> 42 -> 45 -> 46 ->
-48 from 8 to 24 threads; the best barely moves above 8). One core pulls ~13 GB/s
+48 from 8 to 24 threads; the read best rises 52 -> 69 from 8 to 22 threads and
+is 54 at 24, a window of 20-40 ms that does not compare with sub-millisecond
+calls, see Method). One core pulls ~13 GB/s
 median. Pinning is worth +10-20 % in STREAM already (pinned read median 45-48 vs
 37-42 unpinned at 16-24 threads), which matches the +9-20 % the own-team `read`
 shows below. Whether the expert matvec is flat past ~16 threads is a separate
-question, answered by the next section (it is not: `prod` keeps rising to 24).
+question, answered by the next section (roughly yes, within noise: see there).
 
 ## The expert matvec (`prod`) against that baseline
 
@@ -133,8 +163,10 @@ question, answered by the next section (it is not: `prod` keeps rising to 24).
 
 Effective weight GB/s, Qwen3.8 gate shape (N=640 K=2560, k=10 experts per call),
 median (best) over 3 rounds x 8 bursts x 3 calls of the interleaved 1-thread run.
-No arena scheduling and (as `prod+pin` equals `prod` here) no pinning effect:
-this isolates the kernel. A single core pulls 14-16 GB/s median. The p10 of every
+No arena scheduling and no pinning effect worth separating at one thread
+(`prod+pin` and `prod` agree except where a load tail intervenes: Qwen IQ4_NL
+gate `prod` 3.0 against `prod+pin` 6.8 median, both with best 9.6, is such a
+tail artifact): this isolates the kernel. A single core pulls 14-16 GB/s median. The p10 of every
 cell is 2-5 GB/s (load tail); ratios are the better comparison.
 Raw: `sycl-cpu-expert-bandwidth-data/expert-1-2-4-threads.summary.csv`.
 
@@ -159,18 +191,33 @@ above (3 rounds x 8 bursts x 3 calls); 8-24 threads: the high-thread sweep (3
 rounds x 8 bursts x 3 calls, one process per thread count, variants interleaved
 burst by burst). Under the ambient load of the snapshots below, the p10 of every
 cell is 2-10 GB/s and the best is a ceiling-touching outlier; compare medians.
-All 13 configs of the high-thread sweep passed the oracle (exit 0).
+All 13 configs of the high-thread sweep passed the oracle (exit 0; IQ3_XXS
+`down` is skipped, K=640 is not a multiple of 256).
 
 | config | variant | 1 | 2 | 4 | 8 | 12 | 16 | 20 | 22 | 24 threads |
 |---|---|---|---|---|---|---|---|---|---|---|
 | Qwen Q8_0 gate | `prod` | 9.1 (13) | 5.5 (18) | 9.2 (16) | 20 (35) | 21 (46) | 25 (43) | 22 (58) | 28 (58) | 32 (66) |
 | Qwen Q8_0 gate | `prod+pin` | 8.9 (12) | 4.6 (17) | 6.0 (19) | 22 (37) | 25 (48) | 23 (50) | 23 (62) | 30 (67) | 28 (71) |
+| Qwen Q8_0 down | `prod` | 9.1 (14) | 9.2 (24) | 9.2 (24) | 19 (30) | 24 (41) | 20 (46) | 33 (58) | 43 (71) | 23 (58) |
+| Qwen Q8_0 down | `prod+pin` | 8.9 (13) | 11 (23) | 10 (22) | 18 (44) | 19 (47) | 21 (53) | 30 (63) | 47 (75) | 33 (74) |
+| GPT-OSS Q8_0 gate | `prod` | 8.8 (11) | 11 (19) | 12 (26) | 23 (34) | 30 (48) | 30 (52) | 34 (49) | 29 (51) | 34 (63) |
+| GPT-OSS Q8_0 gate | `prod+pin` | 9.0 (11) | 14 (20) | 15 (32) | 25 (37) | 31 (47) | 27 (47) | 28 (62) | 25 (69) | 34 (66) |
+| GPT-OSS Q8_0 down | `prod` | 7.4 (11) | 11 (21) | 11 (22) | 27 (36) | 31 (74) | 28 (49) | 34 (60) | 31 (59) | 26 (55) |
+| GPT-OSS Q8_0 down | `prod+pin` | 5.7 (11) | 14 (21) | 12 (28) | 30 (39) | 32 (72) | 29 (48) | 36 (55) | 34 (61) | 32 (64) |
 | Qwen MXFP4 gate | `prod` | 2.3 (4.8) | 3.0 (6.5) | 3.2 (7.4) | 8.9 (20) | 12 (30) | 12 (37) | 15 (44) | 18 (47) | 21 (41) |
 | Qwen MXFP4 gate | `prod+pin` | 2.2 (4.8) | 3.1 (6.5) | 3.5 (8.8) | 7.6 (19) | 10 (30) | 8.8 (39) | 18 (45) | 20 (48) | 25 (67) |
+| Qwen MXFP4 down | `prod` | 3.8 (5.3) | 4.2 (13) | 4.1 (9.5) | 10 (21) | 13 (36) | 11 (33) | 20 (45) | 30 (63) | 20 (58) |
+| Qwen MXFP4 down | `prod+pin` | 3.9 (5.6) | 4.7 (14) | 4.4 (12) | 10 (21) | 14 (36) | 13 (44) | 21 (56) | 30 (69) | 18 (53) |
 | GPT-OSS MXFP4 gate | `prod` | 3.7 (5.1) | 4.3 (8.3) | 4.6 (10) | 13 (21) | 20 (54) | 17 (36) | 20 (48) | 22 (44) | 20 (47) |
 | GPT-OSS MXFP4 gate | `prod+pin` | 3.7 (5.5) | 4.6 (8.4) | 5.2 (12) | 14 (22) | 22 (48) | 16 (36) | 19 (54) | 21 (62) | 19 (65) |
+| GPT-OSS MXFP4 down | `prod` | 3.9 (6.0) | 3.2 (7.1) | 5.0 (14) | 13 (26) | 24 (52) | 16 (32) | 16 (45) | 16 (44) | 14 (40) |
+| GPT-OSS MXFP4 down | `prod+pin` | 3.8 (6.8) | 3.6 (8.0) | 6.4 (11) | 13 (25) | 21 (54) | 13 (33) | 22 (57) | 14 (54) | 20 (62) |
 | Qwen IQ4_NL gate | `prod` | 3.0 (9.6) | 6.6 (14) | 7.6 (16) | 16 (29) | 21 (43) | 18 (45) | 24 (54) | 28 (57) | 20 (67) |
 | Qwen IQ4_NL gate | `prod+pin` | 6.8 (9.6) | 3.7 (14) | 7.8 (17) | 16 (40) | 21 (47) | 18 (54) | 21 (57) | 25 (69) | 25 (63) |
+| Qwen IQ4_NL down | `prod` | 6.6 (9.6) | 8.6 (15) | 7.3 (16) | 16 (30) | 18 (43) | 20 (44) | 18 (50) | 22 (60) | 19 (49) |
+| Qwen IQ4_NL down | `prod+pin` | 6.8 (9.5) | 9.6 (17) | 7.4 (17) | 18 (40) | 24 (50) | 20 (51) | 20 (59) | 32 (67) | 30 (72) |
+| Qwen IQ3_XXS gate | `prod` | 5.4 (6.0) | 5.2 (11) | 5.2 (10) | 11 (30) | 16 (39) | 19 (42) | 15 (56) | 25 (52) | 20 (54) |
+| Qwen IQ3_XXS gate | `prod+pin` | 5.3 (6.1) | 5.4 (11) | 4.7 (10) | 9.7 (24) | 16 (37) | 17 (42) | 14 (53) | 21 (54) | 17 (62) |
 | Qwen Q2_0 gate | `prod` | 3.5 (3.6) | 3.3 (6.2) | 1.7 (6.6) | 8.5 (17) | 12 (27) | 10 (27) | 14 (40) | 16 (38) | 13 (48) |
 | Qwen Q2_0 gate | `prod+pin` | 3.5 (3.6) | 3.4 (6.5) | 3.3 (9.3) | 8.8 (25) | 14 (26) | 7.9 (35) | 13 (40) | 16 (50) | 13 (52) |
 | Qwen Q2_0 down | `prod` | 3.2 (3.6) | 3.3 (6.2) | 3.4 (8.4) | 8.6 (18) | 11 (26) | 9.9 (35) | 13 (33) | 17 (51) | 11 (39) |
@@ -179,31 +226,42 @@ All 13 configs of the high-thread sweep passed the oracle (exit 0).
 
 Every config and thread count is in the data directory
 (`expert-8-24-threads-qwen.summary.csv`, `expert-8-24-threads-gptoss.summary.csv`).
-`prod+pin` at 22 threads is 14-31 GB/s median across the 12 Qwen/GPT-OSS gate
-and down configs measured, i.e. **30-65 % of the pinned STREAM read median**
-(46); `prod` unpinned is 16-43. The aggregate scales with threads (e.g. Qwen Q8_0
-gate 9 -> 20 -> 25 -> 28 -> 32 at 1/8/16/22/24) but is neither flat past 16
-threads nor close to STREAM: the ratio to STREAM is what the next sections
+`prod+pin` at 22 threads is 14.4-46.7 GB/s median over the 13 configs, i.e.
+**31-102 % of the pinned STREAM read median** (46): Qwen Q8_0 down is the one
+config above the 37 GB/s Strata-equivalent target (46.7); GPT-OSS Q8_0 down
+(33.6), Qwen IQ4_NL down (31.6), Qwen Q8_0 gate (30.5) and Qwen MXFP4 down
+(30.1) are next, and the lowest are MXFP4 (14-30, GPT-OSS down 14.4) and Q2_0
+(16-22). `prod` unpinned at 22 threads is 16-43.
+
+**Scaling.** The pooled median over the 13 configs of `prod` is 13.3 / 19.9 /
+18.2 / 19.9 / 24.9 / 19.8 GB/s at 8 / 12 / 16 / 20 / 22 / 24 threads
+(`prod+pin`: 13.8 / 21.0 / 17.0 / 21.2 / 25.0 / 24.8). `prod` roughly doubles
+from 8 to 12-22 threads and is flat within noise from 12 threads on; 24 threads
+is above 22 in only 3 of the 13 `prod` configs. Each thread count is a separate
+process at a different moment of the ambient load, so single cells jump by up to
+2x between neighbours (Qwen Q8_0 down `prod`: 43 at 22 threads, 23 at 24);
+neither a plateau nor a rise is established beyond that. Neither is `prod` close
+to STREAM at any thread count: the ratio to STREAM is what the next sections
 explain.
 
 **Conditions.** The 8-24 thread runs and the pair ratios below ran under the
-host's ambient load, not a quiet host: load average 32.5-40.9 (1/5/15 min), CPU
-split 6-7 % user, 1-5 % system, **88-91 % nice, 0-1.6 % idle**, dominated by a
-codescout re-index at ~2200 % CPU plus Emby, the ws2022ci VM and Frigate (the
-`top` snapshots are `load-qwen.txt`, `load-gptoss.txt`, `load-topk{1,2,3}.txt`;
-`uptime` / `top -b -n1 | head -15` taken before each block). The model capture
-that would have corrupted the sweep had finished. Absolute numbers are depressed
-and noisy; the pairs are not. STREAM's pinned read median (46 at 22 threads,
-Method above) was taken earlier, at load 45-70.
+host's ambient load, not a quiet host. Five snapshots (`uptime` and `top -b -n1 |
+head -15`, taken before each block): 1-minute load average 32.0-34.3 (5-minute
+35.9-37.8, 15-minute 39.7-40.9); CPU 4-10 % user, 1-8 % system, **84-91 % nice,
+0-5 % idle**; a codescout re-index at 1950-2217 % CPU, plus Emby, the ws2022ci VM
+and Frigate. The files are `load-qwen.txt`, `load-gptoss.txt`,
+`load-topk{1,2,3}.txt`. The model capture that would have corrupted the sweep
+had finished. Absolute numbers are depressed and noisy; the pairs are not. The
+STREAM table and the 1-4 thread runs ran earlier at a 1-minute load of 45-70
+(no snapshot was saved).
 
 #### Correction: the earlier "pinning is worth 1.4-3.5x" is not reproduced
 
-An earlier version of this document, and the first draft of proposal 1, said that
-pinning the arena workers one per core, P-cores first, was worth 1.4-1.7x for
-Q8_0 and 2-3.5x for MXFP4 at 20-24 threads (`prod` 10-23 GB/s unpinned vs 19-37
-pinned). Those runs used a separate process per arm (the arms did not share host
-state), found the workers by thread-id order, compared against an unpinned
-own-team `read`, and ran at load ~70. In the burst-paired, in-process
+The earlier measurement behind "pinning the arena workers one per core, P-cores
+first, is worth 1.4-1.7x for Q8_0 and 2-3.5x for MXFP4 at 20-24 threads"
+(`prod` 10-23 GB/s unpinned vs 19-37 pinned) used a separate process per arm
+(the arms did not share host state), found the workers by thread-id order,
+compared against an unpinned own-team `read`, and ran at load ~70. In the burst-paired, in-process
 measurement at load ~33 the effect is **not there for `prod`**. Median over the 13
 configs of the per-config median of (arm / `prod`) in the same burst, 24 bursts
 per config per thread count:
@@ -216,9 +274,10 @@ per config per thread count:
 | `vecdot+pin` : `vecdot` (own team) | 1.34 | 1.28 | 1.38 | 1.22 | 1.09 | 1.09 |
 | `read+pin` : `read` (own team) | 1.20 | 1.16 | 1.18 | 1.13 | 1.09 | 1.10 |
 
-Pinning the TBB arena workers is worth **0-10 % on average** (one cell of 1.11 at
-24 threads, otherwise within noise of 1.0), and a shuffled pin does as well as
-the P-first pin, as does an E-core-only pin up to 20 threads. By contrast the
+The pooled `prod+pin : prod` ratio is **0.96-1.11** (1.11 at 24 threads,
+0.96-1.04 elsewhere, i.e. within noise of 1.0), a shuffled pin does as well as
+the P-first pin, and the E-core-only pin matches up to 16 threads (0.97-1.00;
+see the next section for 20-24). By contrast the
 same pin applied to the in-process own team is worth 1.1-1.4x. So the pin itself
 works (below) and helps a persistent team, and for `prod` it is not what limits
 throughput. Per type the `prod+pin : prod` median ratio at 22 threads is 0.99
@@ -246,16 +305,22 @@ config-runs of the two high-thread sweeps (`*.csv.stderr`):
 | 22 | 2471 / 4393 | 41 / 6823  | 2468 / 4396 |
 | 24 | 2482 / 5006 | 46 / 7442  | 2487 / 5001 |
 
-P-first pin puts the first 8 workers (plus main) on P-cores and the rest on
-E-cores as intended (the P count is flat at ~2470 because only 8 P-cores exist);
-the E-only pin keeps the samples on E-cores (the few P samples are workers sampled
-before their affinity took effect); the shuffled pin lands in between. At 22 and
+P-first pin puts main and the first 7 workers on the 8 P-cores (CPUs 0-7) and the
+rest on E-cores as intended (the P count is flat at ~2470 because only 8 P-cores
+exist); the E-only pin keeps the samples on E-cores (the few P samples are, as
+an assumption not tested without a new run, workers sampled before their
+affinity took effect); the shuffled pin lands in between. The E-only order is
+the 16 E-core CPUs 8-23 with worker i on slot (i+1) % 16, so at 20, 22 and 24
+threads it wraps and puts two threads on some E-cores: its 1.08 / 0.90 / 0.86
+at those counts is an oversubscribed control, not a like-for-like one (at 8-16
+threads no CPU is shared). At 22 and
 24 threads P-first and shuffled pin occupy (almost) the same set of CPUs and
 differ only in which worker is on which core, and they measure the same.
 The pin is in effect; it just does not move `prod`. At 22 threads for the large
 calls 21 active arena workers were found and pinned (IQ3_XXS: 21 found, 23 other
-idle threads left alone); the `--topk 1` Q2_0 call activates only 4 (a 640-row call has 10 chunks at the
-64-row grain floor).
+idle threads left alone); in the `--topk 1` runs the number found varies by
+round and type from 4 to 21 (`run-digest-8-24-threads.txt`; a 640-row call has
+at most 10 chunks at the 64-row grain floor).
 
 ### Why `prod` loses to the same kernel in a persistent team
 
@@ -274,7 +339,7 @@ the ratio is **dispatch path only**. Median over configs, per type, 8 / 12 / 16 
 | MXFP4 (n=4; kernel differs: 16-row tile vs ggml VNNI row) | 0.66 / 0.69 / 0.58 / 0.54 / 0.62 / 0.56 | 0.43 / 0.56 / 0.39 / 0.54 / 0.59 / 0.57 |
 
 So for the same instructions, production reaches about 0.66-0.97 (typically
-0.8) of a dynamic team unpinned and 0.56-0.99 of a *pinned* dynamic team (0.6-0.75
+0.8) of a dynamic team unpinned and 0.56-0.99 of a *pinned* dynamic team (0.56-0.74
 for Q8_0). That also revises the
 earlier Q8_0 statement that its headroom is "per-call overhead": it is, but
 the overhead is path-level, up to 25-45 % of throughput at 8-24 threads, not a
@@ -322,24 +387,28 @@ the kernel section.)
   ~12 scalar instructions (shift, cmp, cmov) per row per block. "Accumulators in
   memory" is the accurate wording, not "register spill". My out-of-line
   `mxfp4_rows<16>` compiles the same way (1 `vpdpbssd`, accumulators on the
-  stack) and measures the same as `prod` (1T gate: 4.9 vs 4.8 GB/s best), while
-  `mxfp4_rows<8>` unrolls (8 `vpdpbssd`, accumulators in registers) and measures
-  like ggml's one-row kernel (9.8 vs 9.9). So the A/B supports the tile shape,
-  not only the inference: 16 rows is ~2x slower than 8 rows or one row at one
-  thread. (My `mx16` is not byte-identical to the production kernel: no 2-block
+  stack) and measures the same as `prod` (1T Qwen gate, paired `ratio_read` 0.16
+  vs 0.17; medians 1.8 vs 2.3 GB/s), while `mxfp4_rows<8>` unrolls (8
+  `vpdpbssd`, accumulators in registers) and measures like ggml's one-row kernel
+  (`ratio_read` 0.53 vs 0.53; medians 8.0 vs 7.6). So the A/B supports the tile
+  shape, not only the inference: at one thread the 8-row tile is 1.6-3.5x the
+  16-row production kernel by medians (8.0 / 5.9 / 7.5 against 2.3 / 3.8 / 3.7
+  GB/s on Qwen gate, Qwen down, GPT-OSS gate). (My `mx16` is not byte-identical to the production kernel: no 2-block
   unroll and F16C for the activation scale instead of the table.)
 * **Q2_0** (64 weights / 18 bytes): ggml-cpu has only the scalar
-  `ggml_vec_dot_q2_0_q8_0_generic` on x86, 3.5 GB/s per core. My `q2` prototype
+  `ggml_vec_dot_q2_0_q8_0_generic` on x86, 3.2-3.5 GB/s median per core. My `q2` prototype
   is **single-row with no row tiling**: per 64 weights and one row it does one
   16 B weight load, 3 shifts, 4 ands, 4 `vpdpbusd`, and ~6 activation loads (4
   planes, the ysum, the scale). Those activation loads are identical for every
   row, so a multi-row tile (4 rows share one set of plane loads) would cut loads
-  per row from ~7 to ~2.5. It reaches 6.1-8.1 GB/s per core (1.7-2.3x scalar,
-  41-46 % of read) and is numerically equal to the scalar reference (max diff
+  per row from ~7 to ~2.5. It reaches 6.1-6.6 GB/s median per core (1.7-2.1x the scalar median, paired
+  `ratio_read` 0.41-0.63; the bests are 7.2-8.1) and is numerically equal to the scalar reference (max diff
   4e-5 on |ref| up to 182).
 * **IQ3_XXS / IQ4_NL**: generic AVX2 grid-lookup kernels, arithmetic-bound per
   core (IQ3_XXS 39 % of one-core read at 1T, IQ4_NL ~50 %). `r8` (ggml 8x8
-  repack gemv) lifts IQ4_NL 1.2-1.3x per core (best vs best).
+  repack gemv) lifts IQ4_NL over ggml's row `vec_dot` by 1.3-1.6x per core by
+  medians (8.3 / 5.2 on gate, 8.8 / 6.8 on down; paired `ratio_read` 0.61 / 0.47
+  and 0.93 / 0.74).
 
 ### Strata's kernel changes on AVX2 / AVX-VNNI-INT8 (no AVX-512)
 
@@ -365,11 +434,14 @@ GB/s (81 %) of its host's bandwidth.
   is what the Q2_0 note above proposes.
 * **Target.** Strata's 81 % of peak is against a ceiling it measured on its own
   host; the equivalent here is 81 % of the pinned STREAM read median at 22
-  threads, ~37 GB/s. Production `prod+pin` is at 14-31 GB/s median (30-65 % of
-  STREAM) at 22 threads. A pinned dynamic team running an 8-row MXFP4 tile or
-  ggml's 8x8 repack gemv reaches 38-46 GB/s median there, so the target is
-  reachable on this host **in the bench's team**; reaching it from production
-  needs the dispatch change below, not only a kernel.
+  threads, ~37 GB/s. Production `prod+pin` is at 14.4-46.7 GB/s median over the 13
+  configs (31-102 % of STREAM); one config, Qwen Q8_0 down (46.7), is above the
+  target already. The others are at 14-34, lowest for MXFP4 (14-30) and Q2_0
+  (16-22). A pinned dynamic team reaches 38-46 GB/s median there with an 8-row
+  MXFP4 tile or ggml's 8x8 repack gemv (and 45-54 with ggml's `vec_dot` on Q8_0
+  gate shapes), so the target is reachable on this host **in the bench's team**;
+  where `prod+pin` is below it, the data point to the dispatch (and, for MXFP4
+  and Q2_0, the kernel), not to one cause for all types.
 
 ## Headroom estimate and proposed changes
 
@@ -394,23 +466,25 @@ neighbouring thread counts: Qwen Q8_0 down `prod` is 43 at 22 threads and 23 at
 | Qwen Q2_0 down | 17 | 22 | 15 | -- | -- | -- | 29 | 33 |
 | Qwen IQ4_NL gate | 28 | 25 | 34 | -- | -- | 41 | -- | 43 |
 | Qwen IQ4_NL down | 22 | 32 | 34 | -- | -- | 43 | -- | 46 |
+| Qwen IQ3_XXS gate | 25 | 21 | 34 | -- | -- | -- | -- | 46 |
 | Qwen Q8_0 gate | 28 | 30 | 45 | -- | -- | -- | -- | 50 |
 | Qwen Q8_0 down | 43 | 47 | 51 | -- | -- | -- | -- | 55 |
 | GPT-OSS Q8_0 gate | 29 | 25 | 54 | -- | -- | -- | -- | 56 |
+| GPT-OSS Q8_0 down | 31 | 34 | 51 | -- | -- | -- | -- | 54 |
 
 Burst-paired ratios of candidate kernels against `prod+pin` (same burst, median
 over the configs of that type, 22 / 24 threads): `mx8+pin` 1.65 / 2.02 and
 `r8+pin` 1.67 / 1.99 on MXFP4 (4 configs), `q2+pin` 1.33 / 2.20 on Q2_0 (2
 configs), `r8+pin` 1.22 / 1.19 on IQ4_NL (2 configs). At 8 threads the same MXFP4
-ratios are 2.4 / 2.5, which is the per-core 2x of the 1-thread table; they shrink
-as the read stream saturates.
+ratios are 2.4 / 2.5, the same order as the 1-thread gap (1.6-3.5x by medians);
+they shrink as the read stream saturates.
 
 **What those ratios consist of.** For MXFP4, `mx16+pin` is the production tile
 shape run in the same pinned team: it already reaches 1.4-2.5x `prod+pin` by
 medians (29/41/40/35 vs 20/30/21/14), so **most of the 22-thread gap is the
-dispatch path, and the tile change adds a further 1.0-1.35x** (`mx8+pin` over
-`mx16+pin`: 40/29, 42/41, 43/40, 45/35). The 2x tile result at one thread does
-not transfer to 22 threads, where the 16-row loop is no longer the limit.
+dispatch path, and the tile change adds a further 1.0-1.4x** (`mx8+pin` over
+`mx16+pin`: 40/29, 42/41, 43/40, 45/35). The 1.6-3.5x tile result at one thread
+does not transfer to 22 threads, where the 16-row loop is no longer the limit.
 
 1. **Dispatch granularity of the production TBB call (new first item;
    hypothesis).** Same kernel, same weights: production is 0.66-0.84 of a dynamic
@@ -435,8 +509,9 @@ not transfer to 22 threads, where the 16-row loop is no longer the limit.
    Open: threads versus other host work (VM, Frigate), interaction with the GPU
    submit threads, the 22-thread default.
 3. **MXFP4: the 16-row tile.** Per core (1T, measured) the production kernel is
-   4.8 GB/s best against 9.9 for ggml's one-row VNNI kernel and 9.8 for an 8-row
-   register tile (2x). At 22 threads the tile accounts for 1.0-1.35x (above); the
+   2.3-3.8 GB/s median against 7.6 for ggml's one-row VNNI kernel and 8.0 for an
+   8-row register tile (1.6-3.5x over the production kernel; Qwen gate, Qwen
+   down, GPT-OSS gate). At 22 threads the tile accounts for 1.0-1.4x (above); the
    remaining gap is item 1. The change needs no layout: use the 8-row kernel (or
    ggml's one-row kernel) for the **batch-1 decode path**, and keep accumulators
    in registers (explicit unroll) rather than a stack array if the 16-row tile
@@ -449,7 +524,8 @@ not transfer to 22 threads, where the 16-row loop is no longer the limit.
    scoped to the batched-experts call site at :1296.
 4. **MXFP4 repack: not justified by these numbers.** The 8x8 repack
    (block_mxfp4x8 = 8 e8m0 + 128 qs bytes, the size of the unpacked tensor) was
-   +26 % per core over the cheap step at 1T (12.5 vs 9.9 GB/s best). At 22
+   +12-13 % per core over ggml's one-row kernel at 1T (medians 8.6 / 7.6, 8.3 / 7.4,
+   8.4 / 7.5; paired `ratio_read` 0.61 / 0.53, 0.86 / 0.76, 0.67 / 0.58). At 22
    threads it is **equal to the 8-row tile** (`r8+pin` : `mx8+pin` by medians
    0.95 / 1.10 / 0.99 / 0.93 on the four configs). The cost is real, so the repack
    is not worth proposing for MXFP4 batch 1:
@@ -504,14 +580,15 @@ not transfer to 22 threads, where the 16-row loop is no longer the limit.
    | Q2_0  | 2 | 120 (7.7)  | 86 (10.7)  | 39 (23.7) |
    | Q2_0  | 3 | 136 (10.2) | 125 (11.0) | 41 (33.6) |
 
-   A top-1 call moves 0.45-1.7 MB and takes 70-130 us in production, 2-6x a
+   A top-1 call moves 0.45-1.7 MB and takes 67-128 us in production, 2.3-3.9x a
    pure read in the team (19-51 us); the throughput is 7-14 GB/s, a fifth of the
    large-call figure. Per-call overhead, not bandwidth, bounds small calls: for
    Q8_0 the production-over-team excess is ~65-75 us at k=1 and ~90-100 us at k=3
    (the earlier single observation of ~50-70 us was the right order). Pinning
-   changes the median call time by 1.1-1.4x for MXFP4 and Q2_0 and by -9 to +7 %
-   for Q8_0 (medians over the same interleaved bursts, no paired interval, so
-   treat it as weak evidence). The statement that production batches only 1-3
+   shortens the median call time by 1.1-1.35x for MXFP4 and Q2_0 (MXFP4 128 ->
+   96, 157 -> 116, 161 -> 144 us; Q2_0 74 -> 67, 120 -> 86, 136 -> 125 us); for
+   Q8_0 it is 7 % faster at k=1 and 9 % and 4 % **slower** at k=2 and 3 (medians
+   over the same interleaved bursts, no paired interval, so weak evidence). The statement that production batches only 1-3
    CPU-routed experts (~30 % of top-k at a 0.7 VRAM hit rate) is an **assumption
    from the placement design, not measured here**, and no number in this document
    relies on it.
@@ -522,7 +599,7 @@ not transfer to 22 threads, where the 16-row loop is no longer the limit.
   grain explanation is a hypothesis with no experiment behind it; TBB wake-up
   latency, activation quantisation and the activation map are not separated.
 * **Whether pinning helps `prod` at heavier load or after the dispatch change.**
-  Measured only at load ~33 (idle fraction 0-2 %, nice work 88-91 %). The old
+  Measured only at load ~33 (idle 0-5 %, nice work 84-91 %). The old
   1.4-3.5x claim was made at load ~70 with an unpaired protocol and cannot be
   compared with these runs.
 * **The kernel gains inside production's arena.** Every candidate number is from
@@ -558,10 +635,15 @@ not transfer to 22 threads, where the 16-row loop is no longer the limit.
   config) behind every ratio quoted above.
 * `pin-samples-8-24-threads.csv`: the last-run-CPU sample totals per arm.
 * `topk-{1,2,3}.summary.csv`: the small-call runs (item 7).
+* `run-digest-8-24-threads.txt`: from each run's stderr, the oracle verdict
+  counts (all `ok`: 1404 + 720 for the 8-24 thread sweeps, 18 per top-k run),
+  the skipped config, the process return codes (all 0) and every `pin:` line
+  (arena workers found per config and round; the numbers quoted for 21 workers
+  and the top-1 range of 4-21 come from it).
 * `load-*.txt`: `date`, `uptime` and `top -b -n1 | head -15` before each block.
 
 The raw per-call CSVs and stderr logs are large and live only in the author's
 scratchpad; regenerate with the commands above. The oracle printed `ok` for all
 2124 (config x variant) checks of the 8-24 thread sweeps and all 54 of the
-small-call runs; the 1-4 thread sweep and the positive control are described in
+small-call runs (counts in the digest); the 1-4 thread sweep and the positive control are described in
 Method.
