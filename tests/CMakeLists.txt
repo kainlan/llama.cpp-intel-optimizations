@@ -3373,6 +3373,16 @@ set_tests_properties(test-llama-lazy-eligible PROPERTIES LABELS "main;lazy")
 set_property(TEST test-llama-lazy-eligible PROPERTY
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
 
+# llama.cpp-5efe C1: the SYCL device reports mmap_support again. Pure source
+# contract over get_props' caps initializer and the host_unified_known field.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-mmap-support-caps-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mmap-support-caps-source.py
+        LABEL "sycl;host;python;source-contract"
+        TIMEOUT 120)
+endif()
+
 # llama_mmap keeps MADV_HUGEPAGE off the lazily read ranges (llama.cpp-n77l),
 # checked through the VmFlags in /proc/self/smaps. Linux-only; exits 77 when
 # THP is unavailable, and fails when no VmFlags line can be read.
