@@ -162,15 +162,30 @@ def elide_string_literals(text: str) -> str:
 def first_difference(expected: str, actual: str, context: int = 40) -> str:
     at = next((k for k in range(min(len(expected), len(actual))) if expected[k] != actual[k]), min(len(expected), len(actual)))
     lo = max(0, at - context)
-    return f"first difference at offset {at}:\n  expected: ...{expected[lo:at + context]}...\n  actual:   ...{actual[lo:at + context]}..."
+    return f"first difference at offset {at} of the whitespace-squashed, string-elided text:\n  expected: ...{expected[lo:at + context]}...\n  actual:   ...{actual[lo:at + context]}..."
 
 
 # Macros that would change what a helper body means without touching the body. The gate cannot own other
-# headers, but it owns this file.
-FORBIDDEN_REDEFINITIONS = re.compile(
-    r"^[ \t]*#[ \t]*(?:define|undef)[ \t]+(GGML_LOG_WARN|true|false|return|GGML_SYCL_FUSION_ALIAS_\w+|GGML_SYCL_FUSION_SITE_\w+)\b",
-    re.M,
-)
+# headers, but it owns this file. The set is derived, not listed: every identifier token of the pinned helper
+# text (names, keywords, locals, members) plus the names the helpers rely on without spelling them.
+def forbidden_macro_names() -> set[str]:
+    names = {"GGML_LOG_WARN", "true", "false", "return", "if", "nullptr"}
+    for _, expected in WRAPPER_BODIES:
+        names.update(re.findall(r"[A-Za-z_]\w*", elide_string_literals(expected)))
+    return names
+
+
+def redefinition_violations(code: str) -> list[str]:
+    """`#define` / `#undef` of a forbidden name anywhere in the file. Backslash-continued lines are joined first, so
+    `#define \\<nl>true false` and `#\\<nl>define true false` are read as what the preprocessor reads."""
+    joined = code.replace("\\\n", "")
+    names = forbidden_macro_names()
+    found: list[str] = []
+    for m in re.finditer(r"^[ \t]*#[ \t]*(?:define|undef)[ \t]+([A-Za-z_]\w*)", joined, re.M):
+        name = m.group(1)
+        if name in names or name.startswith(("GGML_SYCL_FUSION_ALIAS_", "GGML_SYCL_FUSION_SITE_")):
+            found.append(name)
+    return found
 
 
 def matching_brace(text: str, open_idx: int) -> int:
@@ -391,8 +406,8 @@ def gate_violations(source: str) -> list[str]:
         if "return false;" not in tail and "return reject(" not in tail:
             found.append(f"{site}: no `return false;` follows the gate call, so a decline would still launch")
 
-    for m in FORBIDDEN_REDEFINITIONS.finditer(code):
-        found.append(f"gate helper: ggml-sycl.cpp redefines `{m.group(1)}` with a preprocessor directive, which changes what the pinned helpers mean")
+    for name in redefinition_violations(code):
+        found.append(f"gate helper: ggml-sycl.cpp redefines `{name}` with a preprocessor directive, which changes what the pinned helpers mean")
 
     for signature, expected in WRAPPER_BODIES:
         defined = code.count(signature)
@@ -662,6 +677,34 @@ def test_log_arguments_are_pinned_but_wording_is_free() -> None:
     for macro in ("#undef GGML_LOG_WARN\n#define GGML_LOG_WARN(...) do { return true; } while (0)\n", "#define true false\n"):
         violations = gate_violations(source.replace(body, macro + body, 1))
         assert any(v.startswith("gate helper:") and "preprocessor" in v for v in violations), f"`{macro}` survived: {violations}"
+
+
+def test_macro_redefinitions_of_anything_a_helper_uses_are_witnessed() -> None:
+    """The forbidden set is every identifier of the pinned helpers, so redefining a called function, a keyword, a
+    member or a local is caught, including through backslash-continued directive lines; and the current source
+    has none."""
+    source = SOURCE.read_text()
+    assert redefinition_violations(strip_comments(source)) == []
+    names = forbidden_macro_names()
+    for needed in ("ggml_sycl_fusion_alias_check", "ggml_sycl_fusion_alias_site_name", "fetch_add", "if", "nullptr", "r", "GGML_LOG_WARN"):
+        assert needed in names, needed
+    account = "static bool ggml_sycl_fusion_alias_account("
+    directives = {
+        "the check function": "#define ggml_sycl_fusion_alias_check(...) ggml_sycl_fusion_alias_result{}\n",
+        "if": "#define if(x) if (0)\n",
+        "a member call": "#define fetch_add(...) load()\n",
+        "the site name": '#define ggml_sycl_fusion_alias_site_name(x) "a"\n',
+        "a local": "#define r r\n",
+        "nullptr": "#define nullptr nullptr\n",
+        "#undef": "#undef true\n",
+        "spaced directive": "   #\tdefine true false\n",
+        "continued define": "#define \\\ntrue false\n",
+        "continued hash": "#\\\ndefine true false\n",
+        "an enumerator by prefix": "#define GGML_SYCL_FUSION_SITE_COUNT 0\n",
+    }
+    for name, directive in directives.items():
+        violations = gate_violations(source.replace(account, directive + account, 1))
+        assert any(v.startswith("gate helper:") and "preprocessor" in v for v in violations), f"`{name}` survived: {violations}"
 
 
 def test_miswired_bit0_operands_are_witnessed() -> None:
