@@ -95,6 +95,7 @@
 #include "ggml-sycl/dispatch-tuning.hpp"
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/fattn.hpp"
+#include "ggml-sycl/fusion-alias.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/graph-recorder-scope.hpp"
@@ -85025,6 +85026,110 @@ static const char * ggml_backend_sycl_get_name(ggml_backend_t backend) {
     return sycl_ctx->name.c_str();
 }
 
+// The aliasing gate for fused kernels (fusion-alias.hpp, llama.cpp-rb2h). A fused kernel reads its inputs
+// while it writes its outputs, so an output the allocator placed partially over an input (legal for the
+// unfused order) races between workgroups. Each site declines the fusion and the unfused kernels run.
+//
+// In place is admitted only where the kernel reads an element before it writes that same element, from one
+// work-item: add_rms_norm_f32(_slm_cached), rms_norm_mul_f32(_slm_cached), rms_norm_mul_add_f32(_slm_cached)
+// (norm.cpp: pass 1 and pass 2 use the same `col = tid + k * block_size`), k_mul_add_fused (binbcast.cpp: one
+// work-item per element; the site restricts scale and bias to one row) and the MMVQ epilogue
+// `dst[row] = sum + fused_add[row]` (mmvq.cpp). The router kernel is not in place with its activation:
+// other subgroups still read it while a lane writes the probabilities.
+//
+// Every decline is counted per site and per cause, so a run can say how much fusion it lost; the first few
+// are logged, then every power of two with the running total, and the process-global total is summed at
+// backend teardown (read the last line: it prints once per backend free).
+struct ggml_sycl_fusion_alias_stats {
+    std::atomic<uint64_t> checked[GGML_SYCL_FUSION_SITE_COUNT];
+    std::atomic<uint64_t> declined[GGML_SYCL_FUSION_SITE_COUNT][GGML_SYCL_FUSION_ALIAS_INPLACE + 1];
+    std::atomic<uint64_t> declined_total;
+};
+
+static ggml_sycl_fusion_alias_stats & ggml_sycl_fusion_alias_stats_get() {
+    static ggml_sycl_fusion_alias_stats stats;
+    return stats;
+}
+
+static bool ggml_sycl_fusion_alias_account(ggml_sycl_fusion_alias_site           site,
+                                           const char *                          start_name,
+                                           const ggml_sycl_fusion_alias_result & r) {
+    ggml_sycl_fusion_alias_stats & st = ggml_sycl_fusion_alias_stats_get();
+    st.checked[site].fetch_add(1, std::memory_order_relaxed);
+    if (r.verdict == GGML_SYCL_FUSION_ALIAS_SAFE) {
+        return true;
+    }
+    st.declined[site][r.verdict].fetch_add(1, std::memory_order_relaxed);
+    const uint64_t n = st.declined_total.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 4 || (n & (n - 1)) == 0) {
+        GGML_LOG_WARN(
+            "[SYCL-FUSION] declined the %s fusion at %s: %s (%s against %s); running the unfused kernels "
+            "(decline %llu)\n",
+            ggml_sycl_fusion_alias_site_name(site), start_name ? start_name : "?",
+            ggml_sycl_fusion_alias_verdict_name(r.verdict), r.write && r.write->name ? r.write->name : "?",
+            r.other && r.other->name ? r.other->name : "?", (unsigned long long) n);
+    }
+    return false;
+}
+
+// For the sites that are not chains and already hold every resolved operand: hand those same pointers over.
+static bool ggml_sycl_fusion_alias_admit(ggml_sycl_fusion_alias_site      site,
+                                         const char *                     start_name,
+                                         const ggml_sycl_fusion_operand * writes,
+                                         int                              n_writes,
+                                         const ggml_sycl_fusion_operand * reads,
+                                         int                              n_reads) {
+    return ggml_sycl_fusion_alias_account(site, start_name,
+                                          ggml_sycl_fusion_alias_check(writes, n_writes, reads, n_reads));
+}
+
+// For the chain sites. Each operand resolves with the resolver the fused kernel uses for it: the RMS_NORM
+// input and every output through ggml_sycl_get_data_ptr, the MUL weight and the ADD operand of the
+// RMS_NORM chains through ggml_sycl_resolve_tensor_ptr (norm.cpp); the other chains use get_data_ptr throughout.
+static bool ggml_sycl_fusion_alias_admit_chain(ggml_sycl_fusion_alias_site site,
+                                               const ggml_cgraph *         cgraph,
+                                               int                         node_idx,
+                                               int                         device) {
+    const bool norm_chain =
+        site == GGML_SYCL_FUSION_SITE_RMS_NORM_MUL_ADD || site == GGML_SYCL_FUSION_SITE_RMS_NORM_MUL;
+    const ggml_tensor * norm_src =
+        norm_chain && cgraph && node_idx >= 0 && node_idx < cgraph->n_nodes ? cgraph->nodes[node_idx]->src[0] : nullptr;
+    const ggml_sycl_fusion_alias_result r = ggml_sycl_fusion_chain_alias_check(
+        cgraph, node_idx, site, [&](const ggml_tensor * t, bool is_write) -> const void * {
+            if (is_write || !norm_chain || t == norm_src) {
+                return ggml_sycl_get_data_ptr(t, device);
+            }
+            return ggml_sycl_resolve_tensor_ptr(t, device);
+        });
+    return ggml_sycl_fusion_alias_account(
+        site, cgraph && node_idx >= 0 && node_idx < cgraph->n_nodes ? cgraph->nodes[node_idx]->name : nullptr, r);
+}
+
+static void ggml_sycl_fusion_alias_stats_dump() {
+    ggml_sycl_fusion_alias_stats & st      = ggml_sycl_fusion_alias_stats_get();
+    uint64_t                       checked = 0;
+    uint64_t                       lost    = 0;
+    std::string                    sites;
+    for (int site = 0; site < GGML_SYCL_FUSION_SITE_COUNT; ++site) {
+        const uint64_t c = st.checked[site].load(std::memory_order_relaxed);
+        uint64_t       d = 0;
+        for (int v = 0; v <= GGML_SYCL_FUSION_ALIAS_INPLACE; ++v) {
+            d += st.declined[site][v].load(std::memory_order_relaxed);
+        }
+        checked += c;
+        lost += d;
+        if (c > 0) {
+            sites += std::string(sites.empty() ? "" : ", ") +
+                     ggml_sycl_fusion_alias_site_name(static_cast<ggml_sycl_fusion_alias_site>(site)) + " " +
+                     std::to_string(d) + "/" + std::to_string(c);
+        }
+    }
+    if (checked > 0) {
+        GGML_LOG_WARN("[SYCL-FUSION] alias gate: declined %llu of %llu fused-kernel checks (%s)\n",
+                      (unsigned long long) lost, (unsigned long long) checked, sites.c_str());
+    }
+}
+
 static void ggml_backend_sycl_free(ggml_backend_t backend) {
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
     ggml_sycl_q1_nvfp4_test_revoke_backend(backend);
@@ -85056,6 +85161,7 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     // The function is idempotent - safe to call multiple times
     ggml_sycl_tp_free();
     ggml_sycl_layout_ptr_stats_dump();
+    ggml_sycl_fusion_alias_stats_dump();
     // Print final MoE dispatch statistics
     if (ggml_sycl::MoeDispatchStats::enabled()) {
         for (int d = 0; d < GGML_SYCL_MAX_DEVICES; d++) {
@@ -86714,6 +86820,24 @@ static bool ggml_sycl_try_fuse_tg_router_f32_add_argsort(ggml_backend_sycl_conte
     if (!weight_ptr || !act_ptr || !bias_ptr || !probs_ptr || !sort_ptr) {
         return reject("null-ptr");
     }
+    // llama.cpp-rb2h: the kernel reads act and bias while it writes probs and argsort. The activation is read
+    // by every subgroup, so it is never in place with the probabilities; the bias is read and written by the
+    // same lane. The weight is not checked: it lives in the unified cache, never in the compute buffer gallocr
+    // places graph outputs in, so it cannot overlap an output. Each pointer below is the one the kernel is
+    // about to receive.
+    {
+        const ggml_sycl_fusion_operand writes[2] = {
+            { add,  probs_ptr, true },
+            { sort, sort_ptr,  true }
+        };
+        const ggml_sycl_fusion_operand reads[2] = {
+            { act,    act_ptr,  false },
+            { addend, bias_ptr, true  }
+        };
+        if (!ggml_sycl_fusion_alias_admit(GGML_SYCL_FUSION_SITE_ROUTER, add->name, writes, 2, reads, 2)) {
+            return reject("alias");
+        }
+    }
 
     auto retention = ggml_sycl::terminal_retention_ticket::prepare({ resolved });
     split_merge_drain();
@@ -86804,6 +86928,23 @@ static bool ggml_sycl_try_fuse_tg_mul_mat_add(ggml_backend_sycl_context & ctx,
     const float * addend_ptr = static_cast<const float *>(ggml_sycl_get_data_ptr_slow(addend, ctx.device));
     if (!addend_ptr) {
         return false;
+    }
+    // llama.cpp-rb2h: the MMVQ epilogue reads addend[row] while it writes the output row, so an output the
+    // allocator placed partially over the addend races. The activation is quantised to scratch by a separate
+    // kernel before the MMVQ kernel runs, so it cannot race. The weight is not checked: it lives in the unified
+    // cache (or the model's weight buffer), never in the compute buffer gallocr places graph outputs in, so it
+    // cannot overlap an output. The output resolves in the order of ggml_sycl_op_mul_mat's dst_on_device
+    // branch: ggml_sycl_resolve first, then ggml_sycl_resolve_tensor_ptr.
+    {
+        const auto                     out_resolved = ggml_sycl_resolve(add, ctx.device);
+        const void *                   out_ptr      = (out_resolved && out_resolved.on_device) ?
+                                                          static_cast<const void *>(out_resolved.ptr) :
+                                                          static_cast<const void *>(ggml_sycl_resolve_tensor_ptr(add, ctx.device));
+        const ggml_sycl_fusion_operand writes  = { add, out_ptr, true };
+        const ggml_sycl_fusion_operand reads   = { addend, addend_ptr, true };
+        if (!ggml_sycl_fusion_alias_admit(GGML_SYCL_FUSION_SITE_MUL_MAT_ADD, add->name, &writes, 1, &reads, 1)) {
+            return false;
+        }
     }
 
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(weight->extra);
@@ -94641,7 +94782,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 if (!skip_chain && fusion_site_on(1) &&
                     ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, { i + 2 }) &&
                     ggml_sycl_check_fusion_types(cgraph, i, 3) && ggml_is_contiguous(cgraph->nodes[i + 2]) &&
-                    ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 3, sycl_ctx->device)) {
+                    ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 3, sycl_ctx->device) &&
+                    ggml_sycl_fusion_alias_admit_chain(GGML_SYCL_FUSION_SITE_RMS_NORM_MUL_ADD, cgraph, i,
+                                                       sycl_ctx->device)) {
                     ggml_tensor * mul_node      = cgraph->nodes[i + 1];
                     ggml_tensor * add_node      = cgraph->nodes[i + 2];
                     ggml_tensor * mul_src_check = get_mul_weight(mul_node, node);
@@ -94730,7 +94873,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 if (!skip_chain && fusion_site_on(4) &&
                     ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, { i + 1 }) &&
                     ggml_sycl_check_fusion_types(cgraph, i, 2) &&
-                    ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device)) {
+                    ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device) &&
+                    ggml_sycl_fusion_alias_admit_chain(GGML_SYCL_FUSION_SITE_RMS_NORM_MUL, cgraph, i,
+                                                       sycl_ctx->device)) {
                     ggml_tensor * mul_node = cgraph->nodes[i + 1];
                     ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, mul_node);
                     gpu_queue_dirty = true;  // D+: GPU fusion submitted work
@@ -94748,7 +94893,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     // Check: next op is RMS_NORM and it uses this ADD's output as input
                     if (next->op == GGML_OP_RMS_NORM && next->src[0] == node &&
                         ggml_sycl_check_fusion_types(cgraph, i, 2) && ggml_is_contiguous(next) &&
-                        ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device)) {
+                        ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device) &&
+                        ggml_sycl_fusion_alias_admit_chain(GGML_SYCL_FUSION_SITE_ADD_RMS_NORM, cgraph, i,
+                                                           sycl_ctx->device)) {
                         ggml_sycl_op_add_rms_norm_fused(*sycl_ctx, node, next);
                         gpu_queue_dirty = true;  // D+: GPU fusion submitted work
                         i++;                     // Skip the RMS_NORM node
@@ -94830,7 +94977,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                             }
                         }
                         if (mul_only_used_by_add && scale_ok && bias_ok && operands_offset_safe) {
-                            if (ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device)) {
+                            if (ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device) &&
+                                ggml_sycl_fusion_alias_admit_chain(GGML_SYCL_FUSION_SITE_MUL_ADD, cgraph, i,
+                                                                   sycl_ctx->device)) {
                                 ggml_sycl_op_mul_add_fused(*sycl_ctx, node, next);
                                 gpu_queue_dirty = true;  // D+: GPU fusion submitted work
                                 i++;                     // Skip the ADD node

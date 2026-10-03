@@ -932,6 +932,19 @@ if (NOT WIN32)
         SKIP_RETURN_CODE 77
     )
 
+    # Scoring and arm shape of the qwen35 multi-ubatch perplexity gate (llama.cpp-rb2h). Fixture logs and
+    # --dry-run only: no GPU, no model, safe at any parallelism.
+    llama_test_cmd(
+        bash
+        NAME test-sycl-qwen35-ppl-gate
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-qwen35-ppl-gate.sh
+    )
+    set_tests_properties(test-sycl-qwen35-ppl-gate PROPERTIES
+        LABELS "sycl;source"
+        SKIP_RETURN_CODE 77
+    )
+
     # sycl-gpu-preflight unit tests (llama.cpp-o4fs): the live B50 PCI-
     # address derivation sycl_preflight_b50_pci_address/
     # sycl_preflight_b50_sysfs_bad now share with bench-guard.sh via
@@ -2334,6 +2347,13 @@ if (NOT WIN32)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-pool-legacy-release-source.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;python;source-assert;graph;mutation"
+        TIMEOUT 120
+    )
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fusion-alias-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;fusion;mutation"
         TIMEOUT 120
     )
     llama_test_pytest(
