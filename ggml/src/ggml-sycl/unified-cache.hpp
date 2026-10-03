@@ -5787,7 +5787,7 @@ enum class alloc_tier : uint8_t {
     // One PROT_NONE reservation with a model file's segments mapped over it, made by the cache and read by the CPU
     // only (llama.cpp-5efe C2). Not charged to the host ledger unless locked. Every census and test keys on names,
     // never on this value.
-    FILE_MAPPED = 3,
+    FILE_MAPPED  = 3,
 };
 
 enum class alloc_role : uint8_t {
@@ -6308,14 +6308,15 @@ allocation_result unified_allocate_owner(const alloc_request & req) noexcept;
 // class is EXTERNAL_EXACT: exact, independently released, never a slice of cache backing. The intrusive control is
 // minted before anything is mapped, and the last reference unmaps the whole reservation in one munmap.
 struct file_mapping_request {
-    int                         device    = -1;    // the owning device's cache; the mapping is read by the CPU only
-    int                         fd        = -1;    // the loader's open file: the owner dups it, the caller keeps its own
-    uint64_t                    file_size = 0;     // the size the loader recorded (register_file_identity)
-    file_map_range              reservation;       // the file range the reservation stands for
-    std::vector<file_map_range> segments;          // page aligned, inside the reservation, not overlapping
+    int                         device    = -1;  // the owning device's cache; the mapping is read by the CPU only
+    int                         fd        = -1;  // the loader's open file: the owner dups it, the caller keeps its own
+    uint64_t                    file_size = 0;   // the size the loader recorded (register_file_identity)
+    file_map_range              reservation;     // the file range the reservation stands for
+    std::vector<file_map_range> segments;        // page aligned, inside the reservation, not overlapping
     alloc_role                  role      = alloc_role::WEIGHT;
     const char *                cohort_id = nullptr;
 };
+
 allocation_result unified_allocate_file_mapping(const file_mapping_request & req) noexcept;
 
 // The owner's dup of the loader's fd, for POSIX_FADV_DONTNEED after staging. False if `base` is not a live

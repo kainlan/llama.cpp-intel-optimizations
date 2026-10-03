@@ -1061,6 +1061,14 @@ resolved_ptr mem_handle::resolve() const {
 
 resolved_ptr mem_handle::resolve(int device_id) const {
     resolved_ptr r = resolve();
+    if (r.ptr) {
+        // A file mapping is read by the CPU, in place; it is never handed to a device. Host-pinned memory is
+        // device-agnostic below, a FILE_MAPPED owner (a slice shares its owner) is not.
+        mem_handle_lock_guard g(lock_);
+        if (owned_alloc_ && owned_alloc_.metadata().tier == alloc_tier::FILE_MAPPED) {
+            return {};
+        }
+    }
     if (!r.ptr || !r.on_device) {
         return r;
     }

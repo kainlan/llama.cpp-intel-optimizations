@@ -45,10 +45,10 @@ struct fixture_file {
     uint64_t    size = 0;
 
     explicit fixture_file(uint64_t pages) {
-        char tmpl[] = "/tmp/file-mapped-tier-XXXXXX";
-        const int tmp = mkstemp(tmpl);
+        char      tmpl[] = "/tmp/file-mapped-tier-XXXXXX";
+        const int tmp    = mkstemp(tmpl);
         check(tmp >= 0, "mkstemp");
-        path = tmpl;
+        path                = tmpl;
         const uint64_t page = (uint64_t) sysconf(_SC_PAGESIZE);
         size                = pages * page;
         std::vector<unsigned char> bytes(size);
@@ -95,15 +95,18 @@ file_mapping_request make_request(const fixture_file & f, uint64_t page) {
     req.fd          = f.fd;
     req.file_size   = f.size;
     req.reservation = { 1 * page, 6 * page };
-    req.segments    = { { 1 * page, 1 * page }, { 4 * page, 2 * page } };
+    req.segments    = {
+        { 1 * page, 1 * page },
+        { 4 * page, 2 * page }
+    };
     return req;
 }
 
 void tier_identity_registry_and_release() {
-    const uint64_t page = (uint64_t) sysconf(_SC_PAGESIZE);
-    fixture_file   f(8);
-    const std::string path       = f.path;
-    const int         fds_before = open_fd_count();
+    const uint64_t    page = (uint64_t) sysconf(_SC_PAGESIZE);
+    fixture_file      f(8);
+    const std::string path        = f.path;
+    const int         fds_before  = open_fd_count();
     const size_t      rows_before = allocation_registry_test_size();
 
     uint64_t free_before = 0;
@@ -146,7 +149,8 @@ void tier_identity_registry_and_release() {
     const memory_location at_interior = query_location((char *) base + 3 * page + 17);
     check(at_base.tier == alloc_tier::FILE_MAPPED, "query_location(base) is not FILE_MAPPED");
     check(at_interior.tier == alloc_tier::FILE_MAPPED, "query_location(interior) is not FILE_MAPPED");
-    check(at_base.host_accessible() && !at_base.device_mappable(), "a file mapping must be CPU-read and not device-mappable");
+    check(at_base.host_accessible() && !at_base.device_mappable(),
+          "a file mapping must be CPU-read and not device-mappable");
 
     // the bytes are the file's
     check(((const unsigned char *) base)[0] == pattern(1 * page) &&
@@ -218,7 +222,7 @@ void refusals_leave_nothing_behind() {
 
 void device_mappable_by_tier() {
     memory_location loc{};
-    loc.ptr = (void *) 0x1000;
+    loc.ptr  = (void *) 0x1000;
     loc.tier = alloc_tier::DEVICE_VRAM;
     check(loc.device_mappable() && !loc.host_accessible(), "DEVICE_VRAM is device-mappable and not host-accessible");
     loc.tier = alloc_tier::HOST_PINNED;

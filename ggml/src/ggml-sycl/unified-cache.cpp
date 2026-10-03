@@ -1456,7 +1456,7 @@ struct runtime_alloc_record {
     // staging buffers), so sycl::free must use this keepalive, never *queue.
     std::optional<sycl::queue> queue_keepalive;
     // FILE_MAPPED only: the owner's dup of the loader's fd, closed by the release's one unmap.
-    int                        file_fd = -1;
+    int                         file_fd           = -1;
     bool                       uses_pinned_pool = false;
     bool                       zone_managed     = false;
     bool                       from_arena       = false;  // True if sub-allocated from arena (KV/RUNTIME/etc zone)
@@ -3798,21 +3798,21 @@ void offload_stats_log_summary(const char * tag, int device) {
         tag ? tag : "graph", device, (unsigned long long) s.wait_count, (unsigned long long) s.wait_count_forced,
         (unsigned long long) s.wait_count_fallback, (unsigned long long) s.alloc_count_host,
         (unsigned long long) s.alloc_count_device, (unsigned long long) s.alloc_count_shared,
-        (unsigned long long) s.alloc_count_file_mapped, (unsigned long long) s.pool_hit_count, (unsigned long long) s.pool_miss_count, phase_name,
-        (unsigned long long) s.cross_domain_transfer_count, (unsigned long long) s.cross_domain_transfer_count_pp,
-        (unsigned long long) s.cross_domain_transfer_count_tg, (unsigned long long) s.transfer_bytes_h2d,
-        (unsigned long long) s.transfer_bytes_h2d_pp, (unsigned long long) s.transfer_bytes_h2d_tg,
-        (unsigned long long) s.transfer_bytes_d2h, (unsigned long long) s.transfer_bytes_d2h_pp,
-        (unsigned long long) s.transfer_bytes_d2h_tg, (unsigned long long) s.dispatch_count_cpu,
-        (unsigned long long) s.dispatch_count_gpu, (unsigned long long) s.dispatch_count_gpu_island,
-        (unsigned long long) s.dispatch_count_cpu_pp, (unsigned long long) s.dispatch_count_cpu_tg,
-        (unsigned long long) s.dispatch_count_gpu_pp, (unsigned long long) s.dispatch_count_gpu_tg,
-        (unsigned long long) s.dispatch_count_gpu_island_pp, (unsigned long long) s.dispatch_count_gpu_island_tg,
-        (unsigned long long) s.transition_wait_count, (unsigned long long) s.transition_wait_count_pp,
-        (unsigned long long) s.transition_wait_count_tg, (unsigned long long) s.transition_wait_elided_count,
-        (unsigned long long) s.transition_wait_elided_count_pp, (unsigned long long) s.transition_wait_elided_count_tg,
-        (unsigned long long) s.host_alloc_call_count, (unsigned long long) s.host_alloc_bytes,
-        (unsigned long long) s.host_alloc_calls_unified_alloc_host,
+        (unsigned long long) s.alloc_count_file_mapped, (unsigned long long) s.pool_hit_count,
+        (unsigned long long) s.pool_miss_count, phase_name, (unsigned long long) s.cross_domain_transfer_count,
+        (unsigned long long) s.cross_domain_transfer_count_pp, (unsigned long long) s.cross_domain_transfer_count_tg,
+        (unsigned long long) s.transfer_bytes_h2d, (unsigned long long) s.transfer_bytes_h2d_pp,
+        (unsigned long long) s.transfer_bytes_h2d_tg, (unsigned long long) s.transfer_bytes_d2h,
+        (unsigned long long) s.transfer_bytes_d2h_pp, (unsigned long long) s.transfer_bytes_d2h_tg,
+        (unsigned long long) s.dispatch_count_cpu, (unsigned long long) s.dispatch_count_gpu,
+        (unsigned long long) s.dispatch_count_gpu_island, (unsigned long long) s.dispatch_count_cpu_pp,
+        (unsigned long long) s.dispatch_count_cpu_tg, (unsigned long long) s.dispatch_count_gpu_pp,
+        (unsigned long long) s.dispatch_count_gpu_tg, (unsigned long long) s.dispatch_count_gpu_island_pp,
+        (unsigned long long) s.dispatch_count_gpu_island_tg, (unsigned long long) s.transition_wait_count,
+        (unsigned long long) s.transition_wait_count_pp, (unsigned long long) s.transition_wait_count_tg,
+        (unsigned long long) s.transition_wait_elided_count, (unsigned long long) s.transition_wait_elided_count_pp,
+        (unsigned long long) s.transition_wait_elided_count_tg, (unsigned long long) s.host_alloc_call_count,
+        (unsigned long long) s.host_alloc_bytes, (unsigned long long) s.host_alloc_calls_unified_alloc_host,
         (unsigned long long) s.host_alloc_bytes_unified_alloc_host,
         (unsigned long long) s.host_alloc_calls_unified_cache_host_chunk,
         (unsigned long long) s.host_alloc_bytes_unified_cache_host_chunk,
@@ -15676,8 +15676,12 @@ static std::atomic<uint64_t> g_test_free_branch_malloc_free{ 0 };
 static std::atomic<uint64_t> g_test_free_branch_sycl_free{ 0 };
 
 void unified_cache_test_free_branch_counts(uint64_t * malloc_free, uint64_t * sycl_free) noexcept {
-    if (malloc_free) *malloc_free = g_test_free_branch_malloc_free.load(std::memory_order_acquire);
-    if (sycl_free) *sycl_free = g_test_free_branch_sycl_free.load(std::memory_order_acquire);
+    if (malloc_free) {
+        *malloc_free = g_test_free_branch_malloc_free.load(std::memory_order_acquire);
+    }
+    if (sycl_free) {
+        *sycl_free = g_test_free_branch_sycl_free.load(std::memory_order_acquire);
+    }
 }
 #endif
 
@@ -15687,6 +15691,19 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
     // No separate counter bookkeeping needed.
 
     try {
+        // A file mapping is released by one munmap of the whole reservation and by nothing else. This branch comes
+        // before every other: the UNREGISTERED no-free case, the ::free branch (keyed on the registry type, which a
+        // FILE_MAPPED record never carries), the zone_managed branch and the sycl::free fallthrough, so a mapping
+        // can never reach ::free or sycl::free.
+        if (rec.handle.tier == alloc_tier::FILE_MAPPED) {
+            alloc_registry::instance().unregister_alloc(rec.handle.ptr);
+            file_mapping mapping;
+            mapping.base   = rec.handle.ptr;
+            mapping.length = rec.handle.size;
+            mapping.fd     = rec.file_fd;
+            unified_cache_raw_unmap_file(&mapping);
+            return true;
+        }
         if (rec.handle.tier == alloc_tier::UNREGISTERED) {
             return true;
         }
@@ -17144,11 +17161,113 @@ allocation_result unified_allocate_owner_backing(const alloc_request & req, cach
 }
 
 allocation_result unified_allocate_file_mapping(const file_mapping_request & req) noexcept {
-    // RED stub (llama.cpp-5efe C2c): no tier yet; the front door refuses every request.
-    (void) req;
-    allocation_result result;
-    result.error = allocation_error::INVALID_REQUEST;
-    return result;
+    allocation_result     result;
+    alloc_owner_control * control = nullptr;
+    file_mapping          mapping;
+    bool                  alloc_registered = false;
+    try {
+        if (req.device < 0 || req.device >= GGML_SYCL_MAX_DEVICES || req.fd < 0 || req.reservation.length == 0 ||
+            req.segments.empty()) {
+            result.error = allocation_error::INVALID_REQUEST;
+            return result;
+        }
+        auto coordinator = unified_allocation_release_coordinator(req.device);
+        if (!coordinator) {
+            result.error = allocation_error::INVALID_REQUEST;
+            return result;
+        }
+        // Owner first: the intrusive control exists before anything is mapped, so a mapping cannot exist unowned.
+        // EXTERNAL_EXACT: exact, independently released, never a slice of cache backing, so the two-site
+        // CACHE_BACKING allowlist is untouched.
+        control = allocation_owner_internal_access::create(coordinator, allocation_control_class::EXTERNAL_EXACT);
+        if (!control) {
+            result.error = allocation_error::CONTROL_ALLOCATION_FAILED;
+            return result;
+        }
+        const uint64_t alloc_id = unified_cache_mint_retention_identity();
+        if (alloc_id == 0) {
+            allocation_owner_internal_access::abandon(control);
+            control      = nullptr;
+            result.error = allocation_error::PHYSICAL_ALLOCATION_FAILED;
+            return result;
+        }
+
+        const file_map_status status =
+            unified_cache_raw_map_file(req.fd, req.file_size, req.reservation, req.segments, &mapping);
+        if (status != file_map_status::OK) {
+            GGML_LOG_ERROR("[UNIFIED-ALLOC] file mapping refused: %s (device %d, %llu bytes of the file)\n",
+                           file_map_status_name(status), req.device, (unsigned long long) req.reservation.length);
+            allocation_owner_internal_access::abandon(control);
+            control      = nullptr;
+            result.error = status == file_map_status::INVALID_ARGUMENT ? allocation_error::INVALID_REQUEST :
+                                                                         allocation_error::PHYSICAL_ALLOCATION_FAILED;
+            return result;
+        }
+
+        // One owner and one registry record per reservation: ptr = the base, size = the length. The segments are
+        // not separate records.
+        runtime_alloc_record rec;
+        rec.ownership       = runtime_alloc_ownership::INTRUSIVE;
+        rec.handle.ptr      = mapping.base;
+        rec.handle.size     = mapping.length;
+        rec.handle.device   = req.device;
+        rec.handle.tier     = alloc_tier::FILE_MAPPED;
+        rec.handle.role     = req.role;
+        rec.handle.category = category_from_role(req.role);
+        rec.handle.alloc_id = alloc_id;
+        rec.file_fd         = mapping.fd;
+        if (req.cohort_id && req.cohort_id[0] != '\0') {
+            rec.cohort_id = req.cohort_id;
+        }
+        if (!allocation_owner_internal_access::publish(control, rec.handle)) {
+            unified_cache_raw_unmap_file(&mapping);
+            allocation_owner_internal_access::abandon(control);
+            control      = nullptr;
+            result.error = allocation_error::METADATA_PUBLICATION_FAILED;
+            return result;
+        }
+        rec.handle = control->metadata();
+
+        // the pointer-type registry, which resolves interior pointers: the reservation is FILE_MAPPED
+        alloc_registry::instance().register_alloc(mapping.base, mapping.length, -1, alloc_type::FILE_MAPPED);
+        alloc_registered = true;
+
+        bool               registered = false;
+        stale_claim_report stale_claim;  // declared before the lock: logs after it is dropped
+        {
+            std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+            if (runtime_registry_claim_ptr_locked(mapping.base, stale_claim)) {
+                registered = g_runtime_alloc_registry.emplace(mapping.base, rec).second;
+            }
+        }
+        if (!registered) {
+            alloc_registry::instance().unregister_alloc(mapping.base);
+            unified_cache_raw_unmap_file(&mapping);
+            allocation_owner_internal_access::abandon(control);
+            control      = nullptr;
+            result.error = allocation_error::METADATA_PUBLICATION_FAILED;
+            return result;
+        }
+
+        // the record owns the dup of the fd from here on
+        mapping      = {};
+        result.owner = allocation_owner_internal_access::adopt(control);
+        control      = nullptr;
+        result.error = allocation_error::NONE;
+        offload_stats_note_alloc(alloc_tier::FILE_MAPPED);
+        return result;
+    } catch (...) {
+        if (alloc_registered) {
+            alloc_registry::instance().unregister_alloc(mapping.base);
+        }
+        unified_cache_raw_unmap_file(&mapping);
+        if (control) {
+            allocation_owner_internal_access::abandon(control);
+        }
+        result.owner = {};
+        result.error = allocation_error::CONTROL_ALLOCATION_FAILED;
+        return result;
+    }
 }
 
 bool unified_lookup_file_mapping_fd(const void * base, int * fd) noexcept {
@@ -17410,7 +17529,7 @@ static registered_release_status release_registered_allocation_owned(
         detached.handle = live;
         detached.queue = it->second.queue;
         detached.queue_keepalive = it->second.queue_keepalive;
-        detached.file_fd = it->second.file_fd;
+        detached.file_fd                   = it->second.file_fd;
         detached.uses_pinned_pool = it->second.uses_pinned_pool;
         detached.zone_managed = it->second.zone_managed;
         detached.from_arena = it->second.from_arena;
@@ -17903,7 +18022,7 @@ bool unified_alloc_validate_registry(int device, const char * where) {
     size_t                                    registry_host = 0;
     // A file mapping is not charged to the host ledger (it is page cache, charged only when locked), so it is
     // reported beside the host sum and never compared with it.
-    size_t registry_file_mapped = 0;
+    size_t                                    registry_file_mapped = 0;
     {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         for (const auto & kv : g_runtime_alloc_registry) {
