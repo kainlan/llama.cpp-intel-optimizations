@@ -10,7 +10,6 @@
 # It loads the model once per prompt, so run it on one machine state at a time and
 # never run two copies at once. A failing prompt is reported with its real exit code
 # and the loop goes on; the script exits 1 if any prompt failed.
-#
 # ----- notes below are not part of the usage text -----
 #
 # This is a thin loop and starts no GPU work itself: whether the run is CPU-only or

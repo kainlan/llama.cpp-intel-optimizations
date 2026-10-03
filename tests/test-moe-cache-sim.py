@@ -297,7 +297,7 @@ def test_cli_train_test_path(tmp_path, capsys):
 def test_cli_budget_gib_total_splits_evenly_over_the_layers(tmp_path, capsys):
     tr, te = tmp_path / "a.moetrace", tmp_path / "b.moetrace"
     sim.write_trace(tr, {"set": "a", "id": "a", "n_expert": 4}, [(0, 0, 1, [[0, 1]])])
-    sim.write_trace(te, {"set": "b", "id": "b", "n_expert": 4}, [(0, 0, 1, [[0, 1]])])
+    sim.write_trace(te, {"set": "b", "id": "b", "n_expert": 4}, [(0, 0, 1, [[2, 3]])])
     sim.main(["--train", str(tr), "--test", str(te),
               "--uniform-expert-bytes", f"f={GIB}:2:4",
               "--budget-gib-total", "4"])
@@ -334,11 +334,66 @@ def test_same_id_in_two_capture_directories_is_not_the_same_trace(tmp_path):
     sim.write_trace(two, {"set": "code", "id": "code-0", "n_expert": 4},
                     [(0, 0, 1, [[0, 1]]), (1, 0, 1, [[1, 3]])])
     sim.check_disjoint([sim.read_trace(one)], [sim.read_trace(two)])   # no raise
-    # and a different number of steps is trivially different
-    three = tmp_path / "q8" / "code-1.moetrace"
-    sim.write_trace(three, {"set": "code", "id": "code-0", "n_expert": 4},
-                    [(0, 0, 1, [[0, 1]])])
-    sim.check_disjoint([sim.read_trace(one)], [sim.read_trace(three)])
+
+
+def test_truncated_copy_with_the_same_id_is_refused(tmp_path):
+    full = tmp_path / "a" / "code-0.moetrace"
+    cut = tmp_path / "b" / "code-0.moetrace"
+    full.parent.mkdir()
+    cut.parent.mkdir()
+    hdr = {"set": "code", "id": "code-0", "n_expert": 4}
+    sim.write_trace(full, hdr, [(0, 0, 1, [[0, 1]]), (1, 0, 1, [[0, 2]]), (2, 0, 1, [[1, 2]])])
+    sim.write_trace(cut, hdr, [(0, 0, 1, [[0, 1]]), (1, 0, 1, [[0, 2]])])   # shorter -n
+    with pytest.raises(ValueError, match="step-prefix"):
+        sim.check_disjoint([sim.read_trace(full)], [sim.read_trace(cut)])
+    with pytest.raises(ValueError, match="step-prefix"):   # either way round
+        sim.check_disjoint([sim.read_trace(cut)], [sim.read_trace(full)])
+
+
+def test_renamed_copy_with_identical_routing_is_refused(tmp_path):
+    a, b = tmp_path / "a.moetrace", tmp_path / "b.moetrace"
+    recs = [(0, 0, 1, [[0, 1]]), (1, 0, 1, [[2, 3]])]
+    sim.write_trace(a, {"set": "x", "id": "one", "n_expert": 4}, recs)
+    sim.write_trace(b, {"set": "y", "id": "two", "n_expert": 4}, recs)
+    with pytest.raises(ValueError, match="identical routing under different ids"):
+        sim.check_disjoint([sim.read_trace(a)], [sim.read_trace(b)])
+    # different ids and only a shared prefix: not a duplicate
+    c = tmp_path / "c.moetrace"
+    sim.write_trace(c, {"set": "z", "id": "three", "n_expert": 4}, recs[:1])
+    sim.check_disjoint([sim.read_trace(a)], [sim.read_trace(c)])
+
+
+def test_empty_traces_never_match():
+    a = sim.Trace(header={"id": "p"}, steps=[])
+    b = sim.Trace(header={"id": "p"}, steps=[])
+    c = sim.Trace(header={"id": "q"}, steps=[])
+    sim.check_disjoint([a], [b])
+    sim.check_disjoint([a], [c])
+
+
+def test_leave_one_out_rejects_a_wrong_n_expert_trace():
+    traces = [decode_trace([[0, 1]], set_name="a"),
+              decode_trace([[1, 2]], set_name="b", n_expert=8)]
+    with pytest.raises(ValueError, match="n_expert 8"):
+        sim.sweep_loo({"f": sizes({0: GIB})}, traces, [2 * GIB], "decode",
+                      dict(swap_n=96, every=4, decay=0.7, min_count=2.0,
+                           margin=1.5, land_delay=1))
+    bad = decode_trace([[0, 9]], set_name="c")
+    del bad.header["n_expert"]
+    with pytest.raises(ValueError, match="expert 9"):
+        sim.sweep_loo({"f": sizes({0: GIB})}, [traces[0], bad], [2 * GIB], "decode",
+                      dict(swap_n=96, every=4, decay=0.7, min_count=2.0,
+                           margin=1.5, land_delay=1))
+
+
+def test_capture_script_usage_stops_at_the_usage_block():
+    r = subprocess.run(["bash", str(ROOT / "examples" / "moe-trace" / "capture.sh")],
+                       capture_output=True, text=True, check=False)
+    assert r.returncode == 2
+    out = r.stderr
+    assert "capture.sh MODEL.gguf PROMPTDIR OUTDIR" in out
+    assert "thin loop" not in out and "How to read" not in out
+    assert out.rstrip("\n").splitlines()[-1] != "#"
 
 
 def test_leave_one_out_validates_the_traces_once(monkeypatch):
@@ -347,7 +402,7 @@ def test_leave_one_out_validates_the_traces_once(monkeypatch):
     monkeypatch.setattr(sim, "validate_traces",
                         lambda traces, sizes_by_format: (calls.append(len(traces)),
                                                           real(traces, sizes_by_format))[1])
-    traces = [decode_trace([[0, 1]], set_name=n) for n in ("a", "b", "c")]
+    traces = [decode_trace([[i, i + 1]], set_name=n) for i, n in enumerate("abc")]
     sim.sweep_loo({"f": sizes({0: GIB})}, traces, [2 * GIB], "decode",
                   dict(swap_n=96, every=4, decay=0.7, min_count=2.0,
                        margin=1.5, land_delay=1))
@@ -382,7 +437,7 @@ def test_trace_must_match_the_expert_sizes():
     ok = decode_trace([[0, 1]], set_name="a")
     other = decode_trace([[2, 3]], set_name="b")
     # header n_expert differs from the sizes
-    wrong = decode_trace([[0, 1]], set_name="b", n_expert=8)
+    wrong = decode_trace([[1, 2]], set_name="b", n_expert=8)
     with pytest.raises(ValueError, match="n_expert 8"):
         sim.sweep({"f": sizes({0: GIB})}, [ok], [wrong], **kw)
     # an expert id outside n_expert (header silent about it)

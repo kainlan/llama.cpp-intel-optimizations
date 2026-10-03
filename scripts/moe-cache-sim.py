@@ -175,17 +175,33 @@ def _group_key(trace, by):
     return str(v)
 
 
+def _steps_agree(x, y, prefix):
+    """Cheap: compare lengths first, stop at the first differing step. With
+    prefix=True the shorter list may be a leading part of the longer."""
+    if not x or not y:
+        return False   # two empty traces must not match
+    if not prefix and len(x) != len(y):
+        return False
+    return all(p == q for p, q in zip(x, y))
+
+
 def _same_trace(a, b):
+    """Is `b` the same capture as `a`? Deliberately a PROXY, not an identity:
+      - same object or same file;
+      - the same --trace-id with one capture a step-prefix of the other (a
+        re-run with a shorter -n);
+      - identical non-empty routing under different ids (a renamed copy).
+    Captures of one prompt whose routing genuinely diverges (another
+    quantisation, a nondeterministic backend) are accepted as distinct: capture.sh
+    takes ids from prompt file names, so the IQ3 and Q8 runs of one prompt share
+    an id and are exactly what a cross-format test wants to compare."""
     if a is b:
         return True
     if a.path and b.path and os.path.realpath(a.path) == os.path.realpath(b.path):
         return True
-    # A capture id comes from the prompt file name (capture.sh), so two capture
-    # directories, or the IQ3 and Q8 runs of one prompt, legitimately share it.
-    # Equal ids only mean the same trace when the routing is identical too.
     ia, ib = a.header.get("id"), b.header.get("id")
-    return (ia is not None and str(ia) not in ("", "unset") and ia == ib
-            and a.steps == b.steps)
+    same_id = ia is not None and str(ia) not in ("", "unset") and ia == ib
+    return _steps_agree(a.steps, b.steps, prefix=same_id)
 
 
 def check_disjoint(train, test):
@@ -194,10 +210,13 @@ def check_disjoint(train, test):
             if _same_trace(r, t):
                 raise ValueError(
                     f"trace {t.path or trace_id(t)} is in both train and test "
-                    f"(same object, same file, or same --trace-id "
-                    f"{trace_id(t)!r} with identical routing: rename --trace-id "
-                    "if these are different captures): a profile scored on its "
-                    "own training data is the oracle, not a held-out result")
+                    "(same object or file; the same --trace-id with one routing a "
+                    "step-prefix of the other; or identical routing under "
+                    "different ids). Same-prompt captures whose routing diverges "
+                    "(another quantisation, a nondeterministic backend) are "
+                    "deliberately accepted as distinct; rename --trace-id if "
+                    "these are different captures. A profile scored on its own "
+                    "training data is the oracle, not a held-out result")
 
 
 def validate_traces(traces, sizes_by_format):
