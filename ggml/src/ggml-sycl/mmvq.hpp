@@ -624,12 +624,11 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
 // IQ4_NL (llama.cpp-s36q), whose dense kernel is that generic body with
 // vec_dot_iq4_nl_q8_1, and IQ3_XXS / IQ3_S (s36q phase 2), whose dense kernels
 // (qi = QI3_x / 2, vdr 1) pass grid tables to their vec_dot, so each goes through
-// a generic-signature adaptor over the same tables. The rest of the iq* family is
-// deliberately absent: those use per-type kernels (mul_mat_vec_q_iq2_xxs_q8_1<>
-// and friends, a different template with no vec_dot parameter and adjusted qi),
-// so there is no tuple to carry over and covering them is separate work. Each
-// dispatches the same
-// generic mmvq_submit_aos_id_impl<> that Q1_0/NVFP4 use; the per-type template
+// a generic-signature adaptor over the same grid tables the dense kernels read. The
+// rest of the iq* family stays refused only because no tuple and, where its vec_dot
+// takes grid tables, no adaptor has been written for it yet (mul_mat_vec_q_iq2_xxs_q8_1<>
+// and friends are per-type dense kernels). Each dispatches the same generic
+// mmvq_submit_aos_id_impl<> that Q1_0/NVFP4 use; the per-type template
 // tuple is transcribed verbatim from the already-shipped non-indexed launcher
 // (mul_mat_vec_<t>_q8_1_sycl), because the two kernels share identical block
 // math and differ only in where the weight pointer and y offset come from.

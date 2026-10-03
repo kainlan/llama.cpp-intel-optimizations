@@ -167,7 +167,7 @@ int main() {
         { GGML_TYPE_IQ4_NL, GGML_LAYOUT_AOS, "iq4_nl/AOS" },
         // s36q phase 2: IQ3_XXS and IQ3_S. Their dense kernels pass grid tables to a vec_dot with a
         // non-generic signature, so the _id path wraps each in a generic-signature adaptor over the
-        // device grid tables (qi = QI3_x / 2, vdr = 1, as the dense kernels use).
+        // same grid tables the dense kernels read (qi = QI3_x / 2, vdr = 1, as the dense kernels use).
         { GGML_TYPE_IQ3_XXS, GGML_LAYOUT_AOS, "iq3_xxs/AOS" },
         { GGML_TYPE_IQ3_S,   GGML_LAYOUT_AOS, "iq3_s/AOS"   },
     };
@@ -186,15 +186,14 @@ int main() {
     // 5. The types with no _id kernel family must stay unadvertised. This is the
     //    half that keeps a future coverage pass honest: widening capability for
     //    these without adding the kernel turns a clean refusal into a wrong answer.
-    // The two families that remain refused, for different reasons. The iq* types
-    // other than IQ4_NL (covered since s36q: its dense kernel is the generic
-    // mul_mat_vec_q<> body with vec_dot_iq4_nl_q8_1) and IQ3_XXS/IQ3_S (s36q phase 2:
-    // generic-signature adaptors over their grid-table vec_dots) use per-type
-    // grid-lookup kernels with adjusted qi, so there is no generic tuple to
-    // transcribe; they are covered phase by phase. The float types cannot
-    // use MMVQ at all -- it quantizes the activation to Q8_1 and dispatches
-    // vec_dot_*_q8_1, meaningless for float weights. Covering either must move
-    // this list in the same change, which is the point.
+    // The two families that remain refused, for different reasons. IQ4_XS, IQ2_XXS,
+    // IQ2_XS, IQ2_S, IQ1_S and IQ1_M are refused only because no _id tuple and, where
+    // their vec_dot takes grid tables, no generic-signature adaptor has been written
+    // for them yet (IQ4_NL, IQ3_XXS and IQ3_S are covered since s36q); each moves out
+    // of this list in the change that adds its kernel. The float types cannot use
+    // MMVQ at all -- it quantizes the activation to Q8_1 and dispatches
+    // vec_dot_*_q8_1, meaningless for float weights. Covering either must move this
+    // list in the same change, which is the point.
     const ggml_type uncovered[] = { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_S,
                                     GGML_TYPE_F16,    GGML_TYPE_F32,     GGML_TYPE_BF16 };
     for (const ggml_type type : uncovered) {

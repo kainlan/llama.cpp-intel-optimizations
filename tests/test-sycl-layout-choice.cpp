@@ -2255,6 +2255,7 @@ static bool run_planned_layout_materializable_test() {
         { GGML_TYPE_Q4_0,  tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_AOS, "q4_0 moe (AoS-only _id)" },
         { GGML_TYPE_Q4_K,  tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_AOS, "q4_K moe (AoS-only)" },
         { GGML_TYPE_Q4_K,  tensor_usage::UNKNOWN,           GGML_LAYOUT_AOS, "q4_K unknown (AoS-only)" },
+        { GGML_TYPE_IQ3_XXS, tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_AOS, "iq3_xxs moe (no reorder)" },
         { GGML_TYPE_IQ3_S, tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_AOS, "iq3_s moe (no reorder)" },
         { GGML_TYPE_IQ3_S, tensor_usage::UNKNOWN,           GGML_LAYOUT_AOS, "iq3_s unknown (no reorder)" },
         { GGML_TYPE_Q5_K,  tensor_usage::OUTPUT_WEIGHT,     GGML_LAYOUT_AOS, "q5_K output (no reorder)" },
