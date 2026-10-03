@@ -3436,6 +3436,23 @@ foreach (lazy_range_test test-llama-lazy-range-record test-llama-lazy-range-pref
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
 endforeach()
 
+# llama.cpp-5efe C3: the loader's per-tensor lock is a ranged lock, so a tensor after a lazy
+# range no longer locks the range too. The fixture is a 64 MiB file under the build directory
+# (not tmpfs); the test measures the page cache of the file with cachestat(2) and exits 77
+# when it cannot evict or RLIMIT_MEMLOCK is too small. Host-only: no backend, no device.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    llama_build_and_test(test-llama-mlock-ranged.cpp)
+    target_include_directories(test-llama-mlock-ranged PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_compile_definitions(test-llama-mlock-ranged PRIVATE RESIDENCY_FIXTURE_DIR=\"${CMAKE_BINARY_DIR}\")
+    set_tests_properties(test-llama-mlock-ranged PROPERTIES
+        LABELS "host;lazy"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 300)
+    set_property(TEST test-llama-mlock-ranged PROPERTY
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:$ENV{LD_LIBRARY_PATH}")
+endif()
+
 # llama_mmap keeps MADV_HUGEPAGE off the lazily read ranges (llama.cpp-n77l),
 # checked through the VmFlags in /proc/self/smaps. Linux-only; exits 77 when
 # THP is unavailable, and fails when no VmFlags line can be read.

@@ -850,6 +850,11 @@ llama_mlock::~llama_mlock() = default;
 
 void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
+// RED stand-in (llama.cpp-5efe C3c): the prefix lock this replaces.
+void llama_mlock::lock_range(size_t offs, size_t size, const llama_mmap::ranges & deferred) {
+    (void) deferred;
+    pimpl->grow_to(offs + size);
+}
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mlock::SUPPORTED = true;

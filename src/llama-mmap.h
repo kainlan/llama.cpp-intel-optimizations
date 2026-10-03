@@ -67,7 +67,11 @@ struct llama_mlock {
     ~llama_mlock();
 
     void init(void * ptr);
+    // locks [0, target_size) from the mapping's start: for a whole-buffer lock only
     void grow_to(size_t target_size);
+    // locks the tensor's own byte range [offs, offs + size), outward to pages, except inward at an end whose page holds
+    // a byte of `deferred` (a lazy or storage range the loader must never fault in)
+    void lock_range(size_t offs, size_t size, const llama_mmap::ranges & deferred);
 
     static const bool SUPPORTED;
 
