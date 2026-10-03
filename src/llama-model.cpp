@@ -780,15 +780,13 @@ llama_lazy_tensor_attrs llama_model_lazy_tensor_attrs(llm_arch arch, const llama
             if (name == LLM_TN(arch)(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str()) {
                 // the one layer that consumes the table comes from hparams, never a literal:
                 // the loader refuses more than one PLE layer (src/models/qwen4exp.cpp)
-                int32_t  consumer_layer = -1;
-                uint32_t n_set          = 0;
-                for (uint32_t il = 0; il < LLAMA_MAX_LAYERS; ++il) {
-                    if (hparams.is_ple_impl.test(il) && n_set++ == 0) {
-                        consumer_layer = (int32_t) il;
+                int32_t consumer_layer = -1;
+                if (hparams.is_ple_impl.count() == 1) {
+                    for (uint32_t il = 0; il < LLAMA_MAX_LAYERS; ++il) {
+                        if (hparams.is_ple_impl.test(il)) {
+                            consumer_layer = (int32_t) il;
+                        }
                     }
-                }
-                if (n_set != 1) {
-                    consumer_layer = -1;
                 }
                 return { hparams.ple_n_heads, consumer_layer };
             }
@@ -2350,11 +2348,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
     {
+        // only AUTO reads the caps; get_props runs the SYCL budget authority, so `-lzm on|off` skips it
         std::vector<ggml_backend_dev_caps> device_caps;
-        for (const auto & dev : devices) {
-            ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(dev.dev, &props);
-            device_caps.push_back(props.caps);
+        if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
+            for (const auto & dev : devices) {
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev.dev, &props);
+                device_caps.push_back(props.caps);
+            }
         }
         ml.lazy.mode = llama_lazy_mode_resolve(ml.lazy.mode, device_caps);
     }

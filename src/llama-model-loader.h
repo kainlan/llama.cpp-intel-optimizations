@@ -129,9 +129,6 @@ struct llama_model_loader {
             return tensors.count(ggml_get_name(t)) > 0;
         }
 
-        // the byte ranges of the members in one file, from the record
-        llama_mmap::ranges for_file(uint32_t idx) const;
-
         // lazy tensors are gathered on the host, so no offload setting applies to them
         static ggml_backend_buffer_type_t buft();
 

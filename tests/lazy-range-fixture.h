@@ -45,8 +45,12 @@ struct lazy_fixture {
     };
 
     lazy_fixture() {
-        char tmpl[] = "/tmp/lazy-range-fixture-XXXXXX";
-        dir         = mkdtemp(tmpl);
+        std::string tmpl = (std::filesystem::temp_directory_path() / "lazy-range-fixture-XXXXXX").string();
+        if (mkdtemp(&tmpl[0]) == nullptr) {
+            std::fprintf(stderr, "mkdtemp failed for %s\n", tmpl.c_str());
+            std::exit(2);
+        }
+        dir = tmpl;
 
         add_file({
             { "lz_plus1", GGML_TYPE_I8,  (int64_t) (4 * GIB + 1) },

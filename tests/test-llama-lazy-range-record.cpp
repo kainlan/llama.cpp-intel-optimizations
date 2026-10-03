@@ -283,19 +283,21 @@ int main() {
     // ---- lazy_read reads the record: add() accepts exactly the LAZY_READ rows, under every mode it holds ----
     {
         struct cell {
-            const char *         label;
-            llama_lazy_mode      mode;     // what the record was filled with
-            bool                 taker;
+            const char *    label;
+            llama_lazy_mode mode;  // what the record was filled with
+            bool            taker;
         };
+
         const cell cells[] = {
-            { "ON, off the taker (LAZY_READ rows)", LLAMA_LAZY_MODE_ON, false },
-            { "ON, the taker (STORAGE rows)", LLAMA_LAZY_MODE_ON, true },
+            { "ON, off the taker (LAZY_READ rows)",          LLAMA_LAZY_MODE_ON,   false },
+            { "ON, the taker (STORAGE rows)",                LLAMA_LAZY_MODE_ON,   true  },
             { "AUTO, off the taker (4 GiB row stays EAGER)", LLAMA_LAZY_MODE_AUTO, false },
-            { "OFF, off the taker (EAGER rows)", LLAMA_LAZY_MODE_OFF, false },
+            { "OFF, off the taker (EAGER rows)",             LLAMA_LAZY_MODE_OFF,  false },
         };
         for (const cell & c : cells) {
             llama_lazy_range_record rec;
-            llama_lazy_range_record_prefill(rec, LLM_ARCH_LLAMA, hp, declared, fx.finder(), c.mode, c.mode, c.taker, true);
+            llama_lazy_range_record_prefill(rec, LLM_ARCH_LLAMA, hp, declared, fx.finder(), c.mode, c.mode, c.taker,
+                                            true);
 
             // lazy_read's own mode must not decide anything: upstream's add() read it
             for (llama_lazy_mode held : k_modes) {
@@ -310,14 +312,14 @@ int main() {
 
                 size_t n_lazy_read = 0;
                 for (const std::string & name : declared) {
-                    const bool want = rec.deferral(name) == LLAMA_LAZY_DEFERRAL_LAZY_READ;
-                    ggml_tensor * t = fx.weights.at(name).tensor;
+                    const bool    want = rec.deferral(name) == LLAMA_LAZY_DEFERRAL_LAZY_READ;
+                    ggml_tensor * t    = fx.weights.at(name).tensor;
                     n_lazy_read += want ? 1 : 0;
 
                     const bool fit_got  = fit.add(name, t, nullptr);
                     const bool real_got = real.add(name, t, &fx.weights.at(name));
-                    CHECK(fit_got == want, "%s, held mode %s, fit pass: add(%s) = %d, expected %d", c.label, mode_name(held),
-                          name.c_str(), (int) fit_got, (int) want);
+                    CHECK(fit_got == want, "%s, held mode %s, fit pass: add(%s) = %d, expected %d", c.label,
+                          mode_name(held), name.c_str(), (int) fit_got, (int) want);
                     CHECK(real_got == want, "%s, held mode %s: add(%s) = %d, expected %d", c.label, mode_name(held),
                           name.c_str(), (int) real_got, (int) want);
                     CHECK(real.has(t) == want, "%s: membership of %s is %d, expected %d", c.label, name.c_str(),
@@ -325,14 +327,8 @@ int main() {
                     CHECK(!fit.has(t), "%s: the fit pass (no weight) recorded %s as a member", c.label, name.c_str());
                 }
                 CHECK(!fit.any(), "%s: the fit pass maps something (any() is true)", c.label);
-                CHECK(real.any() == (n_lazy_read > 0), "%s: any() = %d with %zu LAZY_READ rows", c.label, (int) real.any(),
-                      n_lazy_read);
-
-                // the ranges the mapping excludes are the record's, for members only
-                for (uint32_t idx = 0; idx < 2; ++idx) {
-                    CHECK(real.for_file(idx) == rec.deferred_for_file(idx), "%s: for_file(%u) disagrees with the record", c.label,
-                          idx);
-                }
+                CHECK(real.any() == (n_lazy_read > 0), "%s: any() = %d with %zu LAZY_READ rows", c.label,
+                      (int) real.any(), n_lazy_read);
             }
         }
     }

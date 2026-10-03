@@ -1262,7 +1262,9 @@ bool llama_lazy_eligible(enum llama_lazy_mode mode, size_t nbytes, bool mmap_sup
 bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
     GGML_UNUSED(t);
 
-    if (record == nullptr || !record->has(name) || record->deferral(name) != LLAMA_LAZY_DEFERRAL_LAZY_READ) {
+    // the caller ran the drift check first, so the tensor has a row; deferral() aborts on one that does not
+    GGML_ASSERT(record != nullptr);
+    if (record->deferral(name) != LLAMA_LAZY_DEFERRAL_LAZY_READ) {
         return false;
     }
 
@@ -1271,19 +1273,6 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     }
 
     return true;
-}
-
-llama_mmap::ranges llama_model_loader::lazy_read::for_file(uint32_t idx) const {
-    llama_mmap::ranges ranges;
-    if (record == nullptr) {
-        return ranges;
-    }
-    for (const llama_lazy_range_row & row : record->rows()) {
-        if (row.value.file_idx == idx && row.deferral == LLAMA_LAZY_DEFERRAL_LAZY_READ && tensors.count(row.name) > 0) {
-            ranges.emplace_back(row.value.offs, row.value.offs + row.value.size);
-        }
-    }
-    return ranges;
 }
 
 struct ggml_tensor * llama_model_loader::create_tensor(
@@ -1800,11 +1789,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (flags & TENSOR_READ_LAZY) {
         // a STORAGE row is the SYCL storage tier's, not lazy_read's: refuse it before
         // buft_for_tensor() can make it an ordinary input-layer weight in host memory
-        if (lazy_record.deferral(tn.str()) == LLAMA_LAZY_DEFERRAL_STORAGE) {
-            throw std::runtime_error(
-                format("lazy-range record: %s is STORAGE and this tree has no STORAGE consumer (llama.cpp-th32 T6)",
-                       tn.str().c_str()));
-        }
+        llama_lazy_range_check_storage(lazy_record, tn.str());
 
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));

@@ -7,8 +7,8 @@ this project runs on (llama_mmap::SUPPORTED is a constant true on Linux and
 Windows) or that a rebase of upstream code would silently restore:
 
 1. no consumer holds its own RANGE container: lazy_read has no `ranges` member (its
-   membership set of names stays) and init_mappings() passes the record's
-   excluded_for_file(), not lazy.for_file();
+   membership set of names stays), no for_file() and init_mappings() passes the
+   record's excluded_for_file();
 2. lazy_read::add() reads `deferral` and decides nothing: its body names LAZY_READ
    and the record and contains no LLAMA_LAZY_MODE_, no llama_mmap::SUPPORTED and no
    4 GiB floor (upstream's add() restored, as a rebase would restore it, fails);
@@ -25,7 +25,9 @@ Windows) or that a rebase of upstream code would silently restore:
    the guard and before llama_model_sycl_compute_early_plan();
 6. create_tensor()'s TENSOR_READ_LAZY handling checks the record and does not fill
    it, compares the flag with membership (not with `deferral`), and refuses a STORAGE
-   row before buft_for_tensor() can make it an ordinary weight;
+   row, through llama_lazy_range_check_storage() as the first statement of the branch
+   and before buft_for_tensor() can make it an ordinary weight (the refusal's
+   behaviour is driven by test-llama-lazy-range-prefill);
 7. the early plan's weights_map loop consults the record.
 
 8. load_all_data() locks each tensor with llama_mlock::lock_range, passing the record's excluded ranges, and never with the
@@ -121,6 +123,7 @@ def test_init_mappings_passes_the_record():
     body = function_body(read_code(LOADER_CPP), r"void\s+llama_model_loader::init_mappings\s*\([^)]*\)")
     assert "lazy_record.excluded_for_file" in body, "init_mappings() does not pass lazy_record.excluded_for_file(idx) to llama_mmap"
     assert "lazy.for_file" not in body, "init_mappings() still passes lazy.for_file()"
+    assert not re.search(r"\bfor_file\s*\(", lazy_read_struct()), "lazy_read grew a range accessor of its own back"
 
 
 # ---- 2. add() reads deferral and decides nothing ----

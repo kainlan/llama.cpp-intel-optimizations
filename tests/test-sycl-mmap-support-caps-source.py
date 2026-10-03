@@ -127,8 +127,17 @@ def test_known_is_set_only_when_the_query_returned():
     assert re.search(r"known\s*=\s*true", try_part), "`known` is never set true after the query returns"
     assert not re.search(r"known\s*=\s*true", catch_part), "`known` is set true on the throwing path"
 
+    # ggml_sycl_init() must hand the field to the query by reference: get_props itself
+    # names `host_unified_known`, so a search over the whole file would match without it
     sycl = read_code(GGML_SYCL_CPP)
-    assert re.search(r"\.host_unified_known\b", sycl), "ggml_sycl_info() never assigns .host_unified_known"
+    init = function_body(sycl, r"static\s+ggml_sycl_device_info\s+ggml_sycl_init\s*\(\s*\)")
+    assert re.search(
+        r"\.host_unified_memory\s*=\s*ggml_sycl_device_query_host_unified\s*\([^;]*\.host_unified_known\s*\)\s*;", init
+    ), (
+        "ggml_sycl_init() does not assign host_unified_memory from "
+        "ggml_sycl_device_query_host_unified(device, <info>.host_unified_known), so the field stays false "
+        "for every device and mmap_support is false everywhere"
+    )
 
 
 def test_load_path_still_clears_use_mmap_for_a_sycl_model_backend():

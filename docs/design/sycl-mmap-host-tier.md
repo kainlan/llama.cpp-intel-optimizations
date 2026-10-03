@@ -752,8 +752,9 @@ and held by `llama_model_loader`.
       full" WARN (`lml:1252-1253`) moves to the pre-fill. It prints for a
       declared row whose bit is clear because `SUPPORTED` is false off the
       taker.
-  - `any()` and `has()` answer from that membership. `for_file(idx)` returns
-    the record's ranges for its members only.
+  - `any()` and `has()` answer from that membership. As built (C1 review N2)
+    there is no `for_file(idx)`: it had no production caller, and the record's
+    `deferred_for_file(idx)` is the sorted, merged form of the same ranges.
   - Its private `ranges` map is deleted.
   - So under `taker`, where eligible rows are `STORAGE`, `any()` stays false,
     and `init_mappings` does not map every shard with `use_mmap` cleared
@@ -5245,7 +5246,7 @@ Rows marked "superseded in part" did not hold as written at rev 3a (design-5efe-
 | m-6 equivalent tier mutant | Fixed: the mutants are the record registered as `HOST_MALLOC`, and the `FILE_MAPPED` branch moved after `zone_managed` into the `sycl::free` fallthrough. | §7 C2 |
 | m-7 preload site | Fixed: `gs:34701-34735` is added to the §4.3 site table and §5.3, and the loader source test pins it. | §4.3, §5.3 |
 | m-8 C1 test vs C4 deletion | Fixed: C4 narrows `lm:2693` to the no-tier case and amends the C1 caps test. | §4.3, §7 C1, C4 |
-| m-9 pre-fill `no_alloc` | Fixed: under `no_alloc` the pre-fill still runs (rows are metadata), `lazy_read.any()` is false, and no range reaches `llama_mmap`. | §3.1, §7 C1 |
+| m-9 pre-fill `no_alloc` | Fixed: under `no_alloc` the pre-fill still runs (rows are metadata) and `lazy_read.any()` is false. As built (C1 review N8), `init_mappings` passes the record's excluded ranges to `llama_mmap` whenever `use_mmap` is true, the fit pass included, so the fit pass does not `WILLNEED` a lazy table either. | §3.1, §7 C1 |
 | m-10 `SYCL_Mapped` `alloc_buffer` | Fixed: size 0 returns a dummy buffer, and any other size aborts naming the buft. | §4.3 |
 | m-11 `memory_tier::MMAP` | Fixed: listed in §2.7 and renamed `UNRESOLVED` in §4.8. The census gate covers all four legacy names. `alloc_type::MMAP` is split into `HOST_MALLOC` (`::free`) and `HOST_OWNED_ELSEWHERE` (the KV synthetic base, gs:39620-39624, :39641-39642, released at :38408-38415). | §2.7, §4.8, §7 C2 |
 | m-12 allowlist tokenizer | Fixed: comments and strings are stripped, `mmap (` is matched with a fixture, and a non-listed-file mutant is added. | §4.1, §7 C2 |

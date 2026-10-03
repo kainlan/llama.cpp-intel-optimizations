@@ -186,6 +186,14 @@ def declaration() -> dict:
     for m in re.finditer(r"case\s+(LLM_ARCH_\w+)\s*:\s*return\s+(\w+)\s*;", body):
         assert m.group(2) in variables, f"{m.group(2)} is returned but not defined in the declaration"
         result[m.group(1)] = variables[m.group(2)]
+    # the `default:` arm answers for every other arch: it must name nothing, or it declares a
+    # name for an arch whose create_tensor() calls do not flag it, and aborts that arch's load
+    default = re.search(r"\bdefault\s*:\s*return\s+(\w+)\s*;", body)
+    assert default, "llama_model_lazy_tensor_names() has no `default: return <vector>;` arm"
+    assert default.group(1) in variables, f"the default arm returns {default.group(1)}, which is not defined in the declaration"
+    assert not variables[default.group(1)], (
+        f"the default arm returns {default.group(1)} = {sorted(variables[default.group(1)])}: it declares names for every other arch"
+    )
     return result
 
 

@@ -5,6 +5,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <utility>
 
 const char * llama_lazy_deferral_name(enum llama_lazy_deferral deferral) {
@@ -226,7 +227,9 @@ void llama_lazy_range_check_create(const llama_lazy_range_record & record,
 }
 
 void llama_lazy_range_check_storage(const llama_lazy_range_record & record, const std::string & name) {
-    // stand-in: refuses nothing
-    GGML_UNUSED(record);
-    GGML_UNUSED(name);
+    if (record.deferral(name) == LLAMA_LAZY_DEFERRAL_STORAGE) {
+        throw std::runtime_error(
+            format("lazy-range record: %s is STORAGE and this tree has no STORAGE consumer (llama.cpp-th32 T6)",
+                   name.c_str()));
+    }
 }
