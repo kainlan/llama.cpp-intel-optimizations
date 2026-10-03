@@ -1,0 +1,17 @@
+Sat Oct  3 02:08:17 PM EDT 2026
+ 14:08:17 up 24 days, 19:23, 23 users,  load average: 32.76, 37.81, 40.94
+top - 14:08:18 up 24 days, 19:23, 23 users,  load average: 32.76, 37.81, 40.94
+Tasks: 1211 total,   4 running, 1206 sleeping,   0 stopped,   1 zombie
+%Cpu(s):  6.9 us,  4.8 sy, 88.2 ni,  0.0 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st 
+MiB Mem : 252839.4 total, 128195.6 free,  87855.7 used,  50306.8 buff/cache     
+MiB Swap:   8192.0 total,     26.2 free,   8165.7 used. 164983.7 avail Mem 
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+3286086 kainlan   20   0 2151.7g  33.5g   1.4g S  2217  13.6    28w+3d codesco+
+2895723 kainlan   20   0  356580 323556  19648 R 100.0   0.1   0:06.61 python3
+2624452 kainlan   20   0   11.2g   1.1g  38296 R  25.0   0.4 273:51.03 pi
+1410917 emby      20   0  503.0g   1.0g 127076 S   8.3   0.4 167:05.93 EmbySer+
+2897090 kainlan   20   0   11820   6996   4352 R   8.3   0.0   0:00.02 top
+3822873 kainlan   20   0   19.0g   1.4g  42284 S   8.3   0.6 347:24.18 pi
+      1 root      20   0   28236  18272  10576 S   0.0   0.0  32:46.20 systemd
+      2 root      20   0       0      0      0 S   0.0   0.0   0:08.31 kthreadd

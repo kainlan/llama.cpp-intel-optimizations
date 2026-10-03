@@ -1,0 +1,13 @@
+shape,mat,type,threads,variant,best_gbps,p90_gbps,median_gbps,p10_gbps,min_gbps,burst_gbps,ratio_read,median_us,n
+qwen38,gate,mxfp4,22,prod,35.9,20.7,6.8,3.1,0.3,6.5,0.37,128,192
+qwen38,gate,mxfp4,22,prod+pin,42.4,24.6,9.1,3.2,0.8,7.2,0.29,96,192
+qwen38,gate,mxfp4,22,read,53.0,42.6,20.4,6.2,0.4,19.5,,43,192
+qwen38,gate,mxfp4,22,read+pin,54.7,41.0,26.4,19.5,10.9,26.0,,33,192
+qwen38,gate,q2_0,22,prod,23.1,15.9,6.2,3.2,0.1,5.4,0.34,74,192
+qwen38,gate,q2_0,22,prod+pin,21.3,16.7,6.9,3.4,2.0,6.9,0.31,67,192
+qwen38,gate,q2_0,22,read,47.9,37.8,22.3,4.3,0.5,20.1,,21,192
+qwen38,gate,q2_0,22,read+pin,43.0,37.1,24.5,14.1,8.4,24.4,,19,192
+qwen38,gate,q8_0,22,prod,51.1,35.3,13.9,7.9,1.3,13.7,0.71,125,192
+qwen38,gate,q8_0,22,prod+pin,59.4,34.4,15.0,8.1,0.0,14.0,0.44,116,192
+qwen38,gate,q8_0,22,read,54.1,41.2,19.7,7.9,0.3,18.9,,88,192
+qwen38,gate,q8_0,22,read+pin,62.5,53.6,34.4,18.6,1.4,35.1,,51,192
