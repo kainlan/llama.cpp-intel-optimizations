@@ -62,12 +62,36 @@ inline llama_plan_caps_decision llama_plan_caps_decide(bool has_sycl_backend,
 using llama_residency = std::vector<uint8_t>;
 using llama_tenants   = std::vector<ggml_sycl_context_tenant_desc>;
 
+// What the residency probe says about itself. The value-initialised answer is NOT_ANSWERED, so a probe that
+// returns `{}`, or a wrapper that forgets to set a status, refuses: the fixpoint treats every status other than
+// OK -- an unknown value included -- as "the backend could not answer".
+//
+// Mapping obligation of the adapter (llama.cpp-hdpd / step 1d) that turns the backend's
+// ggml_backend_sycl_probe_residency status into this one: OK maps to OK, and every other value, GEOMETRY_NOT_WIRED
+// and NOT_ANSWERED both included and any value the adapter does not know, maps to a status other than OK, with the
+// backend's reason. It must NEVER answer an all-zero residency in their place: "zero host layers" reads as "every
+// layer is device-resident", the answer that fits an unanswered probe least (llama.cpp-71hq).
+enum llama_residency_probe_status {
+    LLAMA_RESIDENCY_PROBE_NOT_ANSWERED = 0,  // the probe produced nothing (also the default)
+    LLAMA_RESIDENCY_PROBE_OK,                // `residency` is the backend's answer
+    LLAMA_RESIDENCY_PROBE_REFUSED,           // the backend answered that it cannot (geometry not wired, ...)
+};
+
+struct llama_residency_probe_answer {
+    llama_residency_probe_status status = LLAMA_RESIDENCY_PROBE_NOT_ANSWERED;
+    llama_residency              residency;  // read only when status is OK
+    std::string                  reason;     // the backend's reason when it is not
+};
+
 enum llama_residency_fixpoint_status {
     LLAMA_RESIDENCY_FIXPOINT_OK,
     LLAMA_RESIDENCY_FIXPOINT_MEASURE_FAILED,
     // the probe contradicted the iteration: a residency of the wrong length, or a loop that did not
     // stop. A plan bug, never a fit verdict.
     LLAMA_RESIDENCY_FIXPOINT_BUG,
+    // the probe could not answer (a status other than OK) at the initial call, a round or the verify. Not a bug and
+    // not a fit verdict either: the plan was never checked, so it is refused.
+    LLAMA_RESIDENCY_FIXPOINT_PROBE_FAILED,
 };
 
 struct llama_residency_fixpoint_result {
@@ -78,6 +102,20 @@ struct llama_residency_fixpoint_result {
     bool                            verify_shrunk = false;  // the verify replaced (R*, T*) with (R_v, T_v)
     std::string                     reason;
 };
+
+// Whether a result is a refusal. Fail-closed: only OK is not, so a status this build does not know is refused too.
+inline bool llama_residency_fixpoint_refused(llama_residency_fixpoint_status status) {
+    return status != LLAMA_RESIDENCY_FIXPOINT_OK;
+}
+
+// The text of the refusal, greppable on purpose: the constructor (llama.cpp-hdpd's consumer of the fixpoint) throws
+// exactly this for any result that is refused, and never acquires a plan from one. Empty for an OK result.
+inline std::string llama_residency_fixpoint_refusal_text(const llama_residency_fixpoint_result & result) {
+    if (!llama_residency_fixpoint_refused(result.status)) {
+        return std::string();
+    }
+    return "SYCL residency fixpoint refused: " + result.reason;
+}
 
 // The residency fixpoint (design 2.7), demote-only:
 //
@@ -93,7 +131,9 @@ struct llama_residency_fixpoint_result {
 // whole iteration rests on. A byte of a probe's answer other than 0 is host-resident and is normalised
 // to 1, so that the comparisons below are about layers.
 //
-//   probe(tenants)         the residency the backend would give with those tenants (nullptr: none)
+//   probe(tenants)         a llama_residency_probe_answer: the residency the backend would give with those
+//                          tenants (nullptr: none), or the status that says it could not give one. A status other
+//                          than OK ends the fixpoint at that call as PROBE_FAILED, whatever the answer holds
 //   measure(R, tenants)    the tenant section measured over memory created with residency R;
 //                          false when the measure cannot be made
 //
@@ -124,11 +164,29 @@ llama_residency_fixpoint_result llama_residency_fixpoint(size_t n_layer, Probe p
         return r;
     };
 
-    llama_residency residency = probe(nullptr);
-    if (residency.size() != n_layer) {
-        return bug("the residency probe answered a residency of the wrong length");
+    // The one place the probe is called. A status other than OK refuses at that call: the residency such an answer
+    // holds is never read, so a probe that cannot answer cannot read as "every layer is device-resident". A wrong
+    // length is a different fault (the probe answered and contradicted the iteration) and stays BUG.
+    const auto ask = [&](const llama_tenants * with, const char * site, llama_residency & into) {
+        llama_residency_probe_answer a = probe(with);
+        if (a.status != LLAMA_RESIDENCY_PROBE_OK) {
+            out.status = LLAMA_RESIDENCY_FIXPOINT_PROBE_FAILED;
+            out.reason = std::string("the residency probe did not answer (") + site +
+                         "): " + (a.reason.empty() ? "no reason given" : a.reason);
+            return false;
+        }
+        if (a.residency.size() != n_layer) {
+            bug("the residency probe answered a residency of the wrong length");
+            return false;
+        }
+        into = normalise(std::move(a.residency));
+        return true;
+    };
+
+    llama_residency residency;
+    if (!ask(nullptr, "initial call", residency)) {
+        return out;
     }
-    residency = normalise(residency);
 
     llama_tenants   tenants;
     llama_residency answer;  // the last round's answer: over T*, the verify's raw probe
@@ -139,11 +197,9 @@ llama_residency_fixpoint_result llama_residency_fixpoint(size_t n_layer, Probe p
         }
         out.iterations++;
 
-        answer = probe(&tenants);
-        if (answer.size() != n_layer) {
-            return bug("the residency probe answered a residency of the wrong length");
+        if (!ask(&tenants, "round", answer)) {
+            return out;
         }
-        answer               = normalise(answer);
         llama_residency next = residency;
         for (size_t i = 0; i < n_layer; i++) {
             next[i] = next[i] || answer[i];
@@ -170,7 +226,11 @@ llama_residency_fixpoint_result llama_residency_fixpoint(size_t n_layer, Probe p
         if (!measure(raw, shrunk)) {
             return measure_failed();
         }
-        if (normalise(probe(&shrunk)) == raw) {
+        llama_residency kept;
+        if (!ask(&shrunk, "verify", kept)) {
+            return out;
+        }
+        if (kept == raw) {
             residency         = raw;
             tenants           = shrunk;
             out.verify_shrunk = true;

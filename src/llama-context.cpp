@@ -2988,6 +2988,13 @@ void llama_context::fused_resolution_report_lost() noexcept {
 // chunk-cap copy, which needs the residency probe (llama_context_l4_ready). The pure iteration is
 // llama_residency_fixpoint (llama-residency-fixpoint.h); what is missing is the backend's tenant-aware probe, which L4
 // does not define yet, so this refuses by name instead of publishing a plan nobody checked.
+//
+// The call that replaces this stub (llama.cpp-hdpd) owes two things the pure iteration cannot do for it. The probe it
+// passes returns a llama_residency_probe_answer, and the adapter from ggml_backend_sycl_probe_residency maps OK to OK
+// and every other status (GEOMETRY_NOT_WIRED, NOT_ANSWERED, any value it does not know) to a status other than OK,
+// never to an all-zero residency. And it throws llama_residency_fixpoint_refusal_text(result) for every result for
+// which llama_residency_fixpoint_refused(result.status) holds, so a PROBE_FAILED fixpoint is a named construction
+// failure and never an acquired plan (llama.cpp-71hq).
 void llama_context::sched_residency_fixpoint() {
     throw std::runtime_error(
         "the SYCL residency fixpoint has no tenant-aware residency probe to run (llama.cpp-7gno, moua L4 step 3)");

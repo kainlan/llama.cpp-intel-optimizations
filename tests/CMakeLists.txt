@@ -3954,6 +3954,16 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-71hq: source gate for the residency probe's failure channel (one probe call in ask, the status read
+# before the residency, the three call sites refusing, the helper refusing every status but OK).
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-residency-fixpoint-status-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-residency-fixpoint-status-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # zhcn C7h-3: source gate for the load-time measure (the unwind order of its locals, the CPU backend last,
 # the one refusal text) and the loader's single late-check call between the dev_layer sync and the mappings.
 if (Python3_Interpreter_FOUND)
