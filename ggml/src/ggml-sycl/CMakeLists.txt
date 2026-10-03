@@ -4433,6 +4433,33 @@ set_tests_properties(test-sycl-cpu-dispatch PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+
+# Host-only CPU expert matvec bandwidth bench (llama.cpp-cego). Not part of
+# `all`, not a test: it opens no SYCL queue, like test-sycl-cpu-dispatch above,
+# but it is a measurement, not a gate. Build on demand with
+#   ./scripts/sycl-build.sh bench-cpu-expert-matvec
+add_executable(bench-cpu-expert-matvec EXCLUDE_FROM_ALL
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/cpu-expert-bench/bench-cpu-expert-matvec.cpp
+)
+target_include_directories(bench-cpu-expert-matvec PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+# Same host ISA as cpu-dispatch.cpp (AVX2 + FMA + AVX-VNNI + AVX-VNNI-INT8) plus
+# F16C for the prototype kernels' scale conversion.
+target_compile_options(bench-cpu-expert-matvec PRIVATE "-fsycl" "-Wno-narrowing"
+    "-mavx2" "-mfma" "-mf16c" "-mavxvnni" "-mavxvnniint8")
+target_link_options(bench-cpu-expert-matvec PRIVATE "-fsycl")
+target_compile_definitions(bench-cpu-expert-matvec PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(bench-cpu-expert-matvec PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(bench-cpu-expert-matvec PRIVATE IntelSYCL::SYCL_CXX)
+endif()
 endif() # static SYCL backend fixture
 
 if (NOT GGML_BACKEND_DL)
