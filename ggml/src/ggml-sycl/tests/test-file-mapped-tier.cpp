@@ -220,6 +220,34 @@ void refusals_leave_nothing_behind() {
     std::cout << "PASS refusals-leave-nothing-behind\n";
 }
 
+// A file mapping is page cache, not host memory the cache allocated: it is never charged to the host ledger
+// (unified_alloc_validate_registry compares that sum with g_runtime_reserved_host_bytes), and the registry reports its
+// bytes separately. The two sums come from the one helper the validator reads.
+void host_ledger_reports_file_mapped_apart() {
+    const uint64_t page = (uint64_t) sysconf(_SC_PAGESIZE);
+    fixture_file   f(8);
+
+    size_t host_before = 0;
+    size_t file_before = 0;
+    unified_alloc_registry_sums_for_test(&host_before, &file_before);
+
+    allocation_result allocation = unified_allocate_file_mapping(make_request(f, page));
+    check(static_cast<bool>(allocation), "the front door refused a valid request");
+
+    size_t host_during = 0;
+    size_t file_during = 0;
+    unified_alloc_registry_sums_for_test(&host_during, &file_during);
+    check(host_during == host_before, "a file mapping was charged to the host-pinned sum");
+    check(file_during == file_before + 6 * page, "the file-mapped sum is not the reservation's length");
+
+    allocation        = {};
+    size_t host_after = 0;
+    size_t file_after = 0;
+    unified_alloc_registry_sums_for_test(&host_after, &file_after);
+    check(host_after == host_before && file_after == file_before, "the sums did not return after the release");
+    std::cout << "PASS host-ledger-reports-file-mapped-apart\n";
+}
+
 void device_mappable_by_tier() {
     memory_location loc{};
     loc.ptr  = (void *) 0x1000;
@@ -239,6 +267,7 @@ void device_mappable_by_tier() {
 int main() {
     tier_identity_registry_and_release();
     refusals_leave_nothing_behind();
+    host_ledger_reports_file_mapped_apart();
     device_mappable_by_tier();
     return 0;
 }

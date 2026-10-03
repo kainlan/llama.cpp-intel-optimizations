@@ -18017,6 +18017,14 @@ void unified_cache_deallocate(void * ptr, int device) {
     }
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void unified_alloc_registry_sums_for_test(size_t * host, size_t * file_mapped) noexcept {
+    // stand-in: reports nothing
+    *host        = 0;
+    *file_mapped = 0;
+}
+#endif
+
 bool unified_alloc_validate_registry(int device, const char * where) {
     std::array<size_t, GGML_SYCL_MAX_DEVICES> registry_device{};
     size_t                                    registry_host = 0;

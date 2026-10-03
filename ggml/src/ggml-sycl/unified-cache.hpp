@@ -6324,6 +6324,10 @@ allocation_result unified_allocate_file_mapping(const file_mapping_request & req
 bool unified_lookup_file_mapping_fd(const void * base, int * fd) noexcept;
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+// The registry's host-pinned and file-mapped byte sums: the figures unified_alloc_validate_registry compares with the
+// host ledger and reports beside it. A file mapping is in the second and never in the first.
+void unified_alloc_registry_sums_for_test(size_t * host, size_t * file_mapped) noexcept;
+
 // How often unified_free_record reached ::free and sycl::free, so a test can tell a file mapping that was
 // unmapped from one that fell through to another branch.
 void unified_cache_test_free_branch_counts(uint64_t * malloc_free, uint64_t * sycl_free) noexcept;
