@@ -207,3 +207,133 @@ def test_a_p_min_arm_without_the_stats_line_is_rejected_not_given_a_derived_leng
         assert result.returncode == 2
         assert "needs the '#mean acc len' statistics line" in result.stdout
         assert "Traceback" not in result.stdout
+
+
+# ---- baseline-vs-MTP pairs (parser --pairs) and the script's arm validation -----------------------------
+# Verbatim lines from the first interleaved pair (code prompt): llama-completion reports the baseline
+# decode rate in its common_perf_print "eval time" line; llama-speculative-simple reports "decoded".
+REAL_BASELINE_LOG = """\
+4.20.332.943 I common_perf_print: prompt eval time =   10280.11 ms /    58 tokens (  177.24 ms per token,     5.64 tokens per second)
+4.20.333.048 I common_perf_print:        eval time =  199613.05 ms /   255 runs   (  782.80 ms per token,     1.28 tokens per second)
+"""
+REAL_MTP_LOG = """\
+2.58.860.660 I encoded   58 tokens in    6.941 seconds, speed:    8.356 t/s
+2.58.860.660 I decoded  259 tokens in  115.649 seconds, speed:    2.240 t/s
+2.58.860.660 I 
+2.58.860.661 I n_draft   = 2
+2.58.860.661 I n_predict = 259
+2.58.860.661 I n_drafted = 178
+2.58.860.661 I n_accept  = 170
+2.58.860.662 I accept    = 95.506%
+2.58.860.703 I spec common_specu: statistics        draft-mtp: #calls(b,g,a) =    1     89     89, #gen drafts =     89, #acc drafts =    87, #gen tokens =    178, #acc tokens =   170, #mean acc len = 2.91, #acc rate/pos = (0.978, 0.933), dur(b,g,a) = 0.009, 7596.425, 0.512 ms
+2.58.860.711 I common_perf_print: prompt eval time =  104222.67 ms /   324 tokens (  321.67 ms per token,     3.11 tokens per second)
+2.58.860.712 I common_perf_print:        eval time =       0.00 ms /     1 runs   (    0.00 ms per token,      inf tokens per second)
+"""
+
+SCRIPT = ROOT / "scripts" / "qwen4exp-mtp-acceptance.sh"
+
+
+def write_pair(tmp: pathlib.Path, base_text: str = REAL_BASELINE_LOG, mtp_text: str = REAL_MTP_LOG,
+               prompt: str = "code") -> pathlib.Path:
+    d = tmp / "pairs"
+    d.mkdir(exist_ok=True)
+    if base_text is not None:
+        (d / ("base_%s_1.log" % prompt)).write_text(base_text, encoding="utf-8")
+    if mtp_text is not None:
+        (d / ("mtp_%s_1.log" % prompt)).write_text(mtp_text, encoding="utf-8")
+    return d
+
+
+def test_pairs_mode_reports_the_speedup_of_the_mtp_run_over_the_baseline() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        d = write_pair(pathlib.Path(tmp_raw))
+        result = run(extra=["--pairs", str(d), "--json"])
+        assert result.returncode == 0, result.stdout
+        pair = json.loads(result.stdout)["pairs"][0]
+        assert pair["prompt"] == "code"
+        # baseline rate = runs / seconds = 255 / 199.61305, not the rounded 1.28 the log prints
+        assert abs(pair["base_tps"] - 255 / 199.61305) < 1e-9
+        assert abs(pair["mtp_tps"] - 2.240) < 1e-9
+        assert abs(pair["speedup"] - 2.240 / (255 / 199.61305)) < 1e-9
+        assert abs(pair["accept_rate"] - 170 / 178) < 1e-9
+
+
+def test_pairs_text_table_names_the_prompt_and_prints_the_speedup() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        d = write_pair(pathlib.Path(tmp_raw))
+        result = run(extra=["--pairs", str(d)])
+        assert result.returncode == 0, result.stdout
+        assert "code" in result.stdout and "1.75x" in result.stdout
+
+
+def test_pairs_mode_rejects_a_speculative_log_passed_as_the_baseline() -> None:
+    # negative control: a speculative run also prints an "eval time" line, for 1 run and 0.00 ms
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        d = write_pair(pathlib.Path(tmp_raw), base_text=REAL_MTP_LOG)
+        result = run(extra=["--pairs", str(d)])
+        assert result.returncode == 2
+        assert "not a no-MTP baseline" in result.stdout
+        assert "Traceback" not in result.stdout
+
+
+def test_pairs_mode_rejects_a_baseline_log_with_no_eval_time_line() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        d = write_pair(pathlib.Path(tmp_raw), base_text="0.00.001.000 E llama_model_load: error loading model\n")
+        result = run(extra=["--pairs", str(d)])
+        assert result.returncode == 2
+        assert "no 'eval time' line" in result.stdout
+
+
+def test_pairs_mode_rejects_a_baseline_without_its_mtp_partner() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        d = write_pair(pathlib.Path(tmp_raw), mtp_text=None)
+        result = run(extra=["--pairs", str(d)])
+        assert result.returncode == 2
+        assert "mtp_code_1.log" in result.stdout
+
+
+def run_script(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    import os
+    full_env = dict(os.environ)
+    full_env.update(env or {})
+    return subprocess.run(["bash", str(SCRIPT), *args], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          check=False, env=full_env)
+
+
+def test_script_dry_run_refuses_an_arm_with_an_unknown_head_instead_of_printing_an_empty_md() -> None:
+    result = run_script("--dry-run", env={"ARMS": "q9_n2_code"})
+    assert result.returncode != 0
+    assert "bad arm" in result.stderr
+    assert "-md ''" not in result.stdout
+
+
+def test_script_dry_run_refuses_a_malformed_arm_name() -> None:
+    for arm in ("q4_n2", "q4_x2_code", "q4_n2_p07_code", "q4_n2_poetry"):
+        result = run_script("--dry-run", env={"ARMS": arm})
+        assert result.returncode != 0, arm
+        assert "bad arm" in result.stderr, arm
+
+
+def test_script_pairs_dry_run_prints_the_interleaved_order_and_the_baseline_has_no_speculation() -> None:
+    result = run_script("--pairs", "--dry-run", env={"BIN": "/x/spec", "BASE_BIN": "/x/completion", "OUT": "/o"})
+    assert result.returncode == 0, result.stderr
+    headers = [ln[2:] for ln in result.stdout.splitlines() if ln.startswith("# ")]
+    assert headers == ["base_code_1", "mtp_code_1", "mtp_chat_1", "base_chat_1", "base_reasoning_1", "mtp_reasoning_1"]
+    cmds = [ln for ln in result.stdout.splitlines() if not ln.startswith("# ")]
+    assert len(cmds) == 6
+    for header, cmd in zip(headers, cmds):
+        if header.startswith("base_"):
+            assert cmd.startswith("/x/completion ") and "--spec-type" not in cmd and "-no-cnv" in cmd, cmd
+        else:
+            assert cmd.startswith("/x/spec ") and "--spec-type draft-mtp" in cmd and "-no-cnv" not in cmd, cmd
+        assert "/o/pairs/%s.log" % header in cmd
+
+
+def test_script_pairs_baseline_and_mtp_share_the_same_run_flags() -> None:
+    result = run_script("--pairs", "--dry-run", env={"BIN": "/x/spec", "BASE_BIN": "/x/completion"})
+    cmds = [ln for ln in result.stdout.splitlines() if not ln.startswith("# ")]
+    base = cmds[0].split()
+    mtp = cmds[1].split()
+    for flag in ("-n", "--seed", "--temp", "-c", "-ub", "-ngl", "-lm", "-lzm", "-t", "-tb"):
+        assert flag in base and flag in mtp, flag
+        assert base[base.index(flag) + 1] == mtp[mtp.index(flag) + 1], flag

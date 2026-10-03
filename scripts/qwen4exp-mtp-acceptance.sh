@@ -19,9 +19,12 @@
 #   scripts/qwen4exp-mtp-acceptance.sh               # run all 24 arms (both sets), serially
 #   SETS=base scripts/qwen4exp-mtp-acceptance.sh     # only the 12 unfiltered arms (SETS=p05: the other 12)
 #   ARMS="q8_n3_code q4_n2_p05_chat" scripts/qwen4exp-mtp-acceptance.sh   # a subset
+#   scripts/qwen4exp-mtp-acceptance.sh --pairs       # no-MTP baseline vs q4 n-max 2, one interleaved pair per prompt
+#                                                    # (code AB, chat BA, reasoning AB); the parser prints the speedup
 #
 # Environment (defaults in brackets):
 #   BIN      speculative binary   [<repo>/build-cpu/bin/llama-speculative-simple]
+#   BASE_BIN no-MTP baseline binary, --pairs only [<repo>/build-cpu/bin/llama-completion]
 #   TARGET   target model, first split of the IQ3_XXS pair
 #   HEAD_Q8  Q8_0 MTP head        [/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf]
 #   HEAD_Q4  Q4_0 MTP head        [/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_0.gguf]
@@ -58,7 +61,15 @@ PROMPTS_DIR=$ROOT/scripts/qwen4exp-mtp-prompts
 PARSER=$ROOT/scripts/parse-qwen4exp-mtp-acceptance.py
 
 DRY=0
-[ "${1:-}" = "--dry-run" ] && DRY=1
+PAIRS=0
+for a in "$@"; do
+    case "$a" in
+        --dry-run) DRY=1 ;;
+        --pairs) PAIRS=1 ;;
+        *) echo "unknown argument: $a (want --dry-run and/or --pairs)" >&2; exit 1 ;;
+    esac
+done
+BASE_BIN=${BASE_BIN:-$ROOT/build-cpu/bin/llama-completion}
 
 SETS=${SETS:-"base p05"}
 ALL_ARMS=""
@@ -74,27 +85,72 @@ for set in $SETS; do
 done
 ARMS=${ARMS:-$ALL_ARMS}
 
+# refuse a malformed arm name up front: head_path() runs inside a command substitution below, where
+# its failure would be swallowed and leave `-md ''` in the command line
+for arm in $ARMS; do
+    [[ "$arm" =~ ^(q8|q4)_n[0-9]+_(p05_)?(code|chat|reasoning)$ ]] || {
+        echo "bad arm '$arm' (want <q8|q4>_n<k>_[p05_]<code|chat|reasoning>)" >&2; exit 1; }
+done
+
 head_path() { case "$1" in q8) echo "$HEAD_Q8" ;; q4) echo "$HEAD_Q4" ;; *) echo "bad head $1" >&2; return 1 ;; esac; }
+
+run_args() { # the flags every run shares, baseline and MTP alike; one argument per line
+    local prompt=$1
+    printf '%s\n' -f "$PROMPTS_DIR/$prompt.txt" -n "$N_PREDICT" --seed 42 --temp 0 \
+        -c "$CTX" -ub "$UBATCH" -ngl 0 -lv 4
+    # -lzm on stays under -lm none: the loader maps a lazy tensor's own file even when use_mmap
+    # is false, so the 27 GiB PLE table stays lazy (measured: RSS 47 GB, not 76 GB)
+    [ "$NOMMAP" = 1 ] && printf '%s\n' -lm none
+    printf '%s\n' -lzm on
+    printf '%s\n' -t "$THREADS" -tb "$THREADS"
+    return 0
+}
 
 arm_cmd() { # prints the command for one arm, one argument per line
     local arm=$1 head k prompt pmin=""
     head=${arm%%_*}; k=${arm#*_n}; k=${k%%_*}; prompt=${arm##*_}
     case "$arm" in *_p05_*) pmin=0.5 ;; esac
     printf '%s\n' "$BIN" -m "$TARGET" -md "$(head_path "$head")" \
-        --spec-type draft-mtp --spec-draft-n-max "$k" \
-        -f "$PROMPTS_DIR/$prompt.txt" -n "$N_PREDICT" --seed 42 --temp 0 \
-        -c "$CTX" -ub "$UBATCH" -ngl 0 -lv 4
-    # -lzm on stays under -lm none: the loader maps a lazy tensor's own file even when use_mmap
-    # is false, so the 27 GiB PLE table stays lazy (measured: RSS 47 GB, not 76 GB)
-    [ "$NOMMAP" = 1 ] && printf '%s\n' -lm none
-    printf '%s\n' -lzm on
-    printf '%s\n' -t "$THREADS" -tb "$THREADS" -td "$THREADS" -tbd "$THREADS"
+        --spec-type draft-mtp --spec-draft-n-max "$k"
+    run_args "$prompt"
+    printf '%s\n' -td "$THREADS" -tbd "$THREADS"
     [ -n "$pmin" ] && printf '%s\n' --spec-draft-p-min "$pmin"
     return 0
 }
 
+base_cmd() { # the no-MTP baseline for one prompt: the same flags without speculation
+    printf '%s\n' "$BASE_BIN" -m "$TARGET"
+    run_args "$1"
+    printf '%s\n' -no-cnv
+    return 0
+}
+
+# --pairs: AB, BA, AB so that a slow drift in host load does not always favour the same arm
+PAIR_ORDER="code:AB chat:BA reasoning:AB"
+PAIR_ARM_N=${PAIR_ARM_N:-2}
+pair_steps() { # prints "<kind> <prompt>" per step, in run order; kind = base or mtp
+    local item prompt order
+    for item in $PAIR_ORDER; do
+        prompt=${item%%:*}; order=${item##*:}
+        if [ "$order" = AB ]; then echo "base $prompt"; echo "mtp $prompt"; else echo "mtp $prompt"; echo "base $prompt"; fi
+    done
+}
+step_cmd() { # $1 kind, $2 prompt
+    if [ "$1" = base ]; then base_cmd "$2"; else arm_cmd "q4_n${PAIR_ARM_N}_$2"; fi
+}
+
 meminfo() { grep -E '^(MemAvailable|Shmem):' /proc/meminfo | tr '\n' ' '; echo; }
 
+if [ "$DRY" = 1 ] && [ "$PAIRS" = 1 ]; then
+    mapfile -t steps < <(pair_steps)
+    for step in "${steps[@]}"; do
+        kind=${step%% *}; prompt=${step##* }
+        mapfile -t cmd < <(step_cmd "$kind" "$prompt")
+        echo "# ${kind}_${prompt}_1"
+        printf '%q ' "${cmd[@]}"; echo "> $OUT/pairs/${kind}_${prompt}_1.log 2>&1"
+    done
+    exit 0
+fi
 if [ "$DRY" = 1 ]; then
     for arm in $ARMS; do
         mapfile -t cmd < <(arm_cmd "$arm") || exit 1
@@ -105,13 +161,17 @@ if [ "$DRY" = 1 ]; then
 fi
 
 # ---- preflight: refuse rather than run a CPU load that cannot mean what it says
-for f in "$BIN" "$TARGET" "$HEAD_Q8" "$HEAD_Q4" "$PARSER"; do
+bins=("$BIN")
+[ "$PAIRS" = 1 ] && bins+=("$BASE_BIN")
+for f in "${bins[@]}" "$TARGET" "$HEAD_Q8" "$HEAD_Q4" "$PARSER"; do
     [ -e "$f" ] || { echo "missing: $f" >&2; exit 1; }
 done
-if ldd "$BIN" 2>/dev/null | grep -qiE 'sycl|libze'; then
-    echo "refusing: $BIN links SYCL/Level Zero; this measurement is CPU-only" >&2
-    exit 1
-fi
+for f in "${bins[@]}"; do
+    if ldd "$f" 2>/dev/null | grep -qiE 'sycl|libze'; then
+        echo "refusing: $f links SYCL/Level Zero; this measurement is CPU-only" >&2
+        exit 1
+    fi
+done
 # comm names only (a command line may merely mention a binary); comm is 15 chars wide
 busy=$(ps -eo pid=,comm= | grep -E ' (llama-|test-)' || true)
 if [ -n "$busy" ]; then
@@ -143,6 +203,27 @@ if [ "$WARM" = 1 ]; then
     # proof for the run log: resident bytes per file (a warm file shows its full size)
     fincore -b "${shards[@]}" || echo "fincore unavailable or failed; warm state not proven" >&2
 fi
+if [ "$PAIRS" = 1 ]; then
+    mkdir -p "$OUT/pairs"
+    mapfile -t steps < <(pair_steps)
+    for step in "${steps[@]}"; do
+        kind=${step%% *}; prompt=${step##* }
+        mapfile -t cmd < <(step_cmd "$kind" "$prompt")
+        log=$OUT/pairs/${kind}_${prompt}_1.log
+        echo "== ${kind}_${prompt}_1  ($(date +%H:%M:%S))"
+        timeout 3600 "${cmd[@]}" < /dev/null > "$log" 2>&1
+        rc=$?
+        echo "   rc=$rc  $(meminfo)"
+        if [ "$rc" -ne 0 ]; then
+            echo "step ${kind}_${prompt}_1 failed (rc=$rc), see $log; stopping" >&2
+            exit "$rc"
+        fi
+        sleep 5
+    done
+    echo
+    exec /usr/bin/env python3 "$PARSER" --pairs "$OUT/pairs"
+fi
+
 logs=()
 for arm in $ARMS; do
     mapfile -t cmd < <(arm_cmd "$arm") || exit 1

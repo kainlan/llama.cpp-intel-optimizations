@@ -1,0 +1,5 @@
+# parser output over mtp-arms/pairs (interleaved no-MTP baseline vs q4 n-max 2; code AB, chat BA, reasoning AB); run from b8fedecc7
+prompt      pair   base_t/s  mtp_t/s   speedup  accept% mean_len
+chat           1      1.394    2.129     1.53x    66.22     2.32
+code           1      1.277    2.240     1.75x    95.51     2.91
+reasoning      1      1.391    2.056     1.48x    87.77     2.76
