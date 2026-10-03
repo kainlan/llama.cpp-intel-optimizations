@@ -19944,15 +19944,8 @@ void * unified_cache::load_partial_rows(const char *               tensor_name,
         row_start > std::numeric_limits<int64_t>::max() - row_count) {
         return nullptr;
     }
-    switch (type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q6_K:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_MXFP4:
-            break;
-        default:
-            return nullptr;
+    if (!ggml_sycl_soa_reorder_supported_type(type)) {
+        return nullptr;
     }
 
     partial_rows_key key{ tensor_id, device_idx, type, ncols, row_start, row_count };

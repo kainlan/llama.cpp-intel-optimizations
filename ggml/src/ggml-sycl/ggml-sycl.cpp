@@ -27983,18 +27983,7 @@ struct ggml_sycl_onednn_woq_fill_ctx {
 };
 
 static bool ggml_sycl_layout_supports_soa(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q6_K:
-        case GGML_TYPE_Q8_0:
-
-        case GGML_TYPE_MXFP4:
-            return true;
-        default:
-
-            return false;
-    }
+    return ggml_sycl_soa_reorder_supported_type(type);
 }
 
 static bool ggml_sycl_moe_mmvq_batched_supports_layout(ggml_type type, layout_mode layout) {
