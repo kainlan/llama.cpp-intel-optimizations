@@ -1183,6 +1183,45 @@ only the CPU reads.
   which is the TU's only `munmap` and carries the private test counter; the
   raw-mapping allowlist gate pins the TU to one `mmap`, one `munmap`, one
   `mlock` and one `madvise`.
+  **As built (T1b):** `alloc_tier::HOST_CPU = 4`, `alloc_type::HOST_CPU`,
+  `alloc_constraints::must_host_cpu`, `lazy_residency { HOST, STORAGE }`, the
+  reported-only `STORAGE` of `cache_location` and `expert_resolve_tier` (refused like
+  a miss by `expert_resolution_allowed`, which never sees a pointer for it) and the
+  roles `LAZY_ROW_CACHE = 9`, `LAZY_STAGING = 10` and `LAZY_OUTPUT = 11`, appended
+  after `OTHER` so no value moves. `unified_select_tier` maps `must_host_cpu` after
+  `must_device` and `must_host_pinned`; its cohort branch skips an entry that names
+  `HOST_CPU`, which the T2 row below lists as T2's edit and which T1b landed with the
+  tier, because a tier that a cohort could inherit is a latent path to the lock
+  failure and T2 has nothing left to add there but its own arm. `unified_alloc` serves
+  the tier through the one wrapper, ahead of the device and host-pinned arms, with no
+  lock held and no queue (a HOST_CPU allocation needs the device only to name its
+  release coordinator); `unified_free_record` releases it ahead of every other branch,
+  sized by `host_cpu_mapped_size(handle.size)`. The owner entry keeps the class
+  `EXTERNAL_EXACT` whatever role rides with the request and refuses `must_host_cpu`
+  beside `must_device` or `must_host_pinned` as `INVALID_REQUEST`; T2 widens that to
+  every listed routing constraint and adds the charge. The census: every switch that
+  names `FILE_MAPPED` names `HOST_CPU` (ten sites over `alloc_tier` and `alloc_type`),
+  `mem_handle::resolve(device)` is empty for a `HOST_CPU` owner, and the sites that hand
+  a pointer to a device (the `HOST_PINNED` arms of `common.hpp`, `binbcast.cpp`,
+  `dmmv.cpp`, `element_wise.cpp`, `make_copy_handle_for_raw_ptr` and
+  `alloc_handle::as_mem_handle`) are untouched, so a `HOST_CPU` pointer falls to their
+  `HOST_DEVICE` else-arm. The registry sums report the tier apart
+  (`unified_alloc_registry_host_cpu_sum_for_test`), so the host-pinned figure the
+  validator compares with the host ledger never carries it; the shutdown census counts
+  it in its total and not as pinned. `unified_cache_role_bytes_for_testing` is
+  unconditional, declared beside the shutdown census accessors, and returns `false`
+  with `*out` zero for a device with no cache; `ggml_backend_sycl_role_bytes_for_testing`
+  wraps it with an `int` role, range-checked, declared `GGML_BACKEND_API` in
+  `ggml-sycl.h` and entered in the proc-address table outside any private-testing block.
+  `tests/test-sycl-alloc-tier-census-source.py` holds the census and reads
+  "unconditional" from the preprocessor nesting at each site;
+  `test-sycl-host-cpu-tier` (host-only, `opencl:cpu`) drives the tier through the front
+  door and reads the accessors' VOID cases. The positive reading needs a device cache,
+  which a host with no SYCL device cannot create (`ggml_sycl_init` fails there), so it
+  is a separate arm of the same binary, `--device-cache`, that ctest does not pass:
+  it is a short GPU run for the lead (for example `ONEAPI_DEVICE_SELECTOR=level_zero:1`),
+  and until it has run the accessor's by-role and by-device sums are checked only by the
+  source gate.
 - **Why locked host memory and not the pinned path.** Pinned USM host memory
   would also be resident, but the driver maps it into both devices' VMs for a
   table no GPU may read (P3), and it rides the pinned pool's 2 GiB chunking.

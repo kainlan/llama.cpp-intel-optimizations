@@ -358,9 +358,38 @@ never be called outside `unified-cache.cpp`. All other files must use the wrappe
 above.
 
 **Rule (mapping):** `mmap`, `munmap`, `mlock` and `madvise` are called only from the
-three file-mapping wrappers above and from the listed guard-page and DPCT sites.
-`tests/test-sycl-raw-mmap-allowlist-source.py` enforces it over the backend's
-tokenized sources (llama.cpp-5efe C2).
+file-mapping wrappers and the two `HOST_CPU` wrappers above and from the listed
+guard-page and DPCT sites. `tests/test-sycl-raw-mmap-allowlist-source.py` enforces it
+over the backend's tokenized sources (llama.cpp-5efe C2, llama.cpp-th32 T1a).
+
+**Rule (`HOST_CPU`, llama.cpp-th32 T1):** the `HOST_CPU` tier is host memory only the
+CPU reads: one anonymous mapping, `MADV_HUGEPAGE`, locked in full. It is requested
+only through `unified_allocate_owner(req)` (or `unified_alloc`) with
+`constraints.must_host_cpu`, and that field selects the tier and nothing else.
+Nothing falls into the tier (`unified_select_tier`'s size fallback stays `HOST_PINNED`,
+and its cohort branch skips a cohort entry that names `HOST_CPU`) and nothing falls out
+of it: a request that cannot be mapped or locked is refused by name
+(`host-cpu-lock-failed`), never served from another tier. The owner is classified
+`EXTERNAL_EXACT` whatever role or placement field rides with it, so the two-site
+`CACHE_BACKING` allowlist of §3.1 is untouched; `must_host_cpu` beside `must_device` or
+`must_host_pinned` is `INVALID_REQUEST` before any control is minted. `unified_alloc`
+calls `unified_cache_raw_alloc_host_cpu` once and takes no queue; `unified_free_record`
+calls `unified_cache_raw_free_host_cpu` once, ahead of every other branch, sized by
+`host_cpu_mapped_size(handle.size)`. No lock is held across either call: the lock
+faults every page in before it returns. The tier is host-accessible and not
+device-mappable (`memory_location::device_mappable()`), the pointer-type registry types
+it `HOST_CPU`, and the sites that hand a pointer to a device name `HOST_PINNED` and so
+fall to their `HOST_DEVICE` else-arm for it. `tests/test-sycl-alloc-tier-census-source.py`
+holds the census: every switch that names `FILE_MAPPED` names `HOST_CPU`, and no
+device-handing site does.
+
+**Allowlist line (llama.cpp-th32 T7, reserved here by T1):** the epoch ring's
+host-signalled Level Zero events (`zeEventPoolCreate` and `zeEventCreate`, owned by the
+refcounted `lazy_event_pool`) are driver objects, not cache bytes, so they pass through no
+allocator above. They are a new native Level Zero object site in the backend; T7 adds
+the one translation unit that may make those calls, and until it lands no site may.
+This line sits next to the `HOST_CPU` wrapper rows because it is the second allowlisted
+native-object site th32 adds.
 
 **Deallocation:** `unified_free(handle)`, `unified_free_ptr(ptr, device)`,
 `unified_cache_zone_free(device_id, zone, ptr)`, `unified_cache_arena_free(device_id, ptr, size)` (deprecated).
@@ -483,6 +512,7 @@ Only the following functions may hand out resolved raw pointers from a handle:
 | Function | When to use |
 |---|---|
 | `mem_handle::resolve()` | Normal dispatch: returns `resolved_ptr{ptr, layout, on_device}` |
+| `mem_handle::resolve(int device_id)` | Dispatch for a named device: empty for a `FILE_MAPPED` or `HOST_CPU` owner, which the CPU reads in place and no device is ever handed (llama.cpp-th32 T1) |
 | `unified_lookup(void * ptr, alloc_handle * out)` | Reverse-look up an allocation by raw pointer (`unified-cache.hpp:2345`) |
 | `unified_cache::memset(h, val, size, queue)` | Fill memory behind a handle (void, no event returned — **deprecated API shape**; see §6) |
 | `unified_cache::memcpy(dst, src, size, queue)` | Copy between handles (void, no event returned — **deprecated API shape**; see §6) |
@@ -1656,6 +1686,19 @@ backing lease; or call teardown/reset code that can acquire another listed lock.
 Event callbacks only enqueue an identity-tagged completion under isolated C and
 return. Lock-rank instrumentation must expose acquire/release, wait, callback,
 blocking-call, and final-destructor hooks so H8/M7 test every prohibition.
+
+**The `HOST_CPU` tier adds no lock and waits for nothing (llama.cpp-th32 T1).** Its raw
+wrapper, `host-cpu-mapping.cpp`, holds no mutex: it is a device-free translation unit
+whose only state is the private munmap counter of the test build, an atomic. Allocation
+and release go through the locks every other tier already takes, and in the same order:
+the owner's release coordinator, then `g_runtime_alloc_mutex` (L5, leaf) for the registry
+record and `alloc_registry`'s own `shared_mutex` for the pointer-type record. Neither is
+held across `mmap` or `mlock`. `mlock` without `MLOCK_ONFAULT` faults every page in
+before it returns, which on a multi-GiB request is seconds of wall time, so a lock held
+across it would stall every allocation and every lookup on the process; `unified_alloc`
+therefore calls the wrapper before it publishes anything, and the registry record is
+written only after the mapping is locked. The release (`unified_free_record`) takes no
+lock of its own and drops the lock with the mapping, in one `munmap`.
 
 ### 12.6 `mem_handle` and event-held leases
 
