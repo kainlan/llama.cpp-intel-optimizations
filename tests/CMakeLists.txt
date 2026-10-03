@@ -3429,6 +3429,13 @@ if (Python3_Interpreter_FOUND)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-host-cpu-mapping-source.py
         LABEL "sycl;host;python;source-contract"
         TIMEOUT 120)
+    # llama.cpp-5efe C4 (part a): a refused segmented node fails the graph; the record loop and the catch hand the
+    # recorded executables over instead of destroying them in the unwind.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-seg-forward-return-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-seg-forward-return-source.py
+        LABEL "sycl;host;python;source-contract"
+        TIMEOUT 120)
 endif()
 
 # llama.cpp-5efe C1: the per-model lazy-range record and its pre-fill, driven over
