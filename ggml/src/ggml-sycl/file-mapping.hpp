@@ -30,6 +30,7 @@ enum class file_map_status : uint8_t {
     RESERVE_FAILED,      // the PROT_NONE address-space reservation failed
     SEGMENT_MAP_FAILED,  // a MAP_FIXED file segment failed
     LOCK_FAILED,         // mlock failed (errno names why)
+    ADVISE_FAILED,       // madvise failed (errno names why)
 };
 
 const char * file_map_status_name(file_map_status status);
@@ -100,6 +101,17 @@ file_segment_plan file_mapping_segments(const std::vector<file_tensor_range> & t
 // W = max(2 x read_ahead, 2 MiB), at least twice the fault read-around's reach, rounded up to whole pages.
 // `read_ahead_bytes` is the backing device's read_ahead_kb in bytes.
 uint64_t file_mapping_random_window(uint64_t read_ahead_bytes, uint64_t page);
+
+enum class file_advice : uint8_t {
+    WILLNEED,  // start reading the pages in; the host-executed segments only
+    RANDOM,    // no fault read-around: the windows at each lazy edge
+};
+
+// madvise(2)s each segment, which must start and end on a page and lie inside the reservation. Like the lock, this
+// never widens a range: an advice that reached a lazy page is the defect the segment plan exists to prevent.
+file_map_status unified_cache_raw_advise_file_segments(const file_mapping &                mapping,
+                                                       const std::vector<file_map_range> & segments,
+                                                       file_advice                         advice);
 
 // The only release: ONE munmap of the whole reservation, then the dup is closed. Idempotent.
 void unified_cache_raw_unmap_file(file_mapping * mapping);

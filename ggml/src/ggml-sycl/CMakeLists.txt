@@ -184,6 +184,22 @@ if (BUILD_TESTING)
     add_test(NAME test-sycl-file-mapping-segments COMMAND test-sycl-file-mapping-segments)
     set_tests_properties(test-sycl-file-mapping-segments PROPERTIES LABELS "sycl;host" TIMEOUT 60)
 
+    # The residency gate: the page cache of the FILE, measured with cachestat(2), over a 64 MiB fixture under the build
+    # directory (not tmpfs). It evicts per arm and exits 77 where it cannot (llama.cpp-5efe C3).
+    add_executable(test-sycl-file-mapping-residency
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-file-mapping-residency.cpp
+        file-mapping.cpp)
+    target_include_directories(test-sycl-file-mapping-residency PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test-sycl-file-mapping-residency PRIVATE RESIDENCY_FIXTURE_DIR=\"${CMAKE_BINARY_DIR}\")
+    set_target_properties(test-sycl-file-mapping-residency PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-file-mapping-residency COMMAND test-sycl-file-mapping-residency)
+    set_tests_properties(test-sycl-file-mapping-residency PROPERTIES
+        LABELS "sycl;host"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 300)
+
     add_executable(test-sycl-lifecycle-load-txn
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-load-txn.cpp
         model-lifecycle.cpp)

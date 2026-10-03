@@ -36,6 +36,8 @@ const char * file_map_status_name(file_map_status status) {
             return "segment-map-failed";
         case file_map_status::LOCK_FAILED:
             return "lock-failed";
+        case file_map_status::ADVISE_FAILED:
+            return "advise-failed";
     }
     return "?";
 }
@@ -276,6 +278,16 @@ uint64_t file_mapping_random_window(uint64_t read_ahead_bytes, uint64_t page) {
     const uint64_t floor_bytes = 2ull * 1024 * 1024;
     const uint64_t w           = std::max(2 * read_ahead_bytes, floor_bytes);
     return page == 0 ? w : page_ceil(w, page);
+}
+
+// RED stand-in (llama.cpp-5efe C3b): validates nothing and advises nothing.
+file_map_status unified_cache_raw_advise_file_segments(const file_mapping &                mapping,
+                                                       const std::vector<file_map_range> & segments,
+                                                       file_advice                         advice) {
+    (void) mapping;
+    (void) segments;
+    (void) advice;
+    return file_map_status::OK;
 }
 
 void unified_cache_raw_unmap_file(file_mapping * mapping) {
