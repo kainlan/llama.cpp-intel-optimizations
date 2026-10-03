@@ -117,7 +117,8 @@ with gate("the fallback boundary cleanup drains, unpins and clears state before 
 with gate("each recording attempt snapshots the retained-handle baseline"):
     assert "const size_t retained_baseline = sycl_ctx->graph_retained_handles.size()" in sycl
 with gate("a segment is marked submitted only before its executable graph is submitted"):
-    assert "bool segment_submitted = false" in sycl
+    # whitespace-tolerant: the formatter aligns the name with its neighbouring declarations
+    assert re.search(r"bool\s+segment_submitted\s*=\s*false", sycl)
     assert "segment_submitted = true" in sycl
     assert (sycl.index("segment_submitted = true")
             < sycl.index("stream->ext_oneapi_graph(*recorded_segments.back().exec_graph)"))
