@@ -138,7 +138,8 @@ static int test_lock_refusal_under_a_one_page_limit() {
     const uint64_t        munmaps_before = unified_cache_host_cpu_munmap_count_for_test();
     host_cpu_mapping      m;
     const host_cpu_status st = unified_cache_raw_alloc_host_cpu(4096, &m);
-    setrlimit(RLIMIT_MEMLOCK, &saved);
+    // restoring only the soft limit: the hard limit was never lowered, so this cannot be refused
+    CHECK(setrlimit(RLIMIT_MEMLOCK, &saved) == 0, "could not restore RLIMIT_MEMLOCK");
     if (st == host_cpu_status::OK) {
         unified_cache_raw_free_host_cpu(m.ptr, m.mapped_bytes);
         std::fprintf(stderr, "SKIP: mlock succeeded over a one-page RLIMIT_MEMLOCK (CAP_IPC_LOCK?)\n");
