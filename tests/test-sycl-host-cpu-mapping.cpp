@@ -6,6 +6,9 @@
 // the argument and map refusals.
 //
 // Exits 77 where the process may lock without limit (CAP_IPC_LOCK), because then the refusal arm cannot be reached.
+// One skipped arm makes the whole binary read as a ctest "skipped" (exit 77) even though every other arm ran and
+// passed: under root or CAP_IPC_LOCK the refusal arm skips, so a green run there is "skipped", not "passed". A failing
+// arm still returns 1 ahead of that.
 
 #include "../ggml/src/ggml-sycl/host-cpu-mapping.hpp"
 
@@ -54,6 +57,29 @@ static std::string vm_flags_at(const void * p) {
     return "";
 }
 
+// AnonHugePages of the VMA that contains `p`, in kB: the bytes the kernel really backs with huge pages. -1 when the VMA
+// or its line was not found. VM_HUGEPAGE alone says the advice was recorded, not that it came before the pages were
+// faulted in.
+static long anon_huge_kb_at(const void * p) {
+    const uintptr_t target = (uintptr_t) p;
+    std::ifstream   smaps("/proc/self/smaps");
+    std::string     line;
+    bool            in_vma = false;
+    while (std::getline(smaps, line)) {
+        uintptr_t beg = 0, end = 0;
+        if (std::sscanf(line.c_str(), "%" SCNxPTR "-%" SCNxPTR " ", &beg, &end) == 2 &&
+            line.find(':') > line.find(' ')) {
+            in_vma = target >= beg && target < end;
+            continue;
+        }
+        long kb = 0;
+        if (in_vma && std::sscanf(line.c_str(), "AnonHugePages: %ld kB", &kb) == 1) {
+            return kb;
+        }
+    }
+    return -1;
+}
+
 static bool vma_exists(const void * p) {
     const uintptr_t target = (uintptr_t) p;
     std::ifstream   maps("/proc/self/maps");
@@ -82,16 +108,19 @@ static int test_sizing() {
 static int test_argument_and_map_refusals() {
     host_cpu_mapping m;
     CHECK(unified_cache_raw_alloc_host_cpu(0, &m) == host_cpu_status::INVALID_ARGUMENT, "a zero request was accepted");
+    CHECK(host_cpu_refusal_text(host_cpu_status::INVALID_ARGUMENT, m).find("errno") == std::string::npos,
+          "the refusal text prints an errno for a refusal that made no syscall");
     CHECK(unified_cache_raw_alloc_host_cpu(SIZE_MAX, &m) == host_cpu_status::INVALID_ARGUMENT,
           "an overflowing request was accepted");
     CHECK(unified_cache_raw_alloc_host_cpu(4096, nullptr) == host_cpu_status::INVALID_ARGUMENT,
           "a null out was accepted");
-    // the whole user address space cannot be mapped
-    const host_cpu_status st = unified_cache_raw_alloc_host_cpu((size_t) 1 << 47, &m);
+    // the largest request that does not overflow the sizing: no address space and no overcommit policy can map it
+    const host_cpu_status st = unified_cache_raw_alloc_host_cpu(SIZE_MAX - 2 * MiB, &m);
     CHECK(st == host_cpu_status::MMAP_FAILED, "an unmappable request was not refused as a map failure");
     CHECK(m.ptr == nullptr && m.err != 0, "a map refusal left a pointer or no errno");
     const std::string text = host_cpu_refusal_text(st, m);
     CHECK(text.find("host-cpu-map-failed") != std::string::npos, "the map refusal text does not carry its name");
+    CHECK(text.find("errno=") != std::string::npos, "the map refusal text does not name errno");
     return 0;
 }
 
@@ -160,6 +189,18 @@ static int test_success_is_locked_hugepage_advised_and_released_once() {
     std::getline(thp, thp_mode);
     if (thp_mode.find("[never]") == std::string::npos) {
         CHECK(flags.find(" hg ") != std::string::npos, "the mapping is not VM_HUGEPAGE although THP is available");
+        // the advice must precede the lock: mlock faults every page in, so advice given after it sets VM_HUGEPAGE
+        // (the flag above) but leaves small pages. The kernel's own count of huge-page-backed bytes tells the two
+        // orders apart. A base that is not 2 MiB aligned (a kernel before 6.7 does not align large anonymous maps)
+        // cannot hold the whole range in huge pages, so only the aligned case is asserted.
+        if (((uintptr_t) m.ptr) % (2 * MiB) == 0) {
+            const long huge_kb = anon_huge_kb_at(m.ptr);
+            CHECK(huge_kb >= 0, "no AnonHugePages line for the mapping");
+            CHECK((size_t) huge_kb * 1024 >= m.mapped_bytes,
+                  "the mapping is not backed by huge pages: MADV_HUGEPAGE came after the lock");
+        } else {
+            std::fprintf(stderr, "note: the mapping is not 2 MiB aligned; the huge-page backing is not asserted\n");
+        }
     }
 
     void * const base = m.ptr;

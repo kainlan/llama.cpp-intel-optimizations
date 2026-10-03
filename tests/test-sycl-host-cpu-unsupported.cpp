@@ -34,7 +34,7 @@ int main() {
     CHECK(unified_cache_raw_alloc_host_cpu(4096, nullptr) == host_cpu_status::INVALID_ARGUMENT,
           "a null out was not refused as an invalid argument");
 
-    // release of a mapping that never existed is a no-op, and a stub never counts a munmap it did not issue
+    // release of a mapping that never existed is a no-op
     unified_cache_raw_free_host_cpu(nullptr, 0);
     unified_cache_raw_free_host_cpu(m.ptr, m.mapped_bytes);
 
@@ -42,6 +42,9 @@ int main() {
           "UNSUPPORTED has no name");
     CHECK(host_cpu_refusal_text(host_cpu_status::UNSUPPORTED, m).find("unsupported-platform") != std::string::npos,
           "the refusal text does not carry the name");
+    // a refusal that made no syscall has no errno to print
+    CHECK(host_cpu_refusal_text(host_cpu_status::UNSUPPORTED, m).find("errno") == std::string::npos,
+          "the refusal text prints an errno for a refusal that made no syscall");
 
     // the plan's HOST terms use the sizing function on every platform, so it is not behind the guard
     CHECK(host_cpu_mapped_size(1) == (size_t) 2 * 1024 * 1024, "the sizing function does not work here");

@@ -202,6 +202,45 @@ def test_the_lock_covers_the_whole_mapping_and_is_not_on_fault():
     assert re.search(r"\bmlock\s*\(\s*p\s*,\s*mapped\s*\)", alloc_body), "mlock is not over the whole mapped range"
 
 
+def test_the_huge_page_advice_precedes_the_lock_and_is_guarded():
+    posix, _ = guard_regions(sycl_text(CPP))
+    alloc_body = function_body(strip_comments(posix), r"host_cpu_status\s+unified_cache_raw_alloc_host_cpu\s*\([^)]*\)")
+    advise = re.search(r"\bmadvise\s*\(\s*p\s*,\s*mapped\s*,\s*MADV_HUGEPAGE\s*\)", alloc_body)
+    lock = re.search(r"\bmlock\s*\(\s*p\s*,\s*mapped\s*\)", alloc_body)
+    assert advise and lock, "the wrapper does not advise and lock the whole mapping"
+    # mlock faults every page in: advice given after it records VM_HUGEPAGE but leaves small pages
+    assert advise.start() < lock.start(), "MADV_HUGEPAGE comes after the mlock that faults the pages in"
+    # MADV_HUGEPAGE is Linux-only while the arm is every POSIX: the call is under its own feature test
+    before = alloc_body[: advise.start()]
+    assert re.search(r"#\s*if\s+defined\s*\(\s*MADV_HUGEPAGE\s*\)\s*$", before.rstrip() + "\n", flags=re.MULTILINE) and (
+        "#endif" in alloc_body[advise.end() : lock.start()]
+    ), "madvise(MADV_HUGEPAGE) is not under `#if defined(MADV_HUGEPAGE)`"
+
+
+def test_the_munmap_counter_counts_only_a_munmap_that_succeeded():
+    posix, _ = guard_regions(sycl_text(CPP))
+    body = function_body(
+        strip_comments(posix), r"static\s+(?:void|bool)\s+host_cpu_munmap\s*\(\s*void\s*\*\s*\w+\s*,\s*size_t\s+\w+\s*\)"
+    )
+    m = re.search(r"if\s*\(\s*munmap\s*\([^)]*\)\s*==\s*0\s*\)\s*\{", body)
+    assert m, "the counter is not inside `if (munmap(...) == 0)`"
+    assert body.index("g_munmap_count") > m.end(), "the counter is bumped outside the success branch of the munmap"
+
+
+def test_the_refusal_text_prints_errno_only_when_there_is_one():
+    code = strip_comments(sycl_text(CPP))
+    body = function_body(code, r"std::string\s+host_cpu_refusal_text\s*\(")
+    non_lock = body[body.index("else") :]
+    assert re.search(r"mapping\.err\s*!=\s*0|mapping\.err\s*\)", non_lock), "the non-lock text does not test errno"
+    assert "no errno" not in non_lock, "the non-lock text still prints a placeholder for a missing errno"
+
+
+def test_the_header_states_the_release_contract_and_the_thp_alignment_assumption():
+    hpp = sycl_text("host-cpu-mapping.hpp")
+    assert re.search(r"exactly once", hpp), "the header does not say the release is exactly once"
+    assert re.search(r"6\.7", hpp), "the header does not name the kernel's THP alignment assumption"
+
+
 if __name__ == "__main__":
     import sys
 
