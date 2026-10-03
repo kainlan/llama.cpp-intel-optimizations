@@ -78512,7 +78512,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             bool         all_entries_routed_cpu     = false;
             int          pp_fallback_gpu_entries    = 0;
             const char * pp_fallback_path           = "pp_per_expert";
-            const bool   device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_IQ2_XXS);
+            // A type named here has its device-resident experts D2H-copied to pinned host memory on
+            // every dispatch and run on the CPU (dispatch_cpu_entries_now): a non-GPU executor for
+            // device data plus weight streaming. Q4_K is still listed although it has an _id kernel
+            // (llama.cpp-zzb5); IQ2_XXS left with its _id kernel (llama.cpp-s36q), so the GPU runs it.
+            // tests/test-sycl-moe-device-weight-cpu-fallback-source.py keeps advertised types out.
+            const bool device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K);
             const bool pp_mmvq_batched_supported = ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, route_layout);
             const bool pp_mmvq_batched_shape =
                 ne11 == 1 || (src0->type == GGML_TYPE_MXFP4 && route_layout == GGML_LAYOUT_MXFP4_I8);
