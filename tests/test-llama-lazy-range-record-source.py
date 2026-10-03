@@ -134,9 +134,11 @@ def test_add_reads_deferral_and_decides_nothing():
 
 def test_taker_is_the_loading_guard_not_the_process_level_hooks():
     body = load_tensors_body()
-    m = re.search(r"\blazy_taker\s*=\s*([^;]+);", body)
-    assert m, "load_tensors() does not assign `lazy_taker`"
-    assert "sycl_model_loading_guard.active" in m.group(1), f"`taker` is assigned from `{m.group(1).strip()}`"
+    # the initial `= false` (a build without SYCL) and the guard's assignment
+    rhs = [m.group(1).strip() for m in re.finditer(r"\blazy_taker\s*=\s*([^;]+);", body)]
+    assert rhs, "load_tensors() does not assign `lazy_taker`"
+    assert any(r == "sycl_model_loading_guard.active" for r in rhs), f"`taker` is assigned from {rhs}, never from the loading guard"
+    assert not any("hooks_enabled" in r for r in rhs), f"`taker` is assigned from the process-level hooks: {rhs}"
     call = re.search(r"llama_lazy_range_record_prefill\s*\(", body)
     assert call, "load_tensors() does not call the pre-fill"
     args = balanced(body, call.end() - 1, "(", ")")

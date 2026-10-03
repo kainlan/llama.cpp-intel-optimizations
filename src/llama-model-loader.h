@@ -109,31 +109,32 @@ struct llama_model_loader {
         // the record whose LAZY_READ rows this reads (set by the loader)
         const llama_lazy_range_record * record = nullptr;
 
-        // decide whether this tensor is read lazily
-        // pass w to also record it, or nullptr to only ask
+        // Whether this tensor is read lazily through the CPU mapping: exactly when its
+        // row in the record is LAZY_READ. It reads `deferral` and decides nothing (the
+        // mode, the size floor and mmap support were the pre-fill's); a STORAGE row is
+        // another consumer's and answers false. The answer does not depend on the load
+        // mode or on `w`: the memory-fit pass (no_alloc, no mmap) passes no weight and
+        // must size a lazy table as the real load will leave it, unread.
+        // Pass w to also make the tensor a member, or nullptr to only ask.
         bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
 
+        // membership: the tensors this load really maps lazily
         bool any() const {
-            return !ranges.empty();
+            return !tensors.empty();
         }
 
         bool has(const ggml_tensor * t) const {
             return tensors.count(ggml_get_name(t)) > 0;
         }
 
-        const llama_mmap::ranges & for_file(uint32_t idx) const {
-            static const llama_mmap::ranges none;
-
-            const auto it = ranges.find(idx);
-            return it == ranges.end() ? none : it->second;
-        }
+        // the byte ranges of the members in one file, from the record
+        llama_mmap::ranges for_file(uint32_t idx) const;
 
         // lazy tensors are gathered on the host, so no offload setting applies to them
         static ggml_backend_buffer_type_t buft();
 
     private:
-        std::map<uint32_t, llama_mmap::ranges> ranges;
-        std::set<std::string>                  tensors;
+        std::set<std::string> tensors;
     } lazy;
 
     llama_files files;

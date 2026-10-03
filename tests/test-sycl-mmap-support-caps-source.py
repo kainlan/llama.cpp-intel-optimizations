@@ -136,3 +136,11 @@ def test_load_path_still_clears_use_mmap_for_a_sycl_model_backend():
     m = re.search(r"if\s*\(\s*sycl_model_backend\s*&&\s*ml\.use_mmap\s*\)\s*\{(.*?)\}", code, flags=re.DOTALL)
     assert m, "`if (sycl_model_backend && ml.use_mmap)` is gone: C1 must not remove it (C4 narrows it)"
     assert re.search(r"ml\.use_mmap\s*=\s*false\s*;", m.group(1)), "that branch no longer clears ml.use_mmap"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

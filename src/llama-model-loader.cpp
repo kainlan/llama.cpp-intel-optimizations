@@ -583,6 +583,8 @@ llama_model_loader::llama_model_loader(
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+    lazy.record = &lazy_record;
+
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -1256,28 +1258,30 @@ bool llama_lazy_eligible(enum llama_lazy_mode mode, size_t nbytes, bool mmap_sup
 }
 
 bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
-    // the mode and the size floor are llama_lazy_eligible()'s; mmap support is asked
-    // separately below, so that its warning prints only for a tensor that would
-    // otherwise have been lazy
-    if (!llama_lazy_eligible(mode, ggml_nbytes(t), true)) {
-        return false;
-    }
+    GGML_UNUSED(t);
 
-    if (!llama_mmap::SUPPORTED) {
-        LLAMA_LOG_WARN("%s: mmap is not available, so tensor %s (size = %zu MiB) is loaded into RAM in full\n",
-                __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
+    if (record == nullptr || !record->has(name) || record->deferral(name) != LLAMA_LAZY_DEFERRAL_LAZY_READ) {
         return false;
     }
 
     if (w) {
-        ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(t));
         tensors.insert(name);
-
-        LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
-                __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
     }
 
     return true;
+}
+
+llama_mmap::ranges llama_model_loader::lazy_read::for_file(uint32_t idx) const {
+    llama_mmap::ranges ranges;
+    if (record == nullptr) {
+        return ranges;
+    }
+    for (const llama_lazy_range_row & row : record->rows()) {
+        if (row.value.file_idx == idx && row.deferral == LLAMA_LAZY_DEFERRAL_LAZY_READ && tensors.count(row.name) > 0) {
+            ranges.emplace_back(row.value.offs, row.value.offs + row.value.size);
+        }
+    }
+    return ranges;
 }
 
 struct ggml_tensor * llama_model_loader::create_tensor(
@@ -1786,7 +1790,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
+    // the record was filled before the early plan, from the arch's declaration; a tensor
+    // flagged lazy that it does not declare, or declared and not flagged, is drift in
+    // that declaration and aborts in every load mode
+    llama_lazy_range_check_create(lazy_record, get_arch(), tn.str(), (flags & TENSOR_READ_LAZY) != 0);
+
     if (flags & TENSOR_READ_LAZY) {
+        // a STORAGE row is the SYCL storage tier's, not lazy_read's: refuse it before
+        // buft_for_tensor() can make it an ordinary input-layer weight in host memory
+        if (lazy_record.deferral(tn.str()) == LLAMA_LAZY_DEFERRAL_STORAGE) {
+            throw std::runtime_error(
+                format("lazy-range record: %s is STORAGE and this tree has no STORAGE consumer (llama.cpp-th32 T6)",
+                       tn.str().c_str()));
+        }
+
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
     }
@@ -1902,8 +1919,8 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+            std::unique_ptr<llama_mmap> mapping =
+                std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa, lazy_record.excluded_for_file(idx));
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

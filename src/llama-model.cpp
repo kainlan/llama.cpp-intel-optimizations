@@ -671,6 +671,12 @@ static void llama_model_sycl_compute_early_plan(llama_model_loader &  ml,
     size_t total_size                   = 0;
     size_t max_pp_pipeline_weight_bytes = 0;
     for (auto & weight : ml.weights_map) {
+        // a lazy table the record defers to the SYCL storage tier is not an ordinary weight:
+        // it is not placed, staged, or counted in the maxima and the host total. An
+        // ineligible row (OFF, or AUTO at or below 4 GiB) is the ordinary weight it is.
+        if (llama_lazy_early_plan_excludes(ml.lazy_record, weight.first)) {
+            continue;
+        }
         llama_model_sycl_add_tensor_info(tensors, total_size, max_pp_pipeline_weight_bytes, weight.second.tensor);
     }
     if (tensors.empty()) {
@@ -2293,6 +2299,10 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
+    // the model's weights are SYCL-owned and the SYCL hooks resolve: the fact the early
+    // plan is gated on, not the process-level "a SYCL backend is registered" (a `-ngl 0`
+    // load in a SYCL build registers the hooks without taking the weights)
+    bool lazy_taker = false;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     const bool sycl_layer_assignment =
         this->n_gpu_layers() > 0 && std::any_of(devices.begin(), devices.end(), [](const llama_device & device) {
@@ -2309,9 +2319,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     const bool                     resolved_sycl_weight_owner = sycl_layer_assignment || sycl_tensor_override;
     llama_model_sycl_loading_guard sycl_model_loading_guard(resolved_sycl_weight_owner, &sycl_model_token);
-    if (sycl_model_loading_guard.active) {
-        llama_model_sycl_compute_early_plan(ml, hparams, __func__);
-    }
+    lazy_taker = sycl_model_loading_guard.active;
 #endif
 
     const auto & split_mode   = params.split_mode;
@@ -2336,17 +2344,42 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // the lazy mode as requested, before the fallback below: the SYCL storage tier reads
+    // through its own O_DIRECT fd and must not be disengaged by a device that cannot mmap
+    const enum llama_lazy_mode lazy_mode_pre = ml.lazy.mode;
+
     // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
-    if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
+    {
+        std::vector<ggml_backend_dev_caps> device_caps;
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev.dev, &props);
-            if (!props.caps.mmap_support) {
-                ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
-                break;
-            }
+            device_caps.push_back(props.caps);
         }
+        ml.lazy.mode = llama_lazy_mode_resolve(ml.lazy.mode, device_caps);
     }
+
+    // The lazy-range record: one row per TENSOR_READ_LAZY tensor this arch declares and the
+    // file carries, filled before the early plan, which builds its inventory from weights_map
+    // and so cannot see a row that create_tensor() would fill later. It runs the same way
+    // under no_alloc, so the memory-fit pass plans what the real load plans.
+    llama_lazy_range_record_prefill(
+        ml.lazy_record, arch, hparams, llama_model_lazy_tensor_names(arch),
+        [&ml](const std::string & name, llama_lazy_range_source & out) {
+            const llama_model_loader::llama_tensor_weight * w = ml.get_weight(name.c_str());
+            if (w == nullptr) {
+                return false;
+            }
+            out = { w->idx, w->offs, ggml_nbytes(w->tensor) };
+            return true;
+        },
+        lazy_mode_pre, ml.lazy.mode, lazy_taker, llama_mmap::SUPPORTED);
+
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    if (sycl_model_loading_guard.active) {
+        llama_model_sycl_compute_early_plan(ml, hparams, __func__);
+    }
+#endif
 
     const char * load_mode_name = params.load_mode == LLAMA_LOAD_MODE_AUTO
         ? llama_load_mode_name(ml.use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE)
