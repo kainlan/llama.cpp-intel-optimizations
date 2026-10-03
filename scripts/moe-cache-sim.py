@@ -29,6 +29,15 @@ Policies (all per layer, slots = floor(budget bytes / expert bytes)):
                every adaptation. An adaptation is skipped (no decay either)
                while the previous swaps are still in flight.
 
+Reading the result: routing recorded from one quantisation on one backend is
+a PROXY for another (an IQ3_XXS CPU capture stands in for Q8_0 and for SYCL;
+hidden states, and so routing, shift a little with the weights). And a round
+here is one decoded token, not Strata's speculative-decoding window, where each
+verify window unions several tokens' experts: the adapt cadence of 4 rounds is
+in these units. A trace is refused if it also appears in --train and --test, if
+its n_expert or expert ids disagree with the GGUF sizes, or (leave-one-out) if
+it has no distinct --trace-set / --trace-id to group on.
+
 A round is one evaluation step of the trace (one decode token, or one prefill
 ubatch). The default phase is `decode`: that is where the expert cache pays
 (prefill touches most experts of a layer in every ubatch; `--stats` shows how
@@ -50,7 +59,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import glob
 import io
 import json
 import os
@@ -86,6 +94,7 @@ class Step:
 class Trace:
     header: dict
     steps: list
+    path: str = ""
 
 
 def write_trace(path, header, records):
@@ -143,7 +152,7 @@ def read_trace(path):
             steps.append(s)
         s.n_tokens = max(s.n_tokens, ntok)
         s.layers[layer] = rows
-    return Trace(header=header, steps=steps)
+    return Trace(header=header, steps=steps, path=str(path))
 
 
 def trace_set(trace):
@@ -152,6 +161,57 @@ def trace_set(trace):
 
 def trace_id(trace):
     return str(trace.header.get("id", trace.header.get("set", "?")))
+
+
+def _group_key(trace, by):
+    """The header field a leave-one-out groups on. A trace captured without
+    --trace-set / --trace-id carries the tool's default 'unset' (or nothing);
+    grouping on that would silently collapse every such trace into one group."""
+    v = trace.header.get(by)
+    if v is None or str(v) in ("", "unset"):
+        raise ValueError(
+            f"trace {trace.path or '?'} has no header '{by}' (capture with "
+            f"--trace-{by}); refusing to group it")
+    return str(v)
+
+
+def _same_trace(a, b):
+    if a is b:
+        return True
+    if a.path and b.path and os.path.realpath(a.path) == os.path.realpath(b.path):
+        return True
+    ia, ib = a.header.get("id"), b.header.get("id")
+    return ia is not None and str(ia) not in ("", "unset") and ia == ib
+
+
+def check_disjoint(train, test):
+    for t in test:
+        for r in train:
+            if _same_trace(r, t):
+                raise ValueError(
+                    f"trace {t.path or trace_id(t)} is in both train and test: "
+                    "a profile scored on its own training data is the oracle, "
+                    "not a held-out result")
+
+
+def validate_traces(traces, sizes_by_format):
+    """The traces must come from a model of the shape the sizes describe."""
+    experts = {fmt: s["n_expert"] for fmt, s in sizes_by_format.items()}
+    if len(set(experts.values())) > 1:
+        raise ValueError(f"formats disagree on n_expert: {experts}")
+    n_expert = next(iter(experts.values()))
+    for t in traces:
+        where = t.path or trace_id(t)
+        h = t.header.get("n_expert")
+        if h and int(h) != n_expert:
+            raise ValueError(
+                f"trace {where} was captured with n_expert {h}, the expert "
+                f"sizes say {n_expert}")
+        top = max((e for s in t.steps for rows in s.layers.values()
+                   for row in rows for e in row), default=-1)
+        if top >= n_expert:
+            raise ValueError(
+                f"trace {where} routes to expert {top}, but n_expert is {n_expert}")
 
 
 def _phase_ok(step_phase, phase):
@@ -212,15 +272,6 @@ class Result:
     @property
     def full_gib_per_token(self):
         return self.full_bytes / self.tokens / GIB if self.tokens else 0.0
-
-    def merge(self, other):
-        self.hits += other.hits
-        self.total += other.total
-        self.miss_bytes += other.miss_bytes
-        self.full_bytes += other.full_bytes
-        self.tokens += other.tokens
-        self.swaps += other.swaps
-        self.swap_log.extend(other.swap_log)
 
 
 def _check_layers(trace, layer_bytes):
@@ -387,6 +438,8 @@ def _budget_label(budget_bytes):
 
 def sweep(sizes_by_format, train, test, budgets_bytes_per_layer, phase, adapt,
           test_set=None):
+    check_disjoint(train, test)
+    validate_traces(list(train) + list(test), sizes_by_format)
     rows = []
     if test_set is None:
         test_set = "+".join(sorted({trace_set(t) for t in test}))
@@ -432,11 +485,14 @@ def sweep_loo(sizes_by_format, traces, budgets_bytes_per_layer, phase, adapt,
     by="set" holds out a whole prompt set (code vs chat vs long: does a profile
     transfer across kinds of text); by="id" holds out one trace (Strata's
     leave-one-prompt-out, where the other traces of the same set stay in)."""
-    key = {"set": trace_set, "id": trace_id}[by]
+    keys = [_group_key(t, by) for t in traces]
+    if by == "id" and len(set(keys)) != len(keys):
+        dup = sorted({k for k in keys if keys.count(k) > 1})
+        raise ValueError(f"duplicate trace ids {dup}: each trace needs its own --trace-id")
     rows = []
-    for held in sorted({key(t) for t in traces}):
-        test = [t for t in traces if key(t) == held]
-        train = [t for t in traces if key(t) != held]
+    for held in sorted(set(keys)):
+        test = [t for t, k in zip(traces, keys) if k == held]
+        train = [t for t, k in zip(traces, keys) if k != held]
         rows += sweep(sizes_by_format, train, test, budgets_bytes_per_layer,
                       phase, adapt, test_set=held)
     return rows
@@ -581,6 +637,9 @@ def main(argv=None):
     counts = {len(s["layer_bytes"]) for s in sizes.values()}
     if len(counts) != 1:
         ap.error(f"formats disagree on the number of MoE layers: {counts}")
+    if len({s["n_expert"] for s in sizes.values()}) != 1:
+        ap.error("formats disagree on n_expert: "
+                 f"{ {k: v['n_expert'] for k, v in sizes.items()} }")
     n_layers = counts.pop()
 
     budgets = [m * MIB for m in a.budget_mib_per_layer]
@@ -591,17 +650,20 @@ def main(argv=None):
     adapt = dict(swap_n=a.swap_n, every=a.every, decay=a.decay,
                  min_count=a.min_count, margin=a.margin, land_delay=a.land_delay)
     first_sizes = next(iter(sizes.values()))
-    if a.loo:
-        traces = [read_trace(p) for p in a.loo]
-        rows = sweep_loo(sizes, traces, budgets, a.phase, adapt, by=a.loo_by)
-        shown = traces
-    else:
-        if not a.test:
-            ap.error("give --test (with --train) or --loo")
-        train = [read_trace(p) for p in a.train]
-        test = [read_trace(p) for p in a.test]
-        rows = sweep(sizes, train, test, budgets, a.phase, adapt)
-        shown = train + test
+    try:
+        if a.loo:
+            traces = [read_trace(p) for p in a.loo]
+            rows = sweep_loo(sizes, traces, budgets, a.phase, adapt, by=a.loo_by)
+            shown = traces
+        else:
+            if not a.test:
+                ap.error("give --test (with --train) or --loo")
+            train = [read_trace(p) for p in a.train]
+            test = [read_trace(p) for p in a.test]
+            rows = sweep(sizes, train, test, budgets, a.phase, adapt)
+            shown = train + test
+    except ValueError as e:
+        ap.error(str(e))
     if a.stats:
         for t in shown:
             print(json.dumps(trace_summary(t, first_sizes["n_expert"])), file=sys.stderr)

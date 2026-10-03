@@ -245,6 +245,125 @@ def test_adaptive_pending_blocks_next_adaptation():
     assert res.swap_log == [(1, 0, 1, 0), (5, 0, 3, 2)]
 
 
+def test_adaptive_boundaries_are_inclusive_as_in_strata():
+    # Strata: candidates need `usage >= 2.0`, and a pair swaps unless
+    # `cand < victim + margin`, so gain == margin and usage == min_count swap.
+    t = decode_trace([[1]] * 4)
+    kw = dict(swap_n=1, every=2, decay=0.5, land_delay=0)
+    # after round 1: u1 = 2.0 == min_count, victim e0 u = 0.0, gain 2.0 == margin
+    at = sim.simulate_adaptive({0: {0}}, {0: 1}, [t], {0: GIB}, "decode",
+                               min_count=2.0, margin=2.0, **kw)
+    assert (at.swaps, at.hits) == (1, 2)
+    # two rounds only, so no second adaptation can find the usage again
+    t = decode_trace([[1]] * 2)
+    over_margin = sim.simulate_adaptive({0: {0}}, {0: 1}, [t], {0: GIB}, "decode",
+                                        min_count=2.0, margin=2.0001, **kw)
+    assert over_margin.swaps == 0
+    over_min = sim.simulate_adaptive({0: {0}}, {0: 1}, [t], {0: GIB}, "decode",
+                                     min_count=2.0001, margin=1.5, **kw)
+    assert over_min.swaps == 0
+
+
+def test_adaptive_ties_go_to_the_lower_expert_id():
+    kw = dict(swap_n=1, every=2, decay=0.5, min_count=2.0, margin=1.5, land_delay=0)
+    # candidates e1 and e3 tie at usage 2; the one victim slot takes e1
+    t = decode_trace([[1, 3], [1, 3]])
+    res = sim.simulate_adaptive({0: {0}}, {0: 1}, [t], {0: GIB}, "decode", **kw)
+    assert res.swap_log == [(1, 0, 1, 0)]
+    # victims e0 and e2 tie at usage 0; e0 is evicted first
+    t = decode_trace([[1], [1]])
+    res = sim.simulate_adaptive({0: {0, 2}}, {0: 2}, [t], {0: GIB}, "decode", **kw)
+    assert res.swap_log == [(1, 0, 1, 0)]
+
+
+def test_cli_train_test_path(tmp_path, capsys):
+    tr, te = tmp_path / "train.moetrace", tmp_path / "test.moetrace"
+    sim.write_trace(tr, {"set": "code", "id": "code-0", "n_expert": 4},
+                    [(i, 0, 1, [[2, 3]]) for i in range(4)])
+    sim.write_trace(te, {"set": "chat", "id": "chat-0", "n_expert": 4},
+                    [(i, 0, 1, [[2, 1]]) for i in range(4)])
+    rc = sim.main(["--train", str(tr), "--test", str(te),
+                   "--uniform-expert-bytes", f"f={GIB}:1:4",
+                   "--budget-mib-per-layer", "2048"])
+    assert rc == 0
+    rows = [l.split(",") for l in capsys.readouterr().out.splitlines()[1:]]
+    by = {r[2]: r for r in rows}
+    assert set(by) == {"static", "oracle", "first-touch", "adaptive"}
+    assert by["static"][1] == "chat"
+    assert float(by["static"][7]) == 0.5       # trained {2,3}: e2 hits, e1 misses
+    assert float(by["oracle"][7]) == 1.0       # profiled on the test itself
+
+
+def test_cli_budget_gib_total_splits_evenly_over_the_layers(tmp_path, capsys):
+    tr, te = tmp_path / "a.moetrace", tmp_path / "b.moetrace"
+    sim.write_trace(tr, {"set": "a", "id": "a", "n_expert": 4}, [(0, 0, 1, [[0, 1]])])
+    sim.write_trace(te, {"set": "b", "id": "b", "n_expert": 4}, [(0, 0, 1, [[0, 1]])])
+    sim.main(["--train", str(tr), "--test", str(te),
+              "--uniform-expert-bytes", f"f={GIB}:2:4",
+              "--budget-gib-total", "4"])
+    rows = [l.split(",") for l in capsys.readouterr().out.splitlines()[1:]]
+    # 4 GiB over 2 layers = 2048 MiB each = 2 one-GiB slots per layer
+    assert {r[3] for r in rows} == {"2048"}
+    assert {r[4] for r in rows} == {"4"}
+    assert {float(r[6]) for r in rows} == {4.0}
+
+
+def test_same_trace_in_train_and_test_is_refused(tmp_path):
+    p = tmp_path / "a.moetrace"
+    sim.write_trace(p, {"set": "a", "id": "a", "n_expert": 4}, [(0, 0, 1, [[0, 1]])])
+    argv = ["--train", str(p), "--test", str(p),
+            "--uniform-expert-bytes", f"f={GIB}:1:4", "--budget-mib-per-layer", "1024"]
+    with pytest.raises(SystemExit):
+        sim.main(argv)
+    # by id, with the files differing: the same capture id is still the same trace
+    q = tmp_path / "copy.moetrace"
+    sim.write_trace(q, {"set": "a", "id": "a", "n_expert": 4}, [(0, 0, 1, [[2, 3]])])
+    with pytest.raises(ValueError, match="both train and test"):
+        sim.check_disjoint([sim.read_trace(p)], [sim.read_trace(q)])
+
+
+def test_leave_one_out_refuses_missing_unset_and_duplicate_keys():
+    args = dict(sizes_by_format={"f": sizes({0: GIB})},
+                budgets_bytes_per_layer=[GIB], phase="decode",
+                adapt=dict(swap_n=96, every=4, decay=0.7, min_count=2.0,
+                           margin=1.5, land_delay=1))
+    a = decode_trace([[0, 1]], set_name="x")
+    b = decode_trace([[2, 3]], set_name="y")
+    del a.header["id"]
+    with pytest.raises(ValueError, match="no header 'id'"):
+        sim.sweep_loo(traces=[a, b], by="id", **args)
+    a.header["id"] = b.header["id"] = "unset"
+    with pytest.raises(ValueError, match="no header 'id'"):
+        sim.sweep_loo(traces=[a, b], by="id", **args)
+    a.header["id"] = b.header["id"] = "same"
+    with pytest.raises(ValueError, match="duplicate trace ids"):
+        sim.sweep_loo(traces=[a, b], by="id", **args)
+    a.header["set"] = b.header["set"] = "unset"
+    with pytest.raises(ValueError, match="no header 'set'"):
+        sim.sweep_loo(traces=[a, b], by="set", **args)
+
+
+def test_trace_must_match_the_expert_sizes():
+    kw = dict(budgets_bytes_per_layer=[GIB], phase="decode",
+              adapt=dict(swap_n=96, every=4, decay=0.7, min_count=2.0,
+                         margin=1.5, land_delay=1))
+    ok = decode_trace([[0, 1]], set_name="a")
+    other = decode_trace([[2, 3]], set_name="b")
+    # header n_expert differs from the sizes
+    wrong = decode_trace([[0, 1]], set_name="b", n_expert=8)
+    with pytest.raises(ValueError, match="n_expert 8"):
+        sim.sweep({"f": sizes({0: GIB})}, [ok], [wrong], **kw)
+    # an expert id outside n_expert (header silent about it)
+    bad = decode_trace([[0, 4]], set_name="b")
+    del bad.header["n_expert"]
+    with pytest.raises(ValueError, match="expert 4"):
+        sim.sweep({"f": sizes({0: GIB})}, [ok], [bad], **kw)
+    # two formats that disagree with each other
+    with pytest.raises(ValueError, match="disagree on n_expert"):
+        sim.sweep({"f": sizes({0: GIB}), "g": sizes({0: GIB}, n_expert=8)},
+                  [ok], [other], **kw)
+
+
 # ---------------------------------------------------------------------------
 # bytes -> slots, CSV, sizes
 # ---------------------------------------------------------------------------
@@ -396,13 +515,16 @@ def test_cxx_tool_selftest_writes_a_trace_the_simulator_reads(tmp_path):
     t = sim.read_trace(out)
     # selftest: layer 7 is a [8, 3] strided view of a [256, 3] I32 parent
     # (value r * 11 + c); layer 9 a contiguous [4, 2] tensor (value r * 5 + c);
-    # then layer 7 again, [8, 1], which must start a second step.
+    # then layer 7 again, [8, 1], which must start a second step; layer 11 a
+    # strided [6, 2] view of a [64, 2] tensor in a real ggml buffer.
     assert t.header["selftest"] is True
     assert t.steps[0].layers[7] == [[r * 11 + c for c in range(8)] for r in range(3)]
     assert t.steps[0].layers[9] == [[r * 5 + c for c in range(4)] for r in range(2)]
     # layer index not increasing starts a new step
     assert len(t.steps) == 2
     assert t.steps[1].layers[7] == [[0, 1, 2, 3, 4, 5, 6, 7]]
+    # layer 11: a strided view read through ggml_backend_tensor_get
+    assert t.steps[1].layers[11] == [[r * 13 + c for c in range(6)] for r in range(2)]
 
 
 # ---------------------------------------------------------------------------

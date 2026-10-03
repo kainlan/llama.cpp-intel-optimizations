@@ -1698,6 +1698,13 @@ if (NOT WIN32)
         LABEL "python"
         TIMEOUT 120
     )
+    # Hand the gate the tracer built beside it so its C++/Python format
+    # cross-check runs instead of skipping. The binary is not a test dependency
+    # (ctest does not build it); an unbuilt one still skips.
+    if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES AND NOT EMSCRIPTEN)
+        set_property(TEST test-moe-cache-sim APPEND PROPERTY ENVIRONMENT
+            "LLAMA_MOE_TRACE_BIN=$<TARGET_FILE:llama-moe-trace>")
+    endif()
 
     # ---------------------------------------------------------------------
     # RESTORED COVERAGE, batch 1/N (llama.cpp-0igs): 37 pytest-style gates for
