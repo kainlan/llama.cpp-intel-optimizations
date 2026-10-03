@@ -303,7 +303,7 @@ planes (`dsv4_build_comp_plan`, rollback `<= n_rs_seq`) carry the same bound. Th
 points at, and it is shared with `llama_memory_recurrent`, which this port touched (the draft context prints
 `n_rs_seq = 0` and a 0 MiB recurrent memory: the `is_empty()` case).
 
-Next discriminating runs (not run). (a) `--spec-draft-n-max 1` on the same prompts: if the output still diverges
+Next discriminating runs (running, started by the lead; results to be recorded here). (a) `--spec-draft-n-max 1` on the same prompts: if the output still diverges
 from greedy, the 3-token verify batch is not needed for the divergence. (b) Locate the first divergence relative
 to the first rejected draft. This cannot be done from the existing logs: they are `-lv 4` and carry only the
 aggregate counters (for `mtp_code_1`: 89 rounds, 178 drafted, 170 accepted, so 8 draft tokens were rejected
