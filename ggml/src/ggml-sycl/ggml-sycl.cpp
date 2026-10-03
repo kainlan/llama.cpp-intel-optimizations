@@ -16109,6 +16109,8 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     g_placement_kv_info.n_head_ctx_max = inventory->n_head_ctx_max;
     g_placement_kv_info.n_head_swa_max = inventory->n_head_swa_max;
     g_placement_kv_info.n_head_all_max = inventory->n_head_all_max;
+    // llama.cpp-5efe C4: the indexer key width is a model property that does not depend on the per-layer arrays below.
+    g_placement_kv_info.kv_idx_width   = inventory->kv_idx_width;
     if (inventory->swa_layer_mask != nullptr && inventory->swa_layer_mask_count > 0) {
         g_placement_kv_info.swa_layer_mask.assign(inventory->swa_layer_mask,
                                                   inventory->swa_layer_mask + inventory->swa_layer_mask_count);
@@ -17173,7 +17175,7 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
     kv_demotion_in.layer_kv_bytes.resize(n_layers);
     for (size_t l = 0; l < n_layers; ++l) {
         kv_demotion_in.kv_device[l]      = plan.get_kv_device((int) l);
-        kv_demotion_in.layer_kv_bytes[l] = plan.kv_size_for_layer(static_cast<uint32_t>(l));
+        kv_demotion_in.layer_kv_bytes[l] = plan.kv_demand_for_layer(static_cast<uint32_t>(l));
     }
 
     const ggml_sycl::kv_demotion_result demotion_result = ggml_sycl::plan_runtime_kv_demotion(kv_demotion_in);
@@ -18463,7 +18465,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         for (size_t l = 0; l < n_kv_layers; ++l) {
             const auto load_it   = next_plan.load_kv_device.find((int) l);
             in.load_kv_device[l] = load_it == next_plan.load_kv_device.end() ? -1 : load_it->second;
-            in.layer_kv_bytes[l] = next_plan.kv_size_for_layer(static_cast<uint32_t>(l));  // at the next shape
+            in.layer_kv_bytes[l] = next_plan.kv_demand_for_layer(static_cast<uint32_t>(l));  // at the next shape
         }
         in.devices = next_plan.multi_device ? next_plan.devices : std::vector<int>{ next_plan.device_id };
         std::vector<ggml_sycl::optional_layout_snapshot> optional_layouts;

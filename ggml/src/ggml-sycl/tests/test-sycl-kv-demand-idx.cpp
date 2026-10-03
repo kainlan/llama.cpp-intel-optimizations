@@ -95,6 +95,19 @@ static void test_zero_width_is_the_old_size() {
     check_eq("layer 3", plan.kv_demand_for_layer(3), 512 * MiB);
 }
 
+static void test_a_plan_without_per_layer_truth() {
+    printf(
+        "(c0) a legacy plan (no per-layer arrays): the device slab is the uniform size, the demand adds the indexer\n");
+    placement_plan plan{};
+    plan.kv_per_layer  = 512 * MiB;
+    plan.planner_n_ctx = 262144;
+    plan.kv_idx_width  = 128;
+    check_eq("slab", plan.kv_size_for_layer(5), 512 * MiB);
+    check_eq("demand", plan.kv_demand_for_layer(5), 576 * MiB);
+    plan.kv_idx_width = 0;
+    check_eq("demand at width 0", plan.kv_demand_for_layer(5), 512 * MiB);
+}
+
 // The demotion input is what the two sites in ggml-sycl.cpp build: layer_kv_bytes per layer from one accessor.
 static ggml_sycl::kv_demotion_result demote(const placement_plan & plan, bool use_demand, size_t room_bytes) {
     ggml_sycl::kv_demotion_input in;
@@ -138,6 +151,7 @@ int main() {
     printf("=== kv_demand_for_layer counts the indexer cache (llama.cpp-5efe C4 part b) ===\n");
     test_demand_adds_the_indexer_to_every_kv_layer();
     test_zero_width_is_the_old_size();
+    test_a_plan_without_per_layer_truth();
     test_demotion_prints_the_indexer_in_the_host_figure();
     printf("=== %d checks, %d failures ===\n", g_checks, g_fail);
     if (g_fail > 0) {

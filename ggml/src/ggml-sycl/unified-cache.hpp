@@ -666,6 +666,10 @@ struct placement_kv_info {
     std::vector<uint8_t>  layer_kind;     // enum ggml_sycl_kv_layer_kind per layer
     std::vector<uint32_t> layer_k_width;  // Per-layer K width (elements); 0 for SHARED layers
     std::vector<uint32_t> layer_v_width;  // Per-layer V width (elements); symmetric
+    // llama.cpp-5efe C4: width (elements) of the indexer key cached beside the attention KV, mirrored from
+    // ggml_sycl_tensor_inventory::kv_idx_width (ggml-sycl.h); 0 = no indexer cache. Not part of a layer's device slab:
+    // read only through placement_plan::kv_demand_for_layer().
+    uint32_t              kv_idx_width = 0;
 
     bool valid() const { return n_layer > 0 && n_embd_k_gqa > 0 && n_embd_v_gqa > 0 && n_ctx > 0; }
 
@@ -780,6 +784,9 @@ struct placement_plan {
     std::vector<uint8_t>                       layer_kind;
     std::vector<uint32_t>                      layer_k_width;
     std::vector<uint32_t>                      layer_v_width;
+    // llama.cpp-5efe C4: mirrors placement_kv_info::kv_idx_width -- see that field's comment. Read only by
+    // kv_demand_for_layer() below.
+    uint32_t                                   kv_idx_width             = 0;
     uint32_t                     planner_n_ctx            = 0;
     uint32_t                     planner_n_ubatch         = 0;
     uint32_t                     planner_n_seq_max        = 0;
@@ -1055,6 +1062,20 @@ struct placement_plan {
             return kv_per_swa_layer;
         }
         return kv_per_layer;
+    }
+
+    // llama.cpp-5efe C4: what a layer asks of the tier that holds its KV -- kv_size_for_layer() plus the indexer keys
+    // cached beside it (kv_idx_width elements per cell, every cell of the context, at the planner's fp16 K size).
+    // A layer that carries no KV carries no indexer either. Both runtime demotion sites read this, so the printed
+    // host-KV figure counts what the load pins. kv_size_for_layer() itself sizes the device per-layer slab and is
+    // deliberately unchanged: on the device the idx_ tensors are not remapped into a layer slab ([KV-REMAP] matches
+    // only cache_k_l / cache_v_l), and how the device accounts for them is llama.cpp-ka9c's.
+    size_t kv_demand_for_layer(uint32_t layer_id) const {
+        const size_t kv = kv_size_for_layer(layer_id);
+        if (kv == 0 || kv_idx_width == 0) {
+            return kv;
+        }
+        return kv + static_cast<size_t>(planner_n_ctx) * static_cast<size_t>(kv_idx_width) * sizeof(ggml_fp16_t);
     }
 
     size_t kv_layer_count() const {

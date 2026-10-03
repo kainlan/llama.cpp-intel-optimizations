@@ -106,7 +106,9 @@ def test_the_helper_answers_the_indexer_width_only_for_the_idx_memory_architectu
     assert re.search(
         r"swa_type\s*==\s*LLAMA_SWA_TYPE_NONE", body
     ), "the hybrid_idx branch is taken only without SWA (the iswa memory wins otherwise); the helper must match"
-    assert re.search(r"hparams\s*\.\s*indexer_head_size", body), "the helper does not read hparams.indexer_head_size"
+    assert re.search(
+        r"return\s+hparams\s*\.\s*indexer_head_size\s*;", body
+    ), "the helper does not answer hparams.indexer_head_size"
     assert re.search(
         r"indexer_head_size\s*>\s*0", body
     ), "a null filter_idx (no indexer tensors) builds no idx cache: the helper must answer 0 for width 0"
@@ -140,6 +142,8 @@ def test_the_apply_step_copies_the_width_unconditionally():
     text = read(BACKEND)
     hit = re.search(r"g_placement_kv_info\s*\.\s*kv_idx_width\s*=\s*inventory\s*->\s*kv_idx_width\s*;", text)
     assert hit, "the apply step does not copy inventory->kv_idx_width into g_placement_kv_info"
+    before = text[: hit.start()].rstrip()
+    assert before.endswith((";", "}", "{")), "the copy is guarded by an if: it must be a plain statement"
     # not inside the per-layer-arrays branch: a model without arrays still carries an indexer width
     arrays = re.search(r"if\s*\(\s*inventory\s*->\s*kv_layer_count\s*>\s*0[^{]*\{", text)
     assert arrays, "the per-layer arrays branch moved"
@@ -171,7 +175,7 @@ def test_kv_demand_for_layer_adds_the_indexer_to_kv_size_for_layer():
     ), "the indexer cache holds every cell of the context; the accessor must use planner_n_ctx"
     assert re.search(r"sizeof\s*\(\s*ggml_fp16_t\s*\)", demand), "the K element size is the planner's fp16"
     assert re.search(
-        r"==\s*0", demand
+        r"\bkv\s*==\s*0", demand
     ), "a layer that carries no KV has no indexer either: the accessor needs a 0 early out"
 
 

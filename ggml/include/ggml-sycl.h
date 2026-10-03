@@ -347,6 +347,13 @@ struct ggml_sycl_tensor_inventory {
     const uint32_t *               kv_v_width_per_layer;  // Per-layer V width (elements) [kv_layer_count]; symmetric
     const uint8_t *                kv_layer_kind;         // Per-layer enum ggml_sycl_kv_layer_kind [kv_layer_count]
     uint32_t                       kv_layer_count;        // Length of the three arrays above (0 = not populated)
+    // llama.cpp-5efe C4: width (elements) of the per-token indexer key a sparse-attention hybrid model caches beside
+    // its attention KV ("idx_", llama_memory_hybrid_idx), one row per cell on every layer that carries KV; 0 for every
+    // other model. A demoted layer's indexer keys go to the host KV buffer with its K and V, so the demotion's
+    // per-layer demand counts them (placement_plan::kv_demand_for_layer). Declared last, after kv_layer_count: it lands
+    // in the struct's tail padding (offset 172, sizeof stays 176) and shifts no other field. The libllama and the
+    // backend rebuild together; a stale libllama leaves it unspecified.
+    uint32_t                       kv_idx_width;
 };
 
 // SYCL-side projection of the four placement-envelope fields the llama

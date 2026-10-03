@@ -366,6 +366,18 @@ static llama_model_sycl_kv_layer_arrays llama_model_sycl_build_kv_layer_arrays(c
     return out;
 }
 
+// llama.cpp-5efe C4: the width of the per-token indexer key cached beside the attention KV, for the one memory type
+// that carries it. llama_model::create_memory builds llama_memory_hybrid_idx for LLM_ARCH_QWEN4EXP when the model has no
+// sliding window (the iswa hybrid memory wins otherwise) and has indexer tensors (indexer_head_size > 0, which is what
+// a non-null filter_idx tests); every other model has no "idx_" cache. A demoted layer's indexer keys go to the host KV
+// buffer with its K and V, so the planner's demand per layer counts them (placement_plan::kv_demand_for_layer).
+static uint32_t llama_model_sycl_kv_idx_width(llm_arch arch, const llama_hparams & hparams) {
+    if (arch == LLM_ARCH_QWEN4EXP && hparams.swa_type == LLAMA_SWA_TYPE_NONE && hparams.indexer_head_size > 0) {
+        return hparams.indexer_head_size;
+    }
+    return 0;
+}
+
 static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &         inventory,
                                                 std::vector<ggml_sycl_tensor_info> & tensors,
                                                 const bool *                         swa_layer_mask,
@@ -374,7 +386,8 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
                                                 const uint8_t *                      kv_layer_kind,
                                                 size_t                               total_size,
                                                 size_t                               max_pp_pipeline_weight_bytes,
-                                                const llama_hparams &                hparams) {
+                                                const llama_hparams &                hparams,
+                                                uint32_t                             kv_idx_width) {
     const uint32_t n_layer             = hparams.n_layer();
     inventory                         = {};
     inventory.tensors                 = tensors.data();
@@ -553,6 +566,7 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     inventory.kv_v_width_per_layer = kv_v_width_per_layer;
     inventory.kv_layer_kind        = kv_layer_kind;
     inventory.kv_layer_count       = n_layer;
+    inventory.kv_idx_width         = kv_idx_width;
 
     uint32_t    n_head_ctx_max        = 0;
     uint32_t    n_head_swa_max        = 0;
@@ -695,7 +709,8 @@ static void llama_model_sycl_compute_early_plan(llama_model_loader &  ml,
     ggml_sycl_tensor_inventory inventory = {};
     llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(),
                                         kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(), total_size,
-                                        max_pp_pipeline_weight_bytes, hparams);
+                                        max_pp_pipeline_weight_bytes, hparams,
+                                        llama_model_sycl_kv_idx_width(ml.get_arch(), hparams));
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
     llama_model_sycl_apply_inventory(inventory, envelope, true);
 
@@ -749,7 +764,8 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader &  ml,
     ggml_sycl_tensor_inventory inventory = {};
     llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(),
                                         kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(), total_size,
-                                        max_pp_pipeline_weight_bytes, hparams);
+                                        max_pp_pipeline_weight_bytes, hparams,
+                                        llama_model_sycl_kv_idx_width(ml.get_arch(), hparams));
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
     llama_model_sycl_apply_inventory(inventory, envelope, false);
 
