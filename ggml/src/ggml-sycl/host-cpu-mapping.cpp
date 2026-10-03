@@ -9,7 +9,6 @@
 #if !defined(_WIN32)
 #    include <sys/mman.h>
 #    include <sys/resource.h>
-#    include <unistd.h>
 #endif
 
 namespace ggml_sycl {
@@ -56,8 +55,15 @@ std::string host_cpu_refusal_text(host_cpu_status status, const host_cpu_mapping
                       host_cpu_status_name(status), mapping.mapped_bytes, mapping.requested_bytes, mapping.err,
                       std::strerror(mapping.err), (unsigned long long) mapping.rlimit_memlock);
     } else {
-        std::snprintf(buf, sizeof(buf), "%s: request of %zu bytes failed: errno=%d (%s)", host_cpu_status_name(status),
-                      mapping.requested_bytes, mapping.err, mapping.err != 0 ? std::strerror(mapping.err) : "no errno");
+        // a refusal that made no syscall (a zero or overflowing request, an absent platform) has no errno to print
+        if (mapping.err != 0) {
+            std::snprintf(buf, sizeof(buf), "%s: request of %zu bytes failed: errno=%d (%s)",
+                          host_cpu_status_name(status), mapping.requested_bytes, mapping.err,
+                          std::strerror(mapping.err));
+        } else {
+            std::snprintf(buf, sizeof(buf), "%s: request of %zu bytes refused", host_cpu_status_name(status),
+                          mapping.requested_bytes);
+        }
     }
     return buf;
 }
@@ -65,12 +71,13 @@ std::string host_cpu_refusal_text(host_cpu_status status, const host_cpu_mapping
 #if !defined(_WIN32)
 
 // The one munmap of this translation unit (a gate counts the calls): the lock-failure unwind and the release both come
-// through here, so the private counter sits at the syscall.
+// through here, so the private counter sits at the syscall and counts only a munmap that returned 0.
 static void host_cpu_munmap(void * ptr, size_t mapped_bytes) {
-    munmap(ptr, mapped_bytes);
+    if (munmap(ptr, mapped_bytes) == 0) {
 #    if defined(GGML_SYCL_PRIVATE_TESTING)
-    g_munmap_count.fetch_add(1, std::memory_order_acq_rel);
+        g_munmap_count.fetch_add(1, std::memory_order_acq_rel);
 #    endif
+    }
 }
 
 host_cpu_status unified_cache_raw_alloc_host_cpu(size_t request_bytes, host_cpu_mapping * out) {
@@ -91,8 +98,12 @@ host_cpu_status unified_cache_raw_alloc_host_cpu(size_t request_bytes, host_cpu_
     }
     out->mapped_bytes = mapped;
 
-    // advisory: a refusal (THP compiled out, or "never") costs speed, not correctness
+    // advisory: a refusal (THP compiled out, or "never") costs speed, not correctness. Before the lock, because mlock
+    // faults every page in and a page faulted in small stays small. MADV_HUGEPAGE is Linux-only, so a POSIX kernel
+    // without it simply leaves huge_advised false.
+#    if defined(MADV_HUGEPAGE)
     out->huge_advised = madvise(p, mapped, MADV_HUGEPAGE) == 0;
+#    endif
 
     // the whole range, faulted in and locked before returning: never MLOCK_ONFAULT, so resident == planned from the
     // first moment and an unlockable request fails here, at load, never mid-run

@@ -212,15 +212,16 @@ def test_the_huge_page_advice_precedes_the_lock_and_is_guarded():
     assert advise.start() < lock.start(), "MADV_HUGEPAGE comes after the mlock that faults the pages in"
     # MADV_HUGEPAGE is Linux-only while the arm is every POSIX: the call is under its own feature test
     before = alloc_body[: advise.start()]
-    assert re.search(r"#\s*if\s+defined\s*\(\s*MADV_HUGEPAGE\s*\)\s*$", before.rstrip() + "\n", flags=re.MULTILINE) and (
-        "#endif" in alloc_body[advise.end() : lock.start()]
+    assert re.search(r"#\s*if\s+defined\s*\(\s*MADV_HUGEPAGE\s*\)\s*(?:\w+\s*->\s*\w+\s*=\s*)?\Z", before) and (
+        re.search(r"#\s*endif", alloc_body[advise.end() : lock.start()])
     ), "madvise(MADV_HUGEPAGE) is not under `#if defined(MADV_HUGEPAGE)`"
 
 
 def test_the_munmap_counter_counts_only_a_munmap_that_succeeded():
     posix, _ = guard_regions(sycl_text(CPP))
     body = function_body(
-        strip_comments(posix), r"static\s+(?:void|bool)\s+host_cpu_munmap\s*\(\s*void\s*\*\s*\w+\s*,\s*size_t\s+\w+\s*\)"
+        strip_comments(posix),
+        r"static\s+(?:void|bool)\s+host_cpu_munmap\s*\(\s*void\s*\*\s*\w+\s*,\s*size_t\s+\w+\s*\)",
     )
     m = re.search(r"if\s*\(\s*munmap\s*\([^)]*\)\s*==\s*0\s*\)\s*\{", body)
     assert m, "the counter is not inside `if (munmap(...) == 0)`"
@@ -231,7 +232,7 @@ def test_the_refusal_text_prints_errno_only_when_there_is_one():
     code = strip_comments(sycl_text(CPP))
     body = function_body(code, r"std::string\s+host_cpu_refusal_text\s*\(")
     non_lock = body[body.index("else") :]
-    assert re.search(r"mapping\.err\s*!=\s*0|mapping\.err\s*\)", non_lock), "the non-lock text does not test errno"
+    assert re.search(r"if\s*\(\s*mapping\.err\s*!=\s*0\s*\)", non_lock), "the non-lock text does not test errno"
     assert "no errno" not in non_lock, "the non-lock text still prints a placeholder for a missing errno"
 
 

@@ -9,8 +9,14 @@
 // that cannot be mapped or locked is refused by name, never served from another tier.
 //
 // Device-free on purpose, like file-mapping.hpp: this header and host-cpu-mapping.cpp include no SYCL header, so host
-// tests link the translation unit alone. They are the only code in ggml-sycl that maps or locks anonymous host memory
-// for the tier; the owner entry (unified_allocate_owner with constraints.must_host_cpu) calls them and nothing else does.
+// tests link the translation unit alone. Together they are the only code in ggml-sycl that maps or locks anonymous host
+// memory for the tier; the owner entry (unified_allocate_owner with constraints.must_host_cpu) calls them and nothing
+// else does.
+//
+// Huge-page backing depends on the kernel: the whole mapping is 2 MiB sized, and it lands in huge pages only when the
+// kernel also 2 MiB-aligns it. Kernels from 6.7 on align large anonymous mmaps; an older one may hand an unaligned
+// base, and then the first and last huge pages degrade to small pages (correctness is unchanged, the speed is not).
+// The wrapper does not over-map and trim to force alignment, because the release is one munmap of the whole mapping.
 
 #include <cstddef>
 #include <cstdint>
@@ -47,7 +53,9 @@ const char * host_cpu_status_name(host_cpu_status status);
 
 struct host_cpu_mapping {
     void *   ptr             = nullptr;
-    size_t   mapped_bytes    = 0;      // host_cpu_mapped_size(request): what was mapped, locked and is released
+    size_t   mapped_bytes    = 0;      // host_cpu_mapped_size(request): the size asked of the kernel. A live mapping
+                                       // only when ptr != null; after LOCK_FAILED it is non-zero though nothing is
+                                       // mapped (it was unmapped again), after MMAP_FAILED it is 0.
     bool     huge_advised    = false;  // MADV_HUGEPAGE was accepted (the kernel may still back it with small pages)
     int      err             = 0;      // errno of the failing call, 0 on success
     uint64_t rlimit_memlock  = 0;      // RLIMIT_MEMLOCK soft limit at the failure; ~0 is unlimited
@@ -62,7 +70,8 @@ struct host_cpu_mapping {
 host_cpu_status unified_cache_raw_alloc_host_cpu(size_t request_bytes, host_cpu_mapping * out);
 
 // The only release: one munmap of the whole mapping, which drops its lock. `mapped_bytes` is what the allocation
-// returned, never the request.
+// returned, never the request. The caller releases exactly once, from the owning handle's destructor: the release is
+// not idempotent, a second call with the same range would unmap whatever was mapped there since.
 void unified_cache_raw_free_host_cpu(void * ptr, size_t mapped_bytes);
 
 // The refusal as the log line and the typed error carry it: the status name, the mapped and requested bytes, errno and
