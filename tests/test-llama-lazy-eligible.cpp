@@ -33,9 +33,9 @@ struct row {
 };
 
 int main() {
-    const size_t gib4  = 4ull * 1024 * 1024 * 1024;
-    const size_t mib1  = 1024ull * 1024;
-    const size_t gib50 = 50ull * 1024 * 1024 * 1024;
+    const size_t          gib4     = 4ull * 1024 * 1024 * 1024;
+    const size_t          mib1     = 1024ull * 1024;
+    const size_t          gib50    = 50ull * 1024 * 1024 * 1024;
     // not an enumerator: the public C-API field is only validated by the CLI
     const llama_lazy_mode bad_mode = (llama_lazy_mode) 99;
 
