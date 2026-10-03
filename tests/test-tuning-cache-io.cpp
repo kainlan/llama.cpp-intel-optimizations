@@ -22,6 +22,7 @@
 // to save_ubatch_cache()/load_ubatch_cache(), never through get_cache_dir().
 
 #include "../ggml/src/ggml-sycl/tuning-cache-io.hpp"
+#include "test-skip.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -1527,7 +1528,7 @@ int main() {
                      "directly -- several of its tests fall back to the real $HOME/.cache/llama.cpp/sycl-tuning "
                      "otherwise. See tests/CMakeLists.txt's test-tuning-cache-io registration for the values "
                      "ctest itself uses.\n";
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     std::cout << "=== Tuning Cache I/O Tests ===\n\n";
