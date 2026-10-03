@@ -46,10 +46,14 @@ inline bool moe_mmvq_batched_dispatch_supports_layout(enum ggml_type type, enum 
         // the corresponding instantiation.
         //
         // This is the complete set reachable by transcribing an existing generic
-        // mul_mat_vec_q<> tuple, plus IQ4_NL (s36q): the first iq* type, whose dense
-        // kernel is that same generic body with vec_dot_iq4_nl_q8_1 (Q4_0-shaped,
-        // qi=4, vdr=2). The rest of the iq* family uses grid-lookup kernels with
-        // adjusted qi, so those types stay refused until their _id variants exist.
+        // mul_mat_vec_q<> tuple, plus the iq* types s36q has covered so far: IQ4_NL,
+        // whose dense kernel is that same generic body with vec_dot_iq4_nl_q8_1
+        // (Q4_0-shaped, qi=4, vdr=2), and IQ3_XXS / IQ3_S, whose dense tuples (qi =
+        // QI3_x / 2, vdr=1) take their grid-table vec_dots behind generic-signature
+        // adaptors. The rest of the iq* family stays refused until its _id variant
+        // exists.
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
@@ -79,6 +83,8 @@ inline bool moe_mmvq_batched_dispatch_supports_type(enum ggml_type type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
@@ -162,6 +168,8 @@ inline bool moe_mmvq_capability_supports_layout(enum ggml_type type, enum ggml_l
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
