@@ -4,9 +4,10 @@ committed raw CSVs in this directory. Standard library only:
 
     python3 analyze.py
 
-Reads   curves-{decode,all}-by-{set,id}.csv, ablations/*.csv, expert-sizes.csv,
+Reads   curves-{decode,all}-by-{set,id}.csv, curves-all-by-set-prefill-{off,seed}.csv,
+        ablations/*.csv, expert-sizes.csv, decode-quarters.csv,
         long-0-rounds.csv
-Writes  summary-curves.csv, summary-ablations.csv, swap-traffic.csv,
+Writes  summary-curves.csv, summary-ablations.csv, summary-prefill-arms.csv, swap-traffic.csv,
         cpu-bound-estimate.csv, long-0-blocks.csv
 
 Token-weighted means: sum(value * tokens) / sum(tokens) over the held-out test
@@ -55,6 +56,8 @@ def main():
     # ---- summary-curves.csv
     out = []
     for path in sorted(glob.glob(os.path.join(HERE, "curves-*-by-*.csv"))):
+        if "prefill-" in os.path.basename(path):
+            continue   # the prefill arms are summarised in summary-prefill-arms.csv
         m = re.match(r"curves-(\w+)-by-(\w+)\.csv", os.path.basename(path))
         phase, by = m.groups()
         cells = defaultdict(list)
@@ -94,7 +97,8 @@ def main():
             abl.append([param, value, fmt, gib, hit, cpu, swaps])
             if param == "default":
                 default[(fmt, gib)] = hit
-    order = {"default": 0, "every": 1, "swapn": 2, "land": 3, "decay": 4, "margin": 5, "mincount": 6}
+    order = {"default": 0, "every": 1, "swapn": 2, "land": 3, "landnoskip": 4, "decay": 5, "margin": 6,
+             "mincount": 7}
     abl.sort(key=lambda r: (order[r[0]], float(r[1] or 0), r[2], r[3]))
     write("summary-ablations.csv",
           ["param", "value", "format", "budget_gib", "hit_rate_token_weighted", "delta_vs_default",
@@ -154,6 +158,23 @@ def main():
            "cpu_gb_per_token", "tps_bound_at_14_gbps", "tps_bound_at_21_gbps",
            "tps_bound_at_30_gbps", "tps_bound_at_47_gbps"], est)
 
+    # ---- summary-prefill-arms.csv: adaptive with prefill swaps on / off / seed (phase all, by set)
+    arms = []
+    for arm, name in (("on", "curves-all-by-set.csv"), ("off", "curves-all-by-set-prefill-off.csv"),
+                      ("seed", "curves-all-by-set-prefill-seed.csv")):
+        cells = defaultdict(list)
+        for r in rows_of(os.path.join(HERE, name)):
+            if r["policy"] == "adaptive":
+                cells[(r["format"], nominal(r["budget_mib_per_layer"]))].append(r)
+        for (fmt, gib), rs in sorted(cells.items()):
+            hit, tokens = tw(rs, "hit_rate")
+            cpu, _ = tw(rs, "cpu_gib_per_token")
+            arms.append([fmt, gib, "adaptive-" + arm, f"{hit:.4f}", f"{cpu:.4f}",
+                         f"{sum(int(r['swaps']) for r in rs) / tokens:.3f}", int(tokens)])
+    write("summary-prefill-arms.csv",
+          ["format", "budget_gib", "arm", "hit_rate_token_weighted_all_rounds",
+           "cpu_gib_per_token_token_weighted", "swaps_per_token", "tokens"], arms)
+
     # ---- long-0-blocks.csv: where the phase=all collapse happens
     rounds = rows_of(os.path.join(HERE, "long-0-rounds.csv"))
     blocks = []
@@ -167,6 +188,11 @@ def main():
         block(f"decode rounds {a}-{min(a + 32, len(dec)) - 1}", dec[a:a + 32])
     block("decode (all 256 rounds)", dec)
     block("prefill + decode", rounds)
+    # control: a fresh decode-only run of long-0 (chat+code decode profile), same budget
+    q = [r for r in rows_of(os.path.join(HERE, "decode-quarters.csv")) if r["held_out"] == "long-0"]
+    mean = lambda pol: sum(float(r["hit_rate"]) for r in q if r["policy"] == pol) / 4   # equal quarters
+    blocks.append(["decode-only control (decode-quarters.csv)", 256, 256, f"{mean('adaptive'):.4f}",
+                   f"{mean('static'):.4f}", f"{mean('first-touch'):.4f}", ""])
     write("long-0-blocks.csv",
           ["rounds", "n_rounds", "n_tokens", "hit_adaptive", "hit_static", "hit_first_touch",
            "hit_first_touch_end_of_round"], blocks)

@@ -25,38 +25,46 @@ sizes unless a line says Q8_0.
    text; CPU bytes per token 0.232 GiB against 0.322 and 0.510. Q8_0 with 7 GiB (5.7 %
    of the experts): 0.47 against 0.18 and 0.13.
 2. **A shipped static profile is not worth it.** A profile trained on two other prompt
-   sets scores 0.12 to 0.79 across 2 to 24 GiB, below first-touch (which needs no
-   training) at every budget measured.
+   sets scores 0.12 to 0.79 across 2 to 24 GiB for IQ3_XXS, below first-touch (which needs
+   no training) at every budget. For Q8_0 it is below first-touch from 7 GiB up (0.13
+   against 0.18 at 7 GiB); at 2 and 4 GiB both are near zero and within 0.01 (0.04 and
+   0.03; 0.08 and 0.08).
 3. **With a large cache, first-touch is nearly as good.** At 14 GiB of IQ3_XXS (36 % of
    the experts) adaptive is 1.1 points above first-touch (0.84 against 0.83); at 2 to
-   4 GiB the gap is 20 to 29 points, and it widens again at 24 GiB (3.6 points) because
-   first-touch never evicts. For Q8_0 the gap stays 9 to 29 points up to 24 GiB.
+   4 GiB the gap is 20 to 29 points, and it widens again at 24 GiB (3.6 points; a hypothesis
+   is that first-touch never evicts, which is not tested). For Q8_0 the gap stays 9 to
+   29 points up to 24 GiB.
 4. **Adaptive can exceed an in-sample static profile.** Against the profile fitted on the
    held-out set itself, adaptive is ahead at 2 and 4 GiB (0.45 against 0.37, 0.59 against
    0.55), level at 7 GiB (0.71 against 0.72) and behind from 10 GiB. It is **not** ahead
    of a profile fitted to the single test trace (0.49 and 0.67 at 2 and 4 GiB), which is
    a stricter and unachievable bound (section 3).
-5. **Do not let the swap rule run during prefill.** With prompt rounds included
-   (`phase=all`) the aggregate collapses (IQ3_XXS 7 GiB: 0.34, below first-touch's 0.47)
-   because a 512-token ubatch is not a decode round: the rule's counters and its cap of
-   96 swaps per 4 rounds are in decode units (section 4). Decode after the prefill is
-   not visibly affected (0.70 on the long trace).
+5. **Score decode and prefill separately; the prefill policy is a different, open
+   question.** With prompt rounds included (`phase=all`) the aggregate collapses (IQ3_XXS
+   7 GiB: 0.34, below first-touch's 0.47) because a 512-token ubatch is not a decode
+   round: the rule's counters and its cap of 96 swaps per 4 rounds are in decode units.
+   Freezing the swaps in prefill was run as an arm and is not clearly better: prefill
+   hit rate falls (0.220 against 0.293 at 7 GiB, long set), and decode after it moves
+   little (0.716 against 0.703; section 4). Whether prefill should swap, seed the
+   counters, or not take part is not settled by this data.
 6. **The parameters Strata chose are near the optimum.** What matters is the adaptation
    rate: the cap of 96 swaps per 4 rounds binds at small budgets (21.5 of a possible 24
-   swaps per token at 4 GiB), and a land delay of 4 rounds or more halves the number of
-   adaptations because of the in-flight skip rule (section 5).
+   swaps per token at 4 GiB), and a land delay of 4 rounds or more cuts the number of
+   swaps by roughly half at small budgets (21.5 to 11.9 per token at 4 GiB; at 14 GiB
+   only 10.4 to 9.9) because of the in-flight skip rule: with the rule disabled the
+   count stays at 21.5 (section 5).
 7. **Swap traffic is small next to what it saves.** IQ3_XXS 7 GiB: 29 MiB per token
-   moved, 284 MiB per token of CPU reads avoided (9.7 MiB saved per MiB moved); about
-   1.2 GB/s at 40 tokens/s. Q8_0 7 GiB: 112 MiB per token moved, about 4.7 GB/s at
+   moved, 284 MiB per token fewer CPU reads than the static profile (not than no cache;
+   9.7 MiB saved per MiB moved); about 1.2 GB/s at 40 tokens/s. Q8_0 7 GiB: 112 MiB per token moved, about 4.7 GB/s at
    40 tokens/s, 7.2 MiB saved per MiB moved (section 6).
-8. **What it buys in tokens/s, as an upper bound on the CPU-limited rate** (estimate,
-   section 7): IQ3_XXS 7 GiB adaptive at 21 GB/s of CPU expert bandwidth is at most
-   84 tokens/s, against 38 for static and 25 with no cache. Q8_0 7 GiB at 30 GB/s: at
-   most 23 against 14 and 12.
+8. **What it buys in tokens/s, as the CPU-limited rate at the median CPU bandwidth**
+   (estimate, section 7): IQ3_XXS 7 GiB adaptive at 21 GB/s of CPU expert bandwidth gives
+   84 tokens/s, against 38 for static and 25 with no cache. Q8_0 7 GiB at 30 GB/s: 23
+   against 14 and 12. This ignores everything but the CPU's expert reads.
 
 One open question is not a measurement: the placement ruling says placement "is made
 once, in the planning pass". An adaptive cache re-places experts while running. Section
-8 says why that needs an explicit owner decision before any build.
+8 sets out the two readings and leaves the decision to the owner.
 
 ## 2. Method
 
@@ -85,7 +93,7 @@ prompts add 18436 prefill tokens and the short ones 487 (21483 tokens in all:
 | static | resident set = top-S experts by routing count over the training traces; scored on held-out traces |
 | oracle | the same, profiled on the test traces themselves (in-sample; not achievable) |
 | first-touch | starts empty, admits each missed expert until the layer is full, never evicts |
-| adaptive | starts from the static profile and follows Strata's `adapt()` (research-strata `src/program/generate.cpp:4794-4860`): usage counts per routed (token, expert); every 4 rounds candidates with usage >= 2.0 are paired with the coldest residents while gain >= 1.5; the 96 largest gains across all layers swap; the victim is evicted at once, the incoming expert lands 1 round later; usage times 0.7 after each adaptation; an adaptation is skipped (no decay) while swaps are in flight |
+| adaptive | starts from the static profile and follows Strata's `adapt()` (from the Strata source, research-strata `src/program/generate.cpp:4794-4860`, not part of this tree): usage counts per routed (token, expert); every 4 rounds candidates with usage >= 2.0 are paired with the coldest residents while gain >= 1.5; the 96 largest gains across all layers swap; the victim is evicted at once, the incoming expert lands 1 round later; usage times 0.7 after each adaptation; an adaptation is skipped (no decay) while swaps are in flight |
 
 A round is one step of the trace: one decoded token, or one prefill ubatch. Each test
 trace starts with fresh caches. "Leave-one-set-out" (`--loo-by set`) trains on the other
@@ -168,8 +176,8 @@ one fold; chat and code have 1024 test tokens, long 512):
 | static | 0.17 / 0.22 / 0.32 | 0.28 / 0.35 / 0.48 | 0.49 / 0.59 / 0.71 |
 | oracle | 0.55 / 0.54 / 0.60 | 0.73 / 0.70 / 0.76 | 0.93 / 0.89 / 0.93 |
 
-The long set behaves like chat and code: its adaptive hit rate (0.59, 0.71, 0.86) is inside
-the spread of the other two. Its static profile does better (0.32, 0.48, 0.71 against
+The long set behaves like chat and code: its adaptive hit rate (0.59, 0.71, 0.86) lies
+between theirs at 4 and 7 GiB and is level with chat's at 14 GiB (0.857 against 0.855). Its static profile does better (0.32, 0.48, 0.71 against
 0.17 to 0.22, 0.28 to 0.35, 0.49 to 0.59), plausibly because the other sets resemble its
 text more than they resemble each other; the data do not test that.
 
@@ -179,10 +187,13 @@ is 0.44; the in-sample profile of the pooled set is 0.72 and of the single trace
 (`summary-curves.csv`, `loo_by=id`).
 
 **Adaptive against the oracle, stated exactly.** The held-out-set oracle is fitted to
-the test tokens, and adaptive is ahead of it at small budgets: temporal locality (the
-experts used in the last few tokens predict the next ones) is worth more than a perfect
-long-run frequency profile when only 5 to 10 % of the experts fit. It is not ahead of a
-profile fitted to one trace: leave-one-trace-out IQ3_XXS gives adaptive 0.45 / 0.60 /
+the test tokens, and adaptive is ahead of it at small budgets. A hypothesis for why:
+temporal locality (the experts used in the last few tokens predict the next ones) is
+worth more than a long-run frequency profile pooled over several prompts when only 5 to
+10 % of the experts fit. The leave-one-trace-out oracle below weakens it: a profile of
+the single trace, which has that trace's own locality built in, beats adaptive, so the
+pooled profile may simply be a worse fit than a per-prompt one. This was not tested
+further. Adaptive is not ahead of a profile fitted to one trace: leave-one-trace-out IQ3_XXS gives adaptive 0.45 / 0.60 /
 0.72 against that oracle's 0.49 / 0.67 / 0.82 at 2 / 4 / 7 GiB. The per-trace oracle
 overfits 256 tokens and cannot be shipped; it bounds what a static profile could do with
 perfect knowledge of the next prompt.
@@ -222,7 +233,7 @@ the cause:
 | usage counters at or above `min_count` 2.0 at the first adaptation (round 3) | 18567 of 24576 (76 %); 22048 (90 %) at the fifth |
 | candidate swaps that pass the margin at the first adaptation | 3401 |
 | swaps taken (cap 96) | 96 per adaptation: 480 in the 5 prefill adaptations, 10.8 % of the 4441 slots |
-| adaptations taken at the cap | all until round 87; then fewer than 96 (candidates exhausted) |
+| adaptations taken at the cap | all of them up to round 83; round 87 is the first shortfall (91); 96 recurs later, in 30 of the 69 adaptations (all 5 in prefill, 25 of 64 in decode) |
 
 **Why a 512-token ubatch fools the swap rule.** The constants (`min_count` 2.0, margin
 1.5, decay 0.7, 96 swaps, every 4 rounds) were chosen for rounds that add 10 counts per
@@ -231,13 +242,14 @@ layer. A prefill round adds 5120. Three consequences, each in the table:
 1. The two gates stop discriminating. After four ubatches three quarters of all counters
    already clear `min_count`, and thousands of candidates clear the margin, so the rule
    reduces to "swap the 96 largest count differences", chosen from the routing of the
-   last four chunks of prompt text.
+   prompt so far (the counters decay by 0.7 per adaptation, so recent chunks weigh most).
 2. The cadence is per round, not per token. Four prefill rounds are 2048 tokens; the cap
    of 96 swaps per adaptation moves at most 2.2 % of the slots every 2048 tokens, so the
    cache cannot follow a 10K-token prompt (5 adaptations, 480 swaps).
 3. A prefill round touches 62 to 78 % of a layer's experts, so a resident subset of 18 %
    serves only the popular part of each round: on the long set the in-sample oracle
-   reaches 0.60 and first-touch 0.45 over all rounds (`curves-all-by-set.csv`, 7 GiB).
+   reaches 0.60 and first-touch 0.46 over all rounds (`curves-all-by-set.csv`, 7 GiB; the
+   0.45 in the table below is long-0's prefill alone).
 
 Per policy on long-0 (`long-0-blocks.csv`, token-weighted within the block):
 
@@ -258,20 +270,81 @@ Per policy on long-0 (`long-0-blocks.csv`, token-weighted within the block):
   land in the middle of a ubatch. The last column admits at the end of the round
   instead: 0.421 against 0.451 in prefill. First-touch is ahead of adaptive in prefill
   either way (the column is identical in decode, where a round is one token).
-- **The decode that follows is not harmed.** The decode part of this trace scores 0.702
-  for adaptive, 0.446 static, 0.399 first-touch, after the prefill's 480 swaps. (The
-  decode-only runs give 0.714 for the long set; different training and two traces, so
-  only roughly comparable.) The collapse in the aggregate is the yardstick: a prefill
-  number.
-- Adaptive keeps improving through the 256 decode rounds (0.596 in the first 32 rounds, 0.71 to
-  0.77 in each 32-round block of the last 128). A 256-token trace therefore understates the steady state; how
-  much is not measured.
+- **The decode that follows is not visibly harmed.** The decode part of this trace scores
+  0.702 for adaptive, 0.446 static, 0.399 first-touch, after the prefill's 480 swaps. The
+  control is the same trace, same training, decode rounds only, no prefill in the run:
+  adaptive 0.705 (last row of `long-0-blocks.csv`; mean of the four quarters in
+  `decode-quarters.csv`). So the prefill swaps cost 0.003 here. First-touch loses a lot
+  from being filled by the prompt (0.399 after prefill; its decode-only quarters average
+  0.562 on long-0), which is the same effect seen from the other policy.
+- **Adaptive's rise over the 256 decode rounds is real on the short traces and is
+  confounded on the long ones.** Decode-only hit rate per 64-round quarter at 7 GiB
+  (`decode-quarters.csv`, leave-one-set-out, IQ3_XXS):
 
-**Recommendation.** Freeze swaps during prefill and score decode. Whether usage counts
-should be seeded from the prompt (without swapping) is untested: the simulator has no
-such mode. Under "placement decides the executor" the experts a prefill ubatch touches
-mostly will not be resident, so prefill is a separate design question, not something
-this cache answers.
+  | held out | policy | Q1 | Q2 | Q3 | Q4 |
+  |---|---|---:|---:|---:|---:|
+  | chat | adaptive | 0.568 | 0.750 | 0.804 | 0.813 |
+  | chat | first-touch | 0.631 | 0.606 | 0.600 | 0.585 |
+  | chat | static | 0.363 | 0.246 | 0.262 | 0.260 |
+  | code | adaptive | 0.577 | 0.704 | 0.710 | 0.723 |
+  | code | first-touch | 0.623 | 0.630 | 0.632 | 0.549 |
+  | code | static | 0.397 | 0.386 | 0.345 | 0.279 |
+  | long | adaptive | 0.654 | 0.729 | 0.750 | 0.724 |
+  | long | first-touch | 0.695 | 0.608 | 0.505 | 0.492 |
+  | long | static | 0.568 | 0.495 | 0.424 | 0.425 |
+
+  On chat and code adaptive keeps climbing through the quarters, so a 256-token trace
+  understates the steady state for such sessions (by how much is not measured). On the
+  long set it gains in the second quarter and is flat after (long-0 0.652 / 0.714 /
+  0.704 / 0.751; long-1 0.656 / 0.744 / 0.797 / 0.697). The rise through the 32-round
+  blocks of the phase=all long-0 table above (0.596, then 0.71 to 0.77) is not evidence
+  of continued learning: its counters start from the prefill, which decays over about 64
+  rounds (0.7 per 4 rounds), and the decode-only run of the same trace is flat after the
+  first quarter.
+
+**Arms for what the cache does in prefill.** The simulator has `--prefill-swaps
+on|off|seed` (`prefill-arms.py`, `prefill-arms.csv`, `summary-prefill-arms.csv`): `on`
+is the default; `off` scores prefill rounds but neither counts nor swaps in them (the
+cache stays at the static profile until decode, and the cadence counts only the
+remaining rounds); `seed` counts usage in prefill and decays it, without swapping.
+Long set held out, IQ3_XXS, prefill hit rate / decode hit rate, token-weighted. The
+decode share is the full run's pairs minus a run cut to the prefill rounds; the two
+shares recombine to the all-rounds rate in the file.
+
+| arm | 4 GiB | 7 GiB | 14 GiB |
+|---|---|---|---|
+| adaptive, swaps on | 0.212 / 0.550 | 0.293 / 0.703 | 0.490 / 0.868 |
+| adaptive, frozen (`off`) | 0.137 / 0.588 | 0.220 / 0.716 | 0.425 / 0.855 |
+| adaptive, `seed` | 0.137 / 0.552 | 0.220 / 0.703 | 0.425 / 0.868 |
+| static (reference) | 0.137 / 0.310 | 0.220 / 0.466 | 0.425 / 0.697 |
+| first-touch (reference) | 0.250 / 0.191 | 0.463 / 0.358 | 0.730 / 0.616 |
+
+Q8_0, same cut: on 0.132 / 0.293, 0.161 / 0.398, 0.227 / 0.587; frozen 0.054 / 0.337,
+0.083 / 0.451, 0.152 / 0.620 (4, 7, 14 GiB).
+
+What the arms say, and do not say:
+
+- A frozen cache in prefill scores exactly the static profile there (the `off` row
+  equals the static row), 0.07 below swapping at 7 GiB. Freezing is not obviously better
+  in prefill, and it is below first-touch (0.463 at 7 GiB) in either case.
+- Decode after a frozen prefill is slightly better than after a swapping one at 4 GiB
+  (0.588 against 0.550) and 7 GiB (0.716 against 0.703; Q8_0 0.451 against 0.398), and
+  slightly worse at 14 GiB (0.855 against 0.868). The per-trace values at 7 GiB are
+  long-0 0.708 against 0.702 and long-1 0.725 against 0.705.
+- `seed` decodes like `on` (0.703 and 0.703 at 7 GiB; 0.868 against 0.868 at 14 GiB):
+  the prompt's counts are what matter, not its swaps, and carrying them costs nothing
+  measurable here. At 4 GiB it is 0.552 against 0.550.
+- First-touch's decode share (0.358 at 7 GiB) is far below its decode-only rate on this
+  set (0.575, the mean of the quarters above): the prompt fills the cache and it never
+  evicts.
+
+**Recommendation.** Score decode and prefill separately; the aggregate over all rounds
+is a prefill number and hides the decode result. The prefill policy is a different,
+open question, and these arms do not decide it: swapping gains 0.07 in prefill, and
+freezing gains 0.01 to 0.04 in decode at small budgets, on one held-out set of two traces.
+Under "placement decides the executor" the experts a prefill ubatch touches mostly will
+not be resident, so prefill is a separate design question, not something this cache
+answers.
 
 ## 5. Parameter sensitivity
 
@@ -293,8 +366,11 @@ hit rate at IQ3_XXS 4 / 7 / 14 GiB and its change from the default row
 | swap-n | 384 | 0.604 / 0.720 / 0.848 | +0.014 / +0.012 / +0.003 |
 | land-delay | 0 | 0.598 / 0.714 / 0.849 | +0.009 / +0.007 / +0.004 |
 | land-delay | 2 | 0.583 / 0.703 / 0.842 | -0.007 / -0.005 / -0.003 |
+| land-delay | 3 | 0.576 / 0.698 / 0.839 | -0.013 / -0.010 / -0.006 |
 | land-delay | 4 | 0.546 / 0.663 / 0.827 | -0.043 / -0.045 / -0.018 |
 | land-delay | 8 | 0.504 / 0.619 / 0.799 | -0.085 / -0.089 / -0.046 |
+| land-delay 4, skip rule disabled | 4 | 0.571 / 0.694 / 0.836 | -0.018 / -0.014 / -0.009 |
+| land-delay 8, skip rule disabled | 8 | 0.551 / 0.678 / 0.826 | -0.039 / -0.029 / -0.019 |
 | decay | 0.0 | 0.469 / 0.594 / 0.785 | -0.120 / -0.114 / -0.060 |
 | decay | 0.5 | 0.583 / 0.699 / 0.838 | -0.006 / -0.009 / -0.007 |
 | decay | 0.85 | 0.597 / 0.718 / 0.855 | +0.007 / +0.011 / +0.010 |
@@ -315,24 +391,33 @@ Reading it:
   of 4 or more, `min_count` 4, margin 3, and forgetting everything (decay 0). Margin
   between 1.0 and 2.0 does nothing.
 - **Small gains:** decay 0.85 to 0.95, `min_count` 1, a cap of 192 or more, and a land
-  delay of 0. Adapting every 1 or 2 rounds is neutral for IQ3_XXS (better at 4 GiB, worse at 14) and
-  slightly positive for Q8_0 (+0.003 to +0.008).
+  delay of 0. Adapting every 1 or 2 rounds is slightly negative for IQ3_XXS at 7 and 14 GiB (-0.006,
+  -0.012) and slightly positive at 4 GiB (+0.005); for Q8_0 it is slightly positive
+  (+0.003 to +0.008).
 - **The cap binds at small budgets.** The most the defaults can swap is 96 / 4 = 24 per
   token; the measured rate is 21.5 per token at 4 GiB and 10.4 at 14 GiB
   (`swap-traffic.csv`). That is why raising the cap helps most at 4 GiB, and why a cap of
   192 or 384 costs more traffic for little: at 4 GiB 30.0 swaps per token against 21.5
   (+40 %) for +0.014; at 7 GiB 20.6 against 17.6 (+17 %) for +0.012.
-- **The land delay cliff is the in-flight skip rule, not slow landing.** The rule skips an
+- **The land delay cliff in swap count is the in-flight skip rule (tested by disabling
+  it); the hit-rate loss is partly the rule and partly late landing.** The rule skips an
   adaptation while swaps are pending. With `every` 4, a swap decided at round r lands at
-  round r + 1 + land; for land 3 or less it has landed before the next window (r + 4), for
-  land 4 it has not. The swaps per token fall from 21.5 to 11.9 at 4 GiB when land goes
-  from 1 to 4 (from 21.5 to 8.3 at land 8): half or more of the windows are skipped. A
-  land delay of 2 costs only 0.003 to 0.007. This is the key engineering number: a
-  batch of swaps must land within `every - 1` = 3 token periods. A full batch of 96
+  round r + 1 + land; for land 3 or less it has landed before the next window (r + 4),
+  for land 4 it has not. Land 3 takes the same number of swaps as the default (21.5 per
+  token at 4 GiB, 17.6 at 7, 10.4 at 14) and costs 0.013 at 4 GiB; the cliff is at land
+  4, where swaps fall from 21.5 to 11.9 per token at 4 GiB (21.5 to 8.3 at land 8). With
+  the rule disabled (`--no-skip-pending`; an expert already in flight is never swapped
+  in twice) the count stays at 21.5 / 17.6 / 10.4 at land 4 and 8, and the hit rate
+  falls less (rows above). So at land 4 the rule itself costs 0.025 / 0.031 / 0.009 at
+  4 / 7 / 14 GiB, and the remainder of the loss against the default (0.018 / 0.014 /
+  0.009) is placement that is stale by the landing time. A land delay of 2 costs only
+  0.003 to 0.007. This is the key engineering number: a batch of swaps must land within
+  `every - 1` = 3 token periods to keep the rule idle. A full batch of 96
   experts is 160 MiB (IQ3_XXS mean size) or 478 MiB (Q8_0); landing within 3 tokens at
   40 tokens/s (75 ms) needs about 2.2 GB/s (IQ3_XXS) or 6.7 GB/s (Q8_0) of copy rate from
   host memory to the device. The host-to-device rate of this machine's cards was not
-  measured here.
+  measured here. The skip rule is modelled as read from Strata's `adapt()`; whether the
+  production rule has this exact form is not tested here.
 
 ## 6. Swap traffic
 
@@ -373,18 +458,28 @@ has over static per swap: 7.0 to 16.4 for IQ3_XXS, 6.6 to 10.5 for Q8_0.
 
 ## 7. What it could mean for decode speed (estimate)
 
-Source: `cpu-bound-estimate.csv`. **This is an upper bound on the rate the CPU expert
-work alone allows, computed from the simulated bytes and a measured bandwidth; it is
-not a decode rate.** It ignores attention, the dense layers, GPU time for the resident
-experts, dispatch overhead, and the swap copies' share of memory bandwidth.
+Source: `cpu-bound-estimate.csv`. **This is the rate the CPU's expert reads alone would
+allow at a given bandwidth, computed from the simulated bytes; it is not a decode rate
+and not a bound.** It ignores attention, the dense layers, GPU time for the resident
+experts, dispatch overhead and the swap copies' share of memory bandwidth, and a kernel
+that beat the median bandwidth would exceed it.
 
-CPU expert throughput comes from [`sycl-cpu-expert-bandwidth.md`](sycl-cpu-expert-bandwidth.md):
-the production kernel with pinned arena workers at 22 threads reaches 14.4 to 46.7 GB/s
-(median over 13 type and shape configs). The two points nearest this model are Qwen
-IQ3_XXS gate, 21 GB/s, and Qwen Q8_0 gate, 30 GB/s (down: 47). The bound is
+CPU expert throughput comes from [`sycl-cpu-expert-bandwidth.md`](sycl-cpu-expert-bandwidth.md)
+(medians of bursts, under the host's ambient load). The production kernel as built
+(unpinned arena workers) reaches 16 to 43 GB/s at 22 threads over 13 type and shape
+configs; the same code with pinned workers, `prod+pin`, is a variant of production and
+reaches 14.4 to 46.7 GB/s. The columns below use the `prod+pin` figures: its 14.4 (taken
+as 14) and 46.7 (47) bound the range, and the two configs nearest this model are Qwen
+IQ3_XXS gate, 21 GB/s, and Qwen Q8_0 gate, 30 GB/s (Qwen Q8_0 down, 47 GB/s, is the
+fastest of the 13). **The IQ3_XXS figure is a proxy:** the measured config is a uniform
+IQ3_XXS gate matrix, but this model's IQ3_XXS file is a mixed allocation in which only 6
+of 48 layers carry IQ3_XXS gate and up tensors (the rest use IQ2_XXS, IQ2_XS, IQ2_S or
+IQ3_S, with Q2_0 down tensors in 30 layers and IQ4_NL in 18; `expert-sizes.csv`,
+`tensor_types`), and Q2_0 measured 16 to 22 GB/s at 22 threads, so the real rate may be
+lower. The rate is
 `bandwidth / (cpu_gib_per_token x 1.0737)`.
 
-| format, budget | policy | CPU GB/token | bound at 14 GB/s | at the format's point (21 / 30) | at 47 GB/s |
+| format, budget | policy | CPU GB/token | tokens/s at 14 GB/s | at the format's point (21 / 30) | at 47 GB/s |
 |---|---|---:|---:|---:|---:|
 | IQ3_XXS, no cache | none | 0.838 | 16.7 | 25.1 | 56.1 |
 | IQ3_XXS 4 GiB | adaptive | 0.350 | 40.0 | 60.0 | 134.4 |
@@ -401,7 +496,7 @@ IQ3_XXS gate, 21 GB/s, and Qwen Q8_0 gate, 30 GB/s (down: 47). The bound is
 | Q8_0 14 GiB | adaptive | 0.955 | 14.7 | 31.4 | 49.2 |
 
 (The IQ3_XXS 21 GB/s column is `tps_bound_at_21_gbps` in the CSV; the Q8_0 column is
-`tps_bound_at_30_gbps`.) Reading: at the bandwidth the CPU kernel measures, an adaptive
+`tps_bound_at_30_gbps`; the column names say `bound`, the text says rate.) Reading: at the median bandwidth the CPU kernel measures, an adaptive
 7 GiB cache lifts the CPU-limited ceiling from 25 to 84 tokens/s for IQ3_XXS and from
 12 to 23 for Q8_0; against a static profile of the same size the ceilings are 2.2x and
 1.6x higher. The CPU's share of a token overlaps the GPU's, so the real gain is smaller
@@ -409,45 +504,52 @@ than these ratios wherever the GPU part is the longer path.
 
 ## 8. Rules context and what to build
 
-**An adaptive cache is re-placement over time, not per-dispatch streaming.** The memory
-design's "Placement decides the executor" (`docs/backend/sycl-memory-design.md`, line
-52, and CLAUDE.md, Architecture) fixes the direction: the planner decides where data
-lives; inference executes each op where its data already is: VRAM-resident on that
-device, host-pinned on the CPU. It forbids GPU zero-copy reads of host memory and weight
-streaming (copying host-resident weights to device scratch per dispatch). What the
-simulator models is neither: a swap is a placement change between tokens, and **the
-executor follows the current placement**. The CPU runs an expert until its copy has
-landed; the evicted slot's victim is gone at once. That is exactly what `land-delay`
-and the in-flight skip rule do, and is why the land delay (section 5) is the engineering
-number that decides whether the cache works.
+**What the simulator models.** A cache that copies host-resident experts into VRAM over
+time, driven by recent routing, with the executor following the current placement: the
+CPU runs an expert until its copy has landed, and the evicted slot's victim is gone at
+once. That is what `land-delay` and the in-flight skip rule do, and it is why the land
+delay (section 5) decides whether the cache works. It is not a GPU zero-copy read of host
+memory, and it does not copy a weight per dispatch.
 
-**This needs an explicit owner decision before anything is built.** The ruling's text
-says placement "is made once, in the planning pass" and that "the dispatcher never
-re-litigates it at op time" (`sycl-memory-design.md:62-65`). An adaptive cache does not
-re-litigate at op time, but it does re-plan while the model runs. The ruling does not
-say whether that is allowed, and this document does not decide it. The "no weight
-streaming" clause also says that if a VRAM-starved configuration is too slow on the CPU,
-"the fix is placement (budget, eviction priority)". An adaptive swap rule is a placement
-policy, which is the shape the clause points at; whether it is within the ruling is the
-owner's call.
+**Whether the placement ruling allows it is an open question for the owner, and this
+document does not answer it.** The memory design's "Placement decides the executor"
+(`docs/backend/sycl-memory-design.md`, line 52, and CLAUDE.md, Architecture) says the
+planning pass decides where data lives and inference executes each op where its data
+already is. It says placement "is made once, in the planning pass" and that "the
+dispatcher never re-litigates it at op time" (`sycl-memory-design.md:62-65`). It forbids
+GPU zero-copy reads of host memory and "weight streaming" (copying host-resident weights
+into device scratch per dispatch). Two readings are open:
 
-If the answer is yes, what the data support:
+- *Allowed.* A swap is a placement change made between dispatches by the planner; every
+  dispatch still runs where its data is, and no weight is copied per dispatch or into
+  scratch. The "streaming" clause is about per-dispatch copies.
+- *Not allowed.* Placement is decided once, and a cache that re-places experts while the
+  model runs is outside the ruling, however it is dispatched. The clause that says a
+  VRAM-starved configuration that is too slow on the CPU is fixed by "placement (budget,
+  eviction priority)" would then mean changes to the plan, not a run-time policy.
+
+The data in this document are what the owner would weigh against either reading.
+
+If run-time re-placement is allowed, what the data support:
 
 1. **The gain is largest when the cache is small.** Against first-touch, CPU bytes per
    token fall 20 to 34 % for IQ3_XXS at 2 to 10 GiB (5 to 26 % of the experts) and 22 to
    35 % for Q8_0 at every budget measured (2 to 20 % of the experts). For IQ3_XXS the gain
-   dips to 7 to 9 % at 14 to 18 GiB and returns to 33 % at 24 GiB, where first-touch's
-   no-eviction plateau shows.
+   dips to 7 to 9 % at 14 to 18 GiB and returns to 33 % at 24 GiB (first-touch plateaus
+   there; the cause is not tested).
 2. **Where the cache is large (IQ3_XXS 14 to 18 GiB, 36 to 47 % of the experts), first-touch
    is the cheaper choice.** It is within 1.1 and 0.9 points of adaptive there and needs no
    swap traffic, no counters and no copy engine. At 24 GiB adaptive is 3.6 points ahead
-   (33 % fewer CPU bytes), because first-touch never evicts. That also means it does not
-   follow a change of topic; this simulation runs each trace alone and does not test a
+   (33 % fewer CPU bytes); a hypothesis is that first-touch never evicts, which was not
+   tested. It also does not follow a change of topic; this simulation runs each trace alone and does not test a
    mid-session shift.
-3. **Do not ship a static profile.** It is below first-touch at every budget measured.
+3. **Do not ship a static profile.** It is below first-touch at every IQ3_XXS budget and
+   from 7 GiB up for Q8_0; at Q8_0's 2 and 4 GiB both are near zero.
 4. **Use Strata's parameters; do not tune them.** The one thing to engineer to is the
    land delay of at most 3 token periods, which sets a minimum copy rate (section 5).
-5. **Freeze swaps during prefill** (section 4).
+5. **Score prefill apart from decode; its policy is open** (section 4). Freezing swaps,
+   seeding counters and swapping all decode within 0.04 of each other for IQ3_XXS at 4 to 14 GiB
+   (0.05 for Q8_0 at 7 GiB).
 
 What would change the answer: a Q8_0 capture (the Q8_0 curves are a proxy), a capture on
 the SYCL backend, longer generations, a trace with a topic change inside one session,
@@ -465,15 +567,17 @@ of these was done here.
   routing stream cut into larger experts.
 - **The simulator models hit rate, not time.** There is no PCIe, no copy latency beyond
   an integer land delay in tokens, no overlap of CPU and GPU, no contention between swap
-  copies and the CPU's expert reads. Section 7 is an upper bound, labelled as such.
+  copies and the CPU's expert reads. Section 7 is a rate at a median bandwidth, labelled
+  as an estimate.
 - **A round is one decoded token, not a speculative-decoding window.** Strata's windows
   union several tokens' experts; the cadence "every 4 rounds" is in tokens here. A
   single sequence is traced; concurrent slots are not.
-- **Traces are 256 decode tokens**, each started from a fresh cache. Adaptive is still
-  improving at the end of the trace (section 4), so its numbers are conservative for
-  longer generations by an amount not measured. First-touch needs no warm-up beyond the
-  fill.
-- **Token-weighted means mix sets of different sizes** (1024, 1024, 512 test tokens).
+- **Traces are 256 decode tokens**, each started from a fresh cache. On chat and code
+  adaptive is still improving at the end of the trace (section 4, quarters), so its
+  numbers are conservative for such sessions by an amount not measured; on the long
+  set it is flat after the first quarter. First-touch needs no warm-up beyond the fill.
+- **Token-weighted means mix sets of different sizes** (decode: 1024, 1024, 512 test
+  tokens for chat, code, long; `phase=all`: 1199, 1336, 18948).
   The per-set table in section 3 shows the spread; no set-balanced mean is used.
 - **The two oracles differ.** "Oracle" in leave-one-set-out is the held-out set pooled;
   in leave-one-trace-out it is the single trace. Statements about adaptive beating the
@@ -497,15 +601,20 @@ All in [`moe-expert-cache-data/`](moe-expert-cache-data/).
 | file | contents |
 |---|---|
 | `curves-{decode,all}-by-{set,id}.csv` | raw simulator output: 7 budgets x 2 formats x 4 policies x each held-out group (`run-curves.sh`) |
-| `ablations/*.csv` | the same for one parameter varied, decode, leave-one-set-out, budgets 4, 7, 14 GiB (`run-ablations.sh`) |
+| `curves-all-by-set-prefill-{off,seed}.csv` | the `phase=all` leave-one-set-out run with `--prefill-swaps off` and `seed` (`run-curves.sh`) |
+| `ablations/*.csv` | the same for one parameter varied, decode, leave-one-set-out, budgets 4, 7, 14 GiB, including land 3 and the skip rule disabled (`landnoskip*`) (`run-ablations.sh`) |
 | `summary-curves.csv` | token-weighted hit rate, CPU GiB per token, swaps per token, resident fraction, min and max over groups |
 | `summary-ablations.csv` | section 5 |
 | `swap-traffic.csv` | section 6 |
 | `cpu-bound-estimate.csv` | section 7 |
-| `long-0-rounds.csv`, `long-0-windows.csv`, `long-0-blocks.csv` | section 4 (`prefill-rounds.py`) |
+| `long-0-rounds.csv`, `long-0-windows.csv`, `long-0-blocks.csv` | section 4 (`prefill-rounds.py`; the decode-only control row comes from `decode-quarters.csv`) |
+| `decode-quarters.csv` | section 4: decode hit rate per 64-round quarter at 7 GiB, per set and per long trace (`decode-quarters.py`) |
+| `prefill-arms.csv`, `summary-prefill-arms.csv` | section 4: prefill and decode hit rate per prefill arm (`prefill-arms.py`; summary from `analyze.py`) |
 | `expert-sizes.csv`, `traces-manifest.csv` | section 2 (`gen-sizes-and-manifest.py`) |
 | `analyze.py` | derives every `summary-*`, `swap-traffic`, `cpu-bound-estimate` and `long-0-blocks` file from the raw CSVs |
 
-The scripts name the session's scratchpad paths for the traces and the GGUFs; the
+`run-curves.sh OUT_DIR TRACE...` and `run-ablations.sh OUT_DIR TRACE...` take the output
+directory and the traces as arguments (`SIM`, `PYTHON`, `GGUF_IQ3` and `GGUF_Q8` override
+the simulator, interpreter and GGUF paths) and write the file names above. The
 simulator needs `gguf-py` and numpy, so run it with `PYTHONPATH=gguf-py` and an
 interpreter that has numpy.
