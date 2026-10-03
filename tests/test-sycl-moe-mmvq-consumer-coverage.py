@@ -97,6 +97,41 @@ def consumer_switches(text):
     return out
 
 
+# Capability types served by a dedicated launcher rather than the generic AoS
+# submit helpers. Q4_0/Q8_0 have mul_mat_vec_q{4_0,8_0}_q8_1_id_sycl; MXFP4 has its
+# own batched executors.
+DEDICATED_LAUNCHER_TYPES = {"GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0", "GGML_TYPE_MXFP4"}
+
+
+def submit_helper_types(text):
+    """Types the generic AoS-id submit helpers (mmvq_submit_q1_nvfp4_aos_id,
+    mmvq_submit_quant_aos_id) can launch: the case labels of their definitions.
+
+    Consumer switches above only prove the consumer REACHES a launcher. A type
+    advertised by capability whose helper has no case returns false there and
+    the consumer aborts (llama.cpp-s36q), which is the same gap from the other
+    side.
+    """
+    types = set()
+    for name in ("mmvq_submit_q1_nvfp4_aos_id", "mmvq_submit_quant_aos_id"):
+        for m in re.finditer(r"\bbool\s+" + name + r"\s*\(", text):
+            j = m.end()
+            while j < len(text) and text[j] not in "{;":
+                j += 1
+            if j >= len(text) or text[j] != "{":
+                continue
+            depth = 0
+            for k in range(j, len(text)):
+                if text[k] == "{":
+                    depth += 1
+                elif text[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        types |= set(re.findall(r"case\s+(GGML_TYPE_[A-Z0-9_]+)\s*:", text[j:k]))
+                        break
+    return types
+
+
 def main():
     failures = []
 
@@ -139,6 +174,18 @@ def main():
                 f'exemption premise broken for "{msg}": the structural guard it '
                 f"depends on is gone. Reason on file was: {entry['reason']} "
                 f"Re-verify reachability before restoring the exemption.")
+
+    helper_types = submit_helper_types(mmvq_src)
+    if not helper_types:
+        print("FAIL: could not find the generic AoS-id submit helpers in mmvq.cpp; "
+              "the launcher check below would pass vacuously.")
+        return 1
+    unlaunchable = sorted(cap - DEDICATED_LAUNCHER_TYPES - helper_types)
+    if unlaunchable:
+        failures.append(
+            f"{', '.join(unlaunchable)} admitted by moe_mmvq_capability_supports_layout "
+            f"but no generic AoS-id submit helper has a case for it, so the consumer's "
+            f"submit call returns false and aborts.")
 
     for msg, types in switches:
         if msg in EXEMPT:

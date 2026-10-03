@@ -161,6 +161,10 @@ int main() {
         { GGML_TYPE_Q5_1,  GGML_LAYOUT_AOS, "q5_1/AOS"  },
         { GGML_TYPE_Q2_K,  GGML_LAYOUT_AOS, "q2_K/AOS"  },
         { GGML_TYPE_Q3_K,  GGML_LAYOUT_AOS, "q3_K/AOS"  },
+        // s36q: the first iq* type. IQ4_NL is Q4_0-shaped (32-wide blocks, qi=4, vdr=2) and its dense MMVQ
+        // kernel is the generic mul_mat_vec_q<> body with vec_dot_iq4_nl_q8_1, so the generic _id path
+        // takes it with that vec_dot and no new kernel body.
+        { GGML_TYPE_IQ4_NL, GGML_LAYOUT_AOS, "iq4_nl/AOS" },
     };
 
     for (const auto & req : required) {
@@ -184,6 +188,7 @@ int main() {
     // either must move this list in the same change, which is the point.
     const ggml_type uncovered[] = { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_S,
                                     GGML_TYPE_F16,    GGML_TYPE_F32,     GGML_TYPE_BF16 };
+    // (IQ4_NL left this list with s36q; the rest of the iq* family follows phase by phase.)
     for (const ggml_type type : uncovered) {
         for (const ggml_layout_mode layout : all_layouts()) {
             if (moe_mmvq_capability_supports_layout(type, layout)) {
@@ -210,14 +215,14 @@ int main() {
     const ggml_type admission_expected[] = {
         GGML_TYPE_Q1_0, GGML_TYPE_NVFP4, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_Q4_1,
         GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,  GGML_TYPE_Q2_K,
-        GGML_TYPE_Q3_K,
+        GGML_TYPE_Q3_K, GGML_TYPE_IQ4_NL,
     };
     //    The exact set that regressed: dense MUL_MAT kernels exist, _id does not.
     //    BF16/q2_0/tq2_0 are absent on purpose -- 186348705 already refuses them
     //    by leaving them out of the dense allowlist, so they never reached here.
     const ggml_type admission_refused[] = {
         GGML_TYPE_F32,     GGML_TYPE_F16,    GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,  GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
-        GGML_TYPE_IQ2_S,   GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
+        GGML_TYPE_IQ2_S,   GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
     };
 
     for (const ggml_type type : admission_expected) {
