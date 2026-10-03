@@ -1985,6 +1985,21 @@ set_tests_properties(sycl-kv-demand-idx PROPERTIES
     TIMEOUT 60
 )
 
+# llama.cpp-5efe C4 (part b): a stream_dma refusal of a file-mapped source is terminal in get_rows' slice loop (the real
+# loop over a fake stream_dma) and the registry predicate stream_dma reads.  getrows-dma-retry.hpp and alloc-registry.hpp
+# are header-only and SYCL-free, so this target builds without -fsycl or ggml-base, like test-kv-runtime-demotion below.
+add_executable(test-sycl-getrows-refusal-terminal
+    tests/test-sycl-getrows-refusal-terminal.cpp
+)
+target_include_directories(test-sycl-getrows-refusal-terminal PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME sycl-getrows-refusal-terminal COMMAND test-sycl-getrows-refusal-terminal)
+set_tests_properties(sycl-getrows-refusal-terminal PROPERTIES
+    LABELS "sycl;host;getrows;hostonly"
+    TIMEOUT 60
+)
+
 # Runtime KV demotion decision (llama.cpp-uize/llama.cpp-3px1).  Deliberately a
 # pure host-linkable TU with no include of unified-cache.hpp (the c-8lff siting
 # lesson: an enum placed in unified-cache.hpp "would not have linked" for a
