@@ -297,7 +297,9 @@ def test_the_owner_entry_refuses_the_combination_and_keeps_the_class_exact():
     body = function_body(
         sources_text("unified-cache.cpp"), r"static\s+allocation_result\s+unified_allocate_owner_impl\s*\("
     )
-    assert re.search(r"must_host_cpu\s*&&\s*\(", body), "must_host_cpu is not refused beside a routing constraint"
+    assert re.search(r"must_host_cpu\s*&&\s*\(\s*[\w.]*must_device\s*\|\|\s*[\w.]*must_host_pinned", body), (
+        "must_host_cpu is not refused beside a routing constraint"
+    )
     suballoc = re.search(r"const\s+bool\s+cache_suballocation\s*=(.*?);", body, flags=re.DOTALL)
     assert suballoc and re.search(r"!\s*req\.intent\.constraints\.must_host_cpu", suballoc.group(1)), (
         "a role or constraint can still make a HOST_CPU owner a cache suballocation"
@@ -323,8 +325,8 @@ def test_the_registry_sums_report_host_cpu_apart_from_the_host_sum():
     )
     host = re.search(r"tier\s*==\s*alloc_tier\s*::\s*HOST_PINNED[^{]*\{\s*sums\.host\s*\+=", body)
     assert host and "HOST_CPU" not in host.group(0), "HOST_CPU is summed into the host-pinned ledger comparison"
-    assert re.search(r"alloc_tier\s*::\s*HOST_CPU\s*\)\s*\{\s*sums\.host_cpu\s*\+=\s*h\.size", body), (
-        "the registry does not sum HOST_CPU bytes on its own"
+    assert re.search(r"alloc_tier\s*::\s*HOST_CPU\s*\)\s*\{\s*sums\.host_cpu\s*\+=\s*h\.size\s*;\s*\}", body), (
+        "the registry does not sum HOST_CPU bytes on their own"
     )
 
 

@@ -15661,11 +15661,17 @@ alloc_tier unified_select_tier(const alloc_request & req) {
     if (req.intent.constraints.must_host_pinned) {
         return alloc_tier::HOST_PINNED;
     }
+    // Requested only explicitly. Nothing below falls into HOST_CPU: the size fallback stays HOST_PINNED.
+    if (req.intent.constraints.must_host_cpu) {
+        return alloc_tier::HOST_CPU;
+    }
 
     if (req.intent.constraints.prefer_same_tier_as_cohort && req.intent.cohort_id && req.intent.cohort_id[0] != '\0') {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         auto                        it = g_runtime_cohort_tier.find(req.intent.cohort_id);
-        if (it != g_runtime_cohort_tier.end()) {
+        // A cohort cannot inherit HOST_CPU: only an explicit must_host_cpu selects it, so an entry that names it is
+        // skipped and the request falls through to normal selection.
+        if (it != g_runtime_cohort_tier.end() && it->second != alloc_tier::HOST_CPU) {
             return it->second;
         }
     }
@@ -15713,6 +15719,13 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
             mapping.length = rec.handle.size;
             mapping.fd     = rec.file_fd;
             unified_cache_raw_unmap_file(&mapping);
+            return true;
+        }
+        // A HOST_CPU allocation is released by one munmap of its whole mapping, sized by the one function the wrapper
+        // mapped with, and by nothing else; the same ordering argument holds as for the file mapping above.
+        if (rec.handle.tier == alloc_tier::HOST_CPU) {
+            alloc_registry::instance().unregister_alloc(rec.handle.ptr);
+            unified_cache_raw_free_host_cpu(rec.handle.ptr, host_cpu_mapped_size(rec.handle.size));
             return true;
         }
         if (rec.handle.tier == alloc_tier::UNREGISTERED) {
@@ -15971,14 +15984,17 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     }
 
     alloc_request req = req_in;
-    if (req.queue == nullptr && req.device >= 0 && req.device < GGML_SYCL_MAX_DEVICES) {
+    // A HOST_CPU allocation is CPU memory: it needs the device only to name its owner's release coordinator, never a
+    // queue, so it neither fetches the default queue nor requires one.
+    const bool    host_cpu_request = req_in.intent.constraints.must_host_cpu;
+    if (req.queue == nullptr && !host_cpu_request && req.device >= 0 && req.device < GGML_SYCL_MAX_DEVICES) {
         req.queue = &ggml_sycl_get_device(req.device).default_queue();
     }
-    if (req.queue == nullptr) {
+    if (req.queue == nullptr && !host_cpu_request) {
         GGML_LOG_ERROR("[UNIFIED-ALLOC] invalid request: missing queue\n");
         return false;
     }
-    if (req.device < 0) {
+    if (req.device < 0 && req.queue != nullptr) {
         req.device = get_device_id_from_queue(*req.queue);
     }
     if (req.device < 0 || req.device >= GGML_SYCL_MAX_DEVICES) {
@@ -15993,6 +16009,11 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
 
     if (req.intent.constraints.must_device && req.intent.constraints.must_host_pinned) {
         GGML_LOG_ERROR("[UNIFIED-ALLOC] invalid request: both must_device and must_host_pinned are set\n");
+        return false;
+    }
+    if (req.intent.constraints.must_host_cpu &&
+        (req.intent.constraints.must_device || req.intent.constraints.must_host_pinned)) {
+        GGML_LOG_ERROR("[UNIFIED-ALLOC] invalid request: must_host_cpu is set with must_device or must_host_pinned\n");
         return false;
     }
 
@@ -16171,6 +16192,25 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 }
             }
         }
+    }
+    if (tier == alloc_tier::HOST_CPU) {
+        // One locked anonymous mapping, made here and nowhere else. No lock is held across the call: mlock faults
+        // every page in before it returns, which on a multi-GiB request is seconds. A refusal is final: the request
+        // is never served from another tier.
+        host_cpu_mapping      mapping;
+        const host_cpu_status status = unified_cache_raw_alloc_host_cpu(alloc_size, &mapping);
+        if (status != host_cpu_status::OK) {
+            const std::string text = host_cpu_refusal_text(status, mapping);
+            if (req.suppress_failure_log) {
+                GGML_SYCL_DEBUG("[UNIFIED-ALLOC] %s\n", text.c_str());
+            } else {
+                GGML_LOG_ERROR("[UNIFIED-ALLOC] %s (device %d)\n", text.c_str(), req.device);
+            }
+            return false;
+        }
+        ptr = mapping.ptr;
+        // the pointer-type registry, which resolves interior pointers
+        alloc_registry::instance().register_alloc(ptr, alloc_size, -1, alloc_type::HOST_CPU);
     }
     if (tier == alloc_tier::DEVICE_VRAM) {
         // Guard against Level Zero overcommit: if this allocation would exceed
@@ -17081,6 +17121,8 @@ static allocation_result unified_allocate_owner_impl(const alloc_request & req, 
         if (req.size == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES ||
             (req.alignment != 0 && (req.alignment & (req.alignment - 1)) != 0) ||
             (req.intent.constraints.must_device && req.intent.constraints.must_host_pinned) ||
+            (req.intent.constraints.must_host_cpu &&
+             (req.intent.constraints.must_device || req.intent.constraints.must_host_pinned)) ||
             (internal_cache_backing &&
              (!req.intent.constraints.require_host_usm_base || !req.intent.constraints.must_host_pinned))) {
             result.error = allocation_error::INVALID_REQUEST;
@@ -17097,8 +17139,9 @@ static allocation_result unified_allocate_owner_impl(const alloc_request & req, 
         // is an ordinary external allocation, never a cache suballocation.
         const bool standalone_host_usm_base =
             req.intent.constraints.require_host_usm_base && req.intent.constraints.must_host_pinned;
+        // A HOST_CPU allocation is exact and independently released, whatever role or placement field rides with it.
         const bool cache_suballocation =
-            !pinned_backing && !standalone_host_usm_base &&
+            !pinned_backing && !standalone_host_usm_base && !req.intent.constraints.must_host_cpu &&
             (req.intent.constraints.use_pinned_pool || req.intent.constraints.must_host_pinned ||
              req.intent.constraints.prefer_vram_zone != vram_zone_id::COUNT || req.intent.role == alloc_role::KV);
         const allocation_control_class ownership_class = pinned_backing ? allocation_control_class::CACHE_BACKING :
@@ -18017,6 +18060,7 @@ struct registry_tier_sums {
     std::array<size_t, GGML_SYCL_MAX_DEVICES> device{};
     size_t                                    host        = 0;
     size_t                                    file_mapped = 0;
+    size_t                                    host_cpu    = 0;
 };
 
 static registry_tier_sums unified_alloc_registry_tier_sums() {
@@ -18032,6 +18076,8 @@ static registry_tier_sums unified_alloc_registry_tier_sums() {
             sums.host += h.size;
         } else if (h.tier == alloc_tier::FILE_MAPPED) {
             sums.file_mapped += h.size;
+        } else if (h.tier == alloc_tier::HOST_CPU) {
+            sums.host_cpu += h.size;
         }
     }
     return sums;
@@ -18042,6 +18088,10 @@ void unified_alloc_registry_sums_for_test(size_t * host, size_t * file_mapped) n
     const registry_tier_sums sums = unified_alloc_registry_tier_sums();
     *host                         = sums.host;
     *file_mapped                  = sums.file_mapped;
+}
+
+void unified_alloc_registry_host_cpu_sum_for_test(size_t * host_cpu) noexcept {
+    *host_cpu = unified_alloc_registry_tier_sums().host_cpu;
 }
 #endif
 
@@ -18083,8 +18133,10 @@ bool unified_alloc_validate_registry(int device, const char * where) {
     const size_t tracked_host = g_runtime_reserved_host_bytes.load(std::memory_order_relaxed);
     if (tracked_host != registry_host) {
         ok = false;
-        GGML_LOG_WARN("[UNIFIED-ALLOC] managed registry mismatch%s%s host tracked=%zu registry=%zu file_mapped=%zu\n",
-                      where ? " at " : "", where ? where : "", tracked_host, registry_host, registry_file_mapped);
+        GGML_LOG_WARN(
+            "[UNIFIED-ALLOC] managed registry mismatch%s%s host tracked=%zu registry=%zu file_mapped=%zu "
+            "host_cpu=%zu\n",
+            where ? " at " : "", where ? where : "", tracked_host, registry_host, registry_file_mapped, sums.host_cpu);
     }
     return ok;
 }

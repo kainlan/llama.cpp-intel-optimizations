@@ -83,12 +83,17 @@ uint64_t runtime_census_host_pinned() {
 void tier_identity_registry_census_and_release() {
     const size_t   size   = 3u * 1024u * 1024u + 1u;  // two huge pages and a byte: the mapping rounds up to 4 MiB
     const size_t   mapped = host_cpu_mapped_size(size);
-    const uint64_t locked_before  = vm_locked_kb();
-    const size_t   rows_before    = allocation_registry_test_size();
-    const uint64_t census_before  = runtime_census_all();
-    const uint64_t pinned_before  = runtime_census_host_pinned();
-    const uint64_t stats_before   = offload_stats_get().alloc_count_host_cpu;
-    const uint64_t munmaps_before = unified_cache_host_cpu_munmap_count_for_test();
+    const uint64_t locked_before   = vm_locked_kb();
+    const size_t   rows_before     = allocation_registry_test_size();
+    const uint64_t census_before   = runtime_census_all();
+    const uint64_t pinned_before   = runtime_census_host_pinned();
+    const uint64_t stats_before    = offload_stats_get().alloc_count_host_cpu;
+    const uint64_t munmaps_before  = unified_cache_host_cpu_munmap_count_for_test();
+    size_t         host_before     = 0;
+    size_t         file_before     = 0;
+    size_t         host_cpu_before = 0;
+    unified_alloc_registry_sums_for_test(&host_before, &file_before);
+    unified_alloc_registry_host_cpu_sum_for_test(&host_cpu_before);
 
     uint64_t free_before = 0;
     uint64_t sycl_before = 0;
@@ -127,6 +132,15 @@ void tier_identity_registry_census_and_release() {
     check(alloc_registry::instance().get_alloc_type((char *) base + size - 1) == alloc_type::HOST_CPU,
           "an interior pointer is not typed HOST_CPU");
     check(offload_stats_get().alloc_count_host_cpu == stats_before + 1, "the allocation was not counted as HOST_CPU");
+
+    // the registry reports the bytes apart from the host-pinned figure the validator compares with the host ledger
+    size_t host_during     = 0;
+    size_t file_during     = 0;
+    size_t host_cpu_during = 0;
+    unified_alloc_registry_sums_for_test(&host_during, &file_during);
+    unified_alloc_registry_host_cpu_sum_for_test(&host_cpu_during);
+    check(host_during == host_before, "a HOST_CPU allocation was charged to the host-pinned sum");
+    check(host_cpu_during == host_cpu_before + size, "the HOST_CPU sum is not the allocation's size");
 
     // query_location: HOST_CPU, read by the CPU, not device-mappable
     const memory_location at_base     = query_location(base);
@@ -169,6 +183,12 @@ void tier_identity_registry_census_and_release() {
     check(free_after == free_before, "the release reached the ::free branch");
     check(sycl_after == sycl_before, "the release reached the sycl::free fallthrough");
     check(allocation_registry_test_size() == rows_before, "the registry did not return to its size");
+    size_t host_after     = 0;
+    size_t file_after     = 0;
+    size_t host_cpu_after = 0;
+    unified_alloc_registry_sums_for_test(&host_after, &file_after);
+    unified_alloc_registry_host_cpu_sum_for_test(&host_cpu_after);
+    check(host_after == host_before && host_cpu_after == host_cpu_before, "the sums did not return after the release");
     std::cout << "PASS tier-identity-registry-census-and-release\n";
 }
 
