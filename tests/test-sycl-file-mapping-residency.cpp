@@ -467,15 +467,21 @@ void arm3_negative_control(const fixture & f) {
 // `tail_only` is the mutant that advises only the windows before the lazy range.
 enum class edge_advice { WINDOWS, NONE, TAIL_ONLY };
 
-int64_t fault_and_measure(const fixture & f, bool forward, edge_advice advice, bool * ran) {
-    *ran = false;
+// Why a measurement did not happen. Only the first two are reasons to skip: a refused plan, map or advice is a
+// failure of the thing under test, and must not read as "cannot evict".
+enum class measure { DONE, NOT_EVICTABLE, BAND_NOT_CLEAN, REFUSED };
+
+measure fault_and_measure(const fixture & f, bool forward, edge_advice advice, int64_t * pages) {
+    const char * arm = "arms 5 and 6";
+    *pages           = -1;
     if (!evict(f)) {
-        return -1;
+        return measure::NOT_EVICTABLE;
     }
     const file_segment_plan plan = file_mapping_segments(fixture_tensors(), fixture_lazy(), g_page, window_for(f));
     tier_mapping            t;
     if (!plan.ok() || !map_plan(f, plan, &t)) {
-        return -1;
+        report_fail(arm, "the plan or the mapping was refused");
+        return measure::REFUSED;
     }
     std::vector<file_map_range> windows;
     for (const file_map_range & w : plan.random_windows) {
@@ -484,17 +490,27 @@ int64_t fault_and_measure(const fixture & f, bool forward, edge_advice advice, b
             windows.push_back(w);
         }
     }
-    if (!advised("arms 5 and 6", unified_cache_raw_advise_file_segments(t.m, windows, file_advice::RANDOM))) {
-        return -1;
+    if (!advised(arm, unified_cache_raw_advise_file_segments(t.m, windows, file_advice::RANDOM))) {
+        return measure::REFUSED;
     }
     if (band_resident(f, forward ? forward_band(f) : backward_band(f)) != 0) {
-        return -1;  // residue in the band before the fault: a "> 0" after it would not be the fault's doing
+        return measure::BAND_NOT_CLEAN;  // residue before the fault: a "> 0" after it would not be the fault's doing
     }
     const uint64_t at = forward ? A_END - 1 : B_BEGIN;  // a byte of the shared page
     (void) read_through(t, at, at + 1);
-    *ran = true;
     settle();
-    return band_resident(f, forward ? forward_band(f) : backward_band(f));
+    *pages = band_resident(f, forward ? forward_band(f) : backward_band(f));
+    return measure::DONE;
+}
+
+// true when the measurement ran; a skip is reported here, a failure was reported where it happened
+bool measured(const char * arm, measure m) {
+    if (m == measure::NOT_EVICTABLE) {
+        report_skip(arm, "the fixture directory cannot be evicted");
+    } else if (m == measure::BAND_NOT_CLEAN) {
+        report_skip(arm, "the edge band held residue before the fault");
+    }
+    return m == measure::DONE;
 }
 
 void arm_read_around(const fixture & f, bool forward) {
@@ -504,19 +520,16 @@ void arm_read_around(const fixture & f, bool forward) {
         report_skip(arm, "read_ahead_kb is 0 or the reach does not extend two pages past the shared page");
         return;
     }
-    bool          ran  = false;
-    const int64_t twin = fault_and_measure(f, forward, edge_advice::NONE, &ran);
-    if (!ran) {
-        report_skip(arm, "the fixture directory cannot be evicted");
+    int64_t twin = -1;
+    if (!measured(arm, fault_and_measure(f, forward, edge_advice::NONE, &twin))) {
         return;
     }
     std::printf("%s: control twin (no edge advice) band resident pages = %lld (want > 0)\n", arm, (long long) twin);
     if (twin <= 0) {
         report_fail(arm, "the no-advice control twin did not read the band resident: the arm cannot fail");
     }
-    const int64_t n = fault_and_measure(f, forward, edge_advice::WINDOWS, &ran);
-    if (!ran) {
-        report_skip(arm, "the fixture directory cannot be evicted");
+    int64_t n = -1;
+    if (!measured(arm, fault_and_measure(f, forward, edge_advice::WINDOWS, &n))) {
         return;
     }
     std::printf("%s: band resident pages with the edge windows = %lld (want 0)\n", arm, (long long) n);
@@ -525,11 +538,14 @@ void arm_read_around(const fixture & f, bool forward) {
     }
     if (!forward) {
         // a mutant that advises only the segment tail leaves the backward edge unadvised
-        const int64_t tail = fault_and_measure(f, false, edge_advice::TAIL_ONLY, &ran);
-        std::printf("arm 6 mutant: band resident pages with only the tail advised = %lld (want > 0)\n",
-                    (long long) tail);
-        if (ran && tail <= 0) {
-            report_fail(arm, "advising only the segment tail still read 0: the arm cannot see a missing head window");
+        int64_t tail = -1;
+        if (measured(arm, fault_and_measure(f, false, edge_advice::TAIL_ONLY, &tail))) {
+            std::printf("arm 6 mutant: band resident pages with only the tail advised = %lld (want > 0)\n",
+                        (long long) tail);
+            if (tail <= 0) {
+                report_fail(arm,
+                            "advising only the segment tail still read 0: the arm cannot see a missing head window");
+            }
         }
     }
 }
