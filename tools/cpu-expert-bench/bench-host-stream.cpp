@@ -158,6 +158,10 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
+    if (rounds < 1 || gib < 1) {  // the summary takes best/median/min of the trials; none would be undefined
+        fprintf(stderr, "--rounds and --gib must be >= 1\n");
+        return 2;
+    }
     g_n = (gib << 30) / sizeof(double);
     g_a = (double *) aligned_alloc(4096, g_n * sizeof(double));
     g_b = (double *) aligned_alloc(4096, g_n * sizeof(double));

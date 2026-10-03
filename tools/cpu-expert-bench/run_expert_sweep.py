@@ -30,6 +30,7 @@ Summary columns, per (shape,mat,type,threads,variant), pooled over all rounds:
 """
 import argparse
 import csv
+import os
 import random
 import statistics
 import subprocess
@@ -54,8 +55,6 @@ def parse_args():
 
 
 def run_sweep(a):
-    import os
-
     rng = random.Random(a.seed)
     threads = [int(t) for t in a.threads.split(",")]
     rows = []

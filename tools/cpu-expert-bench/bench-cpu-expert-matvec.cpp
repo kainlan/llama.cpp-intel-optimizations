@@ -46,9 +46,13 @@
 // Before timing, every config is checked: `prod` and each producing variant is
 // run once over NaN-filled outputs and compared row by row to ggml-cpu's own
 // vec_dot on the same weights; a skipped row (NaN) or a mismatch FAILS the run
-// (exit 3) rather than printing a plausibly high GB/s. The pool's expert slots
-// hold identical bytes, so a wrong-slot read is not detected, only a missing
-// or wrong row.
+// (exit 3) rather than printing a plausibly high GB/s. Other non-zero exits:
+// 2 bad arguments, 4 an --oracle-selftest corruption the oracle failed to reject
+// (or nothing to exercise), 5 threads > 1 but no arena worker ran (library built
+// without TBB, so `prod` was serial), 6 a sched_setaffinity call failed (the
+// +pin arms did not run as labelled), 77 the CPU lacks an ISA the kernels need.
+// The pool's expert slots hold identical bytes, so a wrong-slot read is not
+// detected, only a missing or wrong row.
 //
 // The weight set is rotated so every call reads cold (beyond-LLC) data, as a
 // decode token does. Opens no SYCL queue and touches no GPU. The pool's TBB
@@ -83,6 +87,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -452,10 +457,24 @@ static const char * pin_suffix(pin_mode m) {
     return m == PIN_SEQ ? "+pin" : m == PIN_E ? "+pinE" : m == PIN_SHUF ? "+pinS" : "";
 }
 
+// The affinity mask the process started with, captured once in main(): the CPUs
+// a pin may use, and the mask PIN_NONE restores (cgroups / taskset / isolcpus
+// can make CPUs 0..n-1 not all allowed).
+static cpu_set_t g_start_mask;
+static bool      g_have_start_mask = false;
+static long      g_pin_calls       = 0;
+static long      g_pin_failures    = 0;
+
+static bool cpu_allowed(int c) {
+    return !g_have_start_mask || CPU_ISSET(c, &g_start_mask);
+}
+
 static std::vector<int> cpu_order(pin_mode m, int ncpu, int pcores) {
     std::vector<int> o;
     for (int c = (m == PIN_E ? pcores : 0); c < ncpu; c++) {
-        o.push_back(c);
+        if (cpu_allowed(c)) {
+            o.push_back(c);
+        }
     }
     if (m == PIN_SHUF) {
         std::mt19937 r(42);
@@ -464,33 +483,47 @@ static std::vector<int> cpu_order(pin_mode m, int ncpu, int pcores) {
     return o;
 }
 
-static bool set_cpu(pid_t tid, int cpu) {
+// Every affinity change is counted; the totals are reported at exit, and the
+// first failure is printed where it happens.
+static void set_mask(pid_t tid, const cpu_set_t & s, const char * what) {
+    g_pin_calls++;
+    if (sched_setaffinity(tid, sizeof(s), &s) != 0) {
+        if (g_pin_failures++ == 0) {
+            fprintf(stderr, "warning: sched_setaffinity(tid %d, %s) failed: %s (further failures are only counted)\n",
+                    (int) tid, what, strerror(errno));
+        }
+    }
+}
+
+static void set_cpu(pid_t tid, int cpu) {
     cpu_set_t s;
     CPU_ZERO(&s);
     CPU_SET(cpu, &s);
-    return sched_setaffinity(tid, sizeof(s), &s) == 0;
+    set_mask(tid, s, "one CPU");
 }
 
-static bool set_all_cpus(pid_t tid, int ncpu) {
-    cpu_set_t s;
-    CPU_ZERO(&s);
-    for (int c = 0; c < ncpu; c++) {
-        CPU_SET(c, &s);
+static void restore_start_mask(pid_t tid) {
+    if (g_have_start_mask) {
+        set_mask(tid, g_start_mask, "start mask");
     }
-    return sched_setaffinity(tid, sizeof(s), &s) == 0;
 }
 
 // Main thread to slot 0 of the order, worker i (tid-sorted) to slot i+1.
 static void apply_pin(pid_t main_tid, std::vector<pid_t> workers, pin_mode m, int ncpu, int pcores) {
     std::sort(workers.begin(), workers.end());
     if (m == PIN_NONE) {
-        set_all_cpus(main_tid, ncpu);
+        restore_start_mask(main_tid);
         for (pid_t t : workers) {
-            set_all_cpus(t, ncpu);
+            restore_start_mask(t);
         }
         return;
     }
     const std::vector<int> order = cpu_order(m, ncpu, pcores);
+    if (order.empty()) {
+        g_pin_failures++;  // no allowed CPU for this mode (e.g. E-only on a mask without E-cores)
+        fprintf(stderr, "warning: pin mode %s has no allowed CPU; left unpinned\n", pin_suffix(m));
+        return;
+    }
     set_cpu(main_tid, order[0]);
     for (size_t i = 0; i < workers.size(); i++) {
         set_cpu(workers[i], order[(i + 1) % order.size()]);
@@ -965,6 +998,15 @@ static void discover_tbb_workers(runner & R, config & cfg, const variant_inst & 
             cfg.shp->name, cfg.mat.c_str(), cfg.tname.c_str(), R.threads, (int) R.tbb_tids.size(), idle_other);
 }
 
+static bool has_prod(const std::vector<variant_inst> & variants) {
+    for (const auto & v : variants) {
+        if (!v.def->kernel && !v.kernel) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void apply_variant_pin(runner & R, const variant_inst & v) {
     const bool is_prod = !v.def->kernel && !v.kernel;
     apply_pin(R.main_tid, is_prod ? R.tbb_tids : R.team_tids, v.pin, R.ncpu, R.pcores);
@@ -1220,17 +1262,22 @@ static std::vector<variant_inst> select_variants(const options & o, const config
 }
 
 int main(int argc, char ** argv) {
-    options opt;
-    if (!parse_args(argc, argv, opt)) {
-        return 2;
-    }
+    // First thing: nothing may run an AVX-VNNI instruction before this check.
     if (!host_has_required_isa()) {
         fprintf(stderr, "SKIP: needs AVX2, FMA, F16C, AVX-VNNI and AVX-VNNI-INT8; this CPU lacks one\n");
         return 77;
     }
+    options opt;
+    if (!parse_args(argc, argv, opt)) {
+        return 2;
+    }
+    g_have_start_mask = sched_getaffinity(0, sizeof(g_start_mask), &g_start_mask) == 0;
     ggml_cpu_init();  // fills the fp16->fp32 table the vec_dot kernels read (the backend does this in production)
+    // Same rule as ggml_sycl_cpu_threads_hint() (cpu-dispatch.cpp:3133): env value >= 1, default hw-2, capped at
+    // 32. The arena is sized from it once per process, so the own team must match or the arms compare unequal teams.
     const char * thr_env = getenv("GGML_SYCL_CPU_THREADS");
-    const int    threads = thr_env ? atoi(thr_env) : 22;  // library default: hw-2
+    const int    hw      = std::max(1, (int) std::thread::hardware_concurrency());
+    const int    threads = std::min(32, thr_env ? std::max(1, atoi(thr_env)) : std::max(1, hw - 2));
     team         tm(threads);
 
     runner R{ tm, threads, opt.chunk, (int) sysconf(_SC_NPROCESSORS_ONLN), opt.pcores, (pid_t) syscall(SYS_gettid), {},
@@ -1259,12 +1306,31 @@ int main(int argc, char ** argv) {
                     continue;
                 }
                 const std::vector<variant_inst> variants = select_variants(opt, cfg);
+                if (variants.empty()) {
+                    fprintf(stderr, "%s %s %s: no variant applies to this config; skipped\n", shp->name, mat.c_str(),
+                            tname.c_str());
+                    continue;
+                }
 
                 if (opt.oracle_selftest) {
-                    const bool detected = !oracle_check(R, cfg, variants[0], true);
-                    fprintf(stderr, "oracle selftest %s %s %s %s: %s\n", shp->name, mat.c_str(), tname.c_str(),
-                            variants[0].name.c_str(), detected ? "corruption detected (ok)" : "NOT DETECTED");
-                    if (!detected) {
+                    // The positive control runs on every producing variant: a variant whose
+                    // output the oracle cannot reject proves nothing when it passes.
+                    int n_selftest = 0;
+                    for (const auto & v : variants) {
+                        if (!v.def->produces_output) {
+                            continue;
+                        }
+                        n_selftest++;
+                        const bool detected = !oracle_check(R, cfg, v, true);
+                        fprintf(stderr, "oracle selftest %s %s %s %s: %s\n", shp->name, mat.c_str(), tname.c_str(),
+                                v.name.c_str(), detected ? "corruption detected (ok)" : "NOT DETECTED");
+                        if (!detected) {
+                            rc = 4;
+                        }
+                    }
+                    if (n_selftest == 0) {
+                        fprintf(stderr, "oracle selftest %s %s %s: no producing variant selected, nothing exercised\n",
+                                shp->name, mat.c_str(), tname.c_str());
                         rc = 4;
                     }
                 }
@@ -1292,6 +1358,16 @@ int main(int argc, char ** argv) {
                         discover_tbb_workers(R, cfg, v, 12);
                         break;
                     }
+                }
+                if (R.threads > 1 && R.tbb_tids.empty() && has_prod(variants)) {
+                    // Without TBB the library runs `prod` serially on the calling thread (GGML_SYCL_HAS_TBB == 0):
+                    // every prod number from such a build is a single-core number.
+                    fprintf(stderr,
+                            "ERROR: threads=%d but no arena worker burned CPU during prod: the library was likely "
+                            "built without TBB and prod ran serially; config skipped\n",
+                            R.threads);
+                    rc = 5;
+                    continue;
                 }
 
                 const double bytes = (double) cfg.k * cfg.expert_bytes;
@@ -1323,6 +1399,10 @@ int main(int argc, char ** argv) {
                 fflush(stdout);
             }
         }
+    }
+    fprintf(stderr, "pin: %ld affinity calls, %ld failed\n", g_pin_calls, g_pin_failures);
+    if (g_pin_failures && rc == 0) {
+        rc = 6;  // the +pin arms did not run as labelled
     }
     return rc;
 }
