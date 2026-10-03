@@ -144,3 +144,32 @@ def test_text_table_names_every_arm() -> None:
         assert result.returncode == 0, result.stdout
         assert "q4_n3_code" in result.stdout
         assert "62.96" in result.stdout or "63.0" in result.stdout  # 170/270 as a percentage
+
+
+def test_p_min_arms_are_kept_apart_from_the_unfiltered_arms_of_the_same_head_and_n_max() -> None:
+    # same head and n-max, different draft filter: rolling them up together would hide the filter's effect
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        tmp = pathlib.Path(tmp_raw)
+        a = tmp / "q8_n3_code.log"
+        b = tmp / "q8_n3_p05_code.log"
+        a.write_text(log_text(n_draft=3, n_drafted=300, n_accept=150), encoding="utf-8")
+        b.write_text(log_text(n_draft=3, n_drafted=200, n_accept=160), encoding="utf-8")
+        result = run(a, b, extra=["--json"])
+        assert result.returncode == 0, result.stdout
+        groups = json.loads(result.stdout)["groups"]
+        assert len(groups) == 2
+        by_tag = {g["p_min"]: g for g in groups}
+        assert set(by_tag) == {"none", "p05"}
+        assert abs(by_tag["none"]["accept_rate"] - 0.5) < 1e-9
+        assert abs(by_tag["p05"]["accept_rate"] - 0.8) < 1e-9
+
+
+def test_a_p_min_arm_without_the_stats_line_is_rejected_not_given_a_derived_length() -> None:
+    # the derived length assumes every round drafts n_draft tokens, which a p-min filter breaks
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        log = pathlib.Path(tmp_raw) / "q4_n3_p05_chat.log"
+        log.write_text(log_text(stats=False), encoding="utf-8")
+        result = run(log)
+        assert result.returncode == 2
+        assert "needs the '#mean acc len' statistics line" in result.stdout
+        assert "Traceback" not in result.stdout

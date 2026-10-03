@@ -107,12 +107,13 @@ they are prerequisites for MTP to pay.
 
 Acceptance and tokens per round depend on the target and the prompts, not the backend.
 
-    scripts/qwen4exp-mtp-acceptance.sh --dry-run      # print the 12 commands
-    scripts/qwen4exp-mtp-acceptance.sh                # run them, serially
+    scripts/qwen4exp-mtp-acceptance.sh --dry-run      # print the 24 commands
+    scripts/qwen4exp-mtp-acceptance.sh                # run them, serially (SETS=base or SETS=p05 for 12)
 
 Target: the IQ3_XXS pair (76 GB, fits in page cache; the 177 GB Q8_0 would thrash it). Heads: ggml-org Q8_0
 and Q4_0, in `/models/Qwen3.8-Flash-Next-MTP/`. Arms: n-max {2, 3} x prompts {code, chat, reasoning},
-greedy, seed 42, 256 new tokens, built with `cmake -B build-cpu -G Ninja -DGGML_SYCL=OFF -DLLAMA_CURL=OFF`
+greedy, seed 42, 256 new tokens, in two sets: `base` (binary default p-min 0.00, drafts never filtered) and
+`p05` (`--spec-draft-p-min 0.5`, Strata's keep-while-p>=0.5 filter, for the comparison). Built with `cmake -B build-cpu -G Ninja -DGGML_SYCL=OFF -DLLAMA_CURL=OFF`
 and `--target llama-speculative-simple`. It is a model load: run it by hand, one process at a time. The
 parser (`scripts/parse-qwen4exp-mtp-acceptance.py`, gate `test-qwen4exp-mtp-acceptance-parser`) rejects a
 log with `n_drafted = 0` instead of reporting 0% acceptance, because that is speculation that never ran.

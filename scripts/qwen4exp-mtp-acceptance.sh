@@ -8,13 +8,17 @@
 # from a subagent.
 #
 # Arms: head {q8 = Q8_0 MTP GGUF, q4 = Q4_0 MTP GGUF} x n-max {2,3} x prompt
-# {code, chat, reasoning}; greedy, seed 42.  Each arm writes
-# $OUT/<head>_n<k>_<prompt>.log; the parser prints the table at the end.
+# {code, chat, reasoning}; greedy, seed 42.  Two sets: "base" (the binary's
+# default p-min 0.00, drafts never filtered) and "p05" (--spec-draft-p-min 0.5,
+# the Strata comparison: keep a draft only while the MTP probability is >= 0.5).
+# Each arm writes $OUT/<head>_n<k>_<prompt>.log (base) or
+# $OUT/<head>_n<k>_p05_<prompt>.log (p05); the parser prints the table at the end.
 #
 # Usage:
 #   scripts/qwen4exp-mtp-acceptance.sh --dry-run     # print the commands only
-#   scripts/qwen4exp-mtp-acceptance.sh               # run all 12 arms, serially
-#   ARMS="q8_n3_code q4_n2_chat" scripts/qwen4exp-mtp-acceptance.sh   # a subset
+#   scripts/qwen4exp-mtp-acceptance.sh               # run all 24 arms (both sets), serially
+#   SETS=base scripts/qwen4exp-mtp-acceptance.sh     # only the 12 unfiltered arms (SETS=p05: the other 12)
+#   ARMS="q8_n3_code q4_n2_p05_chat" scripts/qwen4exp-mtp-acceptance.sh   # a subset
 #
 # Environment (defaults in brackets):
 #   BIN      speculative binary   [<repo>/build-cpu/bin/llama-speculative-simple]
@@ -22,7 +26,7 @@
 #   HEAD_Q8  Q8_0 MTP head        [/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf]
 #   HEAD_Q4  Q4_0 MTP head        [/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_0.gguf]
 #   OUT      log directory        [./qwen4exp-mtp-acceptance-out]
-#   N_PREDICT, CTX, UBATCH, THREADS (unset = binary default), PMIN (unset = binary default 0.00)
+#   SETS [base p05], N_PREDICT, CTX, UBATCH, THREADS (unset = binary default)
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -40,11 +44,15 @@ PARSER=$ROOT/scripts/parse-qwen4exp-mtp-acceptance.py
 DRY=0
 [ "${1:-}" = "--dry-run" ] && DRY=1
 
+SETS=${SETS:-"base p05"}
 ALL_ARMS=""
-for head in q8 q4; do
-    for k in 2 3; do
-        for prompt in code chat reasoning; do
-            ALL_ARMS="$ALL_ARMS ${head}_n${k}_${prompt}"
+for set in $SETS; do
+    case "$set" in base) tag="" ;; p05) tag="p05_" ;; *) echo "bad set $set (want base and/or p05)" >&2; exit 1 ;; esac
+    for head in q8 q4; do
+        for k in 2 3; do
+            for prompt in code chat reasoning; do
+                ALL_ARMS="$ALL_ARMS ${head}_n${k}_${tag}${prompt}"
+            done
         done
     done
 done
@@ -53,14 +61,15 @@ ARMS=${ARMS:-$ALL_ARMS}
 head_path() { case "$1" in q8) echo "$HEAD_Q8" ;; q4) echo "$HEAD_Q4" ;; *) echo "bad head $1" >&2; return 1 ;; esac; }
 
 arm_cmd() { # prints the command for one arm, one argument per line
-    local arm=$1 head k prompt
+    local arm=$1 head k prompt pmin=""
     head=${arm%%_*}; k=${arm#*_n}; k=${k%%_*}; prompt=${arm##*_}
+    case "$arm" in *_p05_*) pmin=0.5 ;; esac
     printf '%s\n' "$BIN" -m "$TARGET" -md "$(head_path "$head")" \
         --spec-type draft-mtp --spec-draft-n-max "$k" \
         -f "$PROMPTS_DIR/$prompt.txt" -n "$N_PREDICT" --seed 42 --temp 0 \
         -c "$CTX" -ub "$UBATCH" -ngl 0 -lzm on -lv 4
     [ -n "${THREADS:-}" ] && printf '%s\n' -t "$THREADS"
-    [ -n "${PMIN:-}" ] && printf '%s\n' --spec-draft-p-min "$PMIN"
+    [ -n "$pmin" ] && printf '%s\n' --spec-draft-p-min "$pmin"
     return 0
 }
 

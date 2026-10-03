@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Summarise llama-speculative-simple logs for the qwen4exp MTP measurement.
 
-Input: one log per arm, named `<head>_n<k>_<prompt>.log` (see
+Input: one log per arm, named `<head>_n<k>[_p05]_<prompt>.log` (`_p05` = --spec-draft-p-min 0.5) (see
 scripts/qwen4exp-mtp-acceptance.sh).  Output: per-arm draft acceptance and mean
 tokens per round, plus a token-weighted roll-up per (head, n-max).
 
@@ -57,6 +57,9 @@ def parse_log(path: pathlib.Path) -> dict:
         rec["mean_len_source"] = "stats"
         pos = stats.group(2)
         rec["acc_rate_per_pos"] = [float(x) for x in pos.split(",")] if pos else None
+    elif path.stem.split("_")[2:3] and re.fullmatch(r"p\d+", path.stem.split("_")[2]) and len(path.stem.split("_")) >= 4:
+        # a p-min filter ends drafts early, so rounds no longer draft exactly n_draft tokens
+        raise LogError("%s: a p-min arm needs the '#mean acc len' statistics line (run with -lv 4)" % path.name)
     else:
         rounds = rec["n_drafted"] / rec["n_draft"]
         rec["mean_len"] = rec["n_predict"] / rounds
@@ -68,20 +71,22 @@ def parse_log(path: pathlib.Path) -> dict:
 
     parts = path.stem.split("_")
     rec["head"] = parts[0]
+    rec["p_min"] = parts[2] if len(parts) >= 4 and re.fullmatch(r"p\d+", parts[2]) else "none"
     return rec
 
 
 def aggregate(arms: list[dict]) -> list[dict]:
     groups: dict[tuple, list[dict]] = {}
     for rec in arms:
-        groups.setdefault((rec["head"], rec["n_draft"]), []).append(rec)
+        groups.setdefault((rec["head"], rec["n_draft"], rec["p_min"]), []).append(rec)
     out = []
-    for (head, n_draft), recs in sorted(groups.items()):
+    for (head, n_draft, p_min), recs in sorted(groups.items()):
         drafted = sum(r["n_drafted"] for r in recs)
         accepted = sum(r["n_accept"] for r in recs)
         out.append({
             "head": head,
             "n_draft": n_draft,
+            "p_min": p_min,
             "arms": len(recs),
             "accept_rate": accepted / drafted,
             "mean_len": sum(r["mean_len"] for r in recs) / len(recs),
@@ -99,10 +104,10 @@ def render(arms: list[dict], groups: list[dict]) -> str:
                     (r["arm"], r["n_draft"], r["n_drafted"], r["n_accept"], 100.0 * r["accept_rate"],
                      r["mean_len"], r["mean_len_source"], pos, tps))
     rows.append("")
-    rows.append("%-24s %5s %5s %8s %8s" % ("head", "n_max", "arms", "accept%", "mean_len"))
+    rows.append("%-24s %5s %6s %5s %8s %8s" % ("head", "n_max", "p_min", "arms", "accept%", "mean_len"))
     for g in groups:
-        rows.append("%-24s %5d %5d %8.2f %8.2f" %
-                    (g["head"], g["n_draft"], g["arms"], 100.0 * g["accept_rate"], g["mean_len"]))
+        rows.append("%-24s %5d %6s %5d %8.2f %8.2f" %
+                    (g["head"], g["n_draft"], g["p_min"], g["arms"], 100.0 * g["accept_rate"], g["mean_len"]))
     return "\n".join(rows)
 
 
