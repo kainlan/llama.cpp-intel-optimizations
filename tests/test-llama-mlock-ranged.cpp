@@ -13,6 +13,14 @@
 //   * lock_range(A) then lock_range(B): the lazy interior reads 0 resident pages, and the tensors read resident
 //   * the mutant, grow_to(B_end) (the whole-prefix lock): the interior reads resident, so the test can fail
 //
+// The small cases below (a 16-page anonymous mapping, the lock read from the kernel's per-VMA VM_LOCKED flag, one
+// character per page) cover what the large fixture does not: two neighbours that share a page which holds no lazy
+// byte, a lazy range at offset 0, a tensor that ends on a page boundary against a lazy range, and a whole-buffer
+// grow_to after a ranged lock, which must lock the whole prefix and not only the tail past the bytes already locked.
+//
+// The page cache probe is cachestat(2); its mincore fallback is for kernels before 6.5 and is not exercised on a host
+// that has cachestat.
+//
 // Exits 77 if RLIMIT_MEMLOCK is below the fixture size or the directory cannot be evicted; a fail outranks a skip.
 
 #include "../src/llama-mmap.h"
@@ -29,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -119,6 +128,72 @@ static int vma_locked(const void * p) {
     return -1;
 }
 
+// One character per page of [addr, addr + n * page): '1' VM_LOCKED, '0' not, '?' no VmFlags line for it
+static std::string locked_pages(const void * addr, size_t n) {
+    std::string out;
+    for (size_t i = 0; i < n; ++i) {
+        const int l = vma_locked((const char *) addr + i * g_page);
+        out += l == 1 ? '1' : l == 0 ? '0' : '?';
+    }
+    return out;
+}
+
+// `want` is one character per page, '1' locked and '0' not; the page size is a parameter of the layout, so the byte
+// offsets below are written in pages plus a few bytes.
+static bool small_case(const char *                                       name,
+                       const std::string &                                want,
+                       const std::function<void(llama_mlock &, size_t)> & lock) {
+    const size_t n    = want.size();
+    void *       addr = mmap(nullptr, n * g_page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (addr == MAP_FAILED) {
+        std::fprintf(stderr, "FAIL: %s: cannot map the case\n", name);
+        return false;
+    }
+    std::string got;
+    {
+        llama_mlock m;
+        m.init(addr);
+        lock(m, (size_t) g_page);
+        got = locked_pages(addr, n);
+    }
+    munmap(addr, n * g_page);
+    std::printf("%s: locked pages %s (want %s)\n", name, got.c_str(), want.c_str());
+    if (got != want) {
+        std::fprintf(stderr, "FAIL: %s: the locked pages differ from the expected\n", name);
+        return false;
+    }
+    return true;
+}
+
+static int small_cases() {
+    int fail = 0;
+    // two neighbours that touch share a page that holds no lazy byte: both lock it, once
+    fail += !small_case("shared page", "0111111100000000", [](llama_mlock & m, size_t P) {
+        m.lock_range(P + 100, 3 * P - 50, {});
+        m.lock_range(4 * P + 50, 3 * P - 40, {});
+    });
+    // a lazy range at offset 0: the first tensor's first page holds lazy bytes and is not locked
+    fail += !small_case("lazy at offset 0", "0111000000000000", [](llama_mlock & m, size_t P) {
+        m.lock_range(100, 3 * P - 80,
+                     {
+                         { 0, 100 }
+        });
+    });
+    // a tensor that ends on a page boundary against a lazy range that starts there: locked through its last page
+    fail += !small_case("page-aligned end", "0011100000000000", [](llama_mlock & m, size_t P) {
+        m.lock_range(2 * P + 10, 3 * P - 10,
+                     {
+                         { 5 * P, 8 * P }
+        });
+    });
+    // the whole-buffer lock after a ranged one locks the whole prefix (the bytes already locked are not its measure)
+    fail += !small_case("grow_to after lock_range", "1111111100000000", [](llama_mlock & m, size_t P) {
+        m.lock_range(3 * P + 10, 2 * P, {});
+        m.grow_to(8 * P);
+    });
+    return fail;
+}
+
 struct run_result {
     int64_t interior        = -1;
     int64_t a_mid           = -1;
@@ -173,6 +248,9 @@ int main(int argc, char ** argv) {
         return 77;
     }
 
+    int fail = small_cases();
+    int skip = 0;
+
     std::string       path = std::string(g_fixture_dir) + "/llama-mlock-ranged-XXXXXX";
     std::vector<char> tmpl(path.begin(), path.end());
     tmpl.push_back('\0');
@@ -198,9 +276,6 @@ int main(int argc, char ** argv) {
     const llama_mmap::ranges deferred = {
         { LAZY_BEGIN, LAZY_END }
     };
-    int fail = 0;
-    int skip = 0;
-
     // the fix: each tensor's own range, with the lazy range before B
     const run_result ranged = run(fd, [&](llama_mlock & m) {
         m.lock_range(A_BEGIN, A_END - A_BEGIN, deferred);
