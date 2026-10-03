@@ -979,6 +979,14 @@ static void run_call(runner & R, config & cfg, const variant_inst & v) {
     R.tm.run(job);
 }
 
+// Discovery windows (of 12 prod calls each) tried before concluding that no arena worker exists.
+static constexpr int k_max_discovery_windows = 5;
+
+static bool active_is_busier(const std::pair<unsigned long long, pid_t> & a,
+                             const std::pair<unsigned long long, pid_t> & b) {
+    return a.first > b.first;
+}
+
 // Find the arena threads that did work during `calls` prod calls: not the main
 // thread, not the team, CPU time advanced. Idle helper threads take no pin slot.
 static void discover_tbb_workers(runner & R, config & cfg, const variant_inst & prod, int calls) {
@@ -1007,15 +1015,16 @@ static void discover_tbb_workers(runner & R, config & cfg, const variant_inst & 
     // arena workers. More "active" threads are other threads of the process (or workers that were replaced during
     // the window); keep the busiest threads-1 and leave the rest unpinned.
     const size_t max_workers = (size_t) std::max(0, R.threads - 1);
-    std::sort(active.begin(), active.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+    std::sort(active.begin(), active.end(), active_is_busier);
     const int capped = active.size() > max_workers ? (int) (active.size() - max_workers) : 0;
     for (size_t i = 0; i < active.size() && i < max_workers; i++) {
         R.tbb_tids.push_back(active[i].second);
     }
     fprintf(stderr,
-            "pin: %s %s %s threads=%d: %d active arena workers found, %d other threads idle (left unpinned)%s\n",
+            "pin: %s %s %s threads=%d: %d active arena workers found, %d other threads not pinned (idle or over the "
+            "cap)%s\n",
             cfg.shp->name, cfg.mat.c_str(), cfg.tname.c_str(), R.threads, (int) R.tbb_tids.size(), idle_other + capped,
-            capped ? " [capped at threads-1: extra active threads left unpinned]" : "");
+            capped ? " [capped at threads-1]" : "");
 }
 
 static bool has_prod(const std::vector<variant_inst> & variants) {
@@ -1378,11 +1387,10 @@ int main(int argc, char ** argv) {
                     if (!v.def->kernel && !v.kernel) {
                         // A single window can miss every worker on a loaded host (a run found 4 of 21), so retry
                         // before concluding that there are none.
-                        static const int k_max_windows = 5;
                         do {
                             discover_tbb_workers(R, cfg, v, 12);
                             windows++;
-                        } while (R.threads > 1 && R.tbb_tids.empty() && windows < k_max_windows);
+                        } while (R.threads > 1 && R.tbb_tids.empty() && windows < k_max_discovery_windows);
                         break;
                     }
                 }

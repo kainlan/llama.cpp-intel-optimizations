@@ -162,6 +162,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "--rounds and --gib must be >= 1\n");
         return 2;
     }
+    if (gib >= (1LL << 34)) {  // (size_t) gib << 30 would wrap past 2^64
+        fprintf(stderr, "--gib must be < 2^34\n");
+        return 2;
+    }
     g_n = ((size_t) gib << 30) / sizeof(double);
     g_a = (double *) aligned_alloc(4096, g_n * sizeof(double));
     g_b = (double *) aligned_alloc(4096, g_n * sizeof(double));
