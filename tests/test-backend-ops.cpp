@@ -10825,7 +10825,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     //    kernel's `row >= nrows_per_expert` guard is exercised, at n = 1 and n > 1, with b false and true;
     //  - m = 64, k = 768: a k that is not a power of two (3 x 256), at n > 1.
     // Types move into mmid_sweep_types as their _id kernels land.
-    static const ggml_type mmid_sweep_types[] = { GGML_TYPE_IQ4_NL };
+    static const ggml_type mmid_sweep_types[] = { GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S };
     for (ggml_type type_a : mmid_sweep_types) {
         for (int n_mats : {4, 8}) {
             for (int n_used : {1, 2, 4}) {

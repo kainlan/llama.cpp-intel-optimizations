@@ -165,6 +165,11 @@ int main() {
         // kernel is the generic mul_mat_vec_q<> body with vec_dot_iq4_nl_q8_1, so the generic _id path
         // takes it with that vec_dot and no new kernel body.
         { GGML_TYPE_IQ4_NL, GGML_LAYOUT_AOS, "iq4_nl/AOS" },
+        // s36q phase 2: IQ3_XXS and IQ3_S. Their dense kernels pass grid tables to a vec_dot with a
+        // non-generic signature, so the _id path wraps each in a generic-signature adaptor over the
+        // device grid tables (qi = QI3_x / 2, vdr = 1, as the dense kernels use).
+        { GGML_TYPE_IQ3_XXS, GGML_LAYOUT_AOS, "iq3_xxs/AOS" },
+        { GGML_TYPE_IQ3_S,   GGML_LAYOUT_AOS, "iq3_s/AOS"   },
     };
 
     for (const auto & req : required) {
@@ -183,9 +188,10 @@ int main() {
     //    these without adding the kernel turns a clean refusal into a wrong answer.
     // The two families that remain refused, for different reasons. The iq* types
     // other than IQ4_NL (covered since s36q: its dense kernel is the generic
-    // mul_mat_vec_q<> body with vec_dot_iq4_nl_q8_1) use per-type grid-lookup
-    // kernels with adjusted qi and no vec_dot parameter, so there is no generic
-    // tuple to transcribe; they are covered phase by phase. The float types cannot
+    // mul_mat_vec_q<> body with vec_dot_iq4_nl_q8_1) and IQ3_XXS/IQ3_S (s36q phase 2:
+    // generic-signature adaptors over their grid-table vec_dots) use per-type
+    // grid-lookup kernels with adjusted qi, so there is no generic tuple to
+    // transcribe; they are covered phase by phase. The float types cannot
     // use MMVQ at all -- it quantizes the activation to Q8_1 and dispatches
     // vec_dot_*_q8_1, meaningless for float weights. Covering either must move
     // this list in the same change, which is the point.
@@ -217,14 +223,14 @@ int main() {
     const ggml_type admission_expected[] = {
         GGML_TYPE_Q1_0, GGML_TYPE_NVFP4, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_Q4_1,
         GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,  GGML_TYPE_Q2_K,
-        GGML_TYPE_Q3_K, GGML_TYPE_IQ4_NL,
+        GGML_TYPE_Q3_K, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
     };
     //    The exact set that regressed: dense MUL_MAT kernels exist, _id does not.
     //    BF16/q2_0/tq2_0 are absent on purpose -- 186348705 already refuses them
     //    by leaving them out of the dense allowlist, so they never reached here.
     const ggml_type admission_refused[] = {
         GGML_TYPE_F32,     GGML_TYPE_F16,    GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,  GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
-        GGML_TYPE_IQ2_S,   GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+        GGML_TYPE_IQ2_S,   GGML_TYPE_IQ4_XS,
     };
 
     for (const ggml_type type : admission_expected) {
@@ -263,7 +269,7 @@ int main() {
     //    type, and admitting everything are all CAUGHT by the checks above.
     //    Dropping the predicate's capability axis entirely is NOT caught, and
     //    cannot be, because moe_mmvq_batched_dispatch_supports_type and the
-    //    capability table cover exactly the same 14 types today -- so the two
+    //    capability table cover exactly the same 16 types today -- so the two
     //    axes are indistinguishable by population. The second axis is therefore
     //    defensive, not gated here; what keeps the sets coinciding is the subset
     //    invariant in section 3. Do not add a control that "proves" the axis by
