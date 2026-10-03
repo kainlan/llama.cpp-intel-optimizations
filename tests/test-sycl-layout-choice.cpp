@@ -2179,7 +2179,7 @@ static bool run_planned_layout_materializable_test() {
     int               aos_iq    = 0;
     const tensor_usage usages[] = { tensor_usage::MOE_EXPERT_WEIGHT, tensor_usage::ATTENTION_WEIGHT,
                                     tensor_usage::FFN_WEIGHT,        tensor_usage::OUTPUT_WEIGHT,
-                                    tensor_usage::EMBEDDING };
+                                    tensor_usage::EMBEDDING,         tensor_usage::UNKNOWN };
     for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
         const ggml_type type = (ggml_type) t;
         if (!ggml_is_quantized(type) || ggml_blck_size(type) <= 0) {
@@ -2227,6 +2227,40 @@ static bool run_planned_layout_materializable_test() {
         if (n_entries != (size_t) n_experts) {
             printf("FAIL: planner produced %zu expert entries for %s, expected %lld\n", n_entries,
                    ggml_type_name(type), (long long) n_experts);
+            return false;
+        }
+    }
+    // The other direction: the clamp must not demote a type that HAS a reorder. A sweep that only
+    // asks "is the planned layout materializable" passes if SOA is withdrawn from a table type too
+    // (AOS is always materializable), so pin the table types that plan SOA today. Q4_0 MoE experts are
+    // AOS by design (the MMVQ _id kernels are AoS-only) and Q4_K is AOS everywhere; both are pinned as
+    // such so a change to either is a decision, not a drift.
+    const struct {
+        ggml_type    type;
+        tensor_usage usage;
+        layout_mode  want;
+        const char * name;
+    } pinned[] = {
+        { GGML_TYPE_Q6_K,  tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_SOA, "q6_K moe" },
+        { GGML_TYPE_Q6_K,  tensor_usage::OUTPUT_WEIGHT,     GGML_LAYOUT_SOA, "q6_K output" },
+        { GGML_TYPE_Q6_K,  tensor_usage::UNKNOWN,           GGML_LAYOUT_SOA, "q6_K unknown" },
+        { GGML_TYPE_Q8_0,  tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_SOA, "q8_0 moe" },
+        { GGML_TYPE_Q8_0,  tensor_usage::UNKNOWN,           GGML_LAYOUT_SOA, "q8_0 unknown" },
+        { GGML_TYPE_MXFP4, tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_SOA, "mxfp4 moe" },
+        { GGML_TYPE_MXFP4, tensor_usage::UNKNOWN,           GGML_LAYOUT_SOA, "mxfp4 unknown" },
+        { GGML_TYPE_Q4_0,  tensor_usage::OUTPUT_WEIGHT,     GGML_LAYOUT_SOA, "q4_0 output" },
+        { GGML_TYPE_Q4_0,  tensor_usage::UNKNOWN,           GGML_LAYOUT_SOA, "q4_0 unknown" },
+        { GGML_TYPE_Q4_0,  tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_AOS, "q4_0 moe (AoS-only _id)" },
+        { GGML_TYPE_Q4_K,  tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_AOS, "q4_K moe (AoS-only)" },
+        { GGML_TYPE_Q4_K,  tensor_usage::UNKNOWN,           GGML_LAYOUT_AOS, "q4_K unknown (AoS-only)" },
+        { GGML_TYPE_IQ3_S, tensor_usage::MOE_EXPERT_WEIGHT, GGML_LAYOUT_AOS, "iq3_s moe (no reorder)" },
+        { GGML_TYPE_IQ3_S, tensor_usage::UNKNOWN,           GGML_LAYOUT_AOS, "iq3_s unknown (no reorder)" },
+        { GGML_TYPE_Q5_K,  tensor_usage::OUTPUT_WEIGHT,     GGML_LAYOUT_AOS, "q5_K output (no reorder)" },
+    };
+    for (const auto & pin : pinned) {
+        const layout_mode got = layout_policy::get_optimal(pin.type, pin.usage);
+        if (got != pin.want) {
+            printf("FAIL: get_optimal for %s = layout %d, want %d\n", pin.name, (int) got, (int) pin.want);
             return false;
         }
     }

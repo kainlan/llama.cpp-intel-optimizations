@@ -12,11 +12,17 @@ is the single list. Its readers:
      SOA fallthroughs ("SOA is safe for all quantized types") are what planned
      SOA for IQ*/Q2_0 expert types while the runtime clamped them to AOS.
 
-The fill itself is the materializer: reorder_aos_to_soa_device and
-reorder_rows_to_soa each have a per-type switch of reorder kernels. This gate
-checks both switches carry exactly the table's types, so the table cannot name a
-type the fill has no kernel for (the planner would then plan a layout nothing
-materializes) nor omit one it has (a kernel nothing reaches).
+The fill itself is the materializer: every per-type switch of reorder kernels
+(reorder_aos_to_soa_device, reorder_rows_to_soa, reorder_data_internal_,
+ggml_sycl_reorder_weight_gpu, ggml_sycl_reorder_weight_cpu and the size helper
+ggml_sycl_reorder_expected_size) must carry exactly the table's types, so the
+table cannot name a type the fill has no kernel for (the planner would then plan
+a layout nothing materializes) nor omit one it has (a kernel nothing reaches).
+
+The other readers are the buffer-side eligibility checks (init_tensor, set_tensor,
+should_cpu_reorder, reorder_tensor_to_soa, the dispatch's type_has_reorder_support):
+none may keep a private `type == Q4_0 || ... || type == MXFP4` chain. A statement
+that compares against all five table types is flagged wherever it appears.
 
 The compiled counterpart (run_planned_layout_materializable_test in
 tests/test-sycl-layout-choice.cpp) drives get_optimal and the real planner over
@@ -130,6 +136,15 @@ DEVICE_REORDER_SIG = r"static\s+bool\s+reorder_aos_to_soa_device\s*\("
 ROWS_REORDER_SIG = r"\bbool\s+reorder_rows_to_soa\s*\("
 PARTIAL_ROWS_SIG = r"void\s*\*\s*unified_cache::load_partial_rows\s*\("
 GET_OPTIMAL_SIG = r"static\s+layout_mode\s+get_optimal\s*\("
+# Every per-type switch that selects an AOS->SOA reorder kernel or sizes its output.
+FILL_SWITCH_SIGS = {
+    "reorder_aos_to_soa_device": (r"static\s+bool\s+reorder_aos_to_soa_device\s*\(", "backend"),
+    "reorder_rows_to_soa": (r"\bbool\s+reorder_rows_to_soa\s*\(", "backend"),
+    "reorder_data_internal_": (r"static\s+bool\s+reorder_data_internal_\s*\(", "backend"),
+    "ggml_sycl_reorder_weight_gpu": (r"static\s+sycl::event\s+ggml_sycl_reorder_weight_gpu\s*\(", "backend"),
+    "ggml_sycl_reorder_weight_cpu": (r"static\s+bool\s+ggml_sycl_reorder_weight_cpu\s*\(", "backend"),
+    "ggml_sycl_reorder_expected_size": (r"static\s+bool\s+ggml_sycl_reorder_expected_size\s*\(", "backend"),
+}
 
 
 def table():
@@ -144,16 +159,13 @@ def test_table_is_defined_once_and_headers_include_it():
     assert "soa-reorder-types.hpp" in common, "common.hpp (layout_policy) must include the table header"
 
 
-def test_device_reorder_switch_matches_the_table():
-    # reorder_aos_to_soa_device is the fill the weight-load path runs: a type
-    # in the table without a case here is a layout the fill cannot materialize.
-    got = case_types(function_body(backend, DEVICE_REORDER_SIG))
-    assert got == table(), f"reorder_aos_to_soa_device cases {sorted(got)} != table {sorted(table())}"
-
-
-def test_partial_rows_reorder_switch_matches_the_table():
-    got = case_types(function_body(backend, ROWS_REORDER_SIG))
-    assert got == table(), f"reorder_rows_to_soa cases {sorted(got)} != table {sorted(table())}"
+def test_every_fill_switch_matches_the_table():
+    # Each of these is a fill the weight-load path runs for a SOA layout: a type in
+    # the table without a case is a layout the fill cannot materialize, and a case
+    # outside the table is a kernel nothing reaches.
+    for name, (sig, _) in sorted(FILL_SWITCH_SIGS.items()):
+        got = case_types(function_body(backend, sig))
+        assert got == table(), f"{name} cases {sorted(got)} != table {sorted(table())}"
 
 
 def test_runtime_clamp_reads_the_table():
@@ -162,21 +174,56 @@ def test_runtime_clamp_reads_the_table():
     assert not case_types(body), "ggml_sycl_layout_supports_soa must not keep a private type list"
 
 
+def test_unified_reorder_entry_reads_the_table():
+    # reorder_tensor_to_soa is the single entry every SOA conversion funnels through; its
+    # "type supported" precheck used to be a switch over the five types.
+    body = function_body(backend, r"\bbool\s+reorder_tensor_to_soa\s*\(")
+    assert PREDICATE + "(" in body, "reorder_tensor_to_soa must gate on the table"
+    assert not case_types(body), "reorder_tensor_to_soa must not keep a private type list"
+
+
 def test_partial_row_fill_reads_the_table():
     body = function_body(cache, PARTIAL_ROWS_SIG)
     assert PREDICATE + "(" in body, "load_partial_rows must gate on the table"
     assert not case_types(body), "load_partial_rows must not keep a private type list"
 
 
+def private_chains(text):
+    """Statements that compare against every table type with == / != : a private copy
+    of the table spelled as a chain. Switches are not flagged here (the fill switches
+    are checked above; other switches name a different concept)."""
+    hits = []
+    for m in re.finditer(r"[^;{}]+", text):
+        chunk = m.group(0)
+        names = set(re.findall(r"(?:==|!=)\s*(GGML_TYPE_[A-Z0-9_]+)", chunk))
+        if table() <= names:
+            hits.append(" ".join(chunk.split())[:100])
+    return hits
+
+
+def test_no_private_copy_of_the_table_as_a_comparison_chain():
+    for label, text in (("ggml-sycl.cpp", backend), ("unified-cache.cpp", cache), ("common.hpp", common)):
+        hits = private_chains(text)
+        assert not hits, f"{label} keeps a private copy of the SOA reorder table: {hits}"
+
+
 def test_planner_layout_source_never_defaults_to_unmaterializable_soa():
-    # get_optimal is the planner's layout source. Every SOA it can return for a
-    # type outside the explicit Q4_0/Q8_0/MXFP4 carve-outs is one of its two
-    # fallthroughs (OUTPUT_WEIGHT quantized, and the final default); both must
-    # consult the table.
+    # get_optimal is the planner's layout source. Every SOA it returns must be either
+    # (a) the table-guarded form `table(type) ? SOA : AOS`, or (b) a bare `return SOA` inside
+    # a branch that has just compared the type against a table member (the Q4_0/Q8_0/MXFP4
+    # carve-outs). The two fallthroughs (OUTPUT_WEIGHT quantized, final default) must be (a).
     body = function_body(common, GET_OPTIMAL_SIG)
-    assert body.count(PREDICATE + "(") >= 2, (
-        "layout_policy::get_optimal's OUTPUT_WEIGHT and default SOA fallthroughs must consult the SOA table"
+    guarded = re.findall(
+        r"return\s+" + PREDICATE + r"\(\s*qtype\s*\)\s*\?\s*GGML_LAYOUT_SOA\s*:\s*GGML_LAYOUT_AOS\s*;", body
     )
+    assert len(guarded) == 2, f"expected the OUTPUT_WEIGHT and default arms to be table-guarded, found {len(guarded)}"
+    for m in re.finditer(r"return\s+GGML_LAYOUT_SOA\s*;", body):
+        window = body[body.rfind("if (", 0, m.start()) : m.start()]
+        mentioned = set(re.findall(r"qtype\s*(?:==|!=)\s*(GGML_TYPE_[A-Z0-9_]+)", window))
+        assert mentioned and mentioned <= table(), (
+            f"bare `return GGML_LAYOUT_SOA` at offset {m.start()} is not preceded by a comparison against "
+            f"a SOA-table type (saw {sorted(mentioned)})"
+        )
 
 
 if __name__ == "__main__":
