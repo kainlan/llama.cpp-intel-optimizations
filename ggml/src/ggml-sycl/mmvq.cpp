@@ -3338,6 +3338,20 @@ static __dpct_inline__ float vec_dot_iq3_s_q8_1_id(const void * __restrict__ vbq
     return vec_dot_iq3_s_q8_1(vbq, bq8_1, iqs, iq3s_grid);
 }
 
+// Same for the IQ2 pair that takes grid tables. vec_dot_iq2_s_q8_1 already has the generic
+// signature (it reads iq2s_grid itself), so IQ2_S needs no adaptor.
+static __dpct_inline__ float vec_dot_iq2_xxs_q8_1_id(const void * __restrict__ vbq,
+                                                     const block_q8_1 * __restrict__ bq8_1,
+                                                     const int & iqs) {
+    return vec_dot_iq2_xxs_q8_1(vbq, bq8_1, iqs, iq2xxs_grid, ksigns_iq2xs, kmask_iq2xs);
+}
+
+static __dpct_inline__ float vec_dot_iq2_xs_q8_1_id(const void * __restrict__ vbq,
+                                                    const block_q8_1 * __restrict__ bq8_1,
+                                                    const int & iqs) {
+    return vec_dot_iq2_xs_q8_1(vbq, bq8_1, iqs, iq2xs_grid, ksigns64);
+}
+
 template <int qk, int qi, typename block_q_t, int vdr>
 static void mul_mat_vec_q_iq1_s_q8_1(const void * __restrict__ vx,
                                      const void * __restrict__ vy,
@@ -17336,6 +17350,9 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
             }
             have_kernel_event = true;
             break;
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_NL:
@@ -22151,6 +22168,9 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             }
             have_kernel_event = true;
             break;
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_NL:
@@ -23429,6 +23449,35 @@ bool mmvq_submit_quant_aos_id(sycl::queue &                    q,
             }
             event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ4_NL, QK4_NL, QI4_NL, block_iq4_nl, VDR_Q4_0_Q8_1_MMVQ,
                                             vec_dot_iq4_nl_q8_1>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            // The dense mul_mat_vec_q_iq2_xxs_q8_1 tuple (QK_K, QI2_XXS / 2, vdr 1), vec_dot behind an adaptor.
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ2_XXS, QK_K, QI2_XXS / 2, block_iq2_xxs, 1,
+                                            vec_dot_iq2_xxs_q8_1_id>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_IQ2_XS:
+            // The dense mul_mat_vec_q_iq2_xs_q8_1 tuple (QK_K, QI2_XS / 2, vdr 1), as above.
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ2_XS, QK_K, QI2_XS / 2, block_iq2_xs, 1,
+                                            vec_dot_iq2_xs_q8_1_id>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_IQ2_S:
+            // The dense mul_mat_vec_q_iq2_s_q8_1 tuple (QK_K, QI2_S / 2, vdr 1); the vec_dot is already generic.
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ2_S, QK_K, QI2_S / 2, block_iq2_s, 1, vec_dot_iq2_s_q8_1>(
                 q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
                 ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
             break;
