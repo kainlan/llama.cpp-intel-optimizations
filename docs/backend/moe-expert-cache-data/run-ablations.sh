@@ -7,7 +7,7 @@
 # Writes OUT_DIR/ablations/<name>.csv. The land*noskip* runs turn the in-flight skip rule off.
 # Environment: SIM, PYTHON, GGUF_IQ3, GGUF_Q8 as for run-curves.sh.
 set -euo pipefail
-[ $# -ge 2 ] || { sed -n '2,9p' "$0" >&2; exit 2; }
+[ $# -ge 2 ] || { sed -n '2,8p' "$0" >&2; exit 2; }
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
 SIM=${SIM:-$ROOT/scripts/moe-cache-sim.py}

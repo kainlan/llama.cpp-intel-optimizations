@@ -337,6 +337,29 @@ def test_cli_prefill_swaps_and_skip_pending_flags(tmp_path, capsys):
     run("--no-skip-pending")   # parses and runs
 
 
+def test_cli_no_skip_pending_reaches_the_simulator(tmp_path, capsys):
+    # four slots {0,1,6,7}; e2/e3 swap in at round 2 and land at round 6 (--land-delay 3),
+    # e4/e5 are the hot pair from round 3. The default skips every adaptation while the
+    # first pair is in flight; --no-skip-pending takes the second pair at round 5.
+    tr, te = tmp_path / "tr.moetrace", tmp_path / "te.moetrace"
+    sim.write_trace(tr, {"set": "a", "id": "a", "n_expert": 8}, [(0, 0, 1, [[0, 1, 6, 7]])])
+    sim.write_trace(te, {"set": "b", "id": "b", "n_expert": 8},
+                    [(i, 0, 1, [[2, 3]]) for i in range(3)] +
+                    [(i, 0, 1, [[4, 5]]) for i in range(3, 6)])
+
+    def swaps(*extra):
+        sim.main(["--train", str(tr), "--test", str(te), "--phase", "decode",
+                  "--uniform-expert-bytes", f"f={GIB}:1:8", "--budget-mib-per-layer", "4096",
+                  "--every", "1", "--land-delay", "3", *extra])
+        out = capsys.readouterr().out.splitlines()
+        cols = out[0].split(",")
+        rows = {r.split(",")[2]: dict(zip(cols, r.split(","))) for r in out[1:]}
+        return rows["adaptive"]["swaps"]
+
+    assert swaps() == "2"
+    assert swaps("--no-skip-pending") == "4"
+
+
 def test_adaptive_boundaries_are_inclusive_as_in_strata():
     # Strata: candidates need `usage >= 2.0`, and a pair swaps unless
     # `cand < victim + margin`, so gain == margin and usage == min_count swap.

@@ -233,7 +233,7 @@ the cause:
 | usage counters at or above `min_count` 2.0 at the first adaptation (round 3) | 18567 of 24576 (76 %); 22048 (90 %) at the fifth |
 | candidate swaps that pass the margin at the first adaptation | 3401 |
 | swaps taken (cap 96) | 96 per adaptation: 480 in the 5 prefill adaptations, 10.8 % of the 4441 slots |
-| adaptations taken at the cap | all of them up to round 83; round 87 is the first shortfall (91); 96 recurs later, in 30 of the 69 adaptations (all 5 in prefill, 25 of 64 in decode) |
+| adaptations taken at the cap | all of them up to round 83; round 87 is the first shortfall (91); 96 recurs later: 30 of the 69 adaptations are at the cap in all (21 up to round 83, 9 after the first shortfall; all 5 prefill adaptations, 25 of 64 in decode) |
 
 **Why a 512-token ubatch fools the swap rule.** The constants (`min_count` 2.0, margin
 1.5, decay 0.7, 96 swaps, every 4 rounds) were chosen for rounds that add 10 counts per
@@ -272,9 +272,13 @@ Per policy on long-0 (`long-0-blocks.csv`, token-weighted within the block):
   either way (the column is identical in decode, where a round is one token).
 - **The decode that follows is not visibly harmed.** The decode part of this trace scores
   0.702 for adaptive, 0.446 static, 0.399 first-touch, after the prefill's 480 swaps. The
-  control is the same trace, same training, decode rounds only, no prefill in the run:
-  adaptive 0.705 (last row of `long-0-blocks.csv`; mean of the four quarters in
-  `decode-quarters.csv`). So the prefill swaps cost 0.003 here. First-touch loses a lot
+  control is the same trace, decode rounds only, no prefill in the run: adaptive 0.705
+  (last row of `long-0-blocks.csv`; mean of the four quarters in `decode-quarters.csv`).
+  It is not a clean attribution to the prefill swaps, because the control's static
+  profile is counted over decode rounds only while the phase=all run's is counted over
+  all rounds (static 0.454 against 0.446), so the two start from different profiles. The
+  cleaner comparison is `seed` against `on` in the arms below (0.703 against 0.703 at
+  7 GiB): the prefill swaps change decode very little. First-touch loses a lot
   from being filled by the prompt (0.399 after prefill; its decode-only quarters average
   0.562 on long-0), which is the same effect seen from the other policy.
 - **Adaptive's rise over the 256 decode rounds is real on the short traces and is
@@ -295,18 +299,19 @@ Per policy on long-0 (`long-0-blocks.csv`, token-weighted within the block):
 
   On chat and code adaptive keeps climbing through the quarters, so a 256-token trace
   understates the steady state for such sessions (by how much is not measured). On the
-  long set it gains in the second quarter and is flat after (long-0 0.652 / 0.714 /
-  0.704 / 0.751; long-1 0.656 / 0.744 / 0.797 / 0.697). The rise through the 32-round
+  long set it gains in the second quarter and shows no consistent trend after (long-0
+  0.652 / 0.714 / 0.704 / 0.751; long-1 0.656 / 0.744 / 0.797 / 0.697). The rise through the 32-round
   blocks of the phase=all long-0 table above (0.596, then 0.71 to 0.77) is not evidence
   of continued learning: its counters start from the prefill, which decays over about 64
-  rounds (0.7 per 4 rounds), and the decode-only run of the same trace is flat after the
-  first quarter.
+  rounds (0.7 per 4 rounds), and the decode-only run of the same trace shows no consistent
+  trend after the first quarter.
 
 **Arms for what the cache does in prefill.** The simulator has `--prefill-swaps
 on|off|seed` (`prefill-arms.py`, `prefill-arms.csv`, `summary-prefill-arms.csv`): `on`
 is the default; `off` scores prefill rounds but neither counts nor swaps in them (the
 cache stays at the static profile until decode, and the cadence counts only the
-remaining rounds); `seed` counts usage in prefill and decays it, without swapping.
+remaining rounds); `seed` counts usage in prefill without swapping (no decay until the first decode
+adaptation).
 Long set held out, IQ3_XXS, prefill hit rate / decode hit rate, token-weighted. The
 decode share is the full run's pairs minus a run cut to the prefill rounds; the two
 shares recombine to the all-rounds rate in the file.
@@ -327,9 +332,9 @@ What the arms say, and do not say:
 - A frozen cache in prefill scores exactly the static profile there (the `off` row
   equals the static row), 0.07 below swapping at 7 GiB. Freezing is not obviously better
   in prefill, and it is below first-touch (0.463 at 7 GiB) in either case.
-- Decode after a frozen prefill is slightly better than after a swapping one at 4 GiB
-  (0.588 against 0.550) and 7 GiB (0.716 against 0.703; Q8_0 0.451 against 0.398), and
-  slightly worse at 14 GiB (0.855 against 0.868). The per-trace values at 7 GiB are
+- Decode after a frozen prefill is better than after a swapping one at 4 GiB (0.588
+  against 0.550, +0.038) and 7 GiB (0.716 against 0.703, +0.013; Q8_0 0.451 against
+  0.398, +0.053), and worse at 14 GiB (0.855 against 0.868, -0.013). The per-trace values at 7 GiB are
   long-0 0.708 against 0.702 and long-1 0.725 against 0.705.
 - `seed` decodes like `on` (0.703 and 0.703 at 7 GiB; 0.868 against 0.868 at 14 GiB):
   the prompt's counts are what matter, not its swaps, and carrying them costs nothing
@@ -522,7 +527,9 @@ into device scratch per dispatch). Two readings are open:
 
 - *Allowed.* A swap is a placement change made between dispatches by the planner; every
   dispatch still runs where its data is, and no weight is copied per dispatch or into
-  scratch. The "streaming" clause is about per-dispatch copies.
+  scratch. The "streaming" clause is about per-dispatch copies, and the ruling says
+  placement is chosen "for fit and for where execution will be most optimal"
+  (`sycl-memory-design.md:62`), which a measured routing stream can inform.
 - *Not allowed.* Placement is decided once, and a cache that re-places experts while the
   model runs is outside the ruling, however it is dispatched. The clause that says a
   VRAM-starved configuration that is too slow on the CPU is fixed by "placement (budget,
@@ -575,7 +582,7 @@ of these was done here.
 - **Traces are 256 decode tokens**, each started from a fresh cache. On chat and code
   adaptive is still improving at the end of the trace (section 4, quarters), so its
   numbers are conservative for such sessions by an amount not measured; on the long
-  set it is flat after the first quarter. First-touch needs no warm-up beyond the fill.
+  set it shows no consistent trend after the first quarter. First-touch needs no warm-up beyond the fill.
 - **Token-weighted means mix sets of different sizes** (decode: 1024, 1024, 512 test
   tokens for chat, code, long; `phase=all`: 1199, 1336, 18948).
   The per-set table in section 3 shows the spread; no set-balanced mean is used.
