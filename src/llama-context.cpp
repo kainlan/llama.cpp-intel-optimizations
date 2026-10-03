@@ -2992,7 +2992,9 @@ void llama_context::fused_resolution_report_lost() noexcept {
 // The call that replaces this stub (llama.cpp-hdpd) owes two things the pure iteration cannot do for it. The probe it
 // passes returns a llama_residency_probe_answer, and the adapter from ggml_backend_sycl_probe_residency maps OK to OK
 // and every other status (GEOMETRY_NOT_WIRED, NOT_ANSWERED, any value it does not know) to a status other than OK,
-// never to an all-zero residency. And it throws llama_residency_fixpoint_refusal_text(result) for every result for
+// never to an all-zero residency. A null proc address (the backend does not export it) maps to NOT_ANSWERED, and
+// host_resident is read only when the ggml status is OK. REFUSED and NOT_ANSWERED behave the same in the fixpoint and
+// differ only in the reason. And the call throws llama_residency_fixpoint_refusal_text(result) for every result for
 // which llama_residency_fixpoint_refused(result.status) holds, so a PROBE_FAILED fixpoint is a named construction
 // failure and never an acquired plan (llama.cpp-71hq).
 void llama_context::sched_residency_fixpoint() {

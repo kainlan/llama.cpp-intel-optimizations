@@ -70,7 +70,10 @@ using llama_tenants   = std::vector<ggml_sycl_context_tenant_desc>;
 // ggml_backend_sycl_probe_residency status into this one: OK maps to OK, and every other value, GEOMETRY_NOT_WIRED
 // and NOT_ANSWERED both included and any value the adapter does not know, maps to a status other than OK, with the
 // backend's reason. It must NEVER answer an all-zero residency in their place: "zero host layers" reads as "every
-// layer is device-resident", the answer that fits an unanswered probe least (llama.cpp-71hq).
+// layer is device-resident", the answer that fits an unanswered probe least (llama.cpp-71hq). Two more duties of the
+// adapter: a null proc address (the backend does not export ggml_backend_sycl_probe_residency) maps to NOT_ANSWERED,
+// so it refuses; and host_resident is read only when the ggml status is OK, never on any other status.
+// REFUSED and NOT_ANSWERED behave the same in the fixpoint and differ only in the reason.
 enum llama_residency_probe_status {
     LLAMA_RESIDENCY_PROBE_NOT_ANSWERED = 0,  // the probe produced nothing (also the default)
     LLAMA_RESIDENCY_PROBE_OK,                // `residency` is the backend's answer
