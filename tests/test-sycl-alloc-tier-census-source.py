@@ -191,14 +191,19 @@ def test_every_switch_that_names_file_mapped_names_host_cpu():
                     seen += 1
                     if not re.search(rf"\b{enum}\s*::\s*HOST_CPU\b", body):
                         missing.append(f"{rel}:{line} {enum}")
-    assert seen >= 9, f"the census found only {seen} switches that name FILE_MAPPED, expected at least 9"
+    assert seen == 10, f"the census found {seen} switches that name FILE_MAPPED, expected exactly 10"
     assert not missing, "switches that name FILE_MAPPED and not HOST_CPU: " + ", ".join(missing)
 
 
 def test_a_host_cpu_pointer_is_never_resolved_for_a_device():
     code = sycl_sources()["mem-handle.cpp"]
     body = function_body(code, r"resolved_ptr\s+mem_handle::resolve\s*\(\s*int\s+device_id\s*\)\s*const")
-    assert re.search(r"\balloc_tier\s*::\s*HOST_CPU\b", body), "resolve(device_id) hands out a HOST_CPU pointer"
+    # the two CPU-only tiers share one refusal, not two copies of it
+    assert re.search(
+        r"alloc_tier\s*::\s*FILE_MAPPED\s*\|\|\s*\w+\s*==\s*alloc_tier\s*::\s*HOST_CPU\s*\)"
+        r"\s*\{\s*return\s*\{\s*\}\s*;",
+        body,
+    ), "resolve(device_id) hands out a HOST_CPU pointer, or refuses it apart from FILE_MAPPED"
 
 
 def test_host_cpu_is_named_only_where_it_is_not_handed_to_a_device():
@@ -291,6 +296,80 @@ def test_unified_alloc_serves_host_cpu_through_the_one_wrapper():
         "unified-cache.cpp:unified_cache_raw_alloc_host_cpu",
         "unified-cache.cpp:unified_cache_raw_free_host_cpu",
     ], callers
+
+
+# ---- M1: no lock across the mapping ----
+
+
+def blank_literals(code: str) -> str:
+    """The text with string and character literal contents blanked, so a brace inside one is not a scope."""
+    return re.sub(
+        r"\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'",
+        lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2) + m.group(0)[0],
+        code,
+    )
+
+
+LOCK_DECL = re.compile(
+    r"\b(?:std\s*::\s*)?(?:lock_guard|unique_lock|scoped_lock|shared_lock)\s*(?:<[^>]*>)?\s*\w+\s*[({]"
+    r"|\bmem_handle_lock_guard\s+\w+\s*[({]"
+    r"|\.\s*lock\s*\(\s*\)"
+)
+
+
+def locks_open_at(code: str, pos: int) -> list:
+    """The lock declarations whose enclosing scope is still open at `pos` (a lock in a block that has closed is not)."""
+    scopes = [[]]
+    decls = sorted(m.start() for m in LOCK_DECL.finditer(code[:pos]))
+    nxt = 0
+    for i in range(pos):
+        while nxt < len(decls) and decls[nxt] == i:
+            scopes[-1].append(code[i : i + 60].split("\n")[0])
+            nxt += 1
+        if code[i] == "{":
+            scopes.append([])
+        elif code[i] == "}" and len(scopes) > 1:
+            scopes.pop()
+    return [d for scope in scopes for d in scope]
+
+
+def test_no_lock_is_held_across_the_host_cpu_mapping():
+    body = blank_literals(
+        function_body(
+            sources_text("unified-cache.cpp"), r"bool\s+unified_alloc\s*\(\s*const\s+alloc_request\s*&\s+req_in,"
+        )
+    )
+    call = [m.start() for m in re.finditer(r"\bunified_cache_raw_alloc_host_cpu\s*\(", body)]
+    assert len(call) == 1
+    held = locks_open_at(body, call[0])
+    assert not held, f"a lock is held across the mmap/mlock of a HOST_CPU request: {held}"
+
+
+def test_the_lock_scope_reader_sees_an_open_lock_and_ignores_a_closed_one():
+    closed = "void f() { { std::lock_guard<std::mutex> l(m); x(); } work(); }"
+    assert locks_open_at(closed, closed.index("work")) == []
+    open_ = "void f() { std::lock_guard<std::mutex> l(m); { y(); } work(); }"
+    assert len(locks_open_at(open_, open_.index("work"))) == 1
+    nested = "void f() { if (a) { std::unique_lock<std::mutex> l(m); work(); } }"
+    assert len(locks_open_at(nested, nested.index("work"))) == 1
+    manual = "void f() { m.lock(); work(); }"
+    assert len(locks_open_at(manual, manual.index("work"))) == 1
+
+
+# ---- M2: a HOST_CPU request cannot ask for an alignment the mapping does not give ----
+
+
+def test_host_cpu_refuses_an_alignment_beyond_a_page_at_both_entries():
+    hpp = strip_comments((SYCL_DIR / "host-cpu-mapping.hpp").read_text())
+    assert re.search(r"HOST_CPU_MAX_ALIGNMENT\s*=\s*4096\b", hpp), "no HOST_CPU alignment cap of one 4 KiB page"
+    cache = sources_text("unified-cache.cpp")
+    pattern = r"must_host_cpu\s*&&\s*[\w.]*alignment\s*>\s*HOST_CPU_MAX_ALIGNMENT"
+    for name, header in (
+        ("unified_alloc", r"bool\s+unified_alloc\s*\(\s*const\s+alloc_request\s*&\s+req_in,"),
+        ("the owner entry", r"static\s+allocation_result\s+unified_allocate_owner_impl\s*\("),
+    ):
+        body = function_body(cache, header)
+        assert re.search(pattern, body), f"{name} does not refuse a HOST_CPU alignment beyond the cap"
 
 
 def test_the_owner_entry_refuses_the_combination_and_keeps_the_class_exact():

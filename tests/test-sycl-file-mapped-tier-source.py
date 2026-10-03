@@ -168,7 +168,10 @@ def test_device_mappable_excludes_file_mapped():
 def test_resolve_for_a_device_refuses_a_file_mapped_owner():
     body = function_body(code("mem-handle.cpp"), r"resolved_ptr\s+mem_handle::resolve\s*\(\s*int\s+device_id\s*\)\s*const")
     assert "alloc_tier::FILE_MAPPED" in body, "mem_handle::resolve(device) does not refuse a FILE_MAPPED owner"
-    assert re.search(r"FILE_MAPPED\s*\)\s*\{\s*return\s*\{\s*\}\s*;", body), "the refusal does not return an empty pointer"
+    # alone, or beside the other CPU-only tier in one condition (llama.cpp-th32 T1b)
+    assert re.search(
+        r"FILE_MAPPED\s*(?:\|\|\s*\w+\s*==\s*alloc_tier::HOST_CPU\s*)?\)\s*\{\s*return\s*\{\s*\}\s*;", body
+    ), "the refusal does not return an empty pointer"
 
 
 # ---- 5. the legacy raw entry ----

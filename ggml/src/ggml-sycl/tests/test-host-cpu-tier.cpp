@@ -239,6 +239,24 @@ void refusals_leave_nothing_behind() {
 
     check(!unified_allocate_owner(host_cpu_request(0, alloc_role::LAZY_ROW_CACHE)), "a zero-byte request was accepted");
 
+    // mmap gives a page, so a HOST_CPU request cannot ask for more than one: an alignment past it is refused by name,
+    // at the owner entry and at the legacy raw entry, and one page (or none) is still served
+    alloc_request aligned = host_cpu_request(size, alloc_role::LAZY_ROW_CACHE);
+    aligned.alignment     = 8192;
+    refused               = unified_allocate_owner(aligned);
+    check(!refused && !refused.owner, "an 8192-byte alignment was accepted by the owner entry");
+    check(refused.error == allocation_error::INVALID_REQUEST, "that alignment refusal is not INVALID_REQUEST");
+    alloc_handle legacy;
+    check(!unified_alloc(aligned, &legacy), "an 8192-byte alignment was accepted by unified_alloc");
+    check(!legacy.ptr, "a refused alignment left a pointer");
+    for (size_t alignment : { (size_t) 0, (size_t) 4096 }) {
+        aligned.alignment          = alignment;
+        allocation_result accepted = unified_allocate_owner(aligned);
+        skip_if_unlockable(accepted, host_cpu_mapped_size(size));
+        check(static_cast<bool>(accepted), "an alignment within a page was refused");
+        check(((uintptr_t) accepted.owner.metadata().ptr & 4095u) == 0, "the mapping is not page aligned");
+    }
+
     check(coordinator->live_controls() == 0, "a refusal left a live control");
     check(allocation_registry_test_size() == rows_before, "a refusal left a registry record");
     check(unified_cache_host_cpu_munmap_count_for_test() == munmaps_before, "a refusal mapped something");
@@ -340,6 +358,7 @@ void role_bytes_with_a_device_cache() {
     allocation_result row     = unified_allocate_owner(host_cpu_request(row_bytes, alloc_role::LAZY_ROW_CACHE));
     allocation_result staging = unified_allocate_owner(host_cpu_request(staging_bytes, alloc_role::LAZY_STAGING));
     skip_if_unlockable(row, host_cpu_mapped_size(row_bytes));
+    skip_if_unlockable(staging, host_cpu_mapped_size(staging_bytes));
     check(static_cast<bool>(row) && static_cast<bool>(staging), "the front door refused a valid HOST_CPU request");
     check(read(alloc_role::LAZY_ROW_CACHE) == row_before + row_bytes,
           "the row-cache role is not the allocation's size");
