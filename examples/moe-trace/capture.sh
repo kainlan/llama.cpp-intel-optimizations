@@ -53,7 +53,9 @@ for f in "${files[@]}"; do
     id=$(basename "$f" .txt)
     set_name=${id%-*}
     n_ctx=2048
-    if [ "$set_name" = "long" ]; then n_ctx=10240; fi
+    # long prompts are 8-10K tokens (long-0 measured 10218) plus -n; 12288 leaves about 1.8K
+    # of margin at the default -n 256. Raise it if you raise MOE_TRACE_N_PREDICT a lot.
+    if [ "$set_name" = "long" ]; then n_ctx=12288; fi
     echo "== $id (set $set_name, -c $n_ctx, -n $n_predict)"
     if "$bin" -m "$model" -f "$f" -n "$n_predict" -c "$n_ctx" \
         --trace-out "$out/$id.moetrace" --trace-set "$set_name" --trace-id "$id" \

@@ -14,7 +14,11 @@
 //     each followed by n_tokens * k u16 expert ids.
 // A new step starts when the layer index does not increase (one step = one ubatch evaluation).
 // Within one layer, tokens arrive in order, so the n-th row seen for a layer is that layer's n-th
-// token. The last layer of a prompt ubatch may carry only the rows that produce output.
+// token. The last layer of a prompt ubatch carries only the rows that produce output, and for a
+// ubatch that produces none (every ubatch of a long prompt but the last) llama's output-row
+// gather trims it to ZERO rows: the router's top-k arrives as [k, 0]. That is recorded as a
+// header-only record with n_tokens 0 (k kept, no ids), so each layer still appears once per step
+// and the step boundary stays detectable. Any other malformed top-k tensor is an error.
 //
 //   llama-moe-trace -m model.gguf -f prompt.txt -n 256 -c 9216
 //       --trace-out code-0.moetrace --trace-set code --trace-id code-0
@@ -131,8 +135,9 @@ bool trace_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     if (st->failed) {
         return true;
     }
+    // ne[1] == 0 is the legitimate zero-row last layer of a no-output ubatch (see the top of the file)
     if (t->type != GGML_TYPE_I32 || t->ne[2] != 1 || t->ne[3] != 1 || t->nb[0] != sizeof(int32_t) || t->ne[0] <= 0 ||
-        t->ne[0] > 65535 || t->ne[1] <= 0) {
+        t->ne[0] > 65535 || t->ne[1] < 0) {
         LOG_ERR("%s: unexpected top-k tensor %s (type %d, ne %lld %lld %lld)\n", __func__, t->name, (int) t->type,
                 (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2]);
         st->failed = true;
@@ -142,27 +147,29 @@ bool trace_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     const size_t k    = (size_t) t->ne[0];
     const size_t nt   = (size_t) t->ne[1];
     // rows may be a strided view of the full argsort result: copy the covering span once
-    const size_t span = t->nb[1] * (nt - 1) + k * sizeof(int32_t);
-
-    const uint8_t * data = nullptr;
-    if (t->buffer == nullptr || (ggml_backend_buffer_is_host(t->buffer) && !st->force_copy)) {
-        data = (const uint8_t *) t->data;
-    } else {
-        st->raw.resize(span);
-        ggml_backend_tensor_get(t, st->raw.data(), 0, span);
-        data = st->raw.data();
-    }
+    const size_t span = nt > 0 ? t->nb[1] * (nt - 1) + k * sizeof(int32_t) : 0;
 
     st->ids.resize(k * nt);
-    for (size_t r = 0; r < nt; ++r) {
-        const int32_t * row = (const int32_t *) (data + r * t->nb[1]);
-        for (size_t c = 0; c < k; ++c) {
-            if (row[c] < 0 || row[c] > 65535) {
-                LOG_ERR("%s: expert id %d out of u16 range in %s\n", __func__, (int) row[c], t->name);
-                st->failed = true;
-                return true;
+    if (nt > 0) {
+        const uint8_t * data = nullptr;
+        if (t->buffer == nullptr || (ggml_backend_buffer_is_host(t->buffer) && !st->force_copy)) {
+            data = (const uint8_t *) t->data;
+        } else {
+            st->raw.resize(span);
+            ggml_backend_tensor_get(t, st->raw.data(), 0, span);
+            data = st->raw.data();
+        }
+
+        for (size_t r = 0; r < nt; ++r) {
+            const int32_t * row = (const int32_t *) (data + r * t->nb[1]);
+            for (size_t c = 0; c < k; ++c) {
+                if (row[c] < 0 || row[c] > 65535) {
+                    LOG_ERR("%s: expert id %d out of u16 range in %s\n", __func__, (int) row[c], t->name);
+                    st->failed = true;
+                    return true;
+                }
+                st->ids[r * k + c] = (uint16_t) row[c];
             }
-            st->ids[r * k + c] = (uint16_t) row[c];
         }
     }
 
@@ -276,6 +283,32 @@ int selftest_write(const char * path) {
     ggml_tensor * bare = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, 1);
     ggml_set_name(bare, "ffn_moe_topk-");
 
+    // a two-ubatch prompt with k = 10: ubatch A is layer 3 with 2 rows, then layer 11 trimmed to
+    // ZERO rows ([10, 0], a view of `parent`, never read); ubatch B is both layers with one row.
+    ggml_tensor * a3 = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 10, 2);
+    for (int r = 0; r < 2; ++r) {
+        for (int c = 0; c < 10; ++c) {
+            ((int32_t *) a3->data)[r * 10 + c] = r * 7 + c;
+        }
+    }
+    ggml_set_name(a3, "ffn_moe_topk-3");
+    ggml_tensor * a11 = ggml_view_2d(ctx, parent, 10, 0, parent->nb[1], 0);
+    ggml_set_name(a11, "ffn_moe_topk-11");
+    ggml_tensor * b3  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 10, 1);
+    ggml_tensor * b11 = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 10, 1);
+    for (int c = 0; c < 10; ++c) {
+        ((int32_t *) b3->data)[c]  = 100 + c;
+        ((int32_t *) b11->data)[c] = 200 + c;
+    }
+    ggml_set_name(b3, "ffn_moe_topk-3");
+    ggml_set_name(b11, "ffn_moe_topk-11");
+
+    // malformed top-k tensors that must still be errors: three dims, and zero columns
+    ggml_tensor * bad3d = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 4, 1, 2);
+    ggml_set_name(bad3d, "ffn_moe_topk-5");
+    ggml_tensor * bad0k = ggml_view_2d(ctx, parent, 0, 2, parent->nb[1], 0);
+    ggml_set_name(bad0k, "ffn_moe_topk-5");
+
     trace_state st;
     st.file             = f;
     st.phase            = PHASE_DECODE;
@@ -290,6 +323,22 @@ int selftest_write(const char * path) {
 
     st.force_copy = true;
     ok = ok && trace_cb_eval(view2, true, &st) && trace_cb_eval(view2, false, &st) && st.records == 4 && !st.failed;
+    st.force_copy = false;
+
+    // the zero-row layer is written as a record with n_tokens 0 and starts no extra step
+    ggml_tensor * seq2[] = { a3, a11, b3, b11 };
+    for (ggml_tensor * t : seq2) {
+        ok = ok && trace_cb_eval(t, true, &st) && trace_cb_eval(t, false, &st);
+    }
+    ok = ok && st.records == 8 && st.step == 3 && !st.failed;
+
+    // anything else malformed is still an error, and writes nothing
+    ggml_tensor * bad[] = { bad3d, bad0k };
+    for (ggml_tensor * t : bad) {
+        trace_state bs;
+        bs.file = f;
+        ok      = ok && trace_cb_eval(t, true, &bs) && trace_cb_eval(t, false, &bs) && bs.failed && bs.records == 0;
+    }
 
     ggml_backend_buffer_free(buf2);
     ggml_free(ctx2);

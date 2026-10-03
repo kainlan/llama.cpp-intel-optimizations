@@ -431,6 +431,31 @@ def test_capture_script_usage_stops_at_the_usage_block():
     assert out.rstrip("\n").splitlines()[-1] != "#"
 
 
+def test_capture_script_gives_long_prompts_a_context_that_fits_them(tmp_path):
+    # a stub stands in for llama-moe-trace, so no model is loaded: it records its argv.
+    # long-0 measured 10218 tokens (+ -n 256) and overflowed the old -c 10240.
+    stub = tmp_path / "stub.sh"
+    stub.write_text('#!/usr/bin/env bash\necho "$@" >> "$STUB_LOG"\n'
+                    'echo "moe-trace: stub"\n')
+    stub.chmod(0o755)
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    for name in ("code-0", "long-0", "long-1"):
+        (prompts / (name + ".txt")).write_text("x")
+    log = tmp_path / "args.log"
+    env = dict(os.environ, LLAMA_MOE_TRACE_BIN=str(stub), STUB_LOG=str(log))
+    r = subprocess.run(["bash", str(ROOT / "examples" / "moe-trace" / "capture.sh"),
+                        "m.gguf", str(prompts), str(tmp_path / "out")],
+                       capture_output=True, text=True, check=False, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    ctx = {}
+    for line in log.read_text().splitlines():
+        a = line.split()
+        ctx[a[a.index("--trace-id") + 1]] = int(a[a.index("-c") + 1])
+    assert ctx == {"code-0": 2048, "long-0": 12288, "long-1": 12288}
+    assert 10218 + 256 < ctx["long-0"]
+
+
 def test_leave_one_out_validates_the_traces_once(monkeypatch):
     calls = []
     real = sim.validate_traces
@@ -621,6 +646,38 @@ def test_trace_bad_magic_and_truncation_are_refused(tmp_path):
         sim.read_trace(cut)
 
 
+def test_zero_row_record_round_trips(tmp_path):
+    # llama trims the last layer of a no-output ubatch to zero rows; the tool writes
+    # that layer with n_tokens 0 (k kept) so each layer still appears once per step
+    p = tmp_path / "z.moetrace"
+    sim.write_trace(p, {"set": "z"},
+                    [(0, 3, 0, [[1, 2], [3, 4]]), (0, 5, 0, [], 2), (1, 3, 0, [[1, 2]])])
+    t = sim.read_trace(p)
+    assert [s.index for s in t.steps] == [0, 1]
+    assert t.steps[0].layers == {3: [[1, 2], [3, 4]], 5: []}
+    assert t.steps[0].n_tokens == 2   # the step's token count is its widest layer
+    # without a k an empty row list still writes nothing (the old behaviour)
+    q = tmp_path / "q.moetrace"
+    sim.write_trace(q, {"set": "z"}, [(0, 3, 0, [[1, 2]]), (0, 5, 0, [])])
+    assert sim.read_trace(q).steps[0].layers == {3: [[1, 2]]}
+
+
+def test_zero_row_layer_is_neither_coverage_nor_routed_pairs():
+    steps = [
+        sim.Step(index=0, phase=0, n_tokens=2, layers={0: [[0, 1], [2, 3]], 1: []}),
+        sim.Step(index=1, phase=0, n_tokens=1, layers={0: [[0, 1]], 1: [[1, 2]]}),
+    ]
+    tr = sim.Trace({"set": "s"}, steps)
+    summary = sim.trace_summary(tr, n_expert=4)
+    # coverage averages the layer records that carry rows: (1.0 + 0.5 + 0.5) / 3
+    assert summary["prefill_expert_coverage"] == pytest.approx(2 / 3)
+    assert summary["prefill_empty_layer_records"] == 1
+    assert summary["prefill_tokens"] == 3
+    res = sim.simulate_static({0: {0, 1}, 1: {1, 2}}, [tr], {0: GIB, 1: GIB}, phase="prefill")
+    # 4 + 2 + 2 routed pairs; the zero-row record adds none
+    assert (res.hits, res.total, res.tokens) == (6, 8, 3)
+
+
 def test_cxx_tool_selftest_writes_a_trace_the_simulator_reads(tmp_path):
     binary = os.environ.get("LLAMA_MOE_TRACE_BIN")
     candidates = [pathlib.Path(binary)] if binary else [
@@ -643,10 +700,18 @@ def test_cxx_tool_selftest_writes_a_trace_the_simulator_reads(tmp_path):
     assert t.steps[0].layers[7] == [[r * 11 + c for c in range(8)] for r in range(3)]
     assert t.steps[0].layers[9] == [[r * 5 + c for c in range(4)] for r in range(2)]
     # layer index not increasing starts a new step
-    assert len(t.steps) == 2
     assert t.steps[1].layers[7] == [[0, 1, 2, 3, 4, 5, 6, 7]]
     # layer 11: a strided view read through ggml_backend_tensor_get
     assert t.steps[1].layers[11] == [[r * 13 + c for c in range(6)] for r in range(2)]
+    # a multi-ubatch prompt: step 2 is a ubatch whose last layer (11) was trimmed to
+    # ZERO rows ([10, 0]) by llama's output-row gather. It is recorded, with n_tokens 0,
+    # so every layer still appears once per step; step 3 is the next ubatch, in full.
+    assert len(t.steps) == 4
+    assert t.steps[2].layers[3] == [[r * 7 + c for c in range(10)] for r in range(2)]
+    assert t.steps[2].layers[11] == []
+    assert t.steps[2].n_tokens == 2
+    assert t.steps[3].layers[3] == [[100 + c for c in range(10)]]
+    assert t.steps[3].layers[11] == [[200 + c for c in range(10)]]
 
 
 # ---------------------------------------------------------------------------
