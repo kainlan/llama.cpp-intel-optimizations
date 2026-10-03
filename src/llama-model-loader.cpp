@@ -1162,6 +1162,7 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 // llama.cpp-ir18. Pick the best buffer type in `buft_list` that is OWNED BY THE CPU
 // BACKEND, skipping the host buffer types that other backends expose.
 //
@@ -1228,6 +1229,7 @@ static ggml_backend_buffer_type_t select_weight_buft_cpu_owned(const llama_hpara
     }
     return last;
 }
+#endif
 
 ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
