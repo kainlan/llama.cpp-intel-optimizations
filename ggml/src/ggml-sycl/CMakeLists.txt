@@ -2424,7 +2424,7 @@ if "fail_next_retained_handle_publication_for_test" in symbols:
     raise SystemExit("retained-publication test seam escaped into the ordinary ggml-sycl DSO")
 ]=] ${CMAKE_NM} $<TARGET_FILE:ggml-sycl>)
     set_tests_properties(sycl-retained-publication-no-export PROPERTIES
-        LABELS "sycl;host;source-contract;exports")
+        LABELS "sycl;host;source-contract;exports;python")
 endif()
 endif() # direct-source static SYCL fixture
 
@@ -6117,7 +6117,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     raise SystemExit("no failpoint symbol found in the private fixture: the export probe is vacuous")
 ]=] ${CMAKE_NM} $<TARGET_FILE:ggml-sycl> $<TARGET_FILE:test-sycl-staging-replacement-failpoints>)
         set_tests_properties(sycl-staging-failpoint-no-export PROPERTIES
-            LABELS "sycl;host;source-contract;exports")
+            LABELS "sycl;host;source-contract;exports;python")
     endif()
 
     # Adversarial cache-backing provenance (llama.cpp-fhqe).  CACHE_BACKING is

@@ -45,10 +45,14 @@ Rules, per tests/test-sycl-*.py:
       registration behind a configuration guard, in an uncalled function()/macro(), in an empty foreach() or in an
       unvisited directory cannot hide. Gates a default configuration legitimately lacks are in
       CENSUS_ABSENT_ALLOWLIST with a reason;
-  R8  (only with --census BUILD_DIR) every ctest registration of that build whose command runs a .py file carries the
-      `python` label, as a whole member of its LABELS list. `ctest -L python` is the python census, and a registration
-      without the label is invisible to it (llama.cpp-gogg: 67 were, one of them red on master). This reads the
-      build's ctest files, so it covers .py files that are not tests/test-sycl-*.py and every registrar.
+  R8  (only with --census BUILD_DIR) every ctest registration of that build whose program is a python interpreter (or a
+      .py file) carries the `python` label, as a whole member of its LABELS list, whether it runs a .py file,
+      `-c <inline>` or `-m pytest <dir>`; a .py in the arguments of a non-python program does not count. `ctest -L
+      python` is the python census, and a registration without the label is invisible to it (llama.cpp-gogg: 67 were,
+      one of them red on master). This reads the build's ctest files, so it covers .py files that are not
+      tests/test-sycl-*.py and every registrar. PYTHON_LABEL_EXEMPT lists the registrations that stay unlabelled
+      because they drive device work (`-L python` must stay free of it), each with its reason; an entry is reported
+      once the build no longer registers the test or the test carries `python` after all.
 
 Known limit: without --census this reads every CMakeLists.txt under the tree statically, so it does not know whether
 CMake reaches a registration. A registration in an uncalled function()/macro(), in a foreach() over an empty list,
@@ -1246,6 +1250,27 @@ def census(root, build_dir, absent_allowlist=None, tests_dir=None):
     return problems
 
 
+def python_command(command_tokens):
+    """What a test command [program, args...] runs under python, or None: the first .py argument, `-c <inline>` or
+    `-m <module>` of a python interpreter, or the .py file that is itself the program. The program decides: a `.py` in
+    the arguments of cmake or a test binary (`-DGATE=a.py`) is not a python test, and a python command with no .py file
+    (`python -c <inline>`, `python -m pytest <dir>`) is. The .py match ignores case."""
+    if not command_tokens:
+        return None
+    program, rest = command_tokens[0], command_tokens[1:]
+    if program.lower().endswith(".py"):
+        return program
+    if not INTERPRETER.fullmatch(program):
+        return None
+    script = next((tok for tok in rest if tok.lower().endswith(".py")), None)
+    if script:
+        return script
+    for flag, arg in zip(rest, rest[1:] + [""]):
+        if flag in ("-c", "-m"):
+            return "python %s %s" % (flag, arg.strip().splitlines()[0][:40] if arg.strip() else "")
+    return "python"
+
+
 def label_census(build_dir, exempt=None):
     """R8: every ctest registration of a configured build whose command runs a .py file carries the `python` label.
 
@@ -1253,7 +1278,8 @@ def label_census(build_dir, exempt=None):
     (llama.cpp-gogg: 67 were, among them sycl-lifecycle-source-contract, which sat red on master while a merge claimed
     "ctest -L python 116/116"). Read from the configured build's ctest files, so every registrar counts (add_test,
     llama_test_pytest, llama_test_cmd, a function that calls one) and not only the spellings a CMakeLists.txt scan knows.
-    A .py command is any test with a .py token after the program; the label must be a whole member of the LABELS list
+    A python command is any test whose program is a python interpreter (or is a .py file), whether it runs a .py file,
+    `-c <inline>` or `-m pytest <dir>` (python_command); the label must be a whole member of the LABELS list
     (`python-extra` is not `python`), and APPENDed or set_property labels count. PYTHON_LABEL_EXEMPT names the
     registrations that drive device work and must stay out of `-L python`."""
     exempt = PYTHON_LABEL_EXEMPT if exempt is None else exempt
@@ -1266,9 +1292,9 @@ def label_census(build_dir, exempt=None):
         for name, args in cmake_commands((Path(dirpath) / "CTestTestfile.cmake").read_text(errors="replace")):
             if name == "add_test":
                 tokens = cmake_tokens(args)
-                script = next((tok for tok in tokens[1:] if tok.endswith(".py")), None)
-                if tokens and script:
-                    scripts[tokens[0]] = script
+                what = python_command(tokens[1:])
+                if tokens and what:
+                    scripts[tokens[0]] = what
             elif name in ("set_tests_properties", "set_property"):
                 names, pairs = _property_defects(name, args)
                 for test in names:
@@ -1280,7 +1306,7 @@ def label_census(build_dir, exempt=None):
     problems = ["R8 %s runs %s but does not carry the `python` label (labels: %s): `ctest -L python` skips it, so a red "
                 "there is invisible to the python census (add python to its LABELS, or to PYTHON_LABEL_EXEMPT with the "
                 "reason if it drives device work)"
-                % (test, script.rsplit("/", 1)[-1], ";".join(sorted(labels.get(test, ()))) or "none")
+                % (test, script.rsplit("/", 1)[-1] if script.endswith(".py") else script, ";".join(sorted(labels.get(test, ()))) or "none")
                 for test, script in sorted(scripts.items()) if "python" not in labels.get(test, ()) and test not in exempt]
     for test in sorted(exempt):
         if test not in scripts:
@@ -1427,7 +1453,12 @@ def label_census_self_test(base):
             ("llama_test_pytest's default `main` label", 'add_test([=[b]=] %s)\nset_tests_properties([=[b]=] PROPERTIES  LABELS "main" SKIP_RETURN_CODE "77")\n' % stub),
             ("python labelled on another test only", 'add_test([=[b]=] %s)\nadd_test([=[c]=] %s)\nset_tests_properties([=[c]=] PROPERTIES  LABELS "python")\n' % (py, py.replace("sycl-b", "sycl-c"))),
             ("a script run with a flag and an argument", 'add_test([=[b]=] "/usr/bin/python3" "-B" "/x/tests/test-sycl-b.py" "--self-test")\n'),
-            ("a script that is not a test-sycl gate", 'add_test([=[b]=] "/usr/bin/python3" "/x/scripts/some-audit.py")\n')):
+            ("a script that is not a test-sycl gate", 'add_test([=[b]=] "/usr/bin/python3" "/x/scripts/some-audit.py")\n'),
+            ("python -c with an inline script and no .py file", 'add_test([=[b]=] "/usr/bin/python3" "-c" "import sys; sys.exit(0)" "/x/bin/libx.so")\n'),
+            ("python -m pytest over a directory", 'add_test([=[b]=] "/usr/bin/python3" "-m" "pytest" "-q" "/x/tests")\n'),
+            ("a .PY file name in capitals", 'add_test([=[b]=] "/usr/bin/python3" "/x/tests/test-sycl-B.PY")\n'),
+            ("an executable .py file run as the program itself", 'add_test([=[b]=] "/x/scripts/run-gate.py" "--self-test")\n'),
+            ("an unversioned interpreter path", 'add_test([=[b]=] "/opt/py/bin/python" "-c" "pass")\n')):
         problems = run(text)
         if not any(p.startswith("R8 b ") for p in problems):
             failures.append("label census: %s was not reported: %s" % (label, problems))
@@ -1438,7 +1469,12 @@ def label_census_self_test(base):
             ("the pytest stub, python-labelled", 'add_test([=[b]=] %s)\nset_tests_properties([=[b]=] PROPERTIES  LABELS "sycl;python" SKIP_RETURN_CODE "77")\n' % stub),
             ("python through set_property APPEND", 'add_test([=[b]=] %s)\nset_property(TEST b APPEND PROPERTY LABELS python)\n' % py),
             ("a plain name for a bracketed test name", 'add_test([=[b]=] %s)\nset_tests_properties(b PROPERTIES  LABELS "python")\n' % py),
-            ("a test that runs no .py file", 'add_test([=[b]=] "/x/bin/test-mem-ops")\nadd_test([=[c]=] "/usr/bin/bash" "/x/tests/test-sycl-c.sh")\n')):
+            ("a test that runs no .py file", 'add_test([=[b]=] "/x/bin/test-mem-ops")\nadd_test([=[c]=] "/usr/bin/bash" "/x/tests/test-sycl-c.sh")\n'),
+            ("a non-python program with a .py in an argument", 'add_test([=[b]=] "/usr/bin/cmake" "-DGATE=/x/tests/test-sycl-b.py" "-P" "/x/run.cmake")\n'),
+            ("a non-python test binary handed a .py path", 'add_test([=[b]=] "/x/bin/test-thing" "--script" "/x/tests/test-sycl-b.py")\n'),
+            ("python -c, labelled", 'add_test([=[b]=] "/usr/bin/python3" "-c" "pass")\nset_tests_properties([=[b]=] PROPERTIES  LABELS "python")\n'),
+            ("python -m pytest, labelled", 'add_test([=[b]=] "/usr/bin/python3" "-m" "pytest" "/x/tests")\nset_tests_properties([=[b]=] PROPERTIES  LABELS "sycl;python")\n'),
+            ("a program whose name merely starts with python", 'add_test([=[b]=] "/x/bin/python-like-tool" "-c" "x")\n')):
         problems = run(text)
         if problems:
             failures.append("label census: %s was reported: %s" % (label, problems))
