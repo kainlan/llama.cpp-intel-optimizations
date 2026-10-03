@@ -27,7 +27,9 @@ Policies (all per layer, slots = floor(budget bytes / expert bytes)):
                the incoming expert is resident only land_delay rounds after the
                round that decided the swap; usage is multiplied by decay after
                every adaptation. An adaptation is skipped (no decay either)
-               while the previous swaps are still in flight.
+               while the previous swaps are still in flight (--no-skip-pending
+               turns that off; --prefill-swaps off|seed freezes the cache and
+               the counters, or only the swaps, through prefill ubatches).
 
 Reading the result: routing recorded from one quantisation on one backend is
 a PROXY for another (an IQ3_XXS CPU capture stands in for Q8_0 and for SYCL;
@@ -419,15 +421,17 @@ def simulate_first_touch(slots, test, layer_bytes, phase="decode"):
 
 
 def _adapt(r, resident, usage, pending, swap_n, decay, min_count, margin,
-           land_delay, res):
-    if pending:
+           land_delay, res, skip_pending=True):
+    if pending and skip_pending:
         return   # previous swaps still in flight: no swap, no decay
+    inflight = {(layer, e) for _due, layer, e in pending}
     swaps = []
     for layer in sorted(resident):
         u = usage.get(layer, {})
         have = resident[layer]
         cand = sorted(((-uu, e) for e, uu in u.items()
-                       if e not in have and uu >= min_count))
+                       if e not in have and (layer, e) not in inflight
+                       and uu >= min_count))
         vict = sorted((u.get(e, 0.0), e) for e in have)
         for (neg_cu, ce), (vu, ve) in zip(cand, vict):
             cu = -neg_cu
@@ -445,9 +449,22 @@ def _adapt(r, resident, usage, pending, swap_n, decay, min_count, margin,
             u[e] *= decay
 
 
+PREFILL_SWAPS = ("on", "off", "seed")
+
+
 def simulate_adaptive(init_resident, slots, test, layer_bytes, phase="decode", *,
                       swap_n=96, every=4, decay=0.7, min_count=2.0, margin=1.5,
-                      land_delay=1):
+                      land_delay=1, prefill_swaps="on", skip_pending=True):
+    """prefill_swaps (matters only when the phase includes prefill rounds):
+    "on" treats a prefill ubatch as any other round; "off" scores it against the
+    cache but neither counts its routing nor adapts, and the adaptation cadence
+    and the land delay count only the remaining rounds; "seed" counts its routing
+    (no decay, no swap) so the first decode adaptation starts from those counts.
+    The frozen modes assume prefill rounds precede decode, as they do in a trace.
+    skip_pending=False adapts even while earlier swaps are in flight (Strata skips);
+    an expert already in flight is then never swapped in a second time."""
+    if prefill_swaps not in PREFILL_SWAPS:
+        raise ValueError(f"prefill_swaps must be one of {PREFILL_SWAPS}, got {prefill_swaps!r}")
     for layer, have in init_resident.items():
         if len(have) > slots.get(layer, 0):
             raise ValueError(f"layer {layer}: initial set exceeds its slots")
@@ -457,7 +474,13 @@ def simulate_adaptive(init_resident, slots, test, layer_bytes, phase="decode", *
         resident = {layer: set(v) for layer, v in init_resident.items()}
         usage = {}
         pending = []
-        for r, s in enumerate(_rounds(t, phase)):
+        r = -1   # index among the rounds that take part in adaptation
+        for s in _rounds(t, phase):
+            if prefill_swaps != "on" and s.phase == PHASE_PREFILL:
+                _score_round(s, resident, layer_bytes, res,
+                             usage=usage if prefill_swaps == "seed" else None)
+                continue
+            r += 1
             landed = [p for p in pending if p[0] <= r]
             pending = [p for p in pending if p[0] > r]
             for _due, layer, e in landed:
@@ -465,7 +488,7 @@ def simulate_adaptive(init_resident, slots, test, layer_bytes, phase="decode", *
             _score_round(s, resident, layer_bytes, res, usage=usage)
             if every > 0 and (r + 1) % every == 0:
                 _adapt(r, resident, usage, pending, swap_n, decay, min_count,
-                       margin, land_delay, res)
+                       margin, land_delay, res, skip_pending)
     return res
 
 
@@ -674,6 +697,12 @@ def main(argv=None):
     ap.add_argument("--min-count", type=float, default=2.0)
     ap.add_argument("--margin", type=float, default=1.5)
     ap.add_argument("--land-delay", type=int, default=1)
+    ap.add_argument("--prefill-swaps", choices=PREFILL_SWAPS, default="on",
+                    help="adaptive policy, phase all: treat prefill ubatches as rounds "
+                         "(on), freeze the cache and counters through them (off), or "
+                         "count their routing without swapping (seed)")
+    ap.add_argument("--no-skip-pending", action="store_true",
+                    help="adapt even while earlier swaps are in flight (Strata skips)")
     ap.add_argument("--out", help="CSV path (default stdout)")
     ap.add_argument("--stats", action="store_true", help="print trace summaries to stderr")
     a = ap.parse_args(argv)
@@ -701,7 +730,8 @@ def main(argv=None):
         ap.error("give --budget-mib-per-layer and/or --budget-gib-total")
 
     adapt = dict(swap_n=a.swap_n, every=a.every, decay=a.decay,
-                 min_count=a.min_count, margin=a.margin, land_delay=a.land_delay)
+                 min_count=a.min_count, margin=a.margin, land_delay=a.land_delay,
+                 prefill_swaps=a.prefill_swaps, skip_pending=not a.no_skip_pending)
     first_sizes = next(iter(sizes.values()))
     try:
         if a.loo:

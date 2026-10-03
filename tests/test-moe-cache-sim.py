@@ -245,6 +245,121 @@ def test_adaptive_pending_blocks_next_adaptation():
     assert res.swap_log == [(1, 0, 1, 0), (5, 0, 3, 2)]
 
 
+def prefill_then_decode(prefill_rows, decode_rows, n_expert=4):
+    steps = [sim.Step(index=i, phase=0, n_tokens=len(r), layers={0: r})
+             for i, r in enumerate(prefill_rows)]
+    steps += [sim.Step(index=len(steps) + i, phase=1, n_tokens=1, layers={0: [r]})
+              for i, r in enumerate(decode_rows)]
+    return sim.Trace({"set": "t", "id": "t", "n_expert": n_expert}, steps)
+
+
+EVERY1 = dict(swap_n=96, every=1, decay=0.7, min_count=2.0, margin=1.5, land_delay=1)
+
+
+def test_prefill_swaps_on_off_seed_hand_worked():
+    # one prefill round of three tokens all routing e1, then decode e1 x3; one slot,
+    # resident {0}; every round adapts.
+    t = prefill_then_decode([[[1], [1], [1]]], [[1], [1], [1]])
+    run = lambda mode: sim.simulate_adaptive({0: {0}}, {0: 1}, [t], {0: GIB}, "all",
+                                             prefill_swaps=mode, **EVERY1)
+    # on: the prefill round counts 3 for e1 and swaps it in (lands at round 2), so the
+    # last two decode rounds hit
+    on = run("on")
+    assert (on.hits, on.total, on.swaps) == (2, 6, 1)
+    # off: the prefill round is scored but neither counted nor adapted on. Decode counts
+    # reach 2.19 only in the third decode round, which then swaps (too late to hit)
+    off = run("off")
+    assert (off.hits, off.total, off.swaps) == (0, 6, 1)
+    assert off.swap_log == [(2, 0, 1, 0)]      # round 2 of the DECODE rounds
+    # seed: the prefill counts (3) are kept without a swap, so the first decode round
+    # (4.0) swaps, landing at decode round 2 and hitting in the last one
+    seed = run("seed")
+    assert (seed.hits, seed.total, seed.swaps) == (1, 6, 1)
+    assert seed.swap_log == [(0, 0, 1, 0)]
+    # a decode-only phase has no prefill rounds: every mode is the same run
+    d = [sim.simulate_adaptive({0: {0}}, {0: 1}, [t], {0: GIB}, "decode", prefill_swaps=m,
+                               **EVERY1).swap_log for m in ("on", "off", "seed")]
+    assert d[0] == d[1] == d[2]
+
+
+def test_prefill_swaps_rejects_an_unknown_mode():
+    t = prefill_then_decode([[[1]]], [[1]])
+    with pytest.raises(ValueError, match="prefill_swaps"):
+        sim.simulate_adaptive({0: {0}}, {0: 1}, [t], {0: GIB}, "all", prefill_swaps="x",
+                              **EVERY1)
+
+
+def test_skip_pending_off_adapts_while_swaps_are_in_flight():
+    # four slots {0,1,6,7}; e2 and e3 heat up in rounds 0-2 and swap in (evicting 0 and 1,
+    # landing at round 6, land_delay 3); from round 3 e4 and e5 are the hot pair.
+    kw = dict(swap_n=96, every=1, decay=0.7, min_count=2.0, margin=1.5, land_delay=3)
+    t = decode_trace([[2, 3]] * 3 + [[4, 5]] * 3, n_expert=8)
+    run = lambda skip: sim.simulate_adaptive({0: {0, 1, 6, 7}}, {0: 4}, [t], {0: GIB},
+                                             "decode", skip_pending=skip, **kw)
+    # the default skips every adaptation while the first pair is in flight (rounds 3-5)
+    assert run(True).swap_log == [(2, 0, 2, 0), (2, 0, 3, 1)]
+    # without the skip, round 5 swaps e4 and e5 in as well (decay applied each round)
+    assert run(False).swap_log == [(2, 0, 2, 0), (2, 0, 3, 1), (5, 0, 4, 6), (5, 0, 5, 7)]
+
+
+def test_skip_pending_off_never_swaps_in_the_same_expert_twice():
+    # e2 and e3 stay hot while in flight: they are no longer resident, but a second swap
+    # for them would be a duplicate copy
+    kw = dict(swap_n=96, every=1, decay=0.7, min_count=2.0, margin=1.5, land_delay=3)
+    t = decode_trace([[2, 3]] * 6, n_expert=8)
+    res = sim.simulate_adaptive({0: {0, 1, 6, 7}}, {0: 4}, [t], {0: GIB}, "decode",
+                                skip_pending=False, **kw)
+    assert res.swap_log == [(2, 0, 2, 0), (2, 0, 3, 1)]
+
+
+def test_cli_prefill_swaps_and_skip_pending_flags(tmp_path, capsys):
+    tr, te = tmp_path / "tr.moetrace", tmp_path / "te.moetrace"
+    sim.write_trace(tr, {"set": "a", "id": "a", "n_expert": 4}, [(0, 0, 1, [[0]])])
+    # a prefill step of three tokens, then three decode steps, all on e1
+    sim.write_trace(te, {"set": "b", "id": "b", "n_expert": 4},
+                    [(0, 0, 0, [[1], [1], [1]])] + [(i, 0, 1, [[1]]) for i in (1, 2, 3)])
+
+    def run(*extra):
+        sim.main(["--train", str(tr), "--test", str(te), "--phase", "all",
+                  "--uniform-expert-bytes", f"f={GIB}:1:4", "--budget-mib-per-layer",
+                  "1024", "--every", "1", "--land-delay", "1", *extra])
+        out = capsys.readouterr().out.splitlines()
+        cols = out[0].split(",")
+        return {r.split(",")[2]: dict(zip(cols, r.split(","))) for r in out[1:]}
+
+    assert run()["adaptive"]["swaps"] == "1"
+    on, off = run(), run("--prefill-swaps", "off")
+    assert on["adaptive"]["hit_rate"] != off["adaptive"]["hit_rate"]
+    assert run("--prefill-swaps", "seed")["adaptive"]["swaps"] == "1"
+    with pytest.raises(SystemExit):
+        sim.main(["--train", str(tr), "--test", str(te), "--prefill-swaps", "bogus",
+                  "--uniform-expert-bytes", f"f={GIB}:1:4", "--budget-mib-per-layer", "1"])
+    run("--no-skip-pending")   # parses and runs
+
+
+def test_cli_no_skip_pending_reaches_the_simulator(tmp_path, capsys):
+    # four slots {0,1,6,7}; e2/e3 swap in at round 2 and land at round 6 (--land-delay 3),
+    # e4/e5 are the hot pair from round 3. The default skips every adaptation while the
+    # first pair is in flight; --no-skip-pending takes the second pair at round 5.
+    tr, te = tmp_path / "tr.moetrace", tmp_path / "te.moetrace"
+    sim.write_trace(tr, {"set": "a", "id": "a", "n_expert": 8}, [(0, 0, 1, [[0, 1, 6, 7]])])
+    sim.write_trace(te, {"set": "b", "id": "b", "n_expert": 8},
+                    [(i, 0, 1, [[2, 3]]) for i in range(3)] +
+                    [(i, 0, 1, [[4, 5]]) for i in range(3, 6)])
+
+    def swaps(*extra):
+        sim.main(["--train", str(tr), "--test", str(te), "--phase", "decode",
+                  "--uniform-expert-bytes", f"f={GIB}:1:8", "--budget-mib-per-layer", "4096",
+                  "--every", "1", "--land-delay", "3", *extra])
+        out = capsys.readouterr().out.splitlines()
+        cols = out[0].split(",")
+        rows = {r.split(",")[2]: dict(zip(cols, r.split(","))) for r in out[1:]}
+        return rows["adaptive"]["swaps"]
+
+    assert swaps() == "2"
+    assert swaps("--no-skip-pending") == "4"
+
+
 def test_adaptive_boundaries_are_inclusive_as_in_strata():
     # Strata: candidates need `usage >= 2.0`, and a pair swaps unless
     # `cand < victim + margin`, so gain == margin and usage == min_count swap.
