@@ -13,7 +13,8 @@ does not enforce itself, so this gate does:
    sites, pinned by file and by call count (a ninth call in a listed file is as much a new site as one in a new file);
 3. the canonical contract's §3 allowlist names the four wrappers.
 
-th32 T1's HOST_CPU wrapper adds its own entry to ALLOWED when it lands; the gate is shared with it.
+th32 T1's HOST_CPU wrapper (ggml/src/ggml-sycl/host-cpu-mapping.cpp, `unified_cache_raw_alloc_host_cpu` and
+`unified_cache_raw_free_host_cpu`) is the second wrapper TU: anonymous mmap, MADV_HUGEPAGE and a full mlock, in one place.
 """
 
 import re
@@ -24,7 +25,7 @@ SYCL_DIR = ROOT / "ggml/src/ggml-sycl"
 CONTRACT = ROOT / "docs/design/sycl-canonical-memory-architecture.md"
 
 # the wrapper translation unit: any call
-WRAPPER_TUS = {"file-mapping.cpp"}
+WRAPPER_TUS = {"file-mapping.cpp", "host-cpu-mapping.cpp"}
 
 # today's sites, by file relative to ggml/src/ggml-sycl: {call: count}
 ALLOWED = {
@@ -136,6 +137,17 @@ def test_the_wrapper_tu_exists_and_includes_no_sycl_header():
         assert not re.search(r"#\s*include\s*[<\"](sycl|dpct)", text), f"{path.name} includes a SYCL header"
 
 
+def test_the_host_cpu_wrapper_tu_exists_and_includes_no_sycl_header():
+    for name in ("host-cpu-mapping.cpp", "host-cpu-mapping.hpp"):
+        path = SYCL_DIR / name
+        assert path.is_file(), f"{name} missing"
+        text = strip_comments_and_literals(path.read_text())
+        assert not re.search(r"#\s*include\s*[<\"](sycl|dpct)", text), f"{name} includes a SYCL header"
+    assert calls_in((SYCL_DIR / "host-cpu-mapping.cpp").read_text()).keys() >= {"mmap", "munmap", "mlock", "madvise"}, (
+        "the HOST_CPU wrapper does not make, advise, lock and release the mapping itself"
+    )
+
+
 def test_the_canonical_contract_allowlists_the_four_wrappers():
     text = CONTRACT.read_text()
     section = text[text.index("## 3. Allocator Entry Points (Allowlist)") : text.index("## 4. Pointer-Resolution")]
@@ -144,6 +156,8 @@ def test_the_canonical_contract_allowlists_the_four_wrappers():
         "unified_cache_raw_lock_file_segments",
         "unified_cache_raw_unmap_file",
         "unified_cache_raw_advise_file_segments",
+        "unified_cache_raw_alloc_host_cpu",
+        "unified_cache_raw_free_host_cpu",
     ):
         assert name in section, f"the canonical contract §3 allowlist does not name {name}"
 
