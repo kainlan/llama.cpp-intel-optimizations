@@ -175,11 +175,11 @@ bool test_reorder_validation_contracts() {
                                                      sycl::usm::alloc::unknown, -1, queue_device) ||
         ggml_sycl_reorder_pointer_contract_for_test(true, alloc_tier::HOST_PINNED, queue_device,
                                                      sycl::usm::alloc::device, queue_device, queue_device) ||
-        !ggml_sycl_reorder_pointer_contract_for_test(false, alloc_tier::MMAP_TRACKED, -1,
+        !ggml_sycl_reorder_pointer_contract_for_test(false, alloc_tier::UNREGISTERED, -1,
                                                       sycl::usm::alloc::device, queue_device, queue_device) ||
-        ggml_sycl_reorder_pointer_contract_for_test(false, alloc_tier::MMAP_TRACKED, -1,
+        ggml_sycl_reorder_pointer_contract_for_test(false, alloc_tier::UNREGISTERED, -1,
                                                      sycl::usm::alloc::device, 0, queue_device) ||
-        ggml_sycl_reorder_pointer_contract_for_test(false, alloc_tier::MMAP_TRACKED, -1,
+        ggml_sycl_reorder_pointer_contract_for_test(false, alloc_tier::UNREGISTERED, -1,
                                                      sycl::usm::alloc::unknown, queue_device, queue_device)) {
         fprintf(stderr, "FAIL: reorder registered/external pointer contract\n");
         return false;

@@ -148,7 +148,10 @@ static const char * alloc_type_name(alloc_type type) {
         case alloc_type::DEVICE:      return "device";
         case alloc_type::HOST_PINNED: return "host_pinned";
         case alloc_type::SHARED:      return "shared";
-        case alloc_type::MMAP:        return "mmap";
+        case alloc_type::HOST_MALLOC:
+            return "host_malloc";
+        case alloc_type::HOST_OWNED_ELSEWHERE:
+            return "host_owned_elsewhere";
         case alloc_type::UNKNOWN:     return "unknown";
     }
     return "unknown";

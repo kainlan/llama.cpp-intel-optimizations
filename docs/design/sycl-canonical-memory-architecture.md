@@ -346,10 +346,18 @@ these or be migrated (see §9 for temporary allowlisted sites):
 | `unified_cache_raw_malloc_device(size, queue)` | Raw `sycl::malloc_device` wrapper — call only from inside `unified_cache` internals | `void *` |
 | `unified_cache_raw_malloc_host(size, queue/ctx)` | Raw `sycl::malloc_host` wrapper — call only from inside `unified_cache` internals | `void *` |
 | `unified_cache_raw_malloc_shared(size, queue)` | Raw `sycl::malloc_shared` wrapper — call only from inside `unified_cache` internals | `void *` |
+| `unified_cache_raw_map_file(fd, file_size, reservation, segments, out)` | Raw file-mapping wrapper (`ggml/src/ggml-sycl/file-mapping.cpp`, a device-free TU): one `PROT_NONE` reservation with `MAP_FIXED` file segments over it, from a `dup` of the loader's fd. Call only from the `FILE_MAPPED` owner's front door, `unified_allocate_file_mapping` | `file_map_status` |
+| `unified_cache_raw_lock_file_segments(mapping, lock_segments)` | The only `mlock` of a file mapping: one call per inward-rounded segment, never widened | `file_map_status` |
+| `unified_cache_raw_unmap_file(mapping)` | The only release of a file mapping: one `munmap` of the whole reservation, then the `dup` is closed | `void` |
 
 **Rule:** `sycl::malloc_device`, `sycl::malloc_host`, and `sycl::malloc_shared` must
 never be called outside `unified-cache.cpp`. All other files must use the wrappers
 above.
+
+**Rule (mapping):** `mmap`, `munmap`, `mlock` and `madvise` are called only from the
+three file-mapping wrappers above and from the listed guard-page and DPCT sites.
+`tests/test-sycl-raw-mmap-allowlist-source.py` enforces it over the backend's
+tokenized sources (llama.cpp-5efe C2).
 
 **Deallocation:** `unified_free(handle)`, `unified_free_ptr(ptr, device)`,
 `unified_cache_zone_free(device_id, zone, ptr)`, `unified_cache_arena_free(device_id, ptr, size)` (deprecated).

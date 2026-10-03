@@ -23,8 +23,11 @@ enum class alloc_type : uint8_t {
     DEVICE,       // sycl::malloc_device — GPU-only
     HOST_PINNED,  // sycl::malloc_host   — CPU-accessible, GPU zero-copy via PCIe
     SHARED,       // sycl::malloc_shared  — migrates between host/device
-    MMAP,         // mmap'd from GGUF    — CPU-only, no USM
-    UNKNOWN,      // Not registered — pointer type is unknown
+    // Host memory that is not USM, named for how it is released (llama.cpp-5efe C2). A file mapping is neither:
+    // it has its own owner and, once the FILE_MAPPED tier lands, its own type.
+    HOST_MALLOC,           // registered host memory that unified_free_record releases with ::free
+    HOST_OWNED_ELSEWHERE,  // registered only so the registry can identify it; never freed through the registry
+    UNKNOWN,               // Not registered — pointer type is unknown
 };
 
 // Metadata for a single allocation
@@ -140,7 +143,7 @@ class alloc_registry {
     }
 
     // Convenience: is this pointer host-accessible?
-    // Returns true for HOST_PINNED, SHARED, MMAP.
+    // Returns true for every type but DEVICE.
     // Returns false for DEVICE.
     // Returns false if pointer is not in the registry (unknown = not host-accessible).
     bool is_host_accessible(const void * ptr) const {
@@ -220,7 +223,8 @@ class alloc_registry {
 //       case alloc_type::DEVICE:      return sycl::usm::alloc::device;
 //       case alloc_type::HOST_PINNED: return sycl::usm::alloc::host;
 //       case alloc_type::SHARED:      return sycl::usm::alloc::shared;
-//       case alloc_type::MMAP:        return sycl::usm::alloc::host;  // treat as host-accessible
+//       case alloc_type::HOST_MALLOC:
+//       case alloc_type::HOST_OWNED_ELSEWHERE: return sycl::usm::alloc::unknown;  // not USM
 //       case alloc_type::UNKNOWN:     return sycl::usm::alloc::unknown;
 //   }
 

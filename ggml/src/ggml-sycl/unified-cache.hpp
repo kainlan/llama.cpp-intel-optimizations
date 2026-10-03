@@ -5780,7 +5780,9 @@ enum class runtime_category : uint8_t {
 enum class alloc_tier : uint8_t {
     DEVICE_VRAM  = 0,
     HOST_PINNED  = 1,
-    MMAP_TRACKED = 2,
+    // Not an allocation: the query result for a pointer the registry does not know (llama.cpp-5efe C2). Nobody may
+    // allocate it; a file mapping is not this either, it has its own owner.
+    UNREGISTERED = 2,
 };
 
 enum class alloc_role : uint8_t {
@@ -5801,7 +5803,7 @@ enum class alloc_role : uint8_t {
 // Immutable during inference (allocations do not migrate mid-token).
 struct memory_location {
     void *           ptr        = nullptr;  // Current data pointer (device or host)
-    alloc_tier       tier       = alloc_tier::MMAP_TRACKED;
+    alloc_tier       tier       = alloc_tier::UNREGISTERED;
     ggml_layout_mode layout     = GGML_LAYOUT_AOS;
     alloc_role       role       = alloc_role::OTHER;
     vram_zone_id     zone       = vram_zone_id::COUNT;  // COUNT = not in arena

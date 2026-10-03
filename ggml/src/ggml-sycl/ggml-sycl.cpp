@@ -14338,7 +14338,7 @@ static void * ggml_sycl_bf16_weight_materialize_f32(const ggml_tensor * tensor, 
     const void *     src_ptr   = ggml_sycl_host_data(tensor);
     sycl::usm::alloc src_alloc = sycl::usm::alloc::unknown;
     if (tensor->name[0] != '\0' && g_tiered_enabled.load(std::memory_order_relaxed)) {
-        ggml_sycl::memory_tier tier   = ggml_sycl::memory_tier::MMAP;
+        ggml_sycl::memory_tier tier   = ggml_sycl::memory_tier::UNRESOLVED;
         void *                 cached = ggml_sycl_get_cached_tensor_ptr_for(tensor, device, &tier, nullptr, &src_alloc);
         if (cached) {
             src_ptr = cached;
@@ -19753,7 +19753,7 @@ void * get_cached_tensor_ptr(const char * tensor_name, ggml_sycl::memory_tier * 
     }
     // No tensor cache — return nullptr (unified_cache handles weight placement)
     if (tier_out) {
-        *tier_out = ggml_sycl::memory_tier::MMAP;  // Fallback
+        *tier_out = ggml_sycl::memory_tier::UNRESOLVED;  // Fallback
     }
     return nullptr;
 }
@@ -19776,7 +19776,7 @@ void * ggml_sycl_get_cached_tensor_ptr_for(const ggml_tensor *      tensor,
     if (g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1) {
         return nullptr;
     }
-    ggml_sycl::memory_tier tier         = ggml_sycl::memory_tier::MMAP;
+    ggml_sycl::memory_tier tier         = ggml_sycl::memory_tier::UNRESOLVED;
     bool                   in_inventory = false;
     void *                 cached_ptr   = get_cached_tensor_ptr(tensor->name, &tier, &in_inventory);
 
@@ -35348,7 +35348,7 @@ static void ggml_sycl_preload_model_weights() {
                     const void *     src_ptr   = tensor->data;
                     sycl::usm::alloc src_alloc = sycl::usm::alloc::unknown;
                     if (tensor->name[0] != '\0' && g_tiered_enabled.load(std::memory_order_relaxed)) {
-                        ggml_sycl::memory_tier tier = ggml_sycl::memory_tier::MMAP;
+                        ggml_sycl::memory_tier tier = ggml_sycl::memory_tier::UNRESOLVED;
                         void * cached = ggml_sycl_get_cached_tensor_ptr_for(tensor, device, &tier, nullptr, &src_alloc);
                         if (cached) {
                             src_ptr = cached;
@@ -36247,7 +36247,7 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
     const void *     src_ptr   = tensor->data;
     sycl::usm::alloc src_alloc = sycl::usm::alloc::unknown;
     if (tensor->name[0] != '\0' && g_tiered_enabled.load(std::memory_order_relaxed)) {
-        ggml_sycl::memory_tier tier   = ggml_sycl::memory_tier::MMAP;
+        ggml_sycl::memory_tier tier   = ggml_sycl::memory_tier::UNRESOLVED;
         void *                 cached = ggml_sycl_get_cached_tensor_ptr_for(tensor, device, &tier, nullptr, &src_alloc);
         if (cached) {
             src_ptr = cached;
@@ -38840,7 +38840,7 @@ struct kv_layer_alloc {
     int                     owner_device = -1;       // Physical owner for device KV, HOST_DEVICE for host-pinned
     ggml_sycl::mem_handle   zone_handle{};
     bool                    zone_managed = false;
-    ggml_sycl::alloc_tier   tier         = ggml_sycl::alloc_tier::MMAP_TRACKED;
+    ggml_sycl::alloc_tier   tier         = ggml_sycl::alloc_tier::UNREGISTERED;
     ggml_sycl::vram_zone_id vram_zone    = ggml_sycl::vram_zone_id::COUNT;
     // llama.cpp-0k543 (C3 Category C): context-lifetime chunk lease covering
     // this layer's backing arena chunk.  tiered_kv_buffer_init_tensor rewrites
@@ -38875,7 +38875,7 @@ struct kv_layer_alloc {
         on_device    = false;
         owner_device = -1;
         zone_managed = false;
-        tier         = ggml_sycl::alloc_tier::MMAP_TRACKED;
+        tier         = ggml_sycl::alloc_tier::UNREGISTERED;
         vram_zone    = ggml_sycl::vram_zone_id::COUNT;
     }
 };
@@ -39403,7 +39403,7 @@ static void tiered_kv_buffer_set_tensor(ggml_backend_buffer_t buffer,
     if (ggml_sycl::alloc_registry::instance().is_host_accessible(dst) &&
         !ggml_sycl::alloc_registry::instance().is_device(dst)) {
         const auto * info = ggml_sycl::alloc_registry::instance().lookup(dst);
-        if (info && info->type == ggml_sycl::alloc_type::MMAP) {
+        if (info && info->type == ggml_sycl::alloc_type::HOST_OWNED_ELSEWHERE) {
             std::memcpy(dst, data, size);
             return;
         }
@@ -39428,7 +39428,7 @@ static void tiered_kv_buffer_get_tensor(ggml_backend_buffer_t buffer,
     if (ggml_sycl::alloc_registry::instance().is_host_accessible(src) &&
         !ggml_sycl::alloc_registry::instance().is_device(src)) {
         const auto * info = ggml_sycl::alloc_registry::instance().lookup(src);
-        if (info && info->type == ggml_sycl::alloc_type::MMAP) {
+        if (info && info->type == ggml_sycl::alloc_type::HOST_OWNED_ELSEWHERE) {
             std::memcpy(data, src, size);
             return;
         }
@@ -40309,9 +40309,10 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
         // Zero the synthetic base so any un-remapped fallback reads zeros
         // (defensive — all KV tensors should be remapped by init_tensor).
         std::memset(alloc_base, 0, alloc_padded);
-        // Register as MMAP so alloc_registry can identify it if needed.
+        // Register it so alloc_registry can identify it if needed. The synthetic base is a std::vector its own
+        // context clears: the registry never frees it.
         ggml_sycl::alloc_registry::instance().register_alloc(alloc_base, alloc_padded, device,
-                                                             ggml_sycl::alloc_type::MMAP);
+                                                             ggml_sycl::alloc_type::HOST_OWNED_ELSEWHERE);
     }
 
     // Diagnostic: check for address space overlap between alloc_base and device allocations.
@@ -48865,9 +48866,9 @@ static void ggml_sycl_ensure_weight_on_device(const ggml_tensor * src0, int devi
         // Host pinned (USM) — GPU can access directly via PCIe. Slow but correct.
         extra->set_data_device(device, cached_ptr, GGML_LAYOUT_AOS, /*on_device=*/false);
     } else {
-        // MMAP tier — not USM, GPU cannot access. Stage to pinned memory.
+        // Unresolved tier — not USM, GPU cannot access. Stage to pinned memory.
         // Hold the OWNING handle (llama.cpp-1df8): this is a weight going through
-        // the MMAP-tier fallback rather than the from_cache_id() weight path, and
+        // the unresolved-tier fallback rather than the from_cache_id() weight path, and
         // the staging device buffer is EXTERNAL_EXACT (see the T1 finding on that
         // ticket) -- set_data_device()'s from_chunk_ptr() reconstruction cannot
         // lease it and would silently store an unprotected DIRECT handle. Route
@@ -82354,8 +82355,8 @@ static const char * ggml_sycl_alloc_tier_name(ggml_sycl::alloc_tier tier) {
             return "device-vram";
         case ggml_sycl::alloc_tier::HOST_PINNED:
             return "host-pinned";
-        case ggml_sycl::alloc_tier::MMAP_TRACKED:
-            return "mmap-tracked";
+        case ggml_sycl::alloc_tier::UNREGISTERED:
+            return "unregistered";
     }
     return "invalid";
 }
@@ -88974,8 +88975,10 @@ static block_exec_leaf_materialize_probe_result ggml_sycl_probe_block_exec_leaf_
                 return "host_pinned";
             case ggml_sycl::alloc_type::SHARED:
                 return "shared";
-            case ggml_sycl::alloc_type::MMAP:
-                return "mmap";
+            case ggml_sycl::alloc_type::HOST_MALLOC:
+                return "host_malloc";
+            case ggml_sycl::alloc_type::HOST_OWNED_ELSEWHERE:
+                return "host_owned_elsewhere";
             case ggml_sycl::alloc_type::UNKNOWN:
             default:
                 return "unknown";
@@ -100647,7 +100650,7 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
             }
 
             // Tiered mode: check if weight is in HOST tier and needs promotion to VRAM
-            ggml_sycl::memory_tier tier               = ggml_sycl::memory_tier::MMAP;
+            ggml_sycl::memory_tier tier               = ggml_sycl::memory_tier::UNRESOLVED;
             bool                   found_in_inventory = false;
             void *                 cached_ptr         = get_cached_tensor_ptr(tensor->name, &tier, &found_in_inventory);
 

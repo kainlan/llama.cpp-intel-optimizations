@@ -3203,8 +3203,8 @@ static const char * alloc_tier_name(alloc_tier tier) {
             return "device_vram";
         case alloc_tier::HOST_PINNED:
             return "host_pinned";
-        case alloc_tier::MMAP_TRACKED:
-            return "mmap_tracked";
+        case alloc_tier::UNREGISTERED:
+            return "unregistered";
         default:
             return "unknown";
     }
@@ -3408,7 +3408,7 @@ void offload_stats_note_alloc(alloc_tier tier) {
         case alloc_tier::HOST_PINNED:
             g_offload_alloc_count_host.fetch_add(1, std::memory_order_relaxed);
             break;
-        case alloc_tier::MMAP_TRACKED:
+        case alloc_tier::UNREGISTERED:
             g_offload_alloc_count_shared.fetch_add(1, std::memory_order_relaxed);
             break;
         default:
@@ -15665,7 +15665,7 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
     // No separate counter bookkeeping needed.
 
     try {
-        if (rec.handle.tier == alloc_tier::MMAP_TRACKED) {
+        if (rec.handle.tier == alloc_tier::UNREGISTERED) {
             return true;
         }
         // Zone-managed allocations: route through handle.zone_managed fields.
@@ -15777,10 +15777,11 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
         }
 
         // Check if this pointer was allocated via regular malloc (pinned cap overflow).
-        // The alloc_registry tracks these as MMAP type.  Using sycl::free on them
-        // would crash, so use ::free instead.
+        // The alloc_registry tracks these as HOST_MALLOC.  Using sycl::free on them
+        // would crash, so use ::free instead. Only HOST_MALLOC reaches ::free: a
+        // HOST_OWNED_ELSEWHERE registration is never freed here.
         const auto * reg_info = ggml_sycl::alloc_registry::instance().lookup(rec.handle.ptr);
-        if (reg_info && reg_info->type == ggml_sycl::alloc_type::MMAP) {
+        if (reg_info && reg_info->type == ggml_sycl::alloc_type::HOST_MALLOC) {
             ggml_sycl::alloc_registry::instance().unregister_alloc(rec.handle.ptr);
             ::free(rec.handle.ptr);
             return true;
@@ -15978,8 +15979,8 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     runtime_category cat =
         req.intent.category == runtime_category::OTHER ? category_from_role(req.intent.role) : req.intent.category;
     alloc_tier tier = unified_select_tier(req);
-    if (tier == alloc_tier::MMAP_TRACKED) {
-        GGML_LOG_ERROR("[UNIFIED-ALLOC] MMAP_TRACKED runtime allocations are not supported in unified_alloc\n");
+    if (tier == alloc_tier::UNREGISTERED) {
+        GGML_LOG_ERROR("[UNIFIED-ALLOC] UNREGISTERED runtime allocations are not supported in unified_alloc\n");
         return false;
     }
     if (req.intent.constraints.must_device) {
@@ -17848,7 +17849,7 @@ bool unified_alloc_validate_registry(int device, const char * where) {
                 if (h.device >= 0 && h.device < GGML_SYCL_MAX_DEVICES) {
                     registry_device[h.device] += h.size;
                 }
-            } else if (h.tier == alloc_tier::HOST_PINNED || h.tier == alloc_tier::MMAP_TRACKED) {
+            } else if (h.tier == alloc_tier::HOST_PINNED || h.tier == alloc_tier::UNREGISTERED) {
                 registry_host += h.size;
             }
         }
@@ -22719,9 +22720,11 @@ bool query_registered_location(const void * ptr, memory_location * out) {
         case alloc_type::SHARED:
             out->tier = alloc_tier::HOST_PINNED;
             break;
-        case alloc_type::MMAP:
+        case alloc_type::HOST_MALLOC:
+        case alloc_type::HOST_OWNED_ELSEWHERE:
         default:
-            out->tier = alloc_tier::MMAP_TRACKED;
+            // host memory that is not USM and has no tier of its own
+            out->tier = alloc_tier::UNREGISTERED;
             break;
     }
     return true;
@@ -22736,9 +22739,9 @@ memory_location query_location(const void * ptr, int device_hint) {
     if (!query_registered_location(ptr, &loc)) {
         loc.ptr = const_cast<void *>(ptr);
         if (device_hint >= 0) {
-            // Not registered — assume host/mmap (conservative).
+            // Not registered — assume host (conservative).
             loc.device = device_hint;
-            loc.tier   = alloc_tier::MMAP_TRACKED;
+            loc.tier   = alloc_tier::UNREGISTERED;
         }
     }
 
