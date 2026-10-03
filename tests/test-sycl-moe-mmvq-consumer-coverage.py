@@ -13,6 +13,14 @@ types were refused at capability and could never arrive.
 So this gate reads the other direction: for each consumer switch, does it
 enumerate every type capability admits?
 
+REACHABILITY IS NOT PROVEN HERE (llama.cpp-s36q review M1). mmvq.cpp has two consumer
+switches over the same helpers: the one in mmvq_moe_batched_dispatch is live, the one
+inside ggml_sycl_mul_mat_id_vec_q is not -- that function returns false at its
+"type_unsupported" refusal for every type outside {Q4_0, Q8_0, MXFP4}, before the switch
+is reached. This gate checks that BOTH switches enumerate the capability set and call a
+helper that launches each of their labels; a type passing it in the dead switch is not
+evidence that the type is served, only that the dead arm is consistent.
+
 Design notes, both learned the hard way on this ticket:
   * The switch list is ENUMERATED FROM SOURCE, never hardcoded by line number --
     line numbers drift every commit and a stale list silently checks nothing.
@@ -21,6 +29,7 @@ Design notes, both learned the hard way on this ticket:
     like it still applies, which is how a control quietly dies.
 """
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -28,6 +37,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TABLES = ROOT / "ggml" / "src" / "ggml-sycl" / "moe-mmvq-tables.hpp"
 MMVQ = ROOT / "ggml" / "src" / "ggml-sycl" / "mmvq.cpp"
+# Mutation-check hook: point the gate at a doctored copy of mmvq.cpp.
+if os.environ.get("GGML_SYCL_S36Q_MMVQ_SOURCE"):
+    MMVQ = Path(os.environ["GGML_SYCL_S36Q_MMVQ_SOURCE"])
 
 # Switches that legitimately need not enumerate the capability set. Keyed by the
 # abort message, which is stable across edits in a way line numbers are not.
@@ -62,25 +74,25 @@ def capability_types(text):
     return set(re.findall(r"case\s+(GGML_TYPE_[A-Z0-9_]+)\s*:", m.group(1)))
 
 
-def consumer_switches(text):
-    """Every `switch (src0->type)` whose default arm aborts.
+LIVE_KEY = "mmvq_moe_batched_dispatch: default returns false"
 
-    Returns [(abort_message, {types})]. Brace-matched rather than regexed to the
-    closing brace, because these switches contain nested blocks.
+
+def consumer_switch_bodies(text):
+    """[(key, body)] for every `switch (src0->type)` that is a MoE consumer.
+
+    A consumer is a switch whose default arm aborts, OR (llama.cpp-s36q review M1) one
+    whose arms call a generic AoS-id submit helper. The second form is the live
+    consumer in mmvq_moe_batched_dispatch: its default is `return false`, so a missing
+    case does not abort, it silently drops the op onto the fallback -- and until then
+    this gate enumerated only the abort-defaulted switches and never saw it.
+
+    Brace-matched rather than regexed to the closing brace, because these switches
+    contain nested blocks.
     """
     out = []
     for m in re.finditer(r"switch\s*\(\s*src0->type\s*\)\s*\{", text):
-        i = m.end() - 1
-        depth = 0
-        for j in range(i, len(text)):
-            if text[j] == "{":
-                depth += 1
-            elif text[j] == "}":
-                depth -= 1
-                if depth == 0:
-                    body = text[i:j]
-                    break
-        else:
+        body = brace_body(text, m.end() - 1)
+        if body is None:
             continue
         # Only the default arm's abort counts; an abort inside a case is a
         # layout/shape refusal for a type the switch DOES handle. `body` is the
@@ -90,11 +102,17 @@ def consumer_switches(text):
         if not dm:
             continue
         am = re.search(r'GGML_ABORT\(\s*"([^"]*)"', dm.group(1))
-        if not am:
-            continue
-        types = set(re.findall(r"case\s+(GGML_TYPE_[A-Z0-9_]+)\s*:", body))
-        out.append((am.group(1), types))
+        if am:
+            out.append((am.group(1), body))
+        elif any(re.search(r"\b" + h + r"\s*\(", body) for h in HELPERS):
+            out.append((LIVE_KEY, body))
     return out
+
+
+def consumer_switches(text):
+    """[(key, {types})] for every consumer switch."""
+    return [(key, set(re.findall(r"case\s+(GGML_TYPE_[A-Z0-9_]+)\s*:", body)))
+            for key, body in consumer_switch_bodies(text)]
 
 
 # Capability types served by a dedicated launcher rather than the generic AoS
@@ -103,33 +121,91 @@ def consumer_switches(text):
 DEDICATED_LAUNCHER_TYPES = {"GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0", "GGML_TYPE_MXFP4"}
 
 
-def submit_helper_types(text):
-    """Types the generic AoS-id submit helpers (mmvq_submit_q1_nvfp4_aos_id,
-    mmvq_submit_quant_aos_id) can launch: the case labels of their definitions.
+HELPERS = ("mmvq_submit_q1_nvfp4_aos_id", "mmvq_submit_quant_aos_id")
 
-    Consumer switches above only prove the consumer REACHES a launcher. A type
-    advertised by capability whose helper has no case returns false there and
-    the consumer aborts (llama.cpp-s36q), which is the same gap from the other
-    side.
+
+def brace_body(text, open_idx):
+    """Interior of the brace block opening at text[open_idx], or None."""
+    depth = 0
+    for k in range(open_idx, len(text)):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1:k]
+    return None
+
+
+LABEL = re.compile(r"\bcase\s+(GGML_TYPE_[A-Z0-9_]+)\s*:|\bdefault\s*:")
+
+
+def switch_arms(body):
+    """Split a switch body into arms: [(labels, arm_text)].
+
+    Stacked labels (`case A: case B:` with nothing between) share one arm. An arm's
+    text runs to the next label group.
     """
-    types = set()
-    for name in ("mmvq_submit_q1_nvfp4_aos_id", "mmvq_submit_quant_aos_id"):
+    marks = list(LABEL.finditer(body))
+    arms = []
+    i = 0
+    while i < len(marks):
+        labels = []
+        j = i
+        while j < len(marks):
+            labels.append(marks[j].group(1) or "default")
+            nxt = marks[j + 1] if j + 1 < len(marks) else None
+            if nxt is None or body[marks[j].end():nxt.start()].strip():
+                break
+            j += 1
+        end = marks[j + 1].start() if j + 1 < len(marks) else len(body)
+        arms.append((labels, body[marks[j].end():end]))
+        i = j + 1
+    return arms
+
+
+def helper_launches(text):
+    """{helper: {type: launched}} for the generic AoS-id submit helpers.
+
+    A type counts as launchable by a helper only if one of the helper's switch arms
+    labelled with that type contains a launch `mmvq_submit_aos_id_impl<THAT_TYPE,`. A
+    label with no launch (a renamed case, a body that is just `return false;`, a body
+    launching a different type) is not a launcher, which is the same gap from the
+    other side as a missing consumer case: the consumer's submit call returns false
+    and aborts (llama.cpp-s36q).
+    """
+    out = {h: set() for h in HELPERS}
+    for name in HELPERS:
         for m in re.finditer(r"\bbool\s+" + name + r"\s*\(", text):
             j = m.end()
             while j < len(text) and text[j] not in "{;":
                 j += 1
             if j >= len(text) or text[j] != "{":
                 continue
-            depth = 0
-            for k in range(j, len(text)):
-                if text[k] == "{":
-                    depth += 1
-                elif text[k] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        types |= set(re.findall(r"case\s+(GGML_TYPE_[A-Z0-9_]+)\s*:", text[j:k]))
-                        break
-    return types
+            fbody = brace_body(text, j)
+            if fbody is None:
+                continue
+            sm = re.search(r"switch\s*\(\s*weight_type\s*\)\s*\{", fbody)
+            if not sm:
+                continue  # the if/else overload; the vector-deps one is the switch form
+            sbody = brace_body(fbody, sm.end() - 1)
+            for labels, arm in switch_arms(sbody):
+                launched = set(re.findall(r"mmvq_submit_aos_id_impl\s*<\s*(GGML_TYPE_[A-Z0-9_]+)\s*,", arm))
+                out[name] |= {l for l in labels if l in launched}
+    return out
+
+
+def consumer_arm_helpers(text):
+    """[(switch key, [(labels, helper)])]: which helper each consumer arm calls."""
+    out = []
+    for key, body in consumer_switch_bodies(text):
+        arms = []
+        for labels, arm in switch_arms(body):
+            for h in HELPERS:
+                if re.search(r"\b" + h + r"\s*\(", arm):
+                    arms.append((labels, h))
+        out.append((key, arms))
+    return out
 
 
 def main():
@@ -175,17 +251,42 @@ def main():
                 f"depends on is gone. Reason on file was: {entry['reason']} "
                 f"Re-verify reachability before restoring the exemption.")
 
-    helper_types = submit_helper_types(mmvq_src)
+    launches = helper_launches(mmvq_src)
+    helper_types = set().union(*launches.values())
     if not helper_types:
-        print("FAIL: could not find the generic AoS-id submit helpers in mmvq.cpp; "
+        print("FAIL: found no launch in the generic AoS-id submit helpers in mmvq.cpp; "
               "the launcher check below would pass vacuously.")
         return 1
     unlaunchable = sorted(cap - DEDICATED_LAUNCHER_TYPES - helper_types)
     if unlaunchable:
         failures.append(
             f"{', '.join(unlaunchable)} admitted by moe_mmvq_capability_supports_layout "
-            f"but no generic AoS-id submit helper has a case for it, so the consumer's "
-            f"submit call returns false and aborts.")
+            f"but no generic AoS-id submit helper arm launches mmvq_submit_aos_id_impl<that "
+            f"type, ...>, so the consumer's submit call returns false and aborts.")
+
+    # Each consumer arm that calls a helper must call one that launches every label
+    # on the arm: a type routed to the wrong helper returns false there.
+    arm_calls = consumer_arm_helpers(mmvq_src)
+    if not any(arms for _, arms in arm_calls):
+        print("FAIL: found no consumer arm calling a generic AoS-id submit helper; "
+              "the routing check below would pass vacuously.")
+        return 1
+    for msg, arms in arm_calls:
+        for labels, helper in arms:
+            wrong = sorted(l for l in labels if l != "default" and l not in launches[helper])
+            if wrong:
+                failures.append(
+                    f'consumer switch "{msg}" routes {", ".join(wrong)} to {helper}, '
+                    f"which has no arm launching it.")
+    routed = set()
+    for _, arms in arm_calls:
+        for labels, _h in arms:
+            routed |= set(labels)
+    unrouted = sorted(cap - DEDICATED_LAUNCHER_TYPES - routed)
+    if unrouted:
+        failures.append(
+            f"{', '.join(unrouted)} admitted by capability but no consumer arm calls a "
+            f"generic AoS-id submit helper for it.")
 
     for msg, types in switches:
         if msg in EXEMPT:
@@ -196,7 +297,7 @@ def main():
                 f'consumer switch "{msg}" does not enumerate '
                 f"{', '.join(missing)}, which moe_mmvq_capability_supports_layout "
                 f"admits. A type admitted by capability that reaches this switch "
-                f"hits its default abort.")
+                f"hits its default arm (abort, or a silent `return false` fallback).")
 
     if failures:
         for f in failures:
