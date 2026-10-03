@@ -304,7 +304,7 @@ config-runs of the two high-thread sweeps (`*.csv.stderr`):
 
 | threads | `prod+pin` P / E samples | `prod+pinE` P / E | `prod+pinS` P / E |
 |---|---|---|---|
-| 8  | 2462 / 250  | 164 / 2548 | 1073 / 1639 |
+| 8 (see the over-count below) | 2462 / 250  | 164 / 2548 | 1073 / 1639 |
 | 16 | 2462 / 2594 | 33 / 5023  | 1598 / 3458 |
 | 22 | 2471 / 4393 | 41 / 6823  | 2468 / 4396 |
 | 24 | 2482 / 5006 | 46 / 7442  | 2487 / 5001 |
@@ -341,10 +341,16 @@ CPUs. That explains the 250 E-core samples in the 8-thread `prod+pin` cell above
 have 2146 P / 30 E. Recomputing the pooled paired ratios without those 8
 config-runs (the rounds are dropped from those configs only; recomputed from
 the raw per-call CSVs, which are not committed; the result is
-`pin-discovery-overcount.csv`) changes one cell: `prod+pin : prod` at 8 threads
-goes 1.04 -> 1.12, 16 threads 0.96 -> 0.95; 12, 20, 22 and 24 threads, the
-shuffled and E-only controls, `prod : vecdot` and `prod+pin : vecdot+pin` are
-unchanged to two decimals. The conclusion stands (no robust benefit of pinning
+`pin-discovery-overcount.csv`) changes two `prod+pin : prod` cells: 8 threads
+1.04 -> 1.12 and 16 threads 0.96 -> 0.95; 12, 20, 22 and 24 threads are
+unchanged, and so are the E-only control, `prod : vecdot` and `prod+pin :
+vecdot+pin`, except the shuffled control at 8 threads (`prod+pinS : prod` 1.00 ->
+1.01), all to two decimals. None of the excluded values (1.12, 0.95, the
+per-run values) nor the 220-of-250 and "34 runs, 2146 P / 30 E" sample split can
+be reproduced from any other committed file: the pairs file is pooled over
+rounds, the digest has no per-run samples and `pin-samples-8-24-threads.csv`
+has only totals. They come from the raw per-call CSVs and stderr (not
+committed); the committed record is `pin-discovery-overcount.csv`. The conclusion stands (no robust benefit of pinning
 `prod` above 8 threads; at most ~1.1x anywhere), with the 8-thread figure
 higher than first reported. The bench now caps discovery at `threads - 1`
 (busiest first) and logs when it does; the committed data predate that.
@@ -611,8 +617,8 @@ does not transfer to 22 threads, where the 16-row loop is no longer the limit.
    | Q2_0  | 3 | 136 (10.2) | 125 (11.0) | 41 (33.6) |
 
    A top-1 call moves 0.45-1.7 MB and takes 67-128 us in production, 2.3-3.9x a
-   pure read in the team (19-51 us); the throughput is 6.2-13.9 GB/s, well below the
-   large-call figures (14-47). Per-call overhead, not bandwidth, bounds small calls: for
+   pure read in the team (19-51 us); the throughput is 6.2-13.9 GB/s: Q8_0 (13.9) is at
+   the bottom of the large-call range (14-47), MXFP4 and Q2_0 (6-7) well below it. Per-call overhead, not bandwidth, bounds small calls: for
    Q8_0 the production-over-team excess is ~65-75 us at k=1 and ~90-100 us at k=3
    (the earlier single observation of ~50-70 us was the right order). Pinning
    shortens the median call time by 1.09-1.40x for MXFP4 and Q2_0 (MXFP4 128 ->
@@ -664,9 +670,14 @@ does not transfer to 22 threads, where the 16-row loop is no longer the limit.
   --pairs`: median and interquartile range of arm/base per burst, 24 bursts per
   config) behind every ratio quoted above.
 * `pin-samples-8-24-threads.csv`: the last-run-CPU sample totals per arm.
-* `pin-discovery-overcount.csv`: the pooled paired ratios with and without the 8
-  over-counted config-runs, and those 8 runs (threads, round, workers found,
-  `prod+pin : prod` over all rounds and without that round).
+* `pin-discovery-overcount.csv`: the pooled paired ratios (columns `t8`..`t24`)
+  with and without the 8 over-counted config-runs, and those 8 runs (threads,
+  round, workers found). In the per-run rows `cell_all_rounds` and
+  `cell_excluding_overcounted_rounds` are cell-level values of `prod+pin : prod`
+  for that config and thread count, repeated on each of its over-counted runs:
+  the second drops every over-counted round of the cell, so the two GPT-OSS
+  MXFP4 down 8-thread rows (rounds 0 and 2) both carry 1.12. It is the only
+  committed record of the exclusion (see the over-count paragraph).
 * `topk-{1,2,3}.summary.csv`: the small-call runs (item 7).
 * `run-digest-8-24-threads.txt`: from each run's stderr, the oracle verdict
   counts (all `ok`: 1404 + 720 for the 8-24 thread sweeps, 18 per top-k run),
