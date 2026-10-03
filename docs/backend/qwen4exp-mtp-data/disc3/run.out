@@ -1,0 +1,9 @@
+pre: MemAvailable:   166781456 kB Shmem:          12239816 kB  load: 34.05 39.16 38.93
+ub2            rc=0 token=[ all]
+ub3            rc=0 token=[ all]
+ub4            rc=0 token=[ any]
+ub512_d0.05    rc=0 token=[ all]
+ub512_d0.25    rc=0 token=[ all]
+ub512_d1.0     rc=0 token=[ all]
+post: MemAvailable:   167476860 kB Shmem:          12251244 kB 
+rc=0

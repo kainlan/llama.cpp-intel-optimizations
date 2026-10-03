@@ -1999,6 +1999,23 @@ if (NOT WIN32)
     )
 
     # ---------------------------------------------------------------------
+    # New gate, not part of the llama.cpp-0igs restoration above or below
+    # (llama.cpp-0rhb): the parser and the dry-run argument handling for the
+    # qwen4exp MTP acceptance measurement (scripts/parse-qwen4exp-mtp-
+    # acceptance.py, scripts/qwen4exp-mtp-acceptance.sh).  Pure text and
+    # `bash --dry-run`: no model load, no device, no oneAPI.  Pytest-style, so
+    # it is registered through llama_test_pytest like its neighbours; it is
+    # labelled `python` (the audit's R8) and not `sycl`, because it has nothing
+    # to do with the SYCL backend.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-qwen4exp-mtp-acceptance-parser.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "python;script-gate"
+        TIMEOUT 120
+    )
+
+    # ---------------------------------------------------------------------
     # RESTORED COVERAGE, batch 2/N (llama.cpp-0igs): 26 pytest-style SOURCE
     # assertions over ggml-sycl/ and tools/, same unregistered-so-vacuous
     # situation as batch 1 above.

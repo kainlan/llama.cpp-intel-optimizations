@@ -1,0 +1,24 @@
+# verbatim lines of mtp_n2_reasoning_v.log from after round 9 to the end of round 11 (the divergence); format: draft candidates with MTP head probabilities, then the round summary
+1.15.419.638 D clear kv cache from any extra tokens, n_past = 111
+1.15.461.716 D spec        draft:  - seq_id 0, draft candidate   0, pos   0:   5257 (   0.999) ' train'
+1.15.461.721 D spec        draft:  - seq_id 0, draft candidate   1, pos   0:  25291 (   0.000) ' Train'
+1.15.461.722 D spec        draft:  - seq_id 0, draft candidate   2, pos   0:   8598 (   0.000) ' clock'
+1.15.503.233 D spec        draft:  - seq_id 0, draft candidate   0, pos   1:   8211 (   0.796) ' starts'
+1.15.503.237 D spec        draft:  - seq_id 0, draft candidate   1, pos   1:  28712 (   0.060) ' arrives'
+1.15.503.238 D spec        draft:  - seq_id 0, draft candidate   2, pos   1:  11690 (   0.039) ' begins'
+1.15.503.243 D spec common_specu: called impl draft-mtp, hist size = 111, call_count = 10, gen = 2
+ train dep1.17.087.158 D accepted 1/2 draft tokens, the last target token is: (2101)
+1.17.087.159 D clear kv cache from any extra tokens, n_past = 113
+1.17.170.845 D spec        draft:  - seq_id 0, draft candidate   0, pos   0:   6819 (   1.000) 'arts'
+1.17.170.859 D spec        draft:  - seq_id 0, draft candidate   1, pos   0:  17710 (   0.000) 'parts'
+1.17.170.859 D spec        draft:  - seq_id 0, draft candidate   2, pos   0:    461 (   0.000) 'art'
+1.17.220.108 D spec        draft:  - seq_id 0, draft candidate   0, pos   1:    198 (   0.788) '
+'
+1.17.220.112 D spec        draft:  - seq_id 0, draft candidate   1, pos   1:    271 (   0.212) '
+
+'
+1.17.220.112 D spec        draft:  - seq_id 0, draft candidate   2, pos   1:     13 (   0.000) '.'
+1.17.220.116 D spec common_specu: called impl draft-mtp, hist size = 113, call_count = 11, gen = 2
+arts
+
+1.18.669.335 D accepted 1/2 draft tokens, the last target token is: (271)

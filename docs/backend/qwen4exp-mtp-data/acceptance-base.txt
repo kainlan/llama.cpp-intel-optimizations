@@ -1,0 +1,21 @@
+# parser output over mtp-arms/out/{q8,q4}_n{2,3}_{code,chat,reasoning}.log (base set, p-min 0.00); run from b8fedecc7
+# regenerate: python3 scripts/parse-qwen4exp-mtp-acceptance.py <the 12 logs>
+arm                      n_max n_drafted  n_accept  accept% mean_len source   acc/pos                decode_ts
+q4_n2_chat                   2       222       147    66.22     2.32 stats    0.78,0.54                   1.51
+q4_n2_code                   2       178       170    95.51     2.91 stats    0.98,0.93                   2.01
+q4_n2_reasoning              2       188       165    87.77     2.76 stats    0.92,0.84                   2.06
+q4_n3_chat                   3       311       155    49.84     2.49 stats    0.77,0.46,0.26              1.33
+q4_n3_code                   3       211       189    89.57     3.66 stats    0.96,0.89,0.82              2.30
+q4_n3_reasoning              3       225       185    82.22     3.47 stats    0.92,0.84,0.71              1.95
+q8_n2_chat                   2       230       143    62.17     2.24 stats    0.73,0.51                   1.57
+q8_n2_code                   2       180       169    93.89     2.88 stats    0.98,0.90                   1.92
+q8_n2_reasoning              2       185       166    89.73     2.78 stats    0.94,0.85                   1.93
+q8_n3_chat                   3       311       155    49.84     2.49 stats    0.75,0.48,0.26              1.30
+q8_n3_code                   3       210       189    90.00     3.70 stats    0.96,0.91,0.83              2.29
+q8_n3_reasoning              3       213       189    88.73     3.66 stats    0.94,0.90,0.82              1.73
+
+head                     n_max  p_min  arms  accept% mean_len
+q4                           2   none     3    81.97     2.66
+q4                           3   none     3    70.82     3.21
+q8                           2   none     3    80.34     2.63
+q8                           3   none     3    72.62     3.28

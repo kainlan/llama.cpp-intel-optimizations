@@ -1162,6 +1162,7 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 // llama.cpp-ir18. Pick the best buffer type in `buft_list` that is OWNED BY THE CPU
 // BACKEND, skipping the host buffer types that other backends expose.
 //
@@ -1228,6 +1229,7 @@ static ggml_backend_buffer_type_t select_weight_buft_cpu_owned(const llama_hpara
     }
     return last;
 }
+#endif
 
 ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1470,6 +1472,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // honoured ahead of this, so an explicit request still wins. MoE experts are
         // not name-indexed in the plan and return NO_PLAN, so they fall through
         // untouched to the CpuExpertPool path.
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
         if (!buft && layer_sycl_hooks.reg && layer_sycl_hooks.planned_target_device &&
             host_weight_layout() != LLAMA_HOST_WEIGHT_LAYOUT_OFF) {
             const int  planned_dev   = layer_sycl_hooks.planned_target_device(tn.str().c_str());
@@ -1492,6 +1495,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 // before -- correct, just not CPU-optimal.
             }
         }
+#endif
 
         if (!buft) {
             buft = select_weight_buft(hparams, t_meta, op, buft_list, prefer_host_weights);
