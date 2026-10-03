@@ -1959,6 +1959,32 @@ set_tests_properties(sycl-kv-layer-sizing PROPERTIES
     TIMEOUT 60
 )
 
+# llama.cpp-5efe C4 (part b): the indexer cache counts toward a demoted layer's host-KV demand.  The real
+# placement_plan::kv_demand_for_layer() and the real plan_runtime_kv_demotion(); no device, no queue.  Same
+# arrangement as test-sycl-kv-layer-sizing above (header-only plan, no libggml-sycl).
+add_executable(test-sycl-kv-demand-idx
+    tests/test-sycl-kv-demand-idx.cpp
+    kv-runtime-demotion.cpp
+)
+target_include_directories(test-sycl-kv-demand-idx PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-sycl-kv-demand-idx PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-kv-demand-idx PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-sycl-kv-demand-idx PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-kv-demand-idx PRIVATE ggml-base)
+add_test(NAME sycl-kv-demand-idx COMMAND test-sycl-kv-demand-idx)
+set_tests_properties(sycl-kv-demand-idx PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    LABELS "sycl;host;kv;hostonly"
+    TIMEOUT 60
+)
+
 # Runtime KV demotion decision (llama.cpp-uize/llama.cpp-3px1).  Deliberately a
 # pure host-linkable TU with no include of unified-cache.hpp (the c-8lff siting
 # lesson: an enum placed in unified-cache.hpp "would not have linked" for a
