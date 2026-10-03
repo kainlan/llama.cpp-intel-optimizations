@@ -202,6 +202,7 @@ if (BUILD_TESTING)
     set_tests_properties(test-sycl-host-cpu-mapping PROPERTIES LABELS "sycl;host" SKIP_RETURN_CODE 77 TIMEOUT 60)
 
     # The segment plan: a pure function of byte ranges, so this target links file-mapping.cpp alone (llama.cpp-5efe C3).
+    # The planner sits outside file-mapping.cpp's POSIX guard and the test uses no POSIX header, so it builds everywhere.
     add_executable(test-sycl-file-mapping-segments
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-file-mapping-segments.cpp
         file-mapping.cpp)

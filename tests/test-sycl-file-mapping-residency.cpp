@@ -210,12 +210,20 @@ int64_t resident_pages(const fixture & f, uint64_t off, uint64_t len) {
 int64_t interior_resident(const fixture & f);
 
 bool evict(const fixture & f) {
-    posix_fadvise(f.fd, 0, 0, POSIX_FADV_DONTNEED);
-    const int64_t left = resident_pages(f, 0, FILE_SIZE);
-    // A few pages of metadata-adjacent noise are not the file's data, but they must not sit where an arm measures: the
-    // interior is read 0 here, so a later "> 0" is the arm's doing, and the edge arms read their own band before the
-    // fault for the same reason.
-    return left >= 0 && left <= 64 && interior_resident(f) == 0;
+    // Readahead the previous arm started can still be landing when its mapping is gone, so the advice is repeated for a
+    // few seconds before the file is declared un-evictable.
+    for (int i = 0; i < 10; ++i) {
+        posix_fadvise(f.fd, 0, 0, POSIX_FADV_DONTNEED);
+        const int64_t left = resident_pages(f, 0, FILE_SIZE);
+        // A few pages of metadata-adjacent noise are not the file's data, but they must not sit where an arm measures:
+        // the interior is read 0 here, so a later "> 0" is the arm's doing, and the edge arms read their own band
+        // before the fault for the same reason.
+        if (left >= 0 && left <= 64 && interior_resident(f) == 0) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    return false;
 }
 
 // ---- a tier mapping of the fixture ----

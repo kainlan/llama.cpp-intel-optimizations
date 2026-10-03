@@ -3445,7 +3445,6 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_include_directories(test-llama-mlock-ranged PRIVATE ${PROJECT_SOURCE_DIR}/src)
     set_tests_properties(test-llama-mlock-ranged PROPERTIES
         LABELS "host;lazy"
-        SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE
         TIMEOUT 300)
     set_property(TEST test-llama-mlock-ranged PROPERTY

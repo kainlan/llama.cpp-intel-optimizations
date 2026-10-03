@@ -823,6 +823,7 @@ struct llama_mlock::impl {
         addr = ptr;
     }
 
+    // Locks [0, target_size): the whole prefix, minus whatever lock_range already holds. The two may share one object.
     void grow_to(size_t target_size) {
         GGML_ASSERT(addr);
         if (failed_already) {
@@ -830,14 +831,7 @@ struct llama_mlock::impl {
         }
         size_t granularity = lock_granularity();
         target_size = (target_size + granularity - 1) & ~(granularity - 1);
-        if (target_size > size) {
-            if (raw_lock((uint8_t *) addr + size, target_size - size)) {
-                note_locked(size, target_size);
-                size = target_size;
-            } else {
-                failed_already = true;
-            }
-        }
+        lock_span(0, target_size);
     }
 
     // does the page [page_begin, page_end) hold a byte of a deferred range?
@@ -871,7 +865,11 @@ struct llama_mlock::impl {
         if (lo >= hi) {
             return;
         }
-        // the gaps of [lo, hi) that are not locked yet, in order
+        lock_span(lo, hi);
+    }
+
+    // Locks the gaps of the page-aligned [lo, hi) that are not locked yet, in order.
+    void lock_span(size_t lo, size_t hi) {
         size_t                                 at = lo;
         std::vector<std::pair<size_t, size_t>> gaps;
         for (const auto & r : locked) {
@@ -899,19 +897,18 @@ struct llama_mlock::impl {
         }
     }
 
-    // keeps `locked` sorted and merged
+    // keeps `locked` sorted and merged: the new range replaces every range it overlaps or touches
     void note_locked(size_t first, size_t last) {
-        locked.emplace_back(first, last);
-        std::sort(locked.begin(), locked.end());
-        std::vector<std::pair<size_t, size_t>> merged;
-        for (const auto & r : locked) {
-            if (!merged.empty() && r.first <= merged.back().second) {
-                merged.back().second = std::max(merged.back().second, r.second);
-            } else {
-                merged.push_back(r);
-            }
+        auto it  = std::lower_bound(locked.begin(), locked.end(), first,
+                                    [](const std::pair<size_t, size_t> & r, size_t v) { return r.second < v; });
+        auto end = it;
+        while (end != locked.end() && end->first <= last) {
+            first = std::min(first, end->first);
+            last  = std::max(last, end->second);
+            ++end;
         }
-        locked.swap(merged);
+        it = locked.erase(it, end);
+        locked.insert(it, std::make_pair(first, last));
     }
 
     void * addr;

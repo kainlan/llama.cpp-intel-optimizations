@@ -89,7 +89,8 @@ struct file_segment_plan {
     // The union of the tensor ranges, each rounded OUTWARD to pages and merged. Never a complement: bytes that belong
     // to no tensor of the buffer are never mapped. At most one lazy page is mapped per lazy edge (the shared page).
     std::vector<file_map_range> map;
-    // The host-executed tensor ranges, rounded INWARD to pages, minus every page that holds a lazy byte. These are
+    // The host-executed tensor ranges, merged across a gap shorter than a page that holds no lazy byte and no
+    // device-only tensor byte (GGUF's 32 B padding), then rounded INWARD to pages: no page holds a lazy byte. These are
     // the WILLNEED segments and, under -lm mmap+mlock, the lock segments: one set, so an advice and a lock can never
     // disagree about which pages are safe.
     std::vector<file_map_range> willneed;

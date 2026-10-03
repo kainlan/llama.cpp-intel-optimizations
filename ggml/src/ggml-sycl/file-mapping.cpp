@@ -71,28 +71,6 @@ static std::vector<file_map_range> merge_ranges(std::vector<file_map_range> in) 
     return out;
 }
 
-// `a` minus `b`, both sorted and merged.
-static std::vector<file_map_range> subtract_ranges(const std::vector<file_map_range> & a,
-                                                   const std::vector<file_map_range> & b) {
-    std::vector<file_map_range> out;
-    for (const file_map_range & r : a) {
-        uint64_t at = r.file_offset;
-        for (const file_map_range & cut : b) {
-            if (cut.file_end() <= at || cut.file_offset >= r.file_end()) {
-                continue;
-            }
-            if (cut.file_offset > at) {
-                out.push_back({ at, cut.file_offset - at });
-            }
-            at = std::max(at, cut.file_end());
-        }
-        if (at < r.file_end()) {
-            out.push_back({ at, r.file_end() - at });
-        }
-    }
-    return out;
-}
-
 // `a` intersected with `b`, both sorted and merged.
 static std::vector<file_map_range> intersect_ranges(const std::vector<file_map_range> & a,
                                                     const std::vector<file_map_range> & b) {
@@ -122,6 +100,7 @@ file_segment_plan file_mapping_segments(const std::vector<file_tensor_range> & t
 
     std::vector<file_map_range> all;
     std::vector<file_map_range> host;
+    std::vector<file_map_range> others;  // device-only tensors: bytes a host advice or lock must not reach
     for (const file_tensor_range & t : tensor_ranges) {
         if (t.length == 0) {
             continue;
@@ -135,6 +114,8 @@ file_segment_plan file_mapping_segments(const std::vector<file_tensor_range> & t
         all.push_back({ t.file_offset, t.length });
         if (t.host_executed) {
             host.push_back({ t.file_offset, t.length });
+        } else {
+            others.push_back({ t.file_offset, t.length });
         }
     }
 
@@ -146,22 +127,40 @@ file_segment_plan file_mapping_segments(const std::vector<file_tensor_range> & t
     }
     plan.map = merge_ranges(outward);
 
-    // WILLNEED / lock segments: host-executed bytes first merged exactly (a page two touching host tensors share
-    // holds no lazy byte and may be advised), then rounded inward, then every page holding a lazy byte removed.
-    std::vector<file_map_range> inward;
+    // WILLNEED / lock segments. GGUF pads tensors to 32 B, so two host tensors usually straddle a page with a few
+    // padding bytes between them; that page holds nothing of anybody else, so the host ranges are first merged across a
+    // gap shorter than a page that holds no lazy byte and no device-only tensor byte (the loader's lock_range rounds
+    // outward at such an end for the same reason). The merged ranges are then rounded inward. An inward-rounded page
+    // lies inside a merged range, which has no lazy byte (a tensor overlapping one was refused above, and a merged gap
+    // holds none), so no page of this set holds a lazy byte.
+    std::vector<file_map_range> blocked = lazy;
+    blocked.insert(blocked.end(), others.begin(), others.end());
+    blocked = merge_ranges(blocked);
+    std::vector<file_map_range> joined;
     for (const file_map_range & r : merge_ranges(host)) {
+        if (!joined.empty() && r.file_offset - joined.back().file_end() < page) {
+            const uint64_t gap_begin = joined.back().file_end();
+            bool           clear     = true;
+            for (const file_map_range & b : blocked) {
+                if (b.file_offset < r.file_offset && gap_begin < b.file_end()) {
+                    clear = false;
+                    break;
+                }
+            }
+            if (clear) {
+                joined.back().length = r.file_end() - joined.back().file_offset;
+                continue;
+            }
+        }
+        joined.push_back(r);
+    }
+    for (const file_map_range & r : joined) {
         const uint64_t lo = page_ceil(r.file_offset, page);
         const uint64_t hi = page_floor(r.file_end(), page);
         if (lo < hi) {
-            inward.push_back({ lo, hi - lo });
+            plan.willneed.push_back({ lo, hi - lo });
         }
     }
-    std::vector<file_map_range> lazy_pages;
-    for (const file_map_range & z : lazy) {
-        const uint64_t lo = page_floor(z.file_offset, page);
-        lazy_pages.push_back({ lo, page_ceil(z.file_end(), page) - lo });
-    }
-    plan.willneed = subtract_ranges(merge_ranges(inward), merge_ranges(lazy_pages));
 
     // MADV_RANDOM windows at both edges of every lazy range, the shared pages inside, kept to what is mapped.
     std::vector<file_map_range> windows;
@@ -315,10 +314,12 @@ file_map_status unified_cache_raw_advise_file_segments(const file_mapping &     
         }
     }
     const int      flag  = advice == file_advice::WILLNEED ? MADV_WILLNEED : MADV_RANDOM;
-    // The kernel caps how much one MADV_WILLNEED reads ahead (a single call over a 56 MiB segment populates only its
-    // first few MiB, measured), so a WILLNEED segment is advised in chunks: advising a segment must mean prefetching
-    // all of it. The chunks stay inside the segment, so no advice reaches a page outside it.
-    const uint64_t chunk = advice == file_advice::WILLNEED ? 1024 * 1024 / page * page : ~0ull;
+    // The kernel clamps one MADV_WILLNEED to max(io_pages, ra_pages) of the backing device (a single call over a 56 MiB
+    // segment populates 128 pages here, and 1 MiB chunks populate half of it where max_sectors_kb is 512), so a WILLNEED
+    // segment is advised in chunks no larger than the smallest plausible cap: 128 KiB, the default read_ahead_kb and
+    // below any io_pages that max_sectors_kb >= 128 gives. Advising a segment must mean prefetching all of it. The
+    // chunks stay inside the segment, so no advice reaches a page outside it, and are at least a page.
+    const uint64_t chunk = advice == file_advice::WILLNEED ? std::max(page, 128 * 1024 / page * page) : ~0ull;
     for (const file_map_range & seg : segments) {
         for (uint64_t done = 0; done < seg.length; done += chunk) {
             const uint64_t n = std::min(chunk, seg.length - done);

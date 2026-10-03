@@ -1,7 +1,7 @@
 """Source contract for llama.cpp-5efe C2: the raw mapping primitives have an allowlist.
 
-`mmap`, `munmap`, `mlock` and `madvise` are the calls that make, lock and release address space the unified cache
-must own. The FILE_MAPPED tier (docs/design/sycl-mmap-host-tier.md §4.1) keeps them in one device-free translation
+`mmap`, `munmap`, `mlock` and `madvise` (and `mlock2`, `munlock`, `mremap`, `posix_madvise` and
+`posix_fadvise`) are the calls that make, lock, advise and release address space or file pages the unified cache must own. The FILE_MAPPED tier (docs/design/sycl-mmap-host-tier.md §4.1) keeps them in one device-free translation
 unit, ggml/src/ggml-sycl/file-mapping.cpp, behind four wrappers (`unified_cache_raw_map_file`,
 `unified_cache_raw_lock_file_segments`, `unified_cache_raw_advise_file_segments`,
 `unified_cache_raw_unmap_file`). An allowlist entry in the canonical contract does not enforce itself, so this gate
@@ -16,7 +16,8 @@ does:
 3. the canonical contract's §3 allowlist names the four wrappers.
 
 th32 T1's HOST_CPU wrapper (ggml/src/ggml-sycl/host-cpu-mapping.cpp, `unified_cache_raw_alloc_host_cpu` and
-`unified_cache_raw_free_host_cpu`) is the second wrapper TU: anonymous mmap, MADV_HUGEPAGE and a full mlock, in one place.
+`unified_cache_raw_free_host_cpu`) is the second wrapper TU: anonymous mmap, MADV_HUGEPAGE and a full mlock, in one
+place.
 """
 
 import re
@@ -44,7 +45,9 @@ ALLOWED = {
     "unified-cache.hpp": {"mmap": 1, "munmap": 2},
 }
 
-CALL_RE = re.compile(r"\b(mmap|munmap|mlock|madvise)\s*\(")
+# every raw call that maps, locks, advises or releases memory or file pages, so the FADV_DONTNEED step cannot add one
+# outside the wrapper unseen
+CALL_RE = re.compile(r"\b(mmap|munmap|mlock2?|munlock|mremap|madvise|posix_madvise|posix_fadvise)\s*\(")
 
 _LEXEME_RE = re.compile(
     r'"(?:\\.|[^"\\\n])*"'  # string literal
@@ -125,6 +128,14 @@ def test_a_second_munmap_in_the_file_mapping_tu_is_a_violation():
     files = tree_files()
     files["file-mapping.cpp"] += "\nvoid second_release(void * p) { munmap(p, 4096); }\n"
     assert any(v.startswith("file-mapping.cpp") for v in violations(files)), violations(files)
+
+
+def test_the_other_raw_page_calls_are_policed_too():
+    for call in ("posix_fadvise", "posix_madvise", "mlock2", "munlock", "mremap"):
+        assert calls_in("void f() { %s (p, 0, 0); }" % call) == {call: 1}, call
+        files = tree_files()
+        files["some-new-file.cpp"] = "void h() { %s(p, 0, 0); }\n" % call
+        assert any(v.startswith("some-new-file.cpp") for v in violations(files)), call
 
 
 def test_an_extra_call_in_a_listed_file_is_a_violation():

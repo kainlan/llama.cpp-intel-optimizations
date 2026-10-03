@@ -3146,7 +3146,12 @@ lifts it into `host_ledger_budget()`.
     `llama_mlock::lock_range(offs, size)` instead, which locks the tensor's own
     range: outward to pages, except inward at any end whose page holds a
     record-deferred byte. `llama_mlock` records the ranges it has locked, and
-    `grow_to` remains only for whole-buffer locks (`mlock_bufs`).
+    `grow_to` remains only for whole-buffer locks (`mlock_bufs`). Both go
+    through one gap computation, so `grow_to(n)` after a `lock_range` locks
+    `[0, n)` minus what is already locked (it used to read the byte sum as a
+    prefix length); the ranges are kept sorted and merged by an ordered insert.
+    Locks end when the mapping is unmapped: `llama_mlock` never unlocks, so the
+    remembered ranges only dedupe.
   - Qwen is immune (its table is all of shard 3). DeepSeek's layouts are
     exposed (Q3_K_M shard 2; Q2_K shards 1 and 4), which is why both lock REDs
     put a lazy range before a locked range.
@@ -3215,6 +3220,17 @@ lifts it into `host_ledger_budget()`.
     - Each has a **control twin** with no edge advice, which must read
       resident pages in the edge band. This shows the arm could fail.
     - A mutant that advises only the segment tail fails arm 6.
+  - **Arm 7 (`WILLNEED` reaches the whole segment; C3 review M1).** Map the
+    plan, advise its `WILLNEED` segments, and poll up to 10 s: **every** host
+    segment must read at least 95 % resident. Arms 1 and 2 only read the
+    interior as 0, so they would pass if the advice never ran; arm 3 stops at
+    "some pages". Two mutants advise the same segments in one call and in 1 MiB
+    chunks and must read **below** 95 %; on a host whose per-call cap does not
+    stop one of them the arm exits 77 instead of passing, since it then cannot
+    discriminate. Every advice status in this test is checked: a refused advice
+    fails its arm. `evict()` retries for a few seconds (readahead the previous
+    arm started can land late) and requires the interior to read 0 first; the
+    edge arms read their band before the fault.
   - **Arm 4 (synchronous positive control) runs last**, on its own freshly
     evicted fixture. `pread` 1 MiB inside the interior, then the probe over
     that MiB must read resident. There is no polling and no `WILLNEED` race.
@@ -3242,6 +3258,10 @@ lifts it into `host_ledger_budget()`.
     range through `llama_mlock::lock_range`; the interior must read 0. The
     mutant is `grow_to`, the whole-prefix lock, which must read resident. The
     test exits 77 if `RLIMIT_MEMLOCK` is below the fixture size.
+    Four small cases over a 16-page anonymous mapping read the kernel's
+    per-VMA `VM_LOCKED` flag, one character per page: two neighbours sharing a
+    non-lazy page, a lazy range at offset 0, a tensor ending on a page boundary
+    against a lazy range, and `grow_to` after `lock_range`.
   - **On Qwen** the lead gate is `fincore` on shard 3, which holds only the
     table (§2.5), against the bound pre-registered in §7 C4.
 
