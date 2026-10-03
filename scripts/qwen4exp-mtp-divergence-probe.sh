@@ -15,6 +15,7 @@
 # time, and never from a subagent.  It takes no lock itself.
 #
 #   scripts/qwen4exp-mtp-divergence-probe.sh --dry-run
+#   UBS="2 3 4" PROMPTS=code scripts/qwen4exp-mtp-divergence-probe.sh   # the small-width follow-up
 #   scripts/qwen4exp-mtp-divergence-probe.sh
 #   DELTA=0.25 scripts/qwen4exp-mtp-divergence-probe.sh   # optional margin probe, see below
 #
@@ -22,6 +23,8 @@
 #   BIN     [<repo>/build-cpu/bin/llama-completion]    TARGET  first split of the IQ3_XXS pair
 #   PREFIXES [<repo>/docs/backend/qwen4exp-mtp-data/disc]   the *_prefix.txt files
 #   OUT     [./qwen4exp-mtp-divergence-out]
+#   UBS     micro-batch widths to probe [512 1]; the follow-up used "2 3 4" (small widths like a verify batch)
+#   PROMPTS prompts to probe [code chat reasoning]
 #   DELTA   adds that logit bias to Y (token ids from the GGUF vocab: ' all'=660, '\n\n'=271); the smallest
 #           DELTA that flips X to Y approximates the logit margin.  Unset = the plain discriminator.
 set -u
@@ -31,6 +34,8 @@ BIN=${BIN:-$ROOT/build-cpu/bin/llama-completion}
 TARGET=${TARGET:-/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf}
 PREFIXES=${PREFIXES:-$ROOT/docs/backend/qwen4exp-mtp-data/disc}
 OUT=${OUT:-$PWD/qwen4exp-mtp-divergence-out}
+UBS=${UBS:-"512 1"}
+PROMPTS=${PROMPTS:-"code chat reasoning"}
 DRY=0
 [ "${1:-}" = "--dry-run" ] && DRY=1
 
@@ -44,8 +49,8 @@ run_cmd() { # $1 prompt, $2 ub; prints the command, one argument per line
 
 tag=""; [ -n "${DELTA:-}" ] && tag="_d$DELTA"
 if [ "$DRY" = 1 ]; then
-    for ub in 512 1; do
-        for p in code chat reasoning; do
+    for ub in $UBS; do
+        for p in $PROMPTS; do
             mapfile -t cmd < <(run_cmd "$p" "$ub")
             printf '%q ' "${cmd[@]}"; echo "> $OUT/out_${p}_ub${ub}$tag.txt 2> $OUT/err_${p}_ub${ub}$tag.log"
         done
@@ -60,8 +65,8 @@ done
 mkdir -p "$OUT"
 ulimit -c 0
 echo "pre: $(grep -E '^(Shmem|MemAvailable):' /proc/meminfo | tr '\n' ' ') load: $(cut -d' ' -f1-3 /proc/loadavg)"
-for ub in 512 1; do
-    for p in code chat reasoning; do
+for ub in $UBS; do
+    for p in $PROMPTS; do
         mapfile -t cmd < <(run_cmd "$p" "$ub")
         timeout 1500 "${cmd[@]}" < /dev/null > "$OUT/out_${p}_ub${ub}$tag.txt" 2> "$OUT/err_${p}_ub${ub}$tag.log"
         rc=$?

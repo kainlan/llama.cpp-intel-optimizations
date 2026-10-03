@@ -47,8 +47,9 @@ indexer cache, plus a MoE FFN (512 experts, top 10, like a trunk layer), fed by 
 hnorm(h)])` per hyper-connection stream, collapsed by its own `hc_head` mixer, then the target's output
 projection. `h` is the trunk's hc-wide residual (n_embd * hc = 10240 floats per token), tapped before the
 final mixer. Verification is greedy: a draft token is kept only if it equals the target's own argmax at that
-position. Bit-identical output to a plain greedy run is not established here, though: in our pairs the MTP output
-and the no-MTP output diverge early on all three prompts (see "Output equivalence").
+position. Output bit-identical to a plain greedy run is not what we get, though: in our pairs the MTP output and
+the no-MTP output diverge early on all three prompts, which batch-width numerics on near ties explains for two of
+them and leaves open for the third (see "Output equivalence").
 
 ## The port in this tree
 
@@ -67,8 +68,9 @@ reporting upstream.
 
 Verified: a CPU-only build compiles and links `llama-speculative-simple`, and the lead ran it on the IQ3_XXS
 target with both heads (see "Measured results"): speculation is active, with 50-96% of drafted tokens
-accepted depending on prompt and n-max. **Not verified**: that the output equals plain greedy decoding (it
-diverged from the baseline on all three prompts; see "Output equivalence"), the converter
+accepted depending on prompt and n-max. **Not equal to greedy**: the output diverges from the baseline
+on all three prompts, by batch-width numerics on near ties for code and reasoning and unexplained for chat (see
+"Output equivalence"). **Not verified**: the converter
 (`conversion/qwen4exp.py`, needs the BF16 checkpoint) and anything on SYCL.
 
 ## Expected speedup at our expert-read cost (Phase-1 estimate; superseded for CPU decode by the measurements below)
@@ -245,11 +247,11 @@ same expert and pays the per-layer overhead once, so it costs much less than 2-3
 estimate's `E` term was pessimistic for this path and it says nothing about a GPU or hybrid path, where the
 cost structure differs.
 
-**Output equivalence: not established, and the speedups above are for numerically divergent output.** Speculative
-decoding with greedy verification is meant to reproduce a plain greedy run. Here it does not, on any of the three
-prompts: in each pair the MTP text and the no-MTP text agree for the first 130-200 characters and then differ
-(`pairs/base_<prompt>_1.log` against `pairs/mtp_<prompt>_1.log`). The first divergent token, with what the baseline
-(X) and the MTP run (Y) each emitted:
+**Output equivalence: MTP output is not bit-identical to greedy; on the evidence it is greedy up to batch-width numerics on near ties, and the speedups compare two different texts.**
+Speculative decoding with greedy verification is meant to reproduce a plain greedy run. Here it does not, on any
+of the three prompts: in each pair the MTP text and the no-MTP text agree for the first 130-200 characters and
+then differ (`pairs/base_<prompt>_1.log` against `pairs/mtp_<prompt>_1.log`). The first divergent token, with what
+the baseline (X) and the MTP run (Y) each emitted:
 
 | prompt | text both runs agree on, up to | X (baseline) | Y (MTP) |
 |---|---|---|---|
@@ -257,62 +259,70 @@ prompts: in each pair the MTP text and the no-MTP text agree for the first 130-2
 | chat | "...the light is soft and golden." | ` This` | `\n\n` |
 | reasoning | "...analyze the situation before the second train departs" | `\n` | `\n\n` |
 
-All three are near-tie style choices (word, sentence-versus-paragraph break), which fits floating-point
-differences between a batch-1 and a batch-3 forward pass on a near-tied logit pair: the MTP verify pass computes
-the target's logits for the draft positions as one small batch, while the baseline computes them one token at a
-time, and the CPU kernels do not promise bit-identical results across batch widths. It is equally consistent with
-a verify/rollback defect in the port (target GDN-state rollback, `seq_rm`, QSA indexer positions after a rejected
-draft), and the logs cannot tell the two apart. Consequently:
-- this document does not claim that MTP output equals plain greedy decoding;
+All three are near-tie style choices (word, sentence-versus-paragraph break). Two explanations were open:
+floating-point differences between a batch-1 and a small-batch forward pass, or a verify/rollback defect in the
+port (target GDN-state rollback, `seq_rm`, QSA indexer positions after a rejected draft). Four probes, all CPU-only
+with existing binaries; data under `docs/backend/qwen4exp-mtp-data/`:
+
+1. **Prefill width 1 and 512** (`disc/`, `scripts/qwen4exp-mtp-divergence-probe.sh`). The baseline continues
+   "prompt + the text both runs agreed on" for one token (`-n 1`). `-ub 1` prints X on all three prompts (positive
+   control: the prefixes reconstruct the baseline) and so does `-ub 512`. This tested only widths 1 and 512, and both
+   happen to agree with the baseline, so it did not discriminate (an earlier reading of this result as pointing at
+   rollback was wrong; see probe 4).
+2. **MTP with `--spec-draft-n-max 1`** (`disc2/mtp_n1_*.log`). It diverges from the baseline at the same place as
+   n-max 2 on all three prompts (code `merge all overlapping`, chat `golden.\n\n###`, reasoning `departs\n\nFirst`).
+   Acceptance there: code 127/131 (96.9%), chat 109/148 (73.6%), reasoning 122/136 (89.7%). A 2-token verify batch
+   is enough, so the divergence does not need a 3-token batch or deeper rollback.
+3. **Per-round accept lines** (`-v`, n-max 2: `disc2/rounds_*.txt` for every round, `disc2/excerpt_*.txt` verbatim
+   around the divergence; the full `-v` logs are 12k lines each and are not kept). Positive control: code has 89
+   `accepted k/n` lines, chat 111 (24 x 0/2, 27 x 1/2, 60 x 2/2), reasoning 94.
+   - code, round 14: draft [` merge` (0.863), ` overlapping` (0.976)]. The target accepts ` merge` and then picks
+     ` all` at verify-batch index 1: `accepted 1/2, last target token (660)`. The head's own candidates for that
+     position are near-tied (` any` 0.009, ` all` 0.007). One rejection (round 7, 0/2) precedes it.
+   - chat, round 20: the divergent pick comes from the logits of `id_last` (`.`) at index 0 of the 3-token verify
+     batch [`.`, `\n\n`, `###`], which the drafts cannot influence. Five rejections (rounds 4, 5, 7, 13, 18) precede it.
+   - reasoning, round 11: draft [`arts`, `\n` (0.788; `\n\n` 0.212)]; the target accepts `arts` and emits `\n\n`
+     (`accepted 1/2, last target token (271)`). Rounds 1-9 were fully accepted; round 10 was 1/2.
+4. **Small prefill widths in a fresh context, no MTP and no rollback** (`disc3/`: `UBS="2 3 4"`, then
+   `UBS=512 DELTA=...` on code; plain `llama-completion`, `-n 1`). Same prefixes as probe 1:
+
+   | prompt | ub 1 | ub 2 | ub 3 | ub 4 | ub 512 |
+   |---|---|---|---|---|---|
+   | code | ` any` | ` all` | ` all` | ` any` | ` any` |
+   | reasoning | `\n` | `\n\n` | `\n\n` | (not run) | `\n` |
+   | chat | ` This` | ` This` | ` This` | (not run) | ` This` |
+
+   Margin, code at `-ub 512`: `--logit-bias 660+0.05` already flips to ` all`, as do +0.25 and +1.0, so the X/Y
+   logit gap is under 0.05.
+
+Reading. For code and reasoning, MTP's token appears with no MTP and no rollback, purely from the small batch
+widths (2 and 3) that the verify step uses, on logits whose gap (code: under 0.05) is smaller than the effect of
+changing the batch width. The first probe tested only widths 1 and 512, which happen to agree. Which CPU kernel
+path changes between widths 1 and 4 on one side and 2 and 3 on the other is not identified. The rollback-defect
+hypothesis is therefore not supported: batch-width numerics on near ties explains two of three directly, and these
+are the kind of differences that changing the batch width already causes in plain prefill. llama.cpp's CPU backend
+does not promise batch invariance.
+
+Chat is not reproduced at ub 2 or 3. That is expected but unproven: its divergent position sits after a history
+computed through a different mix of batch shapes (five rejections, 3-wide verifies) which a fresh-context prefill
+cannot replicate. So chat stays unexplained, with no positive evidence of a rollback defect either. What would close
+it: replaying the exact batch partition of the MTP run (the sequence of verify batch widths) in a non-speculative
+run, or a batch-invariant CPU path against which both runs could be compared.
+
+Which rollback path ran, for the record: the target takes the bounded-rollback path, not checkpoints. The `-lv 4`
+logs show `n_rs_seq = 2` (3 for n-max 3), `llama_memory_recurrent: ... 2 rs_seq`, and `common_conte: the context
+supports bounded partial sequence removal`; they contain no "speculative decoding will use checkpoints" line while
+other INFO lines such as "encoded" do appear. After each verified round `llama_memory_seq_rm(ctx_tgt, seq_id, n_past,
+-1)` rewinds the recurrent state by up to `n_rs_seq` positions, and the draft context prints `n_rs_seq = 0` and a
+0 MiB recurrent memory (the `is_empty()` case). The per-round `accepted <k>/<n>` line is `LOG_DBG`, `-lv 5` on this
+tree, which is why the `-lv 4` logs cannot show rejections.
+
+Consequences:
+- MTP output is not equal to greedy output; it is greedy up to batch-width numerics on near ties. The divergences
+  seen are near-tie style choices, not defects, but nothing here bounds how far a later divergence can drift in
+  a long generation;
 - the speedups above compare two different texts of the same length, not the same tokens produced faster;
-- acceptance rates describe agreement between the MTP head and the target's batched argmax.
-
-*Discriminator (CPU-only, existing `llama-completion`, `-n 1`; no new tool).* For each prompt, feed the prompt plus
-the agreed text above as a new prompt and let the baseline emit one token, at `-ub 512` (the prefix is one batched
-pass, like a verify batch) and at `-ub 1` (batch-1, the decode shape). The `-ub 1` run is the positive control and
-must print X. If `-ub 512` prints Y, batch-width numerics on a near tie explain the divergence for that prompt. If
-it prints X, batch width alone does not explain it and the verify/rollback path stays suspect. Optionally add
-`--logit-bias <id of Y>+<delta>` at `-ub 1` and take the smallest delta that flips X to Y as the logit margin.
-Run: `scripts/qwen4exp-mtp-divergence-probe.sh` (the prefixes are `docs/backend/qwen4exp-mtp-data/disc/*_prefix.txt`;
-the lead's run, with the build-cpu binaries, is `disc/run.out`, rc 0, Shmem flat at 12.24 GB before and after).
-
-| prompt | X (baseline in the pair) | -ub 512 printed | -ub 1 printed | Y (MTP in the pair) |
-|---|---|---|---|---|
-| code | ` any` | ` any` | ` any` | ` all` |
-| chat | ` This` | ` This` | ` This` | `\n\n` |
-| reasoning | `\n` | `\n` | `\n` | `\n\n` |
-
-Reading. The positive control holds (`-ub 1` reproduces X on all three prompts, so the prefixes reconstruct the
-baseline). `-ub 512` also prints X on all three: widening the pass from one token to the whole prefix does not
-move the pick to MTP's token. So batch-width numerics on a near tie, at least of the kind a 512-wide prefill
-exercises, do not explain Y, and the weight shifts toward the MTP verify/rollback path (target GDN-state
-rollback, `seq_rm`, QSA indexer positions after a rejected draft). **This is not a proven defect.** The probe
-varies the prefill batch width over a fresh context. It does not reproduce the exact verify shape (a 3-token
-decode step over a KV and recurrent state that has been through accept/reject cycles), so a numerics
-difference that only appears with that state history is not excluded.
-
-Which rollback path runs. Not checkpoints: `examples/speculative-simple` restores the target from a checkpoint only
-when `common_context_can_seq_rm(ctx_tgt)` is `COMMON_CONTEXT_SEQ_RM_TYPE_FULL` and logs "speculative decoding will
-use checkpoints" at INFO, and none of the `-lv 4` logs contains that line (other INFO lines such as "encoded" do
-appear). The logs show the bounded-rollback path instead: the target context prints `n_rs_seq = 2` (3 for the
-n-max 3 arms; `llama_memory_recurrent: ... 2 rs_seq`, 337.71 MiB against 450.28 MiB at 3) and
-`common_conte: the context supports bounded partial sequence removal`. After each verified round
-`llama_memory_seq_rm(ctx_tgt, seq_id, n_past, -1)` (`speculative-simple.cpp`, "clear kv cache from any extra
-tokens") rewinds the recurrent state by up to `n_rs_seq` positions from saved per-step planes, and the compress-state
-planes (`dsv4_build_comp_plan`, rollback `<= n_rs_seq`) carry the same bound. That is the code the divergence
-points at, and it is shared with `llama_memory_recurrent`, which this port touched (the draft context prints
-`n_rs_seq = 0` and a 0 MiB recurrent memory: the `is_empty()` case).
-
-Next discriminating runs (running, started by the lead; results to be recorded here). (a) `--spec-draft-n-max 1` on the same prompts: if the output still diverges
-from greedy, the 3-token verify batch is not needed for the divergence. (b) Locate the first divergence relative
-to the first rejected draft. This cannot be done from the existing logs: they are `-lv 4` and carry only the
-aggregate counters (for `mtp_code_1`: 89 rounds, 178 drafted, 170 accepted, so 8 draft tokens were rejected
-somewhere). Per-round rejections are logged at DEBUG, which is `-lv 5`: `accepted <k>/<n> draft tokens, the last
-target token is: (<id>)` after each round (`speculative-simple.cpp:324`, a rejection is k < n; the generated text
-of the round is printed just before it). The `partial acceptance ... restoring checkpoint` line (`:268`) belongs to the
-checkpoint path and is not expected here. So (b) needs one `-lv 5` re-run of an MTP arm, for example
-`mtp_code_1`'s command with `-lv 5`; the divergence then sits in the round whose text contains the first
-differing character. If no rejection precedes it, rollback is implicated directly.
+- acceptance rates describe agreement between the MTP head and the target's argmax at the verify batch width.
 
 **Compared with upstream's report** (PR #29761: 0.640 acceptance, 1.55x, IQ4_XS, n-max 3, all-VRAM DGX Spark, 24
 prompts over 7 categories): our pooled n3 acceptance without p-min is 70.8-72.6% over 3 prompts only, higher than
@@ -336,8 +346,8 @@ n-max 3 on VRAM-resident weights: similar magnitude, different configuration, no
 
 Acceptance is no longer the open question: at n-max 2 it is 62-96% depending on the prompt (80-82% pooled,
 ~86% with p-min 0.5) and the Q4_0 head is as good as the Q8_0 head. The CPU decode speedup measured here is
-1.48-1.75x (single interleaved pairs, load-affected; chat as low as 1.08x on a repeat; and for output that diverges from the baseline, see "Output equivalence"), well above the Phase-1
-estimate for this target.
+1.48-1.75x (single interleaved pairs, load-affected; chat as low as 1.08x on a repeat; the output differs from
+the baseline's by batch-width numerics, see "Output equivalence"), well above the Phase-1 estimate for this target.
 
 Still holding the SYCL wiring, because the measurement does not cover the placement we run. What is left to
 establish, and where the hold is decided: (1) the GPU-busy versus CPU-expert-pool-busy split per token (`A` and
@@ -345,11 +355,12 @@ establish, and where the hold is decided: (1) the GPU-busy versus CPU-expert-poo
 path) is cheaper than k+1 single-token steps: the CPU result is evidence for that only if the hypothesis above
 (batched expert matmuls reuse dequantized rows) is right and the hybrid path's host experts run through the
 same batched CPU kernels, and neither is tested; (3) the SYCL risks listed above (second model and context on
-one device, draft-context compute buffer); (4) whether the output divergence from the baseline is numerics or a
-port defect ("Output equivalence"): the discriminator ruled out prefill batch-width numerics and left the verify
-and rollback path suspect but unproven, so MTP is not to be treated as output-equivalent, and the speedups stay
-"two different texts", until the rollback path is cleared (next runs (a) and (b) there). If (2) and (4) come
-out well, the working recommendation for a first SYCL
-attempt is the Q4_0 head and n-max 2. `--spec-draft-p-min 0.5` is worth trying for chat-like workloads, but that
-rests on acceptance alone: its effect on decode t/s was not measured (the p05 timings are unreliable). Keep the
-`S > ~1.2x` bar for deciding whether to wire it.
+one device, draft-context compute buffer); (4) output equivalence ("Output equivalence"): MTP output is not bit-identical to greedy. For code and
+reasoning the divergence is reproduced with no MTP and no rollback, from batch width 2-3 alone on near-tied logits
+(code gap under 0.05), so the rollback-defect hypothesis is not supported; chat is not reproduced by that probe and
+stays open (what would close it is in that section). MTP is therefore "greedy up to batch-width numerics on
+near ties", not equivalent; the speedups still compare two different texts, with the divergences being near-tie
+style choices rather than defects. If (2) comes out well and a downstream consumer accepts that equivalence, the
+working recommendation for a first SYCL attempt is the Q4_0 head and n-max 2. `--spec-draft-p-min 0.5` is worth
+trying for chat-like workloads, but that rests on acceptance alone: its effect on decode t/s was not measured (the
+p05 timings are unreliable). Keep the `S > ~1.2x` bar for deciding whether to wire it.
