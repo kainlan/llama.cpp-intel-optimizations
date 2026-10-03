@@ -1326,6 +1326,7 @@ namespace dpct
                     return pointer_access_attribute::host_device;
                 case ggml_sycl::alloc_type::HOST_MALLOC:
                 case ggml_sycl::alloc_type::HOST_OWNED_ELSEWHERE:
+                case ggml_sycl::alloc_type::FILE_MAPPED:
                     return pointer_access_attribute::host_only;  // Not USM — CPU only
             }
             return pointer_access_attribute::host_only;

@@ -82357,6 +82357,8 @@ static const char * ggml_sycl_alloc_tier_name(ggml_sycl::alloc_tier tier) {
             return "host-pinned";
         case ggml_sycl::alloc_tier::UNREGISTERED:
             return "unregistered";
+        case ggml_sycl::alloc_tier::FILE_MAPPED:
+            return "file-mapped";
     }
     return "invalid";
 }
@@ -88979,6 +88981,8 @@ static block_exec_leaf_materialize_probe_result ggml_sycl_probe_block_exec_leaf_
                 return "host_malloc";
             case ggml_sycl::alloc_type::HOST_OWNED_ELSEWHERE:
                 return "host_owned_elsewhere";
+            case ggml_sycl::alloc_type::FILE_MAPPED:
+                return "file_mapped";
             case ggml_sycl::alloc_type::UNKNOWN:
             default:
                 return "unknown";

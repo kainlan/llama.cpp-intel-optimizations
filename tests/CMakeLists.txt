@@ -3418,6 +3418,11 @@ if (Python3_Interpreter_FOUND)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-alloc-tier-census-source.py
         LABEL "sycl;host;python;source-contract"
         TIMEOUT 120)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-file-mapped-tier-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-file-mapped-tier-source.py
+        LABEL "sycl;host;python;source-contract"
+        TIMEOUT 120)
 endif()
 
 # llama.cpp-5efe C1: the per-model lazy-range record and its pre-fill, driven over

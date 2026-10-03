@@ -1455,6 +1455,8 @@ struct runtime_alloc_record {
     // owners released during backend-context teardown, or init-time probe
     // staging buffers), so sycl::free must use this keepalive, never *queue.
     std::optional<sycl::queue> queue_keepalive;
+    // FILE_MAPPED only: the owner's dup of the loader's fd, closed by the release's one unmap.
+    int                        file_fd = -1;
     bool                       uses_pinned_pool = false;
     bool                       zone_managed     = false;
     bool                       from_arena       = false;  // True if sub-allocated from arena (KV/RUNTIME/etc zone)
@@ -1715,6 +1717,7 @@ static std::atomic<uint64_t> g_offload_wait_count_fallback{ 0 };
 static std::atomic<uint64_t> g_offload_alloc_count_host{ 0 };
 static std::atomic<uint64_t> g_offload_alloc_count_device{ 0 };
 static std::atomic<uint64_t> g_offload_alloc_count_shared{ 0 };
+static std::atomic<uint64_t> g_offload_alloc_count_file_mapped{ 0 };
 static std::atomic<uint64_t> g_offload_pool_hit_count{ 0 };
 static std::atomic<uint64_t> g_offload_pool_miss_count{ 0 };
 static std::atomic<uint64_t> g_offload_cross_domain_transfer_count{ 0 };
@@ -3205,6 +3208,8 @@ static const char * alloc_tier_name(alloc_tier tier) {
             return "host_pinned";
         case alloc_tier::UNREGISTERED:
             return "unregistered";
+        case alloc_tier::FILE_MAPPED:
+            return "file_mapped";
         default:
             return "unknown";
     }
@@ -3293,6 +3298,7 @@ void offload_stats_reset() {
     g_offload_alloc_count_host.store(0, std::memory_order_relaxed);
     g_offload_alloc_count_device.store(0, std::memory_order_relaxed);
     g_offload_alloc_count_shared.store(0, std::memory_order_relaxed);
+    g_offload_alloc_count_file_mapped.store(0, std::memory_order_relaxed);
     g_offload_pool_hit_count.store(0, std::memory_order_relaxed);
     g_offload_pool_miss_count.store(0, std::memory_order_relaxed);
     g_offload_cross_domain_transfer_count.store(0, std::memory_order_relaxed);
@@ -3410,6 +3416,9 @@ void offload_stats_note_alloc(alloc_tier tier) {
             break;
         case alloc_tier::UNREGISTERED:
             g_offload_alloc_count_shared.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case alloc_tier::FILE_MAPPED:
+            g_offload_alloc_count_file_mapped.fetch_add(1, std::memory_order_relaxed);
             break;
         default:
             break;
@@ -3562,6 +3571,7 @@ offload_stats_snapshot offload_stats_get() {
     s.alloc_count_host                = g_offload_alloc_count_host.load(std::memory_order_relaxed);
     s.alloc_count_device              = g_offload_alloc_count_device.load(std::memory_order_relaxed);
     s.alloc_count_shared              = g_offload_alloc_count_shared.load(std::memory_order_relaxed);
+    s.alloc_count_file_mapped         = g_offload_alloc_count_file_mapped.load(std::memory_order_relaxed);
     s.pool_hit_count                  = g_offload_pool_hit_count.load(std::memory_order_relaxed);
     s.pool_miss_count                 = g_offload_pool_miss_count.load(std::memory_order_relaxed);
     s.cross_domain_transfer_count     = g_offload_cross_domain_transfer_count.load(std::memory_order_relaxed);
@@ -3770,7 +3780,7 @@ void offload_stats_log_summary(const char * tag, int device) {
         stderr,
         "[SYCL-OFFLOAD-STATS] tag=%s device=%d wait_count=%llu wait_count_forced=%llu "
         "wait_count_fallback=%llu alloc_count_host=%llu alloc_count_device=%llu "
-        "alloc_count_shared=%llu pool_hit_count=%llu pool_miss_count=%llu phase=%s "
+        "alloc_count_shared=%llu alloc_count_file_mapped=%llu pool_hit_count=%llu pool_miss_count=%llu phase=%s "
         "cross_domain_transfer_count=%llu cross_domain_transfer_count_pp=%llu cross_domain_transfer_count_tg=%llu "
         "transfer_bytes_h2d=%llu transfer_bytes_h2d_pp=%llu transfer_bytes_h2d_tg=%llu "
         "transfer_bytes_d2h=%llu transfer_bytes_d2h_pp=%llu transfer_bytes_d2h_tg=%llu "
@@ -3788,7 +3798,7 @@ void offload_stats_log_summary(const char * tag, int device) {
         tag ? tag : "graph", device, (unsigned long long) s.wait_count, (unsigned long long) s.wait_count_forced,
         (unsigned long long) s.wait_count_fallback, (unsigned long long) s.alloc_count_host,
         (unsigned long long) s.alloc_count_device, (unsigned long long) s.alloc_count_shared,
-        (unsigned long long) s.pool_hit_count, (unsigned long long) s.pool_miss_count, phase_name,
+        (unsigned long long) s.alloc_count_file_mapped, (unsigned long long) s.pool_hit_count, (unsigned long long) s.pool_miss_count, phase_name,
         (unsigned long long) s.cross_domain_transfer_count, (unsigned long long) s.cross_domain_transfer_count_pp,
         (unsigned long long) s.cross_domain_transfer_count_tg, (unsigned long long) s.transfer_bytes_h2d,
         (unsigned long long) s.transfer_bytes_h2d_pp, (unsigned long long) s.transfer_bytes_h2d_tg,
@@ -15659,6 +15669,18 @@ alloc_tier unified_select_tier(const alloc_request & req) {
     return alloc_tier::DEVICE_VRAM;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// How often unified_free_record reached ::free and the sycl::free fallthrough (llama.cpp-5efe C2): a FILE_MAPPED
+// record that reached either was released as something it is not.
+static std::atomic<uint64_t> g_test_free_branch_malloc_free{ 0 };
+static std::atomic<uint64_t> g_test_free_branch_sycl_free{ 0 };
+
+void unified_cache_test_free_branch_counts(uint64_t * malloc_free, uint64_t * sycl_free) noexcept {
+    if (malloc_free) *malloc_free = g_test_free_branch_malloc_free.load(std::memory_order_acquire);
+    if (sycl_free) *sycl_free = g_test_free_branch_sycl_free.load(std::memory_order_acquire);
+}
+#endif
+
 static bool unified_free_record(const runtime_alloc_record & rec) {
     bool ok = true;
     // Arena zones handle their own accounting via zone_settle/zone_alloc.
@@ -15783,6 +15805,9 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
         const auto * reg_info = ggml_sycl::alloc_registry::instance().lookup(rec.handle.ptr);
         if (reg_info && reg_info->type == ggml_sycl::alloc_type::HOST_MALLOC) {
             ggml_sycl::alloc_registry::instance().unregister_alloc(rec.handle.ptr);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            g_test_free_branch_malloc_free.fetch_add(1, std::memory_order_acq_rel);
+#endif
             ::free(rec.handle.ptr);
             return true;
         }
@@ -15796,8 +15821,14 @@ static bool unified_free_record(const runtime_alloc_record & rec) {
             // destruction, not individual free().
         } else if (rec.queue_keepalive.has_value() && rec.handle.ptr != nullptr) {
             // rec.queue may dangle by now; only the keepalive copy is safe.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            g_test_free_branch_sycl_free.fetch_add(1, std::memory_order_acq_rel);
+#endif
             sycl::free(rec.handle.ptr, *rec.queue_keepalive);
         } else if (rec.handle.ptr != nullptr && rec.handle.device >= 0 && rec.handle.device < GGML_SYCL_MAX_DEVICES) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            g_test_free_branch_sycl_free.fetch_add(1, std::memory_order_acq_rel);
+#endif
             auto & q = ggml_sycl_get_device(rec.handle.device).default_queue();
             sycl::free(rec.handle.ptr, q);
         }
@@ -15979,8 +16010,10 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     runtime_category cat =
         req.intent.category == runtime_category::OTHER ? category_from_role(req.intent.role) : req.intent.category;
     alloc_tier tier = unified_select_tier(req);
-    if (tier == alloc_tier::UNREGISTERED) {
-        GGML_LOG_ERROR("[UNIFIED-ALLOC] UNREGISTERED runtime allocations are not supported in unified_alloc\n");
+    if (tier == alloc_tier::UNREGISTERED || tier == alloc_tier::FILE_MAPPED) {
+        // mappings come only from the file-mapping front door, unified_allocate_file_mapping
+        GGML_LOG_ERROR("[UNIFIED-ALLOC] %s runtime allocations are not supported in unified_alloc\n",
+                       alloc_tier_name(tier));
         return false;
     }
     if (req.intent.constraints.must_device) {
@@ -17110,6 +17143,32 @@ allocation_result unified_allocate_owner_backing(const alloc_request & req, cach
     return unified_allocate_owner_impl(req, true);
 }
 
+allocation_result unified_allocate_file_mapping(const file_mapping_request & req) noexcept {
+    // RED stub (llama.cpp-5efe C2c): no tier yet; the front door refuses every request.
+    (void) req;
+    allocation_result result;
+    result.error = allocation_error::INVALID_REQUEST;
+    return result;
+}
+
+bool unified_lookup_file_mapping_fd(const void * base, int * fd) noexcept {
+    if (base == nullptr || fd == nullptr) {
+        return false;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        const auto                  it = g_runtime_alloc_registry.find(const_cast<void *>(base));
+        if (it == g_runtime_alloc_registry.end() || it->second.state != runtime_alloc_state::LIVE ||
+            it->second.handle.tier != alloc_tier::FILE_MAPPED || it->second.file_fd < 0) {
+            return false;
+        }
+        *fd = it->second.file_fd;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 mem_handle unified_allocate(const alloc_request & req) {
     allocation_result allocation = unified_allocate_owner(req);
     if (!allocation) return {};
@@ -17351,6 +17410,7 @@ static registered_release_status release_registered_allocation_owned(
         detached.handle = live;
         detached.queue = it->second.queue;
         detached.queue_keepalive = it->second.queue_keepalive;
+        detached.file_fd = it->second.file_fd;
         detached.uses_pinned_pool = it->second.uses_pinned_pool;
         detached.zone_managed = it->second.zone_managed;
         detached.from_arena = it->second.from_arena;
@@ -17841,6 +17901,9 @@ void unified_cache_deallocate(void * ptr, int device) {
 bool unified_alloc_validate_registry(int device, const char * where) {
     std::array<size_t, GGML_SYCL_MAX_DEVICES> registry_device{};
     size_t                                    registry_host = 0;
+    // A file mapping is not charged to the host ledger (it is page cache, charged only when locked), so it is
+    // reported beside the host sum and never compared with it.
+    size_t registry_file_mapped = 0;
     {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         for (const auto & kv : g_runtime_alloc_registry) {
@@ -17851,6 +17914,8 @@ bool unified_alloc_validate_registry(int device, const char * where) {
                 }
             } else if (h.tier == alloc_tier::HOST_PINNED || h.tier == alloc_tier::UNREGISTERED) {
                 registry_host += h.size;
+            } else if (h.tier == alloc_tier::FILE_MAPPED) {
+                registry_file_mapped += h.size;
             }
         }
     }
@@ -17887,8 +17952,8 @@ bool unified_alloc_validate_registry(int device, const char * where) {
     const size_t tracked_host = g_runtime_reserved_host_bytes.load(std::memory_order_relaxed);
     if (tracked_host != registry_host) {
         ok = false;
-        GGML_LOG_WARN("[UNIFIED-ALLOC] managed registry mismatch%s%s host tracked=%zu registry=%zu\n",
-                      where ? " at " : "", where ? where : "", tracked_host, registry_host);
+        GGML_LOG_WARN("[UNIFIED-ALLOC] managed registry mismatch%s%s host tracked=%zu registry=%zu file_mapped=%zu\n",
+                      where ? " at " : "", where ? where : "", tracked_host, registry_host, registry_file_mapped);
     }
     return ok;
 }
@@ -22719,6 +22784,9 @@ bool query_registered_location(const void * ptr, memory_location * out) {
         case alloc_type::HOST_PINNED:
         case alloc_type::SHARED:
             out->tier = alloc_tier::HOST_PINNED;
+            break;
+        case alloc_type::FILE_MAPPED:
+            out->tier = alloc_tier::FILE_MAPPED;
             break;
         case alloc_type::HOST_MALLOC:
         case alloc_type::HOST_OWNED_ELSEWHERE:

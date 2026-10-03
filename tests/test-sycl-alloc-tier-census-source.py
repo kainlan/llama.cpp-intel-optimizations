@@ -92,10 +92,12 @@ def test_the_renamed_names_exist():
     reg = enumerators(enum_body(strip_comments((SYCL_DIR / "alloc-registry.hpp").read_text()), "alloc_type"))
     for n in ("HOST_MALLOC", "HOST_OWNED_ELSEWHERE"):
         assert n in reg, f"alloc_type has no {n}: {reg}"
+    assert "FILE_MAPPED" in reg, f"alloc_type has no FILE_MAPPED: {reg}"
     tiers = enumerators(enum_body(strip_comments((SYCL_DIR / "tensor-types.hpp").read_text()), "memory_tier"))
     assert "UNRESOLVED" in tiers, f"memory_tier has no UNRESOLVED: {tiers}"
     cache = enumerators(enum_body(strip_comments((SYCL_DIR / "unified-cache.hpp").read_text()), "alloc_tier"))
     assert "UNREGISTERED" in cache, f"alloc_tier has no UNREGISTERED: {cache}"
+    assert "FILE_MAPPED" in cache, f"alloc_tier has no FILE_MAPPED: {cache}"
 
 
 def test_the_gate_can_fail():

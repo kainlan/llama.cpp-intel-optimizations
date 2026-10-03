@@ -6076,6 +6076,21 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         LABELS "sycl;allocator;owner;host;tsan-capable"
         TIMEOUT 30)
 
+    # The FILE_MAPPED tier through the real front door (llama.cpp-5efe C2). Host-only: a file mapping needs no
+    # device, so the labels are those of the intrusive-owner test and carry none of cache/mem-handle/residency.
+    add_executable(test-sycl-file-mapped-tier
+        tests/test-file-mapped-tier.cpp)
+    target_link_libraries(test-sycl-file-mapped-tier PRIVATE
+        ggml-sycl-private-fixtures Threads::Threads)
+    set_target_properties(test-sycl-file-mapped-tier PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-file-mapped-tier COMMAND test-sycl-file-mapped-tier)
+    set_tests_properties(sycl-file-mapped-tier PROPERTIES
+        LABELS "sycl;allocator;owner;host"
+        # no device: pin a selector that shows none, so an incidental SYCL init cannot touch a GPU
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu"
+        TIMEOUT 30)
+
     # Forced-failure coverage for the transactional staging-replacement region
     # (4f01993c9).  Most scenarios need no device; the last two repeat the
     # rollback against a live queue, so the binary returns 77 when there is none.
@@ -6213,6 +6228,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     set(_ggml_sycl_private_fixture_consumers
         test-mem-handle-eviction
         test-sycl-intrusive-allocation-owner
+        test-sycl-file-mapped-tier
         test-sycl-staging-replacement-failpoints
         test-sycl-cache-backing-provenance
         test-sycl-mem-handle-concurrent-resolve

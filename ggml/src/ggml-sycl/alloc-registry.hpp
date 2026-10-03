@@ -24,9 +24,10 @@ enum class alloc_type : uint8_t {
     HOST_PINNED,  // sycl::malloc_host   — CPU-accessible, GPU zero-copy via PCIe
     SHARED,       // sycl::malloc_shared  — migrates between host/device
     // Host memory that is not USM, named for how it is released (llama.cpp-5efe C2). A file mapping is neither:
-    // it has its own owner and, once the FILE_MAPPED tier lands, its own type.
+    // it has its own owner and its own type.
     HOST_MALLOC,           // registered host memory that unified_free_record releases with ::free
     HOST_OWNED_ELSEWHERE,  // registered only so the registry can identify it; never freed through the registry
+    FILE_MAPPED,           // one PROT_NONE reservation with file segments mapped over it — CPU-only, no USM
     UNKNOWN,               // Not registered — pointer type is unknown
 };
 
@@ -224,7 +225,8 @@ class alloc_registry {
 //       case alloc_type::HOST_PINNED: return sycl::usm::alloc::host;
 //       case alloc_type::SHARED:      return sycl::usm::alloc::shared;
 //       case alloc_type::HOST_MALLOC:
-//       case alloc_type::HOST_OWNED_ELSEWHERE: return sycl::usm::alloc::unknown;  // not USM
+//       case alloc_type::HOST_OWNED_ELSEWHERE:
+//       case alloc_type::FILE_MAPPED: return sycl::usm::alloc::unknown;  // not USM
 //       case alloc_type::UNKNOWN:     return sycl::usm::alloc::unknown;
 //   }
 

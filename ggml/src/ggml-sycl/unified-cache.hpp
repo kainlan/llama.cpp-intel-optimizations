@@ -9,6 +9,7 @@
 
 #include "device-pool.hpp"
 #include "dpct/helper.hpp"
+#include "file-mapping.hpp"
 #include "ggml-sycl.h"
 #include "kv-runtime-demotion.hpp"
 #include "mem-handle.hpp"
@@ -5783,6 +5784,10 @@ enum class alloc_tier : uint8_t {
     // Not an allocation: the query result for a pointer the registry does not know (llama.cpp-5efe C2). Nobody may
     // allocate it; a file mapping is not this either, it has its own owner.
     UNREGISTERED = 2,
+    // One PROT_NONE reservation with a model file's segments mapped over it, made by the cache and read by the CPU
+    // only (llama.cpp-5efe C2). Not charged to the host ledger unless locked. Every census and test keys on names,
+    // never on this value.
+    FILE_MAPPED = 3,
 };
 
 enum class alloc_role : uint8_t {
@@ -5815,6 +5820,11 @@ struct memory_location {
     bool on_device() const { return tier == alloc_tier::DEVICE_VRAM; }
 
     bool host_accessible() const { return tier != alloc_tier::DEVICE_VRAM; }
+
+    // May a device be handed this pointer? host_accessible() stays true for a file mapping because the CPU reads it;
+    // a device read of mapped pages is at best a slow driver-staged copy and at worst a device loss. Every path
+    // that hands a host-accessible pointer to a device checks this instead.
+    bool device_mappable() const { return tier == alloc_tier::DEVICE_VRAM || tier == alloc_tier::HOST_PINNED; }
 };
 
 // Query only registered allocations, preserving registry authority even when
@@ -6292,6 +6302,31 @@ bool                      allocation_registry_test_publish_raw(void * ptr,
 // allocation. The legacy alloc_handle adapter remains inside the allocator;
 // broad caller migration is intentionally deferred.
 allocation_result unified_allocate_owner(const alloc_request & req) noexcept;
+
+// The owner-first front door of the FILE_MAPPED tier (llama.cpp-5efe C2). One owner and one registry record per
+// reservation: ptr = the reservation's base, size = its length; the segments are not separate records. The owner
+// class is EXTERNAL_EXACT: exact, independently released, never a slice of cache backing. The intrusive control is
+// minted before anything is mapped, and the last reference unmaps the whole reservation in one munmap.
+struct file_mapping_request {
+    int                         device    = -1;    // the owning device's cache; the mapping is read by the CPU only
+    int                         fd        = -1;    // the loader's open file: the owner dups it, the caller keeps its own
+    uint64_t                    file_size = 0;     // the size the loader recorded (register_file_identity)
+    file_map_range              reservation;       // the file range the reservation stands for
+    std::vector<file_map_range> segments;          // page aligned, inside the reservation, not overlapping
+    alloc_role                  role      = alloc_role::WEIGHT;
+    const char *                cohort_id = nullptr;
+};
+allocation_result unified_allocate_file_mapping(const file_mapping_request & req) noexcept;
+
+// The owner's dup of the loader's fd, for POSIX_FADV_DONTNEED after staging. False if `base` is not a live
+// FILE_MAPPED reservation.
+bool unified_lookup_file_mapping_fd(const void * base, int * fd) noexcept;
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// How often unified_free_record reached ::free and sycl::free, so a test can tell a file mapping that was
+// unmapped from one that fell through to another branch.
+void unified_cache_test_free_branch_counts(uint64_t * malloc_free, uint64_t * sycl_free) noexcept;
+#endif
 namespace detail {
 // Narrow compatibility bridge for allocation sites still returning alloc_handle.
 // Atomically promotes the exact legacy registry row to intrusive ownership.
@@ -6377,6 +6412,7 @@ struct offload_stats_snapshot {
     uint64_t alloc_count_host                          = 0;
     uint64_t alloc_count_device                        = 0;
     uint64_t alloc_count_shared                        = 0;
+    uint64_t alloc_count_file_mapped                   = 0;
     uint64_t pool_hit_count                            = 0;
     uint64_t pool_miss_count                           = 0;
     uint64_t cross_domain_transfer_count               = 0;
