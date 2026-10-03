@@ -2173,13 +2173,15 @@ static bool planned_layout_materializable(ggml_type type, ggml_layout_mode layou
 }
 
 static bool run_planned_layout_materializable_test() {
-    constexpr int64_t n_experts = 2;
-    int               checked   = 0;
-    int               soa_seen  = 0;
-    int               aos_iq    = 0;
-    const tensor_usage usages[] = { tensor_usage::MOE_EXPERT_WEIGHT, tensor_usage::ATTENTION_WEIGHT,
-                                    tensor_usage::FFN_WEIGHT,        tensor_usage::OUTPUT_WEIGHT,
-                                    tensor_usage::EMBEDDING,         tensor_usage::UNKNOWN };
+    constexpr int64_t  n_experts = 2;
+    int                checked   = 0;
+    int                soa_seen  = 0;
+    int                aos_iq    = 0;
+    const tensor_usage usages[]  = { tensor_usage::UNKNOWN,    tensor_usage::ATTENTION_WEIGHT,
+                                     tensor_usage::FFN_WEIGHT, tensor_usage::MOE_EXPERT_WEIGHT,
+                                     tensor_usage::MOE_GATE,   tensor_usage::MOE_INTERMEDIATE,
+                                     tensor_usage::EMBEDDING,  tensor_usage::OUTPUT_WEIGHT,
+                                     tensor_usage::NORM };
     for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
         const ggml_type type = (ggml_type) t;
         if (!ggml_is_quantized(type) || ggml_blck_size(type) <= 0) {

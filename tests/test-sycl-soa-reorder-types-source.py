@@ -21,8 +21,15 @@ a layout nothing materializes) nor omit one it has (a kernel nothing reaches).
 
 The other readers are the buffer-side eligibility checks (init_tensor, set_tensor,
 should_cpu_reorder, reorder_tensor_to_soa, the dispatch's type_has_reorder_support):
-none may keep a private `type == Q4_0 || ... || type == MXFP4` chain. A statement
-that compares against all five table types is flagged wherever it appears.
+none may keep a private `type == Q4_0 || ... || type == MXFP4` chain. The chain scan
+is narrow on purpose and flags only a statement that compares against all five
+table types with ==/!=, the type literal on the right, in ggml-sycl.cpp,
+unified-cache.cpp or common.hpp; `switch` statements are exempt (the six fill
+switches are held to the table by the exact-set check above).
+
+ggml_sycl_supports_reorder_mmvq (ggml-sycl.cpp) is an intentionally SEPARATE fact
+("MMVQ has an SOA kernel for this type") that currently coincides with the table.
+It is a switch, so the gate cannot see it, and nothing here keeps the two equal.
 
 The compiled counterpart (run_planned_layout_materializable_test in
 tests/test-sycl-layout-choice.cpp) drives get_optimal and the real planner over
