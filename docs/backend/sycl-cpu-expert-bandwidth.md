@@ -445,6 +445,59 @@ the kernel section.)
   medians (8.3 / 5.2 on gate, 8.8 / 6.8 on down; paired `ratio_read` 0.61 / 0.47
   and 0.93 / 0.74).
 
+### Q2_0: ggml-cpu now has an x86 kernel (llama.cpp-tjg8)
+
+The Q2_0 bullet above describes the state before this change. `ggml_vec_dot_q2_0_q8_0`
+now has an AVX2 implementation in `ggml-cpu/arch/x86/quants.c` (AVX-VNNI or
+AVX512-VNNI when compiled in, `vpmaddubsw` otherwise); the scalar version remains
+for other architectures. It keeps the weights packed and does no activation
+preprocessing: the 16 code bytes of a block are expanded to one byte per weight in
+weight order (`vpsrlvd` + mask, byte unpack, one `vpermq` and one `vpshufb` per 32
+weights) and multiplied against the Q8_0 bytes as they are. The `-1` offset is a
+subtracted sum of the activations (codes are u8 in 0..3).
+
+Measured with the commands in this file against a master worktree
+(`b7055ed84`), `--types q2_0 --shapes qwen38 --mats gate,down --variants
+prod,vecdot,q2,read --bursts 8 --burst-calls 3 --pool-mb 256`, `--rounds 3
+--threads 1,16`, one process per binary, **5 pairs alternating order**
+(base/after, after/base, ...), host load 42-64 (pairs 4 and 5 hit a load
+spike and are in the ranges below). `burst_gbps`, 1 thread:
+
+| mat | variant | base (pairs 1-5) | after (pairs 1-5) |
+|---|---|---|---|
+| gate | `vecdot` | 2.6 2.6 2.6 1.6 1.6 | 3.8 4.0 4.0 4.2 2.2 |
+| gate | `prod`   | 2.6 2.6 2.6 1.5 1.5 | 3.8 4.0 4.0 4.1 3.1 |
+| down | `vecdot` | 2.6 1.7 2.6 1.7 1.1 | 3.9 3.8 4.0 2.5 3.5 |
+| down | `prod`   | 2.6 2.4 2.4 1.3 1.0 | 3.9 3.8 4.0 2.8 3.3 |
+
+Absolute GB/s float with the ambient load; the comparable figure is the same-burst
+ratio to the `read` ceiling (median over the 5 pairs, base -> after, and the
+median of the per-pair ratios of those ratios):
+
+| mat | threads | variant | kernel/`read`, base -> after | ratio of ratios (min..max) |
+|---|---|---|---|---|
+| gate | 1  | `prod`   | 0.26 -> 0.47 | 1.81 (1.47..2.00) |
+| gate | 1  | `vecdot` | 0.27 -> 0.48 | 1.70 (1.47..2.09) |
+| down | 1  | `prod`   | 0.30 -> 0.57 | 1.90 (1.55..3.29) |
+| down | 1  | `vecdot` | 0.32 -> 0.58 | 1.72 (1.55..3.05) |
+| gate | 16 | `vecdot` | 0.47 -> 0.67..0.78 | 1.39 (1.14..1.77) |
+| down | 16 | `vecdot` | 0.55 -> 0.74..0.76 | 1.35 (1.25..1.50) |
+
+16-thread `prod` is not reported: its TBB arena threads share the cores with the
+ambient load and the per-pair ratios span 0.44..5.3, so it is not evidence. The
+16-thread claim rests on `vecdot`, which runs in the bench's own thread team. In
+the same bursts the independent `q2` prototype (pre-planed activations) is at
+about 4.8 GB/s per core against this kernel's ~4.0, i.e. the kernel reaches about
+80 % of that prototype with no activation preprocessing. The scalar baseline
+measured 2.6 GB/s per core here against the 3.2-3.5 quoted above (different
+load), so read the gain from the paired ratios, not from the absolutes. The
+raw CSVs are not committed (see Data).
+
+`--oracle-only --oracle-selftest` over qwen38 and gptoss agrees for `prod`,
+`vecdot` and `q2`; `tests/test-q2-0-q8-0-vec-dot.cpp` checks the kernel against a
+double-precision oracle and fails if the registered `vec_dot` is the scalar
+reference.
+
 ### Strata's kernel changes on AVX2 / AVX-VNNI-INT8 (no AVX-512)
 
 As summarised in the task brief, Strata's CPU kernels do one unpack plus one VNNI
