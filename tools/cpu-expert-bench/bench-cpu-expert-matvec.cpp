@@ -48,9 +48,11 @@
 // vec_dot on the same weights; a skipped row (NaN) or a mismatch FAILS the run
 // (exit 3) rather than printing a plausibly high GB/s. Other non-zero exits:
 // 2 bad arguments, 4 an --oracle-selftest corruption the oracle failed to reject
-// (or nothing to exercise), 5 threads > 1 but no arena worker ran (library built
-// without TBB, so `prod` was serial), 6 a sched_setaffinity call failed (the
-// +pin arms did not run as labelled), 77 the CPU lacks an ISA the kernels need.
+// (or nothing to exercise), 5 threads > 1 but no arena worker ran in 5 discovery
+// windows (library built without TBB, so `prod` was serial), 6 a
+// sched_setaffinity call failed other than with ESRCH (the +pin arms did not run
+// as labelled; a thread that exited before the call is counted separately),
+// 77 the CPU lacks an ISA the kernels need.
 // The pool's expert slots hold identical bytes, so a wrong-slot read is not
 // detected, only a missing or wrong row.
 //
@@ -464,6 +466,7 @@ static cpu_set_t g_start_mask;
 static bool      g_have_start_mask = false;
 static long      g_pin_calls       = 0;
 static long      g_pin_failures    = 0;
+static long      g_pin_gone        = 0;  // targets that exited before the call (ESRCH): not a pin failure
 
 static bool cpu_allowed(int c) {
     return !g_have_start_mask || CPU_ISSET(c, &g_start_mask);
@@ -488,6 +491,10 @@ static std::vector<int> cpu_order(pin_mode m, int ncpu, int pcores) {
 static void set_mask(pid_t tid, const cpu_set_t & s, const char * what) {
     g_pin_calls++;
     if (sched_setaffinity(tid, sizeof(s), &s) != 0) {
+        if (errno == ESRCH) {  // a TBB worker that exited after discovery: nothing left to pin
+            g_pin_gone++;
+            return;
+        }
         if (g_pin_failures++ == 0) {
             fprintf(stderr, "warning: sched_setaffinity(tid %d, %s) failed: %s (further failures are only counted)\n",
                     (int) tid, what, strerror(errno));
@@ -983,19 +990,32 @@ static void discover_tbb_workers(runner & R, config & cfg, const variant_inst & 
         run_call(R, cfg, prod);
     }
     R.tbb_tids.clear();
-    int idle_other = 0;
+    int                                               idle_other = 0;
+    std::vector<std::pair<unsigned long long, pid_t>> active;  // (on-CPU ns during the window, tid)
     for (pid_t t : list_tids()) {
         if (t == R.main_tid || std::find(R.team_tids.begin(), R.team_tids.end(), t) != R.team_tids.end()) {
             continue;
         }
-        if (read_oncpu_ns(t) > before[t]) {
-            R.tbb_tids.push_back(t);
+        const unsigned long long ns = read_oncpu_ns(t);
+        if (ns > before[t]) {
+            active.push_back({ ns - before[t], t });
         } else {
             idle_other++;
         }
     }
-    fprintf(stderr, "pin: %s %s %s threads=%d: %d active arena workers found, %d other threads idle (left unpinned)\n",
-            cfg.shp->name, cfg.mat.c_str(), cfg.tname.c_str(), R.threads, (int) R.tbb_tids.size(), idle_other);
+    // The arena has `threads` slots and the calling thread is one of them, so at most threads-1 workers can be
+    // arena workers. More "active" threads are other threads of the process (or workers that were replaced during
+    // the window); keep the busiest threads-1 and leave the rest unpinned.
+    const size_t max_workers = (size_t) std::max(0, R.threads - 1);
+    std::sort(active.begin(), active.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+    const int capped = active.size() > max_workers ? (int) (active.size() - max_workers) : 0;
+    for (size_t i = 0; i < active.size() && i < max_workers; i++) {
+        R.tbb_tids.push_back(active[i].second);
+    }
+    fprintf(stderr,
+            "pin: %s %s %s threads=%d: %d active arena workers found, %d other threads idle (left unpinned)%s\n",
+            cfg.shp->name, cfg.mat.c_str(), cfg.tname.c_str(), R.threads, (int) R.tbb_tids.size(), idle_other + capped,
+            capped ? " [capped at threads-1: extra active threads left unpinned]" : "");
 }
 
 static bool has_prod(const std::vector<variant_inst> & variants) {
@@ -1353,9 +1373,16 @@ int main(int argc, char ** argv) {
                 }
                 // Arena workers are created by the library on first use: find them
                 // by the CPU time they burn, once per config (idempotent).
+                int windows = 0;
                 for (const auto & v : variants) {
                     if (!v.def->kernel && !v.kernel) {
-                        discover_tbb_workers(R, cfg, v, 12);
+                        // A single window can miss every worker on a loaded host (a run found 4 of 21), so retry
+                        // before concluding that there are none.
+                        static const int k_max_windows = 5;
+                        do {
+                            discover_tbb_workers(R, cfg, v, 12);
+                            windows++;
+                        } while (R.threads > 1 && R.tbb_tids.empty() && windows < k_max_windows);
                         break;
                     }
                 }
@@ -1363,9 +1390,10 @@ int main(int argc, char ** argv) {
                     // Without TBB the library runs `prod` serially on the calling thread (GGML_SYCL_HAS_TBB == 0):
                     // every prod number from such a build is a single-core number.
                     fprintf(stderr,
-                            "ERROR: threads=%d but no arena worker burned CPU during prod: the library was likely "
-                            "built without TBB and prod ran serially; config skipped\n",
-                            R.threads);
+                            "ERROR: threads=%d but no arena worker burned CPU during prod in %d discovery windows of "
+                            "12 calls: the library was likely built without TBB and prod ran serially; config "
+                            "skipped\n",
+                            R.threads, windows);
                     rc = 5;
                     continue;
                 }
@@ -1400,7 +1428,8 @@ int main(int argc, char ** argv) {
             }
         }
     }
-    fprintf(stderr, "pin: %ld affinity calls, %ld failed\n", g_pin_calls, g_pin_failures);
+    fprintf(stderr, "pin: %ld affinity calls, %ld failed, %ld thread gone (ESRCH, not counted as failed)\n",
+            g_pin_calls, g_pin_failures, g_pin_gone);
     if (g_pin_failures && rc == 0) {
         rc = 6;  // the +pin arms did not run as labelled
     }

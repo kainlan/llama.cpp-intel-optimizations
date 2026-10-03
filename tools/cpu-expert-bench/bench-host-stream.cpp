@@ -126,7 +126,7 @@ static void run_slice(kernel_id k, size_t lo, size_t hi, double * sink) {
 }
 
 int main(int argc, char ** argv) {
-    size_t           gib     = 1;  // per array
+    long long        gib     = 1;  // per array; signed so that a negative value reaches the guard below
     int              rounds  = 9;
     std::vector<int> threads = { 1, 2, 4, 8, 12, 16, 20, 24 };
     std::vector<int> pin;
@@ -139,7 +139,7 @@ int main(int argc, char ** argv) {
             return i + 1 < argc ? argv[++i] : "";
         };
         if (a == "--gib") {
-            gib = atoi(v().c_str());
+            gib = atoll(v().c_str());
         } else if (a == "--rounds") {
             rounds = atoi(v().c_str());
         } else if (a == "--pin-label") {
@@ -162,7 +162,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "--rounds and --gib must be >= 1\n");
         return 2;
     }
-    g_n = (gib << 30) / sizeof(double);
+    g_n = ((size_t) gib << 30) / sizeof(double);
     g_a = (double *) aligned_alloc(4096, g_n * sizeof(double));
     g_b = (double *) aligned_alloc(4096, g_n * sizeof(double));
     g_c = (double *) aligned_alloc(4096, g_n * sizeof(double));
