@@ -31,7 +31,7 @@
 #   OUT      log directory        [./qwen4exp-mtp-acceptance-out]
 #   SETS [base p05], N_PREDICT, CTX, UBATCH
 #   THREADS  CPU threads, passed as -t/-tb and -td/-tbd [16].  The binary's own default
-#            was 4 threads on this 24-core host: 0.225 t/s, ~20 min per arm.
+#            was 4 threads on this 24-CPU host (nproc 24: 8P + 16E, no SMT): 0.225 t/s, ~20 min per arm.
 #   NOMMAP   1 = load the models into anonymous memory instead of mmapping them [1]: `-lm none`
 #            (this tree has no --no-mmap).  -lzm on is kept either way: --help says it
 #            "requires mmap", but the loader maps a lazy tensor's own file even when use_mmap

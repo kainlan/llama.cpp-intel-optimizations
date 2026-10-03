@@ -14,9 +14,9 @@ qwen4exp MTP graph, block loading, hidden-state tap or draft memory filter. `qwe
 **Upstream.** ggml-org/llama.cpp#29761 "Qwen4Exp: add MTP" (am17an) merged 2026-10-01. It supersedes
 #28243 (Unsloth, closed unmerged) and #27836 (draft). Unsloth's `qwen4exp/mtp` branch is the #28243 lineage.
 Reported by the PR: 1.55x decode speedup, 0.640 acceptance (Qwen3.8-Flash-Next IQ4_XS, `--spec-draft-n-max 3`,
-DGX Spark, greedy, 24 prompts over 7 categories; per category 0.58-0.78). Unsloth reports 66% acceptance at
-n-max 2 and 1.34-1.67x on a B200. Both are measured with everything in VRAM or unified memory, which is
-not our placement.
+DGX Spark, greedy, 24 prompts over 7 categories; per category 0.58-0.78). That is measured with everything in
+VRAM or unified memory, which is not our placement. (Unsloth speedup and acceptance figures from the Phase-1
+web research were not traceable to a source and are dropped.)
 
 **Neither local GGUF has an MTP head.**
 - Unsloth Q8_0 (6 splits): 1224 tensors, `blk.0` to `blk.47` only, no `nextn.*`, no
@@ -46,21 +46,30 @@ names the port registers. The Q4_0 head has the same 34 tensors. Downloaded to
 indexer cache, plus a MoE FFN (512 experts, top 10, like a trunk layer), fed by `eh_proj([enorm(tok_embd);
 hnorm(h)])` per hyper-connection stream, collapsed by its own `hc_head` mixer, then the target's output
 projection. `h` is the trunk's hc-wide residual (n_embd * hc = 10240 floats per token), tapped before the
-final mixer. Verification is exact: the output is identical to plain greedy decoding.
+final mixer. Verification is greedy: a draft token is kept only if it equals the target's own argmax at that
+position. Bit-identical output to a plain greedy run is not established here, though: in our pairs the MTP output
+and the no-MTP output diverge early on all three prompts (see "Output equivalence").
 
 ## The port in this tree
 
 `a15fe6317` carries #29761 over, credited to upstream. This tree predates upstream #29751 (the QSA rewrite
 that #29761 builds on), so `graph_mtp` was adapted to call `build_layer_attn` without the kpool input
 (QSA here is derived from `mctx_hyb->get_idx()` and the layer's compress ratio), and two upstream hunks
-with no target here were dropped. Also fixed in the same series: the one-line `speculative.cpp` bug where
-the draft model was loaded from `params.model.path` instead of the draft path (`4679665af` separately guards
-a pre-existing `-DGGML_SYCL=OFF` compile break in `llama-model-loader.cpp`).
+with no target here were dropped. The one-line `speculative.cpp` change (the draft model is loaded from the
+draft path rather than `params.model.path`) is a no-op cleanup for the in-tree callers that matches upstream,
+not a bug fix. `4679665af` separately guards a pre-existing `-DGGML_SYCL=OFF` compile break in
+`llama-model-loader.cpp`, and `825238c8c` guards three SYCL-only statics there that were unused in a CPU build.
+
+**One deliberate deviation from upstream #29761.** `llama_memory_recurrent::is_empty()` carries
+`assert(total_size() == 0)` ahead of `return ctxs_bufs.empty();`. In a Debug build that assert aborts in the
+constructor for every non-empty recurrent or hybrid model, so it is dropped here (`825238c8c`). It is worth
+reporting upstream.
 
 Verified: a CPU-only build compiles and links `llama-speculative-simple`, and the lead ran it on the IQ3_XXS
-target with both heads (see "Measured results"): output is accepted-token-exact greedy decoding with real
-draft acceptance. **Not verified**: the converter (`conversion/qwen4exp.py`, needs the BF16 checkpoint) and
-anything on SYCL.
+target with both heads (see "Measured results"): speculation is active, with 50-96% of drafted tokens
+accepted depending on prompt and n-max. **Not verified**: that the output equals plain greedy decoding (it
+diverged from the baseline on all three prompts; see "Output equivalence"), the converter
+(`conversion/qwen4exp.py`, needs the BF16 checkpoint) and anything on SYCL.
 
 ## Expected speedup at our expert-read cost (Phase-1 estimate; superseded for CPU decode by the measurements below)
 
@@ -73,8 +82,9 @@ launch) and `E` is the host expert-read time. A round with `k` drafts verifies `
 
 `m(n)` is the number of distinct experts the verify batch reads, relative to one token: 2.9 at n = 3 and 3.9
 at n = 4 if routing were independent (512 experts, top 10); about 2.4 and 3.0 if routing is skewed.
-Reported acceptance numbers are consistent with `a` of 0.75-0.8 (PR: 0.64 accepted/generated at n-max 3,
-mean length 2.76).
+Reported acceptance numbers are consistent with `a` of 0.75-0.8 (PR: 0.64 accepted/generated at n-max 3, which
+implies a mean length of about 1 + 3 x 0.64 = 2.9 tokens per round if every round drafts 3; the PR does not
+state a mean length).
 
 **The point: MTP amortizes `A`, never `E`.** Every drafted token that is accepted still has its own experts
 read, and the verify batch reads their union, which grows nearly linearly with `n` for top-10 of 512. A
@@ -127,12 +137,18 @@ decode baseline on the SYCL build, and the GPU-busy versus CPU-expert-pool-busy 
 
 ## Measured results (CPU-only, IQ3_XXS target, 2026-10-03)
 
-Setup. Binary: CPU-only `build-cpu` at `b8fedecc7`. Target: ISTA-DASLab GSQ-RCO IQ3_XXS. Settings of every
+Setup. Binary: CPU-only `build-cpu`, built from the C++ of `4679665af` (no C++ file changed between it and
+`b8fedecc7`, which only touched scripts and docs; the later `825238c8c` changes nothing in a Release CPU
+build). Target: ISTA-DASLab GSQ-RCO IQ3_XXS. Settings of every
 arm: `-t/-tb/-td/-tbd 16`, `-lm none -lzm on` (RSS 47 GB), `-c 4096 -ub 512 -ngl 0`, 256 new tokens, greedy,
-seed 42, prompts = the three pre-rendered files in `scripts/qwen4exp-mtp-prompts/`. Host load average was
-~36-57 during the arm sets and ~28-38 during the pairs (a codescout re-index plus ambient load). Logs: scratchpad `mtp-arms/out/*.log` (24 arms),
-`mtp-arms/run-base.out` and `run-p05.out` (the parser tables below), `mtp-arms/pairs/*.log` with
-`run-pairs.sh`/`run-pairs.out` (baseline pairs). Acceptance is deterministic (the same config run twice gave
+seed 42, prompts = the three pre-rendered files in `scripts/qwen4exp-mtp-prompts/` (code: a Python function with
+doctests; chat: a three-day Lisbon itinerary; reasoning: a two-trains word problem, "reasoning-flavoured" only:
+its prompt opens an empty `<think>` and the model closes it at once in both runs, so it is not a thinking trace). Host load average was
+~36-57 during the arm sets and ~28-38 during the pairs (a codescout re-index plus ambient load). Data, all committed in `docs/backend/qwen4exp-mtp-data/`:
+`acceptance-base.txt` and `acceptance-p05.txt` (the parser tables below), `pairs.txt` (parser `--pairs`),
+`run-base.out`, `run-p05.out` and `run-pairs.out` (the run logs), and `raw-logs.tar.xz` (the 24 arm logs under
+`out/` and the 6 pair logs under `pairs/`). The pairs were run with a one-off script whose flags match
+`qwen4exp-mtp-acceptance.sh --pairs` (checked against its dry-run); `--pairs` is the reproducible form. Acceptance is deterministic (the same config run twice gave
 identical `n_drafted`/`n_accept`); decode t/s is not (see Caveats).
 
 **Terms.** `accept%` = `n_accept / n_drafted`. `mean_len` = tokens produced per verify round, i.e. 1 + accepted
@@ -211,14 +227,14 @@ host state (order AB for code, BA for chat, AB for reasoning), same flags, targe
 | prompt | baseline t/s (ms/token) | MTP t/s | speedup (this pair) | MTP t/s, same config in the arm run | speedup using that |
 |---|---|---:|---:|---:|---:|
 | code | 1.28 (782.8) | 2.24 | 1.75x | 2.01 | 1.57x |
-| chat | 1.39 (717.4) | 2.13 | 1.53x | 1.51 | 1.09x |
+| chat | 1.39 (717.4) | 2.13 | 1.53x | 1.51 | 1.08x |
 | reasoning | 1.39 (719.1) | 2.06 | 1.48x | 2.06 | 1.48x |
 
 The pair figures, 1.48-1.75x, are what the interleaved protocol produced. The last two columns are the same MTP
 configuration (q4_n2, base) as measured in the arm set under a different load phase: identical acceptance (170,
-147, 165 accepted), but a decode rate that differs by 11% for code, **41% for chat**, and 0% for reasoning. So one
-run's t/s carries roughly that much load noise, and the chat speedup in particular could be anywhere from 1.1x to
-1.5x on this evidence; the lower number is the one to quote if only one is quoted. All of these are well above the
+147, 165 accepted), but the pair-run rate is 12% above the arm-run rate for code, **41% above for chat**, and equal for reasoning. So one
+run's t/s carries roughly that much load noise, and the chat speedup in particular could be anywhere from 1.08x to
+1.53x on this evidence; the lower number is the one to quote if only one is quoted. All of these are well above the
 Phase-1 estimate for IQ3_XXS (0.72-1.24x).
 
 *Hypothesis for the gap (not tested):* the estimate assumed the verify batch reads `m(n)` x the experts of one
@@ -228,6 +244,36 @@ sync), not by DRAM bandwidth. A 2-3 token batch can reuse dequantized expert row
 same expert and pays the per-layer overhead once, so it costs much less than 2-3 single-token steps. If so, the
 estimate's `E` term was pessimistic for this path and it says nothing about a GPU or hybrid path, where the
 cost structure differs.
+
+**Output equivalence: not established, and the speedups above are for numerically divergent output.** Speculative
+decoding with greedy verification is meant to reproduce a plain greedy run. Here it does not, on any of the three
+prompts: in each pair the MTP text and the no-MTP text agree for the first 130-200 characters and then differ
+(`pairs/base_<prompt>_1.log` against `pairs/mtp_<prompt>_1.log`). The first divergent token, with what the baseline
+(X) and the MTP run (Y) each emitted:
+
+| prompt | text both runs agree on, up to | X (baseline) | Y (MTP) |
+|---|---|---|---|
+| code | "...closed intervals,\n    merge" | ` any` | ` all` |
+| chat | "...the light is soft and golden." | ` This` | `\n\n` |
+| reasoning | "...analyze the situation before the second train departs" | `\n` | `\n\n` |
+
+All three are near-tie style choices (word, sentence-versus-paragraph break), which fits floating-point
+differences between a batch-1 and a batch-3 forward pass on a near-tied logit pair: the MTP verify pass computes
+the target's logits for the draft positions as one small batch, while the baseline computes them one token at a
+time, and the CPU kernels do not promise bit-identical results across batch widths. It is equally consistent with
+a verify/rollback defect in the port (target GDN-state rollback, `seq_rm`, QSA indexer positions after a rejected
+draft), and the logs cannot tell the two apart. Consequently:
+- this document does not claim that MTP output equals plain greedy decoding;
+- the speedups above compare two different texts of the same length, not the same tokens produced faster;
+- acceptance rates describe agreement between the MTP head and the target's batched argmax.
+
+*Discriminator (CPU-only, existing `llama-completion`, `-n 1`; no new tool).* For each prompt, feed the prompt plus
+the agreed text above as a new prompt and let the baseline emit one token, at `-ub 512` (the prefix is one batched
+pass, like a verify batch) and at `-ub 1` (batch-1, the decode shape). The `-ub 1` run is the positive control and
+must print X. If `-ub 512` prints Y, batch-width numerics on a near tie explain the divergence for that prompt. If
+it prints X, batch width alone does not explain it and the verify/rollback path stays suspect. Optionally add
+`--logit-bias <id of Y>+<delta>` at `-ub 1` and take the smallest delta that flips X to Y as the logit margin.
+Result: *pending, run by the lead; this section is updated with it.*
 
 **Compared with upstream's report** (PR #29761: 0.640 acceptance, 1.55x, IQ4_XS, n-max 3, all-VRAM DGX Spark, 24
 prompts over 7 categories): our pooled n3 acceptance without p-min is 70.8-72.6% over 3 prompts only, higher than
@@ -251,14 +297,17 @@ n-max 3 on VRAM-resident weights: similar magnitude, different configuration, no
 
 Acceptance is no longer the open question: at n-max 2 it is 62-96% depending on the prompt (80-82% pooled,
 ~86% with p-min 0.5) and the Q4_0 head is as good as the Q8_0 head. The CPU decode speedup measured here is
-1.48-1.75x (single interleaved pairs, load-affected; chat as low as 1.1x on a repeat), well above the Phase-1
+1.48-1.75x (single interleaved pairs, load-affected; chat as low as 1.08x on a repeat; and for output that diverges from the baseline, see "Output equivalence"), well above the Phase-1
 estimate for this target.
 
 Still holding the SYCL wiring, because the measurement does not cover the placement we run. What is left to
 establish, and where the hold is decided: (1) the GPU-busy versus CPU-expert-pool-busy split per token (`A` and
 `E`) on the SYCL build; (2) whether the host-resident-expert verify batch (k+1 tokens through the CpuExpertPool
-path) is cheaper than k+1 single-token steps, which is the hypothesis above and is what the CPU result implies
-for the hybrid path; (3) the SYCL risks listed above (second model and context on one device, draft-context
-compute buffer). If the CPU-pool batching holds, the working recommendation for a first SYCL attempt is the
-Q4_0 head, n-max 2, `--spec-draft-p-min 0.5` for chat-like workloads. Keep the `S > ~1.2x` bar for deciding
-whether to wire it.
+path) is cheaper than k+1 single-token steps: the CPU result is evidence for that only if the hypothesis above
+(batched expert matmuls reuse dequantized rows) is right and the hybrid path's host experts run through the
+same batched CPU kernels, and neither is tested; (3) the SYCL risks listed above (second model and context on
+one device, draft-context compute buffer); (4) whether the output divergence from the baseline is numerics or a
+port defect ("Output equivalence"). If (2) and (4) come out well, the working recommendation for a first SYCL
+attempt is the Q4_0 head and n-max 2. `--spec-draft-p-min 0.5` is worth trying for chat-like workloads, but that
+rests on acceptance alone: its effect on decode t/s was not measured (the p05 timings are unreliable). Keep the
+`S > ~1.2x` bar for deciding whether to wire it.
