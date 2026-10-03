@@ -10818,6 +10818,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // llama.cpp-s36q: the iq* types the SYCL backend serves through its MUL_MAT_ID _id kernels sit in
+    // other_types, which only gets n = {1, 32}. Give them the sweep base_types gets (n = 129 is the first
+    // n > 128 odd batch, llama.cpp-mn70) plus the row-boundary shapes q6_K failed on (llama.cpp-zoly:
+    // n > 1 with m not a multiple of the work-group row count, and a short m). Types move into this list
+    // as their _id kernels land.
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL}) {
+        for (int n_mats : {4, 8}) {
+            for (int n_used : {1, 2, 4}) {
+                for (bool b : {false, true}) {
+                    for (int n : {1, 4, 5, 17, 32, 129}) {
+                        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, 512, n, 256));
+                    }
+                }
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 768));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 512, 32, 256));
+    }
+
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4}) {
