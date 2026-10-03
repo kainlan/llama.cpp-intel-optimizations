@@ -249,6 +249,12 @@ void refusals_leave_nothing_behind() {
     alloc_handle legacy;
     check(!unified_alloc(aligned, &legacy), "an 8192-byte alignment was accepted by unified_alloc");
     check(!legacy.ptr, "a refused alignment left a pointer");
+    check(coordinator->live_controls() == 0, "a refusal left a live control");
+    check(allocation_registry_test_size() == rows_before, "a refusal left a registry record");
+    check(unified_cache_host_cpu_munmap_count_for_test() == munmaps_before, "a refusal mapped something");
+    check(offload_stats_get().alloc_count_host_cpu == stats_before, "a refusal was counted as an allocation");
+
+    // one page (or none) is still served, and page aligned; after the checks above, since these do map
     for (size_t alignment : { (size_t) 0, (size_t) 4096 }) {
         aligned.alignment          = alignment;
         allocation_result accepted = unified_allocate_owner(aligned);
@@ -256,11 +262,6 @@ void refusals_leave_nothing_behind() {
         check(static_cast<bool>(accepted), "an alignment within a page was refused");
         check(((uintptr_t) accepted.owner.metadata().ptr & 4095u) == 0, "the mapping is not page aligned");
     }
-
-    check(coordinator->live_controls() == 0, "a refusal left a live control");
-    check(allocation_registry_test_size() == rows_before, "a refusal left a registry record");
-    check(unified_cache_host_cpu_munmap_count_for_test() == munmaps_before, "a refusal mapped something");
-    check(offload_stats_get().alloc_count_host_cpu == stats_before, "a refusal was counted as an allocation");
     std::cout << "PASS refusals-leave-nothing-behind\n";
 }
 
