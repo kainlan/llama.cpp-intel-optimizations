@@ -1238,19 +1238,28 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
 }
 
 bool llama_lazy_eligible(enum llama_lazy_mode mode, size_t nbytes, bool mmap_supported) {
-    GGML_UNUSED(nbytes);
-    GGML_UNUSED(mmap_supported);
-    return mode != LLAMA_LAZY_MODE_OFF;
-}
-
-bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
-    if (mode == LLAMA_LAZY_MODE_OFF) {
+    if (!mmap_supported) {
         return false;
     }
 
-    // do not lazy-read small tensors, it has significant overhead and is not worth it
-    constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+    switch (mode) {
+        case LLAMA_LAZY_MODE_OFF:
+            return false;
+        case LLAMA_LAZY_MODE_AUTO:
+            // do not lazy-read small tensors, it has significant overhead and is not worth it
+            return nbytes > 4ull * 1024 * 1024 * 1024;
+        case LLAMA_LAZY_MODE_ON:
+            return true;
+    }
+
+    return false;
+}
+
+bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
+    // the mode and the size floor are llama_lazy_eligible()'s; mmap support is asked
+    // separately below, so that its warning prints only for a tensor that would
+    // otherwise have been lazy
+    if (!llama_lazy_eligible(mode, ggml_nbytes(t), true)) {
         return false;
     }
 
