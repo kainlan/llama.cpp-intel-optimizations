@@ -3383,6 +3383,16 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-5efe C1: llama_model_lazy_tensor_names() declares, per arch, exactly the
+# tensors src/models/*.cpp creates with TENSOR_READ_LAZY. Pure source contract.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-llama-lazy-declaration-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-llama-lazy-declaration-source.py
+        LABEL "sycl;host;lazy;python;source-contract"
+        TIMEOUT 120)
+endif()
+
 # llama_mmap keeps MADV_HUGEPAGE off the lazily read ranges (llama.cpp-n77l),
 # checked through the VmFlags in /proc/self/smaps. Linux-only; exits 77 when
 # THP is unavailable, and fails when no VmFlags line can be read.
