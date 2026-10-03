@@ -1,7 +1,8 @@
 """Source contract for llama.cpp-5efe C2: the raw mapping primitives have an allowlist.
 
 `mmap`, `munmap`, `mlock` and `madvise` (and `mlock2`, `munlock`, `mremap`, `posix_madvise` and
-`posix_fadvise`) are the calls that make, lock, advise and release address space or file pages the unified cache must own. The FILE_MAPPED tier (docs/design/sycl-mmap-host-tier.md §4.1) keeps them in one device-free translation
+`posix_fadvise`) are the calls that make, lock, advise and release address space or file pages the unified cache
+must own. The FILE_MAPPED tier (docs/design/sycl-mmap-host-tier.md §4.1) keeps them in one device-free translation
 unit, ggml/src/ggml-sycl/file-mapping.cpp, behind four wrappers (`unified_cache_raw_map_file`,
 `unified_cache_raw_lock_file_segments`, `unified_cache_raw_advise_file_segments`,
 `unified_cache_raw_unmap_file`). An allowlist entry in the canonical contract does not enforce itself, so this gate
