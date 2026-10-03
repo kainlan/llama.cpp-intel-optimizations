@@ -23,10 +23,14 @@
 #include <random>
 #include <vector>
 
+// The path check needs a weak symbol, which MSVC does not have.
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(_MSC_VER)
+#    define Q2_0_PATH_CHECK 1
 // Weak so that a build where the scalar version is renamed away (the x86 state
 // before the SIMD kernel exists) reports a runtime FAIL instead of a link error.
 extern "C" __attribute__((weak)) void ggml_vec_dot_q2_0_q8_0_generic(
         int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc);
+#endif
 
 static int g_failed = 0;
 
@@ -82,7 +86,9 @@ static void fill(fill_mode mode, std::mt19937 & rng, int nb, block_q2_0 * x, blo
         }
     }
     for (int i = 0; i < 2 * nb; i++) {
-        y[i].d = ggml_fp32_to_fp16(d1);
+        // the two Q8_0 halves of a Q2_0 block get different scales, so a kernel that
+        // swaps or shares them gives a wrong sum (0.5 and not 3: 3 * 65504 is not fp16)
+        y[i].d = ggml_fp32_to_fp16((i & 1) ? 0.5f * d1 : d1);
         for (int j = 0; j < 32; j++) {
             switch (mode) {
                 case FILL_MAX_POS:  y[i].qs[j] = 127; break;
@@ -126,7 +132,7 @@ int main() {
     ggml_cpu_init();
     std::mt19937 rng(42);
 
-#if defined(__x86_64__) || defined(_M_X64)
+#ifdef Q2_0_PATH_CHECK
     if (ggml_cpu_has_avx2()) {
         const ggml_type_traits_cpu * tr = ggml_get_type_traits_cpu(GGML_TYPE_Q2_0);
         CHECK(&ggml_vec_dot_q2_0_q8_0_generic != nullptr &&

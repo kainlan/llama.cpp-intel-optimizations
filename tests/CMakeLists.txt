@@ -3304,6 +3304,7 @@ if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # check that on x86 AVX2 the registered kernel is not the scalar reference.
     # Same include-path remedy as above (the source includes ggml-cpu/quants.h).
     llama_build_and_test(test-q2-0-q8-0-vec-dot.cpp)
+    set_tests_properties(test-q2-0-q8-0-vec-dot PROPERTIES LABELS "main;quant")
     target_include_directories(test-q2-0-q8-0-vec-dot PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 endif()
 
