@@ -5753,6 +5753,8 @@ static const char * ggml_sycl_expert_tier_name(expert_resolve_tier tier) {
             return "host_mmap";
         case expert_resolve_tier::UNAVAILABLE:
             return "unavailable";
+        case expert_resolve_tier::STORAGE:
+            return "storage";
     }
     return "unknown";
 }
@@ -82359,6 +82361,8 @@ static const char * ggml_sycl_alloc_tier_name(ggml_sycl::alloc_tier tier) {
             return "unregistered";
         case ggml_sycl::alloc_tier::FILE_MAPPED:
             return "file-mapped";
+        case ggml_sycl::alloc_tier::HOST_CPU:
+            return "host-cpu";
     }
     return "invalid";
 }
@@ -88983,6 +88987,8 @@ static block_exec_leaf_materialize_probe_result ggml_sycl_probe_block_exec_leaf_
                 return "host_owned_elsewhere";
             case ggml_sycl::alloc_type::FILE_MAPPED:
                 return "file_mapped";
+            case ggml_sycl::alloc_type::HOST_CPU:
+                return "host_cpu";
             case ggml_sycl::alloc_type::UNKNOWN:
             default:
                 return "unknown";

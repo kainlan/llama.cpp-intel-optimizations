@@ -28,6 +28,7 @@ enum class alloc_type : uint8_t {
     HOST_MALLOC,           // registered host memory that unified_free_record releases with ::free
     HOST_OWNED_ELSEWHERE,  // registered only so the registry can identify it; never freed through the registry
     FILE_MAPPED,           // one PROT_NONE reservation with file segments mapped over it — CPU-only, no USM
+    HOST_CPU,              // one anonymous, hugepage-advised, mlocked mapping — CPU-only, no USM (llama.cpp-th32 T1)
     UNKNOWN,               // Not registered — pointer type is unknown
 };
 
@@ -226,7 +227,8 @@ class alloc_registry {
 //       case alloc_type::SHARED:      return sycl::usm::alloc::shared;
 //       case alloc_type::HOST_MALLOC:
 //       case alloc_type::HOST_OWNED_ELSEWHERE:
-//       case alloc_type::FILE_MAPPED: return sycl::usm::alloc::unknown;  // not USM
+//       case alloc_type::FILE_MAPPED:
+//       case alloc_type::HOST_CPU:    return sycl::usm::alloc::unknown;  // not USM
 //       case alloc_type::UNKNOWN:     return sycl::usm::alloc::unknown;
 //   }
 

@@ -2886,6 +2886,7 @@ inline sycl::usm::alloc ggml_sycl_get_alloc_type(const void * ptr) {
         case ggml_sycl::alloc_type::HOST_MALLOC:
         case ggml_sycl::alloc_type::HOST_OWNED_ELSEWHERE:
         case ggml_sycl::alloc_type::FILE_MAPPED:
+        case ggml_sycl::alloc_type::HOST_CPU:
             return sycl::usm::alloc::unknown;  // Not USM — needs staging for GPU access
         case ggml_sycl::alloc_type::UNKNOWN:
             return sycl::usm::alloc::unknown;

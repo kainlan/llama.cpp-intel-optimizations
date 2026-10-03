@@ -1720,6 +1720,9 @@ static std::atomic<uint64_t> g_offload_alloc_count_device{ 0 };
 // and cannot reach offload_stats_note_alloc. Kept so the stats line keeps its shape (test-sycl-offload-regression.sh).
 static std::atomic<uint64_t> g_offload_alloc_count_shared{ 0 };
 static std::atomic<uint64_t> g_offload_alloc_count_file_mapped{ 0 };
+// HOST_CPU allocations (llama.cpp-th32 T1). Read through offload_stats_get() only: the [SYCL-OFFLOAD-STATS] line keeps
+// its shape for test-sycl-offload-regression.sh.
+static std::atomic<uint64_t> g_offload_alloc_count_host_cpu{ 0 };
 static std::atomic<uint64_t> g_offload_pool_hit_count{ 0 };
 static std::atomic<uint64_t> g_offload_pool_miss_count{ 0 };
 static std::atomic<uint64_t> g_offload_cross_domain_transfer_count{ 0 };
@@ -3212,6 +3215,8 @@ static const char * alloc_tier_name(alloc_tier tier) {
             return "unregistered";
         case alloc_tier::FILE_MAPPED:
             return "file_mapped";
+        case alloc_tier::HOST_CPU:
+            return "host_cpu";
         default:
             return "unknown";
     }
@@ -3301,6 +3306,7 @@ void offload_stats_reset() {
     g_offload_alloc_count_device.store(0, std::memory_order_relaxed);
     g_offload_alloc_count_shared.store(0, std::memory_order_relaxed);
     g_offload_alloc_count_file_mapped.store(0, std::memory_order_relaxed);
+    g_offload_alloc_count_host_cpu.store(0, std::memory_order_relaxed);
     g_offload_pool_hit_count.store(0, std::memory_order_relaxed);
     g_offload_pool_miss_count.store(0, std::memory_order_relaxed);
     g_offload_cross_domain_transfer_count.store(0, std::memory_order_relaxed);
@@ -3418,6 +3424,9 @@ void offload_stats_note_alloc(alloc_tier tier) {
             break;
         case alloc_tier::FILE_MAPPED:
             g_offload_alloc_count_file_mapped.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case alloc_tier::HOST_CPU:
+            g_offload_alloc_count_host_cpu.fetch_add(1, std::memory_order_relaxed);
             break;
         default:
             break;
@@ -3571,6 +3580,7 @@ offload_stats_snapshot offload_stats_get() {
     s.alloc_count_device              = g_offload_alloc_count_device.load(std::memory_order_relaxed);
     s.alloc_count_shared              = g_offload_alloc_count_shared.load(std::memory_order_relaxed);
     s.alloc_count_file_mapped         = g_offload_alloc_count_file_mapped.load(std::memory_order_relaxed);
+    s.alloc_count_host_cpu            = g_offload_alloc_count_host_cpu.load(std::memory_order_relaxed);
     s.pool_hit_count                  = g_offload_pool_hit_count.load(std::memory_order_relaxed);
     s.pool_miss_count                 = g_offload_pool_miss_count.load(std::memory_order_relaxed);
     s.cross_domain_transfer_count     = g_offload_cross_domain_transfer_count.load(std::memory_order_relaxed);
@@ -7973,6 +7983,8 @@ static expert_resolve_tier expert_tier_from_location(cache_location location) {
             return expert_resolve_tier::HOST_PINNED;
         case cache_location::HOST_MMAP:
             return expert_resolve_tier::HOST_MMAP;
+        case cache_location::STORAGE:
+            return expert_resolve_tier::STORAGE;
         case cache_location::UNKNOWN:
         default:
             return expert_resolve_tier::UNAVAILABLE;
@@ -22906,6 +22918,9 @@ bool query_registered_location(const void * ptr, memory_location * out) {
             break;
         case alloc_type::FILE_MAPPED:
             out->tier = alloc_tier::FILE_MAPPED;
+            break;
+        case alloc_type::HOST_CPU:
+            out->tier = alloc_tier::HOST_CPU;
             break;
         case alloc_type::HOST_MALLOC:
         case alloc_type::HOST_OWNED_ELSEWHERE:

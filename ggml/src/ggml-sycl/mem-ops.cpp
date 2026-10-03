@@ -154,6 +154,8 @@ static const char * alloc_type_name(alloc_type type) {
             return "host_owned_elsewhere";
         case alloc_type::FILE_MAPPED:
             return "file_mapped";
+        case alloc_type::HOST_CPU:
+            return "host_cpu";
         case alloc_type::UNKNOWN:     return "unknown";
     }
     return "unknown";

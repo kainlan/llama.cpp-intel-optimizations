@@ -324,6 +324,8 @@ static const char * ggml_sycl_set_rows_alloc_type_name(const void * ptr) {
             return "host_owned_elsewhere";
         case ggml_sycl::alloc_type::FILE_MAPPED:
             return "file_mapped";
+        case ggml_sycl::alloc_type::HOST_CPU:
+            return "host_cpu";
         default:
             return "other";
     }

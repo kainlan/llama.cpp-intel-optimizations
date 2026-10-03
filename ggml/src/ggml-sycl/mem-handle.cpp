@@ -1056,8 +1056,8 @@ resolved_ptr mem_handle::resolve() const {
 // === resolve(device_id) — dispatch-device overload ===
 // Resolves the pointer first, then rejects device-resident pointers whose
 // allocator owner is not the caller's device. Host-pinned pointers are
-// device-agnostic from the dispatcher's perspective; a file mapping is not: it is
-// read by the CPU, in place, and never handed to a device. device_ remains the
+// device-agnostic from the dispatcher's perspective; a file mapping and a HOST_CPU
+// allocation are not: they are read by the CPU, in place, and never handed to a device. device_ remains the
 // cache owner used for re-resolution and cleanup.
 
 resolved_ptr mem_handle::resolve(int device_id) const {
@@ -1066,11 +1066,15 @@ resolved_ptr mem_handle::resolve(int device_id) const {
         return r;
     }
     if (!r.on_device) {
-        // Only a host pointer can be a file mapping (from_owned_alloc marks nothing but DEVICE_VRAM on_device), so the
-        // dispatched device weights, the hot case, take no second lock round. A slice shares its owner.
+        // Only a host pointer can be a file mapping or a locked CPU-only mapping (from_owned_alloc marks nothing but
+        // DEVICE_VRAM on_device), so the dispatched device weights, the hot case, take no second lock round. A slice
+        // shares its owner.
         mem_handle_lock_guard g(lock_);
-        if (owned_alloc_ && owned_alloc_.metadata().tier == alloc_tier::FILE_MAPPED) {
-            return {};
+        if (owned_alloc_) {
+            const alloc_tier tier = owned_alloc_.metadata().tier;
+            if (tier == alloc_tier::FILE_MAPPED || tier == alloc_tier::HOST_CPU) {
+                return {};
+            }
         }
         return r;
     }

@@ -2313,6 +2313,9 @@ enum class cache_location {
     HOST_PINNED,
     HOST_MMAP,
     UNKNOWN,  // Sentinel: entry exists but location is unresolved (cache miss)
+    // A lazy table's rows that stay in the file (llama.cpp-th32 T1). Reported only: there is no pointer to resolve,
+    // nothing allocates against it, and expert_resolution_allowed refuses it like a miss.
+    STORAGE,
 };
 
 // XMX layout metadata carried with cache entries/results
@@ -2497,6 +2500,7 @@ enum class expert_resolve_tier : uint8_t {
     HOST_PINNED = 1,
     HOST_MMAP   = 2,
     UNAVAILABLE = 3,
+    STORAGE     = 4,  // reported only (llama.cpp-th32 T1): the rows are in the file and no pointer exists
 };
 
 enum class expert_resolve_reason : uint8_t {
@@ -5788,6 +5792,10 @@ enum class alloc_tier : uint8_t {
     // only (llama.cpp-5efe C2). Not charged to the host ledger unless locked. Every census and test keys on names,
     // never on this value.
     FILE_MAPPED  = 3,
+    // Host memory only the CPU reads: one anonymous mapping, MADV_HUGEPAGE, mlocked in full, never mapped into a
+    // device (llama.cpp-th32 T1). Requested only through alloc_constraints::must_host_cpu; nothing falls into it and
+    // nothing falls out of it. host_accessible() is true for it and device_mappable() is false.
+    HOST_CPU     = 4,
 };
 
 enum class alloc_role : uint8_t {
@@ -5800,6 +5808,20 @@ enum class alloc_role : uint8_t {
     EXPERT_STAGING = 6,
     CONTROL        = 7,
     OTHER          = 8,
+    // The lazy-table roles (llama.cpp-th32 T1), appended so no existing value moves.
+    // unified_cache_role_bytes_for_testing reads the live bytes of each.
+    LAZY_ROW_CACHE = 9,   // a lazy table's row-cache slab and index
+    LAZY_STAGING   = 10,  // landing slabs, epoch-ring captures and the block ring
+    LAZY_OUTPUT    = 11,  // the gathered rows a lazy GET_ROWS writes
+};
+
+// Where the planner puts a lazy table's rows (llama.cpp-th32 T1). Not an allocation tier: no byte is allocated "in"
+// STORAGE, so an allocatable enum value would be a latent path to request it. A lazy_table carries this beside its
+// body; cache_location::STORAGE and expert_resolve_tier::STORAGE report the same state and nothing allocates against
+// them.
+enum class lazy_residency : uint8_t {
+    HOST,     // the rows are loaded, locked, into a HOST_CPU body
+    STORAGE,  // the rows stay in the file and are read per ubatch
 };
 
 // Location-transparent descriptor for any managed allocation.
@@ -5821,9 +5843,9 @@ struct memory_location {
 
     bool host_accessible() const { return tier != alloc_tier::DEVICE_VRAM; }
 
-    // May a device be handed this pointer? host_accessible() stays true for a file mapping because the CPU reads it;
-    // a device read of mapped pages is at best a slow driver-staged copy and at worst a device loss. Every path
-    // that hands a host-accessible pointer to a device checks this instead.
+    // May a device be handed this pointer? host_accessible() stays true for a file mapping and for a HOST_CPU
+    // allocation because the CPU reads them; a device read of either is at best a slow driver-staged copy and at
+    // worst a device loss. Every path that hands a host-accessible pointer to a device checks this instead.
     bool device_mappable() const { return tier == alloc_tier::DEVICE_VRAM || tier == alloc_tier::HOST_PINNED; }
 };
 
@@ -5860,6 +5882,9 @@ enum class offload_buffer_role : uint8_t {
 struct alloc_constraints {
     bool         must_device                = false;
     bool         must_host_pinned           = false;
+    // HOST_CPU (llama.cpp-th32 T1): host memory only the CPU reads, locked. Selects the tier and nothing else: the
+    // owner entry refuses it beside must_device or must_host_pinned, and no tier falls into or out of it.
+    bool         must_host_cpu               = false;
     bool         prefer_same_tier_as_cohort = false;
     bool         use_pinned_pool            = false;
     // Refuse dynamic host-zone growth for planner-bounded staging pools. A
@@ -6414,6 +6439,7 @@ struct offload_stats_snapshot {
     uint64_t alloc_count_device                        = 0;
     uint64_t alloc_count_shared                        = 0;
     uint64_t alloc_count_file_mapped                   = 0;
+    uint64_t alloc_count_host_cpu                      = 0;
     uint64_t pool_hit_count                            = 0;
     uint64_t pool_miss_count                           = 0;
     uint64_t cross_domain_transfer_count               = 0;
