@@ -29,6 +29,12 @@
 #   SETS [base p05], N_PREDICT, CTX, UBATCH
 #   THREADS  CPU threads, passed as -t/-tb and -td/-tbd [16].  The binary's own default
 #            was 4 threads on this 24-core host: 0.225 t/s, ~20 min per arm.
+#   NOMMAP   1 = load the models into anonymous memory (-lm none; this tree has no --no-mmap)
+#            instead of mmapping them [1].  On /models (bcachefs) the page cache does not
+#            keep an mmapped IQ3 file: one mmap run read 2.78 TB from disk in 28 min at
+#            15 GB RSS, so decode was disk-bound.  -lzm on stays: it keeps the 27 GiB
+#            per_layer_token_embd (PLE table, a few rows read per token) out of RAM, and
+#            lazy tensors map their own file even under -lm none, so the two do not conflict.
 #   WARM     1 = once, before the first arm, dd every shard of the target and the
 #            heads to /dev/null (userspace reads) and print fincore, so the page
 #            cache is warm and the log proves it [0]
@@ -45,6 +51,7 @@ CTX=${CTX:-4096}
 UBATCH=${UBATCH:-512}
 THREADS=${THREADS:-16}
 WARM=${WARM:-0}
+NOMMAP=${NOMMAP:-1}
 PROMPTS_DIR=$ROOT/scripts/qwen4exp-mtp-prompts
 PARSER=$ROOT/scripts/parse-qwen4exp-mtp-acceptance.py
 
@@ -75,6 +82,7 @@ arm_cmd() { # prints the command for one arm, one argument per line
         --spec-type draft-mtp --spec-draft-n-max "$k" \
         -f "$PROMPTS_DIR/$prompt.txt" -n "$N_PREDICT" --seed 42 --temp 0 \
         -c "$CTX" -ub "$UBATCH" -ngl 0 -lzm on -lv 4
+    [ "$NOMMAP" = 1 ] && printf '%s\n' -lm none
     printf '%s\n' -t "$THREADS" -tb "$THREADS" -td "$THREADS" -tbd "$THREADS"
     [ -n "$pmin" ] && printf '%s\n' --spec-draft-p-min "$pmin"
     return 0
