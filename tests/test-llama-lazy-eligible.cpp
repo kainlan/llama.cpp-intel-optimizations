@@ -5,12 +5,15 @@
 //   - nothing is eligible when mmap is unsupported;
 //   - OFF is never eligible;
 //   - AUTO is eligible only above 4 GiB (a tensor of exactly 4 GiB is not);
-//   - ON is always eligible.
+//   - ON is always eligible;
+//   - a mode outside the enum is never eligible (fail closed).
 //
-// The pre-fill of the per-file lazy-range record (llama.cpp-5efe C1) calls it
-// once per entry; nothing else evaluates it. A predicate returning `mode != OFF`
-// is the mutant this test exists to kill: it passes the ON rows and the OFF
-// rows, and fails AUTO at 4 GiB and every flag-false row that is not OFF.
+// The pre-fill of the per-file lazy-range record (llama.cpp-5efe C1) is the only
+// caller: it asks once per entry, and once more with mmap supported to word the
+// "would have been lazy" warning. A predicate returning `mode != OFF` is the
+// mutant this test exists to kill: it passes the ON rows and the OFF rows, and
+// fails AUTO at 4 GiB and every flag-false row that is not OFF. The rows away from
+// the 4 GiB boundary kill a floor compare that truncates to 32 bits.
 //
 // Host-only: pure function, no backend registry, device or model.
 
@@ -30,7 +33,11 @@ struct row {
 };
 
 int main() {
-    const size_t gib4 = 4ull * 1024 * 1024 * 1024;
+    const size_t gib4  = 4ull * 1024 * 1024 * 1024;
+    const size_t mib1  = 1024ull * 1024;
+    const size_t gib50 = 50ull * 1024 * 1024 * 1024;
+    // not an enumerator: the public C-API field is only validated by the CLI
+    const llama_lazy_mode bad_mode = (llama_lazy_mode) 99;
 
     const row rows[] = {
         // mmap supported
@@ -40,6 +47,13 @@ int main() {
         { "AUTO @ 4GiB+1    mmap",    LLAMA_LAZY_MODE_AUTO, gib4 + 1, true,  true  },
         { "ON   @ 4GiB      mmap",    LLAMA_LAZY_MODE_ON,   gib4,     true,  true  },
         { "ON   @ 4GiB+1    mmap",    LLAMA_LAZY_MODE_ON,   gib4 + 1, true,  true  },
+        // away from the boundary: a 32-bit truncating floor compare reads 50 GiB as 2 GiB
+        { "AUTO @ 1MiB      mmap",    LLAMA_LAZY_MODE_AUTO, mib1,     true,  false },
+        { "AUTO @ 50GiB     mmap",    LLAMA_LAZY_MODE_AUTO, gib50,    true,  true  },
+        { "AUTO @ 50GiB     no mmap", LLAMA_LAZY_MODE_AUTO, gib50,    false, false },
+        // a mode outside the enum fails closed, at either side of the floor
+        { "bad  @ 1MiB      mmap",    bad_mode,             mib1,     true,  false },
+        { "bad  @ 50GiB     mmap",    bad_mode,             gib50,    true,  false },
         // mmap unsupported: nothing is eligible
         { "OFF  @ 4GiB      no mmap", LLAMA_LAZY_MODE_OFF,  gib4,     false, false },
         { "OFF  @ 4GiB+1    no mmap", LLAMA_LAZY_MODE_OFF,  gib4 + 1, false, false },

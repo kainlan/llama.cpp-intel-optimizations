@@ -1254,6 +1254,8 @@ bool llama_lazy_eligible(enum llama_lazy_mode mode, size_t nbytes, bool mmap_sup
             return true;
     }
 
+    // a mode outside the enum fails closed: never eligible (it used to fall to
+    // AUTO's size floor before the predicate was extracted)
     return false;
 }
 

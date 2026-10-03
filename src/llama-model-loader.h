@@ -35,8 +35,10 @@ const char * llama_file_version_name(llama_fver version);
 // Whether a TENSOR_READ_LAZY tensor of `nbytes` is read lazily, as a function of
 // the lazy mode and of whether mmap is supported (llama.cpp-th32 T6a, design
 // DLM (a)). It is the one eligibility rule: nothing is eligible without mmap,
-// OFF never is, AUTO only above 4 GiB, ON always. Callers pass the answer on;
-// none restates the rule.
+// OFF never is, AUTO only above 4 GiB, ON always. A mode outside the enum (the
+// field is public C API, and only the CLI validates it) is never eligible. The
+// lazy-range record's pre-fill is the only caller: lazy_read::add() and the other
+// consumers read the deferral the record holds and none restates the rule.
 bool llama_lazy_eligible(enum llama_lazy_mode mode, size_t nbytes, bool mmap_supported);
 
 struct llama_model_loader {
