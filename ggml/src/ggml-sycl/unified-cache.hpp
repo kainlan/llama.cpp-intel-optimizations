@@ -6319,10 +6319,6 @@ struct file_mapping_request {
 
 allocation_result unified_allocate_file_mapping(const file_mapping_request & req) noexcept;
 
-// The owner's dup of the loader's fd, for POSIX_FADV_DONTNEED after staging. False if `base` is not a live
-// FILE_MAPPED reservation.
-bool unified_lookup_file_mapping_fd(const void * base, int * fd) noexcept;
-
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // The registry's host-pinned and file-mapped byte sums: the figures unified_alloc_validate_registry compares with the
 // host ledger and reports beside it. A file mapping is in the second and never in the first.

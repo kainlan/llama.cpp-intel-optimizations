@@ -1,15 +1,17 @@
 """Source contract for llama.cpp-5efe C2: the raw mapping primitives have an allowlist.
 
-`mmap`, `munmap`, `mlock` and `madvise` are the calls that make, lock and release address space the unified cache must
-own. The FILE_MAPPED tier (docs/design/sycl-mmap-host-tier.md §4.1) keeps them in one device-free translation unit,
-ggml/src/ggml-sycl/file-mapping.cpp, behind four wrappers (`unified_cache_raw_map_file`,
-`unified_cache_raw_lock_file_segments`, `unified_cache_raw_advise_file_segments`, `unified_cache_raw_unmap_file`). An allowlist entry in the canonical contract
-does not enforce itself, so this gate does:
+`mmap`, `munmap`, `mlock` and `madvise` are the calls that make, lock and release address space the unified cache
+must own. The FILE_MAPPED tier (docs/design/sycl-mmap-host-tier.md §4.1) keeps them in one device-free translation
+unit, ggml/src/ggml-sycl/file-mapping.cpp, behind four wrappers (`unified_cache_raw_map_file`,
+`unified_cache_raw_lock_file_segments`, `unified_cache_raw_advise_file_segments`,
+`unified_cache_raw_unmap_file`). An allowlist entry in the canonical contract does not enforce itself, so this gate
+does:
 
 1. it tokenizes first: comments, string literals and character literals are stripped, then `\\b(mmap|munmap|mlock|
    madvise)\\s*\\(` is matched. A comment such as "host/mmap (conservative)" or a literal "mmap(" is not a call, and a
    real `mmap (` with a space is. A fixture of those forms is part of this test;
-2. every call in ggml/src/ggml-sycl/ must sit in a listed site: the file-mapping TU (any), or one of today's eight
+2. every call in ggml/src/ggml-sycl/ must sit in a listed site: the file-mapping TU (pinned by call count too: a
+   second `munmap` there is a second release, and the tier's munmap counter would not see it), or one of today's eight
    sites, pinned by file and by call count (a ninth call in a listed file is as much a new site as one in a new file);
 3. the canonical contract's §3 allowlist names the four wrappers.
 
@@ -24,8 +26,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SYCL_DIR = ROOT / "ggml/src/ggml-sycl"
 CONTRACT = ROOT / "docs/design/sycl-canonical-memory-architecture.md"
 
-# the wrapper translation unit: any call
-WRAPPER_TUS = {"file-mapping.cpp", "host-cpu-mapping.cpp"}
+# the wrapper translation units: any call in host-cpu-mapping.cpp; file-mapping.cpp is pinned to the calls of its four
+# wrappers, so a second release (or a second map) cannot be added unseen
+WRAPPER_TUS = {"host-cpu-mapping.cpp"}
+PINNED_WRAPPER_TUS = {
+    # reserve + segment map, the one munmap wrapper, the lock, the advise
+    "file-mapping.cpp": {"mmap": 2, "munmap": 1, "mlock": 1, "madvise": 1},
+}
 
 # today's sites, by file relative to ggml/src/ggml-sycl: {call: count}
 ALLOWED = {
@@ -76,7 +83,7 @@ def violations(files: dict) -> list:
         counts = calls_in(src)
         if not counts or rel in WRAPPER_TUS:
             continue
-        allowed = ALLOWED.get(rel)
+        allowed = ALLOWED.get(rel, PINNED_WRAPPER_TUS.get(rel))
         if allowed is None:
             out.append(f"{rel}: {counts} (not a listed site)")
         elif counts != allowed:
@@ -112,6 +119,12 @@ def test_a_call_in_a_non_listed_file_is_a_violation():
     files["some-new-file.cpp"] = "void h() { mmap (nullptr, 4096, 0, 0, -1, 0); }\n"
     found = violations(files)
     assert any(v.startswith("some-new-file.cpp") for v in found), found
+
+
+def test_a_second_munmap_in_the_file_mapping_tu_is_a_violation():
+    files = tree_files()
+    files["file-mapping.cpp"] += "\nvoid second_release(void * p) { munmap(p, 4096); }\n"
+    assert any(v.startswith("file-mapping.cpp") for v in violations(files)), violations(files)
 
 
 def test_an_extra_call_in_a_listed_file_is_a_violation():

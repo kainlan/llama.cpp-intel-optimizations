@@ -446,6 +446,10 @@ static int test_ranged_lock() {
 int main() {
     g_page = (uint64_t) sysconf(_SC_PAGESIZE);
     int rc = 0;
+    if (!file_mapping_supported()) {
+        std::fprintf(stderr, "FAIL: the tier reports itself absent on the POSIX build that runs this test\n");
+        return 1;
+    }
     rc |= test_reservation_shape();
     rc |= test_dup_fd_ownership();
     rc |= test_size_mismatch_refused();

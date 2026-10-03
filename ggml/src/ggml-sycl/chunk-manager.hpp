@@ -19,7 +19,7 @@ enum class MemoryTier : uint8_t {
     NONE = 0,   // Not yet allocated
     VRAM = 1,   // GPU device memory
     HOST = 2,   // Pinned host memory
-    MMAP = 3,   // Memory-mapped from disk
+    MMAP = 3,   // Memory-mapped from disk (this chunk manager's own tier, not the unified cache's FILE_MAPPED)
 };
 
 // Describes a single chunk of a tensor

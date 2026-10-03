@@ -13,6 +13,17 @@
 
 namespace ggml_sycl {
 
+// Whether this build has the tier. The reservation and the MAP_FIXED segments need POSIX, so on Windows the primitives
+// below are refusing stubs and this is false: the fact the loader's `load_maps_files` reads (§4.3 m-19), so a Windows
+// SYCL load keeps SYCL_Host and never routes to a missing hook.
+constexpr bool file_mapping_supported() {
+#if defined(_WIN32)
+    return false;
+#else
+    return true;
+#endif
+}
+
 // A byte range of the file. Offsets are file offsets, never addresses.
 struct file_map_range {
     uint64_t file_offset = 0;
@@ -31,6 +42,7 @@ enum class file_map_status : uint8_t {
     SEGMENT_MAP_FAILED,  // a MAP_FIXED file segment failed
     LOCK_FAILED,         // mlock failed (errno names why)
     ADVISE_FAILED,       // madvise failed (errno names why)
+    UNSUPPORTED,         // this build has no file-mapping tier (Windows): nothing was mapped, locked or advised
 };
 
 const char * file_map_status_name(file_map_status status);
@@ -113,7 +125,8 @@ file_map_status unified_cache_raw_advise_file_segments(const file_mapping &     
                                                        const std::vector<file_map_range> & segments,
                                                        file_advice                         advice);
 
-// The only release: ONE munmap of the whole reservation, then the dup is closed. Idempotent.
+// The only release: ONE munmap of the whole reservation, then the dup is closed. Idempotent. Where the tier is absent
+// (file_mapping_supported() is false) it only empties the struct.
 void unified_cache_raw_unmap_file(file_mapping * mapping);
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)

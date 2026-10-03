@@ -163,16 +163,31 @@ if (BUILD_TESTING)
     set_tests_properties(sycl-fusion-alias PROPERTIES LABELS "sycl;fusion;host")
 
     # The FILE_MAPPED tier's raw file-mapping primitives (llama.cpp-5efe C2). file-mapping.cpp includes no SYCL
-    # header, so this target links it alone: no device, no model, no ggml.
-    add_executable(test-sycl-file-mapping-host
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-file-mapping-host.cpp
+    # header, so this target links it alone: no device, no model, no ggml. The test needs POSIX (mmap, /proc/self/maps),
+    # so it is Linux-only; the stub the other platforms get is run by test-sycl-file-mapping-unsupported below.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test-sycl-file-mapping-host
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-file-mapping-host.cpp
+            file-mapping.cpp)
+        target_include_directories(test-sycl-file-mapping-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(test-sycl-file-mapping-host PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+        set_target_properties(test-sycl-file-mapping-host PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME test-sycl-file-mapping-host COMMAND test-sycl-file-mapping-host)
+        set_tests_properties(test-sycl-file-mapping-host PROPERTIES LABELS "sycl;host" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    endif()
+
+    # The tier on a build without it (llama.cpp-5efe C2 review M2): file-mapping.cpp and the test are compiled with
+    # _WIN32 defined, so the refusing stub that Windows gets is built and run on the host. Both are portable C++.
+    add_executable(test-sycl-file-mapping-unsupported
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-file-mapping-unsupported.cpp
         file-mapping.cpp)
-    target_include_directories(test-sycl-file-mapping-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_definitions(test-sycl-file-mapping-host PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
-    set_target_properties(test-sycl-file-mapping-host PROPERTIES
+    target_include_directories(test-sycl-file-mapping-unsupported PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test-sycl-file-mapping-unsupported PRIVATE _WIN32=1)
+    set_target_properties(test-sycl-file-mapping-unsupported PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-    add_test(NAME test-sycl-file-mapping-host COMMAND test-sycl-file-mapping-host)
-    set_tests_properties(test-sycl-file-mapping-host PROPERTIES LABELS "sycl;host" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_test(NAME test-sycl-file-mapping-unsupported COMMAND test-sycl-file-mapping-unsupported)
+    set_tests_properties(test-sycl-file-mapping-unsupported PROPERTIES LABELS "sycl;host" TIMEOUT 60)
 
     # The HOST_CPU tier's raw wrapper (llama.cpp-th32 T1): anonymous, MADV_HUGEPAGE, mlocked in full. host-cpu-mapping.cpp
     # includes no SYCL header, so this target links it alone.
@@ -197,20 +212,23 @@ if (BUILD_TESTING)
     set_tests_properties(test-sycl-file-mapping-segments PROPERTIES LABELS "sycl;host" TIMEOUT 60)
 
     # The residency gate: the page cache of the FILE, measured with cachestat(2), over a 64 MiB fixture under the build
-    # directory (not tmpfs). It evicts per arm and exits 77 where it cannot (llama.cpp-5efe C3).
-    add_executable(test-sycl-file-mapping-residency
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-file-mapping-residency.cpp
-        file-mapping.cpp)
-    target_include_directories(test-sycl-file-mapping-residency PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    set_target_properties(test-sycl-file-mapping-residency PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-    # the fixture directory is the build directory, passed as argv[1]
-    add_test(NAME test-sycl-file-mapping-residency COMMAND test-sycl-file-mapping-residency ${CMAKE_BINARY_DIR})
-    set_tests_properties(test-sycl-file-mapping-residency PROPERTIES
-        LABELS "sycl;host"
-        SKIP_RETURN_CODE 77
-        RUN_SERIAL TRUE
-        TIMEOUT 300)
+    # directory (not tmpfs). It evicts per arm and exits 77 where it cannot (llama.cpp-5efe C3). Linux-only: it uses
+    # cachestat, /sys/dev/block and the glibc headers for them.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test-sycl-file-mapping-residency
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-file-mapping-residency.cpp
+            file-mapping.cpp)
+        target_include_directories(test-sycl-file-mapping-residency PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        set_target_properties(test-sycl-file-mapping-residency PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        # the fixture directory is the build directory, passed as argv[1]
+        add_test(NAME test-sycl-file-mapping-residency COMMAND test-sycl-file-mapping-residency ${CMAKE_BINARY_DIR})
+        set_tests_properties(test-sycl-file-mapping-residency PROPERTIES
+            LABELS "sycl;host"
+            SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE
+            TIMEOUT 300)
+    endif()
 
     add_executable(test-sycl-lifecycle-load-txn
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-load-txn.cpp
@@ -6116,18 +6134,21 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
 
     # The FILE_MAPPED tier through the real front door (llama.cpp-5efe C2). Host-only: a file mapping needs no
     # device, so the labels are those of the intrusive-owner test and carry none of cache/mem-handle/residency.
-    add_executable(test-sycl-file-mapped-tier
-        tests/test-file-mapped-tier.cpp)
-    target_link_libraries(test-sycl-file-mapped-tier PRIVATE
-        ggml-sycl-private-fixtures Threads::Threads)
-    set_target_properties(test-sycl-file-mapped-tier PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-    add_test(NAME sycl-file-mapped-tier COMMAND test-sycl-file-mapped-tier)
-    set_tests_properties(sycl-file-mapped-tier PROPERTIES
-        LABELS "sycl;allocator;owner;host"
-        # no device: pin a selector that shows none, so an incidental SYCL init cannot touch a GPU
-        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu"
-        TIMEOUT 30)
+    # POSIX-only (it reads /proc/self/maps and counts fds), so Linux-only; its name is its binary's (C2 review m2).
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test-sycl-file-mapped-tier
+            tests/test-file-mapped-tier.cpp)
+        target_link_libraries(test-sycl-file-mapped-tier PRIVATE
+            ggml-sycl-private-fixtures Threads::Threads)
+        set_target_properties(test-sycl-file-mapped-tier PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME test-sycl-file-mapped-tier COMMAND test-sycl-file-mapped-tier)
+        set_tests_properties(test-sycl-file-mapped-tier PROPERTIES
+            LABELS "sycl;allocator;owner;host"
+            # no device: pin a selector that shows none, so an incidental SYCL init cannot touch a GPU
+            ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu"
+            TIMEOUT 30)
+    endif()
 
     # Forced-failure coverage for the transactional staging-replacement region
     # (4f01993c9).  Most scenarios need no device; the last two repeat the
@@ -6266,7 +6287,6 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
     set(_ggml_sycl_private_fixture_consumers
         test-mem-handle-eviction
         test-sycl-intrusive-allocation-owner
-        test-sycl-file-mapped-tier
         test-sycl-staging-replacement-failpoints
         test-sycl-cache-backing-provenance
         test-sycl-mem-handle-concurrent-resolve
@@ -6310,6 +6330,9 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         test-mmq-q6k-gpu
         test-dmmv-q6k-coalesced
         test-dmmv-q4-0-coalesced)
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND _ggml_sycl_private_fixture_consumers test-sycl-file-mapped-tier)
+    endif()
     set(_ggml_sycl_private_fixture_binaries)
     foreach(_consumer IN LISTS _ggml_sycl_private_fixture_consumers)
         list(APPEND _ggml_sycl_private_fixture_binaries $<TARGET_FILE:${_consumer}>)

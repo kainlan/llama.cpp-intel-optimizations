@@ -886,10 +886,46 @@ tests link it alone (§7).
   same-size-replacement gap (r1 m-5). The owner keeps the fd, because
   `POSIX_FADV_DONTNEED` after staging needs it (§4.6), and closes it at
   release.
-- `unified_cache_raw_lock_file_segments(base, lock_segments)` and
-  `unified_cache_raw_unmap_file(reservation)` are the only lock and release.
-  The release is **one `munmap` of the whole reservation** (r1 I-2).
-- All three are added to the canonical contract §3 allowlist, next to
+- `unified_cache_raw_lock_file_segments(mapping, lock_segments)`,
+  `unified_cache_raw_advise_file_segments(mapping, segments, advice)` and
+  `unified_cache_raw_unmap_file(mapping)` are the only lock, advise and
+  release. As built (C2 review, C3 review m6), each takes the `file_mapping`
+  the map call filled in, not a bare base address; the lock and the advise
+  validate every segment inside the reservation, page aligned, before the
+  first syscall and never widen one, so a refused set locks and advises
+  nothing. The release is **one `munmap` of the whole reservation** (r1 I-2),
+  issued from one wrapper function so that a second `munmap` anywhere in the
+  TU is a gate failure and a counter the test reads.
+  - **`WILLNEED` is advised in chunks of 128 KiB**, never one call per
+    segment. The kernel caps each `MADV_WILLNEED` at
+    `max(bdi io_pages, ra_pages)` pages, which is a property of the block
+    device (`max_sectors_kb`, `read_ahead_kb`), not of the tier: a 56 MiB
+    segment advised in one call populated 128 pages, and in 1 MiB chunks
+    half of it, on this host (C3 review M1). 128 KiB is the default
+    `read_ahead_kb` and at most `io_pages` for any `max_sectors_kb >= 128`,
+    and the chunk is at least one page. The residency test requires 95 % of
+    each host segment resident after `WILLNEED`, and fails a one-call and a
+    1 MiB-chunk mutant.
+  - **Windows SYCL stays in scope**, because the repo keeps a Windows CI VM
+    (C2 review M2). `file-mapping.cpp` is compiled on every platform (the
+    backend globs its sources); its POSIX body sits under
+    `#if !defined(_WIN32)` and a refusing stub stands in where it is not:
+    map, lock and advise answer `UNSUPPORTED` and touch nothing, release is a
+    no-op, `file_mapping_supported()` is false (the fact C4's
+    `load_maps_files` reads, §4.3 m-19), and the pure segment plan below is
+    outside the guard. The tests that need POSIX (`test-sycl-file-mapping-host`,
+    `-residency`, `test-sycl-file-mapped-tier`) are registered only on Linux;
+    `test-sycl-file-mapping-unsupported` compiles the stub with `_WIN32`
+    defined and runs it on the Linux host.
+  - **No raw fd accessor.** C2 shipped `unified_lookup_file_mapping_fd(base,
+    fd)`, which handed out the owner's dup keyed by a raw base pointer; it had
+    no production caller and is removed (C2 review m3). The step that adds
+    `POSIX_FADV_DONTNEED` (§4.6, "After staging") must reach the fd through a
+    `mem_handle` (or a handle-bound accessor), never through an address, and
+    must add `posix_fadvise` and the other calls the allowlist gate does not
+    yet police (`posix_madvise`, `mlock2`, `munlock`, `mremap`) to that gate
+    first (C3 review n4).
+- All the wrappers are added to the canonical contract §3 allowlist, next to
   `unified_cache_raw_malloc_host` and th32's `HOST_CPU` wrapper.
 - A new source gate, `test-sycl-raw-mmap-allowlist-source`, makes that
   enforceable, which the allowlist entry alone is not (r1 m-11). It fails on
@@ -2996,14 +3032,16 @@ lifts it into `host_ledger_budget()`.
   ineligible table is not in the set, and is mapped and prefetched as the
   ordinary weight it is.
 - **Three segment sets, one pure function** (r1 I-2, §F2; defined exactly per
-  r2 m-16). `file_mapping_segments(tensor_ranges, lazy_ranges, page)`, where
+  r2 m-16). `file_mapping_segments(tensor_ranges, lazy_ranges, page, random_window)`
+  (four arguments as built, C3 review m6: `random_window` is `W` of the
+  edge-window row, from `file_mapping_random_window(read_ahead, page)`), where
   `tensor_ranges` is the byte ranges of the tensors in this `SYCL_Mapped`
   buffer and `lazy_ranges` is `excluded_for_file(idx)`, returns:
 
   | set | definition | rounding | bound on lazy bytes |
   |---|---|---|---|
   | map segments | the union of `tensor_ranges`, each range rounded **outward** to pages, then merged. It is **not** a complement: bytes that belong to no tensor of this buffer are never mapped | outward, including at a lazy boundary (GGUF alignment is 32 B, so a lazy and a non-lazy tensor can share a page) | at most one page of lazy bytes mapped per lazy edge (the shared page) |
-  | `WILLNEED` segments | the host-executed subset of `tensor_ranges`, each rounded **inward**, minus every page that holds a lazy byte | inward | 0 |
+  | `WILLNEED` segments | the host-executed subset of `tensor_ranges`, **merged across a gap shorter than a page that holds no lazy byte and no byte of a device-only tensor of this buffer** (GGUF pads tensors to 32 B, so consecutive host tensors usually leave a few bytes between them and the page they straddle would otherwise be advised and locked by no one; C3 review m4), each rounded **inward**, minus every page that holds a lazy byte | inward | 0 |
   | lock segments | as `WILLNEED`, under `-lm mmap+mlock` only | inward | 0 |
   | `MADV_RANDOM` edge windows | for each lazy range, `[lazy_begin - W, lazy_begin)` and `[lazy_end, lazy_end + W)` intersected with the map segments, plus the shared pages | inward from each lazy boundary | n/a (advice only) |
 

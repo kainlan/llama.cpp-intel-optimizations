@@ -2,7 +2,7 @@
 // cpu-dispatch.cpp — CPU compute path for data-local inference
 //
 // Executes operations on a CPU SYCL queue when weight data resides in host
-// pinned memory (unified cache PINNED_HOST or MMAP tier).  Avoids unnecessary
+// pinned memory or a file mapping (unified cache HOST_PINNED or FILE_MAPPED tier).  Avoids unnecessary
 // host-to-device transfers for layers evicted from VRAM.
 //
 // MUL_MAT uses quantized vec_dot (e.g., Q4_0×Q8_0) for small M (TG), or

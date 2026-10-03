@@ -157,11 +157,6 @@ void tier_identity_registry_and_release() {
               ((const unsigned char *) base)[3 * page + 5] == pattern(4 * page + 5),
           "the mapped bytes are not the file's");
 
-    // the owner's dup of the loader's fd is reachable for POSIX_FADV_DONTNEED
-    int owner_fd = -1;
-    check(unified_lookup_file_mapping_fd(base, &owner_fd) && owner_fd >= 0 && owner_fd != f.fd,
-          "the owner's dup of the fd is not reachable");
-
     // a device may not be handed the reservation: resolve() is the CPU's, resolve(device) is empty, slices too
     mem_handle handle = mem_handle::from_owned_alloc(std::move(allocation.owner));
     check(handle.valid(), "no handle for the owner");

@@ -100671,7 +100671,7 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
                 return;
             }
 
-            // Weight is in HOST or MMAP tier — unified_cache handles placement
+            // Weight is in the HOST_PINNED or FILE_MAPPED tier — unified_cache handles placement
             mark_staged(tensor);
             return;
         }

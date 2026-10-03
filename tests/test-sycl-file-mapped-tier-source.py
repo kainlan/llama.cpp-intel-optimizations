@@ -15,7 +15,13 @@ from outside, or that a rebase restoring upstream's shape would silently undo:
 5. unified_alloc() (the legacy raw-pointer entry) refuses FILE_MAPPED and UNREGISTERED;
 6. alloc_registry's type and the tier both have FILE_MAPPED, and the front door registers the reservation under
    alloc_type::FILE_MAPPED, not HOST_MALLOC (which would send it to ::free);
-7. the validator's host-ledger sum does not add the file-mapped bytes to the host total.
+7. the registry's tier sums come from one helper: the file-mapped arm adds to its own sum, no arm that adds to the
+   host sum names FILE_MAPPED, and the validator reads the helper rather than summing the registry itself (the
+   runtime arm of test-sycl-file-mapped-tier reads the same helper through a private accessor);
+8. file-mapping.cpp compiles everywhere: its POSIX headers and primitives sit under `#if !defined(_WIN32)`, the
+   `#else` arm holds refusing stubs, the segment plan is outside the guard, and the host tests that need POSIX are
+   registered only under `if (CMAKE_SYSTEM_NAME STREQUAL "Linux")`;
+9. no raw accessor hands out the owner's fd by address, and the ctest name of the runtime test is its binary's.
 
 Plain file I/O, comment-stripped text.
 """
@@ -174,10 +180,143 @@ def test_unified_alloc_refuses_a_file_mapping():
 # ---- 7. the host ledger ----
 
 
-def test_the_registry_validator_does_not_charge_file_mapped_bytes_to_the_host_total():
+def sums_body() -> str:
+    return function_body(code("unified-cache.cpp"), r"static\s+registry_tier_sums\s+unified_alloc_registry_tier_sums\s*\(\s*\)")
+
+
+def test_the_file_mapped_arm_adds_to_its_own_sum_and_never_to_the_host_sum():
+    body = sums_body()
+    arms = list(re.finditer(r"(?:if|else\s+if)\s*\(([^{]*?)\)\s*\{([^}]*)\}", body, flags=re.DOTALL))
+    assert arms, "the sums helper has no tier arms"
+    file_arm = [a for a in arms if "FILE_MAPPED" in a.group(1)]
+    assert len(file_arm) == 1, f"expected one FILE_MAPPED arm, got {len(file_arm)}"
+    assert re.search(r"sums\s*\.\s*file_mapped\s*\+=", file_arm[0].group(2)), "the FILE_MAPPED arm does not add to sums.file_mapped"
+    assert "sums.host" not in file_arm[0].group(2), "the FILE_MAPPED arm adds to the host sum"
+    for a in arms:
+        if re.search(r"sums\s*\.\s*host\s*\+=", a.group(2)):
+            assert "FILE_MAPPED" not in a.group(1), f"an arm that adds to the host sum names FILE_MAPPED: {a.group(1)}"
+
+
+def test_the_validator_reads_the_helper_and_reports_the_file_mapped_sum():
     body = function_body(code("unified-cache.cpp"), r"unified_alloc_validate_registry\s*\([^)]*\)")
+    assert "unified_alloc_registry_tier_sums()" in body, "the validator does not read the one helper"
+    assert "g_runtime_alloc_registry" not in body, "the validator sums the registry itself, not through the helper"
     assert "registry_file_mapped" in body, "the validator does not keep file-mapped bytes apart"
-    assert not re.search(r"registry_host\w*\s*\+=\s*[^;]*FILE_MAPPED", body)
+    assert not re.search(r"registry_host\w*\s*\+=", body), "the validator adds to the host sum itself"
+
+
+def test_the_sums_accessor_is_the_helper():
+    body = function_body(code("unified-cache.cpp"), r"void\s+unified_alloc_registry_sums_for_test\s*\([^)]*\)\s*noexcept")
+    assert "unified_alloc_registry_tier_sums()" in body, "the test accessor does not read the helper the validator reads"
+
+
+# ---- 8. Windows ----
+
+
+def sycl_text(rel: str) -> str:
+    return (SYCL / rel).read_text()
+
+
+def guard_regions(text: str) -> tuple:
+    """(posix, other): the text of the `#if !defined(_WIN32)` arm(s) and of everything else, at the top nesting level."""
+    posix, other, depth, in_posix = [], [], 0, False
+    for line in text.splitlines(keepends=True):
+        stripped = re.sub(r"^\s*#\s*", "#", line.strip())
+        if depth == 0 and re.match(r"#if\s+!defined\s*\(\s*_WIN32\s*\)", stripped):
+            in_posix, depth = True, 1
+            continue
+        if depth >= 1 and stripped.startswith("#if"):
+            depth += 1
+        elif depth >= 1 and stripped.startswith("#endif"):
+            depth -= 1
+            if depth == 0:
+                in_posix = False
+                continue
+        elif depth == 1 and stripped.startswith("#else"):
+            in_posix = False
+            continue
+        (posix if in_posix else other).append(line)
+    return "".join(posix), "".join(other)
+
+
+POSIX_HEADERS = r"#\s*include\s*<(sys/\w+\.h|unistd\.h)>"
+POSIX_CALLS = r"\b(mmap|munmap|mlock|madvise|fstat|dup|close|sysconf)\s*\("
+
+
+def test_file_mapping_cpp_guards_its_posix_body_and_stubs_the_rest():
+    text = sycl_text("file-mapping.cpp")
+    posix, other = guard_regions(text)
+    assert posix, "file-mapping.cpp has no `#if !defined(_WIN32)` body"
+    assert re.search(POSIX_HEADERS, posix), "the POSIX headers are not inside the guard"
+    other_code = strip_comments(other)
+    assert not re.search(POSIX_HEADERS, other_code), "a POSIX header is included outside the guard"
+    assert not re.search(POSIX_CALLS, other_code), f"a POSIX call sits outside the guard: {re.search(POSIX_CALLS, other_code).group(0)}"
+    stubs = other_code[other_code.index("unified_cache_raw_map_file") :] if "unified_cache_raw_map_file" in other_code else ""
+    for name in ("unified_cache_raw_map_file", "unified_cache_raw_lock_file_segments", "unified_cache_raw_advise_file_segments", "unified_cache_raw_unmap_file"):
+        assert name in other_code, f"the non-POSIX arm has no stub for {name}"
+    assert stubs.count("file_map_status::UNSUPPORTED") >= 3, "the stubs do not refuse as UNSUPPORTED"
+
+
+def test_the_segment_plan_is_outside_the_guard():
+    posix, other = guard_regions(sycl_text("file-mapping.cpp"))
+    assert "file_mapping_segments(" in strip_comments(other), "the pure segment plan sits inside the POSIX guard, so Windows loses it"
+    assert "file_mapping_segments(" not in strip_comments(posix)
+
+
+def test_the_capability_query_is_false_on_windows():
+    hpp = strip_comments(sycl_text("file-mapping.hpp"))
+    m = re.search(r"constexpr\s+bool\s+file_mapping_supported\s*\(\s*\)\s*\{(.*?)\n\}", hpp, flags=re.DOTALL)
+    assert m, "file-mapping.hpp has no file_mapping_supported()"
+    assert re.search(r"#\s*if\s+defined\s*\(\s*_WIN32\s*\)\s*return\s+false\s*;\s*#\s*else\s*return\s+true\s*;", m.group(1)), (
+        "file_mapping_supported() is not false on Windows and true elsewhere"
+    )
+
+
+def cmake_blocks() -> dict:
+    """target/test name -> True when registered inside `if (CMAKE_SYSTEM_NAME STREQUAL "Linux")`."""
+    out, stack = {}, []
+    for line in (SYCL / "CMakeLists.txt").read_text().splitlines():
+        t = line.strip()
+        if re.match(r"if\s*\(", t):
+            stack.append(bool(re.search(r'CMAKE_SYSTEM_NAME\s+STREQUAL\s+"Linux"', t)))
+        elif re.match(r"endif\s*\(", t) and stack:
+            stack.pop()
+        for m in re.finditer(r"add_(?:executable|test)\s*\(\s*(?:NAME\s+)?([\w-]+)", t):
+            out[m.group(1)] = any(stack)
+    return out
+
+
+def test_the_posix_only_tests_are_registered_only_on_linux():
+    reg = cmake_blocks()
+    for name in ("test-sycl-file-mapping-host", "test-sycl-file-mapping-residency", "test-sycl-file-mapped-tier"):
+        assert name in reg, f"{name} is not registered"
+        assert reg[name], f"{name} is registered on every platform, but needs POSIX"
+    for name in ("test-sycl-file-mapping-segments", "test-sycl-file-mapping-unsupported"):
+        assert name in reg and not reg[name], f"{name} is portable and should not be Linux-only"
+
+
+def test_the_unsupported_test_compiles_the_stub():
+    text = (SYCL / "CMakeLists.txt").read_text()
+    m = re.search(r"target_compile_definitions\(\s*test-sycl-file-mapping-unsupported\s+PRIVATE\s+([^)]*)\)", text)
+    assert m and "_WIN32" in m.group(1), "test-sycl-file-mapping-unsupported is not compiled with _WIN32 defined"
+
+
+# ---- 9. no raw fd accessor, and the ctest name ----
+
+
+def test_no_raw_accessor_hands_out_the_owners_fd_by_address():
+    for rel in ("unified-cache.hpp", "unified-cache.cpp"):
+        assert "unified_lookup_file_mapping_fd" not in code(rel), (
+            f"{rel} brought back unified_lookup_file_mapping_fd: an fd keyed by a raw base pointer outlives its owner"
+        )
+
+
+def test_the_ctest_name_is_the_binary_name():
+    text = (SYCL / "CMakeLists.txt").read_text()
+    assert re.search(r"add_test\(\s*NAME\s+test-sycl-file-mapped-tier\s+COMMAND\s+test-sycl-file-mapped-tier\s*\)", text), (
+        "the runtime test is not registered under its binary's name (`ctest -R '^test-sycl-file-mapped-tier$'` would select nothing)"
+    )
+    assert not re.search(r"add_test\(\s*NAME\s+sycl-file-mapped-tier\b", text)
 
 
 if __name__ == "__main__":

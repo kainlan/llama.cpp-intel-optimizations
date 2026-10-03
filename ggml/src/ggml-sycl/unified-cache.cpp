@@ -1716,6 +1716,8 @@ static std::atomic<uint64_t> g_offload_wait_count_forced{ 0 };
 static std::atomic<uint64_t> g_offload_wait_count_fallback{ 0 };
 static std::atomic<uint64_t> g_offload_alloc_count_host{ 0 };
 static std::atomic<uint64_t> g_offload_alloc_count_device{ 0 };
+// Not counted since the FILE_MAPPED tier (5efe C2): the arm that fed it was UNREGISTERED, which is not an allocation
+// and cannot reach offload_stats_note_alloc. Kept so the stats line keeps its shape (test-sycl-offload-regression.sh).
 static std::atomic<uint64_t> g_offload_alloc_count_shared{ 0 };
 static std::atomic<uint64_t> g_offload_alloc_count_file_mapped{ 0 };
 static std::atomic<uint64_t> g_offload_pool_hit_count{ 0 };
@@ -3413,9 +3415,6 @@ void offload_stats_note_alloc(alloc_tier tier) {
             break;
         case alloc_tier::HOST_PINNED:
             g_offload_alloc_count_host.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case alloc_tier::UNREGISTERED:
-            g_offload_alloc_count_shared.fetch_add(1, std::memory_order_relaxed);
             break;
         case alloc_tier::FILE_MAPPED:
             g_offload_alloc_count_file_mapped.fetch_add(1, std::memory_order_relaxed);
@@ -17270,24 +17269,6 @@ allocation_result unified_allocate_file_mapping(const file_mapping_request & req
     }
 }
 
-bool unified_lookup_file_mapping_fd(const void * base, int * fd) noexcept {
-    if (base == nullptr || fd == nullptr) {
-        return false;
-    }
-    try {
-        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        const auto                  it = g_runtime_alloc_registry.find(const_cast<void *>(base));
-        if (it == g_runtime_alloc_registry.end() || it->second.state != runtime_alloc_state::LIVE ||
-            it->second.handle.tier != alloc_tier::FILE_MAPPED || it->second.file_fd < 0) {
-            return false;
-        }
-        *fd = it->second.file_fd;
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
 mem_handle unified_allocate(const alloc_request & req) {
     allocation_result allocation = unified_allocate_owner(req);
     if (!allocation) return {};
@@ -18017,35 +17998,46 @@ void unified_cache_deallocate(void * ptr, int device) {
     }
 }
 
+// The registry's byte sums by tier: the one source for the validator's comparison with the ledgers and for the
+// figure it reports beside them. A file mapping is not charged to the host ledger (it is page cache, charged only when
+// locked), so it is summed apart and never compared with `host`.
+struct registry_tier_sums {
+    std::array<size_t, GGML_SYCL_MAX_DEVICES> device{};
+    size_t                                    host        = 0;
+    size_t                                    file_mapped = 0;
+};
+
+static registry_tier_sums unified_alloc_registry_tier_sums() {
+    registry_tier_sums          sums;
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    for (const auto & kv : g_runtime_alloc_registry) {
+        const alloc_metadata & h = kv.second.handle;
+        if (h.tier == alloc_tier::DEVICE_VRAM) {
+            if (h.device >= 0 && h.device < GGML_SYCL_MAX_DEVICES) {
+                sums.device[h.device] += h.size;
+            }
+        } else if (h.tier == alloc_tier::HOST_PINNED || h.tier == alloc_tier::UNREGISTERED) {
+            sums.host += h.size;
+        } else if (h.tier == alloc_tier::FILE_MAPPED) {
+            sums.file_mapped += h.size;
+        }
+    }
+    return sums;
+}
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void unified_alloc_registry_sums_for_test(size_t * host, size_t * file_mapped) noexcept {
-    // stand-in: reports nothing
-    *host        = 0;
-    *file_mapped = 0;
+    const registry_tier_sums sums = unified_alloc_registry_tier_sums();
+    *host                         = sums.host;
+    *file_mapped                  = sums.file_mapped;
 }
 #endif
 
 bool unified_alloc_validate_registry(int device, const char * where) {
-    std::array<size_t, GGML_SYCL_MAX_DEVICES> registry_device{};
-    size_t                                    registry_host = 0;
-    // A file mapping is not charged to the host ledger (it is page cache, charged only when locked), so it is
-    // reported beside the host sum and never compared with it.
-    size_t                                    registry_file_mapped = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        for (const auto & kv : g_runtime_alloc_registry) {
-            const alloc_metadata & h = kv.second.handle;
-            if (h.tier == alloc_tier::DEVICE_VRAM) {
-                if (h.device >= 0 && h.device < GGML_SYCL_MAX_DEVICES) {
-                    registry_device[h.device] += h.size;
-                }
-            } else if (h.tier == alloc_tier::HOST_PINNED || h.tier == alloc_tier::UNREGISTERED) {
-                registry_host += h.size;
-            } else if (h.tier == alloc_tier::FILE_MAPPED) {
-                registry_file_mapped += h.size;
-            }
-        }
-    }
+    const registry_tier_sums sums                 = unified_alloc_registry_tier_sums();
+    const auto &             registry_device      = sums.device;
+    const size_t             registry_host        = sums.host;
+    const size_t             registry_file_mapped = sums.file_mapped;
 
     int active_devices = 0;
     try {

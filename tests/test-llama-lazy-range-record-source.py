@@ -236,9 +236,17 @@ def test_the_per_tensor_lock_is_ranged_and_reads_the_record():
     assert "grow_to" not in body, "load_all_data() locks with grow_to, the whole-prefix lock"
     call = re.search(r"lock_range\s*\(", body)
     assert call, "load_all_data() does not lock a tensor with lock_range"
-    args = balanced(body, call.end() - 1, "(", ")")
-    assert "weight->offs" in args and "n_size" in args, f"lock_range is not given the tensor's own range: {args}"
-    assert "lazy_record.excluded_for_file" in body, "the ranged lock does not read the record's excluded ranges"
+    args = [re.sub(r"\s+", "", a) for a in re.split(r",(?![^(]*\))", balanced(body, call.end() - 1, "(", ")"))]
+    # the whole argument list: the tensor's own offset and size, then the excluded ranges of its file. An empty
+    # set (`{}`) or a prefix (`0, offs + size`) would keep the call's name and lose its meaning.
+    assert args == ["weight->offs", "n_size", "found->second"], f"lock_range is not given the tensor's own range and the excluded set: {args}"
+    assert re.search(
+        r"lock_deferred\s*\.\s*emplace\s*\(\s*weight->idx\s*,\s*lazy_record\s*\.\s*excluded_for_file\s*\(\s*weight->idx\s*\)\s*\)",
+        body,
+    ), "the ranged lock's excluded set is not the record's excluded_for_file(weight->idx)"
+    assert re.search(r"found\s*=\s*lock_deferred\s*\.\s*find\s*\(\s*weight->idx\s*\)", body), (
+        "`found` does not come from lock_deferred"
+    )
 
 
 def test_early_plan_consults_the_record():
