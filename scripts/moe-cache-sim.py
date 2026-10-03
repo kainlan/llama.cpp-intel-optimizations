@@ -54,6 +54,10 @@ Trace file format (little endian):
         n_tokens * k u16 expert ids (token-major)
     phase: 0 prompt (prefill), 1 generated (decode).
     A new step starts when the layer index does not increase.
+    n_tokens may be 0: the last layer of a prompt ubatch that produces no output
+    is trimmed to zero rows by llama's output-row gather. Such a record is just
+    the 16-byte header (k kept, no ids). The reader yields an empty row list for
+    that layer, and it adds no routed pairs, no coverage and no tokens.
 """
 from __future__ import annotations
 
@@ -98,16 +102,20 @@ class Trace:
 
 
 def write_trace(path, header, records):
-    """records: iterable of (step, layer, phase, rows) with rows = [[ids]] per token."""
+    """records: iterable of (step, layer, phase, rows) or (step, layer, phase,
+    rows, k), rows = [[ids]] per token. Empty rows are skipped unless k is given,
+    which writes the zero-row record (n_tokens 0) the tool writes for a trimmed
+    last layer."""
     blob = json.dumps(header, sort_keys=True).encode("utf-8")
     with open(path, "wb") as f:
         f.write(MAGIC)
         f.write(struct.pack("<I", len(blob)))
         f.write(blob)
-        for step, layer, phase, rows in records:
-            if not rows:
+        for rec in records:
+            step, layer, phase, rows = rec[:4]
+            if not rows and (len(rec) < 5 or rec[4] is None):
                 continue
-            k = len(rows[0])
+            k = len(rows[0]) if rows else rec[4]
             if any(len(r) != k for r in rows):
                 raise ValueError("rows of one record must share k")
             f.write(RECORD.pack(step, layer, k, len(rows), phase, 0, 0))
@@ -272,13 +280,16 @@ def trace_summary(trace, n_expert=None):
         st = [s for s in trace.steps if s.phase == ph]
         out[name + "_steps"] = len(st)
         out[name + "_tokens"] = sum(s.n_tokens for s in st)
+        out[name + "_empty_layer_records"] = sum(
+            1 for s in st for rows in s.layers.values() if not rows)
     layers = set()
     cover = []
     for s in trace.steps:
         layers.update(s.layers)
         if s.phase == PHASE_PREFILL and n_expert:
             for rows in s.layers.values():
-                cover.append(len({e for r in rows for e in r}) / n_expert)
+                if rows:   # a zero-row layer touched nothing; it is not coverage 0
+                    cover.append(len({e for r in rows for e in r}) / n_expert)
     out["layers"] = len(layers)
     out["prefill_expert_coverage"] = sum(cover) / len(cover) if cover else None
     return out
