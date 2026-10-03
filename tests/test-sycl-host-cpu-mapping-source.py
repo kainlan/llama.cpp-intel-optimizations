@@ -105,14 +105,27 @@ def test_the_posix_body_is_guarded_and_the_other_arm_stubs_both_wrappers():
     assert not hit, f"a POSIX call sits outside the guard: {hit.group(0) if hit else ''}"
     for name in ("unified_cache_raw_alloc_host_cpu", "unified_cache_raw_free_host_cpu"):
         assert name in strip_comments(other), f"the non-POSIX arm has no stub for {name}"
-    assert strip_comments(other).count("host_cpu_status::UNSUPPORTED") >= 1, "the stub does not refuse as UNSUPPORTED"
+    stub = function_body(
+        strip_comments(other), r"host_cpu_status\s+unified_cache_raw_alloc_host_cpu\s*\([^)]*\)"
+    )
+    assert re.search(r"return\s+host_cpu_status::UNSUPPORTED\s*;", stub), "the stub does not refuse as UNSUPPORTED"
+    assert not re.search(r"\bmmap\s*\(", stub), "the stub maps"
 
 
 def test_the_sizing_function_and_the_refusal_text_are_outside_the_guard():
     posix, other = guard_regions(sycl_text(CPP))
-    for name in ("host_cpu_mapped_size(", "host_cpu_refusal_text(", "host_cpu_status_name("):
-        assert name in strip_comments(other), f"{name} sits inside the POSIX guard, so Windows loses it"
-        assert name not in strip_comments(posix), f"{name} is defined inside the POSIX guard"
+    for ret, name in (
+        (r"size_t", "host_cpu_mapped_size"),
+        (r"std::string", "host_cpu_refusal_text"),
+        (r"const\s+char\s*\*", "host_cpu_status_name"),
+    ):
+        definition = rf"^{ret}\s+{name}\s*\("
+        assert re.search(definition, strip_comments(other), flags=re.MULTILINE), (
+            f"{name} is not defined outside the POSIX guard, so Windows loses it"
+        )
+        assert not re.search(definition, strip_comments(posix), flags=re.MULTILINE), (
+            f"{name} is defined inside the POSIX guard"
+        )
 
 
 # ---- 2. the capability query ----
@@ -173,7 +186,9 @@ def test_one_function_holds_the_munmap_and_the_counter_and_both_releases_call_it
     free_body = function_body(posix, r"void\s+unified_cache_raw_free_host_cpu\s*\([^)]*\)")
     assert re.search(r"\bhost_cpu_munmap\s*\(", free_body), "the public release does not go through host_cpu_munmap"
     alloc_body = function_body(posix, r"host_cpu_status\s+unified_cache_raw_alloc_host_cpu\s*\([^)]*\)")
-    assert re.search(r"\bhost_cpu_munmap\s*\(", alloc_body), "the lock-failure unwind does not go through host_cpu_munmap"
+    assert re.search(r"\bhost_cpu_munmap\s*\(", alloc_body), (
+        "the lock-failure unwind does not go through host_cpu_munmap"
+    )
 
 
 # ---- 5. the lock ----
@@ -185,3 +200,11 @@ def test_the_lock_covers_the_whole_mapping_and_is_not_on_fault():
     posix, _ = guard_regions(sycl_text(CPP))
     alloc_body = function_body(strip_comments(posix), r"host_cpu_status\s+unified_cache_raw_alloc_host_cpu\s*\([^)]*\)")
     assert re.search(r"\bmlock\s*\(\s*p\s*,\s*mapped\s*\)", alloc_body), "mlock is not over the whole mapped range"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

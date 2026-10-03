@@ -1173,6 +1173,16 @@ only the CPU reads.
   counterpart are added to the canonical contract's §3 allowlist exactly like
   `unified_cache_raw_malloc_host`, with a line saying the memory is locked, so
   no other file calls `mmap`/`mlock` for it (P1).
+  **As built (T1a):** the wrapper TU `host-cpu-mapping.cpp` is device-free and is
+  compiled on every platform (the backend globs its sources), so its POSIX body
+  sits under `#if !defined(_WIN32)` with a refusing stub (`UNSUPPORTED`, nothing
+  mapped, `host_cpu_supported()` false), the 5efe C2 Windows ruling applied to
+  the second wrapper; the sizing function and the refusal text sit outside the
+  guard because the plan's HOST terms use the sizing function everywhere. The
+  lock-failure unwind and the release both go through one `host_cpu_munmap`,
+  which is the TU's only `munmap` and carries the private test counter; the
+  raw-mapping allowlist gate pins the TU to one `mmap`, one `munmap`, one
+  `mlock` and one `madvise`.
 - **Why locked host memory and not the pinned path.** Pinned USM host memory
   would also be resident, but the driver maps it into both devices' VMs for a
   table no GPU may read (P3), and it rides the pinned pool's 2 GiB chunking.
