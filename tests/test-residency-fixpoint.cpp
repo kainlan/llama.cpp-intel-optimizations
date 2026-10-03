@@ -33,7 +33,18 @@
 //        or measures it: R0 = {2,0,0} is measured over {1,0,0} and converges in one MEASURE, not two;
 //   (17) the verify asks the probe nothing more: the last round's answer is the raw probe over T*;
 //   (18) the same normalisation holds for a verify answer: a probe that marks a layer with a 2 is accepted
-//        at the same residency as one that marks it with a 1, and the result carries 0/1 bytes.
+//        at the same residency as one that marks it with a 1, and the result carries 0/1 bytes;
+//   (19) llama.cpp-71hq, the probe's failure channel: a probe that cannot answer (NOT_ANSWERED, REFUSED, or a
+//        status this build does not know) at the initial call is PROBE_FAILED, never a convergence, even when the
+//        residency it carries is all zero (the answer "every layer is device-resident");
+//   (20) the same at a later round, after one demotion;
+//   (21) the same at the verify's re-probe over the shrunk tenants;
+//   (22) PROBE_FAILED carries the site and the backend's reason, publishes nothing and asks nothing more;
+//   (23) a non-OK status wins over a wrong-length residency (PROBE_FAILED, not BUG), and an OK answer of the
+//        wrong length stays BUG;
+//   (24) a value-initialised answer (`{}`) is NOT_ANSWERED and refuses;
+//   (25) the constructor's side: every status but OK is a refusal (PROBE_FAILED, BUG, MEASURE_FAILED and a status
+//        this build does not know), and the refusal text is greppable and carries the reason.
 
 #include "../src/llama-residency-fixpoint.h"
 #include "ggml-sycl-cohort.h"  // GGML_SYCL_CONTEXT_COHORT_COMPUTE, named here, not reached transitively
@@ -93,6 +104,9 @@ static llama_residency residency_of(const llama_tenants & t, size_t n_layer) {
 struct stub {
     size_t                                                n_layer = 0;
     std::function<llama_residency(const llama_tenants *)> probe_fn;
+    // the probe's status for the call (0-based, over every call); unset: every call is answered OK
+    std::function<llama_residency_probe_status(int, const llama_tenants *)> status_fn;
+    std::string                                                             status_reason = "stub reason";
     std::vector<llama_residency>                          measured_over;
     int                                                   probe_calls = 0;
     bool                                                  measure_ok  = true;
@@ -103,8 +117,14 @@ static llama_residency_fixpoint_result run(stub & s) {
     return llama_residency_fixpoint(
         s.n_layer,
         [&](const llama_tenants * t) {
-            s.probe_calls++;
-            return s.probe_fn(t);
+            const int                    call = s.probe_calls++;
+            llama_residency_probe_answer a;
+            a.status    = s.status_fn ? s.status_fn(call, t) : LLAMA_RESIDENCY_PROBE_OK;
+            a.residency = s.probe_fn(t);
+            if (a.status != LLAMA_RESIDENCY_PROBE_OK) {
+                a.reason = s.status_reason;
+            }
+            return a;
         },
         [&](const llama_residency & r, llama_tenants & out) {
             s.measured_over.push_back(r);
@@ -393,6 +413,242 @@ static void test_non_binary_verify_answer() {
     CHECK((r.residency == llama_residency{ 0, 1, 0 }));
 }
 
+// the statuses a probe that cannot answer may carry: the two the enum names, and one this build does not know
+static const llama_residency_probe_status k_not_ok[] = {
+    LLAMA_RESIDENCY_PROBE_NOT_ANSWERED,
+    LLAMA_RESIDENCY_PROBE_REFUSED,
+    (llama_residency_probe_status) 7,
+};
+
+// the setup of (10a): R0 = {0,1,1}, every answer over tenants is {0,1,0} when measured over {0,1,1}, else the
+// residency it was measured over. The converged round is the first, so the verify's re-probe is call 2.
+static llama_residency probe_shrinking(const llama_tenants * t) {
+    if (t == nullptr) {
+        return llama_residency{ 0, 1, 1 };
+    }
+    const llama_residency over = residency_of(*t, 3);
+    return over == llama_residency{ 0, 1, 1 } ? llama_residency{ 0, 1, 0 } : over;
+}
+
+static void test_probe_status_initial() {
+    // (19): the probe holds nothing and says so; the residency it carries is the all-zero one a probe that
+    // answered "no host layer" would give, which is what the fixpoint used to read it as
+    for (const auto st : k_not_ok) {
+        stub s;
+        s.n_layer  = 3;
+        s.probe_fn = [](const llama_tenants *) {
+            return llama_residency(3, 0);
+        };
+        s.status_fn = [st](int, const llama_tenants *) {
+            return st;
+        };
+        const auto r = run(s);
+        CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_PROBE_FAILED);
+        CHECK(r.status != LLAMA_RESIDENCY_FIXPOINT_OK);
+        CHECK(r.reason.find("did not answer") != std::string::npos);
+        CHECK(r.reason.find("initial") != std::string::npos);
+        CHECK(r.reason.find("stub reason") != std::string::npos);
+        CHECK(r.residency.empty());
+        CHECK(r.tenants.empty());
+        CHECK(s.probe_calls == 1);
+        CHECK(s.measured_over.empty());
+    }
+}
+
+static void test_probe_status_round() {
+    // (20): R0 = {0,1,0}; the first round answers {0,1,1} (one demotion); the second round cannot answer
+    for (const auto st : k_not_ok) {
+        stub s;
+        s.n_layer  = 3;
+        s.probe_fn = [](const llama_tenants * t) {
+            if (t == nullptr) {
+                return llama_residency{ 0, 1, 0 };
+            }
+            const llama_residency over = residency_of(*t, 3);
+            return over == llama_residency{ 0, 1, 0 } ? llama_residency{ 0, 1, 1 } : llama_residency(3, 0);
+        };
+        s.status_fn = [st](int call, const llama_tenants *) {
+            return call == 2 ? st : LLAMA_RESIDENCY_PROBE_OK;
+        };
+        const auto r = run(s);
+        CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_PROBE_FAILED);
+        CHECK(r.reason.find("did not answer") != std::string::npos);
+        CHECK(r.reason.find("round") != std::string::npos);
+        CHECK(r.residency.empty());
+        CHECK(r.tenants.empty());
+        CHECK(s.probe_calls == 3);
+        CHECK(s.measured_over.size() == 2);
+    }
+    // and the first round alone, where the all-zero answer would converge on R0
+    for (const auto st : k_not_ok) {
+        stub s;
+        s.n_layer  = 3;
+        s.probe_fn = [](const llama_tenants * t) {
+            return t == nullptr ? llama_residency{ 0, 1, 0 } : llama_residency(3, 0);
+        };
+        s.status_fn = [st](int call, const llama_tenants *) {
+            return call == 1 ? st : LLAMA_RESIDENCY_PROBE_OK;
+        };
+        const auto r = run(s);
+        CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_PROBE_FAILED);
+        CHECK(r.reason.find("round") != std::string::npos);
+        CHECK(s.probe_calls == 2);
+        CHECK(s.measured_over.size() == 1);
+    }
+}
+
+static void test_probe_status_verify() {
+    // (21): the setup of (10a) makes the verify's re-probe the third call (R0, the round, the verify); it
+    // answers all zero and says it cannot, where the old code read all zero as "the shrunk set is kept"
+    for (const auto st : k_not_ok) {
+        stub s;
+        s.n_layer  = 3;
+        s.probe_fn = [](const llama_tenants * t) {
+            if (t != nullptr && residency_of(*t, 3) == llama_residency{ 0, 1, 0 }) {
+                return llama_residency(3, 0);
+            }
+            return probe_shrinking(t);
+        };
+        s.status_fn = [st](int call, const llama_tenants *) {
+            return call == 2 ? st : LLAMA_RESIDENCY_PROBE_OK;
+        };
+        const auto r = run(s);
+        CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_PROBE_FAILED);
+        CHECK(r.reason.find("did not answer") != std::string::npos);
+        CHECK(r.reason.find("verify") != std::string::npos);
+        CHECK(r.residency.empty());
+        CHECK(r.tenants.empty());
+        CHECK(s.probe_calls == 3);
+        CHECK(s.measured_over.size() == 2);
+    }
+    // the same stub with every call OK is the verify of (10a): the control, so the call numbering above is
+    // proved and not assumed
+    {
+        stub s;
+        s.n_layer    = 3;
+        s.probe_fn   = probe_shrinking;
+        const auto r = run(s);
+        CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_OK);
+        CHECK(r.verify_shrunk);
+        CHECK(s.probe_calls == 3);
+    }
+}
+
+static void test_probe_status_reason() {
+    // (22): an empty backend reason still gives a reason, and the reason the backend gave is carried
+    {
+        stub s;
+        s.n_layer  = 3;
+        s.probe_fn = [](const llama_tenants *) {
+            return llama_residency(3, 0);
+        };
+        s.status_fn = [](int, const llama_tenants *) {
+            return LLAMA_RESIDENCY_PROBE_REFUSED;
+        };
+        s.status_reason = "";
+        const auto r    = run(s);
+        CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_PROBE_FAILED);
+        CHECK(!r.reason.empty());
+        CHECK(r.reason.find("did not answer") != std::string::npos);
+    }
+    {
+        stub s;
+        s.n_layer  = 3;
+        s.probe_fn = [](const llama_tenants *) {
+            return llama_residency(3, 0);
+        };
+        s.status_fn = [](int, const llama_tenants *) {
+            return LLAMA_RESIDENCY_PROBE_NOT_ANSWERED;
+        };
+        s.status_reason = "geometry not wired";
+        const auto r    = run(s);
+        CHECK(r.reason.find("geometry not wired") != std::string::npos);
+    }
+}
+
+static void test_probe_status_before_length() {
+    // (23): a refusing probe whose residency is the wrong length is PROBE_FAILED (the status is read first), and
+    // an OK answer of the wrong length is still BUG, at the initial call and at a round
+    for (const auto st : k_not_ok) {
+        stub s;
+        s.n_layer  = 3;
+        s.probe_fn = [](const llama_tenants *) {
+            return llama_residency(2, 0);
+        };
+        s.status_fn = [st](int, const llama_tenants *) {
+            return st;
+        };
+        CHECK(run(s).status == LLAMA_RESIDENCY_FIXPOINT_PROBE_FAILED);
+    }
+    {
+        stub s;
+        s.n_layer  = 3;
+        s.probe_fn = [](const llama_tenants *) {
+            return llama_residency(2, 0);
+        };
+        CHECK(run(s).status == LLAMA_RESIDENCY_FIXPOINT_BUG);
+    }
+    {
+        stub s;
+        s.n_layer  = 3;
+        s.probe_fn = [](const llama_tenants * t) {
+            return t == nullptr ? llama_residency(3, 0) : llama_residency(2, 0);
+        };
+        CHECK(run(s).status == LLAMA_RESIDENCY_FIXPOINT_BUG);
+    }
+}
+
+static void test_probe_default_answer() {
+    // (24): a probe that returns `{}` has said nothing, and the default status is the refusing one
+    CHECK(llama_residency_probe_answer().status == LLAMA_RESIDENCY_PROBE_NOT_ANSWERED);
+    CHECK(llama_residency_probe_answer().status != LLAMA_RESIDENCY_PROBE_OK);
+    int        calls = 0;
+    const auto r     = llama_residency_fixpoint(
+        3,
+        [&](const llama_tenants *) {
+            calls++;
+            return llama_residency_probe_answer{};
+        },
+        [](const llama_residency &, llama_tenants &) { return true; });
+    CHECK(r.status == LLAMA_RESIDENCY_FIXPOINT_PROBE_FAILED);
+    CHECK(calls == 1);
+}
+
+static void test_refusal_helpers() {
+    // (25)
+    CHECK(!llama_residency_fixpoint_refused(LLAMA_RESIDENCY_FIXPOINT_OK));
+    CHECK(llama_residency_fixpoint_refused(LLAMA_RESIDENCY_FIXPOINT_PROBE_FAILED));
+    CHECK(llama_residency_fixpoint_refused(LLAMA_RESIDENCY_FIXPOINT_MEASURE_FAILED));
+    CHECK(llama_residency_fixpoint_refused(LLAMA_RESIDENCY_FIXPOINT_BUG));
+    CHECK(llama_residency_fixpoint_refused((llama_residency_fixpoint_status) 99));
+
+    // the text for the result of a probe that could not answer, end to end
+    stub s;
+    s.n_layer  = 3;
+    s.probe_fn = [](const llama_tenants *) {
+        return llama_residency(3, 0);
+    };
+    s.status_fn = [](int, const llama_tenants *) {
+        return LLAMA_RESIDENCY_PROBE_REFUSED;
+    };
+    s.status_reason        = "geometry not wired";
+    const auto        r    = run(s);
+    const std::string text = llama_residency_fixpoint_refusal_text(r);
+    CHECK(text.rfind("SYCL residency fixpoint refused: ", 0) == 0);
+    CHECK(text.find("did not answer") != std::string::npos);
+    CHECK(text.find("geometry not wired") != std::string::npos);
+
+    // an OK result has no refusal text
+    stub ok;
+    ok.n_layer  = 3;
+    ok.probe_fn = [](const llama_tenants * t) {
+        return t == nullptr ? llama_residency(3, 0) : residency_of(*t, 3);
+    };
+    const auto rok = run(ok);
+    CHECK(rok.status == LLAMA_RESIDENCY_FIXPOINT_OK);
+    CHECK(llama_residency_fixpoint_refusal_text(rok).empty());
+}
+
 int main() {
     test_decision();
     test_no_demotion();
@@ -407,6 +663,13 @@ int main() {
     test_no_layers();
     test_non_binary_probe_byte();
     test_non_binary_verify_answer();
+    test_probe_status_initial();
+    test_probe_status_round();
+    test_probe_status_verify();
+    test_probe_status_reason();
+    test_probe_status_before_length();
+    test_probe_default_answer();
+    test_refusal_helpers();
     if (n_failed != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", n_failed);
         return 1;
