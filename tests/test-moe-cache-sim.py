@@ -375,9 +375,9 @@ def test_cxx_tool_selftest_writes_a_trace_the_simulator_reads(tmp_path):
                        capture_output=True, text=True, check=False)
     assert r.returncode == 0, r.stdout + r.stderr
     t = sim.read_trace(out)
-    # selftest: a [256, 3] I32 parent viewed as [8, 3] (strided rows) for layer
-    # 7, then a contiguous [4, 2] for layer 9; parent row r, col c holds
-    # 1000 * (r + 1) % 256 + c is not used -- values are r * 11 + c.
+    # selftest: layer 7 is a [8, 3] strided view of a [256, 3] I32 parent
+    # (value r * 11 + c); layer 9 a contiguous [4, 2] tensor (value r * 5 + c);
+    # then layer 7 again, [8, 1], which must start a second step.
     assert t.header["selftest"] is True
     assert t.steps[0].layers[7] == [[r * 11 + c for c in range(8)] for r in range(3)]
     assert t.steps[0].layers[9] == [[r * 5 + c for c in range(4)] for r in range(2)]
