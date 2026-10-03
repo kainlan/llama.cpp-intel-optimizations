@@ -1720,6 +1720,14 @@ if (NOT WIN32)
         LABEL "sycl;python;script-gate"
         TIMEOUT 120
     )
+    # Parser for the qwen4exp MTP acceptance measurement (llama.cpp-0rhb): pure text, no device.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-qwen4exp-mtp-acceptance-parser.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "python;script-gate"
+        TIMEOUT 120
+    )
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-down-variant-profile-script.py
