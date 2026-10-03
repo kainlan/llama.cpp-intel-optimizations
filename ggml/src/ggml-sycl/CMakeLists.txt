@@ -174,6 +174,16 @@ if (BUILD_TESTING)
     add_test(NAME test-sycl-file-mapping-host COMMAND test-sycl-file-mapping-host)
     set_tests_properties(test-sycl-file-mapping-host PROPERTIES LABELS "sycl;host" SKIP_RETURN_CODE 77 TIMEOUT 60)
 
+    # The segment plan: a pure function of byte ranges, so this target links file-mapping.cpp alone (llama.cpp-5efe C3).
+    add_executable(test-sycl-file-mapping-segments
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-file-mapping-segments.cpp
+        file-mapping.cpp)
+    target_include_directories(test-sycl-file-mapping-segments PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(test-sycl-file-mapping-segments PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME test-sycl-file-mapping-segments COMMAND test-sycl-file-mapping-segments)
+    set_tests_properties(test-sycl-file-mapping-segments PROPERTIES LABELS "sycl;host" TIMEOUT 60)
+
     add_executable(test-sycl-lifecycle-load-txn
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-load-txn.cpp
         model-lifecycle.cpp)

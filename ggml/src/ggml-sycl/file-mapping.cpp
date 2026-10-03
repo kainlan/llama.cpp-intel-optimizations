@@ -145,6 +145,24 @@ file_map_status unified_cache_raw_lock_file_segments(const file_mapping &       
     return file_map_status::OK;
 }
 
+// RED stand-in (llama.cpp-5efe C3a): an empty plan.
+file_segment_plan file_mapping_segments(const std::vector<file_tensor_range> & tensor_ranges,
+                                        const std::vector<file_map_range> &    lazy_ranges,
+                                        uint64_t                               page,
+                                        uint64_t                               random_window) {
+    (void) tensor_ranges;
+    (void) lazy_ranges;
+    (void) page;
+    (void) random_window;
+    return {};
+}
+
+uint64_t file_mapping_random_window(uint64_t read_ahead_bytes, uint64_t page) {
+    (void) read_ahead_bytes;
+    (void) page;
+    return 0;
+}
+
 void unified_cache_raw_unmap_file(file_mapping * mapping) {
     if (mapping == nullptr || mapping->base == nullptr) {
         return;

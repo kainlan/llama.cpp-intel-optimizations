@@ -62,6 +62,45 @@ file_map_status unified_cache_raw_map_file(int                                 f
 file_map_status unified_cache_raw_lock_file_segments(const file_mapping &                mapping,
                                                      const std::vector<file_map_range> & lock_segments);
 
+// A tensor of one SYCL_Mapped buffer, as a byte range of the file. `host_executed` is the placement's answer for the
+// tensor (llama.cpp-5efe §4.6): a host-executed tensor is read by the CPU, so it is advised WILLNEED and, under
+// -lm mlock, locked; a device-only source is only staged through the mapping, once.
+struct file_tensor_range {
+    uint64_t file_offset   = 0;
+    uint64_t length        = 0;
+    bool     host_executed = false;
+};
+
+// The segment sets one buffer needs, from the tensors' byte ranges and the record's lazy (deferred) ranges.
+struct file_segment_plan {
+    // The union of the tensor ranges, each rounded OUTWARD to pages and merged. Never a complement: bytes that belong
+    // to no tensor of the buffer are never mapped. At most one lazy page is mapped per lazy edge (the shared page).
+    std::vector<file_map_range> map;
+    // The host-executed tensor ranges, rounded INWARD to pages, minus every page that holds a lazy byte. These are
+    // the WILLNEED segments and, under -lm mmap+mlock, the lock segments: one set, so an advice and a lock can never
+    // disagree about which pages are safe.
+    std::vector<file_map_range> willneed;
+    // For each lazy range, [lazy_begin - W, lazy_begin) and [lazy_end, lazy_end + W) widened to pages so the shared
+    // pages are inside, intersected with `map`: the MADV_RANDOM windows that stop fault read-around reaching a lazy
+    // page.
+    std::vector<file_map_range> random_windows;
+    // Empty on success. A tensor range that overlaps a lazy range is refused (the plan is then empty): a deferred
+    // table is never a SYCL_Mapped tensor.
+    const char * error = "";
+
+    bool ok() const { return error[0] == '\0'; }
+};
+
+// Pure: no I/O, no device. `page` is the page size; `random_window` is W, in bytes.
+file_segment_plan file_mapping_segments(const std::vector<file_tensor_range> & tensor_ranges,
+                                        const std::vector<file_map_range> &    lazy_ranges,
+                                        uint64_t                               page,
+                                        uint64_t                               random_window);
+
+// W = max(2 x read_ahead, 2 MiB), at least twice the fault read-around's reach, rounded up to whole pages.
+// `read_ahead_bytes` is the backing device's read_ahead_kb in bytes.
+uint64_t file_mapping_random_window(uint64_t read_ahead_bytes, uint64_t page);
+
 // The only release: ONE munmap of the whole reservation, then the dup is closed. Idempotent.
 void unified_cache_raw_unmap_file(file_mapping * mapping);
 
