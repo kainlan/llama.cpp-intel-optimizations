@@ -224,3 +224,9 @@ void llama_lazy_range_check_create(const llama_lazy_range_record & record,
                    name.c_str(), llm_arch_name(arch));
     }
 }
+
+void llama_lazy_range_check_storage(const llama_lazy_range_record & record, const std::string & name) {
+    // stand-in: refuses nothing
+    GGML_UNUSED(record);
+    GGML_UNUSED(name);
+}

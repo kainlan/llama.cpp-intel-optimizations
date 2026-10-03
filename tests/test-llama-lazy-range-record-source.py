@@ -202,13 +202,27 @@ def test_create_tensor_checks_the_record_and_refuses_storage_before_buft_for_ten
     assert "TENSOR_READ_LAZY" in args and "deferral" not in args, (
         "the drift check must compare the flag with membership, not with `deferral`"
     )
-    storage = re.search(r"LLAMA_LAZY_DEFERRAL_STORAGE", body)
-    assert storage, "create_tensor() has no STORAGE branch"
-    # the first real buft_for_tensor( call, after the lambda that defines it
+    # the refusal is a pure function driven by test-llama-lazy-range-prefill; here only its call
+    # site is pinned: the first statement of the TENSOR_READ_LAZY branch, with no extra conjunct
+    # (`!no_alloc && ...` would let the fit pass plan the 51 GB table as an ordinary weight)
+    assert re.search(
+        r"if\s*\(\s*flags\s*&\s*TENSOR_READ_LAZY\s*\)\s*\{\s*llama_lazy_range_check_storage\s*\(\s*lazy_record\s*,\s*tn\.str\(\)\s*\)\s*;",
+        body,
+    ), "create_tensor() does not refuse a STORAGE row as the first statement of its TENSOR_READ_LAZY branch"
+    call = re.search(r"llama_lazy_range_check_storage\s*\(", body)
     use = [m.start() for m in re.finditer(r"\bbuft_for_tensor\s*\(", body)]
-    assert use and storage.start() < use[-1], "the STORAGE refusal must precede the last buft_for_tensor() call"
-    branch = body[storage.start() : storage.start() + 400]
-    assert "throw" in branch, "the STORAGE branch does not refuse the tensor"
+    assert use and call.start() < use[-1], "the STORAGE refusal must precede the last buft_for_tensor() call"
+    assert "LLAMA_LAZY_DEFERRAL_STORAGE" not in body, "create_tensor() decides STORAGE itself, not through the refusal function"
+
+
+def test_the_storage_refusal_function_throws_on_exactly_a_storage_row():
+    body = function_body(
+        read_code(RECORD_CPP), r"void\s+llama_lazy_range_check_storage\s*\((?:[^()]|\([^()]*\))*\)"
+    )
+    assert re.search(r"if\s*\(\s*record\s*\.\s*deferral\s*\(\s*name\s*\)\s*==\s*LLAMA_LAZY_DEFERRAL_STORAGE\s*\)", body), (
+        "the refusal is not conditioned on exactly `record.deferral(name) == LLAMA_LAZY_DEFERRAL_STORAGE`"
+    )
+    assert "throw" in body, "the refusal does not throw"
 
 
 # ---- 7. the early plan ----

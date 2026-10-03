@@ -140,3 +140,10 @@ void llama_lazy_range_check_create(const llama_lazy_range_record & record,
                                    enum llm_arch                   arch,
                                    const std::string &             name,
                                    bool                            flagged);
+
+// The STORAGE refusal of create_tensor(): a TENSOR_READ_LAZY tensor whose row is
+// STORAGE belongs to the SYCL storage tier, and this tree has no consumer for it, so
+// the load refuses it by throwing std::runtime_error naming the tensor, before
+// buft_for_tensor() can make it an ordinary input-layer weight in host memory. Silent
+// on a LAZY_READ or EAGER row; aborts on a name without a row.
+void llama_lazy_range_check_storage(const llama_lazy_range_record & record, const std::string & name);

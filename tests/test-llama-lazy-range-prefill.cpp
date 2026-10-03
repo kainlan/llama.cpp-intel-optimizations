@@ -12,7 +12,9 @@
 //     that compares the flag only against non-EAGER rows lets both through;
 //   - value(name) equals the weight's (file, offset, size);
 //   - with the taker, the early plan's filter includes an ineligible row (AUTO at
-//     4 GiB, OFF) as the ordinary weight it is and excludes the eligible one.
+//     4 GiB, OFF) as the ordinary weight it is and excludes the eligible one;
+//   - create_tensor()'s STORAGE refusal throws, naming the tensor, on a STORAGE row
+//     and on that row alone: a LAZY_READ and an EAGER row pass it.
 //
 // Host-only: no backend, device or model.
 
@@ -24,6 +26,7 @@
 
 #include <csignal>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -160,6 +163,52 @@ int main() {
               "taker, mode %d: the filter excluded an ineligible row (AUTO at 4 GiB / OFF)", (int) mode);
         CHECK(llama_lazy_early_plan_excludes(rec, lazy) == (mode == LLAMA_LAZY_MODE_AUTO),
               "taker, mode %d: the filter decision on the 5 GiB table is wrong", (int) mode);
+    }
+
+    // the STORAGE refusal: a STORAGE row throws naming the tensor; LAZY_READ and EAGER rows pass
+    {
+        struct cell {
+            const char *    label;
+            llama_lazy_mode mode;
+            bool            taker;
+            bool            refused;  // of the 5 GiB table
+        };
+
+        const cell cells[] = {
+            { "ON, the taker (STORAGE)",                             LLAMA_LAZY_MODE_ON,   true,  true  },
+            { "AUTO, the taker (STORAGE: 5 GiB is above the floor)", LLAMA_LAZY_MODE_AUTO, true,  true  },
+            { "OFF, the taker (EAGER)",                              LLAMA_LAZY_MODE_OFF,  true,  false },
+            { "ON, off the taker (LAZY_READ)",                       LLAMA_LAZY_MODE_ON,   false, false },
+            { "OFF, off the taker (EAGER)",                          LLAMA_LAZY_MODE_OFF,  false, false },
+        };
+        for (const cell & c : cells) {
+            llama_lazy_range_record rec;
+            llama_lazy_range_record_prefill(rec, arch, hp, declared, fx.finder(), c.mode, c.mode, c.taker, true);
+
+            bool        threw = false;
+            std::string what;
+            try {
+                llama_lazy_range_check_storage(rec, lazy);
+            } catch (const std::runtime_error & e) {
+                threw = true;
+                what  = e.what();
+            }
+            CHECK(threw == c.refused, "%s: the STORAGE refusal %s", c.label, threw ? "fired" : "did not fire");
+            CHECK(!threw || what.find(lazy) != std::string::npos, "%s: the refusal does not name the tensor: %s",
+                  c.label, what.c_str());
+
+            // an EAGER row (the 4 GiB table is ineligible under AUTO and OFF) never refuses
+            bool threw_eager = false;
+            try {
+                llama_lazy_range_check_storage(rec, unflagged);
+            } catch (const std::runtime_error &) {
+                threw_eager = true;
+            }
+            const bool unflagged_is_storage = rec.deferral(unflagged) == LLAMA_LAZY_DEFERRAL_STORAGE;
+            CHECK(threw_eager == unflagged_is_storage,
+                  "%s: the refusal on the 4 GiB row (%s) disagrees with its deferral", c.label,
+                  llama_lazy_deferral_name(rec.deferral(unflagged)));
+        }
     }
 
     if (n_failures != 0) {
