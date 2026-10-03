@@ -2,8 +2,8 @@
 
 `mmap`, `munmap`, `mlock` and `madvise` are the calls that make, lock and release address space the unified cache must
 own. The FILE_MAPPED tier (docs/design/sycl-mmap-host-tier.md §4.1) keeps them in one device-free translation unit,
-ggml/src/ggml-sycl/file-mapping.cpp, behind three wrappers (`unified_cache_raw_map_file`,
-`unified_cache_raw_lock_file_segments`, `unified_cache_raw_unmap_file`). An allowlist entry in the canonical contract
+ggml/src/ggml-sycl/file-mapping.cpp, behind four wrappers (`unified_cache_raw_map_file`,
+`unified_cache_raw_lock_file_segments`, `unified_cache_raw_advise_file_segments`, `unified_cache_raw_unmap_file`). An allowlist entry in the canonical contract
 does not enforce itself, so this gate does:
 
 1. it tokenizes first: comments, string literals and character literals are stripped, then `\\b(mmap|munmap|mlock|
@@ -11,7 +11,7 @@ does not enforce itself, so this gate does:
    real `mmap (` with a space is. A fixture of those forms is part of this test;
 2. every call in ggml/src/ggml-sycl/ must sit in a listed site: the file-mapping TU (any), or one of today's eight
    sites, pinned by file and by call count (a ninth call in a listed file is as much a new site as one in a new file);
-3. the canonical contract's §3 allowlist names the three wrappers.
+3. the canonical contract's §3 allowlist names the four wrappers.
 
 th32 T1's HOST_CPU wrapper adds its own entry to ALLOWED when it lands; the gate is shared with it.
 """
@@ -136,13 +136,14 @@ def test_the_wrapper_tu_exists_and_includes_no_sycl_header():
         assert not re.search(r"#\s*include\s*[<\"](sycl|dpct)", text), f"{path.name} includes a SYCL header"
 
 
-def test_the_canonical_contract_allowlists_the_three_wrappers():
+def test_the_canonical_contract_allowlists_the_four_wrappers():
     text = CONTRACT.read_text()
     section = text[text.index("## 3. Allocator Entry Points (Allowlist)") : text.index("## 4. Pointer-Resolution")]
     for name in (
         "unified_cache_raw_map_file",
         "unified_cache_raw_lock_file_segments",
         "unified_cache_raw_unmap_file",
+        "unified_cache_raw_advise_file_segments",
     ):
         assert name in section, f"the canonical contract §3 allowlist does not name {name}"
 

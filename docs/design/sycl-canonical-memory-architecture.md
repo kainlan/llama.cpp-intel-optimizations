@@ -348,6 +348,7 @@ these or be migrated (see §9 for temporary allowlisted sites):
 | `unified_cache_raw_malloc_shared(size, queue)` | Raw `sycl::malloc_shared` wrapper — call only from inside `unified_cache` internals | `void *` |
 | `unified_cache_raw_map_file(fd, file_size, reservation, segments, out)` | Raw file-mapping wrapper (`ggml/src/ggml-sycl/file-mapping.cpp`, a device-free TU): one `PROT_NONE` reservation with `MAP_FIXED` file segments over it, from a `dup` of the loader's fd. Call only from the `FILE_MAPPED` owner's front door, `unified_allocate_file_mapping` | `file_map_status` |
 | `unified_cache_raw_lock_file_segments(mapping, lock_segments)` | The only `mlock` of a file mapping: one call per inward-rounded segment, never widened | `file_map_status` |
+| `unified_cache_raw_advise_file_segments(mapping, segments, advice)` | The only `madvise` of a file mapping: `WILLNEED` (in 1 MiB chunks, since the kernel caps one call) and the `RANDOM` edge windows, never widened | `file_map_status` |
 | `unified_cache_raw_unmap_file(mapping)` | The only release of a file mapping: one `munmap` of the whole reservation, then the `dup` is closed | `void` |
 
 **Rule:** `sycl::malloc_device`, `sycl::malloc_host`, and `sycl::malloc_shared` must

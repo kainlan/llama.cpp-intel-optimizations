@@ -280,13 +280,37 @@ uint64_t file_mapping_random_window(uint64_t read_ahead_bytes, uint64_t page) {
     return page == 0 ? w : page_ceil(w, page);
 }
 
-// RED stand-in (llama.cpp-5efe C3b): validates nothing and advises nothing.
 file_map_status unified_cache_raw_advise_file_segments(const file_mapping &                mapping,
                                                        const std::vector<file_map_range> & segments,
                                                        file_advice                         advice) {
-    (void) mapping;
-    (void) segments;
-    (void) advice;
+    if (mapping.base == nullptr) {
+        return file_map_status::INVALID_ARGUMENT;
+    }
+    const uint64_t page = file_map_page_size();
+    const uint64_t lo   = mapping.file_offset;
+    const uint64_t hi   = mapping.file_offset + mapping.length;
+
+    // Validated first, like the lock: a refused set advises nothing, and a range is never widened, because an advice
+    // that reached a neighbouring page would reach a lazy one.
+    for (const file_map_range & seg : segments) {
+        if (seg.length == 0 || seg.file_offset % page != 0 || seg.length % page != 0 || seg.file_offset < lo ||
+            seg.file_end() < seg.file_offset || seg.file_end() > hi) {
+            return file_map_status::INVALID_ARGUMENT;
+        }
+    }
+    const int      flag  = advice == file_advice::WILLNEED ? MADV_WILLNEED : MADV_RANDOM;
+    // The kernel caps how much one MADV_WILLNEED reads ahead (a single call over a 56 MiB segment populates only its
+    // first few MiB, measured), so a WILLNEED segment is advised in chunks: advising a segment must mean prefetching
+    // all of it. The chunks stay inside the segment, so no advice reaches a page outside it.
+    const uint64_t chunk = advice == file_advice::WILLNEED ? 1024 * 1024 / page * page : ~0ull;
+    for (const file_map_range & seg : segments) {
+        for (uint64_t done = 0; done < seg.length; done += chunk) {
+            const uint64_t n = std::min(chunk, seg.length - done);
+            if (madvise((char *) mapping.base + (seg.file_offset - lo + done), (size_t) n, flag) != 0) {
+                return file_map_status::ADVISE_FAILED;  // errno names why
+            }
+        }
+    }
     return file_map_status::OK;
 }
 
