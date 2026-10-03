@@ -1483,6 +1483,12 @@ struct sycl_device_info {
     // 19 MB model). Budget computations must consult this before taking a
     // percentage of `total_vram`/`global_mem_size` for such a device.
     bool            host_unified_memory  = false;
+    // True only when the host_unified_memory query above returned. A device
+    // whose query throws is "not known", not "discrete": mmap_support (the
+    // caps restore of llama.cpp-5efe C1) requires it, so an iGPU whose query
+    // throws does not advertise mmap. The VRAM budget keeps reading
+    // host_unified_memory alone, with its existing treat-as-discrete default.
+    bool            host_unified_known   = false;
     bool            supports_soa_reorder = false;  // Device capability: can use SoA weight layout
     XMXCapabilities xmx_caps;                      // XMX matrix engine capabilities (queried at init)
     char            device_name[256] = { 0 };      // Device name for GPU family detection
@@ -7630,6 +7636,10 @@ bool gpu_has_xmx(sycl::device & dev);
 // ggml_sycl_info() there can deadlock). Returns false (i.e. "treat as
 // discrete") if the query throws.
 bool ggml_sycl_device_is_host_unified(const sycl::device & dev);
+
+// The same query, reporting whether it returned: `known` is set true only when
+// get_info succeeded, and false when it threw (the return is then false too).
+bool ggml_sycl_device_query_host_unified(const sycl::device & dev, bool & known);
 
 // Portable (non-SYCL) queries of total/available system RAM in bytes.
 // Returns 0 if detection fails. Used to size VRAM budgets for host-unified

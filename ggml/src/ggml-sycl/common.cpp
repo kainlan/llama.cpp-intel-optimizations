@@ -824,12 +824,20 @@ void ggml_sycl_watchdog_stop() {
     }
 }
 
-bool ggml_sycl_device_is_host_unified(const sycl::device & dev) {
+bool ggml_sycl_device_query_host_unified(const sycl::device & dev, bool & known) {
     try {
-        return dev.get_info<sycl::info::device::host_unified_memory>();
+        const bool host_unified = dev.get_info<sycl::info::device::host_unified_memory>();
+        known                   = true;
+        return host_unified;
     } catch (...) {
+        known = false;
         return false;
     }
+}
+
+bool ggml_sycl_device_is_host_unified(const sycl::device & dev) {
+    bool known = false;
+    return ggml_sycl_device_query_host_unified(dev, known);
 }
 
 // Moved here (from a file-local static in unified-cache.cpp) so both the

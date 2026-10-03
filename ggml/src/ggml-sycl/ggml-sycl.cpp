@@ -25682,7 +25682,8 @@ static ggml_sycl_device_info ggml_sycl_init() {
         // so paths that must avoid ggml_sycl_info() reentry during static
         // init use ggml_sycl_device_is_host_unified() directly instead; this
         // cached copy is for the (safe, post-init) placement-plan path.
-        info.devices[i].host_unified_memory  = ggml_sycl_device_is_host_unified(device);
+        info.devices[i].host_unified_memory =
+            ggml_sycl_device_query_host_unified(device, info.devices[i].host_unified_known);
 
         // Store device name for GPU family detection (used for ESIMD limits)
         std::string name = device.get_info<sycl::info::device::name>();
@@ -109854,11 +109855,20 @@ static void ggml_backend_sycl_device_get_props(ggml_backend_dev_t dev, ggml_back
     // async disabled only inside the model-load guard so load_all_data falls
     // back to full-tensor set_tensor and the planned layout is materialized.
     const bool async = !g_sycl_in_model_load.load(std::memory_order_acquire);
-    props->caps      = {
+    // mmap_support follows the device: a discrete card maps the model file and the
+    // unified cache owns the mapping; an integrated GPU (system RAM is its
+    // "VRAM", llama.cpp-403s) stays off, as does a device whose host_unified
+    // query did not return. Upstream reports a flat true; leaving the field
+    // unset (value-initialised to false) dropped mmap and lazy loading for every
+    // SYCL load under the default load mode (llama.cpp-5efe).
+    ggml_backend_sycl_device_context * dev_ctx = (ggml_backend_sycl_device_context *) dev->context;
+    const auto &                       info    = ggml_sycl_info().devices[dev_ctx->device];
+    props->caps                                = {
         /* .async                 = */ async,
         /* .host_buffer           = */ host_buffer,
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ events,
+        /* .mmap_support          = */ info.host_unified_known && !info.host_unified_memory,
     };
 }
 
