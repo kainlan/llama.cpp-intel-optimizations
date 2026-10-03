@@ -71,6 +71,40 @@ def test_parses_the_summary_and_the_per_position_stats() -> None:
         assert abs(rec["decode_tps"] - 6.341) < 1e-9
 
 
+# Verbatim from the first real run (q4_n3_code, IQ3_XXS target, Q4_0 head, -lv 4): at that
+# verbosity every summary line carries a "<timestamp> I " log prefix, which the hand-written
+# fixture above does not have.  A parser that only accepts bare lines passes the fixture and
+# rejects every real log.
+REAL_PREFIXED_LOG = """\
+20.06.639.658 I encoded   58 tokens in   29.268 seconds, speed:    1.982 t/s
+20.06.639.660 I decoded  260 tokens in 1153.960 seconds, speed:    0.225 t/s
+20.06.639.660 I 
+20.06.639.660 I n_draft   = 3
+20.06.639.660 I n_predict = 260
+20.06.639.660 I n_drafted = 211
+20.06.639.660 I n_accept  = 189
+20.06.639.661 I accept    = 89.573%
+20.06.639.661 I 
+20.06.639.661 I draft:
+
+20.06.639.712 I spec common_specu: statistics        draft-mtp: #calls(b,g,a) =    1     71     71, #gen drafts =     71, #acc drafts =    68, #gen tokens =    211, #acc tokens =   189, #mean acc len = 3.66, #acc rate/pos = (0.958, 0.887, 0.817), dur(b,g,a) = 0.010, 11291.186, 0.491 ms
+"""
+
+
+def test_parses_a_log_whose_lines_carry_the_timestamp_log_prefix() -> None:
+    with tempfile.TemporaryDirectory() as tmp_raw:
+        log = pathlib.Path(tmp_raw) / "q4_n3_code.log"
+        log.write_text(REAL_PREFIXED_LOG, encoding="utf-8")
+        result = run(log, extra=["--json"])
+        assert result.returncode == 0, result.stdout
+        rec = json.loads(result.stdout)["arms"][0]
+        assert (rec["n_draft"], rec["n_predict"], rec["n_drafted"], rec["n_accept"]) == (3, 260, 211, 189)
+        assert rec["mean_len"] == 3.66
+        assert rec["mean_len_source"] == "stats"
+        assert rec["acc_rate_per_pos"] == [0.958, 0.887, 0.817]
+        assert abs(rec["decode_tps"] - 0.225) < 1e-9
+
+
 def test_without_the_stats_line_the_mean_length_is_derived_and_labelled() -> None:
     with tempfile.TemporaryDirectory() as tmp_raw:
         log = pathlib.Path(tmp_raw) / "q4_n3_chat.log"

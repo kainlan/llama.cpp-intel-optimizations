@@ -26,7 +26,11 @@
 #   HEAD_Q8  Q8_0 MTP head        [/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf]
 #   HEAD_Q4  Q4_0 MTP head        [/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_0.gguf]
 #   OUT      log directory        [./qwen4exp-mtp-acceptance-out]
-#   SETS [base p05], N_PREDICT, CTX, UBATCH, THREADS (unset = binary default)
+#   SETS [base p05], N_PREDICT, CTX, UBATCH
+#   THREADS  CPU threads, passed as -t/-tb and -td/-tbd [16].  The binary's own default
+#            was 4 threads on this 24-core host: 0.225 t/s, ~20 min per arm.
+#   WARM     1 = once, before the first arm, cat every shard of the target and the
+#            heads to /dev/null so the page cache is warm [0]
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -38,6 +42,8 @@ OUT=${OUT:-$PWD/qwen4exp-mtp-acceptance-out}
 N_PREDICT=${N_PREDICT:-256}
 CTX=${CTX:-4096}
 UBATCH=${UBATCH:-512}
+THREADS=${THREADS:-16}
+WARM=${WARM:-0}
 PROMPTS_DIR=$ROOT/scripts/qwen4exp-mtp-prompts
 PARSER=$ROOT/scripts/parse-qwen4exp-mtp-acceptance.py
 
@@ -68,7 +74,7 @@ arm_cmd() { # prints the command for one arm, one argument per line
         --spec-type draft-mtp --spec-draft-n-max "$k" \
         -f "$PROMPTS_DIR/$prompt.txt" -n "$N_PREDICT" --seed 42 --temp 0 \
         -c "$CTX" -ub "$UBATCH" -ngl 0 -lzm on -lv 4
-    [ -n "${THREADS:-}" ] && printf '%s\n' -t "$THREADS"
+    printf '%s\n' -t "$THREADS" -tb "$THREADS" -td "$THREADS" -tbd "$THREADS"
     [ -n "$pmin" ] && printf '%s\n' --spec-draft-p-min "$pmin"
     return 0
 }
@@ -109,6 +115,13 @@ echo "uptime: $(uptime)"
 echo "start:  $(meminfo)"
 
 mkdir -p "$OUT"
+if [ "$WARM" = 1 ]; then
+    # every shard of the split target (<stem>-NNNNN-of-MMMMM.gguf) plus both heads
+    shards=("${TARGET%-*-of-*.gguf}"-*-of-*.gguf "$HEAD_Q8" "$HEAD_Q4")
+    echo "warming page cache: ${#shards[@]} files ($(date +%H:%M:%S))"
+    cat "${shards[@]}" > /dev/null || { echo "warm-up read failed" >&2; exit 1; }
+    echo "warmed ($(date +%H:%M:%S)): $(meminfo)"
+fi
 logs=()
 for arm in $ARMS; do
     mapfile -t cmd < <(arm_cmd "$arm") || exit 1

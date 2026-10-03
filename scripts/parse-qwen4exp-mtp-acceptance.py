@@ -26,6 +26,8 @@ import re
 import sys
 
 INT_FIELDS = ("n_draft", "n_predict", "n_drafted", "n_accept")
+# at -lv 4 every line carries a "<s>.<ms>.<us>.<ns> <level> " log prefix; at default verbosity none does
+LOG_PREFIX = r"^(?:\d+\.\d+\.\d+\.\d+ [A-Z] )?"
 STATS_RE = re.compile(r"#mean acc len = ([0-9.]+)(?:, #acc rate/pos = \(([^)]*)\))?")
 DECODE_RE = re.compile(r"decoded\s+(\d+) tokens in\s+([0-9.]+) seconds, speed:\s+([0-9.]+) t/s")
 
@@ -38,7 +40,7 @@ def parse_log(path: pathlib.Path) -> dict:
     text = path.read_text(encoding="utf-8", errors="replace")
     rec: dict = {"arm": path.stem}
     for name in INT_FIELDS:
-        m = re.search(r"^%s\s*= (\d+)\s*$" % name, text, re.M)
+        m = re.search(LOG_PREFIX + r"%s\s*= (\d+)\s*$" % name, text, re.M)
         if not m:
             raise LogError("%s: no '%s' line (the run did not reach the speculative summary)" % (path.name, name))
         rec[name] = int(m.group(1))
