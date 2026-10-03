@@ -120,6 +120,71 @@ static int test_touching_host_tensors_share_a_willneed_page() {
     return 0;
 }
 
+// A tensor narrower than W after the lazy range: the window past the lazy end must be cut to what is mapped, because
+// an advice that reached outside the reservation is refused as a whole.
+static int test_windows_are_cut_to_the_map() {
+    const file_segment_plan p =
+        file_mapping_segments({ T(0, 40000, true), T(100000, 101000, true) }, { R(40000, 100000) }, P, W);
+    CHECK(p.ok(), "a narrow tensor after the lazy range was refused");
+    CHECK(same(p.map, { R(0, 40960), R(98304, 102400) }, "map"), "map segments");
+    CHECK(same(p.random_windows, { R(28672, 40960), R(98304, 102400) }, "random"),
+          "a window reached past the mapped bytes");
+    return 0;
+}
+
+// A lazy range whose edges are page aligned has no shared page: the neighbours are advised to their own edge.
+static int test_page_aligned_lazy_range() {
+    const file_segment_plan p =
+        file_mapping_segments({ T(0, 40960, true), T(102400, 143360, true) }, { R(40960, 102400) }, P, W);
+    CHECK(p.ok(), "a page-aligned lazy range was refused");
+    CHECK(same(p.map, { R(0, 40960), R(102400, 143360) }, "map"), "map segments");
+    CHECK(same(p.willneed, { R(0, 40960), R(102400, 143360) }, "willneed"), "a page-aligned edge lost a page");
+    CHECK(same(p.random_windows, { R(32768, 40960), R(102400, 110592) }, "random"), "page-aligned windows");
+    return 0;
+}
+
+// The tensor list's order is not the plan's: any order gives the same plan.
+static int test_unsorted_input() {
+    const file_segment_plan sorted =
+        file_mapping_segments({ T(0, 40000, true), T(100000, 140000, true) }, { R(40000, 100000) }, P, W);
+    const file_segment_plan shuffled =
+        file_mapping_segments({ T(100000, 140000, true), T(0, 40000, true) }, { R(40000, 100000) }, P, W);
+    CHECK(shuffled.ok(), "unsorted tensors were refused");
+    CHECK(same(shuffled.map, sorted.map, "unsorted map"), "unsorted map");
+    CHECK(same(shuffled.willneed, sorted.willneed, "unsorted willneed"), "unsorted willneed");
+    CHECK(same(shuffled.random_windows, sorted.random_windows, "unsorted random"), "unsorted windows");
+    return 0;
+}
+
+// GGUF pads tensors to 32 B, so two host tensors usually straddle a page with a few padding bytes between them. That
+// page holds no lazy byte and no device-only byte, so it is advised (and locked) like the rest of the host set.
+static int test_padded_host_tensors_share_a_willneed_page() {
+    const file_segment_plan p = file_mapping_segments({ T(0, 5000, true), T(5020, 12000, true) }, {}, P, W);
+    CHECK(p.ok(), "padded host tensors were refused");
+    CHECK(same(p.willneed, { R(0, 8192) }, "willneed"), "the page two padded host tensors share was left unadvised");
+    return 0;
+}
+
+// ...but only across a gap that holds nothing of anybody else, and shorter than a page.
+static int test_the_gap_merge_stops_at_other_bytes() {
+    // a lazy byte in the gap
+    const file_segment_plan lazy_gap =
+        file_mapping_segments({ T(0, 5000, true), T(5020, 12000, true) }, { R(5000, 5020) }, P, W);
+    CHECK(lazy_gap.ok(), "a lazy gap was refused");
+    CHECK(same(lazy_gap.willneed, { R(0, 4096) }, "willneed"), "a gap holding lazy bytes was merged across");
+    // a device-only tensor in the gap
+    const file_segment_plan device_gap =
+        file_mapping_segments({ T(0, 5000, true), T(5000, 5020, false), T(5020, 12000, true) }, {}, P, W);
+    CHECK(device_gap.ok(), "a device-only gap was refused");
+    CHECK(same(device_gap.willneed, { R(0, 4096) }, "willneed"),
+          "a gap holding a device-only tensor was merged across");
+    // a gap of a whole page or more
+    const file_segment_plan wide_gap = file_mapping_segments({ T(0, 5000, true), T(9096, 20000, true) }, {}, P, W);
+    CHECK(wide_gap.ok(), "a wide gap was refused");
+    CHECK(same(wide_gap.willneed, { R(0, 4096), R(12288, 16384) }, "willneed"), "a page-wide gap was merged across");
+    return 0;
+}
+
 // A tensor that overlaps a lazy range is a caller bug: refused, and the plan is empty.
 static int test_overlap_is_refused() {
     const file_segment_plan p = file_mapping_segments({ T(0, 50000, true) }, { R(40000, 100000) }, P, W);
@@ -147,6 +212,11 @@ int main() {
     rc |= test_sub_page_lazy_range();
     rc |= test_bytes_of_no_tensor_are_never_mapped();
     rc |= test_touching_host_tensors_share_a_willneed_page();
+    rc |= test_windows_are_cut_to_the_map();
+    rc |= test_page_aligned_lazy_range();
+    rc |= test_unsorted_input();
+    rc |= test_padded_host_tensors_share_a_willneed_page();
+    rc |= test_the_gap_merge_stops_at_other_bytes();
     rc |= test_overlap_is_refused();
     rc |= test_random_window_width();
     if (rc == 0) {

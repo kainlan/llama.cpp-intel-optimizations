@@ -11,7 +11,8 @@
 //
 // Every arm evicts first (unmaps, POSIX_FADV_DONTNEED over the file, probe ~0) and reports SKIP if it cannot.
 // Arms 1, 2, 5 and 6 must read 0 resident bytes of the hole; arm 3, the mutants and the control twins must read it
-// resident, which shows each of them could fail. Arm 4 (a synchronous pread) runs last.
+// resident, which shows each of them could fail. Arm 7 requires WILLNEED to leave >= 95% of each host segment resident
+// (production), and shows the one-call and 1 MiB-chunk advice reading short of it. Arm 4 (a synchronous pread) runs last.
 //
 // Exit 0 pass, 1 fail, 77 skipped (a fail outranks a skip).
 
@@ -25,6 +26,7 @@
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -205,10 +207,15 @@ int64_t resident_pages(const fixture & f, uint64_t off, uint64_t len) {
 
 // Evicts the whole file. The caller has unmapped every mapping (POSIX_FADV_DONTNEED skips mapped pages). False if the
 // directory cannot be evicted (tmpfs, or a filesystem that ignores the advice).
+int64_t interior_resident(const fixture & f);
+
 bool evict(const fixture & f) {
     posix_fadvise(f.fd, 0, 0, POSIX_FADV_DONTNEED);
     const int64_t left = resident_pages(f, 0, FILE_SIZE);
-    return left >= 0 && left <= 64;  // a few pages of metadata-adjacent noise are not the file's data
+    // A few pages of metadata-adjacent noise are not the file's data, but they must not sit where an arm measures: the
+    // interior is read 0 here, so a later "> 0" is the arm's doing, and the edge arms read their own band before the
+    // fault for the same reason.
+    return left >= 0 && left <= 64 && interior_resident(f) == 0;
 }
 
 // ---- a tier mapping of the fixture ----
@@ -263,6 +270,16 @@ constexpr uint64_t INTERIOR_END   = LAZY_END - GUARD;
 
 int64_t interior_resident(const fixture & f) {
     return resident_pages(f, INTERIOR_BEGIN, INTERIOR_END - INTERIOR_BEGIN);
+}
+
+bool advised(const char * arm, file_map_status st) {
+    if (st != file_map_status::OK) {
+        std::fprintf(stderr, "FAIL: %s: the advice was refused (%s), so the arm would pass without running it\n", arm,
+                     file_map_status_name(st));
+        ++g_fail;
+        return false;
+    }
+    return true;
 }
 
 // Waits for readahead the kernel started to land, so a "reads 0" is not a probe taken before the pages arrive.
@@ -320,9 +337,6 @@ int64_t band_resident(const fixture & f, const band & b) {
 // with the hole), and the interior reads 0 resident.
 void arm1_property(const fixture & f) {
     const char * arm = "arm 1 (the property)";
-    {
-        tier_mapping t;  // empty: its destructor is a no-op, and nothing is mapped yet
-    }
     if (!evict(f)) {
         report_skip(
             arm, "the fixture directory cannot be evicted (tmpfs, or a filesystem that ignores POSIX_FADV_DONTNEED)");
@@ -334,8 +348,10 @@ void arm1_property(const fixture & f) {
         report_fail(arm, "the plan or the mapping was refused");
         return;
     }
-    unified_cache_raw_advise_file_segments(t.m, plan.random_windows, file_advice::RANDOM);
-    unified_cache_raw_advise_file_segments(t.m, plan.willneed, file_advice::WILLNEED);
+    if (!advised(arm, unified_cache_raw_advise_file_segments(t.m, plan.random_windows, file_advice::RANDOM)) ||
+        !advised(arm, unified_cache_raw_advise_file_segments(t.m, plan.willneed, file_advice::WILLNEED))) {
+        return;
+    }
     read_through(t, A_BEGIN, A_END);
     read_through(t, B_BEGIN, B_END);
     if (!byte_is_the_files(t, A_END - 1) || !byte_is_the_files(t, B_BEGIN)) {
@@ -370,7 +386,9 @@ void arm2_mlock(const fixture & f) {
             report_fail(arm, "the plan or the mapping was refused");
             return;
         }
-        unified_cache_raw_advise_file_segments(t.m, plan.random_windows, file_advice::RANDOM);
+        if (!advised(arm, unified_cache_raw_advise_file_segments(t.m, plan.random_windows, file_advice::RANDOM))) {
+            return;
+        }
         if (unified_cache_raw_lock_file_segments(t.m, plan.willneed) != file_map_status::OK) {
             report_skip(arm, "mlock was refused (RLIMIT_MEMLOCK or a container limit)");
             return;
@@ -426,7 +444,9 @@ void arm3_negative_control(const fixture & f) {
         report_fail(arm, "the plan or the mapping was refused");
         return;
     }
-    unified_cache_raw_advise_file_segments(t.m, plan.willneed, file_advice::WILLNEED);
+    if (!advised(arm, unified_cache_raw_advise_file_segments(t.m, plan.willneed, file_advice::WILLNEED))) {
+        return;
+    }
     const int64_t n = poll_resident([&] { return interior_resident(f); });
     std::printf("arm 3: interior resident pages with the hole as a tensor = %lld (want > 0)\n", (long long) n);
     if (n <= 0) {
@@ -456,7 +476,12 @@ int64_t fault_and_measure(const fixture & f, bool forward, edge_advice advice, b
             windows.push_back(w);
         }
     }
-    unified_cache_raw_advise_file_segments(t.m, windows, file_advice::RANDOM);
+    if (!advised("arms 5 and 6", unified_cache_raw_advise_file_segments(t.m, windows, file_advice::RANDOM))) {
+        return -1;
+    }
+    if (band_resident(f, forward ? forward_band(f) : backward_band(f)) != 0) {
+        return -1;  // residue in the band before the fault: a "> 0" after it would not be the fault's doing
+    }
     const uint64_t at = forward ? A_END - 1 : B_BEGIN;  // a byte of the shared page
     (void) read_through(t, at, at + 1);
     *ran = true;
@@ -501,6 +526,89 @@ void arm_read_around(const fixture & f, bool forward) {
     }
 }
 
+// Arm 7, the positive control of the advice itself: WILLNEED over the host segments must prefetch ALL of each, not
+// the first few pages the kernel's per-call cap allows. The kernel clamps one MADV_WILLNEED to max(io_pages, ra_pages)
+// of the backing device, so a call (or a chunk) above that cap reads part of a segment, and the rest is left to
+// synchronous read-around faults on the CPU decode path. Arms 1 and 2 only read the interior as 0 and would pass if
+// the advice never ran. The mutants advise the same segments in ONE call and in 1 MiB chunks; each must read short of
+// the bar on a host whose cap is below them (if it does not, the host cannot discriminate that mutant: skip).
+constexpr int64_t WILLNEED_BAR_PERCENT = 95;
+
+enum class willneed_how { PRODUCTION, ONE_CALL, MIB_CHUNKS };
+
+// The least resident fraction, in percent, over the segments after at most 10 s (0 when a segment never starts).
+int64_t willneed_least_percent(const fixture &           f,
+                               const tier_mapping &      t,
+                               const file_segment_plan & plan,
+                               willneed_how              how,
+                               bool *                    advice_ok) {
+    *advice_ok = true;
+    if (how == willneed_how::PRODUCTION) {
+        *advice_ok =
+            advised("arm 7", unified_cache_raw_advise_file_segments(t.m, plan.willneed, file_advice::WILLNEED));
+    } else {
+        const uint64_t chunk = how == willneed_how::ONE_CALL ? ~0ull : 1 * MiB;
+        for (const file_map_range & seg : plan.willneed) {
+            for (uint64_t done = 0; done < seg.length; done += chunk) {
+                const uint64_t n = std::min(chunk, seg.length - done);
+                if (madvise((char *) t.m.base + (seg.file_offset - t.m.file_offset + done), (size_t) n,
+                            MADV_WILLNEED) != 0) {
+                    *advice_ok = false;
+                }
+            }
+        }
+    }
+    int64_t least = 100;
+    for (int i = 0; i < 20; ++i) {
+        least = 100;
+        for (const file_map_range & seg : plan.willneed) {
+            const int64_t pct = 100 * resident_pages(f, seg.file_offset, seg.length) / (int64_t) (seg.length / g_page);
+            least             = std::min(least, pct);
+        }
+        if (least >= WILLNEED_BAR_PERCENT) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    return least;
+}
+
+void arm7_willneed_prefetches_each_segment(const fixture & f) {
+    const char * arm = "arm 7 (WILLNEED reaches the whole segment)";
+    for (willneed_how how : { willneed_how::PRODUCTION, willneed_how::ONE_CALL, willneed_how::MIB_CHUNKS }) {
+        if (!evict(f)) {
+            report_skip(arm, "the fixture directory cannot be evicted");
+            return;
+        }
+        const file_segment_plan plan = file_mapping_segments(fixture_tensors(), fixture_lazy(), g_page, window_for(f));
+        tier_mapping            t;
+        if (!plan.ok() || plan.willneed.size() != 2 || !map_plan(f, plan, &t)) {
+            report_fail(arm, "the plan or the mapping was refused");
+            return;
+        }
+        bool          advice_ok = false;
+        const int64_t least     = willneed_least_percent(f, t, plan, how, &advice_ok);
+        if (!advice_ok) {
+            if (how != willneed_how::PRODUCTION) {
+                report_skip(arm, "a mutant's madvise was refused");
+            }
+            continue;
+        }
+        const char * name = how == willneed_how::PRODUCTION ? "production" :
+                            how == willneed_how::ONE_CALL   ? "one-call mutant" :
+                                                              "1 MiB-chunk mutant";
+        std::printf("arm 7 %s: least segment resident = %lld%% (%s %d%%)\n", name, (long long) least,
+                    how == willneed_how::PRODUCTION ? "want >=" : "want <", (int) WILLNEED_BAR_PERCENT);
+        if (how == willneed_how::PRODUCTION) {
+            if (least < WILLNEED_BAR_PERCENT) {
+                report_fail(arm, "WILLNEED did not prefetch the whole of each host segment");
+            }
+        } else if (least >= WILLNEED_BAR_PERCENT) {
+            report_skip(arm, "this host's per-call WILLNEED cap does not stop that mutant: it cannot discriminate");
+        }
+    }
+}
+
 // Arm 4, the synchronous positive control, last: pread 1 MiB inside the interior and that MiB reads resident.
 void arm4_pread_control(const fixture & f) {
     const char * arm = "arm 4 (synchronous positive control)";
@@ -541,6 +649,7 @@ int main(int argc, char ** argv) {
     arm3_negative_control(f);
     arm_read_around(f, true);
     arm_read_around(f, false);
+    arm7_willneed_prefetches_each_segment(f);
     arm4_pread_control(f);  // last: its pread populates the hole
     if (g_fail != 0) {
         return 1;
