@@ -22,9 +22,9 @@ from outside, or that a rebase restoring upstream's shape would silently undo:
    `#else` arm holds refusing stubs, the segment plan is outside the guard, and the host tests that need POSIX are
    registered only under `if (CMAKE_SYSTEM_NAME STREQUAL "Linux")`;
 9. no raw accessor hands out the owner's fd by address, and the ctest name of the runtime test is its binary's;
-10. the WILLNEED advice is chunked at 128 KiB with a floor of one page, and the loop steps by the chunk (the kernel clamps
-   one call to the backing device's io_pages, so a larger chunk or one call prefetches only part of a segment; the
-   residency test's arm 7 measures it where a host can show it).
+10. the WILLNEED advice is chunked at 128 KiB with a floor of one page, and the loop steps by the chunk (the kernel
+   clamps one call to the backing device's io_pages, so a larger chunk or one call prefetches only part of a
+   segment; the residency test's arm 7 measures it where a host can show it).
 
 Plain file I/O, comment-stripped text.
 """
@@ -322,6 +322,25 @@ def test_the_ctest_name_is_the_binary_name():
     assert not re.search(r"add_test\(\s*NAME\s+sycl-file-mapped-tier\b", text)
 
 
+# ---- 10. the WILLNEED chunk ----
+
+
+def test_the_willneed_chunk_is_128_kib_with_a_page_floor_and_the_loop_steps_by_it():
+    body = function_body(
+        code("file-mapping.cpp"),
+        r"file_map_status\s+unified_cache_raw_advise_file_segments\s*\([^)]*\)",
+    )
+    chunk_re = (
+        r"const\s+uint64_t\s+chunk\s*=\s*advice\s*==\s*file_advice::WILLNEED\s*\?\s*"
+        r"std::max\(\s*page\s*,\s*128\s*\*\s*1024\s*/\s*page\s*\*\s*page\s*\)\s*:\s*~0ull\s*;"
+    )
+    assert re.search(chunk_re, body), "the WILLNEED chunk is not max(page, 128 KiB rounded to pages)"
+    assert re.search(r"done\s*\+=\s*chunk", body), "the advice loop does not step by the chunk"
+    assert re.search(r"std::min\(\s*chunk\s*,\s*seg\.length\s*-\s*done\s*\)", body), (
+        "a chunk may reach past its segment"
+    )
+
+
 if __name__ == "__main__":
     import sys
 
@@ -329,15 +348,3 @@ if __name__ == "__main__":
 
     sys.exit(pytest.main([__file__, "-q"]))
 
-
-# ---- 10. the WILLNEED chunk ----
-
-
-def test_the_willneed_chunk_is_128_kib_with_a_page_floor_and_the_loop_steps_by_it():
-    body = function_body(code("file-mapping.cpp"), r"file_map_status\s+unified_cache_raw_advise_file_segments\s*\([^)]*\)")
-    assert re.search(
-        r"const\s+uint64_t\s+chunk\s*=\s*advice\s*==\s*file_advice::WILLNEED\s*\?\s*std::max\(\s*page\s*,\s*128\s*\*\s*1024\s*/\s*page\s*\*\s*page\s*\)\s*:\s*~0ull\s*;",
-        body,
-    ), "the WILLNEED chunk is not max(page, 128 KiB rounded to pages)"
-    assert re.search(r"done\s*\+=\s*chunk", body), "the advice loop does not step by the chunk"
-    assert re.search(r"std::min\(\s*chunk\s*,\s*seg\.length\s*-\s*done\s*\)", body), "a chunk may reach past its segment"
