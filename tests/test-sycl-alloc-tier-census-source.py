@@ -330,6 +330,79 @@ def test_the_registry_sums_report_host_cpu_apart_from_the_host_sum():
     )
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# llama.cpp-th32 T1b: the unconditional role-bytes read accessor and its export
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def under_private_testing(code: str, pos: int) -> bool:
+    """Is `pos` inside a preprocessor conditional whose opening line names GGML_SYCL_PRIVATE_TESTING? An #else or
+    #elif arm counts as inside, because it is compiled only for one value of the same macro."""
+    stack = []
+    for m in re.finditer(r"^[ \t]*#[ \t]*(ifdef|ifndef|if|endif)\b([^\n]*)", code[:pos], flags=re.MULTILINE):
+        if m.group(1) == "endif":
+            stack.pop()
+        else:
+            stack.append("GGML_SYCL_PRIVATE_TESTING" in m.group(2))
+    return any(stack)
+
+
+def declaration_at(code: str, regex: str) -> int:
+    hits = [m.start() for m in re.finditer(regex, code)]
+    assert len(hits) == 1, f"{regex!r} matched {len(hits)} times"
+    return hits[0]
+
+
+ROLE_BYTES_CXX = (
+    r"\bbool\s+unified_cache_role_bytes_for_testing\s*\(\s*int\s+device,\s*alloc_role\s+role,"
+    r"\s*uint64_t\s*\*\s*out\s*\)\s*noexcept\s*"
+)
+ROLE_BYTES_C = (
+    r"\bbool\s+ggml_backend_sycl_role_bytes_for_testing\s*\(\s*int\s+device,\s*int\s+role,"
+    r"\s*uint64_t\s*\*\s*out\s*\)\s*"
+)
+
+
+def test_the_role_bytes_accessor_is_unconditional_and_declared_beside_the_census_accessors():
+    hpp = sources_text("unified-cache.hpp")
+    decl = declaration_at(hpp, ROLE_BYTES_CXX + ";")
+    assert not under_private_testing(hpp, decl), "the accessor is declared only under GGML_SYCL_PRIVATE_TESTING"
+    census = declaration_at(hpp, r"\bbool\s+unified_cache_shutdown_allocation_control_census_for_test\s*\(")
+    assert 0 < decl - census < 2000, "the accessor is not declared beside the shutdown census accessors"
+    cpp = sources_text("unified-cache.cpp")
+    define = declaration_at(cpp, ROLE_BYTES_CXX + r"\{")
+    assert not under_private_testing(cpp, define), "the accessor is defined only under GGML_SYCL_PRIVATE_TESTING"
+    body = function_body(cpp, r"\bbool\s+unified_cache_role_bytes_for_testing\s*\(")
+    assert "g_device_caches" in body, "the reading is not VOID for a device with no cache"
+    assert "g_runtime_alloc_registry" in body, "the accessor does not read the live registry"
+    assert re.search(r"handle\.role\s*==\s*role|\.role\s*==\s*role", body), "the sum is not by role"
+    assert re.search(r"handle\.device\s*==\s*device|\.device\s*==\s*device", body), "the sum is not by device"
+
+
+def test_the_role_bytes_export_resolves_through_the_proc_address_table():
+    header = sources_text("../../include/ggml-sycl.h")
+    decl = declaration_at(header, r"GGML_BACKEND_API\s+" + ROLE_BYTES_C + ";")
+    assert not under_private_testing(header, decl), "the export is declared only under GGML_SYCL_PRIVATE_TESTING"
+    backend = sources_text("ggml-sycl.cpp")
+    define = declaration_at(backend, r"extern\s+\"C\"\s+" + ROLE_BYTES_C + r"\{")
+    assert not under_private_testing(backend, define), "the export is defined only under GGML_SYCL_PRIVATE_TESTING"
+    body = function_body(backend, r"extern\s+\"C\"\s+bool\s+ggml_backend_sycl_role_bytes_for_testing\s*\(")
+    assert "unified_cache_role_bytes_for_testing" in body and "alloc_role::LAZY_OUTPUT" in body, (
+        "the wrapper does not range-check the role before it casts it"
+    )
+    entry = declaration_at(backend, r'strcmp\(name,\s*"ggml_backend_sycl_role_bytes_for_testing"\)\s*==\s*0')
+    assert not under_private_testing(backend, entry), "the proc-address entry is only under GGML_SYCL_PRIVATE_TESTING"
+    assert "return (void *) ggml_backend_sycl_role_bytes_for_testing;" in backend[entry : entry + 200]
+
+
+def test_the_private_testing_reader_sees_a_conditional_and_an_unconditional_site():
+    code = strip_comments(
+        "int a;\n#if defined(GGML_SYCL_PRIVATE_TESTING)\nint b;\n#else\nint c;\n#endif\nint d;\n#if 1\nint e;\n#endif\n"
+    )
+    seen = {n: under_private_testing(code, code.index(f"int {n};")) for n in "abcde"}
+    assert seen == {"a": False, "b": True, "c": True, "d": False, "e": False}, seen
+
+
 if __name__ == "__main__":
     import sys
 
