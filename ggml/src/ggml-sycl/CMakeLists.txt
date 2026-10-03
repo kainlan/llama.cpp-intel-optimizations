@@ -6165,6 +6165,22 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
             # no device: pin a selector that shows none, so an incidental SYCL init cannot touch a GPU
             ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu"
             TIMEOUT 30)
+
+        # The HOST_CPU tier through the same front door (llama.cpp-th32 T1b): a locked anonymous mapping, one registry
+        # record, one munmap. Host-only like the file-mapped tier; SKIP_RETURN_CODE 77 is its refusal to pass when
+        # RLIMIT_MEMLOCK is below the request.
+        add_executable(test-sycl-host-cpu-tier
+            tests/test-host-cpu-tier.cpp)
+        target_link_libraries(test-sycl-host-cpu-tier PRIVATE
+            ggml-sycl-private-fixtures Threads::Threads)
+        set_target_properties(test-sycl-host-cpu-tier PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+        add_test(NAME test-sycl-host-cpu-tier COMMAND test-sycl-host-cpu-tier)
+        set_tests_properties(test-sycl-host-cpu-tier PROPERTIES
+            LABELS "sycl;allocator;owner;host"
+            ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu"
+            SKIP_RETURN_CODE 77
+            TIMEOUT 30)
     endif()
 
     # Forced-failure coverage for the transactional staging-replacement region
@@ -6348,7 +6364,7 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         test-dmmv-q6k-coalesced
         test-dmmv-q4-0-coalesced)
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        list(APPEND _ggml_sycl_private_fixture_consumers test-sycl-file-mapped-tier)
+        list(APPEND _ggml_sycl_private_fixture_consumers test-sycl-file-mapped-tier test-sycl-host-cpu-tier)
     endif()
     set(_ggml_sycl_private_fixture_binaries)
     foreach(_consumer IN LISTS _ggml_sycl_private_fixture_consumers)

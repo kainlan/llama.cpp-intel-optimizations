@@ -255,6 +255,79 @@ def test_the_census_can_fail():
     assert flag == [False, True], flag
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# llama.cpp-th32 T1b: the HOST_CPU front door and its release
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def test_select_tier_maps_must_host_cpu_and_a_cohort_cannot_inherit_it():
+    body = function_body(sources_text("unified-cache.cpp"), r"alloc_tier\s+unified_select_tier\s*\(")
+    assert re.search(r"must_host_cpu\s*\)\s*\{\s*return\s+alloc_tier\s*::\s*HOST_CPU\s*;", body), (
+        "must_host_cpu is not mapped to HOST_CPU"
+    )
+    cohort = body[body.index("prefer_same_tier_as_cohort") :]
+    assert re.search(r"alloc_tier\s*::\s*HOST_CPU\b", cohort), "the cohort branch does not skip a HOST_CPU entry"
+    # nothing falls INTO the tier: the size fallback and the default stay where they were
+    named = body.count("alloc_tier::HOST_CPU")
+    assert named == 2, f"{named} names of HOST_CPU in selection"
+
+
+def test_unified_alloc_serves_host_cpu_through_the_one_wrapper():
+    code = sources_text("unified-cache.cpp")
+    body = function_body(code, r"bool\s+unified_alloc\s*\(\s*const\s+alloc_request\s*&\s+req_in,")
+    assert len(re.findall(r"\bunified_cache_raw_alloc_host_cpu\s*\(", body)) == 1
+    assert re.search(r"register_alloc\([^;]*alloc_type\s*::\s*HOST_CPU\s*\)", body), "no pointer-type registration"
+    assert re.search(r"must_host_cpu\s*&&\s*\([^)]*must_device[^)]*must_host_pinned", body), (
+        "unified_alloc does not refuse must_host_cpu beside a routing constraint"
+    )
+    # the front door is the only caller of the wrapper outside its own TU
+    callers = []
+    for rel, text in sycl_sources().items():
+        if rel in ("host-cpu-mapping.cpp", "host-cpu-mapping.hpp"):
+            continue
+        for name in ("unified_cache_raw_alloc_host_cpu", "unified_cache_raw_free_host_cpu"):
+            callers += [f"{rel}:{name}" for _ in re.finditer(rf"\b{name}\s*\(", text)]
+    assert sorted(callers) == [
+        "unified-cache.cpp:unified_cache_raw_alloc_host_cpu",
+        "unified-cache.cpp:unified_cache_raw_free_host_cpu",
+    ], callers
+
+
+def test_the_owner_entry_refuses_the_combination_and_keeps_the_class_exact():
+    body = function_body(
+        sources_text("unified-cache.cpp"), r"static\s+allocation_result\s+unified_allocate_owner_impl\s*\("
+    )
+    assert re.search(r"must_host_cpu\s*&&\s*\(", body), "must_host_cpu is not refused beside a routing constraint"
+    suballoc = re.search(r"const\s+bool\s+cache_suballocation\s*=(.*?);", body, flags=re.DOTALL)
+    assert suballoc and re.search(r"!\s*req\.intent\.constraints\.must_host_cpu", suballoc.group(1)), (
+        "a role or constraint can still make a HOST_CPU owner a cache suballocation"
+    )
+
+
+def test_the_free_branch_releases_a_host_cpu_record_once_and_first():
+    body = function_body(sources_text("unified-cache.cpp"), r"static\s+bool\s+unified_free_record\s*\(")
+    branch = re.search(r"if\s*\(\s*rec\.handle\.tier\s*==\s*alloc_tier\s*::\s*HOST_CPU\s*\)\s*\{", body)
+    assert branch, "unified_free_record has no HOST_CPU branch"
+    unregistered = body.index("alloc_tier::UNREGISTERED")
+    assert branch.start() < unregistered, "the HOST_CPU branch is not ahead of the UNREGISTERED no-free case"
+    inner = body[branch.end() : matching_brace(body, branch.end() - 1)]
+    assert len(re.findall(r"\bunified_cache_raw_free_host_cpu\s*\(", inner)) == 1
+    assert re.search(r"host_cpu_mapped_size\s*\(\s*rec\.handle\.size\s*\)", inner), "the release is sized another way"
+    assert re.search(r"unregister_alloc\s*\(\s*rec\.handle\.ptr\s*\)", inner), "the pointer-type record survives"
+    assert "return true" in inner
+
+
+def test_the_registry_sums_report_host_cpu_apart_from_the_host_sum():
+    body = function_body(
+        sources_text("unified-cache.cpp"), r"static\s+registry_tier_sums\s+unified_alloc_registry_tier_sums\s*\("
+    )
+    host = re.search(r"tier\s*==\s*alloc_tier\s*::\s*HOST_PINNED[^{]*\{\s*sums\.host\s*\+=", body)
+    assert host and "HOST_CPU" not in host.group(0), "HOST_CPU is summed into the host-pinned ledger comparison"
+    assert re.search(r"alloc_tier\s*::\s*HOST_CPU\s*\)\s*\{\s*sums\.host_cpu\s*\+=\s*h\.size", body), (
+        "the registry does not sum HOST_CPU bytes on its own"
+    )
+
+
 if __name__ == "__main__":
     import sys
 
