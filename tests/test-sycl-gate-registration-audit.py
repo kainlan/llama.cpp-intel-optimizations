@@ -102,6 +102,14 @@ REQUIRE_PYTEST_FOOTER = True
 CENSUS_ABSENT_ALLOWLIST = {
     "test-sycl-module-dependencies.py": "needs the GGML_BACKEND_DL module (registered inside the DL-only block of ggml-sycl)",
 }
+# --census, R8: ctest registrations that run a .py file and deliberately do NOT carry the `python` label, name -> reason.
+# `ctest -L python` is a host-only census; these two are python drivers of device work (they load models or run a GPU
+# binary), so labelling them python would put GPU work into a sweep that is otherwise safe to run. An entry goes stale
+# (and is reported) when the build no longer registers the test, or the test carries `python` after all.
+PYTHON_LABEL_EXEMPT = {
+    "sycl-lifecycle-gpu-sequential": "loads the models its G1 fixture names (labelled `model`); `-L python` must not load models",
+    "mem-handle-eviction-b70-repeat-clean-exit": "runs test-mem-handle-eviction on the B70 three times; `-L python` must not touch a device",
+}
 # The audit refuses a tests/ that has lost most of its gates (a moved directory would otherwise audit nothing and PASS).
 MIN_GATES = 160
 # The programs a registration may run a gate with: python itself, or a CMake variable that names it.
@@ -1238,7 +1246,7 @@ def census(root, build_dir, absent_allowlist=None, tests_dir=None):
     return problems
 
 
-def label_census(build_dir):
+def label_census(build_dir, exempt=None):
     """R8: every ctest registration of a configured build whose command runs a .py file carries the `python` label.
 
     `ctest -L python` is the census of the host-only python gates; a registration without the label is invisible to it
@@ -1246,7 +1254,9 @@ def label_census(build_dir):
     "ctest -L python 116/116"). Read from the configured build's ctest files, so every registrar counts (add_test,
     llama_test_pytest, llama_test_cmd, a function that calls one) and not only the spellings a CMakeLists.txt scan knows.
     A .py command is any test with a .py token after the program; the label must be a whole member of the LABELS list
-    (`python-extra` is not `python`), and APPENDed or set_property labels count."""
+    (`python-extra` is not `python`), and APPENDed or set_property labels count. PYTHON_LABEL_EXEMPT names the
+    registrations that drive device work and must stay out of `-L python`."""
+    exempt = PYTHON_LABEL_EXEMPT if exempt is None else exempt
     scripts, labels, seen = {}, {}, False
     for dirpath, dirnames, filenames in os.walk(build_dir):
         dirnames[:] = [d for d in dirnames if d != "CMakeFiles"]
@@ -1267,10 +1277,17 @@ def label_census(build_dir):
                             labels.setdefault(test, set()).update(part for part in value.split(";") if part)
     if not seen:
         return ["R8 no CTestTestfile.cmake under %s: not a configured build, so the label census proves nothing" % build_dir]
-    return ["R8 %s runs %s but does not carry the `python` label (labels: %s): `ctest -L python` skips it, so a red there "
-            "is invisible to the python census (add python to its LABELS)"
-            % (test, script.rsplit("/", 1)[-1], ";".join(sorted(labels.get(test, ()))) or "none")
-            for test, script in sorted(scripts.items()) if "python" not in labels.get(test, ())]
+    problems = ["R8 %s runs %s but does not carry the `python` label (labels: %s): `ctest -L python` skips it, so a red "
+                "there is invisible to the python census (add python to its LABELS, or to PYTHON_LABEL_EXEMPT with the "
+                "reason if it drives device work)"
+                % (test, script.rsplit("/", 1)[-1], ";".join(sorted(labels.get(test, ()))) or "none")
+                for test, script in sorted(scripts.items()) if "python" not in labels.get(test, ()) and test not in exempt]
+    for test in sorted(exempt):
+        if test not in scripts:
+            problems.append("R8 %s is in PYTHON_LABEL_EXEMPT but the build registers no .py test of that name; drop the entry" % test)
+        elif "python" in labels.get(test, ()):
+            problems.append("R8 %s is in PYTHON_LABEL_EXEMPT but carries the `python` label; drop the entry" % test)
+    return problems
 
 
 def _b(text):
@@ -1398,7 +1415,7 @@ def label_census_self_test(base):
 
     def run(text):
         ctest_file.write_text(text)
-        return label_census(build)
+        return label_census(build, exempt={})
 
     py = '"/usr/bin/python3" "/x/tests/test-sycl-b.py"'
     stub = '"/usr/bin/python3" "-c" "' + PYTEST_STUB_TEXT + '" "/x/tests/test-sycl-b.py"'
@@ -1435,11 +1452,26 @@ def label_census_self_test(base):
     nested = build / "ggml" / "src"
     nested.mkdir(parents=True)
     (nested / "CTestTestfile.cmake").write_text('add_test([=[n]=] %s)\n' % py)
-    if not any(p.startswith("R8 n ") for p in label_census(build)):
+    if not any(p.startswith("R8 n ") for p in label_census(build, exempt={})):
         failures.append("label census: an unlabelled registration in a nested ctest file was not reported")
+    (nested / "CTestTestfile.cmake").unlink()
+    # An exempt registration (device work) may stay unlabelled; a stale exemption is reported.
+    ctest_file.write_text('add_test([=[b]=] %s)\nadd_test([=[n]=] %s)\n' % (py, py))
+    if label_census(build, exempt={"b": "r", "n": "r"}):
+        failures.append("label census: exempt registrations were reported: %s" % label_census(build, exempt={"b": "r", "n": "r"}))
+    if not any(p.startswith("R8 b ") for p in label_census(build, exempt={"n": "r"})):
+        failures.append("label census: a registration not in the exemption list was not reported")
+    if not any("R8 ghost is in PYTHON_LABEL_EXEMPT" in p for p in label_census(build, exempt={"b": "r", "n": "r", "ghost": "r"})):
+        failures.append("label census: an exemption naming no registration was not reported")
+    ctest_file.write_text('add_test([=[b]=] %s)\nset_tests_properties([=[b]=] PROPERTIES  LABELS "python")\n'
+                          'add_test([=[n]=] %s)\nset_tests_properties([=[n]=] PROPERTIES  LABELS "python")\n' % (py, py))
+    if not any("R8 b is in PYTHON_LABEL_EXEMPT but carries" in p for p in label_census(build, exempt={"b": "r"})):
+        failures.append("label census: an exemption on a python-labelled test was not reported")
+    ctest_file.write_text('add_test([=[a]=] %s)\nset_tests_properties([=[a]=] PROPERTIES  LABELS "python")\n'
+                          'add_test([=[n]=] %s)\n' % (py.replace("sycl-b", "sycl-a"), py))
     empty = base / "label-empty"
     empty.mkdir()
-    if not any("not a configured build" in p for p in label_census(empty)):
+    if not any("not a configured build" in p for p in label_census(empty, exempt={})):
         failures.append("label census: an empty build directory passed")
     # main() must act on it: the script itself exits 1 on a build whose registration lacks the label.
     done = subprocess.run([sys.executable, os.path.abspath(__file__), "--census", str(build)], capture_output=True, text=True,
