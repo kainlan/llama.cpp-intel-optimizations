@@ -16,6 +16,7 @@
 #endif
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/ggml-sycl-test.hpp"
+#include "ggml-sycl/soa-reorder-types.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml-sycl/vram-headroom.hpp"
 
@@ -2150,6 +2151,95 @@ static bool run_resource_exhaustion_message_test() {
     return true;
 }
 
+// llama.cpp-76os: one fact, two sources. The planner took its layout from
+// layout_policy::get_optimal, whose default is "SOA is safe for all quantized
+// types", while the runtime clamps SOA to AOS for every type without an AOS->SOA
+// reorder (ggml_sycl_layout_supports_soa). The planner then charged and placed
+// IQ*/Q2_0 expert weights as SOA, a layout the fill cannot materialize. For every
+// quantized type, whatever layout the planner picks must be one the fill can
+// build: SOA only for a type in the reorder table, COALESCED only for a type
+// with a coalesced reorder, tiled MXFP4 layouts only for MXFP4.
+static bool planned_layout_materializable(ggml_type type, ggml_layout_mode layout) {
+    switch (layout) {
+        case GGML_LAYOUT_AOS:
+            return true;
+        case GGML_LAYOUT_SOA:
+            return ggml_sycl_soa_reorder_supported_type(type);
+        case GGML_LAYOUT_COALESCED:
+            return is_coalesced_supported(type);
+        default:
+            return type == GGML_TYPE_MXFP4;
+    }
+}
+
+static bool run_planned_layout_materializable_test() {
+    constexpr int64_t n_experts = 2;
+    int               checked   = 0;
+    int               soa_seen  = 0;
+    int               aos_iq    = 0;
+    const tensor_usage usages[] = { tensor_usage::MOE_EXPERT_WEIGHT, tensor_usage::ATTENTION_WEIGHT,
+                                    tensor_usage::FFN_WEIGHT,        tensor_usage::OUTPUT_WEIGHT,
+                                    tensor_usage::EMBEDDING };
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const ggml_type type = (ggml_type) t;
+        if (!ggml_is_quantized(type) || ggml_blck_size(type) <= 0) {
+            continue;
+        }
+        // layout_policy::get_optimal is the planner's layout source.
+        for (const tensor_usage usage : usages) {
+            const layout_mode layout = layout_policy::get_optimal(type, usage);
+            if (!planned_layout_materializable(type, layout)) {
+                printf("FAIL: get_optimal(%s, usage %d) = layout %d, which the fill cannot materialize\n",
+                       ggml_type_name(type), (int) usage, (int) layout);
+                return false;
+            }
+            ++checked;
+        }
+
+        // The real planner, per-expert entries of a routed expert tensor.
+        const int64_t ne0 = (int64_t) ggml_blck_size(type) * 8;
+        const int64_t ne1 = 64;
+        ggml_sycl::placement_tensor_info tensor{ "blk.0.ffn_gate_exps.weight", 1 };
+        tensor.type  = type;
+        tensor.ne[0] = ne0;
+        tensor.ne[1] = ne1;
+        tensor.ne[2] = n_experts;
+        tensor.size  = ggml_row_size(type, ne0) * (size_t) ne1 * (size_t) n_experts;
+        const std::vector<ggml_sycl::placement_tensor_info> inventory = { tensor };
+
+        ggml_sycl::placement_kv_info kv_info{};
+        const auto                   plan = ggml_sycl::compute_placement_plan(
+            inventory, 64ull * 1024ull * 1024ull * 1024ull, 0, kv_info, nullptr, (int) n_experts);
+        size_t n_entries = 0;
+        for (const ggml_sycl::placement_entry & entry : plan.entries) {
+            if (entry.expert_id < 0) {
+                continue;
+            }
+            ++n_entries;
+            if (!planned_layout_materializable(type, entry.layout)) {
+                printf("FAIL: planner placed %s expert entry in layout %d, which the fill cannot materialize\n",
+                       ggml_type_name(type), (int) entry.layout);
+                return false;
+            }
+            soa_seen += entry.layout == GGML_LAYOUT_SOA ? 1 : 0;
+            aos_iq += (entry.layout == GGML_LAYOUT_AOS && !ggml_sycl_soa_reorder_supported_type(type)) ? 1 : 0;
+        }
+        if (n_entries != (size_t) n_experts) {
+            printf("FAIL: planner produced %zu expert entries for %s, expected %lld\n", n_entries,
+                   ggml_type_name(type), (long long) n_experts);
+            return false;
+        }
+    }
+    // Positive controls: the sweep saw SOA entries (so the SOA arm is not vacuous)
+    // and AOS entries for types outside the reorder table (the clamp's effect).
+    if (checked == 0 || soa_seen == 0 || aos_iq == 0) {
+        printf("FAIL: vacuous sweep checked=%d soa_entries=%d aos_nonreorder_entries=%d\n", checked, soa_seen, aos_iq);
+        return false;
+    }
+    printf("PASS: planner layouts are materializable for every quantized type (%d get_optimal cases)\n", checked);
+    return true;
+}
+
 int main() {
     if (!run_fused_gate_up_role_test()) {
         return 1;
@@ -2172,6 +2262,10 @@ int main() {
     {
         const ggml_sycl_device_info              mock_info = make_mock_sycl_info();
         ggml_sycl::test_sycl_info_override_guard info_guard(mock_info);
+
+        if (!run_planned_layout_materializable_test()) {
+            return 1;
+        }
 
         if (!run_mxfp4_moe_policy_test()) {
             return 1;

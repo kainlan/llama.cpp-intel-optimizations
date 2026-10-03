@@ -3591,6 +3591,20 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
+# llama.cpp-76os: source gate -- the SOA-reorder type table
+# (ggml/src/ggml-sycl/soa-reorder-types.hpp) is the one list of types whose
+# AOS->SOA reorder exists; the device and partial-row reorder switches must carry
+# exactly its types, and the runtime clamp, the partial-row fill and
+# layout_policy::get_optimal (the planner's layout source) must read it instead
+# of keeping a private copy. Host-only, reads the sources as text.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-soa-reorder-types-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-soa-reorder-types-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
 # llama.cpp-2lxw: source gate for the dense split executor's host-side trims
 # (moved-only input refresh on a plan-cache hit and the staging generation it
 # relies on). Host-only, reads the sources as text.
