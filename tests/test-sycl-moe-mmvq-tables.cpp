@@ -170,6 +170,11 @@ int main() {
         // same grid tables the dense kernels read (qi = QI3_x / 2, vdr = 1, as the dense kernels use).
         { GGML_TYPE_IQ3_XXS, GGML_LAYOUT_AOS, "iq3_xxs/AOS" },
         { GGML_TYPE_IQ3_S,   GGML_LAYOUT_AOS, "iq3_s/AOS"   },
+        // s36q phase 3: IQ2_XXS, IQ2_XS and IQ2_S, same (QK_K, QI2_x / 2, vdr 1) dense tuple. The first two
+        // take grid tables through adaptors; IQ2_S's vec_dot already has the generic signature.
+        { GGML_TYPE_IQ2_XXS, GGML_LAYOUT_AOS, "iq2_xxs/AOS" },
+        { GGML_TYPE_IQ2_XS,  GGML_LAYOUT_AOS, "iq2_xs/AOS"  },
+        { GGML_TYPE_IQ2_S,   GGML_LAYOUT_AOS, "iq2_s/AOS"   },
     };
 
     for (const auto & req : required) {
@@ -186,16 +191,16 @@ int main() {
     // 5. The types with no _id kernel family must stay unadvertised. This is the
     //    half that keeps a future coverage pass honest: widening capability for
     //    these without adding the kernel turns a clean refusal into a wrong answer.
-    // The two families that remain refused, for different reasons. IQ4_XS, IQ2_XXS,
-    // IQ2_XS, IQ2_S, IQ1_S and IQ1_M are refused only because no _id tuple and, where
-    // their vec_dot takes grid tables, no generic-signature adaptor has been written
-    // for them yet (IQ4_NL, IQ3_XXS and IQ3_S are covered since s36q); each moves out
-    // of this list in the change that adds its kernel. The float types cannot use
-    // MMVQ at all -- it quantizes the activation to Q8_1 and dispatches
-    // vec_dot_*_q8_1, meaningless for float weights. Covering either must move this
-    // list in the same change, which is the point.
-    const ggml_type uncovered[] = { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_S,
-                                    GGML_TYPE_F16,    GGML_TYPE_F32,     GGML_TYPE_BF16 };
+    // The two families that remain refused, for different reasons. IQ4_XS, IQ1_S and
+    // IQ1_M are refused only because no _id tuple and, where their vec_dot takes grid
+    // tables, no generic-signature adaptor has been written for them yet (IQ4_NL, the
+    // IQ3 and the IQ2 types are covered since s36q); each moves out of this list in
+    // the change that adds its kernel. The float types cannot use MMVQ at all -- it
+    // quantizes the activation to Q8_1 and dispatches vec_dot_*_q8_1, meaningless for
+    // float weights. Covering either must move this list in the same change, which
+    // is the point.
+    const ggml_type uncovered[] = { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ1_S, GGML_TYPE_F16, GGML_TYPE_F32,
+                                    GGML_TYPE_BF16 };
     for (const ggml_type type : uncovered) {
         for (const ggml_layout_mode layout : all_layouts()) {
             if (moe_mmvq_capability_supports_layout(type, layout)) {
@@ -223,13 +228,13 @@ int main() {
         GGML_TYPE_Q1_0, GGML_TYPE_NVFP4, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_Q4_1,
         GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,  GGML_TYPE_Q2_K,
         GGML_TYPE_Q3_K, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
+        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
     };
     //    The exact set that regressed: dense MUL_MAT kernels exist, _id does not.
     //    BF16/q2_0/tq2_0 are absent on purpose -- 186348705 already refuses them
     //    by leaving them out of the dense allowlist, so they never reached here.
     const ggml_type admission_refused[] = {
-        GGML_TYPE_F32,     GGML_TYPE_F16,    GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,  GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
-        GGML_TYPE_IQ2_S,   GGML_TYPE_IQ4_XS,
+        GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS,
     };
 
     for (const ggml_type type : admission_expected) {
@@ -268,7 +273,7 @@ int main() {
     //    type, and admitting everything are all CAUGHT by the checks above.
     //    Dropping the predicate's capability axis entirely is NOT caught, and
     //    cannot be, because moe_mmvq_batched_dispatch_supports_type and the
-    //    capability table cover exactly the same 16 types today -- so the two
+    //    capability table cover exactly the same 19 types today -- so the two
     //    axes are indistinguishable by population. The second axis is therefore
     //    defensive, not gated here; what keeps the sets coinciding is the subset
     //    invariant in section 3. Do not add a control that "proves" the axis by
