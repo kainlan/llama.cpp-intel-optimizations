@@ -27930,9 +27930,11 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // llama.cpp-479i: f16 bytes the f16 dequant arm materializes for a dense weight. Q8_0 is planned
         // UNCONDITIONALLY: ONEDNN_SOA / ONEDNN_COALESCED are the route for its materialized layouts and are selected
         // whatever GGML_SYCL_ONEDNN_PP says, so they were the consumer observed minting per-op copies. Q4_0 and MXFP4
-        // are planned CONDITIONALLY, in the next block (llama.cpp-8ony). Any other type reaching the arm (an AOS-layout
-        // fallback) is not planned: the graph-entry walk finds it from the graph's own nodes and grows the buffer
-        // inside the RUNTIME zone, or refuses by name. Experts are excluded by the same role function as above.
+        // are planned CONDITIONALLY, in the next block (llama.cpp-8ony), as is every type with no coalesced layout
+        // (llama.cpp-gldu): the IQ family, Q5_K and Q4_K are materialized AOS and the router sends an AOS quantized
+        // weight to this arm at PP batch, so for them it is the planned route and not a fallback. A mis-predicted node
+        // is still found by the graph-entry walk from the graph's own nodes, which grows the buffer inside the
+        // RUNTIME zone or refuses by name. Experts are excluded by the same role function as above.
         if (item.has_shape() && item.type == GGML_TYPE_Q8_0 &&
             expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
             size_t weight_bytes = 0;
@@ -27958,7 +27960,18 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // The head's copy is reserved UNCONDITIONALLY otherwise (owner decision) until llama.cpp-fkpg delivers
         // n_outputs to the planner: whether the head runs on many rows (perplexity, embeddings) or on the last row
         // only (chat, llama-bench) is not known here, and an unused plan is bounded by that one weight's f16 copy.
-        if (item.has_shape() && unified_kernel_serves_type(item.type) && ggml_sycl_onednn_pp_type_admitted(item.type) &&
+        //
+        // llama.cpp-gldu: a quantized type with no coalesced layout takes the same fields, from the router's AOS arm
+        // (dense_pp_route_is_f16_dequant_arm, the type predicate the layout policy's coalesced list is also built
+        // from). Unlike the unified kernel's types it does not need the PP admission to reach the arm: the legacy
+        // oneDNN kernel runs with GGML_SYCL_ONEDNN_PP=0 too. The scratch supplies its copies only when the PP admission
+        // holds AND the scratch is enabled for the type, so that is what pp_scratch_type_enabled says here; for the
+        // unified kernel's types the admission already held, which leaves their answer unchanged. The loader's
+        // get_rows_only role excludes a gather-only table (per_layer_token_embd) in the classifier, for every mark.
+        const bool unified_dequant_type =
+            unified_kernel_serves_type(item.type) && ggml_sycl_onednn_pp_type_admitted(item.type);
+        const bool aos_dequant_type = ggml_is_quantized(item.type) && dense_pp_route_is_f16_dequant_arm(item.type);
+        if (item.has_shape() && (unified_dequant_type || aos_dequant_type) &&
             expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
             size_t weight_bytes = 0;
             size_t src1_bytes   = 0;
@@ -27967,7 +27980,8 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
                                                       item.ne[3] > 0 ? item.ne[3] : 1, &src1_bytes)) {
                 desc.dequant_f16_if_unsupplied_weight_bytes         = weight_bytes;
                 desc.dequant_f16_if_unsupplied_src1_bytes_per_token = src1_bytes;
-                desc.pp_scratch_type_enabled                        = onednn_pp_unified_scratch_enabled(item.type);
+                desc.pp_scratch_type_enabled =
+                    onednn_pp_unified_scratch_enabled(item.type) && ggml_sycl_onednn_pp_type_admitted(item.type);
             }
         }
         zone_inventory.push_back(std::move(desc));

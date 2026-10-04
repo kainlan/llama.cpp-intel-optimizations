@@ -32,6 +32,7 @@
 #include "sycl_hw.hpp"
 #include "tensor-types.hpp"
 #include "unified-cache.hpp"
+#include "unified-types.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1988,18 +1989,8 @@ bool ggml_sycl_reorder_enabled();
 // Check if a tensor type supports coalesced memory layout conversion
 // Add new types here as coalesced kernels are implemented
 inline bool is_coalesced_supported(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q4_0:
-            return true;
-        case GGML_TYPE_Q6_K:
-            return true;
-        case GGML_TYPE_Q8_0:
-            return true;
-        case GGML_TYPE_MXFP4:
-            return true;
-        default:
-            return false;
-    }
+    // The one list lives in unified-types.hpp: the zone planner asks its complement.
+    return ggml_sycl::coalesced_capable_type(type);
 }
 
 // =============================================================================

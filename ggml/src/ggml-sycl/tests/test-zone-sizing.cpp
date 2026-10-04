@@ -22,6 +22,7 @@
 //
 
 #include "compute-alloc-scope.hpp"
+#include "unified-types.hpp"
 #include "zone-sizing.hpp"
 
 #include <cstdio>
@@ -989,6 +990,55 @@ int main() {
               "a gather-only Q8_0 embedding is not planned");
         CHECK(zone_scoped_maxima({ q8_embd, q8_head }).dequant_f16_weight_bytes == 1159372800,
               "a Q8_0 head beside it still is");
+    }
+
+    // ---- Case 14k: a weight type with no non-AOS layout takes the f16 dequant arm as its PP route (llama.cpp-gldu) ----
+    // The router sends a quantized dense weight that is materialized AOS to the oneDNN dequant arm at PP batch
+    // (pick_kernel_for_layout, GGML_LAYOUT_AOS). A type the layout policy can never materialize COALESCED (the
+    // IQ family, Q5_K, Q4_K ...) is AOS there, so that arm is its NORMAL route, not a fallback. The planner asks the
+    // SAME type-level predicate (unified-types.hpp) the layout policy's coalesced list is built from, and it must
+    // not claim the types the existing marks already cover or the ones whose route is a coalesced kernel.
+    {
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ4_XS), "IQ4_XS draws the dequant arm");
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ3_S), "IQ3_S draws the dequant arm");
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ4_NL), "IQ4_NL draws the dequant arm");
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q5_K), "Q5_K draws the dequant arm");
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q4_K), "Q4_K (AOS-pinned) draws the dequant arm");
+        CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q8_0), "Q8_0 keeps its own unconditional mark");
+        CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q4_0), "Q4_0 keeps the unified-kernel mark");
+        CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_MXFP4), "MXFP4 keeps the unified-kernel mark");
+        CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q6_K),
+              "Q6_K is materialized COALESCED and routed to MMQ_COALESCED");
+        // The set is disjoint from the unified kernel's, so the two marks never double-count one weight.
+        for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+            const ggml_type ty = static_cast<ggml_type>(t);
+            CHECK(!(ggml_sycl::dense_pp_route_is_f16_dequant_arm(ty) && ggml_sycl::unified_kernel_serves_type(ty)),
+                  "no type is both a unified-kernel type and an AOS dequant-arm type");
+        }
+
+        // The adapter marks such a weight through the if-unsupplied fields (scratch off for its type by default),
+        // so it sizes the dequant plan; a gather-only IQ4_NL (per_layer_token_embd, 26.8 GiB) never does.
+        const size_t layer_w = 50331648;  // 4096 x 6144 f16
+        auto         marked  = [&](const char * name, int type, int64_t ne0, int64_t ne1, size_t f16_w, bool gather) {
+            zone_tensor_desc d                               = desc(name, 1000, type, ne0, ne1, 1, 1);
+            d.dequant_f16_if_unsupplied_weight_bytes         = f16_w;
+            d.dequant_f16_if_unsupplied_src1_bytes_per_token = static_cast<size_t>(ne0) * F16_BYTES;
+            d.pp_scratch_type_enabled                        = false;
+            d.get_rows_only                                  = gather;
+            return d;
+        };
+        std::vector<zone_tensor_desc> iq;
+        for (int i = 0; i < 4; i++) {
+            iq.push_back(marked("blk.0.ffn_gate_shexp.weight", GGML_TYPE_IQ4_XS, 4096, 6144, layer_w, false));
+        }
+        CHECK(zone_scoped_maxima(iq).dequant_f16_weight_bytes == layer_w,
+              "a dense IQ4_XS weight sizes the dequant plan");
+        const size_t                  per_layer_embd_w = 160ull * 320001536ull * F16_BYTES;
+        std::vector<zone_tensor_desc> with_embd        = iq;
+        with_embd.push_back(
+            marked("per_layer_token_embd.weight", GGML_TYPE_IQ4_NL, 160, 320001536, per_layer_embd_w, true));
+        CHECK(zone_scoped_maxima(with_embd).dequant_f16_weight_bytes == layer_w,
+              "a gather-only IQ4_NL table never sizes the dequant plan");
     }
 
     // ---- Case 14h: the figures a zone is described by outlive a later plan (llama.cpp-8ony) -----------------------

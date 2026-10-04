@@ -437,6 +437,14 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-onednn-pp-scratch-plan-source.py
             --self-test)
     set_tests_properties(sycl-onednn-pp-scratch-plan-source PROPERTIES LABELS "sycl;memory;planner;host;source-contract;python")
+    # llama.cpp-gldu: a quantized type with no coalesced layout (IQ family, Q5_K, Q4_K) is materialized AOS and takes the
+    # oneDNN f16 dequant arm as its PP route, so the planner reserves the dequant buffers for it from the type predicate
+    # the layout policy's coalesced list is also built from. test-zone-sizing Case 14k proves the arithmetic and the
+    # get_rows_only exclusion; this gate proves the adapter asks the predicate and excludes expert stacks.
+    add_test(NAME sycl-dequant-f16-aos-plan-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-dequant-f16-aos-plan-source.py
+            --self-test)
+    set_tests_properties(sycl-dequant-f16-aos-plan-source PROPERTIES LABELS "sycl;memory;planner;host;source-contract;python")
     # llama.cpp-qhfp: no CONCAT rejection in check_graph_compatibility and no host wait in concat.cpp, plus the
     # graph-safe memcpy helper's alignment. Source facts only: whether a graph replays is the GPU witness's job.
     # --self-test: most of its checks are absence-based (no host wait, no recording-guarded wait, no allocation,
