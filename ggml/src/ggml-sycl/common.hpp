@@ -4907,11 +4907,12 @@ inline const void * ggml_sycl_host_data(const ggml_tensor * tensor) {
     return tensor ? tensor->data : nullptr;
 }
 
-// llama.cpp-kmeq: pure predicate, no allocation -- true iff a BF16->F32
-// materialization route (ggml_sycl_bf16_weight_materialize_f32, in
-// ggml-sycl.cpp) could be used for this tensor on this device.
-// ggml_backend_sycl_device_supports_op() calls this and must never allocate
-// or mutate cache state from inside it.
+// llama.cpp-kmeq / llama.cpp-9qjy: pure predicate, no allocation -- the weight half of
+// the native BF16 route (ggml_sycl_bf16_weight_native_route_available, in ggml-sycl.cpp,
+// adds the kernel's shape contract and the split/TP buffer decline). True iff this
+// tensor is a named, contiguous BF16 weight with resolvable bytes on this device.
+// ggml_backend_sycl_device_supports_op() calls it and must never allocate or mutate
+// cache state from inside it.
 //
 // Declared inline here (not `static` in ggml-sycl.cpp) specifically so a
 // host-side test can call the SAME function production dispatch uses,
@@ -4920,12 +4921,9 @@ inline const void * ggml_sycl_host_data(const ggml_tensor * tensor) {
 // re-implementing the predicate's logic and drifting from it. See
 // tests/test-sycl-tensor-usage.cpp for the coverage.
 //
-// Requires ggml_is_contiguous(): the materialize path treats tensor->data
-// as a flat, packed run of n = ggml_nelements(tensor) BF16 values
-// (ggml_bf16_to_fp32_row / the on-device conversion kernel both index
-// linearly), and the retyped F32 copy's nb[] is recomputed from ne[]
-// assuming that same packed layout. A permuted or viewed BF16 weight would
-// silently read/produce wrong strides -- a wrong answer, not a decline --
+// Requires ggml_is_contiguous(): the native kernel (mul-mat-bf16.hpp) indexes the
+// weight as M packed rows of K BF16 values. A permuted or viewed BF16 weight would
+// silently read wrong strides -- a wrong answer, not a decline --
 // so decline it here and let it fall back to CPU exactly as an
 // unclassified BF16 weight did before this fix existed. No supported
 // architecture currently creates a non-contiguous BF16 weight tensor, so

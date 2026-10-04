@@ -2145,6 +2145,15 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert;placement"
         TIMEOUT 120
     )
+    # llama.cpp-9qjy: a BF16 dense weight runs natively from the BF16 bytes the planner placed; the
+    # lazily allocated, unplanned F32 copy is gone and the executor allocates and waits on nothing.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-bf16-native-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;placement;hostonly"
+        TIMEOUT 120
+    )
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-supports-op-indexed-moe-source.py
