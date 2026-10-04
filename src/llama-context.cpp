@@ -10,6 +10,7 @@
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-fused-landing.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -413,6 +414,21 @@ static decltype(&ggml_backend_sycl_ubatch_cache_store_layout1) llama_context_syc
         llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_ubatch_cache_store_layout1"));
 }
 #endif
+
+// The SYCL backend's capability-only supports_op (see ggml_backend_sycl_supports_op_capability in ggml-sycl.h), or
+// nullptr when the device is not SYCL or the loaded SYCL DSO predates it; resolve_fused_ops() then falls back to
+// the operand heuristic in llama-fused-landing.h.
+static llama_fused_capability_fn llama_context_sycl_capability_proc(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_SYCL)
+    return llama_context_dev_is_sycl(dev) ? &ggml_backend_sycl_supports_op_capability : nullptr;
+#elif defined(GGML_BACKEND_DL)
+    return reinterpret_cast<llama_fused_capability_fn>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_supports_op_capability"));
+#else
+    GGML_UNUSED(dev);
+    return nullptr;
+#endif
+}
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 // llama.cpp-kpjw (r7 I3): a pinned -ub publishes its plan ONCE, before the memory module (the KV cache, the recurrent
@@ -1457,36 +1473,6 @@ void llama_context::sycl_recheck_runtime_context_flash_attn() {
 #endif
 }
 
-// A fused op that landed on the CPU although its layer is assigned to `dev_layer`: is that PLACEMENT (the
-// designed outcome -- the op's persistent operand lives in host memory, so the CPU runs it where the data is) or
-// a CAPABILITY gap (the layer's device has no kernel for it)? The two read the same in the scheduler's output
-// and need opposite remedies, so the log must say which one happened.
-//
-// supports_op() alone cannot decide this: a backend also declines an op for placement (a KV tensor in a host
-// buffer type), so "unsupported" is only the capability answer once no operand explains the landing. An operand
-// explains it when its (view) tensor already lives in a host buffer that is not a compute scratch buffer --
-// compute scratch is wherever the scheduler put the previous op's output and says nothing about placement.
-static bool llama_fused_cpu_landing_is_placement(ggml_backend_dev_t dev_layer, const ggml_tensor * node) {
-    if (!dev_layer || ggml_backend_dev_supports_op(dev_layer, node)) {
-        return true;
-    }
-
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        const ggml_tensor * src = node->src[i];
-        if (!src) {
-            continue;
-        }
-
-        const ggml_tensor * data = src->view_src ? src->view_src : src;
-        if (data->buffer && ggml_backend_buffer_is_host(data->buffer) &&
-            ggml_backend_buffer_get_usage(data->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
     const char * func = __func__;
     auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
@@ -1546,7 +1532,8 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                     break;
                 }
 
-                if (llama_fused_cpu_landing_is_placement(device_layer, node.tensor)) {
+                if (llama_fused_cpu_landing_is_placement(device_layer, node.tensor,
+                                                                 llama_context_sycl_capability_proc(device_layer))) {
                     n_cpu_landings++;
                     cpu_landing_il  = node.il;
                     cpu_landing_dev = device_fused;

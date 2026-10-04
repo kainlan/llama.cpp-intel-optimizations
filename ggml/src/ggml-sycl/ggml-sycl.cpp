@@ -110024,6 +110024,12 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
     return nullptr;
 }
 
+// Set, on the calling thread only, for the duration of ggml_backend_sycl_supports_op_capability(): the two PLACEMENT
+// predicates supports_op consults (host-demoted KV, planner-on-host) then answer "not placed elsewhere", so the
+// same supports_op body returns its capability answer -- "is there a kernel for this op, type and shape" -- and
+// the two cannot drift apart. Nothing else sets it, and supports_op calls nothing that reads it besides those two.
+static thread_local bool g_sycl_supports_op_capability_only = false;
+
 static int  ggml_sycl_extract_planned_layer_id(const ggml_tensor * op);
 static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device);
 static bool ggml_sycl_layer_plan_applies_to_op(const ggml_tensor * op);
@@ -110170,7 +110176,7 @@ static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {
 // never strcmp) and its rationale: see the comment on
 // ggml_backend_sycl_kv_host_buffer_type() above.
 static bool ggml_sycl_tensor_is_in_kv_host_buft(const ggml_tensor * t) {
-    if (!t) {
+    if (!t || g_sycl_supports_op_capability_only) {
         return false;
     }
     const ggml_backend_buffer_t buf = (t->view_src && t->view_src->buffer) ? t->view_src->buffer : t->buffer;
@@ -110927,6 +110933,25 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
     GGML_UNUSED(dev);
 }
 
+// supports_op without its placement declines, exported through ggml_backend_sycl_reg_get_proc_address for callers
+// that must tell a missing kernel from a placement decline (llama_context::resolve_fused_ops): supports_op's
+// "false" covers both, this is false only when there is no kernel.
+bool ggml_backend_sycl_supports_op_capability(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    if (dev == nullptr || op == nullptr) {
+        return false;
+    }
+
+    struct capability_scope {
+        const bool saved = g_sycl_supports_op_capability_only;
+
+        capability_scope() { g_sycl_supports_op_capability_only = true; }
+
+        ~capability_scope() { g_sycl_supports_op_capability_only = saved; }
+    } scope;
+
+    return ggml_backend_sycl_device_supports_op(dev, op);
+}
+
 static bool ggml_backend_sycl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     // Regular SYCL buffer type
     if (buft->iface.get_name == ggml_backend_sycl_buffer_type_get_name) {
@@ -111308,7 +111333,7 @@ static bool ggml_sycl_layer_plan_applies_to_op(const ggml_tensor * op) {
 }
 
 static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device) {
-    if (!op || device < 0) {
+    if (!op || device < 0 || g_sycl_supports_op_capability_only) {
         return false;
     }
 
@@ -112233,6 +112258,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_for_model") == 0) {
         return (void *) ggml_backend_sycl_set_runtime_context_for_model;
+    }
+    if (strcmp(name, "ggml_backend_sycl_supports_op_capability") == 0) {
+        return (void *) ggml_backend_sycl_supports_op_capability;
     }
     if (strcmp(name, "ggml_backend_sycl_recheck_runtime_context_flash_attn") == 0) {
         return (void *) ggml_backend_sycl_recheck_runtime_context_flash_attn;

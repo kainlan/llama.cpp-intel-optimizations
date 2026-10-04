@@ -1433,6 +1433,13 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime
 // plan-time raise this shape feeds is a no-op once weights hold live
 // leases (see the "Where this can and cannot help" discussion in
 // docs/backend/sycl-memory-design.md).
+// Capability-only form of ggml_backend_dev_supports_op for a SYCL device: true when this backend has a kernel for
+// `op` (its type and shape), whether or not the data it reads is planned onto this device. supports_op is that AND
+// the placement declines (host-demoted KV, planner-on-host), so "supports_op is false" cannot tell a missing kernel
+// from a placement; this can. Reached through ggml_backend_reg_get_proc_address as
+// "ggml_backend_sycl_supports_op_capability".
+GGML_BACKEND_API bool ggml_backend_sycl_supports_op_capability(ggml_backend_dev_t dev, const struct ggml_tensor * op);
+
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
     ggml_backend_t               backend,
     struct ggml_sycl_model_token model,

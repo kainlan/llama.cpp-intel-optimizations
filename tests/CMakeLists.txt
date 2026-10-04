@@ -3358,6 +3358,10 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
+
+    # llama.cpp-pmzl: the classifier resolve_fused_ops() uses to say "placement" or "does not support it" for a fused
+    # op that landed on the CPU. Fake device/buffers/tensors only: no backend, no model, no device.
+    llama_build_and_test(test-llama-fused-landing.cpp)
 endif()
 
 # -------------------------------------------------------------------------
