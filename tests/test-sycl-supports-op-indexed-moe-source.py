@@ -67,7 +67,7 @@ EXPECTED_PRE_INDEXED_GUARD_PREFIX = (
 TYPE_HELPER_START = "static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {"
 TYPE_HELPER_END = FUNCTION_START
 MUL_MAT_TYPE_ORDER = (
-    "F32", "F16", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "MXFP4",
+    "F32", "F16", "Q2_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "MXFP4",
     "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ1_S", "IQ1_M",
     "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS",
 )
@@ -460,7 +460,8 @@ def test_removing_only_early_return_is_rejected() -> None:
 
 def test_reopening_early_guard_to_unconditional_admission_is_rejected() -> None:
     # The pre-b10630 form admitted every expert type into the MoE executor;
-    # q2_0 MMID then computed ERR ~90 wrong answers. Stripping the type guard
+    # q2_0 MMID then computed ERR ~90 wrong answers (it had no SYCL kernel; it has
+    # one since llama.cpp-s36q phase 4, so tq2_0 stands in below). Stripping the type guard
     # back to a bare `return true;` body must fail the contract.
     function = supports_function(SOURCE)
     _, _, early_body = braced_body(function, EARLY_GUARD)
@@ -470,13 +471,14 @@ def test_reopening_early_guard_to_unconditional_admission_is_rejected() -> None:
 
 
 def test_widening_type_guard_exemptions_is_rejected() -> None:
-    # Adding another exempt type (here q2_0) reopens the wrong-answer path.
+    # Adding another exempt type (here tq2_0, which has no SYCL kernel) reopens the
+    # wrong-answer path.
     function = supports_function(SOURCE)
     _, _, early_body = braced_body(function, EARLY_GUARD)
     assert EARLY_TYPE_GUARD in early_body
     widened = early_body.replace(
         "indexed_a_type != GGML_TYPE_NVFP4",
-        "indexed_a_type != GGML_TYPE_NVFP4 && indexed_a_type != GGML_TYPE_Q2_0",
+        "indexed_a_type != GGML_TYPE_NVFP4 && indexed_a_type != GGML_TYPE_TQ2_0",
         1,
     )
     assert not contract(replace_in_supports_function(SOURCE, early_body, widened))

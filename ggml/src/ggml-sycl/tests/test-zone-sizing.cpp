@@ -1034,10 +1034,14 @@ int main() {
         CHECK(!claims(GGML_TYPE_Q8_0, false, false, true) && !claims(GGML_TYPE_Q4_0, false, false, true) &&
                   !claims(GGML_TYPE_MXFP4, false, false, true) && !claims(GGML_TYPE_Q6_K, false, false, true),
               "a coalesced-capable type is not claimed");
-        // SYCL refuses a dense MUL_MAT for these although the router can dequantize two of them: no copy is reserved.
+        // SYCL refuses a dense MUL_MAT for these although the router can dequantize them: no copy is reserved.
         CHECK(!claims(GGML_TYPE_NVFP4, false, false, true), "NVFP4 is refused by SYCL's dense MUL_MAT, so not claimed");
         CHECK(!claims(GGML_TYPE_Q1_0, false, false, true), "Q1_0 is refused by SYCL's dense MUL_MAT, so not claimed");
-        CHECK(!claims(GGML_TYPE_Q2_0, false, false, true), "Q2_0 is refused by SYCL's dense MUL_MAT, so not claimed");
+        // Q2_0 left that group when it gained its SYCL kernels (llama.cpp-s36q phase 4): dense Q2_0 is executed, is
+        // neither MMQ-served nor coalesced, and has a to_fp16 converter, so its PP route is the f16 dequant arm.
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q2_0), "Q2_0 draws the dequant arm");
+        CHECK(claims(GGML_TYPE_Q2_0, false, false, true), "a dense Q2_0 weight is claimed");
+        CHECK(!claims(GGML_TYPE_Q2_0, false, true, true), "a Q2_0 expert stack is not claimed");
         CHECK(ggml_sycl::dense_mul_mat_type_supported(GGML_TYPE_IQ4_XS) &&
                   !ggml_sycl::dense_mul_mat_type_supported(GGML_TYPE_NVFP4),
               "the dense MUL_MAT list carries the IQ family and not NVFP4");

@@ -769,6 +769,14 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-mmvq-consumer-coverage.py)
     set_tests_properties(test-sycl-moe-mmvq-consumer-coverage PROPERTIES
         LABELS "sycl;moe;source;hostonly;python" TIMEOUT 30)
+    # Q2_0 has every SYCL piece it is admitted on: dequant, vec_dot, the dense and _id MMVQ arms,
+    # the MUL_MAT allowlist entry, and a GET_ROWS predicate that still declines it (llama.cpp-s36q
+    # phase 4). The numerics are test-sycl-q2-0-kernels; this is the structural half.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-q2-0-wiring-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-q2-0-wiring-source.py
+        LABEL "sycl;quant;source;hostonly;python"
+        TIMEOUT 30)
     add_test(NAME test-sycl-lifecycle-g1-harness
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-g1-harness.py)
     set_tests_properties(test-sycl-lifecycle-g1-harness PROPERTIES

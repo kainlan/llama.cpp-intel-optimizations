@@ -307,6 +307,19 @@ static __dpct_inline__ void dequantize_q1_0(const void *vx, const int64_t ib,
     v.y() = (2 * bit_1 - 1) * d;
 }
 
+// Q2_0: 2-bit codes, four per byte low bits first, weight = (code - 1) * d. An even iqs
+// yields weights iqs and iqs + 1, which share one byte (QR2_0 == 1 pairing).
+static __dpct_inline__ void dequantize_q2_0(const void * vx, const int64_t ib, const int iqs, dfloat2 & v) {
+    const block_q2_0 * x = (const block_q2_0 *) vx;
+    const dfloat       d = x[ib].d;
+
+    const int shift = (iqs % 4) * 2;
+    const int q     = x[ib].qs[iqs / 4] >> shift;
+
+    v.x() = ((q & 3) - 1) * d;
+    v.y() = (((q >> 2) & 3) - 1) * d;
+}
+
 static __dpct_inline__ void dequantize_nvfp4(const void *vx, const int64_t ib,
                                              const int iqs, dfloat2 &v) {
     const block_nvfp4 & xb = ((const block_nvfp4 *) vx)[ib];

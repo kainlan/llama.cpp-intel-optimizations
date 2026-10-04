@@ -10766,7 +10766,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // The same single-expert, single-row shape for the other types the SYCL _id path serves. The shape
     // needs the MUL_MAT_ID dispatch to publish expert handles for a src0 that is ne[2] == 1 and
     // unclassified by name (llama.cpp-s36q); a type without a case here would not show a gap.
-    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS }) {
+    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0 }) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
     }
 
@@ -10831,14 +10831,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     //    kernel's `row >= nrows_per_expert` guard is exercised, at n = 1 and n > 1, with b false and true;
     //  - m = 64, k = 768: a k that is not a power of two (3 x 256), at n > 1.
     // Types move into mmid_sweep_types as their _id kernels land.
-    static const ggml_type mmid_sweep_types[] = { GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
-                                                 GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,  GGML_TYPE_IQ2_S };
+    // Q2_0 (phase 4) is in base_types, which already ran the n_mats x n_used x n sweep for it above, so
+    // that sweep is skipped for it here and only the added shapes below (m = 66/70, k = 768, n_mats = 1) run.
+    static const ggml_type mmid_sweep_types[] = { GGML_TYPE_IQ4_NL,  GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
+                                                  GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,  GGML_TYPE_IQ2_S,
+                                                  GGML_TYPE_Q2_0 };
     for (ggml_type type_a : mmid_sweep_types) {
-        for (int n_mats : {4, 8}) {
-            for (int n_used : {1, 2, 4}) {
-                for (bool b : {false, true}) {
-                    for (int n : {1, 4, 5, 17, 32, 129}) {
-                        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, 512, n, 256));
+        const bool in_base_types =
+            std::find(std::begin(base_types), std::end(base_types), type_a) != std::end(base_types);
+        if (!in_base_types) {
+            for (int n_mats : {4, 8}) {
+                for (int n_used : {1, 2, 4}) {
+                    for (bool b : {false, true}) {
+                        for (int n : {1, 4, 5, 17, 32, 129}) {
+                            test_cases.emplace_back(
+                                new test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, 512, n, 256));
+                        }
                     }
                 }
             }

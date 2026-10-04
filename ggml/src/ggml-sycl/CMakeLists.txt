@@ -2698,6 +2698,47 @@ set_tests_properties(sycl-runtime-alloc-flag-slab-released-at-shutdown PROPERTIE
 )
 endif() # direct-source static SYCL fixture
 
+# Test: numerics of the SYCL Q2_0 device functions (dequantize_q2_0, vec_dot_q2_0_q8_1)
+# against a double-precision oracle (llama.cpp-s36q phase 4). Header-only: it includes
+# dequantize.hpp / vecdotq.hpp and launches the functions itself, so it links no backend
+# library. Runs on the OpenCL CPU device and touches no GPU. Built once per dfloat width,
+# because dequantize_q2_0 computes in dfloat (half under GGML_SYCL_F16, float otherwise)
+# and a single build would leave the other arithmetic path unexercised. The F16 flag is a
+# directory-wide definition when GGML_SYCL_F16 is ON, so each variant sets it explicitly.
+foreach (_q2_0_variant f16 f32)
+    set(_q2_0_target test-sycl-q2-0-kernels)
+    if (_q2_0_variant STREQUAL "f32")
+        set(_q2_0_target test-sycl-q2-0-kernels-f32)
+    endif()
+    add_executable(${_q2_0_target}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-q2-0-kernels.cpp
+    )
+    target_include_directories(${_q2_0_target} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(${_q2_0_target} PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(${_q2_0_target} PRIVATE "-fsycl")
+    target_compile_definitions(${_q2_0_target} PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+        GGML_SYCL_PRIVATE_TESTING=1
+    )
+    if (_q2_0_variant STREQUAL "f16")
+        target_compile_definitions(${_q2_0_target} PRIVATE GGML_SYCL_F16)
+    else()
+        target_compile_options(${_q2_0_target} PRIVATE "-UGGML_SYCL_F16")
+    endif()
+    add_test(NAME ${_q2_0_target} COMMAND ${_q2_0_target})
+    set_tests_properties(${_q2_0_target} PROPERTIES
+        LABELS "sycl;quant;hostonly;tdd"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        TIMEOUT 120
+    )
+endforeach()
+
 # Test: unified-cache layout and multi-device placement choices, plus the
 # fused-gate_up expert-tensor classifier regression guard (llama.cpp-zozu).
 #
