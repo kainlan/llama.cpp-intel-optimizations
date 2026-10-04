@@ -165,11 +165,11 @@ def expected_pre_guard_decisions():
         ("if", "a_type==GGML_TYPE_Q4_1&&b->ne[1]==1", reject),
         ("if", "a_type==GGML_TYPE_IQ4_NL||a_type==GGML_TYPE_IQ4_XS||a_type==GGML_TYPE_IQ3_XXS||a_type==GGML_TYPE_IQ3_S||a_type==GGML_TYPE_IQ2_XXS||a_type==GGML_TYPE_IQ2_XS||a_type==GGML_TYPE_IQ2_S||a_type==GGML_TYPE_IQ1_S||a_type==GGML_TYPE_IQ1_M", (("if", "b->ne[1]==1&&ggml_nrows(b)>1", reject),)),
         ("statement", "ggml_typesrc0_type=op->src[0]->type"),
-        # llama.cpp-kmeq: a BF16 WEIGHT is materialised to F32 once and then runs the supported dense path, so
-        # BF16 is admitted exactly when that route is available for this tensor and refused otherwise. The
-        # admission reuses the dispatch-side predicate (same composed check), so the two cannot drift apart.
+        # llama.cpp-9qjy: a BF16 WEIGHT runs natively from the BF16 bytes the planner placed, so BF16 is admitted
+        # exactly when that route is available for this op and refused otherwise. The admission reuses the
+        # executor's own predicate (same composed check), so the two cannot drift apart.
         ("if", "src0_type==GGML_TYPE_BF16", (
-            ("if", "ggml_sycl_bf16_weight_materialize_route_available(op->src[0],device)", (("return", "true"),)),
+            ("if", "ggml_sycl_bf16_weight_native_route_available(op->src[0],op->src[1],op,device)", (("return", "true"),)),
             ("return", "false"),
         )),
         ("if", "ggml_is_permuted(a)&&!ggml_is_contiguous(a)&&a->ne[2]>1&&a->ne[3]>1&&src0_type==GGML_TYPE_F16", reject),

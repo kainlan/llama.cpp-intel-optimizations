@@ -109,6 +109,7 @@
 #include "ggml-sycl/moe-layer-ids-cache.hpp"
 #include "ggml-sycl/moe-mmvq-tables.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
+#include "ggml-sycl/mul-mat-bf16.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/onednn-woq.hpp"
 #include "ggml-sycl/orchestrator.hpp"
@@ -7744,6 +7745,7 @@ static bool ggml_sycl_is_device_vram_buffer(const ggml_tensor * t);
 static bool ggml_sycl_is_host_resident_weight(const ggml_tensor * src0, sycl::queue * stream);
 // Forward declaration: check if weight executes on host rather than GPU (defined in dispatch section).
 static bool ggml_sycl_weight_executes_on_host(const ggml_tensor * tensor, int device);
+static bool ggml_sycl_weight_residency_is_observable(const ggml_tensor * tensor);
 // Forward declaration: check if blind preload should be skipped (defined in MoE preload section).
 bool        ggml_sycl_should_skip_blind_preload(int64_t n_experts);
 
@@ -12107,14 +12109,7 @@ static bool ggml_sycl_owner_name_key_matches(const std::string & key, ggml_sycl:
            consume_uint(owner.owner.generation) && pos < key.size() && key[pos++] == ':';
 }
 
-// llama.cpp-kmeq: defined next to g_sycl_bf16_materialize_cache itself
-// (this TU, further down); forward-declared so
-// ggml_sycl_erase_weight_identities_for_owner can call it without
-// reordering the cache's own definition.
-static void ggml_sycl_bf16_materialize_cache_erase_for_owner(ggml_sycl::lifecycle::ModelToken owner);
-
 static void ggml_sycl_erase_weight_identities_for_owner(ggml_sycl::lifecycle::ModelToken owner) {
-    ggml_sycl_bf16_materialize_cache_erase_for_owner(owner);
     {
         std::lock_guard<std::mutex> lock(g_sycl_weight_identity_mutex);
         for (auto it = g_sycl_weight_identities_by_name.begin(); it != g_sycl_weight_identities_by_name.end();) {
@@ -14156,252 +14151,37 @@ tensor_usage ggml_sycl_get_tensor_usage(const ggml_tensor * tensor) {
     return inferred;
 }
 
-// llama.cpp-kmeq: BF16 weight -> F32 materialization for MUL_MAT.
+// llama.cpp-9qjy: BF16 dense weights run natively, in the layout they were planned in.
 //
-// The SYCL backend has no executable dense dispatch for BF16 (see the
-// GGML_OP_MUL_MAT case in ggml_backend_sycl_device_supports_op below) --
-// no quantized or floating-point kernel on this backend reads BF16 bit
-// patterns directly. Rather than declining every BF16 weight to CPU
-// unconditionally (upstream ships model.per_layer_model_proj in
-// gemma3n/gemma4 as BF16; llama.cpp-kmeq), materialize a device-resident
-// F32 copy once, cache it for the weight's lifetime, and let the
-// existing, fully-supported F32 dense mul_mat path run against that
-// instead. This is dtype- and support-predicate-driven, not name-keyed:
-// any BF16 weight feeding a plain MUL_MAT takes this route, not just
-// this one gemma tensor. Deliberately scoped to MUL_MAT only -- MUL_MAT_ID
-// (indexed/MoE) has its own type gate via ggml_sycl_mul_mat_type_supported()
-// and is not touched here; no supported architecture currently routes a
-// BF16 weight through it.
+// A BF16 weight (gemma4 per_layer_model_proj, Qwen3.8 routers / hyper-connection
+// projections / q_proj / k_proj / ssm_alpha / ssm_beta) is placed by the planner as
+// raw BF16 at ggml_nbytes and uploaded once. ggml_sycl_mul_mat_bf16_weight consumes
+// exactly those bytes (mul-mat-bf16.hpp): there is no second, F32 copy, so the
+// planner's byte count for the weight is what lives on the device, and a token reads
+// half the bytes the F32 route read. This replaces llama.cpp-kmeq's route, which
+// allocated an unplanned F32 copy at first dispatch and aborted the load when the
+// planner had already filled VRAM.
 //
-// Conversion runs on the HOST via ggml_bf16_to_fp32_row() -- the same
-// portable, already-correctness-tested routine every other ggml backend
-// uses for BF16 support -- reading tensor->data. For a cache-managed
-// weight that is the tensor's ORIGINAL host bytes (mmap'd or loaded
-// buffer): ggml_sycl_host_data() is a direct read of tensor->data, stable
-// regardless of where the unified cache has since staged device copies.
-// The resulting F32 buffer is allocated through the unified cache's
-// owner-first surface (alloc_role::WEIGHT, matching every other
-// cache-managed weight allocation -- see layer-streaming.cpp for the same
-// alloc_request shape) and cached by owner+name+device so a per-token
-// graph rebuild never re-converts or re-uploads.
+// ggml_sycl_bf16_weight_dispatch_available() lives in common.hpp (an inline,
+// externally-linked function, not `static` here) so a host-side test can call the
+// exact same predicate production code uses -- see its definition there.
 //
-// Cleaned up at model teardown by ggml_sycl_bf16_materialize_cache_erase_for_owner(),
-// called from ggml_sycl_erase_weight_identities_for_owner() -- without that,
-// every load/unload cycle would leak the materialized F32 buffer: owner
-// tokens are unique per load, so a freed model's keys are never reused and
-// its entries (and the mem_handle leases they hold) would sit unreferenced
-// forever, exactly the "ownerless leaked lease" class the unified cache's
-// own strict-lease checking (GGML_SYCL_STRICT_LEASES=1) exists to catch.
-// g_sycl_bf16_materialize_mutex guards both maps below. It is held only for
-// O(1) map lookups/inserts/erases -- never across the slow materialization
-// work (allocation, host conversion, device copy) -- so concurrent
-// materialization of DIFFERENT weights never blocks on it. Per-key
-// serialization for the SAME weight (see ggml_sycl_bf16_weight_materialize_f32)
-// uses the per-key mutex in g_sycl_bf16_materialize_locks instead, held only
-// by racers for that one key.
-static std::mutex                                                   g_sycl_bf16_materialize_mutex;
-static std::unordered_map<std::string, ggml_sycl::mem_handle>       g_sycl_bf16_materialize_cache;
-static std::unordered_map<std::string, std::shared_ptr<std::mutex>> g_sycl_bf16_materialize_locks;
-
-// Prunes every cache entry (and its per-key lock) owned by `owner`. Keyed the
-// same way ggml_sycl_erase_weight_identities_for_owner()'s other maps are (an
-// "owner_name_key(...)" prefix, matched via ggml_sycl_owner_name_key_matches()
-// which parses only the "model:load:slot:generation:" prefix and does not
-// care what follows it) -- this cache's keys append "|dev<N>" after the
-// name, which the matcher's prefix-only parse ignores correctly. Erasing a
-// g_sycl_bf16_materialize_locks entry that a racer still holds a shared_ptr
-// to is safe: the entry is just this map's OWN reference to the
-// std::shared_ptr<std::mutex>, and refcounting keeps the mutex alive for
-// whoever is still using it until they release their copy.
-static void ggml_sycl_bf16_materialize_cache_erase_for_owner(ggml_sycl::lifecycle::ModelToken owner) {
-    std::lock_guard<std::mutex> lock(g_sycl_bf16_materialize_mutex);
-    for (auto it = g_sycl_bf16_materialize_cache.begin(); it != g_sycl_bf16_materialize_cache.end();) {
-        it = ggml_sycl_owner_name_key_matches(it->first, owner) ? g_sycl_bf16_materialize_cache.erase(it) :
-                                                                  std::next(it);
-    }
-    for (auto it = g_sycl_bf16_materialize_locks.begin(); it != g_sycl_bf16_materialize_locks.end();) {
-        it = ggml_sycl_owner_name_key_matches(it->first, owner) ? g_sycl_bf16_materialize_locks.erase(it) :
-                                                                  std::next(it);
-    }
-}
-
-static std::string ggml_sycl_bf16_materialize_key(const ggml_tensor * tensor, int device) {
-    const auto  owner = ggml_sycl_resolve_tensor_owner(tensor);
-    std::string key   = ggml_sycl_owner_name_key(owner, tensor->name);
-    key += "|dev";
-    key += std::to_string(device);
-    return key;
-}
-
-// ggml_sycl_bf16_weight_dispatch_available() now lives in common.hpp (an
-// inline, externally-linked function, not `static` here) specifically so a
-// host-side test can call the exact same predicate production code uses --
-// see its definition there, next to ggml_sycl_host_data(), for the full
-// rationale and the fattn.hpp-style pattern it mirrors.
-
-// llama.cpp-kmeq: composed admission check -- defined next to
-// ggml_backend_buffer_is_sycl_split()/_is_sycl_tp() themselves (this TU,
-// further down, right after both exist) so it can call them without
-// reordering their own definitions; forward-declared here because it is
-// consulted from TWO call sites that both need to be this SAME function
-// (one authority for admission and dispatch, not two independently-written
-// checks that could drift): ggml_backend_sycl_device_supports_op()'s BF16
-// case, and ggml_sycl_bf16_weight_materialize_f32() immediately below.
-// ggml_sycl_bf16_weight_dispatch_available() (common.hpp) is deliberately
-// SYCL-buffer-class-blind (it is the pure, host-testable predicate); this
-// wrapper adds the one check that predicate cannot make from common.hpp --
-// a BF16 weight living on a split or TP buffer must decline, because the
-// retyped F32 view's ->buffer is left pointing at the ORIGINAL tensor's
-// buffer object (see the ->buffer comment at the retyping call site in
-// ggml_sycl_mul_mat), and routing a materialized, non-split, single-device
-// F32 buffer down the multi-device split/TP path would silently produce
-// wrong results, not merely decline -- a real, reachable combination under
-// LLAMA_FTYPE_MOSTLY_BF16 + --split-mode row.
-static bool ggml_sycl_bf16_weight_materialize_route_available(const ggml_tensor * tensor, int device);
-
-// Returns the resolved device pointer to a cached F32 materialization of
-// a BF16 weight, creating and uploading it on first use. Returns nullptr
-// if materialization is not possible or fails -- the caller must then
-// treat the op as genuinely unsupported.
-//
-// TOCTOU note: CLAUDE.md documents real host-submission overlap across
-// calls on this backend's direct/fallback dispatch paths, so two threads
-// reaching this function for the SAME weight at the SAME time is not
-// theoretical. The naive "check cache, materialize if miss, write cache"
-// sequence has an unlocked window between the check and the write: both
-// racers would see a miss, both would allocate+convert+upload, and the
-// second one's `g_sycl_bf16_materialize_cache[key] = std::move(handle)`
-// would destroy the FIRST racer's mem_handle while its raw pointer might
-// already be feeding a live GEMM on another queue -- a use-after-free, not
-// just wasted work. Fixed by claiming a per-key std::mutex (in
-// g_sycl_bf16_materialize_locks) under the map lock BEFORE doing any slow
-// work, then doing the slow work (and the final cache write) under that
-// per-key lock instead of the map lock -- so a second racer for the SAME
-// key blocks until the first finishes and then finds the cache already
-// populated (the re-check just inside the per-key lock, below), while
-// concurrent materialization of DIFFERENT keys never contends at all.
-static void * ggml_sycl_bf16_weight_materialize_f32(const ggml_tensor * tensor, int device) {
-    if (!ggml_sycl_bf16_weight_materialize_route_available(tensor, device)) {
-        return nullptr;
-    }
-
-    const std::string key = ggml_sycl_bf16_materialize_key(tensor, device);
-
-    std::shared_ptr<std::mutex> key_lock;
-    {
-        std::lock_guard<std::mutex> lock(g_sycl_bf16_materialize_mutex);
-        auto                        it = g_sycl_bf16_materialize_cache.find(key);
-        if (it != g_sycl_bf16_materialize_cache.end()) {
-            auto resolved = it->second.resolve(device);
-            if (resolved && resolved.on_device) {
-                return resolved.ptr;
-            }
-            // Stale/invalid entry -- re-materialize below rather than hand
-            // back a dead pointer.
-            g_sycl_bf16_materialize_cache.erase(it);
-        }
-        auto lock_it = g_sycl_bf16_materialize_locks.find(key);
-        if (lock_it == g_sycl_bf16_materialize_locks.end()) {
-            lock_it = g_sycl_bf16_materialize_locks.emplace(key, std::make_shared<std::mutex>()).first;
-        }
-        key_lock = lock_it->second;
-    }
-
-    // Serializes only racers for THIS key. Held across all the slow work
-    // below (and the final cache write), never across the map lock above.
-    std::lock_guard<std::mutex> materialize_lock(*key_lock);
-    {
-        // Re-check: another racer may have finished materializing this
-        // exact key while we were waiting for the map lock and then this
-        // per-key lock.
-        std::lock_guard<std::mutex> lock(g_sycl_bf16_materialize_mutex);
-        auto                        it = g_sycl_bf16_materialize_cache.find(key);
-        if (it != g_sycl_bf16_materialize_cache.end()) {
-            auto resolved = it->second.resolve(device);
-            if (resolved && resolved.on_device) {
-                return resolved.ptr;
-            }
-        }
-    }
-
-    const int64_t n = ggml_nelements(tensor);
-    if (n <= 0) {
-        return nullptr;
-    }
-
-    // Resolve the ACTUAL current source bytes the same way
-    // ggml_sycl_get_weight_layout_ptr() does -- tensor->data is only a
-    // fallback. Under tiered mode (g_tiered_enabled, on for any normal
-    // model load: see compute_vram_budget_for_plan()), a weight's real
-    // backing bytes live wherever the tiered cache has staged them (mmap,
-    // host-pinned, or already device-resident), and tensor->data can be a
-    // placeholder that reads as zero-filled memory rather than the GGUF
-    // bytes. Mirror the resolution exactly rather than re-deriving it.
-    const void *     src_ptr   = ggml_sycl_host_data(tensor);
-    sycl::usm::alloc src_alloc = sycl::usm::alloc::unknown;
-    if (tensor->name[0] != '\0' && g_tiered_enabled.load(std::memory_order_relaxed)) {
-        ggml_sycl::memory_tier tier   = ggml_sycl::memory_tier::MMAP;
-        void *                 cached = ggml_sycl_get_cached_tensor_ptr_for(tensor, device, &tier, nullptr, &src_alloc);
-        if (cached) {
-            src_ptr = cached;
-        }
-    }
-    if (!src_ptr) {
-        return nullptr;
-    }
-    if (src_alloc == sycl::usm::alloc::unknown) {
-        src_alloc = ggml_sycl_get_alloc_type(src_ptr);
-    }
-
-    const size_t             bytes = static_cast<size_t>(n) * sizeof(float);
-    sycl::queue &            q     = ggml_sycl_get_device(device).default_queue();
-    ggml_sycl::alloc_request req{};
-    req.queue                          = &q;
-    req.device                         = device;
-    req.size                           = bytes;
-    req.intent.role                    = ggml_sycl::alloc_role::WEIGHT;
-    req.intent.category                = ggml_sycl::runtime_category::OTHER;
-    req.intent.constraints.must_device = true;
-    ggml_sycl::mem_handle handle       = ggml_sycl::unified_allocate(req);
-    auto                  resolved     = handle.resolve(device);
-    if (!resolved || !resolved.on_device) {
-        GGML_LOG_WARN("[SYCL] BF16->F32 materialization failed to allocate for %s (%.1f MB)\n", tensor->name,
-                      bytes / (1024.0 * 1024.0));
-        return nullptr;
-    }
-
-    if (src_alloc == sycl::usm::alloc::device) {
-        // Source bytes are already device-resident (staged there as raw
-        // BF16 by the normal weight-upload path) -- convert entirely
-        // on-device, no host round trip.
-        const auto * src_dev = static_cast<const ggml_bf16_t *>(src_ptr);
-        float *      dst_dev = static_cast<float *>(resolved.ptr);
-        q.parallel_for(sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) {
-             dst_dev[i] = sycl::bit_cast<float>(static_cast<uint32_t>(src_dev[i].bits) << 16);
-         }).wait();
-    } else {
-        // Host-accessible source (mmap, host-pinned, or plain heap) --
-        // convert on the CPU with ggml's own, already-correctness-tested
-        // routine, then upload once.
-        const auto *       host_bf16 = static_cast<const ggml_bf16_t *>(src_ptr);
-        std::vector<float> host_f32(static_cast<size_t>(n));
-        ggml_bf16_to_fp32_row(host_bf16, host_f32.data(), n);
-
-        ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
-            host_f32.data(), GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, bytes);
-        ggml_sycl::mem_copy(handle, src_handle, bytes, q);
-        q.wait();
-    }
-
-    GGML_LOG_INFO("[SYCL] materialized BF16->F32 weight %s (%.1f MB) on device %d\n", tensor->name,
-                  bytes / (1024.0 * 1024.0), device);
-
-    {
-        std::lock_guard<std::mutex> lock(g_sycl_bf16_materialize_mutex);
-        g_sycl_bf16_materialize_cache[key] = std::move(handle);
-    }
-    return resolved.ptr;
-}
+// Composed admission check, defined next to ggml_backend_buffer_is_sycl_split()/
+// _is_sycl_tp() themselves (this TU, further down) so it can call them without
+// reordering their own definitions; forward-declared here because it is consulted
+// from TWO call sites that both need to be this SAME function (one authority for
+// admission and execution, not two independently-written checks that could drift):
+// ggml_backend_sycl_device_supports_op()'s BF16 case, and the executor
+// ggml_sycl_mul_mat_bf16_weight(). The weight predicate is deliberately SYCL-buffer-
+// class-blind (it is the pure, host-testable one); this wrapper adds the shape
+// contract of the native kernel and the checks neither can make from a header --
+// a BF16 weight living on a split or TP buffer must decline (the kernel reads one
+// single-device matrix), as must one the planner put on the host or on another
+// device, or whose buffer this backend cannot observe (the executor aborts on those).
+static bool ggml_sycl_bf16_weight_native_route_available(const ggml_tensor * src0,
+                                                         const ggml_tensor * src1,
+                                                         const ggml_tensor * dst,
+                                                         int                 device);
 
 ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key(const ggml_tensor * tensor, int device) {
     ggml_sycl_cache_id id{};
@@ -36508,11 +36288,11 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
     }
     // llama.cpp-dyi3 round 6 (root cause, task comment log): this fast path
     // used to live AFTER the recording gate below, only reachable on the
-    // non-recording side. gemma4's kmeq BF16->F32 materialization
-    // (~line 60095, "<name>.bf16_materialized_f32") builds a stack-local
+    // non-recording side. gemma4's kmeq BF16->F32 materialization (removed by
+    // llama.cpp-9qjy, which runs BF16 weights natively) built a stack-local
     // alias tensor with extra=nullptr and data pointing at the already-
     // materialized F32 device buffer, keyed under a synthesized cache name
-    // that is DESIGNED to miss cache->get_view() (kmeq's own comment).
+    // that was DESIGNED to miss cache->get_view().
     // Under recording the old gate below tried only get_view(), missed by
     // design, and returned nullptr -- silently failing MUL_MAT dispatch for
     // gemma4's per-layer-embedding projection on every recorded/replayed
@@ -41760,19 +41540,25 @@ static bool ggml_backend_buffer_is_sycl_tp(ggml_backend_buffer_t buffer) {
     return buffer && buffer->buft && buffer->buft->iface.get_name == ggml_backend_sycl_tp_buffer_type_name;
 }
 
-// llama.cpp-kmeq: see the forward declaration (near
-// ggml_sycl_bf16_weight_materialize_f32) for the full rationale. Composes
-// the pure, host-testable predicate with the one check it cannot make from
-// common.hpp: decline a BF16 weight living on a split or TP buffer, since
-// the retyped F32 view's ->buffer stays pointed at the ORIGINAL tensor's
-// buffer object and would otherwise route materialized, single-device data
-// down the multi-device split/TP path. Both call sites --
-// ggml_backend_sycl_device_supports_op()'s BF16 case (admission) and
-// ggml_sycl_bf16_weight_materialize_f32() (dispatch) -- consult this SAME
-// function, so they cannot independently drift out of agreement.
-static bool ggml_sycl_bf16_weight_materialize_route_available(const ggml_tensor * tensor, int device) {
-    return ggml_sycl_bf16_weight_dispatch_available(tensor, device) &&
-           !ggml_backend_buffer_is_sycl_split(tensor->buffer) && !ggml_backend_buffer_is_sycl_tp(tensor->buffer);
+// llama.cpp-9qjy: see the forward declaration (near ggml_sycl_get_tensor_usage) for the
+// full rationale. Composes the pure, host-testable weight predicate and the native
+// kernel's shape contract with the checks neither can make: decline a BF16 weight on a
+// split or TP buffer, on a buffer this backend cannot observe, planned on the host, or
+// planned on another device. Those placement declines are unconditional -- they hold even
+// where supports_op skips its own host decline (the multi-GPU router-logits exception),
+// because the executor aborts on exactly those inputs: admitting them would trade a clean
+// CPU fallback for an abort. Both call sites -- ggml_backend_sycl_device_supports_op()'s
+// BF16 case (admission) and ggml_sycl_mul_mat_bf16_weight() (execution) -- consult this
+// SAME function, so they cannot independently drift out of agreement.
+static bool ggml_sycl_bf16_weight_native_route_available(const ggml_tensor * src0,
+                                                         const ggml_tensor * src1,
+                                                         const ggml_tensor * dst,
+                                                         int                 device) {
+    return ggml_sycl_bf16_weight_dispatch_available(src0, device) &&
+           ggml_sycl_bf16::mul_mat_shape_supported(src0, src1, dst) &&
+           !ggml_backend_buffer_is_sycl_split(src0->buffer) && !ggml_backend_buffer_is_sycl_tp(src0->buffer) &&
+           ggml_sycl_weight_residency_is_observable(src0) && !ggml_sycl_weight_executes_on_host(src0, device) &&
+           !ggml_sycl_weight_is_planned_on_other_device(src0, device);
 }
 
 static ggml_backend_buffer_t ggml_backend_sycl_tp_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
@@ -64865,6 +64651,74 @@ static ggml_sycl::MatmulDecision ggml_sycl_mul_mat_legacy_fallback_decision(ggml
     return ctx.matmul_orchestrator.select(src0, src1, dst, forced_layout, std::nullopt, false);
 }
 
+// llama.cpp-9qjy: the native BF16-weight executor. Layout follows residency: the weight is
+// consumed in the layout the planner and the unified cache materialized it in (raw BF16, AOS,
+// on the device that executes it), exactly as dispatch selects a device from where an operand
+// lives. It allocates nothing -- no second copy exists to plan -- and waits on nothing: one
+// kernel is submitted on the context's in-order queue.
+//
+// A BF16 weight the plan put on the host never reaches here: supports_op declines it
+// (ggml_sycl_op_is_planned_on_host) and the CPU backend runs it where it already is. Reaching
+// this function with a weight that is not device-resident is a placement defect, not an input
+// to re-route -- copying it to the device per dispatch would be weight streaming.
+static void ggml_sycl_mul_mat_bf16_weight(ggml_backend_sycl_context & ctx,
+                                          const ggml_tensor *         src0,
+                                          const ggml_tensor *         src1,
+                                          ggml_tensor *               dst) try {
+    GGML_ASSERT(src0 != nullptr && src1 != nullptr && dst != nullptr);
+    // The same predicate supports_op admitted this op through.
+    if (!ggml_sycl_bf16_weight_native_route_available(src0, src1, dst, ctx.device)) {
+        GGML_ABORT(
+            "%s: BF16 weight %s reached the native executor outside its admitted shape/placement "
+            "(src1=%s dst=%s); supports_op must have declined it",
+            __func__, src0->name[0] != '\0' ? src0->name : "(unnamed)", ggml_type_name(src1->type),
+            ggml_type_name(dst->type));
+    }
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    // No-materialize resolve: this executor allocates nothing, so a weight the cache cannot
+    // hand back as it is must abort rather than be staged here.
+    const ggml_sycl::resolved_ptr weight = ggml_sycl_resolve_no_materialize(src0, ctx.device);
+    if (!weight || !weight.on_device) {
+        GGML_ABORT(
+            "%s: BF16 weight %s is not device-resident on device %d (planned-host weights run on the CPU "
+            "backend; weight streaming is forbidden)",
+            __func__, src0->name[0] != '\0' ? src0->name : "(unnamed)", ctx.device);
+    }
+    if (weight.layout != GGML_LAYOUT_AOS) {
+        GGML_ABORT(
+            "%s: BF16 weight %s is materialized in layout %s, but the native kernel reads only AOS BF16 "
+            "(support gap to close, not a route to widen)",
+            __func__, src0->name[0] != '\0' ? src0->name : "(unnamed)", ggml_sycl_layout_mode_name(weight.layout));
+    }
+    const size_t weight_bytes = ggml_nbytes(src0);
+    // extent 0 means "unknown" and a bounded consumer must reject it (mem-handle.hpp); the
+    // no-materialize resolve reports the checked tensor extent on every success.
+    if (weight.extent < weight_bytes) {
+        GGML_ABORT("%s: BF16 weight %s resolves to %zu bytes but needs %zu", __func__,
+                   src0->name[0] != '\0' ? src0->name : "(unnamed)", weight.extent, weight_bytes);
+    }
+
+    const float * src1_ddf = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(src1, ctx.device));
+    float *       dst_ddf  = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(dst, ctx.device));
+    GGML_ASSERT(src1_ddf != nullptr && dst_ddf != nullptr);
+
+    int64_t ldx = 0;
+    int64_t ldy = 0;
+    GGML_ASSERT(ggml_sycl_bf16::f32_columns_uniform(src1, &ldx) && ggml_sycl_bf16::f32_columns_uniform(dst, &ldy));
+
+    GGML_SYCL_PROFILE_SCOPE_GEMM("mul_mat.bf16_native");
+    (void) ggml_sycl_bf16::mul_mat_bf16_f32(*ctx.stream(), static_cast<const uint16_t *>(weight.ptr), src1_ddf, dst_ddf,
+                                            src0->ne[0], src0->ne[1], src1->ne[1] * src1->ne[2] * src1->ne[3], ldx, ldy,
+                                            ggml_sycl_info().max_work_group_sizes[ctx.device]);
+} catch (const sycl::exception & exc) {
+    if (ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, exc)) {
+        return;
+    }
+    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+    std::exit(1);
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                               const ggml_tensor *         src0,
                               const ggml_tensor *         src1,
@@ -64894,137 +64748,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 .count());
         ggml_sycl_kernel_profile_record_host_span(entry_label, now_us, now_us);
     }
-    // llama.cpp-kmeq: BF16 weights have no executable dense dispatch on this
-    // backend (see ggml_backend_sycl_device_supports_op's GGML_OP_MUL_MAT
-    // case). supports_op only lets a BF16 op reach here when
-    // ggml_sycl_bf16_weight_materialize_f32() can produce (and cache) an F32
-    // copy, so fetch/materialize it here and recurse against a shallow,
-    // F32-retyped view of src0 -- reusing the existing, fully-supported F32
-    // dense path unchanged rather than teaching every kernel/layout branch
-    // below about BF16.
-    //
-    // PRESERVING identity here (name/extra) was tried first and is WRONG --
-    // this backend's whole weight-pointer resolution chain
-    // (ggml_sycl_resolve_tensor_ptr -> ggml_sycl_get_layout_ptr_impl) is
-    // keyed on (tensor name [+ extra->model_id], layout), not on tensor->data.
-    // The ORIGINAL per_layer_model_proj tensor was already normally staged
-    // by S1-preload as its OWN (BF16) bytes under an AOS cache entry keyed
-    // by its name -- confirmed by the unified-cache inventory logging it at
-    // ~52.5MB, exactly ggml_nbytes() for BF16, not F32. A same-named shallow
-    // copy collides with that entry at EVERY level of the resolution chain:
-    // ggml_sycl_resolve_tensor_ptr's own fast path reads
-    // extra->data_handle[device] (shared, since ->extra is the SAME pointer
-    // for both tensors) before ever looking at ->data; and even with ->extra
-    // cleared, ggml_sycl_get_layout_ptr_impl's cache->lookup(key, target)
-    // resolves `key` from ggml_backend_sycl_get_weight_cache_key(tensor,
-    // device), which hashes tensor->name -- identical for both tensors
-    // regardless of ->extra. Either path hands the GEMM the raw BF16 bytes
-    // reinterpreted as F32: right pointer's worth of memory, wrong contents,
-    // which is exactly the NaN this investigation chased through three
-    // rounds of "the buffer itself is provably correct" evidence before
-    // landing here.
-    //
-    // The fix is to make src0_f32 impossible to confuse with the original:
-    // a synthesized, unique name so every name-keyed lookup above misses
-    // cleanly and falls through to ggml_sycl_get_data_ptr's own fallback,
-    // which (with ->extra cleared) resolves tensor->data via a plain
-    // alloc_registry lookup -- exactly the device pointer this function set.
-    // `.extra` and `.layout` are both explicitly CLEARED, not preserved:
-    // `.layout` is this fork's own resolved-pointer fast-path cache (a field
-    // on the core ggml_tensor struct, separate from ->extra) and would
-    // otherwise carry over whatever the untyped weight had cached there.
-    // Mirrors the existing MoE per-expert row-slicing precedent a few
-    // hundred lines down (`src0_row.layout = nullptr;` / `src1_row.extra =
-    // nullptr;`), which clears the same two fields for the same "don't let a
-    // stale cache entry outlive a reshaped view" reason -- extended here to
-    // src0's own `.extra` too, because unlike a row slice (still genuinely
-    // the same weight, same dtype) this IS a different dtype view that must
-    // not share the original's cache identity at all.
-    //
-    // FOR REVIEWERS -- this is a memory-design smell, not just a local bug:
-    // the unified cache's weight pointer tables are keyed by (name [+
-    // extra->model_id], layout) with no dtype component, so they structurally
-    // cannot distinguish "the same weight materialized in a different type"
-    // from "the same weight, same type, different layout" -- the case they
-    // were designed for. The synthesized name is a SAFE workaround, not a
-    // layering violation: it only affects lookups keyed by this exact string
-    // for the lifetime of this one call, the original name is never mutated
-    // (src0_f32 is a local copy), and nothing else in the codebase has a
-    // reason to look up "<name>.bf16_materialized_f32". It is not a
-    // substitute for making the cache dtype-aware. The long-term fix, if a
-    // second BF16-like materialized-dtype case shows up, is to extend the
-    // cache key (or the `layout_mode` enum used throughout
-    // ggml_sycl_get_weight_layout_ptr) with an explicit dtype/materialization
-    // component, so a retyped view gets a distinct cache slot under its OWN
-    // name instead of needing one.
-    //
-    // `.buffer` is the ONE identity field deliberately left stale (not
-    // cleared like `.extra`/`.layout`): ggml_sycl_mul_mat's own full-dispatch
-    // path unconditionally dereferences it twice more below via
-    // ggml_backend_buffer_is_sycl_split(src0->buffer) -- reached for every
-    // mul_mat regardless of type, not gated behind the TG-fast-path's
-    // ggml_is_quantized() check -- and that function does
-    // `buffer->buft->iface.get_name` with NO null guard, an unconditional
-    // segfault (not even a clean GGML_ASSERT) on a null buffer. Leaving
-    // `.buffer` pointing at the original tensor's buffer object is safe
-    // TODAY because every predicate this codebase currently queries through
-    // it (is_sycl_split, is_host, usage==WEIGHTS) describes a property of
-    // the placement CLASS this weight belongs to -- small, single-device,
-    // non-tensor-split, SYCL-owned -- which the materialized F32 copy
-    // genuinely shares; nothing downstream currently asks "is the buffer
-    // backing *this exact tensor's current ->data*".
-    //
-    // This is ENFORCED, not merely asserted: a BF16 weight actually living
-    // on a split or TP buffer would break the "shares the placement class"
-    // premise above (the materialized F32 copy is single-device; a split/TP
-    // buffer says the ORIGINAL is not), which would route non-split data
-    // down the multi-device split path -- silently wrong results, not a
-    // decline, and reachable under LLAMA_FTYPE_MOSTLY_BF16 +
-    // --split-mode row. ggml_sycl_bf16_weight_materialize_route_available()
-    // (defined next to ggml_backend_buffer_is_sycl_split()/_is_sycl_tp(),
-    // called by BOTH supports_op's admission check above this block's own
-    // BF16 branch AND ggml_sycl_bf16_weight_materialize_f32() below) fails
-    // closed on exactly that case, so a split/TP BF16 weight never reaches
-    // this retyping code at all -- `.buffer`'s staleness is inert by
-    // construction, not by coincidence. If a future consumer needs
-    // `.buffer` to reflect the F32 materialization's own placement (e.g. a
-    // host-vs-device distinction that could differ from the original's),
-    // this assumption breaks, and the fix is to give the materialized
-    // allocation a real backing buffer object (or route that consumer
-    // through supports_op's dtype-aware path), not to null the field --
-    // nulling it crashes the two call sites above outright.
+    // llama.cpp-9qjy: a BF16 dense weight runs natively from the BF16 bytes the planner placed
+    // (ggml_sycl_mul_mat_bf16_weight). The kmeq route that retyped the weight to a lazily
+    // materialized F32 copy and recursed here is gone: that copy was in no plan.
     if (src0 && src0->type == GGML_TYPE_BF16) {
-        void * f32_ptr = ggml_sycl_bf16_weight_materialize_f32(src0, ctx.device);
-        if (!f32_ptr) {
-            // supports_op's admission predicate (ggml_sycl_bf16_weight_dispatch_available)
-            // is allocation-free -- it only checks type/weight/contiguity/host-byte
-            // reachability -- so if it accepted this op, materialization failing
-            // here is a genuine runtime condition (allocation exhaustion, a
-            // conversion/copy failure) that arose AFTER admission, not evidence
-            // the predicate itself is wrong. There is no clean decline this deep
-            // (the op is already committed to this backend), so this stays an
-            // abort, but says what it actually is.
-            GGML_ABORT(
-                "%s: BF16 weight %s passed supports_op's admission check but its F32 "
-                "materialization failed at dispatch time (allocation or conversion "
-                "failure, not a supports_op logic error)",
-                __func__, src0->name[0] != '\0' ? src0->name : "(unnamed)");
-        }
-        ggml_tensor src0_f32 = *src0;
-        src0_f32.type        = GGML_TYPE_F32;
-        src0_f32.data        = f32_ptr;
-        src0_f32.extra       = nullptr;
-        src0_f32.layout      = nullptr;
-        src0_f32.nb[0]       = sizeof(float);
-        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
-            src0_f32.nb[i] = src0_f32.nb[i - 1] * src0_f32.ne[i - 1];
-        }
-        // Unique name so every name-keyed weight-cache lookup downstream
-        // (ggml_backend_sycl_get_weight_cache_key hashes tensor->name) misses
-        // the original BF16 entry cleanly instead of returning its pointer.
-        // See the comment above this block for the full resolution chain.
-        std::snprintf(src0_f32.name, sizeof(src0_f32.name), "%s.bf16_materialized_f32", src0->name);
-        ggml_sycl_mul_mat(ctx, &src0_f32, src1, dst, forced_layout);
+        ggml_sycl_mul_mat_bf16_weight(ctx, src0, src1, dst);
         return;
     }
     GGML_SYCL_PROFILE_SCOPE_GEMM("mul_mat");
@@ -110595,22 +110323,18 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 ggml_type src0_type = op->src[0]->type;
                 if (src0_type == GGML_TYPE_BF16) {
-                    // BF16 has no executable dense dispatch of its own -- but a
-                    // BF16 WEIGHT can be transparently materialized to F32 once
-                    // (llama.cpp-kmeq: ggml_sycl_bf16_weight_materialize_f32,
-                    // consumed by ggml_sycl_mul_mat) and the fully-supported F32
-                    // dense path runs against that instead. Accept ONLY when
-                    // that route is actually available (a genuine, named weight
-                    // tensor with resolvable host bytes, NOT living on a split
-                    // or TP buffer -- see ggml_sycl_bf16_weight_materialize_route_available)
-                    // -- a BF16 activation or an unnamed/synthetic tensor has no
-                    // dispatch and must still fail closed here. This is the SAME
-                    // composed check ggml_sycl_bf16_weight_materialize_f32() uses,
-                    // not an independent re-implementation, so admission and
-                    // dispatch cannot drift apart. Keep it and
-                    // ggml_sycl_mul_mat_type_supported() synchronized with
+                    // A BF16 WEIGHT runs natively, from the BF16 bytes the planner placed
+                    // (llama.cpp-9qjy: ggml_sycl_mul_mat_bf16_weight, mul-mat-bf16.hpp) --
+                    // no second copy. Accept ONLY when that route is actually available
+                    // (a genuine, named weight tensor, NOT on a split or TP buffer, not
+                    // planned on the host or another device, in the one shape the kernel computes -- see
+                    // ggml_sycl_bf16_weight_native_route_available): a BF16 activation or an
+                    // unnamed/synthetic tensor has no dispatch and must still fail closed
+                    // here. This is the SAME composed check the executor asserts, not an
+                    // independent re-implementation, so admission and execution cannot drift
+                    // apart. Keep it and ggml_sycl_mul_mat_type_supported() synchronized with
                     // executable dispatch additions.
-                    if (ggml_sycl_bf16_weight_materialize_route_available(op->src[0], device)) {
+                    if (ggml_sycl_bf16_weight_native_route_available(op->src[0], op->src[1], op, device)) {
                         return true;
                     }
                     return false;

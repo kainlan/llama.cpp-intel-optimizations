@@ -83,12 +83,7 @@ CONSUMERS = [
     (
         "ggml_sycl_get_tensor_usage",
         "tensor_usage ggml_sycl_get_tensor_usage(const ggml_tensor * tensor) {",
-        "// llama.cpp-kmeq: BF16 weight -> F32 materialization for MUL_MAT.",
-    ),
-    (
-        "ggml_sycl_bf16_materialize_key",
-        "static std::string ggml_sycl_bf16_materialize_key(const ggml_tensor * tensor, int device) {",
-        "// ggml_sycl_bf16_weight_dispatch_available() now lives in common.hpp",
+        "// llama.cpp-9qjy: BF16 dense weights run natively, in the layout they were planned in.",
     ),
     (
         "ggml_backend_sycl_get_weight_cache_key",

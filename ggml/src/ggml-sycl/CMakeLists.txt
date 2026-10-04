@@ -1850,6 +1850,35 @@ set_tests_properties(sycl-kv-slice-sizing PROPERTIES
     TIMEOUT 60
 )
 
+# llama.cpp-9qjy: the native BF16-weight MUL_MAT kernels (mul-mat-bf16.hpp) and
+# the shape contract that admits them, checked against a double-precision
+# reference. The kernels are header-only and need no backend state, so the test
+# compiles them directly (device code, JIT spir64: SYCL_LINK_ONLY_TEST_OPTIONS
+# without the AOT list is enough) and links ggml-base alone for the BF16
+# converters. It allocates a few MB of USM on whatever device the selector
+# picks and runs for seconds: the registration pins opencl:cpu so it never
+# touches a GPU; run the binary under a GPU selector to check the same kernels
+# there. NAME carries none of the substrings the throttled sweep excludes
+# (residency|mem-handle|cache), and neither do the labels.
+add_executable(test-sycl-bf16-mul-mat
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-bf16-mul-mat.cpp
+)
+target_include_directories(test-sycl-bf16-mul-mat PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-sycl-bf16-mul-mat PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-bf16-mul-mat PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_libraries(test-sycl-bf16-mul-mat PRIVATE ggml-base)
+set_target_properties(test-sycl-bf16-mul-mat PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-bf16-mul-mat COMMAND test-sycl-bf16-mul-mat)
+set_tests_properties(sycl-bf16-mul-mat PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};ONEAPI_DEVICE_SELECTOR=opencl:cpu"
+    LABELS "sycl;bf16;kernel;hostonly"
+    TIMEOUT 300
+)
+
 # llama.cpp-3aos: per-layer KV sizing (placement_kv_info::kv_bytes_for_layer(),
 # placement_plan::kv_size_for_layer()) -- Gemma 4 E4B's heterogeneous SWA/
 # full/shared-KV layers and n_seq_max scaling for --parallel > 1. Same shape
@@ -3152,6 +3181,40 @@ target_link_libraries(test-sycl-compute-buffer-extra-reuse PRIVATE ggml-sycl-pri
 add_test(NAME test-sycl-compute-buffer-extra-reuse COMMAND test-sycl-compute-buffer-extra-reuse)
 set_tests_properties(test-sycl-compute-buffer-extra-reuse PROPERTIES
     LABELS "sycl;memory;compute-buffer;tensor-extras;gpu-serial"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
+
+# llama.cpp-9qjy: a BF16 dense weight uploaded to the SYCL backend is admitted by
+# supports_op and computed natively from the BF16 bytes through the real dispatch
+# (the kernel arithmetic alone is test-sycl-bf16-mul-mat above). Synthetic ~1 MB
+# weight, three tiny graphs: no model load, not in the OOM-hazard family. Pinned to
+# level_zero:1 like its siblings; SKIP_RETURN_CODE 77 renders "no device" as skipped.
+add_executable(test-sycl-bf16-mul-mat-backend
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-bf16-mul-mat-backend.cpp
+)
+target_include_directories(test-sycl-bf16-mul-mat-backend PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-bf16-mul-mat-backend PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-bf16-mul-mat-backend PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-bf16-mul-mat-backend PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-bf16-mul-mat-backend PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-bf16-mul-mat-backend PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-bf16-mul-mat-backend COMMAND test-sycl-bf16-mul-mat-backend)
+set_tests_properties(test-sycl-bf16-mul-mat-backend PROPERTIES
+    LABELS "sycl;bf16;gpu-serial"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77
