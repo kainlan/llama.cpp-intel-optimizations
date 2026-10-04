@@ -175,6 +175,10 @@ int main() {
         { GGML_TYPE_IQ2_XXS, GGML_LAYOUT_AOS, "iq2_xxs/AOS" },
         { GGML_TYPE_IQ2_XS,  GGML_LAYOUT_AOS, "iq2_xs/AOS"  },
         { GGML_TYPE_IQ2_S,   GGML_LAYOUT_AOS, "iq2_s/AOS"   },
+        // s36q phase 4: Q2_0 (64-wide blocks, qi = QK2_0 / 32 q8_1 chunks, vdr 1, the Q1_0 tuple shape) with
+        // a signature-generic vec_dot, so the generic _id path takes it with no adaptor. Until phase 4 the
+        // type had no SYCL kernel of any kind and was refused (yitq/phbr).
+        { GGML_TYPE_Q2_0,    GGML_LAYOUT_AOS, "q2_0/AOS"    },
     };
 
     for (const auto & req : required) {
@@ -228,11 +232,12 @@ int main() {
         GGML_TYPE_Q1_0, GGML_TYPE_NVFP4, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_Q4_1,
         GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,  GGML_TYPE_Q2_K,
         GGML_TYPE_Q3_K, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
-        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0,
     };
     //    The exact set that regressed: dense MUL_MAT kernels exist, _id does not.
-    //    BF16/q2_0/tq2_0 are absent on purpose -- 186348705 already refuses them
-    //    by leaving them out of the dense allowlist, so they never reached here.
+    //    BF16/tq2_0 are absent on purpose -- 186348705 already refuses them by
+    //    leaving them out of the dense allowlist, so they never reached here. q2_0
+    //    was refused the same way until s36q phase 4 gave it both kernels.
     const ggml_type admission_refused[] = {
         GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS,
     };
@@ -273,7 +278,7 @@ int main() {
     //    type, and admitting everything are all CAUGHT by the checks above.
     //    Dropping the predicate's capability axis entirely is NOT caught, and
     //    cannot be, because moe_mmvq_batched_dispatch_supports_type and the
-    //    capability table cover exactly the same 19 types today -- so the two
+    //    capability table cover exactly the same 20 types today -- so the two
     //    axes are indistinguishable by population. The second axis is therefore
     //    defensive, not gated here; what keeps the sets coinciding is the subset
     //    invariant in section 3. Do not add a control that "proves" the axis by

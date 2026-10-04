@@ -39,6 +39,7 @@
 inline bool moe_mmvq_batched_dispatch_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     switch (type) {
         case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
@@ -52,8 +53,9 @@ inline bool moe_mmvq_batched_dispatch_supports_layout(enum ggml_type type, enum 
         // whose dense kernel is that same generic body with vec_dot_iq4_nl_q8_1
         // (Q4_0-shaped, qi=4, vdr=2), and the IQ3 and IQ2 types, whose dense tuples
         // (qi = QI3_x / 2 or QI2_x / 2, vdr=1) take their grid-table vec_dots behind
-        // generic-signature adaptors (IQ2_S's is already generic). IQ4_XS, IQ1_S and
-        // IQ1_M stay refused until their _id variants exist.
+        // generic-signature adaptors (IQ2_S's is already generic). Q2_0 (phase 4) is the
+        // Q1_0 tuple shape: qi = QK2_0 / 32 q8_1 chunks, vdr = 1, generic vec_dot. IQ4_XS,
+        // IQ1_S and IQ1_M stay refused until their _id variants exist.
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:
@@ -84,6 +86,7 @@ inline bool moe_mmvq_batched_dispatch_supports_layout(enum ggml_type type, enum 
 inline bool moe_mmvq_batched_dispatch_supports_type(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
@@ -173,6 +176,7 @@ inline bool moe_mmvq_any_dispatch_supports_layout(enum ggml_type type, enum ggml
 inline bool moe_mmvq_capability_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     switch (type) {
         case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:

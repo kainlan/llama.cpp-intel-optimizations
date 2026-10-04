@@ -181,7 +181,7 @@ def test_source_contract_mutations_fail_closed() -> None:
             "q1_0 registration renamed away",
             SOURCE.replace(
                 "case GGML_TYPE_Q1_0:\n            return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;",
-                "case GGML_TYPE_Q2_0:\n            return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;",
+                "case GGML_TYPE_TQ2_0:\n            return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;",
                 1,
             ),
         ),

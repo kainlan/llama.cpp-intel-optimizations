@@ -4768,6 +4768,30 @@ static void mul_mat_vec_q4_1_q8_1_sycl(const void *    vx,
     }
 }
 
+// Q2_0: 64-weight blocks, one vec_dot call per 32-weight q8_1 chunk (qi = QI2_0 = 2 chunks,
+// vdr 1), the Q1_0 tuple shape. AoS only; Q2_0 has no reordered layout.
+static void mul_mat_vec_q2_0_q8_1_sycl(const void *    vx,
+                                       const void *    vy,
+                                       float *         dst,
+                                       const int       ncols,
+                                       const int       nrows,
+                                       dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK2_0 == 0);
+    const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for<mmvq_kernel_name<GGML_TYPE_Q2_0>>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q<QK2_0, QI2_0, block_q2_0, VDR_Q2_0_Q8_1_MMVQ, vec_dot_q2_0_q8_1>(vx, vy, dst, ncols,
+                                                                                                   nrows, item_ct1);
+                });
+        });
+    }
+}
+
 static void mul_mat_vec_mxfp4_q8_1_sycl(const void *    vx,
                                         const void *    vy,
                                         float *         dst,
@@ -17364,6 +17388,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q2_0:
             if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
                 ne00 > INT_MAX || ne01 > INT_MAX ||
                 !mmvq_submit_quant_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer, dispatch_ids, dst_d,
@@ -22182,6 +22207,7 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q2_0:
             if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
                 ne00 > INT_MAX || ne01 > INT_MAX ||
                 !mmvq_submit_quant_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer, dispatch_ids, dst_d,
@@ -22656,6 +22682,10 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                                                    fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base);
                     }
                 }
+                break;
+            case GGML_TYPE_Q2_0:
+                GGML_SYCL_KTRACE("mmvq_q2_0", " ne00=%lld row_diff=%lld", (long long) ne00, (long long) row_diff);
+                mul_mat_vec_q2_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                 break;
             case GGML_TYPE_Q4_1:
                 GGML_SYCL_KTRACE("mmvq_q4_1", " ne00=%lld row_diff=%lld", (long long) ne00, (long long) row_diff);
@@ -23441,6 +23471,17 @@ bool mmvq_submit_quant_aos_id(sycl::queue &                    q,
 
     sycl::event event;
     switch (weight_type) {
+        case GGML_TYPE_Q2_0:
+            // The dense mul_mat_vec_q2_0_q8_1_sycl tuple (QK2_0, QI2_0, vdr 1): the generic _id kernel with
+            // the Q2_0 vec_dot, which has the generic vec_dot_q_sycl_t signature.
+            if (ncols % QK2_0 != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_Q2_0, QK2_0, QI2_0, block_q2_0, VDR_Q2_0_Q8_1_MMVQ,
+                                            vec_dot_q2_0_q8_1>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
         case GGML_TYPE_IQ4_NL:
             // Same body as the dense mul_mat_vec_q_iq4_nl_q8_1 (QK4_NL, QI4_NL, vdr 2): the generic
             // _id kernel with the IQ4_NL vec_dot, which has the generic vec_dot_q_sycl_t signature.
