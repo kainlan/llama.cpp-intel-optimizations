@@ -1,5 +1,5 @@
-// The one list of weight types the unified MUL_MAT kernel serves (llama.cpp-8ony), and the one list of weight types
-// the layout policy can materialize COALESCED (llama.cpp-gldu).
+// The one list of weight types the unified MUL_MAT kernel serves (llama.cpp-8ony), the one list of weight types the
+// layout policy can materialize COALESCED, and the one list of types an MMQ kernel serves (llama.cpp-gldu).
 //
 // Header-only and free of SYCL, so both the dispatch router (dispatch.hpp, should_use_unified) and the zone planner's
 // adapter (unified-cache.cpp) can include it. The planner needs the answer before any graph exists: it reserves the
@@ -24,7 +24,7 @@ inline bool unified_kernel_serves_type(ggml_type type) {
 }
 
 // The weight types the layout policy can materialize in the COALESCED layout. Add a type here only when its coalesced
-// kernels exist. Read by is_coalesced_supported (common.hpp) and, through the complement below, by the zone planner.
+// kernels exist. Read by is_coalesced_supported (common.hpp) and by the zone planner, through dense_pp_route_is_f16_dequant_arm.
 inline bool coalesced_capable_type(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
@@ -37,21 +37,41 @@ inline bool coalesced_capable_type(ggml_type type) {
     }
 }
 
+// The weight types an MMQ kernel serves. Read by ggml_sycl_supports_mmq (the router's eligibility term) and, through
+// dense_pp_route_is_f16_dequant_arm, by the zone planner.
+inline bool mmq_capable_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Whether a dense QUANTIZED MUL_MAT weight of this type takes the oneDNN f16 dequant arm as its PP route
 // (llama.cpp-gldu). The caller has already established that the type is quantized and the operand a dense weight.
 //
-// The router sends an AOS-materialized quantized weight at PP batch to that arm (pick_kernel_for_layout,
-// GGML_LAYOUT_AOS, ggml-sycl.cpp), and a type with no coalesced layout is materialized AOS: the IQ family and Q5_K have
-// no SOA layout at all, and Q4_K is pinned AOS by layout_policy::get_optimal. For those types the arm is the planned
-// route, not a fallback, so the planner reserves its buffers. A type with a coalesced layout is routed by its layout
-// to a coalesced kernel (Q6_K), the oneDNN coalesced/SOA arm (Q8_0, which has its own unconditional plan mark) or the
-// unified kernel (Q4_0 / MXFP4, which have the unified-kernel plan mark), so they are not claimed here.
+// The router walks k_mul_mat_priority (ggml-sycl.cpp): a type an MMQ kernel serves is taken by it at PP batch (MMQ_AOS
+// precedes ONEDNN_AOS, and use_mmq holds up to MMQ_MAX_BATCH_SIZE), a type with a coalesced layout is taken by its
+// coalesced kernel, the oneDNN coalesced/SOA arm (Q8_0, which has its own unconditional plan mark) or the unified kernel
+// (Q4_0 / MXFP4, which have the unified-kernel plan mark). A quantized type left after those lists, the IQ family, has
+// no kernel but the dequant arm at PP batch, so for it the arm is the planned route and not a fallback.
 //
-// The planner cannot ask the router: it has no graph node, no batch and no resolved layout. This is a type-level
-// superset the router can only narrow (an op the oneDNN PP scratch supplies, a batch within the MMVQ limit), and an
-// unneeded reservation is bounded by one weight's f16 copy.
+// The planner cannot ask the router: it has no graph node, no batch and no resolved layout, so it asks the two type
+// lists the router's own eligibility terms are built from. The answer is a type-level superset the router can only
+// narrow (an op the oneDNN PP scratch supplies, a batch within the MMVQ limit). A batch above MMQ_MAX_BATCH_SIZE sends
+// an MMQ type to the arm too; that residue is left to the graph-entry walk, which grows the buffer or refuses by name.
 inline bool dense_pp_route_is_f16_dequant_arm(ggml_type type) {
-    return !coalesced_capable_type(type);
+    return !coalesced_capable_type(type) && !mmq_capable_type(type);
 }
 
 }  // namespace ggml_sycl

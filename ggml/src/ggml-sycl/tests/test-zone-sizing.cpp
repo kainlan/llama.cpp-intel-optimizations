@@ -992,18 +992,24 @@ int main() {
               "a Q8_0 head beside it still is");
     }
 
-    // ---- Case 14k: a weight type with no non-AOS layout takes the f16 dequant arm as its PP route (llama.cpp-gldu) ----
-    // The router sends a quantized dense weight that is materialized AOS to the oneDNN dequant arm at PP batch
-    // (pick_kernel_for_layout, GGML_LAYOUT_AOS). A type the layout policy can never materialize COALESCED (the
-    // IQ family, Q5_K, Q4_K ...) is AOS there, so that arm is its NORMAL route, not a fallback. The planner asks the
-    // SAME type-level predicate (unified-types.hpp) the layout policy's coalesced list is built from, and it must
-    // not claim the types the existing marks already cover or the ones whose route is a coalesced kernel.
+    // ---- Case 14k: a quantized type no kernel but the f16 dequant arm serves takes it as its PP route (llama.cpp-gldu) ----
+    // The router walks its priority list: a type an MMQ kernel serves is taken by MMQ at PP batch, a type with a
+    // coalesced layout by its coalesced / unified kernel, and what is left (the IQ family) has only the oneDNN dequant
+    // arm. The planner asks the SAME two type lists the router's eligibility terms are built from
+    // (unified-types.hpp), so it claims exactly that remainder; claiming an MMQ type sized the whole plan from the
+    // 1.2 GB f16 copy of a Q5_K LM head on a device run.
     {
         CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ4_XS), "IQ4_XS draws the dequant arm");
         CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ3_S), "IQ3_S draws the dequant arm");
         CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ4_NL), "IQ4_NL draws the dequant arm");
-        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q5_K), "Q5_K draws the dequant arm");
-        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q4_K), "Q4_K (AOS-pinned) draws the dequant arm");
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ3_XXS), "IQ3_XXS draws the dequant arm");
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ2_XS), "IQ2_XS draws the dequant arm");
+        const ggml_type mmq_types[] = { GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q2_K,
+                                        GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K };
+        for (ggml_type ty : mmq_types) {
+            CHECK(ggml_sycl::mmq_capable_type(ty), "the MMQ list carries the type the router's use_mmq asks about");
+            CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(ty), "an MMQ type is taken by MMQ at PP batch");
+        }
         CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q8_0), "Q8_0 keeps its own unconditional mark");
         CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q4_0), "Q4_0 keeps the unified-kernel mark");
         CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_MXFP4), "MXFP4 keeps the unified-kernel mark");
