@@ -362,6 +362,14 @@ static decltype(&ggml_backend_sycl_planned_hold_spill_fits) llama_context_sycl_h
         llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_planned_hold_spill_fits"));
 }
 
+// llama.cpp-mmi1: the by-name text for a refused scheduler compute buffer (see ggml_backend_sycl_compute_refusal_advice
+// in ggml-sycl.h). A SYCL DSO that predates it exports nothing and the refusal carries no extra text.
+static decltype(&ggml_backend_sycl_compute_refusal_advice) llama_context_sycl_compute_refusal_proc(
+    ggml_backend_dev_t dev) {
+    return reinterpret_cast<decltype(&ggml_backend_sycl_compute_refusal_advice)>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_compute_refusal_advice"));
+}
+
 // llama.cpp-kpjw: re-reads the KV room a pinned -ub's hold epoch is judged with (ggml_backend_sycl_planned_hold_epoch_refresh
 // in ggml-sycl.h). A SYCL DSO that predates it exports nothing and is skipped.
 static decltype(&ggml_backend_sycl_planned_hold_epoch_refresh) llama_context_sycl_hold_epoch_refresh_proc(
@@ -473,6 +481,41 @@ static bool llama_context_sycl_hold_spill_fits(const std::vector<ggml_backend_pt
     return fits;
 }
 #endif
+
+// llama.cpp-mmi1: the text a "failed to allocate compute ... buffers" refusal appends when a SYCL backend could not
+// place the scheduler compute buffer: what was asked, the room each tier had, the largest -ub that fits and the
+// GGML_SYCL_VRAM_BUDGET_PCT that would free enough (never a smaller -c; KV is placed, not shrunk). Empty when no SYCL
+// backend recorded such a refusal, so a failure of another cause says nothing wrong, and with no SYCL backend or a
+// SYCL DSO that predates the entry. `n_ubatch` is the shape the reserve ran at.
+static std::string llama_context_sycl_compute_refusal_text(const std::vector<ggml_backend_ptr> & backends,
+                                                           uint32_t                              n_ubatch) {
+    std::string text;
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    for (auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (!llama_context_dev_is_sycl(dev)) {
+            continue;
+        }
+#    ifdef GGML_USE_SYCL
+        auto advice_fn = &ggml_backend_sycl_compute_refusal_advice;
+#    else
+        auto advice_fn = llama_context_sycl_compute_refusal_proc(dev);
+        if (!advice_fn) {
+            continue;
+        }
+#    endif
+        char buf[2048];
+        if (advice_fn(backend.get(), n_ubatch, buf, sizeof(buf)) > 0) {
+            text += text.empty() ? ": " : "; ";
+            text += buf;
+        }
+    }
+#else
+    GGML_UNUSED(backends);
+    GGML_UNUSED(n_ubatch);
+#endif
+    return text;
+}
 
 // llama.cpp-kpjw: opens the SYCL backend's scheduler-compute scope for its lifetime (see
 // llama_context::sycl_compute_scope_fn). A null function (no SYCL backend, or a library without the export) opens
@@ -1280,10 +1323,10 @@ llama_context::llama_context(
                     cparams.n_ubatch,
                     largest_ub != 0 ?
                         format("the largest -ub that fits is about %u, a power of two, estimated by scaling the "
-                               "measured compute buffers (or free VRAM on the card, or pass a smaller -c)",
+                               "measured compute buffers (or free VRAM on the card)",
                                largest_ub)
                             .c_str() :
-                        "no -ub is known to fit: free VRAM on the card, or pass a smaller -c"));
+                        "no -ub is known to fit: free VRAM on the card"));
             }
         }
 #endif
@@ -2343,10 +2386,10 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
                               format("%u does not fit this context", last_good).c_str(),
                 tried.c_str(), last_stop != nullptr ? last_stop : stop, last_good, settle_refusal.c_str(),
                 advice != 0 ? format("the largest -ub that fits is about %u, a power of two, estimated by scaling the "
-                                     "measured compute buffers (or free VRAM on the card, or pass a smaller -c)",
+                                     "measured compute buffers (or free VRAM on the card)",
                                      advice)
                                   .c_str() :
-                              "no -ub is known to fit: free VRAM on the card, or pass a smaller -c"));
+                              "no -ub is known to fit: free VRAM on the card"));
         } else {
             sched_need_reserve = true;
             sched_reserve();
@@ -2515,6 +2558,9 @@ void llama_context::sched_reserve() {
     int n_input_tensors_tg = -1;
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    // The -ub the pp reserves ran at, for a refusal's advice: a context smaller than -ub reserved at n_ctx tokens, and
+    // naming a -ub for that shape would be wrong, so it is 0 (no -ub is named).
+    const uint32_t refused_ub_pp = n_tokens == cparams.n_ubatch ? cparams.n_ubatch : 0;
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
@@ -2531,7 +2577,8 @@ void llama_context::sched_reserve() {
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
-                throw llama_auto_ubatch_fit_refusal("failed to allocate compute pp buffers");
+                throw llama_auto_ubatch_fit_refusal("failed to allocate compute pp buffers" +
+                                                    llama_context_sycl_compute_refusal_text(backends, refused_ub_pp));
             }
         }
 
@@ -2545,7 +2592,8 @@ void llama_context::sched_reserve() {
     {
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
-            throw llama_auto_ubatch_fit_refusal("failed to allocate compute tg buffers");
+            throw llama_auto_ubatch_fit_refusal("failed to allocate compute tg buffers" +
+                                                llama_context_sycl_compute_refusal_text(backends, 0));
         }
 
         n_splits_tg        = ggml_backend_sched_get_n_splits(sched.get());
@@ -2572,7 +2620,8 @@ void llama_context::sched_reserve() {
         };
 
         if (!gf) {
-            throw llama_auto_ubatch_fit_refusal("failed to allocate compute pp buffers");
+            throw llama_auto_ubatch_fit_refusal("failed to allocate compute pp buffers" +
+                                                llama_context_sycl_compute_refusal_text(backends, refused_ub_pp));
         }
     }
 

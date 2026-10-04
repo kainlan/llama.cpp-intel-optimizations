@@ -500,6 +500,18 @@ GGML_BACKEND_API bool ggml_backend_sycl_planned_hold_spill_fits(ggml_backend_t b
                                                                 uint32_t       n_ubatch,
                                                                 uint32_t *     largest_ub);
 
+// llama.cpp-mmi1: the by-name text for a context refused because a scheduler compute buffer fit no tier of a SYCL
+// device. Writes it into `out` (NUL-terminated, truncated to `out_size`) and returns its length. It names the buffer,
+// the room each tier had, the largest -ub that fits (the kpjw hold-spill fit's machinery, an estimate) and the
+// GGML_SYCL_VRAM_BUDGET_PCT that would free enough outside the arena (from the budget authority); never a smaller -c.
+// Returns 0, and writes an empty string, when the allocator recorded no refused compute buffer since the last
+// runtime-context publish, or the backend is not a SYCL one. It consumes the record. `n_ubatch` is the shape the
+// refused reserve ran at. A SYCL DSO that predates the entry exports nothing and the caller says nothing extra.
+GGML_BACKEND_API size_t ggml_backend_sycl_compute_refusal_advice(ggml_backend_t backend,
+                                                                 uint32_t       n_ubatch,
+                                                                 char *         out,
+                                                                 size_t         out_size);
+
 // llama.cpp-kpjw: re-reads the KV room the owner's hold epoch is judged with, from the zone with the context's KV in
 // place. A pinned -ub publishes once, before the memory module (the KV cache, the recurrent state) exists, so the
 // room its epoch began with predates both; the constructor calls this once they exist and before it reserves the

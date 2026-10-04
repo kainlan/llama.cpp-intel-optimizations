@@ -90,6 +90,7 @@
 #include "ggml-sycl/block-exec-gate.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/compute-alloc-scope.hpp"
+#include "ggml-sycl/compute-refusal-advice.hpp"
 #include "ggml-sycl/convert.hpp"
 #include "ggml-sycl/cpy.hpp"
 #include "ggml-sycl/dispatch-tuning.hpp"
@@ -17105,6 +17106,55 @@ static std::string ggml_sycl_all_vram_ctx_hint(uint32_t fits) {
 // for the public accessor and the "delta, not lifetime total" contract.
 static std::atomic<uint64_t> g_compute_buffer_host_fallbacks[GGML_SYCL_MAX_DEVICES] = {};
 
+// llama.cpp-mmi1: the size of the scheduler compute buffer the allocator last could not place on a device, 0 when none
+// since the last runtime-context publish. Written where a buffer inside the compute scope fails (the allocation, or the
+// publish that refuses the buffer it made) and read, then cleared, by ggml_backend_sycl_compute_refusal_advice() when
+// the context is refused. Declared here for the same reason as the counter above: the transaction clears it, and is
+// defined before the allocator.
+static std::atomic<size_t> g_compute_placement_refused_bytes[GGML_SYCL_MAX_DEVICES] = {};
+
+// Whether the refused buffer was a host-pinned fallback the publish refused (its base is misaligned), as opposed to an
+// allocation no tier made at all; the refusal text says which.
+static std::atomic<bool> g_compute_placement_host_pinned_refused[GGML_SYCL_MAX_DEVICES] = {};
+
+// The thread that wrote each device's record (0: none). The compute scope opens on every decode allocation too, on any
+// thread, so a scope entry may clear only the records its own thread wrote: another thread's pending advice, on another
+// device, must survive it.
+static std::atomic<uint64_t> g_compute_placement_refused_writer[GGML_SYCL_MAX_DEVICES] = {};
+
+static uint64_t ggml_sycl_this_thread_token() {
+    static std::atomic<uint64_t> next{ 1 };
+    thread_local const uint64_t  token = next.fetch_add(1, std::memory_order_relaxed);
+    return token;
+}
+
+// Records the refusal (and that it was not, until told otherwise, a refused host-pinned fallback).
+static void ggml_sycl_note_compute_placement_refusal(int device, size_t size) {
+    if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        g_compute_placement_refused_bytes[device].store(size, std::memory_order_relaxed);
+        g_compute_placement_host_pinned_refused[device].store(false, std::memory_order_relaxed);
+        g_compute_placement_refused_writer[device].store(ggml_sycl_this_thread_token(), std::memory_order_release);
+    }
+}
+
+static void ggml_sycl_note_compute_placement_host_pinned_refusal(int device) {
+    if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        g_compute_placement_host_pinned_refused[device].store(true, std::memory_order_relaxed);
+    }
+}
+
+// Clears the records the calling thread wrote and no one else's.
+static void ggml_sycl_clear_compute_placement_refusals() {
+    const uint64_t token = ggml_sycl_this_thread_token();
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        uint64_t expected = token;
+        if (g_compute_placement_refused_writer[d].compare_exchange_strong(expected, 0, std::memory_order_acq_rel)) {
+            g_compute_placement_refused_bytes[d].store(0, std::memory_order_relaxed);
+            g_compute_placement_host_pinned_refused[d].store(false, std::memory_order_relaxed);
+        }
+    }
+}
+
 uint64_t ggml_backend_sycl_compute_buffer_host_fallbacks(int device) {
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         return 0;
@@ -17384,7 +17434,7 @@ static bool ggml_sycl_check_hold_spill_headroom(const ggml_sycl_hold_fit_query &
         "its worst-case spill outside the arena (%.1f MB: the plan plus the rung's largest compute-buffer request, "
         "net of the KV-zone room a compute buffer can use) would leave device %d %.1f MB free (of %.1f MB free "
         "before it), under the %.1f MB driver headroom the arena expects; %s; or free VRAM on this card (another "
-        "process, or a smaller -c) before loading\n",
+        "process) before loading\n",
         a.demand / mb, q.device, free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb,
         ggml_sycl_hold_fit_advice(a.largest_ub).c_str());
     return false;
@@ -17423,7 +17473,7 @@ static bool ggml_sycl_check_hold_spill_realized(int        device,
         "[SYCL-PLAN] runtime context update rejected: at n_ubatch=%u the compute buffers the planned dense scratch "
         "keeps out of the RUNTIME zone (worst case %.1f MB; %llu request(s) totalling %.1f MB were held out and now "
         "live outside the arena) leave device %d %.1f MB free (of %.1f MB free before them), under the %.1f MB "
-        "driver headroom the arena expects; a smaller -ub or -c keeps those buffers in the zone\n",
+        "driver headroom the arena expects; a smaller -ub keeps those buffers in the zone\n",
         n_ubatch, a.demand / mb, (unsigned long long) spill_totals.raw_count, spill_totals.raw_bytes / mb, device,
         free_after / mb, a.free_before / mb, kSyclArenaMinExternalHeadroomBytes / mb);
     return false;
@@ -17431,8 +17481,14 @@ static bool ggml_sycl_check_hold_spill_realized(int        device,
 
 // The scheduler compute scope (ggml-sycl.h): a buffer-type allocation made while it is open on the calling thread is a
 // scheduler compute buffer. Changes only a thread-local depth.
+//
+// llama.cpp-mmi1: entering the OUTERMOST scope starts a new allocation attempt, so a refusal recorded by an earlier
+// one is dropped here; a retry that succeeded (the pipeline-parallel one) cannot leak its text into a later refusal.
 void ggml_backend_sycl_compute_alloc_scope(bool enter) {
     if (enter) {
+        if (!ggml_sycl::compute_alloc_scope_active()) {
+            ggml_sycl_clear_compute_placement_refusals();
+        }
         ggml_sycl::compute_alloc_scope_enter();
     } else {
         ggml_sycl::compute_alloc_scope_leave();
@@ -17475,6 +17531,80 @@ void ggml_backend_sycl_planned_hold_epoch_refresh(ggml_backend_t backend) {
     auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
     ggml_sycl::unified_cache_refresh_hold_epoch_kv_room(ctx->device, ctx->planned_scratch_owner,
                                                         ggml_sycl_hold_kv_room(ctx->device, 0));
+}
+
+// llama.cpp-mmi1: what a refused context should say about the scheduler compute buffer no tier of this backend's device
+// could place. Writes the text into `out` (NUL-terminated, truncated to fit) and returns its length; 0 when the
+// allocator recorded no such refusal since the last publish (the failure was something else, and the caller says
+// nothing extra) or the backend is not a SYCL one. It consumes the record, so one refusal is explained once.
+//
+// It gathers, for compute_refusal_advise() (compute-refusal-advice.hpp, host-tested): the room each tier had -- the
+// RUNTIME zone's and the KV zone's largest free blocks and the card's free memory outside the arena -- the -ub the
+// kpjw hold-spill fit would accept (the same answer the realized check gives), and the budget authority's own figures,
+// read through ggml_sycl_device_budget_authority() and never re-parsed from the environment. The -ub and the budget
+// percentage it names are estimates: a buffer is scaled linearly with -ub and the card's free memory is a bound.
+// Never a smaller -c: KV is placed, not shrunk (owner rulings).
+size_t ggml_backend_sycl_compute_refusal_advice(ggml_backend_t backend,
+                                                uint32_t       n_ubatch,
+                                                char *         out,
+                                                size_t         out_size) {
+    if (out && out_size > 0) {
+        out[0] = '\0';
+    }
+    if (!out || out_size == 0 || !backend || !backend->context || !ggml_backend_is_sycl(backend)) {
+        return 0;
+    }
+    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    if (ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    const int    device  = ctx->device;
+    const size_t request = g_compute_placement_refused_bytes[device].exchange(0, std::memory_order_relaxed);
+    const bool   host_pinned_refused =
+        g_compute_placement_host_pinned_refused[device].exchange(false, std::memory_order_relaxed);
+    g_compute_placement_refused_writer[device].store(0, std::memory_order_relaxed);
+    if (request == 0) {
+        return 0;
+    }
+    ggml_sycl::compute_refusal_inputs in;
+    in.device              = device;
+    in.n_ubatch            = n_ubatch;
+    in.request             = request;
+    in.headroom_target     = kSyclArenaMinExternalHeadroomBytes;
+    in.host_pinned_refused = host_pinned_refused;
+    size_t free_mem = 0, total_mem = 0;
+    ggml_backend_sycl_get_device_memory(device, &free_mem, &total_mem);
+    if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+        cache && cache->arena_active()) {
+        in.runtime_room = cache->zone_largest_free(ggml_sycl::vram_zone_id::RUNTIME);
+        in.kv_room      = ggml_sycl_hold_kv_room(device, 0);
+        for (ggml_sycl::vram_zone_id zone :
+             { ggml_sycl::vram_zone_id::RUNTIME, ggml_sycl::vram_zone_id::SCRATCH, ggml_sycl::vram_zone_id::ONEDNN }) {
+            in.budget.fixed_zone_bytes += cache->zone_capacity(zone);
+        }
+        // The card's free memory outside the arena with the rung's own compute buffers released: the room the rung has
+        // when it is redone at a smaller -ub, from the ledger and not a driver read (its credit for a release lags).
+        in.raw_free = ggml_sycl::unified_cache_hold_free_before(device, ctx->planned_scratch_owner, free_mem, true);
+    } else {
+        in.raw_free = free_mem;
+    }
+    const ggml_sycl::vram_budget_authority authority =
+        ggml_sycl::ggml_sycl_device_budget_authority(device, total_mem, free_mem, /*default_pct=*/100);
+    in.budget.pct               = authority.budget_pct;
+    in.budget.base_mem          = authority.base_mem;
+    in.budget.budget_bytes      = authority.budget_bytes;
+    in.budget.external_headroom = authority.external_headroom;
+    // The kpjw hold-spill fit's answer for this rung: when it refuses, the -ub it names caps ours, so the -ub printed
+    // passes both checks.
+    ggml_sycl_hold_fit_answer      hold_answer;
+    const ggml_sycl_hold_fit_query hold_query = { device, ctx->planned_scratch_owner, n_ubatch, 0, true };
+    in.hold_fit_refused                       = !ggml_sycl_hold_spill_fit(hold_query, &hold_answer);
+    in.hold_largest_ub                        = hold_answer.largest_ub;
+
+    const ggml_sycl::compute_refusal_advice advice = ggml_sycl::compute_refusal_advise(in);
+    const std::string                       text   = ggml_sycl::compute_refusal_message(in, advice);
+    snprintf(out, out_size, "%s", text.c_str());
+    return std::min(text.size(), out_size - 1);
 }
 
 static bool ggml_sycl_check_nonfa_attn_scratch(int                              device,
@@ -17638,12 +17768,12 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int                              
     // GGML_SYCL_NONFA_ATTN_SCRATCH_MB is NOT offered as a remediation here:
     // it only replaces the demand term d, not the reserve or the headroom
     // comparison, so it is an experimentation knob (llama.cpp-k1ev), not a
-    // fix a user should reach for. Flash attention or a smaller context are
-    // the only remediations with hardware support.
+    // fix a user should reach for. Flash attention is the only remediation
+    // with hardware support (a smaller context is never one: KV is placed).
     GGML_SYCL_RUNTIME_TXN_REFUSAL(
         probe_mode,
         "[SYCL-PLAN] flash attention is disabled for this context and the non-FA attention path does not "
-        "fit the device budget at this length; pass -fa 1/auto to use flash attention, or reduce -c/-p%s\n",
+        "fit the device budget at this length; pass -fa 1/auto to use flash attention%s\n",
         fits_headroom_ctx >= 256 ? "" : " (no non-FA context at this shape is known to fit this device)");
     if (fits_headroom_ctx >= 256) {
         GGML_SYCL_RUNTIME_TXN_REFUSAL(
@@ -19173,6 +19303,10 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // runtime-context transaction"; resetting before those three could-still-
     // fail steps broke that promise for every one of their refusal paths.
     g_compute_buffer_host_fallbacks[ctx->device].store(0, std::memory_order_relaxed);
+    // llama.cpp-mmi1: a refusal recorded before this publish belongs to the previous configuration.
+    g_compute_placement_refused_bytes[ctx->device].store(0, std::memory_order_relaxed);
+    g_compute_placement_host_pinned_refused[ctx->device].store(false, std::memory_order_relaxed);
+    g_compute_placement_refused_writer[ctx->device].store(0, std::memory_order_relaxed);
     // llama.cpp-tsfl round 4 Q4: no `if (out) { ... }` fill here -- this is
     // the PUBLISH path's own success tail, reached only when probe_mode is
     // false, and the publishing wrapper always passes out=nullptr. Every
@@ -38117,12 +38251,28 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_publish(ggml_backend_buffe
                                                               size_t                             size,
                                                               const char *                       origin) {
     if (ctx->dev_ptr != nullptr && (reinterpret_cast<uintptr_t>(ctx->dev_ptr) % GGML_SYCL_BUFFER_BASE_ALIGNMENT) != 0) {
+        const uintptr_t base_addr     = reinterpret_cast<uintptr_t>(ctx->dev_ptr);
+        const size_t    misaligned_by = base_addr % GGML_SYCL_BUFFER_BASE_ALIGNMENT;
+        char            cause[320];
+        if (ctx->managed_meta.tier == ggml_sycl::alloc_tier::HOST_PINNED) {
+            // llama.cpp-mmi1: a host-pinned fallback of a device buffer is refused here, and the reason is the pinned
+            // pool's base, not the buffer: its chunks start 64 bytes past the allocation, so a base the pool hands
+            // out is aligned only to 64 and not to the 128 the contract needs. This refusal is an accident of that
+            // alignment, not a policy: a host-pinned compute buffer for a device would run its compute over PCIe,
+            // which placement-decides-executor forbids (the pinned-pool alignment is a separate ticket). It cannot
+            // say why the buffer fell back to host memory; the context refusal names what no device tier held.
+            snprintf(cause, sizeof(cause),
+                     "this is a host-pinned fallback buffer, so its base is not aligned: the pinned pool's base is "
+                     "aligned only to %zu bytes",
+                     (size_t) (base_addr & (~base_addr + 1)));
+        } else {
+            snprintf(cause, sizeof(cause), "publishing it would under-reserve the buffer by %zu bytes",
+                     GGML_SYCL_BUFFER_BASE_ALIGNMENT - misaligned_by);
+        }
         GGML_LOG_WARN(
             "[SYCL] refusing %s buffer at misaligned base %p (requires %zu-byte alignment); "
-            "publishing it would under-reserve the buffer by %zu bytes\n",
-            origin, ctx->dev_ptr, GGML_SYCL_BUFFER_BASE_ALIGNMENT,
-            GGML_SYCL_BUFFER_BASE_ALIGNMENT -
-                (reinterpret_cast<uintptr_t>(ctx->dev_ptr) % GGML_SYCL_BUFFER_BASE_ALIGNMENT));
+            "%s\n",
+            origin, ctx->dev_ptr, GGML_SYCL_BUFFER_BASE_ALIGNMENT, cause);
         delete ctx;
         return nullptr;
     }
@@ -38530,6 +38680,9 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
             }
         }
         GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device\n", __func__, size);
+        if (ggml_sycl_compute_alloc_scope_active()) {
+            ggml_sycl_note_compute_placement_refusal(buft_ctx->device, size);
+        }
         return nullptr;
     }
 alloc_succeeded:
@@ -38601,9 +38754,18 @@ alloc_succeeded:
         // Restore device context
         ggml_sycl_set_device(buft_ctx->device);
     }
+    // The publish deletes the context it refuses, so the tier is read first.
+    const bool landed_host_pinned = ctx->managed_meta.tier == ggml_sycl::alloc_tier::HOST_PINNED;
+
     ggml_backend_buffer_t legacy_published = ggml_backend_sycl_buffer_publish(buft, ctx, size, "device");
     if (legacy_published && legacy_landing_pending) {
         ggml_sycl_log_compute_buffer_landing(buft_ctx->device, buft_ctx->name, size, legacy_zone);
+    }
+    if (!legacy_published && ggml_sycl_compute_alloc_scope_active()) {
+        ggml_sycl_note_compute_placement_refusal(buft_ctx->device, size);
+        if (landed_host_pinned) {
+            ggml_sycl_note_compute_placement_host_pinned_refusal(buft_ctx->device);
+        }
     }
     return legacy_published;
 } catch (const sycl::exception & exc) {
@@ -112226,6 +112388,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_planned_hold_spill_fits") == 0) {
         return (void *) ggml_backend_sycl_planned_hold_spill_fits;
+    }
+    if (strcmp(name, "ggml_backend_sycl_compute_refusal_advice") == 0) {
+        return (void *) ggml_backend_sycl_compute_refusal_advice;
     }
     if (strcmp(name, "ggml_backend_sycl_compute_alloc_scope") == 0) {
         return (void *) ggml_backend_sycl_compute_alloc_scope;
