@@ -53,6 +53,9 @@
 #    include <sys/stat.h>
 #    include <unistd.h>
 #endif
+#if defined(__GLIBC__)
+#    include <malloc.h>
+#endif
 #include <map>
 #include <sycl/sycl.hpp>
 #include <unordered_map>
@@ -156,6 +159,7 @@
 #include "ggml-sycl/fused-ffn.hpp"
 #include "ggml-sycl/fused-moe-esimd.hpp"
 #include "ggml-sycl/fused-norm-gemm.hpp"
+#include "ggml-sycl/host-mem-ledger.hpp"
 #include "ggml-sycl/kv-cache-tensor-name.hpp"
 #include "ggml-sycl/kv-runtime-demotion.hpp"
 #include "ggml-sycl/kv-tier-manager.hpp"
@@ -13611,6 +13615,78 @@ static void ggml_sycl_release_xmx_aos_staging(ggml_tensor_extra_gpu * extra, int
         extra->weight().xmx_mxfp4_tiled_aos_staging_handle[device] = {};
         extra->weight().xmx_mxfp4_tiled_aos_staging_size[device]   = 0;
     }
+}
+
+size_t ggml_sycl::host_mem_proc_kb_bytes(const char * path, const char * key) {
+    std::ifstream f(path);
+    std::string   line;
+    const size_t  klen = std::strlen(key);
+    while (std::getline(f, line)) {
+        if (line.compare(0, klen, key) == 0 && line.size() > klen && line[klen] == ':') {
+            return static_cast<size_t>(std::strtoull(line.c_str() + klen + 1, nullptr, 10)) * 1024ull;
+        }
+    }
+    return 0;
+}
+
+void ggml_sycl_log_host_mem(const char * phase) {
+    constexpr double gb = 1024.0 * 1024.0 * 1024.0;
+
+    const size_t rss_anon  = ggml_sycl::host_mem_proc_kb_bytes("/proc/self/status", "RssAnon");
+    const size_t rss_file  = ggml_sycl::host_mem_proc_kb_bytes("/proc/self/status", "RssFile");
+    const size_t rss_shmem = ggml_sycl::host_mem_proc_kb_bytes("/proc/self/status", "RssShmem");
+    const size_t sys_shmem = ggml_sycl::host_mem_proc_kb_bytes("/proc/meminfo", "Shmem");
+    const size_t sys_avail = ggml_sycl::host_mem_proc_kb_bytes("/proc/meminfo", "MemAvailable");
+
+    // Bytes live in glibc malloc: the CPU model buffers (large allocations are
+    // mmap'd, so hblkhd) plus every std::vector/std::string in the process.
+    size_t malloc_inuse = 0;
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+    {
+        const struct mallinfo2 mi = mallinfo2();
+        malloc_inuse              = mi.uordblks + mi.hblkhd;
+    }
+#endif
+
+    size_t pool_committed = 0;
+    std::string zones;
+    char        buf[256];
+    for (int d = 0; d < ggml_sycl_info().device_count; ++d) {
+        ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(d);
+        if (!cache) {
+            continue;
+        }
+        pool_committed += cache->pinned_pool_committed();
+        std::snprintf(buf, sizeof(buf), " dev%d{pool=%.2f GB chunks=%zu", d, cache->pinned_pool_committed() / gb,
+                      cache->pinned_pool_chunk_count());
+        zones += buf;
+        for (uint8_t z = 0; z < static_cast<uint8_t>(ggml_sycl::host_zone_id::COUNT); ++z) {
+            const auto zone = static_cast<ggml_sycl::host_zone_id>(z);
+            std::snprintf(buf, sizeof(buf), " %s=%.2f/%.2f", ggml_sycl::host_zone_name(zone),
+                          cache->host_zone_used(zone) / gb, cache->host_zone_capacity(zone) / gb);
+            zones += buf;
+        }
+        zones += "}";
+    }
+
+    const ggml_sycl::host_mem_ledger & led = ggml_sycl::host_mem_ledger_get();
+
+    // Pinned-pool chunks are counted in RssAnon, glibc-malloc'd bytes are too:
+    // what is left is driver / oneDNN / thread stacks. A large value here means a
+    // consumer this breakdown does not know about.
+    const double residual = (static_cast<double>(rss_anon) - static_cast<double>(pool_committed) -
+                             static_cast<double>(malloc_inuse)) / gb;
+
+    GGML_LOG_WARN(
+        "[HOSTMEM] phase=%s rss_anon=%.2f rss_file=%.2f rss_shmem=%.2f GB; system Shmem=%.2f MemAvailable=%.2f GB; "
+        "malloc_inuse=%.2f GB (CPU model buffers + heap); pinned_pool=%.2f GB zones(used/cap GB):%s; "
+        "ledger sycl_host_buffers=%.2f host_expert_copy=%.2f host_dense_copy=%.2f GB; "
+        "residual=rss_anon-pool-malloc=%.2f GB\n",
+        phase ? phase : "?", rss_anon / gb, rss_file / gb, rss_shmem / gb, sys_shmem / gb, sys_avail / gb,
+        malloc_inuse / gb, pool_committed / gb, zones.c_str(),
+        led.sycl_host_buffer_bytes.load(std::memory_order_relaxed) / gb,
+        led.host_expert_copy_bytes.load(std::memory_order_relaxed) / gb,
+        led.host_dense_copy_bytes.load(std::memory_order_relaxed) / gb, residual);
 }
 
 bool ggml_backend_sycl_weights_evictable(void) {
@@ -34788,6 +34864,8 @@ static void ggml_sycl_preload_model_weights() {
                                     ggml_sycl::mem_handle::HOST_DEVICE, expert_size);
                                 ggml_sycl::mem_copy(host_copy_handle, src_handle, expert_size, stream);
                             }
+                            ggml_sycl::host_mem_ledger_get().host_expert_copy_bytes.fetch_add(
+                                expert_size, std::memory_order_relaxed);
                         } else if (!tensor_source_is_device) {
                             host_ptr = const_cast<uint8_t *>(expert_aos);
                         } else {
@@ -35302,6 +35380,8 @@ static void ggml_sycl_preload_model_weights() {
                                     void * arena_ptr = dn_h.ptr;
                                     if (arena_ptr) {
                                         std::memcpy(arena_ptr, tensor->data, nbytes);
+                                        ggml_sycl::host_mem_ledger_get().host_dense_copy_bytes.fetch_add(
+                                            nbytes, std::memory_order_relaxed);
                                         auto                  allocation_owner = ggml_sycl_transfer_alloc_owner(dn_h);
                                         ggml_sycl::mem_handle handle;
                                         if (!cache->register_host_weight(host_key, arena_ptr, nbytes, GGML_LAYOUT_AOS,
@@ -36109,6 +36189,7 @@ static void ggml_sycl_preload_model_weights() {
             "%.1f MB in %lld ms (%.1f GB/s)\n",
             dense_cached, dense_failed, dense_host_placed, moe_cached, moe_failed, total_bytes / (1024.0f * 1024.0f),
             (long long) elapsed, elapsed > 0 ? (total_bytes / (1024.0 * 1024.0 * 1024.0)) / (elapsed / 1000.0) : 0.0);
+        ggml_sycl_log_host_mem("load-end");
 
         // Register MoE expert VRAM reserve AFTER cache creation.
         // Must happen here (not in set_tensor_inventory) because the unified cache
@@ -43284,6 +43365,7 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
     if (!ctx) {
         return;
     }
+    ggml_sycl::host_mem_ledger_get().sycl_host_buffer_bytes.fetch_sub(ctx->size, std::memory_order_relaxed);
     ctx->buffer_handle = {};
     delete ctx;
     buffer->context = nullptr;
@@ -43409,6 +43491,9 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
         delete ctx;
         return nullptr;
     }
+    // Counted only once the context is installed, because free_buffer (which
+    // subtracts) is only reachable through it.
+    ggml_sycl::host_mem_ledger_get().sycl_host_buffer_bytes.fetch_add(size, std::memory_order_relaxed);
     buffer->context           = ctx;
     buffer->iface.get_base    = ggml_backend_sycl_host_buffer_get_base;
     buffer->iface.free_buffer = ggml_backend_sycl_host_buffer_free_buffer;
@@ -108296,6 +108381,7 @@ normal_dispatch:
     }
 
     if (refresh_moe_after_pp) {
+        ggml_sycl_log_host_mem("pp-to-tg-before-refresh");
         if (ggml_sycl_materialize_moe_down_i8_hotset(*sycl_ctx, cgraph) > 0) {
             sycl_ctx->invalidate_moe_phase_layout_cache();
         }
@@ -108308,6 +108394,7 @@ normal_dispatch:
         } else {
             GGML_LOG_INFO("[SYCL-GRAPH] PP→TG refreshed MoE planned residency before direct TG\n");
         }
+        ggml_sycl_log_host_mem("pp-to-tg-after-refresh");
     }
 
     const int descriptor_moe_graph_candidates =
