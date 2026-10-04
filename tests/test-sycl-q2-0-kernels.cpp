@@ -13,11 +13,16 @@
 //   - dequantize_q2_0 (the converter behind to_fp16 / the PP dequant arm), through
 //     the same index mapping dequantize_block<QK2_0, QR2_0, ...> uses;
 //   - vec_dot_q2_0_q8_1 (the MMVQ vec_dot, shared by the dense and the _id path),
-//     once per (block, chunk), with weight blocks at EVERY index of an 18-byte-
-//     stride array. block_q2_0 is 18 bytes, so qs sits at 2 mod 4 on every other
-//     block, and a 4-byte-aligned reader there is a misaligned load.
-// Runs on the OpenCL CPU device (the registration pins the selector); nothing
-// here touches a GPU.
+//     once per (block, chunk), with weight blocks at every index of an 18-byte-
+//     stride array (so both qs alignments, 0 and 2 mod 4, are present).
+// The alignment itself is NOT proven here: an x86 OpenCL CPU device executes a
+// misaligned int load without complaint, so a 4-byte-aligned reader would pass.
+// Only tests/test-sycl-q2-0-wiring-source.py guards that the reader is the
+// 2-byte-aligned one.
+// Registered twice, once per dfloat width (half under GGML_SYCL_F16, float
+// otherwise), because dequantize_q2_0 does its arithmetic in dfloat; the width
+// in force is asserted below. Runs on the OpenCL CPU device (the registration
+// pins the selector); nothing here touches a GPU.
 
 #include "dequantize.hpp"
 #include "ggml-common.h"
@@ -31,6 +36,12 @@
 #include <random>
 #include <sycl/sycl.hpp>
 #include <vector>
+
+#ifdef GGML_SYCL_F16
+static_assert(sizeof(dfloat) == 2, "GGML_SYCL_F16 build must exercise the half dfloat path");
+#else
+static_assert(sizeof(dfloat) == 4, "non-F16 build must exercise the float dfloat path");
+#endif
 
 static int g_failed = 0;
 
@@ -61,14 +72,18 @@ int main() {
                 v = static_cast<uint8_t>(rng());
             }
         }
-        // Activations: two q8_1 chunks per weight block, random int8 quants and scale.
+        // Activations: two q8_1 chunks per weight block, random int8 quants and scale. ds[1] is
+        // d * sum(qs) as quantize_q8_1 stores it, not zero, so a vec_dot that wrongly applies a
+        // Q4_0-style zero-point correction from it changes its result and fails below.
         std::vector<block_q8_1> a(2 * N_BLOCKS);
         for (auto & b : a) {
             const float d = (static_cast<int>(rng() % 1000) + 1) / 4096.0f;
-            b.ds          = sycl::half2(sycl::half(d), sycl::half(0.0f));
+            int         sum = 0;
             for (auto & v : b.qs) {
                 v = static_cast<int8_t>(static_cast<int>(rng() % 255) - 127);
+                sum += v;
             }
+            b.ds = sycl::half2(sycl::half(d), sycl::half(d * sum));
         }
 
         block_q2_0 * dw = sycl::malloc_shared<block_q2_0>(N_BLOCKS, q);
