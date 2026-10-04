@@ -11,8 +11,10 @@
 
 // Single source of truth for batched-MoE MUL_MAT_ID (type, layout) coverage.
 //
-// Three tables and one invariant. Two describe what the executors can actually
-// run; the third describes what the capability query is allowed to advertise:
+// Three tables, one invariant and one publication predicate. Two tables describe
+// what the executors can actually run; the third describes what the capability
+// query is allowed to advertise (the predicate, moe_aos_expert_publication_wanted at
+// the end, says when a tensor's per-expert handles are published):
 //
 //   moe_mmvq_batched_dispatch_supports_layout   -- mmvq_moe_batched_dispatch()
 //   moe_mmvq_pair_glu_dispatch_supports_layout  -- the MXFP4 gate/up pair path
@@ -235,8 +237,6 @@ inline bool moe_mmvq_admission_supports_type(enum ggml_type type) {
     return false;
 }
 
-#endif  // GGML_SYCL_MOE_MMVQ_TABLES_HPP
-
 // Whether a device AoS weight tensor gets per-expert retained handles published for
 // it (ggml_sycl_publish_backend_aos_expert_handles). The buffer cannot see its
 // consumer when the weights are uploaded, so two proxies stand in for "this is an
@@ -246,3 +246,5 @@ inline bool moe_mmvq_admission_supports_type(enum ggml_type type) {
 inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne2, bool consumer_is_mul_mat_id) {
     return classified_expert || ne2 > 1 || consumer_is_mul_mat_id;
 }
+
+#endif  // GGML_SYCL_MOE_MMVQ_TABLES_HPP

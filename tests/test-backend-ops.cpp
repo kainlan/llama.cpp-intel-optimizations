@@ -10851,7 +10851,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 768));
-        // n_mats = 1: a single-expert src0 (ne[2] == 1), as in the issue-27873 case below.
+        // n_mats = 1: a single-expert src0 (ne[2] == 1), as in the issue-27873 case above.
         for (int n : {1, 17}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 1, 1, false, 66, n, 256));
         }

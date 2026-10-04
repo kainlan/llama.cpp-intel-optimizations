@@ -52,7 +52,8 @@ def test_mmid_dispatch_publish_names_its_consumer():
                    r"static bool ggml_sycl_publish_mmid_canonical_aos_experts\s*\(")
     m = re.search(r"ggml_sycl_publish_backend_aos_expert_handles\s*\((.*?)\)\s*;", body, re.S)
     assert m, "the MUL_MAT_ID dispatch publish no longer calls ggml_sycl_publish_backend_aos_expert_handles"
-    assert re.search(r"\btrue\b", m.group(1)), (
+    args = re.sub(r"/\*.*?\*/|//[^\n]*", "", m.group(1), flags=re.S)  # a commented-out `true` must not count
+    assert re.search(r"\btrue\b", args), (
         "the MUL_MAT_ID dispatch publishes without saying its consumer is a MUL_MAT_ID, so a "
         "single-expert (ne[2] == 1) unclassified src0 gets no expert handles")
 
