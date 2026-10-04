@@ -26829,6 +26829,12 @@ static bool ggml_sycl_publish_backend_aos_expert_handles(ggml_backend_sycl_buffe
         ctx->managed_meta.tier != ggml_sycl::alloc_tier::DEVICE_VRAM || !ctx->managed_handle.valid()) {
         return false;
     }
+    // Mutation safety for tensors that are published without a name classification (structural or
+    // MUL_MAT_ID-consumer): every handle built below is a checked slice of this buffer's own allocation
+    // (the `resolved.ptr == expected` test), so a later set_tensor writes through the same bytes and no
+    // handle can go stale. ggml_sycl_invalidate_backend_weight_mutation still withdraws handles and drops
+    // derived unified-cache layouts only for name-classified tensors; a non-aliasing derived copy of an
+    // unclassified tensor is not covered by it (true before this change for ne[2] > 1 and for dense weights).
     const bool classified_expert = ggml_sycl_get_tensor_usage(tensor) == tensor_usage::MOE_EXPERT_WEIGHT;
     if (!moe_aos_expert_publication_wanted(classified_expert, tensor->ne[2], consumer_is_mul_mat_id)) {
         return false;
