@@ -157,6 +157,14 @@ int main(int, char ** argv) {
                 "cache_idx_v_l1 must resolve to the planned device-1 allocation");
     TEST_ASSERT(ggml_backend_tensor_alloc(buf_tag, stray, tag_base) == GGML_STATUS_ALLOC_FAILED,
                 "a base tensor with no resolvable KV layer must fail the allocation");
+    // Out-of-range layer: parses as a valid layer id but names a layer past the buffer's n_layers /
+    // layer_allocs, so init_tensor must fail it rather than keep the synthetic span. The error branch for a
+    // null per-layer allocation is not exercised here: every layer the buffer holds gets an allocation by
+    // construction, so it is covered by inspection only.
+    ggml_tensor * far = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 64);
+    ggml_set_name(far, "cache_k_l99999");
+    TEST_ASSERT(ggml_backend_tensor_alloc(buf_tag, far, tag_base) == GGML_STATUS_ALLOC_FAILED,
+                "a KV tensor naming a layer past the buffer's layers must fail the allocation");
     ggml_backend_buffer_free(buf_tag);
 
     ggml_free(ctx);
