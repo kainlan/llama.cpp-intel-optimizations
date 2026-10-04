@@ -384,3 +384,11 @@ def test_the_nonfa_remedy_comment_names_flash_attention_only():
     assert "Flash attention or a smaller context" not in GGML_SYCL_CPP
     nonfa = (ROOT / "tests/test-sycl-nonfa-attn-scratch-guard-source.py").read_text()
     assert "or a smaller -c are" not in nonfa
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
