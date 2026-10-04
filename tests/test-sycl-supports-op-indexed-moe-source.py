@@ -6,9 +6,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Set, Tuple
 
+from sycl_dense_type_list import with_dense_type_list_inlined
+
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PATH = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
-SOURCE = SOURCE_PATH.read_text(encoding="utf-8")
+SOURCE_RAW = SOURCE_PATH.read_text(encoding="utf-8")
+SOURCE = with_dense_type_list_inlined(SOURCE_RAW)
 FUNCTION_START = "static bool ggml_backend_sycl_device_supports_op("
 FUNCTION_END = "static bool ggml_backend_sycl_device_supports_buft("
 EARLY_GUARD = "if (op->op == GGML_OP_ADD_ID || op->op == GGML_OP_MUL_MAT_ID) {"

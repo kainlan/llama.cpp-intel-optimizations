@@ -123,6 +123,16 @@ bool zone_is_per_layer_weight(const zone_tensor_desc & tensor, size_t group_card
 // settles it. Do not pre-emptively widen the predicate, and above all do not
 // add a name check to special-case the LM head — a name predicate is exactly
 // what this unit exists to replace.
+//
+// This TU's classifier stays name-free. One decision about the head IS made, but
+// by the adapter, from classifiers that exist already (infer_tensor_usage's
+// OUTPUT_WEIGHT and the tied-embedding classifier), and it concerns a different
+// reservation: the f16 dequant buffers for a type whose PP route is the dequant
+// arm (the IQ family) leave the head out, because a completion runs the head on
+// one row per ubatch and its f16 copy (1.2 GB at a 248k vocabulary) would
+// otherwise size the whole plan. The Q4_0 / MXFP4 head stays planned (owner
+// decision, llama.cpp-8ony) until llama.cpp-fkpg delivers n_outputs; that gate
+// reinstates both. See aos_dequant_f16_plan_claims in unified-types.hpp.
 bool zone_is_moe_expert_tensor(const zone_tensor_desc & tensor) {
     // Without a shape there is no evidence either way, and the zeros must not
     // be allowed to vote — same rule as zone_is_per_layer_weight. Returning

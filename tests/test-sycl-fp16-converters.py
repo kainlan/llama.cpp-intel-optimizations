@@ -8,12 +8,15 @@ from pathlib import Path
 
 import pytest
 
+from sycl_dense_type_list import with_dense_type_list_inlined
+
 ROOT = Path(__file__).resolve().parents[1]
 CONVERT = ROOT / "ggml/src/ggml-sycl/convert.cpp"
 COMMON = ROOT / "ggml/src/ggml-common.h"
 SUPPORT = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 SOURCE = CONVERT.read_text(encoding="utf-8")
-SUPPORT_SOURCE = SUPPORT.read_text(encoding="utf-8")
+SUPPORT_SOURCE_RAW = SUPPORT.read_text(encoding="utf-8")
+SUPPORT_SOURCE = with_dense_type_list_inlined(SUPPORT_SOURCE_RAW)
 KVALUES = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
 
 
