@@ -5707,6 +5707,22 @@ target_include_directories(test-pp-moe-ring-admission PRIVATE
 set_target_properties(test-pp-moe-ring-admission PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_test(NAME sycl-pp-moe-ring-admission COMMAND test-pp-moe-ring-admission)
+
+# What a context refusal says when a scheduler compute buffer fits no tier of the card (llama.cpp-mmi1): the request,
+# the room per tier, the largest -ub and the GGML_SYCL_VRAM_BUDGET_PCT that frees enough. Header-only, no SYCL.
+add_executable(test-compute-refusal-advice
+    tests/test-compute-refusal-advice.cpp
+)
+target_include_directories(test-compute-refusal-advice PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_target_properties(test-compute-refusal-advice PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-compute-refusal-advice COMMAND test-compute-refusal-advice)
+set_tests_properties(sycl-compute-refusal-advice PROPERTIES
+    LABELS "sycl;memory;host-only;tsan-capable"
+    TIMEOUT 30
+)
 set_tests_properties(sycl-pp-moe-ring-admission PROPERTIES
     LABELS "sycl;moe;host-only;tsan-capable"
     TIMEOUT 30

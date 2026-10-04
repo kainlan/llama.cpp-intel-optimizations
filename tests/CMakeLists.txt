@@ -3746,6 +3746,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-mmi1: source gate for the by-name refusal of a scheduler compute buffer no tier of the SYCL device could
+# hold: the allocator's refused-request record, ggml_backend_sycl_compute_refusal_advice() and its proc registration,
+# llama_context::sched_reserve() appending the text to its three refusals, and the host-pinned fallback's refusal saying
+# what it is. The arithmetic is test-compute-refusal-advice (ggml/src/ggml-sycl/CMakeLists.txt). Host-only, reads the
+# sources as text. Same registration shape as test-sycl-compute-buffer-fallback-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-compute-refusal-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-compute-refusal-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-xojq: source gate for nphx Task 4b -- the SYCL auto micro-batch
 # selection trial (llama_context::sycl_select_auto_ubatch()) and its one
 # call site in the llama_context constructor. Pins the four-condition gate
