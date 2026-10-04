@@ -110933,9 +110933,12 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
     GGML_UNUSED(dev);
 }
 
-// supports_op without its placement declines, exported through ggml_backend_sycl_reg_get_proc_address for callers
-// that must tell a missing kernel from a placement decline (llama_context::resolve_fused_ops): supports_op's
-// "false" covers both, this is false only when there is no kernel.
+// supports_op without its two placement declines (host-demoted KV, planner-on-host), exported through
+// ggml_backend_sycl_reg_get_proc_address for callers that must tell a missing kernel from a placement decline
+// (llama_context::resolve_fused_ops): supports_op's "false" covers both, this is false only when there is no
+// kernel. Exact for the fused ops that caller probes (FLASH_ATTN_EXT, GATED_DELTA_NET, LIGHTNING_INDEXER,
+// DSV4_HC_*); MUL_MAT (BF16 weight-materialize route) and GET_ROWS (planned layout) keep residency checks of their
+// own that this does not neutralise.
 bool ggml_backend_sycl_supports_op_capability(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     if (dev == nullptr || op == nullptr) {
         return false;

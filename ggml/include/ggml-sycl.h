@@ -1433,17 +1433,19 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime
 // plan-time raise this shape feeds is a no-op once weights hold live
 // leases (see the "Where this can and cannot help" discussion in
 // docs/backend/sycl-memory-design.md).
-// Capability-only form of ggml_backend_dev_supports_op for a SYCL device: true when this backend has a kernel for
-// `op` (its type and shape), whether or not the data it reads is planned onto this device. supports_op is that AND
-// the placement declines (host-demoted KV, planner-on-host), so "supports_op is false" cannot tell a missing kernel
-// from a placement; this can. Reached through ggml_backend_reg_get_proc_address as
-// "ggml_backend_sycl_supports_op_capability".
-GGML_BACKEND_API bool ggml_backend_sycl_supports_op_capability(ggml_backend_dev_t dev, const struct ggml_tensor * op);
-
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
     ggml_backend_t               backend,
     struct ggml_sycl_model_token model,
     bool                         flash_attn_enabled);
+
+// Capability-only form of ggml_backend_dev_supports_op for a SYCL device: supports_op with its two PLACEMENT
+// declines -- host-demoted KV (the KV-host buffer type) and planner-on-host (ggml_sycl_op_is_planned_on_host) --
+// switched off, so it is false only when there is no kernel for `op` (its type and shape). supports_op's "false"
+// cannot tell a missing kernel from a placement; this can, for the fused ops llama_context::resolve_fused_ops
+// probes (FLASH_ATTN_EXT, GATED_DELTA_NET, LIGHTNING_INDEXER, DSV4_HC_*). It is NOT residency-blind for every op:
+// MUL_MAT's BF16 weight-materialize route and GET_ROWS's planned-layout check still depend on where the weight
+// lives. Reached through ggml_backend_reg_get_proc_address as "ggml_backend_sycl_supports_op_capability".
+GGML_BACKEND_API bool ggml_backend_sycl_supports_op_capability(ggml_backend_dev_t dev, const struct ggml_tensor * op);
 
 // Execution-lifecycle context identity is separate from the model lifecycle.
 // One ContextId is allocated per llama_context and then bound to each SYCL
