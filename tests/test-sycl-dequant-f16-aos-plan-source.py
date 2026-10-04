@@ -97,8 +97,8 @@ def check(srcs):
         and re.search(r"aos_dequant_f16_plan_claims\([^;]*lm_head[^;]*\)", adapter) is not None)
     results["the adapter passes the expert flag to the claim"] = (
         re.search(r"aos_dequant_f16_plan_claims\([^;]*is_expert[^;]*\)", adapter) is not None)
-    results["the mark excludes expert stacks"] = (
-        "(unified_dequant_type || aos_dequant_type) && !is_expert" in adapter
+    results["the unified kernel's mark excludes expert stacks"] = (
+        "shaped && !is_expert && unified_kernel_serves_type(item.type)" in adapter
         and "is_expert = expert_tensor_role_from_tensor_name(item.name.c_str()) != expert_tensor_role::UNKNOWN"
         in adapter)
     results["the mark honours the oneDNN PP scratch (type enablement AND admission)"] = (
@@ -141,9 +141,23 @@ if args.self_test:
         ("the router's MMQ eligibility is the shared header's, not a second copy", "backend",
          "return ggml_sycl::mmq_capable_type(type);", "switch (type) { case GGML_TYPE_Q5_K: return true; }"),
         ("the router's dense MUL_MAT type list is the shared header's, not a second copy", "backend",
-         "return ggml_sycl::dense_mul_mat_type_supported(type);", "switch (type) { case GGML_TYPE_NVFP4: return true; }"),
+         "return ggml_sycl::dense_mul_mat_type_supported(type);",
+         "switch (type) { case GGML_TYPE_NVFP4: return true; }"),
+        # one mutant per term of the claim: dropping any of them must trip the check
+        ("the claim composes the type lists, head and expert exclusion in the shared header", "types",
+         "return quantized &&", "return"),
         ("the claim composes the type lists, head and expert exclusion in the shared header", "types",
          "!is_head &&", ""),
+        ("the claim composes the type lists, head and expert exclusion in the shared header", "types",
+         "!is_expert &&", ""),
+        ("the claim composes the type lists, head and expert exclusion in the shared header", "types",
+         "dequant_supported &&", ""),
+        ("the claim composes the type lists, head and expert exclusion in the shared header", "types",
+         "dense_mul_mat_type_supported(type) &&", ""),
+        ("the claim composes the type lists, head and expert exclusion in the shared header", "types",
+         "&& dense_pp_route_is_f16_dequant_arm(type);", ";"),
+        ("the adapter classifies the head by usage and the tied-embedding classifier, and passes it", "cache",
+         "item.type, quantized, lm_head,", "item.type, quantized, false,"),
         ("the adapter asks the shared claim", "cache", "aos_dequant_f16_plan_claims(", "aos_claim_renamed("),
         ("the adapter asks the router's dequant-support function", "cache",
          "&& onednn_woq::supports_dequant_fp16(item.type)", ""),
@@ -152,13 +166,15 @@ if args.self_test:
          "const bool lm_head = false; const bool lm_head_unused = infer_tensor_usage(item.name.c_str()) == "
          "tensor_usage::OUTPUT_WEIGHT ||"),
         ("the adapter passes the expert flag to the claim", "cache", "lm_head, is_expert,", "lm_head, false,"),
-        ("the mark excludes expert stacks", "cache", "(unified_dequant_type || aos_dequant_type) && !is_expert",
-         "(unified_dequant_type || aos_dequant_type)"),
+        ("the unified kernel's mark excludes expert stacks", "cache",
+         "shaped && !is_expert && unified_kernel_serves_type(item.type)",
+         "shaped && unified_kernel_serves_type(item.type)"),
         ("the mark honours the oneDNN PP scratch (type enablement AND admission)", "cache",
          "onednn_pp_unified_scratch_enabled(item.type) && ggml_sycl_onednn_pp_type_admitted(item.type);",
          "onednn_pp_unified_scratch_enabled(item.type);"),
         ("the stale 'any other type is not planned' claim is gone", "cache",
-         "// llama.cpp-gldu: a quantized type", "// is not planned: the graph-entry walk\n        // llama.cpp-gldu: a quantized type"),
+         "// llama.cpp-gldu: a quantized type",
+         "// is not planned: the graph-entry walk\n        // llama.cpp-gldu: a quantized type"),
     ]
     covered = {name for name, *_ in mutants}
     dead = [name for name in results if name not in covered]

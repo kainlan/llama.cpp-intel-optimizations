@@ -6,26 +6,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Set, Tuple
 
+from sycl_dense_type_list import with_dense_type_list_inlined
+
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PATH = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 SOURCE_RAW = SOURCE_PATH.read_text(encoding="utf-8")
-def _with_dense_type_list_inlined(source: str) -> str:
-    """ggml_sycl_mul_mat_type_supported delegates to the shared header's list (llama.cpp-gldu: the zone planner reads
-    the same list). This gate scores and mutates the list itself, so splice the header's switch back in under the
-    function's own signature; a wrapper that stops delegating, or a header that loses the list, fails loudly."""
-    header = (ROOT / "ggml/src/ggml-sycl/unified-types.hpp").read_text(encoding="utf-8")
-    listed = re.search(r"inline bool dense_mul_mat_type_supported\(ggml_type type\) \{(.*?)\n\}\n", header, re.S)
-    wrapper = re.search(
-        r"static bool ggml_sycl_mul_mat_type_supported\(ggml_type type\) \{[^{}]*"
-        r"return ggml_sycl::dense_mul_mat_type_supported\(type\);\n\}\n",
-        source,
-    )
-    assert listed is not None and wrapper is not None, "the dense MUL_MAT type list is no longer shared"
-    inlined = "static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {" + listed.group(1) + "\n}\n"
-    return source[: wrapper.start()] + inlined + source[wrapper.end():]
-
-
-SOURCE = _with_dense_type_list_inlined(SOURCE_RAW)
+SOURCE = with_dense_type_list_inlined(SOURCE_RAW)
 FUNCTION_START = "static bool ggml_backend_sycl_device_supports_op("
 FUNCTION_END = "static bool ggml_backend_sycl_device_supports_buft("
 EARLY_GUARD = "if (op->op == GGML_OP_ADD_ID || op->op == GGML_OP_MUL_MAT_ID) {"

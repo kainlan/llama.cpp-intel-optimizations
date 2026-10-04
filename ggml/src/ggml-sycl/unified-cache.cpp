@@ -27974,17 +27974,18 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // when the PP admission holds AND the scratch is enabled for the type, so that is what pp_scratch_type_enabled
         // says (for the unified kernel's types the admission already held, so their answer is unchanged). The loader's
         // get_rows_only role excludes a gather-only table (per_layer_token_embd) in the classifier, for every mark.
+        const bool shaped    = item.has_shape();
         const bool is_expert = expert_tensor_role_from_tensor_name(item.name.c_str()) != expert_tensor_role::UNKNOWN;
-        const bool unified_dequant_type =
-            unified_kernel_serves_type(item.type) && ggml_sycl_onednn_pp_type_admitted(item.type);
+        // The unified kernel's types carry no expert exclusion of their own (the claim below does), so it is here.
+        const bool unified_dequant_type = shaped && !is_expert && unified_kernel_serves_type(item.type) &&
+                                          ggml_sycl_onednn_pp_type_admitted(item.type);
         const bool lm_head = infer_tensor_usage(item.name.c_str()) == tensor_usage::OUTPUT_WEIGHT ||
                              ggml_sycl_is_canonical_tied_embedding_name(item.name.c_str());
-        const bool dequant_supported = item.has_shape() && dense_pp_route_is_f16_dequant_arm(item.type) &&
-                                       onednn_woq::supports_dequant_fp16(item.type);
+        const bool quantized         = shaped && ggml_is_quantized(item.type);
+        const bool dequant_supported = quantized && onednn_woq::supports_dequant_fp16(item.type);
         const bool aos_dequant_type =
-            item.has_shape() &&
-            aos_dequant_f16_plan_claims(item.type, ggml_is_quantized(item.type), lm_head, is_expert, dequant_supported);
-        if (item.has_shape() && (unified_dequant_type || aos_dequant_type) && !is_expert) {
+            aos_dequant_f16_plan_claims(item.type, quantized, lm_head, is_expert, dequant_supported);
+        if (unified_dequant_type || aos_dequant_type) {
             size_t weight_bytes = 0;
             size_t src1_bytes   = 0;
             if (zone_dequant_f16_weight_bytes(item.ne[0], item.ne[1] > 0 ? item.ne[1] : 1, &weight_bytes) &&
