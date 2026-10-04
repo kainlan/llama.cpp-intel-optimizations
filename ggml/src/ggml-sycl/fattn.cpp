@@ -157,6 +157,8 @@ static bool ggml_sycl_fattn_xmx_sidecar_enabled() {
     return force && std::strstr(force, "split-packed") != nullptr;
 }
 
+// Prefix-only on purpose: tagged caches such as "cache_idx_k_l<N>" are excluded because the sidecar is scoped to
+// the main attention K cache.
 static bool ggml_sycl_fattn_xmx_is_cache_k_tensor(const ggml_tensor * tensor) {
     return tensor && strncmp(tensor->name, "cache_k_l", 9) == 0;
 }

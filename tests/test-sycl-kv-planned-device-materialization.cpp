@@ -18,8 +18,8 @@
 
 #if !defined(GGML_USE_SYCL)
 int main() {
-    fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
-    return 0;
+    fprintf(stderr, "SKIP: GGML_USE_SYCL not enabled; this run proves nothing.\n");
+    return 77;
 }
 #else
 
@@ -40,7 +40,7 @@ int main(int, char ** argv) {
     const int physical_devices = ggml_sycl::test_physical_device_count();
     if (physical_devices < 2) {
         printf("SKIP: need at least two physical SYCL devices, got %d\n", physical_devices);
-        return 0;
+        return 77;
     }
 
     ggml_sycl::unified_cache * cache0 = ggml_sycl::get_unified_cache_for_device(0);
@@ -124,6 +124,49 @@ int main(int, char ** argv) {
     TEST_ASSERT(info->device_id == 1, "cache_k_l1 registry owner must be device 1");
 
     ggml_backend_buffer_free(buf);
+
+    // A name-tagged cache (qwen4exp's indexer cache, "cache_idx_k_l<N>") must be remapped onto its
+    // layer's allocation exactly like the untagged one; before llama.cpp-4ot7 it kept the buffer's synthetic
+    // host span, and the first SET_ROWS into it aborted. A base tensor whose layer cannot be resolved must
+    // fail the allocation rather than keep that span.
+    ggml_tensor * idx0  = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, layer_bytes / sizeof(ggml_fp16_t));
+    ggml_tensor * idx1  = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, layer_bytes / sizeof(ggml_fp16_t));
+    ggml_tensor * stray = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 64);
+    ggml_set_name(idx0, "cache_idx_k_l0");
+    ggml_set_name(idx1, "cache_idx_v_l1");
+    ggml_set_name(stray, "not_a_kv_layer_tensor");
+
+    ggml_backend_buffer_t buf_tag = ggml_backend_buft_alloc_buffer(buft, total_bytes);
+    TEST_ASSERT(buf_tag != nullptr, "tagged KV buffer allocation failed");
+    uint8_t * tag_base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buf_tag));
+    TEST_ASSERT(ggml_backend_tensor_alloc(buf_tag, idx0, tag_base) == GGML_STATUS_SUCCESS,
+                "cache_idx_k_l0 allocation failed");
+    TEST_ASSERT(ggml_backend_tensor_alloc(buf_tag, idx1, tag_base + layer_bytes) == GGML_STATUS_SUCCESS,
+                "cache_idx_v_l1 allocation failed");
+    TEST_ASSERT(idx0->data != tag_base, "cache_idx_k_l0 must be remapped off the synthetic alloc_base span");
+    TEST_ASSERT(idx1->data != tag_base + layer_bytes, "cache_idx_v_l1 must be remapped off the synthetic span");
+    TEST_ASSERT(idx0->extra != nullptr, "cache_idx_k_l0 extra must be populated");
+    auto * idx0_extra = static_cast<ggml_tensor_extra_gpu *>(idx0->extra);
+    auto   idx0_dev0  = idx0_extra->data_handle[0].resolve();
+    TEST_ASSERT(idx0_dev0 && idx0_dev0.on_device && idx0_dev0.ptr == idx0->data,
+                "cache_idx_k_l0 must resolve to the planned device-0 allocation");
+    TEST_ASSERT(idx1->extra != nullptr, "cache_idx_v_l1 extra must be populated");
+    auto * idx1_extra = static_cast<ggml_tensor_extra_gpu *>(idx1->extra);
+    auto   idx1_dev1  = idx1_extra->data_handle[1].resolve();
+    TEST_ASSERT(idx1_dev1 && idx1_dev1.on_device && idx1_dev1.ptr == idx1->data,
+                "cache_idx_v_l1 must resolve to the planned device-1 allocation");
+    TEST_ASSERT(ggml_backend_tensor_alloc(buf_tag, stray, tag_base) == GGML_STATUS_ALLOC_FAILED,
+                "a base tensor with no resolvable KV layer must fail the allocation");
+    // Out-of-range layer: parses as a valid layer id but names a layer past the buffer's n_layers /
+    // layer_allocs, so init_tensor must fail it rather than keep the synthetic span. The error branch for a
+    // null per-layer allocation is not exercised here: every layer the buffer holds gets an allocation by
+    // construction, so it is covered by inspection only.
+    ggml_tensor * far = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 64);
+    ggml_set_name(far, "cache_k_l99999");
+    TEST_ASSERT(ggml_backend_tensor_alloc(buf_tag, far, tag_base) == GGML_STATUS_ALLOC_FAILED,
+                "a KV tensor naming a layer past the buffer's layers must fail the allocation");
+    ggml_backend_buffer_free(buf_tag);
+
     ggml_free(ctx);
     ggml_sycl::test_clear_kv_placement_plan();
 
