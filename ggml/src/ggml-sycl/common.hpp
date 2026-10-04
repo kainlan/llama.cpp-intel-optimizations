@@ -28,6 +28,7 @@
 #include "orchestrator.hpp"
 #include "presets.hpp"
 #include "q8-dense-layout-rule.hpp"
+#include "soa-reorder-types.hpp"
 #include "sycl-kernel-profiler.hpp"
 #include "sycl_hw.hpp"
 #include "tensor-types.hpp"
@@ -1671,7 +1672,8 @@ struct layout_policy {
         }
 
         // Attention/FFN weights: COALESCED for best TG performance (tile-based warp-aligned access).
-        // Types that don't support coalesced fall through to the default SOA path below.
+        // Types that don't support coalesced fall through to the default path below (SOA when the type has
+        // an AOS->SOA reorder, AOS otherwise).
         //
         // Phase E (XMX-RESIZE): when GGML_SYCL_SKIP_ONEDNN_Q4_0=1 is set, Q4_0 PP
         // is routed through the unified XMX kernel which expects SOA or AOS weights
@@ -1752,8 +1754,11 @@ struct layout_policy {
             if (qtype == GGML_TYPE_Q8_0 && is_coalesced_supported(qtype)) {
                 return GGML_LAYOUT_COALESCED;
             }
+            // SOA only where the fill has a reorder for the type (soa-reorder-types.hpp); the runtime
+            // clamps every other quantized type to AOS, so planning SOA for it plans a layout nothing
+            // materializes (llama.cpp-76os).
             if (ggml_is_quantized(qtype)) {
-                return GGML_LAYOUT_SOA;
+                return ggml_sycl_soa_reorder_supported_type(qtype) ? GGML_LAYOUT_SOA : GGML_LAYOUT_AOS;
             }
         }
 
@@ -1794,8 +1799,10 @@ struct layout_policy {
             return GGML_LAYOUT_AOS;
         }
 
-        // Default: SOA is safe for all quantized types
-        return GGML_LAYOUT_SOA;
+        // Default: SOA where the type has an AOS->SOA reorder, AOS otherwise. This default used to say
+        // "SOA is safe for all quantized types", which planned SOA for IQ*/Q2_0 expert weights while
+        // ggml_sycl_adjust_layout_for_tensor clamped them to AOS (llama.cpp-76os).
+        return ggml_sycl_soa_reorder_supported_type(qtype) ? GGML_LAYOUT_SOA : GGML_LAYOUT_AOS;
     }
 
     static layout_mode get_with_override(ggml_type qtype, tensor_usage usage, int device_id = -1) {

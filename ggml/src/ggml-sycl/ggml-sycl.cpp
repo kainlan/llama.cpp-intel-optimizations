@@ -26823,14 +26823,21 @@ static void ggml_sycl_drop_all_weight_cache_entries(ggml_sycl::unified_cache * c
 // expert capability is a checked slice carrying the allocation id, device,
 // exact byte range, layout and shared lifetime. Resolution therefore never
 // reconstructs authority from tensor->data or an allocation registry.
-static bool ggml_sycl_publish_backend_aos_expert_handles(ggml_backend_sycl_buffer_context * ctx, ggml_tensor * tensor) {
+static bool ggml_sycl_publish_backend_aos_expert_handles(ggml_backend_sycl_buffer_context * ctx,
+                                                         ggml_tensor *                      tensor,
+                                                         bool                               consumer_is_mul_mat_id = false) {
     if (!ctx || !tensor || tensor->view_src != nullptr || !tensor->extra ||
         ctx->managed_meta.tier != ggml_sycl::alloc_tier::DEVICE_VRAM || !ctx->managed_handle.valid()) {
         return false;
     }
+    // Mutation safety for tensors that are published without a name classification (structural or
+    // MUL_MAT_ID-consumer): every handle built below is a checked slice of this buffer's own allocation
+    // (the `resolved.ptr == expected` test), so a later set_tensor writes through the same bytes and no
+    // handle can go stale. ggml_sycl_invalidate_backend_weight_mutation still withdraws handles and drops
+    // derived unified-cache layouts only for name-classified tensors; a non-aliasing derived copy of an
+    // unclassified tensor is not covered by it (true before this change for ne[2] > 1 and for dense weights).
     const bool classified_expert = ggml_sycl_get_tensor_usage(tensor) == tensor_usage::MOE_EXPERT_WEIGHT;
-    const bool structural_expert = tensor->ne[2] > 1;
-    if (!classified_expert && !structural_expert) {
+    if (!moe_aos_expert_publication_wanted(classified_expert, tensor->ne[2], consumer_is_mul_mat_id)) {
         return false;
     }
 
@@ -27210,8 +27217,7 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
                                 extra->data_device_ptr(dev_id));
             }
         }
-    } else if ((tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q4_K || tensor->type == GGML_TYPE_Q6_K ||
-                tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_MXFP4) &&
+    } else if (ggml_sycl_soa_reorder_supported_type(tensor->type) &&
                (ggml_sycl_reorder_enabled() || ggml_sycl_unified_kernel_requires_aos(tensor->type))) {
         // Reuse an existing extra if present.  Do NOT overwrite it or we lose the
         // model_id for unified cache lookups.
@@ -27984,18 +27990,7 @@ struct ggml_sycl_onednn_woq_fill_ctx {
 };
 
 static bool ggml_sycl_layout_supports_soa(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q6_K:
-        case GGML_TYPE_Q8_0:
-
-        case GGML_TYPE_MXFP4:
-            return true;
-        default:
-
-            return false;
-    }
+    return ggml_sycl_soa_reorder_supported_type(type);
 }
 
 static bool ggml_sycl_moe_mmvq_batched_supports_layout(ggml_type type, layout_mode layout) {
@@ -36717,10 +36712,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // 2. GET_ROWS for Q4_0/Q8_0 already handles SoA layout via is_soa() check
     // 3. GET_ROWS for Q6_K is now supported on GPU (SoA and coalesced layouts)
     bool do_reorder = false;
-    bool type_ok =
-        (tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_Q4_K ||
-
-         tensor->type == GGML_TYPE_Q6_K || tensor->type == GGML_TYPE_MXFP4);
+    bool type_ok     = ggml_sycl_soa_reorder_supported_type(tensor->type);
     bool dims_ok     = tensor->ne[0] > 0 && tensor->ne[1] > 0;
     bool full_tensor = (offset == 0 && size == ggml_nbytes(tensor));
     if (type_ok && ggml_sycl_reorder_allowed_for_type(tensor->type) && ctx->supports_soa_reorder && dims_ok &&
@@ -55408,9 +55400,7 @@ static void reorder_mxfp4_dpas_cpu(void * dst_dpas, size_t dst_size, const void 
 // Check if tensor is eligible for CPU-side SoA reorder during upload
 static bool should_cpu_reorder(const ggml_tensor * tensor, const ggml_backend_sycl_buffer_context * ctx) {
     // Supported quantized types for CPU-side SoA reorder
-    if (tensor->type != GGML_TYPE_Q4_0 && tensor->type != GGML_TYPE_Q8_0 && tensor->type != GGML_TYPE_Q4_K &&
-
-        tensor->type != GGML_TYPE_Q6_K && tensor->type != GGML_TYPE_MXFP4) {
+    if (!ggml_sycl_soa_reorder_supported_type(tensor->type)) {
         return false;
     }
     // Check if reordering is allowed for this type (unified kernel requires AoS)
@@ -55859,17 +55849,10 @@ bool reorder_tensor_to_soa(const ggml_tensor * tensor, dpct::queue_ptr stream, c
         return false;
     }
     // Check if type is supported
-    switch (tensor->type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q6_K:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_MXFP4:
-            break;  // Supported
-        default:
-            fprintf(stderr, "[REORDER-UNIFIED] ERROR: tensor '%s' type %d not supported for SoA\n", tensor->name,
-                    tensor->type);
-            return false;
+    if (!ggml_sycl_soa_reorder_supported_type(tensor->type)) {
+        fprintf(stderr, "[REORDER-UNIFIED] ERROR: tensor '%s' type %d not supported for SoA\n", tensor->name,
+                tensor->type);
+        return false;
     }
     // DO THE REORDER - transform data from AoS to SoA
 
@@ -67167,9 +67150,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         // Only enforce layout choices for quantized types that support reordering.
         // Float types (F32, F16, BF16) don't have reordered layouts and should
         // always use their default kernel paths regardless of layout finalization.
-        const bool type_has_reorder_support =
-            (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K ||
-             src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_MXFP4);
+        const bool type_has_reorder_support = ggml_sycl_soa_reorder_supported_type(src0->type);
         // Use resolve().layout — no finalization gate needed.
         bool enforce_layout_choice = !has_override && ggml_sycl_tensor_is_weight(src0) && type_has_reorder_support;
         layout_mode chosen_layout  = GGML_LAYOUT_AOS;
@@ -69291,7 +69272,8 @@ static bool ggml_sycl_publish_mmid_canonical_aos_experts(const ggml_tensor * src
         return false;
     }
     const bool published = ggml_sycl_publish_backend_aos_expert_handles(
-        static_cast<ggml_backend_sycl_buffer_context *>(src0->buffer->context), const_cast<ggml_tensor *>(src0));
+        static_cast<ggml_backend_sycl_buffer_context *>(src0->buffer->context), const_cast<ggml_tensor *>(src0),
+        /*consumer_is_mul_mat_id=*/true);
     auto *                                                    extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
     ggml_tensor_extra_gpu::resolved_moe_expert_storage_record expert0{};
     if (published && extra &&
@@ -78542,7 +78524,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             bool         all_entries_routed_cpu     = false;
             int          pp_fallback_gpu_entries    = 0;
             const char * pp_fallback_path           = "pp_per_expert";
-            const bool   device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_IQ2_XXS);
+            // A type named here has its device-resident experts D2H-copied to pinned host memory on
+            // every dispatch and run on the CPU (dispatch_cpu_entries_now): a non-GPU executor for
+            // device data plus weight streaming. Q4_K is still listed although it has an _id kernel
+            // (llama.cpp-zzb5); IQ2_XXS left with its _id kernel (llama.cpp-s36q), so the GPU runs it.
+            // tests/test-sycl-moe-device-weight-cpu-fallback-source.py keeps advertised types out.
+            const bool device_weight_cpu_fallback = (src0->type == GGML_TYPE_Q4_K);
             const bool pp_mmvq_batched_supported = ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, route_layout);
             const bool pp_mmvq_batched_shape =
                 ne11 == 1 || (src0->type == GGML_TYPE_MXFP4 && route_layout == GGML_LAYOUT_MXFP4_I8);

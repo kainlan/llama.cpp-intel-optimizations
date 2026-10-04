@@ -3322,6 +3322,36 @@ static void mul_mat_vec_q_iq3_s_q8_1(const void * __restrict__ vx,
     }
 }
 
+// Generic-signature adaptors for the MUL_MAT_ID _id kernel (mul_mat_vec_q_id takes a
+// vec_dot_q_sycl_t). The IQ3 vec_dots also take their grid tables, which the dense
+// kernels above pass from the global tables; these bind the same tables, so the _id
+// kernel computes exactly the dense kernels' per-block dot product.
+static __dpct_inline__ float vec_dot_iq3_xxs_q8_1_id(const void * __restrict__ vbq,
+                                                     const block_q8_1 * __restrict__ bq8_1,
+                                                     const int & iqs) {
+    return vec_dot_iq3_xxs_q8_1(vbq, bq8_1, iqs, iq3xxs_grid, ksigns64);
+}
+
+static __dpct_inline__ float vec_dot_iq3_s_q8_1_id(const void * __restrict__ vbq,
+                                                   const block_q8_1 * __restrict__ bq8_1,
+                                                   const int & iqs) {
+    return vec_dot_iq3_s_q8_1(vbq, bq8_1, iqs, iq3s_grid);
+}
+
+// Same for the IQ2 pair that takes grid tables. vec_dot_iq2_s_q8_1 already has the generic
+// signature (it reads iq2s_grid itself), so IQ2_S needs no adaptor.
+static __dpct_inline__ float vec_dot_iq2_xxs_q8_1_id(const void * __restrict__ vbq,
+                                                     const block_q8_1 * __restrict__ bq8_1,
+                                                     const int & iqs) {
+    return vec_dot_iq2_xxs_q8_1(vbq, bq8_1, iqs, iq2xxs_grid, ksigns_iq2xs, kmask_iq2xs);
+}
+
+static __dpct_inline__ float vec_dot_iq2_xs_q8_1_id(const void * __restrict__ vbq,
+                                                    const block_q8_1 * __restrict__ bq8_1,
+                                                    const int & iqs) {
+    return vec_dot_iq2_xs_q8_1(vbq, bq8_1, iqs, iq2xs_grid, ksigns64);
+}
+
 template <int qk, int qi, typename block_q_t, int vdr>
 static void mul_mat_vec_q_iq1_s_q8_1(const void * __restrict__ vx,
                                      const void * __restrict__ vy,
@@ -17320,6 +17350,12 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
             }
             have_kernel_event = true;
             break;
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -22108,12 +22144,16 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 }
             }
             break;
-        // Second MMID consumer for the types llama.cpp-gx30 admitted. This switch is
-        // narrower than the set of _id launchers that exist, which is the gap the
-        // census hit at the sibling switch in ggml_sycl_mmvq_dispatch: a type the
-        // capability query admits can reach a consumer whose own switch never
-        // enumerated it. All of these are AoS-only per moe_mmvq_capability_supports_layout;
-        // the submit helpers re-check that and refuse rather than assume it.
+        // Second MMID consumer for the types llama.cpp-gx30 admitted. It sits in
+        // ggml_sycl_mul_mat_id_vec_q, which returns false at "type_unsupported" for
+        // every type outside {Q4_0, Q8_0, MXFP4} before it reaches this switch, so
+        // the Q1_0/NVFP4 and quant-AoS arms below are NOT reachable today: the live
+        // consumer of mmvq_submit_quant_aos_id / mmvq_submit_q1_nvfp4_aos_id is the
+        // first switch, in mmvq_moe_batched_dispatch. The arms are kept enumerated so
+        // the consumer-coverage gate holds both switches to the capability set, but
+        // that gate's coverage of this switch is not evidence the path runs. All of
+        // these are AoS-only per moe_mmvq_capability_supports_layout; the submit
+        // helpers re-check that and refuse rather than assume it.
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_NVFP4:
             if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
@@ -22128,6 +22168,12 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             }
             have_kernel_event = true;
             break;
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -23395,6 +23441,66 @@ bool mmvq_submit_quant_aos_id(sycl::queue &                    q,
 
     sycl::event event;
     switch (weight_type) {
+        case GGML_TYPE_IQ4_NL:
+            // Same body as the dense mul_mat_vec_q_iq4_nl_q8_1 (QK4_NL, QI4_NL, vdr 2): the generic
+            // _id kernel with the IQ4_NL vec_dot, which has the generic vec_dot_q_sycl_t signature.
+            if (ncols % QK4_NL != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ4_NL, QK4_NL, QI4_NL, block_iq4_nl, VDR_Q4_0_Q8_1_MMVQ,
+                                            vec_dot_iq4_nl_q8_1>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            // The dense mul_mat_vec_q_iq2_xxs_q8_1 tuple (QK_K, QI2_XXS / 2, vdr 1), vec_dot behind an adaptor.
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ2_XXS, QK_K, QI2_XXS / 2, block_iq2_xxs, 1,
+                                            vec_dot_iq2_xxs_q8_1_id>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_IQ2_XS:
+            // The dense mul_mat_vec_q_iq2_xs_q8_1 tuple (QK_K, QI2_XS / 2, vdr 1), as above.
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ2_XS, QK_K, QI2_XS / 2, block_iq2_xs, 1,
+                                            vec_dot_iq2_xs_q8_1_id>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_IQ2_S:
+            // The dense mul_mat_vec_q_iq2_s_q8_1 tuple (QK_K, QI2_S / 2, vdr 1); the vec_dot is already generic.
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ2_S, QK_K, QI2_S / 2, block_iq2_s, 1, vec_dot_iq2_s_q8_1>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            // The dense mul_mat_vec_q_iq3_xxs_q8_1 tuple (QK_K, QI3_XXS / 2, vdr 1) with the
+            // grid-table vec_dot behind a generic-signature adaptor.
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ3_XXS, QK_K, QI3_XXS / 2, block_iq3_xxs, 1,
+                                            vec_dot_iq3_xxs_q8_1_id>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_IQ3_S:
+            // The dense mul_mat_vec_q_iq3_s_q8_1 tuple (QK_K, QI3_S / 2, vdr 1), as above.
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ3_S, QK_K, QI3_S / 2, block_iq3_s, 1, vec_dot_iq3_s_q8_1_id>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
         case GGML_TYPE_Q4_1:
             if (ncols % QK4_1 != 0) {
                 return false;

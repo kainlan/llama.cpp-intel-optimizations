@@ -3606,6 +3606,46 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
+# llama.cpp-76os: source gate -- the SOA-reorder type table
+# (ggml/src/ggml-sycl/soa-reorder-types.hpp) is the one list of types whose
+# AOS->SOA reorder exists. The six per-type fill switches (reorder_aos_to_soa_device,
+# reorder_rows_to_soa, reorder_data_internal_, ggml_sycl_reorder_weight_gpu,
+# ggml_sycl_reorder_weight_cpu, ggml_sycl_reorder_expected_size) must carry exactly
+# its types; the runtime clamp, reorder_tensor_to_soa, the partial-row fill and
+# layout_policy::get_optimal (the planner's layout source) must read it; and a chain
+# comparing against all five types is flagged. Host-only, reads the sources as text.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-soa-reorder-types-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-soa-reorder-types-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
+# llama.cpp-s36q: source gate -- the legacy standard-PP MUL_MAT_ID route's
+# device_weight_cpu_fallback flag (ggml-sycl.cpp) must not name a type the MoE MMVQ
+# capability table advertises (it D2H-streams device-resident experts to the CPU per
+# dispatch and makes the _id kernel unreachable), except the ticketed exemptions.
+# Host-only, reads the sources as text.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-device-weight-cpu-fallback-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-device-weight-cpu-fallback-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
+# llama.cpp-s36q: source gate -- the MUL_MAT_ID dispatch publishes AoS expert handles with its
+# consumer named (a single-expert, name-unclassified src0 has no other trigger), and the
+# publication decision is the host-tested predicate in moe-mmvq-tables.hpp. Host-only.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-expert-publication-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-expert-publication-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
 # llama.cpp-2lxw: source gate for the dense split executor's host-side trims
 # (moved-only input refresh on a plan-cache hit and the staging generation it
 # relies on). Host-only, reads the sources as text.
