@@ -286,3 +286,60 @@ def test_publish_has_a_mutation_witness(mutation):
     assert seg2 != seg, f"mutation {mutation} did not change the segment"
     mutated = src[:start] + seg2 + src[end:]
     assert violations_publish(mutated), f"mutation {mutation} was not witnessed"
+
+
+# ---------------------------------------------------------------------------
+# (E) no SYCL refusal text suggests a smaller context
+# ---------------------------------------------------------------------------
+
+# Owner ruling: never shrink the context; place KV. A refusal names -ub, the VRAM budget or KV placement. A FACT about
+# the largest context that fits ("Largest all-VRAM context is about -c N") is not a remedy and stays; a REMEDY that
+# asks for a smaller -c / n_ctx / context does not. "a smaller -ub is not a smaller context" is the negation.
+_STRING_RE = re.compile(r'"(?:\\.|[^"\\\n])*"')
+_SMALLER_CONTEXT_RE = re.compile(
+    r"(?<!not a )\b(?:smaller|reduce|reducing|lower|lowering|shrink|decrease)\s+(?:the\s+)?(?:-c\b|n_ctx|context)"
+    r"|-ub\s+or\s+-c\b|\bor\s+reduce\s+-c",
+    flags=re.IGNORECASE,
+)
+
+
+def violations_smaller_context(name: str, src: str) -> list[str]:
+    found: list[str] = []
+    for lit in _STRING_RE.findall(strip_comments(src)):
+        m = _SMALLER_CONTEXT_RE.search(lit)
+        if m:
+            found.append(f"{name}: a refusal text suggests a smaller context ({m.group(0)!r}) in {lit[:100]}")
+    return found
+
+
+def test_no_sycl_refusal_text_suggests_a_smaller_context():
+    assert violations_smaller_context("ggml-sycl.cpp", GGML_SYCL_CPP) == []
+    assert violations_smaller_context("llama-context.cpp", LLAMA_CONTEXT_CPP) == []
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        '"or free VRAM on this card (another process, or a smaller -c) before loading\\n"',
+        '"a smaller -ub or -c keeps those buffers in the zone\\n"',
+        '"pass -fa 1/auto to use flash attention, or reduce -c/-p%s\\n"',
+        '"no -ub is known to fit: free VRAM on the card, or pass a smaller -c"',
+        '"lower n_ctx"',
+        '"use a smaller context"',
+    ],
+)
+def test_smaller_context_gate_has_a_witness(literal):
+    assert violations_smaller_context("x", "const char * m = " + literal + ";"), literal
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        '"Largest all-VRAM context is about -c 34304."',
+        '"the largest context that fits is about -c %u\\n"',
+        '"a smaller -ub is not a smaller context"',
+        '"a smaller -ub keeps those buffers in the zone\\n"',
+    ],
+)
+def test_smaller_context_gate_allows_facts_and_negations(literal):
+    assert violations_smaller_context("x", "const char * m = " + literal + ";") == [], literal

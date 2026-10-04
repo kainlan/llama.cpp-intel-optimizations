@@ -1323,10 +1323,10 @@ llama_context::llama_context(
                     cparams.n_ubatch,
                     largest_ub != 0 ?
                         format("the largest -ub that fits is about %u, a power of two, estimated by scaling the "
-                               "measured compute buffers (or free VRAM on the card, or pass a smaller -c)",
+                               "measured compute buffers (or free VRAM on the card)",
                                largest_ub)
                             .c_str() :
-                        "no -ub is known to fit: free VRAM on the card, or pass a smaller -c"));
+                        "no -ub is known to fit: free VRAM on the card"));
             }
         }
 #endif
@@ -2386,10 +2386,10 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
                               format("%u does not fit this context", last_good).c_str(),
                 tried.c_str(), last_stop != nullptr ? last_stop : stop, last_good, settle_refusal.c_str(),
                 advice != 0 ? format("the largest -ub that fits is about %u, a power of two, estimated by scaling the "
-                                     "measured compute buffers (or free VRAM on the card, or pass a smaller -c)",
+                                     "measured compute buffers (or free VRAM on the card)",
                                      advice)
                                   .c_str() :
-                              "no -ub is known to fit: free VRAM on the card, or pass a smaller -c"));
+                              "no -ub is known to fit: free VRAM on the card"));
         } else {
             sched_need_reserve = true;
             sched_reserve();
