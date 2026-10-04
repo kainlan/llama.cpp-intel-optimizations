@@ -146,7 +146,7 @@ def violations_advice(h: str, cpp: str) -> list[str]:
     if not re.search(r"GGML_BACKEND_API\s+size_t\s+" + ADVICE_FN + r"\(", strip_comments(h)):
         found.append(f"{ADVICE_FN} is not declared GGML_BACKEND_API in ggml-sycl.h")
     code = strip_comments(cpp)
-    if '#include "compute-refusal-advice.hpp"' not in cpp:
+    if '#include "ggml-sycl/compute-refusal-advice.hpp"' not in cpp:
         found.append("ggml-sycl.cpp does not include compute-refusal-advice.hpp")
     if not re.search(r'strcmp\(name, "' + ADVICE_FN + r'"\) == 0\) \{\s*return \(void \*\) ' + ADVICE_FN, code):
         found.append(f"{ADVICE_FN} is not registered in the backend proc table")
@@ -156,7 +156,7 @@ def violations_advice(h: str, cpp: str) -> list[str]:
         return found + [str(e)]
     for needle, why in (
         ("ggml_sycl_hold_spill_fit(", "the kpjw hold-spill fit (the -ub the realized check would also accept)"),
-        ("zone_hold_fit_largest_ub", "the kpjw largest-ub machinery"),
+        ("hold_answer.largest_ub", "the kpjw largest-ub machinery (the answer the hold-spill fit gives when it refuses a rung)"),
         ("g_compute_placement_refused_bytes", "the recorded refused request"),
         ("zone_largest_free(ggml_sycl::vram_zone_id::RUNTIME)", "the RUNTIME zone's room"),
         ("ggml_sycl_hold_kv_room(", "the KV zone's room, net of the KV still to place"),
@@ -187,7 +187,7 @@ def test_advice_has_a_mutation_witness(mutation):
     elif mutation == "unregistered":
         cpp = cpp.replace('strcmp(name, "' + ADVICE_FN + '") == 0', 'strcmp(name, "x") == 0')
     elif mutation == "no-hold-fit":
-        cpp = cpp.replace("zone_hold_fit_largest_ub", "zone_hold_fit_x", 1)
+        cpp = cpp.replace("hold_answer.largest_ub", "hold_answer.x")
     elif mutation == "no-authority":
         cpp = cpp.replace("ggml_sycl_device_budget_authority(device, total", "ggml_sycl_device_budget_x(device, total", 1)
     elif mutation == "env-reparse":
@@ -237,11 +237,11 @@ def test_llama_has_a_mutation_witness(mutation):
         mutated = src.replace("static std::string llama_context_sycl_compute_refusal_text(", "static std::string llama_x(")
     elif mutation == "pp-bare":
         mutated = re.sub(
-            r'("failed to allocate compute pp buffers") \+ llama_context_sycl_compute_refusal_text\([^)]*\)\)', r"\1)", src, count=1
+            r'("failed to allocate compute pp buffers")\s*\+\s*llama_context_sycl_compute_refusal_text\([^)]*\)\)', r"\1)", src, count=1
         )
     else:
         mutated = re.sub(
-            r'("failed to allocate compute tg buffers") \+ llama_context_sycl_compute_refusal_text\([^)]*\)\)', r"\1)", src, count=1
+            r'("failed to allocate compute tg buffers")\s*\+\s*llama_context_sycl_compute_refusal_text\([^)]*\)\)', r"\1)", src, count=1
         )
     assert mutated != src, f"mutation {mutation} did not change the source"
     assert violations_llama(mutated), f"mutation {mutation} was not witnessed"

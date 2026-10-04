@@ -98,20 +98,20 @@ void test_largest_ub() {
     in.n_ubatch = 600;
     in.request  = kRequest / 512 * 600;
     check(ggml_sycl::compute_refusal_largest_ub(in) == 256, "a non-power-of-two -ub starts at 512, which is refused");
-    in = incident();
+    in          = incident();
     in.raw_free = 200ull * kMiB + kHeadroom;
     check(ggml_sycl::compute_refusal_largest_ub(in) == 64, "a small room names a small -ub: 200 MiB holds 64");
     in.raw_free = kHeadroom;
     in.kv_room  = 0;
     check(ggml_sycl::compute_refusal_largest_ub(in) == 0, "no room at all: no -ub is known to fit");
-    in = incident();
+    in                  = incident();
     in.hold_fit_refused = true;
     in.hold_largest_ub  = 128;
     check(ggml_sycl::compute_refusal_largest_ub(in) == 128,
           "the kpjw hold-spill fit refusing 256 caps the answer: the printed -ub passes both");
     in.hold_largest_ub = 0;
     check(ggml_sycl::compute_refusal_largest_ub(in) == 0, "the hold fit knowing no -ub fits means none is named");
-    in = incident();
+    in                  = incident();
     in.hold_fit_refused = false;
     in.hold_largest_ub  = 64;
     check(ggml_sycl::compute_refusal_largest_ub(in) == 256, "a hold fit that accepted the rung caps nothing");
@@ -157,16 +157,16 @@ void test_budget_pct_declines_what_it_cannot_do() {
     in.raw_free               = kRequest + 2 * kHeadroom;
     check(ggml_sycl::compute_refusal_budget_pct(in) == 0,
           "the room was already there: another cause, no budget change is advised");
-    in = incident();
+    in         = incident();
     in.request = 64ull * 1024ull * kMiB;
     check(ggml_sycl::compute_refusal_budget_pct(in) == 0, "a buffer larger than the whole budget: none");
-    in = incident();
-    in.budget.fixed_zone_bytes = 29000ull * kMiB;
+    in                         = incident();
+    in.budget.fixed_zone_bytes = 30000ull * kMiB;
     check(ggml_sycl::compute_refusal_budget_pct(in) == 0, "a pct that would starve the fixed zones is not advised");
-    in = incident();
+    in                 = incident();
     in.budget.base_mem = 0;
     check(ggml_sycl::compute_refusal_budget_pct(in) == 0, "no budget authority, no advice");
-    in = incident();
+    in            = incident();
     in.budget.pct = 1;
     check(ggml_sycl::compute_refusal_budget_pct(in) == 0, "a pct that cannot go lower is not advised");
 }
@@ -196,10 +196,10 @@ void test_message_names_what_fits() {
 
 void test_message_when_nothing_fits() {
     printf("message: says so when no -ub and no pct is known to fit\n");
-    compute_refusal_inputs in = incident();
-    in.raw_free               = kHeadroom;
-    in.kv_room                = 0;
-    in.budget.base_mem        = 0;
+    compute_refusal_inputs in        = incident();
+    in.raw_free                      = kHeadroom;
+    in.kv_room                       = 0;
+    in.budget.base_mem               = 0;
     const compute_refusal_advice adv = ggml_sycl::compute_refusal_advise(in);
     const std::string            msg = ggml_sycl::compute_refusal_message(in, adv);
     check(adv.largest_ub == 0 && adv.budget_pct == 0, "nothing is named");
@@ -213,7 +213,7 @@ void test_degenerate_inputs() {
     compute_refusal_inputs in = incident();
     in.n_ubatch               = 0;
     check(ggml_sycl::compute_refusal_largest_ub(in) == 0, "an unknown -ub names no -ub");
-    in = incident();
+    in         = incident();
     in.request = 0;
     check(ggml_sycl::compute_refusal_budget_pct(in) == 0, "no request, no pct");
     check(ggml_sycl::compute_refusal_message(in, ggml_sycl::compute_refusal_advise(in)).size() > 0,
