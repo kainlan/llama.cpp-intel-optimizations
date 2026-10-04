@@ -623,9 +623,10 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
 // type that has a generic mul_mat_vec_q<> instantiation to transcribe -- plus
 // IQ4_NL (llama.cpp-s36q), whose dense kernel is that generic body with
 // vec_dot_iq4_nl_q8_1, IQ3_XXS / IQ3_S (s36q phase 2) and IQ2_XXS / IQ2_XS / IQ2_S
-// (phase 3), whose dense kernels (qi = QI3_x / 2 or QI2_x / 2, vdr 1) pass grid
-// tables to their vec_dot, so each goes through a generic-signature adaptor over the
-// same grid tables the dense kernels read (IQ2_S's vec_dot is already generic). The
+// (phase 3). Those five dense kernels share the tuple (QK_K, QI3_x / 2 or QI2_x / 2,
+// vdr 1). Four of their vec_dots take grid tables as extra arguments, so each goes
+// through a generic-signature adaptor over the same grid tables the dense kernels
+// read; IQ2_S's vec_dot already has the generic signature and is passed directly. The
 // rest of the iq* family (IQ4_XS, IQ1_S, IQ1_M) stays refused only because no tuple
 // and, where its vec_dot takes grid tables, no adaptor has been written for it yet.
 // Each dispatches the same generic

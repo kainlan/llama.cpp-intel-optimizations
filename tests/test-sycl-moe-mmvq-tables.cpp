@@ -199,8 +199,8 @@ int main() {
     // quantizes the activation to Q8_1 and dispatches vec_dot_*_q8_1, meaningless for
     // float weights. Covering either must move this list in the same change, which
     // is the point.
-    const ggml_type uncovered[] = { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ1_S, GGML_TYPE_F16, GGML_TYPE_F32,
-                                    GGML_TYPE_BF16 };
+    const ggml_type uncovered[] = { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_F16,
+                                    GGML_TYPE_F32,    GGML_TYPE_BF16 };
     for (const ggml_type type : uncovered) {
         for (const ggml_layout_mode layout : all_layouts()) {
             if (moe_mmvq_capability_supports_layout(type, layout)) {

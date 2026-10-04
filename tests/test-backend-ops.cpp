@@ -10763,6 +10763,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // For issue 27873
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
+    // The same single-expert, single-row shape for the other types the SYCL _id path serves. The shape
+    // needs the MUL_MAT_ID dispatch to publish expert handles for a src0 that is ne[2] == 1 and
+    // unclassified by name (llama.cpp-s36q); a type without a case here would not show a gap.
+    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS }) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
+    }
 
     for (int k : {1, 63, 65}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
