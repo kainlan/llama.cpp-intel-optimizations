@@ -96,16 +96,27 @@ inline float bf16_to_f32(uint16_t bits) {
 // walking K serially, so the op would be latency-bound rather than bandwidth-bound. Split K
 // across a power-of-two number of sub-groups of one work-group, growing it until the op has
 // about SKINNY_TARGET_SUBGROUPS sub-groups, but never so far that a sub-group's share of K
-// drops below one 128-element pass. The partial sums meet in local memory in a fixed order
+// drops below one 128-element pass (floor(K / 128) sub-groups at most) and never past the
+// device's max work-group size. The partial sums meet in local memory in a fixed order
 // (no atomics), so the result does not depend on scheduling.
 constexpr int64_t SKINNY_TARGET_SUBGROUPS = 2048;
 constexpr int     SKINNY_MAX_SPLIT        = 32;  // sub-groups per row; 32 x 16 lanes = a 512-thread work-group
 constexpr int     SKINNY_PASS_ELEMS       = 128;
+// Smallest work-group any launcher here uses: the tiled kernel's 16 x 16 threads (the skinny
+// kernel's smallest is 8 sub-groups of 16 = 128).
+constexpr size_t  MIN_WORK_GROUP          = 256;
 
-inline int skinny_split(int64_t K, int64_t M) {
-    int64_t cap = (K + SKINNY_PASS_ELEMS - 1) / SKINNY_PASS_ELEMS;
+inline int skinny_split(int64_t K, int64_t M, size_t max_work_group) {
+    int64_t cap = K / SKINNY_PASS_ELEMS;
+    if (cap < 1) {
+        cap = 1;
+    }
     if (cap > SKINNY_MAX_SPLIT) {
         cap = SKINNY_MAX_SPLIT;
+    }
+    // One sub-group is 16 work-items; a work-group of `split` sub-groups must fit the device.
+    if (static_cast<int64_t>(max_work_group / 16) < cap) {
+        cap = static_cast<int64_t>(max_work_group / 16);
     }
     int split = 1;
     while (split * 2 <= cap && M * split < SKINNY_TARGET_SUBGROUPS) {
@@ -329,7 +340,10 @@ inline sycl::event mul_mat_bf16_f32(sycl::queue &    q,
                                     int64_t          M,
                                     int64_t          N,
                                     int64_t          ldx,
-                                    int64_t          ldy) {
+                                    int64_t          ldy,
+                                    size_t           max_work_group) {
+    // max_work_group is the device's max_work_group_size; every launch below uses at most that.
+    GGML_ASSERT(max_work_group >= MIN_WORK_GROUP);
     if (K <= 0 || M <= 0 || N <= 0) {
         return sycl::event();
     }
@@ -340,7 +354,7 @@ inline sycl::event mul_mat_bf16_f32(sycl::queue &    q,
     const bool vec4  = (K % 4 == 0) && (reinterpret_cast<uintptr_t>(w) % 8 == 0);
     // float4 activation loads additionally need 16-byte aligned column starts.
     const bool xvec  = vec4 && (reinterpret_cast<uintptr_t>(x) % 16 == 0) && (ldx % 4 == 0);
-    const int  split = skinny_split(K, M);
+    const int  split = skinny_split(K, M, max_work_group);
     switch (N) {
         case 1:
             return launch_skinny<1>(q, w, x, y, K, M, ldx, ldy, vec4, xvec, split);

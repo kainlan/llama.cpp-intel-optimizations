@@ -46,7 +46,9 @@ struct run_case {
 // Guard regions around every buffer the kernel touches. They are poisoned with values that
 // corrupt the result if read (NaN) or are detectably changed if written, so an out-of-bounds
 // access by any lane of any split fails the case instead of passing by luck.
-constexpr int64_t GUARD = 64;
+// 4096 elements: far enough that a large overrun (a mis-sized split or a wrong row base) lands
+// inside the guard instead of in a neighbouring allocation.
+constexpr int64_t GUARD = 4096;
 
 static void run_one(sycl::queue & q, const run_case & c) {
     const int64_t ldx = c.K + c.ldx_pad;
@@ -90,12 +92,19 @@ static void run_one(sycl::queue & q, const run_case & c) {
     q.memcpy(y_dev, y_init.data(), y_init.size() * sizeof(float));
     q.wait();
 
+    const size_t max_wg = q.get_device().get_info<sycl::info::device::max_work_group_size>();
     ggml_sycl_bf16::mul_mat_bf16_f32(q, w_dev + GUARD + c.w_offset, x_dev + GUARD + c.x_offset, y_dev + GUARD, c.K, c.M,
-                                     c.N, ldx, ldy)
+                                     c.N, ldx, ldy, max_wg)
         .wait();
 
     std::vector<float> y_all(y_init.size());
     q.memcpy(y_all.data(), y_dev, y_all.size() * sizeof(float)).wait();
+    // Determinism: a second launch over the same inputs must reproduce the output bit for bit.
+    ggml_sycl_bf16::mul_mat_bf16_f32(q, w_dev + GUARD + c.w_offset, x_dev + GUARD + c.x_offset, y_dev + GUARD, c.K, c.M,
+                                     c.N, ldx, ldy, max_wg)
+        .wait();
+    std::vector<float> y_again(y_init.size());
+    q.memcpy(y_again.data(), y_dev, y_again.size() * sizeof(float)).wait();
     std::vector<uint16_t> w_back(w_bits.size());
     std::vector<float>    x_back(x_host.size());
     q.memcpy(w_back.data(), w_dev, w_back.size() * sizeof(uint16_t)).wait();
@@ -156,6 +165,10 @@ static void run_one(sycl::queue & q, const run_case & c) {
             ++bad;
             break;
         }
+    }
+    if (std::memcmp(y_again.data(), y_all.data(), y_all.size() * sizeof(float)) != 0) {
+        std::printf("  %s: second launch differs from the first (non-deterministic)\n", c.name);
+        ++bad;
     }
     CHECK(bad == 0, "%s: %d bad outputs (K=%lld M=%lld N=%lld)", c.name, bad, (long long) c.K, (long long) c.M,
           (long long) c.N);
@@ -244,23 +257,34 @@ static void check_shape_contract() {
 
 static void check_split_policy() {
     using ggml_sycl_bf16::skinny_split;
+    const size_t big = 1024;
     // Short matrices split K to fill the device; tall ones keep one sub-group per row.
-    CHECK(skinny_split(10240, 1) == 32, "M=1 K=10240 should use the maximum split, got %d", skinny_split(10240, 1));
-    CHECK(skinny_split(10240, 4) == 32, "M=4 K=10240 should use the maximum split");
-    CHECK(skinny_split(2048, 48) == 16, "M=48 K=2048 is limited by K (16 passes of 128), got %d",
-          skinny_split(2048, 48));
-    CHECK(skinny_split(4096, 320) == 8, "M=320 K=4096 should reach ~2048 sub-groups with a split of 8, got %d",
-          skinny_split(4096, 320));
-    CHECK(skinny_split(4096, 4096) == 1, "tall matrix must not split");
+    CHECK(skinny_split(10240, 1, big) == 32, "M=1 K=10240 should use the maximum split, got %d",
+          skinny_split(10240, 1, big));
+    CHECK(skinny_split(10240, 4, big) == 32, "M=4 K=10240 should use the maximum split");
+    CHECK(skinny_split(2048, 48, big) == 16, "M=48 K=2048 is limited by K (16 passes of 128), got %d",
+          skinny_split(2048, 48, big));
+    CHECK(skinny_split(4096, 320, big) == 8, "M=320 K=4096 should reach ~2048 sub-groups with a split of 8, got %d",
+          skinny_split(4096, 320, big));
+    CHECK(skinny_split(4096, 4096, big) == 1, "tall matrix must not split");
     // A split never leaves a sub-group with less than one 128-element pass of K.
-    CHECK(skinny_split(36, 1) == 1, "K=36 must not split");
-    CHECK(skinny_split(128, 1) == 1, "K=128 must not split");
-    CHECK(skinny_split(256, 1) == 2, "K=256 splits in two");
-    for (int64_t K : { 1, 36, 2052, 10240, 65536 }) {
+    CHECK(skinny_split(36, 1, big) == 1, "K=36 must not split");
+    CHECK(skinny_split(128, 1, big) == 1, "K=128 must not split");
+    CHECK(skinny_split(129, 1, big) == 1, "K=129 must not split (two halves would be 64 and 65 elements)");
+    CHECK(skinny_split(255, 1, big) == 1, "K=255 must not split");
+    CHECK(skinny_split(256, 1, big) == 2, "K=256 splits in two");
+    CHECK(skinny_split(512, 600, big) == 4, "K=512 M=600 splits in four, got %d", skinny_split(512, 600, big));
+    // The work-group (split sub-groups of 16) never exceeds the device limit.
+    CHECK(skinny_split(10240, 1, 256) == 16, "a 256-thread device caps the split at 16, got %d",
+          skinny_split(10240, 1, 256));
+    for (int64_t K : { 1, 36, 129, 2052, 10240, 65536 }) {
         for (int64_t M : { 1, 3, 48, 320, 100000 }) {
-            const int s = skinny_split(K, M);
-            CHECK(s >= 1 && s <= 32 && (s & (s - 1)) == 0, "split %d for K=%lld M=%lld is not a power of two in [1,32]",
-                  s, (long long) K, (long long) M);
+            for (size_t wg : { size_t(256), size_t(512), size_t(1024) }) {
+                const int s = skinny_split(K, M, wg);
+                CHECK(s >= 1 && s <= 32 && (s & (s - 1)) == 0 && static_cast<size_t>(s) * 16 <= wg &&
+                          (s == 1 || static_cast<int64_t>(s) * 128 <= K),
+                      "split %d for K=%lld M=%lld wg=%zu violates the policy", s, (long long) K, (long long) M, wg);
+            }
         }
     }
 }
@@ -301,6 +325,12 @@ int main() {
         { "x base misaligned (16B)",    2048,  8,   2,   0, 0, 0, 1.0f,   1 },
         { "x stride odd, vec4 weights", 2048,  8,   3,   1, 0, 0, 1.0f,   0 },
         { "x base +2, M=4 K=10240",     10240, 4,   1,   0, 0, 0, 1.0f,   2 },
+        // One case per split factor so the stage-2 indexing (rows_per_wg x split x N) is exercised.
+        { "split=4 rows_per_wg=2 N=2",  512,   600, 2,   0, 0, 0, 1.0f,   0 },
+        { "split=2 rows_per_wg=4 N=8",  256,   16,  8,   0, 0, 0, 1.0f,   0 },
+        { "split=1 rows_per_wg=8 N=8",  36,    5,   8,   0, 0, 0, 1.0f,   0 },
+        { "split=8 rows_per_wg=1 N=3",  1024,  100, 3,   0, 0, 0, 1.0f,   0 },
+        { "K=129 M=7 N=4",              129,   7,   4,   0, 0, 0, 1.0f,   0 },
         { "tiled n=9",                  2048,  64,  9,   0, 0, 0, 1.0f,   0 },
         { "tiled n=64 ragged m",        2048,  77,  64,  0, 0, 0, 1.0f,   0 },
         { "tiled n=100 ragged all",     130,   45,  100, 7, 9, 0, 1.0f,   0 },

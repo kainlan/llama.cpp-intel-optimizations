@@ -64574,8 +64574,8 @@ static void ggml_sycl_mul_mat_bf16_weight(ggml_backend_sycl_context & ctx,
 
     GGML_SYCL_PROFILE_SCOPE_GEMM("mul_mat.bf16_native");
     (void) ggml_sycl_bf16::mul_mat_bf16_f32(*ctx.stream(), static_cast<const uint16_t *>(weight.ptr), src1_ddf, dst_ddf,
-                                            src0->ne[0], src0->ne[1], src1->ne[1] * src1->ne[2] * src1->ne[3], ldx,
-                                            ldy);
+                                            src0->ne[0], src0->ne[1], src1->ne[1] * src1->ne[2] * src1->ne[3], ldx, ldy,
+                                            ggml_sycl_info().max_work_group_sizes[ctx.device]);
 } catch (const sycl::exception & exc) {
     if (ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, exc)) {
         return;
@@ -110212,8 +110212,8 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                     // A BF16 WEIGHT runs natively, from the BF16 bytes the planner placed
                     // (llama.cpp-9qjy: ggml_sycl_mul_mat_bf16_weight, mul-mat-bf16.hpp) --
                     // no second copy. Accept ONLY when that route is actually available
-                    // (a genuine, named weight tensor with resolvable host bytes, NOT on a
-                    // split or TP buffer, in the one shape the kernel computes -- see
+                    // (a genuine, named weight tensor, NOT on a split or TP buffer, not
+                    // planned on the host or another device, in the one shape the kernel computes -- see
                     // ggml_sycl_bf16_weight_native_route_available): a BF16 activation or an
                     // unnamed/synthetic tensor has no dispatch and must still fail closed
                     // here. This is the SAME composed check the executor asserts, not an

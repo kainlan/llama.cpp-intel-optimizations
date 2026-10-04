@@ -166,6 +166,8 @@ def test_executor_allocates_nothing_and_waits_on_nothing():
                       "ggml_sycl_pool_alloc", "ggml_sycl_bf16_materialize", "mem_copy", ".wait()", "->wait()",
                       "ready_event", "depends_on"):
         assert forbidden not in executor, f"the BF16 executor must not use {forbidden!r} (no second copy, no host wait)"
+    assert "max_work_group_sizes[ctx.device]" in executor, \
+        "the executor must pass the device's max work-group size so the split work-group fits it"
     assert "weight.extent < weight_bytes" in executor and "weight.extent != 0" not in executor, \
         "an unknown (0) extent must be rejected, not accepted"
 
