@@ -3620,6 +3620,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
+# llama.cpp-s36q: source gate -- the MUL_MAT_ID dispatch publishes AoS expert handles with its
+# consumer named (a single-expert, name-unclassified src0 has no other trigger), and the
+# publication decision is the host-tested predicate in moe-mmvq-tables.hpp. Host-only.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-expert-publication-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-expert-publication-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
 # llama.cpp-2lxw: source gate for the dense split executor's host-side trims
 # (moved-only input refresh on a plan-cache hit and the staging generation it
 # relies on). Host-only, reads the sources as text.

@@ -26822,14 +26822,15 @@ static void ggml_sycl_drop_all_weight_cache_entries(ggml_sycl::unified_cache * c
 // expert capability is a checked slice carrying the allocation id, device,
 // exact byte range, layout and shared lifetime. Resolution therefore never
 // reconstructs authority from tensor->data or an allocation registry.
-static bool ggml_sycl_publish_backend_aos_expert_handles(ggml_backend_sycl_buffer_context * ctx, ggml_tensor * tensor) {
+static bool ggml_sycl_publish_backend_aos_expert_handles(ggml_backend_sycl_buffer_context * ctx,
+                                                         ggml_tensor *                      tensor,
+                                                         bool                               consumer_is_mul_mat_id = false) {
     if (!ctx || !tensor || tensor->view_src != nullptr || !tensor->extra ||
         ctx->managed_meta.tier != ggml_sycl::alloc_tier::DEVICE_VRAM || !ctx->managed_handle.valid()) {
         return false;
     }
     const bool classified_expert = ggml_sycl_get_tensor_usage(tensor) == tensor_usage::MOE_EXPERT_WEIGHT;
-    const bool structural_expert = tensor->ne[2] > 1;
-    if (!classified_expert && !structural_expert) {
+    if (!moe_aos_expert_publication_wanted(classified_expert, tensor->ne[2], consumer_is_mul_mat_id)) {
         return false;
     }
 
@@ -69261,7 +69262,8 @@ static bool ggml_sycl_publish_mmid_canonical_aos_experts(const ggml_tensor * src
         return false;
     }
     const bool published = ggml_sycl_publish_backend_aos_expert_handles(
-        static_cast<ggml_backend_sycl_buffer_context *>(src0->buffer->context), const_cast<ggml_tensor *>(src0));
+        static_cast<ggml_backend_sycl_buffer_context *>(src0->buffer->context), const_cast<ggml_tensor *>(src0),
+        /*consumer_is_mul_mat_id=*/true);
     auto *                                                    extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
     ggml_tensor_extra_gpu::resolved_moe_expert_storage_record expert0{};
     if (published && extra &&

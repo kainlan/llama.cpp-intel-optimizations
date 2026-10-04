@@ -236,3 +236,14 @@ inline bool moe_mmvq_admission_supports_type(enum ggml_type type) {
 }
 
 #endif  // GGML_SYCL_MOE_MMVQ_TABLES_HPP
+
+// Whether a device AoS weight tensor gets per-expert retained handles published for
+// it (ggml_sycl_publish_backend_aos_expert_handles). The buffer cannot see its
+// consumer when the weights are uploaded, so two proxies stand in for "this is an
+// expert tensor": the name-based usage classification (classified_expert) and the
+// structural test ne[2] > 1. A MUL_MAT_ID dispatch publishes again just before its
+// non-materializing retained resolver runs, and there the consumer IS known.
+inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne2, bool consumer_is_mul_mat_id) {
+    (void) consumer_is_mul_mat_id;
+    return classified_expert || ne2 > 1;
+}

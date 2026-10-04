@@ -386,6 +386,32 @@ int main() {
         }
     }
 
+    // 7. AoS expert-handle publication (llama.cpp-s36q, test-backend-ops case for issue 27873:
+    //    MUL_MAT_ID with n_mats = 1, whose src0 is ne[2] == 1 and unclassified by name).
+    //    At upload the buffer cannot tell such a tensor from a dense 2D weight, so it must not
+    //    publish; a MUL_MAT_ID dispatch knows its src0 is an expert tensor and must publish, or
+    //    the retained resolver finds no expert and the op fails (NOT_FOUND).
+    const struct {
+        bool        classified;
+        int64_t     ne2;
+        bool        mul_mat_id;
+        bool        want;
+        const char * name;
+    } publication_cases[] = {
+        { false, 1, false, false, "dense 2D weight at upload"                       },
+        { false, 1, true,  true,  "single-expert src0 reached by a MUL_MAT_ID"      },
+        { false, 4, false, true,  "structural expert tensor at upload"              },
+        { false, 4, true,  true,  "structural expert tensor at dispatch"            },
+        { true,  1, false, true,  "name-classified single-expert tensor at upload"  },
+        { true,  1, true,  true,  "name-classified single-expert tensor at dispatch" },
+    };
+    for (const auto & c : publication_cases) {
+        if (moe_aos_expert_publication_wanted(c.classified, c.ne2, c.mul_mat_id) != c.want) {
+            std::printf("FAIL: AoS expert publication wrong for: %s (want %d)\n", c.name, c.want ? 1 : 0);
+            ++failures;
+        }
+    }
+
     if (failures != 0) {
         std::printf("test-sycl-moe-mmvq-tables: FAILED (%d)\n", failures);
         return 1;
