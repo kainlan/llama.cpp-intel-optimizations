@@ -16,7 +16,8 @@ the tree still reads as covered:
     (QK2_0, QI2_0, block_q2_0, VDR_Q2_0_Q8_1_MMVQ, vec_dot_q2_0_q8_1) tuple;
   * mmvq_submit_quant_aos_id has a Q2_0 arm instantiating mmvq_submit_aos_id_impl with the same tuple
     (the consumer switches' coverage is gated by test-sycl-moe-mmvq-consumer-coverage.py);
-  * ggml_sycl_mul_mat_type_supported admits Q2_0, and GET_ROWS still does NOT: no arm exists, and no
+  * ggml_sycl_mul_mat_type_supported admits Q2_0 (through the shared list), get_row_rounding has a Q2_0 case (a
+    row split of an advertised type must not abort), and GET_ROWS still does NOT: no arm exists, and no
     Q2_0 tensor is an embedding table (Qwen3.8's token_embd is IQ3_S).
 
 Runs under pytest and as a plain script. GGML_SYCL_Q2_0_ROOT points the gate at another tree (the
@@ -129,6 +130,9 @@ def check_admission(ggml_sycl: str, get_rows: str) -> list:
     dense = function_body(ggml_sycl, "static bool ggml_sycl_mul_mat_type_supported(ggml_type type)")
     if "case GGML_TYPE_Q2_0:" not in dense:
         failures.append("ggml_sycl_mul_mat_type_supported does not admit Q2_0")
+    rounding = function_body(ggml_sycl, "static int64_t get_row_rounding(")
+    if "case GGML_TYPE_Q2_0:" not in rounding:
+        failures.append("get_row_rounding has no Q2_0 case; a -sm row split of a Q2_0 weight would abort")
     rows = function_body(get_rows, "inline bool ggml_sycl_get_rows_type_supported(ggml_type type)")
     if "GGML_TYPE_Q2_0" in rows:
         failures.append("GET_ROWS admits Q2_0 but no ggml_sycl_op_get_rows arm exists for it")
@@ -161,8 +165,45 @@ def test_gate_fails_on_each_missing_piece() -> None:
             vecdotq.replace("get_int_from_uint8(bq2_0->qs", "get_int_from_uint8_aligned(bq2_0->qs", 1)),
         "dense case dropped": lambda: check_mmvq(
             mmvq.replace('case GGML_TYPE_Q2_0:\n                GGML_SYCL_KTRACE("mmvq_q2_0"', 'case GGML_TYPE_TQ2_0:\n                GGML_SYCL_KTRACE("mmvq_q2_0"', 1)),
+        "fp32 getter case dropped": lambda: check_dequant(
+            dequantize,
+            convert.replace(
+                "    switch (type) {\n        case GGML_TYPE_Q2_0:\n            return dequantize_block_sycl<QK2_0, QR2_0, dequantize_q2_0>;\n        case GGML_TYPE_Q4_0:",
+                "    switch (type) {\n        case GGML_TYPE_Q4_0:",
+                1,
+            ),
+        ),
+        "vec_dot uses the activation sum": lambda: check_vec_dot(
+            vecdotq.replace(
+                "return d2 * bq8_1_chunk->ds[0] * sumi;",
+                "return d2 * (bq8_1_chunk->ds[0] * sumi - 0.5f * (float) bq8_1_chunk->ds[1]);",
+                1,
+            )
+        ),
+        "_id arm dropped": lambda: check_mmvq(
+            mmvq.replace(
+                "        case GGML_TYPE_Q2_0:\n            // The dense mul_mat_vec_q2_0_q8_1_sycl tuple",
+                "        case GGML_TYPE_TQ2_0:\n            // The dense mul_mat_vec_q2_0_q8_1_sycl tuple",
+                1,
+            )
+        ),
+        "_id arm loses the ncols guard": lambda: check_mmvq(mmvq.replace("if (ncols % QK2_0 != 0) {", "if (false) {", 1)),
+        "_id arm wrong tuple": lambda: check_mmvq(
+            mmvq.replace(
+                "mmvq_submit_aos_id_impl<GGML_TYPE_Q2_0, QK2_0, QI2_0, block_q2_0,",
+                "mmvq_submit_aos_id_impl<GGML_TYPE_Q2_0, QK2_0, QK2_0 / 16, block_q2_0,",
+                1,
+            )
+        ),
+        "dense launcher wrong tuple": lambda: check_mmvq(
+            mmvq.replace("mul_mat_vec_q<QK2_0, QI2_0, block_q2_0,", "mul_mat_vec_q<QK2_0, QK2_0 / 16, block_q2_0,", 1)
+        ),
         "dense admission dropped": lambda: check_admission(
             ggml_sycl.replace("        case GGML_TYPE_Q2_0:\n        case GGML_TYPE_Q4_0:", "        case GGML_TYPE_Q4_0:", 1), get_rows),
+        "row rounding case dropped": lambda: check_admission(
+            ggml_sycl.replace("        case GGML_TYPE_Q2_0:\n            return max_compute_capability", "        case GGML_TYPE_TQ2_0:\n            return max_compute_capability", 1),
+            get_rows,
+        ),
         "get_rows admits Q2_0": lambda: check_admission(
             ggml_sycl, get_rows.replace("        case GGML_TYPE_Q4_K:\n        case GGML_TYPE_Q6_K:\n            return true;", "        case GGML_TYPE_Q4_K:\n        case GGML_TYPE_Q2_0:\n            return true;", 1)),
     }

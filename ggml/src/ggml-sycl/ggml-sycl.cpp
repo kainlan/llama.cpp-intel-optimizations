@@ -40484,6 +40484,9 @@ static int64_t get_row_rounding(ggml_type type, const std::array<float, GGML_SYC
         case GGML_TYPE_IQ4_XS:
 
         case GGML_TYPE_IQ4_NL:
+        // Q2_0 takes the IQ group's rounding (llama.cpp-s36q phase 4): MUL_MAT advertises it, so a row split
+        // reaches this switch and would abort. Untested under -sm row.
+        case GGML_TYPE_Q2_0:
             return max_compute_capability >= VER_GEN9 ? 128 : 64;
         case GGML_TYPE_IQ3_S:
 
@@ -110267,13 +110270,16 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         // small planner-managed tables.  Do not reject them merely because the
         // planner placed some backing table in host-pinned memory.
         //
-        // Residency-blind admission is not type-blind admission. Q1_0 and
-        // NVFP4 stay admitted here by design: they carry fp16 converters and
-        // are refused by the runtime route oracle (the sanctioned fail-closed
-        // class of c-wps7). Every other type outside the MUL_MAT allowlist —
-        // upstream b10630's q2_0/tq2_0 and anything future — is refused at
-        // this gate instead, because the MoE executor computes wrong answers
-        // on them (q2_0 MMID: ERR up to 90 vs 5e-4), which is not a refusal.
+        // Residency-blind admission is not type-blind admission. MUL_MAT_ID asks
+        // the MMID coverage tables below. Q1_0 and NVFP4 are in them and stay
+        // admitted by design: they carry fp16 converters and are refused by the
+        // runtime route oracle (the sanctioned fail-closed class of c-wps7).
+        // Q2_0 joined with its kernels (llama.cpp-s36q phase 4). ADD_ID keeps
+        // the dense allowlist plus Q1_0/NVFP4, so every other type without a
+        // kernel -- upstream b10630's tq2_0 and anything future -- is refused
+        // at this gate instead of reaching an executor that computes wrong
+        // answers on it (q2_0 did before it had kernels: ERR up to 90 vs 5e-4),
+        // which is not a refusal.
         const ggml_type indexed_a_type = op->src[0]->type;
         if (op->op == GGML_OP_MUL_MAT_ID) {
             // MUL_MAT_ID admission keys on MMID coverage, NOT on the dense

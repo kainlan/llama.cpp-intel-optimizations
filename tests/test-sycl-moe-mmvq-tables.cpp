@@ -229,10 +229,10 @@ int main() {
     //    The cardinality assertion below is what makes the lists load-bearing --
     //    identity plus population, because either alone fails open.
     const ggml_type admission_expected[] = {
-        GGML_TYPE_Q1_0, GGML_TYPE_NVFP4, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_Q4_1,
-        GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,  GGML_TYPE_Q2_K,
-        GGML_TYPE_Q3_K, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
-        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0,
+        GGML_TYPE_Q1_0,  GGML_TYPE_NVFP4,   GGML_TYPE_Q4_0,   GGML_TYPE_Q8_0,   GGML_TYPE_MXFP4,
+        GGML_TYPE_Q4_1,  GGML_TYPE_Q4_K,    GGML_TYPE_Q5_K,   GGML_TYPE_Q6_K,   GGML_TYPE_Q5_0,
+        GGML_TYPE_Q5_1,  GGML_TYPE_Q2_K,    GGML_TYPE_Q3_K,   GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS,
+        GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,  GGML_TYPE_Q2_0,
     };
     //    The exact set that regressed: dense MUL_MAT kernels exist, _id does not.
     //    BF16/tq2_0 are absent on purpose -- 186348705 already refuses them by
