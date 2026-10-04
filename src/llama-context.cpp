@@ -1457,6 +1457,36 @@ void llama_context::sycl_recheck_runtime_context_flash_attn() {
 #endif
 }
 
+// A fused op that landed on the CPU although its layer is assigned to `dev_layer`: is that PLACEMENT (the
+// designed outcome -- the op's persistent operand lives in host memory, so the CPU runs it where the data is) or
+// a CAPABILITY gap (the layer's device has no kernel for it)? The two read the same in the scheduler's output
+// and need opposite remedies, so the log must say which one happened.
+//
+// supports_op() alone cannot decide this: a backend also declines an op for placement (a KV tensor in a host
+// buffer type), so "unsupported" is only the capability answer once no operand explains the landing. An operand
+// explains it when its (view) tensor already lives in a host buffer that is not a compute scratch buffer --
+// compute scratch is wherever the scheduler put the previous op's output and says nothing about placement.
+static bool llama_fused_cpu_landing_is_placement(ggml_backend_dev_t dev_layer, const ggml_tensor * node) {
+    if (!dev_layer || ggml_backend_dev_supports_op(dev_layer, node)) {
+        return true;
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * src = node->src[i];
+        if (!src) {
+            continue;
+        }
+
+        const ggml_tensor * data = src->view_src ? src->view_src : src;
+        if (data->buffer && ggml_backend_buffer_is_host(data->buffer) &&
+            ggml_backend_buffer_get_usage(data->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
     const char * func = __func__;
     auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
@@ -1475,6 +1505,10 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         uint32_t           n_cpu_landings  = 0;
         int                cpu_landing_il  = -1;
         ggml_backend_dev_t cpu_landing_dev = nullptr;
+        // the landings the layer's device could not have executed (see llama_fused_cpu_landing_is_placement)
+        uint32_t           n_cpu_gaps      = 0;
+        int                cpu_gap_il      = -1;
+        ggml_backend_dev_t cpu_gap_dev     = nullptr;
 
         for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
             if (node.op != probe.op) {
@@ -1512,9 +1546,15 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                     break;
                 }
 
-                n_cpu_landings++;
-                cpu_landing_il  = node.il;
-                cpu_landing_dev = device_fused;
+                if (llama_fused_cpu_landing_is_placement(device_layer, node.tensor)) {
+                    n_cpu_landings++;
+                    cpu_landing_il  = node.il;
+                    cpu_landing_dev = device_fused;
+                } else {
+                    n_cpu_gaps++;
+                    cpu_gap_il  = node.il;
+                    cpu_gap_dev = device_layer;
+                }
             }
         }
 
@@ -1529,6 +1569,11 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                             "the executor follows data placement, not a capability gap\n",
                     func, probe.name, cpu_landing_dev ? ggml_backend_dev_name(cpu_landing_dev) : "CPU", n_cpu_landings,
                     cpu_landing_il);
+            }
+            if (n_cpu_gaps > 0) {
+                LLAMA_LOG_WARN(
+                    "%s: %s executes on CPU for %u layer(s) (e.g. layer %d) because %s does not support it\n", func,
+                    probe.name, n_cpu_gaps, cpu_gap_il, ggml_backend_dev_name(cpu_gap_dev));
             }
             LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
         }

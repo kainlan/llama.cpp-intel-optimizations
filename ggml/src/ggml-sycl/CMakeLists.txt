@@ -461,6 +461,13 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-dsv4-ops-source.py
             --self-test)
     set_tests_properties(sycl-dsv4-ops-source PROPERTIES LABELS "sycl;dsv4;host;source-contract;python")
+    # llama.cpp-pmzl: resolve_fused_ops() words a CPU landing as a capability gap (the layer's device cannot run the
+    # op) or as placement (a host-resident operand), instead of calling every landing placement.
+    # --self-test: the wording and classifier checks are absence-based and pass on a tree that never had them.
+    add_test(NAME sycl-fused-landing-wording-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-llama-context-fused-landing-source.py
+            --self-test)
+    set_tests_properties(sycl-fused-landing-wording-source PROPERTIES LABELS "sycl;dsv4;host;source-contract;python")
     # llama.cpp-qhfp: a recorded graph must not read a host-resident input, so every recorder (full graph, dense
     # split, MoE block graphlets, MoE segments) declines to record or replay when the input pre-stage fails, and a
     # view of an INPUT counts as that input. --self-test: the flag-only, swallowed-failure and statement-form
