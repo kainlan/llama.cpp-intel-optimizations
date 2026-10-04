@@ -2661,6 +2661,33 @@ set_tests_properties(sycl-runtime-alloc-flag-slab-released-at-shutdown PROPERTIE
 )
 endif() # direct-source static SYCL fixture
 
+# Test: numerics of the SYCL Q2_0 device functions (dequantize_q2_0, vec_dot_q2_0_q8_1)
+# against a double-precision oracle (llama.cpp-s36q phase 4). Header-only: it includes
+# dequantize.hpp / vecdotq.hpp and launches the functions itself, so it links no backend
+# library. Runs on the OpenCL CPU device and touches no GPU.
+add_executable(test-sycl-q2-0-kernels
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-q2-0-kernels.cpp
+)
+target_include_directories(test-sycl-q2-0-kernels PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-q2-0-kernels PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-q2-0-kernels PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-q2-0-kernels PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+add_test(NAME test-sycl-q2-0-kernels COMMAND test-sycl-q2-0-kernels)
+set_tests_properties(test-sycl-q2-0-kernels PROPERTIES
+    LABELS "sycl;quant;hostonly;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 # Test: unified-cache layout and multi-device placement choices, plus the
 # fused-gate_up expert-tensor classifier regression guard (llama.cpp-zozu).
 #
