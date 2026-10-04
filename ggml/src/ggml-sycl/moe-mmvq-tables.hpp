@@ -244,6 +244,5 @@ inline bool moe_mmvq_admission_supports_type(enum ggml_type type) {
 // structural test ne[2] > 1. A MUL_MAT_ID dispatch publishes again just before its
 // non-materializing retained resolver runs, and there the consumer IS known.
 inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne2, bool consumer_is_mul_mat_id) {
-    (void) consumer_is_mul_mat_id;
-    return classified_expert || ne2 > 1;
+    return classified_expert || ne2 > 1 || consumer_is_mul_mat_id;
 }
