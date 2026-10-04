@@ -13,7 +13,26 @@ CONVERT = ROOT / "ggml/src/ggml-sycl/convert.cpp"
 COMMON = ROOT / "ggml/src/ggml-common.h"
 SUPPORT = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 SOURCE = CONVERT.read_text(encoding="utf-8")
-SUPPORT_SOURCE = SUPPORT.read_text(encoding="utf-8")
+SUPPORT_SOURCE_RAW = SUPPORT.read_text(encoding="utf-8")
+
+
+def _with_dense_type_list_inlined(source: str) -> str:
+    """ggml_sycl_mul_mat_type_supported delegates to the shared header's list (llama.cpp-gldu: the zone planner reads
+    the same list). This gate scores and mutates the list itself, so splice the header's switch back in under the
+    function's own signature; a wrapper that stops delegating, or a header that loses the list, fails loudly."""
+    header = (ROOT / "ggml/src/ggml-sycl/unified-types.hpp").read_text(encoding="utf-8")
+    listed = re.search(r"inline bool dense_mul_mat_type_supported\(ggml_type type\) \{(.*?)\n\}\n", header, re.S)
+    wrapper = re.search(
+        r"static bool ggml_sycl_mul_mat_type_supported\(ggml_type type\) \{[^{}]*"
+        r"return ggml_sycl::dense_mul_mat_type_supported\(type\);\n\}\n",
+        source,
+    )
+    assert listed is not None and wrapper is not None, "the dense MUL_MAT type list is no longer shared"
+    inlined = "static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {" + listed.group(1) + "\n}\n"
+    return source[: wrapper.start()] + inlined + source[wrapper.end():]
+
+
+SUPPORT_SOURCE = _with_dense_type_list_inlined(SUPPORT_SOURCE_RAW)
 KVALUES = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
 
 

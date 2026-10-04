@@ -1012,9 +1012,35 @@ int main() {
         }
         CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q8_0), "Q8_0 keeps its own unconditional mark");
         CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q4_0), "Q4_0 keeps the unified-kernel mark");
-        CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_MXFP4), "MXFP4 keeps the unified-kernel mark");
+        CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_MXFP4),
+              "MXFP4 is coalesced-capable (and keeps the unified-kernel mark)");
         CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q6_K),
               "Q6_K is materialized COALESCED and routed to MMQ_COALESCED");
+        // The composition the adapter calls: type lists, dense-MUL_MAT support, dequant support, head and expert.
+        auto claims = [](ggml_type ty, bool head, bool expert, bool dequant) {
+            return ggml_sycl::aos_dequant_f16_plan_claims(ty, true, head, expert, dequant);
+        };
+        CHECK(claims(GGML_TYPE_IQ3_S, false, false, true), "a dense IQ3_S weight is claimed");
+        CHECK(claims(GGML_TYPE_IQ4_NL, false, false, true), "a dense IQ4_NL weight is claimed");
+        CHECK(!claims(GGML_TYPE_IQ4_XS, true, false, true), "the LM head is not claimed");
+        CHECK(!claims(GGML_TYPE_IQ3_S, false, true, true), "an expert stack is not claimed");
+        CHECK(!claims(GGML_TYPE_IQ3_S, false, false, false), "a type the router cannot dequantize is not claimed");
+        CHECK(!ggml_sycl::aos_dequant_f16_plan_claims(GGML_TYPE_IQ3_S, false, false, false, true),
+              "a non-quantized operand is not claimed");
+        CHECK(!claims(GGML_TYPE_Q5_K, false, false, true) && !claims(GGML_TYPE_Q4_K, false, false, true) &&
+                  !claims(GGML_TYPE_Q2_K, false, false, true) && !claims(GGML_TYPE_Q4_1, false, false, true) &&
+                  !claims(GGML_TYPE_Q5_0, false, false, true),
+              "an MMQ type is not claimed");
+        CHECK(!claims(GGML_TYPE_Q8_0, false, false, true) && !claims(GGML_TYPE_Q4_0, false, false, true) &&
+                  !claims(GGML_TYPE_MXFP4, false, false, true) && !claims(GGML_TYPE_Q6_K, false, false, true),
+              "a coalesced-capable type is not claimed");
+        // SYCL refuses a dense MUL_MAT for these although the router can dequantize two of them: no copy is reserved.
+        CHECK(!claims(GGML_TYPE_NVFP4, false, false, true), "NVFP4 is refused by SYCL's dense MUL_MAT, so not claimed");
+        CHECK(!claims(GGML_TYPE_Q1_0, false, false, true), "Q1_0 is refused by SYCL's dense MUL_MAT, so not claimed");
+        CHECK(!claims(GGML_TYPE_Q2_0, false, false, true), "Q2_0 is refused by SYCL's dense MUL_MAT, so not claimed");
+        CHECK(ggml_sycl::dense_mul_mat_type_supported(GGML_TYPE_IQ4_XS) &&
+                  !ggml_sycl::dense_mul_mat_type_supported(GGML_TYPE_NVFP4),
+              "the dense MUL_MAT list carries the IQ family and not NVFP4");
         // The set is disjoint from the unified kernel's, so the two marks never double-count one weight.
         for (int t = 0; t < GGML_TYPE_COUNT; t++) {
             const ggml_type ty = static_cast<ggml_type>(t);

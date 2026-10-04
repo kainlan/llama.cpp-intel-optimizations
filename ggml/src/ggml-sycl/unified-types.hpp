@@ -24,7 +24,8 @@ inline bool unified_kernel_serves_type(ggml_type type) {
 }
 
 // The weight types the layout policy can materialize in the COALESCED layout. Add a type here only when its coalesced
-// kernels exist. Read by is_coalesced_supported (common.hpp) and by the zone planner, through dense_pp_route_is_f16_dequant_arm.
+// kernels exist. Read by is_coalesced_supported (common.hpp) and by the zone planner, through
+// dense_pp_route_is_f16_dequant_arm.
 inline bool coalesced_capable_type(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
@@ -57,6 +58,39 @@ inline bool mmq_capable_type(ggml_type type) {
     }
 }
 
+// The types SYCL executes as a dense MUL_MAT operand: the allowlist behind supports_op for MUL_MAT (and the dense
+// ADD_ID operand). Read by ggml_sycl_mul_mat_type_supported (ggml-sycl.cpp) and by the zone planner, which must not
+// reserve a dequant copy for a type SYCL refuses (NVFP4, Q1_0, Q2_0: they run on ggml-cpu).
+inline bool dense_mul_mat_type_supported(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Whether a dense QUANTIZED MUL_MAT weight of this type takes the oneDNN f16 dequant arm as its PP route
 // (llama.cpp-gldu). The caller has already established that the type is quantized and the operand a dense weight.
 //
@@ -72,6 +106,29 @@ inline bool mmq_capable_type(ggml_type type) {
 // an MMQ type to the arm too; that residue is left to the graph-entry walk, which grows the buffer or refuses by name.
 inline bool dense_pp_route_is_f16_dequant_arm(ggml_type type) {
     return !coalesced_capable_type(type) && !mmq_capable_type(type);
+}
+
+// Whether the planner reserves the dense f16 dequant buffers for this weight because the dequant arm is its PP route
+// (llama.cpp-gldu), for the types the unified kernel's own mark does not cover. ONE function so the adapter's
+// composition is testable without a device:
+//   - quantized, and a type no MMQ, coalesced or unified kernel serves (dense_pp_route_is_f16_dequant_arm);
+//   - a type SYCL executes as a dense MUL_MAT at all (dense_mul_mat_type_supported);
+//   - one the router can dequantize (dequant_supported, from onednn_woq::supports_dequant_fp16, which the SYCL-free
+//     header cannot call);
+//   - not an expert stack (MUL_MAT_ID keeps its own workspace);
+//   - not the LM head (is_head, from the usage classification and the tied-embedding classifier): a completion runs
+//     it on the last row of each ubatch, so it normally never reaches the arm, and claiming its f16 copy (1.2 GB for
+//     a 248k-vocabulary head) would size the whole plan from it. Perplexity and embeddings run it on many rows and
+//     are covered by the graph-entry walk, which grows the buffer or refuses by name. This is deliberately unlike the
+//     Q4_0 / MXFP4 head, which stays planned unconditionally by owner decision (llama.cpp-8ony) until llama.cpp-fkpg
+//     delivers n_outputs to the planner; that gate will reinstate both.
+inline bool aos_dequant_f16_plan_claims(ggml_type type,
+                                        bool      quantized,
+                                        bool      is_head,
+                                        bool      is_expert,
+                                        bool      dequant_supported) {
+    return quantized && !is_head && !is_expert && dequant_supported && dense_mul_mat_type_supported(type) &&
+           dense_pp_route_is_f16_dequant_arm(type);
 }
 
 }  // namespace ggml_sycl

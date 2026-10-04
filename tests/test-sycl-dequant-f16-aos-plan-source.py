@@ -14,8 +14,9 @@ kernel serves (the IQ family) has the dequant arm as its PP route; claiming an M
 1.2 GB f16 copy of a Q5_K LM head on a device run.
 
 The fix this gate pins: the planner marks those weights through ONE type predicate built from the same two lists the
-router's eligibility terms read (unified-types.hpp: coalesced_capable_type, mmq_capable_type), excluding expert
-stacks and the LM head, asking the router's own dequant-support function, and honouring the oneDNN PP scratch. The
+router's eligibility terms read (unified-types.hpp: coalesced_capable_type, mmq_capable_type,
+dense_mul_mat_type_supported), composed in ONE helper (aos_dequant_f16_plan_claims) that excludes expert stacks and
+the LM head, with the router's own dequant-support function, and honouring the oneDNN PP scratch. The
 arithmetic and the get_rows_only exclusion are proved by test-zone-sizing (Case 14k); this gate proves the production
 adapter actually uses the predicate and that each type list has one source.
 
@@ -69,26 +70,37 @@ def check(srcs):
     backend_code = strip_comments(srcs["backend"])
     adapter = squash(function_body(strip_comments(srcs["cache"]), "unified_cache_adapt_zone_inventory("))
     predicate = squash(function_body(types_code, "dense_pp_route_is_f16_dequant_arm("))
+    claims = squash(function_body(types_code, "aos_dequant_f16_plan_claims("))
+    mmq_fn = function_body(backend_code, "inline bool ggml_sycl_supports_mmq(enum ggml_type type)")
+    dense_fn = function_body(backend_code, "static bool ggml_sycl_mul_mat_type_supported(ggml_type type)")
+    coalesced_fn = function_body(common_code, "inline bool is_coalesced_supported(ggml_type type) {")
     results = {}
     results["the predicate lives in the shared header"] = bool(predicate)
     results["the predicate is the complement of the coalesced list"] = "!coalesced_capable_type(type)" in predicate
     results["the predicate is the complement of the MMQ list"] = "!mmq_capable_type(type)" in predicate
     results["the layout policy's coalesced list is the shared header's, not a second copy"] = (
-        "coalesced_capable_type(" in common_code
-        and "case GGML_TYPE_Q6_K" not in function_body(common_code, "inline bool is_coalesced_supported(ggml_type type)"))
+        "coalesced_capable_type(" in coalesced_fn and "case GGML_TYPE" not in coalesced_fn)
     results["the router's MMQ eligibility is the shared header's, not a second copy"] = (
-        "mmq_capable_type(" in function_body(backend_code, "inline bool ggml_sycl_supports_mmq(enum ggml_type type)")
-        and "case GGML_TYPE_Q5_K"
-        not in function_body(backend_code, "inline bool ggml_sycl_supports_mmq(enum ggml_type type)"))
-    results["the adapter asks the shared predicate"] = "dense_pp_route_is_f16_dequant_arm(item.type)" in adapter
+        "mmq_capable_type(" in mmq_fn and "case GGML_TYPE" not in mmq_fn)
+    results["the router's dense MUL_MAT type list is the shared header's, not a second copy"] = (
+        "dense_mul_mat_type_supported(" in dense_fn and "case GGML_TYPE" not in dense_fn)
+    results["the claim composes the type lists, head and expert exclusion in the shared header"] = all(
+        term in claims for term in (
+            "quantized", "!is_head", "!is_expert", "dequant_supported",
+            "dense_mul_mat_type_supported(type)", "dense_pp_route_is_f16_dequant_arm(type)"))
+    results["the adapter asks the shared claim"] = "aos_dequant_f16_plan_claims(" in adapter
     results["the adapter asks the router's dequant-support function"] = (
         "onednn_woq::supports_dequant_fp16(item.type)" in adapter)
-    results["the adapter leaves the LM head out"] = (
-        "!lm_head" in adapter and "tensor_usage::OUTPUT_WEIGHT" in adapter
-        and "ggml_sycl_is_canonical_tied_embedding_name(" in adapter)
+    results["the adapter classifies the head by usage and the tied-embedding classifier, and passes it"] = (
+        re.search(r"lm_head = infer_tensor_usage\(item\.name\.c_str\(\)\) == tensor_usage::OUTPUT_WEIGHT \|\|"
+                  r" ggml_sycl_is_canonical_tied_embedding_name\(item\.name\.c_str\(\)\);", adapter) is not None
+        and re.search(r"aos_dequant_f16_plan_claims\([^;]*lm_head[^;]*\)", adapter) is not None)
+    results["the adapter passes the expert flag to the claim"] = (
+        re.search(r"aos_dequant_f16_plan_claims\([^;]*is_expert[^;]*\)", adapter) is not None)
     results["the mark excludes expert stacks"] = (
-        "(unified_dequant_type || aos_dequant_type) && expert_tensor_role_from_tensor_name(item.name.c_str()) =="
-        " expert_tensor_role::UNKNOWN" in adapter)
+        "(unified_dequant_type || aos_dequant_type) && !is_expert" in adapter
+        and "is_expert = expert_tensor_role_from_tensor_name(item.name.c_str()) != expert_tensor_role::UNKNOWN"
+        in adapter)
     results["the mark honours the oneDNN PP scratch (type enablement AND admission)"] = (
         "pp_scratch_type_enabled = onednn_pp_unified_scratch_enabled(item.type) &&"
         " ggml_sycl_onednn_pp_type_admitted(item.type)" in adapter)
@@ -97,9 +109,16 @@ def check(srcs):
     return results
 
 
+def ws_pattern(text):
+    """A regex matching `text` with any run of whitespace between its tokens."""
+    return r"\s*".join(re.escape(tok) for tok in text.split())
+
+
 def mutate(text, old, new):
-    assert old in text, f"mutation target missing: {old!r}"
-    return text.replace(old, new, 1)
+    """Replace the first match of `old` (whitespace-tolerant) by `new`, which is literal."""
+    out, n = re.subn(ws_pattern(old), lambda _m: new, text, count=1)
+    assert n == 1, f"mutation target missing: {old!r}"
+    return out
 
 
 sources = {
@@ -115,21 +134,26 @@ if args.self_test:
     mutants = [
         ("the predicate lives in the shared header", "types",
          "inline bool dense_pp_route_is_f16_dequant_arm(", "inline bool dense_pp_route_renamed("),
-        ("the predicate is the complement of the coalesced list", "types",
-         "!coalesced_capable_type(type) && ", ""),
-        ("the predicate is the complement of the MMQ list", "types", " && !mmq_capable_type(type)", ""),
+        ("the predicate is the complement of the coalesced list", "types", "!coalesced_capable_type(type) &&", ""),
+        ("the predicate is the complement of the MMQ list", "types", "&& !mmq_capable_type(type)", ""),
         ("the layout policy's coalesced list is the shared header's, not a second copy", "common",
          "return ggml_sycl::coalesced_capable_type(type);", "switch (type) { case GGML_TYPE_Q6_K: return true; }"),
         ("the router's MMQ eligibility is the shared header's, not a second copy", "backend",
          "return ggml_sycl::mmq_capable_type(type);", "switch (type) { case GGML_TYPE_Q5_K: return true; }"),
-        ("the adapter asks the shared predicate", "cache",
-         "dense_pp_route_is_f16_dequant_arm(item.type)", "ggml_is_quantized(item.type)"),
+        ("the router's dense MUL_MAT type list is the shared header's, not a second copy", "backend",
+         "return ggml_sycl::dense_mul_mat_type_supported(type);", "switch (type) { case GGML_TYPE_NVFP4: return true; }"),
+        ("the claim composes the type lists, head and expert exclusion in the shared header", "types",
+         "!is_head &&", ""),
+        ("the adapter asks the shared claim", "cache", "aos_dequant_f16_plan_claims(", "aos_claim_renamed("),
         ("the adapter asks the router's dequant-support function", "cache",
-         " && onednn_woq::supports_dequant_fp16(item.type)", ""),
-        ("the adapter leaves the LM head out", "cache", "!lm_head &&", ""),
-        ("the mark excludes expert stacks", "cache",
-         "expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {\n            size_t weight_bytes = 0;\n            size_t src1_bytes   = 0;\n            if (zone_dequant_f16_weight_bytes(item.ne[0], item.ne[1] > 0 ? item.ne[1] : 1, &weight_bytes) &&\n                zone_dequant_f16_src1_bytes_per_token(item.ne[0], item.ne[2] > 0 ? item.ne[2] : 1,\n                                                      item.ne[3] > 0 ? item.ne[3] : 1, &src1_bytes)) {\n                desc.dequant_f16_if_unsupplied_weight_bytes",
-         "true) {\n            size_t weight_bytes = 0;\n            size_t src1_bytes   = 0;\n            if (zone_dequant_f16_weight_bytes(item.ne[0], item.ne[1] > 0 ? item.ne[1] : 1, &weight_bytes) &&\n                zone_dequant_f16_src1_bytes_per_token(item.ne[0], item.ne[2] > 0 ? item.ne[2] : 1,\n                                                      item.ne[3] > 0 ? item.ne[3] : 1, &src1_bytes)) {\n                desc.dequant_f16_if_unsupplied_weight_bytes"),
+         "&& onednn_woq::supports_dequant_fp16(item.type)", ""),
+        ("the adapter classifies the head by usage and the tied-embedding classifier, and passes it", "cache",
+         "const bool lm_head = infer_tensor_usage(item.name.c_str()) == tensor_usage::OUTPUT_WEIGHT ||",
+         "const bool lm_head = false; const bool lm_head_unused = infer_tensor_usage(item.name.c_str()) == "
+         "tensor_usage::OUTPUT_WEIGHT ||"),
+        ("the adapter passes the expert flag to the claim", "cache", "lm_head, is_expert,", "lm_head, false,"),
+        ("the mark excludes expert stacks", "cache", "(unified_dequant_type || aos_dequant_type) && !is_expert",
+         "(unified_dequant_type || aos_dequant_type)"),
         ("the mark honours the oneDNN PP scratch (type enablement AND admission)", "cache",
          "onednn_pp_unified_scratch_enabled(item.type) && ggml_sycl_onednn_pp_type_admitted(item.type);",
          "onednn_pp_unified_scratch_enabled(item.type);"),

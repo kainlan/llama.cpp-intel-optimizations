@@ -27963,26 +27963,28 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // only (chat, llama-bench) is not known here, and an unused plan is bounded by that one weight's f16 copy.
         //
         // llama.cpp-gldu: a quantized type no MMQ, coalesced or unified kernel serves takes the same fields, from the
-        // router's own type lists (dense_pp_route_is_f16_dequant_arm: !coalesced && !MMQ; ggml_sycl_supports_mmq and
-        // is_coalesced_supported read the same lists). A type the router could not dequantize at all (Q2_0) is left out
-        // through the dequant function the router asks (onednn_woq::supports_dequant_fp16). The LM head is left out
-        // too: a completion runs it on the last row of each ubatch (MMVQ), so claiming its f16 copy (1.2 GB for a Q5_K /
-        // IQ head with a 248k vocabulary) would size the whole plan from a weight that normally never reaches the arm;
-        // perplexity or embeddings, which do run it on many rows, are covered by the graph-entry walk, which grows the
-        // buffer or refuses by name (llama.cpp-fkpg will tell the planner n_outputs). Unlike the unified kernel's
-        // types it does not need the PP admission to reach the arm: the legacy oneDNN kernel runs with
-        // GGML_SYCL_ONEDNN_PP=0 too. The scratch supplies its copies only when the PP admission holds AND the scratch is
-        // enabled for the type, so that is what pp_scratch_type_enabled says (for the unified kernel's types the
-        // admission already held, so their answer is unchanged). The loader's get_rows_only role excludes a gather-only
-        // table (per_layer_token_embd) in the classifier, for every mark.
+        // router's own type lists (aos_dequant_f16_plan_claims in unified-types.hpp composes them: !coalesced && !MMQ,
+        // a type SYCL executes as a dense MUL_MAT, not an expert stack, not the LM head; ggml_sycl_supports_mmq,
+        // is_coalesced_supported and ggml_sycl_mul_mat_type_supported read the same lists). The one term a SYCL-free
+        // header cannot compute is whether the router can dequantize the type at all, so it is asked here through the
+        // function the router asks (onednn_woq::supports_dequant_fp16). The head is recognised by its usage
+        // classification (infer_tensor_usage) and the tied-embedding classifier, the same two the layout planner uses,
+        // not by a name of its own. Unlike the unified kernel's types this mark does not need the PP admission to reach
+        // the arm: the legacy oneDNN kernel runs with GGML_SYCL_ONEDNN_PP=0 too. The scratch supplies its copies only
+        // when the PP admission holds AND the scratch is enabled for the type, so that is what pp_scratch_type_enabled
+        // says (for the unified kernel's types the admission already held, so their answer is unchanged). The loader's
+        // get_rows_only role excludes a gather-only table (per_layer_token_embd) in the classifier, for every mark.
+        const bool is_expert = expert_tensor_role_from_tensor_name(item.name.c_str()) != expert_tensor_role::UNKNOWN;
         const bool unified_dequant_type =
             unified_kernel_serves_type(item.type) && ggml_sycl_onednn_pp_type_admitted(item.type);
         const bool lm_head = infer_tensor_usage(item.name.c_str()) == tensor_usage::OUTPUT_WEIGHT ||
                              ggml_sycl_is_canonical_tied_embedding_name(item.name.c_str());
-        const bool aos_dequant_type = ggml_is_quantized(item.type) && dense_pp_route_is_f16_dequant_arm(item.type) &&
-                                      !lm_head && onednn_woq::supports_dequant_fp16(item.type);
-        if (item.has_shape() && (unified_dequant_type || aos_dequant_type) &&
-            expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
+        const bool dequant_supported = item.has_shape() && dense_pp_route_is_f16_dequant_arm(item.type) &&
+                                       onednn_woq::supports_dequant_fp16(item.type);
+        const bool aos_dequant_type =
+            item.has_shape() &&
+            aos_dequant_f16_plan_claims(item.type, ggml_is_quantized(item.type), lm_head, is_expert, dequant_supported);
+        if (item.has_shape() && (unified_dequant_type || aos_dequant_type) && !is_expert) {
             size_t weight_bytes = 0;
             size_t src1_bytes   = 0;
             if (zone_dequant_f16_weight_bytes(item.ne[0], item.ne[1] > 0 ? item.ne[1] : 1, &weight_bytes) &&
