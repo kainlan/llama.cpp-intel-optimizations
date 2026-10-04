@@ -231,8 +231,8 @@ def test_guard_consults_the_headroom_predicate():
     assert "GGML_SYCL_NONFA_ATTN_SCRATCH_MB" not in body_norm, (
         "the runtime refusal must NOT advertise GGML_SYCL_NONFA_ATTN_SCRATCH_MB as a remediation -- "
         "it only replaces the demand term d, not the reserve or the headroom comparison, so it is an "
-        "experimentation knob (llama.cpp-k1ev), not a user-facing fix; -fa 1/auto or a smaller -c are "
-        "the only remediations with hardware support"
+        "experimentation knob (llama.cpp-k1ev), not a user-facing fix; -fa 1/auto is "
+        "the only remediation with hardware support"
     )
     assert "headroom-limited" in body_norm, (
         "the largest-fitting-n_ctx remediation must be labeled \"headroom-limited\" -- it is bounded by "

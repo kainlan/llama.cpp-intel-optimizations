@@ -2558,6 +2558,9 @@ void llama_context::sched_reserve() {
     int n_input_tensors_tg = -1;
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    // The -ub the pp reserves ran at, for a refusal's advice: a context smaller than -ub reserved at n_ctx tokens, and
+    // naming a -ub for that shape would be wrong, so it is 0 (no -ub is named).
+    const uint32_t refused_ub_pp = n_tokens == cparams.n_ubatch ? cparams.n_ubatch : 0;
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
@@ -2574,9 +2577,8 @@ void llama_context::sched_reserve() {
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
-                throw llama_auto_ubatch_fit_refusal(
-                    "failed to allocate compute pp buffers" +
-                    llama_context_sycl_compute_refusal_text(backends, cparams.n_ubatch));
+                throw llama_auto_ubatch_fit_refusal("failed to allocate compute pp buffers" +
+                                                    llama_context_sycl_compute_refusal_text(backends, refused_ub_pp));
             }
         }
 
@@ -2591,7 +2593,7 @@ void llama_context::sched_reserve() {
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw llama_auto_ubatch_fit_refusal("failed to allocate compute tg buffers" +
-                                                llama_context_sycl_compute_refusal_text(backends, cparams.n_ubatch));
+                                                llama_context_sycl_compute_refusal_text(backends, 0));
         }
 
         n_splits_tg        = ggml_backend_sched_get_n_splits(sched.get());
@@ -2619,7 +2621,7 @@ void llama_context::sched_reserve() {
 
         if (!gf) {
             throw llama_auto_ubatch_fit_refusal("failed to allocate compute pp buffers" +
-                                                llama_context_sycl_compute_refusal_text(backends, cparams.n_ubatch));
+                                                llama_context_sycl_compute_refusal_text(backends, refused_ub_pp));
         }
     }
 
