@@ -7744,6 +7744,7 @@ static bool ggml_sycl_is_device_vram_buffer(const ggml_tensor * t);
 static bool ggml_sycl_is_host_resident_weight(const ggml_tensor * src0, sycl::queue * stream);
 // Forward declaration: check if weight executes on host rather than GPU (defined in dispatch section).
 static bool ggml_sycl_weight_executes_on_host(const ggml_tensor * tensor, int device);
+static bool ggml_sycl_weight_residency_is_observable(const ggml_tensor * tensor);
 // Forward declaration: check if blind preload should be skipped (defined in MoE preload section).
 bool        ggml_sycl_should_skip_blind_preload(int64_t n_experts);
 
@@ -14172,9 +14173,10 @@ tensor_usage ggml_sycl_get_tensor_usage(const ggml_tensor * tensor) {
 // ggml_backend_sycl_device_supports_op()'s BF16 case, and the executor
 // ggml_sycl_mul_mat_bf16_weight(). The weight predicate is deliberately SYCL-buffer-
 // class-blind (it is the pure, host-testable one); this wrapper adds the shape
-// contract of the native kernel and the one check neither can make from a header --
-// a BF16 weight living on a split or TP buffer must decline, because the kernel
-// reads one single-device matrix.
+// contract of the native kernel and the checks neither can make from a header --
+// a BF16 weight living on a split or TP buffer must decline (the kernel reads one
+// single-device matrix), as must one the planner put on the host or on another
+// device, or whose buffer this backend cannot observe (the executor aborts on those).
 static bool ggml_sycl_bf16_weight_native_route_available(const ggml_tensor * src0,
                                                          const ggml_tensor * src1,
                                                          const ggml_tensor * dst,
@@ -36157,11 +36159,11 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
     }
     // llama.cpp-dyi3 round 6 (root cause, task comment log): this fast path
     // used to live AFTER the recording gate below, only reachable on the
-    // non-recording side. gemma4's kmeq BF16->F32 materialization
-    // (~line 60095, "<name>.bf16_materialized_f32") builds a stack-local
+    // non-recording side. gemma4's kmeq BF16->F32 materialization (removed by
+    // llama.cpp-9qjy, which runs BF16 weights natively) built a stack-local
     // alias tensor with extra=nullptr and data pointing at the already-
     // materialized F32 device buffer, keyed under a synthesized cache name
-    // that is DESIGNED to miss cache->get_view() (kmeq's own comment).
+    // that was DESIGNED to miss cache->get_view().
     // Under recording the old gate below tried only get_view(), missed by
     // design, and returned nullptr -- silently failing MUL_MAT dispatch for
     // gemma4's per-layer-embedding projection on every recorded/replayed
@@ -41381,8 +41383,12 @@ static bool ggml_backend_buffer_is_sycl_tp(ggml_backend_buffer_t buffer) {
 
 // llama.cpp-9qjy: see the forward declaration (near ggml_sycl_get_tensor_usage) for the
 // full rationale. Composes the pure, host-testable weight predicate and the native
-// kernel's shape contract with the one check neither can make: decline a BF16 weight
-// living on a split or TP buffer. Both call sites -- ggml_backend_sycl_device_supports_op()'s
+// kernel's shape contract with the checks neither can make: decline a BF16 weight on a
+// split or TP buffer, on a buffer this backend cannot observe, planned on the host, or
+// planned on another device. Those placement declines are unconditional -- they hold even
+// where supports_op skips its own host decline (the multi-GPU router-logits exception),
+// because the executor aborts on exactly those inputs: admitting them would trade a clean
+// CPU fallback for an abort. Both call sites -- ggml_backend_sycl_device_supports_op()'s
 // BF16 case (admission) and ggml_sycl_mul_mat_bf16_weight() (execution) -- consult this
 // SAME function, so they cannot independently drift out of agreement.
 static bool ggml_sycl_bf16_weight_native_route_available(const ggml_tensor * src0,
@@ -41391,7 +41397,9 @@ static bool ggml_sycl_bf16_weight_native_route_available(const ggml_tensor * src
                                                          int                 device) {
     return ggml_sycl_bf16_weight_dispatch_available(src0, device) &&
            ggml_sycl_bf16::mul_mat_shape_supported(src0, src1, dst) &&
-           !ggml_backend_buffer_is_sycl_split(src0->buffer) && !ggml_backend_buffer_is_sycl_tp(src0->buffer);
+           !ggml_backend_buffer_is_sycl_split(src0->buffer) && !ggml_backend_buffer_is_sycl_tp(src0->buffer) &&
+           ggml_sycl_weight_residency_is_observable(src0) && !ggml_sycl_weight_executes_on_host(src0, device) &&
+           !ggml_sycl_weight_is_planned_on_other_device(src0, device);
 }
 
 static ggml_backend_buffer_t ggml_backend_sycl_tp_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
@@ -64533,7 +64541,9 @@ static void ggml_sycl_mul_mat_bf16_weight(ggml_backend_sycl_context & ctx,
     }
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
 
-    const ggml_sycl::resolved_ptr weight = ggml_sycl_resolve(src0, ctx.device);
+    // No-materialize resolve: this executor allocates nothing, so a weight the cache cannot
+    // hand back as it is must abort rather than be staged here.
+    const ggml_sycl::resolved_ptr weight = ggml_sycl_resolve_no_materialize(src0, ctx.device);
     if (!weight || !weight.on_device) {
         GGML_ABORT(
             "%s: BF16 weight %s is not device-resident on device %d (planned-host weights run on the CPU "
@@ -64547,7 +64557,9 @@ static void ggml_sycl_mul_mat_bf16_weight(ggml_backend_sycl_context & ctx,
             __func__, src0->name[0] != '\0' ? src0->name : "(unnamed)", ggml_sycl_layout_mode_name(weight.layout));
     }
     const size_t weight_bytes = ggml_nbytes(src0);
-    if (weight.extent != 0 && weight.extent < weight_bytes) {
+    // extent 0 means "unknown" and a bounded consumer must reject it (mem-handle.hpp); the
+    // no-materialize resolve reports the checked tensor extent on every success.
+    if (weight.extent < weight_bytes) {
         GGML_ABORT("%s: BF16 weight %s resolves to %zu bytes but needs %zu", __func__,
                    src0->name[0] != '\0' ? src0->name : "(unnamed)", weight.extent, weight_bytes);
     }
@@ -64562,8 +64574,8 @@ static void ggml_sycl_mul_mat_bf16_weight(ggml_backend_sycl_context & ctx,
 
     GGML_SYCL_PROFILE_SCOPE_GEMM("mul_mat.bf16_native");
     (void) ggml_sycl_bf16::mul_mat_bf16_f32(*ctx.stream(), static_cast<const uint16_t *>(weight.ptr), src1_ddf, dst_ddf,
-                                            src0->ne[0], src0->ne[1], src1->ne[1] * src1->ne[2] * src1->ne[3], ldx, ldy,
-                                            weight.has_ready_event ? &weight.ready_event : nullptr);
+                                            src0->ne[0], src0->ne[1], src1->ne[1] * src1->ne[2] * src1->ne[3], ldx,
+                                            ldy);
 } catch (const sycl::exception & exc) {
     if (ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, exc)) {
         return;

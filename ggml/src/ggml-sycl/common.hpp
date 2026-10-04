@@ -4909,8 +4909,11 @@ inline const void * ggml_sycl_host_data(const ggml_tensor * tensor) {
 
 // llama.cpp-kmeq / llama.cpp-9qjy: pure predicate, no allocation -- the weight half of
 // the native BF16 route (ggml_sycl_bf16_weight_native_route_available, in ggml-sycl.cpp,
-// adds the kernel's shape contract and the split/TP buffer decline). True iff this
-// tensor is a named, contiguous BF16 weight with resolvable bytes on this device.
+// adds the kernel's shape contract, the buffer-class decline and the placement checks).
+// True iff this tensor is a named, contiguous BF16 weight. It deliberately does NOT look
+// at tensor->data: the executor reads the device copy the planner materialized, never the
+// host mapping, so a weight whose host bytes are gone (or never mapped) is still runnable.
+// Whether the device bytes exist is the placement checks' and the executor's question.
 // ggml_backend_sycl_device_supports_op() calls it and must never allocate or mutate
 // cache state from inside it.
 //
@@ -4931,7 +4934,7 @@ inline const void * ggml_sycl_host_data(const ggml_tensor * tensor) {
 // one that might.
 inline bool ggml_sycl_bf16_weight_dispatch_available(const ggml_tensor * tensor, int device) {
     return tensor && tensor->type == GGML_TYPE_BF16 && device >= 0 && ggml_sycl_tensor_is_weight(tensor) &&
-           tensor->name[0] != '\0' && ggml_is_contiguous(tensor) && ggml_sycl_host_data(tensor) != nullptr;
+           tensor->name[0] != '\0' && ggml_is_contiguous(tensor);
 }
 
 inline void * ggml_sycl_resolve_or_host_tensor_ptr(const ggml_tensor * tensor, int device) {

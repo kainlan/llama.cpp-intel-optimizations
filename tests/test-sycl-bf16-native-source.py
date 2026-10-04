@@ -157,9 +157,23 @@ def test_executor_allocates_nothing_and_waits_on_nothing():
         "the executor must assert the same predicate supports_op admitted the op through"
     assert "on_device" in executor, \
         "the executor must refuse a weight that is not device-resident (placement decides the executor)"
-    for forbidden in ("unified_allocate", "unified_alloc(", "malloc_device", "malloc_host", "ggml_sycl_pool_alloc",
-                      "ggml_sycl_bf16_materialize", "mem_copy", ".wait()", "->wait()"):
+    assert "ggml_sycl_resolve_no_materialize(" in executor, \
+        "the executor must resolve the weight without materializing (ggml_sycl_resolve_no_materialize)"
+    # ggml_sycl_resolve( can fall through to ggml_sycl_get_data_ptr_slow, which stages and allocates.
+    # Source ready events are chained by graph_compute (ggml_sycl_should_add_dependency), so the
+    # executor takes no event of its own either.
+    for forbidden in ("ggml_sycl_resolve(", "unified_allocate", "unified_alloc(", "malloc_device", "malloc_host",
+                      "ggml_sycl_pool_alloc", "ggml_sycl_bf16_materialize", "mem_copy", ".wait()", "->wait()",
+                      "ready_event", "depends_on"):
         assert forbidden not in executor, f"the BF16 executor must not use {forbidden!r} (no second copy, no host wait)"
+    assert "weight.extent < weight_bytes" in executor and "weight.extent != 0" not in executor, \
+        "an unknown (0) extent must be rejected, not accepted"
+
+
+def test_kernel_takes_no_event_and_no_atomics():
+    kernel = strip_comments(KERNEL.read_text())
+    for forbidden in ("depends_on", "sycl::event * ready", "atomic_ref", "atomic_fetch", "malloc_device", "malloc_host"):
+        assert forbidden not in kernel, f"mul-mat-bf16.hpp must not use {forbidden!r}"
 
 
 def test_supports_op_admits_bf16_through_the_executors_predicate():
@@ -180,6 +194,10 @@ def test_route_predicate_composes_weight_shape_and_buffer_class():
         "the native route predicate must compose the weight predicate and the shape contract"
     assert "ggml_backend_buffer_is_sycl_split(" in route and "ggml_backend_buffer_is_sycl_tp(" in route, \
         "the native route predicate must still decline split and TP buffers"
+    for placement in ("ggml_sycl_weight_residency_is_observable(", "ggml_sycl_weight_executes_on_host(",
+                      "ggml_sycl_weight_is_planned_on_other_device("):
+        assert placement in route, \
+            f"the native route predicate must decline what the executor aborts on: missing {placement}"
     assert "mul_mat_shape_supported" in strip_comments(KERNEL.read_text()), \
         "mul-mat-bf16.hpp must define mul_mat_shape_supported"
     assert "ggml_sycl_bf16_weight_dispatch_available" in strip_comments(COMMON.read_text()), \
