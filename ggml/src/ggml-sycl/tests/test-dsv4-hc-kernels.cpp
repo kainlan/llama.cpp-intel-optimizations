@@ -426,6 +426,8 @@ void test_post(sycl::queue & q, int64_t n_embd, int64_t hc, int64_t n_tokens, bo
 struct lid_case {
     int64_t   n_embd, n_head, n_kv, n_batch, n_stream, nem3;
     ggml_type type;
+    bool      pad          = false;  // strided q/k/w/m/dst with slack
+    int64_t   max_groups_x = 0;      // launch grid width cap (0: the production default)
 };
 
 std::vector<double> lid_oracle(const std::vector<float> & q,
@@ -491,38 +493,74 @@ template <int LANES> void test_lid(sycl::queue & q, const lid_case & c) {
         v = rnd(0.0f, 1.0f) < 0.2f ? -INFINITY : 0.0f;
     }
 
-    char *  dq = sycl::malloc_shared<char>(qv.size() * sizeof(float), q);
-    char *  dk = sycl::malloc_shared<char>(kq.size(), q);
-    char *  dw = sycl::malloc_shared<char>(wv.size() * sizeof(float), q);
-    char *  dm = sycl::malloc_shared<char>(mv.size() * sizeof(sycl::half), q);
-    float * dd = sycl::malloc_shared<float>((size_t) (c.n_kv * c.n_batch * c.n_stream), q);
-    std::memcpy(dq, qv.data(), qv.size() * sizeof(float));
-    std::memcpy(dk, kq.data(), kq.size());
-    std::memcpy(dw, wv.data(), wv.size() * sizeof(float));
-    for (size_t i = 0; i < mv.size(); ++i) {
-        ((sycl::half *) dm)[i] = (sycl::half) mv[i];
-    }
+    // Strides in bytes. `pad` gives every row and plane the slack a view of a larger tensor has, so a kernel that
+    // assumes packed strides, or reads or writes the slack, is caught.
+    const size_t pq1 = c.pad ? 16 : 0, pq2 = c.pad ? 32 : 0, pq3 = c.pad ? 64 : 0;
+    const size_t pk2 = c.pad ? 32 : 0, pk3 = c.pad ? 64 : 0;
+    const size_t pw1 = c.pad ? 16 : 0, pw3 = c.pad ? 32 : 0;
+    const size_t pm1 = c.pad ? 8 : 0, pm3 = c.pad ? 16 : 0;
+    const size_t pd1 = c.pad ? 3 * sizeof(float) : 0, pd3 = c.pad ? 5 * sizeof(float) : 0;
 
     lightning_indexer_args a = {};
+    a.k_type                 = c.type;
+    a.n_embd                 = c.n_embd;
+    a.n_head                 = c.n_head;
+    a.n_batch                = c.n_batch;
+    a.n_stream               = c.n_stream;
+    a.n_kv                   = c.n_kv;
+    a.nem3                   = c.nem3;
+    a.max_groups_x           = c.max_groups_x;
+    a.nbq1                   = sizeof(float) * c.n_embd + pq1;
+    a.nbq2                   = a.nbq1 * c.n_head + pq2;
+    a.nbq3                   = a.nbq2 * c.n_batch + pq3;
+    a.nbk2                   = row_bytes + pk2;
+    a.nbk3                   = a.nbk2 * c.n_kv + pk3;
+    a.nbw1                   = sizeof(float) * c.n_head + pw1;
+    a.nbw3                   = a.nbw1 * c.n_batch + pw3;
+    a.nbm1                   = sizeof(sycl::half) * c.n_kv + pm1;
+    a.nbm3                   = a.nbm1 * c.n_batch + pm3;
+    a.nb1                    = sizeof(float) * c.n_kv + pd1;
+    a.nb3                    = a.nb1 * c.n_batch + pd3;
+
+    // whole buffers start as garbage (K as garbage blocks too), so only the strided view is meaningful
+    auto alloc = [&](size_t bytes) {
+        char * p = sycl::malloc_shared<char>(bytes ? bytes : 1, q);
+        std::memset(p, 0x5a, bytes);
+        return p;
+    };
+    char *       dq           = alloc(a.nbq3 * c.n_stream);
+    char *       dk           = alloc(a.nbk3 * c.n_stream);
+    char *       dw           = alloc(a.nbw3 * c.n_stream);
+    char *       dm           = alloc(a.nbm3 * c.nem3);
+    float *      dd           = (float *) alloc(a.nb3 * c.n_stream);
+    const size_t n_dst_floats = a.nb3 * c.n_stream / sizeof(float);
+    for (size_t i = 0; i < n_dst_floats; ++i) {
+        dd[i] = 12345.0f;
+    }
+
+    for (int64_t s = 0; s < c.n_stream; ++s) {
+        for (int64_t t = 0; t < c.n_batch; ++t) {
+            for (int64_t h = 0; h < c.n_head; ++h) {
+                std::memcpy(dq + s * a.nbq3 + t * a.nbq2 + h * a.nbq1,
+                            qv.data() + (size_t) (c.n_embd * (h + c.n_head * (t + c.n_batch * s))),
+                            sizeof(float) * c.n_embd);
+            }
+            std::memcpy(dw + s * a.nbw3 + t * a.nbw1, wv.data() + (size_t) (c.n_head * (t + c.n_batch * s)),
+                        sizeof(float) * c.n_head);
+        }
+        for (int64_t ik = 0; ik < c.n_kv; ++ik) {
+            std::memcpy(dk + s * a.nbk3 + ik * a.nbk2, kq.data() + row_bytes * (size_t) (ik + c.n_kv * s), row_bytes);
+        }
+    }
+    for (int64_t sm = 0; sm < c.nem3; ++sm) {
+        for (int64_t t = 0; t < c.n_batch; ++t) {
+            for (int64_t ik = 0; ik < c.n_kv; ++ik) {
+                ((sycl::half *) (dm + sm * a.nbm3 + t * a.nbm1))[ik] =
+                    (sycl::half) mv[(size_t) (ik + c.n_kv * (t + c.n_batch * sm))];
+            }
+        }
+    }
     a.q = dq, a.k = dk, a.w = dw, a.m = dm, a.dst = dd;
-    a.k_type   = c.type;
-    a.n_embd   = c.n_embd;
-    a.n_head   = c.n_head;
-    a.n_batch  = c.n_batch;
-    a.n_stream = c.n_stream;
-    a.n_kv     = c.n_kv;
-    a.nem3     = c.nem3;
-    a.nbq1     = sizeof(float) * c.n_embd;
-    a.nbq2     = a.nbq1 * c.n_head;
-    a.nbq3     = a.nbq2 * c.n_batch;
-    a.nbk2     = row_bytes;
-    a.nbk3     = row_bytes * c.n_kv;
-    a.nbw1     = sizeof(float) * c.n_head;
-    a.nbw3     = a.nbw1 * c.n_batch;
-    a.nbm1     = sizeof(sycl::half) * c.n_kv;
-    a.nbm3     = a.nbm1 * c.n_batch;
-    a.nb1      = sizeof(float) * c.n_kv;
-    a.nb3      = a.nb1 * c.n_batch;
 
     const bool launched = lightning_indexer_launch<LANES>(q, a);
     q.wait_and_throw();
@@ -531,13 +569,31 @@ template <int LANES> void test_lid(sycl::queue & q, const lid_case & c) {
                              " n_embd=" + std::to_string(c.n_embd) + " heads=" + std::to_string(c.n_head) +
                              " kv=" + std::to_string(c.n_kv) + " batch=" + std::to_string(c.n_batch) +
                              " streams=" + std::to_string(c.n_stream) + " mask_streams=" + std::to_string(c.nem3) +
-                             " K=" + ggml_type_name(c.type);
+                             " K=" + ggml_type_name(c.type) + (c.pad ? " strided" : "") +
+                             (c.max_groups_x ? " groups_x<=" + std::to_string(c.max_groups_x) : "");
     if (!launched) {
         report(name + " launches", false, 0.0);
     } else {
         // the half mask rounds -inf/0 exactly, so the oracle may use the float mask
-        const std::vector<double> got(dd, dd + (size_t) (c.n_kv * c.n_batch * c.n_stream));
+        std::vector<double> got;
+        size_t              n_slack_touched = 0;
+        std::vector<char>   seen(n_dst_floats, 0);
+        for (int64_t s = 0; s < c.n_stream; ++s) {
+            for (int64_t t = 0; t < c.n_batch; ++t) {
+                for (int64_t ik = 0; ik < c.n_kv; ++ik) {
+                    const size_t at = (size_t) (ik + t * (a.nb1 / sizeof(float)) + s * (a.nb3 / sizeof(float)));
+                    got.push_back(dd[at]);
+                    seen[at] = 1;
+                }
+            }
+        }
+        for (size_t i = 0; i < n_dst_floats; ++i) {
+            n_slack_touched += !seen[i] && dd[i] != 12345.0f;
+        }
         expect_match(name, got, lid_oracle(qv, kf, wv, mv, c));
+        if (c.pad) {
+            report(name + " leaves padding alone", n_slack_touched == 0, (double) n_slack_touched);
+        }
         if (c.n_kv * c.n_batch >= 16 && c.n_head >= 4) {
             expect_reject(name + " vs no ReLU", got, lid_oracle(qv, kf, wv, mv, c, true, false));
             expect_reject(name + " vs no mask", got, lid_oracle(qv, kf, wv, mv, c, false, true));
@@ -549,6 +605,47 @@ template <int LANES> void test_lid(sycl::queue & q, const lid_case & c) {
     sycl::free(dw, q);
     sycl::free(dm, q);
     sycl::free(dd, q);
+}
+
+// The grid arithmetic that keeps the launch inside 32-bit work-item ids. The shapes that overflowed a 1D range
+// are too big to run here, so the arithmetic is checked on them directly, with the hardware-independent bound
+// the compiler assumes (every global range dimension below 2^31, every group count below 2^31).
+void test_lid_dims() {
+    const int64_t INT_RANGE = int64_t(1) << 31;
+
+    struct shape {
+        const char * what;
+        int64_t      n_rows;
+    };
+
+    const shape shapes[] = {
+        { "empty",                                     0                      },
+        { "one row",                                   1                      },
+        { "one block",                                 4                      },
+        { "one past a block",                          5                      },
+        { "ub=512 kv=131072 (the no -c case)",         512LL * 131072         },
+        { "ub=2048 kv=32768",                          2048LL * 32768         },
+        { "2^26 - 1 rows (last 1D range that fit)",    (int64_t(1) << 26) - 1 },
+        { "2^26 rows (first 1D overflow at 32 lanes)", int64_t(1) << 26       },
+        { "ub=2048 kv=1048576",                        2048LL * 1048576       },
+        { "4 streams of ub=512 kv=1048576",            4LL * 512 * 1048576    },
+    };
+    for (const shape & s : shapes) {
+        const auto    d      = lightning_indexer_launch_dims(s.n_rows, 0);
+        const int64_t groups = d.groups_x * d.groups_y;
+        const bool    covers = s.n_rows == 0 ? d.groups_y == 0 : groups * LID_ROWS_PER_BLOCK >= s.n_rows;
+        const bool    tight  = s.n_rows == 0 || (groups - d.groups_x) * LID_ROWS_PER_BLOCK < s.n_rows;
+        for (int lanes : { 16, 32 }) {
+            const bool fits = d.groups_x * LID_ROWS_PER_BLOCK * lanes < INT_RANGE && d.groups_y < INT_RANGE;
+            report(std::string("indexer grid ") + s.what + " lanes=" + std::to_string(lanes) +
+                       " covers every row, wastes under one grid row, every dimension fits 32-bit ids",
+                   covers && tight && fits, (double) groups);
+        }
+    }
+    // a 1D range for the overflow shapes WOULD have exceeded the id range: the control that makes the above bite
+    report("control: a 1D range for 2^26 rows at 32 lanes exceeds the 32-bit id range",
+           ((int64_t(1) << 26) + LID_ROWS_PER_BLOCK - 1) / LID_ROWS_PER_BLOCK * LID_ROWS_PER_BLOCK * 32 >= INT_RANGE,
+           0.0);
 }
 
 bool sub_group_supported(const sycl::device & dev, size_t n) {
@@ -636,6 +733,15 @@ int main() {
             test_lid<LANES>(q, { 128, 32, 7, 16, 4, 4, t });
             test_lid<LANES>(q, { 128, 4, 63, 9, 4, 1, t });
         }
+        // strided operands, shared and per-stream masks, quantized and plain K
+        test_lid<LANES>(q, { 128, 4, 33, 8, 1, 1, GGML_TYPE_F16, true });
+        test_lid<LANES>(q, { 128, 4, 33, 8, 3, 3, GGML_TYPE_Q8_0, true });
+        test_lid<LANES>(q, { 128, 4, 33, 8, 3, 1, GGML_TYPE_Q4_1, true });
+        test_lid<LANES>(q, { 256, 2, 17, 5, 2, 2, GGML_TYPE_F32, true });
+        // a tall grid (the width cap forces several rows of work-groups), packed and strided
+        test_lid<LANES>(q, { 128, 4, 65, 32, 2, 1, GGML_TYPE_Q8_0, false, 3 });
+        test_lid<LANES>(q, { 128, 4, 65, 32, 2, 2, GGML_TYPE_F16, true, 1 });
+        test_lid<LANES>(q, { 128, 4, 1, 1, 1, 1, GGML_TYPE_F16, false, 1 });
         test_lid<LANES>(q, { 128, 4, 1, 1, 1, 1, GGML_TYPE_F16 });
         test_lid<LANES>(q, { 256, 4, 33, 8, 2, 2, GGML_TYPE_F16 });
         test_lid<LANES>(q, { 256, 4, 33, 8, 2, 1, GGML_TYPE_Q8_0 });
@@ -644,6 +750,7 @@ int main() {
             test_lid<LANES>(q, { 512, 2, 17, 4, 1, 1, GGML_TYPE_F16 });
         }
     };
+    test_lid_dims();
     run_lanes(std::integral_constant<int, 32>{});
     run_lanes(std::integral_constant<int, 16>{});
     ++g_cases;
