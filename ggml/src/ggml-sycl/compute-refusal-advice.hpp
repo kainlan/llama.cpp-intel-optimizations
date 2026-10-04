@@ -32,6 +32,7 @@ struct compute_refusal_inputs {
     size_t                 headroom_target  = 0;      // the driver headroom the arena keeps outside itself
     bool                   hold_fit_refused = false;  // the kpjw hold-spill fit refused n_ubatch ...
     uint32_t               hold_largest_ub  = 0;      // ... and names this -ub (0: none)
+    bool                   host_pinned_refused = false;  // the host-pinned fallback was tried and refused
     compute_refusal_budget budget;
 };
 

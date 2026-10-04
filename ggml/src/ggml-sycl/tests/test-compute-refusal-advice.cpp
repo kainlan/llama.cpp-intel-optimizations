@@ -189,9 +189,45 @@ void test_message_names_what_fits() {
     snprintf(pct, sizeof(pct), "GGML_SYCL_VRAM_BUDGET_PCT=%d", adv.budget_pct);
     check(contains(msg, pct), "names the computed budget pct");
     check(contains(msg, "device 0"), "names the device");
-    check(contains(msg, "host-pinned"), "says why the host fallback is not an answer");
+    check(contains(msg, "host-pinned fallback did not place it either"), "says the host fallback did not place it");
+    check(contains(msg, "over PCIe"), "says why host memory is no remedy, in plain words");
+    check(!contains(msg, "executor") && !contains(msg, "placement decides"), "no internal jargon");
     check(!contains(msg, "-c "), "never advises a smaller context");
     check(!contains(msg, "context size") && !contains(msg, "smaller -c"), "no context-size remedy at all");
+}
+
+void test_message_says_what_happened_to_the_host_fallback() {
+    printf("message: a refused host-pinned fallback is named as such; never claims it was not tried\n");
+    compute_refusal_inputs in = incident();
+    in.host_pinned_refused    = true;
+    const std::string msg     = ggml_sycl::compute_refusal_message(in, ggml_sycl::compute_refusal_advise(in));
+    check(contains(msg, "host-pinned fallback was tried and refused"), "names the refused fallback");
+    check(contains(msg, "misaligned"), "says why it was refused");
+    check(contains(msg, "over PCIe"), "still says host memory is no remedy");
+    check(!contains(msg, "did not place it either"), "does not also claim it was merely not placed");
+    check(!contains(msg, "It is not placed in host memory"), "never says the allocator refuses host memory by policy");
+}
+
+void test_message_for_a_buffer_not_shaped_by_ub() {
+    printf("message: a buffer not shaped by -ub (n_ubatch 0) names no -ub and no -ub advice\n");
+    compute_refusal_inputs in = incident();
+    in.n_ubatch               = 0;
+    const compute_refusal_advice adv = ggml_sycl::compute_refusal_advise(in);
+    const std::string            msg = ggml_sycl::compute_refusal_message(in, adv);
+    check(adv.largest_ub == 0, "no -ub is named");
+    check(contains(msg, "2035.1 MiB") && contains(msg, "283.6 MiB"), "still names the request and the room");
+    check(!contains(msg, "at -ub") && !contains(msg, "-ub 0"), "does not claim a -ub it was not shaped at");
+    check(!contains(msg, "no -ub is known to fit") && !contains(msg, "largest -ub"), "says nothing about -ub");
+    check(contains(msg, "GGML_SYCL_VRAM_BUDGET_PCT="), "the budget lever is still named");
+}
+
+void test_largest_ub_survives_a_huge_ub() {
+    printf("largest ub: the doubling cannot overflow a 32-bit -ub\n");
+    compute_refusal_inputs in = incident();
+    in.n_ubatch               = 0xF0000000u;
+    in.request                = 1;
+    in.raw_free               = 64ull * 1024ull * kMiB;
+    check(ggml_sycl::compute_refusal_largest_ub(in) == 0x80000000u, "a huge -ub names the largest power of two below it");
 }
 
 void test_message_when_nothing_fits() {
@@ -230,8 +266,11 @@ int main() {
     test_budget_pct_frees_enough_and_no_more_than_needed();
     test_budget_pct_declines_what_it_cannot_do();
     test_message_names_what_fits();
+    test_message_says_what_happened_to_the_host_fallback();
+    test_message_for_a_buffer_not_shaped_by_ub();
     test_message_when_nothing_fits();
     test_degenerate_inputs();
+    test_largest_ub_survives_a_huge_ub();
 
     printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;

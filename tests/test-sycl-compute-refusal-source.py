@@ -108,9 +108,17 @@ def violations_record(cpp: str) -> list[str]:
         )
     if "ggml_sycl_compute_alloc_scope_active()" not in alloc:
         found.append("the record must be gated on the compute scope (a weight or state buffer is not a compute buffer)")
+    if "ggml_sycl_note_compute_placement_host_pinned_refusal(" not in alloc:
+        found.append("the allocator does not record that the refused buffer was a host-pinned fallback")
     txn = bounded(code, TXN_START, TXN_END)
     if not re.search(r"g_compute_placement_refused_bytes\[ctx->device\]\.store\(0", txn):
         found.append("the runtime-context transaction does not clear the refused-request record where it publishes")
+    scope = norm(bounded(code, "void ggml_backend_sycl_compute_alloc_scope(bool enter) {", "\n}\n"))
+    if "ggml_sycl_clear_compute_placement_refusals(" not in scope or "compute_alloc_scope_active()" not in scope:
+        found.append(
+            "entering the OUTERMOST compute scope must clear the refused-request records, so a retry that succeeded "
+            "cannot leak its text into a later unrelated refusal"
+        )
     return found
 
 
@@ -162,6 +170,8 @@ def violations_advice(h: str, cpp: str) -> list[str]:
         ("ggml_sycl_hold_kv_room(", "the KV zone's room, net of the KV still to place"),
         ("ggml_sycl_device_budget_authority(", "the budget authority's own figures, not a re-parse of the env var"),
         ("unified_cache_hold_free_before(", "the ledger's free memory outside the arena"),
+        ("g_compute_placement_host_pinned_refused", "whether the host-pinned fallback was tried and refused"),
+        ("ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES", "the device range guard its siblings carry"),
         ("compute_refusal_advise(", "the advice arithmetic"),
         ("compute_refusal_message(", "the message text"),
     ):
@@ -221,6 +231,14 @@ def violations_llama(src: str) -> list[str]:
     for kind, rest in refusals:
         if "llama_context_sycl_compute_refusal_text(" not in rest:
             found.append(f"the {kind} refusal does not append the by-name text")
+        if "cparams.n_ubatch" in rest:
+            found.append(
+                f"the {kind} refusal passes cparams.n_ubatch: that buffer was not necessarily shaped at -ub N "
+                "(the tg reserve is shaped by n_seqs, and a context under -ub is shaped by n_ctx); pass the shape it ran at"
+            )
+    tg = [rest for kind, rest in refusals if kind == "tg"]
+    if tg and not all(re.search(r",\s*0\s*\)", r) for r in tg):
+        found.append("the tg refusal must pass 0: a token-generation buffer is not shaped by -ub")
     return found
 
 
@@ -262,6 +280,8 @@ def violations_publish(cpp: str) -> list[str]:
         found.append("the publish guard does not say the buffer is a host-pinned fallback")
     if "not aligned" not in body and "is aligned only to" not in body:
         found.append("the publish guard does not say the pinned pool's base is the cause")
+    if "did not fit any device tier" in body:
+        found.append("the publish guard claims no device tier held the buffer; it does not know why it fell back")
     if "under-reserve" not in body:
         found.append("the device-buffer wording (under-reserve) was dropped for the case it is true of")
     return found
@@ -343,3 +363,9 @@ def test_smaller_context_gate_has_a_witness(literal):
 )
 def test_smaller_context_gate_allows_facts_and_negations(literal):
     assert violations_smaller_context("x", "const char * m = " + literal + ";") == [], literal
+
+
+def test_the_nonfa_remedy_comment_names_flash_attention_only():
+    assert "Flash attention or a smaller context" not in GGML_SYCL_CPP
+    nonfa = (ROOT / "tests/test-sycl-nonfa-attn-scratch-guard-source.py").read_text()
+    assert "or a smaller -c are" not in nonfa
