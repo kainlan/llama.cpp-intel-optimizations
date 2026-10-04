@@ -30,10 +30,24 @@ from pathlib import Path
 
 ROOT = Path(os.environ.get("GGML_SYCL_Q2_0_ROOT", str(Path(__file__).resolve().parents[1])))
 SYCL = ROOT / "ggml/src/ggml-sycl"
+HEADER = Path(__file__).resolve().parent
+
+
+sys.path.insert(0, str(HEADER))
+from sycl_dense_type_list import with_dense_type_list_inlined  # noqa: E402
 
 
 def read(name: str) -> str:
-    return (SYCL / name).read_text(encoding="utf-8")
+    text = (SYCL / name).read_text(encoding="utf-8")
+    if name != "ggml-sycl.cpp":
+        return text
+    # The dense MUL_MAT list lives in unified-types.hpp and ggml_sycl_mul_mat_type_supported delegates to it;
+    # splice it back in so the check reads the list the function really answers with. A tree from before
+    # that move (the RED export) still has the list inline.
+    try:
+        return with_dense_type_list_inlined(text)
+    except AssertionError:
+        return text
 
 
 def function_body(text: str, header: str) -> str:

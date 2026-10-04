@@ -513,7 +513,8 @@ def evaluate(backend, cache, cache_hpp, zone_sizing, model, header, common, disp
             "ggml_sycl_onednn_pp_enabled()" not in cand and "ggml_sycl_onednn_pp_skip_type(" not in cand
     if adapter is not None:
         results["the adapter plans the conditional mark only for a type the PP admission serves"] = \
-            "ggml_sycl_onednn_pp_type_admitted(item.type)" in adapter
+            "unified_kernel_serves_type(item.type) && ggml_sycl_onednn_pp_type_admitted(item.type)" in \
+            " ".join(adapter.split())
     return results
 
 
