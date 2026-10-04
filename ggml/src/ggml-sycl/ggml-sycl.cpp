@@ -93,6 +93,7 @@
 #include "ggml-sycl/convert.hpp"
 #include "ggml-sycl/cpy.hpp"
 #include "ggml-sycl/dispatch-tuning.hpp"
+#include "ggml-sycl/dsv4-hc.hpp"
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/fattn.hpp"
 #include "ggml-sycl/fusion-alias.hpp"
@@ -102,6 +103,7 @@
 #include "ggml-sycl/host-weight-alias.hpp"
 #include "ggml-sycl/kernel-selection.hpp"
 #include "ggml-sycl/l144i-probe.hpp"
+#include "ggml-sycl/lightning-indexer.hpp"
 #include "ggml-sycl/mem-ops.hpp"
 #include "ggml-sycl/mmq.hpp"
 #include "ggml-sycl/model-lifecycle-probe.hpp"
@@ -84399,6 +84401,18 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
         case GGML_OP_SET_ROWS_PAGED:
             ggml_sycl_op_set_rows_paged(ctx, safe_dst);
             break;
+        case GGML_OP_DSV4_HC_PRE:
+            ggml_sycl_op_dsv4_hc_pre(ctx, safe_dst);
+            break;
+        case GGML_OP_DSV4_HC_COMB:
+            ggml_sycl_op_dsv4_hc_comb(ctx, safe_dst);
+            break;
+        case GGML_OP_DSV4_HC_POST:
+            ggml_sycl_op_dsv4_hc_post(ctx, safe_dst);
+            break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            ggml_sycl_op_lightning_indexer(ctx, safe_dst);
+            break;
         case GGML_OP_DUP:
             ggml_sycl_dup(ctx, dst);
             break;
@@ -110855,6 +110869,15 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_GATED_DELTA_NET:
             return true;
+        // The executors assert these same predicates, so nothing admitted here can abort there.
+        case GGML_OP_DSV4_HC_PRE:
+            return ggml_sycl_dsv4_hc_pre_supported(op);
+        case GGML_OP_DSV4_HC_COMB:
+            return ggml_sycl_dsv4_hc_comb_supported(op);
+        case GGML_OP_DSV4_HC_POST:
+            return ggml_sycl_dsv4_hc_post_supported(op);
+        case GGML_OP_LIGHTNING_INDEXER:
+            return ggml_sycl_lightning_indexer_supported(op);
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_SSM_SCAN:

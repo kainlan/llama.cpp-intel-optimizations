@@ -453,6 +453,14 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-concat-no-host-wait-source.py
             --self-test)
     set_tests_properties(sycl-concat-no-host-wait-source PROPERTIES LABELS "sycl;graph;host;source-contract;python")
+    # llama.cpp-pmzl: DSV4_HC_PRE/COMB/POST and LIGHTNING_INDEXER have a SYCL arm in both the executor switch and
+    # supports_op, supports_op asks the one predicate each executor asserts, and the op sources allocate nothing
+    # and never block the host. Numbers: test-sycl-dsv4-hc-kernels (host) and test-backend-ops (device).
+    # --self-test: the allocation and host-wait checks are absence-based and pass on a tree that never had them.
+    add_test(NAME sycl-dsv4-ops-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-dsv4-ops-source.py
+            --self-test)
+    set_tests_properties(sycl-dsv4-ops-source PROPERTIES LABELS "sycl;dsv4;host;source-contract;python")
     # llama.cpp-qhfp: a recorded graph must not read a host-resident input, so every recorder (full graph, dense
     # split, MoE block graphlets, MoE segments) declines to record or replay when the input pre-stage fails, and a
     # view of an INPUT counts as that input. --self-test: the flag-only, swallowed-failure and statement-form
@@ -1848,6 +1856,37 @@ set_tests_properties(sycl-kv-slice-sizing PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     LABELS "sycl;kv;sizing;hostonly"
     TIMEOUT 60
+)
+
+# DSV4_HC_PRE/COMB/POST and LIGHTNING_INDEXER kernels against an independent double-precision oracle
+# (llama.cpp-pmzl). Host-only: the kernels run on the opencl:cpu device, so no GPU, no model and no unified
+# cache is touched. The kernels are header-only (dsv4-hc-kernels.hpp, lightning-indexer-kernel.hpp) and the test
+# compiles the SAME headers dsv4-hc.cpp / lightning-indexer.cpp launch; it links ggml-base only, for the
+# reference quantizers that build the indexer's K. -fsycl without an AOT target list: the device image is JIT
+# compiled for opencl:cpu. Pinned to opencl:cpu so an unpinned ctest never enumerates the iGPU.
+add_executable(test-sycl-dsv4-hc-kernels
+    tests/test-dsv4-hc-kernels.cpp
+)
+target_include_directories(test-sycl-dsv4-hc-kernels PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-sycl-dsv4-hc-kernels PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-dsv4-hc-kernels PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_libraries(test-sycl-dsv4-hc-kernels PRIVATE ggml-base)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-dsv4-hc-kernels PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-sycl-dsv4-hc-kernels PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-dsv4-hc-kernels COMMAND test-sycl-dsv4-hc-kernels)
+set_tests_properties(sycl-dsv4-hc-kernels PROPERTIES
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # exits 77 when no opencl:cpu device is visible; without this ctest renders the skip as FAILED
+    SKIP_RETURN_CODE 77
+    LABELS "sycl;dsv4;hostonly"
+    TIMEOUT 300
 )
 
 # llama.cpp-3aos: per-layer KV sizing (placement_kv_info::kv_bytes_for_layer(),

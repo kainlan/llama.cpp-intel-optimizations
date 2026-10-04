@@ -9599,6 +9599,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
+    // Qwen3.8-Flash-Next (qwen4exp): n_embd 2560, 4 streams, one decode token and a short prefill
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 1, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 37, true));
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
@@ -9610,6 +9613,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 37, true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
