@@ -189,7 +189,8 @@ void test_message_names_what_fits() {
     snprintf(pct, sizeof(pct), "GGML_SYCL_VRAM_BUDGET_PCT=%d", adv.budget_pct);
     check(contains(msg, pct), "names the computed budget pct");
     check(contains(msg, "device 0"), "names the device");
-    check(contains(msg, "host-pinned fallback did not place it either"), "says the host fallback did not place it");
+    check(contains(msg, "No host-pinned fallback placed it either"),
+          "says no host fallback placed it, without claiming one was tried");
     check(contains(msg, "over PCIe"), "says why host memory is no remedy, in plain words");
     check(!contains(msg, "executor") && !contains(msg, "placement decides"), "no internal jargon");
     check(!contains(msg, "-c "), "never advises a smaller context");
@@ -204,14 +205,14 @@ void test_message_says_what_happened_to_the_host_fallback() {
     check(contains(msg, "host-pinned fallback was tried and refused"), "names the refused fallback");
     check(contains(msg, "misaligned"), "says why it was refused");
     check(contains(msg, "over PCIe"), "still says host memory is no remedy");
-    check(!contains(msg, "did not place it either"), "does not also claim it was merely not placed");
+    check(!contains(msg, "placed it either"), "does not also claim it was merely not placed");
     check(!contains(msg, "It is not placed in host memory"), "never says the allocator refuses host memory by policy");
 }
 
 void test_message_for_a_buffer_not_shaped_by_ub() {
     printf("message: a buffer not shaped by -ub (n_ubatch 0) names no -ub and no -ub advice\n");
-    compute_refusal_inputs in = incident();
-    in.n_ubatch               = 0;
+    compute_refusal_inputs in        = incident();
+    in.n_ubatch                      = 0;
     const compute_refusal_advice adv = ggml_sycl::compute_refusal_advise(in);
     const std::string            msg = ggml_sycl::compute_refusal_message(in, adv);
     check(adv.largest_ub == 0, "no -ub is named");
@@ -227,7 +228,8 @@ void test_largest_ub_survives_a_huge_ub() {
     in.n_ubatch               = 0xF0000000u;
     in.request                = 1;
     in.raw_free               = 64ull * 1024ull * kMiB;
-    check(ggml_sycl::compute_refusal_largest_ub(in) == 0x80000000u, "a huge -ub names the largest power of two below it");
+    check(ggml_sycl::compute_refusal_largest_ub(in) == 0x80000000u,
+          "a huge -ub names the largest power of two below it");
 }
 
 void test_message_when_nothing_fits() {

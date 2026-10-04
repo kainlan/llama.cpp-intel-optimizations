@@ -170,7 +170,7 @@ inline std::string compute_refusal_message(const compute_refusal_inputs & in, co
             "host memory would run its compute over PCIe, so it is not a remedy";
     } else {
         msg +=
-            "The host-pinned fallback did not place it either; a device compute buffer in host memory would run its "
+            "No host-pinned fallback placed it either; a device compute buffer in host memory would run its "
             "compute over PCIe, so it is not a remedy";
     }
     if (in.n_ubatch != 0) {

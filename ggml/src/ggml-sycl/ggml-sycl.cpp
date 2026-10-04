@@ -17117,11 +17117,23 @@ static std::atomic<size_t> g_compute_placement_refused_bytes[GGML_SYCL_MAX_DEVIC
 // allocation no tier made at all; the refusal text says which.
 static std::atomic<bool> g_compute_placement_host_pinned_refused[GGML_SYCL_MAX_DEVICES] = {};
 
+// The thread that wrote each device's record (0: none). The compute scope opens on every decode allocation too, on any
+// thread, so a scope entry may clear only the records its own thread wrote: another thread's pending advice, on another
+// device, must survive it.
+static std::atomic<uint64_t> g_compute_placement_refused_writer[GGML_SYCL_MAX_DEVICES] = {};
+
+static uint64_t ggml_sycl_this_thread_token() {
+    static std::atomic<uint64_t> next{ 1 };
+    thread_local const uint64_t  token = next.fetch_add(1, std::memory_order_relaxed);
+    return token;
+}
+
 // Records the refusal (and that it was not, until told otherwise, a refused host-pinned fallback).
 static void ggml_sycl_note_compute_placement_refusal(int device, size_t size) {
     if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
         g_compute_placement_refused_bytes[device].store(size, std::memory_order_relaxed);
         g_compute_placement_host_pinned_refused[device].store(false, std::memory_order_relaxed);
+        g_compute_placement_refused_writer[device].store(ggml_sycl_this_thread_token(), std::memory_order_release);
     }
 }
 
@@ -17131,10 +17143,15 @@ static void ggml_sycl_note_compute_placement_host_pinned_refusal(int device) {
     }
 }
 
+// Clears the records the calling thread wrote and no one else's.
 static void ggml_sycl_clear_compute_placement_refusals() {
+    const uint64_t token = ggml_sycl_this_thread_token();
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
-        g_compute_placement_refused_bytes[d].store(0, std::memory_order_relaxed);
-        g_compute_placement_host_pinned_refused[d].store(false, std::memory_order_relaxed);
+        uint64_t expected = token;
+        if (g_compute_placement_refused_writer[d].compare_exchange_strong(expected, 0, std::memory_order_acq_rel)) {
+            g_compute_placement_refused_bytes[d].store(0, std::memory_order_relaxed);
+            g_compute_placement_host_pinned_refused[d].store(false, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -17545,15 +17562,16 @@ size_t ggml_backend_sycl_compute_refusal_advice(ggml_backend_t backend,
     const size_t request = g_compute_placement_refused_bytes[device].exchange(0, std::memory_order_relaxed);
     const bool   host_pinned_refused =
         g_compute_placement_host_pinned_refused[device].exchange(false, std::memory_order_relaxed);
+    g_compute_placement_refused_writer[device].store(0, std::memory_order_relaxed);
     if (request == 0) {
         return 0;
     }
     ggml_sycl::compute_refusal_inputs in;
+    in.device              = device;
+    in.n_ubatch            = n_ubatch;
+    in.request             = request;
+    in.headroom_target     = kSyclArenaMinExternalHeadroomBytes;
     in.host_pinned_refused = host_pinned_refused;
-    in.device          = device;
-    in.n_ubatch        = n_ubatch;
-    in.request         = request;
-    in.headroom_target = kSyclArenaMinExternalHeadroomBytes;
     size_t free_mem = 0, total_mem = 0;
     ggml_backend_sycl_get_device_memory(device, &free_mem, &total_mem);
     if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
@@ -19288,6 +19306,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // llama.cpp-mmi1: a refusal recorded before this publish belongs to the previous configuration.
     g_compute_placement_refused_bytes[ctx->device].store(0, std::memory_order_relaxed);
     g_compute_placement_host_pinned_refused[ctx->device].store(false, std::memory_order_relaxed);
+    g_compute_placement_refused_writer[ctx->device].store(0, std::memory_order_relaxed);
     // llama.cpp-tsfl round 4 Q4: no `if (out) { ... }` fill here -- this is
     // the PUBLISH path's own success tail, reached only when probe_mode is
     // false, and the publishing wrapper always passes out=nullptr. Every

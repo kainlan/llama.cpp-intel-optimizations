@@ -113,6 +113,17 @@ def violations_record(cpp: str) -> list[str]:
     txn = bounded(code, TXN_START, TXN_END)
     if not re.search(r"g_compute_placement_refused_bytes\[ctx->device\]\.store\(0", txn):
         found.append("the runtime-context transaction does not clear the refused-request record where it publishes")
+    if not re.search(r"static std::atomic<uint64_t>\s+g_compute_placement_refused_writer\[GGML_SYCL_MAX_DEVICES\]", code):
+        found.append("each refused-request record must carry the token of the thread that wrote it")
+    note = norm(bounded(code, "static void ggml_sycl_note_compute_placement_refusal(", "\n}\n"))
+    if "g_compute_placement_refused_writer[device].store(" not in note or "ggml_sycl_this_thread_token()" not in note:
+        found.append("the note must stamp the record with the writing thread's token")
+    clear = norm(bounded(code, "static void ggml_sycl_clear_compute_placement_refusals() {", "\n}\n"))
+    if "ggml_sycl_this_thread_token()" not in clear or "compare_exchange" not in clear:
+        found.append(
+            "clearing at scope entry must touch only the records THIS thread wrote: the scope opens on every decode "
+            "alloc too, and another thread's pending advice on another device must survive it"
+        )
     scope = norm(bounded(code, "void ggml_backend_sycl_compute_alloc_scope(bool enter) {", "\n}\n"))
     if "ggml_sycl_clear_compute_placement_refusals(" not in scope or "compute_alloc_scope_active()" not in scope:
         found.append(
@@ -128,7 +139,7 @@ def test_the_allocator_records_a_refused_compute_buffer():
 
 @pytest.mark.parametrize(
     "mutation",
-    ["no-record", "ungated", "no-reset", "single-note"],
+    ["no-record", "ungated", "no-reset", "single-note", "clear-all", "unstamped"],
 )
 def test_record_has_a_mutation_witness(mutation):
     src = GGML_SYCL_CPP
@@ -138,6 +149,10 @@ def test_record_has_a_mutation_witness(mutation):
         mutated = src.replace("ggml_sycl_compute_alloc_scope_active()", "true")
     elif mutation == "no-reset":
         mutated = re.sub(r"g_compute_placement_refused_bytes\[ctx->device\]\.store\(0[^;]*;", "", src)
+    elif mutation == "clear-all":
+        mutated = src.replace("compare_exchange_strong", "exchange_all")
+    elif mutation == "unstamped":
+        mutated = src.replace("g_compute_placement_refused_writer[device].store(", "g_compute_placement_refused_x[device].store(")
     else:
         mutated = src.replace("ggml_sycl_note_compute_placement_refusal(buft_ctx->device, size);", "", 1)
     assert mutated != src, f"mutation {mutation} did not change the source"
