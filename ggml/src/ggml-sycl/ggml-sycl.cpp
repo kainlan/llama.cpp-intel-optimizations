@@ -13629,22 +13629,123 @@ size_t ggml_sycl::host_mem_proc_kb_bytes(const char * path, const char * key) {
     return 0;
 }
 
-void ggml_sycl_log_host_mem(const char * phase) {
+// One pass over /proc/meminfo: key -> bytes.
+static std::map<std::string, size_t> ggml_sycl_host_mem_meminfo() {
+    std::map<std::string, size_t> out;
+    std::ifstream                 f("/proc/meminfo");
+    std::string                   line;
+    while (std::getline(f, line)) {
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        out[line.substr(0, colon)] = static_cast<size_t>(std::strtoull(line.c_str() + colon + 1, nullptr, 10)) * 1024ull;
+    }
+    return out;
+}
+
+// The biggest anonymous mappings of this process by resident size, from
+// /proc/self/smaps. A few giant mappings point at one oversized buffer; many
+// ~64 MB ones are per-thread malloc arenas. Either way it names the SHAPE of
+// the growth when the owner is not in the ledger.
+static std::string ggml_sycl_host_mem_top_anon_mappings(size_t * n_big_out, size_t * big_rss_out) {
+    struct mapping {
+        size_t      rss;
+        size_t      size;
+        std::string desc;
+    };
+    constexpr size_t big_threshold = 64ull * 1024 * 1024;
+    std::vector<mapping> top;
+    std::ifstream        f("/proc/self/smaps");
+    std::string          line;
+    mapping              cur{ 0, 0, std::string() };
+    bool                 cur_anon = false;
+    size_t               n_big    = 0;
+    size_t               big_rss  = 0;
+    auto                 flush    = [&]() {
+        if (cur_anon && cur.rss > 0) {
+            if (cur.rss >= big_threshold) {
+                n_big++;
+                big_rss += cur.rss;
+            }
+            top.push_back(cur);
+            std::sort(top.begin(), top.end(), [](const mapping & a, const mapping & b) { return a.rss > b.rss; });
+            if (top.size() > 6) {
+                top.pop_back();
+            }
+        }
+    };
+    while (std::getline(f, line)) {
+        unsigned long long lo = 0, hi = 0, off = 0, inode = 0;
+        char               perms[8] = { 0 };
+        char               dev[16]  = { 0 };
+        int                consumed = 0;
+        if (std::sscanf(line.c_str(), "%llx-%llx %7s %llx %15s %llu%n", &lo, &hi, perms, &off, dev, &inode,
+                        &consumed) == 6) {
+            flush();
+            std::string name = consumed > 0 && static_cast<size_t>(consumed) < line.size() ? line.substr(consumed) : "";
+            const size_t first = name.find_first_not_of(' ');
+            name               = first == std::string::npos ? "" : name.substr(first);
+            cur                = mapping{ 0, static_cast<size_t>(hi - lo), std::string(perms) + " " + name };
+            cur_anon           = inode == 0;
+        } else if (line.compare(0, 4, "Rss:") == 0) {
+            cur.rss = static_cast<size_t>(std::strtoull(line.c_str() + 4, nullptr, 10)) * 1024ull;
+        }
+    }
+    flush();
+    constexpr double gb = 1024.0 * 1024.0 * 1024.0;
+    std::string      out;
+    char             buf[128];
+    for (const mapping & m : top) {
+        std::snprintf(buf, sizeof(buf), " %.2f/%.2f GB %s;", m.rss / gb, m.size / gb, m.desc.c_str());
+        out += buf;
+    }
+    *n_big_out   = n_big;
+    *big_rss_out = big_rss;
+    return out;
+}
+
+bool ggml_sycl_log_host_mem(const char * phase, int min_interval_s) {
+    if (min_interval_s > 0) {
+        // First call always logs; later ones at most once per min_interval_s.
+        static std::atomic<int64_t> last_ns{ 0 };
+        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+        int64_t prev = last_ns.load(std::memory_order_relaxed);
+        if (prev != 0 && now - prev < static_cast<int64_t>(min_interval_s) * 1000000000ll) {
+            return false;
+        }
+        if (!last_ns.compare_exchange_strong(prev, now, std::memory_order_relaxed)) {
+            return false;
+        }
+    }
+
     constexpr double gb = 1024.0 * 1024.0 * 1024.0;
 
     const size_t rss_anon  = ggml_sycl::host_mem_proc_kb_bytes("/proc/self/status", "RssAnon");
     const size_t rss_file  = ggml_sycl::host_mem_proc_kb_bytes("/proc/self/status", "RssFile");
     const size_t rss_shmem = ggml_sycl::host_mem_proc_kb_bytes("/proc/self/status", "RssShmem");
-    const size_t sys_shmem = ggml_sycl::host_mem_proc_kb_bytes("/proc/meminfo", "Shmem");
-    const size_t sys_avail = ggml_sycl::host_mem_proc_kb_bytes("/proc/meminfo", "MemAvailable");
 
-    // Bytes live in glibc malloc: the CPU model buffers (large allocations are
-    // mmap'd, so hblkhd) plus every std::vector/std::string in the process.
-    size_t malloc_inuse = 0;
+    auto         mi = ggml_sycl_host_mem_meminfo();
+    const size_t sys_avail = mi["MemAvailable"];
+    // Pages that belong to none of the userspace categories below: the driver's
+    // pinned/system buffer objects (the pinned pool lives here, NOT in RssAnon).
+    const size_t sys_listed = mi["MemFree"] + mi["Buffers"] + mi["Cached"] + mi["AnonPages"] + mi["Slab"] +
+                              mi["KernelStack"] + mi["PageTables"] + mi["Percpu"];
+    const double sys_kernel_other = (static_cast<double>(mi["MemTotal"]) - static_cast<double>(sys_listed)) / gb;
+
+    // glibc malloc: in-use bytes in arenas (uordblks), free-but-retained arena
+    // bytes (fordblks), and mmap'd chunks (hblkhd, which is where a big
+    // posix_memalign such as a CPU model buffer lands).
+    size_t malloc_inuse = 0, malloc_free = 0, malloc_mmapped = 0, malloc_n_mmapped = 0;
 #if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
     {
-        const struct mallinfo2 mi = mallinfo2();
-        malloc_inuse              = mi.uordblks + mi.hblkhd;
+        const struct mallinfo2 m = mallinfo2();
+        malloc_inuse             = m.uordblks;
+        malloc_free              = m.fordblks;
+        malloc_mmapped           = m.hblkhd;
+        malloc_n_mmapped         = m.hblks;
     }
 #endif
 
@@ -13669,24 +13770,31 @@ void ggml_sycl_log_host_mem(const char * phase) {
         zones += "}";
     }
 
+    size_t            n_big = 0, big_rss = 0;
+    const std::string top   = ggml_sycl_host_mem_top_anon_mappings(&n_big, &big_rss);
+
     const ggml_sycl::host_mem_ledger & led = ggml_sycl::host_mem_ledger_get();
 
-    // Pinned-pool chunks are counted in RssAnon, glibc-malloc'd bytes are too:
-    // what is left is driver / oneDNN / thread stacks. A large value here means a
-    // consumer this breakdown does not know about.
-    const double residual = (static_cast<double>(rss_anon) - static_cast<double>(pool_committed) -
-                             static_cast<double>(malloc_inuse)) / gb;
+    // RssAnon counts malloc'd memory (in use, free-retained, mmapped) but NOT the
+    // pinned pool: the pool's pages are driver-owned and show up only in
+    // sys_kernel_other and MemAvailable. So the process-side residual compares
+    // RssAnon with glibc's own total, and the pool is reported separately.
+    const double malloc_total = static_cast<double>(malloc_inuse + malloc_free + malloc_mmapped);
+    const double residual     = (static_cast<double>(rss_anon) - malloc_total) / gb;
 
     GGML_LOG_WARN(
-        "[HOSTMEM] phase=%s rss_anon=%.2f rss_file=%.2f rss_shmem=%.2f GB; system Shmem=%.2f MemAvailable=%.2f GB; "
-        "malloc_inuse=%.2f GB (CPU model buffers + heap); pinned_pool=%.2f GB zones(used/cap GB):%s; "
-        "ledger sycl_host_buffers=%.2f host_expert_copy=%.2f host_dense_copy=%.2f GB; "
-        "residual=rss_anon-pool-malloc=%.2f GB\n",
-        phase ? phase : "?", rss_anon / gb, rss_file / gb, rss_shmem / gb, sys_shmem / gb, sys_avail / gb,
-        malloc_inuse / gb, pool_committed / gb, zones.c_str(),
-        led.sycl_host_buffer_bytes.load(std::memory_order_relaxed) / gb,
+        "[HOSTMEM] phase=%s | process: rss_anon=%.2f rss_file=%.2f rss_shmem=%.2f GB; malloc inuse=%.2f free_retained=%.2f "
+        "mmapped=%.2f (%zu chunks) GB; process_residual=rss_anon-malloc_total=%.2f GB | anon mappings >=64MB: %zu "
+        "totalling %.2f GB, top by RSS (rss/size perms name):%s | pinned pool (not in RssAnon): %.2f GB zones(used/cap "
+        "GB):%s | ledger: sycl_host_buffers=%.2f host_expert_copy=%.2f host_dense_copy=%.2f GB | system: "
+        "MemAvailable=%.2f Shmem=%.2f AnonPages=%.2f Cached=%.2f Slab=%.2f kernel_other(driver BOs)=%.2f GB\n",
+        phase ? phase : "?", rss_anon / gb, rss_file / gb, rss_shmem / gb, malloc_inuse / gb, malloc_free / gb,
+        malloc_mmapped / gb, malloc_n_mmapped, residual, n_big, big_rss / gb, top.c_str(), pool_committed / gb,
+        zones.c_str(), led.sycl_host_buffer_bytes.load(std::memory_order_relaxed) / gb,
         led.host_expert_copy_bytes.load(std::memory_order_relaxed) / gb,
-        led.host_dense_copy_bytes.load(std::memory_order_relaxed) / gb, residual);
+        led.host_dense_copy_bytes.load(std::memory_order_relaxed) / gb, sys_avail / gb, mi["Shmem"] / gb,
+        mi["AnonPages"] / gb, mi["Cached"] / gb, mi["Slab"] / gb, sys_kernel_other);
+    return true;
 }
 
 bool ggml_backend_sycl_weights_evictable(void) {
@@ -107220,6 +107328,17 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
                     sycl_ctx ? sycl_ctx->device : -1);
     // One token per call: the decline memo counts a signature once per token however many recorders ask.
     ++sycl_ctx->graph_compute_seq;
+    {
+        // [HOSTMEM] at graph_compute call 1, 2, 4, 8, ...: ggml_backend_sched calls this once per
+        // SYCL split, so the power-of-two ladder localizes first-compute host growth (the load-end
+        // and PP->TG lines bracket it too coarsely) in at most ~17 lines per run.
+        static std::atomic<uint64_t> hostmem_call_seq{ 0 };
+        const uint64_t               n_call = hostmem_call_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n_call & (n_call - 1)) == 0) {
+            std::string phase = "graph-compute-call-" + std::to_string(n_call);
+            ggml_sycl_log_host_mem(phase.c_str());
+        }
+    }
     const bool offload_stats_active = ggml_sycl::offload_stats_enabled();
     if (offload_stats_active) {
         ggml_sycl::offload_stats_reset();
@@ -108381,7 +108500,11 @@ normal_dispatch:
     }
 
     if (refresh_moe_after_pp) {
-        ggml_sycl_log_host_mem("pp-to-tg-before-refresh");
+        // The refresh fires whenever a split without MUL_MAT precedes a MUL_MAT split
+        // (ggml_sycl_graph_is_decode), about four times per token; log the first and
+        // then one per 30 s. Whether the refresh itself should be once-only is a
+        // separate question this diagnostic does not change.
+        const bool hostmem_logged = ggml_sycl_log_host_mem("pp-to-tg-before-refresh", 30);
         if (ggml_sycl_materialize_moe_down_i8_hotset(*sycl_ctx, cgraph) > 0) {
             sycl_ctx->invalidate_moe_phase_layout_cache();
         }
@@ -108394,7 +108517,9 @@ normal_dispatch:
         } else {
             GGML_LOG_INFO("[SYCL-GRAPH] PP→TG refreshed MoE planned residency before direct TG\n");
         }
-        ggml_sycl_log_host_mem("pp-to-tg-after-refresh");
+        if (hostmem_logged) {
+            ggml_sycl_log_host_mem("pp-to-tg-after-refresh");
+        }
     }
 
     const int descriptor_moe_graph_candidates =

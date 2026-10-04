@@ -40,5 +40,7 @@ size_t host_mem_proc_kb_bytes(const char * path, const char * key);
 }  // namespace ggml_sycl
 
 // Prints one `[HOSTMEM] <phase> ...` WARN line. Safe at any phase; reads only
-// process counters and the pinned pool.
-void ggml_sycl_log_host_mem(const char * phase);
+// process counters and the pinned pool. With min_interval_s > 0 the line is
+// rate-limited to the first call plus one per interval (shared by every caller
+// that passes a non-zero interval); returns whether it logged.
+bool ggml_sycl_log_host_mem(const char * phase, int min_interval_s = 0);
