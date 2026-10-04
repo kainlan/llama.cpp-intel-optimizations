@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
+#include "llama-lazy-mode.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
@@ -2293,13 +2294,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
     if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
+        std::vector<llama_lazy_device_caps> lazy_caps;
+        lazy_caps.reserve(devices.size());
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev.dev, &props);
-            if (!props.caps.mmap_support) {
-                ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
-                break;
-            }
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+            const bool planner_owns_placement = llama_model_dev_is_sycl(dev.dev);
+#else
+            const bool planner_owns_placement = false;
+#endif
+            lazy_caps.push_back({ props.caps.mmap_support, planner_owns_placement });
+        }
+        if (!llama_lazy_auto_enabled(lazy_caps.data(), lazy_caps.size())) {
+            ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
         }
     }
 
