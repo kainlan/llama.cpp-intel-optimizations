@@ -3495,6 +3495,9 @@ target_compile_definitions(test-sycl-kv-planned-device-materialization PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     GGML_SYCL_PRIVATE_TESTING=1
+    # The test body sits behind #if defined(GGML_USE_SYCL); without this the
+    # whole body compiled out and the binary exited 0 without running anything.
+    GGML_USE_SYCL=1
 )
 target_link_libraries(test-sycl-kv-planned-device-materialization PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-sycl-kv-planned-device-materialization COMMAND test-sycl-kv-planned-device-materialization)
@@ -3504,6 +3507,9 @@ add_test(NAME test-sycl-kv-planned-device-materialization COMMAND test-sycl-kv-p
 set_tests_properties(test-sycl-kv-planned-device-materialization PROPERTIES
     LABELS "sycl;kv;hostonly;tdd;0igs-batch1"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # Every skip path (no SYCL build, fewer than two devices) exits 77 so it
+    # reads as a skip, not a pass.
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 endif() # static SYCL backend fixture

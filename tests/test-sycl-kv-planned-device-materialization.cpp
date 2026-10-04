@@ -18,8 +18,8 @@
 
 #if !defined(GGML_USE_SYCL)
 int main() {
-    fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
-    return 0;
+    fprintf(stderr, "SKIP: GGML_USE_SYCL not enabled; this run proves nothing.\n");
+    return 77;
 }
 #else
 
@@ -40,7 +40,7 @@ int main(int, char ** argv) {
     const int physical_devices = ggml_sycl::test_physical_device_count();
     if (physical_devices < 2) {
         printf("SKIP: need at least two physical SYCL devices, got %d\n", physical_devices);
-        return 0;
+        return 77;
     }
 
     ggml_sycl::unified_cache * cache0 = ggml_sycl::get_unified_cache_for_device(0);
