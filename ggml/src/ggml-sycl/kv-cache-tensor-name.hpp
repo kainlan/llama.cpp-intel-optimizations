@@ -35,7 +35,8 @@ inline int kv_cache_tensor_layer_id(const char * name) {
     while (digits_begin > prefix_len && name[digits_begin - 1] >= '0' && name[digits_begin - 1] <= '9') {
         digits_begin--;
     }
-    // need at least one digit, then "_l", then the k/v letter, all after "cache_"
+    // At least one digit, and room before it for the k/v letter, '_' and 'l' (three chars) that sit at or
+    // after the end of "cache_": the bound keeps the look-behind reads below out of the prefix.
     if (digits_begin == len || digits_begin < prefix_len + 3) {
         return -1;
     }

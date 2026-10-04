@@ -49,8 +49,10 @@ int main() {
     expect_layer("cache_r_l3", -1);   // recurrent state, not attention KV
     expect_layer("cache_s_l3", -1);
     expect_layer("cache_ple_r_l3", -1);
-    expect_layer("cache_k3", -1);   // no "_l"
-    expect_layer("cachek_l3", -1);  // no "cache_" prefix
+    expect_layer("cache_k3", -1);      // no "_l"
+    expect_layer("cache_kxl3", -1);    // 'l' preceded by something other than '_'
+    expect_layer("cache_k_l_l4", -1);  // "_l" is there but the letter before it is 'l', not k/v
+    expect_layer("cachek_l3", -1);     // no "cache_" prefix
     expect_layer("xcache_k_l3", -1);
     expect_layer("k_l3", -1);
     expect_layer("blk.3.attn_k.weight", -1);

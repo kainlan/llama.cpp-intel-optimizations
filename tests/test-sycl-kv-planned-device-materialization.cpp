@@ -145,6 +145,11 @@ int main(int, char ** argv) {
                 "cache_idx_v_l1 allocation failed");
     TEST_ASSERT(idx0->data != tag_base, "cache_idx_k_l0 must be remapped off the synthetic alloc_base span");
     TEST_ASSERT(idx1->data != tag_base + layer_bytes, "cache_idx_v_l1 must be remapped off the synthetic span");
+    TEST_ASSERT(idx0->extra != nullptr, "cache_idx_k_l0 extra must be populated");
+    auto * idx0_extra = static_cast<ggml_tensor_extra_gpu *>(idx0->extra);
+    auto   idx0_dev0  = idx0_extra->data_handle[0].resolve();
+    TEST_ASSERT(idx0_dev0 && idx0_dev0.on_device && idx0_dev0.ptr == idx0->data,
+                "cache_idx_k_l0 must resolve to the planned device-0 allocation");
     TEST_ASSERT(idx1->extra != nullptr, "cache_idx_v_l1 extra must be populated");
     auto * idx1_extra = static_cast<ggml_tensor_extra_gpu *>(idx1->extra);
     auto   idx1_dev1  = idx1_extra->data_handle[1].resolve();

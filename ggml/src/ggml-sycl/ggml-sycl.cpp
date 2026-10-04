@@ -39335,10 +39335,15 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
     // would read or write that span as if it were the layer's cache (SET_ROWS aborts on it,
     // llama.cpp-4ot7).  Fail the allocation instead of keeping the pointer, as the overflow check
     // above does.  llama_kv_cache puts only per-layer k/v base tensors here.
-    GGML_LOG_ERROR(
-        "[KV-REMAP] ERROR: %s cannot be placed: layer_id=%d has no per-layer allocation "
-        "(n_layers=%u, allocs=%zu)\n",
-        name, layer_id, ctx->n_layers, ctx->layer_allocs.size());
+    if (layer_id < 0) {
+        GGML_LOG_ERROR("[KV-REMAP] ERROR: %s is not a per-layer KV tensor name (cache_<tag>(k|v)_l<N>)\n", name);
+    } else if (static_cast<uint32_t>(layer_id) >= ctx->n_layers ||
+               static_cast<uint32_t>(layer_id) >= ctx->layer_allocs.size()) {
+        GGML_LOG_ERROR("[KV-REMAP] ERROR: %s layer_id=%d is out of range (n_layers=%u, allocs=%zu)\n", name, layer_id,
+                       ctx->n_layers, ctx->layer_allocs.size());
+    } else {
+        GGML_LOG_ERROR("[KV-REMAP] ERROR: %s layer_id=%d has no per-layer allocation (null ptr)\n", name, layer_id);
+    }
     return GGML_STATUS_ALLOC_FAILED;
 }
 
