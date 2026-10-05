@@ -49,36 +49,45 @@ class address_range_index {
     // Adds [base, base + size) owned by `key`. Returns false, changing nothing, for an empty range or a base that is
     // already present. Throws std::bad_alloc, changing nothing.
     bool insert(uintptr_t base, size_t size, void * key) {
-        if (size == 0 || contains_base(base)) {
+        if (size == 0) {
             return false;
         }
         node * n   = new node();
         n->e.base  = base;
-        n->e.end   = base + size < base ? UINTPTR_MAX : base + size;
+        n->e.end   = end_of(base, size);
         n->e.key   = key;
         n->max_end = n->e.end;
         n->prio    = next_priority();
         node * lo  = nullptr;
         node * hi  = nullptr;
-        split(root_, base, &lo, &hi);  // lo: bases < base, hi: bases >= base
+        bool   dup = false;
+        // One descent down base's search path both splits the tree and sees whether a node already has this base.
+        split(root_, base, &lo, &hi, &dup);  // lo: bases < base, hi: bases >= base
+        if (dup) {
+            root_ = merge(lo, hi);
+            delete n;
+            return false;
+        }
         root_ = merge(merge(lo, n), hi);
         count_++;
         return true;
     }
 
+    // One past the last byte of [base, base + size), clamped to UINTPTR_MAX rather than wrapped. insert() stores this,
+    // so an audit comparing a row's geometry with the index must use it too.
+    static uintptr_t end_of(uintptr_t base, size_t size) noexcept {
+        return base + size < base ? UINTPTR_MAX : base + size;
+    }
+
     // Removes the range at `base` if it is owned by `key`; a row owned by another key is left alone, so a stale erase can
     // never remove a newer row's entry.
     bool erase(uintptr_t base, void * key) noexcept {
-        node * n = root_;
-        while (n != nullptr && n->e.base != base) {
-            n = base < n->e.base ? n->left : n->right;
+        bool removed = false;
+        root_        = erase_node(root_, base, key, &removed);
+        if (removed) {
+            count_--;
         }
-        if (n == nullptr || n->e.key != key) {
-            return false;
-        }
-        root_ = erase_node(root_, base);
-        count_--;
-        return true;
+        return removed;
     }
 
     // The range with the greatest base among those containing `addr`; see PRECEDENCE above.
@@ -137,8 +146,6 @@ class address_range_index {
         return rng_;
     }
 
-    bool contains_base(uintptr_t base) const noexcept { return find_exact(base, nullptr); }
-
     static void destroy(node * n) noexcept {
         while (n != nullptr) {
             destroy(n->left);
@@ -159,19 +166,23 @@ class address_range_index {
         n->max_end = m;
     }
 
-    // Splits t into bases < base (*lo) and bases >= base (*hi).
-    static void split(node * t, uintptr_t base, node ** lo, node ** hi) noexcept {
+    // Splits t into bases < base (*lo) and bases >= base (*hi); *saw_base is set when a node has exactly that base. Such a
+    // node is always on the search path, so the split visits it.
+    static void split(node * t, uintptr_t base, node ** lo, node ** hi, bool * saw_base) noexcept {
         if (t == nullptr) {
             *lo = nullptr;
             *hi = nullptr;
             return;
         }
         if (t->e.base < base) {
-            split(t->right, base, &t->right, hi);
+            split(t->right, base, &t->right, hi, saw_base);
             *lo = t;
             update(t);
         } else {
-            split(t->left, base, lo, &t->left);
+            if (t->e.base == base) {
+                *saw_base = true;
+            }
+            split(t->left, base, lo, &t->left, saw_base);
             *hi = t;
             update(t);
         }
@@ -195,19 +206,24 @@ class address_range_index {
         return b;
     }
 
-    static node * erase_node(node * t, uintptr_t base) noexcept {
+    // Removes the node at `base` if `key` owns it; otherwise the tree is unchanged.
+    static node * erase_node(node * t, uintptr_t base, void * key, bool * removed) noexcept {
         if (t == nullptr) {
             return nullptr;
         }
         if (t->e.base == base) {
+            if (t->e.key != key) {
+                return t;
+            }
             node * merged = merge(t->left, t->right);
             delete t;
+            *removed = true;
             return merged;
         }
         if (base < t->e.base) {
-            t->left = erase_node(t->left, base);
+            t->left = erase_node(t->left, base, key, removed);
         } else {
-            t->right = erase_node(t->right, base);
+            t->right = erase_node(t->right, base, key, removed);
         }
         update(t);
         return t;

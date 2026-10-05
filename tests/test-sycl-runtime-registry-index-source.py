@@ -7,10 +7,17 @@ it, so:
 
 (A) g_runtime_alloc_registry is mutated (emplace/erase/insert/clear/extract/swap/operator[]/assignment) ONLY inside the
     runtime_registry_emplace_locked / runtime_registry_erase_locked helpers, which keep the index in step.
-(B) A registered row's handle.ptr and handle.size are never assigned through the registry (the index keeps the geometry it
-    was given at insertion).
+(B) A registered row's geometry is never rewritten through the registry (the index keeps the geometry it was given at
+    insertion): no assignment, compound assignment (+=, |=, <<= ...) or ++/-- of handle.ptr/handle.size or of the handle, no
+    whole-row assignment (`it->second = rec;`, `registry.find(p)->second = rec;`) in a function that touches the registry,
+    and no non-const reference or pointer bound to a row.
 (C) Neither registry nor index is touched from another translation unit (both are file-static in unified-cache.cpp).
 (D) The lookup consults the index and does not iterate the registry.
+
+Limits, stated so nobody mistakes the gate for a proof: it reads text, not the AST. It does not understand `#if 0`
+blocks or raw string literals, and it cannot see a row's geometry rewritten by a call (std::swap, std::exchange, memcpy)
+on a reference it did not see being bound; the read-only-use gate and the alias gate bound that to code that already
+looks wrong. Functions are split at a closing brace in column 0, which is how this file is formatted.
 
 Host-only, pure text assertions. llama_test_pytest hands this file to pytest.main(), so the checks live inside test_*()
 functions. Checks run against COMMENT-STRIPPED text, and each has a mutation witness so it is known to fail on the
@@ -57,15 +64,27 @@ HELPERS = (
 )
 # Members that only read the registry. Any other use of the registry outside the helpers (an alias, a pointer, a
 # reference handed to a function, a non-const range-for) could mutate it behind the index's back.
-READ_MEMBER_RE = re.compile(r"\s*\.\s*(?:find|end|begin|cbegin|cend|size|empty|count|contains|at)\b")
+# `at` is deliberately absent: it returns a mutable reference and a read can always be spelled find.
+READ_MEMBER_RE = re.compile(
+    r"\s*\.\s*(?:find|end|begin|cbegin|cend|crbegin|crend|size|max_size|empty|count|contains|equal_range|bucket_count"
+    r"|load_factor|max_load_factor)\b"
+)
 CONST_RANGE_FOR_RE = re.compile(r"const\s+auto\s*&\s*\w+\s*:\s*$")
 # A non-const reference or pointer bound to a registry row (`auto & rec = it->second;`), through which a row's geometry
 # could be rewritten. Only looked for in functions that touch the registry.
 ROW_ALIAS_RE = re.compile(
     r"(?<!const )(?<!const\t)\b(?:auto|alloc_metadata|runtime_alloc_record)\s*(?:&&?|\*)\s*\w+\s*(?:=|\{|\()[^;{}]*\bsecond\b"
 )
-# A row's identity or geometry assigned through an iterator/reference into the registry.
-GEOMETRY_WRITE_RE = re.compile(r"(?:->|\.)second\s*\.\s*handle\s*(?:\.\s*(?:ptr|size)\s*)?=[^=]")
+_ASSIGN = r"(?:(?:[-+*/%|&^]|<<|>>)?=(?!=)|\+\+|--)"  # =, op=, ++, -- ; not ==, <=, >=, !=
+# A row's identity or geometry written through an iterator/reference into the registry: `second.handle = x`,
+# `second.handle.size += n`, `second.handle.ptr++`, `++second.handle.size`.
+GEOMETRY_WRITE_RE = re.compile(
+    r"(?:->|\.)second\s*\.\s*handle\s*(?:\.\s*(?:ptr|size)\s*)?" + _ASSIGN
+    + r"|(?:\+\+|--)\s*[\w.>()\-]*?(?:->|\.)second\s*\.\s*handle\s*\.\s*(?:ptr|size)\b"
+)
+# A whole row written through an iterator/reference: `it->second = rec;`, `registry.find(p)->second = rec;`. Looked for
+# only in functions that touch the registry, because other maps in the file have a `second` too.
+ROW_WRITE_RE = re.compile(r"(?:->|\.)second\s*" + _ASSIGN)
 
 
 def function_span(code: str, signature: str):
@@ -105,17 +124,26 @@ def registry_uses_that_are_not_reads(code: str):
     return bad
 
 
-def row_aliases_in_registry_functions(code: str):
-    """A non-const reference/pointer to a registry row, in a function that uses the registry."""
+def registry_function_scan(code: str, pattern):
+    """Matches of `pattern` inside functions that mention the registry; (line, text)."""
     bad = []
     pos = 0
     for end in re.finditer(r"\n}\n", code):
         body = code[pos : end.end()]
         if "g_runtime_alloc_registry" in body:
-            for m in ROW_ALIAS_RE.finditer(body):
+            for m in pattern.finditer(body):
                 bad.append((code.count("\n", 0, pos + m.start()) + 1, m.group(0)[:70]))
         pos = end.end()
     return bad
+
+
+def row_aliases_in_registry_functions(code: str):
+    """A non-const reference/pointer to a registry row, in a function that uses the registry."""
+    return registry_function_scan(code, ROW_ALIAS_RE)
+
+
+def whole_row_writes_in_registry_functions(code: str):
+    return registry_function_scan(code, ROW_WRITE_RE)
 
 
 def geometry_writes(code: str):
@@ -188,6 +216,7 @@ def test_every_registry_use_outside_the_helpers_is_a_read():
         "drop_rows(g_runtime_alloc_registry);",
         "for (auto & kv : g_runtime_alloc_registry) { kv.second.handle.size = 0; }",
         "g_runtime_alloc_registry.erase(it);",
+        "g_runtime_alloc_registry.at(p) = rec;",
     ],
 )
 def test_use_gate_has_a_witness(line):
@@ -201,6 +230,9 @@ def test_use_gate_has_a_witness(line):
         "for (const auto & kv : g_runtime_alloc_registry) { use(kv); }",
         "if (a == g_runtime_alloc_registry.end()) return;",
         "return g_runtime_alloc_registry.size() + g_runtime_alloc_registry . count(p);",
+        "auto r = g_runtime_alloc_registry.equal_range(p); return g_runtime_alloc_registry.bucket_count();",
+        "return g_runtime_alloc_registry.load_factor() + g_runtime_alloc_registry.max_size();",
+        "auto it = g_runtime_alloc_registry.crbegin(); auto jt = g_runtime_alloc_registry.crend();",
     ],
 )
 def test_use_gate_allows_reads(line):
@@ -258,15 +290,84 @@ def test_registered_row_geometry_is_never_rewritten():
         "it->second.handle.size = 4;",
         "it->second.handle.ptr = nullptr;",
         "found->second.handle = other;",
+        "it->second.handle.size += n;",
+        "it->second.handle.size -= n;",
+        "it->second.handle.size |= 1;",
+        "it->second.handle.size <<= 1;",
+        "it->second.handle.size >>= 1;",
+        "it->second.handle.ptr &= ~0xfull;",
+        "it->second.handle.size *= 2;",
+        "it->second.handle.size /= 2;",
+        "it->second.handle.size %= 7;",
+        "it->second.handle.size ^= 1;",
+        "it->second.handle.size++;",
+        "it->second.handle.size--;",
+        "++it->second.handle.size;",
+        "--it->second.handle.ptr;",
+        "++g_runtime_alloc_registry.find(p)->second.handle.size;",
+        "g_runtime_alloc_registry.find(p)->second.handle.size = 0;",
     ],
 )
 def test_geometry_gate_has_a_witness(line):
     assert geometry_writes(CODE + "\nvoid f() {\n    " + line + "\n}\n"), line
 
 
-def test_geometry_gate_allows_reads_and_other_fields():
-    ok = "const auto & h = it->second.handle; it->second.state = X; it->second.handle.ptr == other;"
-    assert geometry_writes(CODE + "\nvoid f() {\n    " + ok + "\n}\n") == []
+@pytest.mark.parametrize(
+    "line",
+    [
+        "const auto & h = it->second.handle;",
+        "it->second.state = X;",
+        "it->second.handle.ptr == other;",
+        "it->second.handle.size != 0;",
+        "it->second.handle.size <= n;",
+        "it->second.handle.size >= n;",
+        "it->second.handle.size < n && it->second.handle.size > m;",
+        "it->second.handle.size == it->second.handle.size;",
+        "auto n = it->second.handle.size + 1;",
+        "it->second.release_generation += 1;",
+        "it->second.handle.alloc_id++;",
+    ],
+)
+def test_geometry_gate_allows_reads_and_other_fields(line):
+    assert geometry_writes(CODE + "\nvoid f() {\n    " + line + "\n}\n") == [], line
+
+
+def test_whole_row_writes_are_absent_from_registry_functions():
+    assert whole_row_writes_in_registry_functions(CODE) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "it->second = rec;",
+        "it->second = std::move(rec);",
+        "g_runtime_alloc_registry.find(p)->second = rec;",
+        "g_runtime_alloc_registry.begin()->second = rec;",
+        "it->second |= flags;",
+        "it->second++;",
+    ],
+)
+def test_whole_row_gate_has_a_witness(line):
+    planted = CODE + "\nvoid f() {\n    auto it = g_runtime_alloc_registry.find(p);\n    " + line + "\n}\n"
+    assert whole_row_writes_in_registry_functions(planted), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "if (it->second == rec) {}",
+        "bool b = it->second != rec;",
+        "auto copy = it->second;",
+        "use(it->second.state);",
+    ],
+)
+def test_whole_row_gate_allows_reads(line):
+    planted = CODE + "\nvoid f() {\n    auto it = g_runtime_alloc_registry.find(p);\n    " + line + "\n}\n"
+    assert whole_row_writes_in_registry_functions(planted) == [], line
+
+
+def test_whole_row_gate_ignores_functions_that_do_not_touch_the_registry():
+    assert whole_row_writes_in_registry_functions(CODE + "\nvoid f() {\n    other->second = x;\n}\n") == []
 
 
 def test_registry_and_index_stay_file_static():
@@ -284,7 +385,7 @@ def lookup_violations(body: str):
     out = []
     if "g_runtime_alloc_index.find_innermost(" not in body:
         out.append("does not consult the index")
-    if re.search(r"\bfor\s*\(", body) or "g_runtime_alloc_registry.begin()" in body:
+    if re.search(r"\b(?:for|while)\s*\([^)]*g_runtime_alloc_registry", body) or "g_runtime_alloc_registry.begin()" in body:
         out.append("iterates the registry")
     return out
 
@@ -297,12 +398,19 @@ def test_lookup_consults_the_index_and_does_not_scan():
     "body",
     [
         "for (const auto & kv : g_runtime_alloc_registry) { use(kv); }",
-        "g_runtime_alloc_index.find_innermost(a, &h); for (int i = 0; i < n; i++) {}",
+        "g_runtime_alloc_index.find_innermost(a, &h); for (auto it = g_runtime_alloc_registry.begin(); it != e; ++it) {}",
+        "g_runtime_alloc_index.find_innermost(a, &h); while (x != g_runtime_alloc_registry.end()) {}",
         "auto it = g_runtime_alloc_registry.begin();",
+        "for (int i = 0; i < n; i++) {}",
     ],
 )
 def test_lookup_gate_has_a_witness(body):
     assert lookup_violations(body), body
+
+
+def test_lookup_gate_allows_an_unrelated_loop_beside_the_index_query():
+    body = "g_runtime_alloc_index.find_innermost(a, &h); for (int i = 0; i < 3; i++) { pick(i); }"
+    assert lookup_violations(body) == []
 
 
 if __name__ == "__main__":

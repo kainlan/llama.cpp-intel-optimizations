@@ -1522,9 +1522,12 @@ static bool runtime_registry_row_indexed(const alloc_metadata & h) noexcept {
 
 // The only ways to add or remove a registry row; the caller holds g_runtime_alloc_mutex. They keep g_runtime_alloc_index
 // in step. Same contract as unordered_map::emplace: {row, true} on success, {existing row, false} when `ptr` already has
-// one. An allocation failure leaves registry and index unchanged and propagates. A row whose base another row's range
-// already starts at is refused as well ({end(), false}): two live allocations at one address is corruption, the same
-// answer runtime_registry_claim_ptr_locked gives for one pointer.
+// one. An allocation failure leaves registry and index unchanged and propagates.
+//
+// DEFENSIVE: the refusal further down, when the index already has a range starting at this row's handle.ptr, cannot
+// happen while a row's key is its handle.ptr, because the registry cannot hold two rows at one pointer. It exists so a
+// future row whose key and handle.ptr differ is refused ({end(), false}) instead of silently sharing a base with another
+// row; the answer for two live allocations at one address is the one runtime_registry_claim_ptr_locked gives.
 static std::pair<runtime_registry_iterator, bool> runtime_registry_emplace_locked(void *               ptr,
                                                                                   runtime_alloc_record rec) {
     auto inserted = g_runtime_alloc_registry.emplace(ptr, std::move(rec));
@@ -1578,8 +1581,9 @@ static void runtime_registry_assign_locked(void * ptr, const runtime_alloc_recor
     (void) published;
 }
 
-// Every registry row is indexed exactly when it qualifies, with the geometry the row carries, and the index holds nothing
-// else. O(n); for tests and audits.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Every registry row is indexed exactly when it qualifies, with the geometry the row carries (end clamped as insert
+// clamps it), and the index holds nothing else. O(n); only the test seam uses it.
 static bool runtime_registry_index_consistent_locked() noexcept {
     size_t indexed = 0;
     for (const auto & kv : g_runtime_alloc_registry) {
@@ -1590,12 +1594,13 @@ static bool runtime_registry_index_consistent_locked() noexcept {
         indexed++;
         address_range_index::entry e;
         if (!g_runtime_alloc_index.find_exact(reinterpret_cast<uintptr_t>(h.ptr), &e) || e.key != kv.first ||
-            e.end != reinterpret_cast<uintptr_t>(h.ptr) + h.size) {
+            e.end != address_range_index::end_of(reinterpret_cast<uintptr_t>(h.ptr), h.size)) {
             return false;
         }
     }
     return indexed == g_runtime_alloc_index.size() && g_runtime_alloc_index.check_invariants();
 }
+#endif
 
 static bool unified_alloc_lifetime_trace_enabled();
 
@@ -17618,6 +17623,27 @@ allocation_result allocation_registry_test_promote(
 bool allocation_registry_test_contains(void * ptr) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     return g_runtime_alloc_registry.find(ptr) != g_runtime_alloc_registry.end();
+}
+
+// llama.cpp-ii25: the registry's replace-or-insert helper, which the adopt_raw_* paths publish through: a LIVE device-VRAM
+// row of `bytes` at `ptr`, replacing any row already there. No physical allocation.
+bool allocation_registry_test_assign_raw(void * ptr, int device, size_t bytes) noexcept {
+    if (!ptr || bytes == 0) {
+        return false;
+    }
+    try {
+        runtime_alloc_record rec;
+        rec.handle.ptr               = ptr;
+        rec.handle.size              = bytes;
+        rec.handle.device            = device;
+        rec.handle.tier              = alloc_tier::DEVICE_VRAM;
+        rec.test_no_physical_release = true;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        runtime_registry_assign_locked(ptr, rec);
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool allocation_registry_test_index_consistent() noexcept {

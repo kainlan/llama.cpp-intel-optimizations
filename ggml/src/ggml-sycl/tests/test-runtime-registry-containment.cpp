@@ -7,7 +7,9 @@
 //     one, deterministically, on every call (the scan this replaced returned whichever row unordered_map iteration
 //     reached first);
 //   - the index follows every registry mutation: release/erase, a stale RELEASING row displaced by a claim, a rekey
-//     (erase then publish elsewhere), and a refused publish leaves nothing behind;
+//     (erase then publish elsewhere), the adopt paths' replace-or-insert, and a refused publish leaves nothing behind;
+//     the arena commit rollback and arena_forget_allocation_locked need a device cache, so test-unified-runtime-alloc
+//     (device test) asserts the same consistency after them;
 //   - a few thousand random rows agree with a brute-force oracle, and the index/registry consistency audit holds
 //     throughout.
 //
@@ -124,6 +126,31 @@ void test_mutations_follow() {
     check(allocation_registry_test_size() == 0 && allocation_registry_test_index_consistent(), "registry empty again");
 }
 
+// The adopt_raw_* paths publish through the replace-or-insert helper (allocation_registry_test_assign_raw).
+void test_adopt_replaces_a_row() {
+    printf("adopt (replace-or-insert):\n");
+    const uintptr_t chunk = 0x400000;
+    check(publish(chunk, 0x4000, 30), "a chunk row");
+    check(allocation_registry_test_assign_raw(at(chunk + 0x100), 31, 0x100), "adopt a row with no row at its pointer");
+    check(owner_of(chunk + 0x180) == 31 && allocation_registry_test_index_consistent(),
+          "it is a row, nested in the chunk");
+
+    const size_t rows = allocation_registry_test_size();
+    check(allocation_registry_test_assign_raw(at(chunk + 0x100), 32, 0x40), "adopt over the existing row, smaller");
+    check(allocation_registry_test_size() == rows, "still one row at that pointer");
+    check(owner_of(chunk + 0x13f) == 32 && owner_of(chunk + 0x140) == 30,
+          "the old extent is gone, the chunk answers past the new one");
+    check(allocation_registry_test_assign_raw(at(chunk + 0x100), 33, 0x400), "adopt over it again, larger");
+    check(owner_of(chunk + 0x4ff) == 33 && owner_of(chunk + 0x500) == 30, "the new, larger extent answers");
+    check(allocation_registry_test_index_consistent(), "index consistent after the replacements");
+
+    check(!allocation_registry_test_assign_raw(nullptr, 1, 16) && !allocation_registry_test_assign_raw(at(chunk), 1, 0),
+          "a null pointer or empty row is not adopted");
+    allocation_registry_test_erase(at(chunk + 0x100));
+    allocation_registry_test_erase(at(chunk));
+    check(allocation_registry_test_size() == 0 && allocation_registry_test_index_consistent(), "registry empty again");
+}
+
 void test_random_against_oracle() {
     printf("random rows vs a brute-force oracle:\n");
 
@@ -200,6 +227,7 @@ void test_random_against_oracle() {
 int main() {
     test_bounds_and_nesting();
     test_mutations_follow();
+    test_adopt_replaces_a_row();
     test_random_against_oracle();
     if (g_failures != 0) {
         printf("FAILED: %d check(s)\n", g_failures);

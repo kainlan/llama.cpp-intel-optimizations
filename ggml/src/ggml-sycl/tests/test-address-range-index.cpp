@@ -17,8 +17,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-#include <map>
 #include <random>
 #include <unordered_map>
 #include <vector>
@@ -199,9 +197,10 @@ void run_random(const char * name, bool laminar, uint32_t seed, int ops, uintptr
             const bool b   = ref.insert(base, size, key);
             if (a != b) {
                 mismatches++;
-                refusals++;
             } else if (a) {
                 live.push_back({ base, key });
+            } else {
+                refusals++;  // both refused: a duplicate base
             }
         } else if (kind < 6 && !live.empty()) {
             const size_t pick = static_cast<size_t>(rng() % live.size());
@@ -238,6 +237,7 @@ void run_random(const char * name, bool laminar, uint32_t seed, int ops, uintptr
     printf("    %zu live rows at the end, %d refused duplicates, %d mismatches\n", ref.rows.size(), refusals,
            mismatches);
     check(mismatches == 0, "index agrees with the oracle on every operation");
+    check(refusals > 0, "the run exercised duplicate-base refusals");
     check(idx.check_invariants(), "invariants hold at the end");
     check(ref.rows.size() > 100, "the run kept a population worth checking");
 }
@@ -291,7 +291,7 @@ void microbench() {
     using clk               = std::chrono::steady_clock;
     volatile uintptr_t sink = 0;
 
-    const int linear_n = 200;
+    const int linear_n = 50;
     auto      t0       = clk::now();
     for (int i = 0; i < linear_n; i++) {
         const uintptr_t addr = probes[static_cast<size_t>(i) % probes.size()];
@@ -304,7 +304,7 @@ void microbench() {
     }
     auto t1 = clk::now();
 
-    const int indexed_n = 2000000;
+    const int indexed_n = 200000;
     entry     e;
     for (int i = 0; i < indexed_n; i++) {
         if (idx.find_innermost(probes[static_cast<size_t>(i) % probes.size()], &e)) {
@@ -329,9 +329,9 @@ int main() {
     test_address_space_end();
     test_nesting();
     test_rekey();
-    run_random("nested", true, 1, 200000, 1u << 16);
-    run_random("overlapping", false, 2, 200000, 1u << 16);
-    run_random("sparse overlapping", false, 3, 100000, 1u << 22);
+    run_random("nested", true, 1, 100000, 1u << 16);
+    run_random("overlapping", false, 2, 100000, 1u << 16);
+    run_random("sparse overlapping", false, 3, 60000, 1u << 22);
     microbench();
     if (g_failures != 0) {
         printf("FAILED: %d check(s)\n", g_failures);

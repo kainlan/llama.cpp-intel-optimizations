@@ -123,11 +123,14 @@ static bool arena_registry_commit_failure_rolls_back(sycl::queue & q) {
     TEST_ASSERT(failed.ptr == nullptr, "faulted allocation returned a pointer");
     TEST_ASSERT(cache->zone_used(vram_zone_id::RUNTIME) == before,
                 "registry insertion failure leaked TLSF bytes");
+    // llama.cpp-ii25: the rolled-back row must not leave a range in the registry's containment index.
+    TEST_ASSERT(allocation_registry_test_index_consistent(), "registry rollback left the containment index out of step");
 
     alloc_handle retry{};
     TEST_ASSERT(unified_alloc(req, &retry), "allocator did not recover after publication rollback");
     TEST_ASSERT(retry.alloc_id != 0, "retry omitted exact allocation identity");
     TEST_ASSERT(unified_free(retry), "retry cleanup failed");
+    TEST_ASSERT(allocation_registry_test_index_consistent(), "freeing the arena row left the containment index out of step");
     TEST_PASS();
     return true;
 }
