@@ -24,7 +24,7 @@ struct cpu_dispatch_buffers {
     // Note: accs is reinterpreted as __m256 array. Since we only use _mm256_setzero_ps()
     // and array indexing (no aligned load/store), alignment is not critical.
 
-    cpu_dispatch_buffers() = default;
+    cpu_dispatch_buffers()                                         = default;
     cpu_dispatch_buffers(const cpu_dispatch_buffers &)             = delete;
     cpu_dispatch_buffers & operator=(const cpu_dispatch_buffers &) = delete;
 
@@ -59,6 +59,7 @@ struct cpu_dispatch_buffers {
         ggml_sycl::host_mem_ledger_get().cpu_dispatch_scratch_bytes.fetch_add(n_floats * sizeof(float),
                                                                               std::memory_order_relaxed);
     }
+
     static void ledger_sub(size_t n_floats) {
         ggml_sycl::host_mem_ledger_get().cpu_dispatch_scratch_bytes.fetch_sub(n_floats * sizeof(float),
                                                                               std::memory_order_relaxed);
