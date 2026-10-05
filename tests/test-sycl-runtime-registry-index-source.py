@@ -50,17 +50,28 @@ MUTATION_RE = re.compile(
     r"|rehash|reserve)\b|\[|=[^=])"
     r"|\bswap\s*\(\s*g_runtime_alloc_registry\b"
 )
+# Signatures as regexes: clang-format realigns the parameter list, so the whitespace between tokens must not matter.
 HELPERS = (
-    "runtime_registry_emplace_locked(void *               ptr,",
-    "runtime_registry_erase_locked(runtime_registry_iterator it) noexcept {",
+    r"runtime_registry_emplace_locked\(\s*void\s*\*\s*ptr\s*,\s*runtime_alloc_record\s+rec\s*\)\s*\{",
+    r"runtime_registry_erase_locked\(\s*runtime_registry_iterator\s+it\s*\)\s*noexcept\s*\{",
+)
+# Members that only read the registry. Any other use of the registry outside the helpers (an alias, a pointer, a
+# reference handed to a function, a non-const range-for) could mutate it behind the index's back.
+READ_MEMBER_RE = re.compile(r"\s*\.\s*(?:find|end|begin|cbegin|cend|size|empty|count|contains|at)\b")
+CONST_RANGE_FOR_RE = re.compile(r"const\s+auto\s*&\s*\w+\s*:\s*$")
+# A non-const reference or pointer bound to a registry row (`auto & rec = it->second;`), through which a row's geometry
+# could be rewritten. Only looked for in functions that touch the registry.
+ROW_ALIAS_RE = re.compile(
+    r"(?<!const )(?<!const\t)\b(?:auto|alloc_metadata|runtime_alloc_record)\s*(?:&&?|\*)\s*\w+\s*(?:=|\{|\()[^;{}]*\bsecond\b"
 )
 # A row's identity or geometry assigned through an iterator/reference into the registry.
 GEOMETRY_WRITE_RE = re.compile(r"(?:->|\.)second\s*\.\s*handle\s*(?:\.\s*(?:ptr|size)\s*)?=[^=]")
 
 
 def function_span(code: str, signature: str):
-    start = code.find(signature)
-    assert start != -1, f"{signature!r} is not defined"
+    m = re.search(signature, code)
+    assert m is not None, f"{signature!r} is not defined"
+    start = m.start()
     end = code.find("\n}\n", start)
     assert end != -1, f"could not bound {signature!r}"
     return start, end
@@ -76,12 +87,43 @@ def registry_mutations_outside_helpers(code: str):
     return bad
 
 
+def registry_uses_that_are_not_reads(code: str):
+    """Every mention of the registry outside the helpers must be a read member call, a const range-for, or its declaration."""
+    spans = [function_span(code, h) for h in HELPERS]
+    bad = []
+    for m in re.finditer(r"\bg_runtime_alloc_registry\b", code):
+        if any(s <= m.start() < e for s, e in spans):
+            continue
+        tail = code[m.end() : m.end() + 80]
+        pre = code[max(0, m.start() - 80) : m.start()]
+        if READ_MEMBER_RE.match(tail) or CONST_RANGE_FOR_RE.search(pre):
+            continue
+        if re.search(r">\s*$", pre) and tail.lstrip().startswith(";"):
+            continue  # the declaration
+        line = code.count("\n", 0, m.start()) + 1
+        bad.append((line, (pre[-30:] + "|" + tail[:30]).replace("\n", " ")))
+    return bad
+
+
+def row_aliases_in_registry_functions(code: str):
+    """A non-const reference/pointer to a registry row, in a function that uses the registry."""
+    bad = []
+    pos = 0
+    for end in re.finditer(r"\n}\n", code):
+        body = code[pos : end.end()]
+        if "g_runtime_alloc_registry" in body:
+            for m in ROW_ALIAS_RE.finditer(body):
+                bad.append((code.count("\n", 0, pos + m.start()) + 1, m.group(0)[:70]))
+        pos = end.end()
+    return bad
+
+
 def geometry_writes(code: str):
     return [(code.count("\n", 0, m.start()) + 1) for m in GEOMETRY_WRITE_RE.finditer(code)]
 
 
 def lookup_body(code: str) -> str:
-    sig = "bool unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, sycl::queue ** queue_out) {"
+    sig = r"bool\s+unified_lookup_runtime_allocation\(const void \* ptr, alloc_metadata \* out, sycl::queue \*\* queue_out\)\s*\{"
     s, e = function_span(code, sig)
     return code[s:e]
 
@@ -130,6 +172,80 @@ def test_mutation_gate_has_a_witness(line):
 )
 def test_mutation_gate_allows_reads(line):
     assert registry_mutations_outside_helpers(CODE + "\nvoid f() {\n    " + line + "\n}\n") == [], line
+
+
+def test_every_registry_use_outside_the_helpers_is_a_read():
+    assert registry_uses_that_are_not_reads(CODE) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "auto & reg = g_runtime_alloc_registry; reg.erase(it);",
+        "auto * reg = &g_runtime_alloc_registry; reg->clear();",
+        "auto && reg = g_runtime_alloc_registry;",
+        "std::unordered_map<void *, runtime_alloc_record> & reg(g_runtime_alloc_registry);",
+        "drop_rows(g_runtime_alloc_registry);",
+        "for (auto & kv : g_runtime_alloc_registry) { kv.second.handle.size = 0; }",
+        "g_runtime_alloc_registry.erase(it);",
+    ],
+)
+def test_use_gate_has_a_witness(line):
+    assert registry_uses_that_are_not_reads(CODE + "\nvoid f() {\n    " + line + "\n}\n"), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "auto it = g_runtime_alloc_registry.find(ptr);",
+        "for (const auto & kv : g_runtime_alloc_registry) { use(kv); }",
+        "if (a == g_runtime_alloc_registry.end()) return;",
+        "return g_runtime_alloc_registry.size() + g_runtime_alloc_registry . count(p);",
+    ],
+)
+def test_use_gate_allows_reads(line):
+    assert registry_uses_that_are_not_reads(CODE + "\nvoid f() {\n    " + line + "\n}\n") == [], line
+
+
+def test_row_aliases_are_absent_from_registry_functions():
+    assert row_aliases_in_registry_functions(CODE) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "auto & rec = it->second; rec.handle.size = 0;",
+        "runtime_alloc_record & rec = it->second;",
+        "auto * row = &it->second;",
+        "alloc_metadata & h = it->second.handle;",
+        "auto && h = kv.second.handle;",
+    ],
+)
+def test_alias_gate_has_a_witness(line):
+    planted = CODE + "\nvoid f() {\n    auto it = g_runtime_alloc_registry.find(p);\n    " + line + "\n}\n"
+    assert row_aliases_in_registry_functions(planted), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "const auto & rec = it->second;",
+        "const alloc_metadata & h = it->second.handle;",
+        "const runtime_alloc_record * row = &it->second;",
+    ],
+)
+def test_alias_gate_allows_const_views(line):
+    planted = CODE + "\nvoid f() {\n    auto it = g_runtime_alloc_registry.find(p);\n    " + line + "\n}\n"
+    assert row_aliases_in_registry_functions(planted) == [], line
+
+
+def test_alias_gate_ignores_functions_that_do_not_touch_the_registry():
+    assert row_aliases_in_registry_functions(CODE + "\nvoid f() {\n    auto & x = other_map.second;\n}\n") == []
+
+
+def test_helper_signatures_tolerate_reformatting():
+    realigned = "static std::pair<A, bool> runtime_registry_emplace_locked(void *               ptr,\n  runtime_alloc_record rec) {\n body\n}\n"
+    assert function_span(realigned, HELPERS[0])
 
 
 def test_registered_row_geometry_is_never_rewritten():

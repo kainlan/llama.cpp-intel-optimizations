@@ -1571,7 +1571,11 @@ static void runtime_registry_erase_locked(void * ptr) noexcept {
 // then failing to insert.
 static void runtime_registry_assign_locked(void * ptr, const runtime_alloc_record & rec) {
     runtime_registry_erase_locked(ptr);
-    (void) runtime_registry_emplace_locked(ptr, rec);
+    const bool published = runtime_registry_emplace_locked(ptr, rec).second;
+    // The adopt callers hand out a live handle for this row, so a row that did not land would be an unowned allocation.
+    // It cannot happen while a row's key is its handle.ptr (the erase above frees both the key and the base).
+    GGML_ASSERT(published && "runtime allocation registry refused an adopted row");
+    (void) published;
 }
 
 // Every registry row is indexed exactly when it qualifies, with the geometry the row carries, and the index holds nothing
