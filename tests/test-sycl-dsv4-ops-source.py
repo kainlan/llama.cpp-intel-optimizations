@@ -201,6 +201,9 @@ def evaluate(backend, hc, hc_header, hc_kernels, hc_predicates, lid, lid_header,
             table + "(X)" in lid_predicates and table + "(X)" in lid_kernels
     results["the indexer launcher keeps no K-type switch of its own"] = \
         re.search(r"case\s+GGML_TYPE_", lid_kernels) is None and re.search(r"case\s+GGML_TYPE_", lid) is None
+    results["the int op-param slot is one named constant"] = \
+        "HC_OP_PARAM_I32_SLOT" in hc_predicates and "HC_OP_PARAM_I32_SLOT" in hc and \
+        re.search(r"hc_op_param_i32\s*\(\s*\w+\s*,\s*\d", hc_predicates + hc) is None
     results["the comb scale index is one named constant"] = \
         "HC_COMB_SCALE_COMB_IDX" in hc_predicates and "HC_COMB_SCALE_COMB_IDX" in hc_kernels and \
         re.search(r"scale\s*\[\s*2\b", hc_kernels) is None
@@ -249,7 +252,7 @@ if args.self_test:
         ("null comb refused", "post predicate admits a null comb",
          with_(hc_predicates=mutate(sources["hc_predicates"], "if (comb != nullptr) {", "if (true) {"))),
         ("gated flag ignored", "pre predicate reads the gated flag",
-         with_(hc_predicates=sources["hc_predicates"].replace("hc_op_param_i32(op, 1) != 0", "false"))),
+         with_(hc_predicates=sources["hc_predicates"].replace("hc_op_param_i32(op, HC_OP_PARAM_I32_SLOT) != 0", "false"))),
         ("host wait added", "dsv4-hc.cpp has no host wait",
          with_(hc=mutate(sources["hc"], "GGML_ASSERT(", "stream->wait(); GGML_ASSERT("))),
         ("allocation added", "dsv4-hc-kernels.hpp allocates nothing",
@@ -270,6 +273,8 @@ if args.self_test:
          with_(lid_predicates=sources["lid_predicates"] + "\n#define GGML_SYCL_LIGHTNING_INDEXER_EPLS(X) X(2)\n")),
         ("comb scale index back to a literal", "the comb scale index is one named constant",
          with_(hc_kernels=sources["hc_kernels"].replace("a.scale[HC_COMB_SCALE_COMB_IDX * a.ss0]", "a.scale[2 * a.ss0]"))),
+        ("op-param slot back to a literal", "the int op-param slot is one named constant",
+         with_(hc=sources["hc"].replace("hc_op_param_i32(op, ggml_sycl_dsv4::HC_OP_PARAM_I32_SLOT)", "hc_op_param_i32(op, 1)"))),
         ("indexer wait added", "lightning-indexer.cpp has no host wait",
          with_(lid=sources["lid"] + "\nvoid f(sycl::queue * s) { s->wait_and_throw(); }\n")),
     ]

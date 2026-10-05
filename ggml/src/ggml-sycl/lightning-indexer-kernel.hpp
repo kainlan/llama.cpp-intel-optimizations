@@ -34,18 +34,32 @@
 
 namespace ggml_sycl_lightning_indexer {
 
+// What the kernel's casts of a K row read, per K type: one float, half or bfloat16 element, or one quantized block.
+// A type added to GGML_SYCL_LIGHTNING_INDEXER_K_TYPES with no specialization here fails to compile (incomplete type)
+// in the static_assert below, so no K type can be admitted with the default alignment.
+template <ggml_type KT> struct lightning_indexer_k_storage;
+
+// clang-format off
+template <> struct lightning_indexer_k_storage<GGML_TYPE_F32>    { using type = float; };
+template <> struct lightning_indexer_k_storage<GGML_TYPE_F16>    { using type = sycl::half; };
+template <> struct lightning_indexer_k_storage<GGML_TYPE_BF16>   { using type = sycl::ext::oneapi::bfloat16; };
+template <> struct lightning_indexer_k_storage<GGML_TYPE_Q8_0>   { using type = block_q8_0; };
+template <> struct lightning_indexer_k_storage<GGML_TYPE_Q4_0>   { using type = block_q4_0; };
+template <> struct lightning_indexer_k_storage<GGML_TYPE_Q4_1>   { using type = block_q4_1; };
+template <> struct lightning_indexer_k_storage<GGML_TYPE_Q5_0>   { using type = block_q5_0; };
+template <> struct lightning_indexer_k_storage<GGML_TYPE_Q5_1>   { using type = block_q5_1; };
+template <> struct lightning_indexer_k_storage<GGML_TYPE_IQ4_NL> { using type = block_iq4_nl; };
+// clang-format on
+
 // k_align() (the predicate's stride check) states the alignment this kernel's casts of a K row need. The predicate
-// header is pure ggml and cannot see the block types, so the kernel -- which can -- pins the two together: a block
-// layout change breaks the build here instead of silently letting the predicate admit a misaligned view.
-static_assert(k_align(GGML_TYPE_F32) == alignof(float), "k_align: F32");
-static_assert(k_align(GGML_TYPE_F16) == alignof(sycl::half), "k_align: F16");
-static_assert(k_align(GGML_TYPE_BF16) == alignof(sycl::ext::oneapi::bfloat16), "k_align: BF16");
-static_assert(k_align(GGML_TYPE_Q8_0) == alignof(block_q8_0), "k_align: Q8_0");
-static_assert(k_align(GGML_TYPE_Q4_0) == alignof(block_q4_0), "k_align: Q4_0");
-static_assert(k_align(GGML_TYPE_Q4_1) == alignof(block_q4_1), "k_align: Q4_1");
-static_assert(k_align(GGML_TYPE_Q5_0) == alignof(block_q5_0), "k_align: Q5_0");
-static_assert(k_align(GGML_TYPE_Q5_1) == alignof(block_q5_1), "k_align: Q5_1");
-static_assert(k_align(GGML_TYPE_IQ4_NL) == alignof(block_iq4_nl), "k_align: IQ4_NL");
+// header is pure ggml and cannot see the block types, so the kernel -- which can -- pins the two together for every
+// type in the table: a block layout change breaks the build here instead of silently letting the predicate admit a
+// misaligned view.
+#define X(T)                                                                            \
+    static_assert(k_align(T) == alignof(typename lightning_indexer_k_storage<T>::type), \
+                  "k_align disagrees with the alignment of the K storage of " #T);
+GGML_SYCL_LIGHTNING_INDEXER_K_TYPES(X)
+#undef X
 
 constexpr int64_t LIGHTNING_INDEXER_ROWS_PER_BLOCK = 4;
 

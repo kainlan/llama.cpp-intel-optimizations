@@ -54,11 +54,12 @@ constexpr double NMSE_TOL     = 1e-9;
 constexpr double NMSE_REJECTS = 1e-4;  // a control oracle must be at least this far from the kernel
 
 // A loop that silently skipped its work would leave "no failure" standing, so each half of the run has a floor on
-// the checks it produced: the decline matrix on its own, and the kernel checks on their own (the predicate checks
-// must not be able to stand in for them). The kernel floor is what one sub-group size produces, the least a device
-// that offers only 16 or only 32 lanes can run; both floors sit a little under the current counts.
-constexpr int MIN_PREDICATE_CHECKS = 180;  // the decline matrix produces 194
-constexpr int MIN_KERNEL_CHECKS    = 200;  // 331 with both sub-group sizes, about 205 with only one
+// the checks it produced: the decline matrix on its own, and the kernel checks on their own (so the predicate checks
+// cannot stand in for them). The rule for both: about three quarters of what that half produces on the least
+// capable device the test supports -- for the kernel half, a device that offers only one of the two sub-group sizes.
+// That leaves room for cases to be added or reorganised and still trips when a whole loop stops running.
+constexpr int MIN_PREDICATE_CHECKS = 150;
+constexpr int MIN_KERNEL_CHECKS    = 150;
 
 std::mt19937 g_rng(20261003);
 
@@ -809,11 +810,20 @@ void expect_edits(const char * family, Build build, Pred pred, const std::vector
     }
 }
 
-constexpr int64_t PRED_N_EMBD        = 64;
-constexpr int64_t PRED_N_TOK         = 3;
-constexpr int     PRED_N_ITER        = 20;
-// op_params slot ggml_dsv4_hc_comb stores n_iter in (and ggml_dsv4_hc_pre its gated flag)
-constexpr int     PRED_OP_PARAM_SLOT = 1;
+// The same, for a case that needs several edits at once to be coherent (every operand of a zero-stream node at hc 0).
+template <typename Build, typename Pred>
+void expect_edits_together(const char * what, Build build, Pred pred, const std::vector<mut> & edits, bool want) {
+    node_ctx      n;
+    ggml_tensor * op = build(n);
+    for (const mut & m : edits) {
+        m.apply(op);
+    }
+    expect_pred(what, pred(op), want);
+}
+
+constexpr int64_t PRED_N_EMBD = 64;
+constexpr int64_t PRED_N_TOK  = 3;
+constexpr int     PRED_N_ITER = 20;
 
 void test_predicates_pre() {
     auto build = [](bool gated) {
@@ -832,7 +842,6 @@ void test_predicates_pre() {
         mut::nb_add("dst byte stride off a float", DST, 1, 2),
         mut::ne("x has a 4th dim", 0, 3, 2),
         mut::ne("w has a 4th dim", 1, 3, 2),
-        mut::ne("hc is zero", 0, 1, 0),
         mut::ne_add("dst n_embd wrong", DST, 0, 1),
         mut::ne_add("dst n_tokens wrong", DST, 1, 1),
         mut::ne("dst has a plane", DST, 2, 2),
@@ -854,6 +863,11 @@ void test_predicates_pre() {
                     true);
         expect_edits(g ? "hc_pre gated" : "hc_pre plain", build(g), ggml_sycl_dsv4_hc_pre_supported, common, false);
     }
+    // hc = 0 with every coherent operand at hc = 0, so no equality clause declines it first and only `hc <= 0` does
+    expect_edits_together("hc_pre plain with hc = 0", build(false), ggml_sycl_dsv4_hc_pre_supported,
+                          { mut::ne("x hc", 0, 1, 0), mut::ne("w hc", 1, 0, 0) }, false);
+    expect_edits_together("hc_pre gated with hc = 0", build(true), ggml_sycl_dsv4_hc_pre_supported,
+                          { mut::ne("x hc", 0, 1, 0), mut::ne("gate hc", 1, 1, 0) }, false);
     expect_edits("hc_pre", build(false), ggml_sycl_dsv4_hc_pre_supported, plain, false);
     expect_edits("hc_pre", build(true), ggml_sycl_dsv4_hc_pre_supported, gated, false);
 
@@ -885,7 +899,8 @@ void test_predicates_comb() {
         mut::ne("mixes has a 4th dim", 0, 3, 2),
         mut::ne_add("dst n_tokens wrong", DST, 2, 1),
         mut::ne("dst has a 4th dim", DST, 3, 2),
-        mut::param("n_iter zero", PRED_OP_PARAM_SLOT, 0),
+        mut::param("n_iter zero", HC_OP_PARAM_I32_SLOT, 0),
+        mut::param("n_iter negative", HC_OP_PARAM_I32_SLOT, -1),
     };
     // a longer scale vector is fine: only element HC_COMB_SCALE_COMB_IDX is read
     const std::vector<mut> admitted = { mut::ne_add("with a longer scale vector", 1, 0, 5) };
@@ -904,23 +919,49 @@ void test_predicates_post() {
                                      with_comb ? n.t(GGML_TYPE_F32, 4, 4, PRED_N_TOK) : nullptr);
         };
     };
+    // clang-format off
     const std::vector<mut> common = {
-        mut::type("x F16", 0, GGML_TYPE_F16),          mut::type("residual F16", 1, GGML_TYPE_F16),
-        mut::type("post F16", 2, GGML_TYPE_F16),       mut::type("dst F16", DST, GGML_TYPE_F16),
-        mut::nb_add("x stride off a float", 0, 1, 2),  mut::ne("x has a plane", 0, 2, 2),
-        mut::ne("x has a 4th dim", 0, 3, 2),           mut::ne("hc is zero", 1, 1, 0),
-        mut::ne_add("residual n_embd wrong", 1, 0, 1), mut::ne_add("residual n_tokens wrong", 1, 2, 1),
-        mut::ne("residual has a 4th dim", 1, 3, 2),    mut::ne_add("post hc wrong", 2, 0, 1),
-        mut::ne_add("post n_tokens wrong", 2, 1, 1),   mut::ne("post has a plane", 2, 2, 2),
-        mut::ne("post has a 4th dim", 2, 3, 2),        mut::ne_add("dst n_embd wrong", DST, 0, 1),
-        mut::ne_add("dst hc wrong", DST, 1, 1),        mut::ne_add("dst n_tokens wrong", DST, 2, 1),
+        mut::type("x F16", 0, GGML_TYPE_F16),
+        mut::type("residual F16", 1, GGML_TYPE_F16),
+        mut::type("post F16", 2, GGML_TYPE_F16),
+        mut::type("dst F16", DST, GGML_TYPE_F16),
+        mut::nb_add("x stride off a float", 0, 1, 2),
+        mut::ne("x has a plane", 0, 2, 2),
+        mut::ne("x has a 4th dim", 0, 3, 2),
+        mut::ne_add("residual n_embd wrong", 1, 0, 1),
+        mut::ne_add("residual n_tokens wrong", 1, 2, 1),
+        mut::ne("residual has a 4th dim", 1, 3, 2),
+        mut::ne_add("post hc wrong", 2, 0, 1),
+        mut::ne_add("post n_tokens wrong", 2, 1, 1),
+        mut::ne("post has a plane", 2, 2, 2),
+        mut::ne("post has a 4th dim", 2, 3, 2),
+        mut::ne_add("dst n_embd wrong", DST, 0, 1),
+        mut::ne_add("dst hc wrong", DST, 1, 1),
+        mut::ne_add("dst n_tokens wrong", DST, 2, 1),
         mut::ne("dst has a 4th dim", DST, 3, 2),
     };
     const std::vector<mut> comb_only = {
-        mut::type("comb F16", 3, GGML_TYPE_F16),     mut::nb_add("comb stride off a float", 3, 1, 2),
-        mut::ne("comb dim 0 wrong", 3, 0, 3),        mut::ne("comb dim 1 wrong", 3, 1, 3),
-        mut::ne_add("comb n_tokens wrong", 3, 2, 1), mut::ne("comb has a 4th dim", 3, 3, 2),
+        mut::type("comb F16", 3, GGML_TYPE_F16),
+        mut::nb_add("comb stride off a float", 3, 1, 2),
+        mut::ne("comb dim 0 wrong", 3, 0, 3),
+        mut::ne("comb dim 1 wrong", 3, 1, 3),
+        mut::ne_add("comb n_tokens wrong", 3, 2, 1),
+        mut::ne("comb has a 4th dim", 3, 3, 2),
     };
+    // hc = 0 with every coherent operand at hc = 0, so no equality clause declines it first and only `hc <= 0` does
+    const std::vector<mut> hc_zero = {
+        mut::ne("residual hc", 1, 1, 0),
+        mut::ne("post hc", 2, 0, 0),
+        mut::ne("dst hc", DST, 1, 0),
+    };
+    const std::vector<mut> hc_zero_comb = {
+        mut::ne("residual hc", 1, 1, 0),
+        mut::ne("post hc", 2, 0, 0),
+        mut::ne("dst hc", DST, 1, 0),
+        mut::ne("comb dim 0", 3, 0, 0),
+        mut::ne("comb dim 1", 3, 1, 0),
+    };
+    // clang-format on
     for (bool with_comb : { false, true }) {
         node_ctx n;
         expect_pred(std::string("hc_post ") + (with_comb ? "with comb" : "with a null comb (identity)"),
@@ -928,6 +969,10 @@ void test_predicates_post() {
         expect_edits(with_comb ? "hc_post with comb:" : "hc_post null comb:", build(with_comb),
                      ggml_sycl_dsv4_hc_post_supported, common, false);
     }
+    expect_edits_together("hc_post null comb with hc = 0", build(false), ggml_sycl_dsv4_hc_post_supported, hc_zero,
+                          false);
+    expect_edits_together("hc_post with comb with hc = 0", build(true), ggml_sycl_dsv4_hc_post_supported, hc_zero_comb,
+                          false);
     // a present-but-bad comb is declined where a null one is admitted
     expect_edits("hc_post with comb:", build(true), ggml_sycl_dsv4_hc_post_supported, comb_only, false);
     expect_pred("hc_post null op", ggml_sycl_dsv4_hc_post_supported(nullptr), false);
@@ -960,6 +1005,9 @@ void test_predicates_indexer() {
         mut::ne_add("w n_head wrong", 2, 0, 1),
         mut::ne_add("w n_batch wrong", 2, 1, 1),
         mut::ne("w has a dim-2 extent", 2, 2, 2),
+        mut::ne("w streams != q streams", 2, 3, 1),
+        mut::ne("mask has a dim-2 extent", 3, 2, 2),
+        mut::ne("dst has a dim-2 extent", DST, 2, 2),
         mut::ne_add("mask n_kv wrong", 3, 0, 1),
         mut::ne_add("mask n_batch wrong", 3, 1, 1),
         mut::ne("mask streams do not divide", 3, 3, 3),

@@ -12,8 +12,9 @@ CONCAT_SOURCE = ROOT / "ggml/src/ggml-sycl/concat.cpp"
 BACKEND_OPS_SOURCE = ROOT / "tests/test-backend-ops.cpp"
 
 
-# The decisions live in ggml_sycl_device_supports_op_impl; ggml_backend_sycl_device_supports_op is a one-line wrapper over
-# it. Anchor on the impl DEFINITION (the forward declaration before it ends in `;`, so it does not match).
+# The decisions live in ggml_sycl_device_supports_op_impl; ggml_backend_sycl_device_supports_op is a one-line
+# wrapper over it. Anchor on the impl DEFINITION (the forward declaration before it ends in `;`, so it does not
+# match).
 SUPPORTS_IMPL_DEFINITION = re.compile(r"static\s+bool\s+ggml_sycl_device_supports_op_impl\s*\([^)]*\)\s*\{")
 
 

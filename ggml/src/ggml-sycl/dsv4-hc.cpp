@@ -11,7 +11,7 @@ void ggml_sycl_op_dsv4_hc_pre(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     const ggml_tensor * op    = dst.raw();
     const ggml_tensor * x     = op->src[0];
     const ggml_tensor * w     = op->src[1];
-    const bool          gated = ggml_sycl_dsv4::hc_op_param_i32(op, 1) != 0;
+    const bool          gated = ggml_sycl_dsv4::hc_op_param_i32(op, ggml_sycl_dsv4::HC_OP_PARAM_I32_SLOT) != 0;
 
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
 
@@ -61,7 +61,7 @@ void ggml_sycl_op_dsv4_hc_comb(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_
     args.sd1                          = hc_stride(op, 1);
     args.sd2                          = hc_stride(op, 2);
     args.eps                          = ggml_get_op_params_f32(op, 0);
-    args.n_iter                       = ggml_sycl_dsv4::hc_op_param_i32(op, 1);
+    args.n_iter                       = ggml_sycl_dsv4::hc_op_param_i32(op, ggml_sycl_dsv4::HC_OP_PARAM_I32_SLOT);
 
     ggml_sycl_dsv4::hc_comb_launch(*ctx.stream(), args);
 }

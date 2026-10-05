@@ -108,37 +108,100 @@ def squash(text):
     return re.sub(r"\s+", " ", text or "")
 
 
-GATED_IF = re.compile(r"\bif\s*\(\s*placement_declines\s*&&[^;{}]*\{\s*$")
+def blank_comments_and_strings(source):
+    """The source with comments and the CONTENTS of string/char literals replaced by spaces (newlines kept).
+
+    Same length as the input, so offsets still mean something, and nothing a comment or a literal says -- a `}`, an
+    `if (placement_declines && ...) {` -- can be read as code.
+    """
+    out = list(source)
+    i = 0
+    n = len(source)
+    while i < n:
+        ch = source[i]
+        if ch in ('"', "'"):
+            quote = ch
+            i += 1
+            while i < n and source[i] != quote:
+                if source[i] == "\\" and i + 1 < n:
+                    out[i] = " "
+                    i += 1
+                if source[i] != "\n":
+                    out[i] = " "
+                i += 1
+            i += 1
+            continue
+        if source.startswith("//", i):
+            while i < n and source[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        if source.startswith("/*", i):
+            end = source.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            for j in range(i, end):
+                if source[j] != "\n":
+                    out[j] = " "
+            i = end
+            continue
+        i += 1
+    return "".join(out)
+
+
+def matching(text, open_at, open_ch, close_ch):
+    """Index of the bracket closing the one at `open_at`, or -1."""
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == open_ch:
+            depth += 1
+        elif text[i] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def gate_condition_ok(cond):
+    """`placement_declines && ...` with no `||` at the top level, so nothing in it is reachable ungated."""
+    if not re.match(r"\s*placement_declines\s*&&", cond):
+        return False
+    depth = 0
+    for i, ch in enumerate(cond):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif depth == 0 and cond.startswith("||", i):
+            return False
+    return True
 
 
 def ungated_sites(body, site):
     """Offsets of `site` matches that no `if (placement_declines && ...)` covers.
 
-    A site is covered when it sits in the condition of such an if, or anywhere inside its braced body: the outer
-    gate already decides, so a second `placement_declines &&` on a nested site would be dead code and is not
-    required. A site under no gated if -- the defect this gate exists for -- is reported.
+    Comments and string literals are blanked first. A site is covered when it sits in the condition of such an if,
+    or anywhere in its body (a braced block, or the single statement): the outer gate already decides, so a second
+    `placement_declines &&` on a nested site would be dead code and is not required. The gate condition must be
+    `placement_declines && ...` with no top-level `||`; anything else is not a gate. A site under no gate -- the
+    defect this gate exists for -- is reported.
     """
-    bad = []
-    for m in re.finditer(site, body):
-        pos = m.start()
-        # the statement the site belongs to: back to the previous `;`, `{` or `}`
-        head = body[max(body.rfind(";", 0, pos), body.rfind("{", 0, pos), body.rfind("}", 0, pos)) + 1:pos]
-        covered = re.search(r"\bif\s*\(\s*placement_declines\s*&&", head) is not None
-        # every enclosing block: its header is the text from the previous `;`/`{`/`}` up to its `{`
-        depth_stack = []
-        for i in range(pos):
-            if body[i] == "{":
-                depth_stack.append(i)
-            elif body[i] == "}" and depth_stack:
-                depth_stack.pop()
-        for brace in depth_stack:
-            before = body[:brace + 1]
-            start = max(before.rfind(";", 0, brace), before.rfind("{", 0, brace), before.rfind("}", 0, brace)) + 1
-            if GATED_IF.search(before[start:]):
-                covered = True
-        if not covered:
-            bad.append(pos)
-    return bad
+    clean = blank_comments_and_strings(body)
+    spans = []
+    for m in re.finditer(r"\bif\s*\(", clean):
+        open_paren = m.end() - 1
+        close_paren = matching(clean, open_paren, "(", ")")
+        if close_paren < 0 or not gate_condition_ok(clean[open_paren + 1:close_paren]):
+            continue
+        rest = clean[close_paren + 1:]
+        lead = len(rest) - len(rest.lstrip())
+        body_start = close_paren + 1 + lead
+        if clean.startswith("{", body_start):
+            body_end = matching(clean, body_start, "{", "}")
+        else:
+            body_end = clean.find(";", body_start)
+        spans.append((open_paren, body_end if body_end >= 0 else len(clean)))
+    return [m.start() for m in re.finditer(site, clean)
+            if not any(lo <= m.start() <= hi for lo, hi in spans)]
 
 
 def evaluate(ctx, hdr, be, sh):
@@ -327,6 +390,35 @@ if args.self_test:
     ]
     for label, expect, srcs in mutants:
         failed += run(label, srcs, expect)
+
+    # The gate must also keep holding where a comment or a literal carries text that would fool a textual parse.
+    KV_SRC_GATE = "if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {"
+    KV_SITES = "backend: every KV-host placement site in the impl is gated on the parameter"
+    fooled = [
+        ("a comment holding the gate text over an ungated site", KV_SITES,
+         with_(be=mutate(sources["be"], KV_SRC_GATE,
+                         "/* " + KV_SRC_GATE + " */ if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {"))),
+        ("a string holding the gate text over an ungated site", KV_SITES,
+         with_(be=mutate(sources["be"], KV_SRC_GATE,
+                         'const char * g = "' + KV_SRC_GATE + '"; if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {'))),
+        ("a gate whose condition has a top-level ||", KV_SITES,
+         with_(be=mutate(sources["be"], KV_SRC_GATE,
+                         "if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op->src[i]) || g_ggml_sycl_debug) {"))),
+    ]
+    for label, expect, srcs in fooled:
+        failed += run(label, srcs, expect)
+
+    def holds(label, check, srcs):
+        ok = evaluate(*srcs).get(check, False)
+        print(("PASS" if ok else "FAIL") + f": '{label}' still satisfies '{check}'")
+        return [] if ok else [label]
+
+    failed += holds("a } in a comment next to a covered site", KV_SITES,
+                    with_(be=mutate(sources["be"], "(op->op == GGML_OP_SET_ROWS && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&",
+                                    "(op->op == GGML_OP_SET_ROWS /* } */ && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&")))
+    failed += holds("a } in a string next to a covered site", KV_SITES,
+                    with_(be=mutate(sources["be"], 'GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft residency decline (dst)',
+                                    'GGML_SYCL_DEBUG("} [SYCL-SUPPORT] KV-host-buft residency decline (dst)')))
 
 if failed:
     print("\nFAILED: " + ", ".join(failed))
