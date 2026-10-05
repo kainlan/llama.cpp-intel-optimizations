@@ -13786,13 +13786,14 @@ bool ggml_sycl_log_host_mem(const char * phase, int min_interval_s) {
         "[HOSTMEM] phase=%s | process: rss_anon=%.2f rss_file=%.2f rss_shmem=%.2f GB; malloc inuse=%.2f free_retained=%.2f "
         "mmapped=%.2f (%zu chunks) GB; process_residual=rss_anon-malloc_total=%.2f GB | anon mappings >=64MB: %zu "
         "totalling %.2f GB, top by RSS (rss/size perms name):%s | pinned pool (not in RssAnon): %.2f GB zones(used/cap "
-        "GB):%s | ledger: sycl_host_buffers=%.2f host_expert_copy=%.2f host_dense_copy=%.2f GB | system: "
+        "GB):%s | ledger: sycl_host_buffers=%.2f host_expert_copy=%.2f host_dense_copy=%.2f cpu_dispatch_scratch=%.2f GB | system: "
         "MemAvailable=%.2f Shmem=%.2f AnonPages=%.2f Cached=%.2f Slab=%.2f kernel_other(driver BOs)=%.2f GB\n",
         phase ? phase : "?", rss_anon / gb, rss_file / gb, rss_shmem / gb, malloc_inuse / gb, malloc_free / gb,
         malloc_mmapped / gb, malloc_n_mmapped, residual, n_big, big_rss / gb, top.c_str(), pool_committed / gb,
         zones.c_str(), led.sycl_host_buffer_bytes.load(std::memory_order_relaxed) / gb,
         led.host_expert_copy_bytes.load(std::memory_order_relaxed) / gb,
-        led.host_dense_copy_bytes.load(std::memory_order_relaxed) / gb, sys_avail / gb, mi["Shmem"] / gb,
+        led.host_dense_copy_bytes.load(std::memory_order_relaxed) / gb,
+        led.cpu_dispatch_scratch_bytes.load(std::memory_order_relaxed) / gb, sys_avail / gb, mi["Shmem"] / gb,
         mi["AnonPages"] / gb, mi["Cached"] / gb, mi["Slab"] / gb, sys_kernel_other);
     return true;
 }

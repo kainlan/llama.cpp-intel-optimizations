@@ -153,23 +153,20 @@ static std::atomic<uint64_t> g_quant_cache_generation{ 0 };
 // Per-thread buffer pool for CPU dispatch quantization (defined here, declared in common.hpp)
 thread_local cpu_dispatch_buffers g_cpu_dispatch_buffers;
 
-// Initialize CPU dispatch buffers with reasonable max sizes
-// Called once at model load time to avoid per-token resize() calls
+// Initialize the always-needed CPU dispatch buffers (quantized activation + accumulators).
+// Safe to call from every TBB worker: the footprint is ~1 MiB per thread.
+// The weight-dequant buffer (scratch_nk) is NOT sized here; its two consumers call
+// ensure_scratch_nk(N * K) with the size they need (llama.cpp-z5fn).
 void ggml_sycl_cpu_dispatch_buffers_init() {
-    // Reasonable max sizes for typical model dimensions:
     // - Max batch size for TG: 16 tokens
-    // - Max n_embd (embedding dimension): 4096 (typical 7B/13B models)
     // - Max n_ff (feedforward hidden): 14336 (typical 7B; ~3.5x n_embd)
     // - Max quantized row size (Q8_0): ~128 bytes per 256 elements
     // - Max accumulator: 256 stack + 16 heap = 272 __m256 values = 8704 floats
-    // Total per-thread: ~224 MB (much more reasonable than 576 MB)
-
     static constexpr size_t MAX_M      = 16;                      // batch size (TG)
-    static constexpr size_t MAX_N      = 4096;                    // n_embd (typical 7B)
     static constexpr size_t MAX_K      = 14336;                   // n_ff (typical 7B; ~3.5x n_embd)
     static constexpr size_t MAX_Q_SIZE = (MAX_K / 32 + 1) * 128;  // Safe upper bound for any quant type
 
-    g_cpu_dispatch_buffers.init(MAX_M, MAX_N, MAX_K, MAX_Q_SIZE);
+    g_cpu_dispatch_buffers.init(MAX_M, MAX_Q_SIZE);
 }
 
 void ggml_sycl_cpu_quant_cache_new_graph() {
@@ -4405,9 +4402,7 @@ static bool cpu_mul_mat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
         // Pre-allocated buffer via g_cpu_dispatch_buffers.scratch_nk
         float * src0_f32_buf = nullptr;
         if (src0_quantized && !use_vec_dot) {
-            const size_t buf_size = static_cast<size_t>(N) * K;
-            GGML_ASSERT(buf_size <= g_cpu_dispatch_buffers.scratch_nk.size());
-            src0_f32_buf = g_cpu_dispatch_buffers.scratch_nk.data();
+            src0_f32_buf = g_cpu_dispatch_buffers.ensure_scratch_nk(static_cast<size_t>(N) * K);
         }
 
         for (int64_t i13 = 0; i13 < ne13; i13++) {
@@ -6569,8 +6564,7 @@ bool ggml_sycl_cpu_pp_gemm(ggml_type     weight_type,
         }
 
         // Pre-allocated weight dequantization buffer via g_cpu_dispatch_buffers.scratch_nk
-        const size_t buf_size = static_cast<size_t>(N) * K;
-        GGML_ASSERT(buf_size <= g_cpu_dispatch_buffers.scratch_nk.size());
+        g_cpu_dispatch_buffers.ensure_scratch_nk(static_cast<size_t>(N) * K);
 
         // A7L5W Site 2a: validate the per-expert weight slab before dequant.
         // `weight_bytes` is `weight_host + i02*nb02 + i03*nb03` from the caller

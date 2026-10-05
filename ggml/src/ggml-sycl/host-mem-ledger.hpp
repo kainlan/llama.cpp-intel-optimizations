@@ -27,6 +27,8 @@ struct host_mem_ledger {
     // Host-tier expert / dense weights copied into a second pinned allocation.
     std::atomic<size_t> host_expert_copy_bytes{ 0 };
     std::atomic<size_t> host_dense_copy_bytes{ 0 };
+    // Per-thread CPU-dispatch weight-dequant scratch (cpu_dispatch_buffers::scratch_nk), all threads.
+    std::atomic<size_t> cpu_dispatch_scratch_bytes{ 0 };
 };
 
 inline host_mem_ledger & host_mem_ledger_get() {

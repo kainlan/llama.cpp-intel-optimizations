@@ -14,6 +14,7 @@
 #define GGML_SYCL_COMMON_HPP
 
 #include "alloc-registry.hpp"
+#include "cpu-dispatch-buffers.hpp"
 #include "dpct/helper.hpp"
 #include "ggml-sycl.h"
 #include "graph-prestage-decline-memo.hpp"
@@ -1612,22 +1613,7 @@ bool          ggml_sycl_cpu_offload_available();
 sycl::queue * ggml_sycl_get_cpu_queue();
 
 // CPU dispatch buffer pool: pre-allocated quantization buffers to eliminate per-token resize()
-struct cpu_dispatch_buffers {
-    std::vector<uint8_t> src1_q;      // Quantization buffer: max M * max_q_row_size
-    std::vector<float>   accs;        // Accumulator buffer: reused as __m256* via reinterpret_cast
-    std::vector<float>   scratch_nk;  // Weight dequantization buffer: max N * K
-
-    // Note: accs is reinterpreted as __m256 array. Since we only use _mm256_setzero_ps()
-    // and array indexing (no aligned load/store), alignment is not critical.
-
-    // Initialize buffers based on model dimensions
-    void init(size_t max_m, size_t max_n, size_t max_k, size_t max_q_row_size) {
-        src1_q.resize(max_m * max_q_row_size);
-        // __m256 is 32 bytes = 8 floats; allocate for max chunk4 (256 + max_m) accumulators
-        accs.resize((256 + max_m) * 8);  // Conservative upper bound: 256 stack + max_m heap
-        scratch_nk.resize(max_n * max_k);
-    }
-};
+// struct cpu_dispatch_buffers lives in cpu-dispatch-buffers.hpp (pure std, host-testable).
 
 // Per-thread buffer pool for CPU dispatch quantization
 // Declared here, defined in cpu-dispatch.cpp to avoid ODR violations
