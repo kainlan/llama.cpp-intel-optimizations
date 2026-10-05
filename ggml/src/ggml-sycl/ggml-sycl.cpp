@@ -13617,34 +13617,12 @@ static void ggml_sycl_release_xmx_aos_staging(ggml_tensor_extra_gpu * extra, int
     }
 }
 
-// RssAnon / RssFile / RssShmem out of ONE pass over /proc/self/status. A key that is absent stays 0.
-static void ggml_sycl_host_mem_rss(size_t * anon, size_t * file, size_t * shmem) {
-    struct key_slot {
-        const char * key;
-        size_t *     out;
-    };
-
-    const key_slot slots[] = {
-        { "RssAnon",  anon  },
-        { "RssFile",  file  },
-        { "RssShmem", shmem }
-    };
-    std::ifstream f("/proc/self/status");
-    std::string   line;
-    while (std::getline(f, line)) {
-        for (const key_slot & slot : slots) {
-            const size_t klen = std::strlen(slot.key);
-            if (line.compare(0, klen, slot.key) == 0 && line.size() > klen && line[klen] == ':') {
-                *slot.out = static_cast<size_t>(std::strtoull(line.c_str() + klen + 1, nullptr, 10)) * 1024ull;
-            }
-        }
-    }
-}
-
-// One pass over /proc/meminfo: key -> bytes.
-static std::map<std::string, size_t> ggml_sycl_host_mem_meminfo() {
+// One pass over a /proc file of "Key:   <n> kB" lines (/proc/self/status, /proc/meminfo): key -> bytes.
+// An unreadable file gives an empty map and a missing key is simply absent, so callers can tell
+// "not available" from a real 0 and print "n/a" instead of a made-up 0.00.
+static std::map<std::string, size_t> ggml_sycl_host_mem_kv(const char * path) {
     std::map<std::string, size_t> out;
-    std::ifstream                 f("/proc/meminfo");
+    std::ifstream                 f(path);
     std::string                   line;
     while (std::getline(f, line)) {
         const size_t colon = line.find(':');
@@ -13655,6 +13633,17 @@ static std::map<std::string, size_t> ggml_sycl_host_mem_meminfo() {
             static_cast<size_t>(std::strtoull(line.c_str() + colon + 1, nullptr, 10)) * 1024ull;
     }
     return out;
+}
+
+// "%.2f" of a key in GB, or "n/a" when the key is absent.
+static std::string ggml_sycl_host_mem_gb_or_na(const std::map<std::string, size_t> & kv, const char * key) {
+    const auto it = kv.find(key);
+    if (it == kv.end()) {
+        return "n/a";
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.2f", it->second / (1024.0 * 1024.0 * 1024.0));
+    return buf;
 }
 
 // The biggest anonymous mappings of this process by resident size, from
@@ -13761,10 +13750,11 @@ bool ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase phase, const char * label)
     char             buf[512];
     std::string      line;
 
-    size_t rss_anon = 0, rss_file = 0, rss_shmem = 0;
-    ggml_sycl_host_mem_rss(&rss_anon, &rss_file, &rss_shmem);
-    std::snprintf(buf, sizeof(buf), "[HOSTMEM] phase=%s | process: rss_anon=%.2f rss_file=%.2f rss_shmem=%.2f GB",
-                  label ? label : "?", rss_anon / gb, rss_file / gb, rss_shmem / gb);
+    const auto status = ggml_sycl_host_mem_kv("/proc/self/status");
+    std::snprintf(buf, sizeof(buf), "[HOSTMEM] phase=%s | process: rss_anon=%s rss_file=%s rss_shmem=%s GB",
+                  label ? label : "?", ggml_sycl_host_mem_gb_or_na(status, "RssAnon").c_str(),
+                  ggml_sycl_host_mem_gb_or_na(status, "RssFile").c_str(),
+                  ggml_sycl_host_mem_gb_or_na(status, "RssShmem").c_str());
     line += buf;
 
     // Full mode only: glibc malloc split and the anonymous-mapping census. Both are
@@ -13786,19 +13776,20 @@ bool ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase phase, const char * label)
             have_mallinfo            = true;
         }
 #endif
-        if (have_mallinfo) {
+        const auto rss_anon_it = status.find("RssAnon");
+        if (have_mallinfo && rss_anon_it != status.end()) {
             // RssAnon counts malloc'd memory (in use, free-retained, mmapped) but NOT the
             // pinned pool: the pool's pages are driver-owned and show up only in
             // kernel_other and MemAvailable. So the process-side residual compares
             // RssAnon with glibc's own total, and the pool is reported separately.
             const double malloc_total = static_cast<double>(malloc_inuse + malloc_free + malloc_mmapped);
-            const double residual     = (static_cast<double>(rss_anon) - malloc_total) / gb;
+            const double residual     = (static_cast<double>(rss_anon_it->second) - malloc_total) / gb;
             std::snprintf(buf, sizeof(buf),
                           " | malloc inuse=%.2f free_retained=%.2f mmapped=%.2f (%zu chunks) GB; "
                           "process_residual=rss_anon-malloc_total=%.2f GB",
                           malloc_inuse / gb, malloc_free / gb, malloc_mmapped / gb, malloc_n_mmapped, residual);
         } else {
-            // No mallinfo2 (glibc < 2.33 or not glibc): say so rather than print zeros.
+            // No mallinfo2 (glibc < 2.33 or not glibc) or no RssAnon: say so rather than print zeros.
             std::snprintf(buf, sizeof(buf), " | malloc inuse=n/a free_retained=n/a mmapped=n/a process_residual=n/a");
         }
         line += buf;
@@ -13856,15 +13847,28 @@ bool ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase phase, const char * label)
 
     // System view: pages that belong to none of the userspace categories are the
     // driver's pinned/system buffer objects (the pinned pool lives there).
-    auto         mi         = ggml_sycl_host_mem_meminfo();
-    const size_t sys_listed = mi["MemFree"] + mi["Buffers"] + mi["Cached"] + mi["AnonPages"] + mi["Slab"] +
-                              mi["KernelStack"] + mi["PageTables"] + mi["Percpu"];
-    const double sys_kernel_other = (static_cast<double>(mi["MemTotal"]) - static_cast<double>(sys_listed)) / gb;
-    std::snprintf(buf, sizeof(buf),
-                  " | system: MemAvailable=%.2f Shmem=%.2f AnonPages=%.2f Cached=%.2f Slab=%.2f "
-                  "kernel_other(driver BOs)=%.2f GB",
-                  mi["MemAvailable"] / gb, mi["Shmem"] / gb, mi["AnonPages"] / gb, mi["Cached"] / gb, mi["Slab"] / gb,
-                  sys_kernel_other);
+    const auto                mi                  = ggml_sycl_host_mem_kv("/proc/meminfo");
+    // kernel_other = MemTotal minus every listed category; only meaningful when all nine figures exist.
+    static const char * const kernel_other_keys[] = { "MemTotal", "MemFree",     "Buffers",    "Cached", "AnonPages",
+                                                      "Slab",     "KernelStack", "PageTables", "Percpu" };
+    bool                      have_kernel_other   = true;
+    for (const char * key : kernel_other_keys) {
+        have_kernel_other = have_kernel_other && mi.find(key) != mi.end();
+    }
+    std::string kernel_other = "n/a";
+    if (have_kernel_other) {
+        const size_t listed = mi.at("MemFree") + mi.at("Buffers") + mi.at("Cached") + mi.at("AnonPages") +
+                              mi.at("Slab") + mi.at("KernelStack") + mi.at("PageTables") + mi.at("Percpu");
+        std::snprintf(buf, sizeof(buf), "%.2f",
+                      (static_cast<double>(mi.at("MemTotal")) - static_cast<double>(listed)) / gb);
+        kernel_other = buf;
+    }
+    std::snprintf(
+        buf, sizeof(buf),
+        " | system: MemAvailable=%s Shmem=%s AnonPages=%s Cached=%s Slab=%s kernel_other(driver BOs)=%s GB",
+        ggml_sycl_host_mem_gb_or_na(mi, "MemAvailable").c_str(), ggml_sycl_host_mem_gb_or_na(mi, "Shmem").c_str(),
+        ggml_sycl_host_mem_gb_or_na(mi, "AnonPages").c_str(), ggml_sycl_host_mem_gb_or_na(mi, "Cached").c_str(),
+        ggml_sycl_host_mem_gb_or_na(mi, "Slab").c_str(), kernel_other.c_str());
     line += buf;
 
     GGML_LOG_WARN("%s\n", line.c_str());

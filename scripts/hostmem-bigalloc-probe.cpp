@@ -68,7 +68,7 @@ void * __libc_realloc(void *, size_t);
 void * __libc_memalign(size_t, size_t);
 }
 
-static thread_local int t_in_hook = 0;
+static thread_local int t_in_hook   = 0;
 static size_t           g_min_bytes = 0;  // 0 = not read yet
 
 static size_t min_bytes() {
@@ -97,9 +97,9 @@ static void report(const char * fn, size_t size, size_t align) {
         return;
     }
     t_in_hook = 1;
-    void * frames[28];
+    void *    frames[28];
     const int n = backtrace(frames, 28);
-    char line[256];
+    char      line[256];
     snprintf(line, sizeof(line), "[BIGALLOC] fn=%s size=%zu MiB=%.1f align=%zu tid=%ld\n", fn, size,
              size / (1024.0 * 1024.0), align, (long) syscall(SYS_gettid));
     emit(line);
