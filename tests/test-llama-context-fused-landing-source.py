@@ -17,12 +17,15 @@ can see. The SYCL backend therefore exports a capability-only query and resolve_
 
 Pinned here:
   * the SYCL backend exports ggml_backend_sycl_supports_op_capability, registered as a reg proc and declared in
-    ggml-sycl.h, and it runs the SAME supports_op body with the two placement predicates (KV-host buft, planner-on-
-    host) switched off for the calling thread, so the two cannot drift apart;
+    ggml-sycl.h. supports_op and the query are the same function, ggml_sycl_device_supports_op_impl, differing
+    only in its `placement_declines` parameter: supports_op passes true, the query passes false, and each of the
+    four placement-predicate call sites (host-demoted KV x3, planner-on-host x1) is gated on the parameter, so
+    the query is supports_op minus placement and the two cannot drift apart. The predicates themselves stay pure;
   * the classifier asks that query when the backend has one, and otherwise falls back to the device supporting the
     node or a persistent host-resident operand (a host buffer whose usage is not COMPUTE);
-  * a landing the device could not have executed is logged with capability wording naming the device;
-  * a genuine placement landing keeps its placement wording;
+  * a landing the device could not have executed is logged as its own warning that carries the gap count, the layer
+    and the device name; a genuine placement landing keeps its own warning (the log's English is not pinned, its
+    format-string shape and arguments are);
   * the enable/disable decision is untouched: a CPU landing never disables the op, a landing on a non-CPU device
     still does.
 
@@ -113,6 +116,10 @@ def evaluate(ctx, hdr, be, sh):
         ctx, r"static\s+llama_fused_capability_fn\s+llama_context_sycl_capability_proc\s*\([^)]*\)\s*\{") or ""
     export = function_body(
         be, r"\bbool\s+ggml_backend_sycl_supports_op_capability\s*\([^)]*\)\s*\{") or ""
+    wrapper = function_body(
+        be, r"static\s+bool\s+ggml_backend_sycl_device_supports_op\s*\([^)]*\)\s*\{") or ""
+    impl = function_body(
+        be, r"static\s+bool\s+ggml_sycl_device_supports_op_impl\s*\([^)]*\bbool\s+placement_declines\s*\)\s*\{") or ""
     kv_host = function_body(
         be, r"static\s+bool\s+ggml_sycl_tensor_is_in_kv_host_buft\s*\([^)]*\)\s*\{") or ""
     planned = function_body(
@@ -122,19 +129,20 @@ def evaluate(ctx, hdr, be, sh):
 
     checks = {}
     # --- the backend side ---------------------------------------------------------------------------------------
-    checks["backend: the capability query is defined"] = bool(export)
-    checks["backend: the query sets the capability-only flag for the scope"] = bool(
-        re.search(r"g_sycl_supports_op_capability_only\s*=\s*true", export))
-    checks["backend: the flag is restored afterwards"] = bool(
-        re.search(r"~capability_scope\s*\(\s*\)\s*\{\s*g_sycl_supports_op_capability_only\s*=\s*saved", squash(export)))
-    checks["backend: the query runs the SAME supports_op body"] = bool(
-        re.search(r"return\s+ggml_backend_sycl_device_supports_op\s*\(\s*dev\s*,\s*op\s*\)", export))
-    checks["backend: the flag is thread-local"] = bool(
-        re.search(r"static\s+thread_local\s+bool\s+g_sycl_supports_op_capability_only\s*=\s*false", be))
-    checks["backend: the KV-host placement predicate honours the flag"] = bool(
-        re.search(r"if\s*\(\s*!t\s*\|\|\s*g_sycl_supports_op_capability_only\s*\)\s*\{\s*return\s+false", squash(kv_host)))
-    checks["backend: the planner-on-host predicate honours the flag"] = bool(
-        re.search(r"g_sycl_supports_op_capability_only\s*\)\s*\{\s*return\s+false", squash(planned)))
+    checks["backend: supports_op and the capability query share one impl taking placement_declines"] = bool(impl)
+    checks["backend: supports_op keeps its placement declines"] = bool(
+        re.search(r"return\s+ggml_sycl_device_supports_op_impl\s*\(\s*dev\s*,\s*op\s*,\s*true\s*\)", wrapper))
+    checks["backend: the capability query drops them"] = bool(
+        re.search(r"return\s+ggml_sycl_device_supports_op_impl\s*\(\s*dev\s*,\s*op\s*,\s*false\s*\)", export))
+    kv_sites = re.findall(r"ggml_sycl_tensor_is_in_kv_host_buft\s*\(", impl)
+    kv_gated = re.findall(r"placement_declines\s*&&\s*ggml_sycl_tensor_is_in_kv_host_buft\s*\(", impl)
+    checks["backend: every KV-host placement site in the impl is gated on the parameter"] = bool(kv_sites) and len(kv_sites) == len(kv_gated)
+    pl_sites = re.findall(r"ggml_sycl_op_is_planned_on_host\s*\(", impl)
+    pl_gated = re.findall(r"placement_declines\s*&&\s*!is_multi_gpu_router_logits\s*&&\s*ggml_sycl_op_is_planned_on_host\s*\(", impl)
+    checks["backend: every planner-on-host site in the impl is gated on the parameter"] = bool(pl_sites) and len(pl_sites) == len(pl_gated)
+    checks["backend: the placement predicates take no flag (they stay pure)"] = bool(kv_host) and bool(planned) and not re.search(
+        r"placement_declines|thread_local|capability_only", kv_host + planned)
+    checks["backend: no thread-local capability state"] = not re.search(r"thread_local[^;]*capability", be)
     checks["backend: the query is registered as a reg proc"] = bool(
         re.search(r"strcmp\s*\(\s*name\s*,\s*\"ggml_backend_sycl_supports_op_capability\"\s*\)\s*==\s*0\s*\)\s*\{\s*return\s*\(void\s*\*\)\s*ggml_backend_sycl_supports_op_capability",
                   squash(be)))
@@ -160,16 +168,25 @@ def evaluate(ctx, hdr, be, sh):
     checks["context looks the capability query up by its exported name"] = (
         bool(re.search(r"llama_context_dev_is_sycl\s*\(\s*dev\s*\)\s*\?\s*&ggml_backend_sycl_supports_op_capability", squash(cap_proc))) and
         '"ggml_backend_sycl_supports_op_capability"' in cap_proc)
-    checks["resolve_fused_ops hands the classifier the query for the layer device"] = bool(
-        re.search(r"llama_fused_cpu_landing_is_placement\s*\(\s*device_layer\s*,\s*node\.tensor\s*,\s*llama_context_sycl_capability_proc\s*\(\s*device_layer\s*\)\s*\)",
+    checks["resolve_fused_ops looks the query up once per layer device"] = bool(
+        re.search(r"std::map\s*<\s*ggml_backend_dev_t\s*,\s*llama_fused_capability_fn\s*>\s*capability_procs\s*;.*?"
+                  r"capability_procs\s*\.\s*emplace\s*\(\s*device_layer\s*,\s*llama_context_sycl_capability_proc\s*\(\s*device_layer\s*\)\s*\)",
                   flat_resolve))
-    checks["capability wording names the device that lacks support"] = bool(
-        re.search(r"executes on CPU for %u layer\(s\).{0,60}because %s does not support it", flat_resolve))
-    checks["capability wording is a warning"] = bool(
-        re.search(r"if\s*\(\s*n_cpu_gaps\s*>\s*0\s*\)\s*\{\s*LLAMA_LOG_WARN", flat_resolve))
-    checks["placement wording is kept"] = "the executor follows data placement, not a capability gap" in flat_resolve
-    checks["placement wording is only for placement"] = bool(
-        re.search(r"if\s*\(\s*n_cpu_landings\s*>\s*0\s*\)\s*\{\s*LLAMA_LOG_WARN", flat_resolve))
+    checks["resolve_fused_ops hands the classifier the cached query"] = bool(
+        re.search(r"llama_fused_cpu_landing_is_placement\s*\(\s*device_layer\s*,\s*node\.tensor\s*,\s*capability\s*->\s*second\s*\)",
+                  flat_resolve))
+    # the log's English is not pinned, its shape is: one warning per case, each counting its own landings
+    gap_warn = re.search(r"if\s*\(\s*n_cpu_gaps\s*>\s*0\s*\)\s*\{\s*LLAMA_LOG_WARN\s*\((.*?)\)\s*;\s*\}", flat_resolve)
+    gap_call = gap_warn.group(1) if gap_warn else ""
+    checks["capability warning counts the gaps, names the layer and the device"] = bool(
+        gap_warn and gap_call.count("%u") == 1 and gap_call.count("%d") >= 1 and gap_call.count("%s") >= 3 and
+        re.search(r"n_cpu_gaps\s*,\s*cpu_gap_il\s*,\s*ggml_backend_dev_name\s*\(\s*cpu_gap_dev\s*\)", gap_call))
+    place_warn = re.search(r"if\s*\(\s*n_cpu_landings\s*>\s*0\s*\)\s*\{\s*LLAMA_LOG_WARN\s*\((.*?)\)\s*;\s*\}", flat_resolve)
+    place_call = place_warn.group(1) if place_warn else ""
+    checks["placement warning counts the placement landings and names the layer"] = bool(
+        place_warn and place_call.count("%u") == 1 and
+        re.search(r"n_cpu_landings\s*,\s*cpu_landing_il", place_call) and "n_cpu_gaps" not in place_call)
+    checks["the two warnings do not share a counter"] = "n_cpu_gaps" not in place_call and "n_cpu_landings" not in gap_call
     checks["a non-CPU mismatch still disables the op"] = bool(
         re.search(r"device_mismatch\s*=\s*true", flat_resolve) and re.search(r"if\s*\(\s*device_mismatch\s*\)\s*\{\s*enabled\s*=\s*false", flat_resolve))
     checks["a CPU landing still leaves the op enabled"] = bool(
@@ -220,18 +237,20 @@ if args.self_test:
         return tuple(kw.get(k, sources[k]) for k in NAMES)
 
     mutants = [
-        ("query never sets the flag", "backend: the query sets the capability-only flag for the scope",
-         with_(be=mutate(sources["be"], "g_sycl_supports_op_capability_only = true;", "(void) 0;"))),
-        ("flag not restored", "backend: the flag is restored afterwards",
-         with_(be=mutate(sources["be"], "g_sycl_supports_op_capability_only = saved;", "(void) saved;"))),
-        ("query answers from a private switch", "backend: the query runs the SAME supports_op body",
-         with_(be=mutate(sources["be"], "return ggml_backend_sycl_device_supports_op(dev, op);", "return true;"))),
-        ("flag is a plain global", "backend: the flag is thread-local",
-         with_(be=mutate(sources["be"], "static thread_local bool g_sycl_supports_op_capability_only", "static bool g_sycl_supports_op_capability_only"))),
-        ("KV-host predicate ignores the flag", "backend: the KV-host placement predicate honours the flag",
-         with_(be=mutate(sources["be"], "if (!t || g_sycl_supports_op_capability_only) {", "if (!t) {"))),
-        ("planner predicate ignores the flag", "backend: the planner-on-host predicate honours the flag",
-         with_(be=mutate(sources["be"], "if (!op || device < 0 || g_sycl_supports_op_capability_only) {", "if (!op || device < 0) {"))),
+        ("supports_op stops declining for placement", "backend: supports_op keeps its placement declines",
+         with_(be=mutate(sources["be"], "return ggml_sycl_device_supports_op_impl(dev, op, true);", "return ggml_sycl_device_supports_op_impl(dev, op, false);"))),
+        ("capability query keeps the declines", "backend: the capability query drops them",
+         with_(be=mutate(sources["be"], "return ggml_sycl_device_supports_op_impl(dev, op, false);\n}", "return ggml_sycl_device_supports_op_impl(dev, op, true);\n}"))),
+        ("impl loses the parameter", "backend: supports_op and the capability query share one impl taking placement_declines",
+         with_(be=mutate(sources["be"], "const ggml_tensor * op, bool placement_declines) {", "const ggml_tensor * op, bool placement_declines_x) {"))),
+        ("KV-host site ungated", "backend: every KV-host placement site in the impl is gated on the parameter",
+         with_(be=mutate(sources["be"], "if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {", "if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {"))),
+        ("planner site ungated", "backend: every planner-on-host site in the impl is gated on the parameter",
+         with_(be=mutate(sources["be"], "if (placement_declines && !is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {", "if (!is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {"))),
+        ("KV-host predicate takes a flag", "backend: the placement predicates take no flag (they stay pure)",
+         with_(be=mutate(sources["be"], "static bool ggml_sycl_tensor_is_in_kv_host_buft(const ggml_tensor * t) {\n    if (!t) {", "static bool ggml_sycl_tensor_is_in_kv_host_buft(const ggml_tensor * t) {\n    if (!t || placement_declines) {"))),
+        ("thread-local capability state returns", "backend: no thread-local capability state",
+         with_(be=sources["be"] + "\nstatic thread_local bool g_sycl_capability_flag = false;\n")),
         ("proc not registered", "backend: the query is registered as a reg proc",
          with_(be=mutate(sources["be"], 'strcmp(name, "ggml_backend_sycl_supports_op_capability") == 0', 'strcmp(name, "ggml_backend_sycl_supports_op_capability_x") == 0'))),
         ("query undeclared", "backend: the query is declared in ggml-sycl.h",
@@ -252,16 +271,20 @@ if args.self_test:
          with_(ctx=mutate(sources["ctx"], '#include "llama-fused-landing.h"', ""))),
         ("capability proc not looked up", "context looks the capability query up by its exported name",
          with_(ctx=mutate(sources["ctx"], "&ggml_backend_sycl_supports_op_capability", "nullptr"))),
-        ("capability proc not passed", "resolve_fused_ops hands the classifier the query for the layer device",
-         with_(ctx=mutate(sources["ctx"], "llama_context_sycl_capability_proc(device_layer)", "nullptr"))),
-        ("capability wording dropped", "capability wording names the device that lacks support",
-         with_(ctx=mutate(sources["ctx"], "because %s does not support it", "because of placement"))),
-        ("capability line demoted", "capability wording is a warning",
+        ("capability proc looked up per node", "resolve_fused_ops looks the query up once per layer device",
+         with_(ctx=mutate(sources["ctx"], "capability_procs.emplace(device_layer, llama_context_sycl_capability_proc(device_layer))", "capability_procs.emplace(device_layer, llama_context_sycl_capability_proc(nullptr))"))),
+        ("capability proc not passed", "resolve_fused_ops hands the classifier the cached query",
+         with_(ctx=mutate(sources["ctx"], "node.tensor, capability->second)", "node.tensor, nullptr)"))),
+        ("capability warning loses the device", "capability warning counts the gaps, names the layer and the device",
+         with_(ctx=mutate(sources["ctx"], "n_cpu_gaps, cpu_gap_il, ggml_backend_dev_name(cpu_gap_dev)", "n_cpu_gaps, cpu_gap_il, \"\""))),
+        ("capability warning counts placement landings", "capability warning counts the gaps, names the layer and the device",
+         with_(ctx=mutate(sources["ctx"], "n_cpu_gaps, cpu_gap_il, ggml_backend_dev_name(cpu_gap_dev)", "n_cpu_landings, cpu_gap_il, ggml_backend_dev_name(cpu_gap_dev)"))),
+        ("capability line demoted", "capability warning counts the gaps, names the layer and the device",
          with_(ctx=mutate(sources["ctx"], "if (n_cpu_gaps > 0) {\n                LLAMA_LOG_WARN(", "if (n_cpu_gaps > 0) {\n                LLAMA_LOG_INFO("))),
-        ("placement wording dropped", "placement wording is kept",
-         with_(ctx=mutate(sources["ctx"], "the executor follows data placement, not a capability gap", "the executor follows placement"))),
-        ("placement line unguarded", "placement wording is only for placement",
-         with_(ctx=mutate(sources["ctx"], "if (n_cpu_landings > 0) {", "if (n_cpu_landings > 0 || n_cpu_gaps > 0) {"))),
+        ("placement warning dropped", "placement warning counts the placement landings and names the layer",
+         with_(ctx=mutate(sources["ctx"], "if (n_cpu_landings > 0) {", "if (n_cpu_landings > 1000000) {"))),
+        ("placement warning counts the gaps", "the two warnings do not share a counter",
+         with_(ctx=mutate(sources["ctx"], "n_cpu_landings,\n                    cpu_landing_il", "n_cpu_gaps,\n                    cpu_landing_il"))),
         ("mismatch no longer disables", "a non-CPU mismatch still disables the op",
          with_(ctx=mutate(sources["ctx"], "if (device_mismatch) {\n            enabled = false;", "if (device_mismatch) {\n            enabled = true;"))),
         ("CPU landing disables the op", "a CPU landing still leaves the op enabled",

@@ -12,18 +12,20 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PATH = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 SOURCE_RAW = SOURCE_PATH.read_text(encoding="utf-8")
 SOURCE = with_dense_type_list_inlined(SOURCE_RAW)
-FUNCTION_START = "static bool ggml_backend_sycl_device_supports_op("
+# supports_op is the thin wrapper `impl(dev, op, true)`; the decisions live in the impl, whose `placement_declines`
+# parameter is what ggml_backend_sycl_supports_op_capability turns off.
+FUNCTION_START = "static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op, bool placement_declines) {"
 FUNCTION_END = "static bool ggml_backend_sycl_device_supports_buft("
 EARLY_GUARD = "if (op->op == GGML_OP_ADD_ID || op->op == GGML_OP_MUL_MAT_ID) {"
 ROUTER_FLAG = "const bool is_multi_gpu_router_logits ="
-PLANNER_GUARD = "if (!is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {"
+PLANNER_GUARD = "if (placement_declines && !is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {"
 OP_SWITCH = "switch (op->op) {"
 # The KV-host-tier residency decline (llama.cpp-uize/h56y, TKV-13 host attention dispatch) runs before the
 # indexed-MoE early return. It is pinned verbatim, comments aside, rather than waved through: it may only ever
 # return false (or `continue`) on an operand living in the dedicated KV-host buft, which no ADD_ID/MUL_MAT_ID
 # operand does, and anything else that appears ahead of the early return still fails the equality below.
 KV_HOST_RESIDENCY_BLOCK = """
-    if (ggml_sycl_tensor_is_in_kv_host_buft(op)) {
+    if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op)) {
         if (!(op->op == GGML_OP_SET_ROWS && ggml_sycl_attn_host_dispatch_enabled())) {
             if (g_ggml_sycl_debug) {
                 g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
@@ -37,9 +39,9 @@ KV_HOST_RESIDENCY_BLOCK = """
         }
     }
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
+        if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
             if ((op->op == GGML_OP_FLASH_ATTN_EXT ||
-                 (op->op == GGML_OP_SET_ROWS && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&
+                 (op->op == GGML_OP_SET_ROWS && placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&
                 ggml_sycl_attn_host_dispatch_enabled()) {
                 if (g_ggml_sycl_debug) {
                     g_sycl_attn_host_accept_count.fetch_add(1, std::memory_order_relaxed);

@@ -7,10 +7,10 @@
 #endif
 #include "llama-arch.h"
 #include "llama-auto-ubatch.h"
+#include "llama-fused-landing.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
-#include "llama-fused-landing.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -1495,6 +1495,8 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         uint32_t           n_cpu_gaps      = 0;
         int                cpu_gap_il      = -1;
         ggml_backend_dev_t cpu_gap_dev     = nullptr;
+        // the capability query of each layer device, looked up once (a reg-proc lookup in DL builds), not per node
+        std::map<ggml_backend_dev_t, llama_fused_capability_fn> capability_procs;
 
         for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
             if (node.op != probe.op) {
@@ -1532,8 +1534,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                     break;
                 }
 
-                if (llama_fused_cpu_landing_is_placement(device_layer, node.tensor,
-                                                                 llama_context_sycl_capability_proc(device_layer))) {
+                auto capability = capability_procs.find(device_layer);
+                if (capability == capability_procs.end()) {
+                    capability =
+                        capability_procs.emplace(device_layer, llama_context_sycl_capability_proc(device_layer)).first;
+                }
+
+                if (llama_fused_cpu_landing_is_placement(device_layer, node.tensor, capability->second)) {
                     n_cpu_landings++;
                     cpu_landing_il  = node.il;
                     cpu_landing_dev = device_fused;

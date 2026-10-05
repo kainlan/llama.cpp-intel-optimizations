@@ -95,7 +95,7 @@ def _contract(convert_source: str, support_source: str = SUPPORT_SOURCE) -> bool
         kernel = _function(convert_source, "static void dequantize_block_nvfp4_fp16(")
         launch = _function(convert_source, "static void dequantize_row_nvfp4_fp16_sycl(")
         dense = _function(support_source, "static bool ggml_sycl_mul_mat_type_supported(")
-        supports = _function(support_source, "static bool ggml_backend_sycl_device_supports_op(")
+        supports = _function(support_source, "static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op, bool placement_declines) {")
     except (ValueError, AssertionError):
         return False
 

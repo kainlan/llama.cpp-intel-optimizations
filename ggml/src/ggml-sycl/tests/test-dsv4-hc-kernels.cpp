@@ -18,7 +18,9 @@
 // Exit 77 (ctest SKIP) when no opencl:cpu device is visible -- a skip is not a pass.
 
 #include "../dsv4-hc-kernels.hpp"
+#include "../dsv4-hc-predicates.hpp"
 #include "../lightning-indexer-kernel.hpp"
+#include "../lightning-indexer-predicate.hpp"
 #include "sycl-test-skip.hpp"
 
 #include <algorithm>
@@ -33,6 +35,7 @@
 #include <vector>
 
 using namespace ggml_sycl_dsv4;
+using namespace ggml_sycl_lightning_indexer;
 
 namespace {
 
@@ -41,6 +44,10 @@ int g_failed = 0;
 
 constexpr double NMSE_TOL     = 1e-9;
 constexpr double NMSE_REJECTS = 1e-4;  // a control oracle must be at least this far from the kernel
+
+// The matrix below produces several hundred checks (about 480 with both sub-group sizes); a run
+// that produces fewer than this had a loop silently skip its work, which a bare "no failure" would report as a pass.
+constexpr int MIN_CHECKS = 100;
 
 std::mt19937 g_rng(20261003);
 
@@ -236,49 +243,55 @@ void test_pre(sycl::queue & q, int64_t n_embd, int64_t hc, int64_t n_tokens, boo
 
 // ---- DSV4_HC_COMB ----------------------------------------------------------------------------------------------
 
-std::vector<double> comb_oracle(const buf & mixes,
-                                int64_t     n_tokens,
-                                const buf & scale,
-                                const buf & base,
-                                double      eps,
-                                int         n_iter) {
+// The oracle's layout, from the op definition in ggml.h rather than from the kernel: per token, mixes[:, t] is
+// [pre(4), post(4), comb(4 x 4)], so source stream s, destination d of the comb sits at HC_COMB_COMB_OFFSET + 4 s + d.
+std::vector<double> comb_oracle(const buf &   mixes,
+                                const view3 & vm,
+                                const buf &   scale,
+                                int64_t       ss0,
+                                const buf &   base,
+                                int64_t       sb0,
+                                double        eps,
+                                int           n_iter) {
+    const int64_t       n_tokens = vm.n1;
     std::vector<double> out(16 * (size_t) n_tokens);
     for (int64_t t = 0; t < n_tokens; ++t) {
         double m[4][4];  // m[src][dst]
-        for (int s = 0; s < 4; ++s) {
+        for (int s = 0; s < HC_COMB_STREAMS; ++s) {
             double mx = -1e300;
-            for (int d = 0; d < 4; ++d) {
-                const int idx = 8 + 4 * s + d;
-                m[s][d]       = (double) mixes.p[idx + 24 * t] * scale.p[2] + base.p[idx];
-                mx            = std::max(mx, m[s][d]);
+            for (int d = 0; d < HC_COMB_STREAMS; ++d) {
+                const int64_t idx = HC_COMB_COMB_OFFSET + HC_COMB_STREAMS * s + d;
+                m[s][d] =
+                    (double) mixes.p[vm.at(idx, t, 0)] * scale.p[HC_COMB_SCALE_COMB_IDX * ss0] + base.p[idx * sb0];
+                mx = std::max(mx, m[s][d]);
             }
             double sum = 0.0;
-            for (int d = 0; d < 4; ++d) {
+            for (int d = 0; d < HC_COMB_STREAMS; ++d) {
                 m[s][d] = std::exp(m[s][d] - mx);
                 sum += m[s][d];
             }
-            for (int d = 0; d < 4; ++d) {
+            for (int d = 0; d < HC_COMB_STREAMS; ++d) {
                 m[s][d] = m[s][d] / sum + eps;
             }
         }
         auto cols = [&] {
-            for (int d = 0; d < 4; ++d) {
+            for (int d = 0; d < HC_COMB_STREAMS; ++d) {
                 double sum = eps;
-                for (int s = 0; s < 4; ++s) {
+                for (int s = 0; s < HC_COMB_STREAMS; ++s) {
                     sum += m[s][d];
                 }
-                for (int s = 0; s < 4; ++s) {
+                for (int s = 0; s < HC_COMB_STREAMS; ++s) {
                     m[s][d] /= sum;
                 }
             }
         };
         auto rows = [&] {
-            for (int s = 0; s < 4; ++s) {
+            for (int s = 0; s < HC_COMB_STREAMS; ++s) {
                 double sum = eps;
-                for (int d = 0; d < 4; ++d) {
+                for (int d = 0; d < HC_COMB_STREAMS; ++d) {
                     sum += m[s][d];
                 }
-                for (int d = 0; d < 4; ++d) {
+                for (int d = 0; d < HC_COMB_STREAMS; ++d) {
                     m[s][d] /= sum;
                 }
             }
@@ -288,25 +301,35 @@ std::vector<double> comb_oracle(const buf & mixes,
             rows();
             cols();
         }
-        for (int s = 0; s < 4; ++s) {
-            for (int d = 0; d < 4; ++d) {
-                out[(size_t) (d + 4 * s + 16 * t)] = m[s][d];
+        for (int s = 0; s < HC_COMB_STREAMS; ++s) {
+            for (int d = 0; d < HC_COMB_STREAMS; ++d) {
+                out[(size_t) (d + HC_COMB_STREAMS * s + HC_COMB_STREAMS * HC_COMB_STREAMS * t)] = m[s][d];
             }
         }
     }
     return out;
 }
 
-void test_comb(sycl::queue & q, int64_t n_tokens, int n_iter, float eps) {
-    buf mixes(q, 24 * (size_t) n_tokens);
-    buf scale(q, 3);
-    buf base(q, 24);
-    buf d(q, 16 * (size_t) n_tokens);
+// `pad` strides every operand the way a view of a larger tensor is strided: mixes, scale and base with an element
+// stride of 2 plus slack between columns, dst with padded rows and planes. A kernel that assumes packed strides, or
+// that touches the slack, fails the comparison or the padding check.
+void test_comb(sycl::queue & q, int64_t n_tokens, int n_iter, float eps, bool pad = false) {
+    constexpr int64_t SCALE_LEN = HC_COMB_SCALE_COMB_IDX + 1;
+    const int64_t     elem      = pad ? 2 : 1;
+    const view3       vm        = pad ? view3{ HC_COMB_MIX_DIM, n_tokens, 1, elem, HC_COMB_MIX_DIM * elem + 3, 0 } :
+                                        view3{ HC_COMB_MIX_DIM, n_tokens, 1, 1, HC_COMB_MIX_DIM, 0 };
+    const view3       vd        = pad ? padded(HC_COMB_STREAMS, HC_COMB_STREAMS, n_tokens) :
+                                        contiguous(HC_COMB_STREAMS, HC_COMB_STREAMS, n_tokens);
+    buf               mixes(q, vm.span());
+    buf               scale(q, 1 + (SCALE_LEN - 1) * elem);
+    buf               base(q, 1 + (HC_COMB_MIX_DIM - 1) * elem);
+    buf               d(q, vd.span());
     // logits spread over about +-8, so the softmax is peaky and Sinkhorn has real work to do; near-uniform
     // logits leave every normalisation an almost-no-op and no mutation of it would show
     mixes.fill(-2.0f, 2.0f);
     scale.fill(2.0f, 3.0f);
     base.fill(-1.0f, 1.0f);
+    d.fill_value(12345.0f);
 
     hc_comb_args a = {};
     a.mixes        = mixes.p;
@@ -314,22 +337,33 @@ void test_comb(sycl::queue & q, int64_t n_tokens, int n_iter, float eps) {
     a.base         = base.p;
     a.dst          = d.p;
     a.n_tokens     = n_tokens;
-    a.sm0 = 1, a.sm1 = 24;
-    a.ss0 = 1;
-    a.sb0 = 1;
-    a.sd0 = 1, a.sd1 = 4, a.sd2 = 16;
+    a.sm0 = vm.s0, a.sm1 = vm.s1;
+    a.ss0 = elem;
+    a.sb0 = elem;
+    a.sd0 = vd.s0, a.sd1 = vd.s1, a.sd2 = vd.s2;
     a.eps    = eps;
     a.n_iter = n_iter;
     hc_comb_launch(q, a);
     q.wait_and_throw();
 
-    const std::vector<double> got(d.p, d.p + d.n);
-    const std::string         name = "comb tokens=" + std::to_string(n_tokens) + " n_iter=" + std::to_string(n_iter);
-    expect_match(name, got, comb_oracle(mixes, n_tokens, scale, base, eps, n_iter));
+    std::vector<double> got;
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int64_t s = 0; s < HC_COMB_STREAMS; ++s) {
+            for (int64_t dd = 0; dd < HC_COMB_STREAMS; ++dd) {
+                got.push_back(d.p[vd.at(dd, s, t)]);
+            }
+        }
+    }
+    const std::string name =
+        "comb tokens=" + std::to_string(n_tokens) + " n_iter=" + std::to_string(n_iter) + (pad ? " strided" : "");
+    expect_match(name, got, comb_oracle(mixes, vm, scale, elem, base, elem, eps, n_iter));
+    if (pad) {
+        report(name + " leaves padding alone", padding_untouched(d, vd, 12345.0f), 0.0);
+    }
     if (n_iter > 1) {
         // Sinkhorn converges within a few iterations, so "one iteration fewer" is not a different answer;
         // a kernel that never ran the row normalisation (n_iter == 1) is.
-        expect_reject(name + " vs no row normalisation", got, comb_oracle(mixes, n_tokens, scale, base, eps, 1));
+        expect_reject(name + " vs no row normalisation", got, comb_oracle(mixes, vm, scale, elem, base, elem, eps, 1));
     }
 }
 
@@ -423,20 +457,20 @@ void test_post(sycl::queue & q, int64_t n_embd, int64_t hc, int64_t n_tokens, bo
 
 // ---- LIGHTNING_INDEXER -----------------------------------------------------------------------------------------
 
-struct lid_case {
+struct lightning_indexer_case {
     int64_t   n_embd, n_head, n_kv, n_batch, n_stream, nem3;
     ggml_type type;
     bool      pad          = false;  // strided q/k/w/m/dst with slack
     int64_t   max_groups_x = 0;      // launch grid width cap (0: the production default)
 };
 
-std::vector<double> lid_oracle(const std::vector<float> & q,
-                               const std::vector<float> & kf,
-                               const std::vector<float> & w,
-                               const std::vector<float> & m,
-                               const lid_case &           c,
-                               bool                       wrong_no_relu = false,
-                               bool                       wrong_no_mask = false) {
+std::vector<double> lightning_indexer_oracle(const std::vector<float> &     q,
+                                             const std::vector<float> &     kf,
+                                             const std::vector<float> &     w,
+                                             const std::vector<float> &     m,
+                                             const lightning_indexer_case & c,
+                                             bool                           wrong_no_relu = false,
+                                             bool                           wrong_no_mask = false) {
     std::vector<double> out;
     for (int64_t s = 0; s < c.n_stream; ++s) {
         for (int64_t t = 0; t < c.n_batch; ++t) {
@@ -459,7 +493,7 @@ std::vector<double> lid_oracle(const std::vector<float> & q,
     return out;
 }
 
-template <int LANES> void test_lid(sycl::queue & q, const lid_case & c) {
+template <int LANES> void test_lightning_indexer(sycl::queue & q, const lightning_indexer_case & c) {
     // K rows: random floats, stored in c.type with ggml-base's reference quantizer, decoded back by its to_float
     const ggml_type_traits * tr        = ggml_get_type_traits(c.type);
     const size_t             row_bytes = ggml_row_size(c.type, c.n_embd);
@@ -509,7 +543,6 @@ template <int LANES> void test_lid(sycl::queue & q, const lid_case & c) {
     a.n_stream               = c.n_stream;
     a.n_kv                   = c.n_kv;
     a.nem3                   = c.nem3;
-    a.max_groups_x           = c.max_groups_x;
     a.nbq1                   = sizeof(float) * c.n_embd + pq1;
     a.nbq2                   = a.nbq1 * c.n_head + pq2;
     a.nbq3                   = a.nbq2 * c.n_batch + pq3;
@@ -562,7 +595,7 @@ template <int LANES> void test_lid(sycl::queue & q, const lid_case & c) {
     }
     a.q = dq, a.k = dk, a.w = dw, a.m = dm, a.dst = dd;
 
-    const bool launched = lightning_indexer_launch<LANES>(q, a);
+    const bool launched = lightning_indexer_launch<LANES>(q, a, c.max_groups_x);
     q.wait_and_throw();
 
     const std::string name = std::string("indexer lanes=") + std::to_string(LANES) +
@@ -590,13 +623,13 @@ template <int LANES> void test_lid(sycl::queue & q, const lid_case & c) {
         for (size_t i = 0; i < n_dst_floats; ++i) {
             n_slack_touched += !seen[i] && dd[i] != 12345.0f;
         }
-        expect_match(name, got, lid_oracle(qv, kf, wv, mv, c));
+        expect_match(name, got, lightning_indexer_oracle(qv, kf, wv, mv, c));
         if (c.pad) {
             report(name + " leaves padding alone", n_slack_touched == 0, (double) n_slack_touched);
         }
         if (c.n_kv * c.n_batch >= 16 && c.n_head >= 4) {
-            expect_reject(name + " vs no ReLU", got, lid_oracle(qv, kf, wv, mv, c, true, false));
-            expect_reject(name + " vs no mask", got, lid_oracle(qv, kf, wv, mv, c, false, true));
+            expect_reject(name + " vs no ReLU", got, lightning_indexer_oracle(qv, kf, wv, mv, c, true, false));
+            expect_reject(name + " vs no mask", got, lightning_indexer_oracle(qv, kf, wv, mv, c, false, true));
         }
     }
 
@@ -607,10 +640,38 @@ template <int LANES> void test_lid(sycl::queue & q, const lid_case & c) {
     sycl::free(dd, q);
 }
 
+// launch returns true for exactly the (K type, n_embd) combinations the predicate admits at this lane count and
+// false for every other, without touching the queue; nothing else asserts the `false` half, and a launcher that
+// silently ran nothing for an unadmitted shape would leave its destination unwritten.
+template <int LANES> void test_lightning_indexer_dispatch(sycl::queue & q) {
+    int mismatches = 0;
+    int admitted   = 0;
+    int refused    = 0;
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        for (int64_t n_embd : { 16LL, 32LL, 48LL, 64LL, 128LL, 256LL, 512LL, 1024LL }) {
+            lightning_indexer_args a = {};
+            a.k_type                 = (ggml_type) t;
+            a.n_embd                 = n_embd;  // every size/count is zero: an admitted launch is a no-op range
+            const bool want = k_type_supported((ggml_type) t) && n_embd % LANES == 0 && epl_supported(n_embd / LANES);
+            const bool got  = lightning_indexer_launch<LANES>(q, a);
+            q.wait_and_throw();
+            mismatches += got != want;
+            admitted += got;
+            refused += !got;
+        }
+    }
+    report("indexer launch lanes=" + std::to_string(LANES) +
+               " returns true for exactly the admitted (K type, n_embd) pairs",
+           mismatches == 0, (double) mismatches);
+    // non-vacuous: both halves of the assertion were exercised
+    report("indexer launch lanes=" + std::to_string(LANES) + " dispatch matrix has admitted and refused pairs",
+           admitted > 0 && refused > 0, (double) (admitted + refused));
+}
+
 // The grid arithmetic that keeps the launch inside 32-bit work-item ids. The shapes that overflowed a 1D range
 // are too big to run here, so the arithmetic is checked on them directly, with the hardware-independent bound
 // the compiler assumes (every global range dimension below 2^31, every group count below 2^31).
-void test_lid_dims() {
+void test_lightning_indexer_dims() {
     const int64_t INT_RANGE = int64_t(1) << 31;
 
     struct shape {
@@ -633,10 +694,11 @@ void test_lid_dims() {
     for (const shape & s : shapes) {
         const auto    d      = lightning_indexer_launch_dims(s.n_rows, 0);
         const int64_t groups = d.groups_x * d.groups_y;
-        const bool    covers = s.n_rows == 0 ? d.groups_y == 0 : groups * LID_ROWS_PER_BLOCK >= s.n_rows;
-        const bool    tight  = s.n_rows == 0 || (groups - d.groups_x) * LID_ROWS_PER_BLOCK < s.n_rows;
+        const bool    covers = s.n_rows == 0 ? d.groups_y == 0 : groups * LIGHTNING_INDEXER_ROWS_PER_BLOCK >= s.n_rows;
+        const bool    tight  = s.n_rows == 0 || (groups - d.groups_x) * LIGHTNING_INDEXER_ROWS_PER_BLOCK < s.n_rows;
         for (int lanes : { 16, 32 }) {
-            const bool fits = d.groups_x * LID_ROWS_PER_BLOCK * lanes < INT_RANGE && d.groups_y < INT_RANGE;
+            const bool fits =
+                d.groups_x * LIGHTNING_INDEXER_ROWS_PER_BLOCK * lanes < INT_RANGE && d.groups_y < INT_RANGE;
             report(std::string("indexer grid ") + s.what + " lanes=" + std::to_string(lanes) +
                        " covers every row, wastes under one grid row, every dimension fits 32-bit ids",
                    covers && tight && fits, (double) groups);
@@ -644,8 +706,606 @@ void test_lid_dims() {
     }
     // a 1D range for the overflow shapes WOULD have exceeded the id range: the control that makes the above bite
     report("control: a 1D range for 2^26 rows at 32 lanes exceeds the 32-bit id range",
-           ((int64_t(1) << 26) + LID_ROWS_PER_BLOCK - 1) / LID_ROWS_PER_BLOCK * LID_ROWS_PER_BLOCK * 32 >= INT_RANGE,
+           ((int64_t(1) << 26) + LIGHTNING_INDEXER_ROWS_PER_BLOCK - 1) / LIGHTNING_INDEXER_ROWS_PER_BLOCK *
+                   LIGHTNING_INDEXER_ROWS_PER_BLOCK * 32 >=
+               INT_RANGE,
            0.0);
+}
+
+// ---- supports_op predicates ------------------------------------------------------------------------------------
+//
+// The predicates ggml_backend_sycl_device_supports_op asks are pure ggml, so they run here over REAL op nodes built
+// with the ggml API (shapes the API itself would assert on are reached by editing the built node, the way a
+// view or a graph rewrite could present them). Each decline case changes exactly one property of an accepted node,
+// so a predicate that dropped that one check turns the case red; each family also has accepting cases, so a
+// predicate that declined everything is not a pass.
+
+struct node_ctx {
+    ggml_context * c;
+
+    node_ctx() {
+        ggml_init_params ip = {};
+        ip.mem_size         = 4 * 1024 * 1024;
+        ip.no_alloc         = true;
+        c                   = ggml_init(ip);
+    }
+
+    ~node_ctx() { ggml_free(c); }
+
+    ggml_tensor * t(ggml_type ty, int64_t n0, int64_t n1 = 1, int64_t n2 = 1, int64_t n3 = 1) {
+        return ggml_new_tensor_4d(c, ty, n0, n1, n2, n3);
+    }
+};
+
+void expect_pred(const std::string & name, bool got, bool want) {
+    report(std::string("predicate: ") + name + (want ? " is admitted" : " is declined"), got == want, 0.0);
+}
+
+constexpr int64_t PRED_N_EMBD = 64;
+constexpr int64_t PRED_N_TOK  = 3;
+constexpr int     PRED_N_ITER = 20;
+constexpr int     PRED_OP_PARAM_N_ITER =
+    1;  // op_params slot ggml_dsv4_hc_comb stores n_iter in (and hc_pre its gated flag)
+
+void test_predicates_pre() {
+    auto build = [](node_ctx & n, bool gated) {
+        ggml_tensor * x = n.t(GGML_TYPE_F32, PRED_N_EMBD, 4, PRED_N_TOK);
+        return gated ? ggml_dsv4_hc_pre_gated(n.c, x, n.t(GGML_TYPE_F32, PRED_N_EMBD, 4, PRED_N_TOK), 1.0f) :
+                       ggml_dsv4_hc_pre(n.c, x, n.t(GGML_TYPE_F32, 4, PRED_N_TOK));
+    };
+
+    struct mut {
+        const char * what;
+        bool         gated;
+        void (*apply)(ggml_tensor *);
+    };
+
+    const mut muts[] = {
+        { "x F16",                       false,
+         [](ggml_tensor * op) {
+              op->src[0]->type = GGML_TYPE_F16;
+          } },
+        { "w F16",                       false,
+         [](ggml_tensor * op) {
+              op->src[1]->type = GGML_TYPE_F16;
+          } },
+        { "dst F16",                     false,
+         [](ggml_tensor * op) {
+              op->type = GGML_TYPE_F16;
+          } },
+        { "x byte stride off a float",   false,
+         [](ggml_tensor * op) {
+              op->src[0]->nb[1] += 2;
+          } },
+        { "w byte stride off a float",   false,
+         [](ggml_tensor * op) {
+              op->src[1]->nb[1] += 2;
+          } },
+        { "dst byte stride off a float", false,
+         [](ggml_tensor * op) {
+              op->nb[1] += 2;
+          } },
+        { "x has a 4th dim",             false,
+         [](ggml_tensor * op) {
+              op->src[0]->ne[3] = 2;
+          } },
+        { "hc is zero",                  false,
+         [](ggml_tensor * op) {
+              op->src[0]->ne[1] = 0;
+          } },
+        { "dst n_embd wrong",            false,
+         [](ggml_tensor * op) {
+              op->ne[0] += 1;
+          } },
+        { "dst n_tokens wrong",          false,
+         [](ggml_tensor * op) {
+              op->ne[1] += 1;
+          } },
+        { "plain w hc wrong",            false,
+         [](ggml_tensor * op) {
+              op->src[1]->ne[0] += 1;
+          } },
+        { "plain w n_tokens wrong",      false,
+         [](ggml_tensor * op) {
+              op->src[1]->ne[1] += 1;
+          } },
+        { "gate n_embd wrong",           true,
+         [](ggml_tensor * op) {
+              op->src[1]->ne[0] += 1;
+          } },
+        { "gate hc wrong",               true,
+         [](ggml_tensor * op) {
+              op->src[1]->ne[1] += 1;
+          } },
+        { "gate n_tokens wrong",         true,
+         [](ggml_tensor * op) {
+              op->src[1]->ne[2] += 1;
+          } },
+    };
+    for (bool gated : { false, true }) {
+        node_ctx n;
+        expect_pred(std::string("hc_pre ") + (gated ? "gated" : "plain"),
+                    ggml_sycl_dsv4_hc_pre_supported(build(n, gated)), true);
+    }
+    for (const mut & m : muts) {
+        node_ctx      n;
+        ggml_tensor * op = build(n, m.gated);
+        m.apply(op);
+        expect_pred(std::string("hc_pre ") + (m.gated ? "gated " : "plain ") + m.what,
+                    ggml_sycl_dsv4_hc_pre_supported(op), false);
+    }
+    expect_pred("hc_pre null op", ggml_sycl_dsv4_hc_pre_supported(nullptr), false);
+    {
+        node_ctx n;
+        expect_pred("hc_pre fed a comb node", ggml_sycl_dsv4_hc_pre_supported([&] {
+                        ggml_tensor * op = build(n, false);
+                        op->op           = GGML_OP_DSV4_HC_COMB;
+                        return op;
+                    }()),
+                    false);
+    }
+}
+
+void test_predicates_comb() {
+    auto build = [](node_ctx & n) {
+        return ggml_dsv4_hc_comb(n.c, n.t(GGML_TYPE_F32, HC_COMB_MIX_DIM, PRED_N_TOK),
+                                 n.t(GGML_TYPE_F32, HC_COMB_SCALE_COMB_IDX + 1), n.t(GGML_TYPE_F32, HC_COMB_MIX_DIM),
+                                 1e-6f, PRED_N_ITER);
+    };
+
+    struct mut {
+        const char * what;
+        void (*apply)(ggml_tensor *);
+    };
+
+    const mut muts[] = {
+        { "mixes F16",
+         [](ggml_tensor * op) {
+              op->src[0]->type = GGML_TYPE_F16;
+          } },
+        { "scale F16",
+         [](ggml_tensor * op) {
+              op->src[1]->type = GGML_TYPE_F16;
+          } },
+        { "base F16",
+         [](ggml_tensor * op) {
+              op->src[2]->type = GGML_TYPE_F16;
+          } },
+        { "dst F16",
+         [](ggml_tensor * op) {
+              op->type = GGML_TYPE_F16;
+          } },
+        { "mixes stride off a float",
+         [](ggml_tensor * op) {
+              op->src[0]->nb[1] += 2;
+          } },
+        { "hc != 4 (mixes dim 20)",
+         [](ggml_tensor * op) {
+              op->src[0]->ne[0] = 20;
+          } },
+        { "hc != 4 (base dim 20)",
+         [](ggml_tensor * op) {
+              op->src[2]->ne[0] = 20;
+          } },
+        { "hc != 4 (dst 3x3)",
+         [](ggml_tensor * op) {
+              op->ne[0] = 3, op->ne[1] = 3;
+          } },
+        { "scale too short for the comb scale",
+         [](ggml_tensor * op) {
+              op->src[1]->ne[0] = HC_COMB_SCALE_COMB_IDX;
+          } },
+        { "mixes has a plane",
+         [](ggml_tensor * op) {
+              op->src[0]->ne[2] = 2;
+          } },
+        { "dst n_tokens wrong",
+         [](ggml_tensor * op) {
+              op->ne[2] += 1;
+          } },
+        { "n_iter zero",
+         [](ggml_tensor * op) {
+              const int32_t zero = 0;
+              std::memcpy((int32_t *) op->op_params + PRED_OP_PARAM_N_ITER, &zero, sizeof(zero));
+          } },
+    };
+    {
+        node_ctx n;
+        expect_pred("hc_comb", ggml_sycl_dsv4_hc_comb_supported(build(n)), true);
+    }
+    {
+        node_ctx      n;
+        ggml_tensor * op = build(n);
+        op->src[1]->ne[0] += 5;  // a longer scale vector is fine: only element HC_COMB_SCALE_COMB_IDX is read
+        expect_pred("hc_comb with a longer scale vector", ggml_sycl_dsv4_hc_comb_supported(op), true);
+    }
+    for (const mut & m : muts) {
+        node_ctx      n;
+        ggml_tensor * op = build(n);
+        m.apply(op);
+        expect_pred(std::string("hc_comb ") + m.what, ggml_sycl_dsv4_hc_comb_supported(op), false);
+    }
+    expect_pred("hc_comb null op", ggml_sycl_dsv4_hc_comb_supported(nullptr), false);
+}
+
+void test_predicates_post() {
+    auto build = [](node_ctx & n, bool with_comb) {
+        return ggml_dsv4_hc_post(n.c, n.t(GGML_TYPE_F32, PRED_N_EMBD, PRED_N_TOK),
+                                 n.t(GGML_TYPE_F32, PRED_N_EMBD, 4, PRED_N_TOK), n.t(GGML_TYPE_F32, 4, PRED_N_TOK),
+                                 with_comb ? n.t(GGML_TYPE_F32, 4, 4, PRED_N_TOK) : nullptr);
+    };
+
+    struct mut {
+        const char * what;
+        bool         with_comb;
+        void (*apply)(ggml_tensor *);
+    };
+
+    const mut muts[] = {
+        { "x F16",                   false,
+         [](ggml_tensor * op) {
+              op->src[0]->type = GGML_TYPE_F16;
+          } },
+        { "residual F16",            false,
+         [](ggml_tensor * op) {
+              op->src[1]->type = GGML_TYPE_F16;
+          } },
+        { "post F16",                false,
+         [](ggml_tensor * op) {
+              op->src[2]->type = GGML_TYPE_F16;
+          } },
+        { "dst F16",                 false,
+         [](ggml_tensor * op) {
+              op->type = GGML_TYPE_F16;
+          } },
+        { "x stride off a float",    false,
+         [](ggml_tensor * op) {
+              op->src[0]->nb[1] += 2;
+          } },
+        { "x has a plane",           false,
+         [](ggml_tensor * op) {
+              op->src[0]->ne[2] = 2;
+          } },
+        { "hc is zero",              false,
+         [](ggml_tensor * op) {
+              op->src[1]->ne[1] = 0;
+          } },
+        { "residual n_embd wrong",   false,
+         [](ggml_tensor * op) {
+              op->src[1]->ne[0] += 1;
+          } },
+        { "post hc wrong",           false,
+         [](ggml_tensor * op) {
+              op->src[2]->ne[0] += 1;
+          } },
+        { "dst hc wrong",            false,
+         [](ggml_tensor * op) {
+              op->ne[1] += 1;
+          } },
+        { "comb F16",                true,
+         [](ggml_tensor * op) {
+              op->src[3]->type = GGML_TYPE_F16;
+          } },
+        { "comb stride off a float", true,
+         [](ggml_tensor * op) {
+              op->src[3]->nb[1] += 2;
+          } },
+        { "comb dim 0 wrong",        true,
+         [](ggml_tensor * op) {
+              op->src[3]->ne[0] = 3;
+          } },
+        { "comb dim 1 wrong",        true,
+         [](ggml_tensor * op) {
+              op->src[3]->ne[1] = 3;
+          } },
+        { "comb n_tokens wrong",     true,
+         [](ggml_tensor * op) {
+              op->src[3]->ne[2] += 1;
+          } },
+        { "comb has a 4th dim",      true,
+         [](ggml_tensor * op) {
+              op->src[3]->ne[3] = 2;
+          } },
+    };
+    for (bool with_comb : { false, true }) {
+        node_ctx n;
+        expect_pred(std::string("hc_post ") + (with_comb ? "with comb" : "with a null comb (identity)"),
+                    ggml_sycl_dsv4_hc_post_supported(build(n, with_comb)), true);
+    }
+    for (const mut & m : muts) {
+        node_ctx      n;
+        ggml_tensor * op = build(n, m.with_comb);
+        m.apply(op);
+        expect_pred(std::string("hc_post ") + (m.with_comb ? "with comb: " : "null comb: ") + m.what,
+                    ggml_sycl_dsv4_hc_post_supported(op), false);
+    }
+    expect_pred("hc_post null op", ggml_sycl_dsv4_hc_post_supported(nullptr), false);
+}
+
+constexpr int64_t PRED_LANES = 32;  // the sub-group size the backend launches the indexer with
+
+void test_predicates_indexer() {
+    auto build = [](node_ctx & n, ggml_type kt, int64_t n_embd) {
+        return ggml_lightning_indexer(n.c, n.t(GGML_TYPE_F32, n_embd, 4, 8, 2), n.t(kt, n_embd, 1, 16, 2),
+                                      n.t(GGML_TYPE_F32, 4, 8, 1, 2), n.t(GGML_TYPE_F16, 16, 8, 1, 1));
+    };
+
+    struct mut {
+        const char * what;
+        void (*apply)(ggml_tensor *);
+    };
+
+    // the K operand is F16 in every mutation case, so mutations on k are about k alone
+    const mut muts[] = {
+        { "q F16",
+         [](ggml_tensor * op) {
+              op->src[0]->type = GGML_TYPE_F16;
+          } },
+        { "w F16",
+         [](ggml_tensor * op) {
+              op->src[2]->type = GGML_TYPE_F16;
+          } },
+        { "mask F32",
+         [](ggml_tensor * op) {
+              op->src[3]->type = GGML_TYPE_F32;
+          } },
+        { "mask BF16",
+         [](ggml_tensor * op) {
+              op->src[3]->type = GGML_TYPE_BF16;
+          } },
+        { "dst F16",
+         [](ggml_tensor * op) {
+              op->type = GGML_TYPE_F16;
+          } },
+        { "q nb[0] not one element",
+         [](ggml_tensor * op) {
+              op->src[0]->nb[0] = 8;
+          } },
+        { "k nb[0] not one element",
+         [](ggml_tensor * op) {
+              op->src[1]->nb[0] = 4;
+          } },
+        { "w nb[0] not one element",
+         [](ggml_tensor * op) {
+              op->src[2]->nb[0] = 8;
+          } },
+        { "mask nb[0] not one element",
+         [](ggml_tensor * op) {
+              op->src[3]->nb[0] = 4;
+          } },
+        { "dst nb[0] not one element",
+         [](ggml_tensor * op) {
+              op->nb[0] = 8;
+          } },
+        { "q n_embd != k n_embd",
+         [](ggml_tensor * op) {
+              op->src[1]->ne[0] += 2;
+          } },
+        { "k has a dim-1 extent",
+         [](ggml_tensor * op) {
+              op->src[1]->ne[1] = 2;
+          } },
+        { "k streams != q streams",
+         [](ggml_tensor * op) {
+              op->src[1]->ne[3] = 1;
+          } },
+        { "w n_head wrong",
+         [](ggml_tensor * op) {
+              op->src[2]->ne[0] += 1;
+          } },
+        { "w n_batch wrong",
+         [](ggml_tensor * op) {
+              op->src[2]->ne[1] += 1;
+          } },
+        { "w has a dim-2 extent",
+         [](ggml_tensor * op) {
+              op->src[2]->ne[2] = 2;
+          } },
+        { "mask n_kv wrong",
+         [](ggml_tensor * op) {
+              op->src[3]->ne[0] += 1;
+          } },
+        { "mask n_batch wrong",
+         [](ggml_tensor * op) {
+              op->src[3]->ne[1] += 1;
+          } },
+        { "mask streams do not divide",
+         [](ggml_tensor * op) {
+              op->src[3]->ne[3] = 3;
+          } },
+        { "mask streams zero",
+         [](ggml_tensor * op) {
+              op->src[3]->ne[3] = 0;
+          } },
+        { "dst n_kv wrong",
+         [](ggml_tensor * op) {
+              op->ne[0] += 1;
+          } },
+        { "dst n_batch wrong",
+         [](ggml_tensor * op) {
+              op->ne[1] += 1;
+          } },
+        { "dst stream count wrong",
+         [](ggml_tensor * op) {
+              op->ne[3] += 1;
+          } },
+        { "q nb[1] off a float",
+         [](ggml_tensor * op) {
+              op->src[0]->nb[1] += 2;
+          } },
+        { "q nb[2] off a float",
+         [](ggml_tensor * op) {
+              op->src[0]->nb[2] += 2;
+          } },
+        { "q nb[3] off a float",
+         [](ggml_tensor * op) {
+              op->src[0]->nb[3] += 2;
+          } },
+        { "w nb[1] off a float",
+         [](ggml_tensor * op) {
+              op->src[2]->nb[1] += 2;
+          } },
+        { "w nb[3] off a float",
+         [](ggml_tensor * op) {
+              op->src[2]->nb[3] += 2;
+          } },
+        { "mask nb[1] odd",
+         [](ggml_tensor * op) {
+              op->src[3]->nb[1] += 1;
+          } },
+        { "mask nb[3] odd",
+         [](ggml_tensor * op) {
+              op->src[3]->nb[3] += 1;
+          } },
+        { "k nb[2] odd",
+         [](ggml_tensor * op) {
+              op->src[1]->nb[2] += 1;
+          } },
+        { "k nb[3] odd",
+         [](ggml_tensor * op) {
+              op->src[1]->nb[3] += 1;
+          } },
+        { "dst nb[1] off a float",
+         [](ggml_tensor * op) {
+              op->nb[1] += 2;
+          } },
+        { "dst nb[3] off a float",
+         [](ggml_tensor * op) {
+              op->nb[3] += 2;
+          } },
+    };
+    // slack that the kernel's casts tolerate: a half-aligned mask stride and a half-aligned F16 K stride
+    const mut tolerated[] = {
+        { "mask nb[1] 2-byte slack",
+         [](ggml_tensor * op) {
+              op->src[3]->nb[1] += 2;
+          } },
+        { "mask nb[3] 2-byte slack",
+         [](ggml_tensor * op) {
+              op->src[3]->nb[3] += 2;
+          } },
+        { "F16 k nb[2] 2-byte slack",
+         [](ggml_tensor * op) {
+              op->src[1]->nb[2] += 2;
+          } },
+        { "F16 k nb[3] 2-byte slack",
+         [](ggml_tensor * op) {
+              op->src[1]->nb[3] += 2;
+          } },
+        { "q nb[1] 4-byte slack",
+         [](ggml_tensor * op) {
+              op->src[0]->nb[1] += 4;
+          } },
+    };
+
+    // every K type in the table is admitted at the production head size, in every elements-per-lane the kernel has
+    for (ggml_type kt :
+#define X(T) T,
+         { GGML_SYCL_LIGHTNING_INDEXER_K_TYPES(X) }
+#undef X
+    ) {
+        node_ctx n;
+        expect_pred(std::string("indexer K=") + ggml_type_name(kt) + " n_embd=128",
+                    op_supported(build(n, kt, 128), PRED_LANES), true);
+    }
+    for (int64_t n_embd : { 64, 128, 256, 512 }) {  // 2, 4, 8, 16 elements per lane at 32 lanes
+        node_ctx n;
+        expect_pred("indexer n_embd=" + std::to_string(n_embd) + " at 32 lanes",
+                    op_supported(build(n, GGML_TYPE_F16, n_embd), 32), true);
+    }
+    {
+        node_ctx n;
+        expect_pred("indexer n_embd=128 at 16 lanes", op_supported(build(n, GGML_TYPE_F16, 128), 16), true);
+    }
+    for (const mut & m : tolerated) {
+        node_ctx      n;
+        ggml_tensor * op = build(n, GGML_TYPE_F16, 128);
+        m.apply(op);
+        expect_pred(std::string("indexer ") + m.what, op_supported(op, PRED_LANES), true);
+    }
+
+    // every K type outside the table is declined, enumerated from ggml's own type list rather than a list here
+    int declined_types = 0;
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const int64_t blck = ggml_blck_size((ggml_type) t);
+        if (k_type_supported((ggml_type) t) || blck <= 0 || ggml_type_size((ggml_type) t) == 0 || 256 % blck != 0) {
+            continue;
+        }
+        node_ctx n;
+        expect_pred(std::string("indexer K=") + ggml_type_name((ggml_type) t),
+                    op_supported(build(n, (ggml_type) t, 256), PRED_LANES), false);
+        ++declined_types;
+    }
+    report("predicate: the enumeration of unsupported K types is not empty", declined_types > 0,
+           (double) declined_types);
+
+    // K types whose block alignment differs from the half: 4-byte-aligned (Q4_1, Q5_1, F32) refuse the 2-byte slack
+    for (ggml_type kt : { GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q5_1 }) {
+        node_ctx      n;
+        ggml_tensor * op = build(n, kt, 128);
+        op->src[1]->nb[2] += 2;
+        expect_pred(std::string("indexer K=") + ggml_type_name(kt) + " k nb[2] 2-byte slack",
+                    op_supported(op, PRED_LANES), false);
+    }
+    {
+        node_ctx      n;
+        ggml_tensor * op = build(n, GGML_TYPE_Q8_0, 128);
+        op->src[1]->nb[2] += 2;
+        expect_pred("indexer K=q8_0 k nb[2] 2-byte slack", op_supported(op, PRED_LANES), true);
+    }
+
+    for (const mut & m : muts) {
+        node_ctx      n;
+        ggml_tensor * op = build(n, GGML_TYPE_F16, 128);
+        m.apply(op);
+        expect_pred(std::string("indexer ") + m.what, op_supported(op, PRED_LANES), false);
+    }
+
+    // head-size / lane arithmetic: n_embd % lanes, and an elements-per-lane count the kernel is not instantiated for
+    for (int64_t n_embd : { 48, 96 }) {  // F32 K so the head size is not a block-size question
+        node_ctx n;
+        expect_pred("indexer n_embd=" + std::to_string(n_embd) + " (not a multiple of 32 lanes)",
+                    op_supported(build(n, GGML_TYPE_F32, n_embd), 32), false);
+    }
+    {
+        node_ctx n;
+        expect_pred("indexer n_embd=1024 at 32 lanes (32 elements per lane)",
+                    op_supported(build(n, GGML_TYPE_F16, 1024), 32), false);
+    }
+    {
+        node_ctx n;
+        expect_pred("indexer n_embd=512 at 16 lanes (32 elements per lane)",
+                    op_supported(build(n, GGML_TYPE_F16, 512), 16), false);
+    }
+    {
+        node_ctx n;
+        expect_pred("indexer n_embd=32 at 32 lanes (1 element per lane)", op_supported(build(n, GGML_TYPE_F16, 32), 32),
+                    false);
+    }
+    {
+        node_ctx n;
+        expect_pred("indexer lanes=0", op_supported(build(n, GGML_TYPE_F16, 128), 0), false);
+    }
+    expect_pred("indexer null op", op_supported(nullptr, PRED_LANES), false);
+    {
+        node_ctx      n;
+        ggml_tensor * op = build(n, GGML_TYPE_F16, 128);
+        op->src[3]       = nullptr;
+        expect_pred("indexer null mask", op_supported(op, PRED_LANES), false);
+    }
+    {
+        node_ctx      n;
+        ggml_tensor * op = build(n, GGML_TYPE_F16, 128);
+        op->op           = GGML_OP_DSV4_HC_PRE;
+        expect_pred("indexer fed another op", op_supported(op, PRED_LANES), false);
+    }
+}
+
+void test_predicates() {
+    test_predicates_pre();
+    test_predicates_comb();
+    test_predicates_post();
+    test_predicates_indexer();
 }
 
 bool sub_group_supported(const sycl::device & dev, size_t n) {
@@ -670,12 +1330,15 @@ std::vector<sycl::device> cpu_devices() {
 }  // namespace
 
 int main() {
+    // pure ggml, no device: these run (and can fail the run) even where the kernels below are skipped
+    test_predicates();
+
     const std::vector<sycl::device> devs = cpu_devices();
     if (devs.empty()) {
         fprintf(stderr,
                 "SKIP: no SYCL CPU device visible; this run proves NOTHING about the DSv4 HC / indexer kernels.\n"
                 "      Source oneAPI and run with ONEAPI_DEVICE_SELECTOR=opencl:cpu.\n");
-        return SYCL_TEST_SKIP;
+        return g_failed == 0 ? SYCL_TEST_SKIP : 1;
     }
     const sycl::device dev = devs[0];
     printf("device: %s\n", dev.get_info<sycl::info::device::name>().c_str());
@@ -703,6 +1366,8 @@ int main() {
     test_comb(q, 17, 4, 1e-6f);
     test_comb(q, 17, 2, 1e-6f);
     test_comb(q, 257, 8, 1e-3f);
+    test_comb(q, 17, 20, 1e-6f, true);
+    test_comb(q, 257, 4, 1e-6f, true);
 
     // --- POST: Qwen emits the identity (null comb) form; DeepSeek-V4 passes a real comb
     test_post(q, 2560, 4, 1, true, false);
@@ -718,10 +1383,14 @@ int main() {
 
     // --- LIGHTNING_INDEXER: head size 128 (every model that carries an indexer) at the sub-group sizes the
     // device offers, K in every type the predicate admits, one and several streams, shared and per-stream masks
-    const ggml_type k_types[] = { GGML_TYPE_F32,  GGML_TYPE_F16,  GGML_TYPE_BF16, GGML_TYPE_Q8_0,  GGML_TYPE_Q5_1,
-                                  GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL };
-    int             lanes_run = 0;
-    auto            run_lanes = [&](auto lanes_tag) {
+    // generated from the predicate's own table, so a type added there is tested here without an edit
+    const ggml_type k_types[] = {
+#define X(T) T,
+        GGML_SYCL_LIGHTNING_INDEXER_K_TYPES(X)
+#undef X
+    };
+    int  lanes_run = 0;
+    auto run_lanes = [&](auto lanes_tag) {
         constexpr int LANES = decltype(lanes_tag)::value;
         if (!sub_group_supported(dev, LANES)) {
             printf("note: device has no sub-group size %d, indexer lanes=%d not run\n", LANES, LANES);
@@ -729,28 +1398,31 @@ int main() {
         }
         ++lanes_run;
         for (ggml_type t : k_types) {
-            test_lid<LANES>(q, { 128, 4, 65, 32, 1, 1, t });
-            test_lid<LANES>(q, { 128, 32, 7, 16, 4, 4, t });
-            test_lid<LANES>(q, { 128, 4, 63, 9, 4, 1, t });
+            test_lightning_indexer<LANES>(q, { 128, 4, 65, 32, 1, 1, t });
+            test_lightning_indexer<LANES>(q, { 128, 32, 7, 16, 4, 4, t });
+            test_lightning_indexer<LANES>(q, { 128, 4, 63, 9, 4, 1, t });
         }
         // strided operands, shared and per-stream masks, quantized and plain K
-        test_lid<LANES>(q, { 128, 4, 33, 8, 1, 1, GGML_TYPE_F16, true });
-        test_lid<LANES>(q, { 128, 4, 33, 8, 3, 3, GGML_TYPE_Q8_0, true });
-        test_lid<LANES>(q, { 128, 4, 33, 8, 3, 1, GGML_TYPE_Q4_1, true });
-        test_lid<LANES>(q, { 256, 2, 17, 5, 2, 2, GGML_TYPE_F32, true });
+        test_lightning_indexer<LANES>(q, { 128, 4, 33, 8, 1, 1, GGML_TYPE_F16, true });
+        test_lightning_indexer<LANES>(q, { 128, 4, 33, 8, 3, 3, GGML_TYPE_Q8_0, true });
+        test_lightning_indexer<LANES>(q, { 128, 4, 33, 8, 3, 1, GGML_TYPE_Q4_1, true });
+        test_lightning_indexer<LANES>(q, { 256, 2, 17, 5, 2, 2, GGML_TYPE_F32, true });
         // a tall grid (the width cap forces several rows of work-groups), packed and strided
-        test_lid<LANES>(q, { 128, 4, 65, 32, 2, 1, GGML_TYPE_Q8_0, false, 3 });
-        test_lid<LANES>(q, { 128, 4, 65, 32, 2, 2, GGML_TYPE_F16, true, 1 });
-        test_lid<LANES>(q, { 128, 4, 1, 1, 1, 1, GGML_TYPE_F16, false, 1 });
-        test_lid<LANES>(q, { 128, 4, 1, 1, 1, 1, GGML_TYPE_F16 });
-        test_lid<LANES>(q, { 256, 4, 33, 8, 2, 2, GGML_TYPE_F16 });
-        test_lid<LANES>(q, { 256, 4, 33, 8, 2, 1, GGML_TYPE_Q8_0 });
-        test_lid<LANES>(q, { 64, 4, 33, 8, 2, 2, GGML_TYPE_F32 });
-        if (LANES == 32) {  // 512 / 16 lanes = 32 elements per lane, which the kernel is not instantiated for
-            test_lid<LANES>(q, { 512, 2, 17, 4, 1, 1, GGML_TYPE_F16 });
+        test_lightning_indexer<LANES>(q, { 128, 4, 65, 32, 2, 1, GGML_TYPE_Q8_0, false, 3 });
+        test_lightning_indexer<LANES>(q, { 128, 4, 65, 32, 2, 2, GGML_TYPE_F16, true, 1 });
+        test_lightning_indexer<LANES>(q, { 128, 4, 1, 1, 1, 1, GGML_TYPE_F16, false, 1 });
+        test_lightning_indexer<LANES>(q, { 128, 4, 1, 1, 1, 1, GGML_TYPE_F16 });
+        test_lightning_indexer<LANES>(q, { 256, 4, 33, 8, 2, 2, GGML_TYPE_F16 });
+        test_lightning_indexer<LANES>(q, { 256, 4, 33, 8, 2, 1, GGML_TYPE_Q8_0 });
+        test_lightning_indexer<LANES>(q, { 64, 4, 33, 8, 2, 2, GGML_TYPE_F32 });
+        // n_embd 512 is 16 elements per lane at 32 lanes, an instantiated count; at 16 lanes it would be 32,
+        // which is not (the launcher refuses it, checked in test_lightning_indexer_dispatch), so only 32 lanes run it
+        if (LANES == 32) {
+            test_lightning_indexer<LANES>(q, { 512, 2, 17, 4, 1, 1, GGML_TYPE_F16 });
         }
+        test_lightning_indexer_dispatch<LANES>(q);
     };
-    test_lid_dims();
+    test_lightning_indexer_dims();
     run_lanes(std::integral_constant<int, 32>{});
     run_lanes(std::integral_constant<int, 16>{});
     ++g_cases;
@@ -762,8 +1434,9 @@ int main() {
     }
 
     printf("\n%d checks, %d failed\n", g_cases, g_failed);
-    if (g_cases < 100) {
-        printf("FAIL: only %d checks ran; the matrix is not being exercised\n", g_cases);
+    if (g_cases < MIN_CHECKS) {
+        printf("FAIL: only %d checks ran, fewer than the %d the matrix produces; it is not being exercised\n", g_cases,
+               MIN_CHECKS);
         return 1;
     }
     return g_failed == 0 ? 0 : 1;

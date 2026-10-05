@@ -17,6 +17,7 @@
 // mantissa bits of half-precision error into every score of a quantized K cache.
 
 #include "ggml.h"
+#include "lightning-indexer-predicate.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -31,32 +32,9 @@
 #    pragma clang diagnostic pop
 #endif
 
-namespace ggml_sycl_dsv4 {
+namespace ggml_sycl_lightning_indexer {
 
-constexpr int64_t LID_ROWS_PER_BLOCK = 4;
-
-// K row types the kernel can read, and the one place that says so (the supports_op predicate asks it).
-inline bool lightning_indexer_k_type_supported(ggml_type t) {
-    switch (t) {
-        case GGML_TYPE_F32:
-        case GGML_TYPE_F16:
-        case GGML_TYPE_BF16:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_IQ4_NL:
-            return true;
-        default:
-            return false;
-    }
-}
-
-// Elements per lane the kernel is instantiated for. n_embd must equal LANES * EPL for one of these.
-inline bool lightning_indexer_epl_supported(int64_t epl) {
-    return epl == 2 || epl == 4 || epl == 8 || epl == 16;
-}
+constexpr int64_t LIGHTNING_INDEXER_ROWS_PER_BLOCK = 4;
 
 // Element `i` of one K row, as float. All the quantized types here use 32-element blocks. The type is a template
 // parameter so the launcher picks the instantiation once per launch and the kernel body carries no per-element
@@ -103,7 +81,8 @@ template <ggml_type KT> inline float lightning_indexer_k_elem(const char * row, 
         const int            q = j < 16 ? (b->qs[j] & 0xF) : (b->qs[j - 16] >> 4);
         return (float) b->d * (float) kvalues_iq4nl[q];
     } else {
-        static_assert(KT == GGML_TYPE_F32, "lightning_indexer_k_elem: K type not supported");
+        static_assert(KT == GGML_TYPE_F32,
+                      "lightning_indexer_k_elem: a K type in GGML_SYCL_LIGHTNING_INDEXER_K_TYPES has no dequant");
         return 0.0f;
     }
 }
@@ -127,8 +106,6 @@ struct lightning_indexer_args {
     size_t       nbw1, nbw3;
     size_t       nbm1, nbm3;
     size_t       nb1, nb3;
-    // work-groups per row of the launch grid; 0 selects LID_MAX_GROUPS_X (tests set it small to force a tall grid)
-    int64_t      max_groups_x;
 };
 
 // The launch grid is two-dimensional on purpose. One sub-group owns one (token, stream, kv) row, so the total
@@ -136,17 +113,17 @@ struct lightning_indexer_args {
 // the compiler assumes for work-item ids once n_batch * n_stream * n_kv reaches 2^31 / LANES, e.g. ub 512 at
 // n_kv 131072 or ub 2048 at n_kv 32768. A grid of groups_y x groups_x work-groups keeps every dimension far
 // below that for any shape the op can have, so no shape is declined to the CPU.
-constexpr int64_t LID_MAX_GROUPS_X = int64_t(1) << 20;
+constexpr int64_t LIGHTNING_INDEXER_MAX_GROUPS_X = int64_t(1) << 20;
 
 struct lightning_indexer_dims {
     int64_t groups_x;
     int64_t groups_y;
 };
 
-// The smallest grid of at most `max_groups_x` columns (0: LID_MAX_GROUPS_X) holding every work-group the rows need.
+// The smallest grid of at most `max_groups_x` columns (0: LIGHTNING_INDEXER_MAX_GROUPS_X) holding every work-group the rows need.
 inline lightning_indexer_dims lightning_indexer_launch_dims(int64_t n_rows, int64_t max_groups_x) {
-    const int64_t n_blocks = (n_rows + LID_ROWS_PER_BLOCK - 1) / LID_ROWS_PER_BLOCK;
-    const int64_t cap      = max_groups_x > 0 ? max_groups_x : LID_MAX_GROUPS_X;
+    const int64_t n_blocks = (n_rows + LIGHTNING_INDEXER_ROWS_PER_BLOCK - 1) / LIGHTNING_INDEXER_ROWS_PER_BLOCK;
+    const int64_t cap      = max_groups_x > 0 ? max_groups_x : LIGHTNING_INDEXER_MAX_GROUPS_X;
     if (n_blocks <= 0) {
         return { 1, 0 };
     }
@@ -157,11 +134,11 @@ inline lightning_indexer_dims lightning_indexer_launch_dims(int64_t n_rows, int6
 // Cost note: every sub-group re-reads the whole Q tile (n_head * n_embd floats) for its (token, kv) row, with no
 // tiling across kv, so prefill at long n_kv is bound by those Q re-reads rather than by the K dequant.
 template <int LANES, int EPL, ggml_type KT>
-inline void lightning_indexer_launch_impl(sycl::queue & queue, const lightning_indexer_args & a) {
-    constexpr int64_t BLOCK_SIZE = LID_ROWS_PER_BLOCK * LANES;
+inline void lightning_indexer_launch_impl(sycl::queue & queue, const lightning_indexer_args & a, int64_t max_groups_x) {
+    constexpr int64_t BLOCK_SIZE = LIGHTNING_INDEXER_ROWS_PER_BLOCK * LANES;
 
     const int64_t n_rows = a.n_batch * a.n_stream * a.n_kv;
-    const auto    dims   = lightning_indexer_launch_dims(n_rows, a.max_groups_x);
+    const auto    dims   = lightning_indexer_launch_dims(n_rows, max_groups_x);
     if (dims.groups_y == 0) {
         return;
     }
@@ -173,7 +150,7 @@ inline void lightning_indexer_launch_impl(sycl::queue & queue, const lightning_i
             const int64_t lid   = item.get_local_id(1);
             const int64_t lane  = lid % LANES;
             const int64_t block = (int64_t) item.get_group(0) * groups_x + (int64_t) item.get_group(1);
-            const int64_t row   = block * LID_ROWS_PER_BLOCK + lid / LANES;
+            const int64_t row   = block * LIGHTNING_INDEXER_ROWS_PER_BLOCK + lid / LANES;
             // `row` is uniform across the sub-group (a sub-group never spans two rows), so this return cannot
             // split the reduction below
             if (row >= n_rows) {
@@ -221,54 +198,39 @@ inline void lightning_indexer_launch_impl(sycl::queue & queue, const lightning_i
 }
 
 template <int LANES, ggml_type KT>
-inline bool lightning_indexer_launch_epl(sycl::queue & queue, const lightning_indexer_args & a) {
+inline bool lightning_indexer_launch_epl(sycl::queue & queue, const lightning_indexer_args & a, int64_t max_groups_x) {
     switch (a.n_embd / LANES) {
-        case 2:
-            lightning_indexer_launch_impl<LANES, 2, KT>(queue, a);
-            return true;
-        case 4:
-            lightning_indexer_launch_impl<LANES, 4, KT>(queue, a);
-            return true;
-        case 8:
-            lightning_indexer_launch_impl<LANES, 8, KT>(queue, a);
-            return true;
-        case 16:
-            lightning_indexer_launch_impl<LANES, 16, KT>(queue, a);
-            return true;
+#define X(E)                                                                 \
+    case E:                                                                  \
+        lightning_indexer_launch_impl<LANES, E, KT>(queue, a, max_groups_x); \
+        return true;
+        GGML_SYCL_LIGHTNING_INDEXER_EPLS(X)
+#undef X
         default:
             return false;
     }
 }
 
-// Returns false, submitting nothing, when n_embd is not LANES * {2, 4, 8, 16} or K's type is not readable.
-template <int LANES> inline bool lightning_indexer_launch(sycl::queue & queue, const lightning_indexer_args & a) {
-    if (!lightning_indexer_k_type_supported(a.k_type) || a.n_embd % LANES != 0) {
+// Submits one kernel and returns true, or returns false and submits nothing when n_embd is not LANES * an
+// instantiated elements-per-lane count or K's type is not one the kernel reads. `max_groups_x` caps the launch
+// grid's width (0: LIGHTNING_INDEXER_MAX_GROUPS_X, which is what production uses); tests pass a small value to force
+// a tall grid.
+template <int LANES>
+inline bool lightning_indexer_launch(sycl::queue & queue, const lightning_indexer_args & a, int64_t max_groups_x = 0) {
+    if (a.n_embd % LANES != 0) {
         return false;
     }
     switch (a.k_type) {
-        case GGML_TYPE_F32:
-            return lightning_indexer_launch_epl<LANES, GGML_TYPE_F32>(queue, a);
-        case GGML_TYPE_F16:
-            return lightning_indexer_launch_epl<LANES, GGML_TYPE_F16>(queue, a);
-        case GGML_TYPE_BF16:
-            return lightning_indexer_launch_epl<LANES, GGML_TYPE_BF16>(queue, a);
-        case GGML_TYPE_Q8_0:
-            return lightning_indexer_launch_epl<LANES, GGML_TYPE_Q8_0>(queue, a);
-        case GGML_TYPE_Q5_1:
-            return lightning_indexer_launch_epl<LANES, GGML_TYPE_Q5_1>(queue, a);
-        case GGML_TYPE_Q5_0:
-            return lightning_indexer_launch_epl<LANES, GGML_TYPE_Q5_0>(queue, a);
-        case GGML_TYPE_Q4_1:
-            return lightning_indexer_launch_epl<LANES, GGML_TYPE_Q4_1>(queue, a);
-        case GGML_TYPE_Q4_0:
-            return lightning_indexer_launch_epl<LANES, GGML_TYPE_Q4_0>(queue, a);
-        case GGML_TYPE_IQ4_NL:
-            return lightning_indexer_launch_epl<LANES, GGML_TYPE_IQ4_NL>(queue, a);
+#define X(T) \
+    case T:  \
+        return lightning_indexer_launch_epl<LANES, T>(queue, a, max_groups_x);
+        GGML_SYCL_LIGHTNING_INDEXER_K_TYPES(X)
+#undef X
         default:
             return false;
     }
 }
 
-}  // namespace ggml_sycl_dsv4
+}  // namespace ggml_sycl_lightning_indexer
 
 #endif  // GGML_SYCL_LIGHTNING_INDEXER_KERNEL_HPP

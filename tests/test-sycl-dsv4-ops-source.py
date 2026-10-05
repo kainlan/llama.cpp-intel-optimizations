@@ -14,9 +14,13 @@ Pinned here:
   * the executor switch and the supports_op switch each carry all four ops;
   * supports_op asks ONE predicate per op, and the executor asserts that same predicate, so supports_op
     cannot admit a (type, shape) the executor aborts on;
-  * the new op sources allocate nothing and never block the host (graph-recordable);
-  * the post predicate admits a null comb and the pre predicate reads the gated flag, because those are the
-    two forms the Qwen graph emits and the first port of this commit (upstream 31558dbb7657) had neither.
+  * the predicates live in headers that include no SYCL or backend header, so a host test runs the shipped
+    predicates over real ggml nodes (test-sycl-dsv4-hc-kernels, the decline matrix);
+  * the post predicate guards its optional comb and the pre predicate reads the gated flag, because the Qwen
+    graph emits a gated pre and a null-comb post, so both forms must be admitted;
+  * the indexer's K-type and elements-per-lane lists exist once (X-macros in the predicate header) and the
+    launcher is generated from them; the comb scale index is one named constant;
+  * the new op sources allocate nothing and never block the host (graph-recordable).
 
 Run with --self-test to prove every check fires against a mutant of the thing it forbids; a check that
 cannot fail is decoration.
@@ -34,9 +38,11 @@ parser.add_argument("--backend", default=str(sycl / "ggml-sycl.cpp"))
 parser.add_argument("--hc", default=str(sycl / "dsv4-hc.cpp"))
 parser.add_argument("--hc-header", default=str(sycl / "dsv4-hc.hpp"))
 parser.add_argument("--hc-kernels", default=str(sycl / "dsv4-hc-kernels.hpp"))
+parser.add_argument("--hc-predicates", default=str(sycl / "dsv4-hc-predicates.hpp"))
 parser.add_argument("--lid", default=str(sycl / "lightning-indexer.cpp"))
 parser.add_argument("--lid-header", default=str(sycl / "lightning-indexer.hpp"))
 parser.add_argument("--lid-kernels", default=str(sycl / "lightning-indexer-kernel.hpp"))
+parser.add_argument("--lid-predicates", default=str(sycl / "lightning-indexer-predicate.hpp"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
@@ -124,13 +130,13 @@ HOST_WAIT = re.compile(r"(\.|->|::)\s*wait\s*\(|wait_and_throw|\bsynchronize\s*\
 ALLOC = re.compile(r"sycl::malloc|malloc_device|malloc_host|malloc_shared|unified_alloc|unified_allocate|\bnew\s+\w|\bmalloc\s*\(")
 
 
-def evaluate(backend, hc, hc_header, hc_kernels, lid, lid_header, lid_kernels):
+def evaluate(backend, hc, hc_header, hc_kernels, hc_predicates, lid, lid_header, lid_kernels, lid_predicates):
     results = {}
 
     fwd = function_body(backend, r"static bool ggml_sycl_compute_forward_impl\([^)]*\)\s*try\s*\{")
-    sup = function_body(backend, r"static bool ggml_backend_sycl_device_supports_op\([^)]*\)\s*\{")
+    sup = function_body(backend, r"static bool ggml_sycl_device_supports_op_impl\([^)]*\)\s*\{")
     results["anchor: ggml_sycl_compute_forward_impl exists"] = fwd is not None
-    results["anchor: ggml_backend_sycl_device_supports_op exists"] = sup is not None
+    results["anchor: ggml_sycl_device_supports_op_impl exists"] = sup is not None
     if fwd is None or sup is None:
         return results
 
@@ -152,29 +158,52 @@ def evaluate(backend, hc, hc_header, hc_kernels, lid, lid_header, lid_kernels):
         if body is not None:
             results[f"{executor} asserts {predicate}"] = \
                 re.search(r"GGML_ASSERT\s*\(\s*" + predicate + r"\s*\(\s*dst(\.raw\(\))?\s*\)\s*\)", body) is not None
-        header = lid_header if op == "GGML_OP_LIGHTNING_INDEXER" else hc_header
-        results[f"{predicate} is declared"] = re.search(r"\bbool\s+" + predicate + r"\s*\(", header) is not None
-        results[f"{predicate} is defined"] = \
-            re.search(r"\bbool\s+" + predicate + r"\s*\([^)]*\)\s*\{", src) is not None
+        # the predicate is defined in the pure-ggml header the host test includes (the indexer's backend entry point
+        # is a one-line inline in lightning-indexer.hpp over lightning-indexer-predicate.hpp's op_supported)
+        definer = lid_header if op == "GGML_OP_LIGHTNING_INDEXER" else hc_predicates
+        results[f"{predicate} is defined inline in its header"] = \
+            re.search(r"\binline\s+bool\s+" + predicate + r"\s*\([^)]*\)\s*\{", definer) is not None
+    results["dsv4-hc.hpp includes the predicate header"] = '#include "dsv4-hc-predicates.hpp"' in hc_header
+    results["lightning-indexer.hpp includes the predicate header"] = \
+        '#include "lightning-indexer-predicate.hpp"' in lid_header
+    for label, text in (("dsv4-hc-predicates.hpp", hc_predicates), ("lightning-indexer-predicate.hpp", lid_predicates)):
+        includes = re.findall(r'#\s*include\s*([<"][^>"]+[>"])', text)
+        results[f"{label} exists and is non-empty"] = len(text.strip()) > 0
+        results[f"{label} includes only ggml and the standard library"] = \
+            len(text.strip()) > 0 and all(i.strip('<>"') == "ggml.h" or not i.endswith(('.hpp"', '.h"')) for i in includes) \
+            and "sycl" not in " ".join(includes).lower()
 
     # --- the post predicate admits a null comb; the pre predicate reads the gated flag ---------------------------
-    post = function_body(hc, r"\bbool\s+ggml_sycl_dsv4_hc_post_supported\s*\([^)]*\)\s*\{")
+    post = function_body(hc_predicates, r"\binline\s+bool\s+ggml_sycl_dsv4_hc_post_supported\s*\([^)]*\)\s*\{")
     if post is not None:
         # the optional operand is guarded, not dereferenced unconditionally
         results["post predicate admits a null comb"] = re.search(r"if\s*\(\s*comb\s*!=\s*nullptr\s*\)", post) is not None
     else:
         results["post predicate admits a null comb"] = False
-    pre = function_body(hc, r"\bbool\s+ggml_sycl_dsv4_hc_pre_supported\s*\([^)]*\)\s*\{")
-    results["pre predicate reads the gated flag"] = pre is not None and "ggml_get_op_params_i32" in pre
+    pre = function_body(hc_predicates, r"\binline\s+bool\s+ggml_sycl_dsv4_hc_pre_supported\s*\([^)]*\)\s*\{")
+    results["pre predicate reads the gated flag"] = pre is not None and "hc_op_param_i32" in pre
     post_exec = function_body(hc, r"\bvoid\s+ggml_sycl_op_dsv4_hc_post\s*\([^)]*\)\s*\{")
     results["post executor forwards a possibly-null comb"] = post_exec is not None and "src[3]" in post_exec
 
     # --- graph-recordable: no allocation, no host wait ------------------------------------------------------------
-    for label, text in (("dsv4-hc.cpp", hc), ("dsv4-hc-kernels.hpp", hc_kernels),
-                        ("lightning-indexer.cpp", lid), ("lightning-indexer-kernel.hpp", lid_kernels)):
+    for label, text in (("dsv4-hc.cpp", hc), ("dsv4-hc-kernels.hpp", hc_kernels), ("dsv4-hc-predicates.hpp", hc_predicates),
+                        ("lightning-indexer.cpp", lid), ("lightning-indexer-kernel.hpp", lid_kernels),
+                        ("lightning-indexer-predicate.hpp", lid_predicates)):
         results[f"{label} exists and is non-empty"] = len(text.strip()) > 0
         results[f"{label} has no host wait"] = HOST_WAIT.search(text) is None
         results[f"{label} allocates nothing"] = ALLOC.search(text) is None
+
+    # --- one source for each list: the indexer's K types and elements-per-lane, and the comb scale index -------
+    for table in ("GGML_SYCL_LIGHTNING_INDEXER_K_TYPES", "GGML_SYCL_LIGHTNING_INDEXER_EPLS"):
+        results[f"{table} is defined once, in the predicate header"] = \
+            len(re.findall(r"#\s*define\s+" + table + r"\b", lid_predicates)) == 1
+        results[f"{table} generates the predicate and the launcher"] = \
+            table + "(X)" in lid_predicates and table + "(X)" in lid_kernels
+    results["the indexer launcher keeps no K-type switch of its own"] = \
+        re.search(r"case\s+GGML_TYPE_", lid_kernels) is None and re.search(r"case\s+GGML_TYPE_", lid) is None
+    results["the comb scale index is one named constant"] = \
+        "HC_COMB_SCALE_COMB_IDX" in hc_predicates and "HC_COMB_SCALE_COMB_IDX" in hc_kernels and \
+        re.search(r"scale\s*\[\s*2\b", hc_kernels) is None
     return results
 
 
@@ -190,9 +219,10 @@ def run(label, sources, expect_fail=None):
     return [] if fired else [label]
 
 
-names = ("backend", "hc", "hc_header", "hc_kernels", "lid", "lid_header", "lid_kernels")
+names = ("backend", "hc", "hc_header", "hc_kernels", "hc_predicates", "lid", "lid_header", "lid_kernels", "lid_predicates")
 sources = dict(zip(names, (read(args.backend), read(args.hc), read(args.hc_header), read(args.hc_kernels),
-                           read(args.lid), read(args.lid_header), read(args.lid_kernels))))
+                           read(args.hc_predicates), read(args.lid), read(args.lid_header), read(args.lid_kernels),
+                           read(args.lid_predicates))))
 failed = run("tree", tuple(sources[k] for k in names))
 
 if args.self_test:
@@ -217,15 +247,29 @@ if args.self_test:
         ("executor does not assert the predicate", "ggml_sycl_op_dsv4_hc_post asserts ggml_sycl_dsv4_hc_post_supported",
          with_(hc=mutate(sources["hc"], "GGML_ASSERT(ggml_sycl_dsv4_hc_post_supported(dst.raw()))", "(void) dst"))),
         ("null comb refused", "post predicate admits a null comb",
-         with_(hc=mutate(sources["hc"], "if (comb != nullptr) {", "if (true) {"))),
+         with_(hc_predicates=mutate(sources["hc_predicates"], "if (comb != nullptr) {", "if (true) {"))),
         ("gated flag ignored", "pre predicate reads the gated flag",
-         with_(hc=sources["hc"].replace("ggml_get_op_params_i32", "ggml_get_op_params_XX"))),
+         with_(hc_predicates=sources["hc_predicates"].replace("hc_op_param_i32(op, 1) != 0", "false"))),
         ("host wait added", "dsv4-hc.cpp has no host wait",
          with_(hc=mutate(sources["hc"], "GGML_ASSERT(", "stream->wait(); GGML_ASSERT("))),
         ("allocation added", "dsv4-hc-kernels.hpp allocates nothing",
          with_(hc_kernels=sources["hc_kernels"] + "\nvoid * p = sycl::malloc_device(8, q);\n")),
         ("indexer kernel allocation added", "lightning-indexer-kernel.hpp allocates nothing",
          with_(lid_kernels=sources["lid_kernels"] + "\nvoid * p = sycl::malloc_host(8, q);\n")),
+        ("predicate header pulls in the backend", "dsv4-hc-predicates.hpp includes only ggml and the standard library",
+         with_(hc_predicates='#include "common.hpp"\n' + sources["hc_predicates"])),
+        ("indexer predicate pulls in sycl", "lightning-indexer-predicate.hpp includes only ggml and the standard library",
+         with_(lid_predicates="#include <sycl/sycl.hpp>\n" + sources["lid_predicates"])),
+        ("predicate no longer inline in its header", "ggml_sycl_dsv4_hc_pre_supported is defined inline in its header",
+         with_(hc_predicates=sources["hc_predicates"].replace("inline bool ggml_sycl_dsv4_hc_pre_supported", "bool ggml_sycl_dsv4_hc_pre_supported"))),
+        ("launcher grows its own K-type switch", "the indexer launcher keeps no K-type switch of its own",
+         with_(lid_kernels=sources["lid_kernels"] + "\nint f(ggml_type t) { switch (t) { case GGML_TYPE_F16: return 1; default: return 0; } }\n")),
+        ("launcher stops using the K-type table", "GGML_SYCL_LIGHTNING_INDEXER_K_TYPES generates the predicate and the launcher",
+         with_(lid_kernels=sources["lid_kernels"].replace("GGML_SYCL_LIGHTNING_INDEXER_K_TYPES(X)", "X(GGML_TYPE_F16)"))),
+        ("EPL table defined twice", "GGML_SYCL_LIGHTNING_INDEXER_EPLS is defined once, in the predicate header",
+         with_(lid_predicates=sources["lid_predicates"] + "\n#define GGML_SYCL_LIGHTNING_INDEXER_EPLS(X) X(2)\n")),
+        ("comb scale index back to a literal", "the comb scale index is one named constant",
+         with_(hc_kernels=sources["hc_kernels"].replace("a.scale[HC_COMB_SCALE_COMB_IDX * a.ss0]", "a.scale[2 * a.ss0]"))),
         ("indexer wait added", "lightning-indexer.cpp has no host wait",
          with_(lid=sources["lid"] + "\nvoid f(sycl::queue * s) { s->wait_and_throw(); }\n")),
     ]

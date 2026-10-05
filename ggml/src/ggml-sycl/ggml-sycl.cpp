@@ -110024,12 +110024,6 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
     return nullptr;
 }
 
-// Set, on the calling thread only, for the duration of ggml_backend_sycl_supports_op_capability(): the two PLACEMENT
-// predicates supports_op consults (host-demoted KV, planner-on-host) then answer "not placed elsewhere", so the
-// same supports_op body returns its capability answer -- "is there a kernel for this op, type and shape" -- and
-// the two cannot drift apart. Nothing else sets it, and supports_op calls nothing that reads it besides those two.
-static thread_local bool g_sycl_supports_op_capability_only = false;
-
 static int  ggml_sycl_extract_planned_layer_id(const ggml_tensor * op);
 static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device);
 static bool ggml_sycl_layer_plan_applies_to_op(const ggml_tensor * op);
@@ -110176,14 +110170,24 @@ static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {
 // never strcmp) and its rationale: see the comment on
 // ggml_backend_sycl_kv_host_buffer_type() above.
 static bool ggml_sycl_tensor_is_in_kv_host_buft(const ggml_tensor * t) {
-    if (!t || g_sycl_supports_op_capability_only) {
+    if (!t) {
         return false;
     }
     const ggml_backend_buffer_t buf = (t->view_src && t->view_src->buffer) ? t->view_src->buffer : t->buffer;
     return buf && buf->buft && buf->buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name;
 }
 
+// supports_op is "is there a kernel for this op, type and shape" AND "is the data placed where this device runs it".
+// The second half is the placement declines below (host-demoted KV, planner-on-host); `placement_declines` switches
+// exactly those off, which is what ggml_backend_sycl_supports_op_capability() does, so the capability answer is
+// this same body and cannot drift from supports_op.
+static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op, bool placement_declines);
+
 static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    return ggml_sycl_device_supports_op_impl(dev, op, /*placement_declines=*/true);
+}
+
+static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op, bool placement_declines) {
     ggml_backend_sycl_device_context * sycl_ctx = (ggml_backend_sycl_device_context *) dev->context;
     int                                device   = sycl_ctx->device;
 
@@ -110213,7 +110217,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
     // instrumentation below is a temporary TKV-11 observable; delete at
     // TKV-12 cleanup, together with the counter declaration and the
     // teardown print in ggml_backend_sycl_free.
-    if (ggml_sycl_tensor_is_in_kv_host_buft(op)) {
+    if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op)) {
         // TKV-13 step 5: SET_ROWS writing demoted-layer KV is accepted --
         // not declined -- when GGML_SYCL_ATTN_HOST_DISPATCH is set, so the
         // scheduler never carves a mid-graph CPU split for the KV append;
@@ -110234,7 +110238,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
+        if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
             // TKV-13 (B2) step 3: FLASH_ATTN_EXT over host-resident KV is
             // accepted -- not declined -- when GGML_SYCL_ATTN_HOST_DISPATCH
             // is set, so ggml_backend_sched never carves a CPU-backend split
@@ -110260,7 +110264,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             // decline the intercept, and run the normal GPU kernel over
             // host KV -- the forbidden zero-copy, via predicate asymmetry.
             if ((op->op == GGML_OP_FLASH_ATTN_EXT ||
-                 (op->op == GGML_OP_SET_ROWS && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&
+                 (op->op == GGML_OP_SET_ROWS && placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&
                 ggml_sycl_attn_host_dispatch_enabled()) {
                 if (g_ggml_sycl_debug) {
                     g_sycl_attn_host_accept_count.fetch_add(1, std::memory_order_relaxed);
@@ -110331,7 +110335,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
     const bool is_multi_gpu_router_logits =
         g_moe_multi_gpu_active.load(std::memory_order_acquire) && ggml_sycl_op_is_moe_router_logits_matmul(op);
 
-    if (!is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {
+    if (placement_declines && !is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {
         GGML_SYCL_DEBUG("[SYCL-SUPPORT] planner rejects %s on SYCL backend (op=%s layer=%d)\n",
                         op && op->name[0] != '\0' ? op->name : "(unnamed)", ggml_op_name(op->op),
                         ggml_sycl_extract_planned_layer_id(op));
@@ -110944,15 +110948,7 @@ bool ggml_backend_sycl_supports_op_capability(ggml_backend_dev_t dev, const stru
         return false;
     }
 
-    struct capability_scope {
-        const bool saved = g_sycl_supports_op_capability_only;
-
-        capability_scope() { g_sycl_supports_op_capability_only = true; }
-
-        ~capability_scope() { g_sycl_supports_op_capability_only = saved; }
-    } scope;
-
-    return ggml_backend_sycl_device_supports_op(dev, op);
+    return ggml_sycl_device_supports_op_impl(dev, op, /*placement_declines=*/false);
 }
 
 static bool ggml_backend_sycl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -111336,7 +111332,7 @@ static bool ggml_sycl_layer_plan_applies_to_op(const ggml_tensor * op) {
 }
 
 static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device) {
-    if (!op || device < 0 || g_sycl_supports_op_capability_only) {
+    if (!op || device < 0) {
         return false;
     }
 

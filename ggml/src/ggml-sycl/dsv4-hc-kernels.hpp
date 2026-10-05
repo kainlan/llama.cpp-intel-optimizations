@@ -16,14 +16,13 @@
 // Every stride is in ELEMENTS (float), not bytes. Nothing is allocated and nothing blocks the host:
 // each launcher submits one kernel on the caller's in-order queue, so it is recordable into a SYCL graph.
 
+#include "dsv4-hc-predicates.hpp"
+
 #include <cstdint>
 #include <limits>
 #include <sycl/sycl.hpp>
 
 namespace ggml_sycl_dsv4 {
-
-// The comb op is defined for four streams only (ggml_dsv4_hc_comb asserts hc == 4).
-constexpr int HC_COMB_STREAMS = 4;
 
 constexpr int64_t HC_BLOCK_SIZE = 256;
 
@@ -115,8 +114,6 @@ inline void hc_comb_norm_rows(float * comb, float eps) {
 }
 
 inline void hc_comb_launch(sycl::queue & q, const hc_comb_args & a) {
-    constexpr int comb_offset = 2 * HC_COMB_STREAMS;
-
     const int64_t num_blocks = (a.n_tokens + HC_BLOCK_SIZE - 1) / HC_BLOCK_SIZE;
 
     q.parallel_for(sycl::nd_range<1>(sycl::range<1>(num_blocks * HC_BLOCK_SIZE), sycl::range<1>(HC_BLOCK_SIZE)),
@@ -126,15 +123,15 @@ inline void hc_comb_launch(sycl::queue & q, const hc_comb_args & a) {
                            return;
                        }
 
-                       const float scale_comb = a.scale[2 * a.ss0];
+                       const float scale_comb = a.scale[HC_COMB_SCALE_COMB_IDX * a.ss0];
                        float       comb[HC_COMB_STREAMS * HC_COMB_STREAMS];
 
                        for (int isrc = 0; isrc < HC_COMB_STREAMS; ++isrc) {
                            float max = -std::numeric_limits<float>::infinity();
                            for (int idst = 0; idst < HC_COMB_STREAMS; ++idst) {
                                const int   idx = idst + HC_COMB_STREAMS * isrc;
-                               const float v   = a.mixes[(comb_offset + idx) * a.sm0 + it * a.sm1] * scale_comb +
-                                               a.base[(comb_offset + idx) * a.sb0];
+                               const float v = a.mixes[(HC_COMB_COMB_OFFSET + idx) * a.sm0 + it * a.sm1] * scale_comb +
+                                               a.base[(HC_COMB_COMB_OFFSET + idx) * a.sb0];
                                comb[idx] = v;
                                max       = sycl::fmax(max, v);
                            }
