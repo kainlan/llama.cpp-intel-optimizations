@@ -330,7 +330,12 @@ if args.self_test:
                      "int v = ggml_get_op_params_i32(op, 1);",
                      "int v = ggml_sycl_dsv4::hc_op_param_i32(op, (1));",
                      "int v = ggml_sycl_dsv4::hc_op_param_i32(dst->src[0], 1);",
-                     "std::memcpy(&v, (const int32_t *) op->op_params + 1, 4);"):
+                     "std::memcpy(&v, (const int32_t *) op->op_params + 1, 4);",
+                     "int v = op->op_params[0x1];",
+                     "int v = op->op_params[1u];",
+                     "int v = op->op_params[1'0];",
+                     "int v = ggml_get_op_params_i32(op, 1u);",
+                     "int v = ggml_sycl_dsv4::hc_op_param_i32(op, 0x1'0ul);"):
         mutants.append((f"literal slot spelled `{spelling}`", "no DSv4 HC source indexes op_params by a literal",
                         with_(hc=sources["hc"] + "\nvoid f() { " + spelling + " }\n")))
     mutants += [
@@ -351,6 +356,8 @@ if args.self_test:
             ("an identifier ending in digits as the slot", "int v = ggml_get_op_params_i32(op, bad1);"),
             ("an identifier a1 as the slot", "int v = ggml_sycl_dsv4::hc_op_param_i32(op, a1);"),
             ("op_params indexed by an identifier ending in a digit", "int v = op->op_params[a1];"),
+            ("op_params indexed by a token that only starts with a digit", "int v = op->op_params[1x];"),
+            ("op_params indexed by a digit-led identifier", "int v = op->op_params[1_slot];"),
             ("a commented-out accessor call", "// int v = ggml_get_op_params_i32(op, 1);"),
             ("a block-commented accessor call", "/* int v = op->op_params[1]; */")):
         failed += holds(label, SLOT_CHECK, with_(hc=sources["hc"] + "\nvoid f() { " + text + " }\n"))

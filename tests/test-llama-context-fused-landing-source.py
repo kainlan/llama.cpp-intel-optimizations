@@ -211,7 +211,8 @@ def ungated_sites(body, site):
     * a site under no such if is reported.
     What it does not understand: raw string literals, `#if 0` regions (parsed as code), a comma or ternary at the top
     level of a condition (`placement_declines && a, true`, `c ? x : y`, read as gated), a `switch` body's labels, and
-    the `else` branch of a gated BRACED `if` (reported, which fails closed).
+    the `else` branch of a gated BRACED `if` (reported, which fails closed), and a gated `try { } catch (...) { }`
+    (the statement ends at the try block, so an ungated site after the catch is swallowed: fails open).
     """
     clean = strip_comments(body, blank_literals=True, keep_length=True)
     spans = []
@@ -472,6 +473,10 @@ if args.self_test:
                          "if (placement_declines && a) if (b) y(); else if (c) { z(); } use(" + SITE + ");", True)
     failed += parse_case("a gated do/while, then an ungated site",
                          "if (placement_declines && a) do { y(); } while (b); use(" + SITE + ");", True)
+    failed += parse_case("a site in the condition of a gated unbraced do/while",
+                         "if (placement_declines && a) do y(); while (use(" + SITE + "));", False)
+    failed += parse_case("a site in the else-if of a gated one-statement if",
+                         "if (placement_declines && a) if (b) y(); else if (c) use(" + SITE + ");", False)
     failed += parse_case("a site inside a gated for-block",
                          "if (placement_declines && a) for (;;) { use(" + SITE + "); }", False)
     failed += parse_case("a site in the else of a gated one-statement if",
