@@ -3,21 +3,35 @@
 unified_lookup_runtime_allocation() answers "which registered allocation contains this pointer" through
 g_runtime_alloc_index (range-index.hpp) instead of scanning every row of g_runtime_alloc_registry (61.65% of Qwen3.8
 decode CPU with a 512-expert MoE). The index is correct only while every insert and erase of a registry row also updates
-it, so:
+it, and while a row's extent changes only through the helpers that update the index with it. What this file enforces:
 
 (A) g_runtime_alloc_registry is mutated (emplace/erase/insert/clear/extract/swap/operator[]/assignment) ONLY inside the
-    runtime_registry_emplace_locked / runtime_registry_erase_locked helpers, which keep the index in step.
-(B) A registered row's geometry is never rewritten through the registry (the index keeps the geometry it was given at
-    insertion): no assignment, compound assignment (+=, |=, <<= ...) or ++/-- of handle.ptr/handle.size or of the handle, no
-    whole-row assignment (`it->second = rec;`, `registry.find(p)->second = rec;`) in a function that touches the registry,
-    and no non-const reference or pointer bound to a row.
+    runtime_registry_emplace_locked / runtime_registry_erase_locked helpers, and every other mention of the registry is
+    a read member call, a const range-for or the declaration (so no alias, pointer, or reference argument, and no at()).
+(B) A registered row is never WRITTEN THROUGH a plain access path outside those helpers:
+    - an assignment, compound assignment (+=, |=, <<= ...) or ++/-- of `second.handle`, `second.handle.ptr` or
+      `second.handle.size`, anywhere in the file;
+    - a whole-row assignment (`it->second = rec;`, `registry.find(p)->second = rec;`) anywhere in the file, except the
+      three non-registry sites in ROW_WRITE_ALLOWLIST (each checked by hand; an entry that stops matching fails the gate)
+      and the one in runtime_registry_assign_locked, which resizes or re-keys the index before it moves a row over the old;
+    - in a function that touches the registry (names it, or takes a runtime_registry_iterator / the map's own iterator
+      type): a non-const reference or pointer bound to a row (`auto & r = it->second;`, `auto q = &it->second;`,
+      `auto * q = &it->second.handle;`, `alloc_metadata & h = ...second.handle;`, `decltype(auto) r = it->second;`), a
+      non-const structured binding (`auto & [k, v] = *it;`), and a lambda or function parameter that is a non-const
+      reference to a row or its metadata (`[&](runtime_alloc_record & r)`, `[](auto & r)`).
 (C) Neither registry nor index is touched from another translation unit (both are file-static in unified-cache.cpp).
 (D) The lookup consults the index and does not iterate the registry.
 
-Limits, stated so nobody mistakes the gate for a proof: it reads text, not the AST. It does not understand `#if 0`
-blocks or raw string literals, and it cannot see a row's geometry rewritten by a call (std::swap, std::exchange, memcpy)
-on a reference it did not see being bound; the read-only-use gate and the alias gate bound that to code that already
-looks wrong. Functions are split at a closing brace in column 0, which is how this file is formatted.
+NOT COVERED, stated so nobody mistakes this for a proof. The gate reads text, not the AST:
+    - writes by CALL, even directly on a row: `std::swap(it->second, x)`, `std::exchange(it->second.handle.size, 0)`,
+      `memcpy(&it->second, ...)`, `memset(&it->second.handle, ...)`;
+    - `const_cast` of a const view of a row;
+    - a helper that RETURNS `runtime_alloc_record &` / `alloc_metadata &` (the call site never names the registry), and a
+      non-const reference parameter in a function that does not itself touch the registry;
+    - `#if 0` blocks and raw string literals, which the comment stripper does not understand;
+    - functions are split at a closing brace in column 0, which is how this file is formatted.
+Those are bounded only by review; (A) and the alias/parameter rules above keep any such write on code that already looks
+wrong.
 
 Host-only, pure text assertions. llama_test_pytest hands this file to pytest.main(), so the checks live inside test_*()
 functions. Checks run against COMMENT-STRIPPED text, and each has a mutation witness so it is known to fail on the
@@ -70,11 +84,35 @@ READ_MEMBER_RE = re.compile(
     r"|load_factor|max_load_factor)\b"
 )
 CONST_RANGE_FOR_RE = re.compile(r"const\s+auto\s*&\s*\w+\s*:\s*$")
-# A non-const reference or pointer bound to a registry row (`auto & rec = it->second;`), through which a row's geometry
-# could be rewritten. Only looked for in functions that touch the registry.
+# A non-const reference or pointer bound to a registry row, through which a row's geometry could be rewritten. Only looked
+# for in functions that touch the registry.
 ROW_ALIAS_RE = re.compile(
+    # auto & r = it->second;  auto * q = &it->second.handle;  alloc_metadata & h = it->second.handle;
     r"(?<!const )(?<!const\t)\b(?:auto|alloc_metadata|runtime_alloc_record)\s*(?:&&?|\*)\s*\w+\s*(?:=|\{|\()[^;{}]*\bsecond\b"
+    # auto q = &it->second;   (a pointer deduced from an address-of; `const auto q` is still a pointer to a mutable row)
+    r"|\bauto\s+\w+\s*=\s*&[^;{}]*\bsecond\b"
+    # decltype(auto) r = it->second;
+    r"|\bdecltype\s*\(\s*auto\s*\)\s*\w+\s*=[^;{}]*\bsecond\b"
 )
+# A non-const structured binding: `auto & [k, v] = *it;`, `auto && [k, v] = ...;`, `for (auto & [k, v] : map)`.
+STRUCTURED_BINDING_RE = re.compile(r"(?<!const )(?<!const\t)\bauto\s*&{1,2}\s*\[[^\]]*\]\s*(?:=|:|\{|\()")
+# A function or lambda parameter that is a non-const reference to a row or its metadata, or a generic one.
+ROW_REF_PARAM_RE = re.compile(
+    r"[(,]\s*(?:runtime_alloc_record|alloc_metadata)\s*&&?\s*\w*\s*(?=[,)])|[(,]\s*auto\s*&&?\s*\w+\s*(?=[,)])"
+)
+# Functions that deal in registry rows even when they never name the registry (an iterator parameter, say).
+REGISTRY_FUNCTION_MARKERS = (
+    "g_runtime_alloc_registry",
+    "runtime_registry_iterator",
+    "unordered_map<void *, runtime_alloc_record>",
+)
+# The `second` writes in the file that are NOT registry rows, each checked by hand. Keyed by the stripped source line;
+# an entry that no longer appears in the file fails test_row_write_allowlist_is_not_stale.
+ROW_WRITE_ALLOWLIST = {
+    "current->second = replacement;": "the MoE mmid plan registry's entry",
+    "entry.second += bytes;": "offload host-alloc stats, keyed by tag",
+    "mapped->second = replacement;": "the id_to_key_ map",
+}
 _ASSIGN = r"(?:(?:[-+*/%|&^]|<<|>>)?=(?!=)|\+\+|--)"  # =, op=, ++, -- ; not ==, <=, >=, !=
 # A row's identity or geometry written through an iterator/reference into the registry: `second.handle = x`,
 # `second.handle.size += n`, `second.handle.ptr++`, `++second.handle.size`.
@@ -82,8 +120,8 @@ GEOMETRY_WRITE_RE = re.compile(
     r"(?:->|\.)second\s*\.\s*handle\s*(?:\.\s*(?:ptr|size)\s*)?" + _ASSIGN
     + r"|(?:\+\+|--)\s*[\w.>()\-]*?(?:->|\.)second\s*\.\s*handle\s*\.\s*(?:ptr|size)\b"
 )
-# A whole row written through an iterator/reference: `it->second = rec;`, `registry.find(p)->second = rec;`. Looked for
-# only in functions that touch the registry, because other maps in the file have a `second` too.
+# A whole row written through an iterator/reference: `it->second = rec;`, `registry.find(p)->second = rec;`. Scanned over
+# the whole file (a helper that takes the iterator never names the registry), minus ROW_WRITE_ALLOWLIST.
 ROW_WRITE_RE = re.compile(r"(?:->|\.)second\s*" + _ASSIGN)
 
 
@@ -124,13 +162,17 @@ def registry_uses_that_are_not_reads(code: str):
     return bad
 
 
+def touches_registry(body: str) -> bool:
+    return any(marker in body for marker in REGISTRY_FUNCTION_MARKERS)
+
+
 def registry_function_scan(code: str, pattern):
-    """Matches of `pattern` inside functions that mention the registry; (line, text)."""
+    """Matches of `pattern` inside functions that touch the registry; (line, text)."""
     bad = []
     pos = 0
     for end in re.finditer(r"\n}\n", code):
         body = code[pos : end.end()]
-        if "g_runtime_alloc_registry" in body:
+        if touches_registry(body):
             for m in pattern.finditer(body):
                 bad.append((code.count("\n", 0, pos + m.start()) + 1, m.group(0)[:70]))
         pos = end.end()
@@ -138,12 +180,30 @@ def registry_function_scan(code: str, pattern):
 
 
 def row_aliases_in_registry_functions(code: str):
-    """A non-const reference/pointer to a registry row, in a function that uses the registry."""
+    """A non-const reference/pointer to a registry row, in a function that touches the registry."""
     return registry_function_scan(code, ROW_ALIAS_RE)
 
 
-def whole_row_writes_in_registry_functions(code: str):
-    return registry_function_scan(code, ROW_WRITE_RE)
+def non_const_bindings_in_registry_functions(code: str):
+    """Non-const structured bindings and non-const row/generic reference parameters, in functions that touch the registry."""
+    return registry_function_scan(code, STRUCTURED_BINDING_RE) + registry_function_scan(code, ROW_REF_PARAM_RE)
+
+
+# The one helper that replaces a row in place: it resizes or re-keys the index first, then moves the new row over the old.
+ASSIGN_HELPER = r"runtime_registry_assign_locked\(\s*void\s*\*\s*ptr\s*,\s*const\s+runtime_alloc_record\s*&\s*rec\s*\)\s*\{"
+
+
+def row_writes_outside_the_allowlist(code: str):
+    bad = []
+    lines = code.split("\n")
+    start, end = function_span(code, ASSIGN_HELPER)
+    for m in ROW_WRITE_RE.finditer(code):
+        line = code.count("\n", 0, m.start()) + 1
+        if start <= m.start() < end:
+            continue
+        if lines[line - 1].strip() not in ROW_WRITE_ALLOWLIST:
+            bad.append((line, lines[line - 1].strip()[:70]))
+    return bad
 
 
 def geometry_writes(code: str):
@@ -332,28 +392,43 @@ def test_geometry_gate_allows_reads_and_other_fields(line):
     assert geometry_writes(CODE + "\nvoid f() {\n    " + line + "\n}\n") == [], line
 
 
-def test_whole_row_writes_are_absent_from_registry_functions():
-    assert whole_row_writes_in_registry_functions(CODE) == []
+def test_no_row_is_written_whole_outside_the_allowlist():
+    assert row_writes_outside_the_allowlist(CODE) == []
+
+
+def test_the_assign_helper_really_writes_a_row():
+    # Positive control for the exemption above: the pattern matches inside the helper, so excusing it is not vacuous.
+    start, end = function_span(CODE, ASSIGN_HELPER)
+    assert [m for m in ROW_WRITE_RE.finditer(CODE) if start <= m.start() < end]
+
+
+def test_row_write_allowlist_is_not_stale():
+    stripped = {line.strip() for line in CODE.split("\n")}
+    assert [entry for entry in ROW_WRITE_ALLOWLIST if entry not in stripped] == []
+    # And each entry really is a match of the pattern, so the allowlist is exercising what it excuses.
+    matched = {CODE.split("\n")[CODE.count("\n", 0, m.start())].strip() for m in ROW_WRITE_RE.finditer(CODE)}
+    assert set(ROW_WRITE_ALLOWLIST) <= matched
 
 
 @pytest.mark.parametrize(
-    "line",
+    "text",
     [
-        "it->second = rec;",
-        "it->second = std::move(rec);",
-        "g_runtime_alloc_registry.find(p)->second = rec;",
-        "g_runtime_alloc_registry.begin()->second = rec;",
-        "it->second |= flags;",
-        "it->second++;",
+        "static void setrow(runtime_registry_iterator it, const runtime_alloc_record & rec) { it->second = rec; }",
+        "static void setrow(runtime_registry_iterator it, runtime_alloc_record rec) {\n    it->second = std::move(rec);\n}",
+        "void f() {\n    auto it = g_runtime_alloc_registry.find(p);\n    it->second = rec;\n}",
+        "void f() {\n    g_runtime_alloc_registry.find(p)->second = rec;\n}",
+        "void f() {\n    g_runtime_alloc_registry.begin()->second = rec;\n}",
+        "void f() {\n    it->second |= flags;\n}",
+        "void f() {\n    it->second++;\n}",
+        "void f(std::pair<void *, runtime_alloc_record> & kv) {\n    kv.second = rec;\n}",
     ],
 )
-def test_whole_row_gate_has_a_witness(line):
-    planted = CODE + "\nvoid f() {\n    auto it = g_runtime_alloc_registry.find(p);\n    " + line + "\n}\n"
-    assert whole_row_writes_in_registry_functions(planted), line
+def test_row_write_gate_has_a_witness(text):
+    assert row_writes_outside_the_allowlist(CODE + "\n" + text + "\n"), text
 
 
 @pytest.mark.parametrize(
-    "line",
+    "text",
     [
         "if (it->second == rec) {}",
         "bool b = it->second != rec;",
@@ -361,13 +436,85 @@ def test_whole_row_gate_has_a_witness(line):
         "use(it->second.state);",
     ],
 )
-def test_whole_row_gate_allows_reads(line):
+def test_row_write_gate_allows_reads(text):
+    assert row_writes_outside_the_allowlist(CODE + "\nvoid f() {\n    " + text + "\n}\n") == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "auto q = &it->second; q->handle.size = 0;",
+        "auto q = &it->second.handle;",
+        "const auto q = &it->second;",
+        "decltype(auto) r = it->second;",
+        "auto * q = &it->second;",
+        "runtime_alloc_record * q = &it->second;",
+    ],
+)
+def test_more_alias_forms_have_a_witness(line):
     planted = CODE + "\nvoid f() {\n    auto it = g_runtime_alloc_registry.find(p);\n    " + line + "\n}\n"
-    assert whole_row_writes_in_registry_functions(planted) == [], line
+    assert row_aliases_in_registry_functions(planted), line
 
 
-def test_whole_row_gate_ignores_functions_that_do_not_touch_the_registry():
-    assert whole_row_writes_in_registry_functions(CODE + "\nvoid f() {\n    other->second = x;\n}\n") == []
+def test_alias_gate_follows_a_function_that_only_takes_the_iterator():
+    planted = CODE + "\nstatic void g(runtime_registry_iterator it) {\n    auto & r = it->second;\n}\n"
+    assert row_aliases_in_registry_functions(planted)
+    planted = CODE + "\nstatic void g(std::unordered_map<void *, runtime_alloc_record>::iterator it) {\n    auto & r = it->second;\n}\n"
+    assert row_aliases_in_registry_functions(planted)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "auto & [k, v] = *it; v = rec; v.handle.size = 0;",
+        "auto && [k, v] = *it;",
+        "for (auto & [k, v] : g_runtime_alloc_registry) { v.handle.size = 0; }",
+    ],
+)
+def test_non_const_structured_binding_has_a_witness(line):
+    planted = CODE + "\nvoid f() {\n    auto it = g_runtime_alloc_registry.find(p);\n    " + line + "\n}\n"
+    assert non_const_bindings_in_registry_functions(planted), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "[&](runtime_alloc_record & r) { r.handle.size = 0; }(it->second);",
+        "[](auto & r) { r.handle.size = 0; }(it->second);",
+        "[](auto && r) { r.handle.size = 0; }(it->second);",
+        "[&](alloc_metadata & h) { h.size = 0; }(it->second.handle);",
+        "fn([&](int a, runtime_alloc_record & r) {});",
+    ],
+)
+def test_non_const_row_parameter_has_a_witness(line):
+    planted = CODE + "\nvoid f() {\n    auto it = g_runtime_alloc_registry.find(p);\n    " + line + "\n}\n"
+    assert non_const_bindings_in_registry_functions(planted), line
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "const auto & [k, v] = *it;",
+        "auto [k, v] = *it;",
+        "[&](const runtime_alloc_record & r) { use(r); }(it->second);",
+        "[&](const alloc_metadata & h) { use(h); }(it->second.handle);",
+        "[](int a, int b) { return a + b; }(1, 2);",
+        "for (const auto & kv : g_runtime_alloc_registry) { use(kv); }",
+    ],
+)
+def test_non_const_gate_allows_const_and_unrelated_forms(line):
+    planted = CODE + "\nvoid f() {\n    auto it = g_runtime_alloc_registry.find(p);\n    " + line + "\n}\n"
+    assert non_const_bindings_in_registry_functions(planted) == [], line
+
+
+def test_the_rules_ignore_functions_that_do_not_touch_the_registry():
+    other = "\nvoid f(std::map<int, int> & m) {\n    for (auto & [k, v] : m) { v = 1; }\n    auto & x = m.begin()->second;\n}\n"
+    assert non_const_bindings_in_registry_functions(CODE + other) == []
+    assert row_aliases_in_registry_functions(CODE + other) == []
+
+
+def test_non_const_bindings_are_absent_from_registry_functions():
+    assert non_const_bindings_in_registry_functions(CODE) == []
 
 
 def test_registry_and_index_stay_file_static():

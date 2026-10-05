@@ -45,6 +45,7 @@
 #include <map>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 
@@ -1569,16 +1570,46 @@ static void runtime_registry_erase_locked(void * ptr) noexcept {
     }
 }
 
-// Replace-or-insert, the semantics of `registry[ptr] = rec`: the row at `ptr`, if any, is dropped first. An allocation
-// failure after that drop leaves the old row gone, which is the same state the index-free code reached by erasing and
-// then failing to insert.
+// Replace-or-insert, the semantics of `registry[ptr] = rec`, and like it a replace of an existing row allocates nothing
+// that can fail after the old row has been touched: the copy of `rec` and any new index node are made first, and what
+// follows (resizing or dropping the old range, moving the copy over the row) cannot throw. So a bad_alloc leaves the old
+// row and its range as they were, never a live allocation with no row. The adopt callers hand out a live handle for this
+// row, so a row that did not land would be an unowned allocation; hence the assertion.
+static_assert(std::is_nothrow_move_assignable<runtime_alloc_record>::value,
+              "runtime_registry_assign_locked relies on a nothrow row replacement");
+
 static void runtime_registry_assign_locked(void * ptr, const runtime_alloc_record & rec) {
-    runtime_registry_erase_locked(ptr);
-    const bool published = runtime_registry_emplace_locked(ptr, rec).second;
-    // The adopt callers hand out a live handle for this row, so a row that did not land would be an unowned allocation.
-    // It cannot happen while a row's key is its handle.ptr (the erase above frees both the key and the base).
-    GGML_ASSERT(published && "runtime allocation registry refused an adopted row");
-    (void) published;
+    const auto it = g_runtime_alloc_registry.find(ptr);
+    if (it == g_runtime_alloc_registry.end()) {
+        const bool published = runtime_registry_emplace_locked(ptr, rec).second;
+        GGML_ASSERT(published && "runtime allocation registry refused an adopted row");
+        (void) published;
+        return;
+    }
+    runtime_alloc_record fresh = rec;  // may throw; nothing has changed yet
+    const alloc_metadata old_h = it->second.handle;
+    const bool           was   = runtime_registry_row_indexed(old_h);
+    const bool           now   = runtime_registry_row_indexed(fresh.handle);
+    if (now) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(fresh.handle.ptr);
+        if (was && old_h.ptr == fresh.handle.ptr) {
+            const bool resized = g_runtime_alloc_index.resize(base, ptr, fresh.handle.size);
+            GGML_ASSERT(resized && "runtime allocation index lost a registered row");
+            (void) resized;
+        } else {
+            // A row whose key is not its handle.ptr, or one that had no extent: the new range goes in before the old one
+            // goes out, so a failed insert leaves the old range in place.
+            const bool indexed = g_runtime_alloc_index.insert(base, fresh.handle.size, ptr);
+            GGML_ASSERT(indexed && "runtime allocation index refused an adopted row");
+            (void) indexed;
+            if (was) {
+                g_runtime_alloc_index.erase(reinterpret_cast<uintptr_t>(old_h.ptr), ptr);
+            }
+        }
+    } else if (was) {
+        g_runtime_alloc_index.erase(reinterpret_cast<uintptr_t>(old_h.ptr), ptr);
+    }
+    it->second = std::move(fresh);
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)

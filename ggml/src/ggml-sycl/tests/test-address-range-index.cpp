@@ -46,7 +46,8 @@ struct oracle {
     std::vector<oracle_row> rows;
 
     bool insert(uintptr_t base, size_t size, void * key) {
-        if (size == 0) {
+        const uintptr_t end = base + size < base ? UINTPTR_MAX : base + size;
+        if (size == 0 || end <= base) {
             return false;
         }
         for (const auto & r : rows) {
@@ -54,9 +55,22 @@ struct oracle {
                 return false;
             }
         }
-        const uintptr_t end = base + size < base ? UINTPTR_MAX : base + size;
         rows.push_back({ base, end, key });
         return true;
+    }
+
+    bool resize(uintptr_t base, void * key, size_t size) {
+        const uintptr_t end = base + size < base ? UINTPTR_MAX : base + size;
+        if (size == 0 || end <= base) {
+            return false;
+        }
+        for (auto & r : rows) {
+            if (r.base == base && r.key == key) {
+                r.end = end;
+                return true;
+            }
+        }
+        return false;
     }
 
     bool erase(uintptr_t base, void * key) {
@@ -102,6 +116,8 @@ void test_basic_bounds() {
     check(idx.insert(100, 50, key_of(1)), "insert [100,150)");
     check(!idx.insert(100, 10, key_of(2)), "a second range at the same base is refused");
     check(idx.size() == 1, "size is 1");
+    check(!idx.insert(UINTPTR_MAX, 5, key_of(3)), "a range whose clamped end equals its base is empty and is refused");
+    check(idx.size() == 1, "and it was not added");
     check(!idx.find_innermost(99, &e), "one byte before the base misses");
     check(idx.find_innermost(100, &e) && e.base == 100 && e.end == 150 && e.key == key_of(1), "first byte hits");
     check(idx.find_innermost(149, &e) && e.key == key_of(1), "last byte hits");
@@ -158,6 +174,28 @@ void test_nesting() {
     check(idx.check_invariants(), "invariants hold");
 }
 
+void test_resize() {
+    printf("resize:\n");
+    address_range_index idx;
+    entry               e;
+    check(idx.insert(1000, 4000, key_of(1)) && idx.insert(1100, 100, key_of(2)),
+          "chunk [1000,5000) and sub [1100,1200)");
+    check(idx.find_innermost(1250, &e) && e.key == key_of(1), "past the sub the chunk answers");
+    check(idx.resize(1100, key_of(2), 400), "grow the sub to [1100,1500)");
+    check(idx.find_innermost(1250, &e) && e.key == key_of(2) && e.end == 1500, "its new extent answers");
+    check(idx.find_innermost(1500, &e) && e.key == key_of(1), "one past it is the chunk again");
+    check(idx.resize(1100, key_of(2), 10), "shrink the sub to [1100,1110)");
+    check(idx.find_innermost(1109, &e) && e.key == key_of(2) && idx.find_innermost(1110, &e) && e.key == key_of(1),
+          "the shrunk bounds apply");
+    check(idx.resize(1000, key_of(1), 100), "shrink the chunk below its sub's end");
+    check(idx.find_innermost(4000, &e) == false, "the chunk's old tail no longer answers (max_end was recomputed)");
+    check(!idx.resize(1100, key_of(9), 50), "the wrong key resizes nothing");
+    check(!idx.resize(1101, key_of(2), 50), "a base that is not present resizes nothing");
+    check(!idx.resize(1100, key_of(2), 0), "an empty new size is refused");
+    check(idx.find_innermost(1105, &e) && e.end == 1110, "refusals changed nothing");
+    check(idx.size() == 2 && idx.check_invariants(), "size 2, invariants hold");
+}
+
 void test_rekey() {
     printf("rekey:\n");
     address_range_index idx;
@@ -177,6 +215,7 @@ void run_random(const char * name, bool laminar, uint32_t seed, int ops, uintptr
     oracle                                    ref;
     int                                       mismatches = 0;
     int                                       refusals   = 0;
+    int                                       resizes    = 0;
     uintptr_t                                 next_key   = 1;
     std::vector<std::pair<uintptr_t, void *>> live;
 
@@ -212,6 +251,23 @@ void run_random(const char * name, bool laminar, uint32_t seed, int ops, uintptr
             if (a != b) {
                 mismatches++;
             }
+        } else if (kind == 6) {
+            // Resize a live row, or try with the wrong key / a missing base; both must agree with the oracle.
+            uintptr_t base = rng() % space;
+            void *    key  = key_of(next_key++);
+            if (!live.empty() && (rng() & 3) != 0) {
+                const auto & row = live[static_cast<size_t>(rng() % live.size())];
+                base             = row.first;
+                key              = (rng() & 7) != 0 ? row.second : key;
+            }
+            const size_t size = (rng() % 8) == 0 ? 0 : 1 + rng() % 4096;
+            const bool   a    = idx.resize(base, key, size);
+            const bool   b    = ref.resize(base, key, size);
+            if (a != b) {
+                mismatches++;
+            } else if (a) {
+                resizes++;
+            }
         } else {
             // Probe a row's boundaries as well as random addresses.
             uintptr_t addr = rng() % (space + 4096);
@@ -234,10 +290,11 @@ void run_random(const char * name, bool laminar, uint32_t seed, int ops, uintptr
             mismatches++;
         }
     }
-    printf("    %zu live rows at the end, %d refused duplicates, %d mismatches\n", ref.rows.size(), refusals,
-           mismatches);
+    printf("    %zu live rows at the end, %d refused duplicates, %d resizes, %d mismatches\n", ref.rows.size(),
+           refusals, resizes, mismatches);
     check(mismatches == 0, "index agrees with the oracle on every operation");
     check(refusals > 0, "the run exercised duplicate-base refusals");
+    check(resizes > 0, "the run exercised resizes");
     check(idx.check_invariants(), "invariants hold at the end");
     check(ref.rows.size() > 100, "the run kept a population worth checking");
 }
@@ -329,6 +386,7 @@ int main() {
     test_address_space_end();
     test_nesting();
     test_rekey();
+    test_resize();
     run_random("nested", true, 1, 100000, 1u << 16);
     run_random("overlapping", false, 2, 100000, 1u << 16);
     run_random("sparse overlapping", false, 3, 60000, 1u << 22);

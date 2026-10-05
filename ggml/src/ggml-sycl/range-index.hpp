@@ -46,10 +46,11 @@ class address_range_index {
     address_range_index(const address_range_index &)             = delete;
     address_range_index & operator=(const address_range_index &) = delete;
 
-    // Adds [base, base + size) owned by `key`. Returns false, changing nothing, for an empty range or a base that is
-    // already present. Throws std::bad_alloc, changing nothing.
+    // Adds [base, base + size) owned by `key`. Returns false, changing nothing, for an empty range (size 0, or a base so
+    // close to UINTPTR_MAX that the clamped end equals it) or a base that is already present. Throws std::bad_alloc,
+    // changing nothing.
     bool insert(uintptr_t base, size_t size, void * key) {
-        if (size == 0) {
+        if (size == 0 || end_of(base, size) <= base) {
             return false;
         }
         node * n   = new node();
@@ -88,6 +89,17 @@ class address_range_index {
             count_--;
         }
         return removed;
+    }
+
+    // Gives the range at `base`, if `key` owns it, a new size. Never allocates, so it cannot fail half way; false (nothing
+    // changed) for an empty new range or a base/key that is not present.
+    bool resize(uintptr_t base, void * key, size_t size) noexcept {
+        if (size == 0 || end_of(base, size) <= base) {
+            return false;
+        }
+        bool resized = false;
+        resize_node(root_, base, key, end_of(base, size), &resized);
+        return resized;
     }
 
     // The range with the greatest base among those containing `addr`; see PRECEDENCE above.
@@ -204,6 +216,21 @@ class address_range_index {
         b->left = merge(a, b->left);
         update(b);
         return b;
+    }
+
+    static void resize_node(node * t, uintptr_t base, void * key, uintptr_t end, bool * resized) noexcept {
+        if (t == nullptr) {
+            return;
+        }
+        if (t->e.base == base) {
+            if (t->e.key == key) {
+                t->e.end = end;
+                *resized = true;
+            }
+        } else {
+            resize_node(base < t->e.base ? t->left : t->right, base, key, end, resized);
+        }
+        update(t);
     }
 
     // Removes the node at `base` if `key` owns it; otherwise the tree is unchanged.
