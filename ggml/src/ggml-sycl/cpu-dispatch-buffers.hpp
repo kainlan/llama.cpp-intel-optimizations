@@ -24,6 +24,13 @@ struct cpu_dispatch_buffers {
     // Note: accs is reinterpreted as __m256 array. Since we only use _mm256_setzero_ps()
     // and array indexing (no aligned load/store), alignment is not critical.
 
+    cpu_dispatch_buffers() = default;
+    cpu_dispatch_buffers(const cpu_dispatch_buffers &)             = delete;
+    cpu_dispatch_buffers & operator=(const cpu_dispatch_buffers &) = delete;
+
+    // scratch_nk is counted in host_mem_ledger.cpu_dispatch_scratch_bytes; give it back with the thread.
+    ~cpu_dispatch_buffers() { ledger_sub(scratch_nk.capacity()); }
+
     // Size the small, always-needed buffers. Cheap to repeat: resize to the same size is a no-op.
     void init(size_t max_m, size_t max_q_row_size) {
         src1_q.resize(max_m * max_q_row_size);
@@ -36,29 +43,24 @@ struct cpu_dispatch_buffers {
         if (scratch_nk.size() < n_floats) {
             const size_t before = scratch_nk.capacity();
             scratch_nk.resize(n_floats);
-            ledger_add(scratch_nk.capacity(), before);
+            ledger_add(scratch_nk.capacity() - before);
         }
         return scratch_nk.data();
     }
 
-    cpu_dispatch_buffers() = default;
-    cpu_dispatch_buffers(const cpu_dispatch_buffers &)             = delete;
-    cpu_dispatch_buffers & operator=(const cpu_dispatch_buffers &) = delete;
-
-    ~cpu_dispatch_buffers() {
-        ggml_sycl::host_mem_ledger_get().cpu_dispatch_scratch_bytes.fetch_sub(scratch_nk.capacity() * sizeof(float),
-                                                                              std::memory_order_relaxed);
-    }
-
-private:
-    static void ledger_add(size_t after_cap, size_t before_cap) {
-        ggml_sycl::host_mem_ledger_get().cpu_dispatch_scratch_bytes.fetch_add((after_cap - before_cap) * sizeof(float),
-                                                                              std::memory_order_relaxed);
-    }
-
-public:
+    // Test-only: lets test-cpu-dispatch-buffers bound the per-thread footprint.
     size_t resident_bytes() const {
         return src1_q.capacity() * sizeof(uint8_t) + accs.capacity() * sizeof(float) +
                scratch_nk.capacity() * sizeof(float);
+    }
+
+  private:
+    static void ledger_add(size_t n_floats) {
+        ggml_sycl::host_mem_ledger_get().cpu_dispatch_scratch_bytes.fetch_add(n_floats * sizeof(float),
+                                                                              std::memory_order_relaxed);
+    }
+    static void ledger_sub(size_t n_floats) {
+        ggml_sycl::host_mem_ledger_get().cpu_dispatch_scratch_bytes.fetch_sub(n_floats * sizeof(float),
+                                                                              std::memory_order_relaxed);
     }
 };
