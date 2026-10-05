@@ -6266,6 +6266,8 @@ bool allocation_registry_test_contains(void * ptr) noexcept;
 bool allocation_registry_test_index_consistent() noexcept;
 // llama.cpp-ii25: replace-or-insert a host-only LIVE device-VRAM row (what the adopt_raw_* paths do); true when published.
 bool allocation_registry_test_assign_raw(void * ptr, int device, size_t bytes) noexcept;
+// llama.cpp-ii25: rewrite a registered row's size behind the index's back (the next lookup inside that range must abort).
+bool allocation_registry_test_corrupt_row_size(void * ptr, size_t bytes) noexcept;
 bool allocation_registry_test_cleanup_pending(void * ptr) noexcept;
 size_t allocation_registry_test_size() noexcept;
 bool allocation_registry_test_acquire_exact_lease(const alloc_metadata & metadata) noexcept;
