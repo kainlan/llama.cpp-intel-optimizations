@@ -41,7 +41,7 @@ KV_HOST_RESIDENCY_BLOCK = """
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
             if ((op->op == GGML_OP_FLASH_ATTN_EXT ||
-                 (op->op == GGML_OP_SET_ROWS && placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&
+                 (op->op == GGML_OP_SET_ROWS && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&
                 ggml_sycl_attn_host_dispatch_enabled()) {
                 if (g_ggml_sycl_debug) {
                     g_sycl_attn_host_accept_count.fetch_add(1, std::memory_order_relaxed);

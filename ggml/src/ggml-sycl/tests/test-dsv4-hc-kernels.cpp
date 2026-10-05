@@ -42,12 +42,23 @@ namespace {
 int g_cases  = 0;
 int g_failed = 0;
 
+// The K types the indexer predicate admits, generated from its own table: a type added there is exercised here
+// (kernel cases and predicate cases) without an edit.
+constexpr ggml_type INDEXER_K_TYPES[] = {
+#define X(T) T,
+    GGML_SYCL_LIGHTNING_INDEXER_K_TYPES(X)
+#undef X
+};
+
 constexpr double NMSE_TOL     = 1e-9;
 constexpr double NMSE_REJECTS = 1e-4;  // a control oracle must be at least this far from the kernel
 
-// The matrix below produces several hundred checks (about 480 with both sub-group sizes); a run
-// that produces fewer than this had a loop silently skip its work, which a bare "no failure" would report as a pass.
-constexpr int MIN_CHECKS = 100;
+// A loop that silently skipped its work would leave "no failure" standing, so each half of the run has a floor on
+// the checks it produced: the decline matrix on its own, and the kernel checks on their own (the predicate checks
+// must not be able to stand in for them). The kernel floor is what one sub-group size produces, the least a device
+// that offers only 16 or only 32 lanes can run; both floors sit a little under the current counts.
+constexpr int MIN_PREDICATE_CHECKS = 180;  // the decline matrix produces 194
+constexpr int MIN_KERNEL_CHECKS    = 200;  // 331 with both sub-group sizes, about 205 with only one
 
 std::mt19937 g_rng(20261003);
 
@@ -737,113 +748,120 @@ struct node_ctx {
     }
 };
 
+// One single-property edit of a built op node: a tensor field of the op itself (operand DST) or of one of its
+// sources, or one of the op's int params. Each factory is one line at the call site.
+constexpr int DST = -1;
+
+struct mut {
+    const char * what;
+    int          operand;  // DST, or the index into op->src
+    char         field;    // 't'ype, 'e' (ne), 'n' (nb), 'p' (op_params slot `dim`)
+    int          dim;
+    int64_t      value;
+    bool         relative;  // add `value` to the field instead of setting it
+
+    static mut type(const char * w, int operand, ggml_type ty) { return { w, operand, 't', 0, ty, false }; }
+
+    static mut ne(const char * w, int operand, int dim, int64_t v) { return { w, operand, 'e', dim, v, false }; }
+
+    static mut ne_add(const char * w, int operand, int dim, int64_t v) { return { w, operand, 'e', dim, v, true }; }
+
+    static mut nb(const char * w, int operand, int dim, int64_t v) { return { w, operand, 'n', dim, v, false }; }
+
+    static mut nb_add(const char * w, int operand, int dim, int64_t v) { return { w, operand, 'n', dim, v, true }; }
+
+    static mut param(const char * w, int slot, int32_t v) { return { w, DST, 'p', slot, v, false }; }
+
+    void apply(ggml_tensor * op) const {
+        ggml_tensor * tn = operand == DST ? op : op->src[operand];
+        switch (field) {
+            case 't':
+                tn->type = (ggml_type) value;
+                break;
+            case 'e':
+                tn->ne[dim] = relative ? tn->ne[dim] + value : value;
+                break;
+            case 'n':
+                tn->nb[dim] = relative ? tn->nb[dim] + (size_t) value : (size_t) value;
+                break;
+            case 'p':
+                {
+                    const int32_t v = (int32_t) value;
+                    std::memcpy((int32_t *) tn->op_params + dim, &v, sizeof(v));
+                }
+                break;
+        }
+    }
+};
+
 void expect_pred(const std::string & name, bool got, bool want) {
     report(std::string("predicate: ") + name + (want ? " is admitted" : " is declined"), got == want, 0.0);
 }
 
-constexpr int64_t PRED_N_EMBD = 64;
-constexpr int64_t PRED_N_TOK  = 3;
-constexpr int     PRED_N_ITER = 20;
-constexpr int     PRED_OP_PARAM_N_ITER =
-    1;  // op_params slot ggml_dsv4_hc_comb stores n_iter in (and hc_pre its gated flag)
+// Builds a fresh node per case (so edits never leak), applies the edit, and expects `want` of the predicate.
+template <typename Build, typename Pred>
+void expect_edits(const char * family, Build build, Pred pred, const std::vector<mut> & edits, bool want) {
+    for (const mut & m : edits) {
+        node_ctx      n;
+        ggml_tensor * op = build(n);
+        m.apply(op);
+        expect_pred(std::string(family) + " " + m.what, pred(op), want);
+    }
+}
+
+constexpr int64_t PRED_N_EMBD        = 64;
+constexpr int64_t PRED_N_TOK         = 3;
+constexpr int     PRED_N_ITER        = 20;
+// op_params slot ggml_dsv4_hc_comb stores n_iter in (and ggml_dsv4_hc_pre its gated flag)
+constexpr int     PRED_OP_PARAM_SLOT = 1;
 
 void test_predicates_pre() {
-    auto build = [](node_ctx & n, bool gated) {
-        ggml_tensor * x = n.t(GGML_TYPE_F32, PRED_N_EMBD, 4, PRED_N_TOK);
-        return gated ? ggml_dsv4_hc_pre_gated(n.c, x, n.t(GGML_TYPE_F32, PRED_N_EMBD, 4, PRED_N_TOK), 1.0f) :
-                       ggml_dsv4_hc_pre(n.c, x, n.t(GGML_TYPE_F32, 4, PRED_N_TOK));
+    auto build = [](bool gated) {
+        return [gated](node_ctx & n) {
+            ggml_tensor * x = n.t(GGML_TYPE_F32, PRED_N_EMBD, 4, PRED_N_TOK);
+            return gated ? ggml_dsv4_hc_pre_gated(n.c, x, n.t(GGML_TYPE_F32, PRED_N_EMBD, 4, PRED_N_TOK), 1.0f) :
+                           ggml_dsv4_hc_pre(n.c, x, n.t(GGML_TYPE_F32, 4, PRED_N_TOK));
+        };
     };
-
-    struct mut {
-        const char * what;
-        bool         gated;
-        void (*apply)(ggml_tensor *);
+    const std::vector<mut> common = {
+        mut::type("x F16", 0, GGML_TYPE_F16),
+        mut::type("w F16", 1, GGML_TYPE_F16),
+        mut::type("dst F16", DST, GGML_TYPE_F16),
+        mut::nb_add("x byte stride off a float", 0, 1, 2),
+        mut::nb_add("w byte stride off a float", 1, 1, 2),
+        mut::nb_add("dst byte stride off a float", DST, 1, 2),
+        mut::ne("x has a 4th dim", 0, 3, 2),
+        mut::ne("w has a 4th dim", 1, 3, 2),
+        mut::ne("hc is zero", 0, 1, 0),
+        mut::ne_add("dst n_embd wrong", DST, 0, 1),
+        mut::ne_add("dst n_tokens wrong", DST, 1, 1),
+        mut::ne("dst has a plane", DST, 2, 2),
+        mut::ne("dst has a 4th dim", DST, 3, 2),
     };
-
-    const mut muts[] = {
-        { "x F16",                       false,
-         [](ggml_tensor * op) {
-              op->src[0]->type = GGML_TYPE_F16;
-          } },
-        { "w F16",                       false,
-         [](ggml_tensor * op) {
-              op->src[1]->type = GGML_TYPE_F16;
-          } },
-        { "dst F16",                     false,
-         [](ggml_tensor * op) {
-              op->type = GGML_TYPE_F16;
-          } },
-        { "x byte stride off a float",   false,
-         [](ggml_tensor * op) {
-              op->src[0]->nb[1] += 2;
-          } },
-        { "w byte stride off a float",   false,
-         [](ggml_tensor * op) {
-              op->src[1]->nb[1] += 2;
-          } },
-        { "dst byte stride off a float", false,
-         [](ggml_tensor * op) {
-              op->nb[1] += 2;
-          } },
-        { "x has a 4th dim",             false,
-         [](ggml_tensor * op) {
-              op->src[0]->ne[3] = 2;
-          } },
-        { "hc is zero",                  false,
-         [](ggml_tensor * op) {
-              op->src[0]->ne[1] = 0;
-          } },
-        { "dst n_embd wrong",            false,
-         [](ggml_tensor * op) {
-              op->ne[0] += 1;
-          } },
-        { "dst n_tokens wrong",          false,
-         [](ggml_tensor * op) {
-              op->ne[1] += 1;
-          } },
-        { "plain w hc wrong",            false,
-         [](ggml_tensor * op) {
-              op->src[1]->ne[0] += 1;
-          } },
-        { "plain w n_tokens wrong",      false,
-         [](ggml_tensor * op) {
-              op->src[1]->ne[1] += 1;
-          } },
-        { "gate n_embd wrong",           true,
-         [](ggml_tensor * op) {
-              op->src[1]->ne[0] += 1;
-          } },
-        { "gate hc wrong",               true,
-         [](ggml_tensor * op) {
-              op->src[1]->ne[1] += 1;
-          } },
-        { "gate n_tokens wrong",         true,
-         [](ggml_tensor * op) {
-              op->src[1]->ne[2] += 1;
-          } },
+    const std::vector<mut> plain = {
+        mut::ne_add("plain w hc wrong", 1, 0, 1),
+        mut::ne_add("plain w n_tokens wrong", 1, 1, 1),
+        mut::ne("plain w has a plane", 1, 2, 2),
     };
-    for (bool gated : { false, true }) {
+    const std::vector<mut> gated = {
+        mut::ne_add("gate n_embd wrong", 1, 0, 1),
+        mut::ne_add("gate hc wrong", 1, 1, 1),
+        mut::ne_add("gate n_tokens wrong", 1, 2, 1),
+    };
+    for (bool g : { false, true }) {
         node_ctx n;
-        expect_pred(std::string("hc_pre ") + (gated ? "gated" : "plain"),
-                    ggml_sycl_dsv4_hc_pre_supported(build(n, gated)), true);
+        expect_pred(std::string("hc_pre ") + (g ? "gated" : "plain"), ggml_sycl_dsv4_hc_pre_supported(build(g)(n)),
+                    true);
+        expect_edits(g ? "hc_pre gated" : "hc_pre plain", build(g), ggml_sycl_dsv4_hc_pre_supported, common, false);
     }
-    for (const mut & m : muts) {
-        node_ctx      n;
-        ggml_tensor * op = build(n, m.gated);
-        m.apply(op);
-        expect_pred(std::string("hc_pre ") + (m.gated ? "gated " : "plain ") + m.what,
-                    ggml_sycl_dsv4_hc_pre_supported(op), false);
-    }
+    expect_edits("hc_pre", build(false), ggml_sycl_dsv4_hc_pre_supported, plain, false);
+    expect_edits("hc_pre", build(true), ggml_sycl_dsv4_hc_pre_supported, gated, false);
+
     expect_pred("hc_pre null op", ggml_sycl_dsv4_hc_pre_supported(nullptr), false);
-    {
-        node_ctx n;
-        expect_pred("hc_pre fed a comb node", ggml_sycl_dsv4_hc_pre_supported([&] {
-                        ggml_tensor * op = build(n, false);
-                        op->op           = GGML_OP_DSV4_HC_COMB;
-                        return op;
-                    }()),
-                    false);
-    }
+    node_ctx      n;
+    ggml_tensor * op = build(false)(n);
+    op->op           = GGML_OP_DSV4_HC_COMB;
+    expect_pred("hc_pre fed a comb node", ggml_sycl_dsv4_hc_pre_supported(op), false);
 }
 
 void test_predicates_comb() {
@@ -852,377 +870,140 @@ void test_predicates_comb() {
                                  n.t(GGML_TYPE_F32, HC_COMB_SCALE_COMB_IDX + 1), n.t(GGML_TYPE_F32, HC_COMB_MIX_DIM),
                                  1e-6f, PRED_N_ITER);
     };
-
-    struct mut {
-        const char * what;
-        void (*apply)(ggml_tensor *);
+    const std::vector<mut> declined = {
+        mut::type("mixes F16", 0, GGML_TYPE_F16),
+        mut::type("scale F16", 1, GGML_TYPE_F16),
+        mut::type("base F16", 2, GGML_TYPE_F16),
+        mut::type("dst F16", DST, GGML_TYPE_F16),
+        mut::nb_add("mixes stride off a float", 0, 1, 2),
+        mut::ne("hc != 4 (mixes dim 20)", 0, 0, 20),
+        mut::ne("hc != 4 (base dim 20)", 2, 0, 20),
+        mut::ne("hc != 4 (dst dim 0 is 3)", DST, 0, 3),
+        mut::ne("hc != 4 (dst dim 1 is 3)", DST, 1, 3),
+        mut::ne("scale too short for the comb scale", 1, 0, HC_COMB_SCALE_COMB_IDX),
+        mut::ne("mixes has a plane", 0, 2, 2),
+        mut::ne("mixes has a 4th dim", 0, 3, 2),
+        mut::ne_add("dst n_tokens wrong", DST, 2, 1),
+        mut::ne("dst has a 4th dim", DST, 3, 2),
+        mut::param("n_iter zero", PRED_OP_PARAM_SLOT, 0),
     };
-
-    const mut muts[] = {
-        { "mixes F16",
-         [](ggml_tensor * op) {
-              op->src[0]->type = GGML_TYPE_F16;
-          } },
-        { "scale F16",
-         [](ggml_tensor * op) {
-              op->src[1]->type = GGML_TYPE_F16;
-          } },
-        { "base F16",
-         [](ggml_tensor * op) {
-              op->src[2]->type = GGML_TYPE_F16;
-          } },
-        { "dst F16",
-         [](ggml_tensor * op) {
-              op->type = GGML_TYPE_F16;
-          } },
-        { "mixes stride off a float",
-         [](ggml_tensor * op) {
-              op->src[0]->nb[1] += 2;
-          } },
-        { "hc != 4 (mixes dim 20)",
-         [](ggml_tensor * op) {
-              op->src[0]->ne[0] = 20;
-          } },
-        { "hc != 4 (base dim 20)",
-         [](ggml_tensor * op) {
-              op->src[2]->ne[0] = 20;
-          } },
-        { "hc != 4 (dst 3x3)",
-         [](ggml_tensor * op) {
-              op->ne[0] = 3, op->ne[1] = 3;
-          } },
-        { "scale too short for the comb scale",
-         [](ggml_tensor * op) {
-              op->src[1]->ne[0] = HC_COMB_SCALE_COMB_IDX;
-          } },
-        { "mixes has a plane",
-         [](ggml_tensor * op) {
-              op->src[0]->ne[2] = 2;
-          } },
-        { "dst n_tokens wrong",
-         [](ggml_tensor * op) {
-              op->ne[2] += 1;
-          } },
-        { "n_iter zero",
-         [](ggml_tensor * op) {
-              const int32_t zero = 0;
-              std::memcpy((int32_t *) op->op_params + PRED_OP_PARAM_N_ITER, &zero, sizeof(zero));
-          } },
-    };
-    {
-        node_ctx n;
-        expect_pred("hc_comb", ggml_sycl_dsv4_hc_comb_supported(build(n)), true);
-    }
-    {
-        node_ctx      n;
-        ggml_tensor * op = build(n);
-        op->src[1]->ne[0] += 5;  // a longer scale vector is fine: only element HC_COMB_SCALE_COMB_IDX is read
-        expect_pred("hc_comb with a longer scale vector", ggml_sycl_dsv4_hc_comb_supported(op), true);
-    }
-    for (const mut & m : muts) {
-        node_ctx      n;
-        ggml_tensor * op = build(n);
-        m.apply(op);
-        expect_pred(std::string("hc_comb ") + m.what, ggml_sycl_dsv4_hc_comb_supported(op), false);
-    }
+    // a longer scale vector is fine: only element HC_COMB_SCALE_COMB_IDX is read
+    const std::vector<mut> admitted = { mut::ne_add("with a longer scale vector", 1, 0, 5) };
+    node_ctx               n;
+    expect_pred("hc_comb", ggml_sycl_dsv4_hc_comb_supported(build(n)), true);
+    expect_edits("hc_comb", build, ggml_sycl_dsv4_hc_comb_supported, admitted, true);
+    expect_edits("hc_comb", build, ggml_sycl_dsv4_hc_comb_supported, declined, false);
     expect_pred("hc_comb null op", ggml_sycl_dsv4_hc_comb_supported(nullptr), false);
 }
 
 void test_predicates_post() {
-    auto build = [](node_ctx & n, bool with_comb) {
-        return ggml_dsv4_hc_post(n.c, n.t(GGML_TYPE_F32, PRED_N_EMBD, PRED_N_TOK),
-                                 n.t(GGML_TYPE_F32, PRED_N_EMBD, 4, PRED_N_TOK), n.t(GGML_TYPE_F32, 4, PRED_N_TOK),
-                                 with_comb ? n.t(GGML_TYPE_F32, 4, 4, PRED_N_TOK) : nullptr);
+    auto build = [](bool with_comb) {
+        return [with_comb](node_ctx & n) {
+            return ggml_dsv4_hc_post(n.c, n.t(GGML_TYPE_F32, PRED_N_EMBD, PRED_N_TOK),
+                                     n.t(GGML_TYPE_F32, PRED_N_EMBD, 4, PRED_N_TOK), n.t(GGML_TYPE_F32, 4, PRED_N_TOK),
+                                     with_comb ? n.t(GGML_TYPE_F32, 4, 4, PRED_N_TOK) : nullptr);
+        };
     };
-
-    struct mut {
-        const char * what;
-        bool         with_comb;
-        void (*apply)(ggml_tensor *);
+    const std::vector<mut> common = {
+        mut::type("x F16", 0, GGML_TYPE_F16),          mut::type("residual F16", 1, GGML_TYPE_F16),
+        mut::type("post F16", 2, GGML_TYPE_F16),       mut::type("dst F16", DST, GGML_TYPE_F16),
+        mut::nb_add("x stride off a float", 0, 1, 2),  mut::ne("x has a plane", 0, 2, 2),
+        mut::ne("x has a 4th dim", 0, 3, 2),           mut::ne("hc is zero", 1, 1, 0),
+        mut::ne_add("residual n_embd wrong", 1, 0, 1), mut::ne_add("residual n_tokens wrong", 1, 2, 1),
+        mut::ne("residual has a 4th dim", 1, 3, 2),    mut::ne_add("post hc wrong", 2, 0, 1),
+        mut::ne_add("post n_tokens wrong", 2, 1, 1),   mut::ne("post has a plane", 2, 2, 2),
+        mut::ne("post has a 4th dim", 2, 3, 2),        mut::ne_add("dst n_embd wrong", DST, 0, 1),
+        mut::ne_add("dst hc wrong", DST, 1, 1),        mut::ne_add("dst n_tokens wrong", DST, 2, 1),
+        mut::ne("dst has a 4th dim", DST, 3, 2),
     };
-
-    const mut muts[] = {
-        { "x F16",                   false,
-         [](ggml_tensor * op) {
-              op->src[0]->type = GGML_TYPE_F16;
-          } },
-        { "residual F16",            false,
-         [](ggml_tensor * op) {
-              op->src[1]->type = GGML_TYPE_F16;
-          } },
-        { "post F16",                false,
-         [](ggml_tensor * op) {
-              op->src[2]->type = GGML_TYPE_F16;
-          } },
-        { "dst F16",                 false,
-         [](ggml_tensor * op) {
-              op->type = GGML_TYPE_F16;
-          } },
-        { "x stride off a float",    false,
-         [](ggml_tensor * op) {
-              op->src[0]->nb[1] += 2;
-          } },
-        { "x has a plane",           false,
-         [](ggml_tensor * op) {
-              op->src[0]->ne[2] = 2;
-          } },
-        { "hc is zero",              false,
-         [](ggml_tensor * op) {
-              op->src[1]->ne[1] = 0;
-          } },
-        { "residual n_embd wrong",   false,
-         [](ggml_tensor * op) {
-              op->src[1]->ne[0] += 1;
-          } },
-        { "post hc wrong",           false,
-         [](ggml_tensor * op) {
-              op->src[2]->ne[0] += 1;
-          } },
-        { "dst hc wrong",            false,
-         [](ggml_tensor * op) {
-              op->ne[1] += 1;
-          } },
-        { "comb F16",                true,
-         [](ggml_tensor * op) {
-              op->src[3]->type = GGML_TYPE_F16;
-          } },
-        { "comb stride off a float", true,
-         [](ggml_tensor * op) {
-              op->src[3]->nb[1] += 2;
-          } },
-        { "comb dim 0 wrong",        true,
-         [](ggml_tensor * op) {
-              op->src[3]->ne[0] = 3;
-          } },
-        { "comb dim 1 wrong",        true,
-         [](ggml_tensor * op) {
-              op->src[3]->ne[1] = 3;
-          } },
-        { "comb n_tokens wrong",     true,
-         [](ggml_tensor * op) {
-              op->src[3]->ne[2] += 1;
-          } },
-        { "comb has a 4th dim",      true,
-         [](ggml_tensor * op) {
-              op->src[3]->ne[3] = 2;
-          } },
+    const std::vector<mut> comb_only = {
+        mut::type("comb F16", 3, GGML_TYPE_F16),     mut::nb_add("comb stride off a float", 3, 1, 2),
+        mut::ne("comb dim 0 wrong", 3, 0, 3),        mut::ne("comb dim 1 wrong", 3, 1, 3),
+        mut::ne_add("comb n_tokens wrong", 3, 2, 1), mut::ne("comb has a 4th dim", 3, 3, 2),
     };
     for (bool with_comb : { false, true }) {
         node_ctx n;
         expect_pred(std::string("hc_post ") + (with_comb ? "with comb" : "with a null comb (identity)"),
-                    ggml_sycl_dsv4_hc_post_supported(build(n, with_comb)), true);
+                    ggml_sycl_dsv4_hc_post_supported(build(with_comb)(n)), true);
+        expect_edits(with_comb ? "hc_post with comb:" : "hc_post null comb:", build(with_comb),
+                     ggml_sycl_dsv4_hc_post_supported, common, false);
     }
-    for (const mut & m : muts) {
-        node_ctx      n;
-        ggml_tensor * op = build(n, m.with_comb);
-        m.apply(op);
-        expect_pred(std::string("hc_post ") + (m.with_comb ? "with comb: " : "null comb: ") + m.what,
-                    ggml_sycl_dsv4_hc_post_supported(op), false);
-    }
+    // a present-but-bad comb is declined where a null one is admitted
+    expect_edits("hc_post with comb:", build(true), ggml_sycl_dsv4_hc_post_supported, comb_only, false);
     expect_pred("hc_post null op", ggml_sycl_dsv4_hc_post_supported(nullptr), false);
 }
 
 constexpr int64_t PRED_LANES = 32;  // the sub-group size the backend launches the indexer with
 
 void test_predicates_indexer() {
-    auto build = [](node_ctx & n, ggml_type kt, int64_t n_embd) {
-        return ggml_lightning_indexer(n.c, n.t(GGML_TYPE_F32, n_embd, 4, 8, 2), n.t(kt, n_embd, 1, 16, 2),
-                                      n.t(GGML_TYPE_F32, 4, 8, 1, 2), n.t(GGML_TYPE_F16, 16, 8, 1, 1));
+    auto build_k = [](ggml_type kt, int64_t n_embd) {
+        return [kt, n_embd](node_ctx & n) {
+            return ggml_lightning_indexer(n.c, n.t(GGML_TYPE_F32, n_embd, 4, 8, 2), n.t(kt, n_embd, 1, 16, 2),
+                                          n.t(GGML_TYPE_F32, 4, 8, 1, 2), n.t(GGML_TYPE_F16, 16, 8, 1, 1));
+        };
+    };
+    // operands: 0 q, 1 k, 2 w, 3 mask. K is F16 in every edit below, so edits on k are about k alone.
+    const std::vector<mut> declined = {
+        mut::type("q F16", 0, GGML_TYPE_F16),
+        mut::type("w F16", 2, GGML_TYPE_F16),
+        mut::type("mask F32", 3, GGML_TYPE_F32),
+        mut::type("mask BF16", 3, GGML_TYPE_BF16),
+        mut::type("dst F16", DST, GGML_TYPE_F16),
+        mut::nb("q nb[0] not one element", 0, 0, 8),
+        mut::nb("k nb[0] not one element", 1, 0, 4),
+        mut::nb("w nb[0] not one element", 2, 0, 8),
+        mut::nb("mask nb[0] not one element", 3, 0, 4),
+        mut::nb("dst nb[0] not one element", DST, 0, 8),
+        mut::ne_add("q n_embd != k n_embd", 1, 0, 2),
+        mut::ne("k has a dim-1 extent", 1, 1, 2),
+        mut::ne("k streams != q streams", 1, 3, 1),
+        mut::ne_add("w n_head wrong", 2, 0, 1),
+        mut::ne_add("w n_batch wrong", 2, 1, 1),
+        mut::ne("w has a dim-2 extent", 2, 2, 2),
+        mut::ne_add("mask n_kv wrong", 3, 0, 1),
+        mut::ne_add("mask n_batch wrong", 3, 1, 1),
+        mut::ne("mask streams do not divide", 3, 3, 3),
+        mut::ne("mask streams zero", 3, 3, 0),
+        mut::ne_add("dst n_kv wrong", DST, 0, 1),
+        mut::ne_add("dst n_batch wrong", DST, 1, 1),
+        mut::ne_add("dst stream count wrong", DST, 3, 1),
+        mut::nb_add("q nb[1] off a float", 0, 1, 2),
+        mut::nb_add("q nb[2] off a float", 0, 2, 2),
+        mut::nb_add("q nb[3] off a float", 0, 3, 2),
+        mut::nb_add("w nb[1] off a float", 2, 1, 2),
+        mut::nb_add("w nb[3] off a float", 2, 3, 2),
+        mut::nb_add("mask nb[1] odd", 3, 1, 1),
+        mut::nb_add("mask nb[3] odd", 3, 3, 1),
+        mut::nb_add("k nb[2] odd", 1, 2, 1),
+        mut::nb_add("k nb[3] odd", 1, 3, 1),
+        mut::nb_add("dst nb[1] off a float", DST, 1, 2),
+        mut::nb_add("dst nb[3] off a float", DST, 3, 2),
+    };
+    // slack the kernel's casts tolerate: a half-aligned mask stride and a half-aligned F16 K stride
+    const std::vector<mut> tolerated = {
+        mut::nb_add("mask nb[1] 2-byte slack", 3, 1, 2),  mut::nb_add("mask nb[3] 2-byte slack", 3, 3, 2),
+        mut::nb_add("F16 k nb[2] 2-byte slack", 1, 2, 2), mut::nb_add("F16 k nb[3] 2-byte slack", 1, 3, 2),
+        mut::nb_add("q nb[1] 4-byte slack", 0, 1, 4),
+    };
+    auto pred = [](const ggml_tensor * op) {
+        return op_supported(op, PRED_LANES);
     };
 
-    struct mut {
-        const char * what;
-        void (*apply)(ggml_tensor *);
-    };
-
-    // the K operand is F16 in every mutation case, so mutations on k are about k alone
-    const mut muts[] = {
-        { "q F16",
-         [](ggml_tensor * op) {
-              op->src[0]->type = GGML_TYPE_F16;
-          } },
-        { "w F16",
-         [](ggml_tensor * op) {
-              op->src[2]->type = GGML_TYPE_F16;
-          } },
-        { "mask F32",
-         [](ggml_tensor * op) {
-              op->src[3]->type = GGML_TYPE_F32;
-          } },
-        { "mask BF16",
-         [](ggml_tensor * op) {
-              op->src[3]->type = GGML_TYPE_BF16;
-          } },
-        { "dst F16",
-         [](ggml_tensor * op) {
-              op->type = GGML_TYPE_F16;
-          } },
-        { "q nb[0] not one element",
-         [](ggml_tensor * op) {
-              op->src[0]->nb[0] = 8;
-          } },
-        { "k nb[0] not one element",
-         [](ggml_tensor * op) {
-              op->src[1]->nb[0] = 4;
-          } },
-        { "w nb[0] not one element",
-         [](ggml_tensor * op) {
-              op->src[2]->nb[0] = 8;
-          } },
-        { "mask nb[0] not one element",
-         [](ggml_tensor * op) {
-              op->src[3]->nb[0] = 4;
-          } },
-        { "dst nb[0] not one element",
-         [](ggml_tensor * op) {
-              op->nb[0] = 8;
-          } },
-        { "q n_embd != k n_embd",
-         [](ggml_tensor * op) {
-              op->src[1]->ne[0] += 2;
-          } },
-        { "k has a dim-1 extent",
-         [](ggml_tensor * op) {
-              op->src[1]->ne[1] = 2;
-          } },
-        { "k streams != q streams",
-         [](ggml_tensor * op) {
-              op->src[1]->ne[3] = 1;
-          } },
-        { "w n_head wrong",
-         [](ggml_tensor * op) {
-              op->src[2]->ne[0] += 1;
-          } },
-        { "w n_batch wrong",
-         [](ggml_tensor * op) {
-              op->src[2]->ne[1] += 1;
-          } },
-        { "w has a dim-2 extent",
-         [](ggml_tensor * op) {
-              op->src[2]->ne[2] = 2;
-          } },
-        { "mask n_kv wrong",
-         [](ggml_tensor * op) {
-              op->src[3]->ne[0] += 1;
-          } },
-        { "mask n_batch wrong",
-         [](ggml_tensor * op) {
-              op->src[3]->ne[1] += 1;
-          } },
-        { "mask streams do not divide",
-         [](ggml_tensor * op) {
-              op->src[3]->ne[3] = 3;
-          } },
-        { "mask streams zero",
-         [](ggml_tensor * op) {
-              op->src[3]->ne[3] = 0;
-          } },
-        { "dst n_kv wrong",
-         [](ggml_tensor * op) {
-              op->ne[0] += 1;
-          } },
-        { "dst n_batch wrong",
-         [](ggml_tensor * op) {
-              op->ne[1] += 1;
-          } },
-        { "dst stream count wrong",
-         [](ggml_tensor * op) {
-              op->ne[3] += 1;
-          } },
-        { "q nb[1] off a float",
-         [](ggml_tensor * op) {
-              op->src[0]->nb[1] += 2;
-          } },
-        { "q nb[2] off a float",
-         [](ggml_tensor * op) {
-              op->src[0]->nb[2] += 2;
-          } },
-        { "q nb[3] off a float",
-         [](ggml_tensor * op) {
-              op->src[0]->nb[3] += 2;
-          } },
-        { "w nb[1] off a float",
-         [](ggml_tensor * op) {
-              op->src[2]->nb[1] += 2;
-          } },
-        { "w nb[3] off a float",
-         [](ggml_tensor * op) {
-              op->src[2]->nb[3] += 2;
-          } },
-        { "mask nb[1] odd",
-         [](ggml_tensor * op) {
-              op->src[3]->nb[1] += 1;
-          } },
-        { "mask nb[3] odd",
-         [](ggml_tensor * op) {
-              op->src[3]->nb[3] += 1;
-          } },
-        { "k nb[2] odd",
-         [](ggml_tensor * op) {
-              op->src[1]->nb[2] += 1;
-          } },
-        { "k nb[3] odd",
-         [](ggml_tensor * op) {
-              op->src[1]->nb[3] += 1;
-          } },
-        { "dst nb[1] off a float",
-         [](ggml_tensor * op) {
-              op->nb[1] += 2;
-          } },
-        { "dst nb[3] off a float",
-         [](ggml_tensor * op) {
-              op->nb[3] += 2;
-          } },
-    };
-    // slack that the kernel's casts tolerate: a half-aligned mask stride and a half-aligned F16 K stride
-    const mut tolerated[] = {
-        { "mask nb[1] 2-byte slack",
-         [](ggml_tensor * op) {
-              op->src[3]->nb[1] += 2;
-          } },
-        { "mask nb[3] 2-byte slack",
-         [](ggml_tensor * op) {
-              op->src[3]->nb[3] += 2;
-          } },
-        { "F16 k nb[2] 2-byte slack",
-         [](ggml_tensor * op) {
-              op->src[1]->nb[2] += 2;
-          } },
-        { "F16 k nb[3] 2-byte slack",
-         [](ggml_tensor * op) {
-              op->src[1]->nb[3] += 2;
-          } },
-        { "q nb[1] 4-byte slack",
-         [](ggml_tensor * op) {
-              op->src[0]->nb[1] += 4;
-          } },
-    };
-
-    // every K type in the table is admitted at the production head size, in every elements-per-lane the kernel has
-    for (ggml_type kt :
-#define X(T) T,
-         { GGML_SYCL_LIGHTNING_INDEXER_K_TYPES(X) }
-#undef X
-    ) {
+    // every K type in the table is admitted at the production head size
+    for (ggml_type kt : INDEXER_K_TYPES) {
         node_ctx n;
-        expect_pred(std::string("indexer K=") + ggml_type_name(kt) + " n_embd=128",
-                    op_supported(build(n, kt, 128), PRED_LANES), true);
+        expect_pred(std::string("indexer K=") + ggml_type_name(kt) + " n_embd=128", pred(build_k(kt, 128)(n)), true);
     }
     for (int64_t n_embd : { 64, 128, 256, 512 }) {  // 2, 4, 8, 16 elements per lane at 32 lanes
         node_ctx n;
         expect_pred("indexer n_embd=" + std::to_string(n_embd) + " at 32 lanes",
-                    op_supported(build(n, GGML_TYPE_F16, n_embd), 32), true);
+                    op_supported(build_k(GGML_TYPE_F16, n_embd)(n), 32), true);
     }
     {
         node_ctx n;
-        expect_pred("indexer n_embd=128 at 16 lanes", op_supported(build(n, GGML_TYPE_F16, 128), 16), true);
+        expect_pred("indexer n_embd=128 at 16 lanes", op_supported(build_k(GGML_TYPE_F16, 128)(n), 16), true);
     }
-    for (const mut & m : tolerated) {
-        node_ctx      n;
-        ggml_tensor * op = build(n, GGML_TYPE_F16, 128);
-        m.apply(op);
-        expect_pred(std::string("indexer ") + m.what, op_supported(op, PRED_LANES), true);
-    }
+    expect_edits("indexer", build_k(GGML_TYPE_F16, 128), pred, tolerated, true);
 
     // every K type outside the table is declined, enumerated from ggml's own type list rather than a list here
     int declined_types = 0;
@@ -1232,73 +1013,55 @@ void test_predicates_indexer() {
             continue;
         }
         node_ctx n;
-        expect_pred(std::string("indexer K=") + ggml_type_name((ggml_type) t),
-                    op_supported(build(n, (ggml_type) t, 256), PRED_LANES), false);
+        expect_pred(std::string("indexer K=") + ggml_type_name((ggml_type) t), pred(build_k((ggml_type) t, 256)(n)),
+                    false);
         ++declined_types;
     }
     report("predicate: the enumeration of unsupported K types is not empty", declined_types > 0,
            (double) declined_types);
 
-    // K types whose block alignment differs from the half: 4-byte-aligned (Q4_1, Q5_1, F32) refuse the 2-byte slack
-    for (ggml_type kt : { GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q5_1 }) {
+    // K types whose block alignment is 4 (F32, Q4_1, Q5_1) refuse the 2-byte slack that Q8_0 tolerates
+    for (ggml_type kt : { GGML_TYPE_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         node_ctx      n;
-        ggml_tensor * op = build(n, kt, 128);
+        ggml_tensor * op = build_k(kt, 128)(n);
         op->src[1]->nb[2] += 2;
-        expect_pred(std::string("indexer K=") + ggml_type_name(kt) + " k nb[2] 2-byte slack",
-                    op_supported(op, PRED_LANES), false);
-    }
-    {
-        node_ctx      n;
-        ggml_tensor * op = build(n, GGML_TYPE_Q8_0, 128);
-        op->src[1]->nb[2] += 2;
-        expect_pred("indexer K=q8_0 k nb[2] 2-byte slack", op_supported(op, PRED_LANES), true);
+        expect_pred(std::string("indexer K=") + ggml_type_name(kt) + " k nb[2] 2-byte slack", pred(op),
+                    kt == GGML_TYPE_Q8_0);
     }
 
-    for (const mut & m : muts) {
-        node_ctx      n;
-        ggml_tensor * op = build(n, GGML_TYPE_F16, 128);
-        m.apply(op);
-        expect_pred(std::string("indexer ") + m.what, op_supported(op, PRED_LANES), false);
-    }
+    expect_edits("indexer", build_k(GGML_TYPE_F16, 128), pred, declined, false);
 
     // head-size / lane arithmetic: n_embd % lanes, and an elements-per-lane count the kernel is not instantiated for
     for (int64_t n_embd : { 48, 96 }) {  // F32 K so the head size is not a block-size question
         node_ctx n;
         expect_pred("indexer n_embd=" + std::to_string(n_embd) + " (not a multiple of 32 lanes)",
-                    op_supported(build(n, GGML_TYPE_F32, n_embd), 32), false);
+                    op_supported(build_k(GGML_TYPE_F32, n_embd)(n), 32), false);
     }
-    {
+
+    struct arith {
+        const char * what;
+        int64_t      n_embd;
+        int          lanes;
+    };
+
+    for (const arith & a : {
+             arith{ "n_embd=1024 at 32 lanes (32 elements per lane)", 1024, 32 },
+             arith{ "n_embd=512 at 16 lanes (32 elements per lane)",  512,  16 },
+             arith{ "n_embd=32 at 32 lanes (1 element per lane)",     32,   32 },
+             arith{ "lanes=0",                                        128,  0  }
+    }) {
         node_ctx n;
-        expect_pred("indexer n_embd=1024 at 32 lanes (32 elements per lane)",
-                    op_supported(build(n, GGML_TYPE_F16, 1024), 32), false);
-    }
-    {
-        node_ctx n;
-        expect_pred("indexer n_embd=512 at 16 lanes (32 elements per lane)",
-                    op_supported(build(n, GGML_TYPE_F16, 512), 16), false);
-    }
-    {
-        node_ctx n;
-        expect_pred("indexer n_embd=32 at 32 lanes (1 element per lane)", op_supported(build(n, GGML_TYPE_F16, 32), 32),
+        expect_pred(std::string("indexer ") + a.what, op_supported(build_k(GGML_TYPE_F16, a.n_embd)(n), a.lanes),
                     false);
     }
-    {
-        node_ctx n;
-        expect_pred("indexer lanes=0", op_supported(build(n, GGML_TYPE_F16, 128), 0), false);
-    }
-    expect_pred("indexer null op", op_supported(nullptr, PRED_LANES), false);
-    {
-        node_ctx      n;
-        ggml_tensor * op = build(n, GGML_TYPE_F16, 128);
-        op->src[3]       = nullptr;
-        expect_pred("indexer null mask", op_supported(op, PRED_LANES), false);
-    }
-    {
-        node_ctx      n;
-        ggml_tensor * op = build(n, GGML_TYPE_F16, 128);
-        op->op           = GGML_OP_DSV4_HC_PRE;
-        expect_pred("indexer fed another op", op_supported(op, PRED_LANES), false);
-    }
+    expect_pred("indexer null op", pred(nullptr), false);
+    node_ctx      n1, n2;
+    ggml_tensor * no_mask = build_k(GGML_TYPE_F16, 128)(n1);
+    no_mask->src[3]       = nullptr;
+    expect_pred("indexer null mask", pred(no_mask), false);
+    ggml_tensor * other_op = build_k(GGML_TYPE_F16, 128)(n2);
+    other_op->op           = GGML_OP_DSV4_HC_PRE;
+    expect_pred("indexer fed another op", pred(other_op), false);
 }
 
 void test_predicates() {
@@ -1332,6 +1095,12 @@ std::vector<sycl::device> cpu_devices() {
 int main() {
     // pure ggml, no device: these run (and can fail the run) even where the kernels below are skipped
     test_predicates();
+    const int predicate_checks = g_cases;
+    if (predicate_checks < MIN_PREDICATE_CHECKS) {
+        printf("FAIL: only %d predicate checks ran, fewer than the %d the decline matrix produces\n", predicate_checks,
+               MIN_PREDICATE_CHECKS);
+        return 1;
+    }
 
     const std::vector<sycl::device> devs = cpu_devices();
     if (devs.empty()) {
@@ -1383,12 +1152,6 @@ int main() {
 
     // --- LIGHTNING_INDEXER: head size 128 (every model that carries an indexer) at the sub-group sizes the
     // device offers, K in every type the predicate admits, one and several streams, shared and per-stream masks
-    // generated from the predicate's own table, so a type added there is tested here without an edit
-    const ggml_type k_types[] = {
-#define X(T) T,
-        GGML_SYCL_LIGHTNING_INDEXER_K_TYPES(X)
-#undef X
-    };
     int  lanes_run = 0;
     auto run_lanes = [&](auto lanes_tag) {
         constexpr int LANES = decltype(lanes_tag)::value;
@@ -1397,7 +1160,7 @@ int main() {
             return;
         }
         ++lanes_run;
-        for (ggml_type t : k_types) {
+        for (ggml_type t : INDEXER_K_TYPES) {
             test_lightning_indexer<LANES>(q, { 128, 4, 65, 32, 1, 1, t });
             test_lightning_indexer<LANES>(q, { 128, 32, 7, 16, 4, 4, t });
             test_lightning_indexer<LANES>(q, { 128, 4, 63, 9, 4, 1, t });
@@ -1434,9 +1197,11 @@ int main() {
     }
 
     printf("\n%d checks, %d failed\n", g_cases, g_failed);
-    if (g_cases < MIN_CHECKS) {
-        printf("FAIL: only %d checks ran, fewer than the %d the matrix produces; it is not being exercised\n", g_cases,
-               MIN_CHECKS);
+    const int kernel_checks = g_cases - predicate_checks;
+    printf("%d predicate checks, %d kernel checks\n", predicate_checks, kernel_checks);
+    if (kernel_checks < MIN_KERNEL_CHECKS) {
+        printf("FAIL: only %d kernel checks ran, fewer than the %d the matrix produces; it is not being exercised\n",
+               kernel_checks, MIN_KERNEL_CHECKS);
         return 1;
     }
     return g_failed == 0 ? 0 : 1;

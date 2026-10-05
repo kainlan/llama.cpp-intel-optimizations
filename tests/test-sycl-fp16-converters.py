@@ -34,6 +34,17 @@ def _function(source: str, signature: str) -> str:
     raise AssertionError(f"unterminated function: {signature}")
 
 
+# The decisions live in the impl; anchor on its definition (a forward declaration ends in `;`, so it does not match).
+SUPPORTS_IMPL_DEFINITION = re.compile(r"static\s+bool\s+ggml_sycl_device_supports_op_impl\s*\([^)]*\)\s*\{")
+
+
+def _function_matching(source: str, pattern: "re.Pattern[str]") -> str:
+    found = list(pattern.finditer(source))
+    if len(found) != 1:
+        raise AssertionError(f"expected exactly one definition matching {pattern.pattern}, found {len(found)}")
+    return _function(source, found[0].group(0))
+
+
 def _half(value: float) -> bytes:
     """Compare IEEE binary16 encodings, including signed zero."""
     return struct.pack("<e", value)
@@ -95,7 +106,7 @@ def _contract(convert_source: str, support_source: str = SUPPORT_SOURCE) -> bool
         kernel = _function(convert_source, "static void dequantize_block_nvfp4_fp16(")
         launch = _function(convert_source, "static void dequantize_row_nvfp4_fp16_sycl(")
         dense = _function(support_source, "static bool ggml_sycl_mul_mat_type_supported(")
-        supports = _function(support_source, "static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op, bool placement_declines) {")
+        supports = _function_matching(support_source, SUPPORTS_IMPL_DEFINITION)
     except (ValueError, AssertionError):
         return False
 

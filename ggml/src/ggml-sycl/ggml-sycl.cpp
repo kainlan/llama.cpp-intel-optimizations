@@ -110264,7 +110264,7 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
             // decline the intercept, and run the normal GPU kernel over
             // host KV -- the forbidden zero-copy, via predicate asymmetry.
             if ((op->op == GGML_OP_FLASH_ATTN_EXT ||
-                 (op->op == GGML_OP_SET_ROWS && placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&
+                 (op->op == GGML_OP_SET_ROWS && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&
                 ggml_sycl_attn_host_dispatch_enabled()) {
                 if (g_ggml_sycl_debug) {
                     g_sycl_attn_host_accept_count.fetch_add(1, std::memory_order_relaxed);

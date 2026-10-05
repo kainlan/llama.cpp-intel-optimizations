@@ -34,6 +34,19 @@
 
 namespace ggml_sycl_lightning_indexer {
 
+// k_align() (the predicate's stride check) states the alignment this kernel's casts of a K row need. The predicate
+// header is pure ggml and cannot see the block types, so the kernel -- which can -- pins the two together: a block
+// layout change breaks the build here instead of silently letting the predicate admit a misaligned view.
+static_assert(k_align(GGML_TYPE_F32) == alignof(float), "k_align: F32");
+static_assert(k_align(GGML_TYPE_F16) == alignof(sycl::half), "k_align: F16");
+static_assert(k_align(GGML_TYPE_BF16) == alignof(sycl::ext::oneapi::bfloat16), "k_align: BF16");
+static_assert(k_align(GGML_TYPE_Q8_0) == alignof(block_q8_0), "k_align: Q8_0");
+static_assert(k_align(GGML_TYPE_Q4_0) == alignof(block_q4_0), "k_align: Q4_0");
+static_assert(k_align(GGML_TYPE_Q4_1) == alignof(block_q4_1), "k_align: Q4_1");
+static_assert(k_align(GGML_TYPE_Q5_0) == alignof(block_q5_0), "k_align: Q5_0");
+static_assert(k_align(GGML_TYPE_Q5_1) == alignof(block_q5_1), "k_align: Q5_1");
+static_assert(k_align(GGML_TYPE_IQ4_NL) == alignof(block_iq4_nl), "k_align: IQ4_NL");
+
 constexpr int64_t LIGHTNING_INDEXER_ROWS_PER_BLOCK = 4;
 
 // Element `i` of one K row, as float. All the quantized types here use 32-element blocks. The type is a template
@@ -120,7 +133,8 @@ struct lightning_indexer_dims {
     int64_t groups_y;
 };
 
-// The smallest grid of at most `max_groups_x` columns (0: LIGHTNING_INDEXER_MAX_GROUPS_X) holding every work-group the rows need.
+// The smallest grid of at most `max_groups_x` columns (0: LIGHTNING_INDEXER_MAX_GROUPS_X) holding every work-group
+// the rows need.
 inline lightning_indexer_dims lightning_indexer_launch_dims(int64_t n_rows, int64_t max_groups_x) {
     const int64_t n_blocks = (n_rows + LIGHTNING_INDEXER_ROWS_PER_BLOCK - 1) / LIGHTNING_INDEXER_ROWS_PER_BLOCK;
     const int64_t cap      = max_groups_x > 0 ? max_groups_x : LIGHTNING_INDEXER_MAX_GROUPS_X;

@@ -61,8 +61,8 @@ inline bool epl_supported(int64_t epl) {
 }
 
 // The alignment the kernel's casts of a K row need: the 32-bit-aligned block types carry a half2, the rest are
-// 16-bit-aligned.
-inline size_t k_align(ggml_type t) {
+// 16-bit-aligned. lightning-indexer-kernel.hpp static_asserts this against the block types themselves.
+constexpr size_t k_align(ggml_type t) {
     return (t == GGML_TYPE_F32 || t == GGML_TYPE_Q4_1 || t == GGML_TYPE_Q5_1) ? 4 : 2;
 }
 

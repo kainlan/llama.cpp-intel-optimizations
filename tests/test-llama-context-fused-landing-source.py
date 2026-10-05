@@ -108,6 +108,39 @@ def squash(text):
     return re.sub(r"\s+", " ", text or "")
 
 
+GATED_IF = re.compile(r"\bif\s*\(\s*placement_declines\s*&&[^;{}]*\{\s*$")
+
+
+def ungated_sites(body, site):
+    """Offsets of `site` matches that no `if (placement_declines && ...)` covers.
+
+    A site is covered when it sits in the condition of such an if, or anywhere inside its braced body: the outer
+    gate already decides, so a second `placement_declines &&` on a nested site would be dead code and is not
+    required. A site under no gated if -- the defect this gate exists for -- is reported.
+    """
+    bad = []
+    for m in re.finditer(site, body):
+        pos = m.start()
+        # the statement the site belongs to: back to the previous `;`, `{` or `}`
+        head = body[max(body.rfind(";", 0, pos), body.rfind("{", 0, pos), body.rfind("}", 0, pos)) + 1:pos]
+        covered = re.search(r"\bif\s*\(\s*placement_declines\s*&&", head) is not None
+        # every enclosing block: its header is the text from the previous `;`/`{`/`}` up to its `{`
+        depth_stack = []
+        for i in range(pos):
+            if body[i] == "{":
+                depth_stack.append(i)
+            elif body[i] == "}" and depth_stack:
+                depth_stack.pop()
+        for brace in depth_stack:
+            before = body[:brace + 1]
+            start = max(before.rfind(";", 0, brace), before.rfind("{", 0, brace), before.rfind("}", 0, brace)) + 1
+            if GATED_IF.search(before[start:]):
+                covered = True
+        if not covered:
+            bad.append(pos)
+    return bad
+
+
 def evaluate(ctx, hdr, be, sh):
     classifier = function_body(
         hdr, r"static\s+inline\s+bool\s+llama_fused_cpu_landing_is_placement\s*\([^)]*\)\s*\{") or ""
@@ -135,11 +168,11 @@ def evaluate(ctx, hdr, be, sh):
     checks["backend: the capability query drops them"] = bool(
         re.search(r"return\s+ggml_sycl_device_supports_op_impl\s*\(\s*dev\s*,\s*op\s*,\s*false\s*\)", export))
     kv_sites = re.findall(r"ggml_sycl_tensor_is_in_kv_host_buft\s*\(", impl)
-    kv_gated = re.findall(r"placement_declines\s*&&\s*ggml_sycl_tensor_is_in_kv_host_buft\s*\(", impl)
-    checks["backend: every KV-host placement site in the impl is gated on the parameter"] = bool(kv_sites) and len(kv_sites) == len(kv_gated)
+    checks["backend: every KV-host placement site in the impl is gated on the parameter"] = \
+        bool(kv_sites) and not ungated_sites(impl, r"ggml_sycl_tensor_is_in_kv_host_buft\s*\(")
     pl_sites = re.findall(r"ggml_sycl_op_is_planned_on_host\s*\(", impl)
-    pl_gated = re.findall(r"placement_declines\s*&&\s*!is_multi_gpu_router_logits\s*&&\s*ggml_sycl_op_is_planned_on_host\s*\(", impl)
-    checks["backend: every planner-on-host site in the impl is gated on the parameter"] = bool(pl_sites) and len(pl_sites) == len(pl_gated)
+    checks["backend: every planner-on-host site in the impl is gated on the parameter"] = \
+        bool(pl_sites) and not ungated_sites(impl, r"ggml_sycl_op_is_planned_on_host\s*\(")
     checks["backend: the placement predicates take no flag (they stay pure)"] = bool(kv_host) and bool(planned) and not re.search(
         r"placement_declines|thread_local|capability_only", kv_host + planned)
     checks["backend: no thread-local capability state"] = not re.search(r"thread_local[^;]*capability", be)
@@ -243,6 +276,8 @@ if args.self_test:
          with_(be=mutate(sources["be"], "return ggml_sycl_device_supports_op_impl(dev, op, false);\n}", "return ggml_sycl_device_supports_op_impl(dev, op, true);\n}"))),
         ("impl loses the parameter", "backend: supports_op and the capability query share one impl taking placement_declines",
          with_(be=mutate(sources["be"], "const ggml_tensor * op, bool placement_declines) {", "const ggml_tensor * op, bool placement_declines_x) {"))),
+        ("KV-host dst site ungated", "backend: every KV-host placement site in the impl is gated on the parameter",
+         with_(be=mutate(sources["be"], "if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op)) {", "if (ggml_sycl_tensor_is_in_kv_host_buft(op)) {"))),
         ("KV-host site ungated", "backend: every KV-host placement site in the impl is gated on the parameter",
          with_(be=mutate(sources["be"], "if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {", "if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {"))),
         ("planner site ungated", "backend: every planner-on-host site in the impl is gated on the parameter",
