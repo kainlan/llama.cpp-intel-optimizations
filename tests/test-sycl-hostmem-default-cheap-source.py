@@ -88,6 +88,65 @@ def test_mutation_witness_a_reader_above_the_guard_is_caught():
     assert unguarded_expensive_calls(mutated) == ["mallinfo2("]
 
 
+LOG_SIG = "bool ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase phase"
+PLAN_CALL = re.compile(
+    r"host_mem_plan\s+plan\s*=\s*ggml_sycl::host_mem_plan_for\(\s*phase\s*,\s*full_mode\s*,\s*first_pp_to_tg\s*\)"
+)
+FULL_MODE_DECL = re.compile(r"const\s+bool\s+full_mode\s*=\s*ggml_sycl_host_mem_full\(\)\s*;")
+EARLY_OUT = re.compile(r"if\s*\(\s*!\s*plan\.emit\s*\)\s*\{\s*return\s+false\s*;\s*\}")
+
+
+def plan_wiring_problems(code: str) -> list:
+    """The plan must come from host_mem_plan_for(phase, <the env-derived full_mode>, ...), full_mode must
+    be ggml_sycl_host_mem_full(), and the emit early-out must precede every reader."""
+    body = function_body(code, LOG_SIG)
+    bad = []
+    if not FULL_MODE_DECL.search(body):
+        bad.append("full_mode is not initialised from ggml_sycl_host_mem_full()")
+    plan = PLAN_CALL.search(body)
+    if not plan:
+        bad.append("plan is not host_mem_plan_for(phase, full_mode, first_pp_to_tg)")
+    out = EARLY_OUT.search(body)
+    if not out:
+        bad.append("the `if (!plan.emit) return false;` early-out is missing")
+    if plan and out and out.start() < plan.start():
+        bad.append("the emit early-out precedes the plan")
+    if out:
+        for name in EXPENSIVE:
+            i = body.find(name)
+            if i != -1 and i < out.end():
+                bad.append(f"{name} runs before the emit early-out")
+    return bad
+
+
+def test_plan_comes_from_the_env_and_the_early_out_stays():
+    code = strip_comments(SRC)
+    assert plan_wiring_problems(code) == []
+
+
+def test_mutation_witness_a_hardwired_full_mode_is_caught():
+    code = strip_comments(SRC)
+    mutated = code.replace("host_mem_plan_for(phase, full_mode, first_pp_to_tg)",
+                           "host_mem_plan_for(phase, true, first_pp_to_tg)", 1)
+    assert mutated != code, "mutation did not apply"
+    assert plan_wiring_problems(mutated) == ["plan is not host_mem_plan_for(phase, full_mode, first_pp_to_tg)"]
+
+
+def test_mutation_witness_a_dropped_early_out_is_caught():
+    code = strip_comments(SRC)
+    mutated = EARLY_OUT.sub("", code, count=1)
+    assert mutated != code, "mutation did not apply"
+    assert plan_wiring_problems(mutated) == ["the `if (!plan.emit) return false;` early-out is missing"]
+
+
+def test_mutation_witness_an_env_independent_full_mode_is_caught():
+    code = strip_comments(SRC)
+    mutated = FULL_MODE_DECL.sub("const bool full_mode = true;", code, count=1)
+    assert mutated != code, "mutation did not apply"
+    problems = plan_wiring_problems(mutated)
+    assert problems == ["full_mode is not initialised from ggml_sycl_host_mem_full()"]
+
+
 def test_ladder_runs_only_in_full_mode():
     code = strip_comments(SRC)
     m = re.search(r"if\s*\(\s*ggml_sycl_host_mem_full\(\)\s*\)\s*\{", code)

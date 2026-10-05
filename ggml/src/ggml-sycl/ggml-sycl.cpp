@@ -13719,7 +13719,9 @@ bool ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase phase, const char * label)
     bool first_pp_to_tg = false;
     if (phase == ggml_sycl::host_mem_phase::PP_TO_TG_BEFORE) {
         static std::atomic<bool> first_pp_to_tg_done{ false };
-        first_pp_to_tg = !first_pp_to_tg_done.exchange(true, std::memory_order_relaxed);
+        // The transition fires ~4x per token: keep steady state a pure read, no read-modify-write.
+        first_pp_to_tg = !first_pp_to_tg_done.load(std::memory_order_relaxed) &&
+                         !first_pp_to_tg_done.exchange(true, std::memory_order_relaxed);
     }
     const ggml_sycl::host_mem_plan plan = ggml_sycl::host_mem_plan_for(phase, full_mode, first_pp_to_tg);
     if (!plan.emit) {
