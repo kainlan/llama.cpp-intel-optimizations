@@ -2292,7 +2292,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
+    // resolve AUTO: a device without mmap support (e.g. an iGPU) falls back to OFF; see #28160.
+    // The exception is a device whose backend owns placement (SYCL): its planner decides where
+    // each weight lives and reads the tensors itself, so lazy reads stay available there
+    // (llama_lazy_auto_enabled, src/llama-lazy-mode.h).
     if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
         std::vector<llama_lazy_device_caps> lazy_caps;
         lazy_caps.reserve(devices.size());

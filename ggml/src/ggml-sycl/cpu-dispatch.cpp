@@ -158,15 +158,7 @@ thread_local cpu_dispatch_buffers g_cpu_dispatch_buffers;
 // The weight-dequant buffer (scratch_nk) is NOT sized here; its two consumers call
 // ensure_scratch_nk(N * K) with the size they need (llama.cpp-z5fn).
 void ggml_sycl_cpu_dispatch_buffers_init() {
-    // - Max batch size for TG: 16 tokens
-    // - Max n_ff (feedforward hidden): 14336 (typical 7B; ~3.5x n_embd)
-    // - Max quantized row size (Q8_0): ~128 bytes per 256 elements
-    // - Max accumulator: 256 stack + 16 heap = 272 __m256 values = 8704 floats
-    static constexpr size_t MAX_M      = 16;                      // batch size (TG)
-    static constexpr size_t MAX_K      = 14336;                   // n_ff (typical 7B; ~3.5x n_embd)
-    static constexpr size_t MAX_Q_SIZE = (MAX_K / 32 + 1) * 128;  // Safe upper bound for any quant type
-
-    g_cpu_dispatch_buffers.init(MAX_M, MAX_Q_SIZE);
+    g_cpu_dispatch_buffers.init();
 }
 
 void ggml_sycl_cpu_quant_cache_new_graph() {
@@ -6564,7 +6556,7 @@ bool ggml_sycl_cpu_pp_gemm(ggml_type     weight_type,
         }
 
         // Pre-allocated weight dequantization buffer via g_cpu_dispatch_buffers.scratch_nk
-        g_cpu_dispatch_buffers.ensure_scratch_nk(static_cast<size_t>(N) * K);
+        float * const scratch_nk = g_cpu_dispatch_buffers.ensure_scratch_nk(static_cast<size_t>(N) * K);
 
         // A7L5W Site 2a: validate the per-expert weight slab before dequant.
         // `weight_bytes` is `weight_host + i02*nb02 + i03*nb03` from the caller
@@ -6575,12 +6567,11 @@ bool ggml_sycl_cpu_pp_gemm(ggml_type     weight_type,
                                    static_cast<std::size_t>(N) * static_cast<std::size_t>(nb01));
         for (int64_t row = 0; row < N; row++) {
             const void * row_data = weight_bytes + row * nb01;
-            type_traits->to_float(row_data, g_cpu_dispatch_buffers.scratch_nk.data() + row * K, K);
+            type_traits->to_float(row_data, scratch_nk + row * K, K);
         }
 
         // A7L5W Site 2: validate A/B/C pointers passed into DNNL's CPU JIT GEMM.
-        GGML_SYCL_A7L5W_ASSERT_PTR("cpu_pp_gemm/dnnl_sgemm_A", "(cpu_pp_gemm_A)",
-                                   g_cpu_dispatch_buffers.scratch_nk.data(),
+        GGML_SYCL_A7L5W_ASSERT_PTR("cpu_pp_gemm/dnnl_sgemm_A", "(cpu_pp_gemm_A)", scratch_nk,
                                    static_cast<std::size_t>(N) * static_cast<std::size_t>(K) * sizeof(float));
         GGML_SYCL_A7L5W_ASSERT_PTR("cpu_pp_gemm/dnnl_sgemm_B", "(cpu_pp_gemm_B)", src1_host,
                                    static_cast<std::size_t>(M) * static_cast<std::size_t>(K) * sizeof(float));
@@ -6588,8 +6579,8 @@ bool ggml_sycl_cpu_pp_gemm(ggml_type     weight_type,
                                    static_cast<std::size_t>(M) * static_cast<std::size_t>(ldc) * sizeof(float));
         dnnl_status_t status =
             dnnl_sgemm('T', 'N', static_cast<dnnl_dim_t>(N), static_cast<dnnl_dim_t>(M), static_cast<dnnl_dim_t>(K),
-                       1.0f, g_cpu_dispatch_buffers.scratch_nk.data(), static_cast<dnnl_dim_t>(K), src1_host,
-                       static_cast<dnnl_dim_t>(K), 0.0f, dst_host, static_cast<dnnl_dim_t>(ldc));
+                       1.0f, scratch_nk, static_cast<dnnl_dim_t>(K), src1_host, static_cast<dnnl_dim_t>(K), 0.0f,
+                       dst_host, static_cast<dnnl_dim_t>(ldc));
         if (status != dnnl_success) {
             return false;
         }

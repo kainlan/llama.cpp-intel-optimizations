@@ -32,9 +32,11 @@ namespace ggml_sycl {
 struct host_mem_ledger {
     // Live SYCL_Host-family buffers (at load: every non-CPU weight, device-tier and host-tier).
     std::atomic<size_t> sycl_host_buffer_bytes{ 0 };
-    // Host-tier expert / dense weights copied into a second pinned allocation.
-    std::atomic<size_t> host_expert_copy_bytes{ 0 };
-    std::atomic<size_t> host_dense_copy_bytes{ 0 };
+    // Host-tier expert / dense weights copied into a second pinned allocation. CUMULATIVE: added at
+    // load, never decremented (the copies are released through cache eviction, which does not
+    // report back here), so they are not a live figure like their siblings.
+    std::atomic<size_t> host_expert_copy_cumulative_bytes{ 0 };
+    std::atomic<size_t> host_dense_copy_cumulative_bytes{ 0 };
     // Per-thread CPU-dispatch weight-dequant scratch (cpu_dispatch_buffers::scratch_nk), all threads.
     std::atomic<size_t> cpu_dispatch_scratch_bytes{ 0 };
 };
@@ -71,9 +73,6 @@ inline host_mem_ledger & host_mem_ledger_get() {
     static host_mem_ledger ledger;
     return ledger;
 }
-
-// Parses "<key>:   <n> kB" out of a /proc file's text. Returns bytes, or 0 when absent.
-size_t host_mem_proc_kb_bytes(const char * path, const char * key);
 
 }  // namespace ggml_sycl
 

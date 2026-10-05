@@ -30,11 +30,21 @@
 //    from inside dlopen() on the same thread could therefore deadlock. Never seen
 //    in practice at the 64 MiB default; if a run hangs at library load, raise
 //    GGML_HOSTMEM_BIGALLOC_MIN_MB.
-//  * Coverage. valloc(), pvalloc() and direct mmap() calls are NOT interposed, so
-//    a mapping created by mmap itself (a library's own arena, a file mapping, the
-//    driver) never shows up. If the resolved total is well below the growth you
-//    are chasing, the remainder is such a mapping: fall back to a debugger break
-//    on mmap.
+//  * Coverage. malloc, calloc, realloc, memalign, aligned_alloc, posix_memalign,
+//    valloc and pvalloc are interposed. Direct mmap() calls are NOT, so a mapping
+//    created by mmap itself (a library's own arena, a file mapping, the driver)
+//    never shows up. If the resolved total is well below the growth you are
+//    chasing, the remainder is such a mapping: fall back to a debugger break on
+//    mmap.
+//  * Dynamic TLS. The recursion guard is a thread_local in a preloaded library,
+//    i.e. dynamic TLS. The first access on a thread can make the dynamic loader
+//    allocate that thread's TLS block, and if that allocation reaches the
+//    interposed calloc before the block exists, the guard is read from storage
+//    that is not set up yet. It has not been seen to fail at the 64 MiB default,
+//    where only a large request takes the report() path, but it is not proof.
+//  * Benign race. The threshold is read lazily and unsynchronised
+//    (g_min_bytes); concurrent first calls compute the same value, so the race is
+//    benign by construction, and a ThreadSanitizer run will flag it.
 //  * Offsets. Frames are printed as offsets from dladdr's dli_fbase, which is what
 //    addr2line wants for a shared object or a PIE executable. For a non-PIE
 //    (ET_EXEC) main binary addr2line expects the absolute address, so frames in
@@ -144,6 +154,23 @@ void * memalign(size_t align, size_t size) {
 void * aligned_alloc(size_t align, size_t size) {
     report("aligned_alloc", size, align);
     return __libc_memalign(align, size);
+}
+
+void * valloc(size_t size) {
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    report("valloc", size, page);
+    return __libc_memalign(page, size);
+}
+
+void * pvalloc(size_t size) {
+    const size_t page    = (size_t) sysconf(_SC_PAGESIZE);
+    const size_t rounded = (size + page - 1) & ~(page - 1);
+    if (rounded < size) {  // overflow: glibc fails the request with ENOMEM
+        errno = ENOMEM;
+        return nullptr;
+    }
+    report("pvalloc", rounded, page);
+    return __libc_memalign(page, rounded);
 }
 
 int posix_memalign(void ** out, size_t align, size_t size) {

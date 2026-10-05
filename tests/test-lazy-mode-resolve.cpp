@@ -19,22 +19,33 @@ static void expect(bool cond, const char * what) {
 
 int main() {
     {
-        const llama_lazy_device_caps devs[] = { { true, false }, { false, false } };
+        const llama_lazy_device_caps devs[] = {
+            { true,  false },
+            { false, false }
+        };
         expect(!llama_lazy_auto_enabled(devs, 2), "plain device without mmap_support disables AUTO");
     }
     {
-        const llama_lazy_device_caps devs[] = { { true, false } };
+        const llama_lazy_device_caps devs[] = {
+            { true, false }
+        };
         expect(llama_lazy_auto_enabled(devs, 1), "CPU-like device with mmap_support keeps AUTO");
     }
     {
         // SYCL reports mmap_support=false (field omitted from its caps initializer)
         // but its planner executes planner-host weights on the CPU backend.
-        const llama_lazy_device_caps devs[] = { { true, false }, { false, true } };
+        const llama_lazy_device_caps devs[] = {
+            { true,  false },
+            { false, true  }
+        };
         expect(llama_lazy_auto_enabled(devs, 2), "planner-owned device without mmap_support keeps AUTO");
     }
     {
         // A planner-owned SYCL device must not mask a different iGPU backend.
-        const llama_lazy_device_caps devs[] = { { false, true }, { false, false } };
+        const llama_lazy_device_caps devs[] = {
+            { false, true  },
+            { false, false }
+        };
         expect(!llama_lazy_auto_enabled(devs, 2), "non-planner device without mmap_support still disables AUTO");
     }
     {

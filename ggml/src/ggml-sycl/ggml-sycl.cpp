@@ -13617,16 +13617,28 @@ static void ggml_sycl_release_xmx_aos_staging(ggml_tensor_extra_gpu * extra, int
     }
 }
 
-size_t ggml_sycl::host_mem_proc_kb_bytes(const char * path, const char * key) {
-    std::ifstream f(path);
+// RssAnon / RssFile / RssShmem out of ONE pass over /proc/self/status. A key that is absent stays 0.
+static void ggml_sycl_host_mem_rss(size_t * anon, size_t * file, size_t * shmem) {
+    struct key_slot {
+        const char * key;
+        size_t *     out;
+    };
+
+    const key_slot slots[] = {
+        { "RssAnon",  anon  },
+        { "RssFile",  file  },
+        { "RssShmem", shmem }
+    };
+    std::ifstream f("/proc/self/status");
     std::string   line;
-    const size_t  klen = std::strlen(key);
     while (std::getline(f, line)) {
-        if (line.compare(0, klen, key) == 0 && line.size() > klen && line[klen] == ':') {
-            return static_cast<size_t>(std::strtoull(line.c_str() + klen + 1, nullptr, 10)) * 1024ull;
+        for (const key_slot & slot : slots) {
+            const size_t klen = std::strlen(slot.key);
+            if (line.compare(0, klen, slot.key) == 0 && line.size() > klen && line[klen] == ':') {
+                *slot.out = static_cast<size_t>(std::strtoull(line.c_str() + klen + 1, nullptr, 10)) * 1024ull;
+            }
         }
     }
-    return 0;
 }
 
 // One pass over /proc/meminfo: key -> bytes.
@@ -13639,7 +13651,8 @@ static std::map<std::string, size_t> ggml_sycl_host_mem_meminfo() {
         if (colon == std::string::npos) {
             continue;
         }
-        out[line.substr(0, colon)] = static_cast<size_t>(std::strtoull(line.c_str() + colon + 1, nullptr, 10)) * 1024ull;
+        out[line.substr(0, colon)] =
+            static_cast<size_t>(std::strtoull(line.c_str() + colon + 1, nullptr, 10)) * 1024ull;
     }
     return out;
 }
@@ -13654,7 +13667,8 @@ static std::string ggml_sycl_host_mem_top_anon_mappings(size_t * n_big_out, size
         size_t      size;
         std::string desc;
     };
-    constexpr size_t big_threshold = 64ull * 1024 * 1024;
+
+    constexpr size_t     big_threshold = 64ull * 1024 * 1024;
     std::vector<mapping> top;
     std::ifstream        f("/proc/self/smaps");
     std::string          line;
@@ -13729,11 +13743,11 @@ bool ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase phase, const char * label)
     }
     if (plan.rate_limited) {
         // First call always logs; later ones at most once per 30 s.
-        constexpr int64_t min_interval_ns = 30ll * 1000000000ll;
+        constexpr int64_t           min_interval_ns = 30ll * 1000000000ll;
         static std::atomic<int64_t> last_ns{ 0 };
-        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch())
-                                .count();
+        const int64_t               now =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count();
         int64_t prev = last_ns.load(std::memory_order_relaxed);
         if (prev != 0 && now - prev < min_interval_ns) {
             return false;
@@ -13747,9 +13761,8 @@ bool ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase phase, const char * label)
     char             buf[512];
     std::string      line;
 
-    const size_t rss_anon  = ggml_sycl::host_mem_proc_kb_bytes("/proc/self/status", "RssAnon");
-    const size_t rss_file  = ggml_sycl::host_mem_proc_kb_bytes("/proc/self/status", "RssFile");
-    const size_t rss_shmem = ggml_sycl::host_mem_proc_kb_bytes("/proc/self/status", "RssShmem");
+    size_t rss_anon = 0, rss_file = 0, rss_shmem = 0;
+    ggml_sycl_host_mem_rss(&rss_anon, &rss_file, &rss_shmem);
     std::snprintf(buf, sizeof(buf), "[HOSTMEM] phase=%s | process: rss_anon=%.2f rss_file=%.2f rss_shmem=%.2f GB",
                   label ? label : "?", rss_anon / gb, rss_file / gb, rss_shmem / gb);
     line += buf;
@@ -13762,6 +13775,7 @@ bool ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase phase, const char * label)
         // bytes (fordblks), and mmap'd chunks (hblkhd, which is where a big
         // posix_memalign such as a CPU model buffer lands).
         size_t malloc_inuse = 0, malloc_free = 0, malloc_mmapped = 0, malloc_n_mmapped = 0;
+        bool   have_mallinfo = false;
 #if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
         {
             const struct mallinfo2 m = mallinfo2();
@@ -13769,24 +13783,31 @@ bool ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase phase, const char * label)
             malloc_free              = m.fordblks;
             malloc_mmapped           = m.hblkhd;
             malloc_n_mmapped         = m.hblks;
+            have_mallinfo            = true;
         }
 #endif
-        // RssAnon counts malloc'd memory (in use, free-retained, mmapped) but NOT the
-        // pinned pool: the pool's pages are driver-owned and show up only in
-        // kernel_other and MemAvailable. So the process-side residual compares
-        // RssAnon with glibc's own total, and the pool is reported separately.
-        const double malloc_total = static_cast<double>(malloc_inuse + malloc_free + malloc_mmapped);
-        const double residual     = (static_cast<double>(rss_anon) - malloc_total) / gb;
-        std::snprintf(buf, sizeof(buf),
-                      " | malloc inuse=%.2f free_retained=%.2f mmapped=%.2f (%zu chunks) GB; "
-                      "process_residual=rss_anon-malloc_total=%.2f GB",
-                      malloc_inuse / gb, malloc_free / gb, malloc_mmapped / gb, malloc_n_mmapped, residual);
+        if (have_mallinfo) {
+            // RssAnon counts malloc'd memory (in use, free-retained, mmapped) but NOT the
+            // pinned pool: the pool's pages are driver-owned and show up only in
+            // kernel_other and MemAvailable. So the process-side residual compares
+            // RssAnon with glibc's own total, and the pool is reported separately.
+            const double malloc_total = static_cast<double>(malloc_inuse + malloc_free + malloc_mmapped);
+            const double residual     = (static_cast<double>(rss_anon) - malloc_total) / gb;
+            std::snprintf(buf, sizeof(buf),
+                          " | malloc inuse=%.2f free_retained=%.2f mmapped=%.2f (%zu chunks) GB; "
+                          "process_residual=rss_anon-malloc_total=%.2f GB",
+                          malloc_inuse / gb, malloc_free / gb, malloc_mmapped / gb, malloc_n_mmapped, residual);
+        } else {
+            // No mallinfo2 (glibc < 2.33 or not glibc): say so rather than print zeros.
+            std::snprintf(buf, sizeof(buf), " | malloc inuse=n/a free_retained=n/a mmapped=n/a process_residual=n/a");
+        }
         line += buf;
 
         size_t            n_big = 0, big_rss = 0;
         const std::string top = ggml_sycl_host_mem_top_anon_mappings(&n_big, &big_rss);
-        std::snprintf(buf, sizeof(buf), " | anon mappings >=64MB: %zu totalling %.2f GB, top by RSS (rss/size perms name):",
-                      n_big, big_rss / gb);
+        std::snprintf(buf, sizeof(buf),
+                      " | anon mappings >=64MB: %zu totalling %.2f GB, top by RSS (rss/size perms name):", n_big,
+                      big_rss / gb);
         line += buf;
         line += top;
     }
@@ -13794,8 +13815,8 @@ bool ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase phase, const char * label)
     // Pinned pool and host zones. Existing caches only: a diagnostic must not
     // construct a cache (and its staging buffer). In GLOBAL cache mode every device
     // maps to one cache, so count each distinct cache once.
-    size_t                            pool_committed = 0;
-    std::string                       zones;
+    size_t                                  pool_committed = 0;
+    std::string                             zones;
     std::vector<ggml_sycl::unified_cache *> seen;
     for (int d = 0; d < ggml_sycl_info().device_count; ++d) {
         ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(d);
@@ -13815,20 +13836,21 @@ bool ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase phase, const char * label)
         }
         zones += "}";
     }
-    std::snprintf(buf, sizeof(buf), " | pinned pool (not in RssAnon): %.2f GB zones(used/cap GB):", pool_committed / gb);
+    std::snprintf(buf, sizeof(buf),
+                  " | pinned pool (not in RssAnon): %.2f GB zones(used/cap GB):", pool_committed / gb);
     line += buf;
     line += zones;
 
-    // host_expert_copy / host_dense_copy are cumulative bytes copied at load: the
-    // host-tier weights are released through cache eviction, which does not
-    // decrement them, so they are not a live figure.
+    // host_expert_copy_cumulative_bytes / host_dense_copy_cumulative_bytes are bytes copied at
+    // load: the host-tier weights are released through cache eviction, which does not decrement
+    // them, so they are not a live figure.
     const ggml_sycl::host_mem_ledger & led = ggml_sycl::host_mem_ledger_get();
     std::snprintf(buf, sizeof(buf),
                   " | ledger: sycl_host_buffers=%.2f host_expert_copy_cumulative=%.2f host_dense_copy_cumulative=%.2f "
                   "cpu_dispatch_scratch=%.2f GB",
                   led.sycl_host_buffer_bytes.load(std::memory_order_relaxed) / gb,
-                  led.host_expert_copy_bytes.load(std::memory_order_relaxed) / gb,
-                  led.host_dense_copy_bytes.load(std::memory_order_relaxed) / gb,
+                  led.host_expert_copy_cumulative_bytes.load(std::memory_order_relaxed) / gb,
+                  led.host_dense_copy_cumulative_bytes.load(std::memory_order_relaxed) / gb,
                   led.cpu_dispatch_scratch_bytes.load(std::memory_order_relaxed) / gb);
     line += buf;
 
@@ -35024,7 +35046,7 @@ static void ggml_sycl_preload_model_weights() {
                                     ggml_sycl::mem_handle::HOST_DEVICE, expert_size);
                                 ggml_sycl::mem_copy(host_copy_handle, src_handle, expert_size, stream);
                             }
-                            ggml_sycl::host_mem_ledger_get().host_expert_copy_bytes.fetch_add(
+                            ggml_sycl::host_mem_ledger_get().host_expert_copy_cumulative_bytes.fetch_add(
                                 expert_size, std::memory_order_relaxed);
                         } else if (!tensor_source_is_device) {
                             host_ptr = const_cast<uint8_t *>(expert_aos);
@@ -35540,7 +35562,7 @@ static void ggml_sycl_preload_model_weights() {
                                     void * arena_ptr = dn_h.ptr;
                                     if (arena_ptr) {
                                         std::memcpy(arena_ptr, tensor->data, nbytes);
-                                        ggml_sycl::host_mem_ledger_get().host_dense_copy_bytes.fetch_add(
+                                        ggml_sycl::host_mem_ledger_get().host_dense_copy_cumulative_bytes.fetch_add(
                                             nbytes, std::memory_order_relaxed);
                                         auto                  allocation_owner = ggml_sycl_transfer_alloc_owner(dn_h);
                                         ggml_sycl::mem_handle handle;
@@ -108559,7 +108581,8 @@ normal_dispatch:
         // (ggml_sycl_graph_is_decode), about four times per token; log the first and
         // then, with GGML_SYCL_HOSTMEM=1, one per 30 s. Whether the refresh itself should be once-only is a
         // separate question this diagnostic does not change.
-        const bool hostmem_logged = ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase::PP_TO_TG_BEFORE, "pp-to-tg-before-refresh");
+        const bool hostmem_logged =
+            ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase::PP_TO_TG_BEFORE, "pp-to-tg-before-refresh");
         if (ggml_sycl_materialize_moe_down_i8_hotset(*sycl_ctx, cgraph) > 0) {
             sycl_ctx->invalidate_moe_phase_layout_cache();
         }

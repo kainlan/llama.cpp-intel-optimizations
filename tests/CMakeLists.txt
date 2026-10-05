@@ -2134,6 +2134,14 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120
     )
+    # llama.cpp-z5fn: load_tensors must feed planner_owns_placement (SYCL) into the lazy AUTO decision.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-llama-model-lazy-auto-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "python;source-assert"
+        TIMEOUT 120
+    )
     # llama.cpp-z5fn: the default [HOSTMEM] path must not reach smaps/mallinfo2.
     llama_test_pytest(
         ${LLAMA_PYTHON3}
