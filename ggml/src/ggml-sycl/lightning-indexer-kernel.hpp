@@ -49,6 +49,7 @@ template <> struct lightning_indexer_k_storage<GGML_TYPE_Q4_1>   { using type = 
 template <> struct lightning_indexer_k_storage<GGML_TYPE_Q5_0>   { using type = block_q5_0; };
 template <> struct lightning_indexer_k_storage<GGML_TYPE_Q5_1>   { using type = block_q5_1; };
 template <> struct lightning_indexer_k_storage<GGML_TYPE_IQ4_NL> { using type = block_iq4_nl; };
+
 // clang-format on
 
 // k_align() (the predicate's stride check) states the alignment this kernel's casts of a K row need. The predicate
@@ -67,45 +68,48 @@ constexpr int64_t LIGHTNING_INDEXER_ROWS_PER_BLOCK = 4;
 // parameter so the launcher picks the instantiation once per launch and the kernel body carries no per-element
 // switch on it.
 template <ggml_type KT> inline float lightning_indexer_k_elem(const char * row, int64_t i) {
+    // every cast below goes through the K storage trait, the one place a type is tied to its block layout, so a
+    // wrong specialization (a type mapped to another type's block) fails to compile here
+    using storage = typename lightning_indexer_k_storage<KT>::type;
     if constexpr (KT == GGML_TYPE_F32) {
-        return ((const float *) row)[i];
+        return ((const storage *) row)[i];
     } else if constexpr (KT == GGML_TYPE_F16) {
-        return (float) ((const sycl::half *) row)[i];
+        return (float) ((const storage *) row)[i];
     } else if constexpr (KT == GGML_TYPE_BF16) {
-        return (float) ((const sycl::ext::oneapi::bfloat16 *) row)[i];
+        return (float) ((const storage *) row)[i];
     } else if constexpr (KT == GGML_TYPE_Q8_0) {
-        const block_q8_0 * b = (const block_q8_0 *) row + i / 32;
+        const storage * b = (const storage *) row + i / 32;
         return (float) b->d * (float) b->qs[i % 32];
     } else if constexpr (KT == GGML_TYPE_Q4_0) {
-        const block_q4_0 * b = (const block_q4_0 *) row + i / 32;
-        const int          j = (int) (i % 32);
-        const int          q = j < 16 ? (b->qs[j] & 0xF) : (b->qs[j - 16] >> 4);
+        const storage * b = (const storage *) row + i / 32;
+        const int       j = (int) (i % 32);
+        const int       q = j < 16 ? (b->qs[j] & 0xF) : (b->qs[j - 16] >> 4);
         return (float) b->d * (float) (q - 8);
     } else if constexpr (KT == GGML_TYPE_Q4_1) {
-        const block_q4_1 * b = (const block_q4_1 *) row + i / 32;
-        const int          j = (int) (i % 32);
-        const int          q = j < 16 ? (b->qs[j] & 0xF) : (b->qs[j - 16] >> 4);
+        const storage * b = (const storage *) row + i / 32;
+        const int       j = (int) (i % 32);
+        const int       q = j < 16 ? (b->qs[j] & 0xF) : (b->qs[j - 16] >> 4);
         return (float) b->dm[0] * (float) q + (float) b->dm[1];
     } else if constexpr (KT == GGML_TYPE_Q5_0) {
-        const block_q5_0 * b = (const block_q5_0 *) row + i / 32;
-        const int          j = (int) (i % 32);
-        uint32_t           qh;
+        const storage * b = (const storage *) row + i / 32;
+        const int       j = (int) (i % 32);
+        uint32_t        qh;
         std::memcpy(&qh, b->qh, sizeof(qh));
         const int q = j < 16 ? ((b->qs[j] & 0xF) | (int) (((qh >> j) << 4) & 0x10)) :
                                ((b->qs[j - 16] >> 4) | (int) ((qh >> (j - 16 + 12)) & 0x10));
         return (float) b->d * (float) (q - 16);
     } else if constexpr (KT == GGML_TYPE_Q5_1) {
-        const block_q5_1 * b = (const block_q5_1 *) row + i / 32;
-        const int          j = (int) (i % 32);
-        uint32_t           qh;
+        const storage * b = (const storage *) row + i / 32;
+        const int       j = (int) (i % 32);
+        uint32_t        qh;
         std::memcpy(&qh, b->qh, sizeof(qh));
         const int q = j < 16 ? ((b->qs[j] & 0xF) | (int) (((qh >> j) << 4) & 0x10)) :
                                ((b->qs[j - 16] >> 4) | (int) ((qh >> (j - 16 + 12)) & 0x10));
         return (float) b->dm[0] * (float) q + (float) b->dm[1];
     } else if constexpr (KT == GGML_TYPE_IQ4_NL) {
-        const block_iq4_nl * b = (const block_iq4_nl *) row + i / 32;
-        const int            j = (int) (i % 32);
-        const int            q = j < 16 ? (b->qs[j] & 0xF) : (b->qs[j - 16] >> 4);
+        const storage * b = (const storage *) row + i / 32;
+        const int       j = (int) (i % 32);
+        const int       q = j < 16 ? (b->qs[j] & 0xF) : (b->qs[j - 16] >> 4);
         return (float) b->d * (float) kvalues_iq4nl[q];
     } else {
         static_assert(KT == GGML_TYPE_F32,

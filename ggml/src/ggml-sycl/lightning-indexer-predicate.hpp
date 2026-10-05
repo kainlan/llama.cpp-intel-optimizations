@@ -16,8 +16,9 @@
 
 // K row types the kernel reads, and the elements-per-lane counts it is instantiated for. These two lists are the
 // only place either is written: the predicate's switches, the launcher's dispatch and the host test's enumeration
-// are all generated from them, so they cannot disagree. Adding a K type means adding it here AND giving
-// lightning_indexer_k_elem a dequant for it (its static_assert fails the build otherwise).
+// are all generated from them, so they cannot disagree. Adding a K type means adding it here AND, in
+// lightning-indexer-kernel.hpp, a lightning_indexer_k_storage specialization (the block or element type its
+// alignment is checked against) and a dequant in lightning_indexer_k_elem; the build fails without either.
 // clang-format off
 #define GGML_SYCL_LIGHTNING_INDEXER_K_TYPES(X) \
     X(GGML_TYPE_F32)                           \

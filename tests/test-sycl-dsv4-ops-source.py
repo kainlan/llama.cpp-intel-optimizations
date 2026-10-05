@@ -130,6 +130,40 @@ HOST_WAIT = re.compile(r"(\.|->|::)\s*wait\s*\(|wait_and_throw|\bsynchronize\s*\
 ALLOC = re.compile(r"sycl::malloc|malloc_device|malloc_host|malloc_shared|unified_alloc|unified_allocate|\bnew\s+\w|\bmalloc\s*\(")
 
 
+OP_PARAM_CALL = re.compile(r"\b(?:ggml_get_op_params_\w+|hc_op_param_\w+)\s*\(")
+LITERAL_ARG = re.compile(r"^[\s()0-9xXa-fA-FuUlL]*[0-9][\s()0-9xXa-fA-FuUlL]*$")
+LITERAL_OP_PARAMS_INDEX = re.compile(r"\bop_params\s*\)*\s*(?:\[|\+)\s*\(*\s*[0-9]")
+
+
+def literal_op_param_slots(text):
+    """Every spelling that reaches an op_params slot through a number written in the source.
+
+    Pointer indexing or offsetting (`op->op_params[1]`, `((const int32_t *) op->op_params)[1]`, `op_params + 1`)
+    and the accessor calls (`ggml_get_op_params_i32(op, 1)`, `hc_op_param_i32(dst->src[0], (1))`) are recognised;
+    the slot is the call's last top-level argument, whatever the operand expression before it looks like.
+    """
+    found = [m.group(0) for m in LITERAL_OP_PARAMS_INDEX.finditer(text)]
+    for m in OP_PARAM_CALL.finditer(text):
+        depth = 0
+        args, cur = [], ""
+        for ch in text[m.end():]:
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            if ch == "," and depth == 0:
+                args.append(cur)
+                cur = ""
+            else:
+                cur += ch
+        args.append(cur)
+        if len(args) >= 2 and LITERAL_ARG.match(args[-1]):
+            found.append(text[m.start():m.end()] + ",".join(args))
+    return found
+
+
 def evaluate(backend, hc, hc_header, hc_kernels, hc_predicates, lid, lid_header, lid_kernels, lid_predicates):
     results = {}
 
@@ -201,9 +235,10 @@ def evaluate(backend, hc, hc_header, hc_kernels, hc_predicates, lid, lid_header,
             table + "(X)" in lid_predicates and table + "(X)" in lid_kernels
     results["the indexer launcher keeps no K-type switch of its own"] = \
         re.search(r"case\s+GGML_TYPE_", lid_kernels) is None and re.search(r"case\s+GGML_TYPE_", lid) is None
-    results["the int op-param slot is one named constant"] = \
-        "HC_OP_PARAM_I32_SLOT" in hc_predicates and "HC_OP_PARAM_I32_SLOT" in hc and \
-        re.search(r"hc_op_param_i32\s*\(\s*\w+\s*,\s*\d", hc_predicates + hc) is None
+    results["the op-param slots are named constants"] = \
+        all(name in hc_predicates and name in hc for name in ("HC_OP_PARAM_I32_SLOT", "HC_OP_PARAM_F32_SLOT"))
+    results["no DSv4 HC source indexes op_params by a literal"] = \
+        not literal_op_param_slots(hc_predicates + hc + hc_kernels)
     results["the comb scale index is one named constant"] = \
         "HC_COMB_SCALE_COMB_IDX" in hc_predicates and "HC_COMB_SCALE_COMB_IDX" in hc_kernels and \
         re.search(r"scale\s*\[\s*2\b", hc_kernels) is None
@@ -252,7 +287,8 @@ if args.self_test:
         ("null comb refused", "post predicate admits a null comb",
          with_(hc_predicates=mutate(sources["hc_predicates"], "if (comb != nullptr) {", "if (true) {"))),
         ("gated flag ignored", "pre predicate reads the gated flag",
-         with_(hc_predicates=sources["hc_predicates"].replace("hc_op_param_i32(op, HC_OP_PARAM_I32_SLOT) != 0", "false"))),
+         with_(hc_predicates=sources["hc_predicates"].replace(
+             "hc_op_param_i32(op, HC_OP_PARAM_I32_SLOT) != 0", "false"))),
         ("host wait added", "dsv4-hc.cpp has no host wait",
          with_(hc=mutate(sources["hc"], "GGML_ASSERT(", "stream->wait(); GGML_ASSERT("))),
         ("allocation added", "dsv4-hc-kernels.hpp allocates nothing",
@@ -273,8 +309,23 @@ if args.self_test:
          with_(lid_predicates=sources["lid_predicates"] + "\n#define GGML_SYCL_LIGHTNING_INDEXER_EPLS(X) X(2)\n")),
         ("comb scale index back to a literal", "the comb scale index is one named constant",
          with_(hc_kernels=sources["hc_kernels"].replace("a.scale[HC_COMB_SCALE_COMB_IDX * a.ss0]", "a.scale[2 * a.ss0]"))),
-        ("op-param slot back to a literal", "the int op-param slot is one named constant",
-         with_(hc=sources["hc"].replace("hc_op_param_i32(op, ggml_sycl_dsv4::HC_OP_PARAM_I32_SLOT)", "hc_op_param_i32(op, 1)"))),
+        ("op-param slot back to a literal", "no DSv4 HC source indexes op_params by a literal",
+         with_(hc=sources["hc"].replace("hc_op_param_i32(op, ggml_sycl_dsv4::HC_OP_PARAM_I32_SLOT)",
+                                        "hc_op_param_i32(op, 1)"))),
+        ("f32 op-param slot back to a literal", "no DSv4 HC source indexes op_params by a literal",
+         with_(hc=sources["hc"].replace("ggml_get_op_params_f32(op, ggml_sycl_dsv4::HC_OP_PARAM_F32_SLOT)",
+                                        "ggml_get_op_params_f32(op, 0)"))),
+    ]
+    # every other spelling of a literal slot, appended to the executor source
+    for spelling in ("int v = op->op_params[1];",
+                     "int v = ((const int32_t *) op->op_params)[1];",
+                     "int v = ggml_get_op_params_i32(op, 1);",
+                     "int v = ggml_sycl_dsv4::hc_op_param_i32(op, (1));",
+                     "int v = ggml_sycl_dsv4::hc_op_param_i32(dst->src[0], 1);",
+                     "std::memcpy(&v, (const int32_t *) op->op_params + 1, 4);"):
+        mutants.append((f"literal slot spelled `{spelling}`", "no DSv4 HC source indexes op_params by a literal",
+                        with_(hc=sources["hc"] + "\nvoid f() { " + spelling + " }\n")))
+    mutants += [
         ("indexer wait added", "lightning-indexer.cpp has no host wait",
          with_(lid=sources["lid"] + "\nvoid f(sycl::queue * s) { s->wait_and_throw(); }\n")),
     ]

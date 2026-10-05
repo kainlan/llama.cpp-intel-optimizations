@@ -55,9 +55,10 @@ constexpr double NMSE_REJECTS = 1e-4;  // a control oracle must be at least this
 
 // A loop that silently skipped its work would leave "no failure" standing, so each half of the run has a floor on
 // the checks it produced: the decline matrix on its own, and the kernel checks on their own (so the predicate checks
-// cannot stand in for them). The rule for both: about three quarters of what that half produces on the least
-// capable device the test supports -- for the kernel half, a device that offers only one of the two sub-group sizes.
-// That leaves room for cases to be added or reorganised and still trips when a whole loop stops running.
+// cannot stand in for them). The rule for both: about three quarters of what that half produces. The predicate half
+// is device-independent, so that is simply its count; the kernel half depends on the device, so it is taken on the
+// least capable one the test supports, which offers only one of the two sub-group sizes. That leaves room for cases
+// to be added or reorganised and still trips when a whole loop stops running.
 constexpr int MIN_PREDICATE_CHECKS = 150;
 constexpr int MIN_KERNEL_CHECKS    = 150;
 

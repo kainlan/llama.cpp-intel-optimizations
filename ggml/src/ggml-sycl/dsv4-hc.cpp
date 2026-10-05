@@ -30,7 +30,7 @@ void ggml_sycl_op_dsv4_hc_pre(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     args.sw2                         = gated ? hc_stride(w, 2) : 0;
     args.sd0                         = hc_stride(op, 0);
     args.sd1                         = hc_stride(op, 1);
-    args.scale                       = ggml_get_op_params_f32(op, 0);
+    args.scale                       = ggml_get_op_params_f32(op, ggml_sycl_dsv4::HC_OP_PARAM_F32_SLOT);
     args.gated                       = gated;
 
     ggml_sycl_dsv4::hc_pre_launch(*ctx.stream(), args);
@@ -60,7 +60,7 @@ void ggml_sycl_op_dsv4_hc_comb(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_
     args.sd0                          = hc_stride(op, 0);
     args.sd1                          = hc_stride(op, 1);
     args.sd2                          = hc_stride(op, 2);
-    args.eps                          = ggml_get_op_params_f32(op, 0);
+    args.eps                          = ggml_get_op_params_f32(op, ggml_sycl_dsv4::HC_OP_PARAM_F32_SLOT);
     args.n_iter                       = ggml_sycl_dsv4::hc_op_param_i32(op, ggml_sycl_dsv4::HC_OP_PARAM_I32_SLOT);
 
     ggml_sycl_dsv4::hc_comb_launch(*ctx.stream(), args);

@@ -47,37 +47,56 @@ parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
 
-def strip_comments(source):
-    """Remove C/C++ comments, keeping string literals and the line count."""
+def is_digit_separator(source, i):
+    """True when the `'` at `i` is a C++14 digit separator (`1'000`, `0xFF'FF`), not the start of a char literal."""
+    if i + 1 >= len(source) or not (source[i + 1].isalnum() and source[i - 1].isalnum() if i > 0 else False):
+        return False
+    start = i
+    while start > 0 and (source[start - 1].isalnum() or source[start - 1] in "_'."):
+        start -= 1
+    return source[start].isdigit()
+
+
+def strip_comments(source, blank_literals=False, keep_length=False):
+    """Remove C/C++ comments, keeping string literals and the line count.
+
+    blank_literals: replace the contents of string and char literals with spaces (the quotes stay).
+    keep_length:    replace comments with spaces instead of removing them, so offsets still mean something.
+    Digit separators (`1'000`) are not char literals.
+    """
     out = []
     i = 0
     n = len(source)
     while i < n:
         ch = source[i]
-        if ch in ('"', "'"):
+        if ch in ('"', "'") and not (ch == "'" and is_digit_separator(source, i)):
             quote = ch
             out.append(ch)
             i += 1
             while i < n:
-                out.append(source[i])
-                if source[i] == "\\":
-                    if i + 1 < n:
-                        out.append(source[i + 1])
-                        i += 2
-                        continue
-                elif source[i] == quote:
+                if source[i] == "\\" and i + 1 < n:
+                    out.append("  " if blank_literals else source[i:i + 2])
+                    i += 2
+                    continue
+                if source[i] == quote:
+                    out.append(quote)
                     i += 1
                     break
+                out.append(" " if blank_literals and source[i] != "\n" else source[i])
                 i += 1
             continue
         if source.startswith("//", i):
             while i < n and source[i] != "\n":
+                out.append(" " if keep_length else "")
                 i += 1
             continue
         if source.startswith("/*", i):
             end = source.find("*/", i + 2)
             end = n if end < 0 else end + 2
-            out.append("\n" * source.count("\n", i, end))
+            if keep_length:
+                out.append("".join(c if c == "\n" else " " for c in source[i:end]))
+            else:
+                out.append("\n" * source.count("\n", i, end))
             i = end
             continue
         out.append(ch)
@@ -108,46 +127,6 @@ def squash(text):
     return re.sub(r"\s+", " ", text or "")
 
 
-def blank_comments_and_strings(source):
-    """The source with comments and the CONTENTS of string/char literals replaced by spaces (newlines kept).
-
-    Same length as the input, so offsets still mean something, and nothing a comment or a literal says -- a `}`, an
-    `if (placement_declines && ...) {` -- can be read as code.
-    """
-    out = list(source)
-    i = 0
-    n = len(source)
-    while i < n:
-        ch = source[i]
-        if ch in ('"', "'"):
-            quote = ch
-            i += 1
-            while i < n and source[i] != quote:
-                if source[i] == "\\" and i + 1 < n:
-                    out[i] = " "
-                    i += 1
-                if source[i] != "\n":
-                    out[i] = " "
-                i += 1
-            i += 1
-            continue
-        if source.startswith("//", i):
-            while i < n and source[i] != "\n":
-                out[i] = " "
-                i += 1
-            continue
-        if source.startswith("/*", i):
-            end = source.find("*/", i + 2)
-            end = n if end < 0 else end + 2
-            for j in range(i, end):
-                if source[j] != "\n":
-                    out[j] = " "
-            i = end
-            continue
-        i += 1
-    return "".join(out)
-
-
 def matching(text, open_at, open_ch, close_ch):
     """Index of the bracket closing the one at `open_at`, or -1."""
     depth = 0
@@ -176,16 +155,34 @@ def gate_condition_ok(cond):
     return True
 
 
+def single_statement_end(clean, start):
+    """End of the statement starting at `start`: the first `;` outside any parenthesis or brace, so a `for (;;)`
+    header or a lambda body inside it does not cut the statement short. -1 when there is none."""
+    depth = 0
+    for i in range(start, len(clean)):
+        if clean[i] in "({[":
+            depth += 1
+        elif clean[i] in ")}]":
+            depth -= 1
+        elif clean[i] == ";" and depth <= 0:
+            return i
+    return -1
+
+
 def ungated_sites(body, site):
     """Offsets of `site` matches that no `if (placement_declines && ...)` covers.
 
-    Comments and string literals are blanked first. A site is covered when it sits in the condition of such an if,
-    or anywhere in its body (a braced block, or the single statement): the outer gate already decides, so a second
-    `placement_declines &&` on a nested site would be dead code and is not required. The gate condition must be
-    `placement_declines && ...` with no top-level `||`; anything else is not a gate. A site under no gate -- the
-    defect this gate exists for -- is reported.
+    Comments and the contents of string/char literals are blanked first (digit separators are not char literals).
+    A site is covered when it sits in the condition of such an if, or anywhere in its body (a braced block, or the
+    single statement): the outer gate already decides, so a second `placement_declines &&` on a nested site would
+    be dead code and is not required. The gate condition must be `placement_declines && ...` with no top-level
+    `||`; anything else is not a gate. A site under no gate -- the defect this gate exists for -- is reported.
+
+    Not understood, and so not safe to rely on: raw string literals, `#if 0` regions (their text is parsed as
+    code), and a comma or ternary at the top level of the condition (`placement_declines && a, true`, `c ? x : y`),
+    which would be read as gated. None occurs in the function this is pointed at.
     """
-    clean = blank_comments_and_strings(body)
+    clean = strip_comments(body, blank_literals=True, keep_length=True)
     spans = []
     for m in re.finditer(r"\bif\s*\(", clean):
         open_paren = m.end() - 1
@@ -193,12 +190,11 @@ def ungated_sites(body, site):
         if close_paren < 0 or not gate_condition_ok(clean[open_paren + 1:close_paren]):
             continue
         rest = clean[close_paren + 1:]
-        lead = len(rest) - len(rest.lstrip())
-        body_start = close_paren + 1 + lead
+        body_start = close_paren + 1 + len(rest) - len(rest.lstrip())
         if clean.startswith("{", body_start):
             body_end = matching(clean, body_start, "{", "}")
         else:
-            body_end = clean.find(";", body_start)
+            body_end = single_statement_end(clean, body_start)
         spans.append((open_paren, body_end if body_end >= 0 else len(clean)))
     return [m.start() for m in re.finditer(site, clean)
             if not any(lo <= m.start() <= hi for lo, hi in spans)]
@@ -391,34 +387,56 @@ if args.self_test:
     for label, expect, srcs in mutants:
         failed += run(label, srcs, expect)
 
-    # The gate must also keep holding where a comment or a literal carries text that would fool a textual parse.
+    # ungated_sites() is exercised on the extracted impl text itself, with brace-balanced inserts, so each case
+    # reaches the parser instead of tripping the function-extraction anchors first.
+    IMPL_SIGNATURE = (r"static\s+bool\s+ggml_sycl_device_supports_op_impl\s*"
+                      r"\([^)]*\bbool\s+placement_declines\s*\)\s*\{")
+    KV_SITE = r"ggml_sycl_tensor_is_in_kv_host_buft\s*\("
     KV_SRC_GATE = "if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {"
-    KV_SITES = "backend: every KV-host placement site in the impl is gated on the parameter"
-    fooled = [
-        ("a comment holding the gate text over an ungated site", KV_SITES,
-         with_(be=mutate(sources["be"], KV_SRC_GATE,
-                         "/* " + KV_SRC_GATE + " */ if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {"))),
-        ("a string holding the gate text over an ungated site", KV_SITES,
-         with_(be=mutate(sources["be"], KV_SRC_GATE,
-                         'const char * g = "' + KV_SRC_GATE + '"; if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {'))),
-        ("a gate whose condition has a top-level ||", KV_SITES,
-         with_(be=mutate(sources["be"], KV_SRC_GATE,
-                         "if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op->src[i]) || g_ggml_sycl_debug) {"))),
-    ]
-    for label, expect, srcs in fooled:
-        failed += run(label, srcs, expect)
+    KV_SRC_UNGATED = "if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {"
+    impl_text = function_body(sources["be"], IMPL_SIGNATURE) or ""
 
-    def holds(label, check, srcs):
-        ok = evaluate(*srcs).get(check, False)
-        print(("PASS" if ok else "FAIL") + f": '{label}' still satisfies '{check}'")
-        return [] if ok else [label]
+    def parse_case(label, mutated_impl, flagged):
+        sites = ungated_sites(mutated_impl, KV_SITE)
+        ok = bool(sites) == flagged and bool(mutated_impl)
+        verb = "flags" if flagged else "accepts"
+        print(("PASS" if ok else "FAIL") + f": ungated_sites {verb} '{label}'")
+        return [] if ok else ["ungated_sites " + label]
 
-    failed += holds("a } in a comment next to a covered site", KV_SITES,
-                    with_(be=mutate(sources["be"], "(op->op == GGML_OP_SET_ROWS && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&",
-                                    "(op->op == GGML_OP_SET_ROWS /* } */ && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&")))
-    failed += holds("a } in a string next to a covered site", KV_SITES,
-                    with_(be=mutate(sources["be"], 'GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft residency decline (dst)',
-                                    'GGML_SYCL_DEBUG("} [SYCL-SUPPORT] KV-host-buft residency decline (dst)')))
+    def edited(old, new):
+        return mutate(impl_text, old, new)
+
+    failed += parse_case("the unmodified impl", impl_text, False)
+    failed += parse_case("a gate removed from the src loop", edited(KV_SRC_GATE, KV_SRC_UNGATED), True)
+    failed += parse_case("gate text in a comment over an ungated site",
+                         edited(KV_SRC_GATE, "/* " + KV_SRC_GATE + " */ " + KV_SRC_UNGATED), True)
+    failed += parse_case("gate text in a string over an ungated site",
+                         edited(KV_SRC_GATE, 'const char * g = "' + KV_SRC_GATE + '"; ' + KV_SRC_UNGATED), True)
+    failed += parse_case("a gate condition with a top-level ||",
+                         edited(KV_SRC_GATE, "if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])"
+                                             " || g_ggml_sycl_debug) {"), True)
+    failed += parse_case("an ungated site between two digit separators",
+                         edited(KV_SRC_GATE, "int a = 1'000; " + KV_SRC_UNGATED + " int b = 2'000;"), True)
+    failed += parse_case("a } in a comment ahead of the nested site",
+                         edited(KV_SRC_GATE, KV_SRC_GATE + " /* } */"), False)
+    failed += parse_case("a } in a string inside the gated body, ahead of the nested site",
+                         edited(KV_SRC_GATE, KV_SRC_GATE + ' const char * s = "}";'), False)
+    failed += parse_case("a { in a string inside the gated body",
+                         edited(KV_SRC_GATE, KV_SRC_GATE + ' const char * s = "{";'), False)
+    failed += parse_case("a digit separator inside the gated body",
+                         edited(KV_SRC_GATE, KV_SRC_GATE + " int a = 1'000; int b = 2'000;"), False)
+
+    def parse_snippet(label, snippet, flagged):
+        return parse_case(label, snippet, flagged)
+
+    failed += parse_snippet("a one-statement gated body holding a for (;;)",
+                            "if (placement_declines && a) for (int i = 0; i < 3; ++i)"
+                            " use(ggml_sycl_tensor_is_in_kv_host_buft(x));", False)
+    failed += parse_snippet("an ungated site after a gated block, between two digit separators",
+                            "if (placement_declines && a) { int a = 1'0; } use(ggml_sycl_tensor_is_in_kv_host_buft(x));"
+                            " int b = 2'0;", True)
+    failed += parse_snippet("the same site under no gate",
+                            "for (int i = 0; i < 3; ++i) use(ggml_sycl_tensor_is_in_kv_host_buft(x));", True)
 
 if failed:
     print("\nFAILED: " + ", ".join(failed))
