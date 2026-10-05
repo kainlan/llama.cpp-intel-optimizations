@@ -155,32 +155,63 @@ def gate_condition_ok(cond):
     return True
 
 
-def single_statement_end(clean, start):
-    """End of the statement starting at `start`: the first `;` outside any parenthesis or brace, so a `for (;;)`
-    header or a lambda body inside it does not cut the statement short. -1 when there is none."""
+def statement_end(clean, start):
+    """Offset of the last character of the statement that begins at `start`, or -1.
+
+    Understood: a braced block; `if`/`for`/`while`/`switch (...)` followed by a statement, an `if`'s `else` branch
+    included (so `if (a) b; else { c; }` ends at the final `}`); `do ... while (...);`; and any other statement,
+    which ends at the first `;` outside every parenthesis, bracket and brace (so a `;` inside a lambda body, bound
+    by `=` or passed as an argument, does not end it).
+    """
+    m = re.compile(r"\s*").match(clean, start)
+    i = m.end()
+    if i >= len(clean):
+        return -1
+    if clean[i] == "{":
+        return matching(clean, i, "{", "}")
+    kw = re.compile(r"(if|for|while|switch)\s*\(").match(clean, i)
+    if kw:
+        close = matching(clean, kw.end() - 1, "(", ")")
+        end = statement_end(clean, close + 1) if close >= 0 else -1
+        if kw.group(1) == "if" and end >= 0:
+            other = re.compile(r"\s*else\b").match(clean, end + 1)
+            if other:
+                return statement_end(clean, other.end())
+        return end
+    if re.compile(r"do\b").match(clean, i):
+        end = statement_end(clean, i + 2)
+        tail = re.compile(r"\s*while\s*\(").match(clean, end + 1) if end >= 0 else None
+        if tail:
+            close = matching(clean, tail.end() - 1, "(", ")")
+            return clean.find(";", close) if close >= 0 else -1
+        return end
     depth = 0
-    for i in range(start, len(clean)):
-        if clean[i] in "({[":
+    while i < len(clean):
+        c = clean[i]
+        if c in "([{":
             depth += 1
-        elif clean[i] in ")}]":
+        elif c in ")]}":
             depth -= 1
-        elif clean[i] == ";" and depth <= 0:
+        elif c == ";" and depth <= 0:
             return i
+        i += 1
     return -1
 
 
 def ungated_sites(body, site):
     """Offsets of `site` matches that no `if (placement_declines && ...)` covers.
 
-    Comments and the contents of string/char literals are blanked first (digit separators are not char literals).
-    A site is covered when it sits in the condition of such an if, or anywhere in its body (a braced block, or the
-    single statement): the outer gate already decides, so a second `placement_declines &&` on a nested site would
-    be dead code and is not required. The gate condition must be `placement_declines && ...` with no top-level
-    `||`; anything else is not a gate. A site under no gate -- the defect this gate exists for -- is reported.
-
-    Not understood, and so not safe to rely on: raw string literals, `#if 0` regions (their text is parsed as
-    code), and a comma or ternary at the top level of the condition (`placement_declines && a, true`, `c ? x : y`),
-    which would be read as gated. None occurs in the function this is pointed at.
+    This is a source tripwire, not a C++ parser; the behavioural coverage of fused landing is
+    test-llama-fused-landing. What it does:
+    * comments and the contents of string and char literals are blanked first, and a digit separator (`1'000`) is
+      not a char literal;
+    * a site is covered when it sits in the condition of an `if` whose condition is `placement_declines && ...`
+      with no top-level `||`, or in that if's body: a braced block, or a single statement as statement_end() reads
+      it; a second `placement_declines &&` on a nested site would be dead code and is not required;
+    * a site under no such if is reported.
+    What it does not understand: raw string literals, `#if 0` regions (parsed as code), a comma or ternary at the top
+    level of a condition (`placement_declines && a, true`, `c ? x : y`, read as gated), a `switch` body's labels, and
+    the `else` branch of a gated BRACED `if` (reported, which fails closed).
     """
     clean = strip_comments(body, blank_literals=True, keep_length=True)
     spans = []
@@ -194,7 +225,7 @@ def ungated_sites(body, site):
         if clean.startswith("{", body_start):
             body_end = matching(clean, body_start, "{", "}")
         else:
-            body_end = single_statement_end(clean, body_start)
+            body_end = statement_end(clean, body_start)
         spans.append((open_paren, body_end if body_end >= 0 else len(clean)))
     return [m.start() for m in re.finditer(site, clean)
             if not any(lo <= m.start() <= hi for lo, hi in spans)]
@@ -415,28 +446,40 @@ if args.self_test:
     failed += parse_case("a gate condition with a top-level ||",
                          edited(KV_SRC_GATE, "if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])"
                                              " || g_ggml_sycl_debug) {"), True)
-    failed += parse_case("an ungated site between two digit separators",
-                         edited(KV_SRC_GATE, "int a = 1'000; " + KV_SRC_UNGATED + " int b = 2'000;"), True)
     failed += parse_case("a } in a comment ahead of the nested site",
                          edited(KV_SRC_GATE, KV_SRC_GATE + " /* } */"), False)
     failed += parse_case("a } in a string inside the gated body, ahead of the nested site",
                          edited(KV_SRC_GATE, KV_SRC_GATE + ' const char * s = "}";'), False)
-    failed += parse_case("a { in a string inside the gated body",
-                         edited(KV_SRC_GATE, KV_SRC_GATE + ' const char * s = "{";'), False)
     failed += parse_case("a digit separator inside the gated body",
                          edited(KV_SRC_GATE, KV_SRC_GATE + " int a = 1'000; int b = 2'000;"), False)
 
-    def parse_snippet(label, snippet, flagged):
-        return parse_case(label, snippet, flagged)
-
-    failed += parse_snippet("a one-statement gated body holding a for (;;)",
-                            "if (placement_declines && a) for (int i = 0; i < 3; ++i)"
-                            " use(ggml_sycl_tensor_is_in_kv_host_buft(x));", False)
-    failed += parse_snippet("an ungated site after a gated block, between two digit separators",
-                            "if (placement_declines && a) { int a = 1'0; } use(ggml_sycl_tensor_is_in_kv_host_buft(x));"
-                            " int b = 2'0;", True)
-    failed += parse_snippet("the same site under no gate",
-                            "for (int i = 0; i < 3; ++i) use(ggml_sycl_tensor_is_in_kv_host_buft(x));", True)
+    # Snippets, for the shapes the tree does not contain. Each "flags" case has a site after the gated statement.
+    SITE = "ggml_sycl_tensor_is_in_kv_host_buft(x)"
+    failed += parse_case("a one-statement gated body holding a for (;;)",
+                         "if (placement_declines && a) for (int i = 0; i < 3; ++i) use(" + SITE + ");", False)
+    failed += parse_case("the same site under no gate", "for (int i = 0; i < 3; ++i) use(" + SITE + ");", True)
+    failed += parse_case("a { in a string in a gated block, then an ungated site",
+                         'if (placement_declines && a) { const char * s = "{"; } use(' + SITE + ");", True)
+    failed += parse_case("an ungated site after a gated block, between two digit separators",
+                         "if (placement_declines && a) { int a = 1'0; } use(" + SITE + "); int b = 2'0;", True)
+    failed += parse_case("a gated for-block, then an ungated site",
+                         "if (placement_declines && a) for (;;) { y(); } use(" + SITE + ");", True)
+    failed += parse_case("a gated while-block, then an ungated site",
+                         "if (placement_declines && a) while (b) { y(); } use(" + SITE + ");", True)
+    failed += parse_case("a gated if/else, then an ungated site",
+                         "if (placement_declines && a) if (b) { y(); } else { z(); } use(" + SITE + ");", True)
+    failed += parse_case("a gated else-if chain, then an ungated site",
+                         "if (placement_declines && a) if (b) y(); else if (c) { z(); } use(" + SITE + ");", True)
+    failed += parse_case("a gated do/while, then an ungated site",
+                         "if (placement_declines && a) do { y(); } while (b); use(" + SITE + ");", True)
+    failed += parse_case("a site inside a gated for-block",
+                         "if (placement_declines && a) for (;;) { use(" + SITE + "); }", False)
+    failed += parse_case("a site in the else of a gated one-statement if",
+                         "if (placement_declines && a) if (b) y(); else use(" + SITE + ");", False)
+    failed += parse_case("a site in a lambda bound in a gated statement (a `;` inside the braces)",
+                         "if (placement_declines && a) f = [&] { y(); use(" + SITE + "); };", False)
+    failed += parse_case("a site in a lambda passed in a gated statement (braces inside parentheses)",
+                         "if (placement_declines && a) run([&] { y(); use(" + SITE + "); });", False)
 
 if failed:
     print("\nFAILED: " + ", ".join(failed))

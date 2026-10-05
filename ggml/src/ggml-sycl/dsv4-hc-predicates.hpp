@@ -25,7 +25,9 @@ constexpr int64_t HC_COMB_MIX_DIM     = (2 + HC_COMB_STREAMS) * HC_COMB_STREAMS;
 constexpr int64_t HC_COMB_SCALE_COMB_IDX = 2;
 
 // The op_params slots ggml_dsv4_hc_pre_gated and ggml_dsv4_hc_comb (ggml.c) write: the f32 (hc_pre's scale, hc_comb's
-// eps) and the int32 (hc_pre's gated flag, hc_comb's n_iter). Nothing under ggml-sycl indexes op_params by a literal.
+// eps) and the int32 (hc_pre's gated flag, hc_comb's n_iter). The DSv4 HC sources name them through these constants
+// rather than a literal (tests/test-sycl-dsv4-ops-source.py gates that); other ggml-sycl files index op_params
+// directly.
 constexpr int HC_OP_PARAM_F32_SLOT = 0;
 constexpr int HC_OP_PARAM_I32_SLOT = 1;
 

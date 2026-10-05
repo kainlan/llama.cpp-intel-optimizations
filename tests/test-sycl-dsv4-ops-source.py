@@ -131,17 +131,25 @@ ALLOC = re.compile(r"sycl::malloc|malloc_device|malloc_host|malloc_shared|unifie
 
 
 OP_PARAM_CALL = re.compile(r"\b(?:ggml_get_op_params_\w+|hc_op_param_\w+)\s*\(")
-LITERAL_ARG = re.compile(r"^[\s()0-9xXa-fA-FuUlL]*[0-9][\s()0-9xXa-fA-FuUlL]*$")
-LITERAL_OP_PARAMS_INDEX = re.compile(r"\bop_params\s*\)*\s*(?:\[|\+)\s*\(*\s*[0-9]")
+# a numeric literal as one token: decimal or 0x hex, optional ' digit separators, optional suffix
+NUMBER = r"(?:0[xX][0-9a-fA-F]+(?:'[0-9a-fA-F]+)*|[0-9]+(?:'[0-9]+)*)[uUlL]*"
+LITERAL_ARG = re.compile(r"[\s(]*" + NUMBER + r"[\s)]*")
+LITERAL_OP_PARAMS_INDEX = re.compile(r"\bop_params\s*\)*\s*(?:\[|\+)\s*\(*\s*" + NUMBER + r"(?![\w'])")
 
 
 def literal_op_param_slots(text):
-    """Every spelling that reaches an op_params slot through a number written in the source.
+    """Spellings that reach an op_params slot through a number written in the source (a tripwire, not a parser).
 
-    Pointer indexing or offsetting (`op->op_params[1]`, `((const int32_t *) op->op_params)[1]`, `op_params + 1`)
-    and the accessor calls (`ggml_get_op_params_i32(op, 1)`, `hc_op_param_i32(dst->src[0], (1))`) are recognised;
-    the slot is the call's last top-level argument, whatever the operand expression before it looks like.
+    Comments are stripped first. Caught:
+    * `op_params[N]`, `((const int32_t *) op->op_params)[N]` and `op_params + N`, where N is a numeric literal;
+    * a call to ggml_get_op_params_* or hc_op_param_* whose last top-level argument is a numeric literal, however
+      the operand expression before it is written and whether or not the literal is parenthesised.
+    A numeric literal is one token (decimal or 0x hex, with ' separators and a suffix): an identifier that merely
+    ends in digits or hex letters (`bad1`, `a1`) is not one.
+    NOT covered: an index written as an expression (`N + 1`), a cast literal (`(int) 1`), and any access through a
+    local alias of the pointer (`p = op->op_params; p[1]`, `p + 1`).
     """
+    text = strip_comments(text)
     found = [m.group(0) for m in LITERAL_OP_PARAMS_INDEX.finditer(text)]
     for m in OP_PARAM_CALL.finditer(text):
         depth = 0
@@ -159,7 +167,7 @@ def literal_op_param_slots(text):
             else:
                 cur += ch
         args.append(cur)
-        if len(args) >= 2 and LITERAL_ARG.match(args[-1]):
+        if len(args) >= 2 and LITERAL_ARG.fullmatch(args[-1]):
             found.append(text[m.start():m.end()] + ",".join(args))
     return found
 
@@ -331,6 +339,21 @@ if args.self_test:
     ]
     for label, expect, srcs in mutants:
         failed += run(label, srcs, expect)
+
+    # counter-examples: spellings that must NOT be taken for a literal slot
+    def holds(label, check, srcs):
+        ok = evaluate(*srcs).get(check, False)
+        print(("PASS" if ok else "FAIL") + f": '{label}' still satisfies '{check}'")
+        return [] if ok else [label]
+
+    SLOT_CHECK = "no DSv4 HC source indexes op_params by a literal"
+    for label, text in (
+            ("an identifier ending in digits as the slot", "int v = ggml_get_op_params_i32(op, bad1);"),
+            ("an identifier a1 as the slot", "int v = ggml_sycl_dsv4::hc_op_param_i32(op, a1);"),
+            ("op_params indexed by an identifier ending in a digit", "int v = op->op_params[a1];"),
+            ("a commented-out accessor call", "// int v = ggml_get_op_params_i32(op, 1);"),
+            ("a block-commented accessor call", "/* int v = op->op_params[1]; */")):
+        failed += holds(label, SLOT_CHECK, with_(hc=sources["hc"] + "\nvoid f() { " + text + " }\n"))
 
 if failed:
     print("\nFAILED: " + ", ".join(failed))

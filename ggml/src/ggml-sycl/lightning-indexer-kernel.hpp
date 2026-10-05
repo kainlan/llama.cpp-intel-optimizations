@@ -68,8 +68,11 @@ constexpr int64_t LIGHTNING_INDEXER_ROWS_PER_BLOCK = 4;
 // parameter so the launcher picks the instantiation once per launch and the kernel body carries no per-element
 // switch on it.
 template <ggml_type KT> inline float lightning_indexer_k_elem(const char * row, int64_t i) {
-    // every cast below goes through the K storage trait, the one place a type is tied to its block layout, so a
-    // wrong specialization (a type mapped to another type's block) fails to compile here
+    // every cast below goes through the K storage trait, the one place a type is tied to its block layout. A missing
+    // specialization fails to compile. A wrong one fails only when this dequant reads a member the wrong block lacks
+    // (Q5_0 mapped to block_q4_0 has no `qh`) or its alignment differs from k_align's; one with the same members and
+    // alignment (Q4_0 for IQ4_NL, F16 for BF16) compiles silently, so the specializations are read against
+    // ggml-common.h when one is added or changed.
     using storage = typename lightning_indexer_k_storage<KT>::type;
     if constexpr (KT == GGML_TYPE_F32) {
         return ((const storage *) row)[i];
