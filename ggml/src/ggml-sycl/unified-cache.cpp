@@ -22,6 +22,7 @@
 #include "model-lifecycle.hpp"
 #include "moe-resolved-batch.hpp"
 #include "onednn-woq.hpp"
+#include "range-index.hpp"
 #include "sycl-timeline.hpp"
 #include "unified-types.hpp"
 #include "vram-headroom.hpp"
@@ -1479,6 +1480,16 @@ struct runtime_alloc_record {
 };
 
 static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry;
+
+// Containment index over the registry's rows: [handle.ptr, handle.ptr + handle.size) -> the row's key, for every row with
+// a non-null pointer and a non-zero size. It answers "which allocation contains this address" in O(log n), where the
+// registry itself can only scan (llama.cpp-ii25). Guarded by g_runtime_alloc_mutex, and in step with the registry only
+// because EVERY mutation of the registry goes through the runtime_registry_*_locked helpers below; no other code may
+// emplace, erase or assign a row (tests/test-sycl-runtime-registry-index-source.py enforces it). A registered row's
+// handle.ptr and handle.size must not change, since the index keeps the geometry it was given at insertion.
+// Declared before g_device_caches for the reason given there: the caches' destructors erase rows.
+static address_range_index g_runtime_alloc_index;
+
 // Keep cache owners later in declaration order than the registry they call from
 // unified_cache::~unified_cache(). Reverse static destruction then tears caches
 // down first instead of asking release_registered_allocation_owned() to access
@@ -1502,6 +1513,85 @@ static std::atomic<bool> g_test_fail_next_arena_registry_commit{ false };
 static std::atomic<bool> g_test_pause_arena_registry_commit{ false };
 static std::atomic<bool> g_test_arena_registry_commit_reached{ false };
 #endif
+
+using runtime_registry_iterator = std::unordered_map<void *, runtime_alloc_record>::iterator;
+
+static bool runtime_registry_row_indexed(const alloc_metadata & h) noexcept {
+    return h.ptr != nullptr && h.size != 0;
+}
+
+// The only ways to add or remove a registry row; the caller holds g_runtime_alloc_mutex. They keep g_runtime_alloc_index
+// in step. Same contract as unordered_map::emplace: {row, true} on success, {existing row, false} when `ptr` already has
+// one. An allocation failure leaves registry and index unchanged and propagates. A row whose base another row's range
+// already starts at is refused as well ({end(), false}): two live allocations at one address is corruption, the same
+// answer runtime_registry_claim_ptr_locked gives for one pointer.
+static std::pair<runtime_registry_iterator, bool> runtime_registry_emplace_locked(void *               ptr,
+                                                                                  runtime_alloc_record rec) {
+    auto inserted = g_runtime_alloc_registry.emplace(ptr, std::move(rec));
+    if (!inserted.second) {
+        return inserted;
+    }
+    const alloc_metadata & h = inserted.first->second.handle;
+    if (!runtime_registry_row_indexed(h)) {
+        return inserted;
+    }
+    bool indexed = false;
+    try {
+        indexed = g_runtime_alloc_index.insert(reinterpret_cast<uintptr_t>(h.ptr), h.size, ptr);
+    } catch (...) {
+        g_runtime_alloc_registry.erase(inserted.first);
+        throw;
+    }
+    if (!indexed) {
+        g_runtime_alloc_registry.erase(inserted.first);
+        return { g_runtime_alloc_registry.end(), false };
+    }
+    return inserted;
+}
+
+static void runtime_registry_erase_locked(runtime_registry_iterator it) noexcept {
+    const alloc_metadata & h = it->second.handle;
+    if (runtime_registry_row_indexed(h)) {
+        const bool unindexed = g_runtime_alloc_index.erase(reinterpret_cast<uintptr_t>(h.ptr), it->first);
+        GGML_ASSERT(unindexed && "runtime allocation index lost a registered row");
+        (void) unindexed;
+    }
+    g_runtime_alloc_registry.erase(it);
+}
+
+static void runtime_registry_erase_locked(void * ptr) noexcept {
+    const auto it = g_runtime_alloc_registry.find(ptr);
+    if (it != g_runtime_alloc_registry.end()) {
+        runtime_registry_erase_locked(it);
+    }
+}
+
+// Replace-or-insert, the semantics of `registry[ptr] = rec`: the row at `ptr`, if any, is dropped first. An allocation
+// failure after that drop leaves the old row gone, which is the same state the index-free code reached by erasing and
+// then failing to insert.
+static void runtime_registry_assign_locked(void * ptr, const runtime_alloc_record & rec) {
+    runtime_registry_erase_locked(ptr);
+    (void) runtime_registry_emplace_locked(ptr, rec);
+}
+
+// Every registry row is indexed exactly when it qualifies, with the geometry the row carries, and the index holds nothing
+// else. O(n); for tests and audits.
+static bool runtime_registry_index_consistent_locked() noexcept {
+    size_t indexed = 0;
+    for (const auto & kv : g_runtime_alloc_registry) {
+        const alloc_metadata & h = kv.second.handle;
+        if (!runtime_registry_row_indexed(h)) {
+            continue;
+        }
+        indexed++;
+        address_range_index::entry e;
+        if (!g_runtime_alloc_index.find_exact(reinterpret_cast<uintptr_t>(h.ptr), &e) || e.key != kv.first ||
+            e.end != reinterpret_cast<uintptr_t>(h.ptr) + h.size) {
+            return false;
+        }
+    }
+    return indexed == g_runtime_alloc_index.size() && g_runtime_alloc_index.check_invariants();
+}
 
 static bool unified_alloc_lifetime_trace_enabled();
 
@@ -1569,7 +1659,7 @@ static bool runtime_registry_claim_ptr_locked(void * ptr, stale_claim_report & r
         } catch (...) {
         }
     }
-    g_runtime_alloc_registry.erase(it);
+    runtime_registry_erase_locked(it);
     return true;
 }
 
@@ -1603,12 +1693,12 @@ static bool arena_runtime_registry_commit(void * ptr, const arena_authority::all
         if (!runtime_registry_claim_ptr_locked(ptr, stale_claim)) {
             return false;
         }
-        auto inserted = g_runtime_alloc_registry.emplace(ptr, rec);
+        auto inserted = runtime_registry_emplace_locked(ptr, rec);
         if (!inserted.second) return false;
         try {
             if (!rec.cohort_id.empty()) g_runtime_cohort_tier[rec.cohort_id] = rec.handle.tier;
         } catch (...) {
-            g_runtime_alloc_registry.erase(inserted.first);
+            runtime_registry_erase_locked(inserted.first);
             throw;
         }
         context.published = true;
@@ -16540,13 +16630,13 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             }
             try {
                 if (runtime_registry_claim_ptr_locked(ptr, stale_claim)) {
-                    auto inserted = g_runtime_alloc_registry.emplace(ptr, rec);
+                    auto inserted = runtime_registry_emplace_locked(ptr, rec);
                     if (inserted.second) {
                         try {
                             if (!rec.cohort_id.empty()) g_runtime_cohort_tier[rec.cohort_id] = tier;
                             registered = true;
                         } catch (...) {
-                            g_runtime_alloc_registry.erase(inserted.first);
+                            runtime_registry_erase_locked(inserted.first);
                         }
                     }
                 }
@@ -17300,25 +17390,21 @@ bool unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, s
 
     const uintptr_t             addr = reinterpret_cast<uintptr_t>(ptr);
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-    for (const auto & kv : g_runtime_alloc_registry) {
-        const runtime_alloc_record & rec = kv.second;
-        const alloc_metadata &       h   = rec.handle;
-        if (h.ptr == nullptr || h.size == 0) {
-            continue;
-        }
-        const uintptr_t base = reinterpret_cast<uintptr_t>(h.ptr);
-        if (addr < base || addr >= base + h.size) {
-            continue;
-        }
-        if (out != nullptr) {
-            *out = h;
-        }
-        if (queue_out != nullptr) {
-            *queue_out = rec.queue;
-        }
-        return true;
+    address_range_index::entry  hit;
+    if (!g_runtime_alloc_index.find_innermost(addr, &hit)) {
+        return false;
     }
-    return false;
+    const auto it = g_runtime_alloc_registry.find(hit.key);
+    if (it == g_runtime_alloc_registry.end()) {
+        return false;
+    }
+    if (out != nullptr) {
+        *out = it->second.handle;
+    }
+    if (queue_out != nullptr) {
+        *queue_out = it->second.queue;
+    }
+    return true;
 }
 
 static registered_release_status release_registered_allocation_owned(
@@ -17408,7 +17494,7 @@ static registered_release_status release_registered_allocation_owned(
     if (it != g_runtime_alloc_registry.end() && it->second.handle.key() == detached.handle.key() &&
         it->second.release_generation == detached.release_generation &&
         it->second.state == runtime_alloc_state::RELEASING) {
-        g_runtime_alloc_registry.erase(it);
+        runtime_registry_erase_locked(it);
     }
     return registered_release_status::RELEASED;
 }
@@ -17511,7 +17597,7 @@ bool allocation_registry_test_publish(const alloc_metadata & metadata, bool intr
         rec.ownership = intrusive ? runtime_alloc_ownership::INTRUSIVE : runtime_alloc_ownership::LEGACY;
         rec.test_no_physical_release = true;
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        return g_runtime_alloc_registry.emplace(metadata.ptr, std::move(rec)).second;
+        return runtime_registry_emplace_locked(metadata.ptr, std::move(rec)).second;
     } catch (...) {
         return false;
     }
@@ -17528,6 +17614,11 @@ allocation_result allocation_registry_test_promote(
 bool allocation_registry_test_contains(void * ptr) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     return g_runtime_alloc_registry.find(ptr) != g_runtime_alloc_registry.end();
+}
+
+bool allocation_registry_test_index_consistent() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return runtime_registry_index_consistent_locked();
 }
 
 bool allocation_registry_test_cleanup_pending(void * ptr) noexcept {
@@ -17617,7 +17708,7 @@ bool allocation_registry_test_claim_ptr(void * ptr) noexcept {
 
 void allocation_registry_test_erase(void * ptr) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-    g_runtime_alloc_registry.erase(ptr);
+    runtime_registry_erase_locked(ptr);
 }
 
 bool allocation_registry_test_publish_raw(void * ptr,
@@ -17641,7 +17732,7 @@ bool allocation_registry_test_publish_raw(void * ptr,
         rec.state                    = releasing ? runtime_alloc_state::RELEASING : runtime_alloc_state::LIVE;
         rec.test_no_physical_release = true;
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        return g_runtime_alloc_registry.emplace(ptr, std::move(rec)).second;
+        return runtime_registry_emplace_locked(ptr, std::move(rec)).second;
     } catch (...) {
         return false;
     }
@@ -20320,7 +20411,7 @@ static alloc_handle unified_cache_adopt_raw_host_allocation(void *           ptr
     rec.cohort_id        = cohort_id ? cohort_id : "";
 
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-    g_runtime_alloc_registry[ptr] = rec;
+    runtime_registry_assign_locked(ptr, rec);
     if (cohort_id && cohort_id[0] != '\0') {
         g_runtime_cohort_tier[cohort_id] = alloc_tier::HOST_PINNED;
     }
@@ -20369,9 +20460,9 @@ static alloc_handle unified_cache_adopt_raw_device_allocation(void *           p
         if (!dup->second.cohort_id.empty()) {
             g_runtime_cohort_tier.erase(dup->second.cohort_id);
         }
-        g_runtime_alloc_registry.erase(dup);
+        runtime_registry_erase_locked(dup);
     }
-    g_runtime_alloc_registry[ptr] = rec;
+    runtime_registry_assign_locked(ptr, rec);
     if (cohort_id && cohort_id[0] != '\0') {
         g_runtime_cohort_tier[cohort_id] = alloc_tier::DEVICE_VRAM;
     }
@@ -24004,7 +24095,7 @@ void unified_cache::arena_forget_allocation_locked(vram_zone_id zone, void * ptr
         auto runtime = g_runtime_alloc_registry.find(ptr);
         if (runtime != g_runtime_alloc_registry.end() && runtime->second.handle.alloc_id == exact_id) {
             if (!runtime->second.cohort_id.empty()) g_runtime_cohort_tier.erase(runtime->second.cohort_id);
-            g_runtime_alloc_registry.erase(runtime);
+            runtime_registry_erase_locked(runtime);
         }
     }
 }

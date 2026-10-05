@@ -6261,6 +6261,9 @@ allocation_result allocation_registry_test_promote(
     const alloc_metadata & metadata,
     const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept;
 bool allocation_registry_test_contains(void * ptr) noexcept;
+// llama.cpp-ii25: the registry's containment index holds exactly the rows that qualify, with their geometry
+// (runtime_registry_index_consistent_locked()). O(n).
+bool allocation_registry_test_index_consistent() noexcept;
 bool allocation_registry_test_cleanup_pending(void * ptr) noexcept;
 size_t allocation_registry_test_size() noexcept;
 bool allocation_registry_test_acquire_exact_lease(const alloc_metadata & metadata) noexcept;
@@ -6318,6 +6321,15 @@ registered_release_status release_registered_allocation(const alloc_metadata & e
 // metadata-bearing callers must use release_registered_allocation_exact().
 registered_release_status release_registered_pointer(void * ptr, int expected_device = -1);
 bool       unified_lookup(void * ptr, alloc_metadata * out);
+// The registered allocation that contains `ptr` (any byte of [handle.ptr, handle.ptr + handle.size)), not only one that
+// starts there. O(log n) through the registry's containment index (range-index.hpp).
+//
+// PRECEDENCE: ranges nest (a cache or arena chunk is registered alongside the suballocations carved from it), so several
+// rows can contain `ptr`. The answer is the INNERMOST: the row with the greatest base, which is the smallest enclosing
+// range in a properly nested family. Every caller wants the allocation that is the authority for its pointer (its tier,
+// device, queue and the extent a view may address), and a containing chunk is physical lifetime ownership, not authority
+// over a suballocation inside it. It is deterministic; the scan this replaced returned whichever row unordered_map
+// iteration reached first. A row that is RELEASING is still a row here, as before.
 bool       unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, sycl::queue ** queue_out = nullptr);
 alloc_tier unified_select_tier(const alloc_request & req);
 bool       unified_alloc_validate_registry(int device = -1, const char * where = nullptr);

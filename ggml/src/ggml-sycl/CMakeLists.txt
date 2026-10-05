@@ -5846,6 +5846,23 @@ set_tests_properties(sycl-compute-refusal-advice PROPERTIES
     TIMEOUT 30
 )
 
+# Ordered address-range index behind the runtime allocation registry's containment lookup (llama.cpp-ii25): innermost
+# containing range, bounds, nesting, erase/rekey, a brute-force oracle over random ranges, and a 100k-row microbench
+# against the linear scan it replaces. Header-only, no SYCL.
+add_executable(test-address-range-index
+    tests/test-address-range-index.cpp
+)
+target_include_directories(test-address-range-index PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_target_properties(test-address-range-index PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-address-range-index COMMAND test-address-range-index)
+set_tests_properties(sycl-address-range-index PROPERTIES
+    LABELS "sycl;memory;host-only;tsan-capable"
+    TIMEOUT 120
+)
+
 # Dense two-card split decode policies (llama.cpp-m1or): which simple-consumer
 # sources the route must stage, and which gate stopped the block executor. Both
 # headers are dependency-free, so this target takes no -fsycl and links nothing.
@@ -6230,6 +6247,20 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
     set_tests_properties(sycl-intrusive-allocation-owner PROPERTIES
         LABELS "sycl;allocator;owner;host;tsan-capable"
         TIMEOUT 30)
+
+    # The runtime allocation registry's containment lookup follows its range index (llama.cpp-ii25): bounds, nested
+    # chunk/suballocation precedence, every registry mutation, and a brute-force oracle. Rows are published through the
+    # host-only test seams; nothing is allocated and no device is touched.
+    add_executable(test-sycl-runtime-registry-containment
+        tests/test-runtime-registry-containment.cpp)
+    target_link_libraries(test-sycl-runtime-registry-containment PRIVATE
+        ggml-sycl-private-fixtures)
+    set_target_properties(test-sycl-runtime-registry-containment PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-runtime-registry-containment COMMAND test-sycl-runtime-registry-containment)
+    set_tests_properties(sycl-runtime-registry-containment PROPERTIES
+        LABELS "sycl;allocator;registry;host;tsan-capable"
+        TIMEOUT 60)
 
     # Forced-failure coverage for the transactional staging-replacement region
     # (4f01993c9).  Most scenarios need no device; the last two repeat the
