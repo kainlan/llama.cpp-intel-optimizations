@@ -12,9 +12,21 @@ CONCAT_SOURCE = ROOT / "ggml/src/ggml-sycl/concat.cpp"
 BACKEND_OPS_SOURCE = ROOT / "tests/test-backend-ops.cpp"
 
 
+# The decisions live in ggml_sycl_device_supports_op_impl; ggml_backend_sycl_device_supports_op is a one-line
+# wrapper over it. Anchor on the impl DEFINITION (the forward declaration before it ends in `;`, so it does not
+# match).
+SUPPORTS_IMPL_DEFINITION = re.compile(r"static\s+bool\s+ggml_sycl_device_supports_op_impl\s*\([^)]*\)\s*\{")
+
+
+def _supports_impl_start(source: str) -> int:
+    found = list(SUPPORTS_IMPL_DEFINITION.finditer(source))
+    assert len(found) == 1, f"supports_op impl definition occurs {len(found)} times, expected exactly 1"
+    return found[0].start()
+
+
 def _supports_source(text: Optional[str] = None) -> str:
     source = text if text is not None else SUPPORT_SOURCE.read_text(encoding="utf-8")
-    return source[source.index("static bool ggml_backend_sycl_device_supports_op") :]
+    return source[_supports_impl_start(source) :]
 
 
 def _case(source: str, op: str, next_op: str) -> str:
@@ -362,7 +374,7 @@ def test_norm_family_predicates_match_complete_kernel_contracts() -> None:
 
     full_source = SUPPORT_SOURCE.read_text(encoding="utf-8")
     helper_start = full_source.index("static bool ggml_sycl_norm_rows_supported")
-    helper_end = full_source.index("static bool ggml_backend_sycl_device_supports_op", helper_start)
+    helper_end = _supports_impl_start(full_source)
     helper = full_source[helper_start:helper_end]
     assert "if (!t)" in helper and "return false;" in helper
     _assert_expression(
@@ -428,7 +440,7 @@ def test_review_mutations_are_detected() -> None:
         )
         assert _contract_rejects(_assert_odd_stride_source_contract, mutated_source), old
 
-    support_start = full_support.index("static bool ggml_backend_sycl_device_supports_op")
+    support_start = _supports_impl_start(full_support)
     rope_start = full_support.index("case GGML_OP_ROPE:", support_start)
     rope_end = full_support.index("case GGML_OP_IM2COL:", rope_start)
     rope_case = full_support[rope_start:rope_end]

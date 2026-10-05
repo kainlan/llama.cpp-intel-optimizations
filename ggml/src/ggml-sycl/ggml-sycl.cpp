@@ -97,6 +97,7 @@
 #include "ggml-sycl/convert.hpp"
 #include "ggml-sycl/cpy.hpp"
 #include "ggml-sycl/dispatch-tuning.hpp"
+#include "ggml-sycl/dsv4-hc.hpp"
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/fattn.hpp"
 #include "ggml-sycl/fusion-alias.hpp"
@@ -106,6 +107,7 @@
 #include "ggml-sycl/host-weight-alias.hpp"
 #include "ggml-sycl/kernel-selection.hpp"
 #include "ggml-sycl/l144i-probe.hpp"
+#include "ggml-sycl/lightning-indexer.hpp"
 #include "ggml-sycl/mem-ops.hpp"
 #include "ggml-sycl/mmq.hpp"
 #include "ggml-sycl/model-lifecycle-probe.hpp"
@@ -84563,6 +84565,18 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
         case GGML_OP_SET_ROWS_PAGED:
             ggml_sycl_op_set_rows_paged(ctx, safe_dst);
             break;
+        case GGML_OP_DSV4_HC_PRE:
+            ggml_sycl_op_dsv4_hc_pre(ctx, safe_dst);
+            break;
+        case GGML_OP_DSV4_HC_COMB:
+            ggml_sycl_op_dsv4_hc_comb(ctx, safe_dst);
+            break;
+        case GGML_OP_DSV4_HC_POST:
+            ggml_sycl_op_dsv4_hc_post(ctx, safe_dst);
+            break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            ggml_sycl_op_lightning_indexer(ctx, safe_dst);
+            break;
         case GGML_OP_DUP:
             ggml_sycl_dup(ctx, dst);
             break;
@@ -110350,7 +110364,17 @@ static bool ggml_sycl_tensor_is_in_kv_host_buft(const ggml_tensor * t) {
     return buf && buf->buft && buf->buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name;
 }
 
+// supports_op is "is there a kernel for this op, type and shape" AND "is the data placed where this device runs it".
+// The second half is the placement declines below (host-demoted KV, planner-on-host); `placement_declines` switches
+// exactly those off, which is what ggml_backend_sycl_supports_op_capability() does, so the capability answer is
+// this same body and cannot drift from supports_op.
+static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op, bool placement_declines);
+
 static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    return ggml_sycl_device_supports_op_impl(dev, op, /*placement_declines=*/true);
+}
+
+static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op, bool placement_declines) {
     ggml_backend_sycl_device_context * sycl_ctx = (ggml_backend_sycl_device_context *) dev->context;
     int                                device   = sycl_ctx->device;
 
@@ -110380,7 +110404,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
     // instrumentation below is a temporary TKV-11 observable; delete at
     // TKV-12 cleanup, together with the counter declaration and the
     // teardown print in ggml_backend_sycl_free.
-    if (ggml_sycl_tensor_is_in_kv_host_buft(op)) {
+    if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op)) {
         // TKV-13 step 5: SET_ROWS writing demoted-layer KV is accepted --
         // not declined -- when GGML_SYCL_ATTN_HOST_DISPATCH is set, so the
         // scheduler never carves a mid-graph CPU split for the KV append;
@@ -110401,7 +110425,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
+        if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
             // TKV-13 (B2) step 3: FLASH_ATTN_EXT over host-resident KV is
             // accepted -- not declined -- when GGML_SYCL_ATTN_HOST_DISPATCH
             // is set, so ggml_backend_sched never carves a CPU-backend split
@@ -110501,7 +110525,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
     const bool is_multi_gpu_router_logits =
         g_moe_multi_gpu_active.load(std::memory_order_acquire) && ggml_sycl_op_is_moe_router_logits_matmul(op);
 
-    if (!is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {
+    if (placement_declines && !is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {
         GGML_SYCL_DEBUG("[SYCL-SUPPORT] planner rejects %s on SYCL backend (op=%s layer=%d)\n",
                         op && op->name[0] != '\0' ? op->name : "(unnamed)", ggml_op_name(op->op),
                         ggml_sycl_extract_planned_layer_id(op));
@@ -111041,6 +111065,15 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_GATED_DELTA_NET:
             return true;
+        // The executors assert these same predicates, so nothing admitted here can abort there.
+        case GGML_OP_DSV4_HC_PRE:
+            return ggml_sycl_dsv4_hc_pre_supported(op);
+        case GGML_OP_DSV4_HC_COMB:
+            return ggml_sycl_dsv4_hc_comb_supported(op);
+        case GGML_OP_DSV4_HC_POST:
+            return ggml_sycl_dsv4_hc_post_supported(op);
+        case GGML_OP_LIGHTNING_INDEXER:
+            return ggml_sycl_lightning_indexer_supported(op);
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_SSM_SCAN:
@@ -111088,6 +111121,20 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
     }
 
     GGML_UNUSED(dev);
+}
+
+// supports_op without its two placement declines (host-demoted KV, planner-on-host), exported through
+// ggml_backend_sycl_reg_get_proc_address for callers that must tell a missing kernel from a placement decline
+// (llama_context::resolve_fused_ops): supports_op's "false" covers both, this is false only when there is no
+// kernel. Exact for the fused ops that caller probes (FLASH_ATTN_EXT, GATED_DELTA_NET, LIGHTNING_INDEXER,
+// DSV4_HC_*); MUL_MAT (BF16 weight-materialize route) and GET_ROWS (planned layout) keep residency checks of their
+// own that this does not neutralise.
+bool ggml_backend_sycl_supports_op_capability(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    if (dev == nullptr || op == nullptr) {
+        return false;
+    }
+
+    return ggml_sycl_device_supports_op_impl(dev, op, /*placement_declines=*/false);
 }
 
 static bool ggml_backend_sycl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -112396,6 +112443,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_for_model") == 0) {
         return (void *) ggml_backend_sycl_set_runtime_context_for_model;
+    }
+    if (strcmp(name, "ggml_backend_sycl_supports_op_capability") == 0) {
+        return (void *) ggml_backend_sycl_supports_op_capability;
     }
     if (strcmp(name, "ggml_backend_sycl_recheck_runtime_context_flash_attn") == 0) {
         return (void *) ggml_backend_sycl_recheck_runtime_context_flash_attn;

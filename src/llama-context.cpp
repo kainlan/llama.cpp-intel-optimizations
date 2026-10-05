@@ -7,6 +7,7 @@
 #endif
 #include "llama-arch.h"
 #include "llama-auto-ubatch.h"
+#include "llama-fused-landing.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -421,6 +422,21 @@ static decltype(&ggml_backend_sycl_ubatch_cache_store_layout1) llama_context_syc
         llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_ubatch_cache_store_layout1"));
 }
 #endif
+
+// The SYCL backend's capability-only supports_op (see ggml_backend_sycl_supports_op_capability in ggml-sycl.h), or
+// nullptr when the device is not SYCL or the loaded SYCL DSO predates it; resolve_fused_ops() then falls back to
+// the operand heuristic in llama-fused-landing.h.
+static llama_fused_capability_fn llama_context_sycl_capability_proc(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_SYCL)
+    return llama_context_dev_is_sycl(dev) ? &ggml_backend_sycl_supports_op_capability : nullptr;
+#elif defined(GGML_BACKEND_DL)
+    return reinterpret_cast<llama_fused_capability_fn>(
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_supports_op_capability"));
+#else
+    GGML_UNUSED(dev);
+    return nullptr;
+#endif
+}
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 // llama.cpp-kpjw (r7 I3): a pinned -ub publishes its plan ONCE, before the memory module (the KV cache, the recurrent
@@ -1518,6 +1534,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         uint32_t           n_cpu_landings  = 0;
         int                cpu_landing_il  = -1;
         ggml_backend_dev_t cpu_landing_dev = nullptr;
+        // the landings the layer's device could not have executed (see llama_fused_cpu_landing_is_placement)
+        uint32_t           n_cpu_gaps      = 0;
+        int                cpu_gap_il      = -1;
+        ggml_backend_dev_t cpu_gap_dev     = nullptr;
+        // the capability query of each layer device, looked up once (a reg-proc lookup in DL builds), not per node
+        std::map<ggml_backend_dev_t, llama_fused_capability_fn> capability_procs;
 
         for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
             if (node.op != probe.op) {
@@ -1555,9 +1577,21 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                     break;
                 }
 
-                n_cpu_landings++;
-                cpu_landing_il  = node.il;
-                cpu_landing_dev = device_fused;
+                auto capability = capability_procs.find(device_layer);
+                if (capability == capability_procs.end()) {
+                    capability =
+                        capability_procs.emplace(device_layer, llama_context_sycl_capability_proc(device_layer)).first;
+                }
+
+                if (llama_fused_cpu_landing_is_placement(device_layer, node.tensor, capability->second)) {
+                    n_cpu_landings++;
+                    cpu_landing_il  = node.il;
+                    cpu_landing_dev = device_fused;
+                } else {
+                    n_cpu_gaps++;
+                    cpu_gap_il  = node.il;
+                    cpu_gap_dev = device_layer;
+                }
             }
         }
 
@@ -1572,6 +1606,11 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                             "the executor follows data placement, not a capability gap\n",
                     func, probe.name, cpu_landing_dev ? ggml_backend_dev_name(cpu_landing_dev) : "CPU", n_cpu_landings,
                     cpu_landing_il);
+            }
+            if (n_cpu_gaps > 0) {
+                LLAMA_LOG_WARN(
+                    "%s: %s executes on CPU for %u layer(s) (e.g. layer %d) because %s does not support it\n", func,
+                    probe.name, n_cpu_gaps, cpu_gap_il, ggml_backend_dev_name(cpu_gap_dev));
             }
             LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
         }

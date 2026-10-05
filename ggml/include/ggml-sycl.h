@@ -1450,6 +1450,15 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runti
     struct ggml_sycl_model_token model,
     bool                         flash_attn_enabled);
 
+// Capability-only form of ggml_backend_dev_supports_op for a SYCL device: supports_op with its two PLACEMENT
+// declines -- host-demoted KV (the KV-host buffer type) and planner-on-host (ggml_sycl_op_is_planned_on_host) --
+// switched off, so it is false only when there is no kernel for `op` (its type and shape). supports_op's "false"
+// cannot tell a missing kernel from a placement; this can, for the fused ops llama_context::resolve_fused_ops
+// probes (FLASH_ATTN_EXT, GATED_DELTA_NET, LIGHTNING_INDEXER, DSV4_HC_*). It is NOT residency-blind for every op:
+// MUL_MAT's BF16 weight-materialize route and GET_ROWS's planned-layout check still depend on where the weight
+// lives. Reached through ggml_backend_reg_get_proc_address as "ggml_backend_sycl_supports_op_capability".
+GGML_BACKEND_API bool ggml_backend_sycl_supports_op_capability(ggml_backend_dev_t dev, const struct ggml_tensor * op);
+
 // Execution-lifecycle context identity is separate from the model lifecycle.
 // One ContextId is allocated per llama_context and then bound to each SYCL
 // backend created for it.
