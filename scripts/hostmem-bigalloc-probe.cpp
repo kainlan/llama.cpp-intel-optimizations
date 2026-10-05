@@ -19,6 +19,27 @@
 // turns those into function names. Nothing in here allocates: output goes
 // through write(2), and a thread-local flag stops the unwinder's own first-use
 // allocations from recursing.
+//
+// Caveats (read before trusting a negative result):
+//  * Frame skipping. The first two backtrace frames are dropped on the assumption
+//    that they are report() and the interposed entry point. That holds only while
+//    report() is not inlined into its caller; an -O2 build that inlines it shifts
+//    the stacks by one frame. Build with the -O1 line above.
+//  * Deadlock risk. The hook takes no lock of its own, but backtrace() may call
+//    dl_iterate_phdr, which takes the loader lock. A >= threshold malloc made
+//    from inside dlopen() on the same thread could therefore deadlock. Never seen
+//    in practice at the 64 MiB default; if a run hangs at library load, raise
+//    GGML_HOSTMEM_BIGALLOC_MIN_MB.
+//  * Coverage. valloc(), pvalloc() and direct mmap() calls are NOT interposed, so
+//    a mapping created by mmap itself (a library's own arena, a file mapping, the
+//    driver) never shows up. If the resolved total is well below the growth you
+//    are chasing, the remainder is such a mapping: fall back to a debugger break
+//    on mmap.
+//  * Offsets. Frames are printed as offsets from dladdr's dli_fbase, which is what
+//    addr2line wants for a shared object or a PIE executable. For a non-PIE
+//    (ET_EXEC) main binary addr2line expects the absolute address, so frames in
+//    that module resolve to the wrong symbol unless the base is added back. The
+//    llama.cpp tools and libraries here are PIE/shared.
 
 #include <dlfcn.h>
 #include <errno.h>

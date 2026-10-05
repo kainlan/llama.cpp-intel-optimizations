@@ -7,6 +7,11 @@ Prints one block per [BIGALLOC] record with function names (addr2line -f -C)
 for the first N frames (default 10), then a summary of how many allocations and
 how many bytes each distinct "first project frame" accounts for. A frame is a
 "project frame" when its module is not libc/libstdc++/libgcc/ld.
+
+Run it on the same host and tree as the probed run: offsets are looked up with
+addr2line in the libraries actually loaded. See the caveats in
+hostmem-bigalloc-probe.cpp (frame skipping, no valloc/pvalloc/mmap coverage,
+non-PIE offsets); a negative result there is not proof of absence.
 """
 import re, subprocess, sys, collections
 
