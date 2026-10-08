@@ -275,13 +275,37 @@ int test_replay_resets_churn_count() {
     return 0;
 }
 
+// A slot whose recording no longer matches what its split reads (an input's staging copy changed) is forgotten
+// alone: its payload is retired for the drain, the key warms up again, and other keys keep replaying.
+int test_forget_retires_one_key() {
+    gsc::slot_cache<fake_payload> cache(8);
+    const gsc::key                a = layer_key(1);
+    const gsc::key                b = layer_key(2);
+    for (const gsc::key & k : { a, b }) {
+        cache.begin(k);
+        cache.begin(k);
+        cache.record_succeeded(k, fake_payload{ k == a ? 1 : 2 });
+    }
+    cache.forget(a);
+    CHECK(cache.size() == 1, "forget kept the slot or dropped another one");
+    CHECK(cache.payload(a) == nullptr, "a forgotten key still has a payload");
+    std::vector<fake_payload> retired = cache.take_retired();
+    CHECK(retired.size() == 1 && retired[0].id == 1, "forget did not retire the forgotten recording");
+    CHECK(cache.begin(b) == gsc::action::REPLAY, "forget disturbed another key");
+    CHECK(cache.begin(a) == gsc::action::WARMUP, "a forgotten key does not warm up again");
+    cache.forget(layer_key(3));
+    CHECK(cache.size() == 2 && !cache.has_retired(), "forgetting an unknown key changed the cache");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     if (test_hasher() || test_key_fields() || test_lifecycle() || test_same_n_nodes_layers_do_not_share() ||
         test_interleaved_splits_all_replay() || test_failed_runs_direct() || test_lru_eviction_retires_payload() ||
         test_evicting_a_warmed_slot_retires_nothing() || test_invalidate_all() ||
-        test_record_after_invalidate_is_retired() || test_churn_turns_cache_off() || test_replay_resets_churn_count()) {
+        test_record_after_invalidate_is_retired() || test_churn_turns_cache_off() || test_replay_resets_churn_count() ||
+        test_forget_retires_one_key()) {
         return 1;
     }
     std::printf("test-sycl-graph-segment-cache: all checks passed\n");

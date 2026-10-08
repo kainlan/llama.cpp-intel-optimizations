@@ -1060,6 +1060,72 @@ with gate('keyed-q8-cache-invalidation'):
         assert check_keyed_q8_cache(mutated), "control %r was not caught" % label
     print("PASS keyed-q8-cache-invalidation-source-gate (%d controls caught)" % len(controls))
 
+def check_keyed_slot_input_staging(code: str, common: str) -> list:
+    """llama.cpp-7pm2 review I3: a slot's graphs bake the staging copies of its inputs. The staging map is keyed by
+    tensor struct (not by the slot key) and is cleared at a phase boundary before the slots drain, so the slot owns
+    those handles (declared before its graphs, so it outlives them) and a replay first checks that every input
+    still stages to the same allocation; a mismatch forgets the slot and runs direct."""
+    problems = []
+    try:
+        slot = region(common, "struct moe_segment_slot {", "};")
+        capture = region(code, "static void moe_segment_slot_capture_staging(", "\n}\n")
+        matches = region(code, "static bool moe_segment_slot_staging_matches(", "\n}\n")
+        lookup = region(code, "static ggml_sycl::mem_handle moe_segment_slot_input_staging(", "\n}\n")
+        compute = region(code, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                         "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
+    except ValueError as error:
+        return [str(error)]
+    staging = slot.find("std::vector<ggml_sycl::mem_handle> input_staging;")
+    graphs = slot.find("std::vector<moe_graph_segment>     segments;")
+    if staging < 0 or graphs < 0 or staging > graphs:
+        problems.append("the slot does not own its inputs' staging handles, declared before (outliving) its graphs")
+    if "ctx->graph_input_stage_lookup(t, ggml_nbytes(t), ctx->device, &staged, nullptr)" not in lookup:
+        problems.append("the staging a slot holds is not the handle the staging map hands out")
+    if "slot.input_staging.push_back(moe_segment_slot_input_staging(" not in capture:
+        problems.append("the capture does not take each input's staging handle")
+    if not re.search(r"rec\.valid\(\) != now\.valid\(\) \|\|\s*\(rec\.valid\(\) && !rec\.stable_identity_equal\(now\)\)",
+                     matches) or "return false;" not in matches:
+        problems.append("the replay check does not compare each input's staging by allocation identity")
+    order = [compute.find(t) for t in ("moe_segment_slot_collect_inputs(cgraph, slot.input_refs);",
+                                       "moe_segment_slot_refresh_inputs(sycl_ctx, cgraph, slot);",
+                                       "moe_segment_slot_capture_staging(sycl_ctx, cgraph, slot);",
+                                       "moe_graph_record_segment_slot(sycl_ctx, cgraph, slot);")]
+    if min(order) < 0 or order != sorted(order):
+        problems.append("the record does not capture the staging after refreshing it and before recording")
+    if not re.search(r"\}\s*else if \(!moe_segment_slot_staging_matches\(sycl_ctx, cgraph, \*slot\)\)\s*\{\s*"
+                     r"GGML_SYCL_DEBUG\([^\n]*\);\s*sycl_ctx->moe_segment_slots\.forget\(slot_key\);\s*"
+                     r"compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);"
+                     r"\s*moe_graph_replay_segment_slot\(", compute):
+        problems.append("a replay does not drop a slot whose inputs stage elsewhere before replaying it")
+    return problems
+
+
+with gate('keyed-slot-input-staging'):
+    problems = check_keyed_slot_input_staging(RUNTIME_CODE, COMMON_CODE)
+    assert not problems, "\n".join(problems)
+    controls = (
+        ("staging declared after the graphs", "common",
+         r"(        std::vector<ggml_sycl::mem_handle> input_staging;\n)([\s\S]*?)(        std::vector<moe_graph_segment>     segments;\n)",
+         r"\2\3\1"),
+        ("capture dropped", "runtime", r"\n\s*moe_segment_slot_capture_staging\(sycl_ctx, cgraph, slot\);", ""),
+        ("capture before the refresh", "runtime",
+         r"(moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, slot\);)(\s*)(moe_segment_slot_capture_staging\(sycl_ctx, cgraph, slot\);)",
+         r"\3\2\1"),
+        ("replay skips the check", "runtime", r"else if \(!moe_segment_slot_staging_matches\(sycl_ctx, cgraph, \*slot\)\)",
+         "else if (false)"),
+        ("mismatch keeps the slot", "runtime", r"\n\s*sycl_ctx->moe_segment_slots\.forget\(slot_key\);", ""),
+        ("check ignores identity", "runtime", r" \|\|\s*\(rec\.valid\(\) && !rec\.stable_identity_equal\(now\)\)", ""),
+        ("capture holds nothing", "runtime", r"slot\.input_staging\.push_back\(moe_segment_slot_input_staging\(",
+         "(void) (moe_segment_slot_input_staging("),
+    )
+    for label, which, pattern, repl in controls:
+        base = RUNTIME_CODE if which == "runtime" else COMMON_CODE
+        assert len(re.findall(pattern, base)) == 1, "control %r anchor (%d)" % (label, len(re.findall(pattern, base)))
+        mutated = re.sub(pattern, repl, base, count=1)
+        args = (mutated, COMMON_CODE) if which == "runtime" else (RUNTIME_CODE, mutated)
+        assert check_keyed_slot_input_staging(*args), "control %r was not caught" % label
+    print("PASS keyed-slot-input-staging-source-gate (%d controls caught)" % len(controls))
+
 with gate('moe-metadata'):
     # Metadata and its derived group registry are built locally and atomically
     # swapped under both writer locks; bad_alloc preserves the old epoch.

@@ -205,6 +205,17 @@ template <typename Payload> class slot_cache {
         warmups_since_replay_ = 0;
     }
 
+    // Retires k's payload and forgets the key, so its next begin() warms it up again. Other keys are untouched.
+    void forget(const key & k) {
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            if (slots_[i].k == k) {
+                retire_payload(slots_[i]);
+                slots_.erase(slots_.begin() + static_cast<std::ptrdiff_t>(i));
+                return;
+            }
+        }
+    }
+
     // Payloads that must be destroyed only after the queue that ran them has drained.
     std::vector<Payload> take_retired() {
         std::vector<Payload> out;

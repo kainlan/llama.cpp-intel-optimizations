@@ -99437,6 +99437,45 @@ static void moe_segment_slot_refresh_inputs(ggml_backend_sycl_context *         
     }
 }
 
+// The staging copy a recorded kernel reads for input t, or an invalid handle when t is read in place.
+static ggml_sycl::mem_handle moe_segment_slot_input_staging(ggml_backend_sycl_context * ctx, const ggml_tensor * t) {
+    ggml_sycl::mem_handle staged{};
+    if (t && t->data) {
+        (void) ctx->graph_input_stage_lookup(t, ggml_nbytes(t), ctx->device, &staged, nullptr);
+    }
+    return staged;
+}
+
+// Taken right before recording: the slot owns the staging copies its graphs bake, so clearing or swapping the
+// staging map cannot free one while a replay may still read it.
+static void moe_segment_slot_capture_staging(ggml_backend_sycl_context *                   ctx,
+                                             const ggml_cgraph *                           cgraph,
+                                             ggml_backend_sycl_context::moe_segment_slot & slot) {
+    slot.input_staging.clear();
+    for (int32_t ref : slot.input_refs) {
+        slot.input_staging.push_back(moe_segment_slot_input_staging(ctx, moe_segment_slot_input(cgraph, ref)));
+    }
+}
+
+// True when every input still stages to the allocation the recording baked. Staging is keyed by the tensor struct,
+// so a rebuilt graph with the same names and storage refreshes a different buffer than the slot's graphs read.
+static bool moe_segment_slot_staging_matches(ggml_backend_sycl_context *                         ctx,
+                                             const ggml_cgraph *                                 cgraph,
+                                             const ggml_backend_sycl_context::moe_segment_slot & slot) {
+    if (slot.input_staging.size() != slot.input_refs.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < slot.input_refs.size(); ++i) {
+        const ggml_sycl::mem_handle now =
+            moe_segment_slot_input_staging(ctx, moe_segment_slot_input(cgraph, slot.input_refs[i]));
+        const ggml_sycl::mem_handle & rec = slot.input_staging[i];
+        if (rec.valid() != now.valid() || (rec.valid() && !rec.stable_identity_equal(now))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Destroys the slots the cache retired (evicted, invalidated or churned) once the queue that ran them has drained.
 // If the drain fails, their graphs may still run, so they are kept alive for the life of the process instead.
 // other_graphs: the caller is about to destroy other graphs this queue ran, so the drain is needed even with no
@@ -110493,6 +110532,12 @@ normal_dispatch:
                         if (!slot) {
                             // The gateway swapped an input's staging buffer and retired every slot after begin().
                             compute_impl_unlocked();
+                        } else if (!moe_segment_slot_staging_matches(sycl_ctx, cgraph, *slot)) {
+                            // An input stages to another buffer than the one the graphs read: drop this slot (the
+                            // drain destroys it) and run direct; the key records again on a later token.
+                            GGML_SYCL_DEBUG("[SYCL-SEG-SLOT] input staging changed under a slot; re-recording\n");
+                            sycl_ctx->moe_segment_slots.forget(slot_key);
+                            compute_impl_unlocked();
                         } else {
                             moe_segment_slot_refresh_inputs(sycl_ctx, cgraph, *slot);
                             moe_graph_replay_segment_slot(sycl_ctx, cgraph, *slot);
@@ -110506,6 +110551,7 @@ normal_dispatch:
                         ggml_backend_sycl_context::moe_segment_slot slot;
                         moe_segment_slot_collect_inputs(cgraph, slot.input_refs);
                         moe_segment_slot_refresh_inputs(sycl_ctx, cgraph, slot);
+                        moe_segment_slot_capture_staging(sycl_ctx, cgraph, slot);
                         try {
                             moe_graph_record_segment_slot(sycl_ctx, cgraph, slot);
                         } catch (...) {

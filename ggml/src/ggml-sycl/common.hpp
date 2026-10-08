@@ -6332,6 +6332,10 @@ struct ggml_backend_sycl_context {
     // the graphs are destroyed only after a queue drain (ggml_sycl_retire_moe_segment_slots).
     struct moe_segment_slot {
         std::vector<ggml_sycl::mem_handle> retained_handles;
+        // Per input_refs entry: the staging copy the recording read (graph_input_staging), or an invalid handle when
+        // the input is read in place. Holding it keeps the buffer alive past a staging clear; a replay checks that
+        // each input still stages to the same allocation, since staging is keyed by tensor struct, not by this key.
+        std::vector<ggml_sycl::mem_handle> input_staging;
         std::vector<moe_graph_segment>     segments;
         std::vector<int>                   boundary_nodes;  // dispatched directly between segments
         std::vector<int32_t>               input_refs;      // graph inputs: leaf i as i, node n src j as -(n*S+j)-1
