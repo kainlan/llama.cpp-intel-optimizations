@@ -454,12 +454,16 @@ with gate('graph-preload-refused'):
     # honors it.
     compute = region(RUNTIME, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
                      "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
-    decided = re.search(r"sycl_ctx->moe_graph_preload_refused\s*=\s*ggml_sycl_moe_graph_preload_decide\(", compute)
+    decided = re.search(r"sycl_ctx->moe_graph_preload_refused\s*=\s*ggml_sycl_moe_graph_preload_decide\([^;]*\)\s*"
+                        r"==\s*ggml_sycl::moe_graph_preload_split_decision::REFUSED;", compute)
     first_compute = re.search(r"\bcompute_impl(?:_unlocked)?\(\);", compute)
     assert decided and first_compute and decided.start() < first_compute.start()
     entry = re.search(r"if \(sycl_ctx->moe_graph_preload_refused\) \{\s*GGML_SYCL_DEBUG\([^;]*\);\s*"
                       r"use_sycl_graph = false;\s*\}", compute)
     assert entry and entry.start() < compute.index("const int descriptor_moe_graph_candidates")
+    # The entry block reads the decision itself: nothing between them overwrites the flag.
+    assert decided.end() < entry.start()
+    assert not re.search(r"moe_graph_preload_refused\s*=(?!=)", compute[decided.end():entry.start()])
     assert re.search(r"!sycl_ctx->moe_direct_dispatch_graphs_disabled\s*&&\s*!sycl_ctx->moe_graph_preload_refused\s*&&"
                      r"\s*node->op\s*==\s*GGML_OP_MUL_MAT_ID", RUNTIME)
     assert re.search(r"sycl_ctx->graphs_disabled\s*\|\|\s*sycl_ctx->moe_graph_preload_refused\s*\|\|\s*"
@@ -467,6 +471,53 @@ with gate('graph-preload-refused'):
     assert re.search(r"if \(sycl_ctx->moe_block_graphs_disabled\s*\|\|[^{};]*\bsycl_ctx->moe_graph_preload_refused\b"
                      r"[^{};]*\)\s*\{", RUNTIME)
     print("PASS graph-preload-refused-split-source-gate")
+
+with gate('graph-preload-stamp-sites'):
+    # A stamped all-host tensor skips the preload before any per-tensor work (host residency, layout selection, the
+    # per-expert route probe); otherwise the skip saves nothing. Only the route-probe refusal is structural, so every
+    # other preload failure goes through the bounded transient retry.
+    impl = region(RUNTIME, "static bool graph_preload_moe_experts_impl(",
+                  "static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx")
+    skip = re.search(r"moe_graph_preload_stamp_skips_tensor\([^;{]*\)\s*\{\s*continue;", impl)
+    assert skip
+    for later in (r"\bbool\s+host_weights\s*=", r"\bggml_sycl_select_moe_planned_graph_layout\(",
+                  r"\bggml_sycl_select_moe_graph_layout\(", r"\bggml_sycl_probe_moe_planned_layout\("):
+        first = re.search(later, impl)
+        assert first and skip.end() < first.start(), later
+    assert RUNTIME_CODE.count("moe_graph_preload_failure::STRUCTURAL") == 1
+    assert re.search(r"cannot be represented as one current-device[^}]*\}\s*"
+                     r"\*failure = ggml_sycl::moe_graph_preload_failure::STRUCTURAL;\s*return false;", impl)
+    assert RUNTIME_CODE.count("moe_graph_preload_stamp_failure(") == 1
+    assert "moe_graph_preload_outcome::REFUSED" not in RUNTIME_CODE
+    wrapper = region(RUNTIME, "static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx",
+                     "\n}\n")
+    assert re.search(r"moe_graph_preload_failure\s+failure\s*=\s*ggml_sycl::moe_graph_preload_failure::TRANSIENT;",
+                     wrapper)
+    assert "moe_graph_preload_stamp_failure(" in wrapper
+
+    # Post-prompt work: each split claims its own slot before the helpers it gates, and only a prompt split
+    # advances the epoch those claims compare against.
+    compute = region(RUNTIME, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                     "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
+    prepare = re.search(r"const bool post_prompt_prepare_due =\s*cached_is_decode && "
+                        r"ggml_sycl_moe_post_prompt_claim\(cgraph, sycl_ctx->device, /\*refresh=\*/false\);", compute)
+    assert prepare
+    for helper in ("ggml_sycl_materialize_prompt_down_i8_before_decode(",
+                   "ggml_sycl_release_prompt_down_soa_before_decode("):
+        assert compute.count(helper) == 1, helper
+        assert "if (post_prompt_prepare_due && " + helper in compute, helper
+        assert prepare.end() < compute.index(helper), helper
+    refresh_claim = re.search(r"const bool post_prompt_refresh_due =\s*cached_is_decode && "
+                              r"ggml_sycl_moe_post_prompt_claim\(cgraph, sycl_ctx->device, /\*refresh=\*/true\);",
+                              compute)
+    hotset = "if (post_prompt_refresh_due && ggml_sycl_materialize_moe_down_i8_hotset("
+    assert refresh_claim and compute.count("ggml_sycl_materialize_moe_down_i8_hotset(") == 1 and hotset in compute
+    assert refresh_claim.end() < compute.index(hotset)
+    assert RUNTIME_CODE.count("g_moe_prompt_epoch.fetch_add(") == 1
+    assert re.search(r"if \(!cached_is_decode\) \{\s*g_moe_post_pp_preload_pending\.store\(true, "
+                     r"std::memory_order_release\);\s*g_moe_prompt_epoch\.fetch_add\(1, std::memory_order_acq_rel\);",
+                     compute)
+    print("PASS graph-preload-stamp-sites-source-gate")
 
 with gate('moe-metadata'):
     # Metadata and its derived group registry are built locally and atomically

@@ -46,8 +46,12 @@ namespace ggml_sycl {
 enum class moe_graph_preload_outcome {
     PREPARED,            // one device pointer table represents it; the preload prepared it
     HOST_TIER_BOUNDARY,  // every expert is host-planned: a direct CPU node, nothing to prepare
-    REFUSED,             // mixed or missing experts: no single table represents it
+    REFUSED,             // mixed or missing experts, or transient failures that never cleared: graphs stay off
+    RETRYING,            // transient failures under these inputs, below the cap: undecided, the preload runs again
 };
+
+// Consecutive transient failures under unchanged inputs before the tensor settles as REFUSED.
+constexpr uint32_t moe_graph_preload_transient_retry_cap = 8;
 
 struct moe_graph_preload_stamp {
     uint64_t                  replan_epoch       = 0;
@@ -57,6 +61,7 @@ struct moe_graph_preload_stamp {
     bool                      host_tier_boundary = false;
     bool                      valid              = false;
     moe_graph_preload_outcome outcome            = moe_graph_preload_outcome::PREPARED;
+    uint32_t                  transient_failures = 0;  // consecutive, under these inputs
 };
 
 struct moe_graph_preload_inputs {
@@ -82,6 +87,7 @@ inline void moe_graph_preload_stamp_record(moe_graph_preload_stamp &        s,
     s.host_tier_boundary = in.host_tier_boundary;
     s.valid              = true;
     s.outcome            = outcome;
+    s.transient_failures = 0;
 }
 
 // The preload checks this first for every tensor, before any layout selection or route probe: a tensor already
@@ -91,21 +97,38 @@ inline bool moe_graph_preload_stamp_skips_tensor(const moe_graph_preload_stamp &
     return moe_graph_preload_stamp_current(s, in) && s.outcome == moe_graph_preload_outcome::HOST_TIER_BOUNDARY;
 }
 
-// Why a preload stopped. Only a STRUCTURAL failure (the route probe found mixed or missing experts) is a fact about
-// residency, so only it is stamped: the stamp lives on the weight and is shared by every context using it. A
-// TRANSIENT failure (ids readback, a staging allocation, a pointer-table update, invalid geometry, a disabled
-// preload mode) refuses the current call only and leaves the stamp as it was.
+// Why a preload stopped. A STRUCTURAL failure (the route probe found mixed or missing experts) is a fact about
+// residency and is stamped REFUSED at once. A TRANSIENT failure (ids readback, a staging allocation, a pointer-table
+// update, invalid geometry, a disabled preload mode) refuses the current call only and is counted: the stamp lives
+// on the weight and is shared by every context using it, so one passing failure must not refuse graphs for all of
+// them. Only moe_graph_preload_transient_retry_cap consecutive failures under unchanged inputs settle the tensor as
+// REFUSED, which bounds the per-call error logs; a success or an input change (replan, storage change) starts the
+// count again. Below the cap the stamp keeps the verdict it had (an unstamped tensor reads RETRYING, undecided).
 enum class moe_graph_preload_failure {
     STRUCTURAL,
     TRANSIENT,
 };
 
-inline void moe_graph_preload_stamp_failure(moe_graph_preload_stamp &        s,
+// Returns true when this failure is the one that settled the tensor as REFUSED after transient retries, so the
+// caller can log that once.
+inline bool moe_graph_preload_stamp_failure(moe_graph_preload_stamp &        s,
                                             const moe_graph_preload_inputs & in,
                                             moe_graph_preload_failure        failure) {
     if (failure == moe_graph_preload_failure::STRUCTURAL) {
         moe_graph_preload_stamp_record(s, in, moe_graph_preload_outcome::REFUSED);
+        return false;
     }
+    if (!moe_graph_preload_stamp_current(s, in)) {
+        moe_graph_preload_stamp_record(s, in, moe_graph_preload_outcome::RETRYING);
+    }
+    if (s.outcome == moe_graph_preload_outcome::REFUSED) {
+        return false;
+    }
+    if (++s.transient_failures < moe_graph_preload_transient_retry_cap) {
+        return false;
+    }
+    s.outcome = moe_graph_preload_outcome::REFUSED;
+    return true;
 }
 
 // What a split's stamps say about running the preload for it.
@@ -131,7 +154,7 @@ inline void moe_graph_preload_split_add(moe_graph_preload_split_scan &   scan,
     }
     if (stamp.outcome == moe_graph_preload_outcome::REFUSED) {
         scan.refused = true;
-    } else {
+    } else if (stamp.outcome != moe_graph_preload_outcome::RETRYING) {
         scan.n_ok++;
     }
 }

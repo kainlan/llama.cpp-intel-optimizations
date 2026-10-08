@@ -31698,8 +31698,12 @@ static bool moe_graphlet_probe_enabled() {
 }
 
 static bool moe_graphlet_replay_probe_enabled() {
-    const char * env = std::getenv("GGML_SYCL_MOE_GRAPHLET_REPLAY_PROBE");
-    return env && std::atoi(env) != 0;
+    // Read once: graph_compute asks on every decode call.
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_GRAPHLET_REPLAY_PROBE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
 }
 
 static bool moe_first_arrival_graphlet_enabled() {
@@ -61959,12 +61963,14 @@ static ggml_sycl::moe_graph_preload_split_decision ggml_sycl_moe_graph_preload_d
 // Prepare MoE pointer tables before graph recording/execution
 // This updates per-id cached layouts without full preload.
 // host_tier_boundary: the caller keeps MUL_MAT_ID nodes out of recorded graphs (segmented decode), so a tensor whose
-// experts are all host-planned is skipped rather than refused. *refused_node is set only by a structural refusal
-// (mixed or missing experts); any other false return is transient.
-static bool graph_preload_moe_experts_impl(ggml_backend_sycl_context & ctx,
-                                           ggml_cgraph *               cgraph,
-                                           bool                        host_tier_boundary,
-                                           const ggml_tensor **        refused_node) {
+// experts are all host-planned is skipped rather than refused. On a false return *failed_node is the MUL_MAT_ID that
+// failed; *failure is set to STRUCTURAL only by the route-probe refusal (mixed or missing experts) and otherwise keeps
+// the caller's TRANSIENT.
+static bool graph_preload_moe_experts_impl(ggml_backend_sycl_context &            ctx,
+                                           ggml_cgraph *                          cgraph,
+                                           bool                                   host_tier_boundary,
+                                           const ggml_tensor **                   failed_node,
+                                           ggml_sycl::moe_graph_preload_failure * failure) {
     // Unified cache handles expert layouts; prep pointer tables per graph invocation.
     // Placement-plan model load already materializes MoE experts in VRAM or host-pinned
     // memory. Graph preload still refreshes pointer tables and retains the smart
@@ -62011,6 +62017,7 @@ static bool graph_preload_moe_experts_impl(ggml_backend_sycl_context & ctx,
                 continue;
             }
         }
+        *failed_node = node;
 
         bool          host_weights   = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
         const int64_t n_ids    = ids->ne[0];
@@ -62089,7 +62096,7 @@ static bool graph_preload_moe_experts_impl(ggml_backend_sycl_context & ctx,
             const int layer_id = ggml_sycl_tp_extract_layer_number(src0->name);
             GGML_LOG_WARN(
                 "[GRAPH-PRELOAD] Blind preload disabled for layer %d (%lld experts) and routing prestage "
-                "is off; disabling graphs for this run\n",
+                "is off; this split runs direct\n",
                 layer_id, (long long) n_experts);
             return false;
         }
@@ -62186,7 +62193,7 @@ static bool graph_preload_moe_experts_impl(ggml_backend_sycl_context & ctx,
                         src0->name ? src0->name : "(unknown)", ggml_sycl_layout_mode_name(layout), probe.local,
                         probe.secondary, probe.host, probe.missing);
                 }
-                *refused_node = node;
+                *failure = ggml_sycl::moe_graph_preload_failure::STRUCTURAL;
                 return false;
             }
         }
@@ -62300,27 +62307,24 @@ static bool graph_preload_moe_experts_impl(ggml_backend_sycl_context & ctx,
     return true;
 }
 
-// Runs the preload. A structural refusal is stamped on the tensor, so the same residency state is not re-decided; a
-// transient failure refuses this call only and leaves the stamp alone (moe_graph_preload_failure).
+// Runs the preload and stamps a failure on the tensor that failed (moe_graph_preload_failure): a structural refusal
+// settles it at once; a transient failure refuses this call only, and only a bounded run of them under unchanged
+// inputs settles it, which also bounds the per-site error logs above.
 static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, bool host_tier_boundary) {
-    const ggml_tensor * refused_node = nullptr;
-    if (graph_preload_moe_experts_impl(ctx, cgraph, host_tier_boundary, &refused_node)) {
+    const ggml_tensor *                  failed_node = nullptr;
+    ggml_sycl::moe_graph_preload_failure failure     = ggml_sycl::moe_graph_preload_failure::TRANSIENT;
+    if (graph_preload_moe_experts_impl(ctx, cgraph, host_tier_boundary, &failed_node, &failure)) {
         return true;
     }
-    if (refused_node) {
-        ggml_sycl::moe_graph_preload_stamp * stamp = ggml_sycl_moe_graph_preload_stamp_of(refused_node, ctx.device);
-        if (stamp) {
-            ggml_sycl::moe_graph_preload_stamp_failure(
-                *stamp, ggml_sycl_moe_graph_preload_inputs_of(refused_node, ctx.device, host_tier_boundary),
-                ggml_sycl::moe_graph_preload_failure::STRUCTURAL);
-        }
-    } else {
-        static std::atomic<int> transient_log{ 0 };
-        if (transient_log.fetch_add(1, std::memory_order_relaxed) < 8) {
-            GGML_LOG_INFO(
-                "[GRAPH-PRELOAD] MoE preload failed for a transient reason (see the error above); this call runs "
-                "direct and the next one retries\n");
-        }
+    ggml_sycl::moe_graph_preload_stamp * stamp =
+        failed_node ? ggml_sycl_moe_graph_preload_stamp_of(failed_node, ctx.device) : nullptr;
+    if (stamp &&
+        ggml_sycl::moe_graph_preload_stamp_failure(
+            *stamp, ggml_sycl_moe_graph_preload_inputs_of(failed_node, ctx.device, host_tier_boundary), failure)) {
+        GGML_LOG_INFO(
+            "[GRAPH-PRELOAD] MoE preload of %s failed %u times in a row under unchanged expert residency; this split "
+            "runs direct until that residency changes\n",
+            failed_node->src[0]->name, ggml_sycl::moe_graph_preload_transient_retry_cap);
     }
     return false;
 }

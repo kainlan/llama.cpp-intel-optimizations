@@ -184,12 +184,46 @@ int test_failure_stamping() {
     const moe_graph_preload_inputs in = decode_inputs(9);
     {
         moe_graph_preload_stamp s;
-        moe_graph_preload_stamp_failure(s, in, moe_graph_preload_failure::TRANSIENT);
-        CHECK(!s.valid, "a transient failure leaves an unstamped tensor unstamped");
+        CHECK(!moe_graph_preload_stamp_failure(s, in, moe_graph_preload_failure::TRANSIENT),
+              "one transient failure does not settle the tensor");
+        moe_graph_preload_split_scan scan;
+        moe_graph_preload_split_add(scan, s, in);
+        CHECK(moe_graph_preload_split_decide(scan) == moe_graph_preload_split_decision::RUN,
+              "after a transient failure the split stays undecided and runs the preload again");
         moe_graph_preload_stamp_record(s, in, moe_graph_preload_outcome::PREPARED);
         moe_graph_preload_stamp_failure(s, in, moe_graph_preload_failure::TRANSIENT);
         CHECK(s.valid && s.outcome == moe_graph_preload_outcome::PREPARED,
-              "a transient failure does not overwrite the residency verdict");
+              "a transient failure below the cap does not overwrite the residency verdict");
+    }
+    {
+        // Consecutive transient failures under unchanged inputs settle as REFUSED, reported once.
+        moe_graph_preload_stamp s;
+        const uint32_t          cap     = ggml_sycl::moe_graph_preload_transient_retry_cap;
+        int                     settled = 0;
+        for (uint32_t i = 0; i < cap; ++i) {
+            settled += moe_graph_preload_stamp_failure(s, in, moe_graph_preload_failure::TRANSIENT) ? 1 : 0;
+            if (i + 1 < cap) {
+                CHECK(s.outcome != moe_graph_preload_outcome::REFUSED, "below the cap the tensor is not refused");
+            }
+        }
+        CHECK(settled == 1 && moe_graph_preload_stamp_current(s, in) && s.outcome == moe_graph_preload_outcome::REFUSED,
+              "the cap-th consecutive transient failure settles the tensor as REFUSED, exactly once");
+        moe_graph_preload_inputs bumped = in;
+        bumped.storage_generation++;
+        CHECK(!moe_graph_preload_stamp_failure(s, bumped, moe_graph_preload_failure::TRANSIENT) &&
+                  s.outcome != moe_graph_preload_outcome::REFUSED,
+              "a storage change resets the transient count and re-opens the tensor");
+    }
+    {
+        moe_graph_preload_stamp s;
+        const uint32_t          cap = ggml_sycl::moe_graph_preload_transient_retry_cap;
+        for (uint32_t i = 0; i + 1 < cap; ++i) {
+            moe_graph_preload_stamp_failure(s, in, moe_graph_preload_failure::TRANSIENT);
+        }
+        moe_graph_preload_stamp_record(s, in, moe_graph_preload_outcome::PREPARED);
+        CHECK(!moe_graph_preload_stamp_failure(s, in, moe_graph_preload_failure::TRANSIENT) &&
+                  s.outcome == moe_graph_preload_outcome::PREPARED,
+              "a success in between resets the transient count");
     }
     {
         moe_graph_preload_stamp s;
