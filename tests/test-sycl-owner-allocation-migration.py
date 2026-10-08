@@ -1008,10 +1008,14 @@ def check_segment_graphs_drained(code: str, common: str) -> list:
     """llama.cpp-7pm2 B2 lifetime rule: no segment exec graph is destroyed while a replay may still run it. Retired
     keyed slots are destroyed only after a queue wait, and invalidate_moe_segments destroys the one-slot segment and
     MoE dispatch graphs only after the same wait succeeded (the epoch retire waits only where retention terminals
-    exist)."""
+    exist). A slot a failed drain could not prove idle is kept for the life of the process: the retired ones, and a
+    slot whose recording threw. A failed per-call drain runs that call direct."""
     problems = []
     try:
         drain = region(code, "static bool moe_segment_slots_drain_retired(", "\n}\n")
+        keep = region(code, "static void moe_segment_slot_keep_alive(", "\n}\n")
+        compute = region(code, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                         "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
         retire = region(code, "bool ggml_sycl_retire_moe_segment_slots(ggml_backend_sycl_context * ctx) noexcept {",
                         "\n}\n")
         invalidate = region(common, "bool invalidate_moe_segments() {", "\n    }\n")
@@ -1024,9 +1028,21 @@ def check_segment_graphs_drained(code: str, common: str) -> list:
     skip = re.search(r"if \(!any_graph\)\s*\{\s*return true;", drain)
     if wait < 0 or not gate or not skip or not (gate.start() < skip.start() < wait):
         problems.append("the drain does not wait whenever a retired slot or the caller has a graph")
-    if not re.search(r"catch \(const std::exception & exc\)[\s\S]*kept->push_back\(std::move\(slot\)\);[\s\S]*"
-                     r"return false;", drain[wait:] if wait >= 0 else ""):
+    if not re.search(r"static auto \* kept = new std::vector<ggml_backend_sycl_context::moe_segment_slot>\(\);\s*"
+                     r"kept->push_back\(std::move\(slot\)\);", keep):
+        problems.append("the keep-alive does not hold its slots for the life of the process")
+    if not re.search(r"catch \(const std::exception & exc\)[\s\S]*for \(auto & slot : retired\)\s*\{\s*"
+                     r"moe_segment_slot_keep_alive\(std::move\(slot\)\);\s*\}\s*return false;", drain[wait:] if wait >= 0 else ""):
         problems.append("a failed drain destroys the retired slots instead of keeping them")
+    if not re.search(r"\}\s*catch \(\.\.\.\)\s*\{\s*bool drained = true;\s*try\s*\{\s*ggml_sycl_trace_queue_wait\("
+                     r"sycl_ctx->stream\(\), \"segment-slot-record-failed\"[^;]*;\s*\}\s*catch \(\.\.\.\)\s*\{\s*"
+                     r"drained = false;\s*\}\s*sycl_ctx->moe_segment_slots\.record_failed\(slot_key\);\s*"
+                     r"if \(!drained\)\s*\{[^{}]*?sycl_ctx->moe_graphs_disabled = true;\s*"
+                     r"moe_segment_slot_keep_alive\(std::move\(slot\)\);\s*\}\s*throw;", compute):
+        problems.append("a recording that throws destroys its slot's graphs after a failed drain")
+    if not re.search(r"if \(!moe_segment_slots_drain_retired\(sycl_ctx\)\)\s*\{\s*sycl_ctx->moe_graphs_disabled = true;\s*"
+                     r"compute_impl_unlocked\(\);\s*\}\s*else if \(slot_action == gsc::action::WARMUP\)", compute):
+        problems.append("a call whose drain failed still records or replays a slot")
     if not (re.search(r"legacy_graphs = !ctx->moe_dispatch_graphs\.empty\(\);", retire) and
             re.search(r"legacy_graphs = legacy_graphs \|\| seg\.exec_graph != nullptr;", retire) and
             "return moe_segment_slots_drain_retired(ctx, legacy_graphs);" in retire):
@@ -1051,7 +1067,15 @@ with gate('segment-graphs-destroyed-after-drain'):
          "moe_segment_slots_drain_retired(ctx, false)"),
         ("retire ignores segment graphs", "runtime", r"legacy_graphs = legacy_graphs \|\| seg\.exec_graph != nullptr;",
          "(void) seg;"),
-        ("failed drain destroys the slots", "runtime", r"kept->push_back\(std::move\(slot\)\);", "(void) slot;"),
+        ("keep-alive frees its slots", "runtime", r"kept->push_back\(std::move\(slot\)\);", "(void) slot;"),
+        ("failed drain destroys the slots", "runtime",
+         r"(for \(auto & slot : retired\)\s*\{)\s*moe_segment_slot_keep_alive\(std::move\(slot\)\);", r"\1 (void) slot;"),
+        ("record catch destroys the slot after a failed drain", "runtime",
+         r"(moe_graphs_disabled = true;)\s*moe_segment_slot_keep_alive\(std::move\(slot\)\);", r"\1"),
+        ("record catch never sees the failed drain", "runtime", r"drained = false;", "(void) 0;"),
+        ("failed per-call drain still records", "runtime",
+         r"(moe_graphs_disabled = true;)\s*compute_impl_unlocked\(\);\s*\}\s*else (if \(slot_action == gsc::action::WARMUP\))",
+         r"\1 }\n \2"),
         ("clear before the drain", "common",
          r"(if \(!ggml_sycl_retire_moe_segment_slots\(this\)\))", r"moe_segments.clear();\n        \1"),
         ("clear after a failed drain", "common",

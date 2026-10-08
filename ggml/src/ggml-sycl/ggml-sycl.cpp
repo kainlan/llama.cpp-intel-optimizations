@@ -99488,6 +99488,13 @@ static bool moe_segment_slot_staging_matches(ggml_backend_sycl_context *        
     return true;
 }
 
+// A slot whose graphs a failed drain could not prove idle may still be running them, so its graphs and the handles
+// they read are kept for the life of the process: never destroyed, never reused.
+static void moe_segment_slot_keep_alive(ggml_backend_sycl_context::moe_segment_slot && slot) {
+    static auto * kept = new std::vector<ggml_backend_sycl_context::moe_segment_slot>();
+    kept->push_back(std::move(slot));
+}
+
 // Destroys the slots the cache retired (evicted, invalidated or churned) once the queue that ran them has drained.
 // If the drain fails, their graphs may still run, so they are kept alive for the life of the process instead.
 // other_graphs: the caller is about to destroy other graphs this queue ran, so the drain is needed even with no
@@ -99509,9 +99516,8 @@ static bool moe_segment_slots_drain_retired(ggml_backend_sycl_context * ctx, boo
     } catch (const std::exception & exc) {
         GGML_LOG_ERROR("[SYCL-SEG-SLOT] retire drain failed on device %d: %s; keeping %zu slot(s) alive\n", ctx->device,
                        exc.what(), retired.size());
-        static auto * kept = new std::vector<ggml_backend_sycl_context::moe_segment_slot>();
         for (auto & slot : retired) {
-            kept->push_back(std::move(slot));
+            moe_segment_slot_keep_alive(std::move(slot));
         }
         return false;
     }
@@ -110525,9 +110531,11 @@ normal_dispatch:
                     moe_segment_slots_report(sycl_ctx);
                     // Slots the cache evicted or churned are destroyed only after the queue drains.
                     if (!moe_segment_slots_drain_retired(sycl_ctx)) {
+                        // The queue did not drain, so a retired graph may still run: record and replay nothing
+                        // from here on, this call included.
                         sycl_ctx->moe_graphs_disabled = true;
-                    }
-                    if (slot_action == gsc::action::WARMUP) {
+                        compute_impl_unlocked();
+                    } else if (slot_action == gsc::action::WARMUP) {
                         // B4: a split with no run worth a graph stays direct for good, decided once per key.
                         if (!moe_graph_keyed_plan_profitable(cgraph)) {
                             sycl_ctx->moe_segment_slots.record_failed(slot_key);
@@ -110568,12 +110576,22 @@ normal_dispatch:
                             moe_graph_record_segment_slot(sycl_ctx, cgraph, slot);
                         } catch (...) {
                             // Segments already submitted may still run: drain before the slot's graphs and handles go.
+                            // If the drain fails, they may still be running, so the slot is kept alive instead.
+                            bool drained = true;
                             try {
                                 ggml_sycl_trace_queue_wait(sycl_ctx->stream(), "segment-slot-record-failed",
                                                            sycl_ctx->device, -1, nullptr);
                             } catch (...) {
+                                drained = false;
                             }
                             sycl_ctx->moe_segment_slots.record_failed(slot_key);
+                            if (!drained) {
+                                GGML_LOG_ERROR("[SYCL-SEG-SLOT] record-failure drain failed on device %d; keeping "
+                                               "the slot's %d graph(s) alive\n",
+                                               sycl_ctx->device, slot.graphed_segments);
+                                sycl_ctx->moe_graphs_disabled = true;
+                                moe_segment_slot_keep_alive(std::move(slot));
+                            }
                             throw;
                         }
                         graph_executed = true;
