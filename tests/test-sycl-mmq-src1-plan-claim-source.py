@@ -14,7 +14,8 @@ The fix this gate pins: the runtime-context transaction, on its publish path, cl
 right after the plan is committed and before the hold is recomputed, so it holds its planned bytes before any graph
 and an op within n_ubatch never grows it. The claim goes through the same unified-cache allocator as every other
 planned RUNTIME scratch (RUNTIME zone, spill forbidden). A claim that cannot be met is reported, not repaired: the
-hold still keeps the bytes off spill-capable allocations and the graph-entry walk still refuses by name.
+hold still keeps the bytes off spill-capable allocations, a node the graph-entry walk counts is refused before
+submission, and a node it does not count still meets the 479i plan-breach abort.
 
 It also pins the accounting the ticket suspected was missing and is not: the RUNTIME zone requirement folds in both
 dense plans, and the ring re-plan is admitted against the zone's free bytes less the dense plans (pending demand).
@@ -116,11 +117,12 @@ def claim_transaction_claims_after_commit_before_hold(sycl: str) -> bool:
     if min(ring, commit, claim) < 0:
         return False
     hold = txn.find("ggml_sycl_planned_scratch_hold_refresh(*ctx);", claim)
-    # The call sits at the commit's own statement level: nothing between the two may open a block or a condition,
-    # or the claim could be made conditional (on probe_mode, say) while still following the commit in the text.
+    # The call is the statement right after the commit: once comments are stripped nothing at all stands between
+    # them, so no block, condition, loop or preprocessor guard (`#if 0`) can make the claim conditional while it still
+    # follows the commit in the text.
     between = txn[commit + len("dense_guard.commit();"):claim]
     # Exactly one claim, on the publish path only (after the commit, which a probe never reaches).
-    return (ring < commit < claim < hold and "{" not in between and "if (" not in between
+    return (ring < commit < claim < hold and between.strip() == ""
             and txn.count("ggml_sycl_mmq_src1_claim_plan(") == 1)
 
 
@@ -136,7 +138,7 @@ def claim_helper_claims_the_whole_plan(sycl: str) -> bool:
         return False
     planned, dev = m.group(1), m.group(2)
     skip = f"if ({planned} == 0 || ctx.mmvq_q8_activation_cache.capacity({dev}) >= {planned}) {{ return; }}"
-    ensure = f"ctx.mmvq_q8_activation_cache.ensure_buffer({planned}, {dev}, *ctx.stream({dev}, 0))"
+    ensure = f"if (ctx.mmvq_q8_activation_cache.ensure_buffer({planned}, {dev}, *ctx.stream({dev}, 0)) != nullptr)"
     read_at = m.start()
     skip_at = helper.find(skip, m.end())
     ensure_at = helper.find(ensure, skip_at + len(skip)) if skip_at >= 0 else -1
@@ -146,8 +148,12 @@ def claim_helper_claims_the_whole_plan(sycl: str) -> bool:
     # one allowed before the claim, so no early exit can stand before the read or between the skip and the claim.
     before_read = helper[:read_at]
     skip_to_claim = helper[skip_at + len(skip):ensure_at]
+    # A claim that fails is reported, never fatal: no abort or assert form anywhere in the helper's CODE (string
+    # literals are blanked first, since the WARN's own text names the abort a later op can still meet).
+    code = re.sub(r"\"(?:\\.|[^\"\\])*\"", '""', helper)
+    fatal = ("GGML_ABORT", "GGML_ASSERT(", "abort(")
     return ("return" not in before_read and "return" not in skip_to_claim and "GGML_LOG_WARN(" in helper
-            and "GGML_ABORT" not in helper and "malloc" not in helper)
+            and not any(f in code for f in fatal) and "malloc" not in code)
 
 
 def claim_runtime_scratch_stays_in_the_runtime_zone(common: str) -> bool:
@@ -270,10 +276,36 @@ def test_mutant_claim_sized_by_an_op_not_the_plan_fails():
     assert not claim_helper_claims_the_whole_plan(_once(SYCL, m.group(0), "ensure_buffer(required_bytes,"))
 
 
+_WARN_ANCHOR = "    GGML_LOG_WARN(\n        \"[MMQ-SRC1] device %d: the planned Q8_1 src1 buffer"
+
+
 def test_mutant_claim_that_aborts_fails():
+    # The WARN stays: only the abort check can fail this mutant.
     assert not claim_helper_claims_the_whole_plan(
-        _once(SYCL, "GGML_LOG_WARN(\n        \"[MMQ-SRC1] device %d: the planned Q8_1 src1 buffer",
-              "GGML_ABORT(\n        \"[MMQ-SRC1] device %d: the planned Q8_1 src1 buffer"))
+        _once(SYCL, _WARN_ANCHOR, "    GGML_ABORT(\"claim failed\");\n" + _WARN_ANCHOR))
+
+
+def test_mutant_claim_that_asserts_fails():
+    assert not claim_helper_claims_the_whole_plan(
+        _once(SYCL, _WARN_ANCHOR, "    GGML_ASSERT(false && \"claim failed\");\n" + _WARN_ANCHOR))
+
+
+def test_mutant_claim_short_circuited_fails():
+    assert not claim_helper_claims_the_whole_plan(
+        _once(SYCL, "if (ctx.mmvq_q8_activation_cache.ensure_buffer(planned,",
+              "if (false && ctx.mmvq_q8_activation_cache.ensure_buffer(planned,"))
+
+
+def test_mutant_claim_under_if_0_fails():
+    assert not claim_transaction_claims_after_commit_before_hold(
+        _once(SYCL, "    ggml_sycl_mmq_src1_claim_plan(*ctx);\n",
+              "#if 0\n    ggml_sycl_mmq_src1_claim_plan(*ctx);\n#endif\n"))
+
+
+def test_mutant_claim_under_while_false_fails():
+    assert not claim_transaction_claims_after_commit_before_hold(
+        _once(SYCL, "    ggml_sycl_mmq_src1_claim_plan(*ctx);\n",
+              "    while (false) ggml_sycl_mmq_src1_claim_plan(*ctx);\n"))
 
 
 def test_mutant_runtime_scratch_spill_allowed_fails():
