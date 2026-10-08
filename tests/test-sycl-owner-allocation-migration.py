@@ -566,6 +566,43 @@ with gate('decode-env-reads-once'):
                      r"sycl_ctx->moe_aggregation_last_reject\s*=\s*\"disabled\";\s*\}", direct)
     print("PASS decode-env-reads-once-source-gate")
 
+with gate('futile-context-direct'):
+    # Once replay is futile for a context (sticky: nothing resets exec_graph_replay_futile), every later call takes the
+    # GGML_SYCL_DISABLE_GRAPH=1 path, decided before any of the per-call graph-policy scans run.
+    compute = region(RUNTIME_CODE, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                     "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
+    futile = re.search(r"\}\s*else if \(sycl_ctx->exec_graph_replay_futile\)\s*\{\s*use_sycl_graph\s*=\s*false;\s*\}"
+                       r"\s*else if \(sycl_ctx->exec_graph\)\s*\{", compute)
+    assert futile
+    graph_branch = compute.index("    if (use_sycl_graph) {\n")
+    scans = ("check_graph_compatibility(*sycl_ctx, cgraph)", "ggml_sycl_graph_has_host_inputs(cgraph)",
+             "ggml_sycl_graph_has_op(cgraph, GGML_OP_FLASH_ATTN_EXT)",
+             "moe_graph_descriptor_moe_dispatch_candidate_count(sycl_ctx, cgraph)",
+             "moe_decode_segmented_graph_profitable(cgraph)", "moe_decode_segmented_graph_analyze(cgraph)")
+    for scan in scans:
+        assert futile.end() < compute.index(scan) < graph_branch, scan
+    assert futile.end() < compute.index("ggml_sycl_graph_signature(cgraph)", graph_branch)
+    assert futile.end() < compute.index("sycl_exec_graph_make_key(", graph_branch)
+    # Every scan between the decision and the graph branch is skipped for a futile context: either it needs
+    # use_sycl_graph, or it is guarded on the flag itself.
+    policy = compute[futile.end():graph_branch]
+    assert "use_sycl_graph && cached_is_decode && ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph)" in policy
+    assert re.search(r"decode_has_flash_attn_ext\s*=\s*cached_is_decode && !sycl_ctx->exec_graph_replay_futile &&\s*"
+                     r"ggml_sycl_graph_has_op\(cgraph, GGML_OP_FLASH_ATTN_EXT\)", policy)
+    assert re.search(r"moe_graphlet_replay_probe\s*=\s*cached_is_decode && !sycl_ctx->exec_graph_replay_futile &&\s*"
+                     r"moe_graphlet_replay_probe_enabled\(\)", policy)
+    assert re.search(r"\(use_sycl_graph && cached_is_decode && !moe_graphlet_replay_probe\)\s*\?\s*"
+                     r"moe_graph_descriptor_moe_dispatch_candidate_count\(sycl_ctx, cgraph\)", policy)
+    for m in re.finditer(r"moe_decode_segmented_graph_(?:profitable|analyze)\(cgraph\)", policy):
+        guard = policy[policy.rindex("if (", 0, m.start()):m.start()]
+        assert guard.startswith("if (use_sycl_graph && "), guard
+    # The decode no-graph diagnostic names the futility gate once, ahead of the branch that rescans for other reasons.
+    reason = policy.index("if (!use_sycl_graph && cached_is_decode && sycl_ctx->exec_graph_replay_futile) {")
+    rest = policy.index("} else if (!use_sycl_graph && cached_is_decode) {", reason)
+    assert "replay futility gate tripped for this context" in policy[reason:rest]
+    assert "ggml_sycl_graph_has_host_inputs" not in policy[reason:rest]
+    print("PASS futile-context-direct-source-gate")
+
 with gate('moe-metadata'):
     # Metadata and its derived group registry are built locally and atomically
     # swapped under both writer locks; bad_alloc preserves the old epoch.

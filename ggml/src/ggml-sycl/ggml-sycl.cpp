@@ -108908,6 +108908,11 @@ normal_dispatch:
         // Prefix mode: graph execution of partial graphs is broken.
         // Use compute_impl for both prefix and suffix.
         use_sycl_graph = false;
+    } else if (sycl_ctx->exec_graph_replay_futile) {
+        // Replay was proven futile for this context, and nothing clears that. Every later call takes the
+        // GGML_SYCL_DISABLE_GRAPH=1 path, decided here so it skips the graph-policy scans below as well
+        // (fragmented graphs run many small splits per token, and each one paid them).
+        use_sycl_graph = false;
     } else if (sycl_ctx->exec_graph) {
         use_sycl_graph = !g_ggml_sycl_disable_graph && !g_sycl_graph_multithreaded.load(std::memory_order_relaxed) &&
                          !sycl_ctx->graphs_disabled && !(g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1);
@@ -108932,7 +108937,9 @@ normal_dispatch:
         }
     }
 
-    const bool decode_has_flash_attn_ext = cached_is_decode && ggml_sycl_graph_has_op(cgraph, GGML_OP_FLASH_ATTN_EXT);
+    // A futile context never records, so neither this scan nor the replay probe below has anything to decide there.
+    const bool decode_has_flash_attn_ext = cached_is_decode && !sycl_ctx->exec_graph_replay_futile &&
+                                           ggml_sycl_graph_has_op(cgraph, GGML_OP_FLASH_ATTN_EXT);
     if (use_sycl_graph && decode_has_flash_attn_ext) {
         // llama.cpp-dyi3/86a7: default-engage the graph for FA, but ONLY
         // when every decode-shape FA dispatch this context has observed
@@ -109048,7 +109055,8 @@ normal_dispatch:
     // instead of disabling graphs entirely.  The moe_graphs_disabled_once flag
     // is still set by MoE paths but no longer disables graphs — it signals
     // that selective re-record mode is needed.
-    bool moe_graphlet_replay_probe = cached_is_decode && moe_graphlet_replay_probe_enabled();
+    bool moe_graphlet_replay_probe =
+        cached_is_decode && !sycl_ctx->exec_graph_replay_futile && moe_graphlet_replay_probe_enabled();
     if (moe_graphlet_replay_probe && decode_has_flash_attn_ext && !ggml_sycl_flash_attn_graph_allow_enabled()) {
         static std::atomic<bool> logged{ false };
         if (!logged.exchange(true, std::memory_order_acq_rel)) {
@@ -109234,7 +109242,13 @@ normal_dispatch:
 
     // ---- Diagnostic: log once why use_sycl_graph is disabled during TG ----
     // This block runs after all overrides so it sees the final use_sycl_graph value.
-    if (!use_sycl_graph && cached_is_decode) {
+    if (!use_sycl_graph && cached_is_decode && sycl_ctx->exec_graph_replay_futile) {
+        // The one reason that holds for the rest of the context; the checks below would only rescan the graph.
+        static std::atomic<bool> diag_futile_logged{ false };
+        if (!diag_futile_logged.exchange(true)) {
+            GGML_SYCL_DEBUG("[GRAPH-DIAG] TG graph DISABLED: replay futility gate tripped for this context\n");
+        }
+    } else if (!use_sycl_graph && cached_is_decode) {
         static std::atomic<bool> diag_prefix_logged{ false };
         static std::atomic<bool> diag_disable_graph_logged{ false };
         static std::atomic<bool> diag_multithreaded_logged{ false };
