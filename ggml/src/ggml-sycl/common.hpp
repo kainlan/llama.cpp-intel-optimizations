@@ -6439,6 +6439,13 @@ struct ggml_backend_sycl_context {
 
     // Each retire below reports whether it retired the epoch. A failure leaves the recorded graphs valid, so the
     // caller (the staging-swap gateway) must not trust them and declines; the failure also sets the disabled flag.
+    //
+    // Cost: this retires the keyed decode slots along with the one-slot segment graphs, and when either holds a
+    // recorded graph it waits for the queue before destroying them (no exec graph is destroyed while a replay may
+    // still run it). The prompt path calls it before every one-slot record and on its decline paths, so a prompt
+    // that records segments costs one queue wait if graphs exist, and the next decode token re-warms and re-records
+    // each keyed split. Sparing the keyed slots at the prompt-path calls would save the re-record only where no
+    // phase-change clear_active retires them anyway; that needs a measurement before it is worth the extra state.
     bool invalidate_moe_segments() {
         if (!ggml_sycl_retire_moe_graph_epoch(this)) {
             moe_graphs_disabled = true;
