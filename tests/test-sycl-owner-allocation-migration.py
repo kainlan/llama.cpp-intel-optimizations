@@ -1272,6 +1272,11 @@ def check_keyed_plan_and_key(code: str) -> list:
     push = record.find("slot.segments.push_back({ item.start, item.end, std::move(exec) });")
     if not weights or push < 0 or weights.end() > push:
         problems.append("slot: a recorded segment does not retain the weight handles its nodes read")
+    fallback = re.search(r"const ggml_sycl::resolved_ptr view = ggml_sycl_resolve\(node->src\[s\], device\);\s*"
+                         r"if \(view\.retention && view\.retention->valid\(\)\)\s*\{\s*"
+                         r"slot\.retained_handles\.push_back\(\*view\.retention\);", record)
+    if not weights or not fallback or fallback.start() < weights.end() or fallback.end() > push:
+        problems.append("slot: a weight resolved through the cache fallback is not retained for the graph's life")
     if "slot.retained_handles.push_back(q8);" not in record:
         problems.append("slot: the Q8 activation buffer the graphs bake is not retained")
     return problems
@@ -1295,6 +1300,7 @@ with gate('keyed-plan-and-key'):
         ("handle identity ignores the generation", r"\^ \(handle\.generation\(\) \* 0x9e3779b97f4a7c15ULL\)", ""),
         ("M4 weights not retained", r"slot\.retained_handles\.push_back\(extra->data_handle\[device\]\);", "(void) extra;"),
         ("Q8 not retained", r"slot\.retained_handles\.push_back\(q8\);", "(void) q8;"),
+        ("fallback view not retained", r"slot\.retained_handles\.push_back\(\*view\.retention\);", "(void) view;"),
     )
     for label, pattern, repl in controls:
         assert len(re.findall(pattern, RUNTIME_CODE)) == 1, "control %r anchor (%d)" % (

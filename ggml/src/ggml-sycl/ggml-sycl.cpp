@@ -99707,6 +99707,13 @@ static void moe_graph_record_segment_slot(ggml_backend_sycl_context *           
                 if (extra && extra->data_handle[device].valid()) {
                     slot.retained_handles.push_back(extra->data_handle[device]);
                 }
+                // A kernel that resolved this weight through the cache fallback (no trusted data_handle, or a
+                // layout its entry cannot serve) baked the fallback entry's pointer, whose lease it held only until
+                // submission: the slot holds that lease too, so the entry outlives every replay.
+                const ggml_sycl::resolved_ptr view = ggml_sycl_resolve(node->src[s], device);
+                if (view.retention && view.retention->valid()) {
+                    slot.retained_handles.push_back(*view.retention);
+                }
             }
         }
         slot.segments.push_back({ item.start, item.end, std::move(exec) });
