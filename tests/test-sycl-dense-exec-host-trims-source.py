@@ -224,6 +224,7 @@ def test_no_other_code_touches_the_staging_map():
 LOOKUP_HANDLE_TAKERS = Counter({
     ("getrows.cpp", "&out_handle"): 1,  # pre-staged get_rows indices, read by the kernel
     ("ggml-sycl.cpp", "&moved_dst"): 1,  # the executor's moved-only copy
+    ("ggml-sycl.cpp", "&staged"): 1,  # a keyed segment slot retains the copies its graphs read and compares identity
 })
 
 

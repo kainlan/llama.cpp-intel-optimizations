@@ -484,6 +484,15 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-graph-phase PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# Per-split segmented-graph slots (llama.cpp-7pm2): the slot key (signature, names, storage identity) and the
+# warmup/record/replay/direct state machine with LRU retirement and the churn guard.
+# ggml-sycl/graph-segment-cache.hpp includes only standard headers, so the test needs no device.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-graph-segment-cache.cpp)
+    set_tests_properties(test-sycl-graph-segment-cache PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-graph-segment-cache PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
 # MoE graph preload memo (llama.cpp-7pm2): per-tensor, per-device stamps of the preload outcome, and the verdict that
 # lets an all-host expert tensor stay a direct node. ggml-sycl/moe-graph-preload-stamp.hpp includes only
 # <cstddef>/<cstdint>, so the test needs no SYCL wiring.

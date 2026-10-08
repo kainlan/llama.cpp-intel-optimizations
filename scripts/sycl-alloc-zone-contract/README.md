@@ -37,6 +37,16 @@ and code that arrived from master, not new lane code). Re-keyed by a master rena
 test hooks `allocation_registry_test_assign_raw`, `_assign_host`, `_publish_host` and `_publish_irregular` (G-CATCH). Retired: the
 D-FORBID and D-ZONE pair of `ggml_sycl_bf16_weight_materialize_f32`, a function master removed.
 
+The W7 merge of master `63dfd237d` (7pm2 Stage B, the keyed per-split segment-graph cache) added six G-CATCH entries the same way.
+None of them can swallow a planned refusal, and none is lane code:
+- `moe_graph_record_segment_slot`'s `std::exception` handler follows a `ggml_sycl_fallback_error` handler that invalidates the Q8 cache
+  and then rethrows. The clause recognises only the empty `{ throw; }` body, so it reports this one.
+- The `catch (...)` around that record call in graph compute drains, then rethrows. The `catch (...)` inside it wraps only that drain,
+  in a failure path. Both are keyed `<file scope>`: the clause does not resolve the lambda that encloses them.
+- `ggml_sycl_retire_moe_segment_slots` is `noexcept`, and `recording_end_guard`'s destructor only ends a recording. A rethrow in
+  either would terminate the process.
+- `moe_segment_slots_drain_retired`'s `std::exception` handler wraps only the retire drain. It keeps the slots alive and reports failure.
+
 Clause (q), libc allocation primitives (S3-0): `mmap`, `mmap64`, `mremap`, `posix_memalign`, `memalign`, `aligned_alloc`, `valloc`,
 `pvalloc`, `malloc`, `calloc`, `realloc`, `reallocarray`, `strdup`, `strndup` and `VirtualAlloc`, called bare or through `std::` / `::` (or taken as a value, or spelled in a `#define` body), are E-LIBC findings. A member
 (`pool.realloc`), a name qualified by another scope (`sycl::malloc` stays clause (e)'s) and a declaration are not. Five allowlist entries

@@ -452,7 +452,7 @@ if (BUILD_TESTING)
 
     add_test(NAME sycl-lifecycle-source-contract
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-source-contract.py)
-    set_tests_properties(sycl-lifecycle-source-contract PROPERTIES LABELS "python")
+    set_tests_properties(sycl-lifecycle-source-contract PROPERTIES LABELS "sycl;execution;lifecycle;host;source-contract;python")
     add_test(NAME sycl-teardown-sequence-contract
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-teardown-sequence-contract.py)
     set_tests_properties(sycl-teardown-sequence-contract PROPERTIES LABELS "sycl;execution;lifecycle;host;source-contract;python")

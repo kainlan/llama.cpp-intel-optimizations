@@ -108,7 +108,7 @@ HOST_WAIT = re.compile(r"(\.|->|::)\s*wait\s*\(|wait_and_throw|\bsynchronize\s*\
 def evaluate(backend, concat, common):
     results = {}
 
-    compat = function_body(backend, r"static bool check_graph_compatibility\([^)]*\)\s*\{")
+    compat = function_body(backend, r"static ggml_sycl_graph_compat check_graph_compatibility\([^)]*\)\s*\{")
     impl = function_body(concat, r"void concat_impl_sycl\([^)]*\)\s*\{")
     op = function_body(concat, r"void ggml_sycl_op_concat\([^)]*\)\s*\{")
     results["anchor: check_graph_compatibility exists"] = compat is not None
@@ -214,7 +214,7 @@ if args.self_test:
         k = src.find(old, m.end())
         return src[:k] + new + src[k + len(old):]
 
-    compat_sig = r"static bool check_graph_compatibility\([^)]*\)\s*\{"
+    compat_sig = r"static ggml_sycl_graph_compat check_graph_compatibility\([^)]*\)\s*\{"
     impl_sig = r"void concat_impl_sycl\([^)]*\)\s*\{"
     safe_sig = r"inline sycl::event ggml_sycl_graph_safe_memcpy\([^)]*\)\s*\{"
     first_stmt = "const size_t size0 = src0.nbytes();"
