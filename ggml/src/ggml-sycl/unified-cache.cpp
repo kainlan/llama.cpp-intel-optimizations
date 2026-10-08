@@ -1491,6 +1491,18 @@ static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry
 // Declared before g_device_caches for the reason given there: the caches' destructors erase rows.
 static address_range_index g_runtime_alloc_index;
 
+// Settle-side counters over the same rows, guarded by g_runtime_alloc_mutex and written ONLY by
+// runtime_registry_count_row_locked(), which only the registry mutation helpers call (llama.cpp-rriv;
+// tests/test-sycl-runtime-registry-settle-source.py enforces both). A clean zone settle used to scan every row to learn that
+// nothing in its zone was live; these make that O(1) and leave the enumeration to the refusal that needs it.
+//   g_runtime_host_zone_rows[z]     rows whose handle.host_zone is z, in any state (RELEASING rows included: the scan this
+//                                   replaces counted them, and a host zone is not reusable while one holds its bytes).
+//   g_runtime_span_irregular_rows   rows the index cannot answer a key-in-span question for: the key is not the base the
+//                                   row is indexed at (no extent, or handle.ptr != key). Always 0 in practice; while it is
+//                                   not, runtime_registry_span_live_locked() scans, so it keeps the old answer.
+static size_t g_runtime_host_zone_rows[static_cast<size_t>(host_zone_id::COUNT)];
+static size_t g_runtime_span_irregular_rows = 0;
+
 // Keep cache owners later in declaration order than the registry they call from
 // unified_cache::~unified_cache(). Reverse static destruction then tears caches
 // down first instead of asking release_registered_allocation_owned() to access
@@ -1521,6 +1533,68 @@ static bool runtime_registry_row_indexed(const alloc_metadata & h) noexcept {
     return h.ptr != nullptr && h.size != 0;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+static size_t g_test_registry_rows_scanned = 0;  // guarded by g_runtime_alloc_mutex
+#endif
+
+// Registry rows visited by the settle queries and their refusal enumerations; only the tests read it, to pin that a clean
+// settle visits none.
+static void runtime_registry_note_row_scanned_locked() noexcept {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    g_test_registry_rows_scanned++;
+#endif
+}
+
+// The index holds the row at its own key, so "is this row's key in [lo, hi)" is "is its indexed base in [lo, hi)".
+static bool runtime_registry_row_span_regular(const void * key, const alloc_metadata & h) noexcept {
+    return key == nullptr || (runtime_registry_row_indexed(h) && h.ptr == key);
+}
+
+// Adds (or removes) one row's contribution to the counters above. The ONLY writer of them; the caller holds
+// g_runtime_alloc_mutex and passes the row exactly as it is registered.
+static void runtime_registry_count_row_locked(const void * key, const alloc_metadata & h, bool add) noexcept {
+    if (static_cast<size_t>(h.host_zone) < static_cast<size_t>(host_zone_id::COUNT)) {
+        size_t & rows = g_runtime_host_zone_rows[static_cast<size_t>(h.host_zone)];
+        if (add) {
+            rows++;
+        } else {
+            GGML_ASSERT(rows > 0 && "host-zone row counter lost a registered row");
+            rows--;
+        }
+    }
+    if (!runtime_registry_row_span_regular(key, h)) {
+        if (add) {
+            g_runtime_span_irregular_rows++;
+        } else {
+            GGML_ASSERT(g_runtime_span_irregular_rows > 0 && "irregular-row counter lost a registered row");
+            g_runtime_span_irregular_rows--;
+        }
+    }
+}
+
+// Is any registry row in host zone `zone`? What host_zone_settle() decides on. O(1); see the counters' comment.
+static bool runtime_registry_host_zone_live_locked(host_zone_id zone) noexcept {
+    return static_cast<size_t>(zone) < static_cast<size_t>(host_zone_id::COUNT) &&
+           g_runtime_host_zone_rows[static_cast<size_t>(zone)] != 0;
+}
+
+// Is any registry row's key in [lo, hi)? What zone_settle() decides on. The index answers in O(log n) while every row is
+// held at its own key; an irregular row (see the counters' comment) makes the index's answer differ from the key test, so
+// the registry is scanned for as long as one exists.
+static bool runtime_registry_span_live_locked(uintptr_t lo, uintptr_t hi) noexcept {
+    if (g_runtime_span_irregular_rows == 0) {
+        return g_runtime_alloc_index.find_first_base_in(lo, hi, nullptr);
+    }
+    for (const auto & kv : g_runtime_alloc_registry) {
+        runtime_registry_note_row_scanned_locked();
+        const uintptr_t p = reinterpret_cast<uintptr_t>(kv.first);
+        if (p >= lo && p < hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // The only ways to add or remove a registry row; the caller holds g_runtime_alloc_mutex. They keep g_runtime_alloc_index
 // in step. Same contract as unordered_map::emplace: {row, true} on success, {existing row, false} when `ptr` already has
 // one. An allocation failure leaves registry and index unchanged and propagates.
@@ -1536,20 +1610,20 @@ static std::pair<runtime_registry_iterator, bool> runtime_registry_emplace_locke
         return inserted;
     }
     const alloc_metadata & h = inserted.first->second.handle;
-    if (!runtime_registry_row_indexed(h)) {
-        return inserted;
+    if (runtime_registry_row_indexed(h)) {
+        bool indexed = false;
+        try {
+            indexed = g_runtime_alloc_index.insert(reinterpret_cast<uintptr_t>(h.ptr), h.size, ptr);
+        } catch (...) {
+            g_runtime_alloc_registry.erase(inserted.first);
+            throw;
+        }
+        if (!indexed) {
+            g_runtime_alloc_registry.erase(inserted.first);
+            return { g_runtime_alloc_registry.end(), false };
+        }
     }
-    bool indexed = false;
-    try {
-        indexed = g_runtime_alloc_index.insert(reinterpret_cast<uintptr_t>(h.ptr), h.size, ptr);
-    } catch (...) {
-        g_runtime_alloc_registry.erase(inserted.first);
-        throw;
-    }
-    if (!indexed) {
-        g_runtime_alloc_registry.erase(inserted.first);
-        return { g_runtime_alloc_registry.end(), false };
-    }
+    runtime_registry_count_row_locked(ptr, h, true);
     return inserted;
 }
 
@@ -1560,6 +1634,7 @@ static void runtime_registry_erase_locked(runtime_registry_iterator it) noexcept
         GGML_ASSERT(unindexed && "runtime allocation index lost a registered row");
         (void) unindexed;
     }
+    runtime_registry_count_row_locked(it->first, h, false);
     g_runtime_alloc_registry.erase(it);
 }
 
@@ -1609,6 +1684,8 @@ static void runtime_registry_assign_locked(void * ptr, const runtime_alloc_recor
     } else if (was) {
         g_runtime_alloc_index.erase(reinterpret_cast<uintptr_t>(old_h.ptr), ptr);
     }
+    runtime_registry_count_row_locked(ptr, old_h, false);
+    runtime_registry_count_row_locked(ptr, fresh.handle, true);
     it->second = std::move(fresh);
 }
 
@@ -1629,7 +1706,25 @@ static bool runtime_registry_index_consistent_locked() noexcept {
             return false;
         }
     }
-    return indexed == g_runtime_alloc_index.size() && g_runtime_alloc_index.check_invariants();
+    if (indexed != g_runtime_alloc_index.size() || !g_runtime_alloc_index.check_invariants()) {
+        return false;
+    }
+    // The settle counters equal a recount of the registry (llama.cpp-rriv).
+    size_t zone_rows[static_cast<size_t>(host_zone_id::COUNT)] = {};
+    size_t irregular                                           = 0;
+    for (const auto & kv : g_runtime_alloc_registry) {
+        const alloc_metadata & h = kv.second.handle;
+        if (static_cast<size_t>(h.host_zone) < static_cast<size_t>(host_zone_id::COUNT)) {
+            zone_rows[static_cast<size_t>(h.host_zone)]++;
+        }
+        irregular += runtime_registry_row_span_regular(kv.first, h) ? 0 : 1;
+    }
+    for (size_t z = 0; z < static_cast<size_t>(host_zone_id::COUNT); z++) {
+        if (zone_rows[z] != g_runtime_host_zone_rows[z]) {
+            return false;
+        }
+    }
+    return irregular == g_runtime_span_irregular_rows;
 }
 #endif
 
@@ -17682,6 +17777,101 @@ bool allocation_registry_test_index_consistent() noexcept {
     return runtime_registry_index_consistent_locked();
 }
 
+bool allocation_registry_test_publish_host(void *       ptr,
+                                           int          device,
+                                           size_t       bytes,
+                                           host_zone_id zone,
+                                           bool         releasing) noexcept {
+    if (!ptr || bytes == 0) {
+        return false;
+    }
+    try {
+        runtime_alloc_record rec;
+        rec.handle.ptr               = ptr;
+        rec.handle.size              = bytes;
+        rec.handle.device            = device;
+        rec.handle.tier              = alloc_tier::HOST_PINNED;
+        rec.handle.host_zone         = zone;
+        rec.handle.zone_managed      = zone != host_zone_id::COUNT;
+        rec.state                    = releasing ? runtime_alloc_state::RELEASING : runtime_alloc_state::LIVE;
+        rec.test_no_physical_release = true;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        return runtime_registry_emplace_locked(ptr, std::move(rec)).second;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool allocation_registry_test_assign_host(void * ptr, int device, size_t bytes, host_zone_id zone) noexcept {
+    if (!ptr || bytes == 0) {
+        return false;
+    }
+    try {
+        runtime_alloc_record rec;
+        rec.handle.ptr               = ptr;
+        rec.handle.size              = bytes;
+        rec.handle.device            = device;
+        rec.handle.tier              = alloc_tier::HOST_PINNED;
+        rec.handle.host_zone         = zone;
+        rec.handle.zone_managed      = zone != host_zone_id::COUNT;
+        rec.test_no_physical_release = true;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        runtime_registry_assign_locked(ptr, rec);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool allocation_registry_test_publish_irregular(void * key, void * handle_ptr, size_t bytes) noexcept {
+    if (!key) {
+        return false;
+    }
+    try {
+        runtime_alloc_record rec;
+        rec.handle.ptr               = handle_ptr;
+        rec.handle.size              = bytes;
+        rec.handle.tier              = alloc_tier::DEVICE_VRAM;
+        rec.test_no_physical_release = true;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        return runtime_registry_emplace_locked(key, std::move(rec)).second;
+    } catch (...) {
+        return false;
+    }
+}
+
+size_t allocation_registry_test_host_zone_rows(host_zone_id zone) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return static_cast<size_t>(zone) < static_cast<size_t>(host_zone_id::COUNT) ?
+               g_runtime_host_zone_rows[static_cast<size_t>(zone)] :
+               0;
+}
+
+bool allocation_registry_test_host_zone_live(host_zone_id zone) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return runtime_registry_host_zone_live_locked(zone);
+}
+
+bool allocation_registry_test_span_live(uintptr_t lo, uintptr_t hi) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return runtime_registry_span_live_locked(lo, hi);
+}
+
+size_t allocation_registry_test_span_irregular_rows() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return g_runtime_span_irregular_rows;
+}
+
+size_t allocation_registry_test_rows_scanned() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return g_test_registry_rows_scanned;
+}
+
+void allocation_registry_test_reset_rows_scanned() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    g_test_registry_rows_scanned = 0;
+}
+
 bool allocation_registry_test_cleanup_pending(void * ptr) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     const auto it = g_runtime_alloc_registry.find(ptr);
@@ -21412,6 +21602,43 @@ void unified_cache::host_pool_free(void * ptr, size_t size) {
     host_arena_->deallocate(ptr, size);
 }
 
+// What a REFUSED host-zone settle reports: every registry row in `zone`, logged (the first few) and recorded for the zone
+// audit (all of them), plus the oldest epoch among them. Walks the whole registry, so a settle calls it only after
+// runtime_registry_host_zone_live_locked() has said a row exists. Caller holds g_runtime_alloc_mutex.
+static size_t runtime_registry_scan_host_zone_locked(host_zone_id            zone,
+                                                     bool                    log_detail,
+                                                     bool                    epoch_tracked,
+                                                     zone_audit_site_visit & audit,
+                                                     uint64_t &              oldest_epoch) {
+    size_t detail_lines     = 0;
+    size_t live_allocations = 0;
+    for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
+        runtime_registry_note_row_scanned_locked();
+        if (it->second.handle.host_zone == zone) {
+            if (log_detail && detail_lines < 8) {
+                runtime_reset_reclaimed_log_live_locked(it->second, "host-zone-reset");
+                detail_lines++;
+            }
+            if (audit.active()) {
+                // The audit collects EVERY live record, uncapped -- the
+                // refusal dump is capped at 4 refusals x 8 lines per
+                // zone, which cannot produce an inventory. Collected here so
+                // it sees exactly what the refusal saw, under the same lock.
+                // Attribution is READ from the handle (post-f9tg), never
+                // re-derived.
+                const alloc_metadata & h = it->second.handle;
+                audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
+                                       static_cast<int>(h.tier), it->second.cohort_id });
+            }
+            if (epoch_tracked) {
+                oldest_epoch = std::min(oldest_epoch, it->second.handle.epoch_id);
+            }
+            live_allocations++;
+        }
+    }
+    return live_allocations;
+}
+
 void unified_cache::host_zone_settle(host_zone_id zone) {
     // Phase 0 escape audit. Declared FIRST, ahead of the reservation
     // early-return just below, so the RAII destructor still records a visit
@@ -21492,31 +21719,13 @@ void unified_cache::host_zone_settle(host_zone_id zone) {
         // instead of aborting, so keep it only for the first few refusals, and
         // bound it within a single refusal too.
         const bool                  log_detail       = zone_logs.load(std::memory_order_relaxed) < 4;
-        size_t                      detail_lines     = 0;
         size_t                      live_allocations = 0;
         uint64_t                    oldest_epoch     = new_epoch;
-        for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
-            if (it->second.handle.host_zone == zone) {
-                if (log_detail && detail_lines < 8) {
-                    runtime_reset_reclaimed_log_live_locked(it->second, "host-zone-reset");
-                    detail_lines++;
-                }
-                if (audit.active()) {
-                    // The audit collects EVERY live record, uncapped -- the
-                    // refusal dump above is capped at 4 refusals x 8 lines per
-                    // zone, which cannot produce an inventory. Collected here so
-                    // it sees exactly what the refusal saw, under the same lock.
-                    // Attribution is READ from the handle (post-f9tg), never
-                    // re-derived.
-                    const alloc_metadata & h = it->second.handle;
-                    audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
-                                           static_cast<int>(h.tier), it->second.cohort_id });
-                }
-                if (epoch_tracked) {
-                    oldest_epoch = std::min(oldest_epoch, it->second.handle.epoch_id);
-                }
-                live_allocations++;
-            }
+        // A clean settle (the normal case: once per graph) is one counter read. Only a zone that has a row pays for the
+        // enumeration, which exists to explain the refusal.
+        if (runtime_registry_host_zone_live_locked(zone)) {
+            live_allocations =
+                runtime_registry_scan_host_zone_locked(zone, log_detail, epoch_tracked, audit, oldest_epoch);
         }
         if (live_allocations > 0) {
             if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -24393,6 +24602,37 @@ static const char * vram_zone_name(vram_zone_id zone) {
     }
 }
 
+// What a REFUSED zone settle reports: every registry row whose key is in [lo, hi), logged (the first few) and recorded for
+// the zone audit (all of them). Walks the whole registry, so a settle calls it only after
+// runtime_registry_span_live_locked() has said a row exists. Caller holds g_runtime_alloc_mutex.
+static size_t runtime_registry_scan_span_locked(uintptr_t               lo,
+                                                uintptr_t               hi,
+                                                bool                    log_detail,
+                                                zone_audit_site_visit & audit) {
+    size_t detail_lines     = 0;
+    size_t live_allocations = 0;
+    for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
+        runtime_registry_note_row_scanned_locked();
+        const uintptr_t p = reinterpret_cast<uintptr_t>(it->first);
+        if (p >= lo && p < hi) {
+            if (log_detail && detail_lines < 8) {
+                runtime_reset_reclaimed_log_live_locked(it->second, "device-zone-reset");
+                detail_lines++;
+            }
+            if (audit.active()) {
+                // Uncapped, unlike the bounded refusal dump; collected
+                // under the same lock so it sees exactly what the refusal
+                // saw. Attribution is READ from the handle (post-f9tg).
+                const alloc_metadata & h = it->second.handle;
+                audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
+                                       static_cast<int>(h.tier), it->second.cohort_id });
+            }
+            live_allocations++;
+        }
+    }
+    return live_allocations;
+}
+
 // Shared implementation for zone_boundary_check() / zone_reclaim() (below) --
 // see the doc comment on zone_settle()'s declaration in unified-cache.hpp for
 // why this is genuinely internal and not called directly outside this class.
@@ -24502,25 +24742,11 @@ void unified_cache::zone_settle(vram_zone_id zone) {
         // aborting now, so identify owners only for the first few refusals, and
         // bound the dump within a single refusal too.
         const bool                  log_detail       = zone_logs.load(std::memory_order_relaxed) < 4;
-        size_t                      detail_lines     = 0;
         size_t                      live_allocations = 0;
-        for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
-            const uintptr_t p = reinterpret_cast<uintptr_t>(it->first);
-            if (p >= zone_lo && p < zone_hi) {
-                if (log_detail && detail_lines < 8) {
-                    runtime_reset_reclaimed_log_live_locked(it->second, "device-zone-reset");
-                    detail_lines++;
-                }
-                if (audit.active()) {
-                    // Uncapped, unlike the bounded refusal dump above; collected
-                    // under the same lock so it sees exactly what the refusal
-                    // saw. Attribution is READ from the handle (post-f9tg).
-                    const alloc_metadata & h = it->second.handle;
-                    audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
-                                           static_cast<int>(h.tier), it->second.cohort_id });
-                }
-                live_allocations++;
-            }
+        // A clean settle (the normal case: once per graph per device) is one index query. Only a zone that has a row
+        // pays for the enumeration, which exists to explain the refusal.
+        if (runtime_registry_span_live_locked(zone_lo, zone_hi)) {
+            live_allocations = runtime_registry_scan_span_locked(zone_lo, zone_hi, log_detail, audit);
         }
         if (live_allocations > 0) {
             if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {

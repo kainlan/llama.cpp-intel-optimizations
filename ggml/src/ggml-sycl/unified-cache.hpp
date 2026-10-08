@@ -6266,6 +6266,27 @@ bool allocation_registry_test_contains(void * ptr) noexcept;
 bool allocation_registry_test_index_consistent() noexcept;
 // llama.cpp-ii25: replace-or-insert a host-only LIVE device-VRAM row (what the adopt_raw_* paths do); true when published.
 bool allocation_registry_test_assign_raw(void * ptr, int device, size_t bytes) noexcept;
+// llama.cpp-rriv: what host_zone_settle() / zone_settle() ask of the registry, without a device or an arena.
+//   publish_host / assign_host: a host-pinned row of `bytes` in `zone` (LIVE or RELEASING / replace-or-insert).
+//   publish_irregular: a row whose KEY is not the base the index holds it at (`handle_ptr` differs from `key`, may be
+//   null, and `bytes` may be 0); true when published.
+//   host_zone_rows / host_zone_live: the per-host-zone live-row counter, and the question host_zone_settle() asks.
+//   span_live: "does any row's key fall in [lo, hi)", the question zone_settle() asks; span_irregular_rows: how many rows
+//   make it fall back to scanning the registry.
+//   rows_scanned: registry rows those questions have visited since the last reset (0 on every clean, regular path).
+bool   allocation_registry_test_publish_host(void *       ptr,
+                                             int          device,
+                                             size_t       bytes,
+                                             host_zone_id zone,
+                                             bool         releasing) noexcept;
+bool   allocation_registry_test_assign_host(void * ptr, int device, size_t bytes, host_zone_id zone) noexcept;
+bool   allocation_registry_test_publish_irregular(void * key, void * handle_ptr, size_t bytes) noexcept;
+size_t allocation_registry_test_host_zone_rows(host_zone_id zone) noexcept;
+bool   allocation_registry_test_host_zone_live(host_zone_id zone) noexcept;
+bool   allocation_registry_test_span_live(uintptr_t lo, uintptr_t hi) noexcept;
+size_t allocation_registry_test_span_irregular_rows() noexcept;
+size_t allocation_registry_test_rows_scanned() noexcept;
+void   allocation_registry_test_reset_rows_scanned() noexcept;
 bool allocation_registry_test_cleanup_pending(void * ptr) noexcept;
 size_t allocation_registry_test_size() noexcept;
 bool allocation_registry_test_acquire_exact_lease(const alloc_metadata & metadata) noexcept;

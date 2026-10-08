@@ -3829,6 +3829,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-rriv: source gate for the clean zone settle: host_zone_settle() / zone_settle() answer "is anything live in
+# this zone" from a per-host-zone row counter and the registry index's first-base-in-span query instead of walking every
+# registry row (37.3% + 20.0% of Qwen3.8 decode CPU), enumerate rows only to explain a refusal, and the counters are
+# written only by the registry mutation helpers. Host-only, reads the sources as text. The counters against a full scan
+# are test-sycl-runtime-registry-containment (ggml/src/ggml-sycl/CMakeLists.txt).
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-runtime-registry-settle-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-runtime-registry-settle-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-xojq: source gate for nphx Task 4b -- the SYCL auto micro-batch
 # selection trial (llama_context::sycl_select_auto_ubatch()) and its one
 # call site in the llama_context constructor. Pins the four-condition gate
