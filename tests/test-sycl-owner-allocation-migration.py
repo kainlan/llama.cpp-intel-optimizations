@@ -448,6 +448,26 @@ with gate('graph-preload'):
     assert "graph_unpin_moe_experts(sycl_ctx)" in refresh
     print("PASS graph-preload-bool-propagation-source-gate")
 
+with gate('graph-preload-refused'):
+    # A split whose MoE preload is refused runs direct: the compute entry turns its graph off, the per-split flag is
+    # decided before any path can run compute_impl (the graphlet gates read it there), and every MoE graphlet gate
+    # honors it.
+    compute = region(RUNTIME, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                     "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
+    decided = re.search(r"sycl_ctx->moe_graph_preload_refused\s*=\s*ggml_sycl_moe_graph_preload_decide\(", compute)
+    first_compute = re.search(r"\bcompute_impl(?:_unlocked)?\(\);", compute)
+    assert decided and first_compute and decided.start() < first_compute.start()
+    entry = re.search(r"if \(sycl_ctx->moe_graph_preload_refused\) \{\s*GGML_SYCL_DEBUG\([^;]*\);\s*"
+                      r"use_sycl_graph = false;\s*\}", compute)
+    assert entry and entry.start() < compute.index("const int descriptor_moe_graph_candidates")
+    assert re.search(r"!sycl_ctx->moe_direct_dispatch_graphs_disabled\s*&&\s*!sycl_ctx->moe_graph_preload_refused\s*&&"
+                     r"\s*node->op\s*==\s*GGML_OP_MUL_MAT_ID", RUNTIME)
+    assert re.search(r"sycl_ctx->graphs_disabled\s*\|\|\s*sycl_ctx->moe_graph_preload_refused\s*\|\|\s*"
+                     r"sycl_ctx->moe_graphs_disabled\s*\|\|\s*sycl_ctx->moe_sequence_graphs_disabled", RUNTIME)
+    assert re.search(r"if \(sycl_ctx->moe_block_graphs_disabled\s*\|\|[^{};]*\bsycl_ctx->moe_graph_preload_refused\b"
+                     r"[^{};]*\)\s*\{", RUNTIME)
+    print("PASS graph-preload-refused-split-source-gate")
+
 with gate('moe-metadata'):
     # Metadata and its derived group registry are built locally and atomically
     # swapped under both writer locks; bad_alloc preserves the old epoch.
