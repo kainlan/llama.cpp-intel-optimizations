@@ -28,6 +28,7 @@ struct moe_decode_direct_stamp {
     int      layout                    = 0;
     bool     valid                     = false;
     bool     eligible                  = false;
+    uint32_t retries                   = 0;  // RETRY outcomes in a row for these inputs
 };
 
 inline bool moe_decode_direct_stamp_current(const moe_decode_direct_stamp & s,
@@ -55,25 +56,47 @@ inline void moe_decode_direct_stamp_record(moe_decode_direct_stamp & s,
 // How one eligibility decision ended. A refusal follows from the tensor, the
 // device or the materialized storage, so it holds until the stamp's inputs
 // change. A retry is a failure of the attempt itself (the table upload could
-// not allocate), so it is not remembered and the next op decides again.
+// not allocate), so the next op decides again, up to
+// moe_decode_direct_retry_limit times in a row for the same inputs. The retry
+// that reaches the limit settles as a refusal, so a failure that never clears
+// stops costing a full decision per op. New inputs (a replan or a storage
+// rewrite) start a new count.
 enum moe_decode_direct_outcome {
     MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE,
     MOE_DECODE_DIRECT_OUTCOME_REFUSED,
     MOE_DECODE_DIRECT_OUTCOME_RETRY,
 };
 
-inline void moe_decode_direct_stamp_settle(moe_decode_direct_stamp & s,
-                                           uint64_t                  plan_generation,
-                                           uint64_t                  expert_storage_generation,
-                                           int64_t                   selected_rows,
-                                           int                       layout,
-                                           moe_decode_direct_outcome outcome) {
+constexpr uint32_t moe_decode_direct_retry_limit = 8;
+
+inline moe_decode_direct_outcome moe_decode_direct_stamp_settle(moe_decode_direct_stamp & s,
+                                                                uint64_t                  plan_generation,
+                                                                uint64_t                  expert_storage_generation,
+                                                                int64_t                   selected_rows,
+                                                                int                       layout,
+                                                                moe_decode_direct_outcome outcome) {
     if (outcome == MOE_DECODE_DIRECT_OUTCOME_RETRY) {
-        s.valid = false;
-        return;
+        const bool same_inputs = s.plan_generation == plan_generation &&
+                                 s.expert_storage_generation == expert_storage_generation &&
+                                 s.selected_rows == selected_rows;
+        const uint32_t retries = same_inputs ? s.retries + 1 : 1;
+        if (retries >= moe_decode_direct_retry_limit) {
+            moe_decode_direct_stamp_record(s, plan_generation, expert_storage_generation, selected_rows, layout,
+                                           /*eligible=*/false);
+            s.retries = retries;
+            return MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+        }
+        s.plan_generation           = plan_generation;
+        s.expert_storage_generation = expert_storage_generation;
+        s.selected_rows             = selected_rows;
+        s.valid                     = false;
+        s.retries                   = retries;
+        return outcome;
     }
     moe_decode_direct_stamp_record(s, plan_generation, expert_storage_generation, selected_rows, layout,
                                    outcome == MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE);
+    s.retries = 0;
+    return outcome;
 }
 
 // The route's layout is the one expert 0 is materialized in on the device:
@@ -169,6 +192,31 @@ struct moe_shared_act_record {
     bool         valid          = false;
 };
 
+// A layer's gate and up MUL_MAT_ID nodes as the graph scan found them, with
+// the src1 node each reads. Identities only; nothing is dereferenced.
+struct moe_gate_up_nodes {
+    const void * gate_dst  = nullptr;
+    const void * gate_src1 = nullptr;
+    const void * up_dst    = nullptr;
+    const void * up_src1   = nullptr;
+};
+
+// The one op that may reuse the activation row `dst` copies to host: the
+// other half of its layer's gate/up pair, and only when gate, up and `dst`
+// all read the same src1 node. Anything else -- down, a fused gate_up (the
+// scan finds no up), an op the scan did not find, a layer it has no pair for
+// (`pair` null) -- has no sibling and makes its own copy.
+inline const void * moe_shared_act_sibling_of(const moe_gate_up_nodes * pair, const void * dst, const void * dst_src1) {
+    if (!pair || !dst || !dst_src1 || !pair->gate_dst || !pair->up_dst || pair->gate_src1 != dst_src1 ||
+        pair->up_src1 != dst_src1) {
+        return nullptr;
+    }
+    if (dst == pair->gate_dst) {
+        return pair->up_dst;
+    }
+    return dst == pair->up_dst ? pair->gate_dst : nullptr;
+}
+
 struct moe_shared_act_query {
     const void * src1_tensor    = nullptr;
     const void * op_dst         = nullptr;
@@ -201,7 +249,7 @@ inline bool moe_shared_act_reusable(const moe_shared_act_record & r, const moe_s
 struct moe_sibling_pending_request {
     bool     pending_active     = false;  // a CPU job is pending in the primary slot
     bool     sibling_slot_free  = false;  // the second slot can hold it
-    bool     reuses_activation  = false;  // this op does no activation copy
+    bool     reuses_activation  = false;  // this op reads the pending job's activation copy, making none
     uint64_t pending_act_serial = 0;      // staging contents the pending job reads
     uint64_t current_act_serial = 0;      // staging contents now
     bool     pending_from_pool  = false;

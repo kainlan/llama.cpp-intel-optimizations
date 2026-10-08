@@ -77,6 +77,82 @@ static int test_direct_stamp() {
     return 0;
 }
 
+// Stand-ins for graph nodes: only their identity matters.
+static const int k_gate_dst  = 0;
+static const int k_up_dst    = 0;
+static const int k_src1      = 0;
+static const int k_next_src1 = 0;
+static const int k_down_dst  = 0;
+
+static int test_direct_retry_cap() {
+    using ggml_sycl::moe_decode_direct_stamp_current;
+    using ggml_sycl::moe_decode_direct_stamp_settle;
+    const uint32_t limit = ggml_sycl::moe_decode_direct_retry_limit;
+    const auto     retry = ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY;
+
+    ggml_sycl::moe_decode_direct_stamp s{};
+    for (uint32_t i = 1; i < limit; ++i) {
+        CHECK(moe_decode_direct_stamp_settle(s, 3, 7, 10, 0, retry) == retry, "a retry below the cap stays a retry");
+        CHECK(!moe_decode_direct_stamp_current(s, 3, 7, 10), "a retry below the cap is not remembered");
+    }
+    CHECK(moe_decode_direct_stamp_settle(s, 3, 7, 10, 0, retry) == ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED,
+          "the retry that reaches the cap settles as a refusal");
+    CHECK(moe_decode_direct_stamp_current(s, 3, 7, 10) && !s.eligible, "the capped refusal is remembered");
+
+    // A generation bump starts a new count: the new storage gets its own tries.
+    ggml_sycl::moe_decode_direct_stamp t{};
+    for (uint32_t i = 1; i < limit; ++i) {
+        moe_decode_direct_stamp_settle(t, 3, 7, 10, 0, retry);
+    }
+    for (uint32_t i = 1; i < limit; ++i) {
+        CHECK(moe_decode_direct_stamp_settle(t, 3, 8, 10, 0, retry) == retry,
+              "a storage generation bump resets the retry count");
+    }
+    CHECK(moe_decode_direct_stamp_settle(t, 3, 8, 10, 0, retry) == ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED,
+          "the reset count reaches the cap again for the new generation");
+
+    // A decision in between also starts a new count.
+    ggml_sycl::moe_decode_direct_stamp u{};
+    for (uint32_t i = 1; i < limit; ++i) {
+        moe_decode_direct_stamp_settle(u, 3, 7, 10, 0, retry);
+    }
+    moe_decode_direct_stamp_settle(u, 3, 7, 10, 0, ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE);
+    CHECK(moe_decode_direct_stamp_settle(u, 3, 7, 10, 0, retry) == retry,
+          "an eligible decision resets the retry count");
+    return 0;
+}
+
+static int test_shared_act_sibling() {
+    using ggml_sycl::moe_shared_act_sibling_of;
+    ggml_sycl::moe_gate_up_nodes pair;
+    pair.gate_dst  = &k_gate_dst;
+    pair.gate_src1 = &k_src1;
+    pair.up_dst    = &k_up_dst;
+    pair.up_src1   = &k_src1;
+    CHECK(moe_shared_act_sibling_of(&pair, &k_gate_dst, &k_src1) == &k_up_dst, "gate's sibling is up");
+    CHECK(moe_shared_act_sibling_of(&pair, &k_up_dst, &k_src1) == &k_gate_dst, "up's sibling is gate");
+
+    ggml_sycl::moe_gate_up_nodes split = pair;
+    split.up_src1                      = &k_next_src1;
+    CHECK(moe_shared_act_sibling_of(&split, &k_gate_dst, &k_src1) == nullptr,
+          "gate and up reading different src1 nodes are not siblings");
+    CHECK(moe_shared_act_sibling_of(&pair, &k_gate_dst, &k_next_src1) == nullptr,
+          "an op reading another src1 than the scanned pair has no sibling");
+
+    ggml_sycl::moe_gate_up_nodes fused;  // one gate_up node: the scan files it as gate
+    fused.gate_dst  = &k_gate_dst;
+    fused.gate_src1 = &k_src1;
+    CHECK(moe_shared_act_sibling_of(&fused, &k_gate_dst, &k_src1) == nullptr, "a fused gate_up op has no sibling");
+
+    CHECK(moe_shared_act_sibling_of(&pair, &k_down_dst, &k_src1) == nullptr, "down has no sibling");
+    CHECK(moe_shared_act_sibling_of(&pair, &k_next_src1, &k_src1) == nullptr,
+          "an op that is not a scanned node has no sibling");
+    CHECK(moe_shared_act_sibling_of(nullptr, &k_gate_dst, &k_src1) == nullptr,
+          "a layer missing from the scan has no sibling");
+    CHECK(moe_shared_act_sibling_of(&pair, nullptr, &k_src1) == nullptr, "no op, no sibling");
+    return 0;
+}
+
 static int test_direct_layout() {
     using ggml_sycl::moe_decode_direct_layout_from_materialized;
     int layout = -1;
@@ -135,13 +211,6 @@ static int test_gather_runs() {
     CHECK(runs.empty(), "no rows, no copies");
     return 0;
 }
-
-// Stand-ins for graph nodes: only their identity matters.
-static const int k_gate_dst  = 0;
-static const int k_up_dst    = 0;
-static const int k_src1      = 0;
-static const int k_next_src1 = 0;
-static const int k_down_dst  = 0;
 
 // Gate made the copy of its src1 row; up is the one sibling allowed to reuse it.
 static ggml_sycl::moe_shared_act_record act_record() {
@@ -270,8 +339,9 @@ static int test_sibling_pending() {
 }
 
 int main() {
-    if (test_direct_request() != 0 || test_direct_stamp() != 0 || test_direct_layout() != 0 || test_pool_ring() != 0 ||
-        test_gather_runs() != 0 || test_shared_activation() != 0 || test_sibling_pending() != 0) {
+    if (test_direct_request() != 0 || test_direct_stamp() != 0 || test_direct_layout() != 0 ||
+        test_direct_retry_cap() != 0 || test_pool_ring() != 0 || test_gather_runs() != 0 ||
+        test_shared_activation() != 0 || test_shared_act_sibling() != 0 || test_sibling_pending() != 0) {
         return 1;
     }
     std::printf("OK: moe decode host path decisions\n");

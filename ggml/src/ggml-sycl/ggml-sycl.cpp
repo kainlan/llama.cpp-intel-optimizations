@@ -21584,25 +21584,22 @@ static void moe_layer_group_profile_record(const moe_layer_decode_plan &      pl
 static thread_local std::unordered_map<int, moe_gate_up_pair> g_moe_gate_up_pairs;
 
 // The one op that may reuse the activation row dst's MUL_MAT_ID copied to
-// host: the other half of its layer's gate/up pair in the current graph, and
-// only when both halves read the same src1 node. Anything else (down, a fused
-// gate_up, an op outside the scanned graph) has no sibling and copies its own.
-static const ggml_tensor * moe_shared_act_sibling(const ggml_tensor * dst) {
-    if (!dst || !dst->src[0] || !dst->src[1]) {
+// host, from the current graph's gate/up scan; see moe_shared_act_sibling_of().
+static const void * moe_shared_act_sibling(const ggml_tensor * dst) {
+    if (!dst || !dst->src[0]) {
         return nullptr;
     }
     const auto it = g_moe_gate_up_pairs.find(parse_layer_id_from_name(dst->src[0]->name));
     if (it == g_moe_gate_up_pairs.end()) {
-        return nullptr;
+        return ggml_sycl::moe_shared_act_sibling_of(nullptr, dst, dst->src[1]);
     }
-    const moe_gate_up_pair & pair = it->second;
-    if (!pair.gate_dst || !pair.up_dst || pair.gate_dst->src[1] != dst->src[1] || pair.up_dst->src[1] != dst->src[1]) {
-        return nullptr;
-    }
-    if (dst == pair.gate_dst) {
-        return pair.up_dst;
-    }
-    return dst == pair.up_dst ? pair.gate_dst : nullptr;
+    const moe_gate_up_pair &     pair = it->second;
+    ggml_sycl::moe_gate_up_nodes nodes;
+    nodes.gate_dst  = pair.gate_dst;
+    nodes.gate_src1 = pair.gate_dst ? pair.gate_dst->src[1] : nullptr;
+    nodes.up_dst    = pair.up_dst;
+    nodes.up_src1   = pair.up_dst ? pair.up_dst->src[1] : nullptr;
+    return ggml_sycl::moe_shared_act_sibling_of(&nodes, dst, dst->src[1]);
 }
 // llama.cpp-3hs5: per (layer, device, role) generation at which an in-line
 // RESTORE-T1 decode pointer-table build (see ggml_sycl_mul_mat_id) was last
@@ -22217,6 +22214,15 @@ struct moe_shared_act_state {
 };
 
 static thread_local moe_shared_act_state g_moe_shared_act;
+
+// A new graph compute: the staging no longer holds a row of this graph, and
+// node pointers may repeat (graph reuse), so the epoch moves on. compute_impl
+// reaches it through ggml_sycl_cpu_tg_flush_pending(); segmented replay and
+// block graphlets, which bypass compute_impl, call it directly.
+static void moe_shared_act_new_graph() {
+    g_moe_shared_act = {};
+    ++g_moe_graph_epoch;
+}
 
 // Result struct for async CPU expert dispatch.  Carries compute output and
 // metadata from the async thread back to the main thread so the main thread
@@ -24700,8 +24706,7 @@ void ggml_sycl_cpu_tg_flush_pending() {
     flush_pending_cpu_scatter();
     flush_prev_cpu_pipeline_bufs();  // Final cleanup for last deferred pipeline scatter
     flush_prev_scatter_bufs();       // Final cleanup for last async scatter
-    g_moe_shared_act = {};           // graph-local: src1 storage is rewritten by the next graph
-    ++g_moe_graph_epoch;
+    moe_shared_act_new_graph();      // graph-local: src1 storage is rewritten by the next graph
     if (ggml_sycl_pipeline_moe_enabled()) {
         pipeline_scatter_drain();
     }
@@ -57851,8 +57856,17 @@ static const void * const * ggml_sycl_moe_decode_direct_table(ggml_backend_sycl_
     layout_mode                                layout  = GGML_LAYOUT_AOS;
     const void * const *                       table   = nullptr;
     const ggml_sycl::moe_decode_direct_outcome outcome = ggml_sycl_moe_decode_direct_decide(ctx, src0, &layout, &table);
-    ggml_sycl::moe_decode_direct_stamp_settle(stamp, replan_epoch, storage_generation, selected_rows,
-                                              static_cast<int>(layout), outcome);
+    const ggml_sycl::moe_decode_direct_outcome settled = ggml_sycl::moe_decode_direct_stamp_settle(
+        stamp, replan_epoch, storage_generation, selected_rows, static_cast<int>(layout), outcome);
+    if (settled != outcome) {
+        static std::atomic<int> capped_log{ 0 };
+        if (capped_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+            GGML_LOG_INFO(
+                "[MOE-ROUTE] decode direct tensor=%s device=%d: table build failed %u times in a row; "
+                "using the existing route until the plan or expert storage changes\n",
+                src0->name, device, ggml_sycl::moe_decode_direct_retry_limit);
+        }
+    }
     if (table) {
         *layout_out = layout;
     }
@@ -109598,6 +109612,10 @@ normal_dispatch:
         }
 
         if (use_segmented) {
+            // Segmented replay and block graphlets dispatch MoE ops without
+            // entering compute_impl, so they start the graph's shared
+            // activation state here.
+            moe_shared_act_new_graph();
             bool block_graphlet_executed = false;
             if (cached_is_decode && descriptor_moe_graph_candidates > 0 &&
                 !sycl_ctx->moe_fa_post_prompt_record_pending) {
