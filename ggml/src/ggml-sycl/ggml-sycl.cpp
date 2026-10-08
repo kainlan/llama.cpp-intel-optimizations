@@ -9726,7 +9726,8 @@ bool test_backend_graphs_disabled(ggml_backend_t backend) {
     if (!ctx) {
         return true;
     }
-    return g_ggml_sycl_disable_graph || ctx->graphs_disabled || ctx->moe_graphs_disabled;
+    return g_ggml_sycl_disable_graph || ctx->graphs_disabled || ctx->moe_graphs_disabled ||
+           ctx->moe_graph_preload_refused;
 }
 
 size_t test_graph_pinned_entry_count(ggml_backend_t backend) {
@@ -61790,9 +61791,64 @@ static bool ggml_sycl_moe_phase_materialization_needed(ggml_backend_sycl_context
     return false;
 }
 
+// Stamp inputs of one MUL_MAT_ID (moe-graph-preload-stamp.hpp). Reads weight_ext without creating it: a tensor whose
+// extension does not exist yet reads generation 0, and creating the extension then reads as a residency change.
+static ggml_sycl::moe_graph_preload_inputs ggml_sycl_moe_graph_preload_inputs_of(const ggml_tensor * node,
+                                                                                 int                 device,
+                                                                                 bool host_tier_boundary) {
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(node->src[0]->extra);
+
+    ggml_sycl::moe_graph_preload_inputs in;
+    in.replan_epoch       = ggml_sycl::moe_route_table_current_replan_epoch();
+    in.storage_generation = extra && extra->weight_ext ? extra->weight_ext->moe_expert_storage_generation : 0;
+    in.n_tokens           = node->src[2]->ne[1];
+    in.device             = device;
+    in.host_tier_boundary = host_tier_boundary;
+    return in;
+}
+
+static void ggml_sycl_moe_graph_preload_stamp_tensor(const ggml_tensor * node,
+                                                     int                 device,
+                                                     bool                host_tier_boundary,
+                                                     bool                refused) {
+    auto * extra = static_cast<ggml_tensor_extra_gpu *>(node->src[0]->extra);
+    if (!extra || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    auto & weight = extra->weight();  // before reading the inputs: creating the extension sets its generation
+    ggml_sycl::moe_graph_preload_stamp_record(weight.moe_graph_preload[device],
+                                              ggml_sycl_moe_graph_preload_inputs_of(node, device, host_tier_boundary),
+                                              refused);
+}
+
+// What the stamps of this split's MUL_MAT_IDs say about running the preload. Scans the same nodes the preload walks.
+static ggml_sycl::moe_graph_preload_split_decision ggml_sycl_moe_graph_preload_decide(const ggml_cgraph * cgraph,
+                                                                                      int                 device,
+                                                                                      bool host_tier_boundary) {
+    ggml_sycl::moe_graph_preload_split_scan scan;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[2]) {
+            continue;
+        }
+        const auto * extra   = static_cast<const ggml_tensor_extra_gpu *>(node->src[0]->extra);
+        const bool   stamped = extra && extra->weight_ext && device >= 0 && device < GGML_SYCL_MAX_DEVICES;
+        ggml_sycl::moe_graph_preload_split_add(
+            scan, stamped ? extra->weight_ext->moe_graph_preload[device] : ggml_sycl::moe_graph_preload_stamp{},
+            ggml_sycl_moe_graph_preload_inputs_of(node, device, host_tier_boundary));
+    }
+    return ggml_sycl::moe_graph_preload_split_decide(scan);
+}
+
 // Prepare MoE pointer tables before graph recording/execution
-// This updates per-id cached layouts without full preload
-static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
+// This updates per-id cached layouts without full preload.
+// host_tier_boundary: the caller keeps MUL_MAT_ID nodes out of recorded graphs (segmented decode), so a tensor whose
+// experts are all host-planned is skipped rather than refused. *pending_node is the MUL_MAT_ID being prepared, and
+// stays set when a failure returns false.
+static bool graph_preload_moe_experts_impl(ggml_backend_sycl_context & ctx,
+                                           ggml_cgraph *               cgraph,
+                                           bool                        host_tier_boundary,
+                                           const ggml_tensor **        pending_node) {
     // Unified cache handles expert layouts; prep pointer tables per graph invocation.
     // Placement-plan model load already materializes MoE experts in VRAM or host-pinned
     // memory. Graph preload still refreshes pointer tables and retains the smart
@@ -61826,7 +61882,8 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
         if (!src0 || !ids) {
             continue;
         }
-        any_moe = true;
+        any_moe       = true;
+        *pending_node = node;
 
         bool          host_weights   = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
         const int64_t n_ids    = ids->ne[0];
@@ -61872,6 +61929,19 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
                         }
                     }
                 }
+            }
+        }
+        // Placement decides the executor: a tensor whose experts are all host-planned runs on the CPU as a direct
+        // node, which segmented decode keeps outside its recordings. It needs no device pointer table, ids staging
+        // or leases, so none of the work below runs for it.
+        if (plan_preloaded && host_weights && host_tier_boundary) {
+            const moe_planned_layout_probe host_probe = ggml_sycl_probe_moe_planned_layout(src0, ctx.device, layout);
+            if (ggml_sycl::moe_graph_preload_classify(host_probe.local, host_probe.secondary, host_probe.host,
+                                                      host_probe.missing, n_experts, host_tier_boundary) ==
+                ggml_sycl::moe_graph_preload_tensor_verdict::HOST_TIER_BOUNDARY) {
+                ggml_sycl_moe_graph_preload_stamp_tensor(node, ctx.device, host_tier_boundary, /*refused=*/false);
+                *pending_node = nullptr;
+                continue;
             }
         }
         if (!plan_preloaded && host_weights && cache) {
@@ -61974,11 +62044,15 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
                                                moe_ptr_table_coverage::FULL_TABLE;
         if (plan_preloaded && coverage == moe_ptr_table_coverage::AUTO_RESOLVED_VIEW) {
             const moe_planned_layout_probe probe = ggml_sycl_probe_moe_planned_layout(src0, ctx.device, layout);
-            if (probe.local != static_cast<size_t>(std::max<int64_t>(0, n_experts))) {
+            // An all-host tensor was skipped above where that is safe, so here only a full local table passes.
+            if (ggml_sycl::moe_graph_preload_classify(probe.local, probe.secondary, probe.host, probe.missing,
+                                                      n_experts, /*host_tier_boundary=*/false) !=
+                ggml_sycl::moe_graph_preload_tensor_verdict::TABLE) {
+                // The refusal is stamped, so this logs once per residency change of the tensor, not per token.
                 static std::atomic<int> planned_graph_skip_log{ 0 };
                 const int               n = planned_graph_skip_log.fetch_add(1, std::memory_order_relaxed);
                 if (n < 32) {
-                    GGML_LOG_WARN(
+                    GGML_LOG_INFO(
                         "[GRAPH-PRELOAD] Planner-owned MoE tensor %s cannot be represented as one current-device "
                         "pointer table for layout=%s (local=%zu secondary=%zu host=%zu missing=%zu); using direct "
                         "smart-handle dispatch\n",
@@ -62080,6 +62154,8 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
                               src0->name ? src0->name : "(unknown)");
             }
         }
+        ggml_sycl_moe_graph_preload_stamp_tensor(node, ctx.device, host_tier_boundary, /*refused=*/false);
+        *pending_node = nullptr;
     }
     if (!table_events.empty()) {
         sycl::event deps_barrier = ctx.stream()->ext_oneapi_submit_barrier(table_events);
@@ -62094,6 +62170,18 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
     }
 
     return true;
+}
+
+// Runs the preload and stamps the tensor it stopped on as refused, so the same residency state is not re-decided.
+static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, bool host_tier_boundary) {
+    const ggml_tensor * pending_node = nullptr;
+    if (graph_preload_moe_experts_impl(ctx, cgraph, host_tier_boundary, &pending_node)) {
+        return true;
+    }
+    if (pending_node) {
+        ggml_sycl_moe_graph_preload_stamp_tensor(pending_node, ctx.device, host_tier_boundary, /*refused=*/true);
+    }
+    return false;
 }
 
 // Unpin all expert cache slots after graph execution
@@ -95946,7 +96034,7 @@ gpu_dispatch:
             if (direct_moe_graphlet_probe && !g_ggml_sycl_graph_recording && g_moe_descriptor_capture_decode_phase &&
                 !g_moe_segmented_graph_dispatch_active && !g_ggml_sycl_disable_graph && !sycl_ctx->graphs_disabled &&
                 !sycl_ctx->moe_graphs_disabled && !sycl_ctx->moe_direct_dispatch_graphs_disabled &&
-                node->op == GGML_OP_MUL_MAT_ID &&
+                !sycl_ctx->moe_graph_preload_refused && node->op == GGML_OP_MUL_MAT_ID &&
                 !ggml_sycl_moe_precomputed_mmid_skip_pending(node, sycl_ctx->device) &&
                 moe_graph_descriptor_moe_dispatch_supported(sycl_ctx, node) &&
                 ggml_sycl_get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_limited_graph)) {
@@ -98514,7 +98602,8 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
     if (!sycl_ctx || !cgraph || !node || !graph_hash_cache || !moe_default_fast_path_runtime_enabled() ||
         !g_moe_descriptor_capture_decode_phase || g_moe_segmented_graph_dispatch_active ||
         g_ggml_sycl_graph_recording || g_ggml_sycl_disable_graph || sycl_ctx->graphs_disabled ||
-        sycl_ctx->moe_graphs_disabled || sycl_ctx->moe_sequence_graphs_disabled || node->op != GGML_OP_MUL_MAT_ID ||
+        sycl_ctx->moe_graph_preload_refused || sycl_ctx->moe_graphs_disabled ||
+        sycl_ctx->moe_sequence_graphs_disabled || node->op != GGML_OP_MUL_MAT_ID ||
         ggml_sycl_moe_precomputed_mmid_skip_pending(node, sycl_ctx->device)) {
         return false;
     }
@@ -100005,7 +100094,7 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
         return false;
     }
     if (sycl_ctx->moe_block_graphs_disabled || g_ggml_sycl_disable_graph || sycl_ctx->graphs_disabled ||
-        sycl_ctx->moe_graphs_disabled) {
+        sycl_ctx->moe_graph_preload_refused || sycl_ctx->moe_graphs_disabled) {
         ggml_sycl_moe_aggregation_diag(sycl_ctx, "block-graphlet", "reject", "disabled");
         return false;
     }
@@ -108754,9 +108843,22 @@ normal_dispatch:
         }
     }
 
-    // Check if graphs were disabled due to MoE preload failure (persists until model reload)
+    // An all-host expert tensor may stay a direct node only where MUL_MAT_ID nodes are kept out of recorded graphs:
+    // decode, which records segments around them, and not the opt-in full-capture graphlet probe.
+    const bool moe_host_tier_boundary = cached_is_decode && !moe_graphlet_replay_probe_enabled();
+    sycl_ctx->moe_graph_preload_refused =
+        ggml_sycl_moe_graph_preload_decide(cgraph, sycl_ctx->device, moe_host_tier_boundary) ==
+        ggml_sycl::moe_graph_preload_split_decision::REFUSED;
+
+    // Check if graphs were quarantined by a failed MoE graph epoch retire (persists for this context)
     if (sycl_ctx->moe_graphs_disabled) {
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] graphs disabled due to MoE preload failure\n");
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] graphs disabled: a MoE graph epoch retire failed\n");
+        use_sycl_graph = false;
+    }
+    // This split's MoE preload was refused under its current expert residency; other splits are unaffected, and a
+    // residency change re-opens it.
+    if (sycl_ctx->moe_graph_preload_refused) {
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] graphs off for this split: MoE preload refused for the current residency\n");
         use_sycl_graph = false;
     }
 
@@ -108819,13 +108921,21 @@ normal_dispatch:
             sycl_ctx->invalidate_moe_phase_layout_cache();
         }
         moe_prestage_popular_experts();
-        if (!graph_preload_moe_experts(*sycl_ctx, cgraph)) {
-            GGML_LOG_WARN("[SYCL-GRAPH] PP→TG MoE planned-residency refresh failed; suppressing graph path\n");
-            sycl_ctx->moe_graphs_disabled = true;
-            use_sycl_graph                = false;
-            graph_unpin_moe_experts(sycl_ctx);
-        } else {
-            GGML_LOG_INFO("[SYCL-GRAPH] PP→TG refreshed MoE planned residency before direct TG\n");
+        // The residency check is answered once per expert-residency state of this split's tensors; the stamps it
+        // leaves (moe-graph-preload-stamp.hpp) say whether it must run again. A skipped check collects no leases
+        // and releases none, so leases an executable graph retained stay in place.
+        if (ggml_sycl_moe_graph_preload_decide(cgraph, sycl_ctx->device, moe_host_tier_boundary) ==
+            ggml_sycl::moe_graph_preload_split_decision::RUN) {
+            if (!graph_preload_moe_experts(*sycl_ctx, cgraph, moe_host_tier_boundary)) {
+                GGML_LOG_INFO(
+                    "[SYCL-GRAPH] PP→TG MoE planned-residency refresh failed; this split runs direct until its "
+                    "expert residency changes\n");
+                sycl_ctx->moe_graph_preload_refused = true;
+                use_sycl_graph                      = false;
+                graph_unpin_moe_experts(sycl_ctx);
+            } else {
+                GGML_LOG_INFO("[SYCL-GRAPH] PP→TG refreshed MoE planned residency before direct TG\n");
+            }
         }
         if (hostmem_logged) {
             ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase::PP_TO_TG_AFTER, "pp-to-tg-after-refresh");
@@ -108858,12 +108968,13 @@ normal_dispatch:
             const bool has_host_inputs = ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph);
             fprintf(stderr,
                     "[SYCL-SEG-MOE-POLICY] use_graph=%d candidates=%d free_vram=%.1fMB headroom_ok=%d "
-                    "segments_match=%d moe_rerecord=%d has_host_inputs=%d graphs_disabled=%d moe_graphs_disabled=%d\n",
+                    "segments_match=%d moe_rerecord=%d has_host_inputs=%d graphs_disabled=%d moe_graphs_disabled=%d "
+                    "moe_preload_refused=%d\n",
                     use_sycl_graph ? 1 : 0, descriptor_moe_graph_candidates,
                     descriptor_moe_graph_candidates > 0 ? descriptor_moe_graph_free_vram / (1024.0 * 1024.0) : -1.0,
                     descriptor_moe_graph_headroom_ok ? 1 : 0, descriptor_moe_segments_match ? 1 : 0,
                     sycl_ctx->moe_graph_rerecord ? 1 : 0, has_host_inputs ? 1 : 0, sycl_ctx->graphs_disabled ? 1 : 0,
-                    sycl_ctx->moe_graphs_disabled ? 1 : 0);
+                    sycl_ctx->moe_graphs_disabled ? 1 : 0, sycl_ctx->moe_graph_preload_refused ? 1 : 0);
         }
     }
     if (use_sycl_graph && cached_is_decode && !moe_graphlet_replay_probe && descriptor_moe_graph_candidates > 0 &&
@@ -108955,6 +109066,7 @@ normal_dispatch:
         static std::atomic<bool> diag_tp_logged{ false };
         static std::atomic<bool> diag_placement_host_logged{ false };
         static std::atomic<bool> diag_moe_graphs_disabled_logged{ false };
+        static std::atomic<bool> diag_moe_preload_refused_logged{ false };
         static std::atomic<bool> diag_split_logged{ false };
         static std::atomic<bool> diag_compat_logged{ false };
 
@@ -108979,7 +109091,10 @@ normal_dispatch:
             GGML_SYCL_DEBUG("[GRAPH-DIAG] TG graph DISABLED: placement plan + host intermediates in decode graph\n");
         }
         if (sycl_ctx->moe_graphs_disabled && !diag_moe_graphs_disabled_logged.exchange(true)) {
-            GGML_SYCL_DEBUG("[GRAPH-DIAG] TG graph DISABLED: moe_graphs_disabled (MoE preload failure)\n");
+            GGML_SYCL_DEBUG("[GRAPH-DIAG] TG graph DISABLED: moe_graphs_disabled (MoE graph epoch retire failed)\n");
+        }
+        if (sycl_ctx->moe_graph_preload_refused && !diag_moe_preload_refused_logged.exchange(true)) {
+            GGML_SYCL_DEBUG("[GRAPH-DIAG] TG graph DISABLED: moe_graph_preload_refused (MoE preload refused)\n");
         }
         if (g_split_config.enabled && !diag_split_logged.exchange(true)) {
             GGML_SYCL_DEBUG("[GRAPH-DIAG] TG graph DISABLED: tensor split active (multi-device overlap preferred)\n");
@@ -108989,7 +109104,8 @@ normal_dispatch:
             !g_sycl_graph_multithreaded.load(std::memory_order_relaxed) &&
             !(g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1) && !g_split_config.enabled &&
             gpu_prefix_end < 0 && !(ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph)) &&
-            !sycl_ctx->moe_graphs_disabled && !diag_compat_logged.exchange(true)) {
+            !sycl_ctx->moe_graphs_disabled && !sycl_ctx->moe_graph_preload_refused &&
+            !diag_compat_logged.exchange(true)) {
             GGML_SYCL_DEBUG("[GRAPH-DIAG] TG graph DISABLED: check_graph_compatibility() returned false\n");
         }
     }
@@ -109417,9 +109533,13 @@ normal_dispatch:
         sycl_ctx->mmvq_q8_activation_cache.invalidate();
 
         // Prepare MoE pointer tables for current ids before graph recording/execution.
-        if (!graph_preload_moe_experts(*sycl_ctx, cgraph)) {
-            GGML_LOG_WARN("[SYCL-GRAPH] MoE pointer table prep failed, disabling graphs for all splits\n");
-            sycl_ctx->moe_graphs_disabled = true;
+        // A refusal is stamped on the tensor, so the entry check keeps this split direct, without rerunning the
+        // preload or logging again, until its expert residency changes. Other splits keep their graphs.
+        if (!graph_preload_moe_experts(*sycl_ctx, cgraph, moe_host_tier_boundary)) {
+            GGML_LOG_INFO(
+                "[SYCL-GRAPH] MoE pointer table prep failed; this split runs direct until its expert residency "
+                "changes\n");
+            sycl_ctx->moe_graph_preload_refused = true;
             graph_unpin_moe_experts(sycl_ctx);
             compute_impl_unlocked();
             record_completion(false);

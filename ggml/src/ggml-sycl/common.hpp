@@ -24,6 +24,7 @@
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 #include "moe-decode-hostpath.hpp"
+#include "moe-graph-preload-stamp.hpp"
 #include "moe-graph-retention.hpp"
 #include "moe-layer-plan.hpp"
 #include "moe-route-table.hpp"
@@ -3920,6 +3921,8 @@ struct ggml_tensor_extra_gpu_weight_ext {
     uint64_t                           moe_planned_layout_generation[GGML_SYCL_MAX_DEVICES][2][2]      = {};
     ggml_layout_mode                   moe_planned_layout_cache[GGML_SYCL_MAX_DEVICES][2][2]           = {};
     bool                               moe_planned_layout_valid[GGML_SYCL_MAX_DEVICES][2][2]           = {};
+    // Outcome of the MoE graph preload for this tensor, per device; see moe-graph-preload-stamp.hpp.
+    ggml_sycl::moe_graph_preload_stamp moe_graph_preload[GGML_SYCL_MAX_DEVICES];
     // Per-device cached MoE expert route table (perf-recovery epic, track B,
     // llama.cpp-1tjn). Built once per (plan_generation, expert_storage_generation)
     // pair and consumed read-only by decode dispatch instead of re-resolving
@@ -6246,13 +6249,19 @@ struct ggml_backend_sycl_context {
     // (one shape, forever) scans once instead of every call.
     uint64_t exec_graph_last_scanned_hash   = 0;
     bool     exec_graph_has_scanned         = false;
-    bool     moe_graphs_disabled      = false;  // Set when MoE preload fails; disables graphs for all splits
+    bool     moe_graphs_disabled      = false;  // Set when a MoE graph epoch retire fails; quarantines graph replay
     bool     moe_graphs_disabled_once = false;  // Set when we skip graphs for a single run
     bool     moe_graph_rerecord       = false;  // Once set, never cleared — MoE models always re-record per token
     bool     graph_recording_dispatch = false;  // Context-scoped guard while compute_impl records a command graph
+
+    // Set per graph_compute call: the MoE preload of THIS split was refused under its tensors' current expert
+    // residency (moe-graph-preload-stamp.hpp), so this split runs direct. A residency change re-opens it.
+    bool moe_graph_preload_refused = false;
+
     // Phase of the last split this context classified. A split with no matmul has no batch evidence and keeps it
     // (graph-phase.hpp). Atomic because the classification runs before graph_mutex is taken.
     std::atomic<bool> graph_phase_is_decode{ false };
+
     uint64_t test_graph_replay_count  = 0;
 
     // One published retention epoch owns every MMID graphlet currently cached
