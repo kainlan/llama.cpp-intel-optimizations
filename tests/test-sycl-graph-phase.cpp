@@ -45,6 +45,28 @@ struct graph_fixture {
         ggml_build_forward_expand(graph, ggml_mul_mat_id(ctx, w, x, ids));
     }
 
+    // A per-token lookup: rows gathered from a leaf 2-D table (a token embedding) by a 1-D index vector.
+    void add_lookup(int64_t n_rows) {
+        ggml_tensor * table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 1000);
+        ggml_tensor * rows  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_rows);
+        ggml_build_forward_expand(graph, ggml_rms_norm(ctx, ggml_get_rows(ctx, table, rows), 1e-6f));
+    }
+
+    // A recurrent-state gather: rows of a reshaped (view) state cache, one per sequence, not per token.
+    void add_state_gather(int64_t n_seqs) {
+        ggml_tensor * cache  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64 * 8);
+        ggml_tensor * states = ggml_reshape_2d(ctx, cache, 64, 8);
+        ggml_tensor * rows   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_build_forward_expand(graph, ggml_get_rows(ctx, states, rows));
+    }
+
+    // A MoE weight gather: routing probabilities [1, n_expert, n_tokens] picked by ids [n_used, n_tokens].
+    void add_moe_weight_gather(int64_t n_tokens) {
+        ggml_tensor * probs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, n_tokens);
+        ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_tokens);
+        ggml_build_forward_expand(graph, ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, 8, n_tokens), ids));
+    }
+
     // Neither kind of matmul: a norm and an add over n_tokens rows.
     void add_elementwise(int64_t n_tokens) {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, n_tokens);
@@ -121,6 +143,45 @@ int test_no_evidence_keeps_phase() {
     return 0;
 }
 
+int test_lookup_evidence() {
+    {
+        graph_fixture g;
+        g.add_lookup(6);
+        CHECK(!g.is_decode(true), "a matmul-free split looking up several token rows is a prompt, even after decode");
+    }
+    {
+        graph_fixture g;
+        g.add_lookup(1);
+        CHECK(g.is_decode(false), "a matmul-free split looking up one token row is decode");
+    }
+    {
+        graph_fixture g;
+        g.add_lookup(1);
+        g.add_dense(5);
+        CHECK(!g.is_decode(true), "a matmul in the split outranks a lookup");
+    }
+    return 0;
+}
+
+int test_non_token_gathers_are_not_evidence() {
+    {
+        graph_fixture g;
+        g.add_state_gather(1);
+        CHECK(!g.is_decode(false), "a per-sequence state gather (a view table) does not make a prompt split decode");
+    }
+    {
+        graph_fixture g;
+        g.add_moe_weight_gather(1);
+        CHECK(!g.is_decode(false), "a MoE weight gather (3-D view table, 2-D ids) is not evidence");
+    }
+    {
+        graph_fixture g;
+        g.add_moe_weight_gather(7);
+        CHECK(g.is_decode(true), "a MoE weight gather over several tokens is not evidence either");
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -129,6 +190,8 @@ int main() {
     rc |= test_moe_evidence();
     rc |= test_first_evidence_decides();
     rc |= test_no_evidence_keeps_phase();
+    rc |= test_lookup_evidence();
+    rc |= test_non_token_gathers_are_not_evidence();
     if (rc == 0) {
         std::printf("test-sycl-graph-phase: all checks passed\n");
     }
