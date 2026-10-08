@@ -23,6 +23,7 @@
 #include "layer-streaming.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
+#include "moe-decode-hostpath.hpp"
 #include "moe-graph-retention.hpp"
 #include "moe-layer-plan.hpp"
 #include "moe-route-table.hpp"
@@ -3913,6 +3914,9 @@ struct ggml_tensor_extra_gpu_weight_ext {
     uint64_t                           moe_full_local_probe_generation[GGML_SYCL_MAX_DEVICES]          = {};
     ggml_layout_mode                   moe_full_local_probe_layout[GGML_SYCL_MAX_DEVICES]              = {};
     bool                               moe_full_local_probe_ok[GGML_SYCL_MAX_DEVICES]                  = {};
+    // Batch-1 decode direct-dispatch eligibility and layout, per device; see
+    // moe-decode-hostpath.hpp (llama.cpp-yx28).
+    ggml_sycl::moe_decode_direct_stamp moe_decode_direct[GGML_SYCL_MAX_DEVICES];
     uint64_t                           moe_planned_layout_generation[GGML_SYCL_MAX_DEVICES][2][2]      = {};
     ggml_layout_mode                   moe_planned_layout_cache[GGML_SYCL_MAX_DEVICES][2][2]           = {};
     bool                               moe_planned_layout_valid[GGML_SYCL_MAX_DEVICES][2][2]           = {};

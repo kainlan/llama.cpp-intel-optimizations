@@ -57538,30 +57538,20 @@ static const void * const * moe_fusion_ensure_full_local_ptr_table_from_descript
     return ggml_sycl_upload_moe_transient_ptr_table(ctx, weight, slots, layer_hash, role.layout, &role.ready_events);
 }
 
-static const void * const * moe_fusion_ensure_full_local_ptr_table(ggml_backend_sycl_context & ctx,
-                                                                   const ggml_tensor *         weight,
-                                                                   int                         layer_hash,
-                                                                   layout_mode                 layout) {
-    const void * const * cached = moe_fusion_full_local_ptr_table(weight, ctx.device, layout);
-    if (cached) {
-        return cached;
-    }
+// Resolves every expert's storage record on ctx.device in `layout` and uploads
+// the full-coverage pointer table; records the full-local probe either way.
+static const void * const * moe_fusion_build_full_local_ptr_table(ggml_backend_sycl_context & ctx,
+                                                                  const ggml_tensor *         weight,
+                                                                  int                         layer_hash,
+                                                                  layout_mode                 layout) {
     if (!weight || ctx.device < 0 || ctx.device >= GGML_SYCL_MAX_DEVICES) {
         return nullptr;
     }
-
     auto * extra = static_cast<ggml_tensor_extra_gpu *>(weight->extra);
     if (!extra) {
         return nullptr;
     }
-
     const uint64_t storage_generation = extra->weight().moe_expert_storage_generation;
-    if (extra->weight().moe_full_local_probe_generation[ctx.device] == storage_generation &&
-        extra->weight().moe_full_local_probe_layout[ctx.device] == layout &&
-        !extra->weight().moe_full_local_probe_ok[ctx.device]) {
-        return nullptr;
-    }
-
     const int64_t n_experts = weight->ne[2] > 0 ? weight->ne[2] : 1;
     if (n_experts <= 0) {
         return nullptr;
@@ -57596,6 +57586,116 @@ static const void * const * moe_fusion_ensure_full_local_ptr_table(ggml_backend_
     extra->weight().moe_full_local_probe_layout[ctx.device]     = layout;
     extra->weight().moe_full_local_probe_ok[ctx.device]         = table != nullptr;
     return table;
+}
+
+static const void * const * moe_fusion_ensure_full_local_ptr_table(ggml_backend_sycl_context & ctx,
+                                                                   const ggml_tensor *         weight,
+                                                                   int                         layer_hash,
+                                                                   layout_mode                 layout) {
+    const void * const * cached = moe_fusion_full_local_ptr_table(weight, ctx.device, layout);
+    if (cached) {
+        return cached;
+    }
+    if (!weight || ctx.device < 0 || ctx.device >= GGML_SYCL_MAX_DEVICES) {
+        return nullptr;
+    }
+
+    auto * extra = static_cast<ggml_tensor_extra_gpu *>(weight->extra);
+    if (!extra) {
+        return nullptr;
+    }
+
+    const uint64_t storage_generation = extra->weight().moe_expert_storage_generation;
+    if (extra->weight().moe_full_local_probe_generation[ctx.device] == storage_generation &&
+        extra->weight().moe_full_local_probe_layout[ctx.device] == layout &&
+        !extra->weight().moe_full_local_probe_ok[ctx.device]) {
+        return nullptr;
+    }
+    return moe_fusion_build_full_local_ptr_table(ctx, weight, layer_hash, layout);
+}
+
+// llama.cpp-yx28: the batch-1 decode direct route. When every expert of src0
+// is resident on ctx.device, decode dispatches from the full-coverage table
+// built here plus the device ids tensor: no ids readback, no table upload and
+// no host batch-ids upload per op. Eligibility and layout are decided once per
+// (replan epoch, expert storage generation, selected rows) and cached in the
+// tensor's weight extension; the steady state is the memoized
+// moe_fusion_full_local_ptr_table() query. Returns nullptr when the tensor is
+// not eligible, and the caller keeps its existing route.
+static const void * const * ggml_sycl_moe_decode_direct_table(ggml_backend_sycl_context & ctx,
+                                                              const ggml_tensor *         src0,
+                                                              int64_t                     selected_rows,
+                                                              layout_mode *               layout_out) {
+    const int device = ctx.device;
+    auto *    extra  = src0 ? static_cast<ggml_tensor_extra_gpu *>(src0->extra) : nullptr;
+    if (!extra || !layout_out || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return nullptr;
+    }
+    ggml_sycl::moe_decode_direct_stamp & stamp              = extra->weight().moe_decode_direct[device];
+    const uint64_t                       replan_epoch       = ggml_sycl::moe_route_table_current_replan_epoch();
+    const uint64_t                       storage_generation = extra->weight().moe_expert_storage_generation;
+    if (ggml_sycl::moe_decode_direct_stamp_current(stamp, replan_epoch, storage_generation, selected_rows)) {
+        if (!stamp.eligible) {
+            return nullptr;
+        }
+        const layout_mode    layout = static_cast<layout_mode>(stamp.layout);
+        const void * const * table  = moe_fusion_full_local_ptr_table(src0, device, layout);
+        if (table) {
+            *layout_out = layout;
+            return table;
+        }
+        // Another route rewrote a slot of this tensor's shared table (the
+        // upload invalidates the full-local probe); rebuild it below.
+    }
+
+    // An empty plan is transient (the retained route republishes it), so it
+    // is not cached as a decision.
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
+        return nullptr;
+    }
+    // Every other refusal below holds for this generation; record it first.
+    ggml_sycl::moe_decode_direct_stamp_record(stamp, replan_epoch, storage_generation, selected_rows,
+                                              static_cast<int>(GGML_LAYOUT_AOS), /*eligible=*/false);
+    // The batched pointer-table route is admitted only on a single routable
+    // device, as in the planner-owned route's planner_batched_ptr_table_safe.
+    if (ggml_sycl_get_tensor_usage(src0) != tensor_usage::MOE_EXPERT_WEIGHT || ggml_sycl_routable_device_count() > 1 ||
+        ggml_sycl_is_host_resident_weight(src0, ctx.stream())) {
+        return nullptr;
+    }
+    // Same layout derivation as the planner-owned decode route.
+    layout_mode layout = ggml_sycl_select_moe_planned_graph_layout(src0, device, /*host_weights=*/false, 1);
+    layout = ggml_sycl_moe_layout_for_selected_rows(src0, device, layout, static_cast<size_t>(selected_rows),
+                                                    /*exact_override=*/false, 1);
+    if (!ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, layout)) {
+        return nullptr;
+    }
+    // Fresh resolution of every expert's storage record: the actual
+    // materialization, not the plan, decides that all experts are local.
+    const void * const * table =
+        moe_fusion_build_full_local_ptr_table(ctx, src0, moe_cache_layer_id(src0->name), layout);
+    ggml_sycl::moe_decode_direct_stamp_record(stamp, replan_epoch, storage_generation, selected_rows,
+                                              static_cast<int>(layout), table != nullptr);
+    if (table) {
+        *layout_out = layout;
+    }
+    return table;
+}
+
+// The ids tensor's own device storage, or nullptr when it is not resident on
+// ctx.device. Unlike ggml_sycl_get_moe_ids_device_ptr() this never stages a
+// host copy, so the decode direct route takes no H2D and no host wait for ids.
+static const int32_t * ggml_sycl_moe_ids_device_resident_ptr(ggml_backend_sycl_context & ctx, const ggml_tensor * ids) {
+    ggml_sycl_tensor_storage_handle storage{};
+    if (!ids || !ggml_sycl_find_tensor_storage_handle(ids, ctx.device, &storage) || !storage.handle.valid() ||
+        storage.owner != ctx.device) {
+        return nullptr;
+    }
+    auto resolved = storage.handle.resolve(ctx.device);
+    if (!resolved || !resolved.ptr || !resolved.on_device) {
+        return nullptr;
+    }
+    return reinterpret_cast<const int32_t *>(static_cast<const char *>(resolved.ptr) + storage.view_offset);
 }
 
 static bool ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
@@ -73203,6 +73303,52 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                    /* use_tensor_data_ptr = */ false);
         std::lock_guard<std::mutex> lock(s_mul_mat_id_extras_mutex);
         s_mul_mat_id_extras.push_back(std::move(new_extra));
+    }
+
+    // llama.cpp-yx28: batch-1 decode with every expert resident on this
+    // device. Dispatch straight from the cached full-coverage pointer table and
+    // the device ids tensor, ahead of the retained decode admission, whose ids
+    // readback, per-op table upload, host batch-ids upload, prefetch await and
+    // planner lookups this op does not need. It also runs ahead of
+    // ggml_sycl_ensure_weight_on_device(), whose composite pointer this route
+    // never reads. A refusal anywhere falls through to the existing route.
+    if (const ggml_tensor * ids = dst->src[2]) {
+        layout_mode                          direct_override = GGML_LAYOUT_AOS;
+        ggml_sycl::moe_decode_direct_request direct_request;
+        direct_request.src1_tokens     = src1->ne[2];
+        direct_request.ids_tokens      = ids->ne[1];
+        direct_request.ids_selected    = ids->ne[0];
+        direct_request.graph_recording = g_ggml_sycl_graph_recording;
+        direct_request.layout_override = ggml_sycl_layout_override_active(direct_override);
+        direct_request.dedicated_decode_route =
+            src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4;
+        if (ggml_sycl::moe_decode_direct_request_admissible(direct_request) && src1->type == GGML_TYPE_F32 &&
+            dst->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
+            !ggml_backend_buffer_is_sycl_split(src0->buffer)) {
+            const int64_t        selected_rows = ids->ne[0] * ids->ne[1];
+            layout_mode          direct_layout = GGML_LAYOUT_AOS;
+            const void * const * direct_table =
+                ggml_sycl_moe_decode_direct_table(ctx, src0, selected_rows, &direct_layout);
+            const int32_t * direct_ids = direct_table ? ggml_sycl_moe_ids_device_resident_ptr(ctx, ids) : nullptr;
+            if (direct_ids) {
+                ctx.moe_graphs_disabled_once = true;
+                const bool direct_ok         = mmvq_moe_batched_dispatch(
+                    ctx, src0, src1, dst, direct_table, nullptr, nullptr, nullptr, static_cast<int>(selected_rows),
+                    static_cast<int>(src0->ne[2]), ids->ne[0], direct_layout, direct_ids, ids->nb[0], ids->nb[1],
+                    nullptr, 0, nullptr, nullptr, nullptr);
+                if (direct_ok) {
+                    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                        static std::atomic<int> direct_log{ 0 };
+                        if (direct_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+                            GGML_LOG_INFO("[MOE-ROUTE] decode direct tensor=%s device=%d layout=%s rows=%lld\n",
+                                          src0->name, ctx.device, ggml_sycl_layout_mode_name(direct_layout),
+                                          (long long) selected_rows);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     ggml_sycl_ensure_weight_on_device(src0, ctx.device);
