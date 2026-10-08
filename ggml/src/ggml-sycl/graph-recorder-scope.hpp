@@ -108,7 +108,7 @@ inline void graph_record_begin_note() {
 // ggml-sycl.cpp's graph paths goes through graph_exec_submit(), and test-sycl-holder-census-source
 // refuses a bare ext_oneapi_graph() there.  The census scans only ggml-sycl.cpp: unified-kernel.cpp's
 // opt-in GGML_SYCL_PERSISTENT_TG_MICRO_GRAPH replay and its overhead bench still submit bare and are
-// not counted.
+// not counted (llama.cpp-rk7z).
 inline uint64_t & graph_exec_submit_slot() {
     static thread_local uint64_t submits = 0;
     return submits;
