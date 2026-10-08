@@ -94,6 +94,18 @@ scatter events and was rejected for that reason).  It is DISJOINT REGIONS:
      Pin A3: the opt-in pipeline slot (GGML_SYCL_PIPELINE_CPU=1) has the same overwrite and aborts
      through the same kind of assertion until llama.cpp-ytc9 fixes it.
 
+     THE yx28 JOIN (llama.cpp-yx28, 7ad9eb21a; lead ruling on llama.cpp-p6zh).  Decode up after gate
+     reuses gate's activation copy and makes no D2H, so the third op-entry flush is skipped exactly
+     when `defer_entry_flush` holds (pin F3: the flush is the body of `if (!defer_entry_flush)`, and
+     that guard is itself unconditional in `if (moe_hybrid_with_plan)`).  The decision moves to the
+     join, ahead of dispatch_cpu_compute's pool writes: J1, the deferred path asks
+     moe_sibling_pending_keep, which refuses unless the staging serial is unchanged and, when both
+     sides use the pool, their spans are disjoint; on keep, gate's job moves to the sibling slot.
+     J2, otherwise gate is flushed and both slots' scatter_events are waited before the
+     dispatch_cpu_compute call that writes up's pool entries.  J3, every flush drains the older
+     (sibling) slot first, and a consumed slot of either kind flushes both.  A1 is unchanged and
+     still makes an unflushed primary slot at apply time an abort.
+
 WHAT THIS DOES NOT PROVE.  It reads source text.  It shows the shortcut can no longer
 be taken when ne11 > 1 and that the per-expert path it falls to is still the
 row-selecting one.  It does not show that the numbers are right, that the CPU kernel
@@ -288,7 +300,7 @@ def check(backend_src: str, pool_src: str | None = None, hostpath_src: str | Non
         )
     check_gather(code, lam_at, hostpath_src)
 
-    check_hot_cold(code)
+    check_hot_cold(code, hostpath_src)
     check_pending_scatter(code)
     check_pool_ring(pool_src if pool_src is not None else POOL_CPP.read_text(), hostpath_src)
 
@@ -415,7 +427,86 @@ def check_pending_scatter(code: str) -> None:
         )
 
 
-def check_hot_cold(code: str) -> None:
+JOIN_ANCHOR = "size_t cpu_pool_first = pool_entry_npos;"
+
+
+def check_sibling_join(code: str, hostpath_src: str | None = None) -> None:
+    """J1-J3: what replaced the unconditional op-entry flush when it is deferred (llama.cpp-yx28)."""
+    if code.count(JOIN_ANCHOR) != 1:
+        raise ContractError(f"FAIL [pin J1]: the CPU join anchor `{JOIN_ANCHOR}` is not unique -- renamed or moved? (llama.cpp-yx28)")
+    at = code.find(JOIN_ANCHOR)
+    guard_at = code.find("if (defer_entry_flush) {", at)
+    if guard_at < 0 or squash(code[at:guard_at]).strip() != JOIN_ANCHOR:
+        raise ContractError("FAIL [pin J1]: the join does not open with `if (defer_entry_flush) {` (llama.cpp-yx28)")
+    block_text = brace_block_from(code, guard_at)
+    block = squash(block_text)
+    tail = squash(code[guard_at + len("if (defer_entry_flush) ") + len(block_text):]).lstrip()
+    for needle in (
+        "const pending_cpu_scatter & gate = g_pending_scatter;",
+        "keep.pending_active = gate.active;",
+        "keep.sibling_slot_free = !g_pending_scatter_sibling.active;",
+        "keep.reuses_activation = reuse_shared_act && gate.shares_activation;",
+        "keep.pending_act_serial = gate.act_serial;",
+        "keep.current_act_serial = g_moe_shared_act.record.serial;",
+        "keep.pending_from_pool = gate.from_pool;",
+        "keep.op_from_pool = op_pool;",
+        "keep.pending_first = gate.pool_first;",
+        "keep.pending_count = gate.pool_count;",
+        "keep.op_first = op_pool ? sib_pool.reserve_peek(n_cpu_rows) : 0;",
+        "keep.op_count = n_cpu_rows;",
+        "keep.same_row_geometry = gate.row_k == K && gate.row_n == N;",
+    ):
+        if needle not in block:
+            raise ContractError(f"FAIL [pin J1]: the deferred join no longer builds its keep request with `{needle}` (llama.cpp-yx28)")
+    keep = (r"if \(ggml_sycl::moe_sibling_pending_keep\(keep\)\) \{ move_pending_cpu_scatter_to_sibling\(\); "
+            r"if \(op_pool\) \{ cpu_pool_first = sib_pool\.reserve\(n_cpu_rows\); "
+            r"GGML_ASSERT\(cpu_pool_first == keep\.op_first\); \} \} else \{")
+    if not re.search(keep, block):
+        raise ContractError(
+            "FAIL [pin J1]: the deferred join does not keep gate's job beside this op only when "
+            "moe_sibling_pending_keep(keep) accepts, moving it to the sibling slot and reserving the predicted span "
+            "(llama.cpp-yx28)"
+        )
+    hp = squash(blank_comments(hostpath_src if hostpath_src is not None else HOSTPATH_HPP.read_text()))
+    k_at = hp.find("inline bool moe_sibling_pending_keep(const moe_sibling_pending_request & r)")
+    d_at = hp.find("inline bool moe_pool_spans_disjoint(size_t a_first, size_t a_count, size_t b_first, size_t b_count)")
+    keep_body = brace_block_from(hp, k_at) if k_at >= 0 else ""
+    disjoint_body = brace_block_from(hp, d_at) if d_at >= 0 else ""
+    if (
+        "if (!r.pending_active || !r.sibling_slot_free || !r.reuses_activation || r.op_count == 0 || "
+        "r.pending_act_serial != r.current_act_serial) { return false; }" not in keep_body
+        or "return r.same_row_geometry && moe_pool_spans_disjoint(r.pending_first, r.pending_count, r.op_first, "
+        "r.op_count);" not in keep_body
+        or disjoint_body != "{ return a_first + a_count <= b_first || b_first + b_count <= a_first; }"
+    ):
+        raise ContractError(
+            "FAIL [pin J1]: moe_sibling_pending_keep no longer refuses a rewritten activation staging (serial "
+            "mismatch) and overlapping pool spans; a kept job could read rewritten staging or share pool bytes "
+            "with this op (llama.cpp-yx28)"
+        )
+    if not re.search(
+        r"\} else \{ flush_pending_cpu_scatter\(\); sycl::event::wait\(g_pending_scatter_sibling\.prev_bufs\.scatter_events\); "
+        r"sycl::event::wait\(g_pending_scatter\.prev_bufs\.scatter_events\); \} \}$",
+        block,
+    ) or not tail.startswith("auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);"):
+        raise ContractError(
+            "FAIL [pin J2]: when gate is not kept, the join does not flush it and wait both slots' scatter_events "
+            "before the dispatch_cpu_compute call that writes this op's pool entries; this op made no activation "
+            "copy, so nothing else orders that scatter ahead of the writes (llama.cpp-yx28)"
+        )
+    drain = squash(brace_block_from(code, code.find("static void flush_pending_cpu_scatter() ")))
+    consumed_at = code.find("static bool flush_pending_cpu_scatter_if_consumed(")
+    consumed = squash(brace_block_from(code, consumed_at)) if consumed_at >= 0 else ""
+    if drain != "{ flush_pending_cpu_scatter_slot(g_pending_scatter_sibling); flush_pending_cpu_scatter_slot(g_pending_scatter); }" \
+            or "const pending_cpu_scatter * slots[2] = { &g_pending_scatter_sibling, &g_pending_scatter };" not in consumed \
+            or not re.search(r"ggml_sycl_op_consumes_tensor\(consuming_dst, slot->dst_tensor\)\) \{ flush_pending_cpu_scatter\(\); return true; \}", consumed):
+        raise ContractError(
+            "FAIL [pin J3]: a CPU scatter flush no longer drains the older (sibling) slot first, or a consumed slot "
+            "no longer flushes both (llama.cpp-yx28)"
+        )
+
+
+def check_hot_cold(code: str, hostpath_src: str | None = None) -> None:
     lam_at = code.find(LAMBDA_MARKER)
     lam = squash(brace_block_from(code, lam_at))
     head = squash(code[lam_at : code.find("{", lam_at)])
@@ -501,7 +592,29 @@ def check_hot_cold(code: str) -> None:
         if nxt < at:
             raise ContractError(f"FAIL [pin {pin}]: `{needle}` is out of order; the op-entry flushes run consumed, pipeline, then the unconditional scatter flush (llama.cpp-4hg7)")
         at = nxt
-        require_unconditional(entry, nxt, header="if (moe_hybrid_with_plan)", pin=pin, what=f"`{needle}`")
+        if pin == "F3":
+            # yx28: the third flush is the body of the defer guard, and the guard is a statement of the
+            # hybrid block.  Directional: an unconditional flush here is a FAIL too, because the join
+            # below is then dead and the pin would no longer describe the code.
+            guard = "if (!defer_entry_flush) { flush_pending_cpu_scatter(); reuse_shared_act = shared_act_reusable(); }"
+            if entry.count(guard) != 1:
+                raise ContractError(
+                    f"FAIL [pin F3]: the op-entry `{needle}` is not exactly `{guard}`; the yx28 join defers it only "
+                    "for decode up after gate, and flushes it on every other path (llama.cpp-yx28)"
+                )
+            require_unconditional(entry, nxt, header="if (!defer_entry_flush)", pin=pin, what=f"`{needle}`")
+            require_unconditional(entry, entry.find(guard), header="if (moe_hybrid_with_plan)", pin=pin,
+                                  what="the `if (!defer_entry_flush)` op-entry flush guard")
+        else:
+            require_unconditional(entry, nxt, header="if (moe_hybrid_with_plan)", pin=pin, what=f"`{needle}`")
+    defer_def = ("const bool defer_entry_flush = reuse_shared_act && g_pending_scatter.active && "
+                 "!g_pending_scatter_sibling.active && g_pending_scatter.shares_activation && "
+                 "g_pending_scatter.act_serial == g_moe_shared_act.record.serial;")
+    if squash(code).count(defer_def) != 1:
+        raise ContractError(
+            f"FAIL [pin F3]: defer_entry_flush is not defined exactly once as `{defer_def}` (llama.cpp-yx28)"
+        )
+    check_sibling_join(code, hostpath_src)
 
     # 7. the split.
     d_at = code.find(DISPATCH_MARKER)
@@ -699,6 +812,36 @@ def self_test(backend_src: str) -> int:
         "            if (g_pending_scatter.future.valid() && g_pending_scatter.future.wait_for(std::chrono::seconds(0)) "
         "== std::future_status::ready) { flush_pending_cpu_scatter(); }\n",
         in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F3")
+    # yx28 join (lead ruling on llama.cpp-p6zh): one mutant per property.
+    guarded = "            if (!defer_entry_flush) {\n                flush_pending_cpu_scatter();\n"
+    expect_fail("entry-flush-unconditional-again", sub(
+        guarded, "            flush_pending_cpu_scatter();\n            if (!defer_entry_flush) {\n",
+        in_lambda=False, after='"[MoE-HYBRID] ne12=%ld hybrid_active'), None, "F3")
+    expect_fail("join-skips-keep-decision", sub("if (ggml_sycl::moe_sibling_pending_keep(keep)) {", "if (true) {",
+                                                in_lambda=False, after=JOIN_ANCHOR), None, "J1")
+    expect_fail("keep-drops-serial-check", backend_src, None, "J1", hostpath_src.replace(
+        " ||\n        r.pending_act_serial != r.current_act_serial", "", 1))
+    expect_fail("keep-drops-disjoint-check", backend_src, None, "J1", hostpath_src.replace(
+        "return r.same_row_geometry && moe_pool_spans_disjoint(r.pending_first, r.pending_count, r.op_first, r.op_count);",
+        "return r.same_row_geometry;", 1))
+    expect_fail("keep-request-drops-staging-serial", sub(
+        "keep.current_act_serial = g_moe_shared_act.record.serial;", "keep.current_act_serial = gate.act_serial;",
+        in_lambda=False, after=JOIN_ANCHOR), None, "J1")
+    wait_pair = ("                        sycl::event::wait(g_pending_scatter_sibling.prev_bufs.scatter_events);\n"
+                 "                        sycl::event::wait(g_pending_scatter.prev_bufs.scatter_events);\n")
+    expect_fail("join-else-drops-wait", sub(
+        "                        sycl::event::wait(g_pending_scatter.prev_bufs.scatter_events);\n", "",
+        in_lambda=False, after=JOIN_ANCHOR), None, "J2")
+    no_wait = sub(wait_pair, "", in_lambda=False, after=JOIN_ANCHOR)
+    dispatch_line = "                auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);\n"
+    late = dispatch_line + wait_pair.replace("                        ", "                ")
+    expect_fail("join-wait-after-pool-writes",
+                no_wait.replace(dispatch_line, late, 1) if no_wait != backend_src else backend_src, None, "J2")
+    expect_fail("drain-drops-older-slot", sub("    flush_pending_cpu_scatter_slot(g_pending_scatter_sibling);\n", "",
+                                              in_lambda=False, after="static void flush_pending_cpu_scatter() {"), None, "J3")
+    expect_fail("consumed-check-ignores-sibling", sub(
+        "{ &g_pending_scatter_sibling, &g_pending_scatter }", "{ &g_pending_scatter, &g_pending_scatter }",
+        in_lambda=False, after="static bool flush_pending_cpu_scatter_if_consumed("), None, "J3")
     # A1: the assertion that a pending scatter is never overwritten.
     # The assertion statement, lifted from the source so the mutants cannot drift from its layout.
     a_start = backend_src.find("                GGML_ASSERT(!g_pending_scatter.active &&", backend_src.find(APPLY_MARKER))
