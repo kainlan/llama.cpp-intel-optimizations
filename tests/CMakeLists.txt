@@ -4263,6 +4263,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-g6yk: the planned dense Q8_1 src1 buffer is claimed at its whole plan when the runtime-context transaction
+# publishes it (after the commit, before the hold is recomputed), so it holds its planned bytes before the first graph
+# instead of growing on first use; and the RUNTIME zone accounting the PP MoE ring is admitted against still counts
+# both dense plans. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-mmq-src1-plan-claim-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mmq-src1-plan-claim-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-pyu4: executes the pure helpers in src/llama-auto-ubatch.h --
 # llama_auto_ubatch_ladder_has_candidate(), the predicate behind the trial's
 # early exit before its ladder loop, on the shapes where no rung lies in
