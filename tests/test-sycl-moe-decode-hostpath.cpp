@@ -3,6 +3,7 @@
 #include "ggml-sycl/moe-decode-hostpath.hpp"
 
 #include <cstdio>
+#include <vector>
 
 #define CHECK(cond, msg)                      \
     do {                                      \
@@ -65,8 +66,130 @@ static int test_direct_stamp() {
     return 0;
 }
 
+static int test_pool_ring() {
+    using ggml_sycl::moe_pool_reserve_first;
+    using ggml_sycl::moe_pool_spans_disjoint;
+    // A 20-entry pool serving top-10 ops alternates halves: gate, up, down.
+    CHECK(moe_pool_reserve_first(0, 10, 20) == 0, "the first reservation starts at the cursor");
+    CHECK(moe_pool_reserve_first(10, 10, 20) == 10, "a reservation that fits stays at the cursor");
+    CHECK(moe_pool_reserve_first(0, 10, 10) == 0, "a pool of exactly one op restarts every op");
+    CHECK(moe_pool_reserve_first(15, 10, 20) == 0, "a reservation past the end restarts at entry 0");
+    CHECK(moe_pool_spans_disjoint(0, 10, 10, 10), "adjacent spans are disjoint");
+    CHECK(!moe_pool_spans_disjoint(0, 10, 9, 10), "an overlapping span is not disjoint");
+    CHECK(!moe_pool_spans_disjoint(5, 10, 0, 10), "overlap is detected in either order");
+    return 0;
+}
+
+static int test_gather_runs() {
+    std::vector<ggml_sycl::moe_gather_run> runs;
+    // Down projection, all ten slots on the CPU: one contiguous [640, 10] block.
+    std::vector<size_t>                    src;
+    for (size_t i = 0; i < 10; ++i) {
+        src.push_back(4096 + i * 2560);
+    }
+    ggml_sycl::moe_gather_runs_build(src, 7680, 2560, runs);
+    CHECK(runs.size() == 1, "ten contiguous rows gather in one copy");
+    CHECK(runs[0].src_offset == 4096 && runs[0].dst_offset == 7680 && runs[0].bytes == 25600,
+          "the single run covers every row");
+
+    // A hole in the source (slot 3 ran on a GPU) splits the gather.
+    src = { 0, 2560, 5120, 10240, 12800 };
+    ggml_sycl::moe_gather_runs_build(src, 0, 2560, runs);
+    CHECK(runs.size() == 2, "a source gap starts a new run");
+    CHECK(runs[1].src_offset == 10240 && runs[1].dst_offset == 7680 && runs[1].bytes == 5120,
+          "the second run lands right after the first in the destination");
+
+    // Rows out of source order never merge backwards.
+    src = { 2560, 0 };
+    ggml_sycl::moe_gather_runs_build(src, 0, 2560, runs);
+    CHECK(runs.size() == 2, "descending sources are copied row by row");
+
+    src.clear();
+    ggml_sycl::moe_gather_runs_build(src, 0, 2560, runs);
+    CHECK(runs.empty(), "no rows, no copies");
+    return 0;
+}
+
+static ggml_sycl::moe_shared_act_record act_record() {
+    ggml_sycl::moe_shared_act_record r;
+    r.serial         = 4;
+    r.scatter_serial = 9;
+    r.view_offset    = 128;
+    r.bytes          = 10240;
+    r.device         = 0;
+    r.valid          = true;
+    return r;
+}
+
+static int test_shared_activation() {
+    using ggml_sycl::moe_shared_act_reusable;
+    const ggml_sycl::moe_shared_act_record r = act_record();
+    CHECK(moe_shared_act_reusable(r, true, 9, 128, 10240, 0), "up reuses gate's activation copy");
+    CHECK(!moe_shared_act_reusable(r, false, 9, 128, 10240, 0), "a different src1 needs its own copy");
+    CHECK(!moe_shared_act_reusable(r, true, 10, 128, 10240, 0),
+          "a scatter enqueued after the copy breaks the pool ordering the copy's wait provided");
+    CHECK(!moe_shared_act_reusable(r, true, 9, 0, 10240, 0), "another view of the buffer is another row");
+    CHECK(!moe_shared_act_reusable(r, true, 9, 128, 8192, 0), "a different row size is a different copy");
+    CHECK(!moe_shared_act_reusable(r, true, 9, 128, 10240, 1), "another device has its own staging");
+    ggml_sycl::moe_shared_act_record cleared = r;
+    cleared.valid                            = false;
+    CHECK(!moe_shared_act_reusable(cleared, true, 9, 128, 10240, 0), "the graph boundary clears the record");
+    return 0;
+}
+
+static ggml_sycl::moe_sibling_pending_request sibling_request() {
+    ggml_sycl::moe_sibling_pending_request r;
+    r.pending_active     = true;
+    r.sibling_slot_free  = true;
+    r.reuses_activation  = true;
+    r.pending_act_serial = 4;
+    r.current_act_serial = 4;
+    r.pending_from_pool  = true;
+    r.op_from_pool       = true;
+    r.pending_first      = 0;
+    r.pending_count      = 10;
+    r.op_first           = 10;
+    r.op_count           = 10;
+    r.same_row_geometry  = true;
+    return r;
+}
+
+static int test_sibling_pending() {
+    using ggml_sycl::moe_sibling_pending_keep;
+    ggml_sycl::moe_sibling_pending_request r = sibling_request();
+    CHECK(moe_sibling_pending_keep(r), "gate stays pending while up is issued into the other pool half");
+
+    r                = sibling_request();
+    r.pending_active = false;
+    CHECK(!moe_sibling_pending_keep(r), "nothing pending, nothing to keep");
+    r                   = sibling_request();
+    r.sibling_slot_free = false;
+    CHECK(!moe_sibling_pending_keep(r), "two pending jobs already fill both slots");
+    r                   = sibling_request();
+    r.reuses_activation = false;
+    CHECK(!moe_sibling_pending_keep(r), "a new activation copy would rewrite what the pending job reads");
+    r                    = sibling_request();
+    r.current_act_serial = 5;
+    CHECK(!moe_sibling_pending_keep(r), "the staging was rewritten since the pending job read it");
+    r          = sibling_request();
+    r.op_first = 0;
+    CHECK(!moe_sibling_pending_keep(r), "an overlapping reservation would overwrite the pending output");
+    r          = sibling_request();
+    r.op_count = 0;
+    CHECK(!moe_sibling_pending_keep(r), "an op with no CPU rows has nothing to overlap");
+    r                   = sibling_request();
+    r.same_row_geometry = false;
+    CHECK(!moe_sibling_pending_keep(r), "entry spans of different row sizes cannot be compared");
+    r                   = sibling_request();
+    r.op_first          = 0;
+    r.pending_from_pool = false;
+    CHECK(moe_sibling_pending_keep(r), "a pending job with its own buffers shares no pool entries");
+    return 0;
+}
+
 int main() {
-    if (test_direct_request() != 0 || test_direct_stamp() != 0) {
+    if (test_direct_request() != 0 || test_direct_stamp() != 0 || test_pool_ring() != 0 || test_gather_runs() != 0 ||
+        test_shared_activation() != 0 || test_sibling_pending() != 0) {
         return 1;
     }
     std::printf("OK: moe decode host path decisions\n");
