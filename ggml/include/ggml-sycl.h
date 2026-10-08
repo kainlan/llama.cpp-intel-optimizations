@@ -10,6 +10,7 @@
 #include "ggml.h"
 
 #include <limits.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #define GGML_SYCL_NAME        "SYCL"
@@ -1471,7 +1472,10 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runti
 // from one static cohort table (a later commit adds it beside these types).
 // ---------------------------------------------------------------------------
 
-#define GGML_SYCL_RUNTIME_CONTEXT_DESC_VERSION 1
+// Version 2 appends the forced-host section (llama.cpp-moua L4 step 3d).  A version-1 publisher's struct_size is
+// GGML_SYCL_RUNTIME_CONTEXT_DESC_V1_SIZE (defined after the struct) and reads as no forced layers and no_promotion
+// off; a version-2 publisher's is the whole struct.
+#define GGML_SYCL_RUNTIME_CONTEXT_DESC_VERSION 2
 
 // One measured tenant slot.  device is the SYCL device index, or -1 for the
 // host-pinned tier (a tier, not an owner: its slots are held by the registry
@@ -1512,6 +1516,9 @@ typedef struct ggml_sycl_rs_layer_desc {
 // insert after sidecar; it is named so the layout is visible and must be 0.
 // The tenants array is zhcn's section (n_tenants == 0 for a publisher that
 // has none), the layers array is moua's, and so is the recurrent-state one.
+// Each array is read by its own stride, so a publisher that grows an element lengthens the
+// stride and stays readable.  A count above 65536 (the reader's cap) is refused as a bad array,
+// as are a non-zero count with no array and a stride below the element.
 typedef struct ggml_sycl_runtime_context_desc {
     uint32_t struct_size;  // sizeof(*this) as the publisher built it; the reader gates every field on it
     uint32_t version;      // GGML_SYCL_RUNTIME_CONTEXT_DESC_VERSION; bumped on any change of meaning
@@ -1534,6 +1541,19 @@ typedef struct ggml_sycl_runtime_context_desc {
     uint32_t                              n_rs_layer;
     uint32_t                              rs_layer_desc_size;  // element stride of rs_layers
     const ggml_sycl_rs_layer_desc *       rs_layers;
+    // forced-host section (version 2): layers the caller requires to be host-resident (zhcn's residency fixpoint
+    // forces a layer to the host once an earlier probe demoted it, so a later answer never promotes it back).
+    // Each index is a layer id below n_layer and appears once; the array is uint32_t at its own 4-byte stride; a
+    // count above 65536, a non-zero count with no array, an index at or past n_layer and a repeated index are
+    // refused.  no_promotion (0 or 1): the probe may not demote a layer outside the forced set; layers the plan
+    // already places on the host are inputs, not violations.  From step 1d the commit enforces the same reading (every
+    // forced index host-resident, and under no_promotion no layer the plan placed on a device demoted unforced); until
+    // then the probe is the only place the rule is applied.  Neither field is in the tenant key: the key is the
+    // tenants' digest.
+    uint32_t                              n_forced_host;
+    uint8_t                               no_promotion;
+    uint8_t                               pad1[3];  // must be 0
+    const uint32_t *                      forced_host;
 } ggml_sycl_runtime_context_desc;
 
 // The layout is pinned here so a changed field fails to compile instead of
@@ -1547,8 +1567,13 @@ typedef struct ggml_sycl_runtime_context_desc {
 GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_context_tenant_desc) == 24, "tenant desc layout changed");
 GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_kv_layer_desc) == 20, "kv layer desc layout changed");
 GGML_SYCL_ABI_ASSERT(sizeof(ggml_sycl_rs_layer_desc) == 24, "rs layer desc layout changed");
-GGML_SYCL_ABI_ASSERT(sizeof(void *) != 8 || sizeof(ggml_sycl_runtime_context_desc) == 72,
+GGML_SYCL_ABI_ASSERT(sizeof(void *) != 8 || sizeof(ggml_sycl_runtime_context_desc) == 88,
                      "runtime context desc layout changed");
+
+// The version-1 descriptor ended where the forced-host section begins.
+#define GGML_SYCL_RUNTIME_CONTEXT_DESC_V1_SIZE offsetof(ggml_sycl_runtime_context_desc, n_forced_host)
+GGML_SYCL_ABI_ASSERT(sizeof(void *) != 8 || GGML_SYCL_RUNTIME_CONTEXT_DESC_V1_SIZE == 72,
+                     "runtime context desc version 1 size changed");
 
 // Coverage of a candidate publish by this context's own published entry.
 // GROWTH is 0 on purpose: a zero-initialised or unwritten answer must read as
@@ -1631,6 +1656,71 @@ GGML_BACKEND_API enum ggml_sycl_tenant_coverage ggml_backend_sycl_tenant_coverag
 GGML_BACKEND_API enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check(struct ggml_sycl_load_txn txn,
                                                                                     int32_t                   device,
                                                                                     uint64_t compute_bytes);
+
+// The residency probe (llama.cpp-moua L4 step 3d, llama.cpp-5cim).  Which layers would this context's plan leave in
+// host memory?  A pure plan query: it takes no replan lock, publishes nothing and changes nothing, and works with no
+// tenants and no published section (the caller asks before it publishes).
+//
+// Its own status enum, not ggml_sycl_lifecycle_result, whose OK is 0: the zero value here is NOT_ANSWERED, so a
+// zero-initialised or never-written answer, a null proc address and a value this reader does not know all read as
+// "no answer", never as "zero host layers".  Only OK carries a vector.
+enum ggml_sycl_residency_probe_status {
+    GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED       = 0,  // no answer: a null proc, an unknown value, or a zeroed result
+    GGML_SYCL_RESIDENCY_PROBE_OK                 = 1,  // host_resident[0..n_layer) is the answer
+    // The backend has the entry point but not yet the zone geometry to answer from.  It carries no vector and is no
+    // answer: a caller must not read it as OK or as "every layer is device-resident".
+    GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED = 2,
+    GGML_SYCL_RESIDENCY_PROBE_INVALID            = 3,  // a malformed input, named in the WARN line
+    GGML_SYCL_RESIDENCY_PROBE_HEAD_SLOT_REFUSED =
+        4,  // a tenant head slot that fits on no zone even with every KV layer on the host
+    GGML_SYCL_RESIDENCY_PROBE_NO_PROMOTION_VIOLATED =
+        5,  // desc->no_promotion is set and an unforced layer would be demoted
+    GGML_SYCL_RESIDENCY_PROBE_N_LAYER_CAP_TOO_SMALL =
+        6,  // out->n_layer_cap is below n_layer; out->n_layer is written, nothing else
+    GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND = 7,  // not a SYCL backend of this module
+};
+
+#define GGML_SYCL_RESIDENCY_PROBE_VERSION 1
+
+// The probe's answer.  The caller fills struct_size (sizeof(*this)), version, n_layer_cap (the capacity of
+// host_resident in bytes) and host_resident (caller-owned).  The backend writes n_layer, the number of layers the
+// answer covers, on every status that reaches it; it writes host_resident[0..n_layer) only on OK, one byte per
+// layer id, 1 for a layer the plan leaves in host memory (a layer with no KV answers 0).
+typedef struct ggml_sycl_residency_probe {
+    uint32_t  struct_size;
+    uint32_t  version;  // GGML_SYCL_RESIDENCY_PROBE_VERSION
+    uint32_t  n_layer_cap;
+    uint32_t  n_layer;  // written by the backend
+    uint8_t * host_resident;
+} ggml_sycl_residency_probe;
+
+GGML_SYCL_ABI_ASSERT(sizeof(void *) != 8 || sizeof(ggml_sycl_residency_probe) == 24, "residency probe layout changed");
+
+// The geometry arguments are the publish's own and mean the same (see ggml_backend_sycl_tenant_coverage).  `desc` is
+// the shape and the tenants the probe answers for, read once under its struct_size and version gates (a version-2
+// desc carries the forced-host set and no_promotion); NULL means no tenants.  n_layer comes from desc->n_layer; with
+// no desc the backend has no layer count to answer for, so n_layer is written 0.
+//
+// Determinism, which the caller relies on: the answer is a pure function of the model token, the shape arguments and
+// the desc.  The same call with the same inputs answers the same bytes, whatever the order the tenants arrive in,
+// and does not depend on any earlier call.  A caller may therefore reuse the last answer to verify a commit instead
+// of probing again.
+//
+// Until step 1d fills the zone geometry the backend answers GEOMETRY_NOT_WIRED (or N_LAYER_CAP_TOO_SMALL) and logs
+// why at WARN; it writes only out->n_layer.  A null proc address means the backend predates the entry point; the
+// caller reads that as NOT_ANSWERED.
+// Proc name: "ggml_backend_sycl_probe_residency".
+GGML_BACKEND_API enum ggml_sycl_residency_probe_status ggml_backend_sycl_probe_residency(
+    ggml_backend_t                         backend,
+    struct ggml_sycl_model_token           model,
+    uint32_t                               n_ctx,
+    uint32_t                               n_ubatch,
+    uint32_t                               n_seq_max,
+    bool                                   kv_unified,
+    bool                                   swa_full,
+    bool                                   flash_attn_enabled,
+    const ggml_sycl_runtime_context_desc * desc,
+    struct ggml_sycl_residency_probe *     out);
 
 // Execution-lifecycle context identity is separate from the model lifecycle.
 // One ContextId is allocated per llama_context and then bound to each SYCL
@@ -1801,6 +1891,50 @@ enum ggml_sycl_replan_scope_kind {
 GGML_BACKEND_API void * ggml_backend_sycl_replan_scope_open(enum ggml_sycl_replan_scope_kind kind,
                                                             bool                             require_outermost);
 GGML_BACKEND_API void   ggml_backend_sycl_replan_scope_close(void * scope);
+
+// The claim scope of a context's tenant slots.  A context reserves its host-tier slots at its first
+// publish (one owner-first carve per host (cohort, index), sized by the descriptor's slot_bytes) and its
+// registry entry holds them for its life.  Between open and close, on the opening thread, the SYCL_Host
+// buffer type's alloc_buffer does not allocate: it claims the lowest free slot of the host compute
+// cohort, checks the request against that slot's size, and builds the buffer over the slot's memory.  A
+// request the table cannot serve (a slot too small, or none free) is refused by name,
+// "[CONTEXT-PLAN-BUG] host buffer claim refused", and returns a null buffer: it never grows and never
+// falls back to the allocating path.  A buffer's free releases its slot.  Outside a scope the buffer type
+// allocates as before, which is what an output buffer, a control vector and a host-resident LoRA base
+// take, so a caller keeps those out of every scope.
+//
+// open answers a status, and writes the scope to `*scope` (NULL unless OPENED), so the situations a
+// bare NULL would have conflated stay apart:
+//   OPENED          a scope is in force; `*scope` is it, and close must run;
+//   NO_RESERVATION  the context holds no host reservation (its descriptor carried no host slot, it has
+//                   not published one, or it is not bound to an execution context): no scope is in
+//                   force and the buffer type allocates as before -- the one answer a caller may treat
+//                   as "allocate as before";
+//   NESTED          this thread already holds a scope: refused and logged, nothing changed.  The scope
+//                   in force is the OUTER one, so a SYCL_Host allocation made now would claim from
+//                   ANOTHER context's slots -- the caller must not allocate on this answer;
+//   INVALID_BACKEND a null or foreign backend, or a device out of range;
+//   FAILED          nothing opened and nothing is known: a closed module, a null `scope`, or a
+//                   caught exception.  FAILED is 0, so an unwritten answer reads as a failure.
+// close must run on the thread that opened; NULL is a no-op, and anything but the thread's open scope is
+// refused and logged.  A scope still open when its thread exits is a leak, reported on stderr.  claims
+// returns how many claims succeeded through the scope, 0 for NULL and, logged, for anything that is not
+// this thread's open scope.
+enum ggml_sycl_claim_scope_status {
+    GGML_SYCL_CLAIM_SCOPE_FAILED          = 0,
+    GGML_SYCL_CLAIM_SCOPE_OPENED          = 1,
+    GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION  = 2,
+    GGML_SYCL_CLAIM_SCOPE_NESTED          = 3,
+    GGML_SYCL_CLAIM_SCOPE_INVALID_BACKEND = 4,
+};
+
+// Proc name: "ggml_backend_sycl_claim_scope_open".
+GGML_BACKEND_API enum ggml_sycl_claim_scope_status ggml_backend_sycl_claim_scope_open(ggml_backend_t backend,
+                                                                                      void **        scope);
+// Proc name: "ggml_backend_sycl_claim_scope_close".
+GGML_BACKEND_API void   ggml_backend_sycl_claim_scope_close(void * scope);
+// Proc name: "ggml_backend_sycl_claim_scope_claims".
+GGML_BACKEND_API size_t ggml_backend_sycl_claim_scope_claims(void * scope);
 
 // A re-plan's per-context steps.  synchronize_for_replan waits every
 // queue that can reach a slice of the context, after llama's synchronize(); it returns

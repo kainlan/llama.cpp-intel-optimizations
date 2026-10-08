@@ -47,6 +47,23 @@ class tlsf_allocator {
     // reads the rule it must mirror instead of restating the number.
     static constexpr size_t block_grain = 256;
 
+    // The size a request of `size` bytes at `alignment` actually occupies: rounded up to the larger of
+    // the alignment and the grain, so every block offset stays on the grain (llama.cpp-f8ws).  Returns 0
+    // for a zero size and for a size the rounding would wrap (the guard is conservative by one grain: a size
+    // within one grain of the top is refused although it would not wrap).  Aborts on an alignment over the
+    // grain, but only for a request that gets past those two refusals, as allocate() always has: offsets
+    // carry the grain's alignment and no more, so a caller that needs more aligns above this allocator.  The
+    // one definition of the rule; allocate(), carve_gap(), allocate_excluding(), allocate_at() and the
+    // pending-range draws all read it from here.
+    static size_t round_request(size_t size, size_t alignment) {
+        const size_t granularity = alignment > block_grain ? alignment : block_grain;
+        if (size == 0 || size > SIZE_MAX - granularity) {
+            return 0;
+        }
+        TLSF_ASSERT(alignment <= block_grain && "TLSF only supports alignment <= MIN_BLOCK_SIZE (256)");
+        return (size + granularity - 1) & ~(granularity - 1);
+    }
+
     // Initialize with the SIZE of the managed region [0, size).
     // No pointer to the managed region is needed — all bookkeeping is
     // in host memory.  min_alloc_size: minimum block granularity
@@ -169,6 +186,181 @@ class tlsf_allocator {
         }
         std::reverse(census.begin(), census.end());
         return census;
+    }
+
+    // ------------------------------------------------------------------
+    // Exact and range-excluding placement (llama.cpp-moua L4, pending-range
+    // primitive; moua design 2.3.3).
+    //
+    // The planner chooses offsets and the carve must take exactly those
+    // offsets, so fit == carve is a property of the primitive and not of two
+    // search policies agreeing.  Both calls round the size like allocate()
+    // (a multiple of MIN_BLOCK_SIZE), require every offset to sit on the
+    // block grain, and return SIZE_MAX, changing nothing, on any failure.
+    // Group-mutex-only, like every member.  A host-tier caller never reaches
+    // them: they place device-zone blocks.
+    //
+    // allocate_at(offset, size, tag): the block [offset, offset + size).  The
+    // range must lie wholly inside ONE free block (a range across two blocks
+    // is refused: free blocks are never adjacent, so a range that spans two
+    // spans an allocated block).  The free block's front and back remainders
+    // go back on the free lists as whole blocks; a remainder under
+    // MIN_BLOCK_SIZE (only possible at an off-grid region end) is absorbed
+    // into the carved block, by the rule carve_gap() uses.
+    //
+    // allocate_excluding(excluded, size, alignment, tag): the lowest offset at
+    // which a block of `size` lies inside one free block and is disjoint from
+    // every excluded range, carved with allocate_at() semantics.  It excludes
+    // RANGES, not blocks: a free block an excluded range cuts is usable in its
+    // parts outside the ranges, and its remainders stay whole free blocks that
+    // may straddle a range (the exclusion is enforced at allocation time, and
+    // splitting a free block at the boundary would leave two adjacent free
+    // blocks, which check_invariants() rejects).  Excluded ranges may overlap
+    // each other and need not be sorted or on the grain; one whose offset + size
+    // wraps is a caller defect and aborts.
+    //
+    // One case hands out bytes of an excluded range: the sub-MIN_BLOCK_SIZE tail
+    // of an off-grain region is absorbed into the block carved before it, so
+    // TLSF(1000) with [768, 1000) excluded and a request of 768 returns the block
+    // [0, 1000).  Only a range lying wholly in that unallocatable tail is
+    // affected.
+    //
+    // allocate_extent_at(offset, size, tag): the block [offset, offset + size)
+    // with `size` taken as the extent, NOT rounded.  It exists to restore a block
+    // whose recorded extent already includes an absorbed tail (a size that is
+    // not a multiple of the grain): allocate_at() would round such a size up
+    // past the region end and refuse it.  offset must be on the grain; the extent
+    // must lie wholly inside one free block.  The grid rule: an extent off the
+    // grain would leave the block after it off the grain (check_invariants()
+    // fails and the next allocate() aborts, llama.cpp-f8ws), so it is refused
+    // unless it ends exactly at the free block's end, where the block simply ends
+    // off the grain as the region does.
+    // ------------------------------------------------------------------
+    struct excluded_range {
+        size_t offset;
+        size_t size;
+    };
+
+    size_t allocate_at(size_t offset, size_t size, uint8_t tag = 0) {
+        size = round_request(size, block_grain);
+        if (size == 0) {
+            return SIZE_MAX;
+        }
+        return allocate_extent_at(offset, size, tag);
+    }
+
+    size_t allocate_extent_at(size_t offset, size_t size, uint8_t tag = 0) {
+        if (size == 0 || (offset % MIN_BLOCK_SIZE) != 0 || offset > SIZE_MAX - size) {
+            return SIZE_MAX;
+        }
+        int id = last_block_;
+        while (id >= 0 && blocks_[id].offset > offset) {
+            id = blocks_[id].prev_block;
+        }
+        if (id < 0 || !blocks_[id].free || offset + size > blocks_[id].offset + blocks_[id].size) {
+            return SIZE_MAX;
+        }
+        if ((size % MIN_BLOCK_SIZE) != 0 && offset + size != blocks_[id].offset + blocks_[id].size) {
+            return SIZE_MAX;
+        }
+        remove_free(id);
+        const size_t front = offset - blocks_[id].offset;
+        if (front > 0) {
+            // Read values before alloc_block_id(): it may reallocate blocks_.
+            const size_t block_offset = blocks_[id].offset;
+            const size_t block_size   = blocks_[id].size;
+            const int    block_next   = blocks_[id].next_block;
+            const int    mid_id       = alloc_block_id();
+            auto &       mid          = blocks_[mid_id];
+            mid.offset                = block_offset + front;
+            mid.size                  = block_size - front;
+            mid.free                  = true;
+            mid.prev_block            = id;
+            mid.next_block            = block_next;
+            mid.prev_free             = -1;
+            mid.next_free             = -1;
+            mid.tag                   = 0;
+            if (block_next >= 0) {
+                blocks_[block_next].prev_block = mid_id;
+            } else {
+                last_block_ = mid_id;
+            }
+            blocks_[id].size       = front;
+            blocks_[id].next_block = mid_id;
+            insert_free(id);
+            id = mid_id;
+        }
+        blocks_[id].free = false;
+        blocks_[id].tag  = tag;
+        split_block(id, size);
+        used_ += blocks_[id].size;
+        offset_to_block_[blocks_[id].offset] = id;
+        TLSF_ASSERT(blocks_[id].offset == offset && "allocate_at moved the block it was asked to place");
+        return offset;
+    }
+
+    size_t allocate_excluding(const std::vector<excluded_range> & excluded,
+                              size_t                              size,
+                              size_t                              alignment = 256,
+                              uint8_t                             tag       = 0) {
+        for (const excluded_range & r : excluded) {
+            TLSF_ASSERT(r.offset <= SIZE_MAX - r.size && "an excluded range wraps the address space");
+        }
+        size = round_request(size, alignment);
+        if (size == 0) {
+            return SIZE_MAX;
+        }
+        std::vector<int> free_ids;
+        for (int id = last_block_; id >= 0; id = blocks_[id].prev_block) {
+            if (blocks_[id].free) {
+                free_ids.push_back(id);
+            }
+        }
+        // free_ids is highest first; the first fit is the lowest offset.
+        for (size_t i = free_ids.size(); i-- > 0;) {
+            const size_t        begin = blocks_[free_ids[i]].offset;
+            const size_t        end   = begin + blocks_[free_ids[i]].size;
+            // The candidate offsets are the block's start and the grain-rounded end of each excluded range
+            // that lies inside it; anything between two of them is covered by the earlier candidate's check.
+            std::vector<size_t> starts;
+            starts.push_back(begin);
+            for (const excluded_range & r : excluded) {
+                if (r.size == 0) {
+                    continue;
+                }
+                const size_t r_end = r.offset + r.size;
+                if (r_end > SIZE_MAX - (MIN_BLOCK_SIZE - 1)) {
+                    continue;
+                }
+                const size_t s = (r_end + MIN_BLOCK_SIZE - 1) & ~(MIN_BLOCK_SIZE - 1);
+                if (s > begin && s < end) {
+                    starts.push_back(s);
+                }
+            }
+            std::sort(starts.begin(), starts.end());
+            for (const size_t s : starts) {
+                if (s + size > end) {
+                    break;
+                }
+                bool clear = true;
+                for (const excluded_range & r : excluded) {
+                    if (r.size != 0 && r.offset < s + size && s < r.offset + r.size) {
+                        clear = false;
+                        break;
+                    }
+                }
+                if (clear) {
+                    return allocate_at(s, size, tag);
+                }
+            }
+        }
+        return SIZE_MAX;
+    }
+
+    // Size of the allocated block at `offset`; 0 for a free or unknown offset.
+    size_t block_size_at(size_t offset) const {
+        auto it = offset_to_block_.find(offset);
+        return it != offset_to_block_.end() ? blocks_[it->second].size : 0;
     }
 
     // No header overhead in the managed region (metadata is external).
@@ -473,10 +665,6 @@ inline int tlsf_allocator::alloc_block_id() {
 // allocate: O(1) via bitmap search, returns offset (SIZE_MAX on failure)
 // ------------------------------------------------------------------
 inline size_t tlsf_allocator::allocate(size_t size, size_t alignment, uint8_t tag) {
-    if (size == 0) {
-        return SIZE_MAX;
-    }
-
     // Every block offset must stay a multiple of MIN_BLOCK_SIZE.  The pool's
     // first block starts at offset 0 and split_block() places the remainder at
     // (offset + size), so that holds only while every allocated size is itself a
@@ -484,17 +672,12 @@ inline size_t tlsf_allocator::allocate(size_t size, size_t alignment, uint8_t ta
     // breaks it: most callers leave alignment at the allocator default of 64, and
     // the resulting remainders are 64- but not 128/256-aligned, so later
     // allocations hand back offsets that violate the alignment this allocator
-    // promises (llama.cpp-f8ws).  Rounding by the larger of the two also
-    // satisfies any alignment <= MIN_BLOCK_SIZE for free.
-    const size_t granularity = alignment > MIN_BLOCK_SIZE ? alignment : MIN_BLOCK_SIZE;
-    if (size > SIZE_MAX - granularity) {
-        return SIZE_MAX;  // the rounding below would wrap to a zero-size block
+    // promises (llama.cpp-f8ws).  round_request() rounds by the larger of the
+    // two, which also satisfies any alignment <= MIN_BLOCK_SIZE for free.
+    size = round_request(size, alignment);
+    if (size == 0) {
+        return SIZE_MAX;  // a zero size, or one the rounding would wrap to a zero-size block
     }
-    size = (size + granularity - 1) & ~(granularity - 1);
-
-    // Offsets carry MIN_BLOCK_SIZE alignment and no more, so a larger request
-    // cannot be honoured here; such callers must align above this allocator.
-    TLSF_ASSERT(alignment <= MIN_BLOCK_SIZE && "TLSF only supports alignment <= MIN_BLOCK_SIZE (256)");
     size_t adjusted = size;
 
     int fl, sl;
@@ -650,18 +833,13 @@ inline size_t tlsf_allocator::gap_below(size_t anchor) const {
 }
 
 inline size_t tlsf_allocator::carve_gap(size_t anchor, size_t size, size_t alignment, uint8_t tag, bool from_top) {
-    if (size == 0) {
-        return SIZE_MAX;
-    }
     // Same rounding and the same alignment limit as allocate(), for the same
     // reason: every block offset must stay a multiple of MIN_BLOCK_SIZE, and a
     // top carve places its block at (end - size), so size must be a multiple too.
-    const size_t granularity = alignment > MIN_BLOCK_SIZE ? alignment : MIN_BLOCK_SIZE;
-    if (size > SIZE_MAX - granularity) {
-        return SIZE_MAX;  // the rounding below would wrap to a zero-size block
+    size = round_request(size, alignment);
+    if (size == 0) {
+        return SIZE_MAX;
     }
-    size = (size + granularity - 1) & ~(granularity - 1);
-    TLSF_ASSERT(alignment <= MIN_BLOCK_SIZE && "TLSF only supports alignment <= MIN_BLOCK_SIZE (256)");
 
     int gap_id = gap_block(anchor);
     if (gap_id < 0 || blocks_[gap_id].size < size) {

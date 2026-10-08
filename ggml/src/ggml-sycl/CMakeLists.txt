@@ -132,6 +132,16 @@ if (BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-counter-dump.py
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
     set_tests_properties(test-sycl-counter-dump-gate PROPERTIES LABELS "sycl;source-contract;host")
+    # llama.cpp-moua L4: every "Proc name:" in ggml-sycl.h has an unconditional registration arm and a definition,
+    # the load-compute ledger has one writer and one clearer, and the txn-end clear guard, the destructor erase
+    # and the success-tail drop keep their order. Pure Python over source text, with its own mutation matrix.
+    add_test(NAME test-sycl-l4-proc-registration-gate
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-l4-proc-registration.py
+                --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
+    set_tests_properties(test-sycl-l4-proc-registration-gate PROPERTIES LABELS "sycl;source-contract;host" TIMEOUT 300)
+    # 300 s: the gate strips the 6 MB source once and applies each mutant to that text, ~7 s idle.  It runs ~40 s under this
+    # host's permanent load (60+), where the default 60 s limit leaves too little margin for a passing run.
     # llama.cpp-23mk S3-3/S3-4: the three oneDNN wrappers that ask get_scratchpad_mem in dnnl-ops.hpp (softmax, eltwise,
     # binary_broadcast_row) and the five DnnlGemmWrapper consumers in gemm.hpp (with the next paths in ggml-sycl.cpp and
     # outprod.cpp) return a [[nodiscard]] bool or optional, make the `return false` decision on a declined scratchpad
@@ -351,7 +361,12 @@ if (BUILD_TESTING)
             ggml-sycl-private-fixtures)
     endif()
     add_test(NAME sycl-lifecycle-runtime-wrapper COMMAND test-sycl-lifecycle-runtime-wrapper)
-    set_tests_properties(sycl-lifecycle-runtime-wrapper PROPERTIES RUN_SERIAL TRUE)
+    # The selector is a precondition, not a courtesy: unpinned, a backend enumerates the iGPU, whose "VRAM"
+    # is host RAM (CLAUDE.md, llama.cpp-403s).  level_zero:0 is the B70; the registration also supplies the
+    # LD_LIBRARY_PATH a direct invocation lacks (without it the binary prints SKIP and exits 0).
+    set_tests_properties(sycl-lifecycle-runtime-wrapper PROPERTIES
+        RUN_SERIAL TRUE
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
     add_executable(test-sycl-lifecycle-wrapper-overlap
         tests/test-lifecycle-wrapper-overlap.cpp)
     target_include_directories(test-sycl-lifecycle-wrapper-overlap PRIVATE
@@ -2015,6 +2030,22 @@ set_tests_properties(sycl-kv-geometry-census PROPERTIES
     TIMEOUT 60
 )
 
+# Pending-range primitive (llama.cpp-moua L4): pending-range.hpp is the
+# term-filtered record/clear/retag set, the draws inside an owner's ranges, the
+# keyed WEIGHT draw, replace_within's block core and the device-wide queries,
+# over tlsf_allocator's allocate_at / allocate_excluding. Header-only, SYCL-free.
+add_executable(test-pending-range
+    tests/test-pending-range.cpp
+)
+target_include_directories(test-pending-range PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME sycl-pending-range COMMAND test-pending-range)
+set_tests_properties(sycl-pending-range PROPERTIES
+    LABELS "sycl;kv;hostonly"
+    TIMEOUT 60
+)
+
 # Host-weight create-set record (llama.cpp-moua L4 1c; th32pre test 1r):
 # host-create-record.hpp is the one wire converter, the thread-local pending slot
 # and the stage-scoped holder. Header-only; it includes ggml-sycl.h for the wire
@@ -2202,6 +2233,76 @@ set_target_properties(test-context-nonfa-stage PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_test(NAME sycl-context-nonfa-stage COMMAND test-context-nonfa-stage)
 set_tests_properties(sycl-context-nonfa-stage PROPERTIES
+    LABELS "sycl;tenant;hostonly"
+    TIMEOUT 30
+)
+
+# The published section of a context and the load's compute-term ledger (llama.cpp-moua
+# L4 step 3): runtime-context-section.hpp reads a runtime-context descriptor once into an
+# owning section, classifies a candidate's coverage and holds the late check's rule. It names
+# only the public ABI structs and the cohort table, so it needs neither -fsycl nor a device.
+# The test also includes src/llama-context-tenant.h to pin the backend's tenant key equal to
+# llama's digest.
+add_executable(test-runtime-context-section
+    tests/test-runtime-context-section.cpp
+    context-tenant-measure.cpp
+)
+target_include_directories(test-runtime-context-section PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../src
+)
+target_link_libraries(test-runtime-context-section PRIVATE ggml-base)
+set_target_properties(test-runtime-context-section PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-runtime-context-section COMMAND test-runtime-context-section)
+set_tests_properties(sycl-runtime-context-section PROPERTIES
+    LABELS "sycl;tenant;hostonly"
+    TIMEOUT 30
+)
+
+# The residency probe's pure core (llama.cpp-moua L4 step 3d, llama.cpp-5cim): residency-probe.hpp answers, from
+# one input value, which layers a context's plan leaves in host memory, by fitting the KV slots behind the tenant
+# head slots on each device's shared zone.  SYCL-free like test-kv-runtime-demotion above, so it needs no device;
+# the backend proc that will fill its geometry is step 1d's.
+add_executable(test-residency-probe-core
+    tests/test-residency-probe-core.cpp
+    kv-runtime-demotion.cpp
+    context-tenant-measure.cpp
+)
+target_include_directories(test-residency-probe-core PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../src
+)
+target_link_libraries(test-residency-probe-core PRIVATE ggml-base)
+set_target_properties(test-residency-probe-core PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-residency-probe-core COMMAND test-residency-probe-core)
+set_tests_properties(sycl-residency-probe-core PROPERTIES
+    LABELS "sycl;tenant;probe;hostonly"
+    TIMEOUT 60
+)
+
+# The tenant claim scope and the registry entry that holds a context's slot table (llama.cpp-moua L4 step 3c).
+# Host only: the scope and the table name no device.
+add_executable(test-tenant-claim-scope
+    tests/test-tenant-claim-scope.cpp
+    context-tenant-measure.cpp
+)
+target_include_directories(test-tenant-claim-scope PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../src
+)
+target_link_libraries(test-tenant-claim-scope PRIVATE ggml-base Threads::Threads)
+set_target_properties(test-tenant-claim-scope PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-tenant-claim-scope COMMAND test-tenant-claim-scope)
+set_tests_properties(sycl-tenant-claim-scope PROPERTIES
     LABELS "sycl;tenant;hostonly"
     TIMEOUT 30
 )
@@ -6596,6 +6697,27 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         # is still diagnosed by the backend before CTest terminates the process.
         ENVIRONMENT "GGML_SYCL_OP_TIMEOUT_MS=110000"
         TIMEOUT 120)
+
+    # llama.cpp-moua L4 step 3c: a context's held host-tier reservation and the claim scope, through the public
+    # entry points on a real backend.  Megabyte-scale allocations only.
+    add_executable(test-sycl-host-tenant-claim
+        tests/test-host-tenant-claim.cpp)
+    target_include_directories(test-sycl-host-tenant-claim PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_link_libraries(test-sycl-host-tenant-claim PRIVATE
+        ggml-sycl-private-fixtures)
+    set_target_properties(test-sycl-host-tenant-claim PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-host-tenant-claim COMMAND test-sycl-host-tenant-claim)
+    set_tests_properties(sycl-host-tenant-claim PROPERTIES
+        LABELS "sycl;tenant;device;B70;B50"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 120
+        # Pinned to the B70 (level_zero:1 selects the B50 for a second run); see the lifecycle wrapper's note.
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
 
     add_executable(test-sycl-intrusive-allocation-owner
         tests/test-intrusive-allocation-owner.cpp)

@@ -43,6 +43,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <type_traits>
 #include <typeinfo>
@@ -102,6 +103,7 @@
 #include "ggml-sycl/graph-recorder-scope.hpp"
 #include "ggml-sycl/host-weight-alias.hpp"
 #include "ggml-sycl/kernel-selection.hpp"
+#include "ggml-sycl/kv-region-registry.hpp"
 #include "ggml-sycl/l144i-probe.hpp"
 #include "ggml-sycl/mem-ops.hpp"
 #include "ggml-sycl/mmq.hpp"
@@ -117,12 +119,15 @@
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
+#include "ggml-sycl/residency-probe.hpp"
+#include "ggml-sycl/runtime-context-section.hpp"
 #include "ggml-sycl/set.hpp"
 #include "ggml-sycl/set_rows.hpp"
 #include "ggml-sycl/set_rows_paged.hpp"
 #include "ggml-sycl/simple-consumer-route-policy.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
+#include "ggml-sycl/tenant-claim-scope.hpp"
 #include "model-lifecycle.hpp"
 #include "sycl-kernel-profiler.hpp"
 #include "sycl-timeline.hpp"
@@ -12174,6 +12179,8 @@ static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
 static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) noexcept;
 static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id);
+static void                        ggml_sycl_execution_drop_context_registry_entries(uint64_t context_id,
+                                                                                     const bool (&devices)[GGML_SYCL_MAX_DEVICES]) noexcept;
 static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const char * reason);
 static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl_context * cleanup_ctx,
                                                                const char *                stage,
@@ -12275,15 +12282,31 @@ static void ggml_sycl_execution_sync_binding_devices_locked(ggml_sycl_execution_
 }
 
 static void ggml_sycl_execution_clear_bindings_for_context(uint64_t context_id) {
-    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
-    for (auto it = g_execution_backend_bindings.begin(); it != g_execution_backend_bindings.end();) {
-        if (it->second && it->second->context_id == context_id) {
-            ggml_sycl_execution_reset_backend_binding_state(it->first);
-            it = g_execution_backend_bindings.erase(it);
-        } else {
-            ++it;
+    // The reset below zeroes each backend's key, and after it the backend's destructor cannot find the registry
+    // entry (host reservation, published section) this id keyed: nothing else would drop it.  So the devices of
+    // the bindings that end here are collected under the lock (no allocation, nothing to fail), and the entries
+    // are dropped BY THE ENDED ID after the reset, outside the lock.  A publish that reads its backend's id after
+    // the reset finds none, so it cannot key an entry by the dead id; an entry made before the reset is dropped
+    // here.  A publish that had already read the id can still store under the dead one: for the host table the
+    // install guard drops by the id the install used (and attaching the root fails once the context is drained);
+    // for the section it needs the end to land within a few instructions of the store on the same context, a
+    // publish racing the end of its own context, which is unsupported.
+    bool devices[GGML_SYCL_MAX_DEVICES] = {};
+    {
+        std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
+        for (auto it = g_execution_backend_bindings.begin(); it != g_execution_backend_bindings.end();) {
+            if (it->second && it->second->context_id == context_id) {
+                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {
+                    devices[it->first->device] = true;
+                }
+                ggml_sycl_execution_reset_backend_binding_state(it->first);
+                it = g_execution_backend_bindings.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
+    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);
 }
 
 template<typename F>
@@ -13072,6 +13095,416 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
     return clean;
 }
 
+// ---------------------------------------------------------------------------
+// The published section of a context and the load's compute-term ledger
+// (llama.cpp-moua L4 step 3; moua design 2.4.2).
+//
+// Both are leaf state.  A context's section lives in its entry of the device's KV region
+// registry, under the registry's own leaf mutex (L3); the ledger lives under its own leaf
+// mutex.  Neither lock is held across a log line or the last drop of a section.  The one
+// nesting is the ledger's mutex over the lifecycle registry's mutex, for the open-transaction
+// read (ggml_sycl_load_txn_is_open): the order is fixed, because no lifecycle registry method
+// calls into the ledger, so nothing takes them the other way round.
+// Both are allocated once and never destroyed, so a backend freed during static destruction
+// still finds them; they hold no device memory.
+// ---------------------------------------------------------------------------
+static ggml_sycl::kv_region_registry & ggml_sycl_kv_region_registry(int device) {
+    static ggml_sycl::kv_region_registry * const registries = new ggml_sycl::kv_region_registry[GGML_SYCL_MAX_DEVICES];
+    return registries[device];
+}
+
+// `mutex` guards `ledger`, the process-wide load_compute_ledger, which is an unlocked value type: every
+// access to `ledger` is made with `mutex` held, by the functions that name ggml_sycl_load_ledger().
+struct ggml_sycl_load_ledger_state {
+    std::mutex                     mutex;
+    ggml_sycl::load_compute_ledger ledger;
+};
+
+static ggml_sycl_load_ledger_state & ggml_sycl_load_ledger() {
+    static ggml_sycl_load_ledger_state * const state = new ggml_sycl_load_ledger_state;
+    return *state;
+}
+
+// The execution context id of a backend context: the registry key of its entry, 0 while unbound.
+static uint64_t ggml_sycl_context_execution_id(const ggml_backend_sycl_context * ctx) {
+    std::lock_guard<std::mutex> lock(ctx->execution_state_mutex);
+    return ctx->execution_context_id;
+}
+
+// Replace this context's published section; null drops it.  A context that was never bound to an
+// execution context has no registry key, so it publishes nothing and a coverage query about it
+// answers GROWTH: fail-closed, but a publish that stores nothing is said so at WARN, because the
+// caller is then waiting on a section that will never exist.  The replaced section is released
+// after the registry lock.
+static void ggml_sycl_published_section_set(const ggml_backend_sycl_context *                         ctx,
+                                            std::shared_ptr<const ggml_sycl::runtime_context_section> section) {
+    if (!ctx || ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    const uint64_t id = ggml_sycl_context_execution_id(ctx);
+    if (id == 0) {
+        if (section) {
+            GGML_LOG_WARN(
+                "[CONTEXT-PLAN] a runtime-context descriptor was published for a backend context that is not bound "
+                "to an execution context: no section is stored, and a coverage query answers GROWTH\n");
+        }
+        return;
+    }
+    auto & registry = ggml_sycl_kv_region_registry(ctx->device);
+    auto   previous =
+        section ? registry.set_published_section(id, std::move(section)) : registry.drop_published_section(id);
+    (void) previous;  // dropped here, with no registry lock held
+}
+
+// A context's entry loses its section: the one erase of a section by the id that keyed it.  The caller
+// names the id and the device (the backend destructor reads its own once, the end of an execution context
+// passes the ended id), and nothing here reads a backend's id again, so one drop has one id.  Never throws,
+// because a destructor cannot let one out; the registry's lock failing is the only way the drop can, and a
+// drop that fails leaves the entry to the process's end (its key is gone with the context), which is why it is
+// said at ERROR.  The publish tail does NOT use this: it calls ggml_sycl_published_section_set directly and
+// lets such a failure out, so a section describing the replaced shape is never kept silently.
+static void ggml_sycl_published_section_erase(int device, uint64_t context_id) noexcept {
+    try {
+        if (context_id == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+            return;
+        }
+        auto previous = ggml_sycl_kv_region_registry(device).drop_published_section(context_id);
+        (void) previous;  // dropped here, with no registry lock held
+    } catch (...) {
+        GGML_LOG_ERROR(
+            "[CONTEXT-PLAN] the published section of an execution context could not be dropped; it stays until the "
+            "process ends\n");
+    }
+}
+
+// A host-tier tenant slot: one owner-first host reservation (moua design 2.3.2, "the host-pinned tier").
+// It is the kv_region_handle of a slot in the table ggml_sycl_reserve_host_tenants builds, and that
+// function is the only builder of a table carrying the host cohort, so a claim of that cohort casts
+// the handle back to this type.
+struct ggml_sycl_host_tenant_slot {
+    ggml_sycl::mem_handle handle;
+    size_t                bytes = 0;
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    ggml_sycl_host_tenant_slot() { live_count().fetch_add(1, std::memory_order_relaxed); }
+
+    ~ggml_sycl_host_tenant_slot() { live_count().fetch_sub(1, std::memory_order_relaxed); }
+
+    ggml_sycl_host_tenant_slot(const ggml_sycl_host_tenant_slot &)             = delete;
+    ggml_sycl_host_tenant_slot & operator=(const ggml_sycl_host_tenant_slot &) = delete;
+
+    // Slots alive in the process: a test reads it to see a refused reservation's carves and a torn-down
+    // context's carves go back.
+    static std::atomic<size_t> & live_count() {
+        static std::atomic<size_t> n{ 0 };
+        return n;
+    }
+#endif
+};
+
+// The slot's handle is a shared_ptr<void> in the registry's table, which carries no type.  A slot is made only
+// by this deleter's factory, and a reader checks the deleter before it casts, so a handle of any other type --
+// a test's, or a future producer's -- is refused rather than reinterpreted.
+struct ggml_sycl_host_tenant_slot_deleter {
+    void operator()(void * p) const noexcept { delete static_cast<ggml_sycl_host_tenant_slot *>(p); }
+};
+
+static ggml_sycl::kv_region_handle ggml_sycl_host_tenant_slot_make(ggml_sycl::mem_handle handle, size_t bytes) {
+    auto * slot  = new ggml_sycl_host_tenant_slot();
+    slot->handle = std::move(handle);
+    slot->bytes  = bytes;
+    return ggml_sycl::kv_region_handle(slot, ggml_sycl_host_tenant_slot_deleter{});
+}
+
+// The slot a table handle holds, or null when the handle was not made by ggml_sycl_host_tenant_slot_make.
+static ggml_sycl_host_tenant_slot * ggml_sycl_host_tenant_slot_of(const ggml_sycl::kv_region_handle & handle) {
+    if (!handle || std::get_deleter<ggml_sycl_host_tenant_slot_deleter>(handle) == nullptr) {
+        return nullptr;
+    }
+    return static_cast<ggml_sycl_host_tenant_slot *>(handle.get());
+}
+
+// Reserve one host carve per host-tier element of `section` (device -1) and build the slot table over
+// them: slot (cohort, slot_index) IS carve (cohort, slot_index), contiguous, `slot_bytes` long.  Each is
+// an owner-first allocation through unified_allocate_owner (must_host_pinned, use_pinned_pool, category
+// HOST_COMPUTE, the cohort's own name), never a bare USM call, and it runs before L1 under a
+// TRANSACTION token, so the pool's phase gates take it as planned work.  `out` is null on success when
+// the section carries no host element.  False, with `refusal` naming the slot, when an allocation
+// failed; every carve made so far drops with `table`, with no registry lock held.
+static bool ggml_sycl_reserve_host_tenants(const ggml_backend_sycl_context *             ctx,
+                                           const ggml_sycl::runtime_context_section &    section,
+                                           std::shared_ptr<ggml_sycl::kv_tenant_slots> & out,
+                                           std::string &                                 refusal) {
+    out.reset();
+    std::shared_ptr<ggml_sycl::kv_tenant_slots> table;
+    auto *                                      cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
+    sycl::queue * queue = cache ? &cache->get_queue() : &ggml_sycl_get_device(ctx->device).default_queue();
+    for (const ggml_sycl::runtime_context_tenant & e : section.tenants) {
+        if (e.device != -1) {
+            continue;
+        }
+        const ggml_sycl_context_cohort_info * info = ggml_sycl_context_cohort_lookup(e.cohort);
+        if (info == nullptr || info->tier != GGML_SYCL_CONTEXT_COHORT_TIER_HOST_PINNED) {
+            refusal = "host-tier element " + std::to_string(e.slot_index) + " names cohort " +
+                      std::to_string(e.cohort) + ", which is not a host-pinned cohort";
+            return false;
+        }
+        ggml_sycl::alloc_request req{};
+        req.queue                               = queue;
+        req.device                              = ctx->device;
+        req.size                                = (size_t) e.slot_bytes;
+        req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+        req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+        req.intent.cohort_id                    = info->name;
+        req.intent.constraints.must_host_pinned = true;
+        req.intent.constraints.use_pinned_pool  = true;
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (!allocation) {
+            refusal = std::string("the host reservation of ") + std::to_string(e.slot_bytes) + " B for cohort " +
+                      info->name + " slot " + std::to_string(e.slot_index) + " failed";
+            return false;
+        }
+        ggml_sycl::mem_handle carve =
+            ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = carve.resolve(ctx->device);
+        if (!resolved.ptr || resolved.on_device) {
+            refusal = std::string("the host reservation for cohort ") + info->name + " slot " +
+                      std::to_string(e.slot_index) + " did not resolve to host memory";
+            return false;
+        }
+        if (!table) {
+            table = std::make_shared<ggml_sycl::kv_tenant_slots>();
+        }
+        (void) table->add(info->name, e.slot_index,
+                          ggml_sycl_host_tenant_slot_make(std::move(carve), (size_t) e.slot_bytes),
+                          (size_t) e.slot_bytes);  // a fresh table: nothing retained
+    }
+    out = std::move(table);
+    return true;
+}
+
+// A republish while a table is held reuses it in place and never allocates (moua design 2.4.2, "reuse in
+// place"), so the held slots have to carry the candidate: every host-tier element of `section` needs a held
+// slot at the same (cohort, slot_index) with at least its bytes.  A section the table cannot carry is
+// refused, not published: storing it would make the section say what the table cannot back (coverage would
+// answer EQUAL for a slot whose claim is then refused), and a table that is still the old one is the fact the
+// published shape has to follow.  A smaller candidate is carried; a host cohort the table has never held, or
+// a slot index it has not, is not.  `refusal` names the first element that is not carried.
+static bool ggml_sycl_host_tenants_carry(const ggml_sycl::kv_tenant_slots &         held,
+                                         const ggml_sycl::runtime_context_section & section,
+                                         std::string &                              refusal) {
+    for (const ggml_sycl::runtime_context_tenant & e : section.tenants) {
+        if (e.device != -1) {
+            continue;
+        }
+        const ggml_sycl_context_cohort_info * info = ggml_sycl_context_cohort_lookup(e.cohort);
+        if (info == nullptr || info->tier != GGML_SYCL_CONTEXT_COHORT_TIER_HOST_PINNED) {
+            refusal = "host-tier element " + std::to_string(e.slot_index) + " names cohort " +
+                      std::to_string(e.cohort) + ", which is not a host-pinned cohort";
+            return false;
+        }
+        const size_t held_bytes = held.cap(info->name, e.slot_index);
+        if (held_bytes == 0) {
+            refusal = std::string("the held reservation has no slot ") + std::to_string(e.slot_index) + " of cohort " +
+                      info->name + " (a republish reuses the held slots and allocates none)";
+            return false;
+        }
+        if ((size_t) e.slot_bytes > held_bytes) {
+            refusal = std::string("slot ") + std::to_string(e.slot_index) + " of cohort " + info->name + " needs " +
+                      std::to_string(e.slot_bytes) + " B and the held slot is " + std::to_string(held_bytes) + " B";
+            return false;
+        }
+    }
+    return true;
+}
+
+// The commit of a first publish: the reserved table becomes the entry's held reservation.  `table` is
+// emptied on success; on false (an unbound context, or an entry that already holds a table) the caller
+// still owns it and drops it with no lock held.  `installed_id` is the id the table was keyed by, read once
+// here: the rollback guard drops by it, so the install and its rollback cannot name different ids.
+static bool ggml_sycl_host_tenants_install(const ggml_backend_sycl_context *             ctx,
+                                           std::shared_ptr<ggml_sycl::kv_tenant_slots> & table,
+                                           uint64_t                                      tenant_key,
+                                           uint64_t &                                    installed_id) {
+    if (!ctx || ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES || !table) {
+        return false;
+    }
+    const uint64_t id = ggml_sycl_context_execution_id(ctx);
+    if (id == 0 || !ggml_sycl_kv_region_registry(ctx->device).install_tenant_slots(id, table, tenant_key)) {
+        return false;
+    }
+    table.reset();
+    installed_id = id;
+    return true;
+}
+
+// A context's entry loses its held host reservation, after its section: the one erase of a table by the id
+// that keyed it, named by the caller as the section's erase is.  The last drop of a slot is the last drop of
+// its carve, and a buffer still built over one keeps it through its own copy of the handle.  Never throws; a
+// drop that fails leaves the carves pinned to the process's end, and is said at ERROR.
+static void ggml_sycl_host_tenants_erase(int device, uint64_t context_id) noexcept {
+    try {
+        if (context_id == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+            return;
+        }
+        auto previous = ggml_sycl_kv_region_registry(device).take_tenant_slots(context_id);
+        (void) previous;  // dropped here, with no registry lock held
+    } catch (...) {
+        GGML_LOG_ERROR(
+            "[CONTEXT-PLAN] the held host reservation of an execution context could not be dropped; its carves stay "
+            "pinned until the process ends\n");
+    }
+}
+
+// A table installed ahead of the inner transaction is taken back unless the section that describes it was stored: a
+// publish that fails after the install (the inner transaction refused or threw, the plan could not be bound, the
+// section's store threw) leaves the context holding no host reservation, as a refused first publish always did.
+// Only a table this publish installed arms it, so a republish never takes back the held one.  It holds the device
+// and the id the install keyed the table by.
+struct ggml_sycl_host_tenants_install_guard {
+    int      device = -1;
+    uint64_t id     = 0;
+
+    ~ggml_sycl_host_tenants_install_guard() {
+        if (id != 0) {
+            ggml_sycl_host_tenants_erase(device, id);
+        }
+    }
+
+    void keep() { id = 0; }
+};
+
+// The end of an execution context is the end of its id, and the registry entries it keyed (the host
+// reservation and the published section) go with it: the backend destructor drops them too, but only
+// while the backend still carries the id, and finish_drain / close_if_idle reset that first.  The drop is
+// by the ENDED id and the devices the ended bindings were on, so it needs no backend (nothing to pin, no
+// allocation that can fail) and runs outside the binding mutex (it frees memory through the unified cache),
+// in the destructor's order.  Never throws; each erase says its own failure at ERROR.
+static void ggml_sycl_execution_drop_context_registry_entries(uint64_t context_id,
+                                                              const bool (&devices)[GGML_SYCL_MAX_DEVICES]) noexcept {
+    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {
+        if (devices[device]) {
+            ggml_sycl_published_section_erase(device, context_id);
+            ggml_sycl_host_tenants_erase(device, context_id);
+        }
+    }
+}
+
+// Whether `txn` is the open load transaction.  The caller holds the ledger's mutex, so that a clear
+// cannot run between this read and the use of its answer (the lifecycle registry's mutex is taken and
+// released inside, which is the one nesting the block comment above names).
+static bool ggml_sycl_load_txn_is_open(uint64_t txn) {
+    return txn != 0 && ggml_sycl::lifecycle::global_registry().admission_diagnostics().active_txn == txn;
+}
+
+// The one writer of the compute-term ledger's terms: c(P) for (load transaction, device), the term
+// the early inventory stage admitted (zhcn measure call site (b)).  False, recording nothing, when
+// the load carries no n_ctx (an envelope with no shape has no c(P) to measure, and the late check
+// then answers NOT_RECORDED) or when `txn` is not the open load, which the same lock that guards the
+// ledger decides, so no term lands after the clear of a load that ended.
+//
+// NO PRODUCTION CALLER UNTIL L6.  llama.cpp-moua L6 (moua design 2.4.2 (b)) adds the llama-side
+// early measure call site that reaches this; until fkpg(a) puts a non-zero n_ctx in the envelope the
+// only caller is the private test hook below.  It is the single entry on purpose and is not dead
+// code to delete: scripts/check-sycl-l4-proc-registration.py pins that no other function writes the
+// ledger.
+[[maybe_unused]] static bool ggml_sycl_load_record_compute_term(uint64_t txn,
+                                                                int32_t  device,
+                                                                uint64_t bytes,
+                                                                uint32_t n_ctx) {
+    ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+    std::lock_guard<std::mutex>   lock(state.mutex);
+    return state.ledger.record(txn, device, bytes, n_ctx, ggml_sycl_load_txn_is_open(txn));
+}
+
+// One ledger line, at the level the ledger chose for it.
+static void ggml_sycl_load_ledger_log(const ggml_sycl::load_compute_ledger::check_result & r) {
+    if (r.line.empty()) {
+        return;
+    }
+    switch (r.level) {
+        case ggml_sycl::LOAD_LOG_LEVEL_ERROR:
+            GGML_LOG_ERROR("%s\n", r.line.c_str());
+            break;
+        case ggml_sycl::LOAD_LOG_LEVEL_WARN:
+            GGML_LOG_WARN("%s\n", r.line.c_str());
+            break;
+        case ggml_sycl::LOAD_LOG_LEVEL_INFO:
+            GGML_LOG_INFO("%s\n", r.line.c_str());
+            break;
+        case ggml_sycl::LOAD_LOG_LEVEL_NONE:
+            break;
+    }
+}
+
+// A load's commit or rollback drops its terms.  Returns how many.
+static size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {
+    try {
+        ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+        std::lock_guard<std::mutex>   lock(state.mutex);
+        return state.ledger.clear(txn);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Clears the finisher's terms when the end call's try scope is left normally: the registry has ended the
+// transaction by then, so no record for it can still find it open.  An exit by exception does NOT clear here:
+// the handler has yet to end the transaction, and a clear before that end would leave a window in which a
+// record still finds the transaction open and inserts after the clear.  The handler's
+// ggml_sycl_load_ledger_clear_after_end clears after the end instead.
+struct ggml_sycl_load_ledger_clear_guard {
+    uint64_t txn;
+    int      uncaught;
+
+    explicit ggml_sycl_load_ledger_clear_guard(uint64_t t) : txn(t), uncaught(std::uncaught_exceptions()) {}
+
+    ~ggml_sycl_load_ledger_clear_guard() {
+        if (std::uncaught_exceptions() > uncaught) {
+            return;
+        }
+        (void) ggml_sycl_load_clear_compute_terms(txn);
+    }
+};
+
+// The end call's handler arms it (txn non-zero) with the transaction it is about to end -- as its first act when
+// this call is the finisher, so a throw from anything the handler does before the end still clears -- and the
+// clear runs when the handler is left, after the end call: order is end, then clear, on every path.  If the
+// registry's end call (finalize_end, or ggml_sycl_finalize_binding_failure_abort in the recovery arm) itself
+// throws out of the handler, or anything the handler does before the end call throws (the placement cleanup, on
+// the finisher arm, which the top arming exists to survive), the clear still runs, but the registry never ended
+// the transaction, so a record in that case can still find it open; that residue is a failure this ordering
+// cannot close, whoever's it is.
+struct ggml_sycl_load_ledger_clear_after_end {
+    uint64_t txn = 0;
+
+    ~ggml_sycl_load_ledger_clear_after_end() {
+        if (txn != 0) {
+            (void) ggml_sycl_load_clear_compute_terms(txn);
+        }
+    }
+};
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+extern "C" bool ggml_backend_sycl_test_record_compute_term(ggml_sycl_load_txn txn,
+                                                           int32_t            device,
+                                                           uint64_t           bytes,
+                                                           uint32_t           n_ctx) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return false;
+    }
+    return ggml_sycl_load_record_compute_term(txn.id, device, bytes, n_ctx);
+}
+
+// How many terms the ledger holds in all; a cleared load leaves none behind.
+extern "C" size_t ggml_backend_sycl_test_compute_term_count() {
+    ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+    std::lock_guard<std::mutex>   lock(state.mutex);
+    return state.ledger.size();
+}
+#endif
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
     ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LOAD);
     sycl_module_mutation_guard module_guard;
@@ -13479,6 +13912,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             return ggml_sycl_load_end_replay_result(ticket, model);
         }
 
+        // This call finishes the load: when it ends normally from here, the load's early terms are done and the
+        // guard clears them after the registry ended the transaction.  The handler clears them after its own end
+        // call instead (ggml_sycl_load_ledger_clear_after_end), and so does the recovery arm.
+        ggml_sycl_load_ledger_clear_guard           ledger_clear{ txn.id };
         ggml_sycl::lifecycle::finisher_effect_scope finisher_effect;
         if (ticket.commit) {
             finisher_effect = registry->acquire_finisher_effect(ticket);
@@ -13604,6 +14041,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         }
         return ggml_sycl_lifecycle_c_result(result.code);
     } catch (...) {
+        ggml_sycl_load_ledger_clear_after_end after_end;
+        if (ticket.finisher) {
+            after_end.txn = txn.id;  // armed before anything below that can throw: end, then clear, on every path
+        }
         g_sycl_abort_load_exit = false;
         if (placement_inserted) {
             const auto failed_plan = ggml_sycl::lifecycle_find_placement_plan(
@@ -13630,6 +14071,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             if (!recovery.finisher) {
                 return ggml_sycl_load_end_replay_result(recovery, model);
             }
+            after_end.txn = txn.id;
             ggml_sycl_finalize_binding_failure_abort(*registry, recovery);
         }
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
@@ -19602,6 +20044,14 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // next = ...` even runs, so this point is never reached with a non-NULL
     // out.
     ctx->runtime_kv_admitted = true;
+    // Any publish changes the context's shape, so a section published earlier no longer describes it.
+    // The descriptor path publishes its own section after this returns.
+    // Not the swallowing helper: a drop that fails must reach the caller, which answers EFFECT_FAILED.  The new
+    // plan is already live and nothing rolls it back, so when the drop's lock fails the OLD section stays in
+    // the registry while the new plan is live, and a coverage query could answer EQUAL against the dead shape
+    // until the next publish.  The failure is a mutex lock's std::system_error, practically unreachable; it is
+    // reported, not repaired.
+    ggml_sycl_published_section_set(ctx, nullptr);
     return ggml_sycl_txn_result::ACCEPTED;
 }
 
@@ -19618,9 +20068,26 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                            bool           swa_full,
                                            bool           flash_attn_enabled) {
     ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_TRANSACTION);
-    (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
-                                                     flash_attn_enabled,
-                                                     /*probe_mode=*/false, /*out=*/nullptr);
+    // C ABI boundary: no exception of any type crosses this entry.  The publish tail's drop of the earlier section
+    // takes the registry lock and may throw; the state is left as the failed path leaves it (the new plan is live,
+    // the old section may remain), and the entry only reports.
+    try {
+        (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
+                                                         flash_attn_enabled,
+                                                         /*probe_mode=*/false, /*out=*/nullptr);
+    } catch (const std::system_error & e) {
+        GGML_LOG_ERROR(
+            "[SYCL] ggml_backend_sycl_set_runtime_context: a lock failed after the plan was published (%s); the "
+            "earlier descriptor section may remain\n",
+            e.what());
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("[SYCL] ggml_backend_sycl_set_runtime_context: the runtime context update threw (%s)\n",
+                       e.what());
+    } catch (...) {
+        GGML_LOG_ERROR(
+            "[SYCL] ggml_backend_sycl_set_runtime_context: the runtime context update threw a non-standard "
+            "exception\n");
+    }
 }
 
 // llama.cpp-tsfl (nphx comment c-wgxn): see ggml_sycl_runtime_context_probe
@@ -19751,14 +20218,22 @@ uint32_t ggml_backend_sycl_moe_gpu_ubatch_max() {
     return ggml_sycl::MOE_GPU_UBATCH_MAX;
 }
 
-ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_backend_t        backend,
-                                                                           ggml_sycl_model_token model,
-                                                                           uint32_t              n_ctx,
-                                                                           uint32_t              n_ubatch,
-                                                                           uint32_t              n_seq_max,
-                                                                           bool                  kv_unified,
-                                                                           bool                  swa_full,
-                                                                           bool                  flash_attn_enabled) {
+// The model-bound publish both entry points share.  `has_desc` selects the descriptor entry point:
+// `desc` is then read once, here, under its gates (a refusal is deterministic, so PLAN_REJECTED, the
+// same answer the inner transaction gives), and the section it yields is stored in the context's
+// registry entry once the transaction has published.  The older entry point passes has_desc == false
+// and publishes no section (its inner transaction drops any earlier one).
+static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
+    ggml_backend_t                         backend,
+    ggml_sycl_model_token                  model,
+    uint32_t                               n_ctx,
+    uint32_t                               n_ubatch,
+    uint32_t                               n_seq_max,
+    bool                                   kv_unified,
+    bool                                   swa_full,
+    bool                                   flash_attn_enabled,
+    const ggml_sycl_runtime_context_desc * desc,
+    bool                                   has_desc) {
     ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_TRANSACTION);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
@@ -19771,6 +20246,31 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
     if (!ggml_backend_is_sycl(backend) || !backend->device ||
         ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
         return GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND;
+    }
+    std::shared_ptr<const ggml_sycl::runtime_context_section> section;
+    if (has_desc) {
+        try {
+            ggml_sycl::runtime_context_geometry geometry;
+            geometry.n_ctx      = n_ctx;
+            geometry.n_ubatch   = n_ubatch;
+            geometry.n_seq_max  = n_seq_max;
+            geometry.kv_unified = kv_unified;
+            geometry.swa_full   = swa_full;
+            geometry.flash_attn = flash_attn_enabled;
+            ggml_sycl::runtime_context_section parsed;
+            const auto                         status = ggml_sycl::parse_runtime_context_desc(
+                desc, geometry, std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES), parsed);
+            if (status != ggml_sycl::runtime_context_desc_status::OK) {
+                GGML_LOG_WARN("[CONTEXT-PLAN] runtime context descriptor refused: %s (n_ctx=%u n_ubatch=%u)\n",
+                              ggml_sycl::runtime_context_desc_status_text(status), n_ctx, n_ubatch);
+                return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+            }
+            section = std::make_shared<const ggml_sycl::runtime_context_section>(std::move(parsed));
+        } catch (const ggml_sycl_fallback_error &) {
+            throw;
+        } catch (...) {
+            return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+        }
     }
     const ggml_sycl::lifecycle::ModelToken token{
         { model.model_id },
@@ -19793,6 +20293,55 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
             (void) registry.finalize_live_update(ticket);
         }
     } guard{ registry, std::move(ticket) };
+
+    // The first publish of a context reserves AND HOLDS its host-tier room (moua design 2.3.2): one
+    // owner-first carve per host slot, allocated here, before L1 (g_tensor_inventory_mutex), because a
+    // host-zone allocation can need a new pinned chunk and a USM call must not run under L1.  A republish
+    // never allocates: the entry already holds the table, and a section that table cannot carry is refused
+    // here, before anything is published, so the published section never says more than the table backs.  A
+    // refused allocation is likewise a refusal before anything was published, and the carves made so far drop
+    // with `host_tenants` on every exit that does not install them, with no registry lock held.
+    std::shared_ptr<ggml_sycl::kv_tenant_slots> host_tenants;
+    ggml_sycl_host_tenants_install_guard        host_tenants_installed;
+    if (section && backend_ctx && backend_ctx->device >= 0 && backend_ctx->device < GGML_SYCL_MAX_DEVICES) {
+        const uint64_t exec_id = ggml_sycl_context_execution_id(backend_ctx);
+        if (exec_id != 0) {
+            std::string refusal;
+            try {
+                const auto held = ggml_sycl_kv_region_registry(backend_ctx->device).tenants(exec_id);
+                if (held == nullptr) {
+                    if (!ggml_sycl_reserve_host_tenants(backend_ctx, *section, host_tenants, refusal)) {
+                        GGML_LOG_WARN("[CONTEXT-PLAN] host tenant reservation refused: %s (n_ctx=%u n_ubatch=%u)\n",
+                                      refusal.c_str(), n_ctx, n_ubatch);
+                        return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                    }
+                } else if (!ggml_sycl_host_tenants_carry(*held, *section, refusal)) {
+                    GGML_LOG_WARN("[CONTEXT-PLAN] host tenant republish refused: %s (n_ctx=%u n_ubatch=%u)\n",
+                                  refusal.c_str(), n_ctx, n_ubatch);
+                    return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                }
+                // The table is installed here, before anything is published, so that a refused install (the
+                // context ended since its id was read, or its entry already holds a table) is a refusal with
+                // nothing published, as PLAN_REJECTED says.  The guard takes the table back on any later failure.
+                if (host_tenants) {
+                    uint64_t installed_id = 0;
+                    if (!ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key, installed_id)) {
+                        GGML_LOG_ERROR(
+                            "[CONTEXT-PLAN-BUG] the host reservation could not be installed on its context; the "
+                            "descriptor publish is refused and nothing is published (n_ctx=%u n_ubatch=%u)\n",
+                            n_ctx, n_ubatch);
+                        return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                    }
+                    host_tenants_installed.device = backend_ctx->device;
+                    host_tenants_installed.id     = installed_id;
+                }
+            } catch (const ggml_sycl_fallback_error &) {
+                throw;
+            } catch (...) {
+                return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+            }
+        }
+    }
 
     // Retained past the locked scope below so a load_end deferral can be
     // resolved OUTSIDE g_tensor_inventory_mutex. Copying the pointer under the
@@ -19875,13 +20424,33 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
     g_runtime_expected_model_set = true;
     g_runtime_external_lease     = true;
     g_runtime_update_succeeded   = false;
+    // The transaction, not the C entry: that entry catches what the publish tail's drop of the earlier section
+    // can throw so none crosses the C ABI, and this caller must see it to answer EFFECT_FAILED.  The token
+    // held above is the one the transaction needs.
     try {
-        ggml_backend_sycl_set_runtime_context(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
-                                              flash_attn_enabled);
+        (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
+                                                         flash_attn_enabled,
+                                                         /*probe_mode=*/false, /*out=*/nullptr);
     } catch (...) {
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
     const bool inner_ok = g_runtime_update_succeeded;
+    // The descriptor's section is the context's published shape from here on.  Only when the inner
+    // transaction published: a refused one changed nothing, and the section it was given describes a
+    // shape that never went live.
+    if (inner_ok && section) {
+        try {
+            // The table was installed before anything was published (above), so the section, the cheap step and
+            // the one a reader trusts, is stored last and only once the table it describes is held.  Once it is
+            // stored the table stays; a throw before that leaves the guard to take the table back.
+            ggml_sycl_published_section_set(backend_ctx, section);
+            host_tenants_installed.keep();
+        } catch (const ggml_sycl_fallback_error &) {
+            throw;
+        } catch (...) {
+            return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+        }
+    }
     // Resolve a load_end deferral now that a backend context exists. Idempotent:
     // the MMID registry answers ALREADY_PUBLISHED when a pool is already live,
     // so the registry itself is the deferred-state record and no parallel
@@ -19912,6 +20481,183 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
     // caller rerun a decision that cannot change (llama.cpp-uize). Genuine
     // transients above still return BUSY.
     return inner_ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+}
+
+ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_backend_t        backend,
+                                                                           ggml_sycl_model_token model,
+                                                                           uint32_t              n_ctx,
+                                                                           uint32_t              n_ubatch,
+                                                                           uint32_t              n_seq_max,
+                                                                           bool                  kv_unified,
+                                                                           bool                  swa_full,
+                                                                           bool                  flash_attn_enabled) {
+    return ggml_sycl_set_runtime_context_for_model_impl(backend, model, n_ctx, n_ubatch, n_seq_max, kv_unified,
+                                                        swa_full, flash_attn_enabled, nullptr, false);
+}
+
+ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_desc(ggml_backend_t        backend,
+                                                                      ggml_sycl_model_token model,
+                                                                      uint32_t              n_ctx,
+                                                                      uint32_t              n_ubatch,
+                                                                      uint32_t              n_seq_max,
+                                                                      bool                  kv_unified,
+                                                                      bool                  swa_full,
+                                                                      bool                  flash_attn_enabled,
+                                                                      const ggml_sycl_runtime_context_desc * desc) {
+    return ggml_sycl_set_runtime_context_for_model_impl(backend, model, n_ctx, n_ubatch, n_seq_max, kv_unified,
+                                                        swa_full, flash_attn_enabled, desc, true);
+}
+
+// Would publishing this candidate need a transaction?  Read-only: it publishes nothing, takes no
+// replan lock and no lifecycle lease.  It reads this context's own entry in one section under the
+// registry's leaf mutex.  Every doubt answers GROWTH (the zero value): a null or foreign backend, a
+// closed module, a candidate that does not parse, a context with no execution identity, and a
+// context with no published section.
+enum ggml_sycl_tenant_coverage ggml_backend_sycl_tenant_coverage(ggml_backend_t backend,
+                                                                 uint32_t       n_ctx,
+                                                                 uint32_t       n_ubatch,
+                                                                 uint32_t       n_seq_max,
+                                                                 bool           kv_unified,
+                                                                 bool           swa_full,
+                                                                 bool           flash_attn_enabled,
+                                                                 const ggml_sycl_runtime_context_desc * candidate) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard || !backend || !backend->context || !candidate) {
+        return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+    }
+    if (!ggml_backend_is_sycl(backend) || !backend->device ||
+        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
+        return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+    }
+    try {
+        const auto * ctx = static_cast<const ggml_backend_sycl_context *>(backend->context);
+        if (ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES) {
+            return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+        }
+        ggml_sycl::runtime_context_geometry geometry;
+        geometry.n_ctx      = n_ctx;
+        geometry.n_ubatch   = n_ubatch;
+        geometry.n_seq_max  = n_seq_max;
+        geometry.kv_unified = kv_unified;
+        geometry.swa_full   = swa_full;
+        geometry.flash_attn = flash_attn_enabled;
+        ggml_sycl::runtime_context_section parsed;
+        if (ggml_sycl::parse_runtime_context_desc(candidate, geometry,
+                                                  std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES),
+                                                  parsed) != ggml_sycl::runtime_context_desc_status::OK) {
+            return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+        }
+        const uint64_t id = ggml_sycl_context_execution_id(ctx);
+        if (id == 0) {
+            return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+        }
+        const auto published = ggml_sycl_kv_region_registry(ctx->device).published_section(id);
+        return ggml_sycl::classify_tenant_coverage(published.get(), parsed);
+    } catch (...) {
+        return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+    }
+}
+
+// The late measure of a load against the term the early stage recorded (zhcn call site (c)).  The
+// rule and the strings are load_compute_ledger's; this adds the open-transaction read, the log at the
+// level the line is for, and the shrink counter.  Fail-closed: NOT_RECORDED is the zero value and is
+// the answer to everything this cannot compare, and it never reads as a pass.
+enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check(ggml_sycl_load_txn txn,
+                                                                   int32_t            device,
+                                                                   uint64_t           compute_bytes) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
+    try {
+        ggml_sycl::load_compute_ledger::check_result r;
+        {
+            ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+            std::lock_guard<std::mutex>   lock(state.mutex);
+            r = state.ledger.check(txn.id, device, compute_bytes, ggml_sycl_load_txn_is_open(txn.id));
+        }
+        ggml_sycl_load_ledger_log(r);
+        if (r.shrink_counted) {
+            ggml_sycl::unified_cache_dump_counter_add(ggml_sycl::dump_counter::late_term_shrink_admitted, device);
+        }
+        return r.result;
+    } catch (...) {
+        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
+}
+
+// The residency probe (llama.cpp-moua L4 step 3d, llama.cpp-5cim): which layers would this context's plan leave in host
+// memory?  The core that answers is residency-probe.hpp's; what it needs and this entry cannot yet give it is the live
+// shared-zone geometry of each device and the planned device of each layer, which step 1d wires.  Until then the proc
+// validates what it is handed and answers GEOMETRY_NOT_WIRED: a status of its own that is not OK, carries no vector and
+// is not "zero host layers".  It writes the layer count and nothing else of the answer, and says why at WARN on every
+// refusal.  Pure plan query: it takes no replan lock and no lifecycle lease and changes nothing.
+enum ggml_sycl_residency_probe_status ggml_backend_sycl_probe_residency(ggml_backend_t        backend,
+                                                                        ggml_sycl_model_token model,
+                                                                        uint32_t              n_ctx,
+                                                                        uint32_t              n_ubatch,
+                                                                        uint32_t              n_seq_max,
+                                                                        bool                  kv_unified,
+                                                                        bool                  swa_full,
+                                                                        bool                  flash_attn_enabled,
+                                                                        const ggml_sycl_runtime_context_desc * desc,
+                                                                        struct ggml_sycl_residency_probe *     out) {
+    (void) model;
+    if (!ggml_sycl::residency_probe_out_declared(out)) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] refused: the result struct is missing, short or of another version\n");
+        return GGML_SYCL_RESIDENCY_PROBE_INVALID;
+    }
+    out->n_layer = 0;
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] no answer: the SYCL module is closing\n");
+        return GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED;
+    }
+    if (!backend || !backend->context || !ggml_backend_is_sycl(backend) || !backend->device ||
+        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] refused: not a SYCL backend of this module\n");
+        return GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND;
+    }
+    if (n_ctx == 0 || n_ubatch == 0 || n_seq_max == 0) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] refused: the shape has a zero n_ctx, n_ubatch or n_seq_max (%u, %u, %u)\n",
+                      n_ctx, n_ubatch, n_seq_max);
+        return GGML_SYCL_RESIDENCY_PROBE_INVALID;
+    }
+    try {
+        if (desc != nullptr) {
+            ggml_sycl::runtime_context_geometry geometry;
+            geometry.n_ctx      = n_ctx;
+            geometry.n_ubatch   = n_ubatch;
+            geometry.n_seq_max  = n_seq_max;
+            geometry.kv_unified = kv_unified;
+            geometry.swa_full   = swa_full;
+            geometry.flash_attn = flash_attn_enabled;
+            ggml_sycl::runtime_context_section parsed;
+            const auto                         status = ggml_sycl::parse_runtime_context_desc(
+                desc, geometry, std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES), parsed);
+            if (status != ggml_sycl::runtime_context_desc_status::OK) {
+                GGML_LOG_WARN("[RESIDENCY-PROBE] refused: the descriptor is malformed: %s\n",
+                              ggml_sycl::runtime_context_desc_status_text(status));
+                return GGML_SYCL_RESIDENCY_PROBE_INVALID;
+            }
+            out->n_layer = (uint32_t) parsed.kv.layers.size();
+        }
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (...) {
+        out->n_layer = 0;
+        GGML_LOG_WARN("[RESIDENCY-PROBE] no answer: reading the descriptor threw\n");
+        return GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED;
+    }
+    if (out->n_layer_cap < out->n_layer) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] refused: the answer covers %u layers and the caller's buffer holds %u\n",
+                      out->n_layer, out->n_layer_cap);
+        return GGML_SYCL_RESIDENCY_PROBE_N_LAYER_CAP_TOO_SMALL;
+    }
+    GGML_LOG_WARN(
+        "[RESIDENCY-PROBE] no answer: the zone geometry is not wired to the probe yet (step 1d); n_layer=%u\n",
+        out->n_layer);
+    return GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED;
 }
 
 // llama.cpp-oyfl: a NARROW re-evaluation of the non-FA attention scratch
@@ -39587,7 +40333,83 @@ void ggml_backend_sycl_replan_scope_close(void * scope) {
     delete static_cast<ggml_backend_sycl_replan_scope_state *>(scope);
 }
 
+// The claim scope of a context's tenant slots (ggml-sycl.h; tenant-claim-scope.hpp).  Open reads the
+// context's held table from its registry entry and makes it this thread's claim target; the SYCL_Host
+// buffer type's alloc_buffer claims from it until close.  The status says why a scope did not open: a
+// context with no reservation (allocate as before) is not a nested open (do not allocate: the scope in force
+// is another context's) and neither is a failure.
+enum ggml_sycl_claim_scope_status ggml_backend_sycl_claim_scope_open(ggml_backend_t backend, void ** scope) {
+    if (scope == nullptr) {
+        return GGML_SYCL_CLAIM_SCOPE_FAILED;
+    }
+    *scope = nullptr;
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return GGML_SYCL_CLAIM_SCOPE_FAILED;
+    }
+    if (!backend || !backend->context || !ggml_backend_is_sycl(backend) || !backend->device ||
+        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
+        return GGML_SYCL_CLAIM_SCOPE_INVALID_BACKEND;
+    }
+    try {
+        const auto * ctx = static_cast<const ggml_backend_sycl_context *>(backend->context);
+        if (ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES) {
+            return GGML_SYCL_CLAIM_SCOPE_INVALID_BACKEND;
+        }
+        // A nested open is refused before the table is read, so a caller inside a scope always learns that,
+        // whatever its own context holds.
+        if (ggml_sycl::tenant_claim_scope::active()) {
+            GGML_LOG_ERROR("[CLAIM-SCOPE] nested open refused: this thread already holds a claim scope\n");
+            return GGML_SYCL_CLAIM_SCOPE_NESTED;
+        }
+        const uint64_t id = ggml_sycl_context_execution_id(ctx);
+        if (id == 0) {
+            return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;
+        }
+        auto table = ggml_sycl_kv_region_registry(ctx->device).tenants(id);
+        ggml_sycl::tenant_claim_scope::state * opened = nullptr;
+        switch (ggml_sycl::tenant_claim_scope::open(std::move(table), opened)) {
+            case ggml_sycl::tenant_claim_scope::open_status::OPENED:
+                *scope = opened;
+                return GGML_SYCL_CLAIM_SCOPE_OPENED;
+            case ggml_sycl::tenant_claim_scope::open_status::NO_TABLE:
+                return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;
+            case ggml_sycl::tenant_claim_scope::open_status::NESTED:
+                return GGML_SYCL_CLAIM_SCOPE_NESTED;
+        }
+        return GGML_SYCL_CLAIM_SCOPE_FAILED;
+    } catch (...) {
+        return GGML_SYCL_CLAIM_SCOPE_FAILED;
+    }
+}
+
+void ggml_backend_sycl_claim_scope_close(void * scope) {
+    if (scope == nullptr) {
+        return;
+    }
+    if (!ggml_sycl::tenant_claim_scope::close(static_cast<ggml_sycl::tenant_claim_scope::state *>(scope))) {
+        GGML_LOG_ERROR("[CLAIM-SCOPE] close refused: the scope is not the one open on this thread\n");
+    }
+}
+
+size_t ggml_backend_sycl_claim_scope_claims(void * scope) {
+    if (scope == nullptr) {
+        return 0;
+    }
+    size_t claims = 0;
+    if (!ggml_sycl::tenant_claim_scope::claims_made(static_cast<const ggml_sycl::tenant_claim_scope::state *>(scope),
+                                                    claims)) {
+        GGML_LOG_ERROR("[CLAIM-SCOPE] claims read refused: the scope is not the one open on this thread\n");
+    }
+    return claims;
+}
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+// Host-tier slots alive in the process (a test's view of a reservation's carves).
+extern "C" size_t ggml_backend_sycl_test_host_tenant_slots_live() {
+    return ggml_sycl_host_tenant_slot::live_count().load(std::memory_order_relaxed);
+}
+
 size_t ggml_backend_sycl_plan_caps_freeze_core(ggml_backend_sycl_plan_caps_t caps,
                                                ggml_backend_buffer_type_t    buft,
                                                bool                          is_vm,
@@ -44268,6 +45090,10 @@ struct sycl_host_buf_ctx {
     // host-access accessors below can order against the GPU before delegating.
     int                   device = -1;
     ggml_backend_buffer_i cpu_iface{};
+    // Set when the buffer was built over a claimed tenant slot (inside a claim scope); free_buffer
+    // releases it.  `buffer_handle` is then a copy of the slot's own handle, so the memory outlives
+    // the table that carried it.
+    std::unique_ptr<ggml_sycl::tenant_claim> claim;
 };
 
 // llama.cpp-30h4: order host-side access to this pinned USM against the GPU
@@ -44314,6 +45140,66 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
     auto * ctx = static_cast<sycl_host_buf_ctx *>(buffer->context);
     if (!ctx) {
         return;
+    }
+    if (ctx->claim) {
+        // No wait here, on purpose (no host waits; event-chain instead), and the slot goes back with event 0.  That
+        // is sound because of a contract that holds on every path to this function, read against the code and
+        // pinned by scripts/check-sycl-l4-proc-registration.py.  Each paragraph below is one part of it.
+        //
+        // CONTRACT: a claimed compute buffer is freed only after a synchronize ATTEMPT of every backend of its
+        // scheduler, and every SYCL queue that can touch a claimed slot is the device's one execution queue, which
+        // that synchronize drains.
+        //
+        // ONE QUEUE: once the unified cache exists (a claim requires it: its slots are cache carves),
+        // ggml_backend_sycl_context::stream(device, idx) answers ggml_sycl_execution_queue_for_device(device) for
+        // EVERY idx -- the TP queue when TP is on, else the cache's own queue.  Before the cache exists stream() falls
+        // back to the device's default queue, which no claim can outlive or predate.  So stream 0, the streams
+        // "1..N" and the cache's queue are one queue, not several that the synchronize could miss, and the
+        // synchronize's wait on stream 0 (or on the deferred last graph event, plus ggml_sycl_cpu_tg_flush_pending
+        // for the CPU-expert and scatter pipelines, detached threads included) is a wait on all of them.  A second
+        // real queue per device breaks that, and with it this contract: the pins on stream() and on the
+        // synchronize's drain exist so that it cannot happen quietly.
+        //
+        // READERS: when the plan has CPU work, or the offload is partial, the CPU backend's compute buft is the
+        // CpuActivation clone, which ggml_backend_sycl_device_supports_buft does not list, so no SYCL op touches an
+        // activation in it.  With no CPU work and every layer offloaded it is the GENERIC SYCL_Host buft
+        // (llama_context_cpu_compute_buft), which supports_buft accepts, and SYCL kernels DO read and write a
+        // claimed slot in place -- on the execution queue above, which is why the synchronize covers them.  A
+        // consumer that puts work for a slot on anything that is not that queue must make the backend synchronize
+        // drain it, or chain on the slot's wait_event (the L6 event ledger); it must not rely on this contract and
+        // must not add a wait here.  No async copy has a SYCL_Host tensor at either end: set/get_tensor_async assert
+        // a SYCL device, host-compute or cpu-offload buft and cpy_tensor_async is NULL; the scheduler's
+        // cross-backend copy is a blocking ggml_backend_tensor_copy between the two backends' synchronizes, through
+        // accessors that wait the cache and default queues themselves; ggml-cpu's graph_compute is synchronous (its
+        // synchronize is NULL); and the staging the scatter threads touch is their own owner-first host handles.
+        //
+        // PATHS: ggml_backend_sched_reserve and _reserve_size (ggml_backend_sched_synchronize first); the realloc in
+        // ggml_backend_sched_alloc_splits (ggml_backend_synchronize of every backend before ggml_gallocr_reserve_n --
+        // the other realloc, the automatic reserve in ggml_gallocr_alloc_graph, needs a single-buffer allocator,
+        // which llama.cpp never builds because the CPU backend is always one of the scheduler's backends, so a SYCL
+        // scheduler has two or more); llama_context's scheduler replacement in sched_reserve_impl (synchronize()
+        // before it on the ALLOC path; the pipeline-parallel retry replaces a scheduler that only failed to reserve,
+        // so it never computed) and in release_rung_buffers (synchronize() first); and ~llama_context
+        // (synchronize() first).  Nothing else frees a compute buffer: ggml_backend_sched_reset only resets the
+        // allocator.
+        //
+        // BENIGN FREES AND THE L6 CONSTRAINT: two more frees run no synchronize: the MEASURE scheduler's destruction
+        // (sched_measure_storage, whose reserves go through ggml_backend_sched_reserve, which does synchronize, and
+        // whose final free does not) and the unwinding of a constructor that threw.  Nothing runs a kernel on either,
+        // and no claim scope is open on either.  L6 CONSTRAINT: a claim scope must never be opened on the measure
+        // scheduler (its reserve is bare, with no plan scope or hold record around it); a scope opened there turns both
+        // frees into paths on the list above, and each then needs a synchronize before it.
+        //
+        // A FAILED DRAIN: "synchronize" is an attempt: ggml_backend_sycl_synchronize swallows its own failure (a
+        // throwing drain goes to ggml_backend_sycl_graph_boundary_exception_cleanup, which logs, and the call
+        // returns).  So after a failed drain (a lost device) the slot goes back with event 0 while the queue may
+        // still reference it, and the contract is void for that device from then on: nothing is submitted to a lost
+        // device's context, which is why that is tolerated, and the synchronize's own ERROR line is the only report.
+        // A caller that needs the drain to have worked must ask the backend, not infer it from this function having
+        // been reached.  A queue-wide wait here would be too much (it waited on, and rethrew, other contexts' work),
+        // and the contract already makes it unneeded.
+        (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);
+        ctx->claim.reset();
     }
     ctx->buffer_handle = {};
     delete ctx;
@@ -44379,6 +45265,97 @@ static bool ggml_backend_sycl_host_buffer_cpy_tensor(ggml_backend_buffer_t buffe
     return ctx->cpu_iface.cpy_tensor(buffer, src, dst);
 }
 
+// Inside a claim scope the host buffer is a claim of a tenant slot, not an allocation (moua design 2.3.2):
+// the lowest free slot of the host compute cohort, checked against its cap, and the buffer is built over
+// the slot's memory.  A request the table cannot serve is a plan bug, never a silent growth and never a
+// fall back to the legacy path: the buffer is refused by name.  On OK `claim` holds the live claim and
+// `ptr`/`handle` the slot's memory; on false nothing is claimed.
+static bool ggml_backend_sycl_host_buffer_claim_slot(size_t                                     size,
+                                                     int                                        device,
+                                                     std::unique_ptr<ggml_sycl::tenant_claim> & claim,
+                                                     void *&                                    ptr,
+                                                     ggml_sycl::mem_handle &                    handle) {
+    const ggml_sycl_context_cohort_info * info = ggml_sycl_context_cohort_lookup(GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST);
+    GGML_ASSERT(info != nullptr);
+    // `made` releases its slot when it is dropped, so every refusal below and an exception from here on leave
+    // the slot free: there is no explicit release to forget.
+    auto                                  made    = std::make_unique<ggml_sycl::tenant_claim>();
+    const ggml_sycl::tenant_claim_outcome outcome = ggml_sycl::tenant_claim_scope::claim(info->name, size, *made);
+    if (outcome.status != ggml_sycl::tenant_claim_status::OK) {
+        if (outcome.status == ggml_sycl::tenant_claim_status::OVER_PLAN) {
+            GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] host buffer claim refused: %zu B over the %zu B slot %u of cohort %s\n",
+                           size, outcome.cap, outcome.index, info->name);
+        } else {
+            GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] host buffer claim refused: no free slot %u of cohort %s for %zu B\n",
+                           outcome.index, info->name, size);
+        }
+        return false;
+    }
+    const ggml_sycl_host_tenant_slot * slot     = ggml_sycl_host_tenant_slot_of(made->owner);
+    const auto                         resolved = slot ? slot->handle.resolve(device) : ggml_sycl::resolved_ptr{};
+    if (!slot || !resolved.ptr || resolved.on_device) {
+        GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] host buffer claim refused: slot %u of cohort %s holds no host memory\n",
+                       made->index, info->name);
+        return false;
+    }
+    ptr    = resolved.ptr;
+    handle = slot->handle;
+    claim  = std::move(made);
+    return true;
+}
+
+// The buffer over `ptr`: the CPU buffer from the pointer with the host accessors installed.  `claim` is the
+// live tenant claim the memory belongs to, or null for a buffer the buft allocated itself.  The claim is
+// released by its own destructor on every refusal here, so none of them has a release to forget.
+static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap(ggml_backend_buffer_type_t               buft,
+                                                                void *                                   ptr,
+                                                                size_t                                   size,
+                                                                ggml_sycl::mem_handle                    handle,
+                                                                int                                      device,
+                                                                std::unique_ptr<ggml_sycl::tenant_claim> claim) {
+    // Use the wrapper struct as buffer context so free_buffer knows which
+    // deallocation path to take.  Override get_base to extract the raw pointer.
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    if (!buffer) {
+        return nullptr;
+    }
+
+    // Capture the CPU iface BEFORE overriding it: the accessors below delegate
+    // to these exact implementations after waiting the GPU (llama.cpp-30h4).  nothrow: a failed allocation
+    // frees the CPU buffer built above and answers null, rather than leaving it, and its claim, to an unwind.
+    auto * ctx = new (std::nothrow) sycl_host_buf_ctx{ ptr, size, std::move(handle), device, buffer->iface };
+    if (!ctx) {
+        ggml_backend_buffer_free(buffer);
+        return nullptr;
+    }
+    ctx->claim = std::move(claim);
+
+    if (!ggml_backend_buffer_set_type(buffer, buft)) {
+        ggml_backend_buffer_free(buffer);
+        delete ctx;  // its claim, if any, releases with it
+        return nullptr;
+    }
+    buffer->context           = ctx;
+    buffer->iface.get_base    = ggml_backend_sycl_host_buffer_get_base;
+    buffer->iface.free_buffer = ggml_backend_sycl_host_buffer_free_buffer;
+    buffer->iface.clear       = ggml_backend_sycl_host_buffer_clear;
+    // Only wrap the accessors the CPU buffer actually implements; leaving an
+    // absent one null keeps ggml-backend's own fallbacks reachable.
+    if (ctx->cpu_iface.set_tensor) {
+        buffer->iface.set_tensor = ggml_backend_sycl_host_buffer_set_tensor;
+    }
+    if (ctx->cpu_iface.get_tensor) {
+        buffer->iface.get_tensor = ggml_backend_sycl_host_buffer_get_tensor;
+    }
+    if (ctx->cpu_iface.memset_tensor) {
+        buffer->iface.memset_tensor = ggml_backend_sycl_host_buffer_memset_tensor;
+    }
+    if (ctx->cpu_iface.cpy_tensor) {
+        buffer->iface.cpy_tensor = ggml_backend_sycl_host_buffer_cpy_tensor;
+    }
+    return buffer;
+}
+
 static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                                                              size_t                     size) {
     const bool weights_evictable = ggml_backend_sycl_weights_evictable();
@@ -44389,6 +45366,17 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     const int exact_device = ggml_sycl_device_id_from_backend_dev(buft ? buft->device : nullptr);
     if (exact_device < 0) {
         return nullptr;
+    }
+    // Inside a claim scope the buffer is a claim of a tenant slot, not an allocation.
+    if (ggml_sycl::tenant_claim_scope::active()) {
+        void *                                   claimed_ptr = nullptr;
+        ggml_sycl::mem_handle                    claimed_handle;
+        std::unique_ptr<ggml_sycl::tenant_claim> claim;
+        if (!ggml_backend_sycl_host_buffer_claim_slot(size, exact_device, claim, claimed_ptr, claimed_handle)) {
+            return nullptr;
+        }
+        return ggml_backend_sycl_host_buffer_wrap(buft, claimed_ptr, size, std::move(claimed_handle), exact_device,
+                                                  std::move(claim));
     }
     auto *        exact_cache = ggml_sycl::get_unified_cache_for_device(exact_device);
     sycl::queue * exact_queue =
@@ -44424,41 +45412,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     ggml_sycl::mem_handle buffer_handle =
         ggml_sycl::detail::from_legacy_owned_alloc(std::move(host_buffer_owner), GGML_LAYOUT_AOS);
 
-    // Use the wrapper struct as buffer context so free_buffer knows which
-    // deallocation path to take.  Override get_base to extract the raw pointer.
-    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
-    if (!buffer) {
-        return nullptr;
-    }
-
-    // Capture the CPU iface BEFORE overriding it: the accessors below delegate
-    // to these exact implementations after waiting the GPU (llama.cpp-30h4).
-    auto * ctx = new sycl_host_buf_ctx{ ptr, size, std::move(buffer_handle), exact_device, buffer->iface };
-
-    if (!ggml_backend_buffer_set_type(buffer, buft)) {
-        ggml_backend_buffer_free(buffer);
-        delete ctx;
-        return nullptr;
-    }
-    buffer->context           = ctx;
-    buffer->iface.get_base    = ggml_backend_sycl_host_buffer_get_base;
-    buffer->iface.free_buffer = ggml_backend_sycl_host_buffer_free_buffer;
-    buffer->iface.clear       = ggml_backend_sycl_host_buffer_clear;
-    // Only wrap the accessors the CPU buffer actually implements; leaving an
-    // absent one null keeps ggml-backend's own fallbacks reachable.
-    if (ctx->cpu_iface.set_tensor) {
-        buffer->iface.set_tensor = ggml_backend_sycl_host_buffer_set_tensor;
-    }
-    if (ctx->cpu_iface.get_tensor) {
-        buffer->iface.get_tensor = ggml_backend_sycl_host_buffer_get_tensor;
-    }
-    if (ctx->cpu_iface.memset_tensor) {
-        buffer->iface.memset_tensor = ggml_backend_sycl_host_buffer_memset_tensor;
-    }
-    if (ctx->cpu_iface.cpy_tensor) {
-        buffer->iface.cpy_tensor = ggml_backend_sycl_host_buffer_cpy_tensor;
-    }
-    return buffer;
+    return ggml_backend_sycl_host_buffer_wrap(buft, ptr, size, std::move(buffer_handle), exact_device, nullptr);
 }
 
 ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
@@ -45768,6 +46722,11 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     }
     pp_moe_onednn_drain_scratch_slots(device);
     ggml_sycl_execution_abort_and_release_graph(this);
+    // One read of the id for both drops: zero once an execution context's end has reset it, which dropped the
+    // entries by the ended id already.
+    const uint64_t context_id = ggml_sycl_context_execution_id(this);
+    ggml_sycl_published_section_erase(device, context_id);
+    ggml_sycl_host_tenants_erase(device, context_id);
     ggml_sycl_execution_unbind_backend(this);
     {
         std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
@@ -113702,6 +114661,15 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_replan_scope_close") == 0) {
         return (void *) ggml_backend_sycl_replan_scope_close;
     }
+    if (strcmp(name, "ggml_backend_sycl_claim_scope_open") == 0) {
+        return (void *) ggml_backend_sycl_claim_scope_open;
+    }
+    if (strcmp(name, "ggml_backend_sycl_claim_scope_close") == 0) {
+        return (void *) ggml_backend_sycl_claim_scope_close;
+    }
+    if (strcmp(name, "ggml_backend_sycl_claim_scope_claims") == 0) {
+        return (void *) ggml_backend_sycl_claim_scope_claims;
+    }
     if (strcmp(name, "ggml_backend_sycl_plan_scope_open") == 0) {
         return (void *) ggml_backend_sycl_plan_scope_open;
     }
@@ -113800,6 +114768,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_test_allocate_predictor_scores") == 0) {
         return (void *) ggml_backend_sycl_test_allocate_predictor_scores;
     }
+    if (strcmp(name, "ggml_backend_sycl_test_record_compute_term") == 0) {
+        return (void *) ggml_backend_sycl_test_record_compute_term;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_compute_term_count") == 0) {
+        return (void *) ggml_backend_sycl_test_compute_term_count;
+    }
 #endif
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_candidate_binding_allocation") == 0) {
@@ -113820,6 +114794,21 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_for_model") == 0) {
         return (void *) ggml_backend_sycl_set_runtime_context_for_model;
+    }
+    // The L4 descriptor publish, the coverage read, the late check and the residency probe.  Each name is the
+    // "Proc name:" its declaration in ggml-sycl.h carries; scripts/check-sycl-l4-proc-registration.py pins that
+    // every such name in the header has an arm here.
+    if (strcmp(name, "ggml_backend_sycl_set_runtime_context_desc") == 0) {
+        return (void *) ggml_backend_sycl_set_runtime_context_desc;
+    }
+    if (strcmp(name, "ggml_backend_sycl_tenant_coverage") == 0) {
+        return (void *) ggml_backend_sycl_tenant_coverage;
+    }
+    if (strcmp(name, "ggml_backend_sycl_load_late_check") == 0) {
+        return (void *) ggml_backend_sycl_load_late_check;
+    }
+    if (strcmp(name, "ggml_backend_sycl_probe_residency") == 0) {
+        return (void *) ggml_backend_sycl_probe_residency;
     }
     if (strcmp(name, "ggml_backend_sycl_recheck_runtime_context_flash_attn") == 0) {
         return (void *) ggml_backend_sycl_recheck_runtime_context_flash_attn;

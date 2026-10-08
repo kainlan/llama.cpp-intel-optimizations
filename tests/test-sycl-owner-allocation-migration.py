@@ -167,12 +167,17 @@ NAMED_OWNER_FIRST_SITES = (
     ("ggml_backend_sycl_test_park_tenant_staging",
      "zhcn C7a (cec4a5f10): parks one host-pinned STAGING entry under a tenant cohort for the replay-only-call "
      "test; owner-first, handed over via from_owned_alloc"),
+    ("ggml_sycl_reserve_host_tenants",
+     "moua L4 step 3c: the host tier of a context's tenants -- one owner-first carve per host slot (must_host_pinned, "
+     "pinned pool, category HOST_COMPUTE, the cohort's own name), held by the registry entry that carries the table, "
+     "so no raw pointer or side cache holds the room; refuses on failure, handed over via from_owned_alloc"),
 )
 
 
 def function_body_span(code: str, name: str):
     """(start of the definition, end of its closing brace) of the one function `name` defined in `code`."""
-    heads = list(re.finditer(r"\b%s\([^;{}]*\)\s*(?:noexcept\s*)?\{" % re.escape(name), code))
+    # A definition is not a call: `if (!name(...)) {` also ends in `) {`, so a head preceded by `!` or `(` is a call.
+    heads = list(re.finditer(r"(?<![!(])\b%s\([^;{}]*\)\s*(?:noexcept\s*)?\{" % re.escape(name), code))
     assert len(heads) == 1, "%s: expected one definition, found %d" % (name, len(heads))
     start = heads[0].start()
     depth, index = 0, heads[0].end() - 1

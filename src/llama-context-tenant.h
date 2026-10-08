@@ -15,26 +15,30 @@
 // plain integers and the backend's wire structs: tests/test-context-tenant-section.cpp executes
 // them on the host with no device.
 //
-//   llama_sycl_l4_procs        the three L4 entry points and the fail-closed way to call each;
+//   llama_sycl_l4_procs        the four L4 entry points and the fail-closed way to call each;
 //   llama_tenant_section_*     the tenant section from the measured compute caps, and its merge
 //                              with the backend visitors' demands;
 //   llama_tenant_key_digest()  the tenant key;
 //   llama_tenant_plan_line()   the line the scorer matches.
 
-// The L4 entry points: the tenant publish, the coverage query and the load-time late check
-// (ggml-sycl.h, "The measured-tenant publish"). A backend that predates them leaves a proc
-// null, and each reader below then answers the value that makes the caller do the safe thing:
-// no publish happened (UNSUPPORTED), the section needs a transaction (GROWTH), and nothing was
-// compared (NOT_RECORDED). The table is filled by llama-context.cpp through the SYCL reg's proc
-// address in every link mode, by the names ggml-sycl-l4-procs.h pins.
+// The L4 entry points: the tenant publish, the coverage query, the load-time late check and the
+// residency probe (ggml-sycl.h, "The measured-tenant publish"). A backend that predates them leaves a
+// proc null, and each reader below then answers the value that makes the caller do the safe thing:
+// no publish happened (UNSUPPORTED), the section needs a transaction (GROWTH), nothing was
+// compared (NOT_RECORDED), and the probe gave no answer (NOT_ANSWERED). The table is filled by
+// llama-context.cpp through the SYCL reg's proc address in every link mode, by the names
+// ggml-sycl-l4-procs.h pins.
 struct llama_sycl_l4_procs {
-    decltype(&ggml_backend_sycl_set_runtime_context_desc) publish    = nullptr;
-    decltype(&ggml_backend_sycl_tenant_coverage)          coverage   = nullptr;
-    decltype(&ggml_backend_sycl_load_late_check)          late_check = nullptr;
+    decltype(&ggml_backend_sycl_set_runtime_context_desc) publish         = nullptr;
+    decltype(&ggml_backend_sycl_tenant_coverage)          coverage        = nullptr;
+    decltype(&ggml_backend_sycl_load_late_check)          late_check      = nullptr;
+    decltype(&ggml_backend_sycl_probe_residency)          probe_residency = nullptr;
 
-    // A planned context needs all three: a publish that cannot be covered-checked, or a load
-    // that cannot be late-checked, is half a plan.
-    bool available() const { return publish != nullptr && coverage != nullptr && late_check != nullptr; }
+    // A planned context needs all four: a publish that cannot be covered-checked, a load that
+    // cannot be late-checked, or a plan whose residency cannot be probed, is half a plan.
+    bool available() const {
+        return publish != nullptr && coverage != nullptr && late_check != nullptr && probe_residency != nullptr;
+    }
 };
 
 inline ggml_sycl_lifecycle_result llama_sycl_l4_publish(const llama_sycl_l4_procs &            procs,
@@ -95,6 +99,50 @@ inline ggml_sycl_late_check_result llama_sycl_l4_late_check(const llama_sycl_l4_
             return r;
         default:
             return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
+}
+
+// The residency probe's one door: no other code calls the proc pointer or the symbol
+// (scripts/check-sycl-l4-proc-registration.py pins it). NOT_ANSWERED is the answer to anything this reader cannot
+// vouch for: a null proc, and a value outside the enum (a newer backend's status is not "OK" to an older reader).
+// `out->n_layer` is cleared to 0 for those, so a stale count left in the caller's struct is never read as an answer.
+// Only OK carries a vector, and this door never writes out->host_resident: the backend does, on OK alone.
+// GEOMETRY_NOT_WIRED and every other refusal pass through as themselves, and a caller must treat every status but OK
+// as "no answer", never as "no host layers".
+inline ggml_sycl_residency_probe_status llama_sycl_l4_probe_residency(const llama_sycl_l4_procs &  procs,
+                                                                      ggml_backend_t               backend,
+                                                                      struct ggml_sycl_model_token model,
+                                                                      uint32_t                     n_ctx,
+                                                                      uint32_t                     n_ubatch,
+                                                                      uint32_t                     n_seq_max,
+                                                                      bool                         kv_unified,
+                                                                      bool                         swa_full,
+                                                                      bool                         flash_attn_enabled,
+                                                                      const ggml_sycl_runtime_context_desc * desc,
+                                                                      struct ggml_sycl_residency_probe *     out) {
+    if (procs.probe_residency == nullptr) {
+        if (out != nullptr) {
+            out->n_layer = 0;
+        }
+        return GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED;
+    }
+    const ggml_sycl_residency_probe_status r = procs.probe_residency(
+        backend, model, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full, flash_attn_enabled, desc, out);
+    switch (r) {
+        case GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED:
+        case GGML_SYCL_RESIDENCY_PROBE_OK:
+        case GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED:
+        case GGML_SYCL_RESIDENCY_PROBE_INVALID:
+        case GGML_SYCL_RESIDENCY_PROBE_HEAD_SLOT_REFUSED:
+        case GGML_SYCL_RESIDENCY_PROBE_NO_PROMOTION_VIOLATED:
+        case GGML_SYCL_RESIDENCY_PROBE_N_LAYER_CAP_TOO_SMALL:
+        case GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND:
+            return r;
+        default:
+            if (out != nullptr) {
+                out->n_layer = 0;
+            }
+            return GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED;
     }
 }
 

@@ -231,67 +231,42 @@ class zone_model {
         }
     }
 
-    // Carve one op the way the commit does, at the op's offset.  A chain that runs
-    // down from a block's top is allocate_below the block above it; a carve whose top
-    // is not the free block's (a survivor of a commit re-fit that kept its planned
-    // offset under a slot that is gone) is the offset-fixed carve of the spec's
-    // allocate_at, which the model builds from the same primitives: a plug allocated
-    // below the block's top, the carve below the plug, then the plug freed.
-    //
-    // The contract the production allocate_at must keep, and L4 reruns these cases
-    // against it: the block is carved at exactly [offset, offset + demand) or nothing
-    // changes.  A failed carve leaves the allocator as it found it, so the model frees
-    // the plug and anything it carved on every failure path.  Returns false, printing
-    // why, on failure.
+    // Carve one op the way the commit does: tlsf_allocator::allocate_at, the
+    // offset-fixed carve of the spec, at the op's offset.  The block is carved at
+    // exactly [offset, offset + size) or nothing changes: a carve that lands on
+    // another offset, or whose block is not the extent the fit planned (a demand
+    // that rounds to a different size, an end off the allocator's grain), is freed
+    // again, so a failed carve leaves the allocator as it found it.  Returns false,
+    // printing why, on failure.
     bool carve(const kv_carve_op & op) {
         if (!op.carve) {
             return true;
         }
         const size_t end = op.offset + op.size;
-        // The free stretch holding [offset, end): between two census blocks.
-        size_t       hi  = size_;
         for (const auto & kv : census_) {
-            if (kv.first + kv.second.size <= op.offset) {
-                continue;
-            }
-            if (kv.first >= end) {
-                hi = std::min(hi, kv.first);
-            } else {
+            if (kv.first < end && op.offset < kv.first + kv.second.size) {
                 std::fprintf(stderr, "carve mismatch: fit offset %zu size %zu overlaps an allocated block\n", op.offset,
                              op.size);
                 return false;
             }
         }
-        const size_t top_anchor = hi >= size_ ? tlsf_allocator::no_anchor : hi;
-        size_t       plug       = SIZE_MAX;
-        if (end < hi) {
-            plug = tlsf_.allocate_below(top_anchor, hi - end, 256, ggml_sycl::SHARED_ZONE_TAG_CONTEXT);
-            if (plug != end) {
-                std::fprintf(stderr, "carve mismatch: no plug at %zu for the carve at %zu\n", end, op.offset);
-                if (plug != SIZE_MAX) {
-                    tlsf_.free(plug);
-                }
-                return false;
-            }
-        }
-        const size_t anchor = plug != SIZE_MAX ? plug : top_anchor;
-        const size_t used   = tlsf_.used();
-        const size_t off    = tlsf_.allocate_below(anchor, op.demand, 256, ggml_sycl::SHARED_ZONE_TAG_CONTEXT);
+        const size_t off = tlsf_.allocate_at(op.offset, op.demand, ggml_sycl::SHARED_ZONE_TAG_CONTEXT);
         if (off != op.offset) {
             std::fprintf(stderr, "carve mismatch: fit offset %zu size %zu demand %zu, allocator gave %zu\n", op.offset,
                          op.size, op.demand, off);
             if (off != SIZE_MAX) {
                 tlsf_.free(off);
             }
-            if (plug != SIZE_MAX) {
-                tlsf_.free(plug);
-            }
             return false;
         }
-        census_[off] = { off, tlsf_.used() - used, ggml_sycl::SHARED_ZONE_TAG_CONTEXT, false };
-        if (plug != SIZE_MAX) {
-            tlsf_.free(plug);
+        const size_t got = tlsf_.block_size_at(off);
+        if (got != op.size) {
+            std::fprintf(stderr, "carve mismatch: fit offset %zu size %zu demand %zu, the block is %zu bytes\n",
+                         op.offset, op.size, op.demand, got);
+            tlsf_.free(off);
+            return false;
         }
+        census_[off] = { off, got, ggml_sycl::SHARED_ZONE_TAG_CONTEXT, false };
         if (end == anchor_ || (anchor_ == tlsf_allocator::no_anchor && end >= size_)) {
             anchor_ = off;
         }

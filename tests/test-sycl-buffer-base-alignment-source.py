@@ -153,13 +153,21 @@ def tlsf_violations(source: str) -> list[str]:
     if body is None:
         return ["tlsf_allocator::allocate is missing"]
 
-    # The rounding granularity must be at least MIN_BLOCK_SIZE, never bare alignment.
-    if not re.search(r"granularity\s*=\s*alignment\s*>\s*MIN_BLOCK_SIZE\s*\?\s*alignment\s*:\s*MIN_BLOCK_SIZE", body):
-        found.append("allocate() does not raise the rounding granularity to MIN_BLOCK_SIZE")
-    if not re.search(r"size\s*=\s*\(size\s*\+\s*granularity\s*-\s*1\)\s*&\s*~\(granularity\s*-\s*1\)", body):
-        found.append("allocate() does not round the size by the granularity")
+    # allocate() takes the rounded size from round_request(), the one definition of the rule
+    # (the fold of the pending-range review): it must not round by its own copy again.
+    if not re.search(r"size\s*=\s*round_request\(size,\s*alignment\)", body):
+        found.append("allocate() does not round the size through round_request()")
     if re.search(r"size\s*=\s*\(size\s*\+\s*alignment\s*-\s*1\)\s*&\s*~\(alignment\s*-\s*1\)", body):
         found.append("allocate() still rounds the size by the caller's alignment")
+
+    # The rounding granularity must be at least MIN_BLOCK_SIZE, never bare alignment.
+    rounding = function_or_none(source, "static size_t round_request")
+    if rounding is None:
+        return found + ["tlsf_allocator::round_request is missing"]
+    if not re.search(r"granularity\s*=\s*alignment\s*>\s*block_grain\s*\?\s*alignment\s*:\s*block_grain", rounding):
+        found.append("round_request() does not raise the rounding granularity to the block grain")
+    if not re.search(r"\(size\s*\+\s*granularity\s*-\s*1\)\s*&\s*~\(granularity\s*-\s*1\)", rounding):
+        found.append("round_request() does not round the size by the granularity")
 
     # The invariant is checked where it is produced, not merely documented.
     if not re.search(r"TLSF_ASSERT\(\(blocks_\[block_id\]\.offset\s*%\s*MIN_BLOCK_SIZE\)\s*==\s*0", body):
@@ -290,8 +298,11 @@ def test_tlsf_and_fallthrough_mutations_are_witnessed() -> None:
     tlsf = TLSF.read_text()
     tlsf_mutations = [
         # Reinstating the alignment-based rounding is the llama.cpp-f8ws defect.
-        tlsf.replace("const size_t granularity = alignment > MIN_BLOCK_SIZE ? alignment : MIN_BLOCK_SIZE;",
+        tlsf.replace("const size_t granularity = alignment > block_grain ? alignment : block_grain;",
                      "const size_t granularity = alignment;", 1),
+        # allocate() rounding by its own copy again instead of the shared rule.
+        tlsf.replace("size = round_request(size, alignment);\n    if (size == 0) {\n        return SIZE_MAX;  // a zero size",
+                     "size = (size + alignment - 1) & ~(alignment - 1);\n    if (size == 0) {\n        return SIZE_MAX;  // a zero size", 1),
         # \s* not \n: clang-format may join this assert onto one line.
         re.sub(r"TLSF_ASSERT\(\(blocks_\[block_id\]\.offset % MIN_BLOCK_SIZE\) == 0 &&\s*\"[^\"]*\"\);",
                "", tlsf, count=1),

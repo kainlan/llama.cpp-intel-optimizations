@@ -1,3 +1,4 @@
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "../kv-runtime-demotion.hpp"
 #include "../tlsf-allocator.hpp"
 #include "kv-region-test-model.hpp"
@@ -2795,14 +2796,13 @@ static int case_i18_refit_misuse_aborts() {
     return 0;
 #else
     std::fprintf(stderr, "SKIP: misuse aborts need fork\n");
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 #endif
 }
 
-// The allocate_at stand-in leaves the allocator as it found it when a carve fails, so a
-// negative case can be followed by a legitimate carve (and the real allocate_at, which
-// L4 reruns these cases against, owes the same).
-static int case_i19_allocate_at_stand_in_is_atomic() {
+// A carve through the real allocate_at leaves the allocator as it found it when it fails,
+// so a negative case can be followed by a legitimate carve.
+static int case_i19_allocate_at_is_atomic() {
     krt::device_model dev    = gap_zone(100 * MiB);
     krt::zone_model & z      = dev.tlsfs[0];
     const size_t      top    = z.anchor();
@@ -3066,7 +3066,7 @@ static int run_case(const char * name, int (*fn)()) {
         return 0;
     }
     const int rc = fn();
-    if (rc == 77) {  // ctest's skip code: say so, so a skipped case is never mistaken for a pass
+    if (rc == LLAMA_TEST_EXIT_SKIP) {  // ctest's skip code: say so, so a skipped case is never mistaken for a pass
         std::fprintf(stderr, "case %s SKIPPED: it proves nothing on this platform\n", name);
         return 0;
     }
@@ -4031,7 +4031,7 @@ int main() {
     if (int rc = run_case("i18_refit_misuse_aborts", case_i18_refit_misuse_aborts)) {
         return rc;
     }
-    if (int rc = run_case("i19_allocate_at_stand_in_is_atomic", case_i19_allocate_at_stand_in_is_atomic)) {
+    if (int rc = run_case("i19_allocate_at_is_atomic", case_i19_allocate_at_is_atomic)) {
         return rc;
     }
     if (int rc = run_case("i20_refit_result_is_an_assignment_only", case_i20_refit_result_is_an_assignment_only)) {

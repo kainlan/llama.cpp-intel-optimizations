@@ -319,7 +319,7 @@ register_usage_body = re.search(
     r"bool ggml_backend_sycl_try_register_weight_usage\(.*?^}\n", backend, re.S | re.M
 ).group(0)
 exact_runtime_body = re.search(
-    r"ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model\(.*?^}\n",
+    r"static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl\(.*?^}\n",
     backend, re.S | re.M
 ).group(0)
 begin_graph_body = re.search(
