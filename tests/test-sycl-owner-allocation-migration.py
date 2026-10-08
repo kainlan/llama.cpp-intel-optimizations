@@ -519,6 +519,21 @@ with gate('graph-preload-stamp-sites'):
                      compute)
     print("PASS graph-preload-stamp-sites-source-gate")
 
+with gate('graph-preload-refresh-needs-graph'):
+    # The post-prompt residency check builds the pointer tables and leases a recorded graph replays. A call that
+    # cannot record or replay reads none of them (direct dispatch builds its own tables on first use), so the check
+    # must not run there: with GGML_SYCL_DISABLE_GRAPH=1 it was a once-per-split stall on the first decode token.
+    compute = region(RUNTIME, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                     "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
+    refresh = region(compute, "if (refresh_moe_after_pp || post_prompt_refresh_due)",
+                     "const int descriptor_moe_graph_candidates")
+    guard = re.search(r"if \(([^{]*)\)\s*\{\s*if \(!graph_preload_moe_experts\(", refresh)
+    assert guard and re.match(r"use_sycl_graph\s*&&", guard.group(1).strip()), guard and guard.group(1)
+    assert refresh.count("graph_preload_moe_experts(") == 1
+    decided = re.search(r"use_sycl_graph\s*=\s*!g_ggml_sycl_disable_graph", compute)
+    assert decided and decided.start() < compute.index("if (refresh_moe_after_pp || post_prompt_refresh_due)")
+    print("PASS graph-preload-refresh-needs-graph-source-gate")
+
 with gate('moe-metadata'):
     # Metadata and its derived group registry are built locally and atomically
     # swapped under both writer locks; bad_alloc preserves the old epoch.

@@ -109099,8 +109099,11 @@ normal_dispatch:
         }
         // The residency check is answered once per expert-residency state of this split's tensors; the stamps it
         // leaves (moe-graph-preload-stamp.hpp) say whether it must run again. A skipped check collects no leases
-        // and releases none, so leases an executable graph retained stay in place.
-        if (post_prompt_refresh_due &&
+        // and releases none, so leases an executable graph retained stay in place. It builds the pointer tables and
+        // leases a recorded graph replays, so it runs only when this call may record or replay: direct dispatch
+        // builds its own full-local tables on first use (ggml_sycl_moe_decode_direct_table, the fused gate/up pair
+        // route), and an eager upload here would rewrite the shared table they memoize.
+        if (use_sycl_graph && post_prompt_refresh_due &&
             ggml_sycl_moe_graph_preload_decide(cgraph, sycl_ctx->device, moe_host_tier_boundary) ==
                 ggml_sycl::moe_graph_preload_split_decision::RUN) {
             if (!graph_preload_moe_experts(*sycl_ctx, cgraph, moe_host_tier_boundary)) {
