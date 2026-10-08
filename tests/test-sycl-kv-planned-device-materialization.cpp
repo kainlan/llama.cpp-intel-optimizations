@@ -12,6 +12,7 @@
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "sycl-selector-fallback.hpp"
+#include "test-skip.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -19,7 +20,7 @@
 #if !defined(GGML_USE_SYCL)
 int main() {
     fprintf(stderr, "SKIP: GGML_USE_SYCL not enabled; this run proves nothing.\n");
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 
@@ -40,7 +41,7 @@ int main(int, char ** argv) {
     const int physical_devices = ggml_sycl::test_physical_device_count();
     if (physical_devices < 2) {
         printf("SKIP: need at least two physical SYCL devices, got %d\n", physical_devices);
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     ggml_sycl::unified_cache * cache0 = ggml_sycl::get_unified_cache_for_device(0);

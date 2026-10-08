@@ -323,6 +323,48 @@ def test_mandatory_ranges_reach_pointer_table_and_dpas_rollback() -> None:
     assert "/*logical_offset=*/0" in rollback
 
 
+# The full-local expert pointer table resolves every expert in
+# moe_fusion_build_full_local_ptr_table; moe_fusion_ensure_full_local_ptr_table
+# is its memoizing front end and must reach the table only through it
+# (llama.cpp-yx28 split the two).
+FULL_LOCAL_ENSURE = "static const void * const * moe_fusion_ensure_full_local_ptr_table("
+FULL_LOCAL_BUILD = "static const void * const * moe_fusion_build_full_local_ptr_table("
+
+
+def full_local_table_violations(source: str) -> list[str]:
+    for signature in (FULL_LOCAL_ENSURE, FULL_LOCAL_BUILD):
+        if signature not in source:
+            return [f"anchor missing (renamed or moved?): {signature}"]
+    ensure = function(source, FULL_LOCAL_ENSURE)
+    build = function(source, FULL_LOCAL_BUILD)
+    checks = {
+        "build resolves every expert record": "extra->resolve_moe_storage_record(" in build,
+        "build fails closed off-device": "!logical.on_device" in build,
+        "build never looks up a raw storage handle": "find_moe_storage_handle" not in build,
+        "ensure delegates to build": "return moe_fusion_build_full_local_ptr_table(" in ensure,
+        "ensure never looks up a raw storage handle": "find_moe_storage_handle" not in ensure,
+    }
+    return [name for name, ok in checks.items() if not ok]
+
+
+def test_full_local_table_contract_rejects_mutants() -> None:
+    source = SOURCE.read_text()
+    assert not full_local_table_violations(source)
+    ensure = function(source, FULL_LOCAL_ENSURE)
+    build = function(source, FULL_LOCAL_BUILD)
+    mutants = {
+        "ensure-renamed": source.replace(FULL_LOCAL_ENSURE, "static const void * const * moe_fusion_get_full_local_ptr_table(", 1),
+        "build-renamed": source.replace(FULL_LOCAL_BUILD, "static const void * const * moe_fusion_make_full_local_ptr_table(", 1),
+        "build-uses-raw-handle": source.replace(build, build.replace("extra->resolve_moe_storage_record(", "extra->find_moe_storage_handle(", 1), 1),
+        "build-accepts-off-device": source.replace(build, build.replace("!logical.on_device", "false", 1), 1),
+        "ensure-bypasses-build": source.replace(ensure, ensure.replace("return moe_fusion_build_full_local_ptr_table(", "return moe_fusion_full_local_ptr_table_unchecked(", 1), 1),
+        "ensure-uses-raw-handle": source.replace(ensure, ensure.replace("const void * const * cached =", "(void) extra_lookup.find_moe_storage_handle(0);\n    const void * const * cached =", 1), 1),
+    }
+    for name, mutant in mutants.items():
+        assert mutant != source, f"{name}: mutation did not change the source (anchor stale)"
+        assert full_local_table_violations(mutant), f"{name}: mutant was NOT rejected"
+
+
 def test_logical_consumers_and_publishers_fail_closed() -> None:
     source = SOURCE.read_text()
     common = COMMON.read_text()
@@ -353,11 +395,13 @@ def test_logical_consumers_and_publishers_fail_closed() -> None:
     for signature in (
         "static void moe_layer_executor_abi_add_full_role_storage",
         "static bool persistent_tg_collect_full_role_descriptor",
-        "static const void * const * moe_fusion_ensure_full_local_ptr_table(",
+        FULL_LOCAL_BUILD,
     ):
         consumer = function(source, signature)
         assert "resolve_moe_storage_record" in consumer, signature
         assert "find_moe_storage_handle" not in consumer, signature
+    failures = full_local_table_violations(source)
+    assert not failures, failures
 
     materialize = function(source, "static bool ggml_sycl_materialize_planned_expert_layout")
     assert "resolve_moe_storage_record" in materialize
