@@ -12,8 +12,10 @@ O(1) / O(log n) and enumerate rows only to explain a refusal:
 
 What this file enforces, as text assertions on comment-stripped unified-cache.cpp:
 
-(A) host_zone_settle() and zone_settle() never name g_runtime_alloc_registry. Each calls its scan helper only inside
-    the block of an `if (<O(1) question>(<its zone arguments>)) {` whose condition is that question alone.
+(A) host_zone_settle() and zone_settle() never name g_runtime_alloc_registry. Each consults
+    runtime_registry_host_zone_live_locked() / runtime_registry_span_live_locked() (the question, with exactly its zone
+    arguments) and calls its scan helper only inside the block of an `if (<question>(...)) {` whose condition is that
+    question alone.
 (B) The enumerating helpers (runtime_registry_scan_host_zone_locked / runtime_registry_scan_span_locked) are called only
     from those two functions, and only inside the branch the O(1) question opened.
 (C) runtime_registry_host_zone_live_locked() is a counter read with no loop; runtime_registry_span_live_locked() queries
@@ -46,7 +48,8 @@ NOT COVERED, stated so nobody mistakes this for a proof. This is a tripwire on t
       `std::add_lvalue_reference_t<size_t>`) passes;
     - a counter returned by reference from a member function (`struct S { size_t & get() { return COUNTER; } };`, its
       static variant) or from the FIRST function after a fresh scope opener
-      (`namespace detail { size_t & get() {...} }`) passes: only functions whose header follows a column-0 `}` or the file start have their leading return type read;
+      (`namespace detail { size_t & get() {...} }`) passes: only functions whose header follows a column-0 `}` or
+      the file start have their leading return type read;
     - fail-closed: a `->` member access followed by `&` in an enclosing `if`/`while` header (`if ((p)->a & 1) { return
       COUNTER; }`) is read as a trailing return type, so such a return from a by-value function is reported;
     - a host_zone passed through a parenthesised callee (`(consume)(it->second.handle.host_zone)`) passes;
@@ -90,7 +93,10 @@ CODE = strip_comments((SYCL_DIR / "unified-cache.cpp").read_text())
 HOST_SETTLE = r"void\s+unified_cache::host_zone_settle\(\s*host_zone_id\s+zone\s*\)\s*\{"
 VRAM_SETTLE = r"void\s+unified_cache::zone_settle\(\s*vram_zone_id\s+zone\s*\)\s*\{"
 HOST_LIVE = r"static\s+bool\s+runtime_registry_host_zone_live_locked\(\s*host_zone_id\s+zone\s*\)\s*noexcept\s*\{"
-SPAN_LIVE = r"static\s+bool\s+runtime_registry_span_live_locked\(\s*uintptr_t\s+lo\s*,\s*uintptr_t\s+hi\s*\)\s*noexcept\s*\{"
+SPAN_LIVE = (
+    r"static\s+bool\s+runtime_registry_span_live_locked\(\s*uintptr_t\s+lo\s*,\s*uintptr_t\s+hi\s*\)"
+    r"\s*noexcept\s*\{"
+)
 COUNT_ROW = r"static\s+void\s+runtime_registry_count_row_locked\("
 EMPLACE = r"runtime_registry_emplace_locked\(\s*void\s*\*\s*ptr\s*,\s*runtime_alloc_record\s+rec\s*\)\s*\{"
 ERASE_IT = r"runtime_registry_erase_locked\(\s*runtime_registry_iterator\s+it\s*\)\s*noexcept\s*\{"
@@ -127,7 +133,7 @@ def blank_literals(text: str) -> str:
 
 
 def matching_brace(text: str, open_idx: int):
-    """Index of the `}` that closes the `{` at open_idx, or None (braces inside string and char literals are ignored)."""
+    """Index of the `}` closing the `{` at open_idx, or None (braces in string and char literals are ignored)."""
     text = blank_literals(text)
     depth = 0
     for i in range(open_idx, len(text)):
@@ -211,7 +217,9 @@ def test_real_settle_bodies_defeat_the_question_bypass_mutants():
     q = "if (runtime_registry_host_zone_live_locked(zone)) {"
     assert q in host
     # asks the question, then scans on an always-true condition
-    m1 = host.replace(q, "(void) runtime_registry_host_zone_live_locked(zone);\n        if (epoch_tracked || !epoch_tracked) {")
+    m1 = host.replace(
+        q, "(void) runtime_registry_host_zone_live_locked(zone);\n        if (epoch_tracked || !epoch_tracked) {"
+    )
     assert settle_violations(m1, "runtime_registry_host_zone_live_locked", SCAN_HOST, HOST_ARGS)
     m2 = host.replace(q, "if (runtime_registry_host_zone_live_locked(zone) || true) {")
     assert settle_violations(m2, "runtime_registry_host_zone_live_locked", SCAN_HOST, HOST_ARGS)
@@ -297,7 +305,8 @@ def test_host_zone_live_is_a_counter_read():
 @pytest.mark.parametrize(
     "body",
     [
-        "{ for (const auto & kv : g_runtime_alloc_registry) { if (kv.second.handle.host_zone == zone) return true; } return false; }",
+        "{ for (const auto & kv : g_runtime_alloc_registry) {"
+        " if (kv.second.handle.host_zone == zone) return true; } return false; }",
         "{ return g_runtime_alloc_registry.size() > 0; }",
         "{ return true; }",
         "{ size_t n = 0; while (n < 3) { n++; } return g_runtime_host_zone_rows[0] > n; }",
@@ -368,7 +377,10 @@ def test_span_live_gate_accepts_the_intended_shape():
         "  }\n"
         "  return false; }\n",
         # the guarded block no longer returns the index answer
-        SPAN_OK.replace("return g_runtime_alloc_index.find_first_base_in(lo, hi, nullptr);", "(void) g_runtime_alloc_index.find_first_base_in(lo, hi, nullptr);"),
+        SPAN_OK.replace(
+            "return g_runtime_alloc_index.find_first_base_in(lo, hi, nullptr);",
+            "(void) g_runtime_alloc_index.find_first_base_in(lo, hi, nullptr);",
+        ),
     ],
 )
 def test_span_live_gate_has_a_witness(mutant):
@@ -383,17 +395,19 @@ _PLAIN_ASSIGN = re.compile(r"(?<![=!<>+\-*/%|&^])=(?!=)")
 
 
 def ternary_operand_is_read(prefix: str) -> bool:
-    """A conditional operand is a read only when its statement is `return <expr>` or `<decl or lvalue> = <expr>` with every
-    parenthesis in <expr> closed before the operand: `(c ? X : y) = 0` and `f(c ? X : y)` are not."""
+    """A conditional operand is a read only when its statement is `return <expr>` or `<decl or lvalue> = <expr>`
+    with every parenthesis in <expr> closed before the operand: `(c ? X : y) = 0` and `f(c ? X : y)` are not."""
     stripped = prefix.lstrip()
     if stripped.startswith("return"):
         rest = stripped[len("return") :]
     else:
         # the initialising `=` is the first one outside every parenthesis: `f(a = 1, c ? X : y)` has none
-        m = next(
-            (m for m in _PLAIN_ASSIGN.finditer(stripped) if stripped.count("(", 0, m.start()) == stripped.count(")", 0, m.start())),
-            None,
+        outside = (
+            m
+            for m in _PLAIN_ASSIGN.finditer(stripped)
+            if stripped.count("(", 0, m.start()) == stripped.count(")", 0, m.start())
         )
+        m = next(outside, None)
         if m is None:
             return False
         rest = stripped[m.end() :]
@@ -603,15 +617,24 @@ def test_the_count_helper_gate_has_witnesses():
 
 
 # A registered row's host zone is counted when the row is registered and uncounted when it leaves, so it must not be
-# rewritten in between. test-sycl-runtime-registry-index-source.py forbids writing a row's handle, ptr and size through the
-# registry; this adds the one field the counters key on.
+# rewritten in between. test-sycl-runtime-registry-index-source.py forbids writing a row's handle, ptr and size
+# through the registry; this adds the one field the counters key on.
 _ASSIGN = r"(?:(?:[-+*/%|&^]|<<|>>)?=(?!=)|\+\+|--)"
 HOST_ZONE_WRITE_RE = re.compile(r"(?:->|\.)\s*second\s*\)*\s*\.\s*handle\s*\)*\s*\.\s*host_zone\s*" + _ASSIGN)
 HOST_ZONE_USE_RE = re.compile(r"(?:->|\.)\s*second\s*\)*\s*\.\s*handle\s*\)*\s*\.\s*host_zone\b")
 
 
+_HOST_ZONE_READ_CONTEXT = re.compile(r"(?:\breturn|=|\bif\s*\(|\bwhile\s*\()\s*([\w\(\)\.\->\s]*)$")
+
+
+def host_zone_read_context(prefix: str) -> bool:
+    """Does the statement prefix end in a read position (`return`, `=`, `if (`, `while (`) with no call in between?"""
+    m = _HOST_ZONE_READ_CONTEXT.search(prefix)
+    return m is not None and re.search(r"\w\s*\(", m.group(1)) is None
+
+
 def host_zone_row_writes(code: str):
-    """Rewrites of a registered row's host_zone: assignment, ++/--, address-of, a reference binding, or a call argument."""
+    """Rewrites of a registered row's host_zone: assignment, ++/--, address-of, a reference binding, a call argument."""
     bad = [m.start() for m in HOST_ZONE_WRITE_RE.finditer(code)]
     for m in HOST_ZONE_USE_RE.finditer(code):
         prefix = statement_prefix(code, m.start())
@@ -621,9 +644,7 @@ def host_zone_row_writes(code: str):
             bad.append(m.start())
         elif re.match(r"\s*(?:==|!=|<=|>=|<(?!<)|>(?!>)|;|\?|&&|\|\|)", after):
             continue
-        elif (m_ctx := re.search(r"(?:\breturn|=|\bif\s*\(|\bwhile\s*\()\s*([\w\(\)\.\->\s]*)$", prefix)) and not re.search(
-            r"\w\s*\(", m_ctx.group(1)
-        ):
+        elif host_zone_read_context(prefix):
             continue
         else:
             bad.append(m.start())
@@ -671,7 +692,12 @@ def test_host_zone_write_gate_allows_reads(line):
     assert host_zone_row_writes(CODE + "\nvoid f() {\n    " + line + "\n}\n") == [], line
 
 
-STATIC_NAMES = COUNTERS + (SCAN_HOST, SCAN_SPAN, "runtime_registry_host_zone_live_locked", "runtime_registry_span_live_locked")
+STATIC_NAMES = COUNTERS + (
+    SCAN_HOST,
+    SCAN_SPAN,
+    "runtime_registry_host_zone_live_locked",
+    "runtime_registry_span_live_locked",
+)
 
 
 def static_offenders(stripped_texts):
