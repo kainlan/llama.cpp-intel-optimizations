@@ -19,12 +19,14 @@ one measure-only context over a load's placement. This gate pins, on comment-str
   NOT_RECORDED is its own list and never an EQUAL, and the first REFUSED is the load's refusal;
 - the loader calls the late check exactly once, after the dev_layer sync and before the mappings are
   initialised; it WARNs for an unsupported model (the WARN pinned inside its own block) and, through one
-  text helper that carries the ubatch, for every device nothing was compared on, and throws a refusal;
+  text helper that carries the ubatch and the device's measured compute term (the fold keeps it beside the
+  device), for every device nothing was compared on, and throws a refusal;
 - "this model needs ctx_other" is one predicate, `llama_model_needs_ctx_other`, used by the context
   constructor and by the unsupported reason alike;
 - llama_load_measure asks the unsupported question before it creates any backend;
-- `llama_late_check_result` carries only what production reads (no `checked`, no `shrunk`), and the
-  ubatch reaches it through the fold, where a host test can see it.
+- `llama_late_check_result` carries only what production reads (no `checked`, no `shrunk`; the measured
+  term of each not-recorded device is read by the WARN), and the ubatch reaches it through the fold, where a
+  host test can see it.
 
 Every clause has a mutant that must fail it. Host-only; collected by pytest.
 """
@@ -189,7 +191,11 @@ def late_ok(code: str) -> bool:
 def fold_ok(code: str) -> bool:
     b = function_body(code, _FOLD)
     return (
-        z("case GGML_SYCL_LATE_CHECK_NOT_RECORDED: out.not_recorded.push_back(d.device); break;") in b
+        z(
+            "case GGML_SYCL_LATE_CHECK_NOT_RECORDED: out.not_recorded.push_back(d.device); "
+            "out.not_recorded_bytes.push_back(d.total); break;"
+        )
+        in b
         and z("case GGML_SYCL_LATE_CHECK_EQUAL: case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED: break;") in b
         and z("case GGML_SYCL_LATE_CHECK_REFUSED:") in b
         and "default:" not in b
@@ -228,7 +234,7 @@ def site_ok(code: str) -> bool:
     # an unsupported model is a WARN and the load goes on, the WARN inside its own block; a device nothing was
     # compared on is a WARN through the one text helper; a refusal is thrown. The refusal is the only throw.
     unsupported = block_after(seg, "if (!late.unsupported.empty())")
-    not_recorded = block_after(seg, "for (const int32_t device : late.not_recorded)")
+    not_recorded = block_after(seg, "for (size_t i = 0; i < late.not_recorded.size(); ++i)")
     return (
         "sycl_model_loading_guard.txn" in c[call : call + 400]
         and "LLAMA_LOG_WARN(" in unsupported
@@ -236,15 +242,28 @@ def site_ok(code: str) -> bool:
         and "late.unsupported.c_str()" in unsupported
         and "throw" not in unsupported
         and "LLAMA_LOG_WARN(" in not_recorded
-        and z("llama_late_check_not_recorded_text(device, late.n_ubatch)") in not_recorded
+        and z("llama_late_check_not_recorded_text(late.not_recorded[i], late.n_ubatch, late.not_recorded_bytes[i])")
+        in not_recorded
         and z("if (!late.refusal.empty()) { throw std::runtime_error(late.refusal); }") in seg
         and seg.count("throw") == 1
     )
 
 
+_NOT_RECORDED_TEXT = (
+    "inline std::string llama_late_check_not_recorded_text(int32_t device, uint32_t n_ubatch, size_t measured_bytes)"
+)
+
+
 def not_recorded_text_ok(code: str) -> bool:
-    b = function_body(code, "inline std::string llama_late_check_not_recorded_text(int32_t device, uint32_t n_ubatch)")
-    return "nothing was compared" in b and "std::to_string(n_ubatch)" in b and "std::to_string(device)" in b
+    b = function_body(code, _NOT_RECORDED_TEXT)
+    return (
+        "nothing was compared" in b
+        and "std::to_string(n_ubatch)" in b
+        and "std::to_string(device)" in b
+        # the measured term, in MiB with one decimal, reaches the returned text
+        and z('std::snprintf(mib, sizeof(mib), "%.1f", measured_bytes / 1024.0 / 1024.0);') in b
+        and z('"; measured compute term " + mib + " MiB on device "') in b
+    )
 
 
 def result_fields_ok(raw: str) -> bool:
@@ -252,8 +271,8 @@ def result_fields_ok(raw: str) -> bool:
     code = _gate.strip_comments(raw)
     i = code.index("struct llama_late_check_result {")
     body = code[i : code.index("};", i)]
-    names = set(re.findall(r"(?:std::string|uint32_t|std::vector<int32_t>|bool)\s+(\w+)", body))
-    return names == {"refusal", "unsupported", "n_ubatch", "not_recorded"}
+    names = set(re.findall(r"(?:std::string|uint32_t|std::vector<int32_t>|std::vector<size_t>|bool)\s+(\w+)", body))
+    return names == {"refusal", "unsupported", "n_ubatch", "not_recorded", "not_recorded_bytes"}
 
 
 _NEEDS_OTHER = "bool llama_model_needs_ctx_other(const llama_model & model)"
@@ -386,7 +405,8 @@ def test_fold_mutants():
     code = code_of(MEASURE_H)
     b = function_body(code, _FOLD)
     for name, old, new in [
-        ("not recorded read as equal", "case GGML_SYCL_LATE_CHECK_NOT_RECORDED:\n                out.not_recorded.push_back(d.device);\n                break;", "case GGML_SYCL_LATE_CHECK_NOT_RECORDED:\n                break;"),
+        ("not recorded read as equal", "case GGML_SYCL_LATE_CHECK_NOT_RECORDED:\n                out.not_recorded.push_back(d.device);\n                out.not_recorded_bytes.push_back(d.total);\n                break;", "case GGML_SYCL_LATE_CHECK_NOT_RECORDED:\n                break;"),
+        ("the measured term dropped", "out.not_recorded_bytes.push_back(d.total);", ""),
         ("shrink unhandled", "case GGML_SYCL_LATE_CHECK_EQUAL:\n            case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED:", "case GGML_SYCL_LATE_CHECK_EQUAL:"),
         ("a default arm", "case GGML_SYCL_LATE_CHECK_REFUSED:", "default:\n                break;\n            case GGML_SYCL_LATE_CHECK_REFUSED:"),
         ("the host tier compared", "if (d.host) {\n            continue;\n        }", ""),
@@ -401,7 +421,7 @@ def test_the_loader_calls_the_late_check_once_before_the_mappings():
 def test_site_mutants():
     code = code_of(MODEL_CPP)
     assert not site_ok(code.replace(z("throw std::runtime_error(late.refusal);"), "", 1))
-    assert not site_ok(code.replace(z("for (const int32_t device : late.not_recorded) {"), z("for (const int32_t device : late.shrunk) {"), 1))
+    assert not site_ok(code.replace(z("for (size_t i = 0; i < late.not_recorded.size(); ++i) {"), z("for (size_t i = 0; i < late.shrunk.size(); ++i) {"), 1))
     assert not site_ok(code.replace(z("if (!late.unsupported.empty()) {"), z("if (false) {"), 1))
     assert not site_ok(code + z("llama_load_late_check(*this, 0, sycl_model_loading_guard.txn, {});"))
     moved = code.replace(z("ml.init_mappings(true,"), z("llama_load_late_check(") + z("ml.init_mappings(true,"), 1)
@@ -417,21 +437,29 @@ def test_the_unsupported_warn_is_pinned_in_its_block():
     assert "LLAMA_LOG_WARN(" in blk
     quiet = blk.replace("LLAMA_LOG_WARN(", "(void)sizeof(", 1)
     assert not site_ok(code.replace(blk, quiet, 1))
-    # the not-recorded WARN with a hand-written text, losing the ubatch
-    nr = block_after(code, "for (const int32_t device : late.not_recorded)")
-    assert not site_ok(code.replace(nr, nr.replace(z("llama_late_check_not_recorded_text(device, late.n_ubatch)"), '"x"', 1), 1))
+    # the not-recorded WARN with a hand-written text, losing the ubatch and the measured term
+    nr = block_after(code, "for (size_t i = 0; i < late.not_recorded.size(); ++i)")
+    call = z("llama_late_check_not_recorded_text(late.not_recorded[i], late.n_ubatch, late.not_recorded_bytes[i])")
+    assert not site_ok(code.replace(nr, nr.replace(call, '"x"', 1), 1))
+    # the measured term of another device
+    wrong = z("llama_late_check_not_recorded_text(late.not_recorded[i], late.n_ubatch, late.not_recorded_bytes[0])")
+    assert not site_ok(code.replace(nr, nr.replace(call, wrong, 1), 1))
 
 
 def test_the_not_recorded_text_carries_the_ubatch():
     assert not_recorded_text_ok(code_of(MEASURE_H))
     code = code_of(MEASURE_H)
-    b = function_body(code, "inline std::string llama_late_check_not_recorded_text(int32_t device, uint32_t n_ubatch)")
+    b = function_body(code, _NOT_RECORDED_TEXT)
     assert not not_recorded_text_ok(code.replace(b, mutate(b, "std::to_string(n_ubatch)", '"0"'), 1))
+    # the measured term left out of the text, or printed unscaled
+    assert not not_recorded_text_ok(code.replace(b, mutate(b, '" + mib + "', ''), 1))
+    assert not not_recorded_text_ok(code.replace(b, mutate(b, "measured_bytes / 1024.0 / 1024.0", "measured_bytes"), 1))
 
 
 def test_the_result_carries_only_what_production_reads():
     assert result_fields_ok(MEASURE_H)
     assert not result_fields_ok(MEASURE_H.replace("std::vector<int32_t> not_recorded;", "std::vector<int32_t> not_recorded;\n    bool checked = false;", 1))
+    assert not result_fields_ok(MEASURE_H.replace("std::vector<size_t>  not_recorded_bytes;", "", 1))
 
 
 def test_the_fold_sets_the_ubatch_and_the_caller_passes_it():

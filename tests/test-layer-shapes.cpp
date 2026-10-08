@@ -202,6 +202,11 @@ static const ggml_tensor * rs_s(const llama_memory_recurrent * rs, int il) {
     return (size_t) il < rs->s_l.size() ? rs->s_l[il] : nullptr;
 }
 
+// a PLE layer's conv history, the third state tensor; null on every other layer
+static const ggml_tensor * rs_p(const llama_memory_recurrent * rs, int il) {
+    return (size_t) il < rs->p_l.size() ? rs->p_l[il] : nullptr;
+}
+
 // The model layers a memory holds K/V for, from the memory itself: each layer's K tensor and
 // which cache owns it.
 struct realised_layer {
@@ -371,8 +376,9 @@ static void check_shapes(const char * arch_name, const config & cfg, llama_conte
             n_idx++;
             CHECK((int64_t) sh.n_embd_k_gqa == k->ne[0], "%s/%s: layer %d indexer n_embd_k_gqa %u vs tensor %lld",
                   arch_name, cfg.name, il, sh.n_embd_k_gqa, (long long) k->ne[0]);
-            CHECK(k->ne[1] == (int64_t) cells && k->ne[2] == (int64_t) kv.n_stream, "%s/%s: layer %d indexer K extent",
-                  arch_name, cfg.name, il);
+            CHECK(k->ne[1] == (int64_t) cells && k->ne[2] == (int64_t) kv.n_stream && k->type == kv.type_k,
+                  "%s/%s: layer %d indexer K extent or type (%d, want %d)", arch_name, cfg.name, il, (int) k->type,
+                  (int) kv.type_k);
             CHECK(ggml_nbytes(k) == ggml_row_size(kv.type_k, sh.n_embd_k_gqa) * cells * kv.n_stream,
                   "%s/%s: layer %d indexer K bytes", arch_name, cfg.name, il);
             CHECK(v == nullptr && sh.n_embd_v_gqa == 0, "%s/%s: layer %d: the indexer holds a V (n_embd_v_gqa=%u)",
@@ -391,13 +397,18 @@ static void check_shapes(const char * arch_name, const config & cfg, llama_conte
     // recurrent state: exactly the offloaded layers the memory created r/s for
     if (mv.rs == nullptr) {
         CHECK(rs.layers.empty(), "%s/%s: no recurrent memory but %zu RS layers", arch_name, cfg.name, rs.layers.size());
-    } else if (model.hparams.ple_conv_state() > 0) {
-        // a PLE layer's conv history is a third state tensor (p_l) the RS shape has no place for: the publisher
-        // refuses the model by that name and publishes nothing
+    } else if (std::any_of(mv.rs->p_l.begin(), mv.rs->p_l.end(), [](const ggml_tensor * p) { return p != nullptr; })) {
+        // the memory created a PLE conv history, a third state tensor (p_l) the RS shape has no place for: the
+        // publisher refuses the model by that name and publishes nothing. Keyed on the realised memory, so the
+        // publisher's own predicate is checked against it rather than shared with it.
+        CHECK(model.hparams.ple_conv_state() > 0, "%s/%s: the memory holds a PLE row but ple_conv_state() is 0",
+              arch_name, cfg.name);
         CHECK(rs.unsupported == "llama_memory_recurrent (PLE conv-state row)" && rs.layers.empty(),
               "%s/%s: a PLE model's RS shapes must be the named refusal, got '%s' and %zu layers", arch_name, cfg.name,
               rs.unsupported.c_str(), rs.layers.size());
     } else {
+        CHECK(model.hparams.ple_conv_state() == 0, "%s/%s: ple_conv_state() is %u but the memory holds no PLE row",
+              arch_name, cfg.name, model.hparams.ple_conv_state());
         CHECK(rs.unsupported.empty(), "%s/%s: RS reported unsupported: %s", arch_name, cfg.name,
               rs.unsupported.c_str());
         size_t n_made = 0;
@@ -529,6 +540,15 @@ static void check_no_alloc(const char * arch_name, const config & cfg, llama_con
                           ggml_backend_buffer_get_size(ds->buffer) == 0,
                       "%s/%s: layer %d RS differs or is allocated", arch_name, cfg.name, il);
             }
+            const ggml_tensor * rp = rs_p(mv.rs, il);
+            const ggml_tensor * dp = rs_p(dv.rs, il);
+            CHECK((rp == nullptr) == (dp == nullptr), "%s/%s: layer %d PLE row presence %d (real) vs %d (no_alloc)",
+                  arch_name, cfg.name, il, (int) (rp != nullptr), (int) (dp != nullptr));
+            if (rp && dp) {
+                CHECK(rp->ne[0] == dp->ne[0] && rp->ne[1] == dp->ne[1] && rp->type == dp->type &&
+                          dp->buffer != nullptr && ggml_backend_buffer_get_size(dp->buffer) == 0,
+                      "%s/%s: layer %d PLE row differs or is allocated", arch_name, cfg.name, il);
+            }
         }
     }
     CHECK((mv.rs == nullptr) == (dv.rs == nullptr), "%s/%s: recurrent half present in one memory only", arch_name,
@@ -540,29 +560,30 @@ static void check_no_alloc(const char * arch_name, const config & cfg, llama_con
         CHECK(mv.idx->get_size() == dv.idx->get_size(), "%s/%s: indexer cells %u (real) vs %u (no_alloc)", arch_name,
               cfg.name, mv.idx->get_size(), dv.idx->get_size());
         for (int il = 0; il < n_layer; ++il) {
-            const ggml_tensor * rk     = nullptr;
-            const ggml_tensor * rv     = nullptr;
-            const ggml_tensor * dk     = nullptr;
-            const ggml_tensor * dv_    = nullptr;
-            const bool          r_owns = mv.idx->get_layer_tensors(il, &rk, &rv);
-            const bool          d_owns = dv.idx->get_layer_tensors(il, &dk, &dv_);
-            CHECK(r_owns == d_owns, "%s/%s: layer %d indexer owned %d (real) vs %d (no_alloc)", arch_name, cfg.name, il,
-                  (int) r_owns, (int) d_owns);
-            if (!r_owns || !d_owns) {
+            const ggml_tensor * real_k    = nullptr;
+            const ggml_tensor * real_v    = nullptr;
+            const ggml_tensor * dumb_k    = nullptr;
+            const ggml_tensor * dumb_v    = nullptr;
+            const bool          real_owns = mv.idx->get_layer_tensors(il, &real_k, &real_v);
+            const bool          dumb_owns = dv.idx->get_layer_tensors(il, &dumb_k, &dumb_v);
+            CHECK(real_owns == dumb_owns, "%s/%s: layer %d indexer owned %d (real) vs %d (no_alloc)", arch_name,
+                  cfg.name, il, (int) real_owns, (int) dumb_owns);
+            if (!real_owns || !dumb_owns) {
                 continue;
             }
             CHECK(
-                rk->ne[0] == dk->ne[0] && rk->ne[1] == dk->ne[1] && rk->ne[2] == dk->ne[2] && rk->type == dk->type &&
-                    strcmp(rk->name, dk->name) == 0,
+                real_k->ne[0] == dumb_k->ne[0] && real_k->ne[1] == dumb_k->ne[1] && real_k->ne[2] == dumb_k->ne[2] &&
+                    real_k->type == dumb_k->type && strcmp(real_k->name, dumb_k->name) == 0,
                 "%s/%s: layer %d indexer K differs: real %s %lld/%lld/%lld type %d, no_alloc %s %lld/%lld/%lld type %d",
-                arch_name, cfg.name, il, rk->name, (long long) rk->ne[0], (long long) rk->ne[1], (long long) rk->ne[2],
-                (int) rk->type, dk->name, (long long) dk->ne[0], (long long) dk->ne[1], (long long) dk->ne[2],
-                (int) dk->type);
-            CHECK(rk->buffer != nullptr && ggml_backend_buffer_get_size(rk->buffer) > 0,
+                arch_name, cfg.name, il, real_k->name, (long long) real_k->ne[0], (long long) real_k->ne[1],
+                (long long) real_k->ne[2], (int) real_k->type, dumb_k->name, (long long) dumb_k->ne[0],
+                (long long) dumb_k->ne[1], (long long) dumb_k->ne[2], (int) dumb_k->type);
+            CHECK(real_k->buffer != nullptr && ggml_backend_buffer_get_size(real_k->buffer) > 0,
                   "%s/%s: layer %d: the real memory has no allocated indexer K", arch_name, cfg.name, il);
-            CHECK(dk->buffer != nullptr && ggml_backend_buffer_get_size(dk->buffer) == 0,
+            CHECK(dumb_k->buffer != nullptr && ggml_backend_buffer_get_size(dumb_k->buffer) == 0,
                   "%s/%s: layer %d: no_alloc indexer K is not on a size-0 buffer", arch_name, cfg.name, il);
-            CHECK(rv == nullptr && dv_ == nullptr, "%s/%s: layer %d: an indexer V exists", arch_name, cfg.name, il);
+            CHECK(real_v == nullptr && dumb_v == nullptr, "%s/%s: layer %d: an indexer V exists", arch_name, cfg.name,
+                  il);
             n_no_alloc_idx_layers++;
         }
     }
@@ -691,6 +712,10 @@ int main() {
 
     // a run that built nothing checked nothing
     CHECK(n_built >= 21, "only %d (arch, config) cases built; the must-cover set alone is 21", n_built);
+    // 42 is the full count, not a margin: 20 archs x 3 configs = 60 cases; the 6 archs that reach a kind with no
+    // no_alloc form (deepseek32, glm_dsa, hy_v4: DSA; dots3note: DSA_ISWA; minimax_m3: MSA; deepseek4: DSV4) refuse
+    // in all 3 configs, 18 cases; 60 - 18 = 42. A SKIP of any non-refused fixture, must=false or not, trips this
+    // VOID by design.
     CHECK(n_no_alloc_cases >= 42 && n_no_alloc_refused > 0, "VOID: %d no_alloc builds and %d refusals",
           n_no_alloc_cases, n_no_alloc_refused);
     CHECK(n_kv_cases > 0 && n_rs_cases > 0, "VOID: %d KV and %d recurrent cases", n_kv_cases, n_rs_cases);

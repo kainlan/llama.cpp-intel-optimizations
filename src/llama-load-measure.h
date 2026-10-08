@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -247,14 +248,20 @@ struct llama_late_check_result {
     std::string          unsupported;   // non-empty: the model cannot be measured; the load goes on, with a WARN
     uint32_t             n_ubatch = 0;  // the measure's ubatch, for the text of a miss
     std::vector<int32_t> not_recorded;  // devices with no early term to compare: NOT a pass
+    // the measured compute term c(P) of each not_recorded device, in the same order: what the late measure found,
+    // printed so a load can be read against the real compute buffer even though nothing was compared
+    std::vector<size_t>  not_recorded_bytes;
 };
 
 // The WARN the loader prints for a device the backend recorded nothing for: nothing was compared, which is
-// not a pass.
-inline std::string llama_late_check_not_recorded_text(int32_t device, uint32_t n_ubatch) {
+// not a pass. `measured_bytes` is the late measure's c(P) term for that device, in MiB with one decimal.
+inline std::string llama_late_check_not_recorded_text(int32_t device, uint32_t n_ubatch, size_t measured_bytes) {
+    char mib[32];
+    std::snprintf(mib, sizeof(mib), "%.1f", measured_bytes / 1024.0 / 1024.0);
     return "[LOAD-PLAN] late check on device " + std::to_string(device) +
            ": no early compute term was recorded for this load, nothing was compared (ubatch " +
-           std::to_string(n_ubatch) + ")";
+           std::to_string(n_ubatch) + "; measured compute term " + mib + " MiB on device " + std::to_string(device) +
+           ")";
 }
 
 // Folds the measured devices through the backend's late check. A device the backend recorded nothing for
@@ -290,6 +297,7 @@ inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs &
                 return out;
             case GGML_SYCL_LATE_CHECK_NOT_RECORDED:
                 out.not_recorded.push_back(d.device);
+                out.not_recorded_bytes.push_back(d.total);
                 break;
         }
     }

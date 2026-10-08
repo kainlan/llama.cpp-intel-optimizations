@@ -259,6 +259,7 @@ static void test_late_check_fold() {
         CHECK(r.n_ubatch == 512, "the fold dropped the ubatch: %u", r.n_ubatch);
         CHECK(r.refusal.empty(), "refused: %s", r.refusal.c_str());
         CHECK(r.not_recorded == std::vector<int32_t>({ 2 }), "not_recorded has %zu entries", r.not_recorded.size());
+        CHECK(r.not_recorded_bytes == std::vector<size_t>({ 30 }), "the measured term beside device 2 is not its own");
         CHECK(g_late_seen == std::vector<int32_t>({ 0, 1, 2, 3 }), "the host tier reached the backend");
     }
 
@@ -283,6 +284,7 @@ static void test_late_check_fold() {
         const llama_late_check_result r = llama_late_check_fold(none, ggml_sycl_load_txn{ 9 }, devs, 512);
         CHECK(r.refusal.empty() && r.not_recorded == std::vector<int32_t>({ 0, 1 }),
               "a missing proc was read as a pass");
+        CHECK(r.not_recorded_bytes == std::vector<size_t>({ 1, 2 }), "the measured terms are not in device order");
     }
 
     // a value outside the enum is NOT_RECORDED too
@@ -321,12 +323,18 @@ static void test_measure_params_tie_to_the_ladder() {
 }
 
 static void test_not_recorded_text() {
-    const std::string t = llama_late_check_not_recorded_text(2, 512);
+    // 2133928064 B is 2035.07 MiB
+    const std::string t = llama_late_check_not_recorded_text(2, 512, 2133928064);
     CHECK(t.find("device 2") != std::string::npos, "the text does not name the device: %s", t.c_str());
     CHECK(t.find("ubatch 512") != std::string::npos, "the text does not carry the ubatch: %s", t.c_str());
     CHECK(t.find("nothing was compared") != std::string::npos, "the text does not say nothing was compared: %s",
           t.c_str());
-    CHECK(llama_late_check_not_recorded_text(2, 1024).find("ubatch 1024") != std::string::npos, "the ubatch is fixed");
+    CHECK(t.find("measured compute term 2035.1 MiB on device 2)") != std::string::npos,
+          "the text does not carry the measured term in MiB: %s", t.c_str());
+    CHECK(llama_late_check_not_recorded_text(2, 1024, 0).find("ubatch 1024") != std::string::npos,
+          "the ubatch is fixed");
+    CHECK(llama_late_check_not_recorded_text(2, 512, 1024 * 1024).find("term 1.0 MiB") != std::string::npos,
+          "the measured term is fixed");
 }
 
 // --- the quiet log scope -------------------------------------------------------------------------

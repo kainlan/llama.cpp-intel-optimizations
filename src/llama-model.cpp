@@ -2755,9 +2755,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_WARN("%s: late compute-slot check skipped, the load continues on the unplanned path: %s\n",
                            __func__, late.unsupported.c_str());
         }
-        for (const int32_t device : late.not_recorded) {
-            // nothing was compared for this device, which is not a pass
-            LLAMA_LOG_WARN("%s: %s\n", __func__, llama_late_check_not_recorded_text(device, late.n_ubatch).c_str());
+        for (size_t i = 0; i < late.not_recorded.size(); ++i) {
+            // nothing was compared for this device, which is not a pass; the text carries the measured term
+            const std::string text =
+                llama_late_check_not_recorded_text(late.not_recorded[i], late.n_ubatch, late.not_recorded_bytes[i]);
+            LLAMA_LOG_WARN("%s: %s\n", __func__, text.c_str());
         }
         if (!late.refusal.empty()) {
             throw std::runtime_error(late.refusal);
