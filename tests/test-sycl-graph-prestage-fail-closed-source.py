@@ -347,7 +347,7 @@ def evaluate(backend, common, memo_hdr):
                 if re.search(r"if\s*\([^;{]*!\s*$", backend[max(0, at - 160):at]) is not None]
     results["every pre-stage consumer tests the result (void-style calls ignore a failure)"] = \
         len(consumers) > 0 and len(consumers) == len(consumed)
-    results["no unnamed pre-stage consumer: the six recording sites below are all there are"] = len(consumers) == 6
+    results["no unnamed pre-stage consumer: the seven recording sites below are all there are"] = len(consumers) == 7
 
     # Each recording site, named, with the exact shape of its decline: the condition is the bare negated call (a
     # `&& false` or `|| true` tail would make the decline dead or the pre-stage unconditional), and the body leaves
@@ -381,6 +381,23 @@ def evaluate(backend, common, memo_hdr):
                           compute[compute.rfind("if", 0, rr_call):]) if rr_call >= 0 else None
     results["site 5, full re-record: declines, clears the live graph (after a wait) and leaves for the direct path"] = \
         rr_decline is not None
+    # llama.cpp-7pm2: a keyed decode split's slot. Warmup and direct keys record nothing and run before the
+    # decline; a replay or a record runs only past it, and each re-reads the slot, since a staging swap at the
+    # gateway retires every slot after begin() chose the action. A replay whose inputs now stage to other buffers
+    # than the slot's graphs read forgets the slot and runs direct.
+    keyed = re.search(
+        r"\}\s*else if\s*\(slot_action == gsc::action::DIRECT\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*" + site +
+        r"compute_impl_unlocked\(\);\s*\}\s*else if\s*\(slot_action == gsc::action::REPLAY\)\s*\{\s*"
+        r"const auto \* slot = sycl_ctx->moe_segment_slots\.payload\(slot_key\);\s*if\s*\(!slot\)\s*\{\s*"
+        r"compute_impl_unlocked\(\);\s*\}\s*"
+        r"else if\s*\(!moe_segment_slot_staging_matches\(sycl_ctx, cgraph, \*slot\)\)\s*\{[^{}]*?"
+        r"sycl_ctx->moe_segment_slots\.forget\(slot_key\);\s*compute_impl_unlocked\(\);\s*\}\s*"
+        r"else\s*\{\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);\s*"
+        r"moe_graph_replay_segment_slot\(sycl_ctx, cgraph, \*slot\);\s*graph_executed = true;\s*\}\s*\}\s*"
+        r"else if\s*\(!sycl_ctx->moe_segment_slots\.state\(slot_key\)\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*\{",
+        compute)
+    results["site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists"] = \
+        keyed is not None and compute.find("moe_graph_record_segment_slot(", keyed.end()) > keyed.end()
     first_at = compute.find("Pre-staging leaf tensors before recording")
     results["site 6, full first record: declines and leaves for the direct path"] = \
         first_at >= 0 and re.match(r"[^;]*;\s*" + site + exit_direct, compute[first_at:]) is not None
@@ -405,8 +422,13 @@ def evaluate(backend, common, memo_hdr):
     begin = [m.start() for m in re.finditer(r"model_sycl_graph\.begin_recording\(", compute)]
     s3 = re.search(r"moe_graph_replay_segments\(", compute)
     s4 = re.search(r"moe_graph_record_segments\(", compute)
+    s7 = re.search(r"slot_action == gsc::action::DIRECT", compute)
+    s7_call = compute.find("graph_prestage_or_decline(", s7.end()) if s7 else -1
+    s7_replay = compute.find("moe_graph_replay_segment_slot(")
+    s7_record = compute.find("moe_graph_record_segment_slot(")
     first_call = compute.find("graph_prestage_or_decline(", first_at) if first_at >= 0 else -1
-    chain = [("segment replay", s3.start() if s3 else -1), ("segment record", s4.start() if s4 else -1),
+    chain = [("keyed decline", s7_call), ("keyed replay", s7_replay), ("keyed record", s7_record),
+             ("segment replay", s3.start() if s3 else -1), ("segment record", s4.start() if s4 else -1),
              ("re-record anchor", rerecord_at), ("re-record decline", rr_call),
              ("re-record begin_recording", begin[0] if len(begin) == 2 else -1),
              ("first-record anchor", first_at), ("first-record decline", first_call),
@@ -613,6 +635,8 @@ if args.self_test:
     ref_sig = r"static void graph_refresh_input_tensors\([^)]*\)\s*\{"
     dec_sig = r"static bool graph_prestage_or_decline\([^)]*\)\s*\{"
     cmp_sig = r"static ggml_status ggml_backend_sycl_graph_compute_unchecked\([^)]*\)\s*\{"
+    # Sites 3 and 4 sit in the legacy (prompt-phase) segmented branch, after the keyed slot's own decline (site 7).
+    legacy_seg_sig = r"\}\s*else if \(segments_match\)\s*\{"
     # the first full-graph recording site (the debug line just above it is the anchor)
     full_sig = r"Pre-staging leaf tensors before recording[^;]*;"
     stage_sig = r"void \* graph_input_stage\(const ggml_tensor \* owner,[^)]*\)\s*\{"
@@ -828,10 +852,10 @@ if args.self_test:
                          "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) { (void) 0;"
                          " } if (false) {"), common, mem_)),
         ("segment replay decline is dead", "site 3, MoE segment replay: declines, invalidates the segments, runs direct, else replays",
-         (mutate_in_func(backend, cmp_sig, "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {",
+         (mutate_in_func(backend, legacy_seg_sig, "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {",
                          "if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash) && false) {"), common, mem_)),
         ("segment record decline loses its direct run", "site 4, MoE segment record: declines and runs direct, else records",
-         (mutate_re(backend, cmp_sig, r"\}\s*else if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{\s*compute_impl_unlocked\(\);",
+         (mutate_re(backend, legacy_seg_sig, r"\}\s*else if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{\s*compute_impl_unlocked\(\);",
                     "} else if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) { (void) 0;"), common, mem_)),
         ("re-record decline is unconditional-tail", "site 5, full re-record: declines, clears the live graph (after a wait) and leaves for the direct path",
          (mutate_re(backend, r"re-record \+ update \(%s\)", r"if \(!graph_prestage_or_decline\(sycl_ctx, cgraph, graph_hash\)\) \{",
@@ -974,7 +998,14 @@ if args.self_test:
          (mutate_in_func(backend, cmp_sig, "else if (!sycl_ctx->moe_segments_valid) {", "else if (false) {"), common, mem_)),
         ("the retired-segments branch is gone", "site 3: segments a staging swap retired run the token direct instead of replaying nothing",
          (mutate_re(backend, cmp_sig, r"\s*else if \(!sycl_ctx->moe_segments_valid\) \{\s*compute_impl_unlocked\(\);\s*\}", ""), common, mem_)),
-        ("a seventh recorder appears", "no unnamed pre-stage consumer: the six recording sites below are all there are",
+        ("the keyed slot replays a slot a staging swap retired", "site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists",
+         (mutate_in_func(backend, cmp_sig, "if (!slot) {", "if (false) {"), common, mem_)),
+        ("the keyed slot records a slot a staging swap retired", "site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists",
+         (mutate_in_func(backend, cmp_sig, "} else if (!sycl_ctx->moe_segment_slots.state(slot_key)) {", "} else if (false) {"), common, mem_)),
+        ("the keyed slot records past a decline", "site 7, keyed segment slot: declines and runs direct, else replays or records a slot that still exists",
+         (mutate_in_func(backend, r"slot_action == gsc::action::DIRECT\)", "} else if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {",
+                         "} else if (false) {"), common, mem_)),
+        ("an eighth recorder appears", "no unnamed pre-stage consumer: the seven recording sites below are all there are",
          (backend + "\nstatic bool new_recorder(ggml_backend_sycl_context * c, const ggml_cgraph * g) "
                     "{ if (!graph_prestage_or_decline(c, g, 1)) { return false; } return true; }\n", common, mem_)),
     ]

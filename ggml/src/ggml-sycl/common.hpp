@@ -19,6 +19,7 @@
 #include "ggml-sycl.h"
 #include "graph-prestage-decline-memo.hpp"
 #include "graph-safe-memcpy-width.hpp"
+#include "graph-segment-cache.hpp"
 #include "kv-offload.hpp"
 #include "layer-streaming.hpp"
 #include "mem-handle.hpp"
@@ -61,6 +62,10 @@
 
 struct ggml_backend_sycl_context;
 bool ggml_sycl_retire_moe_graph_epoch(ggml_backend_sycl_context * ctx) noexcept;
+// Drains the queue, then destroys every per-split segment slot (llama.cpp-7pm2); the drain also covers the
+// one-slot segment and MoE dispatch graphs invalidate_moe_segments destroys next. False when the drain failed:
+// the slots are kept, since their graphs may still be running, and the caller keeps its graphs too.
+bool ggml_sycl_retire_moe_segment_slots(ggml_backend_sycl_context * ctx) noexcept;
 
 namespace ggml_sycl {
 class L2PrefetchManager;  // Forward declaration for l2-prefetch.hpp
@@ -6321,6 +6326,22 @@ struct ggml_backend_sycl_context {
         std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph;
     };
 
+    // One decode split's recorded segments (llama.cpp-7pm2), owned by moe_segment_slots under that split's key.
+    // retained_handles is declared first so it is destroyed last: every allocation a segment graph baked a pointer
+    // to (sink retentions, pool scratch freed while recording, Q8 scratch, weight handles) outlives the graphs, and
+    // the graphs are destroyed only after a queue drain (ggml_sycl_retire_moe_segment_slots).
+    struct moe_segment_slot {
+        std::vector<ggml_sycl::mem_handle> retained_handles;
+        // Per input_refs entry: the staging copy the recording read (graph_input_staging), or an invalid handle when
+        // the input is read in place. Holding it keeps the buffer alive past a staging clear; a replay checks that
+        // each input still stages to the same allocation, since staging is keyed by tensor struct, not by this key.
+        std::vector<ggml_sycl::mem_handle> input_staging;
+        std::vector<moe_graph_segment>     segments;
+        std::vector<int>                   boundary_nodes;  // dispatched directly between segments
+        std::vector<int32_t>               input_refs;      // graph inputs: leaf i as i, node n src j as -(n*S+j)-1
+        int                                graphed_segments = 0;
+    };
+
     struct moe_graph_moe_dispatch {
         int      node_idx;      // Fused MoE dispatch boundary in cgraph->nodes[]
         uint64_t graph_hash;    // Structural cgraph signature at record time
@@ -6377,6 +6398,10 @@ struct ggml_backend_sycl_context {
     bool                                moe_segments_failed_is_decode     = false;
     bool                                moe_segments_failed_valid         = false;
     bool                                moe_segments_failed_logged        = false;
+    // Decode splits' segments, one slot per split key (llama.cpp-7pm2). Replaces moe_segments for decode.
+    ggml_sycl::graph_segment_cache::slot_cache<moe_segment_slot> moe_segment_slots;
+    // The decode MUL_MAT_ID splits of a replay-futile context that have had their one try at segmented MoE mode.
+    ggml_sycl::graph_segment_cache::probe_memo                   moe_segment_keyed_probes;
 
     // Direct decode graphlets cache only the fused MoE descriptor dispatches.
     // They are independent from segmented non-MoE graph replay and are safe to
@@ -6414,8 +6439,19 @@ struct ggml_backend_sycl_context {
 
     // Each retire below reports whether it retired the epoch. A failure leaves the recorded graphs valid, so the
     // caller (the staging-swap gateway) must not trust them and declines; the failure also sets the disabled flag.
+    //
+    // Cost: this retires the keyed decode slots along with the one-slot segment graphs, and when either holds a
+    // recorded graph it waits for the queue before destroying them (no exec graph is destroyed while a replay may
+    // still run it). The prompt path calls it before every one-slot record and on its decline paths, so a prompt
+    // that records segments costs one queue wait if graphs exist, and the next decode token re-warms and re-records
+    // each keyed split. Sparing the keyed slots at the prompt-path calls would save the re-record only where no
+    // phase-change clear_active retires them anyway; that needs a measurement before it is worth the extra state.
     bool invalidate_moe_segments() {
         if (!ggml_sycl_retire_moe_graph_epoch(this)) {
+            moe_graphs_disabled = true;
+            return false;
+        }
+        if (!ggml_sycl_retire_moe_segment_slots(this)) {
             moe_graphs_disabled = true;
             return false;
         }
