@@ -767,8 +767,9 @@ if (Python3_Interpreter_FOUND)
     # experts). Run WITH --self-test so each anchor is proven load-bearing.
     add_test(NAME test-sycl-moe-cpu-activation-row-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-activation-row-source.py --self-test)
+    # TIMEOUT: the 61-mutant self-test measured 32 s wall at host load 7.5.
     set_tests_properties(test-sycl-moe-cpu-activation-row-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
     # A hybrid MoE CPU-expert dispatch must never drop host-expert rows when its
     # staging allocation fails, and the registry must not fail an allocation on a
     # stale RELEASING row at a recycled address (llama.cpp-93tw). WITH --self-test.
