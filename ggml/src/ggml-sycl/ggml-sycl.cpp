@@ -109104,24 +109104,11 @@ normal_dispatch:
         if (refresh_moe_after_pp) {
             moe_prestage_popular_experts();
         }
-        // The residency check is answered once per expert-residency state of this split's tensors; the stamps it
-        // leaves (moe-graph-preload-stamp.hpp) say whether it must run again. A skipped check collects no leases
-        // and releases none, so leases an executable graph retained stay in place. It builds the pointer tables and
-        // leases a recorded graph replays, so it runs only when this call may record or replay: direct dispatch
-        // builds its own full-local tables on first use (ggml_sycl_moe_decode_direct_table, the fused gate/up pair
-        // route), and an eager upload here would rewrite the shared table they memoize.
-        if (use_sycl_graph && post_prompt_refresh_due &&
-            ggml_sycl_moe_graph_preload_decide(cgraph, sycl_ctx->device, moe_host_tier_boundary) ==
-                ggml_sycl::moe_graph_preload_split_decision::RUN) {
-            if (!graph_preload_moe_experts(*sycl_ctx, cgraph, moe_host_tier_boundary)) {
-                GGML_LOG_INFO("[SYCL-GRAPH] PP→TG MoE planned-residency refresh failed; this split runs direct\n");
-                sycl_ctx->moe_graph_preload_refused = true;
-                use_sycl_graph                      = false;
-                graph_unpin_moe_experts(sycl_ctx);
-            } else {
-                GGML_LOG_INFO("[SYCL-GRAPH] PP→TG refreshed MoE planned residency before direct TG\n");
-            }
-        }
+        // No pointer-table preload here. Its tables and leases serve a recorded graph, and the graph path prepares
+        // them right before every record or replay. Direct dispatch and the descriptor graphlets build their own
+        // full-local tables on first use (ggml_sycl_moe_decode_direct_table, the fused gate/up pair route,
+        // moe_fusion_ensure_full_local_ptr_table_from_descriptor); an eager upload here rewrote the shared table
+        // they memoize and stalled the first decode token once per MoE split.
         if (hostmem_logged) {
             ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase::PP_TO_TG_AFTER, "pp-to-tg-after-refresh");
         }

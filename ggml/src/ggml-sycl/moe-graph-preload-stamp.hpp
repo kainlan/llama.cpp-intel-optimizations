@@ -30,9 +30,9 @@
 //   - REFUSED can be stale against a layout the hotset would have chosen. It
 //     fails closed: the split runs direct, which is always correct, until a
 //     residency change re-opens it.
-//   - PREPARED only lets the PP->TG refresh skip its residency check. The
-//     graph path re-runs the preload on every call with the layout of that
-//     call, so a recorded graph never relies on a stamped table.
+//   - PREPARED gates nothing. The graph path re-runs the preload on every
+//     call with the layout of that call, so a recorded graph never relies on
+//     a stamped table.
 //
 // SYCL-free on purpose so tests/test-sycl-moe-graph-preload-stamp.cpp can run
 // it without a device.
@@ -135,7 +135,7 @@ inline bool moe_graph_preload_stamp_failure(moe_graph_preload_stamp &        s,
 enum class moe_graph_preload_split_decision {
     NO_MOE,    // no MUL_MAT_ID: nothing to prepare
     REFUSED,   // a tensor's current stamp is a refusal: graphs stay off for this split, nothing to run
-    KNOWN_OK,  // every tensor has a current success stamp: the residency check need not run again
+    KNOWN_OK,  // every tensor has a current success stamp
     RUN,       // some tensor has no current stamp: run the preload
 };
 

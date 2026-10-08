@@ -440,12 +440,13 @@ with gate('graph-preload'):
     # Graph-preload failure propagates into graph suppression, rather than logging
     # and continuing through a stale graph path. The suppression is per split and
     # per expert-residency state (moe-graph-preload-stamp.hpp), not a sticky flag.
-    refresh = region(RUNTIME, "if (refresh_moe_after_pp || post_prompt_refresh_due)",
-                     "const int descriptor_moe_graph_candidates")
-    assert "if (!graph_preload_moe_experts(*sycl_ctx, cgraph, moe_host_tier_boundary))" in refresh
-    assert "sycl_ctx->moe_graph_preload_refused = true" in refresh
-    assert re.search(r"\buse_sycl_graph\s+= false;", refresh)
-    assert "graph_unpin_moe_experts(sycl_ctx)" in refresh
+    # The preload runs at one site, right before a record or replay.
+    assert RUNTIME_CODE.count("graph_preload_moe_experts(*sycl_ctx") == 1
+    site = RUNTIME[RUNTIME.index("if (!graph_preload_moe_experts(*sycl_ctx, cgraph, moe_host_tier_boundary)) {"):]
+    site = site[:site.index("return GGML_STATUS_SUCCESS;")]
+    assert "sycl_ctx->moe_graph_preload_refused = true" in site
+    assert "graph_unpin_moe_experts(sycl_ctx)" in site
+    assert "compute_impl_unlocked();" in site and "record_completion(false);" in site
     print("PASS graph-preload-bool-propagation-source-gate")
 
 with gate('graph-preload-refused'):
@@ -519,20 +520,19 @@ with gate('graph-preload-stamp-sites'):
                      compute)
     print("PASS graph-preload-stamp-sites-source-gate")
 
-with gate('graph-preload-refresh-needs-graph'):
-    # The post-prompt residency check builds the pointer tables and leases a recorded graph replays. A call that
-    # cannot record or replay reads none of them (direct dispatch builds its own tables on first use), so the check
-    # must not run there: with GGML_SYCL_DISABLE_GRAPH=1 it was a once-per-split stall on the first decode token.
+with gate('graph-preload-not-in-refresh'):
+    # The post-prompt refresh does not run the pointer-table preload. Its tables and leases serve a recorded graph,
+    # and the graph path prepares them right before every record or replay; direct dispatch and the descriptor
+    # graphlets build their own full-local tables. Run eagerly on the first decode token it cost one host-blocking
+    # table rebuild per MoE split per prompt, with or without graphs.
     compute = region(RUNTIME, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
                      "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
     refresh = region(compute, "if (refresh_moe_after_pp || post_prompt_refresh_due)",
                      "const int descriptor_moe_graph_candidates")
-    guard = re.search(r"if \(([^{]*)\)\s*\{\s*if \(!graph_preload_moe_experts\(", refresh)
-    assert guard and re.match(r"use_sycl_graph\s*&&", guard.group(1).strip()), guard and guard.group(1)
-    assert refresh.count("graph_preload_moe_experts(") == 1
-    decided = re.search(r"use_sycl_graph\s*=\s*!g_ggml_sycl_disable_graph", compute)
-    assert decided and decided.start() < compute.index("if (refresh_moe_after_pp || post_prompt_refresh_due)")
-    print("PASS graph-preload-refresh-needs-graph-source-gate")
+    assert "graph_preload_moe_experts(" not in refresh
+    assert "ggml_sycl_moe_graph_preload_decide(" not in refresh
+    assert "ggml_sycl_materialize_moe_down_i8_hotset(" in refresh and "moe_prestage_popular_experts();" in refresh
+    print("PASS graph-preload-not-in-refresh-source-gate")
 
 with gate('decode-env-reads-once'):
     # Both predicates are asked on every decode call; their environment terms are read once.
