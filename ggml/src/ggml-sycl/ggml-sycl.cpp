@@ -91894,7 +91894,16 @@ static bool ggml_sycl_graph_is_decode(const ggml_cgraph * cgraph, bool previous_
 }
 
 #ifdef GGML_SYCL_GRAPH
-static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph);
+// What command-graph capture a graph admits (llama.cpp-7pm2 B3). SEGMENTED_ONLY: the only obstacle is a MUL_MAT_ID
+// that cannot be recorded (its quant type, batch or layout). Segmented replay dispatches every MUL_MAT_ID directly
+// between its segments, so that veto applies to the whole-graph capture only.
+enum ggml_sycl_graph_compat {
+    GGML_SYCL_GRAPH_COMPAT_NONE,
+    GGML_SYCL_GRAPH_COMPAT_SEGMENTED_ONLY,
+    GGML_SYCL_GRAPH_COMPAT_WHOLE_GRAPH,
+};
+
+static ggml_sycl_graph_compat check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph);
 static bool graph_prestage_or_decline(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, uint64_t graph_hash);
 static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph);
 static bool graph_refresh_input_tensor(ggml_backend_sycl_context * ctx, ggml_tensor * tensor, sycl::queue & q);
@@ -92353,7 +92362,7 @@ class ggml_sycl_block_exec_dense_run {
         for (const recorded_range & g : st.graphs) {
             any_missing = any_missing || !g.exec;
         }
-        if (any_missing && !check_graph_compatibility(ctx_, cgraph_)) {
+        if (any_missing && check_graph_compatibility(ctx_, cgraph_) != GGML_SYCL_GRAPH_COMPAT_WHOLE_GRAPH) {
             graphs_off_ = ggml_sycl::DENSE_GRAPH_OFF_INCOMPATIBLE;
             return;
         }
@@ -99167,6 +99176,525 @@ static void moe_graph_segmented_call_end() {
     }
 }
 
+// ---- Keyed per-split segment slots (llama.cpp-7pm2 B2) ----------------------------------------------------------
+//
+// A decode token reaches graph_compute once per scheduler split. Each split now records and replays its own
+// segments, kept in ctx->moe_segment_slots under a key built from the split's structure, its tensor names and the
+// storage it touches. The single moe_segments slot keyed on (n_nodes, is_decode) let two same-sized splits from
+// different layers replay each other's graphs, and thrashed across the splits of one token.
+
+static bool graph_tensor_is_input(const ggml_tensor * tensor);
+
+// GGML_SYCL_GRAPH_RERECORD or GGML_SYCL_NO_SEG_GRAPH turns segmented replay off.
+static bool ggml_sycl_segmented_graph_env_allows() {
+    static const bool allows =
+        std::getenv("GGML_SYCL_GRAPH_RERECORD") == nullptr && std::getenv("GGML_SYCL_NO_SEG_GRAPH") == nullptr;
+    return allows;
+}
+
+// A decode split of a context in segmented MoE mode runs from its keyed slot. The whole-graph futility machinery
+// (the '#' split-copy trip and the consecutive re-record counter) belongs to the one-slot exec graph and does not
+// apply: a split-copy tensor is a graph input whose storage is part of the key.
+static bool moe_segment_keyed_mode(const ggml_backend_sycl_context * ctx, bool is_decode) {
+    return is_decode && ctx->moe_graph_rerecord && ggml_sycl_segmented_graph_env_allows() &&
+           !ctx->moe_segment_slots.churned();
+}
+
+// A replay-futile context still serves keyed slots, since its futility verdict is about the whole-graph slot. Until the
+// context is in segmented MoE mode, a decode split with a MUL_MAT_ID is what can put it there.
+static bool moe_segment_keyed_reachable(const ggml_backend_sycl_context * ctx,
+                                        const ggml_cgraph *               cgraph,
+                                        bool                              is_decode) {
+    if (!is_decode || !ggml_sycl_segmented_graph_env_allows() || ctx->moe_segment_slots.churned()) {
+        return false;
+    }
+    return ctx->moe_graph_rerecord || ggml_sycl_graph_has_op(cgraph, GGML_OP_MUL_MAT_ID);
+}
+
+// Owner identity of the allocation behind a backend buffer, from its mem_handle. A buffer without a SYCL context
+// has no owner identity; its size and usage still tell buffers apart.
+static uint64_t moe_segment_buffer_identity(ggml_backend_buffer_t buffer) {
+    if (ggml_backend_buffer_has_sycl_context(buffer)) {
+        const auto * bctx = static_cast<const ggml_backend_sycl_buffer_context *>(buffer->context);
+        if (bctx && bctx->managed_handle.valid() && bctx->managed_handle.has_stable_owner_identity()) {
+            return static_cast<uint64_t>(bctx->managed_handle.stable_identity_hash()) ^
+                   (bctx->managed_handle.generation() * 0x9e3779b97f4a7c15ULL);
+        }
+        if (bctx && bctx->managed_meta.valid()) {
+            return bctx->managed_meta.id;
+        }
+    }
+    return 1 + 31 * static_cast<uint64_t>(ggml_backend_buffer_get_size(buffer)) +
+           static_cast<uint64_t>(ggml_backend_buffer_get_usage(buffer));
+}
+
+// The slot key: structural signature, then every leaf, node and src name, and for each the owner identity of its
+// buffer plus its offset from the buffer's base. The base is read only to take that difference.
+static ggml_sycl::graph_segment_cache::key moe_segment_slot_key(const ggml_backend_sycl_context * ctx,
+                                                                const ggml_cgraph *               cgraph,
+                                                                uint64_t                          signature,
+                                                                bool                              is_decode) {
+    ggml_sycl::graph_segment_cache::key_hasher names;
+    ggml_sycl::graph_segment_cache::key_hasher storage;
+
+    struct seen_buffer {
+        ggml_backend_buffer_t buffer;
+        uint64_t              identity;
+        const char *          base;
+    };
+
+    std::vector<seen_buffer> seen;  // this call only
+    auto                     mix_tensor = [&](const ggml_tensor * t) {
+        if (!t) {
+            names.mix_byte(0xfe);
+            storage.mix(0);
+            return;
+        }
+        names.mix_name(t->name, GGML_MAX_NAME);
+        if (!t->buffer || !t->data) {
+            storage.mix(0);
+            return;
+        }
+        const seen_buffer * sb = nullptr;
+        for (const seen_buffer & s : seen) {
+            if (s.buffer == t->buffer) {
+                sb = &s;
+                break;
+            }
+        }
+        if (!sb) {
+            seen.push_back({ t->buffer, moe_segment_buffer_identity(t->buffer),
+                             static_cast<const char *>(ggml_backend_buffer_get_base(t->buffer)) });
+            sb = &seen.back();
+        }
+        storage.mix(sb->identity);
+        storage.mix(sb->base ? static_cast<uint64_t>(static_cast<const char *>(t->data) - sb->base) : 0);
+    };
+    for (int i = 0; i < cgraph->n_leafs; ++i) {
+        mix_tensor(cgraph->leafs[i]);
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        mix_tensor(node);
+        for (int j = 0; node && j < GGML_MAX_SRC; ++j) {
+            mix_tensor(node->src[j]);
+        }
+    }
+    ggml_sycl::graph_segment_cache::key k;
+    k.signature = signature;
+    k.names     = names.value();
+    k.storage   = storage.value();
+    k.n_nodes   = cgraph->n_nodes;
+    k.device    = ctx->device;
+    k.is_decode = is_decode;
+    return k;
+}
+
+// Smallest segment worth a graph, counted in nodes that dispatch work. GGML_SYCL_SEG_MIN_NODES overrides it for
+// the profitability re-measure (llama.cpp-7pm2 B4).
+static int moe_graph_keyed_min_segment_nodes() {
+    static const int n = [] {
+        const char * env = std::getenv("GGML_SYCL_SEG_MIN_NODES");
+        return (env && std::atoi(env) > 0) ? std::atoi(env) : 4;
+    }();
+    return n;
+}
+
+// One step of a keyed split, in node order: a boundary node dispatched directly, or a run of nodes between two
+// boundaries that is recorded as a graph or, when too small, dispatched directly.
+struct moe_graph_keyed_item {
+    int  start;
+    int  end;
+    bool boundary;
+    bool graph;
+};
+
+// Boundaries are the nodes whose work cannot be baked into a replayed graph: every MUL_MAT_ID (the yx28 direct
+// route and the CPU-expert path run them, with routing that changes per token), every node of an expert section
+// (an `ffn_moe_*` node from the first MUL_MAT_ID until a node that is not one: the fused MoE executor may compute
+// them itself and mark them skipped, and that decision must be taken per call), FLASH_ATTN_EXT unless FA graph
+// capture is allowed, and the host-dispatched attention nodes of a demoted layer.
+static std::vector<moe_graph_keyed_item> moe_graph_keyed_plan(const ggml_cgraph * cgraph) {
+    std::vector<moe_graph_keyed_item> plan;
+    const bool                        fa_graph       = ggml_sycl_flash_attn_graph_allow_enabled();
+    const bool                        host_attn      = ggml_sycl_attn_host_dispatch_enabled();
+    const int                         min_nodes      = moe_graph_keyed_min_segment_nodes();
+    bool                              expert_section = false;
+    int                               run_start      = 0;
+    int                               run_work       = 0;
+    auto                              close_run      = [&](int end) {
+        if (end > run_start) {
+            plan.push_back({ run_start, end, false, run_work >= min_nodes });
+        }
+    };
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node     = cgraph->nodes[i];
+        bool                boundary = false;
+        if (node) {
+            const bool moe_named = std::strncmp(node->name, "ffn_moe_", 8) == 0;
+            if (node->op == GGML_OP_MUL_MAT_ID) {
+                expert_section = true;
+            } else if (node->name[0] != '\0' && !moe_named) {
+                expert_section = false;
+            }
+            if (!ggml_sycl_is_noop(node)) {
+                boundary = node->op == GGML_OP_MUL_MAT_ID || (expert_section && moe_named) ||
+                           (node->op == GGML_OP_FLASH_ATTN_EXT && !fa_graph) ||
+                           (host_attn && (node->op == GGML_OP_FLASH_ATTN_EXT || node->op == GGML_OP_SET_ROWS) &&
+                            ggml_sycl_tensor_is_in_kv_host_buft(node->op == GGML_OP_SET_ROWS ? node : node->src[1]));
+            }
+        }
+        if (boundary) {
+            close_run(i);
+            plan.push_back({ i, i + 1, true, false });
+            run_start = i + 1;
+            run_work  = 0;
+        } else if (node && !ggml_sycl_is_noop(node)) {
+            run_work++;
+        }
+    }
+    close_run(cgraph->n_nodes);
+    return plan;
+}
+
+// Per-split profitability (llama.cpp-7pm2 B4): a split is worth a slot when at least one run between its
+// boundaries is large enough to record. Boundaries and small runs cost the same direct or not, so they do not
+// count against it. Decided once per key, at its warmup.
+static bool moe_graph_keyed_plan_profitable(const ggml_cgraph * cgraph) {
+    const std::vector<moe_graph_keyed_item> plan           = moe_graph_keyed_plan(cgraph);
+    int                                     graph_segments = 0, graph_nodes = 0, direct_segments = 0, boundaries = 0;
+    for (const auto & item : plan) {
+        if (item.boundary) {
+            boundaries++;
+        } else if (item.graph) {
+            graph_segments++;
+            graph_nodes += item.end - item.start;
+        } else {
+            direct_segments++;
+        }
+    }
+    const bool profitable = graph_segments > 0;
+    if (ggml_sycl_graph_diag_enabled()) {
+        static std::atomic<int> logged{ 0 };
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 128) {
+            fprintf(stderr,
+                    "[SYCL-SEG-SLOT-POLICY] nodes=%d boundaries=%d graph_segments=%d graph_nodes=%d "
+                    "direct_segments=%d min_segment_nodes=%d profitable=%d\n",
+                    cgraph->n_nodes, boundaries, graph_segments, graph_nodes, direct_segments,
+                    moe_graph_keyed_min_segment_nodes(), profitable ? 1 : 0);
+        }
+    }
+    return profitable;
+}
+
+// A slot's graph inputs, as positions in the split (leaf i as i, src j of node n as -(n*GGML_MAX_SRC+j)-1), never as
+// tensor pointers: a key fixes the split's structure, so the same positions name the same inputs on every replay.
+static void moe_segment_slot_collect_inputs(const ggml_cgraph * cgraph, std::vector<int32_t> & refs) {
+    refs.clear();
+    std::vector<const ggml_tensor *> seen;  // this call only
+    auto                             consider = [&](const ggml_tensor * t, int32_t ref) {
+        if (!t || !t->data || ggml_sycl_tensor_is_weight(t) || ggml_nbytes(t) == 0 || !graph_tensor_is_input(t)) {
+            return;
+        }
+        if (std::find(seen.begin(), seen.end(), t) != seen.end()) {
+            return;
+        }
+        seen.push_back(t);
+        refs.push_back(ref);
+    };
+    for (int i = 0; i < cgraph->n_leafs; ++i) {
+        consider(cgraph->leafs[i], i);
+    }
+    for (int n = 0; n < cgraph->n_nodes; ++n) {
+        const ggml_tensor * node = cgraph->nodes[n];
+        for (int j = 0; node && j < GGML_MAX_SRC; ++j) {
+            consider(node->src[j], -(n * GGML_MAX_SRC + j) - 1);
+        }
+    }
+}
+
+static ggml_tensor * moe_segment_slot_input(const ggml_cgraph * cgraph, int32_t ref) {
+    if (ref >= 0) {
+        return ref < cgraph->n_leafs ? cgraph->leafs[ref] : nullptr;
+    }
+    const int pos  = -(ref + 1);
+    const int node = pos / GGML_MAX_SRC;
+    const int src  = pos % GGML_MAX_SRC;
+    return node < cgraph->n_nodes && cgraph->nodes[node] ? cgraph->nodes[node]->src[src] : nullptr;
+}
+
+// Copies each graph input's host bytes into its staged device copy before the slot runs, the per-slot form of
+// graph_refresh_input_tensors (whose cached list is one per context).
+static void moe_segment_slot_refresh_inputs(ggml_backend_sycl_context *                         ctx,
+                                            const ggml_cgraph *                                 cgraph,
+                                            const ggml_backend_sycl_context::moe_segment_slot & slot) {
+    sycl::queue & q = *ctx->stream();
+    for (int32_t ref : slot.input_refs) {
+        ggml_tensor * t = moe_segment_slot_input(cgraph, ref);
+        if (t) {
+            (void) graph_refresh_input_tensor(ctx, t, q);
+        }
+    }
+}
+
+// Destroys the slots the cache retired (evicted, invalidated or churned) once the queue that ran them has drained.
+// If the drain fails, their graphs may still run, so they are kept alive for the life of the process instead.
+static bool moe_segment_slots_drain_retired(ggml_backend_sycl_context * ctx) {
+    if (!ctx->moe_segment_slots.has_retired()) {
+        return true;
+    }
+    std::vector<ggml_backend_sycl_context::moe_segment_slot> retired   = ctx->moe_segment_slots.take_retired();
+    bool                                                     any_graph = false;
+    for (const auto & slot : retired) {
+        any_graph = any_graph || slot.graphed_segments > 0;
+    }
+    if (!any_graph) {
+        return true;
+    }
+    try {
+        ggml_sycl_trace_queue_wait(ctx->stream(), "segment-slot-retire", ctx->device, -1, nullptr);
+    } catch (const std::exception & exc) {
+        GGML_LOG_ERROR("[SYCL-SEG-SLOT] retire drain failed on device %d: %s; keeping %zu slot(s) alive\n", ctx->device,
+                       exc.what(), retired.size());
+        static auto * kept = new std::vector<ggml_backend_sycl_context::moe_segment_slot>();
+        for (auto & slot : retired) {
+            kept->push_back(std::move(slot));
+        }
+        return false;
+    }
+    return true;
+}
+
+bool ggml_sycl_retire_moe_segment_slots(ggml_backend_sycl_context * ctx) noexcept {
+    try {
+        ctx->moe_segment_slots.invalidate_all();
+        return moe_segment_slots_drain_retired(ctx);
+    } catch (...) {
+        return false;
+    }
+}
+
+// Slot counters at INFO every 1024 keyed calls, so a -lv 4 run shows replays per decode token.
+static void moe_segment_slots_report(const ggml_backend_sycl_context * ctx) {
+    const auto &   st = ctx->moe_segment_slots.stats();
+    const uint64_t n  = st.warmups + st.records + st.replays + st.directs;
+    if (n == 0 || (n % 1024) != 0) {
+        return;
+    }
+    GGML_LOG_INFO(
+        "[SYCL-SEG-SLOTS] device=%d calls=%llu keys=%zu warmups=%llu records=%llu replays=%llu directs=%llu "
+        "failures=%llu evictions=%llu churned=%d\n",
+        ctx->device, (unsigned long long) n, ctx->moe_segment_slots.size(), (unsigned long long) st.warmups,
+        (unsigned long long) st.records, (unsigned long long) st.replays, (unsigned long long) st.directs,
+        (unsigned long long) st.failures, (unsigned long long) st.evictions, ctx->moe_segment_slots.churned() ? 1 : 0);
+}
+
+struct moe_segmented_dispatch_scope {
+    bool previous = false;
+
+    moe_segmented_dispatch_scope() : previous(g_moe_segmented_graph_dispatch_active) {
+        g_moe_segmented_graph_dispatch_active = true;
+    }
+
+    ~moe_segmented_dispatch_scope() { g_moe_segmented_graph_dispatch_active = previous; }
+};
+
+// Records one decode split into `slot` and runs it, so the split has executed when this returns. A run that fails
+// to record runs directly and stays direct in the slot. Everything a recorded graph baked a pointer to is retained
+// in the slot: what the recording sink collected, the pool scratch freed while recording, the Q8 activation
+// buffer, and the weight handles its nodes read.
+static void moe_graph_record_segment_slot(ggml_backend_sycl_context *                   sycl_ctx,
+                                          ggml_cgraph *                                 cgraph,
+                                          ggml_backend_sycl_context::moe_segment_slot & slot) {
+    g_graph_diag_counters.seg_record_attempts.fetch_add(1, std::memory_order_relaxed);
+    moe_graph_segmented_call_begin(sycl_ctx, cgraph);
+    ggml_sycl_moe_precomputed_skip_new_graph();
+    moe_segmented_dispatch_scope segmented_scope;
+
+    const std::vector<moe_graph_keyed_item> plan            = moe_graph_keyed_plan(cgraph);
+    queue_ptr                               stream          = sycl_ctx->stream();
+    const int                               device          = sycl_ctx->device;
+    int                                     direct_segments = 0;
+    int                                     graph_nodes     = 0;
+    slot.segments.clear();
+    slot.boundary_nodes.clear();
+    slot.graphed_segments = 0;
+
+    auto dispatch_direct = [&](int start, int end) {
+        for (int i = start; i < end; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (node && !ggml_sycl_is_noop(node)) {
+                ggml_sycl_compute_forward(*sycl_ctx, node);
+            }
+        }
+    };
+
+    for (const moe_graph_keyed_item & item : plan) {
+        if (item.boundary) {
+            slot.boundary_nodes.push_back(item.start);
+            dispatch_direct(item.start, item.end);
+            continue;
+        }
+        if (!item.graph) {
+            slot.segments.push_back({ item.start, item.end, nullptr });
+            direct_segments++;
+            dispatch_direct(item.start, item.end);
+            continue;
+        }
+
+        // Publish every pending result before the queue enters recording mode (B1).
+        moe_graph_segment_boundary_flush(sycl_ctx->device);
+        // The recording quantizes its own activations: no hit on a Q8 buffer some other dispatch filled.
+        sycl_ctx->mmvq_q8_activation_cache.invalidate();
+        const size_t                                     retained_baseline = slot.retained_handles.size();
+        std::vector<std::pair<ggml_sycl_pool *, size_t>> pool_baseline;
+        for (ggml_sycl_pool * pool : ggml_sycl_block_exec_dense_pools(*sycl_ctx)) {
+            pool_baseline.emplace_back(pool, pool->graph_retained_count());
+        }
+        auto take_pool_scratch = [&](std::vector<ggml_sycl::mem_handle> & out) {
+            for (const auto & b : pool_baseline) {
+                b.first->take_graph_retained_since(b.second, out);
+            }
+        };
+        int                                                                       recording_node_index = -1;
+        ggml_tensor *                                                             recording_node       = nullptr;
+        std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec;
+        try {
+            sycl_ex::command_graph   seg_graph(*stream, { sycl_ex::property::graph::assume_buffer_outlives_graph{} });
+            ggml_sycl_graph_recorder recorder(ggml_sycl_graph_recorder_slots(*sycl_ctx), &seg_graph, stream,
+                                              &slot.retained_handles, false);
+
+            // A throw mid-recording ends the recording before the recorder puts the state back.
+            struct recording_end_guard {
+                sycl_ex::command_graph<sycl_ex::graph_state::modifiable> & graph;
+                bool                                                       open = false;
+
+                ~recording_end_guard() {
+                    if (open) {
+                        try {
+                            graph.end_recording();
+                        } catch (...) {
+                        }
+                    }
+                }
+            } end_guard{ seg_graph };
+
+            seg_graph.begin_recording(*stream);
+            end_guard.open = true;
+            for (int i = item.start; i < item.end; i++) {
+                ggml_tensor * node = cgraph->nodes[i];
+                if (!node || ggml_sycl_is_noop(node)) {
+                    continue;
+                }
+                recording_node_index = i;
+                recording_node       = node;
+                ggml_sycl_compute_forward(*sycl_ctx, node);
+            }
+            end_guard.open = false;
+            seg_graph.end_recording();
+            recorder.leave();
+            exec = std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(seg_graph.finalize());
+        } catch (const ggml_sycl_fallback_error &) {
+            throw;
+        } catch (const std::exception & exc) {
+            // Nothing recorded ran: the handles and pool scratch it collected can go, and the run executes directly.
+            slot.retained_handles.resize(retained_baseline);
+            std::vector<ggml_sycl::mem_handle> dropped;
+            take_pool_scratch(dropped);
+            GGML_LOG_WARN(
+                "[SYCL-SEG-SLOT] segment [%d-%d) recording failed at node %d op=%s name=%s: %s; "
+                "running it directly\n",
+                item.start, item.end, recording_node_index, recording_node ? ggml_op_name(recording_node->op) : "?",
+                recording_node ? recording_node->name : "?", exc.what());
+            g_graph_diag_counters.seg_record_failures.fetch_add(1, std::memory_order_relaxed);
+            slot.segments.push_back({ item.start, item.end, nullptr });
+            direct_segments++;
+            dispatch_direct(item.start, item.end);
+            continue;
+        }
+        take_pool_scratch(slot.retained_handles);
+        for (int i = item.start; i < item.end; i++) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            for (int s = 0; node && s < GGML_MAX_SRC; ++s) {
+                size_t              offs = 0;
+                const ggml_tensor * root = node->src[s] ? ggml_sycl_view_root_and_offset(node->src[s], offs) : nullptr;
+                if (!root || !ggml_sycl_tensor_is_weight(root)) {
+                    continue;
+                }
+                const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(root->extra);
+                if (extra && extra->data_handle[device].valid()) {
+                    slot.retained_handles.push_back(extra->data_handle[device]);
+                }
+            }
+        }
+        slot.segments.push_back({ item.start, item.end, std::move(exec) });
+        slot.graphed_segments++;
+        graph_nodes += item.end - item.start;
+        // The recording only described the run: submitting it is what executes it.
+        stream->ext_oneapi_graph(*slot.segments.back().exec_graph);
+        sycl_ctx->mmvq_q8_activation_cache.invalidate();
+    }
+    const ggml_sycl::mem_handle q8 = sycl_ctx->mmvq_q8_activation_cache.handle(device);
+    if (slot.graphed_segments > 0 && q8.valid()) {
+        slot.retained_handles.push_back(q8);
+    }
+
+    g_graph_diag_counters.seg_record_success.fetch_add(1, std::memory_order_relaxed);
+    g_graph_diag_counters.seg_graphed_segments.fetch_add(slot.graphed_segments, std::memory_order_relaxed);
+    g_graph_diag_counters.seg_direct_segments.fetch_add(direct_segments, std::memory_order_relaxed);
+    GGML_LOG_INFO(
+        "[SYCL-SEG-SLOT] recorded split: %d segment graphs + %zu direct boundaries + %d direct segments "
+        "(%d/%d nodes in graphs, %zu retained handles)\n",
+        slot.graphed_segments, slot.boundary_nodes.size(), direct_segments, graph_nodes, cgraph->n_nodes,
+        slot.retained_handles.size());
+    moe_graph_segmented_call_end();
+}
+
+// Replays a keyed slot: its segment graphs and its boundary nodes, interleaved in node order.
+static void moe_graph_replay_segment_slot(ggml_backend_sycl_context *                         sycl_ctx,
+                                          ggml_cgraph *                                       cgraph,
+                                          const ggml_backend_sycl_context::moe_segment_slot & slot) {
+    g_graph_diag_counters.seg_replay.fetch_add(1, std::memory_order_relaxed);
+    moe_graph_segmented_call_begin(sycl_ctx, cgraph);
+    ggml_sycl_moe_precomputed_skip_new_graph();
+    moe_segmented_dispatch_scope segmented_scope;
+
+    queue_ptr stream  = sycl_ctx->stream();
+    size_t    seg_idx = 0;
+    size_t    b_idx   = 0;
+    while (seg_idx < slot.segments.size() || b_idx < slot.boundary_nodes.size()) {
+        const int next_seg = seg_idx < slot.segments.size() ? slot.segments[seg_idx].start_node : INT_MAX;
+        const int next_b   = b_idx < slot.boundary_nodes.size() ? slot.boundary_nodes[b_idx] : INT_MAX;
+        if (next_seg <= next_b) {
+            const auto & seg = slot.segments[seg_idx++];
+            if (seg.exec_graph) {
+                // The recorded segment runs no per-node flush: publish pending results first (B1).
+                moe_graph_segment_boundary_flush(sycl_ctx->device);
+                stream->ext_oneapi_graph(*seg.exec_graph);
+                // The replay rewrote the Q8 buffer: the cache no longer describes it.
+                sycl_ctx->mmvq_q8_activation_cache.invalidate();
+                continue;
+            }
+            g_graph_diag_counters.seg_direct_segments.fetch_add(1, std::memory_order_relaxed);
+            for (int i = seg.start_node; i < seg.end_node; i++) {
+                ggml_tensor * node = cgraph->nodes[i];
+                if (node && !ggml_sycl_is_noop(node)) {
+                    ggml_sycl_compute_forward(*sycl_ctx, node);
+                }
+            }
+        } else {
+            ggml_tensor * node = cgraph->nodes[slot.boundary_nodes[b_idx++]];
+            if (node && !ggml_sycl_is_noop(node)) {
+                if (node->op == GGML_OP_MUL_MAT_ID) {
+                    g_graph_diag_counters.seg_moe_dispatches.fetch_add(1, std::memory_order_relaxed);
+                }
+                ggml_sycl_compute_forward(*sycl_ctx, node);
+            }
+        }
+    }
+    moe_graph_segmented_call_end();
+}
+
 // Record segmented graphs for a MoE compute graph.
 // Called after warmup when we know the graph topology is stable.
 // Returns true on success, false on failure (caller should fall back).
@@ -100439,7 +100967,7 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
 #endif  // GGML_SYCL_GRAPH
 
 #ifdef GGML_SYCL_GRAPH
-static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
+static ggml_sycl_graph_compat check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {
     // NOTE: Multi-device check removed (December 2024)
     // Each backend context has its own device and exec_graph, so graphs can be
     // created per-device. The scheduler calls graph_compute separately for each
@@ -100477,7 +101005,7 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
                 "[GRAPH-CHECK] Forced XMX MoE with host-resident expert weights requires direct TG dispatch; "
                 "disabling SYCL graph replay for this graph\n");
             g_graph_diag_counters.graph_disabled.fetch_add(1, std::memory_order_relaxed);
-            return false;
+            return GGML_SYCL_GRAPH_COMPAT_NONE;
         }
         GGML_SYCL_DEBUG("[GRAPH-CHECK] lazy-moe: unified cache mandatory, %zu experts from %d nodes\n",
                         total_experts_needed, moe_node_count);
@@ -100485,7 +101013,7 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
             ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(*ctx.stream());
             if (!cache) {
                 GGML_LOG_INFO("[GRAPH-CHECK] MoE cache unavailable; disabling graphs\n");
-                return false;
+                return GGML_SYCL_GRAPH_COMPAT_NONE;
             }
             const size_t budget    = cache->budget();
             const size_t used      = cache->used();
@@ -100539,6 +101067,7 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
         ggml_sycl_moe_act_publish(variant, alpha, limit);
     }
 
+    bool mul_mat_id_not_recordable = false;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_op node_op = cgraph->nodes[i]->op;
         switch (node_op) {
@@ -100624,11 +101153,13 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
                     if (!graph_compatible) {
                         static bool logged_once = false;
                         if (!logged_once) {
-                            GGML_LOG_INFO("%s: disabling SYCL graphs for MUL_MAT_ID (type=%s, ne12=%ld)\n", __func__,
-                                          ggml_type_name(src0->type), (long) ne12);
+                            GGML_LOG_INFO(
+                                "%s: disabling whole-graph SYCL capture for MUL_MAT_ID (type=%s, ne12=%ld); segmented "
+                                "replay can still run it as a direct boundary\n",
+                                __func__, ggml_type_name(src0->type), (long) ne12);
                             logged_once = true;
                         }
-                        return false;
+                        mul_mat_id_not_recordable = true;
                     }
                     // Graph-compatible path available
                 }
@@ -100645,7 +101176,7 @@ static bool check_graph_compatibility(ggml_backend_sycl_context & ctx, ggml_cgra
                 break;
         }
     }
-    return true;
+    return mul_mat_id_not_recordable ? GGML_SYCL_GRAPH_COMPAT_SEGMENTED_ONLY : GGML_SYCL_GRAPH_COMPAT_WHOLE_GRAPH;
 }
 
 // Whether the kernel the router picked quantizes src1 into the planned Q8_1 buffer: the MMVQ / MMQ / XMX family.
@@ -108956,18 +109487,33 @@ normal_dispatch:
         // Prefix mode: graph execution of partial graphs is broken.
         // Use compute_impl for both prefix and suffix.
         use_sycl_graph = false;
-    } else if (sycl_ctx->exec_graph_replay_futile) {
+    } else if (sycl_ctx->exec_graph_replay_futile && !moe_segment_keyed_reachable(sycl_ctx, cgraph, cached_is_decode)) {
         // Replay was proven futile for this context, and nothing clears that. Every later call takes the
         // GGML_SYCL_DISABLE_GRAPH=1 path, decided here so it skips the graph-policy scans below as well
-        // (fragmented graphs run many small splits per token, and each one paid them).
+        // (fragmented graphs run many small splits per token, and each one paid them). Decode splits that keyed
+        // segment slots can serve are the exception (llama.cpp-7pm2 B2): the verdict is the whole-graph slot's.
         use_sycl_graph = false;
     } else if (sycl_ctx->exec_graph) {
         use_sycl_graph = !g_ggml_sycl_disable_graph && !g_sycl_graph_multithreaded.load(std::memory_order_relaxed) &&
                          !sycl_ctx->graphs_disabled && !(g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1);
     } else {
         use_sycl_graph = !g_ggml_sycl_disable_graph && !g_sycl_graph_multithreaded.load(std::memory_order_relaxed) &&
-                         !sycl_ctx->graphs_disabled && check_graph_compatibility(*sycl_ctx, cgraph) &&
-                         !(g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1);
+                         !sycl_ctx->graphs_disabled && !(g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1);
+        if (use_sycl_graph) {
+            // B3 (llama.cpp-7pm2): a MUL_MAT_ID that cannot be recorded vetoes only the whole-graph capture. A decode
+            // graph segmented replay can serve runs it with those nodes as direct boundaries.
+            const ggml_sycl_graph_compat compat = check_graph_compatibility(*sycl_ctx, cgraph);
+            use_sycl_graph                      = compat == GGML_SYCL_GRAPH_COMPAT_WHOLE_GRAPH ||
+                             (compat == GGML_SYCL_GRAPH_COMPAT_SEGMENTED_ONLY && cached_is_decode &&
+                              ggml_sycl_segmented_graph_env_allows());
+            if (compat == GGML_SYCL_GRAPH_COMPAT_SEGMENTED_ONLY && use_sycl_graph && !sycl_ctx->moe_graph_rerecord) {
+                GGML_LOG_INFO(
+                    "[SYCL-SEG] MUL_MAT_ID cannot be recorded on device %d; decode splits replay per-split "
+                    "segments with MoE ops as direct boundaries\n",
+                    sycl_ctx->device);
+                sycl_ctx->moe_graph_rerecord = true;
+            }
+        }
     }
     if (use_sycl_graph && cached_is_decode && ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph)) {
         static std::atomic<bool> logged{ false };
@@ -109035,7 +109581,8 @@ normal_dispatch:
             }
             if (has_moe_ops) {
                 sycl_ctx->moe_graph_rerecord = true;
-            } else {
+            } else if (!moe_segment_keyed_mode(sycl_ctx, cached_is_decode)) {
+                // A keyed slot dispatches FLASH_ATTN_EXT as a direct boundary, so only the other paths need this.
                 use_sycl_graph = false;
             }
         } else if (allow_mode == ggml_sycl_fa_graph_allow_mode::AUTO) {
@@ -109174,8 +109721,12 @@ normal_dispatch:
         }
     }
 
+    // A keyed decode split decides profitability per key, once, at its warmup (llama.cpp-7pm2 B4), and records no
+    // descriptor MoE graphs, so neither the candidate count nor the per-call profitability scans below apply.
+    const bool moe_segment_keyed_policy = use_sycl_graph && moe_segment_keyed_mode(sycl_ctx, cached_is_decode);
+
     const int descriptor_moe_graph_candidates =
-        (use_sycl_graph && cached_is_decode && !moe_graphlet_replay_probe) ?
+        (use_sycl_graph && cached_is_decode && !moe_graphlet_replay_probe && !moe_segment_keyed_policy) ?
             moe_graph_descriptor_moe_dispatch_candidate_count(sycl_ctx, cgraph) :
             0;
     size_t     descriptor_moe_graph_free_vram = 0;
@@ -109231,7 +109782,7 @@ normal_dispatch:
         use_sycl_graph = false;
     }
     if (use_sycl_graph && cached_is_decode && !moe_graphlet_replay_probe && descriptor_moe_graph_candidates == 0 &&
-        !moe_decode_segmented_graph_profitable(cgraph)) {
+        !moe_segment_keyed_policy && !moe_decode_segmented_graph_profitable(cgraph)) {
         static std::atomic<bool> logged{ false };
         if (!logged.exchange(true, std::memory_order_acq_rel)) {
             GGML_LOG_INFO(
@@ -109423,6 +109974,9 @@ normal_dispatch:
         bool       is_decode_phase = cached_is_decode;
         bool       is_prompt_phase = !cached_is_decode && cgraph->n_nodes > 0;
         const auto graph_key       = sycl_exec_graph_make_key(*sycl_ctx, cgraph, graph_hash, is_decode_phase);
+        // This decode split runs from its own keyed segment slot (llama.cpp-7pm2 B2). The single-slot machinery
+        // below (failed-graph memo, '#' futility trip, warmup slot, MoE expert preload) does not apply to it.
+        const bool moe_segment_keyed = moe_segment_keyed_mode(sycl_ctx, is_decode_phase);
 
         // llama.cpp-dkw0 (defect #4, hypothesis b/collision): one exec_graph slot
         // and one signature per context, but ~260 distinct tiny splits flow
@@ -109470,8 +110024,8 @@ normal_dispatch:
                                                             sycl_ctx->moe_segments_failed_n_nodes == cgraph->n_nodes &&
                                                             sycl_ctx->moe_segments_failed_is_decode == is_decode_phase;
 
-        if (is_decode_phase && sycl_ctx->moe_graph_rerecord && moe_segment_recording_failed_for_graph &&
-            !moe_graphlet_replay_probe) {
+        if (!moe_segment_keyed && is_decode_phase && sycl_ctx->moe_graph_rerecord &&
+            moe_segment_recording_failed_for_graph && !moe_graphlet_replay_probe) {
             if (!sycl_ctx->moe_segments_failed_logged) {
                 sycl_ctx->moe_segments_failed_logged = true;
                 GGML_LOG_INFO(
@@ -109589,7 +110143,7 @@ normal_dispatch:
         // exec_graph_last_scanned_hash) so the healthy whole-graph regime
         // (one shape, forever) pays one strchr sweep total instead of one per
         // call.
-        if (!sycl_ctx->exec_graph_replay_futile &&
+        if (!moe_segment_keyed && !sycl_ctx->exec_graph_replay_futile &&
             (!sycl_ctx->exec_graph_has_scanned || sycl_ctx->exec_graph_last_scanned_hash != graph_hash)) {
             sycl_ctx->exec_graph_has_scanned       = true;
             sycl_ctx->exec_graph_last_scanned_hash = graph_hash;
@@ -109626,7 +110180,7 @@ normal_dispatch:
         // and the preventive scan just above), stop paying for record-mode
         // capture on every call -- it is not just wasted cost, it is the
         // bisected root cause of the garbage output.
-        if (sycl_ctx->exec_graph_replay_futile) {
+        if (!moe_segment_keyed && sycl_ctx->exec_graph_replay_futile) {
             GGML_SYCL_DEBUG("[SYCL-GRAPH] skipping - replay futility gate tripped for this context\n");
             compute_impl_unlocked();
             record_completion(false);
@@ -109775,12 +110329,16 @@ normal_dispatch:
         // preload or logging again, until its expert residency changes. A structural refusal is stamped at once. A
         // transient failure refuses this call only, until moe_graph_preload_transient_retry_cap of them in a row
         // under unchanged residency settle the tensor as REFUSED with one INFO line. Other splits keep their graphs.
-        if (!graph_preload_moe_experts(*sycl_ctx, cgraph, moe_host_tier_boundary)) {
-            sycl_ctx->moe_graph_preload_refused = true;
-            graph_unpin_moe_experts(sycl_ctx);
-            compute_impl_unlocked();
-            record_completion(false);
-            return GGML_STATUS_SUCCESS;
+        // A keyed slot records no MUL_MAT_ID: every one is a direct boundary, so the expert tables this prepares for
+        // recorded MoE ops have no consumer there.
+        if (!moe_segment_keyed) {
+            if (!graph_preload_moe_experts(*sycl_ctx, cgraph, moe_host_tier_boundary)) {
+                sycl_ctx->moe_graph_preload_refused = true;
+                graph_unpin_moe_experts(sycl_ctx);
+                compute_impl_unlocked();
+                record_completion(false);
+                return GGML_STATUS_SUCCESS;
+            }
         }
 
         // Warmup pass: If this phase hasn't been warmed up, run without graph recording
@@ -109789,8 +110347,9 @@ normal_dispatch:
         // graph recording which is incompatible with SYCL command graphs.
         // Note: Prompt and decode phases have same n_nodes but different matrix dimensions,
         // so we track warmup per-phase to ensure primitives are cached for both.
+        // A keyed slot warms up per key (graph_segment_cache WARMUP), not through this one slot per phase.
         int & warmup_n_nodes = is_decode_phase ? sycl_ctx->warmup_decode_n_nodes : sycl_ctx->warmup_prompt_n_nodes;
-        if (warmup_n_nodes != cgraph->n_nodes) {
+        if (!moe_segment_keyed && warmup_n_nodes != cgraph->n_nodes) {
             GGML_SYCL_DEBUG("[SYCL-GRAPH] warmup pass for %s phase (n_nodes=%d, warmed=%d)\n",
                             is_decode_phase ? "decode" : "prompt", cgraph->n_nodes, warmup_n_nodes);
             ggml_sycl::offload_stats_set_phase(ggml_sycl::offload_phase::WARMUP);
@@ -109895,7 +110454,70 @@ normal_dispatch:
                                       sycl_ctx->moe_segments_n_nodes == cgraph->n_nodes &&
                                       sycl_ctx->moe_segments_is_decode == is_decode_phase;
 
-                if (segments_match) {
+                if (moe_segment_keyed) {
+                    // Per-split slot (llama.cpp-7pm2 B2): warm up, record, then replay under this split's own key.
+                    namespace gsc                 = ggml_sycl::graph_segment_cache;
+                    const gsc::key    slot_key    = moe_segment_slot_key(sycl_ctx, cgraph, graph_hash, is_decode_phase);
+                    const gsc::action slot_action = sycl_ctx->moe_segment_slots.begin(slot_key);
+                    moe_segment_slots_report(sycl_ctx);
+                    // Slots the cache evicted or churned are destroyed only after the queue drains.
+                    if (!moe_segment_slots_drain_retired(sycl_ctx)) {
+                        sycl_ctx->moe_graphs_disabled = true;
+                    }
+                    if (slot_action == gsc::action::WARMUP) {
+                        // B4: a split with no run worth a graph stays direct for good, decided once per key.
+                        if (!moe_graph_keyed_plan_profitable(cgraph)) {
+                            sycl_ctx->moe_segment_slots.record_failed(slot_key);
+                        }
+                        compute_impl_unlocked();
+                    } else if (slot_action == gsc::action::DIRECT) {
+                        compute_impl_unlocked();
+                    } else if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
+                        // An input has no staged copy: a recorded segment would read the host one. Run direct; the
+                        // slot stays, and a later token that stages its inputs uses it.
+                        compute_impl_unlocked();
+                    } else if (slot_action == gsc::action::REPLAY) {
+                        const auto * slot = sycl_ctx->moe_segment_slots.payload(slot_key);
+                        if (!slot) {
+                            // The gateway swapped an input's staging buffer and retired every slot after begin().
+                            compute_impl_unlocked();
+                        } else {
+                            moe_segment_slot_refresh_inputs(sycl_ctx, cgraph, *slot);
+                            moe_graph_replay_segment_slot(sycl_ctx, cgraph, *slot);
+                            graph_executed = true;
+                        }
+                    } else if (!sycl_ctx->moe_segment_slots.state(slot_key)) {
+                        // RECORD, but a staging swap at the gateway retired the slot: record on a later token.
+                        compute_impl_unlocked();
+                    } else {
+                        sycl_ctx->moe_fa_post_prompt_record_pending = false;
+                        ggml_backend_sycl_context::moe_segment_slot slot;
+                        moe_segment_slot_collect_inputs(cgraph, slot.input_refs);
+                        moe_segment_slot_refresh_inputs(sycl_ctx, cgraph, slot);
+                        try {
+                            moe_graph_record_segment_slot(sycl_ctx, cgraph, slot);
+                        } catch (...) {
+                            // Segments already submitted may still run: drain before the slot's graphs and handles go.
+                            try {
+                                ggml_sycl_trace_queue_wait(sycl_ctx->stream(), "segment-slot-record-failed",
+                                                           sycl_ctx->device, -1, nullptr);
+                            } catch (...) {
+                            }
+                            sycl_ctx->moe_segment_slots.record_failed(slot_key);
+                            throw;
+                        }
+                        graph_executed = true;
+                        if (slot.graphed_segments > 0) {
+                            sycl_ctx->moe_segment_slots.record_succeeded(slot_key, std::move(slot));
+                        } else {
+                            // Nothing recorded: the split ran directly and has no graph to keep.
+                            sycl_ctx->moe_segment_slots.record_failed(slot_key);
+                        }
+                    }
+                } else if (is_decode_phase) {
+                    // The slot cache churned (keys never repeated, so nothing replayed): this context runs direct.
+                    compute_impl_unlocked();
+                } else if (segments_match) {
                     // Fast path: replay cached segments + dispatch MoE ops
                     if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
                         // An input has no staged copy: the recorded segments would read the host one. Retire them

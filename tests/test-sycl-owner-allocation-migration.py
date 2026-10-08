@@ -571,10 +571,35 @@ with gate('futile-context-direct'):
     # GGML_SYCL_DISABLE_GRAPH=1 path, decided before any of the per-call graph-policy scans run.
     compute = region(RUNTIME_CODE, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
                      "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
-    futile = re.search(r"\}\s*else if \(sycl_ctx->exec_graph_replay_futile\)\s*\{\s*use_sycl_graph\s*=\s*false;\s*\}"
-                       r"\s*else if \(sycl_ctx->exec_graph\)\s*\{", compute)
+    # llama.cpp-7pm2 B2: the one exception is a decode split that keyed segment slots can serve, since the futility
+    # verdict belongs to the whole-graph slot.
+    futile = re.search(r"\}\s*else if \(sycl_ctx->exec_graph_replay_futile && "
+                       r"!moe_segment_keyed_reachable\(sycl_ctx, cgraph, cached_is_decode\)\)\s*\{"
+                       r"\s*use_sycl_graph\s*=\s*false;\s*\}\s*else if \(sycl_ctx->exec_graph\)\s*\{", compute)
     assert futile
-    graph_branch = compute.index("    if (use_sycl_graph) {\n")
+
+    def keyed_reachable_problems(code):
+        body = region(code, "static bool moe_segment_keyed_reachable(", "\n}\n")
+        problems = []
+        if not re.search(r"if \(!is_decode \|\| !ggml_sycl_segmented_graph_env_allows\(\) \|\| "
+                         r"ctx->moe_segment_slots\.churned\(\)\)\s*\{\s*return false;\s*\}", body):
+            problems.append("the exception is not limited to decode, the segmented env, and an unchurned cache")
+        if not re.search(r"return ctx->moe_graph_rerecord \|\| ggml_sycl_graph_has_op\(cgraph, GGML_OP_MUL_MAT_ID\);",
+                         body):
+            problems.append("the exception does not require segmented MoE mode or a MUL_MAT_ID that can enter it")
+        return problems
+
+    assert not keyed_reachable_problems(RUNTIME_CODE), keyed_reachable_problems(RUNTIME_CODE)
+    _reach = region(RUNTIME_CODE, "static bool moe_segment_keyed_reachable(", "\n}\n")
+    for _label, _old, _new in (
+            ("prompt splits reach keyed slots", "if (!is_decode || ", "if ("),
+            ("a churned cache still reaches them", " || ctx->moe_segment_slots.churned())", ")"),
+            ("any split reaches them", "return ctx->moe_graph_rerecord || ggml_sycl_graph_has_op(cgraph, GGML_OP_MUL_MAT_ID);",
+             "return true;")):
+        assert _reach.count(_old) == 1, _label
+        assert keyed_reachable_problems(RUNTIME_CODE.replace(_reach, _reach.replace(_old, _new))), \
+            "control %r was not caught" % _label
+    graph_branch = compute.index("\n    if (use_sycl_graph) {\n") + 1
     scans = ("check_graph_compatibility(*sycl_ctx, cgraph)", "ggml_sycl_graph_has_host_inputs(cgraph)",
              "ggml_sycl_graph_has_op(cgraph, GGML_OP_FLASH_ATTN_EXT)",
              "moe_graph_descriptor_moe_dispatch_candidate_count(sycl_ctx, cgraph)",
@@ -592,8 +617,9 @@ with gate('futile-context-direct'):
                      r"ggml_sycl_graph_has_op\(cgraph, GGML_OP_FLASH_ATTN_EXT\)", policy)
     assert re.search(r"moe_graphlet_replay_probe\s*=\s*cached_is_decode && !sycl_ctx->exec_graph_replay_futile &&\s*"
                      r"moe_graphlet_replay_probe_enabled\(\)", policy)
-    assert re.search(r"\(use_sycl_graph && cached_is_decode && !moe_graphlet_replay_probe\)\s*\?\s*"
-                     r"moe_graph_descriptor_moe_dispatch_candidate_count\(sycl_ctx, cgraph\)", policy)
+    # A keyed split records no descriptor MoE graphs, so it skips the candidate count too.
+    assert re.search(r"\(use_sycl_graph && cached_is_decode && !moe_graphlet_replay_probe && !moe_segment_keyed_policy\)"
+                     r"\s*\?\s*moe_graph_descriptor_moe_dispatch_candidate_count\(sycl_ctx, cgraph\)", policy)
     for m in re.finditer(r"moe_decode_segmented_graph_(?:profitable|analyze)\(cgraph\)", policy):
         guard = policy[policy.rindex("if (", 0, m.start()):m.start()]
         assert guard.startswith("if (use_sycl_graph && "), guard
@@ -621,6 +647,8 @@ def check_segment_boundary_flush(code: str) -> list:
         helper = region(code, "static void moe_graph_segment_boundary_flush(int device) {", "\n}\n")
         record = region(code, "static bool moe_graph_record_segments(", "struct moe_decode_segmented_graph_stats {")
         replay = region(code, "static void moe_graph_replay_segments(", "static bool graph_prestage_or_decline(")
+        keyed_record = region(code, "static void moe_graph_record_segment_slot(", "static void moe_graph_replay_segment_slot(")
+        keyed_replay = region(code, "static void moe_graph_replay_segment_slot(", "static bool moe_graph_record_segments(")
     except ValueError as error:
         return [str(error)]
     for flush in ("flush_pending_cpu_scatter();", "flush_pending_cpu_pipeline();", "pipeline_scatter_drain();",
@@ -628,8 +656,9 @@ def check_segment_boundary_flush(code: str) -> list:
                   "flush_pending_attn_dispatch(device);"):
         if flush not in helper:
             problems.append("boundary flush helper does not run %s" % flush)
-    if code.count(call) != 2:
-        problems.append("expected the boundary flush at exactly 2 sites (record, replay), found %d" % code.count(call))
+    if code.count(call) != 4:
+        problems.append("expected the boundary flush at exactly 4 sites (record, replay, keyed record, keyed replay), "
+                        "found %d" % code.count(call))
     # Record: after the direct-segment branch has continued, before the segment graph exists and records.
     direct = record.find("if (seg_size < MIN_SEGMENT_NODES || direct_fa_segment) {")
     skip = record.find("continue;", direct)
@@ -656,6 +685,33 @@ def check_segment_boundary_flush(code: str) -> list:
     elif not (graphed < flush < submit < direct_branch):
         problems.append("replay: the flush must precede the recorded segment's submission "
                         "(graphed=%d flush=%d submit=%d)" % (graphed, flush, submit))
+    # Keyed record (B2): after the direct-run branch has continued, before the segment graph exists and records.
+    direct = keyed_record.find("if (!item.graph) {")
+    skip = keyed_record.find("continue;", direct)
+    flush = keyed_record.find(call)
+    _graph = re.search(r"sycl_ex::command_graph\s+seg_graph\(", keyed_record)
+    graph = _graph.start() if _graph else -1
+    begin = keyed_record.find("seg_graph.begin_recording(")
+    end = keyed_record.find("seg_graph.end_recording();", begin)
+    if min(direct, skip, flush, graph, begin, end) < 0:
+        problems.append("keyed record: an anchor is missing (direct=%d skip=%d flush=%d graph=%d begin=%d end=%d)" % (
+            direct, skip, flush, graph, begin, end))
+    elif not (direct < skip < flush < graph < begin < end):
+        problems.append("keyed record: the flush must follow the direct-run branch and precede the segment graph "
+                        "(skip=%d flush=%d graph=%d begin=%d)" % (skip, flush, graph, begin))
+    elif call in keyed_record[begin:end] or "flush_pending_" in keyed_record[begin:end]:
+        problems.append("keyed record: a pending-slot flush runs while the queue is recording")
+    # Keyed replay: inside the recorded-segment branch, before the submission; the direct run follows `continue;`.
+    graphed = keyed_replay.find("if (seg.exec_graph) {")
+    submit = keyed_replay.find("stream->ext_oneapi_graph(*seg.exec_graph);")
+    leave = keyed_replay.find("continue;", graphed)
+    flush = keyed_replay.find(call)
+    if min(graphed, submit, leave, flush) < 0:
+        problems.append("keyed replay: an anchor is missing (graphed=%d submit=%d continue=%d flush=%d)" % (
+            graphed, submit, leave, flush))
+    elif not (graphed < flush < submit < leave):
+        problems.append("keyed replay: the flush must precede the recorded segment's submission "
+                        "(graphed=%d flush=%d submit=%d)" % (graphed, flush, submit))
     return problems
 
 
@@ -666,15 +722,34 @@ with gate('segment-boundary-flush'):
     _call = "moe_graph_segment_boundary_flush(sycl_ctx->device);"
     _record_flush = "        " + _call + "\n        const size_t retained_baseline"
     _replay_flush = "                " + _call + "\n                stream->ext_oneapi_graph(*seg.exec_graph);"
-    assert RUNTIME_CODE.count(_record_flush) == 1 and RUNTIME_CODE.count(_replay_flush) == 1
+    # The legacy replay is the first of the two replay sites; the keyed replay is the second.
+    assert RUNTIME_CODE.count(_record_flush) == 1 and RUNTIME_CODE.count(_replay_flush) == 2
     _begin = "            seg_graph.begin_recording(*stream);\n"
+    _keyed_record = region(RUNTIME_CODE, "static void moe_graph_record_segment_slot(", "static void moe_graph_replay_segment_slot(")
+    _keyed_replay = region(RUNTIME_CODE, "static void moe_graph_replay_segment_slot(", "static bool moe_graph_record_segments(")
+    _keyed_flush = "        " + _call + "\n"
+    _keyed_begin = "            seg_graph.begin_recording(*stream);\n            end_guard.open = true;\n"
+    assert _keyed_record.count(_keyed_flush) == 1 and _keyed_record.count(_keyed_begin) == 1
+    assert _keyed_replay.count(_replay_flush) == 1
+
+    def _in_keyed(body, old, new):
+        return RUNTIME_CODE.replace(body, body.replace(old, new, 1), 1)
+
     controls = {
         "record flush dropped": RUNTIME_CODE.replace(_record_flush, "        const size_t retained_baseline"),
         "record flush inside the recording": RUNTIME_CODE.replace(_record_flush, "        const size_t retained_baseline")
             .replace(_begin, _begin + "            " + _call + "\n"),
-        "replay flush dropped": RUNTIME_CODE.replace(_replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);"),
+        "replay flush dropped": RUNTIME_CODE.replace(_replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);", 1),
         "replay flush after the submission": RUNTIME_CODE.replace(
-            _replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);\n                " + _call),
+            _replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);\n                " + _call, 1),
+        "keyed record flush dropped": _in_keyed(_keyed_record, _keyed_flush, ""),
+        "keyed record flush inside the recording": RUNTIME_CODE.replace(
+            _keyed_record, _keyed_record.replace(_keyed_flush, "", 1).replace(
+                _keyed_begin, _keyed_begin + "            " + _call + "\n", 1), 1),
+        "keyed replay flush dropped": _in_keyed(
+            _keyed_replay, _replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);"),
+        "keyed replay flush after the submission": _in_keyed(
+            _keyed_replay, _replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);\n                " + _call),
         "attention slot not flushed": RUNTIME_CODE.replace(
             "flush_pending_secondary_scatter());\n    flush_pending_attn_dispatch(device);\n}",
             "flush_pending_secondary_scatter());\n}"),
@@ -697,6 +772,8 @@ def check_segmented_call_ends(code: str) -> list:
         end = region(code, "static void moe_graph_segmented_call_end() {", "\n}\n")
         record = region(code, "static bool moe_graph_record_segments(", "struct moe_decode_segmented_graph_stats {")
         replay = region(code, "static void moe_graph_replay_segments(", "static bool graph_prestage_or_decline(")
+        keyed_record = region(code, "static void moe_graph_record_segment_slot(", "static void moe_graph_replay_segment_slot(")
+        keyed_replay = region(code, "static void moe_graph_replay_segment_slot(", "static bool moe_graph_record_segments(")
     except ValueError as error:
         return [str(error)]
     # Comment-blind text: the /*reset_precomputed=*/ annotation is whitespace here.
@@ -708,7 +785,9 @@ def check_segmented_call_ends(code: str) -> list:
     if "ggml_sycl_cpu_tg_flush_pending();" not in end or "flush_pending_attn_dispatch(d);" not in end:
         problems.append("end does not drain every pending slot")
     for name, body, first_use in (("record", record, "moe_graph_collect_dispatch_indices(cgraph)"),
-                                  ("replay", replay, "while (seg_idx <")):
+                                  ("replay", replay, "while (seg_idx <"),
+                                  ("keyed record", keyed_record, "moe_graph_keyed_plan(cgraph)"),
+                                  ("keyed replay", keyed_replay, "while (seg_idx <")):
         at = body.find("moe_graph_segmented_call_begin(sycl_ctx, cgraph);")
         use = body.find(first_use)
         if at < 0 or use < 0 or at > use:
@@ -717,6 +796,9 @@ def check_segmented_call_ends(code: str) -> list:
         problems.append("record: the successful record does not end with the drain")
     if not re.search(r"moe_graph_segmented_call_end\(\);\s*\}\s*$", replay):
         problems.append("replay: the replay does not end with the drain")
+    for name, body in (("keyed record", keyed_record), ("keyed replay", keyed_replay)):
+        if not re.search(r"moe_graph_segmented_call_end\(\);\s*\}\s*$", body):
+            problems.append("%s: does not end with the drain" % name)
     return problems
 
 
@@ -724,7 +806,12 @@ with gate('segmented-call-owns-graph-ends'):
     problems = check_segmented_call_ends(RUNTIME_CODE)
     assert not problems, "\n".join(problems)
     _begin_call = "    moe_graph_segmented_call_begin(sycl_ctx, cgraph);\n"
-    assert RUNTIME_CODE.count(_begin_call) == 2
+    assert RUNTIME_CODE.count(_begin_call) == 4
+    _keyed_record = region(RUNTIME_CODE, "static void moe_graph_record_segment_slot(", "static void moe_graph_replay_segment_slot(")
+    _keyed_replay = region(RUNTIME_CODE, "static void moe_graph_replay_segment_slot(", "static bool moe_graph_record_segments(")
+    _keyed_end = "    moe_graph_segmented_call_end();\n}\n"
+    assert _keyed_record.count(_begin_call) == 1 and _keyed_replay.count(_begin_call) == 1
+    assert _keyed_record.count(_keyed_end) == 1 and _keyed_replay.count(_keyed_end) == 1
     controls = {
         "no topology rescan": re.sub(
             r"moe_layer_scan_graph_topology\(\*sycl_ctx, cgraph,\s*true,\s*capture_moe_descriptors\);",
@@ -737,6 +824,14 @@ with gate('segmented-call-owns-graph-ends'):
             "    moe_graph_segmented_call_end();\n    return true;\n}", "    return true;\n}"),
         "end drain dropped from replay": RUNTIME_CODE.replace(
             "    moe_graph_segmented_call_end();\n}\n", "}\n", 1),
+        "keyed record begin dropped": RUNTIME_CODE.replace(
+            _keyed_record, _keyed_record.replace(_begin_call, "", 1), 1),
+        "keyed replay begin dropped": RUNTIME_CODE.replace(
+            _keyed_replay, _keyed_replay.replace(_begin_call, "", 1), 1),
+        "keyed record end drain dropped": RUNTIME_CODE.replace(
+            _keyed_record, _keyed_record.replace(_keyed_end, "}\n", 1), 1),
+        "keyed replay end drain dropped": RUNTIME_CODE.replace(
+            _keyed_replay, _keyed_replay.replace(_keyed_end, "}\n", 1), 1),
         "end drain without the CPU slots": RUNTIME_CODE.replace(
             "static void moe_graph_segmented_call_end() {\n    ggml_sycl_cpu_tg_flush_pending();",
             "static void moe_graph_segmented_call_end() {"),
@@ -745,6 +840,91 @@ with gate('segmented-call-owns-graph-ends'):
         assert mutated != RUNTIME_CODE, "control %r did not apply" % label
         assert check_segmented_call_ends(mutated), "control %r was not caught" % label
     print("PASS segmented-call-owns-graph-ends-source-gate (%d controls caught)" % len(controls))
+
+def check_keyed_segment_slots(code: str) -> list:
+    """llama.cpp-7pm2 B2/B3: a decode split in segmented MoE mode runs from its own keyed slot, so the single-slot
+    whole-graph machinery does not apply to it: the failed-graph memo, the '#' split-copy futility trip, the futile
+    early return, the MoE expert preload (a keyed slot records no MUL_MAT_ID) and the one-per-phase warmup slot.
+    The legacy one-slot segmented path keeps the prompt phase only. A MUL_MAT_ID that cannot be recorded vetoes the
+    whole-graph capture only: decode admits it as segmented, prompt and the dense range recorder do not."""
+    problems = []
+    try:
+        compute = region(code, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                         "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
+        mode = region(code, "static bool moe_segment_keyed_mode(", "\n}\n")
+        compat = region(code, "static ggml_sycl_graph_compat check_graph_compatibility(ggml_backend_sycl_context & ctx, "
+                        "ggml_cgraph * cgraph) {", "\n}\n")
+    except ValueError as error:
+        return [str(error)]
+    if not re.search(r"return is_decode && ctx->moe_graph_rerecord && ggml_sycl_segmented_graph_env_allows\(\) &&\s*"
+                     r"!ctx->moe_segment_slots\.churned\(\);", mode):
+        problems.append("keyed mode is not limited to decode, segmented MoE mode, the env and an unchurned cache")
+    decided = compute.find("const bool moe_segment_keyed = moe_segment_keyed_mode(sycl_ctx, is_decode_phase);")
+    exempt = (
+        ("failed-graph memo", r"if \(!moe_segment_keyed && is_decode_phase && sycl_ctx->moe_graph_rerecord &&\s*"
+                              r"moe_segment_recording_failed_for_graph"),
+        ("'#' split-copy trip", r"if \(!moe_segment_keyed && !sycl_ctx->exec_graph_replay_futile &&\s*"
+                                r"\(!sycl_ctx->exec_graph_has_scanned"),
+        ("futile early return", r"if \(!moe_segment_keyed && sycl_ctx->exec_graph_replay_futile\)\s*\{"),
+        ("MoE expert preload", r"if \(!moe_segment_keyed\)\s*\{\s*if \(!graph_preload_moe_experts\("),
+        ("phase warmup slot", r"if \(!moe_segment_keyed && warmup_n_nodes != cgraph->n_nodes\)"),
+    )
+    if decided < 0:
+        problems.append("graph_compute does not decide keyed mode once per call")
+    for label, pattern in exempt:
+        m = re.search(pattern, compute)
+        if not m:
+            problems.append("keyed splits are not exempt from the %s" % label)
+        elif decided >= 0 and m.start() < decided:
+            problems.append("the %s exemption is tested before keyed mode is decided" % label)
+    if not re.search(r"if \(moe_segment_keyed\)\s*\{[\s\S]*?\}\s*else if \(is_decode_phase\)\s*\{\s*"
+                     r"compute_impl_unlocked\(\);\s*\}\s*else if \(segments_match\)\s*\{", compute):
+        problems.append("a decode split can reach the one-slot segmented path (keyed first, churned decode direct)")
+    if not re.search(r"return mul_mat_id_not_recordable \? GGML_SYCL_GRAPH_COMPAT_SEGMENTED_ONLY : "
+                     r"GGML_SYCL_GRAPH_COMPAT_WHOLE_GRAPH;\s*$", compat):
+        problems.append("check_graph_compatibility does not report an unrecordable MUL_MAT_ID as segmented-only")
+    if re.search(r"mul_mat_id_not_recordable = true;\s*return", compat):
+        problems.append("an unrecordable MUL_MAT_ID still ends the scan early")
+    if not re.search(r"use_sycl_graph\s*=\s*compat == GGML_SYCL_GRAPH_COMPAT_WHOLE_GRAPH \|\|\s*"
+                     r"\(compat == GGML_SYCL_GRAPH_COMPAT_SEGMENTED_ONLY && cached_is_decode &&\s*"
+                     r"ggml_sycl_segmented_graph_env_allows\(\)\);", compute):
+        problems.append("the entry admits a segmented-only graph outside decode or the segmented env")
+    if "check_graph_compatibility(ctx_, cgraph_) != GGML_SYCL_GRAPH_COMPAT_WHOLE_GRAPH" not in code:
+        problems.append("the dense range recorder accepts a graph that is not whole-graph recordable")
+    return problems
+
+
+with gate('keyed-segment-slots'):
+    problems = check_keyed_segment_slots(RUNTIME_CODE)
+    assert not problems, "\n".join(problems)
+    controls = {
+        "memo applies to keyed": ("if (!moe_segment_keyed && is_decode_phase && sycl_ctx->moe_graph_rerecord &&",
+                                  "if (is_decode_phase && sycl_ctx->moe_graph_rerecord &&"),
+        "'#' trip applies to keyed": ("if (!moe_segment_keyed && !sycl_ctx->exec_graph_replay_futile &&",
+                                      "if (!sycl_ctx->exec_graph_replay_futile &&"),
+        "futile return applies to keyed": ("if (!moe_segment_keyed && sycl_ctx->exec_graph_replay_futile) {",
+                                           "if (sycl_ctx->exec_graph_replay_futile) {"),
+        "preload applies to keyed": ("if (!moe_segment_keyed) {\n            if (!graph_preload_moe_experts(",
+                                     "{\n            if (!graph_preload_moe_experts("),
+        "warmup applies to keyed": ("if (!moe_segment_keyed && warmup_n_nodes != cgraph->n_nodes)",
+                                    "if (warmup_n_nodes != cgraph->n_nodes)"),
+        "keyed mode outlives churn": (" &&\n           !ctx->moe_segment_slots.churned();", ";"),
+        "MUL_MAT_ID vetoes segmented": ("return mul_mat_id_not_recordable ? GGML_SYCL_GRAPH_COMPAT_SEGMENTED_ONLY :",
+                                        "return mul_mat_id_not_recordable ? GGML_SYCL_GRAPH_COMPAT_NONE :"),
+        "prompt admits segmented-only": ("(compat == GGML_SYCL_GRAPH_COMPAT_SEGMENTED_ONLY && cached_is_decode &&",
+                                         "(compat == GGML_SYCL_GRAPH_COMPAT_SEGMENTED_ONLY &&"),
+        "dense recorder admits segmented-only": ("check_graph_compatibility(ctx_, cgraph_) != GGML_SYCL_GRAPH_COMPAT_WHOLE_GRAPH",
+                                                 "check_graph_compatibility(ctx_, cgraph_) == GGML_SYCL_GRAPH_COMPAT_NONE"),
+    }
+    for label, (old, new) in controls.items():
+        assert RUNTIME_CODE.count(old) == 1, "control %r anchor appears %d times" % (label, RUNTIME_CODE.count(old))
+        assert check_keyed_segment_slots(RUNTIME_CODE.replace(old, new)), "control %r was not caught" % label
+    _churned = re.compile(r"\}\s*else if \(is_decode_phase\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*"
+                          r"(else if \(segments_match\)\s*\{)")
+    assert len(_churned.findall(RUNTIME_CODE)) == 1
+    assert check_keyed_segment_slots(_churned.sub(r"} \1", RUNTIME_CODE)), \
+        "control 'churned decode takes the one-slot path' was not caught"
+    print("PASS keyed-segment-slots-source-gate (%d controls caught)" % (len(controls) + 1))
 
 with gate('moe-metadata'):
     # Metadata and its derived group registry are built locally and atomically

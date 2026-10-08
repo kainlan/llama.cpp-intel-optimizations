@@ -19,6 +19,7 @@
 #include "ggml-sycl.h"
 #include "graph-prestage-decline-memo.hpp"
 #include "graph-safe-memcpy-width.hpp"
+#include "graph-segment-cache.hpp"
 #include "kv-offload.hpp"
 #include "layer-streaming.hpp"
 #include "mem-handle.hpp"
@@ -61,6 +62,9 @@
 
 struct ggml_backend_sycl_context;
 bool ggml_sycl_retire_moe_graph_epoch(ggml_backend_sycl_context * ctx) noexcept;
+// Drains the queue, then destroys every per-split segment slot (llama.cpp-7pm2 B2). False when the drain failed:
+// the slots are kept, since their graphs may still be running.
+bool ggml_sycl_retire_moe_segment_slots(ggml_backend_sycl_context * ctx) noexcept;
 
 namespace ggml_sycl {
 class L2PrefetchManager;  // Forward declaration for l2-prefetch.hpp
@@ -6321,6 +6325,18 @@ struct ggml_backend_sycl_context {
         std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph;
     };
 
+    // One decode split's recorded segments (llama.cpp-7pm2 B2), owned by moe_segment_slots under that split's key.
+    // retained_handles is declared first so it is destroyed last: every allocation a segment graph baked a pointer
+    // to (sink retentions, pool scratch freed while recording, Q8 scratch, weight handles) outlives the graphs, and
+    // the graphs are destroyed only after a queue drain (ggml_sycl_retire_moe_segment_slots).
+    struct moe_segment_slot {
+        std::vector<ggml_sycl::mem_handle> retained_handles;
+        std::vector<moe_graph_segment>     segments;
+        std::vector<int>                   boundary_nodes;  // dispatched directly between segments
+        std::vector<int32_t>               input_refs;      // graph inputs: leaf i as i, node n src j as -(n*S+j)-1
+        int                                graphed_segments = 0;
+    };
+
     struct moe_graph_moe_dispatch {
         int      node_idx;      // Fused MoE dispatch boundary in cgraph->nodes[]
         uint64_t graph_hash;    // Structural cgraph signature at record time
@@ -6377,6 +6393,8 @@ struct ggml_backend_sycl_context {
     bool                                moe_segments_failed_is_decode     = false;
     bool                                moe_segments_failed_valid         = false;
     bool                                moe_segments_failed_logged        = false;
+    // Decode splits' segments, one slot per split key (llama.cpp-7pm2 B2). Replaces moe_segments for decode.
+    ggml_sycl::graph_segment_cache::slot_cache<moe_segment_slot> moe_segment_slots;
 
     // Direct decode graphlets cache only the fused MoE descriptor dispatches.
     // They are independent from segmented non-MoE graph replay and are safe to
@@ -6416,6 +6434,10 @@ struct ggml_backend_sycl_context {
     // caller (the staging-swap gateway) must not trust them and declines; the failure also sets the disabled flag.
     bool invalidate_moe_segments() {
         if (!ggml_sycl_retire_moe_graph_epoch(this)) {
+            moe_graphs_disabled = true;
+            return false;
+        }
+        if (!ggml_sycl_retire_moe_segment_slots(this)) {
             moe_graphs_disabled = true;
             return false;
         }

@@ -1932,12 +1932,12 @@ static int test_default_ready_block_graphlet_safety_contract() {
     const std::string sycl   = read_required_file("ggml/src/ggml-sycl/ggml-sycl.cpp");
     const std::string common = read_required_file("ggml/src/ggml-sycl/common.hpp");
 
-    const std::string block_region = required_region(sycl, "static uint64_t moe_graph_block_identity_signature",
-                                                     "static bool check_graph_compatibility",
-                                                     "block graphlet implementation");
-    const std::string try_fn = required_region(sycl, "static bool moe_graph_try_block_graphlets",
-                                               "static bool check_graph_compatibility",
-                                               "block graphlet try implementation");
+    const std::string block_region =
+        required_region(sycl, "static uint64_t moe_graph_block_identity_signature",
+                        "static ggml_sycl_graph_compat check_graph_compatibility", "block graphlet implementation");
+    const std::string try_fn =
+        required_region(sycl, "static bool moe_graph_try_block_graphlets",
+                        "static ggml_sycl_graph_compat check_graph_compatibility", "block graphlet try implementation");
     const std::string descriptor_capture = required_region(
         sycl, "static bool moe_block_graphlet_descriptor_capture_enabled",
         "static bool moe_descriptor_capture_probe_enabled", "block graphlet descriptor capture helper");
