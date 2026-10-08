@@ -581,8 +581,9 @@ with gate('futile-context-direct'):
              "moe_decode_segmented_graph_profitable(cgraph)", "moe_decode_segmented_graph_analyze(cgraph)")
     for scan in scans:
         assert futile.end() < compute.index(scan) < graph_branch, scan
-    assert futile.end() < compute.index("ggml_sycl_graph_signature(cgraph)", graph_branch)
-    assert futile.end() < compute.index("sycl_exec_graph_make_key(", graph_branch)
+    # The signature hash and the exec-graph key are first computed inside the graph branch, never on the way to it.
+    for call in ("ggml_sycl_graph_signature(cgraph)", "sycl_exec_graph_make_key("):
+        assert graph_branch < compute.index(call, futile.end()), call
     # Every scan between the decision and the graph branch is skipped for a futile context: either it needs
     # use_sycl_graph, or it is guarded on the flag itself.
     policy = compute[futile.end():graph_branch]
