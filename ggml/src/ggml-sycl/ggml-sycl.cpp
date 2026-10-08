@@ -99127,6 +99127,24 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
     return false;
 }
 
+// llama.cpp-7pm2 B1: the segment boundary owns the pending-slot flush. Direct dispatch publishes a deferred
+// CPU-expert, secondary-device, CPU-pipeline or host-attention result in the per-node host code, at the first
+// node that reads it (flush_pending_*_if_consumed). A recorded segment has no per-node host code: replayed, it
+// would read the MoE output before its H2D scatter lands, and a flush reached while recording would capture a
+// pinned-pool H2D (and a host join) into the graph. So every active slot is flushed here, on the host, before a
+// segment is recorded and before one is replayed. The H2D copies go to the same in-order queue the segment is
+// then submitted to, which orders them ahead of it without a host wait on the device. Direct segments and MoE
+// boundary nodes keep the per-node flushes and do not call this.
+static void moe_graph_segment_boundary_flush(int device) {
+    flush_pending_cpu_scatter();
+    flush_pending_cpu_pipeline();
+    if (ggml_sycl_pipeline_moe_enabled()) {
+        pipeline_scatter_drain();
+    }
+    wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());
+    flush_pending_attn_dispatch(device);
+}
+
 // Record segmented graphs for a MoE compute graph.
 // Called after warmup when we know the graph topology is stable.
 // Returns true on success, false on failure (caller should fall back).
@@ -99274,6 +99292,8 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
             continue;
         }
 
+        // Publish every pending result before the queue enters recording mode (B1, above).
+        moe_graph_segment_boundary_flush(sycl_ctx->device);
         const size_t retained_baseline = sycl_ctx->graph_retained_handles.size();
         bool segment_submitted = false;
         struct recording_depth_owner {
@@ -99567,6 +99587,8 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
             // Replay this segment
             const auto & seg = sycl_ctx->moe_segments[seg_idx];
             if (seg.exec_graph) {
+                // The recorded segment runs no per-node flush: publish pending results first (B1).
+                moe_graph_segment_boundary_flush(sycl_ctx->device);
                 stream->ext_oneapi_graph(*seg.exec_graph);
                 GGML_SYCL_DEBUG(
                     "[SYCL-SEG] Replayed segment %zu "

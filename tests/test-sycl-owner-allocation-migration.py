@@ -609,6 +609,84 @@ with gate('futile-context-direct'):
                      r"moe_block_graphlet_requested_size\(sycl_ctx->device\)\s*>\s*0\)", direct)
     print("PASS futile-context-direct-source-gate")
 
+def check_segment_boundary_flush(code: str) -> list:
+    """llama.cpp-7pm2 B1: a recorded segment runs no per-node host code, so the segment boundary owns the
+    pending-slot flush. It runs before the queue enters recording mode (a flush inside the recording would
+    capture a pinned-pool H2D and a host join into the graph) and before every recorded segment is replayed
+    (the replay would otherwise read a CPU MoE output before its H2D scatter lands). Direct segments keep the
+    per-node flushes. `code` is ggml-sycl.cpp with comments blanked."""
+    problems = []
+    call = "moe_graph_segment_boundary_flush(sycl_ctx->device);"
+    try:
+        helper = region(code, "static void moe_graph_segment_boundary_flush(int device) {", "\n}\n")
+        record = region(code, "static bool moe_graph_record_segments(", "struct moe_decode_segmented_graph_stats {")
+        replay = region(code, "static void moe_graph_replay_segments(", "static bool graph_prestage_or_decline(")
+    except ValueError as error:
+        return [str(error)]
+    for flush in ("flush_pending_cpu_scatter();", "flush_pending_cpu_pipeline();", "pipeline_scatter_drain();",
+                  "wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());",
+                  "flush_pending_attn_dispatch(device);"):
+        if flush not in helper:
+            problems.append("boundary flush helper does not run %s" % flush)
+    if code.count(call) != 2:
+        problems.append("expected the boundary flush at exactly 2 sites (record, replay), found %d" % code.count(call))
+    # Record: after the direct-segment branch has continued, before the segment graph exists and records.
+    direct = record.find("if (seg_size < MIN_SEGMENT_NODES || direct_fa_segment) {")
+    skip = record.find("continue;", direct)
+    flush = record.find(call)
+    graph = record.find("sycl_ex::command_graph seg_graph(")
+    begin = record.find("seg_graph.begin_recording(")
+    end = record.find("seg_graph.end_recording();")
+    if min(direct, skip, flush, graph, begin, end) < 0:
+        problems.append("record: an anchor is missing (direct=%d skip=%d flush=%d graph=%d begin=%d end=%d)" % (
+            direct, skip, flush, graph, begin, end))
+    elif not (direct < skip < flush < graph < begin < end):
+        problems.append("record: the flush must follow the direct-segment branch and precede the segment graph "
+                        "(skip=%d flush=%d graph=%d begin=%d)" % (skip, flush, graph, begin))
+    elif call in record[begin:end] or "flush_pending_" in record[begin:end]:
+        problems.append("record: a pending-slot flush runs while the queue is recording")
+    # Replay: inside the recorded-segment branch, before the submission; not in the direct branch.
+    graphed = replay.find("if (seg.exec_graph) {")
+    submit = replay.find("stream->ext_oneapi_graph(*seg.exec_graph);")
+    direct_branch = replay.find("} else {", graphed)
+    flush = replay.find(call)
+    if min(graphed, submit, direct_branch, flush) < 0:
+        problems.append("replay: an anchor is missing (graphed=%d submit=%d else=%d flush=%d)" % (
+            graphed, submit, direct_branch, flush))
+    elif not (graphed < flush < submit < direct_branch):
+        problems.append("replay: the flush must precede the recorded segment's submission "
+                        "(graphed=%d flush=%d submit=%d)" % (graphed, flush, submit))
+    return problems
+
+
+with gate('segment-boundary-flush'):
+    problems = check_segment_boundary_flush(RUNTIME_CODE)
+    assert not problems, "\n".join(problems)
+    # Controls: each broken ordering must be reported, or a pass above proves nothing.
+    _call = "moe_graph_segment_boundary_flush(sycl_ctx->device);"
+    _record_flush = "        " + _call + "\n        const size_t retained_baseline"
+    _replay_flush = "                " + _call + "\n                stream->ext_oneapi_graph(*seg.exec_graph);"
+    assert RUNTIME_CODE.count(_record_flush) == 1 and RUNTIME_CODE.count(_replay_flush) == 1
+    _begin = "            seg_graph.begin_recording(*stream);\n"
+    controls = {
+        "record flush dropped": RUNTIME_CODE.replace(_record_flush, "        const size_t retained_baseline"),
+        "record flush inside the recording": RUNTIME_CODE.replace(_record_flush, "        const size_t retained_baseline")
+            .replace(_begin, _begin + "            " + _call + "\n"),
+        "replay flush dropped": RUNTIME_CODE.replace(_replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);"),
+        "replay flush after the submission": RUNTIME_CODE.replace(
+            _replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);\n                " + _call),
+        "attention slot not flushed": RUNTIME_CODE.replace(
+            "flush_pending_secondary_scatter());\n    flush_pending_attn_dispatch(device);\n}",
+            "flush_pending_secondary_scatter());\n}"),
+        "CPU scatter slots not flushed": RUNTIME_CODE.replace(
+            "static void moe_graph_segment_boundary_flush(int device) {\n    flush_pending_cpu_scatter();\n",
+            "static void moe_graph_segment_boundary_flush(int device) {\n"),
+    }
+    for label, mutated in controls.items():
+        assert mutated != RUNTIME_CODE, "control %r did not apply" % label
+        assert check_segment_boundary_flush(mutated), "control %r was not caught" % label
+    print("PASS segment-boundary-flush-source-gate (%d controls caught)" % len(controls))
+
 with gate('moe-metadata'):
     # Metadata and its derived group registry are built locally and atomically
     # swapped under both writer locks; bad_alloc preserves the old epoch.
@@ -842,4 +920,4 @@ with gate('internal-backing-mint-stays-private'):
     problems = check_internal_backing_mint_stays_private(CACHE)
     assert not problems, "\n".join(problems)
 
-finish(min_checks=61)
+finish(min_checks=62)
