@@ -17396,10 +17396,13 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 dispatch_ids  = nullptr;
                 ids_nb0       = 0;
                 ids_nb1       = 0;
+                // Read once: every batch-1 decode op on the direct route passes here.
+                static const bool row_agg_debug = [] {
+                    const char * env = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
+                    return env && std::atoi(env) != 0;
+                }();
                 static std::atomic<int> compact_log{ 0 };
-                const char *            row_agg_debug = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
-                if (row_agg_debug && std::atoi(row_agg_debug) != 0 &&
-                    compact_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+                if (row_agg_debug && compact_log.fetch_add(1, std::memory_order_relaxed) < 32) {
                     fprintf(stderr,
                             "[MOE-ROW-AGG] stage=compact path=mmvq_compact tensor=%s layout=%d "
                             "entries=%d total_batches=%lld topk=%lld tokens=%lld device=%d\n",

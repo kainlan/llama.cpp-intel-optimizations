@@ -21582,6 +21582,25 @@ static void moe_layer_group_profile_record(const moe_layer_decode_plan &      pl
 }
 
 static thread_local std::unordered_map<int, moe_gate_up_pair> g_moe_gate_up_pairs;
+
+// The one op that may reuse the activation row dst's MUL_MAT_ID copied to
+// host, from the current graph's gate/up scan; see moe_shared_act_sibling_of().
+static const void * moe_shared_act_sibling(const ggml_tensor * dst) {
+    if (!dst || !dst->src[0]) {
+        return nullptr;
+    }
+    const auto it = g_moe_gate_up_pairs.find(parse_layer_id_from_name(dst->src[0]->name));
+    if (it == g_moe_gate_up_pairs.end()) {
+        return ggml_sycl::moe_shared_act_sibling_of(nullptr, dst, dst->src[1]);
+    }
+    const moe_gate_up_pair &     pair = it->second;
+    ggml_sycl::moe_gate_up_nodes nodes;
+    nodes.gate_dst  = pair.gate_dst;
+    nodes.gate_src1 = pair.gate_dst ? pair.gate_dst->src[1] : nullptr;
+    nodes.up_dst    = pair.up_dst;
+    nodes.up_src1   = pair.up_dst ? pair.up_dst->src[1] : nullptr;
+    return ggml_sycl::moe_shared_act_sibling_of(&nodes, dst, dst->src[1]);
+}
 // llama.cpp-3hs5: per (layer, device, role) generation at which an in-line
 // RESTORE-T1 decode pointer-table build (see ggml_sycl_mul_mat_id) was last
 // attempted and FAILED -- either ggml_sycl_update_moe_ptr_table() itself
@@ -22117,6 +22136,16 @@ struct pending_cpu_scatter {
     bool owns_buffers;  // Whether flush should free out_pinned/act_pinned
     bool active;        // Whether there's a pending scatter
 
+    // What the pending CPU job holds while it runs (llama.cpp-yx28): its pool
+    // span in entries of its own K/N row geometry, and the shared activation
+    // staging contents it reads (act_serial, when shares_activation).
+    size_t   pool_first        = 0;
+    size_t   pool_count        = 0;
+    int64_t  row_k             = 0;
+    int64_t  row_n             = 0;
+    uint64_t act_serial        = 0;
+    bool     shares_activation = false;
+
     // Deferred scatter tracking: the MUL_MAT_ID output tensor that this
     // scatter writes to.  Used by selective flush to skip flushing when
     // the next op doesn't consume our destination tensor.
@@ -22157,6 +22186,45 @@ struct pending_cpu_scatter {
 static thread_local pending_cpu_scatter      g_pending_scatter = {};
 static thread_local std::vector<sycl::event> g_cpu_tg_direct_pending_scatter;
 
+// llama.cpp-yx28: the second pending slot. Decode gate's CPU job moves here
+// when up is issued without joining it (moe_sibling_pending_keep() in
+// moe-decode-hostpath.hpp states when that is safe). It is always the older
+// of the two, so every flush drains it first. Each slot keeps its own
+// prev_bufs.
+static thread_local pending_cpu_scatter g_pending_scatter_sibling = {};
+
+// Counts flushes that enqueued a scatter H2D. An activation copy records the
+// count it was made at; see moe_shared_act_reusable().
+static thread_local uint64_t g_cpu_scatter_serial = 0;
+
+// Neither counter is ever reset, so a value names one event for the life of
+// the thread: a serial names one rewrite of the shared activation staging, an
+// epoch one graph compute. A reset would let a new copy or graph repeat an
+// old value and pass a comparison meant to tell them apart.
+static thread_local uint64_t g_moe_shared_act_serial = 0;
+static thread_local uint64_t g_moe_graph_epoch       = 0;
+
+// The shared decode activation staging's contents: the src1 storage it was
+// copied from (a graph-local lease) and that copy's event. Cleared at every
+// graph boundary by ggml_sycl_cpu_tg_flush_pending().
+struct moe_shared_act_state {
+    ggml_sycl::moe_shared_act_record record;
+    ggml_sycl::mem_handle            source;
+    sycl::event                      d2h;
+};
+
+static thread_local moe_shared_act_state g_moe_shared_act;
+
+// A new graph compute: the staging no longer holds a row of this graph, and
+// node pointers may repeat (graph reuse), so the epoch moves on. compute_impl
+// reaches it through ggml_sycl_cpu_tg_flush_pending(); segmented replay and
+// moe_graph_try_block_graphlets(), which bypass compute_impl, call it beside
+// their other per-graph invalidations.
+static void moe_shared_act_new_graph() {
+    g_moe_shared_act = {};
+    ++g_moe_graph_epoch;
+}
+
 // Result struct for async CPU expert dispatch.  Carries compute output and
 // metadata from the async thread back to the main thread so the main thread
 // can populate g_pending_scatter (which is thread_local and therefore not
@@ -22173,6 +22241,13 @@ struct cpu_dispatch_result {
     bool                                            from_pool    = false;
     bool                                            owns_buffers = true;
     bool                                            valid        = false;
+    // See pending_cpu_scatter's fields of the same names.
+    size_t                                          pool_first        = 0;
+    size_t                                          pool_count        = 0;
+    int64_t                                         row_k             = 0;
+    int64_t                                         row_n             = 0;
+    uint64_t                                        act_serial        = 0;
+    bool                                            shares_activation = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -23542,8 +23617,8 @@ static bool ggml_sycl_moe_fusion_enabled() {
 // Free deferred buffers from a previous async scatter.  By the time this
 // is called, the in-order compute queue has processed at least one kernel
 // after the memcpys, guaranteeing the copies have completed.
-static void flush_prev_scatter_bufs() {
-    auto & pb = g_pending_scatter.prev_bufs;
+static void flush_prev_scatter_bufs(pending_cpu_scatter & slot) {
+    auto & pb = slot.prev_bufs;
     if (!pb.pending) {
         return;
     }
@@ -23583,22 +23658,28 @@ static void flush_prev_scatter_bufs() {
     pb.pending = false;
 }
 
-static void flush_pending_cpu_scatter() {
-    if (!g_pending_scatter.active) {
+static void flush_prev_scatter_bufs() {
+    flush_prev_scatter_bufs(g_pending_scatter_sibling);
+    flush_prev_scatter_bufs(g_pending_scatter);
+}
+
+static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
+    if (!slot.active) {
         return;
     }
 
     // Free buffers from the PREVIOUS async scatter (safe now — in-order
     // queue has processed past those memcpys).
-    flush_prev_scatter_bufs();
+    flush_prev_scatter_bufs(slot);
+    ++g_cpu_scatter_serial;
 
     using hrc = std::chrono::high_resolution_clock;
     auto t0   = hrc::now();
 
     try {
         // Wait for CPU compute to finish
-        if (g_pending_scatter.future.valid()) {
-            g_pending_scatter.future.get();
+        if (slot.future.valid()) {
+            slot.future.get();
         }
 
         auto t1 = hrc::now();  // After CPU future.get()
@@ -23609,27 +23690,27 @@ static void flush_pending_cpu_scatter() {
         // to let the host proceed to dispatch the next layer immediately.
         double total_bytes = 0;
         int    n_entries   = 0;
-        g_pending_scatter.scatter_events.clear();
+        slot.scatter_events.clear();
         // Both producers of an active pending scatter set a stream and an output buffer.  A pending
         // scatter without them used to be skipped quietly, which loses its host-expert rows
         // (llama.cpp-93tw).
-        GGML_ASSERT(g_pending_scatter.stream && g_pending_scatter.out_pinned &&
+        GGML_ASSERT(slot.stream && slot.out_pinned &&
                     "pending CPU scatter has no stream or output staging; its host-expert rows would be dropped "
                     "(llama.cpp-93tw)");
         {
             // Batch contiguous scatter entries into single memcpy calls.
             // Source (out_pinned) is always contiguous; check if destination
             // addresses are also contiguous to merge.
-            const auto &  entries  = g_pending_scatter.entries;
-            const float * src_base = g_pending_scatter.out_pinned;
+            const auto &  entries  = slot.entries;
+            const float * src_base = slot.out_pinned;
             size_t        i        = 0;
             while (i < entries.size()) {
                 // Every entry names its destination; skipping one would drop that row (llama.cpp-93tw).
                 GGML_ASSERT(entries[i].dst_device &&
                             "pending CPU scatter entry has no destination; its row would be dropped (llama.cpp-93tw)");
-                if (!entries[i].dst_handle.valid() || !g_pending_scatter.out_handle.valid()) {
+                if (!entries[i].dst_handle.valid() || !slot.out_handle.valid()) {
                     GGML_ABORT("[CPU-TG] Deferred scatter missing smart mem_handle for dst=%p device=%d",
-                               entries[i].dst_device, g_pending_scatter.device_id);
+                               entries[i].dst_device, slot.device_id);
                 }
                 // Start a new batch from entry i. Raw dst pointers are retained
                 // for contiguity checks only; the copy is submitted through
@@ -23651,9 +23732,9 @@ static void flush_pending_cpu_scatter() {
                     src_base += entries[j].N;
                     j++;
                 }
-                g_pending_scatter.scatter_events.push_back(
-                    ggml_sycl::mem_copy_async(batch_dst_handle, batch_dst_offset, g_pending_scatter.out_handle,
-                                              batch_src_offset, batch_N * sizeof(float), *g_pending_scatter.stream));
+                slot.scatter_events.push_back(ggml_sycl::mem_copy_async(batch_dst_handle, batch_dst_offset,
+                                                                        slot.out_handle, batch_src_offset,
+                                                                        batch_N * sizeof(float), *slot.stream));
                 total_bytes += static_cast<double>(batch_N) * sizeof(float);
                 n_entries++;
                 i = j;
@@ -23679,18 +23760,18 @@ static void flush_pending_cpu_scatter() {
     // yet.  Move buffers to prev_bufs for cleanup at the next flush call
     // (by then, the in-order queue guarantees completion).
     {
-        auto & pb         = g_pending_scatter.prev_bufs;
-        pb.scatter_events = std::move(g_pending_scatter.scatter_events);
-        if (g_pending_scatter.owns_buffers) {
-            pb.out           = g_pending_scatter.out_pinned;
-            pb.act           = g_pending_scatter.act_pinned;
-            pb.weight        = g_pending_scatter.weight_pinned;
-            pb.out_handle    = std::move(g_pending_scatter.out_handle);
-            pb.act_handle    = std::move(g_pending_scatter.act_handle);
-            pb.weight_handle = std::move(g_pending_scatter.weight_handle);
-            pb.ctx           = g_pending_scatter.sycl_ctx;
-            pb.dev_id        = g_pending_scatter.device_id;
-            pb.pool          = g_pending_scatter.from_pool;
+        auto & pb         = slot.prev_bufs;
+        pb.scatter_events = std::move(slot.scatter_events);
+        if (slot.owns_buffers) {
+            pb.out           = slot.out_pinned;
+            pb.act           = slot.act_pinned;
+            pb.weight        = slot.weight_pinned;
+            pb.out_handle    = std::move(slot.out_handle);
+            pb.act_handle    = std::move(slot.act_handle);
+            pb.weight_handle = std::move(slot.weight_handle);
+            pb.ctx           = slot.sycl_ctx;
+            pb.dev_id        = slot.device_id;
+            pb.pool          = slot.from_pool;
         } else {
             pb.out           = nullptr;
             pb.act           = nullptr;
@@ -23699,26 +23780,87 @@ static void flush_pending_cpu_scatter() {
             pb.act_handle    = {};
             pb.weight_handle = {};
             pb.ctx.reset();
-            pb.dev_id = g_pending_scatter.device_id;
+            pb.dev_id = slot.device_id;
             pb.pool   = false;
         }
-        pb.pending = !pb.scatter_events.empty() || g_pending_scatter.owns_buffers;
+        pb.pending = !pb.scatter_events.empty() || slot.owns_buffers;
     }
 
-    g_pending_scatter.entries.clear();
-    g_pending_scatter.tasks.clear();
-    g_pending_scatter.out_pinned    = nullptr;
-    g_pending_scatter.act_pinned    = nullptr;
-    g_pending_scatter.weight_pinned = nullptr;
-    g_pending_scatter.out_handle    = {};
-    g_pending_scatter.act_handle    = {};
-    g_pending_scatter.weight_handle = {};
-    g_pending_scatter.scatter_events.clear();
-    g_pending_scatter.stream = nullptr;
-    g_pending_scatter.sycl_ctx.reset();
-    g_pending_scatter.active       = false;
-    g_pending_scatter.owns_buffers = true;
-    g_pending_scatter.dst_tensor   = nullptr;
+    slot.entries.clear();
+    slot.tasks.clear();
+    slot.out_pinned    = nullptr;
+    slot.act_pinned    = nullptr;
+    slot.weight_pinned = nullptr;
+    slot.out_handle    = {};
+    slot.act_handle    = {};
+    slot.weight_handle = {};
+    slot.scatter_events.clear();
+    slot.stream = nullptr;
+    slot.sycl_ctx.reset();
+    slot.active            = false;
+    slot.owns_buffers      = true;
+    slot.dst_tensor        = nullptr;
+    slot.pool_first        = 0;
+    slot.pool_count        = 0;
+    slot.row_k             = 0;
+    slot.row_n             = 0;
+    slot.act_serial        = 0;
+    slot.shares_activation = false;
+}
+
+// Older slot first: gate's scatter is enqueued ahead of up's.
+static void flush_pending_cpu_scatter() {
+    flush_pending_cpu_scatter_slot(g_pending_scatter_sibling);
+    flush_pending_cpu_scatter_slot(g_pending_scatter);
+}
+
+// Hands the primary slot's pending job to the empty sibling slot; each slot
+// keeps its own prev_bufs.
+static void move_pending_cpu_scatter_to_sibling() {
+    pending_cpu_scatter & from = g_pending_scatter;
+    pending_cpu_scatter & to   = g_pending_scatter_sibling;
+    GGML_ASSERT(from.active && !to.active && "sibling CPU scatter slot is occupied (llama.cpp-yx28)");
+    to.future            = std::move(from.future);
+    to.out_pinned        = from.out_pinned;
+    to.act_pinned        = from.act_pinned;
+    to.weight_pinned     = from.weight_pinned;
+    to.out_handle        = std::move(from.out_handle);
+    to.act_handle        = std::move(from.act_handle);
+    to.weight_handle     = std::move(from.weight_handle);
+    to.entries           = std::move(from.entries);
+    to.stream            = from.stream;
+    to.sycl_ctx          = std::move(from.sycl_ctx);
+    to.device_id         = from.device_id;
+    to.from_pool         = from.from_pool;
+    to.owns_buffers      = from.owns_buffers;
+    to.dst_tensor        = from.dst_tensor;
+    to.pool_first        = from.pool_first;
+    to.pool_count        = from.pool_count;
+    to.row_k             = from.row_k;
+    to.row_n             = from.row_n;
+    to.act_serial        = from.act_serial;
+    to.shares_activation = from.shares_activation;
+    to.active            = true;
+
+    from.future = {};
+    from.entries.clear();
+    from.out_pinned    = nullptr;
+    from.act_pinned    = nullptr;
+    from.weight_pinned = nullptr;
+    from.out_handle    = {};
+    from.act_handle    = {};
+    from.weight_handle = {};
+    from.stream        = nullptr;
+    from.sycl_ctx.reset();
+    from.active            = false;
+    from.owns_buffers      = true;
+    from.dst_tensor        = nullptr;
+    from.pool_first        = 0;
+    from.pool_count        = 0;
+    from.row_k             = 0;
+    from.row_n             = 0;
+    from.act_serial        = 0;
+    from.shares_activation = false;
 }
 
 // Selective flush: only flush if the pending scatter's destination tensor
@@ -23739,7 +23881,7 @@ static bool ggml_sycl_op_consumes_tensor(const ggml_tensor * consuming_dst, cons
 }
 
 static bool flush_pending_cpu_scatter_if_consumed(const ggml_tensor * consuming_dst, int device) {
-    if (!g_pending_scatter.active) {
+    if (!g_pending_scatter.active && !g_pending_scatter_sibling.active) {
         return false;
     }
     if (!consuming_dst) {
@@ -23756,20 +23898,20 @@ static bool flush_pending_cpu_scatter_if_consumed(const ggml_tensor * consuming_
     // with GPU work, overlapping CPU compute with GPU attention/normalization.
     // Previously tunable via GGML_SYCL_EXPERT_DEFER; now hardcoded on.
 
-    const ggml_tensor * pending_dst = g_pending_scatter.dst_tensor;
-    if (!pending_dst) {
+    // Either slot being consumed flushes both, older first.
+    const pending_cpu_scatter * slots[2] = { &g_pending_scatter_sibling, &g_pending_scatter };
+    for (const pending_cpu_scatter * slot : slots) {
+        if (!slot->active) {
+            continue;
+        }
         // No dst_tensor recorded — flush unconditionally (safety)
-        flush_pending_cpu_scatter();
-        return true;
+        if (!slot->dst_tensor || ggml_sycl_op_consumes_tensor(consuming_dst, slot->dst_tensor)) {
+            flush_pending_cpu_scatter();
+            return true;
+        }
     }
 
-    if (ggml_sycl_op_consumes_tensor(consuming_dst, pending_dst)) {
-        flush_pending_cpu_scatter();
-        return true;
-    }
-
-    GGML_SYCL_DEBUG("[MoE-DEFER] Deferring CPU scatter (pending=%s, op=%s)\n",
-                    pending_dst->name ? pending_dst->name : "?", consuming_dst->name ? consuming_dst->name : "?");
+    GGML_SYCL_DEBUG("[MoE-DEFER] Deferring CPU scatter (op=%s)\n", consuming_dst->name);
     return false;  // No overlap — defer the scatter
 }
 
@@ -24565,6 +24707,7 @@ void ggml_sycl_cpu_tg_flush_pending() {
     flush_pending_cpu_scatter();
     flush_prev_cpu_pipeline_bufs();  // Final cleanup for last deferred pipeline scatter
     flush_prev_scatter_bufs();       // Final cleanup for last async scatter
+    moe_shared_act_new_graph();      // graph-local: src1 storage is rewritten by the next graph
     if (ggml_sycl_pipeline_moe_enabled()) {
         pipeline_scatter_drain();
     }
@@ -57538,30 +57681,28 @@ static const void * const * moe_fusion_ensure_full_local_ptr_table_from_descript
     return ggml_sycl_upload_moe_transient_ptr_table(ctx, weight, slots, layer_hash, role.layout, &role.ready_events);
 }
 
-static const void * const * moe_fusion_ensure_full_local_ptr_table(ggml_backend_sycl_context & ctx,
-                                                                   const ggml_tensor *         weight,
-                                                                   int                         layer_hash,
-                                                                   layout_mode                 layout) {
-    const void * const * cached = moe_fusion_full_local_ptr_table(weight, ctx.device, layout);
-    if (cached) {
-        return cached;
+// Resolves every expert's storage record on ctx.device in `layout` and uploads
+// the full-coverage pointer table; records the full-local probe either way.
+// every_expert_resolved, when given, tells a nullptr result's two causes
+// apart: false when some expert has no on-device record at layout (a fact of
+// this storage generation), true when every expert resolved and the table
+// upload itself failed.
+static const void * const * moe_fusion_build_full_local_ptr_table(ggml_backend_sycl_context & ctx,
+                                                                  const ggml_tensor *         weight,
+                                                                  int                         layer_hash,
+                                                                  layout_mode                 layout,
+                                                                  bool * every_expert_resolved = nullptr) {
+    if (every_expert_resolved) {
+        *every_expert_resolved = false;
     }
     if (!weight || ctx.device < 0 || ctx.device >= GGML_SYCL_MAX_DEVICES) {
         return nullptr;
     }
-
     auto * extra = static_cast<ggml_tensor_extra_gpu *>(weight->extra);
     if (!extra) {
         return nullptr;
     }
-
     const uint64_t storage_generation = extra->weight().moe_expert_storage_generation;
-    if (extra->weight().moe_full_local_probe_generation[ctx.device] == storage_generation &&
-        extra->weight().moe_full_local_probe_layout[ctx.device] == layout &&
-        !extra->weight().moe_full_local_probe_ok[ctx.device]) {
-        return nullptr;
-    }
-
     const int64_t n_experts = weight->ne[2] > 0 ? weight->ne[2] : 1;
     if (n_experts <= 0) {
         return nullptr;
@@ -57590,12 +57731,170 @@ static const void * const * moe_fusion_ensure_full_local_ptr_table(ggml_backend_
         slot.has_ready_event = logical.has_ready_event;
         slots.push_back(std::move(slot));
     }
+    if (every_expert_resolved) {
+        *every_expert_resolved = true;
+    }
 
     const void * const * table = ggml_sycl_upload_moe_transient_ptr_table(ctx, weight, slots, layer_hash, layout);
     extra->weight().moe_full_local_probe_generation[ctx.device] = storage_generation;
     extra->weight().moe_full_local_probe_layout[ctx.device]     = layout;
     extra->weight().moe_full_local_probe_ok[ctx.device]         = table != nullptr;
     return table;
+}
+
+static const void * const * moe_fusion_ensure_full_local_ptr_table(ggml_backend_sycl_context & ctx,
+                                                                   const ggml_tensor *         weight,
+                                                                   int                         layer_hash,
+                                                                   layout_mode                 layout) {
+    const void * const * cached = moe_fusion_full_local_ptr_table(weight, ctx.device, layout);
+    if (cached) {
+        return cached;
+    }
+    if (!weight || ctx.device < 0 || ctx.device >= GGML_SYCL_MAX_DEVICES) {
+        return nullptr;
+    }
+
+    auto * extra = static_cast<ggml_tensor_extra_gpu *>(weight->extra);
+    if (!extra) {
+        return nullptr;
+    }
+
+    const uint64_t storage_generation = extra->weight().moe_expert_storage_generation;
+    if (extra->weight().moe_full_local_probe_generation[ctx.device] == storage_generation &&
+        extra->weight().moe_full_local_probe_layout[ctx.device] == layout &&
+        !extra->weight().moe_full_local_probe_ok[ctx.device]) {
+        return nullptr;
+    }
+    return moe_fusion_build_full_local_ptr_table(ctx, weight, layer_hash, layout);
+}
+
+// One eligibility decision of ggml_sycl_moe_decode_direct_table(). On
+// ELIGIBLE, *table and *layout hold the route.
+static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_decode_direct_decide(ggml_backend_sycl_context & ctx,
+                                                                               const ggml_tensor *         src0,
+                                                                               layout_mode *               layout,
+                                                                               const void * const **       table) {
+    const int    device = ctx.device;
+    const auto * extra  = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    // The batched pointer-table route is admitted only on a single routable
+    // device, as in the planner-owned route's planner_batched_ptr_table_safe.
+    if (ggml_sycl_get_tensor_usage(src0) != tensor_usage::MOE_EXPERT_WEIGHT || ggml_sycl_routable_device_count() > 1 ||
+        ggml_sycl_is_host_resident_weight(src0, ctx.stream())) {
+        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+    }
+    // The loaded layout is the answer: read it from expert 0's materialized
+    // records on this device, never from a layout policy. A record in a layout
+    // the batched kernel cannot read (a prompt-processing alternate) is a copy
+    // for another executor, not a candidate.
+    std::vector<int> expert0_layouts;
+    extra->moe_storage_layouts_on_device(0, device, expert0_layouts);
+    std::vector<int> readable_layouts;
+    for (int candidate : expert0_layouts) {
+        if (ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, static_cast<layout_mode>(candidate))) {
+            readable_layouts.push_back(candidate);
+        }
+    }
+    int materialized = 0;
+    if (!ggml_sycl::moe_decode_direct_layout_from_materialized(readable_layouts, &materialized)) {
+        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+    }
+    *layout = static_cast<layout_mode>(materialized);
+
+    // Fresh resolution of every expert's storage record at that layout: any
+    // expert not materialized there on this device refuses the route.
+    bool every_expert_resolved = false;
+    *table = moe_fusion_build_full_local_ptr_table(ctx, src0, moe_cache_layer_id(src0->name), *layout,
+                                                   &every_expert_resolved);
+    if (*table) {
+        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE;
+    }
+    return every_expert_resolved ? ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY :
+                                   ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+}
+
+// llama.cpp-yx28: the batch-1 decode direct route. When every expert of src0
+// is resident on ctx.device, decode dispatches from the full-coverage table
+// built here plus the device ids tensor: no ids readback, no table upload and
+// no host batch-ids upload per op. Eligibility and layout are decided once per
+// (replan epoch, expert storage generation, selected rows) and cached in the
+// tensor's weight extension; the steady state is the memoized
+// moe_fusion_full_local_ptr_table() query. The layout is the one expert 0 is
+// materialized in on the device, and the table build refuses unless every
+// expert resolves there in that layout. Returns nullptr when the tensor is
+// not eligible, and the caller keeps its existing route.
+static const void * const * ggml_sycl_moe_decode_direct_table(ggml_backend_sycl_context & ctx,
+                                                              const ggml_tensor *         src0,
+                                                              int64_t                     selected_rows,
+                                                              layout_mode *               layout_out) {
+    const int device = ctx.device;
+    auto *    extra  = src0 ? static_cast<ggml_tensor_extra_gpu *>(src0->extra) : nullptr;
+    if (!extra || !layout_out || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return nullptr;
+    }
+    ggml_sycl::moe_decode_direct_stamp & stamp              = extra->weight().moe_decode_direct[device];
+    const uint64_t                       replan_epoch       = ggml_sycl::moe_route_table_current_replan_epoch();
+    const uint64_t                       storage_generation = extra->weight().moe_expert_storage_generation;
+    if (ggml_sycl::moe_decode_direct_stamp_current(stamp, replan_epoch, storage_generation, selected_rows)) {
+        if (!stamp.eligible) {
+            return nullptr;
+        }
+        const layout_mode    layout = static_cast<layout_mode>(stamp.layout);
+        const void * const * table  = moe_fusion_full_local_ptr_table(src0, device, layout);
+        if (table) {
+            *layout_out = layout;
+            return table;
+        }
+        // Another route rewrote a slot of this tensor's shared table (the
+        // upload invalidates the full-local probe); rebuild it below.
+    }
+
+    // An empty plan is transient (the retained route republishes it), so it
+    // is not cached as a decision.
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
+        return nullptr;
+    }
+    layout_mode                                layout  = GGML_LAYOUT_AOS;
+    const void * const *                       table   = nullptr;
+    const ggml_sycl::moe_decode_direct_outcome outcome = ggml_sycl_moe_decode_direct_decide(ctx, src0, &layout, &table);
+    const ggml_sycl::moe_decode_direct_outcome settled = ggml_sycl::moe_decode_direct_stamp_settle(
+        stamp, replan_epoch, storage_generation, selected_rows, static_cast<int>(layout), outcome);
+    if (settled != outcome) {
+        static std::atomic<int> capped_log{ 0 };
+        if (capped_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+            GGML_LOG_INFO(
+                "[MOE-ROUTE] decode direct tensor=%s device=%d: table build failed %u times in a row; "
+                "using the existing route until the plan or expert storage changes\n",
+                src0->name, device, ggml_sycl::moe_decode_direct_retry_limit);
+        }
+    }
+    if (table) {
+        *layout_out = layout;
+    }
+    return table;
+}
+
+// The ids tensor's own device storage, or nullptr when it is not resident on
+// ctx.device. It never stages a host copy, so the decode direct route takes
+// no H2D and no host wait for ids; ggml_sycl_get_moe_ids_device_ptr_exact()
+// tries it before staging one. out_handle, when given, receives the storage
+// handle the pointer was resolved from.
+static const int32_t * ggml_sycl_moe_ids_device_resident_ptr(ggml_backend_sycl_context & ctx,
+                                                             const ggml_tensor *         ids,
+                                                             ggml_sycl::mem_handle *     out_handle = nullptr) {
+    ggml_sycl_tensor_storage_handle storage{};
+    if (!ids || !ggml_sycl_find_tensor_storage_handle(ids, ctx.device, &storage) || !storage.handle.valid() ||
+        storage.owner != ctx.device) {
+        return nullptr;
+    }
+    auto resolved = storage.handle.resolve(ctx.device);
+    if (!resolved || !resolved.ptr || !resolved.on_device) {
+        return nullptr;
+    }
+    if (out_handle) {
+        *out_handle = storage.handle;
+    }
+    return reinterpret_cast<const int32_t *>(static_cast<const char *>(resolved.ptr) + storage.view_offset);
 }
 
 static bool ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
@@ -58588,32 +58887,21 @@ static const int32_t * ggml_sycl_get_moe_ids_device_ptr_exact(ggml_backend_sycl_
     if (!ids) {
         return nullptr;
     }
-    ggml_sycl_tensor_storage_handle ids_storage_handle{};
-    if (ggml_sycl_find_tensor_storage_handle(ids, ctx.device, &ids_storage_handle) &&
-        ids_storage_handle.handle.valid() && ids_storage_handle.owner == ctx.device) {
-        auto resolved = ids_storage_handle.handle.resolve(ctx.device);
-        if (resolved && resolved.ptr && resolved.on_device) {
-            if (out_nb0) {
-                *out_nb0 = ids->nb[0];
-            }
-            if (out_nb1) {
-                *out_nb1 = ids->nb[1];
-            }
-            const int32_t * ids_device_ptr = reinterpret_cast<const int32_t *>(static_cast<const char *>(resolved.ptr) +
-                                                                               ids_storage_handle.view_offset);
-            if (out_device_handle) {
-                *out_device_handle = ids_storage_handle.handle;
-            }
-            if (ids_stage_profile) {
-                fprintf(
-                    stderr,
+    if (const int32_t * ids_device_ptr = ggml_sycl_moe_ids_device_resident_ptr(ctx, ids, out_device_handle)) {
+        if (out_nb0) {
+            *out_nb0 = ids->nb[0];
+        }
+        if (out_nb1) {
+            *out_nb1 = ids->nb[1];
+        }
+        if (ids_stage_profile) {
+            fprintf(stderr,
                     "[MOE-IDS-STAGE] tensor=%s device=%d bytes=%zu ptr_type=%d hostbuf=0 need_stage=0 "
                     "smart_handle=1 async=%d alloc_us=0.0 host_us=0.0 h2d_submit_us=0.0 wait_us=0.0 total_us=%.1f\n",
                     ids->name, ctx.device, ggml_nbytes(ids), (int) sycl::usm::alloc::device, allow_async ? 1 : 0,
                     ids_stage_us(ids_stage_t0, ids_stage_now()));
-            }
-            return ids_device_ptr;
         }
+        return ids_device_ptr;
     }
     const void * ids_storage = ggml_sycl_host_data(ids);
     if (!ids_storage) {
@@ -73205,6 +73493,58 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         s_mul_mat_id_extras.push_back(std::move(new_extra));
     }
 
+    // llama.cpp-yx28: batch-1 decode with every expert resident on this
+    // device. Dispatch straight from the cached full-coverage pointer table and
+    // the device ids tensor, ahead of the retained decode admission, whose ids
+    // readback, per-op table upload, host batch-ids upload, prefetch await and
+    // planner lookups this op does not need. It also runs ahead of
+    // ggml_sycl_ensure_weight_on_device(), whose composite pointer this route
+    // never reads. A refusal anywhere falls through to the existing route.
+    // This route records no expert warmup, predictor or popularity
+    // observations: it never reads the ids on the host, and reading them would
+    // bring back the readback it exists to remove. That is acceptable because
+    // the route runs only when every expert is already resident on the device,
+    // which the default planner preload provides, so no placement decision
+    // waits on those observations.
+    if (const ggml_tensor * ids = dst->src[2]) {
+        layout_mode                          direct_override = GGML_LAYOUT_AOS;
+        ggml_sycl::moe_decode_direct_request direct_request;
+        direct_request.src1_tokens     = src1->ne[2];
+        direct_request.ids_tokens      = ids->ne[1];
+        direct_request.ids_selected    = ids->ne[0];
+        direct_request.graph_recording = g_ggml_sycl_graph_recording;
+        direct_request.layout_override = ggml_sycl_layout_override_active(direct_override);
+        direct_request.dedicated_decode_route =
+            src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4;
+        if (ggml_sycl::moe_decode_direct_request_admissible(direct_request) && src1->type == GGML_TYPE_F32 &&
+            dst->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
+            !ggml_backend_buffer_is_sycl_split(src0->buffer)) {
+            const int64_t        selected_rows = ids->ne[0] * ids->ne[1];
+            layout_mode          direct_layout = GGML_LAYOUT_AOS;
+            const void * const * direct_table =
+                ggml_sycl_moe_decode_direct_table(ctx, src0, selected_rows, &direct_layout);
+            const int32_t * direct_ids = direct_table ? ggml_sycl_moe_ids_device_resident_ptr(ctx, ids) : nullptr;
+            if (direct_ids) {
+                ctx.moe_graphs_disabled_once = true;
+                const bool direct_ok         = mmvq_moe_batched_dispatch(
+                    ctx, src0, src1, dst, direct_table, nullptr, nullptr, nullptr, static_cast<int>(selected_rows),
+                    static_cast<int>(src0->ne[2]), ids->ne[0], direct_layout, direct_ids, ids->nb[0], ids->nb[1],
+                    nullptr, 0, nullptr, nullptr, nullptr);
+                if (direct_ok) {
+                    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                        static std::atomic<int> direct_log{ 0 };
+                        if (direct_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+                            GGML_LOG_INFO("[MOE-ROUTE] decode direct tensor=%s device=%d layout=%s rows=%lld\n",
+                                          src0->name, ctx.device, ggml_sycl_layout_mode_name(direct_layout),
+                                          (long long) selected_rows);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
     ggml_sycl_ensure_weight_on_device(src0, ctx.device);
     if (g_moe_profile_enabled) {
         g_moe_profile.moe_weight_load_done();
@@ -76854,15 +77194,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             //  - the pending CPU workers read the shared activation staging
             //    buffer directly (task.activations), and this op's D2H rewrites
             //    it and may reallocate it in ensure().
-            // ---------------------------------------------------------------
-            flush_pending_cpu_scatter();
-
-            // ---------------------------------------------------------------
-            // Shared activation D2H: for batch=1 TG, all experts in a layer
-            // share the same src1 activation. Copy once to host-pinned staging,
-            // shared between CPU dispatch and secondary GPU dispatch.
-            // Use sycl::event capture instead of stream->wait() so B580's
-            // compute pipeline continues executing during the D2H transfer.
+            // The one exception (llama.cpp-yx28) is decode up after gate: up
+            // reuses gate's activation copy, so it does no D2H at all, and its
+            // job may then run beside gate's (defer_entry_flush below; the
+            // final decision is moe_sibling_pending_keep() at CPU dispatch).
             // ---------------------------------------------------------------
             float *               shared_act_host = nullptr;
             sycl::event           act_d2h_event;
@@ -76881,28 +77216,86 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // buffers; they never use the PinnedBufferPool, so they neither reserve a pool span
             // nor depend on the pool's capacity.
             const bool immutable_host_recipe = src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4;
-            if (ne11 == 1 && src0->type != GGML_TYPE_Q1_0 && src0->type != GGML_TYPE_NVFP4 &&
-                (cpu_expert_tg_active || multi_gpu)) {
+            const bool shared_act_wanted = ne11 == 1 && src0->type != GGML_TYPE_Q1_0 && src0->type != GGML_TYPE_NVFP4 &&
+                                           (cpu_expert_tg_active || multi_gpu);
+            const size_t                    shared_act_bytes = static_cast<size_t>(K) * sizeof(float);
+            ggml_sycl_tensor_storage_handle shared_src1_storage{};
+            if (shared_act_wanted && !ggml_sycl_ensure_tensor_storage_handle(src1, ctx.device, &shared_src1_storage,
+                                                                             "MUL_MAT_ID shared activation", "src1")) {
+                if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                    GGML_LOG_WARN(
+                        "[MOE-ROUTE] shared activation missing smart src1 handle tensor=%s device=%d; "
+                        "refusing route\n",
+                        src1->name, ctx.device);
+                }
+                throw ggml_sycl_fallback_error("MUL_MAT_ID shared activation missing smart src1 handle");
+            }
+            auto shared_act_reusable = [&]() {
+                if (!shared_act_wanted || !cpu_shared_act || ggml_sycl_pipeline_cpu_enabled() ||
+                    !g_moe_shared_act.source.valid()) {
+                    return false;
+                }
+                ggml_sycl::moe_shared_act_query query;
+                query.src1_tensor    = src1;
+                query.op_dst         = dst;
+                query.same_source    = g_moe_shared_act.source.stable_identity_equal(shared_src1_storage.handle);
+                query.graph_epoch    = g_moe_graph_epoch;
+                query.scatter_serial = g_cpu_scatter_serial;
+                query.view_offset    = shared_src1_storage.view_offset;
+                query.bytes          = shared_act_bytes;
+                query.device         = ctx.device;
+                return ggml_sycl::moe_shared_act_reusable(g_moe_shared_act.record, query);
+            };
+            bool       reuse_shared_act  = shared_act_reusable();
+            const bool defer_entry_flush = reuse_shared_act && g_pending_scatter.active &&
+                                           !g_pending_scatter_sibling.active && g_pending_scatter.shares_activation &&
+                                           g_pending_scatter.act_serial == g_moe_shared_act.record.serial;
+            if (!defer_entry_flush) {
+                flush_pending_cpu_scatter();
+                reuse_shared_act = shared_act_reusable();  // a flush that enqueued an H2D voids it
+            }
+
+            // ---------------------------------------------------------------
+            // Shared activation D2H: for batch=1 TG, all experts in a layer
+            // share the same src1 activation. Copy once to host-pinned staging,
+            // shared between CPU dispatch and secondary GPU dispatch.
+            // Use sycl::event capture instead of stream->wait() so B580's
+            // compute pipeline continues executing during the D2H transfer.
+            // Decode gate and up read the same src1 row, so up reuses gate's
+            // copy instead of making its own (llama.cpp-yx28).
+            // ---------------------------------------------------------------
+            if (shared_act_wanted) {
                 static thread_local managed_host_pinned_buffer s_act_staging;
-                const size_t                                   needed = static_cast<size_t>(K) * sizeof(float);
-                if (s_act_staging.ensure(*stream, ctx.device, needed, ggml_sycl::alloc_role::EXPERT_STAGING,
-                                         ggml_sycl::runtime_category::HOST_COMPUTE, "moe_shared_activation_host")) {
+                if (reuse_shared_act) {
                     shared_act_handle = s_act_staging.as_mem_handle();
-                    ggml_sycl_tensor_storage_handle src1_storage{};
-                    if (!ggml_sycl_ensure_tensor_storage_handle(src1, ctx.device, &src1_storage,
-                                                                "MUL_MAT_ID shared activation", "src1")) {
-                        if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
-                            GGML_LOG_WARN(
-                                "[MOE-ROUTE] shared activation missing smart src1 handle tensor=%s device=%d; "
-                                "refusing route\n",
-                                src1 && src1->name ? src1->name : "?", ctx.device);
-                        }
-                        throw ggml_sycl_fallback_error("MUL_MAT_ID shared activation missing smart src1 handle");
-                    }
-                    shared_act_host = s_act_staging.as<float>();
-                    act_d2h_event   = ggml_sycl::mem_copy_async(shared_act_handle, 0, src1_storage.handle,
-                                                                src1_storage.view_offset, needed, *stream);
-                    act_on_host     = true;
+                    shared_act_host   = s_act_staging.as<float>();
+                    act_d2h_event     = g_moe_shared_act.d2h;
+                    act_on_host       = true;
+                } else if (s_act_staging.ensure(
+                               *stream, ctx.device, shared_act_bytes, ggml_sycl::alloc_role::EXPERT_STAGING,
+                               ggml_sycl::runtime_category::HOST_COMPUTE, "moe_shared_activation_host")) {
+                    shared_act_handle = s_act_staging.as_mem_handle();
+                    shared_act_host   = s_act_staging.as<float>();
+                    act_d2h_event =
+                        ggml_sycl::mem_copy_async(shared_act_handle, 0, shared_src1_storage.handle,
+                                                  shared_src1_storage.view_offset, shared_act_bytes, *stream);
+                    act_on_host = true;
+
+                    ggml_sycl::moe_shared_act_record record;
+                    record.src1_tensor      = src1;
+                    record.sibling_dst      = moe_shared_act_sibling(dst);
+                    record.graph_epoch      = g_moe_graph_epoch;
+                    record.serial           = ++g_moe_shared_act_serial;
+                    record.scatter_serial   = g_cpu_scatter_serial;
+                    record.view_offset      = shared_src1_storage.view_offset;
+                    record.bytes            = shared_act_bytes;
+                    record.device           = ctx.device;
+                    record.valid            = true;
+                    g_moe_shared_act.record = record;
+                    g_moe_shared_act.source = shared_src1_storage.handle;
+                    g_moe_shared_act.d2h    = act_d2h_event;
+                } else {
+                    g_moe_shared_act = {};  // the staging may have been released
                 }
             }
 
@@ -76917,8 +77310,40 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // carrying the compute future and metadata — does NOT touch
             // g_pending_scatter (which is thread_local and must only be
             // written from the main thread).
+            // Copies each entry's src1 row into consecutive act staging rows
+            // from act_first_byte, one copy per contiguous source run: the
+            // decode down projection's rows are one [n_ff, n_used] block, so
+            // its gather is a single copy (llama.cpp-yx28).
+            auto gather_activation_rows = [&](const std::vector<const expert_dispatch_entry *> & rows,
+                                              const ggml_sycl::mem_handle & act_handle, size_t act_first_byte) {
+                ggml_sycl_tensor_storage_handle src1_storage{};
+                if (!ggml_sycl_ensure_tensor_storage_handle(src1, ctx.device, &src1_storage,
+                                                            "MUL_MAT_ID CPU activation gather", "src1")) {
+                    throw ggml_sycl_fallback_error("MUL_MAT_ID CPU activation gather missing smart src1 handle");
+                }
+                std::vector<size_t> src_offsets;
+                src_offsets.reserve(rows.size());
+                for (const expert_dispatch_entry * entry : rows) {
+                    src_offsets.push_back(src1_storage.view_offset + static_cast<size_t>(entry->id % ne11) * nb11 +
+                                          static_cast<size_t>(entry->iid1) * nb12);
+                }
+                std::vector<ggml_sycl::moe_gather_run> runs;
+                ggml_sycl::moe_gather_runs_build(src_offsets, act_first_byte, static_cast<size_t>(K) * sizeof(float),
+                                                 runs);
+                std::vector<sycl::event> copy_events;
+                copy_events.reserve(runs.size());
+                for (const ggml_sycl::moe_gather_run & run : runs) {
+                    copy_events.push_back(ggml_sycl::mem_copy_async(act_handle, run.dst_offset, src1_storage.handle,
+                                                                    run.src_offset, run.bytes, *stream));
+                }
+                sycl::event::wait(copy_events);
+            };
+
+            // act_pregathered: the caller already gathered this dispatch's
+            // per-row activations into its pool slice (gather_activation_rows).
             auto dispatch_cpu_compute = [&](const std::vector<expert_dispatch_entry> & entries,
-                                            size_t pool_first_entry = pool_entry_npos) -> cpu_dispatch_result {
+                                            size_t pool_first_entry = pool_entry_npos,
+                                            bool   act_pregathered  = false) -> cpu_dispatch_result {
                 cpu_dispatch_result result;
                 if (entries.empty()) {
                     return result;
@@ -77070,23 +77495,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         act_handle, pool_base * static_cast<size_t>(K) * sizeof(float), src1_storage.handle,
                         src1_storage.view_offset, static_cast<size_t>(K) * sizeof(float), *stream);
                     act_deferred_pending = true;
-                } else {
-                    // Per-expert D2H: collect events and batch-wait instead
-                    // of draining the entire GPU queue with stream->wait().
-                    std::vector<sycl::event> copy_events;
-                    copy_events.reserve(n_cpu);
-                    for (size_t ci = 0; ci < n_cpu; ci++) {
-                        const auto &  entry   = entries[ci];
-                        const int64_t i11     = entry.id % ne11;
-                        const int64_t i12     = entry.iid1;
-                        const size_t  src_off = src1_storage.view_offset + static_cast<size_t>(i11) * nb11 +
-                                               static_cast<size_t>(i12) * nb12;
-                        const size_t dst_off = (pool_base + ci) * static_cast<size_t>(K) * sizeof(float);
-                        copy_events.push_back(ggml_sycl::mem_copy_async(act_handle, dst_off, src1_storage.handle,
-                                                                        src_off, static_cast<size_t>(K) * sizeof(float),
-                                                                        *stream));
+                } else if (!act_pregathered) {
+                    // Per-row activations: coalesced copies, batch-waited
+                    // instead of draining the GPU queue with stream->wait().
+                    std::vector<const expert_dispatch_entry *> rows;
+                    rows.reserve(n_cpu);
+                    for (const expert_dispatch_entry & entry : entries) {
+                        rows.push_back(&entry);
                     }
-                    sycl::event::wait(copy_events);
+                    gather_activation_rows(rows, act_handle, pool_base * static_cast<size_t>(K) * sizeof(float));
                 }
 
                 // Build CPU tasks from mmap host weight pointers.
@@ -77255,14 +77672,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                (pool_base + ci) * static_cast<size_t>(N) * sizeof(float) });
                 }
 
-                result.out_pinned   = out_pinned;
-                result.act_pinned   = act_pinned;
-                result.out_handle   = out_handle;
-                result.act_handle   = act_handle;
-                result.device_id    = ctx.device;
-                result.from_pool    = from_pool;
-                result.owns_buffers = true;
-                result.valid        = true;
+                result.out_pinned        = out_pinned;
+                result.act_pinned        = act_pinned;
+                result.out_handle        = out_handle;
+                result.act_handle        = act_handle;
+                result.device_id         = ctx.device;
+                result.from_pool         = from_pool;
+                result.owns_buffers      = true;
+                result.valid             = true;
+                result.pool_first        = pool_base;
+                result.pool_count        = n_cpu;
+                result.row_k             = K;
+                result.row_n             = N;
+                result.shares_activation = act_on_host && cpu_shared_act;
+                result.act_serial        = result.shares_activation ? g_moe_shared_act.record.serial : 0;
                 return result;
             };
 
@@ -77295,6 +77718,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 g_pending_scatter.active        = true;
                 g_pending_scatter.dst_tensor    = dst;
                 g_pending_scatter.entries       = std::move(r.entries);
+                g_pending_scatter.pool_first        = r.pool_first;
+                g_pending_scatter.pool_count        = r.pool_count;
+                g_pending_scatter.row_k             = r.row_k;
+                g_pending_scatter.row_n             = r.row_n;
+                g_pending_scatter.act_serial        = r.act_serial;
+                g_pending_scatter.shares_activation = r.shares_activation;
             };
 
             // Apply CPU dispatch result to pipeline (cross-layer overlap).
@@ -77333,11 +77762,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // Synchronous dispatch + scatter setup: used by the sequential
             // (PP) path and the hot/cold deferral path.
             auto dispatch_cpu_and_scatter = [&](const std::vector<expert_dispatch_entry> & entries,
-                                                size_t pool_first_entry = pool_entry_npos) {
+                                                size_t pool_first_entry = pool_entry_npos,
+                                                bool   act_pregathered  = false) {
                 if (entries.empty()) {
                     return;
                 }
-                auto r = dispatch_cpu_compute(entries, pool_first_entry);
+                auto r = dispatch_cpu_compute(entries, pool_first_entry, act_pregathered);
                 // A non-empty dispatch always yields a valid result or aborts inside; an invalid one
                 // here would be dropped by apply_cpu_result_to_scatter (llama.cpp-93tw).
                 GGML_ASSERT(r.valid &&
@@ -78005,28 +78435,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
 
             // ----- Concurrent GPU+CPU dispatch -----
-            // For batch=1 TG: launch CPU expert dispatch on a background thread
-            // BEFORE GPU0 kernel submission so DDR5 AVX-VNNI compute overlaps
-            // with GPU MMVQ execution.  The async thread ONLY does CPU compute
-            // (via dispatch_cpu_compute) and returns results; the main thread
-            // populates g_pending_scatter after joining.  This avoids:
-            //   Bug 1: g_pending_scatter is thread_local — async thread writes
-            //          to its own copy, main thread never sees it.
-            //   Bug 2: Hot/cold deferral calls flush_pending_cpu_scatter which
-            //          submits stream->memcpy from the async thread, racing with
-            //          the main thread's GPU0 kernel submissions on the same
-            //          in-order queue.
-            // For batch>1 (PP): CPU dispatch runs sequentially after GPU0 to
-            // avoid concurrent stream->memcpy submissions from two threads.
-            std::future<cpu_dispatch_result> cpu_compute_future;
-            const bool                       have_cpu_experts = !cpu_entries.empty();
-            const bool                       cpu_async_safe   = have_cpu_experts && cpu_expert_tg_active && act_on_host;
+            // For batch=1 TG the CPU job is handed to the persistent
+            // CpuExpertPool from this thread after the GPU0 submissions, so
+            // the CPU compute overlaps GPU MMVQ execution without a per-op
+            // thread, and every queue submission and g_pending_scatter write
+            // stays on the submitting thread (llama.cpp-yx28).
+            // For batch>1 (PP): CPU dispatch runs sequentially after GPU0.
+            const bool have_cpu_experts = !cpu_entries.empty();
+            const bool cpu_async_safe   = have_cpu_experts && cpu_expert_tg_active && act_on_host;
 
             // Helper: CPU dispatch with hot/cold deferral logic.
-            // Used ONLY for the synchronous (PP) path.  The async TG path
-            // skips deferral entirely (batch=1 has few experts, splitting
-            // gains nothing, and deferral requires flush_pending_cpu_scatter
-            // which submits stream->memcpy — unsafe from an async thread).
+            // Used for every CPU dispatch that is not the shared-activation TG
+            // path below (gate/up), including the decode down projection.
             // MoE CPU expert deferral count: how many CPU experts to batch
             // before dispatching.  Default: 1 (dispatch each expert immediately).
             // Previously tunable via GGML_SYCL_MOE_DEFER_COUNT; now hardcoded.
@@ -78069,30 +78489,35 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // One reservation covers both groups; each takes its own slice.
                     const size_t hot_first  = split_needs_pool ? hc_pool.reserve(n_cpu_entries) : 0;
                     const size_t cold_first = hot_first + hot_entries.size();
+                    // Per-row activations of both slices are adjacent in the
+                    // pool, so gather them in one pass (one copy for the
+                    // decode down projection) before either dispatch.
+                    const bool   pregather  = split_needs_pool && !cpu_shared_act;
+                    if (pregather) {
+                        std::vector<const expert_dispatch_entry *> rows;
+                        rows.reserve(n_cpu_entries);
+                        for (const expert_dispatch_entry & e : hot_entries) {
+                            rows.push_back(&e);
+                        }
+                        for (const expert_dispatch_entry & e : cold_entries) {
+                            rows.push_back(&e);
+                        }
+                        gather_activation_rows(rows, hc_pool.act_handle(),
+                                               hot_first * static_cast<size_t>(K) * sizeof(float));
+                    }
                     if (!hot_entries.empty()) {
-                        dispatch_cpu_and_scatter(hot_entries, hot_first);
+                        dispatch_cpu_and_scatter(hot_entries, hot_first, pregather);
                         flush_pending_cpu_scatter();
                     }
-                    dispatch_cpu_and_scatter(cold_entries, cold_first);
+                    dispatch_cpu_and_scatter(cold_entries, cold_first, pregather);
                 }
             };
 
-            // TG path: launch CPU compute on async thread.
-            // CRITICAL: dispatch_cpu_compute may submit stream->memcpy (D2H
-            // activation copy) when !act_on_host.  SYCL queues are NOT thread-
-            // safe for concurrent submissions.  The main thread concurrently
-            // submits GPU MMVQ kernels to the SAME queue at line ~34802.
-            // Two threads writing to the same in-order command list corrupts
-            // it → GPU page faults at low addresses → DEVICE_LOST.
-            //
-            // Fix: when !act_on_host, submit the D2H on the main thread BEFORE
-            // TG path: launch CPU compute on async thread.
-            // dispatch_cpu_compute does not submit to the compute queue when
-            // act_on_host is true (uses the pre-submitted act_d2h_event).
-            if (cpu_async_safe) {
-                cpu_compute_future = std::async(
-                    std::launch::async, [&]() -> cpu_dispatch_result { return dispatch_cpu_compute(cpu_entries); });
-            }
+            // TG path: the CPU job is issued at the join below, on this
+            // thread, after the GPU0 submissions. dispatch_cpu_compute only
+            // waits the activation copy submitted above and hands the tasks to
+            // the persistent CpuExpertPool, so no OS thread is spawned per op
+            // (llama.cpp-yx28).
 
             // ----- GPU0 path (B580): batched MMVQ dispatch -----
             // Runs IN PARALLEL with B50 secondary GPU and CPU DDR5 compute.
@@ -78292,10 +78717,49 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // ----- Join / sequential CPU dispatch -----
             // Pipeline CPU: store in g_pending_cpu_pipeline for cross-layer overlap.
             // Standard: store in g_pending_scatter (intra-layer deferral).
-            if (cpu_async_safe && cpu_compute_future.valid()) {
-                auto cpu_result = cpu_compute_future.get();
+            if (cpu_async_safe) {
+                size_t cpu_pool_first = pool_entry_npos;
+                if (defer_entry_flush) {
+                    // Gate's job is still pending (see the op-entry flush). Issue
+                    // up's beside it when their pool spans and the activation
+                    // staging allow it; otherwise join gate now.
+                    auto &                      sib_pool   = g_pinned_buffer_pools[ctx.device];
+                    const size_t                n_cpu_rows = cpu_entries.size();
+                    const bool                  op_pool    = sib_pool.can_serve(n_cpu_rows) && !immutable_host_recipe;
+                    const pending_cpu_scatter & gate       = g_pending_scatter;
+                    ggml_sycl::moe_sibling_pending_request keep{};
+                    keep.pending_active     = gate.active;
+                    keep.sibling_slot_free  = !g_pending_scatter_sibling.active;
+                    // A pending job that does not read the staging has no
+                    // serial to compare, so it is never kept beside this op.
+                    keep.reuses_activation  = reuse_shared_act && gate.shares_activation;
+                    keep.pending_act_serial = gate.act_serial;
+                    keep.current_act_serial = g_moe_shared_act.record.serial;
+                    keep.pending_from_pool  = gate.from_pool;
+                    keep.op_from_pool       = op_pool;
+                    keep.pending_first      = gate.pool_first;
+                    keep.pending_count      = gate.pool_count;
+                    keep.op_first           = op_pool ? sib_pool.reserve_peek(n_cpu_rows) : 0;
+                    keep.op_count           = n_cpu_rows;
+                    keep.same_row_geometry  = gate.row_k == K && gate.row_n == N;
+                    if (ggml_sycl::moe_sibling_pending_keep(keep)) {
+                        move_pending_cpu_scatter_to_sibling();
+                        if (op_pool) {
+                            cpu_pool_first = sib_pool.reserve(n_cpu_rows);
+                            GGML_ASSERT(cpu_pool_first == keep.op_first);
+                        }
+                    } else {
+                        flush_pending_cpu_scatter();
+                        // This op made no activation copy, so nothing orders the
+                        // scatter just enqueued ahead of this op's writes to its
+                        // pool entries: wait for that scatter itself.
+                        sycl::event::wait(g_pending_scatter_sibling.prev_bufs.scatter_events);
+                        sycl::event::wait(g_pending_scatter.prev_bufs.scatter_events);
+                    }
+                }
+                auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);
                 GGML_ASSERT(cpu_result.valid &&
-                            "async dispatch_cpu_compute returned an invalid result for a "
+                            "dispatch_cpu_compute returned an invalid result for a "
                             "non-empty dispatch; its host-expert rows would be dropped "
                             "(llama.cpp-93tw)");
                 if (ggml_sycl_pipeline_cpu_enabled()) {
@@ -78420,7 +78884,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     return;
                 }
 
-                if (g_pending_scatter.active) {
+                if (g_pending_scatter.active || g_pending_scatter_sibling.active) {
                     flush_pending_cpu_scatter();
                 }
 
@@ -93976,6 +94440,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // MUL_MAT_ID (so flush_pending_cpu_scatter / flush_pending_cpu_pipeline
     // is never called), the lambda would linger with stale weight_host
     // pointers until thread exit.  Reset after wait to consume.
+    if (g_pending_scatter_sibling.future.valid()) {
+        try {
+            g_pending_scatter_sibling.future.wait();
+        } catch (...) {
+        }
+        g_pending_scatter_sibling.future = {};
+    }
     if (g_pending_scatter.future.valid()) {
         try {
             g_pending_scatter.future.wait();
@@ -99699,6 +100170,7 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
     ggml_sycl_cpu_quant_cache_new_graph();
     ggml_sycl_moe_ids_cache_new_graph();
     ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);
+    moe_shared_act_new_graph();  // graphlets bypass compute_impl's flush, which does this
     if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
         // The graphlets would read a host-resident input inside a recording or a replay; the caller runs direct.
         // Conservative: retire the recorded ones so a declined graph leaves none to be mistaken for a current one.
@@ -109161,6 +109633,7 @@ normal_dispatch:
                 ggml_sycl_cpu_quant_cache_new_graph();
                 ggml_sycl_moe_ids_cache_new_graph();
                 ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);
+                moe_shared_act_new_graph();  // replay bypasses compute_impl's flush, which does this
 
                 // Check if segments are valid for this graph
                 bool segments_match = sycl_ctx->moe_segments_valid &&

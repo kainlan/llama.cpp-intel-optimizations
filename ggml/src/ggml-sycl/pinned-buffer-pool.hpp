@@ -75,10 +75,18 @@ class PinnedBufferPool {
     // a scatter pending ACROSS a following reserve() would be outside this argument and would have
     // to retain its slice and its staging until the scatter event instead (llama.cpp-8k68).
     //
-    // Threading: one MUL_MAT_ID at a time, joined before the next.  It is not main-thread-only:
-    // the cpu_async_safe path calls it from the async CPU thread, which the main thread joins
-    // before the next op touches the pool.
+    // The one such caller is the decode sibling slot (llama.cpp-yx28): up is issued while gate's
+    // job is still pending, without a flush.  It is admitted only when up does no activation D2H
+    // (it reuses gate's staging, unrewritten), no scatter was enqueued since that D2H, so (1)
+    // and (2) still hold through it, and reserve_peek() shows up's span disjoint from gate's.  Gate
+    // keeps its own slice and staging until its scatter is flushed; see moe_sibling_pending_keep()
+    // in moe-decode-hostpath.hpp.
+    //
+    // Threading: one MUL_MAT_ID at a time, called on the thread that submits it.
     size_t reserve(size_t n_experts);
+
+    // The first entry reserve(n_experts) would return, without moving the cursor.
+    size_t reserve_peek(size_t n_experts) const;
 
     // Whether acquire(n_experts) would be served. The pool's capacity is fixed
     // at init() and the buffers really are max_experts_ * dim floats, so an

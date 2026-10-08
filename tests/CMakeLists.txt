@@ -446,6 +446,15 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-vram-headroom PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# MoE batch-1 decode host path (llama.cpp-yx28): the direct-dispatch admission
+# and stamp decisions. ggml-sycl/moe-decode-hostpath.hpp includes only
+# <cstdint>, so like test-sycl-vram-headroom it needs no SYCL wiring.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-moe-decode-hostpath.cpp)
+    set_tests_properties(test-sycl-moe-decode-hostpath PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-moe-decode-hostpath PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
 # KV cache tensor name -> layer id (llama.cpp-4ot7): the tiered KV buffer remaps each tensor onto its
 # layer's allocation by this id, and a name-tagged cache ("cache_idx_k_l3") used to parse as no layer.
 # ggml-sycl/kv-cache-tensor-name.hpp includes only <climits>/<cstring>: no SYCL, no ggml, no device.

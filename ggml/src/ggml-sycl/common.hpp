@@ -23,6 +23,7 @@
 #include "layer-streaming.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
+#include "moe-decode-hostpath.hpp"
 #include "moe-graph-retention.hpp"
 #include "moe-layer-plan.hpp"
 #include "moe-route-table.hpp"
@@ -3764,6 +3765,28 @@ struct ggml_tensor_extra_gpu_weight_ext {
         return nullptr;
     }
 
+    // Every layout expert_id has a published record in on owner_device: what
+    // the unified cache materialized, read from the records themselves.
+    void moe_storage_layouts_on_device(int expert_id, int owner_device, std::vector<int> & layouts) const {
+        layouts.clear();
+        if (expert_id < 0) {
+            return;
+        }
+        for (const auto & kv : moe_expert_storage_handles) {
+            if (static_cast<uint32_t>(kv.first) != static_cast<uint32_t>(expert_id)) {
+                continue;
+            }
+            for (const moe_expert_storage_record & record : kv.second) {
+                const auto resolved = record.handle.resolve();
+                const int  owner    = resolved.on_device ? record.handle.device() : ggml_sycl::mem_handle::HOST_DEVICE;
+                if (owner == owner_device) {
+                    layouts.push_back(static_cast<int>(kv.first >> 32));
+                    break;
+                }
+            }
+        }
+    }
+
     bool forget_moe_storage_handle_on_device(int expert_id, ggml_layout_mode layout, int owner_device) {
         if (expert_id < 0) {
             return false;
@@ -3913,6 +3936,9 @@ struct ggml_tensor_extra_gpu_weight_ext {
     uint64_t                           moe_full_local_probe_generation[GGML_SYCL_MAX_DEVICES]          = {};
     ggml_layout_mode                   moe_full_local_probe_layout[GGML_SYCL_MAX_DEVICES]              = {};
     bool                               moe_full_local_probe_ok[GGML_SYCL_MAX_DEVICES]                  = {};
+    // Batch-1 decode direct-dispatch eligibility and layout, per device; see
+    // moe-decode-hostpath.hpp (llama.cpp-yx28).
+    ggml_sycl::moe_decode_direct_stamp moe_decode_direct[GGML_SYCL_MAX_DEVICES];
     uint64_t                           moe_planned_layout_generation[GGML_SYCL_MAX_DEVICES][2][2]      = {};
     ggml_layout_mode                   moe_planned_layout_cache[GGML_SYCL_MAX_DEVICES][2][2]           = {};
     bool                               moe_planned_layout_valid[GGML_SYCL_MAX_DEVICES][2][2]           = {};
@@ -4402,6 +4428,14 @@ struct ggml_tensor_extra_gpu {
                                                                         ggml_layout_mode layout,
                                                                         int              owner_device) const {
         return weight_ext ? weight_ext->find_moe_storage_handle_on_device(expert_id, layout, owner_device) : nullptr;
+    }
+
+    void moe_storage_layouts_on_device(int expert_id, int owner_device, std::vector<int> & layouts) const {
+        if (weight_ext) {
+            weight_ext->moe_storage_layouts_on_device(expert_id, owner_device, layouts);
+        } else {
+            layouts.clear();
+        }
     }
 
     bool forget_moe_storage_handle_on_device(int expert_id, ggml_layout_mode layout, int owner_device) {
