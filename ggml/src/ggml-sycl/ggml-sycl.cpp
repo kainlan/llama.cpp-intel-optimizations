@@ -61948,11 +61948,26 @@ static bool ggml_sycl_moe_post_prompt_claim(const ggml_cgraph * cgraph, int devi
     return due;
 }
 
+// Identity of a decode split for the futile-context probe memo: its node count and the name of its first MUL_MAT_ID,
+// which names the layer. split_id is 0 when the split has no MUL_MAT_ID. Two splits that collide share one probe, and
+// the other one runs direct, as every split of a futile context did before keyed slots. The residency is what a
+// refused preload re-opens on (the replan epoch and every MUL_MAT_ID's expert storage generation) plus the prompt
+// epoch, so a probe vetoed by low headroom gets one more call after the next prompt.
+struct moe_segment_probe_key {
+    uint64_t split_id  = 0;
+    uint64_t residency = 0;
+};
+
 // What the stamps of this split's MUL_MAT_IDs say about running the preload. Scans the same nodes the preload walks.
+// The same scan fills *probe, so the futile-context probe costs no walk of its own.
 static ggml_sycl::moe_graph_preload_split_decision ggml_sycl_moe_graph_preload_decide(const ggml_cgraph * cgraph,
                                                                                       int                 device,
-                                                                                      bool host_tier_boundary) {
-    ggml_sycl::moe_graph_preload_split_scan scan;
+                                                                                      bool host_tier_boundary,
+                                                                                      moe_segment_probe_key * probe) {
+    ggml_sycl::moe_graph_preload_split_scan    scan;
+    ggml_sycl::graph_segment_cache::key_hasher residency;
+    residency.mix(g_moe_prompt_epoch.load(std::memory_order_acquire));
+    *probe = moe_segment_probe_key{};
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[2]) {
@@ -61960,10 +61975,20 @@ static ggml_sycl::moe_graph_preload_split_decision ggml_sycl_moe_graph_preload_d
         }
         const auto * extra   = static_cast<const ggml_tensor_extra_gpu *>(node->src[0]->extra);
         const bool   stamped = extra && extra->weight_ext && device >= 0 && device < GGML_SYCL_MAX_DEVICES;
+        const ggml_sycl::moe_graph_preload_inputs in =
+            ggml_sycl_moe_graph_preload_inputs_of(node, device, host_tier_boundary);
         ggml_sycl::moe_graph_preload_split_add(
-            scan, stamped ? extra->weight_ext->moe_graph_preload[device] : ggml_sycl::moe_graph_preload_stamp{},
-            ggml_sycl_moe_graph_preload_inputs_of(node, device, host_tier_boundary));
+            scan, stamped ? extra->weight_ext->moe_graph_preload[device] : ggml_sycl::moe_graph_preload_stamp{}, in);
+        if (probe->split_id == 0) {
+            ggml_sycl::graph_segment_cache::key_hasher h;
+            h.mix(static_cast<uint64_t>(cgraph->n_nodes));
+            h.mix_name(node->name, sizeof(node->name));
+            probe->split_id = h.value() | 1;
+        }
+        residency.mix(in.replan_epoch);
+        residency.mix(in.storage_generation);
     }
+    probe->residency = residency.value();
     return ggml_sycl::moe_graph_preload_split_decide(scan);
 }
 
@@ -99216,56 +99241,24 @@ static bool moe_segment_keyed_mode(const ggml_backend_sycl_context * ctx, bool i
            !ctx->moe_segment_slots.churned();
 }
 
-// Identity of a decode split for the futile-context probe memo: its node count and the name of its first MUL_MAT_ID,
-// which names the layer. 0 when the split has no MUL_MAT_ID. Two splits that collide share one probe, and the other
-// one runs direct, as every split of a futile context did before keyed slots. The residency is what a refused preload
-// re-opens on (the replan epoch and every MUL_MAT_ID's expert storage generation) plus the prompt epoch, so a probe
-// vetoed by low headroom gets one more call after the next prompt.
-struct moe_segment_probe_key {
-    uint64_t split_id  = 0;
-    uint64_t residency = 0;
-};
-
-static moe_segment_probe_key moe_segment_probe_key_of(const ggml_cgraph * cgraph, int device) {
-    moe_segment_probe_key                      key;
-    ggml_sycl::graph_segment_cache::key_hasher residency;
-    residency.mix(g_moe_prompt_epoch.load(std::memory_order_acquire));
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[2]) {
-            continue;
-        }
-        if (key.split_id == 0) {
-            ggml_sycl::graph_segment_cache::key_hasher h;
-            h.mix(static_cast<uint64_t>(cgraph->n_nodes));
-            h.mix_name(node->name, sizeof(node->name));
-            key.split_id = h.value() | 1;
-        }
-        const ggml_sycl::moe_graph_preload_inputs in =
-            ggml_sycl_moe_graph_preload_inputs_of(node, device, /*host_tier_boundary=*/true);
-        residency.mix(in.replan_epoch);
-        residency.mix(in.storage_generation);
-    }
-    key.residency = residency.value();
-    return key;
-}
-
 // A replay-futile context still serves keyed slots, since its futility verdict is about the whole-graph slot. Until
 // the context is in segmented MoE mode, each decode split with a MUL_MAT_ID gets one call per residency that may put
 // it there: the entry's segmented-only admission, or the decode policy's segmented-replay decision. A call vetoed
 // before that decision (this split's preload refused, an unprofitable shape, low headroom) spends only this split's
 // probe, so another split can still enter the mode, and a residency change gives it one more call. A split whose
 // probe is spent takes the futile path again, so a context that never enters segmented mode pays the policy scans
-// once per split and residency, not every call.
-static bool moe_segment_keyed_reachable(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, bool is_decode) {
+// once per split and residency, not every call. The key comes from the preload decision's scan, which runs on every
+// call anyway, so a spent probe costs a search of the memo and no walk of the graph.
+static bool moe_segment_keyed_reachable(ggml_backend_sycl_context *   ctx,
+                                        const moe_segment_probe_key & probe,
+                                        bool                          is_decode) {
     if (!is_decode || !ggml_sycl_segmented_graph_env_allows() || ctx->moe_segment_slots.churned()) {
         return false;
     }
     if (ctx->moe_graph_rerecord) {
         return true;
     }
-    const moe_segment_probe_key key = moe_segment_probe_key_of(cgraph, ctx->device);
-    return ctx->moe_segment_keyed_probes.take(key.split_id, key.residency);
+    return ctx->moe_segment_keyed_probes.take(probe.split_id, probe.residency);
 }
 
 static uint64_t moe_segment_handle_identity(const ggml_sycl::mem_handle & handle) {
@@ -108701,8 +108694,9 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     // tensor may stay a direct node only where MUL_MAT_ID nodes are kept out of recorded graphs: decode, which
     // records segments around them, and not the opt-in full-capture graphlet probe.
     const bool moe_host_tier_boundary = cached_is_decode && !moe_graphlet_replay_probe_enabled();
+    moe_segment_probe_key probe_key;
     sycl_ctx->moe_graph_preload_refused =
-        ggml_sycl_moe_graph_preload_decide(cgraph, sycl_ctx->device, moe_host_tier_boundary) ==
+        ggml_sycl_moe_graph_preload_decide(cgraph, sycl_ctx->device, moe_host_tier_boundary, &probe_key) ==
         ggml_sycl::moe_graph_preload_split_decision::REFUSED;
 
     // llama.cpp-479i: the dense MMQ/MMVQ Q8_1 src1 buffer is planned, and the graph's demand is checked against it
@@ -109623,7 +109617,8 @@ normal_dispatch:
         // Prefix mode: graph execution of partial graphs is broken.
         // Use compute_impl for both prefix and suffix.
         use_sycl_graph = false;
-    } else if (sycl_ctx->exec_graph_replay_futile && !moe_segment_keyed_reachable(sycl_ctx, cgraph, cached_is_decode)) {
+    } else if (sycl_ctx->exec_graph_replay_futile &&
+               !moe_segment_keyed_reachable(sycl_ctx, probe_key, cached_is_decode)) {
         // Replay was proven futile for this context, and nothing clears that. Every later call takes the
         // GGML_SYCL_DISABLE_GRAPH=1 path, decided here so it skips the graph-policy scans below as well
         // (fragmented graphs run many small splits per token, and each one paid them). Decode splits that keyed

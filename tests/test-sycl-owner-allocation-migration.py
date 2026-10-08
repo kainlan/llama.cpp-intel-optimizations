@@ -575,19 +575,19 @@ with gate('futile-context-direct'):
     # DISABLE_GRAPH path unless the split is a decode split that keyed segment slots serve (the context is in
     # segmented MoE mode, moe_graph_rerecord, or this split's MUL_MAT_ID puts it there); that one exception reopens
     # the policy pipeline below for keyed splits, by design, and keyed-segment-slots pins what it may then skip.
-    futile_arm = re.compile(r"\}\s*else if \(sycl_ctx->exec_graph_replay_futile && "
-                            r"!moe_segment_keyed_reachable\(sycl_ctx, cgraph, cached_is_decode\)\)\s*\{"
+    futile_arm = re.compile(r"\}\s*else if \(sycl_ctx->exec_graph_replay_futile &&\s*"
+                            r"!moe_segment_keyed_reachable\(sycl_ctx, probe_key, cached_is_decode\)\)\s*\{"
                             r"\s*use_sycl_graph\s*=\s*false;\s*\}\s*else if \(sycl_ctx->exec_graph\)\s*\{")
     futile = futile_arm.search(compute)
     assert futile
     for _label, _pattern, _repl in (
             ("the futile arm has no keyed exception (prompt and dense splits would lose it too)",
-             r"exec_graph_replay_futile && !moe_segment_keyed_reachable\(sycl_ctx, cgraph, cached_is_decode\)\) \{",
+             r"exec_graph_replay_futile &&\s*!moe_segment_keyed_reachable\(sycl_ctx, probe_key, cached_is_decode\)\) \{",
              "exec_graph_replay_futile) {"),
-            ("the futile arm is bypassed outright", r"exec_graph_replay_futile && !moe_segment_keyed_reachable\(",
+            ("the futile arm is bypassed outright", r"exec_graph_replay_futile &&\s*!moe_segment_keyed_reachable\(",
              "exec_graph_replay_futile && !true && !moe_segment_keyed_reachable("),
             ("a futile context still enables graphs",
-             r"(moe_segment_keyed_reachable\(sycl_ctx, cgraph, cached_is_decode\)\) \{\s*)use_sycl_graph = false;",
+             r"(moe_segment_keyed_reachable\(sycl_ctx, probe_key, cached_is_decode\)\) \{\s*)use_sycl_graph = false;",
              r"\1use_sycl_graph = true;")):
         assert len(re.findall(_pattern, compute)) == 1, "control %r anchor" % _label
         assert futile_arm.search(re.sub(_pattern, _repl, compute, count=1)) is None, \
@@ -600,53 +600,81 @@ with gate('futile-context-direct'):
                          r"ctx->moe_segment_slots\.churned\(\)\)\s*\{\s*return false;\s*\}", body):
             problems.append("the exception is not limited to decode, the segmented env, and an unchurned cache")
         if not re.search(r"if \(ctx->moe_graph_rerecord\)\s*\{\s*return true;\s*\}\s*"
-                         r"const moe_segment_probe_key key = moe_segment_probe_key_of\(cgraph, ctx->device\);\s*"
-                         r"return ctx->moe_segment_keyed_probes\.take\(key\.split_id, key\.residency\);", body):
+                         r"return ctx->moe_segment_keyed_probes\.take\(probe\.split_id, probe\.residency\);", body):
             problems.append("the exception does not require segmented MoE mode after one probe per MUL_MAT_ID split "
                             "and residency (a context-wide probe can be spent by a vetoed split; a probe without the "
                             "residency stays spent after the change that lifts its veto; none at all pays the scans "
                             "every call)")
+        # A spent probe costs a memo search, not a walk: the key comes from the preload decision's scan, which runs
+        # on every call anyway, and reaches the probe through one local.
+        if re.search(r"\bcgraph\b|\bfor \(|\bwhile \(", body):
+            problems.append("the probe walks the graph on every futile decode call")
         try:
-            key_of = region(code, "static moe_segment_probe_key moe_segment_probe_key_of(", "\n}\n")
+            decide = region(code, "static ggml_sycl::moe_graph_preload_split_decision ggml_sycl_moe_graph_preload_decide(",
+                            "\n}\n")
+            compute_fn = region(code, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                                "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
         except ValueError as error:
             return problems + [str(error)]
-        if not re.search(r"if \(key\.split_id == 0\)\s*\{\s*[^{}]*"
+        call = re.search(r"moe_segment_probe_key probe_key;\s*sycl_ctx->moe_graph_preload_refused =\s*"
+                         r"ggml_sycl_moe_graph_preload_decide\(cgraph, sycl_ctx->device, moe_host_tier_boundary, "
+                         r"&probe_key\)", compute_fn)
+        use = compute_fn.find("moe_segment_keyed_reachable(sycl_ctx, probe_key, cached_is_decode)")
+        if not call or use < call.end() or len(re.findall(r"\bprobe_key\b", compute_fn)) != 3:
+            problems.append("the probe does not read the key the preload decision filled for this call")
+        loop = decide.find("for (int i = 0; i < cgraph->n_nodes; i++) {")
+        if not re.search(r"\*probe = moe_segment_probe_key\{\};", decide[:loop] if loop >= 0 else ""):
+            problems.append("a split without a MUL_MAT_ID keeps the previous call's split id")
+        if not re.search(r"if \(probe->split_id == 0\)\s*\{\s*[^{}]*"
                          r"h\.mix\(static_cast<uint64_t>\(cgraph->n_nodes\)\);\s*"
-                         r"h\.mix_name\(node->name, sizeof\(node->name\)\);\s*key\.split_id = h\.value\(\) \| 1;",
-                         key_of) or not re.search(r"key\.residency = residency\.value\(\);\s*return key;\s*$", key_of):
+                         r"h\.mix_name\(node->name, sizeof\(node->name\)\);\s*probe->split_id = h\.value\(\) \| 1;",
+                         decide) or not re.search(r"probe->residency = residency\.value\(\);\s*"
+                                                  r"return ggml_sycl::moe_graph_preload_split_decide\(scan\);\s*$", decide):
             problems.append("the split id does not name the split by its node count and first MUL_MAT_ID "
                             "(equal-size splits of different layers would share one probe)")
         # The residency is what re-opens a refused preload (moe_graph_preload_stamp_current), plus the prompt epoch.
         for what, pattern in (("the prompt epoch", r"residency\.mix\(g_moe_prompt_epoch\.load\("),
                               ("the replan epoch", r"residency\.mix\(in\.replan_epoch\);"),
                               ("each MUL_MAT_ID's expert storage generation", r"residency\.mix\(in\.storage_generation\);")):
-            if not re.search(pattern, key_of):
+            if not re.search(pattern, decide):
                 problems.append("the probe's residency leaves out %s, so a spent probe survives its change" % what)
         return problems
 
     assert not keyed_reachable_problems(RUNTIME_CODE), keyed_reachable_problems(RUNTIME_CODE)
     _reach = region(RUNTIME_CODE, "static bool moe_segment_keyed_reachable(", "\n}\n")
-    _take = "return ctx->moe_segment_keyed_probes.take(key.split_id, key.residency);"
+    _take = "return ctx->moe_segment_keyed_probes.take(probe.split_id, probe.residency);"
     for _label, _old, _new in (
             ("prompt splits reach keyed slots", "if (!is_decode || ", "if ("),
             ("a churned cache still reaches them", " || ctx->moe_segment_slots.churned())", ")"),
             ("any split reaches them every call", _take, "return true;"),
-            ("a vetoed split spends the context's probe", "take(key.split_id, ", "take(1, "),
-            ("the memo survives the residency change", "take(key.split_id, key.residency)", "take(key.split_id, 0)"),
-            ("the probe is never consulted", _take, "return key.split_id != 0;")):
+            ("a vetoed split spends the context's probe", "take(probe.split_id, ", "take(1, "),
+            ("the memo survives the residency change", "take(probe.split_id, probe.residency)", "take(probe.split_id, 0)"),
+            ("the probe is never consulted", _take, "return probe.split_id != 0;"),
+            ("the probe walks the graph on every call", _take,
+             "uint64_t n = 0;\n    for (int i = 0; i < 4; ++i) {\n        n += i;\n    }\n    " + _take)):
         assert _reach.count(_old) == 1, _label
         assert keyed_reachable_problems(RUNTIME_CODE.replace(_reach, _reach.replace(_old, _new))), \
             "control %r was not caught" % _label
-    _key_of = region(RUNTIME_CODE, "static moe_segment_probe_key moe_segment_probe_key_of(", "\n}\n") + "\n}\n"
-    for _label, _old, _new in (
-            ("equal-size splits of different layers share a probe", "h.mix_name(node->name, sizeof(node->name));", ""),
-            ("the node count is not in the split id", "h.mix(static_cast<uint64_t>(cgraph->n_nodes));", ""),
-            ("a split without a MUL_MAT_ID gets a probe", "    return key;\n}", "    key.split_id |= 1;\n    return key;\n}"),
-            ("the memo survives a storage change", "residency.mix(in.storage_generation);", ""),
-            ("the memo survives a replan", "residency.mix(in.replan_epoch);", ""),
-            ("the memo survives a new prompt", "residency.mix(g_moe_prompt_epoch.load(", "(void) (")):
-        assert _key_of.count(_old) == 1, _label
-        _mut = RUNTIME_CODE.replace(_key_of, _key_of.replace(_old, _new), 1)
+    _decide = region(RUNTIME_CODE, "static ggml_sycl::moe_graph_preload_split_decision ggml_sycl_moe_graph_preload_decide(",
+                     "\n}\n") + "\n}\n"
+    _compute_fn = region(RUNTIME_CODE, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                         "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
+    for _label, _where, _old, _new in (
+            ("equal-size splits of different layers share a probe", _decide,
+             "h.mix_name(node->name, sizeof(node->name));", ""),
+            ("the node count is not in the split id", _decide, "h.mix(static_cast<uint64_t>(cgraph->n_nodes));", ""),
+            ("a split without a MUL_MAT_ID keeps the last split's id", _decide, "*probe = moe_segment_probe_key{};", ""),
+            ("a split without a MUL_MAT_ID gets a probe", _decide, "    return ggml_sycl::moe_graph_preload_split_decide",
+             "    probe->split_id |= 1;\n    return ggml_sycl::moe_graph_preload_split_decide"),
+            ("the memo survives a storage change", _decide, "residency.mix(in.storage_generation);", ""),
+            ("the memo survives a replan", _decide, "residency.mix(in.replan_epoch);", ""),
+            ("the memo survives a new prompt", _decide, "residency.mix(g_moe_prompt_epoch.load(", "(void) ("),
+            ("the probe reads a stale key", _compute_fn, ", &probe_key)", ", &stale_key)"),
+            ("the probe recomputes its key with a walk", _compute_fn,
+             "moe_segment_keyed_reachable(sycl_ctx, probe_key, cached_is_decode)",
+             "moe_segment_keyed_reachable(sycl_ctx, moe_segment_probe_key_of(cgraph), cached_is_decode)")):
+        assert _where.count(_old) == 1, _label
+        _mut = RUNTIME_CODE.replace(_where, _where.replace(_old, _new), 1)
         assert _mut != RUNTIME_CODE, "control %r did not apply" % _label
         assert keyed_reachable_problems(_mut), "control %r was not caught" % _label
     graph_branch = compute.index("\n    if (use_sycl_graph) {\n") + 1
