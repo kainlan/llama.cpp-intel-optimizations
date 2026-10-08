@@ -99562,10 +99562,11 @@ static void moe_segment_slots_report(const ggml_backend_sycl_context * ctx) {
     }
     GGML_LOG_INFO(
         "[SYCL-SEG-SLOTS] device=%d calls=%llu keys=%zu warmups=%llu records=%llu replays=%llu directs=%llu "
-        "failures=%llu evictions=%llu churned=%d\n",
+        "failures=%llu unprofitable=%llu evictions=%llu churned=%d\n",
         ctx->device, (unsigned long long) n, ctx->moe_segment_slots.size(), (unsigned long long) st.warmups,
         (unsigned long long) st.records, (unsigned long long) st.replays, (unsigned long long) st.directs,
-        (unsigned long long) st.failures, (unsigned long long) st.evictions, ctx->moe_segment_slots.churned() ? 1 : 0);
+        (unsigned long long) st.failures, (unsigned long long) st.unprofitable, (unsigned long long) st.evictions,
+        ctx->moe_segment_slots.churned() ? 1 : 0);
 }
 
 struct moe_segmented_dispatch_scope {
@@ -110559,7 +110560,7 @@ normal_dispatch:
                     } else if (slot_action == gsc::action::WARMUP) {
                         // A split with no run worth a graph stays direct for good, decided once per key.
                         if (!moe_graph_keyed_plan_profitable(cgraph)) {
-                            sycl_ctx->moe_segment_slots.record_failed(slot_key);
+                            sycl_ctx->moe_segment_slots.mark_unprofitable(slot_key);
                         }
                         compute_impl_unlocked();
                     } else if (slot_action == gsc::action::DIRECT) {

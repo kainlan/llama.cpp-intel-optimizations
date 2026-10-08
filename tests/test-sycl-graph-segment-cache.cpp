@@ -169,6 +169,20 @@ int test_failed_runs_direct() {
     return 0;
 }
 
+// A key whose split has nothing worth a graph runs direct for good, counted apart from recordings that failed.
+int test_unprofitable_runs_direct_counted_apart() {
+    gsc::slot_cache<fake_payload> cache(8);
+    const gsc::key                k = layer_key(0);
+    CHECK(cache.begin(k) == gsc::action::WARMUP, "first sight does not warm up");
+    cache.mark_unprofitable(k);
+    CHECK(cache.begin(k) == gsc::action::DIRECT, "an unprofitable key does not run direct");
+    CHECK(cache.begin(k) == gsc::action::DIRECT, "an unprofitable key retries");
+    CHECK(cache.payload(k) == nullptr, "an unprofitable key has a payload");
+    CHECK(cache.stats().unprofitable == 1, "an unprofitable key is not counted");
+    CHECK(cache.stats().failures == 0, "an unprofitable key is counted as a failed recording");
+    return 0;
+}
+
 int test_lru_eviction_retires_payload() {
     gsc::slot_cache<fake_payload> cache(2);
     const gsc::key                a = layer_key(1);
@@ -302,7 +316,8 @@ int test_forget_retires_one_key() {
 
 int main() {
     if (test_hasher() || test_key_fields() || test_lifecycle() || test_same_n_nodes_layers_do_not_share() ||
-        test_interleaved_splits_all_replay() || test_failed_runs_direct() || test_lru_eviction_retires_payload() ||
+        test_interleaved_splits_all_replay() || test_failed_runs_direct() ||
+        test_unprofitable_runs_direct_counted_apart() || test_lru_eviction_retires_payload() ||
         test_evicting_a_warmed_slot_retires_nothing() || test_invalidate_all() ||
         test_record_after_invalidate_is_retired() || test_churn_turns_cache_off() || test_replay_resets_churn_count() ||
         test_forget_retires_one_key()) {

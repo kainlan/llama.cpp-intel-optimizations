@@ -89,12 +89,13 @@ enum class slot_state {
 };
 
 struct counters {
-    uint64_t warmups   = 0;
-    uint64_t records   = 0;
-    uint64_t replays   = 0;
-    uint64_t directs   = 0;
-    uint64_t failures  = 0;
-    uint64_t evictions = 0;
+    uint64_t warmups      = 0;
+    uint64_t records      = 0;
+    uint64_t replays      = 0;
+    uint64_t directs      = 0;
+    uint64_t failures     = 0;  // recordings that went wrong
+    uint64_t unprofitable = 0;  // keys with nothing worth a graph, made direct at warmup
+    uint64_t evictions    = 0;
 };
 
 inline const char * action_name(action a) {
@@ -177,12 +178,14 @@ template <typename Payload> class slot_cache {
 
     void record_failed(const key & k) {
         stats_.failures++;
-        slot * s = find(k);
-        if (s == nullptr) {
-            return;
-        }
-        retire_payload(*s);
-        s->state = slot_state::FAILED;
+        make_direct(k);
+    }
+
+    // A key whose split has nothing worth a graph: it runs direct for good, like a failed one, but is counted apart
+    // so that failures counts only recordings that went wrong.
+    void mark_unprofitable(const key & k) {
+        stats_.unprofitable++;
+        make_direct(k);
     }
 
     // The recorded payload for k, or null.
@@ -243,6 +246,15 @@ template <typename Payload> class slot_cache {
     const counters & stats() const { return stats_; }
 
   private:
+    void make_direct(const key & k) {
+        slot * s = find(k);
+        if (s == nullptr) {
+            return;
+        }
+        retire_payload(*s);
+        s->state = slot_state::FAILED;
+    }
+
     struct slot {
         key        k{};
         slot_state state       = slot_state::WARMED;
