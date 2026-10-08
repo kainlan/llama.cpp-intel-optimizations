@@ -687,6 +687,65 @@ with gate('segment-boundary-flush'):
         assert check_segment_boundary_flush(mutated), "control %r was not caught" % label
     print("PASS segment-boundary-flush-source-gate (%d controls caught)" % len(controls))
 
+def check_segmented_call_ends(code: str) -> list:
+    """llama.cpp-7pm2 B1: a segmented record or replay bypasses compute_impl, so it does compute_impl's per-graph
+    work at both ends: the MoE topology scan first (boundary MoE nodes dispatch against this split's pairs), the
+    graph-completion drain of every pending slot last (outputs are visible when graph_compute returns)."""
+    problems = []
+    try:
+        begin = region(code, "static void moe_graph_segmented_call_begin(", "\n}\n")
+        end = region(code, "static void moe_graph_segmented_call_end() {", "\n}\n")
+        record = region(code, "static bool moe_graph_record_segments(", "struct moe_decode_segmented_graph_stats {")
+        replay = region(code, "static void moe_graph_replay_segments(", "static bool graph_prestage_or_decline(")
+    except ValueError as error:
+        return [str(error)]
+    # Comment-blind text: the /*reset_precomputed=*/ annotation is whitespace here.
+    if not re.search(r"moe_layer_scan_graph_topology\(\*sycl_ctx, cgraph,\s*true,\s*"
+                     r"capture_moe_descriptors\);\s*g_moe_descriptor_prescanned_for_dispatch = false;", begin):
+        problems.append("begin does not rescan this split's MoE topology the way compute_impl does")
+    if "!g_moe_descriptor_prescanned_for_dispatch" not in begin:
+        problems.append("begin captures descriptors even when the decode prescan already did")
+    if "ggml_sycl_cpu_tg_flush_pending();" not in end or "flush_pending_attn_dispatch(d);" not in end:
+        problems.append("end does not drain every pending slot")
+    for name, body, first_use in (("record", record, "moe_graph_collect_dispatch_indices(cgraph)"),
+                                  ("replay", replay, "while (seg_idx <")):
+        at = body.find("moe_graph_segmented_call_begin(sycl_ctx, cgraph);")
+        use = body.find(first_use)
+        if at < 0 or use < 0 or at > use:
+            problems.append("%s: begin is missing or runs after the first dispatch decision" % name)
+    if not re.search(r"moe_graph_segmented_call_end\(\);\s*return true;\s*\}\s*$", record):
+        problems.append("record: the successful record does not end with the drain")
+    if not re.search(r"moe_graph_segmented_call_end\(\);\s*\}\s*$", replay):
+        problems.append("replay: the replay does not end with the drain")
+    return problems
+
+
+with gate('segmented-call-owns-graph-ends'):
+    problems = check_segmented_call_ends(RUNTIME_CODE)
+    assert not problems, "\n".join(problems)
+    _begin_call = "    moe_graph_segmented_call_begin(sycl_ctx, cgraph);\n"
+    assert RUNTIME_CODE.count(_begin_call) == 2
+    controls = {
+        "no topology rescan": re.sub(
+            r"moe_layer_scan_graph_topology\(\*sycl_ctx, cgraph,\s*true,\s*capture_moe_descriptors\);",
+            "(void) capture_moe_descriptors;", RUNTIME_CODE),
+        "rescan keeps the stale precomputed state": re.sub(
+            r"moe_layer_scan_graph_topology\(\*sycl_ctx, cgraph,\s*true,\s*capture_moe_descriptors\);",
+            "moe_layer_scan_graph_topology(*sycl_ctx, cgraph, false, capture_moe_descriptors);", RUNTIME_CODE),
+        "begin dropped from both": RUNTIME_CODE.replace(_begin_call, ""),
+        "end drain dropped from record": RUNTIME_CODE.replace(
+            "    moe_graph_segmented_call_end();\n    return true;\n}", "    return true;\n}"),
+        "end drain dropped from replay": RUNTIME_CODE.replace(
+            "    moe_graph_segmented_call_end();\n}\n", "}\n", 1),
+        "end drain without the CPU slots": RUNTIME_CODE.replace(
+            "static void moe_graph_segmented_call_end() {\n    ggml_sycl_cpu_tg_flush_pending();",
+            "static void moe_graph_segmented_call_end() {"),
+    }
+    for label, mutated in controls.items():
+        assert mutated != RUNTIME_CODE, "control %r did not apply" % label
+        assert check_segmented_call_ends(mutated), "control %r was not caught" % label
+    print("PASS segmented-call-owns-graph-ends-source-gate (%d controls caught)" % len(controls))
+
 with gate('moe-metadata'):
     # Metadata and its derived group registry are built locally and atomically
     # swapped under both writer locks; bad_alloc preserves the old epoch.
@@ -920,4 +979,4 @@ with gate('internal-backing-mint-stays-private'):
     problems = check_internal_backing_mint_stays_private(CACHE)
     assert not problems, "\n".join(problems)
 
-finish(min_checks=62)
+finish(min_checks=63)

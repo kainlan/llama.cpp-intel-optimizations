@@ -99145,6 +99145,28 @@ static void moe_graph_segment_boundary_flush(int device) {
     flush_pending_attn_dispatch(device);
 }
 
+// A segmented record or replay bypasses compute_impl, so it owns the per-graph work compute_impl does at its
+// two ends (llama.cpp-7pm2 B1). At the start: the MoE topology scan, so a boundary MoE node is dispatched against
+// THIS split's gate/up pairs and precomputed-skip state rather than whatever split compute_impl scanned last (a
+// keyed slot replays between other splits' direct calls). At the end: graph completion is an output-visibility
+// boundary, so every deferred MoE merge and host-attention result is published before graph_compute returns,
+// exactly as compute_impl's tail does.
+static void moe_graph_segmented_call_begin(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+    const bool capture_moe_descriptors = !g_moe_descriptor_prescanned_for_dispatch;
+    moe_layer_scan_graph_topology(*sycl_ctx, cgraph, /*reset_precomputed=*/true, capture_moe_descriptors);
+    g_moe_descriptor_prescanned_for_dispatch = false;
+}
+
+static void moe_graph_segmented_call_end() {
+    ggml_sycl_cpu_tg_flush_pending();
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; d++) {
+        if (g_pending_attn_dispatch[d].active) {
+            flush_pending_attn_dispatch(d);
+        }
+        release_stale_attn_dispatch(d);
+    }
+}
+
 // Record segmented graphs for a MoE compute graph.
 // Called after warmup when we know the graph topology is stable.
 // Returns true on success, false on failure (caller should fall back).
@@ -99155,6 +99177,7 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
     g_graph_diag_counters.seg_record_attempts.fetch_add(1, std::memory_order_relaxed);
     GGML_LOG_INFO("[SYCL-SEG] Recording segmented graphs (%d nodes, %s phase)...\n", cgraph->n_nodes,
                   is_decode_phase ? "decode" : "prompt");
+    moe_graph_segmented_call_begin(sycl_ctx, cgraph);
 
     // 1. Identify MoE dispatch boundaries.  The normal decode executor fuses
     // gate/up/GLU/down at the first gate/up node and marks partner nodes as
@@ -99433,6 +99456,7 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
         graphed_segments, moe_indices.size(), sycl_ctx->moe_dispatch_graphs.size(),
         (int) sycl_ctx->moe_segments.size() - graphed_segments, total_segment_nodes, cgraph->n_nodes);
 
+    moe_graph_segmented_call_end();
     return true;
 }
 
@@ -99530,6 +99554,7 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
     GGML_SYCL_DEBUG("[SYCL-SEG] Replaying %zu segments + %zu MoE ops\n", sycl_ctx->moe_segments.size(),
                     sycl_ctx->moe_node_indices.size());
 
+    moe_graph_segmented_call_begin(sycl_ctx, cgraph);
     queue_ptr      stream            = sycl_ctx->stream();
     const uint64_t replay_graph_hash = ggml_sycl_graph_signature(cgraph);
     ggml_sycl_moe_precomputed_skip_new_graph();
@@ -99653,6 +99678,7 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
     }
 
     ggml_sycl_sequence_graphlet_summary_report("TG", false);
+    moe_graph_segmented_call_end();
 }
 
 static bool graph_prestage_or_decline(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, uint64_t graph_hash);
