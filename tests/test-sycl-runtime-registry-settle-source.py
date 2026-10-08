@@ -22,7 +22,9 @@ What this file enforces, as text assertions on comment-stripped unified-cache.cp
     helpers (emplace, erase, assign) call; so a counter cannot drift from the registry the way a hand-kept one would.
     A registered row's handle.host_zone, the field the host counters key on, is never rewritten through the registry.
     Outside that helper a counter name may only be read (a comparison operand, a returned or copied value): assignment,
-    ++/--, reference or pointer binding, address-of, an unsubscripted array and a call argument are all refused.
+    ++/--, a reference declarator or init-capture of ANY type spelling, address-of, an unsubscripted array, a call
+    argument, and a return from a function whose declared return type contains `&` are all refused. A row's
+    handle.host_zone obeys the same rule (assignment, ++/--, address-of, call argument).
 
 NOT COVERED, stated so nobody mistakes this for a proof. This is a tripwire on text, not on cost or on drift:
     - it cannot see what a helper's callee does (a counter read that someone makes expensive passes);
@@ -30,7 +32,10 @@ NOT COVERED, stated so nobody mistakes this for a proof. This is a tripwire on t
       compares the counters with a full scan, and test-unified-runtime-alloc (device) exercises the real settles;
     - a clean-settle slow path that is not a loop over the registry (another global scan, a sleep) passes;
     - functions are bounded at a closing brace in column 0, which is how this file is formatted; `#if 0` blocks and raw
-      string literals are not understood by the comment stripper.
+      string literals are not understood by the comment stripper (ordinary string and char literals are blanked before
+      braces are matched);
+    - a counter or host_zone reached through a macro, a template parameter or a pointer arithmetic expression the text
+      rules do not parse passes; the rules are a name-based tripwire.
 
 Host-only, pure text assertions. llama_test_pytest hands this file to pytest.main(), so the checks live inside test_*()
 functions. Each check has a mutation witness so it is known to fail on the regression it guards.
@@ -74,6 +79,8 @@ EMPLACE = r"runtime_registry_emplace_locked\(\s*void\s*\*\s*ptr\s*,\s*runtime_al
 ERASE_IT = r"runtime_registry_erase_locked\(\s*runtime_registry_iterator\s+it\s*\)\s*noexcept\s*\{"
 ASSIGN = r"runtime_registry_assign_locked\(\s*void\s*\*\s*ptr\s*,\s*const\s+runtime_alloc_record\s*&\s*rec\s*\)\s*\{"
 
+HOST_ARGS = r"zone"
+SPAN_ARGS = r"zone_lo\s*,\s*zone_hi"
 SCAN_HOST = "runtime_registry_scan_host_zone_locked"
 SCAN_SPAN = "runtime_registry_scan_span_locked"
 COUNTERS = ("g_runtime_host_zone_rows", "g_runtime_span_irregular_rows")
@@ -94,8 +101,17 @@ def function_body(code: str, signature: str) -> str:
     return code[start:end]
 
 
+_LITERAL_RE = re.compile(r'"(?:\\.|[^"\\\n])*"' + r"|'(?:\\.|[^'\\\n])*'")
+
+
+def blank_literals(text: str) -> str:
+    """Same-length text with string and char literal contents replaced by spaces, so braces inside them do not count."""
+    return _LITERAL_RE.sub(lambda m: " " * len(m.group(0)), text)
+
+
 def matching_brace(text: str, open_idx: int):
-    """Index of the `}` that closes the `{` at open_idx, or None."""
+    """Index of the `}` that closes the `{` at open_idx, or None (braces inside string and char literals are ignored)."""
+    text = blank_literals(text)
     depth = 0
     for i in range(open_idx, len(text)):
         if text[i] == "{":
@@ -107,7 +123,7 @@ def matching_brace(text: str, open_idx: int):
     return None
 
 
-def settle_violations(body: str, o1_question: str, scan: str):
+def settle_violations(body: str, o1_question: str, scan: str, args: str):
     """What is wrong with a settle body: the O(1) question must be the WHOLE condition of an `if`, and the scan may be
     called only inside that `if`'s block."""
     out = []
@@ -115,10 +131,10 @@ def settle_violations(body: str, o1_question: str, scan: str):
         out.append("names g_runtime_alloc_registry")
     if re.search(r"\b(?:for|while)\s*\([^)]*(?:registry|alloc_index)", body):
         out.append("loops over the registry")
-    gate = re.search(r"\bif\s*\(\s*" + re.escape(o1_question) + r"\s*\([^()]*\)\s*\)\s*\{", body)
+    gate = re.search(r"\bif\s*\(\s*" + re.escape(o1_question) + r"\s*\(\s*" + args + r"\s*\)\s*\)\s*\{", body)
     block = (gate.end() - 1, matching_brace(body, gate.end() - 1)) if gate else None
     if gate is None:
-        out.append(f"has no `if ({o1_question}(...)) {{` (the question must be the whole condition)")
+        out.append(f"has no `if ({o1_question}(<its zone arguments>)) {{` (the question must be the whole condition)")
     elif block[1] is None:
         out.append("the question's block is unbalanced")
     calls = [m.start() for m in re.finditer(re.escape(scan) + r"\s*\(", body)]
@@ -132,12 +148,12 @@ def settle_violations(body: str, o1_question: str, scan: str):
 
 def test_host_zone_settle_does_not_scan_the_registry_when_clean():
     body = function_body(CODE, HOST_SETTLE)
-    assert settle_violations(body, "runtime_registry_host_zone_live_locked", SCAN_HOST) == []
+    assert settle_violations(body, "runtime_registry_host_zone_live_locked", SCAN_HOST, HOST_ARGS) == []
 
 
 def test_zone_settle_does_not_scan_the_registry_when_clean():
     body = function_body(CODE, VRAM_SETTLE)
-    assert settle_violations(body, "runtime_registry_span_live_locked", SCAN_SPAN) == []
+    assert settle_violations(body, "runtime_registry_span_live_locked", SCAN_SPAN, SPAN_ARGS) == []
 
 
 HOST_OK = (
@@ -170,7 +186,7 @@ HOST_OK = (
     ],
 )
 def test_settle_gate_has_a_witness(mutant):
-    assert settle_violations(mutant, "runtime_registry_host_zone_live_locked", SCAN_HOST), mutant
+    assert settle_violations(mutant, "runtime_registry_host_zone_live_locked", SCAN_HOST, HOST_ARGS), mutant
 
 
 def test_real_settle_bodies_defeat_the_question_bypass_mutants():
@@ -179,20 +195,35 @@ def test_real_settle_bodies_defeat_the_question_bypass_mutants():
     assert q in host
     # asks the question, then scans on an always-true condition
     m1 = host.replace(q, "(void) runtime_registry_host_zone_live_locked(zone);\n        if (epoch_tracked || !epoch_tracked) {")
-    assert settle_violations(m1, "runtime_registry_host_zone_live_locked", SCAN_HOST)
+    assert settle_violations(m1, "runtime_registry_host_zone_live_locked", SCAN_HOST, HOST_ARGS)
     m2 = host.replace(q, "if (runtime_registry_host_zone_live_locked(zone) || true) {")
-    assert settle_violations(m2, "runtime_registry_host_zone_live_locked", SCAN_HOST)
+    assert settle_violations(m2, "runtime_registry_host_zone_live_locked", SCAN_HOST, HOST_ARGS)
     vram = function_body(CODE, VRAM_SETTLE)
     q = "if (runtime_registry_span_live_locked(zone_lo, zone_hi)) {"
     assert q in vram
     m3 = vram.replace(q, "if (runtime_registry_span_live_locked(zone_lo, zone_hi) || true) {")
-    assert settle_violations(m3, "runtime_registry_span_live_locked", SCAN_SPAN)
+    assert settle_violations(m3, "runtime_registry_span_live_locked", SCAN_SPAN, SPAN_ARGS)
     m4 = vram.replace(q, "(void) runtime_registry_span_live_locked(zone_lo, zone_hi);\n        if (true) {")
-    assert settle_violations(m4, "runtime_registry_span_live_locked", SCAN_SPAN)
+    assert settle_violations(m4, "runtime_registry_span_live_locked", SCAN_SPAN, SPAN_ARGS)
+
+
+def test_real_settle_bodies_defeat_wrong_argument_and_literal_brace_mutants():
+    host = function_body(CODE, HOST_SETTLE)
+    q = "if (runtime_registry_host_zone_live_locked(zone)) {"
+    m1 = host.replace(q, "if (runtime_registry_host_zone_live_locked(host_zone_id::KV)) {")
+    assert settle_violations(m1, "runtime_registry_host_zone_live_locked", SCAN_HOST, HOST_ARGS)
+    vram = function_body(CODE, VRAM_SETTLE)
+    q = "if (runtime_registry_span_live_locked(zone_lo, zone_hi)) {"
+    m2 = vram.replace(q, "if (runtime_registry_span_live_locked(0, UINTPTR_MAX)) {")
+    assert settle_violations(m2, "runtime_registry_span_live_locked", SCAN_SPAN, SPAN_ARGS)
+    # a `{` inside a string literal must not keep the question's block open past its real end
+    m3 = host.replace(q.replace("span_live_locked(zone_lo, zone_hi)", "host_zone_live_locked(zone)"),
+                      'if (runtime_registry_host_zone_live_locked(zone)) { GGML_LOG_WARN("{"); }\n    if (true) {')
+    assert m3 != host and settle_violations(m3, "runtime_registry_host_zone_live_locked", SCAN_HOST, HOST_ARGS)
 
 
 def test_settle_gate_accepts_the_intended_shape():
-    assert settle_violations(HOST_OK, "runtime_registry_host_zone_live_locked", SCAN_HOST) == []
+    assert settle_violations(HOST_OK, "runtime_registry_host_zone_live_locked", SCAN_HOST, HOST_ARGS) == []
 
 
 SCAN_HOST_SIG = r"static\s+size_t\s+" + SCAN_HOST + r"\("
@@ -327,6 +358,29 @@ _COMPARE_AFTER = re.compile(r"\s*(?:==|!=|<=|>=|<(?!<)|>(?!>))")
 _READ_BEFORE = re.compile(r"(?:\breturn|[=!<>]=|=|<|>|\?|:|&&|\|\|)\s*$")
 
 
+# A reference declarator or init-capture: `T & x =`, `T&& x =`, `[&x =`, whatever the type spelling is.
+_REF_DECLARATOR = re.compile(r"(?<![&\w])&{1,2}\s*\w+\s*=(?!=)|\w\s*&{1,2}\s*\w+\s*=(?!=)")
+
+
+def statement_prefix(code: str, pos: int) -> str:
+    """Text from the previous `;`, `{` or `}` up to pos."""
+    return code[max(code.rfind(c, 0, pos) for c in ";{}") + 1 : pos]
+
+
+def returns_reference(code: str, pos: int) -> bool:
+    """Is pos inside a function whose declared return type contains `&`? Functions start after a column-0 `}` line."""
+    prev = None
+    for prev in re.finditer(r"^\}[^\n]*\n", code[:pos], flags=re.M):
+        pass
+    region = prev.end() if prev else 0
+    brace = code.find("{", region)
+    if brace == -1 or brace > pos:
+        return False
+    header = code[region:brace]
+    header = header[max(header.rfind(";"), header.rfind("}")) + 1 :]
+    return "&" in header.split("(")[0]
+
+
 def counter_writes_outside_the_count_helper(code: str):
     """Every use of a counter name outside the count helper that is not a plain read: an assignment, ++/--, a reference
     binding, address-of, an array used without a subscript (decay: memset/std::fill/pointer), or a call argument
@@ -366,6 +420,13 @@ def counter_writes_outside_the_count_helper(code: str):
             end_use += sub.end()
             after = code[end_use:]
         before = code[: m.start()]
+        prefix = statement_prefix(code, m.start())
+        if _REF_DECLARATOR.search(prefix):
+            note(m.start(), "bound through a reference: " + code[max(0, m.start() - 30) : m.start() + 30])
+            continue
+        if re.match(r"\s*return\b", prefix) and returns_reference(code, m.start()):
+            note(m.start(), "returned from a function returning a reference")
+            continue
         if re.search(r"(?<!&)&\s*$", before):
             note(m.start(), "address-of: " + code[m.start() - 4 : m.start() + 40])
             continue
@@ -397,11 +458,34 @@ def test_counters_are_written_only_by_the_count_helper():
         "std::swap(g_runtime_span_irregular_rows, x);",
         "std::swap(x, g_runtime_host_zone_rows[1]);",
         "size_t * q = &g_runtime_host_zone_rows[2];",
+        "unsigned long & c = g_runtime_span_irregular_rows; c = 0;",
+        "uint64_t & c = g_runtime_host_zone_rows[0]; c = 0;",
+        "size_t & c = flag ? g_runtime_span_irregular_rows : other; c = 0;",
+        "auto l = [&c = g_runtime_span_irregular_rows] { c = 0; };",
+        "auto && c = g_runtime_host_zone_rows[1]; c = 0;",
+        "decltype(auto) c = (g_runtime_span_irregular_rows);",
     ],
 )
 def test_counter_write_gate_has_a_witness(line):
     planted = CODE + "\nvoid f() {\n    " + line + "\n}\n"
     assert counter_writes_outside_the_count_helper(planted), line
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        "static size_t & irregular_ref() noexcept {\n    return g_runtime_span_irregular_rows;\n}\n",
+        "static auto & rows_ref(size_t z) {\n    return g_runtime_host_zone_rows[z];\n}\n",
+        "static const size_t & rows_cref() {\n    return g_runtime_span_irregular_rows;\n}\n",
+    ],
+)
+def test_counter_returned_by_reference_has_a_witness(func):
+    assert counter_writes_outside_the_count_helper(CODE + "\n" + func)
+
+
+def test_counter_returned_by_value_is_a_read():
+    func = "static size_t irregular_value() noexcept {\n    return g_runtime_span_irregular_rows;\n}\n"
+    assert counter_writes_outside_the_count_helper(CODE + "\n" + func) == []
 
 
 @pytest.mark.parametrize(
@@ -447,10 +531,29 @@ def test_the_count_helper_gate_has_witnesses():
 # registry; this adds the one field the counters key on.
 _ASSIGN = r"(?:(?:[-+*/%|&^]|<<|>>)?=(?!=)|\+\+|--)"
 HOST_ZONE_WRITE_RE = re.compile(r"(?:->|\.)\s*second\s*\)*\s*\.\s*handle\s*\)*\s*\.\s*host_zone\s*" + _ASSIGN)
+HOST_ZONE_USE_RE = re.compile(r"(?:->|\.)\s*second\s*\)*\s*\.\s*handle\s*\)*\s*\.\s*host_zone\b")
+
+
+def host_zone_row_writes(code: str):
+    """Rewrites of a registered row's host_zone: assignment, ++/--, address-of, a reference binding, or a call argument."""
+    bad = [m.start() for m in HOST_ZONE_WRITE_RE.finditer(code)]
+    for m in HOST_ZONE_USE_RE.finditer(code):
+        prefix = statement_prefix(code, m.start())
+        after = code[m.end() :]
+        # the object the row is reached through sits left of `->second`; address-of is the token before it
+        if re.search(r"(?<!&)&\s*[\w\(\)\.\->\s]*$", prefix) or _REF_DECLARATOR.search(prefix):
+            bad.append(m.start())
+        elif re.match(r"\s*(?:==|!=|<=|>=|<(?!<)|>(?!>)|;|\?|&&|\|\|)", after):
+            continue
+        elif re.search(r"(?:\breturn|=|\bif\s*\(|\bwhile\s*\()\s*[\w\(\)\.\->\s]*$", prefix):
+            continue
+        else:
+            bad.append(m.start())
+    return sorted(set(bad))
 
 
 def test_a_registered_rows_host_zone_is_never_rewritten():
-    assert HOST_ZONE_WRITE_RE.findall(CODE) == []
+    assert host_zone_row_writes(CODE) == []
 
 
 @pytest.mark.parametrize(
@@ -463,15 +566,28 @@ def test_a_registered_rows_host_zone_is_never_rewritten():
         "it-> second.handle.host_zone = host_zone_id::KV;",
         "(it->second.handle).host_zone = host_zone_id::KV;",
         "((it)->second).handle.host_zone++;",
+        "std::swap(it->second.handle.host_zone, z);",
+        "std::swap(z, it->second.handle.host_zone);",
+        "host_zone_id * zp = &it->second.handle.host_zone;",
+        "host_zone_id & zr = it->second.handle.host_zone;",
+        "consume(it->second.handle.host_zone);",
     ],
 )
 def test_host_zone_write_gate_has_a_witness(line):
-    assert HOST_ZONE_WRITE_RE.findall(CODE + "\nvoid f() {\n    " + line + "\n}\n"), line
+    assert host_zone_row_writes(CODE + "\nvoid f() {\n    " + line + "\n}\n"), line
 
 
-def test_host_zone_write_gate_allows_reads():
-    planted = CODE + "\nvoid f() {\n    if (it->second.handle.host_zone == zone) {}\n}\n"
-    assert HOST_ZONE_WRITE_RE.findall(planted) == []
+@pytest.mark.parametrize(
+    "line",
+    [
+        "if (it->second.handle.host_zone == zone) {}",
+        "const host_zone_id z = it->second.handle.host_zone;",
+        "return it->second.handle.host_zone;",
+        "while (it->second.handle.host_zone != zone) {}",
+    ],
+)
+def test_host_zone_write_gate_allows_reads(line):
+    assert host_zone_row_writes(CODE + "\nvoid f() {\n    " + line + "\n}\n") == [], line
 
 
 STATIC_NAMES = COUNTERS + (SCAN_HOST, SCAN_SPAN, "runtime_registry_host_zone_live_locked", "runtime_registry_span_live_locked")
