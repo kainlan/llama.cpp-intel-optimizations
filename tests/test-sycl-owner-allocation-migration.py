@@ -534,6 +534,28 @@ with gate('graph-preload-refresh-needs-graph'):
     assert decided and decided.start() < compute.index("if (refresh_moe_after_pp || post_prompt_refresh_due)")
     print("PASS graph-preload-refresh-needs-graph-source-gate")
 
+with gate('decode-env-reads-once'):
+    # Both predicates are asked on every decode call; their environment terms are read once.
+    capture = region(RUNTIME, "static bool persistent_tg_moe_descriptor_capture_enabled() {", "\n}\n")
+    assert re.search(r"static const bool\s+\w+\s*=\s*\[\]", capture)
+    lam = capture[capture.index("static const bool"):]
+    for term in ("ggml_sycl::env_persistent_tg_enabled()", "moe_graphlet_probe_enabled()",
+                 "moe_block_graphlet_descriptor_capture_enabled()", "moe_descriptor_capture_probe_enabled()",
+                 'std::getenv("GGML_SYCL_PERSISTENT_TG_LOG_POLICY")'):
+        assert term in lam.split("}();")[0], term
+    assert "g_moe_descriptor_capture_decode_phase && moe_layer_descriptor_executor_enabled()" in lam.split("}();")[1]
+    size = region(RUNTIME, "static int moe_block_graphlet_requested_size(int device) {", "\n}\n")
+    assert re.search(r"static const int\s+\w+\s*=\s*\[\]", size)
+    assert size.index("static const int") < size.index('std::getenv("GGML_SYCL_MOE_BLOCK_GRAPHLETS")')
+    # The non-graph decode path hashes the graph only when block graphlets can run.
+    compute = region(RUNTIME, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                     "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
+    direct = region(compute[compute.rindex("bool block_graphlet_executed = false;"):],
+                    "bool block_graphlet_executed = false;", "if (!block_graphlet_executed)")
+    sized = re.search(r"moe_block_graphlet_requested_size\(sycl_ctx->device\)\s*>\s*0", direct)
+    assert sized and sized.start() < direct.index("ggml_sycl_graph_signature(cgraph)")
+    print("PASS decode-env-reads-once-source-gate")
+
 with gate('moe-metadata'):
     # Metadata and its derived group registry are built locally and atomically
     # swapped under both writer locks; bad_alloc preserves the old epoch.

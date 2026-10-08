@@ -31997,13 +31997,16 @@ static bool moe_descriptor_capture_probe_enabled() {
 }
 
 static bool persistent_tg_moe_descriptor_capture_enabled() {
-    return (g_moe_descriptor_capture_decode_phase && moe_layer_descriptor_executor_enabled()) ||
-           ggml_sycl::env_persistent_tg_enabled() || moe_graphlet_probe_enabled() ||
-           moe_graphlet_replay_probe_enabled() ||
-           (moe_default_fast_path_runtime_enabled() && moe_sequence_graphlets_safe_mode_enabled() &&
-            moe_sequence_graphlets_recording_enabled()) ||
-           moe_block_graphlet_descriptor_capture_enabled() || moe_descriptor_capture_probe_enabled() ||
-           std::getenv("GGML_SYCL_PERSISTENT_TG_LOG_POLICY") != nullptr;
+    // The environment terms are read once: graph_compute asks on every decode call.
+    static const bool env_enabled = [] {
+        return ggml_sycl::env_persistent_tg_enabled() || moe_graphlet_probe_enabled() ||
+               moe_graphlet_replay_probe_enabled() ||
+               (moe_default_fast_path_runtime_enabled() && moe_sequence_graphlets_safe_mode_enabled() &&
+                moe_sequence_graphlets_recording_enabled()) ||
+               moe_block_graphlet_descriptor_capture_enabled() || moe_descriptor_capture_probe_enabled() ||
+               std::getenv("GGML_SYCL_PERSISTENT_TG_LOG_POLICY") != nullptr;
+    }();
+    return (g_moe_descriptor_capture_decode_phase && moe_layer_descriptor_executor_enabled()) || env_enabled;
 }
 
 static bool persistent_tg_capture_tensor_descriptor(ggml_sycl::moe_layer_persistent_tensor_descriptor & descriptor,
@@ -99673,16 +99676,20 @@ static int moe_block_graphlet_requested_size_from_env(const char * enabled_env, 
 
 static int moe_block_graphlet_requested_size(int device) {
     GGML_UNUSED(device);
-    const char * enabled_env = std::getenv("GGML_SYCL_MOE_BLOCK_GRAPHLETS");
-    const char * size_env    = std::getenv("GGML_SYCL_MOE_BLOCK_GRAPHLET_SIZE");
-    if (moe_default_fast_path_env_explicitly_disabled()) {
-        return 0;
-    }
-    if (moe_block_graphlet_bulk_xmx_phase_disabled()) {
-        moe_block_graphlet_log_bulk_xmx_phase_disabled_once();
-        return 0;
-    }
-    return moe_block_graphlet_requested_size_from_env(enabled_env, size_env);
+    // Read once: the non-graph decode path asks on every call.
+    static const int requested_size = [] {
+        const char * enabled_env = std::getenv("GGML_SYCL_MOE_BLOCK_GRAPHLETS");
+        const char * size_env    = std::getenv("GGML_SYCL_MOE_BLOCK_GRAPHLET_SIZE");
+        if (moe_default_fast_path_env_explicitly_disabled()) {
+            return 0;
+        }
+        if (moe_block_graphlet_bulk_xmx_phase_disabled()) {
+            moe_block_graphlet_log_bulk_xmx_phase_disabled_once();
+            return 0;
+        }
+        return moe_block_graphlet_requested_size_from_env(enabled_env, size_env);
+    }();
+    return requested_size;
 }
 
 static const char * moe_aggregation_selected_decision() {
@@ -110147,7 +110154,8 @@ normal_dispatch:
     {
 #ifdef GGML_SYCL_GRAPH
         bool block_graphlet_executed = false;
-        if (cached_is_decode) {
+        // The graph is hashed only when block graphlets can run; with them off the try would reject anyway.
+        if (cached_is_decode && moe_block_graphlet_requested_size(sycl_ctx->device) > 0) {
             const uint64_t block_graph_hash = ggml_sycl_graph_signature(cgraph);
             if (moe_graph_try_block_graphlets(sycl_ctx, cgraph, block_graph_hash, cached_is_decode)) {
                 graph_executed          = true;
