@@ -1147,6 +1147,97 @@ with gate('keyed-q8-cache-invalidation'):
         assert check_keyed_q8_cache(mutated), "control %r was not caught" % label
     print("PASS keyed-q8-cache-invalidation-source-gate (%d controls caught)" % len(controls))
 
+MMID_SKIP_DEF = "static bool ggml_sycl_moe_skip_precomputed_mmid(ggml_backend_sycl_context & ctx, ggml_tensor * node) {"
+SEG_DISPATCH_DEF = "static bool moe_graph_dispatch_direct_node(ggml_backend_sycl_context * sycl_ctx, ggml_tensor * node) {"
+COMPUTE_IMPL_DEF = "static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {"
+
+
+def check_keyed_precomputed_mmid_skip(code: str) -> list:
+    """llama.cpp-7pm2: a fused MoE executor running on a layer's gate MUL_MAT_ID also writes the up and down
+    MUL_MAT_IDs and marks them in g_moe_precomputed_mmid_skip. ggml_sycl_mul_mat_id honors the mark only for
+    prompt shapes, so on decode the dispatcher must: compute_impl did, and the keyed record/replay called
+    ggml_sycl_compute_forward on every boundary instead, rerunning both nodes per layer through the generic
+    route (a host readback of the routing ids each). One helper owns the skip and its side effects; compute_impl
+    and every keyed direct dispatch go through it."""
+    problems = []
+    try:
+        helper = region(code, MMID_SKIP_DEF, "\n}\n")
+        dispatch = region(code, SEG_DISPATCH_DEF, "\n}\n")
+        impl = region(code, COMPUTE_IMPL_DEF, "\n}\n")
+        record = region(code, "static void moe_graph_record_segment_slot(", "static void moe_graph_replay_segment_slot(")
+        replay = region(code, "static void moe_graph_replay_segment_slot(", "static bool moe_graph_record_segments(")
+    except ValueError as error:
+        return [str(error)]
+    if not re.search(r"node->op\s*!=\s*GGML_OP_MUL_MAT_ID\s*\|\|\s*"
+                     r"!ggml_sycl_moe_precomputed_skip_contains\(g_moe_precomputed_mmid_skip,\s*node,\s*ctx\.device\)"
+                     r"\)\s*\{\s*return false;\s*\}", helper):
+        problems.append("helper: does not test the exact MUL_MAT_ID mark before skipping")
+    tail = helper[helper.find("return false;") + 1:]
+    for effect in ("ggml_sycl_moe_residual_add_id_skip_clear_last();",
+                   "ggml_sycl_moe_down_sum_shadow_compare(ctx, node);", "return true;"):
+        if effect not in tail:
+            problems.append("helper: a skipped node does not run %s" % effect)
+    if not re.search(r"if\s*\(\s*!node\s*\|\|\s*ggml_sycl_is_noop\(node\)\s*\|\|\s*"
+                     r"ggml_sycl_moe_skip_precomputed_mmid\(\*sycl_ctx,\s*node\)\s*\)\s*\{\s*return false;\s*\}\s*"
+                     r"ggml_sycl_compute_forward\(\*sycl_ctx,\s*node\);\s*return true;", dispatch):
+        problems.append("dispatch: the keyed direct dispatch does not consult the skip before compute_forward")
+    if not re.search(r"if\s*\(ggml_sycl_moe_skip_precomputed_mmid\(\*sycl_ctx,\s*node\)\)\s*\{\s*continue;\s*\}", impl):
+        problems.append("compute_impl: the decode early-skip does not go through the shared helper")
+    if "g_moe_precomputed_mmid_skip, node, sycl_ctx->device" in impl:
+        problems.append("compute_impl: keeps its own copy of the MUL_MAT_ID mark test")
+    for name, body in (("record", record), ("replay", replay)):
+        if "ggml_sycl_compute_forward(" in body:
+            problems.append("%s: dispatches a node without the precomputed-skip helper" % name)
+    if record.count("moe_graph_dispatch_direct_node(sycl_ctx, cgraph->nodes[i])") < 2:
+        problems.append("record: the direct and recorded node loops do not both use the shared dispatch")
+    if not re.search(r"if\s*\(moe_graph_dispatch_direct_node\(sycl_ctx,\s*node\)\s*&&\s*"
+                     r"node->op\s*==\s*GGML_OP_MUL_MAT_ID\)\s*\{\s*"
+                     r"g_graph_diag_counters\.seg_moe_dispatches\.fetch_add", replay):
+        problems.append("replay: a boundary is counted or dispatched without the shared dispatch")
+    if replay.count("moe_graph_dispatch_direct_node(sycl_ctx, ") < 2:
+        problems.append("replay: the direct segment loop does not use the shared dispatch")
+    return problems
+
+
+with gate('keyed-precomputed-mmid-skip'):
+    problems = check_keyed_precomputed_mmid_skip(RUNTIME_CODE)
+    assert not problems, "\n".join(problems)
+    _helper = region(RUNTIME_CODE, MMID_SKIP_DEF, "\n}\n")
+    _dispatch = region(RUNTIME_CODE, SEG_DISPATCH_DEF, "\n}\n")
+    _impl = region(RUNTIME_CODE, COMPUTE_IMPL_DEF, "\n}\n")
+    _rec = region(RUNTIME_CODE, "static void moe_graph_record_segment_slot(", "static void moe_graph_replay_segment_slot(")
+    _rep = region(RUNTIME_CODE, "static void moe_graph_replay_segment_slot(", "static bool moe_graph_record_segments(")
+
+    def _swap(body, old, new, count=1):
+        assert old in body, "control anchor missing: %r" % old
+        return RUNTIME_CODE.replace(body, body.replace(old, new, count), 1)
+
+    _nth = lambda body, old, new, n: RUNTIME_CODE.replace(  # noqa: E731
+        body, body[:[i for i in range(len(body)) if body.startswith(old, i)][n]] + new +
+        body[[i for i in range(len(body)) if body.startswith(old, i)][n] + len(old):], 1)
+    controls = {
+        "helper tests the node mark set": _swap(_helper, "g_moe_precomputed_mmid_skip", "g_moe_precomputed_node_skip"),
+        "helper drops clear_last": _swap(_helper, "ggml_sycl_moe_residual_add_id_skip_clear_last();", ""),
+        "helper drops shadow compare": _swap(_helper, "ggml_sycl_moe_down_sum_shadow_compare(ctx, node);", ""),
+        "dispatch skips no mark": _swap(_dispatch, " || ggml_sycl_moe_skip_precomputed_mmid(*sycl_ctx, node)", ""),
+        "compute_impl inline copy": _swap(
+            _impl, "if (ggml_sycl_moe_skip_precomputed_mmid(*sycl_ctx, node)) {",
+            "if (node->op == GGML_OP_MUL_MAT_ID && ggml_sycl_moe_precomputed_skip_contains("
+            "g_moe_precomputed_mmid_skip, node, sycl_ctx->device)) {"),
+        "record direct loop bypasses": _nth(_rec, "moe_graph_dispatch_direct_node(sycl_ctx, cgraph->nodes[i])",
+                                            "ggml_sycl_compute_forward(*sycl_ctx, cgraph->nodes[i])", 0),
+        "record recorded loop bypasses": _nth(_rec, "moe_graph_dispatch_direct_node(sycl_ctx, cgraph->nodes[i])",
+                                              "ggml_sycl_compute_forward(*sycl_ctx, cgraph->nodes[i])", 1),
+        "replay boundary bypasses": _swap(_rep, "if (moe_graph_dispatch_direct_node(sycl_ctx, node) &&",
+                                          "if (ggml_sycl_compute_forward(*sycl_ctx, node) &&"),
+        "replay direct segment bypasses": _nth(_rep, "moe_graph_dispatch_direct_node(sycl_ctx, ",
+                                               "ggml_sycl_compute_forward(*sycl_ctx, ", 0),
+    }
+    for label, mutated in controls.items():
+        assert mutated != RUNTIME_CODE, "control %r did not apply" % label
+        assert check_keyed_precomputed_mmid_skip(mutated), "control %r was not caught" % label
+    print("PASS keyed-precomputed-mmid-skip-source-gate (%d controls caught)" % len(controls))
+
 def check_keyed_slot_input_staging(code: str, common: str) -> list:
     """llama.cpp-7pm2 review I3: a slot's graphs bake the staging copies of its inputs. The staging map is keyed by
     tensor struct (not by the slot key) and is cleared at a phase boundary before the slots drain, so the slot owns

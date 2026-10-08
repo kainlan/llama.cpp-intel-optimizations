@@ -86939,6 +86939,22 @@ static void ggml_sycl_moe_down_sum_shadow_compare(ggml_backend_sycl_context & ct
             static_cast<double>(normal_v));
 }
 
+// A fused MoE executor running on a layer's gate MUL_MAT_ID also writes that layer's partner and down MUL_MAT_IDs
+// and marks them. ggml_sycl_mul_mat_id honors the mark only for prompt shapes, so on decode the dispatcher must:
+// a node dispatched without this check reruns through the generic route, including a host readback of the routing
+// ids. Every dispatcher that walks graph nodes (compute_impl, the keyed segment record and replay) asks here.
+static bool ggml_sycl_moe_skip_precomputed_mmid(ggml_backend_sycl_context & ctx, ggml_tensor * node) {
+    if (node->op != GGML_OP_MUL_MAT_ID ||
+        !ggml_sycl_moe_precomputed_skip_contains(g_moe_precomputed_mmid_skip, node, ctx.device)) {
+        return false;
+    }
+    GGML_SYCL_DEBUG("[MOE-PAIR] Early-skip precomputed MUL_MAT_ID %s\n",
+                    node->src[0] && node->src[0]->name ? node->src[0]->name : "?");
+    ggml_sycl_moe_residual_add_id_skip_clear_last();
+    ggml_sycl_moe_down_sum_shadow_compare(ctx, node);
+    return true;
+}
+
 static sycl::event ggml_sycl_router_f32_bias_argsort_sycl(sycl::queue & queue,
                                                           const float * weight,
                                                           const float * act,
@@ -96377,12 +96393,7 @@ gpu_dispatch:
             // re-entering ggml_sycl_mul_mat_id(), so skipped partner/down nodes do not pay profiling queue drains
             // or host dispatch/bookkeeping.  Keep this to the exact semantic marker (not the broader down-layer
             // pending predicate) so we only bypass nodes whose output was explicitly produced by the executor.
-            if (node->op == GGML_OP_MUL_MAT_ID &&
-                ggml_sycl_moe_precomputed_skip_contains(g_moe_precomputed_mmid_skip, node, sycl_ctx->device)) {
-                GGML_SYCL_DEBUG("[MOE-PAIR] Early-skip precomputed MUL_MAT_ID %s\n",
-                                node->src[0] && node->src[0]->name ? node->src[0]->name : "?");
-                ggml_sycl_moe_residual_add_id_skip_clear_last();
-                ggml_sycl_moe_down_sum_shadow_compare(*sycl_ctx, node);
+            if (ggml_sycl_moe_skip_precomputed_mmid(*sycl_ctx, node)) {
                 continue;
             }
 
@@ -99583,6 +99594,16 @@ struct moe_segmented_dispatch_scope {
 // to record runs directly and stays direct in the slot. Everything a recorded graph baked a pointer to is retained
 // in the slot: what the recording sink collected, the pool scratch freed while recording, the Q8 activation
 // buffer, and the weight handles its nodes read.
+// The keyed segment paths walk nodes outside compute_impl, so they take its precomputed-MUL_MAT_ID skip from the
+// shared helper: a boundary whose output a fused executor already wrote is not run again. Returns whether it ran.
+static bool moe_graph_dispatch_direct_node(ggml_backend_sycl_context * sycl_ctx, ggml_tensor * node) {
+    if (!node || ggml_sycl_is_noop(node) || ggml_sycl_moe_skip_precomputed_mmid(*sycl_ctx, node)) {
+        return false;
+    }
+    ggml_sycl_compute_forward(*sycl_ctx, node);
+    return true;
+}
+
 static void moe_graph_record_segment_slot(ggml_backend_sycl_context *                   sycl_ctx,
                                           ggml_cgraph *                                 cgraph,
                                           ggml_backend_sycl_context::moe_segment_slot & slot) {
@@ -99602,10 +99623,7 @@ static void moe_graph_record_segment_slot(ggml_backend_sycl_context *           
 
     auto dispatch_direct = [&](int start, int end) {
         for (int i = start; i < end; i++) {
-            ggml_tensor * node = cgraph->nodes[i];
-            if (node && !ggml_sycl_is_noop(node)) {
-                ggml_sycl_compute_forward(*sycl_ctx, node);
-            }
+            moe_graph_dispatch_direct_node(sycl_ctx, cgraph->nodes[i]);
         }
     };
 
@@ -99662,13 +99680,9 @@ static void moe_graph_record_segment_slot(ggml_backend_sycl_context *           
             seg_graph.begin_recording(*stream);
             end_guard.open = true;
             for (int i = item.start; i < item.end; i++) {
-                ggml_tensor * node = cgraph->nodes[i];
-                if (!node || ggml_sycl_is_noop(node)) {
-                    continue;
-                }
                 recording_node_index = i;
-                recording_node       = node;
-                ggml_sycl_compute_forward(*sycl_ctx, node);
+                recording_node       = cgraph->nodes[i];
+                moe_graph_dispatch_direct_node(sycl_ctx, cgraph->nodes[i]);
             }
             end_guard.open = false;
             seg_graph.end_recording();
@@ -99768,18 +99782,12 @@ static void moe_graph_replay_segment_slot(ggml_backend_sycl_context *           
             }
             g_graph_diag_counters.seg_direct_segments.fetch_add(1, std::memory_order_relaxed);
             for (int i = seg.start_node; i < seg.end_node; i++) {
-                ggml_tensor * node = cgraph->nodes[i];
-                if (node && !ggml_sycl_is_noop(node)) {
-                    ggml_sycl_compute_forward(*sycl_ctx, node);
-                }
+                moe_graph_dispatch_direct_node(sycl_ctx, cgraph->nodes[i]);
             }
         } else {
             ggml_tensor * node = cgraph->nodes[slot.boundary_nodes[b_idx++]];
-            if (node && !ggml_sycl_is_noop(node)) {
-                if (node->op == GGML_OP_MUL_MAT_ID) {
-                    g_graph_diag_counters.seg_moe_dispatches.fetch_add(1, std::memory_order_relaxed);
-                }
-                ggml_sycl_compute_forward(*sycl_ctx, node);
+            if (moe_graph_dispatch_direct_node(sycl_ctx, node) && node->op == GGML_OP_MUL_MAT_ID) {
+                g_graph_diag_counters.seg_moe_dispatches.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
