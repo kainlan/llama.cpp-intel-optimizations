@@ -128,7 +128,7 @@ _ROW_OR_GEOMETRY = r"\bsecond\b(?!\s*\.\s*(?!handle\b)\w)(?!\s*\.\s*handle\s*\.\
 # for in functions that touch the registry.
 ROW_ALIAS_RE = re.compile(
     # auto & r = it->second;  auto * q = &it->second.handle;  alloc_metadata & h = it->second.handle;
-    r"(?<!const )(?<!const\t)\b(?:auto|alloc_metadata|runtime_alloc_record)\s*(?:&&?|\*)\s*\w+\s*(?:=|\{|\()[^;{}]*"
+    r"(?<!const )(?<!const\t)\b(?:auto|alloc_metadata|runtime_alloc_record)\s*(?:&&?|\*)\s*(?:const\s+)?\w+\s*(?:=|\{|\()[^;{}]*"
     + _ROW_OR_GEOMETRY
     # auto q = &it->second;   (a pointer deduced from an address-of; `const auto q` is still a pointer to a mutable row)
     + r"|\bauto\s+\w+\s*=\s*&[^;{}]*"
@@ -166,7 +166,7 @@ _ASSIGN = r"(?:(?:[-+*/%|&^]|<<|>>)?=(?!=)|\+\+|--)"  # =, op=, ++, -- ; not ==,
 # parentheses may sit between the parts).
 GEOMETRY_WRITE_RE = re.compile(
     r"(?:->|\.)\s*second\s*\)*\s*\.\s*handle\s*\)*\s*(?:\.\s*(?:ptr|size)\s*\)*\s*)?" + _ASSIGN
-    + r"|(?:\+\+|--)\s*[\w.>()\-]*?(?:->|\.)\s*second\s*\)*\s*\.\s*handle\s*\)*\s*\.\s*(?:ptr|size)\b"
+    + r"|(?:\+\+|--)\s*[\w.>()\-\[\]*]*?(?:->|\.)\s*second\s*\)*\s*\.\s*handle\s*\)*\s*\.\s*(?:ptr|size)\b"
 )
 # The address of a row's identity or geometry, whatever the pointer is declared as: `size_t * s = &it->second.handle.size;`,
 # `void ** s = &it->second.handle.ptr;`, `*(&it->second.handle.size) = 0;`. `&it->second.handle.alloc_id` (another field)
@@ -176,7 +176,7 @@ ADDRESS_OF_GEOMETRY_RE = re.compile(
 )
 # A whole row written through an iterator/reference: `it->second = rec;`, `registry.find(p)->second = rec;`. Scanned over
 # the whole file (a helper that takes the iterator never names the registry), minus ROW_WRITE_ALLOWLIST.
-ROW_WRITE_RE = re.compile(r"(?:->|\.)second\s*" + _ASSIGN)
+ROW_WRITE_RE = re.compile(r"(?:->|\.)\s*second\s*\)*\s*" + _ASSIGN)
 # The `second` writes in the file that are rows of the registry or are NOT registry rows, each checked by hand. Keyed by
 # (enclosing function, stripped source line) with the exact number of times that line appears in that function: a second
 # copy in the same function, the same line in another function, and an entry that no longer matches all fail.
@@ -618,6 +618,7 @@ def test_registered_row_geometry_is_never_rewritten_outside_the_allowlist():
         "++g_runtime_alloc_registry.find(p)->second.handle.size;",
         "g_runtime_alloc_registry.find(p)->second.handle.size = 0;",
         # parenthesised access paths
+        "++(*it).second.handle.size;",
         "(it->second).handle.size = 0;",
         "((*it).second).handle.size = 0;",
         "(it->second.handle).size = 0;",
@@ -733,6 +734,8 @@ def mutate(code: str, old: str, new: str) -> str:
         # an allowed line copied into a function that is not the allowed one
         "void f() {\n    current->second = replacement;\n}",
         "void f() {\n    it->second = std::move(fresh);\n}",
+        # parenthesised row access
+        "void f() {\n    (it->second) = rec;\n}",
     ],
 )
 def test_row_write_gate_has_a_witness(text):
@@ -786,7 +789,8 @@ def test_the_geometry_allowlist_is_exact_and_confined_to_private_testing():
     guarded = "#if defined(GGML_SYCL_PRIVATE_TESTING)\n" + body + "#endif\n"
     assert allowlist_violations(guarded, GEOMETRY_WRITE_RE, allow, private_testing_only=True) == []
     after_endif = guarded + body
-    assert allowlist_violations(after_endif, GEOMETRY_WRITE_RE, allow, private_testing_only=True)
+    violations = allowlist_violations(after_endif, GEOMETRY_WRITE_RE, allow, private_testing_only=True)
+    assert any(v[0] == "unguarded" for v in violations)
     in_else = "#if defined(GGML_SYCL_PRIVATE_TESTING)\n#else\n" + body + "#endif\n"
     assert allowlist_violations(in_else, GEOMETRY_WRITE_RE, allow, private_testing_only=True)
     nested = "#if defined(GGML_SYCL_PRIVATE_TESTING)\n#if X\n#endif\n" + body + "#endif\n"
@@ -802,6 +806,7 @@ def test_the_geometry_allowlist_is_exact_and_confined_to_private_testing():
         "decltype(auto) r = it->second;",
         "auto * q = &it->second;",
         "runtime_alloc_record * q = &it->second;",
+        "auto * const q = &it->second;",
     ],
 )
 def test_more_alias_forms_have_a_witness(line):
