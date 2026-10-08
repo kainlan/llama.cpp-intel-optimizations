@@ -27,10 +27,16 @@ namespace ggml_sycl {
 // unit-tested without oneAPI (docs/plans/2026-08-27-tkv13-b2-addendum.md §2,
 // §6 step 1).
 
+// Deepest src[] level the dependency walk expands (level 0 is the queried
+// tensor itself). A dependency further away is not seen, which bounds the cost
+// per op and was the cap of the original recursion.
+constexpr int attn_dependency_walk_max_depth = 32;
+
 // Does `tensor` transitively read `target`, walking the view_src chain at
-// every node and recursing into every ggml_tensor::src[]? Depth-bounded
-// (`depth > 32`) and visited-set deduplicated, so a malformed graph with a
-// src[] cycle terminates and converging paths cost their node count.
+// every node and following every ggml_tensor::src[], breadth first? Bounded by
+// attn_dependency_walk_max_depth and visited-set deduplicated, so a malformed
+// graph with a src[] cycle terminates and converging paths cost their node
+// count.
 bool attn_tensor_depends_on(const ggml_tensor * tensor, const ggml_tensor * target, int depth = 0);
 
 // Same answer as attn_tensor_depends_on; additionally reports in *visits (when

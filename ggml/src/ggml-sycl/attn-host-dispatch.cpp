@@ -17,6 +17,10 @@ namespace {
 // allocates nothing once warm. The visited set is open-addressed and stamped
 // with a per-call generation, so starting a walk never clears the table.
 struct dependency_scratch {
+    // The probes mask with `size - 1`, so the table size must stay a power of
+    // two; grow() doubles it, which preserves that.
+    static constexpr size_t initial_table_size = 256;
+
     struct slot {
         const ggml_tensor * key = nullptr;
         uint32_t            gen = 0;
@@ -30,7 +34,7 @@ struct dependency_scratch {
 
     void begin() {
         if (table.empty()) {
-            table.resize(256);
+            table.resize(initial_table_size);
         }
         if (++gen == 0) {  // generation wrapped: stale stamps could alias
             for (slot & s : table) {
@@ -94,13 +98,16 @@ bool depends_on_any(const ggml_tensor * const * seeds,
     if (visits) {
         *visits = 0;
     }
-    if (!target || depth > 32) {
+    if (!target || depth > attn_dependency_walk_max_depth) {
         return false;
     }
     // Level-synchronous so a node is first reached at its shortest distance:
-    // "some path of depth <= 32 reaches target" is exactly "target is within 32
-    // levels", which is what the old path-by-path recursion computed, but each
-    // node is expanded once instead of once per path.
+    // "some path within the depth cap reaches target" is exactly "target is
+    // within the cap's levels", which is what the old path-by-path recursion
+    // computed, but each node is expanded once instead of once per path.
+    // Per-thread computational scratch: no owner, no teardown, reset by begin()
+    // on every call. It lives in this TU, which the static-storage audit
+    // (scripts/audit-sycl-static-storage.py) does not scan, so it has no row.
     thread_local dependency_scratch sc;
     sc.begin();
     for (int i = 0; i < n_seeds; ++i) {
@@ -109,7 +116,7 @@ bool depends_on_any(const ggml_tensor * const * seeds,
         }
     }
     size_t n_visits = 0;
-    for (; depth <= 32 && !sc.frontier.empty(); ++depth) {
+    for (; depth <= attn_dependency_walk_max_depth && !sc.frontier.empty(); ++depth) {
         sc.next.clear();
         for (const ggml_tensor * node : sc.frontier) {
             ++n_visits;

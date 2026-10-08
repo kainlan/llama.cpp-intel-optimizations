@@ -14,8 +14,12 @@
         }                                                                       \
     } while (0)
 
+using ggml_sycl::attn_dependency_walk_max_depth;
+
 // Reference: the original path-by-path recursion, exhaustive, counting every
-// call. Its count is the cost the production walk used to pay.
+// call. Its count is the cost the production walk used to pay. It keeps the
+// literal 32 because it is the old algorithm verbatim, independent of the
+// production constant.
 static bool reference_depends_on(const ggml_tensor * tensor, const ggml_tensor * target, int depth, size_t & calls) {
     if (!tensor || !target || depth > 32) {
         return false;
@@ -32,6 +36,32 @@ static bool reference_depends_on(const ggml_tensor * tensor, const ggml_tensor *
         }
     }
     return false;
+}
+
+// Distinct nodes the production walk can expand from `seeds`: breadth-first,
+// levels 0..max_depth. For an unreachable target the walk expands exactly this
+// set, so it is both the upper bound and the expected count.
+static size_t reachable_within_cap(const ggml_tensor * const * seeds, int n_seeds) {
+    std::set<const ggml_tensor *>    seen;
+    std::vector<const ggml_tensor *> level;
+    for (int i = 0; i < n_seeds; ++i) {
+        if (seeds[i] && seen.insert(seeds[i]).second) {
+            level.push_back(seeds[i]);
+        }
+    }
+    for (int d = 0; d <= attn_dependency_walk_max_depth && !level.empty(); ++d) {
+        std::vector<const ggml_tensor *> next;
+        for (const ggml_tensor * t : level) {
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                if (t->src[i] && seen.insert(t->src[i]).second) {
+                    next.push_back(t->src[i]);
+                }
+            }
+        }
+        level.swap(next);
+    }
+    // Nodes first reached one level past the cap are never expanded.
+    return seen.size() - level.size();
 }
 
 static ggml_tensor * node(ggml_context * ctx) {
@@ -87,29 +117,33 @@ int main() {
         const bool                 got = ggml_sycl::attn_tensor_depends_on_counted(xs.back(), other, 0, &visits);
         CHECK(!ref && !got, "case 2: unreachable target is not a dependency");
         std::printf("case 2 (unreachable, 12 layers): reference calls=%zu, visits=%zu\n", ref_calls, visits);
-        CHECK(visits <= xs.size() * 2 - 1, "case 2: each node expanded at most once");
+        const ggml_tensor * xs_root = xs.back();
+        CHECK(visits == reachable_within_cap(&xs_root, 1), "case 2: unreachable walk expands each node exactly once");
 
         size_t visits64 = 0;
         CHECK(!ggml_sycl::attn_tensor_depends_on_counted(root, other, 0, &visits64), "case 2: 64-layer unreachable");
         std::printf("case 2 (unreachable, 64 layers): visits=%zu\n", visits64);
-        CHECK(visits64 <= n_nodes, "case 2: 64-layer visits at most once per node");
-        CHECK(visits64 <= 70, "case 2: visits bounded by the depth cap, not by the path count");
+        const ggml_tensor * root_seed = root;
+        CHECK(visits64 == reachable_within_cap(&root_seed, 1),
+              "case 2: 64-layer walk bounded by the depth cap, not by the path count");
     }
 
     // 3. target reachable only through a view_src chain.
     {
-        ggml_tensor * base = x[n_layers - 5];
-        ggml_tensor * v1   = ggml_view_1d(ctx, base, 4, 0);
-        ggml_tensor * v2   = ggml_view_1d(ctx, v1, 2, 0);
-        ggml_tensor * c    = node(ctx);
-        c->src[0]          = v2;
-        ggml_tensor * top  = node(ctx);
-        top->src[0]        = x[n_layers - 4];
-        top->src[1]        = c;
-        size_t ref_calls = 0, visits = 0;
+        ggml_tensor * base            = x[n_layers - 5];
+        ggml_tensor * v1              = ggml_view_1d(ctx, base, 4, 0);
+        ggml_tensor * v2              = ggml_view_1d(ctx, v1, 2, 0);
+        ggml_tensor * c               = node(ctx);
+        c->src[0]                     = v2;
+        ggml_tensor * top             = node(ctx);
+        top->src[0]                   = x[n_layers - 4];
+        top->src[1]                   = c;
+        size_t              ref_calls = 0, visits = 0;
+        const ggml_tensor * top_seed = top;
         CHECK(reference_depends_on(top, base, 0, ref_calls), "case 3: reference sanity");
         CHECK(ggml_sycl::attn_tensor_depends_on_counted(top, base, 0, &visits),
               "case 3: view_src chain reaches target");
+        CHECK(visits <= reachable_within_cap(&top_seed, 1), "case 3: each node expanded at most once");
         CHECK(ggml_sycl::attn_tensor_depends_on(top, base), "case 3: plain entry point agrees");
     }
 
@@ -120,8 +154,9 @@ int main() {
         CHECK(!ggml_sycl::attn_tensor_depends_on_counted(nullptr, root, 0, &visits) && visits == 0,
               "case 4: null tensor");
         CHECK(!ggml_sycl::attn_tensor_depends_on_counted(root, nullptr, 0, &visits), "case 4: null target");
-        CHECK(!ggml_sycl::attn_tensor_depends_on_counted(root, root->src[0], 33, &visits),
-              "case 4: starting past the cap");
+        CHECK(
+            !ggml_sycl::attn_tensor_depends_on_counted(root, root->src[0], attn_dependency_walk_max_depth + 1, &visits),
+            "case 4: starting past the cap");
 
         std::vector<ggml_tensor *> chain;
         chain.push_back(node(ctx));
@@ -134,8 +169,10 @@ int main() {
         const bool ref       = reference_depends_on(chain.back(), chain[0], 0, ref_calls);
         const bool got       = ggml_sycl::attn_tensor_depends_on(chain.back(), chain[0]);
         CHECK(ref == got, "case 4: cap behaviour matches the reference");
-        CHECK(ggml_sycl::attn_tensor_depends_on(chain.back(), chain[40 - 32]), "case 4: exactly at the cap is found");
-        CHECK(!ggml_sycl::attn_tensor_depends_on(chain.back(), chain[40 - 33]), "case 4: one past the cap is not");
+        CHECK(ggml_sycl::attn_tensor_depends_on(chain.back(), chain[40 - attn_dependency_walk_max_depth]),
+              "case 4: exactly at the cap is found");
+        CHECK(!ggml_sycl::attn_tensor_depends_on(chain.back(), chain[40 - attn_dependency_walk_max_depth - 1]),
+              "case 4: one past the cap is not");
     }
 
     // 5. a src[] self-cycle terminates.
@@ -152,7 +189,7 @@ int main() {
               "case 6: a node is not its own consumer");
     }
 
-    // 7. consumer entry point: a residual block's two srcs (x[n-1] and f)
+    // 7. consumer entry point: a residual block's two srcs (the last layer's output and its f)
     // share their whole upstream subgraph, so one walk must expand each
     // distinct node once, not once per src.
     {
@@ -167,29 +204,10 @@ int main() {
             per_src += v;
         }
         std::printf("case 7 (consumer, two shared srcs): one walk visits=%zu, per-src walks=%zu\n", visits, per_src);
-        // Bound by the distinct nodes within 32 levels of the srcs, not by the
-        // whole graph: the cap hides the deepest layers, so n_nodes would let a
-        // per-src walk (which re-expands the shared part) pass.
-        std::set<const ggml_tensor *>    seen;
-        std::vector<const ggml_tensor *> level;
-        for (int i = 0; i < GGML_MAX_SRC; ++i) {
-            if (block->src[i] && seen.insert(block->src[i]).second) {
-                level.push_back(block->src[i]);
-            }
-        }
-        for (int d = 0; d <= 32 && !level.empty(); ++d) {
-            std::vector<const ggml_tensor *> next;
-            for (const ggml_tensor * t : level) {
-                for (int i = 0; i < GGML_MAX_SRC; ++i) {
-                    if (t->src[i] && seen.insert(t->src[i]).second) {
-                        next.push_back(t->src[i]);
-                    }
-                }
-            }
-            level.swap(next);
-        }
-        // Nodes first reached at level 33 are never expanded, so drop them.
-        const size_t reachable = seen.size() - level.size();
+        // Bound by the distinct nodes within the depth cap of the srcs, not by
+        // the whole graph: the cap hides the deepest layers, so n_nodes would
+        // let a per-src walk (which re-expands the shared part) pass.
+        const size_t reachable = reachable_within_cap(block->src, GGML_MAX_SRC);
         std::printf("case 7: distinct reachable within the cap=%zu\n", reachable);
         CHECK(visits <= reachable, "case 7: consumer query expands each reachable node at most once");
         CHECK(visits < per_src, "case 7: shared subgraph is not re-expanded per src");
