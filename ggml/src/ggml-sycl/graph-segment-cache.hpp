@@ -316,12 +316,19 @@ template <typename Payload> class slot_cache {
 // (preload refused, an unprofitable shape, low headroom) spends only its own probe, never another split's. The probe
 // is spent under a residency, the value of what that veto read: a split whose residency differs from the one it
 // spent its probe under gets one more call, so a veto that a residency change lifts does not keep the split direct
-// for the life of the context. Split id 0 means "no MUL_MAT_ID" and never probes. A context has a handful of splits,
-// so a linear search is enough.
+// for the life of the context. Split id 0 means "no MUL_MAT_ID" and never probes.
+//
+// The memo holds at most `capacity` splits and refuses a new one past that. The bound is safe because a refused split
+// runs direct, as every split of a futile context did before keyed slots: it loses its chance at segmented mode, never
+// correctness, and the splits already held keep their per-residency retries. A model's decode splits number a few
+// per layer, well under the bound, so only a graph whose split ids never repeat reaches it, and the bound stops that
+// graph from growing the memo, and the linear search a spent probe costs, without limit.
 class probe_memo {
   public:
-    // True when the split has not probed under this residency: the caller probes it. False otherwise, and always for
-    // id 0.
+    static constexpr size_t capacity = 256;
+
+    // True when the split has not probed under this residency: the caller probes it. False otherwise, always for id
+    // 0, and for a new split once the memo holds `capacity`.
     bool take(uint64_t split_id, uint64_t residency) {
         if (split_id == 0) {
             return false;
@@ -334,6 +341,9 @@ class probe_memo {
                 spent.residency = residency;
                 return true;
             }
+        }
+        if (spent_.size() >= capacity) {
+            return false;
         }
         spent_.push_back({ split_id, residency });
         return true;

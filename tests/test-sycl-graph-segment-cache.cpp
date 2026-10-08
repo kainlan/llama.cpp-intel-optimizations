@@ -210,6 +210,21 @@ int test_probe_reopens_on_residency_change() {
     return 0;
 }
 
+// The memo holds at most probe_memo::capacity splits. A split past the bound is refused, so it runs direct as every
+// split of a futile context did before keyed slots; the splits already held keep their per-residency retries.
+int test_probe_memo_is_bounded() {
+    gsc::probe_memo probes;
+    for (uint64_t id = 1; id <= gsc::probe_memo::capacity; ++id) {
+        CHECK(probes.take(id, 5), "a split under the bound does not probe");
+    }
+    CHECK(probes.size() == gsc::probe_memo::capacity, "the memo does not hold capacity splits");
+    CHECK(!probes.take(gsc::probe_memo::capacity + 1, 5), "a split past the bound probes");
+    CHECK(probes.size() == gsc::probe_memo::capacity, "the memo grows past its bound");
+    CHECK(probes.take(1, 6), "a held split loses its residency retry at the bound");
+    CHECK(!probes.take(1, 6), "a held split probes twice under one residency at the bound");
+    return 0;
+}
+
 int test_lru_eviction_retires_payload() {
     gsc::slot_cache<fake_payload> cache(2);
     const gsc::key                a = layer_key(1);
@@ -345,8 +360,8 @@ int main() {
     if (test_hasher() || test_key_fields() || test_lifecycle() || test_same_n_nodes_layers_do_not_share() ||
         test_interleaved_splits_all_replay() || test_failed_runs_direct() ||
         test_unprofitable_runs_direct_counted_apart() || test_probe_is_spent_per_split() ||
-        test_probe_reopens_on_residency_change() || test_lru_eviction_retires_payload() ||
-        test_evicting_a_warmed_slot_retires_nothing() || test_invalidate_all() ||
+        test_probe_reopens_on_residency_change() || test_probe_memo_is_bounded() ||
+        test_lru_eviction_retires_payload() || test_evicting_a_warmed_slot_retires_nothing() || test_invalidate_all() ||
         test_record_after_invalidate_is_retired() || test_churn_turns_cache_off() || test_replay_resets_churn_count() ||
         test_forget_retires_one_key()) {
         return 1;
