@@ -21587,6 +21587,25 @@ static void moe_layer_group_profile_record(const moe_layer_decode_plan &      pl
 }
 
 static thread_local std::unordered_map<int, moe_gate_up_pair> g_moe_gate_up_pairs;
+
+// The one op that may reuse the activation row dst's MUL_MAT_ID copied to
+// host, from the current graph's gate/up scan; see moe_shared_act_sibling_of().
+static const void * moe_shared_act_sibling(const ggml_tensor * dst) {
+    if (!dst || !dst->src[0]) {
+        return nullptr;
+    }
+    const auto it = g_moe_gate_up_pairs.find(parse_layer_id_from_name(dst->src[0]->name));
+    if (it == g_moe_gate_up_pairs.end()) {
+        return ggml_sycl::moe_shared_act_sibling_of(nullptr, dst, dst->src[1]);
+    }
+    const moe_gate_up_pair &     pair = it->second;
+    ggml_sycl::moe_gate_up_nodes nodes;
+    nodes.gate_dst  = pair.gate_dst;
+    nodes.gate_src1 = pair.gate_dst ? pair.gate_dst->src[1] : nullptr;
+    nodes.up_dst    = pair.up_dst;
+    nodes.up_src1   = pair.up_dst ? pair.up_dst->src[1] : nullptr;
+    return ggml_sycl::moe_shared_act_sibling_of(&nodes, dst, dst->src[1]);
+}
 // llama.cpp-3hs5: per (layer, device, role) generation at which an in-line
 // RESTORE-T1 decode pointer-table build (see ggml_sycl_mul_mat_id) was last
 // attempted and FAILED -- either ggml_sycl_update_moe_ptr_table() itself
@@ -22183,6 +22202,13 @@ static thread_local pending_cpu_scatter g_pending_scatter_sibling = {};
 // count it was made at; see moe_shared_act_reusable().
 static thread_local uint64_t g_cpu_scatter_serial = 0;
 
+// Neither counter is ever reset, so a value names one event for the life of
+// the thread: a serial names one rewrite of the shared activation staging, an
+// epoch one graph compute. A reset would let a new copy or graph repeat an
+// old value and pass a comparison meant to tell them apart.
+static thread_local uint64_t g_moe_shared_act_serial = 0;
+static thread_local uint64_t g_moe_graph_epoch       = 0;
+
 // The shared decode activation staging's contents: the src1 storage it was
 // copied from (a graph-local lease) and that copy's event. Cleared at every
 // graph boundary by ggml_sycl_cpu_tg_flush_pending().
@@ -22193,6 +22219,16 @@ struct moe_shared_act_state {
 };
 
 static thread_local moe_shared_act_state g_moe_shared_act;
+
+// A new graph compute: the staging no longer holds a row of this graph, and
+// node pointers may repeat (graph reuse), so the epoch moves on. compute_impl
+// reaches it through ggml_sycl_cpu_tg_flush_pending(); segmented replay and
+// moe_graph_try_block_graphlets(), which bypass compute_impl, call it beside
+// their other per-graph invalidations.
+static void moe_shared_act_new_graph() {
+    g_moe_shared_act = {};
+    ++g_moe_graph_epoch;
+}
 
 // Result struct for async CPU expert dispatch.  Carries compute output and
 // metadata from the async thread back to the main thread so the main thread
@@ -24676,7 +24712,7 @@ void ggml_sycl_cpu_tg_flush_pending() {
     flush_pending_cpu_scatter();
     flush_prev_cpu_pipeline_bufs();  // Final cleanup for last deferred pipeline scatter
     flush_prev_scatter_bufs();       // Final cleanup for last async scatter
-    g_moe_shared_act = {};           // graph-local: src1 storage is rewritten by the next graph
+    moe_shared_act_new_graph();      // graph-local: src1 storage is rewritten by the next graph
     if (ggml_sycl_pipeline_moe_enabled()) {
         pipeline_scatter_drain();
     }
@@ -57652,10 +57688,18 @@ static const void * const * moe_fusion_ensure_full_local_ptr_table_from_descript
 
 // Resolves every expert's storage record on ctx.device in `layout` and uploads
 // the full-coverage pointer table; records the full-local probe either way.
+// every_expert_resolved, when given, tells a nullptr result's two causes
+// apart: false when some expert has no on-device record at layout (a fact of
+// this storage generation), true when every expert resolved and the table
+// upload itself failed.
 static const void * const * moe_fusion_build_full_local_ptr_table(ggml_backend_sycl_context & ctx,
                                                                   const ggml_tensor *         weight,
                                                                   int                         layer_hash,
-                                                                  layout_mode                 layout) {
+                                                                  layout_mode                 layout,
+                                                                  bool * every_expert_resolved = nullptr) {
+    if (every_expert_resolved) {
+        *every_expert_resolved = false;
+    }
     if (!weight || ctx.device < 0 || ctx.device >= GGML_SYCL_MAX_DEVICES) {
         return nullptr;
     }
@@ -57692,6 +57736,9 @@ static const void * const * moe_fusion_build_full_local_ptr_table(ggml_backend_s
         slot.has_ready_event = logical.has_ready_event;
         slots.push_back(std::move(slot));
     }
+    if (every_expert_resolved) {
+        *every_expert_resolved = true;
+    }
 
     const void * const * table = ggml_sycl_upload_moe_transient_ptr_table(ctx, weight, slots, layer_hash, layout);
     extra->weight().moe_full_local_probe_generation[ctx.device] = storage_generation;
@@ -57726,13 +57773,59 @@ static const void * const * moe_fusion_ensure_full_local_ptr_table(ggml_backend_
     return moe_fusion_build_full_local_ptr_table(ctx, weight, layer_hash, layout);
 }
 
+// One eligibility decision of ggml_sycl_moe_decode_direct_table(). On
+// ELIGIBLE, *table and *layout hold the route.
+static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_decode_direct_decide(ggml_backend_sycl_context & ctx,
+                                                                               const ggml_tensor *         src0,
+                                                                               layout_mode *               layout,
+                                                                               const void * const **       table) {
+    const int    device = ctx.device;
+    const auto * extra  = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    // The batched pointer-table route is admitted only on a single routable
+    // device, as in the planner-owned route's planner_batched_ptr_table_safe.
+    if (ggml_sycl_get_tensor_usage(src0) != tensor_usage::MOE_EXPERT_WEIGHT || ggml_sycl_routable_device_count() > 1 ||
+        ggml_sycl_is_host_resident_weight(src0, ctx.stream())) {
+        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+    }
+    // The loaded layout is the answer: read it from expert 0's materialized
+    // records on this device, never from a layout policy. A record in a layout
+    // the batched kernel cannot read (a prompt-processing alternate) is a copy
+    // for another executor, not a candidate.
+    std::vector<int> expert0_layouts;
+    extra->moe_storage_layouts_on_device(0, device, expert0_layouts);
+    std::vector<int> readable_layouts;
+    for (int candidate : expert0_layouts) {
+        if (ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, static_cast<layout_mode>(candidate))) {
+            readable_layouts.push_back(candidate);
+        }
+    }
+    int materialized = 0;
+    if (!ggml_sycl::moe_decode_direct_layout_from_materialized(readable_layouts, &materialized)) {
+        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+    }
+    *layout = static_cast<layout_mode>(materialized);
+
+    // Fresh resolution of every expert's storage record at that layout: any
+    // expert not materialized there on this device refuses the route.
+    bool every_expert_resolved = false;
+    *table = moe_fusion_build_full_local_ptr_table(ctx, src0, moe_cache_layer_id(src0->name), *layout,
+                                                   &every_expert_resolved);
+    if (*table) {
+        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE;
+    }
+    return every_expert_resolved ? ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY :
+                                   ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+}
+
 // llama.cpp-yx28: the batch-1 decode direct route. When every expert of src0
 // is resident on ctx.device, decode dispatches from the full-coverage table
 // built here plus the device ids tensor: no ids readback, no table upload and
 // no host batch-ids upload per op. Eligibility and layout are decided once per
 // (replan epoch, expert storage generation, selected rows) and cached in the
 // tensor's weight extension; the steady state is the memoized
-// moe_fusion_full_local_ptr_table() query. Returns nullptr when the tensor is
+// moe_fusion_full_local_ptr_table() query. The layout is the one expert 0 is
+// materialized in on the device, and the table build refuses unless every
+// expert resolves there in that layout. Returns nullptr when the tensor is
 // not eligible, and the caller keeps its existing route.
 static const void * const * ggml_sycl_moe_decode_direct_table(ggml_backend_sycl_context & ctx,
                                                               const ggml_tensor *         src0,
@@ -57766,28 +57859,20 @@ static const void * const * ggml_sycl_moe_decode_direct_table(ggml_backend_sycl_
     if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
         return nullptr;
     }
-    // Every other refusal below holds for this generation; record it first.
-    ggml_sycl::moe_decode_direct_stamp_record(stamp, replan_epoch, storage_generation, selected_rows,
-                                              static_cast<int>(GGML_LAYOUT_AOS), /*eligible=*/false);
-    // The batched pointer-table route is admitted only on a single routable
-    // device, as in the planner-owned route's planner_batched_ptr_table_safe.
-    if (ggml_sycl_get_tensor_usage(src0) != tensor_usage::MOE_EXPERT_WEIGHT || ggml_sycl_routable_device_count() > 1 ||
-        ggml_sycl_is_host_resident_weight(src0, ctx.stream())) {
-        return nullptr;
+    layout_mode                                layout  = GGML_LAYOUT_AOS;
+    const void * const *                       table   = nullptr;
+    const ggml_sycl::moe_decode_direct_outcome outcome = ggml_sycl_moe_decode_direct_decide(ctx, src0, &layout, &table);
+    const ggml_sycl::moe_decode_direct_outcome settled = ggml_sycl::moe_decode_direct_stamp_settle(
+        stamp, replan_epoch, storage_generation, selected_rows, static_cast<int>(layout), outcome);
+    if (settled != outcome) {
+        static std::atomic<int> capped_log{ 0 };
+        if (capped_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+            GGML_LOG_INFO(
+                "[MOE-ROUTE] decode direct tensor=%s device=%d: table build failed %u times in a row; "
+                "using the existing route until the plan or expert storage changes\n",
+                src0->name, device, ggml_sycl::moe_decode_direct_retry_limit);
+        }
     }
-    // Same layout derivation as the planner-owned decode route.
-    layout_mode layout = ggml_sycl_select_moe_planned_graph_layout(src0, device, /*host_weights=*/false, 1);
-    layout = ggml_sycl_moe_layout_for_selected_rows(src0, device, layout, static_cast<size_t>(selected_rows),
-                                                    /*exact_override=*/false, 1);
-    if (!ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, layout)) {
-        return nullptr;
-    }
-    // Fresh resolution of every expert's storage record: the actual
-    // materialization, not the plan, decides that all experts are local.
-    const void * const * table =
-        moe_fusion_build_full_local_ptr_table(ctx, src0, moe_cache_layer_id(src0->name), layout);
-    ggml_sycl::moe_decode_direct_stamp_record(stamp, replan_epoch, storage_generation, selected_rows,
-                                              static_cast<int>(layout), table != nullptr);
     if (table) {
         *layout_out = layout;
     }
@@ -57795,9 +57880,13 @@ static const void * const * ggml_sycl_moe_decode_direct_table(ggml_backend_sycl_
 }
 
 // The ids tensor's own device storage, or nullptr when it is not resident on
-// ctx.device. Unlike ggml_sycl_get_moe_ids_device_ptr() this never stages a
-// host copy, so the decode direct route takes no H2D and no host wait for ids.
-static const int32_t * ggml_sycl_moe_ids_device_resident_ptr(ggml_backend_sycl_context & ctx, const ggml_tensor * ids) {
+// ctx.device. It never stages a host copy, so the decode direct route takes
+// no H2D and no host wait for ids; ggml_sycl_get_moe_ids_device_ptr_exact()
+// tries it before staging one. out_handle, when given, receives the storage
+// handle the pointer was resolved from.
+static const int32_t * ggml_sycl_moe_ids_device_resident_ptr(ggml_backend_sycl_context & ctx,
+                                                             const ggml_tensor *         ids,
+                                                             ggml_sycl::mem_handle *     out_handle = nullptr) {
     ggml_sycl_tensor_storage_handle storage{};
     if (!ids || !ggml_sycl_find_tensor_storage_handle(ids, ctx.device, &storage) || !storage.handle.valid() ||
         storage.owner != ctx.device) {
@@ -57806,6 +57895,9 @@ static const int32_t * ggml_sycl_moe_ids_device_resident_ptr(ggml_backend_sycl_c
     auto resolved = storage.handle.resolve(ctx.device);
     if (!resolved || !resolved.ptr || !resolved.on_device) {
         return nullptr;
+    }
+    if (out_handle) {
+        *out_handle = storage.handle;
     }
     return reinterpret_cast<const int32_t *>(static_cast<const char *>(resolved.ptr) + storage.view_offset);
 }
@@ -58800,32 +58892,21 @@ static const int32_t * ggml_sycl_get_moe_ids_device_ptr_exact(ggml_backend_sycl_
     if (!ids) {
         return nullptr;
     }
-    ggml_sycl_tensor_storage_handle ids_storage_handle{};
-    if (ggml_sycl_find_tensor_storage_handle(ids, ctx.device, &ids_storage_handle) &&
-        ids_storage_handle.handle.valid() && ids_storage_handle.owner == ctx.device) {
-        auto resolved = ids_storage_handle.handle.resolve(ctx.device);
-        if (resolved && resolved.ptr && resolved.on_device) {
-            if (out_nb0) {
-                *out_nb0 = ids->nb[0];
-            }
-            if (out_nb1) {
-                *out_nb1 = ids->nb[1];
-            }
-            const int32_t * ids_device_ptr = reinterpret_cast<const int32_t *>(static_cast<const char *>(resolved.ptr) +
-                                                                               ids_storage_handle.view_offset);
-            if (out_device_handle) {
-                *out_device_handle = ids_storage_handle.handle;
-            }
-            if (ids_stage_profile) {
-                fprintf(
-                    stderr,
+    if (const int32_t * ids_device_ptr = ggml_sycl_moe_ids_device_resident_ptr(ctx, ids, out_device_handle)) {
+        if (out_nb0) {
+            *out_nb0 = ids->nb[0];
+        }
+        if (out_nb1) {
+            *out_nb1 = ids->nb[1];
+        }
+        if (ids_stage_profile) {
+            fprintf(stderr,
                     "[MOE-IDS-STAGE] tensor=%s device=%d bytes=%zu ptr_type=%d hostbuf=0 need_stage=0 "
                     "smart_handle=1 async=%d alloc_us=0.0 host_us=0.0 h2d_submit_us=0.0 wait_us=0.0 total_us=%.1f\n",
                     ids->name, ctx.device, ggml_nbytes(ids), (int) sycl::usm::alloc::device, allow_async ? 1 : 0,
                     ids_stage_us(ids_stage_t0, ids_stage_now()));
-            }
-            return ids_device_ptr;
         }
+        return ids_device_ptr;
     }
     const void * ids_storage = ggml_sycl_host_data(ids);
     if (!ids_storage) {
@@ -73568,6 +73649,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // planner lookups this op does not need. It also runs ahead of
     // ggml_sycl_ensure_weight_on_device(), whose composite pointer this route
     // never reads. A refusal anywhere falls through to the existing route.
+    // This route records no expert warmup, predictor or popularity
+    // observations: it never reads the ids on the host, and reading them would
+    // bring back the readback it exists to remove. That is acceptable because
+    // the route runs only when every expert is already resident on the device,
+    // which the default planner preload provides, so no placement decision
+    // waits on those observations.
     if (const ggml_tensor * ids = dst->src[2]) {
         layout_mode                          direct_override = GGML_LAYOUT_AOS;
         ggml_sycl::moe_decode_direct_request direct_request;
@@ -77293,12 +77380,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 throw ggml_sycl_fallback_error("MUL_MAT_ID shared activation missing smart src1 handle");
             }
             auto shared_act_reusable = [&]() {
-                return shared_act_wanted && cpu_shared_act && !ggml_sycl_pipeline_cpu_enabled() &&
-                       g_moe_shared_act.source.valid() &&
-                       ggml_sycl::moe_shared_act_reusable(
-                           g_moe_shared_act.record,
-                           g_moe_shared_act.source.stable_identity_equal(shared_src1_storage.handle),
-                           g_cpu_scatter_serial, shared_src1_storage.view_offset, shared_act_bytes, ctx.device);
+                if (!shared_act_wanted || !cpu_shared_act || ggml_sycl_pipeline_cpu_enabled() ||
+                    !g_moe_shared_act.source.valid()) {
+                    return false;
+                }
+                ggml_sycl::moe_shared_act_query query;
+                query.src1_tensor    = src1;
+                query.op_dst         = dst;
+                query.same_source    = g_moe_shared_act.source.stable_identity_equal(shared_src1_storage.handle);
+                query.graph_epoch    = g_moe_graph_epoch;
+                query.scatter_serial = g_cpu_scatter_serial;
+                query.view_offset    = shared_src1_storage.view_offset;
+                query.bytes          = shared_act_bytes;
+                query.device         = ctx.device;
+                return ggml_sycl::moe_shared_act_reusable(g_moe_shared_act.record, query);
             };
             bool       reuse_shared_act  = shared_act_reusable();
             const bool defer_entry_flush = reuse_shared_act && g_pending_scatter.active &&
@@ -77335,13 +77430,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                   shared_src1_storage.view_offset, shared_act_bytes, *stream);
                     act_on_host = true;
 
-                    ggml_sycl::moe_shared_act_record & record = g_moe_shared_act.record;
-                    record.serial += 1;
+                    ggml_sycl::moe_shared_act_record record;
+                    record.src1_tensor      = src1;
+                    record.sibling_dst      = moe_shared_act_sibling(dst);
+                    record.graph_epoch      = g_moe_graph_epoch;
+                    record.serial           = ++g_moe_shared_act_serial;
                     record.scatter_serial   = g_cpu_scatter_serial;
                     record.view_offset      = shared_src1_storage.view_offset;
                     record.bytes            = shared_act_bytes;
                     record.device           = ctx.device;
                     record.valid            = true;
+                    g_moe_shared_act.record = record;
                     g_moe_shared_act.source = shared_src1_storage.handle;
                     g_moe_shared_act.d2h    = act_d2h_event;
                 } else {
@@ -78780,8 +78879,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     ggml_sycl::moe_sibling_pending_request keep{};
                     keep.pending_active     = gate.active;
                     keep.sibling_slot_free  = !g_pending_scatter_sibling.active;
-                    keep.reuses_activation  = reuse_shared_act;
-                    keep.pending_act_serial = gate.shares_activation ? gate.act_serial : gate.act_serial + 1;
+                    // A pending job that does not read the staging has no
+                    // serial to compare, so it is never kept beside this op.
+                    keep.reuses_activation  = reuse_shared_act && gate.shares_activation;
+                    keep.pending_act_serial = gate.act_serial;
                     keep.current_act_serial = g_moe_shared_act.record.serial;
                     keep.pending_from_pool  = gate.from_pool;
                     keep.op_from_pool       = op_pool;
@@ -100217,6 +100318,7 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
     ggml_sycl_cpu_quant_cache_new_graph();
     ggml_sycl_moe_ids_cache_new_graph();
     ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);
+    moe_shared_act_new_graph();  // graphlets bypass compute_impl's flush, which does this
     if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
         // The graphlets would read a host-resident input inside a recording or a replay; the caller runs direct.
         // Conservative: retire the recorded ones so a declined graph leaves none to be mistaken for a current one.
@@ -109718,6 +109820,7 @@ normal_dispatch:
                 ggml_sycl_cpu_quant_cache_new_graph();
                 ggml_sycl_moe_ids_cache_new_graph();
                 ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);
+                moe_shared_act_new_graph();  // replay bypasses compute_impl's flush, which does this
 
                 // Check if segments are valid for this graph
                 bool segments_match = sycl_ctx->moe_segments_valid &&

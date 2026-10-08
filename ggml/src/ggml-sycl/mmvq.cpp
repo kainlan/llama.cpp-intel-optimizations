@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -60,6 +61,29 @@ static ggml_sycl_profile_label mmvq_profile_label(sycl::queue & queue,
     label.device     = ggml_sycl_get_device_id_from_queue(queue);
     label.bytes      = bytes;
     return label;
+}
+
+// MoE id-kernel metadata shared by the MUL_MAT_ID profile labels (llama.cpp-bzkx):
+// total_batches is the (expert, token) slot count the grid is launched over.
+// Both id-label string helpers return an empty string (no allocation) while the profiler is off.
+static std::string mmvq_id_profile_metadata(int ncols, int nrows_per_expert, int total_batches) {
+    if (!ggml_sycl_kernel_profile_enabled()) {
+        return std::string();
+    }
+    return "ncols=" + std::to_string(ncols) + ";nrows_per_expert=" + std::to_string(nrows_per_expert) +
+           ";total_batches=" + std::to_string(total_batches);
+}
+
+// Label name for the type-generic AOS id kernel: mulmat.mmvq.id_aos_<ggml_type_name, lowercased>.
+static std::string mmvq_id_aos_profile_name(ggml_type type) {
+    if (!ggml_sycl_kernel_profile_enabled()) {
+        return std::string();
+    }
+    std::string name = std::string("mulmat.mmvq.id_aos_") + ggml_type_name(type);
+    for (char & c : name) {
+        c = (char) std::tolower((unsigned char) c);
+    }
+    return name;
 }
 
 static sycl::event mmvq_profile_submit_quantize_activation_q8_soa(sycl::queue & queue,
@@ -4729,17 +4753,24 @@ static void mul_mat_vec_q4_0_q8_1_id_sycl(const void *                     vx,
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
     const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
 
-    sycl::event ev = stream->submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for<mmvq_id_kernel_name<GGML_TYPE_Q4_0>>(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_id<QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>(
-                    vx, expert_ptrs, vy, dst, ids, ncols, nrows_per_expert, n_ids, n_tokens, ne11, stride_expert_x,
-                    ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
-            });
+    // llama.cpp-bzkx: MUL_MAT_ID expert kernel, previously dark to GGML_SYCL_KERNEL_PROFILE.
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.id_aos_q4_0", profile_metadata.c_str(), "mulmat");
+
+    sycl::event ev = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for<mmvq_id_kernel_name<GGML_TYPE_Q4_0>>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_id<QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>(
+                        vx, expert_ptrs, vy, dst, ids, ncols, nrows_per_expert, n_ids, n_tokens, ne11, stride_expert_x,
+                        ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
+                });
+        });
     });
     if (event_out) {
         *event_out = ev;
@@ -4949,17 +4980,24 @@ static void mul_mat_vec_q8_0_q8_1_id_sycl(const void *                     vx,
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
     const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
 
-    sycl::event ev = stream->submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for<mmvq_id_kernel_name<GGML_TYPE_Q8_0>>(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_id<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>(
-                    vx, expert_ptrs, vy, dst, ids, ncols, nrows_per_expert, n_ids, n_tokens, ne11, stride_expert_x,
-                    ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
-            });
+    // llama.cpp-bzkx: MUL_MAT_ID expert kernel, previously dark to GGML_SYCL_KERNEL_PROFILE.
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.id_aos_q8_0", profile_metadata.c_str(), "mulmat");
+
+    sycl::event ev = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for<mmvq_id_kernel_name<GGML_TYPE_Q8_0>>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_id<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>(
+                        vx, expert_ptrs, vy, dst, ids, ncols, nrows_per_expert, n_ids, n_tokens, ne11, stride_expert_x,
+                        ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
+                });
+        });
     });
     if (event_out) {
         *event_out = ev;
@@ -5462,16 +5500,24 @@ static void mul_mat_vec_mxfp4_q8_1_id_sycl(const void *                     vx,
 
     // Use generic template with vec_dot_mxfp4_q8_1 function pointer
     // This matches how Q4_0 and Q8_0 work
-    sycl::event ev = stream->submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_q_id<QK_MXFP4, QI_MXFP4, block_mxfp4, VDR_MXFP4_Q8_1_MMVQ, vec_dot_mxfp4_q8_1>(
-                                 vx, expert_ptrs, vy, dst, ids, ncols, nrows_per_expert, n_ids, n_tokens, ne11,
-                                 stride_expert_x, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
-                         });
+    // llama.cpp-bzkx: MXFP4 AOS id kernel, previously dark to GGML_SYCL_KERNEL_PROFILE.
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.id_aos_mxfp4", profile_metadata.c_str(), "mulmat");
+
+    sycl::event ev = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_id<QK_MXFP4, QI_MXFP4, block_mxfp4, VDR_MXFP4_Q8_1_MMVQ, vec_dot_mxfp4_q8_1>(
+                        vx, expert_ptrs, vy, dst, ids, ncols, nrows_per_expert, n_ids, n_tokens, ne11, stride_expert_x,
+                        ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
+                });
+        });
     });
     if (event_out) {
         *event_out = ev;
@@ -16428,18 +16474,25 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_sycl(const void * const *    
 
     const int64_t total_qs_size_per_expert = (ncols / 2) * nrows_per_expert;
 
-    sycl::event ev = stream->submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_mxfp4_q8_1_soa_id_pair_kernel(
-                                 (const uint8_t * const *) expert_ptrs_a, (const uint8_t * const *) expert_ptrs_b, vy,
-                                 dst_a, dst_b, ids, ncols, ncols_y, nrows_per_expert, n_ids, n_tokens, ne11,
-                                 total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, nb1_a, nb2_a, nb1_b, nb2_b,
-                                 item_ct1);
-                         });
+    // llama.cpp-bzkx: MXFP4 SOA pair id kernel, previously dark to GGML_SYCL_KERNEL_PROFILE.
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.id_soa_mxfp4_pair", profile_metadata.c_str(), "mulmat");
+
+    sycl::event ev = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 mul_mat_vec_mxfp4_q8_1_soa_id_pair_kernel(
+                                     (const uint8_t * const *) expert_ptrs_a, (const uint8_t * const *) expert_ptrs_b,
+                                     vy, dst_a, dst_b, ids, ncols, ncols_y, nrows_per_expert, n_ids, n_tokens, ne11,
+                                     total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, nb1_a, nb2_a, nb1_b, nb2_b,
+                                     item_ct1);
+                             });
+        });
     });
     if (event_out) {
         *event_out = ev;
@@ -16615,17 +16668,24 @@ static void coalesced_mul_mat_vec_mxfp4_q8_1_id_sycl(const void *         vx,
     const int64_t total_qs_size            = (ncols / 2) * total_rows;
     const int64_t total_qs_size_per_expert = (ncols / 2) * nrows_per_expert;
 
-    sycl::event ev = stream->submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_mxfp4_q8_1_coalesced_id_kernel(
-                                 (const uint8_t *) vx, (const uint8_t * const *) expert_ptrs, vy, dst, ids, ncols,
-                                 ncols_y, nrows_per_expert, n_ids, n_tokens, ne11, total_qs_size,
-                                 total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
-                         });
+    // llama.cpp-bzkx: MXFP4 coalesced id kernel, previously dark to GGML_SYCL_KERNEL_PROFILE.
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.id_soa_mxfp4_coalesced", profile_metadata.c_str(), "mulmat");
+
+    sycl::event ev = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 mul_mat_vec_mxfp4_q8_1_coalesced_id_kernel(
+                                     (const uint8_t *) vx, (const uint8_t * const *) expert_ptrs, vy, dst, ids, ncols,
+                                     ncols_y, nrows_per_expert, n_ids, n_tokens, ne11, total_qs_size,
+                                     total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
+                             });
+        });
     });
     if (event_out) {
         *event_out = ev;
@@ -17336,10 +17396,13 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 dispatch_ids  = nullptr;
                 ids_nb0       = 0;
                 ids_nb1       = 0;
+                // Read once: every batch-1 decode op on the direct route passes here.
+                static const bool row_agg_debug = [] {
+                    const char * env = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
+                    return env && std::atoi(env) != 0;
+                }();
                 static std::atomic<int> compact_log{ 0 };
-                const char *            row_agg_debug = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
-                if (row_agg_debug && std::atoi(row_agg_debug) != 0 &&
-                    compact_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+                if (row_agg_debug && compact_log.fetch_add(1, std::memory_order_relaxed) < 32) {
                     fprintf(stderr,
                             "[MOE-ROW-AGG] stage=compact path=mmvq_compact tensor=%s layout=%d "
                             "entries=%d total_batches=%lld topk=%lld tokens=%lld device=%d\n",
@@ -23325,19 +23388,27 @@ static sycl::event mmvq_submit_aos_id_impl(sycl::queue &                    q,
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
     const sycl::range<3> block_dims(1, rows_per_group, WARP_SIZE);
 
-    return q.submit([&](sycl::handler & cgh) {
-        if (dependency) {
-            cgh.depends_on(*dependency);
-        } else if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for<mmvq_id_kernel_name<qtype>>(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_id<qk, qi, block_q_t, vdr, vec_dot>(
-                    nullptr, expert_ptrs_device, y_q8_1, dst, ids_device, ncols, nrows_per_expert, n_ids, n_tokens,
-                    ne11, 0, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, item);
-            });
+    // llama.cpp-bzkx: label every type arm of the batched id path for GGML_SYCL_KERNEL_PROFILE.
+    const std::string       profile_name     = mmvq_id_aos_profile_name((ggml_type) qtype);
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(q, profile_name.c_str(), profile_metadata.c_str(), "mulmat");
+
+    return ggml_sycl_profile_submit(q, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (dependency) {
+                cgh.depends_on(*dependency);
+            } else if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for<mmvq_id_kernel_name<qtype>>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_id<qk, qi, block_q_t, vdr, vec_dot>(
+                        nullptr, expert_ptrs_device, y_q8_1, dst, ids_device, ncols, nrows_per_expert, n_ids, n_tokens,
+                        ne11, 0, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, item);
+                });
+        });
     });
 }
 
