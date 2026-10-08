@@ -38,6 +38,10 @@ assert create < physical
 PUBLISH_ANCHOR = "allocation_owner_internal_access::publish(owner_control, rec.handle)"
 REGISTRY_ANCHOR = "runtime_registry_emplace_locked(ptr, rec)"
 RAW_EMPLACE = "g_runtime_alloc_registry.emplace("
+# The allocation path that publishes and then inserts. The order is checked inside
+# this function only, so an identical insert call elsewhere in the file cannot
+# satisfy it.
+ALLOC_FN = "bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {"
 
 
 def check_publish_before_registry(source: str) -> str:
@@ -45,14 +49,20 @@ def check_publish_before_registry(source: str) -> str:
     for anchor in (PUBLISH_ANCHOR, REGISTRY_ANCHOR):
         if anchor not in source:
             return f"anchor missing (renamed or moved?): {anchor}"
+    if source.count(ALLOC_FN) != 1:
+        return f"anchor must occur exactly once (renamed or moved?): {ALLOC_FN}"
     if source.count(RAW_EMPLACE) != 1:
         return f"expected exactly one {RAW_EMPLACE} (inside runtime_registry_emplace_locked)"
     wrapper = source.index("runtime_registry_emplace_locked(void *")
     if not wrapper < source.index(RAW_EMPLACE) < source.index("\n}\n", wrapper):
         return f"{RAW_EMPLACE} is not inside runtime_registry_emplace_locked"
-    publish = source.index(PUBLISH_ANCHOR)
-    if REGISTRY_ANCHOR not in source[publish:]:
-        return f"{REGISTRY_ANCHOR} does not follow {PUBLISH_ANCHOR}"
+    fn_start = source.index(ALLOC_FN)
+    body = source[fn_start:source.index("\n}\n", fn_start)]
+    if PUBLISH_ANCHOR not in body:
+        return f"{PUBLISH_ANCHOR} is not inside unified_alloc"
+    publish = body.index(PUBLISH_ANCHOR)
+    if REGISTRY_ANCHOR not in body[publish:]:
+        return f"{REGISTRY_ANCHOR} does not follow {PUBLISH_ANCHOR} inside unified_alloc"
     return ""
 
 
@@ -68,7 +78,13 @@ def self_test(source: str) -> None:
         "publish-after-insert": (source[:publish] + "/*moved*/" + source[publish + len(PUBLISH_ANCHOR):insert]
                                  + REGISTRY_ANCHOR + "; " + PUBLISH_ANCHOR
                                  + source[insert + len(REGISTRY_ANCHOR):]),
+        "alloc-fn-renamed": source.replace(ALLOC_FN, ALLOC_FN.replace("unified_alloc(", "unified_alloc_impl("), 1),
     }
+    # The scope control: publish moved after the insert, plus an identical insert
+    # call in a later function. A file-wide search would accept that later call;
+    # the function-scoped check must still fail.
+    mutants["publish-after-insert-with-later-identical-insert"] = (
+        mutants["publish-after-insert"] + "\nstatic void later_insert() {\n    (void) " + REGISTRY_ANCHOR + ";\n}\n")
     for name, mutant in mutants.items():
         assert mutant != source, f"self-test mutant {name} did not change the source (anchor stale)"
         assert check_publish_before_registry(mutant), f"self-test mutant {name} was NOT caught"
