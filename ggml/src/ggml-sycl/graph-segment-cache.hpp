@@ -311,5 +311,31 @@ template <typename Payload> class slot_cache {
     counters             stats_;
 };
 
+// A replay-futile context runs direct, except that each decode split with a MUL_MAT_ID gets one call that may put
+// the context into segmented MoE mode. The memo is per split: a split whose call is vetoed before that decision
+// (preload refused, an unprofitable shape, low headroom) spends only its own probe, never another split's. Split
+// id 0 means "no MUL_MAT_ID" and never probes. A context has a handful of splits, so a linear search is enough.
+class probe_memo {
+  public:
+    // True the first time a split id is seen: the caller probes it. False afterwards, and always for id 0.
+    bool take(uint64_t split_id) {
+        if (split_id == 0) {
+            return false;
+        }
+        for (uint64_t id : probed_) {
+            if (id == split_id) {
+                return false;
+            }
+        }
+        probed_.push_back(split_id);
+        return true;
+    }
+
+    size_t size() const { return probed_.size(); }
+
+  private:
+    std::vector<uint64_t> probed_;
+};
+
 }  // namespace graph_segment_cache
 }  // namespace ggml_sycl

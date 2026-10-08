@@ -6400,8 +6400,8 @@ struct ggml_backend_sycl_context {
     bool                                moe_segments_failed_logged        = false;
     // Decode splits' segments, one slot per split key (llama.cpp-7pm2). Replaces moe_segments for decode.
     ggml_sycl::graph_segment_cache::slot_cache<moe_segment_slot> moe_segment_slots;
-    // A replay-futile context has let one decode MUL_MAT_ID split try to enter segmented MoE mode.
-    bool                                                         moe_segment_keyed_probed = false;
+    // The decode MUL_MAT_ID splits of a replay-futile context that have had their one try at segmented MoE mode.
+    ggml_sycl::graph_segment_cache::probe_memo                   moe_segment_keyed_probes;
 
     // Direct decode graphlets cache only the fused MoE descriptor dispatches.
     // They are independent from segmented non-MoE graph replay and are safe to

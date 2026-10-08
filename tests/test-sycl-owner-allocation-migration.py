@@ -600,10 +600,19 @@ with gate('futile-context-direct'):
                          r"ctx->moe_segment_slots\.churned\(\)\)\s*\{\s*return false;\s*\}", body):
             problems.append("the exception is not limited to decode, the segmented env, and an unchurned cache")
         if not re.search(r"if \(ctx->moe_graph_rerecord\)\s*\{\s*return true;\s*\}\s*"
-                         r"if \(ctx->moe_segment_keyed_probed \|\| !ggml_sycl_graph_has_op\(cgraph, GGML_OP_MUL_MAT_ID\)\)"
-                         r"\s*\{\s*return false;\s*\}\s*ctx->moe_segment_keyed_probed = true;\s*return true;", body):
-            problems.append("the exception does not require segmented MoE mode after one MUL_MAT_ID probe "
-                            "(a context that never enters it would pay the policy scans every call)")
+                         r"return ctx->moe_segment_keyed_probes\.take\(moe_segment_probe_split_id\(cgraph\)\);", body):
+            problems.append("the exception does not require segmented MoE mode after one probe per MUL_MAT_ID split "
+                            "(a context-wide probe can be spent by a vetoed split; none at all pays the scans every call)")
+        try:
+            split_id = region(code, "static uint64_t moe_segment_probe_split_id(", "\n}\n")
+        except ValueError as error:
+            return problems + [str(error)]
+        if not re.search(r"node->op == GGML_OP_MUL_MAT_ID\)\s*\{[^{}]*"
+                         r"h\.mix\(static_cast<uint64_t>\(cgraph->n_nodes\)\);\s*"
+                         r"h\.mix_name\(node->name, sizeof\(node->name\)\);\s*return h\.value\(\) \| 1;", split_id) or \
+                not re.search(r"\}\s*return 0;\s*$", split_id):
+            problems.append("the split id does not name the split by its node count and first MUL_MAT_ID "
+                            "(equal-size splits of different layers would share one probe)")
         return problems
 
     assert not keyed_reachable_problems(RUNTIME_CODE), keyed_reachable_problems(RUNTIME_CODE)
@@ -611,14 +620,23 @@ with gate('futile-context-direct'):
     for _label, _old, _new in (
             ("prompt splits reach keyed slots", "if (!is_decode || ", "if ("),
             ("a churned cache still reaches them", " || ctx->moe_segment_slots.churned())", ")"),
-            ("any split reaches them", "if (ctx->moe_segment_keyed_probed || !ggml_sycl_graph_has_op(cgraph, GGML_OP_MUL_MAT_ID)) {",
-             "if (false) {"),
-            ("the probe repeats every call", "    ctx->moe_segment_keyed_probed = true;\n", ""),
-            ("the probe is never consulted", "if (ctx->moe_segment_keyed_probed || !ggml_sycl_graph_has_op(",
-             "if (!ggml_sycl_graph_has_op(")):
+            ("any split reaches them every call", "return ctx->moe_segment_keyed_probes.take(moe_segment_probe_split_id(cgraph));",
+             "return true;"),
+            ("a vetoed split spends the context's probe", "take(moe_segment_probe_split_id(cgraph))", "take(1)"),
+            ("the probe is never consulted", "return ctx->moe_segment_keyed_probes.take(moe_segment_probe_split_id(cgraph));",
+             "return moe_segment_probe_split_id(cgraph) != 0;")):
         assert _reach.count(_old) == 1, _label
         assert keyed_reachable_problems(RUNTIME_CODE.replace(_reach, _reach.replace(_old, _new))), \
             "control %r was not caught" % _label
+    _split = region(RUNTIME_CODE, "static uint64_t moe_segment_probe_split_id(", "\n}\n")
+    for _label, _old, _new in (
+            ("equal-size splits of different layers share a probe", "h.mix_name(node->name, sizeof(node->name));", ""),
+            ("the node count is not in the split id", "h.mix(static_cast<uint64_t>(cgraph->n_nodes));", ""),
+            ("a split without a MUL_MAT_ID gets a probe", "    return 0;\n}", "    return 1;\n}")):
+        assert (_split + "\n}\n").count(_old) == 1 or _split.count(_old) == 1, _label
+        _mut = RUNTIME_CODE.replace(_split + "\n}\n", (_split + "\n}\n").replace(_old, _new), 1)
+        assert _mut != RUNTIME_CODE, "control %r did not apply" % _label
+        assert keyed_reachable_problems(_mut), "control %r was not caught" % _label
     graph_branch = compute.index("\n    if (use_sycl_graph) {\n") + 1
     scans = ("check_graph_compatibility(*sycl_ctx, cgraph)", "ggml_sycl_graph_has_host_inputs(cgraph)",
              "ggml_sycl_graph_has_op(cgraph, GGML_OP_FLASH_ATTN_EXT)",

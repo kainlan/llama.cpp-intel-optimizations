@@ -99216,11 +99216,28 @@ static bool moe_segment_keyed_mode(const ggml_backend_sycl_context * ctx, bool i
            !ctx->moe_segment_slots.churned();
 }
 
+// Identity of a decode split for the futile-context probe memo: its node count and the name of its first MUL_MAT_ID,
+// which names the layer. 0 when the split has no MUL_MAT_ID. Two splits that collide share one probe, and the other
+// one runs direct, as every split of a futile context did before keyed slots.
+static uint64_t moe_segment_probe_split_id(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node && node->op == GGML_OP_MUL_MAT_ID) {
+            ggml_sycl::graph_segment_cache::key_hasher h;
+            h.mix(static_cast<uint64_t>(cgraph->n_nodes));
+            h.mix_name(node->name, sizeof(node->name));
+            return h.value() | 1;
+        }
+    }
+    return 0;
+}
+
 // A replay-futile context still serves keyed slots, since its futility verdict is about the whole-graph slot. Until
-// the context is in segmented MoE mode, one decode split with a MUL_MAT_ID may try to put it there (the entry's
-// segmented-only admission does, for a MUL_MAT_ID that cannot be recorded). If that call leaves the context outside
-// segmented mode, every later call takes the futile path again, so a context that never enters it does not pay the
-// policy scans forever.
+// the context is in segmented MoE mode, each decode split with a MUL_MAT_ID gets one call that may put it there: the
+// entry's segmented-only admission, or the decode policy's segmented-replay decision. A call vetoed before that
+// decision (this split's preload refused, an unprofitable shape, low headroom) spends only this split's probe, so
+// another split can still enter the mode. A split whose probe is spent takes the futile path again, so a context
+// that never enters segmented mode pays the policy scans once per split, not every call.
 static bool moe_segment_keyed_reachable(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, bool is_decode) {
     if (!is_decode || !ggml_sycl_segmented_graph_env_allows() || ctx->moe_segment_slots.churned()) {
         return false;
@@ -99228,11 +99245,7 @@ static bool moe_segment_keyed_reachable(ggml_backend_sycl_context * ctx, const g
     if (ctx->moe_graph_rerecord) {
         return true;
     }
-    if (ctx->moe_segment_keyed_probed || !ggml_sycl_graph_has_op(cgraph, GGML_OP_MUL_MAT_ID)) {
-        return false;
-    }
-    ctx->moe_segment_keyed_probed = true;
-    return true;
+    return ctx->moe_segment_keyed_probes.take(moe_segment_probe_split_id(cgraph));
 }
 
 static uint64_t moe_segment_handle_identity(const ggml_sycl::mem_handle & handle) {
