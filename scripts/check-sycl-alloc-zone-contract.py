@@ -2516,8 +2516,10 @@ P_SHAPE_OF, P_KV_PAIR_OF, P_LAYER_OF = "ggml_sycl_fattn_shape_of", "ggml_sycl_fa
 P_LOADFILL, P_VALUEFN = "placement_plan_set_routed_head_maxima", "onednn_graph_scratch_bytes"
 P_ONEDNN, P_PLAN, P_VEC, P_TILE = ("ggml_sycl_flash_attn_ext_onednn", "ggml_sycl_flash_attn_ext_onednn_plan",
                                    "fattn_vec_supports_head_dim", "ggml_sycl_fattn_d512_tile_admissible")
+# The support decision's home is the op switch: since master's pmzl, ggml_backend_sycl_device_supports_op is a one-line
+# wrapper over ggml_sycl_device_supports_op_impl(dev, op, true), and the capability query passes false.
 P_FLASH, P_FAST_POLICY, P_SUPPORTS_OP = ("ggml_sycl_flash_attn_ext", "ggml_sycl_fattn_fast_decode_policy",
-                                         "ggml_backend_sycl_device_supports_op")
+                                         "ggml_sycl_device_supports_op_impl")
 P_FLAGS = ("g_sycl_fa_onednn_enabled", "g_sycl_paged_v2_enabled", "ggml_sycl_fa_onednn_d512_enabled")
 P_BODY_BANNED = (P_VEC, P_ENABLED, P_KV_PAIR_OF, P_TILE)               # support clauses the supported/route bodies may not hold
 P_FP8_CALL_RE = re.compile(r"(?<![\w.>])(\w*fp8\w*)\s*\(")               # ... nor any fp8 type helper (ggml_sycl_type_is_fp8_e4m3)
@@ -5210,10 +5212,8 @@ def b1_tree(files, keep_test_reads=False):
         append_to("fattn-onednn.cpp", B1_ONEDNN_TAIL),
         append_to("common.cpp", B1_COMMON_TAIL),
         append_to("unified-cache.cpp", B1_LOADFILL),
-        replace_once("ggml-sycl.cpp", '    const char * prefix_k = "cache_k_l";\n    const char * prefix_v = "cache_v_l";\n'
-                     "    if (strncmp(name, prefix_k, 9) == 0) {\n        layer_id = atoi(name + 9);\n"
-                     "    } else if (strncmp(name, prefix_v, 9) == 0) {\n        layer_id = atoi(name + 9);\n    }\n",
-                     "    layer_id = ggml_sycl_kv_cache_layer_of(name);\n"),
+        # The KV buffer's per-layer strncmp parse in ggml-sycl.cpp, which b1 turned into a call of the helper, is gone
+        # from master (the per-layer remap was removed), so b1 has no parse site left to convert there.
     ) + (() if keep_test_reads else (
         replace_regex("tests/test-sycl-fattn-onednn-gates.cpp", r'std::getenv\("GGML_SYCL_FLASH_ATTN_EXT"\)', "nullptr", 2),))
     for st in steps:
@@ -6185,7 +6185,7 @@ def matrix_cases_s2d2():
     A(Case("38", "ggml_sycl_fattn_kv_pair_of called outside the shape function and the fills", b1(append_to(
         "fattn.cpp", "int zzplant_p(const fattn_params & p) {\n    return (int) ggml_sycl_fattn_kv_pair_of(p.K_type, p.V_type);\n}\n")),
         "FAIL", "P-HOME", "census:ggml_sycl_fattn_kv_pair_of"))
-    A(Case("38", "the FLASH_ATTN_EXT case guarded by a head-dim test in ggml_backend_sycl_device_supports_op", b1(replace_once(
+    A(Case("38", "the FLASH_ATTN_EXT case guarded by a head-dim test in ggml_sycl_device_supports_op_impl", b1(replace_once(
         "ggml-sycl.cpp", "            return ggml_sycl_flash_attn_ext_supported(op);\n",
         "            return fattn_vec_supports_head_dim(op->src[0]->ne[0]) && ggml_sycl_flash_attn_ext_supported(op);\n")),
         "FAIL", "P-HOME", "case-line", planted=False))
@@ -6209,10 +6209,11 @@ def matrix_cases_s2d2():
         "fattn.cpp", "bool zzplant_p() {\n    bool kv_is_fp8 = true;\n    kv_is_fp8 = false;\n    return kv_is_fp8;\n}\n")), "PASS", active="p-fill"))
     A(Case("38", "the load-maxima fill still defined in b2", b2(append_to("unified-cache.cpp", B1_LOADFILL)),
            "FAIL", "P-FILL", "load-fill-in-b2", planted=False))
-    A(Case("38", "the KV buffer's strncmp parse kept in ggml-sycl.cpp beside the helper", b1(replace_once(
-        "ggml-sycl.cpp", "    layer_id = ggml_sycl_kv_cache_layer_of(name);\n",
-        '    layer_id = ggml_sycl_kv_cache_layer_of(name);\n    const char * prefix_v = "cache_v_l";\n    if (strncmp(name, prefix_v, 9) == 0) {\n        layer_id = atoi(name + 9);\n    }\n')),
-        "FAIL", "P-LAYER", "ggml-sycl.cpp", planted=False))
+    A(Case("38", "a strncmp layer parse beside the helper in ggml-sycl.cpp", b1(append_to(
+        "ggml-sycl.cpp", 'static int zzplant_p(const char * name) {\n    int layer_id = ggml_sycl_kv_cache_layer_of(name);\n'
+        '    const char * prefix_v = "cache_v_l";\n    if (strncmp(name, prefix_v, 9) == 0) {\n        layer_id = atoi(name + 9);\n'
+        '    }\n    return layer_id;\n}\n')),
+        "FAIL", "P-LAYER", "ggml-sycl.cpp"))
     A(Case("38", "sscanf(name, \"cache_k_l%d\", &il) planted in ggml-sycl.cpp", b1(append_to(
         "ggml-sycl.cpp", 'void zzplant_p(const char * name) {\n    int il = -1;\n    sscanf(name, "cache_k_l%d", &il);\n}\n')),
         "FAIL", "P-LAYER", "ggml-sycl.cpp"))
@@ -6481,10 +6482,10 @@ def cmake_witness(root):
     wit = [m.group(0) for m in re.finditer(r"add_test\(NAME test-sycl-alloc-zone-contract-w\s[^)]*\)", text, flags=re.S)]
     wit_props = re.findall(r"set_tests_properties\(test-sycl-alloc-zone-contract-w PROPERTIES[^)]*\)", text)
     ok = len(wit) == 1 and "--witnesses" in wit[0] and "--mutation-matrix" not in wit[0] and len(wit_props) == 1 \
-        and 'LABELS "sycl;host-only;ast;mutation"' in wit_props[0] and re.search(r"\bTIMEOUT\s+600\b", wit_props[0]) is not None
+        and 'LABELS "sycl;host-only;ast;mutation;python"' in wit_props[0] and re.search(r"\bTIMEOUT\s+600\b", wit_props[0]) is not None
     detail = "%d witnesses registration(s)" % len(wit)
     ok = ok and len(plain) == 1 and "--mutation-matrix" not in plain[0] and loop is not None \
-        and len(plain_props) == 1 and 'LABELS "sycl;host-only;ast"' in plain_props[0] \
+        and len(plain_props) == 1 and 'LABELS "sycl;host-only;ast;python"' in plain_props[0] \
         and re.search(r"\bTIMEOUT\s+120\b", plain_props[0]) is not None
     detail += ", %d plain registration(s)" % len(plain)
     if loop is not None:
@@ -6495,7 +6496,7 @@ def cmake_witness(root):
         ok = ok and "--mutation-matrix" in body and n == len(idx) == SHARDS and idx == list(range(n)) \
             and "NAME test-sycl-alloc-zone-contract-m${%s}" % var in body \
             and len(props) == 1 and re.search(r"\bTIMEOUT\s+600\b", props[0]) is not None \
-            and 'LABELS "sycl;host-only;ast;mutation"' in props[0]
+            and 'LABELS "sycl;host-only;ast;mutation;python"' in props[0]
         detail += ", %d shard(s) of %d, timeout %s" % (len(idx), n, "set" if props and "TIMEOUT" in props[0] else "MISSING")
     region = "".join(plain) + "".join(wit) + (loop.group(0) if loop is not None else "")
     ok = ok and "--write-debt" not in region and "--allow-growth" not in region
@@ -6514,13 +6515,13 @@ def cmake_mutants(root):
         ("passes the wrong shard count", lambda t: t.replace("${zc_shard}/%d" % SHARDS, "${zc_shard}/%d" % (SHARDS + 1), 1)),
         ("loses the witnesses test", lambda t: t.replace("add_test(NAME test-sycl-alloc-zone-contract-w\n", "add_test(NAME test-sycl-alloc-zone-contract-x\n", 1)),
         ("runs the matrix in the witnesses test", lambda t: t.replace("--witnesses)", "--witnesses --mutation-matrix)", 1)),
-        ("loses the witnesses test's TIMEOUT", lambda t: t.replace('test-sycl-alloc-zone-contract-w PROPERTIES LABELS "sycl;host-only;ast;mutation" TIMEOUT 600',
-                                                                    'test-sycl-alloc-zone-contract-w PROPERTIES LABELS "sycl;host-only;ast;mutation"', 1)),
+        ("loses the witnesses test's TIMEOUT", lambda t: t.replace('test-sycl-alloc-zone-contract-w PROPERTIES LABELS "sycl;host-only;ast;mutation;python" TIMEOUT 600',
+                                                                    'test-sycl-alloc-zone-contract-w PROPERTIES LABELS "sycl;host-only;ast;mutation;python"', 1)),
         ("passes --write-debt to a shard", lambda t: t.replace("--mutation-matrix --shard", "--write-debt --mutation-matrix --shard", 1)),
         ("loses the plain gate's test", lambda t: t.replace("add_test(NAME test-sycl-alloc-zone-contract\n", "add_test(NAME test-sycl-alloc-zone-contract-x\n", 1)),
-        ("drops the plain gate's TIMEOUT", lambda t: t.replace('PROPERTIES LABELS "sycl;host-only;ast" TIMEOUT 120)', 'PROPERTIES LABELS "sycl;host-only;ast")', 1)),
-        ("loses a shard's TIMEOUT", lambda t: t.replace('-m${zc_shard} PROPERTIES LABELS "sycl;host-only;ast;mutation" TIMEOUT 600',
-                                                       '-m${zc_shard} PROPERTIES LABELS "sycl;host-only;ast;mutation"', 1)),
+        ("drops the plain gate's TIMEOUT", lambda t: t.replace('PROPERTIES LABELS "sycl;host-only;ast;python" TIMEOUT 120)', 'PROPERTIES LABELS "sycl;host-only;ast;python")', 1)),
+        ("loses a shard's TIMEOUT", lambda t: t.replace('-m${zc_shard} PROPERTIES LABELS "sycl;host-only;ast;mutation;python" TIMEOUT 600',
+                                                       '-m${zc_shard} PROPERTIES LABELS "sycl;host-only;ast;mutation;python"', 1)),
         ("runs the matrix in the plain test", lambda t: t.replace("../../..)\n    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES",
                                                                     "../../.. --mutation-matrix)\n    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES", 1)),
     ]
