@@ -455,6 +455,24 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-moe-decode-hostpath PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# Decode/prompt classification of a scheduler split (llama.cpp-7pm2): MUL_MAT_ID is batch evidence and a split with
+# no matmul keeps the previous phase. ggml-sycl/graph-phase.hpp includes only ggml.h; the test builds synthetic
+# graphs on a no-alloc ggml context, so it needs no device.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-graph-phase.cpp)
+    set_tests_properties(test-sycl-graph-phase PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-graph-phase PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
+# MoE graph preload memo (llama.cpp-7pm2): per-tensor, per-device stamps of the preload outcome, and the verdict that
+# lets an all-host expert tensor stay a direct node. ggml-sycl/moe-graph-preload-stamp.hpp includes only
+# <cstddef>/<cstdint>, so the test needs no SYCL wiring.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-moe-graph-preload-stamp.cpp)
+    set_tests_properties(test-sycl-moe-graph-preload-stamp PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-moe-graph-preload-stamp PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
 # KV cache tensor name -> layer id (llama.cpp-4ot7): the tiered KV buffer remaps each tensor onto its
 # layer's allocation by this id, and a name-tagged cache ("cache_idx_k_l3") used to parse as no layer.
 # ggml-sycl/kv-cache-tensor-name.hpp includes only <climits>/<cstring>: no SYCL, no ggml, no device.

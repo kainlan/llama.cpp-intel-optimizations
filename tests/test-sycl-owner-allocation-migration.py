@@ -438,13 +438,176 @@ with gate('overflow-safe'):
 
 with gate('graph-preload'):
     # Graph-preload failure propagates into graph suppression, rather than logging
-    # and continuing through a stale graph path.
-    refresh = region(RUNTIME, "if (refresh_moe_after_pp)", "const int descriptor_moe_graph_candidates")
-    assert "if (!graph_preload_moe_experts(*sycl_ctx, cgraph))" in refresh
-    assert "sycl_ctx->moe_graphs_disabled = true" in refresh
-    assert "use_sycl_graph                = false" in refresh
-    assert "graph_unpin_moe_experts(sycl_ctx)" in refresh
+    # and continuing through a stale graph path. The suppression is per split and
+    # per expert-residency state (moe-graph-preload-stamp.hpp), not a sticky flag.
+    # The preload runs at one site, right before a record or replay.
+    assert len(re.findall(r"\bgraph_preload_moe_experts\s*\(\s*\*sycl_ctx", RUNTIME_CODE)) == 1
+    site = RUNTIME[RUNTIME.index("if (!graph_preload_moe_experts(*sycl_ctx, cgraph, moe_host_tier_boundary)) {"):]
+    site = site[:site.index("return GGML_STATUS_SUCCESS;")]
+    assert "sycl_ctx->moe_graph_preload_refused = true" in site
+    assert "graph_unpin_moe_experts(sycl_ctx)" in site
+    assert "compute_impl_unlocked();" in site and "record_completion(false);" in site
     print("PASS graph-preload-bool-propagation-source-gate")
+
+with gate('graph-preload-refused'):
+    # A split whose MoE preload is refused runs direct: the compute entry turns its graph off, the per-split flag is
+    # decided before any path can run compute_impl (the graphlet gates read it there), and every MoE graphlet gate
+    # honors it.
+    compute = region(RUNTIME, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                     "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
+    decided = re.search(r"sycl_ctx->moe_graph_preload_refused\s*=\s*ggml_sycl_moe_graph_preload_decide\([^;]*\)\s*"
+                        r"==\s*ggml_sycl::moe_graph_preload_split_decision::REFUSED;", compute)
+    first_compute = re.search(r"\bcompute_impl(?:_unlocked)?\(\);", compute)
+    assert decided and first_compute and decided.start() < first_compute.start()
+    entry = re.search(r"if \(sycl_ctx->moe_graph_preload_refused\) \{\s*GGML_SYCL_DEBUG\([^;]*\);\s*"
+                      r"use_sycl_graph = false;\s*\}", compute)
+    assert entry and entry.start() < compute.index("const int descriptor_moe_graph_candidates")
+    # The entry block reads the decision itself: nothing between them overwrites the flag.
+    assert decided.end() < entry.start()
+    assert not re.search(r"moe_graph_preload_refused\s*=(?!=)", compute[decided.end():entry.start()])
+    assert re.search(r"!sycl_ctx->moe_direct_dispatch_graphs_disabled\s*&&\s*!sycl_ctx->moe_graph_preload_refused\s*&&"
+                     r"\s*node->op\s*==\s*GGML_OP_MUL_MAT_ID", RUNTIME)
+    assert re.search(r"sycl_ctx->graphs_disabled\s*\|\|\s*sycl_ctx->moe_graph_preload_refused\s*\|\|\s*"
+                     r"sycl_ctx->moe_graphs_disabled\s*\|\|\s*sycl_ctx->moe_sequence_graphs_disabled", RUNTIME)
+    assert re.search(r"if \(sycl_ctx->moe_block_graphs_disabled\s*\|\|[^{};]*\bsycl_ctx->moe_graph_preload_refused\b"
+                     r"[^{};]*\)\s*\{", RUNTIME)
+    print("PASS graph-preload-refused-split-source-gate")
+
+with gate('graph-preload-stamp-sites'):
+    # A stamped all-host tensor skips the preload before any per-tensor work (host residency, layout selection, the
+    # per-expert route probe); otherwise the skip saves nothing. Only the route-probe refusal is structural, so every
+    # other preload failure goes through the bounded transient retry.
+    impl = region(RUNTIME, "static bool graph_preload_moe_experts_impl(",
+                  "static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx")
+    skip = re.search(r"moe_graph_preload_stamp_skips_tensor\([^;{]*\)\s*\{\s*continue;", impl)
+    assert skip
+    for later in (r"\bbool\s+host_weights\s*=", r"\bggml_sycl_select_moe_planned_graph_layout\(",
+                  r"\bggml_sycl_select_moe_graph_layout\(", r"\bggml_sycl_probe_moe_planned_layout\("):
+        first = re.search(later, impl)
+        assert first and skip.end() < first.start(), later
+    assert RUNTIME_CODE.count("moe_graph_preload_failure::STRUCTURAL") == 1
+    assert re.search(r"cannot be represented as one current-device[^}]*\}\s*"
+                     r"\*failure = ggml_sycl::moe_graph_preload_failure::STRUCTURAL;\s*return false;", impl)
+    assert RUNTIME_CODE.count("moe_graph_preload_stamp_failure(") == 1
+    assert "moe_graph_preload_outcome::REFUSED" not in RUNTIME_CODE
+    wrapper = region(RUNTIME, "static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx",
+                     "\n}\n")
+    assert re.search(r"moe_graph_preload_failure\s+failure\s*=\s*ggml_sycl::moe_graph_preload_failure::TRANSIENT;",
+                     wrapper)
+    assert "moe_graph_preload_stamp_failure(" in wrapper
+
+    # Post-prompt work: each split claims its own slot before the helpers it gates, and only a prompt split
+    # advances the epoch those claims compare against.
+    compute = region(RUNTIME, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                     "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
+    prepare = re.search(r"const bool post_prompt_prepare_due =\s*cached_is_decode && "
+                        r"ggml_sycl_moe_post_prompt_claim\(cgraph, sycl_ctx->device, /\*refresh=\*/false\);", compute)
+    assert prepare
+    for helper in ("ggml_sycl_materialize_prompt_down_i8_before_decode(",
+                   "ggml_sycl_release_prompt_down_soa_before_decode("):
+        assert compute.count(helper) == 1, helper
+        assert "if (post_prompt_prepare_due && " + helper in compute, helper
+        assert prepare.end() < compute.index(helper), helper
+    refresh_claim = re.search(r"const bool post_prompt_refresh_due =\s*cached_is_decode && "
+                              r"ggml_sycl_moe_post_prompt_claim\(cgraph, sycl_ctx->device, /\*refresh=\*/true\);",
+                              compute)
+    hotset = "if (post_prompt_refresh_due && ggml_sycl_materialize_moe_down_i8_hotset("
+    assert refresh_claim and compute.count("ggml_sycl_materialize_moe_down_i8_hotset(") == 1 and hotset in compute
+    assert refresh_claim.end() < compute.index(hotset)
+    assert RUNTIME_CODE.count("g_moe_prompt_epoch.fetch_add(") == 1
+    assert re.search(r"if \(!cached_is_decode\) \{\s*g_moe_post_pp_preload_pending\.store\(true, "
+                     r"std::memory_order_release\);\s*g_moe_prompt_epoch\.fetch_add\(1, std::memory_order_acq_rel\);",
+                     compute)
+    print("PASS graph-preload-stamp-sites-source-gate")
+
+with gate('graph-preload-not-in-refresh'):
+    # The post-prompt refresh does not run the pointer-table preload. Its tables and leases serve a recorded graph,
+    # and the graph path prepares them right before every record or replay; direct dispatch and the descriptor
+    # graphlets build their own full-local tables. Run eagerly on the first decode token it cost one host-blocking
+    # table rebuild per MoE split per prompt, with or without graphs.
+    compute = region(RUNTIME, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                     "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
+    refresh = region(region(RUNTIME_CODE, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                            "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend"),
+                     "if (refresh_moe_after_pp || post_prompt_refresh_due)", "const int descriptor_moe_graph_candidates")
+    assert not re.search(r"\bgraph_preload_moe_experts\s*\(", refresh)
+    assert not re.search(r"\bggml_sycl_moe_graph_preload_decide\s*\(", refresh)
+    assert "ggml_sycl_materialize_moe_down_i8_hotset(" in refresh and "moe_prestage_popular_experts();" in refresh
+    print("PASS graph-preload-not-in-refresh-source-gate")
+
+with gate('decode-env-reads-once'):
+    # Both predicates are asked on every decode call; their environment terms are read once.
+    # The runtime term is tested first, so the env terms (some log when first evaluated) run only when it is false.
+    capture = region(RUNTIME, "static bool persistent_tg_moe_descriptor_capture_enabled() {", "\n}\n")
+    runtime = re.search(r"if \(g_moe_descriptor_capture_decode_phase && moe_layer_descriptor_executor_enabled\(\)\)\s*"
+                        r"\{\s*return true;\s*\}", capture)
+    static = re.search(r"static const bool\s+\w+\s*=\s*\[\]", capture)
+    assert runtime and static and runtime.end() < static.start()
+    lam = capture[static.start():].split("}();")[0]
+    for term in ("ggml_sycl::env_persistent_tg_enabled()", "moe_graphlet_probe_enabled()",
+                 "moe_block_graphlet_descriptor_capture_enabled()", "moe_descriptor_capture_probe_enabled()",
+                 'std::getenv("GGML_SYCL_PERSISTENT_TG_LOG_POLICY")'):
+        assert term in lam, term
+    size = region(RUNTIME, "static int moe_block_graphlet_requested_size(int device) {", "\n}\n")
+    assert re.search(r"static const int\s+\w+\s*=\s*\[\]", size)
+    assert size.index("static const int") < size.index('std::getenv("GGML_SYCL_MOE_BLOCK_GRAPHLETS")')
+    # The non-graph decode path hashes the graph only when block graphlets can run.
+    compute = region(RUNTIME, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                     "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
+    direct = region(compute[compute.rindex("bool block_graphlet_executed = false;"):],
+                    "bool block_graphlet_executed = false;", "if (!block_graphlet_executed)")
+    sized = re.search(r"moe_block_graphlet_requested_size\(sycl_ctx->device\)\s*>\s*0", direct)
+    assert sized and sized.start() < direct.index("ggml_sycl_graph_signature(cgraph)")
+    # Skipping the try still records the reject it would have recorded.
+    try_fn = region(RUNTIME, "static bool moe_graph_try_block_graphlets(", "\n}\n")
+    assert 'ggml_sycl_moe_aggregation_diag(sycl_ctx, "block-graphlet", "reject", "disabled")' in try_fn
+    assert re.search(r"\}\s*else if \(cached_is_decode\)\s*\{[^{}]*"
+                     r"sycl_ctx->moe_aggregation_last_decision\s*=\s*\"block-graphlet\";\s*"
+                     r"sycl_ctx->moe_aggregation_last_reject\s*=\s*\"disabled\";\s*\}", direct)
+    print("PASS decode-env-reads-once-source-gate")
+
+with gate('futile-context-direct'):
+    # Once replay is futile for a context (sticky: nothing resets exec_graph_replay_futile), every later call takes the
+    # GGML_SYCL_DISABLE_GRAPH=1 path, decided before any of the per-call graph-policy scans run.
+    compute = region(RUNTIME_CODE, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                     "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
+    futile = re.search(r"\}\s*else if \(sycl_ctx->exec_graph_replay_futile\)\s*\{\s*use_sycl_graph\s*=\s*false;\s*\}"
+                       r"\s*else if \(sycl_ctx->exec_graph\)\s*\{", compute)
+    assert futile
+    graph_branch = compute.index("    if (use_sycl_graph) {\n")
+    scans = ("check_graph_compatibility(*sycl_ctx, cgraph)", "ggml_sycl_graph_has_host_inputs(cgraph)",
+             "ggml_sycl_graph_has_op(cgraph, GGML_OP_FLASH_ATTN_EXT)",
+             "moe_graph_descriptor_moe_dispatch_candidate_count(sycl_ctx, cgraph)",
+             "moe_decode_segmented_graph_profitable(cgraph)", "moe_decode_segmented_graph_analyze(cgraph)")
+    for scan in scans:
+        assert futile.end() < compute.index(scan) < graph_branch, scan
+    # The signature hash and the exec-graph key are first computed inside the graph branch, never on the way to it.
+    for call in ("ggml_sycl_graph_signature(cgraph)", "sycl_exec_graph_make_key("):
+        assert graph_branch < compute.index(call, futile.end()), call
+    # Every scan between the decision and the graph branch is skipped for a futile context: either it needs
+    # use_sycl_graph, or it is guarded on the flag itself.
+    policy = compute[futile.end():graph_branch]
+    assert "use_sycl_graph && cached_is_decode && ggml_sycl_has_global_plan() && ggml_sycl_graph_has_host_inputs(cgraph)" in policy
+    assert re.search(r"decode_has_flash_attn_ext\s*=\s*cached_is_decode && !sycl_ctx->exec_graph_replay_futile &&\s*"
+                     r"ggml_sycl_graph_has_op\(cgraph, GGML_OP_FLASH_ATTN_EXT\)", policy)
+    assert re.search(r"moe_graphlet_replay_probe\s*=\s*cached_is_decode && !sycl_ctx->exec_graph_replay_futile &&\s*"
+                     r"moe_graphlet_replay_probe_enabled\(\)", policy)
+    assert re.search(r"\(use_sycl_graph && cached_is_decode && !moe_graphlet_replay_probe\)\s*\?\s*"
+                     r"moe_graph_descriptor_moe_dispatch_candidate_count\(sycl_ctx, cgraph\)", policy)
+    for m in re.finditer(r"moe_decode_segmented_graph_(?:profitable|analyze)\(cgraph\)", policy):
+        guard = policy[policy.rindex("if (", 0, m.start()):m.start()]
+        assert guard.startswith("if (use_sycl_graph && "), guard
+    # The decode no-graph diagnostic names the futility gate once, ahead of the branch that rescans for other reasons.
+    reason = policy.index("if (!use_sycl_graph && cached_is_decode && sycl_ctx->exec_graph_replay_futile) {")
+    rest = policy.index("} else if (!use_sycl_graph && cached_is_decode) {", reason)
+    assert "replay futility gate tripped for this context" in policy[reason:rest]
+    assert "ggml_sycl_graph_has_host_inputs" not in policy[reason:rest]
+    # The no-graph path's block graphlets record command graphs, so a replay-futile context never tries them.
+    direct = region(compute[compute.rindex("bool block_graphlet_executed = false;"):],
+                    "bool block_graphlet_executed = false;", "if (!block_graphlet_executed)")
+    assert re.search(r"if \(cached_is_decode && !sycl_ctx->exec_graph_replay_futile &&\s*"
+                     r"moe_block_graphlet_requested_size\(sycl_ctx->device\)\s*>\s*0\)", direct)
+    print("PASS futile-context-direct-source-gate")
 
 with gate('moe-metadata'):
     # Metadata and its derived group registry are built locally and atomically
