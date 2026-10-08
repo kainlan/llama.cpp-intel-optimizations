@@ -244,6 +244,7 @@ bool lookup_aborts_with_backstop(uintptr_t lookup_addr) {
         close(pipefd[0]);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
+        alarm(10);
         setenv("GGML_NO_BACKTRACE", "1", 1);
         alloc_metadata m{};
         (void) unified_lookup_runtime_allocation(at(lookup_addr), &m, nullptr);
@@ -269,7 +270,7 @@ bool lookup_aborts_with_backstop(uintptr_t lookup_addr) {
     const bool aborted = WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
     const bool message = captured.find("containment index disagrees with its registry row") != std::string::npos;
     if (!aborted || !message) {
-        fprintf(stderr, "    child: aborted=%d message=%d stderr=[%s]\n", aborted, message, captured.c_str());
+        fprintf(stderr, "    child: aborted=%d message=%d stderr=[%s]\n", aborted ? 1 : 0, message ? 1 : 0, captured.c_str());
     }
     return aborted && message;
 }

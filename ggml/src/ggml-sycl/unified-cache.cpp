@@ -1523,8 +1523,9 @@ static bool runtime_registry_row_indexed(const alloc_metadata & h) noexcept {
 
 // The only ways to add, remove or replace a registry row (runtime_registry_emplace_locked, runtime_registry_erase_locked
 // and runtime_registry_assign_locked below); the caller holds g_runtime_alloc_mutex. They keep g_runtime_alloc_index in
-// step. runtime_registry_emplace_locked has the contract of unordered_map::emplace: {row, true} on success, {existing row, false} when `ptr` already has
-// one. An allocation failure leaves registry and index unchanged and propagates.
+// step. runtime_registry_emplace_locked has the contract of unordered_map::emplace: {row, true} on success,
+// {existing row, false} when `ptr` already has one. An allocation failure leaves registry and index unchanged and
+// propagates.
 //
 // DEFENSIVE: the refusal further down, when the index already has a range starting at this row's handle.ptr, cannot
 // happen while a row's key is its handle.ptr, because the registry cannot hold two rows at one pointer. It exists so a
@@ -17445,6 +17446,8 @@ bool unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, s
     if (it == g_runtime_alloc_registry.end()) {
         return false;
     }
+    // Index and registry are kept in step by the emplace/erase/assign helpers, holding g_runtime_alloc_mutex.
+    GGML_ASSERT(it != g_runtime_alloc_registry.end());
     // Backstop for the index's one assumption, that a registered row's geometry never changes: if anything rewrote it
     // (the source gate is only a tripwire), fail here, loudly, instead of answering from a stale extent.
     GGML_ASSERT(runtime_registry_row_matches_index_entry(it->second.handle, hit) &&
