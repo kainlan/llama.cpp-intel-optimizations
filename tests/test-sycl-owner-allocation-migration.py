@@ -845,6 +845,9 @@ def check_segmented_call_ends(code: str) -> list:
         problems.append("begin captures descriptors even when the decode prescan already did")
     if "ggml_sycl_cpu_tg_flush_pending();" not in end or "flush_pending_attn_dispatch(d);" not in end:
         problems.append("end does not drain every pending slot")
+    if not re.search(r"for \(int d = 0; d < GGML_SYCL_MAX_DEVICES; d\+\+\) \{\s*if \(g_pending_attn_dispatch\[d\]\.active\) \{"
+                     r"\s*flush_pending_attn_dispatch\(d\);\s*\}\s*release_stale_attn_dispatch\(d\);\s*\}", end):
+        problems.append("end does not publish and release every device's host-attention slot")
     for name, body, first_use in (("record", record, "moe_graph_collect_dispatch_indices(cgraph)"),
                                   ("replay", replay, "while (seg_idx <"),
                                   ("keyed record", keyed_record, "moe_graph_keyed_plan(cgraph)"),
@@ -873,6 +876,7 @@ with gate('segmented-call-owns-graph-ends'):
     _keyed_end = "    moe_graph_segmented_call_end();\n}\n"
     assert _keyed_record.count(_begin_call) == 1 and _keyed_replay.count(_begin_call) == 1
     assert _keyed_record.count(_keyed_end) == 1 and _keyed_replay.count(_keyed_end) == 1
+    _end_body = region(RUNTIME_CODE, "static void moe_graph_segmented_call_end() {", "\n}\n")
     controls = {
         "no topology rescan": re.sub(
             r"moe_layer_scan_graph_topology\(\*sycl_ctx, cgraph,\s*true,\s*capture_moe_descriptors\);",
@@ -896,6 +900,12 @@ with gate('segmented-call-owns-graph-ends'):
         "end drain without the CPU slots": RUNTIME_CODE.replace(
             "static void moe_graph_segmented_call_end() {\n    ggml_sycl_cpu_tg_flush_pending();",
             "static void moe_graph_segmented_call_end() {"),
+        "end drain stops at the first device": RUNTIME_CODE.replace(
+            _end_body, _end_body.replace("d < GGML_SYCL_MAX_DEVICES;", "d < 1;", 1), 1),
+        "end drain keeps stale attention slots": RUNTIME_CODE.replace(
+            _end_body, _end_body.replace("        release_stale_attn_dispatch(d);\n", "", 1), 1),
+        "end drain publishes only an inactive slot": RUNTIME_CODE.replace(
+            _end_body, _end_body.replace("if (g_pending_attn_dispatch[d].active) {", "if (false) {", 1), 1),
     }
     for label, mutated in controls.items():
         assert mutated != RUNTIME_CODE, "control %r did not apply" % label
@@ -913,6 +923,7 @@ def check_keyed_segment_slots(code: str) -> list:
         compute = region(code, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
                          "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
         mode = region(code, "static bool moe_segment_keyed_mode(", "\n}\n")
+        env = region(code, "static bool ggml_sycl_segmented_graph_env_allows() {", "\n}\n")
         compat = region(code, "static ggml_sycl_graph_compat check_graph_compatibility(ggml_backend_sycl_context & ctx, "
                         "ggml_cgraph * cgraph) {", "\n}\n")
     except ValueError as error:
@@ -920,6 +931,9 @@ def check_keyed_segment_slots(code: str) -> list:
     if not re.search(r"return is_decode && ctx->moe_graph_rerecord && ggml_sycl_segmented_graph_env_allows\(\) &&\s*"
                      r"!ctx->moe_segment_slots\.churned\(\);", mode):
         problems.append("keyed mode is not limited to decode, segmented MoE mode, the env and an unchurned cache")
+    if not re.search(r"static const bool allows =\s*std::getenv\(\"GGML_SYCL_GRAPH_RERECORD\"\) == nullptr && "
+                     r"std::getenv\(\"GGML_SYCL_NO_SEG_GRAPH\"\) == nullptr;\s*return allows;", env):
+        problems.append("segmented replay ignores the GGML_SYCL_GRAPH_RERECORD or GGML_SYCL_NO_SEG_GRAPH opt-out")
     decided = compute.find("const bool moe_segment_keyed = moe_segment_keyed_mode(sycl_ctx, is_decode_phase);")
     exempt = (
         ("failed-graph memo", r"if \(!moe_segment_keyed && is_decode_phase && sycl_ctx->moe_graph_rerecord &&\s*"
@@ -970,6 +984,9 @@ with gate('keyed-segment-slots'):
         "warmup applies to keyed": ("if (!moe_segment_keyed && warmup_n_nodes != cgraph->n_nodes)",
                                     "if (warmup_n_nodes != cgraph->n_nodes)"),
         "keyed mode outlives churn": (" &&\n           !ctx->moe_segment_slots.churned();", ";"),
+        "env opt-outs ignored": ('GGML_SYCL_NO_SEG_GRAPH") == nullptr;\n    return allows;', 'GGML_SYCL_NO_SEG_GRAPH") == nullptr;\n    return true;'),
+        "NO_SEG_GRAPH ignored": (' && std::getenv("GGML_SYCL_NO_SEG_GRAPH") == nullptr;', ";"),
+        "GRAPH_RERECORD ignored": ('std::getenv("GGML_SYCL_GRAPH_RERECORD") == nullptr && ', ""),
         "MUL_MAT_ID vetoes segmented": ("return mul_mat_id_not_recordable ? GGML_SYCL_GRAPH_COMPAT_SEGMENTED_ONLY :",
                                         "return mul_mat_id_not_recordable ? GGML_SYCL_GRAPH_COMPAT_NONE :"),
         "prompt admits segmented-only": ("(compat == GGML_SYCL_GRAPH_COMPAT_SEGMENTED_ONLY && cached_is_decode &&",
@@ -1142,7 +1159,8 @@ def check_keyed_slot_input_staging(code: str, common: str) -> list:
                      r"GGML_SYCL_DEBUG\([^\n]*\);\s*sycl_ctx->moe_segment_slots\.forget\(slot_key\);\s*"
                      r"compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);"
                      r"\s*moe_graph_replay_segment_slot\(", compute):
-        problems.append("a replay does not drop a slot whose inputs stage elsewhere before replaying it")
+        problems.append("a replay does not drop a slot whose inputs stage elsewhere, then refresh its inputs, "
+                        "before replaying it")
     return problems
 
 
@@ -1161,6 +1179,8 @@ with gate('keyed-slot-input-staging'):
          "else if (false)"),
         ("mismatch keeps the slot", "runtime", r"\n\s*sycl_ctx->moe_segment_slots\.forget\(slot_key\);", ""),
         ("check ignores identity", "runtime", r" \|\|\s*\(rec\.valid\(\) && !rec\.stable_identity_equal\(now\)\)", ""),
+        ("replay without the input refresh", "runtime",
+         r"(compute_impl_unlocked\(\);\s*\}\s*else\s*\{)\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);", r"\1"),
         ("capture holds nothing", "runtime", r"slot\.input_staging\.push_back\(moe_segment_slot_input_staging\(",
          "(void) (moe_segment_slot_input_staging("),
     )
