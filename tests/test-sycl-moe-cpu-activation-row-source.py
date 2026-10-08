@@ -472,17 +472,22 @@ def check_sibling_join(code: str, hostpath_src: str | None = None) -> None:
     d_at = hp.find("inline bool moe_pool_spans_disjoint(size_t a_first, size_t a_count, size_t b_first, size_t b_count)")
     keep_body = brace_block_from(hp, k_at) if k_at >= 0 else ""
     disjoint_body = brace_block_from(hp, d_at) if d_at >= 0 else ""
-    if (
-        "if (!r.pending_active || !r.sibling_slot_free || !r.reuses_activation || r.op_count == 0 || "
-        "r.pending_act_serial != r.current_act_serial) { return false; }" not in keep_body
-        or "return r.same_row_geometry && moe_pool_spans_disjoint(r.pending_first, r.pending_count, r.op_first, "
-        "r.op_count);" not in keep_body
-        or disjoint_body != "{ return a_first + a_count <= b_first || b_first + b_count <= a_first; }"
-    ):
+    # The whole predicate, exactly: a needle check would not see a statement added ahead of the needles
+    # (an early `return true;`), and the pool guard -- the only accept without the span check, taken only
+    # when one side owns separate buffers -- is part of the contract too.
+    expected_keep = (
+        "{ if (!r.pending_active || !r.sibling_slot_free || !r.reuses_activation || r.op_count == 0 || "
+        "r.pending_act_serial != r.current_act_serial) { return false; } "
+        "if (!r.pending_from_pool || !r.op_from_pool) { return true; } "
+        "return r.same_row_geometry && moe_pool_spans_disjoint(r.pending_first, r.pending_count, r.op_first, "
+        "r.op_count); }"
+    )
+    if keep_body != expected_keep or disjoint_body != "{ return a_first + a_count <= b_first || b_first + b_count <= a_first; }":
         raise ContractError(
-            "FAIL [pin J1]: moe_sibling_pending_keep no longer refuses a rewritten activation staging (serial "
-            "mismatch) and overlapping pool spans; a kept job could read rewritten staging or share pool bytes "
-            "with this op (llama.cpp-yx28)"
+            "FAIL [pin J1]: moe_sibling_pending_keep is not exactly: refuse unless pending, sibling free, reusing an "
+            "unrewritten staging (serial match) and non-empty; accept when one side owns separate buffers; else "
+            "require equal geometry and disjoint pool spans. A changed predicate could keep a job that reads "
+            "rewritten staging or shares pool bytes with this op (llama.cpp-yx28)"
         )
     if not re.search(
         r"\} else \{ flush_pending_cpu_scatter\(\); sycl::event::wait\(g_pending_scatter_sibling\.prev_bufs\.scatter_events\); "
@@ -824,6 +829,12 @@ def self_test(backend_src: str) -> int:
     expect_fail("keep-drops-disjoint-check", backend_src, None, "J1", hostpath_src.replace(
         "return r.same_row_geometry && moe_pool_spans_disjoint(r.pending_first, r.pending_count, r.op_first, r.op_count);",
         "return r.same_row_geometry;", 1))
+    expect_fail("keep-pool-guard-weakened", backend_src, None, "J1", hostpath_src.replace(
+        "if (!r.pending_from_pool || !r.op_from_pool) {", "if (!r.pending_from_pool || r.op_from_pool) {", 1))
+    expect_fail("keep-early-accept-inserted", backend_src, None, "J1", hostpath_src.replace(
+        "inline bool moe_sibling_pending_keep(const moe_sibling_pending_request & r) {\n",
+        "inline bool moe_sibling_pending_keep(const moe_sibling_pending_request & r) {\n"
+        "    if (r.op_count != 0) {\n        return true;\n    }\n", 1))
     expect_fail("keep-request-drops-staging-serial", sub(
         "keep.current_act_serial = g_moe_shared_act.record.serial;", "keep.current_act_serial = gate.act_serial;",
         in_lambda=False, after=JOIN_ANCHOR), None, "J1")
