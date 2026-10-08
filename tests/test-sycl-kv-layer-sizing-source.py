@@ -847,7 +847,12 @@ def runtime_kv_admission_violations(source: str) -> list[str]:
         found.append("the re-fit trigger does not receive ctx->runtime_kv_admitted")
 
     sets = [m.start() for m in re.finditer(r"runtime_kv_admitted\s*=\s*true\s*;", strip_comments(source))]
-    tail = re.search(r"ctx->runtime_kv_admitted\s*=\s*true\s*;\s*return\s+ggml_sycl_txn_result::ACCEPTED\s*;\s*}\s*$",
+    # moua L4: the publish tail drops the context's earlier published section after the flag and before the
+    # return. The plan is already live there and the drop cannot refuse the transaction (a failed drop reaches the
+    # caller as EFFECT_FAILED), so it is the one statement allowed between the flag and the return.
+    tail = re.search(r"ctx->runtime_kv_admitted\s*=\s*true\s*;\s*"
+                     r"(?:ggml_sycl_published_section_set\(\s*ctx\s*,\s*nullptr\s*\)\s*;\s*)?"
+                     r"return\s+ggml_sycl_txn_result::ACCEPTED\s*;\s*}\s*$",
                      code)
     if not sets:
         found.append("runtime_kv_admitted is never set true")
