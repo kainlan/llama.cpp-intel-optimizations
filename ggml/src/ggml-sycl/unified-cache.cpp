@@ -5004,20 +5004,18 @@ constexpr int    k_dump_devices  = GGML_SYCL_MAX_DEVICES;
 constexpr size_t k_dump_max_keys = 32;
 constexpr size_t k_dump_key_len  = 64;
 
-const char * const k_dump_counter_names[] = {
+// The defines sit outside the braces: the static-storage audit's parser proves an initializer list with no directive in
+// it, and rejects one with (llama.cpp-y8w5).
 #define GGML_SYCL_DUMP_COUNTER_NAME(name) #name,
-    GGML_SYCL_DUMP_COUNTERS(GGML_SYCL_DUMP_COUNTER_NAME)
+const char * const k_dump_counter_names[] = { GGML_SYCL_DUMP_COUNTERS(GGML_SYCL_DUMP_COUNTER_NAME) };
 #undef GGML_SYCL_DUMP_COUNTER_NAME
-};
 static_assert(sizeof(k_dump_counter_names) / sizeof(k_dump_counter_names[0]) ==
                   static_cast<size_t>(dump_counter::COUNT),
               "every dump counter needs its printed name");
 
-const char * const k_dump_snapshot_names[] = {
 #define GGML_SYCL_DUMP_SNAPSHOT_NAME(id, printed) printed,
-    GGML_SYCL_DUMP_SNAPSHOTS(GGML_SYCL_DUMP_SNAPSHOT_NAME)
+const char * const k_dump_snapshot_names[] = { GGML_SYCL_DUMP_SNAPSHOTS(GGML_SYCL_DUMP_SNAPSHOT_NAME) };
 #undef GGML_SYCL_DUMP_SNAPSHOT_NAME
-};
 static_assert(sizeof(k_dump_snapshot_names) / sizeof(k_dump_snapshot_names[0]) ==
                   static_cast<size_t>(dump_snapshot::COUNT),
               "every dump snapshot needs its printed name");

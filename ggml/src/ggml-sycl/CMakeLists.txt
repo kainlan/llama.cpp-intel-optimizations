@@ -132,8 +132,9 @@ if (BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-counter-dump.py
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
     set_tests_properties(test-sycl-counter-dump-gate PROPERTIES LABELS "sycl;source-contract;host")
-    # llama.cpp-23mk S3-3: the three oneDNN wrappers that ask get_scratchpad_mem (softmax, eltwise,
-    # binary_broadcast_row) return a [[nodiscard]] bool, make the `return false` decision on a declined scratchpad
+    # llama.cpp-23mk S3-3/S3-4: the three oneDNN wrappers that ask get_scratchpad_mem in dnnl-ops.hpp (softmax, eltwise,
+    # binary_broadcast_row) and the five DnnlGemmWrapper consumers in gemm.hpp (with the next paths in ggml-sycl.cpp and
+    # outprod.cpp) return a [[nodiscard]] bool or optional, make the `return false` decision on a declined scratchpad
     # before anything writes to or binds the output, and never throw or catch. The deleted wrappers (binary,
     # Reduction, eltwise_inplace) stay deleted. Every caller's `if` is exactly the call with a body of exactly
     # `return;`, so a decline falls through to its default path. Pure Python over source text, with its own mutants

@@ -47895,9 +47895,15 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
             const sycl::half * src0_ptr = src0->type == GGML_TYPE_F16 ?
                                               (const sycl::half *) src0_dd_i :
                                               (src0_dq_scratch ? src0_dq_scratch : src0_as_f16.get());
-            DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
-                                      src1_ptr, DnnlGemmWrapper::to_dt<sycl::half>(), dst_dd_i,
-                                      DnnlGemmWrapper::to_dt<float>(), stream, ldc, ggml_type_name(src0->type));
+            // A declined scratchpad submitted nothing, and a DNNL build compiles no other arm here (the dpct::gemm arm
+            // below exists only without GGML_SYCL_DNNL): the op fails by name, never by abort (llama.cpp-23mk S3-4).
+            if (!DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ptr,
+                                           DnnlGemmWrapper::to_dt<sycl::half>(), src1_ptr,
+                                           DnnlGemmWrapper::to_dt<sycl::half>(), dst_dd_i,
+                                           DnnlGemmWrapper::to_dt<float>(), stream, ldc, ggml_type_name(src0->type))) {
+                throw ggml_sycl_fallback_error(
+                    "dnnl_gemm declined in mul_mat's f16 dense arm: no other arm in a DNNL build");
+            }
         }
 #elif GGML_SYCL_HAS_ONEAPI_MATH
         {
@@ -48052,9 +48058,13 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
         const float * src1_ddf1_i = src1->type == GGML_TYPE_F32 ? (const float *) src1_ddf_i : src1_ddq_as_f32.get();
 #if GGML_SYCL_DNNL
 
-        DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i, DnnlGemmWrapper::to_dt<float>(),
-                                  src1_ddf1_i, DnnlGemmWrapper::to_dt<float>(), dst_dd_i,
-                                  DnnlGemmWrapper::to_dt<float>(), stream, ldc, ggml_type_name(src0->type));
+        // Same declared path as the f16 dense arm above: no other arm exists in a DNNL build.
+        if (!DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i, DnnlGemmWrapper::to_dt<float>(),
+                                       src1_ddf1_i, DnnlGemmWrapper::to_dt<float>(), dst_dd_i,
+                                       DnnlGemmWrapper::to_dt<float>(), stream, ldc, ggml_type_name(src0->type))) {
+            throw ggml_sycl_fallback_error(
+                "dnnl_gemm declined in mul_mat's f32 dense arm: no other arm in a DNNL build");
+        }
 #elif GGML_SYCL_HAS_ONEAPI_MATH
         {
             const float alpha = 1.0f;
@@ -52777,10 +52787,13 @@ bool context_measure_mul_mat_route_env(void *, const ggml_tensor * node, ggml_sy
 }
 }  // namespace ggml_sycl
 
-static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
-                                           const ggml_tensor *         src0,
-                                           const ggml_tensor *         src1,
-                                           ggml_tensor *               dst) try {
+// Returns false when the oneDNN scratchpad request was declined before anything was written to dst: both callers then
+// run ggml_sycl_mul_mat_batched_f16_fallback (llama.cpp-23mk S3-4). A decline is not resource exhaustion, so it never
+// reaches the resource-exhaustion ladder; errors still throw as before.
+[[nodiscard]] static bool ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
+                                                         const ggml_tensor *         src0,
+                                                         const ggml_tensor *         src1,
+                                                         ggml_tensor *               dst) try {
     // batched_sycl is intended for activation-only GEMM (Q/K/V). Weight GEMM should
     // route through the unified-cache streaming path in ggml_sycl_op_mul_mat.
     GGML_ASSERT(!ggml_sycl_tensor_is_weight(src0));
@@ -52927,7 +52940,7 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
                 (const void **) (ptrs_src.get() + 1 * ne23), dpct::library_data_t::real_half, s11, beta,
                 (void **) (ptrs_dst.get() + 0 * ne23), mkl_data_type, ne0, ne23, mkl_compute_type, matrix_info.get())));
         }
-        return;
+        return true;
 #    else
         throw std::runtime_error("oneMKL unavailable for cache_k batched F16 attention route");
 #    endif
@@ -52940,16 +52953,29 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
         int64_t str_b0                  = nb10 / type_size_src1;
         int64_t str_b1                  = nb11 / type_size_src1;
         int64_t str_b2                  = nb12 / type_size_src1;
+        // Returns false when the scratchpad was declined before this launch wrote anything. A decline after a write is
+        // not a next path, so it throws by name (dnnl_decline_after_write).
         auto    launch_gemm_for_batches = [&ctx, queue](const sycl::half * src0, const sycl::half * src1, float * dst,
                                                      int64_t a0, int64_t a1, int64_t batcha, int64_t /*b0*/, int64_t b1,
                                                      int64_t batchb, int64_t sa0, int64_t sa1, int64_t sa2, int64_t sb0,
-                                                     int64_t sb1, int64_t sb2, int64_t sd2) {
+                                                     int64_t sb1, int64_t sb2, int64_t sd2) -> bool {
             bool supported_broadcast = batchb == batcha ? true : batchb == 1 || batcha == 1 ? true : false;
             if (supported_broadcast) {
-                DnnlGemmWrapper::gemm(ctx, a1, b1, a0, src0, DnnlGemmWrapper::to_dt<sycl::half>(), sa0, sa1, sa2, src1,
-                                         DnnlGemmWrapper::to_dt<sycl::half>(), sb0, sb1, sb2, dst,
-                                         DnnlGemmWrapper::to_dt<float>(), queue, batcha, batchb);
+                return DnnlGemmWrapper::gemm(ctx, a1, b1, a0, src0, DnnlGemmWrapper::to_dt<sycl::half>(), sa0, sa1, sa2,
+                                                src1, DnnlGemmWrapper::to_dt<sycl::half>(), sb0, sb1, sb2, dst,
+                                                DnnlGemmWrapper::to_dt<float>(), queue, batcha, batchb)
+                    .has_value();
             } else {
+                // One descriptor serves every batch of the loops below, so the scratchpad is asked for once, before
+                // the first write: a decline here returns false with dst untouched. (Call 1 of this launch at the
+                // dnnl_gemm site, the counters being cumulative across launches; batch b's own query inside gemm is
+                // call b + 2 of the launch.)
+                if (!DnnlGemmWrapper::gemm(ctx, a1, b1, a0, src0, DnnlGemmWrapper::to_dt<sycl::half>(), sa0, sa1, sa2,
+                                              src1, DnnlGemmWrapper::to_dt<sycl::half>(), sb0, sb1, sb2, dst,
+                                              DnnlGemmWrapper::to_dt<float>(), queue, 1, 1, /* ldc = */ -1,
+                                              /* deps = */ {}, /* op_context = */ nullptr, /* query_only = */ true)) {
+                    return false;
+                }
                 // iterate over batches from smaller set of matrices (matrix 0)
                 int64_t batches0 = batcha;
                 int64_t batches1 = batchb;
@@ -52966,10 +52992,12 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
                             const int64_t      batch_idx    = i0 * sub_batch + j;
                             const sycl::half * src0_shifted = src0 + sa2 * batch_idx;
                             float *            dst_shifted  = dst + sd2 * batch_idx;
-                            DnnlGemmWrapper::gemm(ctx, a1, b1, a0, src0_shifted, DnnlGemmWrapper::to_dt<sycl::half>(),
-                                                     sa0, sa1, sa2, src1_shifted, DnnlGemmWrapper::to_dt<sycl::half>(),
-                                                     sb0, sb1, sb2, dst_shifted, DnnlGemmWrapper::to_dt<float>(), queue, 1,
-                                                     1);
+                            if (!DnnlGemmWrapper::gemm(
+                                    ctx, a1, b1, a0, src0_shifted, DnnlGemmWrapper::to_dt<sycl::half>(), sa0, sa1, sa2,
+                                    src1_shifted, DnnlGemmWrapper::to_dt<sycl::half>(), sb0, sb1, sb2, dst_shifted,
+                                    DnnlGemmWrapper::to_dt<float>(), queue, 1, 1)) {
+                                throw ggml_sycl_fallback_error("dnnl_decline_after_write:dnnl_gemm");
+                            }
                         }
                     }
                 } else {
@@ -52985,14 +53013,17 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
                             const int64_t      batch_idx    = i1 * sub_batch + j;
                             const sycl::half * src1_shifted = src1 + sb2 * batch_idx;
                             float *            dst_shifted  = dst + sd2 * batch_idx;
-                            DnnlGemmWrapper::gemm(ctx, a1, b1, a0, src0_shifted, DnnlGemmWrapper::to_dt<sycl::half>(),
-                                                     sa0, sa1, sa2, src1_shifted, DnnlGemmWrapper::to_dt<sycl::half>(),
-                                                     sb0, sb1, sb2, dst_shifted, DnnlGemmWrapper::to_dt<float>(), queue, 1,
-                                                     1);
+                            if (!DnnlGemmWrapper::gemm(
+                                    ctx, a1, b1, a0, src0_shifted, DnnlGemmWrapper::to_dt<sycl::half>(), sa0, sa1, sa2,
+                                    src1_shifted, DnnlGemmWrapper::to_dt<sycl::half>(), sb0, sb1, sb2, dst_shifted,
+                                    DnnlGemmWrapper::to_dt<float>(), queue, 1, 1)) {
+                                throw ggml_sycl_fallback_error("dnnl_decline_after_write:dnnl_gemm");
+                            }
                         }
                     }
                 }
             }
+            return true;
         };
         const bool cont_batches_dim2_a = nb02 * ne02 == nb03;
         const bool cont_batches_dim2_b = nb12 * ne12 == nb13;
@@ -53002,9 +53033,10 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
             // A batch is considered contiguous if the dimension 2 is not strided
             int64_t batches0 = ne02 * ne03;
             int64_t batches1 = ne12 * ne13;
-            launch_gemm_for_batches(src0_f16, src1_f16, dst_ddf, ne00, ne01, batches0, ne10, ne11, batches1, str_a0,
-                                    str_a1, str_a2, str_b0, str_b1, str_b2, nb2 / sizeof(float));
-
+            if (!launch_gemm_for_batches(src0_f16, src1_f16, dst_ddf, ne00, ne01, batches0, ne10, ne11, batches1,
+                                         str_a0, str_a1, str_a2, str_b0, str_b1, str_b2, nb2 / sizeof(float))) {
+                return false;
+            }
         } else if (cont_batches_dim3_a && cont_batches_dim3_b) {
             // This case is similar to the one above with the difference that only the batch in dimension 3 is used and the dimension 2 is of size 1.
             int64_t batches0 = ne02 * ne03;
@@ -53012,8 +53044,10 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
             int64_t str_a3   = nb03 / type_size_src0;
             int64_t str_b3   = nb13 / type_size_src1;
 
-            launch_gemm_for_batches(src0_f16, src1_f16, dst_ddf, ne00, ne01, batches0, ne10, ne11, batches1, str_a0,
-                                    str_a1, str_a3, str_b0, str_b1, str_b3, nb2 / sizeof(float));
+            if (!launch_gemm_for_batches(src0_f16, src1_f16, dst_ddf, ne00, ne01, batches0, ne10, ne11, batches1,
+                                         str_a0, str_a1, str_a3, str_b0, str_b1, str_b3, nb2 / sizeof(float))) {
+                return false;
+            }
         } else {
             for (int64_t b_a = 0; b_a < ne03; b_a++) {
                 const sycl::half * src0_f16_shifted = src0_f16 + (nb03 * b_a / type_size_src0);
@@ -53021,9 +53055,16 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
                 float *            dst_shifted      = dst_ddf + (nb3 * b_a / sizeof(float));
                 int64_t            batches0         = ne02;
                 int64_t            batches1         = ne12;
-                launch_gemm_for_batches(src0_f16_shifted, src1_f16_shifted, dst_shifted, ne00, ne01, batches0, ne10,
-                                        ne11, batches1, str_a0, str_a1, str_a2, str_b0, str_b1, str_b2,
-                                        nb2 / sizeof(float));
+                if (!launch_gemm_for_batches(src0_f16_shifted, src1_f16_shifted, dst_shifted, ne00, ne01, batches0,
+                                             ne10, ne11, batches1, str_a0, str_a1, str_a2, str_b0, str_b1, str_b2,
+                                             nb2 / sizeof(float))) {
+                    // A decline for the first slice wrote nothing; one for a later slice comes after the earlier
+                    // slices wrote dst, which is not a next path.
+                    if (b_a == 0) {
+                        return false;
+                    }
+                    throw ggml_sycl_fallback_error("dnnl_decline_after_write:dnnl_gemm");
+                }
             }
         }
     }
@@ -53072,6 +53113,7 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
     static_assert(false,
                   "Either GGML_SYCL_DNNL or GGML_SYCL_HAS_ONEAPI_MATH must be defined for batch GEMM operations");
 #endif
+    return true;
 } catch (const dnnl::error & e) {
     if (g_ggml_sycl_graph_recording) {
         throw;
@@ -66382,11 +66424,15 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                         ctx.stream()->wait();
                                         t_gemm0 = std::chrono::high_resolution_clock::now();
                                     }
-                                    DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(N), static_cast<int>(M),
-                                                              static_cast<int>(K), src0_f16_ptr,
-                                                              DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
-                                                              DnnlGemmWrapper::to_dt<sycl::half>(), dst_batch_ptr,
-                                                              DnnlGemmWrapper::to_dt<float>(), ctx.stream());
+                                    if (!DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(N), static_cast<int>(M),
+                                                                   static_cast<int>(K), src0_f16_ptr,
+                                                                   DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
+                                                                   DnnlGemmWrapper::to_dt<sycl::half>(), dst_batch_ptr,
+                                                                   DnnlGemmWrapper::to_dt<float>(), ctx.stream())) {
+                                        // Declined scratchpad: the SOA q8_1 loop below, as the catch does.
+                                        used_onednn = false;
+                                        break;
+                                    }
                                     ctx.stream()->wait_and_throw();
                                     if (split_timing) {
                                         const auto t_gemm1 = std::chrono::high_resolution_clock::now();
@@ -66517,11 +66563,15 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                     f32_to_fp16(src1_batch_ptr, src1_f16_ptr, src1_elems, ctx.stream());
 
                                     try {
-                                        DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(N), static_cast<int>(M),
-                                                                  static_cast<int>(K), src0_f16_ptr,
-                                                                  DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
-                                                                  DnnlGemmWrapper::to_dt<sycl::half>(), dst_batch_ptr,
-                                                                  DnnlGemmWrapper::to_dt<float>(), ctx.stream());
+                                        if (!DnnlGemmWrapper::row_gemm(
+                                                ctx, static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
+                                                src0_f16_ptr, DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
+                                                DnnlGemmWrapper::to_dt<sycl::half>(), dst_batch_ptr,
+                                                DnnlGemmWrapper::to_dt<float>(), ctx.stream())) {
+                                            // Declined scratchpad: the unified kernel below, as the catch does.
+                                            used_onednn = false;
+                                            break;
+                                        }
                                         ctx.stream()->wait_and_throw();
                                         used_onednn = true;
                                     } catch (const std::exception & e) {
@@ -67335,8 +67385,13 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         } else {
             // The kernel from the if path is faster for that specific case, but does not support all mul mats.
             GGML_SYCL_KTRACE("mul_mat_f16_batched", " ne3=%lld", (long long) src0->ne[3]);
+            bool batched_declined = false;
             try {
-                ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
+                batched_declined = !ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
+            } catch (const ggml_sycl_fallback_error &) {
+                // A named failure (a decline after a write) is not resource exhaustion: it must reach the caller's
+                // handler by name, not become the ladder's "likely VRAM exhaustion" abort.
+                throw;
             } catch (const std::exception & e) {
                 // ggml_sycl_mul_mat_batched_sycl deliberately re-throws
                 // sycl::exception "for callers that have eviction-retry
@@ -67351,6 +67406,12 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                     "[SYCL] batched F16 mul_mat failed — likely VRAM exhaustion. "
                     "The per-layer KV allocator should leave headroom for compute scratch.");
             }
+            // A declined oneDNN scratchpad wrote nothing to dst: the native GPU fallback runs. A decline is not
+            // resource exhaustion, so it never enters the ladder above, and if the fallback fails too the op fails by
+            // name (llama.cpp-23mk S3-4).
+            if (batched_declined && !ggml_sycl_mul_mat_batched_f16_fallback(ctx, src0, src1, dst)) {
+                throw ggml_sycl_fallback_error("dnnl_gemm declined and batched_f16_fallback failed");
+            }
         }
     } else if (f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_VEC_NC) {
         // KQV single-batch
@@ -67361,8 +67422,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         // KQ + KQV multi-batch
         GGML_SYCL_KTRACE("mul_mat_f16_kqkv_multi", " batches=%lld", (long long) (src1->ne[2] * src1->ne[3]));
         if (f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED) {
+            bool batched_declined = false;
             try {
-                ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
+                batched_declined = !ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
             } catch (const std::exception & e) {
                 // Batched path failed. Do not unpin or evict weights from here:
                 // scratch headroom is a planning invariant, and forced eviction
@@ -67410,6 +67472,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                             "scratch guard (llama.cpp-oyfl) if flash attention was off for this context.");
                     }
                 }
+            }
+            // A declined oneDNN scratchpad wrote nothing to dst: the same native GPU fallback the catch above runs.
+            // The decline never enters the resource-exhaustion ladder; if the fallback fails too the op fails by name.
+            if (batched_declined && !ggml_sycl_mul_mat_batched_f16_fallback(ctx, src0, src1, dst)) {
+                throw ggml_sycl_fallback_error("dnnl_gemm declined and batched_f16_fallback failed");
             }
         } else {
             GGML_SYCL_DEBUG("[SYCL] KQV debug override: routing through non-batched mul_mat path\n");
@@ -67760,17 +67827,21 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                                 t_gemm0 = std::chrono::high_resolution_clock::now();
                                             }
                                             try {
-                                                DnnlGemmWrapper::row_gemm(
-                                                    ctx,
-                                                    static_cast<int>(N),  // row_diff = N (output cols)
-                                                    static_cast<int>(M),  // src1_ncols = M (batch)
-                                                    static_cast<int>(K),  // ne10 = K (reduction)
-                                                    fp16_weights_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
-                                                    activations_scratch, DnnlGemmWrapper::to_dt<sycl::half>(), dst_data,
-                                                    DnnlGemmWrapper::to_dt<float>(), ctx.stream());
-
-                                                used_onednn_fp16   = true;
-                                                unified_dispatched = true;
+                                                // A declined scratchpad submitted nothing: the unified kernel below, as
+                                                // the catch does.
+                                                used_onednn_fp16 =
+                                                    DnnlGemmWrapper::row_gemm(
+                                                        ctx,
+                                                        static_cast<int>(N),  // row_diff = N (output cols)
+                                                        static_cast<int>(M),  // src1_ncols = M (batch)
+                                                        static_cast<int>(K),  // ne10 = K (reduction)
+                                                        fp16_weights_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
+                                                        activations_scratch, DnnlGemmWrapper::to_dt<sycl::half>(),
+                                                        dst_data, DnnlGemmWrapper::to_dt<float>(), ctx.stream())
+                                                        .has_value();
+                                                if (used_onednn_fp16) {
+                                                    unified_dispatched = true;
+                                                }
                                             } catch (const std::exception & e) {
                                                 GGML_LOG_WARN(
                                                     "[SYCL] oneDNN PP failed, falling back to unified kernel: %s\n",
@@ -81243,51 +81314,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // reached at all).
             std::optional<sycl::event> gemm_profile_begin;
             std::optional<sycl::event> gemm_profile_end;
-            // host-stall attribution cycle, phase 5/6: repack/activation-
-            // stage kernel dispatch (components 1/2/4's own device-event
-            // markers cover their DEVICE time; this is that dispatch's HOST
-            // submission cost, not previously measured) plus any other prep
-            // between grouping and here.
-            host_phase_mark(&mxfp4_pp_batched_profile_accum::host_repackstage_us,
-                            &mxfp4_pp_batched_profile_accum::host_repackstage_calls);
-            try {
-                const sycl::event deps_in = stream->ext_oneapi_submit_barrier();
-                if (pp_profile) {
-                    gemm_profile_begin = ggml_sycl_submit_marker<class mxfp4_pp_profile_gemm_begin_marker>(*stream);
-                }
-                for (const pp_gemm_group & group : gemm_groups) {
-                    if (pp_woq_enabled) {
-                        gemm_events.push_back(DnnlGemmWrapper::woq_gemm_batch_mxfp4(
-                            ctx, /* m = */ static_cast<int>(group.n_rows), /* n = */ static_cast<int>(ne01),
-                            /* k = */ static_cast<int>(ne00), batched_acts + group.begin * act_slot_elems,
-                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int64_t>(act_slot_elems),
-                            batched_weight_bytes + group.begin * weight_slot_bytes,
-                            static_cast<int64_t>(weight_slot_bytes) * 2, /* group_size = */ QK_MXFP4,
-                            batched_weight_bytes + group.begin * weight_slot_bytes + woq_nibble_slot_bytes,
-                            static_cast<int64_t>(weight_slot_bytes), batched_out + group.begin * out_slot_elems,
-                            DnnlGemmWrapper::to_dt<float>(), static_cast<int64_t>(out_slot_elems),
-                            static_cast<int>(group.end - group.begin), ctx.stream(), { deps_in }));
-                    } else {
-                        gemm_events.push_back(DnnlGemmWrapper::gemm_batch_strided(
-                            ctx,
-                            /* trans_a = */ true,
-                            /* trans_b = */ false, static_cast<int>(ne01), static_cast<int>(group.n_rows),
-                            static_cast<int>(ne00), 1.0f, batched_weights + group.begin * weight_elems,
-                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne00),
-                            static_cast<int64_t>(weight_elems), batched_acts + group.begin * act_slot_elems,
-                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne10),
-                            static_cast<int64_t>(act_slot_elems), 0.0f, batched_out + group.begin * out_slot_elems,
-                            DnnlGemmWrapper::to_dt<float>(), static_cast<int>(ne0),
-                            static_cast<int64_t>(out_slot_elems), static_cast<int>(group.end - group.begin),
-                            ctx.stream(), { deps_in }));
-                    }
-                }
-            } catch (const std::exception & e) {
+            // Both ways this stage can fail (a thrown error, or a declined scratchpad) take the same path, so the tail
+            // is shared: the non-batched MoE path, or the named error for an XMX_TILED-claimed op. Returns false.
+            auto                       gemm_stage_failed = [&](const char * what) -> bool {
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     static std::atomic<int> gemm_fail_log{ 0 };
                     if (gemm_fail_log.fetch_add(1, std::memory_order_relaxed) < 8) {
                         GGML_LOG_WARN("[MOE-PP-ONEDNN-F16-BATCHED] oneDNN dispatch failed tensor=%s: %s\n",
-                                      src0 && src0->name ? src0->name : "?", e.what());
+                                      src0 && src0->name ? src0->name : "?", what);
                     }
                 }
                 batched_scratch_claim.finish_or_release();
@@ -81302,11 +81336,64 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // not copy the string it is given.
                     static thread_local std::string tiled_claim_gemm_msg;
                     tiled_claim_gemm_msg = std::string("[MOE-PP-ONEDNN-BATCHED] XMX_TILED-claimed op '") +
-                                           (src0 && src0->name ? src0->name : "?") +
-                                           "' GEMM dispatch failed: " + e.what();
+                                           (src0 && src0->name ? src0->name : "?") + "' GEMM dispatch failed: " + what;
                     throw ggml_sycl_fallback_error(tiled_claim_gemm_msg.c_str());
                 }
                 return false;
+            };
+            bool gemm_declined = false;
+            // host-stall attribution cycle, phase 5/6: repack/activation-
+            // stage kernel dispatch (components 1/2/4's own device-event
+            // markers cover their DEVICE time; this is that dispatch's HOST
+            // submission cost, not previously measured) plus any other prep
+            // between grouping and here.
+            host_phase_mark(&mxfp4_pp_batched_profile_accum::host_repackstage_us,
+                            &mxfp4_pp_batched_profile_accum::host_repackstage_calls);
+            try {
+                const sycl::event deps_in = stream->ext_oneapi_submit_barrier();
+                if (pp_profile) {
+                    gemm_profile_begin = ggml_sycl_submit_marker<class mxfp4_pp_profile_gemm_begin_marker>(*stream);
+                }
+                for (const pp_gemm_group & group : gemm_groups) {
+                    // A declined scratchpad submitted nothing for this group; the groups before it wrote only the
+                    // batched scratch buffers, never dst, so the whole stage takes the failure path below.
+                    std::optional<sycl::event> group_event;
+                    if (pp_woq_enabled) {
+                        group_event = DnnlGemmWrapper::woq_gemm_batch_mxfp4(
+                            ctx, /* m = */ static_cast<int>(group.n_rows), /* n = */ static_cast<int>(ne01),
+                            /* k = */ static_cast<int>(ne00), batched_acts + group.begin * act_slot_elems,
+                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int64_t>(act_slot_elems),
+                            batched_weight_bytes + group.begin * weight_slot_bytes,
+                            static_cast<int64_t>(weight_slot_bytes) * 2, /* group_size = */ QK_MXFP4,
+                            batched_weight_bytes + group.begin * weight_slot_bytes + woq_nibble_slot_bytes,
+                            static_cast<int64_t>(weight_slot_bytes), batched_out + group.begin * out_slot_elems,
+                            DnnlGemmWrapper::to_dt<float>(), static_cast<int64_t>(out_slot_elems),
+                            static_cast<int>(group.end - group.begin), ctx.stream(), { deps_in });
+                    } else {
+                        group_event = DnnlGemmWrapper::gemm_batch_strided(
+                            ctx,
+                            /* trans_a = */ true,
+                            /* trans_b = */ false, static_cast<int>(ne01), static_cast<int>(group.n_rows),
+                            static_cast<int>(ne00), 1.0f, batched_weights + group.begin * weight_elems,
+                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne00),
+                            static_cast<int64_t>(weight_elems), batched_acts + group.begin * act_slot_elems,
+                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne10),
+                            static_cast<int64_t>(act_slot_elems), 0.0f, batched_out + group.begin * out_slot_elems,
+                            DnnlGemmWrapper::to_dt<float>(), static_cast<int>(ne0),
+                            static_cast<int64_t>(out_slot_elems), static_cast<int>(group.end - group.begin),
+                            ctx.stream(), { deps_in });
+                    }
+                    if (!group_event) {
+                        gemm_declined = true;
+                        break;
+                    }
+                    gemm_events.push_back(*group_event);
+                }
+            } catch (const std::exception & e) {
+                return gemm_stage_failed(e.what());
+            }
+            if (gemm_declined) {
+                return gemm_stage_failed("oneDNN scratchpad declined");
             }
             stream->ext_oneapi_submit_barrier(gemm_events);
             if (pp_profile) {
@@ -81993,10 +82080,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 dequantize_row_mxfp4_soa_to_fp16_rowmajor(static_cast<const char *>(expert_ptr), pp_mxfp4_src0_f16_ptr,
                                                           blocks_per_row, static_cast<int>(ne01), ctx.stream());
                 const auto dequant_done = moe_profile_state::hrc::now();
-                DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(ne01), static_cast<int>(batch), static_cast<int>(ne00),
-                                          pp_mxfp4_src0_f16_ptr, DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
-                                          DnnlGemmWrapper::to_dt<sycl::half>(), dst_f32_ptr,
-                                          DnnlGemmWrapper::to_dt<float>(), ctx.stream());
+                if (!DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(ne01), static_cast<int>(batch),
+                                               static_cast<int>(ne00), pp_mxfp4_src0_f16_ptr,
+                                               DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
+                                               DnnlGemmWrapper::to_dt<sycl::half>(), dst_f32_ptr,
+                                               DnnlGemmWrapper::to_dt<float>(), ctx.stream())) {
+                    return false;  // a declined scratchpad: the caller's next path, as the catches below
+                }
                 const auto gemm_submit_done = moe_profile_state::hrc::now();
                 if (local_trace) {
                     local_trace->dequant_submit_us += moe_profile_state::us(dequant_start, dequant_done);

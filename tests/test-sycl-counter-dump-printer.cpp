@@ -530,7 +530,7 @@ int main(int argc, char ** argv) {
         // set / pending / clear: the load-end entries overwrite, and load_2 returns to not_captured.
         check(unified_cache_dump_snapshot_pending(dump_snapshot::weight_planned_device_bytes_load_2, 0),
               "an untouched snapshot is pending");
-        unified_cache_dump_snapshot_set(dump_snapshot::weight_planned_device_bytes_load_2, 0, 77);
+        unified_cache_dump_snapshot_set(dump_snapshot::weight_planned_device_bytes_load_2, 0, 79);
         unified_cache_dump_snapshot_set(dump_snapshot::weight_planned_device_bytes_load_2, 0, 88);
         const auto s1 = split_lines(capture_stderr([] { unified_cache_test_counter_dump(); }));
         check(has_line(s1, "[SYCL-COUNTER] dev=0 name=weight_planned_device_bytes{load_2}@last_load_end value=88"),

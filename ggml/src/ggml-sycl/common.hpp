@@ -285,14 +285,19 @@ extern int               g_ggml_sycl_tp_debug;  // Tensor Parallelism debug outp
 extern int               g_ggml_sycl_prioritize_dmmv;
 extern std::atomic<bool> g_ggml_sycl_debug_forced_off;
 
-// The get_scratchpad_mem call sites that decide a declined scratchpad themselves (llama.cpp-23mk S3-3): the three
-// oneDNN wrappers in dnnl-ops.hpp. The PRIVATE_TESTING seam counts the calls that carry a site and can force a
-// decline on the Nth (ggml_sycl_test_inject_scratchpad_decline, ggml-sycl.h); the ordinary build compiles the hook
-// to false. The other consumers get a tag with the std::optional return (S3-2).
+// The get_scratchpad_mem call sites that decide a declined scratchpad themselves (llama.cpp-23mk S3-3, S3-4): the
+// three oneDNN wrappers in dnnl-ops.hpp and the DnnlGemmWrapper consumers in gemm.hpp. The PRIVATE_TESTING seam counts
+// the calls that carry a site and can force a decline on the Nth (ggml_sycl_test_inject_scratchpad_decline,
+// ggml-sycl.h); the ordinary build compiles the hook to false.
 enum ggml_sycl_scratchpad_site : int {
     GGML_SYCL_SCRATCHPAD_SITE_DNNL_SOFTMAX = 0,
     GGML_SYCL_SCRATCHPAD_SITE_DNNL_ELTWISE,
     GGML_SYCL_SCRATCHPAD_SITE_DNNL_BINARY_ROW,
+    GGML_SYCL_SCRATCHPAD_SITE_DNNL_GEMM,
+    GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_Q8_0,
+    GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_Q4_0,
+    GGML_SYCL_SCRATCHPAD_SITE_DNNL_GEMM_BATCH,
+    GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_MXFP4_BATCH,
     GGML_SYCL_SCRATCHPAD_SITE_COUNT,
 };
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -6185,15 +6190,20 @@ struct ggml_backend_sycl_context {
 
     dnnl::stream stream_dnnl() { return stream_dnnl(device, 0); }
 
-    dnnl::memory get_scratchpad_mem(const dnnl::memory::desc & scratchpad_md,
-                                    const dnnl::engine &       eng,
-                                    const queue_ptr            q) {
-        std::lock_guard<std::mutex> lock(dnnl_mutex);
-
+    // An empty memory is the answer for a 0 B descriptor (nothing to bind) and also what a failed allocation or an
+    // unresolved buffer returns; the consumer tells them apart with ggml_sycl_scratchpad_declined (dnnl-ops.hpp), which
+    // reads the descriptor's size. The caller must decide that before its first write to the op's output
+    // (llama.cpp-23mk S3-4). The zero-size return precedes the lock, so a consumer that asks unconditionally takes no
+    // lock for a 0 B descriptor.
+    [[nodiscard]] dnnl::memory get_scratchpad_mem(const dnnl::memory::desc & scratchpad_md,
+                                                  const dnnl::engine &       eng,
+                                                  const queue_ptr            q) {
         size_t scratchpad_size = scratchpad_md.get_size();
         if (scratchpad_size == 0) {
             return dnnl::memory();
         }
+        std::lock_guard<std::mutex> lock(dnnl_mutex);
+
         auto & entry = scratchpad_map[q];
 
         // Keep old buffers alive for the context lifetime so in-flight oneDNN

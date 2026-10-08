@@ -1,4 +1,4 @@
-// GPU test for llama.cpp-23mk S3-3 (design 4.8, G6): a declined oneDNN scratchpad is a decline, not an error.
+// GPU test for llama.cpp-23mk S3-3 and S3-4 (design 4.8, G6): a declined oneDNN scratchpad is a decline, not an error.
 //
 // The three oneDNN wrappers outside ggml-sycl.cpp that ask for a scratchpad (softmax, eltwise, binary_broadcast_row)
 // return false when the request is declined, before they write the op's output, and their callers fall through to the
@@ -6,14 +6,36 @@
 // be provoked from outside; the PRIVATE_TESTING seam ggml_sycl_test_inject_scratchpad_decline(site, after_n) forces one
 // at the wrapper's decision and counts what each site did.
 //
-// Each arm builds one small graph on one backend context and computes it twice, the seam off and then on. The graph
-// is computed directly on the SYCL backend with every tensor in a SYCL buffer. It must not go through
-// ggml_backend_sched: the scheduler gives graph inputs to its last backend (the CPU), and the ops that consume them
-// follow, so the first version of this test ran every op on the CPU and read calls == 0 at every site.
+// Each arm but the last builds one small graph on one backend context and computes it twice, the seam off and then on
+// (the last arm, below, computes once). The graph is computed directly on the SYCL backend with every tensor in a SYCL
+// buffer. It must not go through ggml_backend_sched: the scheduler gives graph inputs to its last backend (the CPU),
+// and the ops that consume them follow, so the first version of this test ran every op on the CPU and read
+// calls == 0 at every site.
 //
-//   off  the wrapper must run: calls == 1, declined == 0, engaged == 1, the output matches a host reference;
+//   off  the wrapper must run: calls and engaged equal the arm's expected counts (1 and 1 for the single-call wrappers;
+//        the KQ arms below count every launch of the graph), declined == 0, the output matches a host reference;
 //   on   the wrapper must decline: calls == 1, declined == 1, engaged == 0 and the output still matches the host
 //        reference (a fallback that ran over a half-written dst, or scaled a softmax twice, would not).
+//
+// Two further arms cover DnnlGemmWrapper::gemm (site "dnnl_gemm") through the batched f16 KQ mul_mat, which falls to a
+// native GPU kernel on a decline: one with equal K and query head counts (one gemm per dim-3 slice) and one
+// grouped-query arm (K has fewer heads) that takes the non-broadcast launch. That launch's hoisted pre-query is call 1
+// of each slice's launch (the counters are cumulative across the graph, so slice s starts at call 5s + 1) and its
+// per-pair gemm calls follow, so the counting statement "pre-query is call 1, batch b's own query is call b + 2" has a
+// consumer.
+//
+// A decline after a write (a later call of the same launch, an inject with after_n > 1) throws
+// dnnl_decline_after_write:dnnl_gemm, a ggml_sycl_fallback_error. ggml_sycl_mul_mat's batched f16 branch rethrows it
+// (its `catch (const ggml_sycl_fallback_error &) { throw; }` around ggml_sycl_mul_mat_batched_sycl),
+// ggml_sycl_compute_forward_impl rethrows it (its function-level `catch (const ggml_sycl_fallback_error &) { throw; }`)
+// and ggml_backend_sycl_graph_compute turns it into GGML_STATUS_FAILED (its `catch (const ggml_sycl_fallback_error &
+// error)`, which returns GGML_STATUS_FAILED). The last arm of main drives it
+// on the grouped-query graph with after_n = 3 (call 1 the pre-query, call 2 the first gemm, which wrote dst, call 3
+// the declined second gemm): graph_compute must return GGML_STATUS_FAILED, never SUCCESS and never a crash, with
+// calls = 3, declined = 1, engaged = 1. Its output is undefined after the failed graph and is not compared; run_arm
+// accepts a non-SUCCESS status only for an arm that sets expect_status. The other sites (MXFP4 PP, unified PP, MoE
+// batched, the dense arms, out_prod) are pinned by scripts/check-sycl-dnnl-decline-consumers.py and have no device arm
+// yet.
 //
 // The counters are the positive control. An arm whose off-run never reached its site (the env opt-in is missing, a
 // shape fell under a threshold, the graph was recorded) has calls == 0 and FAILS as void; "identical" outputs from a
@@ -62,9 +84,18 @@ struct arm {
     const char *                                            site;
     double                                                  tol;         // abs + rel tolerance against the host reference
     bool                                                    exact;       // off and on runs must be bit-identical
+    ggml_type                                               w_type = GGML_TYPE_F32;  // the second input's storage type
     std::function<arm_graph(ggml_context *)>                build;
     std::function<void(std::vector<float> &, std::vector<float> &)> fill;  // x, w
     std::function<void(const std::vector<float> &, const std::vector<float> &, std::vector<float> &)> reference;
+
+    // What the undeclined run must count at the site: calls the wrapper consulted it (a hoisted pre-query counts), engaged
+    // the primitives it went on to submit. Derived from the arm's shape, not assumed to be 1.
+    uint64_t expect_calls   = 1;
+    uint64_t expect_engaged = 1;
+
+    // The status graph_compute must return. Every arm but the post-write decline one expects SUCCESS.
+    ggml_status expect_status = GGML_STATUS_SUCCESS;
 };
 
 constexpr int64_t SOFTMAX_COLS = 96;
@@ -73,6 +104,19 @@ constexpr int64_t MUL_COLS     = 256;
 constexpr int64_t MUL_ROWS     = 160;  // row-broadcast MUL needs a batch >= 128 (binbcast.cpp)
 constexpr int64_t ELT_N        = 8192;  // the eltwise paths need >= 4096 elements (element_wise.cpp)
 constexpr float   SOFTMAX_SCALE = 0.5f;
+// The batched f16 mul_mat (a KQ-shaped graph: both operands permuted, one query column, more than one batch) reaches
+// ggml_sycl_mul_mat_batched_sycl, whose oneDNN arm asks DnnlGemmWrapper::gemm (site "dnnl_gemm") once per launch. A
+// decline falls to ggml_sycl_mul_mat_batched_f16_fallback, a native GPU kernel. K's batch dimension (dim 2) is strided, so
+// the launches are made once per dim-3 slice, with the batch counts below:
+//   KQ_HK == KQ_H  equal batch counts: one gemm per slice, so calls == engaged == KQ_B;
+//   KQ_HK <  KQ_H  a grouped-query broadcast, the non-broadcast launch: one hoisted pre-query (call 1 of the slice,
+//                  not engaged), then one gemm per (K head, query head per K head) pair, so per slice
+//                  1 + KQ_H calls and KQ_H engaged.
+constexpr int64_t KQ_D          = 64;
+constexpr int64_t KQ_T          = 48;
+constexpr int64_t KQ_H          = 4;  // query heads
+constexpr int64_t KQ_HK         = 2;  // K heads of the grouped-query arm
+constexpr int64_t KQ_B          = 2;
 
 float input_value(int64_t i, int64_t n) {
     // a deterministic spread over [-6, 6) that is not a multiple pattern of any row width above
@@ -82,7 +126,7 @@ float input_value(int64_t i, int64_t n) {
 std::vector<arm> make_arms() {
     std::vector<arm> arms;
 
-    arms.push_back({ "SOFT_MAX scale 0.5, in place", "dnnl_softmax", 2e-5, false,
+    arms.push_back({ "SOFT_MAX scale 0.5, in place", "dnnl_softmax", 2e-5, false, GGML_TYPE_F32,
         [](ggml_context * ctx) {
             arm_graph g;
             g.x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, SOFTMAX_COLS, SOFTMAX_ROWS);
@@ -118,7 +162,7 @@ std::vector<arm> make_arms() {
             }
         } });
 
-    arms.push_back({ "MUL row broadcast", "dnnl_binary_row", 0.0, true,
+    arms.push_back({ "MUL row broadcast", "dnnl_binary_row", 0.0, true, GGML_TYPE_F32,
         [](ggml_context * ctx) {
             arm_graph g;
             g.x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, MUL_COLS, MUL_ROWS);
@@ -148,9 +192,57 @@ std::vector<arm> make_arms() {
             }
         } });
 
+    const auto kq_arm = [&arms](const char * name, int64_t hk, uint64_t calls, uint64_t engaged) {
+        arms.push_back(
+            { name, "dnnl_gemm", 3e-2, false, GGML_TYPE_F16,
+              [hk](ggml_context * ctx) {
+                  arm_graph g;
+                  // k and q are stored as [D, H, T|1, B] and permuted to [D, T|1, H, B], as llama's KQ is
+                  g.x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, KQ_D, KQ_H, 1, KQ_B);
+                  g.w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, KQ_D, hk, KQ_T, KQ_B);
+                  ggml_set_input(g.x);
+                  ggml_set_input(g.w);
+                  g.out = ggml_mul_mat(ctx, ggml_permute(ctx, g.w, 0, 2, 1, 3), ggml_permute(ctx, g.x, 0, 2, 1, 3));
+                  ggml_set_output(g.out);
+                  return g;
+              },
+              [hk](std::vector<float> & q, std::vector<float> & k) {
+                  q.resize((size_t) (KQ_D * KQ_H * KQ_B));
+                  k.resize((size_t) (KQ_D * hk * KQ_T * KQ_B));
+                  for (size_t i = 0; i < q.size(); ++i) {
+                      q[i] = 0.2f * input_value((int64_t) i, (int64_t) q.size());
+                  }
+                  for (size_t i = 0; i < k.size(); ++i) {
+                      k[i] = 0.2f * input_value((int64_t) i, (int64_t) k.size());
+                  }
+              },
+              [hk](const std::vector<float> & q, const std::vector<float> & k, std::vector<float> & ref) {
+                  ref.assign((size_t) (KQ_T * KQ_H * KQ_B), 0.0f);
+                  for (int64_t b = 0; b < KQ_B; ++b) {
+                      for (int64_t h = 0; h < KQ_H; ++h) {
+                          const int64_t kh = h / (KQ_H / hk);  // query head h reads K head h / (heads per K head)
+                          for (int64_t tt = 0; tt < KQ_T; ++tt) {
+                              double s = 0.0;
+                              for (int64_t d = 0; d < KQ_D; ++d) {
+                                  const double kv = ggml_fp16_to_fp32(
+                                      ggml_fp32_to_fp16(k[(size_t) (d + KQ_D * (kh + hk * (tt + KQ_T * b)))]));
+                                  const double qv =
+                                      ggml_fp16_to_fp32(ggml_fp32_to_fp16(q[(size_t) (d + KQ_D * (h + KQ_H * b))]));
+                                  s += kv * qv;
+                              }
+                              ref[(size_t) (tt + KQ_T * (h + KQ_H * b))] = (float) s;
+                          }
+                      }
+                  }
+              },
+              calls, engaged });
+    };
+    kq_arm("batched f16 KQ mul_mat", KQ_H, (uint64_t) KQ_B, (uint64_t) KQ_B);
+    kq_arm("batched f16 KQ mul_mat GQA", KQ_HK, (uint64_t) KQ_B * (1 + KQ_H), (uint64_t) KQ_B * KQ_H);
+
     const auto eltwise = [&arms](const char * name, ggml_tensor * (*op)(ggml_context *, ggml_tensor *),
                                  double (*f)(double)) {
-        arms.push_back({ name, "dnnl_eltwise", 5e-4, false,
+        arms.push_back({ name, "dnnl_eltwise", 5e-4, false, GGML_TYPE_F32,
             [op](ggml_context * ctx) {
                 arm_graph g;
                 g.x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ELT_N);
@@ -180,7 +272,8 @@ std::vector<arm> make_arms() {
 }
 
 struct run_result {
-    bool               ok = false;
+    bool               ok     = false;
+    ggml_status        status = GGML_STATUS_FAILED;  // what graph_compute returned (set once it has returned)
     std::vector<float> out;
     uint64_t           calls = 0, declined = 0, engaged = 0;
 };
@@ -223,20 +316,29 @@ run_result run_arm(ggml_backend_t backend, const arm & a, int inject, bool keep_
     std::vector<float> x, w;
     a.fill(x, w);
     ggml_backend_tensor_set(g.x, x.data(), 0, x.size() * sizeof(float));
-    if (g.w) {
+    if (g.w && a.w_type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> w16(w.size());
+        ggml_fp32_to_fp16_row(w.data(), w16.data(), (int64_t) w.size());
+        ggml_backend_tensor_set(g.w, w16.data(), 0, w16.size() * sizeof(ggml_fp16_t));
+    } else if (g.w) {
         ggml_backend_tensor_set(g.w, w.data(), 0, w.size() * sizeof(float));
     }
 
     const ggml_status status = ggml_backend_graph_compute(backend, gf);
     ggml_backend_synchronize(backend);
-    if (status != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "FAIL: %s: graph compute returned %d\n", a.name, (int) status);
+    res.status = status;
+    if (status != a.expect_status) {
+        fprintf(stderr, "FAIL: %s: graph compute returned %d, expected %d\n", a.name, (int) status,
+                (int) a.expect_status);
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);
         return res;
     }
+    // An expected failure (a decline after a write): the output is undefined after a failed graph, so it is not read,
+    // and there is no recorded graph to check. Only the seam's counters are read.
+    const bool expected_failure = a.expect_status != GGML_STATUS_SUCCESS;
     // Recording would route the softmax and MUL arms around their sites, so a recorded run is void.
-    if (ggml_sycl::test_backend_has_exec_graph(backend)) {
+    if (!expected_failure && ggml_sycl::test_backend_has_exec_graph(backend)) {
         fprintf(stderr, "FAIL: %s: the backend recorded an executable graph; the arm is void (run with GGML_SYCL_DISABLE_GRAPH=1)\n",
                 a.name);
         ggml_backend_buffer_free(buf);
@@ -244,8 +346,10 @@ run_result run_arm(ggml_backend_t backend, const arm & a, int inject, bool keep_
         return res;
     }
 
-    res.out.resize((size_t) ggml_nelements(g.out));
-    ggml_backend_tensor_get(g.out, res.out.data(), 0, res.out.size() * sizeof(float));
+    if (!expected_failure) {
+        res.out.resize((size_t) ggml_nelements(g.out));
+        ggml_backend_tensor_get(g.out, res.out.data(), 0, res.out.size() * sizeof(float));
+    }
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     if (!ggml_sycl_test_scratchpad_site_counts(a.site, &res.calls, &res.declined, &res.engaged)) {
@@ -377,11 +481,15 @@ int main(int, char ** argv) {
                (unsigned long long) on.declined, (unsigned long long) on.engaged, worst_on, same ? 1 : 0);
 
         bool arm_ok = true;
-        if (off.calls != 1 || off.engaged != 1 || off.declined != 0) {
+        if (off.calls != a.expect_calls || off.engaged != a.expect_engaged || off.declined != 0) {
             fprintf(stderr,
-                    "FAIL: %s: the undeclined run did not engage the wrapper exactly once (calls=%llu engaged=%llu declined=%llu); "
-                    "the arm is VOID -- check GGML_SYCL_ONEDNN_SOFTMAX / GGML_SYCL_ONEDNN_MUL and the shape thresholds\n",
-                    a.name, (unsigned long long) off.calls, (unsigned long long) off.engaged,
+                    "FAIL: %s: the undeclined run did not consult the site %llu time(s) and engage %llu (calls=%llu "
+                    "engaged=%llu "
+                    "declined=%llu); the arm is VOID or the call-counting statement is wrong -- check "
+                    "GGML_SYCL_ONEDNN_SOFTMAX / "
+                    "GGML_SYCL_ONEDNN_MUL and the shape thresholds\n",
+                    a.name, (unsigned long long) a.expect_calls, (unsigned long long) a.expect_engaged,
+                    (unsigned long long) off.calls, (unsigned long long) off.engaged,
                     (unsigned long long) off.declined);
             arm_ok = false;
         }
@@ -406,6 +514,51 @@ int main(int, char ** argv) {
             arm_ok = false;
         }
         ok = ok && arm_ok;
+    }
+
+    {
+        // A decline AFTER a write (llama.cpp-23mk S3-4, design 4.8): the GQA arm's first slice launches the hoisted
+        // pre-query (call 1) and then one gemm per (K head, query head per K head) pair. Declining call 3 refuses the
+        // second pair's gemm after the first pair wrote dst, which is not a next path: the decline throws
+        // dnnl_decline_after_write:dnnl_gemm, a ggml_sycl_fallback_error that ggml_sycl_mul_mat's
+        // batched f16 branch and ggml_sycl_compute_forward_impl both rethrow, and graph_compute returns
+        // GGML_STATUS_FAILED. It must not be SUCCESS (the
+        // KQ product would be half-written and nobody told) and must not crash.
+        //
+        // The counters are the positive control: calls == 3 (pre-query, first gemm, declined gemm), declined == 1 and
+        // engaged == 1 (the one gemm that wrote). The output buffer is NOT compared: after a failed graph it is
+        // undefined. This arm runs last because a failed graph quarantines the backend's execution state.
+        const char *           base_name = "batched f16 KQ mul_mat GQA";
+        const std::vector<arm> base_arms = make_arms();
+        const arm *            base      = nullptr;
+        for (const arm & candidate : base_arms) {
+            if (strcmp(candidate.name, base_name) == 0) {
+                base = &candidate;
+            }
+        }
+        if (!base) {
+            // Never run a different arm in its place: its counters would not mean what this arm's expect.
+            fprintf(stderr, "FAIL: arm '%s' not found: the post-write decline arm is built from it\n", base_name);
+            ok = false;
+        } else {
+            arm post                 = *base;
+            post.name                = "batched f16 KQ mul_mat GQA, post-write decline";
+            post.expect_status       = GGML_STATUS_FAILED;
+            const int        after_n = 3;
+            const run_result r       = run_arm(backend, post, after_n);
+            printf(
+                "%-30s site=%-16s inject=%d: status=%d calls=%llu declined=%llu engaged=%llu (output not compared)\n",
+                post.name, post.site, after_n, (int) r.status, (unsigned long long) r.calls,
+                (unsigned long long) r.declined, (unsigned long long) r.engaged);
+            if (!r.ok || r.status != GGML_STATUS_FAILED || r.calls != 3 || r.declined != 1 || r.engaged != 1) {
+                fprintf(stderr,
+                        "FAIL: %s: expected status FAILED with calls=3 declined=1 engaged=1 (got ok=%d status=%d "
+                        "calls=%llu declined=%llu engaged=%llu)\n",
+                        post.name, r.ok ? 1 : 0, (int) r.status, (unsigned long long) r.calls,
+                        (unsigned long long) r.declined, (unsigned long long) r.engaged);
+                ok = false;
+            }
+        }
     }
 
     ggml_backend_free(backend);
