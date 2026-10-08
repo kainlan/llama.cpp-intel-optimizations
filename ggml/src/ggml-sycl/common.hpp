@@ -62,7 +62,7 @@
 
 struct ggml_backend_sycl_context;
 bool ggml_sycl_retire_moe_graph_epoch(ggml_backend_sycl_context * ctx) noexcept;
-// Drains the queue, then destroys every per-split segment slot (llama.cpp-7pm2 B2); the drain also covers the
+// Drains the queue, then destroys every per-split segment slot (llama.cpp-7pm2); the drain also covers the
 // one-slot segment and MoE dispatch graphs invalidate_moe_segments destroys next. False when the drain failed:
 // the slots are kept, since their graphs may still be running, and the caller keeps its graphs too.
 bool ggml_sycl_retire_moe_segment_slots(ggml_backend_sycl_context * ctx) noexcept;
@@ -6326,7 +6326,7 @@ struct ggml_backend_sycl_context {
         std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph;
     };
 
-    // One decode split's recorded segments (llama.cpp-7pm2 B2), owned by moe_segment_slots under that split's key.
+    // One decode split's recorded segments (llama.cpp-7pm2), owned by moe_segment_slots under that split's key.
     // retained_handles is declared first so it is destroyed last: every allocation a segment graph baked a pointer
     // to (sink retentions, pool scratch freed while recording, Q8 scratch, weight handles) outlives the graphs, and
     // the graphs are destroyed only after a queue drain (ggml_sycl_retire_moe_segment_slots).
@@ -6398,7 +6398,7 @@ struct ggml_backend_sycl_context {
     bool                                moe_segments_failed_is_decode     = false;
     bool                                moe_segments_failed_valid         = false;
     bool                                moe_segments_failed_logged        = false;
-    // Decode splits' segments, one slot per split key (llama.cpp-7pm2 B2). Replaces moe_segments for decode.
+    // Decode splits' segments, one slot per split key (llama.cpp-7pm2). Replaces moe_segments for decode.
     ggml_sycl::graph_segment_cache::slot_cache<moe_segment_slot> moe_segment_slots;
     // A replay-futile context has let one decode MUL_MAT_ID split try to enter segmented MoE mode.
     bool                                                         moe_segment_keyed_probed = false;

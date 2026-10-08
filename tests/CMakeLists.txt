@@ -464,7 +464,7 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-graph-phase PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
-# Per-split segmented-graph slots (llama.cpp-7pm2 B2): the slot key (signature, names, storage identity) and the
+# Per-split segmented-graph slots (llama.cpp-7pm2): the slot key (signature, names, storage identity) and the
 # warmup/record/replay/direct state machine with LRU retirement and the churn guard.
 # ggml-sycl/graph-segment-cache.hpp includes only standard headers, so the test needs no device.
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)

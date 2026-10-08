@@ -1,4 +1,4 @@
-// Per-split segmented-graph slots (llama.cpp-7pm2 B2). ggml-sycl/graph-segment-cache.hpp is SYCL-free, so the key
+// Per-split segmented-graph slots (llama.cpp-7pm2). ggml-sycl/graph-segment-cache.hpp is SYCL-free, so the key
 // and the slot state machine are checked here without a device. The payload stands in for a slot's recorded
 // segments and retained handles; its id tells which recording a retired payload came from.
 #include "ggml-sycl/graph-segment-cache.hpp"
@@ -113,8 +113,8 @@ int test_lifecycle() {
     return 0;
 }
 
-// The defect B2 replaces: two splits with the same node count from different layers matched one slot, so one
-// layer replayed the other's graph.
+// The defect the per-split slots replace: two splits with the same node count from different layers matched one
+// slot, so one layer replayed the other's graph.
 int test_same_n_nodes_layers_do_not_share() {
     gsc::slot_cache<fake_payload> cache(8);
     const gsc::key                a = layer_key(1);

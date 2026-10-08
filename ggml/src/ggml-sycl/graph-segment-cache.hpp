@@ -1,6 +1,6 @@
 #pragma once
 
-// Per-split segmented-graph slots (llama.cpp-7pm2 B2). Host-only: no SYCL, no ggml types, so the key and the
+// Per-split segmented-graph slots (llama.cpp-7pm2). Host-only: no SYCL, no ggml types, so the key and the
 // slot state machine are unit-tested without a device (tests/test-sycl-graph-segment-cache.cpp).
 //
 // A decode token reaches graph_compute once per scheduler split. Splits from different layers can share a node

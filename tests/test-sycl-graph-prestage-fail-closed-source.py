@@ -381,7 +381,7 @@ def evaluate(backend, common, memo_hdr):
                           compute[compute.rfind("if", 0, rr_call):]) if rr_call >= 0 else None
     results["site 5, full re-record: declines, clears the live graph (after a wait) and leaves for the direct path"] = \
         rr_decline is not None
-    # llama.cpp-7pm2 B2: a keyed decode split's slot. Warmup and direct keys record nothing and run before the
+    # llama.cpp-7pm2: a keyed decode split's slot. Warmup and direct keys record nothing and run before the
     # decline; a replay or a record runs only past it, and each re-reads the slot, since a staging swap at the
     # gateway retires every slot after begin() chose the action. A replay whose inputs now stage to other buffers
     # than the slot's graphs read forgets the slot and runs direct.

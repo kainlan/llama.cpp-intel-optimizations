@@ -571,7 +571,7 @@ with gate('futile-context-direct'):
     # GGML_SYCL_DISABLE_GRAPH=1 path, decided before any of the per-call graph-policy scans run.
     compute = region(RUNTIME_CODE, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
                      "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
-    # llama.cpp-7pm2 B2: the futility verdict belongs to the whole-graph slot. A futile context takes the
+    # llama.cpp-7pm2: the futility verdict belongs to the whole-graph slot. A futile context takes the
     # DISABLE_GRAPH path unless the split is a decode split that keyed segment slots serve (the context is in
     # segmented MoE mode, moe_graph_rerecord, or this split's MUL_MAT_ID puts it there); that one exception reopens
     # the policy pipeline below for keyed splits, by design, and keyed-segment-slots pins what it may then skip.
@@ -824,7 +824,7 @@ with gate('segment-boundary-flush'):
     print("PASS segment-boundary-flush-source-gate (%d controls caught)" % len(controls))
 
 def check_segmented_call_ends(code: str) -> list:
-    """llama.cpp-7pm2 B1: a segmented record or replay bypasses compute_impl, so it does compute_impl's per-graph
+    """llama.cpp-7pm2: a segmented record or replay bypasses compute_impl, so it does compute_impl's per-graph
     work at both ends: the MoE topology scan first (boundary MoE nodes dispatch against this split's pairs), the
     graph-completion drain of every pending slot last (outputs are visible when graph_compute returns)."""
     problems = []
@@ -913,7 +913,7 @@ with gate('segmented-call-owns-graph-ends'):
     print("PASS segmented-call-owns-graph-ends-source-gate (%d controls caught)" % len(controls))
 
 def check_keyed_segment_slots(code: str) -> list:
-    """llama.cpp-7pm2 B2/B3: a decode split in segmented MoE mode runs from its own keyed slot, so the single-slot
+    """llama.cpp-7pm2: a decode split in segmented MoE mode runs from its own keyed slot, so the single-slot
     whole-graph machinery does not apply to it: the failed-graph memo, the '#' split-copy futility trip, the futile
     early return, the MoE expert preload (a keyed slot records no MUL_MAT_ID) and the one-per-phase warmup slot.
     The legacy one-slot segmented path keeps the prompt phase only. A MUL_MAT_ID that cannot be recorded vetoes the
@@ -1005,7 +1005,7 @@ with gate('keyed-segment-slots'):
     print("PASS keyed-segment-slots-source-gate (%d controls caught)" % (len(controls) + 1))
 
 def check_segment_graphs_drained(code: str, common: str) -> list:
-    """llama.cpp-7pm2 B2 lifetime rule: no segment exec graph is destroyed while a replay may still run it. Retired
+    """llama.cpp-7pm2 lifetime rule: no segment exec graph is destroyed while a replay may still run it. Retired
     keyed slots are destroyed only after a queue wait, and invalidate_moe_segments destroys the one-slot segment and
     MoE dispatch graphs only after the same wait succeeded (the epoch retire waits only where retention terminals
     exist). A slot a failed drain could not prove idle is kept for the life of the process: the retired ones, and a

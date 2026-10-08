@@ -91894,7 +91894,7 @@ static bool ggml_sycl_graph_is_decode(const ggml_cgraph * cgraph, bool previous_
 }
 
 #ifdef GGML_SYCL_GRAPH
-// What command-graph capture a graph admits (llama.cpp-7pm2 B3). SEGMENTED_ONLY: the only obstacle is a MUL_MAT_ID
+// What command-graph capture a graph admits (llama.cpp-7pm2). SEGMENTED_ONLY: the only obstacle is a MUL_MAT_ID
 // that cannot be recorded (its quant type, batch or layout). Segmented replay dispatches every MUL_MAT_ID directly
 // between its segments, so that veto applies to the whole-graph capture only.
 enum ggml_sycl_graph_compat {
@@ -99160,7 +99160,7 @@ static void moe_graph_segment_boundary_flush(const ggml_cgraph * cgraph, int sta
 }
 
 // A segmented record or replay bypasses compute_impl, so it owns the per-graph work compute_impl does at its
-// two ends (llama.cpp-7pm2 B1). At the start: the MoE topology scan, so a boundary MoE node is dispatched against
+// two ends (llama.cpp-7pm2). At the start: the MoE topology scan, so a boundary MoE node is dispatched against
 // THIS split's gate/up pairs and precomputed-skip state rather than whatever split compute_impl scanned last (a
 // keyed slot replays between other splits' direct calls). At the end: graph completion is an output-visibility
 // boundary, so every deferred MoE merge and host-attention result is published before graph_compute returns,
@@ -99181,7 +99181,7 @@ static void moe_graph_segmented_call_end() {
     }
 }
 
-// ---- Keyed per-split segment slots (llama.cpp-7pm2 B2) ----------------------------------------------------------
+// ---- Keyed per-split segment slots (llama.cpp-7pm2) ----------------------------------------------------------
 //
 // A decode token reaches graph_compute once per scheduler split. Each split now records and replays its own
 // segments, kept in ctx->moe_segment_slots under a key built from the split's structure, its tensor names and the
@@ -99205,10 +99205,11 @@ static bool moe_segment_keyed_mode(const ggml_backend_sycl_context * ctx, bool i
            !ctx->moe_segment_slots.churned();
 }
 
-// A replay-futile context still serves keyed slots, since its futility verdict is about the whole-graph slot. Until the
-// context is in segmented MoE mode, one decode split with a MUL_MAT_ID may try to put it there (the B3 admission
-// does, for a MUL_MAT_ID that cannot be recorded). If that call leaves the context outside segmented mode, every
-// later call takes the futile path again, so a context that never enters it does not pay the policy scans forever.
+// A replay-futile context still serves keyed slots, since its futility verdict is about the whole-graph slot. Until
+// the context is in segmented MoE mode, one decode split with a MUL_MAT_ID may try to put it there (the entry's
+// segmented-only admission does, for a MUL_MAT_ID that cannot be recorded). If that call leaves the context outside
+// segmented mode, every later call takes the futile path again, so a context that never enters it does not pay the
+// policy scans forever.
 static bool moe_segment_keyed_reachable(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, bool is_decode) {
     if (!is_decode || !ggml_sycl_segmented_graph_env_allows() || ctx->moe_segment_slots.churned()) {
         return false;
@@ -99316,7 +99317,7 @@ static ggml_sycl::graph_segment_cache::key moe_segment_slot_key(const ggml_backe
 }
 
 // Smallest segment worth a graph, counted in nodes that dispatch work. GGML_SYCL_SEG_MIN_NODES overrides it for
-// the profitability re-measure (llama.cpp-7pm2 B4).
+// the profitability re-measure (llama.cpp-7pm2).
 static int moe_graph_keyed_min_segment_nodes() {
     static const int n = [] {
         const char * env = std::getenv("GGML_SYCL_SEG_MIN_NODES");
@@ -99382,7 +99383,7 @@ static std::vector<moe_graph_keyed_item> moe_graph_keyed_plan(const ggml_cgraph 
     return plan;
 }
 
-// Per-split profitability (llama.cpp-7pm2 B4): a split is worth a slot when at least one run between its
+// Per-split profitability (llama.cpp-7pm2): a split is worth a slot when at least one run between its
 // boundaries is large enough to record. Boundaries and small runs cost the same direct or not, so they do not
 // count against it. Decided once per key, at its warmup.
 static bool moe_graph_keyed_plan_profitable(const ggml_cgraph * cgraph) {
@@ -109580,7 +109581,7 @@ normal_dispatch:
         // Replay was proven futile for this context, and nothing clears that. Every later call takes the
         // GGML_SYCL_DISABLE_GRAPH=1 path, decided here so it skips the graph-policy scans below as well
         // (fragmented graphs run many small splits per token, and each one paid them). Decode splits that keyed
-        // segment slots can serve are the exception (llama.cpp-7pm2 B2): the verdict is the whole-graph slot's.
+        // segment slots can serve are the exception (llama.cpp-7pm2): the verdict is the whole-graph slot's.
         use_sycl_graph = false;
     } else if (sycl_ctx->exec_graph) {
         use_sycl_graph = !g_ggml_sycl_disable_graph && !g_sycl_graph_multithreaded.load(std::memory_order_relaxed) &&
@@ -109589,7 +109590,7 @@ normal_dispatch:
         use_sycl_graph = !g_ggml_sycl_disable_graph && !g_sycl_graph_multithreaded.load(std::memory_order_relaxed) &&
                          !sycl_ctx->graphs_disabled && !(g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1);
         if (use_sycl_graph) {
-            // B3 (llama.cpp-7pm2): a MUL_MAT_ID that cannot be recorded vetoes only the whole-graph capture. A decode
+            // A MUL_MAT_ID that cannot be recorded (llama.cpp-7pm2) vetoes only the whole-graph capture. A decode
             // graph segmented replay can serve runs it with those nodes as direct boundaries.
             const ggml_sycl_graph_compat compat = check_graph_compatibility(*sycl_ctx, cgraph);
             use_sycl_graph                      = compat == GGML_SYCL_GRAPH_COMPAT_WHOLE_GRAPH ||
@@ -109810,7 +109811,7 @@ normal_dispatch:
         }
     }
 
-    // A keyed decode split decides profitability per key, once, at its warmup (llama.cpp-7pm2 B4), and records no
+    // A keyed decode split decides profitability per key, once, at its warmup (llama.cpp-7pm2), and records no
     // descriptor MoE graphs, so neither the candidate count nor the per-call profitability scans below apply.
     const bool moe_segment_keyed_policy = use_sycl_graph && moe_segment_keyed_mode(sycl_ctx, cached_is_decode);
 
@@ -110063,7 +110064,7 @@ normal_dispatch:
         bool       is_decode_phase = cached_is_decode;
         bool       is_prompt_phase = !cached_is_decode && cgraph->n_nodes > 0;
         const auto graph_key       = sycl_exec_graph_make_key(*sycl_ctx, cgraph, graph_hash, is_decode_phase);
-        // This decode split runs from its own keyed segment slot (llama.cpp-7pm2 B2). The single-slot machinery
+        // This decode split runs from its own keyed segment slot (llama.cpp-7pm2). The single-slot machinery
         // below (failed-graph memo, '#' futility trip, warmup slot, MoE expert preload) does not apply to it.
         const bool moe_segment_keyed = moe_segment_keyed_mode(sycl_ctx, is_decode_phase);
 
@@ -110544,7 +110545,7 @@ normal_dispatch:
                                       sycl_ctx->moe_segments_is_decode == is_decode_phase;
 
                 if (moe_segment_keyed) {
-                    // Per-split slot (llama.cpp-7pm2 B2): warm up, record, then replay under this split's own key.
+                    // Per-split slot (llama.cpp-7pm2): warm up, record, then replay under this split's own key.
                     namespace gsc                 = ggml_sycl::graph_segment_cache;
                     const gsc::key    slot_key    = moe_segment_slot_key(sycl_ctx, cgraph, graph_hash, is_decode_phase);
                     const gsc::action slot_action = sycl_ctx->moe_segment_slots.begin(slot_key);
@@ -110556,7 +110557,7 @@ normal_dispatch:
                         sycl_ctx->moe_graphs_disabled = true;
                         compute_impl_unlocked();
                     } else if (slot_action == gsc::action::WARMUP) {
-                        // B4: a split with no run worth a graph stays direct for good, decided once per key.
+                        // A split with no run worth a graph stays direct for good, decided once per key.
                         if (!moe_graph_keyed_plan_profitable(cgraph)) {
                             sycl_ctx->moe_segment_slots.record_failed(slot_key);
                         }
