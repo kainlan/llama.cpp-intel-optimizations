@@ -509,7 +509,8 @@ def _owning_reader_sites():
 # section 5 before the list is edited. A statement line that holds two wrapper names is counted once under
 # each. History of the totals, for explaining the next delta: abecb785/90a3f2a/75883a6 (127+1-6-2 readers),
 # f5f0d3758 (+1, kv_layer_on_device), oyfl (+2, AUTO-FA re-check), tsfl (+1, probe entry), glkg 8c8a0afae (-1),
-# nsl3 reconciliation, y2zx (+1, dense overflow filter); 119/14/12/26 at a882b9c2a, the last green tree
+# nsl3 reconciliation, y2zx (+1, dense overflow filter), 56805284f yx28 (+1, canonical `!cache ||` empty-plan
+# guard in the all-device decode MUL_MAT_ID table builder); 119/14/12/26 at a882b9c2a, the last green tree
 # before 64ec60199's pins drifted.
 INTERNAL_WRAPPER_SITES = {
     "ggml_sycl_cache_plan_owner": Counter({
@@ -545,7 +546,7 @@ INTERNAL_WRAPPER_SITES = {
         "if (!(*ggml_sycl_cache_plan_owner(cache)).expert_on_device(meta.tensor_name, expert_idx, device_id)) {": 1,
         "if (!actual_weights && cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 1,
         "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty() || tensor->name[0] == '\\0') {": 1,
-        "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 14,
+        "if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 15,
         "if (!cgraph || !cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {": 2,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() &&": 2,
         "if (!ggml_sycl_cache_plan_owner(cache)->entries.empty() && !dense_name.empty()) {": 2,
