@@ -99218,26 +99218,45 @@ static bool moe_segment_keyed_mode(const ggml_backend_sycl_context * ctx, bool i
 
 // Identity of a decode split for the futile-context probe memo: its node count and the name of its first MUL_MAT_ID,
 // which names the layer. 0 when the split has no MUL_MAT_ID. Two splits that collide share one probe, and the other
-// one runs direct, as every split of a futile context did before keyed slots.
-static uint64_t moe_segment_probe_split_id(const ggml_cgraph * cgraph) {
+// one runs direct, as every split of a futile context did before keyed slots. The residency is what a refused preload
+// re-opens on (the replan epoch and every MUL_MAT_ID's expert storage generation) plus the prompt epoch, so a probe
+// vetoed by low headroom gets one more call after the next prompt.
+struct moe_segment_probe_key {
+    uint64_t split_id  = 0;
+    uint64_t residency = 0;
+};
+
+static moe_segment_probe_key moe_segment_probe_key_of(const ggml_cgraph * cgraph, int device) {
+    moe_segment_probe_key                      key;
+    ggml_sycl::graph_segment_cache::key_hasher residency;
+    residency.mix(g_moe_prompt_epoch.load(std::memory_order_acquire));
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (node && node->op == GGML_OP_MUL_MAT_ID) {
+        if (!node || node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || !node->src[2]) {
+            continue;
+        }
+        if (key.split_id == 0) {
             ggml_sycl::graph_segment_cache::key_hasher h;
             h.mix(static_cast<uint64_t>(cgraph->n_nodes));
             h.mix_name(node->name, sizeof(node->name));
-            return h.value() | 1;
+            key.split_id = h.value() | 1;
         }
+        const ggml_sycl::moe_graph_preload_inputs in =
+            ggml_sycl_moe_graph_preload_inputs_of(node, device, /*host_tier_boundary=*/true);
+        residency.mix(in.replan_epoch);
+        residency.mix(in.storage_generation);
     }
-    return 0;
+    key.residency = residency.value();
+    return key;
 }
 
 // A replay-futile context still serves keyed slots, since its futility verdict is about the whole-graph slot. Until
-// the context is in segmented MoE mode, each decode split with a MUL_MAT_ID gets one call that may put it there: the
-// entry's segmented-only admission, or the decode policy's segmented-replay decision. A call vetoed before that
-// decision (this split's preload refused, an unprofitable shape, low headroom) spends only this split's probe, so
-// another split can still enter the mode. A split whose probe is spent takes the futile path again, so a context
-// that never enters segmented mode pays the policy scans once per split, not every call.
+// the context is in segmented MoE mode, each decode split with a MUL_MAT_ID gets one call per residency that may put
+// it there: the entry's segmented-only admission, or the decode policy's segmented-replay decision. A call vetoed
+// before that decision (this split's preload refused, an unprofitable shape, low headroom) spends only this split's
+// probe, so another split can still enter the mode, and a residency change gives it one more call. A split whose
+// probe is spent takes the futile path again, so a context that never enters segmented mode pays the policy scans
+// once per split and residency, not every call.
 static bool moe_segment_keyed_reachable(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, bool is_decode) {
     if (!is_decode || !ggml_sycl_segmented_graph_env_allows() || ctx->moe_segment_slots.churned()) {
         return false;
@@ -99245,7 +99264,8 @@ static bool moe_segment_keyed_reachable(ggml_backend_sycl_context * ctx, const g
     if (ctx->moe_graph_rerecord) {
         return true;
     }
-    return ctx->moe_segment_keyed_probes.take(moe_segment_probe_split_id(cgraph));
+    const moe_segment_probe_key key = moe_segment_probe_key_of(cgraph, ctx->device);
+    return ctx->moe_segment_keyed_probes.take(key.split_id, key.residency);
 }
 
 static uint64_t moe_segment_handle_identity(const ggml_sycl::mem_handle & handle) {

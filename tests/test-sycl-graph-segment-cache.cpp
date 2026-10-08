@@ -187,12 +187,26 @@ int test_unprofitable_runs_direct_counted_apart() {
 // probe was vetoed (preload refused, unprofitable, low headroom) must not spend the probe of another split.
 int test_probe_is_spent_per_split() {
     gsc::probe_memo probes;
-    CHECK(probes.take(11), "a split's first call does not probe");
-    CHECK(!probes.take(11), "a split probes again after spending its probe");
-    CHECK(probes.take(22), "a vetoed split spent another split's probe");
-    CHECK(!probes.take(22), "the second split probes again");
-    CHECK(!probes.take(0), "a split without a MUL_MAT_ID probes");
+    CHECK(probes.take(11, 5), "a split's first call does not probe");
+    CHECK(!probes.take(11, 5), "a split probes again after spending its probe");
+    CHECK(probes.take(22, 5), "a vetoed split spent another split's probe");
+    CHECK(!probes.take(22, 5), "the second split probes again");
+    CHECK(!probes.take(0, 5), "a split without a MUL_MAT_ID probes");
     CHECK(probes.size() == 2, "the memo does not hold one entry per probed split");
+    return 0;
+}
+
+// A probe spent on a veto that a residency change lifts (a refused preload, low headroom) is not spent for good: the
+// split gets one more call under each new residency, and only that split does.
+int test_probe_reopens_on_residency_change() {
+    gsc::probe_memo probes;
+    CHECK(probes.take(11, 5), "a split's first call does not probe");
+    CHECK(probes.take(22, 5), "the second split's first call does not probe");
+    CHECK(probes.take(11, 6), "the memo survives the split's residency change");
+    CHECK(!probes.take(11, 6), "a split probes twice under one residency");
+    CHECK(!probes.take(22, 5), "one split's residency change re-opened another split");
+    CHECK(probes.take(11, 5), "a split does not probe again when its residency changes back");
+    CHECK(probes.size() == 2, "a residency change adds an entry instead of replacing the split's");
     return 0;
 }
 
@@ -331,7 +345,8 @@ int main() {
     if (test_hasher() || test_key_fields() || test_lifecycle() || test_same_n_nodes_layers_do_not_share() ||
         test_interleaved_splits_all_replay() || test_failed_runs_direct() ||
         test_unprofitable_runs_direct_counted_apart() || test_probe_is_spent_per_split() ||
-        test_lru_eviction_retires_payload() || test_evicting_a_warmed_slot_retires_nothing() || test_invalidate_all() ||
+        test_probe_reopens_on_residency_change() || test_lru_eviction_retires_payload() ||
+        test_evicting_a_warmed_slot_retires_nothing() || test_invalidate_all() ||
         test_record_after_invalidate_is_retired() || test_churn_turns_cache_off() || test_replay_resets_churn_count() ||
         test_forget_retires_one_key()) {
         return 1;

@@ -600,41 +600,53 @@ with gate('futile-context-direct'):
                          r"ctx->moe_segment_slots\.churned\(\)\)\s*\{\s*return false;\s*\}", body):
             problems.append("the exception is not limited to decode, the segmented env, and an unchurned cache")
         if not re.search(r"if \(ctx->moe_graph_rerecord\)\s*\{\s*return true;\s*\}\s*"
-                         r"return ctx->moe_segment_keyed_probes\.take\(moe_segment_probe_split_id\(cgraph\)\);", body):
+                         r"const moe_segment_probe_key key = moe_segment_probe_key_of\(cgraph, ctx->device\);\s*"
+                         r"return ctx->moe_segment_keyed_probes\.take\(key\.split_id, key\.residency\);", body):
             problems.append("the exception does not require segmented MoE mode after one probe per MUL_MAT_ID split "
-                            "(a context-wide probe can be spent by a vetoed split; none at all pays the scans every call)")
+                            "and residency (a context-wide probe can be spent by a vetoed split; a probe without the "
+                            "residency stays spent after the change that lifts its veto; none at all pays the scans "
+                            "every call)")
         try:
-            split_id = region(code, "static uint64_t moe_segment_probe_split_id(", "\n}\n")
+            key_of = region(code, "static moe_segment_probe_key moe_segment_probe_key_of(", "\n}\n")
         except ValueError as error:
             return problems + [str(error)]
-        if not re.search(r"node->op == GGML_OP_MUL_MAT_ID\)\s*\{[^{}]*"
+        if not re.search(r"if \(key\.split_id == 0\)\s*\{\s*[^{}]*"
                          r"h\.mix\(static_cast<uint64_t>\(cgraph->n_nodes\)\);\s*"
-                         r"h\.mix_name\(node->name, sizeof\(node->name\)\);\s*return h\.value\(\) \| 1;", split_id) or \
-                not re.search(r"\}\s*return 0;\s*$", split_id):
+                         r"h\.mix_name\(node->name, sizeof\(node->name\)\);\s*key\.split_id = h\.value\(\) \| 1;",
+                         key_of) or not re.search(r"key\.residency = residency\.value\(\);\s*return key;\s*$", key_of):
             problems.append("the split id does not name the split by its node count and first MUL_MAT_ID "
                             "(equal-size splits of different layers would share one probe)")
+        # The residency is what re-opens a refused preload (moe_graph_preload_stamp_current), plus the prompt epoch.
+        for what, pattern in (("the prompt epoch", r"residency\.mix\(g_moe_prompt_epoch\.load\("),
+                              ("the replan epoch", r"residency\.mix\(in\.replan_epoch\);"),
+                              ("each MUL_MAT_ID's expert storage generation", r"residency\.mix\(in\.storage_generation\);")):
+            if not re.search(pattern, key_of):
+                problems.append("the probe's residency leaves out %s, so a spent probe survives its change" % what)
         return problems
 
     assert not keyed_reachable_problems(RUNTIME_CODE), keyed_reachable_problems(RUNTIME_CODE)
     _reach = region(RUNTIME_CODE, "static bool moe_segment_keyed_reachable(", "\n}\n")
+    _take = "return ctx->moe_segment_keyed_probes.take(key.split_id, key.residency);"
     for _label, _old, _new in (
             ("prompt splits reach keyed slots", "if (!is_decode || ", "if ("),
             ("a churned cache still reaches them", " || ctx->moe_segment_slots.churned())", ")"),
-            ("any split reaches them every call", "return ctx->moe_segment_keyed_probes.take(moe_segment_probe_split_id(cgraph));",
-             "return true;"),
-            ("a vetoed split spends the context's probe", "take(moe_segment_probe_split_id(cgraph))", "take(1)"),
-            ("the probe is never consulted", "return ctx->moe_segment_keyed_probes.take(moe_segment_probe_split_id(cgraph));",
-             "return moe_segment_probe_split_id(cgraph) != 0;")):
+            ("any split reaches them every call", _take, "return true;"),
+            ("a vetoed split spends the context's probe", "take(key.split_id, ", "take(1, "),
+            ("the memo survives the residency change", "take(key.split_id, key.residency)", "take(key.split_id, 0)"),
+            ("the probe is never consulted", _take, "return key.split_id != 0;")):
         assert _reach.count(_old) == 1, _label
         assert keyed_reachable_problems(RUNTIME_CODE.replace(_reach, _reach.replace(_old, _new))), \
             "control %r was not caught" % _label
-    _split = region(RUNTIME_CODE, "static uint64_t moe_segment_probe_split_id(", "\n}\n")
+    _key_of = region(RUNTIME_CODE, "static moe_segment_probe_key moe_segment_probe_key_of(", "\n}\n") + "\n}\n"
     for _label, _old, _new in (
             ("equal-size splits of different layers share a probe", "h.mix_name(node->name, sizeof(node->name));", ""),
             ("the node count is not in the split id", "h.mix(static_cast<uint64_t>(cgraph->n_nodes));", ""),
-            ("a split without a MUL_MAT_ID gets a probe", "    return 0;\n}", "    return 1;\n}")):
-        assert (_split + "\n}\n").count(_old) == 1 or _split.count(_old) == 1, _label
-        _mut = RUNTIME_CODE.replace(_split + "\n}\n", (_split + "\n}\n").replace(_old, _new), 1)
+            ("a split without a MUL_MAT_ID gets a probe", "    return key;\n}", "    key.split_id |= 1;\n    return key;\n}"),
+            ("the memo survives a storage change", "residency.mix(in.storage_generation);", ""),
+            ("the memo survives a replan", "residency.mix(in.replan_epoch);", ""),
+            ("the memo survives a new prompt", "residency.mix(g_moe_prompt_epoch.load(", "(void) (")):
+        assert _key_of.count(_old) == 1, _label
+        _mut = RUNTIME_CODE.replace(_key_of, _key_of.replace(_old, _new), 1)
         assert _mut != RUNTIME_CODE, "control %r did not apply" % _label
         assert keyed_reachable_problems(_mut), "control %r was not caught" % _label
     graph_branch = compute.index("\n    if (use_sycl_graph) {\n") + 1

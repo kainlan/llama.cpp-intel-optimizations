@@ -313,28 +313,41 @@ template <typename Payload> class slot_cache {
 
 // A replay-futile context runs direct, except that each decode split with a MUL_MAT_ID gets one call that may put
 // the context into segmented MoE mode. The memo is per split: a split whose call is vetoed before that decision
-// (preload refused, an unprofitable shape, low headroom) spends only its own probe, never another split's. Split
-// id 0 means "no MUL_MAT_ID" and never probes. A context has a handful of splits, so a linear search is enough.
+// (preload refused, an unprofitable shape, low headroom) spends only its own probe, never another split's. The probe
+// is spent under a residency, the value of what that veto read: a split whose residency differs from the one it
+// spent its probe under gets one more call, so a veto that a residency change lifts does not keep the split direct
+// for the life of the context. Split id 0 means "no MUL_MAT_ID" and never probes. A context has a handful of splits,
+// so a linear search is enough.
 class probe_memo {
   public:
-    // True the first time a split id is seen: the caller probes it. False afterwards, and always for id 0.
-    bool take(uint64_t split_id) {
+    // True when the split has not probed under this residency: the caller probes it. False otherwise, and always for
+    // id 0.
+    bool take(uint64_t split_id, uint64_t residency) {
         if (split_id == 0) {
             return false;
         }
-        for (uint64_t id : probed_) {
-            if (id == split_id) {
-                return false;
+        for (entry & spent : spent_) {
+            if (spent.split_id == split_id) {
+                if (spent.residency == residency) {
+                    return false;
+                }
+                spent.residency = residency;
+                return true;
             }
         }
-        probed_.push_back(split_id);
+        spent_.push_back({ split_id, residency });
         return true;
     }
 
-    size_t size() const { return probed_.size(); }
+    size_t size() const { return spent_.size(); }
 
   private:
-    std::vector<uint64_t> probed_;
+    struct entry {
+        uint64_t split_id;
+        uint64_t residency;
+    };
+
+    std::vector<entry> spent_;
 };
 
 }  // namespace graph_segment_cache
