@@ -10,6 +10,8 @@
 //     (erase then publish elsewhere), the adopt paths' replace-or-insert, and a refused publish leaves nothing behind;
 //     the arena commit rollback and arena_forget_allocation_locked need a device cache, so test-unified-runtime-alloc
 //     (device test) asserts the same consistency after them;
+//   - the lookup's backstop: a row whose size was rewritten behind the index's back makes the next lookup that reaches
+//     it abort (GGML_ASSERT) instead of answering from a stale extent, and the consistency audit reports the drift;
 //   - a few thousand random rows agree with a brute-force oracle, and the index/registry consistency audit holds
 //     throughout.
 //
@@ -27,9 +29,15 @@
 #include "ggml.h"
 #include "unified-cache.hpp"
 
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace ggml_sycl;
@@ -501,12 +509,76 @@ void test_settle_queries_against_oracle() {
           "drained: every counter back at zero");
 }
 
+// Run `lookup_addr` through unified_lookup_runtime_allocation in a child: true when it died of SIGABRT carrying the
+// backstop's message.
+bool lookup_aborts_with_backstop(uintptr_t lookup_addr) {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        return false;
+    }
+    fflush(stdout);  // a buffered line must not be written twice, once by the child's exit
+    fflush(stderr);
+    const pid_t child = fork();
+    if (child == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        setenv("GGML_NO_BACKTRACE", "1", 1);
+        alloc_metadata m{};
+        (void) unified_lookup_runtime_allocation(at(lookup_addr), &m, nullptr);
+        _exit(0);
+    }
+    if (child < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return false;
+    }
+    close(pipefd[1]);
+    std::string captured;
+    char        buf[4096];
+    ssize_t     n;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
+        captured.append(buf, static_cast<size_t>(n));
+    }
+    close(pipefd[0]);
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) {
+        return false;
+    }
+    const bool aborted = WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+    const bool message = captured.find("containment index disagrees with its registry row") != std::string::npos;
+    if (!aborted || !message) {
+        fprintf(stderr, "    child: aborted=%d message=%d stderr=[%s]\n", aborted, message, captured.c_str());
+    }
+    return aborted && message;
+}
+
+void test_backstop_catches_a_rewritten_row() {
+    printf("backstop (a row rewritten behind the index):\n");
+    const uintptr_t base = 0x500000;
+    check(publish(base, 0x1000, 40), "a row");
+    check(!lookup_aborts_with_backstop(base + 0x10), "an untouched row answers without aborting");
+
+    check(allocation_registry_test_corrupt_row_size(at(base), 0x100), "rewrite the row's size to be smaller");
+    check(!allocation_registry_test_index_consistent(), "the consistency audit reports the drift");
+    check(lookup_aborts_with_backstop(base + 0x10), "a lookup that reaches the row aborts with the backstop message");
+    check(lookup_aborts_with_backstop(base + 0xf00), "so does one the stale index still sends to it");
+    check(owner_of(base + 0x2000) == -1, "an address outside every indexed range is unaffected");
+
+    check(allocation_registry_test_corrupt_row_size(at(base), 0x1000), "restore the size");
+    check(allocation_registry_test_index_consistent() && owner_of(base + 0xf00) == 40,
+          "consistent and answering again");
+    allocation_registry_test_erase(at(base));
+    check(allocation_registry_test_size() == 0 && allocation_registry_test_index_consistent(), "registry empty again");
+}
+
 }  // namespace
 
 int main() {
     test_bounds_and_nesting();
     test_mutations_follow();
     test_adopt_replaces_a_row();
+    test_backstop_catches_a_rewritten_row();
     test_random_against_oracle();
     test_host_zone_counters();
     test_span_liveness();

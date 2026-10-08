@@ -1595,8 +1595,9 @@ static bool runtime_registry_span_live_locked(uintptr_t lo, uintptr_t hi) noexce
     return false;
 }
 
-// The only ways to add or remove a registry row; the caller holds g_runtime_alloc_mutex. They keep g_runtime_alloc_index
-// in step. Same contract as unordered_map::emplace: {row, true} on success, {existing row, false} when `ptr` already has
+// The only ways to add, remove or replace a registry row (runtime_registry_emplace_locked, runtime_registry_erase_locked
+// and runtime_registry_assign_locked below); the caller holds g_runtime_alloc_mutex. They keep g_runtime_alloc_index in
+// step. runtime_registry_emplace_locked has the contract of unordered_map::emplace: {row, true} on success, {existing row, false} when `ptr` already has
 // one. An allocation failure leaves registry and index unchanged and propagates.
 //
 // DEFENSIVE: the refusal further down, when the index already has a range starting at this row's handle.ptr, cannot
@@ -1627,6 +1628,12 @@ static std::pair<runtime_registry_iterator, bool> runtime_registry_emplace_locke
     return inserted;
 }
 
+// The geometry a row carries is the geometry the index was given for it (end clamped as insert clamps it).
+static bool runtime_registry_row_matches_index_entry(const alloc_metadata &             h,
+                                                     const address_range_index::entry & e) noexcept {
+    return reinterpret_cast<uintptr_t>(h.ptr) == e.base && address_range_index::end_of(e.base, h.size) == e.end;
+}
+
 static void runtime_registry_erase_locked(runtime_registry_iterator it) noexcept {
     const alloc_metadata & h = it->second.handle;
     if (runtime_registry_row_indexed(h)) {
@@ -1645,14 +1652,14 @@ static void runtime_registry_erase_locked(void * ptr) noexcept {
     }
 }
 
+static_assert(std::is_nothrow_move_assignable<runtime_alloc_record>::value,
+              "runtime_registry_assign_locked relies on a nothrow row replacement");
+
 // Replace-or-insert, the semantics of `registry[ptr] = rec`, and like it a replace of an existing row allocates nothing
 // that can fail after the old row has been touched: the copy of `rec` and any new index node are made first, and what
 // follows (resizing or dropping the old range, moving the copy over the row) cannot throw. So a bad_alloc leaves the old
 // row and its range as they were, never a live allocation with no row. The adopt callers hand out a live handle for this
 // row, so a row that did not land would be an unowned allocation; hence the assertion.
-static_assert(std::is_nothrow_move_assignable<runtime_alloc_record>::value,
-              "runtime_registry_assign_locked relies on a nothrow row replacement");
-
 static void runtime_registry_assign_locked(void * ptr, const runtime_alloc_record & rec) {
     const auto it = g_runtime_alloc_registry.find(ptr);
     if (it == g_runtime_alloc_registry.end()) {
@@ -17533,6 +17540,10 @@ bool unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, s
     if (it == g_runtime_alloc_registry.end()) {
         return false;
     }
+    // Backstop for the index's one assumption, that a registered row's geometry never changes: if anything rewrote it
+    // (the source gate is only a tripwire), fail here, loudly, instead of answering from a stale extent.
+    GGML_ASSERT(runtime_registry_row_matches_index_entry(it->second.handle, hit) &&
+                "runtime allocation containment index disagrees with its registry row");
     if (out != nullptr) {
         *out = it->second.handle;
     }
@@ -17770,6 +17781,17 @@ bool allocation_registry_test_assign_raw(void * ptr, int device, size_t bytes) n
     } catch (...) {
         return false;
     }
+}
+
+// llama.cpp-ii25: rewrite a registered row's size WITHOUT telling the index, to prove the lookup's backstop assertion fires.
+bool allocation_registry_test_corrupt_row_size(void * ptr, size_t bytes) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    const auto                  it = g_runtime_alloc_registry.find(ptr);
+    if (it == g_runtime_alloc_registry.end()) {
+        return false;
+    }
+    it->second.handle.size = bytes;
+    return true;
 }
 
 bool allocation_registry_test_index_consistent() noexcept {

@@ -6287,6 +6287,8 @@ bool   allocation_registry_test_span_live(uintptr_t lo, uintptr_t hi) noexcept;
 size_t allocation_registry_test_span_irregular_rows() noexcept;
 size_t allocation_registry_test_rows_scanned() noexcept;
 void   allocation_registry_test_reset_rows_scanned() noexcept;
+// llama.cpp-ii25: rewrite a registered row's size behind the index's back (the next lookup inside that range must abort).
+bool allocation_registry_test_corrupt_row_size(void * ptr, size_t bytes) noexcept;
 bool allocation_registry_test_cleanup_pending(void * ptr) noexcept;
 size_t allocation_registry_test_size() noexcept;
 bool allocation_registry_test_acquire_exact_lease(const alloc_metadata & metadata) noexcept;
