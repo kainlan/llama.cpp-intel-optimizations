@@ -456,28 +456,35 @@ def test_every_registry_use_outside_the_helpers_is_a_read():
 
 
 @pytest.mark.parametrize(
-    "line",
+    "line, reported",
     [
-        "auto & reg = g_runtime_alloc_registry; reg.erase(it);",
-        "auto * reg = &g_runtime_alloc_registry; reg->clear();",
-        "auto && reg = g_runtime_alloc_registry;",
-        "std::unordered_map<void *, runtime_alloc_record> & reg(g_runtime_alloc_registry);",
-        "drop_rows(g_runtime_alloc_registry);",
-        "for (auto & kv : g_runtime_alloc_registry) { kv.second.handle.size = 0; }",
-        "g_runtime_alloc_registry.erase(it);",
-        "g_runtime_alloc_registry.at(p) = rec;",
+        ("auto & reg = g_runtime_alloc_registry; reg.erase(it);",
+         "void f() {     auto & reg = |; reg.erase(it); }"),
+        ("auto * reg = &g_runtime_alloc_registry; reg->clear();",
+         "void f() {     auto * reg = &|; reg->clear(); }"),
+        ("auto && reg = g_runtime_alloc_registry;",
+         "void f() {     auto && reg = |; }"),
+        ("std::unordered_map<void *, runtime_alloc_record> & reg(g_runtime_alloc_registry);",
+         ", runtime_alloc_record> & reg(|); }"),
+        ("drop_rows(g_runtime_alloc_registry);",
+         "}    void f() {     drop_rows(|); }"),
+        ("for (auto & kv : g_runtime_alloc_registry) { kv.second.handle.size = 0; }",
+         "id f() {     for (auto & kv : |) { kv.second.handle.size = 0;"),
+        ("g_runtime_alloc_registry.erase(it);",
+         "ream); }  }    void f() {     |.erase(it); }"),
+        ("g_runtime_alloc_registry.at(p) = rec;",
+         "ream); }  }    void f() {     |.at(p) = rec; }"),
     ],
 )
-def test_use_gate_has_a_witness(line):
+def test_use_gate_has_a_witness(line, reported):
+    # `reported` is the gate's clipped window (30 chars either side of the global, redacted to `|`).
+    # It is exact, so it also pins the tail of CODE that the leading context is clipped from.
     test_code = CODE + "\nvoid f() {\n    " + line + "\n}\n"
     expected_line = CODE.count('\n') + 3
     violations = registry_uses_that_are_not_reads(test_code)
-    redacted = line.replace('g_runtime_alloc_registry', '|')
-    violation_text = violations[0][1].strip()
-    # Check if the redacted line (or key part of it) is in the violation text
-    assert (violations and violations[0][0] == expected_line and
-            (redacted.rstrip('}').strip() in violation_text or
-             '& reg(|)' in violation_text)), line
+    assert violations, line
+    assert violations[0][0] == expected_line, line
+    assert violations[0][1].strip() == reported, line
 
 
 @pytest.mark.parametrize(
@@ -675,32 +682,47 @@ def test_geometry_gate_allows_reads_and_other_fields(line):
 
 
 @pytest.mark.parametrize(
-    "line",
+    "line, reported",
     [
-        "size_t * s = &it->second.handle.size; *s = 0;",
-        "void ** s = &it->second.handle.ptr; *s = nullptr;",
-        "*(&it->second.handle.size) = 0;",
-        "auto * s = &it->second.handle.size;",
-        "const auto s = &it->second.handle.ptr;",
-        "uintptr_t * s = reinterpret_cast<uintptr_t *>(&it->second.handle.ptr);",
-        "alloc_metadata * h = &it->second.handle;",
-        "auto * h = &(it->second).handle;",
-        "size_t * s = &(it->second.handle.size);",
-        "size_t * s = &g_runtime_alloc_registry.find(p)->second.handle.size;",
-        "size_t * s = &((*it).second).handle.size;",
-        "return &it->second.handle.size;",
-        "zap(&it->second.handle.size);",
-        "zap(1, &it->second.handle);",
+        ("size_t * s = &it->second.handle.size; *s = 0;",
+         "&it->second.handle.size"),
+        ("void ** s = &it->second.handle.ptr; *s = nullptr;",
+         "&it->second.handle.ptr"),
+        ("*(&it->second.handle.size) = 0;",
+         "&it->second.handle.size"),
+        ("auto * s = &it->second.handle.size;",
+         "&it->second.handle.size"),
+        ("const auto s = &it->second.handle.ptr;",
+         "&it->second.handle.ptr"),
+        ("uintptr_t * s = reinterpret_cast<uintptr_t *>(&it->second.handle.ptr);",
+         "&it->second.handle.ptr"),
+        ("alloc_metadata * h = &it->second.handle;",
+         "&it->second.handle"),
+        ("auto * h = &(it->second).handle;",
+         "&(it->second).handle"),
+        ("size_t * s = &(it->second.handle.size);",
+         "&(it->second.handle.size"),
+        ("size_t * s = &g_runtime_alloc_registry.find(p)->second.handle.size;",
+         "&g_runtime_alloc_registry.find(p)->second.handle.size"),
+        ("size_t * s = &((*it).second).handle.size;",
+         "&((*it).second).handle.size"),
+        ("return &it->second.handle.size;",
+         "&it->second.handle.size"),
+        ("zap(&it->second.handle.size);",
+         "&it->second.handle.size"),
+        ("zap(1, &it->second.handle);",
+         "&it->second.handle)"),
     ],
 )
-def test_address_gate_has_a_witness(line):
+def test_address_gate_has_a_witness(line, reported):
+    # `reported` is the `&...` operand the gate emits. Some are odd (`&(it->second.handle.size` is
+    # unbalanced, `&it->second.handle)` carries the call paren): this pins current gate behaviour.
     test_code = CODE + "\nvoid f() {\n    " + line + "\n}\n"
     expected_line = CODE.count('\n') + 3
     violations = geometry_addresses_taken(test_code)
-    redacted = line.replace('g_runtime_alloc_registry', '|')
-    # Gate may report with or without redaction of globals; check both
-    violation_text = violations[0][1].strip()
-    assert violations and violations[0][0] == expected_line and (violation_text in redacted or violation_text in line), line
+    assert violations, line
+    assert violations[0][0] == expected_line, line
+    assert violations[0][1].strip() == reported, line
 
 
 @pytest.mark.parametrize(
@@ -823,22 +845,33 @@ def test_the_geometry_allowlist_is_exact_and_confined_to_private_testing():
 
 
 @pytest.mark.parametrize(
-    "line",
+    "line, reported",
     [
-        "auto q = &it->second; q->handle.size = 0;",
-        "auto q = &it->second.handle;",
-        "const auto q = &it->second;",
-        "decltype(auto) r = it->second;",
-        "auto * q = &it->second;",
-        "runtime_alloc_record * q = &it->second;",
-        "auto * const q = &it->second;",
+        ("auto q = &it->second; q->handle.size = 0;",
+         "auto q = &it->second"),
+        ("auto q = &it->second.handle;",
+         "auto q = &it->second"),
+        ("const auto q = &it->second;",
+         "auto q = &it->second"),
+        ("decltype(auto) r = it->second;",
+         "decltype(auto) r = it->second"),
+        ("auto * q = &it->second;",
+         "auto * q = &it->second"),
+        ("runtime_alloc_record * q = &it->second;",
+         "runtime_alloc_record * q = &it->second"),
+        ("auto * const q = &it->second;",
+         "auto * const q = &it->second"),
     ],
 )
-def test_more_alias_forms_have_a_witness(line):
+def test_more_alias_forms_have_a_witness(line, reported):
+    # `auto q = &it->second` is reported for three cases; they share one fragment and one line, so
+    # the reported text cannot tell them apart. The gate emits no column.
     test_code = planted_in_registry_function(line)
     expected_line = CODE.count('\n') + 4
     violations = row_aliases_in_registry_functions(test_code)
-    assert violations and violations[0][0] == expected_line and violations[0][1].strip() in ' '.join(line.split()), line
+    assert violations, line
+    assert violations[0][0] == expected_line, line
+    assert violations[0][1].strip() == reported, line
 
 
 def test_alias_gate_follows_a_function_that_only_takes_the_iterator():
@@ -862,41 +895,60 @@ def test_the_map_type_marker_tolerates_spacing(decl):
 
 
 @pytest.mark.parametrize(
-    "line",
+    "line, reported",
     [
-        "auto & [k, v] = *it; v = rec; v.handle.size = 0;",
-        "auto && [k, v] = *it;",
-        "for (auto & [k, v] : g_runtime_alloc_registry) { v.handle.size = 0; }",
-        "auto & [k, v] = *g_runtime_alloc_registry.find(p);",
-        "auto & [a, b] = it->second;",
-        "auto & [k, v] = (*it);",
+        ("auto & [k, v] = *it; v = rec; v.handle.size = 0;",
+         "auto & [k, v] ="),
+        ("auto && [k, v] = *it;",
+         "auto && [k, v] ="),
+        ("for (auto & [k, v] : g_runtime_alloc_registry) { v.handle.size = 0; }",
+         "auto & [k, v] :"),
+        ("auto & [k, v] = *g_runtime_alloc_registry.find(p);",
+         "auto & [k, v] ="),
+        ("auto & [a, b] = it->second;",
+         "auto & [a, b] ="),
+        ("auto & [k, v] = (*it);",
+         "auto & [k, v] ="),
     ],
 )
-def test_non_const_structured_binding_has_a_witness(line):
+def test_non_const_structured_binding_has_a_witness(line, reported):
     test_code = planted_in_registry_function(line)
     expected_line = CODE.count('\n') + 4
     violations = non_const_bindings_in_registry_functions(test_code)
-    assert violations and violations[0][0] == expected_line and violations[0][1].strip() in ' '.join(line.split()), line
+    assert violations, line
+    assert violations[0][0] == expected_line, line
+    assert violations[0][1].strip() == reported, line
 
 
 @pytest.mark.parametrize(
-    "line",
+    "line, reported",
     [
-        "[&](runtime_alloc_record & r) { r.handle.size = 0; }(it->second);",
-        "[](auto & r) { r.handle.size = 0; }(it->second);",
-        "[](auto && r) { r.handle.size = 0; }(it->second);",
-        "[&](alloc_metadata & h) { h.size = 0; }(it->second.handle);",
-        "auto f = [&](int a, runtime_alloc_record & r) {}; f(1, it->second);",
-        "auto f = [](auto & r) {}; f(*it);",
-        "auto f = [](auto & r) {}; f(g_runtime_alloc_registry.find(p)->second);",
-        "auto f = [&](alloc_metadata & h) {}; f(&it->second.handle);",
+        ("[&](runtime_alloc_record & r) { r.handle.size = 0; }(it->second);",
+         "(runtime_alloc_record & r"),
+        ("[](auto & r) { r.handle.size = 0; }(it->second);",
+         "(auto & r"),
+        ("[](auto && r) { r.handle.size = 0; }(it->second);",
+         "(auto && r"),
+        ("[&](alloc_metadata & h) { h.size = 0; }(it->second.handle);",
+         "(alloc_metadata & h"),
+        ("auto f = [&](int a, runtime_alloc_record & r) {}; f(1, it->second);",
+         ", runtime_alloc_record & r"),
+        ("auto f = [](auto & r) {}; f(*it);",
+         "(auto & r"),
+        ("auto f = [](auto & r) {}; f(g_runtime_alloc_registry.find(p)->second);",
+         "(auto & r"),
+        ("auto f = [&](alloc_metadata & h) {}; f(&it->second.handle);",
+         "(alloc_metadata & h"),
     ],
 )
-def test_non_const_row_parameter_has_a_witness(line):
+def test_non_const_row_parameter_has_a_witness(line, reported):
+    # the gate reports only the parameter head, so cases with the same head share `reported`.
     test_code = planted_in_registry_function(line)
     expected_line = CODE.count('\n') + 4
     violations = non_const_bindings_in_registry_functions(test_code)
-    assert violations and violations[0][0] == expected_line and violations[0][1].strip() in ' '.join(line.split()), line
+    assert violations, line
+    assert violations[0][0] == expected_line, line
+    assert violations[0][1].strip() == reported, line
 
 
 @pytest.mark.parametrize(
