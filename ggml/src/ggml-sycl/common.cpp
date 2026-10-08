@@ -2902,3 +2902,90 @@ void ggml_sycl_pp_reset_stats() {
     g_sycl_pp_config.total_stage_transfers = 0;
     g_sycl_pp_config.total_sync_waits      = 0;
 }
+
+// --- Scratchpad decline seam (llama.cpp-23mk S3-3) ---
+namespace {
+const char * const g_scratchpad_site_names[GGML_SYCL_SCRATCHPAD_SITE_COUNT] = {
+    "dnnl_softmax",  "dnnl_eltwise",  "dnnl_binary_row", "dnnl_gemm",
+    "dnnl_woq_q8_0", "dnnl_woq_q4_0", "dnnl_gemm_batch", "dnnl_woq_mxfp4_batch",
+};
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+struct scratchpad_site_state {
+    std::atomic<int32_t>  after_n{ 0 };  // 0 = disarmed: decline on the call that makes calls == after_n
+    std::atomic<uint64_t> calls{ 0 };
+    std::atomic<uint64_t> declined{ 0 };
+    std::atomic<uint64_t> engaged{ 0 };
+};
+scratchpad_site_state g_scratchpad_sites[GGML_SYCL_SCRATCHPAD_SITE_COUNT];
+
+scratchpad_site_state * scratchpad_site_find(const char * site) {
+    for (int i = 0; site && i < GGML_SYCL_SCRATCHPAD_SITE_COUNT; ++i) {
+        if (strcmp(site, g_scratchpad_site_names[i]) == 0) {
+            return &g_scratchpad_sites[i];
+        }
+    }
+    return nullptr;
+}
+#endif
+}  // namespace
+
+void ggml_sycl_dnnl_note_engaged(ggml_sycl_scratchpad_site site) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    g_scratchpad_sites[site].engaged.fetch_add(1, std::memory_order_relaxed);
+#endif
+    if (g_ggml_sycl_debug_forced_off.load(std::memory_order_relaxed) || !g_ggml_sycl_debug) {
+        return;
+    }
+    static std::atomic<unsigned> reported{ 0 };
+    const unsigned               bit = 1u << site;
+    if (reported.fetch_or(bit, std::memory_order_relaxed) & bit) {
+        return;
+    }
+    GGML_LOG_WARN("[ONEDNN][%s] wrapper engaged: the oneDNN primitive was submitted (first call in this process)\n",
+                  g_scratchpad_site_names[site]);
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site site) {
+    scratchpad_site_state & s = g_scratchpad_sites[site];
+    const uint64_t          n = s.calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int32_t           a = s.after_n.load(std::memory_order_relaxed);
+    if (a > 0 && n == (uint64_t) a) {
+        s.declined.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+GGML_BACKEND_API bool ggml_sycl_test_inject_scratchpad_decline(const char * site, int32_t after_n) {
+    scratchpad_site_state * s = scratchpad_site_find(site);
+    if (!s || after_n < 0) {
+        return false;
+    }
+    s->calls.store(0, std::memory_order_relaxed);
+    s->after_n.store(after_n, std::memory_order_relaxed);
+    return true;
+}
+
+GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset(void) {
+    for (scratchpad_site_state & s : g_scratchpad_sites) {
+        s.after_n.store(0, std::memory_order_relaxed);
+        s.calls.store(0, std::memory_order_relaxed);
+        s.declined.store(0, std::memory_order_relaxed);
+        s.engaged.store(0, std::memory_order_relaxed);
+    }
+}
+
+GGML_BACKEND_API bool ggml_sycl_test_scratchpad_site_counts(const char * site, uint64_t * calls, uint64_t * declined,
+                                                            uint64_t * engaged) {
+    scratchpad_site_state * s = scratchpad_site_find(site);
+    if (!s) {
+        return false;
+    }
+    *calls    = s->calls.load(std::memory_order_relaxed);
+    *declined = s->declined.load(std::memory_order_relaxed);
+    *engaged  = s->engaged.load(std::memory_order_relaxed);
+    return true;
+}
+#endif

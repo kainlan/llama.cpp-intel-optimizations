@@ -396,14 +396,16 @@ void ggml_sycl_op_soft_max(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
 
 #if GGML_SYCL_DNNL
     if (use_dnnl_softmax && !src1_d && max_bias == 0.0f && nrows_x >= 128 && !g_ggml_sycl_graph_recording) {
-        DnnlSoftmaxWrapper::softmax(
-            ctx, src0_d, dst_d,
-            nrows_x,                              // batch = total rows
-            ne00,                                 // features = softmax axis
-            scale,                                // pre-softmax scale (e.g. 1/sqrt(d_head))
-            DnnlSoftmaxWrapper::to_dt<float>(),
-            stream);
-        return;
+        // A declined scratchpad wrote nothing to dst: fall through to the SYCL kernel below.
+        if (DnnlSoftmaxWrapper::softmax(
+                ctx, src0_d, dst_d,
+                nrows_x,                              // batch = total rows
+                ne00,                                 // features = softmax axis
+                scale,                                // pre-softmax scale (e.g. 1/sqrt(d_head))
+                DnnlSoftmaxWrapper::to_dt<float>(),
+                stream)) {
+            return;
+        }
     }
 #else
     (void) use_dnnl_softmax;

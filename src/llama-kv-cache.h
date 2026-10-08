@@ -114,7 +114,9 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // create the tensors on size-0 dummy buffers: nothing is allocated (a load-time measure's memory)
+                         bool   no_alloc = false);
 
     ~llama_kv_cache() = default;
 
@@ -129,9 +131,12 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_streams) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    void get_shift_caches(std::vector<const llama_kv_cache *> & caches) const override;
 
     void clear(bool data) override;
 
@@ -165,6 +170,11 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+
+    // The K and V tensors this cache itself created for model layer il. False when the layer has
+    // none here: it has no KV, another layer's tensors stand in for it (reuse), or another cache's
+    // do (share). V is null for an MLA layer.
+    bool get_layer_tensors(int32_t il, const ggml_tensor ** k, const ggml_tensor ** v) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -204,7 +214,8 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
-    bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
+    // FAILED leaves the pending shift recorded, so the next call retries it
+    llama_memory_update_result update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
 
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
@@ -228,6 +239,11 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
+
+    // the K-shift graph update() allocates, built into `res`; a planned reserve measures it
+    ggml_cgraph * build_graph_shift(
+               llm_graph_result * res,
+                  llama_context * lctx) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -260,9 +276,15 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // the tensors belong to another cache (layer_share_cb)
+        bool shared = false;
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    // the tensors sit on size-0 dummy buffers: the model's no_alloc, or the caller's (a measure)
+    bool no_alloc = false;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -332,10 +354,6 @@ private:
                           float   freq_scale,
                        uint32_t   il) const;
 
-    ggml_cgraph * build_graph_shift(
-               llm_graph_result * res,
-                  llama_context * lctx) const;
-
     struct cell_ranges_t {
         uint32_t strm;
 
@@ -364,6 +382,11 @@ public:
     // used to create a full-cache context
     llama_kv_cache_context(
             llama_kv_cache * kv);
+
+    // used to create a worst-case context over exactly n_streams streams (1 <= n_streams <= the cache's stream count)
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            uint32_t n_streams);
 
     // used to create an update context
     llama_kv_cache_context(

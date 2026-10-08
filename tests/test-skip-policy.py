@@ -139,6 +139,11 @@ ALLOWED_NON_EXIT_77 = (
     ("ggml/src/ggml-sycl/tests/test-moe-mmid-workspace-plan.cpp", re.compile(r"\bacquire\(77,\s*88\)")),
     ("ggml/src/ggml-sycl/tests/test-moe-mmid-workspace-plan.cpp", re.compile(r"terminal_release\(later_slot\.lease,\s*77,\s*88\)")),
     ("ggml/src/ggml-sycl/tests/test-moe-mmid-workspace-plan.cpp", re.compile(r"\badmitted\s*=\s*77;")),
+    # An out-of-range enum value: a fake residency-probe / tenant-coverage proc answers 77, which no named
+    # constant of the enum has, to prove the caller treats an unknown answer as "not recorded" rather than a pass
+    # (zhcn). Neither is an exit code.
+    ("tests/test-context-tenant-section.cpp", re.compile(r"return \(ggml_sycl_tenant_coverage\) 77;")),
+    ("tests/test-load-measure-guards.cpp", re.compile(r"g_late_answers\s*=\s*\{\s*77\s*\};")),
     # GGML_SYCL_NONFA_ATTN_SCRATCH_MB=77 is the MiB override value the ctest
     # ENVIRONMENT sets: the env-var text compared with strcmp, the same value
     # named in two check() message strings, and the 77 * kMiB byte expectation

@@ -18,6 +18,7 @@
 
 #if GGML_SYCL_DNNL
 
+#    include "dnnl-ops.hpp"
 #    include "dnnl.hpp"
 #    include "dnnl_sycl.hpp"
 #    include "sycl-kernel-profiler.hpp"
@@ -27,6 +28,7 @@
 #    include <chrono>
 #    include <cstdio>
 #    include <mutex>
+#    include <optional>
 #    include <unordered_map>
 #    include <utility>
 
@@ -313,28 +315,34 @@ class DnnlGemmWrapper {
     // (SYCL events this GEMM must wait on) even though no caller populates it
     // today -- the event-form execute() needs the parameter to exist either
     // way, and every other executor in this file already writes it this way.
-    static sycl::event gemm(ggml_backend_sycl_context &      ctx,
-                            int                              m,
-                            int                              n,
-                            int                              k,
-                            const void *                     a,
-                            dt                               at,
-                            dnnl_dim_t                       stra0,
-                            dnnl_dim_t                       stra1,
-                            dnnl_dim_t                       stra2,
-                            const void *                     b,
-                            dt                               bt,
-                            dnnl_dim_t                       strb0,
-                            dnnl_dim_t                       strb1,
-                            dnnl_dim_t                       strb2,
-                            void *                           c,
-                            dt                               ct,
-                            const queue_ptr &                q,
-                            dnnl_dim_t                       batches_a,
-                            dnnl_dim_t                       batches_b,
-                            int                              ldc        = -1,
-                            const std::vector<sycl::event> & deps       = {},
-                            const char *                     op_context = nullptr) {
+    // Returns std::nullopt when the scratchpad request was declined (nothing was submitted and c was not written);
+    // the caller takes its declared next path (llama.cpp-23mk S3-4). A value is the primitive's completion event.
+    // query_only asks the scratchpad question and stops: it submits nothing, does not count as an engaged call, and
+    // returns an empty event when not declined. A caller that will run the same descriptor over many batches asks once
+    // with it before its first write.
+    [[nodiscard]] static std::optional<sycl::event> gemm(ggml_backend_sycl_context &      ctx,
+                                                         int                              m,
+                                                         int                              n,
+                                                         int                              k,
+                                                         const void *                     a,
+                                                         dt                               at,
+                                                         dnnl_dim_t                       stra0,
+                                                         dnnl_dim_t                       stra1,
+                                                         dnnl_dim_t                       stra2,
+                                                         const void *                     b,
+                                                         dt                               bt,
+                                                         dnnl_dim_t                       strb0,
+                                                         dnnl_dim_t                       strb1,
+                                                         dnnl_dim_t                       strb2,
+                                                         void *                           c,
+                                                         dt                               ct,
+                                                         const queue_ptr &                q,
+                                                         dnnl_dim_t                       batches_a,
+                                                         dnnl_dim_t                       batches_b,
+                                                         int                              ldc        = -1,
+                                                         const std::vector<sycl::event> & deps       = {},
+                                                         const char *                     op_context = nullptr,
+                                                         bool                             query_only = false) {
         std::lock_guard<std::mutex> lock(exec_mutex(q));
 
         auto stream = ctx.stream_dnnl(q);
@@ -397,15 +405,21 @@ class DnnlGemmWrapper {
             const size_t scratchpad_size = scratchpad_md.get_size();
             auto         matmul_prim     = dnnl::matmul(matmul_pd);
 
+            auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
+            if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_GEMM, scratchpad_mem, scratchpad_md)) {
+                return std::nullopt;
+            }
+            if (query_only) {
+                return sycl::event{};
+            }
+            ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_GEMM);
+
             std::unordered_map<int, dnnl::memory> matmul_args;
             matmul_args.insert({ DNNL_ARG_SRC, a_mem });
             matmul_args.insert({ DNNL_ARG_WEIGHTS, b_mem });
             matmul_args.insert({ DNNL_ARG_DST, c_mem });
+            // llama.cpp-dboi: a 0 B scratchpad is an empty memory, and passing one as an argument makes execute throw.
             if (scratchpad_size > 0) {
-                auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
-                if (scratchpad_mem.get(true) == nullptr) {
-                    throw std::runtime_error("oneDNN scratchpad allocation failed");
-                }
                 matmul_args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
             }
             ggml_sycl_profile_label gemm_label{};
@@ -435,15 +449,20 @@ class DnnlGemmWrapper {
         auto         c_mem           = dnnl::memory(cached->c_md, eng, c);
         const size_t scratchpad_size = cached->scratchpad_md.get_size();
 
+        auto scratchpad_mem = ctx.get_scratchpad_mem(cached->scratchpad_md, eng, q);
+        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_GEMM, scratchpad_mem, cached->scratchpad_md)) {
+            return std::nullopt;
+        }
+        if (query_only) {
+            return sycl::event{};
+        }
+        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_GEMM);
+
         std::unordered_map<int, dnnl::memory> matmul_args;
         matmul_args.insert({ DNNL_ARG_SRC, a_mem });
         matmul_args.insert({ DNNL_ARG_WEIGHTS, b_mem });
         matmul_args.insert({ DNNL_ARG_DST, c_mem });
         if (scratchpad_size > 0) {
-            auto scratchpad_mem = ctx.get_scratchpad_mem(cached->scratchpad_md, eng, q);
-            if (scratchpad_mem.get(true) == nullptr) {
-                throw std::runtime_error("oneDNN scratchpad allocation failed");
-            }
             matmul_args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
         }
 
@@ -465,63 +484,43 @@ class DnnlGemmWrapper {
         });
     }
 
-    static sycl::event row_gemm(ggml_backend_sycl_context & ctx,
-                                int                         m,
-                                int                         n,
-                                int                         k,
-                                const void *                a,
-                                dt                          at,
-                                const void *                b,
-                                dt                          bt,
-                                void *                      c,
-                                dt                          ct,
-                                const queue_ptr &           q,
-                                int                         ldc        = -1,
-                                const char *                op_context = nullptr) {
+    // Forwards gemm's result: std::nullopt is a declined scratchpad (see gemm).
+    [[nodiscard]] static std::optional<sycl::event> row_gemm(ggml_backend_sycl_context & ctx,
+                                                             int                         m,
+                                                             int                         n,
+                                                             int                         k,
+                                                             const void *                a,
+                                                             dt                          at,
+                                                             const void *                b,
+                                                             dt                          bt,
+                                                             void *                      c,
+                                                             dt                          ct,
+                                                             const queue_ptr &           q,
+                                                             int                         ldc        = -1,
+                                                             const char *                op_context = nullptr) {
         return gemm(ctx, m, n, k, a, at, 1, k, k * m, b, bt, 1, k, n * k, c, ct, q, 1, 1, ldc, /* deps = */ {},
                     op_context);
     }
 
     // WoQ GEMM for Q4_0 weights (s4) with grouped scales/zero-points.
     // A: [m, k] row-major, B: [k, n] row-major (s4), C: [m, n] row-major.
-    static bool woq_gemm_q4_0(ggml_backend_sycl_context & ctx,
-                              int                         m,
-                              int                         n,
-                              int                         k,
-                              const void *                a,
-                              dt                          at,
-                              const void *                b_s4,
-                              int64_t                     group_size,
-                              const float *               scales,
-                              const int8_t *              zero_points,
-                              void *                      c,
-                              dt                          ct,
-                              const queue_ptr &           q,
-                              int64_t                     c_stride0,
-                              int64_t                     c_stride1) {
-        return woq_gemm_q4_0_impl(ctx, m, n, k, a, at, b_s4, /* b_bytes = */ 0, /* b_is_packed = */ false, group_size,
-                                  scales, zero_points, c, ct, q, c_stride0, c_stride1);
-    }
-
-    // WoQ GEMM with pre-packed oneDNN weights (b_packed uses cached->b_md layout).
-    static bool woq_gemm_q4_0_packed(ggml_backend_sycl_context & ctx,
-                                     int                         m,
-                                     int                         n,
-                                     int                         k,
-                                     const void *                a,
-                                     dt                          at,
-                                     const void *                b_packed,
-                                     size_t                      b_packed_bytes,
-                                     int64_t                     group_size,
-                                     const float *               scales,
-                                     const int8_t *              zero_points,
-                                     void *                      c,
-                                     dt                          ct,
-                                     const queue_ptr &           q,
-                                     int64_t                     c_stride0,
-                                     int64_t                     c_stride1) {
-        return woq_gemm_q4_0_impl(ctx, m, n, k, a, at, b_packed, b_packed_bytes, /* b_is_packed = */ true, group_size,
-                                  scales, zero_points, c, ct, q, c_stride0, c_stride1);
+    [[nodiscard]] static bool woq_gemm_q4_0(ggml_backend_sycl_context & ctx,
+                                            int                         m,
+                                            int                         n,
+                                            int                         k,
+                                            const void *                a,
+                                            dt                          at,
+                                            const void *                b_s4,
+                                            int64_t                     group_size,
+                                            const float *               scales,
+                                            const int8_t *              zero_points,
+                                            void *                      c,
+                                            dt                          ct,
+                                            const queue_ptr &           q,
+                                            int64_t                     c_stride0,
+                                            int64_t                     c_stride1) {
+        return woq_gemm_q4_0_impl(ctx, m, n, k, a, at, b_s4, group_size, scales, zero_points, c, ct, q, c_stride0,
+                                  c_stride1);
     }
 
     // llama.cpp-nz1k (prefill L2b phase 1): WoQ-int8 GEMM for Q8_0 SOA weights
@@ -643,13 +642,13 @@ class DnnlGemmWrapper {
     // Bind + submit a prepared plan. Returns false (nothing submitted) on an
     // unready plan or a null pointer; throws only what
     // dnnl::sycl_interop::execute throws.
-    static bool woq_gemm_q8_0(ggml_backend_sycl_context & ctx,
-                              const woq_q8_0_plan &       plan,
-                              const void *                a_f16,
-                              const void *                b_s8,
-                              const void *                scales_f16_kbn,
-                              void *                      c_f32,
-                              const queue_ptr &           q) {
+    [[nodiscard]] static bool woq_gemm_q8_0(ggml_backend_sycl_context & ctx,
+                                            const woq_q8_0_plan &       plan,
+                                            const void *                a_f16,
+                                            const void *                b_s8,
+                                            const void *                scales_f16_kbn,
+                                            void *                      c_f32,
+                                            const queue_ptr &           q) {
         if (!plan.ready || !a_f16 || !b_s8 || !scales_f16_kbn || !c_f32) {
             if (g_ggml_sycl_debug) {
                 std::fprintf(stderr, "[ONEDNN][WOQ-Q8] unready plan or null pointer(s)\n");
@@ -666,6 +665,14 @@ class DnnlGemmWrapper {
         auto                        stream = ctx.stream_dnnl(q);
         auto                        eng    = ctx.engine_dnnl(q);
 
+        // A declined scratchpad submits nothing and writes nothing to c: the caller takes its dequant arm.
+        auto scratchpad_mem = ctx.get_scratchpad_mem(cached->scratchpad_md, eng, q);
+        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_Q8_0, scratchpad_mem,
+                                          cached->scratchpad_md)) {
+            return false;
+        }
+        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_Q8_0);
+
         auto a_mem = dnnl::memory(cached->a_md, eng, const_cast<void *>(a_f16));
         auto b_mem = dnnl::memory(cached->b_md, eng, const_cast<void *>(b_s8));
         auto c_mem = dnnl::memory(cached->c_md, eng, c_f32);
@@ -677,10 +684,6 @@ class DnnlGemmWrapper {
         args.insert({ DNNL_ARG_DST, c_mem });
         args.insert({ DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, s_mem });
         if (cached->scratchpad_size > 0) {
-            auto scratchpad_mem = ctx.get_scratchpad_mem(cached->scratchpad_md, eng, q);
-            if (scratchpad_mem.get(true) == nullptr) {
-                throw std::runtime_error("oneDNN scratchpad allocation failed");
-            }
             args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
         }
 
@@ -727,23 +730,21 @@ class DnnlGemmWrapper {
         return attr;
     }
 
-    static bool woq_gemm_q4_0_impl(ggml_backend_sycl_context & ctx,
-                                   int                         m,
-                                   int                         n,
-                                   int                         k,
-                                   const void *                a,
-                                   dt                          at,
-                                   const void *                b_data,
-                                   size_t                      b_bytes,
-                                   bool                        b_is_packed,
-                                   int64_t                     group_size,
-                                   const float *               scales,
-                                   const int8_t *              zero_points,
-                                   void *                      c,
-                                   dt                          ct,
-                                   const queue_ptr &           q,
-                                   int64_t                     c_stride0,
-                                   int64_t                     c_stride1) {
+    [[nodiscard]] static bool woq_gemm_q4_0_impl(ggml_backend_sycl_context & ctx,
+                                                 int                         m,
+                                                 int                         n,
+                                                 int                         k,
+                                                 const void *                a,
+                                                 dt                          at,
+                                                 const void *                b_data,
+                                                 int64_t                     group_size,
+                                                 const float *               scales,
+                                                 const int8_t *              zero_points,
+                                                 void *                      c,
+                                                 dt                          ct,
+                                                 const queue_ptr &           q,
+                                                 int64_t                     c_stride0,
+                                                 int64_t                     c_stride1) {
         if (!a || !b_data || !scales || !zero_points || !c) {
             if (g_ggml_sycl_debug) {
                 std::fprintf(stderr, "[ONEDNN][WOQ] null pointer(s) provided\n");
@@ -840,52 +841,49 @@ class DnnlGemmWrapper {
         auto a_mem = dnnl::memory(cached->a_md, eng, const_cast<void *>(a));
         auto c_mem = dnnl::memory(cached->c_md, eng, c);
 
+        // Decided before the weights are packed and before anything is submitted: a declined scratchpad returns
+        // false with c untouched, and the caller takes its dequant arm (llama.cpp-23mk S3-4).
+        auto scratchpad_mem = ctx.get_scratchpad_mem(cached->scratchpad_md, eng, q);
+        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_Q4_0, scratchpad_mem,
+                                          cached->scratchpad_md)) {
+            return false;
+        }
+
         dnnl::memory          b_mem        = {};
         void *                b_packed_dev = nullptr;
         ggml_sycl::mem_handle b_packed_owner;
-        if (b_is_packed) {
-            const size_t packed_bytes = cached->b_md.get_size();
-            if (b_bytes > 0 && b_bytes < packed_bytes) {
+        dnnl::memory          b_user_mem(b_user_md, eng, const_cast<void *>(b_data));
+        b_mem = b_user_mem;
+        if (cached->b_md != b_user_mem.get_desc()) {
+            const size_t             packed_bytes = cached->b_md.get_size();
+            ggml_sycl::alloc_request req{};
+            req.queue                          = q;
+            req.device                         = ggml_sycl_get_device_id_from_queue(*q);
+            req.size                           = packed_bytes;
+            req.intent.role                    = ggml_sycl::alloc_role::STAGING;
+            req.intent.category                = ggml_sycl::runtime_category::STAGING;
+            req.intent.cohort_id               = "onednn_woq_packed";
+            req.intent.constraints.must_device = true;
+
+            ggml_sycl::alloc_handle b_packed_alloc_owner{};
+            if (ggml_sycl::unified_alloc(req, &b_packed_alloc_owner) && b_packed_alloc_owner.ptr) {
+                b_packed_owner =
+                    ggml_sycl::detail::from_legacy_owned_alloc(std::move(b_packed_alloc_owner), GGML_LAYOUT_AOS);
+                auto resolved = b_packed_owner.resolve(req.device);
+                b_packed_dev  = resolved && resolved.on_device ? resolved.ptr : nullptr;
+                if (!b_packed_dev) {
+                    b_packed_owner = {};
+                }
+            }
+            if (!b_packed_dev) {
                 if (g_ggml_sycl_debug) {
-                    std::fprintf(stderr, "[ONEDNN][WOQ] packed weights too small (%zu < %zu)\n", b_bytes, packed_bytes);
+                    std::fprintf(stderr, "[ONEDNN][WOQ] packed weights alloc failed (%zu bytes)\n", packed_bytes);
                 }
                 return false;
             }
-            b_mem = dnnl::memory(cached->b_md, eng, const_cast<void *>(b_data));
-        } else {
-            dnnl::memory b_user_mem(b_user_md, eng, const_cast<void *>(b_data));
-            b_mem = b_user_mem;
-            if (cached->b_md != b_user_mem.get_desc()) {
-                const size_t             packed_bytes = cached->b_md.get_size();
-                ggml_sycl::alloc_request req{};
-                req.queue                          = q;
-                req.device                         = ggml_sycl_get_device_id_from_queue(*q);
-                req.size                           = packed_bytes;
-                req.intent.role                    = ggml_sycl::alloc_role::STAGING;
-                req.intent.category                = ggml_sycl::runtime_category::STAGING;
-                req.intent.cohort_id               = "onednn_woq_packed";
-                req.intent.constraints.must_device = true;
-
-                ggml_sycl::alloc_handle b_packed_alloc_owner{};
-                if (ggml_sycl::unified_alloc(req, &b_packed_alloc_owner) && b_packed_alloc_owner.ptr) {
-                    b_packed_owner =
-                        ggml_sycl::detail::from_legacy_owned_alloc(std::move(b_packed_alloc_owner), GGML_LAYOUT_AOS);
-                    auto resolved = b_packed_owner.resolve(req.device);
-                    b_packed_dev  = resolved && resolved.on_device ? resolved.ptr : nullptr;
-                    if (!b_packed_dev) {
-                        b_packed_owner = {};
-                    }
-                }
-                if (!b_packed_dev) {
-                    if (g_ggml_sycl_debug) {
-                        std::fprintf(stderr, "[ONEDNN][WOQ] packed weights alloc failed (%zu bytes)\n", packed_bytes);
-                    }
-                    return false;
-                }
-                b_mem = dnnl::memory(cached->b_md, eng, b_packed_dev);
-                dnnl::reorder(b_user_mem, b_mem).execute(stream, b_user_mem, b_mem);
-                stream.wait();
-            }
+            b_mem = dnnl::memory(cached->b_md, eng, b_packed_dev);
+            dnnl::reorder(b_user_mem, b_mem).execute(stream, b_user_mem, b_mem);
+            stream.wait();
         }
 
         dnnl::memory scales_mem(
@@ -908,13 +906,11 @@ class DnnlGemmWrapper {
         args.insert({ DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, scales_mem });
         args.insert({ DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS, zp_mem });
         if (cached->scratchpad_size > 0) {
-            auto scratchpad_mem = ctx.get_scratchpad_mem(cached->scratchpad_md, eng, q);
-            if (scratchpad_mem.get(true) == nullptr) {
-                throw std::runtime_error("oneDNN scratchpad allocation failed");
-            }
             args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
         }
 
+        // Every later `return false` is behind us: "engaged" means the primitive is about to be submitted.
+        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_Q4_0);
         cached->primitive.execute(stream, args);
 
         if (b_packed_dev) {
@@ -933,29 +929,30 @@ class DnnlGemmWrapper {
     // when the GEMM completes, so callers on the same in-order queue can chain
     // dependent submissions onto it (e.g. via cgh.depends_on(...) or a barrier)
     // instead of relying on in-order-queue ordering with an async primitive.
-    static sycl::event gemm_batch_strided(ggml_backend_sycl_context &      ctx,
-                                          bool                             trans_a,
-                                          bool                             trans_b,
-                                          int                              m,
-                                          int                              n,
-                                          int                              k,
-                                          float                            alpha,
-                                          const void *                     a,
-                                          dt                               at,
-                                          int                              lda,
-                                          int64_t                          stride_a,
-                                          const void *                     b,
-                                          dt                               bt,
-                                          int                              ldb,
-                                          int64_t                          stride_b,
-                                          float                            beta,
-                                          void *                           c,
-                                          dt                               ct,
-                                          int                              ldc,
-                                          int64_t                          stride_c,
-                                          int                              batch_size,
-                                          const queue_ptr &                q,
-                                          const std::vector<sycl::event> & deps = {}) {
+    // std::nullopt: the scratchpad request was declined before anything was submitted; c is untouched.
+    [[nodiscard]] static std::optional<sycl::event> gemm_batch_strided(ggml_backend_sycl_context &      ctx,
+                                                                       bool                             trans_a,
+                                                                       bool                             trans_b,
+                                                                       int                              m,
+                                                                       int                              n,
+                                                                       int                              k,
+                                                                       float                            alpha,
+                                                                       const void *                     a,
+                                                                       dt                               at,
+                                                                       int                              lda,
+                                                                       int64_t                          stride_a,
+                                                                       const void *                     b,
+                                                                       dt                               bt,
+                                                                       int                              ldb,
+                                                                       int64_t                          stride_b,
+                                                                       float                            beta,
+                                                                       void *                           c,
+                                                                       dt                               ct,
+                                                                       int                              ldc,
+                                                                       int64_t                          stride_c,
+                                                                       int                              batch_size,
+                                                                       const queue_ptr &                q,
+                                                                       const std::vector<sycl::event> & deps = {}) {
         std::lock_guard<std::mutex> lock(exec_mutex(q));
         auto                        stream = ctx.stream_dnnl(q);
         auto                        eng    = ctx.engine_dnnl(q);
@@ -1040,9 +1037,11 @@ class DnnlGemmWrapper {
             auto c_mem          = dnnl::memory(matmul_pd.dst_desc(), eng, c);
             auto scratchpad_md  = matmul_pd.scratchpad_desc();
             auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
-            if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {
-                throw std::runtime_error("oneDNN scratchpad allocation failed");
+            if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_GEMM_BATCH, scratchpad_mem,
+                                              scratchpad_md)) {
+                return std::nullopt;
             }
+            ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_GEMM_BATCH);
             auto matmul_prim = dnnl::matmul(matmul_pd);
 
             std::unordered_map<int, dnnl::memory> args;
@@ -1074,6 +1073,13 @@ class DnnlGemmWrapper {
         auto b_mem = dnnl::memory(cached->b_md, eng, const_cast<void *>(b));
         auto c_mem = dnnl::memory(cached->c_md, eng, c);
 
+        auto scratchpad_mem = ctx.get_scratchpad_mem(cached->scratchpad_md, eng, q);
+        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_GEMM_BATCH, scratchpad_mem,
+                                          cached->scratchpad_md)) {
+            return std::nullopt;
+        }
+        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_GEMM_BATCH);
+
         std::unordered_map<int, dnnl::memory> args;
         args.insert({ DNNL_ARG_SRC, a_mem });
         args.insert({ DNNL_ARG_WEIGHTS, b_mem });
@@ -1081,13 +1087,10 @@ class DnnlGemmWrapper {
         // llama.cpp-dboi: a zero-size scratchpad desc makes get_scratchpad_mem()
         // return a default-constructed dnnl::memory, and passing that
         // uninitialized object as an arg makes sycl_interop::execute throw
-        // "object is not initialized". Guard the insert on the size, exactly
-        // as the gemm (variant 0) branches above already do.
+        // "object is not initialized". The query above is unconditional; the
+        // guard stays on the insert alone, exactly as the gemm (variant 0)
+        // branches above do.
         if (cached->scratchpad_md.get_size() > 0) {
-            auto scratchpad_mem = ctx.get_scratchpad_mem(cached->scratchpad_md, eng, q);
-            if (scratchpad_mem.get(true) == nullptr) {
-                throw std::runtime_error("oneDNN scratchpad allocation failed");
-            }
             args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
         }
 
@@ -1255,24 +1258,25 @@ class DnnlGemmWrapper {
     // `deps` are SYCL events this GEMM must wait on (repack + activation
     // staging); the returned event fires on GEMM completion, matching
     // gemm_batch_strided's deps-in/event-out contract.
-    static sycl::event woq_gemm_batch_mxfp4(ggml_backend_sycl_context &      ctx,
-                                            int                              m,
-                                            int                              n,
-                                            int                              k,
-                                            const void *                     a,
-                                            dt                               at,
-                                            int64_t                          stride_a,
-                                            const void *                     b_nibbles,
-                                            int64_t                          stride_b,
-                                            int64_t                          group_size,
-                                            const void *                     b_scales,
-                                            int64_t                          stride_scales,
-                                            void *                           c,
-                                            dt                               ct,
-                                            int64_t                          stride_c,
-                                            int                              batch_size,
-                                            const queue_ptr &                q,
-                                            const std::vector<sycl::event> & deps = {}) {
+    // std::nullopt: the scratchpad request was declined before anything was submitted; c is untouched.
+    [[nodiscard]] static std::optional<sycl::event> woq_gemm_batch_mxfp4(ggml_backend_sycl_context &      ctx,
+                                                                         int                              m,
+                                                                         int                              n,
+                                                                         int                              k,
+                                                                         const void *                     a,
+                                                                         dt                               at,
+                                                                         int64_t                          stride_a,
+                                                                         const void *                     b_nibbles,
+                                                                         int64_t                          stride_b,
+                                                                         int64_t                          group_size,
+                                                                         const void *                     b_scales,
+                                                                         int64_t                          stride_scales,
+                                                                         void *                           c,
+                                                                         dt                               ct,
+                                                                         int64_t                          stride_c,
+                                                                         int                              batch_size,
+                                                                         const queue_ptr &                q,
+                                                                         const std::vector<sycl::event> & deps = {}) {
         if (m <= 0 || n <= 0 || k <= 0 || batch_size <= 0 || group_size <= 0 || (k % group_size) != 0) {
             throw std::runtime_error("woq_gemm_batch_mxfp4: invalid dims/group_size");
         }
@@ -1378,16 +1382,19 @@ class DnnlGemmWrapper {
                 auto b_mem = dnnl::memory(b_md_3d, eng, const_cast<void *>(b_nibbles));
                 auto s_mem = dnnl::memory(s_md_3d, eng, const_cast<void *>(b_scales));
 
+                auto scratchpad_mem = ctx.get_scratchpad_mem(cached3d->scratchpad_md, eng, q);
+                if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_MXFP4_BATCH, scratchpad_mem,
+                                                  cached3d->scratchpad_md)) {
+                    return std::nullopt;
+                }
+                ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_MXFP4_BATCH);
+
                 std::unordered_map<int, dnnl::memory> args;
                 args.insert({ DNNL_ARG_SRC, a_mem });
                 args.insert({ DNNL_ARG_WEIGHTS, b_mem });
                 args.insert({ DNNL_ARG_DST, c_mem });
                 args.insert({ DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, s_mem });
                 if (cached3d->scratchpad_md.get_size() > 0) {
-                    auto scratchpad_mem = ctx.get_scratchpad_mem(cached3d->scratchpad_md, eng, q);
-                    if (scratchpad_mem.get(true) == nullptr) {
-                        throw std::runtime_error("oneDNN scratchpad allocation failed");
-                    }
                     args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
                 }
                 // llama.cpp-iikr (sycl-kernel-profiler extension cycle, final
@@ -1482,6 +1489,17 @@ class DnnlGemmWrapper {
         // already provides for submission, while adding the correctness
         // guarantee for oneDNN's internal scratchpad reuse that submission
         // order alone does not).
+        //
+        // The scratchpad is asked for once, here, before the loop (llama.cpp-23mk S3-4): every batch uses cached2d's
+        // one descriptor, so a decline is a decline for the whole op, and deciding it per batch would let batch b > 0
+        // decline after batches 0..b-1 had already written their rows of c.
+        auto scratchpad_mem = ctx.get_scratchpad_mem(cached2d->scratchpad_md, eng, q);
+        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_MXFP4_BATCH, scratchpad_mem,
+                                          cached2d->scratchpad_md)) {
+            return std::nullopt;
+        }
+        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_MXFP4_BATCH);
+
         std::vector<sycl::event> per_batch_events;
         per_batch_events.reserve(static_cast<size_t>(batch_size));
         for (int b = 0; b < batch_size; ++b) {
@@ -1509,10 +1527,6 @@ class DnnlGemmWrapper {
             args.insert({ DNNL_ARG_DST, c_mem_b });
             args.insert({ DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, s_mem_b });
             if (cached2d->scratchpad_md.get_size() > 0) {
-                auto scratchpad_mem = ctx.get_scratchpad_mem(cached2d->scratchpad_md, eng, q);
-                if (scratchpad_mem.get(true) == nullptr) {
-                    throw std::runtime_error("oneDNN scratchpad allocation failed");
-                }
                 args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
             }
             if (args_map_profile_enabled) {
@@ -1564,56 +1578,6 @@ class DnnlGemmWrapper {
             per_batch_events.push_back(exec_event);
         }
         return q->ext_oneapi_submit_barrier(per_batch_events);
-    }
-
-    // Pointer array batch GEMM - C[i] = alpha * A[i] * B[i] + beta * C[i]
-    // For arrays of matrix pointers (non-contiguous batches)
-    // Falls back to iterating over individual GEMM operations
-    static void gemm_batch_array(ggml_backend_sycl_context & ctx,
-                                 bool                        trans_a,
-                                 bool                        trans_b,
-                                 int                         m,
-                                 int                         n,
-                                 int                         k,
-                                 float                       alpha,
-                                 const void **               a,
-                                 dt                          at,
-                                 int                         lda,
-                                 const void **               b,
-                                 dt                          bt,
-                                 int                         ldb,
-                                 float                       beta,
-                                 void **                     c,
-                                 dt                          ct,
-                                 int                         ldc,
-                                 int                         batch_size,
-                                 const queue_ptr &           q) {
-        // For pointer arrays, we iterate and call individual GEMM operations
-        // This is less efficient than strided batch but handles non-contiguous data
-        for (int i = 0; i < batch_size; ++i) {
-            gemm_batch_strided(ctx, trans_a, trans_b, m, n, k, alpha, a[i], at, lda, 0, b[i], bt, ldb, 0, beta, c[i],
-                               ct, ldc, 0, 1, q);
-        }
-    }
-
-    // Simplified row-major batch GEMM (no transpose, alpha=1, beta=0)
-    static void row_gemm_batch(ggml_backend_sycl_context & ctx,
-                               int                         m,
-                               int                         n,
-                               int                         k,
-                               const void *                a,
-                               dt                          at,
-                               int64_t                     stride_a,
-                               const void *                b,
-                               dt                          bt,
-                               int64_t                     stride_b,
-                               void *                      c,
-                               dt                          ct,
-                               [[maybe_unused]] int64_t    stride_c,
-                               int                         batch_size,
-                               const queue_ptr &           q) {
-        // Use the existing gemm function which handles batching natively
-        gemm(ctx, m, n, k, a, at, 1, k, stride_a, b, bt, 1, k, stride_b, c, ct, q, batch_size, batch_size);
     }
 };
 

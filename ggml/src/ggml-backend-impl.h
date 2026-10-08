@@ -289,6 +289,7 @@ extern "C" {
     GGML_API void ggml_backend_test_fail_next_buffer_refresh(void);
     GGML_API void ggml_backend_test_fail_next_event_emplace(void);
     GGML_API size_t ggml_backend_test_owner_close_attempts(void);
+    GGML_API size_t ggml_backend_test_live_buffer_count(void);
     GGML_API size_t ggml_backend_test_owner_transfer_attempts(void);
     GGML_API size_t ggml_backend_test_unload_attempts(void);
     GGML_API size_t ggml_backend_test_durable_owners(ggml_backend_reg_t reg);

@@ -577,9 +577,19 @@ def test_header_declares_the_probe_struct_and_function():
                                            "ggml_backend_sycl_probe_runtime_context_for_model(")
     idx_publish_decl = GGML_SYCL_H_CODE.find("ggml_backend_sycl_set_runtime_context_for_model(\n    ggml_backend_t")
     assert idx_probe_decl != -1 and idx_publish_decl != -1
-    assert 0 < idx_probe_decl - idx_publish_decl < 2500, (
-        "the probe declaration should sit close to ggml_backend_sycl_set_runtime_context_for_model(), per the "
-        "task spec"
+    # "Next to" means adjacent by declaration order: no other exported function
+    # is declared between the publisher and the probe.  A character distance
+    # measured this and rotted every time an unrelated declaration or comment
+    # was inserted nearby.  The publisher's own GGML_BACKEND_API sits before
+    # idx_publish_decl, so the slice holds the rest of its prototype, comments,
+    # and the probe's result struct, and must hold no other export.
+    assert idx_publish_decl < idx_probe_decl, (
+        "the probe declaration must follow ggml_backend_sycl_set_runtime_context_for_model()"
+    )
+    between = GGML_SYCL_H_CODE[idx_publish_decl:idx_probe_decl]
+    assert "GGML_BACKEND_API" not in between, (
+        "the probe declaration should be the next exported declaration after "
+        "ggml_backend_sycl_set_runtime_context_for_model(), per the task spec; another export sits between them"
     )
 
 

@@ -1176,9 +1176,11 @@ void ggml_sycl_mul(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
             float *       dst_ptr  = dst.resolve_as<float>();
             auto          q        = ctx.stream();
 
-            DnnlBinaryWrapper::binary_broadcast_row(ctx, DnnlBinaryWrapper::op::MUL, src0_ptr, src1_ptr, dst_ptr, batch,
-                                                    src0.ne(0), DnnlBinaryWrapper::dt::f32, q);
-            return;
+            // A declined scratchpad wrote nothing to dst: fall through to ggml_sycl_op_mul below.
+            if (DnnlBinaryWrapper::binary_broadcast_row(ctx, DnnlBinaryWrapper::op::MUL, src0_ptr, src1_ptr, dst_ptr, batch,
+                                                        src0.ne(0), DnnlBinaryWrapper::dt::f32, q)) {
+                return;
+            }
         }
     }
 #else

@@ -120,7 +120,14 @@ def test_moe_sequence_graphlet_records_timeline_scopes_around_refresh_record_rep
     assert "ggml_op_name(node->op)" in sequence_graphlet
     assert "moe_sequence_graphlet_prepare_pointer_tables" in sequence_graphlet
     assert "moe_graph_record_moe_dispatch_graph" in sequence_graphlet
-    assert "ext_oneapi_graph(*exec_graph)" in sequence_graphlet
+    # The replay submit goes through ggml_sycl::graph_exec_submit (graph-recorder-scope.hpp), which counts the
+    # submission and then calls q.ext_oneapi_graph(exec) (cec4a5f10, zhcn C7a: graph_compute's exit must see a
+    # replay-only call as one that submitted). It replaced the bare `ext_oneapi_graph(*exec_graph)` in both arms
+    # of the replay scope; a bare call here would be a submission the counter cannot see.
+    assert "ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *exec_graph)" in sequence_graphlet
+    assert "ext_oneapi_graph(" not in sequence_graphlet
+    replay_scope = sequence_graphlet[sequence_graphlet.index('"moe_sequence_graphlet_replay"'):]
+    assert replay_scope.count("ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *exec_graph)") == 2
 
 
 if __name__ == "__main__":

@@ -70,6 +70,7 @@ enum class moe_batch_reject_reason : uint8_t {
     RECIPE_MISMATCH,
     WORKSPACE_UNDERSIZED,
     WORKSPACE_LEASE_MISSING,
+    PLAN_OWNER_REFUSED,
 };
 
 const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason);

@@ -115,7 +115,9 @@ PYTHON_LABEL_EXEMPT = {
     "mem-handle-eviction-b70-repeat-clean-exit": "runs test-mem-handle-eviction on the B70 three times; `-L python` must not touch a device",
 }
 # The audit refuses a tests/ that has lost most of its gates (a moved directory would otherwise audit nothing and PASS).
-MIN_GATES = 175
+# 190 (was 160) after the master merge into merge/combined brought the tree to 191 gates; the floor must stay within 10%
+# below the real count (min_gates_band_problem) so a lost directory of gates still fails R6.
+MIN_GATES = 190
 # The programs a registration may run a gate with: python itself, or a CMake variable that names it.
 INTERPRETER = re.compile(r"(?:.*/)?python[0-9.]*|\$\{\w*python\w*\}", re.I)
 # Test properties that make a registered gate not count: it never runs, its exit status is inverted, or its output

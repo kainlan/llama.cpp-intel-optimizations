@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """resolve_fused_ops() tells a capability gap from a placement landing (llama.cpp-pmzl).
 
-Host-only: reads src/llama-context.cpp, src/llama-fused-landing.h, ggml-sycl.cpp and ggml-sycl.h, runs no build and
-loads no model. The classifier's behaviour is test-llama-fused-landing (fake devices and tensors); this gate pins the
+Host-only: reads src/llama-context.cpp, src/llama-fused-landing.h, src/llama-fused-resolution.h, ggml-sycl.cpp and
+ggml-sycl.h, runs no build and loads no model. The classifier's behaviour is test-llama-fused-landing (fake devices and tensors); this gate pins the
 wiring around it.
 
 The defect: a fused op (flash attention, gated delta net) that the scheduler put on the CPU was always reported as
@@ -23,9 +23,11 @@ Pinned here:
     the query is supports_op minus placement and the two cannot drift apart. The predicates themselves stay pure;
   * the classifier asks that query when the backend has one, and otherwise falls back to the device supporting the
     node or a persistent host-resident operand (a host buffer whose usage is not COMPUTE);
-  * a landing the device could not have executed is logged as its own warning that carries the gap count, the layer
-    and the device name; a genuine placement landing keeps its own warning (the log's English is not pinned, its
-    format-string shape and arguments are);
+  * a landing the device could not have executed is counted apart from a placement landing, and each gets its own
+    warning: the gap one carries the gap count, the layer and the device name. resolve_fused_ops logs nothing (zhcn:
+    it records into a fused_resolution_entry_data and fused_resolution_render prints the record at the publish), so
+    the counters, layer and device are pinned where resolve_fused_ops writes the entry and the warnings where the
+    renderer builds them (the English is not pinned, the WARN level, the counter and the arguments are);
   * the enable/disable decision is untouched: a CPU landing never disables the op, a landing on a non-CPU device
     still does.
 
@@ -41,6 +43,7 @@ root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
 parser.add_argument("--context", default=str(root / "src/llama-context.cpp"))
 parser.add_argument("--landing-header", default=str(root / "src/llama-fused-landing.h"))
+parser.add_argument("--resolution-header", default=str(root / "src/llama-fused-resolution.h"))
 parser.add_argument("--backend", default=str(root / "ggml/src/ggml-sycl/ggml-sycl.cpp"))
 parser.add_argument("--sycl-header", default=str(root / "ggml/include/ggml-sycl.h"))
 parser.add_argument("--self-test", action="store_true")
@@ -232,7 +235,7 @@ def ungated_sites(body, site):
             if not any(lo <= m.start() <= hi for lo, hi in spans)]
 
 
-def evaluate(ctx, hdr, be, sh):
+def evaluate(ctx, hdr, be, sh, res):
     classifier = function_body(
         hdr, r"static\s+inline\s+bool\s+llama_fused_cpu_landing_is_placement\s*\([^)]*\)\s*\{") or ""
     resolve = function_body(ctx, r"void\s+llama_context::resolve_fused_ops\s*\([^)]*\)\s*\{") or ""
@@ -248,8 +251,11 @@ def evaluate(ctx, hdr, be, sh):
         be, r"static\s+bool\s+ggml_sycl_tensor_is_in_kv_host_buft\s*\([^)]*\)\s*\{") or ""
     planned = function_body(
         be, r"static\s+bool\s+ggml_sycl_op_is_planned_on_host\s*\([^)]*\)\s*\{") or ""
+    render = function_body(
+        res, r"inline\s+std::vector<fused_resolution_line>\s+fused_resolution_render\s*\([^)]*\)\s*\{") or ""
     flat_resolve = squash(resolve)
     flat_classifier = squash(classifier)
+    flat_render = squash(render)
 
     checks = {}
     # --- the backend side ---------------------------------------------------------------------------------------
@@ -299,26 +305,47 @@ def evaluate(ctx, hdr, be, sh):
     checks["resolve_fused_ops hands the classifier the cached query"] = bool(
         re.search(r"llama_fused_cpu_landing_is_placement\s*\(\s*device_layer\s*,\s*node\.tensor\s*,\s*capability\s*->\s*second\s*\)",
                   flat_resolve))
-    # the log's English is not pinned, its shape is: one warning per case, each counting its own landings
-    gap_warn = re.search(r"if\s*\(\s*n_cpu_gaps\s*>\s*0\s*\)\s*\{\s*LLAMA_LOG_WARN\s*\((.*?)\)\s*;\s*\}", flat_resolve)
+    # The English is not pinned, the shape is: resolve_fused_ops counts each kind of landing into its own entry field,
+    # and the renderer gives each its own WARN line, counting only its own landings.
+    split = re.search(
+        r"if\s*\(\s*llama_fused_cpu_landing_is_placement\s*\([^;{}]*\)\s*\)\s*\{\s*"
+        r"entry\.n_cpu_landings\s*\+\+\s*;\s*entry\.cpu_landing_layer\s*=\s*node\.il\s*;[^{}]*\}\s*"
+        r"else\s*\{\s*entry\.n_cpu_gaps\s*\+\+\s*;\s*entry\.cpu_gap_layer\s*=\s*node\.il\s*;\s*"
+        r"cpu_gap_dev\s*=\s*device_layer\s*;\s*\}", flat_resolve)
+    gap_dev = re.search(
+        r"entry\.cpu_gap_dev\s*=\s*cpu_gap_dev\s*\?\s*ggml_backend_dev_name\s*\(\s*cpu_gap_dev\s*\)", flat_resolve)
+    gap_warn = re.search(
+        r"if\s*\(\s*e\.n_cpu_gaps\s*>\s*0\s*\)\s*\{\s*lines\.push_back\s*\(\s*\{\s*FUSED_RESOLUTION_LEVEL_WARN\s*,"
+        r"([^;]*)\}\s*\)\s*;\s*\}", flat_render)
     gap_call = gap_warn.group(1) if gap_warn else ""
     checks["capability warning counts the gaps, names the layer and the device"] = bool(
-        gap_warn and gap_call.count("%u") == 1 and gap_call.count("%d") >= 1 and gap_call.count("%s") >= 3 and
-        re.search(r"n_cpu_gaps\s*,\s*cpu_gap_il\s*,\s*ggml_backend_dev_name\s*\(\s*cpu_gap_dev\s*\)", gap_call))
-    place_warn = re.search(r"if\s*\(\s*n_cpu_landings\s*>\s*0\s*\)\s*\{\s*LLAMA_LOG_WARN\s*\((.*?)\)\s*;\s*\}", flat_resolve)
+        split and gap_dev and gap_warn and
+        re.search(r"std::to_string\s*\(\s*e\.n_cpu_gaps\s*\)", gap_call) and
+        re.search(r"std::to_string\s*\(\s*e\.cpu_gap_layer\s*\)", gap_call) and
+        re.search(r"\be\.cpu_gap_dev\b", gap_call) and re.search(r"\be\.probe_name\b", gap_call))
+    place_warn = re.search(
+        r"if\s*\(\s*e\.n_cpu_landings\s*>\s*0\s*\)\s*\{\s*lines\.push_back\s*\(\s*\{\s*FUSED_RESOLUTION_LEVEL_WARN\s*,"
+        r"([^;]*)\}\s*\)\s*;\s*\}", flat_render)
     place_call = place_warn.group(1) if place_warn else ""
     checks["placement warning counts the placement landings and names the layer"] = bool(
-        place_warn and place_call.count("%u") == 1 and
-        re.search(r"n_cpu_landings\s*,\s*cpu_landing_il", place_call) and "n_cpu_gaps" not in place_call)
+        split and place_warn and
+        re.search(r"std::to_string\s*\(\s*e\.n_cpu_landings\s*\)", place_call) and
+        re.search(r"std::to_string\s*\(\s*e\.cpu_landing_layer\s*\)", place_call) and "n_cpu_gaps" not in place_call)
     checks["the two warnings do not share a counter"] = "n_cpu_gaps" not in place_call and "n_cpu_landings" not in gap_call
+    disabled_at = re.search(r"if\s*\(\s*!\s*e\.enabled\s*\)\s*\{", flat_render)
+    disabled_end = matching(flat_render, disabled_at.end() - 1, "{", "}") if disabled_at else -1
+    disabled = flat_render[disabled_at.end():disabled_end] if disabled_end > 0 else ""
     checks["a non-CPU mismatch still disables the op"] = bool(
-        re.search(r"device_mismatch\s*=\s*true", flat_resolve) and re.search(r"if\s*\(\s*device_mismatch\s*\)\s*\{\s*enabled\s*=\s*false", flat_resolve))
+        re.search(r"entry\.mismatch\s*=\s*true", flat_resolve) and
+        re.search(r"entry\.enabled\s*=\s*!\s*entry\.mismatch\s*;", flat_resolve) and
+        "FUSED_RESOLUTION_LEVEL_WARN" in disabled and re.search(r"return\s+lines\s*;", disabled))
     checks["a CPU landing still leaves the op enabled"] = bool(
-        re.search(r"\}\s*else\s*\{\s*enabled\s*=\s*true", flat_resolve))
+        re.search(r"entry\.enabled\s*=\s*!\s*entry\.mismatch\s*;", flat_resolve) and
+        gap_warn and place_warn and "return" not in gap_warn.group(0) + place_warn.group(0))
     return checks
 
 
-NAMES = ("ctx", "hdr", "be", "sh")
+NAMES = ("ctx", "hdr", "be", "sh", "res")
 
 
 def run(label, srcs, expect_fail=None):
@@ -345,6 +372,7 @@ sources = {
     "hdr": load(args.landing_header),
     "be": load(args.backend),
     "sh": load(args.sycl_header),
+    "res": load(args.resolution_header),
 }
 failed = run("tree", tuple(sources[k] for k in NAMES))
 
@@ -402,19 +430,25 @@ if args.self_test:
         ("capability proc not passed", "resolve_fused_ops hands the classifier the cached query",
          with_(ctx=mutate(sources["ctx"], "node.tensor, capability->second)", "node.tensor, nullptr)"))),
         ("capability warning loses the device", "capability warning counts the gaps, names the layer and the device",
-         with_(ctx=mutate(sources["ctx"], "n_cpu_gaps, cpu_gap_il, ggml_backend_dev_name(cpu_gap_dev)", "n_cpu_gaps, cpu_gap_il, \"\""))),
+         with_(res=mutate(sources["res"], "e.cpu_gap_dev + \" does not support it\"", "\" does not support it\""))),
         ("capability warning counts placement landings", "capability warning counts the gaps, names the layer and the device",
-         with_(ctx=mutate(sources["ctx"], "n_cpu_gaps, cpu_gap_il, ggml_backend_dev_name(cpu_gap_dev)", "n_cpu_landings, cpu_gap_il, ggml_backend_dev_name(cpu_gap_dev)"))),
+         with_(res=mutate(sources["res"], "std::to_string(e.n_cpu_gaps)", "std::to_string(e.n_cpu_landings)"))),
         ("capability line demoted", "capability warning counts the gaps, names the layer and the device",
-         with_(ctx=mutate(sources["ctx"], "if (n_cpu_gaps > 0) {\n                LLAMA_LOG_WARN(", "if (n_cpu_gaps > 0) {\n                LLAMA_LOG_INFO("))),
+         with_(res=mutate(sources["res"], "if (e.n_cpu_gaps > 0) {\n        lines.push_back({ FUSED_RESOLUTION_LEVEL_WARN,", "if (e.n_cpu_gaps > 0) {\n        lines.push_back({ FUSED_RESOLUTION_LEVEL_INFO,"))),
+        ("a gap counted as a placement landing", "capability warning counts the gaps, names the layer and the device",
+         with_(ctx=mutate(sources["ctx"], "entry.n_cpu_gaps++;", "entry.n_cpu_landings++;"))),
+        ("the gap device not recorded", "capability warning counts the gaps, names the layer and the device",
+         with_(ctx=mutate(sources["ctx"], "entry.cpu_gap_dev     = cpu_gap_dev ? ggml_backend_dev_name(cpu_gap_dev)", "entry.cpu_gap_dev     = cpu_gap_dev ? \"?\""))),
         ("placement warning dropped", "placement warning counts the placement landings and names the layer",
-         with_(ctx=mutate(sources["ctx"], "if (n_cpu_landings > 0) {", "if (n_cpu_landings > 1000000) {"))),
+         with_(res=mutate(sources["res"], "if (e.n_cpu_landings > 0) {", "if (e.n_cpu_landings > 1000000) {"))),
         ("placement warning counts the gaps", "the two warnings do not share a counter",
-         with_(ctx=mutate(sources["ctx"], "n_cpu_landings,\n                    cpu_landing_il", "n_cpu_gaps,\n                    cpu_landing_il"))),
+         with_(res=mutate(sources["res"], "std::to_string(e.n_cpu_landings)", "std::to_string(e.n_cpu_gaps)"))),
         ("mismatch no longer disables", "a non-CPU mismatch still disables the op",
-         with_(ctx=mutate(sources["ctx"], "if (device_mismatch) {\n            enabled = false;", "if (device_mismatch) {\n            enabled = true;"))),
+         with_(ctx=mutate(sources["ctx"], "entry.enabled         = !entry.mismatch;", "entry.enabled         = true;"))),
         ("CPU landing disables the op", "a CPU landing still leaves the op enabled",
-         with_(ctx=mutate(sources["ctx"], "} else {\n            enabled = true;", "} else {\n            enabled = n_cpu_gaps == 0;"))),
+         with_(ctx=mutate(sources["ctx"], "entry.enabled         = !entry.mismatch;", "entry.enabled         = !entry.mismatch && entry.n_cpu_gaps == 0;"))),
+        ("a gap ends the rendering before enabled", "a CPU landing still leaves the op enabled",
+         with_(res=mutate(sources["res"], "e.cpu_gap_dev + \" does not support it\" });\n    }", "e.cpu_gap_dev + \" does not support it\" });\n        return lines;\n    }"))),
     ]
     for label, expect, srcs in mutants:
         failed += run(label, srcs, expect)

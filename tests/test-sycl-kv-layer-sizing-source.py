@@ -55,6 +55,7 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 UNIFIED_CACHE_HPP = ROOT / "ggml/src/ggml-sycl/unified-cache.hpp"
+KV_RUNTIME_DEMOTION_HPP = ROOT / "ggml/src/ggml-sycl/kv-runtime-demotion.hpp"
 UNIFIED_CACHE_CPP = ROOT / "ggml/src/ggml-sycl/unified-cache.cpp"
 GGML_SYCL_CPP = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 MEM_HANDLE_CPP = ROOT / "ggml/src/ggml-sycl/mem-handle.cpp"
@@ -62,6 +63,10 @@ LLAMA_MODEL_CPP = ROOT / "src/llama-model.cpp"
 LLAMA_CONTEXT_CPP = ROOT / "src/llama-context.cpp"
 
 KV_LAYER_BYTES_FOR_KIND = "kv_layer_bytes_for_kind"
+# The cell arithmetic, factored out of kv_layer_bytes_for_kind so the load-time
+# estimate and the region fit's slots share it (llama.cpp-moua).
+KV_LAYER_CELLS = "kv_layer_cells"
+KV_LAYER_TENSOR_BYTES = "kv_layer_tensor_bytes"
 # The actual shared transaction body -- ggml_backend_sycl_set_runtime_context_
 # for_model() (the public entry point) and the probe path both call into this
 # one function; it is where next_kv_info/next_plan are built and consumed.
@@ -123,10 +128,12 @@ def function_or_none(text: str, signature: str) -> str | None:
     return function(text, signature)
 
 
-def kv_layer_bytes_for_kind_violations(source: str) -> list[str]:
-    body = function_or_none(source, "inline size_t " + KV_LAYER_BYTES_FOR_KIND)
+def kv_layer_cells_violations(source: str) -> list[str]:
+    """The SWA/FULL cell arithmetic, in kv-runtime-demotion.hpp."""
+    body = function_or_none(source, "inline size_t " + KV_LAYER_CELLS)
     if body is None:
-        return [f"{KV_LAYER_BYTES_FOR_KIND} is missing"]
+        return [f"{KV_LAYER_CELLS} is missing"]
+    params = function_signature_params(source, "inline size_t " + KV_LAYER_CELLS)
 
     found: list[str] = []
 
@@ -136,14 +143,13 @@ def kv_layer_bytes_for_kind_violations(source: str) -> list[str]:
         found.append("does not derive seqs from n_seq_max (with a >0 guard)")
 
     # Bug 2: the three-way switch, SHARED charged 0.
-    if not re.search(r"kind\s*==\s*GGML_SYCL_KV_LAYER_SHARED\s*\)\s*\{\s*return\s+0\s*;", body):
+    if not re.search(r"kind\s*==\s*KV_CELLS_SHARED\s*\)\s*\{\s*return\s+0\s*;", body):
         found.append("does not return 0 for a SHARED layer")
-    if "GGML_SYCL_KV_LAYER_SWA" not in body:
-        found.append("does not branch on GGML_SYCL_KV_LAYER_SWA")
+    if "KV_CELLS_SWA" not in body:
+        found.append("does not branch on KV_CELLS_SWA")
 
     # Bug 3: the kv_unified two-mode split.
-    if not re.search(r"bool\s+kv_unified\b",
-                     function_signature_params(source, "inline size_t " + KV_LAYER_BYTES_FOR_KIND)):
+    if not re.search(r"bool\s+kv_unified\b", params):
         found.append("has no bool kv_unified parameter")
     if not re.search(r"if\s*\(\s*kv_unified\s*\)\s*\{", body):
         found.append("does not branch on kv_unified")
@@ -151,10 +157,14 @@ def kv_layer_bytes_for_kind_violations(source: str) -> list[str]:
     if not re.search(r"n_ctx_seq\s*=\s*n_ctx\s*;\s*\n\s*n_stream\s*=\s*1\s*;\s*\n\s*window_seqs\s*=\s*seqs\s*;", body):
         found.append("kv_unified==true branch does not set n_ctx_seq=n_ctx, n_stream=1, window_seqs=seqs")
     # Non-unified mode: n_seq_max independent streams, each windowed at 1 sequence.
-    if not re.search(r"n_ctx_seq\s*=\s*GGML_PAD\(n_ctx\s*/\s*seqs,\s*256\)", body):
-        found.append("kv_unified==false branch does not derive n_ctx_seq = GGML_PAD(n_ctx / seqs, 256)")
+    if not re.search(r"n_ctx_seq\s*=\s*pad256\(n_ctx\s*/\s*seqs\)", body):
+        found.append("kv_unified==false branch does not derive n_ctx_seq = pad256(n_ctx / seqs)")
     if not re.search(r"n_stream\s*=\s*seqs\s*;\s*\n\s*window_seqs\s*=\s*1\s*;", body):
         found.append("kv_unified==false branch does not set n_stream=seqs, window_seqs=1")
+    # The 256-cell padding is the one thing llama pads cells to (GGML_PAD(x, 256));
+    # kv-runtime-demotion.hpp spells it as a lambda so it needs no ggml header.
+    if not re.search(r"pad256\s*=\s*\[\]\(uint32_t\s+x\)\s*\{\s*return\s*\(x\s*\+\s*255u\)\s*&\s*~255u\s*;", body):
+        found.append("pad256 is not (x + 255u) & ~255u")
     # The per-stream cap and the stream multiplication must both survive
     # into the final formula, in EITHER mode.
     if not re.search(r"n_swa\s*\*\s*window_seqs\s*\+\s*n_ubatch", body):
@@ -166,12 +176,66 @@ def kv_layer_bytes_for_kind_violations(source: str) -> list[str]:
     # consulted before the windowed SWA formula -- with swa_full llama
     # allocates an SWA layer at size_base (n_ctx_seq per stream), so the
     # windowed arithmetic above must not run for it.
-    if not re.search(r"bool\s+swa_full\b",
-                     function_signature_params(source, "inline size_t " + KV_LAYER_BYTES_FOR_KIND)):
+    if not re.search(r"bool\s+swa_full\b", params):
         found.append("has no bool swa_full parameter")
-    if not re.search(r"kind\s*==\s*GGML_SYCL_KV_LAYER_SWA\s*&&\s*!\s*swa_full", body):
+    if not re.search(r"kind\s*==\s*KV_CELLS_SWA\s*&&\s*!\s*swa_full", body):
         found.append("does not branch on swa_full")
 
+    return found
+
+
+def kv_layer_bytes_for_kind_violations(source: str) -> list[str]:
+    """kv_layer_bytes_for_kind() must take its cells from kv_layer_cells() and
+    its bytes from kv_layer_tensor_bytes(), forwarding every shape input: the
+    one byte function the region fit sizes a slot with, so the load-time
+    estimate cannot drift from it (llama.cpp-moua)."""
+    signature = "inline size_t " + KV_LAYER_BYTES_FOR_KIND
+    body = function_or_none(source, signature)
+    if body is None:
+        return [f"{KV_LAYER_BYTES_FOR_KIND} is missing"]
+    params = function_signature_params(source, signature)
+
+    found: list[str] = []
+    for param in ("kv_unified", "swa_full"):
+        if not re.search(r"bool\s+" + param + r"\b", params):
+            found.append(f"has no bool {param} parameter")
+    call = re.search(re.escape(KV_LAYER_CELLS) + r"\(\s*kind\s*,[^;]*\)", body, re.S)
+    if call is None:
+        found.append(f"does not take its cell count from {KV_LAYER_CELLS}")
+    else:
+        for arg in ("n_ctx", "n_ubatch", "n_seq_max", "kv_unified", "swa_full", "n_swa"):
+            if not re.search(r"\b" + arg + r"\b", call.group(0)):
+                found.append(f"does not forward {arg} to {KV_LAYER_CELLS}")
+    # The two flags are consumed positionally by kv_layer_cells and by every
+    # caller, so their order is part of the contract, not just their presence.
+    if not re.search(r"bool\s+kv_unified\s*,\s*bool\s+swa_full\s*\)", params):
+        found.append("does not take kv_unified then swa_full, in that order")
+    if call is not None and not re.search(
+            r"\(\s*kind\s*,\s*n_ctx\s*,\s*n_ubatch\s*,\s*n_seq_max\s*,\s*kv_unified\s*,\s*swa_full\s*,\s*n_swa\s*\)",
+            call.group(0)):
+        found.append(f"does not pass {KV_LAYER_CELLS} its arguments in positional order")
+    if KV_LAYER_TENSOR_BYTES + "(" not in body:
+        found.append(f"does not size through {KV_LAYER_TENSOR_BYTES}")
+    else:
+        # The load-time estimate is the f16, unpadded shape over exactly the
+        # cells kv_layer_cells returned: pin each argument of the byte call.
+        sized = re.search(re.escape(KV_LAYER_TENSOR_BYTES) + r"\(([^\[]*)", body)
+        args = [re.sub(r"/\*.*?\*/", "", a).strip() for a in sized.group(1).split(",")] if sized else []
+        if len(args) < 5:
+            found.append(f"calls {KV_LAYER_TENSOR_BYTES} with too few arguments to check")
+        else:
+            if args[0] != "layer":
+                found.append(f"does not size the layer descriptor through {KV_LAYER_TENSOR_BYTES}")
+            if args[1] != "GGML_TYPE_F16" or args[2] != "GGML_TYPE_F16":
+                found.append(f"does not size an f16 K and V through {KV_LAYER_TENSOR_BYTES}")
+            if args[3] != "cells":
+                found.append(f"does not pass kv_layer_cells' cells to {KV_LAYER_TENSOR_BYTES}")
+            if args[4] != "1":
+                found.append("does not size unpadded: pad_to is not 1")
+    if not re.search(r"n_embd_k_gqa\s*=\s*k_width\s*;", body) or not re.search(r"n_embd_v_gqa\s*=\s*v_width\s*;", body):
+        found.append("does not map k_width to n_embd_k_gqa and v_width to n_embd_v_gqa")
+    if "window_seqs" in body or "GGML_PAD" in body:
+        found.append("carries a second copy of the cell arithmetic")
     return found
 
 
@@ -326,8 +390,8 @@ def llama_context_swa_full_violations(source: str) -> list[str]:
     # search to one statement so a later call cannot satisfy an earlier one.
     for fn in ("runtime_context_fn", "probe_fn"):
         calls = re.findall(fn + r"\([^;]*?\)\s*;", source)
-        if len(calls) < 2:
-            found.append(f"expected at least two {fn}(...) call sites, found {len(calls)}")
+        if len(calls) < 1:
+            found.append(f"expected at least one {fn}(...) call site, found {len(calls)}")
         for call in calls:
             if "cparams.swa_full" not in call:
                 found.append(f"cparams.swa_full is not forwarded to {fn}")
@@ -346,7 +410,11 @@ def stale_comment_violations(hpp_source: str, cpp_source: str) -> list[str]:
     return found
 
 
-def test_kv_layer_bytes_for_kind_consumes_n_seq_max_and_kv_unified() -> None:
+def test_kv_layer_cells_consumes_n_seq_max_and_kv_unified() -> None:
+    assert kv_layer_cells_violations(KV_RUNTIME_DEMOTION_HPP.read_text()) == []
+
+
+def test_kv_layer_bytes_for_kind_takes_the_one_byte_function() -> None:
     assert kv_layer_bytes_for_kind_violations(UNIFIED_CACHE_HPP.read_text()) == []
 
 
@@ -391,16 +459,16 @@ def _assert_witnessed(original: str, mutated: str, checker, expected_substring: 
 
 
 def test_mutation_seqs_hardcoded_to_1_is_witnessed() -> None:
-    hpp = UNIFIED_CACHE_HPP.read_text()
+    hpp = KV_RUNTIME_DEMOTION_HPP.read_text()
     mutated = hpp.replace("const uint32_t seqs = n_seq_max > 0 ? n_seq_max : 1;", "const uint32_t seqs = 1;", 1)
-    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not derive seqs from n_seq_max",
+    _assert_witnessed(hpp, mutated, kv_layer_cells_violations, "does not derive seqs from n_seq_max",
                       "seqs hardcoded to 1")
 
 
 def test_mutation_shared_arm_dropped_is_witnessed() -> None:
-    hpp = UNIFIED_CACHE_HPP.read_text()
-    mutated = re.sub(r"if \(kind == GGML_SYCL_KV_LAYER_SHARED\) \{\s*\n\s*return 0;\s*\n\s*\}\s*\n", "", hpp, count=1)
-    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not return 0 for a SHARED layer",
+    hpp = KV_RUNTIME_DEMOTION_HPP.read_text()
+    mutated = re.sub(r"if \(kind == KV_CELLS_SHARED\) \{\s*\n\s*return 0;\s*\n\s*\}\s*\n", "", hpp, count=1)
+    _assert_witnessed(hpp, mutated, kv_layer_cells_violations, "does not return 0 for a SHARED layer",
                       "SHARED arm dropped")
 
 
@@ -417,6 +485,11 @@ def test_mutation_kv_unified_param_renamed_is_witnessed() -> None:
     assert n == 1, "kv_unified parameter pattern did not match the current source"
     _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "has no bool kv_unified parameter",
                       "kv_unified parameter renamed away")
+    cells = KV_RUNTIME_DEMOTION_HPP.read_text()
+    mutated, n = re.subn(r"(bool\s+)kv_unified,", r"\1kv_unified_flag,", cells, count=1)
+    assert n == 1, "kv_unified parameter pattern did not match kv_layer_cells"
+    _assert_witnessed(cells, mutated, kv_layer_cells_violations, "has no bool kv_unified parameter",
+                      "kv_layer_cells kv_unified parameter renamed away")
 
 
 def test_mutation_swa_full_param_renamed_is_witnessed() -> None:
@@ -425,21 +498,25 @@ def test_mutation_swa_full_param_renamed_is_witnessed() -> None:
     assert n == 1, "swa_full parameter pattern did not match the current source"
     _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "has no bool swa_full parameter",
                       "swa_full parameter renamed away")
+    cells = KV_RUNTIME_DEMOTION_HPP.read_text()
+    mutated, n = re.subn(r"(bool\s+)swa_full,", r"\1swa_full_flag,", cells, count=1)
+    assert n == 1, "swa_full parameter pattern did not match kv_layer_cells"
+    _assert_witnessed(cells, mutated, kv_layer_cells_violations, "has no bool swa_full parameter",
+                      "kv_layer_cells swa_full parameter renamed away")
 
 
 def test_mutation_swa_full_branch_dropped_is_witnessed() -> None:
-    hpp = UNIFIED_CACHE_HPP.read_text()
+    hpp = KV_RUNTIME_DEMOTION_HPP.read_text()
     # Back to "size by the window regardless of swa_full" -- the exact
     # llama.cpp-uajm defect.
-    mutated, n = re.subn(r"kind == GGML_SYCL_KV_LAYER_SWA && !swa_full", "kind == GGML_SYCL_KV_LAYER_SWA", hpp,
-                         count=1)
+    mutated, n = re.subn(r"kind == KV_CELLS_SWA && !swa_full", "kind == KV_CELLS_SWA", hpp, count=1)
     assert n == 1, "swa_full branch pattern did not match the current source"
-    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not branch on swa_full",
+    _assert_witnessed(hpp, mutated, kv_layer_cells_violations, "does not branch on swa_full",
                       "swa_full branch dropped")
 
 
 def test_mutation_kv_unified_branch_dropped_is_witnessed() -> None:
-    hpp = UNIFIED_CACHE_HPP.read_text()
+    hpp = KV_RUNTIME_DEMOTION_HPP.read_text()
     # Collapse the two-mode split to the (kv_unified==true) formula
     # unconditionally -- the exact Bug 3 shape (assumes a single shared
     # stream regardless of the caller's real kv_unified). Skips any
@@ -461,8 +538,65 @@ def test_mutation_kv_unified_branch_dropped_is_witnessed() -> None:
         "        } else if (false) {",
         hpp, count=1)
     assert n == 1, "kv_unified branch pattern did not match the current source"
-    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations,
+    _assert_witnessed(hpp, mutated, kv_layer_cells_violations,
                       "does not branch on kv_unified", "kv_unified branch collapsed")
+
+
+def test_mutation_kv_layer_bytes_for_kind_stops_taking_cells_from_the_one_function_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace("kv_layer_cells(kind, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full, n_swa)", "n_ctx", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not take its cell count from",
+                      "cells no longer from kv_layer_cells")
+
+
+def test_mutation_kv_layer_bytes_for_kind_stops_forwarding_swa_full_to_the_cells_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace("kv_unified, swa_full, n_swa)", "kv_unified, false, n_swa)", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not forward swa_full to",
+                      "swa_full no longer forwarded to kv_layer_cells")
+
+
+def test_mutation_kv_layer_bytes_for_kind_stops_sizing_through_the_one_function_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace("return kv_layer_tensor_bytes(", "return legacy_tensor_bytes(", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not size through",
+                      "bytes no longer from kv_layer_tensor_bytes")
+
+
+def test_mutation_kv_layer_bytes_for_kind_swaps_cells_and_pad_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace("GGML_TYPE_F16, cells, /*pad_to=*/1", "GGML_TYPE_F16, n_ctx, /*pad_to=*/1", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not pass kv_layer_cells' cells to",
+                      "the byte call no longer gets kv_layer_cells' cells")
+    mutated = hpp.replace("cells, /*pad_to=*/1", "cells, /*pad_to=*/256", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "pad_to is not 1",
+                      "the load-time estimate padded")
+    mutated = hpp.replace("layer, GGML_TYPE_F16, GGML_TYPE_F16, cells", "layer, GGML_TYPE_Q8_0, GGML_TYPE_F16, cells", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not size an f16 K and V",
+                      "the load-time estimate no longer f16")
+
+
+def test_mutation_kv_layer_bytes_for_kind_swaps_the_two_flags_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated, n = re.subn(r"bool(\s+)kv_unified,(\s*)bool(\s+)swa_full\)", r"bool\1swa_full,\2bool\3kv_unified)", hpp, count=1)
+    assert n == 1, "flag parameter pair pattern did not match the current source"
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "in that order", "parameter flags swapped")
+    mutated = hpp.replace("kv_unified, swa_full, n_swa)", "swa_full, kv_unified, n_swa)", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "in positional order",
+                      "call flags swapped")
+
+
+def test_mutation_pad256_changed_is_witnessed() -> None:
+    hpp = KV_RUNTIME_DEMOTION_HPP.read_text()
+    mutated = hpp.replace("return (x + 255u) & ~255u;", "return (x + 256u) & ~255u;", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_cells_violations, "pad256 is not", "pad256 constant changed")
+
+
+def test_mutation_kv_layer_bytes_for_kind_grows_a_second_cell_formula_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace("    kv_layer_desc layer;", "    const uint32_t window_seqs = 1;\n    kv_layer_desc layer;", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "second copy of the cell arithmetic",
+                      "a second cell formula")
 
 
 def test_mutation_kv_bytes_for_layer_stops_forwarding_kv_unified_is_witnessed() -> None:
@@ -713,7 +847,12 @@ def runtime_kv_admission_violations(source: str) -> list[str]:
         found.append("the re-fit trigger does not receive ctx->runtime_kv_admitted")
 
     sets = [m.start() for m in re.finditer(r"runtime_kv_admitted\s*=\s*true\s*;", strip_comments(source))]
-    tail = re.search(r"ctx->runtime_kv_admitted\s*=\s*true\s*;\s*return\s+ggml_sycl_txn_result::ACCEPTED\s*;\s*}\s*$",
+    # moua L4: the publish tail drops the context's earlier published section after the flag and before the
+    # return. The plan is already live there and the drop cannot refuse the transaction (a failed drop reaches the
+    # caller as EFFECT_FAILED), so it is the one statement allowed between the flag and the return.
+    tail = re.search(r"ctx->runtime_kv_admitted\s*=\s*true\s*;\s*"
+                     r"(?:ggml_sycl_published_section_set\(\s*ctx\s*,\s*nullptr\s*\)\s*;\s*)?"
+                     r"return\s+ggml_sycl_txn_result::ACCEPTED\s*;\s*}\s*$",
                      code)
     if not sets:
         found.append("runtime_kv_admitted is never set true")
@@ -853,7 +992,7 @@ KV_CAPACITY_SIGNATURE = "static size_t ggml_sycl_kv_capacity_live"
 TRY_DEMOTE_SIGNATURE = "static bool ggml_sycl_try_demote_runtime_kv"
 CTX_HINT_SIGNATURE = "static std::string ggml_sycl_all_vram_ctx_hint"
 LLAMA_CONTEXT_CTOR_SIGNATURE = "llama_context::llama_context("
-RESYNC_SIGNATURE = "void llama_context::sycl_resync_runtime_context_flash_attn()"
+RESYNC_SIGNATURE = "sched_reserve_result llama_context::sycl_publish_runtime_context(bool flash_attn)"
 PLAN_OWNED_BLOCK = "if (kv_plan && kv_geometry.valid()) {"
 MODE_IS_GLOBAL_SIGNATURE = "bool unified_cache_mode_is_global()"
 ANNOUNCE_LAMBDA = "auto announce_kv_host_demotions = [&](const ggml_sycl::placement_plan & final_plan) {"
@@ -1475,8 +1614,8 @@ def test_mutation_publish_after_kv_allocation_is_witnessed() -> None:
     ctor = function(ctx, LLAMA_CONTEXT_CTOR_SIGNATURE)
     first = ctor.index("        sycl_resync_runtime_context_flash_attn();\n")
     moved = ctor[:first] + ctor[first + len("        sycl_resync_runtime_context_flash_attn();\n"):]
-    at = moved.index("        memory.reset(model.create_memory(params_mem, cparams));\n")
-    at += len("        memory.reset(model.create_memory(params_mem, cparams));\n")
+    at = moved.index("        memory.reset(model.create_memory(params_mem, cparams, measure_only));\n")
+    at += len("        memory.reset(model.create_memory(params_mem, cparams, measure_only));\n")
     moved = moved[:at] + "        sycl_resync_runtime_context_flash_attn();\n" + moved[at:]
     _assert_witnessed(ctx, ctx.replace(ctor, moved, 1), kv_publish_order_violations,
                       "a backend's first publish can run after the context's KV is allocated",
@@ -1729,7 +1868,14 @@ def optional_layout_release_violations(sycl_cpp: str, cache_cpp: str) -> list[st
 
     compute = strip_comments(function(sycl_cpp, GRAPH_COMPUTE_SIGNATURE))
     clear = compute.find('sycl_exec_graph_clear_active(sycl_ctx, "optional-layouts-retired");')
-    replay = compute.find("ext_oneapi_graph(")
+    # Every replay goes through ggml_sycl::graph_exec_submit since zhcn C7a (cec4a5f10), which counts and then calls
+    # ext_oneapi_graph; the bare call no longer appears in graph compute, so a search for it alone found nothing
+    # and let the ordering check below pass for any order. Look for either spelling, and refuse to pass when
+    # neither is there, so a further rename cannot make this vacuous again.
+    replays = [m.start() for m in re.finditer(r"graph_exec_submit\(|ext_oneapi_graph\(", compute)]
+    if not replays:
+        found.append("graph compute has no replay submit to order against the drop of recorded graphs")
+    replay = replays[0] if replays else -1
     if clear < 0 or (replay >= 0 and replay < clear):
         found.append("graph compute can replay before dropping graphs recorded before a yield")
 
@@ -1786,6 +1932,27 @@ def test_mutation_yield_keeps_graphs_is_witnessed() -> None:
 def test_mutation_graphs_not_dropped_is_witnessed() -> None:
     _release_sycl_mutation('sycl_exec_graph_clear_active(sycl_ctx, "optional-layouts-retired");', "(void) 0;",
                            "replay before dropping graphs", "epoch check dropped")
+
+
+def test_mutation_graphs_dropped_after_the_replay_is_witnessed() -> None:
+    # The order half of the check: the drop is still there but sits after the first replay submit.
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    clear = 'sycl_exec_graph_clear_active(sycl_ctx, "optional-layouts-retired");'
+    submit = "ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *(sycl_ctx->exec_graph));"
+    start = cpp.index(GRAPH_COMPUTE_SIGNATURE)
+    head, tail = cpp[:start], cpp[start:]
+    assert clear in tail and submit in tail
+    tail = tail.replace(clear, "(void) 0;", 1).replace(submit, submit + "\n" + clear, 1)
+    _assert_witnessed(cpp, head + tail, lambda c: optional_layout_release_violations(c, cache),
+                      "replay before dropping graphs", "drop moved after the replay")
+
+
+def test_mutation_graph_compute_without_replay_is_not_vacuous() -> None:
+    cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
+    start = cpp.index(GRAPH_COMPUTE_SIGNATURE)
+    tail = re.sub(r"ggml_sycl::graph_exec_submit\(|\.ext_oneapi_graph\(|->ext_oneapi_graph\(", "renamed_submit(", cpp[start:])
+    _assert_witnessed(cpp, cpp[:start] + tail, lambda c: optional_layout_release_violations(c, cache),
+                      "no replay submit", "replay spelling renamed away")
 
 
 def test_mutation_free_gated_on_write_event_is_witnessed() -> None:
@@ -2227,8 +2394,8 @@ STRICT_SWITCH_SUFFIXES = {".c", ".cpp", ".h", ".hpp"}
 # Assembled, so a grep of the tree finds the one real reader and no mention of
 # the retired switch. The quoted name, closing quote included, appears only
 # where the variable is read: every message that names it says "=1".
-STRICT_LEASES_LITERAL = '"GGML_SYCL_STRICT_' + 'LEASES"'
-RETIRED_STRICT_SWITCH = "GGML_SYCL_STRICT_" + "PLAN"
+STRICT_LEASES_LITERAL = '"GGML_SYCL_' + 'STRICT_LEASES"'
+RETIRED_STRICT_SWITCH = "GGML_SYCL_" + "STRICT_PLAN"
 STRICT_ACCESSOR = "ggml_sycl_strict_enabled"
 STRICT_ACCESSOR_USE = re.compile(r"(?:::)?(?:ggml_sycl::)?\bggml_sycl_strict_enabled\s*\(\s*\)")
 STRICT_CACHE_CPP = "ggml/src/ggml-sycl/unified-cache.cpp"

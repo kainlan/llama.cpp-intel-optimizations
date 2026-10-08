@@ -864,6 +864,13 @@ mem_handle detail::from_legacy_owned_alloc(alloc_handle && handle, ggml_layout_m
     return promotion ? mem_handle::from_owned_alloc(std::move(promotion.owner), layout) : mem_handle{};
 }
 
+uint32_t mem_handle::owner_use_count() const noexcept {
+    // Taken for the reason owns_allocation() takes it: copy- and move-assignment replace
+    // owned_alloc_ under lock_, so an unlocked read would race an assignment into this object.
+    mem_handle_lock_guard g(lock_);
+    return owned_alloc_.use_count();
+}
+
 mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {
     // An ownerless DIRECT may derive a view only when its creator explicitly
     // minted a finite extent. This is bounded address authority, not lifetime
@@ -1483,6 +1490,30 @@ release_attempt mem_handle::reset_owned_allocation() noexcept {
 
 bool mem_handle::has_stable_owner_identity() const {
     return is_weight() || is_arena() || kind_ == mem_handle_kind::CHUNK_LEASE || static_cast<bool>(owned_alloc_);
+}
+
+mem_handle_identity mem_handle::identity() const {
+    mem_handle_lock_guard g(lock_);
+    mem_handle_identity   id;
+    // A weight's canonical id stays 0 (cache WEIGHT constructors do not
+    // populate it), so a weight is "no identity" rather than a key-derived one.
+    id.allocation_id = canonical_allocation_id_;
+    id.generation    = canonical_generation_;
+    id.slice_offset  = offset_;
+    id.size          = size_;
+    if (id.allocation_id == 0) {
+        return mem_handle_identity{};
+    }
+    return id;
+}
+
+bool mem_handle::identity_equal(const mem_handle_identity & id) const {
+    return id == identity();
+}
+
+const char * mem_handle::tenant_cohort() const {
+    mem_handle_lock_guard g(lock_);
+    return owned_alloc_ ? owned_alloc_.tenant_cohort() : nullptr;
 }
 
 void mem_handle::set_debug_owner(const char * owner_tag) {

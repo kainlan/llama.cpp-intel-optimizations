@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Audit mutable SYCL cache/MMID/streaming seams and ordinary artifact payload."""
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -24,12 +25,53 @@ checks = {
         "GGML_SYCL_MEM_FILL_TEST_CHECK",
         "mem_fill_set_profile_error_after_submit_for_test",
     ),
+    # llama.cpp-23mk S3-3: the scratchpad decline seam. The hook and the three test accessors are defined behind the guard
+    # and the hook compiles to a constexpr false without it; the guard is what keeps them out of the ordinary artifact.
+    "common.cpp": (
+        "#if defined(GGML_SYCL_PRIVATE_TESTING)\nbool ggml_sycl_scratchpad_site_hook(",
+        "ggml_sycl_test_inject_scratchpad_decline",
+    ),
+    "common.hpp": (
+        "#if defined(GGML_SYCL_PRIVATE_TESTING)\nbool ggml_sycl_scratchpad_site_hook(",
+        "constexpr bool ggml_sycl_scratchpad_site_hook(",
+    ),
 }
 for name, needles in checks.items():
     text = (SYCL / name).read_text(encoding="utf-8")
     missing = [needle for needle in needles if needle not in text]
     if missing:
         raise SystemExit(f"{name}: missing private seam contract: {missing}")
+
+# The needles above say the guard exists somewhere in the file. These say each seam definition or declaration sits inside one:
+# the nearest `#if defined(GGML_SYCL_PRIVATE_TESTING)` before it opens a region with no other preprocessor line before the
+# target, so a seam moved outside its guard (or a guard closed early) fails here.
+GUARD = "#if defined(GGML_SYCL_PRIVATE_TESTING)"
+guarded = {
+    SYCL / "common.cpp": (
+        "bool ggml_sycl_scratchpad_site_hook(",
+        "GGML_BACKEND_API bool ggml_sycl_test_inject_scratchpad_decline",
+        "GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset",
+        "GGML_BACKEND_API bool ggml_sycl_test_scratchpad_site_counts",
+    ),
+    SYCL / "common.hpp": ("bool ggml_sycl_scratchpad_site_hook(ggml_sycl_scratchpad_site site);",),
+    ROOT / "ggml/include/ggml-sycl.h": (
+        "GGML_BACKEND_API bool ggml_sycl_test_inject_scratchpad_decline",
+        "GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset",
+        "GGML_BACKEND_API bool ggml_sycl_test_scratchpad_site_counts",
+    ),
+}
+for path, targets in guarded.items():
+    text = path.read_text(encoding="utf-8")
+    for target in targets:
+        # Every occurrence, not the first: a second, unguarded definition appended to the file must fail too.
+        found = [m.start() for m in re.finditer(re.escape(target), text)]
+        if not found:
+            raise SystemExit(f"{path.name}: seam `{target}` not found")
+        for at in found:
+            opened = text.rfind(GUARD, 0, at)
+            if opened < 0 or re.search(r"^\s*#\s*(?:if|ifdef|ifndef|elif|else|endif)\b", text[opened + len(GUARD):at], re.M):
+                line = text.count("\n", 0, at) + 1
+                raise SystemExit(f"{path.name}:{line}: seam `{target}` is not directly inside a `{GUARD}` region")
 
 if len(sys.argv) > 1:
     artifact = Path(sys.argv[1])
@@ -47,6 +89,10 @@ if len(sys.argv) > 1:
         "unified_cache_fail_expert_allocation_after_for_test",
         "mem_fill_set_profile_error_after_submit_for_test",
         "ggml_backend_sycl_test_allocate_predictor_scores",
+        "ggml_sycl_test_inject_scratchpad_decline",
+        "ggml_sycl_test_scratchpad_sites_reset",
+        "ggml_sycl_test_scratchpad_site_counts",
+        "ggml_sycl_scratchpad_site_hook",
     )
     leaked = [name for name in forbidden_symbols if name in nm]
     if leaked:

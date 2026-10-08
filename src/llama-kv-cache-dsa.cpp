@@ -151,6 +151,10 @@ llama_memory_context_ptr llama_kv_cache_dsa::init_full() {
     return std::make_unique<llama_kv_cache_dsa_context>(this);
 }
 
+llama_memory_context_ptr llama_kv_cache_dsa::init_reserve(uint32_t n_streams) {
+    return std::make_unique<llama_kv_cache_dsa_context>(this, n_streams);
+}
+
 llama_memory_context_ptr llama_kv_cache_dsa::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_kv_cache_dsa_context>(this, lctx, optimize);
 }
@@ -159,6 +163,15 @@ bool llama_kv_cache_dsa::get_can_shift() const {
     return kv_mla->get_can_shift() &&
            kv_lid->get_can_shift() &&
            kv_mla->get_size() == kv_lid->get_size();
+}
+
+void llama_kv_cache_dsa::get_shift_caches(std::vector<const llama_kv_cache *> & caches) const {
+    if (!get_can_shift()) {
+        return;
+    }
+
+    kv_mla->get_shift_caches(caches);
+    kv_lid->get_shift_caches(caches);
 }
 
 void llama_kv_cache_dsa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
@@ -197,6 +210,14 @@ llama_kv_cache_dsa_context::llama_kv_cache_dsa_context(
         llama_kv_cache_dsa * kv) :
     ctx_mla(kv->get_mla()->init_full()),
     ctx_lid(kv->get_lid()->init_full()),
+    status(llama_memory_status_combine(ctx_mla->get_status(), ctx_lid->get_status())) {
+}
+
+llama_kv_cache_dsa_context::llama_kv_cache_dsa_context(
+        llama_kv_cache_dsa * kv,
+        uint32_t n_streams) :
+    ctx_mla(kv->get_mla()->init_reserve(n_streams)),
+    ctx_lid(kv->get_lid()->init_reserve(n_streams)),
     status(llama_memory_status_combine(ctx_mla->get_status(), ctx_lid->get_status())) {
 }
 

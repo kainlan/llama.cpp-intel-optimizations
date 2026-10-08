@@ -266,8 +266,13 @@ def evaluate(backend, common, memo_hdr):
 
     # --- (a) a view of an INPUT is that input -------------------------------------------------
     results["the INPUT test walks view_src"] = "view_src" in is_input and "GGML_TENSOR_FLAG_INPUT" in is_input
-    results["pre-stage asks the view-aware INPUT test"] = "graph_tensor_is_input(" in prestage
-    results["pre-stage has no flag-only INPUT test left"] = "flags & GGML_TENSOR_FLAG_INPUT" not in prestage
+    # Pre-stage decides INPUT through the shared classifier (llama.cpp-zhcn's prestage predicate), which asks the
+    # view-aware test; the flag-only test must be gone from both.
+    classify = function_body(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{") or ""
+    results["pre-stage asks the view-aware INPUT test"] = \
+        "ggml_sycl_prestage_classify(" in prestage and "graph_tensor_is_input(tensor)" in classify
+    results["pre-stage has no flag-only INPUT test left"] = \
+        "flags & GGML_TENSOR_FLAG_INPUT" not in prestage and "flags & GGML_TENSOR_FLAG_INPUT" not in classify
     results["refresh discovery asks the view-aware INPUT test"] = "graph_tensor_is_input(" in refresh
     results["refresh discovery has no flag-only INPUT test left"] = "flags & GGML_TENSOR_FLAG_INPUT" not in refresh
     # A zero-byte tensor has nothing to stage; reporting it as a failure is what made fail-closed unusable.
@@ -475,12 +480,20 @@ def evaluate(backend, common, memo_hdr):
         stage_fn.find("ggml_sycl_submit_marker<graph_input_staging_retire_marker>(q)") < stage_fn.find("retain_handles_until_event")
     # One fact, one source, and the only mutation sites: the swap itself publishes and retains; nothing else resets,
     # erases or releases an entry, and the swap waits on nothing (retention is by event, not by host wait).
+    # llama.cpp-zhcn adds the one other erase: an eager graph_compute exit drops the entries that are tenant slices
+    # (tenant_cohort() != nullptr), whose release is the tenant claim's event-chained one; a recording or replaying
+    # call keeps them, so no erase can free a buffer a replay still reads. Exactly that one site, nothing broader.
+    release_fn = function_body(common, r"size_t graph_input_staging_release_tenants\(\)\s*\{") or ""
+    tenant_release_only_erase = \
+        len(re.findall(r"graph_input_staging\.erase\(", common)) == 1 and \
+        len(re.findall(r"graph_input_staging\.erase\(", release_fn)) == 1 and \
+        re.search(r"if\s*\(\s*it->second\.handle\.tenant_cohort\(\)\s*!=\s*nullptr\s*\)\s*\{\s*it\s*=\s*graph_input_staging\.erase\(it\);", release_fn) is not None
     results["the staging map's only mutation sites are the swap and the clear, and the swap waits on nothing"] = \
         len(re.findall(r"\.handle\s*=[^=]", stage_fn)) == 1 and \
         len(re.findall(r"graph_input_staging_swapped\s*=\s*true", stage_fn)) == 1 and \
         re.search(r"\.wait\(|wait_and_throw|trace_queue_wait|sycl::event\s*\{\s*\}", stage_fn) is None and \
         len(re.findall(r"graph_input_staging\.clear\(\)", common)) == 1 and \
-        re.search(r"graph_input_staging\.erase\(", common) is None and \
+        tenant_release_only_erase and \
         re.search(r"graph_input_staging\.(clear|erase)|graph_input_staging_retired", backend) is None and \
         "graph_input_staging_retired" not in common
     results["the context owns the swapped flag, and clear resets it with the map"] = \
@@ -489,7 +502,7 @@ def evaluate(backend, common, memo_hdr):
     results["a staging failure for an INPUT tensor is terminal for the pass (no fallthrough to the cache paths)"] = \
         re.search(r"graph_input_stage\([^;]*;\s*if\s*\(\s*!dev_ptr\s*\)\s*\{[^{}]*\ball_staged\s*=\s*false;\s*return;\s*\}", prestage) is not None
     results["the INPUT arm tests exactly 'is input, named' and its success path returns"] = \
-        re.search(r"if\s*\(graph_tensor_is_input\(tensor\)\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{[^{}]*"
+        re.search(r"if\s*\(source_class\s*==\s*ggml_sycl_prestage_class::INPUT\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{[^{}]*"
                   r"graph_input_stage\([^;]*;\s*if\s*\(\s*!dev_ptr\s*\)\s*\{[^{}]*\}\s*staged_count\+\+;\s*mark_staged\(tensor\);\s*"
                   r"GGML_SYCL_DEBUG\([^;]*;\s*return;\s*\}", prestage) is not None
     results["the gateway consumes the swapped flag and retires the recorders, with no second pass"] = \
@@ -561,7 +574,7 @@ def evaluate(backend, common, memo_hdr):
         print("NOTE: compute-entry check: " + entry_reason)
     results["the compute entry turns graphs off when MoE graphs were disabled by a failed retire"] = entry_reason == ""
     results["the INPUT arm stages on the backend's own queue"] = \
-        re.search(r"if\s*\(graph_tensor_is_input\(tensor\)\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{\s*"
+        re.search(r"if\s*\(source_class\s*==\s*ggml_sycl_prestage_class::INPUT\s*&&\s*tensor->name\s*&&\s*tensor->name\[0\]\s*!=\s*'\\0'\)\s*\{\s*"
                   r"sycl::queue\s*&\s*q\s*=\s*\*ctx->stream\(\);\s*void\s*\*\s*dev_ptr\s*=\s*ctx->graph_input_stage\(tensor, tensor->data, nbytes, q\);",
                   prestage) is not None
     dense_drop = function_body(backend, r"static void ggml_sycl_block_exec_dense_drop_graphs\(ggml_backend_sycl_context \* ctx\)\s*\{") or ""
@@ -572,11 +585,15 @@ def evaluate(backend, common, memo_hdr):
         gw_at >= 0 and re.search(r"if\s*\(st\.graphs\.size\(\)\s*!=\s*ranges_\.size\(\)\)\s*\{\s*st\.graphs\.resize\(ranges_\.size\(\)\);\s*st\.graphs_key\s*=\s*key;\s*ctx_\.input_tensors_cached\s*=\s*false;", dense[gw_at:]) is not None
 
     # Every release of recorded state waits first, under the guard that says there is something in flight (review r6).
-    clear_active = function_body(backend, r"static void sycl_exec_graph_clear_active\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{") or ""
+    # The release is the context-scoped body since llama.cpp-zhcn: clear_active is that body (called exactly once, before
+    # the process-global effects) plus the unpins, so the wait-before-release order is pinned on the scoped body.
+    clear_active_outer = function_body(backend, r"static void sycl_exec_graph_clear_active\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{") or ""
+    clear_active = function_body(backend, r"static void sycl_exec_graph_clear_scoped\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{") or ""
     wait_at = re.search(r"if\s*\(\s*ctx->exec_graph\s*\)\s*\{\s*ggml_sycl_trace_queue_wait\(ctx->stream\(\)", clear_active)
     results["clear_active waits on the queue before it resets the exec graph or releases the staging"] = \
         bool(wait_at) and 0 <= wait_at.start() < clear_active.find("ctx->exec_graph.reset()") < \
-        clear_active.find("graph_input_staging_clear(") and clear_active.count("graph_input_staging_clear(") == 1
+        clear_active.find("graph_input_staging_clear(") and clear_active.count("graph_input_staging_clear(") == 1 and \
+        clear_active_outer.count("sycl_exec_graph_clear_scoped(ctx, reason);") == 1
     drop_fn = function_body(backend, r"void ggml_sycl_block_exec_dense_state::drop_graphs\(ggml_backend_sycl_context & ctx\)\s*\{") or ""
     results["drop_graphs drains each used device before it clears the range graphs"] = \
         re.search(r"if\s*\(!used\[d\]\)\s*\{\s*continue;\s*\}\s*try\s*\{\s*ggml_sycl_block_exec_dense_queue\(ctx, d\)->wait_and_throw\(\);", drop_fn) is not None \
@@ -642,7 +659,7 @@ if args.self_test:
     stage_sig = r"void \* graph_input_stage\(const ggml_tensor \* owner,[^)]*\)\s*\{"
     swap_sig = r"static bool graph_staging_swap_retire\(ggml_backend_sycl_context \* ctx\)\s*\{"
     dense_drop_sig = r"static void ggml_sycl_block_exec_dense_drop_graphs\(ggml_backend_sycl_context \* ctx\)\s*\{"
-    clear_sig = r"static void sycl_exec_graph_clear_active\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{"
+    clear_sig = r"static void sycl_exec_graph_clear_scoped\(ggml_backend_sycl_context \* ctx, const char \* reason\)\s*\{"
     drop_sig = r"void ggml_sycl_block_exec_dense_state::drop_graphs\(ggml_backend_sycl_context & ctx\)\s*\{"
     retire_sig = r"static bool moe_graph_retention_retire_exact\(ggml_backend_sycl_context \* ctx\)\s*\{"
     def move_first_record_decline(src):
@@ -785,7 +802,7 @@ if args.self_test:
          (mutate_in_func(backend, r"graph_prestage_decline_memo::dense_split_key\(key\)\)\)\s*\{[^}]*\}\s*if \(st\.graphs\.size\(\) != ranges_\.size\(\)\) \{",
                          "ctx_.input_tensors_cached = false;", "(void) 0;"), common, mem_)),
         ("flag-only INPUT test in pre-stage", "pre-stage has no flag-only INPUT test left",
-         (mutate_in_func(backend, pre_sig, "graph_tensor_is_input(tensor)",
+         (mutate_in_func(backend, r"static ggml_sycl_prestage_class ggml_sycl_prestage_classify\([^)]*\)\s*\{", "graph_tensor_is_input(tensor)",
                          "(tensor->flags & GGML_TENSOR_FLAG_INPUT)"), common, mem_)),
         ("flag-only INPUT test in refresh", "refresh discovery has no flag-only INPUT test left",
          (mutate_in_func(backend, ref_sig, "graph_tensor_is_input(tensor)",
@@ -937,6 +954,12 @@ if args.self_test:
          (backend, mutate_in_func(common, stage_sig, "slot.capacity = nbytes;", "slot.capacity = nbytes;\n        graph_input_staging_swapped = true;"), mem_)),
         ("the generation is not bumped at the swap", "the displaced staging handle is retained until a marker event, flagged, and the generation bumped",
          (backend, mutate_in_func(common, stage_sig, "slot.capacity = nbytes;\n        graph_input_staging_generation++;", "slot.capacity = nbytes;"), mem_)),
+        ("the tenant release drops its tenant filter", "the staging map's only mutation sites are the swap and the clear, and the swap waits on nothing",
+         (backend, mutate_in_func(common, r"size_t graph_input_staging_release_tenants\(\)\s*\{", "if (it->second.handle.tenant_cohort() != nullptr) {",
+                                  "if (true) {"), mem_)),
+        ("a second erase site", "the staging map's only mutation sites are the swap and the clear, and the swap waits on nothing",
+         (backend, mutate_in_func(common, r"void graph_input_staging_clear\(sycl::queue & q\)\s*\{", "graph_input_staging.clear();",
+                                  "graph_input_staging.erase(graph_input_staging.begin());"), mem_)),
         ("the swap waits on the host", "the staging map's only mutation sites are the swap and the clear, and the swap waits on nothing",
          (backend, mutate_in_func(common, stage_sig, "slot.capacity = nbytes;", "slot.capacity = nbytes;\n        q.wait();"), mem_)),
         ("the entry is published before the resolve check", "graph_input_stage publishes into the map only after its last failure return",
@@ -947,8 +970,8 @@ if args.self_test:
         ("the staging map is released before the wait", "clear_active waits on the queue before it resets the exec graph or releases the staging",
          (mutate_in_func(backend, clear_sig, "if (ctx->exec_graph) {", "ctx->graph_input_staging_clear(*ctx->stream());\n    if (ctx->exec_graph) {"), common, mem_)),
         ("the INPUT condition is dead", "the INPUT arm tests exactly 'is input, named' and its success path returns",
-         (mutate_re(backend, pre_sig, r"if \(graph_tensor_is_input\(tensor\) && tensor->name && tensor->name\[0\] != '\\0'\) \{",
-                    "if (graph_tensor_is_input(tensor) && tensor->name && tensor->name[0] != '\\0' && false) {"), common, mem_)),
+         (mutate_re(backend, pre_sig, r"if \(source_class == ggml_sycl_prestage_class::INPUT && tensor->name && tensor->name\[0\] != '\\0'\) \{",
+                    "if (source_class == ggml_sycl_prestage_class::INPUT && tensor->name && tensor->name[0] != '\\0' && false) {"), common, mem_)),
         ("the INPUT success falls through", "the INPUT arm tests exactly 'is input, named' and its success path returns",
          (mutate_re(backend, pre_sig, r"(\(long long\) tensor->name, tensor->data, nbytes, dev_ptr\);|tensor->name, tensor->data, nbytes, dev_ptr\);)\s*return;",
                     "tensor->name, tensor->data, nbytes, dev_ptr);"), common, mem_)),

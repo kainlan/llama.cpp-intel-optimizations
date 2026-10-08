@@ -43,6 +43,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <type_traits>
 #include <typeinfo>
@@ -91,8 +92,10 @@
 #include "ggml-sycl/backend.hpp"
 #include "ggml-sycl/block-exec-dense.hpp"
 #include "ggml-sycl/block-exec-gate.hpp"
+#include "ggml-sycl/chunk-cap.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/compute-alloc-scope.hpp"
+#include "ggml-sycl/context-tenant-measure.hpp"
 #include "ggml-sycl/compute-refusal-advice.hpp"
 #include "ggml-sycl/convert.hpp"
 #include "ggml-sycl/cpy.hpp"
@@ -107,6 +110,7 @@
 #include "ggml-sycl/graph-recorder-scope.hpp"
 #include "ggml-sycl/host-weight-alias.hpp"
 #include "ggml-sycl/kernel-selection.hpp"
+#include "ggml-sycl/kv-region-registry.hpp"
 #include "ggml-sycl/l144i-probe.hpp"
 #include "ggml-sycl/lightning-indexer.hpp"
 #include "ggml-sycl/mem-ops.hpp"
@@ -115,6 +119,7 @@
 #include "ggml-sycl/moe-layer-ids-cache.hpp"
 #include "ggml-sycl/moe-mmvq-tables.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
+#include "ggml-sycl/nonfa-stage.hpp"
 #include "ggml-sycl/mul-mat-bf16.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/onednn-woq.hpp"
@@ -123,12 +128,15 @@
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
+#include "ggml-sycl/residency-probe.hpp"
+#include "ggml-sycl/runtime-context-section.hpp"
 #include "ggml-sycl/set.hpp"
 #include "ggml-sycl/set_rows.hpp"
 #include "ggml-sycl/set_rows_paged.hpp"
 #include "ggml-sycl/simple-consumer-route-policy.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
+#include "ggml-sycl/tenant-claim-scope.hpp"
 #include "model-lifecycle.hpp"
 #include "sycl-kernel-profiler.hpp"
 #include "sycl-timeline.hpp"
@@ -355,6 +363,15 @@ static void pp_scratch_profile_end() {
 #include "ggml.h"
 #include "mem-handle.hpp"
 
+// L0, the re-plan transaction mutex (unified-cache.hpp): every public entry that can
+// publish the plan or prepare a live update constructs the token as its first
+// statement, before the module admission guard and before any ticket.
+using ggml_sycl::ggml_sycl_replan_kind;
+using ggml_sycl::GGML_SYCL_REPLAN_KIND_ANY;
+using ggml_sycl::GGML_SYCL_REPLAN_KIND_LIFECYCLE;
+using ggml_sycl::GGML_SYCL_REPLAN_KIND_LOAD;
+using ggml_sycl::GGML_SYCL_REPLAN_KIND_TRANSACTION;
+using ggml_sycl::ggml_sycl_replan_token;
 using ggml_sycl::moe_gate_up_pair;
 using ggml_sycl::moe_layer_decode_artifact_plan;
 using ggml_sycl::moe_layer_decode_plan;
@@ -816,7 +833,8 @@ static void ggml_sycl_graph_diag_report(const char * phase, bool use_graph, cons
             "sequence_graphlet_direct_replay_calls=%llu sequence_graphlet_segmented_replay_calls=%llu "
             "sequence_submit=%.3fms sequence_drain=%.3fms/%llu waits pending=%d "
             "sequence_refresh=%.3fms sequence_match=%.3fms sequence_direct_gap=%.3fms "
-            "sequence_fail=%llu\n",
+            "sequence_fail=%llu "
+            "stage_host_returns_pp=%llu stage_host_returns_tg=%llu stage_host_returns_other=%llu\n",
             phase ? phase : "?", use_graph ? 1 : 0, (ctx && ctx->exec_graph) ? 1 : 0,
             (ctx && ctx->moe_graph_rerecord) ? 1 : 0, (ctx && ctx->moe_segments_valid) ? 1 : 0,
             (unsigned long long) ggml_sycl_graph_diag_load(g_graph_diag_counters.calls),
@@ -852,8 +870,12 @@ static void ggml_sycl_graph_diag_report(const char * phase, bool use_graph, cons
             sequence_submit_ns / 1000000.0, sequence_drain_ns / 1000000.0, (unsigned long long) sequence_waits,
             g_moe_sequence_graphlet_pending_replays, sequence_refresh_ns / 1000000.0, sequence_match_ns / 1000000.0,
             sequence_direct_gap_ns / 1000000.0,
-            (unsigned long long) ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_failures));
-    if (ggml_sycl::e2e_tg_profile_enabled()) {
+            (unsigned long long) ggml_sycl_graph_diag_load(g_graph_diag_counters.sequence_graphlet_failures),
+            (unsigned long long) ggml_sycl_resolver_host_returns_to_device(ggml_sycl::offload_phase::PP),
+            (unsigned long long) ggml_sycl_resolver_host_returns_to_device(ggml_sycl::offload_phase::TG),
+            (unsigned long long) ggml_sycl_resolver_host_returns_to_device(ggml_sycl::offload_phase::UNKNOWN));
+    // The final summary is not a frame: it records nothing into the TG profile.
+    if (ggml_sycl::e2e_tg_profile_enabled() && !(phase && std::strcmp(phase, "final") == 0)) {
         ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::GRAPH, use_graph ? "use_graph_1" : "use_graph_0", 0.0,
                                          0.0, 0, 1);
     }
@@ -1519,6 +1541,14 @@ static bool acquire_onednn_pp_scratch(int                       device_id,
     if (!ggml_sycl_onednn_pp_scratch_planned_bytes(device_id, weights_bytes, activations_bytes)) {
         return false;
     }
+    if (g_ggml_sycl_graph_recording) {
+        // A's acquire reached while a graph records: the count decides whether the activation scratch
+        // waits for the graph invalidation (G0 reads it; the key carries the bytes either way).
+        char key[64];
+        std::snprintf(key, sizeof(key), "weights=%zu,activations=%zu", weights_bytes, activations_bytes);
+        ggml_sycl::unified_cache_dump_counter_add_key(ggml_sycl::dump_counter::onednn_pp_record_mode_acquires,
+                                                      device_id, key);
+    }
     ggml_sycl::onednn_scratch_result scratch =
         ggml_sycl::unified_cache_get_onednn_scratch(device_id, weights_bytes, activations_bytes);
     if (!scratch.ok && ggml_sycl::unified_cache_reserve_onednn_scratch(device_id, weights_bytes, activations_bytes)) {
@@ -1716,15 +1746,35 @@ static void pp_moe_onednn_bind_scratch_slot_generation(int device,
         return;
     }
     pp_moe_onednn_scratch_slot_state & state = g_pp_moe_onednn_scratch_slot_state[device];
-    std::lock_guard<std::mutex>        lock(state.mutex);
-    if (state.ring_depth != ring_depth || state.done_events.size() != ring_depth || state.busy.size() != ring_depth ||
-        state.generations.size() != ring_depth) {
-        pp_moe_onednn_reset_slot_state_locked(state, ring_depth);
+    // A slot is claimed only after the acquire's wait path has moved its owners
+    // out, so its retained_owners is empty here.  A non-empty vector is a holder
+    // that outlived its slot (a tenant slice parked in the ring), which is a
+    // [CONTEXT-PLAN-BUG], not something to clear silently.  It is moved out under
+    // the slot-state mutex and dropped after it, never released under it.
+    std::vector<ggml_sycl::mem_handle> stale_owners;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.ring_depth != ring_depth || state.done_events.size() != ring_depth ||
+            state.busy.size() != ring_depth || state.generations.size() != ring_depth) {
+            pp_moe_onednn_reset_slot_state_locked(state, ring_depth);
+        }
+        state.done_events[slot] = sycl::event{};
+        state.generations[slot] = generation;
+        state.busy[slot]        = 1;
+        stale_owners.swap(state.retained_owners[slot]);
     }
-    state.done_events[slot]      = sycl::event{};
-    state.generations[slot]      = generation;
-    state.busy[slot]             = 1;
-    state.retained_owners[slot].clear();
+    if (!stale_owners.empty()) {
+        GGML_LOG_WARN(
+            "[CONTEXT-PLAN-BUG] oneDNN scratch ring slot %u of device %d was claimed with %zu retained owner(s) "
+            "still held\n",
+            slot, device, stale_owners.size());
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT(
+                "[CONTEXT-PLAN-BUG] oneDNN scratch ring slot %u of device %d was claimed with %zu retained "
+                "owner(s) still held",
+                slot, device, stale_owners.size());
+        }
+    }
 }
 
 static void pp_moe_onednn_record_scratch_slot_event(int                                 device,
@@ -2674,6 +2724,16 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_bound
         return nullptr;
     }
 }
+
+// The load-time measure's plan override: the plan every plan
+// accessor answers from on THIS thread while a measure context is built and
+// reserved.  It is written only by the install and clear procs below, never
+// published, and never read by another thread.  An empty pointer is "no override".
+static thread_local std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> g_measure_plan_override;
+
+static bool ggml_sycl_measure_plan_override_active() noexcept {
+    return g_measure_plan_override != nullptr;
+}
 static thread_local bool                                                      g_runtime_expected_model_set = false;
 static thread_local ggml_sycl_model_token                                     g_runtime_expected_model{};
 static thread_local bool                                                      g_runtime_update_succeeded = false;
@@ -2702,11 +2762,22 @@ static ggml_sycl_prepared_plan_publication ggml_sycl_prepare_plan_publication_lo
 static void ggml_sycl_publish_prepared_plan_locked(ggml_sycl_prepared_plan_publication & publication) noexcept;
 static void ggml_sycl_publish_plan_locked(const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot);
 
+// The process-global tenant publish generation (g_data_ptr_cache's stamp), defined
+// beside the cache.  Bumped by every plan publication and every teardown release.
+uint64_t ggml_sycl_tenant_publish_gen();
+void     ggml_sycl_tenant_publish_gen_bump();
+
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_global_plan_snapshot() {
+    if (g_measure_plan_override) {
+        return g_measure_plan_override;
+    }
     return std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
 }
 
 static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_identity_plan_snapshot() {
+    if (g_measure_plan_override) {
+        return g_measure_plan_override;
+    }
     const auto candidate = ggml_sycl_bound_load_candidate();
     return candidate ? candidate : ggml_sycl_global_plan_snapshot();
 }
@@ -2935,6 +3006,9 @@ static const std::shared_ptr<const placement_plan> & empty_placement_plan_owner(
 }
 
 std::shared_ptr<const placement_plan> global_placement_plan_owner() noexcept {
+    if (g_measure_plan_override) {
+        return g_measure_plan_override->plan ? g_measure_plan_override->plan : empty_placement_plan_owner();
+    }
     const auto candidate = ggml_sycl_bound_load_candidate();
     const auto authority =
         candidate ? candidate : std::atomic_load_explicit(&g_placement_publication, std::memory_order_acquire);
@@ -2952,6 +3026,15 @@ std::shared_ptr<const placement_plan> coherent_placement_plan_owner(const unifie
 placement_cache_read cache_placement_coherence(const unified_cache * cache) noexcept {
     placement_cache_read result;
     result.owner = empty_placement_plan_owner();
+    if (g_measure_plan_override) {
+        // The override names the plan; there is no cache snapshot to compare it with.
+        result.coherence = g_measure_plan_override->plan ? placement_cache_coherence::MATCH :
+                                                           placement_cache_coherence::GENUINE_NO_PLAN;
+        if (g_measure_plan_override->plan) {
+            result.owner = g_measure_plan_override->plan;
+        }
+        return result;
+    }
     const auto candidate = ggml_sycl_bound_load_candidate();
     if (candidate && candidate->plan) {
         result.coherence = placement_cache_coherence::MATCH;
@@ -3033,6 +3116,190 @@ static bool ggml_sycl_placement_plan_needs_secondary_devices(const ggml_sycl::pl
 static bool ggml_sycl_placement_plan_needs_moe_secondary_devices(const ggml_sycl::placement_plan & plan);
 static bool ggml_sycl_placement_plan_moe_needs_other_device(const ggml_sycl::placement_plan & plan,
                                                             int                               execution_device);
+
+// ---------------------------------------------------------------------------
+// The dispatch owner (rulings M246, option A).
+//
+// Several MoE route chains need the model that the dispatching context executes
+// but hold no context: the resolver and the decode candidate collector. A graph
+// compute root binds that owner here for the extent of the call; an unbound read
+// is null, and the consumer takes its specified refusal path. There is no default
+// owner and no rebinding. Work that crosses threads (a host_task, the CPU expert
+// pool, a worker lambda) captures the owner by value when it is submitted; this
+// thread-local is never read inside a body that runs on another thread.
+// ---------------------------------------------------------------------------
+static bool ggml_sycl_execution_current_owner(const ggml_backend_sycl_context *  ctx,
+                                              ggml_sycl::lifecycle::ModelToken & owner);
+
+static thread_local ggml_sycl::lifecycle::ModelToken g_dispatch_owner{};
+static thread_local bool                             g_dispatch_owner_bound = false;
+static thread_local int                              g_dispatch_owner_depth = 0;
+
+class ggml_sycl_dispatch_owner_scope {
+  public:
+    explicit ggml_sycl_dispatch_owner_scope(const ggml_backend_sycl_context * ctx) {
+        ggml_sycl::lifecycle::ModelToken owner{};
+        const bool                       bound = ggml_sycl_execution_current_owner(ctx, owner);
+        if (g_dispatch_owner_depth > 0 &&
+            (bound != g_dispatch_owner_bound || (bound && !(owner == g_dispatch_owner)))) {
+            GGML_ABORT("[DISPATCH-OWNER] nested scope binds a different owner");
+        }
+        g_dispatch_owner       = owner;
+        g_dispatch_owner_bound = bound;
+        ++g_dispatch_owner_depth;
+    }
+
+    ~ggml_sycl_dispatch_owner_scope() {
+        if (--g_dispatch_owner_depth == 0) {
+            g_dispatch_owner       = {};
+            g_dispatch_owner_bound = false;
+        }
+    }
+
+    ggml_sycl_dispatch_owner_scope(const ggml_sycl_dispatch_owner_scope &)             = delete;
+    ggml_sycl_dispatch_owner_scope & operator=(const ggml_sycl_dispatch_owner_scope &) = delete;
+};
+
+static const ggml_sycl::lifecycle::ModelToken * ggml_sycl_dispatch_owner() {
+    return g_dispatch_owner_bound ? &g_dispatch_owner : nullptr;
+}
+
+enum ggml_sycl_secondary_queue_status {
+    GGML_SYCL_SECONDARY_QUEUE_READY,
+    GGML_SYCL_SECONDARY_QUEUE_NONE,
+    GGML_SYCL_SECONDARY_QUEUE_REFUSED,
+};
+
+enum class ggml_sycl_into_empty_result : uint8_t {
+    NOOP,
+    INSTALLED,
+    REFUSED,
+};
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+static std::atomic<uint64_t> g_into_empty_installs{ 0 };
+static std::atomic<uint64_t> g_into_empty_foreign{ 0 };
+
+static uint64_t ggml_sycl_into_empty_install_count() {
+    return g_into_empty_installs.load(std::memory_order_acquire);
+}
+#endif
+
+// The key of the into_empty hint: the owning load, bound to the tenant publish
+// generation.  The generation is bumped by every plan publication, including a stable-MMID
+// re-publish that keeps the plan version: that re-publish re-decides kv_device, and
+// ggml_sycl_placement_plan_uses_device counts it, so it can add a participant device while
+// handing out no new id.  A non-participant hint recorded before any publication therefore
+// never matches after it.  (A teardown release also bumps it; that only costs one locked pass.)
+static uint64_t ggml_sycl_into_empty_skip_key(const ggml_sycl::lifecycle::ModelToken & owner, uint64_t publish_gen) {
+    return (owner.model.value * 0x9E3779B97F4A7C15ULL ^ owner.load.value ^ (publish_gen * 0xC2B2AE3D27D4EB4FULL)) |
+           1ULL;
+}
+
+// The key of the once-per-owner foreign-plan WARN: the owning load alone, so a later
+// publication does not warn again for an owner that was already told.
+static uint64_t ggml_sycl_into_empty_foreign_warn_key(const ggml_sycl::lifecycle::ModelToken & owner) {
+    return (owner.model.value * 0x9E3779B97F4A7C15ULL ^ owner.load.value) | 1ULL;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+uint64_t ggml_sycl_into_empty_skip_key_for_test(const ggml_sycl::lifecycle::ModelToken & owner, uint64_t publish_gen) {
+    return ggml_sycl_into_empty_skip_key(owner, publish_gen);
+}
+#endif
+
+static bool ggml_sycl_cache_snapshot_empty(const ggml_sycl::unified_cache * cache) {
+    const auto current = cache->get_placement_plan_snapshot();
+    // A bool, not a pointer into the snapshot: it is computed while the owner is held
+    // and nothing derived from the snapshot leaves this function.
+    const bool empty   = !current || !current->plan || current->plan->entries.empty();
+    return empty;
+}
+
+// Installs the owning model's publication into ONE cache whose plan is empty.
+// It is one critical section under g_tensor_inventory_mutex and writes no
+// device-global: not g_model_n_layer, not g_placement_kv_info, not
+// g_placement_publication, and no other cache's snapshot. The snapshot comes from
+// the owner's own registry row, never from the process-global publication, which
+// with two models loaded may be the other model's.
+static ggml_sycl_into_empty_result ggml_sycl_republish_current_plan_into_empty(
+    ggml_sycl::unified_cache *               cache,
+    const ggml_sycl::lifecycle::ModelToken & owner) {
+    if (!cache) {
+        return ggml_sycl_into_empty_result::NOOP;
+    }
+    // The hint: an earlier locked pass found this cache is not a device of this
+    // owner's plan, so a participant-less cache does not take the inventory lock
+    // on every MUL_MAT_ID.  The key names the owning load, so another owner never
+    // matches, and the locked pass below remains the authority.  The key also names
+    // the tenant publish generation read before the lock: a publication that lands later
+    // (a stable-MMID re-publish included) changes it, so a stale "not a participant" is
+    // never trusted past a re-plan.
+    const uint64_t skip_key = ggml_sycl_into_empty_skip_key(owner, ggml_sycl_tenant_publish_gen());
+    if (cache->into_empty_skip_key() == skip_key) {
+        return ggml_sycl_into_empty_result::NOOP;
+    }
+    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    const auto selected = ggml_sycl::lifecycle_select_placement_plan(owner.model.value, owner.load.value,
+                                                                     owner.owner.slot, owner.owner.generation);
+    if (!selected) {
+        // A model outlives its contexts, so a bound owner whose snapshot is gone
+        // is a defect, never a silent skip and never an empty-plan proceed.
+        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] into_empty: no snapshot for owner model=%llu load=%llu slot=%u\n",
+                      (unsigned long long) owner.model.value, (unsigned long long) owner.load.value,
+                      (unsigned) owner.owner.slot);
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] into_empty: no snapshot for the bound owner");
+        }
+        return ggml_sycl_into_empty_result::REFUSED;
+    }
+    const auto current = cache->get_placement_plan_snapshot();
+    if (current && current->plan && !current->plan->entries.empty()) {
+        // Never overwritten.  A cache that already holds another load's plan is not
+        // this owner's to fill; say so once per owner so the two-model case is
+        // visible, and leave it alone.
+        const uint64_t warn_key = ggml_sycl_into_empty_foreign_warn_key(owner);
+        if ((current->model_id != selected->model_id || current->load_txn_id != selected->load_txn_id) &&
+            cache->into_empty_foreign_key() != warn_key) {
+            cache->set_into_empty_foreign_key(warn_key);
+            GGML_LOG_WARN(
+                "[CONTEXT-PLAN] into_empty: this device's cache holds model=%llu load=%llu's plan, not the owner's "
+                "model=%llu load=%llu; left as it is\n",
+                (unsigned long long) current->model_id, (unsigned long long) current->load_txn_id,
+                (unsigned long long) owner.model.value, (unsigned long long) owner.load.value);
+        }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        if (current->model_id != selected->model_id || current->load_txn_id != selected->load_txn_id) {
+            g_into_empty_foreign.fetch_add(1, std::memory_order_acq_rel);
+        }
+#endif
+        return ggml_sycl_into_empty_result::NOOP;
+    }
+    bool      participates = false;
+    const int total        = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
+    for (int d = 0; d < total && !participates; ++d) {
+        participates = ggml_sycl::get_unified_cache_for_device(d) == cache && selected->plan &&
+                       ggml_sycl_placement_plan_uses_device(*selected->plan, d);
+    }
+    cache->set_placement_plan_snapshot(participates ? selected : nullptr);
+    if (!participates) {
+        cache->set_into_empty_skip_key(skip_key);
+        return ggml_sycl_into_empty_result::NOOP;
+    }
+    const auto installed = cache->get_placement_plan_snapshot();
+    if (!installed || installed->version != selected->version || installed->model_id != selected->model_id ||
+        installed->load_txn_id != selected->load_txn_id) {
+        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] into_empty: the installed snapshot is not the owner's\n");
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] into_empty: the installed snapshot is not the owner's");
+        }
+        return ggml_sycl_into_empty_result::REFUSED;
+    }
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    g_into_empty_installs.fetch_add(1, std::memory_order_acq_rel);
+#endif
+    return ggml_sycl_into_empty_result::INSTALLED;
+}
 
 // Thread-local flag: set to true when moe_prefetch_scan() has submitted hints
 // for the current graph. Checked at dispatch time to skip redundant hint() calls.
@@ -5775,6 +6042,7 @@ enum class moe_expert_route_kind : uint8_t {
     SECONDARY_DEVICE,
     HOST,
     UNAVAILABLE,
+    REFUSED,
 };
 
 static const char * ggml_sycl_moe_route_kind_name(moe_expert_route_kind kind) {
@@ -5787,6 +6055,8 @@ static const char * ggml_sycl_moe_route_kind_name(moe_expert_route_kind kind) {
             return "host";
         case moe_expert_route_kind::UNAVAILABLE:
             return "unavailable";
+        case moe_expert_route_kind::REFUSED:
+            return "refused";
     }
     return "unknown";
 }
@@ -5878,7 +6148,12 @@ static bool ggml_sycl_moe_route_log_enabled() {
     return v != 0;
 }
 
-static bool ggml_sycl_ensure_moe_secondary_queues_for_plan(int target_device) {
+// Whether the secondary device's queue is ready. A null owner is an unbound
+// caller and installs nothing; REFUSED is returned only when the owner's install
+// into an empty cache refused, and it is never a re-route.
+static ggml_sycl_secondary_queue_status ggml_sycl_ensure_moe_secondary_queues_for_plan(
+    int                                      target_device,
+    const ggml_sycl::lifecycle::ModelToken * owner) {
     const auto & info = ggml_sycl_info();
     if (ggml_sycl_moe_route_log_enabled()) {
         static std::atomic<int> logged_ensure{ 0 };
@@ -5893,7 +6168,7 @@ static bool ggml_sycl_ensure_moe_secondary_queues_for_plan(int target_device) {
         }
     }
     if (target_device < 0) {
-        return false;
+        return GGML_SYCL_SECONDARY_QUEUE_NONE;
     }
 
     const int total_gpus = std::max(info.total_gpu_count, target_device + 1);
@@ -5905,18 +6180,19 @@ static bool ggml_sycl_ensure_moe_secondary_queues_for_plan(int target_device) {
                 "[MOE-MULTI-GPU] Planner resolved secondary device %d, but only %d physical GPU(s) are known\n",
                 target_device, info.total_gpu_count);
         }
-        return false;
+        return GGML_SYCL_SECONDARY_QUEUE_NONE;
     }
 
     if (sycl::queue * q = ggml_sycl::get_shared_context_queue(target_device)) {
         (void) ggml_sycl::unified_cache_register_for_queue(target_device, *q);
-        if (ggml_sycl_has_global_plan()) {
+        if (owner) {
             if (auto * cache = ggml_sycl::get_unified_cache_for_device(target_device);
-                cache && ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-                ggml_sycl_republish_current_plan();
+                cache && ggml_sycl_cache_snapshot_empty(cache) &&
+                ggml_sycl_republish_current_plan_into_empty(cache, *owner) == ggml_sycl_into_empty_result::REFUSED) {
+                return GGML_SYCL_SECONDARY_QUEUE_REFUSED;
             }
         }
-        return true;
+        return GGML_SYCL_SECONDARY_QUEUE_READY;
     }
 
     static std::mutex           init_mutex;
@@ -5931,10 +6207,11 @@ static bool ggml_sycl_ensure_moe_secondary_queues_for_plan(int target_device) {
             continue;
         }
         (void) ggml_sycl::unified_cache_register_for_queue(d, *q_d);
-        if (ggml_sycl_has_global_plan()) {
+        if (owner) {
             if (auto * cache = ggml_sycl::get_unified_cache_for_device(d);
-                cache && ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-                ggml_sycl_republish_current_plan();
+                cache && ggml_sycl_cache_snapshot_empty(cache) &&
+                ggml_sycl_republish_current_plan_into_empty(cache, *owner) == ggml_sycl_into_empty_result::REFUSED) {
+                return GGML_SYCL_SECONDARY_QUEUE_REFUSED;
             }
         }
         ++n_registered;
@@ -5955,7 +6232,31 @@ static bool ggml_sycl_ensure_moe_secondary_queues_for_plan(int target_device) {
         }
     }
 
-    return ggml_sycl::get_shared_context_queue(target_device) != nullptr;
+    return ggml_sycl::get_shared_context_queue(target_device) != nullptr ? GGML_SYCL_SECONDARY_QUEUE_READY :
+                                                                           GGML_SYCL_SECONDARY_QUEUE_NONE;
+}
+
+// A REFUSED install is a clean graph failure through the fallback channel,
+// never a re-route to the host or to another device.
+[[noreturn]] static void ggml_sycl_secondary_queue_refused_fail() {
+    GGML_LOG_WARN("[CONTEXT-PLAN-BUG] secondary queue refused: plan owner\n");
+    if (ggml_sycl::ggml_sycl_strict_enabled()) {
+        GGML_ABORT("[CONTEXT-PLAN-BUG] secondary queue refused: plan owner");
+    }
+    throw ggml_sycl_fallback_error("MUL_MAT_ID secondary queue refused: plan owner");
+}
+
+// The consumers' shared step: ready, absent, or a clean failure.
+static bool ggml_sycl_secondary_queue_ready_or_throw(ggml_sycl_secondary_queue_status status) {
+    switch (status) {
+        case GGML_SYCL_SECONDARY_QUEUE_READY:
+            return true;
+        case GGML_SYCL_SECONDARY_QUEUE_NONE:
+            return false;
+        case GGML_SYCL_SECONDARY_QUEUE_REFUSED:
+            ggml_sycl_secondary_queue_refused_fail();
+    }
+    return false;
 }
 
 static std::vector<ggml_sycl_cache_id> ggml_sycl_get_canonical_moe_expert_keys(const ggml_tensor * src0,
@@ -6450,11 +6751,34 @@ static bool ggml_sycl_moe_plan_admits_current_alternate(const ggml_tensor *     
     return false;
 }
 
+static moe_expert_route ggml_sycl_resolve_moe_expert_route_core(const ggml_tensor * src0,
+                                                                int                 current_device,
+                                                                int                 expert_id,
+                                                                ggml_layout_mode    requested_layout,
+                                                                bool                allow_materialize);
+
+// The one entry every consumer calls. The core reports a refused plan owner as
+// the REFUSED kind; this wrapper turns that into a clean graph failure through
+// the fallback channel, so no consumer can read a refused route as an ordinary
+// miss and re-route it to the host or to another device.
 static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * src0,
                                                            int                 current_device,
                                                            int                 expert_id,
                                                            ggml_layout_mode    requested_layout,
                                                            bool                allow_materialize = false) {
+    moe_expert_route route =
+        ggml_sycl_resolve_moe_expert_route_core(src0, current_device, expert_id, requested_layout, allow_materialize);
+    if (route.kind == moe_expert_route_kind::REFUSED) {
+        ggml_sycl_secondary_queue_refused_fail();
+    }
+    return route;
+}
+
+static moe_expert_route ggml_sycl_resolve_moe_expert_route_core(const ggml_tensor * src0,
+                                                                int                 current_device,
+                                                                int                 expert_id,
+                                                                ggml_layout_mode    requested_layout,
+                                                                bool                allow_materialize) {
     // llama.cpp-1tjn (B3 rework census, temporary): total per-op resolve
     // volume, any caller. See moe_decode_route_census above this namespace.
     g_moe_decode_route_census.raw_resolve_calls.fetch_add(1, std::memory_order_relaxed);
@@ -6487,7 +6811,16 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
             route.planned_device           = placement.on_device ? placement.target_device : -1;
             route.planned_layout           = placement.layout;
             if (route.planned_device_residency && route.planned_device >= 0 && route.planned_device != current_device) {
-                (void) ggml_sycl_ensure_moe_secondary_queues_for_plan(route.planned_device);
+                switch (
+                    ggml_sycl_ensure_moe_secondary_queues_for_plan(route.planned_device, ggml_sycl_dispatch_owner())) {
+                    case GGML_SYCL_SECONDARY_QUEUE_READY:
+                    case GGML_SYCL_SECONDARY_QUEUE_NONE:
+                        break;
+                    case GGML_SYCL_SECONDARY_QUEUE_REFUSED:
+                        route.kind   = moe_expert_route_kind::REFUSED;
+                        route.reason = expert_resolve_reason::NOT_READY;
+                        return route;
+                }
             }
             current_device_planned_alternate =
                 ggml_sycl_moe_plan_admits_current_alternate(src0, current_device, requested_layout, placement);
@@ -9794,6 +10127,11 @@ static void test_init_q8_moe_tensor(ggml_tensor & tensor, const char * name) {
 
 bool test_moe_storage_handle_first_route_and_negatives() {
     constexpr int expert_id = 3;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // This test holds no context and binds no dispatch owner, so every resolve
+    // below runs with an unbound owner and must install nothing (the owner is bound only inside graph compute).
+    const uint64_t installs_before = ggml_sycl_into_empty_install_count();
+#endif
     ggml_tensor   tensor{};
     test_init_q8_moe_tensor(tensor, "");
     ggml_tensor_extra_gpu extra{};
@@ -9986,8 +10324,13 @@ bool test_moe_storage_handle_first_route_and_negatives() {
     // cannot bypass lookup and route through an otherwise valid handle.
     ggml_set_name(&tensor, "");
     moe_expert_route unnamed = ggml_sycl_resolve_moe_expert_route(&tensor, 0, expert_id, GGML_LAYOUT_AOS);
-    return unnamed.plan_missing && !unnamed.plan_found && !unnamed.ptr &&
-           unnamed.kind == moe_expert_route_kind::UNAVAILABLE;
+    const bool       unnamed_ok = unnamed.plan_missing && !unnamed.plan_found && !unnamed.ptr &&
+                            unnamed.kind == moe_expert_route_kind::UNAVAILABLE;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    return unnamed_ok && ggml_sycl_into_empty_install_count() == installs_before;
+#else
+    return unnamed_ok;
+#endif
 }
 
 bool test_moe_route_preserves_ready_event_for_chaining() {
@@ -11866,6 +12209,8 @@ static void ggml_sycl_execution_wrapper_failpoint_maybe_throw() {
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
 static void ggml_sycl_execution_unbind_backend(ggml_backend_sycl_context * ctx) noexcept;
 static void ggml_sycl_execution_drain_context_terminal_events(uint64_t context_id);
+static void                        ggml_sycl_execution_drop_context_registry_entries(uint64_t context_id,
+                                                                                     const bool (&devices)[GGML_SYCL_MAX_DEVICES]) noexcept;
 static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const char * reason);
 static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl_context * cleanup_ctx,
                                                                const char *                stage,
@@ -11967,15 +12312,31 @@ static void ggml_sycl_execution_sync_binding_devices_locked(ggml_sycl_execution_
 }
 
 static void ggml_sycl_execution_clear_bindings_for_context(uint64_t context_id) {
-    std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
-    for (auto it = g_execution_backend_bindings.begin(); it != g_execution_backend_bindings.end();) {
-        if (it->second && it->second->context_id == context_id) {
-            ggml_sycl_execution_reset_backend_binding_state(it->first);
-            it = g_execution_backend_bindings.erase(it);
-        } else {
-            ++it;
+    // The reset below zeroes each backend's key, and after it the backend's destructor cannot find the registry
+    // entry (host reservation, published section) this id keyed: nothing else would drop it.  So the devices of
+    // the bindings that end here are collected under the lock (no allocation, nothing to fail), and the entries
+    // are dropped BY THE ENDED ID after the reset, outside the lock.  A publish that reads its backend's id after
+    // the reset finds none, so it cannot key an entry by the dead id; an entry made before the reset is dropped
+    // here.  A publish that had already read the id can still store under the dead one: for the host table the
+    // install guard drops by the id the install used (and attaching the root fails once the context is drained);
+    // for the section it needs the end to land within a few instructions of the store on the same context, a
+    // publish racing the end of its own context, which is unsupported.
+    bool devices[GGML_SYCL_MAX_DEVICES] = {};
+    {
+        std::lock_guard<std::mutex> lock(g_execution_backend_binding_mutex);
+        for (auto it = g_execution_backend_bindings.begin(); it != g_execution_backend_bindings.end();) {
+            if (it->second && it->second->context_id == context_id) {
+                if (it->first->device >= 0 && it->first->device < GGML_SYCL_MAX_DEVICES) {
+                    devices[it->first->device] = true;
+                }
+                ggml_sycl_execution_reset_backend_binding_state(it->first);
+                it = g_execution_backend_bindings.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
+    ggml_sycl_execution_drop_context_registry_entries(context_id, devices);
 }
 
 template<typename F>
@@ -12313,6 +12674,7 @@ void ggml_backend_sycl_model_unloaded(uint32_t slot) {
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_model_token token) {
+    ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     const auto                            owner = ggml_sycl_cpp_token(token);
@@ -12487,15 +12849,11 @@ static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
         // --- Compute Arena: reserve VRAM for compute scratch BEFORE weight preload ---
         // This guarantees FP16 attention scratch has VRAM even after weights fill budget.
         // Reserved unconditionally (arena is needed regardless of weight placement).
-        // Default 512 MB; override with GGML_SYCL_COMPUTE_ARENA_MB=N (0 to disable).
-        size_t       arena_mb = 512;
-        const char * env      = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
-        if (env) {
-            arena_mb = static_cast<size_t>(std::max(0, std::atoi(env)));
-        }
-        if (arena_mb > 0) {
-            const size_t arena_bytes = arena_mb * 1024 * 1024;
-            const int    total_gpus  = ggml_sycl_info().total_gpu_count;
+        // Sized by ggml_sycl_compute_arena_bytes (512 MB, or GGML_SYCL_COMPUTE_ARENA_MB=N,
+        // 0 to disable): the same function the chunk cap's probe set reads.
+        const size_t arena_bytes = ggml_sycl::ggml_sycl_compute_arena_bytes(0);
+        if (arena_bytes > 0) {
+            const int total_gpus = ggml_sycl_info().total_gpu_count;
             for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
                 if (ggml_sycl::unified_cache_total_managed(d) > 0) {
                     if (!ggml_sycl::unified_cache_reserve_compute_arena(d, arena_bytes)) {
@@ -12616,6 +12974,9 @@ static void ggml_sycl_moe_discovery_report(const char *                    op,
 
 static bool ggml_sycl_teardown_owner_effects(ggml_sycl::lifecycle::ModelToken owner) noexcept {
     try {
+        // A teardown release can free storage a cached data pointer names, whether or
+        // not this owner holds the published plan.
+        ggml_sycl_tenant_publish_gen_bump();
         ggml_sycl_plan_restoration_bundle restoration;
         {
             std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
@@ -12757,7 +13118,418 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
     return clean;
 }
 
+// ---------------------------------------------------------------------------
+// The published section of a context and the load's compute-term ledger
+// (llama.cpp-moua L4 step 3; moua design 2.4.2).
+//
+// Both are leaf state.  A context's section lives in its entry of the device's KV region
+// registry, under the registry's own leaf mutex (L3); the ledger lives under its own leaf
+// mutex.  Neither lock is held across a log line or the last drop of a section.  The one
+// nesting is the ledger's mutex over the lifecycle registry's mutex, for the open-transaction
+// read (ggml_sycl_load_txn_is_open): the order is fixed, because no lifecycle registry method
+// calls into the ledger, so nothing takes them the other way round.
+// Both are allocated once and never destroyed, so a backend freed during static destruction
+// still finds them; they hold no device memory.
+// ---------------------------------------------------------------------------
+static ggml_sycl::kv_region_registry & ggml_sycl_kv_region_registry(int device) {
+    static ggml_sycl::kv_region_registry * const registries = new ggml_sycl::kv_region_registry[GGML_SYCL_MAX_DEVICES];
+    return registries[device];
+}
+
+// `mutex` guards `ledger`, the process-wide load_compute_ledger, which is an unlocked value type: every
+// access to `ledger` is made with `mutex` held, by the functions that name ggml_sycl_load_ledger().
+struct ggml_sycl_load_ledger_state {
+    std::mutex                     mutex;
+    ggml_sycl::load_compute_ledger ledger;
+};
+
+static ggml_sycl_load_ledger_state & ggml_sycl_load_ledger() {
+    static ggml_sycl_load_ledger_state * const state = new ggml_sycl_load_ledger_state;
+    return *state;
+}
+
+// The execution context id of a backend context: the registry key of its entry, 0 while unbound.
+static uint64_t ggml_sycl_context_execution_id(const ggml_backend_sycl_context * ctx) {
+    std::lock_guard<std::mutex> lock(ctx->execution_state_mutex);
+    return ctx->execution_context_id;
+}
+
+// Replace this context's published section; null drops it.  A context that was never bound to an
+// execution context has no registry key, so it publishes nothing and a coverage query about it
+// answers GROWTH: fail-closed, but a publish that stores nothing is said so at WARN, because the
+// caller is then waiting on a section that will never exist.  The replaced section is released
+// after the registry lock.
+static void ggml_sycl_published_section_set(const ggml_backend_sycl_context *                         ctx,
+                                            std::shared_ptr<const ggml_sycl::runtime_context_section> section) {
+    if (!ctx || ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    const uint64_t id = ggml_sycl_context_execution_id(ctx);
+    if (id == 0) {
+        if (section) {
+            GGML_LOG_WARN(
+                "[CONTEXT-PLAN] a runtime-context descriptor was published for a backend context that is not bound "
+                "to an execution context: no section is stored, and a coverage query answers GROWTH\n");
+        }
+        return;
+    }
+    auto & registry = ggml_sycl_kv_region_registry(ctx->device);
+    auto   previous =
+        section ? registry.set_published_section(id, std::move(section)) : registry.drop_published_section(id);
+    (void) previous;  // dropped here, with no registry lock held
+}
+
+// A context's entry loses its section: the one erase of a section by the id that keyed it.  The caller
+// names the id and the device (the backend destructor reads its own once, the end of an execution context
+// passes the ended id), and nothing here reads a backend's id again, so one drop has one id.  Never throws,
+// because a destructor cannot let one out; the registry's lock failing is the only way the drop can, and a
+// drop that fails leaves the entry to the process's end (its key is gone with the context), which is why it is
+// said at ERROR.  The publish tail does NOT use this: it calls ggml_sycl_published_section_set directly and
+// lets such a failure out, so a section describing the replaced shape is never kept silently.
+static void ggml_sycl_published_section_erase(int device, uint64_t context_id) noexcept {
+    try {
+        if (context_id == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+            return;
+        }
+        auto previous = ggml_sycl_kv_region_registry(device).drop_published_section(context_id);
+        (void) previous;  // dropped here, with no registry lock held
+    } catch (...) {
+        GGML_LOG_ERROR(
+            "[CONTEXT-PLAN] the published section of an execution context could not be dropped; it stays until the "
+            "process ends\n");
+    }
+}
+
+// A host-tier tenant slot: one owner-first host reservation (moua design 2.3.2, "the host-pinned tier").
+// It is the kv_region_handle of a slot in the table ggml_sycl_reserve_host_tenants builds, and that
+// function is the only builder of a table carrying the host cohort, so a claim of that cohort casts
+// the handle back to this type.
+struct ggml_sycl_host_tenant_slot {
+    ggml_sycl::mem_handle handle;
+    size_t                bytes = 0;
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    ggml_sycl_host_tenant_slot() { live_count().fetch_add(1, std::memory_order_relaxed); }
+
+    ~ggml_sycl_host_tenant_slot() { live_count().fetch_sub(1, std::memory_order_relaxed); }
+
+    ggml_sycl_host_tenant_slot(const ggml_sycl_host_tenant_slot &)             = delete;
+    ggml_sycl_host_tenant_slot & operator=(const ggml_sycl_host_tenant_slot &) = delete;
+
+    // Slots alive in the process: a test reads it to see a refused reservation's carves and a torn-down
+    // context's carves go back.
+    static std::atomic<size_t> & live_count() {
+        static std::atomic<size_t> n{ 0 };
+        return n;
+    }
+#endif
+};
+
+// The slot's handle is a shared_ptr<void> in the registry's table, which carries no type.  A slot is made only
+// by this deleter's factory, and a reader checks the deleter before it casts, so a handle of any other type --
+// a test's, or a future producer's -- is refused rather than reinterpreted.
+struct ggml_sycl_host_tenant_slot_deleter {
+    void operator()(void * p) const noexcept { delete static_cast<ggml_sycl_host_tenant_slot *>(p); }
+};
+
+static ggml_sycl::kv_region_handle ggml_sycl_host_tenant_slot_make(ggml_sycl::mem_handle handle, size_t bytes) {
+    auto * slot  = new ggml_sycl_host_tenant_slot();
+    slot->handle = std::move(handle);
+    slot->bytes  = bytes;
+    return ggml_sycl::kv_region_handle(slot, ggml_sycl_host_tenant_slot_deleter{});
+}
+
+// The slot a table handle holds, or null when the handle was not made by ggml_sycl_host_tenant_slot_make.
+static ggml_sycl_host_tenant_slot * ggml_sycl_host_tenant_slot_of(const ggml_sycl::kv_region_handle & handle) {
+    if (!handle || std::get_deleter<ggml_sycl_host_tenant_slot_deleter>(handle) == nullptr) {
+        return nullptr;
+    }
+    return static_cast<ggml_sycl_host_tenant_slot *>(handle.get());
+}
+
+// Reserve one host carve per host-tier element of `section` (device -1) and build the slot table over
+// them: slot (cohort, slot_index) IS carve (cohort, slot_index), contiguous, `slot_bytes` long.  Each is
+// an owner-first allocation through unified_allocate_owner (must_host_pinned, use_pinned_pool, category
+// HOST_COMPUTE, the cohort's own name), never a bare USM call, and it runs before L1 under a
+// TRANSACTION token, so the pool's phase gates take it as planned work.  `out` is null on success when
+// the section carries no host element.  False, with `refusal` naming the slot, when an allocation
+// failed; every carve made so far drops with `table`, with no registry lock held.
+static bool ggml_sycl_reserve_host_tenants(const ggml_backend_sycl_context *             ctx,
+                                           const ggml_sycl::runtime_context_section &    section,
+                                           std::shared_ptr<ggml_sycl::kv_tenant_slots> & out,
+                                           std::string &                                 refusal) {
+    out.reset();
+    std::shared_ptr<ggml_sycl::kv_tenant_slots> table;
+    auto *                                      cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
+    sycl::queue * queue = cache ? &cache->get_queue() : &ggml_sycl_get_device(ctx->device).default_queue();
+    for (const ggml_sycl::runtime_context_tenant & e : section.tenants) {
+        if (e.device != -1) {
+            continue;
+        }
+        const ggml_sycl_context_cohort_info * info = ggml_sycl_context_cohort_lookup(e.cohort);
+        if (info == nullptr || info->tier != GGML_SYCL_CONTEXT_COHORT_TIER_HOST_PINNED) {
+            refusal = "host-tier element " + std::to_string(e.slot_index) + " names cohort " +
+                      std::to_string(e.cohort) + ", which is not a host-pinned cohort";
+            return false;
+        }
+        ggml_sycl::alloc_request req{};
+        req.queue                               = queue;
+        req.device                              = ctx->device;
+        req.size                                = (size_t) e.slot_bytes;
+        req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+        req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
+        req.intent.cohort_id                    = info->name;
+        req.intent.constraints.must_host_pinned = true;
+        req.intent.constraints.use_pinned_pool  = true;
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (!allocation) {
+            refusal = std::string("the host reservation of ") + std::to_string(e.slot_bytes) + " B for cohort " +
+                      info->name + " slot " + std::to_string(e.slot_index) + " failed";
+            return false;
+        }
+        ggml_sycl::mem_handle carve =
+            ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = carve.resolve(ctx->device);
+        if (!resolved.ptr || resolved.on_device) {
+            refusal = std::string("the host reservation for cohort ") + info->name + " slot " +
+                      std::to_string(e.slot_index) + " did not resolve to host memory";
+            return false;
+        }
+        if (!table) {
+            table = std::make_shared<ggml_sycl::kv_tenant_slots>();
+        }
+        (void) table->add(info->name, e.slot_index,
+                          ggml_sycl_host_tenant_slot_make(std::move(carve), (size_t) e.slot_bytes),
+                          (size_t) e.slot_bytes);  // a fresh table: nothing retained
+    }
+    out = std::move(table);
+    return true;
+}
+
+// A republish while a table is held reuses it in place and never allocates (moua design 2.4.2, "reuse in
+// place"), so the held slots have to carry the candidate: every host-tier element of `section` needs a held
+// slot at the same (cohort, slot_index) with at least its bytes.  A section the table cannot carry is
+// refused, not published: storing it would make the section say what the table cannot back (coverage would
+// answer EQUAL for a slot whose claim is then refused), and a table that is still the old one is the fact the
+// published shape has to follow.  A smaller candidate is carried; a host cohort the table has never held, or
+// a slot index it has not, is not.  `refusal` names the first element that is not carried.
+static bool ggml_sycl_host_tenants_carry(const ggml_sycl::kv_tenant_slots &         held,
+                                         const ggml_sycl::runtime_context_section & section,
+                                         std::string &                              refusal) {
+    for (const ggml_sycl::runtime_context_tenant & e : section.tenants) {
+        if (e.device != -1) {
+            continue;
+        }
+        const ggml_sycl_context_cohort_info * info = ggml_sycl_context_cohort_lookup(e.cohort);
+        if (info == nullptr || info->tier != GGML_SYCL_CONTEXT_COHORT_TIER_HOST_PINNED) {
+            refusal = "host-tier element " + std::to_string(e.slot_index) + " names cohort " +
+                      std::to_string(e.cohort) + ", which is not a host-pinned cohort";
+            return false;
+        }
+        const size_t held_bytes = held.cap(info->name, e.slot_index);
+        if (held_bytes == 0) {
+            refusal = std::string("the held reservation has no slot ") + std::to_string(e.slot_index) + " of cohort " +
+                      info->name + " (a republish reuses the held slots and allocates none)";
+            return false;
+        }
+        if ((size_t) e.slot_bytes > held_bytes) {
+            refusal = std::string("slot ") + std::to_string(e.slot_index) + " of cohort " + info->name + " needs " +
+                      std::to_string(e.slot_bytes) + " B and the held slot is " + std::to_string(held_bytes) + " B";
+            return false;
+        }
+    }
+    return true;
+}
+
+// The commit of a first publish: the reserved table becomes the entry's held reservation.  `table` is
+// emptied on success; on false (an unbound context, or an entry that already holds a table) the caller
+// still owns it and drops it with no lock held.  `installed_id` is the id the table was keyed by, read once
+// here: the rollback guard drops by it, so the install and its rollback cannot name different ids.
+static bool ggml_sycl_host_tenants_install(const ggml_backend_sycl_context *             ctx,
+                                           std::shared_ptr<ggml_sycl::kv_tenant_slots> & table,
+                                           uint64_t                                      tenant_key,
+                                           uint64_t &                                    installed_id) {
+    if (!ctx || ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES || !table) {
+        return false;
+    }
+    const uint64_t id = ggml_sycl_context_execution_id(ctx);
+    if (id == 0 || !ggml_sycl_kv_region_registry(ctx->device).install_tenant_slots(id, table, tenant_key)) {
+        return false;
+    }
+    table.reset();
+    installed_id = id;
+    return true;
+}
+
+// A context's entry loses its held host reservation, after its section: the one erase of a table by the id
+// that keyed it, named by the caller as the section's erase is.  The last drop of a slot is the last drop of
+// its carve, and a buffer still built over one keeps it through its own copy of the handle.  Never throws; a
+// drop that fails leaves the carves pinned to the process's end, and is said at ERROR.
+static void ggml_sycl_host_tenants_erase(int device, uint64_t context_id) noexcept {
+    try {
+        if (context_id == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+            return;
+        }
+        auto previous = ggml_sycl_kv_region_registry(device).take_tenant_slots(context_id);
+        (void) previous;  // dropped here, with no registry lock held
+    } catch (...) {
+        GGML_LOG_ERROR(
+            "[CONTEXT-PLAN] the held host reservation of an execution context could not be dropped; its carves stay "
+            "pinned until the process ends\n");
+    }
+}
+
+// A table installed ahead of the inner transaction is taken back unless the section that describes it was stored: a
+// publish that fails after the install (the inner transaction refused or threw, the plan could not be bound, the
+// section's store threw) leaves the context holding no host reservation, as a refused first publish always did.
+// Only a table this publish installed arms it, so a republish never takes back the held one.  It holds the device
+// and the id the install keyed the table by.
+struct ggml_sycl_host_tenants_install_guard {
+    int      device = -1;
+    uint64_t id     = 0;
+
+    ~ggml_sycl_host_tenants_install_guard() {
+        if (id != 0) {
+            ggml_sycl_host_tenants_erase(device, id);
+        }
+    }
+
+    void keep() { id = 0; }
+};
+
+// The end of an execution context is the end of its id, and the registry entries it keyed (the host
+// reservation and the published section) go with it: the backend destructor drops them too, but only
+// while the backend still carries the id, and finish_drain / close_if_idle reset that first.  The drop is
+// by the ENDED id and the devices the ended bindings were on, so it needs no backend (nothing to pin, no
+// allocation that can fail) and runs outside the binding mutex (it frees memory through the unified cache),
+// in the destructor's order.  Never throws; each erase says its own failure at ERROR.
+static void ggml_sycl_execution_drop_context_registry_entries(uint64_t context_id,
+                                                              const bool (&devices)[GGML_SYCL_MAX_DEVICES]) noexcept {
+    for (int device = 0; device < GGML_SYCL_MAX_DEVICES; ++device) {
+        if (devices[device]) {
+            ggml_sycl_published_section_erase(device, context_id);
+            ggml_sycl_host_tenants_erase(device, context_id);
+        }
+    }
+}
+
+// Whether `txn` is the open load transaction.  The caller holds the ledger's mutex, so that a clear
+// cannot run between this read and the use of its answer (the lifecycle registry's mutex is taken and
+// released inside, which is the one nesting the block comment above names).
+static bool ggml_sycl_load_txn_is_open(uint64_t txn) {
+    return txn != 0 && ggml_sycl::lifecycle::global_registry().admission_diagnostics().active_txn == txn;
+}
+
+// The one writer of the compute-term ledger's terms: c(P) for (load transaction, device), the term
+// the early inventory stage admitted (zhcn measure call site (b)).  False, recording nothing, when
+// the load carries no n_ctx (an envelope with no shape has no c(P) to measure, and the late check
+// then answers NOT_RECORDED) or when `txn` is not the open load, which the same lock that guards the
+// ledger decides, so no term lands after the clear of a load that ended.
+//
+// NO PRODUCTION CALLER UNTIL L6.  llama.cpp-moua L6 (moua design 2.4.2 (b)) adds the llama-side
+// early measure call site that reaches this; until fkpg(a) puts a non-zero n_ctx in the envelope the
+// only caller is the private test hook below.  It is the single entry on purpose and is not dead
+// code to delete: scripts/check-sycl-l4-proc-registration.py pins that no other function writes the
+// ledger.
+[[maybe_unused]] static bool ggml_sycl_load_record_compute_term(uint64_t txn,
+                                                                int32_t  device,
+                                                                uint64_t bytes,
+                                                                uint32_t n_ctx) {
+    ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+    std::lock_guard<std::mutex>   lock(state.mutex);
+    return state.ledger.record(txn, device, bytes, n_ctx, ggml_sycl_load_txn_is_open(txn));
+}
+
+// One ledger line, at the level the ledger chose for it.
+static void ggml_sycl_load_ledger_log(const ggml_sycl::load_compute_ledger::check_result & r) {
+    if (r.line.empty()) {
+        return;
+    }
+    switch (r.level) {
+        case ggml_sycl::LOAD_LOG_LEVEL_ERROR:
+            GGML_LOG_ERROR("%s\n", r.line.c_str());
+            break;
+        case ggml_sycl::LOAD_LOG_LEVEL_WARN:
+            GGML_LOG_WARN("%s\n", r.line.c_str());
+            break;
+        case ggml_sycl::LOAD_LOG_LEVEL_INFO:
+            GGML_LOG_INFO("%s\n", r.line.c_str());
+            break;
+        case ggml_sycl::LOAD_LOG_LEVEL_NONE:
+            break;
+    }
+}
+
+// A load's commit or rollback drops its terms.  Returns how many.
+static size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {
+    try {
+        ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+        std::lock_guard<std::mutex>   lock(state.mutex);
+        return state.ledger.clear(txn);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Clears the finisher's terms when the end call's try scope is left normally: the registry has ended the
+// transaction by then, so no record for it can still find it open.  An exit by exception does NOT clear here:
+// the handler has yet to end the transaction, and a clear before that end would leave a window in which a
+// record still finds the transaction open and inserts after the clear.  The handler's
+// ggml_sycl_load_ledger_clear_after_end clears after the end instead.
+struct ggml_sycl_load_ledger_clear_guard {
+    uint64_t txn;
+    int      uncaught;
+
+    explicit ggml_sycl_load_ledger_clear_guard(uint64_t t) : txn(t), uncaught(std::uncaught_exceptions()) {}
+
+    ~ggml_sycl_load_ledger_clear_guard() {
+        if (std::uncaught_exceptions() > uncaught) {
+            return;
+        }
+        (void) ggml_sycl_load_clear_compute_terms(txn);
+    }
+};
+
+// The end call's handler arms it (txn non-zero) with the transaction it is about to end -- as its first act when
+// this call is the finisher, so a throw from anything the handler does before the end still clears -- and the
+// clear runs when the handler is left, after the end call: order is end, then clear, on every path.  If the
+// registry's end call (finalize_end, or ggml_sycl_finalize_binding_failure_abort in the recovery arm) itself
+// throws out of the handler, or anything the handler does before the end call throws (the placement cleanup, on
+// the finisher arm, which the top arming exists to survive), the clear still runs, but the registry never ended
+// the transaction, so a record in that case can still find it open; that residue is a failure this ordering
+// cannot close, whoever's it is.
+struct ggml_sycl_load_ledger_clear_after_end {
+    uint64_t txn = 0;
+
+    ~ggml_sycl_load_ledger_clear_after_end() {
+        if (txn != 0) {
+            (void) ggml_sycl_load_clear_compute_terms(txn);
+        }
+    }
+};
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+extern "C" bool ggml_backend_sycl_test_record_compute_term(ggml_sycl_load_txn txn,
+                                                           int32_t            device,
+                                                           uint64_t           bytes,
+                                                           uint32_t           n_ctx) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return false;
+    }
+    return ggml_sycl_load_record_compute_term(txn.id, device, bytes, n_ctx);
+}
+
+// How many terms the ledger holds in all; a cleared load leaves none behind.
+extern "C" size_t ggml_backend_sycl_test_compute_term_count() {
+    ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+    std::lock_guard<std::mutex>   lock(state.mutex);
+    return state.ledger.size();
+}
+#endif
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_begin(ggml_sycl_load_txn * txn) {
+    ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LOAD);
     sycl_module_mutation_guard module_guard;
     // A closed module is the same load-admission condition as the Registry's
     // shutdown gate, not the generic operation BUSY result.
@@ -13125,9 +13897,27 @@ static bool ggml_sycl_materialize_published_mmid_workspaces(
     return false;
 }
 
+// Counts the load_end bodies running at once. The LOAD token serialises them, so
+// the count is 0 on every entry; the witness checks that rather than assuming it.
+static std::atomic<int> g_load_end_bodies_running{ 0 };
+
+namespace {
+struct ggml_sycl_load_end_body_witness {
+    ggml_sycl_load_end_body_witness() {
+        const int running = g_load_end_bodies_running.fetch_add(1, std::memory_order_acq_rel);
+        GGML_SYCL_WITNESS(running == 0, "[REPLAN-TOKEN] two load_end bodies overlapped");
+        (void) running;
+    }
+
+    ~ggml_sycl_load_end_body_witness() { g_load_end_bodies_running.fetch_sub(1, std::memory_order_acq_rel); }
+};
+}  // namespace
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn      txn,
                                                             bool                    explicit_success,
                                                             ggml_sycl_model_token * model) {
+    ggml_sycl_replan_token          l0(GGML_SYCL_REPLAN_KIND_LOAD);
+    ggml_sycl_load_end_body_witness load_end_body_witness;
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     ggml_sycl::lifecycle::Registry *    registry = nullptr;
@@ -13145,6 +13935,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             return ggml_sycl_load_end_replay_result(ticket, model);
         }
 
+        // This call finishes the load: when it ends normally from here, the load's early terms are done and the
+        // guard clears them after the registry ended the transaction.  The handler clears them after its own end
+        // call instead (ggml_sycl_load_ledger_clear_after_end), and so does the recovery arm.
+        ggml_sycl_load_ledger_clear_guard           ledger_clear{ txn.id };
         ggml_sycl::lifecycle::finisher_effect_scope finisher_effect;
         if (ticket.commit) {
             finisher_effect = registry->acquire_finisher_effect(ticket);
@@ -13270,6 +14064,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         }
         return ggml_sycl_lifecycle_c_result(result.code);
     } catch (...) {
+        ggml_sycl_load_ledger_clear_after_end after_end;
+        if (ticket.finisher) {
+            after_end.txn = txn.id;  // armed before anything below that can throw: end, then clear, on every path
+        }
         g_sycl_abort_load_exit = false;
         if (placement_inserted) {
             const auto failed_plan = ggml_sycl::lifecycle_find_placement_plan(
@@ -13296,6 +14094,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             if (!recovery.finisher) {
                 return ggml_sycl_load_end_replay_result(recovery, model);
             }
+            after_end.txn = txn.id;
             ggml_sycl_finalize_binding_failure_abort(*registry, recovery);
         }
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
@@ -14860,6 +15659,41 @@ bool ggml_backend_sycl_has_active_placement_plan(void) {
     return ggml_sycl_has_global_plan();
 }
 
+// The measure plan override's two writers.  The thread-local is
+// written only here.  Install builds nothing: it finds the plan moua staged for the
+// load -- the probe placement's at (a), the load's candidate at (b) and (c) -- and
+// holds it, in the candidate's shape, for this thread until clear.
+bool ggml_backend_sycl_measure_plan_override_install(uint64_t load_txn, ggml_sycl_measure_stage stage) {
+    if (g_measure_plan_override) {
+        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] measure plan override nested\n");
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override nested");
+        }
+        return false;
+    }
+    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snapshot;
+    switch (stage) {
+        case GGML_SYCL_MEASURE_STAGE_PROBE:
+            snapshot = ggml_sycl::lifecycle_find_probe_placement_plan(load_txn);
+            break;
+        case GGML_SYCL_MEASURE_STAGE_CANDIDATE_B:
+        case GGML_SYCL_MEASURE_STAGE_CANDIDATE_C:
+            snapshot = ggml_sycl::lifecycle_find_candidate_placement_plan(load_txn);
+            break;
+    }
+    if (!snapshot || !snapshot->plan) {
+        GGML_LOG_WARN("[LOAD-PLAN] measure plan override: no plan staged for load %llu at stage %d\n",
+                      (unsigned long long) load_txn, (int) stage);
+        return false;
+    }
+    g_measure_plan_override = std::move(snapshot);
+    return true;
+}
+
+void ggml_backend_sycl_measure_plan_override_clear(void) {
+    g_measure_plan_override.reset();
+}
+
 ggml_sycl_execution_result ggml_backend_sycl_execution_context_create(ggml_sycl_exec_context_id * context) {
     try {
         sycl_module_mutation_guard module_guard;
@@ -15301,6 +16135,7 @@ ggml_sycl_execution_result ggml_backend_sycl_execution_session_finish_reset(
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_activate_model_plan(ggml_sycl_model_token model) {
+    ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     try {
@@ -15418,6 +16253,19 @@ static ggml_sycl_prepared_plan_publication ggml_sycl_prepare_plan_publication_lo
 }
 
 static void ggml_sycl_publish_prepared_plan_locked(ggml_sycl_prepared_plan_publication & publication) noexcept {
+    // The measure's plan override is never published, and neither is anything
+    // derived from it (a copy of an accessor's answer included, so a pointer match
+    // would miss it).  This runs before any write below.
+    if (ggml_sycl_measure_plan_override_active()) {
+        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] measure plan override reached a publish\n");
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override reached a publish");
+        }
+        return;
+    }
+    // A plan publication can move or release the storage a cached data pointer
+    // names; entries filled before it must miss.
+    ggml_sycl_tenant_publish_gen_bump();
     const auto & snapshot = publication.snapshot;
     g_model_n_layer       = publication.model_n_layer;
     g_placement_kv_info   = std::move(publication.kv_info);
@@ -15905,6 +16753,28 @@ static bool ggml_sycl_placement_plan_needs_moe_secondary_devices(const ggml_sycl
     return false;
 }
 
+// Was multi-GPU MoE asked for on this host?  Two or more GPUs and not switched off.
+static bool ggml_sycl_moe_multi_gpu_requested() {
+    const char * env = std::getenv("GGML_SYCL_MOE_MULTI_GPU");
+    return ggml_sycl_info().total_gpu_count >= 2 && (!env || std::atoi(env) != 0);
+}
+
+// The one function that turns a plan into "this plan wants the multi-GPU MoE path".
+// The latch's writer applies it to the plan it computes, and the measure's executor
+// reads apply it to the override's plan, so both answer from the same condition.
+static bool ggml_sycl_moe_multi_gpu_wanted(const ggml_sycl::placement_plan & plan) {
+    return ggml_sycl_moe_multi_gpu_requested() && ggml_sycl_placement_plan_needs_moe_secondary_devices(plan);
+}
+
+// The latch as the executor-deciding reads see it: the override's plan under a
+// measure, the process latch otherwise.
+static bool ggml_sycl_moe_multi_gpu_for_executor() {
+    if (g_measure_plan_override) {
+        return g_measure_plan_override->plan && ggml_sycl_moe_multi_gpu_wanted(*g_measure_plan_override->plan);
+    }
+    return g_moe_multi_gpu_active.load(std::memory_order_acquire);
+}
+
 static bool ggml_sycl_placement_plan_moe_needs_other_device(const ggml_sycl::placement_plan & plan,
                                                             int                               execution_device) {
     if (!plan.multi_device) {
@@ -16308,6 +17178,18 @@ void test_clear_kv_placement_plan() {
     g_model_n_layer     = 0;
     g_placement_kv_info = {};
 }
+
+bool test_moe_multi_gpu_for_executor() {
+    return ggml_sycl_moe_multi_gpu_for_executor();
+}
+
+bool test_moe_multi_gpu_latch() {
+    return g_moe_multi_gpu_active.load(std::memory_order_acquire);
+}
+
+bool test_moe_multi_gpu_wanted(const placement_plan & plan) {
+    return ggml_sycl_moe_multi_gpu_wanted(plan);
+}
 #endif
 }  // namespace ggml_sycl
 
@@ -16558,11 +17440,8 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     // weight-zone capacity.  S1 materialization must follow this final plan.
     if (have_plan) {
         const bool   plan_needs_moe_secondary = ggml_sycl_placement_plan_needs_moe_secondary_devices(plan);
-        const auto & info              = ggml_sycl_info();
-        const char * moe_multi_gpu_env = std::getenv("GGML_SYCL_MOE_MULTI_GPU");
-        const bool   moe_multi_gpu_requested =
-            info.total_gpu_count >= 2 && (!moe_multi_gpu_env || std::atoi(moe_multi_gpu_env) != 0);
-        if (moe_multi_gpu_requested && plan_needs_moe_secondary) {
+        const auto & info                     = ggml_sycl_info();
+        if (ggml_sycl_moe_multi_gpu_wanted(plan)) {
             ggml_sycl::init_shared_context_queues(info.total_gpu_count);
 
             int n_registered = 0;
@@ -16908,6 +17787,7 @@ static std::atomic<bool> g_test_fail_next_stage_inventory_plan_late_after_first_
 ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory *   inventory,
                                                                   const ggml_sycl_placement_envelope * envelope,
                                                                   bool                                 early) {
+    ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_LOAD);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     if (!inventory || (inventory->count > 0 && !inventory->tensors)) {
@@ -19321,6 +20201,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     ggml_sycl::unified_cache_begin_planned_hold_epoch(ctx->device, ctx->planned_scratch_owner, next_kv_info.n_ubatch,
                                                       hold_kv_room);
     announce_kv_host_demotions(*immutable->plan);
+    // The commit point the dump's context_txn snapshot entries name: the RUNTIME room and the ONEDNN
+    // capacity as they stand once this transaction has published.
+    ggml_sycl::unified_cache_dump_capture_zone_figures(ctx->device, ggml_sycl::dump_point::CONTEXT_TXN);
 
 #if GGML_SYCL_DNNL
     // llama.cpp-0oxf: a pooled DIRECT Graph-scratch buffer was sized for the
@@ -19363,6 +20246,14 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // next = ...` even runs, so this point is never reached with a non-NULL
     // out.
     ctx->runtime_kv_admitted = true;
+    // Any publish changes the context's shape, so a section published earlier no longer describes it.
+    // The descriptor path publishes its own section after this returns.
+    // Not the swallowing helper: a drop that fails must reach the caller, which answers EFFECT_FAILED.  The new
+    // plan is already live and nothing rolls it back, so when the drop's lock fails the OLD section stays in
+    // the registry while the new plan is live, and a coverage query could answer EQUAL against the dead shape
+    // until the next publish.  The failure is a mutex lock's std::system_error, practically unreachable; it is
+    // reported, not repaired.
+    ggml_sycl_published_section_set(ctx, nullptr);
     return ggml_sycl_txn_result::ACCEPTED;
 }
 
@@ -19378,9 +20269,27 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                            bool           kv_unified,
                                            bool           swa_full,
                                            bool           flash_attn_enabled) {
-    (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
-                                                     flash_attn_enabled,
-                                                     /*probe_mode=*/false, /*out=*/nullptr);
+    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_TRANSACTION);
+    // C ABI boundary: no exception of any type crosses this entry.  The publish tail's drop of the earlier section
+    // takes the registry lock and may throw; the state is left as the failed path leaves it (the new plan is live,
+    // the old section may remain), and the entry only reports.
+    try {
+        (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
+                                                         flash_attn_enabled,
+                                                         /*probe_mode=*/false, /*out=*/nullptr);
+    } catch (const std::system_error & e) {
+        GGML_LOG_ERROR(
+            "[SYCL] ggml_backend_sycl_set_runtime_context: a lock failed after the plan was published (%s); the "
+            "earlier descriptor section may remain\n",
+            e.what());
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("[SYCL] ggml_backend_sycl_set_runtime_context: the runtime context update threw (%s)\n",
+                       e.what());
+    } catch (...) {
+        GGML_LOG_ERROR(
+            "[SYCL] ggml_backend_sycl_set_runtime_context: the runtime context update threw a non-standard "
+            "exception\n");
+    }
 }
 
 // llama.cpp-tsfl (nphx comment c-wgxn): see ggml_sycl_runtime_context_probe
@@ -19407,6 +20316,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(ggm
                                                                              bool                  swa_full,
                                                                              bool                  flash_attn_enabled,
                                                                              ggml_sycl_runtime_context_probe * out) {
+    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     if (!out) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
@@ -19510,14 +20420,23 @@ uint32_t ggml_backend_sycl_moe_gpu_ubatch_max() {
     return ggml_sycl::MOE_GPU_UBATCH_MAX;
 }
 
-ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_backend_t        backend,
-                                                                           ggml_sycl_model_token model,
-                                                                           uint32_t              n_ctx,
-                                                                           uint32_t              n_ubatch,
-                                                                           uint32_t              n_seq_max,
-                                                                           bool                  kv_unified,
-                                                                           bool                  swa_full,
-                                                                           bool                  flash_attn_enabled) {
+// The model-bound publish both entry points share.  `has_desc` selects the descriptor entry point:
+// `desc` is then read once, here, under its gates (a refusal is deterministic, so PLAN_REJECTED, the
+// same answer the inner transaction gives), and the section it yields is stored in the context's
+// registry entry once the transaction has published.  The older entry point passes has_desc == false
+// and publishes no section (its inner transaction drops any earlier one).
+static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(
+    ggml_backend_t                         backend,
+    ggml_sycl_model_token                  model,
+    uint32_t                               n_ctx,
+    uint32_t                               n_ubatch,
+    uint32_t                               n_seq_max,
+    bool                                   kv_unified,
+    bool                                   swa_full,
+    bool                                   flash_attn_enabled,
+    const ggml_sycl_runtime_context_desc * desc,
+    bool                                   has_desc) {
+    ggml_sycl_replan_token     l0(GGML_SYCL_REPLAN_KIND_TRANSACTION);
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     if (!backend || !backend->context || n_ctx == 0) {
@@ -19529,6 +20448,31 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
     if (!ggml_backend_is_sycl(backend) || !backend->device ||
         ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
         return GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND;
+    }
+    std::shared_ptr<const ggml_sycl::runtime_context_section> section;
+    if (has_desc) {
+        try {
+            ggml_sycl::runtime_context_geometry geometry;
+            geometry.n_ctx      = n_ctx;
+            geometry.n_ubatch   = n_ubatch;
+            geometry.n_seq_max  = n_seq_max;
+            geometry.kv_unified = kv_unified;
+            geometry.swa_full   = swa_full;
+            geometry.flash_attn = flash_attn_enabled;
+            ggml_sycl::runtime_context_section parsed;
+            const auto                         status = ggml_sycl::parse_runtime_context_desc(
+                desc, geometry, std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES), parsed);
+            if (status != ggml_sycl::runtime_context_desc_status::OK) {
+                GGML_LOG_WARN("[CONTEXT-PLAN] runtime context descriptor refused: %s (n_ctx=%u n_ubatch=%u)\n",
+                              ggml_sycl::runtime_context_desc_status_text(status), n_ctx, n_ubatch);
+                return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+            }
+            section = std::make_shared<const ggml_sycl::runtime_context_section>(std::move(parsed));
+        } catch (const ggml_sycl_fallback_error &) {
+            throw;
+        } catch (...) {
+            return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+        }
     }
     const ggml_sycl::lifecycle::ModelToken token{
         { model.model_id },
@@ -19551,6 +20495,55 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
             (void) registry.finalize_live_update(ticket);
         }
     } guard{ registry, std::move(ticket) };
+
+    // The first publish of a context reserves AND HOLDS its host-tier room (moua design 2.3.2): one
+    // owner-first carve per host slot, allocated here, before L1 (g_tensor_inventory_mutex), because a
+    // host-zone allocation can need a new pinned chunk and a USM call must not run under L1.  A republish
+    // never allocates: the entry already holds the table, and a section that table cannot carry is refused
+    // here, before anything is published, so the published section never says more than the table backs.  A
+    // refused allocation is likewise a refusal before anything was published, and the carves made so far drop
+    // with `host_tenants` on every exit that does not install them, with no registry lock held.
+    std::shared_ptr<ggml_sycl::kv_tenant_slots> host_tenants;
+    ggml_sycl_host_tenants_install_guard        host_tenants_installed;
+    if (section && backend_ctx && backend_ctx->device >= 0 && backend_ctx->device < GGML_SYCL_MAX_DEVICES) {
+        const uint64_t exec_id = ggml_sycl_context_execution_id(backend_ctx);
+        if (exec_id != 0) {
+            std::string refusal;
+            try {
+                const auto held = ggml_sycl_kv_region_registry(backend_ctx->device).tenants(exec_id);
+                if (held == nullptr) {
+                    if (!ggml_sycl_reserve_host_tenants(backend_ctx, *section, host_tenants, refusal)) {
+                        GGML_LOG_WARN("[CONTEXT-PLAN] host tenant reservation refused: %s (n_ctx=%u n_ubatch=%u)\n",
+                                      refusal.c_str(), n_ctx, n_ubatch);
+                        return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                    }
+                } else if (!ggml_sycl_host_tenants_carry(*held, *section, refusal)) {
+                    GGML_LOG_WARN("[CONTEXT-PLAN] host tenant republish refused: %s (n_ctx=%u n_ubatch=%u)\n",
+                                  refusal.c_str(), n_ctx, n_ubatch);
+                    return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                }
+                // The table is installed here, before anything is published, so that a refused install (the
+                // context ended since its id was read, or its entry already holds a table) is a refusal with
+                // nothing published, as PLAN_REJECTED says.  The guard takes the table back on any later failure.
+                if (host_tenants) {
+                    uint64_t installed_id = 0;
+                    if (!ggml_sycl_host_tenants_install(backend_ctx, host_tenants, section->tenant_key, installed_id)) {
+                        GGML_LOG_ERROR(
+                            "[CONTEXT-PLAN-BUG] the host reservation could not be installed on its context; the "
+                            "descriptor publish is refused and nothing is published (n_ctx=%u n_ubatch=%u)\n",
+                            n_ctx, n_ubatch);
+                        return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+                    }
+                    host_tenants_installed.device = backend_ctx->device;
+                    host_tenants_installed.id     = installed_id;
+                }
+            } catch (const ggml_sycl_fallback_error &) {
+                throw;
+            } catch (...) {
+                return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+            }
+        }
+    }
 
     // Retained past the locked scope below so a load_end deferral can be
     // resolved OUTSIDE g_tensor_inventory_mutex. Copying the pointer under the
@@ -19633,13 +20626,33 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
     g_runtime_expected_model_set = true;
     g_runtime_external_lease     = true;
     g_runtime_update_succeeded   = false;
+    // The transaction, not the C entry: that entry catches what the publish tail's drop of the earlier section
+    // can throw so none crosses the C ABI, and this caller must see it to answer EFFECT_FAILED.  The token
+    // held above is the one the transaction needs.
     try {
-        ggml_backend_sycl_set_runtime_context(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
-                                              flash_attn_enabled);
+        (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
+                                                         flash_attn_enabled,
+                                                         /*probe_mode=*/false, /*out=*/nullptr);
     } catch (...) {
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
     const bool inner_ok = g_runtime_update_succeeded;
+    // The descriptor's section is the context's published shape from here on.  Only when the inner
+    // transaction published: a refused one changed nothing, and the section it was given describes a
+    // shape that never went live.
+    if (inner_ok && section) {
+        try {
+            // The table was installed before anything was published (above), so the section, the cheap step and
+            // the one a reader trusts, is stored last and only once the table it describes is held.  Once it is
+            // stored the table stays; a throw before that leaves the guard to take the table back.
+            ggml_sycl_published_section_set(backend_ctx, section);
+            host_tenants_installed.keep();
+        } catch (const ggml_sycl_fallback_error &) {
+            throw;
+        } catch (...) {
+            return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
+        }
+    }
     // Resolve a load_end deferral now that a backend context exists. Idempotent:
     // the MMID registry answers ALREADY_PUBLISHED when a pool is already live,
     // so the registry itself is the deferred-state record and no parallel
@@ -19664,19 +20677,197 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
         }
     }
     // PLAN_REJECTED, not BUSY. The inner refusal is deterministic -- the same
-    // n_ctx against the same budget refuses identically every time -- and
-    // llama_context retries BUSY seven times with backoff, which turned one
-    // decision into eight identical error lines and no different outcome
-    // (llama.cpp-uize). Genuine transients above still return BUSY.
+    // n_ctx against the same budget refuses identically every time -- and a
+    // BUSY is a transient the caller reruns on its next decode (it never loops
+    // on it), so reporting a deterministic refusal as BUSY would have the
+    // caller rerun a decision that cannot change (llama.cpp-uize). Genuine
+    // transients above still return BUSY.
     return inner_ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+}
+
+ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_backend_t        backend,
+                                                                           ggml_sycl_model_token model,
+                                                                           uint32_t              n_ctx,
+                                                                           uint32_t              n_ubatch,
+                                                                           uint32_t              n_seq_max,
+                                                                           bool                  kv_unified,
+                                                                           bool                  swa_full,
+                                                                           bool                  flash_attn_enabled) {
+    return ggml_sycl_set_runtime_context_for_model_impl(backend, model, n_ctx, n_ubatch, n_seq_max, kv_unified,
+                                                        swa_full, flash_attn_enabled, nullptr, false);
+}
+
+ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_desc(ggml_backend_t        backend,
+                                                                      ggml_sycl_model_token model,
+                                                                      uint32_t              n_ctx,
+                                                                      uint32_t              n_ubatch,
+                                                                      uint32_t              n_seq_max,
+                                                                      bool                  kv_unified,
+                                                                      bool                  swa_full,
+                                                                      bool                  flash_attn_enabled,
+                                                                      const ggml_sycl_runtime_context_desc * desc) {
+    return ggml_sycl_set_runtime_context_for_model_impl(backend, model, n_ctx, n_ubatch, n_seq_max, kv_unified,
+                                                        swa_full, flash_attn_enabled, desc, true);
+}
+
+// Would publishing this candidate need a transaction?  Read-only: it publishes nothing, takes no
+// replan lock and no lifecycle lease.  It reads this context's own entry in one section under the
+// registry's leaf mutex.  Every doubt answers GROWTH (the zero value): a null or foreign backend, a
+// closed module, a candidate that does not parse, a context with no execution identity, and a
+// context with no published section.
+enum ggml_sycl_tenant_coverage ggml_backend_sycl_tenant_coverage(ggml_backend_t backend,
+                                                                 uint32_t       n_ctx,
+                                                                 uint32_t       n_ubatch,
+                                                                 uint32_t       n_seq_max,
+                                                                 bool           kv_unified,
+                                                                 bool           swa_full,
+                                                                 bool           flash_attn_enabled,
+                                                                 const ggml_sycl_runtime_context_desc * candidate) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard || !backend || !backend->context || !candidate) {
+        return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+    }
+    if (!ggml_backend_is_sycl(backend) || !backend->device ||
+        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
+        return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+    }
+    try {
+        const auto * ctx = static_cast<const ggml_backend_sycl_context *>(backend->context);
+        if (ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES) {
+            return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+        }
+        ggml_sycl::runtime_context_geometry geometry;
+        geometry.n_ctx      = n_ctx;
+        geometry.n_ubatch   = n_ubatch;
+        geometry.n_seq_max  = n_seq_max;
+        geometry.kv_unified = kv_unified;
+        geometry.swa_full   = swa_full;
+        geometry.flash_attn = flash_attn_enabled;
+        ggml_sycl::runtime_context_section parsed;
+        if (ggml_sycl::parse_runtime_context_desc(candidate, geometry,
+                                                  std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES),
+                                                  parsed) != ggml_sycl::runtime_context_desc_status::OK) {
+            return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+        }
+        const uint64_t id = ggml_sycl_context_execution_id(ctx);
+        if (id == 0) {
+            return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+        }
+        const auto published = ggml_sycl_kv_region_registry(ctx->device).published_section(id);
+        return ggml_sycl::classify_tenant_coverage(published.get(), parsed);
+    } catch (...) {
+        return GGML_SYCL_TENANT_COVERAGE_GROWTH;
+    }
+}
+
+// The late measure of a load against the term the early stage recorded (zhcn call site (c)).  The
+// rule and the strings are load_compute_ledger's; this adds the open-transaction read, the log at the
+// level the line is for, and the shrink counter.  Fail-closed: NOT_RECORDED is the zero value and is
+// the answer to everything this cannot compare, and it never reads as a pass.
+enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check(ggml_sycl_load_txn txn,
+                                                                   int32_t            device,
+                                                                   uint64_t           compute_bytes) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
+    try {
+        ggml_sycl::load_compute_ledger::check_result r;
+        {
+            ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+            std::lock_guard<std::mutex>   lock(state.mutex);
+            r = state.ledger.check(txn.id, device, compute_bytes, ggml_sycl_load_txn_is_open(txn.id));
+        }
+        ggml_sycl_load_ledger_log(r);
+        if (r.shrink_counted) {
+            ggml_sycl::unified_cache_dump_counter_add(ggml_sycl::dump_counter::late_term_shrink_admitted, device);
+        }
+        return r.result;
+    } catch (...) {
+        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
+}
+
+// The residency probe (llama.cpp-moua L4 step 3d, llama.cpp-5cim): which layers would this context's plan leave in host
+// memory?  The core that answers is residency-probe.hpp's; what it needs and this entry cannot yet give it is the live
+// shared-zone geometry of each device and the planned device of each layer, which step 1d wires.  Until then the proc
+// validates what it is handed and answers GEOMETRY_NOT_WIRED: a status of its own that is not OK, carries no vector and
+// is not "zero host layers".  It writes the layer count and nothing else of the answer, and says why at WARN on every
+// refusal.  Pure plan query: it takes no replan lock and no lifecycle lease and changes nothing.
+enum ggml_sycl_residency_probe_status ggml_backend_sycl_probe_residency(ggml_backend_t        backend,
+                                                                        ggml_sycl_model_token model,
+                                                                        uint32_t              n_ctx,
+                                                                        uint32_t              n_ubatch,
+                                                                        uint32_t              n_seq_max,
+                                                                        bool                  kv_unified,
+                                                                        bool                  swa_full,
+                                                                        bool                  flash_attn_enabled,
+                                                                        const ggml_sycl_runtime_context_desc * desc,
+                                                                        struct ggml_sycl_residency_probe *     out) {
+    (void) model;
+    if (!ggml_sycl::residency_probe_out_declared(out)) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] refused: the result struct is missing, short or of another version\n");
+        return GGML_SYCL_RESIDENCY_PROBE_INVALID;
+    }
+    out->n_layer = 0;
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] no answer: the SYCL module is closing\n");
+        return GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED;
+    }
+    if (!backend || !backend->context || !ggml_backend_is_sycl(backend) || !backend->device ||
+        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] refused: not a SYCL backend of this module\n");
+        return GGML_SYCL_RESIDENCY_PROBE_FOREIGN_BACKEND;
+    }
+    if (n_ctx == 0 || n_ubatch == 0 || n_seq_max == 0) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] refused: the shape has a zero n_ctx, n_ubatch or n_seq_max (%u, %u, %u)\n",
+                      n_ctx, n_ubatch, n_seq_max);
+        return GGML_SYCL_RESIDENCY_PROBE_INVALID;
+    }
+    try {
+        if (desc != nullptr) {
+            ggml_sycl::runtime_context_geometry geometry;
+            geometry.n_ctx      = n_ctx;
+            geometry.n_ubatch   = n_ubatch;
+            geometry.n_seq_max  = n_seq_max;
+            geometry.kv_unified = kv_unified;
+            geometry.swa_full   = swa_full;
+            geometry.flash_attn = flash_attn_enabled;
+            ggml_sycl::runtime_context_section parsed;
+            const auto                         status = ggml_sycl::parse_runtime_context_desc(
+                desc, geometry, std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES), parsed);
+            if (status != ggml_sycl::runtime_context_desc_status::OK) {
+                GGML_LOG_WARN("[RESIDENCY-PROBE] refused: the descriptor is malformed: %s\n",
+                              ggml_sycl::runtime_context_desc_status_text(status));
+                return GGML_SYCL_RESIDENCY_PROBE_INVALID;
+            }
+            out->n_layer = (uint32_t) parsed.kv.layers.size();
+        }
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (...) {
+        out->n_layer = 0;
+        GGML_LOG_WARN("[RESIDENCY-PROBE] no answer: reading the descriptor threw\n");
+        return GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED;
+    }
+    if (out->n_layer_cap < out->n_layer) {
+        GGML_LOG_WARN("[RESIDENCY-PROBE] refused: the answer covers %u layers and the caller's buffer holds %u\n",
+                      out->n_layer, out->n_layer_cap);
+        return GGML_SYCL_RESIDENCY_PROBE_N_LAYER_CAP_TOO_SMALL;
+    }
+    GGML_LOG_WARN(
+        "[RESIDENCY-PROBE] no answer: the zone geometry is not wired to the probe yet (step 1d); n_layer=%u\n",
+        out->n_layer);
+    return GGML_SYCL_RESIDENCY_PROBE_GEOMETRY_NOT_WIRED;
 }
 
 // llama.cpp-oyfl: a NARROW re-evaluation of the non-FA attention scratch
 // guard only, against the currently PUBLISHED plan's shape -- deliberately
 // not a call into ggml_backend_sycl_set_runtime_context_for_model() above.
 // That full transaction re-runs the KV replan, the MoE MMID
-// reaccount/materialize pass, a plan republish, and (via the caller's own
-// retry loop) a BUSY backoff -- none of which a mere flash_attn_type
+// reaccount/materialize pass, a plan republish, and (when it answers BUSY)
+// a rerun of the whole transaction on the next decode -- none of which a mere flash_attn_type
 // resolution has any business touching, since n_ctx/n_ubatch have not
 // changed. NOT read-only: it takes sycl_module_mutation_guard (so it
 // cannot run past a module shutdown) and g_tensor_inventory_mutex -- the
@@ -19697,6 +20888,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
 ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(ggml_backend_t        backend,
                                                                                 ggml_sycl_model_token model,
                                                                                 bool flash_attn_enabled) {
+    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     if (!backend || !backend->context) {
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
@@ -20000,8 +21192,14 @@ void * ggml_sycl_get_cached_tensor_ptr_for(const ggml_tensor *      tensor,
 
 // Per-graph-compute pointer resolution cache.  Avoids repeated slow-path
 // resolution for the same tensor/device pair within a single graph compute.
-// Cleared at the start of each ggml_backend_sycl_graph_compute_impl() call.
-// Values are mem_handle so weight handles auto-revalidate via generation counter.
+// Cleared at the start and at the exit of each graph compute, and at each publish.
+//
+// An entry holds NO mem_handle: a
+// pointer cache that owned a handle would be a holder of whatever slice it
+// names.  It stores the pointer, where it lives, the non-owning identity of the
+// tensor's storage slice at fill time, and the process tenant-publish generation
+// at fill time.  A lookup hits only when BOTH still match; either mismatch is a
+// miss, so a stale entry can never name a block a re-plan has recarved.
 struct ggml_sycl_data_ptr_cache_key {
     const ggml_tensor * tensor = nullptr;
     int                 device = -1;
@@ -20018,9 +21216,114 @@ struct ggml_sycl_data_ptr_cache_key_hash {
     }
 };
 
+struct ggml_sycl_data_ptr_cache_entry {
+    void *                         ptr        = nullptr;
+    bool                           on_device  = false;
+    ggml_sycl::mem_handle_identity src        = {};
+    uint64_t                       tenant_gen = 0;
+};
+
 static thread_local std::
-    unordered_map<ggml_sycl_data_ptr_cache_key, ggml_sycl::mem_handle, ggml_sycl_data_ptr_cache_key_hash>
+    unordered_map<ggml_sycl_data_ptr_cache_key, ggml_sycl_data_ptr_cache_entry, ggml_sycl_data_ptr_cache_key_hash>
         g_data_ptr_cache;
+
+// The process-global tenant publish generation.  It is bumped under L0 at every
+// tenant commit and every teardown release, so any entry filled before one of
+// them stamps an older value and misses.  Starts at 1: an entry never carries 0.
+static std::atomic<uint64_t> g_tenant_publish_gen{ 1 };
+
+uint64_t ggml_sycl_tenant_publish_gen() {
+    return g_tenant_publish_gen.load(std::memory_order_acquire);
+}
+
+// Called from the lifecycle entries that commit or release tenant storage, all of
+// which hold L0 (the plan publication, the teardown release, the graph
+// invalidation).  Over-bumping is safe -- it only turns a cached pointer into a
+// miss -- so this does not witness its caller.
+void ggml_sycl_tenant_publish_gen_bump() {
+    g_tenant_publish_gen.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// Fills that found no allocator identity and so cached nothing (a miss is
+// today's slow path).  Always compiled, as every dump-table counter is; the
+// name is llama.cpp-zhcn's and is registered in llama.cpp-23mk's table by that task's step 0.
+static std::atomic<uint64_t> g_graph_ptr_cache_uncached_fill{ 0 };
+
+uint64_t ggml_sycl_graph_ptr_cache_uncached_fill() {
+    return g_graph_ptr_cache_uncached_fill.load(std::memory_order_relaxed);
+}
+
+// The one identity function of the data-pointer cache, used at fill and at lookup.  Defined beside
+// ggml_sycl_find_tensor_storage_handle().
+static bool ggml_sycl_tensor_slice_identity(const ggml_tensor *              tensor,
+                                            int                              device,
+                                            ggml_sycl::mem_handle_identity * out);
+
+// The keep-alive for a staged handle (llama.cpp-1df8) lives outside the cache:
+// the staged handle is the staging cache's own allocation, never a tenant.  Eager
+// calls append here and publish at graph_compute exit; a recording call hands it
+// to the recording sink at once.
+static thread_local std::vector<ggml_sycl::mem_handle> g_graph_staged_owners;
+
+static void ggml_sycl_graph_staged_owner_add(ggml_sycl::mem_handle owner) {
+    if (!owner.valid()) {
+        return;
+    }
+    if (g_ggml_sycl_graph_recording) {
+        std::vector<ggml_sycl::mem_handle> handles;
+        handles.push_back(std::move(owner));
+        ggml_sycl::retain_handles_until_event(std::move(handles), sycl::event{});
+        return;
+    }
+    g_graph_staged_owners.push_back(std::move(owner));
+}
+
+static void ggml_sycl_data_ptr_cache_store(const ggml_tensor * tensor, int device, void * ptr, bool on_device) {
+    ggml_sycl_data_ptr_cache_entry entry;
+    entry.ptr       = ptr;
+    entry.on_device = on_device;
+    if (!ggml_sycl_tensor_slice_identity(tensor, device, &entry.src)) {
+        // No allocator identity: not cached.
+        g_graph_ptr_cache_uncached_fill.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    entry.tenant_gen                     = g_tenant_publish_gen.load(std::memory_order_acquire);
+    g_data_ptr_cache[{ tensor, device }] = entry;
+}
+
+static bool ggml_sycl_data_ptr_on_device(const void * ptr) {
+    return ptr != nullptr && ggml_sycl_get_alloc_type(ptr) == sycl::usm::alloc::device;
+}
+
+// A hit needs the generation AND the tensor's slice identity (computed now) to
+// match the entry's; otherwise the entry is dropped and the caller re-resolves.
+//
+// What the identity compare costs per lookup, so the TG A/B has a bound to be
+// read against: ggml_sycl_tensor_slice_identity walks the tensor's view chain
+// (its depth), then scans the root's extra for a storage handle, which is at most
+// two passes over the routable devices (device-resident first, then any), each
+// pass one mem_handle::resolve(device) per device, plus one resolve of the found
+// handle, one identity() and one narrow.  So it is O(view depth + devices), with
+// devices <= GGML_SYCL_MAX_DEVICES.  It is NOT lock-free: each resolve takes that
+// handle's own leaf spin lock (uncontended on the owner thread) and copies the
+// resolved view, which carries a ready event, so it is an atomic refcount bump.
+// It takes no allocation-registry or zone lock and makes no unified-cache call on
+// a hit (resolve_slow runs only after a cache-generation change).
+static bool ggml_sycl_data_ptr_cache_lookup(const ggml_tensor * tensor, int device, void ** ptr, bool * on_device) {
+    auto it = g_data_ptr_cache.find({ tensor, device });
+    if (it == g_data_ptr_cache.end()) {
+        return false;
+    }
+    ggml_sycl::mem_handle_identity now;
+    if (it->second.tenant_gen == g_tenant_publish_gen.load(std::memory_order_acquire) &&
+        ggml_sycl_tensor_slice_identity(tensor, device, &now) && now == it->second.src && it->second.ptr != nullptr) {
+        *ptr       = it->second.ptr;
+        *on_device = it->second.on_device;
+        return true;
+    }
+    g_data_ptr_cache.erase(it);
+    return false;
+}
 
 // Called on every storage publish and restore, often with the map already
 // empty. clear() still walks the whole bucket array, which never shrinks, so
@@ -20045,6 +21348,37 @@ static bool ggml_sycl_ptr_is_invalid_sentinel(const void * ptr) {
     return ptr == nullptr || reinterpret_cast<uintptr_t>(ptr) == UINTPTR_MAX;
 }
 
+// The tenant belt: a persistent publisher must not
+// leave a tenant-tagged handle in an extra the backend minted for itself
+// (`runtime_minted`).  Such an extra is released only with its backend context,
+// so a tenant slice parked there would outlive its graph and block the reap.
+// The scoped stage publication is the one writer allowed to store a
+// tenant-tagged handle there, and it does not go through these writers.
+// A WARN normally; an abort under GGML_SYCL_STRICT_LEASES=1.  Returns whether the
+// store is allowed.
+static bool ggml_sycl_persistent_publish_allowed(const ggml_tensor_extra_gpu * extra,
+                                                 const ggml_sycl::mem_handle & handle,
+                                                 const char *                  writer) {
+    if (!extra || !extra->runtime_minted) {
+        return true;
+    }
+    const char * cohort = handle.tenant_cohort();
+    if (cohort == nullptr) {
+        return true;
+    }
+    GGML_LOG_WARN(
+        "[CONTEXT-PLAN-BUG] persistent writer %s would store a tenant-tagged handle (cohort %s) into a "
+        "runtime-minted extra\n",
+        writer, cohort);
+    if (ggml_sycl::ggml_sycl_strict_enabled()) {
+        GGML_ABORT(
+            "[CONTEXT-PLAN-BUG] persistent writer %s would store a tenant-tagged handle (cohort %s) into a "
+            "runtime-minted extra",
+            writer, cohort);
+    }
+    return false;
+}
+
 static bool ggml_sycl_publish_existing_storage_handle_for_device(const ggml_tensor *           tensor,
                                                                  int                           device,
                                                                  const ggml_sycl::mem_handle & handle) {
@@ -20066,6 +21400,13 @@ static bool ggml_sycl_publish_existing_storage_handle_for_device(const ggml_tens
     auto *       root       = const_cast<ggml_tensor *>(root_const);
     auto *       root_extra = static_cast<ggml_tensor_extra_gpu *>(root->extra);
     const size_t root_size  = handle.size() != 0 ? handle.size() : ggml_nbytes(root);
+
+    if (!ggml_sycl_persistent_publish_allowed(root_extra, handle, "publish_existing_storage_handle_for_device") ||
+        (tensor != root && tensor->extra &&
+         !ggml_sycl_persistent_publish_allowed(static_cast<const ggml_tensor_extra_gpu *>(tensor->extra), handle,
+                                               "publish_existing_storage_handle_for_device"))) {
+        return false;
+    }
 
     root_extra->data_device[device]      = resolved.ptr;
     root_extra->data_handle[device]      = handle;
@@ -21820,15 +23161,17 @@ struct moe_down_shadow_entry {
     std::vector<uint8_t> bytes;
 };
 
+// The key names its source by a non-owning mem_handle_identity: the shadow only
+// compares it (its entries' bytes are a host copy, never a slice), so it must
+// not keep an activation slice alive past its graph.
 struct moe_down_shadow_key {
-    ggml_sycl_cache_id    id{};
-    ggml_sycl::mem_handle handle{};
-    const ggml_tensor *   tensor          = nullptr;
-    size_t                handle_identity = 0;
-    int                   device          = -1;
-    size_t                view_offs       = 0;
-    bool                  use_handle      = false;
-    bool                  use_tensor      = false;
+    ggml_sycl_cache_id             id{};
+    ggml_sycl::mem_handle_identity handle{};
+    const ggml_tensor *            tensor     = nullptr;
+    int                            device     = -1;
+    size_t                         view_offs  = 0;
+    bool                           use_handle = false;
+    bool                           use_tensor = false;
 
     bool operator==(const moe_down_shadow_key & other) const {
         if (device != other.device || view_offs != other.view_offs || use_handle != other.use_handle ||
@@ -21836,7 +23179,7 @@ struct moe_down_shadow_key {
             return false;
         }
         if (use_handle) {
-            return handle_identity == other.handle_identity && handle.stable_identity_equal(other.handle);
+            return handle == other.handle;
         }
         if (use_tensor) {
             return tensor == other.tensor;
@@ -21847,7 +23190,7 @@ struct moe_down_shadow_key {
 
 struct moe_down_shadow_key_hash {
     size_t operator()(const moe_down_shadow_key & key) const {
-        size_t h = key.use_handle ? key.handle_identity :
+        size_t h = key.use_handle ? key.handle.hash() :
                    key.use_tensor ? std::hash<const ggml_tensor *>()(key.tensor) :
                                     ggml_sycl::detail::cache_id_hash{}(key.id);
         h        = ggml_sycl::detail::cache_hash_combine(h, std::hash<int>()(key.device));
@@ -21896,14 +23239,15 @@ static bool ggml_sycl_make_moe_down_shadow_key(const ggml_tensor * tensor, int d
         return false;
     }
     ggml_sycl_tensor_storage_handle storage{};
-    if (ggml_sycl_find_tensor_storage_handle(tensor, device, &storage) && storage.handle.valid()) {
+    // A source with no allocator identity falls through to the cache-id / tensor key.
+    if (ggml_sycl_find_tensor_storage_handle(tensor, device, &storage) && storage.handle.valid() &&
+        storage.handle.identity().valid()) {
         moe_down_shadow_key key{};
-        key.handle          = storage.handle;
-        key.handle_identity = key.handle.stable_identity_hash();
-        key.device          = device;
-        key.view_offs       = storage.view_offset;
-        key.use_handle      = true;
-        *out_key            = std::move(key);
+        key.handle     = storage.handle.identity();
+        key.device     = device;
+        key.view_offs  = storage.view_offset;
+        key.use_handle = true;
+        *out_key       = std::move(key);
         return true;
     }
 
@@ -24720,6 +26064,55 @@ void ggml_sycl_cpu_tg_flush_pending() {
     moe_fusion_clear_all();
 }
 
+// True when any of the thread-local MoE scatter and CPU-expert lists holds
+// state: the four lists whose entries carry compute-buffer slices between graphs,
+// plus the direct-scatter event list.  A recording call must never reach its exit
+// with one non-empty (recorded scatter state is the recording sink's, or the
+// record is refused), so the exit hook reads this before it flushes.
+bool ggml_sycl_cpu_tg_pending_any() {
+    if (!g_cpu_tg_direct_pending_scatter.empty() || g_pending_scatter.active || g_pending_scatter.prev_bufs.pending ||
+        g_pending_cpu_pipeline.active || g_pending_cpu_pipeline.prev_bufs.pending ||
+        ggml_sycl_pending_secondary_scatter_active()) {
+        return true;
+    }
+    for (int i = 0; i < PIPELINE_SLOTS; i++) {
+        const pipeline_scatter_slot & slot = g_pipeline_scatter[i];
+        if (slot.submitted.load(std::memory_order_acquire) && !slot.done.load(std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// H4h's RED arms drop one release step at a time.  The exit flush (the
+// graph_compute return hook) and the synchronize flush are the two steps that
+// release pending scatter state before a re-plan; a test can disable either.
+static std::atomic<bool> g_test_cpu_tg_skip_exit_flush{ false };
+static std::atomic<bool> g_test_cpu_tg_skip_synchronize_flush{ false };
+
+void ggml_sycl_test_set_cpu_tg_flush_disabled(bool exit_flush, bool synchronize_flush) {
+    g_test_cpu_tg_skip_exit_flush.store(exit_flush, std::memory_order_release);
+    g_test_cpu_tg_skip_synchronize_flush.store(synchronize_flush, std::memory_order_release);
+}
+#endif
+
+static bool ggml_sycl_cpu_tg_exit_flush_skipped_for_test() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    return g_test_cpu_tg_skip_exit_flush.load(std::memory_order_acquire);
+#else
+    return false;
+#endif
+}
+
+static bool ggml_sycl_cpu_tg_synchronize_flush_skipped_for_test() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    return g_test_cpu_tg_skip_synchronize_flush.load(std::memory_order_acquire);
+#else
+    return false;
+#endif
+}
+
 // Cold path for ggml_sycl_get_data_ptr: full resolution chain
 // (tiered cache, get_pointer_type, unified cache, staging).
 // Called only when the fast-path data_device[] cache misses.
@@ -24756,13 +26149,13 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
         }
         if (base_dev_ptr != nullptr) {
             void *    result        = static_cast<char *>(base_dev_ptr) + view_offs;
-            const int handle_device = base_on_device ? device : ggml_sycl::mem_handle::HOST_DEVICE;
-            g_data_ptr_cache[{ tensor, device }] =
-                base_on_device ? ggml_sycl::mem_handle::from_chunk_ptr(result, device, GGML_LAYOUT_AOS, true) :
-                                 ggml_sycl::mem_handle::from_direct(result, GGML_LAYOUT_AOS, false, handle_device);
+            ggml_sycl_data_ptr_cache_store(tensor, device, result, base_on_device);
             if (tensor->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
                 auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
                 extra->set_data_device(device, result, GGML_LAYOUT_AOS, base_on_device);
+            }
+            if (!base_on_device) {
+                ggml_sycl_resolver_count_host_return(tensor, device);
             }
             return result;
         }
@@ -24782,13 +26175,13 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
     // always return their stored pointer.  If resolve() returns null (weight evicted),
     // erase the entry and fall through to re-resolve below.
     {
-        auto it = g_data_ptr_cache.find({ tensor, device });
-        if (it != g_data_ptr_cache.end()) {
-            auto resolved = it->second.resolve(device);
-            if (resolved.ptr) {
-                return resolved.ptr;
+        void * cached_data_ptr       = nullptr;
+        bool   cached_data_on_device = false;
+        if (ggml_sycl_data_ptr_cache_lookup(tensor, device, &cached_data_ptr, &cached_data_on_device)) {
+            if (!cached_data_on_device) {
+                ggml_sycl_resolver_count_host_return(tensor, device);
             }
-            g_data_ptr_cache.erase(it);
+            return cached_data_ptr;
         }
     }
 
@@ -24808,7 +26201,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
             if (is_input_tensor && !tp_enabled && tensor->data) {
                 ggml_sycl_refresh_cached_input_ptr(cached_ptr, tensor->data, ggml_nbytes(tensor), device);
             }
-            g_data_ptr_cache[{ tensor, device }] = make_data_ptr_handle(tensor, device, cached_ptr);
+            ggml_sycl_data_ptr_cache_store(tensor, device, cached_ptr, ggml_sycl_data_ptr_on_device(cached_ptr));
             return cached_ptr;
         }
     }
@@ -24830,7 +26223,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                 }
                 GGML_SYCL_DEBUG("ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, using extra->data_device[%d]=%p\n",
                                 tensor->name, device, device, dev_ptr);
-                g_data_ptr_cache[{ tensor, device }] = make_data_ptr_handle(tensor, device, dev_ptr);
+                ggml_sycl_data_ptr_cache_store(tensor, device, dev_ptr, ggml_sycl_data_ptr_on_device(dev_ptr));
                 return dev_ptr;
             }
         }
@@ -24873,13 +26266,13 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                 GGML_SYCL_DEBUG(
                     "ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, resolved via view_src %s + offset %zu = %p\n",
                     tensor->name, device, base->name, offset, result);
-                const int handle_device = base_on_device ? device : ggml_sycl::mem_handle::HOST_DEVICE;
-                g_data_ptr_cache[{ tensor, device }] =
-                    base_on_device ? ggml_sycl::mem_handle::from_chunk_ptr(result, device, GGML_LAYOUT_AOS, true) :
-                                     ggml_sycl::mem_handle::from_direct(result, GGML_LAYOUT_AOS, false, handle_device);
+                ggml_sycl_data_ptr_cache_store(tensor, device, result, base_on_device);
                 if (tensor->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
                     auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
                     extra->set_data_device(device, result, GGML_LAYOUT_AOS, base_on_device);
+                }
+                if (!base_on_device) {
+                    ggml_sycl_resolver_count_host_return(tensor, device);
                 }
                 return result;
             }
@@ -24916,12 +26309,13 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                         "ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, resolved via view_src base USM + offset "
                         "%zu = %p\n",
                         tensor->name, device, offset, result);
-                    g_data_ptr_cache[{ tensor, device }] = ggml_sycl::mem_handle::from_direct(
-                        result, GGML_LAYOUT_AOS, base_device_matches,
-                        base_device_matches ? device : ggml_sycl::mem_handle::HOST_DEVICE);
+                    ggml_sycl_data_ptr_cache_store(tensor, device, result, base_device_matches);
                     if (tensor->extra != nullptr && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
                         auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
                         extra->set_data_device(device, result, GGML_LAYOUT_AOS, base_device_matches);
+                    }
+                    if (!base_device_matches) {
+                        ggml_sycl_resolver_count_host_return(tensor, device);
                     }
                     return result;
                 }
@@ -24936,7 +26330,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
         // get_pointer_type to return 'unknown'.  alloc_registry always knows.
         const auto * alloc_info = ggml_sycl::alloc_registry::instance().lookup(tensor->data);
         if (alloc_info && alloc_info->type == ggml_sycl::alloc_type::DEVICE && alloc_info->device_id == device) {
-            g_data_ptr_cache[{ tensor, device }] = make_data_ptr_handle(tensor, device, tensor->data);
+            ggml_sycl_data_ptr_cache_store(tensor, device, tensor->data, ggml_sycl_data_ptr_on_device(tensor->data));
             return tensor->data;
         }
         if (alloc_info && alloc_info->type == ggml_sycl::alloc_type::DEVICE && alloc_info->device_id != device) {
@@ -24948,8 +26342,8 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
         if (alloc_info && (alloc_info->type == ggml_sycl::alloc_type::HOST_PINNED ||
                            alloc_info->type == ggml_sycl::alloc_type::SHARED)) {
             // Host-pinned is GPU-accessible via PCIe zero-copy — return directly
-            g_data_ptr_cache[{ tensor, device }] = ggml_sycl::mem_handle::from_direct(
-                tensor->data, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+            ggml_sycl_data_ptr_cache_store(tensor, device, tensor->data, false);
+            ggml_sycl_resolver_count_host_return(tensor, device);
             return tensor->data;
         }
 
@@ -24979,7 +26373,8 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                 }
                 GGML_SYCL_DEBUG("ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, using DEVICE USM tensor->data=%p\n",
                                 tensor->name, device, tensor->data);
-                g_data_ptr_cache[{ tensor, device }] = make_data_ptr_handle(tensor, device, tensor->data);
+                ggml_sycl_data_ptr_cache_store(tensor, device, tensor->data,
+                                               ggml_sycl_data_ptr_on_device(tensor->data));
                 return tensor->data;
             }
             if (ptr_type == sycl::usm::alloc::device) {
@@ -25005,8 +26400,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                 void * streamed = ggml_sycl::layer_streaming_get_weight_ptr(device, tensor->name);
                 if (streamed) {
                     GGML_LOG_DEBUG("get_data_ptr_slow: %s from layer stream buffer\n", tensor->name);
-                    g_data_ptr_cache[{ tensor, device }] =
-                        ggml_sycl::mem_handle::from_chunk_ptr(streamed, device, GGML_LAYOUT_AOS, true);
+                    ggml_sycl_data_ptr_cache_store(tensor, device, streamed, true);
                     return streamed;
                 }
             }
@@ -25059,8 +26453,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                             "ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, resolved via unified cache "
                             "(prestage) %p -> %p (%zu bytes)\n",
                             tensor->name, device, tensor->data, unified_cached, nbytes);
-                        g_data_ptr_cache[{ tensor, device }] =
-                            ggml_sycl::mem_handle::from_chunk_ptr(unified_cached, device, GGML_LAYOUT_AOS, true);
+                        ggml_sycl_data_ptr_cache_store(tensor, device, unified_cached, true);
                         return unified_cached;
                     }
                 }
@@ -25090,7 +26483,11 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
                     "ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, staged non-device %p -> %p (%zu bytes, "
                     "type=%d)\n",
                     tensor->name, device, tensor->data, staged, nbytes, (int) ptr_type);
-                g_data_ptr_cache[{ tensor, device }] = staged_handle;
+                // The staged entry is keyed on its SOURCE tensor's slice identity.  The
+                // staged handle (the staging cache's own allocation, never a tenant)
+                // is kept alive by the per-graph owner list, not by the cache.
+                ggml_sycl_data_ptr_cache_store(tensor, device, staged, staged_res.on_device);
+                ggml_sycl_graph_staged_owner_add(std::move(staged_handle));
                 return staged;
             }
             GGML_SYCL_DEBUG(
@@ -25102,8 +26499,7 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
 
     GGML_SYCL_DEBUG("ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, using tensor->data=%p\n", tensor->name, device,
                     tensor->data);
-    g_data_ptr_cache[{ tensor, device }] =
-        ggml_sycl::mem_handle::from_direct(tensor->data, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+    ggml_sycl_data_ptr_cache_store(tensor, device, tensor->data, false);
     return tensor->data;
 }
 
@@ -25933,6 +27329,7 @@ static ggml_sycl_device_info ggml_sycl_init() {
     }
 
     info.device_count = static_cast<int>(device_map.size());
+    ggml_sycl::unified_cache_dump_set_device_count(info.device_count);
     ggml_sycl_set_device_map(full_gpu_device_map.data(), static_cast<int>(full_gpu_device_map.size()));
     if (g_ggml_sycl_debug && !device_map.empty()) {
         std::string mapped;
@@ -26804,6 +28201,20 @@ static bool ggml_sycl_is_device_vram_buffer(const ggml_tensor * t) {
     return buf_ctx->managed_meta.tier == ggml_sycl::alloc_tier::DEVICE_VRAM;
 }
 
+// The placement plan the MoE residency queries read for `device`: the cache's plan when it holds one, else
+// the global plan, else none. The one place that resolution is written; the owners are shared_ptrs returned
+// by value, so the caller holds the result for the walk.
+static std::shared_ptr<const ggml_sycl::placement_plan> ggml_sycl_moe_plan_owner_for_device(int device) {
+    auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+    if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
+        return ggml_sycl_cache_plan_owner(cache);
+    }
+    if (ggml_sycl_has_global_plan()) {
+        return ggml_sycl_global_plan_owner();
+    }
+    return nullptr;
+}
+
 static bool ggml_sycl_moe_plan_has_host_experts(const ggml_tensor * src0, int device, bool * known = nullptr) {
     if (known) {
         *known = false;
@@ -26811,22 +28222,76 @@ static bool ggml_sycl_moe_plan_has_host_experts(const ggml_tensor * src0, int de
     if (!src0 || device < 0 || ggml_sycl_get_tensor_usage(src0) != tensor_usage::MOE_EXPERT_WEIGHT) {
         return false;
     }
-    auto *        cache     = ggml_sycl::get_unified_cache_for_device(device);
+    const auto plan = ggml_sycl_moe_plan_owner_for_device(device);
+    if (!plan) {
+        return false;
+    }
+    if (known) {
+        *known = true;
+    }
+    return plan->has_host_experts(src0->name ? src0->name : "", src0->ne[2] > 0 ? src0->ne[2] : 1, device);
+}
+
+// The dump-armed flag, read from the environment once per process (the g_ggml_sycl_debug precedent): the
+// G0 report sites sit on per-op paths (mul_mat dispatch, the MoE pointer-table entries), where a getenv
+// per call is a libc scan per op. A host test that needs both arms runs each in its own process. This
+// helper is the only reader of the live accessor outside unified-cache.cpp (scripts/check-sycl-counter-dump.py
+// pins that and the function-local static).
+static bool ggml_sycl_dump_report_armed() {
+    static const bool armed = [] {
+        const bool a = ggml_sycl::unified_cache_dump_report_enabled();
+        ggml_sycl::unified_cache_dump_note_armed(a);  // the dump marks the armed-only counter by this
+        return a;
+    }();
+    return armed;
+}
+
+// How many of the tensor's experts the admitted placement plan executes on `device`'s GPU, from the same
+// plan source ggml_sycl_moe_plan_has_host_experts reads. False when no plan is known: the caller then
+// counts nothing, since an unknown plan is not a measured zero.
+static bool ggml_sycl_moe_plan_gpu_expert_count(const ggml_tensor * src0, int device, int64_t * count) {
+    if (!src0 || !count || device < 0 || ggml_sycl_get_tensor_usage(src0) != tensor_usage::MOE_EXPERT_WEIGHT) {
+        return false;
+    }
+    const auto plan = ggml_sycl_moe_plan_owner_for_device(device);
+    if (!plan) {
+        return false;
+    }
     const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
-    if (cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-        if (known) {
-            *known = true;
-        }
-        return ggml_sycl_cache_plan_owner(cache)->has_host_experts(src0->name ? src0->name : "", n_experts, device);
+    const char *  name      = src0->name ? src0->name : "";
+    int64_t       n         = 0;
+    for (int64_t e = 0; e < n_experts; ++e) {
+        n += plan->expert_on_device(name, static_cast<int>(e), device) ? 1 : 0;
     }
-    const auto plan_owner = ggml_sycl_global_plan_owner();
-    if (ggml_sycl_has_global_plan()) {
-        if (known) {
-            *known = true;
-        }
-        return plan_owner->has_host_experts(src0->name ? src0->name : "", n_experts, device);
+    *count = n;
+    return true;
+}
+
+// G0's row-134 reach count: a call of ggml_sycl_ensure_moe_ptr_table, or of a caller of
+// ggml_sycl_update_moe_ptr_table / ggml_sycl_upload_moe_ptr_table_from_batch, on a tensor the plan
+// executes ZERO experts of on `device` is that site's P3 violation. `site` names the call site as
+// `<callee kind>:<function>[/<role>]`. The count is predicted 0 everywhere but the preload; it is
+// moe_table_reach_zero_gpu_expert in the dump.
+//
+// One real reach is noted at BOTH the callee's ensure site and each caller above it (an upload from
+// mul_mat_id reaches the transient helper's ensure), so the unkeyed total is a sum of notes, not a count
+// of reaches. A reach is read from the `ensure:` keys (one per ensure_moe_ptr_table call site:
+// ensure:graph_preload_moe_experts is the preload, the case the conversion skips); the `update:` and
+// `upload:` keys say which caller a reach came through.
+//
+// The zero test walks the plan once per expert, so it runs only in a run that arms the dump (the
+// counter is read only from that dump). That is the one counter here whose evaluation is armed-only,
+// and it is named as such in scripts/check-sycl-counter-dump.py (ARMED_ONLY_COUNTERS); the dump prints it
+// as not_captured unless the armed flag was read armed.
+static void ggml_sycl_note_moe_table_reach(const char * site, const ggml_tensor * src0, int device) {
+    if (!ggml_sycl_dump_report_armed()) {
+        return;
     }
-    return false;
+    int64_t gpu_experts = 0;
+    if (ggml_sycl_moe_plan_gpu_expert_count(src0, device, &gpu_experts) && gpu_experts == 0) {
+        ggml_sycl::unified_cache_dump_counter_add_key(ggml_sycl::dump_counter::moe_table_reach_zero_gpu_expert, device,
+                                                      site);
+    }
 }
 
 // Returns true if the tensor's weights are host-resident (not in device VRAM).
@@ -27020,7 +28485,7 @@ static bool ggml_sycl_tensor_is_cross_device_control(const ggml_tensor * tensor)
 }
 
 static bool ggml_sycl_tensor_uses_cross_device_control_storage(const ggml_tensor * tensor) {
-    if (!tensor || !ggml_backend_sycl_moe_multi_gpu_requested() || tensor->type != GGML_TYPE_I32) {
+    if (!tensor || tensor->type != GGML_TYPE_I32 || !ggml_backend_sycl_moe_multi_gpu_requested()) {
         return false;
     }
     if (tensor->op == GGML_OP_ARGSORT) {
@@ -28860,130 +30325,6 @@ struct ggml_sycl_decode_secondary_candidate {
     double score  = 0.0;
 };
 
-static const sycl_peer_link_info * ggml_sycl_decode_peer_link(int src_device, int dst_device) {
-    return src_device == dst_device ? nullptr : ggml_sycl_get_peer_link_info(src_device, dst_device);
-}
-
-static bool ggml_sycl_decode_remote_direct_path_available(int src_device, int dst_device) {
-    const sycl_peer_link_info * link = ggml_sycl_decode_peer_link(src_device, dst_device);
-    return link && link->valid && link->same_sycl_context && (link->direct_copy_measured || link->l0_can_access_peer);
-}
-
-static double ggml_sycl_decode_remote_estimated_us(int    src_device,
-                                                   int    dst_device,
-                                                   size_t activation_bytes,
-                                                   size_t output_bytes) {
-    if (src_device == dst_device) {
-        return 0.0;
-    }
-    const sycl_peer_link_info * link = ggml_sycl_decode_peer_link(src_device, dst_device);
-    if (!link || !link->valid || std::strcmp(link->preferred_transfer, "unsupported") == 0) {
-        return std::numeric_limits<double>::infinity();
-    }
-
-    const size_t bytes = activation_bytes + output_bytes;
-    if (link->host_bounce_measured && link->host_bounce_us > 0.0 && link->measured_bytes > 0) {
-        // The measured value is one ordered device->host->device bounce.  Decode
-        // secondary work bounces activation bytes to the remote device and
-        // output bytes back, so scale by their sum rather than assuming direct
-        // peer events can be chained.
-        const double scale = static_cast<double>(std::max<size_t>(bytes, link->measured_bytes)) /
-                             static_cast<double>(link->measured_bytes);
-        return link->host_bounce_us * scale;
-    }
-    if (link->direct_copy_measured && link->direct_copy_us > 0.0 && link->measured_bytes > 0) {
-        const double scale = static_cast<double>(std::max<size_t>(bytes, link->measured_bytes)) /
-                             static_cast<double>(link->measured_bytes);
-        return link->direct_copy_us * scale;
-    }
-    if (!link->same_sycl_context) {
-        return std::numeric_limits<double>::infinity();
-    }
-    return 0.0;
-}
-
-static bool ggml_sycl_decode_secondary_auto_allowed(const ggml_tensor * gate_weight,
-                                                    int                 current_device,
-                                                    size_t              selected_rows,
-                                                    int64_t             activation_cols,
-                                                    int64_t             output_cols,
-                                                    double *            best_estimated_us = nullptr,
-                                                    const char **       reject_reason     = nullptr) {
-    if (best_estimated_us) {
-        *best_estimated_us = std::numeric_limits<double>::infinity();
-    }
-    if (reject_reason) {
-        *reject_reason = "not-evaluated";
-    }
-    if (!gate_weight || current_device < 0 || selected_rows == 0 || activation_cols <= 0 || output_cols <= 0) {
-        if (reject_reason) {
-            *reject_reason = "invalid-shape";
-        }
-        return false;
-    }
-
-    const auto & info = ggml_sycl_info();
-    if (info.total_gpu_count < 2) {
-        if (reject_reason) {
-            *reject_reason = "single-device";
-        }
-        return false;
-    }
-
-    const size_t activation_bytes = selected_rows * static_cast<size_t>(activation_cols) * sizeof(float);
-    const size_t output_bytes     = selected_rows * static_cast<size_t>(output_cols) * sizeof(float);
-    bool         saw_candidate    = false;
-    bool         saw_direct       = false;
-    double       best_us          = std::numeric_limits<double>::infinity();
-
-    for (int d = 0; d < info.total_gpu_count && d < GGML_SYCL_MAX_DEVICES; ++d) {
-        if (d == current_device) {
-            continue;
-        }
-        if (!ggml_sycl_moe_secondary_dispatch_supports_layout(gate_weight->type, GGML_LAYOUT_SOA)) {
-            continue;
-        }
-        if (!ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(d)) {
-            continue;
-        }
-        saw_candidate = true;
-        const double estimated_us =
-            ggml_sycl_decode_remote_estimated_us(current_device, d, activation_bytes, output_bytes);
-        best_us    = std::min(best_us, estimated_us);
-        saw_direct = saw_direct || ggml_sycl_decode_remote_direct_path_available(current_device, d);
-    }
-
-    if (best_estimated_us) {
-        *best_estimated_us = best_us;
-    }
-    if (!saw_candidate) {
-        if (reject_reason) {
-            *reject_reason = "no-secondary-capability";
-        }
-        return false;
-    }
-    if (!(best_us >= 0.0 && std::isfinite(best_us))) {
-        if (reject_reason) {
-            *reject_reason = "transfer-unknown";
-        }
-        return false;
-    }
-    // Use measured hardware transfer cost, not board names or model-fit flags.
-    // Tiny decode groups are eligible only when the activation+output bounce is
-    // small enough to be hidden by the local MoE work that continues executing.
-    constexpr double max_auto_secondary_xfer_us = 300.0;
-    if (!(best_us >= 0.0 && best_us <= max_auto_secondary_xfer_us)) {
-        if (reject_reason) {
-            *reject_reason = saw_direct ? "transfer-cost" : "host-bounce-cost";
-        }
-        return false;
-    }
-    if (reject_reason) {
-        *reject_reason = "accepted";
-    }
-    return true;
-}
-
 static double ggml_sycl_collect_decode_secondary_candidates(
     const ggml_tensor *                                 src0,
     int                                                 current_device,
@@ -29000,7 +30341,8 @@ static double ggml_sycl_collect_decode_secondary_candidates(
         if (d == current_device) {
             continue;
         }
-        if (!ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(d)) {
+        if (!ggml_sycl::ggml_sycl_secondary_queue_ready_or_throw(
+                ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(d, ggml_sycl_dispatch_owner()))) {
             continue;
         }
         const double transfer_penalty = ggml_sycl_decode_remote_transfer_penalty(current_device, d);
@@ -29279,6 +30621,8 @@ const char * moe_batch_reject_reason_name(moe_batch_reject_reason reason) {
             return "workspace_undersized";
         case moe_batch_reject_reason::WORKSPACE_LEASE_MISSING:
             return "workspace_lease_missing";
+        case moe_batch_reject_reason::PLAN_OWNER_REFUSED:
+            return "plan_owner_refused";
     }
     return "unknown";
 }
@@ -29311,6 +30655,11 @@ moe_resolved_batch_result ggml_sycl_build_moe_resolved_batch(const ggml_tensor *
                 normalized.residency = moe_batch_residency::HOST;
                 break;
             case moe_expert_route_kind::UNAVAILABLE:
+                normalized.residency = moe_batch_residency::UNAVAILABLE;
+                break;
+            case moe_expert_route_kind::REFUSED:
+                // The wrapper throws on a refused route, so none reaches here; a
+                // refused plan owner is never normalized into an executor.
                 normalized.residency = moe_batch_residency::UNAVAILABLE;
                 break;
         }
@@ -30320,9 +31669,6 @@ static bool ggml_sycl_moe_tensor_plan_primary_layout(const ggml_tensor * src0, i
 static bool ggml_sycl_materialize_moe_tensor_phase_layout(const ggml_tensor * src0,
                                                           int                 device,
                                                           layout_mode         target_layout);
-static bool ggml_sycl_materialize_moe_tensor_planned_layout(const ggml_tensor * src0,
-                                                            int                 current_device,
-                                                            layout_mode         target_layout);
 
 static layout_mode ggml_sycl_adjust_moe_runtime_layout(const ggml_tensor * src0,
                                                        int                 device,
@@ -34662,6 +36008,10 @@ static void ggml_sycl_preload_model_weights() {
             // is silent stale-pointer corruption, not a crash.
             g_moe_prompt_admission_cache.clear();
             if (global_plan != nullptr) {
+                // The preload runs inside load_end's LOAD-kind token (it is not a
+                // public entry), so this republish is an L0-held load-path site.
+                GGML_SYCL_WITNESS(ggml_sycl::ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_LOAD),
+                                  "[REPLAN-TOKEN] preload without a LOAD token");
                 ggml_sycl_republish_current_plan();
             }
 
@@ -38433,6 +39783,18 @@ static constexpr size_t GGML_SYCL_BUFFER_BASE_ALIGNMENT = 128;
 // places the tensors elsewhere — whereas publishing a misaligned base is not: it
 // under-reserves silently and aborts later somewhere unrelated.  Deleting the
 // context releases the allocation through its managed mem_handle owner.
+static const char * ggml_sycl_alloc_tier_name(ggml_sycl::alloc_tier tier) {
+    switch (tier) {
+        case ggml_sycl::alloc_tier::DEVICE_VRAM:
+            return "device-vram";
+        case ggml_sycl::alloc_tier::HOST_PINNED:
+            return "host-pinned";
+        case ggml_sycl::alloc_tier::MMAP_TRACKED:
+            return "mmap-tracked";
+    }
+    return "invalid";
+}
+
 static ggml_backend_buffer_t ggml_backend_sycl_buffer_publish(ggml_backend_buffer_type_t         buft,
                                                               ggml_backend_sycl_buffer_context * ctx,
                                                               size_t                             size,
@@ -38468,6 +39830,19 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_publish(ggml_backend_buffe
     // never leaves an owner behind.  A buffer whose backing allocation carries
     // no id simply gets no owner and behaves exactly as it did before.
     ctx->buffer_owner = ggml_sycl_mint_buffer_owner(ctx->managed_meta.id);
+    if (ggml_sycl_dump_report_armed()) {
+        // Where this backend buffer landed, and what the zones it competes for hold afterwards: the
+        // RUNTIME and SCRATCH rooms G0 prints next to the planned terms.
+        char line[256];
+        std::snprintf(line, sizeof(line), "landing dev=%d buft=%s size=%zu origin=\"%s\" tier=%s", ctx->device,
+                      ggml_backend_sycl_buffer_type_get_name(buft), size, origin,
+                      ggml_sycl_alloc_tier_name(ctx->managed_meta.tier));
+        ggml_sycl::unified_cache_dump_report(line);
+        ggml_sycl::unified_cache_dump_report_zone_figures(ctx->device, "after_backend_buffer",
+                                                          ggml_sycl::vram_zone_id::RUNTIME);
+        ggml_sycl::unified_cache_dump_report_zone_figures(ctx->device, "after_backend_buffer",
+                                                          ggml_sycl::vram_zone_id::SCRATCH);
+    }
     if (ctx->buffer_owner.model.value != 0) {
         if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
             cache->note_buffer_owner_live(ctx->buffer_owner.model.value);
@@ -38528,6 +39903,12 @@ static void ggml_sycl_log_compute_buffer_landing(int device, const std::string &
 
 static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                                                         size_t                     size) try {
+    // The shared invariant: no TRANSACTION token is held at gallocr ALLOC or at
+    // this function's host-pinned fallback. The planner's own carve is exempt from
+    // the pool phase gates only because it runs inside that token; an allocation
+    // reached from here is not planner work.
+    GGML_SYCL_WITNESS(!ggml_sycl::ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_TRANSACTION),
+                      "[REPLAN-TOKEN] TRANSACTION token held at alloc_buffer entry");
     ggml_backend_sycl_buffer_type_context * buft_ctx = (ggml_backend_sycl_buffer_type_context *) buft->context;
     ggml_sycl_set_device(buft_ctx->device);
     const queue_ptr stream                = buft_ctx->stream;
@@ -38773,7 +40154,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
         }
     }
 
-    ggml_sycl::alloc_request req;
+    ggml_sycl::alloc_request req{};
     req.queue                               = alloc_stream;
     req.device                              = buft_ctx->device;
     req.size                                = size;
@@ -38858,6 +40239,8 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
             // nullptr is not a fallback -- it falls through to the
             // allocation-failure ERROR just past this block, a hard
             // failure, not a successful landing in host memory).
+            GGML_SYCL_WITNESS(!ggml_sycl::ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_TRANSACTION),
+                              "[REPLAN-TOKEN] TRANSACTION token held at alloc_buffer host fallback");
             GGML_LOG_WARN("SYCL: Alloc failed (%zu MB), retrying with host-pinned fallback\n", size / (1024 * 1024));
             req.intent.constraints.must_device      = false;
             req.intent.constraints.must_host_pinned = true;
@@ -38965,13 +40348,534 @@ static size_t ggml_backend_sycl_buffer_type_get_alignment(ggml_backend_buffer_ty
     GGML_UNUSED(buft);
 }
 
+// ===== Chunk cap, the per-context copy and plan scopes =====
+//
+// A device buft's get_max_size is the largest buffer ggml-alloc may request in one
+// allocation.  On the plan path it is one expression, ggml_sycl_chunk_cap_core,
+// reached through one wrapper, ggml_sycl_arena_chunk_cap, which is the only function
+// on this path that names the arena backing kind.
+
+static size_t ggml_backend_sycl_host_buffer_type_chunk_cap();
+
+enum class ggml_sycl_chunk_cap_set {
+    LEDGER_CURRENT,  // the capacities the ledger holds now: the unscoped device function reads these
+    COMMITTED,       // the committed planned capacities: only the freeze reads these
+    LOAD_TO_COMMIT,  // the bound load's to-commit capacities: the load-time (b) and (c) read these
+    PROBE_MIN,       // RUNTIME 0 and SCRATCH the compute-arena floor: the load-time (a) reads this
+};
+
+struct ggml_sycl_arena_chunk_cap_result {
+    bool                       is_vm = false;
+    ggml_sycl_chunk_cap_result value;
+};
+
+static ggml_sycl_arena_chunk_cap_result ggml_sycl_arena_chunk_cap(int device, ggml_sycl_chunk_cap_set set) {
+    ggml_sycl_arena_chunk_cap_result result;
+    result.is_vm   = ggml_sycl::ggml_sycl_arena_backing(device) == ggml_sycl::GGML_SYCL_ARENA_BACKING_TYPE_VM;
+    size_t runtime = 0;
+    size_t kv      = 0;
+    size_t scratch = 0;
+    if (result.is_vm) {
+        // A capacity is read only off VM: USM has no zone cap, and the core takes 0s.
+        auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+        if (cache) {
+            switch (set) {
+                case ggml_sycl_chunk_cap_set::LEDGER_CURRENT:
+                    runtime = cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME);
+                    kv      = cache->zone_capacity(ggml_sycl::vram_zone_id::KV);
+                    scratch = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
+                    break;
+                case ggml_sycl_chunk_cap_set::COMMITTED:
+                    runtime = cache->zone_capacity_committed(ggml_sycl::vram_zone_id::RUNTIME);
+                    kv      = cache->zone_capacity_committed(ggml_sycl::vram_zone_id::KV);
+                    scratch = cache->zone_capacity_committed(ggml_sycl::vram_zone_id::SCRATCH);
+                    break;
+                case ggml_sycl_chunk_cap_set::LOAD_TO_COMMIT:
+                    runtime = cache->zone_capacity_to_commit(ggml_sycl::vram_zone_id::RUNTIME);
+                    kv      = cache->zone_capacity_to_commit(ggml_sycl::vram_zone_id::KV);
+                    scratch = cache->zone_capacity_to_commit(ggml_sycl::vram_zone_id::SCRATCH);
+                    break;
+                case ggml_sycl_chunk_cap_set::PROBE_MIN:
+                    scratch = ggml_sycl::ggml_sycl_compute_arena_bytes(device);
+                    break;
+            }
+        }
+    }
+    const auto & dev = ggml_sycl_info().devices[device];
+    result.value =
+        ggml_sycl_chunk_cap_core(result.is_vm, runtime, kv, scratch, dev.safe_max_alloc_size, dev.max_alloc_size);
+    return result;
+}
+
+// What a read that cannot be answered from the copy returns: the per-process constant,
+// never a fresh read.  A device buft's is min(2 GiB, A(dev)); the SYCL_Host buft's is
+// its chunk cap bounded by one pinned-pool chunk.
+static size_t ggml_sycl_host_chunk_cap_constant() {
+    return std::min(ggml_backend_sycl_host_buffer_type_chunk_cap(),
+                    static_cast<size_t>(ggml_sycl::pinned_chunk_pool::CHUNK_SIZE));
+}
+
+static size_t ggml_sycl_device_chunk_cap_constant(int device) {
+    size_t cap = GGML_SYCL_CHUNK_CAP_MAX;
+    if (device >= 0 && device < ggml_sycl_info().device_count) {
+        const auto & dev = ggml_sycl_info().devices[device];
+        const size_t a   = dev.safe_max_alloc_size > 0 ? dev.safe_max_alloc_size : dev.max_alloc_size;
+        if (a > 0) {
+            cap = std::min(cap, a);
+        }
+    }
+    return cap;
+}
+
+// The context's one copy of the frozen caps.  Its only value writer is the freeze,
+// through ggml_sycl_plan_caps_store.
+struct ggml_backend_sycl_plan_caps {
+    struct slot {
+        ggml_backend_buffer_type_t buft    = nullptr;
+        size_t                     value   = 0;
+        uint32_t                   freezes = 0;
+    };
+
+    std::mutex        mutex;
+    std::atomic<int>  state{ GGML_SYCL_PLAN_CAPS_UNARMED };
+    std::vector<slot> slots;
+};
+
+static std::atomic<int> g_plan_caps_live{ 0 };
+
+static const char * ggml_sycl_plan_caps_state_name(int state) {
+    switch (state) {
+        case GGML_SYCL_PLAN_CAPS_UNARMED:
+            return "UNARMED";
+        case GGML_SYCL_PLAN_CAPS_FREEZING:
+            return "FREEZING";
+        case GGML_SYCL_PLAN_CAPS_FROZEN:
+            return "FROZEN";
+    }
+    return "?";
+}
+
+ggml_backend_sycl_plan_caps_t ggml_backend_sycl_plan_caps_new(void) {
+    try {
+        auto * caps = new ggml_backend_sycl_plan_caps();
+        g_plan_caps_live.fetch_add(1, std::memory_order_acq_rel);
+        return caps;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void ggml_backend_sycl_plan_caps_free(ggml_backend_sycl_plan_caps_t caps) {
+    if (!caps) {
+        return;
+    }
+    delete caps;
+    g_plan_caps_live.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+// UNARMED -> FREEZING at the fixpoint's entry, FREEZING -> FROZEN at its publish commit.
+bool ggml_backend_sycl_plan_caps_set_state(ggml_backend_sycl_plan_caps_t caps, enum ggml_sycl_plan_caps_state next) {
+    if (!caps) {
+        return false;
+    }
+    const int  current = caps->state.load(std::memory_order_acquire);
+    const bool legal   = (current == GGML_SYCL_PLAN_CAPS_UNARMED && next == GGML_SYCL_PLAN_CAPS_FREEZING) ||
+                       (current == GGML_SYCL_PLAN_CAPS_FREEZING && next == GGML_SYCL_PLAN_CAPS_FROZEN);
+    if (!legal) {
+        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] plan caps state %s -> %s is not a legal transition\n",
+                      ggml_sycl_plan_caps_state_name(current), ggml_sycl_plan_caps_state_name(next));
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] plan caps state %s -> %s is not a legal transition",
+                       ggml_sycl_plan_caps_state_name(current), ggml_sycl_plan_caps_state_name(next));
+        }
+        return false;
+    }
+    caps->state.store(next, std::memory_order_release);
+    return true;
+}
+
+// The one store: records (buft, value) and counts the freeze for that buft.
+static void ggml_sycl_plan_caps_store(ggml_backend_sycl_plan_caps * caps,
+                                      ggml_backend_buffer_type_t    buft,
+                                      size_t                        value) {
+    std::lock_guard<std::mutex> lock(caps->mutex);
+    for (auto & s : caps->slots) {
+        if (s.buft == buft) {
+            s.value = value;
+            ++s.freezes;
+            return;
+        }
+    }
+    caps->slots.push_back({ buft, value, 1 });
+}
+
+static bool ggml_sycl_plan_caps_find(ggml_backend_sycl_plan_caps * caps,
+                                     ggml_backend_buffer_type_t    buft,
+                                     size_t &                      value) {
+    std::lock_guard<std::mutex> lock(caps->mutex);
+    for (const auto & s : caps->slots) {
+        if (s.buft == buft) {
+            value = s.value;
+            return true;
+        }
+    }
+    return false;
+}
+
+// A plan scope: thread-local, open for one MEASURE or ALLOC of one context (or one
+// load-time measure).  llama opens it; the compute bufts' get_max_size read it.
+struct ggml_sycl_plan_scope {
+    uint32_t                      exec_context_id = 0;
+    ggml_sycl_plan_scope_mode     mode            = GGML_SYCL_PLAN_SCOPE_MEASURE;
+    ggml_backend_sycl_plan_caps * caps            = nullptr;
+    ggml_sycl_measure_stage       stage           = GGML_SYCL_MEASURE_STAGE_PROBE;  // LOAD_MEASURE only
+    // Every (buft, value) the scope answered: the seal's evidence that MEASURE and ALLOC read one copy.
+    std::vector<std::pair<ggml_backend_buffer_type_t, size_t>> reads;
+    std::string                                                failure;  // first failure, empty when none
+};
+
+static thread_local ggml_sycl_plan_scope * g_plan_scope = nullptr;
+
+// The scope open on this thread, or null. L4's claim hook in alloc_buffer reads
+// this and never mints a scope of its own.
+[[maybe_unused]] static ggml_sycl_plan_scope * ggml_sycl_plan_scope_current() {
+    return g_plan_scope;
+}
+
+static void ggml_sycl_plan_scope_fail(ggml_sycl_plan_scope * scope, const std::string & text) {
+    if (scope->failure.empty()) {
+        scope->failure = text;
+    }
+}
+
+enum class ggml_sycl_chunk_cap_buft_kind { DEVICE, HOST, CPU_OFFLOAD };
+
+static bool ggml_sycl_chunk_cap_buft_device(ggml_backend_buffer_type_t buft, int & device) {
+    auto * ctx = buft ? static_cast<ggml_backend_sycl_buffer_type_context *>(buft->context) : nullptr;
+    device     = ctx ? ctx->device : -1;
+    return ctx && device >= 0 && device < ggml_sycl_info().device_count;
+}
+
+// The freeze: the one named place a value enters a context's copy.  An in-scope
+// get_max_size for a buft the copy does not hold calls it, and it runs only in
+// FREEZING, under the fixpoint's TRANSACTION token.
+static size_t ggml_backend_sycl_plan_caps_freeze(ggml_sycl_plan_scope *        scope,
+                                                 ggml_backend_sycl_plan_caps * caps,
+                                                 ggml_backend_buffer_type_t    buft,
+                                                 ggml_sycl_chunk_cap_buft_kind kind) {
+    GGML_SYCL_WITNESS(caps->state.load(std::memory_order_acquire) == GGML_SYCL_PLAN_CAPS_FREEZING &&
+                          ggml_sycl::ggml_sycl_replan_token_held(GGML_SYCL_REPLAN_KIND_TRANSACTION),
+                      "[REPLAN-TOKEN] chunk-cap freeze outside the fixpoint");
+    size_t value = 0;
+    if (kind == ggml_sycl_chunk_cap_buft_kind::HOST) {
+        value = ggml_sycl_host_chunk_cap_constant();
+    } else {
+        int device = -1;
+        if (!ggml_sycl_chunk_cap_buft_device(buft, device)) {
+            ggml_sycl_plan_scope_fail(scope, "chunk cap: the device buft names no device");
+            return GGML_SYCL_CHUNK_CAP_MAX;
+        }
+        const auto frozen = ggml_sycl_arena_chunk_cap(device, ggml_sycl_chunk_cap_set::COMMITTED);
+        if (frozen.value.refusal) {
+            ggml_sycl_plan_scope_fail(scope,
+                                      std::string(frozen.value.refusal) + " for SYCL device " + std::to_string(device));
+        }
+        value = frozen.value.cap;
+    }
+    ggml_sycl_plan_caps_store(caps, buft, value);
+    return value;
+}
+
+static size_t ggml_sycl_plan_scope_load_measure_cap(ggml_sycl_plan_scope *        scope,
+                                                    ggml_sycl_chunk_cap_buft_kind kind,
+                                                    int                           device) {
+    if (kind == ggml_sycl_chunk_cap_buft_kind::HOST) {
+        return ggml_sycl_host_chunk_cap_constant();
+    }
+    if (device < 0 || device >= ggml_sycl_info().device_count) {
+        ggml_sycl_plan_scope_fail(scope, "chunk cap: the device buft names no device");
+        return GGML_SYCL_CHUNK_CAP_MAX;
+    }
+    const bool probe = scope->stage == GGML_SYCL_MEASURE_STAGE_PROBE;
+    const auto read  = ggml_sycl_arena_chunk_cap(
+        device, probe ? ggml_sycl_chunk_cap_set::PROBE_MIN : ggml_sycl_chunk_cap_set::LOAD_TO_COMMIT);
+    if (read.value.refusal) {
+        ggml_sycl_plan_scope_fail(scope,
+                                  std::string(read.value.refusal) + " for SYCL device " + std::to_string(device));
+    }
+    if (!probe && read.is_vm) {
+        // (b) and (c) must not read a cap below (a)'s: a smaller cap at (a) bounds c(P) by chunking.
+        const auto cap_min = ggml_sycl_arena_chunk_cap(device, ggml_sycl_chunk_cap_set::PROBE_MIN);
+        if (read.value.cap < cap_min.value.cap) {
+            GGML_LOG_ERROR("[ZONE-PLAN-BUG] the admitted cap %zu B is below the probe's cap_min %zu B on device %d\n",
+                           read.value.cap, cap_min.value.cap, device);
+            if (ggml_sycl::ggml_sycl_strict_enabled()) {
+                GGML_ABORT("[ZONE-PLAN-BUG] the admitted cap %zu B is below the probe's cap_min %zu B on device %d",
+                           read.value.cap, cap_min.value.cap, device);
+            }
+            ggml_sycl_plan_scope_fail(scope, "the admitted cap is below the probe's cap_min");
+        }
+    }
+    return read.value.cap;
+}
+
+// The in-scope branch of a compute buft's get_max_size: only the copy's value, never a
+// zone read.  A read the copy cannot answer is E5 and returns the per-process constant.
+static size_t ggml_sycl_plan_scope_chunk_cap(ggml_sycl_plan_scope *        scope,
+                                             ggml_backend_buffer_type_t    buft,
+                                             ggml_sycl_chunk_cap_buft_kind kind,
+                                             int                           device) {
+    if (kind == ggml_sycl_chunk_cap_buft_kind::CPU_OFFLOAD) {
+        // D12: a GPU op's compute buffer in host memory is the forbidden zero-copy read.
+        ggml_sycl_plan_scope_fail(scope, "the CPU-offload compute buft is not reachable under a placement plan");
+        return ggml_sycl_host_chunk_cap_constant();
+    }
+    if (scope->mode == GGML_SYCL_PLAN_SCOPE_LOAD_MEASURE) {
+        return ggml_sycl_plan_scope_load_measure_cap(scope, kind, device);
+    }
+    const size_t constant = kind == ggml_sycl_chunk_cap_buft_kind::HOST ? ggml_sycl_host_chunk_cap_constant() :
+                                                                          ggml_sycl_device_chunk_cap_constant(device);
+    size_t       value    = 0;
+    if (ggml_sycl_plan_caps_find(scope->caps, buft, value)) {
+        scope->reads.emplace_back(buft, value);
+        return value;
+    }
+    const int state = scope->caps->state.load(std::memory_order_acquire);
+    if (state != GGML_SYCL_PLAN_CAPS_FREEZING) {
+        const char * name = buft && buft->iface.get_name ? buft->iface.get_name(buft) : "?";
+        GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] chunk cap unfrozen at read (state=%s, buft=%s)\n",
+                       ggml_sycl_plan_caps_state_name(state), name);
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] chunk cap unfrozen at read (state=%s, buft=%s)",
+                       ggml_sycl_plan_caps_state_name(state), name);
+        }
+        ggml_sycl_plan_scope_fail(scope, "chunk cap unfrozen during this reserve");
+        return constant;
+    }
+    value = ggml_backend_sycl_plan_caps_freeze(scope, scope->caps, buft, kind);
+    scope->reads.emplace_back(buft, value);
+    return value;
+}
+
+void * ggml_backend_sycl_plan_scope_open(uint32_t                       exec_context_id,
+                                         enum ggml_sycl_plan_scope_mode mode,
+                                         ggml_backend_sycl_plan_caps_t  caps) {
+    if (g_plan_scope) {
+        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] plan scope nested\n");
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] plan scope nested");
+        }
+        return nullptr;
+    }
+    if ((mode == GGML_SYCL_PLAN_SCOPE_LOAD_MEASURE) != (caps == nullptr)) {
+        GGML_LOG_WARN("[CONTEXT-PLAN-BUG] plan scope constructed with no copy, or the load measure given one\n");
+        if (ggml_sycl::ggml_sycl_strict_enabled()) {
+            GGML_ABORT("[CONTEXT-PLAN-BUG] plan scope constructed with no copy, or the load measure given one");
+        }
+        return nullptr;
+    }
+    try {
+        auto * scope           = new ggml_sycl_plan_scope();
+        scope->exec_context_id = exec_context_id;
+        scope->mode            = mode;
+        scope->caps            = caps;
+        g_plan_scope           = scope;
+        return scope;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void * ggml_backend_sycl_plan_scope_open_load_measure(enum ggml_sycl_measure_stage stage) {
+    void * handle = ggml_backend_sycl_plan_scope_open(0, GGML_SYCL_PLAN_SCOPE_LOAD_MEASURE, nullptr);
+    if (handle) {
+        static_cast<ggml_sycl_plan_scope *>(handle)->stage = stage;
+    }
+    return handle;
+}
+
+const char * ggml_backend_sycl_plan_scope_failure(void * scope) {
+    auto * s = static_cast<ggml_sycl_plan_scope *>(scope);
+    return s && !s->failure.empty() ? s->failure.c_str() : nullptr;
+}
+
+void ggml_backend_sycl_plan_scope_close(void * scope) {
+    auto * s = static_cast<ggml_sycl_plan_scope *>(scope);
+    if (!s) {
+        return;
+    }
+    if (g_plan_scope == s) {
+        g_plan_scope = nullptr;
+    }
+    delete s;
+}
+
+// L0 for a caller outside the backend (ggml-sycl.h).  The token is thread-local state, so
+// the scope is just its owner: open constructs it, close destroys it.
+struct ggml_backend_sycl_replan_scope_state {
+    explicit ggml_backend_sycl_replan_scope_state(ggml_sycl::ggml_sycl_replan_kind kind) : token(kind) {}
+
+    ggml_sycl::ggml_sycl_replan_token token;
+};
+
+void * ggml_backend_sycl_replan_scope_open(enum ggml_sycl_replan_scope_kind kind, bool require_outermost) {
+    if (kind != GGML_SYCL_REPLAN_SCOPE_TRANSACTION) {
+        return nullptr;
+    }
+    if (require_outermost) {
+        GGML_SYCL_WITNESS(!ggml_sycl::ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_TRANSACTION),
+                          "[REPLAN-TOKEN] growth scope not outermost: under TRANSACTION");
+        GGML_SYCL_WITNESS(!ggml_sycl::ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_LOAD),
+                          "[REPLAN-TOKEN] growth scope not outermost: under LOAD");
+        GGML_SYCL_WITNESS(!ggml_sycl::ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_LIFECYCLE),
+                          "[REPLAN-TOKEN] growth scope not outermost: under LIFECYCLE");
+    }
+    try {
+        return new ggml_backend_sycl_replan_scope_state(ggml_sycl::GGML_SYCL_REPLAN_KIND_TRANSACTION);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void ggml_backend_sycl_replan_scope_close(void * scope) {
+    delete static_cast<ggml_backend_sycl_replan_scope_state *>(scope);
+}
+
+// The claim scope of a context's tenant slots (ggml-sycl.h; tenant-claim-scope.hpp).  Open reads the
+// context's held table from its registry entry and makes it this thread's claim target; the SYCL_Host
+// buffer type's alloc_buffer claims from it until close.  The status says why a scope did not open: a
+// context with no reservation (allocate as before) is not a nested open (do not allocate: the scope in force
+// is another context's) and neither is a failure.
+enum ggml_sycl_claim_scope_status ggml_backend_sycl_claim_scope_open(ggml_backend_t backend, void ** scope) {
+    if (scope == nullptr) {
+        return GGML_SYCL_CLAIM_SCOPE_FAILED;
+    }
+    *scope = nullptr;
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return GGML_SYCL_CLAIM_SCOPE_FAILED;
+    }
+    if (!backend || !backend->context || !ggml_backend_is_sycl(backend) || !backend->device ||
+        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
+        return GGML_SYCL_CLAIM_SCOPE_INVALID_BACKEND;
+    }
+    try {
+        const auto * ctx = static_cast<const ggml_backend_sycl_context *>(backend->context);
+        if (ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES) {
+            return GGML_SYCL_CLAIM_SCOPE_INVALID_BACKEND;
+        }
+        // A nested open is refused before the table is read, so a caller inside a scope always learns that,
+        // whatever its own context holds.
+        if (ggml_sycl::tenant_claim_scope::active()) {
+            GGML_LOG_ERROR("[CLAIM-SCOPE] nested open refused: this thread already holds a claim scope\n");
+            return GGML_SYCL_CLAIM_SCOPE_NESTED;
+        }
+        const uint64_t id = ggml_sycl_context_execution_id(ctx);
+        if (id == 0) {
+            return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;
+        }
+        auto table = ggml_sycl_kv_region_registry(ctx->device).tenants(id);
+        ggml_sycl::tenant_claim_scope::state * opened = nullptr;
+        switch (ggml_sycl::tenant_claim_scope::open(std::move(table), opened)) {
+            case ggml_sycl::tenant_claim_scope::open_status::OPENED:
+                *scope = opened;
+                return GGML_SYCL_CLAIM_SCOPE_OPENED;
+            case ggml_sycl::tenant_claim_scope::open_status::NO_TABLE:
+                return GGML_SYCL_CLAIM_SCOPE_NO_RESERVATION;
+            case ggml_sycl::tenant_claim_scope::open_status::NESTED:
+                return GGML_SYCL_CLAIM_SCOPE_NESTED;
+        }
+        return GGML_SYCL_CLAIM_SCOPE_FAILED;
+    } catch (...) {
+        return GGML_SYCL_CLAIM_SCOPE_FAILED;
+    }
+}
+
+void ggml_backend_sycl_claim_scope_close(void * scope) {
+    if (scope == nullptr) {
+        return;
+    }
+    if (!ggml_sycl::tenant_claim_scope::close(static_cast<ggml_sycl::tenant_claim_scope::state *>(scope))) {
+        GGML_LOG_ERROR("[CLAIM-SCOPE] close refused: the scope is not the one open on this thread\n");
+    }
+}
+
+size_t ggml_backend_sycl_claim_scope_claims(void * scope) {
+    if (scope == nullptr) {
+        return 0;
+    }
+    size_t claims = 0;
+    if (!ggml_sycl::tenant_claim_scope::claims_made(static_cast<const ggml_sycl::tenant_claim_scope::state *>(scope),
+                                                    claims)) {
+        GGML_LOG_ERROR("[CLAIM-SCOPE] claims read refused: the scope is not the one open on this thread\n");
+    }
+    return claims;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Host-tier slots alive in the process (a test's view of a reservation's carves).
+extern "C" size_t ggml_backend_sycl_test_host_tenant_slots_live() {
+    return ggml_sycl_host_tenant_slot::live_count().load(std::memory_order_relaxed);
+}
+
+size_t ggml_backend_sycl_plan_caps_freeze_core(ggml_backend_sycl_plan_caps_t caps,
+                                               ggml_backend_buffer_type_t    buft,
+                                               bool                          is_vm,
+                                               size_t                        runtime,
+                                               size_t                        kv,
+                                               size_t                        scratch,
+                                               size_t                        safe_alloc,
+                                               size_t                        max_alloc) {
+    const auto core = ggml_sycl_chunk_cap_core(is_vm, runtime, kv, scratch, safe_alloc, max_alloc);
+    ggml_sycl_plan_caps_store(caps, buft, core.cap);
+    return core.cap;
+}
+
+uint32_t ggml_backend_sycl_plan_caps_freeze_count(ggml_backend_sycl_plan_caps_t caps, ggml_backend_buffer_type_t buft) {
+    std::lock_guard<std::mutex> lock(caps->mutex);
+    for (const auto & s : caps->slots) {
+        if (s.buft == buft) {
+            return s.freezes;
+        }
+    }
+    return 0;
+}
+
+int ggml_backend_sycl_plan_caps_live(void) {
+    return g_plan_caps_live.load(std::memory_order_acquire);
+}
+#endif
+
+static bool ggml_backend_sycl_buffer_type_is_host_compute(ggml_backend_buffer_type_t buft);
+
 static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     ggml_backend_sycl_buffer_type_context * ctx = (ggml_backend_sycl_buffer_type_context *) buft->context;
     if (ctx && ctx->max_size_override > 0) {
         return ctx->max_size_override;
     }
+    if (g_plan_scope && ggml_backend_sycl_buffer_type_is_host_compute(buft)) {
+        // The tensor-split host compute buft is refused under a plan by pointer (r4 m-1,
+        // m-3): its alloc_buffer takes a direct host-pinned allocation before any scope check.
+        ggml_sycl_plan_scope_fail(g_plan_scope,
+                                  "the tensor-split host compute buft is not reachable under a placement plan");
+        return ggml_sycl_device_chunk_cap_constant(ctx ? ctx->device : -1);
+    }
+    // In a plan scope the answer is the context's copy, never a zone read.  This comes
+    // before the device-index check, so a buft naming a device with no device reaches it.
+    if (g_plan_scope) {
+        return ggml_sycl_plan_scope_chunk_cap(g_plan_scope, buft, ggml_sycl_chunk_cap_buft_kind::DEVICE,
+                                              ctx ? ctx->device : -1);
+    }
     if (!ctx || ctx->device < 0 || ctx->device >= ggml_sycl_info().device_count) {
         return 0;
+    }
+    {
+        // On VM backing the cap is the one expression over the ledger's current capacities.
+        // Otherwise this falls through to the arena branch and the no-arena tail below.
+        const auto vm_cap = ggml_sycl_arena_chunk_cap(ctx->device, ggml_sycl_chunk_cap_set::LEDGER_CURRENT);
+        if (vm_cap.is_vm) {
+            return vm_cap.value.cap;
+        }
     }
 
     // llama.cpp-w1rxh: arena-aware per-chunk limit.
@@ -39138,6 +41042,22 @@ ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device) {
     }
     return &ggml_backend_sycl_buffer_types[device];
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// A device buft that touches no device: the production interface over a context naming
+// `device`.  ggml_backend_sycl_buffer_type(int) asserts device < device_count and gets
+// the device, so a host with none cannot use it.
+ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type_make_for_testing(int device) {
+    return new ggml_backend_buffer_type{
+        /* .iface    = */ ggml_backend_sycl_buffer_type_interface,
+        /* .device   = */ nullptr,
+        /* .context  = */
+        new ggml_backend_sycl_buffer_type_context{ device, GGML_SYCL_NAME + std::to_string(device),
+                                                  GGML_SYCL_MEM_DEVICE, GGML_SYCL_MEM_POLICY_STATIC, false, true, 0,
+                                                  nullptr, nullptr },
+    };
+}
+#endif
 
 static ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(ggml_backend_sycl_context * ctx) {
     GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_buffer_type\n");
@@ -43512,6 +45432,9 @@ static size_t ggml_backend_sycl_host_buffer_type_chunk_cap() {
 }
 
 static size_t ggml_backend_sycl_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    if (g_plan_scope) {
+        return ggml_sycl_plan_scope_chunk_cap(g_plan_scope, buft, ggml_sycl_chunk_cap_buft_kind::HOST, -1);
+    }
     const size_t chunk_cap = ggml_backend_sycl_host_buffer_type_chunk_cap();
 
     // When host zones are configured, report the largest single-chunk
@@ -43587,6 +45510,10 @@ struct sycl_host_buf_ctx {
     // host-access accessors below can order against the GPU before delegating.
     int                   device = -1;
     ggml_backend_buffer_i cpu_iface{};
+    // Set when the buffer was built over a claimed tenant slot (inside a claim scope); free_buffer
+    // releases it.  `buffer_handle` is then a copy of the slot's own handle, so the memory outlives
+    // the table that carried it.
+    std::unique_ptr<ggml_sycl::tenant_claim> claim;
 };
 
 // llama.cpp-30h4: order host-side access to this pinned USM against the GPU
@@ -43633,6 +45560,66 @@ static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buff
     auto * ctx = static_cast<sycl_host_buf_ctx *>(buffer->context);
     if (!ctx) {
         return;
+    }
+    if (ctx->claim) {
+        // No wait here, on purpose (no host waits; event-chain instead), and the slot goes back with event 0.  That
+        // is sound because of a contract that holds on every path to this function, read against the code and
+        // pinned by scripts/check-sycl-l4-proc-registration.py.  Each paragraph below is one part of it.
+        //
+        // CONTRACT: a claimed compute buffer is freed only after a synchronize ATTEMPT of every backend of its
+        // scheduler, and every SYCL queue that can touch a claimed slot is the device's one execution queue, which
+        // that synchronize drains.
+        //
+        // ONE QUEUE: once the unified cache exists (a claim requires it: its slots are cache carves),
+        // ggml_backend_sycl_context::stream(device, idx) answers ggml_sycl_execution_queue_for_device(device) for
+        // EVERY idx -- the TP queue when TP is on, else the cache's own queue.  Before the cache exists stream() falls
+        // back to the device's default queue, which no claim can outlive or predate.  So stream 0, the streams
+        // "1..N" and the cache's queue are one queue, not several that the synchronize could miss, and the
+        // synchronize's wait on stream 0 (or on the deferred last graph event, plus ggml_sycl_cpu_tg_flush_pending
+        // for the CPU-expert and scatter pipelines, detached threads included) is a wait on all of them.  A second
+        // real queue per device breaks that, and with it this contract: the pins on stream() and on the
+        // synchronize's drain exist so that it cannot happen quietly.
+        //
+        // READERS: when the plan has CPU work, or the offload is partial, the CPU backend's compute buft is the
+        // CpuActivation clone, which ggml_backend_sycl_device_supports_buft does not list, so no SYCL op touches an
+        // activation in it.  With no CPU work and every layer offloaded it is the GENERIC SYCL_Host buft
+        // (llama_context_cpu_compute_buft), which supports_buft accepts, and SYCL kernels DO read and write a
+        // claimed slot in place -- on the execution queue above, which is why the synchronize covers them.  A
+        // consumer that puts work for a slot on anything that is not that queue must make the backend synchronize
+        // drain it, or chain on the slot's wait_event (the L6 event ledger); it must not rely on this contract and
+        // must not add a wait here.  No async copy has a SYCL_Host tensor at either end: set/get_tensor_async assert
+        // a SYCL device, host-compute or cpu-offload buft and cpy_tensor_async is NULL; the scheduler's
+        // cross-backend copy is a blocking ggml_backend_tensor_copy between the two backends' synchronizes, through
+        // accessors that wait the cache and default queues themselves; ggml-cpu's graph_compute is synchronous (its
+        // synchronize is NULL); and the staging the scatter threads touch is their own owner-first host handles.
+        //
+        // PATHS: ggml_backend_sched_reserve and _reserve_size (ggml_backend_sched_synchronize first); the realloc in
+        // ggml_backend_sched_alloc_splits (ggml_backend_synchronize of every backend before ggml_gallocr_reserve_n --
+        // the other realloc, the automatic reserve in ggml_gallocr_alloc_graph, needs a single-buffer allocator,
+        // which llama.cpp never builds because the CPU backend is always one of the scheduler's backends, so a SYCL
+        // scheduler has two or more); llama_context's scheduler replacement in sched_reserve_impl (synchronize()
+        // before it on the ALLOC path; the pipeline-parallel retry replaces a scheduler that only failed to reserve,
+        // so it never computed) and in release_rung_buffers (synchronize() first); and ~llama_context
+        // (synchronize() first).  Nothing else frees a compute buffer: ggml_backend_sched_reset only resets the
+        // allocator.
+        //
+        // BENIGN FREES AND THE L6 CONSTRAINT: two more frees run no synchronize: the MEASURE scheduler's destruction
+        // (sched_measure_storage, whose reserves go through ggml_backend_sched_reserve, which does synchronize, and
+        // whose final free does not) and the unwinding of a constructor that threw.  Nothing runs a kernel on either,
+        // and no claim scope is open on either.  L6 CONSTRAINT: a claim scope must never be opened on the measure
+        // scheduler (its reserve is bare, with no plan scope or hold record around it); a scope opened there turns both
+        // frees into paths on the list above, and each then needs a synchronize before it.
+        //
+        // A FAILED DRAIN: "synchronize" is an attempt: ggml_backend_sycl_synchronize swallows its own failure (a
+        // throwing drain goes to ggml_backend_sycl_graph_boundary_exception_cleanup, which logs, and the call
+        // returns).  So after a failed drain (a lost device) the slot goes back with event 0 while the queue may
+        // still reference it, and the contract is void for that device from then on: nothing is submitted to a lost
+        // device's context, which is why that is tolerated, and the synchronize's own ERROR line is the only report.
+        // A caller that needs the drain to have worked must ask the backend, not infer it from this function having
+        // been reached.  A queue-wide wait here would be too much (it waited on, and rethrew, other contexts' work),
+        // and the contract already makes it unneeded.
+        (void) ggml_sycl::tenant_claim_scope::release(*ctx->claim, 0);
+        ctx->claim.reset();
     }
     ggml_sycl::host_mem_ledger_get().sycl_host_buffer_bytes.fetch_sub(ctx->size, std::memory_order_relaxed);
     ctx->buffer_handle = {};
@@ -43699,6 +45686,101 @@ static bool ggml_backend_sycl_host_buffer_cpy_tensor(ggml_backend_buffer_t buffe
     return ctx->cpu_iface.cpy_tensor(buffer, src, dst);
 }
 
+// Inside a claim scope the host buffer is a claim of a tenant slot, not an allocation (moua design 2.3.2):
+// the lowest free slot of the host compute cohort, checked against its cap, and the buffer is built over
+// the slot's memory.  A request the table cannot serve is a plan bug, never a silent growth and never a
+// fall back to the legacy path: the buffer is refused by name.  On OK `claim` holds the live claim and
+// `ptr`/`handle` the slot's memory; on false nothing is claimed.
+static bool ggml_backend_sycl_host_buffer_claim_slot(size_t                                     size,
+                                                     int                                        device,
+                                                     std::unique_ptr<ggml_sycl::tenant_claim> & claim,
+                                                     void *&                                    ptr,
+                                                     ggml_sycl::mem_handle &                    handle) {
+    const ggml_sycl_context_cohort_info * info = ggml_sycl_context_cohort_lookup(GGML_SYCL_CONTEXT_COHORT_COMPUTE_HOST);
+    GGML_ASSERT(info != nullptr);
+    // `made` releases its slot when it is dropped, so every refusal below and an exception from here on leave
+    // the slot free: there is no explicit release to forget.
+    auto                                  made    = std::make_unique<ggml_sycl::tenant_claim>();
+    const ggml_sycl::tenant_claim_outcome outcome = ggml_sycl::tenant_claim_scope::claim(info->name, size, *made);
+    if (outcome.status != ggml_sycl::tenant_claim_status::OK) {
+        if (outcome.status == ggml_sycl::tenant_claim_status::OVER_PLAN) {
+            GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] host buffer claim refused: %zu B over the %zu B slot %u of cohort %s\n",
+                           size, outcome.cap, outcome.index, info->name);
+        } else {
+            GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] host buffer claim refused: no free slot %u of cohort %s for %zu B\n",
+                           outcome.index, info->name, size);
+        }
+        return false;
+    }
+    const ggml_sycl_host_tenant_slot * slot     = ggml_sycl_host_tenant_slot_of(made->owner);
+    const auto                         resolved = slot ? slot->handle.resolve(device) : ggml_sycl::resolved_ptr{};
+    if (!slot || !resolved.ptr || resolved.on_device) {
+        GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] host buffer claim refused: slot %u of cohort %s holds no host memory\n",
+                       made->index, info->name);
+        return false;
+    }
+    ptr    = resolved.ptr;
+    handle = slot->handle;
+    claim  = std::move(made);
+    return true;
+}
+
+// The buffer over `ptr`: the CPU buffer from the pointer with the host accessors installed.  `claim` is the
+// live tenant claim the memory belongs to, or null for a buffer the buft allocated itself.  The claim is
+// released by its own destructor on every refusal here, so none of them has a release to forget.
+static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_wrap(ggml_backend_buffer_type_t               buft,
+                                                                void *                                   ptr,
+                                                                size_t                                   size,
+                                                                ggml_sycl::mem_handle                    handle,
+                                                                int                                      device,
+                                                                std::unique_ptr<ggml_sycl::tenant_claim> claim) {
+    // Use the wrapper struct as buffer context so free_buffer knows which
+    // deallocation path to take.  Override get_base to extract the raw pointer.
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    if (!buffer) {
+        return nullptr;
+    }
+
+    // Capture the CPU iface BEFORE overriding it: the accessors below delegate
+    // to these exact implementations after waiting the GPU (llama.cpp-30h4).  nothrow: a failed allocation
+    // frees the CPU buffer built above and answers null, rather than leaving it, and its claim, to an unwind.
+    auto * ctx = new (std::nothrow) sycl_host_buf_ctx{ ptr, size, std::move(handle), device, buffer->iface };
+    if (!ctx) {
+        ggml_backend_buffer_free(buffer);
+        return nullptr;
+    }
+    ctx->claim = std::move(claim);
+
+    if (!ggml_backend_buffer_set_type(buffer, buft)) {
+        ggml_backend_buffer_free(buffer);
+        delete ctx;  // its claim, if any, releases with it
+        return nullptr;
+    }
+    // Counted only once the context is installed, because free_buffer (which
+    // subtracts) is only reachable through it.  A claimed tenant slot is a live
+    // SYCL_Host buffer too, so it counts like one the buft allocated.
+    ggml_sycl::host_mem_ledger_get().sycl_host_buffer_bytes.fetch_add(size, std::memory_order_relaxed);
+    buffer->context           = ctx;
+    buffer->iface.get_base    = ggml_backend_sycl_host_buffer_get_base;
+    buffer->iface.free_buffer = ggml_backend_sycl_host_buffer_free_buffer;
+    buffer->iface.clear       = ggml_backend_sycl_host_buffer_clear;
+    // Only wrap the accessors the CPU buffer actually implements; leaving an
+    // absent one null keeps ggml-backend's own fallbacks reachable.
+    if (ctx->cpu_iface.set_tensor) {
+        buffer->iface.set_tensor = ggml_backend_sycl_host_buffer_set_tensor;
+    }
+    if (ctx->cpu_iface.get_tensor) {
+        buffer->iface.get_tensor = ggml_backend_sycl_host_buffer_get_tensor;
+    }
+    if (ctx->cpu_iface.memset_tensor) {
+        buffer->iface.memset_tensor = ggml_backend_sycl_host_buffer_memset_tensor;
+    }
+    if (ctx->cpu_iface.cpy_tensor) {
+        buffer->iface.cpy_tensor = ggml_backend_sycl_host_buffer_cpy_tensor;
+    }
+    return buffer;
+}
+
 static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                                                              size_t                     size) {
     const bool weights_evictable = ggml_backend_sycl_weights_evictable();
@@ -43709,6 +45791,17 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     const int exact_device = ggml_sycl_device_id_from_backend_dev(buft ? buft->device : nullptr);
     if (exact_device < 0) {
         return nullptr;
+    }
+    // Inside a claim scope the buffer is a claim of a tenant slot, not an allocation.
+    if (ggml_sycl::tenant_claim_scope::active()) {
+        void *                                   claimed_ptr = nullptr;
+        ggml_sycl::mem_handle                    claimed_handle;
+        std::unique_ptr<ggml_sycl::tenant_claim> claim;
+        if (!ggml_backend_sycl_host_buffer_claim_slot(size, exact_device, claim, claimed_ptr, claimed_handle)) {
+            return nullptr;
+        }
+        return ggml_backend_sycl_host_buffer_wrap(buft, claimed_ptr, size, std::move(claimed_handle), exact_device,
+                                                  std::move(claim));
     }
     auto *        exact_cache = ggml_sycl::get_unified_cache_for_device(exact_device);
     sycl::queue * exact_queue =
@@ -43744,44 +45837,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     ggml_sycl::mem_handle buffer_handle =
         ggml_sycl::detail::from_legacy_owned_alloc(std::move(host_buffer_owner), GGML_LAYOUT_AOS);
 
-    // Use the wrapper struct as buffer context so free_buffer knows which
-    // deallocation path to take.  Override get_base to extract the raw pointer.
-    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
-    if (!buffer) {
-        return nullptr;
-    }
-
-    // Capture the CPU iface BEFORE overriding it: the accessors below delegate
-    // to these exact implementations after waiting the GPU (llama.cpp-30h4).
-    auto * ctx = new sycl_host_buf_ctx{ ptr, size, std::move(buffer_handle), exact_device, buffer->iface };
-
-    if (!ggml_backend_buffer_set_type(buffer, buft)) {
-        ggml_backend_buffer_free(buffer);
-        delete ctx;
-        return nullptr;
-    }
-    // Counted only once the context is installed, because free_buffer (which
-    // subtracts) is only reachable through it.
-    ggml_sycl::host_mem_ledger_get().sycl_host_buffer_bytes.fetch_add(size, std::memory_order_relaxed);
-    buffer->context           = ctx;
-    buffer->iface.get_base    = ggml_backend_sycl_host_buffer_get_base;
-    buffer->iface.free_buffer = ggml_backend_sycl_host_buffer_free_buffer;
-    buffer->iface.clear       = ggml_backend_sycl_host_buffer_clear;
-    // Only wrap the accessors the CPU buffer actually implements; leaving an
-    // absent one null keeps ggml-backend's own fallbacks reachable.
-    if (ctx->cpu_iface.set_tensor) {
-        buffer->iface.set_tensor = ggml_backend_sycl_host_buffer_set_tensor;
-    }
-    if (ctx->cpu_iface.get_tensor) {
-        buffer->iface.get_tensor = ggml_backend_sycl_host_buffer_get_tensor;
-    }
-    if (ctx->cpu_iface.memset_tensor) {
-        buffer->iface.memset_tensor = ggml_backend_sycl_host_buffer_memset_tensor;
-    }
-    if (ctx->cpu_iface.cpy_tensor) {
-        buffer->iface.cpy_tensor = ggml_backend_sycl_host_buffer_cpy_tensor;
-    }
-    return buffer;
+    return ggml_backend_sycl_host_buffer_wrap(buft, ptr, size, std::move(buffer_handle), exact_device, nullptr);
 }
 
 ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
@@ -43805,6 +45861,26 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
     };
     return &ggml_backend_sycl_buffer_type_host;
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The SYCL_Host buft with no device behind it, for hosts that have none.  Its iface is
+// the production host interface (the same functions the getter above installs).
+ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_make_for_testing() {
+    return new ggml_backend_buffer_type{
+        /* .iface    = */ {
+                           /* .get_name         = */ ggml_backend_sycl_host_buffer_type_name,
+                           /* .alloc_buffer     = */ ggml_backend_sycl_host_buffer_type_alloc_buffer,
+                           /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+                           /* .get_max_size     = */ ggml_backend_sycl_host_buffer_type_get_max_size,
+                           /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                           /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+                           },
+        /* .device   = */
+        nullptr,
+        /* .context  = */ nullptr,
+    };
+}
+#endif
 
 static const char * ggml_backend_sycl_kv_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
@@ -43941,7 +46017,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_compute_buffer_alloc(ggml_ba
             primary_stream          = &(primary_dpct_dev.default_queue());
         }
 
-        ggml_sycl::alloc_request req;
+        ggml_sycl::alloc_request req{};
         req.queue                               = primary_stream;
         req.device                              = primary_device;
         req.size                                = size;
@@ -44013,6 +46089,23 @@ static const ggml_backend_buffer_type_i ggml_backend_sycl_host_compute_buffer_ty
     /* .is_host          = */ NULL,  // Not a CPU host buffer - it's SYCL host memory
 };
 
+// The per-device tensor-split host compute bufts.  File scope so a plan scope can name one
+// by pointer without creating it.
+static struct ggml_backend_buffer_type ggml_backend_sycl_host_compute_buffer_types[GGML_SYCL_MAX_DEVICES];
+static bool                            g_host_compute_buffer_types_initialized = false;
+
+static bool ggml_backend_sycl_buffer_type_is_host_compute(ggml_backend_buffer_type_t buft) {
+    if (!buft) {
+        return false;
+    }
+    for (int i = 0; i < GGML_SYCL_MAX_DEVICES; ++i) {
+        if (buft == &ggml_backend_sycl_host_compute_buffer_types[i]) {
+            return g_host_compute_buffer_types_initialized;
+        }
+    }
+    return false;
+}
+
 ggml_backend_buffer_type_t ggml_backend_sycl_host_compute_buffer_type(int device) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return nullptr;
@@ -44024,8 +46117,7 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_compute_buffer_type(int device
                        device, dev_count - 1);
         GGML_ASSERT(device < dev_count);
     }
-    static struct ggml_backend_buffer_type ggml_backend_sycl_host_compute_buffer_types[GGML_SYCL_MAX_DEVICES];
-    static bool                            initialized = false;
+    bool & initialized = g_host_compute_buffer_types_initialized;
     if (!initialized) {
         for (int i = 0; i < dev_count; i++) {
             auto &    device_i                             = ggml_sycl_get_device(i);
@@ -44062,6 +46154,9 @@ static bool ggml_backend_sycl_cpu_offload_compute_is_host(ggml_backend_buffer_ty
 }
 
 static size_t ggml_backend_sycl_cpu_offload_compute_get_max_size(ggml_backend_buffer_type_t buft) {
+    if (g_plan_scope) {
+        return ggml_sycl_plan_scope_chunk_cap(g_plan_scope, buft, ggml_sycl_chunk_cap_buft_kind::CPU_OFFLOAD, -1);
+    }
     // llama.cpp-15li2 CRIT-2: host-pinned memory is limited by system
     // host-zone configuration, not VRAM zones.
     //
@@ -45052,6 +47147,11 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     }
     pp_moe_onednn_drain_scratch_slots(device);
     ggml_sycl_execution_abort_and_release_graph(this);
+    // One read of the id for both drops: zero once an execution context's end has reset it, which dropped the
+    // entries by the ended id already.
+    const uint64_t context_id = ggml_sycl_context_execution_id(this);
+    ggml_sycl_published_section_erase(device, context_id);
+    ggml_sycl_host_tenants_erase(device, context_id);
     ggml_sycl_execution_unbind_backend(this);
     {
         std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
@@ -45321,6 +47421,9 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
     GGML_UNUSED(ctx);
     throw ggml_sycl_fallback_error(reason);
 #else
+    // A ggml-cpu graph on the dispatching thread: it resolves host tensors by
+    // design, so its resolver calls are not device kernels' reads.
+    ggml_sycl_host_executor_region host_executor;
 
     if (!dst) {
         return false;
@@ -47180,9 +49283,15 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
             const sycl::half * src0_ptr = src0->type == GGML_TYPE_F16 ?
                                               (const sycl::half *) src0_dd_i :
                                               (src0_dq_scratch ? src0_dq_scratch : src0_as_f16.get());
-            DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
-                                      src1_ptr, DnnlGemmWrapper::to_dt<sycl::half>(), dst_dd_i,
-                                      DnnlGemmWrapper::to_dt<float>(), stream, ldc, ggml_type_name(src0->type));
+            // A declined scratchpad submitted nothing, and a DNNL build compiles no other arm here (the dpct::gemm arm
+            // below exists only without GGML_SYCL_DNNL): the op fails by name, never by abort (llama.cpp-23mk S3-4).
+            if (!DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ptr,
+                                           DnnlGemmWrapper::to_dt<sycl::half>(), src1_ptr,
+                                           DnnlGemmWrapper::to_dt<sycl::half>(), dst_dd_i,
+                                           DnnlGemmWrapper::to_dt<float>(), stream, ldc, ggml_type_name(src0->type))) {
+                throw ggml_sycl_fallback_error(
+                    "dnnl_gemm declined in mul_mat's f16 dense arm: no other arm in a DNNL build");
+            }
         }
 #elif GGML_SYCL_HAS_ONEAPI_MATH
         {
@@ -47337,9 +49446,13 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
         const float * src1_ddf1_i = src1->type == GGML_TYPE_F32 ? (const float *) src1_ddf_i : src1_ddq_as_f32.get();
 #if GGML_SYCL_DNNL
 
-        DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i, DnnlGemmWrapper::to_dt<float>(),
-                                  src1_ddf1_i, DnnlGemmWrapper::to_dt<float>(), dst_dd_i,
-                                  DnnlGemmWrapper::to_dt<float>(), stream, ldc, ggml_type_name(src0->type));
+        // Same declared path as the f16 dense arm above: no other arm exists in a DNNL build.
+        if (!DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i, DnnlGemmWrapper::to_dt<float>(),
+                                       src1_ddf1_i, DnnlGemmWrapper::to_dt<float>(), dst_dd_i,
+                                       DnnlGemmWrapper::to_dt<float>(), stream, ldc, ggml_type_name(src0->type))) {
+            throw ggml_sycl_fallback_error(
+                "dnnl_gemm declined in mul_mat's f32 dense arm: no other arm in a DNNL build");
+        }
 #elif GGML_SYCL_HAS_ONEAPI_MATH
         {
             const float alpha = 1.0f;
@@ -49416,6 +51529,10 @@ int g_ggml_sycl_tp_threaded_ffn = 0;  // DISABLED - causes hangs at MMVQ kernel
 
 static void tp_device1_worker_thread_func();
 
+// The worker's own in-order queue, created by the worker thread.  Namespace-scope so
+// that ggml_backend_sycl_synchronize_for_replan can wait it when it exists.
+static sycl::queue * g_tp_device1_worker_queue = nullptr;
+
 // Worker thread function: runs FFN computations on device 1
 static void tp_device1_worker_thread_func() {
     auto &    w      = g_tp_device1_worker;
@@ -49424,12 +51541,11 @@ static void tp_device1_worker_thread_func() {
     // Using the shared TP queue causes hangs due to SYCL queue contention
 
     ggml_sycl_set_device(device);
-    sycl::device         dev          = ggml_sycl_get_device(device);
-    static sycl::queue * worker_queue = nullptr;
-    if (!worker_queue) {
-        worker_queue = new sycl::queue(dev, default_queue_properties());
+    sycl::device dev = ggml_sycl_get_device(device);
+    if (!g_tp_device1_worker_queue) {
+        g_tp_device1_worker_queue = new sycl::queue(dev, default_queue_properties());
     }
-    queue_ptr stream = worker_queue;
+    queue_ptr stream = g_tp_device1_worker_queue;
 
     if (!stream) {
         fprintf(stderr, "SYCL TP WORKER: Failed to create worker queue for device %d!\n", device);
@@ -52029,10 +54145,43 @@ static bool ggml_sycl_batched_f16_use_onemath(const ggml_tensor * src0, const gg
     return false;
 }
 
-static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
-                                           const ggml_tensor *         src0,
-                                           const ggml_tensor *         src1,
-                                           ggml_tensor *               dst) try {
+static_assert(GGML_SYCL_NONFA_STAGE_ELEM_BYTES == sizeof(sycl::half),
+              "the non-FA staging slot is sized in the element bytes the batched op stages");
+
+// The facts ggml_sycl_mul_mat's f16 attention chain routes on that are not a function of the tensors. The
+// dispatch and the measure pass's context-nonfa-stage visitor (ggml_sycl::context_measure_mul_mat_route_env)
+// both read them here, so the route and the staged size are derived once. A tensor with no buffer is not row-split
+// and not a weight (ggml_sycl_mul_mat_route_env_from).
+static ggml_sycl_mul_mat_route_env ggml_sycl_mul_mat_route_env_of(const ggml_tensor * src0, const ggml_tensor * src1) {
+#if GGML_SYCL_DNNL
+    // oneDNN handles strided data; the oneMath path converts the elements.
+    const bool stage_strided = !ggml_sycl_batched_f16_use_onemath(src0, src1);
+#else
+    const bool stage_strided = false;
+#endif
+    return ggml_sycl_mul_mat_route_env_from(src0, src1, ggml_backend_buffer_is_sycl_split, ggml_sycl_tensor_is_weight,
+                                            g_ggml_sycl_kqv_force_simple || g_ggml_sycl_kqv_disable_fp16,
+                                            stage_strided);
+}
+
+namespace ggml_sycl {
+// The view callback of the measure pass: the same environment the dispatch routes on.
+bool context_measure_mul_mat_route_env(void *, const ggml_tensor * node, ggml_sycl_mul_mat_route_env * env) {
+    if (node == nullptr || node->op != GGML_OP_MUL_MAT || node->src[0] == nullptr || node->src[1] == nullptr) {
+        return false;
+    }
+    *env = ggml_sycl_mul_mat_route_env_of(node->src[0], node->src[1]);
+    return true;
+}
+}  // namespace ggml_sycl
+
+// Returns false when the oneDNN scratchpad request was declined before anything was written to dst: both callers then
+// run ggml_sycl_mul_mat_batched_f16_fallback (llama.cpp-23mk S3-4). A decline is not resource exhaustion, so it never
+// reaches the resource-exhaustion ladder; errors still throw as before.
+[[nodiscard]] static bool ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
+                                                         const ggml_tensor *         src0,
+                                                         const ggml_tensor *         src1,
+                                                         ggml_tensor *               dst) try {
     // batched_sycl is intended for activation-only GEMM (Q/K/V). Weight GEMM should
     // route through the unified-cache streaming path in ggml_sycl_op_mul_mat.
     GGML_ASSERT(!ggml_sycl_tensor_is_weight(src0));
@@ -52075,28 +54224,12 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
         scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_nc_sycl", dst, /*num_src=*/2,
                                              " : converting src1 to fp16");
 
-        // iterate tensor dims and find the slowest moving dim and stride
-        int    last_dim    = 0;
-        int    last_str    = 0;
-        size_t largest_str = 0;
-        for (int i = 0; i < 4; i++) {
-            // last stride is always the largest
-            if (src1->nb[i] == largest_str) {
-                if (src1->ne[last_dim] == 1) {
-                    last_str = i;
-                    last_dim = i;
-                }
-            }
-            if (src1->nb[i] > largest_str) {
-                largest_str = src1->nb[i];
-                last_str    = i;
-                last_dim    = i;
-            }
-        }
 #if GGML_SYCL_DNNL
         if (!use_onemath_batched) {
             // oneDNN handles strided data and does not need overhead of get_to_fp16_nc_sycl.
-            const int64_t ne_src1 = src1->nb[last_str] * src1->ne[last_dim] / type_size_src1;
+            // The staged size is the shared function's, which the measure visitor sizes the slot with.
+            const int64_t ne_src1 =
+                static_cast<int64_t>(ggml_sycl_batched_f16_src1_stage_elems(src1, /*strided=*/true));
             if (!src1_f16_alloc.alloc(*queue, ctx.device, static_cast<size_t>(ne_src1), "batched_f16_src1_stage")) {
                 // llama.cpp-oyfl: name the actual size that failed to allocate.
                 // This staging buffer's demand at long context is exactly what
@@ -52117,7 +54250,8 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
         } else
 #endif
         {
-            const int64_t ne_src1 = ggml_nelements(src1);
+            const int64_t ne_src1 =
+                static_cast<int64_t>(ggml_sycl_batched_f16_src1_stage_elems(src1, /*strided=*/false));
             if (!src1_f16_alloc.alloc(*queue, ctx.device, static_cast<size_t>(ne_src1), "batched_f16_src1_stage")) {
                 // llama.cpp-oyfl: see the sibling throw above -- same guard,
                 // same size-attribution reasoning, oneMath/non-contiguous path.
@@ -52194,7 +54328,7 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
                 (const void **) (ptrs_src.get() + 1 * ne23), dpct::library_data_t::real_half, s11, beta,
                 (void **) (ptrs_dst.get() + 0 * ne23), mkl_data_type, ne0, ne23, mkl_compute_type, matrix_info.get())));
         }
-        return;
+        return true;
 #    else
         throw std::runtime_error("oneMKL unavailable for cache_k batched F16 attention route");
 #    endif
@@ -52207,16 +54341,29 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
         int64_t str_b0                  = nb10 / type_size_src1;
         int64_t str_b1                  = nb11 / type_size_src1;
         int64_t str_b2                  = nb12 / type_size_src1;
+        // Returns false when the scratchpad was declined before this launch wrote anything. A decline after a write is
+        // not a next path, so it throws by name (dnnl_decline_after_write).
         auto    launch_gemm_for_batches = [&ctx, queue](const sycl::half * src0, const sycl::half * src1, float * dst,
                                                      int64_t a0, int64_t a1, int64_t batcha, int64_t /*b0*/, int64_t b1,
                                                      int64_t batchb, int64_t sa0, int64_t sa1, int64_t sa2, int64_t sb0,
-                                                     int64_t sb1, int64_t sb2, int64_t sd2) {
+                                                     int64_t sb1, int64_t sb2, int64_t sd2) -> bool {
             bool supported_broadcast = batchb == batcha ? true : batchb == 1 || batcha == 1 ? true : false;
             if (supported_broadcast) {
-                DnnlGemmWrapper::gemm(ctx, a1, b1, a0, src0, DnnlGemmWrapper::to_dt<sycl::half>(), sa0, sa1, sa2, src1,
-                                         DnnlGemmWrapper::to_dt<sycl::half>(), sb0, sb1, sb2, dst,
-                                         DnnlGemmWrapper::to_dt<float>(), queue, batcha, batchb);
+                return DnnlGemmWrapper::gemm(ctx, a1, b1, a0, src0, DnnlGemmWrapper::to_dt<sycl::half>(), sa0, sa1, sa2,
+                                                src1, DnnlGemmWrapper::to_dt<sycl::half>(), sb0, sb1, sb2, dst,
+                                                DnnlGemmWrapper::to_dt<float>(), queue, batcha, batchb)
+                    .has_value();
             } else {
+                // One descriptor serves every batch of the loops below, so the scratchpad is asked for once, before
+                // the first write: a decline here returns false with dst untouched. (Call 1 of this launch at the
+                // dnnl_gemm site, the counters being cumulative across launches; batch b's own query inside gemm is
+                // call b + 2 of the launch.)
+                if (!DnnlGemmWrapper::gemm(ctx, a1, b1, a0, src0, DnnlGemmWrapper::to_dt<sycl::half>(), sa0, sa1, sa2,
+                                              src1, DnnlGemmWrapper::to_dt<sycl::half>(), sb0, sb1, sb2, dst,
+                                              DnnlGemmWrapper::to_dt<float>(), queue, 1, 1, /* ldc = */ -1,
+                                              /* deps = */ {}, /* op_context = */ nullptr, /* query_only = */ true)) {
+                    return false;
+                }
                 // iterate over batches from smaller set of matrices (matrix 0)
                 int64_t batches0 = batcha;
                 int64_t batches1 = batchb;
@@ -52233,10 +54380,12 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
                             const int64_t      batch_idx    = i0 * sub_batch + j;
                             const sycl::half * src0_shifted = src0 + sa2 * batch_idx;
                             float *            dst_shifted  = dst + sd2 * batch_idx;
-                            DnnlGemmWrapper::gemm(ctx, a1, b1, a0, src0_shifted, DnnlGemmWrapper::to_dt<sycl::half>(),
-                                                     sa0, sa1, sa2, src1_shifted, DnnlGemmWrapper::to_dt<sycl::half>(),
-                                                     sb0, sb1, sb2, dst_shifted, DnnlGemmWrapper::to_dt<float>(), queue, 1,
-                                                     1);
+                            if (!DnnlGemmWrapper::gemm(
+                                    ctx, a1, b1, a0, src0_shifted, DnnlGemmWrapper::to_dt<sycl::half>(), sa0, sa1, sa2,
+                                    src1_shifted, DnnlGemmWrapper::to_dt<sycl::half>(), sb0, sb1, sb2, dst_shifted,
+                                    DnnlGemmWrapper::to_dt<float>(), queue, 1, 1)) {
+                                throw ggml_sycl_fallback_error("dnnl_decline_after_write:dnnl_gemm");
+                            }
                         }
                     }
                 } else {
@@ -52252,14 +54401,17 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
                             const int64_t      batch_idx    = i1 * sub_batch + j;
                             const sycl::half * src1_shifted = src1 + sb2 * batch_idx;
                             float *            dst_shifted  = dst + sd2 * batch_idx;
-                            DnnlGemmWrapper::gemm(ctx, a1, b1, a0, src0_shifted, DnnlGemmWrapper::to_dt<sycl::half>(),
-                                                     sa0, sa1, sa2, src1_shifted, DnnlGemmWrapper::to_dt<sycl::half>(),
-                                                     sb0, sb1, sb2, dst_shifted, DnnlGemmWrapper::to_dt<float>(), queue, 1,
-                                                     1);
+                            if (!DnnlGemmWrapper::gemm(
+                                    ctx, a1, b1, a0, src0_shifted, DnnlGemmWrapper::to_dt<sycl::half>(), sa0, sa1, sa2,
+                                    src1_shifted, DnnlGemmWrapper::to_dt<sycl::half>(), sb0, sb1, sb2, dst_shifted,
+                                    DnnlGemmWrapper::to_dt<float>(), queue, 1, 1)) {
+                                throw ggml_sycl_fallback_error("dnnl_decline_after_write:dnnl_gemm");
+                            }
                         }
                     }
                 }
             }
+            return true;
         };
         const bool cont_batches_dim2_a = nb02 * ne02 == nb03;
         const bool cont_batches_dim2_b = nb12 * ne12 == nb13;
@@ -52269,9 +54421,10 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
             // A batch is considered contiguous if the dimension 2 is not strided
             int64_t batches0 = ne02 * ne03;
             int64_t batches1 = ne12 * ne13;
-            launch_gemm_for_batches(src0_f16, src1_f16, dst_ddf, ne00, ne01, batches0, ne10, ne11, batches1, str_a0,
-                                    str_a1, str_a2, str_b0, str_b1, str_b2, nb2 / sizeof(float));
-
+            if (!launch_gemm_for_batches(src0_f16, src1_f16, dst_ddf, ne00, ne01, batches0, ne10, ne11, batches1,
+                                         str_a0, str_a1, str_a2, str_b0, str_b1, str_b2, nb2 / sizeof(float))) {
+                return false;
+            }
         } else if (cont_batches_dim3_a && cont_batches_dim3_b) {
             // This case is similar to the one above with the difference that only the batch in dimension 3 is used and the dimension 2 is of size 1.
             int64_t batches0 = ne02 * ne03;
@@ -52279,8 +54432,10 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
             int64_t str_a3   = nb03 / type_size_src0;
             int64_t str_b3   = nb13 / type_size_src1;
 
-            launch_gemm_for_batches(src0_f16, src1_f16, dst_ddf, ne00, ne01, batches0, ne10, ne11, batches1, str_a0,
-                                    str_a1, str_a3, str_b0, str_b1, str_b3, nb2 / sizeof(float));
+            if (!launch_gemm_for_batches(src0_f16, src1_f16, dst_ddf, ne00, ne01, batches0, ne10, ne11, batches1,
+                                         str_a0, str_a1, str_a3, str_b0, str_b1, str_b3, nb2 / sizeof(float))) {
+                return false;
+            }
         } else {
             for (int64_t b_a = 0; b_a < ne03; b_a++) {
                 const sycl::half * src0_f16_shifted = src0_f16 + (nb03 * b_a / type_size_src0);
@@ -52288,9 +54443,16 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
                 float *            dst_shifted      = dst_ddf + (nb3 * b_a / sizeof(float));
                 int64_t            batches0         = ne02;
                 int64_t            batches1         = ne12;
-                launch_gemm_for_batches(src0_f16_shifted, src1_f16_shifted, dst_shifted, ne00, ne01, batches0, ne10,
-                                        ne11, batches1, str_a0, str_a1, str_a2, str_b0, str_b1, str_b2,
-                                        nb2 / sizeof(float));
+                if (!launch_gemm_for_batches(src0_f16_shifted, src1_f16_shifted, dst_shifted, ne00, ne01, batches0,
+                                             ne10, ne11, batches1, str_a0, str_a1, str_a2, str_b0, str_b1, str_b2,
+                                             nb2 / sizeof(float))) {
+                    // A decline for the first slice wrote nothing; one for a later slice comes after the earlier
+                    // slices wrote dst, which is not a next path.
+                    if (b_a == 0) {
+                        return false;
+                    }
+                    throw ggml_sycl_fallback_error("dnnl_decline_after_write:dnnl_gemm");
+                }
             }
         }
     }
@@ -52339,6 +54501,7 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
     static_assert(false,
                   "Either GGML_SYCL_DNNL or GGML_SYCL_HAS_ONEAPI_MATH must be defined for batch GEMM operations");
 #endif
+    return true;
 } catch (const dnnl::error & e) {
     if (g_ggml_sycl_graph_recording) {
         throw;
@@ -53136,6 +55299,10 @@ static bool ggml_sycl_publish_f16_attention_dst_handle(ggml_tensor *           d
                                                                  /*on_device=*/true);
     }
 
+    if (!ggml_sycl_persistent_publish_allowed(extra, published_handle, "publish_f16_attention_dst_handle")) {
+        return false;
+    }
+
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
         if (d == target_device) {
             continue;
@@ -53208,33 +55375,6 @@ static bool ggml_sycl_publish_f16_attention_dst_handle(ggml_tensor *            
     }
     return ggml_sycl_publish_f16_attention_dst_handle(dst, target_device, produced_base, bytes,
                                                       owned_handle.valid() ? &owned_handle : nullptr);
-}
-
-static bool ggml_sycl_publish_moe_artifact_handle(ggml_tensor *                          dst,
-                                                  int                                    target_device,
-                                                  const moe_layer_decode_artifact_plan & artifact,
-                                                  const char *                           role) {
-    if (!dst || target_device < 0 || target_device >= GGML_SYCL_MAX_DEVICES || !artifact.handle.valid() ||
-        !artifact.resolved.ptr) {
-        return false;
-    }
-    if (dst->view_src != nullptr) {
-        GGML_LOG_WARN("[SYCL] refusing to publish MoE artifact view tensor=%s role=%s target=%d\n",
-                      dst->name ? dst->name : "?", role ? role : "?", target_device);
-        return false;
-    }
-
-    ggml_sycl::mem_handle handle_copy = artifact.handle;
-    auto                  resolved    = handle_copy.resolve(target_device);
-    if (!resolved || resolved.ptr != artifact.resolved.ptr) {
-        GGML_LOG_WARN("[SYCL] MoE artifact handle mismatch tensor=%s role=%s target=%d artifact=%p handle=%p\n",
-                      dst->name ? dst->name : "?", role ? role : "?", target_device, artifact.resolved.ptr,
-                      resolved.ptr);
-        return false;
-    }
-
-    return ggml_sycl_publish_f16_attention_dst_handle(dst, target_device, artifact.resolved.ptr,
-                                                      ggml_sycl_tensor_span_bytes(dst), &handle_copy);
 }
 
 static bool ggml_sycl_simple_consumer_op(enum ggml_op op) {
@@ -53507,6 +55647,111 @@ static bool ggml_sycl_find_tensor_storage_handle(const ggml_tensor *            
         return true;
     }
     if (root != tensor && scan_buffer_allocation(root)) {
+        return true;
+    }
+    return false;
+}
+
+// The device address a tensor currently resolves to: its extra's per-device
+// pointer, else tensor->data.
+static const char * ggml_sycl_tensor_device_address(const ggml_tensor * tensor, int device) {
+    if (tensor && tensor->extra && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
+        if (extra->data_device[device] != nullptr) {
+            return static_cast<const char *>(extra->data_device[device]);
+        }
+    }
+    return tensor ? static_cast<const char *>(tensor->data) : nullptr;
+}
+
+// Narrow a storage handle's identity to a tensor's own range, `off` bytes into
+// the handle and `span` bytes long.  An `off` outside [0, handle size - span]
+// means no identity.
+static bool ggml_sycl_narrow_storage_identity(const ggml_sycl::mem_handle_identity & base,
+                                              size_t                                 handle_size,
+                                              size_t                                 off,
+                                              size_t                                 span,
+                                              ggml_sycl::mem_handle_identity *       out) {
+    if (!base.valid() || span == 0 || handle_size == 0 || off > handle_size || span > handle_size - off ||
+        off > SIZE_MAX - base.slice_offset) {
+        return false;
+    }
+    *out              = base;
+    out->slice_offset = base.slice_offset + off;
+    out->size         = span;
+    return true;
+}
+
+// The data-pointer cache's one identity function: the non-owning
+// identity of the slice of storage a tensor occupies, used at fill and at lookup
+// of g_data_ptr_cache so the two sides can never compare a whole allocation
+// against a slice.
+//
+//  * A tensor with SYCL storage: the root's storage handle narrowed to the
+//    tensor's own range.  The offset is the tensor's RESOLVED byte offset from
+//    the handle's base (its device address minus the handle's resolved base),
+//    never the scan's view_offset: a view whose own extra carries the ROOT's
+//    handle has data_device = root + view offset and is found with view_offset
+//    0, so a scan-offset identity would give it the root's head.
+//  * A SYCL_Host tensor: find_tensor_storage_handle() fails for that buffer (it
+//    has no SYCL buffer context), so the same sliced form is built from the
+//    host buffer's own handle, with offset tensor->data - ctx->ptr.
+//  * Anything else (a weight or chunk-lease root with no allocator id, an mmap'd
+//    or CPU buffer, a view whose root the scan cannot resolve) has no identity.
+static bool ggml_sycl_tensor_slice_identity(const ggml_tensor *              tensor,
+                                            int                              device,
+                                            ggml_sycl::mem_handle_identity * out) {
+    if (!tensor || !out) {
+        return false;
+    }
+    *out              = {};
+    const size_t span = ggml_sycl_tensor_span_bytes(tensor);
+    if (span == 0) {
+        return false;
+    }
+
+    ggml_sycl_tensor_storage_handle storage{};
+    if (ggml_sycl_find_tensor_storage_handle(tensor, device, &storage) && storage.handle.valid()) {
+        const ggml_sycl::resolved_ptr base_resolved = storage.handle.resolve();
+        const char *                  addr          = ggml_sycl_tensor_device_address(tensor, device);
+        if (!base_resolved.ptr || !addr || addr < static_cast<const char *>(base_resolved.ptr)) {
+            return false;
+        }
+        const size_t off = static_cast<size_t>(addr - static_cast<const char *>(base_resolved.ptr));
+        if (!ggml_sycl_narrow_storage_identity(storage.handle.identity(), storage.handle.size(), off, span, out)) {
+            *out = {};
+            return false;
+        }
+        if (ggml_sycl::g_sycl_witness_enabled) {
+            // Whenever the handle is the root's, the resolved offset is the view
+            // chain's own offset.  A mismatch means the identity names a different
+            // slice than the view addresses.
+            size_t              view_offs = 0;
+            const ggml_tensor * root      = ggml_sycl_view_root_and_offset(tensor, view_offs);
+            if (root != tensor &&
+                ggml_sycl_tensor_device_address(root, device) == static_cast<const char *>(base_resolved.ptr)) {
+                GGML_SYCL_WITNESS(off == view_offs,
+                                  "[CONTEXT-PLAN-BUG] slice identity offset disagrees with the view root's offset");
+            }
+        }
+        return true;
+    }
+
+    // SYCL_Host tensor.
+    const ggml_tensor * owner_buffer_tensor = tensor->buffer ? tensor : tensor->view_src;
+    if (owner_buffer_tensor && owner_buffer_tensor->buffer && owner_buffer_tensor->buffer->context &&
+        owner_buffer_tensor->buffer->iface.free_buffer == ggml_backend_sycl_host_buffer_free_buffer && tensor->data) {
+        const auto * ctx  = static_cast<const sycl_host_buf_ctx *>(owner_buffer_tensor->buffer->context);
+        const char * data = static_cast<const char *>(tensor->data);
+        const char * base = static_cast<const char *>(ctx->ptr);
+        if (!ctx->buffer_handle.valid() || !base || data < base) {
+            return false;
+        }
+        const size_t off = static_cast<size_t>(data - base);
+        if (!ggml_sycl_narrow_storage_identity(ctx->buffer_handle.identity(), ctx->size, off, span, out)) {
+            *out = {};
+            return false;
+        }
         return true;
     }
     return false;
@@ -54035,6 +56280,7 @@ static bool ggml_sycl_try_route_simple_consumer(ggml_backend_sycl_context & ctx,
         }
         if (root->extra == nullptr) {
             auto * extra = new ggml_tensor_extra_gpu{};
+            extra->runtime_minted = true;
             ggml_sycl_register_optimize_feature(&extra->optimized_feature);
             root->extra = extra;
             ctx.runtime_tensor_extras.push_back({ root, extra });
@@ -54291,6 +56537,7 @@ static bool ggml_sycl_try_cross_device_f16_attention(ggml_backend_sycl_context &
         }
         if (root->extra == nullptr) {
             auto * extra = new ggml_tensor_extra_gpu{};
+            extra->runtime_minted = true;
             ggml_sycl_register_optimize_feature(&extra->optimized_feature);
             root->extra = extra;
             ctx.runtime_tensor_extras.push_back({ root, extra });
@@ -54605,6 +56852,7 @@ static bool ggml_sycl_try_route_flash_attn_ext(ggml_backend_sycl_context & ctx, 
         }
         if (root->extra == nullptr) {
             auto * extra = new ggml_tensor_extra_gpu{};
+            extra->runtime_minted = true;
             ggml_sycl_register_optimize_feature(&extra->optimized_feature);
             root->extra = extra;
             ctx.runtime_tensor_extras.push_back({ root, extra });
@@ -57304,6 +59552,7 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
         extra->weight().moe_device_table_valid[device] && extra->moe_ptrs_ptr_raw(device) != nullptr &&
         extra->weight().moe_expert_ptrs_size[device] == static_cast<size_t>(n_experts) * sizeof(void *);
 
+    ggml_sycl_note_moe_table_reach("ensure:ggml_sycl_upload_moe_transient_ptr_table", src0, device);
     if (!ggml_sycl_ensure_moe_ptr_table(extra, device, n_experts, q, table_index) ||
         extra->weight().moe_expert_ptrs_size[device] < static_cast<size_t>(n_experts) * sizeof(void *)) {
         return nullptr;
@@ -57460,6 +59709,7 @@ static ggml_sycl::moe_retained_pointer_table ggml_sycl_upload_moe_retained_ptr_t
     layout_mode                           layout) {
     ggml_sycl::moe_retained_pointer_table result;
     bool                                  event_set = false;
+    ggml_sycl_note_moe_table_reach("upload:ggml_sycl_upload_moe_retained_ptr_table_from_batch", src0, ctx.device);
     const void * const * transient = ggml_sycl_upload_moe_ptr_table_from_batch(ctx, src0, batch, layer_hash, layout,
                                                                                &result.ready_event, &event_set);
     if (!transient) {
@@ -57989,6 +60239,18 @@ static bool ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
     }
 
     // Fallback: runtime allocation via unified_alloc.
+    if (ggml_sycl_dump_report_armed()) {
+        // Row 73's own-allocation fallback, as master takes it: the bytes it asks for and the
+        // table_index that sent it here (-1, or out of the preallocated range), beside the
+        // preallocated block's own table size and count. A baseline for a path the conversion deletes.
+        const auto * report_bufs = ggml_sycl::moe_get_inference_buffers(device);
+        char         line[192];
+        std::snprintf(line, sizeof(line),
+                      "row73_own_alloc dev=%d bytes=%zu table_index=%d prealloc_table_bytes=%zu prealloc_n_tables=%d",
+                      device, bytes, table_index, report_bufs ? report_bufs->table_bytes : (size_t) 0,
+                      report_bufs ? report_bufs->n_tables : -1);
+        ggml_sycl::unified_cache_dump_report(line);
+    }
     ggml_sycl::alloc_request req{};
     req.queue                          = &queue;
     req.device                         = device;
@@ -58818,14 +61080,16 @@ static bool ggml_sycl_make_context_moe_ids_staging_cache_key(const ggml_tensor *
     }
 
     ggml_sycl_tensor_storage_handle storage{};
-    if (ggml_sycl_find_tensor_storage_handle(ids, device, &storage) && storage.handle.valid()) {
+    // A source with no allocator identity is not keyed by handle: it falls through
+    // to the cache-id / tensor key below (a miss for the handle form).
+    if (ggml_sycl_find_tensor_storage_handle(ids, device, &storage) && storage.handle.valid() &&
+        storage.handle.identity().valid()) {
         ggml_backend_sycl_context::moe_ids_cache_key key{};
-        key.handle          = storage.handle;
-        key.handle_identity = key.handle.stable_identity_hash();
-        key.device          = device;
-        key.view_offs       = storage.view_offset;
-        key.use_handle      = true;
-        *out_key            = std::move(key);
+        key.handle     = storage.handle.identity();
+        key.device     = device;
+        key.view_offs  = storage.view_offset;
+        key.use_handle = true;
+        *out_key       = std::move(key);
         return true;
     }
 
@@ -59393,6 +61657,7 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         }
     }
     if (!skip_device_copy) {
+        ggml_sycl_note_moe_table_reach("ensure:ggml_sycl_update_moe_ptr_table", src0, device);
         const bool table_ready = ggml_sycl_ensure_moe_ptr_table(extra, device, n_experts, *stream, tbl_idx);
         GGML_SYCL_DEBUG("[MOE-PTR] ensure_moe_ptr_table done\n");
         if (!table_ready || !extra->moe_ptrs_ptr(device) ||
@@ -61465,144 +63730,6 @@ static bool ggml_sycl_materialize_moe_tensor_phase_layout(const ggml_tensor * sr
     return complete;
 }
 
-static bool ggml_sycl_materialize_moe_tensor_planned_layout(const ggml_tensor * src0,
-                                                            int                 current_device,
-                                                            layout_mode         target_layout) {
-    if (!src0 || target_layout == GGML_LAYOUT_AOS || current_device < 0 ||
-        current_device >= ggml_sycl_info().device_count) {
-        return false;
-    }
-
-    ggml_sycl::unified_cache * plan_cache = ggml_sycl::get_unified_cache_for_device(current_device);
-    if (!plan_cache || ggml_sycl_cache_plan_owner(plan_cache)->entries.empty()) {
-        return false;
-    }
-    auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-    if (!extra) {
-        return false;
-    }
-
-    const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
-    if (n_experts <= 0) {
-        return false;
-    }
-
-    std::vector<int> grouped_experts[GGML_SYCL_MAX_DEVICES];
-    size_t           planned_count  = 0;
-    bool             all_on_current = true;
-    const auto       plan_owner     = ggml_sycl_cache_plan_owner(plan_cache);
-    const auto &     plan           = *plan_owner;
-    for (int64_t e = 0; e < n_experts; ++e) {
-        const auto placement =
-            plan.lookup_expert_placement(std::string(src0->name ? src0->name : ""), static_cast<int>(e));
-        if (!placement.found() || !placement.on_device || placement.target_device < 0 ||
-            placement.target_device >= GGML_SYCL_MAX_DEVICES) {
-            return false;
-        }
-        grouped_experts[placement.target_device].push_back(static_cast<int>(e));
-        planned_count++;
-        all_on_current = all_on_current && placement.target_device == current_device;
-    }
-    if (planned_count != static_cast<size_t>(n_experts)) {
-        return false;
-    }
-
-    if (all_on_current) {
-        return ggml_sycl_materialize_moe_tensor_phase_layout(src0, current_device, target_layout);
-    }
-
-    size_t total_materialized = 0;
-    size_t failed_devices     = 0;
-    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
-        const std::vector<int> & experts = grouped_experts[d];
-        if (experts.empty()) {
-            continue;
-        }
-        if (d != current_device && !ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(d)) {
-            failed_devices++;
-            continue;
-        }
-        ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(d);
-        if (!cache) {
-            failed_devices++;
-            continue;
-        }
-        if (ggml_sycl_cache_plan_owner(cache)->entries.empty() && ggml_sycl_has_global_plan()) {
-            ggml_sycl_republish_current_plan();
-        }
-        if (ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
-            failed_devices++;
-            continue;
-        }
-
-        std::vector<sycl::event> ready_events;
-        ready_events.reserve(experts.size());
-        size_t materialized_on_device = 0;
-        for (int expert_id : experts) {
-            const ggml_sycl_cache_id base_key = ggml_sycl_get_moe_expert_cache_key(src0, extra, expert_id);
-            if (!base_key.valid) {
-                failed_devices++;
-                break;
-            }
-            const ggml_sycl_cache_id layout_key =
-                ggml_sycl_layout_specific_moe_expert_cache_key(base_key, target_layout);
-            sycl::event event;
-            if (!ggml_sycl::ggml_sycl_materialize_planned_expert_layout(
-                    src0, layout_key, expert_id, d, target_layout, &event,
-                    /*remember_storage_handle=*/true,
-                    /*release_conflicting_layouts_ok=*/
-                    target_layout == GGML_LAYOUT_XMX_TILED || target_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4)) {
-                failed_devices++;
-                break;
-            }
-            ready_events.push_back(event);
-            materialized_on_device++;
-            if (ready_events.size() >= 8) {
-                try {
-                    for (sycl::event & ready_event : ready_events) {
-                        ready_event.wait_and_throw();
-                    }
-                    ready_events.clear();
-                } catch (const sycl::exception & e) {
-                    GGML_LOG_WARN(
-                        "[MOE-PHASE-LAYOUT] planned-layout backpressure wait failed for %s device=%d layout=%s: %s\n",
-                        src0->name ? src0->name : "?", d, ggml_sycl_layout_mode_name(target_layout), e.what());
-                    ready_events.clear();
-                    failed_devices++;
-                    break;
-                }
-            }
-        }
-        for (sycl::event & event : ready_events) {
-            try {
-                event.wait_and_throw();
-            } catch (const sycl::exception & e) {
-                GGML_LOG_WARN("[MOE-PHASE-LAYOUT] planned-layout wait failed for %s device=%d layout=%s: %s\n",
-                              src0->name ? src0->name : "?", d, ggml_sycl_layout_mode_name(target_layout), e.what());
-                failed_devices++;
-                break;
-            }
-        }
-        total_materialized += materialized_on_device;
-    }
-
-    const moe_planned_layout_probe probe    = ggml_sycl_probe_moe_planned_layout(src0, current_device, target_layout);
-    const bool                     complete = failed_devices == 0 && probe.ok;
-    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
-        static std::atomic<int> planned_layout_log{ 0 };
-        const int               n = planned_layout_log.fetch_add(1, std::memory_order_relaxed);
-        if (n < 96) {
-            fprintf(stderr,
-                    "[MOE-PHASE-LAYOUT] tensor=%s current=%d target=%s planned_materialized=%zu/%lld "
-                    "local=%zu secondary=%zu host=%zu missing=%zu failed_devices=%zu complete=%d\n",
-                    src0->name ? src0->name : "?", current_device, ggml_sycl_layout_mode_name(target_layout),
-                    total_materialized, (long long) n_experts, probe.local, probe.secondary, probe.host, probe.missing,
-                    failed_devices, complete ? 1 : 0);
-        }
-    }
-    return complete;
-}
-
 static bool ggml_sycl_moe_phase_release_source_after_xmx_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_PHASE_RELEASE_SOURCE");
@@ -62166,6 +64293,7 @@ static bool graph_preload_moe_experts_impl(ggml_backend_sycl_context &          
                     preload_tbl_idx = it->second;
                 }
             }
+            ggml_sycl_note_moe_table_reach("ensure:graph_preload_moe_experts", src0, ctx.device);
             ggml_sycl_ensure_moe_ptr_table(extra, ctx.device, src0->ne[2] > 0 ? src0->ne[2] : 1, *ctx.stream(),
                                            preload_tbl_idx);
         }
@@ -62297,6 +64425,7 @@ static bool graph_preload_moe_experts_impl(ggml_backend_sycl_context &          
         const bool  expect_table_event =
             extra && ctx.device >= 0 && ctx.device < GGML_SYCL_MAX_DEVICES && extra->moe_ptrs_ptr(ctx.device);
 
+        ggml_sycl_note_moe_table_reach("update:graph_preload_moe_experts", src0, ctx.device);
         if (!ggml_sycl_update_moe_ptr_table(ctx, src0, ids, layout, &table_event, coverage, ids_override,
                                             /*skip_device_copy=*/false,
                                             /*force_cache_aos=*/host_weights,
@@ -63508,6 +65637,13 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_select_preferred_kernel(
     return std::nullopt;
 }
 
+// The LM head: `output.weight`, not an `attn_output` weight whose name contains it. The one predicate the
+// dispatch debug line and the arm-A report share.
+static bool ggml_sycl_is_lm_head_weight(const ggml_tensor * src0) {
+    return src0 && src0->name && std::strstr(src0->name, "output.weight") != nullptr &&
+           std::strstr(src0->name, "attn_output") == nullptr;
+}
+
 // Dispatch helper - calls the appropriate kernel without re-checking eligibility
 // Assumes kernel has already been validated by ggml_sycl_select_preferred_kernel()
 static bool ggml_sycl_dispatch_mul_mat_kernel(ggml_backend_sycl_context & ctx,
@@ -63516,10 +65652,33 @@ static bool ggml_sycl_dispatch_mul_mat_kernel(ggml_backend_sycl_context & ctx,
                                               ggml_tensor *               dst,
                                               ggml_sycl_mul_mat_kernel    kernel) {
     const layout_mode layout = ggml_sycl_mul_mat_kernel_layout(kernel);
-    if (g_ggml_sycl_debug && src0 && src0->name && std::strstr(src0->name, "output.weight") != nullptr &&
-        std::strstr(src0->name, "attn_output") == nullptr) {
+    // The LM head test runs only on a debug or armed run: the other runs pay one flag test (a static read),
+    // not the name scan, so an unarmed dispatch has no per-op string work here.
+    const bool is_lm_head = (g_ggml_sycl_debug || ggml_sycl_dump_report_armed()) && ggml_sycl_is_lm_head_weight(src0);
+    if (g_ggml_sycl_debug && is_lm_head) {
         GGML_SYCL_DEBUG("[SYCL] output.weight dispatch kernel=%s layout=%d batch=%lld\n",
                         ggml_sycl_mul_mat_kernel_name(kernel), (int) layout, (long long) src1->ne[1]);
+    }
+    if (is_lm_head && ggml_sycl_dump_report_armed()) {
+        // The LM head's (type, layout, kernel) pairing, once per distinct reading: arm A's kernel at the
+        // batch G1h and rivk read (ne11 = 512 and 16), and the layout-pairing check's input. src0_layout is
+        // the layout the operand was MATERIALIZED in (its handle's), kernel_layout the one the selected
+        // kernel consumes; the two are separate sources, so a disagreement (llama.cpp-l9i1: route
+        // soa, operand aos) shows as layout_mismatch=1. An operand that does not resolve prints
+        // src0_layout=-1 and layout_mismatch=-1, never a guess.
+        const auto resolved    = ggml_sycl_resolve(src0, ctx.device);
+        const int  src0_layout = resolved ? (int) resolved.layout : -1;
+        const int  mismatch    = resolved ? (resolved.layout != layout ? 1 : 0) : -1;
+        char       key[160];
+        char       line[320];
+        std::snprintf(key, sizeof(key), "arm_a_kernel:%d:%s:%d:%d:%d:%lld", ctx.device, ggml_type_name(src0->type),
+                      src0_layout, (int) layout, (int) kernel, (long long) src1->ne[1]);
+        std::snprintf(line, sizeof(line),
+                      "arm_a_kernel dev=%d weight=%s type=%s kernel=%s src0_layout=%d kernel_layout=%d "
+                      "layout_mismatch=%d ne11=%lld",
+                      ctx.device, src0->name, ggml_type_name(src0->type), ggml_sycl_mul_mat_kernel_name(kernel),
+                      src0_layout, (int) layout, mismatch, (long long) src1->ne[1]);
+        (void) ggml_sycl::unified_cache_dump_report_once(key, line);
     }
 
     switch (kernel) {
@@ -65885,11 +68044,15 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                         ctx.stream()->wait();
                                         t_gemm0 = std::chrono::high_resolution_clock::now();
                                     }
-                                    DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(N), static_cast<int>(M),
-                                                              static_cast<int>(K), src0_f16_ptr,
-                                                              DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
-                                                              DnnlGemmWrapper::to_dt<sycl::half>(), dst_batch_ptr,
-                                                              DnnlGemmWrapper::to_dt<float>(), ctx.stream());
+                                    if (!DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(N), static_cast<int>(M),
+                                                                   static_cast<int>(K), src0_f16_ptr,
+                                                                   DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
+                                                                   DnnlGemmWrapper::to_dt<sycl::half>(), dst_batch_ptr,
+                                                                   DnnlGemmWrapper::to_dt<float>(), ctx.stream())) {
+                                        // Declined scratchpad: the SOA q8_1 loop below, as the catch does.
+                                        used_onednn = false;
+                                        break;
+                                    }
                                     ctx.stream()->wait_and_throw();
                                     if (split_timing) {
                                         const auto t_gemm1 = std::chrono::high_resolution_clock::now();
@@ -66020,11 +68183,15 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                     f32_to_fp16(src1_batch_ptr, src1_f16_ptr, src1_elems, ctx.stream());
 
                                     try {
-                                        DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(N), static_cast<int>(M),
-                                                                  static_cast<int>(K), src0_f16_ptr,
-                                                                  DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
-                                                                  DnnlGemmWrapper::to_dt<sycl::half>(), dst_batch_ptr,
-                                                                  DnnlGemmWrapper::to_dt<float>(), ctx.stream());
+                                        if (!DnnlGemmWrapper::row_gemm(
+                                                ctx, static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
+                                                src0_f16_ptr, DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
+                                                DnnlGemmWrapper::to_dt<sycl::half>(), dst_batch_ptr,
+                                                DnnlGemmWrapper::to_dt<float>(), ctx.stream())) {
+                                            // Declined scratchpad: the unified kernel below, as the catch does.
+                                            used_onednn = false;
+                                            break;
+                                        }
                                         ctx.stream()->wait_and_throw();
                                         used_onednn = true;
                                     } catch (const std::exception & e) {
@@ -66376,7 +68543,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     // Set GGML_SYCL_TG_FAST=0 to disable and fall through to unified kernel.
     // =====================================================================
     {
-        const bool        fast_split       = ggml_backend_buffer_is_sycl_split(src0->buffer);
+        const bool        fast_split       = ggml_sycl_mul_mat_src0_is_split(src0, ggml_backend_buffer_is_sycl_split);
         static const bool tg_fast_disabled = []() {
             const char * env = std::getenv("GGML_SYCL_TG_FAST");
             return env && std::atoi(env) == 0;
@@ -66466,20 +68633,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     // Unified kernel / full dispatch path: drain any pending merge
     split_merge_drain();
 
-    auto is_kqv_matmul = [](const ggml_tensor * a, const ggml_tensor * b, const ggml_tensor * c) -> bool {
-        if (c && c->name && std::strstr(c->name, "kqv") != nullptr) {
-            return true;
-        }
-        if (a && a->name && std::strstr(a->name, "cache_v") != nullptr) {
-            return true;
-        }
-        if (b && b->name && std::strstr(b->name, "kq_soft_max") != nullptr) {
-            return true;
-        }
-        return false;
-    };
-    const bool kqv_matmul       = is_kqv_matmul(src0, src1, dst);
-    const bool force_simple_kqv = (g_ggml_sycl_kqv_force_simple || g_ggml_sycl_kqv_disable_fp16) && kqv_matmul;
+    // The facts the f16 attention chain below routes on. The measure pass's non-FA staging visitor asks the
+    // same function (ggml_sycl_mul_mat_route_env_of), so the slot it sizes and the staging this chain does
+    // cannot be counted from two derivations.
+    const ggml_sycl_mul_mat_route_env route_env = ggml_sycl_mul_mat_route_env_of(src0, src1);
+    const bool force_simple_kqv = route_env.kqv_force_simple && ggml_sycl_mul_mat_is_kqv(src0, src1, dst);
 
     // Inter-layer weight prefetch for TG (batch=1) workloads
     // When we detect a layer transition, async prefetch next layer's first weight.
@@ -66630,7 +68788,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     // Check for TP-sharded weight tensor and log the operation
     ggml_sycl_mul_mat_tp_pre(src0);
 
-    const bool split                  = ggml_backend_buffer_is_sycl_split(src0->buffer);
+    const bool split                  = route_env.split;
     int64_t    min_compute_capability = INT_MAX;
     if (split) {
         ggml_backend_sycl_split_buffer_type_context * buft_ctx =
@@ -66784,7 +68942,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             }
         }
     }
-    const bool batched_has_weight = ggml_sycl_tensor_is_weight(src0) || ggml_sycl_tensor_is_weight(src1);
+    const bool batched_has_weight = route_env.has_weight;
     if (force_simple_kqv) {
         GGML_LOG_WARN("[SYCL] KQV debug override: skipping batched path (force_simple=%d disable_fp16=%d)\n",
                       g_ggml_sycl_kqv_force_simple, g_ggml_sycl_kqv_disable_fp16);
@@ -66836,10 +68994,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         }
         GGML_ABORT("[SYCL] Non-weight F16 matmul requires device-resident tensors or GPU cross-device recovery.");
     }
-    if (!split && !batched_has_weight && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) &&
-        ggml_is_permuted(src1) && src1->ne[1] == 1) {
+    const ggml_sycl_mul_mat_f16_route f16_route = ggml_sycl_mul_mat_f16_route_of(src0, src1, dst, route_env);
+    if (f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_P021 || f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_BATCHED) {
         // TODO: Refactor and cleanup of mul mat dispatching.
-        if (src0->ne[3] == 1 && src1->ne[3] == 1) {
+        if (f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQ_P021) {
             // KQ single-batch
             // mmv p021 was specific for these dimensions
             GGML_SYCL_KTRACE("mul_mat_f16_kq_single", " ne3=%lld", (long long) src0->ne[3]);
@@ -66847,8 +69005,13 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         } else {
             // The kernel from the if path is faster for that specific case, but does not support all mul mats.
             GGML_SYCL_KTRACE("mul_mat_f16_batched", " ne3=%lld", (long long) src0->ne[3]);
+            bool batched_declined = false;
             try {
-                ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
+                batched_declined = !ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
+            } catch (const ggml_sycl_fallback_error &) {
+                // A named failure (a decline after a write) is not resource exhaustion: it must reach the caller's
+                // handler by name, not become the ladder's "likely VRAM exhaustion" abort.
+                throw;
             } catch (const std::exception & e) {
                 // ggml_sycl_mul_mat_batched_sycl deliberately re-throws
                 // sycl::exception "for callers that have eviction-retry
@@ -66863,19 +69026,25 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                     "[SYCL] batched F16 mul_mat failed — likely VRAM exhaustion. "
                     "The per-layer KV allocator should leave headroom for compute scratch.");
             }
+            // A declined oneDNN scratchpad wrote nothing to dst: the native GPU fallback runs. A decline is not
+            // resource exhaustion, so it never enters the ladder above, and if the fallback fails too the op fails by
+            // name (llama.cpp-23mk S3-4).
+            if (batched_declined && !ggml_sycl_mul_mat_batched_f16_fallback(ctx, src0, src1, dst)) {
+                throw ggml_sycl_fallback_error("dnnl_gemm declined and batched_f16_fallback failed");
+            }
         }
-    } else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) &&
-               src1->ne[1] == 1 && src1->ne[3] == 1) {
+    } else if (f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_VEC_NC) {
         // KQV single-batch
         GGML_SYCL_KTRACE("mul_mat_f16_kqv_single", " ne1=%lld", (long long) src1->ne[1]);
         ggml_sycl_mul_mat_vec_nc(ctx, src0, src1, dst);
-    } else if (!split && !batched_has_weight && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) &&
-               !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1) {
+    } else if (f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED ||
+               f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_SCALAR) {
         // KQ + KQV multi-batch
         GGML_SYCL_KTRACE("mul_mat_f16_kqkv_multi", " batches=%lld", (long long) (src1->ne[2] * src1->ne[3]));
-        if (!force_simple_kqv) {
+        if (f16_route == GGML_SYCL_MUL_MAT_F16_ROUTE_KQKV_BATCHED) {
+            bool batched_declined = false;
             try {
-                ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
+                batched_declined = !ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
             } catch (const std::exception & e) {
                 // Batched path failed. Do not unpin or evict weights from here:
                 // scratch headroom is a planning invariant, and forced eviction
@@ -66923,6 +69092,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                             "scratch guard (llama.cpp-oyfl) if flash attention was off for this context.");
                     }
                 }
+            }
+            // A declined oneDNN scratchpad wrote nothing to dst: the same native GPU fallback the catch above runs.
+            // The decline never enters the resource-exhaustion ladder; if the fallback fails too the op fails by name.
+            if (batched_declined && !ggml_sycl_mul_mat_batched_f16_fallback(ctx, src0, src1, dst)) {
+                throw ggml_sycl_fallback_error("dnnl_gemm declined and batched_f16_fallback failed");
             }
         } else {
             GGML_SYCL_DEBUG("[SYCL] KQV debug override: routing through non-batched mul_mat path\n");
@@ -67312,17 +69486,21 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                                                 t_gemm0 = std::chrono::high_resolution_clock::now();
                                             }
                                             try {
-                                                DnnlGemmWrapper::row_gemm(
-                                                    ctx,
-                                                    static_cast<int>(N),  // row_diff = N (output cols)
-                                                    static_cast<int>(M),  // src1_ncols = M (batch)
-                                                    static_cast<int>(K),  // ne10 = K (reduction)
-                                                    fp16_weights_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
-                                                    activations_scratch, DnnlGemmWrapper::to_dt<sycl::half>(), dst_data,
-                                                    DnnlGemmWrapper::to_dt<float>(), ctx.stream());
-
-                                                used_onednn_fp16   = true;
-                                                unified_dispatched = true;
+                                                // A declined scratchpad submitted nothing: the unified kernel below, as
+                                                // the catch does.
+                                                used_onednn_fp16 =
+                                                    DnnlGemmWrapper::row_gemm(
+                                                        ctx,
+                                                        static_cast<int>(N),  // row_diff = N (output cols)
+                                                        static_cast<int>(M),  // src1_ncols = M (batch)
+                                                        static_cast<int>(K),  // ne10 = K (reduction)
+                                                        fp16_weights_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
+                                                        activations_scratch, DnnlGemmWrapper::to_dt<sycl::half>(),
+                                                        dst_data, DnnlGemmWrapper::to_dt<float>(), ctx.stream())
+                                                        .has_value();
+                                                if (used_onednn_fp16) {
+                                                    unified_dispatched = true;
+                                                }
                                             } catch (const std::exception & e) {
                                                 GGML_LOG_WARN(
                                                     "[SYCL] oneDNN PP failed, falling back to unified kernel: %s\n",
@@ -68653,6 +70831,7 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context &           ctx,
             // This is critical for mmap'd weights which cannot be accessed directly by GPU kernels.
             // XMX kernels cannot consume host-routed experts, so selected experts must be staged instead of skipped.
             bool table_event_set = false;
+            ggml_sycl_note_moe_table_reach("upload:try_xmx_sorted_moe", src0, ctx.device);
             if (!ggml_sycl_upload_moe_ptr_table_from_batch(ctx, src0, batch, moe_cache_layer_id(src0->name), layout,
                                                            &table_event, &table_event_set)) {
                 GGML_SYCL_DEBUG("[XMX MoE] Failed to upload retained expert pointer table for %s\n", src0->name);
@@ -73448,6 +75627,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         b3_segment_timing_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
     init_moe_debug();
+    // The model this context executes, read once from the context's execution
+    // binding. The secondary-queue ensures below pass it explicitly (null means
+    // unbound: nothing is installed); no thread-local is read here.
+    ggml_sycl::lifecycle::ModelToken mmid_owner{};
+    const bool                       mmid_owner_bound             = ggml_sycl_execution_current_owner(&ctx, mmid_owner);
+    const ggml_sycl::lifecycle::ModelToken * const mmid_owner_ptr = mmid_owner_bound ? &mmid_owner : nullptr;
     // llama.cpp-fwhv (B1): TEMPORARY host-time probe over this function --
     // total CPU-side dispatch cost per MUL_MAT_ID call, all exits included via
     // the destructor. Enabled by GGML_SYCL_MOE_PROLOGUE_TIMING=1; removed by
@@ -75098,6 +77283,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
         sycl::event          table_event;
         bool                 table_event_set = false;
+        ggml_sycl_note_moe_table_reach("upload:ggml_sycl_mul_mat_id/prompt", src0, ctx.device);
         const void * const * expert_ptrs_dev = ggml_sycl_upload_moe_ptr_table_from_batch(
             ctx, src0, prompt_batch, layer_hash, route_layout, &table_event, &table_event_set);
         if (!expert_ptrs_dev) {
@@ -75435,6 +77621,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             sycl::event          retained_table_event;
             bool                 retained_table_event_set = false;
+            ggml_sycl_note_moe_table_reach("upload:ggml_sycl_mul_mat_id/retained", src0, ctx.device);
             const void * const * retained_ptrs            = ggml_sycl_upload_moe_ptr_table_from_batch(
                 ctx, src0, retained_prompt_batch_result.batch, moe_cache_layer_id(src0->name), layout,
                 &retained_table_event, &retained_table_event_set);
@@ -75904,6 +78091,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             // llama.cpp-1tjn (B3 rework census v2, temporary).
                             g_moe_decode_route_census.pair_glu_ptr_table_rebuild_attempts.fetch_add(
                                 1, std::memory_order_relaxed);
+                            ggml_sycl_note_moe_table_reach("update:ggml_sycl_mul_mat_id/pair_gate", pair.gate_weight,
+                                                           ctx.device);
                             if (ggml_sycl_update_moe_ptr_table(ctx, pair.gate_weight, ids, pair_layout,
                                                                &gate_table_event, moe_ptr_table_coverage::FULL_TABLE,
                                                                /*ids_host_override=*/nullptr,
@@ -75936,6 +78125,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             // llama.cpp-1tjn (B3 rework census v2, temporary).
                             g_moe_decode_route_census.pair_glu_ptr_table_rebuild_attempts.fetch_add(
                                 1, std::memory_order_relaxed);
+                            ggml_sycl_note_moe_table_reach("update:ggml_sycl_mul_mat_id/pair_up", pair.up_weight,
+                                                           ctx.device);
                             if (ggml_sycl_update_moe_ptr_table(ctx, pair.up_weight, ids, pair_layout, &up_table_event,
                                                                moe_ptr_table_coverage::FULL_TABLE,
                                                                /*ids_host_override=*/nullptr,
@@ -76378,6 +78569,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 // llama.cpp-1tjn (B3 rework census v2, temporary).
                                 g_moe_decode_route_census.pair_glu_ptr_table_rebuild_attempts.fetch_add(
                                     1, std::memory_order_relaxed);
+                                ggml_sycl_note_moe_table_reach("update:ggml_sycl_mul_mat_id/pair_down",
+                                                               pair.down_weight, ctx.device);
                                 if (ggml_sycl_update_moe_ptr_table(ctx, pair.down_weight, ids, down_layout,
                                                                    &down_table_event,
                                                                    moe_ptr_table_coverage::FULL_TABLE,
@@ -76528,8 +78721,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // Detect host-resident weights including SYCL HOST_PINNED buffers
     bool   host_weights  = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
     auto * route_cache   = ggml_sycl::get_unified_cache(*stream);
-    if (route_cache && ggml_sycl_cache_plan_owner(route_cache)->entries.empty() && ggml_sycl_has_global_plan()) {
-        ggml_sycl_republish_current_plan();
+    if (route_cache && mmid_owner_ptr && ggml_sycl_cache_snapshot_empty(route_cache) &&
+        ggml_sycl_republish_current_plan_into_empty(route_cache, *mmid_owner_ptr) ==
+            ggml_sycl_into_empty_result::REFUSED) {
+        ggml_sycl::ggml_sycl_secondary_queue_refused_fail();
     }
     const bool has_placement_plan         = route_cache && !ggml_sycl_cache_plan_owner(route_cache)->entries.empty();
     bool       plan_has_cpu_experts       = false;
@@ -78033,10 +80228,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             auto append_retained_operand = [&](const ggml_sycl::moe_resolved_operand & operand, int64_t iid1,
                                                int64_t id, moe_route_phase phase, size_t rows,
                                                retained_decode_partition_stats & stats) {
-                const bool queue_available =
-                    operand.residency() != ggml_sycl::moe_batch_residency::SECONDARY_DEVICE ||
-                    (operand.owning_device() >= 0 && operand.owning_device() < n_gpu_devs &&
-                     ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(operand.owning_device()));
+                bool queue_available = operand.residency() != ggml_sycl::moe_batch_residency::SECONDARY_DEVICE;
+                if (!queue_available && operand.owning_device() >= 0 && operand.owning_device() < n_gpu_devs) {
+                    const auto queue_status = ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(
+                        operand.owning_device(), mmid_owner_ptr);
+                    if (queue_status == GGML_SYCL_SECONDARY_QUEUE_REFUSED) {
+                        // A refused plan owner is a rejected choice made BEFORE the
+                        // chooser: it must never become queue_available=false, from
+                        // which the chooser could pick HOST_CPU for this operand.
+                        ggml_sycl::moe_batch_executor_choice refused;
+                        refused.reject = ggml_sycl::moe_batch_reject_reason::PLAN_OWNER_REFUSED;
+                        GGML_LOG_ERROR("[CONTEXT-PLAN-BUG] secondary queue refused: plan owner\n");
+                        return refused;
+                    }
+                    queue_available = queue_status == GGML_SYCL_SECONDARY_QUEUE_READY;
+                }
                 // Admission already retained the exact capability-derived recipe
                 // and bound its signature to this lease. Never fabricate a second
                 // argument-less capability query at fallback/partition time.
@@ -78415,9 +80621,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         return;
                     }
 
-                    const bool queue_ready =
-                        route.owning_device >= 0 && route.owning_device < n_gpu_devs &&
-                        ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(route.owning_device);
+                    const bool queue_ready = route.owning_device >= 0 && route.owning_device < n_gpu_devs &&
+                                             ggml_sycl::ggml_sycl_secondary_queue_ready_or_throw(
+                                                 ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(
+                                                     route.owning_device, mmid_owner_ptr));
                     const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
                         src0->type, route.actual_layout, phase, src0->ne[0], src0->ne[1], rows, route.owning_device,
                         moe_layer_route_residency::DEVICE, ctx.device);
@@ -79384,6 +81591,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
 
                     if (all_local_device && !gpu_expert_ids.empty()) {
+                        ggml_sycl_note_moe_table_reach("upload:ggml_sycl_mul_mat_id/retained_local", src0, ctx.device);
                         expert_ptrs_dev = ggml_sycl_upload_moe_ptr_table_from_batch(
                             ctx, src0, retained_prompt_batch_result.batch, layer_id, route_layout, &expert_ptrs_event,
                             &expert_ptrs_event_set);
@@ -79859,6 +82067,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
             sycl::event          expert_ptrs_event;
             bool                 expert_ptrs_event_set = false;
+            ggml_sycl_note_moe_table_reach("upload:ggml_sycl_mul_mat_id/retained_tail", src0, ctx.device);
             const void * const * expert_ptrs_dev =
                 ggml_sycl_upload_moe_ptr_table_from_batch(ctx, src0, retained_prompt_batch_result.batch, layer_id,
                                                           route_layout, &expert_ptrs_event, &expert_ptrs_event_set);
@@ -80944,51 +83153,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // reached at all).
             std::optional<sycl::event> gemm_profile_begin;
             std::optional<sycl::event> gemm_profile_end;
-            // host-stall attribution cycle, phase 5/6: repack/activation-
-            // stage kernel dispatch (components 1/2/4's own device-event
-            // markers cover their DEVICE time; this is that dispatch's HOST
-            // submission cost, not previously measured) plus any other prep
-            // between grouping and here.
-            host_phase_mark(&mxfp4_pp_batched_profile_accum::host_repackstage_us,
-                            &mxfp4_pp_batched_profile_accum::host_repackstage_calls);
-            try {
-                const sycl::event deps_in = stream->ext_oneapi_submit_barrier();
-                if (pp_profile) {
-                    gemm_profile_begin = ggml_sycl_submit_marker<class mxfp4_pp_profile_gemm_begin_marker>(*stream);
-                }
-                for (const pp_gemm_group & group : gemm_groups) {
-                    if (pp_woq_enabled) {
-                        gemm_events.push_back(DnnlGemmWrapper::woq_gemm_batch_mxfp4(
-                            ctx, /* m = */ static_cast<int>(group.n_rows), /* n = */ static_cast<int>(ne01),
-                            /* k = */ static_cast<int>(ne00), batched_acts + group.begin * act_slot_elems,
-                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int64_t>(act_slot_elems),
-                            batched_weight_bytes + group.begin * weight_slot_bytes,
-                            static_cast<int64_t>(weight_slot_bytes) * 2, /* group_size = */ QK_MXFP4,
-                            batched_weight_bytes + group.begin * weight_slot_bytes + woq_nibble_slot_bytes,
-                            static_cast<int64_t>(weight_slot_bytes), batched_out + group.begin * out_slot_elems,
-                            DnnlGemmWrapper::to_dt<float>(), static_cast<int64_t>(out_slot_elems),
-                            static_cast<int>(group.end - group.begin), ctx.stream(), { deps_in }));
-                    } else {
-                        gemm_events.push_back(DnnlGemmWrapper::gemm_batch_strided(
-                            ctx,
-                            /* trans_a = */ true,
-                            /* trans_b = */ false, static_cast<int>(ne01), static_cast<int>(group.n_rows),
-                            static_cast<int>(ne00), 1.0f, batched_weights + group.begin * weight_elems,
-                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne00),
-                            static_cast<int64_t>(weight_elems), batched_acts + group.begin * act_slot_elems,
-                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne10),
-                            static_cast<int64_t>(act_slot_elems), 0.0f, batched_out + group.begin * out_slot_elems,
-                            DnnlGemmWrapper::to_dt<float>(), static_cast<int>(ne0),
-                            static_cast<int64_t>(out_slot_elems), static_cast<int>(group.end - group.begin),
-                            ctx.stream(), { deps_in }));
-                    }
-                }
-            } catch (const std::exception & e) {
+            // Both ways this stage can fail (a thrown error, or a declined scratchpad) take the same path, so the tail
+            // is shared: the non-batched MoE path, or the named error for an XMX_TILED-claimed op. Returns false.
+            auto                       gemm_stage_failed = [&](const char * what) -> bool {
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     static std::atomic<int> gemm_fail_log{ 0 };
                     if (gemm_fail_log.fetch_add(1, std::memory_order_relaxed) < 8) {
                         GGML_LOG_WARN("[MOE-PP-ONEDNN-F16-BATCHED] oneDNN dispatch failed tensor=%s: %s\n",
-                                      src0 && src0->name ? src0->name : "?", e.what());
+                                      src0 && src0->name ? src0->name : "?", what);
                     }
                 }
                 batched_scratch_claim.finish_or_release();
@@ -81003,11 +83175,64 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // not copy the string it is given.
                     static thread_local std::string tiled_claim_gemm_msg;
                     tiled_claim_gemm_msg = std::string("[MOE-PP-ONEDNN-BATCHED] XMX_TILED-claimed op '") +
-                                           (src0 && src0->name ? src0->name : "?") +
-                                           "' GEMM dispatch failed: " + e.what();
+                                           (src0 && src0->name ? src0->name : "?") + "' GEMM dispatch failed: " + what;
                     throw ggml_sycl_fallback_error(tiled_claim_gemm_msg.c_str());
                 }
                 return false;
+            };
+            bool gemm_declined = false;
+            // host-stall attribution cycle, phase 5/6: repack/activation-
+            // stage kernel dispatch (components 1/2/4's own device-event
+            // markers cover their DEVICE time; this is that dispatch's HOST
+            // submission cost, not previously measured) plus any other prep
+            // between grouping and here.
+            host_phase_mark(&mxfp4_pp_batched_profile_accum::host_repackstage_us,
+                            &mxfp4_pp_batched_profile_accum::host_repackstage_calls);
+            try {
+                const sycl::event deps_in = stream->ext_oneapi_submit_barrier();
+                if (pp_profile) {
+                    gemm_profile_begin = ggml_sycl_submit_marker<class mxfp4_pp_profile_gemm_begin_marker>(*stream);
+                }
+                for (const pp_gemm_group & group : gemm_groups) {
+                    // A declined scratchpad submitted nothing for this group; the groups before it wrote only the
+                    // batched scratch buffers, never dst, so the whole stage takes the failure path below.
+                    std::optional<sycl::event> group_event;
+                    if (pp_woq_enabled) {
+                        group_event = DnnlGemmWrapper::woq_gemm_batch_mxfp4(
+                            ctx, /* m = */ static_cast<int>(group.n_rows), /* n = */ static_cast<int>(ne01),
+                            /* k = */ static_cast<int>(ne00), batched_acts + group.begin * act_slot_elems,
+                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int64_t>(act_slot_elems),
+                            batched_weight_bytes + group.begin * weight_slot_bytes,
+                            static_cast<int64_t>(weight_slot_bytes) * 2, /* group_size = */ QK_MXFP4,
+                            batched_weight_bytes + group.begin * weight_slot_bytes + woq_nibble_slot_bytes,
+                            static_cast<int64_t>(weight_slot_bytes), batched_out + group.begin * out_slot_elems,
+                            DnnlGemmWrapper::to_dt<float>(), static_cast<int64_t>(out_slot_elems),
+                            static_cast<int>(group.end - group.begin), ctx.stream(), { deps_in });
+                    } else {
+                        group_event = DnnlGemmWrapper::gemm_batch_strided(
+                            ctx,
+                            /* trans_a = */ true,
+                            /* trans_b = */ false, static_cast<int>(ne01), static_cast<int>(group.n_rows),
+                            static_cast<int>(ne00), 1.0f, batched_weights + group.begin * weight_elems,
+                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne00),
+                            static_cast<int64_t>(weight_elems), batched_acts + group.begin * act_slot_elems,
+                            DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne10),
+                            static_cast<int64_t>(act_slot_elems), 0.0f, batched_out + group.begin * out_slot_elems,
+                            DnnlGemmWrapper::to_dt<float>(), static_cast<int>(ne0),
+                            static_cast<int64_t>(out_slot_elems), static_cast<int>(group.end - group.begin),
+                            ctx.stream(), { deps_in });
+                    }
+                    if (!group_event) {
+                        gemm_declined = true;
+                        break;
+                    }
+                    gemm_events.push_back(*group_event);
+                }
+            } catch (const std::exception & e) {
+                return gemm_stage_failed(e.what());
+            }
+            if (gemm_declined) {
+                return gemm_stage_failed("oneDNN scratchpad declined");
             }
             stream->ext_oneapi_submit_barrier(gemm_events);
             if (pp_profile) {
@@ -81694,10 +83919,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 dequantize_row_mxfp4_soa_to_fp16_rowmajor(static_cast<const char *>(expert_ptr), pp_mxfp4_src0_f16_ptr,
                                                           blocks_per_row, static_cast<int>(ne01), ctx.stream());
                 const auto dequant_done = moe_profile_state::hrc::now();
-                DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(ne01), static_cast<int>(batch), static_cast<int>(ne00),
-                                          pp_mxfp4_src0_f16_ptr, DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
-                                          DnnlGemmWrapper::to_dt<sycl::half>(), dst_f32_ptr,
-                                          DnnlGemmWrapper::to_dt<float>(), ctx.stream());
+                if (!DnnlGemmWrapper::row_gemm(ctx, static_cast<int>(ne01), static_cast<int>(batch),
+                                               static_cast<int>(ne00), pp_mxfp4_src0_f16_ptr,
+                                               DnnlGemmWrapper::to_dt<sycl::half>(), src1_f16_ptr,
+                                               DnnlGemmWrapper::to_dt<sycl::half>(), dst_f32_ptr,
+                                               DnnlGemmWrapper::to_dt<float>(), ctx.stream())) {
+                    return false;  // a declined scratchpad: the caller's next path, as the catches below
+                }
                 const auto gemm_submit_done = moe_profile_state::hrc::now();
                 if (local_trace) {
                     local_trace->dequant_submit_us += moe_profile_state::us(dequant_start, dequant_done);
@@ -81761,9 +83989,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         moe_profile_state::us(route_resolve_start, moe_profile_state::hrc::now());
                 }
                 if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE && route.ptr) {
-                    const bool queue_ready =
-                        route.owning_device >= 0 && route.owning_device < pp_n_gpus &&
-                        ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(route.owning_device);
+                    const bool queue_ready = route.owning_device >= 0 && route.owning_device < pp_n_gpus &&
+                                             ggml_sycl::ggml_sycl_secondary_queue_ready_or_throw(
+                                                 ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(
+                                                     route.owning_device, mmid_owner_ptr));
                     const moe_route_capability cap = ggml_sycl_moe_query_route_capability(
                         src0->type, route.actual_layout, moe_route_phase::PROMPT, src0->ne[0], src0->ne[1],
                         static_cast<size_t>(num_src1_rows), route.owning_device, moe_layer_route_residency::DEVICE,
@@ -81800,7 +84029,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                 } else if (route.kind == moe_expert_route_kind::SECONDARY_DEVICE && route.ptr &&
                            route.owning_device >= 0 && route.owning_device < pp_n_gpus &&
-                           ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(route.owning_device)) {
+                           ggml_sycl::ggml_sycl_secondary_queue_ready_or_throw(
+                               ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(route.owning_device,
+                                                                                         mmid_owner_ptr))) {
                     if (use_expert_cache && has_placement_plan && !route.lease.valid()) {
                         GGML_ABORT(
                             "[MOE-ROUTE] planned secondary PP expert resolved without smart mem_handle tensor=%s "
@@ -83117,18 +85348,6 @@ static const char * ggml_sycl_planned_weight_residency_name(ggml_sycl_planned_we
     return "invalid";
 }
 
-static const char * ggml_sycl_alloc_tier_name(ggml_sycl::alloc_tier tier) {
-    switch (tier) {
-        case ggml_sycl::alloc_tier::DEVICE_VRAM:
-            return "device-vram";
-        case ggml_sycl::alloc_tier::HOST_PINNED:
-            return "host-pinned";
-        case ggml_sycl::alloc_tier::MMAP_TRACKED:
-            return "mmap-tracked";
-    }
-    return "invalid";
-}
-
 static uint64_t ggml_sycl_diag_fnv1a64(const uint8_t * data, size_t size) {
     uint64_t h = 1469598103934665603ULL;
     for (size_t i = 0; i < size; ++i) {
@@ -83847,7 +86066,7 @@ static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_st
             const size_t                 rounded = (bytes + 64 + (1u << 20) - 1) & ~((size_t) (1u << 20) - 1);
             ggml_sycl::alloc_constraints c;
             c.must_host_pinned = true;
-            ggml_sycl::alloc_request req;
+            ggml_sycl::alloc_request req{};
             req.queue  = &q_dev;
             req.device = -1;
             req.size   = rounded;
@@ -83867,7 +86086,7 @@ static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_st
         // slot held but NEVER handed out; the caller gets a per-call buffer
         ggml_sycl::alloc_constraints c;
         c.must_host_pinned = true;
-        ggml_sycl::alloc_request req;
+        ggml_sycl::alloc_request req{};
         req.queue       = &q_dev;
         req.device      = -1;
         req.size        = bytes;
@@ -83878,7 +86097,7 @@ static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_st
     if (!ggml_sycl_attn_host_staging_enabled(kind)) {
         ggml_sycl::alloc_constraints c;
         c.must_host_pinned = true;
-        ggml_sycl::alloc_request req;
+        ggml_sycl::alloc_request req{};
         req.queue       = &q_dev;
         req.device      = -1;
         req.size        = bytes;
@@ -83896,7 +86115,7 @@ static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_st
         const size_t                 rounded = (bytes + 64 + (1u << 20) - 1) & ~((size_t) (1u << 20) - 1);
         ggml_sycl::alloc_constraints c;
         c.must_host_pinned = true;
-        ggml_sycl::alloc_request req;
+        ggml_sycl::alloc_request req{};
         req.queue  = &q_dev;
         req.device = -1;
         req.size   = rounded;
@@ -84529,7 +86748,7 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
     if (attn_profile) {
         ggml_sycl::alloc_constraints vc;
         vc.must_host_pinned = true;
-        ggml_sycl::alloc_request vreq;
+        ggml_sycl::alloc_request vreq{};
         vreq.queue  = &q_dev;
         vreq.device = -1;
         vreq.size   = q_bytes;
@@ -84837,6 +87056,24 @@ static bool ggml_sycl_dispatch_host_flash_attn(ggml_backend_sycl_context & ctx, 
     return ggml_sycl_dispatch_host_flash_attn_sync(ctx, dst);
 }
 
+// True exactly for the nodes the funnel intercepts and runs on the host: a
+// FLASH_ATTN_EXT whose K or V lives in the KV-host buft, and a SET_ROWS into a
+// KV-host dst, with GGML_SYCL_ATTN_HOST_DISPATCH on.  The funnel and supports_op call
+// it and neither re-derives it; a host-dispatched node's sources are read on the host,
+// so they are not staged for a device.
+static bool ggml_sycl_node_is_host_dispatched(const ggml_tensor * node) {
+    if (!node || !ggml_sycl_attn_host_dispatch_enabled()) {
+        return false;
+    }
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        return ggml_sycl_tensor_is_in_kv_host_buft(node->src[1]) || ggml_sycl_tensor_is_in_kv_host_buft(node->src[2]);
+    }
+    if (node->op == GGML_OP_SET_ROWS) {
+        return ggml_sycl_tensor_is_in_kv_host_buft(node);
+    }
+    return false;
+}
+
 // True while the dense layer-block executor runs a node range on that range's
 // own device (llama.cpp-tf8m). Every operand of such a range was placed on, or
 // copied to, that device before the range started, so the per-op routes in
@@ -84864,16 +87101,14 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
     // persistent-TG, MoE-precomputed) calls ggml_sycl_compute_forward, so
     // intercepting here — rather than at each of its ~7 call sites — covers
     // all of them uniformly.
-    if (dst && dst->op == GGML_OP_FLASH_ATTN_EXT && ggml_sycl_attn_host_dispatch_enabled() &&
-        (ggml_sycl_tensor_is_in_kv_host_buft(dst->src[1]) || ggml_sycl_tensor_is_in_kv_host_buft(dst->src[2]))) {
+    if (dst && dst->op == GGML_OP_FLASH_ATTN_EXT && ggml_sycl_node_is_host_dispatched(dst)) {
         return ggml_sycl_dispatch_host_flash_attn(ctx, dst);
     }
 
     // TKV-13 step 5: the KV append for a demoted layer, kept inside the
     // SYCL graph by the matching supports_op acceptance and executed
     // host-side (see ggml_sycl_dispatch_host_set_rows_sync).
-    if (dst && dst->op == GGML_OP_SET_ROWS && ggml_sycl_attn_host_dispatch_enabled() &&
-        ggml_sycl_tensor_is_in_kv_host_buft(dst)) {
+    if (dst && dst->op == GGML_OP_SET_ROWS && ggml_sycl_node_is_host_dispatched(dst)) {
         return ggml_sycl_dispatch_host_set_rows_sync(ctx, dst);
     }
 
@@ -85917,6 +88152,14 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     ggml_sycl_q1_nvfp4_test_revoke_backend(backend);
 #endif
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
+#ifdef GGML_SYCL_GRAPH
+    // The whole GRAPH_DIAG summary, once, before any teardown. A persistent
+    // decode frame returns before the per-frame summary, so only this line
+    // carries the decode counts. It is the scored line (scripts/sycl-graph-diag-score.sh).
+    // The report also reaches the sequence-graphlet summary, so a
+    // `[SYCL-MOE-SEQUENCE-GRAPHLET] summary phase=final` line may print here too.
+    ggml_sycl_graph_diag_report("final", sycl_ctx && sycl_ctx->exec_graph, sycl_ctx);
+#endif
     // Stop adaptive prestage background thread before tearing down SYCL resources.
     g_adaptive_prestage.stop();
     // Flush any deferred CPU scatter before tearing down SYCL resources.
@@ -86280,7 +88523,9 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
             (void) ggml_sycl::unified_alloc_validate_registry(sycl_ctx->device, "pre_synchronize");
         }
         const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-        ggml_sycl_cpu_tg_flush_pending();
+        if (!ggml_sycl_cpu_tg_synchronize_flush_skipped_for_test()) {
+            ggml_sycl_cpu_tg_flush_pending();
+        }
         const bool use_deferred_decode_event =
             sycl_ctx->last_graph_event.has_value() && sycl_ctx->last_graph_event_deferred_decode;
         auto err = use_deferred_decode_event ? CHECK_TRY_ERROR(sycl_ctx->last_graph_event->wait_and_throw()) :
@@ -89376,16 +91621,20 @@ static sycl::queue * ggml_sycl_block_exec_queue_for_device(ggml_backend_sycl_con
     return nullptr;
 }
 
+// The dense block executor's per-device copy queues.  File scope so the re-plan wait
+// can reach them (ggml_backend_sycl_synchronize_for_replan).
+static std::mutex                                                      g_block_exec_copy_queue_mutex;
+static std::array<std::unique_ptr<sycl::queue>, GGML_SYCL_MAX_DEVICES> g_block_exec_copy_queues;
+
 static sycl::queue * ggml_sycl_block_exec_copy_queue_for_device(int device) {
     sycl::queue * base = ggml_sycl_block_exec_queue_for_device(device);
     if (!base || !ggml_sycl_block_exec_queue_matches_device(*base, device, true)) {
         return base;
     }
 
-    static std::mutex                                                      copy_queue_mutex;
-    static std::array<std::unique_ptr<sycl::queue>, GGML_SYCL_MAX_DEVICES> copy_queues;
+    auto & copy_queues = g_block_exec_copy_queues;
 
-    std::lock_guard<std::mutex> lock(copy_queue_mutex);
+    std::lock_guard<std::mutex> lock(g_block_exec_copy_queue_mutex);
     if (copy_queues[device] && ggml_sycl_block_exec_queue_matches_device(*copy_queues[device], device, true)) {
         return copy_queues[device].get();
     }
@@ -91885,6 +94134,13 @@ static ggml_sycl_block_exec_dense_state & ggml_sycl_block_exec_dense_state_for(c
     return *state;
 }
 
+// The context's dense state if it has one; never creates it.
+static ggml_sycl_block_exec_dense_state * ggml_sycl_block_exec_dense_state_find(const ggml_backend_sycl_context * ctx) {
+    std::lock_guard<std::mutex> lock(g_ggml_sycl_block_exec_dense_states_mutex);
+    auto                        it = g_ggml_sycl_block_exec_dense_states.find(ctx);
+    return it == g_ggml_sycl_block_exec_dense_states.end() ? nullptr : it->second.get();
+}
+
 static void ggml_sycl_block_exec_dense_release(ggml_backend_sycl_context * ctx) {
     std::unique_ptr<ggml_sycl_block_exec_dense_state> state;
     {
@@ -92661,7 +94917,7 @@ class ggml_sycl_block_exec_dense_run {
                             sycl::queue &                                              q,
                             const char *                                               what) {
         try {
-            q.ext_oneapi_graph(exec);
+            ggml_sycl::graph_exec_submit(q, exec);
         } catch (const std::exception & e) {
             disable_range_graphs(idx, what, e.what());
             throw;
@@ -96327,7 +98583,7 @@ gpu_dispatch:
                                 throw std::runtime_error("MMID direct graphlet publication is not invokable");
                             }
                             try {
-                                sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);
+                                ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *exec_graph);
                                 if (!moe_graph_retention_finish_replay(sycl_ctx, retained_invocation)) {
                                     throw std::runtime_error("MMID direct graphlet terminal publication failed");
                                 }
@@ -98454,6 +100710,7 @@ static std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>>
         recording_depth_incremented = true;
         ggml_sycl::set_graph_retained_handle_sink(retained_handle_sink);
         g_ggml_sycl_graph_recording = true;
+        ggml_sycl::graph_record_begin_note();
         g_recording_graph_ptr       = &moe_graph;
         g_recording_queue_ptr       = stream;
         recording_stage             = "begin-recording";
@@ -99123,9 +101380,9 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
         try {
             if (timeline_graphlet_spans) {
                 GGML_SYCL_TIMELINE_SCOPE("sycl.graph", "moe_sequence_graphlet_replay", graphlet_timeline_metadata.c_str());
-                sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);
+                ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *exec_graph);
             } else {
-                sycl_ctx->stream()->ext_oneapi_graph(*exec_graph);
+                ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *exec_graph);
             }
             if (!moe_graph_retention_finish_replay(sycl_ctx, retained_invocation)) {
                 throw std::runtime_error("MMID graph retention terminal publication failed");
@@ -99767,7 +102024,7 @@ static void moe_graph_record_segment_slot(ggml_backend_sycl_context *           
         slot.graphed_segments++;
         graph_nodes += item.end - item.start;
         // The recording only described the run: submitting it is what executes it.
-        stream->ext_oneapi_graph(*slot.segments.back().exec_graph);
+        ggml_sycl::graph_exec_submit(*stream, *slot.segments.back().exec_graph);
         sycl_ctx->mmvq_q8_activation_cache.invalidate();
     }
     const ggml_sycl::mem_handle q8 = sycl_ctx->mmvq_q8_activation_cache.handle(device);
@@ -99806,7 +102063,7 @@ static void moe_graph_replay_segment_slot(ggml_backend_sycl_context *           
             if (seg.exec_graph) {
                 // The recorded segment runs no per-node flush: publish what it reads first.
                 moe_graph_segment_boundary_flush(cgraph, seg.start_node, seg.end_node, sycl_ctx->device);
-                stream->ext_oneapi_graph(*seg.exec_graph);
+                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);
                 // The replay rewrote the Q8 buffer: the cache no longer describes it.
                 sycl_ctx->mmvq_q8_activation_cache.invalidate();
                 continue;
@@ -99997,6 +102254,7 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
             depth_owner.acquire();
             ggml_sycl::set_graph_retained_handle_sink(&sycl_ctx->graph_retained_handles);
             g_ggml_sycl_graph_recording = true;
+            ggml_sycl::graph_record_begin_note();
             g_recording_graph_ptr       = &seg_graph;
             g_recording_queue_ptr       = stream;
             seg_graph.begin_recording(*stream);
@@ -100039,7 +102297,7 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
             // Mark first so exception cleanup retains handles unless completion
             // is successfully drained by a higher-level cleanup path.
             segment_submitted = true;
-            stream->ext_oneapi_graph(*recorded_segments.back().exec_graph);
+            ggml_sycl::graph_exec_submit(*stream, *recorded_segments.back().exec_graph);
             if (seg.moe_after >= 0) {
                 ggml_tensor * moe_node = cgraph->nodes[seg.moe_after];
                 if (moe_node) {
@@ -100272,7 +102530,7 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
             if (seg.exec_graph) {
                 // The recorded segment runs no per-node flush: publish what it reads first.
                 moe_graph_segment_boundary_flush(cgraph, seg.start_node, seg.end_node, sycl_ctx->device);
-                stream->ext_oneapi_graph(*seg.exec_graph);
+                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);
                 GGML_SYCL_DEBUG(
                     "[SYCL-SEG] Replayed segment %zu "
                     "[%d-%d)\n",
@@ -100316,7 +102574,7 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
                         throw std::runtime_error("MMID segmented graph publication is not invokable");
                     }
                     try {
-                        stream->ext_oneapi_graph(*moe_graph);
+                        ggml_sycl::graph_exec_submit(*stream, *moe_graph);
                         if (!moe_graph_retention_finish_replay(sycl_ctx, retained_invocation)) {
                             throw std::runtime_error("MMID segmented graph terminal publication failed");
                         }
@@ -100554,7 +102812,7 @@ static void moe_graph_submit_block_graphlet(sycl::queue &                       
     if (ggml_sycl_graph_diag_enabled()) {
         t_submit_start = std::chrono::high_resolution_clock::now();
     }
-    stream.ext_oneapi_graph(exec_graph);
+    ggml_sycl::graph_exec_submit(stream, exec_graph);
     g_graph_diag_counters.block_graphlet_replay.fetch_add(1, std::memory_order_relaxed);
     if (ggml_sycl_graph_diag_enabled()) {
         const auto t_submit_end = std::chrono::high_resolution_clock::now();
@@ -100791,6 +103049,7 @@ static bool moe_graph_record_block_graphs(ggml_backend_sycl_context * sycl_ctx,
             std::vector<ggml_sycl::mem_handle> retained_handles;
             ggml_sycl::set_graph_retained_handle_sink(&retained_handles);
             g_ggml_sycl_graph_recording = true;
+            ggml_sycl::graph_record_begin_note();
             g_recording_graph_ptr       = &block_graph;
             g_recording_queue_ptr       = stream;
             block_graph.begin_recording(*stream);
@@ -101986,6 +104245,135 @@ static bool graph_tensor_is_input(const ggml_tensor * tensor) {
     return false;
 }
 
+// What a graph prestage does with one source tensor. The first three classes
+// are decided without copying; COPY is the only class whose bytes the
+// predicate reports. INPUT and KV_HOST are not counted but still reach the
+// prestage's copy path: INPUT has its own stable staging, and a KV-host source
+// is staged as before.
+enum class ggml_sycl_prestage_class {
+    CONTROL,
+    WEIGHT,
+    DEVICE,
+    INPUT,
+    KV_HOST,
+    COPY,
+};
+
+// The buffer type `tensor`'s bytes live in. A view lives in its source's buffer.
+static ggml_backend_buffer_type_t ggml_sycl_prestage_source_buft(const ggml_tensor * tensor) {
+    if (!tensor) {
+        return nullptr;
+    }
+    const ggml_backend_buffer_t buf =
+        (tensor->view_src && tensor->view_src->buffer) ? tensor->view_src->buffer : tensor->buffer;
+    return buf ? buf->buft : nullptr;
+}
+
+// Requires tensor->data: a tensor with no storage yet has nothing to classify.
+static ggml_sycl_prestage_class ggml_sycl_prestage_classify(const ggml_tensor *        tensor,
+                                                            ggml_backend_buffer_type_t src_buft) {
+    if (ggml_sycl_tensor_uses_cross_device_control_storage(tensor)) {
+        return ggml_sycl_prestage_class::CONTROL;
+    }
+    if (ggml_sycl_tensor_is_weight(tensor)) {
+        return ggml_sycl_prestage_class::WEIGHT;
+    }
+    if (ggml_sycl_get_alloc_type(tensor->data) == sycl::usm::alloc::device) {
+        return ggml_sycl_prestage_class::DEVICE;
+    }
+    if (graph_tensor_is_input(tensor)) {
+        return ggml_sycl_prestage_class::INPUT;
+    }
+    if (src_buft && src_buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name) {
+        return ggml_sycl_prestage_class::KV_HOST;
+    }
+    return ggml_sycl_prestage_class::COPY;
+}
+
+size_t ggml_sycl_prestage_needs_device_copy(const ggml_tensor *        tensor,
+                                            ggml_backend_buffer_type_t src_buft,
+                                            int                        device) {
+    // `device` is part of the predicate's signature for the measure's callers;
+    // none of today's checks depends on it.
+    GGML_UNUSED(device);
+    if (!tensor || !tensor->data) {
+        return 0;
+    }
+    return ggml_sycl_prestage_classify(tensor, src_buft) == ggml_sycl_prestage_class::COPY ? ggml_nbytes(tensor) : 0;
+}
+
+thread_local int g_ggml_sycl_device_dispatch_depth = 0;
+
+// Resolver host returns of staged sources, by offload phase: PP, TG, and every
+// other phase (UNKNOWN, LOAD, WARMUP). The phase is process-global, so another
+// thread's load can move it during a frame.
+enum {
+    GGML_SYCL_RESOLVER_BUCKET_PP,
+    GGML_SYCL_RESOLVER_BUCKET_TG,
+    GGML_SYCL_RESOLVER_BUCKET_OTHER,
+    GGML_SYCL_RESOLVER_BUCKETS
+};
+
+static std::atomic<uint64_t> g_resolver_host_returns[GGML_SYCL_RESOLVER_BUCKETS];
+
+static int ggml_sycl_resolver_bucket(ggml_sycl::offload_phase phase) {
+    switch (phase) {
+        case ggml_sycl::offload_phase::PP:
+            return GGML_SYCL_RESOLVER_BUCKET_PP;
+        case ggml_sycl::offload_phase::TG:
+            return GGML_SYCL_RESOLVER_BUCKET_TG;
+        default:
+            return GGML_SYCL_RESOLVER_BUCKET_OTHER;
+    }
+}
+
+void ggml_sycl_resolver_count_host_return(const ggml_tensor * tensor, int device) {
+    if (g_ggml_sycl_device_dispatch_depth == 0 || !tensor) {
+        return;
+    }
+    size_t              view_offs = 0;
+    const ggml_tensor * root      = ggml_sycl_view_root_and_offset(tensor, view_offs);
+    const bool          counted =
+        ggml_sycl_prestage_needs_device_copy(tensor, ggml_sycl_prestage_source_buft(tensor), device) != 0 ||
+        (root && root != tensor &&
+         ggml_sycl_prestage_needs_device_copy(root, ggml_sycl_prestage_source_buft(root), device) != 0);
+    if (counted) {
+        g_resolver_host_returns[ggml_sycl_resolver_bucket(ggml_sycl::offload_stats_phase())].fetch_add(
+            1, std::memory_order_relaxed);
+    }
+}
+
+uint64_t ggml_sycl_resolver_host_returns_to_device(ggml_sycl::offload_phase phase) {
+    return g_resolver_host_returns[ggml_sycl_resolver_bucket(phase)].load(std::memory_order_relaxed);
+}
+
+// The sources a prestage of `cgraph` copies to `device`, in the prestage's own
+// walk: leafs, then every node's sources. Sources are deduplicated by tensor
+// object, not by the prestage's (cache id, device, view offset) key, so two
+// tensors that share a key count twice; the value is a diagnostic cohort size.
+static size_t ggml_sycl_graph_stage_source_count(const ggml_cgraph * cgraph, int device) {
+    std::unordered_set<const ggml_tensor *> seen;
+    size_t                                  count = 0;
+    auto                                    visit = [&](const ggml_tensor * tensor) {
+        if (!tensor || !seen.insert(tensor).second) {
+            return;
+        }
+        if (ggml_sycl_prestage_needs_device_copy(tensor, ggml_sycl_prestage_source_buft(tensor), device) != 0) {
+            count++;
+        }
+    };
+    for (int i = 0; i < cgraph->n_leafs; i++) {
+        visit(cgraph->leafs[i]);
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        for (int j = 0; node && j < GGML_MAX_SRC; j++) {
+            visit(node->src[j]);
+        }
+    }
+    return count;
+}
+
 // Pre-stage all non-device tensors in a compute graph before SYCL graph recording.
 // This ensures that all non-device (mmap'd) tensors are uploaded to device memory
 // BEFORE graph recording begins, since we cannot use .wait() during recording.
@@ -102095,6 +104483,8 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
             return;
         }
 
+        // CONTROL is tested before the staged check so a revisited control
+        // tensor is still counted, as the prestage always did.
         if (ggml_sycl_tensor_uses_cross_device_control_storage(tensor)) {
             skipped_control++;
             mark_staged(tensor);
@@ -102108,8 +104498,11 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
             return;
         }
 
+        const ggml_sycl_prestage_class source_class =
+            ggml_sycl_prestage_classify(tensor, ggml_sycl_prestage_source_buft(tensor));
+
         // Handle weight tensors specially in tiered mode
-        if (ggml_sycl_tensor_is_weight(tensor)) {
+        if (source_class == ggml_sycl_prestage_class::WEIGHT) {
             if (cache && ggml_sycl_weight_is_planned_on_host(tensor, device)) {
                 skipped_weight_count++;
                 skipped_host_planned++;
@@ -102146,8 +104539,7 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
         }
 
         // Check if this is already device memory
-        sycl::usm::alloc ptr_type = ggml_sycl_get_alloc_type(tensor->data);
-        if (ptr_type == sycl::usm::alloc::device) {
+        if (source_class == ggml_sycl_prestage_class::DEVICE) {
             already_device_count++;
             mark_staged(tensor);
             return;
@@ -102161,7 +104553,7 @@ static bool graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
         // bakes the pointer at finalize time. The stable staging buffer survives across replays.
         // Pre-existing exception to "an INPUT failure is terminal": an INPUT with an EMPTY name does not take this arm
         // and falls through to the cache paths below, which key on its current data address.
-        if (graph_tensor_is_input(tensor) && tensor->name && tensor->name[0] != '\0') {
+        if (source_class == ggml_sycl_prestage_class::INPUT && tensor->name && tensor->name[0] != '\0') {
             sycl::queue & q       = *ctx->stream();
             // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
             // comment on graph_input_staging in common.hpp.
@@ -102760,12 +105152,15 @@ static void sycl_exec_graph_mark_active(ggml_backend_sycl_context &             
     }
 }
 
-static void sycl_exec_graph_release_pool_retained(ggml_backend_sycl_context * ctx) {
+// The context-scoped half of the retained-handle release: this context's own list and
+// its pools' graph-retained lists.  It does not touch the process-global
+// graph_unwaitable swap, which other contexts' entries can back executable graphs
+// through.
+static void sycl_exec_graph_release_pool_retained_scoped(ggml_backend_sycl_context * ctx) {
     if (!ctx) {
         return;
     }
     ctx->graph_retained_handles.clear();
-    ggml_sycl::release_graph_retained_handles();
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
         if (ctx->pools[d]) {
             ctx->pools[d]->release_graph_retained();
@@ -102786,16 +105181,51 @@ static void sycl_exec_graph_release_pool_retained(ggml_backend_sycl_context * ct
     }
 }
 
-// llama.cpp-dkw0: NOT side-effect-free even when exec_graph is already null --
-// besides tearing down the executable graph, this unconditionally unpins MoE
-// experts/weights, clears the CPU staging cache, and invalidates MoE
-// segment/phase-layout/input-tensor caches. Calling it at a point where
-// nothing was recorded still perturbs that other state; a caller with
-// nothing to release should skip the call rather than rely on this being a
-// no-op (measured regression: calling it unconditionally at a preventive,
-// nothing-recorded-yet trip site altered gemma's decode output relative to
-// GGML_SYCL_DISABLE_GRAPH=1 at identical settings).
-static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const char * reason) {
+static void sycl_exec_graph_release_pool_retained(ggml_backend_sycl_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    sycl_exec_graph_release_pool_retained_scoped(ctx);
+    ggml_sycl::release_graph_retained_handles();
+}
+
+// Every kind of recorded state this context holds.  The
+// one statement of what "has recorded state" means: the re-plan's invalidate proc
+// tests it before any clear, and a context with nothing recorded does nothing.
+static bool sycl_exec_graph_has_recorded_state(ggml_backend_sycl_context * ctx) {
+    if (!ctx) {
+        return false;
+    }
+    if (ctx->exec_graph || ctx->active_exec_graph.valid || !ctx->graph_retained_handles.empty()) {
+        return true;
+    }
+    // A tenant staging entry parked by a recording or replaying call is a holder of the slot, whether or not
+    // the graph that baked it survived (a failed recording leaves the entry and no graph).
+    if (ctx->graph_input_staging_has_tenants()) {
+        return true;
+    }
+    // A keyed decode split's segment slot (llama.cpp-7pm2) owns retained handles and owning input-staging copies, and a
+    // retired slot holds its graphs until the queue drains. The scoped clear retires both via invalidate_moe_segments().
+    if (ctx->moe_segment_slots.size() != 0 || ctx->moe_segment_slots.has_retired()) {
+        return true;
+    }
+    if (ctx->moe_segments_valid || ctx->moe_block_graphs_valid || !ctx->moe_direct_dispatch_graphs.empty() ||
+        !ctx->moe_sequence_graphs.empty()) {
+        return true;
+    }
+#ifdef GGML_SYCL_GRAPH
+    if (const auto * dense = ggml_sycl_block_exec_dense_state_find(ctx); dense && !dense->graphs.empty()) {
+        return true;
+    }
+#endif
+    return ctx->unified_kernel && ctx->unified_kernel->has_cached_plan();
+}
+
+// The context-scoped clear body: what a re-plan must drop for THIS context's own
+// recorded state, and nothing process-global.  It never releases the graph_unwaitable
+// swap, clears the static CPU staging cache or unpins weights: other contexts'
+// entries back their live executable graphs, and the staging cache has no lock.
+static void sycl_exec_graph_clear_scoped(ggml_backend_sycl_context * ctx, const char * reason) {
     if (!ctx) {
         return;
     }
@@ -102824,7 +105254,7 @@ static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const 
         ggml_sycl_trace_queue_wait(ctx->stream(), reason ? reason : "exec-graph-clear", ctx->device, -1, nullptr);
     }
     ctx->exec_graph.reset();
-    sycl_exec_graph_release_pool_retained(ctx);
+    sycl_exec_graph_release_pool_retained_scoped(ctx);
     ctx->active_exec_graph.valid = false;
     ctx->exec_graph_n_nodes      = 0;
     ctx->exec_graph_hash         = 0;
@@ -102840,11 +105270,44 @@ static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const 
     // it alongside the other per-generation input caches above.
     ctx->graph_input_staging_clear(*ctx->stream());
 
+    ctx->invalidate_moe_segments();
+    ctx->invalidate_moe_block_graphs();
+    // A re-plan drops every kind of recording: the graphlets, the
+    // block-exec range graphs and the unified kernel's plan cache (with its micro graph
+    // and update recipe) all bake addresses of the scheduler being replaced.
+    ctx->invalidate_moe_sequence_graphs();
+    ctx->invalidate_moe_direct_dispatch_graphs();
+#ifdef GGML_SYCL_GRAPH
+    if (auto * dense = ggml_sycl_block_exec_dense_state_find(ctx)) {
+        dense->drop_graphs(*ctx);
+    }
+#endif
+    if (ctx->unified_kernel) {
+        ctx->unified_kernel->invalidate_plan_cache();
+    }
+}
+
+// llama.cpp-dkw0: NOT side-effect-free even when exec_graph is already null --
+// besides tearing down the executable graph, this unconditionally unpins MoE
+// experts/weights, clears the CPU staging cache, and invalidates MoE
+// segment/phase-layout/input-tensor caches. Calling it at a point where
+// nothing was recorded still perturbs that other state; a caller with
+// nothing to release should skip the call rather than rely on this being a
+// no-op (measured regression: calling it unconditionally at a preventive,
+// nothing-recorded-yet trip site altered gemma's decode output relative to
+// GGML_SYCL_DISABLE_GRAPH=1 at identical settings).
+// The scoped body plus the process-global effects: the graph_unwaitable swap, the
+// static CPU staging cache and the weight unpins.  Its callers are the phase
+// boundaries, the replay-management trips and teardown, none of them a re-plan path.
+static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const char * reason) {
+    if (!ctx) {
+        return;
+    }
+    sycl_exec_graph_clear_scoped(ctx, reason);
+    ggml_sycl::release_graph_retained_handles();
     ggml_sycl_cpu_staging_cache_clear();
     graph_unpin_moe_experts(ctx);
     graph_unpin_weights(ctx);
-    ctx->invalidate_moe_segments();
-    ctx->invalidate_moe_block_graphs();
 }
 
 // Owner-targeted replacement for the historical all-device graph-lease sweep at
@@ -102863,6 +105326,118 @@ static void ggml_sycl_release_graph_leases_for_owner(ggml_sycl::lifecycle::Model
         // Teardown effects report failure through their caller's result; a
         // throwing lease release must not escape into a noexcept unload path.
     }
+}
+
+// A re-plan's invalidation of ONE context's own recorded graph state.  Runs on the
+// owner thread, outside graph_compute.  With nothing recorded
+// it does nothing; otherwise it runs the context-scoped clear body, which reaches none
+// of the process-global effects sycl_exec_graph_clear_active adds.
+void ggml_backend_sycl_graph_invalidate(ggml_backend_t backend, const char * reason) {
+    if (!backend || !ggml_backend_is_sycl(backend)) {
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    if (!sycl_exec_graph_has_recorded_state(ctx)) {
+        return;
+    }
+    sycl_exec_graph_clear_scoped(ctx, reason ? reason : "context-replan");
+}
+
+// Waits every queue that can reach a slice of this context, after llama's
+// synchronize().  llama's synchronize() waits only the device execution queue (or the
+// deferred-decode event) and flushes the thread-local pending-scatter lists; the queues
+// below carry other work too, which is allowed only here, on the rare re-plan
+// path under L0.  Gate 30 censuses every queue and names the line that waits it.
+bool ggml_backend_sycl_synchronize_for_replan(ggml_backend_t backend) {
+    if (!backend || !ggml_backend_is_sycl(backend)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    try {
+        // The queue waits below have no timeout of their own and run under L0, so a
+        // stuck queue would hold every other thread's re-plan.  The watch logs which
+        // wait is running each interval and never abandons one; under STRICT it aborts.
+        ggml_sycl::ggml_sycl_wait_watch watch("synchronize_for_replan");
+        const int                       total = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
+        // The device execution queues, waited unconditionally (not last_graph_event): this
+        // context's own, then every other device's, which a split graph also submits to.
+        watch.site("the context's device execution queue");
+        ctx->stream(ctx->device, 0)->wait();
+        watch.site("another device's execution queue");
+        for (int d = 0; d < total; ++d) {
+            if (sycl::queue * q = ggml_sycl_execution_queue_for_device(d)) {
+                q->wait();
+            }
+        }
+        // The split secondary, merge and coord queues.
+        watch.site("a split secondary, merge or coord queue");
+        if (g_split_config.enabled) {
+            if (g_split_secondary_queue_owner) {
+                g_split_secondary_queue_owner->wait();
+            }
+            if (g_split_merge_queue_owner) {
+                g_split_merge_queue_owner->wait();
+            }
+            if (g_split_coord_queue_owner) {
+                g_split_coord_queue_owner->wait();
+            }
+        }
+        // The MoE shared-context queues.
+        watch.site("a MoE shared-context queue");
+        for (int d = 0; d < total; ++d) {
+            if (sycl::queue * q = ggml_sycl::get_shared_context_queue(d)) {
+                q->wait();
+            }
+        }
+        // The unified cache's queues.
+        watch.site("the unified cache's queues");
+        if (auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
+            cache->get_queue().wait();
+            cache->get_bcs_queue().wait();
+        }
+        // The CPU-dispatch queue.
+        watch.site("the CPU-dispatch queue");
+        if (sycl::queue * q = ggml_sycl_get_cpu_queue()) {
+            q->wait();
+        }
+        watch.site("a tensor-parallel queue");
+        // The TP queues (unreachable under a plan, waited if non-null) and the TP
+        // device-1 worker's own queue.
+        for (int d = 0; d < total; ++d) {
+            if (sycl::queue * q = ggml_sycl_get_tp_queue(d)) {
+                q->wait();
+            }
+        }
+        if (g_tp_device1_worker_queue) {
+            g_tp_device1_worker_queue->wait();
+        }
+        watch.site("a dense block executor copy queue");
+        // The dense block executor's copy queues.
+        {
+            std::lock_guard<std::mutex> lock(g_block_exec_copy_queue_mutex);
+            for (auto & q : g_block_exec_copy_queues) {
+                if (q) {
+                    q->wait();
+                }
+            }
+        }
+        watch.site("a PP pipeline copy queue");
+        // The PP pipeline copy queues, when GGML_SYCL_PP_PIPELINE created them.
+        {
+            std::lock_guard<std::mutex> lock(g_pipeline_copy_queue_mutex);
+            for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+                if (g_pipeline_copy_queue[d]) {
+                    g_pipeline_copy_queue[d]->wait();
+                }
+            }
+        }
+        return true;
+    } catch (const std::exception & exc) {
+        GGML_LOG_ERROR("[SYCL-REPLAN] synchronize_for_replan failed on device %d: %s\n", ctx->device, exc.what());
+    } catch (...) {
+        GGML_LOG_ERROR("[SYCL-REPLAN] synchronize_for_replan failed on device %d\n", ctx->device);
+    }
+    return false;
 }
 
 // =============================================================================
@@ -103493,6 +106068,7 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
             return resolved;
         }
 
+        ggml_sycl_resolver_count_host_return(tensor, ctx.device);
         return const_cast<void *>(ggml_sycl_host_data(tensor));
     };
 
@@ -103615,7 +106191,7 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
             return true;
         }
 
-        ggml_sycl::alloc_request rope_req;
+        ggml_sycl::alloc_request rope_req{};
         rope_req.queue                          = q;
         rope_req.device                         = ctx.device;
         rope_req.size                           = half_dim * sizeof(float);
@@ -103683,7 +106259,7 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
         }
 
         const size_t             bytes = ggml_nbytes(tensor);
-        ggml_sycl::alloc_request mat_req;
+        ggml_sycl::alloc_request mat_req{};
         mat_req.queue                          = q;
         mat_req.device                         = ctx.device;
         mat_req.size                           = bytes;
@@ -103850,7 +106426,7 @@ static bool extract_persistent_plan(ggml_sycl::UnifiedKernel &  kernel,
             return ptr;
         }
 
-        ggml_sycl::alloc_request stage_req;
+        ggml_sycl::alloc_request stage_req{};
         stage_req.queue                          = q;
         stage_req.device                         = ctx.device;
         stage_req.size                           = bytes;
@@ -107702,7 +110278,7 @@ static void debug_validate_persistent_set_rows(ggml_backend_sycl_context & ctx) 
         GGML_LOG_WARN("[PERSISTENT-TG] SET_ROWS validate skipped: zero-sized dst buffer\n");
         return;
     }
-    ggml_sycl::alloc_request tmp_req;
+    ggml_sycl::alloc_request tmp_req{};
     tmp_req.queue                          = q;
     tmp_req.device                         = ctx.device;
     tmp_req.size                           = dst_bytes;
@@ -108571,6 +111147,38 @@ static bool should_use_persistent_tg(ggml_backend_sycl_context & ctx, ggml_cgrap
     return true;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Defined ahead of graph_compute_unchecked on purpose: the parse of that function fails, and tree-sitter
+// reads every definition after it as an ERROR region, where the alloc-zone contract cannot trust an
+// alloc_request (finding A-ERROR). A test hook that builds one belongs where the file parses.
+size_t ggml_backend_sycl_test_park_tenant_staging(ggml_backend_t backend, size_t nbytes) {
+    auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+    if (!ctx || nbytes == 0) {
+        return 0;
+    }
+    ggml_sycl::alloc_request req{};
+    req.queue                               = ctx->stream();
+    req.device                              = ctx->device;
+    req.size                                = nbytes;
+    req.intent.role                         = ggml_sycl::alloc_role::STAGING;
+    req.intent.category                     = ggml_sycl::runtime_category::STAGING;
+    // The entry only has to sit in the staging map under a tenant cohort; nothing resolves it on the
+    // device. Host-pinned keeps it out of the VRAM zones, which an unplanned test backend has not carved.
+    req.intent.constraints.must_host_pinned = true;
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
+        return 0;
+    }
+    allocation.owner.set_tenant_cohort("test-tenant-cohort");
+    static ggml_tensor keys[8];
+    static size_t      next_key = 0;
+    ctx->graph_input_staging_adopt_for_test(
+        &keys[next_key++ % 8], ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS),
+        nbytes);
+    return ctx->graph_input_staging_tenant_count();
+}
+#endif
+
 static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t backend, ggml_cgraph * cgraph) {
     // Phase timing: measure each stage of graph_compute to find overhead
     static const bool phase_timing = (std::getenv("GGML_SYCL_PHASE_TIMING") != nullptr);
@@ -108648,7 +111256,18 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     const bool cached_is_decode =
         ggml_sycl_graph_is_decode(cgraph, sycl_ctx->graph_phase_is_decode.load(std::memory_order_relaxed));
     sycl_ctx->graph_phase_is_decode.store(cached_is_decode, std::memory_order_relaxed);
+    if (cached_is_decode) {
+        // Once per device, at the entry of its first one-token graph: the WEIGHT room G0 prints beside
+        // the bytes each interim WEIGHT row requests.
+        ggml_sycl::unified_cache_dump_capture_zone_figures(sycl_ctx->device, ggml_sycl::dump_point::FIRST_DECODE);
+    }
     ggml_sycl::offload_stats_set_phase(cached_is_decode ? ggml_sycl::offload_phase::TG : ggml_sycl::offload_phase::PP);
+
+    // Every device kernel this call dispatches, on every path below, runs in
+    // this region.
+    ggml_sycl_device_dispatch_region device_dispatch_region;
+    GGML_SYCL_DEBUG("[GRAPH-STAGE] cohort=%zu phase=%s\n", ggml_sycl_graph_stage_source_count(cgraph, sycl_ctx->device),
+                    cached_is_decode ? "tg" : "pp");
     const bool arena_pp_profile_active = ggml_sycl::arena_pp_profile_begin(sycl_ctx->device, !cached_is_decode);
     pp_scratch_profile_begin(!cached_is_decode);
 
@@ -110803,7 +113422,7 @@ normal_dispatch:
                 sycl_exec_graph_mark_active(*sycl_ctx, graph_key, cgraph);
 
                 graph_executed = true;
-                sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
+                ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *(sycl_ctx->exec_graph));
                 g_graph_diag_counters.rerecord_success.fetch_add(1, std::memory_order_relaxed);
                 recording_guard.committed = true;
                 // llama.cpp-dkw0 (N8): if THIS record just tripped replay
@@ -110834,7 +113453,7 @@ normal_dispatch:
 
             graph_executed = true;
             sycl_ctx->test_graph_replay_count++;
-            sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
+            ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *(sycl_ctx->exec_graph));
             g_graph_diag_counters.full_replay.fetch_add(1, std::memory_order_relaxed);
 
             GGML_SYCL_DEBUG("[SYCL-GRAPH] execute done\n");
@@ -110950,7 +113569,7 @@ normal_dispatch:
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] execute new graph...\n");
 
                 graph_executed = true;
-                sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
+                ggml_sycl::graph_exec_submit(*sycl_ctx->stream(), *(sycl_ctx->exec_graph));
                 g_graph_diag_counters.full_record_success.fetch_add(1, std::memory_order_relaxed);
                 recording_guard.committed = true;
                 // llama.cpp-dkw0 (N8): same reasoning as the re-record site
@@ -111133,6 +113752,150 @@ normal_dispatch:
     return GGML_STATUS_SUCCESS;
 }
 
+// Publishes the per-graph staged owners (the llama.cpp-1df8 keep-alive, kept out
+// of g_data_ptr_cache).  An eager call retained them in
+// g_graph_staged_owners; they leave through the retained store bound to the
+// graph's completion, never parked in a cache.  A recording call handed its
+// owners to the recording sink when it staged them.
+//
+// Why this is safe after the data-pointer cache drop and with no L0 token held: the list is
+// thread_local, filled only by ggml_sycl_graph_staged_owner_add on the thread
+// that runs this graph_compute and emptied only here and in the exceptional
+// exit on that same thread, so nothing else can observe it half-moved.  The one
+// shared step is retain_handles_until_event, which takes the retained store's
+// own lock.  A re-plan that reaps the store concurrently either runs before this
+// publish (and finds the store without these owners, which no re-plan may claim:
+// the call that holds them has not returned) or after it (and finds them bound
+// to this graph's completion event, which it waits).  graph_compute holds no L0
+// token (witnessed at its entry), so the publish never nests a store lock inside
+// one.
+static void ggml_sycl_graph_staged_owners_publish(ggml_backend_sycl_context * ctx) {
+    if (g_graph_staged_owners.empty()) {
+        return;
+    }
+    std::vector<ggml_sycl::mem_handle> owners;
+    owners.swap(g_graph_staged_owners);
+    sycl::event done{};
+    if (ctx && ctx->stream()) {
+        done = ctx->stream()->ext_oneapi_submit_barrier();
+    }
+    ggml_sycl::retain_handles_until_event(std::move(owners), std::move(done));
+}
+
+// The exit of every graph_compute call, on every return path.  It runs the
+// steps that keep a graph's transient holders from outliving it, so no tenant
+// slice stays parked in a thread-local or per-context structure past the call.
+//
+//  * Pending scatter work: an EAGER call flushes every thread-local MoE scatter
+//    and CPU-expert list.  A RECORDING call is exempt: CPU-expert
+//    dispatch is off while a graph records (ggml_sycl_cpu_offload_active_for_compute
+//    reads the recording state), so its four lists are empty at the exit and it
+//    waits for nothing.  Non-empty lists at a recording exit mean a producer ran
+//    inside a recording, which is a [CONTEXT-PLAN-BUG]; they are drained anyway,
+//    so a scatter is never skipped, and that drain is the only wait a recording
+//    call can reach.  (The three MoE segment recorders turn the flag off between
+//    their segments, so CPU work they run there is eager work: it is drained
+//    here, and its WARN is what a producer inside a recording looks like too.
+//    That false WARN, a known hazard rather than intended behaviour, is
+//    llama.cpp-b7l2.)  The eager flush is itself a host wait, which principle P4
+//    forbids; the spec keeps it for now (it is the base's own end-of-graph fence),
+//    and llama.cpp-flv8 tracks replacing it by an event chain.
+//  * The activation-keyed MoE maps are dropped now, not at the next graph's
+//    start (they hold only identities, so this is the extra measure the design allows).
+//  * The data-pointer cache is dropped likewise, and the staged owners go to
+//    the retained store.
+//  * Staging entries that are tenant slices are released on an eager exit.
+//    A call that recorded a graph, or replayed one, keeps them: the graph has their
+//    addresses baked in.  They are then named by the re-plan's invalidation
+//    (sycl_exec_graph_has_recorded_state), which clears them with the graph.
+//
+// `recorded_call` is true when a command graph began recording on this thread
+// during the call, from any recorder (ggml_sycl::graph_record_begins).
+// `replayed_call` is true when the call submitted an executable graph, which a
+// replay-only call does without beginning a recording
+// (ggml_sycl::graph_exec_submits).  Only the staging release reads it: a
+// replay has no scatter lists of its own, so the flush classification stays
+// recorded_call's.
+//
+// Returns false when a step failed (the caller reports GGML_STATUS_FAILED).
+static bool ggml_sycl_graph_compute_exit(ggml_backend_sycl_context * ctx, bool recorded_call, bool replayed_call) {
+    try {
+        const bool scatter_pending = recorded_call && ggml_sycl_cpu_tg_pending_any();
+        if (scatter_pending) {
+            GGML_LOG_WARN(
+                "[CONTEXT-PLAN-BUG] a recording graph_compute reached its exit with MoE scatter state "
+                "pending\n");
+            if (ggml_sycl::ggml_sycl_strict_enabled()) {
+                GGML_ABORT(
+                    "[CONTEXT-PLAN-BUG] a recording graph_compute reached its exit with MoE scatter state "
+                    "pending");
+            }
+        }
+        if ((!recorded_call || scatter_pending) && !ggml_sycl_cpu_tg_exit_flush_skipped_for_test()) {
+            // A host wait (P4): the eager exit fence the spec keeps; llama.cpp-flv8.
+            ggml_sycl_cpu_tg_flush_pending();
+        }
+        ggml_sycl_moe_ids_cache_new_graph();
+        ggml_sycl_data_ptr_cache_new_graph();
+        ggml_sycl_graph_staged_owners_publish(ctx);
+        if (!recorded_call && !replayed_call && ctx) {
+            (void) ctx->graph_input_staging_release_tenants();
+        }
+        return true;
+    } catch (const std::exception & exc) {
+        GGML_LOG_ERROR("[SYCL] graph_compute exit failed: %s\n", exc.what());
+    } catch (...) {
+        GGML_LOG_ERROR("[SYCL] graph_compute exit failed with unknown exception\n");
+    }
+    return false;
+}
+
+static ggml_status ggml_sycl_graph_compute_exit_status(ggml_backend_t backend,
+                                                       ggml_status    status,
+                                                       uint64_t       record_begins_before,
+                                                       uint64_t       exec_submits_before) {
+    auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+    if (!ggml_sycl_graph_compute_exit(ctx, ggml_sycl::graph_record_begins() != record_begins_before,
+                                      ggml_sycl::graph_exec_submits() != exec_submits_before)) {
+        return GGML_STATUS_FAILED;
+    }
+    return status;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+size_t ggml_backend_sycl_test_tenant_staging_count(ggml_backend_t backend) {
+    auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+    return ctx ? ctx->graph_input_staging_tenant_count() : 0;
+}
+
+bool ggml_backend_sycl_test_graph_exit(ggml_backend_t backend, bool recorded, bool replayed) {
+    auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+    return ggml_sycl_graph_compute_exit(ctx, recorded, replayed);
+}
+#endif
+
+// The same drops for an exceptional exit, where the stream may be unusable: no
+// barrier is submitted, so the staged owners go to the retained store with an
+// already-complete event, after the cleanup that called this has drained.
+static void ggml_sycl_graph_compute_exception_exit() noexcept {
+    try {
+        ggml_sycl_moe_ids_cache_new_graph();
+    } catch (...) {
+    }
+    try {
+        ggml_sycl_data_ptr_cache_new_graph();
+    } catch (...) {
+    }
+    try {
+        if (!g_graph_staged_owners.empty()) {
+            std::vector<ggml_sycl::mem_handle> owners;
+            owners.swap(g_graph_staged_owners);
+            ggml_sycl::retain_handles_until_event(std::move(owners), sycl::event{});
+        }
+    } catch (...) {
+    }
+}
+
 static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl_context * cleanup_ctx,
                                                                const char *                stage,
                                                                const char *                what) noexcept {
@@ -111164,10 +113927,18 @@ static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl
     g_recording_queue_ptr       = nullptr;
     ggml_sycl::set_graph_retained_handle_sink(nullptr);
     ggml_sycl::unified_cache_set_graph_compute_active(false);
+    ggml_sycl_graph_compute_exception_exit();
     GGML_LOG_ERROR("[SYCL] %s failed: %s\n", stage, what ? what : "unknown exception");
 }
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    // Graph compute never runs under L0: a token held here would serialize every
+    // other thread's re-plan behind a decode. One load and one branch when the
+    // witness is off.
+    GGML_SYCL_WITNESS(!ggml_sycl::ggml_sycl_replan_token_held(), "[REPLAN-TOKEN] token held in graph compute");
+    // The root that binds the dispatch owner for every ctx-less MoE route chain below.
+    ggml_sycl_dispatch_owner_scope dispatch_owner(
+        backend ? static_cast<const ggml_backend_sycl_context *>(backend->context) : nullptr);
     // llama.cpp-480a: segment the pinned-staging trace by graph so occupancy can
     // be read as "returns to baseline" vs "climbs". Bracketing both sides is what
     // makes that readable -- an entry sample alone cannot distinguish a graph that
@@ -111210,6 +113981,8 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     } attn_graph_profile_guard{ ggml_sycl_attn_sync_profile_enabled(), cgraph ? cgraph->n_nodes : -1,
                                 std::chrono::steady_clock::now() };
 
+    const uint64_t record_begins_before = ggml_sycl::graph_record_begins();
+    const uint64_t exec_submits_before  = ggml_sycl::graph_exec_submits();
     try {
 #if GGML_SYCL_DNNL
         // llama.cpp-6405: GGML_SYCL_MXFP4_PP_PROFILE component 5 ("everything
@@ -111259,11 +114032,12 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
                 // wait time has nowhere to land but "other".
                 end_ev.wait();
                 mxfp4_pp_batched_profile_record_graph_total(mxfp4_pp_event_span_us(begin_ev, end_ev));
-                return status;
+                return ggml_sycl_graph_compute_exit_status(backend, status, record_begins_before, exec_submits_before);
             }
         }
 #endif
-        return ggml_backend_sycl_graph_compute_unchecked(backend, cgraph);
+        return ggml_sycl_graph_compute_exit_status(backend, ggml_backend_sycl_graph_compute_unchecked(backend, cgraph),
+                                                   record_begins_before, exec_submits_before);
     } catch (const ggml_sycl_fallback_error & error) {
         auto * cleanup_ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
         try { ggml_sycl_cpu_tg_flush_pending(); } catch (...) {}
@@ -111294,6 +114068,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         g_recording_queue_ptr       = nullptr;
         ggml_sycl::set_graph_retained_handle_sink(nullptr);
         ggml_sycl::unified_cache_set_graph_compute_active(false);
+        ggml_sycl_graph_compute_exception_exit();
         GGML_LOG_ERROR("[SYCL] recoverable runtime fallback failed: %s\n", error.what());
         return GGML_STATUS_FAILED;
     } catch (const std::exception & exc) {
@@ -111669,13 +114444,19 @@ bool ggml_backend_sycl_plan_has_cpu_work(ggml_backend_dev_t dev) {
         return false;  // neutral: keep today's host buft
     }
     GGML_UNUSED(dev);  // the placement plan is process-global, not per-device
+    // A measure-only context asks this on every scheduler it builds; its lines would
+    // read as a real load's, so they stay quiet while the measure plan override is active.
     const auto snapshot = ggml_sycl_global_plan_snapshot();
     if (!snapshot || !snapshot->plan) {
-        GGML_LOG_INFO("[SYCL-CPU-ACT] plan CPU work: none (no active plan)\n");
+        if (!ggml_sycl_measure_plan_override_active()) {
+            GGML_LOG_INFO("[SYCL-CPU-ACT] plan CPU work: none (no active plan)\n");
+        }
         return false;
     }
     const char * reason = ggml_sycl_plan_cpu_work_reason(*snapshot->plan);
-    GGML_LOG_INFO("[SYCL-CPU-ACT] plan CPU work: %s\n", reason ? reason : "none");
+    if (!ggml_sycl_measure_plan_override_active()) {
+        GGML_LOG_INFO("[SYCL-CPU-ACT] plan CPU work: %s\n", reason ? reason : "none");
+    }
     return reason != nullptr;
 }
 
@@ -111901,7 +114682,7 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
         // ggml_sycl_dispatch_host_set_rows_sync (host-side, in-place).
         // Every other dst-resident op kind keeps declining exactly as
         // before.
-        if (!(op->op == GGML_OP_SET_ROWS && ggml_sycl_attn_host_dispatch_enabled())) {
+        if (!(op->op == GGML_OP_SET_ROWS && ggml_sycl_node_is_host_dispatched(op))) {
             if (g_ggml_sycl_debug) {
                 g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
                 GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft residency decline (dst): op=%s\n", ggml_op_name(op->op));
@@ -111939,9 +114720,7 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
             // the dst, so a src-only match would be admitted to SYCL,
             // decline the intercept, and run the normal GPU kernel over
             // host KV -- the forbidden zero-copy, via predicate asymmetry.
-            if ((op->op == GGML_OP_FLASH_ATTN_EXT ||
-                 (op->op == GGML_OP_SET_ROWS && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&
-                ggml_sycl_attn_host_dispatch_enabled()) {
+            if (ggml_sycl_node_is_host_dispatched(op)) {
                 if (g_ggml_sycl_debug) {
                     g_sycl_attn_host_accept_count.fetch_add(1, std::memory_order_relaxed);
                     GGML_SYCL_DEBUG(
@@ -112012,7 +114791,7 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
     // to stay ordered with the smart handles that consume them.  This exception
     // applies only to planner residency; normal MUL_MAT validation still applies.
     const bool is_multi_gpu_router_logits =
-        g_moe_multi_gpu_active.load(std::memory_order_acquire) && ggml_sycl_op_is_moe_router_logits_matmul(op);
+        ggml_sycl_moe_multi_gpu_for_executor() && ggml_sycl_op_is_moe_router_logits_matmul(op);
 
     if (placement_declines && !is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {
         GGML_SYCL_DEBUG("[SYCL-SUPPORT] planner rejects %s on SYCL backend (op=%s layer=%d)\n",
@@ -112844,7 +115623,7 @@ static bool ggml_sycl_op_is_host_gate_activation_chain(const ggml_tensor * op, i
         case GGML_OP_RMS_NORM:
             return ggml_sycl_tensor_depends_on_planned_host_weight(op, device, 0);
         case GGML_OP_GLU:
-            return g_moe_multi_gpu_active.load(std::memory_order_acquire) &&
+            return ggml_sycl_moe_multi_gpu_for_executor() &&
                    ggml_sycl_tensor_depends_on_planned_host_weight(op, device, 0);
         default:
             return false;
@@ -113034,7 +115813,7 @@ static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device) 
 
     if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) && op->src[0] != nullptr &&
         ggml_sycl_weight_executes_on_host(op->src[0], device)) {
-        if (g_moe_multi_gpu_active.load(std::memory_order_acquire) &&
+        if (ggml_sycl_moe_multi_gpu_for_executor() &&
             (ggml_sycl_op_is_moe_routing_subgraph(op) || ggml_sycl_op_is_host_gate_activation_chain(op, device))) {
             return n04bq_tr_final(false, "multi_gpu_moe_routing");
         }
@@ -113051,7 +115830,7 @@ static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device) 
 
     if ((op->op == GGML_OP_ADD_ID || op->op == GGML_OP_GLU) &&
         ggml_sycl_tensor_depends_on_planned_host_weight(op, device)) {
-        if (g_moe_multi_gpu_active.load(std::memory_order_acquire) && op->op == GGML_OP_GLU) {
+        if (ggml_sycl_moe_multi_gpu_for_executor() && op->op == GGML_OP_GLU) {
             return n04bq_tr_final(false, "multi_gpu_moe_glu");
         }
         return n04bq_tr_final(true, "addid_glu_depends_host");
@@ -113099,7 +115878,7 @@ static bool ggml_backend_sycl_device_offload_op(ggml_backend_dev_t dev, const gg
         // expert tensors through the wrong contract.
         return true;
     }
-    if (g_moe_multi_gpu_active.load(std::memory_order_acquire) &&
+    if (ggml_sycl_moe_multi_gpu_for_executor() &&
         (ggml_sycl_op_is_moe_routing_subgraph(op) || ggml_sycl_op_is_host_gate_activation_chain(op, device_index))) {
         return true;
     }
@@ -113207,6 +115986,14 @@ static const ggml_backend_device_i ggml_backend_sycl_device_interface = {
 };
 
 bool ggml_backend_sycl_can_unload(void) {
+    // It never blocks on L0: it closes module admission and waits for the module's
+    // in-flight mutations to drain, and a thread that holds L0 and a lifecycle
+    // lease can be the one calling it. Another thread's L0 hold is an answer:
+    // false at once, which ggml_backend_unload_checked reports as BUSY.
+    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE, std::try_to_lock);
+    if (!l0.owns()) {
+        return false;
+    }
     bool newly_closed = false;
     {
         std::unique_lock<std::mutex> lock(g_sycl_module_admission_mutex);
@@ -113272,6 +116059,7 @@ void ggml_backend_sycl_cancel_unload(void) {
 }
 
 void ggml_backend_sycl_complete_unload(void) {
+    ggml_sycl_replan_token      l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
     g_sycl_module_admission = sycl_module_admission_state::COMPLETE_CLOSED;
     ggml_sycl::lifecycle::global_registry().complete_shutdown();
@@ -113302,6 +116090,7 @@ bool ggml_backend_sycl_prepare_reactivate(void) {
 }
 
 void ggml_backend_sycl_commit_reactivate(void) {
+    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     ggml_sycl::lifecycle::global_registry().reactivate();
     ggml_sycl::prepare_unified_cache_for_module_use();
     std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
@@ -113328,6 +116117,7 @@ void ggml_backend_sycl_finalize_reactivate(void) {
 }
 
 void ggml_backend_sycl_rollback_reactivate(void) {
+    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     bool rollback_committed = false;
     {
         std::lock_guard<std::mutex> lock(g_sycl_module_admission_mutex);
@@ -113515,6 +116305,7 @@ extern "C" bool ggml_backend_sycl_test_moe_module_state_clean() {
 }
 
 void ggml_backend_sycl_shutdown(void) {
+    ggml_sycl_replan_token l0(GGML_SYCL_REPLAN_KIND_LIFECYCLE);
     {
         std::lock_guard<std::mutex> admission_lock(g_sycl_module_admission_mutex);
         g_sycl_module_shutdown_started = true;
@@ -113826,6 +116617,57 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_has_active_placement_plan") == 0) {
         return (void *) ggml_backend_sycl_has_active_placement_plan;
     }
+    if (strcmp(name, "ggml_backend_sycl_measure_plan_override_install") == 0) {
+        return (void *) ggml_backend_sycl_measure_plan_override_install;
+    }
+    if (strcmp(name, "ggml_backend_sycl_measure_plan_override_clear") == 0) {
+        return (void *) ggml_backend_sycl_measure_plan_override_clear;
+    }
+    if (strcmp(name, "ggml_backend_sycl_measure_backend_init") == 0) {
+        return (void *) ggml_backend_sycl_measure_backend_init;
+    }
+    if (strcmp(name, "ggml_backend_sycl_graph_invalidate") == 0) {
+        return (void *) ggml_backend_sycl_graph_invalidate;
+    }
+    if (strcmp(name, "ggml_backend_sycl_synchronize_for_replan") == 0) {
+        return (void *) ggml_backend_sycl_synchronize_for_replan;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_caps_new") == 0) {
+        return (void *) ggml_backend_sycl_plan_caps_new;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_caps_free") == 0) {
+        return (void *) ggml_backend_sycl_plan_caps_free;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_caps_set_state") == 0) {
+        return (void *) ggml_backend_sycl_plan_caps_set_state;
+    }
+    if (strcmp(name, "ggml_backend_sycl_replan_scope_open") == 0) {
+        return (void *) ggml_backend_sycl_replan_scope_open;
+    }
+    if (strcmp(name, "ggml_backend_sycl_replan_scope_close") == 0) {
+        return (void *) ggml_backend_sycl_replan_scope_close;
+    }
+    if (strcmp(name, "ggml_backend_sycl_claim_scope_open") == 0) {
+        return (void *) ggml_backend_sycl_claim_scope_open;
+    }
+    if (strcmp(name, "ggml_backend_sycl_claim_scope_close") == 0) {
+        return (void *) ggml_backend_sycl_claim_scope_close;
+    }
+    if (strcmp(name, "ggml_backend_sycl_claim_scope_claims") == 0) {
+        return (void *) ggml_backend_sycl_claim_scope_claims;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_scope_open") == 0) {
+        return (void *) ggml_backend_sycl_plan_scope_open;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_scope_open_load_measure") == 0) {
+        return (void *) ggml_backend_sycl_plan_scope_open_load_measure;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_scope_failure") == 0) {
+        return (void *) ggml_backend_sycl_plan_scope_failure;
+    }
+    if (strcmp(name, "ggml_backend_sycl_plan_scope_close") == 0) {
+        return (void *) ggml_backend_sycl_plan_scope_close;
+    }
     // llama.cpp-ir18: the model loader asks the placement plan, pre-create_tensor,
     // which dense weights are destined for the host, so it can give those to the CPU
     // backend's repacking buft instead of SYCL_Host. Exported here rather than linked
@@ -113912,6 +116754,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_test_allocate_predictor_scores") == 0) {
         return (void *) ggml_backend_sycl_test_allocate_predictor_scores;
     }
+    if (strcmp(name, "ggml_backend_sycl_test_record_compute_term") == 0) {
+        return (void *) ggml_backend_sycl_test_record_compute_term;
+    }
+    if (strcmp(name, "ggml_backend_sycl_test_compute_term_count") == 0) {
+        return (void *) ggml_backend_sycl_test_compute_term_count;
+    }
 #endif
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_backend_sycl_test_fail_next_candidate_binding_allocation") == 0) {
@@ -113932,6 +116780,21 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_for_model") == 0) {
         return (void *) ggml_backend_sycl_set_runtime_context_for_model;
+    }
+    // The L4 descriptor publish, the coverage read, the late check and the residency probe.  Each name is the
+    // "Proc name:" its declaration in ggml-sycl.h carries; scripts/check-sycl-l4-proc-registration.py pins that
+    // every such name in the header has an arm here.
+    if (strcmp(name, "ggml_backend_sycl_set_runtime_context_desc") == 0) {
+        return (void *) ggml_backend_sycl_set_runtime_context_desc;
+    }
+    if (strcmp(name, "ggml_backend_sycl_tenant_coverage") == 0) {
+        return (void *) ggml_backend_sycl_tenant_coverage;
+    }
+    if (strcmp(name, "ggml_backend_sycl_load_late_check") == 0) {
+        return (void *) ggml_backend_sycl_load_late_check;
+    }
+    if (strcmp(name, "ggml_backend_sycl_probe_residency") == 0) {
+        return (void *) ggml_backend_sycl_probe_residency;
     }
     if (strcmp(name, "ggml_backend_sycl_supports_op_capability") == 0) {
         return (void *) ggml_backend_sycl_supports_op_capability;
@@ -114092,6 +116955,65 @@ extern "C" void ggml_backend_sycl_test_fail_next_backend_publish() {
     g_test_fail_next_backend_publish.store(true, std::memory_order_release);
 }
 #endif
+
+// The load-time measure's backend.  It is a ggml_backend_t the
+// scheduler can reserve against, and nothing else: no SYCL context, no refcount, no
+// lifecycle registration.  Its interface is its own, never ggml_backend_sycl_interface,
+// and every slot but get_name and free is NULL.  synchronize is NULL on purpose: the
+// llama_context destructor's ggml_backend_synchronize returns on a NULL slot, where the
+// real one would dereference a context this backend never built and wait queues.  The
+// guid is its own too, so ggml_backend_is_sycl() is false for it and no proc in this
+// file reads a context out of it.
+static const char * ggml_backend_sycl_measure_get_name(ggml_backend_t) {
+    return "SYCL-measure";
+}
+
+// Deletes the backend object and nothing else.  Not ggml_backend_sycl_free: its
+// process-global tail must not run for a backend that was never counted.
+static void ggml_backend_sycl_measure_free(ggml_backend_t backend) {
+    delete backend;
+}
+
+static ggml_backend_i ggml_backend_sycl_measure_interface = {
+    /* .get_name                = */ ggml_backend_sycl_measure_get_name,
+    /* .free                    = */ ggml_backend_sycl_measure_free,
+    /* .set_tensor_async        = */ NULL,
+    /* .get_tensor_async        = */ NULL,
+    /* .set_tensor_2d_async     = */ NULL,
+    /* .get_tensor_2d_async     = */ NULL,
+    /* .cpy_tensor_async        = */ NULL,
+    /* .synchronize             = */ NULL,
+    /* .graph_plan_create       = */ NULL,
+    /* .graph_plan_free         = */ NULL,
+    /* .graph_plan_update       = */ NULL,
+    /* .graph_plan_compute      = */ NULL,
+    /* .graph_compute           = */ NULL,
+    /* .event_record            = */ NULL,
+    /* .event_wait              = */ NULL,
+    /* .graph_optimize          = */ NULL,
+};
+
+static ggml_guid_t ggml_backend_sycl_measure_guid() {
+    static ggml_guid guid = { 0x6d, 0x65, 0x61, 0x73, 0x75, 0x72, 0x65, 0x2d,
+                              0x73, 0x79, 0x63, 0x6c, 0x2d, 0x7a, 0x68, 0x63 };
+    return &guid;
+}
+
+ggml_backend_t ggml_backend_sycl_measure_backend_init(int device) {
+    if (device < 0 || device >= ggml_backend_sycl_get_device_count()) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), device);
+    if (!dev) {
+        return nullptr;
+    }
+    return new ggml_backend{
+        /* .guid    = */ ggml_backend_sycl_measure_guid(),
+        /* .iface   = */ ggml_backend_sycl_measure_interface,
+        /* .device  = */ dev,
+        /* .context = */ nullptr,
+    };
+}
 
 ggml_backend_t ggml_backend_sycl_init(int device) {
     sycl_module_mutation_guard module_guard;

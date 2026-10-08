@@ -39,7 +39,8 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                     bool   no_alloc = false);
 
     ~llama_memory_hybrid_iswa() = default;
 
@@ -54,9 +55,12 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_streams) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    void get_shift_caches(std::vector<const llama_kv_cache *> & caches) const override;
 
     void clear(bool data) override;
 
@@ -99,6 +103,11 @@ public:
 
     // init full
     explicit llama_memory_hybrid_iswa_context(llama_memory_hybrid_iswa * mem);
+
+    // init a worst-case context over exactly n_streams streams
+    explicit llama_memory_hybrid_iswa_context(
+        llama_memory_hybrid_iswa * mem,
+        uint32_t n_streams);
 
     // init update
     explicit llama_memory_hybrid_iswa_context(

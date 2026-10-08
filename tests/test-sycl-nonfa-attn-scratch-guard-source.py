@@ -136,11 +136,16 @@ def test_llama_context_threads_real_flash_attn_state():
     # check's intent is "flash_attn is the real cparams field, passed all
     # the way to the call", not "these two arguments are adjacent".
     matches = re.findall(
-        r"runtime_context_fn\([^;]*?cparams\.n_seq_max,(?:\s*cparams\.\w+,)*\s*cparams\.flash_attn\)", ctx_norm
+        r"runtime_context_fn\([^;]*?cparams\.n_seq_max,(?:\s*cparams\.\w+,)*\s*flash_attn\)", ctx_norm
     )
-    assert len(matches) >= 2, (
-        "expected at least two runtime_context_fn(...) call sites in llama-context.cpp "
-        "(the initial call and the BUSY-retry loop) to pass cparams.flash_attn -- found "
+    # the publish takes the resolved state as a parameter: the context's own cparams.flash_attn
+    # must reach it from the throwing form's call, never a literal
+    assert "sycl_publish_runtime_context(cparams.flash_attn)" in ctx_norm, (
+        "the throwing publish form must pass the context's own cparams.flash_attn"
+    )
+    assert len(matches) >= 1, (
+        "expected a runtime_context_fn(...) call site in llama-context.cpp (the publish; it no longer "
+        "retries on BUSY) to pass cparams.flash_attn -- found "
         f"{len(matches)}"
     )
 
@@ -530,15 +535,33 @@ def test_for_model_forwards_flash_attn_enabled():
     parameter into the inner call rather than dropping it on the floor."""
     func_start = GGML_SYCL_CPP_CODE.find("ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(")
     assert func_start != -1, "ggml_backend_sycl_set_runtime_context_for_model() definition not found"
-    body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[func_start : func_start + 8000])
+    # Bounded at the function's closing brace: the descriptor publish that follows it makes the same impl call.
+    func_end = GGML_SYCL_CPP_CODE.find("\n}\n", func_start)
+    assert func_end != -1, "ggml_backend_sycl_set_runtime_context_for_model() has no closing brace"
+    body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[func_start:func_end])
     # llama.cpp-3aos: tolerate additional arguments inserted between
     # n_seq_max and flash_attn_enabled (e.g. kv_unified) -- the intent is
     # "flash_attn_enabled reaches the inner call", not "these two
     # parameters are adjacent".
+    # moua L4 (0dddb26f6): the public entry forwards to
+    # ggml_sycl_set_runtime_context_for_model_impl (shared with the descriptor
+    # publish), and the impl calls the runtime-context transaction directly so
+    # a throw answers EFFECT_FAILED instead of being swallowed by the void C
+    # entry. Follow both hops: the parameter reaches the impl, and the impl
+    # hands it to the transaction.
     assert re.search(
-        r"ggml_backend_sycl_set_runtime_context\(backend, n_ctx, n_ubatch, n_seq_max,(?:\s*\w+,)*\s*flash_attn_enabled\)",
+        r"ggml_sycl_set_runtime_context_for_model_impl\(backend, model, n_ctx, n_ubatch, n_seq_max,(?:\s*\w+,)*\s*flash_attn_enabled,",
         body_norm,
-    ), "ggml_backend_sycl_set_runtime_context_for_model() must forward flash_attn_enabled to the inner call"
+    ), "ggml_backend_sycl_set_runtime_context_for_model() must forward flash_attn_enabled to the impl"
+    impl_start = GGML_SYCL_CPP_CODE.find("static ggml_sycl_lifecycle_result ggml_sycl_set_runtime_context_for_model_impl(")
+    assert impl_start != -1, "ggml_sycl_set_runtime_context_for_model_impl() definition not found"
+    impl_end = GGML_SYCL_CPP_CODE.find("\n}\n", impl_start)
+    assert impl_end != -1, "ggml_sycl_set_runtime_context_for_model_impl() has no closing brace"
+    impl_norm = _normalize_ws(GGML_SYCL_CPP_CODE[impl_start:impl_end])
+    assert re.search(
+        r"ggml_sycl_run_runtime_context_transaction\(backend, n_ctx, n_ubatch, n_seq_max,(?:\s*\w+,)*\s*flash_attn_enabled,",
+        impl_norm,
+    ), "ggml_sycl_set_runtime_context_for_model_impl() must forward flash_attn_enabled to the transaction"
 
 
 def test_formula_and_inverse_are_declared_and_defined():
@@ -655,7 +678,8 @@ def test_auto_flash_attn_resolution_rechecks_the_guard():
     # call the full-transaction helper (that would needlessly re-run KV/MMID
     # work resolve_fused_ops() has no reason to touch).
     resolve_body = ctx_norm[resolve_start : resolve_start + 4000]
-    assert re.search(r"if \(cparams\.auto_fa\) \{[^}]*resolve\([^;]*flash_attn[^;]*;[^}]*"
+    # the reserve state's cparams: resolve_fused_ops() reads them through it
+    assert re.search(r"if \(state\.cparams\.auto_fa\) \{[^}]*resolve\([^;]*flash_attn[^;]*;[^}]*"
                       r"sycl_recheck_runtime_context_flash_attn\(\);", resolve_body), (
         "resolve_fused_ops() must call sycl_recheck_runtime_context_flash_attn() inside the same "
         "if (cparams.auto_fa) block that resolves flash_attn, so it fires exactly once, right when "

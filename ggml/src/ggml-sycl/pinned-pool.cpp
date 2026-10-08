@@ -187,7 +187,7 @@ segmented_buffer pinned_chunk_pool::allocate_segmented(size_t size, size_t align
         return {};
     }
 
-    if (!grow_into(chunks_, std::max(size, chunk_size_), false)) {
+    if (!grow_into(chunks_, std::max(size, chunk_size_), false, "allocate_segmented")) {
         return {};
     }
 
@@ -244,7 +244,7 @@ size_t pinned_chunk_pool::pre_allocate(size_t total_bytes) {
                           chunks_needed);
             break;
         }
-        if (!grow(chunk_size_)) {
+        if (!grow(chunk_size_, "pre_allocate")) {
             GGML_LOG_WARN("[SYCL] Pinned pool pre_allocate: grow failed at chunk %zu/%zu\n", chunks_grown,
                           chunks_needed);
             break;
@@ -290,7 +290,7 @@ size_t pinned_chunk_pool::pre_allocate_runtime_chunks(size_t total_bytes) {
     size_t       chunks_grown  = 0;
 
     for (size_t i = 0; i < chunks_needed; ++i) {
-        if (!grow_into(runtime_chunks_, chunk_size_, true)) {
+        if (!grow_into(runtime_chunks_, chunk_size_, true, "pre_allocate_runtime")) {
             GGML_LOG_WARN("[SYCL] Pinned pool pre_allocate_runtime: grow failed at chunk %zu/%zu\n", chunks_grown,
                           chunks_needed);
             break;
@@ -321,7 +321,7 @@ void pinned_chunk_pool::configure_zones(size_t weight_bytes,
         total_capacity += c.size;
     }
     while (total_capacity < total_zone_bytes && total_allocated_ + chunk_size_ <= budget_) {
-        if (!grow(chunk_size_)) {
+        if (!grow(chunk_size_, "configure_zones")) {
             break;
         }
         total_capacity += chunks_.back().size;
@@ -627,12 +627,16 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
         mode             = (env != nullptr) ? std::atoi(env) : 1;
         s_phase_gate.store(mode, std::memory_order_relaxed);
     }
-    if (mode > 0) {
+    // A thread inside a TRANSACTION-kind re-plan token is the planner pre-sizing
+    // (a context's first publish carves its host slots here), so the gate does not
+    // apply to it. LOAD and LIFECYCLE tokens are NOT exempt: a load's pinned fills
+    // stay gated, and the kind is read before the phase.
+    if (mode > 0 && !ggml_sycl::ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_TRANSACTION)) {
         const auto phase = ggml_sycl::offload_stats_phase();
         if (phase == ggml_sycl::offload_phase::PP || phase == ggml_sycl::offload_phase::TG) {
-            GGML_LOG_WARN("[HOST-POOL] grow_zone(%s, %.1f MB) during %s phase; planner should pre-size\n",
-                          host_zone_name(zone), additional_bytes / (1024.0 * 1024.0),
-                          ggml_sycl::offload_phase_name(phase));
+            GGML_LOG_WARN(
+                "[HOST-POOL] grow_zone(%s, %.1f MB) during %s phase site=grow_zone; planner should pre-size\n",
+                host_zone_name(zone), additional_bytes / (1024.0 * 1024.0), ggml_sycl::offload_phase_name(phase));
             if (mode >= 2) {
                 GGML_ASSERT(false && "host pool zone growth during inference");
                 return false;
@@ -672,7 +676,7 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
     // below visits that one chunk.
     const size_t old_chunk_count = chunks_.size();
 
-    if (!grow(footprint.usable)) {
+    if (!grow(footprint.usable, "grow_zone")) {
         GGML_LOG_WARN("[SYCL] Pinned pool grow_zone: grow failed for zone %zu (%.1f MB chunk)\n", zi,
                       footprint.usable / (1024.0 * 1024.0));
         return false;
@@ -791,8 +795,8 @@ void pinned_chunk_pool::free_chunk_owner(chunk & c, const char * ctx) {
     c.base = nullptr;
 }
 
-bool pinned_chunk_pool::grow(size_t min_size) {
-    return grow_into(chunks_, min_size, false);
+bool pinned_chunk_pool::grow(size_t min_size, const char * site) {
+    return grow_into(chunks_, min_size, false, site);
 }
 
 pinned_chunk_pool::chunk_footprint pinned_chunk_pool::chunk_footprint_for(size_t min_size) const {
@@ -835,7 +839,7 @@ void * pinned_chunk_pool::allocate_from_chunks(std::vector<chunk> & chunks,
                       new_chunk_size, total_allocated_ / (1024.0 * 1024.0 * 1024.0),
                       budget_ / (1024.0 * 1024.0 * 1024.0), runtime_pool ? "runtime" : "zone-base");
     }
-    if (!grow_into(chunks, size, runtime_pool)) {
+    if (!grow_into(chunks, size, runtime_pool, "allocate_from_chunks")) {
         return nullptr;
     }
 
@@ -862,7 +866,7 @@ bool pinned_chunk_pool::deallocate_from_chunks(std::vector<chunk> & chunks, void
     return false;
 }
 
-bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, bool runtime_pool) {
+bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, bool runtime_pool, const char * site) {
     // Phase gate: warn/assert when allocating chunks during inference
     static std::atomic<int> s_phase_gate{ -1 };
     int                     mode = s_phase_gate.load(std::memory_order_relaxed);
@@ -871,11 +875,13 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
         mode             = (env != nullptr) ? std::atoi(env) : 1;
         s_phase_gate.store(mode, std::memory_order_relaxed);
     }
-    if (mode > 0) {
+    // The same exemption as grow_zone(): only a TRANSACTION-kind token skips it.
+    if (mode > 0 && !ggml_sycl::ggml_sycl_replan_token_held(ggml_sycl::GGML_SYCL_REPLAN_KIND_TRANSACTION)) {
         const auto phase = ggml_sycl::offload_stats_phase();
         if (phase == ggml_sycl::offload_phase::PP || phase == ggml_sycl::offload_phase::TG) {
-            GGML_LOG_WARN("[HOST-POOL] chunk allocation during %s phase — planner should pre-size (%zu bytes)\n",
-                          ggml_sycl::offload_phase_name(phase), min_size);
+            GGML_LOG_WARN(
+                "[HOST-POOL] chunk allocation during %s phase site=%s — planner should pre-size (%zu bytes)\n",
+                ggml_sycl::offload_phase_name(phase), site != nullptr ? site : "unknown", min_size);
             if (mode >= 2) {
                 GGML_ASSERT(false && "host pool chunk allocation during inference");
             }

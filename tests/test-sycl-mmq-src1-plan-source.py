@@ -982,7 +982,7 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
         0 <= try_fn.find("release_rung_buffers();") < probe_at
     # r4 I1: the realized check also runs after a reserve the ladder did not make (a pinned -ub, a ladder that never
     # ran), by name, with the largest -ub that fits; and it runs after the WHOLE trial/else block.
-    trial_at = context.find("sycl_select_auto_ubatch(params.type_k, params.type_v);")
+    trial_at = context.find("sycl_select_auto_ubatch();")
     else_reserve_at = context.find("sched_reserve();", trial_at)
     call_at = context.find("llama_context_sycl_hold_spill_fits(backends", trial_at)
     guard_at = context.find("quantized V cache was requested", trial_at)
@@ -1060,7 +1060,7 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
     results["there is no settle refusal descent"] = \
         "settle_refusal_descend" not in auto_header and "settle_refusal_descend" not in context and \
         "refusal_largest_ub" not in context
-    loop_at = select_fn.find("for (uint32_t c : ladder) {")
+    loop_at = select_fn.find("for (uint32_t c : rung_ladder) {")
     fallback_assign_at = select_fn.find("if (last_good == 0) {")
     descent_m = re.search(r"if\s*\(\s*last_good\s*==\s*0\s*&&\s*ladder_needed\s*&&\s*fallback_tried\s*&&\s*rung_fit_refused\s*\)\s*\{", select_fn)
     descent_block = balanced_block(select_fn, descent_m.end() - 1) if descent_m else ""
@@ -1143,8 +1143,9 @@ def evaluate_context(context, header, ctx_header=None, auto_header=None):
         re.search(r"struct sycl_compute_scope_guard \{ void \(\*fn\)\(bool\); explicit sycl_compute_scope_guard\(void \(\*f\)\(bool\)\) : fn\(f\) \{ if \(fn\) \{ fn\(true\); \} \} ~sycl_compute_scope_guard\(\) \{ if \(fn\) \{ fn\(false\); \} \}", ctx_flat) is not None and \
         re.search(r"bool llama_context::sched_alloc_graph\(ggml_cgraph \* gf\) \{ sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); return ggml_backend_sched_alloc_graph\(sched\.get\(\), gf\); \}", ctx_flat) is not None and \
         re.search(r"bool llama_context::sched_reserve_graph\(ggml_cgraph \* gf\) \{ sycl_compute_scope_guard \w+\(sycl_compute_scope_fn\(\)\); return ggml_backend_sched_reserve\(sched\.get\(\), gf\); \}", ctx_flat) is not None and \
-        "if (!sched_alloc_graph(gf)) {" in ctx_flat and "if (!sched_reserve_graph(gf)) {" in ctx_flat and \
-        ctx_flat.count("ggml_backend_sched_alloc_graph(") == 1 and len(re.findall(r"ggml_backend_sched_reserve\(", ctx_flat)) == 1 and \
+        "if (!sched_alloc_graph(gf)) {" in ctx_flat and "if (!reserved) {" in ctx_flat and \
+        ctx_flat.count("ggml_backend_sched_alloc_graph(") == 1 and len(re.findall(r"ggml_backend_sched_reserve\(", ctx_flat)) == 2 and \
+        "const bool reserved = state.measure ? ggml_backend_sched_reserve(state.sched.get(), gf) : sched_reserve_graph(gf);" in ctx_flat and \
         "if (!sycl_compute_scope_resolved) { sycl_compute_scope_resolved = true;" in ctx_flat and \
         "sycl_compute_scope_cached = &ggml_backend_sycl_compute_alloc_scope;" in ctx_flat and \
         '"ggml_backend_sycl_compute_alloc_scope"' in ctx_flat and \
@@ -2095,7 +2096,7 @@ if args.self_test:
         ctx_mut_h("a bare graph allocation comes back", SCOPE,
                   new_ctx=context_src.replace("if (!sched_alloc_graph(gf)) {", "if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {", 1)),
         ctx_mut_h("a bare reserve comes back", SCOPE,
-                  new_ctx=context_src.replace("if (!sched_reserve_graph(gf)) {", "if (!ggml_backend_sched_reserve(sched.get(), gf)) {", 1)),
+                  new_ctx=context_src.replace(": sched_reserve_graph(gf);", ": ggml_backend_sched_reserve(sched.get(), gf);", 1)),
         ctx_mut_h("the scope is resolved on every call", SCOPE, new_ctx=context_src.replace("sycl_compute_scope_resolved = true;", "(void) 0;", 1)),
         ctx_mut_h("the direct-build scope function is not bound", SCOPE, new_ctx=context_src.replace("sycl_compute_scope_cached = &ggml_backend_sycl_compute_alloc_scope;", "(void) 0;", 1)),
         ctx_mut_h("the backend-DL scope function is not looked up", SCOPE, new_ctx=context_src.replace('"ggml_backend_sycl_compute_alloc_scope"', '"ggml_backend_sycl_XXXX"', 1)),

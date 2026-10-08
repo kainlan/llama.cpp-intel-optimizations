@@ -17,6 +17,19 @@
 // Forward declaration
 struct ggml_backend_sycl_context;
 
+// True when the scratchpad request was declined and the wrapper must return false before it writes anything. The seam
+// hook comes first so that it reaches a wrapper whose scratchpad is 0 B, which every family measured so far is.
+[[nodiscard]] inline bool ggml_sycl_scratchpad_declined(
+    ggml_sycl_scratchpad_site site,
+    const dnnl::memory & scratchpad_mem,
+    const dnnl::memory::desc & scratchpad_md)
+{
+    if (ggml_sycl_scratchpad_site_hook(site)) {
+        return true;
+    }
+    return scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0;
+}
+
 //
 // DnnlSoftmaxWrapper - Softmax primitive using oneDNN
 //
@@ -34,7 +47,9 @@ public:
 
     // Softmax along the last dimension (axis = -1)
     // src/dst shape: [batch, features] or [n3, n2, n1, n0] with softmax on n0
-    static void softmax(
+    // Returns false when the scratchpad request was declined: nothing was written to dst, so the caller
+    // falls through to its default path. true means the primitive was submitted.
+    [[nodiscard]] static bool softmax(
         ggml_backend_sycl_context & ctx,
         const void * src,
         void * dst,
@@ -55,6 +70,20 @@ public:
         dnnl::primitive_attr attr;
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
+        auto softmax_pd = dnnl::softmax_forward::primitive_desc(
+            eng, dnnl::prop_kind::forward_inference,
+            dnnl::algorithm::softmax_accurate,
+            src_md, dst_md, 1, attr);  // axis = 1 (features dimension)
+
+        // Decide the scratchpad before the first write to dst: the pre-scale pass below runs in place, so
+        // a decline after it would hand the fallback an input that is already scaled.
+        auto scratchpad_md = softmax_pd.scratchpad_desc();
+        auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
+        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_SOFTMAX, scratchpad_mem, scratchpad_md)) {
+            return false;
+        }
+        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_SOFTMAX);
+
         // Pre-scale: oneDNN softmax has no built-in pre-op, so when scale != 1.0
         // we write scaled input into dst via SYCL kernel, then softmax in-place.
         const void * softmax_src = src;
@@ -68,19 +97,8 @@ public:
             softmax_src = dst;  // softmax reads from pre-scaled dst (in-place)
         }
 
-        auto softmax_pd = dnnl::softmax_forward::primitive_desc(
-            eng, dnnl::prop_kind::forward_inference,
-            dnnl::algorithm::softmax_accurate,
-            src_md, dst_md, 1, attr);  // axis = 1 (features dimension)
-
         auto src_mem = dnnl::memory(src_md, eng, const_cast<void *>(softmax_src));
         auto dst_mem = dnnl::memory(dst_md, eng, dst);
-
-        auto scratchpad_md = softmax_pd.scratchpad_desc();
-        auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
-        if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {
-            throw std::runtime_error("oneDNN scratchpad allocation failed");
-        }
 
         auto softmax_prim = dnnl::softmax_forward(softmax_pd);
 
@@ -90,6 +108,7 @@ public:
         args.insert({DNNL_ARG_SCRATCHPAD, scratchpad_mem});
 
         softmax_prim.execute(stream, args);
+        return true;
     }
 };
 
@@ -149,8 +168,9 @@ public:
         }
     }
 
-    // Element-wise unary operation
-    static void eltwise(
+    // Element-wise unary operation. Returns false when the scratchpad request was declined: nothing was
+    // written to dst, so the caller falls through to its default path. true means the primitive was submitted.
+    [[nodiscard]] static bool eltwise(
         ggml_backend_sycl_context & ctx,
         op operation,
         const void * src,
@@ -177,14 +197,15 @@ public:
             eng, dnnl::prop_kind::forward_inference,
             algorithm, md, md, alpha, beta, attr);
 
-        auto src_mem = dnnl::memory(md, eng, const_cast<void*>(src));
-        auto dst_mem = dnnl::memory(md, eng, dst);
-
         auto scratchpad_md = eltwise_pd.scratchpad_desc();
         auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
-        if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {
-            throw std::runtime_error("oneDNN scratchpad allocation failed");
+        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_ELTWISE, scratchpad_mem, scratchpad_md)) {
+            return false;
         }
+        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_ELTWISE);
+
+        auto src_mem = dnnl::memory(md, eng, const_cast<void*>(src));
+        auto dst_mem = dnnl::memory(md, eng, dst);
 
         auto eltwise_prim = dnnl::eltwise_forward(eltwise_pd);
 
@@ -194,18 +215,7 @@ public:
         args.insert({DNNL_ARG_SCRATCHPAD, scratchpad_mem});
 
         eltwise_prim.execute(stream, args);
-    }
-
-    // In-place element-wise (src == dst)
-    static void eltwise_inplace(
-        ggml_backend_sycl_context & ctx,
-        op operation,
-        void * data,
-        int64_t nelements,
-        dt data_type,
-        const queue_ptr & q)
-    {
-        eltwise(ctx, operation, data, data, nelements, data_type, q);
+        return true;
     }
 };
 
@@ -248,56 +258,11 @@ public:
         }
     }
 
-    // Binary operation for same-shape tensors (no broadcasting)
-    static void binary(
-        ggml_backend_sycl_context & ctx,
-        op operation,
-        const void * src0,
-        const void * src1,
-        void * dst,
-        int64_t nelements,
-        dt data_type,
-        const queue_ptr & q)
-    {
-        auto stream = ctx.stream_dnnl(q);
-        auto eng = ctx.engine_dnnl(q);
-
-        // 1D layout for element-wise binary
-        dnnl::memory::dims dims = {nelements};
-        auto md = dnnl::memory::desc(dims, data_type, tag::a);
-
-        dnnl::primitive_attr attr;
-        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
-
-        alg algorithm = to_dnnl_algorithm(operation);
-
-        auto binary_pd = dnnl::binary::primitive_desc(
-            eng, algorithm, md, md, md, attr);
-
-        auto src0_mem = dnnl::memory(md, eng, const_cast<void*>(src0));
-        auto src1_mem = dnnl::memory(md, eng, const_cast<void*>(src1));
-        auto dst_mem = dnnl::memory(md, eng, dst);
-
-        auto scratchpad_md = binary_pd.scratchpad_desc();
-        auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
-        if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {
-            throw std::runtime_error("oneDNN scratchpad allocation failed");
-        }
-
-        auto binary_prim = dnnl::binary(binary_pd);
-
-        std::unordered_map<int, dnnl::memory> args;
-        args.insert({DNNL_ARG_SRC_0, src0_mem});
-        args.insert({DNNL_ARG_SRC_1, src1_mem});
-        args.insert({DNNL_ARG_DST, dst_mem});
-        args.insert({DNNL_ARG_SCRATCHPAD, scratchpad_mem});
-
-        binary_prim.execute(stream, args);
-    }
-
     // Broadcast binary op: src0=[batch, features], src1=[1, features] (row vector broadcast)
     // oneDNN handles broadcasting natively via memory descriptors.
-    static void binary_broadcast_row(
+    // Returns false when the scratchpad request was declined: nothing was written to dst, so the caller
+    // falls through to its default path. true means the primitive was submitted.
+    [[nodiscard]] static bool binary_broadcast_row(
         ggml_backend_sycl_context & ctx,
         op operation,
         const void * src0,    // [batch, features] matrix
@@ -330,15 +295,16 @@ public:
         auto binary_pd = dnnl::binary::primitive_desc(
             eng, algorithm, src0_md, src1_md, dst_md, attr);
 
+        auto scratchpad_md  = binary_pd.scratchpad_desc();
+        auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
+        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_BINARY_ROW, scratchpad_mem, scratchpad_md)) {
+            return false;
+        }
+        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_BINARY_ROW);
+
         auto src0_mem = dnnl::memory(src0_md, eng, const_cast<void *>(src0));
         auto src1_mem = dnnl::memory(src1_md, eng, const_cast<void *>(src1));
         auto dst_mem  = dnnl::memory(dst_md,  eng, dst);
-
-        auto scratchpad_md  = binary_pd.scratchpad_desc();
-        auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
-        if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {
-            throw std::runtime_error("oneDNN scratchpad allocation failed");
-        }
 
         auto binary_prim = dnnl::binary(binary_pd);
 
@@ -349,98 +315,7 @@ public:
         args.insert({DNNL_ARG_SCRATCHPAD, scratchpad_mem});
 
         binary_prim.execute(stream, args);
-    }
-};
-
-//
-// DnnlReductionWrapper - Reduction operations using oneDNN
-//
-class DnnlReductionWrapper {
-public:
-    using dt = dnnl::memory::data_type;
-    using tag = dnnl::memory::format_tag;
-    using alg = dnnl::algorithm;
-
-    template<typename T>
-    static constexpr dt to_dt() {
-        if constexpr (std::is_same_v<T, float>) return dt::f32;
-        else if constexpr (std::is_same_v<T, sycl::half>) return dt::f16;
-        else static_assert(sizeof(T) == 0, "Unsupported type");
-    }
-
-    // Supported reduction operations
-    enum class op {
-        SUM,        // sum of elements
-        MEAN,       // mean of elements
-        MAX,        // max element
-        MIN,        // min element
-        SUM_SQ,     // sum of squares
-        NORM_LP_1,  // L1 norm
-        NORM_LP_2   // L2 norm
-    };
-
-    // Map our op enum to oneDNN algorithm
-    static alg to_dnnl_algorithm(op operation) {
-        switch (operation) {
-            case op::SUM:       return alg::reduction_sum;
-            case op::MEAN:      return alg::reduction_mean;
-            case op::MAX:       return alg::reduction_max;
-            case op::MIN:       return alg::reduction_min;
-            case op::SUM_SQ:    return alg::reduction_mul;  // Need custom
-            case op::NORM_LP_1: return alg::reduction_norm_lp_sum;
-            case op::NORM_LP_2: return alg::reduction_norm_lp_power_p_sum;
-            default:            return alg::reduction_sum;
-        }
-    }
-
-    // Reduce along the last dimension
-    // Input: [batch, features], Output: [batch, 1]
-    static void reduce_last_dim(
-        ggml_backend_sycl_context & ctx,
-        op operation,
-        const void * src,
-        void * dst,
-        int64_t batch,
-        int64_t features,
-        dt data_type,
-        const queue_ptr & q)
-    {
-        auto stream = ctx.stream_dnnl(q);
-        auto eng = ctx.engine_dnnl(q);
-
-        dnnl::memory::dims src_dims = {batch, features};
-        dnnl::memory::dims dst_dims = {batch, 1};
-
-        auto src_md = dnnl::memory::desc(src_dims, data_type, tag::ab);
-        auto dst_md = dnnl::memory::desc(dst_dims, data_type, tag::ab);
-
-        dnnl::primitive_attr attr;
-        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
-
-        alg algorithm = to_dnnl_algorithm(operation);
-        float p = (operation == op::NORM_LP_2) ? 2.0f : 1.0f;
-        float eps = 0.0f;
-
-        auto reduction_pd = dnnl::reduction::primitive_desc(
-            eng, algorithm, src_md, dst_md, p, eps, attr);
-
-        auto src_mem = dnnl::memory(src_md, eng, const_cast<void*>(src));
-        auto dst_mem = dnnl::memory(dst_md, eng, dst);
-
-        auto scratchpad_md = reduction_pd.scratchpad_desc();
-        auto scratchpad_mem = ctx.get_scratchpad_mem(scratchpad_md, eng, q);
-        if (scratchpad_mem.get(true) == nullptr && scratchpad_md.get_size() > 0) {
-            throw std::runtime_error("oneDNN scratchpad allocation failed");
-        }
-
-        auto reduction_prim = dnnl::reduction(reduction_pd);
-
-        std::unordered_map<int, dnnl::memory> args;
-        args.insert({DNNL_ARG_SRC, src_mem});
-        args.insert({DNNL_ARG_DST, dst_mem});
-        args.insert({DNNL_ARG_SCRATCHPAD, scratchpad_mem});
-
-        reduction_prim.execute(stream, args);
+        return true;
     }
 };
 

@@ -798,6 +798,108 @@ static void test_tier_manager_swa_full_false_unchanged() {
                g_log.find("[KV-TIER] per-layer KV truth") == std::string::npos);
 }
 
+// kv_layer_bytes_for_kind() as it stood before it was routed through the one
+// byte function (kv_layer_cells() and kv_layer_tensor_bytes(),
+// kv-runtime-demotion.hpp), copied verbatim: the delegation must keep every
+// result of it.
+static size_t legacy_kv_layer_bytes_for_kind(uint8_t  kind,
+                                             uint32_t k_width,
+                                             uint32_t v_width,
+                                             uint32_t n_ctx,
+                                             uint32_t n_swa,
+                                             uint32_t n_ubatch,
+                                             uint32_t n_seq_max,
+                                             bool     kv_unified,
+                                             bool     swa_full) {
+    if (kind == GGML_SYCL_KV_LAYER_SHARED) {
+        return 0;
+    }
+    if (kind == GGML_SYCL_KV_LAYER_SWA && !swa_full) {
+        if (n_swa == 0) {
+            return 0;
+        }
+        const uint32_t seqs = n_seq_max > 0 ? n_seq_max : 1;
+        uint32_t       n_ctx_seq;
+        uint32_t       n_stream;
+        uint32_t       window_seqs;
+        if (kv_unified) {
+            n_ctx_seq   = n_ctx;
+            n_stream    = 1;
+            window_seqs = seqs;
+        } else {
+            n_ctx_seq   = GGML_PAD(n_ctx / seqs, 256);
+            n_stream    = seqs;
+            window_seqs = 1;
+        }
+        const uint32_t swa_cells_per_stream = GGML_PAD(std::min(n_ctx_seq, n_swa * window_seqs + n_ubatch), 256);
+        const uint32_t swa_cells            = swa_cells_per_stream * n_stream;
+        return static_cast<size_t>(swa_cells) * static_cast<size_t>(k_width + v_width) * sizeof(ggml_fp16_t);
+    }
+    return static_cast<size_t>(n_ctx) * static_cast<size_t>(k_width + v_width) * sizeof(ggml_fp16_t);
+}
+
+static size_t real_row_size(int32_t type, int64_t n_elements) {
+    return ggml_row_size(static_cast<ggml_type>(type), n_elements);
+}
+
+// kv_layer_bytes_for_kind() keeps its exact results, now computed through the one
+// byte function: every kind, every SWA mode (per-stream, unified, swa_full, no
+// window), n_seq_max 0 to 32, n_ctx to 262144, awkward n_ctx values (not a multiple of n_seq_max or
+// of 256), homogeneous, heterogeneous, MLA (no V) and zero widths.
+static void test_kv_layer_bytes_for_kind_keeps_its_results() {
+    const uint8_t  kinds[]     = { GGML_SYCL_KV_LAYER_FULL, GGML_SYCL_KV_LAYER_SWA, GGML_SYCL_KV_LAYER_SHARED, 7 };
+    const uint32_t n_ctxs[]    = { 1, 256, 1000, 4096, 4097, 8192, 65536, 131072, 262144 };
+    const uint32_t n_swas[]    = { 0, 1, 128, 512, 1024, 4096 };
+    const uint32_t n_ubs[]     = { 1, 128, 512, 1024, 2048 };
+    const uint32_t n_seqs[]    = { 0, 1, 2, 3, 4, 8, 16, 32 };
+    const uint32_t widths[][2] = {
+        { 512,  512  },
+        { 1024, 1024 },
+        { 1024, 512  },
+        { 96,   160  },
+        { 0,    0    },
+        { 256,  0    },
+        { 0,    256  }
+    };
+    size_t n_cmp   = 0;
+    size_t n_diff  = 0;
+    size_t n_cells = 0;
+    for (uint8_t kind : kinds) {
+        for (uint32_t n_ctx : n_ctxs) {
+            for (uint32_t n_swa : n_swas) {
+                for (uint32_t n_ub : n_ubs) {
+                    for (uint32_t n_seq : n_seqs) {
+                        for (int mode = 0; mode < 4; ++mode) {
+                            const bool kv_unified = (mode & 1) != 0;
+                            const bool swa_full   = (mode & 2) != 0;
+                            for (const auto & w : widths) {
+                                const size_t want = legacy_kv_layer_bytes_for_kind(kind, w[0], w[1], n_ctx, n_swa, n_ub,
+                                                                                   n_seq, kv_unified, swa_full);
+                                const size_t got  = ggml_sycl::kv_layer_bytes_for_kind(
+                                    kind, w[0], w[1], n_ctx, n_swa, n_ub, n_seq, kv_unified, swa_full);
+                                n_cmp++;
+                                n_diff += got != want;
+                                // The one byte function, called with the real ggml row size, agrees too.
+                                ggml_sycl::kv_layer_desc layer;
+                                layer.n_embd_k_gqa = w[0];
+                                layer.n_embd_v_gqa = w[1];
+                                layer.has_kv       = 1;
+                                const size_t cells =
+                                    ggml_sycl::kv_layer_cells(kind, n_ctx, n_ub, n_seq, kv_unified, swa_full, n_swa);
+                                n_cells += ggml_sycl::kv_layer_tensor_bytes(layer, GGML_TYPE_F16, GGML_TYPE_F16, cells,
+                                                                            1, real_row_size) != want;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    check_true("kv_layer_bytes_for_kind compared against the pre-change formula on a real sweep", n_cmp > 100000);
+    check_eq("kv_layer_bytes_for_kind results that differ from the pre-change formula", n_diff, 0);
+    check_eq("kv_layer_tensor_bytes (f16, unpadded, ggml_row_size) results that differ", n_cells, 0);
+}
+
 int main() {
     // Hermetic: GGML_SYCL_KV_HOT_LAYERS short-circuits configure_from_plan()
     // before any per-layer sizing, so a stray value in the environment would
@@ -820,6 +922,9 @@ int main() {
     test_aggregate_uses_n_seq_max_and_kv_unified();
     test_fallback_without_per_layer_arrays();
     test_plan_kv_size_for_layer_matches_kv_info();
+
+    printf("=== kv_layer_bytes_for_kind keeps its results through the one byte function (llama.cpp-moua) ===\n");
+    test_kv_layer_bytes_for_kind_keeps_its_results();
 
     printf("=== kv_tier_manager consumes the plan's per-layer sizes (llama.cpp-7yv9) ===\n");
     test_tier_manager_sizes_layers_from_plan_truth();

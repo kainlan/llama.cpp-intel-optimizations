@@ -8,6 +8,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-load-measure.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -2739,6 +2740,29 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
+    if (sycl_model_backend) {
+        // (c) the late measure: the final placement's compute term, over stand-ins for the weights
+        // that are not yet allocated, handed to the backend to compare with the term it admitted.
+        // Inert until the backend exports the L4 entry points; a refusal is the load's.
+        std::vector<llama_measure_dummy_entry> late_weights;
+        for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+            late_weights.push_back({ ctx_key.buft, ctx_ptr.get() });
+        }
+        const llama_late_check_result late = llama_load_late_check(
+            *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, late_weights);
+        if (!late.unsupported.empty()) {
+            // not a refusal of the load: this model cannot be measured, so it goes on the unplanned path
+            LLAMA_LOG_WARN("%s: late compute-slot check skipped, the load continues on the unplanned path: %s\n",
+                           __func__, late.unsupported.c_str());
+        }
+        for (const int32_t device : late.not_recorded) {
+            // nothing was compared for this device, which is not a pass
+            LLAMA_LOG_WARN("%s: %s\n", __func__, llama_late_check_not_recorded_text(device, late.n_ubatch).c_str());
+        }
+        if (!late.refusal.empty()) {
+            throw std::runtime_error(late.refusal);
+        }
+    }
     if (sycl_model_backend && ml.use_mmap) {
         LLAMA_LOG_INFO("%s: disabling mmap for SYCL weight layout upload\n", __func__);
         ml.use_mmap = false;
@@ -3224,6 +3248,10 @@ ggml_backend_dev_t llama_model::dev_layer(int il) const {
     return pimpl->dev_layer.at(il).dev;
 }
 
+bool llama_model::dev_layer_is_sycl(int il) const {
+    return llama_model_dev_is_sycl(dev_layer(il));
+}
+
 ggml_backend_dev_t llama_model::dev_output() const {
     return pimpl->dev_output.dev;
 }
@@ -3317,8 +3345,19 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
-llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
-    llama_memory_i * res;
+llama_memory_policy llama_model::memory_policy(const llama_memory_params & params, const llama_cparams & cparams) const {
+    llama_memory_policy pol;
+
+    // Every callback below captures the model (`this`) and nothing of the arguments, so the policy
+    // outlives this call.
+
+    if (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) {
+        // DSV4 DSpark stages store a single MLA-style K per position (window = the draft ring)
+        GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+
+        pol.kind = LLAMA_MEMORY_KIND_ISWA;
+        return pol;
+    }
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the
@@ -3338,29 +3377,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
             {
-                res = nullptr;
+                pol.kind = LLAMA_MEMORY_KIND_NONE;
             } break;
         case LLM_ARCH_MINIMAX_M3:
             {
                 // sparse (MSA) layers carry an indexer key cache, but leading dense layers do not
-                llama_kv_cache::layer_filter_cb filter_idx =
-                    [&](int32_t il) { return (uint32_t) il >= hparams.n_layer_dense_lead; };
-
-                res = new llama_kv_cache_msa(
-                        *this,
-                        params.type_k,
-                        params.type_v,
-                        !cparams.flash_attn,
-                        cparams.offload_kqv,
-                        cparams.kv_unified,
-                        cparams.n_ctx_seq,
-                        cparams.n_seq_max,
-                        1,
-                        hparams.n_swa,
-                        hparams.swa_type,
-                        nullptr,
-                        filter_idx,
-                        nullptr);
+                pol.kind       = LLAMA_MEMORY_KIND_MSA;
+                pol.filter_idx = [this](int32_t il) { return (uint32_t) il >= hparams.n_layer_dense_lead; };
             } break;
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
@@ -3369,92 +3392,29 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // The NextN/MTP draft head runs dense MLA (no DSA indexer), so the
                     // MTP context uses a plain attention KV cache holding only the
                     // nextn layer(s) - same pattern as the hybrid Qwen3.5 MTP context.
-                    llama_kv_cache::layer_filter_cb filter =
-                        [&](uint32_t il) { return il >= hparams.n_layer(); };
-
-                    res = new llama_kv_cache(
-                            *this,
-                            hparams,
-                            params.type_k,
-                            params.type_v,
-                            !cparams.flash_attn,
-                            cparams.offload_kqv,
-                            cparams.kv_unified,
-                            cparams.n_ctx_seq,
-                            cparams.n_seq_max,
-                            1,
-                            hparams.n_swa,
-                            hparams.swa_type,
-                            nullptr,
-                            filter,
-                            nullptr,
-                            nullptr);
+                    pol.kind   = LLAMA_MEMORY_KIND_KV;
+                    pol.filter = [this](int32_t il) { return (uint32_t) il >= hparams.n_layer(); };
                 } else {
                     // Main context: DSA cache for the trunk layers only - the nextn
                     // layer(s) are never attended by the trunk graph.
-                    llama_kv_cache::layer_filter_cb filter_mla = nullptr;
+                    pol.kind = LLAMA_MEMORY_KIND_DSA;
                     if (hparams.n_layer_nextn > 0) {
-                        filter_mla = [&](uint32_t il) { return il < hparams.n_layer(); };
+                        pol.filter = [this](int32_t il) { return (uint32_t) il < hparams.n_layer(); };
                     }
-                    llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il < hparams.n_layer() && (arch != LLM_ARCH_GLM_DSA || hparams.is_indexer_full(il)); };
-
-                    res = new llama_kv_cache_dsa(
-                            *this,
-                            params.type_k,
-                            params.type_v,
-                            !cparams.flash_attn,
-                            cparams.offload_kqv,
-                            cparams.kv_unified,
-                            cparams.n_ctx_seq,
-                            cparams.n_seq_max,
-                            1,
-                            hparams.n_swa,
-                            hparams.swa_type,
-                            filter_mla,
-                            filter_lid,
-                            nullptr);
+                    pol.filter_aux = [this](int32_t il) {
+                        return (uint32_t) il < hparams.n_layer() && (arch != LLM_ARCH_GLM_DSA || hparams.is_indexer_full(il));
+                    };
                 }
             } break;
         case LLM_ARCH_HY_V4:
             {
                 if (hparams.indexer_top_k == 0) {
                     // full-attention checkpoint: no indexer, so no indexer key cache
-                    res = new llama_kv_cache(
-                            *this,
-                            hparams,
-                            params.type_k,
-                            params.type_v,
-                            !cparams.flash_attn,
-                            cparams.offload_kqv,
-                            cparams.kv_unified,
-                            cparams.n_ctx_seq,
-                            cparams.n_seq_max,
-                            1,
-                            hparams.n_swa,
-                            hparams.swa_type,
-                            nullptr,
-                            nullptr,
-                            nullptr,
-                            nullptr);
+                    pol.kind = LLAMA_MEMORY_KIND_KV;
                 } else {
                     // only "full" layers own an indexer, so the shared layers need no indexer cache
-                    llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return hparams.is_indexer_full(il); };
-
-                    res = new llama_kv_cache_dsa(
-                            *this,
-                            params.type_k,
-                            params.type_v,
-                            !cparams.flash_attn,
-                            cparams.offload_kqv,
-                            cparams.kv_unified,
-                            cparams.n_ctx_seq,
-                            cparams.n_seq_max,
-                            1,
-                            hparams.n_swa,
-                            hparams.swa_type,
-                            nullptr,
-                            filter_lid,
-                            nullptr);
+                    pol.kind       = LLAMA_MEMORY_KIND_DSA;
+                    pol.filter_aux = [this](int32_t il) { return hparams.is_indexer_full(il); };
                 }
             } break;
         case LLM_ARCH_DOTS3NOTE:
@@ -3463,49 +3423,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                 if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
                     // MTP draft context: plain attention KV cache holding only the nextn layer
-                    llama_kv_cache::layer_filter_cb filter =
-                        [&](uint32_t il) { return il >= hparams.n_layer(); };
-
-                    res = new llama_kv_cache(
-                            *this,
-                            hparams,
-                            params.type_k,
-                            params.type_v,
-                            !cparams.flash_attn,
-                            cparams.offload_kqv,
-                            cparams.kv_unified,
-                            cparams.n_ctx_seq,
-                            cparams.n_seq_max,
-                            1,
-                            hparams.n_swa,
-                            hparams.swa_type,
-                            nullptr,
-                            filter,
-                            nullptr,
-                            nullptr);
+                    pol.kind   = LLAMA_MEMORY_KIND_KV;
+                    pol.filter = [this](int32_t il) { return (uint32_t) il >= hparams.n_layer(); };
                 } else {
                     // main context: DSA cache for the trunk full-attention layers plus a window-sized SWA cache
-                    llama_kv_cache::layer_filter_cb filter_mla = nullptr;
+                    pol.kind = LLAMA_MEMORY_KIND_DSA_ISWA;
                     if (hparams.n_layer_nextn > 0) {
-                        filter_mla = [&](uint32_t il) { return il < hparams.n_layer(); };
+                        pol.filter = [this](int32_t il) { return (uint32_t) il < hparams.n_layer(); };
                     }
-                    llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il < hparams.n_layer() && hparams.is_indexer_full(il); };
-
-                    res = new llama_kv_cache_dsa_iswa(
-                            *this,
-                            params.type_k,
-                            params.type_v,
-                            !cparams.flash_attn,
-                            cparams.offload_kqv,
-                            params.swa_full,
-                            cparams.kv_unified,
-                            cparams.n_ctx_seq,
-                            cparams.n_seq_max,
-                            cparams.n_ubatch,
-                            1,
-                            filter_mla,
-                            filter_lid,
-                            nullptr);
+                    pol.filter_aux = [this](int32_t il) {
+                        return (uint32_t) il < hparams.n_layer() && hparams.is_indexer_full(il);
+                    };
                 }
             } break;
         case LLM_ARCH_DEEPSEEK4:
@@ -3513,70 +3441,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
                 if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-                    const llama_memory_i::layer_filter_cb filter_mtp = [&](int32_t il) {
-                        return il >= (int32_t) hparams.n_layer();
-                    };
-
-                    res = new llama_kv_cache_iswa(
-                            *this,
-                            params.type_k,
-                            params.type_v,
-                            !cparams.flash_attn,
-                            cparams.offload_kqv,
-                            params.swa_full,
-                            cparams.kv_unified,
-                            cparams.n_ctx_seq,
-                            cparams.n_seq_max,
-                            cparams.n_ubatch,
-                            1,
-                            nullptr,
-                            filter_mtp,
-                            nullptr,
-                            nullptr);
+                    pol.kind   = LLAMA_MEMORY_KIND_ISWA;
+                    pol.filter = [this](int32_t il) { return il >= (int32_t) hparams.n_layer(); };
                 } else {
-                    res = new llama_kv_cache_dsv4(
-                            *this,
-                            params.type_k,
-                            params.type_v,
-                            !cparams.flash_attn,
-                            cparams.offload_kqv,
-                            params.swa_full,
-                            cparams.kv_unified,
-                            cparams.n_ctx_seq,
-                            cparams.n_seq_max,
-                            cparams.n_ubatch,
-                            1,
-                            cparams.n_rs_seq,
-                            nullptr,
-                            nullptr);
+                    pol.kind = LLAMA_MEMORY_KIND_DSV4;
                 }
             } break;
-        case LLM_ARCH_DFLASH:
-            {
-                // DSV4 DSpark stages store a single MLA-style K per position (window = the draft ring)
-                if (hparams.dsv4_hc_mult > 0) {
-                    GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
-
-                    res = new llama_kv_cache_iswa(
-                            *this,
-                            params.type_k,
-                            params.type_v,
-                            !cparams.flash_attn,
-                            cparams.offload_kqv,
-                            params.swa_full,
-                            cparams.kv_unified,
-                            cparams.n_ctx_seq,
-                            cparams.n_seq_max,
-                            cparams.n_ubatch,
-                            1,
-                            nullptr,
-                            nullptr,
-                            nullptr,
-                            nullptr);
-                    break;
-                }
-            }
-            [[fallthrough]];
         // Models that need standard caching should rely on recurrent/hybrid
         // checks
         default:
@@ -3591,46 +3461,38 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
 
                 if (llm_arch_is_recurrent(arch)) {
-                    res = new llama_memory_recurrent(
-                            *this,
-                            GGML_TYPE_F32,
-                            GGML_TYPE_F32,
-                            cparams.offload_kqv,
-                            std::max((uint32_t) 1, cparams.n_seq_max),
-                            cparams.n_seq_max,
-                            cparams.n_rs_seq,
-                            nullptr);
+                    pol.kind = LLAMA_MEMORY_KIND_RECURRENT;
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                     // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
-                    llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
-                    llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
+                    llama_memory_i::layer_filter_cb filter_attn = [this](int32_t il) { return !hparams.is_recr(il); };
+                    llama_memory_i::layer_filter_cb filter_recr = [this](int32_t il) { return hparams.is_recr(il); };
                     // only the sparse-attention architectures use llama_memory_hybrid_idx
                     // a null filter_idx means the GGUF has no indexer tensors
-                    llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
+                    llama_memory_i::layer_filter_cb filter_idx  = nullptr;
                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
                     if (arch == LLM_ARCH_FALCON_H1) {
-                        filter_attn = [&](uint32_t) { return true; };
-                        filter_recr = [&](uint32_t) { return true; };
+                        filter_attn = [](int32_t) { return true; };
+                        filter_recr = [](int32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
-                        filter_attn = [&](uint32_t il) {
+                        filter_attn = [this](int32_t il) {
                             return !hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
-                        filter_recr = [&](uint32_t il) {
+                        filter_recr = [this](int32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
-                        filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                        filter_attn = [this](int32_t il) {
+                            return (uint32_t) il < hparams.n_layer() && !hparams.is_recr(il);
                         };
-                        filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
+                        filter_recr = [this](int32_t il) {
+                            return (uint32_t) il < hparams.n_layer() && hparams.is_recr(il);
                         };
 
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
                             // QSA runs on the dense-attention layers only
-                            filter_idx = [&](uint32_t il) {
-                                return il < hparams.n_layer() && !hparams.is_recr(il);
+                            filter_idx = [this](int32_t il) {
+                                return (uint32_t) il < hparams.n_layer() && !hparams.is_recr(il);
                             };
                         }
 
@@ -3644,106 +3506,58 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
-                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-                        // Use hybrid-iswa for hybrid models with SWA
-                        res = new llama_memory_hybrid_iswa(
-                            /* model             */ *this,
-                            /* attn_type_k       */ params.type_k,
-                            /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_swa_full     */ params.swa_full,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
-                            /* attn_n_ubatch     */ cparams.n_ubatch,
-                            /* attn_n_pad        */ 1,
-                            /* recurrent_type_r  */ GGML_TYPE_F32,
-                            /* recurrent_type_s  */ GGML_TYPE_F32,
-                            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
-                            /* n_seq_max         */ cparams.n_seq_max,
-                            /* n_rs_seq          */ cparams.n_rs_seq,
-                            /* offload           */ cparams.offload_kqv,
-                            /* unified           */ cparams.kv_unified,
-                            /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
-                    } else if (needs_mem_idx) {
-                        // sparse attention over a per-token indexer cache, in its own memory type
-                        res = new llama_memory_hybrid_idx(
-                            /* model             */ *this,
-                            /* attn_type_k       */ params.type_k,
-                            /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
-                            /* attn_n_pad        */ 1,
-                            /* attn_n_swa        */ hparams.n_swa,
-                            /* attn_swa_type     */ hparams.swa_type,
-                            /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
-                            /* n_seq_max         */ cparams.n_seq_max,
-                            /* n_rs_seq          */ cparams.n_rs_seq,
-                            /* offload           */ cparams.offload_kqv,
-                            /* unified           */ cparams.kv_unified,
-                            /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr),
-                            /* filter_idx        */ std::move(filter_idx));
-                    } else {
-                        res = new llama_memory_hybrid(
-                            /* model             */ *this,
-                            /* attn_type_k       */ params.type_k,
-                            /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
-                            /* attn_n_pad        */ 1,
-                            /* attn_n_swa        */ hparams.n_swa,
-                            /* attn_swa_type     */ hparams.swa_type,
-                            /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
-                            /* n_seq_max         */ cparams.n_seq_max,
-                            /* n_rs_seq          */ cparams.n_rs_seq,
-                            /* offload           */ cparams.offload_kqv,
-                            /* unified           */ cparams.kv_unified,
-                            /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
-                    }
+                    pol.kind       = hparams.swa_type != LLAMA_SWA_TYPE_NONE ? LLAMA_MEMORY_KIND_HYBRID_ISWA :
+                                     needs_mem_idx                           ? LLAMA_MEMORY_KIND_HYBRID_IDX :
+                                                                               LLAMA_MEMORY_KIND_HYBRID;
+                    pol.filter     = std::move(filter_attn);
+                    pol.filter_aux = std::move(filter_recr);
+                    pol.filter_idx = std::move(filter_idx);
                 } else {
-                    llama_kv_cache::layer_filter_cb filter = nullptr;
-                    llama_memory_i::layer_reuse_cb reuse = nullptr;
-                    llama_kv_cache::layer_share_cb share = nullptr;
+                    llama_memory_i::layer_filter_cb filter = nullptr;
+                    llama_memory_i::layer_reuse_cb  reuse  = nullptr;
+                    llama_memory_i::layer_share_cb  share  = nullptr;
 
                     if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
-                        reuse = [&](uint32_t il) {
+                        reuse = [this](int32_t il) {
                             GGML_ASSERT(hparams.n_layer_kv_from_start >= 2);
 
-                            if (il >= (uint32_t)hparams.n_layer_kv_from_start) {
-                                return hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
+                            if ((uint32_t) il >= (uint32_t) hparams.n_layer_kv_from_start) {
+                                return (int32_t) hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
                             }
 
-                            return -1;
+                            return (int32_t) -1;
                         };
                     }
 
                     if (mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron) {
-                        filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                        filter = [this](int32_t il) { return (uint32_t) il >= hparams.n_layer(); };
                     }
 
                     // don't filter when n_layer_nextn is repurposed for a router layer the trunk attends
                     // or when a model is entirely n_layer_nextn layers and has no trunk
                     if (hparams.n_layer_nextn > 0 && hparams.n_layer() > 0 && hparams.router_layer < 0) {
                         if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-                            filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            filter = [this](int32_t il) { return (uint32_t) il >= hparams.n_layer(); };
                         } else {
-                            filter = [&](uint32_t il) { return il <  hparams.n_layer(); };
+                            filter = [this](int32_t il) { return (uint32_t) il <  hparams.n_layer(); };
                         }
                     }
+
+                    pol.filter = std::move(filter);
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
-                        if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
-                            llama_memory_t mem_other = llama_get_memory(cparams.ctx_other);
+                        pol.kind  = LLAMA_MEMORY_KIND_ISWA;
+                        pol.reuse = std::move(reuse);
 
-                            share = [&](int32_t il) {
-                                const llama_model * model_other = llama_get_model(cparams.ctx_other);
+                        if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+                            // the target model's KV cache is the source this one shares from
+                            llama_context * ctx_other = cparams.ctx_other;
+
+                            pol.mem_other = llama_get_memory(ctx_other);
+                            pol.share     = [this, ctx_other](int32_t il) {
+                                const llama_model * model_other = llama_get_model(ctx_other);
 
                                 if (hparams.is_swa(il)) {
                                     return llama_model_n_layer(model_other) - 2;
@@ -3751,64 +3565,232 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                                 return llama_model_n_layer(model_other) - 1;
                             };
-
-                            res = new llama_kv_cache_iswa(
-                                    *this,
-                                    params.type_k,
-                                    params.type_v,
-                                    !cparams.flash_attn,
-                                    cparams.offload_kqv,
-                                    params.swa_full,
-                                    cparams.kv_unified,
-                                    cparams.n_ctx_seq,
-                                    cparams.n_seq_max,
-                                    cparams.n_ubatch,
-                                    1,
-                                    mem_other,
-                                    filter,
-                                    reuse,
-                                    share);
-                        } else {
-                            res = new llama_kv_cache_iswa(
-                                    *this,
-                                    params.type_k,
-                                    params.type_v,
-                                    !cparams.flash_attn,
-                                    cparams.offload_kqv,
-                                    params.swa_full,
-                                    cparams.kv_unified,
-                                    cparams.n_ctx_seq,
-                                    cparams.n_seq_max,
-                                    cparams.n_ubatch,
-                                    1,
-                                    nullptr,
-                                    filter,
-                                    reuse,
-                                    share);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
-                        res = new llama_kv_cache(
-                                *this,
-                                hparams,
-                                params.type_k,
-                                params.type_v,
-                                !cparams.flash_attn,
-                                cparams.offload_kqv,
-                                cparams.kv_unified,
-                                cparams.n_ctx_seq,
-                                cparams.n_seq_max,
-                                1,
-                                hparams.n_swa,
-                                hparams.swa_type,
-                                nullptr,
-                                filter,
-                                nullptr,
-                                nullptr);
+                        pol.kind = LLAMA_MEMORY_KIND_KV;
                     }
                 }
             }
+    }
+
+    return pol;
+}
+
+llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams,
+                                            bool no_alloc) const {
+    const llama_memory_policy pol = memory_policy(params, cparams);
+
+    if (no_alloc) {
+        if (const char * name = llama_memory_kind_unsupported(pol.kind)) {
+            throw llama_measure_unsupported(
+                format("memory kind %s has no no_alloc form (arch %s; refused)", name, arch_name().c_str()));
+        }
+    }
+
+    llama_memory_i * res = nullptr;
+
+    switch (pol.kind) {
+        case LLAMA_MEMORY_KIND_NONE:
+            {
+                res = nullptr;
+            } break;
+        case LLAMA_MEMORY_KIND_MSA:
+            {
+                res = new llama_kv_cache_msa(
+                        *this,
+                        params.type_k,
+                        params.type_v,
+                        !cparams.flash_attn,
+                        cparams.offload_kqv,
+                        cparams.kv_unified,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max,
+                        1,
+                        hparams.n_swa,
+                        hparams.swa_type,
+                        nullptr,
+                        pol.filter_idx,
+                        nullptr);
+            } break;
+        case LLAMA_MEMORY_KIND_DSA:
+            {
+                res = new llama_kv_cache_dsa(
+                        *this,
+                        params.type_k,
+                        params.type_v,
+                        !cparams.flash_attn,
+                        cparams.offload_kqv,
+                        cparams.kv_unified,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max,
+                        1,
+                        hparams.n_swa,
+                        hparams.swa_type,
+                        pol.filter,
+                        pol.filter_aux,
+                        nullptr);
+            } break;
+        case LLAMA_MEMORY_KIND_DSA_ISWA:
+            {
+                res = new llama_kv_cache_dsa_iswa(
+                        *this,
+                        params.type_k,
+                        params.type_v,
+                        !cparams.flash_attn,
+                        cparams.offload_kqv,
+                        params.swa_full,
+                        cparams.kv_unified,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max,
+                        cparams.n_ubatch,
+                        1,
+                        pol.filter,
+                        pol.filter_aux,
+                        nullptr);
+            } break;
+        case LLAMA_MEMORY_KIND_DSV4:
+            {
+                res = new llama_kv_cache_dsv4(
+                        *this,
+                        params.type_k,
+                        params.type_v,
+                        !cparams.flash_attn,
+                        cparams.offload_kqv,
+                        params.swa_full,
+                        cparams.kv_unified,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max,
+                        cparams.n_ubatch,
+                        1,
+                        cparams.n_rs_seq,
+                        nullptr,
+                        nullptr);
+            } break;
+        case LLAMA_MEMORY_KIND_RECURRENT:
+            {
+                res = new llama_memory_recurrent(
+                        *this,
+                        GGML_TYPE_F32,
+                        GGML_TYPE_F32,
+                        cparams.offload_kqv,
+                        std::max((uint32_t) 1, cparams.n_seq_max),
+                        cparams.n_seq_max,
+                        cparams.n_rs_seq,
+                        nullptr,
+                        no_alloc);
+            } break;
+        case LLAMA_MEMORY_KIND_HYBRID_ISWA:
+            {
+                // Use hybrid-iswa for hybrid models with SWA
+                res = new llama_memory_hybrid_iswa(
+                    /* model             */ *this,
+                    /* attn_type_k       */ params.type_k,
+                    /* attn_type_v       */ params.type_v,
+                    /* attn_v_trans      */ !cparams.flash_attn,
+                    /* attn_swa_full     */ params.swa_full,
+                    /* attn_kv_size      */ cparams.n_ctx_seq,
+                    /* attn_n_ubatch     */ cparams.n_ubatch,
+                    /* attn_n_pad        */ 1,
+                    /* recurrent_type_r  */ GGML_TYPE_F32,
+                    /* recurrent_type_s  */ GGML_TYPE_F32,
+                    /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                    /* n_seq_max         */ cparams.n_seq_max,
+                    /* n_rs_seq          */ cparams.n_rs_seq,
+                    /* offload           */ cparams.offload_kqv,
+                    /* unified           */ cparams.kv_unified,
+                    /* filter_attn       */ pol.filter,
+                    /* filter_recr       */ pol.filter_aux,
+                    /* no_alloc          */ no_alloc);
+            } break;
+        case LLAMA_MEMORY_KIND_HYBRID_IDX:
+            {
+                // sparse attention over a per-token indexer cache, in its own memory type
+                res = new llama_memory_hybrid_idx(
+                    /* model             */ *this,
+                    /* attn_type_k       */ params.type_k,
+                    /* attn_type_v       */ params.type_v,
+                    /* attn_v_trans      */ !cparams.flash_attn,
+                    /* attn_kv_size      */ cparams.n_ctx_seq,
+                    /* attn_n_pad        */ 1,
+                    /* attn_n_swa        */ hparams.n_swa,
+                    /* attn_swa_type     */ hparams.swa_type,
+                    /* recurrent_type_k  */ GGML_TYPE_F32,
+                    /* recurrent_type_v  */ GGML_TYPE_F32,
+                    /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                    /* n_seq_max         */ cparams.n_seq_max,
+                    /* n_rs_seq          */ cparams.n_rs_seq,
+                    /* offload           */ cparams.offload_kqv,
+                    /* unified           */ cparams.kv_unified,
+                    /* filter_attn       */ pol.filter,
+                    /* filter_recr       */ pol.filter_aux,
+                    /* filter_idx        */ pol.filter_idx);
+            } break;
+        case LLAMA_MEMORY_KIND_HYBRID:
+            {
+                res = new llama_memory_hybrid(
+                    /* model             */ *this,
+                    /* attn_type_k       */ params.type_k,
+                    /* attn_type_v       */ params.type_v,
+                    /* attn_v_trans      */ !cparams.flash_attn,
+                    /* attn_kv_size      */ cparams.n_ctx_seq,
+                    /* attn_n_pad        */ 1,
+                    /* attn_n_swa        */ hparams.n_swa,
+                    /* attn_swa_type     */ hparams.swa_type,
+                    /* recurrent_type_k  */ GGML_TYPE_F32,
+                    /* recurrent_type_v  */ GGML_TYPE_F32,
+                    /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                    /* n_seq_max         */ cparams.n_seq_max,
+                    /* n_rs_seq          */ cparams.n_rs_seq,
+                    /* offload           */ cparams.offload_kqv,
+                    /* unified           */ cparams.kv_unified,
+                    /* filter_attn       */ pol.filter,
+                    /* filter_recr       */ pol.filter_aux,
+                    /* no_alloc          */ no_alloc);
+            } break;
+        case LLAMA_MEMORY_KIND_ISWA:
+            {
+                res = new llama_kv_cache_iswa(
+                        *this,
+                        params.type_k,
+                        params.type_v,
+                        !cparams.flash_attn,
+                        cparams.offload_kqv,
+                        params.swa_full,
+                        cparams.kv_unified,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max,
+                        cparams.n_ubatch,
+                        1,
+                        pol.mem_other,
+                        pol.filter,
+                        pol.reuse,
+                        pol.share,
+                        no_alloc);
+            } break;
+        case LLAMA_MEMORY_KIND_KV:
+            {
+                res = new llama_kv_cache(
+                        *this,
+                        hparams,
+                        params.type_k,
+                        params.type_v,
+                        !cparams.flash_attn,
+                        cparams.offload_kqv,
+                        cparams.kv_unified,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max,
+                        1,
+                        hparams.n_swa,
+                        hparams.swa_type,
+                        nullptr,
+                        pol.filter,
+                        nullptr,
+                        nullptr,
+                        "",
+                        no_alloc);
+            } break;
     }
 
     return res;

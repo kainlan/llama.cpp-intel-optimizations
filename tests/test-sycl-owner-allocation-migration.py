@@ -150,8 +150,123 @@ RUNTIME_CODE     = _blank_comments(RUNTIME)
 COMMON_CODE      = _blank_comments(COMMON)
 COMMON_IMPL_CODE = _blank_comments(COMMON_IMPL)
 
+# unified_allocate_owner( in ggml-sycl.cpp is pinned as a baseline count plus a NAMED-site list. A site that is
+# not one of the baseline runtime sites is added as one (function, reason) line in NAMED_OWNER_FIRST_SITES below,
+# never by raising the baseline: a count says nothing about WHICH site was added or why it is legitimate, and the
+# list is a plain per-line merge when two branches each add a site. The census counts the code with every named
+# function's body cut out, so the baseline stays at the reviewed 24 runtime sites. Each name must be listed once.
+# Each named function must hold exactly one owner-first allocation, refuse on failure (the `if (!allocation)` branch
+# must contain a return or throw token -- textual, so a return in a nested lambda or a string literal satisfies it --
+# or, braceless, be a return or throw statement itself; an empty one does not count), and hand the owner over only
+# through mem_handle::from_owned_alloc, with no legacy unified_alloc( / from_legacy_owned_alloc in it. A function named
+# ggml_backend_sycl_test_* is a PRIVATE_TESTING seam and must sit inside an `#if defined(GGML_SYCL_PRIVATE_TESTING)`
+# block; several hooks may share one block. A function with any other name is production code, needs no guard, and
+# is not required to have one. The next adder is the L4 lane (impl/moua-l4).
+OWNER_FIRST_BASELINE_SITES = 24
+NAMED_OWNER_FIRST_SITES = (
+    ("ggml_backend_sycl_test_park_tenant_staging",
+     "zhcn C7a (cec4a5f10): parks one host-pinned STAGING entry under a tenant cohort for the replay-only-call "
+     "test; owner-first, handed over via from_owned_alloc"),
+    ("ggml_sycl_reserve_host_tenants",
+     "moua L4 step 3c: the host tier of a context's tenants -- one owner-first carve per host slot (must_host_pinned, "
+     "pinned pool, category HOST_COMPUTE, the cohort's own name), held by the registry entry that carries the table, "
+     "so no raw pointer or side cache holds the room; refuses on failure, handed over via from_owned_alloc"),
+)
+
+
+def function_body_span(code: str, name: str):
+    """(start of the definition, end of its closing brace) of the one function `name` defined in `code`."""
+    # A definition is not a call: `if (!name(...)) {` also ends in `) {`, so a head preceded by `!` or `(` is a call.
+    heads = list(re.finditer(r"(?<![!(])\b%s\([^;{}]*\)\s*(?:noexcept\s*)?\{" % re.escape(name), code))
+    assert len(heads) == 1, "%s: expected one definition, found %d" % (name, len(heads))
+    start = heads[0].start()
+    depth, index = 0, heads[0].end() - 1
+    while True:
+        depth += (code[index] == "{") - (code[index] == "}")
+        index += 1
+        if depth == 0:
+            return start, index
+
+
+def inside_private_testing(code: str, position: int) -> bool:
+    """True when `position` sits in an `#if defined(GGML_SYCL_PRIVATE_TESTING)` / `#ifdef` block that no #else/#elif
+    has turned over: the preprocessor conditions open at that point are walked as a stack."""
+    stack = []  # [condition text, turned over by #else/#elif]
+    for line in code[:position].split("\n"):
+        directive = re.match(r"\s*#\s*(\w+)\s*(.*)", line)
+        if not directive:
+            continue
+        kind, rest = directive.group(1), " ".join(directive.group(2).split())
+        if kind in ("if", "ifdef", "ifndef"):
+            stack.append([("defined(%s)" % rest) if kind == "ifdef" else (None if kind == "ifndef" else rest), False])
+        elif kind in ("else", "elif") and stack:
+            stack[-1][1] = True
+        elif kind == "endif" and stack:
+            stack.pop()
+    return any(cond == "defined(GGML_SYCL_PRIVATE_TESTING)" and not turned for cond, turned in stack)
+
+
+def refusal_branch_refuses(body: str, start: int) -> bool:
+    """The statement `if (!allocation)` that begins at `start` in `body` refuses. Either a braced block (matched from
+    its own `{`) that contains a return or throw TOKEN, or a braceless single statement, up to its `;`, that is itself
+    a return or throw. Textual: a return inside a nested lambda or a string literal in the block also satisfies it.
+    Anything that does not parse as one of those two shapes is False, never an exception."""
+    head = re.compile(r"if\s*\(\s*!\s*allocation\s*\)\s*").match(body, start)
+    if head is None:
+        return False
+    index = head.end()
+    if index >= len(body):
+        return False
+    if body[index] == "{":
+        depth, end = 0, index
+        while end < len(body):
+            depth += (body[end] == "{") - (body[end] == "}")
+            end += 1
+            if depth == 0:
+                return re.search(r"\b(return|throw)\b", body[index:end]) is not None
+        return False
+    semicolon = body.find(";", index)
+    if semicolon < 0:
+        return False
+    return re.match(r"(return|throw)\b", body[index:semicolon]) is not None
+
+
+RUNTIME_PRODUCTION_CODE = RUNTIME_CODE
+with gate("every named owner-first site in ggml-sycl.cpp is a guarded, owner-first site"):
+    _names      = [name for name, _reason in NAMED_OWNER_FIRST_SITES]
+    _duplicates = sorted({name for name in _names if _names.count(name) > 1})
+    assert not _duplicates, "NAMED_OWNER_FIRST_SITES lists %s more than once" % ", ".join(_duplicates)
+    _spans = []
+    for _function, _reason in NAMED_OWNER_FIRST_SITES:
+        assert _reason, "%s has no reason" % _function
+        _start, _end = function_body_span(RUNTIME_CODE, _function)
+        _body = RUNTIME_CODE[_start:_end]
+        assert _body.count("unified_allocate_owner(") == 1, "%s: not exactly one owner-first allocation" % _function
+        assert "unified_alloc(" not in _body and "from_legacy_owned_alloc" not in _body, _function
+        _allocation = _body.find("unified_allocate_owner(")
+        _refused    = _body.find("if (!allocation)", max(_allocation, 0))
+        assert _refused >= 0, "%s: no `if (!allocation)` refusal after the allocation" % _function
+        _wrapped    = _body.find("from_owned_alloc(std::move(allocation.owner)", _refused)
+        assert _wrapped >= 0, "%s: the owner is not handed over via from_owned_alloc after the refusal check" % _function
+        assert _allocation < _refused < _wrapped, "%s: allocate, refuse-check, from_owned_alloc out of order" % _function
+        assert refusal_branch_refuses(_body, _refused), "%s: the `if (!allocation)` branch does not return or throw" % _function
+        if _function.startswith("ggml_backend_sycl_test_"):
+            assert inside_private_testing(RUNTIME_CODE, _start), \
+                "%s is a test seam outside GGML_SYCL_PRIVATE_TESTING" % _function
+        _spans.append((_start, _end))
+    # Cut the named bodies out of the ORIGINAL text; each name is unique, so no span is cut twice.
+    _kept, _from = [], 0
+    for _start, _end in sorted(_spans):
+        assert _start >= _from, "named owner-first functions overlap"
+        _kept.append(RUNTIME_CODE[_from:_start])
+        _from = _end
+    _kept.append(RUNTIME_CODE[_from:])
+    RUNTIME_PRODUCTION_CODE = "".join(_kept)
+    assert RUNTIME_CODE.count("unified_allocate_owner(") == \
+        RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner(") + len(_spans)
+
 for _label, _code, _pins in (
-    ("ggml-sycl.cpp", RUNTIME_CODE, (54, 42, 24)),
+    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (54, 42, OWNER_FIRST_BASELINE_SITES)),
     ("common.hpp", COMMON_CODE, (3, 4, 3)),
     ("common.cpp", COMMON_IMPL_CODE, (8, 8, 4)),
 ):
@@ -797,7 +912,9 @@ def check_segment_boundary_flush(code: str) -> list:
     # Replay: inside the recorded-segment branch, before the submission; not in the direct branch.
     call = SEG_FLUSH_CALLS["replay"]
     graphed = replay.find("if (seg.exec_graph) {")
-    submit = replay.find("stream->ext_oneapi_graph(*seg.exec_graph);")
+    # Every replay submits through ggml_sycl::graph_exec_submit (graph-recorder-scope.hpp), which counts the submission
+    # for graph_compute's exit; the holder-census gate refuses a bare ext_oneapi_graph() in ggml-sycl.cpp.
+    submit = replay.find("ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);")
     direct_branch = replay.find("} else {", graphed)
     flush = replay.find(call)
     if min(graphed, submit, direct_branch, flush) < 0:
@@ -826,7 +943,7 @@ def check_segment_boundary_flush(code: str) -> list:
     # Keyed replay: inside the recorded-segment branch, before the submission; the direct run follows `continue;`.
     call = SEG_FLUSH_CALLS["keyed replay"]
     graphed = keyed_replay.find("if (seg.exec_graph) {")
-    submit = keyed_replay.find("stream->ext_oneapi_graph(*seg.exec_graph);")
+    submit = keyed_replay.find("ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);")
     leave = keyed_replay.find("continue;", graphed)
     flush = keyed_replay.find(call)
     if min(graphed, submit, leave, flush) < 0:
@@ -846,7 +963,7 @@ with gate('segment-boundary-flush'):
     _pcall = SEG_FLUSH_CALLS["replay"]
     _kcall = SEG_FLUSH_CALLS["keyed record"]
     _record_flush = "        " + _rcall + "\n        const size_t retained_baseline"
-    _replay_flush = "                " + _pcall + "\n                stream->ext_oneapi_graph(*seg.exec_graph);"
+    _replay_flush = "                " + _pcall + "\n                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);"
     # The legacy replay is the first of the two replay sites; the keyed replay is the second.
     assert RUNTIME_CODE.count(_record_flush) == 1 and RUNTIME_CODE.count(_replay_flush) == 2
     _begin = "            seg_graph.begin_recording(*stream);\n"
@@ -875,9 +992,9 @@ with gate('segment-boundary-flush'):
             .replace(_begin, _begin + "            " + _rcall + "\n"),
         "record flush covers the wrong nodes": RUNTIME_CODE.replace(
             _rcall, _rcall.replace("seg.start, seg.end", "seg.start, seg.start + 1"), 1),
-        "replay flush dropped": RUNTIME_CODE.replace(_replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);", 1),
+        "replay flush dropped": RUNTIME_CODE.replace(_replay_flush, "                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);", 1),
         "replay flush after the submission": RUNTIME_CODE.replace(
-            _replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);\n                " + _pcall, 1),
+            _replay_flush, "                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);\n                " + _pcall, 1),
         "keyed record flush dropped": _in_keyed(_keyed_record, _keyed_flush, ""),
         "keyed record flush inside the recording": RUNTIME_CODE.replace(
             _keyed_record, _keyed_record.replace(_keyed_flush, "", 1).replace(
@@ -885,9 +1002,9 @@ with gate('segment-boundary-flush'):
         "keyed record flush covers another segment": _in_keyed(
             _keyed_record, _kcall, _kcall.replace("item.start, item.end", "0, item.end")),
         "keyed replay flush dropped": _in_keyed(
-            _keyed_replay, _replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);"),
+            _keyed_replay, _replay_flush, "                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);"),
         "keyed replay flush after the submission": _in_keyed(
-            _keyed_replay, _replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);\n                " + _pcall),
+            _keyed_replay, _replay_flush, "                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);\n                " + _pcall),
         "attention slot not checked": _in_helper("        flush_pending_attn_if_consumed(node, device);\n", ""),
         "CPU scatter slots not checked": _in_helper("        flush_pending_cpu_scatter_if_consumed(node, device);\n", ""),
         "helper walks the whole graph": _in_helper("for (int i = start; i < end; ++i) {",
@@ -1205,10 +1322,10 @@ def check_keyed_q8_cache(code: str) -> list:
     if inv not in body or "dispatch_direct(item.start, item.end);" not in body or \
             body.find(inv) > body.find("dispatch_direct(item.start, item.end);"):
         problems.append("record: a failed recording runs directly on the recording's Q8 entries")
-    submit = record.find("stream->ext_oneapi_graph(*slot.segments.back().exec_graph);")
+    submit = record.find("ggml_sycl::graph_exec_submit(*stream, *slot.segments.back().exec_graph);")
     if submit < 0 or record.find(inv, submit) < 0:
         problems.append("record: the submitted segment's Q8 rewrite is not invalidated")
-    rsub = replay.find("stream->ext_oneapi_graph(*seg.exec_graph);")
+    rsub = replay.find("ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);")
     rcont = replay.find("continue;", rsub)
     if rsub < 0 or rcont < 0 or inv not in replay[rsub:rcont]:
         problems.append("replay: a replayed segment's Q8 rewrite is not invalidated")

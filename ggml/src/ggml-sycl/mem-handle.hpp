@@ -61,6 +61,15 @@ class alloc_owner {
     release_attempt reset() noexcept;
     class shared_alloc_owner into_shared() && noexcept;
 
+    // Tags the allocation as a context tenant of the named cohort (a string
+    // literal or other externally-owned stable string).  The tag lives on the
+    // intrusive control, so every copy and slice of the handle reads the same
+    // one through mem_handle::tenant_cohort().  Set by the tenant carve before
+    // the owner is shared, and only once: a second set with any cohort aborts
+    // ("[TENANT] allocation already tagged"), and a null cohort is ignored.
+    // Null (the default) means "not a tenant".
+    void set_tenant_cohort(const char * cohort) noexcept;
+
   private:
     friend struct allocation_owner_internal_access;
     explicit alloc_owner(alloc_owner_control * control) noexcept : control_(control) {}
@@ -83,6 +92,7 @@ class shared_alloc_owner {
     const alloc_metadata & metadata() const noexcept;
     uint32_t use_count() const noexcept;
     uint64_t control_id() const noexcept;
+    const char *           tenant_cohort() const noexcept;
     release_attempt reset() noexcept;
 
   private:
@@ -263,6 +273,42 @@ class mem_handle_lock_guard {
 
   private:
     const mem_handle_spin_lock & lock_;
+};
+
+// A plain-value name for "this slice of that allocation", for caches that only
+// ever compare a source and must not keep it alive.  It holds no control, so a
+// cache keyed on it is never a holder of the allocation.  An owning handle held
+// only to compare identity is a holder to fix, not to exempt.
+//
+// It is built only from the allocator's monotonic retention id
+// (unified_cache_mint_retention_identity(): never an address, never reused, and
+// fail-closed on exhaustion), so a freed and reallocated source misses even at
+// the same address.  Valid iff allocation_id != 0; a handle with no allocator id
+// (a weight, an external pointer) yields an invalid identity, which a cache
+// treats as "do not cache".
+struct mem_handle_identity {
+    uint64_t allocation_id = 0;
+    uint64_t generation    = 0;
+    size_t   slice_offset  = 0;
+    size_t   size          = 0;
+
+    bool valid() const noexcept { return allocation_id != 0; }
+
+    // An invalid identity equals nothing, itself included.
+    friend bool operator==(const mem_handle_identity & a, const mem_handle_identity & b) noexcept {
+        return a.valid() && b.valid() && a.allocation_id == b.allocation_id && a.generation == b.generation &&
+               a.slice_offset == b.slice_offset && a.size == b.size;
+    }
+
+    friend bool operator!=(const mem_handle_identity & a, const mem_handle_identity & b) noexcept { return !(a == b); }
+
+    size_t hash() const noexcept {
+        size_t h = std::hash<uint64_t>()(allocation_id);
+        h ^= std::hash<uint64_t>()(generation) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<size_t>()(slice_offset) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<size_t>()(size) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
 };
 
 class mem_handle {
@@ -447,6 +493,13 @@ class mem_handle {
         return static_cast<bool>(owned_alloc_);
     }
 
+    // Read-only snapshot of how many references share this handle's intrusive
+    // allocation owner: every mem_handle copy, assignment and slice of it (all
+    // three copy owned_alloc_). 0 means the handle carries no intrusive owner,
+    // which says nothing about whether anyone else holds the storage.
+    // Never a release decision: release happens only through a handle.
+    uint32_t owner_use_count() const noexcept;
+
     // Identity of the allocation owner control this handle retains: the one
     // from_owned_alloc() adopted, shared by every copy and slice of it. It is
     // minted once per control and never reused, so it cannot name a later
@@ -507,6 +560,19 @@ class mem_handle {
     // True when stable_identity_hash()/stable_identity_equal() are backed by a
     // unified-cache/allocator identity rather than a raw external pointer.
     bool has_stable_owner_identity() const;
+
+    // The non-owning identity of this handle's slice (see mem_handle_identity).
+    // Invalid when the handle carries no allocator-minted id.
+    mem_handle_identity identity() const;
+
+    // True when `id` is valid and names exactly this handle's slice.  Compares
+    // the four fields only: no control is held and no pointer is resolved.
+    bool identity_equal(const mem_handle_identity & id) const;
+
+    // The cohort the tenant carve tagged this allocation with, or null when it
+    // is not a context tenant (or the handle has no owner).  Every copy and
+    // slice of a tenant reads the tag of its shared control.
+    const char * tenant_cohort() const;
 
     // Lightweight debug metadata for diagnostics.  Owner tags are expected to
     // be string literals or other externally-owned stable strings; mem_handle
