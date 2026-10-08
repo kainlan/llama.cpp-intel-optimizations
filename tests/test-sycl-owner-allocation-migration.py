@@ -638,6 +638,15 @@ with gate('futile-context-direct'):
                               ("each MUL_MAT_ID's expert storage generation", r"residency\.mix\(in\.storage_generation\);")):
             if not re.search(pattern, decide):
                 problems.append("the probe's residency leaves out %s, so a spent probe survives its change" % what)
+        # And nothing else: a per-call value mixed in (a clock, the cgraph address) re-opens every probe on every call,
+        # which is the per-call policy scan the memo exists to stop. The hasher is fed exactly these three inputs,
+        # in this order, and read once.
+        uses = re.findall(r"\bresidency\.(\w+)\(([^;]*)\);", decide)
+        if uses != [("mix", "g_moe_prompt_epoch.load(std::memory_order_acquire)"), ("mix", "in.replan_epoch"),
+                    ("mix", "in.storage_generation"), ("value", "")] or \
+                len(re.findall(r"\bresidency\b", decide)) != 6:
+            problems.append("the probe's residency mixes something besides the prompt epoch, the replan epoch and the "
+                            "storage generations, so a per-call value can re-open every probe on every call")
         return problems
 
     assert not keyed_reachable_problems(RUNTIME_CODE), keyed_reachable_problems(RUNTIME_CODE)
@@ -669,6 +678,15 @@ with gate('futile-context-direct'):
             ("the memo survives a storage change", _decide, "residency.mix(in.storage_generation);", ""),
             ("the memo survives a replan", _decide, "residency.mix(in.replan_epoch);", ""),
             ("the memo survives a new prompt", _decide, "residency.mix(g_moe_prompt_epoch.load(", "(void) ("),
+            ("a per-call clock re-opens every probe", _decide, "residency.mix(in.storage_generation);",
+             "residency.mix(in.storage_generation);\n        residency.mix(static_cast<uint64_t>("
+             "std::chrono::steady_clock::now().time_since_epoch().count()));"),
+            ("the cgraph address re-opens every probe", _decide, "    probe->residency = residency.value();",
+             "    residency.mix(reinterpret_cast<uintptr_t>(cgraph));\n    probe->residency = residency.value();"),
+            ("a name is mixed into the residency", _decide, "residency.mix(in.replan_epoch);",
+             "residency.mix(in.replan_epoch);\n        residency.mix_name(node->name, sizeof(node->name));"),
+            ("the residency is fed through another call", _decide, "residency.mix(in.storage_generation);",
+             "residency.mix(in.storage_generation);\n        mix_into(residency, i);"),
             ("the probe reads a stale key", _compute_fn, ", &probe_key)", ", &stale_key)"),
             ("the probe recomputes its key with a walk", _compute_fn,
              "moe_segment_keyed_reachable(sycl_ctx, probe_key, cached_is_decode)",
