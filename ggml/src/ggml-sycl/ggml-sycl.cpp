@@ -109708,9 +109708,10 @@ normal_dispatch:
         sycl_ctx->mmvq_q8_activation_cache.invalidate();
 
         // Prepare MoE pointer tables for current ids before graph recording/execution.
-        // A structural refusal is stamped on the tensor, so the entry check keeps this split direct, without
-        // rerunning the preload or logging again, until its expert residency changes; a transient failure refuses
-        // this call only. graph_preload_moe_experts() logs either. Other splits keep their graphs.
+        // A refusal stamped on the tensor makes the entry check keep this split direct, without rerunning the
+        // preload or logging again, until its expert residency changes. A structural refusal is stamped at once. A
+        // transient failure refuses this call only, until moe_graph_preload_transient_retry_cap of them in a row
+        // under unchanged residency settle the tensor as REFUSED with one INFO line. Other splits keep their graphs.
         if (!graph_preload_moe_experts(*sycl_ctx, cgraph, moe_host_tier_boundary)) {
             sycl_ctx->moe_graph_preload_refused = true;
             graph_unpin_moe_experts(sycl_ctx);
