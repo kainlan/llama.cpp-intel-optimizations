@@ -62,8 +62,9 @@
 
 struct ggml_backend_sycl_context;
 bool ggml_sycl_retire_moe_graph_epoch(ggml_backend_sycl_context * ctx) noexcept;
-// Drains the queue, then destroys every per-split segment slot (llama.cpp-7pm2 B2). False when the drain failed:
-// the slots are kept, since their graphs may still be running.
+// Drains the queue, then destroys every per-split segment slot (llama.cpp-7pm2 B2); the drain also covers the
+// one-slot segment and MoE dispatch graphs invalidate_moe_segments destroys next. False when the drain failed:
+// the slots are kept, since their graphs may still be running, and the caller keeps its graphs too.
 bool ggml_sycl_retire_moe_segment_slots(ggml_backend_sycl_context * ctx) noexcept;
 
 namespace ggml_sycl {

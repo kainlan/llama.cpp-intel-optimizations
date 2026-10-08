@@ -99439,12 +99439,14 @@ static void moe_segment_slot_refresh_inputs(ggml_backend_sycl_context *         
 
 // Destroys the slots the cache retired (evicted, invalidated or churned) once the queue that ran them has drained.
 // If the drain fails, their graphs may still run, so they are kept alive for the life of the process instead.
-static bool moe_segment_slots_drain_retired(ggml_backend_sycl_context * ctx) {
-    if (!ctx->moe_segment_slots.has_retired()) {
+// other_graphs: the caller is about to destroy other graphs this queue ran, so the drain is needed even with no
+// retired slot.
+static bool moe_segment_slots_drain_retired(ggml_backend_sycl_context * ctx, bool other_graphs = false) {
+    if (!other_graphs && !ctx->moe_segment_slots.has_retired()) {
         return true;
     }
     std::vector<ggml_backend_sycl_context::moe_segment_slot> retired   = ctx->moe_segment_slots.take_retired();
-    bool                                                     any_graph = false;
+    bool                                                     any_graph = other_graphs;
     for (const auto & slot : retired) {
         any_graph = any_graph || slot.graphed_segments > 0;
     }
@@ -99465,10 +99467,16 @@ static bool moe_segment_slots_drain_retired(ggml_backend_sycl_context * ctx) {
     return true;
 }
 
+// The caller (invalidate_moe_segments) destroys the one-slot segment graphs and MoE dispatch graphs right after
+// this returns true, so the same drain covers them: no exec graph is destroyed while a replay may still run it.
 bool ggml_sycl_retire_moe_segment_slots(ggml_backend_sycl_context * ctx) noexcept {
     try {
+        bool legacy_graphs = !ctx->moe_dispatch_graphs.empty();
+        for (const auto & seg : ctx->moe_segments) {
+            legacy_graphs = legacy_graphs || seg.exec_graph != nullptr;
+        }
         ctx->moe_segment_slots.invalidate_all();
-        return moe_segment_slots_drain_retired(ctx);
+        return moe_segment_slots_drain_retired(ctx, legacy_graphs);
     } catch (...) {
         return false;
     }

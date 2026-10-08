@@ -571,12 +571,27 @@ with gate('futile-context-direct'):
     # GGML_SYCL_DISABLE_GRAPH=1 path, decided before any of the per-call graph-policy scans run.
     compute = region(RUNTIME_CODE, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
                      "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
-    # llama.cpp-7pm2 B2: the one exception is a decode split that keyed segment slots can serve, since the futility
-    # verdict belongs to the whole-graph slot.
-    futile = re.search(r"\}\s*else if \(sycl_ctx->exec_graph_replay_futile && "
-                       r"!moe_segment_keyed_reachable\(sycl_ctx, cgraph, cached_is_decode\)\)\s*\{"
-                       r"\s*use_sycl_graph\s*=\s*false;\s*\}\s*else if \(sycl_ctx->exec_graph\)\s*\{", compute)
+    # llama.cpp-7pm2 B2: the futility verdict belongs to the whole-graph slot. A futile context takes the
+    # DISABLE_GRAPH path unless the split is a decode split that keyed segment slots serve (the context is in
+    # segmented MoE mode, moe_graph_rerecord, or this split's MUL_MAT_ID puts it there); that one exception reopens
+    # the policy pipeline below for keyed splits, by design, and keyed-segment-slots pins what it may then skip.
+    futile_arm = re.compile(r"\}\s*else if \(sycl_ctx->exec_graph_replay_futile && "
+                            r"!moe_segment_keyed_reachable\(sycl_ctx, cgraph, cached_is_decode\)\)\s*\{"
+                            r"\s*use_sycl_graph\s*=\s*false;\s*\}\s*else if \(sycl_ctx->exec_graph\)\s*\{")
+    futile = futile_arm.search(compute)
     assert futile
+    for _label, _pattern, _repl in (
+            ("the futile arm has no keyed exception (prompt and dense splits would lose it too)",
+             r"exec_graph_replay_futile && !moe_segment_keyed_reachable\(sycl_ctx, cgraph, cached_is_decode\)\) \{",
+             "exec_graph_replay_futile) {"),
+            ("the futile arm is bypassed outright", r"exec_graph_replay_futile && !moe_segment_keyed_reachable\(",
+             "exec_graph_replay_futile && !true && !moe_segment_keyed_reachable("),
+            ("a futile context still enables graphs",
+             r"(moe_segment_keyed_reachable\(sycl_ctx, cgraph, cached_is_decode\)\) \{\s*)use_sycl_graph = false;",
+             r"\1use_sycl_graph = true;")):
+        assert len(re.findall(_pattern, compute)) == 1, "control %r anchor" % _label
+        assert futile_arm.search(re.sub(_pattern, _repl, compute, count=1)) is None, \
+            "control %r was not caught" % _label
 
     def keyed_reachable_problems(code):
         body = region(code, "static bool moe_segment_keyed_reachable(", "\n}\n")
@@ -925,6 +940,68 @@ with gate('keyed-segment-slots'):
     assert check_keyed_segment_slots(_churned.sub(r"} \1", RUNTIME_CODE)), \
         "control 'churned decode takes the one-slot path' was not caught"
     print("PASS keyed-segment-slots-source-gate (%d controls caught)" % (len(controls) + 1))
+
+def check_segment_graphs_drained(code: str, common: str) -> list:
+    """llama.cpp-7pm2 B2 lifetime rule: no segment exec graph is destroyed while a replay may still run it. Retired
+    keyed slots are destroyed only after a queue wait, and invalidate_moe_segments destroys the one-slot segment and
+    MoE dispatch graphs only after the same wait succeeded (the epoch retire waits only where retention terminals
+    exist)."""
+    problems = []
+    try:
+        drain = region(code, "static bool moe_segment_slots_drain_retired(", "\n}\n")
+        retire = region(code, "bool ggml_sycl_retire_moe_segment_slots(ggml_backend_sycl_context * ctx) noexcept {",
+                        "\n}\n")
+        invalidate = region(common, "bool invalidate_moe_segments() {", "\n    }\n")
+    except ValueError as error:
+        return [str(error)]
+    if not re.search(r"if \(!other_graphs && !ctx->moe_segment_slots\.has_retired\(\)\)\s*\{\s*return true;", drain):
+        problems.append("the drain skips its wait while the caller still has graphs to destroy")
+    wait = drain.find("ggml_sycl_trace_queue_wait(")
+    gate = re.search(r"bool\s+any_graph = other_graphs;", drain)
+    skip = re.search(r"if \(!any_graph\)\s*\{\s*return true;", drain)
+    if wait < 0 or not gate or not skip or not (gate.start() < skip.start() < wait):
+        problems.append("the drain does not wait whenever a retired slot or the caller has a graph")
+    if not re.search(r"catch \(const std::exception & exc\)[\s\S]*kept->push_back\(std::move\(slot\)\);[\s\S]*"
+                     r"return false;", drain[wait:] if wait >= 0 else ""):
+        problems.append("a failed drain destroys the retired slots instead of keeping them")
+    if not (re.search(r"legacy_graphs = !ctx->moe_dispatch_graphs\.empty\(\);", retire) and
+            re.search(r"legacy_graphs = legacy_graphs \|\| seg\.exec_graph != nullptr;", retire) and
+            "return moe_segment_slots_drain_retired(ctx, legacy_graphs);" in retire):
+        problems.append("the retire does not drain for the one-slot graphs its caller destroys next")
+    order = [invalidate.find(t) for t in ("ggml_sycl_retire_moe_segment_slots(this)", "moe_segments.clear();",
+                                          "moe_dispatch_graphs.clear();")]
+    if min(order) < 0 or not (order[0] < order[1] and order[0] < order[2]):
+        problems.append("invalidate_moe_segments destroys segment graphs before the drain")
+    if not re.search(r"if \(!ggml_sycl_retire_moe_segment_slots\(this\)\)\s*\{\s*moe_graphs_disabled = true;\s*"
+                     r"return false;\s*\}", invalidate):
+        problems.append("invalidate_moe_segments destroys its graphs after a failed drain")
+    return problems
+
+
+with gate('segment-graphs-destroyed-after-drain'):
+    problems = check_segment_graphs_drained(RUNTIME_CODE, COMMON_CODE)
+    assert not problems, "\n".join(problems)
+    controls = (
+        ("drain skips for the caller's graphs", "runtime", r"if \(!other_graphs && !ctx", "if (!ctx"),
+        ("drain ignores the caller's graphs", "runtime", r"any_graph = other_graphs;", "any_graph = false;"),
+        ("retire passes no legacy graphs", "runtime", r"moe_segment_slots_drain_retired\(ctx, legacy_graphs\)",
+         "moe_segment_slots_drain_retired(ctx, false)"),
+        ("retire ignores segment graphs", "runtime", r"legacy_graphs = legacy_graphs \|\| seg\.exec_graph != nullptr;",
+         "(void) seg;"),
+        ("failed drain destroys the slots", "runtime", r"kept->push_back\(std::move\(slot\)\);", "(void) slot;"),
+        ("clear before the drain", "common",
+         r"(if \(!ggml_sycl_retire_moe_segment_slots\(this\)\))", r"moe_segments.clear();\n        \1"),
+        ("clear after a failed drain", "common",
+         r"if \(!ggml_sycl_retire_moe_segment_slots\(this\)\)\s*\{\s*moe_graphs_disabled = true;\s*return false;\s*\}",
+         "(void) ggml_sycl_retire_moe_segment_slots(this);"),
+    )
+    for label, which, pattern, repl in controls:
+        base = RUNTIME_CODE if which == "runtime" else COMMON_CODE
+        assert len(re.findall(pattern, base)) == 1, "control %r anchor" % label
+        mutated = re.sub(pattern, repl, base, count=1)
+        args = (mutated, COMMON_CODE) if which == "runtime" else (RUNTIME_CODE, mutated)
+        assert check_segment_graphs_drained(*args), "control %r was not caught" % label
+    print("PASS segment-graphs-destroyed-after-drain-source-gate (%d controls caught)" % len(controls))
 
 with gate('moe-metadata'):
     # Metadata and its derived group registry are built locally and atomically
