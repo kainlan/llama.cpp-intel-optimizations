@@ -23,8 +23,10 @@ What this file enforces, as text assertions on comment-stripped unified-cache.cp
     A registered row's handle.host_zone, the field the host counters key on, is never rewritten through the registry.
     Outside that helper a counter name may only be read (a comparison operand, a returned or copied value): assignment,
     ++/--, a reference declarator or init-capture whose type spelling contains `&`/`&&` textually, address-of, an unsubscripted array, a call
-    argument, a conditional operand outside a `return` or a plain `=` initialiser, and a return from a function or lambda
-    whose declared (leading or trailing) return type contains `&` are all refused. A row's
+    argument, a conditional operand outside a `return` or a plain `=` initialiser (and inside one only while every
+    parenthesis before the operand is closed: a parenthesised or nested conditional is refused even in a return), and a
+    return from a namespace-scope function whose header follows a column-0 `}` or the file start, or from a lambda, whose
+    declared (leading or trailing) return type contains `&` are all refused. A row's
     handle.host_zone obeys the same rule (assignment, ++/--, address-of, call argument).
 
 NOT COVERED, stated so nobody mistakes this for a proof. This is a tripwire on text, not on cost or on drift:
@@ -35,7 +37,14 @@ NOT COVERED, stated so nobody mistakes this for a proof. This is a tripwire on t
     - functions are bounded at a closing brace in column 0, which is how this file is formatted; `#if 0` blocks and raw
       string literals are not understood by the comment stripper (ordinary string and char literals are blanked before
       braces are matched);
-    - a type alias that hides the `&` (`using R = size_t &; R c = COUNTER; c = 0;`) passes;
+    - an alias or type trait that hides the `&` (`using R = size_t &; R c = COUNTER; c = 0;`,
+      `std::add_lvalue_reference_t<size_t>`) passes;
+    - a counter returned by reference from a member function (`struct S { size_t & get() { return COUNTER; } };`, its
+      static variant) or from the FIRST function after a fresh scope opener (`namespace detail { size_t & get() {...} }`)
+      passes: only functions whose header follows a column-0 `}` or the file start have their leading return type read;
+    - fail-closed: a `->` member access followed by `&` in an enclosing `if`/`while` header (`if ((p)->a & 1) { return
+      COUNTER; }`) is read as a trailing return type, so such a return from a by-value function is reported;
+    - a host_zone passed through a parenthesised callee (`(consume)(it->second.handle.host_zone)`) passes;
     - a counter or host_zone reached through a macro, a template parameter or a pointer arithmetic expression the text
       rules do not parse passes; the rules are a name-based tripwire.
 
@@ -368,7 +377,11 @@ def ternary_operand_is_read(prefix: str) -> bool:
     if stripped.startswith("return"):
         rest = stripped[len("return") :]
     else:
-        m = _PLAIN_ASSIGN.search(stripped)
+        # the initialising `=` is the first one outside every parenthesis: `f(a = 1, c ? X : y)` has none
+        m = next(
+            (m for m in _PLAIN_ASSIGN.finditer(stripped) if stripped.count("(", 0, m.start()) == stripped.count(")", 0, m.start())),
+            None,
+        )
         if m is None:
             return False
         rest = stripped[m.end() :]
@@ -504,6 +517,9 @@ def test_counters_are_written_only_by_the_count_helper():
         "bump(flag ? g_runtime_host_zone_rows[0] : other);",
         "(flag ? other : g_runtime_span_irregular_rows) = 0;",
         "size_t n = f(flag ? g_runtime_span_irregular_rows : other);",
+        "bump(a = 1, flag ? g_runtime_span_irregular_rows : other);",
+        "std::swap(t = u, flag ? g_runtime_host_zone_rows[0] : other);",
+        "x = bump(a = 1, flag ? g_runtime_span_irregular_rows : other);",
     ],
 )
 def test_counter_write_gate_has_a_witness(line):
