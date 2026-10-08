@@ -9,7 +9,7 @@
 // expert's storage, so the decision is cached per tensor and per device. The
 // stamp holds what can change it: the replan epoch (a MID_LOAD_REPLAN bumps
 // it), the expert storage generation (a storage rewrite bumps it) and the
-// selected-row count (it feeds the layout choice). The per-op request check
+// selected-row count the decision was made for. The per-op request check
 // below reads only tensor shapes and flags already in hand.
 //
 // SYCL-free on purpose so tests/test-sycl-moe-decode-hostpath.cpp can run it
@@ -50,6 +50,49 @@ inline void moe_decode_direct_stamp_record(moe_decode_direct_stamp & s,
     s.layout                    = layout;
     s.valid                     = true;
     s.eligible                  = eligible;
+}
+
+// How one eligibility decision ended. A refusal follows from the tensor, the
+// device or the materialized storage, so it holds until the stamp's inputs
+// change. A retry is a failure of the attempt itself (the table upload could
+// not allocate), so it is not remembered and the next op decides again.
+enum moe_decode_direct_outcome {
+    MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE,
+    MOE_DECODE_DIRECT_OUTCOME_REFUSED,
+    MOE_DECODE_DIRECT_OUTCOME_RETRY,
+};
+
+inline void moe_decode_direct_stamp_settle(moe_decode_direct_stamp & s,
+                                           uint64_t                  plan_generation,
+                                           uint64_t                  expert_storage_generation,
+                                           int64_t                   selected_rows,
+                                           int                       layout,
+                                           moe_decode_direct_outcome outcome) {
+    if (outcome == MOE_DECODE_DIRECT_OUTCOME_RETRY) {
+        s.valid = false;
+        return;
+    }
+    moe_decode_direct_stamp_record(s, plan_generation, expert_storage_generation, selected_rows, layout,
+                                   outcome == MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE);
+}
+
+// The route's layout is the one expert 0 is materialized in on the device:
+// what the unified cache loaded, not what a policy would pick. `layouts` lists
+// the layouts of expert 0's records on that device that the batched kernel
+// reads; a copy held for another executor (a prompt-processing alternate, say)
+// is not in it. Exactly one distinct layout is the answer; none, or more than
+// one, leaves the route without one.
+inline bool moe_decode_direct_layout_from_materialized(const std::vector<int> & layouts, int * layout) {
+    if (layouts.empty() || !layout) {
+        return false;
+    }
+    for (int candidate : layouts) {
+        if (candidate != layouts.front()) {
+            return false;
+        }
+    }
+    *layout = layouts.front();
+    return true;
 }
 
 struct moe_decode_direct_request {
@@ -113,29 +156,43 @@ inline void moe_gather_runs_build(const std::vector<size_t> &   src_offsets,
 }
 
 // What the shared activation staging (one src1 row, read by every host
-// expert of gate and of up) currently holds. Cleared at every graph boundary.
+// expert of gate and of up) currently holds.
 struct moe_shared_act_record {
-    uint64_t serial         = 0;  // bumped on every rewrite of the staging
-    uint64_t scatter_serial = 0;  // CPU scatter flushes enqueued before the copy
-    size_t   view_offset    = 0;
-    size_t   bytes          = 0;
-    int      device         = -1;
-    bool     valid          = false;
+    const void * src1_tensor    = nullptr;  // graph node the row was copied from
+    const void * sibling_dst    = nullptr;  // the one op that may reuse it
+    uint64_t     graph_epoch    = 0;
+    uint64_t     serial         = 0;        // never repeats: one value per rewrite of the staging
+    uint64_t     scatter_serial = 0;        // CPU scatter flushes enqueued before the copy
+    size_t       view_offset    = 0;
+    size_t       bytes          = 0;
+    int          device         = -1;
+    bool         valid          = false;
+};
+
+struct moe_shared_act_query {
+    const void * src1_tensor    = nullptr;
+    const void * op_dst         = nullptr;
+    bool         same_source    = false;  // src1's storage handle has the recorded identity
+    uint64_t     graph_epoch    = 0;
+    uint64_t     scatter_serial = 0;
+    size_t       view_offset    = 0;
+    size_t       bytes          = 0;
+    int          device         = -1;
 };
 
 // An op may skip its own activation copy when the staging already holds its
-// src1 row. same_source: src1's storage handle has the recorded identity. The
-// scatter serial matters because the copy's completion is what orders every
-// earlier scatter H2D ahead of this op's writes to its pool entries; a scatter
-// enqueued after the copy is not covered by it.
-inline bool moe_shared_act_reusable(const moe_shared_act_record & r,
-                                    bool                          same_source,
-                                    uint64_t                      scatter_serial,
-                                    size_t                        view_offset,
-                                    size_t                        bytes,
-                                    int                           device) {
-    return r.valid && same_source && r.scatter_serial == scatter_serial && r.view_offset == view_offset &&
-           r.bytes == bytes && r.device == device;
+// src1 row. The storage location alone does not say that: the compute buffer
+// reuses offsets, so the next layer's input can sit where this one's did. The
+// row is this op's only if it was copied from the same src1 node, for this
+// op's gate/up sibling, within the same graph compute. The scatter serial
+// matters because the copy's completion is what orders every earlier scatter
+// H2D ahead of this op's writes to its pool entries; a scatter enqueued after
+// the copy is not covered by it.
+inline bool moe_shared_act_reusable(const moe_shared_act_record & r, const moe_shared_act_query & q) {
+    return r.valid && r.src1_tensor != nullptr && r.src1_tensor == q.src1_tensor && r.sibling_dst != nullptr &&
+           r.sibling_dst == q.op_dst && r.graph_epoch == q.graph_epoch && q.same_source &&
+           r.scatter_serial == q.scatter_serial && r.view_offset == q.view_offset && r.bytes == q.bytes &&
+           r.device == q.device;
 }
 
 // May this op's CPU job be issued while the pending job (gate, typically) is

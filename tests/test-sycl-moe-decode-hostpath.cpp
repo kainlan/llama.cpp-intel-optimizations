@@ -63,6 +63,32 @@ static int test_direct_stamp() {
     // re-probed on every decode op of the same generation.
     ggml_sycl::moe_decode_direct_stamp_record(s, 3, 9, 10, /*layout=*/0, /*eligible=*/false);
     CHECK(moe_decode_direct_stamp_current(s, 3, 9, 10) && !s.eligible, "an ineligible decision is cached");
+
+    // Settling: a refusal is a decision, a failed attempt is not.
+    using ggml_sycl::moe_decode_direct_stamp_settle;
+    ggml_sycl::moe_decode_direct_stamp t{};
+    moe_decode_direct_stamp_settle(t, 3, 7, 10, /*layout=*/2, ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE);
+    CHECK(moe_decode_direct_stamp_current(t, 3, 7, 10) && t.eligible && t.layout == 2, "eligible is remembered");
+    moe_decode_direct_stamp_settle(t, 3, 8, 10, /*layout=*/0, ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED);
+    CHECK(moe_decode_direct_stamp_current(t, 3, 8, 10) && !t.eligible, "a structural refusal is remembered");
+    moe_decode_direct_stamp_settle(t, 3, 9, 10, /*layout=*/2, ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY);
+    CHECK(!moe_decode_direct_stamp_current(t, 3, 9, 10), "a transient failure is not remembered as ineligible");
+    CHECK(!moe_decode_direct_stamp_current(t, 3, 8, 10), "a transient failure voids the earlier decision");
+    return 0;
+}
+
+static int test_direct_layout() {
+    using ggml_sycl::moe_decode_direct_layout_from_materialized;
+    int layout = -1;
+    CHECK(!moe_decode_direct_layout_from_materialized({}, &layout),
+          "an expert with no record on the device has no layout");
+    CHECK(moe_decode_direct_layout_from_materialized({ 3 }, &layout) && layout == 3,
+          "the one materialized layout is the route's layout");
+    layout = -1;
+    CHECK(moe_decode_direct_layout_from_materialized({ 3, 3 }, &layout) && layout == 3,
+          "repeated records of one layout still name that layout");
+    CHECK(!moe_decode_direct_layout_from_materialized({ 1, 3 }, &layout),
+          "two kernel-readable materialized layouts name no single one");
     return 0;
 }
 
@@ -110,8 +136,19 @@ static int test_gather_runs() {
     return 0;
 }
 
+// Stand-ins for graph nodes: only their identity matters.
+static const int k_gate_dst  = 0;
+static const int k_up_dst    = 0;
+static const int k_src1      = 0;
+static const int k_next_src1 = 0;
+static const int k_down_dst  = 0;
+
+// Gate made the copy of its src1 row; up is the one sibling allowed to reuse it.
 static ggml_sycl::moe_shared_act_record act_record() {
     ggml_sycl::moe_shared_act_record r;
+    r.src1_tensor    = &k_src1;
+    r.sibling_dst    = &k_up_dst;
+    r.graph_epoch    = 2;
     r.serial         = 4;
     r.scatter_serial = 9;
     r.view_offset    = 128;
@@ -121,19 +158,64 @@ static ggml_sycl::moe_shared_act_record act_record() {
     return r;
 }
 
+static ggml_sycl::moe_shared_act_query up_query() {
+    ggml_sycl::moe_shared_act_query q;
+    q.src1_tensor    = &k_src1;
+    q.op_dst         = &k_up_dst;
+    q.same_source    = true;
+    q.graph_epoch    = 2;
+    q.scatter_serial = 9;
+    q.view_offset    = 128;
+    q.bytes          = 10240;
+    q.device         = 0;
+    return q;
+}
+
 static int test_shared_activation() {
     using ggml_sycl::moe_shared_act_reusable;
     const ggml_sycl::moe_shared_act_record r = act_record();
-    CHECK(moe_shared_act_reusable(r, true, 9, 128, 10240, 0), "up reuses gate's activation copy");
-    CHECK(!moe_shared_act_reusable(r, false, 9, 128, 10240, 0), "a different src1 needs its own copy");
-    CHECK(!moe_shared_act_reusable(r, true, 10, 128, 10240, 0),
+    ggml_sycl::moe_shared_act_query        q = up_query();
+    CHECK(moe_shared_act_reusable(r, q), "up reuses its sibling gate's copy of the same src1 tensor");
+
+    // The storage location alone proves nothing: ggml-alloc puts the next
+    // layer's ffn input at the same compute-buffer offset.
+    q             = up_query();
+    q.src1_tensor = &k_next_src1;
+    CHECK(!moe_shared_act_reusable(r, q), "the same location holding a different tensor is not the copied row");
+    q        = up_query();
+    q.op_dst = &k_gate_dst;
+    CHECK(!moe_shared_act_reusable(r, q), "the op that made the copy is not its sibling");
+    q        = up_query();
+    q.op_dst = &k_down_dst;
+    CHECK(!moe_shared_act_reusable(r, q), "an op that is not the recorded sibling never reuses the copy");
+    ggml_sycl::moe_shared_act_record unpaired = r;
+    unpaired.sibling_dst                      = nullptr;
+    q                                         = up_query();
+    q.op_dst                                  = nullptr;
+    CHECK(!moe_shared_act_reusable(unpaired, q), "a copy made by an op with no gate/up sibling is never reused");
+    q             = up_query();
+    q.graph_epoch = 3;
+    CHECK(!moe_shared_act_reusable(r, q), "a copy from an earlier graph compute is stale");
+
+    q             = up_query();
+    q.same_source = false;
+    CHECK(!moe_shared_act_reusable(r, q), "a different src1 storage needs its own copy");
+    q                = up_query();
+    q.scatter_serial = 10;
+    CHECK(!moe_shared_act_reusable(r, q),
           "a scatter enqueued after the copy breaks the pool ordering the copy's wait provided");
-    CHECK(!moe_shared_act_reusable(r, true, 9, 0, 10240, 0), "another view of the buffer is another row");
-    CHECK(!moe_shared_act_reusable(r, true, 9, 128, 8192, 0), "a different row size is a different copy");
-    CHECK(!moe_shared_act_reusable(r, true, 9, 128, 10240, 1), "another device has its own staging");
+    q             = up_query();
+    q.view_offset = 0;
+    CHECK(!moe_shared_act_reusable(r, q), "another view of the buffer is another row");
+    q       = up_query();
+    q.bytes = 8192;
+    CHECK(!moe_shared_act_reusable(r, q), "a different row size is a different copy");
+    q        = up_query();
+    q.device = 1;
+    CHECK(!moe_shared_act_reusable(r, q), "another device has its own staging");
     ggml_sycl::moe_shared_act_record cleared = r;
     cleared.valid                            = false;
-    CHECK(!moe_shared_act_reusable(cleared, true, 9, 128, 10240, 0), "the graph boundary clears the record");
+    CHECK(!moe_shared_act_reusable(cleared, up_query()), "a cleared record is never reused");
     return 0;
 }
 
@@ -188,8 +270,8 @@ static int test_sibling_pending() {
 }
 
 int main() {
-    if (test_direct_request() != 0 || test_direct_stamp() != 0 || test_pool_ring() != 0 || test_gather_runs() != 0 ||
-        test_shared_activation() != 0 || test_sibling_pending() != 0) {
+    if (test_direct_request() != 0 || test_direct_stamp() != 0 || test_direct_layout() != 0 || test_pool_ring() != 0 ||
+        test_gather_runs() != 0 || test_shared_activation() != 0 || test_sibling_pending() != 0) {
         return 1;
     }
     std::printf("OK: moe decode host path decisions\n");

@@ -3765,6 +3765,28 @@ struct ggml_tensor_extra_gpu_weight_ext {
         return nullptr;
     }
 
+    // Every layout expert_id has a published record in on owner_device: what
+    // the unified cache materialized, read from the records themselves.
+    void moe_storage_layouts_on_device(int expert_id, int owner_device, std::vector<int> & layouts) const {
+        layouts.clear();
+        if (expert_id < 0) {
+            return;
+        }
+        for (const auto & kv : moe_expert_storage_handles) {
+            if (static_cast<uint32_t>(kv.first) != static_cast<uint32_t>(expert_id)) {
+                continue;
+            }
+            for (const moe_expert_storage_record & record : kv.second) {
+                const auto resolved = record.handle.resolve();
+                const int  owner    = resolved.on_device ? record.handle.device() : ggml_sycl::mem_handle::HOST_DEVICE;
+                if (owner == owner_device) {
+                    layouts.push_back(static_cast<int>(kv.first >> 32));
+                    break;
+                }
+            }
+        }
+    }
+
     bool forget_moe_storage_handle_on_device(int expert_id, ggml_layout_mode layout, int owner_device) {
         if (expert_id < 0) {
             return false;
@@ -4406,6 +4428,14 @@ struct ggml_tensor_extra_gpu {
                                                                         ggml_layout_mode layout,
                                                                         int              owner_device) const {
         return weight_ext ? weight_ext->find_moe_storage_handle_on_device(expert_id, layout, owner_device) : nullptr;
+    }
+
+    void moe_storage_layouts_on_device(int expert_id, int owner_device, std::vector<int> & layouts) const {
+        if (weight_ext) {
+            weight_ext->moe_storage_layouts_on_device(expert_id, owner_device, layouts);
+        } else {
+            layouts.clear();
+        }
     }
 
     bool forget_moe_storage_handle_on_device(int expert_id, ggml_layout_mode layout, int owner_device) {
