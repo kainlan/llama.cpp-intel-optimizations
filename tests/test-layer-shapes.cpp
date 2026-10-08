@@ -43,6 +43,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <set>
@@ -550,10 +551,13 @@ static void check_no_alloc(const char * arch_name, const config & cfg, llama_con
             if (!r_owns || !d_owns) {
                 continue;
             }
-            CHECK(rk->ne[0] == dk->ne[0] && rk->ne[1] == dk->ne[1] && rk->ne[2] == dk->ne[2] && rk->type == dk->type,
-                  "%s/%s: layer %d indexer K differs: real %lld/%lld/%lld type %d, no_alloc %lld/%lld/%lld type %d",
-                  arch_name, cfg.name, il, (long long) rk->ne[0], (long long) rk->ne[1], (long long) rk->ne[2],
-                  (int) rk->type, (long long) dk->ne[0], (long long) dk->ne[1], (long long) dk->ne[2], (int) dk->type);
+            CHECK(
+                rk->ne[0] == dk->ne[0] && rk->ne[1] == dk->ne[1] && rk->ne[2] == dk->ne[2] && rk->type == dk->type &&
+                    strcmp(rk->name, dk->name) == 0,
+                "%s/%s: layer %d indexer K differs: real %s %lld/%lld/%lld type %d, no_alloc %s %lld/%lld/%lld type %d",
+                arch_name, cfg.name, il, rk->name, (long long) rk->ne[0], (long long) rk->ne[1], (long long) rk->ne[2],
+                (int) rk->type, dk->name, (long long) dk->ne[0], (long long) dk->ne[1], (long long) dk->ne[2],
+                (int) dk->type);
             CHECK(rk->buffer != nullptr && ggml_backend_buffer_get_size(rk->buffer) > 0,
                   "%s/%s: layer %d: the real memory has no allocated indexer K", arch_name, cfg.name, il);
             CHECK(dk->buffer != nullptr && ggml_backend_buffer_get_size(dk->buffer) == 0,
@@ -687,7 +691,7 @@ int main() {
 
     // a run that built nothing checked nothing
     CHECK(n_built >= 21, "only %d (arch, config) cases built; the must-cover set alone is 21", n_built);
-    CHECK(n_no_alloc_cases >= 39 && n_no_alloc_refused > 0, "VOID: %d no_alloc builds and %d refusals",
+    CHECK(n_no_alloc_cases >= 42 && n_no_alloc_refused > 0, "VOID: %d no_alloc builds and %d refusals",
           n_no_alloc_cases, n_no_alloc_refused);
     CHECK(n_kv_cases > 0 && n_rs_cases > 0, "VOID: %d KV and %d recurrent cases", n_kv_cases, n_rs_cases);
     // the indexer comparisons ran on real layers (qwen4exp is the fixture that reaches llama_memory_hybrid_idx)
