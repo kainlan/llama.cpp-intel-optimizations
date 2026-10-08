@@ -151,6 +151,28 @@ int main() {
               "case 6: a node is not its own consumer");
     }
 
+    // 7. consumer entry point: a residual block's two srcs (x[n-1] and f)
+    // share their whole upstream subgraph, so one walk must expand each
+    // distinct node once, not once per src.
+    {
+        ggml_tensor * block  = node(ctx);
+        block->src[0]        = x[n_layers];
+        block->src[1]        = x[n_layers]->src[1];  // f of the last layer, itself fed by x[n_layers - 1]
+        ggml_tensor * other  = node(ctx);
+        size_t        visits = 0, per_src = 0, v = 0;
+        CHECK(!ggml_sycl::attn_op_consumes_tensor_counted(block, other, &visits), "case 7: unreachable target");
+        for (int i = 0; i < 2; ++i) {
+            ggml_sycl::attn_tensor_depends_on_counted(block->src[i], other, 0, &v);
+            per_src += v;
+        }
+        std::printf("case 7 (consumer, two shared srcs): one walk visits=%zu, per-src walks=%zu\n", visits, per_src);
+        CHECK(visits <= n_nodes, "case 7: consumer query expands each node at most once");
+        CHECK(visits < per_src, "case 7: shared subgraph is not re-expanded per src");
+        CHECK(ggml_sycl::attn_op_consumes_tensor_counted(block, x[n_layers - 4], &visits), "case 7: reachable target");
+        CHECK(!ggml_sycl::attn_op_consumes_tensor_counted(nullptr, other, &visits) && visits == 0,
+              "case 7: null consumer");
+    }
+
     ggml_free(ctx);
     std::printf("test-tensor-depends-on-visits: all ok\n");
     return 0;

@@ -84,16 +84,17 @@ struct dependency_scratch {
     }
 };
 
-}  // namespace
-
-bool attn_tensor_depends_on_counted(const ggml_tensor * tensor,
-                                    const ggml_tensor * target,
-                                    int                 depth,
-                                    size_t *            visits) {
+// One walk from every non-null seed at once. Seeds share the visited set, so
+// subgraphs common to several seeds are expanded once for the whole query.
+bool depends_on_any(const ggml_tensor * const * seeds,
+                    int                         n_seeds,
+                    const ggml_tensor *         target,
+                    int                         depth,
+                    size_t *                    visits) {
     if (visits) {
         *visits = 0;
     }
-    if (!tensor || !target || depth > 32) {
+    if (!target || depth > 32) {
         return false;
     }
     // Level-synchronous so a node is first reached at its shortest distance:
@@ -102,8 +103,11 @@ bool attn_tensor_depends_on_counted(const ggml_tensor * tensor,
     // node is expanded once instead of once per path.
     thread_local dependency_scratch sc;
     sc.begin();
-    sc.insert(tensor);
-    sc.frontier.push_back(tensor);
+    for (int i = 0; i < n_seeds; ++i) {
+        if (seeds[i] && sc.insert(seeds[i])) {
+            sc.frontier.push_back(seeds[i]);
+        }
+    }
     size_t n_visits = 0;
     for (; depth <= 32 && !sc.frontier.empty(); ++depth) {
         sc.next.clear();
@@ -131,20 +135,35 @@ bool attn_tensor_depends_on_counted(const ggml_tensor * tensor,
     return false;
 }
 
+}  // namespace
+
+bool attn_tensor_depends_on_counted(const ggml_tensor * tensor,
+                                    const ggml_tensor * target,
+                                    int                 depth,
+                                    size_t *            visits) {
+    return depends_on_any(&tensor, 1, target, depth, visits);
+}
+
 bool attn_tensor_depends_on(const ggml_tensor * tensor, const ggml_tensor * target, int depth) {
     return attn_tensor_depends_on_counted(tensor, target, depth, nullptr);
 }
 
-bool attn_op_consumes_tensor(const ggml_tensor * consuming_dst, const ggml_tensor * pending_dst) {
+bool attn_op_consumes_tensor_counted(const ggml_tensor * consuming_dst,
+                                     const ggml_tensor * pending_dst,
+                                     size_t *            visits) {
     if (!consuming_dst || !pending_dst) {
+        if (visits) {
+            *visits = 0;
+        }
         return false;
     }
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (attn_tensor_depends_on(consuming_dst->src[i], pending_dst, 0)) {
-            return true;
-        }
-    }
-    return false;
+    // One walk seeded with every src: the consumer's srcs usually share most of
+    // their upstream subgraph, so per-src walks would expand it once per src.
+    return depends_on_any(consuming_dst->src, GGML_MAX_SRC, pending_dst, 0, visits);
+}
+
+bool attn_op_consumes_tensor(const ggml_tensor * consuming_dst, const ggml_tensor * pending_dst) {
+    return attn_op_consumes_tensor_counted(consuming_dst, pending_dst, nullptr);
 }
 
 }  // namespace ggml_sycl

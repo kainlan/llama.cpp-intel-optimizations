@@ -53,4 +53,10 @@ bool attn_tensor_depends_on_counted(const ggml_tensor * tensor, const ggml_tenso
 // a blocking flush belongs.
 bool attn_op_consumes_tensor(const ggml_tensor * consuming_dst, const ggml_tensor * pending_dst);
 
+// Same answer as attn_op_consumes_tensor; *visits (when non-null) is the
+// number of distinct nodes expanded by the single walk over all srcs.
+bool attn_op_consumes_tensor_counted(const ggml_tensor * consuming_dst,
+                                     const ggml_tensor * pending_dst,
+                                     size_t *            visits);
+
 }  // namespace ggml_sycl

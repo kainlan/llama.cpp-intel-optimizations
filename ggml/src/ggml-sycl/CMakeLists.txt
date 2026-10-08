@@ -2030,9 +2030,9 @@ set_tests_properties(sycl-layer-streaming-gate PROPERTIES
 # "host-only, no -fsycl, links ggml-base" shape test-dmmv-coalesced-q4-0-oracle
 # already establishes below. attn-host-dispatch.cpp is ALSO globbed into
 # libggml-sycl (the file(GLOB) at :83) and compiled there with -fsycl like
-# every other backend TU; it is dead code there until TKV-13 step 3 wires it
-# into ggml_backend_sycl_device_supports_op / the graph-compute node loop --
-# this target is the host-only proof it works first.
+# every other backend TU. It is live there: the TU hosts the dependency walk
+# ggml_sycl_op_consumes_tensor uses for the MoE scatter flush. This target is
+# the host-only proof of the walk.
 add_executable(test-attn-host-dispatch
     tests/test-attn-host-dispatch.cpp
     attn-host-dispatch.cpp
