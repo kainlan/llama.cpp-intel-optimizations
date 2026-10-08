@@ -19246,6 +19246,42 @@ static void ggml_sycl_planned_scratch_hold_refresh(ggml_backend_sycl_context & c
     ggml_sycl::unified_cache_set_planned_scratch_hold(d, hold, ctx.planned_scratch_owner);
 }
 
+// llama.cpp-g6yk: claim the planned dense Q8_1 src1 buffer at its whole plan when the runtime-context transaction
+// publishes the plan, before any graph runs. Counting the plan in the RUNTIME zone (and charging it to the PP MoE ring's
+// admission) does not make the buffer exist: when the graph-entry walk does not count the node that draws it, the
+// first op finds the buffer empty and grows it to that op's own need, and a later, larger op grows it again while the
+// first backing is still retained behind its queue marker. The two backings together exceed the plan. On the B70 with
+// Qwen3.8 at -ub 512 that was 1.4 MB, then 3.4 MB, in a zone the 4265 MB ring had left with 2.6 MB, and the plan-breach
+// abort fired. Claimed here, the buffer holds its plan before the first graph and no op within n_ubatch grows it.
+//
+// The claim goes through the same allocator as every planned RUNTIME scratch (ggml_sycl_runtime_scratch_ensure:
+// RUNTIME zone, spill forbidden). A claim the zone cannot meet is reported and left to the existing defences: the hold
+// keeps the planned bytes off spill-capable allocations, and the graph-entry walk refuses the graph by name before
+// anything is submitted. It is not refused here, because the plan is already published.
+static void ggml_sycl_mmq_src1_claim_plan(ggml_backend_sycl_context & ctx) {
+    const int    d       = ctx.device;
+    const size_t planned = ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(d);
+    if (planned == 0 || ctx.mmvq_q8_activation_cache.capacity(d) >= planned) {
+        return;
+    }
+    if (ctx.mmvq_q8_activation_cache.ensure_buffer(planned, d, *ctx.stream(d, 0)) != nullptr) {
+        GGML_LOG_INFO(
+            "[SYCL-PLAN] dense MMQ src1 Q8_1 scratch claimed on device %d: %.1f MB (plan %.1f MB at "
+            "n_ubatch=%u, RUNTIME zone)\n",
+            d, ctx.mmvq_q8_activation_cache.capacity(d) / (1024.0 * 1024.0), planned / (1024.0 * 1024.0),
+            (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d));
+        return;
+    }
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(d);
+    GGML_LOG_WARN(
+        "[MMQ-SRC1] device %d: the planned Q8_1 src1 buffer (%.1f MB at n_ubatch=%u) could not be claimed when the "
+        "plan was published (buffer holds %.1f MB, RUNTIME zone has %.1f MB free); the hold keeps its bytes off "
+        "spill-capable allocations and the graph-entry walk refuses a graph it cannot serve (llama.cpp-g6yk)\n",
+        d, planned / (1024.0 * 1024.0), (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d),
+        ctx.mmvq_q8_activation_cache.capacity(d) / (1024.0 * 1024.0),
+        (cache ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : 0) / (1024.0 * 1024.0));
+}
+
 // llama.cpp-kpjw: the runtime-context transaction re-plans the dense scratch at the runtime n_ubatch and drops the
 // hold while it materializes its own pools; this restores both on every exit that is not the success tail. A probe
 // changes nothing, so its guard is inert. The hold is the OWNER's: the guard zeroes it for this context and puts
@@ -20196,6 +20232,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     g_runtime_update_succeeded = true;
     // Published: the plan stands, so the hold is recomputed from it (and from what this context already holds).
     dense_guard.commit();
+    // The plan stands, so its Q8_1 src1 buffer is claimed now, before any graph; the hold below then sees it at plan.
+    ggml_sycl_mmq_src1_claim_plan(*ctx);
     ggml_sycl_planned_scratch_hold_refresh(*ctx);
     // This plan's own reserve is what the realized-spill check (try_candidate, after sched_reserve()) must see, not a losing rung's.
     ggml_sycl::unified_cache_begin_planned_hold_epoch(ctx->device, ctx->planned_scratch_owner, next_kv_info.n_ubatch,
