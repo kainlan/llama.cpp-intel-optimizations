@@ -1003,6 +1003,63 @@ with gate('segment-graphs-destroyed-after-drain'):
         assert check_segment_graphs_drained(*args), "control %r was not caught" % label
     print("PASS segment-graphs-destroyed-after-drain-source-gate (%d controls caught)" % len(controls))
 
+def check_keyed_q8_cache(code: str) -> list:
+    """llama.cpp-7pm2: the MMVQ Q8 activation cache describes the last quantize that ran. A recording stores entries
+    for quantizes that only run when the graph is submitted, and a replay rewrites the buffer without a store, so
+    the keyed record and replay invalidate it around every recorded segment, and a failed recording invalidates it
+    before the run executes directly (or the fallback does), else the first direct matmul reads a stale quantize."""
+    problems = []
+    inv = "sycl_ctx->mmvq_q8_activation_cache.invalidate();"
+    try:
+        record = region(code, "static void moe_graph_record_segment_slot(", "static void moe_graph_replay_segment_slot(")
+        replay = region(code, "static void moe_graph_replay_segment_slot(", "static bool moe_graph_record_segments(")
+    except ValueError as error:
+        return [str(error)]
+    graph = re.search(r"sycl_ex::command_graph\s+seg_graph\(", record)
+    before = record.rfind(inv, 0, graph.start()) if graph else -1
+    flush = record.find("moe_graph_segment_boundary_flush(")
+    if not graph or before < 0 or before < flush:
+        problems.append("record: no invalidate between the boundary flush and the recording")
+    fb = re.search(r"catch \(const ggml_sycl_fallback_error &\)\s*\{([^{}]*)\}", record)
+    if not fb or inv not in fb.group(1) or fb.group(1).find(inv) > fb.group(1).find("throw;"):
+        problems.append("record: the fallback rethrow leaves the recording's Q8 entries behind")
+    ex = re.search(r"catch \(const std::exception & exc\)\s*\{([\s\S]*?)\n        \}", record)
+    body = ex.group(1) if ex else ""
+    if inv not in body or "dispatch_direct(item.start, item.end);" not in body or \
+            body.find(inv) > body.find("dispatch_direct(item.start, item.end);"):
+        problems.append("record: a failed recording runs directly on the recording's Q8 entries")
+    submit = record.find("stream->ext_oneapi_graph(*slot.segments.back().exec_graph);")
+    if submit < 0 or record.find(inv, submit) < 0:
+        problems.append("record: the submitted segment's Q8 rewrite is not invalidated")
+    rsub = replay.find("stream->ext_oneapi_graph(*seg.exec_graph);")
+    rcont = replay.find("continue;", rsub)
+    if rsub < 0 or rcont < 0 or inv not in replay[rsub:rcont]:
+        problems.append("replay: a replayed segment's Q8 rewrite is not invalidated")
+    return problems
+
+
+with gate('keyed-q8-cache-invalidation'):
+    problems = check_keyed_q8_cache(RUNTIME_CODE)
+    assert not problems, "\n".join(problems)
+    _rec = region(RUNTIME_CODE, "static void moe_graph_record_segment_slot(", "static void moe_graph_replay_segment_slot(")
+    _rep = region(RUNTIME_CODE, "static void moe_graph_replay_segment_slot(", "static bool moe_graph_record_segments(")
+    _inv = "sycl_ctx->mmvq_q8_activation_cache.invalidate();"
+
+    def _drop_nth(body, n):
+        at = -1
+        for _ in range(n + 1):
+            at = body.find(_inv, at + 1)
+        return RUNTIME_CODE.replace(body, body[:at] + body[at + len(_inv):], 1)
+
+    _n = _rec.count(_inv)
+    assert _n == 4, "expected 4 Q8 invalidates in the keyed record, found %d" % _n
+    controls = {"record invalidate %d dropped" % i: _drop_nth(_rec, i) for i in range(_n)}
+    controls["replay invalidate dropped"] = _drop_nth(_rep, 0)
+    for label, mutated in controls.items():
+        assert mutated != RUNTIME_CODE, "control %r did not apply" % label
+        assert check_keyed_q8_cache(mutated), "control %r was not caught" % label
+    print("PASS keyed-q8-cache-invalidation-source-gate (%d controls caught)" % len(controls))
+
 with gate('moe-metadata'):
     # Metadata and its derived group registry are built locally and atomically
     # swapped under both writer locks; bad_alloc preserves the old epoch.

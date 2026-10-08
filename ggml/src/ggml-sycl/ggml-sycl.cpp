@@ -99603,9 +99603,13 @@ static void moe_graph_record_segment_slot(ggml_backend_sycl_context *           
             recorder.leave();
             exec = std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(seg_graph.finalize());
         } catch (const ggml_sycl_fallback_error &) {
+            // The fallback runs these nodes directly: no hit on a Q8 entry the aborted recording stored.
+            sycl_ctx->mmvq_q8_activation_cache.invalidate();
             throw;
         } catch (const std::exception & exc) {
             // Nothing recorded ran: the handles and pool scratch it collected can go, and the run executes directly.
+            // The recording stored Q8 cache entries for quantizes that never ran; a direct matmul must not hit them.
+            sycl_ctx->mmvq_q8_activation_cache.invalidate();
             slot.retained_handles.resize(retained_baseline);
             std::vector<ggml_sycl::mem_handle> dropped;
             take_pool_scratch(dropped);
