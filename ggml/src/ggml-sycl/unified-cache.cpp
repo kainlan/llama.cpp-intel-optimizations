@@ -17539,10 +17539,8 @@ bool unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, s
         return false;
     }
     const auto it = g_runtime_alloc_registry.find(hit.key);
-    if (it == g_runtime_alloc_registry.end()) {
-        return false;
-    }
-    // Index and registry are kept in step by the emplace/erase/assign helpers, holding g_runtime_alloc_mutex.
+    // Index and registry are kept in step by the emplace/erase/assign helpers, holding g_runtime_alloc_mutex;
+    // if the index found a key that the registry does not have, that is a defect in the mutation helpers.
     GGML_ASSERT(it != g_runtime_alloc_registry.end());
     // Backstop for the index's one assumption, that a registered row's geometry never changes: if anything rewrote it
     // (the source gate is only a tripwire), fail here, loudly, instead of answering from a stale extent.

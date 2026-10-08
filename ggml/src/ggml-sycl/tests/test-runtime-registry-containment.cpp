@@ -549,7 +549,7 @@ bool lookup_aborts_with_backstop(uintptr_t lookup_addr) {
     const bool aborted = WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
     const bool message = captured.find("containment index disagrees with its registry row") != std::string::npos;
     if (!aborted || !message) {
-        fprintf(stderr, "    child: aborted=%d message=%d stderr=[%s]\n", aborted ? 1 : 0, message ? 1 : 0, captured.c_str());
+        fprintf(stderr, "    child: aborted=%d message=%d stderr=[%s]\n", aborted, message, captured.c_str());
     }
     return aborted && message;
 }

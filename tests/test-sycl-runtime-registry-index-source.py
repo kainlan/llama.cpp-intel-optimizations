@@ -469,7 +469,8 @@ def test_every_registry_use_outside_the_helpers_is_a_read():
     ],
 )
 def test_use_gate_has_a_witness(line):
-    assert registry_uses_that_are_not_reads(CODE + "\nvoid f() {\n    " + line + "\n}\n"), line
+    violations = registry_uses_that_are_not_reads(CODE + "\nvoid f() {\n    " + line + "\n}\n")
+    assert violations, line
 
 
 @pytest.mark.parametrize(
@@ -518,7 +519,8 @@ def test_the_three_helpers_really_mutate_the_index():
     ],
 )
 def test_index_gate_has_a_witness(line):
-    assert index_uses_that_are_not_reads(CODE + "\nvoid f() {\n    " + line + "\n}\n"), line
+    violations = index_uses_that_are_not_reads(CODE + "\nvoid f() {\n    " + line + "\n}\n")
+    assert violations, line
 
 
 @pytest.mark.parametrize(
@@ -562,7 +564,8 @@ def planted_in_registry_function(line: str) -> str:
     ],
 )
 def test_alias_gate_has_a_witness(line):
-    assert row_aliases_in_registry_functions(planted_in_registry_function(line)), line
+    violations = row_aliases_in_registry_functions(planted_in_registry_function(line))
+    assert violations, line
 
 
 @pytest.mark.parametrize(
@@ -631,7 +634,8 @@ def test_registered_row_geometry_is_never_rewritten_outside_the_allowlist():
     ],
 )
 def test_geometry_gate_has_a_witness(line):
-    assert geometry_write_violations(CODE + "\nvoid f() {\n    " + line + "\n}\n"), line
+    violations = geometry_write_violations(CODE + "\nvoid f() {\n    " + line + "\n}\n")
+    assert violations and violations[0][0] == "unlisted", line
 
 
 @pytest.mark.parametrize(
@@ -654,7 +658,8 @@ def test_geometry_gate_has_a_witness(line):
     ],
 )
 def test_geometry_gate_allows_reads_and_other_fields(line):
-    assert geometry_write_violations(CODE + "\nvoid f() {\n    " + line + "\n}\n") == [], line
+    violations = geometry_write_violations(CODE + "\nvoid f() {\n    " + line + "\n}\n")
+    assert violations == [], line
 
 
 @pytest.mark.parametrize(
@@ -677,7 +682,8 @@ def test_geometry_gate_allows_reads_and_other_fields(line):
     ],
 )
 def test_address_gate_has_a_witness(line):
-    assert geometry_addresses_taken(CODE + "\nvoid f() {\n    " + line + "\n}\n"), line
+    violations = geometry_addresses_taken(CODE + "\nvoid f() {\n    " + line + "\n}\n")
+    assert violations, line
 
 
 @pytest.mark.parametrize(
@@ -739,7 +745,8 @@ def mutate(code: str, old: str, new: str) -> str:
     ],
 )
 def test_row_write_gate_has_a_witness(text):
-    assert row_write_violations(CODE + "\n" + text + "\n"), text
+    violations = row_write_violations(CODE + "\n" + text + "\n")
+    assert violations and violations[0][0] == "unlisted", text
 
 
 @pytest.mark.parametrize(
@@ -757,7 +764,8 @@ def test_row_write_gate_has_a_witness(text):
     ],
 )
 def test_allowlist_is_keyed_by_function_line_and_exact_count(mutation):
-    assert row_write_violations(mutate(CODE, *mutation)), mutation
+    violations = row_write_violations(mutate(CODE, *mutation))
+    assert violations and violations[0][0] in ("unlisted", "count"), mutation
 
 
 @pytest.mark.parametrize(
@@ -810,7 +818,8 @@ def test_the_geometry_allowlist_is_exact_and_confined_to_private_testing():
     ],
 )
 def test_more_alias_forms_have_a_witness(line):
-    assert row_aliases_in_registry_functions(planted_in_registry_function(line)), line
+    violations = row_aliases_in_registry_functions(planted_in_registry_function(line))
+    assert violations, line
 
 
 def test_alias_gate_follows_a_function_that_only_takes_the_iterator():
@@ -845,7 +854,8 @@ def test_the_map_type_marker_tolerates_spacing(decl):
     ],
 )
 def test_non_const_structured_binding_has_a_witness(line):
-    assert non_const_bindings_in_registry_functions(planted_in_registry_function(line)), line
+    violations = non_const_bindings_in_registry_functions(planted_in_registry_function(line))
+    assert violations, line
 
 
 @pytest.mark.parametrize(
@@ -862,7 +872,8 @@ def test_non_const_structured_binding_has_a_witness(line):
     ],
 )
 def test_non_const_row_parameter_has_a_witness(line):
-    assert non_const_bindings_in_registry_functions(planted_in_registry_function(line)), line
+    violations = non_const_bindings_in_registry_functions(planted_in_registry_function(line))
+    assert violations, line
 
 
 @pytest.mark.parametrize(
