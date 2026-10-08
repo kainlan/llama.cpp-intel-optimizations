@@ -22218,7 +22218,8 @@ static thread_local moe_shared_act_state g_moe_shared_act;
 // A new graph compute: the staging no longer holds a row of this graph, and
 // node pointers may repeat (graph reuse), so the epoch moves on. compute_impl
 // reaches it through ggml_sycl_cpu_tg_flush_pending(); segmented replay and
-// block graphlets, which bypass compute_impl, call it directly.
+// moe_graph_try_block_graphlets(), which bypass compute_impl, call it beside
+// their other per-graph invalidations.
 static void moe_shared_act_new_graph() {
     g_moe_shared_act = {};
     ++g_moe_graph_epoch;
@@ -100169,6 +100170,7 @@ static bool moe_graph_try_block_graphlets(ggml_backend_sycl_context * sycl_ctx,
     ggml_sycl_cpu_quant_cache_new_graph();
     ggml_sycl_moe_ids_cache_new_graph();
     ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);
+    moe_shared_act_new_graph();  // graphlets bypass compute_impl's flush, which does this
     if (!graph_prestage_or_decline(sycl_ctx, cgraph, graph_hash)) {
         // The graphlets would read a host-resident input inside a recording or a replay; the caller runs direct.
         // Conservative: retire the recorded ones so a declined graph leaves none to be mistaken for a current one.
@@ -109612,10 +109614,6 @@ normal_dispatch:
         }
 
         if (use_segmented) {
-            // Segmented replay and block graphlets dispatch MoE ops without
-            // entering compute_impl, so they start the graph's shared
-            // activation state here.
-            moe_shared_act_new_graph();
             bool block_graphlet_executed = false;
             if (cached_is_decode && descriptor_moe_graph_candidates > 0 &&
                 !sycl_ctx->moe_fa_post_prompt_record_pending) {
@@ -109635,6 +109633,7 @@ normal_dispatch:
                 ggml_sycl_cpu_quant_cache_new_graph();
                 ggml_sycl_moe_ids_cache_new_graph();
                 ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);
+                moe_shared_act_new_graph();  // replay bypasses compute_impl's flush, which does this
 
                 // Check if segments are valid for this graph
                 bool segments_match = sycl_ctx->moe_segments_valid &&
