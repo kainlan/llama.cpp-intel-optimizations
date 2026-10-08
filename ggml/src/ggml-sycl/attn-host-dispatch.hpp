@@ -15,26 +15,30 @@
 // target follows.
 #include "ggml.h"
 
+#include <cstddef>
+
 namespace ggml_sycl {
 
-// TKV-13 (B2) step 1: the DAG-consumption check that will let the SYCL
-// backend defer -- rather than block on -- a pending host-computed
-// demoted-layer attention result, mirroring the mechanism that already makes
-// CpuExpertPool's MoE CPU dispatch overlap with GPU work (ggml-sycl.cpp
-// flush_pending_cpu_scatter_if_consumed / ggml_sycl_op_consumes_tensor /
-// ggml_sycl_tensor_depends_on). That mechanism lives as static functions
-// inside the ggml-sycl.cpp mega-TU and is not itself host-testable; this file
-// reimplements the same logic as its own pure TU so TKV-13's addendum's
-// "RED-first, host-only" piece has something concrete to test before any
-// SYCL/GPU code exists (docs/plans/2026-08-27-tkv13-b2-addendum.md §2, §6
-// step 1). Wiring this into ggml-sycl.cpp's dispatch loop is step 3 -- this
-// file is dead code (linked only by its own test binary) until then.
+// TKV-13 (B2) step 1: the DAG-consumption check that lets the SYCL backend
+// defer -- rather than block on -- a pending host-computed result, the
+// mechanism CpuExpertPool's MoE CPU dispatch uses to overlap with GPU work.
+// ggml-sycl.cpp's ggml_sycl_op_consumes_tensor (the MoE expert-deferral flush
+// check) calls attn_op_consumes_tensor here, so the walk is a pure TU that is
+// unit-tested without oneAPI (docs/plans/2026-08-27-tkv13-b2-addendum.md §2,
+// §6 step 1).
 
 // Does `tensor` transitively read `target`, walking the view_src chain at
 // every node and recursing into every ggml_tensor::src[]? Depth-bounded
-// (mirrors the mega-TU original's `depth > 32` bound) so a malformed graph
-// with a src[] cycle cannot recurse unboundedly.
+// (`depth > 32`) and visited-set deduplicated, so a malformed graph with a
+// src[] cycle terminates and converging paths cost their node count.
 bool attn_tensor_depends_on(const ggml_tensor * tensor, const ggml_tensor * target, int depth = 0);
+
+// Same answer as attn_tensor_depends_on; additionally reports in *visits (when
+// non-null) how many distinct nodes the walk expanded. Each node is expanded at
+// most once per call, so on a DAG with many converging paths (the residual
+// stream) the cost is the reachable subgraph, not the number of paths. This is
+// the test seam that pins that bound.
+bool attn_tensor_depends_on_counted(const ggml_tensor * tensor, const ggml_tensor * target, int depth, size_t * visits);
 
 // Is `pending_dst` one of `consuming_dst`'s actual inputs -- i.e. would
 // dispatching `consuming_dst` today read data that a still-in-flight

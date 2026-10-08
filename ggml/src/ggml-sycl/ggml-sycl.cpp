@@ -23727,36 +23727,15 @@ static void flush_pending_cpu_scatter() {
 // This enables expert deferral: cold CPU experts from layer N can compute
 // in parallel with layer N+1's GPU attention window (~381us) as long as
 // the attention ops don't read from the MoE output tensor.
-static bool ggml_sycl_tensor_depends_on(const ggml_tensor * tensor, const ggml_tensor * target, int depth = 0) {
-    if (!tensor || !target || depth > 32) {
-        return false;
-    }
-    for (const ggml_tensor * t = tensor; t; t = t->view_src) {
-        if (t == target) {
-            return true;
-        }
-    }
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (ggml_sycl_tensor_depends_on(tensor->src[i], target, depth + 1)) {
-            return true;
-        }
-    }
-    return false;
-}
-
+// The dependency walk is the shared host-testable implementation in
+// attn-host-dispatch.cpp: it expands each node once per query, because this runs
+// for every op while a scatter is pending and the residual stream makes the
+// number of paths to a node explode.
 static bool ggml_sycl_op_consumes_tensor(const ggml_tensor * consuming_dst, const ggml_tensor * pending_dst) {
-    if (!consuming_dst || !pending_dst) {
-        return false;
-    }
     // A pending scatter writes consuming_dst itself when a fused MoE producer
     // precomputes later graph nodes.  That producer skip is not a consumer; only
     // downstream source dependencies require the deferred scatter to be visible.
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (ggml_sycl_tensor_depends_on(consuming_dst->src[i], pending_dst)) {
-            return true;
-        }
-    }
-    return false;
+    return ggml_sycl::attn_op_consumes_tensor(consuming_dst, pending_dst);
 }
 
 static bool flush_pending_cpu_scatter_if_consumed(const ggml_tensor * consuming_dst, int device) {

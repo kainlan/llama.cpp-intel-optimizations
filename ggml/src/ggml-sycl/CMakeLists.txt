@@ -2050,6 +2050,26 @@ set_tests_properties(sycl-attn-host-dispatch PROPERTIES
     TIMEOUT 30
 )
 
+# Expert-deferral dependency walk (llama.cpp-ax5u): the same pure TU, driven
+# with a residual-stream DAG whose path count is exponential, to pin that each
+# node is expanded once per query and the answer matches an exhaustive walk.
+add_executable(test-tensor-depends-on-visits
+    tests/test-tensor-depends-on-visits.cpp
+    attn-host-dispatch.cpp
+)
+target_include_directories(test-tensor-depends-on-visits PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-tensor-depends-on-visits PRIVATE ggml-base)
+set_target_properties(test-tensor-depends-on-visits PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-tensor-depends-on-visits COMMAND test-tensor-depends-on-visits)
+set_tests_properties(sycl-tensor-depends-on-visits PROPERTIES
+    LABELS "sycl;moe;hostonly"
+    TIMEOUT 30
+)
+
 # TKV-13 (B2) step 2: the dedicated persistent thread pool for demoted-layer
 # attention (docs/plans/2026-08-27-tkv13-b2-addendum.md §2, §6 step 2). Its
 # own class -- NOT a CpuExpertPool generalization (owner ruling 2026-08-27,
