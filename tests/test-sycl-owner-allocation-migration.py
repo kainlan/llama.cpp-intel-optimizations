@@ -655,31 +655,55 @@ with gate('futile-context-direct'):
                      r"moe_block_graphlet_requested_size\(sycl_ctx->device\)\s*>\s*0\)", direct)
     print("PASS futile-context-direct-source-gate")
 
+SEG_FLUSH_DEF = "static void moe_graph_segment_boundary_flush(const ggml_cgraph * cgraph, int start, int end, int device) {"
+SEG_FLUSH_CALLS = {
+    "record": "moe_graph_segment_boundary_flush(cgraph, seg.start, seg.end, sycl_ctx->device);",
+    "replay": "moe_graph_segment_boundary_flush(cgraph, seg.start_node, seg.end_node, sycl_ctx->device);",
+    "keyed record": "moe_graph_segment_boundary_flush(cgraph, item.start, item.end, sycl_ctx->device);",
+    "keyed replay": "moe_graph_segment_boundary_flush(cgraph, seg.start_node, seg.end_node, sycl_ctx->device);",
+}
+
+
 def check_segment_boundary_flush(code: str) -> list:
-    """llama.cpp-7pm2 B1: a recorded segment runs no per-node host code, so the segment boundary owns the
+    """llama.cpp-7pm2: a recorded segment runs no per-node host code, so the segment boundary owns the
     pending-slot flush. It runs before the queue enters recording mode (a flush inside the recording would
     capture a pinned-pool H2D and a host join into the graph) and before every recorded segment is replayed
-    (the replay would otherwise read a CPU MoE output before its H2D scatter lands). Direct segments keep the
-    per-node flushes. `code` is ggml-sycl.cpp with comments blanked."""
+    (the replay would otherwise read a CPU MoE output before its H2D scatter lands). It runs the direct path's
+    per-node consumer checks over exactly the segment's nodes, so a slot the segment does not read stays
+    deferred and keeps overlapping the GPU work after it. Direct segments keep the per-node flushes.
+    `code` is ggml-sycl.cpp with comments blanked."""
     problems = []
-    call = "moe_graph_segment_boundary_flush(sycl_ctx->device);"
     try:
-        helper = region(code, "static void moe_graph_segment_boundary_flush(int device) {", "\n}\n")
+        helper = region(code, SEG_FLUSH_DEF, "\n}\n")
         record = region(code, "static bool moe_graph_record_segments(", "struct moe_decode_segmented_graph_stats {")
         replay = region(code, "static void moe_graph_replay_segments(", "static bool graph_prestage_or_decline(")
         keyed_record = region(code, "static void moe_graph_record_segment_slot(", "static void moe_graph_replay_segment_slot(")
         keyed_replay = region(code, "static void moe_graph_replay_segment_slot(", "static bool moe_graph_record_segments(")
     except ValueError as error:
         return [str(error)]
-    for flush in ("flush_pending_cpu_scatter();", "flush_pending_cpu_pipeline();", "pipeline_scatter_drain();",
-                  "wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());",
-                  "flush_pending_attn_dispatch(device);"):
-        if flush not in helper:
-            problems.append("boundary flush helper does not run %s" % flush)
-    if code.count(call) != 4:
+    # The helper walks the segment's node range and asks each node what it consumes, as the direct path does.
+    loop = re.search(r"for \(int i = start; i < end; \+\+i\) \{\s*const ggml_tensor \* node = cgraph->nodes\[i\];"
+                     r"\s*if \(!node \|\| ggml_sycl_is_noop\(node\)\) \{\s*continue;\s*\}([\s\S]*?)\n    \}", helper)
+    if not loop:
+        problems.append("boundary flush helper does not walk the segment's nodes [start, end) skipping no-ops")
+    checks = re.findall(r"flush_pending_(\w+?)_if_consumed\(node, device\);", loop.group(1) if loop else "")
+    direct = set(re.findall(r"flush_pending_(\w+?)_if_consumed\(dst, ctx\.device\);", code))
+    if not direct:
+        problems.append("the direct path's per-node consumer flushes were not found")
+    for slot in sorted(direct - set(checks)):
+        problems.append("boundary flush helper does not check the %s slot the direct path checks per node" % slot)
+    # A whole-slot flush publishes results the segment does not read and ends their overlap early.
+    for flush in ("flush_pending_cpu_scatter()", "flush_pending_cpu_pipeline()", "pipeline_scatter_drain()",
+                  "flush_pending_secondary_scatter()", "flush_pending_attn_dispatch("):
+        if flush in helper:
+            problems.append("boundary flush helper publishes every pending slot (%s), not only what the segment "
+                            "reads" % flush)
+    total = len(re.findall(r"moe_graph_segment_boundary_flush\(", code)) - 1
+    if total != 4:
         problems.append("expected the boundary flush at exactly 4 sites (record, replay, keyed record, keyed replay), "
-                        "found %d" % code.count(call))
+                        "found %d" % total)
     # Record: after the direct-segment branch has continued, before the segment graph exists and records.
+    call = SEG_FLUSH_CALLS["record"]
     direct = record.find("if (seg_size < MIN_SEGMENT_NODES || direct_fa_segment) {")
     skip = record.find("continue;", direct)
     flush = record.find(call)
@@ -687,25 +711,27 @@ def check_segment_boundary_flush(code: str) -> list:
     begin = record.find("seg_graph.begin_recording(")
     end = record.find("seg_graph.end_recording();")
     if min(direct, skip, flush, graph, begin, end) < 0:
-        problems.append("record: an anchor is missing (direct=%d skip=%d flush=%d graph=%d begin=%d end=%d)" % (
-            direct, skip, flush, graph, begin, end))
+        problems.append("record: an anchor is missing, or the flush does not cover the segment's nodes "
+                        "(direct=%d skip=%d flush=%d graph=%d begin=%d end=%d)" % (direct, skip, flush, graph, begin, end))
     elif not (direct < skip < flush < graph < begin < end):
         problems.append("record: the flush must follow the direct-segment branch and precede the segment graph "
                         "(skip=%d flush=%d graph=%d begin=%d)" % (skip, flush, graph, begin))
-    elif call in record[begin:end] or "flush_pending_" in record[begin:end]:
+    elif "moe_graph_segment_boundary_flush(" in record[begin:end] or "flush_pending_" in record[begin:end]:
         problems.append("record: a pending-slot flush runs while the queue is recording")
     # Replay: inside the recorded-segment branch, before the submission; not in the direct branch.
+    call = SEG_FLUSH_CALLS["replay"]
     graphed = replay.find("if (seg.exec_graph) {")
     submit = replay.find("stream->ext_oneapi_graph(*seg.exec_graph);")
     direct_branch = replay.find("} else {", graphed)
     flush = replay.find(call)
     if min(graphed, submit, direct_branch, flush) < 0:
-        problems.append("replay: an anchor is missing (graphed=%d submit=%d else=%d flush=%d)" % (
-            graphed, submit, direct_branch, flush))
+        problems.append("replay: an anchor is missing, or the flush does not cover the segment's nodes "
+                        "(graphed=%d submit=%d else=%d flush=%d)" % (graphed, submit, direct_branch, flush))
     elif not (graphed < flush < submit < direct_branch):
         problems.append("replay: the flush must precede the recorded segment's submission "
                         "(graphed=%d flush=%d submit=%d)" % (graphed, flush, submit))
-    # Keyed record (B2): after the direct-run branch has continued, before the segment graph exists and records.
+    # Keyed record: after the direct-run branch has continued, before the segment graph exists and records.
+    call = SEG_FLUSH_CALLS["keyed record"]
     direct = keyed_record.find("if (!item.graph) {")
     skip = keyed_record.find("continue;", direct)
     flush = keyed_record.find(call)
@@ -714,21 +740,22 @@ def check_segment_boundary_flush(code: str) -> list:
     begin = keyed_record.find("seg_graph.begin_recording(")
     end = keyed_record.find("seg_graph.end_recording();", begin)
     if min(direct, skip, flush, graph, begin, end) < 0:
-        problems.append("keyed record: an anchor is missing (direct=%d skip=%d flush=%d graph=%d begin=%d end=%d)" % (
-            direct, skip, flush, graph, begin, end))
+        problems.append("keyed record: an anchor is missing, or the flush does not cover the segment's nodes "
+                        "(direct=%d skip=%d flush=%d graph=%d begin=%d end=%d)" % (direct, skip, flush, graph, begin, end))
     elif not (direct < skip < flush < graph < begin < end):
         problems.append("keyed record: the flush must follow the direct-run branch and precede the segment graph "
                         "(skip=%d flush=%d graph=%d begin=%d)" % (skip, flush, graph, begin))
-    elif call in keyed_record[begin:end] or "flush_pending_" in keyed_record[begin:end]:
+    elif "moe_graph_segment_boundary_flush(" in keyed_record[begin:end] or "flush_pending_" in keyed_record[begin:end]:
         problems.append("keyed record: a pending-slot flush runs while the queue is recording")
     # Keyed replay: inside the recorded-segment branch, before the submission; the direct run follows `continue;`.
+    call = SEG_FLUSH_CALLS["keyed replay"]
     graphed = keyed_replay.find("if (seg.exec_graph) {")
     submit = keyed_replay.find("stream->ext_oneapi_graph(*seg.exec_graph);")
     leave = keyed_replay.find("continue;", graphed)
     flush = keyed_replay.find(call)
     if min(graphed, submit, leave, flush) < 0:
-        problems.append("keyed replay: an anchor is missing (graphed=%d submit=%d continue=%d flush=%d)" % (
-            graphed, submit, leave, flush))
+        problems.append("keyed replay: an anchor is missing, or the flush does not cover the segment's nodes "
+                        "(graphed=%d submit=%d continue=%d flush=%d)" % (graphed, submit, leave, flush))
     elif not (graphed < flush < submit < leave):
         problems.append("keyed replay: the flush must precede the recorded segment's submission "
                         "(graphed=%d flush=%d submit=%d)" % (graphed, flush, submit))
@@ -738,44 +765,58 @@ def check_segment_boundary_flush(code: str) -> list:
 with gate('segment-boundary-flush'):
     problems = check_segment_boundary_flush(RUNTIME_CODE)
     assert not problems, "\n".join(problems)
-    # Controls: each broken ordering must be reported, or a pass above proves nothing.
-    _call = "moe_graph_segment_boundary_flush(sycl_ctx->device);"
-    _record_flush = "        " + _call + "\n        const size_t retained_baseline"
-    _replay_flush = "                " + _call + "\n                stream->ext_oneapi_graph(*seg.exec_graph);"
+    # Controls: each broken ordering, range or slot set must be reported, or a pass above proves nothing.
+    _rcall = SEG_FLUSH_CALLS["record"]
+    _pcall = SEG_FLUSH_CALLS["replay"]
+    _kcall = SEG_FLUSH_CALLS["keyed record"]
+    _record_flush = "        " + _rcall + "\n        const size_t retained_baseline"
+    _replay_flush = "                " + _pcall + "\n                stream->ext_oneapi_graph(*seg.exec_graph);"
     # The legacy replay is the first of the two replay sites; the keyed replay is the second.
     assert RUNTIME_CODE.count(_record_flush) == 1 and RUNTIME_CODE.count(_replay_flush) == 2
     _begin = "            seg_graph.begin_recording(*stream);\n"
     _keyed_record = region(RUNTIME_CODE, "static void moe_graph_record_segment_slot(", "static void moe_graph_replay_segment_slot(")
     _keyed_replay = region(RUNTIME_CODE, "static void moe_graph_replay_segment_slot(", "static bool moe_graph_record_segments(")
-    _keyed_flush = "        " + _call + "\n"
+    _keyed_flush = "        " + _kcall + "\n"
     _keyed_begin = "            seg_graph.begin_recording(*stream);\n            end_guard.open = true;\n"
     assert _keyed_record.count(_keyed_flush) == 1 and _keyed_record.count(_keyed_begin) == 1
     assert _keyed_replay.count(_replay_flush) == 1
+    _helper = region(RUNTIME_CODE, SEG_FLUSH_DEF, "\n}\n")
 
     def _in_keyed(body, old, new):
         return RUNTIME_CODE.replace(body, body.replace(old, new, 1), 1)
 
+    def _in_helper(old, new):
+        assert _helper.count(old) == 1, old
+        return RUNTIME_CODE.replace(_helper, _helper.replace(old, new, 1), 1)
+
+    _full_flush = ("    flush_pending_cpu_scatter();\n    flush_pending_cpu_pipeline();\n"
+                   "    if (ggml_sycl_pipeline_moe_enabled()) {\n        pipeline_scatter_drain();\n    }\n"
+                   "    wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());\n"
+                   "    flush_pending_attn_dispatch(device);\n")
     controls = {
         "record flush dropped": RUNTIME_CODE.replace(_record_flush, "        const size_t retained_baseline"),
         "record flush inside the recording": RUNTIME_CODE.replace(_record_flush, "        const size_t retained_baseline")
-            .replace(_begin, _begin + "            " + _call + "\n"),
+            .replace(_begin, _begin + "            " + _rcall + "\n"),
+        "record flush covers the wrong nodes": RUNTIME_CODE.replace(
+            _rcall, _rcall.replace("seg.start, seg.end", "seg.start, seg.start + 1"), 1),
         "replay flush dropped": RUNTIME_CODE.replace(_replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);", 1),
         "replay flush after the submission": RUNTIME_CODE.replace(
-            _replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);\n                " + _call, 1),
+            _replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);\n                " + _pcall, 1),
         "keyed record flush dropped": _in_keyed(_keyed_record, _keyed_flush, ""),
         "keyed record flush inside the recording": RUNTIME_CODE.replace(
             _keyed_record, _keyed_record.replace(_keyed_flush, "", 1).replace(
-                _keyed_begin, _keyed_begin + "            " + _call + "\n", 1), 1),
+                _keyed_begin, _keyed_begin + "            " + _kcall + "\n", 1), 1),
+        "keyed record flush covers another segment": _in_keyed(
+            _keyed_record, _kcall, _kcall.replace("item.start, item.end", "0, item.end")),
         "keyed replay flush dropped": _in_keyed(
             _keyed_replay, _replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);"),
         "keyed replay flush after the submission": _in_keyed(
-            _keyed_replay, _replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);\n                " + _call),
-        "attention slot not flushed": RUNTIME_CODE.replace(
-            "flush_pending_secondary_scatter());\n    flush_pending_attn_dispatch(device);\n}",
-            "flush_pending_secondary_scatter());\n}"),
-        "CPU scatter slots not flushed": RUNTIME_CODE.replace(
-            "static void moe_graph_segment_boundary_flush(int device) {\n    flush_pending_cpu_scatter();\n",
-            "static void moe_graph_segment_boundary_flush(int device) {\n"),
+            _keyed_replay, _replay_flush, "                stream->ext_oneapi_graph(*seg.exec_graph);\n                " + _pcall),
+        "attention slot not checked": _in_helper("        flush_pending_attn_if_consumed(node, device);\n", ""),
+        "CPU scatter slots not checked": _in_helper("        flush_pending_cpu_scatter_if_consumed(node, device);\n", ""),
+        "helper walks the whole graph": _in_helper("for (int i = start; i < end; ++i) {",
+                                                   "for (int i = 0; i < cgraph->n_nodes; ++i) {"),
+        "every pending slot published again": _in_helper("    for (int i = start;", _full_flush + "    for (int i = start;"),
     }
     for label, mutated in controls.items():
         assert mutated != RUNTIME_CODE, "control %r did not apply" % label

@@ -99136,22 +99136,27 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
     return false;
 }
 
-// llama.cpp-7pm2 B1: the segment boundary owns the pending-slot flush. Direct dispatch publishes a deferred
+// The segment boundary owns the pending-slot flush (llama.cpp-7pm2). Direct dispatch publishes a deferred
 // CPU-expert, secondary-device, CPU-pipeline or host-attention result in the per-node host code, at the first
 // node that reads it (flush_pending_*_if_consumed). A recorded segment has no per-node host code: replayed, it
 // would read the MoE output before its H2D scatter lands, and a flush reached while recording would capture a
-// pinned-pool H2D (and a host join) into the graph. So every active slot is flushed here, on the host, before a
-// segment is recorded and before one is replayed. The H2D copies go to the same in-order queue the segment is
-// then submitted to, which orders them ahead of it without a host wait on the device. Direct segments and MoE
-// boundary nodes keep the per-node flushes and do not call this.
-static void moe_graph_segment_boundary_flush(int device) {
-    flush_pending_cpu_scatter();
-    flush_pending_cpu_pipeline();
-    if (ggml_sycl_pipeline_moe_enabled()) {
-        pipeline_scatter_drain();
+// pinned-pool H2D (and a host join) into the graph. So the same per-node checks run here, on the host, for every
+// node of the segment before it is recorded and before it is replayed: exactly the slots one of its nodes reads
+// are published, in node order, and the rest stay deferred (a shared-expert run after the MoE section keeps
+// overlapping the CPU experts). Nothing the segment reads is then pending while it records. The H2D copies go to
+// the same in-order queue the segment is submitted to, which orders them ahead of it without a host wait on the
+// device. Direct segments and MoE boundary nodes keep the per-node flushes and do not call this.
+static void moe_graph_segment_boundary_flush(const ggml_cgraph * cgraph, int start, int end, int device) {
+    for (int i = start; i < end; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (!node || ggml_sycl_is_noop(node)) {
+            continue;
+        }
+        flush_pending_cpu_scatter_if_consumed(node, device);
+        flush_pending_secondary_scatter_if_consumed(node, device);
+        flush_pending_cpu_pipeline_if_consumed(node, device);
+        flush_pending_attn_if_consumed(node, device);
     }
-    wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());
-    flush_pending_attn_dispatch(device);
 }
 
 // A segmented record or replay bypasses compute_impl, so it owns the per-graph work compute_impl does at its
@@ -99596,8 +99601,8 @@ static void moe_graph_record_segment_slot(ggml_backend_sycl_context *           
             continue;
         }
 
-        // Publish every pending result before the queue enters recording mode (B1).
-        moe_graph_segment_boundary_flush(sycl_ctx->device);
+        // Publish what the segment reads before the queue enters recording mode.
+        moe_graph_segment_boundary_flush(cgraph, item.start, item.end, sycl_ctx->device);
         // The recording quantizes its own activations: no hit on a Q8 buffer some other dispatch filled.
         sycl_ctx->mmvq_q8_activation_cache.invalidate();
         const size_t                                     retained_baseline = slot.retained_handles.size();
@@ -99726,8 +99731,8 @@ static void moe_graph_replay_segment_slot(ggml_backend_sycl_context *           
         if (next_seg <= next_b) {
             const auto & seg = slot.segments[seg_idx++];
             if (seg.exec_graph) {
-                // The recorded segment runs no per-node flush: publish pending results first (B1).
-                moe_graph_segment_boundary_flush(sycl_ctx->device);
+                // The recorded segment runs no per-node flush: publish what it reads first.
+                moe_graph_segment_boundary_flush(cgraph, seg.start_node, seg.end_node, sycl_ctx->device);
                 stream->ext_oneapi_graph(*seg.exec_graph);
                 // The replay rewrote the Q8 buffer: the cache no longer describes it.
                 sycl_ctx->mmvq_q8_activation_cache.invalidate();
@@ -99901,8 +99906,8 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
             continue;
         }
 
-        // Publish every pending result before the queue enters recording mode (B1, above).
-        moe_graph_segment_boundary_flush(sycl_ctx->device);
+        // Publish what the segment reads before the queue enters recording mode (see the helper).
+        moe_graph_segment_boundary_flush(cgraph, seg.start, seg.end, sycl_ctx->device);
         const size_t retained_baseline = sycl_ctx->graph_retained_handles.size();
         bool segment_submitted = false;
         struct recording_depth_owner {
@@ -100198,8 +100203,8 @@ static void moe_graph_replay_segments(ggml_backend_sycl_context * sycl_ctx, ggml
             // Replay this segment
             const auto & seg = sycl_ctx->moe_segments[seg_idx];
             if (seg.exec_graph) {
-                // The recorded segment runs no per-node flush: publish pending results first (B1).
-                moe_graph_segment_boundary_flush(sycl_ctx->device);
+                // The recorded segment runs no per-node flush: publish what it reads first.
+                moe_graph_segment_boundary_flush(cgraph, seg.start_node, seg.end_node, sycl_ctx->device);
                 stream->ext_oneapi_graph(*seg.exec_graph);
                 GGML_SYCL_DEBUG(
                     "[SYCL-SEG] Replayed segment %zu "
