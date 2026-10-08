@@ -487,6 +487,7 @@ static void check_no_alloc(const char * arch_name, const config & cfg, llama_con
 
     std::unique_ptr<llama_memory_i> dummy(model.create_memory(pm, cp, true));
     if (mv.kind == "none") {
+        // not counted in n_no_alloc_cases: a kind-none fixture would lower the floor in main() (none exists today)
         CHECK(dummy == nullptr, "%s/%s: no memory, yet no_alloc built one", arch_name, cfg.name);
         return;
     }
@@ -716,6 +717,10 @@ int main() {
     // no_alloc form (deepseek32, glm_dsa, hy_v4: DSA; dots3note: DSA_ISWA; minimax_m3: MSA; deepseek4: DSV4) refuse
     // in all 3 configs, 18 cases; 60 - 18 = 42. A SKIP of any non-refused fixture, must=false or not, trips this
     // VOID by design.
+    // The count also excludes kind-none fixtures (check_no_alloc returns before counting them), and there are none:
+    // llama_model::memory_policy sets LLAMA_MEMORY_KIND_NONE only for the encoder and diffusion archs of its first
+    // case list (bert family, wavtokenizer-dec, gemma-embedding, dream, llada, llada-moe, rnd1), and no k_archs entry
+    // is among them. Adding one lowers the full count by 3 and must change this floor with it.
     CHECK(n_no_alloc_cases >= 42 && n_no_alloc_refused > 0, "VOID: %d no_alloc builds and %d refusals",
           n_no_alloc_cases, n_no_alloc_refused);
     CHECK(n_kv_cases > 0 && n_rs_cases > 0, "VOID: %d KV and %d recurrent cases", n_kv_cases, n_rs_cases);
