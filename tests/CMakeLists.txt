@@ -3839,6 +3839,19 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-ii25: source gate for the runtime allocation registry's containment index: g_runtime_alloc_registry is
+# mutated only through the helpers that keep the index in step, a row's geometry is never rewritten, neither object
+# leaves unified-cache.cpp, and unified_lookup_runtime_allocation() queries the index instead of scanning. The index
+# logic itself is test-address-range-index; the registry wiring is test-sycl-runtime-registry-containment (both in
+# ggml/src/ggml-sycl/CMakeLists.txt). Host-only, reads the sources as text.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-runtime-registry-index-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-runtime-registry-index-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-xojq: source gate for nphx Task 4b -- the SYCL auto micro-batch
 # selection trial (llama_context::sycl_select_auto_ubatch()) and its one
 # call site in the llama_context constructor. Pins the four-condition gate
