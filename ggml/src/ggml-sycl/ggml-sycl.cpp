@@ -99514,9 +99514,13 @@ static bool moe_segment_slot_staging_matches(ggml_backend_sycl_context *        
 }
 
 // A slot whose graphs a failed drain could not prove idle may still be running them, so its graphs and the handles
-// they read are kept for the life of the process: never destroyed, never reused.
+// they read are kept for the life of the process: never destroyed, never reused. The failed-drain callers (the
+// retired-slot drain and the record catch) do not all hold g_sycl_graph_compute_mutex, and two contexts can fail at
+// once, so the list has its own lock.
 static void moe_segment_slot_keep_alive(ggml_backend_sycl_context::moe_segment_slot && slot) {
-    static auto * kept = new std::vector<ggml_backend_sycl_context::moe_segment_slot>();
+    static std::mutex           kept_mutex;
+    static auto *               kept = new std::vector<ggml_backend_sycl_context::moe_segment_slot>();
+    std::lock_guard<std::mutex> lock(kept_mutex);
     kept->push_back(std::move(slot));
 }
 
