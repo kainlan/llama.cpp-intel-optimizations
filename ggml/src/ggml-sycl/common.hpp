@@ -6250,6 +6250,9 @@ struct ggml_backend_sycl_context {
     bool     moe_graphs_disabled_once = false;  // Set when we skip graphs for a single run
     bool     moe_graph_rerecord       = false;  // Once set, never cleared — MoE models always re-record per token
     bool     graph_recording_dispatch = false;  // Context-scoped guard while compute_impl records a command graph
+    // Phase of the last split this context classified. A split with no matmul has no batch evidence and keeps it
+    // (graph-phase.hpp). Atomic because the classification runs before graph_mutex is taken.
+    std::atomic<bool> graph_phase_is_decode{ false };
     uint64_t test_graph_replay_count  = 0;
 
     // One published retention epoch owns every MMID graphlet currently cached

@@ -103,6 +103,7 @@
 #include "ggml-sycl/fusion-alias.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
+#include "ggml-sycl/graph-phase.hpp"
 #include "ggml-sycl/graph-recorder-scope.hpp"
 #include "ggml-sycl/host-weight-alias.hpp"
 #include "ggml-sycl/kernel-selection.hpp"
@@ -91625,15 +91626,11 @@ static void ggml_sycl_block_exec_dense_drop_graphs(ggml_backend_sycl_context * c
 
 static uint64_t ggml_sycl_graph_signature(const ggml_cgraph * cgraph);
 
-// A decode graph: its first MUL_MAT multiplies a single row. The scan stops at
-// the first MUL_MAT, so it is O(1) in practice.
-static bool ggml_sycl_graph_is_decode(const ggml_cgraph * cgraph) {
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && cgraph->nodes[i]->src[1]) {
-            return cgraph->nodes[i]->src[1]->ne[1] == 1;
-        }
-    }
-    return false;
+// A decode graph: its first matmul, dense or routed, carries a single row. A
+// split with no matmul keeps the context's previous phase (graph-phase.hpp says
+// why). The scan stops at the first matmul, so it is O(1) in practice.
+static bool ggml_sycl_graph_is_decode(const ggml_cgraph * cgraph, bool previous_is_decode) {
+    return ggml_sycl::graph_phase_is_decode(cgraph->nodes, cgraph->n_nodes, previous_is_decode);
 }
 
 #ifdef GGML_SYCL_GRAPH
@@ -92040,8 +92037,10 @@ class ggml_sycl_block_exec_dense_run {
     void prepare_graphs() {
         graphs_on_ = false;
 
+        const bool previous_is_decode = ctx_.graph_phase_is_decode.load(std::memory_order_relaxed);
+
         ggml_sycl::dense_graph_facts f{};
-        f.is_decode     = ggml_sycl_graph_is_decode(cgraph_);
+        f.is_decode     = ggml_sycl_graph_is_decode(cgraph_, previous_is_decode);
         f.enabled       = ggml_sycl_block_exec_dense_graph_enabled();
         f.disable_graph = g_ggml_sycl_disable_graph != 0;
         // The diagnostics that wait on or read back from the queue inside the
@@ -107671,7 +107670,9 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     // when GPU prefix mode truncates the graph, so caching by n_nodes alone
     // returns stale PP phase during TG, causing graph replay with wrong shapes.
     // Computed BEFORE arena reset so per-PP profiling can include reset cost.
-    const bool cached_is_decode = ggml_sycl_graph_is_decode(cgraph);
+    const bool cached_is_decode =
+        ggml_sycl_graph_is_decode(cgraph, sycl_ctx->graph_phase_is_decode.load(std::memory_order_relaxed));
+    sycl_ctx->graph_phase_is_decode.store(cached_is_decode, std::memory_order_relaxed);
     ggml_sycl::offload_stats_set_phase(cached_is_decode ? ggml_sycl::offload_phase::TG : ggml_sycl::offload_phase::PP);
     const bool arena_pp_profile_active = ggml_sycl::arena_pp_profile_begin(sycl_ctx->device, !cached_is_decode);
     pp_scratch_profile_begin(!cached_is_decode);
@@ -108809,10 +108810,9 @@ normal_dispatch:
     }
 
     if (refresh_moe_after_pp) {
-        // The refresh fires whenever a split without MUL_MAT precedes a MUL_MAT split
-        // (ggml_sycl_graph_is_decode), about four times per token; log the first and
-        // then, with GGML_SYCL_HOSTMEM=1, one per 30 s. Whether the refresh itself should be once-only is a
-        // separate question this diagnostic does not change.
+        // The refresh fires on the first decode split after a prompt split. A split with no matmul keeps the
+        // previous phase (ggml_sycl_graph_is_decode), so it no longer reads as a prompt mid-token. With
+        // GGML_SYCL_HOSTMEM=1 log the first and then one per 30 s.
         const bool hostmem_logged =
             ggml_sycl_log_host_mem(ggml_sycl::host_mem_phase::PP_TO_TG_BEFORE, "pp-to-tg-before-refresh");
         if (ggml_sycl_materialize_moe_down_i8_hotset(*sycl_ctx, cgraph) > 0) {
