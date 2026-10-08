@@ -601,6 +601,11 @@ with gate('futile-context-direct'):
     rest = policy.index("} else if (!use_sycl_graph && cached_is_decode) {", reason)
     assert "replay futility gate tripped for this context" in policy[reason:rest]
     assert "ggml_sycl_graph_has_host_inputs" not in policy[reason:rest]
+    # The no-graph path's block graphlets record command graphs, so a replay-futile context never tries them.
+    direct = region(compute[compute.rindex("bool block_graphlet_executed = false;"):],
+                    "bool block_graphlet_executed = false;", "if (!block_graphlet_executed)")
+    assert re.search(r"if \(cached_is_decode && !sycl_ctx->exec_graph_replay_futile &&\s*"
+                     r"moe_block_graphlet_requested_size\(sycl_ctx->device\)\s*>\s*0\)", direct)
     print("PASS futile-context-direct-source-gate")
 
 with gate('moe-metadata'):

@@ -110159,8 +110159,10 @@ normal_dispatch:
     {
 #ifdef GGML_SYCL_GRAPH
         bool block_graphlet_executed = false;
-        // The graph is hashed only when block graphlets can run; with them off the try would reject anyway.
-        if (cached_is_decode && moe_block_graphlet_requested_size(sycl_ctx->device) > 0) {
+        // The graph is hashed only when block graphlets can run; with them off the try would reject anyway. They
+        // record command graphs, which a replay-futile context has given up on.
+        if (cached_is_decode && !sycl_ctx->exec_graph_replay_futile &&
+            moe_block_graphlet_requested_size(sycl_ctx->device) > 0) {
             const uint64_t block_graph_hash = ggml_sycl_graph_signature(cgraph);
             if (moe_graph_try_block_graphlets(sycl_ctx, cgraph, block_graph_hash, cached_is_decode)) {
                 graph_executed          = true;
@@ -110171,7 +110173,8 @@ normal_dispatch:
                 }
             }
         } else if (cached_is_decode) {
-            // The reject the skipped try would have recorded, so the aggregation state stays truthful.
+            // The reject the skipped try would have recorded (graphlets off, or off for this replay-futile context),
+            // so the aggregation state stays truthful.
             sycl_ctx->moe_aggregation_last_decision = "block-graphlet";
             sycl_ctx->moe_aggregation_last_reject   = "disabled";
         }
