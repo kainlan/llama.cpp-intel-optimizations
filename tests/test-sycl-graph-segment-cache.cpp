@@ -67,8 +67,8 @@ int test_hasher() {
     CHECK(a.value() != b.value(), "mix() ignores the byte position");
 
     // max_len bounds the read: a name without a terminator inside the bound hashes its first max_len bytes.
-    char        bounded[4] = { 'a', 'b', 'c', 'd' };
-    const char * abc[]     = { "abc" };
+    char            bounded[4] = { 'a', 'b', 'c', 'd' };
+    const char *    abc[]      = { "abc" };
     gsc::key_hasher c;
     c.mix_name(bounded, 3);
     CHECK(c.value() == hash_names(abc, 1), "mix_name reads past max_len");
@@ -90,10 +90,10 @@ int test_key_fields() {
     k = base;
     k.n_nodes++;
     CHECK(k != base, "n_nodes is not part of the key");
-    k = base;
+    k        = base;
     k.device = 1;
     CHECK(k != base, "device is not part of the key");
-    k = base;
+    k           = base;
     k.is_decode = false;
     CHECK(k != base, "phase is not part of the key");
     return 0;

@@ -110606,9 +110606,10 @@ normal_dispatch:
                             }
                             sycl_ctx->moe_segment_slots.record_failed(slot_key);
                             if (!drained) {
-                                GGML_LOG_ERROR("[SYCL-SEG-SLOT] record-failure drain failed on device %d; keeping "
-                                               "the slot's %d graph(s) alive\n",
-                                               sycl_ctx->device, slot.graphed_segments);
+                                GGML_LOG_ERROR(
+                                    "[SYCL-SEG-SLOT] record-failure drain failed on device %d; keeping "
+                                    "the slot's %d graph(s) alive\n",
+                                    sycl_ctx->device, slot.graphed_segments);
                                 sycl_ctx->moe_graphs_disabled = true;
                                 moe_segment_slot_keep_alive(std::move(slot));
                             }
