@@ -206,9 +206,43 @@ def strip_comments(text):
     return "".join(out)
 
 
+# The longest plain identifier in a signature is a literal every match contains, so instead of scanning the whole
+# 6 MB source from a `\b` anchor (which defeats the regex engine's literal prefilter) the search visits the
+# identifier's occurrences in order and searches a window around each: from _ANCHOR_REACH before it to _ANCHOR_SPAN
+# after it.  The leftmost match contains some occurrence; every match that starts earlier would contain an earlier
+# one, whose window was searched first, so the first window that matches answers the same match a full search
+# would.  That holds while a match starts within _ANCHOR_REACH of its identifier and ends within _ANCHOR_SPAN of it
+# (a declaration header, which is far shorter).  A signature with alternation, an optional or starred group, or no
+# identifier of 8+ characters is searched from the start as before.  The gate runs its whole check once per mutant,
+# and the full scan put it at its ctest TIMEOUT.
+_ANCHOR_REACH = 4096
+_ANCHOR_SPAN = 16384
+_ANCHOR_CACHE = {}
+
+
+def _signature_anchor(signature_re):
+    if signature_re not in _ANCHOR_CACHE:
+        anchor = None
+        if "|" not in signature_re and not re.search(r"\)[*?]", signature_re):
+            words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", re.sub(r"\\.", " ", signature_re))
+            longest = max(words, key=len) if words else ""
+            anchor = longest if len(longest) >= 8 else None
+        _ANCHOR_CACHE[signature_re] = anchor
+    return _ANCHOR_CACHE[signature_re]
+
+
 def function_body(text, signature_re):
     """The brace-balanced body of the first definition whose header matches signature_re, or None."""
-    m = re.search(signature_re + r"[^;{]*\{", text)
+    pattern = re.compile(signature_re + r"[^;{]*\{")
+    anchor = _signature_anchor(signature_re)
+    if anchor is None:
+        m = pattern.search(text)
+    else:
+        m = None
+        at = text.find(anchor)
+        while at >= 0 and m is None:
+            m = pattern.search(text, max(0, at - _ANCHOR_REACH), at + len(anchor) + _ANCHOR_SPAN)
+            at = text.find(anchor, at + 1)
     if not m:
         return None
     i = m.end() - 1
