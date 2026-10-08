@@ -390,6 +390,12 @@ static void check_shapes(const char * arch_name, const config & cfg, llama_conte
     // recurrent state: exactly the offloaded layers the memory created r/s for
     if (mv.rs == nullptr) {
         CHECK(rs.layers.empty(), "%s/%s: no recurrent memory but %zu RS layers", arch_name, cfg.name, rs.layers.size());
+    } else if (model.hparams.ple_conv_state() > 0) {
+        // a PLE layer's conv history is a third state tensor (p_l) the RS shape has no place for: the publisher
+        // refuses the model by that name and publishes nothing
+        CHECK(rs.unsupported == "llama_memory_recurrent (PLE conv-state row)" && rs.layers.empty(),
+              "%s/%s: a PLE model's RS shapes must be the named refusal, got '%s' and %zu layers", arch_name, cfg.name,
+              rs.unsupported.c_str(), rs.layers.size());
     } else {
         CHECK(rs.unsupported.empty(), "%s/%s: RS reported unsupported: %s", arch_name, cfg.name,
               rs.unsupported.c_str());

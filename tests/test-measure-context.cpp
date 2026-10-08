@@ -500,7 +500,9 @@ static void check_run_paths() {
 }
 
 int main() {
-    static const llm_arch archs[] = { LLM_ARCH_LLAMA, LLM_ARCH_GEMMA3, LLM_ARCH_MAMBA, LLM_ARCH_QWEN35 };
+    // qwen4exp: llama_memory_hybrid_idx, whose indexer cache the measure builds on dummies like the others
+    static const llm_arch archs[] = { LLM_ARCH_LLAMA, LLM_ARCH_GEMMA3, LLM_ARCH_MAMBA, LLM_ARCH_QWEN35,
+                                      LLM_ARCH_QWEN4EXP };
     for (llm_arch arch : archs) {
         for (bool fa : { false, true }) {
             // 0: every token yields an output. 1: the output gather leaves one row, so the last layer
