@@ -151,9 +151,10 @@ def claim_helper_claims_the_whole_plan(sycl: str) -> bool:
     # A claim that fails is reported, never fatal: no abort or assert form anywhere in the helper's CODE (string
     # literals are blanked first, since the WARN's own text names the abort a later op can still meet).
     code = re.sub(r"\"(?:\\.|[^\"\\])*\"", '""', helper)
-    fatal = ("GGML_ABORT", "GGML_ASSERT(", "abort(")
+    # A call of any of them, however spaced before its parenthesis (`GGML_ASSERT (x)`, `assert(x)`).
+    fatal = re.search(r"\b(GGML_ABORT|GGML_ASSERT|abort|assert)\s*\(", code)
     return ("return" not in before_read and "return" not in skip_to_claim and "GGML_LOG_WARN(" in helper
-            and not any(f in code for f in fatal) and "malloc" not in code)
+            and fatal is None and "malloc" not in code)
 
 
 def claim_runtime_scratch_stays_in_the_runtime_zone(common: str) -> bool:
@@ -288,6 +289,15 @@ def test_mutant_claim_that_aborts_fails():
 def test_mutant_claim_that_asserts_fails():
     assert not claim_helper_claims_the_whole_plan(
         _once(SYCL, _WARN_ANCHOR, "    GGML_ASSERT(false && \"claim failed\");\n" + _WARN_ANCHOR))
+
+
+def test_mutant_claim_that_asserts_with_a_space_fails():
+    assert not claim_helper_claims_the_whole_plan(
+        _once(SYCL, _WARN_ANCHOR, "    GGML_ASSERT (false && \"x\");\n" + _WARN_ANCHOR))
+
+
+def test_mutant_claim_with_a_plain_assert_fails():
+    assert not claim_helper_claims_the_whole_plan(_once(SYCL, _WARN_ANCHOR, "    assert(false);\n" + _WARN_ANCHOR))
 
 
 def test_mutant_claim_short_circuited_fails():
