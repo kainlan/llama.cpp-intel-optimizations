@@ -392,24 +392,6 @@ def test_mmvq_eight_decode_arms_use_shared_helper_with_bytes_set() -> None:
         )
 
 
-if __name__ == "__main__":
-    import sys
-
-    failures = 0
-    for fn_name, fn in sorted(list(globals().items())):
-        if fn_name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS {fn_name}")
-            except AssertionError as exc:
-                failures += 1
-                print(f"FAIL {fn_name}: {exc}")
-    if failures:
-        print(f"{failures} test(s) failed")
-        sys.exit(1)
-    print("all tests passed")
-
-
 def test_mmvq_moe_id_kernels_have_named_profile_labels() -> None:
     mmvq = MMVQ.read_text(encoding="utf-8")
 
@@ -439,3 +421,28 @@ def test_mmvq_moe_id_kernels_have_named_profile_labels() -> None:
         assert "ggml_sycl_profile_submit(*stream" in body, label
         assert "mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches)" in body, label
     assert mmvq.count('"mulmat.mmvq.id_soa_mxfp4_coalesced"') == 1
+    mxfp4_aos = slice_between(mmvq, "static void mul_mat_vec_mxfp4_q8_1_id_sycl", "template <bool VECTOR_QS_LOAD = false>")
+    assert "mulmat.mmvq.id_aos_mxfp4" in mxfp4_aos
+    assert "ggml_sycl_profile_submit(*stream" in mxfp4_aos
+    assert "mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches)" in mxfp4_aos
+    helpers = slice_between(mmvq, "static std::string mmvq_id_profile_metadata", "static sycl::event mmvq_profile_submit_quantize")
+    assert helpers.count("ggml_sycl_kernel_profile_enabled()") == 2
+
+
+if __name__ == "__main__":
+    import sys
+
+    failures = 0
+    for fn_name, fn in sorted(list(globals().items())):
+        if fn_name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"PASS {fn_name}")
+            except AssertionError as exc:
+                failures += 1
+                print(f"FAIL {fn_name}: {exc}")
+    if failures:
+        print(f"{failures} test(s) failed")
+        sys.exit(1)
+    print("all tests passed")
+

@@ -65,13 +65,20 @@ static ggml_sycl_profile_label mmvq_profile_label(sycl::queue & queue,
 
 // MoE id-kernel metadata shared by the MUL_MAT_ID profile labels (llama.cpp-bzkx):
 // total_batches is the (expert, token) slot count the grid is launched over.
+// Both id-label string helpers return an empty string (no allocation) while the profiler is off.
 static std::string mmvq_id_profile_metadata(int ncols, int nrows_per_expert, int total_batches) {
+    if (!ggml_sycl_kernel_profile_enabled()) {
+        return std::string();
+    }
     return "ncols=" + std::to_string(ncols) + ";nrows_per_expert=" + std::to_string(nrows_per_expert) +
            ";total_batches=" + std::to_string(total_batches);
 }
 
 // Label name for the type-generic AOS id kernel: mulmat.mmvq.id_aos_<ggml_type_name, lowercased>.
 static std::string mmvq_id_aos_profile_name(ggml_type type) {
+    if (!ggml_sycl_kernel_profile_enabled()) {
+        return std::string();
+    }
     std::string name = std::string("mulmat.mmvq.id_aos_") + ggml_type_name(type);
     for (char & c : name) {
         c = (char) std::tolower((unsigned char) c);
@@ -5493,16 +5500,24 @@ static void mul_mat_vec_mxfp4_q8_1_id_sycl(const void *                     vx,
 
     // Use generic template with vec_dot_mxfp4_q8_1 function pointer
     // This matches how Q4_0 and Q8_0 work
-    sycl::event ev = stream->submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_q_id<QK_MXFP4, QI_MXFP4, block_mxfp4, VDR_MXFP4_Q8_1_MMVQ, vec_dot_mxfp4_q8_1>(
-                                 vx, expert_ptrs, vy, dst, ids, ncols, nrows_per_expert, n_ids, n_tokens, ne11,
-                                 stride_expert_x, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
-                         });
+    // llama.cpp-bzkx: MXFP4 AOS id kernel, previously dark to GGML_SYCL_KERNEL_PROFILE.
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.id_aos_mxfp4", profile_metadata.c_str(), "mulmat");
+
+    sycl::event ev = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_id<QK_MXFP4, QI_MXFP4, block_mxfp4, VDR_MXFP4_Q8_1_MMVQ, vec_dot_mxfp4_q8_1>(
+                        vx, expert_ptrs, vy, dst, ids, ncols, nrows_per_expert, n_ids, n_tokens, ne11, stride_expert_x,
+                        ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
+                });
+        });
     });
     if (event_out) {
         *event_out = ev;
