@@ -1126,6 +1126,84 @@ with gate('keyed-slot-input-staging'):
         assert check_keyed_slot_input_staging(*args), "control %r was not caught" % label
     print("PASS keyed-slot-input-staging-source-gate (%d controls caught)" % len(controls))
 
+def check_keyed_plan_and_key(code: str) -> list:
+    """llama.cpp-7pm2 review I1: the invariants keyed replay rests on.
+    Plan: every MUL_MAT_ID is a direct boundary (its routing and the yx28/CPU-expert executors change per token),
+    so are the ffn_moe_* nodes of its expert section (the fused executor decides per call what it computes),
+    FLASH_ATTN_EXT unless FA capture is allowed, and host-dispatched attention; only runs of at least min_nodes
+    working nodes record. Key: names and storage of every leaf, node and src; storage is the buffer's owner
+    identity plus the offset inside it, never a raw address. Slot: it retains the weight handles its graphs read."""
+    problems = []
+    try:
+        plan = region(code, "static std::vector<moe_graph_keyed_item> moe_graph_keyed_plan(", "\n}\n")
+        key = region(code, "static ggml_sycl::graph_segment_cache::key moe_segment_slot_key(", "\n}\n")
+        ident = region(code, "static uint64_t moe_segment_buffer_identity(", "\n}\n")
+        record = region(code, "static void moe_graph_record_segment_slot(", "static void moe_graph_replay_segment_slot(")
+    except ValueError as error:
+        return [str(error)]
+    if not re.search(r"boundary = node->op == GGML_OP_MUL_MAT_ID \|\| \(expert_section && moe_named\) \|\|\s*"
+                     r"\(node->op == GGML_OP_FLASH_ATTN_EXT && !fa_graph\) \|\|\s*"
+                     r"\(host_attn && \(node->op == GGML_OP_FLASH_ATTN_EXT \|\| node->op == GGML_OP_SET_ROWS\) &&", plan):
+        problems.append("plan: MUL_MAT_ID, expert-section, FA or host-attention nodes are not all boundaries")
+    if not re.search(r"const bool moe_named = std::strncmp\(node->name, \"ffn_moe_\", 8\) == 0;\s*"
+                     r"if \(node->op == GGML_OP_MUL_MAT_ID\)\s*\{\s*expert_section = true;\s*\}\s*"
+                     r"else if \(node->name\[0\] != '\\0' && !moe_named\)\s*\{\s*expert_section = false;\s*\}", plan):
+        problems.append("plan: the expert section does not run from a MUL_MAT_ID to the next named non-ffn_moe node")
+    if not re.search(r"if \(boundary\)\s*\{\s*close_run\(i\);\s*plan\.push_back\(\{ i, i \+ 1, true, false \}\);", plan):
+        problems.append("plan: a boundary is not its own direct, never-graphed step")
+    if "plan.push_back({ run_start, end, false, run_work >= min_nodes });" not in plan:
+        problems.append("plan: a run records regardless of its size")
+    for needle, what in (("names.mix_name(t->name, GGML_MAX_NAME);", "names"),
+                         ("storage.mix(sb->identity);", "owner identity"),
+                         ("storage.mix(sb->base ? static_cast<uint64_t>(static_cast<const char *>(t->data) - sb->base) : 0);",
+                          "offset inside the buffer"),
+                         ("k.signature = signature;", "signature"), ("k.names     = names.value();", "names value"),
+                         ("k.storage   = storage.value();", "storage value"), ("k.n_nodes   = cgraph->n_nodes;", "n_nodes"),
+                         ("k.device    = ctx->device;", "device"), ("k.is_decode = is_decode;", "phase"),
+                         ("mix_tensor(cgraph->leafs[i]);", "leafs"), ("mix_tensor(node);", "nodes"),
+                         ("mix_tensor(node->src[j]);", "srcs")):
+        if needle not in key:
+            problems.append("key: missing %s" % what)
+    if re.search(r"(reinterpret_cast<u?int\w*>|\(u?int\w*_t\)\s*|static_cast<u?int\w*_t>\()\s*\(?t->data\b", key):
+        problems.append("key: a raw tensor address is mixed into the key")
+    if not re.search(r"bctx->managed_handle\.has_stable_owner_identity\(\)\)\s*\{\s*return static_cast<uint64_t>"
+                     r"\(bctx->managed_handle\.stable_identity_hash\(\)\) \^", ident):
+        problems.append("key: a SYCL buffer is not identified by its mem_handle owner identity")
+    weights = re.search(r"if \(!root \|\| !ggml_sycl_tensor_is_weight\(root\)\)\s*\{\s*continue;\s*\}[\s\S]*?"
+                        r"slot\.retained_handles\.push_back\(extra->data_handle\[device\]\);", record)
+    push = record.find("slot.segments.push_back({ item.start, item.end, std::move(exec) });")
+    if not weights or push < 0 or weights.end() > push:
+        problems.append("slot: a recorded segment does not retain the weight handles its nodes read")
+    if "slot.retained_handles.push_back(q8);" not in record:
+        problems.append("slot: the Q8 activation buffer the graphs bake is not retained")
+    return problems
+
+
+with gate('keyed-plan-and-key'):
+    problems = check_keyed_plan_and_key(RUNTIME_CODE)
+    assert not problems, "\n".join(problems)
+    controls = (
+        ("M1 MUL_MAT_ID recorded", r"boundary = node->op == GGML_OP_MUL_MAT_ID \|\| ", "boundary = "),
+        ("expert section never ends", r"else if \(node->name\[0\] != '\\0' && !moe_named\)", "else if (false)"),
+        ("FA recorded", r"\(node->op == GGML_OP_FLASH_ATTN_EXT && !fa_graph\) \|\|", "false ||"),
+        ("small runs recorded", r"run_work >= min_nodes \}\);", "true });"),
+        ("boundary graphed", r"plan\.push_back\(\{ i, i \+ 1, true, false \}\);", "plan.push_back({ i, i + 1, false, true });"),
+        ("M2 raw address", r"storage\.mix\(sb->identity\);", "storage.mix(reinterpret_cast<uint64_t>(t->data));"),
+        ("offset dropped", r"storage\.mix\(sb->base \? [^\n]*\n", "\n"),
+        ("M3 names dropped", r"k\.names     = names\.value\(\);", "k.names     = 0;"),
+        ("srcs not keyed", r"mix_tensor\(node->src\[j\]\);", "(void) j;"),
+        ("buffer identity from size", r"return static_cast<uint64_t>\(bctx->managed_handle\.stable_identity_hash\(\)\) \^",
+         "return 0 ^"),
+        ("M4 weights not retained", r"slot\.retained_handles\.push_back\(extra->data_handle\[device\]\);", "(void) extra;"),
+        ("Q8 not retained", r"slot\.retained_handles\.push_back\(q8\);", "(void) q8;"),
+    )
+    for label, pattern, repl in controls:
+        assert len(re.findall(pattern, RUNTIME_CODE)) == 1, "control %r anchor (%d)" % (
+            label, len(re.findall(pattern, RUNTIME_CODE)))
+        assert check_keyed_plan_and_key(re.sub(pattern, repl, RUNTIME_CODE, count=1)), \
+            "control %r was not caught" % label
+    print("PASS keyed-plan-and-key-source-gate (%d controls caught)" % len(controls))
+
 with gate('moe-metadata'):
     # Metadata and its derived group registry are built locally and atomically
     # swapped under both writer locks; bad_alloc preserves the old epoch.
