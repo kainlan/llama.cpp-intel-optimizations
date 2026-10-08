@@ -1,10 +1,13 @@
 #pragma once
 
 // The proc-address names of the measured-tenant entry points (ggml-sycl.h, "The measured-tenant
-// publish, its coverage query and the load-time late check"). The SYCL reg's get_proc_address
-// answers each name with the function of the same name, and a caller that resolves them
+// publish, its coverage query and the load-time late check"). A caller that resolves them
 // (src/llama-context.cpp, through ggml_backend_reg_get_proc_address in every link mode) names
-// them only by these macros, so the answer table and the readers cannot drift apart.
+// them only by these macros. The SYCL reg's get_proc_address does not use the macros: it answers
+// each name, spelled there as a string literal, with the function of the same name.
+// scripts/check-sycl-l4-proc-registration.py pins those literals to the `Proc name:` lines in
+// ggml-sycl.h. No gate compares the strings below with those literals, so renaming a proc means
+// changing all three spellings.
 //
 // A backend that does not define one of them answers null, which every reader treats as
 // inert: UNSUPPORTED for the publish, GROWTH for the coverage query, NOT_RECORDED for the

@@ -104,8 +104,11 @@ inline void graph_record_begin_note() {
 // has (whole-graph, segment, block, graphlet and dense-range replays, and the submit right
 // after a recording).  A call that only replays a recorded graph begins no recording, so the
 // begin counter above cannot see it; yet the graph it submits has its staging addresses
-// baked in, so graph_compute's exit must not treat it as an eager call.  Every submission goes
-// through graph_exec_submit(), so a site cannot submit one uncounted.
+// baked in, so graph_compute's exit must not treat it as an eager call.  Every submission in
+// ggml-sycl.cpp's graph paths goes through graph_exec_submit(), and test-sycl-holder-census-source
+// refuses a bare ext_oneapi_graph() there.  The census scans only ggml-sycl.cpp: unified-kernel.cpp's
+// opt-in GGML_SYCL_PERSISTENT_TG_MICRO_GRAPH replay and its overhead bench still submit bare and are
+// not counted.
 inline uint64_t & graph_exec_submit_slot() {
     static thread_local uint64_t submits = 0;
     return submits;

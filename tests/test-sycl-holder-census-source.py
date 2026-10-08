@@ -455,6 +455,11 @@ def violations(files):
     hs = func_bodies(main, "sycl_exec_graph_has_recorded_state")
     if len(hs) != 1 or "graph_input_staging_has_tenants(" not in text_of(main, hs[0]):
         out.append("%s: sycl_exec_graph_has_recorded_state does not name the parked tenant staging entries" % MAIN)
+    # A keyed segment slot (llama.cpp-7pm2) holds retained handles and owning input-staging copies, and a retired one
+    # waits for its drain, so the predicate must name both or a re-plan returns early and the slots keep their handles.
+    if len(hs) != 1 or not re.search(r"moe_segment_slots\.size\(\)\s*!=\s*0\s*\|\|\s*ctx->moe_segment_slots\.has_retired\(\)",
+                                     text_of(main, hs[0])):
+        out.append("%s: sycl_exec_graph_has_recorded_state does not name the keyed segment slots" % MAIN)
     com = code(files, COMMON)
     ct = re.search(r"size_t\s+graph_input_staging_tenant_count\s*\(\s*\)\s*const\s*\{(?P<body>[^}]*)\}", com)
     ht = re.search(r"bool\s+graph_input_staging_has_tenants\s*\(\s*\)\s*const\s*\{(?P<body>[^}]*)\}", com)
@@ -465,6 +470,8 @@ def violations(files):
     sc = func_bodies(main, "sycl_exec_graph_clear_scoped")
     if len(sc) != 1 or "graph_input_staging_clear(" not in text_of(main, sc[0]):
         out.append("%s: the scoped clear body does not clear graph_input_staging" % MAIN)
+    if len(sc) != 1 or "invalidate_moe_segments(" not in text_of(main, sc[0]):
+        out.append("%s: the scoped clear body does not retire the MoE segments and keyed slots" % MAIN)
     # every executable-graph submission counts itself: the raw queue call exists only inside the counting helper
     rec_h = code(files, RECS)
     raw = [m.start() for m in re.finditer(r"\.\s*ext_oneapi_graph\s*\(|->\s*ext_oneapi_graph\s*\(", main)]
@@ -645,6 +652,16 @@ def mutants(files):
     yield ("a recorded-state predicate that ignores parked tenant staging",
            edit(files, M, "if (ctx->graph_input_staging_has_tenants()) {\n        return true;\n    }\n", "", "k46"),
            "does not name the parked tenant staging entries")
+    yield ("a recorded-state predicate that ignores the keyed segment slots",
+           edit(files, M, "if (ctx->moe_segment_slots.size() != 0 || ctx->moe_segment_slots.has_retired()) {\n        return true;\n    }\n",
+                "", "k49"), "does not name the keyed segment slots")
+    yield ("a recorded-state predicate that ignores retired slots awaiting their drain",
+           edit(files, M, "ctx->moe_segment_slots.size() != 0 || ctx->moe_segment_slots.has_retired()",
+                "ctx->moe_segment_slots.size() != 0", "k50"), "does not name the keyed segment slots")
+    yield ("a scoped clear that leaves the segments and keyed slots",
+           edit(files, M, "ctx->invalidate_moe_segments();\n    ctx->invalidate_moe_block_graphs();",
+                "ctx->invalidate_moe_block_graphs();", "k51"),
+           "does not retire the MoE segments and keyed slots")
     yield ("a has-tenants test that tests nothing",
            edit(files, COMMON, "n += entry.second.handle.tenant_cohort() != nullptr ? 1 : 0;", "n += 0;", "k47"), "does not test the tenant tag")
     yield ("a scoped clear that leaves the staging map",

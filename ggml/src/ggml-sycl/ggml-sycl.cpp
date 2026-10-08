@@ -105204,6 +105204,11 @@ static bool sycl_exec_graph_has_recorded_state(ggml_backend_sycl_context * ctx) 
     if (ctx->graph_input_staging_has_tenants()) {
         return true;
     }
+    // A keyed decode split's segment slot (llama.cpp-7pm2) owns retained handles and owning input-staging copies, and a
+    // retired slot holds its graphs until the queue drains. The scoped clear retires both via invalidate_moe_segments().
+    if (ctx->moe_segment_slots.size() != 0 || ctx->moe_segment_slots.has_retired()) {
+        return true;
+    }
     if (ctx->moe_segments_valid || ctx->moe_block_graphs_valid || !ctx->moe_direct_dispatch_graphs.empty() ||
         !ctx->moe_sequence_graphs.empty()) {
         return true;
