@@ -48,7 +48,7 @@ _MUL_MAT = (
     "const ggml_tensor * src1, ggml_tensor * dst, const layout_mode * forced_layout = nullptr)"
 )
 _BATCHED = (
-    "static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, "
+    "[[nodiscard]] static bool ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, "
     "const ggml_tensor * src1, ggml_tensor * dst) try"
 )
 _ENV_OF = (
@@ -85,7 +85,9 @@ def dispatch_ok(code: str) -> bool:
         f"if (f16_route == {_R}KQ_P021) {{",
         f"}} else if (f16_route == {_R}VEC_NC) {{",
         f"}} else if (f16_route == {_R}KQKV_BATCHED || f16_route == {_R}KQKV_SCALAR) {{",
-        f"if (f16_route == {_R}KQKV_BATCHED) {{ try {{ ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);",
+        # the batched op returns false on a declined oneDNN scratchpad (llama.cpp-23mk S3-4); the branch consumes it
+        f"if (f16_route == {_R}KQKV_BATCHED) {{ bool batched_declined = false; try {{ "
+        "batched_declined = !ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);",
     ]
     for p in pins:
         if b.count(z(p)) != 1:
@@ -121,7 +123,8 @@ def test_dispatch_mutants():
         ("the kqv branch not the classifier's", f"}} else if (f16_route == {_R}VEC_NC) {{",
          "} else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0)) {"),
         ("the scalar branch lost", f"f16_route == {_R}KQKV_BATCHED || f16_route == {_R}KQKV_SCALAR", f"f16_route == {_R}KQKV_BATCHED"),
-        ("the batched branch not the classifier's", f"if (f16_route == {_R}KQKV_BATCHED) {{ try {{", "if (!force_simple_kqv) { try {"),
+        ("the batched branch not the classifier's", f"if (f16_route == {_R}KQKV_BATCHED) {{ bool batched_declined = false; try {{",
+         "if (!force_simple_kqv) { bool batched_declined = false; try {"),
     ]:
         assert not dispatch_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
     # an inline chain predicate returns
