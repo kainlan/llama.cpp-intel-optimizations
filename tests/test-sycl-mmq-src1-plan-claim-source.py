@@ -116,8 +116,12 @@ def claim_transaction_claims_after_commit_before_hold(sycl: str) -> bool:
     if min(ring, commit, claim) < 0:
         return False
     hold = txn.find("ggml_sycl_planned_scratch_hold_refresh(*ctx);", claim)
+    # The call sits at the commit's own statement level: nothing between the two may open a block or a condition,
+    # or the claim could be made conditional (on probe_mode, say) while still following the commit in the text.
+    between = txn[commit + len("dense_guard.commit();"):claim]
     # Exactly one claim, on the publish path only (after the commit, which a probe never reaches).
-    return ring < commit < claim < hold and txn.count("ggml_sycl_mmq_src1_claim_plan(") == 1
+    return (ring < commit < claim < hold and "{" not in between and "if (" not in between
+            and txn.count("ggml_sycl_mmq_src1_claim_plan(") == 1)
 
 
 def claim_helper_claims_the_whole_plan(sycl: str) -> bool:
@@ -131,10 +135,19 @@ def claim_helper_claims_the_whole_plan(sycl: str) -> bool:
     if not m:
         return False
     planned, dev = m.group(1), m.group(2)
-    skip = f"if ({planned} == 0 || ctx.mmvq_q8_activation_cache.capacity({dev}) >= {planned})"
+    skip = f"if ({planned} == 0 || ctx.mmvq_q8_activation_cache.capacity({dev}) >= {planned}) {{ return; }}"
     ensure = f"ctx.mmvq_q8_activation_cache.ensure_buffer({planned}, {dev}, *ctx.stream({dev}, 0))"
-    return (skip in helper and ensure in helper and "GGML_LOG_WARN(" in helper and "GGML_ABORT" not in helper
-            and "malloc" not in helper)
+    read_at = m.start()
+    skip_at = helper.find(skip, m.end())
+    ensure_at = helper.find(ensure, skip_at + len(skip)) if skip_at >= 0 else -1
+    if min(skip_at, ensure_at) < 0:
+        return False
+    # In order: the plan read, the skip for a buffer already at plan, the claim. The skip's own `return` is the only
+    # one allowed before the claim, so no early exit can stand before the read or between the skip and the claim.
+    before_read = helper[:read_at]
+    skip_to_claim = helper[skip_at + len(skip):ensure_at]
+    return ("return" not in before_read and "return" not in skip_to_claim and "GGML_LOG_WARN(" in helper
+            and "GGML_ABORT" not in helper and "malloc" not in helper)
 
 
 def claim_runtime_scratch_stays_in_the_runtime_zone(common: str) -> bool:
@@ -229,6 +242,25 @@ def test_mutant_claim_before_the_commit_fails():
     raw = _once(SYCL, "ggml_sycl_mmq_src1_claim_plan(*ctx);\n", "")
     raw = _once(raw, "dense_guard.commit();", "ggml_sycl_mmq_src1_claim_plan(*ctx);\n    dense_guard.commit();")
     assert not claim_transaction_claims_after_commit_before_hold(raw)
+
+
+def test_mutant_claim_only_on_the_probe_path_fails():
+    assert not claim_transaction_claims_after_commit_before_hold(
+        _once(SYCL, "    ggml_sycl_mmq_src1_claim_plan(*ctx);\n",
+              "    if (probe_mode) {\n        ggml_sycl_mmq_src1_claim_plan(*ctx);\n    }\n"))
+
+
+def test_mutant_claim_helper_returns_first_fails():
+    assert not claim_helper_claims_the_whole_plan(
+        _once(SYCL, "static void ggml_sycl_mmq_src1_claim_plan(ggml_backend_sycl_context & ctx) {\n",
+              "static void ggml_sycl_mmq_src1_claim_plan(ggml_backend_sycl_context & ctx) {\n    return;\n"))
+
+
+def test_mutant_claim_helper_returns_after_the_skip_fails():
+    assert not claim_helper_claims_the_whole_plan(
+        _once(SYCL, "        return;\n    }\n    if (ctx.mmvq_q8_activation_cache.ensure_buffer(",
+              "        return;\n    }\n    if (true) {\n        return;\n    }\n"
+              "    if (ctx.mmvq_q8_activation_cache.ensure_buffer("))
 
 
 def test_mutant_claim_sized_by_an_op_not_the_plan_fails():

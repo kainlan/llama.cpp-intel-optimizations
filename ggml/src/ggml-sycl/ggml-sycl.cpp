@@ -19255,9 +19255,11 @@ static void ggml_sycl_planned_scratch_hold_refresh(ggml_backend_sycl_context & c
 // abort fired. Claimed here, the buffer holds its plan before the first graph and no op within n_ubatch grows it.
 //
 // The claim goes through the same allocator as every planned RUNTIME scratch (ggml_sycl_runtime_scratch_ensure:
-// RUNTIME zone, spill forbidden). A claim the zone cannot meet is reported and left to the existing defences: the hold
-// keeps the planned bytes off spill-capable allocations, and the graph-entry walk refuses the graph by name before
-// anything is submitted. It is not refused here, because the plan is already published.
+// RUNTIME zone, spill forbidden). A claim the zone cannot meet is reported, not refused here (the plan is already
+// published), and is left to the existing defences, which do not cover every case: the hold keeps the planned bytes off
+// spill-capable allocations, and a node the graph-entry walk counts is refused before submission, but a node the walk
+// does not count (the case this claim exists for) still grows the buffer in the op and meets the 479i plan-breach
+// abort.
 static void ggml_sycl_mmq_src1_claim_plan(ggml_backend_sycl_context & ctx) {
     const int    d       = ctx.device;
     const size_t planned = ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(d);
@@ -19276,7 +19278,8 @@ static void ggml_sycl_mmq_src1_claim_plan(ggml_backend_sycl_context & ctx) {
     GGML_LOG_WARN(
         "[MMQ-SRC1] device %d: the planned Q8_1 src1 buffer (%.1f MB at n_ubatch=%u) could not be claimed when the "
         "plan was published (buffer holds %.1f MB, RUNTIME zone has %.1f MB free); the hold keeps its bytes off "
-        "spill-capable allocations and the graph-entry walk refuses a graph it cannot serve (llama.cpp-g6yk)\n",
+        "spill-capable allocations, a node the graph-entry walk counts is refused before submission, and a node it "
+        "does not count still meets the 479i plan-breach abort (llama.cpp-g6yk)\n",
         d, planned / (1024.0 * 1024.0), (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d),
         ctx.mmvq_q8_activation_cache.capacity(d) / (1024.0 * 1024.0),
         (cache ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : 0) / (1024.0 * 1024.0));
