@@ -2030,9 +2030,9 @@ set_tests_properties(sycl-layer-streaming-gate PROPERTIES
 # "host-only, no -fsycl, links ggml-base" shape test-dmmv-coalesced-q4-0-oracle
 # already establishes below. attn-host-dispatch.cpp is ALSO globbed into
 # libggml-sycl (the file(GLOB) at :83) and compiled there with -fsycl like
-# every other backend TU; it is dead code there until TKV-13 step 3 wires it
-# into ggml_backend_sycl_device_supports_op / the graph-compute node loop --
-# this target is the host-only proof it works first.
+# every other backend TU. It is live there: the TU hosts the dependency walk
+# ggml_sycl_op_consumes_tensor uses for the MoE scatter flush. This target is
+# the host-only proof of the walk.
 add_executable(test-attn-host-dispatch
     tests/test-attn-host-dispatch.cpp
     attn-host-dispatch.cpp
@@ -2047,6 +2047,26 @@ set_target_properties(test-attn-host-dispatch PROPERTIES
 add_test(NAME sycl-attn-host-dispatch COMMAND test-attn-host-dispatch)
 set_tests_properties(sycl-attn-host-dispatch PROPERTIES
     LABELS "sycl;attn;tkv13;hostonly"
+    TIMEOUT 30
+)
+
+# Expert-deferral dependency walk (llama.cpp-ax5u): the same pure TU, driven
+# with a residual-stream DAG whose path count is exponential, to pin that each
+# node is expanded once per query and the answer matches an exhaustive walk.
+add_executable(test-tensor-depends-on-visits
+    tests/test-tensor-depends-on-visits.cpp
+    attn-host-dispatch.cpp
+)
+target_include_directories(test-tensor-depends-on-visits PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-tensor-depends-on-visits PRIVATE ggml-base)
+set_target_properties(test-tensor-depends-on-visits PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-tensor-depends-on-visits COMMAND test-tensor-depends-on-visits)
+set_tests_properties(sycl-tensor-depends-on-visits PROPERTIES
+    LABELS "sycl;moe;hostonly"
     TIMEOUT 30
 )
 
