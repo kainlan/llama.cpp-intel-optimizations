@@ -1086,14 +1086,18 @@ def check_segment_graphs_drained(code: str, common: str) -> list:
     skip = re.search(r"if \(!any_graph\)\s*\{\s*return true;", drain)
     if wait < 0 or not gate or not skip or not (gate.start() < skip.start() < wait):
         problems.append("the drain does not wait whenever a retired slot or the caller has a graph")
-    if not re.search(r"static auto \*\s+kept = new std::vector<ggml_backend_sycl_context::moe_segment_slot>\(\);", keep) \
+    if not re.search(r"static auto \*\s+kept\s+= new std::vector<ggml_backend_sycl_context::moe_segment_slot>\(\);", keep) \
             or keep.count("kept->push_back(std::move(slot));") != 1:
         problems.append("the keep-alive does not hold its slots for the life of the process")
     # Its callers (a failed drain in drain_retired, the record catch) are not all under the graph-compute mutex, and
     # two contexts can fail at once: the list takes its own lock around every access.
-    if not re.search(r"static std::mutex\s+kept_mutex;[\s\S]*std::lock_guard<std::mutex>\s+lock\(kept_mutex\);\s*"
+    if not re.search(r"std::lock_guard<std::mutex>\s+lock\(\*kept_mutex\);\s*"
                      r"kept->push_back\(std::move\(slot\)\);", keep) or keep.count("kept->") != 1:
         problems.append("the keep-alive list is touched without its own lock")
+    # The lock is leaked like the list, so a keep-alive during static destruction never locks a destroyed mutex.
+    if not re.search(r"static auto \*\s+kept_mutex\s+= new std::mutex\(\);", keep) or \
+            re.search(r"static std::mutex\b", keep):
+        problems.append("the keep-alive lock is a static with a destructor")
     if not re.search(r"catch \(const std::exception & exc\)[\s\S]*for \(auto & slot : retired\)\s*\{\s*"
                      r"moe_segment_slot_keep_alive\(std::move\(slot\)\);\s*\}\s*return false;", drain[wait:] if wait >= 0 else ""):
         problems.append("a failed drain destroys the retired slots instead of keeping them")
@@ -1131,8 +1135,11 @@ with gate('segment-graphs-destroyed-after-drain'):
         ("retire ignores segment graphs", "runtime", r"legacy_graphs = legacy_graphs \|\| seg\.exec_graph != nullptr;",
          "(void) seg;"),
         ("keep-alive frees its slots", "runtime", r"kept->push_back\(std::move\(slot\)\);", "(void) slot;"),
-        ("keep-alive appends without its lock", "runtime", r"std::lock_guard<std::mutex>\s+lock\(kept_mutex\);\s*", ""),
-        ("keep-alive locks another mutex", "runtime", r"lock\(kept_mutex\);", "lock(g_sycl_graph_compute_mutex);"),
+        ("keep-alive appends without its lock", "runtime", r"std::lock_guard<std::mutex>\s+lock\(\*kept_mutex\);\s*", ""),
+        ("keep-alive locks another mutex", "runtime", r"lock\(\*kept_mutex\);", "lock(g_sycl_graph_compute_mutex);"),
+        ("keep-alive lock is a static with a destructor", "runtime",
+         r"static auto \*\s+kept_mutex\s+= new std::mutex\(\);",
+         "static std::mutex kept_mutex_storage;\n    static auto * kept_mutex = &kept_mutex_storage;"),
         ("failed drain destroys the slots", "runtime",
          r"(for \(auto & slot : retired\)\s*\{)\s*moe_segment_slot_keep_alive\(std::move\(slot\)\);", r"\1 (void) slot;"),
         ("record catch destroys the slot after a failed drain", "runtime",
