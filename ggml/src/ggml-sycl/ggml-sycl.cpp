@@ -31997,7 +31997,11 @@ static bool moe_descriptor_capture_probe_enabled() {
 }
 
 static bool persistent_tg_moe_descriptor_capture_enabled() {
-    // The environment terms are read once: graph_compute asks on every decode call.
+    if (g_moe_descriptor_capture_decode_phase && moe_layer_descriptor_executor_enabled()) {
+        return true;
+    }
+    // The environment terms are read once, and only once the runtime term above is false, as the original
+    // short-circuit did: graph_compute asks on every decode call, and some terms log the first time they run.
     static const bool env_enabled = [] {
         return ggml_sycl::env_persistent_tg_enabled() || moe_graphlet_probe_enabled() ||
                moe_graphlet_replay_probe_enabled() ||
@@ -32006,7 +32010,7 @@ static bool persistent_tg_moe_descriptor_capture_enabled() {
                moe_block_graphlet_descriptor_capture_enabled() || moe_descriptor_capture_probe_enabled() ||
                std::getenv("GGML_SYCL_PERSISTENT_TG_LOG_POLICY") != nullptr;
     }();
-    return (g_moe_descriptor_capture_decode_phase && moe_layer_descriptor_executor_enabled()) || env_enabled;
+    return env_enabled;
 }
 
 static bool persistent_tg_capture_tensor_descriptor(ggml_sycl::moe_layer_persistent_tensor_descriptor & descriptor,
@@ -110152,6 +110156,10 @@ normal_dispatch:
                     fprintf(stderr, "[PHASE] block_graphlets: %.3f ms\n", phase_ms());
                 }
             }
+        } else if (cached_is_decode) {
+            // The reject the skipped try would have recorded, so the aggregation state stays truthful.
+            sycl_ctx->moe_aggregation_last_decision = "block-graphlet";
+            sycl_ctx->moe_aggregation_last_reject   = "disabled";
         }
         if (!block_graphlet_executed) {
 #endif

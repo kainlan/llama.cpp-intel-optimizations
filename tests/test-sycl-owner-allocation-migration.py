@@ -441,7 +441,7 @@ with gate('graph-preload'):
     # and continuing through a stale graph path. The suppression is per split and
     # per expert-residency state (moe-graph-preload-stamp.hpp), not a sticky flag.
     # The preload runs at one site, right before a record or replay.
-    assert RUNTIME_CODE.count("graph_preload_moe_experts(*sycl_ctx") == 1
+    assert len(re.findall(r"\bgraph_preload_moe_experts\s*\(\s*\*sycl_ctx", RUNTIME_CODE)) == 1
     site = RUNTIME[RUNTIME.index("if (!graph_preload_moe_experts(*sycl_ctx, cgraph, moe_host_tier_boundary)) {"):]
     site = site[:site.index("return GGML_STATUS_SUCCESS;")]
     assert "sycl_ctx->moe_graph_preload_refused = true" in site
@@ -527,23 +527,27 @@ with gate('graph-preload-not-in-refresh'):
     # table rebuild per MoE split per prompt, with or without graphs.
     compute = region(RUNTIME, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
                      "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend")
-    refresh = region(compute, "if (refresh_moe_after_pp || post_prompt_refresh_due)",
-                     "const int descriptor_moe_graph_candidates")
-    assert "graph_preload_moe_experts(" not in refresh
-    assert "ggml_sycl_moe_graph_preload_decide(" not in refresh
+    refresh = region(region(RUNTIME_CODE, "static ggml_status ggml_backend_sycl_graph_compute_unchecked(",
+                            "static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend"),
+                     "if (refresh_moe_after_pp || post_prompt_refresh_due)", "const int descriptor_moe_graph_candidates")
+    assert not re.search(r"\bgraph_preload_moe_experts\s*\(", refresh)
+    assert not re.search(r"\bggml_sycl_moe_graph_preload_decide\s*\(", refresh)
     assert "ggml_sycl_materialize_moe_down_i8_hotset(" in refresh and "moe_prestage_popular_experts();" in refresh
     print("PASS graph-preload-not-in-refresh-source-gate")
 
 with gate('decode-env-reads-once'):
     # Both predicates are asked on every decode call; their environment terms are read once.
+    # The runtime term is tested first, so the env terms (some log when first evaluated) run only when it is false.
     capture = region(RUNTIME, "static bool persistent_tg_moe_descriptor_capture_enabled() {", "\n}\n")
-    assert re.search(r"static const bool\s+\w+\s*=\s*\[\]", capture)
-    lam = capture[capture.index("static const bool"):]
+    runtime = re.search(r"if \(g_moe_descriptor_capture_decode_phase && moe_layer_descriptor_executor_enabled\(\)\)\s*"
+                        r"\{\s*return true;\s*\}", capture)
+    static = re.search(r"static const bool\s+\w+\s*=\s*\[\]", capture)
+    assert runtime and static and runtime.end() < static.start()
+    lam = capture[static.start():].split("}();")[0]
     for term in ("ggml_sycl::env_persistent_tg_enabled()", "moe_graphlet_probe_enabled()",
                  "moe_block_graphlet_descriptor_capture_enabled()", "moe_descriptor_capture_probe_enabled()",
                  'std::getenv("GGML_SYCL_PERSISTENT_TG_LOG_POLICY")'):
-        assert term in lam.split("}();")[0], term
-    assert "g_moe_descriptor_capture_decode_phase && moe_layer_descriptor_executor_enabled()" in lam.split("}();")[1]
+        assert term in lam, term
     size = region(RUNTIME, "static int moe_block_graphlet_requested_size(int device) {", "\n}\n")
     assert re.search(r"static const int\s+\w+\s*=\s*\[\]", size)
     assert size.index("static const int") < size.index('std::getenv("GGML_SYCL_MOE_BLOCK_GRAPHLETS")')
@@ -554,6 +558,12 @@ with gate('decode-env-reads-once'):
                     "bool block_graphlet_executed = false;", "if (!block_graphlet_executed)")
     sized = re.search(r"moe_block_graphlet_requested_size\(sycl_ctx->device\)\s*>\s*0", direct)
     assert sized and sized.start() < direct.index("ggml_sycl_graph_signature(cgraph)")
+    # Skipping the try still records the reject it would have recorded.
+    try_fn = region(RUNTIME, "static bool moe_graph_try_block_graphlets(", "\n}\n")
+    assert 'ggml_sycl_moe_aggregation_diag(sycl_ctx, "block-graphlet", "reject", "disabled")' in try_fn
+    assert re.search(r"\}\s*else if \(cached_is_decode\)\s*\{[^{}]*"
+                     r"sycl_ctx->moe_aggregation_last_decision\s*=\s*\"block-graphlet\";\s*"
+                     r"sycl_ctx->moe_aggregation_last_reject\s*=\s*\"disabled\";\s*\}", direct)
     print("PASS decode-env-reads-once-source-gate")
 
 with gate('moe-metadata'):
