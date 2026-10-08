@@ -599,9 +599,11 @@ with gate('futile-context-direct'):
         if not re.search(r"if \(!is_decode \|\| !ggml_sycl_segmented_graph_env_allows\(\) \|\| "
                          r"ctx->moe_segment_slots\.churned\(\)\)\s*\{\s*return false;\s*\}", body):
             problems.append("the exception is not limited to decode, the segmented env, and an unchurned cache")
-        if not re.search(r"return ctx->moe_graph_rerecord \|\| ggml_sycl_graph_has_op\(cgraph, GGML_OP_MUL_MAT_ID\);",
-                         body):
-            problems.append("the exception does not require segmented MoE mode or a MUL_MAT_ID that can enter it")
+        if not re.search(r"if \(ctx->moe_graph_rerecord\)\s*\{\s*return true;\s*\}\s*"
+                         r"if \(ctx->moe_segment_keyed_probed \|\| !ggml_sycl_graph_has_op\(cgraph, GGML_OP_MUL_MAT_ID\)\)"
+                         r"\s*\{\s*return false;\s*\}\s*ctx->moe_segment_keyed_probed = true;\s*return true;", body):
+            problems.append("the exception does not require segmented MoE mode after one MUL_MAT_ID probe "
+                            "(a context that never enters it would pay the policy scans every call)")
         return problems
 
     assert not keyed_reachable_problems(RUNTIME_CODE), keyed_reachable_problems(RUNTIME_CODE)
@@ -609,8 +611,11 @@ with gate('futile-context-direct'):
     for _label, _old, _new in (
             ("prompt splits reach keyed slots", "if (!is_decode || ", "if ("),
             ("a churned cache still reaches them", " || ctx->moe_segment_slots.churned())", ")"),
-            ("any split reaches them", "return ctx->moe_graph_rerecord || ggml_sycl_graph_has_op(cgraph, GGML_OP_MUL_MAT_ID);",
-             "return true;")):
+            ("any split reaches them", "if (ctx->moe_segment_keyed_probed || !ggml_sycl_graph_has_op(cgraph, GGML_OP_MUL_MAT_ID)) {",
+             "if (false) {"),
+            ("the probe repeats every call", "    ctx->moe_segment_keyed_probed = true;\n", ""),
+            ("the probe is never consulted", "if (ctx->moe_segment_keyed_probed || !ggml_sycl_graph_has_op(",
+             "if (!ggml_sycl_graph_has_op(")):
         assert _reach.count(_old) == 1, _label
         assert keyed_reachable_problems(RUNTIME_CODE.replace(_reach, _reach.replace(_old, _new))), \
             "control %r was not caught" % _label

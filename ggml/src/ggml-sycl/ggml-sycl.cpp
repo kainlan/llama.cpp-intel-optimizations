@@ -99201,14 +99201,21 @@ static bool moe_segment_keyed_mode(const ggml_backend_sycl_context * ctx, bool i
 }
 
 // A replay-futile context still serves keyed slots, since its futility verdict is about the whole-graph slot. Until the
-// context is in segmented MoE mode, a decode split with a MUL_MAT_ID is what can put it there.
-static bool moe_segment_keyed_reachable(const ggml_backend_sycl_context * ctx,
-                                        const ggml_cgraph *               cgraph,
-                                        bool                              is_decode) {
+// context is in segmented MoE mode, one decode split with a MUL_MAT_ID may try to put it there (the B3 admission
+// does, for a MUL_MAT_ID that cannot be recorded). If that call leaves the context outside segmented mode, every
+// later call takes the futile path again, so a context that never enters it does not pay the policy scans forever.
+static bool moe_segment_keyed_reachable(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, bool is_decode) {
     if (!is_decode || !ggml_sycl_segmented_graph_env_allows() || ctx->moe_segment_slots.churned()) {
         return false;
     }
-    return ctx->moe_graph_rerecord || ggml_sycl_graph_has_op(cgraph, GGML_OP_MUL_MAT_ID);
+    if (ctx->moe_graph_rerecord) {
+        return true;
+    }
+    if (ctx->moe_segment_keyed_probed || !ggml_sycl_graph_has_op(cgraph, GGML_OP_MUL_MAT_ID)) {
+        return false;
+    }
+    ctx->moe_segment_keyed_probed = true;
+    return true;
 }
 
 // Owner identity of the allocation behind a backend buffer, from its mem_handle. A buffer without a SYCL context
