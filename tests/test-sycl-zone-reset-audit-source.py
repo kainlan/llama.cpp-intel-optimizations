@@ -170,6 +170,13 @@ def guard_block_contains(text, guard_pattern, mutation_pattern):
     return end >= 0 and all(brace < mutation.start() < end for mutation in mutations)
 
 
+# A registry-row erase in arena_forget_allocation_locked. Every registry
+# mutation goes through runtime_registry_erase_locked since llama.cpp-ii25
+# (which keeps the containment index in step); the raw unordered_map erase is
+# still matched so a bypass of the wrapper is caught too.
+REGISTRY_ERASE_PATTERN = r"\b(?:g_runtime_alloc_registry\.erase|runtime_registry_erase_locked)\s*\([^)]*\)"
+
+
 def evaluate(cache, backend, common, header):
     cache, backend, common, header = squeeze(cache), squeeze(backend), squeeze(common), squeeze(header)
 
@@ -268,6 +275,8 @@ def evaluate(cache, backend, common, header):
         "watchdog_thread_fn body": watchdog,
         "unified_cache::reserve_onednn_scratch body": reserve_onednn,
         "unified_cache::arena_forget_allocation_locked body": arena_forget,
+        "arena_forget_allocation_locked erases its registry row":
+            "".join(m.group(0) for m in re.finditer(REGISTRY_ERASE_PATTERN, arena_forget)),
         "unified_cache::arena_destroy body": arena_destroy,
     }
 
@@ -332,7 +341,7 @@ def evaluate(cache, backend, common, header):
                 arena_forget,
                 r"if\s*\(\s*runtime\s*!=\s*g_runtime_alloc_registry\.end\(\)\s*&&\s*"
                 r"runtime->second\.handle\.alloc_id\s*==\s*exact_id\s*\)",
-                r"g_runtime_alloc_registry\.erase\s*\([^)]*\)"),
+                REGISTRY_ERASE_PATTERN),
         'arena destroy refuses owned groups before physical free and never raw-clears first':
             arena_destroy.count("if (!group.allocations.empty())") == 1
             and re.search(r"sycl::free\s*\(", arena_destroy) is not None
@@ -539,6 +548,12 @@ MUTANTS = {
                    "void unified_cache::arena_forget_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id) noexcept {\n"
                    "    auto bypass = g_runtime_alloc_registry.find(ptr);\n"
                    "    if (bypass != g_runtime_alloc_registry.end()) g_runtime_alloc_registry.erase(bypass);")]),
+    # The same bypass through the sanctioned wrapper: erasing by address alone,
+    # outside the exact-id guard, is the defect whichever erase spelling it uses.
+    "exact allocation ownership is erased by allocation id (wrapper bypass)": (
+        "cache", [("void unified_cache::arena_forget_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id) noexcept {",
+                   "void unified_cache::arena_forget_allocation_locked(vram_zone_id zone, void * ptr, uint64_t allocation_id) noexcept {\n"
+                   "    runtime_registry_erase_locked(ptr);")]),
     "arena destroy refuses owned groups before physical free and never raw-clears first": (
         "cache", [("bool unified_cache::arena_destroy() {",
                    "bool unified_cache::arena_destroy() {\n"
@@ -635,6 +650,16 @@ MUTANTS = {
 }
 
 
+# Anchor controls: a region the checks read that has moved must report a
+# MISSING ANCHOR, not a contract FAIL. The registry-erase anchor is the one
+# llama.cpp-ii25 moved (raw erase -> runtime_registry_erase_locked); before it
+# was an anchor, that move read as "ownership erased by address".
+ANCHOR_MUTANTS = {
+    "arena_forget_allocation_locked erases its registry row": (
+        "cache", [("runtime_registry_erase_locked(runtime);", "runtime_registry_drop_row(runtime);")]),
+}
+
+
 def self_test(cache, backend, common, header):
     """Every mutable check must fail once its defect is injected."""
     problems = []
@@ -647,8 +672,19 @@ def self_test(cache, backend, common, header):
         for anchor, replacement in edits:
             sources[target] = sources[target].replace(anchor, replacement, 1)
         _, failed, _, _ = evaluate(sources["cache"], sources["backend"], sources["common"], sources["header"])
-        if name not in failed:
+        check = name.split(" (")[0]
+        if check not in failed:
             problems.append("check did not fire on its mutant: " + name)
+    for name, (target, edits) in ANCHOR_MUTANTS.items():
+        sources = {"cache": cache, "backend": backend, "common": common, "header": header}
+        if any(anchor not in sources[target] for anchor, _ in edits):
+            problems.append("anchor mutation anchor missing for: " + name)
+            continue
+        for anchor, replacement in edits:
+            sources[target] = sources[target].replace(anchor, replacement, 1)
+        missing, _, _, _ = evaluate(sources["cache"], sources["backend"], sources["common"], sources["header"])
+        if name not in missing:
+            problems.append("anchor did not report missing on its mutant: " + name)
     return problems
 
 
@@ -676,6 +712,7 @@ if args.self_test:
         print("SELF-TEST FAIL: " + problem)
     if problems:
         sys.exit(1)
-    print("sycl zone reset audit source contract: self-test PASS ({} mutants)".format(len(MUTANTS)))
+    print("sycl zone reset audit source contract: self-test PASS ({} mutants, {} anchor mutants)".format(
+        len(MUTANTS), len(ANCHOR_MUTANTS)))
 
 print("sycl zone reset audit source contract: PASS ({} checks)".format(n_checks))
