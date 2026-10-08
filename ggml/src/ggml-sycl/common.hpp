@@ -3923,6 +3923,10 @@ struct ggml_tensor_extra_gpu_weight_ext {
     bool                               moe_planned_layout_valid[GGML_SYCL_MAX_DEVICES][2][2]           = {};
     // Outcome of the MoE graph preload for this tensor, per device; see moe-graph-preload-stamp.hpp.
     ggml_sycl::moe_graph_preload_stamp moe_graph_preload[GGML_SYCL_MAX_DEVICES];
+    // Prompt epoch whose post-prompt work this tensor has done, per device: the down-layout preparation before
+    // decode, and the PP->TG refresh. See moe_post_prompt_work_due().
+    uint64_t                           moe_post_prompt_prepared_epoch[GGML_SYCL_MAX_DEVICES]  = {};
+    uint64_t                           moe_post_prompt_refreshed_epoch[GGML_SYCL_MAX_DEVICES] = {};
     // Per-device cached MoE expert route table (perf-recovery epic, track B,
     // llama.cpp-1tjn). Built once per (plan_generation, expert_storage_generation)
     // pair and consumed read-only by decode dispatch instead of re-resolving

@@ -440,7 +440,8 @@ with gate('graph-preload'):
     # Graph-preload failure propagates into graph suppression, rather than logging
     # and continuing through a stale graph path. The suppression is per split and
     # per expert-residency state (moe-graph-preload-stamp.hpp), not a sticky flag.
-    refresh = region(RUNTIME, "if (refresh_moe_after_pp)", "const int descriptor_moe_graph_candidates")
+    refresh = region(RUNTIME, "if (refresh_moe_after_pp || post_prompt_refresh_due)",
+                     "const int descriptor_moe_graph_candidates")
     assert "if (!graph_preload_moe_experts(*sycl_ctx, cgraph, moe_host_tier_boundary))" in refresh
     assert "sycl_ctx->moe_graph_preload_refused = true" in refresh
     assert re.search(r"\buse_sycl_graph\s+= false;", refresh)

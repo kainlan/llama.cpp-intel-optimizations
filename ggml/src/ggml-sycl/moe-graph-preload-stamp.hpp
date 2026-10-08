@@ -15,14 +15,24 @@
 //   - the routed-token count (it feeds the layout choice),
 //   - whether an all-host tensor may stay a direct boundary node,
 //   - the device.
-// Refusals are stamped as well as successes, so a refusal is decided once per
-// residency state instead of once per token, and a residency change re-opens
-// it. The stamp lives on the tensor's weight extension, like the decode
-// direct-dispatch stamp, so it is keyed by the weight itself and never by an
-// address that a later tensor could reuse.
+// Structural refusals are stamped as well as successes, so a refusal is
+// decided once per residency state instead of once per token, and a residency
+// change re-opens it. The stamp lives on the tensor's weight extension, like
+// the decode direct-dispatch stamp, so it is keyed by the weight itself and
+// never by an address that a later tensor could reuse.
 //
-// Layout is not a separate input: the preload derives it from the stamped
-// inputs (tensor, device, plan, token count, storage).
+// What the key does NOT cover: the layout the preload probes. Layout follows
+// the stamped inputs, but also the decode down-i8 hotset (the ids of the
+// moment) and the prompt-down transient-SoA state, neither of which is keyed.
+// Each outcome stays safe without it:
+//   - HOST_TIER_BOUNDARY counts host routes, which the probe accepts at any
+//     layout, so it does not depend on layout at all.
+//   - REFUSED can be stale against a layout the hotset would have chosen. It
+//     fails closed: the split runs direct, which is always correct, until a
+//     residency change re-opens it.
+//   - PREPARED only lets the PP->TG refresh skip its residency check. The
+//     graph path re-runs the preload on every call with the layout of that
+//     call, so a recorded graph never relies on a stamped table.
 //
 // SYCL-free on purpose so tests/test-sycl-moe-graph-preload-stamp.cpp can run
 // it without a device.
@@ -32,14 +42,21 @@
 
 namespace ggml_sycl {
 
+// What the preload concluded for one tensor.
+enum class moe_graph_preload_outcome {
+    PREPARED,            // one device pointer table represents it; the preload prepared it
+    HOST_TIER_BOUNDARY,  // every expert is host-planned: a direct CPU node, nothing to prepare
+    REFUSED,             // mixed or missing experts: no single table represents it
+};
+
 struct moe_graph_preload_stamp {
-    uint64_t replan_epoch       = 0;
-    uint64_t storage_generation = 0;
-    int64_t  n_tokens           = 0;
-    int      device             = -1;
-    bool     host_tier_boundary = false;
-    bool     valid              = false;
-    bool     refused            = false;
+    uint64_t                  replan_epoch       = 0;
+    uint64_t                  storage_generation = 0;
+    int64_t                   n_tokens           = 0;
+    int                       device             = -1;
+    bool                      host_tier_boundary = false;
+    bool                      valid              = false;
+    moe_graph_preload_outcome outcome            = moe_graph_preload_outcome::PREPARED;
 };
 
 struct moe_graph_preload_inputs {
@@ -57,14 +74,38 @@ inline bool moe_graph_preload_stamp_current(const moe_graph_preload_stamp & s, c
 
 inline void moe_graph_preload_stamp_record(moe_graph_preload_stamp &        s,
                                            const moe_graph_preload_inputs & in,
-                                           bool                             refused) {
+                                           moe_graph_preload_outcome        outcome) {
     s.replan_epoch       = in.replan_epoch;
     s.storage_generation = in.storage_generation;
     s.n_tokens           = in.n_tokens;
     s.device             = in.device;
     s.host_tier_boundary = in.host_tier_boundary;
     s.valid              = true;
-    s.refused            = refused;
+    s.outcome            = outcome;
+}
+
+// The preload checks this first for every tensor, before any layout selection or route probe: a tensor already
+// known to be all host-planned under the current inputs needs none of that work again.
+inline bool moe_graph_preload_stamp_skips_tensor(const moe_graph_preload_stamp &  s,
+                                                 const moe_graph_preload_inputs & in) {
+    return moe_graph_preload_stamp_current(s, in) && s.outcome == moe_graph_preload_outcome::HOST_TIER_BOUNDARY;
+}
+
+// Why a preload stopped. Only a STRUCTURAL failure (the route probe found mixed or missing experts) is a fact about
+// residency, so only it is stamped: the stamp lives on the weight and is shared by every context using it. A
+// TRANSIENT failure (ids readback, a staging allocation, a pointer-table update, invalid geometry, a disabled
+// preload mode) refuses the current call only and leaves the stamp as it was.
+enum class moe_graph_preload_failure {
+    STRUCTURAL,
+    TRANSIENT,
+};
+
+inline void moe_graph_preload_stamp_failure(moe_graph_preload_stamp &        s,
+                                            const moe_graph_preload_inputs & in,
+                                            moe_graph_preload_failure        failure) {
+    if (failure == moe_graph_preload_failure::STRUCTURAL) {
+        moe_graph_preload_stamp_record(s, in, moe_graph_preload_outcome::REFUSED);
+    }
 }
 
 // What a split's stamps say about running the preload for it.
@@ -88,7 +129,7 @@ inline void moe_graph_preload_split_add(moe_graph_preload_split_scan &   scan,
     if (!moe_graph_preload_stamp_current(stamp, in)) {
         return;
     }
-    if (stamp.refused) {
+    if (stamp.outcome == moe_graph_preload_outcome::REFUSED) {
         scan.refused = true;
     } else {
         scan.n_ok++;
@@ -129,6 +170,14 @@ inline moe_graph_preload_tensor_verdict moe_graph_preload_classify(size_t  local
         return moe_graph_preload_tensor_verdict::HOST_TIER_BOUNDARY;
     }
     return moe_graph_preload_tensor_verdict::REFUSE;
+}
+
+// Post-prompt work: after a prompt, some per-split work (releasing prompt-only down layouts, materializing decode
+// down layouts, the residency check) must run once on each split's first decode occurrence, never per token. A
+// global prompt epoch advances on every prompt split; each expert tensor records, per device, the epoch it last
+// handled. A decode split is due when any of its tensors is behind.
+inline bool moe_post_prompt_work_due(uint64_t handled_epoch, uint64_t prompt_epoch) {
+    return handled_epoch < prompt_epoch;
 }
 
 }  // namespace ggml_sycl
