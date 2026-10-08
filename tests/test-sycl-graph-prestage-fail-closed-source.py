@@ -383,12 +383,16 @@ def evaluate(backend, common, memo_hdr):
         rr_decline is not None
     # llama.cpp-7pm2 B2: a keyed decode split's slot. Warmup and direct keys record nothing and run before the
     # decline; a replay or a record runs only past it, and each re-reads the slot, since a staging swap at the
-    # gateway retires every slot after begin() chose the action.
+    # gateway retires every slot after begin() chose the action. A replay whose inputs now stage to other buffers
+    # than the slot's graphs read forgets the slot and runs direct.
     keyed = re.search(
         r"\}\s*else if\s*\(slot_action == gsc::action::DIRECT\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*" + site +
         r"compute_impl_unlocked\(\);\s*\}\s*else if\s*\(slot_action == gsc::action::REPLAY\)\s*\{\s*"
         r"const auto \* slot = sycl_ctx->moe_segment_slots\.payload\(slot_key\);\s*if\s*\(!slot\)\s*\{\s*"
-        r"compute_impl_unlocked\(\);\s*\}\s*else\s*\{\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);\s*"
+        r"compute_impl_unlocked\(\);\s*\}\s*"
+        r"else if\s*\(!moe_segment_slot_staging_matches\(sycl_ctx, cgraph, \*slot\)\)\s*\{[^{}]*?"
+        r"sycl_ctx->moe_segment_slots\.forget\(slot_key\);\s*compute_impl_unlocked\(\);\s*\}\s*"
+        r"else\s*\{\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);\s*"
         r"moe_graph_replay_segment_slot\(sycl_ctx, cgraph, \*slot\);\s*graph_executed = true;\s*\}\s*\}\s*"
         r"else if\s*\(!sycl_ctx->moe_segment_slots\.state\(slot_key\)\)\s*\{\s*compute_impl_unlocked\(\);\s*\}\s*else\s*\{",
         compute)
