@@ -147,6 +147,11 @@ ALLOWED_NON_EXIT_77 = (
     ("tests/test-sycl-nonfa-attn-scratch-demand.cpp", re.compile(r"SCRATCH_MB=77 is set")),
     ("tests/test-sycl-nonfa-attn-scratch-demand.cpp", re.compile(r"non-zero override \(77\) is NOT")),
     ("tests/test-sycl-nonfa-attn-scratch-demand.cpp", re.compile(r"demand_(?:small|large)\s*==\s*77\s*\*\s*kMiB")),
+    # A std::mt19937 seed (77 + the column count), and the M=77 row dimension
+    # of the "tiled n=64 ragged m" case-table row: random-data seed and tensor
+    # shape, not exit codes.
+    ("tests/test-sycl-bf16-mul-mat-backend.cpp", re.compile(r"\brng\(77\s*\+")),
+    ("tests/test-sycl-bf16-mul-mat.cpp", re.compile(r'"tiled n=64 ragged m",\s*2048,\s*77,\s*64,')),
 )
 
 
@@ -725,6 +730,16 @@ def test_allowlist_matcher_has_controls() -> None:
         f"{sample_path} allowlisted an unrelated 'return 77;' line -- the "
         "matcher is not scoped to the entry's specific shape."
     )
+
+    # Negative: a real skip exit planted in a file that HAS non-exit entries
+    # is still not allowlisted, so an entry for a seed or a tensor dimension
+    # cannot hide a `return 77;` in the same file.
+    for rel_path, _ in ALLOWED_NON_EXIT_77:
+        for planted in ("    return 77;", "    exit(77);", "    static constexpr int kSkip = 77;"):
+            assert not _is_allowlisted(rel_path, planted), (
+                f"{rel_path} allowlisted the planted skip exit {planted.strip()!r} -- "
+                "an entry regex there is broader than the line shape it exempts."
+            )
 
     # Negative: a line that WOULD match an entry's regex, but under a
     # different file, is not allowlisted -- proves matching is keyed on the
