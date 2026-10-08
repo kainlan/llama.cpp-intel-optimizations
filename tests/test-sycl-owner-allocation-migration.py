@@ -1289,6 +1289,11 @@ def check_keyed_slot_input_staging(code: str, common: str) -> list:
     if not re.search(r"rec\.valid\(\) != now\.valid\(\) \|\|\s*\(rec\.valid\(\) && !rec\.stable_identity_equal\(now\)\)",
                      matches) or "return false;" not in matches:
         problems.append("the replay check does not compare each input's staging by allocation identity")
+    # The loop indexes the recorded staging by the input's position: a slot whose recorded list does not line up
+    # with its inputs is a mismatch, never an out-of-range read.
+    if not re.search(r"if \(slot\.input_staging\.size\(\) != slot\.input_refs\.size\(\)\)\s*\{\s*return false;\s*\}\s*"
+                     r"for \(size_t i = 0; i < slot\.input_refs\.size\(\); \+\+i\)", matches):
+        problems.append("the replay check reads recorded staging without first checking it lines up with the inputs")
     order = [compute.find(t) for t in ("moe_segment_slot_collect_inputs(cgraph, slot.input_refs);",
                                        "moe_segment_slot_refresh_inputs(sycl_ctx, cgraph, slot);",
                                        "moe_segment_slot_capture_staging(sycl_ctx, cgraph, slot);",
@@ -1323,6 +1328,10 @@ with gate('keyed-slot-input-staging'):
          r"(compute_impl_unlocked\(\);\s*\}\s*else\s*\{)\s*moe_segment_slot_refresh_inputs\(sycl_ctx, cgraph, \*slot\);", r"\1"),
         ("capture holds nothing", "runtime", r"slot\.input_staging\.push_back\(moe_segment_slot_input_staging\(",
          "(void) (moe_segment_slot_input_staging("),
+        ("check reads without the size guard", "runtime",
+         r"if \(slot\.input_staging\.size\(\) != slot\.input_refs\.size\(\)\)\s*\{\s*return false;\s*\}\s*", ""),
+        ("size guard admits a mismatch", "runtime",
+         r"(if \(slot\.input_staging\.size\(\) != slot\.input_refs\.size\(\)\)\s*\{\s*)return false;", r"\1(void) 0;"),
     )
     for label, which, pattern, repl in controls:
         base = RUNTIME_CODE if which == "runtime" else COMMON_CODE
