@@ -408,3 +408,34 @@ if __name__ == "__main__":
         print(f"{failures} test(s) failed")
         sys.exit(1)
     print("all tests passed")
+
+
+def test_mmvq_moe_id_kernels_have_named_profile_labels() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+
+    generic = slice_between(
+        mmvq,
+        "static sycl::event mmvq_submit_aos_id_impl",
+        "bool mmvq_submit_q1_nvfp4_aos(",
+    )
+    assert "mmvq_id_aos_profile_name(" in generic
+    assert '"mulmat.mmvq.id_aos_"' in mmvq
+    assert "ggml_type_name(type)" in mmvq
+    assert "mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches)" in generic
+    assert '";total_batches="' in mmvq and '"ncols="' in mmvq and '";nrows_per_expert="' in mmvq
+    assert "ggml_sycl_profile_submit(q" in generic
+
+    for label, start, end in [
+        ("mulmat.mmvq.id_aos_q4_0", "static void mul_mat_vec_q4_0_q8_1_id_sycl", "static void mul_mat_vec_q4_1_q8_1_sycl"),
+        ("mulmat.mmvq.id_aos_q8_0", "static void mul_mat_vec_q8_0_q8_1_id_sycl", "static void mul_mat_vec_q2_K_q8_1_sycl"),
+        (
+            "mulmat.mmvq.id_soa_mxfp4_pair",
+            "static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_sycl",
+            "reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_sycl_rows",
+        ),
+    ]:
+        body = slice_between(mmvq, start, end)
+        assert label in body, label
+        assert "ggml_sycl_profile_submit(*stream" in body, label
+        assert "mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches)" in body, label
+    assert mmvq.count('"mulmat.mmvq.id_soa_mxfp4_coalesced"') == 1
