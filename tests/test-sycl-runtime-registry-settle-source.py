@@ -12,8 +12,8 @@ O(1) / O(log n) and enumerate rows only to explain a refusal:
 
 What this file enforces, as text assertions on comment-stripped unified-cache.cpp:
 
-(A) host_zone_settle() and zone_settle() never name g_runtime_alloc_registry, contain no scan-helper call that is not
-    guarded by the O(1) question, and consult runtime_registry_host_zone_live_locked() / runtime_registry_span_live_locked().
+(A) host_zone_settle() and zone_settle() never name g_runtime_alloc_registry, call a scan helper only inside the block of an
+    `if (<O(1) question>(...)) {` whose condition is that question alone, and consult runtime_registry_host_zone_live_locked() / runtime_registry_span_live_locked().
 (B) The enumerating helpers (runtime_registry_scan_host_zone_locked / runtime_registry_scan_span_locked) are called only
     from those two functions, and only inside the branch the O(1) question opened.
 (C) runtime_registry_host_zone_live_locked() is a counter read with no loop; runtime_registry_span_live_locked() queries
@@ -21,6 +21,8 @@ What this file enforces, as text assertions on comment-stripped unified-cache.cp
 (D) The counters are written only inside runtime_registry_count_row_locked(), which only the three registry mutation
     helpers (emplace, erase, assign) call; so a counter cannot drift from the registry the way a hand-kept one would.
     A registered row's handle.host_zone, the field the host counters key on, is never rewritten through the registry.
+    Outside that helper a counter name may only be read (a comparison operand, a returned or copied value): assignment,
+    ++/--, reference or pointer binding, address-of, an unsubscripted array and a call argument are all refused.
 
 NOT COVERED, stated so nobody mistakes this for a proof. This is a tripwire on text, not on cost or on drift:
     - it cannot see what a helper's callee does (a counter read that someone makes expensive passes);
@@ -92,28 +94,39 @@ def function_body(code: str, signature: str) -> str:
     return code[start:end]
 
 
+def matching_brace(text: str, open_idx: int):
+    """Index of the `}` that closes the `{` at open_idx, or None."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
 def settle_violations(body: str, o1_question: str, scan: str):
-    """What is wrong with a settle body: it must ask the O(1) question and may call the scan only inside its branch."""
+    """What is wrong with a settle body: the O(1) question must be the WHOLE condition of an `if`, and the scan may be
+    called only inside that `if`'s block."""
     out = []
     if "g_runtime_alloc_registry" in body:
         out.append("names g_runtime_alloc_registry")
-    if LOOP_RE.search(body) and re.search(r"\b(?:for|while)\s*\([^)]*(?:registry|alloc_index)", body):
+    if re.search(r"\b(?:for|while)\s*\([^)]*(?:registry|alloc_index)", body):
         out.append("loops over the registry")
-    q = body.find(o1_question + "(")
-    if q == -1:
-        out.append(f"never asks {o1_question}()")
+    gate = re.search(r"\bif\s*\(\s*" + re.escape(o1_question) + r"\s*\([^()]*\)\s*\)\s*\{", body)
+    block = (gate.end() - 1, matching_brace(body, gate.end() - 1)) if gate else None
+    if gate is None:
+        out.append(f"has no `if ({o1_question}(...)) {{` (the question must be the whole condition)")
+    elif block[1] is None:
+        out.append("the question's block is unbalanced")
     calls = [m.start() for m in re.finditer(re.escape(scan) + r"\s*\(", body)]
     if not calls:
         out.append(f"never enumerates with {scan}() (the refusal needs its diagnostics)")
     for c in calls:
-        # The call must come after the question, and the question's `if (` must still be open: the text between the
-        # question and the call has to contain an unclosed `{`.
-        if q == -1 or c < q:
-            out.append(f"{scan}() is called before the O(1) question")
-            continue
-        between = body[q:c]
-        if between.count("{") <= between.count("}"):
-            out.append(f"{scan}() is called outside the branch the O(1) question opened")
+        if block is None or block[1] is None or not (block[0] < c < block[1]):
+            out.append(f"{scan}() is called outside the block the O(1) question opened")
     return out
 
 
@@ -158,6 +171,24 @@ HOST_OK = (
 )
 def test_settle_gate_has_a_witness(mutant):
     assert settle_violations(mutant, "runtime_registry_host_zone_live_locked", SCAN_HOST), mutant
+
+
+def test_real_settle_bodies_defeat_the_question_bypass_mutants():
+    host = function_body(CODE, HOST_SETTLE)
+    q = "if (runtime_registry_host_zone_live_locked(zone)) {"
+    assert q in host
+    # asks the question, then scans on an always-true condition
+    m1 = host.replace(q, "(void) runtime_registry_host_zone_live_locked(zone);\n        if (epoch_tracked || !epoch_tracked) {")
+    assert settle_violations(m1, "runtime_registry_host_zone_live_locked", SCAN_HOST)
+    m2 = host.replace(q, "if (runtime_registry_host_zone_live_locked(zone) || true) {")
+    assert settle_violations(m2, "runtime_registry_host_zone_live_locked", SCAN_HOST)
+    vram = function_body(CODE, VRAM_SETTLE)
+    q = "if (runtime_registry_span_live_locked(zone_lo, zone_hi)) {"
+    assert q in vram
+    m3 = vram.replace(q, "if (runtime_registry_span_live_locked(zone_lo, zone_hi) || true) {")
+    assert settle_violations(m3, "runtime_registry_span_live_locked", SCAN_SPAN)
+    m4 = vram.replace(q, "(void) runtime_registry_span_live_locked(zone_lo, zone_hi);\n        if (true) {")
+    assert settle_violations(m4, "runtime_registry_span_live_locked", SCAN_SPAN)
 
 
 def test_settle_gate_accepts_the_intended_shape():
@@ -291,7 +322,15 @@ def test_span_live_gate_has_a_witness(mutant):
     assert span_live_violations(mutant), mutant
 
 
+COUNTER_ARRAY = "g_runtime_host_zone_rows"
+_COMPARE_AFTER = re.compile(r"\s*(?:==|!=|<=|>=|<(?!<)|>(?!>))")
+_READ_BEFORE = re.compile(r"(?:\breturn|[=!<>]=|=|<|>|\?|:|&&|\|\|)\s*$")
+
+
 def counter_writes_outside_the_count_helper(code: str):
+    """Every use of a counter name outside the count helper that is not a plain read: an assignment, ++/--, a reference
+    binding, address-of, an array used without a subscript (decay: memset/std::fill/pointer), or a call argument
+    (std::swap and friends). A plain read is a comparison operand, a returned or copied value."""
     start, end = function_span(code, COUNT_ROW)
     bad = []
     write = re.compile(
@@ -300,14 +339,40 @@ def counter_writes_outside_the_count_helper(code: str):
         # a counter bound to a non-const reference could be written through it
         r"|(?<!const )(?:auto|size_t)\s*&&?\s*\w+\s*=\s*(?:" + "|".join(COUNTERS) + r")\b"
     )
+
+    def note(pos, text):
+        bad.append((code.count("\n", 0, pos) + 1, text[:60].replace("\n", " ")))
+
     for m in write.finditer(code):
         if start <= m.start() < end:
             continue
         line_start = code.rfind("\n", 0, m.start()) + 1
         if re.fullmatch(r"static\s+size_t\s+", code[line_start : m.start()]):
             continue  # the declaration's own initialiser
-        bad.append((code.count("\n", 0, m.start()) + 1, m.group(0)[:60].replace("\n", " ")))
-    return bad
+        note(m.start(), m.group(0))
+    for m in re.finditer(r"\b(?:" + "|".join(COUNTERS) + r")\b", code):
+        if start <= m.start() < end:
+            continue
+        line_start = code.rfind("\n", 0, m.start()) + 1
+        if re.fullmatch(r"static\s+size_t\s+", code[line_start : m.start()]):
+            continue  # the declaration itself
+        after = code[m.end() :]
+        end_use = m.end()
+        if m.group(0) == COUNTER_ARRAY:
+            sub = re.match(r"\s*\[[^\]]*\]", after)
+            if sub is None:
+                note(m.start(), "array used without a subscript: " + code[m.start() : m.start() + 40])
+                continue
+            end_use += sub.end()
+            after = code[end_use:]
+        before = code[: m.start()]
+        if re.search(r"(?<!&)&\s*$", before):
+            note(m.start(), "address-of: " + code[m.start() - 4 : m.start() + 40])
+            continue
+        if _COMPARE_AFTER.match(after) or _READ_BEFORE.search(before):
+            continue
+        note(m.start(), "not a plain read: " + code[max(0, m.start() - 20) : m.start() + 40])
+    return sorted(set(bad))
 
 
 def test_counters_are_written_only_by_the_count_helper():
@@ -325,6 +390,13 @@ def test_counters_are_written_only_by_the_count_helper():
         "g_runtime_span_irregular_rows = 0;",
         "auto & c = g_runtime_host_zone_rows[0];",
         "size_t & c = g_runtime_span_irregular_rows;",
+        "memset(g_runtime_host_zone_rows, 0, sizeof(g_runtime_host_zone_rows));",
+        "std::fill(std::begin(g_runtime_host_zone_rows), std::end(g_runtime_host_zone_rows), 0);",
+        "size_t * p = &g_runtime_span_irregular_rows; *p = 0;",
+        "size_t * rows = g_runtime_host_zone_rows;",
+        "std::swap(g_runtime_span_irregular_rows, x);",
+        "std::swap(x, g_runtime_host_zone_rows[1]);",
+        "size_t * q = &g_runtime_host_zone_rows[2];",
     ],
 )
 def test_counter_write_gate_has_a_witness(line):
@@ -346,27 +418,35 @@ def test_counter_write_gate_allows_reads(line):
     assert counter_writes_outside_the_count_helper(planted) == [], line
 
 
-def test_the_count_helper_is_called_only_by_the_three_registry_helpers():
-    assert uses_outside(CODE, "runtime_registry_count_row_locked", [COUNT_ROW, EMPLACE, ERASE_IT, ASSIGN]) == []
+def count_helper_violations(code: str):
+    out = []
+    if uses_outside(code, "runtime_registry_count_row_locked", [COUNT_ROW, EMPLACE, ERASE_IT, ASSIGN]):
+        out.append("called outside the three registry helpers")
+    for name, sig in (("emplace", EMPLACE), ("erase", ERASE_IT), ("assign", ASSIGN)):
+        if "runtime_registry_count_row_locked(" not in function_body(code, sig):
+            out.append(f"{name} does not update the counters")
+    return out
 
 
-@pytest.mark.parametrize("signature", [EMPLACE, ERASE_IT, ASSIGN])
-def test_each_registry_mutation_helper_updates_the_counters(signature):
-    assert "runtime_registry_count_row_locked(" in function_body(CODE, signature)
+def test_the_count_helper_is_called_only_by_the_registry_helpers_and_each_calls_it():
+    assert count_helper_violations(CODE) == []
 
 
-def test_the_count_helper_calls_have_a_witness():
+def test_the_count_helper_gate_has_witnesses():
     planted = CODE + "\nvoid f() {\n    runtime_registry_count_row_locked(p, h, true);\n}\n"
-    assert uses_outside(planted, "runtime_registry_count_row_locked", [COUNT_ROW, EMPLACE, ERASE_IT, ASSIGN]) != []
-    forgot = function_body(CODE, ERASE_IT).replace("runtime_registry_count_row_locked(", "forgot(")
-    assert "runtime_registry_count_row_locked(" not in forgot
+    assert "called outside the three registry helpers" in count_helper_violations(planted)
+    for name, sig in (("emplace", EMPLACE), ("erase", ERASE_IT), ("assign", ASSIGN)):
+        start, end = function_span(CODE, sig)
+        body = CODE[start:end].replace("runtime_registry_count_row_locked(", "forgot(")
+        forgot = CODE[:start] + body + CODE[end:]
+        assert count_helper_violations(forgot) == [f"{name} does not update the counters"], name
 
 
 # A registered row's host zone is counted when the row is registered and uncounted when it leaves, so it must not be
 # rewritten in between. test-sycl-runtime-registry-index-source.py forbids writing a row's handle, ptr and size through the
 # registry; this adds the one field the counters key on.
 _ASSIGN = r"(?:(?:[-+*/%|&^]|<<|>>)?=(?!=)|\+\+|--)"
-HOST_ZONE_WRITE_RE = re.compile(r"(?:->|\.)second\s*\.\s*handle\s*\.\s*host_zone\s*" + _ASSIGN)
+HOST_ZONE_WRITE_RE = re.compile(r"(?:->|\.)\s*second\s*\)*\s*\.\s*handle\s*\)*\s*\.\s*host_zone\s*" + _ASSIGN)
 
 
 def test_a_registered_rows_host_zone_is_never_rewritten():
@@ -379,6 +459,10 @@ def test_a_registered_rows_host_zone_is_never_rewritten():
         "it->second.handle.host_zone = host_zone_id::KV;",
         "registry.find(p)->second.handle.host_zone=host_zone_id::KV;",
         "it->second.handle.host_zone |= x;",
+        "(it->second).handle.host_zone = host_zone_id::KV;",
+        "it-> second.handle.host_zone = host_zone_id::KV;",
+        "(it->second.handle).host_zone = host_zone_id::KV;",
+        "((it)->second).handle.host_zone++;",
     ],
 )
 def test_host_zone_write_gate_has_a_witness(line):
@@ -390,16 +474,35 @@ def test_host_zone_write_gate_allows_reads():
     assert HOST_ZONE_WRITE_RE.findall(planted) == []
 
 
-def test_counters_and_scan_helpers_stay_file_static():
-    offenders = []
-    names = COUNTERS + (SCAN_HOST, SCAN_SPAN, "runtime_registry_host_zone_live_locked", "runtime_registry_span_live_locked")
+STATIC_NAMES = COUNTERS + (SCAN_HOST, SCAN_SPAN, "runtime_registry_host_zone_live_locked", "runtime_registry_span_live_locked")
+
+
+def static_offenders(texts):
+    """Names of the files (other than unified-cache.cpp) whose comment-stripped text mentions a file-static name."""
+    return [name for name, text in sorted(texts.items()) if any(n in strip_comments(text) for n in STATIC_NAMES)]
+
+
+def sycl_sources_other_than_unified_cache():
+    texts = {}
     for path in sorted(SYCL_DIR.rglob("*")):
-        if path.suffix not in (".cpp", ".hpp", ".h", ".cu", ".cuh") or path.name == "unified-cache.cpp":
-            continue
-        text = strip_comments(path.read_text(errors="replace"))
-        if any(n in text for n in names):
-            offenders.append(path.name)
-    assert offenders == []
+        if path.suffix in (".cpp", ".hpp", ".h", ".cu", ".cuh") and path.name != "unified-cache.cpp":
+            texts[path.name] = path.read_text(errors="replace")
+    return texts
+
+
+def test_counters_and_scan_helpers_stay_file_static():
+    texts = sycl_sources_other_than_unified_cache()
+    assert texts, "found no SYCL sources to check"
+    assert static_offenders(texts) == []
+
+
+@pytest.mark.parametrize("name", STATIC_NAMES)
+def test_file_static_gate_has_a_witness(name):
+    texts = dict(sycl_sources_other_than_unified_cache())
+    texts["planted.cpp"] = "void f() { use(" + name + "); }\n"
+    assert static_offenders(texts) == ["planted.cpp"]
+    texts["planted.cpp"] = "// " + name + " is only named in a comment\n"
+    assert static_offenders(texts) == []
 
 
 if __name__ == "__main__":

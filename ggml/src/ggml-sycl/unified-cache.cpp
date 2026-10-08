@@ -1546,8 +1546,9 @@ static void runtime_registry_note_row_scanned_locked() noexcept {
 }
 
 // The index holds the row at its own key, so "is this row's key in [lo, hi)" is "is its indexed base in [lo, hi)".
+// A row with a null key is irregular too: the index never holds one, so it cannot answer for it.
 static bool runtime_registry_row_span_regular(const void * key, const alloc_metadata & h) noexcept {
-    return key == nullptr || (runtime_registry_row_indexed(h) && h.ptr == key);
+    return runtime_registry_row_indexed(h) && h.ptr == key;
 }
 
 // Adds (or removes) one row's contribution to the counters above. The ONLY writer of them; the caller holds
@@ -17790,7 +17791,8 @@ bool allocation_registry_test_assign_raw(void * ptr, int device, size_t bytes) n
 bool allocation_registry_test_corrupt_row_size(void * ptr, size_t bytes) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     const auto                  it = g_runtime_alloc_registry.find(ptr);
-    if (it == g_runtime_alloc_registry.end()) {
+    if (it == g_runtime_alloc_registry.end() || bytes == 0) {
+        // A zero size would turn the row irregular behind the settle counters (llama.cpp-rriv); no test needs it.
         return false;
     }
     it->second.handle.size = bytes;
