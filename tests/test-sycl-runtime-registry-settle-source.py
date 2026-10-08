@@ -12,27 +12,32 @@ O(1) / O(log n) and enumerate rows only to explain a refusal:
 
 What this file enforces, as text assertions on comment-stripped unified-cache.cpp:
 
-(A) host_zone_settle() and zone_settle() never name g_runtime_alloc_registry, call a scan helper only inside the block of an
-    `if (<O(1) question>(...)) {` whose condition is that question alone, and consult runtime_registry_host_zone_live_locked() / runtime_registry_span_live_locked().
+(A) host_zone_settle() and zone_settle() never name g_runtime_alloc_registry. Each calls its scan helper only inside
+    the block of an `if (<O(1) question>(<its zone arguments>)) {` whose condition is that question alone.
 (B) The enumerating helpers (runtime_registry_scan_host_zone_locked / runtime_registry_scan_span_locked) are called only
     from those two functions, and only inside the branch the O(1) question opened.
 (C) runtime_registry_host_zone_live_locked() is a counter read with no loop; runtime_registry_span_live_locked() queries
     the index first and reaches its one registry loop only after the irregular-row guard has declined the index answer.
-(D) The counters are written only inside runtime_registry_count_row_locked(), which only the three registry mutation
-    helpers (emplace, erase, assign) call; so a counter cannot drift from the registry the way a hand-kept one would.
-    A registered row's handle.host_zone, the field the host counters key on, is never rewritten through the registry.
-    Outside that helper a counter name may only be read (a comparison operand, a returned or copied value): assignment,
-    ++/--, a reference declarator or init-capture whose type spelling contains `&`/`&&` textually, address-of, an unsubscripted array, a call
-    argument, a conditional operand outside a `return` or a plain `=` initialiser (and inside one only while every
-    parenthesis before the operand is closed: a parenthesised or nested conditional is refused even in a return), and a
-    return from a namespace-scope function whose header follows a column-0 `}` or the file start, or from a lambda, whose
-    declared (leading or trailing) return type contains `&` are all refused. A row's
-    handle.host_zone obeys the same rule (assignment, ++/--, address-of, call argument).
+(D) Counter and host_zone rules:
+    - writer: the counters are written only inside runtime_registry_count_row_locked(), which only the three registry
+      mutation helpers (emplace, erase, assign) call, so a counter cannot drift from the registry the way a hand-kept
+      one would;
+    - host_zone: a registered row's handle.host_zone, the field the host counters key on, is never rewritten through
+      the registry (assignment, ++/--, address-of, a reference binding or a call argument);
+    - accepted reads: outside the helper a counter name may only be read (a comparison operand, a returned or copied
+      value); a conditional operand counts as a read only in a `return` or a plain `=` initialiser, and only while
+      every parenthesis before the operand is closed (a parenthesised or nested conditional is refused even in a
+      return);
+    - refused: assignment, ++/--, a reference declarator or init-capture whose type spelling contains `&`/`&&`
+      textually, address-of, an unsubscripted array, a call argument, and a return from a namespace-scope function
+      whose header follows a column-0 `}` or the file start, or from a lambda, whose declared (leading or trailing)
+      return type contains `&`.
 
 NOT COVERED, stated so nobody mistakes this for a proof. This is a tripwire on text, not on cost or on drift:
     - it cannot see what a helper's callee does (a counter read that someone makes expensive passes);
-    - a counter that is updated by the right helper with the wrong row still passes: tests/test-runtime-registry-containment.cpp
-      compares the counters with a full scan, and test-unified-runtime-alloc (device) exercises the real settles;
+    - a counter that is updated by the right helper with the wrong row still passes:
+      ggml/src/ggml-sycl/tests/test-runtime-registry-containment.cpp compares the counters with a full scan, and
+      test-unified-runtime-alloc (device) exercises the real settles;
     - a clean-settle slow path that is not a loop over the registry (another global scan, a sleep) passes;
     - functions are bounded at a closing brace in column 0, which is how this file is formatted; `#if 0` blocks and raw
       string literals are not understood by the comment stripper (ordinary string and char literals are blanked before
@@ -40,8 +45,8 @@ NOT COVERED, stated so nobody mistakes this for a proof. This is a tripwire on t
     - an alias or type trait that hides the `&` (`using R = size_t &; R c = COUNTER; c = 0;`,
       `std::add_lvalue_reference_t<size_t>`) passes;
     - a counter returned by reference from a member function (`struct S { size_t & get() { return COUNTER; } };`, its
-      static variant) or from the FIRST function after a fresh scope opener (`namespace detail { size_t & get() {...} }`)
-      passes: only functions whose header follows a column-0 `}` or the file start have their leading return type read;
+      static variant) or from the FIRST function after a fresh scope opener
+      (`namespace detail { size_t & get() {...} }`) passes: only functions whose header follows a column-0 `}` or the file start have their leading return type read;
     - fail-closed: a `->` member access followed by `&` in an enclosing `if`/`while` header (`if ((p)->a & 1) { return
       COUNTER; }`) is read as a trailing return type, so such a return from a by-value function is reported;
     - a host_zone passed through a parenthesised callee (`(consume)(it->second.handle.host_zone)`) passes;
@@ -52,6 +57,7 @@ Host-only, pure text assertions. llama_test_pytest hands this file to pytest.mai
 functions. Each check has a mutation witness so it is known to fail on the regression it guards.
 """
 
+import functools
 import re
 from pathlib import Path
 
@@ -224,12 +230,16 @@ def test_real_settle_bodies_defeat_wrong_argument_and_literal_brace_mutants():
     m1 = host.replace(q, "if (runtime_registry_host_zone_live_locked(host_zone_id::KV)) {")
     assert settle_violations(m1, "runtime_registry_host_zone_live_locked", SCAN_HOST, HOST_ARGS)
     vram = function_body(CODE, VRAM_SETTLE)
-    q = "if (runtime_registry_span_live_locked(zone_lo, zone_hi)) {"
-    m2 = vram.replace(q, "if (runtime_registry_span_live_locked(0, UINTPTR_MAX)) {")
+    m2 = vram.replace(
+        "if (runtime_registry_span_live_locked(zone_lo, zone_hi)) {",
+        "if (runtime_registry_span_live_locked(0, UINTPTR_MAX)) {",
+    )
     assert settle_violations(m2, "runtime_registry_span_live_locked", SCAN_SPAN, SPAN_ARGS)
     # a `{` inside a string literal must not keep the question's block open past its real end
-    m3 = host.replace(q.replace("span_live_locked(zone_lo, zone_hi)", "host_zone_live_locked(zone)"),
-                      'if (runtime_registry_host_zone_live_locked(zone)) { GGML_LOG_WARN("{"); }\n    if (true) {')
+    m3 = host.replace(
+        "if (runtime_registry_host_zone_live_locked(zone)) {",
+        'if (runtime_registry_host_zone_live_locked(zone)) { GGML_LOG_WARN("{"); }\n    if (true) {',
+    )
     assert m3 != host and settle_violations(m3, "runtime_registry_host_zone_live_locked", SCAN_HOST, HOST_ARGS)
 
 
@@ -269,6 +279,7 @@ def test_the_scan_helpers_exist_and_enumerate():
 
 
 def host_live_violations(body: str):
+    """What is wrong with the host-zone question: it must be a counter read, no loop and no registry access."""
     out = []
     if LOOP_RE.search(body):
         out.append("loops")
@@ -297,6 +308,7 @@ def test_host_zone_live_gate_has_a_witness(body):
 
 
 def span_live_violations(body: str):
+    """What is wrong with the span question: the index answer must be returned inside the irregular-row guard."""
     out = []
     if "g_runtime_alloc_index.find_first_base_in(" not in body:
         out.append("does not query the index")
@@ -426,6 +438,12 @@ def returns_reference(code: str, pos: int) -> bool:
     return False
 
 
+def is_declaration(code: str, pos: int) -> bool:
+    """Is pos the name in `static size_t <name>` at the start of its line (the counter's own declaration)?"""
+    line_start = code.rfind("\n", 0, pos) + 1
+    return re.fullmatch(r"static\s+size_t\s+", code[line_start:pos]) is not None
+
+
 def counter_writes_outside_the_count_helper(code: str):
     """Every use of a counter name outside the count helper that is not a plain read: an assignment, ++/--, a reference
     binding, address-of, an array used without a subscript (decay: memset/std::fill/pointer), or a call argument
@@ -443,18 +461,12 @@ def counter_writes_outside_the_count_helper(code: str):
         bad.append((code.count("\n", 0, pos) + 1, text[:60].replace("\n", " ")))
 
     for m in write.finditer(code):
-        if start <= m.start() < end:
+        if start <= m.start() < end or is_declaration(code, m.start()):
             continue
-        line_start = code.rfind("\n", 0, m.start()) + 1
-        if re.fullmatch(r"static\s+size_t\s+", code[line_start : m.start()]):
-            continue  # the declaration's own initialiser
         note(m.start(), m.group(0))
     for m in re.finditer(r"\b(?:" + "|".join(COUNTERS) + r")\b", code):
-        if start <= m.start() < end:
+        if start <= m.start() < end or is_declaration(code, m.start()):
             continue
-        line_start = code.rfind("\n", 0, m.start()) + 1
-        if re.fullmatch(r"static\s+size_t\s+", code[line_start : m.start()]):
-            continue  # the declaration itself
         after = code[m.end() :]
         end_use = m.end()
         if m.group(0) == COUNTER_ARRAY:
@@ -566,6 +578,7 @@ def test_counter_write_gate_allows_reads(line):
 
 
 def count_helper_violations(code: str):
+    """Calls of the count helper outside the three registry helpers, and registry helpers that do not call it."""
     out = []
     if uses_outside(code, "runtime_registry_count_row_locked", [COUNT_ROW, EMPLACE, ERASE_IT, ASSIGN]):
         out.append("called outside the three registry helpers")
@@ -661,16 +674,18 @@ def test_host_zone_write_gate_allows_reads(line):
 STATIC_NAMES = COUNTERS + (SCAN_HOST, SCAN_SPAN, "runtime_registry_host_zone_live_locked", "runtime_registry_span_live_locked")
 
 
-def static_offenders(texts):
-    """Names of the files (other than unified-cache.cpp) whose comment-stripped text mentions a file-static name."""
-    return [name for name, text in sorted(texts.items()) if any(n in strip_comments(text) for n in STATIC_NAMES)]
+def static_offenders(stripped_texts):
+    """Names of the (comment-stripped) files that mention a file-static name."""
+    return [name for name, text in sorted(stripped_texts.items()) if any(n in text for n in STATIC_NAMES)]
 
 
+@functools.lru_cache(maxsize=1)
 def sycl_sources_other_than_unified_cache():
+    """Comment-stripped text of every SYCL source but unified-cache.cpp, read once per run."""
     texts = {}
     for path in sorted(SYCL_DIR.rglob("*")):
         if path.suffix in (".cpp", ".hpp", ".h", ".cu", ".cuh") and path.name != "unified-cache.cpp":
-            texts[path.name] = path.read_text(errors="replace")
+            texts[path.name] = strip_comments(path.read_text(errors="replace"))
     return texts
 
 
@@ -683,9 +698,9 @@ def test_counters_and_scan_helpers_stay_file_static():
 @pytest.mark.parametrize("name", STATIC_NAMES)
 def test_file_static_gate_has_a_witness(name):
     texts = dict(sycl_sources_other_than_unified_cache())
-    texts["planted.cpp"] = "void f() { use(" + name + "); }\n"
+    texts["planted.cpp"] = strip_comments("void f() { use(" + name + "); }\n")
     assert static_offenders(texts) == ["planted.cpp"]
-    texts["planted.cpp"] = "// " + name + " is only named in a comment\n"
+    texts["planted.cpp"] = strip_comments("// " + name + " is only named in a comment\n")
     assert static_offenders(texts) == []
 
 

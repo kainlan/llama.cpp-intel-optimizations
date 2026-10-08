@@ -41,8 +41,8 @@ What this file enforces:
 (D) The lookup consults the index, does not iterate the registry, and carries the backstop assertion.
 (E) g_runtime_alloc_index is MUTATED (insert/erase/resize/clear/assignment, an alias, a pointer) only inside
     runtime_registry_emplace_locked, runtime_registry_erase_locked and runtime_registry_assign_locked. Everywhere else
-    it is a read member call (find_innermost/find_exact/find_first_base_in/size/check_invariants) or its declaration, which covers the
-    PRIVATE_TESTING consistency audit.
+    it is a read member call (find_innermost/find_exact/find_first_base_in/size/check_invariants) or its declaration,
+    which covers the PRIVATE_TESTING consistency audit.
 
 NOT COVERED, stated so nobody mistakes this for a proof. The gate reads text, not the AST:
     - writes by CALL, even directly on a row: `std::swap(it->second, x)`, `std::exchange(it->second.handle.size, 0)`,

@@ -1626,7 +1626,7 @@ static std::pair<runtime_registry_iterator, bool> runtime_registry_emplace_locke
             return { g_runtime_alloc_registry.end(), false };
         }
     }
-    runtime_registry_count_row_locked(ptr, h, true);
+    runtime_registry_count_row_locked(ptr, h, /*add=*/true);
     return inserted;
 }
 
@@ -1643,7 +1643,7 @@ static void runtime_registry_erase_locked(runtime_registry_iterator it) noexcept
         GGML_ASSERT(unindexed && "runtime allocation index lost a registered row");
         (void) unindexed;
     }
-    runtime_registry_count_row_locked(it->first, h, false);
+    runtime_registry_count_row_locked(it->first, h, /*add=*/false);
     g_runtime_alloc_registry.erase(it);
 }
 
@@ -1693,8 +1693,8 @@ static void runtime_registry_assign_locked(void * ptr, const runtime_alloc_recor
     } else if (was) {
         g_runtime_alloc_index.erase(reinterpret_cast<uintptr_t>(old_h.ptr), ptr);
     }
-    runtime_registry_count_row_locked(ptr, old_h, false);
-    runtime_registry_count_row_locked(ptr, fresh.handle, true);
+    runtime_registry_count_row_locked(ptr, old_h, /*add=*/false);
+    runtime_registry_count_row_locked(ptr, fresh.handle, /*add=*/true);
     it->second = std::move(fresh);
 }
 
