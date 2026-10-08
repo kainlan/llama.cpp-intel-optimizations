@@ -22,8 +22,9 @@ What this file enforces, as text assertions on comment-stripped unified-cache.cp
     helpers (emplace, erase, assign) call; so a counter cannot drift from the registry the way a hand-kept one would.
     A registered row's handle.host_zone, the field the host counters key on, is never rewritten through the registry.
     Outside that helper a counter name may only be read (a comparison operand, a returned or copied value): assignment,
-    ++/--, a reference declarator or init-capture of ANY type spelling, address-of, an unsubscripted array, a call
-    argument, and a return from a function whose declared return type contains `&` are all refused. A row's
+    ++/--, a reference declarator or init-capture whose type spelling contains `&`/`&&` textually, address-of, an unsubscripted array, a call
+    argument, a conditional operand outside a `return` or a plain `=` initialiser, and a return from a function or lambda
+    whose declared (leading or trailing) return type contains `&` are all refused. A row's
     handle.host_zone obeys the same rule (assignment, ++/--, address-of, call argument).
 
 NOT COVERED, stated so nobody mistakes this for a proof. This is a tripwire on text, not on cost or on drift:
@@ -34,6 +35,7 @@ NOT COVERED, stated so nobody mistakes this for a proof. This is a tripwire on t
     - functions are bounded at a closing brace in column 0, which is how this file is formatted; `#if 0` blocks and raw
       string literals are not understood by the comment stripper (ordinary string and char literals are blanked before
       braces are matched);
+    - a type alias that hides the `&` (`using R = size_t &; R c = COUNTER; c = 0;`) passes;
     - a counter or host_zone reached through a macro, a template parameter or a pointer arithmetic expression the text
       rules do not parse passes; the rules are a name-based tripwire.
 
@@ -294,16 +296,7 @@ def span_live_violations(body: str):
         out.append("has no irregular-row guard")
         return out
     # The index answer sits inside the guard and returns; any loop must come after the guard's block has closed.
-    depth = 0
-    close = None
-    for i in range(guard.end() - 1, len(body)):
-        if body[i] == "{":
-            depth += 1
-        elif body[i] == "}":
-            depth -= 1
-            if depth == 0:
-                close = i
-                break
+    close = matching_brace(body, guard.end() - 1)
     if close is None:
         out.append("guard block is unbalanced")
         return out
@@ -345,6 +338,14 @@ def test_span_live_gate_accepts_the_intended_shape():
         SPAN_OK.replace("if (g_runtime_span_irregular_rows == 0)", "if (true)"),
         # a loop ahead of the guard
         "{ for (int i = 0; i < 3; i++) {}\n" + SPAN_OK[2:],
+        # a `}` inside a string literal must not close the guard early and hide the loop that follows
+        "{ if (g_runtime_span_irregular_rows == 0) {\n"
+        "      if (g_runtime_alloc_index.find_first_base_in(lo, hi, nullptr)) return true;\n"
+        '      GGML_LOG_WARN("}");\n'
+        "      for (const auto & kv : g_runtime_alloc_registry) { if (in(kv.first)) return true; }\n"
+        "      return false;\n"
+        "  }\n"
+        "  return false; }\n",
         # the guarded block no longer returns the index answer
         SPAN_OK.replace("return g_runtime_alloc_index.find_first_base_in(lo, hi, nullptr);", "(void) g_runtime_alloc_index.find_first_base_in(lo, hi, nullptr);"),
     ],
@@ -355,7 +356,23 @@ def test_span_live_gate_has_a_witness(mutant):
 
 COUNTER_ARRAY = "g_runtime_host_zone_rows"
 _COMPARE_AFTER = re.compile(r"\s*(?:==|!=|<=|>=|<(?!<)|>(?!>))")
-_READ_BEFORE = re.compile(r"(?:\breturn|[=!<>]=|=|<|>|\?|:|&&|\|\|)\s*$")
+_READ_BEFORE = re.compile(r"(?:\breturn|[=!<>]=|=|<|>|&&|\|\|)\s*$")
+_TERNARY_BEFORE = re.compile(r"[?:]\s*$")
+_PLAIN_ASSIGN = re.compile(r"(?<![=!<>+\-*/%|&^])=(?!=)")
+
+
+def ternary_operand_is_read(prefix: str) -> bool:
+    """A conditional operand is a read only when its statement is `return <expr>` or `<decl or lvalue> = <expr>` with every
+    parenthesis in <expr> closed before the operand: `(c ? X : y) = 0` and `f(c ? X : y)` are not."""
+    stripped = prefix.lstrip()
+    if stripped.startswith("return"):
+        rest = stripped[len("return") :]
+    else:
+        m = _PLAIN_ASSIGN.search(stripped)
+        if m is None:
+            return False
+        rest = stripped[m.end() :]
+    return rest.count("(") == rest.count(")")
 
 
 # A reference declarator or init-capture: `T & x =`, `T&& x =`, `[&x =`, whatever the type spelling is.
@@ -367,18 +384,33 @@ def statement_prefix(code: str, pos: int) -> str:
     return code[max(code.rfind(c, 0, pos) for c in ";{}") + 1 : pos]
 
 
+_TRAILING_REF_RETURN = re.compile(r"\)\s*(?:(?:const|noexcept|mutable)\s*)*->\s*[^;{}()]*&")
+
+
 def returns_reference(code: str, pos: int) -> bool:
-    """Is pos inside a function whose declared return type contains `&`? Functions start after a column-0 `}` line."""
+    """Is pos inside a function or lambda whose declared return type contains `&`? Functions start after a column-0 `}`
+    line; the leading return type is the text before the first `(`, a trailing one follows `) ->`."""
     prev = None
     for prev in re.finditer(r"^\}[^\n]*\n", code[:pos], flags=re.M):
         pass
     region = prev.end() if prev else 0
-    brace = code.find("{", region)
-    if brace == -1 or brace > pos:
+    text = blank_literals(code)
+    stack = []
+    for i in range(region, pos):
+        if text[i] == "{":
+            stack.append(i)
+        elif text[i] == "}" and stack:
+            stack.pop()
+    if not stack:
         return False
-    header = code[region:brace]
-    header = header[max(header.rfind(";"), header.rfind("}")) + 1 :]
-    return "&" in header.split("(")[0]
+    for depth, brace in enumerate(stack):
+        header = text[region:brace] if depth == 0 else text[:brace]
+        header = header[max(header.rfind(";"), header.rfind("{"), header.rfind("}"), -1) + 1 :]
+        if _TRAILING_REF_RETURN.search(header):
+            return True
+        if depth == 0 and "&" in header.split("(")[0]:
+            return True
+    return False
 
 
 def counter_writes_outside_the_count_helper(code: str):
@@ -430,7 +462,10 @@ def counter_writes_outside_the_count_helper(code: str):
         if re.search(r"(?<!&)&\s*$", before):
             note(m.start(), "address-of: " + code[m.start() - 4 : m.start() + 40])
             continue
-        if _COMPARE_AFTER.match(after) or _READ_BEFORE.search(before):
+        if _TERNARY_BEFORE.search(before):
+            if ternary_operand_is_read(prefix):
+                continue
+        elif _COMPARE_AFTER.match(after) or _READ_BEFORE.search(before):
             continue
         note(m.start(), "not a plain read: " + code[max(0, m.start() - 20) : m.start() + 40])
     return sorted(set(bad))
@@ -464,6 +499,11 @@ def test_counters_are_written_only_by_the_count_helper():
         "auto l = [&c = g_runtime_span_irregular_rows] { c = 0; };",
         "auto && c = g_runtime_host_zone_rows[1]; c = 0;",
         "decltype(auto) c = (g_runtime_span_irregular_rows);",
+        "(flag ? g_runtime_span_irregular_rows : other) = 0;",
+        "std::swap(flag ? g_runtime_span_irregular_rows : other, y);",
+        "bump(flag ? g_runtime_host_zone_rows[0] : other);",
+        "(flag ? other : g_runtime_span_irregular_rows) = 0;",
+        "size_t n = f(flag ? g_runtime_span_irregular_rows : other);",
     ],
 )
 def test_counter_write_gate_has_a_witness(line):
@@ -477,6 +517,9 @@ def test_counter_write_gate_has_a_witness(line):
         "static size_t & irregular_ref() noexcept {\n    return g_runtime_span_irregular_rows;\n}\n",
         "static auto & rows_ref(size_t z) {\n    return g_runtime_host_zone_rows[z];\n}\n",
         "static const size_t & rows_cref() {\n    return g_runtime_span_irregular_rows;\n}\n",
+        "static auto irregular_ref() noexcept -> size_t & {\n    return g_runtime_span_irregular_rows;\n}\n",
+        "static void g() {\n    auto l = []() -> size_t & { return g_runtime_span_irregular_rows; };\n}\n",
+        "static void g() {\n    auto l = [](size_t z) mutable -> auto & { return g_runtime_host_zone_rows[z]; };\n}\n",
     ],
 )
 def test_counter_returned_by_reference_has_a_witness(func):
@@ -485,6 +528,7 @@ def test_counter_returned_by_reference_has_a_witness(func):
 
 def test_counter_returned_by_value_is_a_read():
     func = "static size_t irregular_value() noexcept {\n    return g_runtime_span_irregular_rows;\n}\n"
+    func += "static void g() {\n    auto l = []() -> size_t { return g_runtime_span_irregular_rows; };\n}\n"
     assert counter_writes_outside_the_count_helper(CODE + "\n" + func) == []
 
 
@@ -493,6 +537,9 @@ def test_counter_returned_by_value_is_a_read():
     [
         "if (g_runtime_span_irregular_rows == 0) { return true; }",
         "return g_runtime_host_zone_rows[0] != 0;",
+        "const size_t n = flag ? g_runtime_host_zone_rows[0] : 0;",
+        "size_t n; n = flag ? other : g_runtime_span_irregular_rows;",
+        "return (a < b) ? g_runtime_host_zone_rows[1] : 0;",
         "const size_t n = g_runtime_host_zone_rows[1];",
         "if (g_runtime_span_irregular_rows >= 1) {}",
     ],
@@ -545,7 +592,9 @@ def host_zone_row_writes(code: str):
             bad.append(m.start())
         elif re.match(r"\s*(?:==|!=|<=|>=|<(?!<)|>(?!>)|;|\?|&&|\|\|)", after):
             continue
-        elif re.search(r"(?:\breturn|=|\bif\s*\(|\bwhile\s*\()\s*[\w\(\)\.\->\s]*$", prefix):
+        elif (m_ctx := re.search(r"(?:\breturn|=|\bif\s*\(|\bwhile\s*\()\s*([\w\(\)\.\->\s]*)$", prefix)) and not re.search(
+            r"\w\s*\(", m_ctx.group(1)
+        ):
             continue
         else:
             bad.append(m.start())
@@ -571,6 +620,9 @@ def test_a_registered_rows_host_zone_is_never_rewritten():
         "host_zone_id * zp = &it->second.handle.host_zone;",
         "host_zone_id & zr = it->second.handle.host_zone;",
         "consume(it->second.handle.host_zone);",
+        "bool b = consume(it->second.handle.host_zone);",
+        "if (consume(it->second.handle.host_zone)) {}",
+        "while (bump(it->second.handle.host_zone)) {}",
     ],
 )
 def test_host_zone_write_gate_has_a_witness(line):
