@@ -11,6 +11,7 @@
 #include "pinned-buffer-pool.hpp"
 
 #include "common.hpp"
+#include "moe-decode-hostpath.hpp"
 #include "unified-cache.hpp"
 
 #include <cassert>
@@ -127,12 +128,13 @@ PinnedBufferPool::BufferPair PinnedBufferPool::acquire(size_t n_experts) {
 
 size_t PinnedBufferPool::reserve(size_t n_experts) {
     GGML_ASSERT(n_experts <= max_experts_ && "Expert count exceeds pool capacity");
-    if (next_entry_ + n_experts > max_experts_) {
-        next_entry_ = 0;
-    }
-    const size_t first = next_entry_;
+    const size_t first = ggml_sycl::moe_pool_reserve_first(next_entry_, n_experts, max_experts_);
     next_entry_        = (first + n_experts) % max_experts_;
     return first;
+}
+
+size_t PinnedBufferPool::reserve_peek(size_t n_experts) const {
+    return ggml_sycl::moe_pool_reserve_first(next_entry_, n_experts, max_experts_);
 }
 
 void PinnedBufferPool::release(BufferPair) {

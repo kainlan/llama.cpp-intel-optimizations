@@ -1,0 +1,14 @@
+<|im_start|>user
+Write a Python function `merge_intervals(intervals)` that merges overlapping closed intervals given as a list of (start, end) tuples and returns the merged list sorted by start. Include a short docstring and three doctest examples.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+```python
+def merge_intervals(intervals):
+    """
+    Merge overlapping closed intervals.
+
+    Given a list of (start, end) tuples representing closed intervals,
+    merge

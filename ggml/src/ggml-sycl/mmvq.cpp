@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -62,6 +63,29 @@ static ggml_sycl_profile_label mmvq_profile_label(sycl::queue & queue,
     return label;
 }
 
+// MoE id-kernel metadata shared by the MUL_MAT_ID profile labels (llama.cpp-bzkx):
+// total_batches is the (expert, token) slot count the grid is launched over.
+// Both id-label string helpers return an empty string (no allocation) while the profiler is off.
+static std::string mmvq_id_profile_metadata(int ncols, int nrows_per_expert, int total_batches) {
+    if (!ggml_sycl_kernel_profile_enabled()) {
+        return std::string();
+    }
+    return "ncols=" + std::to_string(ncols) + ";nrows_per_expert=" + std::to_string(nrows_per_expert) +
+           ";total_batches=" + std::to_string(total_batches);
+}
+
+// Label name for the type-generic AOS id kernel: mulmat.mmvq.id_aos_<ggml_type_name, lowercased>.
+static std::string mmvq_id_aos_profile_name(ggml_type type) {
+    if (!ggml_sycl_kernel_profile_enabled()) {
+        return std::string();
+    }
+    std::string name = std::string("mulmat.mmvq.id_aos_") + ggml_type_name(type);
+    for (char & c : name) {
+        c = (char) std::tolower((unsigned char) c);
+    }
+    return name;
+}
+
 static sycl::event mmvq_profile_submit_quantize_activation_q8_soa(sycl::queue & queue,
                                                                   const float * src,
                                                                   char *        dst,
@@ -79,6 +103,10 @@ static sycl::event mmvq_profile_submit_quantize_activation_q8_soa(sycl::queue & 
     }, file, line, function);
 }
 
+// The fused-add MMVQ kernels below take dst and fused_add WITHOUT __restrict__: the fusion alias gate
+// (fusion-alias.hpp) admits an output that is the addend itself (identical address, shape and strides), and
+// each row is read and written by one lane in one expression. A restrict-qualified pair would make that
+// formally undefined and let the compiler reorder the load and the store.
 static __dpct_inline__ float mmvq_fused_add_value(const float * add,
                                                   const int64_t add_ne0,
                                                   const int64_t add_nb0,
@@ -2283,16 +2311,16 @@ template <int qtype> class mmvq_id_kernel_name;
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_reorder(const void * __restrict__ vx,
                                   const void * __restrict__ vy,
-                                  float * __restrict__ dst,
+                                  float *                  dst,
                                   const int                ncols,
                                   const int                nrows,
                                   const int                total_nrows,
                                   const int                row_low,
                                   const sycl::nd_item<3> & nd_item,
-                                  const float * __restrict__ fused_add = nullptr,
-                                  const int64_t fused_add_ne0          = 0,
-                                  const int64_t fused_add_nb0          = sizeof(float),
-                                  const int64_t fused_add_row_base     = 0) {
+                                  const float *            fused_add          = nullptr,
+                                  const int64_t            fused_add_ne0      = 0,
+                                  const int64_t            fused_add_nb0      = sizeof(float),
+                                  const int64_t            fused_add_row_base = 0) {
     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
     using block_traits = typename block_type::traits;
 
@@ -2351,7 +2379,7 @@ static void mul_mat_vec_q_reorder(const void * __restrict__ vx,
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_reorder_slm(const void * __restrict__ vx,
                                       const void * __restrict__ vy,
-                                      float * __restrict__ dst,
+                                      float *                  dst,
                                       const int                ncols,
                                       const int                nrows,
                                       const int                total_nrows,
@@ -2359,10 +2387,10 @@ static void mul_mat_vec_q_reorder_slm(const void * __restrict__ vx,
                                       const sycl::nd_item<3> & nd_item,
                                       int8_t * __restrict__ slm_y_qs,
                                       sycl::half2 * __restrict__ slm_y_ds,
-                                      const float * __restrict__ fused_add = nullptr,
-                                      const int64_t fused_add_ne0          = 0,
-                                      const int64_t fused_add_nb0          = sizeof(float),
-                                      const int64_t fused_add_row_base     = 0) {
+                                      const float * fused_add          = nullptr,
+                                      const int64_t fused_add_ne0      = 0,
+                                      const int64_t fused_add_nb0      = sizeof(float),
+                                      const int64_t fused_add_row_base = 0) {
     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
     using block_traits = typename block_type::traits;
 
@@ -2442,14 +2470,14 @@ static void mul_mat_vec_q_reorder_slm(const void * __restrict__ vx,
 // This achieves 100% cache line utilization (vs 50% with strided access in standard reorder)
 static void mul_mat_vec_q4_0_coalesced(const void * __restrict__ vx,  // Coalesced X weights
                                        const void * __restrict__ vy,  // Reordered Y activations
-                                       float * __restrict__ dst,
+                                       float *                  dst,
                                        const int                ncols,
                                        const int                nrows,
                                        const sycl::nd_item<3> & nd_item,
-                                       const float * __restrict__ fused_add = nullptr,
-                                       const int64_t fused_add_ne0          = 0,
-                                       const int64_t fused_add_nb0          = sizeof(float),
-                                       const int64_t fused_add_row_base     = 0) {
+                                       const float *            fused_add          = nullptr,
+                                       const int64_t            fused_add_ne0      = 0,
+                                       const int64_t            fused_add_nb0      = sizeof(float),
+                                       const int64_t            fused_add_row_base = 0) {
     const auto sg           = nd_item.get_sub_group();
     const int  sg_range     = sg.get_group_linear_range();
     const int  workgroup_id = nd_item.get_group_linear_id();
@@ -2766,14 +2794,14 @@ static void variable_tile_mul_mat_vec_q6_k_q8_1_sycl(const void *  vx,
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
 static void mul_mat_vec_q(const void * __restrict__ vx,
                           const void * __restrict__ vy,
-                          float * __restrict__ dst,
+                          float *                  dst,
                           const int                ncols,
                           const int                nrows,
                           const sycl::nd_item<3> & item_ct1,
-                          const float * __restrict__ fused_add = nullptr,
-                          const int64_t fused_add_ne0          = 0,
-                          const int64_t fused_add_nb0          = sizeof(float),
-                          const int64_t fused_add_row_base     = 0) {
+                          const float *            fused_add          = nullptr,
+                          const int64_t            fused_add_ne0      = 0,
+                          const int64_t            fused_add_nb0      = sizeof(float),
+                          const int64_t            fused_add_row_base = 0) {
     const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
 
     if (row >= nrows) {
@@ -2984,16 +3012,16 @@ template <int qk,
           int nrows_per_wg>
 static void mul_mat_vec_q_multirow(const void * __restrict__ vx,
                                    const void * __restrict__ vy,
-                                   float * __restrict__ dst,
+                                   float *                  dst,
                                    const int                ncols,
                                    const int                nrows,
                                    const sycl::nd_item<3> & item_ct1,
                                    int * __restrict__ slm_y_qs,
                                    sycl::half2 * __restrict__ slm_y_ds,
-                                   const float * __restrict__ fused_add = nullptr,
-                                   const int64_t fused_add_ne0          = 0,
-                                   const int64_t fused_add_nb0          = sizeof(float),
-                                   const int64_t fused_add_row_base     = 0) {
+                                   const float * fused_add          = nullptr,
+                                   const int64_t fused_add_ne0      = 0,
+                                   const int64_t fused_add_nb0      = sizeof(float),
+                                   const int64_t fused_add_row_base = 0) {
     // Work-group layout: (1, nrows_per_wg, WARP_SIZE)
     // Each warp handles one row, all warps share Y-vector in SLM
     const int local_row = item_ct1.get_local_id(1);           // Which row within work-group (0 to nrows_per_wg-1)
@@ -3096,14 +3124,14 @@ template <int qtype> class mmvq_multirow_kernel_name;
 template <int qk, int qi, typename block_q_t, int vdr>
 static void mul_mat_vec_q_iq2_xxs_q8_1(const void * __restrict__ vx,
                                        const void * __restrict__ vy,
-                                       float * __restrict__ dst,
+                                       float *                  dst,
                                        const int                ncols,
                                        const int                nrows,
                                        const sycl::nd_item<3> & item_ct1,
-                                       const float * __restrict__ fused_add = nullptr,
-                                       const int64_t fused_add_ne0          = 0,
-                                       const int64_t fused_add_nb0          = sizeof(float),
-                                       const int64_t fused_add_row_base     = 0) {
+                                       const float *            fused_add          = nullptr,
+                                       const int64_t            fused_add_ne0      = 0,
+                                       const int64_t            fused_add_nb0      = sizeof(float),
+                                       const int64_t            fused_add_row_base = 0) {
     const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
 
     if (row >= nrows) {
@@ -3316,6 +3344,36 @@ static void mul_mat_vec_q_iq3_s_q8_1(const void * __restrict__ vx,
     if (item_ct1.get_local_id(2) == 0) {
         dst[row] = tmp;
     }
+}
+
+// Generic-signature adaptors for the MUL_MAT_ID _id kernel (mul_mat_vec_q_id takes a
+// vec_dot_q_sycl_t). The IQ3 vec_dots also take their grid tables, which the dense
+// kernels above pass from the global tables; these bind the same tables, so the _id
+// kernel computes exactly the dense kernels' per-block dot product.
+static __dpct_inline__ float vec_dot_iq3_xxs_q8_1_id(const void * __restrict__ vbq,
+                                                     const block_q8_1 * __restrict__ bq8_1,
+                                                     const int & iqs) {
+    return vec_dot_iq3_xxs_q8_1(vbq, bq8_1, iqs, iq3xxs_grid, ksigns64);
+}
+
+static __dpct_inline__ float vec_dot_iq3_s_q8_1_id(const void * __restrict__ vbq,
+                                                   const block_q8_1 * __restrict__ bq8_1,
+                                                   const int & iqs) {
+    return vec_dot_iq3_s_q8_1(vbq, bq8_1, iqs, iq3s_grid);
+}
+
+// Same for the IQ2 pair that takes grid tables. vec_dot_iq2_s_q8_1 already has the generic
+// signature (it reads iq2s_grid itself), so IQ2_S needs no adaptor.
+static __dpct_inline__ float vec_dot_iq2_xxs_q8_1_id(const void * __restrict__ vbq,
+                                                     const block_q8_1 * __restrict__ bq8_1,
+                                                     const int & iqs) {
+    return vec_dot_iq2_xxs_q8_1(vbq, bq8_1, iqs, iq2xxs_grid, ksigns_iq2xs, kmask_iq2xs);
+}
+
+static __dpct_inline__ float vec_dot_iq2_xs_q8_1_id(const void * __restrict__ vbq,
+                                                    const block_q8_1 * __restrict__ bq8_1,
+                                                    const int & iqs) {
+    return vec_dot_iq2_xs_q8_1(vbq, bq8_1, iqs, iq2xs_grid, ksigns64);
 }
 
 template <int qk, int qi, typename block_q_t, int vdr>
@@ -3948,14 +4006,14 @@ static void coalesced_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
 // Thread mapping: threads iterate block_in_tile and process both halves per block
 static void mul_mat_vec_q8_0_coalesced(const void * __restrict__ vx,  // Coalesced X weights
                                        const void * __restrict__ vy,  // Reordered Y activations
-                                       float * __restrict__ dst,
+                                       float *                  dst,
                                        const int                ncols,
                                        const int                nrows,
                                        const sycl::nd_item<3> & nd_item,
-                                       const float * __restrict__ fused_add = nullptr,
-                                       const int64_t fused_add_ne0          = 0,
-                                       const int64_t fused_add_nb0          = sizeof(float),
-                                       const int64_t fused_add_row_base     = 0) {
+                                       const float *            fused_add          = nullptr,
+                                       const int64_t            fused_add_ne0      = 0,
+                                       const int64_t            fused_add_nb0      = sizeof(float),
+                                       const int64_t            fused_add_row_base = 0) {
     const auto sg           = nd_item.get_sub_group();
     const int  sg_range     = sg.get_group_linear_range();
     const int  workgroup_id = nd_item.get_group_linear_id();
@@ -4218,14 +4276,14 @@ static void coalesced_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
 // Same coalesced layout as Q4_0 (16 bytes quants per block)
 static void mul_mat_vec_mxfp4_coalesced(const void * __restrict__ vx,  // Coalesced X weights
                                         const void * __restrict__ vy,  // Reordered Y activations
-                                        float * __restrict__ dst,
+                                        float *                  dst,
                                         const int                ncols,
                                         const int                nrows,
                                         const sycl::nd_item<3> & nd_item,
-                                        const float * __restrict__ fused_add = nullptr,
-                                        const int64_t fused_add_ne0          = 0,
-                                        const int64_t fused_add_nb0          = sizeof(float),
-                                        const int64_t fused_add_row_base     = 0) {
+                                        const float *            fused_add          = nullptr,
+                                        const int64_t            fused_add_ne0      = 0,
+                                        const int64_t            fused_add_nb0      = sizeof(float),
+                                        const int64_t            fused_add_row_base = 0) {
     const auto sg           = nd_item.get_sub_group();
     const int  sg_range     = sg.get_group_linear_range();
     const int  workgroup_id = nd_item.get_group_linear_id();
@@ -4695,17 +4753,24 @@ static void mul_mat_vec_q4_0_q8_1_id_sycl(const void *                     vx,
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
     const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
 
-    sycl::event ev = stream->submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for<mmvq_id_kernel_name<GGML_TYPE_Q4_0>>(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_id<QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>(
-                    vx, expert_ptrs, vy, dst, ids, ncols, nrows_per_expert, n_ids, n_tokens, ne11, stride_expert_x,
-                    ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
-            });
+    // llama.cpp-bzkx: MUL_MAT_ID expert kernel, previously dark to GGML_SYCL_KERNEL_PROFILE.
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.id_aos_q4_0", profile_metadata.c_str(), "mulmat");
+
+    sycl::event ev = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for<mmvq_id_kernel_name<GGML_TYPE_Q4_0>>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_id<QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>(
+                        vx, expert_ptrs, vy, dst, ids, ncols, nrows_per_expert, n_ids, n_tokens, ne11, stride_expert_x,
+                        ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
+                });
+        });
     });
     if (event_out) {
         *event_out = ev;
@@ -4728,6 +4793,30 @@ static void mul_mat_vec_q4_1_q8_1_sycl(const void *    vx,
                 sycl::nd_range<3>(block_nums * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                     mul_mat_vec_q<QK4_0, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1>(vx, vy, dst, ncols,
+                                                                                                   nrows, item_ct1);
+                });
+        });
+    }
+}
+
+// Q2_0: 64-weight blocks, one vec_dot call per 32-weight q8_1 chunk (qi = QI2_0 = 2 chunks,
+// vdr 1), the Q1_0 tuple shape. AoS only; Q2_0 has no reordered layout.
+static void mul_mat_vec_q2_0_q8_1_sycl(const void *    vx,
+                                       const void *    vy,
+                                       float *         dst,
+                                       const int       ncols,
+                                       const int       nrows,
+                                       dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK2_0 == 0);
+    const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for<mmvq_kernel_name<GGML_TYPE_Q2_0>>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q<QK2_0, QI2_0, block_q2_0, VDR_Q2_0_Q8_1_MMVQ, vec_dot_q2_0_q8_1>(vx, vy, dst, ncols,
                                                                                                    nrows, item_ct1);
                 });
         });
@@ -4891,17 +4980,24 @@ static void mul_mat_vec_q8_0_q8_1_id_sycl(const void *                     vx,
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
     const sycl::range<3> block_dims(1, moe_mmv_y, WARP_SIZE);
 
-    sycl::event ev = stream->submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for<mmvq_id_kernel_name<GGML_TYPE_Q8_0>>(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_id<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>(
-                    vx, expert_ptrs, vy, dst, ids, ncols, nrows_per_expert, n_ids, n_tokens, ne11, stride_expert_x,
-                    ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
-            });
+    // llama.cpp-bzkx: MUL_MAT_ID expert kernel, previously dark to GGML_SYCL_KERNEL_PROFILE.
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.id_aos_q8_0", profile_metadata.c_str(), "mulmat");
+
+    sycl::event ev = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for<mmvq_id_kernel_name<GGML_TYPE_Q8_0>>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_id<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>(
+                        vx, expert_ptrs, vy, dst, ids, ncols, nrows_per_expert, n_ids, n_tokens, ne11, stride_expert_x,
+                        ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
+                });
+        });
     });
     if (event_out) {
         *event_out = ev;
@@ -5404,16 +5500,24 @@ static void mul_mat_vec_mxfp4_q8_1_id_sycl(const void *                     vx,
 
     // Use generic template with vec_dot_mxfp4_q8_1 function pointer
     // This matches how Q4_0 and Q8_0 work
-    sycl::event ev = stream->submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_q_id<QK_MXFP4, QI_MXFP4, block_mxfp4, VDR_MXFP4_Q8_1_MMVQ, vec_dot_mxfp4_q8_1>(
-                                 vx, expert_ptrs, vy, dst, ids, ncols, nrows_per_expert, n_ids, n_tokens, ne11,
-                                 stride_expert_x, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
-                         });
+    // llama.cpp-bzkx: MXFP4 AOS id kernel, previously dark to GGML_SYCL_KERNEL_PROFILE.
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.id_aos_mxfp4", profile_metadata.c_str(), "mulmat");
+
+    sycl::event ev = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_id<QK_MXFP4, QI_MXFP4, block_mxfp4, VDR_MXFP4_Q8_1_MMVQ, vec_dot_mxfp4_q8_1>(
+                        vx, expert_ptrs, vy, dst, ids, ncols, nrows_per_expert, n_ids, n_tokens, ne11, stride_expert_x,
+                        ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
+                });
+        });
     });
     if (event_out) {
         *event_out = ev;
@@ -16370,18 +16474,25 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_sycl(const void * const *    
 
     const int64_t total_qs_size_per_expert = (ncols / 2) * nrows_per_expert;
 
-    sycl::event ev = stream->submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_mxfp4_q8_1_soa_id_pair_kernel(
-                                 (const uint8_t * const *) expert_ptrs_a, (const uint8_t * const *) expert_ptrs_b, vy,
-                                 dst_a, dst_b, ids, ncols, ncols_y, nrows_per_expert, n_ids, n_tokens, ne11,
-                                 total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, nb1_a, nb2_a, nb1_b, nb2_b,
-                                 item_ct1);
-                         });
+    // llama.cpp-bzkx: MXFP4 SOA pair id kernel, previously dark to GGML_SYCL_KERNEL_PROFILE.
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.id_soa_mxfp4_pair", profile_metadata.c_str(), "mulmat");
+
+    sycl::event ev = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 mul_mat_vec_mxfp4_q8_1_soa_id_pair_kernel(
+                                     (const uint8_t * const *) expert_ptrs_a, (const uint8_t * const *) expert_ptrs_b,
+                                     vy, dst_a, dst_b, ids, ncols, ncols_y, nrows_per_expert, n_ids, n_tokens, ne11,
+                                     total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, nb1_a, nb2_a, nb1_b, nb2_b,
+                                     item_ct1);
+                             });
+        });
     });
     if (event_out) {
         *event_out = ev;
@@ -16557,17 +16668,24 @@ static void coalesced_mul_mat_vec_mxfp4_q8_1_id_sycl(const void *         vx,
     const int64_t total_qs_size            = (ncols / 2) * total_rows;
     const int64_t total_qs_size_per_expert = (ncols / 2) * nrows_per_expert;
 
-    sycl::event ev = stream->submit([&](sycl::handler & cgh) {
-        if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
-                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                             mul_mat_vec_mxfp4_q8_1_coalesced_id_kernel(
-                                 (const uint8_t *) vx, (const uint8_t * const *) expert_ptrs, vy, dst, ids, ncols,
-                                 ncols_y, nrows_per_expert, n_ids, n_tokens, ne11, total_qs_size,
-                                 total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
-                         });
+    // llama.cpp-bzkx: MXFP4 coalesced id kernel, previously dark to GGML_SYCL_KERNEL_PROFILE.
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.id_soa_mxfp4_coalesced", profile_metadata.c_str(), "mulmat");
+
+    sycl::event ev = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                                 mul_mat_vec_mxfp4_q8_1_coalesced_id_kernel(
+                                     (const uint8_t *) vx, (const uint8_t * const *) expert_ptrs, vy, dst, ids, ncols,
+                                     ncols_y, nrows_per_expert, n_ids, n_tokens, ne11, total_qs_size,
+                                     total_qs_size_per_expert, ids_nb0, ids_nb1, nb11, nb12, nb1, nb2, item_ct1);
+                             });
+        });
     });
     if (event_out) {
         *event_out = ev;
@@ -17278,10 +17396,13 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                 dispatch_ids  = nullptr;
                 ids_nb0       = 0;
                 ids_nb1       = 0;
+                // Read once: every batch-1 decode op on the direct route passes here.
+                static const bool row_agg_debug = [] {
+                    const char * env = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
+                    return env && std::atoi(env) != 0;
+                }();
                 static std::atomic<int> compact_log{ 0 };
-                const char *            row_agg_debug = std::getenv("GGML_SYCL_MOE_ROW_AGG_DEBUG");
-                if (row_agg_debug && std::atoi(row_agg_debug) != 0 &&
-                    compact_log.fetch_add(1, std::memory_order_relaxed) < 32) {
+                if (row_agg_debug && compact_log.fetch_add(1, std::memory_order_relaxed) < 32) {
                     fprintf(stderr,
                             "[MOE-ROW-AGG] stage=compact path=mmvq_compact tensor=%s layout=%d "
                             "entries=%d total_batches=%lld topk=%lld tokens=%lld device=%d\n",
@@ -17316,6 +17437,12 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
             }
             have_kernel_event = true;
             break;
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -17324,6 +17451,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q2_0:
             if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
                 ne00 > INT_MAX || ne01 > INT_MAX ||
                 !mmvq_submit_quant_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer, dispatch_ids, dst_d,
@@ -22104,12 +22232,16 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 }
             }
             break;
-        // Second MMID consumer for the types llama.cpp-gx30 admitted. This switch is
-        // narrower than the set of _id launchers that exist, which is the gap the
-        // census hit at the sibling switch in ggml_sycl_mmvq_dispatch: a type the
-        // capability query admits can reach a consumer whose own switch never
-        // enumerated it. All of these are AoS-only per moe_mmvq_capability_supports_layout;
-        // the submit helpers re-check that and refuse rather than assume it.
+        // Second MMID consumer for the types llama.cpp-gx30 admitted. It sits in
+        // ggml_sycl_mul_mat_id_vec_q, which returns false at "type_unsupported" for
+        // every type outside {Q4_0, Q8_0, MXFP4} before it reaches this switch, so
+        // the Q1_0/NVFP4 and quant-AoS arms below are NOT reachable today: the live
+        // consumer of mmvq_submit_quant_aos_id / mmvq_submit_q1_nvfp4_aos_id is the
+        // first switch, in mmvq_moe_batched_dispatch. The arms are kept enumerated so
+        // the consumer-coverage gate holds both switches to the capability set, but
+        // that gate's coverage of this switch is not evidence the path runs. All of
+        // these are AoS-only per moe_mmvq_capability_supports_layout; the submit
+        // helpers re-check that and refuse rather than assume it.
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_NVFP4:
             if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
@@ -22124,6 +22256,12 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             }
             have_kernel_event = true;
             break;
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -22132,6 +22270,7 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q2_0:
             if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
                 ne00 > INT_MAX || ne01 > INT_MAX ||
                 !mmvq_submit_quant_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer, dispatch_ids, dst_d,
@@ -22606,6 +22745,10 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
                                                    fused_add, fused_add_ne0, fused_add_nb0, fused_add_row_base);
                     }
                 }
+                break;
+            case GGML_TYPE_Q2_0:
+                GGML_SYCL_KTRACE("mmvq_q2_0", " ne00=%lld row_diff=%lld", (long long) ne00, (long long) row_diff);
+                mul_mat_vec_q2_0_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                 break;
             case GGML_TYPE_Q4_1:
                 GGML_SYCL_KTRACE("mmvq_q4_1", " ne00=%lld row_diff=%lld", (long long) ne00, (long long) row_diff);
@@ -23245,19 +23388,27 @@ static sycl::event mmvq_submit_aos_id_impl(sycl::queue &                    q,
     const sycl::range<3> block_nums(1, total_batches, block_num_z);
     const sycl::range<3> block_dims(1, rows_per_group, WARP_SIZE);
 
-    return q.submit([&](sycl::handler & cgh) {
-        if (dependency) {
-            cgh.depends_on(*dependency);
-        } else if (deps && !deps->empty()) {
-            cgh.depends_on(*deps);
-        }
-        cgh.parallel_for<mmvq_id_kernel_name<qtype>>(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_id<qk, qi, block_q_t, vdr, vec_dot>(
-                    nullptr, expert_ptrs_device, y_q8_1, dst, ids_device, ncols, nrows_per_expert, n_ids, n_tokens,
-                    ne11, 0, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, item);
-            });
+    // llama.cpp-bzkx: label every type arm of the batched id path for GGML_SYCL_KERNEL_PROFILE.
+    const std::string       profile_name     = mmvq_id_aos_profile_name((ggml_type) qtype);
+    const std::string       profile_metadata = mmvq_id_profile_metadata(ncols, nrows_per_expert, total_batches);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(q, profile_name.c_str(), profile_metadata.c_str(), "mulmat");
+
+    return ggml_sycl_profile_submit(q, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            if (dependency) {
+                cgh.depends_on(*dependency);
+            } else if (deps && !deps->empty()) {
+                cgh.depends_on(*deps);
+            }
+            cgh.parallel_for<mmvq_id_kernel_name<qtype>>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_id<qk, qi, block_q_t, vdr, vec_dot>(
+                        nullptr, expert_ptrs_device, y_q8_1, dst, ids_device, ncols, nrows_per_expert, n_ids, n_tokens,
+                        ne11, 0, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, item);
+                });
+        });
     });
 }
 
@@ -23391,6 +23542,77 @@ bool mmvq_submit_quant_aos_id(sycl::queue &                    q,
 
     sycl::event event;
     switch (weight_type) {
+        case GGML_TYPE_Q2_0:
+            // The dense mul_mat_vec_q2_0_q8_1_sycl tuple (QK2_0, QI2_0, vdr 1): the generic _id kernel with
+            // the Q2_0 vec_dot, which has the generic vec_dot_q_sycl_t signature.
+            if (ncols % QK2_0 != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_Q2_0, QK2_0, QI2_0, block_q2_0, VDR_Q2_0_Q8_1_MMVQ,
+                                            vec_dot_q2_0_q8_1>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            // Same body as the dense mul_mat_vec_q_iq4_nl_q8_1 (QK4_NL, QI4_NL, vdr 2): the generic
+            // _id kernel with the IQ4_NL vec_dot, which has the generic vec_dot_q_sycl_t signature.
+            if (ncols % QK4_NL != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ4_NL, QK4_NL, QI4_NL, block_iq4_nl, VDR_Q4_0_Q8_1_MMVQ,
+                                            vec_dot_iq4_nl_q8_1>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            // The dense mul_mat_vec_q_iq2_xxs_q8_1 tuple (QK_K, QI2_XXS / 2, vdr 1), vec_dot behind an adaptor.
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ2_XXS, QK_K, QI2_XXS / 2, block_iq2_xxs, 1,
+                                            vec_dot_iq2_xxs_q8_1_id>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_IQ2_XS:
+            // The dense mul_mat_vec_q_iq2_xs_q8_1 tuple (QK_K, QI2_XS / 2, vdr 1), as above.
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ2_XS, QK_K, QI2_XS / 2, block_iq2_xs, 1,
+                                            vec_dot_iq2_xs_q8_1_id>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_IQ2_S:
+            // The dense mul_mat_vec_q_iq2_s_q8_1 tuple (QK_K, QI2_S / 2, vdr 1); the vec_dot is already generic.
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ2_S, QK_K, QI2_S / 2, block_iq2_s, 1, vec_dot_iq2_s_q8_1>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            // The dense mul_mat_vec_q_iq3_xxs_q8_1 tuple (QK_K, QI3_XXS / 2, vdr 1) with the
+            // grid-table vec_dot behind a generic-signature adaptor.
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ3_XXS, QK_K, QI3_XXS / 2, block_iq3_xxs, 1,
+                                            vec_dot_iq3_xxs_q8_1_id>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_IQ3_S:
+            // The dense mul_mat_vec_q_iq3_s_q8_1 tuple (QK_K, QI3_S / 2, vdr 1), as above.
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_IQ3_S, QK_K, QI3_S / 2, block_iq3_s, 1, vec_dot_iq3_s_q8_1_id>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
         case GGML_TYPE_Q4_1:
             if (ncols % QK4_1 != 0) {
                 return false;

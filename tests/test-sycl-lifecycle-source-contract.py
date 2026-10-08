@@ -495,7 +495,13 @@ OWNING_READER_NAMES = (
 OWNING_READER_SITES = {
     "ggml/src/ggml-sycl/common.hpp": Counter({
         "if (ggml_sycl::coherent_placement_plan_owner(cache)->entries.size() != 0 && is_composite_moe_weight) {": 1,
-        "const auto plan_owner = ggml_sycl::coherent_placement_plan_owner(cache);": 2,
+        # Three single-load readers, each one coherent read held in plan_owner for a different fact:
+        # ggml_sycl_get_planned_weight_residency (885c7bd16), ggml_sycl_weight_is_planned_on_other_device
+        # (169b25c42, llama.cpp-21jd) and ggml_sycl_get_planned_weight_layout (f20bb3a5c, llama.cpp-qhfp:
+        # the layout the plan materialises, which supports_op asks before it admits a (type, layout) pair).
+        # The third was the one that took this from 2 to 3: no other reader returns the plan entry's
+        # layout, so it re-derives nothing (llama.cpp-2xvk).
+        "const auto plan_owner = ggml_sycl::coherent_placement_plan_owner(cache);": 3,
         "return !ggml_sycl::coherent_placement_plan_owner(cache)->entries.empty();": 1,
     }),
     "ggml/src/ggml-sycl/expert-prefetch.cpp": Counter({

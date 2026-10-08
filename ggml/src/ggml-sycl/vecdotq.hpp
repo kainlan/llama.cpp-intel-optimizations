@@ -344,6 +344,42 @@ vec_dot_q1_0_q8_1(const void *__restrict__ vbq,
     return d1 * bq8_1_chunk->ds[0] * sumi;
 }
 
+#define VDR_Q2_0_Q8_1_MMVQ 1
+
+// iqs selects one q8_1 chunk (32 weights) of the 64-weight block, the Q1_0 convention
+// (QI2_0 == QK2_0 / 32 chunks). A chunk is 8 bytes of qs, read as two ints. The codes
+// are unpacked to signed (code - 1) lanes, so the dot needs no zero-point term from the
+// activation sum and each call is correct on its own, whatever lane pairing sums them.
+// get_int_from_uint8 (2-byte aligned) because block_q2_0 is 18 bytes: qs is 2 mod 4 on
+// every other block.
+static __dpct_inline__ float vec_dot_q2_0_q8_1(const void * __restrict__ vbq,
+                                               const block_q8_1 * __restrict__ bq8_1,
+                                               const int & iqs) {
+    const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq;
+
+    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
+    const float        d2          = bq2_0->d;
+
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int v = get_int_from_uint8(bq2_0->qs, 2 * iqs + i);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int bits8 = (v >> (8 * j)) & 0xFF;
+            uint32_t  vi    = 0;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                vi |= static_cast<uint32_t>((((bits8 >> (2 * k)) & 3) - 1) & 0xFF) << (8 * k);
+            }
+            const int u = get_int_from_int8_aligned(bq8_1_chunk->qs, 4 * i + j);
+            sumi        = ggml_sycl_dp4a(static_cast<int>(vi), u, sumi);
+        }
+    }
+
+    return d2 * bq8_1_chunk->ds[0] * sumi;
+}
+
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 

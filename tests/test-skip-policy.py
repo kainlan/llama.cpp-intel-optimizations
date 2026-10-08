@@ -144,6 +144,14 @@ ALLOWED_NON_EXIT_77 = (
     # (zhcn). Neither is an exit code.
     ("tests/test-context-tenant-section.cpp", re.compile(r"return \(ggml_sycl_tenant_coverage\) 77;")),
     ("tests/test-load-measure-guards.cpp", re.compile(r"g_late_answers\s*=\s*\{\s*77\s*\};")),
+    # GGML_SYCL_NONFA_ATTN_SCRATCH_MB=77 is the MiB override value the ctest
+    # ENVIRONMENT sets: the env-var text compared with strcmp, the same value
+    # named in two check() message strings, and the 77 * kMiB byte expectation
+    # it must produce. A scratch-size override, never an exit code.
+    ("tests/test-sycl-nonfa-attn-scratch-demand.cpp", re.compile(r'std::strcmp\(env,\s*"77"\)')),
+    ("tests/test-sycl-nonfa-attn-scratch-demand.cpp", re.compile(r"SCRATCH_MB=77 is set")),
+    ("tests/test-sycl-nonfa-attn-scratch-demand.cpp", re.compile(r"non-zero override \(77\) is NOT")),
+    ("tests/test-sycl-nonfa-attn-scratch-demand.cpp", re.compile(r"demand_(?:small|large)\s*==\s*77\s*\*\s*kMiB")),
 )
 
 

@@ -26,6 +26,7 @@
 #include "tuning-engine-impl.hpp"
 #include "tuning-engine.hpp"
 #include "unified-kernel.hpp"
+#include "unified-types.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -82,14 +83,8 @@ enum class KernelType {
  * @return true if unified kernel supports this type
  */
 inline bool should_use_unified(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_MXFP4:
-            // TODO: Add Q8_0, Q6_K, Q4_K support to unified kernel
-            return true;
-        default:
-            return false;  // FP16, BF16, F32, Q6_K, etc. use legacy path for now
-    }
+    // The one list of served types lives in unified-types.hpp, which the zone planner includes as well.
+    return unified_kernel_serves_type(type);
 }
 
 // =============================================================================

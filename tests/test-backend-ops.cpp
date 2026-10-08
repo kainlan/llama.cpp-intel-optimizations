@@ -9599,6 +9599,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
+    // Qwen3.8-Flash-Next (qwen4exp): n_embd 2560, 4 streams, one decode token and a short prefill
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 1, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 37, true));
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
@@ -9610,6 +9613,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 37, true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -10763,6 +10768,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // For issue 27873
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
+    // The same single-expert, single-row shape for the other types the SYCL _id path serves. The shape
+    // needs the MUL_MAT_ID dispatch to publish expert handles for a src0 that is ne[2] == 1 and
+    // unclassified by name (llama.cpp-s36q); a type without a case here would not show a gap.
+    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0 }) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
+    }
 
     for (int k : {1, 63, 65}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
@@ -10818,7 +10829,51 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // llama.cpp-s36q: the iq* types the SYCL backend serves through its MUL_MAT_ID _id kernels get the
+    // sweep base_types gets (n up to 129 is the first n > 128 odd batch, llama.cpp-mn70) instead of the
+    // n = {1, 32} that other_types gets, so the loop after this one skips them. Added shapes:
+    //  - m = 66 and 70: not multiples of the _id work-group's rows (GGML_SYCL_MOE_MMV_Y = 4), so the
+    //    kernel's `row >= nrows_per_expert` guard is exercised, at n = 1 and n > 1, with b false and true;
+    //  - m = 64, k = 768: a k that is not a power of two (3 x 256), at n > 1.
+    // Types move into mmid_sweep_types as their _id kernels land.
+    // Q2_0 (phase 4) is in base_types, which already ran the n_mats x n_used x n sweep for it above, so
+    // that sweep is skipped for it here and only the added shapes below (m = 66/70, k = 768, n_mats = 1) run.
+    static const ggml_type mmid_sweep_types[] = { GGML_TYPE_IQ4_NL,  GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
+                                                  GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,  GGML_TYPE_IQ2_S,
+                                                  GGML_TYPE_Q2_0 };
+    for (ggml_type type_a : mmid_sweep_types) {
+        const bool in_base_types =
+            std::find(std::begin(base_types), std::end(base_types), type_a) != std::end(base_types);
+        if (!in_base_types) {
+            for (int n_mats : {4, 8}) {
+                for (int n_used : {1, 2, 4}) {
+                    for (bool b : {false, true}) {
+                        for (int n : {1, 4, 5, 17, 32, 129}) {
+                            test_cases.emplace_back(
+                                new test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, 512, n, 256));
+                        }
+                    }
+                }
+            }
+        }
+        for (int m : {66, 70}) {
+            for (bool b : {false, true}) {
+                for (int n : {1, 17, 129}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, b, m, n, 256));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 768));
+        // n_mats = 1: a single-expert src0 (ne[2] == 1), as in the issue-27873 case above.
+        for (int n : {1, 17}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 1, 1, false, 66, n, 256));
+        }
+    }
+
     for (ggml_type type_a : other_types) {
+        if (std::find(std::begin(mmid_sweep_types), std::end(mmid_sweep_types), type_a) != std::end(mmid_sweep_types)) {
+            continue;  // covered by the wider sweep above
+        }
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4}) {
                 for (int n_used : {2}) {

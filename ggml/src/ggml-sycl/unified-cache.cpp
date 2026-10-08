@@ -21,7 +21,10 @@
 #include "mem-ops.hpp"
 #include "model-lifecycle.hpp"
 #include "moe-resolved-batch.hpp"
+#include "onednn-woq.hpp"
+#include "range-index.hpp"
 #include "sycl-timeline.hpp"
+#include "unified-types.hpp"
 #include "vram-headroom.hpp"
 #include "zone-sizing.hpp"
 
@@ -42,6 +45,7 @@
 #include <map>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 
@@ -755,6 +759,54 @@ static std::atomic<size_t>   g_runtime_host_cat_bytes[static_cast<int>(runtime_c
 static std::atomic<size_t>   g_runtime_managed_reserved_host_bytes{};
 static std::atomic<size_t>   g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<size_t>   g_planned_onednn_pair_weights_bytes[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<size_t>   g_planned_onednn_pair_activations_bytes[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-8ony: the two figures the current ONEDNN zone was sized from -- the pair's own plan and the Graph SDPA
+// floor that shares the zone -- kept together as ONE snapshot, written by unified_cache::ensure_planned_arena_zones
+// when it keeps or builds the zone. The planner's live figures are overwritten by every model's plan (and the pair's
+// upward by reserve), and the SDPA shape the floor derives from is rewritten by runtime plans the zone was not rebuilt
+// for, so neither can describe a zone that was built earlier: a draft model loaded beside the target would hand a
+// bound derived from the draft's figures to the target's zone.
+static std::mutex            g_onednn_zone_plan_mutex;
+static zone_onednn_plan      g_onednn_zone_plan[GGML_SYCL_MAX_DEVICES]{};
+
+static void onednn_zone_plan_store(int device_id, const zone_onednn_plan & plan) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
+    g_onednn_zone_plan[device_id] = plan;
+}
+
+static zone_onednn_plan onednn_zone_plan_load(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return zone_onednn_plan();
+    }
+    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
+    return g_onednn_zone_plan[device_id];
+}
+
+// Keep the larger plan (zone_onednn_plan_keep) as the stored snapshot, in ONE critical section. A load, a keep and a
+// store taken separately would let two contexts planning on one device each read the same snapshot and the later store
+// drop the other's larger figure. Takes the mutex itself, so it must not call the accessors above.
+static void onednn_zone_plan_keep_and_store(int device_id, const zone_onednn_plan & plan) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_onednn_zone_plan_mutex);
+    g_onednn_zone_plan[device_id] = zone_onednn_plan_keep(g_onednn_zone_plan[device_id], plan);
+}
+
+// The most an op's f16 pair may be for the ONEDNN zone of capacity `capacity_bytes` on `device_id` to count it as
+// planned (zone_onednn_pp_pair_bound over the snapshot above). The one source for the admission accessor and for the
+// reserve's own merge and refusal, so the two cannot disagree about what the zone was planned to hold.
+static size_t onednn_pp_pair_bound_for(const zone_onednn_plan & plan, size_t capacity_bytes) {
+    return zone_onednn_pp_pair_bound(capacity_bytes, plan.bare_bytes, plan.graph_floor_bytes);
+}
+
+static size_t onednn_pp_pair_bound_for(int device_id, size_t capacity_bytes) {
+    return onednn_pp_pair_bound_for(onednn_zone_plan_load(device_id), capacity_bytes);
+}
 // llama.cpp-479i: planned bytes of the per-context dense MMQ/MMVQ Q8_1 src1 buffer
 // (n_ubatch * bytes-per-token from the inventory, 256-aligned), folded into the
 // RUNTIME zone requirement so the zone the buffer lives in is sized for it.
@@ -1499,6 +1551,28 @@ struct runtime_alloc_record {
 };
 
 static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry;
+
+// Containment index over the registry's rows: [handle.ptr, handle.ptr + handle.size) -> the row's key, for every row with
+// a non-null pointer and a non-zero size. It answers "which allocation contains this address" in O(log n), where the
+// registry itself can only scan (llama.cpp-ii25). Guarded by g_runtime_alloc_mutex, and in step with the registry only
+// because EVERY mutation of the registry goes through the runtime_registry_*_locked helpers below; no other code may
+// emplace, erase or assign a row (tests/test-sycl-runtime-registry-index-source.py enforces it). A registered row's
+// handle.ptr and handle.size must not change, since the index keeps the geometry it was given at insertion.
+// Declared before g_device_caches for the reason given there: the caches' destructors erase rows.
+static address_range_index g_runtime_alloc_index;
+
+// Settle-side counters over the same rows, guarded by g_runtime_alloc_mutex and written ONLY by
+// runtime_registry_count_row_locked(), which only the registry mutation helpers call (llama.cpp-rriv;
+// tests/test-sycl-runtime-registry-settle-source.py enforces both). A clean zone settle used to scan every row to learn that
+// nothing in its zone was live; these make that O(1) and leave the enumeration to the refusal that needs it.
+//   g_runtime_host_zone_rows[z]     rows whose handle.host_zone is z, in any state (RELEASING rows included: the scan this
+//                                   replaces counted them, and a host zone is not reusable while one holds its bytes).
+//   g_runtime_span_irregular_rows   rows the index cannot answer a key-in-span question for: the key is not the base the
+//                                   row is indexed at (no extent, or handle.ptr != key). Always 0 in practice; while it is
+//                                   not, runtime_registry_span_live_locked() scans, so it keeps the old answer.
+static size_t g_runtime_host_zone_rows[static_cast<size_t>(host_zone_id::COUNT)];
+static size_t g_runtime_span_irregular_rows = 0;
+
 // Keep cache owners later in declaration order than the registry they call from
 // unified_cache::~unified_cache(). Reverse static destruction then tears caches
 // down first instead of asking release_registered_allocation_owned() to access
@@ -1521,6 +1595,216 @@ struct arena_runtime_publication_context {
 static std::atomic<bool> g_test_fail_next_arena_registry_commit{ false };
 static std::atomic<bool> g_test_pause_arena_registry_commit{ false };
 static std::atomic<bool> g_test_arena_registry_commit_reached{ false };
+#endif
+
+using runtime_registry_iterator = std::unordered_map<void *, runtime_alloc_record>::iterator;
+
+static bool runtime_registry_row_indexed(const alloc_metadata & h) noexcept {
+    return h.ptr != nullptr && h.size != 0;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+static size_t g_test_registry_rows_scanned = 0;  // guarded by g_runtime_alloc_mutex
+#endif
+
+// Registry rows visited by the settle queries and their refusal enumerations; only the tests read it, to pin that a clean
+// settle visits none.
+static void runtime_registry_note_row_scanned_locked() noexcept {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    g_test_registry_rows_scanned++;
+#endif
+}
+
+// The index holds the row at its own key, so "is this row's key in [lo, hi)" is "is its indexed base in [lo, hi)".
+// A row with a null key is irregular too: the index never holds one, so it cannot answer for it.
+static bool runtime_registry_row_span_regular(const void * key, const alloc_metadata & h) noexcept {
+    return runtime_registry_row_indexed(h) && h.ptr == key;
+}
+
+// Adds (or removes) one row's contribution to the counters above. The ONLY writer of them; the caller holds
+// g_runtime_alloc_mutex and passes the row exactly as it is registered.
+static void runtime_registry_count_row_locked(const void * key, const alloc_metadata & h, bool add) noexcept {
+    if (static_cast<size_t>(h.host_zone) < static_cast<size_t>(host_zone_id::COUNT)) {
+        size_t & rows = g_runtime_host_zone_rows[static_cast<size_t>(h.host_zone)];
+        if (add) {
+            rows++;
+        } else {
+            GGML_ASSERT(rows > 0 && "host-zone row counter lost a registered row");
+            rows--;
+        }
+    }
+    if (!runtime_registry_row_span_regular(key, h)) {
+        if (add) {
+            g_runtime_span_irregular_rows++;
+        } else {
+            GGML_ASSERT(g_runtime_span_irregular_rows > 0 && "irregular-row counter lost a registered row");
+            g_runtime_span_irregular_rows--;
+        }
+    }
+}
+
+// Is any registry row in host zone `zone`? What host_zone_settle() decides on. O(1); see the counters' comment.
+static bool runtime_registry_host_zone_live_locked(host_zone_id zone) noexcept {
+    return static_cast<size_t>(zone) < static_cast<size_t>(host_zone_id::COUNT) &&
+           g_runtime_host_zone_rows[static_cast<size_t>(zone)] != 0;
+}
+
+// Is any registry row's key in [lo, hi)? What zone_settle() decides on. The index answers in O(log n) while every row is
+// held at its own key; an irregular row (see the counters' comment) makes the index's answer differ from the key test, so
+// the registry is scanned for as long as one exists.
+static bool runtime_registry_span_live_locked(uintptr_t lo, uintptr_t hi) noexcept {
+    if (g_runtime_span_irregular_rows == 0) {
+        return g_runtime_alloc_index.find_first_base_in(lo, hi, nullptr);
+    }
+    for (const auto & kv : g_runtime_alloc_registry) {
+        runtime_registry_note_row_scanned_locked();
+        const uintptr_t p = reinterpret_cast<uintptr_t>(kv.first);
+        if (p >= lo && p < hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The only ways to add, remove or replace a registry row (runtime_registry_emplace_locked, runtime_registry_erase_locked
+// and runtime_registry_assign_locked below); the caller holds g_runtime_alloc_mutex. They keep g_runtime_alloc_index in
+// step. runtime_registry_emplace_locked has the contract of unordered_map::emplace: {row, true} on success,
+// {existing row, false} when `ptr` already has one. An allocation failure leaves registry and index unchanged and
+// propagates.
+//
+// DEFENSIVE: the refusal further down, when the index already has a range starting at this row's handle.ptr, cannot
+// happen while a row's key is its handle.ptr, because the registry cannot hold two rows at one pointer. It exists so a
+// future row whose key and handle.ptr differ is refused ({end(), false}) instead of silently sharing a base with another
+// row; the answer for two live allocations at one address is the one runtime_registry_claim_ptr_locked gives.
+static std::pair<runtime_registry_iterator, bool> runtime_registry_emplace_locked(void *               ptr,
+                                                                                  runtime_alloc_record rec) {
+    auto inserted = g_runtime_alloc_registry.emplace(ptr, std::move(rec));
+    if (!inserted.second) {
+        return inserted;
+    }
+    const alloc_metadata & h = inserted.first->second.handle;
+    if (runtime_registry_row_indexed(h)) {
+        bool indexed = false;
+        try {
+            indexed = g_runtime_alloc_index.insert(reinterpret_cast<uintptr_t>(h.ptr), h.size, ptr);
+        } catch (...) {
+            g_runtime_alloc_registry.erase(inserted.first);
+            throw;
+        }
+        if (!indexed) {
+            g_runtime_alloc_registry.erase(inserted.first);
+            return { g_runtime_alloc_registry.end(), false };
+        }
+    }
+    runtime_registry_count_row_locked(ptr, h, /*add=*/true);
+    return inserted;
+}
+
+// The geometry a row carries is the geometry the index was given for it (end clamped as insert clamps it).
+static bool runtime_registry_row_matches_index_entry(const alloc_metadata &             h,
+                                                     const address_range_index::entry & e) noexcept {
+    return reinterpret_cast<uintptr_t>(h.ptr) == e.base && address_range_index::end_of(e.base, h.size) == e.end;
+}
+
+static void runtime_registry_erase_locked(runtime_registry_iterator it) noexcept {
+    const alloc_metadata & h = it->second.handle;
+    if (runtime_registry_row_indexed(h)) {
+        const bool unindexed = g_runtime_alloc_index.erase(reinterpret_cast<uintptr_t>(h.ptr), it->first);
+        GGML_ASSERT(unindexed && "runtime allocation index lost a registered row");
+        (void) unindexed;
+    }
+    runtime_registry_count_row_locked(it->first, h, /*add=*/false);
+    g_runtime_alloc_registry.erase(it);
+}
+
+static void runtime_registry_erase_locked(void * ptr) noexcept {
+    const auto it = g_runtime_alloc_registry.find(ptr);
+    if (it != g_runtime_alloc_registry.end()) {
+        runtime_registry_erase_locked(it);
+    }
+}
+
+static_assert(std::is_nothrow_move_assignable<runtime_alloc_record>::value,
+              "runtime_registry_assign_locked relies on a nothrow row replacement");
+
+// Replace-or-insert, the semantics of `registry[ptr] = rec`, and like it a replace of an existing row allocates nothing
+// that can fail after the old row has been touched: the copy of `rec` and any new index node are made first, and what
+// follows (resizing or dropping the old range, moving the copy over the row) cannot throw. So a bad_alloc leaves the old
+// row and its range as they were, never a live allocation with no row. The adopt callers hand out a live handle for this
+// row, so a row that did not land would be an unowned allocation; hence the assertion.
+static void runtime_registry_assign_locked(void * ptr, const runtime_alloc_record & rec) {
+    const auto it = g_runtime_alloc_registry.find(ptr);
+    if (it == g_runtime_alloc_registry.end()) {
+        const bool published = runtime_registry_emplace_locked(ptr, rec).second;
+        GGML_ASSERT(published && "runtime allocation registry refused an adopted row");
+        (void) published;
+        return;
+    }
+    runtime_alloc_record fresh = rec;  // may throw; nothing has changed yet
+    const alloc_metadata old_h = it->second.handle;
+    const bool           was   = runtime_registry_row_indexed(old_h);
+    const bool           now   = runtime_registry_row_indexed(fresh.handle);
+    if (now) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(fresh.handle.ptr);
+        if (was && old_h.ptr == fresh.handle.ptr) {
+            const bool resized = g_runtime_alloc_index.resize(base, ptr, fresh.handle.size);
+            GGML_ASSERT(resized && "runtime allocation index lost a registered row");
+            (void) resized;
+        } else {
+            // A row whose key is not its handle.ptr, or one that had no extent: the new range goes in before the old one
+            // goes out, so a failed insert leaves the old range in place.
+            const bool indexed = g_runtime_alloc_index.insert(base, fresh.handle.size, ptr);
+            GGML_ASSERT(indexed && "runtime allocation index refused an adopted row");
+            (void) indexed;
+            if (was) {
+                g_runtime_alloc_index.erase(reinterpret_cast<uintptr_t>(old_h.ptr), ptr);
+            }
+        }
+    } else if (was) {
+        g_runtime_alloc_index.erase(reinterpret_cast<uintptr_t>(old_h.ptr), ptr);
+    }
+    runtime_registry_count_row_locked(ptr, old_h, /*add=*/false);
+    runtime_registry_count_row_locked(ptr, fresh.handle, /*add=*/true);
+    it->second = std::move(fresh);
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Every registry row is indexed exactly when it qualifies, with the geometry the row carries (end clamped as insert
+// clamps it), and the index holds nothing else. O(n); only the test seam uses it.
+static bool runtime_registry_index_consistent_locked() noexcept {
+    size_t indexed = 0;
+    for (const auto & kv : g_runtime_alloc_registry) {
+        const alloc_metadata & h = kv.second.handle;
+        if (!runtime_registry_row_indexed(h)) {
+            continue;
+        }
+        indexed++;
+        address_range_index::entry e;
+        if (!g_runtime_alloc_index.find_exact(reinterpret_cast<uintptr_t>(h.ptr), &e) || e.key != kv.first ||
+            e.end != address_range_index::end_of(reinterpret_cast<uintptr_t>(h.ptr), h.size)) {
+            return false;
+        }
+    }
+    if (indexed != g_runtime_alloc_index.size() || !g_runtime_alloc_index.check_invariants()) {
+        return false;
+    }
+    // The settle counters equal a recount of the registry (llama.cpp-rriv).
+    size_t zone_rows[static_cast<size_t>(host_zone_id::COUNT)] = {};
+    size_t irregular                                           = 0;
+    for (const auto & kv : g_runtime_alloc_registry) {
+        const alloc_metadata & h = kv.second.handle;
+        if (static_cast<size_t>(h.host_zone) < static_cast<size_t>(host_zone_id::COUNT)) {
+            zone_rows[static_cast<size_t>(h.host_zone)]++;
+        }
+        irregular += runtime_registry_row_span_regular(kv.first, h) ? 0 : 1;
+    }
+    for (size_t z = 0; z < static_cast<size_t>(host_zone_id::COUNT); z++) {
+        if (zone_rows[z] != g_runtime_host_zone_rows[z]) {
+            return false;
+        }
+    }
+    return irregular == g_runtime_span_irregular_rows;
+}
 #endif
 
 static bool unified_alloc_lifetime_trace_enabled();
@@ -1589,7 +1873,7 @@ static bool runtime_registry_claim_ptr_locked(void * ptr, stale_claim_report & r
         } catch (...) {
         }
     }
-    g_runtime_alloc_registry.erase(it);
+    runtime_registry_erase_locked(it);
     return true;
 }
 
@@ -1623,12 +1907,12 @@ static bool arena_runtime_registry_commit(void * ptr, const arena_authority::all
         if (!runtime_registry_claim_ptr_locked(ptr, stale_claim)) {
             return false;
         }
-        auto inserted = g_runtime_alloc_registry.emplace(ptr, rec);
+        auto inserted = runtime_registry_emplace_locked(ptr, rec);
         if (!inserted.second) return false;
         try {
             if (!rec.cohort_id.empty()) g_runtime_cohort_tier[rec.cohort_id] = rec.handle.tier;
         } catch (...) {
-            g_runtime_alloc_registry.erase(inserted.first);
+            runtime_registry_erase_locked(inserted.first);
             throw;
         }
         context.published = true;
@@ -2381,6 +2665,15 @@ void unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t byt
     g_planned_onednn_scratchpad_bytes[device_id].store(bytes, std::memory_order_release);
 }
 
+void unified_cache_set_planned_onednn_scratchpad_pair(int device_id, size_t weights_bytes, size_t activations_bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_onednn_pair_weights_bytes[device_id].store(weights_bytes, std::memory_order_release);
+    g_planned_onednn_pair_activations_bytes[device_id].store(activations_bytes, std::memory_order_release);
+    unified_cache_set_planned_onednn_scratchpad_bytes(device_id, weights_bytes + activations_bytes);
+}
+
 // llama.cpp-0oxf/o3a0: record the SDPA shape (n_head_ctx_max, n_head_swa_max,
 // n_swa, n_ubatch, n_ctx) alongside the scratchpad bytes above so
 // onednn_graph_scratch_zone_floor_bytes_swa() can derive its floor from the
@@ -2945,20 +3238,30 @@ size_t unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id) {
     return g_planned_onednn_scratchpad_bytes[device_id].load(std::memory_order_acquire);
 }
 
-size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {
+// The pair's own planned requirement and the Graph SDPA floor that shares its zone, read ONCE so the two describe
+// the same plan: the planner may overwrite the stored figure between two separate reads.
+static zone_onednn_plan onednn_planned_pair_and_floor(int device_id) {
+    zone_onednn_plan plan;
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return 0;
+        return plan;
     }
-    size_t bytes = unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id);
+    plan.bare_bytes        = unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id);
+    plan.weights_bytes     = g_planned_onednn_pair_weights_bytes[device_id].load(std::memory_order_acquire);
+    plan.activations_bytes = g_planned_onednn_pair_activations_bytes[device_id].load(std::memory_order_acquire);
 #if GGML_SYCL_DNNL
     if (ggml_sycl::onednn_graph_allocator_enabled()) {
         const onednn_graph_scratch_planned_shape shape =
             unified_cache_get_planned_onednn_graph_scratch_shape(device_id);
-        bytes += onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa,
-                                                           shape.n_ubatch, shape.n_ctx);
+        plan.graph_floor_bytes = onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max,
+                                                                           shape.n_swa, shape.n_ubatch, shape.n_ctx);
     }
 #endif
-    return bytes;
+    return plan;
+}
+
+size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {
+    const zone_onednn_plan plan = onednn_planned_pair_and_floor(device_id);
+    return plan.bare_bytes + plan.graph_floor_bytes;
 }
 
 void unified_cache_set_planned_pp_moe_onednn_scratch(int      device_id,
@@ -6056,10 +6359,13 @@ bool unified_cache::ensure_planned_arena_zones() {
     }
 
     size_t       onednn_zone         = 256 * 1024 * 1024;
-    // WITH-FLOOR getter, deliberately: this sizes the REAL physical ONEDNN
-    // zone, which has to hold both the primitive-API pair and the
-    // Graph-scratch allocator's floor.
-    const size_t planned_onednn_zone = unified_cache_get_planned_onednn_scratchpad_bytes(dev_id);
+    // This sizes the REAL physical ONEDNN zone, which has to hold both the
+    // primitive-API pair and the Graph-scratch allocator's floor. The pair's
+    // plan and the floor are read once, as one pair: they are what the zone is
+    // described by afterwards (the snapshot stored at both successful exits
+    // below).
+    const zone_onednn_plan live_plan           = onednn_planned_pair_and_floor(dev_id);
+    const size_t           planned_onednn_zone = live_plan.bare_bytes + live_plan.graph_floor_bytes;
     if (planned_onednn_zone > onednn_zone) {
         onednn_zone = planned_onednn_zone;
         GGML_LOG_INFO("[UNIFIED-CACHE] ONEDNN zone raised to %.1f MB from placement scratch estimate\n",
@@ -6083,8 +6389,8 @@ bool unified_cache::ensure_planned_arena_zones() {
     // own, so clamping the shared zone below what IT alone needs would starve
     // the primitive-API GEMM path, not just the Graph-scratch floor this
     // clamp exists to bound.
-    const size_t onednn_zone_budget_cap =
-        std::max(available_budget() / 4, unified_cache_get_planned_onednn_scratchpad_bytes_stored(dev_id));
+    const size_t planned_onednn_bare    = live_plan.bare_bytes;
+    const size_t onednn_zone_budget_cap = std::max(available_budget() / 4, planned_onednn_bare);
     if (onednn_zone > onednn_zone_budget_cap) {
         const size_t shortfall = onednn_zone - onednn_zone_budget_cap;
         // Per-instance member, not a function-local static -- see its
@@ -6164,6 +6470,10 @@ bool unified_cache::ensure_planned_arena_zones() {
             // which guards every read.
             onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
 #endif
+            // The zone is kept as it was built, so it stays described by the larger plan it was built from (its whole
+            // pair, with the Graph floor's own maximum): a later, smaller plan (a draft model beside the target) must
+            // not shrink it.
+            onednn_zone_plan_keep_and_store(dev_id, live_plan);
             return true;
         }
 
@@ -6230,6 +6540,7 @@ bool unified_cache::ensure_planned_arena_zones() {
     // std::atomic store -- see that branch's comment.
     onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
 #endif
+    onednn_zone_plan_store(dev_id, live_plan);
     return true;
 }
 
@@ -17393,13 +17704,13 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             }
             try {
                 if (runtime_registry_claim_ptr_locked(ptr, stale_claim)) {
-                    auto inserted = g_runtime_alloc_registry.emplace(ptr, rec);
+                    auto inserted = runtime_registry_emplace_locked(ptr, rec);
                     if (inserted.second) {
                         try {
                             if (!rec.cohort_id.empty()) g_runtime_cohort_tier[rec.cohort_id] = tier;
                             registered = true;
                         } catch (...) {
-                            g_runtime_alloc_registry.erase(inserted.first);
+                            runtime_registry_erase_locked(inserted.first);
                         }
                     }
                 }
@@ -18157,25 +18468,25 @@ bool unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, s
 
     const uintptr_t             addr = reinterpret_cast<uintptr_t>(ptr);
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-    for (const auto & kv : g_runtime_alloc_registry) {
-        const runtime_alloc_record & rec = kv.second;
-        const alloc_metadata &       h   = rec.handle;
-        if (h.ptr == nullptr || h.size == 0) {
-            continue;
-        }
-        const uintptr_t base = reinterpret_cast<uintptr_t>(h.ptr);
-        if (addr < base || addr >= base + h.size) {
-            continue;
-        }
-        if (out != nullptr) {
-            *out = h;
-        }
-        if (queue_out != nullptr) {
-            *queue_out = rec.queue;
-        }
-        return true;
+    address_range_index::entry  hit;
+    if (!g_runtime_alloc_index.find_innermost(addr, &hit)) {
+        return false;
     }
-    return false;
+    const auto it = g_runtime_alloc_registry.find(hit.key);
+    // Index and registry are kept in step by the emplace/erase/assign helpers, holding g_runtime_alloc_mutex;
+    // if the index found a key that the registry does not have, that is a defect in the mutation helpers.
+    GGML_ASSERT(it != g_runtime_alloc_registry.end());
+    // Backstop for the index's one assumption, that a registered row's geometry never changes: if anything rewrote it
+    // (the source gate is only a tripwire), fail here, loudly, instead of answering from a stale extent.
+    GGML_ASSERT(runtime_registry_row_matches_index_entry(it->second.handle, hit) &&
+                "runtime allocation containment index disagrees with its registry row");
+    if (out != nullptr) {
+        *out = it->second.handle;
+    }
+    if (queue_out != nullptr) {
+        *queue_out = it->second.queue;
+    }
+    return true;
 }
 
 static registered_release_status release_registered_allocation_owned(
@@ -18265,7 +18576,7 @@ static registered_release_status release_registered_allocation_owned(
     if (it != g_runtime_alloc_registry.end() && it->second.handle.key() == detached.handle.key() &&
         it->second.release_generation == detached.release_generation &&
         it->second.state == runtime_alloc_state::RELEASING) {
-        g_runtime_alloc_registry.erase(it);
+        runtime_registry_erase_locked(it);
     }
     return registered_release_status::RELEASED;
 }
@@ -18368,7 +18679,7 @@ bool allocation_registry_test_publish(const alloc_metadata & metadata, bool intr
         rec.ownership = intrusive ? runtime_alloc_ownership::INTRUSIVE : runtime_alloc_ownership::LEGACY;
         rec.test_no_physical_release = true;
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        return g_runtime_alloc_registry.emplace(metadata.ptr, std::move(rec)).second;
+        return runtime_registry_emplace_locked(metadata.ptr, std::move(rec)).second;
     } catch (...) {
         return false;
     }
@@ -18385,6 +18696,139 @@ allocation_result allocation_registry_test_promote(
 bool allocation_registry_test_contains(void * ptr) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     return g_runtime_alloc_registry.find(ptr) != g_runtime_alloc_registry.end();
+}
+
+// llama.cpp-ii25: the registry's replace-or-insert helper, which the adopt_raw_* paths publish through: a LIVE device-VRAM
+// row of `bytes` at `ptr`, replacing any row already there. No physical allocation.
+bool allocation_registry_test_assign_raw(void * ptr, int device, size_t bytes) noexcept {
+    if (!ptr || bytes == 0) {
+        return false;
+    }
+    try {
+        runtime_alloc_record rec;
+        rec.handle.ptr               = ptr;
+        rec.handle.size              = bytes;
+        rec.handle.device            = device;
+        rec.handle.tier              = alloc_tier::DEVICE_VRAM;
+        rec.test_no_physical_release = true;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        runtime_registry_assign_locked(ptr, rec);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// llama.cpp-ii25: rewrite a registered row's size WITHOUT telling the index, to prove the lookup's backstop assertion fires.
+bool allocation_registry_test_corrupt_row_size(void * ptr, size_t bytes) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    const auto                  it = g_runtime_alloc_registry.find(ptr);
+    if (it == g_runtime_alloc_registry.end() || bytes == 0) {
+        // A zero size would turn the row irregular behind the settle counters (llama.cpp-rriv); no test needs it.
+        return false;
+    }
+    it->second.handle.size = bytes;
+    return true;
+}
+
+bool allocation_registry_test_index_consistent() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return runtime_registry_index_consistent_locked();
+}
+
+bool allocation_registry_test_publish_host(void *       ptr,
+                                           int          device,
+                                           size_t       bytes,
+                                           host_zone_id zone,
+                                           bool         releasing) noexcept {
+    if (!ptr || bytes == 0) {
+        return false;
+    }
+    try {
+        runtime_alloc_record rec;
+        rec.handle.ptr               = ptr;
+        rec.handle.size              = bytes;
+        rec.handle.device            = device;
+        rec.handle.tier              = alloc_tier::HOST_PINNED;
+        rec.handle.host_zone         = zone;
+        rec.handle.zone_managed      = zone != host_zone_id::COUNT;
+        rec.state                    = releasing ? runtime_alloc_state::RELEASING : runtime_alloc_state::LIVE;
+        rec.test_no_physical_release = true;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        return runtime_registry_emplace_locked(ptr, std::move(rec)).second;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool allocation_registry_test_assign_host(void * ptr, int device, size_t bytes, host_zone_id zone) noexcept {
+    if (!ptr || bytes == 0) {
+        return false;
+    }
+    try {
+        runtime_alloc_record rec;
+        rec.handle.ptr               = ptr;
+        rec.handle.size              = bytes;
+        rec.handle.device            = device;
+        rec.handle.tier              = alloc_tier::HOST_PINNED;
+        rec.handle.host_zone         = zone;
+        rec.handle.zone_managed      = zone != host_zone_id::COUNT;
+        rec.test_no_physical_release = true;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        runtime_registry_assign_locked(ptr, rec);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool allocation_registry_test_publish_irregular(void * key, void * handle_ptr, size_t bytes) noexcept {
+    if (!key) {
+        return false;
+    }
+    try {
+        runtime_alloc_record rec;
+        rec.handle.ptr               = handle_ptr;
+        rec.handle.size              = bytes;
+        rec.handle.tier              = alloc_tier::DEVICE_VRAM;
+        rec.test_no_physical_release = true;
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        return runtime_registry_emplace_locked(key, std::move(rec)).second;
+    } catch (...) {
+        return false;
+    }
+}
+
+size_t allocation_registry_test_host_zone_rows(host_zone_id zone) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return static_cast<size_t>(zone) < static_cast<size_t>(host_zone_id::COUNT) ?
+               g_runtime_host_zone_rows[static_cast<size_t>(zone)] :
+               0;
+}
+
+bool allocation_registry_test_host_zone_live(host_zone_id zone) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return runtime_registry_host_zone_live_locked(zone);
+}
+
+bool allocation_registry_test_span_live(uintptr_t lo, uintptr_t hi) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return runtime_registry_span_live_locked(lo, hi);
+}
+
+size_t allocation_registry_test_span_irregular_rows() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return g_runtime_span_irregular_rows;
+}
+
+size_t allocation_registry_test_rows_scanned() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return g_test_registry_rows_scanned;
+}
+
+void allocation_registry_test_reset_rows_scanned() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    g_test_registry_rows_scanned = 0;
 }
 
 bool allocation_registry_test_cleanup_pending(void * ptr) noexcept {
@@ -18474,7 +18918,7 @@ bool allocation_registry_test_claim_ptr(void * ptr) noexcept {
 
 void allocation_registry_test_erase(void * ptr) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-    g_runtime_alloc_registry.erase(ptr);
+    runtime_registry_erase_locked(ptr);
 }
 
 bool allocation_registry_test_publish_raw(void * ptr,
@@ -18498,7 +18942,7 @@ bool allocation_registry_test_publish_raw(void * ptr,
         rec.state                    = releasing ? runtime_alloc_state::RELEASING : runtime_alloc_state::LIVE;
         rec.test_no_physical_release = true;
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        return g_runtime_alloc_registry.emplace(ptr, std::move(rec)).second;
+        return runtime_registry_emplace_locked(ptr, std::move(rec)).second;
     } catch (...) {
         return false;
     }
@@ -19568,6 +20012,29 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         return resolved.ptr;
     };
 
+    // A smaller request must never shrink what is held (llama.cpp-8ony). The two halves are separate blocks and
+    // different ops are largest in different halves, so replacing the held pair by the latest request shrinks one
+    // half every time and forces a regrowth the plan never provisioned: a 512-row layer op freed the LM head's weights
+    // block and the head could not get it back. Size the pair to the per-component maximum with what is held (bounded
+    // by the ONEDNN zone when an arena is active); a request the held pair already covers is then reused below.
+    {
+        const bool   arena_on = arena_active();
+        const size_t held_w   = onednn_weights_scratch_ ? onednn_weights_scratch_size_ : 0;
+        const size_t held_a   = onednn_activations_scratch_ ? onednn_activations_scratch_size_ : 0;
+        // Bounded by the pair bound, not the raw capacity: two ops that each fit the bound can merge, per component,
+        // into a pair above it, and a held pair above it eats the bytes reserved for the Graph SDPA scratch. The
+        // first reservation is the pair the zone was planned for, from the same stored snapshot as the bound: a
+        // pair that starts at the first op's size and grows stepwise needs the superseded block and the new one in
+        // the zone at once, which a zone sized for one pair plus the Graph floor cannot hold.
+        const int              bound_dev = ggml_sycl_get_device_id_from_queue(queue_);
+        const zone_onednn_plan zone_plan = arena_on ? onednn_zone_plan_load(bound_dev) : zone_onednn_plan();
+        const size_t           pair_bound =
+            arena_on ? onednn_pp_pair_bound_for(zone_plan, zone_capacity(vram_zone_id::ONEDNN)) : 0;
+        zone_onednn_scratch_reserve_target(arena_on, pair_bound, held_w, held_a, zone_plan.weights_bytes,
+                                           zone_plan.activations_bytes, weights_size, activations_size, &weights_size,
+                                           &activations_size);
+    }
+
     // Already reserved with sufficient size?
     if (onednn_weights_scratch_ && onednn_activations_scratch_ && onednn_weights_scratch_size_ >= weights_size &&
         onednn_activations_scratch_size_ >= activations_size) {
@@ -19687,7 +20154,7 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             GGML_LOG_WARN(
                 "[UNIFIED-CACHE] oneDNN scratch request %.1f MB (weights %.1f MB + activations %.1f MB) exceeds the "
                 "planned ONEDNN zone %.1f MB: a path-scoped sizing predicate under-estimated the oneDNN scratchpad; "
-                "growing through the unified cache\n",
+                "attempting an arena replan (refused once allocations are live)\n",
                 total_needed / (1024.0f * 1024.0f), weights_size / (1024.0f * 1024.0f),
                 activations_size / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
 
@@ -19696,8 +20163,15 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             // including its refusal to rebuild while any allocation is still live — the
             // refusal is deliberately preserved, nothing here force-evicts or resets a
             // zone to make room. Once weights are resident the rebuild is (correctly)
-            // refused, and the request is instead satisfied below through
-            // allocate_direct_scratch(), i.e. unified_alloc() with mem_handle ownership.
+            // refused, and the over-zone request is then refused below (an unplanned
+            // direct allocation is not the answer to a plan that did not provision it).
+            //
+            // llama.cpp-8ony: acquire_onednn_pp_scratch turns away a request larger than
+            // the zone before it asks for a reserve, so this branch is reached only when
+            // the zone was rebuilt smaller between acquire's read of its capacity and this
+            // one (defence in depth). It is no longer the way an LM-head-sized request
+            // reports an under-estimated predicate: that op is not routed here at all, so
+            // the under-estimate record above does not fire for it.
             const int dev_id = ggml_sycl_get_device_id_from_queue(queue_);
             // STORED (bare) getter, deliberately: total_needed is the
             // primitive-API pair's own requirement and never includes the
@@ -19711,6 +20185,20 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
             }
             (void) ensure_planned_arena_zones();
             zone_cap = zone_capacity(vram_zone_id::ONEDNN);
+        }
+        // A pair above the bound fits the zone but is not planned into it: it would take the bytes reserved for the
+        // Graph SDPA scratch. acquire_onednn_pp_scratch asks the same bound before it asks for a reserve, so only a
+        // caller that skipped that question gets here.
+        const size_t pair_bound_now = onednn_pp_pair_bound_for(ggml_sycl_get_device_id_from_queue(queue_), zone_cap);
+        if (total_needed <= zone_cap && total_needed > pair_bound_now) {
+            GGML_LOG_ERROR(
+                "[UNIFIED-CACHE] refusing oneDNN scratch request %.1f MB (weights %.1f MB + activations %.1f MB): "
+                "it fits the %.1f MB ONEDNN zone but is above its pair bound %.1f MB, which leaves the Graph SDPA "
+                "scratch floor free; callers must ask the plan first (acquire_onednn_pp_scratch)\n",
+                total_needed / (1024.0f * 1024.0f), weights_size / (1024.0f * 1024.0f),
+                activations_size / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f),
+                pair_bound_now / (1024.0f * 1024.0f));
+            return finish(false);
         }
         if (total_needed <= zone_cap) {
             // The old arena-owned pair (if any) was already point-released
@@ -19769,37 +20257,33 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
                 zone_free(vram_zone_id::ONEDNN, w);
             }
         }
-        // Two distinct causes reach this point and they must not be conflated:
-        //
-        //   * total_needed > zone_cap — the planned zone is genuinely too small, i.e.
-        //     a path-scoped sizing predicate under-estimated. Warned about above, and
-        //     the in-place re-plan was attempted and refused (ensure_planned_arena_zones()
-        //     logs the live allocations that blocked the rebuild).
-        //   * total_needed <= zone_cap — the zone was large enough but zone_alloc could
-        //     not hand out both buffers, so the partial allocation was individually freed
-        //     above. That is fragmentation, allocator rounding, or (since
-        //     llama.cpp-ndn9) a superseded reservation whose barrier has not drained
-        //     yet, so its bytes are still occupied. None of the three is a sizing miss,
-        //     and no re-plan was attempted for any of them. Counting them as an
-        //     under-estimate would blame the predicate for an allocator condition.
-        //
-        // Either way, grow through the unified-cache allocation path below rather than
-        // failing the reservation.
-        const bool zone_undersized = total_needed > zone_cap;
-        if (!zone_undersized) {
-            GGML_LOG_WARN(
-                "[UNIFIED-CACHE] oneDNN scratch sub-allocation failed with sufficient ONEDNN zone capacity "
-                "(need %.1f MB, zone %.1f MB): the zone is fragmented or still holds a superseded "
-                "reservation awaiting its release barrier, not under-sized; growing through the unified cache\n",
-                total_needed / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
+        // An over-zone request that the replan did not make fit ends here, and it is REFUSED, not served around
+        // the plan (llama.cpp-8ony). The direct unified_alloc this used to fall through to is an unplanned
+        // allocation: once weights were resident it was the only way a 1104.6 MiB LM-head pair got built against a
+        // 256 MiB zone, and it thrashed against the planned bytes around it. acquire_onednn_pp_scratch turns an op
+        // the plan routes elsewhere away before it asks, so a request reaching this refusal is a caller that skipped
+        // that question; it falls back to the planned RUNTIME dequant buffers, never to a larger scratch here.
+        if (total_needed > zone_cap) {
+            GGML_LOG_ERROR(
+                "[UNIFIED-CACHE] refusing oneDNN scratch request %.1f MB (weights %.1f MB + activations %.1f MB): "
+                "it is not planned into the ONEDNN zone (%.1f MB) and the arena replan did not make it fit; "
+                "callers must ask the plan first (acquire_onednn_pp_scratch)\n",
+                total_needed / (1024.0f * 1024.0f), weights_size / (1024.0f * 1024.0f),
+                activations_size / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
+            return finish(false);
         }
-        // The not-undersized label must carry BOTH of its causes. It is the only
-        // form most readers see -- the detailed WARN above fires on just one of
-        // the two paths -- so a bare "zone fragmented" here tells the stale
-        // pre-llama.cpp-ndn9 story and sends the reader hunting for
-        // fragmentation that may not exist.
-        arena_grow_cause =
-            zone_undersized ? "planned zone under-estimated" : "zone fragmented or awaiting a release barrier";
+        // Only a request the zone is large enough for reaches this point, so the zone_alloc above failed for one of
+        // the causes the under-estimate counter must NOT be charged for: allocator fragmentation, allocator
+        // rounding, or (since llama.cpp-ndn9) a superseded reservation whose barrier has not drained yet, so its
+        // bytes are still occupied. None is a sizing miss, and no re-plan was attempted for any of them. Grow
+        // through the unified-cache allocation path below rather than failing the reservation: this is the
+        // transient old+new case of a PLANNED op, not an op the plan routes elsewhere.
+        GGML_LOG_WARN(
+            "[UNIFIED-CACHE] oneDNN scratch sub-allocation failed with sufficient ONEDNN zone capacity "
+            "(need %.1f MB, zone %.1f MB): the zone is fragmented or still holds a superseded "
+            "reservation awaiting its release barrier, not under-sized; growing through the unified cache\n",
+            total_needed / (1024.0f * 1024.0f), zone_cap / (1024.0f * 1024.0f));
+        arena_grow_cause     = "zone fragmented or awaiting a release barrier";
         arena_zone_exhausted = true;
     }
     direct_attempt = true;
@@ -20401,6 +20885,26 @@ bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, si
     return cache->reserve_onednn_scratch(weights_size, activations_size);
 }
 
+// llama.cpp-8ony: the most an op's f16 pair may be for the ONEDNN zone to count it as planned, from the zone the arena
+// was built with and the snapshot of the two figures it was sized from (the pair's own plan and the Graph SDPA floor,
+// stored by the zone sizing when it kept or built the zone; see onednn_pp_pair_bound_for). Capacity minus the floor is
+// slack nobody else planned for, so a pair inside it cannot push the Graph SDPA scratch onto its DIRECT path (an
+// unplanned device allocation); a pair above it would. The bound never falls below the plan (a clamped zone holds the
+// plan), nor above the capacity. No figure is read live or recomputed here: both are overwritten by later plans the
+// zone was not rebuilt for. Not covered: a growth step still needs the superseded pair and the new one in the zone
+// at once (see the note in reserve_onednn_scratch), so a pair inside the bound can still fall through to the
+// unplanned direct allocation while its predecessor drains.
+bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound) {
+    unified_cache * cache = get_existing_unified_cache_for_device(device_id);
+    if (!cache || !cache->arena_active()) {
+        return false;
+    }
+    if (bound) {
+        *bound = onednn_pp_pair_bound_for(device_id, cache->zone_capacity(vram_zone_id::ONEDNN));
+    }
+    return true;
+}
+
 bool unified_cache_reserve_pp_moe_onednn_scratch(int      device_id,
                                                  size_t   weight_slot_bytes,
                                                  size_t   activation_slot_bytes,
@@ -20742,15 +21246,8 @@ void * unified_cache::load_partial_rows(const char *               tensor_name,
         row_start > std::numeric_limits<int64_t>::max() - row_count) {
         return nullptr;
     }
-    switch (type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q6_K:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_MXFP4:
-            break;
-        default:
-            return nullptr;
+    if (!ggml_sycl_soa_reorder_supported_type(type)) {
+        return nullptr;
     }
 
     partial_rows_key key{ tensor_id, device_idx, type, ncols, row_start, row_count };
@@ -21183,7 +21680,7 @@ static alloc_handle unified_cache_adopt_raw_host_allocation(void *           ptr
     rec.cohort_id        = cohort_id ? cohort_id : "";
 
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-    g_runtime_alloc_registry[ptr] = rec;
+    runtime_registry_assign_locked(ptr, rec);
     if (cohort_id && cohort_id[0] != '\0') {
         g_runtime_cohort_tier[cohort_id] = alloc_tier::HOST_PINNED;
     }
@@ -21232,9 +21729,9 @@ static alloc_handle unified_cache_adopt_raw_device_allocation(void *           p
         if (!dup->second.cohort_id.empty()) {
             g_runtime_cohort_tier.erase(dup->second.cohort_id);
         }
-        g_runtime_alloc_registry.erase(dup);
+        runtime_registry_erase_locked(dup);
     }
-    g_runtime_alloc_registry[ptr] = rec;
+    runtime_registry_assign_locked(ptr, rec);
     if (cohort_id && cohort_id[0] != '\0') {
         g_runtime_cohort_tier[cohort_id] = alloc_tier::DEVICE_VRAM;
     }
@@ -22123,6 +22620,43 @@ void unified_cache::host_pool_free(void * ptr, size_t size) {
     host_arena_->deallocate(ptr, size);
 }
 
+// What a REFUSED host-zone settle reports: every registry row in `zone`, logged (the first few) and recorded for the zone
+// audit (all of them), plus the oldest epoch among them. Walks the whole registry, so a settle calls it only after
+// runtime_registry_host_zone_live_locked() has said a row exists. Caller holds g_runtime_alloc_mutex.
+static size_t runtime_registry_scan_host_zone_locked(host_zone_id            zone,
+                                                     bool                    log_detail,
+                                                     bool                    epoch_tracked,
+                                                     zone_audit_site_visit & audit,
+                                                     uint64_t &              oldest_epoch) {
+    size_t detail_lines     = 0;
+    size_t live_allocations = 0;
+    for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
+        runtime_registry_note_row_scanned_locked();
+        if (it->second.handle.host_zone == zone) {
+            if (log_detail && detail_lines < 8) {
+                runtime_reset_reclaimed_log_live_locked(it->second, "host-zone-reset");
+                detail_lines++;
+            }
+            if (audit.active()) {
+                // The audit collects EVERY live record, uncapped -- the
+                // refusal dump is capped at 4 refusals x 8 lines per
+                // zone, which cannot produce an inventory. Collected here so
+                // it sees exactly what the refusal saw, under the same lock.
+                // Attribution is READ from the handle (post-f9tg), never
+                // re-derived.
+                const alloc_metadata & h = it->second.handle;
+                audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
+                                       static_cast<int>(h.tier), it->second.cohort_id });
+            }
+            if (epoch_tracked) {
+                oldest_epoch = std::min(oldest_epoch, it->second.handle.epoch_id);
+            }
+            live_allocations++;
+        }
+    }
+    return live_allocations;
+}
+
 void unified_cache::host_zone_settle(host_zone_id zone) {
     // Phase 0 escape audit. Declared FIRST, ahead of the reservation
     // early-return just below, so the RAII destructor still records a visit
@@ -22203,31 +22737,13 @@ void unified_cache::host_zone_settle(host_zone_id zone) {
         // instead of aborting, so keep it only for the first few refusals, and
         // bound it within a single refusal too.
         const bool                  log_detail       = zone_logs.load(std::memory_order_relaxed) < 4;
-        size_t                      detail_lines     = 0;
         size_t                      live_allocations = 0;
         uint64_t                    oldest_epoch     = new_epoch;
-        for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
-            if (it->second.handle.host_zone == zone) {
-                if (log_detail && detail_lines < 8) {
-                    runtime_reset_reclaimed_log_live_locked(it->second, "host-zone-reset");
-                    detail_lines++;
-                }
-                if (audit.active()) {
-                    // The audit collects EVERY live record, uncapped -- the
-                    // refusal dump above is capped at 4 refusals x 8 lines per
-                    // zone, which cannot produce an inventory. Collected here so
-                    // it sees exactly what the refusal saw, under the same lock.
-                    // Attribution is READ from the handle (post-f9tg), never
-                    // re-derived.
-                    const alloc_metadata & h = it->second.handle;
-                    audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
-                                           static_cast<int>(h.tier), it->second.cohort_id });
-                }
-                if (epoch_tracked) {
-                    oldest_epoch = std::min(oldest_epoch, it->second.handle.epoch_id);
-                }
-                live_allocations++;
-            }
+        // A clean settle (the normal case: once per graph) is one counter read. Only a zone that has a row pays for the
+        // enumeration, which exists to explain the refusal.
+        if (runtime_registry_host_zone_live_locked(zone)) {
+            live_allocations =
+                runtime_registry_scan_host_zone_locked(zone, log_detail, epoch_tracked, audit, oldest_epoch);
         }
         if (live_allocations > 0) {
             if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -25044,7 +25560,7 @@ void unified_cache::arena_forget_allocation_locked(vram_zone_id zone, void * ptr
         auto runtime = g_runtime_alloc_registry.find(ptr);
         if (runtime != g_runtime_alloc_registry.end() && runtime->second.handle.alloc_id == exact_id) {
             if (!runtime->second.cohort_id.empty()) g_runtime_cohort_tier.erase(runtime->second.cohort_id);
-            g_runtime_alloc_registry.erase(runtime);
+            runtime_registry_erase_locked(runtime);
         }
     }
 }
@@ -25281,6 +25797,37 @@ static const char * vram_zone_name(vram_zone_id zone) {
     }
 }
 
+// What a REFUSED zone settle reports: every registry row whose key is in [lo, hi), logged (the first few) and recorded for
+// the zone audit (all of them). Walks the whole registry, so a settle calls it only after
+// runtime_registry_span_live_locked() has said a row exists. Caller holds g_runtime_alloc_mutex.
+static size_t runtime_registry_scan_span_locked(uintptr_t               lo,
+                                                uintptr_t               hi,
+                                                bool                    log_detail,
+                                                zone_audit_site_visit & audit) {
+    size_t detail_lines     = 0;
+    size_t live_allocations = 0;
+    for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
+        runtime_registry_note_row_scanned_locked();
+        const uintptr_t p = reinterpret_cast<uintptr_t>(it->first);
+        if (p >= lo && p < hi) {
+            if (log_detail && detail_lines < 8) {
+                runtime_reset_reclaimed_log_live_locked(it->second, "device-zone-reset");
+                detail_lines++;
+            }
+            if (audit.active()) {
+                // Uncapped, unlike the bounded refusal dump; collected
+                // under the same lock so it sees exactly what the refusal
+                // saw. Attribution is READ from the handle (post-f9tg).
+                const alloc_metadata & h = it->second.handle;
+                audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
+                                       static_cast<int>(h.tier), it->second.cohort_id });
+            }
+            live_allocations++;
+        }
+    }
+    return live_allocations;
+}
+
 // Shared implementation for zone_boundary_check() / zone_reclaim() (below) --
 // see the doc comment on zone_settle()'s declaration in unified-cache.hpp for
 // why this is genuinely internal and not called directly outside this class.
@@ -25390,25 +25937,11 @@ void unified_cache::zone_settle(vram_zone_id zone) {
         // aborting now, so identify owners only for the first few refusals, and
         // bound the dump within a single refusal too.
         const bool                  log_detail       = zone_logs.load(std::memory_order_relaxed) < 4;
-        size_t                      detail_lines     = 0;
         size_t                      live_allocations = 0;
-        for (auto it = g_runtime_alloc_registry.begin(); it != g_runtime_alloc_registry.end(); ++it) {
-            const uintptr_t p = reinterpret_cast<uintptr_t>(it->first);
-            if (p >= zone_lo && p < zone_hi) {
-                if (log_detail && detail_lines < 8) {
-                    runtime_reset_reclaimed_log_live_locked(it->second, "device-zone-reset");
-                    detail_lines++;
-                }
-                if (audit.active()) {
-                    // Uncapped, unlike the bounded refusal dump above; collected
-                    // under the same lock so it sees exactly what the refusal
-                    // saw. Attribution is READ from the handle (post-f9tg).
-                    const alloc_metadata & h = it->second.handle;
-                    audit.live.push_back({ h.alloc_id, h.size, static_cast<int>(h.role), static_cast<int>(h.category),
-                                           static_cast<int>(h.tier), it->second.cohort_id });
-                }
-                live_allocations++;
-            }
+        // A clean settle (the normal case: once per graph per device) is one index query. Only a zone that has a row
+        // pays for the enumeration, which exists to explain the refusal.
+        if (runtime_registry_span_live_locked(zone_lo, zone_hi)) {
+            live_allocations = runtime_registry_scan_span_locked(zone_lo, zone_hi, log_detail, audit);
         }
         if (live_allocations > 0) {
             if (zone_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -29016,6 +29549,18 @@ static_assert(k_zone_mmq_src1_block_elems == QK8_1, "zone-sizing.hpp Q8_1 block 
 static_assert(k_zone_mmq_src1_block_bytes == sizeof(block_q8_1), "zone-sizing.hpp Q8_1 block size drifted");
 static_assert(k_zone_dequant_f16_elem_bytes == sizeof(sycl::half), "zone-sizing.hpp f16 element size drifted");
 
+bool onednn_pp_unified_scratch_enabled(ggml_type type) {
+    static const int mode = []() {
+        const char * env = std::getenv("GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH");
+        if (env) {
+            return std::atoi(env) != 0 ? 1 : 0;
+        }
+        return -1;
+    }();
+    return zone_onednn_pp_scratch_type_enabled(
+        mode, type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_MXFP4);
+}
+
 std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vector<placement_tensor_info> & inventory) {
     std::vector<zone_tensor_desc> zone_inventory;
     zone_inventory.reserve(inventory.size());
@@ -29029,6 +29574,10 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         }
         desc.name         = item.name;
         desc.reorder_size = zone_onednn_reorder_bytes(item);
+        // llama.cpp-8ony: the marks below describe a MUL_MAT operand. The loader's role says whether this tensor is one
+        // (a token embedding looked up by GET_ROWS is not, unless it is also the tied output head); the pure classifier
+        // honours it for all of them at once.
+        desc.get_rows_only = item.get_rows_only;
         // llama.cpp-479i: Q8_1 bytes a dense quantized MUL_MAT quantizes its activations into, per
         // token. Operand-ness is decided HERE, where the traits and the name are, not in the pure
         // classifier: a quantized weight that is not an expert stack (MUL_MAT_ID keeps its own
@@ -29048,13 +29597,14 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
                 desc.mmq_src1_bytes_per_token = bytes_per_token;
             }
         }
-        // llama.cpp-479i: f16 bytes the f16 dequant arm materializes for a dense weight. The
-        // planned candidate set is Q8_0: ONEDNN_SOA / ONEDNN_COALESCED are the planned route for its
-        // materialized layouts and are selected whatever GGML_SYCL_ONEDNN_PP says, so they are the
-        // consumer that was observed minting per-op copies. Another type reaching the arm (an AOS-layout
-        // fallback) is not planned here: the graph-entry walk finds it from the graph's own nodes and
-        // grows the buffer inside the RUNTIME zone, or refuses by name. Experts are excluded by the same
-        // role function as above.
+        // llama.cpp-479i: f16 bytes the f16 dequant arm materializes for a dense weight. Q8_0 is planned
+        // UNCONDITIONALLY: ONEDNN_SOA / ONEDNN_COALESCED are the route for its materialized layouts and are selected
+        // whatever GGML_SYCL_ONEDNN_PP says, so they were the consumer observed minting per-op copies. Q4_0 and MXFP4
+        // are planned CONDITIONALLY, in the next block (llama.cpp-8ony), as is a quantized type no MMQ, coalesced or
+        // unified kernel serves, the IQ family (llama.cpp-gldu): at PP batch the router has no kernel for it but this
+        // arm, so for it the arm is the planned route and not a fallback. A mis-predicted node is still found by the
+        // graph-entry walk from the graph's own nodes, which grows the buffer inside the RUNTIME zone or refuses by
+        // name. Experts are excluded by the same role function as above.
         if (item.has_shape() && item.type == GGML_TYPE_Q8_0 &&
             expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN) {
             size_t weight_bytes = 0;
@@ -29064,6 +29614,56 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
                                                       item.ne[3] > 0 ? item.ne[3] : 1, &src1_bytes)) {
                 desc.dequant_f16_weight_bytes         = weight_bytes;
                 desc.dequant_f16_src1_bytes_per_token = src1_bytes;
+            }
+        }
+        // llama.cpp-8ony: a dense weight of a type the unified kernel's oneDNN f16 route serves (Q4_0, MXFP4) draws
+        // the planned dequant buffers whenever the oneDNN PP scratch does not supply its f16 copies: the scratch is
+        // off for the type, or the weight is one the ONEDNN zone was not sized for (the LM head). Whether it is
+        // one of those is decided by the pure classifier, which alone sees the group cardinality the zone's own
+        // eligibility rule needs; the adapter supplies the sizes and the type/env enablement. Experts are excluded
+        // by the same role function as above.
+        // Only a type the oneDNN PP admission serves is marked at all (ggml_sycl_onednn_pp_type_admitted, the same two
+        // gates the op's candidate takes): with GGML_SYCL_ONEDNN_PP=0 or GGML_SYCL_SKIP_ONEDNN_Q4_0=1 no PP route draws
+        // the buffers, so reserving the head's copy would be a RUNTIME-zone reservation nothing uses. The plan cannot
+        // ask the router: it has no graph node, no batch and no resolved layout. GGML_SYCL_UNIFIED_DISPATCH is left
+        // out on purpose, because the legacy oneDNN arm draws the same buffers when the unified kernel is off.
+        // The head's copy is reserved UNCONDITIONALLY otherwise (owner decision) until llama.cpp-fkpg delivers
+        // n_outputs to the planner: whether the head runs on many rows (perplexity, embeddings) or on the last row
+        // only (chat, llama-bench) is not known here, and an unused plan is bounded by that one weight's f16 copy.
+        //
+        // llama.cpp-gldu: a quantized type no MMQ, coalesced or unified kernel serves takes the same fields, from the
+        // router's own type lists (aos_dequant_f16_plan_claims in unified-types.hpp composes them: !coalesced && !MMQ,
+        // a type SYCL executes as a dense MUL_MAT, not an expert stack, not the LM head; ggml_sycl_supports_mmq,
+        // is_coalesced_supported and ggml_sycl_mul_mat_type_supported read the same lists). The one term a SYCL-free
+        // header cannot compute is whether the router can dequantize the type at all, so it is asked here through the
+        // function the router asks (onednn_woq::supports_dequant_fp16). The head is recognised by its usage
+        // classification (infer_tensor_usage) and the tied-embedding classifier, the same two the layout planner uses,
+        // not by a name of its own. Unlike the unified kernel's types this mark does not need the PP admission to reach
+        // the arm: the legacy oneDNN kernel runs with GGML_SYCL_ONEDNN_PP=0 too. The scratch supplies its copies only
+        // when the PP admission holds AND the scratch is enabled for the type, so that is what pp_scratch_type_enabled
+        // says (for the unified kernel's types the admission already held, so their answer is unchanged). The loader's
+        // get_rows_only role excludes a gather-only table (per_layer_token_embd) in the classifier, for every mark.
+        const bool shaped    = item.has_shape();
+        const bool is_expert = expert_tensor_role_from_tensor_name(item.name.c_str()) != expert_tensor_role::UNKNOWN;
+        // The unified kernel's types carry no expert exclusion of their own (the claim below does), so it is here.
+        const bool unified_dequant_type = shaped && !is_expert && unified_kernel_serves_type(item.type) &&
+                                          ggml_sycl_onednn_pp_type_admitted(item.type);
+        const bool lm_head = infer_tensor_usage(item.name.c_str()) == tensor_usage::OUTPUT_WEIGHT ||
+                             ggml_sycl_is_canonical_tied_embedding_name(item.name.c_str());
+        const bool quantized         = shaped && ggml_is_quantized(item.type);
+        const bool dequant_supported = quantized && onednn_woq::supports_dequant_fp16(item.type);
+        const bool aos_dequant_type =
+            aos_dequant_f16_plan_claims(item.type, quantized, lm_head, is_expert, dequant_supported);
+        if (unified_dequant_type || aos_dequant_type) {
+            size_t weight_bytes = 0;
+            size_t src1_bytes   = 0;
+            if (zone_dequant_f16_weight_bytes(item.ne[0], item.ne[1] > 0 ? item.ne[1] : 1, &weight_bytes) &&
+                zone_dequant_f16_src1_bytes_per_token(item.ne[0], item.ne[2] > 0 ? item.ne[2] : 1,
+                                                      item.ne[3] > 0 ? item.ne[3] : 1, &src1_bytes)) {
+                desc.dequant_f16_if_unsupplied_weight_bytes         = weight_bytes;
+                desc.dequant_f16_if_unsupplied_src1_bytes_per_token = src1_bytes;
+                desc.pp_scratch_type_enabled =
+                    onednn_pp_unified_scratch_enabled(item.type) && ggml_sycl_onednn_pp_type_admitted(item.type);
             }
         }
         zone_inventory.push_back(std::move(desc));

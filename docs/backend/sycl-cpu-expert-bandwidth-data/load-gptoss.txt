@@ -1,0 +1,17 @@
+Sat Oct  3 02:10:01 PM EDT 2026
+ 14:10:01 up 24 days, 19:25, 23 users,  load average: 34.33, 36.97, 40.30
+top - 14:10:01 up 24 days, 19:25, 23 users,  load average: 34.33, 36.97, 40.30
+Tasks: 1212 total,   1 running, 1210 sleeping,   0 stopped,   1 zombie
+%Cpu(s):  4.2 us,  6.7 sy, 83.8 ni,  5.3 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st 
+MiB Mem : 252839.4 total, 126596.1 free,  89182.5 used,  50578.8 buff/cache     
+MiB Swap:   8192.0 total,     26.3 free,   8165.7 used. 163656.8 avail Mem 
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+3286086 kainlan   20   0 2151.7g  33.5g   1.4g S  2033  13.6    28w+3d codesco+
+  11462 root      20   0   18.4g 274052  21592 S   8.3   0.1      8,45 MainThr+
+ 138281 kainlan   20   0   37052  12144   1984 S   8.3   0.0 238:35.73 tmux: s+
+2624452 kainlan   20   0   11.2g   1.1g  38296 S   8.3   0.4 274:08.64 pi
+2908448 kainlan   20   0   11820   6928   4280 R   8.3   0.0   0:00.02 top
+3822873 kainlan   20   0   19.0g   1.4g  42284 S   8.3   0.6 347:38.67 pi
+3893123 kainlan   20   0 2775392 110568  20144 S   8.3   0.0  18:56.86 Isolate+
+      1 root      20   0   28236  18272  10576 S   0.0   0.0  32:46.28 systemd

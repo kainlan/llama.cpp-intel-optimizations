@@ -33,8 +33,8 @@
      "cite": "ggml_sycl_flash_attn_ext_supported: D=256 native, F16 K/V and mask (ggml-sycl/fattn.cpp:2436-2497)"},
     {"id": "ROPE", "op": "ROPE", "expect": "SYCL", "verdict": "SUPPORTED",
      "cite": "ROPE out-of-place, offset 0 (:108657-108672); imrope sections implemented (ggml-sycl/rope.cpp:197)"},
-    {"id": "IDX-PROJ-BF16", "op": "MUL_MAT", "src0": "indexer\\.[qk]_pro", "expect": "SYCL", "verdict": "SUSPECT", "count": 24,
-     "cite": "BF16 weights admitted only through the one-time F32 materialization route (:108305-108325); the route keeps its own materialization cache outside the planner"},
+    {"id": "IDX-PROJ-BF16", "op": "MUL_MAT", "src0": "indexer\\.[qk]_pro", "expect": "SYCL", "verdict": "SUPPORTED", "count": 24,
+     "cite": "BF16 weights admitted through ggml_sycl_bf16_weight_native_route_available and run by the native BF16 executor (ggml_sycl_mul_mat_bf16_weight, llama.cpp-9qjy) from the bytes the planner placed; no F32 copy exists, a host-planned weight declines to the CPU"},
 
     {"id": "MOE-MMID", "op": "MUL_MAT_ID", "expect": "SYCL", "verdict": "SUPPORTED", "count": 144,
      "cite": "residency-blind MUL_MAT_ID admission, Q8_0 in the MMID tables (:108134-108176, ggml-sycl/moe-mmvq-tables.hpp:78); host experts run in the backend's CpuExpertPool, which the scheduler dump cannot see"},

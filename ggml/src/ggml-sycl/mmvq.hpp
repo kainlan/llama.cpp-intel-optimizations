@@ -620,12 +620,17 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
 
 // Batched MoE AoS submit for the quantized types whose _id coverage was added
 // for llama.cpp-gx30: Q4_1, Q4_K, Q5_K, Q6_K, Q5_0, Q5_1, Q2_K, Q3_K -- every
-// type that has a generic mul_mat_vec_q<> instantiation to transcribe. The iq*
-// family is deliberately absent: those use per-type kernels
-// (mul_mat_vec_q_iq2_xxs_q8_1<> and friends, a different template with no
-// vec_dot parameter and adjusted qi), so there is no tuple to carry over and
-// covering them is separate work. Each dispatches the same
-// generic mmvq_submit_aos_id_impl<> that Q1_0/NVFP4 use; the per-type template
+// type that has a generic mul_mat_vec_q<> instantiation to transcribe -- plus
+// IQ4_NL (llama.cpp-s36q), whose dense kernel is that generic body with
+// vec_dot_iq4_nl_q8_1, IQ3_XXS / IQ3_S (s36q phase 2) and IQ2_XXS / IQ2_XS / IQ2_S
+// (phase 3). Those five dense kernels share the tuple (QK_K, QI3_x / 2 or QI2_x / 2,
+// vdr 1). Four of their vec_dots take grid tables as extra arguments, so each goes
+// through a generic-signature adaptor over the same grid tables the dense kernels
+// read; IQ2_S's vec_dot already has the generic signature and is passed directly. The
+// rest of the iq* family (IQ4_XS, IQ1_S, IQ1_M) stays refused only because no tuple
+// and, where its vec_dot takes grid tables, no adaptor has been written for it yet.
+// Each dispatches the same generic
+// mmvq_submit_aos_id_impl<> that Q1_0/NVFP4 use; the per-type template
 // tuple is transcribed verbatim from the already-shipped non-indexed launcher
 // (mul_mat_vec_<t>_q8_1_sycl), because the two kernels share identical block
 // math and differ only in where the weight pointer and y offset come from.

@@ -332,7 +332,10 @@ def evaluate(backend, common, cache, zone):
     # router sends to the unified or oneDNN kernel never touches this buffer, so counting it is an idle RUNTIME
     # reservation and can refuse a graph whose real route needs nothing.
     route_pred = function_body(backend, r"static bool ggml_sycl_mul_mat_src1_quantizing_route\([^)]*\)\s*\{") or ""
-    route_core = function_body(backend, r"static bool ggml_sycl_mul_mat_scratch_route\([^)]*\)\s*\{") or ""
+    # The route is the wrapper that asks the router (scratch_route) plus the decided core both walks share
+    # (scratch_route_decided); the checks read them together.
+    route_core = (function_body(backend, r"static bool ggml_sycl_mul_mat_scratch_route\([^)]*\)\s*\{") or "") + \
+        (function_body(backend, r"static bool ggml_sycl_mul_mat_scratch_route_decided\([^)]*\)\s*\{") or "")
     results["the Q8 walk asks the dispatch's router"] = \
         "ggml_sycl_mul_mat_src1_quantizing_route(" in q8_walk and "matmul_orchestrator.select(" in route_core
     results["the Q8 walk asks the router quietly"] = "ggml_sycl_select_quiet_scope" in q8_walk
@@ -383,7 +386,11 @@ def evaluate(backend, common, cache, zone):
     fallback_decision = function_body(
         backend, r"static ggml_sycl::MatmulDecision ggml_sycl_mul_mat_legacy_fallback_decision\([^)]*\)\s*\{")
     unified_alloc_fn = function_body(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)\s*\{")
-    scratch_route = function_body(backend, r"static bool ggml_sycl_mul_mat_scratch_route\([^)]*\)\s*\{")
+    scratch_route_wrapper = function_body(backend, r"static bool ggml_sycl_mul_mat_scratch_route\([^)]*\)\s*\{")
+    scratch_route_decided = function_body(
+        backend, r"static bool ggml_sycl_mul_mat_scratch_route_decided\([^)]*\)\s*\{")
+    scratch_route = None if None in (scratch_route_wrapper, scratch_route_decided) else \
+        scratch_route_wrapper + scratch_route_decided
     f16_route = function_body(backend, r"static bool ggml_sycl_mul_mat_f16_dequant_route\([^)]*\)\s*\{")
     nonfa_check = function_body(backend, r"static bool ggml_sycl_check_nonfa_attn_scratch\([^)]*\)\s*\{")
     note_spill_fn = function_body(cache, r"void unified_cache_note_planned_hold_spill\([^)]*\)\s*\{")
@@ -506,9 +513,10 @@ def evaluate(backend, common, cache, zone):
     # I1: the f16 walk asks the same route question the Q8 walk does, and the hold counts the f16 plan the way it
     # counts the Q8 plan, from the first plan, because the decline-served node it used to miss draws from it.
     results["the f16 walk asks the shared f16 route predicate"] = \
-        "ggml_sycl_mul_mat_f16_dequant_route(" in dq_walk and "matmul_orchestrator.select(" not in dq_walk
+        "ggml_sycl_mul_mat_f16_dequant_route(" in dq_walk and dq_walk.count("matmul_orchestrator.select(") == 1
     results["both route predicates share one decision core"] = \
-        "ggml_sycl_mul_mat_scratch_route(" in quantizing_route and "ggml_sycl_mul_mat_scratch_route(" in f16_route and \
+        "ggml_sycl_mul_mat_scratch_route(" in quantizing_route and \
+        "ggml_sycl_mul_mat_scratch_route_decided(" in f16_route and \
         "zone_route_draws_scratch(" in scratch_route and \
         "ggml_sycl_mul_mat_legacy_fallback_decision(" in scratch_route and "matmul_orchestrator.select(" in scratch_route
     f16_draws = function_body(backend, r"static bool ggml_sycl_mul_mat_kernel_draws_dequant_f16\([^)]*\)\s*\{") or ""
@@ -1468,7 +1476,7 @@ if args.self_test:
                          "ggml_sycl_mul_mat_src1_quantizing_route(",
                          "ctx.matmul_orchestrator.select("), common, cache, zone)),
         ("route predicate blind to the decline", "the route predicate asks the shared fallback decision",
-         (mutate_in_func(backend, r"static bool ggml_sycl_mul_mat_scratch_route\(",
+         (mutate_in_func(backend, r"static bool ggml_sycl_mul_mat_scratch_route_decided\(",
                          "ggml_sycl_mul_mat_legacy_fallback_decision(", "ggml_sycl_XXXX("), common, cache, zone)),
         ("second decline re-select", "the allow_unified=false re-select is written once",
          (backend + "\nstatic void kpjw_second_source(ggml_backend_sycl_context & c) { c.matmul_orchestrator."
@@ -1480,7 +1488,7 @@ if args.self_test:
           common, cache, zone)),
         ("f16 route off the shared core", "both route predicates share one decision core",
          (mutate_in_func(backend, r"static bool ggml_sycl_mul_mat_f16_dequant_route\(",
-                         "ggml_sycl_mul_mat_scratch_route(", "ggml_sycl_XXXX("), common, cache, zone)),
+                         "ggml_sycl_mul_mat_scratch_route_decided(", "ggml_sycl_XXXX("), common, cache, zone)),
         ("f16 route kernels dropped", "the f16 route predicate selects the oneDNN legacy kernels",
          (mutate_in_func(backend, r"static bool ggml_sycl_mul_mat_kernel_draws_dequant_f16\(",
                          "ONEDNN_COALESCED", "XXXX"), common, cache, zone)),

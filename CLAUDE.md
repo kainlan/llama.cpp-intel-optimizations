@@ -937,35 +937,23 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
 # GPT-OSS B50 chat correctness gate. With --no-display-prompt the prompt echo
 # lands on the interactive "> " line and the model's ANSWER is the next line,
 # on its own:
-# ⚠️ KNOWN ISSUE (llama.cpp-uize, 2026-08-16): as written, this gate currently
-# FAILS CONTEXT INIT on the B50 — "[SYCL-PLAN] runtime KV update rejected: MMID
-# workspace demand/accounting failed" then a segfault. That message is LYING
-# about the cause: llama-cli defaults to n_ctx_train=131072 and 131K of KV
-# (~3.2 GB) exceeds the B50's placement headroom (and physical VRAM) — the
-# fork disabled upstream's context fitter (fit_params=false under SYCL) and
-# the unified cache only validates, never shrinks. It is NOT a chat-correctness
-# or MMID regression — do not open that investigation.
-# ✅ WORKAROUND (verified on hardware 2026-08-16): **add `-c 4096`** (or any
-# context below the limit the refusal itself prints). The gate then reaches
-# `1, 2, 3, 4, 5` with rc=0 and zero aborts. A second defect used to break even
-# that path — llama.cpp-fxrg, where tiered_kv_buffer_get_tensor omitted its
-# byte-contract argument so the server's prompt-checkpoint read got a
-# zero-extent destination handle and the range guard correctly refused — and it
-# is FIXED (c1f4504c8 + ff9d10cd0). Only the default-context init refusal
-# remains, tracked on llama.cpp-uize; its part 3 (re-place KV to host tiers
-# instead of refusing) is deliberately unimplemented pending an owner decision
-# on whether the canonical gate should pin `-c` at all.
-# The refusal message now tells the truth and does the arithmetic for you:
-#   runtime KV update rejected: budget-exceeded -- n_ctx=131072 n_ubatch=512
-#     vram=16569.0 MB (weights 13363.7 + kv 3090.0) budget=14828.0 MB over_by=1741.0 MB
-#   the KV cache for this context does not fit ...; the largest context that
-#     fits is about -c 56576
-# llama-bench GPT-OSS runs are unaffected throughout — bench does not go through
-# the in-process server path that the chat gate uses.
-# POST-b10630 MERGE (2026-08-26): the gate re-verified green on the landed tree
-# in the form below MINUS `-cnv` and WITH `-c 4096` (digit line count=1, rc=0).
-# The -c pin remains required per llama.cpp-uize. Re-verified green again
-# 2026-09-18 on a restored tree: rc=0, 0 aborts, Shmem flat at 0.96 GB.
+# ✅ RUNS AT DEFAULT CONTEXT (llama.cpp-uize closed 2026-10-03). llama-cli
+# defaults to n_ctx_train=131072, which is ~3.2 GB of KV and more than the B50
+# has left after the weights. The unified cache now re-places the overflow
+# instead of refusing. Verified on master 77fad673a:
+#   W [SYCL-PLAN] KV overflow re-placed to host tier: 9 layer(s) demoted, 0 SWA
+#     (2304.0 MB host KV, layers 7..23) on device 0 for n_ctx=131072 ...
+#     Largest all-VRAM context is about -c 34304.
+# Result: rc=0, digit line count=1. Generation is 16.2 t/s, against 25.5 t/s at
+# -c 4096, because the demoted layers' attention runs on the CPU. So the gate
+# below carries NO -c. Keep a `-c 4096` arm as the all-VRAM control when you
+# A/B; `-c` stays a normal user option (owner rulings, uize c-g612/c-xi9g:
+# never shrink context, place KV). A "runtime KV update rejected:
+# budget-exceeded" line now means even the host tiers could not hold the KV.
+# Its arithmetic (the largest context that fits) is the fallback diagnostic.
+# The old `-c 4096` workaround text is retired. The fxrg byte-contract defect
+# that also broke this path is fixed (c1f4504c8 + ff9d10cd0).
+# llama-bench GPT-OSS runs never went through this path.
 #   > Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5
 #   1, 2, 3, 4, 5
 # ⚠️ SCORE IT WITH `grep -cx`, NOT `grep -c` -- "count=1" above is only true of
@@ -1005,7 +993,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
 # Use the GGUF tokenizer.chat_template metadata. Do not force
 # `--chat-template gpt-oss`; that selects the older native formatter.
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli \
-  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 -c 4096 \
+  -m /models/gpt-oss-20b-mxfp4.gguf -ngl 99 \
   -st --simple-io --no-display-prompt \
   --chat-template-kwargs '{"reasoning_effort":"medium"}' \
   --reasoning-format none --reasoning-budget 0 \

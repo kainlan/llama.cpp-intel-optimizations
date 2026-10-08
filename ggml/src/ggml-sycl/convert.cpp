@@ -2762,6 +2762,8 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl_for_layout(ggml_type type, layout_mode layo
     switch (type) {
         case GGML_TYPE_Q1_0:
             return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;
+        case GGML_TYPE_Q2_0:
+            return dequantize_block_sycl<QK2_0, QR2_0, dequantize_q2_0>;
         case GGML_TYPE_Q4_0:
             if (use_coalesced) {
                 return dequantize_row_q4_0_sycl_coalesced;
@@ -2869,6 +2871,8 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor * dst, bool ful
     const bool use_coalesced = full_tensor && ggml_sycl_layout_is_coalesced(extra);
 
     switch (type) {
+        case GGML_TYPE_Q2_0:
+            return dequantize_block_sycl<QK2_0, QR2_0, dequantize_q2_0>;
         case GGML_TYPE_Q4_0:
             if (use_coalesced) {
                 return dequantize_row_q4_0_sycl_coalesced;

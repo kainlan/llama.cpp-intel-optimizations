@@ -1,0 +1,48 @@
+pre: MemAvailable:   158297556 kB Shmem:          12239704 kB  load: 36.97 35.79 36.54 16:02:00
+uptime:  16:02:00 up 24 days, 21:17, 23 users,  load average: 38.17, 36.06, 36.62
+start:  MemAvailable:   158197364 kB Shmem:          12239704 kB 
+== q8_n2_p05_code  (16:02:00)
+   rc=0  MemAvailable:   168309116 kB Shmem:          12239380 kB 
+== q8_n2_p05_chat  (16:06:11)
+   rc=0  MemAvailable:   168020360 kB Shmem:          12239384 kB 
+== q8_n2_p05_reasoning  (16:09:45)
+   rc=0  MemAvailable:   167648592 kB Shmem:          12239380 kB 
+== q8_n3_p05_code  (16:13:22)
+   rc=0  MemAvailable:   168822476 kB Shmem:          12239520 kB 
+== q8_n3_p05_chat  (16:16:25)
+   rc=0  MemAvailable:   168802944 kB Shmem:          12239456 kB 
+== q8_n3_p05_reasoning  (16:20:07)
+   rc=0  MemAvailable:   168813592 kB Shmem:          12239456 kB 
+== q4_n2_p05_code  (16:23:08)
+   rc=0  MemAvailable:   168800896 kB Shmem:          12239456 kB 
+== q4_n2_p05_chat  (16:26:08)
+   rc=0  MemAvailable:   168826840 kB Shmem:          12239588 kB 
+== q4_n2_p05_reasoning  (16:29:25)
+   rc=0  MemAvailable:   168912400 kB Shmem:          12239604 kB 
+== q4_n3_p05_code  (16:32:07)
+   rc=0  MemAvailable:   168878424 kB Shmem:          12239604 kB 
+== q4_n3_p05_chat  (16:35:09)
+   rc=0  MemAvailable:   168843960 kB Shmem:          12239608 kB 
+== q4_n3_p05_reasoning  (16:38:31)
+   rc=0  MemAvailable:   169038356 kB Shmem:          12239604 kB 
+
+arm                      n_max n_drafted  n_accept  accept% mean_len source   acc/pos                decode_ts
+q8_n2_p05_code               2       177       169    95.48     2.88 stats    0.98,0.90                   1.75
+q8_n2_p05_chat               2       189       136    71.96     2.11 stats    0.68,0.43                   1.77
+q8_n2_p05_reasoning          2       177       164    92.66     2.74 stats    0.90,0.84                   1.82
+q8_n3_p05_code               3       205       190    92.68     3.71 stats    0.97,0.91,0.83              2.20
+q8_n3_p05_chat               3       227       148    65.20     2.35 stats    0.69,0.40,0.26              1.71
+q8_n3_p05_reasoning          3       202       188    93.07     3.61 stats    0.96,0.86,0.79              2.37
+q4_n2_p05_code               2       178       170    95.51     2.91 stats    0.98,0.93                   2.33
+q4_n2_p05_chat               2       190       140    73.68     2.19 stats    0.73,0.46                   2.00
+q4_n2_p05_reasoning          2       179       163    91.06     2.70 stats    0.93,0.77                   2.89
+q4_n3_p05_code               3       211       189    89.57     3.66 stats    0.96,0.89,0.82              2.33
+q4_n3_p05_chat               3       217       152    70.05     2.45 stats    0.70,0.49,0.25              1.96
+q4_n3_p05_reasoning          3       202       187    92.57     3.56 stats    0.94,0.86,0.75              2.46
+
+head                     n_max  p_min  arms  accept% mean_len
+q4                           2    p05     3    86.47     2.60
+q4                           3    p05     3    83.81     3.22
+q8                           2    p05     3    86.37     2.58
+q8                           3    p05     3    82.97     3.22
+post rc=0: MemAvailable:   169006876 kB Shmem:          12239604 kB  16:41:34

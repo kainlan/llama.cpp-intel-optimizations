@@ -161,6 +161,24 @@ int main() {
         { GGML_TYPE_Q5_1,  GGML_LAYOUT_AOS, "q5_1/AOS"  },
         { GGML_TYPE_Q2_K,  GGML_LAYOUT_AOS, "q2_K/AOS"  },
         { GGML_TYPE_Q3_K,  GGML_LAYOUT_AOS, "q3_K/AOS"  },
+        // s36q: the first iq* type. IQ4_NL is Q4_0-shaped (32-wide blocks, qi=4, vdr=2) and its dense MMVQ
+        // kernel is the generic mul_mat_vec_q<> body with vec_dot_iq4_nl_q8_1, so the generic _id path
+        // takes it with that vec_dot and no new kernel body.
+        { GGML_TYPE_IQ4_NL, GGML_LAYOUT_AOS, "iq4_nl/AOS" },
+        // s36q phase 2: IQ3_XXS and IQ3_S. Their dense kernels pass grid tables to a vec_dot with a
+        // non-generic signature, so the _id path wraps each in a generic-signature adaptor over the
+        // same grid tables the dense kernels read (qi = QI3_x / 2, vdr = 1, as the dense kernels use).
+        { GGML_TYPE_IQ3_XXS, GGML_LAYOUT_AOS, "iq3_xxs/AOS" },
+        { GGML_TYPE_IQ3_S,   GGML_LAYOUT_AOS, "iq3_s/AOS"   },
+        // s36q phase 3: IQ2_XXS, IQ2_XS and IQ2_S, same (QK_K, QI2_x / 2, vdr 1) dense tuple. The first two
+        // take grid tables through adaptors; IQ2_S's vec_dot already has the generic signature.
+        { GGML_TYPE_IQ2_XXS, GGML_LAYOUT_AOS, "iq2_xxs/AOS" },
+        { GGML_TYPE_IQ2_XS,  GGML_LAYOUT_AOS, "iq2_xs/AOS"  },
+        { GGML_TYPE_IQ2_S,   GGML_LAYOUT_AOS, "iq2_s/AOS"   },
+        // s36q phase 4: Q2_0 (64-wide blocks, qi = QK2_0 / 32 q8_1 chunks, vdr 1, the Q1_0 tuple shape) with
+        // a signature-generic vec_dot, so the generic _id path takes it with no adaptor. Until phase 4 the
+        // type had no SYCL kernel of any kind and was refused (yitq/phbr).
+        { GGML_TYPE_Q2_0,    GGML_LAYOUT_AOS, "q2_0/AOS"    },
     };
 
     for (const auto & req : required) {
@@ -177,13 +195,16 @@ int main() {
     // 5. The types with no _id kernel family must stay unadvertised. This is the
     //    half that keeps a future coverage pass honest: widening capability for
     //    these without adding the kernel turns a clean refusal into a wrong answer.
-    // The two families that remain refused, for different reasons. iq* has no
-    // generic mul_mat_vec_q<> tuple to transcribe (it uses per-type kernels), and
-    // the float types cannot use MMVQ at all -- it quantizes the activation to
-    // Q8_1 and dispatches vec_dot_*_q8_1, meaningless for float weights. Covering
-    // either must move this list in the same change, which is the point.
-    const ggml_type uncovered[] = { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_S,
-                                    GGML_TYPE_F16,    GGML_TYPE_F32,     GGML_TYPE_BF16 };
+    // The two families that remain refused, for different reasons. IQ4_XS, IQ1_S and
+    // IQ1_M are refused only because no _id tuple and, where their vec_dot takes grid
+    // tables, no generic-signature adaptor has been written for them yet (IQ4_NL, the
+    // IQ3 and the IQ2 types are covered since s36q); each moves out of this list in
+    // the change that adds its kernel. The float types cannot use MMVQ at all -- it
+    // quantizes the activation to Q8_1 and dispatches vec_dot_*_q8_1, meaningless for
+    // float weights. Covering either must move this list in the same change, which
+    // is the point.
+    const ggml_type uncovered[] = { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_F16,
+                                    GGML_TYPE_F32,    GGML_TYPE_BF16 };
     for (const ggml_type type : uncovered) {
         for (const ggml_layout_mode layout : all_layouts()) {
             if (moe_mmvq_capability_supports_layout(type, layout)) {
@@ -208,16 +229,17 @@ int main() {
     //    The cardinality assertion below is what makes the lists load-bearing --
     //    identity plus population, because either alone fails open.
     const ggml_type admission_expected[] = {
-        GGML_TYPE_Q1_0, GGML_TYPE_NVFP4, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_Q4_1,
-        GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,  GGML_TYPE_Q6_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,  GGML_TYPE_Q2_K,
-        GGML_TYPE_Q3_K,
+        GGML_TYPE_Q1_0,  GGML_TYPE_NVFP4,   GGML_TYPE_Q4_0,   GGML_TYPE_Q8_0,   GGML_TYPE_MXFP4,
+        GGML_TYPE_Q4_1,  GGML_TYPE_Q4_K,    GGML_TYPE_Q5_K,   GGML_TYPE_Q6_K,   GGML_TYPE_Q5_0,
+        GGML_TYPE_Q5_1,  GGML_TYPE_Q2_K,    GGML_TYPE_Q3_K,   GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_XXS,
+        GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,  GGML_TYPE_Q2_0,
     };
     //    The exact set that regressed: dense MUL_MAT kernels exist, _id does not.
-    //    BF16/q2_0/tq2_0 are absent on purpose -- 186348705 already refuses them
-    //    by leaving them out of the dense allowlist, so they never reached here.
+    //    BF16/tq2_0 are absent on purpose -- 186348705 already refuses them by
+    //    leaving them out of the dense allowlist, so they never reached here. q2_0
+    //    was refused the same way until s36q phase 4 gave it both kernels.
     const ggml_type admission_refused[] = {
-        GGML_TYPE_F32,     GGML_TYPE_F16,    GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,  GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
-        GGML_TYPE_IQ2_S,   GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
+        GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS,
     };
 
     for (const ggml_type type : admission_expected) {
@@ -256,7 +278,7 @@ int main() {
     //    type, and admitting everything are all CAUGHT by the checks above.
     //    Dropping the predicate's capability axis entirely is NOT caught, and
     //    cannot be, because moe_mmvq_batched_dispatch_supports_type and the
-    //    capability table cover exactly the same 13 types today -- so the two
+    //    capability table cover exactly the same 20 types today -- so the two
     //    axes are indistinguishable by population. The second axis is therefore
     //    defensive, not gated here; what keeps the sets coinciding is the subset
     //    invariant in section 3. Do not add a control that "proves" the axis by
@@ -365,6 +387,32 @@ int main() {
     for (const auto & c : prompt_cover_cases) {
         if (moe_mmvq_prompt_layout_cover_executable(c.local, c.secondary, c.host, c.missing, c.n_experts) != c.want) {
             std::printf("FAIL: prompt layout cover policy wrong for: %s (want %d)\n", c.name, c.want ? 1 : 0);
+            ++failures;
+        }
+    }
+
+    // 7. AoS expert-handle publication (llama.cpp-s36q, test-backend-ops case for issue 27873:
+    //    MUL_MAT_ID with n_mats = 1, whose src0 is ne[2] == 1 and unclassified by name).
+    //    At upload the buffer cannot tell such a tensor from a dense 2D weight, so it must not
+    //    publish; a MUL_MAT_ID dispatch knows its src0 is an expert tensor and must publish, or
+    //    the retained resolver finds no expert and the op fails (NOT_FOUND).
+    const struct {
+        bool        classified;
+        int64_t     ne2;
+        bool        mul_mat_id;
+        bool        want;
+        const char * name;
+    } publication_cases[] = {
+        { false, 1, false, false, "dense 2D weight at upload"                       },
+        { false, 1, true,  true,  "single-expert src0 reached by a MUL_MAT_ID"      },
+        { false, 4, false, true,  "structural expert tensor at upload"              },
+        { false, 4, true,  true,  "structural expert tensor at dispatch"            },
+        { true,  1, false, true,  "name-classified single-expert tensor at upload"  },
+        { true,  1, true,  true,  "name-classified single-expert tensor at dispatch" },
+    };
+    for (const auto & c : publication_cases) {
+        if (moe_aos_expert_publication_wanted(c.classified, c.ne2, c.mul_mat_id) != c.want) {
+            std::printf("FAIL: AoS expert publication wrong for: %s (want %d)\n", c.name, c.want ? 1 : 0);
             ++failures;
         }
     }

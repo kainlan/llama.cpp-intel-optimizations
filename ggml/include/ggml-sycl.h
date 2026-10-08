@@ -239,6 +239,12 @@ struct ggml_sycl_tensor_info {
     const char *   name;
     size_t         size;
     enum ggml_type type;
+    // llama.cpp-8ony: true when the model loader's role for this tensor is a row gather (GET_ROWS: the token /
+    // position embedding lookup) and nothing else, so no MUL_MAT scratch is planned for it. False is the default
+    // and means "a MUL_MAT operand or unknown", which is what a producer that never writes the byte has always
+    // implied. Kept in the 4 bytes of padding after `type` so the array stride libllama and libggml-sycl both
+    // index by does not move; rebuild both together all the same.
+    bool           get_rows_only;
     int64_t        ne[GGML_MAX_DIMS];
 };
 
@@ -509,6 +515,18 @@ GGML_BACKEND_API uint64_t ggml_backend_sycl_compute_buffer_host_fallbacks(int de
 GGML_BACKEND_API bool ggml_backend_sycl_planned_hold_spill_fits(ggml_backend_t backend,
                                                                 uint32_t       n_ubatch,
                                                                 uint32_t *     largest_ub);
+
+// llama.cpp-mmi1: the by-name text for a context refused because a scheduler compute buffer fit no tier of a SYCL
+// device. Writes it into `out` (NUL-terminated, truncated to `out_size`) and returns its length. It names the buffer,
+// the room each tier had, the largest -ub that fits (the kpjw hold-spill fit's machinery, an estimate) and the
+// GGML_SYCL_VRAM_BUDGET_PCT that would free enough outside the arena (from the budget authority); never a smaller -c.
+// Returns 0, and writes an empty string, when the allocator recorded no refused compute buffer since the last
+// runtime-context publish, or the backend is not a SYCL one. It consumes the record. `n_ubatch` is the shape the
+// refused reserve ran at. A SYCL DSO that predates the entry exports nothing and the caller says nothing extra.
+GGML_BACKEND_API size_t ggml_backend_sycl_compute_refusal_advice(ggml_backend_t backend,
+                                                                 uint32_t       n_ubatch,
+                                                                 char *         out,
+                                                                 size_t         out_size);
 
 // llama.cpp-kpjw: re-reads the KV room the owner's hold epoch is judged with, from the zone with the context's KV in
 // place. A pinned -ub publishes once, before the memory module (the KV cache, the recurrent state) exists, so the
@@ -1721,6 +1739,14 @@ GGML_BACKEND_API enum ggml_sycl_residency_probe_status ggml_backend_sycl_probe_r
     bool                                   flash_attn_enabled,
     const ggml_sycl_runtime_context_desc * desc,
     struct ggml_sycl_residency_probe *     out);
+// Capability-only form of ggml_backend_dev_supports_op for a SYCL device: supports_op with its two PLACEMENT
+// declines -- host-demoted KV (the KV-host buffer type) and planner-on-host (ggml_sycl_op_is_planned_on_host) --
+// switched off, so it is false only when there is no kernel for `op` (its type and shape). supports_op's "false"
+// cannot tell a missing kernel from a placement; this can, for the fused ops llama_context::resolve_fused_ops
+// probes (FLASH_ATTN_EXT, GATED_DELTA_NET, LIGHTNING_INDEXER, DSV4_HC_*). It is NOT residency-blind for every op:
+// MUL_MAT's BF16 weight-materialize route and GET_ROWS's planned-layout check still depend on where the weight
+// lives. Reached through ggml_backend_reg_get_proc_address as "ggml_backend_sycl_supports_op_capability".
+GGML_BACKEND_API bool ggml_backend_sycl_supports_op_capability(ggml_backend_dev_t dev, const struct ggml_tensor * op);
 
 // Execution-lifecycle context identity is separate from the model lifecycle.
 // One ContextId is allocated per llama_context and then bound to each SYCL

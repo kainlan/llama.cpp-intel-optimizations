@@ -449,6 +449,9 @@ struct placement_tensor_info {
     // Declared capacities copied into the immutable inventory; never live values.
     uint32_t    planner_n_ubatch  = 0;
     uint32_t    planner_n_seq_max = 0;
+    // The model loader's role for the tensor: consumed only by a row gather (GET_ROWS), so no MUL_MAT scratch is
+    // planned for it (ggml_sycl_tensor_info::get_rows_only).
+    bool        get_rows_only     = false;
 
     placement_tensor_info() = default;
 
@@ -1773,6 +1776,10 @@ void unified_cache_note_zone_full_kv_placement(int device_id, const char * tag, 
 void unified_cache_get_recent_planned_hold_spills(int device_id, uint64_t owner, planned_hold_spill_totals * out);
 
 void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
+// The same plan stated as its two halves (the largest dequantized per-layer weight, and the activations half), which
+// also sets the stored sum to their total. The halves are what the first reservation is sized to (llama.cpp-8ony);
+// the reserve's own upward rewrite of the sum leaves them alone.
+void   unified_cache_set_planned_onednn_scratchpad_pair(int device_id, size_t weights_bytes, size_t activations_bytes);
 // The primitive-API weights+activations pair's own planned requirement,
 // WITHOUT the Graph-scratch allocator's additive floor (llama.cpp-gwno
 // round 3, spec-review finding 3). Two getters exist because they answer
@@ -6337,6 +6344,34 @@ allocation_result allocation_registry_test_promote(
     const alloc_metadata & metadata,
     const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept;
 bool allocation_registry_test_contains(void * ptr) noexcept;
+// llama.cpp-ii25: the registry's containment index holds exactly the rows that qualify, with their geometry
+// (runtime_registry_index_consistent_locked()). O(n).
+bool allocation_registry_test_index_consistent() noexcept;
+// llama.cpp-ii25: replace-or-insert a host-only LIVE device-VRAM row (what the adopt_raw_* paths do); true when published.
+bool allocation_registry_test_assign_raw(void * ptr, int device, size_t bytes) noexcept;
+// llama.cpp-rriv: what host_zone_settle() / zone_settle() ask of the registry, without a device or an arena.
+//   publish_host / assign_host: a host-pinned row of `bytes` in `zone` (LIVE or RELEASING / replace-or-insert).
+//   publish_irregular: a row whose KEY is not the base the index holds it at (`handle_ptr` differs from `key`, may be
+//   null, and `bytes` may be 0); true when published.
+//   host_zone_rows / host_zone_live: the per-host-zone live-row counter, and the question host_zone_settle() asks.
+//   span_live: "does any row's key fall in [lo, hi)", the question zone_settle() asks; span_irregular_rows: how many rows
+//   make it fall back to scanning the registry.
+//   rows_scanned: registry rows those questions have visited since the last reset (0 on every clean, regular path).
+bool   allocation_registry_test_publish_host(void *       ptr,
+                                             int          device,
+                                             size_t       bytes,
+                                             host_zone_id zone,
+                                             bool         releasing) noexcept;
+bool   allocation_registry_test_assign_host(void * ptr, int device, size_t bytes, host_zone_id zone) noexcept;
+bool   allocation_registry_test_publish_irregular(void * key, void * handle_ptr, size_t bytes) noexcept;
+size_t allocation_registry_test_host_zone_rows(host_zone_id zone) noexcept;
+bool   allocation_registry_test_host_zone_live(host_zone_id zone) noexcept;
+bool   allocation_registry_test_span_live(uintptr_t lo, uintptr_t hi) noexcept;
+size_t allocation_registry_test_span_irregular_rows() noexcept;
+size_t allocation_registry_test_rows_scanned() noexcept;
+void   allocation_registry_test_reset_rows_scanned() noexcept;
+// llama.cpp-ii25: rewrite a registered row's size behind the index's back (the next lookup inside that range must abort).
+bool allocation_registry_test_corrupt_row_size(void * ptr, size_t bytes) noexcept;
 bool allocation_registry_test_cleanup_pending(void * ptr) noexcept;
 size_t allocation_registry_test_size() noexcept;
 bool allocation_registry_test_acquire_exact_lease(const alloc_metadata & metadata) noexcept;
@@ -6394,6 +6429,15 @@ registered_release_status release_registered_allocation(const alloc_metadata & e
 // metadata-bearing callers must use release_registered_allocation_exact().
 registered_release_status release_registered_pointer(void * ptr, int expected_device = -1);
 bool       unified_lookup(void * ptr, alloc_metadata * out);
+// The registered allocation that contains `ptr` (any byte of [handle.ptr, handle.ptr + handle.size)), not only one that
+// starts there. O(log n) through the registry's containment index (range-index.hpp).
+//
+// PRECEDENCE: ranges nest (a cache or arena chunk is registered alongside the suballocations carved from it), so several
+// rows can contain `ptr`. The answer is the INNERMOST: the row with the greatest base, which is the smallest enclosing
+// range in a properly nested family. Every caller wants the allocation that is the authority for its pointer (its tier,
+// device, queue and the extent a view may address), and a containing chunk is physical lifetime ownership, not authority
+// over a suballocation inside it. It is deterministic; the scan this replaced returned whichever row unordered_map
+// iteration reached first. A row that is RELEASING is still a row here, as before.
 bool       unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, sycl::queue ** queue_out = nullptr);
 alloc_tier unified_select_tier(const alloc_request & req);
 bool       unified_alloc_validate_registry(int device = -1, const char * where = nullptr);
@@ -6866,6 +6910,19 @@ size_t compute_moe_effective_weight_bytes(size_t total_weight_bytes,
 //
 // The buffers are reserved from the unified cache budget and reused across all matmuls.
 bool unified_cache_reserve_onednn_scratch(int device_id, size_t weights_size, size_t activations_size);
+
+// llama.cpp-8ony: the most an op's oneDNN PP scratch pair may be for the ONEDNN zone on `device_id` to count it as
+// planned (zone_onednn_pp_pair_bound over the zone's capacity and the zone-plan snapshot ensure_planned_arena_zones
+// stores: the pair's plan and the Graph SDPA floor the zone was sized from, as one figure). False (and *bound
+// untouched) when there is no cache or no active arena, i.e. no zone exists to plan against. This is the one source
+// for "does an op's pair fit what was planned" (zone_onednn_pp_scratch_planned).
+bool unified_cache_get_onednn_pp_pair_bound(int device_id, size_t * bound);
+
+// llama.cpp-8ony: whether the oneDNN PP scratch may supply a dense op's f16 copies for a weight of `type`
+// (GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH, and the default type set when it is unset). ONE answer for the op arm,
+// the graph-entry walk and the zone-inventory adapter that sizes the dequant plan for the ops the scratch does not
+// supply; the backend must not keep a copy.
+bool onednn_pp_unified_scratch_enabled(ggml_type type);
 
 struct pp_moe_onednn_scratch_result {
     uint32_t   slot            = std::numeric_limits<uint32_t>::max();

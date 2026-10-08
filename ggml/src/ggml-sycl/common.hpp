@@ -14,6 +14,7 @@
 #define GGML_SYCL_COMMON_HPP
 
 #include "alloc-registry.hpp"
+#include "cpu-dispatch-buffers.hpp"
 #include "dpct/helper.hpp"
 #include "ggml-sycl.h"
 #include "graph-prestage-decline-memo.hpp"
@@ -22,16 +23,20 @@
 #include "layer-streaming.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
+#include "moe-decode-hostpath.hpp"
+#include "moe-graph-preload-stamp.hpp"
 #include "moe-graph-retention.hpp"
 #include "moe-layer-plan.hpp"
 #include "moe-route-table.hpp"
 #include "orchestrator.hpp"
 #include "presets.hpp"
 #include "q8-dense-layout-rule.hpp"
+#include "soa-reorder-types.hpp"
 #include "sycl-kernel-profiler.hpp"
 #include "sycl_hw.hpp"
 #include "tensor-types.hpp"
 #include "unified-cache.hpp"
+#include "unified-types.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1646,22 +1651,7 @@ bool          ggml_sycl_cpu_offload_available();
 sycl::queue * ggml_sycl_get_cpu_queue();
 
 // CPU dispatch buffer pool: pre-allocated quantization buffers to eliminate per-token resize()
-struct cpu_dispatch_buffers {
-    std::vector<uint8_t> src1_q;      // Quantization buffer: max M * max_q_row_size
-    std::vector<float>   accs;        // Accumulator buffer: reused as __m256* via reinterpret_cast
-    std::vector<float>   scratch_nk;  // Weight dequantization buffer: max N * K
-
-    // Note: accs is reinterpreted as __m256 array. Since we only use _mm256_setzero_ps()
-    // and array indexing (no aligned load/store), alignment is not critical.
-
-    // Initialize buffers based on model dimensions
-    void init(size_t max_m, size_t max_n, size_t max_k, size_t max_q_row_size) {
-        src1_q.resize(max_m * max_q_row_size);
-        // __m256 is 32 bytes = 8 floats; allocate for max chunk4 (256 + max_m) accumulators
-        accs.resize((256 + max_m) * 8);  // Conservative upper bound: 256 stack + max_m heap
-        scratch_nk.resize(max_n * max_k);
-    }
-};
+// struct cpu_dispatch_buffers lives in cpu-dispatch-buffers.hpp (pure std, host-testable).
 
 // Per-thread buffer pool for CPU dispatch quantization
 // Declared here, defined in cpu-dispatch.cpp to avoid ODR violations
@@ -1705,7 +1695,8 @@ struct layout_policy {
         }
 
         // Attention/FFN weights: COALESCED for best TG performance (tile-based warp-aligned access).
-        // Types that don't support coalesced fall through to the default SOA path below.
+        // Types that don't support coalesced fall through to the default path below (SOA when the type has
+        // an AOS->SOA reorder, AOS otherwise).
         //
         // Phase E (XMX-RESIZE): when GGML_SYCL_SKIP_ONEDNN_Q4_0=1 is set, Q4_0 PP
         // is routed through the unified XMX kernel which expects SOA or AOS weights
@@ -1713,6 +1704,10 @@ struct layout_policy {
         // unified kernel dispatch guard at ggml-sycl.cpp:31236 does not skip them.
         // TG path still works via MMVQ/DMMV SOA kernels (~77 t/s, slightly under
         // COALESCED's 81 t/s — acceptable cost for unlocking unified XMX PP).
+        // This reads GGML_SYCL_SKIP_ONEDNN_Q4_0 for a LAYOUT question and is not the PP admission's term: the
+        // admission (ggml_sycl_onednn_pp_type_admitted, ggml-sycl.cpp) is "enabled && !skip", this is the knob alone,
+        // so with GGML_SYCL_ONEDNN_PP=0 and no skip the admission refuses and the layout is untouched. The opt-in
+        // stays one variable parsed the same way at both sites (non-zero integer).
         static int skip_onednn_q4_0_cached = -1;
         if (skip_onednn_q4_0_cached < 0) {
             const char * env        = std::getenv("GGML_SYCL_SKIP_ONEDNN_Q4_0");
@@ -1782,8 +1777,11 @@ struct layout_policy {
             if (qtype == GGML_TYPE_Q8_0 && is_coalesced_supported(qtype)) {
                 return GGML_LAYOUT_COALESCED;
             }
+            // SOA only where the fill has a reorder for the type (soa-reorder-types.hpp); the runtime
+            // clamps every other quantized type to AOS, so planning SOA for it plans a layout nothing
+            // materializes (llama.cpp-76os).
             if (ggml_is_quantized(qtype)) {
-                return GGML_LAYOUT_SOA;
+                return ggml_sycl_soa_reorder_supported_type(qtype) ? GGML_LAYOUT_SOA : GGML_LAYOUT_AOS;
             }
         }
 
@@ -1824,8 +1822,10 @@ struct layout_policy {
             return GGML_LAYOUT_AOS;
         }
 
-        // Default: SOA is safe for all quantized types
-        return GGML_LAYOUT_SOA;
+        // Default: SOA where the type has an AOS->SOA reorder, AOS otherwise. This default used to say
+        // "SOA is safe for all quantized types", which planned SOA for IQ*/Q2_0 expert weights while
+        // ggml_sycl_adjust_layout_for_tensor clamped them to AOS (llama.cpp-76os).
+        return ggml_sycl_soa_reorder_supported_type(qtype) ? GGML_LAYOUT_SOA : GGML_LAYOUT_AOS;
     }
 
     static layout_mode get_with_override(ggml_type qtype, tensor_usage usage, int device_id = -1) {
@@ -2018,18 +2018,8 @@ bool ggml_sycl_reorder_enabled();
 // Check if a tensor type supports coalesced memory layout conversion
 // Add new types here as coalesced kernels are implemented
 inline bool is_coalesced_supported(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q4_0:
-            return true;
-        case GGML_TYPE_Q6_K:
-            return true;
-        case GGML_TYPE_Q8_0:
-            return true;
-        case GGML_TYPE_MXFP4:
-            return true;
-        default:
-            return false;
-    }
+    // The one list lives in unified-types.hpp: the zone planner asks its complement.
+    return ggml_sycl::coalesced_capable_type(type);
 }
 
 // =============================================================================
@@ -2450,6 +2440,11 @@ sycl::event ggml_sycl_pp_stage_transfer(int          src_device,
 // drift apart. Definitions live in ggml-sycl.cpp; see
 // ggml_sycl_dense_woq_alternate_eligible's own comment for the history.
 bool   ggml_sycl_dense_woq_alternate_eligible(ggml_type type, bool is_contiguous);
+
+// llama.cpp-8ony: the environment-level terms of the oneDNN PP admission for a weight of `type` (GGML_SYCL_ONEDNN_PP
+// and GGML_SYCL_SKIP_ONEDNN_Q4_0). Defined next to ggml_sycl_onednn_pp_candidate, which asks the same two gates; the
+// planner calls it because it cannot see that TU's statics.
+bool   ggml_sycl_onednn_pp_type_admitted(ggml_type type);
 // Same predicate, with placement safety judged for `plan` rather than the current global
 // plan -- the planner's form, since the plan it is building is not global yet.
 bool   ggml_sycl_dense_woq_alternate_eligible_for_plan(ggml_type                         type,
@@ -3805,6 +3800,28 @@ struct ggml_tensor_extra_gpu_weight_ext {
         return nullptr;
     }
 
+    // Every layout expert_id has a published record in on owner_device: what
+    // the unified cache materialized, read from the records themselves.
+    void moe_storage_layouts_on_device(int expert_id, int owner_device, std::vector<int> & layouts) const {
+        layouts.clear();
+        if (expert_id < 0) {
+            return;
+        }
+        for (const auto & kv : moe_expert_storage_handles) {
+            if (static_cast<uint32_t>(kv.first) != static_cast<uint32_t>(expert_id)) {
+                continue;
+            }
+            for (const moe_expert_storage_record & record : kv.second) {
+                const auto resolved = record.handle.resolve();
+                const int  owner    = resolved.on_device ? record.handle.device() : ggml_sycl::mem_handle::HOST_DEVICE;
+                if (owner == owner_device) {
+                    layouts.push_back(static_cast<int>(kv.first >> 32));
+                    break;
+                }
+            }
+        }
+    }
+
     bool forget_moe_storage_handle_on_device(int expert_id, ggml_layout_mode layout, int owner_device) {
         if (expert_id < 0) {
             return false;
@@ -3954,9 +3971,18 @@ struct ggml_tensor_extra_gpu_weight_ext {
     uint64_t                           moe_full_local_probe_generation[GGML_SYCL_MAX_DEVICES]          = {};
     ggml_layout_mode                   moe_full_local_probe_layout[GGML_SYCL_MAX_DEVICES]              = {};
     bool                               moe_full_local_probe_ok[GGML_SYCL_MAX_DEVICES]                  = {};
+    // Batch-1 decode direct-dispatch eligibility and layout, per device; see
+    // moe-decode-hostpath.hpp (llama.cpp-yx28).
+    ggml_sycl::moe_decode_direct_stamp moe_decode_direct[GGML_SYCL_MAX_DEVICES];
     uint64_t                           moe_planned_layout_generation[GGML_SYCL_MAX_DEVICES][2][2]      = {};
     ggml_layout_mode                   moe_planned_layout_cache[GGML_SYCL_MAX_DEVICES][2][2]           = {};
     bool                               moe_planned_layout_valid[GGML_SYCL_MAX_DEVICES][2][2]           = {};
+    // Outcome of the MoE graph preload for this tensor, per device; see moe-graph-preload-stamp.hpp.
+    ggml_sycl::moe_graph_preload_stamp moe_graph_preload[GGML_SYCL_MAX_DEVICES];
+    // Prompt epoch whose post-prompt work this tensor has done, per device: the down-layout preparation before
+    // decode, and the PP->TG refresh. See moe_post_prompt_work_due().
+    uint64_t                           moe_post_prompt_prepared_epoch[GGML_SYCL_MAX_DEVICES]  = {};
+    uint64_t                           moe_post_prompt_refreshed_epoch[GGML_SYCL_MAX_DEVICES] = {};
     // Per-device cached MoE expert route table (perf-recovery epic, track B,
     // llama.cpp-1tjn). Built once per (plan_generation, expert_storage_generation)
     // pair and consumed read-only by decode dispatch instead of re-resolving
@@ -4450,6 +4476,14 @@ struct ggml_tensor_extra_gpu {
                                                                         ggml_layout_mode layout,
                                                                         int              owner_device) const {
         return weight_ext ? weight_ext->find_moe_storage_handle_on_device(expert_id, layout, owner_device) : nullptr;
+    }
+
+    void moe_storage_layouts_on_device(int expert_id, int owner_device, std::vector<int> & layouts) const {
+        if (weight_ext) {
+            weight_ext->moe_storage_layouts_on_device(expert_id, owner_device, layouts);
+        } else {
+            layouts.clear();
+        }
     }
 
     bool forget_moe_storage_handle_on_device(int expert_id, ggml_layout_mode layout, int owner_device) {
@@ -5000,11 +5034,15 @@ inline const void * ggml_sycl_host_data(const ggml_tensor * tensor) {
     return tensor ? tensor->data : nullptr;
 }
 
-// llama.cpp-kmeq: pure predicate, no allocation -- true iff a BF16->F32
-// materialization route (ggml_sycl_bf16_weight_materialize_f32, in
-// ggml-sycl.cpp) could be used for this tensor on this device.
-// ggml_backend_sycl_device_supports_op() calls this and must never allocate
-// or mutate cache state from inside it.
+// llama.cpp-kmeq / llama.cpp-9qjy: pure predicate, no allocation -- the weight half of
+// the native BF16 route (ggml_sycl_bf16_weight_native_route_available, in ggml-sycl.cpp,
+// adds the kernel's shape contract, the buffer-class decline and the placement checks).
+// True iff this tensor is a named, contiguous BF16 weight. It deliberately does NOT look
+// at tensor->data: the executor reads the device copy the planner materialized, never the
+// host mapping, so a weight whose host bytes are gone (or never mapped) is still runnable.
+// Whether the device bytes exist is the placement checks' and the executor's question.
+// ggml_backend_sycl_device_supports_op() calls it and must never allocate or mutate
+// cache state from inside it.
 //
 // Declared inline here (not `static` in ggml-sycl.cpp) specifically so a
 // host-side test can call the SAME function production dispatch uses,
@@ -5013,12 +5051,9 @@ inline const void * ggml_sycl_host_data(const ggml_tensor * tensor) {
 // re-implementing the predicate's logic and drifting from it. See
 // tests/test-sycl-tensor-usage.cpp for the coverage.
 //
-// Requires ggml_is_contiguous(): the materialize path treats tensor->data
-// as a flat, packed run of n = ggml_nelements(tensor) BF16 values
-// (ggml_bf16_to_fp32_row / the on-device conversion kernel both index
-// linearly), and the retyped F32 copy's nb[] is recomputed from ne[]
-// assuming that same packed layout. A permuted or viewed BF16 weight would
-// silently read/produce wrong strides -- a wrong answer, not a decline --
+// Requires ggml_is_contiguous(): the native kernel (mul-mat-bf16.hpp) indexes the
+// weight as M packed rows of K BF16 values. A permuted or viewed BF16 weight would
+// silently read wrong strides -- a wrong answer, not a decline --
 // so decline it here and let it fall back to CPU exactly as an
 // unclassified BF16 weight did before this fix existed. No supported
 // architecture currently creates a non-contiguous BF16 weight tensor, so
@@ -5026,7 +5061,7 @@ inline const void * ggml_sycl_host_data(const ggml_tensor * tensor) {
 // one that might.
 inline bool ggml_sycl_bf16_weight_dispatch_available(const ggml_tensor * tensor, int device) {
     return tensor && tensor->type == GGML_TYPE_BF16 && device >= 0 && ggml_sycl_tensor_is_weight(tensor) &&
-           tensor->name[0] != '\0' && ggml_is_contiguous(tensor) && ggml_sycl_host_data(tensor) != nullptr;
+           tensor->name[0] != '\0' && ggml_is_contiguous(tensor);
 }
 
 inline void * ggml_sycl_resolve_or_host_tensor_ptr(const ggml_tensor * tensor, int device) {
@@ -5231,11 +5266,6 @@ inline bool ggml_sycl_unified_dispatch_env_enabled() {
         enabled          = (env == nullptr || std::atoi(env) != 0) ? 1 : 0;
     }
     return enabled != 0;
-}
-
-inline bool ggml_sycl_should_use_unified_type(ggml_type type) {
-    // Mirror ggml_sycl::should_use_unified() without pulling in dispatch.hpp
-    return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_MXFP4;
 }
 
 // Forward declaration of unified resolve (defined below).
@@ -6364,10 +6394,19 @@ struct ggml_backend_sycl_context {
     // (one shape, forever) scans once instead of every call.
     uint64_t exec_graph_last_scanned_hash   = 0;
     bool     exec_graph_has_scanned         = false;
-    bool     moe_graphs_disabled      = false;  // Set when MoE preload fails; disables graphs for all splits
+    bool     moe_graphs_disabled      = false;  // Set when a MoE graph epoch retire fails; quarantines graph replay
     bool     moe_graphs_disabled_once = false;  // Set when we skip graphs for a single run
     bool     moe_graph_rerecord       = false;  // Once set, never cleared — MoE models always re-record per token
     bool     graph_recording_dispatch = false;  // Context-scoped guard while compute_impl records a command graph
+
+    // Set per graph_compute call: the MoE preload of THIS split was refused under its tensors' current expert
+    // residency (moe-graph-preload-stamp.hpp), so this split runs direct. A residency change re-opens it.
+    bool moe_graph_preload_refused = false;
+
+    // Phase of the last split this context classified. A split with no matmul has no batch evidence and keeps it
+    // (graph-phase.hpp). Atomic because the classification runs before graph_mutex is taken.
+    std::atomic<bool> graph_phase_is_decode{ false };
+
     uint64_t test_graph_replay_count  = 0;
 
     // One published retention epoch owns every MMID graphlet currently cached

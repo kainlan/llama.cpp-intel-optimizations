@@ -6,14 +6,19 @@ from collections import Counter
 from pathlib import Path
 from typing import Set, Tuple
 
+from sycl_dense_type_list import with_dense_type_list_inlined
+
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PATH = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
-SOURCE = SOURCE_PATH.read_text(encoding="utf-8")
-FUNCTION_START = "static bool ggml_backend_sycl_device_supports_op("
+SOURCE_RAW = SOURCE_PATH.read_text(encoding="utf-8")
+SOURCE = with_dense_type_list_inlined(SOURCE_RAW)
+# supports_op is the thin wrapper `impl(dev, op, true)`; the decisions live in the impl, whose `placement_declines`
+# parameter is what ggml_backend_sycl_supports_op_capability turns off.
+FUNCTION_START = "static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op, bool placement_declines) {"
 FUNCTION_END = "static bool ggml_backend_sycl_device_supports_buft("
 EARLY_GUARD = "if (op->op == GGML_OP_ADD_ID || op->op == GGML_OP_MUL_MAT_ID) {"
 ROUTER_FLAG = "const bool is_multi_gpu_router_logits ="
-PLANNER_GUARD = "if (!is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {"
+PLANNER_GUARD = "if (placement_declines && !is_multi_gpu_router_logits && ggml_sycl_op_is_planned_on_host(op, device)) {"
 OP_SWITCH = "switch (op->op) {"
 # The KV-host-tier residency decline (llama.cpp-uize/h56y, TKV-13 host attention dispatch) runs before the
 # indexed-MoE early return. It is pinned verbatim, comments aside, rather than waved through: it may only ever
@@ -24,7 +29,7 @@ OP_SWITCH = "switch (op->op) {"
 # KV-host dst, so it still cannot hold for ADD_ID/MUL_MAT_ID; the one narrowing (a KV-host Q or mask is declined,
 # as the funnel intercept already did) only removes acceptances.
 KV_HOST_RESIDENCY_BLOCK = """
-    if (ggml_sycl_tensor_is_in_kv_host_buft(op)) {
+    if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op)) {
         if (!(op->op == GGML_OP_SET_ROWS && ggml_sycl_node_is_host_dispatched(op))) {
             if (g_ggml_sycl_debug) {
                 g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
@@ -38,7 +43,7 @@ KV_HOST_RESIDENCY_BLOCK = """
         }
     }
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
+        if (placement_declines && ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
             if (ggml_sycl_node_is_host_dispatched(op)) {
                 if (g_ggml_sycl_debug) {
                     g_sycl_attn_host_accept_count.fetch_add(1, std::memory_order_relaxed);
@@ -66,7 +71,7 @@ EXPECTED_PRE_INDEXED_GUARD_PREFIX = (
 TYPE_HELPER_START = "static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {"
 TYPE_HELPER_END = FUNCTION_START
 MUL_MAT_TYPE_ORDER = (
-    "F32", "F16", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "MXFP4",
+    "F32", "F16", "Q2_0", "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "MXFP4",
     "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ1_S", "IQ1_M",
     "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS",
 )
@@ -183,11 +188,11 @@ def expected_pre_guard_decisions():
         ("if", "a_type==GGML_TYPE_Q4_1&&b->ne[1]==1", reject),
         ("if", "a_type==GGML_TYPE_IQ4_NL||a_type==GGML_TYPE_IQ4_XS||a_type==GGML_TYPE_IQ3_XXS||a_type==GGML_TYPE_IQ3_S||a_type==GGML_TYPE_IQ2_XXS||a_type==GGML_TYPE_IQ2_XS||a_type==GGML_TYPE_IQ2_S||a_type==GGML_TYPE_IQ1_S||a_type==GGML_TYPE_IQ1_M", (("if", "b->ne[1]==1&&ggml_nrows(b)>1", reject),)),
         ("statement", "ggml_typesrc0_type=op->src[0]->type"),
-        # llama.cpp-kmeq: a BF16 WEIGHT is materialised to F32 once and then runs the supported dense path, so
-        # BF16 is admitted exactly when that route is available for this tensor and refused otherwise. The
-        # admission reuses the dispatch-side predicate (same composed check), so the two cannot drift apart.
+        # llama.cpp-9qjy: a BF16 WEIGHT runs natively from the BF16 bytes the planner placed, so BF16 is admitted
+        # exactly when that route is available for this op and refused otherwise. The admission reuses the
+        # executor's own predicate (same composed check), so the two cannot drift apart.
         ("if", "src0_type==GGML_TYPE_BF16", (
-            ("if", "ggml_sycl_bf16_weight_materialize_route_available(op->src[0],device)", (("return", "true"),)),
+            ("if", "ggml_sycl_bf16_weight_native_route_available(op->src[0],op->src[1],op,device)", (("return", "true"),)),
             ("return", "false"),
         )),
         ("if", "ggml_is_permuted(a)&&!ggml_is_contiguous(a)&&a->ne[2]>1&&a->ne[3]>1&&src0_type==GGML_TYPE_F16", reject),
@@ -499,7 +504,8 @@ def test_removing_only_early_return_is_rejected() -> None:
 
 def test_reopening_early_guard_to_unconditional_admission_is_rejected() -> None:
     # The pre-b10630 form admitted every expert type into the MoE executor;
-    # q2_0 MMID then computed ERR ~90 wrong answers. Stripping the type guard
+    # q2_0 MMID then computed ERR ~90 wrong answers (it had no SYCL kernel; it has
+    # one since llama.cpp-s36q phase 4, so tq2_0 stands in below). Stripping the type guard
     # back to a bare `return true;` body must fail the contract.
     function = supports_function(SOURCE)
     _, _, early_body = braced_body(function, EARLY_GUARD)
@@ -509,13 +515,14 @@ def test_reopening_early_guard_to_unconditional_admission_is_rejected() -> None:
 
 
 def test_widening_type_guard_exemptions_is_rejected() -> None:
-    # Adding another exempt type (here q2_0) reopens the wrong-answer path.
+    # Adding another exempt type (here tq2_0, which has no SYCL kernel) reopens the
+    # wrong-answer path.
     function = supports_function(SOURCE)
     _, _, early_body = braced_body(function, EARLY_GUARD)
     assert EARLY_TYPE_GUARD in early_body
     widened = early_body.replace(
         "indexed_a_type != GGML_TYPE_NVFP4",
-        "indexed_a_type != GGML_TYPE_NVFP4 && indexed_a_type != GGML_TYPE_Q2_0",
+        "indexed_a_type != GGML_TYPE_NVFP4 && indexed_a_type != GGML_TYPE_TQ2_0",
         1,
     )
     assert not contract(replace_in_supports_function(SOURCE, early_body, widened))

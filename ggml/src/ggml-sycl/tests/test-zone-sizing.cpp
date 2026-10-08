@@ -22,6 +22,7 @@
 //
 
 #include "compute-alloc-scope.hpp"
+#include "unified-types.hpp"
 #include "zone-sizing.hpp"
 
 #include <cstdio>
@@ -40,6 +41,7 @@
     } while (0)
 
 using ggml_sycl::path_scoped_maxima;
+using ggml_sycl::zone_onednn_plan;
 using ggml_sycl::zone_scoped_maxima;
 using ggml_sycl::zone_tensor_desc;
 
@@ -704,6 +706,507 @@ int main() {
         CHECK(m.dequant_f16_src1_bytes_per_token == 20480, "the widest marked K");
         CHECK(zone_scoped_maxima(std::vector<zone_tensor_desc>()).dequant_f16_weight_bytes == 0,
               "an empty inventory plans no dequant scratch");
+    }
+
+    // ---- Case 14a: oneDNN PP scratch admission (llama.cpp-8ony) ---------------
+    // GPT-OSS 20B on the B50, perplexity -c 512 -ub 512: the ONEDNN zone is 256 MiB and the LM head
+    // (output.weight, Q8_0 2880 x 201088) wants a 1104.6 MiB f16 weight copy plus 256 x 2880 f16 activations.
+    // The head is outside the ONEDNN zone's sizing and inside the RUNTIME dequant plan, so it must not be
+    // sent to the oneDNN scratch: the arena refuses to grow the zone once weights are resident.
+    {
+        const size_t zone_256mib = 256u * 1024u * 1024u;
+        const size_t head_w      = 1158266880;  // 2880 x 201088 x 2
+        const size_t head_a      = 1474560;     // 256 x 2880 x 2
+        const size_t attn_w      = 23592960;    // 2880 x 4096 x 2
+        const size_t attn_a      = 2949120;     // 512 x 2880 x 2
+
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, zone_256mib, attn_w, attn_a),
+              "a per-layer attention weight fits the 256 MiB ONEDNN zone");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, zone_256mib, head_w, head_a),
+              "the LM head does not fit the ONEDNN zone, so it is not planned there");
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(false, 0, head_w, head_a),
+              "with no arena there is no zone to disagree with: the unified-cache path serves it");
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, 100, 60, 40), "a pair that exactly fills the zone fits");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, 100, 60, 41), "one byte over the zone does not fit");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, 0, 1, 1), "an empty zone holds nothing");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, SIZE_MAX, SIZE_MAX, 2),
+              "an overflowing pair is refused, not wrapped into a small sum");
+    }
+
+    // ---- Case 14b: a smaller request never shrinks a held oneDNN scratch (llama.cpp-8ony) ----
+    // Perplexity chunk 2, layer 0: a 512-row attention op (weights 23.6 MB, activations 2.9 MB) arrived while the
+    // cache held the LM head's pair (weights 1104.6 MiB, activations 1.4 MB for 256 rows). Replacing the pair by
+    // the request freed the big weights block; the head then had to regrow it and could not.
+    {
+        const size_t mib = 1024u * 1024u;
+        size_t       w   = 0;
+        size_t       a   = 0;
+
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 0, 0, 0, 0, 24 * mib, 3 * mib, &w, &a);
+        CHECK(w == 24 * mib && a == 3 * mib, "nothing held: the request is the target");
+
+        ggml_sycl::zone_onednn_scratch_reserve_target(false, 0, 1105 * mib, 1 * mib, 0, 0, 24 * mib, 3 * mib, &w, &a);
+        CHECK(w == 1105 * mib, "a smaller weights request never shrinks the held weights block");
+        CHECK(a == 3 * mib, "a larger activations request still grows the activations half on its own");
+
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 100 * mib, 2 * mib, 0, 0, 50 * mib, 3 * mib, &w,
+                                                      &a);
+        CHECK(w == 100 * mib && a == 3 * mib, "inside the zone the merged pair is the target");
+
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 200 * mib, 2 * mib, 0, 0, 50 * mib, 100 * mib,
+                                                      &w, &a);
+        CHECK(w == 50 * mib && a == 100 * mib,
+              "a merge that would overflow the zone falls back to the request instead of wedging every op");
+
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, SIZE_MAX, 1, 0, 0, 50 * mib, 3 * mib, &w, &a);
+        CHECK(w == 50 * mib && a == 3 * mib, "an unrepresentable merged sum is refused, not wrapped");
+
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 1, 1, 0, 0, 2, 2, nullptr, nullptr);
+    }
+
+    // ---- Case 14c: the oneDNN scratch supplies an op only when its type is enabled too (llama.cpp-8ony) -----
+    // acquire_onednn_pp_scratch also turns away every type but Q4_0 / Q8_0 / MXFP4 (unless the env var forces it),
+    // and every type under GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH=0. The graph-entry walk skipped an op on admission
+    // plus plan alone, so a Q6_K op (Qwen3.5-9B-UD-Q6_K_XL, Mistral Q4_K_M) was skipped by the walk and refused by
+    // acquire, then drew a planned dequant buffer nothing had sized.
+    {
+        const size_t zone_256mib = 256u * 1024u * 1024u;
+        const size_t attn_w      = 23592960;
+        const size_t attn_a      = 2949120;
+
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_type_enabled(-1, true), "unset: Q4_0 / Q8_0 / MXFP4 are enabled");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_type_enabled(-1, false), "unset: a K-quant type is not enabled");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_type_enabled(0, true), "=0 turns the scratch off for every type");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_type_enabled(0, false), "=0: a K-quant stays off");
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_type_enabled(1, false), "=1 enables a K-quant type too");
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_type_enabled(1, true), "=1 keeps the default types on");
+
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_supplies(true, true, true, zone_256mib, attn_w, attn_a),
+              "an admitted, enabled, planned op is supplied by the scratch");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(true, false, true, zone_256mib, attn_w, attn_a),
+              "an op whose type is not enabled is NOT supplied, so the walk must size its planned dequant buffers");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(true, false, false, 0, attn_w, attn_a),
+              "type refusal holds with no arena too");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(false, true, true, zone_256mib, attn_w, attn_a),
+              "an op that fails the PP admission is not supplied");
+        CHECK(!ggml_sycl::zone_onednn_pp_scratch_supplies(true, true, true, zone_256mib, 1158266880, 1474560),
+              "an enabled op whose pair is over the zone is not supplied");
+        CHECK(ggml_sycl::zone_onednn_pp_scratch_supplies(true, true, true, 100, 60, 40),
+              "a pair that exactly fills the zone is supplied");
+    }
+
+    // ---- Case 14d: the unified kernel's oneDNN f16 route draws the planned dequant buffers (llama.cpp-8ony) ----
+    // A Q4_0 / MXFP4 dense op the unified kernel serves, outside a layer group (an LM head or tied embedding) with
+    // a pair over the ONEDNN zone: acquire refuses it, the route fell back to a per-op pool copy of the whole
+    // weight, and the walk never counted it (a unified-served node was "not counted").
+    {
+        CHECK(ggml_sycl::zone_unified_pp_draws_dequant(true, true, true, true, false),
+              "an over-zone unified-served op draws the planned dequant buffers");
+        CHECK(!ggml_sycl::zone_unified_pp_draws_dequant(true, true, true, true, true),
+              "a unified-served op the scratch supplies draws nothing from them");
+        CHECK(!ggml_sycl::zone_unified_pp_draws_dequant(false, true, true, true, false),
+              "a node the router did not send to the unified kernel is the legacy route's business");
+        CHECK(!ggml_sycl::zone_unified_pp_draws_dequant(true, false, true, true, false),
+              "a type the unified kernel does not serve never reaches its oneDNN f16 route");
+        CHECK(!ggml_sycl::zone_unified_pp_draws_dequant(true, true, false, true, false),
+              "a non-plain src1 skips the unified route's f16 arm");
+        CHECK(!ggml_sycl::zone_unified_pp_draws_dequant(true, true, true, false, false),
+              "an op that fails the PP admission never takes the f16 arm");
+    }
+
+    // ---- Case 14e: the walk asks the unified route before it filters on precision (llama.cpp-8ony) -----------------
+    // The unified kernel's oneDNN f16 route has no precision check, the legacy f16 arm requires GGML_PREC_DEFAULT.
+    // A Q4_0 / MXFP4 node with GGML_PREC_F32 (a GLM4 attention output) that the scratch does not supply takes the
+    // unified route and draws the planned buffers, so the walk must count it.
+    {
+        CHECK(ggml_sycl::zone_walk_f16_node_draws(true, true, false), "a default-precision legacy node draws");
+        CHECK(ggml_sycl::zone_walk_f16_node_draws(true, false, true), "a default-precision unified node draws");
+        CHECK(!ggml_sycl::zone_walk_f16_node_draws(true, false, false), "a node no route draws for draws nothing");
+        CHECK(!ggml_sycl::zone_walk_f16_node_draws(false, true, false),
+              "a legacy-route node with another precision is not on the legacy f16 arm");
+        CHECK(ggml_sycl::zone_walk_f16_node_draws(false, false, true),
+              "a unified-route node draws whatever its precision: Route A has no precision check");
+        CHECK(ggml_sycl::zone_walk_f16_node_draws(false, true, true), "either arm that draws counts the node");
+    }
+
+    // ---- Case 14f: the pair bound leaves the Graph SDPA floor free, and never drops below the plan (llama.cpp-8ony) --
+    // The ONEDNN zone is max(256 MiB, plan + floor), so capacity can sit far above plan + floor. A pair is
+    // planned up to capacity - floor (slack nobody else reserved), never below the plan, never above the capacity.
+    {
+        const size_t mib = 1024u * 1024u;
+        // (a) a small-model head (stories15M class): plan ~2 MB, head pair ~19 MB, floor ~10 MB, the 256 MiB zone.
+        {
+            const size_t bound = ggml_sycl::zone_onednn_pp_pair_bound(256 * mib, 2 * mib, 10 * mib);
+            CHECK(bound == 246 * mib, "small model: the bound is capacity minus the floor, well above the plan");
+            CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, 18 * mib, 1 * mib),
+                  "small model: a 19 MB head pair fits the slack, so it stays supplied by the scratch");
+        }
+        // (b) the Mistral head window: plan 143.5 MB, floor ~33 MB, capacity 256 MiB, head pair 266 MB.
+        {
+            const size_t plan  = 150470656;  // 143.5 MiB
+            const size_t floor = 34603008;   // 33 MiB
+            const size_t bound = ggml_sycl::zone_onednn_pp_pair_bound(256 * mib, plan, floor);
+            CHECK(bound == 256 * mib - floor, "Mistral: the bound is capacity minus the floor");
+            CHECK(!ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, 262144000, 4194304),
+                  "Mistral: a 266 MB head pair would eat the Graph SDPA floor, so it is not supplied");
+            CHECK(ggml_sycl::zone_onednn_pp_scratch_planned(true, bound, 117440512, 4194304),
+                  "Mistral: a per-layer pair (the plan's own op) is still supplied");
+        }
+        // (c) a clamped zone: capacity - floor falls under the plan, so the bound is exactly the plan.
+        {
+            CHECK(ggml_sycl::zone_onednn_pp_pair_bound(100 * mib, 80 * mib, 50 * mib) == 80 * mib,
+                  "clamped zone: the bound is the plan itself, not capacity minus the floor");
+            CHECK(ggml_sycl::zone_onednn_pp_pair_bound(100 * mib, 80 * mib, 20 * mib) == 80 * mib,
+                  "equal reading: capacity minus the floor equals the plan");
+        }
+        // edges
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(100 * mib, 20 * mib, 0) == 100 * mib,
+              "no floor: the whole capacity");
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(10 * mib, 80 * mib, 50 * mib) == 10 * mib,
+              "never above the capacity, even when the plan is");
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(100 * mib, 20 * mib, 500 * mib) == 20 * mib,
+              "a floor larger than the capacity leaves the plan, with no wrapped subtraction");
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(SIZE_MAX, 0, SIZE_MAX) == 0, "a saturated floor leaves nothing");
+    }
+
+    // ---- Case 14g: the dequant plan covers the ops the oneDNN PP scratch will not supply (llama.cpp-8ony) ----------
+    // Mistral Q4_0 under the default scratch: the per-layer weights are the ONEDNN zone's own plan and are supplied by
+    // the scratch, but the LM head is outside that plan and (over the pair bound) draws the dequant buffers; with
+    // GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH=0 every dense Q4_0 op draws them. Both used to allocate with planned=0.
+    {
+        CHECK(!ggml_sycl::zone_dequant_f16_planned_when_unsupplied(true, true),
+              "an enabled type's per-layer weight is the zone's own plan: supplied, nothing for the dequant plan");
+        CHECK(ggml_sycl::zone_dequant_f16_planned_when_unsupplied(true, false),
+              "a weight the zone was not sized for (the LM head) is planned into the dequant buffers");
+        CHECK(ggml_sycl::zone_dequant_f16_planned_when_unsupplied(false, true),
+              "a type the scratch is off for draws the dequant buffers even when it is a per-layer weight");
+        CHECK(ggml_sycl::zone_dequant_f16_planned_when_unsupplied(false, false), "neither: planned");
+
+        const size_t layer_w = 117440512;  // 4096 x 14336 f16
+        const size_t head_w  = 262144000;  // 4096 x 32000 f16
+        auto         marked  = [&](const char * name, int64_t ne0, int64_t ne1, size_t f16_w, bool enabled) {
+            zone_tensor_desc d                               = desc(name, 1000, TYPE_Q4_0, ne0, ne1, 1, 1);
+            d.dequant_f16_if_unsupplied_weight_bytes         = f16_w;
+            d.dequant_f16_if_unsupplied_src1_bytes_per_token = static_cast<size_t>(ne0) * F16_BYTES;
+            d.pp_scratch_type_enabled                        = enabled;
+            return d;
+        };
+        std::vector<zone_tensor_desc> layers;
+        for (int i = 0; i < 4; i++) {
+            layers.push_back(marked("blk.0.ffn_gate.weight", 4096, 14336, layer_w, true));
+        }
+        CHECK(zone_scoped_maxima(layers).dequant_f16_weight_bytes == 0 &&
+                  zone_scoped_maxima(layers).dequant_f16_src1_bytes_per_token == 0,
+              "default scratch, layer weights only: the zone's plan supplies them all, the dequant plan is empty");
+
+        std::vector<zone_tensor_desc> with_head = layers;
+        with_head.push_back(marked("output.weight", 4096, 32000, head_w, true));
+        const path_scoped_maxima mh = zone_scoped_maxima(with_head);
+        CHECK(mh.dequant_f16_weight_bytes == head_w, "the LM head is the dequant plan's weight copy");
+        CHECK(mh.dequant_f16_src1_bytes_per_token == 4096 * F16_BYTES, "and its activation row");
+
+        std::vector<zone_tensor_desc> off;
+        for (int i = 0; i < 4; i++) {
+            off.push_back(marked("blk.0.ffn_gate.weight", 4096, 14336, layer_w, false));
+        }
+        CHECK(zone_scoped_maxima(off).dequant_f16_weight_bytes == layer_w,
+              "scratch off: the layer weights draw the dequant buffers, so they size the plan");
+
+        // The unconditional marks (dense Q8_0) still count, and the two sources take the larger.
+        std::vector<zone_tensor_desc> mixed = layers;
+        zone_tensor_desc              q8    = desc("blk.1.attn_q.weight", 1000, TYPE_Q8_0, 6144, 5120, 1, 1);
+        q8.dequant_f16_weight_bytes         = 62914560;
+        q8.dequant_f16_src1_bytes_per_token = 12288;
+        mixed.push_back(q8);
+        CHECK(zone_scoped_maxima(mixed).dequant_f16_weight_bytes == 62914560,
+              "an unconditionally planned Q8_0 weight counts although the Q4_0 layers do not");
+        mixed.push_back(marked("output.weight", 4096, 32000, head_w, true));
+        CHECK(zone_scoped_maxima(mixed).dequant_f16_weight_bytes == head_w, "the larger of the two sources");
+
+        // An expert stack never gets the mark (the adapter excludes it), so an unmarked tensor changes nothing.
+        std::vector<zone_tensor_desc> unmarked = layers;
+        unmarked.push_back(desc("output.weight", 1000, TYPE_Q4_0, 4096, 32000, 1, 1));
+        CHECK(zone_scoped_maxima(unmarked).dequant_f16_weight_bytes == 0, "no mark, no plan");
+    }
+
+    // ---- Case 14j: a row-gather tensor is not a MUL_MAT operand (llama.cpp-8ony) ---------------------------------
+    // token_embd.weight is consumed by GET_ROWS, which draws neither the dequant buffers nor the Q8_1 src1 buffer.
+    // Planned as if it were the head it cost a Q4_0 Mistral a 254 MB RUNTIME zone for nothing. The loader's role for
+    // the tensor decides: a tied embedding that also serves as the output head IS a MUL_MAT operand.
+    {
+        const size_t head_w  = 262144000;  // 4096 x 32000 f16
+        auto         marked  = [&](const char * name, int type, size_t f16_w, bool gather_only) {
+            zone_tensor_desc d                               = desc(name, 1000, type, 4096, 32000, 1, 1);
+            d.dequant_f16_if_unsupplied_weight_bytes         = f16_w;
+            d.dequant_f16_if_unsupplied_src1_bytes_per_token = 4096 * F16_BYTES;
+            d.pp_scratch_type_enabled                        = true;
+            d.mmq_src1_bytes_per_token                       = 4608;
+            d.get_rows_only                                  = gather_only;
+            return d;
+        };
+        std::vector<zone_tensor_desc> layers;
+        for (int i = 0; i < 4; i++) {
+            layers.push_back(desc("blk.0.ffn_gate.weight", 1000, TYPE_Q4_0, 4096, 14336, 1, 1));
+        }
+
+        // (a) Q4_0 token_embd beside a separate Q6_K head: the embedding is gather-only, the head is not a candidate.
+        std::vector<zone_tensor_desc> separate_head = layers;
+        separate_head.push_back(marked("token_embd.weight", TYPE_Q4_0, head_w, true));
+        separate_head.push_back(desc("output.weight", 1000, TYPE_Q6_K, 4096, 32000, 1, 1));
+        const path_scoped_maxima ma = zone_scoped_maxima(separate_head);
+        CHECK(ma.dequant_f16_weight_bytes == 0 && ma.dequant_f16_src1_bytes_per_token == 0,
+              "(a) a gather-only Q4_0 embedding is not planned into the dequant buffers");
+        CHECK(ma.mmq_src1_bytes_per_token == 0, "(a) nor into the Q8_1 src1 buffer");
+
+        // (b) tied: the one token_embd tensor is also the head, so the loader does not call it gather-only.
+        std::vector<zone_tensor_desc> tied = layers;
+        tied.push_back(marked("token_embd.weight", TYPE_Q4_0, head_w, false));
+        const path_scoped_maxima mb = zone_scoped_maxima(tied);
+        CHECK(mb.dequant_f16_weight_bytes == head_w && mb.dequant_f16_src1_bytes_per_token == 4096 * F16_BYTES,
+              "(b) a tied embedding used as the head is planned");
+        CHECK(mb.mmq_src1_bytes_per_token == 4608, "(b) and draws the Q8_1 src1 buffer");
+
+        // (c) a Q4_0 head beside a gather-only Q4_0 embedding: the head alone is the plan.
+        std::vector<zone_tensor_desc> q4_head = layers;
+        q4_head.push_back(marked("token_embd.weight", TYPE_Q4_0, head_w, true));
+        q4_head.push_back(marked("output.weight", TYPE_Q4_0, head_w, false));
+        const path_scoped_maxima mc = zone_scoped_maxima(q4_head);
+        CHECK(mc.dequant_f16_weight_bytes == head_w, "(c) a Q4_0 head is planned");
+
+        // The head's own mark is what carries it: with the head removed, nothing is left to plan.
+        std::vector<zone_tensor_desc> embd_only = layers;
+        embd_only.push_back(marked("token_embd.weight", TYPE_Q4_0, head_w, true));
+        CHECK(zone_scoped_maxima(embd_only).dequant_f16_weight_bytes == 0,
+              "the gather-only embedding alone leaves the plan empty");
+
+        // The unconditional Q8_0 marks are held to the same rule.
+        zone_tensor_desc q8_embd                 = desc("token_embd.weight", 1000, TYPE_Q8_0, 2880, 201088, 1, 1);
+        q8_embd.dequant_f16_weight_bytes         = 1159372800;
+        q8_embd.dequant_f16_src1_bytes_per_token = 2880 * F16_BYTES;
+        q8_embd.get_rows_only                    = true;
+        zone_tensor_desc q8_head                 = q8_embd;
+        q8_head.get_rows_only                    = false;
+        CHECK(zone_scoped_maxima({ q8_embd }).dequant_f16_weight_bytes == 0,
+              "a gather-only Q8_0 embedding is not planned");
+        CHECK(zone_scoped_maxima({ q8_embd, q8_head }).dequant_f16_weight_bytes == 1159372800,
+              "a Q8_0 head beside it still is");
+    }
+
+    // ---- Case 14k: a quantized type no kernel but the f16 dequant arm serves takes it as its PP route (llama.cpp-gldu) ----
+    // The router walks its priority list: a type an MMQ kernel serves is taken by MMQ at PP batch, a type with a
+    // coalesced layout by its coalesced / unified kernel, and what is left (the IQ family) has only the oneDNN dequant
+    // arm. The planner asks the SAME two type lists the router's eligibility terms are built from
+    // (unified-types.hpp), so it claims exactly that remainder; claiming an MMQ type sized the whole plan from the
+    // 1.2 GB f16 copy of a Q5_K LM head on a device run.
+    {
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ4_XS), "IQ4_XS draws the dequant arm");
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ3_S), "IQ3_S draws the dequant arm");
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ4_NL), "IQ4_NL draws the dequant arm");
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ3_XXS), "IQ3_XXS draws the dequant arm");
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_IQ2_XS), "IQ2_XS draws the dequant arm");
+        const ggml_type mmq_types[] = { GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q2_K,
+                                        GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K };
+        for (ggml_type ty : mmq_types) {
+            CHECK(ggml_sycl::mmq_capable_type(ty), "the MMQ list carries the type the router's use_mmq asks about");
+            CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(ty), "an MMQ type is taken by MMQ at PP batch");
+        }
+        CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q8_0), "Q8_0 keeps its own unconditional mark");
+        CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q4_0), "Q4_0 keeps the unified-kernel mark");
+        CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_MXFP4),
+              "MXFP4 is coalesced-capable (and keeps the unified-kernel mark)");
+        CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q6_K),
+              "Q6_K is materialized COALESCED and routed to MMQ_COALESCED");
+        // The composition the adapter calls: type lists, dense-MUL_MAT support, dequant support, head and expert.
+        auto claims = [](ggml_type ty, bool head, bool expert, bool dequant) {
+            return ggml_sycl::aos_dequant_f16_plan_claims(ty, true, head, expert, dequant);
+        };
+        CHECK(claims(GGML_TYPE_IQ3_S, false, false, true), "a dense IQ3_S weight is claimed");
+        CHECK(claims(GGML_TYPE_IQ4_NL, false, false, true), "a dense IQ4_NL weight is claimed");
+        CHECK(!claims(GGML_TYPE_IQ4_XS, true, false, true), "the LM head is not claimed");
+        CHECK(!claims(GGML_TYPE_IQ3_S, false, true, true), "an expert stack is not claimed");
+        CHECK(!claims(GGML_TYPE_IQ3_S, false, false, false), "a type the router cannot dequantize is not claimed");
+        CHECK(!ggml_sycl::aos_dequant_f16_plan_claims(GGML_TYPE_IQ3_S, false, false, false, true),
+              "a non-quantized operand is not claimed");
+        CHECK(!claims(GGML_TYPE_Q5_K, false, false, true) && !claims(GGML_TYPE_Q4_K, false, false, true) &&
+                  !claims(GGML_TYPE_Q2_K, false, false, true) && !claims(GGML_TYPE_Q4_1, false, false, true) &&
+                  !claims(GGML_TYPE_Q5_0, false, false, true),
+              "an MMQ type is not claimed");
+        CHECK(!claims(GGML_TYPE_Q8_0, false, false, true) && !claims(GGML_TYPE_Q4_0, false, false, true) &&
+                  !claims(GGML_TYPE_MXFP4, false, false, true) && !claims(GGML_TYPE_Q6_K, false, false, true),
+              "a coalesced-capable type is not claimed");
+        // SYCL refuses a dense MUL_MAT for these although the router can dequantize them: no copy is reserved.
+        CHECK(!claims(GGML_TYPE_NVFP4, false, false, true), "NVFP4 is refused by SYCL's dense MUL_MAT, so not claimed");
+        CHECK(!claims(GGML_TYPE_Q1_0, false, false, true), "Q1_0 is refused by SYCL's dense MUL_MAT, so not claimed");
+        // Q2_0 left that group when it gained its SYCL kernels (llama.cpp-s36q phase 4): dense Q2_0 is executed, is
+        // neither MMQ-served nor coalesced, and has a to_fp16 converter, so its PP route is the f16 dequant arm.
+        CHECK(ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q2_0), "Q2_0 draws the dequant arm");
+        CHECK(claims(GGML_TYPE_Q2_0, false, false, true), "a dense Q2_0 weight is claimed");
+        CHECK(!claims(GGML_TYPE_Q2_0, false, true, true), "a Q2_0 expert stack is not claimed");
+        CHECK(ggml_sycl::dense_mul_mat_type_supported(GGML_TYPE_IQ4_XS) &&
+                  !ggml_sycl::dense_mul_mat_type_supported(GGML_TYPE_NVFP4),
+              "the dense MUL_MAT list carries the IQ family and not NVFP4");
+        // The set is disjoint from the unified kernel's, so the two marks never double-count one weight.
+        for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+            const ggml_type ty = static_cast<ggml_type>(t);
+            CHECK(!(ggml_sycl::dense_pp_route_is_f16_dequant_arm(ty) && ggml_sycl::unified_kernel_serves_type(ty)),
+                  "no type is both a unified-kernel type and an AOS dequant-arm type");
+        }
+
+        // The adapter marks such a weight through the if-unsupplied fields (scratch off for its type by default),
+        // so it sizes the dequant plan; a gather-only IQ4_NL (per_layer_token_embd, 26.8 GiB) never does.
+        const size_t layer_w = 50331648;  // 4096 x 6144 f16
+        auto         marked  = [&](const char * name, int type, int64_t ne0, int64_t ne1, size_t f16_w, bool gather) {
+            zone_tensor_desc d                               = desc(name, 1000, type, ne0, ne1, 1, 1);
+            d.dequant_f16_if_unsupplied_weight_bytes         = f16_w;
+            d.dequant_f16_if_unsupplied_src1_bytes_per_token = static_cast<size_t>(ne0) * F16_BYTES;
+            d.pp_scratch_type_enabled                        = false;
+            d.get_rows_only                                  = gather;
+            return d;
+        };
+        std::vector<zone_tensor_desc> iq;
+        for (int i = 0; i < 4; i++) {
+            iq.push_back(marked("blk.0.ffn_gate_shexp.weight", GGML_TYPE_IQ4_XS, 4096, 6144, layer_w, false));
+        }
+        CHECK(zone_scoped_maxima(iq).dequant_f16_weight_bytes == layer_w,
+              "a dense IQ4_XS weight sizes the dequant plan");
+        const size_t                  per_layer_embd_w = 160ull * 320001536ull * F16_BYTES;
+        std::vector<zone_tensor_desc> with_embd        = iq;
+        with_embd.push_back(
+            marked("per_layer_token_embd.weight", GGML_TYPE_IQ4_NL, 160, 320001536, per_layer_embd_w, true));
+        CHECK(zone_scoped_maxima(with_embd).dequant_f16_weight_bytes == layer_w,
+              "a gather-only IQ4_NL table never sizes the dequant plan");
+    }
+
+    // ---- Case 14h: the figures a zone is described by outlive a later plan (llama.cpp-8ony) -----------------------
+    // A draft model loaded beside the target overwrites the planner's live (bare plan, Graph floor) with its own
+    // smaller figures. The arena's zones are found sufficient and kept, so the zone is still the target's: the
+    // snapshot it is described by must keep the larger of each figure, or the bound it yields would describe the
+    // draft's zone (a head pair then eats the target's Graph SDPA floor, or a clamped zone's bound drops below the
+    // target's own planned pair).
+    {
+        const size_t           mib    = 1024u * 1024u;
+        const zone_onednn_plan target = { 144 * mib, 64 * mib };
+        const zone_onednn_plan draft  = { 30 * mib, 10 * mib };
+        const zone_onednn_plan kept   = ggml_sycl::zone_onednn_plan_keep(target, draft);
+        CHECK(kept.bare_bytes == 144 * mib && kept.graph_floor_bytes == 64 * mib,
+              "a smaller later plan does not shrink what the kept zone is described by");
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(256 * mib, kept.bare_bytes, kept.graph_floor_bytes) == 192 * mib,
+              "the bound stays the target's: capacity minus the target's floor");
+        CHECK(ggml_sycl::zone_onednn_pp_pair_bound(256 * mib, draft.bare_bytes, draft.graph_floor_bytes) == 246 * mib,
+              "the draft's live figures alone would have admitted a pair that eats the target's Graph floor");
+        const zone_onednn_plan grown = ggml_sycl::zone_onednn_plan_keep(draft, target);
+        CHECK(grown.bare_bytes == 144 * mib && grown.graph_floor_bytes == 64 * mib,
+              "a larger later plan the zone was found sufficient for is described by its own figures");
+        const zone_onednn_plan wide_plan  = { 144 * mib, 10 * mib };
+        const zone_onednn_plan wide_floor = { 30 * mib, 64 * mib };
+        const zone_onednn_plan mixed      = ggml_sycl::zone_onednn_plan_keep(wide_plan, wide_floor);
+        CHECK(mixed.bare_bytes == 144 * mib && mixed.graph_floor_bytes == 64 * mib,
+              "each figure keeps its own larger value");
+        const zone_onednn_plan none = ggml_sycl::zone_onednn_plan_keep(zone_onednn_plan(), draft);
+        CHECK(none.bare_bytes == draft.bare_bytes && none.graph_floor_bytes == draft.graph_floor_bytes,
+              "with nothing held, the live plan is what the zone is described by");
+
+        // The halves are the two components of ONE pair plan and travel with the bare plan they sum into. Maxing
+        // each half on its own builds a pair no plan had: held (weights 100, activations 10) against live (10, 100)
+        // is 110 either way, but the per-half maxima are (100, 100), above the zone's 110, so a bound equal to the bare
+        // plan could not hold the planned pair and the first reservation would regrow after all.
+        {
+            zone_onednn_plan held_plan;
+            held_plan.bare_bytes        = 110 * mib;
+            held_plan.weights_bytes     = 100 * mib;
+            held_plan.activations_bytes = 10 * mib;
+            zone_onednn_plan live_plan;
+            live_plan.bare_bytes           = 110 * mib;
+            live_plan.weights_bytes        = 10 * mib;
+            live_plan.activations_bytes    = 100 * mib;
+            const zone_onednn_plan crossed = ggml_sycl::zone_onednn_plan_keep(held_plan, live_plan);
+            CHECK(crossed.weights_bytes + crossed.activations_bytes <= crossed.bare_bytes,
+                  "the kept halves never sum above the kept bare plan");
+            size_t cw = 0, ca = 0;
+            ggml_sycl::zone_onednn_scratch_reserve_target(true, crossed.bare_bytes, 0, 0, crossed.weights_bytes,
+                                                          crossed.activations_bytes, 50 * mib, 5 * mib, &cw, &ca);
+            CHECK(cw == 100 * mib && ca == 10 * mib,
+                  "the kept plan's first reservation is its planned pair, which a bound equal to the bare plan holds");
+            // An op of the OTHER plan, whose pair the kept one is not: the halves it needs are not the kept pair's,
+            // so the kept pair is replaced by the request as asked. That is a regrow, but only for an op the kept plan
+            // never provisioned. The superseded reservation's release is event-deferred, so the old and new blocks can
+            // briefly both be in the zone, and a failed zone allocation falls back to the unified-cache direct path;
+            // the request fits the bound alone, which is what acquire admitted it against.
+            size_t xw = 0, xa = 0;
+            ggml_sycl::zone_onednn_scratch_reserve_target(true, crossed.bare_bytes, cw, ca, crossed.weights_bytes,
+                                                          crossed.activations_bytes, 10 * mib, 100 * mib, &xw, &xa);
+            CHECK(xw == 10 * mib && xa == 100 * mib,
+                  "a crossed request the kept pair does not hold is used as asked, not merged above the bound");
+            CHECK(xw + xa <= crossed.bare_bytes, "the crossed request stays within the bound");
+
+            zone_onednn_plan big_plan;
+            big_plan.bare_bytes        = 200 * mib;
+            big_plan.weights_bytes     = 120 * mib;
+            big_plan.activations_bytes = 80 * mib;
+            zone_onednn_plan small_plan;
+            small_plan.bare_bytes         = 150 * mib;
+            small_plan.weights_bytes      = 140 * mib;
+            small_plan.activations_bytes  = 10 * mib;
+            const zone_onednn_plan larger = ggml_sycl::zone_onednn_plan_keep(small_plan, big_plan);
+            CHECK(larger.bare_bytes == 200 * mib && larger.weights_bytes == 120 * mib &&
+                      larger.activations_bytes == 80 * mib,
+                  "the halves come from the plan with the larger bare plan, whichever side it is on");
+            const zone_onednn_plan smaller = ggml_sycl::zone_onednn_plan_keep(big_plan, small_plan);
+            CHECK(smaller.weights_bytes == 120 * mib && smaller.activations_bytes == 80 * mib,
+                  "a later, smaller plan does not replace the halves of the larger one");
+        }
+
+        // The reserve merges per-component maxima, so two ops that each fit the bound can hold a pair above it. The
+        // merge is bounded by the PAIR BOUND, not the capacity: the held pair would otherwise eat the Graph floor.
+        const size_t bound = 235 * mib;
+        size_t       w = 0, a = 0;
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, bound, 200 * mib, 4 * mib, 0, 0, 40 * mib, 40 * mib, &w,
+                                                      &a);
+        CHECK(w == 40 * mib && a == 40 * mib, "a merge above the bound is not held: the request is used as asked");
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 256 * mib, 200 * mib, 4 * mib, 0, 0, 40 * mib, 40 * mib, &w,
+                                                      &a);
+        CHECK(w == 200 * mib && a == 40 * mib,
+              "the same two ops against the raw capacity merge to 240 MiB, past the 235 MiB bound");
+    }
+
+    // ---- Case 14i: the first reservation is the planned pair, so it never regrows (llama.cpp-8ony) ----------------
+    // The zone is sized for one pair plus the Graph floor. A reservation that starts at the first op's size and grows
+    // stepwise needs the superseded block and the new one in the zone at once (the release barrier holds the old
+    // one), which does not fit: the regrow fell through to an unplanned direct allocation. So the first reservation is
+    // max(request, planned) per component, and every later planned op is reused from it.
+    {
+        const size_t mib = 1024u * 1024u;
+        size_t       w = 0, a = 0;
+        const size_t plan_w = 112 * mib;  // the largest dequantized per-layer weight
+        const size_t plan_a = 32 * mib;   // the activations half
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 192 * mib, 0, 0, plan_w, plan_a, 80 * mib, 14 * mib, &w,
+                                                      &a);
+        CHECK(w == plan_w && a == plan_a,
+              "nothing held: the first reservation is the planned pair, not the first op's");
+        const size_t first_w = w, first_a = a;
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 192 * mib, first_w, first_a, plan_w, plan_a, 112 * mib,
+                                                      28 * mib, &w, &a);
+        CHECK(w == first_w && a == first_a, "a later planned op, even the widest, is covered by what is held");
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 192 * mib, 0, 0, plan_w, plan_a, 120 * mib, 14 * mib, &w,
+                                                      &a);
+        CHECK(w == 120 * mib && a == plan_a, "a request above the plan in one half still grows that half");
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 100 * mib, 0, 0, plan_w, plan_a, 40 * mib, 10 * mib, &w,
+                                                      &a);
+        CHECK(w == 40 * mib && a == 10 * mib, "a zone clamped below its plan reserves what is asked, not the plan");
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 100 * mib, 60 * mib, 5 * mib, plan_w, plan_a, 50 * mib,
+                                                      12 * mib, &w, &a);
+        CHECK(w == 60 * mib && a == 12 * mib,
+              "a clamped zone still never shrinks what is held: the held-and-requested merge, without the plan");
+        ggml_sycl::zone_onednn_scratch_reserve_target(false, 0, 0, 0, plan_w, plan_a, 40 * mib, 10 * mib, &w, &a);
+        CHECK(w == 40 * mib && a == 10 * mib, "without an arena there is no planned pair to reserve");
+        ggml_sycl::zone_onednn_scratch_reserve_target(true, 192 * mib, 0, 0, plan_w, plan_a, 40 * mib, 10 * mib,
+                                                      nullptr, nullptr);
+        // the pair halves are part of the snapshot a kept zone is described by
+        const zone_onednn_plan big   = { 144 * mib, 64 * mib, plan_w, plan_a };
+        const zone_onednn_plan small = { 30 * mib, 10 * mib, 20 * mib, 4 * mib };
+        const zone_onednn_plan kept  = ggml_sycl::zone_onednn_plan_keep(big, small);
+        CHECK(kept.weights_bytes == plan_w && kept.activations_bytes == plan_a,
+              "a smaller later plan does not shrink the pair halves the kept zone was built for");
     }
 
     // ---- Case 14: the planned dense scratch is ONE reservation that follows the runtime n_ubatch (llama.cpp-kpjw) --

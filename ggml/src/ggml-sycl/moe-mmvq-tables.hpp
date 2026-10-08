@@ -11,8 +11,10 @@
 
 // Single source of truth for batched-MoE MUL_MAT_ID (type, layout) coverage.
 //
-// Three tables and one invariant. Two describe what the executors can actually
-// run; the third describes what the capability query is allowed to advertise:
+// Three tables, one invariant and one publication predicate. Two tables describe
+// what the executors can actually run; the third describes what the capability
+// query is allowed to advertise (the predicate, moe_aos_expert_publication_wanted at
+// the end, says when a tensor's per-expert handles are published):
 //
 //   moe_mmvq_batched_dispatch_supports_layout   -- mmvq_moe_batched_dispatch()
 //   moe_mmvq_pair_glu_dispatch_supports_layout  -- the MXFP4 gate/up pair path
@@ -37,6 +39,7 @@
 inline bool moe_mmvq_batched_dispatch_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     switch (type) {
         case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
@@ -46,9 +49,19 @@ inline bool moe_mmvq_batched_dispatch_supports_layout(enum ggml_type type, enum 
         // the corresponding instantiation.
         //
         // This is the complete set reachable by transcribing an existing generic
-        // mul_mat_vec_q<> tuple. The iq* family has no such tuple -- it uses
-        // per-type kernels -- so those types stay refused until someone writes
-        // their _id variants.
+        // mul_mat_vec_q<> tuple, plus the iq* types s36q has covered so far: IQ4_NL,
+        // whose dense kernel is that same generic body with vec_dot_iq4_nl_q8_1
+        // (Q4_0-shaped, qi=4, vdr=2), and the IQ3 and IQ2 types, whose dense tuples
+        // (qi = QI3_x / 2 or QI2_x / 2, vdr=1) take their grid-table vec_dots behind
+        // generic-signature adaptors (IQ2_S's is already generic). Q2_0 (phase 4) is the
+        // Q1_0 tuple shape: qi = QK2_0 / 32 q8_1 chunks, vdr = 1, generic vec_dot. IQ4_XS,
+        // IQ1_S and IQ1_M stay refused until their _id variants exist.
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -73,10 +86,17 @@ inline bool moe_mmvq_batched_dispatch_supports_layout(enum ggml_type type, enum 
 inline bool moe_mmvq_batched_dispatch_supports_type(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -156,9 +176,16 @@ inline bool moe_mmvq_any_dispatch_supports_layout(enum ggml_type type, enum ggml
 inline bool moe_mmvq_capability_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
     switch (type) {
         case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -212,6 +239,16 @@ inline bool moe_mmvq_admission_supports_type(enum ggml_type type) {
         }
     }
     return false;
+}
+
+// Whether a device AoS weight tensor gets per-expert retained handles published for
+// it (ggml_sycl_publish_backend_aos_expert_handles). The buffer cannot see its
+// consumer when the weights are uploaded, so two proxies stand in for "this is an
+// expert tensor": the name-based usage classification (classified_expert) and the
+// structural test ne[2] > 1. A MUL_MAT_ID dispatch publishes again just before its
+// non-materializing retained resolver runs, and there the consumer IS known.
+inline bool moe_aos_expert_publication_wanted(bool classified_expert, int64_t ne2, bool consumer_is_mul_mat_id) {
+    return classified_expert || ne2 > 1 || consumer_is_mul_mat_id;
 }
 
 #endif  // GGML_SYCL_MOE_MMVQ_TABLES_HPP

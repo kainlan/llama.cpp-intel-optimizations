@@ -56,6 +56,11 @@ struct fused_resolution_entry_data {
     uint32_t    n_cpu_landings    = 0;
     int         cpu_landing_layer = -1;
     std::string cpu_landing_dev;
+    // CPU landings the layer's device could not have executed: a capability gap, not a placement
+    // (llama_fused_cpu_landing_is_placement). Counted apart from n_cpu_landings and printed as its own WARN.
+    uint32_t    n_cpu_gaps    = 0;
+    int         cpu_gap_layer = -1;
+    std::string cpu_gap_dev;
 };
 
 struct fused_resolution {
@@ -106,6 +111,12 @@ inline std::vector<fused_resolution_line> fused_resolution_render(const fused_re
                                                " for " + std::to_string(e.n_cpu_landings) + " layer(s) (e.g. layer " +
                                                std::to_string(e.cpu_landing_layer) +
                                                ") -- the executor follows data placement, not a capability gap" });
+    }
+    if (e.n_cpu_gaps > 0) {
+        lines.push_back({ FUSED_RESOLUTION_LEVEL_WARN, prefix + ": " + e.probe_name + " executes on CPU for " +
+                                                           std::to_string(e.n_cpu_gaps) + " layer(s) (e.g. layer " +
+                                                           std::to_string(e.cpu_gap_layer) + ") because " +
+                                                           e.cpu_gap_dev + " does not support it" });
     }
     lines.push_back({ FUSED_RESOLUTION_LEVEL_INFO, prefix + ": " + e.probe_name + " enabled" });
     return lines;

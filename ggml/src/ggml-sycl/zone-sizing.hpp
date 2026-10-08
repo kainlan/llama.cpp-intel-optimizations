@@ -88,6 +88,25 @@ struct zone_tensor_desc {
     // Supplied by the adapter, which knows the type and the expert role; zero means "not a candidate".
     size_t dequant_f16_weight_bytes         = 0;
     size_t dequant_f16_src1_bytes_per_token = 0;
+
+    // The same two figures for a dense weight the oneDNN PP scratch may or may not supply (llama.cpp-8ony): a type
+    // the unified kernel's oneDNN f16 route serves (Q4_0, MXFP4). Its f16 copies come from the scratch when the
+    // scratch is enabled for its type and the tensor is a per-layer weight the ONEDNN zone was sized for;
+    // otherwise they come from the planned dequant buffers, so only then do they count
+    // (zone_dequant_f16_planned_when_unsupplied). Zero means "not such a tensor". Unlike the two fields above,
+    // these are not planned unconditionally: that would reserve a copy for every layer weight the scratch supplies.
+    size_t dequant_f16_if_unsupplied_weight_bytes         = 0;
+    size_t dequant_f16_if_unsupplied_src1_bytes_per_token = 0;
+    // The adapter's answer to "is the oneDNN PP scratch enabled for this tensor's type" (environment and the
+    // default type set). Only read together with the two fields above.
+    bool   pp_scratch_type_enabled                        = false;
+
+    // True for a tensor whose only consumer is a row gather (GET_ROWS: the token / position embedding lookup), so
+    // none of the MUL_MAT-side marks above describe it (llama.cpp-8ony). Supplied by the adapter from the model
+    // loader's own role for the tensor, which makes a tied token embedding that doubles as the output head a
+    // MUL_MAT operand and so NOT gather-only. The marks are the adapter's to set; a gather-only tensor is
+    // excluded from every one of them here, in one place, rather than by each mark's own condition.
+    bool   get_rows_only                                  = false;
 };
 
 struct path_scoped_maxima {
@@ -245,6 +264,150 @@ bool zone_dequant_f16_plan_bytes(size_t   max_weight_bytes,
                                  uint32_t n_ubatch,
                                  size_t * src0_bytes,
                                  size_t * src1_bytes);
+
+// Whether a dense weight's f16 copies are planned into the dequant buffers because the oneDNN PP scratch will not
+// supply them (llama.cpp-8ony). The scratch supplies an op when it is enabled for the weight's type and the pair
+// fits the ONEDNN zone; the zone's own plan covers exactly the per-layer weights (zone_is_onednn_reorder_eligible).
+// An eligible weight of an enabled type is therefore supplied, and needs no dequant plan, on the condition that its
+// activations half is within the placeholder the zone is sized with (the largest eligible STORED weight) and the pair
+// is within the pair bound. That condition fails at a large -ub (Mistral ffn_down at -ub 4096 needs ~234 MB against a
+// ~223 MB bound): the op is then refused by the scratch, draws the dequant buffers, and nothing planned them. Closing
+// that gap needs the real n_ubatch at planning time, which is llama.cpp-fkpg; until then it is walk-grown.
+// A weight the zone was not sized for (the LM head, a tied embedding) or a type the scratch is off for
+// (GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH=0) draws the dequant buffers instead. A head that the zone's slack happens to
+// supply is still planned: whether the head runs on many rows or on the last row only is unknown until llama.cpp-fkpg
+// delivers n_outputs, and an unused plan is bounded by that one weight's f16 copy. Pure.
+bool zone_dequant_f16_planned_when_unsupplied(bool pp_scratch_type_enabled, bool pair_eligible);
+
+// ---------------------------------------------------------------------------
+// oneDNN PP scratch admission (llama.cpp-8ony)
+// ---------------------------------------------------------------------------
+//
+// Whether an op's f16 weight + activation copies are PLANNED to live in the ONEDNN zone (the oneDNN PP reorder
+// scratch), as opposed to the planned RUNTIME-zone dense f16 dequant buffers above. One fact with one source:
+// the zone the arena was actually built with. The LM head is deliberately outside the ONEDNN zone's sizing
+// (zone_is_onednn_reorder_eligible) and inside the dequant plan, so asking "is this op a oneDNN PP candidate?"
+// alone sends it to a scratch the plan never provisioned, and the arena then refuses to grow once weights are
+// resident. Both the op arm and the graph-entry walk must ask THIS question, with the same numbers.
+//
+// `arena_active` is false when there is no ONEDNN zone at all (no arena): nothing was planned, nothing can
+// disagree, and the scratch comes from the unified-cache allocation path as it always did. With an arena the
+// pair must fit the bound the zone was planned to hold (sum <= `pair_bound_bytes`, overflow-checked: a wrapped sum
+// compares as small). `pair_bound_bytes` is zone_onednn_pp_pair_bound over the zone's capacity, NOT the capacity
+// itself: a caller passing the raw capacity would admit a pair that takes the bytes reserved for the Graph SDPA
+// scratch. Pure.
+bool zone_onednn_pp_scratch_planned(bool   arena_active,
+                                    size_t pair_bound_bytes,
+                                    size_t weights_bytes,
+                                    size_t activations_bytes);
+
+// The pair reserve_onednn_scratch should size a reservation to, given what the cache already holds and what the
+// op now asks for. Never smaller than what is held, per component: the weights and activations halves are separate
+// blocks and different ops are largest in different halves (a 512-row layer op needs a wider activations half than
+// the 256-row LM-head op, which needs the wider weights half), so replacing the held pair by the latest request
+// shrinks one half every time and forces the regrowth that the plan never provisioned (llama.cpp-8ony).
+//
+// With an arena the merged pair is still bounded by `pair_bound_bytes` (zone_onednn_pp_pair_bound, not the raw
+// capacity): two ops that each fit the bound can merge, per component, into a pair above it. A held pair that
+// cannot be merged inside the bound (left over from a smaller or rebuilt arena) must not wedge every later
+// request, so the request is used as asked.
+//
+// The zone's PLANNED pair is a floor (llama.cpp-8ony): the first reservation is sized to max(held, requested, planned)
+// per component, so the pair the plan provisioned is reserved once and does not regrow for the ops that plan sized
+// (a regrow needs the superseded reservation and the new one in the zone at once, which a zone sized for one pair plus
+// the Graph floor cannot hold). That holds only for the ops of the plan whose pair is kept: an op that needs the other
+// plan's halves (kept (100, 10) at a bound of 110, request (10, 100)) fits neither the planned pair nor the merge, so
+// the target is the request as asked and the held pair is replaced. The held pair's release is event-deferred, so for
+// a moment the superseded block and the new one can both occupy the zone; if the zone allocation then fails, the
+// request is served through the unified-cache direct path (the transient old-plus-new case in
+// reserve_onednn_scratch). The request fits the bound alone, which acquire has already admitted it against.
+// Used only with an arena, where the planned pair exists; without one the planned halves are ignored. When that pair
+// does not fit `pair_bound_bytes` (a zone clamped below its plan) the target is the held-and-requested merge. Pass 0, 0
+// for no planned pair. Pure; a null out is ignored.
+void zone_onednn_scratch_reserve_target(bool     arena_active,
+                                        size_t   pair_bound_bytes,
+                                        size_t   held_weights_bytes,
+                                        size_t   held_activations_bytes,
+                                        size_t   planned_weights_bytes,
+                                        size_t   planned_activations_bytes,
+                                        size_t   requested_weights_bytes,
+                                        size_t   requested_activations_bytes,
+                                        size_t * weights_bytes,
+                                        size_t * activations_bytes);
+
+// The most an op's f16 pair may be for the ONEDNN zone to count it as planned there (the `pair_bound_bytes` that
+// zone_onednn_pp_scratch_planned and zone_onednn_scratch_reserve_target take). The zone is sized as the
+// primitive-API pair's own plan plus a floor for the oneDNN Graph SDPA scratch that shares it, and the zone is never
+// smaller than a fixed minimum, so its capacity can sit well above both. A pair is admitted up to capacity - floor:
+// that is slack nobody planned for, so admitting it cannot push the Graph SDPA scratch onto its DIRECT path (an
+// unplanned device allocation).
+// It is never admitted below the pair plan itself (a zone clamped so that capacity - floor falls under the plan
+// still holds the plan, which is what the planner's own ops are sized from), and never above the capacity.
+// `bare_plan_bytes` and `graph_floor_bytes` are the stored figures the zone was sized from; neither is recomputed
+// by the caller. A floor larger than the capacity leaves only the plan. Pure.
+size_t zone_onednn_pp_pair_bound(size_t capacity_bytes, size_t bare_plan_bytes, size_t graph_floor_bytes);
+
+// The two figures the ONEDNN zone was sized from, kept together as ONE snapshot (llama.cpp-8ony): the pair's own
+// plan and the Graph SDPA floor that shares the zone. Each is a plain number the planner can overwrite for the next
+// model; the zone is built once, so a bound derived from the live figures of a later plan (a draft model loaded beside
+// the target) would describe a zone that does not exist.
+struct zone_onednn_plan {
+    size_t bare_bytes        = 0;
+    size_t graph_floor_bytes = 0;
+    // The two halves of the pair plan: the weights half (the largest dequantized per-layer weight) and the
+    // activations half. The first reservation is sized to them, so the pair never regrows (llama.cpp-8ony).
+    size_t weights_bytes     = 0;
+    size_t activations_bytes = 0;
+};
+
+// The snapshot to keep when the arena's zones were found sufficient for `live` and the zone is NOT rebuilt: the zone
+// stays the size an earlier plan built it to, so it must still be described by the larger plan, never by a later,
+// smaller one's. The pair is kept whole (its halves sum into its bare plan): the pair of whichever plan has the larger
+// bare plan, the held one on a tie. Maxing each half on its own would build a pair no plan had, above what the zone
+// holds. Keeping one pair means an op sized by the other plan's halves is reserved as asked (see
+// zone_onednn_scratch_reserve_target), not from the kept pair. The Graph floor is a separate requirement on the same
+// zone and keeps its own maximum. A rebuilt zone is described by the live plan outright (the caller stores it
+// directly). Pure.
+zone_onednn_plan zone_onednn_plan_keep(const zone_onednn_plan & held, const zone_onednn_plan & live);
+
+// Whether the oneDNN PP scratch is allowed to supply a dense op's f16 copies at all, as a function of the
+// GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH setting and the weight's type (llama.cpp-8ony). `env_mode` is the parsed
+// variable: negative when unset, 0 when it turns the scratch off, positive when it turns it on for every type.
+// `default_type` is the type's default (Q4_0, Q8_0 and MXFP4). Unset, only the default types are supplied; set to
+// 0, none; set non-zero, all. Pure.
+bool zone_onednn_pp_scratch_type_enabled(int env_mode, bool default_type);
+
+// "The oneDNN PP scratch supplies this op's f16 copies": the op passes the PP admission, the scratch is enabled for
+// its type, and the pair is planned into the ONEDNN zone (zone_onednn_pp_scratch_planned). This is the ONE question
+// the op arm, acquire_onednn_pp_scratch and the graph-entry walk must answer the same way: an op the scratch does
+// not supply draws the planned dequant buffers, and the walk sizes those only for the ops it also says are not
+// supplied (a K-quant weight, or any op under UNIFIED_SCRATCH=0, was skipped by the walk and refused by acquire).
+// Pure.
+bool zone_onednn_pp_scratch_supplies(bool   pp_candidate,
+                                     bool   type_enabled,
+                                     bool   arena_active,
+                                     size_t pair_bound_bytes,
+                                     size_t weights_bytes,
+                                     size_t activations_bytes);
+
+// Whether the unified kernel's oneDNN f16 route (the "Route A" of the unified dispatch) draws the planned dequant
+// buffers for a node: the router picked the unified kernel, the type is one the unified kernel serves, src1 is
+// plain (contiguous, not transposed or permuted), the node passes the PP admission, and the oneDNN scratch does
+// NOT supply its pair (zone_onednn_pp_scratch_supplies). That is the over-zone LM head or tied embedding of a
+// Q4_0 / MXFP4 model, which took a per-op pool copy of the whole weight that no plan sized (llama.cpp-8ony).
+// Pure.
+bool zone_unified_pp_draws_dequant(bool primary_unified,
+                                   bool unified_type,
+                                   bool src1_plain,
+                                   bool pp_candidate,
+                                   bool scratch_supplies);
+
+// Whether the graph-entry walk counts a node toward the planned f16 dequant buffers. Two arms can draw them and they
+// do not share a precision condition: the legacy f16 arm only runs for GGML_PREC_DEFAULT, the unified kernel's
+// oneDNN f16 route has no precision check at all. A walk that filtered every node on precision first would leave
+// an F32-precision node the unified route draws for unsized (growth, or a plan-breach abort where the old pool copy
+// degraded silently). Pure.
+bool zone_walk_f16_node_draws(bool prec_default, bool legacy_route_draws, bool unified_route_draws);
 
 // ---------------------------------------------------------------------------
 // The planned dense scratch as ONE reservation (llama.cpp-kpjw)

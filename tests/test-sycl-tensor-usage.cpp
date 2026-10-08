@@ -95,8 +95,9 @@ int main() {
 
     // llama.cpp-kmeq: ggml_sycl_bf16_weight_dispatch_available() coverage.
     // This predicate gates whether ggml_backend_sycl_device_supports_op()
-    // admits a BF16 MUL_MAT for the ggml_sycl_bf16_weight_materialize_f32()
-    // route (ggml-sycl.cpp). It is declared inline in common.hpp (not
+    // admits a BF16 MUL_MAT for the native BF16 executor
+    // (ggml_sycl_mul_mat_bf16_weight, ggml-sycl.cpp; llama.cpp-9qjy) as the
+    // weight half of ggml_sycl_bf16_weight_native_route_available. It is declared inline in common.hpp (not
     // `static` in ggml-sycl.cpp) specifically so this test calls the exact
     // same function production dispatch does, mirroring the fattn.hpp
     // pattern -- one definition, both callers -- rather than re-implementing

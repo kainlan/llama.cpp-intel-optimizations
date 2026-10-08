@@ -29,6 +29,14 @@ Debt that came in from master: `unified-cache.cpp::runtime_registry_claim_ptr_lo
 trace-only `try { report.cohort = it->second.cohort_id; } catch (...) {}` that wraps a `std::string` copy, so it can only swallow a
 `bad_alloc` of a diagnostic string. It is not 23mk's to fix; it stays debt until that code is converted.
 
+The W7 merge of master `ec4e4eba7` brought more of the same, regenerated with `--write-debt --allow-growth` (key migration
+and code that arrived from master, not new lane code). Re-keyed by a master rename, same handler or request: `graph_preload_moe_experts` to
+`graph_preload_moe_experts_impl` (7pm2 Stage A, its D-FORBID and D-ZONE pair) and `flush_pending_cpu_scatter` to
+`flush_pending_cpu_scatter_slot` (its G-CATCH, which aborts and cannot swallow). Arrived as master code: a fifth `catch (...)` in
+`ggml_backend_sycl_graph_compute_impl`; the `catch (...)` that erases and rethrows in `runtime_registry_emplace_locked`; and the noexcept
+test hooks `allocation_registry_test_assign_raw`, `_assign_host`, `_publish_host` and `_publish_irregular` (G-CATCH). Retired: the
+D-FORBID and D-ZONE pair of `ggml_sycl_bf16_weight_materialize_f32`, a function master removed.
+
 Clause (q), libc allocation primitives (S3-0): `mmap`, `mmap64`, `mremap`, `posix_memalign`, `memalign`, `aligned_alloc`, `valloc`,
 `pvalloc`, `malloc`, `calloc`, `realloc`, `reallocarray`, `strdup`, `strndup` and `VirtualAlloc`, called bare or through `std::` / `::` (or taken as a value, or spelled in a `#define` body), are E-LIBC findings. A member
 (`pool.realloc`), a name qualified by another scope (`sycl::malloc` stays clause (e)'s) and a declaration are not. Five allowlist entries
