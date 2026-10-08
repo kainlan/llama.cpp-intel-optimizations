@@ -2,6 +2,7 @@
 #include "ggml.h"
 
 #include <cstdio>
+#include <set>
 #include <vector>
 
 // The build is -DNDEBUG, so assert() would compile away; use an explicit check.
@@ -166,7 +167,31 @@ int main() {
             per_src += v;
         }
         std::printf("case 7 (consumer, two shared srcs): one walk visits=%zu, per-src walks=%zu\n", visits, per_src);
-        CHECK(visits <= n_nodes, "case 7: consumer query expands each node at most once");
+        // Bound by the distinct nodes within 32 levels of the srcs, not by the
+        // whole graph: the cap hides the deepest layers, so n_nodes would let a
+        // per-src walk (which re-expands the shared part) pass.
+        std::set<const ggml_tensor *>    seen;
+        std::vector<const ggml_tensor *> level;
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            if (block->src[i] && seen.insert(block->src[i]).second) {
+                level.push_back(block->src[i]);
+            }
+        }
+        for (int d = 0; d <= 32 && !level.empty(); ++d) {
+            std::vector<const ggml_tensor *> next;
+            for (const ggml_tensor * t : level) {
+                for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                    if (t->src[i] && seen.insert(t->src[i]).second) {
+                        next.push_back(t->src[i]);
+                    }
+                }
+            }
+            level.swap(next);
+        }
+        // Nodes first reached at level 33 are never expanded, so drop them.
+        const size_t reachable = seen.size() - level.size();
+        std::printf("case 7: distinct reachable within the cap=%zu\n", reachable);
+        CHECK(visits <= reachable, "case 7: consumer query expands each reachable node at most once");
         CHECK(visits < per_src, "case 7: shared subgraph is not re-expanded per src");
         CHECK(ggml_sycl::attn_op_consumes_tensor_counted(block, x[n_layers - 4], &visits), "case 7: reachable target");
         CHECK(!ggml_sycl::attn_op_consumes_tensor_counted(nullptr, other, &visits) && visits == 0,
