@@ -131,7 +131,7 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-counter-dump.py
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
-    set_tests_properties(test-sycl-counter-dump-gate PROPERTIES LABELS "sycl;source-contract;host")
+    set_tests_properties(test-sycl-counter-dump-gate PROPERTIES LABELS "sycl;source-contract;host;python")
     # llama.cpp-moua L4: every "Proc name:" in ggml-sycl.h has an unconditional registration arm and a definition,
     # the load-compute ledger has one writer and one clearer, and the txn-end clear guard, the destructor erase
     # and the success-tail drop keep their order. Pure Python over source text, with its own mutation matrix.
@@ -139,7 +139,7 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-l4-proc-registration.py
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
-    set_tests_properties(test-sycl-l4-proc-registration-gate PROPERTIES LABELS "sycl;source-contract;host" TIMEOUT 600)
+    set_tests_properties(test-sycl-l4-proc-registration-gate PROPERTIES LABELS "sycl;source-contract;host;python" TIMEOUT 600)
     # 600 s: the gate runs its whole check once per mutant against the 6 MB source.  With the L4 step 3c/3d mutants it
     # took ~300 s at load ~9 (on the lane head and on merge/combined alike) and hit the old 300 s limit; the anchored
     # function_body lookup brings that to ~97 s, and 600 s keeps a passing run inside its limit under this host's
@@ -155,7 +155,7 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-dnnl-decline-consumers.py
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
-    set_tests_properties(test-sycl-dnnl-decline-consumers PROPERTIES LABELS "sycl;source-contract;host" TIMEOUT 60)
+    set_tests_properties(test-sycl-dnnl-decline-consumers PROPERTIES LABELS "sycl;source-contract;host;python" TIMEOUT 60)
     # llama.cpp-23mk S2: the allocation-zone contract. A tree-sitter parse of every non-test
     # ggml-sycl source; each request construction names its tier by literal, a device request names
     # its zone and forbids the spill, and raw allocator names stay inside the allowlisted functions.
@@ -170,18 +170,18 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-alloc-zone-contract.py
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/../../..)
-    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES LABELS "sycl;host-only;ast" TIMEOUT 120)
+    set_tests_properties(test-sycl-alloc-zone-contract PROPERTIES LABELS "sycl;host-only;ast;python" TIMEOUT 120)
     add_test(NAME test-sycl-alloc-zone-contract-w
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-alloc-zone-contract.py
                 --root ${CMAKE_CURRENT_SOURCE_DIR}/../../.. --witnesses)
-    set_tests_properties(test-sycl-alloc-zone-contract-w PROPERTIES LABELS "sycl;host-only;ast;mutation" TIMEOUT 600)
+    set_tests_properties(test-sycl-alloc-zone-contract-w PROPERTIES LABELS "sycl;host-only;ast;mutation;python" TIMEOUT 600)
     foreach(zc_shard 0 1 2 3 4 5 6 7)
         add_test(NAME test-sycl-alloc-zone-contract-m${zc_shard}
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/check-sycl-alloc-zone-contract.py
                     --root ${CMAKE_CURRENT_SOURCE_DIR}/../../.. --mutation-matrix --shard ${zc_shard}/8)
-        set_tests_properties(test-sycl-alloc-zone-contract-m${zc_shard} PROPERTIES LABELS "sycl;host-only;ast;mutation" TIMEOUT 600)
+        set_tests_properties(test-sycl-alloc-zone-contract-m${zc_shard} PROPERTIES LABELS "sycl;host-only;ast;mutation;python" TIMEOUT 600)
     endforeach()
 endif()
 

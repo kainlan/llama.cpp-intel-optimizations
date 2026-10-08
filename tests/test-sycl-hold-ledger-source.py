@@ -125,8 +125,14 @@ def claim_fit_flag_needs_the_fit_exception(ctx: str, header: str) -> bool:
         c,
     ):
         return False
+    # each carries the fit verdict; the reason is the refusal text plus the backend's by-name advice (master's mmi1,
+    # pinned by test-sycl-compute-refusal-source.py)
     for what in ("pp", "tg"):
-        if f'{{ sched_reserve_status::FAILED, "failed to allocate compute {what} buffers", true }}' not in c:
+        if not re.search(
+            r'\{ sched_reserve_status::FAILED, "failed to allocate compute %s buffers" '
+            r"\+ llama_context_sycl_compute_refusal_text\([^()]*\), true \}" % what,
+            c,
+        ):
             return False
     # the tenant section's builder refuses a plan inconsistency, never a capacity shortfall: no fit verdict
     if "return { sched_reserve_status::REFUSED, tenant_reason };" not in c or "tenant_reason, true" in c:

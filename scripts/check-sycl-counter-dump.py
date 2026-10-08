@@ -142,8 +142,10 @@ ENV_TEST = re.compile(r"getenv|counter_dump_requested|dump_report_enabled|dump_r
 REACH_SITES = [
     ("ggml_sycl_upload_moe_transient_ptr_table", "ensure:ggml_sycl_upload_moe_transient_ptr_table"),
     ("ggml_sycl_update_moe_ptr_table", "ensure:ggml_sycl_update_moe_ptr_table"),
-    ("graph_preload_moe_experts", "ensure:graph_preload_moe_experts"),
-    ("graph_preload_moe_experts", "update:graph_preload_moe_experts"),
+    # 7pm2 Stage A moved the preload's body into graph_preload_moe_experts_impl (the wrapper reports a failure);
+    # the notes moved with it and keep their labels, which the dump keys and the docs name.
+    ("graph_preload_moe_experts_impl", "ensure:graph_preload_moe_experts"),
+    ("graph_preload_moe_experts_impl", "update:graph_preload_moe_experts"),
     ("ggml_sycl_upload_moe_retained_ptr_table_from_batch", "upload:ggml_sycl_upload_moe_retained_ptr_table_from_batch"),
     ("try_xmx_sorted_moe", "upload:try_xmx_sorted_moe"),
     ("ggml_sycl_mul_mat_id", "upload:ggml_sycl_mul_mat_id/prompt"),
@@ -1255,7 +1257,7 @@ def mutation_matrix(files, cmake):
     f["ggml-sycl.cpp"] = re.sub(r'ggml_sycl_note_moe_table_reach\("ensure:graph_preload_moe_experts",[^;]*;', "",
                                 files["ggml-sycl.cpp"], count=1)
     muts.append(("the preload's reach note dropped",
-                 "H13 G0: graph_preload_moe_experts (ggml-sycl.cpp) lost its row-134 reach note `ensure:graph_preload_moe_experts`",
+                 "H13 G0: graph_preload_moe_experts_impl (ggml-sycl.cpp) lost its row-134 reach note `ensure:graph_preload_moe_experts`",
                  f, cmake))
     f = clone()
     f["ggml-sycl.cpp"] = files["ggml-sycl.cpp"] + (

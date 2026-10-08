@@ -1742,7 +1742,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-graph-diag-final-scorer.py
     )
     set_tests_properties(test-sycl-graph-diag-final-scorer PROPERTIES
-        LABELS "sycl;profiling;tdd"
+        LABELS "sycl;profiling;tdd;python"
         TIMEOUT 120
     )
 
@@ -1756,7 +1756,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-dispatch-resolver-region.py
     )
     set_tests_properties(test-sycl-cpu-dispatch-resolver-region PROPERTIES
-        LABELS "sycl;profiling;tdd"
+        LABELS "sycl;profiling;tdd;python"
         TIMEOUT 60
     )
 
@@ -1771,7 +1771,7 @@ if (NOT WIN32)
     )
     # The mutant sweep of gate 22 reads every tracked file; ~20 s idle, and this host is never idle.
     set_tests_properties(test-sycl-context-tenant-plan-source PROPERTIES
-        LABELS "sycl;tdd"
+        LABELS "sycl;tdd;python"
         TIMEOUT 180
     )
 
@@ -1785,7 +1785,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-holder-census-source.py
     )
     set_tests_properties(test-sycl-holder-census-source PROPERTIES
-        LABELS "sycl;tdd"
+        LABELS "sycl;tdd;python"
         TIMEOUT 180
     )
 
@@ -1799,7 +1799,7 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-replan-census-source.py
     )
     set_tests_properties(test-sycl-replan-census-source PROPERTIES
-        LABELS "sycl;tdd"
+        LABELS "sycl;tdd;python"
         TIMEOUT 400
     )
 

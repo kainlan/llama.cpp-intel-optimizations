@@ -10,8 +10,9 @@ pp buffers" and nothing else. The wiring that must say more:
 (B) ggml_backend_sycl_compute_refusal_advice() (ggml-sycl.h, reached by llama.cpp through the backend proc table)
     gathers the tiers' room, the kpjw hold-spill fit's -ub, and the budget authority's figures, and answers with
     compute_refusal_message() (compute-refusal-advice.hpp, host-tested by test-compute-refusal-advice).
-(C) llama_context::sched_reserve() appends that text to each of its three "failed to allocate compute ... buffers"
-    refusals.
+(C) llama_context::sched_reserve_impl() appends that text to each of its three "failed to allocate compute ... buffers"
+    refusals, which it returns as `{ sched_reserve_status::FAILED, <reason>, true }` (zhcn's transaction result; the
+    caller throws llama_auto_ubatch_fit_refusal for a result that carries the fit verdict).
 (D) The host-pinned fallback's refusal says what it is: the pinned pool's base is not aligned, and a host-pinned buffer
     is no home for a device compute buffer; it is not an "under-reserve" of a device buffer.
 
@@ -69,7 +70,7 @@ PUBLISH_START = "static ggml_backend_buffer_t ggml_backend_sycl_buffer_publish("
 PUBLISH_END = "static const char * ggml_backend_sycl_buffer_type_get_name("
 TXN_START = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
 TXN_END = "void ggml_backend_sycl_set_runtime_context("
-SCHED_START = "void llama_context::sched_reserve() {"
+SCHED_START = "sched_reserve_result llama_context::sched_reserve_impl("
 
 
 def advice_body(cpp: str) -> str:
@@ -84,7 +85,7 @@ def advice_body(cpp: str) -> str:
 def sched_reserve_body(cpp: str) -> str:
     code = strip_comments(cpp)
     start = code.find(SCHED_START)
-    assert start != -1, "llama_context::sched_reserve() not found"
+    assert start != -1, "llama_context::sched_reserve_impl() not found"
     end = code.find("\n}\n", start)
     return norm(code[start:end])
 
@@ -240,9 +241,10 @@ def violations_llama(src: str) -> list[str]:
     if not re.search(r"static std::string llama_context_sycl_compute_refusal_text\(", code):
         found.append("the text helper llama_context_sycl_compute_refusal_text is missing")
     body = sched_reserve_body(src)
-    refusals = re.findall(r'throw llama_auto_ubatch_fit_refusal\(\s*"failed to allocate compute (pp|tg) buffers"([^;]*)\)\s*;', body)
+    refusals = re.findall(
+        r'return \{\s*sched_reserve_status::FAILED,\s*"failed to allocate compute (pp|tg) buffers"([^;]*)\}\s*;', body)
     if len(refusals) != 3:
-        found.append(f"sched_reserve() should throw its three compute-buffer refusals through one shape (found {len(refusals)})")
+        found.append(f"sched_reserve_impl() should return its three compute-buffer refusals through one shape (found {len(refusals)})")
     for kind, rest in refusals:
         if "llama_context_sycl_compute_refusal_text(" not in rest:
             found.append(f"the {kind} refusal does not append the by-name text")
@@ -270,11 +272,11 @@ def test_llama_has_a_mutation_witness(mutation):
         mutated = src.replace("static std::string llama_context_sycl_compute_refusal_text(", "static std::string llama_x(")
     elif mutation == "pp-bare":
         mutated = re.sub(
-            r'("failed to allocate compute pp buffers")\s*\+\s*llama_context_sycl_compute_refusal_text\([^)]*\)\)', r"\1)", src, count=1
+            r'("failed to allocate compute pp buffers")\s*\+\s*llama_context_sycl_compute_refusal_text\([^)]*\)', r"\1", src, count=1
         )
     else:
         mutated = re.sub(
-            r'("failed to allocate compute tg buffers")\s*\+\s*llama_context_sycl_compute_refusal_text\([^)]*\)\)', r"\1)", src, count=1
+            r'("failed to allocate compute tg buffers")\s*\+\s*llama_context_sycl_compute_refusal_text\([^)]*\)', r"\1", src, count=1
         )
     assert mutated != src, f"mutation {mutation} did not change the source"
     assert violations_llama(mutated), f"mutation {mutation} was not witnessed"
