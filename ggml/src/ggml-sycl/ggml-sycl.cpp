@@ -99223,17 +99223,30 @@ static bool moe_segment_keyed_reachable(ggml_backend_sycl_context * ctx, const g
     return true;
 }
 
-// Owner identity of the allocation behind a backend buffer, from its mem_handle. A buffer without a SYCL context
-// has no owner identity; its size and usage still tell buffers apart.
+static uint64_t moe_segment_handle_identity(const ggml_sycl::mem_handle & handle) {
+    return static_cast<uint64_t>(handle.stable_identity_hash()) ^ (handle.generation() * 0x9e3779b97f4a7c15ULL);
+}
+
+// Owner identity of the allocation behind a backend buffer, from the mem_handle its context owns: a SYCL device or
+// compute buffer, or a pinned-host buffer (SYCL_Host and its KV_Host and CpuActivation clones, which share its
+// free_buffer and context). Any other buffer (plain CPU memory, another backend's) has no owner identity here and
+// falls back to size and usage, so two such buffers of equal size, or one freed and reallocated at the same size,
+// share an identity and the key tells them apart by tensor names and offsets alone. A recorded segment does not
+// bake a pointer into that memory: graph_prestage_leaf_tensors stages every non-device tensor into a device copy
+// before a recording, and the kernels read the copy.
 static uint64_t moe_segment_buffer_identity(ggml_backend_buffer_t buffer) {
     if (ggml_backend_buffer_has_sycl_context(buffer)) {
         const auto * bctx = static_cast<const ggml_backend_sycl_buffer_context *>(buffer->context);
         if (bctx && bctx->managed_handle.valid() && bctx->managed_handle.has_stable_owner_identity()) {
-            return static_cast<uint64_t>(bctx->managed_handle.stable_identity_hash()) ^
-                   (bctx->managed_handle.generation() * 0x9e3779b97f4a7c15ULL);
+            return moe_segment_handle_identity(bctx->managed_handle);
         }
         if (bctx && bctx->managed_meta.valid()) {
             return bctx->managed_meta.id;
+        }
+    } else if (buffer && buffer->iface.free_buffer == ggml_backend_sycl_host_buffer_free_buffer) {
+        const auto * hctx = static_cast<const sycl_host_buf_ctx *>(buffer->context);
+        if (hctx && hctx->buffer_handle.valid() && hctx->buffer_handle.has_stable_owner_identity()) {
+            return moe_segment_handle_identity(hctx->buffer_handle);
         }
     }
     return 1 + 31 * static_cast<uint64_t>(ggml_backend_buffer_get_size(buffer)) +

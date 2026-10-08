@@ -1228,6 +1228,7 @@ def check_keyed_plan_and_key(code: str) -> list:
         plan = region(code, "static std::vector<moe_graph_keyed_item> moe_graph_keyed_plan(", "\n}\n")
         key = region(code, "static ggml_sycl::graph_segment_cache::key moe_segment_slot_key(", "\n}\n")
         ident = region(code, "static uint64_t moe_segment_buffer_identity(", "\n}\n")
+        handle_ident = region(code, "static uint64_t moe_segment_handle_identity(", "\n}\n")
         record = region(code, "static void moe_graph_record_segment_slot(", "static void moe_graph_replay_segment_slot(")
     except ValueError as error:
         return [str(error)]
@@ -1256,9 +1257,16 @@ def check_keyed_plan_and_key(code: str) -> list:
             problems.append("key: missing %s" % what)
     if re.search(r"(reinterpret_cast<u?int\w*>|\(u?int\w*_t\)\s*|static_cast<u?int\w*_t>\()\s*\(?t->data\b", key):
         problems.append("key: a raw tensor address is mixed into the key")
-    if not re.search(r"bctx->managed_handle\.has_stable_owner_identity\(\)\)\s*\{\s*return static_cast<uint64_t>"
-                     r"\(bctx->managed_handle\.stable_identity_hash\(\)\) \^", ident):
+    if not re.search(r"return static_cast<uint64_t>\(handle\.stable_identity_hash\(\)\) \^ \(handle\.generation\(\) \*",
+                     handle_ident):
+        problems.append("key: a handle's identity is not its stable owner identity and generation")
+    if not re.search(r"bctx->managed_handle\.has_stable_owner_identity\(\)\)\s*\{\s*"
+                     r"return moe_segment_handle_identity\(bctx->managed_handle\);", ident):
         problems.append("key: a SYCL buffer is not identified by its mem_handle owner identity")
+    if not re.search(r"buffer->iface\.free_buffer == ggml_backend_sycl_host_buffer_free_buffer\)\s*\{[^{}]*"
+                     r"hctx->buffer_handle\.has_stable_owner_identity\(\)\)\s*\{\s*"
+                     r"return moe_segment_handle_identity\(hctx->buffer_handle\);", ident):
+        problems.append("key: a pinned-host buffer is not identified by its mem_handle owner identity")
     weights = re.search(r"if \(!root \|\| !ggml_sycl_tensor_is_weight\(root\)\)\s*\{\s*continue;\s*\}[\s\S]*?"
                         r"slot\.retained_handles\.push_back\(extra->data_handle\[device\]\);", record)
     push = record.find("slot.segments.push_back({ item.start, item.end, std::move(exec) });")
@@ -1282,8 +1290,9 @@ with gate('keyed-plan-and-key'):
         ("offset dropped", r"storage\.mix\(sb->base \? [^\n]*\n", "\n"),
         ("M3 names dropped", r"k\.names     = names\.value\(\);", "k.names     = 0;"),
         ("srcs not keyed", r"mix_tensor\(node->src\[j\]\);", "(void) j;"),
-        ("buffer identity from size", r"return static_cast<uint64_t>\(bctx->managed_handle\.stable_identity_hash\(\)\) \^",
-         "return 0 ^"),
+        ("buffer identity from size", r"return moe_segment_handle_identity\(bctx->managed_handle\);", "return 0;"),
+        ("pinned host buffers keyed by size", r"return moe_segment_handle_identity\(hctx->buffer_handle\);", "return 0;"),
+        ("handle identity ignores the generation", r"\^ \(handle\.generation\(\) \* 0x9e3779b97f4a7c15ULL\)", ""),
         ("M4 weights not retained", r"slot\.retained_handles\.push_back\(extra->data_handle\[device\]\);", "(void) extra;"),
         ("Q8 not retained", r"slot\.retained_handles\.push_back\(q8\);", "(void) q8;"),
     )
