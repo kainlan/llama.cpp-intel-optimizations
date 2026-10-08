@@ -17,6 +17,9 @@
 //
 //   KV layers         one source: the caches decide each layer through llama_kv_layer_decide(), and
 //                     llama_kv_layer_shapes() reads the same function, so the two cannot differ.
+//   indexer layers    the same source: llama_memory_hybrid_idx builds its indexer key cache from
+//                     llama_kv_idx_hparams(), and llama_kv_layer_shapes() decides those layers through
+//                     llama_kv_layer_decide() with the same hparams and the policy's filter_idx.
 //   recurrent layers  two statements of one rule: llama_memory_recurrent's constructor writes its own
 //                     ggml_new_tensor_2d(type, hparams.n_embd_r() / n_embd_s(), n_rows) calls, and
 //                     llama_rs_layer_shapes_for() restates the policy filter, the row count and the
@@ -68,6 +71,10 @@ struct llama_memory_policy {
 // allocating (no_alloc): the name a refusal quotes. Null for every kind that has both forms.
 const char * llama_memory_kind_unsupported(llama_memory_kind kind);
 
+// The hparams llama_memory_hybrid_idx's indexer key cache is built with: one key head of indexer_head_size per
+// layer, no rotation (the cached keys are raw), and an MLA-shaped cache so it holds no V.
+llama_hparams llama_kv_idx_hparams(const llama_hparams & hparams);
+
 // One layer of one llama_kv_cache.
 struct llama_kv_layer_shape {
     uint32_t n_embd_k_gqa  = 0;
@@ -115,6 +122,10 @@ struct llama_kv_layer_shapes_result {
 
     // indexed by the model's layer index, size n_layer_all (empty when there is no KV cache)
     std::vector<llama_kv_layer_shape> layers;
+
+    // The indexer key cache of a llama_memory_hybrid_idx: K only (n_embd_v_gqa 0), of type_k, over the same
+    // cells and streams as `layers`. Indexed like `layers`; empty when the memory has no indexer cache.
+    std::vector<llama_kv_layer_shape> layers_idx;
 };
 
 // The KV layers of the memory create_memory builds for these arguments. Pure: it reads the model's

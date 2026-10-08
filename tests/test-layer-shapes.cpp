@@ -8,10 +8,15 @@
 //   - a layer the shapes call has_kv owns K (and V unless MLA) of exactly the published widths, element
 //     types, stream count and byte size, in the cache the shape's is_swa names;
 //   - a layer the shapes do not call has_kv owns no tensor in any cache (filtered, reused, shared);
+//   - the indexer key cache of a hybrid_idx memory: a layer the published layers_idx call has_kv owns an
+//     indexer K of exactly that width (one head of indexer_head_size), element type, stream count and byte
+//     size, and no V; every other layer owns none;
 //   - the recurrent layers are exactly the offloaded layers, with the published row widths and rows;
-//   - the memory kinds llama does not model report themselves unsupported by name, and publish nothing;
-//     create_memory(no_alloc) refuses each of them with llama_measure_unsupported, which the load-time
-//     measure maps to "unsupported" (a WARN and the unplanned path, never a failed load);
+//   - the memory kinds llama does not model (MSA, DSA, DSA_ISWA, DSV4) report themselves unsupported by
+//     name, and publish nothing; create_memory(no_alloc) refuses each of them with llama_measure_unsupported,
+//     which the load-time measure maps to "unsupported" (a WARN and the unplanned path, never a failed load);
+//   - every other kind's create_memory(no_alloc) builds the tensors of the real memory, the indexer cache
+//     included, on size-0 dummy buffers;
 //   - the K-shift sub-caches a memory reports (get_shift_caches) are exactly the leaf caches that can shift
 //     under a memory that can shift, kind by kind.
 //
@@ -148,7 +153,8 @@ struct kv_part {
 struct memory_view {
     std::string                    kind = "none";
     std::vector<kv_part>           kvs;
-    const llama_memory_recurrent * rs = nullptr;
+    const llama_memory_recurrent * rs  = nullptr;
+    const llama_kv_cache *         idx = nullptr;  // the indexer key cache of a hybrid_idx memory
 };
 
 static memory_view view_of(llama_memory_t mem) {
@@ -166,10 +172,11 @@ static memory_view view_of(llama_memory_t mem) {
         v.kvs.push_back({ m->get_mem_attn()->get_swa(), true });
         v.rs = m->get_mem_recr();
     } else if (auto * m = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
-        // the indexer cache holds K the shapes have no place for: this kind is not modelled
+        // the indexer cache spans the attention layers too, so it is kept apart from the attention caches
         v.kind = "hybrid_idx";
         v.kvs.push_back({ m->get_mem_attn(), false });
-        v.rs = m->get_mem_recr();
+        v.rs  = m->get_mem_recr();
+        v.idx = m->get_mem_idx();
     } else if (auto * m = dynamic_cast<llama_memory_hybrid *>(mem)) {
         v.kind = "hybrid";
         v.kvs.push_back({ m->get_mem_attn(), false });
@@ -259,7 +266,8 @@ static bool all_on_arena(const llama_model &, uint32_t) {
     return true;
 }
 
-static int n_rs_layers_equal = 0;
+static int n_rs_layers_equal  = 0;
+static int n_idx_layers_equal = 0;
 
 static void check_shapes(const char * arch_name, const config & cfg, llama_context * ctx, const memory_view & mv) {
     const llama_model & model = ctx->get_model();
@@ -280,7 +288,7 @@ static void check_shapes(const char * arch_name, const config & cfg, llama_conte
     const int n_layer = (int) model.hparams.n_layer_all;
 
     const bool modelled = mv.kind == "kv" || mv.kind == "iswa" || mv.kind == "hybrid" || mv.kind == "hybrid_iswa" ||
-                          mv.kind == "recurrent" || mv.kind == "none";
+                          mv.kind == "hybrid_idx" || mv.kind == "recurrent" || mv.kind == "none";
     if (!modelled) {
         CHECK(!kv.unsupported.empty(), "%s/%s: kind '%s' is not modelled and must say so", arch_name, cfg.name,
               expected_kind(mv.kind));
@@ -340,6 +348,45 @@ static void check_shapes(const char * arch_name, const config & cfg, llama_conte
                 n_layer);
     }
 
+    // indexer keys: exactly the layers the indexer cache created K for, of the published width, and no V
+    if (mv.idx == nullptr) {
+        CHECK(kv.layers_idx.empty(), "%s/%s: no indexer cache but %zu indexer shapes", arch_name, cfg.name,
+              kv.layers_idx.size());
+    } else {
+        CHECK((int) kv.layers_idx.size() == n_layer, "%s/%s: %zu indexer shapes for %d layers", arch_name, cfg.name,
+              kv.layers_idx.size(), n_layer);
+        const uint32_t cells = mv.idx->get_size();
+        int            n_idx = 0;
+        for (int il = 0; il < (int) kv.layers_idx.size() && il < n_layer; ++il) {
+            const llama_kv_layer_shape & sh    = kv.layers_idx[il];
+            const ggml_tensor *          k     = nullptr;
+            const ggml_tensor *          v     = nullptr;
+            const bool                   owned = mv.idx->get_layer_tensors(il, &k, &v);
+            CHECK(sh.has_kv == owned, "%s/%s: layer %d indexer has_kv=%d but the memory %s an indexer K", arch_name,
+                  cfg.name, il, (int) sh.has_kv, owned ? "created" : "created no");
+            if (!owned) {
+                continue;
+            }
+            n_idx++;
+            CHECK((int64_t) sh.n_embd_k_gqa == k->ne[0], "%s/%s: layer %d indexer n_embd_k_gqa %u vs tensor %lld",
+                  arch_name, cfg.name, il, sh.n_embd_k_gqa, (long long) k->ne[0]);
+            CHECK(k->ne[1] == (int64_t) cells && k->ne[2] == (int64_t) kv.n_stream, "%s/%s: layer %d indexer K extent",
+                  arch_name, cfg.name, il);
+            CHECK(ggml_nbytes(k) == ggml_row_size(kv.type_k, sh.n_embd_k_gqa) * cells * kv.n_stream,
+                  "%s/%s: layer %d indexer K bytes", arch_name, cfg.name, il);
+            CHECK(v == nullptr && sh.n_embd_v_gqa == 0, "%s/%s: layer %d: the indexer holds a V (n_embd_v_gqa=%u)",
+                  arch_name, cfg.name, il, sh.n_embd_v_gqa);
+            // from the model, not from the indexer hparams the shapes are derived with
+            CHECK(sh.n_head_kv == 1 && sh.n_embd_head_k == model.hparams.indexer_head_size &&
+                      sh.n_embd_k_gqa == model.hparams.indexer_head_size,
+                  "%s/%s: layer %d indexer head geometry %u x %u, want 1 x %u", arch_name, cfg.name, il, sh.n_head_kv,
+                  sh.n_embd_head_k, model.hparams.indexer_head_size);
+            n_idx_layers_equal++;
+        }
+        fprintf(stderr, "  %s/%s kind=%s: %d of %d layers hold an indexer K\n", arch_name, cfg.name, mv.kind.c_str(),
+                n_idx, n_layer);
+    }
+
     // recurrent state: exactly the offloaded layers the memory created r/s for
     if (mv.rs == nullptr) {
         CHECK(rs.layers.empty(), "%s/%s: no recurrent memory but %zu RS layers", arch_name, cfg.name, rs.layers.size());
@@ -375,8 +422,9 @@ static void check_shapes(const char * arch_name, const config & cfg, llama_conte
 
 // create_memory(no_alloc) builds the same tensors as the real memory, on size-0 dummy buffers: nothing
 // is allocated, which is what a load-time measure needs. A kind with no such form throws, naming it.
-static int n_no_alloc_cases   = 0;
-static int n_no_alloc_refused = 0;
+static int           n_no_alloc_cases      = 0;
+static int           n_no_alloc_refused    = 0;
+static int           n_no_alloc_idx_layers = 0;
 static std::set<int> refused_kinds;
 
 static void check_no_alloc(const char * arch_name, const config & cfg, llama_context * ctx, const memory_view & mv) {
@@ -478,6 +526,36 @@ static void check_no_alloc(const char * arch_name, const config & cfg, llama_con
     }
     CHECK((mv.rs == nullptr) == (dv.rs == nullptr), "%s/%s: recurrent half present in one memory only", arch_name,
           cfg.name);
+
+    CHECK((mv.idx == nullptr) == (dv.idx == nullptr), "%s/%s: indexer cache present in one memory only", arch_name,
+          cfg.name);
+    if (mv.idx != nullptr && dv.idx != nullptr) {
+        CHECK(mv.idx->get_size() == dv.idx->get_size(), "%s/%s: indexer cells %u (real) vs %u (no_alloc)", arch_name,
+              cfg.name, mv.idx->get_size(), dv.idx->get_size());
+        for (int il = 0; il < n_layer; ++il) {
+            const ggml_tensor * rk     = nullptr;
+            const ggml_tensor * rv     = nullptr;
+            const ggml_tensor * dk     = nullptr;
+            const ggml_tensor * dv_    = nullptr;
+            const bool          r_owns = mv.idx->get_layer_tensors(il, &rk, &rv);
+            const bool          d_owns = dv.idx->get_layer_tensors(il, &dk, &dv_);
+            CHECK(r_owns == d_owns, "%s/%s: layer %d indexer owned %d (real) vs %d (no_alloc)", arch_name, cfg.name, il,
+                  (int) r_owns, (int) d_owns);
+            if (!r_owns || !d_owns) {
+                continue;
+            }
+            CHECK(rk->ne[0] == dk->ne[0] && rk->ne[1] == dk->ne[1] && rk->ne[2] == dk->ne[2] && rk->type == dk->type,
+                  "%s/%s: layer %d indexer K differs: real %lld/%lld/%lld type %d, no_alloc %lld/%lld/%lld type %d",
+                  arch_name, cfg.name, il, (long long) rk->ne[0], (long long) rk->ne[1], (long long) rk->ne[2],
+                  (int) rk->type, (long long) dk->ne[0], (long long) dk->ne[1], (long long) dk->ne[2], (int) dk->type);
+            CHECK(rk->buffer != nullptr && ggml_backend_buffer_get_size(rk->buffer) > 0,
+                  "%s/%s: layer %d: the real memory has no allocated indexer K", arch_name, cfg.name, il);
+            CHECK(dk->buffer != nullptr && ggml_backend_buffer_get_size(dk->buffer) == 0,
+                  "%s/%s: layer %d: no_alloc indexer K is not on a size-0 buffer", arch_name, cfg.name, il);
+            CHECK(rv == nullptr && dv_ == nullptr, "%s/%s: layer %d: an indexer V exists", arch_name, cfg.name, il);
+            n_no_alloc_idx_layers++;
+        }
+    }
 }
 
 // The K-shift sub-caches. Each memory kind reports the llama_kv_cache objects whose K the context re-ropes on
@@ -530,7 +608,7 @@ static void check_shift_caches(const char *        arch_name,
 }
 
 // Which kinds have no no_alloc form is one fact, in llama_memory_kind_unsupported. This is its table by kind:
-// the five kinds whose caches hold tensors the shape structs have no place for, and every other kind.
+// the four kinds whose caches hold tensors the shape structs have no place for, and every other kind.
 static void check_unsupported_table() {
     static const struct {
         llama_memory_kind kind;
@@ -546,7 +624,7 @@ static void check_unsupported_table() {
         { LLAMA_MEMORY_KIND_RECURRENT,   false },
         { LLAMA_MEMORY_KIND_HYBRID,      false },
         { LLAMA_MEMORY_KIND_HYBRID_ISWA, false },
-        { LLAMA_MEMORY_KIND_HYBRID_IDX,  true  },
+        { LLAMA_MEMORY_KIND_HYBRID_IDX,  false },
     };
 
     static_assert(sizeof(k_table) / sizeof(k_table[0]) == 11, "a new memory kind needs a row here and a decision");
@@ -606,6 +684,10 @@ int main() {
     CHECK(n_no_alloc_cases >= 39 && n_no_alloc_refused > 0, "VOID: %d no_alloc builds and %d refusals",
           n_no_alloc_cases, n_no_alloc_refused);
     CHECK(n_kv_cases > 0 && n_rs_cases > 0, "VOID: %d KV and %d recurrent cases", n_kv_cases, n_rs_cases);
+    // the indexer comparisons ran on real layers (qwen4exp is the fixture that reaches llama_memory_hybrid_idx)
+    CHECK(n_idx_layers_equal > 0 && n_no_alloc_idx_layers > 0,
+          "VOID: %d indexer layers compared with the shapes, %d with the no_alloc memory", n_idx_layers_equal,
+          n_no_alloc_idx_layers);
     // the recurrent equality compared real layers, and the shift check saw a memory that shifts
     CHECK(n_rs_layers_equal >= 20, "VOID: only %d recurrent layers were compared with the realised r/s tensors",
           n_rs_layers_equal);

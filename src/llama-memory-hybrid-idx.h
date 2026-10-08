@@ -37,7 +37,9 @@ public:
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
                             /* the indexer cache exists only if this is given */
-    const layer_filter_cb & filter_idx);
+    const layer_filter_cb & filter_idx,
+                            /* every cache's tensors on size-0 dummy buffers: nothing is allocated */
+                     bool   no_alloc = false);
 
     ~llama_memory_hybrid_idx() = default;
 
@@ -94,9 +96,9 @@ private:
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
 
-    // the indexer cache holds one key head per layer, so it needs its own hparams:
+    // the indexer cache holds one key head per layer, so it needs its own hparams (llama_kv_idx_hparams):
     // llama_kv_cache keeps a reference to what it is given
-    llama_hparams hparams_idx;
+    const llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
 };

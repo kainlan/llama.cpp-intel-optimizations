@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-layer-shapes.h"
 #include "llama-model.h"
 
 
@@ -38,33 +39,23 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-    const layer_filter_cb & filter_idx) :
+    const layer_filter_cb & filter_idx,
+                     bool   no_alloc) :
     llama_memory_hybrid(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
-        filter_attn, filter_recr),
-    hparams_idx(model.hparams),
+        filter_attn, filter_recr, no_alloc),
+    // the one statement of the indexer's shape, which llama_kv_layer_shapes() publishes too
+    hparams_idx(llama_kv_idx_hparams(model.hparams)),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
-        // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
-        std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
-        hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
-
-        // the cached indexer keys are raw, rotation happens after pooling at read time, so a
-        // K-shift must not rotate them while the stream copies in the same update still apply
-        hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
-
-        // fool llama_kv_cache into thinking this is a MLA cache, so it won't cache V tensors
-        hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
-        hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
-
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "idx_");
+            nullptr, filter_idx, nullptr, nullptr, "idx_", no_alloc);
     }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {

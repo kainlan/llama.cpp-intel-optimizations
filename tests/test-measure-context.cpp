@@ -365,8 +365,7 @@ static bool check_unsupported_arch(llm_arch arch, bool by_memory_kind) {
             CHECK(what.find("no no_alloc form") != std::string::npos, "%s: the refusal does not name the reason (%s)",
                   name, what.c_str());
             static const llama_memory_kind kinds[] = { LLAMA_MEMORY_KIND_MSA, LLAMA_MEMORY_KIND_DSA,
-                                                       LLAMA_MEMORY_KIND_DSA_ISWA, LLAMA_MEMORY_KIND_DSV4,
-                                                       LLAMA_MEMORY_KIND_HYBRID_IDX };
+                                                       LLAMA_MEMORY_KIND_DSA_ISWA, LLAMA_MEMORY_KIND_DSV4 };
             for (llama_memory_kind k : kinds) {
                 if (what.find(llama_memory_kind_unsupported(k)) != std::string::npos) {
                     g_unsupported_kinds_seen.insert(llama_memory_kind_unsupported(k));
@@ -518,8 +517,8 @@ int main() {
     // every memory kind without a no_alloc form: the architectures that reach one. A kind no fixture
     // reaches is covered by test-layer-shapes' by-kind table; this arm shows the measure's own mapping.
     int n_memory_refused = 0;
-    for (llm_arch arch : { LLM_ARCH_DEEPSEEK32, LLM_ARCH_DEEPSEEK4, LLM_ARCH_MINIMAX_M3, LLM_ARCH_QWEN4EXP,
-                           LLM_ARCH_DOTS3NOTE, LLM_ARCH_HY_V4, LLM_ARCH_GLM_DSA }) {
+    for (llm_arch arch : { LLM_ARCH_DEEPSEEK32, LLM_ARCH_DEEPSEEK4, LLM_ARCH_MINIMAX_M3, LLM_ARCH_DOTS3NOTE,
+                           LLM_ARCH_HY_V4, LLM_ARCH_GLM_DSA }) {
         n_memory_refused += check_unsupported_arch(arch, true) ? 1 : 0;
     }
     CHECK(n_memory_refused >= 1 && !g_unsupported_kinds_seen.empty(), "VOID: %d memory-kind refusals, %zu kinds named",

@@ -3725,7 +3725,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* unified           */ cparams.kv_unified,
                     /* filter_attn       */ pol.filter,
                     /* filter_recr       */ pol.filter_aux,
-                    /* filter_idx        */ pol.filter_idx);
+                    /* filter_idx        */ pol.filter_idx,
+                    /* no_alloc          */ no_alloc);
             } break;
         case LLAMA_MEMORY_KIND_HYBRID:
             {

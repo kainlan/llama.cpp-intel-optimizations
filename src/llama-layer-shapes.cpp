@@ -44,6 +44,24 @@ llama_kv_layer_decision llama_kv_layer_decide(const llama_hparams &             
     return dec;
 }
 
+llama_hparams llama_kv_idx_hparams(const llama_hparams & hparams) {
+    llama_hparams hp = hparams;
+
+    // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
+    std::fill(hp.n_head_kv_arr.begin(), hp.n_head_kv_arr.end(), 1);
+    hp.n_embd_head_k_full = hparams.indexer_head_size;
+
+    // the cached indexer keys are raw, rotation happens after pooling at read time, so a
+    // K-shift must not rotate them while the stream copies in the same update still apply
+    hp.rope_type = LLAMA_ROPE_TYPE_NONE;
+
+    // fool llama_kv_cache into thinking this is a MLA cache, so it won't cache V tensors
+    hp.n_embd_head_k_mla_impl = hparams.indexer_head_size;
+    hp.n_embd_head_v_mla_impl = hparams.indexer_head_size;
+
+    return hp;
+}
+
 // The kinds whose caches hold tensors the shape structs have no place for (an indexer key cache, the DSV4
 // compressor state). Named, so a publisher refuses by the name instead of publishing a guess.
 const char * llama_memory_kind_unsupported(llama_memory_kind kind) {
@@ -56,14 +74,13 @@ const char * llama_memory_kind_unsupported(llama_memory_kind kind) {
             return "llama_kv_cache_dsa_iswa (indexer key cache)";
         case LLAMA_MEMORY_KIND_DSV4:
             return "llama_kv_cache_dsv4 (compressor state)";
-        case LLAMA_MEMORY_KIND_HYBRID_IDX:
-            return "llama_memory_hybrid_idx (indexer key cache)";
         case LLAMA_MEMORY_KIND_NONE:
         case LLAMA_MEMORY_KIND_KV:
         case LLAMA_MEMORY_KIND_ISWA:
         case LLAMA_MEMORY_KIND_RECURRENT:
         case LLAMA_MEMORY_KIND_HYBRID:
         case LLAMA_MEMORY_KIND_HYBRID_ISWA:
+        case LLAMA_MEMORY_KIND_HYBRID_IDX:
             break;
     }
     return nullptr;
@@ -90,6 +107,7 @@ llama_kv_layer_shapes_result llama_kv_layer_shapes(const llama_model &         m
         case LLAMA_MEMORY_KIND_HYBRID:
         case LLAMA_MEMORY_KIND_ISWA:
         case LLAMA_MEMORY_KIND_HYBRID_ISWA:
+        case LLAMA_MEMORY_KIND_HYBRID_IDX:
             break;
         default:
             return res;
@@ -110,6 +128,21 @@ llama_kv_layer_shapes_result llama_kv_layer_shapes(const llama_model &         m
             llama_kv_layer_decide(hparams, il, res.v_trans, pol.filter, pol.share, has_other);
         if (dec.role == LLAMA_KV_LAYER_OWN) {
             res.layers[il] = dec.shape;
+        }
+    }
+
+    // the indexer key cache: its own hparams and filter, no source cache to share from (llama_memory_hybrid_idx)
+    if (pol.kind == LLAMA_MEMORY_KIND_HYBRID_IDX && pol.filter_idx != nullptr) {
+        const llama_hparams hparams_idx = llama_kv_idx_hparams(hparams);
+
+        res.layers_idx.resize(hparams.n_layer_all);
+
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            const llama_kv_layer_decision dec =
+                llama_kv_layer_decide(hparams_idx, il, res.v_trans, pol.filter_idx, nullptr, false);
+            if (dec.role == LLAMA_KV_LAYER_OWN) {
+                res.layers_idx[il] = dec.shape;
+            }
         }
     }
 
@@ -138,6 +171,7 @@ llama_rs_layer_shapes_result llama_rs_layer_shapes_for(const llama_model &      
             break;
         case LLAMA_MEMORY_KIND_HYBRID:
         case LLAMA_MEMORY_KIND_HYBRID_ISWA:
+        case LLAMA_MEMORY_KIND_HYBRID_IDX:
             filter = pol.filter_aux;
             break;
         default:
