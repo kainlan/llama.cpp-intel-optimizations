@@ -9,6 +9,9 @@
 //   - [base, base + size) is half-open: the first byte hits, the last byte hits, one past the end misses.
 //   - It stays correct, and O(log n), for arbitrary overlap, not only nesting.
 //   - erase()/insert() keep it in step (a rekey is an erase plus an insert).
+//   - find_first_base_in(lo, hi) returns the range with the smallest base in [lo, hi), or nothing: "does any registered
+//     row START inside this span" (the zone-settle liveness test, llama.cpp-rriv). A range that begins below lo and
+//     reaches into the span is NOT answered; that is containment, which find_innermost() owns.
 //
 // The oracle is a brute-force vector scan. Plain C++, no SYCL: the header has no backend dependency.
 
@@ -81,6 +84,20 @@ struct oracle {
             }
         }
         return false;
+    }
+
+    bool find_first_base_in(uintptr_t lo, uintptr_t hi, entry * out) const {
+        const oracle_row * best = nullptr;
+        for (const auto & r : rows) {
+            if (r.base >= lo && r.base < hi && (best == nullptr || r.base < best->base)) {
+                best = &r;
+            }
+        }
+        if (best == nullptr) {
+            return false;
+        }
+        *out = { best->base, best->end, best->key };
+        return true;
     }
 
     bool find(uintptr_t addr, entry * out) const {
@@ -207,6 +224,31 @@ void test_rekey() {
     check(idx.size() == 1 && idx.check_invariants(), "size 1, invariants hold");
 }
 
+void test_first_base_in() {
+    printf("first base in [lo, hi):\n");
+    address_range_index idx;
+    entry               e;
+    check(!idx.find_first_base_in(0, UINTPTR_MAX, &e), "an empty index has no row in any span");
+    check(idx.insert(1000, 100, key_of(1)) && idx.insert(2000, 100, key_of(2)) && idx.insert(3000, 100, key_of(3)),
+          "three rows at 1000, 2000, 3000");
+    check(idx.find_first_base_in(0, UINTPTR_MAX, &e) && e.base == 1000 && e.key == key_of(1),
+          "the whole space answers the lowest base");
+    check(idx.find_first_base_in(1000, 1001, &e) && e.base == 1000, "lo is inclusive");
+    check(!idx.find_first_base_in(1001, 2000, &e), "hi is exclusive, and a base below lo is not found");
+    check(idx.find_first_base_in(1001, 2001, &e) && e.base == 2000 && e.end == 2100 && e.key == key_of(2),
+          "the span (1001, 2001) answers the row at 2000, with its full entry");
+    check(!idx.find_first_base_in(2500, 2500, &e) && !idx.find_first_base_in(2600, 2500, &e),
+          "an empty or inverted span answers nothing");
+    check(!idx.find_first_base_in(1050, 1090, &e),
+          "a span wholly INSIDE a range does not answer it: only a base inside the span counts");
+    check(!idx.find_first_base_in(3001, UINTPTR_MAX, &e), "above the highest base");
+    check(idx.erase(2000, key_of(2)) && !idx.find_first_base_in(1500, 2500, &e), "an erased row is not found");
+    check(idx.insert(UINTPTR_MAX - 100, 50, key_of(4)) && idx.find_first_base_in(UINTPTR_MAX - 100, UINTPTR_MAX, &e) &&
+              e.key == key_of(4),
+          "a row near the top of the address space");
+    check(idx.check_invariants(), "the query changed nothing");
+}
+
 // Random ranges, both laminar (nested) and arbitrarily overlapping, against the brute-force oracle.
 void run_random(const char * name, bool laminar, uint32_t seed, int ops, uintptr_t space) {
     printf("random vs oracle (%s, seed %u, %d ops):\n", name, seed, ops);
@@ -216,6 +258,7 @@ void run_random(const char * name, bool laminar, uint32_t seed, int ops, uintptr
     int                                       mismatches = 0;
     int                                       refusals   = 0;
     int                                       resizes    = 0;
+    int                                       spans      = 0;
     uintptr_t                                 next_key   = 1;
     std::vector<std::pair<uintptr_t, void *>> live;
 
@@ -282,6 +325,21 @@ void run_random(const char * name, bool laminar, uint32_t seed, int ops, uintptr
             if (fa != fb || (fa && !same(a, b))) {
                 mismatches++;
             }
+            // The same probe as a span: [addr, addr + width), and one whose bounds sit on row bases.
+            uintptr_t lo = addr;
+            uintptr_t hi = addr + rng() % 512;
+            if (!ref.rows.empty() && (rng() & 1)) {
+                const oracle_row & r = ref.rows[static_cast<size_t>(rng() % ref.rows.size())];
+                lo                   = (rng() & 1) ? r.base : r.base + 1;
+                hi                   = (rng() & 1) ? r.base + 1 : r.end;
+            }
+            entry      c, d;
+            const bool fc = idx.find_first_base_in(lo, hi, &c);
+            const bool fd = ref.find_first_base_in(lo, hi, &d);
+            spans++;
+            if (fc != fd || (fc && !same(c, d))) {
+                mismatches++;
+            }
         }
         if (i % 4096 == 0 && !idx.check_invariants()) {
             mismatches++;
@@ -293,6 +351,7 @@ void run_random(const char * name, bool laminar, uint32_t seed, int ops, uintptr
     printf("    %zu live rows at the end, %d refused duplicates, %d resizes, %d mismatches\n", ref.rows.size(),
            refusals, resizes, mismatches);
     check(mismatches == 0, "index agrees with the oracle on every operation");
+    check(spans > 1000, "the run probed spans as well as addresses");
     check(refusals > 0, "the run exercised duplicate-base refusals");
     check(resizes > 0, "the run exercised resizes");
     check(idx.check_invariants(), "invariants hold at the end");
@@ -387,6 +446,7 @@ int main() {
     test_nesting();
     test_rekey();
     test_resize();
+    test_first_base_in();
     run_random("nested", true, 1, 100000, 1u << 16);
     run_random("overlapping", false, 2, 100000, 1u << 16);
     run_random("sparse overlapping", false, 3, 60000, 1u << 22);

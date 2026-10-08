@@ -41,8 +41,8 @@ What this file enforces:
 (D) The lookup consults the index, does not iterate the registry, and carries the backstop assertion.
 (E) g_runtime_alloc_index is MUTATED (insert/erase/resize/clear/assignment, an alias, a pointer) only inside
     runtime_registry_emplace_locked, runtime_registry_erase_locked and runtime_registry_assign_locked. Everywhere else
-    it is a read member call (find_innermost/find_exact/size/check_invariants) or its declaration, which covers the
-    PRIVATE_TESTING consistency audit.
+    it is a read member call (find_innermost/find_exact/find_first_base_in/size/check_invariants) or its declaration,
+    which covers the PRIVATE_TESTING consistency audit.
 
 NOT COVERED, stated so nobody mistakes this for a proof. The gate reads text, not the AST:
     - writes by CALL, even directly on a row: `std::swap(it->second, x)`, `std::exchange(it->second.handle.size, 0)`,
@@ -119,7 +119,7 @@ READ_MEMBER_RE = re.compile(
     r"|load_factor|max_load_factor)\b"
 )
 # The index's const members. Every other mention of it outside the three helpers is a mutation or an alias.
-INDEX_READ_MEMBER_RE = re.compile(r"\s*\.\s*(?:find_innermost|find_exact|size|check_invariants)\b")
+INDEX_READ_MEMBER_RE = re.compile(r"\s*\.\s*(?:find_innermost|find_exact|find_first_base_in|size|check_invariants)\b")
 CONST_RANGE_FOR_RE = re.compile(r"const\s+auto\s*&\s*\w+\s*:\s*$")
 # What follows `second` in an alias target. `second` itself, `second.handle`, `second.handle.ptr` and `second.handle.size`
 # are the row and its identity/geometry; `second.owned_segments` or `second.handle.alloc_id` is another field's reference.

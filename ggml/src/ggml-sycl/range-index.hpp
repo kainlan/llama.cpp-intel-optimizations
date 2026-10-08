@@ -129,6 +129,28 @@ class address_range_index {
         return true;
     }
 
+    // The range with the smallest base in [lo, hi), if any: "does a registered range START inside this span". A range
+    // that begins below `lo` and reaches into the span is not answered (that is containment, find_innermost()). One
+    // descent of the search path for `lo`, O(depth).
+    bool find_first_base_in(uintptr_t lo, uintptr_t hi, entry * out) const noexcept {
+        const node * best = nullptr;
+        for (const node * n = root_; n != nullptr;) {
+            if (n->e.base >= lo) {
+                best = n;
+                n    = n->left;
+            } else {
+                n = n->right;
+            }
+        }
+        if (best == nullptr || best->e.base >= hi) {
+            return false;
+        }
+        if (out != nullptr) {
+            *out = best->e;
+        }
+        return true;
+    }
+
     size_t size() const noexcept { return count_; }
 
     // Walks the whole tree: key order, heap order, subtree max_end, and the node count. O(n); for tests and
