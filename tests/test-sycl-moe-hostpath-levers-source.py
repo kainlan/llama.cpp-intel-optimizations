@@ -26,11 +26,12 @@ calls them, and calls them the way the tests assume.
      buffers), the deferred secondary scatter, and the pipeline scatter ring.  Missing one lets a
      recording call reach its exit with state the exit hook does not see.
 
-  R. Retired GGML_SYCL_PIPELINE_CPU.  ggml_check_sycl calls ggml_sycl_pipeline_cpu_warn_retired at
-     init, in the settings-report block itself and not under its `if (!overrides.empty())`, so a run
-     that sets only the retired variable still hears about it.  The helper latches through a
-     `static const bool`, so a second backend init in the same process does not repeat the WARN.  The
-     WARN and the env-var row cite llama.cpp-ytc9 and defer the direction under llama.cpp-3oju9.
+  R. Retired GGML_SYCL_PIPELINE_CPU.  ggml_sycl_pipeline_cpu_warn_retired has exactly one call in
+     the whole file.  It is in ggml_check_sycl at init, in the settings-report block itself and not
+     under its `if (!overrides.empty())`, so a run that sets only the retired variable still hears
+     about it.  The helper latches through a `static const bool`, so a second backend init in the
+     same process does not repeat the WARN.  The WARN and the env-var row cite llama.cpp-ytc9 and
+     defer the direction under llama.cpp-3oju9.
 
 WHAT THIS DOES NOT PROVE.  It reads source text with comments blanked.  It does not show which
 executor a GLU ran on (that needs a GPU run) and cannot see a conditional hidden behind a macro.
@@ -255,6 +256,14 @@ def check_pending_any(src: Source) -> None:
 
 
 def check_retired(src: Source, doc: str) -> None:
+    # Whole file, not just ggml_check_sycl: a second call anywhere (a dispatch site, say) would
+    # still be latched to one WARN, but it is dead code that costs a static-guard check per call.
+    # The definition's header ends in `() {`, so the pattern does not count it.
+    everywhere = list(re.finditer(r"\bggml_sycl_pipeline_cpu_warn_retired\(\)\s*;", src.code))
+    if len(everywhere) != 1:
+        raise ContractError(
+            f"R: ggml_sycl_pipeline_cpu_warn_retired must have exactly one call in {BACKEND}, found {len(everywhere)}"
+        )
     init_at, init = src.body(r"static void ggml_check_sycl\(\)")
     calls = list(re.finditer(r"\bggml_sycl_pipeline_cpu_warn_retired\(\)\s*;", init))
     if len(calls) != 1:
@@ -403,6 +412,13 @@ MUTANTS = [
         BACKEND,
         "            ggml_sycl_pipeline_cpu_warn_retired();\n        }\n",
         "        }\n",
+    ),
+    (
+        "R6 retired WARN call re-added at the CPU dispatch site",
+        BACKEND,
+        "                apply_cpu_result_to_scatter(cpu_result);\n",
+        "                ggml_sycl_pipeline_cpu_warn_retired();\n"
+        "                apply_cpu_result_to_scatter(cpu_result);\n",
     ),
     (
         "R4 retired WARN no longer latched: a second backend init would repeat it",
