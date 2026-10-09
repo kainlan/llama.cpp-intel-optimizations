@@ -884,7 +884,7 @@ def check_segment_boundary_flush(code: str) -> list:
     for slot in sorted(direct - set(checks)):
         problems.append("boundary flush helper does not check the %s slot the direct path checks per node" % slot)
     # A whole-slot flush publishes results the segment does not read and ends their overlap early.
-    for flush in ("flush_pending_cpu_scatter()", "flush_pending_cpu_pipeline()", "pipeline_scatter_drain()",
+    for flush in ("flush_pending_cpu_scatter()", "pipeline_scatter_drain()",
                   "flush_pending_secondary_scatter()", "flush_pending_attn_dispatch("):
         if flush in helper:
             problems.append("boundary flush helper publishes every pending slot (%s), not only what the segment "
@@ -982,7 +982,7 @@ with gate('segment-boundary-flush'):
         assert _helper.count(old) == 1, old
         return RUNTIME_CODE.replace(_helper, _helper.replace(old, new, 1), 1)
 
-    _full_flush = ("    flush_pending_cpu_scatter();\n    flush_pending_cpu_pipeline();\n"
+    _full_flush = ("    flush_pending_cpu_scatter();\n"
                    "    if (ggml_sycl_pipeline_moe_enabled()) {\n        pipeline_scatter_drain();\n    }\n"
                    "    wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());\n"
                    "    flush_pending_attn_dispatch(device);\n")
