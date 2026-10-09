@@ -2788,7 +2788,7 @@ shared zone, and the buffer took whatever the allocator found. On the B70 with Q
   not the compute term's: a state reserved beside a declined compute term is real RUNTIME memory the backend holds a
   term for, so it is recorded and late-checked like any other. The late check compares the late measure's state with
   it under the same rule (`ggml_backend_sycl_load_late_check_state`): larger refuses the load as `term state in zone
-  RUNTIME`, smaller is admitted with the shrink WARN, and equal WARNs `state term equal`. That catches a state that
+  RUNTIME`, smaller is admitted with the shrink WARN, and equal WARNs `late state check on device N: state term equal`. That catches a state that
   moves at the dev_layer sync, which can retier recurrent layers to the CPU. A late state with no record WARNs
   `late state check on device N: no state term was recorded`, because that state is allocated in RUNTIME unplanned. A
   device whose late state is zero is not asked, so a state that leaves a device entirely gives no shrink WARN. The

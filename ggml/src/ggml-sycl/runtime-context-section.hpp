@@ -544,7 +544,7 @@ class load_compute_ledger {
         if (!e.equal_logged) {
             e.equal_logged = true;
             std::snprintf(line, sizeof(line),
-                          "[LOAD-PLAN] late check on device %d: %s term equal (%.1f MiB), early reservation stands",
+                          "[LOAD-PLAN] %s on device %d: %s term equal (%.1f MiB), early reservation stands", label,
                           (int) device, name, (double) e.admitted / (1024.0 * 1024.0));
             r.line  = line;
             r.level = LOAD_LOG_LEVEL_WARN;

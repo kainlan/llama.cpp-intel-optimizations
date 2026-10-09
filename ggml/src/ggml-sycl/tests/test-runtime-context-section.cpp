@@ -840,7 +840,7 @@ void case_ledger_state_term_is_its_own() {
     CHECK(l.check(7, 0, 1000, true).result == GGML_SYCL_LATE_CHECK_EQUAL, "compute compares with compute");
     const load_compute_ledger::check_result eq = l.check(7, 0, LOAD_LEDGER_TERM_STATE, 500, true);
     CHECK(eq.result == GGML_SYCL_LATE_CHECK_EQUAL, "state compares with state");
-    CHECK(eq.line == "[LOAD-PLAN] late check on device 0: state term equal (0.0 MiB), early reservation stands",
+    CHECK(eq.line == "[LOAD-PLAN] late state check on device 0: state term equal (0.0 MiB), early reservation stands",
           "the state's equal WARN names the state term");
     CHECK(eq.level == LOAD_LOG_LEVEL_WARN, "at WARN");
 
