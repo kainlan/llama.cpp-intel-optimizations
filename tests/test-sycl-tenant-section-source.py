@@ -160,6 +160,7 @@ _L4_NAMES = {
     "late_check": "GGML_SYCL_PROC_LOAD_LATE_CHECK",
     "probe_residency": "GGML_SYCL_PROC_PROBE_RESIDENCY",
     "record_term": "GGML_SYCL_PROC_LOAD_RECORD_COMPUTE_TERM",  # llama.cpp-p6i0
+    "reserve_term": "GGML_SYCL_PROC_LOAD_RESERVE_COMPUTE_TERM",  # llama.cpp-p6i0
 }
 
 

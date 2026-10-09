@@ -1476,11 +1476,12 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runti
 // ---------------------------------------------------------------------------
 // The measured-tenant publish, its coverage query and the load-time late check
 // (llama.cpp-moua L4, doc 2.4.2 and 2.4.4), and the load's compute-term record
-// (llama.cpp-p6i0).  The SYCL reg's get_proc_address answers each of them under
-// the "Proc name:" its declaration carries.  A null proc address means the
-// backend predates the entry point; the caller then treats it as GROWTH
-// (coverage), NOT_RECORDED (late check), GGML_SYCL_LIFECYCLE_UNSUPPORTED
-// (publish) and not recorded (the record).  Resolve them with
+// and reservation (llama.cpp-p6i0).  The SYCL reg's get_proc_address answers
+// each of them under the "Proc name:" its declaration carries.  A null proc
+// address means the backend predates the entry point; the caller then treats it
+// as GROWTH (coverage), NOT_RECORDED (late check), GGML_SYCL_LIFECYCLE_UNSUPPORTED
+// (publish), not recorded (the record) and not reserved (the reservation).
+// Resolve them with
 // ggml_backend_reg_get_proc_address() under the exact names below.
 //
 // Layout rules, which moua owns: fields are only appended; a reader treats a
@@ -1686,6 +1687,20 @@ GGML_BACKEND_API bool ggml_backend_sycl_load_record_compute_term(struct ggml_syc
                                                                  int32_t                   device,
                                                                  uint64_t                  bytes,
                                                                  uint32_t                  n_ctx);
+
+// The load's compute reservation (llama.cpp-p6i0): the probe measure's compute term for device, handed to the
+// planner before the weight pack.  chunk_bytes[0..n_chunks) are the measure's per-chunk peaks (one allocation each);
+// the backend sizes a planned RUNTIME term from them at its allocator's grain, with no headroom, so the weight pack
+// leaves room for the scheduler's compute buffer.  It never touches the ledger the record writes.  False, reserving
+// nothing, when txn is not the open load transaction, when n_ctx is 0, when device is out of range or has no VRAM
+// arena, when chunk_bytes is null with n_chunks > 0 or the sum overflows, or while the backend admits no mutation;
+// the load then goes on with its compute buffer unplanned.
+// Proc name: "ggml_backend_sycl_load_reserve_compute_term".
+GGML_BACKEND_API bool ggml_backend_sycl_load_reserve_compute_term(struct ggml_sycl_load_txn txn,
+                                                                  int32_t                   device,
+                                                                  const uint64_t *          chunk_bytes,
+                                                                  uint32_t                  n_chunks,
+                                                                  uint32_t                  n_ctx);
 
 // The residency probe (llama.cpp-moua L4 step 3d, llama.cpp-5cim).  Which layers would this context's plan leave in
 // host memory?  A pure plan query: it takes no replan lock, publishes nothing and changes nothing, and works with no

@@ -1678,6 +1678,17 @@ bool     unified_cache_replan_planned_dense_scratch(int device_id, uint32_t n_ub
 uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id);
 // The plan's total bytes at `n_ubatch` without changing the published plan (a probe asks this).
 bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_ubatch, size_t * out);
+// llama.cpp-p6i0: the load's planned compute term, the bytes the scheduler's compute buffer occupies in the RUNTIME
+// zone (zone_compute_term_bytes over the probe measure's chunks), a named RUNTIME consumer folded into
+// unified_cache_get_planned_runtime_zone_requirement() so the zone is sized for the buffer before the weight pack.
+// It is measured at the load's measure shape (n_ctx_train and ubatch 512 until fkpg (a) transports the caller's
+// -c and -ub), so it is the planned term for that shape, not for every context. `other_model_live` merges like the
+// dense terms: the larger of the stored and the new term stays while another model is live on the device.
+// False for a device out of range (nothing stored). moua L6 retires it into the FIRST_CONTEXT head slot.
+bool             unified_cache_set_planned_compute_term(int device_id, size_t bytes, bool other_model_live = false);
+size_t           unified_cache_get_planned_compute_term_bytes(int device_id);
+// Drops every device's term. Called where no model is live, so no context can still draw one.
+void             unified_cache_clear_planned_compute_terms();
 // Whether the dense scratch at `n_ubatch` fits the RUNTIME zone's CAPACITY beside the other n_ubatch-independent
 // planned consumers. Capacity, not free space: free space depends on which compute buffers are live, capacity is
 // the fact the plan can be held to. `largest_ubatch` (optional) receives n_ubatch when it fits, else the largest

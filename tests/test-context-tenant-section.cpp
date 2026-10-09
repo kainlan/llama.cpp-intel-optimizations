@@ -129,6 +129,27 @@ static bool fake_record(struct ggml_sycl_load_txn txn, int32_t device, uint64_t 
     return g_record_answer;
 }
 
+// The reserve proc (llama.cpp-p6i0): it copies the chunk list it was handed and answers what the test picks.
+static bool                  g_reserve_answer = true;
+static int                   g_reserve_calls  = 0;
+static uint64_t              g_reserve_txn    = 0;
+static int32_t               g_reserve_dev    = -2;
+static std::vector<uint64_t> g_reserve_chunks;
+static uint32_t              g_reserve_n_ctx = 0;
+
+static bool fake_reserve(struct ggml_sycl_load_txn txn,
+                         int32_t                   device,
+                         const uint64_t *          chunk_bytes,
+                         uint32_t                  n_chunks,
+                         uint32_t                  n_ctx) {
+    g_reserve_calls++;
+    g_reserve_txn = txn.id;
+    g_reserve_dev = device;
+    g_reserve_chunks.assign(chunk_bytes, chunk_bytes + n_chunks);
+    g_reserve_n_ctx = n_ctx;
+    return g_reserve_answer;
+}
+
 // The probe procs: one that answers a status the test picks and writes n_layer the way the backend's proc does
 // (never host_resident), and one that answers a value outside the enum.
 static ggml_sycl_residency_probe_status g_probe_answer = GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED;
@@ -347,6 +368,44 @@ int main() {
         four.late_check      = &fake_late;
         four.probe_residency = &fake_probe;
         CHECK(four.available(), "the four L4 procs without the record are no longer L4");
+    }
+
+    // (13) the load's compute reservation door, and the loader's own gate over its two procs (llama.cpp-p6i0)
+    {
+        // a null proc reserves nothing and says so
+        llama_sycl_l4_procs none;
+        g_reserve_calls = 0;
+        CHECK(!llama_sycl_l4_reserve_compute_term(none, ggml_sycl_load_txn{ 9 }, 0, { 100 }, 4096),
+              "a null reserve proc was read as reserved");
+        CHECK(g_reserve_calls == 0, "a null reserve proc was called");
+        CHECK(!none.load_terms_available(), "an empty table reports the load terms");
+
+        // the chunk list goes through whole and in order, at the backend's width
+        llama_sycl_l4_procs procs;
+        procs.reserve_term = &fake_reserve;
+        g_reserve_answer   = true;
+        CHECK(llama_sycl_l4_reserve_compute_term(procs, ggml_sycl_load_txn{ 44 }, 1, { 1618052864, 536870912 }, 262144),
+              "a reserved term was read as not reserved");
+        CHECK(g_reserve_calls == 1 && g_reserve_txn == 44 && g_reserve_dev == 1 && g_reserve_n_ctx == 262144 &&
+                  g_reserve_chunks == std::vector<uint64_t>({ 1618052864ull, 536870912ull }),
+              "the reserve arguments were not forwarded");
+        // an empty list is forwarded as an empty list (the backend decides), not dropped here
+        CHECK(llama_sycl_l4_reserve_compute_term(procs, ggml_sycl_load_txn{ 44 }, 0, {}, 262144) &&
+                  g_reserve_calls == 2 && g_reserve_chunks.empty(),
+              "an empty chunk list was not forwarded");
+        g_reserve_answer = false;
+        CHECK(!llama_sycl_l4_reserve_compute_term(procs, ggml_sycl_load_txn{ 44 }, 1, { 1 }, 262144),
+              "a refused reservation was read as reserved");
+        g_reserve_answer = true;
+
+        // the loader runs its reserve and record steps only with both procs; neither is part of available()
+        CHECK(!procs.load_terms_available(), "the reserve proc alone reports the load terms");
+        CHECK(!procs.available(), "the reserve proc alone made the table L4");
+        procs.record_term = &fake_record;
+        CHECK(procs.load_terms_available(), "the reserve and record procs do not report the load terms");
+        llama_sycl_l4_procs record_only;
+        record_only.record_term = &fake_record;
+        CHECK(!record_only.load_terms_available(), "the record proc alone reports the load terms");
     }
 
     // (4) the section builder

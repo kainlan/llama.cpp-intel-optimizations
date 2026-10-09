@@ -33,15 +33,22 @@ struct llama_sycl_l4_procs {
     decltype(&ggml_backend_sycl_tenant_coverage)          coverage        = nullptr;
     decltype(&ggml_backend_sycl_load_late_check)          late_check      = nullptr;
     decltype(&ggml_backend_sycl_probe_residency)          probe_residency = nullptr;
-    // The load's compute-term record (llama.cpp-p6i0). Not part of available(): the context side and the late
-    // check keep their gate, and the loader's record step checks this member through its own door below.
-    decltype(&ggml_backend_sycl_load_record_compute_term) record_term     = nullptr;
+    // The load's compute-term record and compute reservation (llama.cpp-p6i0). Not part of available(): the
+    // context side and the late check keep their gate, and the loader gates its two steps on
+    // load_terms_available().
+    decltype(&ggml_backend_sycl_load_record_compute_term)  record_term     = nullptr;
+    decltype(&ggml_backend_sycl_load_reserve_compute_term) reserve_term    = nullptr;
 
     // A planned context needs all four: a publish that cannot be covered-checked, a load that
     // cannot be late-checked, or a plan whose residency cannot be probed, is half a plan.
     bool available() const {
         return publish != nullptr && coverage != nullptr && late_check != nullptr && probe_residency != nullptr;
     }
+
+    // The loader reserves the probe bound and records the admitted term only with both: a reservation that is
+    // never recorded leaves the late check nothing to compare, and a record with no reservation compares a
+    // term the pack never made room for.
+    bool load_terms_available() const { return record_term != nullptr && reserve_term != nullptr; }
 };
 
 inline ggml_sycl_lifecycle_result llama_sycl_l4_publish(const llama_sycl_l4_procs &            procs,
@@ -116,6 +123,21 @@ inline bool llama_sycl_l4_record_compute_term(const llama_sycl_l4_procs & procs,
         return false;
     }
     return procs.record_term(txn, device, bytes, n_ctx);
+}
+
+// The load's compute reservation (llama.cpp-p6i0): the probe measure's per-chunk peaks for one device, handed to the
+// backend at its width. False is "not reserved", and a null proc reads as it: the load goes on with its compute buffer
+// unplanned, as it did before the entry existed.
+inline bool llama_sycl_l4_reserve_compute_term(const llama_sycl_l4_procs & procs,
+                                               struct ggml_sycl_load_txn   txn,
+                                               int32_t                     device,
+                                               const std::vector<size_t> & chunk_bytes,
+                                               uint32_t                    n_ctx) {
+    if (procs.reserve_term == nullptr || chunk_bytes.size() > UINT32_MAX) {
+        return false;
+    }
+    const std::vector<uint64_t> chunks(chunk_bytes.begin(), chunk_bytes.end());
+    return procs.reserve_term(txn, device, chunks.data(), static_cast<uint32_t>(chunks.size()), n_ctx);
 }
 
 // The residency probe's one door: no other code calls the proc pointer or the symbol
