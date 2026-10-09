@@ -512,6 +512,39 @@ static void test_admitted_fold() {
         CHECK(r_unb.refusal.find("no probe bound") != std::string::npos,
               "a device with no probe bound was tolerated: %s", r_unb.refusal.c_str());
     }
+    // the residency is judged per device: on a two-card split the probe demoted a layer on SYCL0 and the admitted fit
+    // one on SYCL1. The totals match, but SYCL1's graph moved, so its grown c(P) is the KV-residency delta, not a
+    // planning defect
+    {
+        llama_kv_residency_tally kv_dev0;
+        llama_kv_residency_tally kv_dev1;
+        for (int i = 0; i < 4; ++i) {
+            llama_kv_residency_count(kv_dev0, "SYCL0", i == 0);
+            llama_kv_residency_count(kv_dev0, "SYCL1", false);
+            llama_kv_residency_count(kv_dev1, "SYCL0", false);
+            llama_kv_residency_count(kv_dev1, "SYCL1", i == 0);
+        }
+        llama_kv_residency_count(kv_dev0, nullptr, false);
+        llama_kv_residency_count(kv_dev1, nullptr, false);
+        CHECK(kv_dev0.n_device == kv_dev1.n_device && kv_dev0.n_host == kv_dev1.n_host &&
+                  kv_dev0.n_cpu == kv_dev1.n_cpu && kv_dev0.n_device == 7 && kv_dev0.n_host == 1 && kv_dev0.n_cpu == 1,
+              "the two tallies do not have equal totals");
+        CHECK(kv_dev0.devices.size() == 2 && kv_dev0.devices[0].device == "SYCL0" && kv_dev0.devices[0].n_host == 1 &&
+                  kv_dev0.devices[0].n_device == 3 && kv_dev0.devices[1].n_device == 4,
+              "the per-device counts are wrong");
+        const std::vector<llama_load_measure_device> probe = { chunked(0, false, { 100 }), chunked(1, false, { 512 }) };
+        const std::vector<llama_load_measure_device> grown = { chunked(0, false, { 100 }), chunked(1, false, { 600 }) };
+        const llama_admitted_check_result            r =
+            llama_admitted_check_fold(procs, probe, {}, {}, grown, 4096, 512, kv_dev0, kv_dev1);
+        CHECK(r.refusal.empty() && r.terms.size() == 2 && r.terms[1].kv_excess == 256,
+              "a per-device residency move with equal totals was refused as a planning defect: %s", r.refusal.c_str());
+        // the same per-device residency on both sides is unmoved, so the growth still refuses
+        llama_kv_residency_tally kv_same;
+        llama_kv_residency_merge(kv_same, kv_dev0);
+        const llama_admitted_check_result r_same =
+            llama_admitted_check_fold(procs, probe, {}, {}, grown, 4096, 512, kv_dev0, kv_same);
+        CHECK(!r_same.refusal.empty(), "growth with an unmoved per-device residency was admitted");
+    }
 }
 
 static std::vector<int32_t>  g_record_seen;

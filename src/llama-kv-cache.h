@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -17,11 +18,61 @@ struct llama_context;
 // compute trace): how many KV layers a cache put in a device buffer, in the SYCL host-tier KV buffer, and in a
 // CPU buffer because the layer is not offloaded. A real cache also prints its count; a load-time measure's
 // cache prints nothing (the measure-only context is quiet below ERROR), so the measure reads its count here.
-struct llama_kv_residency_tally {
-    uint32_t n_device = 0;
-    uint32_t n_host   = 0;
-    uint32_t n_cpu    = 0;
+// One device's share of a tally: the KV layers planned for it that sit in its own buffer, and those demoted to the
+// host KV tier.
+struct llama_kv_residency_device {
+    std::string device;  // the layer's device, by ggml_backend_dev_name
+    uint32_t    n_device = 0;
+    uint32_t    n_host   = 0;
 };
+
+struct llama_kv_residency_tally {
+    uint32_t                               n_device = 0;
+    uint32_t                               n_host   = 0;
+    uint32_t                               n_cpu    = 0;
+    std::vector<llama_kv_residency_device> devices;  // the same counts per device, in first-seen order
+};
+
+// Counts one KV layer: on `device` (its own buffer, or the host KV tier when on_host), or on the CPU for a null device
+// (a layer that is not offloaded).
+inline void llama_kv_residency_count(llama_kv_residency_tally & tally, const char * device, bool on_host) {
+    if (device == nullptr) {
+        tally.n_cpu++;
+        return;
+    }
+    (on_host ? tally.n_host : tally.n_device)++;
+    for (llama_kv_residency_device & d : tally.devices) {
+        if (d.device == device) {
+            (on_host ? d.n_host : d.n_device)++;
+            return;
+        }
+    }
+    llama_kv_residency_device d;
+    d.device                          = device;
+    (on_host ? d.n_host : d.n_device) = 1;
+    tally.devices.push_back(d);
+}
+
+// Adds `from` into `into`, the totals and each device's share.
+inline void llama_kv_residency_merge(llama_kv_residency_tally & into, const llama_kv_residency_tally & from) {
+    into.n_device += from.n_device;
+    into.n_host += from.n_host;
+    into.n_cpu += from.n_cpu;
+    for (const llama_kv_residency_device & f : from.devices) {
+        bool found = false;
+        for (llama_kv_residency_device & d : into.devices) {
+            if (d.device == f.device) {
+                d.n_device += f.n_device;
+                d.n_host += f.n_host;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            into.devices.push_back(f);
+        }
+    }
+}
 
 struct llama_kv_residency_tally_scope {
     explicit llama_kv_residency_tally_scope(llama_kv_residency_tally & tally);

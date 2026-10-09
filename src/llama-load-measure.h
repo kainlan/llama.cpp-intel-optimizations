@@ -518,8 +518,27 @@ struct llama_admitted_check_result {
     llama_kv_residency_tally         admitted_kv;
 };
 
+// Whether two measures saw the same KV residency. Judged per device, not on whole-model totals: the planner demotes
+// KV per device against that device's headroom, so on a split one fit can demote a layer on one card where the other
+// demoted it on another. The totals then match while both cards' graphs moved, and any per-device difference is a move.
 inline bool llama_kv_residency_same(const llama_kv_residency_tally & a, const llama_kv_residency_tally & b) {
-    return a.n_device == b.n_device && a.n_host == b.n_host && a.n_cpu == b.n_cpu;
+    if (a.n_device != b.n_device || a.n_host != b.n_host || a.n_cpu != b.n_cpu ||
+        a.devices.size() != b.devices.size()) {
+        return false;
+    }
+    for (const llama_kv_residency_device & da : a.devices) {
+        bool matched = false;
+        for (const llama_kv_residency_device & db : b.devices) {
+            if (db.device == da.device) {
+                matched = db.n_device == da.n_device && db.n_host == da.n_host;
+                break;
+            }
+        }
+        if (!matched) {
+            return false;
+        }
+    }
+    return true;
 }
 
 inline llama_admitted_check_result llama_admitted_check_fold(const llama_sycl_l4_procs &                    procs,

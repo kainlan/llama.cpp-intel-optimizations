@@ -95,9 +95,7 @@ llama_kv_residency_tally_scope::~llama_kv_residency_tally_scope() {
 
 void llama_kv_residency_tally_scope::add(const llama_kv_residency_tally & cache) {
     if (g_kv_residency_tally != nullptr) {
-        g_kv_residency_tally->n_device += cache.n_device;
-        g_kv_residency_tally->n_host += cache.n_host;
-        g_kv_residency_tally->n_cpu += cache.n_cpu;
+        llama_kv_residency_merge(*g_kv_residency_tally, cache);
     }
 }
 
@@ -306,6 +304,7 @@ llama_kv_cache::llama_kv_cache(
         const uint32_t n_embd_v_gqa = dec.shape.n_embd_v_gqa;
 
         const char * dev_name = "CPU";
+        const char * kv_dev   = nullptr;  // the layer's device for the residency tally; null for a CPU layer
 
         ggml_backend_buffer_type_t buft          = ggml_backend_cpu_buffer_type();
         bool                       kv_host_layer = false;
@@ -340,17 +339,12 @@ llama_kv_cache::llama_kv_cache(
             // that just assigned buft = hooks.kv_host_buft(), so buft is
             // never null on this path.
             dev_name = kv_host_layer ? ggml_backend_buft_name(buft) : ggml_backend_dev_name(dev);
+            kv_dev   = ggml_backend_dev_name(dev);
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
-        if (!offload) {
-            residency.n_cpu++;
-        } else if (kv_host_layer) {
-            residency.n_host++;
-        } else {
-            residency.n_device++;
-        }
+        llama_kv_residency_count(residency, kv_dev, kv_host_layer);
 
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
