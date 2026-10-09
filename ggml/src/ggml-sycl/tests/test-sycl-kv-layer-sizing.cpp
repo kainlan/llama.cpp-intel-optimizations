@@ -965,26 +965,28 @@ static void test_qwen38_indexer_keys_budgeted_and_sized_per_buffer() {
     for (uint32_t il = 0; il < 48; ++il) {
         plan.kv_device[static_cast<int>(il)] = 0;
     }
-    plan.kv_per_layer       = kv.kv_bytes_per_layer();
-    plan.layer_kind         = kv.layer_kind;
-    plan.layer_k_width      = kv.layer_k_width;
-    plan.layer_v_width      = kv.layer_v_width;
-    plan.layer_idx_k_width  = kv.layer_idx_k_width;
-    plan.planner_n_ctx      = kv.n_ctx;
-    plan.planner_n_ubatch   = kv.n_ubatch;
-    plan.planner_n_seq_max  = 1;
+    plan.kv_per_layer      = kv.kv_bytes_per_layer();
+    plan.layer_kind        = kv.layer_kind;
+    plan.layer_k_width     = kv.layer_k_width;
+    plan.layer_v_width     = kv.layer_v_width;
+    plan.layer_idx_k_width = kv.layer_idx_k_width;
+    plan.planner_n_ctx     = kv.n_ctx;
+    plan.planner_n_ubatch  = kv.n_ubatch;
+    plan.planner_n_seq_max = 1;
     check_eq("qwen38: the plan's per-layer KV matches kv_info", plan.kv_size_for_layer(3), 576 * mib);
     check_eq("qwen38: the plan's K/V buffer share", plan.kv_main_size_for_layer(3), 512 * mib);
     check_eq("qwen38: the plan's indexer buffer share", plan.kv_idx_size_for_layer(3), 64 * mib);
 
     const auto mask = qwen38_attention_mask();
+
     struct buffer_case {
         const char * name;
         size_t       per_layer;
     };
+
     const buffer_case buffers[] = {
-        { "K/V buffer", 512 * mib },
-        { "indexer buffer", 64 * mib },
+        { "K/V buffer",     512 * mib },
+        { "indexer buffer", 64 * mib  },
     };
     for (const buffer_case & b : buffers) {
         g_log.clear();
