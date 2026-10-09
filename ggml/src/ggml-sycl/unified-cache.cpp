@@ -20,6 +20,7 @@
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 #include "model-lifecycle.hpp"
+#include "moe-host-scatter.hpp"
 #include "moe-resolved-batch.hpp"
 #include "onednn-woq.hpp"
 #include "range-index.hpp"
@@ -2061,6 +2062,22 @@ size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id) {
 // round would make an unplanned device poison its own RUNTIME zone sizing.
 static std::atomic<size_t> g_planned_moe_control_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<bool>   g_planned_moe_control_invalid[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-cre6: planned bytes of the host-expert MoE scatter scratch (RUNTIME zone).
+static std::atomic<size_t> g_planned_moe_host_scatter_bytes[GGML_SYCL_MAX_DEVICES]{};
+
+void unified_cache_set_planned_moe_host_scatter_scratch_bytes(int device_id, size_t bytes) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_moe_host_scatter_bytes[device_id].store(bytes, std::memory_order_release);
+}
+
+size_t unified_cache_get_planned_moe_host_scatter_scratch_bytes(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_moe_host_scatter_bytes[device_id].load(std::memory_order_acquire);
+}
 
 void unified_cache_set_planned_moe_control_requirement(int device_id, const moe_control_requirement & requirement) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
@@ -2309,6 +2326,9 @@ bool unified_cache_dense_scratch_runtime_fit(int        device_id,
                                               unified_cache_get_planned_moe_control_requirement(device_id), &other)) {
         other = 0;  // unanswerable: the zone sizing keeps its default and so does this check
     }
+    // The host-expert MoE scatter scratch (llama.cpp-cre6) does not follow n_ubatch either.
+    const size_t moe_host_scatter = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device_id);
+    other                         = moe_host_scatter > SIZE_MAX - other ? SIZE_MAX : other + moe_host_scatter;
     if (capacity) {
         *capacity = zone_bytes;
     }
@@ -2701,6 +2721,12 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
                                               unified_cache_get_planned_moe_control_requirement(device_id), &base)) {
         return false;
     }
+    // The host-expert MoE scatter scratch lives in this zone (llama.cpp-cre6), checked the same way.
+    const size_t moe_host_scatter = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device_id);
+    if (moe_host_scatter > SIZE_MAX - base) {
+        return false;
+    }
+    base += moe_host_scatter;
     // The dense MMQ/MMVQ Q8_1 src1 buffer lives in this zone (llama.cpp-479i). Checked like
     // the terms above: a wrapped sum would be a SMALLER zone, not a refusal.
     const size_t mmq_src1 = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);
@@ -30011,6 +30037,56 @@ static void validate_moe_mmid_execution_owners(placement_plan & plan) {
     }
 }
 
+// llama.cpp-cre6: the host-expert MoE scatter scratch, published per device. One flush places one op's rows, or a
+// decode gate/up pair's when the layer splits gate and up (the sibling slot then flushes both through one copy and
+// one kernel); each expert matrix's row is its ne[1] floats. Only a tensor whose MUL_MAT_ID takes the host path
+// scatters anything, and only on the device whose layer runs it, so a dense model or an all-VRAM placement plans 0
+// there and nothing is claimed or reported. Whether a tensor takes the host path is the plan's own
+// has_host_experts(), the query the MUL_MAT_ID dispatch asks, which is why this runs after build_index() and not
+// inside populate_host_zone_sizing().
+static void publish_moe_host_scatter_term(const placement_plan &                     plan,
+                                          const std::vector<placement_tensor_info> & tensor_inventory,
+                                          int                                        n_experts,
+                                          int                                        n_expert_used) {
+    std::vector<moe_host_scatter_tensor> scattered;
+    if (n_experts > 0 && n_expert_used > 0) {
+        for (const auto & item : tensor_inventory) {
+            const expert_tensor_role role = expert_tensor_role_from_tensor_name(item.name.c_str());
+            if (role == expert_tensor_role::UNKNOWN || !item.has_shape() || item.ne[1] <= 0) {
+                continue;
+            }
+            const int               layer = expert_layer_from_tensor_name(item.name.c_str());
+            moe_host_scatter_tensor t;
+            t.device           = plan.devices.empty() ? plan.device_id : plan.get_layer_device(layer);
+            t.has_host_experts = plan.has_host_experts(item.name, item.ne[2] > 0 ? item.ne[2] : 1, t.device);
+            t.split_gate_up    = role == expert_tensor_role::GATE || role == expert_tensor_role::UP ||
+                              role == expert_tensor_role::CHUNK_GATE || role == expert_tensor_role::CHUNK_UP;
+            t.row_elems = static_cast<size_t>(item.ne[1]);
+            scattered.push_back(t);
+        }
+    }
+    std::vector<int> devices = plan.devices;
+    if (devices.empty()) {
+        devices.push_back(plan.device_id);
+    }
+    for (int device : devices) {
+        size_t moe_host_scatter_bytes = 0;
+        if (!moe_host_scatter_scratch_bytes_for_device(scattered, device, static_cast<size_t>(n_expert_used),
+                                                       &moe_host_scatter_bytes)) {
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] MoE host scatter scratch on device %d overflows; none is planned and "
+                "host-expert results scatter with one copy per run of rows (llama.cpp-cre6)\n",
+                device);
+            moe_host_scatter_bytes = 0;
+        }
+        unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, moe_host_scatter_bytes);
+        if (moe_host_scatter_bytes != 0) {
+            GGML_LOG_INFO("[SYCL-PLAN] MoE host scatter scratch on device %d: %.1f KB (RUNTIME zone)\n", device,
+                          moe_host_scatter_bytes / 1024.0);
+        }
+    }
+}
+
 static void populate_host_zone_sizing(placement_plan &                           plan,
                                       const std::vector<placement_tensor_info> & tensor_inventory,
                                       int                                        n_experts,
@@ -31310,6 +31386,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
 
     // Build the name->index lookup for O(1) queries
     plan.build_index();
+    publish_moe_host_scatter_term(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
     log_moe_placement_diagnostics("PLACEMENT-MOE", plan, n_experts);
 
     // Log placement summary per priority level
@@ -33331,6 +33408,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     populate_host_zone_sizing(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
 
     plan.build_index();
+    publish_moe_host_scatter_term(plan, tensor_inventory, n_experts, kv_info.n_expert_used);
     log_moe_placement_diagnostics("PLACEMENT-MOE", plan, n_experts);
 
     // Build runtime query maps for multi-device inference routing.

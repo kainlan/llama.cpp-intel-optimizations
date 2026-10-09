@@ -475,6 +475,15 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-moe-decode-hostpath PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# Host-expert MoE result scatter (llama.cpp-cre6): the compact form (one copy into the planned scratch, one kernel
+# placing rows by slot) against the per-run copies it replaces, on synthetic routings. ggml-sycl/moe-host-scatter.hpp
+# includes only the standard library, so this needs no device.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-moe-host-scatter.cpp)
+    set_tests_properties(test-sycl-moe-host-scatter PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-moe-host-scatter PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
 # Decode/prompt classification of a scheduler split (llama.cpp-7pm2): MUL_MAT_ID is batch evidence and a split with
 # no matmul keeps the previous phase. ggml-sycl/graph-phase.hpp includes only ggml.h; the test builds synthetic
 # graphs on a no-alloc ggml context, so it needs no device.
@@ -4313,6 +4322,18 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-load-compute-term-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-load-compute-term-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-cre6: the host-expert MoE result scatter scratch is the third planned RUNTIME-zone buffer, in the g6yk
+# shape: a planned term published with the MoE control requirement and folded into the RUNTIME zone requirement and
+# the dense fit, claimed whole at publish (after the Q8_1 claim, before the hold is recomputed), charged to the ring
+# re-plan, and never allocated by the scatter itself. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-host-scatter-plan-claim-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-host-scatter-plan-claim-source.py
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()

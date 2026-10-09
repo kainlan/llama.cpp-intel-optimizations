@@ -20,7 +20,8 @@ production code actually uses it and that the old per-op path is gone.
 The same defect, second arm: the dense f16 dequant arm of ggml_sycl_op_mul_mat_sycl minted an f16 copy of
 the WHOLE weight (and of the activations) from the SCRATCH pool per op -- 11 raw 60 MiB spills on
 the same run once the Q8 buffer was planned. It gets the same treatment: one persistent
-RUNTIME-zone, spill-forbidden buffer (common.hpp dequant_f16_scratch_t), planned from the
+RUNTIME-zone, spill-forbidden buffer (common.hpp dequant_f16_scratch_t, an instance of the shared
+planned_runtime_scratch_t), planned from the
 inventory and checked against the graph's own demand before anything is submitted.
 
 Run with --self-test to prove every check fires against a mutant of the thing it
@@ -140,7 +141,10 @@ def evaluate(backend, common, cache, zone):
     results["anchor: graph_compute_unchecked exists"] = graph_entry is not None
     results["anchor: runtime zone requirement exists"] = req_fn is not None
     results["anchor: zone adapter exists"] = adapter is not None
-    dq_struct = function_body(common, r"struct dequant_f16_scratch_t\s*\{")
+    # The dequant buffers are instances of the shared planned_runtime_scratch_t template (llama.cpp-cre6), so
+    # the allocator facts are read from that template's body, and the alias ties the buffers to it.
+    dq_alias = re.search(r"using dequant_f16_scratch_t\s*=\s*planned_runtime_scratch_t<", common) is not None
+    dq_struct = function_body(common, r"struct planned_runtime_scratch_t\s*\{") if dq_alias else None
     dq_ensure = function_body(dq_struct, r"void \* ensure_buffer\([^)]*\)\s*\{") if dq_struct else None
     dq_acquire = function_body(backend, r"static void \* ggml_sycl_dequant_f16_scratch\([^)]*\)\s*\{")
     dq_walk = function_body(backend, r"static bool ggml_sycl_dequant_f16_ensure_for_graph\([^)]*\)\s*\{")
@@ -1384,7 +1388,7 @@ if args.self_test:
          (backend, mutate_after(common, "inline void * ggml_sycl_runtime_scratch_ensure(",
                                 "forbid_vram_zone_spill = true", "forbid_vram_zone_spill = false"), cache, zone)),
         ("dequant weight zone", "dequant scratch never prefers the WEIGHT or SCRATCH zone",
-         (backend, mutate_after(common, "struct dequant_f16_scratch_t", "ggml_sycl_runtime_scratch_ensure<",
+         (backend, mutate_after(common, "struct planned_runtime_scratch_t", "ggml_sycl_runtime_scratch_ensure<",
                                 "ggml_sycl_runtime_scratch_ensure_scratch_zone<"), cache, zone)),
         ("dequant planner blind", "the runtime zone requirement folds in the planned dequant bytes",
          (backend, common, mutate(cache, "const size_t dequant_f16 = unified_cache_get_planned_dequant_f16_scratch_bytes(",
@@ -1415,7 +1419,7 @@ if args.self_test:
          (backend, mutate_in_func(common, r"inline void \* ggml_sycl_runtime_scratch_ensure\(",
                                   "has_property<sycl::property::queue::in_order>", "has_property<XXXX>"), cache, zone)),
         ("private allocator", "the dequant buffer ensures through the shared allocator",
-         (backend, mutate_after(common, "struct dequant_f16_scratch_t", "ggml_sycl_runtime_scratch_ensure<",
+         (backend, mutate_after(common, "struct planned_runtime_scratch_t", "ggml_sycl_runtime_scratch_ensure<",
                                 "ggml_sycl_XXXX<"), cache, zone)),
         # llama.cpp-kpjw
         ("zone request ignores the hold", "a RUNTIME zone request asks the pure held-back predicate",
