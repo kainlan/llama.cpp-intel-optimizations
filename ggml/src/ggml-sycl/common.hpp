@@ -5261,6 +5261,17 @@ inline void * ggml_sycl_get_layout_ptr_impl(const ggml_tensor * tensor, int devi
 
 #include "sycl-tensor.hpp"
 
+// GGML_SYCL_HANDLE_TRACE, read once per process: its readers sit on per-op
+// resolve and route paths (llama.cpp-5tdy measured getenv at 0.7% of the
+// submitting thread in Qwen3.8 decode).
+inline bool ggml_sycl_handle_trace_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_HANDLE_TRACE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // Resolve a weight layout pointer for a specific target layout.
 // Returns nullptr if the requested layout cannot be satisfied.
 inline bool ggml_sycl_unified_dispatch_env_enabled() {
@@ -5326,7 +5337,7 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
         if (tensor->extra != nullptr && ggml_sycl_valid_device_index(device)) {
             auto *       extra  = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
             const auto & handle = extra->data_handle[device];
-            if (const char * trace = std::getenv("GGML_SYCL_HANDLE_TRACE"); trace && std::atoi(trace) != 0) {
+            if (ggml_sycl_handle_trace_enabled()) {
                 fprintf(stderr,
                         "[HANDLE-RESOLVE] tensor=%s request_device=%d handle_valid=%d handle_kind=%d "
                         "handle_device=%d\n",

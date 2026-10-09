@@ -1813,6 +1813,20 @@ if (NOT WIN32)
         TIMEOUT 400
     )
 
+    # llama.cpp-5tdy: the placement plan's per-op read path reads the residency
+    # summary -- has_host_experts and mul_mat_id's residency predicates do not
+    # sweep every expert through lookup_expert_placement.
+    llama_test_cmd(
+        ${LLAMA_PYTHON3}
+        NAME test-sycl-placement-read-path-source
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-placement-read-path-source.py
+    )
+    set_tests_properties(test-sycl-placement-read-path-source PROPERTIES
+        LABELS "sycl;tdd;python"
+        TIMEOUT 60
+    )
+
     # Regression + arithmetic gate for parse-sycl-gap-device-split.py, the
     # device-clock A/B decomposition the Cluster B verdict rests on. Registered
     # because that script shipped with a reproducible ZeroDivisionError: its

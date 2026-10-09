@@ -149,12 +149,16 @@ struct ggml_sycl_fattn_xmx_packed_k_sidecar_entry {
 std::mutex                                                               g_packed_k_sidecar_mutex;
 std::vector<std::unique_ptr<ggml_sycl_fattn_xmx_packed_k_sidecar_entry>> g_packed_k_sidecars;
 
+// Read once per process: the caller runs for every K-cache set_rows (llama.cpp-5tdy).
 static bool ggml_sycl_fattn_xmx_sidecar_enabled() {
-    if (std::getenv("GGML_SYCL_PACKED_K_SIDECAR") != nullptr) {
-        return true;
-    }
-    const char * force = std::getenv("GGML_SYCL_FA_FORCE_PATH");
-    return force && std::strstr(force, "split-packed") != nullptr;
+    static const bool enabled = [] {
+        if (std::getenv("GGML_SYCL_PACKED_K_SIDECAR") != nullptr) {
+            return true;
+        }
+        const char * force = std::getenv("GGML_SYCL_FA_FORCE_PATH");
+        return force && std::strstr(force, "split-packed") != nullptr;
+    }();
+    return enabled;
 }
 
 // Prefix-only on purpose: tagged caches such as "cache_idx_k_l<N>" are excluded because the sidecar is scoped to
@@ -2572,13 +2576,19 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     }
 
     // ---- Debug trace: gated by GGML_SYCL_FA_DISPATCH_DEBUG, limited by GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT ----
+    // Both variables are read once per process; this dispatcher runs for every
+    // attention op (llama.cpp-5tdy).
     static std::atomic<int> fattn_dispatch_debug_count = 0;
+    static const int        fattn_dispatch_debug_limit = [] {
+        const char * env = std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT");
+        return env ? std::atoi(env) : 32;
+    }();
+    static const bool fattn_dispatch_debug_env = std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG") != nullptr;
+
     int        dispatch_debug_counter = fattn_dispatch_debug_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    int        debug_limit            = std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT") ?
-                                            std::atoi(std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT")) :
-                                            32;
-    const bool dispatch_debug_enabled =
-        std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG") && dispatch_debug_counter <= debug_limit;
+    int        debug_limit            = fattn_dispatch_debug_limit;
+    const bool dispatch_debug_enabled = fattn_dispatch_debug_env && dispatch_debug_counter <= debug_limit;
+
     auto dispatch_debug_kernel = [&](const char * kernel) {
         // llama.cpp-dyi3: OBSERVE (not predict) which kernel family a
         // decode-shape (ne01<=1) FA op actually reached. This is the
@@ -2763,7 +2773,13 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
 
     // ---- GGML_SYCL_FA_FORCE_PATH: override all shape-based kernel selection ----
     {
-        const char * force = std::getenv("GGML_SYCL_FA_FORCE_PATH");
+        // Read once per process (llama.cpp-5tdy); a copy, so a later setenv
+        // cannot leave a dangling pointer.
+        static const std::pair<bool, std::string> fattn_force_path_env = [] {
+            const char * env = std::getenv("GGML_SYCL_FA_FORCE_PATH");
+            return std::make_pair(env != nullptr, std::string(env ? env : ""));
+        }();
+        const char * force = fattn_force_path_env.first ? fattn_force_path_env.second.c_str() : nullptr;
         if (force) {
             bool force_known = false;
 
@@ -3135,8 +3151,8 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                 dispatch_debug_kernel("onednn");
                 return;
             }
-            if (plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED &&
-                std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG") && dispatch_debug_counter <= debug_limit) {
+            if (plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED && fattn_dispatch_debug_env &&
+                dispatch_debug_counter <= debug_limit) {
                 fprintf(
                     stderr,
                     "[SYCL] fattn: oneDNN MATERIALIZE_REQUIRED_BUT_UNAVAILABLE; falling back to native FA: reason=%s\n",

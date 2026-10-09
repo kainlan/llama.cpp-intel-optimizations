@@ -4812,6 +4812,35 @@ set_tests_properties(sycl-plan-cpu-work PROPERTIES
     TIMEOUT 120
 )
 
+# The placement plan's per-(layer, role) residency summary agrees with the
+# per-expert sweep it replaced (llama.cpp-5tdy). Host-only: synthetic plans, no
+# queue, no device, no model.
+add_executable(test-sycl-placement-residency-summary
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-placement-residency-summary.cpp
+)
+target_include_directories(test-sycl-placement-residency-summary PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-placement-residency-summary PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-placement-residency-summary PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-placement-residency-summary PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-placement-residency-summary PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-placement-residency-summary PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-placement-residency-summary COMMAND test-sycl-placement-residency-summary)
+set_tests_properties(sycl-placement-residency-summary PROPERTIES
+    LABELS "sycl;plan;host;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 add_test(NAME test-sycl-moe-handle-resolution COMMAND test-sycl-moe-handle-resolution)
 set_tests_properties(test-sycl-moe-handle-resolution PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"

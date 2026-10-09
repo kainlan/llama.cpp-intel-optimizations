@@ -735,6 +735,61 @@ struct moe_mmid_owner_workspace_plan {
 
 // Complete placement plan for all model weights.
 // Supports single-device (P4) and multi-device (P4.5) planning.
+// llama.cpp-5tdy: residency counts for one group of expert entries -- one
+// (layer, role) of the semantic expert index, or one tensor name of the
+// name-keyed fallback index -- so the per-op residency predicates read a count
+// instead of sweeping every expert through lookup_expert_placement(). The plan
+// stays the authority: placement_plan::build_index() derives the groups from
+// the entries, and placement_plan::update_expert_placement() moves an entry
+// between counts. Nothing else may change an indexed entry's on_device or
+// target_device without calling build_index() again (the same contract the
+// indexes themselves already carry).
+struct expert_residency_group {
+    int32_t                              n_entries   = 0;      // experts indexed in the group
+    int32_t                              expert_span = 0;      // max expert_id + 1 over the group
+    int32_t                              n_host      = 0;      // entries with on_device == false
+    std::vector<std::pair<int, int32_t>> on_device_by_target;  // on_device entries per target_device
+
+    int32_t n_on_device() const { return n_entries - n_host; }
+
+    int32_t n_on_target(int target) const {
+        for (const auto & [dev, count] : on_device_by_target) {
+            if (dev == target) {
+                return count;
+            }
+        }
+        return 0;
+    }
+
+    void count_residency(bool on_device, int target, int32_t delta) {
+        if (!on_device) {
+            n_host += delta;
+            return;
+        }
+        for (auto & [dev, count] : on_device_by_target) {
+            if (dev == target) {
+                count += delta;
+                return;
+            }
+        }
+        on_device_by_target.emplace_back(target, delta);
+    }
+
+    void add_entry(const placement_entry & e) {
+        n_entries++;
+        expert_span = std::max(expert_span, static_cast<int32_t>(e.expert_id) + 1);
+        count_residency(e.on_device, e.target_device, 1);
+    }
+};
+
+// Counts over experts [0, n) of one (layer, role), semantic index only.
+struct expert_residency_counts {
+    int64_t found     = 0;  // experts with a semantic entry
+    int64_t host      = 0;  // found and on_device == false
+    int64_t on_device = 0;  // found and on_device (any target)
+    int64_t on_target = 0;  // found, on_device and target_device == the queried device
+};
+
 struct placement_plan {
     std::vector<placement_entry> entries;            // All weights, sorted by priority
     size_t                       vram_bytes;         // Total planned bytes on device(s), including KV
@@ -1100,19 +1155,34 @@ struct placement_plan {
         refresh_kv_byte_totals();
     }
 
+    // Non-copying view of one expert's planned entry, or nullptr when the
+    // semantic index has none. Per-op callers use this (llama.cpp-5tdy):
+    // lookup_expert_placement() below returns a copy, std::string and
+    // std::vector included, and is kept for planner and diagnostic paths.
+    const placement_entry * find_expert_entry(int layer_id, int expert_id, expert_tensor_role role) const {
+        auto it = expert_placement_index_.find(expert_placement_key{ layer_id, expert_id, role });
+        return it == expert_placement_index_.end() ? nullptr : &entries[it->second];
+    }
+
+    // Parses the tensor name on every call: a caller asking about several
+    // experts of one tensor parses once and uses the 3-arg overload.
+    const placement_entry * find_expert_entry(const char * tensor_name, int expert_id) const {
+        return find_expert_entry(expert_layer_from_tensor_name(tensor_name), expert_id,
+                                 expert_tensor_role_from_tensor_name(tensor_name));
+    }
+
     expert_placement_result lookup_expert_placement(int layer_id, int expert_id, expert_tensor_role role) const {
         expert_placement_result result;
         result.layer_id  = layer_id;
         result.expert_id = expert_id;
         result.role      = role;
 
-        const expert_placement_key key{ layer_id, expert_id, role };
-        auto                       it = expert_placement_index_.find(key);
-        if (it == expert_placement_index_.end()) {
+        const placement_entry * found = find_expert_entry(layer_id, expert_id, role);
+        if (!found) {
             return result;
         }
 
-        const auto & e           = entries[it->second];
+        const auto & e           = *found;
         result.status            = expert_placement_status::FOUND;
         result.tensor_name       = e.name;
         result.on_device         = e.on_device;
@@ -1160,6 +1230,19 @@ struct placement_plan {
             saturating_sub(host_bytes, e.dst_size + e.kv_size);
             weight_vram_bytes += charge;
             vram_bytes += charge + e.kv_size;
+        }
+
+        auto group_it = expert_groups_.find(expert_residency_group_key(layer_id, role));
+        if (group_it != expert_groups_.end()) {
+            group_it->second.count_residency(e.on_device, e.target_device, -1);
+            group_it->second.count_residency(on_device, target, 1);
+        }
+        if (expert_fallback_entries_.count(it->second) != 0) {
+            auto fallback_it = expert_fallback_groups_.find(e.name);
+            if (fallback_it != expert_fallback_groups_.end()) {
+                fallback_it->second.count_residency(e.on_device, e.target_device, -1);
+                fallback_it->second.count_residency(on_device, target, 1);
+            }
         }
 
         e.on_device     = on_device;
@@ -1333,55 +1416,101 @@ struct placement_plan {
     // tensor_name: the composite MoE tensor name (e.g. "blk.0.ffn_down_exps")
     // expert_id: individual expert index (0..n_experts-1)
     // device_id: if >= 0, checks assignment to a specific device; -1 checks any device
+    bool expert_on_device(const char * tensor_name, int expert_id, int device_id = -1) const {
+        const placement_entry * e = find_expert_entry(tensor_name, expert_id);
+        if (!e) {
+            // Missing/unclassified entries are explicit host/miss, never implicit device.
+            e = find_fallback_expert_entry(tensor_name, expert_id);
+        }
+        return e && e->on_device && (device_id < 0 || e->target_device == device_id);
+    }
+
     bool expert_on_device(const std::string & tensor_name, int expert_id, int device_id = -1) const {
-        const auto placement = lookup_expert_placement(tensor_name, expert_id);
-        if (placement.found()) {
-            if (!placement.on_device) {
-                return false;
+        return expert_on_device(tensor_name.c_str(), expert_id, device_id);
+    }
+
+    // Counts over experts [0, n_experts) of one (layer, role), semantic index
+    // only. O(1) when the range covers the group (n_experts >= the group's
+    // expert span, which holds whenever n_experts is the tensor's expert count).
+    expert_residency_counts count_planned_experts(int                layer_id,
+                                                  expert_tensor_role role,
+                                                  int64_t            n_experts,
+                                                  int                device_id) const {
+        expert_residency_counts        counts;
+        const expert_residency_group * group = find_expert_group(layer_id, role);
+        if (!group || n_experts <= 0) {
+            return counts;
+        }
+        if (n_experts >= group->expert_span) {
+            counts.found     = group->n_entries;
+            counts.host      = group->n_host;
+            counts.on_device = group->n_on_device();
+            counts.on_target = group->n_on_target(device_id);
+            return counts;
+        }
+        // A prefix of the group: walk it through the non-copying view.
+        for (int64_t e = 0; e < n_experts; ++e) {
+            const placement_entry * p = find_expert_entry(layer_id, static_cast<int>(e), role);
+            if (!p) {
+                continue;
             }
-            if (device_id >= 0) {
-                return placement.target_device == device_id;
+            counts.found++;
+            if (!p->on_device) {
+                counts.host++;
+                continue;
             }
+            counts.on_device++;
+            if (p->target_device == device_id) {
+                counts.on_target++;
+            }
+        }
+        return counts;
+    }
+
+    expert_residency_counts count_planned_experts(const char * tensor_name, int64_t n_experts, int device_id) const {
+        return count_planned_experts(expert_layer_from_tensor_name(tensor_name),
+                                     expert_tensor_role_from_tensor_name(tensor_name), n_experts, device_id);
+    }
+
+    // True when every expert in [0, n_experts) has a semantic entry planned on
+    // device_id. Same answer as looping lookup_expert_placement(tensor_name, e)
+    // and requiring found && on_device && target_device == device_id.
+    bool all_experts_on_device(const char * tensor_name, int64_t n_experts, int device_id) const {
+        if (n_experts <= 0) {
             return true;
         }
+        const expert_residency_counts counts =
+            count_planned_experts(expert_layer_from_tensor_name(tensor_name),
+                                  expert_tensor_role_from_tensor_name(tensor_name), n_experts, device_id);
+        return counts.on_target == n_experts;
+    }
 
-        const std::string key = tensor_name + ":e" + std::to_string(expert_id);
-        auto              it  = expert_index_.find(key);
-        if (it == expert_index_.end()) {
-            return false;  // Missing/unclassified entries are explicit host/miss, never implicit device.
-        }
-        const auto & e = entries[it->second];
-        if (!e.on_device) {
-            return false;
-        }
-        if (device_id >= 0) {
-            return e.target_device == device_id;
-        }
-        return true;
+    // How many experts in [0, n_experts) expert_on_device(tensor_name, e, device_id) holds for.
+    int64_t count_experts_on_device(const char * tensor_name, int64_t n_experts, int device_id = -1) const {
+        const int                     layer_id = expert_layer_from_tensor_name(tensor_name);
+        const expert_tensor_role      role     = expert_tensor_role_from_tensor_name(tensor_name);
+        const expert_residency_counts counts   = count_planned_experts(layer_id, role, n_experts, device_id);
+        return (device_id >= 0 ? counts.on_target : counts.on_device) +
+               count_fallback_experts_on_device(tensor_name, layer_id, role, n_experts, device_id);
     }
 
     // Returns true if any expert of the given MoE tensor is planned for host (not device).
-    // Replaces the static plan_has_cpu_cache map in ggml_sycl_mul_mat_id: the expert_index_
-    // already provides O(1) per-expert lookup, so a separate memoization layer is redundant.
+    // Replaces the static plan_has_cpu_cache map in ggml_sycl_mul_mat_id. Reads the
+    // per-(layer, role) residency summary that build_index() and
+    // update_expert_placement() maintain, so it is O(1) per call (llama.cpp-5tdy).
     // device_id: if >= 0, checks residency for that specific device; -1 checks any device.
-    bool has_host_experts(const std::string & tensor_name, int64_t n_experts, int device_id = -1) const {
+    bool has_host_experts(const char * tensor_name, int64_t n_experts, int device_id = -1) const {
         (void) device_id;
-        for (int64_t e = 0; e < n_experts; ++e) {
-            const auto placement = lookup_expert_placement(tensor_name, static_cast<int>(e));
-            if (placement.found()) {
-                if (!placement.on_device) {
-                    return true;
-                }
-                continue;
-            }
-
-            const std::string key = tensor_name + ":e" + std::to_string(e);
-            auto              it  = expert_index_.find(key);
-            if (it != expert_index_.end() && !entries[it->second].on_device) {
-                return true;
-            }
+        const int                layer_id = expert_layer_from_tensor_name(tensor_name);
+        const expert_tensor_role role     = expert_tensor_role_from_tensor_name(tensor_name);
+        if (count_planned_experts(layer_id, role, n_experts, -1).host > 0) {
+            return true;
         }
-        return false;
+        return fallback_has_host_experts(tensor_name, layer_id, role, n_experts);
+    }
+
+    bool has_host_experts(const std::string & tensor_name, int64_t n_experts, int device_id = -1) const {
+        return has_host_experts(tensor_name.c_str(), n_experts, device_id);
     }
 
     // Build the name->index lookup after entries are populated.
@@ -1416,15 +1545,116 @@ struct placement_plan {
                 name_index_[e.name] = i;
             }
         }
+
+        // Residency summary (llama.cpp-5tdy). One group per (layer, role) of
+        // the semantic index. The fallback groups hold the name-keyed entries
+        // a by-name query falls back to: those whose own name does not reach a
+        // semantic entry (unclassified roles, a layer the name does not carry).
+        expert_groups_.clear();
+        expert_fallback_groups_.clear();
+        expert_fallback_entries_.clear();
+        for (const auto & [key, index] : expert_placement_index_) {
+            expert_groups_[expert_residency_group_key(key.layer_id, key.role)].add_entry(entries[index]);
+        }
+        for (const auto & [key, index] : expert_index_) {
+            const placement_entry & e = entries[index];
+            if (find_expert_entry(e.name.c_str(), e.expert_id)) {
+                continue;
+            }
+            expert_fallback_groups_[e.name].add_entry(e);
+            expert_fallback_entries_.insert(index);
+        }
     }
 
   private:
+    static int64_t expert_residency_group_key(int layer_id, expert_tensor_role role) {
+        return (static_cast<int64_t>(layer_id) << 8) | static_cast<int64_t>(static_cast<uint8_t>(role));
+    }
+
+    const expert_residency_group * find_expert_group(int layer_id, expert_tensor_role role) const {
+        auto it = expert_groups_.find(expert_residency_group_key(layer_id, role));
+        return it == expert_groups_.end() ? nullptr : &it->second;
+    }
+
+    // The name-keyed entry a by-name query falls back to when the semantic
+    // index misses ("tensor_name:eN").
+    const placement_entry * find_fallback_expert_entry(const char * tensor_name, int expert_id) const {
+        if (expert_index_.empty() || !tensor_name) {
+            return nullptr;
+        }
+        const std::string key = std::string(tensor_name) + ":e" + std::to_string(expert_id);
+        auto              it  = expert_index_.find(key);
+        return it == expert_index_.end() ? nullptr : &entries[it->second];
+    }
+
+    const expert_residency_group * find_fallback_group(const char * tensor_name) const {
+        if (expert_fallback_groups_.empty() || !tensor_name) {
+            return nullptr;
+        }
+        auto it = expert_fallback_groups_.find(tensor_name);
+        return it == expert_fallback_groups_.end() ? nullptr : &it->second;
+    }
+
+    // The fallback half of has_host_experts(): an expert in [0, n_experts)
+    // that the semantic index misses and whose name-keyed entry is on host.
+    bool fallback_has_host_experts(const char *       tensor_name,
+                                   int                layer_id,
+                                   expert_tensor_role role,
+                                   int64_t            n_experts) const {
+        const expert_residency_group * group = find_fallback_group(tensor_name);
+        if (!group || group->n_host == 0 || n_experts <= 0) {
+            return false;
+        }
+        if (n_experts >= group->expert_span) {
+            return true;
+        }
+        for (int64_t e = 0; e < n_experts; ++e) {
+            if (find_expert_entry(layer_id, static_cast<int>(e), role)) {
+                continue;
+            }
+            const placement_entry * p = find_fallback_expert_entry(tensor_name, static_cast<int>(e));
+            if (p && !p->on_device) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The fallback half of count_experts_on_device().
+    int64_t count_fallback_experts_on_device(const char *       tensor_name,
+                                             int                layer_id,
+                                             expert_tensor_role role,
+                                             int64_t            n_experts,
+                                             int                device_id) const {
+        const expert_residency_group * group = find_fallback_group(tensor_name);
+        if (!group || n_experts <= 0) {
+            return 0;
+        }
+        if (n_experts >= group->expert_span) {
+            return device_id >= 0 ? group->n_on_target(device_id) : group->n_on_device();
+        }
+        int64_t count = 0;
+        for (int64_t e = 0; e < n_experts; ++e) {
+            if (find_expert_entry(layer_id, static_cast<int>(e), role)) {
+                continue;
+            }
+            const placement_entry * p = find_fallback_expert_entry(tensor_name, static_cast<int>(e));
+            if (p && p->on_device && (device_id < 0 || p->target_device == device_id)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     std::unordered_map<std::string, size_t> name_index_;    // Dense weights: name -> index
     std::unordered_map<std::string, size_t> expert_index_;  // MoE experts: "name:eN" -> index
     std::unordered_map<expert_placement_key, size_t, expert_placement_key_hash>
            expert_placement_index_;                         // MoE experts: (layer, expert, role) -> index
     size_t expert_placement_duplicate_count_    = 0;
     size_t expert_placement_unclassified_count_ = 0;
+    std::unordered_map<int64_t, expert_residency_group>     expert_groups_;            // (layer, role) -> residency
+    std::unordered_map<std::string, expert_residency_group> expert_fallback_groups_;   // name -> fallback residency
+    std::unordered_set<size_t>                              expert_fallback_entries_;  // entries counted there
 };
 
 struct moe_mmid_queue_binding {
