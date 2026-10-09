@@ -9396,8 +9396,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     // via GGML_SYCL_CPU_EXPERT_THREADS=N.
     if (max_K > 0 && max_N > 0 && max_dispatch_count > 0) {
         auto & cpu_pool = g_cpu_expert_pools[device];
-        cpu_pool.init(0 /* auto thread count */, static_cast<size_t>(max_dispatch_count), static_cast<size_t>(max_K),
-                      static_cast<size_t>(max_N), q);
+        cpu_pool.init(0 /* auto thread count */);
     }
 
     // -----------------------------------------------------------------------
