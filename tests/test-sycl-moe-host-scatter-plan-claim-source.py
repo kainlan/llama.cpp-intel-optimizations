@@ -174,7 +174,7 @@ def claim_zone_requirement_folds_in_the_term(cache: str) -> bool:
     read_at = req.find("const size_t moe_host_scatter = unified_cache_get_planned_moe_host_scatter_scratch_bytes(device_id);")
     check_at = req.find("if (moe_host_scatter > SIZE_MAX - base) { return false; }", read_at)
     add_at = req.find("base += moe_host_scatter;", check_at)
-    out_at = req.find("*out = base + mmq_src1 + dequant_f16;", add_at)
+    out_at = req.find("*out = base + mmq_src1 + dequant_f16", add_at)
     return (min(read_at, check_at, add_at, out_at) >= 0
             and re.search(r"unified_cache_get_planned_runtime_zone_requirement\(dev_id, &planned_runtime_scratch\).*?"
                           r"runtime_zone = planned_runtime_scratch;", t) is not None)
