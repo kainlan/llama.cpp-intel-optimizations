@@ -93,9 +93,9 @@ struct cpu_expert_pool_trace_totals {
     double   compute_us  = 0.0;
     double   wall_us     = 0.0;
 
-    // The same jobs split by the weight type of their rows (llama.cpp-y9i6).
-    // Slot GGML_TYPE_COUNT holds the jobs whose rows mix types, and slot
-    // GGML_TYPE_COUNT + 1 the jobs that ran no row loop: the batched kernel
+    // The same jobs split by the weight type of their rows (llama.cpp-y9i6),
+    // indexed by type. by_type[slot_mixed] holds the jobs whose rows mix types,
+    // and by_type[slot_none] the jobs that ran no row loop: the batched kernel
     // returned before it, or every task took the MXFP4 multi-activation path.
     //   threads_max  most threads one job of the type ran on
     //   overlapped   jobs that ran at the same time as another pool job at some
@@ -112,7 +112,11 @@ struct cpu_expert_pool_trace_totals {
         double   compute_us  = 0.0;
     };
 
-    type_totals by_type[GGML_TYPE_COUNT + 2];
+    static constexpr int slot_mixed = GGML_TYPE_COUNT;
+    static constexpr int slot_none  = GGML_TYPE_COUNT + 1;
+    static constexpr int n_slots    = GGML_TYPE_COUNT + 2;
+
+    type_totals by_type[n_slots];
 };
 
 void cpu_expert_pool_trace_take(cpu_expert_pool_trace_totals & out);

@@ -122,9 +122,10 @@ void cpu_expert_pool_trace_add_job(cpu_expert_pool_trace_totals &         totals
     totals.compute_us += ph.compute_us;
     totals.wall_us += wall_us;
 
-    int slot = ph.type >= 0 && ph.type < GGML_TYPE_COUNT ? static_cast<int>(ph.type) : GGML_TYPE_COUNT;
+    int slot = ph.type >= 0 && ph.type < GGML_TYPE_COUNT ? static_cast<int>(ph.type) :
+                                                           cpu_expert_pool_trace_totals::slot_mixed;
     if (ph.rows == 0) {
-        slot = GGML_TYPE_COUNT + 1;
+        slot = cpu_expert_pool_trace_totals::slot_none;
     }
     cpu_expert_pool_trace_totals::type_totals & t = totals.by_type[slot];
     t.jobs += 1;
@@ -139,14 +140,14 @@ void cpu_expert_pool_trace_add_job(cpu_expert_pool_trace_totals &         totals
 std::string cpu_expert_pool_trace_format_types(const cpu_expert_pool_trace_totals & totals) {
     std::string out;
     char        buf[256];
-    for (int i = 0; i <= GGML_TYPE_COUNT + 1; i++) {
+    for (int i = 0; i < cpu_expert_pool_trace_totals::n_slots; i++) {
         const cpu_expert_pool_trace_totals::type_totals & t = totals.by_type[i];
         if (t.jobs == 0) {
             continue;
         }
-        const char * name = i == GGML_TYPE_COUNT     ? "mixed" :
-                            i == GGML_TYPE_COUNT + 1 ? "none" :
-                                                       ggml_type_name(static_cast<ggml_type>(i));
+        const char * name = i == cpu_expert_pool_trace_totals::slot_mixed ? "mixed" :
+                            i == cpu_expert_pool_trace_totals::slot_none  ? "none" :
+                                                                            ggml_type_name(static_cast<ggml_type>(i));
         const double gbps = t.compute_us > 0.0 ? static_cast<double>(t.bytes) / (t.compute_us * 1e3) : 0.0;
         snprintf(buf, sizeof(buf), " %s:jobs=%llu,rows=%llu,bytes=%llu,compute=%.0fus,gbps=%.2f,thr=%.1f/%llu,ovl=%llu",
                  name, (unsigned long long) t.jobs, (unsigned long long) t.rows, (unsigned long long) t.bytes,

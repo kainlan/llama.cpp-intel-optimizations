@@ -486,12 +486,12 @@ static bool test_pool_trace_per_type() {
                s.compute_us);
         return false;
     }
-    if (t.by_type[GGML_TYPE_Q2_0].jobs != 1 || t.by_type[GGML_TYPE_COUNT].jobs != 1 ||
-        t.by_type[GGML_TYPE_COUNT + 1].jobs != 1 || t.by_type[GGML_TYPE_Q4_0].jobs != 0) {
+    if (t.by_type[GGML_TYPE_Q2_0].jobs != 1 || t.by_type[cpu_expert_pool_trace_totals::slot_mixed].jobs != 1 ||
+        t.by_type[cpu_expert_pool_trace_totals::slot_none].jobs != 1 || t.by_type[GGML_TYPE_Q4_0].jobs != 0) {
         printf("FAIL (slots: q2_0=%llu mixed=%llu none=%llu q4_0=%llu)\n",
                (unsigned long long) t.by_type[GGML_TYPE_Q2_0].jobs,
-               (unsigned long long) t.by_type[GGML_TYPE_COUNT].jobs,
-               (unsigned long long) t.by_type[GGML_TYPE_COUNT + 1].jobs,
+               (unsigned long long) t.by_type[cpu_expert_pool_trace_totals::slot_mixed].jobs,
+               (unsigned long long) t.by_type[cpu_expert_pool_trace_totals::slot_none].jobs,
                (unsigned long long) t.by_type[GGML_TYPE_Q4_0].jobs);
         return false;
     }
