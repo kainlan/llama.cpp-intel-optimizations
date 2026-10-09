@@ -23586,6 +23586,141 @@ static thread_local pending_cpu_scatter g_pending_scatter_sibling = {};
 // count it was made at; see moe_shared_act_reusable().
 static thread_local uint64_t g_cpu_scatter_serial = 0;
 
+// ---------------------------------------------------------------------------
+// Submitting-thread wait census for the host-expert MoE decode path
+// (llama.cpp-z4kd).  Under GGML_SYCL_MOE_IDS_COPY_TRACE, one WARN line per
+// decode token reports, for each wait class (B1..B7, listed with the
+// classifiers in moe-decode-hostpath.hpp), how many times this thread blocked
+// and for how long.
+// A token's line is printed when the next token's first id readback arrives
+// (the layer id drops), so it includes the boundary flushes in between.  The
+// last token of a run is not printed.  Counters are never reset between
+// prefill and decode, so two readings need care:
+//   - token 0 also carries every wait of the prompt's ubatches;
+//   - B4b counts any hot-group join, so during prefill it also counts the
+//     gate/up jobs a multi-row hot group joins, not only down.
+// When the variable is unset, a timed wait costs two cached flag tests (one
+// when the timer starts, one when it ends) and reads no clock and classifies
+// nothing; a flush context still saves and restores the thread-local context
+// field unconditionally.
+// ---------------------------------------------------------------------------
+using ggml_sycl::MOE_WAIT_B1;
+using ggml_sycl::MOE_WAIT_B2;
+using ggml_sycl::MOE_WAIT_B3;
+using ggml_sycl::MOE_WAIT_B4;
+using ggml_sycl::MOE_WAIT_B4B;
+using ggml_sycl::MOE_WAIT_B5;
+using ggml_sycl::MOE_WAIT_B6;
+using ggml_sycl::MOE_WAIT_B7;
+using ggml_sycl::MOE_WAIT_COUNT;
+using ggml_sycl::MOE_WAIT_JOIN;
+using ggml_sycl::MOE_WAIT_NONE;
+
+struct moe_hostpath_wait_census {
+    uint64_t count[MOE_WAIT_COUNT] = {};
+    double   us[MOE_WAIT_COUNT]    = {};
+    uint64_t token                 = 0;
+    int      last_layer            = -1;
+    int      readbacks             = 0;
+    int      context               = MOE_WAIT_NONE;  // class forced on the waits inside a flush (B4b, B7)
+};
+
+static thread_local moe_hostpath_wait_census g_moe_hostpath_waits;
+
+static bool moe_hostpath_waits_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_IDS_COPY_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+using moe_hostpath_clock = std::chrono::steady_clock;
+
+static moe_hostpath_clock::time_point moe_hostpath_wait_begin() {
+    return moe_hostpath_waits_enabled() ? moe_hostpath_clock::now() : moe_hostpath_clock::time_point{};
+}
+
+// Classification (moe_hostpath_wait_classify) runs only past the enabled check, so a join's name
+// is not read when the census is off.  `joined` names the op of a MOE_WAIT_JOIN wait.
+static void moe_hostpath_wait_end(int natural, const ggml_tensor * joined, moe_hostpath_clock::time_point t0) {
+    if (!moe_hostpath_waits_enabled()) {
+        return;
+    }
+    moe_hostpath_wait_census & w = g_moe_hostpath_waits;
+    const int cls = ggml_sycl::moe_hostpath_wait_classify(natural, joined ? joined->name : nullptr, w.context);
+    w.count[cls] += 1;
+    w.us[cls] += std::chrono::duration<double, std::micro>(moe_hostpath_clock::now() - t0).count();
+}
+
+static void moe_hostpath_wait_end(int natural, moe_hostpath_clock::time_point t0) {
+    moe_hostpath_wait_end(natural, nullptr, t0);
+}
+
+struct moe_hostpath_wait_timer {
+    int                            natural;
+    const ggml_tensor *            joined;
+    moe_hostpath_clock::time_point t0;
+
+    explicit moe_hostpath_wait_timer(int cls) : natural(cls), joined(nullptr), t0(moe_hostpath_wait_begin()) {}
+
+    // A CPU job join; its class is read from `op` when the wait ends.
+    moe_hostpath_wait_timer(int cls, const ggml_tensor * op) :
+        natural(cls),
+        joined(op),
+        t0(moe_hostpath_wait_begin()) {}
+
+    ~moe_hostpath_wait_timer() { moe_hostpath_wait_end(natural, joined, t0); }
+};
+
+// Counts the waits inside one flush under `cls`, unless an enclosing boundary flush already does.
+struct moe_hostpath_wait_context {
+    int saved;
+
+    explicit moe_hostpath_wait_context(int cls) : saved(g_moe_hostpath_waits.context) {
+        if (saved != MOE_WAIT_B7) {
+            g_moe_hostpath_waits.context = cls;
+        }
+    }
+
+    ~moe_hostpath_wait_context() { g_moe_hostpath_waits.context = saved; }
+};
+
+// Called at each expert-id readback.  A layer id lower than the last one starts a new token, so the
+// previous token's line is printed and the counts restart.
+static void moe_hostpath_waits_readback(int layer) {
+    if (!moe_hostpath_waits_enabled()) {
+        return;
+    }
+    moe_hostpath_wait_census & w = g_moe_hostpath_waits;
+    if (w.last_layer >= 0 && layer < w.last_layer) {
+        static const char * const names[MOE_WAIT_COUNT] = { "B1", "B2", "B3", "B4", "B4b", "B5", "B6", "B7" };
+        char                      line[512];
+        int                       at       = 0;
+        uint64_t                  total_n  = 0;
+        double                    total_us = 0.0;
+        for (int c = 0; c < MOE_WAIT_COUNT; ++c) {
+            if (at >= (int) sizeof(line)) {
+                break;
+            }
+            at += snprintf(line + at, sizeof(line) - at, " %s=%llu/%.0fus", names[c], (unsigned long long) w.count[c],
+                           w.us[c]);
+            total_n += w.count[c];
+            total_us += w.us[c];
+        }
+        GGML_LOG_WARN("[MOE-HOSTPATH-WAITS] token=%llu readbacks=%d%s total=%llu/%.0fus\n",
+                      (unsigned long long) w.token, w.readbacks, line, (unsigned long long) total_n, total_us);
+        for (int c = 0; c < MOE_WAIT_COUNT; ++c) {
+            w.count[c] = 0;
+            w.us[c]    = 0.0;
+        }
+        w.readbacks = 0;
+        ++w.token;
+    }
+    w.last_layer = layer;
+    ++w.readbacks;
+}
+
 // Neither counter is ever reset, so a value names one event for the life of
 // the thread: a serial names one rewrite of the shared activation staging, an
 // epoch one graph compute. A reset would let a new copy or graph repeat an
@@ -25012,6 +25147,7 @@ static void flush_prev_scatter_bufs(pending_cpu_scatter & slot) {
         return;
     }
     if (!pb.scatter_events.empty()) {
+        moe_hostpath_wait_timer wait_timer(MOE_WAIT_B6);
         sycl::event::wait(pb.scatter_events);
         pb.scatter_events.clear();
     }
@@ -25068,6 +25204,7 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
     try {
         // Wait for CPU compute to finish
         if (slot.future.valid()) {
+            moe_hostpath_wait_timer wait_timer(MOE_WAIT_JOIN, slot.dst_tensor);
             slot.future.get();
         }
 
@@ -25313,211 +25450,29 @@ static bool ggml_sycl_pipeline_moe_enabled() {
     return false;
 }
 
-// ----- Pipeline CPU: environment variable gate -----
-// When GGML_SYCL_PIPELINE_CPU=1, CPU expert compute from MoE layer N
-// overlaps with GPU attention for layer N+1.  Instead of blocking until
-// CPU experts finish and scattering results immediately, the merge is
-// deferred to the start of the next MoE layer (or graph boundary).
-// This gives one full (residual + norm + attention) cycle of overlap time.
-static bool ggml_sycl_pipeline_cpu_enabled() {
-    static std::atomic<int> val{ -1 };
-    int                     v = val.load(std::memory_order_acquire);
-    if (v < 0) {
-        const char * env = getenv("GGML_SYCL_PIPELINE_CPU");
-        int          nv  = env ? atoi(env) : 0;  // Default: OFF
-        val.compare_exchange_strong(v, nv, std::memory_order_release, std::memory_order_acquire);
-        v = val.load(std::memory_order_acquire);
-    }
-    return v != 0;
-}
-
-// ---------------------------------------------------------------------------
-// Pipeline CPU: deferred cross-layer merge
-// ---------------------------------------------------------------------------
-struct pending_cpu_pipeline {
-    std::future<void>            future;
-    float *                      out_pinned;
-    float *                      act_pinned;
-    ggml_sycl::mem_handle        out_handle;
-    ggml_sycl::mem_handle        act_handle;
-    sycl::queue *                stream;
-    std::optional<sycl::context> sycl_ctx;
-
-    struct scatter_entry {
-        char *                dst_device;
-        int                   N;
-        ggml_sycl::mem_handle dst_handle;
-        size_t                dst_offset = 0;
-        size_t                src_offset = 0;
-    };
-
-    std::vector<scatter_entry>   entries;
-    std::vector<cpu_expert_task> tasks;
-    std::vector<sycl::event>     scatter_events;
-    int                          device_id;
-    bool                         from_pool;
-    bool                         owns_buffers;
-    bool                         active;
-    const ggml_tensor *          dst_tensor;
-    int                          layer_id;
-
-    struct deferred_bufs {
-        float *                      out = nullptr;
-        float *                      act = nullptr;
-        ggml_sycl::mem_handle        out_handle;
-        ggml_sycl::mem_handle        act_handle;
-        std::vector<sycl::event>     scatter_events;
-        std::optional<sycl::context> ctx;
-        int                          dev_id  = -1;
-        bool                         pool    = false;
-        bool                         pending = false;
-    } prev_bufs;
-
-    pending_cpu_pipeline() :
-        out_pinned(nullptr),
-        act_pinned(nullptr),
-        out_handle(),
-        act_handle(),
-        stream(nullptr),
-        sycl_ctx(),
-        device_id(-1),
-        from_pool(false),
-        owns_buffers(false),
-        active(false),
-        dst_tensor(nullptr),
-        layer_id(-1) {}
-};
-
-static thread_local pending_cpu_pipeline g_pending_cpu_pipeline;
-
-static void flush_prev_cpu_pipeline_bufs() {
-    auto & pb = g_pending_cpu_pipeline.prev_bufs;
-    if (!pb.pending) {
-        return;
-    }
-    if (!pb.scatter_events.empty()) {
-        sycl::event::wait(pb.scatter_events);
-        pb.scatter_events.clear();
-    }
-    if (pb.pool) {
-        g_pinned_buffer_pools[pb.dev_id].release({ pb.act, pb.out });
-    } else if (pb.act_handle.valid() || pb.out_handle.valid()) {
-        pb.act_handle = {};
-        pb.out_handle = {};
-    } else {
-        // Legacy sycl::free path — dead code after migration to unified_alloc
-        if (pb.act) {
-            GGML_ASSERT(false && "cpu_pipeline.act: legacy sycl::free path — act_handle should always be set");
+// GGML_SYCL_PIPELINE_CPU used to park every CPU expert job in a separate
+// one-entry slot that was flushed only when a later op consumed its output
+// (llama.cpp-3oju9).  Up does not consume gate, so the second job of a layer
+// found the slot full and aborted (llama.cpp-ytc9) on every model that runs gate
+// and up as separate MUL_MAT_IDs.  The 2026-10-08 acceptance run of the opt-in
+// arm aborted the same way, so the slot is retired (llama.cpp-z4kd).  The
+// direction it was a step toward stays open under llama.cpp-3oju9: an
+// event-chained host path, where a CPU job's completion is an event that the
+// scatter H2D depends on, so no later op has to join the job on the submitting
+// thread.  A run that still sets the variable is told once, at backend init,
+// that it has no effect; the static latch keeps a second init from repeating it.
+static void ggml_sycl_pipeline_cpu_warn_retired() {
+    static const bool set = [] {
+        const bool present = getenv("GGML_SYCL_PIPELINE_CPU") != nullptr;
+        if (present) {
+            GGML_LOG_WARN(
+                "GGML_SYCL_PIPELINE_CPU is retired and ignored (llama.cpp-z4kd): its opt-in path aborted at the "
+                "llama.cpp-ytc9 assert; the event-chained host path it led toward is deferred under "
+                "llama.cpp-3oju9; see docs/backend/sycl-env-vars.md\n");
         }
-        if (pb.out) {
-            GGML_ASSERT(false && "cpu_pipeline.out: legacy sycl::free path — out_handle should always be set");
-        }
-    }
-    pb.out        = nullptr;
-    pb.act        = nullptr;
-    pb.out_handle = {};
-    pb.act_handle = {};
-    pb.scatter_events.clear();
-    pb.ctx.reset();
-    pb.dev_id  = -1;
-    pb.pool    = false;
-    pb.pending = false;
-}
-
-static void flush_pending_cpu_pipeline() {
-    if (!g_pending_cpu_pipeline.active) {
-        return;
-    }
-    flush_prev_cpu_pipeline_bufs();
-    try {
-        if (g_pending_cpu_pipeline.future.valid()) {
-            g_pending_cpu_pipeline.future.get();
-        }
-        g_pending_cpu_pipeline.scatter_events.clear();
-        // The producer sets a stream and an output buffer, and every entry names its destination.
-        // Skipping quietly would lose the rows (llama.cpp-93tw), as in flush_pending_cpu_scatter.
-        GGML_ASSERT(g_pending_cpu_pipeline.stream && g_pending_cpu_pipeline.out_pinned &&
-                    "pending CPU pipeline has no stream or output staging; its host-expert rows would be dropped "
-                    "(llama.cpp-93tw)");
-        for (auto & e : g_pending_cpu_pipeline.entries) {
-            GGML_ASSERT(e.dst_device &&
-                        "pending CPU pipeline entry has no destination; its row would be dropped (llama.cpp-93tw)");
-            if (!e.dst_handle.valid() || !g_pending_cpu_pipeline.out_handle.valid()) {
-                GGML_ABORT("[PIPELINE-CPU] Deferred merge missing smart mem_handle for dst=%p device=%d", e.dst_device,
-                           g_pending_cpu_pipeline.device_id);
-            }
-            g_pending_cpu_pipeline.scatter_events.push_back(
-                ggml_sycl::mem_copy_async(e.dst_handle, e.dst_offset, g_pending_cpu_pipeline.out_handle, e.src_offset,
-                                          static_cast<size_t>(e.N) * sizeof(float), *g_pending_cpu_pipeline.stream));
-        }
-    } catch (const std::exception & ex) {
-        GGML_ABORT("[PIPELINE-CPU] Deferred merge failed: %s; its host-expert rows would be dropped (llama.cpp-93tw)",
-                   ex.what());
-    }
-    static std::atomic<int> pipeline_log{ 0 };
-    if (pipeline_log.fetch_add(1, std::memory_order_relaxed) < 5) {
-        GGML_LOG_INFO("[PIPELINE-CPU] Flushed deferred merge from layer %d (%zu entries)\n",
-                      g_pending_cpu_pipeline.layer_id, g_pending_cpu_pipeline.entries.size());
-    }
-    {
-        auto & pb         = g_pending_cpu_pipeline.prev_bufs;
-        pb.scatter_events = std::move(g_pending_cpu_pipeline.scatter_events);
-        if (g_pending_cpu_pipeline.owns_buffers) {
-            pb.out        = g_pending_cpu_pipeline.out_pinned;
-            pb.act        = g_pending_cpu_pipeline.act_pinned;
-            pb.out_handle = std::move(g_pending_cpu_pipeline.out_handle);
-            pb.act_handle = std::move(g_pending_cpu_pipeline.act_handle);
-            pb.ctx        = g_pending_cpu_pipeline.sycl_ctx;
-            pb.dev_id     = g_pending_cpu_pipeline.device_id;
-            pb.pool       = g_pending_cpu_pipeline.from_pool;
-        } else {
-            pb.out        = nullptr;
-            pb.act        = nullptr;
-            pb.out_handle = {};
-            pb.act_handle = {};
-            pb.ctx.reset();
-            pb.dev_id = g_pending_cpu_pipeline.device_id;
-            pb.pool   = false;
-        }
-        pb.pending = !pb.scatter_events.empty() || g_pending_cpu_pipeline.owns_buffers;
-    }
-    g_pending_cpu_pipeline.entries.clear();
-    g_pending_cpu_pipeline.tasks.clear();
-    g_pending_cpu_pipeline.scatter_events.clear();
-    g_pending_cpu_pipeline.out_pinned = nullptr;
-    g_pending_cpu_pipeline.act_pinned = nullptr;
-    g_pending_cpu_pipeline.out_handle = {};
-    g_pending_cpu_pipeline.act_handle = {};
-    g_pending_cpu_pipeline.stream     = nullptr;
-    g_pending_cpu_pipeline.sycl_ctx.reset();
-    g_pending_cpu_pipeline.device_id    = -1;
-    g_pending_cpu_pipeline.from_pool    = false;
-    g_pending_cpu_pipeline.owns_buffers = false;
-    g_pending_cpu_pipeline.active       = false;
-    g_pending_cpu_pipeline.dst_tensor   = nullptr;
-    g_pending_cpu_pipeline.layer_id     = -1;
-}
-
-static bool flush_pending_cpu_pipeline_if_consumed(const ggml_tensor * consuming_dst, int device) {
-    if (!g_pending_cpu_pipeline.active) {
-        return false;
-    }
-    if (!consuming_dst) {
-        return false;
-    }
-    if (ggml_sycl_moe_precomputed_mmid_skip_pending(consuming_dst, device)) {
-        return false;
-    }
-    const ggml_tensor * pending_dst = g_pending_cpu_pipeline.dst_tensor;
-    if (!pending_dst) {
-        flush_pending_cpu_pipeline();
-        return true;
-    }
-    if (ggml_sycl_op_consumes_tensor(consuming_dst, pending_dst)) {
-        flush_pending_cpu_pipeline();
-        return true;
-    }
-    return false;
+        return present;
+    }();
+    (void) set;
 }
 
 // ----- Deferred secondary GPU scatter (async B50 dispatch) -----
@@ -26088,13 +26043,13 @@ static void pipeline_scatter_start_async(int device) {
 
 // Public entry point for graph boundary flush
 void ggml_sycl_cpu_tg_flush_pending() {
+    moe_hostpath_wait_context boundary_waits(MOE_WAIT_B7);
     if (!g_cpu_tg_direct_pending_scatter.empty()) {
+        moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
         sycl::event::wait(g_cpu_tg_direct_pending_scatter);
         g_cpu_tg_direct_pending_scatter.clear();
     }
-    flush_pending_cpu_pipeline();
     flush_pending_cpu_scatter();
-    flush_prev_cpu_pipeline_bufs();  // Final cleanup for last deferred pipeline scatter
     flush_prev_scatter_bufs();       // Final cleanup for last async scatter
     moe_shared_act_new_graph();      // graph-local: src1 storage is rewritten by the next graph
     if (ggml_sycl_pipeline_moe_enabled()) {
@@ -26105,13 +26060,14 @@ void ggml_sycl_cpu_tg_flush_pending() {
 }
 
 // True when any of the thread-local MoE scatter and CPU-expert lists holds
-// state: the four lists whose entries carry compute-buffer slices between graphs,
-// plus the direct-scatter event list.  A recording call must never reach its exit
+// state: the direct-scatter event list, the pending scatter slot and its sibling
+// (each with its previous-scatter buffers), the deferred secondary-GPU scatter,
+// and the pipeline scatter ring.  A recording call must never reach its exit
 // with one non-empty (recorded scatter state is the recording sink's, or the
 // record is refused), so the exit hook reads this before it flushes.
 bool ggml_sycl_cpu_tg_pending_any() {
     if (!g_cpu_tg_direct_pending_scatter.empty() || g_pending_scatter.active || g_pending_scatter.prev_bufs.pending ||
-        g_pending_cpu_pipeline.active || g_pending_cpu_pipeline.prev_bufs.pending ||
+        g_pending_scatter_sibling.active || g_pending_scatter_sibling.prev_bufs.pending ||
         ggml_sycl_pending_secondary_scatter_active()) {
         return true;
     }
@@ -27957,6 +27913,9 @@ static void ggml_check_sycl() try {
             if (!overrides.empty()) {
                 GGML_LOG_WARN("[SYCL] non-default settings in effect: %s\n", overrides.c_str());
             }
+            // A retired variable is not in sycl_env_settings, so it gets its own line here,
+            // whether or not any other setting is non-default.
+            ggml_sycl_pipeline_cpu_warn_retired();
         }
 
         GGML_LOG_INFO("Running with Environment Variables:\n");
@@ -77923,7 +77882,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             return env && std::atoi(env) != 0;
         }();
         auto copy_start = std::chrono::high_resolution_clock::now();
-        if (!ggml_sycl_copy_ids_to_host(ctx, ids, ids_host)) {
+        moe_hostpath_waits_readback(blk_layer_id);
+        bool ids_copied = false;
+        {
+            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B1);
+            ids_copied = ggml_sycl_copy_ids_to_host(ctx, ids, ids_host);
+        }
+        if (!ids_copied) {
             GGML_LOG_ERROR("[MoE] Failed to copy ids to host for %s\n", src0->name ? src0->name : "?");
             throw ggml_sycl_fallback_error("MUL_MAT_ID expert ID admission failed");
         }
@@ -79549,7 +79514,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // This enables expert deferral: cold CPU experts from layer N
             // compute in parallel with layer N+1's GPU attention window.
             flush_pending_cpu_scatter_if_consumed(dst, ctx.device);
-            flush_pending_cpu_pipeline_if_consumed(dst, ctx.device);
             // Only flush secondary scatter if ring buffers are full.
             // This allows inter-layer pipelining: layer N+1's B50 dispatch
             // can start while layer N's results are still being scattered.
@@ -79626,8 +79590,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 throw ggml_sycl_fallback_error("MUL_MAT_ID shared activation missing smart src1 handle");
             }
             auto shared_act_reusable = [&]() {
-                if (!shared_act_wanted || !cpu_shared_act || ggml_sycl_pipeline_cpu_enabled() ||
-                    !g_moe_shared_act.source.valid()) {
+                if (!shared_act_wanted || !cpu_shared_act || !g_moe_shared_act.source.valid()) {
                     return false;
                 }
                 ggml_sycl::moe_shared_act_query query;
@@ -79731,6 +79694,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     copy_events.push_back(ggml_sycl::mem_copy_async(act_handle, run.dst_offset, src1_storage.handle,
                                                                     run.src_offset, run.bytes, *stream));
                 }
+                moe_hostpath_wait_timer wait_timer(MOE_WAIT_B4);
                 sycl::event::wait(copy_events);
             };
 
@@ -80003,6 +79967,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // Wait for deferred activation D2H before CPU tasks read it.
                 // This wait was moved here from the D2H submission site above
                 // to overlap the transfer with task struct building.
+                const moe_hostpath_clock::time_point job_wait_t0 = moe_hostpath_wait_begin();
                 if (act_deferred_pending) {
                     act_deferred_evt.wait();
                 }
@@ -80018,6 +79983,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         ready.wait();
                     }
                 }
+                moe_hostpath_wait_end(MOE_WAIT_B2, job_wait_t0);
 
                 // Submit to CPU thread pool — move the tasks vector into
                 // the worker so storage outlives every possible caller action.
@@ -80119,39 +80085,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 g_pending_scatter.row_n             = r.row_n;
                 g_pending_scatter.act_serial        = r.act_serial;
                 g_pending_scatter.shares_activation = r.shares_activation;
-            };
-
-            // Apply CPU dispatch result to pipeline (cross-layer overlap).
-            // Task storage is owned by r.future's worker lambda, not by
-            // g_pending_cpu_pipeline, so no vector move is needed here.
-            auto apply_cpu_result_to_pipeline = [&](cpu_dispatch_result & r) {
-                if (!r.valid) {
-                    return;
-                }
-                // Same one-slot overwrite as g_pending_scatter, still open under the opt-in
-                // GGML_SYCL_PIPELINE_CPU=1: abort rather than corrupt (fix: llama.cpp-ytc9).
-                GGML_ASSERT(!g_pending_cpu_pipeline.active &&
-                            "hybrid MUL_MAT_ID reached apply_cpu_result_to_pipeline with a pending pipeline slot "
-                            "that was not flushed; its host-expert rows would be dropped (llama.cpp-ytc9)");
-                g_pending_cpu_pipeline.future       = std::move(r.future);
-                g_pending_cpu_pipeline.out_pinned   = r.out_pinned;
-                g_pending_cpu_pipeline.act_pinned   = r.act_pinned;
-                g_pending_cpu_pipeline.out_handle   = std::move(r.out_handle);
-                g_pending_cpu_pipeline.act_handle   = std::move(r.act_handle);
-                g_pending_cpu_pipeline.stream       = stream;
-                g_pending_cpu_pipeline.sycl_ctx     = stream->get_context();
-                g_pending_cpu_pipeline.device_id    = r.device_id;
-                g_pending_cpu_pipeline.from_pool    = r.from_pool;
-                g_pending_cpu_pipeline.owns_buffers = r.owns_buffers;
-                g_pending_cpu_pipeline.active       = true;
-                g_pending_cpu_pipeline.dst_tensor   = dst;
-                g_pending_cpu_pipeline.layer_id     = layer_id;
-                g_pending_cpu_pipeline.entries.clear();
-                g_pending_cpu_pipeline.entries.reserve(r.entries.size());
-                for (auto & e : r.entries) {
-                    g_pending_cpu_pipeline.entries.push_back(
-                        { e.dst_device, e.N, e.dst_handle, e.dst_offset, e.src_offset });
-                }
             };
 
             // Synchronous dispatch + scatter setup: used by the sequential
@@ -80919,6 +80852,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                     if (!hot_entries.empty()) {
                         dispatch_cpu_and_scatter(hot_entries, hot_first, pregather);
+                        moe_hostpath_wait_context hot_join(MOE_WAIT_B4B);
                         flush_pending_cpu_scatter();
                     }
                     dispatch_cpu_and_scatter(cold_entries, cold_first, pregather);
@@ -81127,8 +81061,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
 
             // ----- Join / sequential CPU dispatch -----
-            // Pipeline CPU: store in g_pending_cpu_pipeline for cross-layer overlap.
-            // Standard: store in g_pending_scatter (intra-layer deferral).
+            // The result goes to g_pending_scatter, flushed at its first consumer.
             if (cpu_async_safe) {
                 size_t cpu_pool_first = pool_entry_npos;
                 if (defer_entry_flush) {
@@ -81165,6 +81098,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         // This op made no activation copy, so nothing orders the
                         // scatter just enqueued ahead of this op's writes to its
                         // pool entries: wait for that scatter itself.
+                        moe_hostpath_wait_timer wait_timer(MOE_WAIT_B6);
                         sycl::event::wait(g_pending_scatter_sibling.prev_bufs.scatter_events);
                         sycl::event::wait(g_pending_scatter.prev_bufs.scatter_events);
                     }
@@ -81174,11 +81108,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             "dispatch_cpu_compute returned an invalid result for a "
                             "non-empty dispatch; its host-expert rows would be dropped "
                             "(llama.cpp-93tw)");
-                if (ggml_sycl_pipeline_cpu_enabled()) {
-                    apply_cpu_result_to_pipeline(cpu_result);
-                } else {
-                    apply_cpu_result_to_scatter(cpu_result);
-                }
+                apply_cpu_result_to_scatter(cpu_result);
             } else if (have_cpu_experts) {
                 do_cpu_dispatch();
             }
@@ -86307,7 +86237,7 @@ static void ggml_sycl_attn_host_cpu_backend_free() {
 // of on the submitting thread (mirrors act_deferred_evt/act_deferred_pending,
 // ~70378-70393/70517-70520).
 //
-// A SEPARATE pending slot from g_pending_scatter/g_pending_cpu_pipeline
+// A SEPARATE pending slot from g_pending_scatter
 // (owner ruling 2026-08-27, llama.cpp-sbky): two independent producers
 // sharing one pending-result slot is a correctness hazard (the blast-radius
 // note, addendum §6) -- a second submission before the first is flushed
@@ -87179,7 +87109,6 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
     // nothing leaks across graphs.
     flush_pending_cpu_scatter_if_consumed(dst, ctx.device);
     flush_pending_secondary_scatter_if_consumed(dst, ctx.device);
-    flush_pending_cpu_pipeline_if_consumed(dst, ctx.device);
     // TKV-13 (B2) final increment: same shape, own pending slot -- see
     // flush_pending_attn_if_consumed's comment above
     // ggml_sycl_dispatch_host_flash_attn.
@@ -89584,7 +89513,6 @@ static bool ggml_sycl_try_fuse_moe_down_weighted_sum(ggml_backend_sycl_context &
             g_preclassified_node_idx = j;
             flush_pending_cpu_scatter_if_consumed(replay, ctx.device);
             flush_pending_secondary_scatter_if_consumed(replay, ctx.device);
-            flush_pending_cpu_pipeline_if_consumed(replay, ctx.device);
             ggml_sycl::sycl_tensor safe_replay(replay, ctx.device);
             switch (replay->op) {
                 case GGML_OP_ADD_ID:
@@ -89637,7 +89565,6 @@ static bool ggml_sycl_try_fuse_moe_down_weighted_sum(ggml_backend_sycl_context &
                     g_preclassified_node_idx = j;
                     flush_pending_cpu_scatter_if_consumed(replay, ctx.device);
                     flush_pending_secondary_scatter_if_consumed(replay, ctx.device);
-                    flush_pending_cpu_pipeline_if_consumed(replay, ctx.device);
                     ggml_sycl::sycl_tensor safe_replay(replay, ctx.device);
                     switch (replay->op) {
                         case GGML_OP_ADD_ID:
@@ -96921,11 +96848,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // window unconditionally.
     // wait() blocks until ready but leaves the future valid() with the
     // lambda's captured task vector alive.  If the next graph has no
-    // MUL_MAT_ID (so flush_pending_cpu_scatter / flush_pending_cpu_pipeline
-    // is never called), the lambda would linger with stale weight_host
+    // MUL_MAT_ID (so flush_pending_cpu_scatter is never called), the lambda
+    // would linger with stale weight_host
     // pointers until thread exit.  Reset after wait to consume.
     if (g_pending_scatter_sibling.future.valid()) {
         try {
+            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
             g_pending_scatter_sibling.future.wait();
         } catch (...) {
         }
@@ -96933,17 +96861,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     }
     if (g_pending_scatter.future.valid()) {
         try {
+            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
             g_pending_scatter.future.wait();
         } catch (...) {
         }
         g_pending_scatter.future = {};
-    }
-    if (g_pending_cpu_pipeline.future.valid()) {
-        try {
-            g_pending_cpu_pipeline.future.wait();
-        } catch (...) {
-        }
-        g_pending_cpu_pipeline.future = {};
     }
     // TKV-13 (B2) final increment: unconditional graph-boundary drain for
     // the attention pending slot, mirroring the two drains immediately
@@ -97674,7 +97596,6 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             // must still publish any deferred MoE scatter whose output they consume.
             flush_pending_cpu_scatter_if_consumed(node, sycl_ctx->device);
             flush_pending_secondary_scatter_if_consumed(node, sycl_ctx->device);
-            flush_pending_cpu_pipeline_if_consumed(node, sycl_ctx->device);
             // TKV-13 (B2) final increment: same bypass hazard applies to the
             // attention pending slot.
             flush_pending_attn_if_consumed(node, sycl_ctx->device);
@@ -101467,7 +101388,6 @@ static void moe_graph_segment_boundary_flush(const ggml_cgraph * cgraph, int sta
         }
         flush_pending_cpu_scatter_if_consumed(node, device);
         flush_pending_secondary_scatter_if_consumed(node, device);
-        flush_pending_cpu_pipeline_if_consumed(node, device);
         flush_pending_attn_if_consumed(node, device);
     }
 }
@@ -115650,6 +115570,10 @@ static bool ggml_sycl_op_is_host_gate_activation_chain(const ggml_tensor * op, i
     }
 }
 
+// The MUL_MAT_ID clause below is stale: a MUL_MAT_ID always runs in this backend and its output is device
+// memory, host experts or not (see moe_glu_input_host_produced, which the GLU branch of
+// ggml_sycl_op_is_planned_on_host uses instead).  Left as is here because it feeds the ADD/MUL/NORM/RMS_NORM
+// host-gate chain, should_dispatch_to_cpu and classify_cpu_layer_blocks; llama.cpp-2w4f measures and fixes it.
 static bool ggml_sycl_tensor_depends_on_planned_host_weight(const ggml_tensor * tensor, int device, int depth = 0) {
     // Memoize visited tensors to avoid redundant graph traversals.
     // Cleared at the top-level call (depth == 0) so each per-op query gets a
@@ -115798,6 +115722,11 @@ static bool ggml_sycl_layer_plan_applies_to_op(const ggml_tensor * op) {
     }
 }
 
+// moe_glu_input_host_produced's residency callback; ctx points at the device index.
+static bool ggml_sycl_glu_weight_executes_on_host(const ggml_tensor * weight, void * ctx) {
+    return ggml_sycl_weight_executes_on_host(weight, *static_cast<const int *>(ctx));
+}
+
 static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device) {
     if (!op || device < 0) {
         return false;
@@ -115841,12 +115770,16 @@ static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device) 
         }
     }
 
-    if ((op->op == GGML_OP_ADD_ID || op->op == GGML_OP_GLU) &&
-        ggml_sycl_tensor_depends_on_planned_host_weight(op, device)) {
-        if (ggml_sycl_moe_multi_gpu_for_executor() && op->op == GGML_OP_GLU) {
+    // Only a host MUL_MAT producer keeps a GLU on the CPU backend; a MUL_MAT_ID's
+    // output is device memory even when its experts are on the host
+    // (moe_glu_input_host_produced).  ADD_ID never reaches this function:
+    // supports_op and offload_op answer for it first.
+    if (op->op == GGML_OP_GLU &&
+        ggml_sycl::moe_glu_input_host_produced(op, ggml_sycl_glu_weight_executes_on_host, &device)) {
+        if (ggml_sycl_moe_multi_gpu_for_executor()) {
             return n04bq_tr_final(false, "multi_gpu_moe_glu");
         }
-        return n04bq_tr_final(true, "addid_glu_depends_host");
+        return n04bq_tr_final(true, "glu_input_host_produced");
     }
 
     auto * cache = ggml_sycl::get_unified_cache_for_device(device);

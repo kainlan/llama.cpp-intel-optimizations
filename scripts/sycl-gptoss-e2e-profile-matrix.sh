@@ -134,7 +134,7 @@ run_case baseline
 run_case graph_disabled "GGML_SYCL_DISABLE_GRAPH=1"
 run_case fa_kv_detail "GGML_SYCL_FA_DISPATCH_DEBUG=1" "GGML_SYCL_PACKED_K_DEBUG_LIMIT=8"
 run_case vram_pressure "GGML_SYCL_VRAM_BUDGET_PCT=85"
-run_case cpu_sharing "GGML_SYCL_PIPELINE_CPU=1" "GGML_SYCL_CPU_EXPERT_THREADS=8"
+run_case cpu_sharing "GGML_SYCL_CPU_EXPERT_THREADS=8"
 
 if [[ "${INCLUDE_MULTIGPU}" -eq 1 ]]; then
     run_case multigpu_host_bounce "GGML_SYCL_MOE_ROUTE_LOG=1"

@@ -19,9 +19,10 @@ Four more paths in the same family drop rows the same way, and are closed here t
     expert gets no task, yet its scatter entry (zeroed output rows) is still published;
   * the planner CPU path (dispatch_cpu_entries_now) logs "Failed planner CPU dispatch staging
     alloc" and `return`s, leaving dst unwritten for every entry of that dispatch;
-  * flush_pending_cpu_scatter / flush_pending_cpu_pipeline wrap `future.get()` and the scatter
-    H2D submission in `catch (std::exception)` that only logs, so a throwing CPU worker or a
-    failed scatter submission clears the pending state and loses the rows.
+  * flush_pending_cpu_scatter wraps `future.get()` and the scatter H2D submission in
+    `catch (std::exception)` that only logs, so a throwing CPU worker or a failed scatter
+    submission clears the pending state and loses the rows.  (The opt-in pipeline slot's flush
+    had the same shape; that slot was removed by llama.cpp-z4kd.)
 
 THE CONTRACT (comments blanked).  Each of those sites ABORTS, naming the site and the failed
 request (GGML_ABORT), instead of returning, continuing or logging:
@@ -37,7 +38,7 @@ request (GGML_ABORT), instead of returning, continuing or logging:
      apply (the apply lambdas keep their own `if (!r.valid) return;` -- that is pinned by
      test-sycl-moe-cpu-activation-row-source.py and is now unreachable for a non-empty dispatch);
   5. dispatch_cpu_entries_now's staging-failure block aborts and contains no return;
-  6. the catch blocks in flush_pending_cpu_scatter and flush_pending_cpu_pipeline abort.
+  6. the catch block in flush_pending_cpu_scatter's per-slot flush aborts.
 
 THE CAUSE of the intermittent allocation failure (the other half of llama.cpp-93tw; observed
 with GGML_SYCL_UNIFIED_ALLOC_LIFETIME_TRACE=1, which logs each [UNIFIED-ALLOC-STALE-CLAIM]).  A
@@ -57,8 +58,8 @@ real corruption and still fails.
      refuses a LIVE one, and is the only registry-presence check before the emplace at either
      site; the claim is logged under the lifetime trace (stale_claim_report), and a release
      records its thread (release_tid, "release-begin" line);
-  8. flush_pending_cpu_scatter and flush_pending_cpu_pipeline assert a stream, an output buffer
-     and a destination for every entry instead of skipping quietly;
+  8. flush_pending_cpu_scatter asserts a stream, an output buffer and a destination for every
+     entry instead of skipping quietly;
   9. every expert_dispatch_entry the HYBRID branch builds (the region between the first and the
      second `std::vector<expert_dispatch_entry> cpu_entries;`) passes allow_cpu_fallback=false.
      That is what keeps dispatch_cpu_compute's allow_cpu_fallback=true arm of the `!host_weight`
@@ -259,13 +260,10 @@ def check_backend(backend_src: str) -> None:
     # 6. the deferred flushes do not swallow a failed CPU future or scatter submission.
     # Since llama.cpp-yx28 each pending CPU scatter lives in a slot (primary and sibling) and the
     # per-slot flush carries the body; flush_pending_cpu_scatter only drains both slots.
-    for fn, params, tagname in (
-        ("flush_pending_cpu_scatter_slot", r"pending_cpu_scatter & slot", "[CPU-TG]"),
-        ("flush_pending_cpu_pipeline", "", "[PIPELINE-CPU]"),
-    ):
-        body = block_after(code, r"static void " + fn + r"\(" + params + r"\)\s*", fn)
-        catch = block_after(body, r"catch\s*\(\s*const std::exception\s*&\s*ex\s*\)", f"the catch block of {fn}")
-        require_abort(catch, f"the catch block of {fn} ({tagname})")
+    fn = "flush_pending_cpu_scatter_slot"
+    body = block_after(code, r"static void " + fn + r"\(pending_cpu_scatter & slot\)\s*", fn)
+    catch = block_after(body, r"catch\s*\(\s*const std::exception\s*&\s*ex\s*\)", f"the catch block of {fn}")
+    require_abort(catch, f"the catch block of {fn} ([CPU-TG])")
 
     # 8. the scatter flush does not skip quietly.
     drain = squash(block_after(code, r"static void flush_pending_cpu_scatter\(\)\s*", "flush_pending_cpu_scatter"))
@@ -291,22 +289,6 @@ def check_backend(backend_src: str) -> None:
         raise ContractError(f"FAIL: flush_pending_cpu_scatter skips a destination-less entry again ({TAG})")
     if re.search(r"if \(slot\.stream && slot\.out_pinned\)", sc):
         raise ContractError(f"FAIL: flush_pending_cpu_scatter makes the scatter conditional on a stream again ({TAG})")
-
-    # 8b. so does the (opt-in) pipeline flush.
-    pipe = squash(block_after(code, r"static void flush_pending_cpu_pipeline\(\)\s*", "flush_pending_cpu_pipeline"))
-    if not re.search(r"GGML_ASSERT\(g_pending_cpu_pipeline\.stream && g_pending_cpu_pipeline\.out_pinned &&", pipe):
-        raise ContractError(
-            f"FAIL: flush_pending_cpu_pipeline does not GGML_ASSERT a stream and an output buffer; a pending pipeline "
-            f"merge without them would be skipped and its rows lost ({TAG})"
-        )
-    if not re.search(r"GGML_ASSERT\(e\.dst_device &&", pipe):
-        raise ContractError(
-            f"FAIL: flush_pending_cpu_pipeline does not GGML_ASSERT every entry's destination ({TAG})"
-        )
-    if re.search(r"if \(e\.dst_device\)", pipe) or re.search(
-        r"if \(g_pending_cpu_pipeline\.stream && g_pending_cpu_pipeline\.out_pinned\)", pipe
-    ):
-        raise ContractError(f"FAIL: flush_pending_cpu_pipeline skips an entry or the merge quietly again ({TAG})")
 
     # 9. the hybrid branch builds only allow_cpu_fallback=false entries.
     decl = [m.start() for m in re.finditer(r"std::vector<expert_dispatch_entry>\s+cpu_entries\s*;", code)]
@@ -473,15 +455,6 @@ def mutants(backend: str, cache: str):
     yield "scatter flush skips a destination-less entry again", mutate(
         backend, "GGML_ASSERT(entries[i].dst_device &&", "if (!entries[i].dst_device) { i++; continue; } GGML_ASSERT(true &&"
     ), cache
-    yield "pipeline flush skips a missing stream quietly again", mutate(
-        backend, "GGML_ASSERT(g_pending_cpu_pipeline.stream && g_pending_cpu_pipeline.out_pinned &&", "GGML_ASSERT(true &&"
-    ), cache
-    yield "pipeline flush skips a destination-less entry again", mutate(
-        backend, "GGML_ASSERT(e.dst_device &&", "if (!e.dst_device) { continue; } GGML_ASSERT(true &&"
-    ), cache
-    yield "pipeline flush guards on dst_device again", mutate(
-        backend, "GGML_ASSERT(e.dst_device &&", "if (e.dst_device) GGML_ASSERT(true &&"
-    ), cache
     yield "a hybrid-branch entry allows CPU fallback", mutate(
         backend, "operand.actual_layout(), operand.lease(), /*allow_cpu_fallback=*/false);",
         "operand.actual_layout(), operand.lease(), /*allow_cpu_fallback=*/true);",
@@ -489,9 +462,6 @@ def mutants(backend: str, cache: str):
     yield "a hybrid-branch entry omits allow_cpu_fallback (default true)", mutate(
         backend, "operand.actual_layout(), operand.lease(), /*allow_cpu_fallback=*/false);",
         "operand.actual_layout(), operand.lease());",
-    ), cache
-    yield "deferred pipeline merge swallows exceptions again", mutate(
-        backend, 'GGML_ABORT("[PIPELINE-CPU] Deferred merge failed', 'GGML_LOG_ERROR("[PIPELINE-CPU] Deferred merge failed'
     ), cache
     yield "claim helper accepts a LIVE row", backend, mutate(
         cache, "if (it->second.state != runtime_alloc_state::RELEASING) {", "if (false) {"

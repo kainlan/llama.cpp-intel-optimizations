@@ -338,10 +338,177 @@ static int test_sibling_pending() {
     return 0;
 }
 
+// The residency callback for the GLU walk tests: ctx is the one weight that executes on the host.
+static bool weight_is(const ggml_tensor * w, void * ctx) {
+    return w == static_cast<const ggml_tensor *>(ctx);
+}
+
+// GLU placement: only a host MUL_MAT producer is host-produced; a MUL_MAT_ID is device-produced
+// and ends the walk (llama.cpp-z4kd).  Plain tensors, no context: the walk reads op and src only.
+static int test_glu_input_host_produced() {
+    using ggml_sycl::moe_glu_input_host_produced;
+    ggml_tensor host_w{};
+    ggml_tensor dev_w{};
+    ggml_tensor act{};
+    act.op         = GGML_OP_NONE;
+    void * on_host = &host_w;
+
+    // A dense FFN whose gate/up weights are on the host: GLU follows its producers.
+    ggml_tensor gate{};
+    gate.op     = GGML_OP_MUL_MAT;
+    gate.src[0] = &host_w;
+    gate.src[1] = &act;
+    ggml_tensor glu{};
+    glu.op     = GGML_OP_GLU;
+    glu.src[0] = &gate;
+    CHECK(moe_glu_input_host_produced(&glu, weight_is, on_host), "a GLU fed by a host MUL_MAT is host-produced");
+
+    // The same with device weights.
+    gate.src[0] = &dev_w;
+    CHECK(!moe_glu_input_host_produced(&glu, weight_is, on_host), "a GLU fed by a device MUL_MAT is not host-produced");
+
+    // A MoE layer whose experts are on the host: the MUL_MAT_ID writes device memory.
+    ggml_tensor mmid{};
+    mmid.op     = GGML_OP_MUL_MAT_ID;
+    mmid.src[0] = &host_w;
+    mmid.src[1] = &act;
+    glu.src[0]  = &mmid;
+    CHECK(!moe_glu_input_host_produced(&glu, weight_is, on_host),
+          "a GLU fed by a host-expert MUL_MAT_ID is not host-produced");
+
+    // A host MUL_MAT upstream of the MUL_MAT_ID's activation is behind it, so it does not count.
+    ggml_tensor up_proj{};
+    up_proj.op     = GGML_OP_MUL_MAT;
+    up_proj.src[0] = &host_w;
+    up_proj.src[1] = &act;
+    mmid.src[0]    = &dev_w;
+    mmid.src[1]    = &up_proj;
+    CHECK(!moe_glu_input_host_produced(&glu, weight_is, on_host), "the walk does not descend through a MUL_MAT_ID");
+
+    // Through an elementwise op, a host MUL_MAT still counts (the dense case keeps its reach).
+    ggml_tensor scale{};
+    scale.op     = GGML_OP_MUL;
+    scale.src[0] = &up_proj;
+    scale.src[1] = &act;
+    glu.src[0]   = &scale;
+    CHECK(moe_glu_input_host_produced(&glu, weight_is, on_host), "a host MUL_MAT behind an elementwise op counts");
+
+    // GPT-OSS shape: the GLU reads an expert bias add (ADD_ID) over a host-expert MUL_MAT_ID.
+    mmid.src[0] = &host_w;
+    mmid.src[1] = &act;
+    ggml_tensor bias_add{};
+    bias_add.op     = GGML_OP_ADD_ID;
+    bias_add.src[0] = &mmid;
+    bias_add.src[1] = &act;
+    glu.src[0]      = &bias_add;
+    CHECK(!moe_glu_input_host_produced(&glu, weight_is, on_host),
+          "a GLU fed by a bias add over a host-expert MUL_MAT_ID is not host-produced");
+
+    // The depth bound: a host MUL_MAT 8 levels below the GLU counts, one level deeper it does not.  The
+    // literal 8 is the documented reach ("within 8 levels"), so a change to MOE_GLU_INPUT_WALK_MAX_DEPTH
+    // must change this test too.  The chain is elementwise ops, so only the bound decides.
+    {
+        constexpr int      max_depth = 8;
+        static ggml_tensor chain[max_depth];
+        ggml_tensor        deep{};
+        deep.op     = GGML_OP_MUL_MAT;
+        deep.src[0] = &host_w;
+        deep.src[1] = &act;
+        ggml_tensor top{};
+        top.op = GGML_OP_GLU;
+        // n elementwise nodes between the GLU (depth 0) and the MUL_MAT put the MUL_MAT at depth n + 1.
+        for (int n = max_depth - 1; n <= max_depth; ++n) {
+            for (int i = 0; i < n; ++i) {
+                chain[i]        = ggml_tensor{};
+                chain[i].op     = GGML_OP_ADD;
+                chain[i].src[0] = i + 1 < n ? &chain[i + 1] : &deep;
+                chain[i].src[1] = &act;
+            }
+            top.src[0]          = &chain[0];
+            const bool found    = moe_glu_input_host_produced(&top, weight_is, on_host);
+            const bool expected = n + 1 <= max_depth;
+            CHECK(found == expected, expected ? "a host MUL_MAT at the depth bound counts" :
+                                                "a host MUL_MAT one level past the depth bound does not count");
+        }
+    }
+
+    // A walk that would need more than MOE_GLU_INPUT_WALK_MAX_VISITED nodes gives up as device-produced:
+    // three levels of ten-way fan-out (1 + 10 + 100 + 1000 nodes), the host MUL_MAT reachable only last.
+    static ggml_tensor fan1[10];
+    static ggml_tensor fan2[100];
+    static ggml_tensor fan3[1000];
+    ggml_tensor        wide{};
+    wide.op = GGML_OP_GLU;
+    for (int i = 0; i < 10; ++i) {
+        fan1[i]     = ggml_tensor{};
+        fan1[i].op  = GGML_OP_ADD;
+        wide.src[i] = &fan1[i];
+        for (int j = 0; j < 10; ++j) {
+            ggml_tensor & m = fan2[i * 10 + j];
+            m               = ggml_tensor{};
+            m.op            = GGML_OP_ADD;
+            fan1[i].src[j]  = &m;
+            for (int k = 0; k < 10; ++k) {
+                ggml_tensor & l = fan3[(i * 10 + j) * 10 + k];
+                l               = ggml_tensor{};
+                l.op            = GGML_OP_NONE;
+                m.src[k]        = &l;
+            }
+        }
+    }
+    ggml_tensor & last = fan3[999];
+    last.op            = GGML_OP_MUL_MAT;
+    last.src[0]        = &host_w;
+    last.src[1]        = &act;
+    CHECK(!moe_glu_input_host_produced(&wide, weight_is, on_host),
+          "a walk past the visited capacity ends as device-produced");
+    fan3[0].op     = GGML_OP_MUL_MAT;
+    fan3[0].src[0] = &host_w;
+    fan3[0].src[1] = &act;
+    CHECK(moe_glu_input_host_produced(&wide, weight_is, on_host), "a host MUL_MAT within the capacity still counts");
+    return 0;
+}
+
+// The submitting-thread wait census (llama.cpp-z4kd): which class a wait is counted under.
+static int test_wait_census_classes() {
+    using namespace ggml_sycl;
+    CHECK(moe_hostpath_join_class("ffn_moe_down-29") == MOE_WAIT_B5, "a down job join is B5");
+    CHECK(moe_hostpath_join_class("ffn_moe_gate-29") == MOE_WAIT_B3, "a gate job join is B3");
+    CHECK(moe_hostpath_join_class("ffn_moe_up-29") == MOE_WAIT_B3, "an up job join is B3");
+    CHECK(moe_hostpath_join_class(nullptr) == MOE_WAIT_B3, "an unnamed job join is B3");
+
+    const int none = MOE_WAIT_NONE;
+    CHECK(none != MOE_WAIT_JOIN && none < 0 && MOE_WAIT_JOIN < 0, "neither marker is a class");
+    CHECK(moe_hostpath_wait_classify(MOE_WAIT_B1, nullptr, none) == MOE_WAIT_B1, "a readback is B1");
+    CHECK(moe_hostpath_wait_classify(MOE_WAIT_B6, nullptr, none) == MOE_WAIT_B6, "a scatter wait is B6");
+    CHECK(moe_hostpath_wait_classify(MOE_WAIT_JOIN, "ffn_moe_down-3", none) == MOE_WAIT_B5,
+          "a join is classified by the joined op's name");
+    CHECK(moe_hostpath_wait_classify(MOE_WAIT_JOIN, "ffn_moe_gate-3", none) == MOE_WAIT_B3,
+          "a gate join outside any flush context is B3");
+
+    // Inside the graph-boundary flush every wait is B7.
+    CHECK(moe_hostpath_wait_classify(MOE_WAIT_B1, nullptr, MOE_WAIT_B7) == MOE_WAIT_B7, "boundary: a readback is B7");
+    CHECK(moe_hostpath_wait_classify(MOE_WAIT_B6, nullptr, MOE_WAIT_B7) == MOE_WAIT_B7, "boundary: a scatter is B7");
+    CHECK(moe_hostpath_wait_classify(MOE_WAIT_JOIN, "ffn_moe_down-3", MOE_WAIT_B7) == MOE_WAIT_B7,
+          "boundary: a join is B7");
+
+    // Inside the hot-group flush a job join is B4b; other waits keep their class.
+    CHECK(moe_hostpath_wait_classify(MOE_WAIT_JOIN, "ffn_moe_down-3", MOE_WAIT_B4B) == MOE_WAIT_B4B,
+          "hot group: a down join is B4b");
+    CHECK(moe_hostpath_wait_classify(MOE_WAIT_JOIN, "ffn_moe_gate-3", MOE_WAIT_B4B) == MOE_WAIT_B4B,
+          "hot group: a gate/up join (prefill) is B4b");
+    CHECK(moe_hostpath_wait_classify(MOE_WAIT_B6, nullptr, MOE_WAIT_B4B) == MOE_WAIT_B6,
+          "hot group: a scatter wait stays B6");
+    CHECK(moe_hostpath_wait_classify(MOE_WAIT_B2, nullptr, MOE_WAIT_B4B) == MOE_WAIT_B2,
+          "hot group: an activation wait stays B2");
+    return 0;
+}
+
 int main() {
     if (test_direct_request() != 0 || test_direct_stamp() != 0 || test_direct_layout() != 0 ||
         test_direct_retry_cap() != 0 || test_pool_ring() != 0 || test_gather_runs() != 0 ||
-        test_shared_activation() != 0 || test_shared_act_sibling() != 0 || test_sibling_pending() != 0) {
+        test_shared_activation() != 0 || test_shared_act_sibling() != 0 || test_sibling_pending() != 0 ||
+        test_glu_input_host_produced() != 0 || test_wait_census_classes() != 0) {
         return 1;
     }
     std::printf("OK: moe decode host path decisions\n");
