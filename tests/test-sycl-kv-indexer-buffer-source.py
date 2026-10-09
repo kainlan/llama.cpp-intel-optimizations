@@ -17,11 +17,11 @@ one helper kv_buffer_device_bytes(). test-kv-runtime-demotion runs that helper o
 
 Nothing budgeted the indexer cache either: the inventory published the attention widths only, so the planner, the
 runtime transaction and the largest-fitting -c hint all left it out, and at -c 10240 the fit kept all 12 attention
-layers on the device with 27.6 MiB left for the 30 MiB indexer buffer. The fix this gate pins: the indexer key width travels as its own per-layer field
-(ggml_sycl_tensor_inventory::kv_idx_k_width_per_layer, appended, sizeof 184 pinned at the consumer), every budget
-(placement_kv_info::kv_bytes_for_layer, placement_plan::kv_size_for_layer, the -c hint) adds the indexer keys to
-the layer's K/V, and the tier manager compares each buffer with its own cache's sum, never with the layers' total,
-which no single buffer holds. test-sycl-kv-layer-sizing runs the two buffers through configure_from_plan.
+layers on the device with 27.6 MiB left for the 30 MiB indexer buffer. The fix this gate pins: the indexer key width
+travels as its own per-layer field (ggml_sycl_tensor_inventory::kv_idx_k_width_per_layer, appended, sizeof 184 pinned at
+the consumer), every budget (placement_kv_info::kv_bytes_for_layer, placement_plan::kv_size_for_layer, the -c hint) adds
+the indexer keys to the layer's K/V, and the tier manager compares each buffer with its own cache's sum, never with the
+layers' total, which no single buffer holds. test-sycl-kv-layer-sizing runs the two buffers through configure_from_plan.
 
 The GGML_SYCL_KV_HOT_LAYERS override used to return from configure_from_plan before the per-layer sizing, so the
 manager the allocator reuses kept the previous buffer's sizes and the backstop charged the indexer buffer the K/V
