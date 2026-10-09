@@ -16,18 +16,23 @@ blanked:
   * none of the ring's names: acquire_staging, release_staging, StagingSlot,
     RingEntry, RING_SLOTS, ring_, ring_handle_, ring_mutex_, or the
     "cpu_expert_ring" allocation tag;
-  * no allocation: no unified_allocate, unified_alloc, alloc_request or
-    mem_handle member, so the pool owns no memory;
+  * no allocation: no unified_allocate, unified_alloc or alloc_request in
+    either file, and no mem_handle, alloc_handle or alloc_owner in the class
+    body or anywhere in the .cpp, in any form (a member of any name, a
+    container of handles, a file-scope handle), so the pool owns no memory;
   * CpuExpertPool::init() takes no SYCL queue and no buffer geometry, only
     its thread count.
 
 NOT VACUOUS.  --self-test runs the gate on in-memory mutants (each ring name
-declared again, the allocation tag, an allocation call, an alloc_request, a
-mem_handle member, a queue parameter on init) and requires each to FAIL; it
+declared again, the allocation tag, an allocation call, an alloc_request, each
+handle type in several forms, a queue parameter on init) and requires each to
+FAIL; it
 then requires a comment that mentions the ring to PASS, which shows the check
 reads code rather than prose, and finally requires the unmodified tree to
-pass.  --root runs the gate on another tree, which is how the mutants were
-also checked against a git-archive copy.
+pass.  The mutants are inserted at whitespace-tolerant regex anchors that
+must match exactly once, so a clang-format re-wrap of the pool does not break
+the self-test.  --root runs the gate on another tree, which is how the mutants
+were also checked against a git-archive copy.
 """
 
 from __future__ import annotations
@@ -58,7 +63,8 @@ ALLOC_NAMES = (
     r"\bunified_alloc\s*\(",
     r"\balloc_request\b",
 )
-MEM_HANDLE_MEMBER = re.compile(r"\bmem_handle\s+\w+_\s*[;={]")
+OWNERSHIP_TYPES = re.compile(r"\b(?:mem_handle|alloc_handle|alloc_owner)\b")
+CLASS_HEAD = re.compile(r"\bclass\s+CpuExpertPool\s*\{")
 
 
 class ContractError(AssertionError):
@@ -96,6 +102,22 @@ def blank_comments(src: str) -> str:
     return "".join(out)
 
 
+def class_body(src: str) -> str | None:
+    """The text between CpuExpertPool's opening brace and its matching closing brace."""
+    m = CLASS_HEAD.search(src)
+    if not m:
+        return None
+    depth = 0
+    for i in range(m.end() - 1, len(src)):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[m.end() : i]
+    return None
+
+
 def check(hpp_raw: str | None, cpp_raw: str | None) -> None:
     if hpp_raw is None or cpp_raw is None:
         raise ContractError(f"FAIL: cpu-expert-pool.hpp/.cpp missing ({TAG})")
@@ -116,11 +138,19 @@ def check(hpp_raw: str | None, cpp_raw: str | None) -> None:
                     f"FAIL: {name} allocates memory ({m.group(0).strip()}); the pool owns threads and a queue, "
                     f"and CPU expert staging comes from the PinnedBufferPool ({TAG})"
                 )
-        m = MEM_HANDLE_MEMBER.search(src)
-        if m:
-            raise ContractError(f"FAIL: {name} gives the pool a mem_handle member ({m.group(0).strip()}) ({TAG})")
 
-    hpp = files[0][1]
+    hpp, cpp = files[0][1], files[1][1]
+    body = class_body(hpp)
+    if body is None:
+        raise ContractError(f"FAIL: cpu-expert-pool.hpp declares no class CpuExpertPool body ({TAG})")
+    for name, src in (("class CpuExpertPool", body), ("cpu-expert-pool.cpp", cpp)):
+        m = OWNERSHIP_TYPES.search(src)
+        if m:
+            raise ContractError(
+                f"FAIL: {name} names {m.group(0)}; the pool owns threads and a queue, not memory, so it holds no "
+                f"allocation handle or owner ({TAG})"
+            )
+
     m = re.search(r"\bvoid\s+init\s*\(([^)]*)\)\s*;", hpp)
     if not m:
         raise ContractError(f"FAIL: cpu-expert-pool.hpp declares no CpuExpertPool::init() ({TAG})")
@@ -138,14 +168,28 @@ def run(root: Path) -> None:
     check(hpp.read_text() if hpp.exists() else None, cpp.read_text() if cpp.exists() else None)
 
 
-def mutants(hpp: str, cpp: str) -> list[tuple[str, str, str]]:
-    def sub(src: str, old: str, new: str, what: str) -> str:
-        if old not in src:
-            raise SystemExit(f"SELF-TEST BROKEN: mutant anchor for '{what}' not found: {old!r}")
-        return src.replace(old, new, 1)
+CLASS_ANCHOR = r"class\s+CpuExpertPool\s*\{\s*public\s*:[ \t]*\n"
+NS_ANCHOR = r"namespace\s+ggml_sycl\s*\{[ \t]*\n"
+INIT_DECL = r"\bvoid\s+init\s*\(\s*int\s+n_threads\s*\)\s*;"
 
-    cls = "class CpuExpertPool {\n  public:\n"
-    ns = "namespace ggml_sycl {\n"
+
+def insert_after(src: str, anchor: str, text: str, what: str) -> str:
+    """Insert `text` after the one match of the whitespace-tolerant regex `anchor`."""
+    hits = list(re.finditer(anchor, src))
+    if len(hits) != 1:
+        raise SystemExit(f"SELF-TEST BROKEN: anchor for '{what}' must match exactly once, matched {len(hits)}: {anchor}")
+    end = hits[0].end()
+    return src[:end] + text + src[end:]
+
+
+def replace_once(src: str, anchor: str, text: str, what: str) -> str:
+    hits = list(re.finditer(anchor, src))
+    if len(hits) != 1:
+        raise SystemExit(f"SELF-TEST BROKEN: anchor for '{what}' must match exactly once, matched {len(hits)}: {anchor}")
+    return src[: hits[0].start()] + text + src[hits[0].end() :]
+
+
+def mutants(hpp: str, cpp: str) -> list[tuple[str, str, str]]:
     out = []
     for decl in (
         "    int acquire_staging();\n",
@@ -154,29 +198,31 @@ def mutants(hpp: str, cpp: str) -> list[tuple[str, str, str]]:
         "    struct RingEntry { float * act; };\n",
         "    float * ring_[4];\n",
         "    std::mutex ring_mutex_;\n",
+        "    mem_handle ring_handle_;\n",
+        "    mem_handle staging;\n",
+        "    std::vector<mem_handle> slots_;\n",
+        "    alloc_handle ring_alloc_;\n",
+        "    alloc_owner owner_;\n",
     ):
-        out.append((f"hpp declares {decl.strip()}", sub(hpp, cls, cls + decl, decl), cpp))
-    out.append(("cpp ring constant", hpp, sub(cpp, ns, ns + "static constexpr int RING_SLOTS = 4;\n", "ring const")))
-    out.append(("cpp ring allocation tag", hpp,
-                sub(cpp, ns, ns + 'static const char * k_tag = "cpu_expert_ring";\n', "tag")))
-    out.append(("cpp allocates through the unified cache", hpp,
-                sub(cpp, ns, ns + "static void grab() { (void) unified_allocate(alloc_request{}); }\n", "alloc")))
-    out.append(("cpp builds an alloc_request", hpp, sub(cpp, ns, ns + "static alloc_request g_req;\n", "req")))
-    out.append(("hpp mem_handle member", sub(hpp, cls, cls + "    mem_handle ring_handle_;\n", "handle"), cpp))
-    out.append(("hpp mem_handle member under another name", sub(hpp, cls, cls + "    mem_handle staging_;\n", "handle2"),
-                cpp))
-    out.append(("init takes a queue again",
-                re.sub(r"\bvoid\s+init\s*\(\s*int\s+n_threads[^)]*\)\s*;",
-                       "void init(int n_threads, size_t max_experts, sycl::queue & q);", hpp, count=1), cpp))
+        out.append((f"class declares {decl.strip()}", insert_after(hpp, CLASS_ANCHOR, decl, decl), cpp))
+    for name, line in (
+        ("cpp ring constant", "static constexpr int RING_SLOTS = 4;\n"),
+        ("cpp ring allocation tag", 'static const char * k_tag = "cpu_expert_ring";\n'),
+        ("cpp allocates through the unified cache", "static void grab() { (void) unified_allocate(alloc_request{}); }\n"),
+        ("cpp builds an alloc_request", "static alloc_request g_req;\n"),
+        ("cpp file-scope mem_handle", "static mem_handle g_ring_handle;\n"),
+        ("cpp file-scope alloc_owner", "static alloc_owner g_ring_owner;\n"),
+    ):
+        out.append((name, hpp, insert_after(cpp, NS_ANCHOR, line, name)))
+    out.append(("init takes a queue again", replace_once(
+        hpp, INIT_DECL, "void init(int n_threads, size_t max_experts, sycl::queue & q);", "init"), cpp))
     return out
 
 
 def harmless(hpp: str, cpp: str) -> list[tuple[str, str, str]]:
-    ns = "namespace ggml_sycl {\n"
-    if ns not in cpp:
-        raise SystemExit("SELF-TEST BROKEN: harmless-probe anchor not found")
-    return [("a comment naming acquire_staging and unified_allocate()", hpp,
-             cpp.replace(ns, ns + "// the old acquire_staging() ring came from unified_allocate()\n", 1))]
+    note = "// the old acquire_staging() ring came from unified_allocate() and held a mem_handle\n"
+    return [("a comment naming acquire_staging, unified_allocate() and mem_handle", hpp,
+             insert_after(cpp, NS_ANCHOR, note, "harmless"))]
 
 
 def self_test(root: Path) -> int:
