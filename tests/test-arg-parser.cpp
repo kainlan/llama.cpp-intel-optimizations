@@ -400,6 +400,9 @@ static void test(void) {
     // --help and --version stay metadata-only with -c given: they exit inside the parse, so nothing after it (the
     // model parameters, the load) runs. Each runs in a child, because both call exit(0).
     for (const char * flag : { "--help", "--version" }) {
+        // the child inherits unflushed stdio buffers and would print them again on exit
+        fflush(stdout);
+        fflush(stderr);
         const pid_t pid = fork();
         assert(pid >= 0);
         if (pid == 0) {
