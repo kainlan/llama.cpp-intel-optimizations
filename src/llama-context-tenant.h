@@ -33,11 +33,12 @@ struct llama_sycl_l4_procs {
     decltype(&ggml_backend_sycl_tenant_coverage)          coverage        = nullptr;
     decltype(&ggml_backend_sycl_load_late_check)          late_check      = nullptr;
     decltype(&ggml_backend_sycl_probe_residency)          probe_residency = nullptr;
-    // The load's compute-term record and compute reservation (llama.cpp-p6i0). Not part of available(): the
-    // context side and the late check keep their gate, and the loader gates its two steps on
+    // The load's compute-term record, compute reservation and the reservation's units (llama.cpp-p6i0). Not part of
+    // available(): the context side and the late check keep their gate, and the loader gates its two steps on
     // load_terms_available().
     decltype(&ggml_backend_sycl_load_record_compute_term)  record_term     = nullptr;
     decltype(&ggml_backend_sycl_load_reserve_compute_term) reserve_term    = nullptr;
+    decltype(&ggml_backend_sycl_load_compute_term_bytes)   term_bytes      = nullptr;
 
     // A planned context needs all four: a publish that cannot be covered-checked, a load that
     // cannot be late-checked, or a plan whose residency cannot be probed, is half a plan.
@@ -45,10 +46,13 @@ struct llama_sycl_l4_procs {
         return publish != nullptr && coverage != nullptr && late_check != nullptr && probe_residency != nullptr;
     }
 
-    // The loader reserves the probe bound and records the admitted term only with both: a reservation that is
-    // never recorded leaves the late check nothing to compare, and a record with no reservation compares a
-    // term the pack never made room for.
-    bool load_terms_available() const { return record_term != nullptr && reserve_term != nullptr; }
+    // The loader reserves the probe bound and records the admitted term only with all three: a reservation that is
+    // never recorded leaves the late check nothing to compare, a record with no reservation compares a term the
+    // pack never made room for, and without the reservation's units the admitted check cannot compare c(P) with
+    // what was reserved.
+    bool load_terms_available() const {
+        return record_term != nullptr && reserve_term != nullptr && term_bytes != nullptr;
+    }
 };
 
 inline ggml_sycl_lifecycle_result llama_sycl_l4_publish(const llama_sycl_l4_procs &            procs,
@@ -138,6 +142,24 @@ inline bool llama_sycl_l4_reserve_compute_term(const llama_sycl_l4_procs & procs
     }
     const std::vector<uint64_t> chunks(chunk_bytes.begin(), chunk_bytes.end());
     return procs.reserve_term(txn, device, chunks.data(), static_cast<uint32_t>(chunks.size()), n_ctx);
+}
+
+// The reservation's units of one measured device's chunks (llama.cpp-p6i0). False is "not sized", and a null proc
+// reads as it: the admitted check then refuses the load by name rather than compare raw sums with a reservation.
+inline bool llama_sycl_l4_compute_term_bytes(const llama_sycl_l4_procs & procs,
+                                             const std::vector<size_t> & chunk_bytes,
+                                             size_t *                    out) {
+    if (procs.term_bytes == nullptr || out == nullptr || chunk_bytes.size() > UINT32_MAX) {
+        return false;
+    }
+    const std::vector<uint64_t> chunks(chunk_bytes.begin(), chunk_bytes.end());
+    uint64_t                    bytes = 0;
+    if (!procs.term_bytes(chunks.data(), static_cast<uint32_t>(chunks.size()), &bytes) ||
+        static_cast<uint64_t>(static_cast<size_t>(bytes)) != bytes) {
+        return false;
+    }
+    *out = static_cast<size_t>(bytes);
+    return true;
 }
 
 // The residency probe's one door: no other code calls the proc pointer or the symbol

@@ -150,6 +150,21 @@ static bool fake_reserve(struct ggml_sycl_load_txn txn,
     return g_reserve_answer;
 }
 
+// The reservation's units: answers a value the test picks, and records the chunk list it was handed.
+static bool                  g_term_answer = true;
+static uint64_t              g_term_value  = 0;
+static int                   g_term_calls  = 0;
+static std::vector<uint64_t> g_term_chunks;
+
+static bool fake_term_bytes(const uint64_t * chunk_bytes, uint32_t n_chunks, uint64_t * out) {
+    g_term_calls++;
+    g_term_chunks.assign(chunk_bytes, chunk_bytes + n_chunks);
+    if (g_term_answer) {
+        *out = g_term_value;
+    }
+    return g_term_answer;
+}
+
 // The probe procs: one that answers a status the test picks and writes n_layer the way the backend's proc does
 // (never host_resident), and one that answers a value outside the enum.
 static ggml_sycl_residency_probe_status g_probe_answer = GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED;
@@ -398,14 +413,45 @@ int main() {
               "a refused reservation was read as reserved");
         g_reserve_answer = true;
 
-        // the loader runs its reserve and record steps only with both procs; neither is part of available()
+        // the loader runs its reserve and record steps only with all three load procs; none is part of available()
         CHECK(!procs.load_terms_available(), "the reserve proc alone reports the load terms");
         CHECK(!procs.available(), "the reserve proc alone made the table L4");
         procs.record_term = &fake_record;
-        CHECK(procs.load_terms_available(), "the reserve and record procs do not report the load terms");
+        CHECK(!procs.load_terms_available(), "the reserve and record procs without the units report the load terms");
+        procs.term_bytes = &fake_term_bytes;
+        CHECK(procs.load_terms_available(), "the three load procs do not report the load terms");
+        CHECK(!procs.available(), "the load procs made the table L4");
         llama_sycl_l4_procs record_only;
         record_only.record_term = &fake_record;
         CHECK(!record_only.load_terms_available(), "the record proc alone reports the load terms");
+    }
+
+    // (14) the reservation's units door (llama.cpp-p6i0)
+    {
+        // a null proc sizes nothing and says so
+        llama_sycl_l4_procs none;
+        size_t              out = 7;
+        g_term_calls            = 0;
+        CHECK(!llama_sycl_l4_compute_term_bytes(none, { 100 }, &out), "a null units proc was read as sized");
+        CHECK(g_term_calls == 0 && out == 7, "a null units proc was called or wrote the answer");
+
+        // the chunk list goes through whole and in order, at the backend's width, and the answer comes back
+        llama_sycl_l4_procs procs;
+        procs.term_bytes = &fake_term_bytes;
+        g_term_answer    = true;
+        g_term_value     = 2154925056ull;
+        CHECK(llama_sycl_l4_compute_term_bytes(procs, { 1618052864, 536870912 }, &out) && out == 2154925056ull,
+              "the sized term did not come back");
+        CHECK(g_term_calls == 1 && g_term_chunks == std::vector<uint64_t>({ 1618052864ull, 536870912ull }),
+              "the chunk list was not forwarded");
+
+        // a refusal is "not sized" and leaves the answer alone; a null out is refused before the proc is called
+        g_term_answer = false;
+        out           = 7;
+        CHECK(!llama_sycl_l4_compute_term_bytes(procs, { 1 }, &out) && out == 7, "a refused sizing was read as sized");
+        g_term_answer = true;
+        CHECK(!llama_sycl_l4_compute_term_bytes(procs, { 1 }, nullptr) && g_term_calls == 2,
+              "a null out reached the proc");
     }
 
     // (4) the section builder

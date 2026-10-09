@@ -711,12 +711,14 @@ DOOR_CALL = re.compile(r"(?:\.|->)\s*probe_residency\s*\)?\s*\(")
 
 
 def load_term_pins(header_raw, source, fails):
-    """The load's two compute-term entries (llama.cpp-p6i0).  The record export is the production caller of the one
-    ledger writer: it reaches the writer, under the module guard, and never the ledger itself; the writer is called
-    only by it and by the private test hook, and is no longer marked unused.  The reserve export hands the probe
-    bound to the planner and touches neither the ledger nor its writer, so c(P) is recorded at one stage only."""
+    """The load's compute-term entries (llama.cpp-p6i0).  The header names all three procs: the record, the reserve
+    and the reservation's units.  The record export is the production caller of the one ledger writer: it reaches the
+    writer, under the module guard, and never the ledger itself; the writer is called only by it and by the private
+    test hook, and is no longer marked unused.  The reserve export hands the probe bound to the planner and touches
+    neither the ledger nor its writer, so c(P) is recorded at one stage only."""
     names = header_proc_names(header_raw)
-    for name in ("ggml_backend_sycl_load_record_compute_term", "ggml_backend_sycl_load_reserve_compute_term"):
+    for name in ("ggml_backend_sycl_load_record_compute_term", "ggml_backend_sycl_load_reserve_compute_term",
+                 "ggml_backend_sycl_load_compute_term_bytes"):
         if name not in names:
             fails.append("L4 load terms: the header does not name the proc %s" % name)
     if re.search(r"\[\[maybe_unused\]\]\s*static\s+bool\s+ggml_sycl_load_record_compute_term\s*\(", source):
@@ -1776,7 +1778,7 @@ def mutations(header_raw, source):
                   "auto release_rung_buffers = [&]() {\n        synchronize();\n", "auto release_rung_buffers = [&]() {\n"))
     pairs.append(("the backend interface wires cpy_tensor_async", "cpy_tensor_async is referenced beyond its definition",
                   CPY_ASYNC_DEF, "static void h_wire_cpy() { (void) ggml_backend_sycl_cpy_tensor_async; }\n" + CPY_ASYNC_DEF))
-    # llama.cpp-p6i0: the load's two compute-term entries
+    # llama.cpp-p6i0: the load's compute-term entries
     pairs.append(("the writer marked unused again", "still marked [[maybe_unused]]",
                   "static bool ggml_sycl_load_record_compute_term(",
                   "[[maybe_unused]] static bool ggml_sycl_load_record_compute_term("))
@@ -1799,7 +1801,8 @@ def mutations(header_raw, source):
         else:
             a, b = span
             muts.append((label, msg, header_raw, src[:a] + src[a:b].replace(old, new, 1) + src[b:]))
-    for name in ("ggml_backend_sycl_load_record_compute_term", "ggml_backend_sycl_load_reserve_compute_term"):
+    for name in ("ggml_backend_sycl_load_record_compute_term", "ggml_backend_sycl_load_reserve_compute_term",
+                 "ggml_backend_sycl_load_compute_term_bytes"):
         line = '// Proc name: "%s".' % name
         if header_raw.count(line) != 1:
             muts.append(("PATTERN NOT FOUND: the header's proc name " + name, "PATTERN", header_raw, src))

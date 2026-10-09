@@ -359,13 +359,20 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
                                                const std::vector<llama_measure_dummy_entry> & weights);
 
 // The admitted check (stage (b), llama.cpp-p6i0): c(P), measured at the admitted placement after the late plan
-// packed the weights, against the probe bound C-hat the pack reserved room for. c(P) <= C-hat is admitted and
-// c(P), never C-hat, is what the ledger records for the late check to compare; c(P) > C-hat, or a device with no
-// probe bound, refuses the load by name. The host tier is skipped, as in the late fold.
+// packed the weights, against the probe bound C-hat the pack reserved room for. Both are sized in the reservation's
+// units (ggml_backend_sycl_load_compute_term_bytes: each chunk at the RUNTIME allocator's grain, summed), so the
+// comparison is the one the reservation can honour, not one between raw sums. c(P) <= C-hat is admitted and c(P),
+// never C-hat, is what the ledger records for the late check to compare; c(P) > C-hat, a device with no probe bound,
+// or a term the backend cannot size refuses the load by name. A device the backend declined to reserve for
+// (`not_reserved`) has no reservation to compare with: it is listed, not compared and not recorded, so its compute
+// buffer stays unplanned and its late check answers NOT_RECORDED, as before the reservation existed. The host tier
+// is skipped, as in the late fold.
 struct llama_admitted_term {
     int32_t device         = -1;
-    size_t  probe_bytes    = 0;  // C-hat: the term the pack reserved room for
-    size_t  admitted_bytes = 0;  // c(P): the term recorded
+    bool    reserved       = true;  // false: the backend declined the probe bound; neither compared nor recorded
+    size_t  probe_term     = 0;     // C-hat in the reservation's units: the room the pack left
+    size_t  admitted_term  = 0;     // c(P) in the reservation's units, compared with probe_term
+    size_t  admitted_bytes = 0;     // c(P) as the measure's total: what the ledger records and the late check compares
 };
 
 struct llama_admitted_check_result {
@@ -377,13 +384,20 @@ struct llama_admitted_check_result {
     size_t                           n_recorded = 0;  // the terms the backend recorded
 };
 
-inline llama_admitted_check_result llama_admitted_check_fold(const std::vector<llama_load_measure_device> & probe,
+inline llama_admitted_check_result llama_admitted_check_fold(const llama_sycl_l4_procs &                    procs,
+                                                             const std::vector<llama_load_measure_device> & probe,
+                                                             const std::vector<int32_t> & not_reserved,
                                                              const std::vector<llama_load_measure_device> & admitted,
                                                              uint32_t                                       n_ctx,
                                                              uint32_t                                       n_ubatch) {
     llama_admitted_check_result out;
     out.n_ctx    = n_ctx;
     out.n_ubatch = n_ubatch;
+    const auto refuse = [&](int32_t device, const std::string & why) {
+        out.refusal = "[LOAD-PLAN] compute-slot-exceeds-probe-bound on device " + std::to_string(device) + ": " + why +
+                      " at n_ctx " + std::to_string(n_ctx) + " ubatch " + std::to_string(n_ubatch) + " (refused)";
+        out.terms.clear();
+    };
     for (const auto & d : admitted) {
         if (d.host) {
             continue;
@@ -395,30 +409,40 @@ inline llama_admitted_check_result llama_admitted_check_fold(const std::vector<l
                 break;
             }
         }
-        if (bound == nullptr || d.total > bound->total) {
-            const std::string shape = " at n_ctx " + std::to_string(n_ctx) + " ubatch " + std::to_string(n_ubatch);
-            out.refusal = "[LOAD-PLAN] compute-slot-exceeds-probe-bound on device " + std::to_string(d.device) +
-                          ": c(P) " + std::to_string(d.total) + " B" +
-                          (bound == nullptr ? std::string(" and no probe bound") :
-                                              " > probe bound C-hat " + std::to_string(bound->total) + " B") +
-                          shape + " (refused)";
-            out.terms.clear();
+        if (bound == nullptr) {
+            refuse(d.device, "c(P) " + std::to_string(d.total) + " B and no probe bound");
             return out;
         }
-        out.terms.push_back({ d.device, bound->total, d.total });
+        llama_admitted_term t;
+        t.device         = d.device;
+        t.admitted_bytes = d.total;
+        t.reserved       = std::find(not_reserved.begin(), not_reserved.end(), d.device) == not_reserved.end();
+        const bool sized = llama_sycl_l4_compute_term_bytes(procs, bound->chunk_bytes, &t.probe_term) &&
+                           llama_sycl_l4_compute_term_bytes(procs, d.chunk_bytes, &t.admitted_term);
+        if (t.reserved && !sized) {
+            refuse(d.device, "the compute term cannot be sized in the reservation's units");
+            return out;
+        }
+        if (t.reserved && t.admitted_term > t.probe_term) {
+            refuse(d.device, "c(P) " + std::to_string(t.admitted_term) + " B > probe bound C-hat " +
+                                 std::to_string(t.probe_term) + " B in the reservation's units");
+            return out;
+        }
+        out.terms.push_back(t);
     }
     return out;
 }
 
-// Records each admitted term, c(P), at the measure's n_ctx. Returns how many the backend recorded: a record it
-// refuses is not counted, and the late check then answers NOT_RECORDED for that device.
+// Records each reserved admitted term, c(P), at the measure's n_ctx. Returns how many the backend recorded: a record
+// it refuses is not counted, and the late check then answers NOT_RECORDED for that device. A device with no
+// reservation is not recorded.
 inline size_t llama_admitted_record(const llama_sycl_l4_procs &         procs,
                                     struct ggml_sycl_load_txn           txn,
                                     const llama_admitted_check_result & admitted,
                                     uint32_t                            n_ctx) {
     size_t n = 0;
     for (const auto & t : admitted.terms) {
-        if (llama_sycl_l4_record_compute_term(procs, txn, t.device, t.admitted_bytes, n_ctx)) {
+        if (t.reserved && llama_sycl_l4_record_compute_term(procs, txn, t.device, t.admitted_bytes, n_ctx)) {
             ++n;
         }
     }
@@ -429,7 +453,7 @@ llama_admitted_check_result llama_load_admitted_check(const llama_model &       
                                                       uint32_t                                       n_ctx,
                                                       struct ggml_sycl_load_txn                      txn,
                                                       const std::vector<llama_measure_dummy_entry> & weights,
-                                                      const std::vector<llama_load_measure_device> & probe);
+                                                      const llama_load_probe_result &                probe);
 
 // The late check (stage (c)): after the dev_layer sync and before the mappings are initialised, measure
 // the load's final placement over the real weights' dummies and hand each device's term to the backend.

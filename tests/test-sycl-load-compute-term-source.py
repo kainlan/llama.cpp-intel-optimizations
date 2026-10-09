@@ -99,6 +99,8 @@ def ordered(text: str, *needles: str) -> bool:
 
 
 RESERVE_SIG = "bool ggml_backend_sycl_load_reserve_compute_term(ggml_sycl_load_txn txn,"
+SIZE_SIG = "static bool ggml_sycl_load_compute_term_size(const uint64_t * chunk_bytes, uint32_t n_chunks, size_t * out)"
+UNITS_SIG = "bool ggml_backend_sycl_load_compute_term_bytes(const uint64_t * chunk_bytes, uint32_t n_chunks, uint64_t * out)"
 SETTER_SIG = "bool unified_cache_set_planned_compute_term(int device_id, size_t bytes, bool other_model_live)"
 REQ_SIG = "bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out)"
 TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
@@ -112,21 +114,40 @@ CLEAR = "ggml_sycl::unified_cache_clear_planned_compute_terms();"
 # ---- (a) the reservation: refusals first, the allocator's grain, the planner term only ----------------------------
 
 
+def claim_the_units_are_the_grain_at_the_buffer_alignment(sycl: str) -> bool:
+    """One rule for the reservation's units: zone_compute_term_bytes at the compute buffer type's alignment."""
+    return body(norm(sycl), SIZE_SIG) == (
+        "{ return ggml_sycl::zone_compute_term_bytes(chunk_bytes, n_chunks, GGML_SYCL_BUFFER_BASE_ALIGNMENT, out); }")
+
+
 def claim_reserve_sizes_at_the_grain_and_writes_only_the_term(sycl: str) -> bool:
     """The export admits the mutation, refuses a closed txn, n_ctx 0, a bad device and a device with no arena, then
-    stores exactly what zone_compute_term_bytes answered at the buffer type's alignment: no headroom, no ledger."""
+    stores exactly what the reservation's units answered: no headroom, no ledger."""
     b = body(norm(sycl), RESERVE_SIG)
-    return (bool(b) and ordered(
+    return (claim_the_units_are_the_grain_at_the_buffer_alignment(sycl) and bool(b) and ordered(
         b, "sycl_module_mutation_guard module_guard;", "if (!module_guard) { return false; }",
         "if (!ggml_sycl_load_txn_is_open(txn.id))", "else if (n_ctx == 0)",
         "else if (device < 0 || device >= ggml_sycl_info().total_gpu_count || device >= GGML_SYCL_MAX_DEVICES)",
         "if (cache == nullptr || !cache->arena_active())",
-        "else if (!ggml_sycl::zone_compute_term_bytes(chunk_bytes, n_chunks, GGML_SYCL_BUFFER_BASE_ALIGNMENT, &bytes))",
+        "else if (!ggml_sycl_load_compute_term_size(chunk_bytes, n_chunks, &bytes))",
         "else if (!ggml_sycl::unified_cache_set_planned_compute_term(device, bytes, "
         "ggml_sycl::lifecycle::global_registry().live_mask() != 0))",
         "if (why != nullptr)", "return false;", "return true;")
         and b.count("unified_cache_set_planned_compute_term(") == 1
         and "ledger" not in b and "ggml_sycl_load_record_compute_term" not in b)
+
+
+def claim_the_units_export_is_the_reserves_rule_and_stateless(sycl: str) -> bool:
+    """The loader's admitted check sizes C-hat and c(P) through this export, so it must answer the reserve's own rule,
+    and read or write nothing: no module admission, no planner term, no ledger."""
+    b = body(norm(sycl), UNITS_SIG)
+    return (claim_the_units_are_the_grain_at_the_buffer_alignment(sycl) and bool(b)
+            and "if (out == nullptr || !ggml_sycl_load_compute_term_size(chunk_bytes, n_chunks, &bytes)) { return false; }" in b
+            and "*out = static_cast<uint64_t>(bytes);" in b
+            and "zone_compute_term_bytes" not in b and "unified_cache" not in b and "ledger" not in b
+            and "module_guard" not in b
+            and ('strcmp(name, "ggml_backend_sycl_load_compute_term_bytes") == 0) { '
+                 "return (void *) ggml_backend_sycl_load_compute_term_bytes; }") in norm(sycl))
 
 
 def claim_setter_merges_like_the_dense_terms(cache: str) -> bool:
@@ -212,6 +233,10 @@ def test_the_reservation_sizes_at_the_grain_and_writes_only_the_term():
     assert claim_reserve_sizes_at_the_grain_and_writes_only_the_term(SYCL)
 
 
+def test_the_units_export_is_the_reserves_rule_and_stateless():
+    assert claim_the_units_export_is_the_reserves_rule_and_stateless(SYCL)
+
+
 def test_the_setter_merges_like_the_dense_terms():
     assert claim_setter_merges_like_the_dense_terms(CACHE)
 
@@ -251,10 +276,37 @@ def test_mutant_reserve_with_headroom_fails():
         _once(SYCL, _TERM_SET, _TERM_SET.replace("device, bytes,", "device, bytes + bytes / 8,")))
 
 
+_SIZE_CALL = "return ggml_sycl::zone_compute_term_bytes(chunk_bytes, n_chunks, GGML_SYCL_BUFFER_BASE_ALIGNMENT, out);"
+
+
 def test_mutant_reserve_without_the_grain_fails():
+    mutant = _once(SYCL, _SIZE_CALL, _SIZE_CALL.replace("GGML_SYCL_BUFFER_BASE_ALIGNMENT", "1"))
+    assert not claim_reserve_sizes_at_the_grain_and_writes_only_the_term(mutant)
+    assert not claim_the_units_export_is_the_reserves_rule_and_stateless(mutant)
+
+
+def test_mutant_reserve_sizing_past_the_shared_rule_fails():
     assert not claim_reserve_sizes_at_the_grain_and_writes_only_the_term(
-        _once(SYCL, "GGML_SYCL_BUFFER_BASE_ALIGNMENT,\n                                                           &bytes)",
-              "1,\n                                                           &bytes)"))
+        _once(SYCL, "} else if (!ggml_sycl_load_compute_term_size(chunk_bytes, n_chunks, &bytes)) {",
+              "} else if (!ggml_sycl::zone_compute_term_bytes(chunk_bytes, n_chunks, 1, &bytes)) {"))
+
+
+def test_mutant_units_export_with_its_own_rule_fails():
+    assert not claim_the_units_export_is_the_reserves_rule_and_stateless(
+        _once(SYCL, "if (out == nullptr || !ggml_sycl_load_compute_term_size(chunk_bytes, n_chunks, &bytes)) {",
+              "if (out == nullptr || !ggml_sycl::zone_compute_term_bytes(chunk_bytes, n_chunks, 1, &bytes)) {"))
+
+
+def test_mutant_units_export_writing_the_planner_term_fails():
+    assert not claim_the_units_export_is_the_reserves_rule_and_stateless(
+        _once(SYCL, "    *out = static_cast<uint64_t>(bytes);\n",
+              "    *out = static_cast<uint64_t>(bytes);\n    (void) ggml_sycl::unified_cache_set_planned_compute_term(0, bytes);\n"))
+
+
+def test_mutant_units_proc_not_answered_fails():
+    assert not claim_the_units_export_is_the_reserves_rule_and_stateless(
+        _once(SYCL, 'if (strcmp(name, "ggml_backend_sycl_load_compute_term_bytes") == 0) {',
+              'if (strcmp(name, "ggml_backend_sycl_load_compute_term_bytes_x") == 0) {'))
 
 
 def test_mutant_reserve_on_a_closed_txn_fails():

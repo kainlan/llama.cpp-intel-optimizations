@@ -827,6 +827,8 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
         llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_RECORD_COMPUTE_TERM));
     procs.reserve_term = reinterpret_cast<decltype(procs.reserve_term)>(
         llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_RESERVE_COMPUTE_TERM));
+    procs.term_bytes = reinterpret_cast<decltype(procs.term_bytes)>(
+        llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_COMPUTE_TERM_BYTES));
     return procs;
 }
 
@@ -4101,7 +4103,7 @@ llama_admitted_check_result llama_load_admitted_check(const llama_model &       
                                                       uint32_t                                       n_ctx,
                                                       struct ggml_sycl_load_txn                      txn,
                                                       const std::vector<llama_measure_dummy_entry> & weights,
-                                                      const std::vector<llama_load_measure_device> & probe) {
+                                                      const llama_load_probe_result &                probe) {
     llama_admitted_check_result out;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     llama_sycl_l4_procs procs;
@@ -4131,7 +4133,8 @@ llama_admitted_check_result llama_load_admitted_check(const llama_model &       
     const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
     const uint32_t n_ubatch       = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train).n_ubatch;
 
-    out = llama_admitted_check_fold(probe, measured.devices, measured_n_ctx, n_ubatch);
+    out =
+        llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, measured.devices, measured_n_ctx, n_ubatch);
     if (!out.refusal.empty()) {
         return out;
     }

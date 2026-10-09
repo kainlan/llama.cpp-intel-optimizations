@@ -1702,6 +1702,16 @@ GGML_BACKEND_API bool ggml_backend_sycl_load_reserve_compute_term(struct ggml_sy
                                                                   uint32_t                  n_chunks,
                                                                   uint32_t                  n_ctx);
 
+// The reservation's units (llama.cpp-p6i0): the bytes ggml_backend_sycl_load_reserve_compute_term would size from
+// chunk_bytes[0..n_chunks), written to *out, with no state read or written.  The loader's admitted check sizes the
+// probe bound and c(P) with it, so it compares them in the units the reservation is in rather than as raw sums.
+// False, writing nothing, when out is null, when chunk_bytes is null with n_chunks > 0, or when a chunk or the sum
+// overflows.
+// Proc name: "ggml_backend_sycl_load_compute_term_bytes".
+GGML_BACKEND_API bool ggml_backend_sycl_load_compute_term_bytes(const uint64_t * chunk_bytes,
+                                                                uint32_t         n_chunks,
+                                                                uint64_t *       out);
+
 // The residency probe (llama.cpp-moua L4 step 3d, llama.cpp-5cim).  Which layers would this context's plan leave in
 // host memory?  A pure plan query: it takes no replan lock, publishes nothing and changes nothing, and works with no
 // tenants and no published section (the caller asks before it publishes).

@@ -40111,9 +40111,26 @@ static void ggml_sycl_log_compute_buffer_landing(int device, const std::string &
                   ggml_sycl::unified_cache_get_planned_compute_term_bytes(device) / (1024.0 * 1024.0));
 }
 
+// The reservation's units (llama.cpp-p6i0): what a chunk list occupies in the RUNTIME zone's TLSF at the alignment
+// the compute buffer's type requests.  The reserve below sizes its term with it, and the admitted check sizes C-hat and
+// c(P) with it through ggml_backend_sycl_load_compute_term_bytes, so the two compare in the units the reservation is in.
+static bool ggml_sycl_load_compute_term_size(const uint64_t * chunk_bytes, uint32_t n_chunks, size_t * out) {
+    return ggml_sycl::zone_compute_term_bytes(chunk_bytes, n_chunks, GGML_SYCL_BUFFER_BASE_ALIGNMENT, out);
+}
+
+// The reservation's units of a chunk list, with no state read or written (llama.cpp-p6i0).
+bool ggml_backend_sycl_load_compute_term_bytes(const uint64_t * chunk_bytes, uint32_t n_chunks, uint64_t * out) {
+    size_t bytes = 0;
+    if (out == nullptr || !ggml_sycl_load_compute_term_size(chunk_bytes, n_chunks, &bytes)) {
+        return false;
+    }
+    *out = static_cast<uint64_t>(bytes);
+    return true;
+}
+
 // The load's compute reservation (llama.cpp-p6i0): the planned RUNTIME term for the scheduler's compute buffer on
 // `device`, from the probe measure's chunks.  The bytes are what those chunks occupy in the RUNTIME zone's TLSF at the
-// alignment this buffer type requests (zone_compute_term_bytes): the allocator's grain, and no headroom.  It writes
+// alignment this buffer type requests (ggml_sycl_load_compute_term_size): the allocator's grain, and no headroom.  It writes
 // the planner term only, never the ledger; c(P) is recorded at the admitted stage by
 // ggml_backend_sycl_load_record_compute_term.  The term is measured at the load's measure shape (n_ctx, ubatch 512),
 // not the caller's -c and -ub, which fkpg (a) transports.  False, reserving nothing, when txn is not the open load,
@@ -40141,8 +40158,7 @@ bool ggml_backend_sycl_load_reserve_compute_term(ggml_sycl_load_txn txn,
             auto * cache = ggml_sycl::get_unified_cache_for_device(device);
             if (cache == nullptr || !cache->arena_active()) {
                 why = "no VRAM arena on the device";
-            } else if (!ggml_sycl::zone_compute_term_bytes(chunk_bytes, n_chunks, GGML_SYCL_BUFFER_BASE_ALIGNMENT,
-                                                           &bytes)) {
+            } else if (!ggml_sycl_load_compute_term_size(chunk_bytes, n_chunks, &bytes)) {
                 why = "the chunk list is null or overflows";
             } else if (!ggml_sycl::unified_cache_set_planned_compute_term(
                            device, bytes, ggml_sycl::lifecycle::global_registry().live_mask() != 0)) {
@@ -117066,6 +117082,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_load_reserve_compute_term") == 0) {
         return (void *) ggml_backend_sycl_load_reserve_compute_term;
+    }
+    if (strcmp(name, "ggml_backend_sycl_load_compute_term_bytes") == 0) {
+        return (void *) ggml_backend_sycl_load_compute_term_bytes;
     }
     if (strcmp(name, "ggml_backend_sycl_supports_op_capability") == 0) {
         return (void *) ggml_backend_sycl_supports_op_capability;

@@ -2626,7 +2626,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             const int64_t                     admitted_t0 = ggml_time_us();
             const llama_admitted_check_result admitted =
                 llama_load_admitted_check(*this, llama_model_sycl_make_placement_envelope().n_ctx,
-                                          sycl_model_loading_guard.txn, admitted_weights, probe.devices);
+                                          sycl_model_loading_guard.txn, admitted_weights, probe);
             const int64_t admitted_ms = (ggml_time_us() - admitted_t0) / 1000;
             if (!admitted.unsupported.empty()) {
                 LLAMA_LOG_WARN("%s: admitted compute-slot measure skipped, the load continues: %s\n", __func__,
@@ -2636,15 +2636,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 throw std::runtime_error(admitted.refusal);
             }
             for (const llama_admitted_term & t : admitted.terms) {
-                const bool reserved = std::find(probe.not_reserved.begin(), probe.not_reserved.end(), t.device) ==
-                                      probe.not_reserved.end();
                 LLAMA_LOG_WARN(
                     "%s: [LOAD-PLAN] compute slot on device %d: probe bound %.1f MiB %s, admitted %.1f MiB (%zu of "
                     "%zu recorded); measured at n_ctx %u ubatch %u, the caller's -c and -ub are not transported "
                     "(fkpg); measure %lld ms probe, %lld ms admitted\n",
-                    __func__, (int) t.device, t.probe_bytes / 1024.0 / 1024.0,
-                    reserved ? "reserved in RUNTIME" : "NOT reserved (the backend said why)",
-                    t.admitted_bytes / 1024.0 / 1024.0, admitted.n_recorded, admitted.terms.size(), admitted.n_ctx,
+                    __func__, (int) t.device, t.probe_term / 1024.0 / 1024.0,
+                    t.reserved ? "reserved in RUNTIME" : "NOT reserved (the backend said why), not compared",
+                    t.admitted_term / 1024.0 / 1024.0, admitted.n_recorded, admitted.terms.size(), admitted.n_ctx,
                     admitted.n_ubatch, (long long) probe_ms, (long long) admitted_ms);
             }
         }

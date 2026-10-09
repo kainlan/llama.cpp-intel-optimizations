@@ -258,7 +258,7 @@ _PROBE = (
 _ADMIT = (
     "llama_admitted_check_result llama_load_admitted_check(const llama_model & model, uint32_t n_ctx, "
     "struct ggml_sycl_load_txn txn, const std::vector<llama_measure_dummy_entry> & weights, "
-    "const std::vector<llama_load_measure_device> & probe)"
+    "const llama_load_probe_result & probe)"
 )
 _N_CTX = "inline uint32_t llama_load_measure_n_ctx(uint32_t n_ctx, uint32_t n_ctx_train)"
 
@@ -299,7 +299,7 @@ def admit_ok(code: str) -> bool:
         "llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B)",
         "if (!measured.ok)",
         "const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);",
-        "llama_admitted_check_fold(probe, measured.devices, measured_n_ctx,",
+        "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, measured.devices, measured_n_ctx,",
         "if (!out.refusal.empty()) { return out; }",
         "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);",
     ]
@@ -310,7 +310,9 @@ def admit_ok(code: str) -> bool:
         and b.count(z("llama_admitted_record(")) == 1
         and "GGML_SYCL_MEASURE_STAGE_PROBE" not in b
         and "GGML_SYCL_MEASURE_STAGE_CANDIDATE_C" not in b
-        and "reserve" not in b
+        # the admitted stage reserves nothing: the probe's reservation is the one it compares with
+        and "reserve_compute_term" not in b
+        and "reserve_term" not in b
     )
 
 
@@ -350,7 +352,7 @@ def stage_order_ok(code: str) -> bool:
     return (
         args in c[probe : probe + 300]
         and args in c[admit : admit + 300]
-        and z("probe.devices)") in c[admit : admit + 400]
+        and z("admitted_weights, probe);") in c[admit : admit + 400]
         and "LLAMA_LOG_WARN(" in unsupported
         and "unplanned path" in unsupported
         and "throw" not in unsupported
@@ -670,7 +672,9 @@ def test_admit_mutants():
         ("recorded despite a refusal", "if (!out.refusal.empty()) {\n        return out;\n    }", ""),
         ("never recorded", "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);", ""),
         ("recorded at n_ctx 0", "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);", "out.n_recorded = llama_admitted_record(procs, txn, out, n_ctx);"),
-        ("the fold bypassed", "llama_admitted_check_fold(probe, measured.devices, measured_n_ctx,", "llama_admitted_check_fold(measured.devices, measured.devices, measured_n_ctx,"),
+        ("the fold bypassed", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, measured.devices,", "llama_admitted_check_fold(procs, measured.devices, probe.not_reserved, measured.devices,"),
+        ("the admitted stage reserves", "    if (!out.refusal.empty()) {\n        return out;\n    }", "    (void) llama_sycl_l4_reserve_compute_term(procs, txn, measured.devices[0], measured_n_ctx);\n    if (!out.refusal.empty()) {\n        return out;\n    }"),
+        ("unreserved devices compared", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, measured.devices,", "llama_admitted_check_fold(procs, probe.devices, {}, measured.devices,"),
     ]:
         assert not admit_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
 
