@@ -1027,9 +1027,10 @@ static void test_qwen38_indexer_keys_budgeted_and_sized_per_buffer() {
 }
 
 int main() {
-    // Hermetic: GGML_SYCL_KV_HOT_LAYERS short-circuits configure_from_plan()
-    // before any per-layer sizing, so a stray value in the environment would
-    // quietly change what cases (h)-(k) measure.
+    // Hermetic: GGML_SYCL_KV_HOT_LAYERS overrides which layers
+    // configure_from_plan() puts on the device, so a stray value in the
+    // environment would quietly change the device/host split cases (h)-(k)
+    // and (p) measure.
     if (const char * env = std::getenv("GGML_SYCL_KV_HOT_LAYERS")) {
         printf("unsetting GGML_SYCL_KV_HOT_LAYERS=%s for a hermetic run\n", env);
         unsetenv("GGML_SYCL_KV_HOT_LAYERS");
