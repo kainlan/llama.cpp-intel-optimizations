@@ -3,9 +3,9 @@
 Host-only: reads sources, builds nothing, loads no model and touches no device.
 
 The defect (B70, Qwen3.8 IQ3_XXS, no -c): the load planned KV at n_ctx 512, the routed experts filled the card, and
-the runtime context transaction, which can only demote, re-placed all KV to the host tier ("KV overflow re-placed to
-host tier: 48 layer(s) demoted ... the device has 283.8 MB free for KV"), so the 12 full-attention layers ran their
-attention on the CPU. 48, not 12: the SYCL inventory charged KV for the 36 recurrent layers the KV cache never holds.
+the runtime context transaction, which can only demote, re-placed all the KV to the host tier, so the 12
+full-attention layers ran their attention on the CPU. (That it reported 48 layers, not 12, is the over-count
+test-sycl-kv-layer-owners-source pins.)
 
 The fix this gate pins:
   - compute_placement_plan packs in three phases, in order: the dense pass charges weights only; the KV phase charges
@@ -13,9 +13,11 @@ The fix this gate pins:
     are the routed experts packed into what is left;
   - the room is capped at what is left and counted in the plan's device bytes, and the runtime transaction's KV
     re-derivation drops it;
+  - the expert pack counts the triplets the room displaced (a second first-fit budget with the room added back), the
+    plan keeps that figure, and the room's line reports it in MiB after the pack, as a WARN when the room cost
+    experts, naming its limit: the room is for n_ctx_train;
   - the loader hands the backend that context (n_ctx_train, the probe measure's own n_ctx, since the caller's -c
-    does not reach the load), and the per-layer KV kind comes from the memory the default context builds, so a
-    layer the KV cache does not hold costs nothing.
+    does not reach the load, fkpg).
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -62,7 +64,6 @@ CACHE_HPP = read("ggml/src/ggml-sycl/unified-cache.hpp")
 SYCL = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 SYCL_H = read("ggml/include/ggml-sycl.h")
 MODEL = read("src/llama-model.cpp")
-SHAPES = read("src/llama-layer-shapes.cpp")
 
 
 def body(text: str, signature: str) -> str:
@@ -108,16 +109,15 @@ def ordered(text: str, *needles: str) -> bool:
 
 PLAN_SIG = "placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,"
 LAYER_KV_SIG = "static void plan_single_device_layer_kv(placement_plan & plan,"
-ROOM_SIG = "static void hold_kv_context_room(placement_plan & plan,"
+ROOM_SIG = "static kv_context_room hold_kv_context_room(placement_plan & plan,"
+ROOM_LOG_SIG = "static void log_kv_context_room(const kv_context_room & room,"
 REFRESH_SIG = "void refresh_kv_byte_totals()"
 POPULATE_SIG = "static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory & inventory,"
-ARRAYS_SIG = "static llama_model_sycl_kv_layer_arrays llama_model_sycl_build_kv_layer_arrays(const llama_model & model,"
-OWNERS_SIG = "llama_kv_layer_owners llama_kv_layer_owners_default(const llama_model & model)"
 INVENTORY_STRUCT = "struct ggml_sycl_tensor_inventory {"
 
 DENSE_LOOP = "for (const auto & [layer_id, indices] : dense_layer_indices) {"
 LAYER_KV_CALL = "plan_single_device_layer_kv(plan, kv_info, layer_has_attention, device_id, remaining);"
-ROOM_CALL = "hold_kv_context_room(plan, kv_info, device_id, remaining);"
+ROOM_CALL = "const kv_context_room room = hold_kv_context_room(plan, kv_info, device_id, remaining);"
 EXPERT_PASS = "auto moe_groups = build_moe_triplet_groups(plan, moe_indices, &hotness_source);"
 WEIGHTS_ONLY = "on_device = weight_charge <= remaining; target = on_device ? device_id : -1; kv_on_device = false;"
 
@@ -164,8 +164,34 @@ def claim_room_is_the_context_extra_capped_and_counted(cache: str) -> bool:
     return (bool(b) and ordered(
         b, "if (layer_id < 0 || owner != device_id) { continue; }",
         "kv_info.kv_context_extra_bytes_for_layer(static_cast<uint32_t>(layer_id));",
-        "const size_t held = std::min(wanted, remaining);", "remaining -= held;",
-        "plan.kv_context_reserve_bytes = held;", "plan.vram_bytes += held;"))
+        "room.held = std::min(room.wanted, remaining);", "remaining -= room.held;",
+        "plan.kv_context_reserve_bytes = room.held;", "plan.vram_bytes += room.held;"))
+
+
+ROOM_PACK = ("if (group.charge_bytes <= without_room) { without_room -= group.charge_bytes; "
+             "if (!on_device) { room_displaced_bytes += group.bytes; room_displaced_groups++; } }")
+
+
+def claim_room_displacement_is_counted_and_logged(cache: str) -> bool:
+    """The expert pack runs a second first-fit budget with the room added back; a triplet that fits it and went to the
+    host tier is one the room displaced. The plan keeps that figure and the room's line reports it after the pack."""
+    b = body(norm(cache), PLAN_SIG)
+    return bool(b) and ordered(
+        b, ROOM_CALL, "size_t without_room = remaining + room.held;",
+        "const bool on_device = group.charge_bytes <= remaining;", ROOM_PACK,
+        "log_moe_triplet_pack_stats(\"PLACEMENT-MOE\", stats, remaining);",
+        "plan.kv_context_room_displaced_bytes = room_displaced_bytes;",
+        "log_kv_context_room(room, kv_info, device_id, room_displaced_bytes, room_displaced_groups);")
+
+
+def claim_room_line_is_visible_and_names_its_limit(cache: str) -> bool:
+    """The line is in MiB, says the room is for n_ctx_train because the load does not see -c, and is a WARN whenever
+    the room cost experts or could not hold all it wanted, so a default run shows it."""
+    b = body(norm(cache), ROOM_LOG_SIG)
+    return (bool(b) and "const bool warn = displaced_bytes > 0 || room.held < room.wanted;" in b
+            and ordered(b, "if (warn) { GGML_LOG_WARN(fmt,", "} else { GGML_LOG_INFO(fmt,")
+            and "held %.1f MiB of %.1f MiB" in b and "displaced %.1f MiB of routed experts" in b
+            and "The room is for n_ctx_train: the load does not see -c." in b)
 
 
 def claim_extra_is_the_context_minus_the_charge(hpp: str) -> bool:
@@ -184,7 +210,7 @@ def claim_runtime_rederivation_drops_the_room(hpp: str) -> bool:
     return bool(b) and ordered(b, "kv_context_reserve_bytes = 0;", "vram_bytes = weight_vram_bytes + kv_vram_bytes;")
 
 
-# ---- (b) the context and the per-layer kind come from libllama ------------------------------------------------------
+# ---- (b) the context comes from libllama ----------------------------------------------------------------------------
 
 
 def claim_loader_hands_the_opening_context(model: str, sycl: str, header: str) -> bool:
@@ -199,20 +225,6 @@ def claim_loader_hands_the_opening_context(model: str, sycl: str, header: str) -
     return (bool(pop) and want in pop
             and inv.endswith("uint32_t kv_layer_count; uint32_t n_ctx_context; }")
             and "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;" in norm(sycl))
-
-
-def claim_kind_comes_from_the_default_memory(model: str, shapes: str) -> bool:
-    """A layer owns KV when the default context's memory holds it; has_kv() only for a kind the shapes do not model."""
-    arrays = body(norm(model), ARRAYS_SIG)
-    owners = body(norm(shapes), OWNERS_SIG)
-    return (bool(arrays) and ordered(
-        arrays, "const llama_kv_layer_owners owners = llama_kv_layer_owners_default(model);",
-        "const bool owns_kv = owners.modelled ? il < owners.owns.size() && owners.owns[il] : hparams.has_kv(il);",
-        "if (!owns_kv) {", "out.kind[il] = GGML_SYCL_KV_LAYER_SHARED;")
-            and bool(owners) and ordered(
-                owners, "const llama_kv_layer_shapes_result kv = llama_kv_layer_shapes(model, params_mem, cparams);",
-                "if (!kv.unsupported.empty()) { return out; }", "out.modelled = true;",
-                "out.owns[il] = kv.layers[il].has_kv;"))
 
 
 def test_phases_are_dense_kv_experts():
@@ -231,6 +243,14 @@ def test_room_is_the_context_extra_capped_and_counted():
     assert claim_room_is_the_context_extra_capped_and_counted(CACHE)
 
 
+def test_room_displacement_is_counted_and_logged():
+    assert claim_room_displacement_is_counted_and_logged(CACHE)
+
+
+def test_room_line_is_visible_and_names_its_limit():
+    assert claim_room_line_is_visible_and_names_its_limit(CACHE)
+
+
 def test_extra_is_the_context_minus_the_charge():
     assert claim_extra_is_the_context_minus_the_charge(CACHE_HPP)
 
@@ -241,10 +261,6 @@ def test_runtime_rederivation_drops_the_room():
 
 def test_loader_hands_the_opening_context():
     assert claim_loader_hands_the_opening_context(MODEL, SYCL, SYCL_H)
-
-
-def test_kind_comes_from_the_default_memory():
-    assert claim_kind_comes_from_the_default_memory(MODEL, SHAPES)
 
 
 # ---- mutants: each must turn its claim red --------------------------------------------------------------------------
@@ -287,12 +303,36 @@ def test_mutant_kv_on_a_host_layer_fails():
 
 def test_mutant_room_uncapped_fails():
     assert not claim_room_is_the_context_extra_capped_and_counted(
-        _once(CACHE, "const size_t held = std::min(wanted, remaining);", "const size_t held = wanted;"))
+        _once(CACHE, "room.held = std::min(room.wanted, remaining);", "room.held = room.wanted;"))
 
 
 def test_mutant_room_not_counted_fails():
     assert not claim_room_is_the_context_extra_capped_and_counted(
-        _once(CACHE, "plan.vram_bytes += held;", ""))
+        _once(CACHE, "plan.vram_bytes += room.held;", ""))
+
+
+def test_mutant_displacement_without_the_room_fails():
+    """A counterfactual budget without the room added back would count nothing: every triplet it fits, fits."""
+    assert not claim_room_displacement_is_counted_and_logged(
+        _once(CACHE, "size_t without_room = remaining + room.held;", "size_t without_room = remaining;"))
+
+
+def test_mutant_displacement_counts_device_triplets_fails():
+    assert not claim_room_displacement_is_counted_and_logged(
+        _once(CACHE, "if (!on_device) { room_displaced_bytes += group.bytes;",
+              "if (on_device) { room_displaced_bytes += group.bytes;"))
+
+
+def test_mutant_room_logged_before_the_pack_fails():
+    n = norm(CACHE)
+    call = "log_kv_context_room(room, kv_info, device_id, room_displaced_bytes, room_displaced_groups);"
+    mutant = _once(n, call, "").replace(ROOM_CALL, ROOM_CALL + " " + call, 1)
+    assert not claim_room_displacement_is_counted_and_logged(mutant)
+
+
+def test_mutant_room_line_only_info_fails():
+    assert not claim_room_line_is_visible_and_names_its_limit(
+        _once(CACHE, "const bool warn = displaced_bytes > 0 || room.held < room.wanted;", "const bool warn = false;"))
 
 
 def test_mutant_extra_at_the_planning_context_fails():
@@ -321,15 +361,3 @@ def test_mutant_field_appended_after_padding_fails():
 def test_mutant_backend_drops_the_context_fails():
     assert not claim_loader_hands_the_opening_context(
         MODEL, _once(SYCL, "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;", ""), SYCL_H)
-
-
-def test_mutant_kind_from_has_kv_fails():
-    """Restores master's rule: every has_kv() layer is charged KV, recurrent layers included."""
-    assert not claim_kind_comes_from_the_default_memory(
-        _once(MODEL, "const bool owns_kv = owners.modelled ? il < owners.owns.size() && owners.owns[il] : "
-              "hparams.has_kv(il);", "const bool owns_kv = hparams.has_kv(il);"), SHAPES)
-
-
-def test_mutant_owners_ignore_the_shapes_fails():
-    assert not claim_kind_comes_from_the_default_memory(
-        MODEL, _once(SHAPES, "out.owns[il] = kv.layers[il].has_kv;", "out.owns[il] = true;"))
