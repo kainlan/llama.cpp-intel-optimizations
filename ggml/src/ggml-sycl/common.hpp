@@ -7138,19 +7138,12 @@ struct ggml_backend_sycl_context {
         }
     } mmvq_q8_activation_cache;
 
-    // Per-context, per-device dense f16 dequant scratch (llama.cpp-479i): one buffer for the f16 copy of src0 and
-    // one for the f16 copy of src1 in the f16 arm of ggml_sycl_op_mul_mat_sycl, which used to take both from the
-    // SCRATCH pool per op. NOT the oneDNN PP reorder scratch (the ONEDNN zone, acquire_onednn_pp_scratch): that one
-    // is only used when ggml_sycl_onednn_pp_candidate() holds, and this is what the same arm falls back to when it
-    // does not, so the two zones never share a consumer's sizing facts.
-    //
-    // They are two buffers, not one with two regions, because the src0 copy is needed only when the oneDNN WoQ arm
-    // declines and is acquired lazily after src1 is already converted: growing a shared backing at that point
-    // would strand the converted src1 in the retired one. Same ownership story as the Q8_1 buffer above (see
-    // ggml_sycl_runtime_scratch_ensure): the unified cache owns the backing, the mem_handle is the identity, the
-    // RUNTIME zone is the planned home and the raw-malloc spill is forbidden.
-    struct dequant_f16_scratch_t {
-        explicit dequant_f16_scratch_t(const char * cohort) : cohort_id(cohort) {}
+    // One planned RUNTIME-zone scratch cohort, one backing per device: the unified cache owns the backing, the
+    // mem_handle is the identity, the RUNTIME zone is the planned home and the raw-malloc spill is forbidden (see
+    // ggml_sycl_runtime_scratch_ensure). The marker kernel names the work that retires a grown backing. It serves
+    // the two dense f16 dequant buffers and the host-expert MoE scatter scratch below.
+    template <typename RetireMarkerKernel> struct planned_runtime_scratch_t {
+        explicit planned_runtime_scratch_t(const char * cohort) : cohort_id(cohort) {}
 
         const char * cohort_id;
 
@@ -7189,66 +7182,36 @@ struct ggml_backend_sycl_context {
         void * ensure_buffer(size_t required_size, int device, sycl::queue & queue) {
             slot_t & s    = slot(device);
             bool     grew = false;
-            void *   ptr  = ggml_sycl_runtime_scratch_ensure<ggml_sycl_dequant_f16_retire_marker_kernel>(
+            void *   ptr  = ggml_sycl_runtime_scratch_ensure<RetireMarkerKernel>(
                 s.backing_handle, s.backing_capacity, required_size, device, queue, cohort_id, &grew);
             if (grew) {
                 s.stats.allocs++;
             }
             return ptr;
         }
-    } dequant_f16_src0_scratch{ "mul-mat-dequant-f16-src0" }, dequant_f16_src1_scratch{ "mul-mat-dequant-f16-src1" };
+    };
+
+    // Per-context, per-device dense f16 dequant scratch (llama.cpp-479i): one buffer for the f16 copy of src0 and
+    // one for the f16 copy of src1 in the f16 arm of ggml_sycl_op_mul_mat_sycl, which used to take both from the
+    // SCRATCH pool per op. NOT the oneDNN PP reorder scratch (the ONEDNN zone, acquire_onednn_pp_scratch): that one
+    // is only used when ggml_sycl_onednn_pp_candidate() holds, and this is what the same arm falls back to when it
+    // does not, so the two zones never share a consumer's sizing facts.
+    //
+    // They are two buffers, not one with two regions, because the src0 copy is needed only when the oneDNN WoQ arm
+    // declines and is acquired lazily after src1 is already converted: growing a shared backing at that point
+    // would strand the converted src1 in the retired one. Same ownership story as the Q8_1 buffer above.
+    using dequant_f16_scratch_t = planned_runtime_scratch_t<ggml_sycl_dequant_f16_retire_marker_kernel>;
+    dequant_f16_scratch_t dequant_f16_src0_scratch{ "mul-mat-dequant-f16-src0" },
+        dequant_f16_src1_scratch{ "mul-mat-dequant-f16-src1" };
 
     // Per-context, per-device scratch the host-expert MoE result scatter stages through (llama.cpp-cre6): the CPU's
-    // compact result block is copied here in one H2D copy, and one kernel places each row at its slot of dst. Sized
-    // by unified_cache_get_planned_moe_host_scatter_scratch_bytes() and claimed whole when the runtime-context
+    // compact result block is copied here, and one kernel places each row at its slot of dst. Sized by
+    // unified_cache_get_planned_moe_host_scatter_scratch_bytes() and claimed whole when the runtime-context
     // transaction publishes (ggml_sycl_moe_host_scatter_claim_plan); the scatter itself never allocates it, so a
-    // flush larger than the plan goes through in chunks rather than growing it. Same ownership story as the dense
-    // scratch above (see ggml_sycl_runtime_scratch_ensure): unified cache backing, mem_handle identity, RUNTIME
-    // zone, raw-malloc spill forbidden.
-    struct moe_host_scatter_scratch_t {
-        struct slot_t {
-            ggml_sycl::mem_handle backing_handle;
-            size_t                backing_capacity = 0;
-            planned_scratch_stats stats;
-        };
-
-        std::array<slot_t, GGML_SYCL_MAX_DEVICES> slots;
-
-        slot_t & slot(int device) {
-            GGML_ASSERT(device >= 0 && device < GGML_SYCL_MAX_DEVICES);
-            return slots[device];
-        }
-
-        const slot_t & slot(int device) const {
-            GGML_ASSERT(device >= 0 && device < GGML_SYCL_MAX_DEVICES);
-            return slots[device];
-        }
-
-        void release() {
-            for (slot_t & s : slots) {
-                s.backing_handle   = {};
-                s.backing_capacity = 0;
-            }
-        }
-
-        // Bytes the device's backing holds; zero before the claim.
-        size_t capacity(int device) const { return slot(device).backing_capacity; }
-
-        ggml_sycl::mem_handle handle(int device) const { return slot(device).backing_handle; }
-
-        planned_scratch_stats & stats(int device) { return slot(device).stats; }
-
-        void * ensure_buffer(size_t required_size, int device, sycl::queue & queue) {
-            slot_t & s    = slot(device);
-            bool     grew = false;
-            void *   ptr  = ggml_sycl_runtime_scratch_ensure<ggml_sycl_moe_host_scatter_retire_marker_kernel>(
-                s.backing_handle, s.backing_capacity, required_size, device, queue, "moe-host-scatter", &grew);
-            if (grew) {
-                s.stats.allocs++;
-            }
-            return ptr;
-        }
-    } moe_host_scatter_scratch;
+    // flush larger than the plan goes through in chunks rather than growing it.
+    planned_runtime_scratch_t<ggml_sycl_moe_host_scatter_retire_marker_kernel> moe_host_scatter_scratch{
+        "moe-host-scatter"
+    };
 
     // One WARN-level line per planned scratch cohort and device that was used (uses, allocs, capacity against the
     // plan, peak demand). Emitted once, at teardown, so a normal run proves the planned buffers were exercised.

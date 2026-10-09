@@ -361,11 +361,11 @@ with gate('planned-scratch-ensure-owner-first'):
     planned_scratch = region(COMMON, *PLANNED_SCRATCH_HELPER)
     owner_first(planned_scratch, "backing  = std::move(replacement)")
     # Every planned caller must keep going through the helper rather than allocating itself.
-    # Callers in common.hpp: the MMQ/MMVQ Q8_1 src1 buffer, the dense f16 dequant buffers, and the
-    # host-expert MoE result scatter scratch (llama.cpp-cre6).
+    # Callers in common.hpp: the MMQ/MMVQ Q8_1 src1 buffer, and planned_runtime_scratch_t, the one type
+    # behind the dense f16 dequant buffers and the host-expert MoE result scatter scratch (llama.cpp-cre6).
     # Comment- and string-blind: a comment or a string literal naming the helper (a quoted example, a log
     # message) is not a caller.
-    assert _blank_comments(COMMON, keep_strings=False).count("ggml_sycl_runtime_scratch_ensure<") == 3, \
+    assert _blank_comments(COMMON, keep_strings=False).count("ggml_sycl_runtime_scratch_ensure<") == 2, \
         "a planned scratch caller stopped using the helper"
     print("PASS planned-scratch-owner-first-source-gate")
 
