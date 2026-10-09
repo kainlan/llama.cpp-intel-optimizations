@@ -272,6 +272,12 @@ static bool all_on_arena(const llama_model &, uint32_t) {
     return true;
 }
 
+// The memory kinds llama_kv_layer_shapes() models: the rest must report themselves unsupported.
+static bool kind_is_modelled(const memory_view & mv) {
+    return mv.kind == "kv" || mv.kind == "iswa" || mv.kind == "hybrid" || mv.kind == "hybrid_iswa" ||
+           mv.kind == "hybrid_idx" || mv.kind == "recurrent" || mv.kind == "none";
+}
+
 // llama.cpp-8ecj: the SYCL placement inventory charges KV for the layers llama_kv_layer_owners_default() says own
 // K/V. They must be exactly the layers the context's memory created K/V for, in every config: a hybrid model's
 // recurrent layers pass hparams.has_kv() but own none, which is how Qwen3-Next came to be charged 48 KV layers
@@ -284,8 +290,7 @@ static void check_kv_owners(const char * arch_name, const config & cfg, llama_co
     const llama_kv_layer_owners owners  = llama_kv_layer_owners_default(model);
     const int                   n_layer = (int) model.hparams.n_layer_all;
 
-    const bool modelled = mv.kind == "kv" || mv.kind == "iswa" || mv.kind == "hybrid" || mv.kind == "hybrid_iswa" ||
-                          mv.kind == "hybrid_idx" || mv.kind == "recurrent" || mv.kind == "none";
+    const bool modelled = kind_is_modelled(mv);
     CHECK(owners.modelled == modelled, "%s/%s: kind '%s' owners modelled=%d", arch_name, cfg.name, mv.kind.c_str(),
           (int) owners.modelled);
     if (!owners.modelled) {
@@ -327,8 +332,7 @@ static void check_shapes(const char * arch_name, const config & cfg, llama_conte
           cfg.name, rs_sycl.layers.size());
     const int n_layer = (int) model.hparams.n_layer_all;
 
-    const bool modelled = mv.kind == "kv" || mv.kind == "iswa" || mv.kind == "hybrid" || mv.kind == "hybrid_iswa" ||
-                          mv.kind == "hybrid_idx" || mv.kind == "recurrent" || mv.kind == "none";
+    const bool modelled = kind_is_modelled(mv);
     if (!modelled) {
         CHECK(!kv.unsupported.empty(), "%s/%s: kind '%s' is not modelled and must say so", arch_name, cfg.name,
               expected_kind(mv.kind));

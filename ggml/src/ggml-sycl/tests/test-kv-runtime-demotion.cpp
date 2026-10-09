@@ -3059,7 +3059,6 @@ static int case_i6_single_gap_oracle() {
     return 0;
 }
 
-// Runs a case unless KRT_ONLY names another one (a RED capture runs one case alone).
 // llama.cpp-8ecj: what the overflow re-placement demotes for a Qwen3-Next-shaped model at its trained context
 // (48 layers, full attention on every 4th, KV width 512 for K and V, f16, n_ctx 262144) on a device whose KV room
 // after the weights is 287.8 MB, under one 512 MiB layer. When the inventory charges only the layers the KV cache
@@ -3069,7 +3068,9 @@ static int case_qwen3next_kv_owner_shape() {
     const size_t   mb       = 1024 * 1024;
     const int      n_layers = 48;
     const uint32_t n_ctx    = 262144;
-    const size_t   width    = 512;
+    const size_t   width    = 512;  // K and V elements per cell
+    const uint32_t n_ubatch = 512;  // the load's planning ubatch; a FULL layer's cells do not depend on it
+    const size_t   f16      = 2;    // bytes per element
     auto           demote   = [&](bool owners_only) {
         kv_device_fit_input in;
         in.device   = 0;
@@ -3080,7 +3081,7 @@ static int case_qwen3next_kv_owner_shape() {
         for (int il = 0; il < n_layers; ++il) {
             const bool    owns    = !owners_only || il % 4 == 3;
             const uint8_t kind    = owns ? ggml_sycl::KV_CELLS_FULL : ggml_sycl::KV_CELLS_SHARED;
-            in.layer_kv_bytes[il] = kv_layer_cells(kind, n_ctx, 512, 1, true, false, 0) * (width + width) * 2;
+            in.layer_kv_bytes[il] = kv_layer_cells(kind, n_ctx, n_ubatch, 1, true, false, 0) * (width + width) * f16;
         }
         return plan_device_kv_fit(in);
     };
@@ -3101,6 +3102,7 @@ static int case_qwen3next_kv_owner_shape() {
     return 0;
 }
 
+// Runs a case unless KRT_ONLY names another one (a RED capture runs one case alone).
 static int run_case(const char * name, int (*fn)()) {
     const char * only = std::getenv("KRT_ONLY");
     if (only != nullptr && std::string(only) != name) {
