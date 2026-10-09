@@ -25585,12 +25585,12 @@ enum class moe_host_scatter_form {
 };
 
 // The compact scatter of the rows the flush collected into `ws` (llama.cpp-cre6): one copy per run of contiguous
-// sources into the planned scratch the producer bound, then one kernel placing each scratch row at its destination,
-// per chunk of the plan. It is taken only when it issues fewer device submissions than ws.runs, the per-run copies of
-// the same rows; rows that already arrive as one run per destination (every selected expert on the host, in slot
-// order) return PER_RUN, two runs or fewer before any scratch or plan is looked at. The raw pointers the kernel takes are views resolved here, at submission, from handles that
-// are retained until the kernel completes. Returns PER_RUN or DECLINED having submitted nothing, DECLINED with `why`
-// naming the reason; the caller then makes the per-run copies.
+// sources into the planned scratch the producer bound, then one kernel placing each scratch row at its destination, per
+// chunk of the plan. It is taken only when it issues fewer device submissions than ws.runs, the per-run copies of the
+// same rows; rows that already arrive as one run per destination (every selected expert on the host, in slot order)
+// return PER_RUN, two runs or fewer before any scratch or plan is looked at. The raw pointers the kernel takes are
+// views resolved here, at submission, from handles that are retained until the kernel completes. Returns PER_RUN or
+// DECLINED having submitted nothing, DECLINED with `why` naming the reason; the caller then makes the per-run copies.
 static moe_host_scatter_form moe_host_scatter_submit_compact(const pending_cpu_scatter &      lead,
                                                              moe_host_scatter_workspace &     ws,
                                                              size_t *                         n_copies,
