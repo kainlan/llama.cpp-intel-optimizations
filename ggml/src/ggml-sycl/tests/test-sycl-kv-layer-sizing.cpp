@@ -1002,6 +1002,26 @@ static void test_qwen38_indexer_keys_budgeted_and_sized_per_buffer() {
         check_true("qwen38: no sizing WARN for a buffer that matches its own cache",
                    g_log.find("[KV-TIER] per-layer KV truth") == std::string::npos);
     }
+
+    // GGML_SYCL_KV_HOT_LAYERS overrides which layers are on the device, not what a layer costs: each buffer is still
+    // sized from its own cache. The manager is a per-device singleton the allocator copies for each buffer, so the
+    // indexer buffer is configured on the one the K/V buffer left, as here.
+    {
+        const char *      prior     = std::getenv("GGML_SYCL_KV_HOT_LAYERS");
+        const std::string prior_val = prior != nullptr ? prior : "";
+        kv_tier_manager   mgr;
+        mgr.configure_from_plan(0, plan, kv.n_layer, kv_slice_size::from_layer_mask(12u * 512 * mib, 12), &mask);
+        setenv("GGML_SYCL_KV_HOT_LAYERS", "48", 1);
+        mgr.configure_from_plan(0, plan, kv.n_layer, kv_slice_size::from_layer_mask(12u * 64 * mib, 12), &mask);
+        if (prior != nullptr) {
+            setenv("GGML_SYCL_KV_HOT_LAYERS", prior_val.c_str(), 1);
+        } else {
+            unsetenv("GGML_SYCL_KV_HOT_LAYERS");
+        }
+        check_eq("qwen38: under GGML_SYCL_KV_HOT_LAYERS the indexer buffer is sized from its own cache",
+                 mgr.kv_layer_size(3), 64 * mib);
+        check_eq("qwen38: and a recurrent layer still holds none of it", mgr.kv_layer_size(0), 0u);
+    }
 }
 
 int main() {

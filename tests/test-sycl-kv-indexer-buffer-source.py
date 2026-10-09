@@ -23,6 +23,10 @@ layers on the device with 27.6 MiB left for the 30 MiB indexer buffer. The fix t
 the layer's K/V, and the tier manager compares each buffer with its own cache's sum, never with the layers' total,
 which no single buffer holds. test-sycl-kv-layer-sizing runs the two buffers through configure_from_plan.
 
+The GGML_SYCL_KV_HOT_LAYERS override used to return from configure_from_plan before the per-layer sizing, so the
+manager the allocator reuses kept the previous buffer's sizes and the backstop charged the indexer buffer the K/V
+buffer's layers again. The override now runs after the sizing and changes placement only.
+
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
 Pytest-style (module-level test_* functions): register with llama_test_pytest.
@@ -142,6 +146,8 @@ MAIN_SUM = "main_sum += plan.kv_main_size_for_layer(l);"
 IDX_SUM = "idx_sum += plan.kv_idx_size_for_layer(l);"
 PICK = "const size_t truth_sum = is_idx_buffer ? idx_sum : main_sum;"
 PER_LAYER = "per_layer_kv_bytes_[l] = is_idx_buffer ? plan.kv_idx_size_for_layer(l) : plan.kv_main_size_for_layer(l);"
+SIZES_RESET = "per_layer_kv_bytes_.assign(n_layers, kv_per_layer_);"
+HOT_ENV = "const char * hot_layers_env = std::getenv(\"GGML_SYCL_KV_HOT_LAYERS\");"
 
 
 def claim_inventory_carries_the_indexer_width(header: str, sycl_cpp: str) -> bool:
@@ -168,6 +174,13 @@ def claim_tier_manager_sizes_each_buffer_from_its_cache(tier_cpp: str) -> bool:
             and "plan.kv_size_for_layer(" not in cfg)
 
 
+def claim_hot_layers_override_keeps_the_sizes(tier_cpp: str) -> bool:
+    """The debug placement override is read once, after every layer of this buffer has been sized, so it cannot
+    leave a reused manager with the previous buffer's sizes."""
+    cfg = body(norm(tier_cpp), CONFIGURE_SIG)
+    return bool(cfg) and ordered(cfg, SIZES_RESET, PER_LAYER, HOT_ENV) and cfg.count(HOT_ENV) == 1
+
+
 def claim_backstop_counts_this_buffer(sycl_cpp: str) -> bool:
     """The backstop counts this buffer's own layer sizes, from the tier manager configured for it, and refuses only
     after that count; the plan's per-layer KV is no longer what it sums."""
@@ -180,6 +193,10 @@ def claim_helper_sums_member_device_layers(demotion_hpp: str) -> bool:
     """The helper adds a layer's bytes only when the buffer holds it and the device owns it."""
     helper = body(norm(demotion_hpp), HELPER_SIG)
     return bool(helper) and HELPER_SUM in helper and helper.rstrip().endswith("return total; }")
+
+
+def test_hot_layers_override_keeps_the_sizes():
+    assert claim_hot_layers_override_keeps_the_sizes(TIER_CPP)
 
 
 def test_backstop_counts_this_buffer():
@@ -265,3 +282,12 @@ def test_mutant_tier_manager_measures_the_total_fails():
     """Folding the caches back together: each buffer compared with both caches' sum, the WARN on every load."""
     assert not claim_tier_manager_sizes_each_buffer_from_its_cache(
         _once(TIER_CPP, PICK, "const size_t truth_sum = main_sum + idx_sum;"))
+
+
+def test_mutant_hot_layers_override_before_the_sizing_fails():
+    """The override read, as before, ahead of the per-layer sizing it used to return past."""
+    n = norm(TIER_CPP)
+    cfg = body(n, CONFIGURE_SIG)
+    assert cfg.count(HOT_ENV) == 1 and cfg.count(SIZES_RESET) == 1
+    moved = cfg.replace(HOT_ENV, "", 1).replace(SIZES_RESET, HOT_ENV + " " + SIZES_RESET, 1)
+    assert not claim_hot_layers_override_keeps_the_sizes(n.replace(cfg, moved, 1))

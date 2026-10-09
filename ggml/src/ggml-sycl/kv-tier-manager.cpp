@@ -282,27 +282,6 @@ void kv_tier_manager::configure_from_plan(int                          device,
         kv_per_layer_ = slice.bytes();
     }
 
-    // Explicit debug override remains higher priority than planned placement.
-    const char * hot_layers_env = std::getenv("GGML_SYCL_KV_HOT_LAYERS");
-    if (hot_layers_env) {
-        int val = std::atoi(hot_layers_env);
-        if (val >= 0) {
-            hot_layers_ = std::min(static_cast<uint32_t>(val), n_layers);
-            layer_on_device_.assign(n_layers, false);
-            for (uint32_t l = 0; l < hot_layers_; l++) {
-                layer_on_device_[l] = true;
-            }
-            active_ = (hot_layers_ < total_layers_);
-            const size_t dev_bytes  = std::min(static_cast<size_t>(hot_layers_) * kv_per_layer_, slice.total_bytes());
-            const size_t host_bytes = slice.total_bytes() - dev_bytes;
-            GGML_LOG_INFO(
-                "[KV-TIER] Plan-driven (env override): %u/%u layers on device "
-                "(%.1f MB device, %.1f MB host)\n",
-                hot_layers_, total_layers_, dev_bytes / (1024.0 * 1024.0), host_bytes / (1024.0 * 1024.0));
-            return;
-        }
-    }
-
     // Build per-layer placement.
     layer_on_device_.assign(n_layers, false);
     // assign(), not resize(): kv_tier_manager is a per-device singleton reused
@@ -414,6 +393,20 @@ void kv_tier_manager::configure_from_plan(int                          device,
         }
     }
 
+    // Explicit debug override, higher priority than the planned placement. It moves placement only, after the sizing
+    // above: returning before it would leave the sizes the previous buffer set on this reused manager, and the
+    // tiered allocator's backstop would charge an indexer buffer its K/V buffer's layers (llama.cpp-8ecj).
+    const char * hot_layers_env = std::getenv("GGML_SYCL_KV_HOT_LAYERS");
+    const bool   hot_override   = hot_layers_env != nullptr && std::atoi(hot_layers_env) >= 0;
+    if (hot_override) {
+        hot_layers_ = std::min(static_cast<uint32_t>(std::atoi(hot_layers_env)), n_layers);
+        layer_on_device_.assign(n_layers, false);
+        for (uint32_t l = 0; l < hot_layers_; l++) {
+            layer_on_device_[l] = true;
+        }
+        active_ = (hot_layers_ < total_layers_);
+    }
+
     // Byte totals for this buffer's layers, using the per-layer sizes.
     size_t dev_bytes  = 0;
     size_t host_bytes = 0;
@@ -431,6 +424,13 @@ void kv_tier_manager::configure_from_plan(int                          device,
     // class guards against was invisible because the only logged per-layer
     // figure came from a value the allocator never used (llama.cpp-2120).
     // sizing= says which of the two paths above produced the per-layer sizes.
+    if (hot_override) {
+        GGML_LOG_INFO(
+            "[KV-TIER] Plan-driven (env override): %u/%u layers on device (sizing=%s, %.1f MB device, %.1f MB host)\n",
+            hot_layers_, total_layers_, use_truth ? "per-layer" : "uniform", dev_bytes / (1024.0 * 1024.0),
+            host_bytes / (1024.0 * 1024.0));
+        return;
+    }
     GGML_LOG_INFO(
         "[KV-TIER] Plan-driven: %u/%u layers on device "
         "(planner_n_ctx=%u, kv_layers=%u, kv_per_layer=%zu, sizing=%s, %.1f MB device, %.1f MB host)\n",
