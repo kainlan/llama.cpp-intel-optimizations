@@ -2830,15 +2830,22 @@ recovery path: it measures the driver's working set and sizes the headroom from 
   allocate, fall back to host memory, or would leave the card under the driver headroom (the hold-spill fit). A
   compute buffer that does not fit RUNTIME takes the KV zone next, then raw device memory outside the arena, and the
   trial accepts both. So a dense auto pick above 512 can land `zone=raw`, in the external headroom. That is an open
-  finding, not an invariant of this design. MoE models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the
+  finding, not an invariant of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the
   auto pick's. `llama.cpp-fkpg` (a) transports the caller's shape.
-- The state term is measured at the measure's `n_seq_max` of 1, so a context with `-np` above 1 allocates more state
-  than the term holds. No load-time check sees that. The late check also measures at `n_seq_max` 1, so its refusal and
-  its shrink WARN compare one sequence's state with one sequence's state. The excess takes RUNTIME room from the
-  compute buffer, and the buffer's last chunk can land `zone=raw`. Today that landing line is the only signal. Catching
-  it needs either a context-side comparison of the real state with the planned term, or the caller's shape at the load
-  (`llama.cpp-fkpg`). The state is summed per buffer type, so a type holding several buffers can round up by one grain
-  per extra buffer beyond the term.
+- Every load-time path runs at `n_seq_max` 1 and cannot see the context's sequence count. The probe, the admitted
+  stage and the late check all build their measure context from the default parameters. So the state term holds one
+  sequence's state, and the late check compares one sequence's state with one sequence's state. A context with `-np`
+  above 1 allocates about `n_seq_max` times that state, RUNTIME-first and before its compute buffer. The excess takes
+  RUNTIME room from the compute term, and the buffer's last chunk can land `zone=raw`.
+  The context constructor names it. Right after its memory exists, it compares each SYCL device's state with the
+  planned state term the backend holds (`ggml_backend_sycl_planned_state_term`). The state is the memory's bytes for
+  that device's buffer type. When the state is larger, it WARNs `[LOAD-PLAN] state term exceeded on device N` with
+  `n_seq_max`, both sizes and the excess. It never refuses: `-np` is a normal user option, and a context the user
+  asked for is placed and warned, never shrunk or refused. `tests/test-sycl-load-measure-source.py` pins the WARN and
+  pins that neither the comparison nor its text helper refuses.
+  The fix is to transport the caller's `n_seq_max` into the load's measure, the same gap `llama.cpp-fkpg` records for
+  `-c` and `-ub`. It is tracked as `llama.cpp-0zyy`. The state is summed per buffer type, so a type holding several
+  buffers can round up by one grain per extra buffer beyond the term.
 - A second model whose term is larger than the live one's raises the RUNTIME requirement. The late zone rebuild is
   refused while the first model holds allocations, so that load reaches the abort in
   `compute_and_store_plan_for_inventory`. `llama.cpp-ouur` refuses it by name instead.

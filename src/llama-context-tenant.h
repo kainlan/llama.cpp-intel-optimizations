@@ -42,6 +42,9 @@ struct llama_sycl_l4_procs {
     decltype(&ggml_backend_sycl_load_reserve_state_term)   reserve_state    = nullptr;
     decltype(&ggml_backend_sycl_load_record_state_term)    record_state     = nullptr;
     decltype(&ggml_backend_sycl_load_late_check_state)     late_check_state = nullptr;
+    // The planned state term, read at context init to compare with the state the context's memory allocated
+    // (llama.cpp-p6i0). In neither gate: a WARN-only comparison, which a null proc simply skips.
+    decltype(&ggml_backend_sycl_planned_state_term)        planned_state    = nullptr;
 
     // A planned context needs all four: a publish that cannot be covered-checked, a load that
     // cannot be late-checked, or a plan whose residency cannot be probed, is half a plan.
@@ -193,6 +196,15 @@ inline ggml_sycl_late_check_result llama_sycl_l4_late_check_state(const llama_sy
         default:
             return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
     }
+}
+
+// The planned state term the backend holds for one device (llama.cpp-p6i0). False is "not read", and a null proc or a
+// null out reads as it, writing nothing: the context-init comparison then compares nothing for the device.
+inline bool llama_sycl_l4_planned_state_term(const llama_sycl_l4_procs & procs, int32_t device, uint64_t * out) {
+    if (procs.planned_state == nullptr || out == nullptr) {
+        return false;
+    }
+    return procs.planned_state(device, out);
 }
 
 // The reservation's units of one measured device's chunks (llama.cpp-p6i0). False is "not sized", and a null proc

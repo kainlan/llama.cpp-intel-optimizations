@@ -836,6 +836,8 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
         llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_RECORD_STATE_TERM));
     procs.late_check_state = reinterpret_cast<decltype(procs.late_check_state)>(
         llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_LATE_CHECK_STATE));
+    procs.planned_state = reinterpret_cast<decltype(procs.planned_state)>(
+        llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_PLANNED_STATE_TERM));
     return procs;
 }
 
@@ -848,6 +850,36 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
         }
     }
     return {};
+}
+
+// llama.cpp-p6i0: the context-init comparison of each SYCL device's recurrent state with the load's planned state term.
+// The state sits in the device's plain buffer type (the KV cache has its own), which is the device's compute buft, so
+// the memory's bytes for backend_buft[i] are that device's state, the quantity the load's probe measured and reserved.
+// The load measured it at n_seq_max 1; a context with more sequences allocates more, and llama_context_state_excess_text
+// names the excess at WARN. Never a refusal: the context stays as the user asked for it.
+[[maybe_unused]] static void llama_context_sycl_warn_state_excess(
+    const llama_sycl_l4_procs &                          procs,
+    const std::vector<ggml_backend_t> &                  backend_ptrs,
+    const std::vector<ggml_backend_buffer_type_t> &      backend_buft,
+    const std::map<ggml_backend_buffer_type_t, size_t> & memory_bytes,
+    uint32_t                                             n_seq_max) {
+    for (size_t i = 0, sycl_ordinal = 0; i < backend_ptrs.size() && i < backend_buft.size(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+        if (!llama_context_dev_is_sycl(dev)) {
+            continue;
+        }
+        const int32_t device  = llama_context_sycl_device_index(dev, (int) sycl_ordinal++);
+        const auto    state   = memory_bytes.find(backend_buft[i]);
+        const size_t  real    = state != memory_bytes.end() ? state->second : 0;
+        uint64_t      planned = 0;
+        if (real == 0 || !llama_sycl_l4_planned_state_term(procs, device, &planned)) {
+            continue;
+        }
+        const std::string warn = llama_context_state_excess_text(device, n_seq_max, planned, real);
+        if (!warn.empty()) {
+            LLAMA_LOG_WARN("%s: %s\n", __func__, warn.c_str());
+        }
+    }
 }
 
 // llama.cpp-7gno: what the constructor's planned-reserve decision reads. The chunk-cap copy's two procs come the way the
@@ -1677,6 +1709,15 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams, measure_only));
+
+        // llama.cpp-p6i0: the state this context's memory allocated against the state term the load planned. A
+        // measure-only context is the measure itself and allocates nothing.
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        if (!measure_only && memory && llama_context_has_sycl_backend(backends)) {
+            llama_context_sycl_warn_state_excess(llama_context_sycl_l4_procs_for(backends), backend_ptrs, backend_buft,
+                                                 memory->memory_breakdown(), cparams.n_seq_max);
+        }
+#endif
     }
 
     // the measure-only context's one MEASURE, on a scheduler of its own: no ALLOC, no ladder, no publish

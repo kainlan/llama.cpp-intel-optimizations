@@ -208,6 +208,21 @@ static bool fake_term_bytes(const uint64_t * chunk_bytes, uint32_t n_chunks, uin
     return g_term_answer;
 }
 
+// The planned state term read: answers a value the test picks, and records the device it was asked about.
+static bool     g_pstate_answer = true;
+static uint64_t g_pstate_value  = 0;
+static int      g_pstate_calls  = 0;
+static int32_t  g_pstate_dev    = -2;
+
+static bool fake_planned_state(int32_t device, uint64_t * out) {
+    g_pstate_calls++;
+    g_pstate_dev = device;
+    if (g_pstate_answer) {
+        *out = g_pstate_value;
+    }
+    return g_pstate_answer;
+}
+
 // The probe procs: one that answers a status the test picks and writes n_layer the way the backend's proc does
 // (never host_resident), and one that answers a value outside the enum.
 static ggml_sycl_residency_probe_status g_probe_answer = GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED;
@@ -568,6 +583,29 @@ int main() {
             "a value outside the enum was read as a comparison");
         g_slate_answer = GGML_SYCL_LATE_CHECK_EQUAL;
         CHECK(!procs.load_terms_available() && !procs.available(), "the state record and check alone report a gate");
+    }
+
+    // (17) the planned state term door (llama.cpp-p6i0): what the context-init comparison reads, outside both gates
+    {
+        llama_sycl_l4_procs none;
+        g_pstate_calls = 0;
+        uint64_t got   = 7;
+        CHECK(!llama_sycl_l4_planned_state_term(none, 0, &got), "a null planned-state proc was read as an answer");
+        CHECK(got == 7 && g_pstate_calls == 0, "a null planned-state proc wrote or was called");
+
+        llama_sycl_l4_procs procs;
+        procs.planned_state = &fake_planned_state;
+        CHECK(!llama_sycl_l4_planned_state_term(procs, 0, nullptr), "a null out was read as an answer");
+        CHECK(g_pstate_calls == 0, "the proc was called with a null out");
+        g_pstate_answer = true;
+        g_pstate_value  = 118063104;
+        CHECK(llama_sycl_l4_planned_state_term(procs, 1, &got) && got == 118063104ull && g_pstate_dev == 1,
+              "the planned state term was not read through");
+        g_pstate_answer = false;
+        got             = 7;
+        CHECK(!llama_sycl_l4_planned_state_term(procs, 1, &got) && got == 7, "a refused read was read as an answer");
+        g_pstate_answer = true;
+        CHECK(!procs.load_terms_available() && !procs.available(), "the planned-state read alone reports a gate");
     }
 
     // (4) the section builder

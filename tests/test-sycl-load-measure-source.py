@@ -31,7 +31,11 @@ one measure-only context over a load's placement. This gate pins, on comment-str
   is one: the measure reads the context memory's size per buffer type (memory_breakdown) into each SYCL device's
   caps, the run carries it on the measured device and never on the host tier, the probe reserve hands it to the
   state reservation before the compute term, the admitted stage records it under its own name, and the late fold
-  checks it with the state bytes, never the compute total.
+  checks it with the state bytes, never the compute total;
+- (llama.cpp-p6i0) the load measures that state at n_seq_max 1, so the context constructor compares, once and right
+  after its memory exists, each SYCL device's state (the memory's bytes for that device's buffer type) with the
+  planned state term the backend holds, and WARNs by name through one text helper when the state is larger. It is
+  never a refusal: neither the comparison nor the helper throws, returns a failure, or reaches the scheduler.
 
 Every clause has a mutant that must fail it. Host-only; collected by pytest.
 """
@@ -808,6 +812,79 @@ def test_state_consumer_mutants():
         else:
             c2, m2 = ctx, meas.replace(body, mutate(body, old, new), 1)
         assert not state_consumer_ok(c2, m2), f"mutant {name!r} slipped through"
+
+
+_WARN_EXCESS = (
+    "static void llama_context_sycl_warn_state_excess(const llama_sycl_l4_procs & procs, "
+    "const std::vector<ggml_backend_t> & backend_ptrs, const std::vector<ggml_backend_buffer_type_t> & backend_buft, "
+    "const std::map<ggml_backend_buffer_type_t, size_t> & memory_bytes, uint32_t n_seq_max)"
+)
+_EXCESS_TEXT = (
+    "inline std::string llama_context_state_excess_text(int32_t device, uint32_t n_seq_max, uint64_t planned_bytes, "
+    "uint64_t real_bytes)"
+)
+_EXCESS_CALL = (
+    "llama_context_sycl_warn_state_excess(llama_context_sycl_l4_procs_for(backends), backend_ptrs, backend_buft, "
+    "memory->memory_breakdown(), cparams.n_seq_max);"
+)
+_REFUSALS = ("throw", "return false", "GGML_ABORT", "abort(", "measure_status", "sched_reserve")
+
+
+def state_excess_ok(ctx_code: str, measure_code: str) -> bool:
+    """llama.cpp-p6i0: a context with more sequences than the load measured is placed and warned, never refused."""
+    ctor = ctor_body(ctx_code)
+    warn = function_body(ctx_code, _WARN_EXCESS)
+    text = function_body(measure_code, _EXCESS_TEXT)
+    # once, right after the memory exists, for a context that allocates (not the measure itself)
+    mem = ctor.find(z("memory.reset(model.create_memory(params_mem, cparams, measure_only));"))
+    gate = ctor.find(z("if (!measure_only && memory && llama_context_has_sycl_backend(backends)) {"))
+    call = ctor.find(z(_EXCESS_CALL))
+    if -1 in (mem, gate, call) or not mem < gate < call or ctx_code.count(z(_EXCESS_CALL)) != 1:
+        return False
+    if ctor[mem:call].count(";") != 1:  # nothing between the memory and its comparison but the gate
+        return False
+    # the comparison: the device's own buft's bytes, the backend's planned term, the one text, at WARN
+    for t in (
+        "const auto state = memory_bytes.find(backend_buft[i]);",
+        "llama_sycl_l4_planned_state_term(procs, device, &planned)",
+        "const std::string warn = llama_context_state_excess_text(device, n_seq_max, planned, real);",
+        'LLAMA_LOG_WARN("%s: %s\\n", __func__, warn.c_str());',
+    ):
+        if z(t) not in warn:
+            return False
+    # never a refusal, in the comparison or the helper
+    if any(r in warn or r in text for r in _REFUSALS):
+        return False
+    return z("if (real_bytes <= planned_bytes) {return {};}") in text
+
+
+def test_a_larger_state_is_warned_never_refused():
+    assert state_excess_ok(code_of(CONTEXT_CPP), code_of(MEASURE_H))
+
+
+def test_state_excess_mutants():
+    ctx = code_of(CONTEXT_CPP)
+    meas = code_of(MEASURE_H)
+    warn = function_body(ctx, _WARN_EXCESS)
+    text = function_body(meas, _EXCESS_TEXT)
+    ctor = ctor_body(ctx)
+    for name, body, old, new, in_ctx in [
+        ("the call is dropped", ctor, _EXCESS_CALL, "", True),
+        ("the measure context warns too", ctor, "if (!measure_only && memory && llama_context_has_sycl_backend(backends)) {", "if (memory && llama_context_has_sycl_backend(backends)) {", True),
+        ("the call passes n_seq_max 1", ctor, _EXCESS_CALL, _EXCESS_CALL.replace("cparams.n_seq_max", "1"), True),
+        ("the WARN is dropped", warn, 'LLAMA_LOG_WARN("%s: %s\\n", __func__, warn.c_str());', "", True),
+        ("the WARN is demoted to INFO", warn, 'LLAMA_LOG_WARN("%s: %s\\n", __func__, warn.c_str());', 'LLAMA_LOG_INFO("%s: %s\\n", __func__, warn.c_str());', True),
+        ("the WARN becomes a refusal", warn, 'LLAMA_LOG_WARN("%s: %s\\n", __func__, warn.c_str());', "throw std::runtime_error(warn);", True),
+        ("another buft's bytes", warn, "const auto state = memory_bytes.find(backend_buft[i]);", "const auto state = memory_bytes.begin();", True),
+        ("the planned term is not read", warn, "llama_sycl_l4_planned_state_term(procs, device, &planned)", "true", True),
+        ("the helper refuses", text, "if (real_bytes <= planned_bytes) {", "if (real_bytes > planned_bytes) {throw std::runtime_error(\"state\");}if (real_bytes <= planned_bytes) {", False),
+        ("the helper compares loosely", text, "if (real_bytes <= planned_bytes) {", "if (real_bytes < planned_bytes) {", False),
+    ]:
+        if in_ctx:
+            c2, m2 = ctx.replace(body, mutate(body, old, new), 1), meas
+        else:
+            c2, m2 = ctx, meas.replace(body, mutate(body, old, new), 1)
+        assert not state_excess_ok(c2, m2), f"mutant {name!r} slipped through"
 
 
 def test_one_n_ctx_rule():

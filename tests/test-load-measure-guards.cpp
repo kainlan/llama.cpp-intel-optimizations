@@ -960,6 +960,35 @@ static void test_quiet_scope() {
     llama_log_set(old_cb, old_data);
 }
 
+// The context-init comparison of a device's real recurrent state with the load's planned state term (llama.cpp-p6i0):
+// a WARN by name when the state is larger, nothing when it fits, never a refusal (the helper has no other output).
+static void test_state_excess() {
+    // fits: equal, smaller, and no state at all
+    CHECK(llama_context_state_excess_text(0, 1, 118063104, 118063104).empty(), "an equal state warned");
+    CHECK(llama_context_state_excess_text(0, 4, 118063104, 1).empty(), "a smaller state warned");
+    CHECK(llama_context_state_excess_text(0, 1, 0, 0).empty(), "a device with no state warned");
+
+    // larger: names the device, n_seq_max, both sizes and the excess
+    const std::string w = llama_context_state_excess_text(1, 4, 118063104, 472252416);
+    CHECK(!w.empty(), "a state four times the term did not warn");
+    CHECK(w.find("[LOAD-PLAN] state term exceeded on device 1") == 0, "the WARN does not lead with its name: %s",
+          w.c_str());
+    CHECK(w.find("n_seq_max 4") != std::string::npos, "the WARN does not name n_seq_max: %s", w.c_str());
+    CHECK(w.find("450.4 MiB of recurrent state") != std::string::npos, "the WARN does not name the real state: %s",
+          w.c_str());
+    CHECK(w.find("planned 112.6 MiB") != std::string::npos, "the WARN does not name the planned term: %s", w.c_str());
+    CHECK(w.find("337.8 MiB excess") != std::string::npos, "the WARN does not name the excess: %s", w.c_str());
+    CHECK(w.find("n_seq_max 1") != std::string::npos, "the WARN does not say what the load measured at: %s", w.c_str());
+    CHECK(w.find("zone=raw") != std::string::npos, "the WARN does not name the consequence: %s", w.c_str());
+    CHECK(w.find("kept as asked") != std::string::npos, "the WARN does not say the context is kept: %s", w.c_str());
+
+    // one byte over still warns: the comparison is exact, not rounded
+    CHECK(!llama_context_state_excess_text(0, 2, 1048576, 1048577).empty(), "one byte over did not warn");
+    // nothing planned (the load reserved no state term) and a real state: still named
+    const std::string z = llama_context_state_excess_text(0, 1, 0, 1048576);
+    CHECK(z.find("planned 0.0 MiB") != std::string::npos, "an unplanned state was not named: %s", z.c_str());
+}
+
 int main() {
     test_guard();
     test_dummies();
@@ -975,6 +1004,7 @@ int main() {
     test_admitted_record();
     test_probe_reserve();
     test_state_terms();
+    test_state_excess();
     if (n_failed != 0) {
         fprintf(stderr, "%d check(s) failed\n", n_failed);
         return 1;

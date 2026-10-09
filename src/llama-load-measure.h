@@ -320,6 +320,31 @@ inline std::string llama_late_check_state_not_recorded_text(int32_t device, size
            " MiB on device " + std::to_string(device) + "; it is allocated in the RUNTIME zone unplanned)";
 }
 
+// The context-init comparison of one SYCL device's recurrent state with the load's planned state term
+// (llama.cpp-p6i0). Every load-time measure runs at n_seq_max 1, the only shape a load sees, so a context with more
+// sequences allocates more state than the term holds, RUNTIME-first and before the compute buffer, and the excess
+// draws down the compute term. -np is a normal user option: the context is kept as asked and this is a WARN, never a
+// refusal. The comparison is exact (one byte over warns). Empty when the state fits the term.
+inline std::string llama_context_state_excess_text(int32_t  device,
+                                                   uint32_t n_seq_max,
+                                                   uint64_t planned_bytes,
+                                                   uint64_t real_bytes) {
+    if (real_bytes <= planned_bytes) {
+        return {};
+    }
+    char real_mib[32];
+    char planned_mib[32];
+    char excess_mib[32];
+    std::snprintf(real_mib, sizeof(real_mib), "%.1f", real_bytes / 1024.0 / 1024.0);
+    std::snprintf(planned_mib, sizeof(planned_mib), "%.1f", planned_bytes / 1024.0 / 1024.0);
+    std::snprintf(excess_mib, sizeof(excess_mib), "%.1f", (real_bytes - planned_bytes) / 1024.0 / 1024.0);
+    return "[LOAD-PLAN] state term exceeded on device " + std::to_string(device) + ": this context holds " + real_mib +
+           " MiB of recurrent state at n_seq_max " + std::to_string(n_seq_max) + ", the load planned " + planned_mib +
+           " MiB (measured at n_seq_max 1, the only shape a load sees); the " + excess_mib +
+           " MiB excess is allocated in the RUNTIME zone unplanned and draws down the compute term, so a compute "
+           "buffer chunk can land outside RUNTIME (zone=raw). The context is kept as asked";
+}
+
 // Folds the measured devices through the backend's late check. A device the backend recorded nothing for
 // stays in `not_recorded`; it is never read as EQUAL. The first REFUSED ends the fold with the named refusal
 // (the backend has logged its own canonical line). The host tier is skipped: the backend's entry point takes a

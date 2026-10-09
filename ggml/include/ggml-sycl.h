@@ -1742,6 +1742,14 @@ GGML_BACKEND_API enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_ch
                                                                                           int32_t  device,
                                                                                           uint64_t state_bytes);
 
+// The planned state term the backend holds for device (llama.cpp-p6i0): the RUNTIME bytes the loads reserved for the
+// context memory on the device's plain buffer type, merged across live models the way the reservation merges it,
+// written to *out.  It reads that value only.  A context compares it at init with the state its memory allocated,
+// which the load measured at n_seq_max 1 and cannot see for a context with more sequences.  False, writing nothing,
+// when out is null or device is out of range.
+// Proc name: "ggml_backend_sycl_planned_state_term".
+GGML_BACKEND_API bool ggml_backend_sycl_planned_state_term(int32_t device, uint64_t * out);
+
 // The residency probe (llama.cpp-moua L4 step 3d, llama.cpp-5cim).  Which layers would this context's plan leave in
 // host memory?  A pure plan query: it takes no replan lock, publishes nothing and changes nothing, and works with no
 // tenants and no published section (the caller asks before it publishes).

@@ -21051,6 +21051,17 @@ enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check_state(ggml_sy
     }
 }
 
+// The planned state term on device (llama.cpp-p6i0), for the context-init comparison with the state a context's memory
+// allocated.  A read of the planner's term and nothing else: a bounds check and an atomic load, so it takes no lock
+// and cannot throw.
+bool ggml_backend_sycl_planned_state_term(int32_t device, uint64_t * out) {
+    if (out == nullptr || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    *out = ggml_sycl::unified_cache_get_planned_state_term_bytes(device);
+    return true;
+}
+
 // The residency probe (llama.cpp-moua L4 step 3d, llama.cpp-5cim): which layers would this context's plan leave in host
 // memory?  The core that answers is residency-probe.hpp's; what it needs and this entry cannot yet give it is the live
 // shared-zone geometry of each device and the planned device of each layer, which step 1d wires.  Until then the proc
@@ -117201,6 +117212,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_load_late_check_state") == 0) {
         return (void *) ggml_backend_sycl_load_late_check_state;
+    }
+    if (strcmp(name, "ggml_backend_sycl_planned_state_term") == 0) {
+        return (void *) ggml_backend_sycl_planned_state_term;
     }
     if (strcmp(name, "ggml_backend_sycl_supports_op_capability") == 0) {
         return (void *) ggml_backend_sycl_supports_op_capability;
