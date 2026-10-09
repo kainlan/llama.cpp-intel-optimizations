@@ -30332,34 +30332,71 @@ static void populate_host_zone_sizing(placement_plan &                          
     // llama.cpp-cre6: the host-expert MoE scatter scratch, published beside the CONTROL requirement for the same
     // devices. One flush places one op's rows, or a decode gate/up pair's when the layer splits gate and up (the
     // sibling slot then flushes both through one copy and one kernel); each expert matrix's row is its ne[1] floats.
-    // A dense model plans nothing.
+    // Only tensors that keep experts on the host scatter anything, and only on the device whose layer runs their
+    // MUL_MAT_ID: a dense model or an all-VRAM placement plans 0 there, so nothing is claimed or reported. An expert
+    // with no entry of its own counts as host-resident, as it does at dispatch.
     {
-        size_t moe_host_scatter_bytes = 0;
+        struct expert_residency {
+            int     layer           = -1;
+            bool    any_host        = false;
+            bool    whole_on_device = false;
+            int64_t n_on_device     = 0;
+        };
+
+        std::unordered_map<std::string, expert_residency> residency;
+        std::vector<moe_host_scatter_tensor>              scattered;
         if (n_experts > 0 && n_expert_used > 0) {
+            for (const placement_entry & e : plan.entries) {
+                if (expert_tensor_role_from_tensor_name(e.name.c_str()) == expert_tensor_role::UNKNOWN) {
+                    continue;
+                }
+                expert_residency & r = residency[e.name];
+                r.layer              = e.layer_id;
+                if (!e.on_device) {
+                    r.any_host = true;
+                } else if (e.expert_id < 0) {
+                    r.whole_on_device = true;
+                } else {
+                    r.n_on_device++;
+                }
+            }
             for (const auto & item : tensor_inventory) {
                 const expert_tensor_role role = expert_tensor_role_from_tensor_name(item.name.c_str());
                 if (role == expert_tensor_role::UNKNOWN || !item.has_shape() || item.ne[1] <= 0) {
                     continue;
                 }
-                const bool split_gate_up = role == expert_tensor_role::GATE || role == expert_tensor_role::UP ||
-                                           role == expert_tensor_role::CHUNK_GATE ||
-                                           role == expert_tensor_role::CHUNK_UP;
-                size_t bytes = 0;
-                if (moe_host_scatter_scratch_bytes(static_cast<size_t>(n_expert_used), split_gate_up,
-                                                   static_cast<size_t>(item.ne[1]), &bytes)) {
-                    moe_host_scatter_bytes = std::max(moe_host_scatter_bytes, bytes);
-                }
+                const auto              it = residency.find(item.name);
+                moe_host_scatter_tensor t;
+                t.has_host_experts = it == residency.end() || it->second.any_host ||
+                                     (!it->second.whole_on_device && it->second.n_on_device < n_experts);
+                const int layer = it != residency.end() && it->second.layer >= 0 ?
+                                      it->second.layer :
+                                      expert_layer_from_tensor_name(item.name.c_str());
+                t.device        = plan.devices.empty() ? plan.device_id : plan.get_layer_device(layer);
+                t.split_gate_up = role == expert_tensor_role::GATE || role == expert_tensor_role::UP ||
+                                  role == expert_tensor_role::CHUNK_GATE || role == expert_tensor_role::CHUNK_UP;
+                t.row_elems = static_cast<size_t>(item.ne[1]);
+                scattered.push_back(t);
             }
         }
-        if (plan.devices.empty()) {
-            unified_cache_set_planned_moe_host_scatter_scratch_bytes(plan.device_id, moe_host_scatter_bytes);
-        } else {
-            for (int device : plan.devices) {
-                unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, moe_host_scatter_bytes);
-            }
+        std::vector<int> devices = plan.devices;
+        if (devices.empty()) {
+            devices.push_back(plan.device_id);
         }
-        GGML_LOG_INFO("[SYCL-PLAN] MoE host scatter scratch: %.1f KB (RUNTIME zone)\n",
-                      moe_host_scatter_bytes / 1024.0);
+        for (int device : devices) {
+            size_t moe_host_scatter_bytes = 0;
+            if (!moe_host_scatter_scratch_bytes_for_device(scattered, device, static_cast<size_t>(n_expert_used),
+                                                           &moe_host_scatter_bytes)) {
+                GGML_LOG_WARN(
+                    "[SYCL-PLAN] MoE host scatter scratch on device %d overflows; none is planned and "
+                    "host-expert results scatter with one copy per run of rows (llama.cpp-cre6)\n",
+                    device);
+                moe_host_scatter_bytes = 0;
+            }
+            unified_cache_set_planned_moe_host_scatter_scratch_bytes(device, moe_host_scatter_bytes);
+            GGML_LOG_INFO("[SYCL-PLAN] MoE host scatter scratch on device %d: %.1f KB (RUNTIME zone)\n", device,
+                          moe_host_scatter_bytes / 1024.0);
+        }
     }
 
     // 4. CPU quantization temp buffers: 3 pre-allocated slots (cpu_dispatch_buffers) each

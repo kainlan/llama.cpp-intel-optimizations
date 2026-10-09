@@ -19291,6 +19291,10 @@ static void ggml_sycl_mmq_src1_claim_plan(ggml_backend_sycl_context & ctx) {
 // forbidden). The scatter never allocates it: a flush stages through what is claimed here, in chunks when it has more
 // rows than the plan, so no op grows it. A claim the zone cannot meet is reported, not fatal: the producers then bind
 // no scratch and the flush makes one copy per run of adjacent rows, which is slower and equally correct.
+// Known limitation, shared with the Q8_1 claim: the term is counted once per device in the RUNTIME zone, but every
+// context on that device claims its own scratch, so two contexts on one device over-draw the zone by one scratch.
+// Same-device concurrent contexts are unsupported until RUNTIME ownership is context-keyed (canonical contract §5,
+// llama.cpp-wld8); then the claim should draw from its own context's reservation.
 static void ggml_sycl_moe_host_scatter_claim_plan(ggml_backend_sycl_context & ctx) {
     const int    d       = ctx.device;
     const size_t planned = ggml_sycl::unified_cache_get_planned_moe_host_scatter_scratch_bytes(d);
@@ -24944,8 +24948,12 @@ struct moe_profile_state {
                 print_row("    CPU future.get()", dtok_scat_cpu, dtok.n_moe_layers);
                 print_row("    memcpy submit", dtok_scat_sub, dtok.n_moe_layers);
                 print_row("    event::wait()", dtok_scat_wait, dtok.n_moe_layers);
-                fprintf(stderr, "    Scatter: %d calls, %d entries, %.1f KB total\n", dtok_scat_calls, dtok_scat_ent,
-                        dtok_scat_bytes / 1024.0);
+                // "entries" counts H2D copies only (llama.cpp-cre6): the compact scatter's placement kernels are not
+                // in it, so compare copies with copies across builds, and count kernels from the kernel profiler.
+                fprintf(
+                    stderr,
+                    "    Scatter: %d calls, %d entries (H2D copies, placement kernels not counted), %.1f KB total\n",
+                    dtok_scat_calls, dtok_scat_ent, dtok_scat_bytes / 1024.0);
                 if (dtok_scat_calls > 0) {
                     double per_call_us    = (dtok_scat_cpu + dtok_scat_sub + dtok_scat_wait) / dtok_scat_calls;
                     double per_call_bytes = dtok_scat_bytes / dtok_scat_calls;
@@ -25033,7 +25041,10 @@ struct moe_profile_state {
                 print_avg("    CPU future.get()", avg_scatter_cpu_wait);
                 print_avg("    memcpy submit", avg_scatter_submit);
                 print_avg("    event::wait()", avg_scatter_event_wait);
-                fprintf(stderr, "    Avg scatter: %.0f calls, %.0f entries, %.1f KB/token\n",
+                // See the per-token line above: entries are H2D copies, without the placement kernels.
+                fprintf(stderr,
+                        "    Avg scatter: %.0f calls, %.0f entries (H2D copies, placement kernels not counted), "
+                        "%.1f KB/token\n",
                         static_cast<double>(avg_scatter_calls) / nt, static_cast<double>(avg_scatter_entries) / nt,
                         avg_scatter_bytes / 1024.0);
                 double avg_total_scatter_us = avg_scatter_cpu_wait + avg_scatter_submit + avg_scatter_event_wait;
@@ -25240,15 +25251,38 @@ static void flush_prev_scatter_bufs() {
     flush_prev_scatter_bufs(g_pending_scatter);
 }
 
+// Everything one host-expert scatter flush builds, kept across flushes so a decode token's flushes allocate nothing
+// once the first has sized it (llama.cpp-cre6). Thread-local like the pending slots it serves. The handle vectors
+// are cleared when each flush is done with them, so they never hold an allocation past its flush.
+struct moe_host_scatter_workspace {
+    std::vector<ggml_sycl::mem_handle>      srcs;
+    std::vector<ggml_sycl::mem_handle>      dsts;
+    std::vector<ggml_sycl::moe_scatter_row> rows;
+    std::vector<ggml_sycl::moe_scatter_run> runs;
+    ggml_sycl::moe_scatter_plan             plan;
+    std::vector<sycl::event>                copied;
+    std::vector<sycl::event>                events;
+
+    void release_handles() {
+        srcs.clear();
+        dsts.clear();
+    }
+};
+
+static thread_local moe_host_scatter_workspace g_moe_host_scatter_ws;
+
 // The rows of one scatter as moe-host-scatter.hpp sees them (llama.cpp-cre6): every entry of `slots`, in order, with
 // its staging and destination named by index into `srcs` / `dsts`, one index per allocation (stable identity, never
 // the resolved address). A shared pool is one source and gate and up are at most two destinations, so the compact plan
-// can merge the copy and keep the kernel to two destination buffers.
-static void moe_host_scatter_rows_collect(pending_cpu_scatter * const *             slots,
-                                          int                                       n_slots,
-                                          std::vector<ggml_sycl::mem_handle> &      srcs,
-                                          std::vector<ggml_sycl::mem_handle> &      dsts,
-                                          std::vector<ggml_sycl::moe_scatter_row> & rows) {
+// can merge the copy and keep the kernel to two destination buffers. Fills the workspace, which it clears first.
+static void moe_host_scatter_rows_collect(pending_cpu_scatter * const * slots,
+                                          int                           n_slots,
+                                          moe_host_scatter_workspace &  ws) {
+    std::vector<ggml_sycl::mem_handle> &      srcs = ws.srcs;
+    std::vector<ggml_sycl::mem_handle> &      dsts = ws.dsts;
+    std::vector<ggml_sycl::moe_scatter_row> & rows = ws.rows;
+    ws.release_handles();
+    rows.clear();
     auto index_of = [](std::vector<ggml_sycl::mem_handle> & set, const ggml_sycl::mem_handle & h) {
         for (size_t i = 0; i < set.size(); ++i) {
             if (set[i].stable_identity_equal(h)) {
@@ -25283,38 +25317,41 @@ struct moe_host_scatter_rows {
 // pointers the kernel takes are views resolved here, at submission, from handles that are retained until the kernel
 // completes. Returns false having submitted nothing when the rows cannot take this form here; `why` names the reason
 // and the caller makes the per-run copies instead.
-static bool moe_host_scatter_submit_compact(pending_cpu_scatter * const * slots,
-                                            int                           n_slots,
-                                            std::vector<sycl::event> &    events,
-                                            size_t *                      n_copies,
-                                            const char **                 why) {
+static bool moe_host_scatter_submit_compact(pending_cpu_scatter * const *    slots,
+                                            int                              n_slots,
+                                            moe_host_scatter_workspace &     ws,
+                                            size_t *                         n_copies,
+                                            ggml_sycl::moe_scatter_decline * why) {
     const pending_cpu_scatter & lead   = *slots[0];
     sycl::queue &               queue  = *lead.stream;
     const int                   device = lead.device_id;
     if (!lead.scatter_scratch.valid() || lead.scatter_scratch_bytes == 0) {
-        *why = "no planned scratch was claimed for this context";
+        *why = ggml_sycl::MOE_SCATTER_DECLINE_NO_SCRATCH;
         return false;
     }
     // The scratch is reused by the next chunk and the next flush: only an in-order queue orders their copies after
     // this kernel.
     if (!queue.has_property<sycl::property::queue::in_order>()) {
-        *why = "the queue is not in order";
+        *why = ggml_sycl::MOE_SCATTER_DECLINE_QUEUE_NOT_IN_ORDER;
         return false;
     }
     // A recorded kernel would replay this flush's scratch contents into dst on every replay; the per-run copies
     // keep whatever a recording does with them today.
     if (ggml_sycl_graph_recording_active()) {
-        *why = "a SYCL graph is recording";
+        *why = ggml_sycl::MOE_SCATTER_DECLINE_GRAPH_RECORDING;
         return false;
     }
-    std::vector<ggml_sycl::mem_handle>      srcs;
-    std::vector<ggml_sycl::mem_handle>      dsts;
-    std::vector<ggml_sycl::moe_scatter_row> rows;
-    moe_host_scatter_rows_collect(slots, n_slots, srcs, dsts, rows);
-    ggml_sycl::moe_scatter_plan plan;
-    if (dsts.size() > static_cast<size_t>(ggml_sycl::MOE_SCATTER_MAX_DSTS) ||
-        !ggml_sycl::moe_scatter_plan_build(rows, lead.scatter_scratch_bytes, &plan)) {
-        *why = "the rows do not take the compact form";
+    moe_host_scatter_rows_collect(slots, n_slots, ws);
+    const std::vector<ggml_sycl::mem_handle> &      srcs = ws.srcs;
+    const std::vector<ggml_sycl::mem_handle> &      dsts = ws.dsts;
+    const std::vector<ggml_sycl::moe_scatter_row> & rows = ws.rows;
+    const ggml_sycl::moe_scatter_plan &             plan = ws.plan;
+    if (dsts.size() > static_cast<size_t>(ggml_sycl::MOE_SCATTER_MAX_DSTS)) {
+        *why = ggml_sycl::MOE_SCATTER_DECLINE_TOO_MANY_DSTS;
+        return false;
+    }
+    if (!ggml_sycl::moe_scatter_plan_build(rows, lead.scatter_scratch_bytes, &ws.plan)) {
+        *why = ggml_sycl::MOE_SCATTER_DECLINE_NOT_COMPACT;
         return false;
     }
 
@@ -25325,7 +25362,7 @@ static bool moe_host_scatter_submit_compact(pending_cpu_scatter * const * slots,
     }
     const ggml_sycl::resolved_ptr scratch = lead.scatter_scratch.resolve(device);
     if (!scratch.ptr || !scratch.on_device || scratch.extent < scratch_used) {
-        *why = "the scratch does not resolve on the device";
+        *why = ggml_sycl::MOE_SCATTER_DECLINE_SCRATCH_UNRESOLVED;
         return false;
     }
     char * dst_base[ggml_sycl::MOE_SCATTER_MAX_DSTS]   = {};
@@ -25333,7 +25370,7 @@ static bool moe_host_scatter_submit_compact(pending_cpu_scatter * const * slots,
     for (size_t d = 0; d < dsts.size(); ++d) {
         const ggml_sycl::resolved_ptr r = dsts[d].resolve(device);
         if (!r.ptr || !r.on_device || r.extent == 0) {
-            *why = "a destination does not resolve on the device";
+            *why = ggml_sycl::MOE_SCATTER_DECLINE_DST_UNRESOLVED;
             return false;
         }
         dst_base[d]   = static_cast<char *>(r.ptr);
@@ -25341,18 +25378,17 @@ static bool moe_host_scatter_submit_compact(pending_cpu_scatter * const * slots,
     }
     for (const ggml_sycl::moe_scatter_row & row : rows) {
         if (row.dst_offset > dst_extent[row.dst] || plan.row_bytes > dst_extent[row.dst] - row.dst_offset) {
-            *why = "a destination row lies outside its buffer";
+            *why = ggml_sycl::MOE_SCATTER_DECLINE_DST_OUT_OF_RANGE;
             return false;
         }
     }
 
-    std::vector<ggml_sycl::mem_handle> retained = dsts;
-    retained.push_back(lead.scatter_scratch);
     const float *  scratch_rows = static_cast<const float *>(scratch.ptr);
     const uint32_t row_elems    = static_cast<uint32_t>(plan.row_bytes / sizeof(float));
+    sycl::event    placed_last;
     for (const ggml_sycl::moe_scatter_chunk & chunk : plan.chunks) {
-        std::vector<sycl::event> copied;
-        copied.reserve(chunk.n_copies);
+        std::vector<sycl::event> & copied = ws.copied;
+        copied.clear();
         for (size_t c = chunk.first_copy; c < chunk.first_copy + chunk.n_copies; ++c) {
             const ggml_sycl::moe_scatter_copy & copy = plan.copies[c];
             copied.push_back(ggml_sycl::mem_copy_async(lead.scatter_scratch, copy.scratch_offset, srcs[copy.src],
@@ -25381,10 +25417,18 @@ static bool moe_host_scatter_submit_compact(pending_cpu_scatter * const * slots,
                 });
             });
         });
-        ggml_sycl::retain_handles_until_event(retained, placed);
-        events.insert(events.end(), copied.begin(), copied.end());
-        events.push_back(placed);
+        ws.events.insert(ws.events.end(), copied.begin(), copied.end());
+        ws.events.push_back(placed);
+        placed_last = placed;
     }
+    // One retention for the whole flush: the queue is in order, so the last kernel completes after every copy and
+    // kernel before it. The list goes to the retention by value, which is the one allocation a flush still makes.
+    std::vector<ggml_sycl::mem_handle> retained;
+    retained.reserve(dsts.size() + 1);
+    retained.insert(retained.end(), dsts.begin(), dsts.end());
+    retained.push_back(lead.scatter_scratch);
+    ggml_sycl::retain_handles_until_event(std::move(retained), placed_last);
+    ws.release_handles();
     *n_copies = plan.copies.size();
     if (lead.scatter_stats) {
         lead.scatter_stats->note_use(scratch_used);
@@ -25487,7 +25531,8 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
     using hrc = std::chrono::high_resolution_clock;
     auto t0   = hrc::now();
 
-    std::vector<sycl::event> scatter_events;
+    moe_host_scatter_workspace & ws = g_moe_host_scatter_ws;
+    ws.events.clear();
     try {
         // Wait for CPU compute to finish
         for (int k = 0; k < n_group; ++k) {
@@ -25524,30 +25569,28 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
         // One copy of the compact result block into the planned scratch and one kernel placing its rows; when the
         // rows cannot take that form, one copy per run of rows whose destinations are adjacent, slot by slot, older
         // first. Both go through mem_handle, so ownership and event retention stay centralized.
-        size_t       n_copies = 0;
-        const char * why      = nullptr;
-        if (!moe_host_scatter_submit_compact(group, n_group, scatter_events, &n_copies, &why)) {
-            static std::atomic<bool> warned{ false };
-            if (!warned.exchange(true, std::memory_order_relaxed)) {
+        size_t                         n_copies = 0;
+        ggml_sycl::moe_scatter_decline why      = ggml_sycl::MOE_SCATTER_DECLINE_COUNT;
+        if (!moe_host_scatter_submit_compact(group, n_group, ws, &n_copies, &why)) {
+            // Once per reason: a later decline for a different reason is still reported.
+            static std::atomic<uint32_t> reported{ 0 };
+            if (ggml_sycl::moe_scatter_decline_first(reported, why)) {
                 GGML_LOG_WARN(
                     "[MOE-SCATTER] host-expert results on device %d scatter with one copy per run of "
-                    "adjacent rows: %s (llama.cpp-cre6); reported once\n",
-                    slot.device_id, why ? why : "unknown");
+                    "adjacent rows: %s (llama.cpp-cre6); reported once per reason\n",
+                    slot.device_id, ggml_sycl::moe_scatter_decline_name(why));
             }
             for (int k = 0; k < n_group; ++k) {
-                pending_cpu_scatter &                   s = *group[k];
-                std::vector<ggml_sycl::mem_handle>      srcs;
-                std::vector<ggml_sycl::mem_handle>      dsts;
-                std::vector<ggml_sycl::moe_scatter_row> rows;
-                std::vector<ggml_sycl::moe_scatter_run> runs;
-                pending_cpu_scatter * const             one[1] = { &s };
-                moe_host_scatter_rows_collect(one, 1, srcs, dsts, rows);
-                ggml_sycl::moe_scatter_runs_build(rows, runs);
-                for (const ggml_sycl::moe_scatter_run & run : runs) {
-                    scatter_events.push_back(ggml_sycl::mem_copy_async(dsts[run.dst], run.dst_offset, srcs[run.src],
-                                                                       run.src_offset, run.bytes, *s.stream));
+                pending_cpu_scatter &       s      = *group[k];
+                pending_cpu_scatter * const one[1] = { &s };
+                moe_host_scatter_rows_collect(one, 1, ws);
+                ggml_sycl::moe_scatter_runs_build(ws.rows, ws.runs);
+                for (const ggml_sycl::moe_scatter_run & run : ws.runs) {
+                    ws.events.push_back(ggml_sycl::mem_copy_async(ws.dsts[run.dst], run.dst_offset, ws.srcs[run.src],
+                                                                  run.src_offset, run.bytes, *s.stream));
                 }
-                n_copies += runs.size();
+                n_copies += ws.runs.size();
+                ws.release_handles();
             }
         }
 
@@ -25557,6 +25600,7 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
         if (g_moe_profile_enabled) {
             double cpu_wait_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
             double submit_us   = std::chrono::duration<double, std::micro>(t2 - t1).count();
+            // n_copies counts the H2D copies only; the compact form's placement kernels are not entries.
             g_moe_profile.moe_scatter_detail(cpu_wait_us, submit_us, 0, static_cast<int>(n_copies), total_bytes);
         }
     } catch (const std::exception & ex) {
@@ -25567,7 +25611,7 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
     }
 
     for (int k = 0; k < n_group; ++k) {
-        pending_cpu_scatter_retire(*group[k], scatter_events);
+        pending_cpu_scatter_retire(*group[k], ws.events);
     }
 }
 
