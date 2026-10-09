@@ -121,6 +121,7 @@ ROWS_SIG = "static void moe_host_scatter_rows_collect(pending_cpu_scatter * cons
 FOR_DEVICE_SIG = "inline bool moe_host_scatter_scratch_bytes_for_device("
 DECLINE_FIRST_SIG = "inline bool moe_scatter_decline_first(std::atomic<uint32_t> & seen, moe_scatter_decline why)"
 PAYS_SIG = "inline bool moe_scatter_compact_pays(size_t n_runs, const moe_scatter_plan & plan)"
+MAY_PAY_SIG = "inline bool moe_scatter_compact_may_pay(size_t n_runs)"
 BIND_SIG = "static void pending_cpu_scatter_bind_scratch(pending_cpu_scatter & slot, ggml_backend_sycl_context & ctx)"
 
 PUBLISH_CALL = "publish_moe_host_scatter_term(plan, tensor_inventory, n_experts, kv_info.n_expert_used);"
@@ -313,8 +314,26 @@ def claim_compact_taken_only_when_it_pays(sycl: str, hdr: str = HDR) -> bool:
                           "{ return moe_host_scatter_form::PER_RUN; }")
     first_submit = min(i for i in (compact.find("mem_copy_async("), compact.find("ggml_sycl_profile_submit(")) if i >= 0)
     return (min(collect, submit, per_run, choice) >= 0 and choice < first_submit
-            and compact.count("moe_host_scatter_form::PER_RUN") == 1
+            and compact.count("moe_host_scatter_form::PER_RUN") == 2
             and "return n_runs > plan.copies.size() + plan.chunks.size();" in pays)
+
+
+_EARLY = "if (!ggml_sycl::moe_scatter_compact_may_pay(ws.runs.size())) { return moe_host_scatter_form::PER_RUN; }"
+
+
+def claim_too_few_runs_answer_first(sycl: str, hdr: str = HDR) -> bool:
+    """Two runs or fewer can never pay (the compact form is at least one copy and one kernel), so the compact form
+    answers PER_RUN from the run count before it names any decline reason or builds a plan: a flush that could never
+    pay reports no NO_SCRATCH, and the one-run decode flush builds no plan."""
+    compact = body(norm(sycl), COMPACT_SIG)
+    may_pay = body(norm(hdr), MAY_PAY_SIG)
+    if not (compact and may_pay):
+        return False
+    early = compact.find(_EARLY)
+    first_why = compact.find("*why =")
+    plan_at = compact.find("moe_scatter_plan_build(")
+    return (min(early, first_why, plan_at) >= 0 and early < first_why and early < plan_at
+            and "return n_runs > 2;" in may_pay)
 
 
 def claim_decline_reported_once_per_reason(sycl: str, hdr: str = HDR) -> bool:
@@ -405,6 +424,10 @@ def test_the_compact_scatter_never_allocates():
 
 def test_the_compact_form_is_taken_only_when_it_pays():
     assert claim_compact_taken_only_when_it_pays(SYCL)
+
+
+def test_too_few_runs_answer_before_any_decline():
+    assert claim_too_few_runs_answer_first(SYCL)
 
 
 # ---- mutants: every claim must fail against the thing it forbids --------------------------------------------------
@@ -505,6 +528,22 @@ def test_mutant_compact_taken_whenever_it_can_run_fails():
     assert not claim_compact_taken_only_when_it_pays(
         _once(SYCL, "if (!ggml_sycl::moe_scatter_compact_pays(ws.runs.size(), plan)) { return moe_host_scatter_form::PER_RUN; }",
               "", within=COMPACT_SIG))
+
+
+def test_mutant_too_few_runs_not_answered_fails():
+    assert not claim_too_few_runs_answer_first(_once(SYCL, _EARLY, "", within=COMPACT_SIG))
+
+
+def test_mutant_too_few_runs_answered_after_no_scratch_fails():
+    raw = _once(SYCL, _EARLY, "", within=COMPACT_SIG)
+    assert not claim_too_few_runs_answer_first(
+        _once(raw, "*why = ggml_sycl::MOE_SCATTER_DECLINE_NO_SCRATCH; return moe_host_scatter_form::DECLINED; }",
+              "*why = ggml_sycl::MOE_SCATTER_DECLINE_NO_SCRATCH; return moe_host_scatter_form::DECLINED; } " + _EARLY,
+              within=COMPACT_SIG))
+
+
+def test_mutant_two_runs_may_pay_fails():
+    assert not claim_too_few_runs_answer_first(SYCL, _once(HDR, "return n_runs > 2;", "return n_runs > 1;"))
 
 
 def test_mutant_compact_pays_whenever_it_can_run_fails():

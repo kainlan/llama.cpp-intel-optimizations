@@ -184,6 +184,13 @@ inline bool moe_scatter_compact_pays(size_t n_runs, const moe_scatter_plan & pla
     return n_runs > plan.copies.size() + plan.chunks.size();
 }
 
+// Whether the compact form can pay at all, from the run count alone: it is at least one copy and one kernel, so two
+// runs or fewer never pay. A flush asks this before it looks for scratch or builds a plan, so the common one-run decode
+// flush builds none, and a flush that could never pay reports no decline.
+inline bool moe_scatter_compact_may_pay(size_t n_runs) {
+    return n_runs > 2;
+}
+
 // Why a flush did not take the compact form; each reason is reported once (llama.cpp-cre6).
 enum moe_scatter_decline : uint32_t {
     MOE_SCATTER_DECLINE_NO_SCRATCH = 0,

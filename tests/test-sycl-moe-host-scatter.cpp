@@ -458,6 +458,8 @@ static int compact_choice(const std::vector<dispatch> & ds, size_t scratch_bytes
     CHECK(ggml_sycl::moe_scatter_plan_build(rows, scratch_bytes, &plan), "the routing takes a compact plan");
     *runs = run_list.size();
     *pays = ggml_sycl::moe_scatter_compact_pays(run_list.size(), plan);
+    CHECK(!*pays || ggml_sycl::moe_scatter_compact_may_pay(run_list.size()),
+          "a flush the plan says pays is one the run count alone already allowed");
     g_compact_census.flushes += 1;
     g_compact_census.compact += *pays ? 1 : 0;
     g_compact_census.kernels += *pays ? (int) plan.chunks.size() : 0;
@@ -506,6 +508,24 @@ static int test_compact_pays() {
                          gate_scratch, &runs, &pays) == 0,
           "gate+up, shared pool");
     CHECK(runs == 6 && pays, "six runs against one merged copy and one kernel");
+
+    // Two runs or fewer never pay: the compact form is at least one copy and one kernel. The flush answers that from
+    // the run count before it looks for scratch or builds a plan, so a two-run flush on a device with no planned
+    // scratch takes the per-run copies without reporting NO_SCRATCH.
+    CHECK(!ggml_sycl::moe_scatter_compact_may_pay(0) && !ggml_sycl::moe_scatter_compact_may_pay(1) &&
+              !ggml_sycl::moe_scatter_compact_may_pay(2) && ggml_sycl::moe_scatter_compact_may_pay(3),
+          "the compact form can pay only from three runs");
+    {
+        std::vector<moe_scatter_row> rows;
+        append_rows(decode(0, 0, 0, k_n_down, { 1, 4 }), rows);
+        std::vector<moe_scatter_run> run_list;
+        ggml_sycl::moe_scatter_runs_build(rows, run_list);
+        moe_scatter_plan plan;
+        CHECK(run_list.size() == 2 && !ggml_sycl::moe_scatter_compact_may_pay(run_list.size()),
+              "a two-run flush is answered PER_RUN from its run count");
+        CHECK(!ggml_sycl::moe_scatter_plan_build(rows, 0, &plan),
+              "positive control: with no scratch term the plan fails, so only the early answer avoids a decline");
+    }
 
     // Positive control for the GPU census: the compact form is taken on exactly the flushes where it pays.
     std::printf("compact form taken on %d of %d flushes, %d placement kernels\n", g_compact_census.compact,
