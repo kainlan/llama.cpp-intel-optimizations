@@ -2661,8 +2661,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         "%s: [LOAD-PLAN] state term on device %d: %.1f MiB of recurrent state %s, %s; measured at "
                         "n_seq_max 1, so a context with more sequences allocates more state than this holds\n",
                         __func__, (int) t.device, t.state_bytes / 1024.0 / 1024.0,
-                        t.reserved ? "reserved in RUNTIME beside the compute term" :
-                                     "NOT reserved (the backend said why)",
+                        t.state_reserved ? "reserved in RUNTIME as its own term" :
+                                           "NOT reserved (the backend said why)",
                         t.state_recorded ? "recorded for the late check" : "not recorded");
                 }
             }

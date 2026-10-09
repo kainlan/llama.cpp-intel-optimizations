@@ -30,8 +30,9 @@ one measure-only context over a load's placement. This gate pins, on comment-str
 - (llama.cpp-p6i0) every RUNTIME-first consumer at context time is named in the reserve, and the recurrent state
   is one: the measure reads the context memory's size per buffer type (memory_breakdown) into each SYCL device's
   caps, the run carries it on the measured device and never on the host tier, the probe reserve hands it to the
-  state reservation before the compute term, the admitted stage records it under its own name, and the late fold
-  checks it with the state bytes, never the compute total;
+  state reservation before the compute term and lists each reserved state apart from the declined compute terms, the
+  admitted stage marks and records each reserved state under its own name whatever its compute term did, and the
+  late fold checks it with the state bytes, never the compute total;
 - (llama.cpp-p6i0) the load measures that state at n_seq_max 1, so the context constructor compares, once and right
   after its memory exists, each SYCL device's state (the memory's bytes for that device's buffer type) with the
   planned state term the backend holds, and WARNs by name through one text helper when the state is larger. It is
@@ -302,7 +303,10 @@ def probe_ok(code: str) -> bool:
         "llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_PROBE)",
         "if (!measured.ok) { (measured.unsupported ? out.unsupported : out.refusal) = measured.refusal; return out; }",
         "const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);",
-        "out.not_reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);",
+        "llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);",
+        # both outcomes kept: the declined compute terms and, apart from them, the reserved states
+        "out.not_reserved = std::move(reserved.compute_declined);",
+        "out.state_reserved = std::move(reserved.state_reserved);",
     ]
     pos = [b.find(z(t)) for t in order]
     return (
@@ -332,7 +336,7 @@ def admit_ok(code: str) -> bool:
         "llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B)",
         "if (!measured.ok)",
         "const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);",
-        "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, measured.devices, measured_n_ctx,",
+        "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, probe.state_reserved, measured.devices, measured_n_ctx,",
         "if (!out.refusal.empty()) { return out; }",
         "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);",
         # llama.cpp-p6i0: the reserved state under its own name, at the same n_ctx
@@ -697,11 +701,13 @@ def test_probe_mutants():
     b = function_body(code, _PROBE)
     for name, old, new in [
         ("measured at the admitted stage", "GGML_SYCL_MEASURE_STAGE_PROBE)", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_B)"),
-        ("no reservation", "out.not_reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);", "(void) measured_n_ctx;"),
+        ("no reservation", "llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);", "(void) measured_n_ctx;"),
         ("the envelope's n_ctx reserved", "llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx)", "llama_load_probe_reserve(procs, txn, measured.devices, n_ctx)"),
         ("the probe's residency not kept", "out.kv = measured.kv;", ""),
-        ("the declined devices dropped", "out.not_reserved = llama_load_probe_reserve(", "(void) llama_load_probe_reserve("),
-        ("the compute term reserved past the helper", "out.not_reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);", "out.not_reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);\n    (void) llama_sycl_l4_reserve_compute_term(procs, txn, measured.devices[0], measured_n_ctx);"),
+        ("the declined devices dropped", "out.not_reserved = std::move(reserved.compute_declined);", ""),
+        ("the reserved states dropped", "out.state_reserved = std::move(reserved.state_reserved);", ""),
+        ("the reserved states read from the declined list", "out.state_reserved = std::move(reserved.state_reserved);", "out.state_reserved = reserved.compute_declined;"),
+        ("the compute term reserved past the helper", "llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);", "llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);\n    (void) llama_sycl_l4_reserve_compute_term(procs, txn, measured.devices[0], measured_n_ctx);"),
         ("no proc gate", "if (!procs.load_terms_available())", "if (false)"),
         ("stand-ins dropped", "llama_measure_dummy_scope dummies(weights);", ""),
     ]:
@@ -720,9 +726,11 @@ def test_admit_mutants():
         ("recorded despite a refusal", "if (!out.refusal.empty()) {\n        return out;\n    }", ""),
         ("never recorded", "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);", ""),
         ("recorded at n_ctx 0", "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);", "out.n_recorded = llama_admitted_record(procs, txn, out, n_ctx);"),
-        ("the fold bypassed", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, measured.devices,", "llama_admitted_check_fold(procs, measured.devices, probe.not_reserved, measured.devices,"),
+        ("the fold bypassed", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, probe.state_reserved, measured.devices,", "llama_admitted_check_fold(procs, measured.devices, probe.not_reserved, probe.state_reserved, measured.devices,"),
         ("the admitted stage reserves", "    if (!out.refusal.empty()) {\n        return out;\n    }", "    (void) llama_sycl_l4_reserve_compute_term(procs, txn, measured.devices[0], measured_n_ctx);\n    if (!out.refusal.empty()) {\n        return out;\n    }"),
-        ("unreserved devices compared", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, measured.devices,", "llama_admitted_check_fold(procs, probe.devices, {}, measured.devices,"),
+        ("unreserved devices compared", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, probe.state_reserved, measured.devices,", "llama_admitted_check_fold(procs, probe.devices, {}, probe.state_reserved, measured.devices,"),
+        ("the fold given no reserved state", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, probe.state_reserved, measured.devices,", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, {}, measured.devices,"),
+        ("the fold given the declined list as the states", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, probe.state_reserved, measured.devices,", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, probe.not_reserved, measured.devices,"),
         ("the residencies swapped", "probe.kv, measured.kv);", "measured.kv, probe.kv);"),
         ("the probe's residency judged against itself", "probe.kv, measured.kv);", "probe.kv, probe.kv);"),
         ("the admitted stage reserves state", "    if (!out.refusal.empty()) {\n        return out;\n    }", "    (void) llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);\n    if (!out.refusal.empty()) {\n        return out;\n    }"),
@@ -735,7 +743,7 @@ def test_admit_mutants():
 
 _CAPS = "std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sched_measure_plan & plan) const"
 _PROBE_RESERVE = (
-    "inline std::vector<int32_t> llama_load_probe_reserve(const llama_sycl_l4_procs & procs, "
+    "inline llama_load_probe_reservations llama_load_probe_reserve(const llama_sycl_l4_procs & procs, "
     "struct ggml_sycl_load_txn txn, const std::vector<llama_load_measure_device> & devices, uint32_t n_ctx)"
 )
 _RECORD_STATE = (
@@ -768,9 +776,17 @@ def state_consumer_ok(ctx_code: str, measure_code: str) -> bool:
     if z("d.state_bytes = c.host ? 0 : c.state_bytes;") not in run:
         return False
     # the probe reserve: the state's own reservation, before the compute term, for a device that has state
-    st = res.find(z("if (d.state_bytes != 0 && !llama_sycl_l4_reserve_state_term(procs, txn, d.device, d.state_bytes))"))
+    st = res.find(z("if (d.state_bytes != 0) {if (!llama_sycl_l4_reserve_state_term(procs, txn, d.device, d.state_bytes)) {"))
+    ls = res.find(z("out.state_reserved.push_back(d.device);"))
     co = res.find(z("llama_sycl_l4_reserve_compute_term(procs, txn, d, n_ctx)"))
-    if st == -1 or co == -1 or st > co:
+    if -1 in (st, ls, co) or not st < ls < co or res.count(z("out.state_reserved.push_back(")) != 1:
+        return False
+    # the state reservation is its own outcome: the fold marks it from the reserved-state list, and the record follows
+    # it, never the compute term's (a state reserved beside a declined compute term is still recorded)
+    if z("t.state_reserved = t.state_bytes != 0 && std::find(state_reserved.begin(), state_reserved.end(), d.device) "
+         "!= state_reserved.end();") not in measure_code:
+        return False
+    if z("t.state_recorded = t.state_reserved && t.state_bytes != 0 &&") not in rec:
         return False
     # the admitted fold carries the probe's state (the reserved one); the record names it as the state term
     if z("t.state_bytes = bound->state_bytes;") not in measure_code:
@@ -799,7 +815,11 @@ def test_state_consumer_mutants():
         ("the caps take another buft's state", caps, "const auto state = memory_bytes.find(entry.buft);", "const auto state = memory_bytes.begin();", True),
         ("the run drops the state", run, "d.state_bytes = c.host ? 0 : c.state_bytes;", "", True),
         ("the run carries the host tier's state", run, "d.state_bytes = c.host ? 0 : c.state_bytes;", "d.state_bytes = c.state_bytes;", True),
-        ("the probe reserve drops the state", res, "if (d.state_bytes != 0 && !llama_sycl_l4_reserve_state_term(procs, txn, d.device, d.state_bytes)) {", "if (false) {", False),
+        ("the probe reserve drops the state", res, "if (d.state_bytes != 0) {", "if (false) {", False),
+        ("the probe reserve never lists the state", res, "out.state_reserved.push_back(d.device);", "", False),
+        ("the probe reserve lists the state before it is reserved", res, "if (d.state_bytes != 0) {", "if (d.state_bytes != 0) {out.state_reserved.push_back(d.device);", False),
+        ("the fold marks the state from the compute term", meas, "t.state_reserved = t.state_bytes != 0 &&", "t.state_reserved = t.reserved && t.state_bytes != 0 &&", False),
+        ("the record follows the compute reservation", rec, "t.state_recorded = t.state_reserved && t.state_bytes != 0 &&", "t.state_recorded = t.reserved && t.state_bytes != 0 &&", False),
         ("the probe reserve hands over the compute total", res, "llama_sycl_l4_reserve_state_term(procs, txn, d.device, d.state_bytes)", "llama_sycl_l4_reserve_state_term(procs, txn, d.device, d.total)", False),
         ("the admitted fold carries the admitted state", meas, "t.state_bytes = bound->state_bytes;", "t.state_bytes = d.state_bytes;", False),
         ("the record drops the state", rec, "llama_sycl_l4_record_state_term(procs, txn, t.device, t.state_bytes, n_ctx)", "false", False),

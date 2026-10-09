@@ -364,7 +364,7 @@ static void test_admitted_fold() {
                                                                   chunked(1, false, { 300 }),
                                                                   chunked(-1, true, { 5000 }) };
         const llama_admitted_check_result            r =
-            llama_admitted_check_fold(procs, probe, {}, admitted, 262144, 512, kv_probe, kv_probe);
+            llama_admitted_check_fold(procs, probe, {}, {}, admitted, 262144, 512, kv_probe, kv_probe);
         CHECK(r.refusal.empty(), "refused: %s", r.refusal.c_str());
         CHECK(r.terms.size() == 2, "%zu terms for two SYCL devices", r.terms.size());
         if (r.terms.size() == 2) {
@@ -383,7 +383,7 @@ static void test_admitted_fold() {
         const std::vector<llama_load_measure_device> probe    = { chunked(0, false, { 256, 256 }) };
         const std::vector<llama_load_measure_device> admitted = { chunked(0, false, { 300, 10 }) };
         const llama_admitted_check_result            r =
-            llama_admitted_check_fold(procs, probe, {}, admitted, 4096, 512, kv_probe, kv_probe);
+            llama_admitted_check_fold(procs, probe, {}, {}, admitted, 4096, 512, kv_probe, kv_probe);
         CHECK(!r.refusal.empty(), "a c(P) larger than the reservation in its own units was admitted");
         CHECK(r.refusal.find("768 B") != std::string::npos && r.refusal.find("512 B") != std::string::npos,
               "the refusal does not print both values in the reservation's units: %s", r.refusal.c_str());
@@ -393,7 +393,7 @@ static void test_admitted_fold() {
         const std::vector<llama_load_measure_device> probe    = { chunked(0, false, { 200 }) };
         const std::vector<llama_load_measure_device> admitted = { chunked(0, false, { 250 }) };
         const llama_admitted_check_result            r =
-            llama_admitted_check_fold(procs, probe, {}, admitted, 4096, 512, kv_probe, kv_probe);
+            llama_admitted_check_fold(procs, probe, {}, {}, admitted, 4096, 512, kv_probe, kv_probe);
         CHECK(r.refusal.empty(), "a c(P) equal to the reservation in its own units was refused: %s", r.refusal.c_str());
         CHECK(r.terms.size() == 1 && r.terms[0].admitted_bytes == 250, "the recorded c(P) is not the raw total");
     }
@@ -404,7 +404,7 @@ static void test_admitted_fold() {
         const std::vector<llama_load_measure_device> admitted = { chunked(0, false, { 100 }),
                                                                   chunked(1, false, { 513 }) };
         const llama_admitted_check_result            r =
-            llama_admitted_check_fold(procs, probe, {}, admitted, 262144, 512, kv_probe, kv_probe);
+            llama_admitted_check_fold(procs, probe, {}, {}, admitted, 262144, 512, kv_probe, kv_probe);
         CHECK(r.refusal.rfind("[LOAD-PLAN] compute-slot-exceeds-probe-bound on device 1: ", 0) == 0, "refusal text: %s",
               r.refusal.c_str());
         CHECK(r.refusal.find("c(P) 768 B > probe bound C-hat 512 B") != std::string::npos,
@@ -422,7 +422,7 @@ static void test_admitted_fold() {
         const std::vector<llama_load_measure_device> admitted = { chunked(0, false, { 100 }),
                                                                   chunked(1, false, { 1 }) };
         const llama_admitted_check_result            r =
-            llama_admitted_check_fold(procs, probe, {}, admitted, 4096, 512, kv_probe, kv_probe);
+            llama_admitted_check_fold(procs, probe, {}, {}, admitted, 4096, 512, kv_probe, kv_probe);
         CHECK(r.refusal.rfind("[LOAD-PLAN] compute-slot-exceeds-probe-bound on device 1: ", 0) == 0,
               "a device without a probe bound was admitted: %s", r.refusal.c_str());
         CHECK(r.refusal.find("no probe bound") != std::string::npos, "the refusal does not say why: %s",
@@ -435,7 +435,7 @@ static void test_admitted_fold() {
         const std::vector<llama_load_measure_device> admitted = { chunked(0, false, { 100 }),
                                                                   chunked(1, false, { 5000 }) };
         const llama_admitted_check_result            r =
-            llama_admitted_check_fold(procs, probe, { 1 }, admitted, 4096, 512, kv_probe, kv_probe);
+            llama_admitted_check_fold(procs, probe, { 1 }, {}, admitted, 4096, 512, kv_probe, kv_probe);
         CHECK(r.refusal.empty(), "a device with no reservation was compared and refused: %s", r.refusal.c_str());
         CHECK(r.terms.size() == 2 && r.terms[0].reserved && !r.terms[1].reserved,
               "the device with no reservation is not listed as such");
@@ -448,11 +448,11 @@ static void test_admitted_fold() {
         const std::vector<llama_load_measure_device> probe    = { chunked(0, false, { 100 }) };
         const std::vector<llama_load_measure_device> admitted = { chunked(0, false, { 100 }) };
         const llama_admitted_check_result            r =
-            llama_admitted_check_fold(none, probe, {}, admitted, 4096, 512, kv_probe, kv_probe);
+            llama_admitted_check_fold(none, probe, {}, {}, admitted, 4096, 512, kv_probe, kv_probe);
         CHECK(r.refusal.find("cannot be sized in the reservation's units") != std::string::npos,
               "an unsized term was compared as raw bytes: %s", r.refusal.c_str());
         const llama_admitted_check_result u =
-            llama_admitted_check_fold(none, probe, { 0 }, admitted, 4096, 512, kv_probe, kv_probe);
+            llama_admitted_check_fold(none, probe, { 0 }, {}, admitted, 4096, 512, kv_probe, kv_probe);
         CHECK(u.refusal.empty() && u.terms.size() == 1 && !u.terms[0].reserved,
               "an unreserved device was refused for a term nobody compares");
     }
@@ -460,7 +460,7 @@ static void test_admitted_fold() {
     // nothing on a SYCL device: nothing to record, nothing refused
     {
         const llama_admitted_check_result r =
-            llama_admitted_check_fold(procs, {}, {}, { chunked(-1, true, { 7 }) }, 4096, 512, kv_probe, kv_probe);
+            llama_admitted_check_fold(procs, {}, {}, {}, { chunked(-1, true, { 7 }) }, 4096, 512, kv_probe, kv_probe);
         CHECK(r.refusal.empty() && r.terms.empty(), "a host-only measure produced a term or a refusal");
     }
     // c(P) > C-hat with the KV residency moved between the measures is the KV-residency delta, not a planning defect:
@@ -471,7 +471,7 @@ static void test_admitted_fold() {
         const std::vector<llama_load_measure_device> admitted = { chunked(0, false, { 100 }),
                                                                   chunked(1, false, { 600 }) };
         const llama_admitted_check_result            r =
-            llama_admitted_check_fold(procs, probe, {}, admitted, 131072, 512, kv_probe, kv_moved);
+            llama_admitted_check_fold(procs, probe, {}, {}, admitted, 131072, 512, kv_probe, kv_moved);
         CHECK(r.refusal.empty(), "a growth explained by the KV residency was refused: %s", r.refusal.c_str());
         CHECK(r.terms.size() == 2, "%zu terms for two SYCL devices", r.terms.size());
         if (r.terms.size() == 2) {
@@ -490,7 +490,7 @@ static void test_admitted_fold() {
         const std::vector<llama_load_measure_device> admitted = { chunked(0, false, { 300 }),
                                                                   chunked(1, false, { 5000 }) };
         const llama_admitted_check_result            r =
-            llama_admitted_check_fold(procs, probe, { 1 }, admitted, 4096, 512, kv_probe, kv_moved);
+            llama_admitted_check_fold(procs, probe, { 1 }, {}, admitted, 4096, 512, kv_probe, kv_moved);
         CHECK(r.refusal.empty() && r.terms.size() == 2 && r.terms[0].kv_excess == 0 && r.terms[1].kv_excess == 0 &&
                   !r.terms[1].reserved,
               "a shrink or an unreserved device was given an excess");
@@ -503,12 +503,12 @@ static void test_admitted_fold() {
         const std::vector<llama_load_measure_device> probe = { chunked(0, false, { 100 }) };
         const std::vector<llama_load_measure_device> grown = { chunked(0, false, { 300 }) };
         const llama_admitted_check_result            r_cpu =
-            llama_admitted_check_fold(procs, probe, {}, grown, 4096, 512, kv_probe, kv_cpu);
+            llama_admitted_check_fold(procs, probe, {}, {}, grown, 4096, 512, kv_probe, kv_cpu);
         CHECK(r_cpu.refusal.empty() && r_cpu.terms.size() == 1 && r_cpu.terms[0].kv_excess == 256,
               "a residency moved to the CPU was not tolerated: %s", r_cpu.refusal.c_str());
         const std::vector<llama_load_measure_device> unbound = { chunked(0, false, { 100 }), chunked(1, false, { 1 }) };
         const llama_admitted_check_result            r_unb =
-            llama_admitted_check_fold(procs, probe, {}, unbound, 4096, 512, kv_probe, kv_moved);
+            llama_admitted_check_fold(procs, probe, {}, {}, unbound, 4096, 512, kv_probe, kv_moved);
         CHECK(r_unb.refusal.find("no probe bound") != std::string::npos,
               "a device with no probe bound was tolerated: %s", r_unb.refusal.c_str());
     }
@@ -624,8 +624,9 @@ static void test_probe_reserve() {
             with_state(chunked(0, false, { 1618052864, 536870912 }), 118038528), chunked(1, false, { 100 }),
             with_state(chunked(-1, true, { 900 }), 77)
         };
-        const std::vector<int32_t> declined = llama_load_probe_reserve(procs, ggml_sycl_load_txn{ 5 }, devs, 262144);
-        CHECK(declined.empty(), "a device was declined");
+        const llama_load_probe_reservations r = llama_load_probe_reserve(procs, ggml_sycl_load_txn{ 5 }, devs, 262144);
+        CHECK(r.compute_declined.empty(), "a device was declined");
+        CHECK(r.state_reserved == std::vector<int32_t>({ 0 }), "the reserved state was not listed");
         CHECK(g_reserve_seq == std::vector<std::string>({ "state 0 118038528 txn 5", "compute 0 2154923776 262144",
                                                           "compute 1 100 262144" }),
               "the reservations were not state-then-compute per device: %zu call(s)", g_reserve_seq.size());
@@ -637,8 +638,9 @@ static void test_probe_reserve() {
         g_reserve_decline_compute.clear();
         const std::vector<llama_load_measure_device> devs = { with_state(chunked(0, false, { 200 }), 64),
                                                               with_state(chunked(1, false, { 300 }), 32) };
-        const std::vector<int32_t> declined = llama_load_probe_reserve(procs, ggml_sycl_load_txn{ 5 }, devs, 4096);
-        CHECK(declined == std::vector<int32_t>({ 0 }), "a declined state did not decline its device");
+        const llama_load_probe_reservations r = llama_load_probe_reserve(procs, ggml_sycl_load_txn{ 5 }, devs, 4096);
+        CHECK(r.compute_declined == std::vector<int32_t>({ 0 }), "a declined state did not decline its device");
+        CHECK(r.state_reserved == std::vector<int32_t>({ 1 }), "a declined state was listed as reserved");
         CHECK(
             g_reserve_seq == std::vector<std::string>({ "state 0 64 txn 5", "state 1 32 txn 5", "compute 1 300 4096" }),
             "a device whose state was declined was offered its compute term");
@@ -649,8 +651,9 @@ static void test_probe_reserve() {
         g_reserve_decline_state.clear();
         g_reserve_decline_compute                         = { 1 };
         const std::vector<llama_load_measure_device> devs = { with_state(chunked(1, false, { 300 }), 32) };
-        const std::vector<int32_t> declined = llama_load_probe_reserve(procs, ggml_sycl_load_txn{ 5 }, devs, 4096);
-        CHECK(declined == std::vector<int32_t>({ 1 }), "a declined compute term did not decline its device");
+        const llama_load_probe_reservations r = llama_load_probe_reserve(procs, ggml_sycl_load_txn{ 5 }, devs, 4096);
+        CHECK(r.compute_declined == std::vector<int32_t>({ 1 }), "a declined compute term did not decline its device");
+        CHECK(r.state_reserved == std::vector<int32_t>({ 1 }), "a declined compute term dropped the reserved state");
         CHECK(g_reserve_seq.size() == 2, "the state and the compute term were not both asked");
     }
     // with no state proc a device with state is declined, never reserved as compute alone
@@ -661,9 +664,9 @@ static void test_probe_reserve() {
         g_reserve_decline_state.clear();
         g_reserve_decline_compute.clear();
         const std::vector<llama_load_measure_device> devs = { with_state(chunked(0, false, { 300 }), 32) };
-        const std::vector<int32_t>                   declined =
+        const llama_load_probe_reservations          r =
             llama_load_probe_reserve(compute_only, ggml_sycl_load_txn{ 5 }, devs, 4096);
-        CHECK(declined == std::vector<int32_t>({ 0 }) && g_reserve_seq.empty(),
+        CHECK(r.compute_declined == std::vector<int32_t>({ 0 }) && r.state_reserved.empty() && g_reserve_seq.empty(),
               "a device with state was reserved as compute alone");
     }
     g_reserve_decline_state.clear();
@@ -704,11 +707,12 @@ static void test_state_terms() {
         const std::vector<llama_load_measure_device> admitted = { with_state(chunked(0, false, { 900 }), 400),
                                                                   with_state(chunked(1, false, { 900 }), 300) };
         const llama_admitted_check_result            r =
-            llama_admitted_check_fold(procs, probe, { 1 }, admitted, 4096, 512, {}, {});
+            llama_admitted_check_fold(procs, probe, { 1 }, { 1 }, admitted, 4096, 512, {}, {});
         CHECK(r.refusal.empty() && r.terms.size() == 2, "the fold refused: %s", r.refusal.c_str());
         CHECK(r.terms.size() == 2 && r.terms[0].state_bytes == 500, "the term does not carry the probe's state");
-        CHECK(r.terms.size() == 2 && r.terms[1].state_bytes == 300 && !r.terms[1].reserved,
-              "a declined device's state is carried but the device is not reserved");
+        CHECK(r.terms.size() == 2 && !r.terms[0].state_reserved, "a state not listed as reserved was marked reserved");
+        CHECK(r.terms.size() == 2 && r.terms[1].state_bytes == 300 && !r.terms[1].reserved && r.terms[1].state_reserved,
+              "a reserved state beside a declined compute term was not marked reserved apart from it");
     }
 
     // each reserved device with state records it under the state term at the measure's n_ctx; a device with no state
@@ -717,19 +721,26 @@ static void test_state_terms() {
         llama_sycl_l4_procs procs;
         procs.record_state = &fake_record_state;
         llama_admitted_check_result admitted;
-        admitted.terms                = { admitted_term(0, true, 100, 90), admitted_term(1, true, 200, 200),
-                                          admitted_term(2, false, 300, 300) };
-        admitted.terms[0].state_bytes = 118038528;
-        admitted.terms[2].state_bytes = 77;
+        admitted.terms                   = { admitted_term(0, true, 100, 90), admitted_term(1, true, 200, 200),
+                                             admitted_term(2, false, 300, 300), admitted_term(3, false, 400, 400),
+                                             admitted_term(4, true, 500, 500) };
+        admitted.terms[0].state_bytes    = 118038528;
+        admitted.terms[0].state_reserved = true;
+        admitted.terms[2].state_bytes    = 77;  // its state was declined too: the device was declined whole
+        admitted.terms[3].state_bytes    = 55;  // its compute term was declined, its state reserved
+        admitted.terms[3].state_reserved = true;
+        admitted.terms[4].state_bytes    = 33;  // its compute term reserved, its state not: the state is not recorded
         g_state_seq.clear();
         g_state_record_ok = true;
-        CHECK(llama_admitted_record_state(procs, ggml_sycl_load_txn{ 7 }, admitted, 262144) == 1,
-              "not exactly one state recorded");
-        CHECK(g_state_seq == std::vector<std::string>({ "record 0 118038528 262144 txn 7" }),
-              "the state record visited the wrong devices or carried the wrong bytes: %zu call(s)", g_state_seq.size());
+        CHECK(llama_admitted_record_state(procs, ggml_sycl_load_txn{ 7 }, admitted, 262144) == 2,
+              "not exactly two states recorded");
         CHECK(
-            admitted.terms[0].state_recorded && !admitted.terms[1].state_recorded && !admitted.terms[2].state_recorded,
-            "the recorded flags are wrong");
+            g_state_seq == std::vector<std::string>({ "record 0 118038528 262144 txn 7", "record 3 55 262144 txn 7" }),
+            "the state record visited the wrong devices or carried the wrong bytes: %zu call(s)", g_state_seq.size());
+        CHECK(admitted.terms[0].state_recorded && !admitted.terms[1].state_recorded &&
+                  !admitted.terms[2].state_recorded && admitted.terms[3].state_recorded &&
+                  !admitted.terms[4].state_recorded,
+              "the recorded flags are wrong");
         g_state_record_ok                = false;
         admitted.terms[0].state_recorded = false;
         CHECK(llama_admitted_record_state(procs, ggml_sycl_load_txn{ 7 }, admitted, 262144) == 0 &&

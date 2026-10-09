@@ -2783,8 +2783,10 @@ shared zone, and the buffer took whatever the allocator found. On the B70 with Q
   `[LOAD-PLAN] late check on device N: compute term equal (X MiB), early reservation stands`. A pass that printed
   nothing could not be told from a check that never ran.
 - The state term is recorded in the same ledger under its own name, never added to c(P), so the late check still
-  compares compute with compute. At the admitted stage each reserved device records the probe's state, the value the
-  reservation holds (`ggml_backend_sycl_load_record_state_term`). The late check compares the late measure's state with
+  compares compute with compute. At the admitted stage each device whose state was reserved records the probe's state,
+  the value the reservation holds (`ggml_backend_sycl_load_record_state_term`). The state's own reservation decides,
+  not the compute term's: a state reserved beside a declined compute term is real RUNTIME memory the backend holds a
+  term for, so it is recorded and late-checked like any other. The late check compares the late measure's state with
   it under the same rule (`ggml_backend_sycl_load_late_check_state`): larger refuses the load as `term state in zone
   RUNTIME`, smaller is admitted with the shrink WARN, and equal WARNs `state term equal`. That catches a state that
   moves at the dev_layer sync, which can retier recurrent layers to the CPU. A late state with no record WARNs
