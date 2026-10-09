@@ -1475,12 +1475,18 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runti
 
 // ---------------------------------------------------------------------------
 // The measured-tenant publish, its coverage query and the load-time late check
-// (llama.cpp-moua L4, doc 2.4.2 and 2.4.4).  DECLARATIONS ONLY: no export in
-// this tree defines them yet and no proc address answers to their names.
-// A null proc address means the backend predates the entry point; the caller
-// then treats it as GROWTH (coverage), NOT_RECORDED (late check) and
-// GGML_SYCL_LIFECYCLE_UNSUPPORTED (publish).  Resolve them with
-// ggml_backend_reg_get_proc_address() under the exact names below.
+// (llama.cpp-moua L4, doc 2.4.2 and 2.4.4); the load's compute term, its record,
+// its reservation and the reservation's units; and the load's recurrent-state
+// term, its reservation, its record, its late check and the planned-state read
+// (llama.cpp-p6i0).  The SYCL reg's get_proc_address answers each of them under
+// the "Proc name:" its declaration carries.  A null proc address means the
+// backend predates the entry point; the caller then treats it as GROWTH
+// (coverage), NOT_RECORDED (either late check), GGML_SYCL_LIFECYCLE_UNSUPPORTED
+// (publish), not recorded (either record), not reserved (either reservation),
+// not sized (the units) and not read (the planned state, whose context-init
+// comparison is then skipped).  A loader missing any of the six load-term
+// entry points measures nothing and takes the unplanned path.  Resolve them
+// with ggml_backend_reg_get_proc_address() under the exact names below.
 //
 // Layout rules, which moua owns: fields are only appended; a reader treats a
 // field beyond the publisher's struct_size as absent and refuses a version it
@@ -1675,6 +1681,79 @@ GGML_BACKEND_API enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_ch
                                                                                     int32_t                   device,
                                                                                     uint64_t compute_bytes);
 
+// The early stage's record of a load's compute term (llama.cpp-p6i0): c(P), the compute term measured for device at the
+// load's admitted placement, at the n_ctx that measure ran with.  ggml_backend_sycl_load_late_check compares the late
+// measure against it.  False, recording nothing, when txn is not the open load transaction, when n_ctx is 0 (a measure
+// with no shape has no c(P)), or while the backend admits no mutation (a reactivation or a shutdown is in progress);
+// the late check then answers NOT_RECORDED for the device.  A load's commit or rollback drops what it recorded.
+// Proc name: "ggml_backend_sycl_load_record_compute_term".
+GGML_BACKEND_API bool ggml_backend_sycl_load_record_compute_term(struct ggml_sycl_load_txn txn,
+                                                                 int32_t                   device,
+                                                                 uint64_t                  bytes,
+                                                                 uint32_t                  n_ctx);
+
+// The load's compute reservation (llama.cpp-p6i0): the probe measure's compute term for device, handed to the
+// planner before the weight pack.  chunk_bytes[0..n_chunks) are the measure's per-chunk peaks (one allocation each);
+// the backend sizes a planned RUNTIME term from them at its allocator's grain, with no headroom, so the weight pack
+// leaves room for the scheduler's compute buffer.  It never touches the ledger the record writes.  False, reserving
+// nothing, when txn is not the open load transaction, when n_ctx is 0, when device is out of range or has no VRAM
+// arena, when chunk_bytes is null with n_chunks > 0 or the sum overflows, or while the backend admits no mutation;
+// the load then goes on with its compute buffer unplanned.
+// Proc name: "ggml_backend_sycl_load_reserve_compute_term".
+GGML_BACKEND_API bool ggml_backend_sycl_load_reserve_compute_term(struct ggml_sycl_load_txn txn,
+                                                                  int32_t                   device,
+                                                                  const uint64_t *          chunk_bytes,
+                                                                  uint32_t                  n_chunks,
+                                                                  uint32_t                  n_ctx);
+
+// The reservation's units (llama.cpp-p6i0): the bytes ggml_backend_sycl_load_reserve_compute_term would size from
+// chunk_bytes[0..n_chunks), written to *out, with no state read or written.  The loader's admitted check sizes the
+// probe bound and c(P) with it, so it compares them in the units the reservation is in rather than as raw sums.
+// False, writing nothing, when out is null, when chunk_bytes is null with n_chunks > 0, or when a chunk or the sum
+// overflows.
+// Proc name: "ggml_backend_sycl_load_compute_term_bytes".
+GGML_BACKEND_API bool ggml_backend_sycl_load_compute_term_bytes(const uint64_t * chunk_bytes,
+                                                                uint32_t         n_chunks,
+                                                                uint64_t *       out);
+
+// The load's state reservation (llama.cpp-p6i0): the context memory the probe measure placed on device's plain buffer
+// type (the recurrent state of a hybrid or recurrent model), handed to the planner before the weight pack as its own
+// planned RUNTIME term.  The real context allocates that memory in the RUNTIME zone before the scheduler's compute
+// buffer, so without it the compute term does not hold the buffer.  The backend sizes state_bytes as one allocation at
+// its allocator's grain, with no headroom, and never touches the ledger.  False, reserving nothing, when txn is not the
+// open load transaction, when device is out of range or has no VRAM arena, when the size overflows, or while the
+// backend admits no mutation; the loader then offers no compute term for the device either.
+// Proc name: "ggml_backend_sycl_load_reserve_state_term".
+GGML_BACKEND_API bool ggml_backend_sycl_load_reserve_state_term(struct ggml_sycl_load_txn txn,
+                                                                int32_t                   device,
+                                                                uint64_t                  state_bytes);
+
+// The early stage's record of a load's state term (llama.cpp-p6i0): the state bytes the probe reserved for device, at
+// the n_ctx that measure ran with, recorded in the ledger under the state term's own name beside c(P), never added to
+// it.  ggml_backend_sycl_load_late_check_state compares the late measure's state against it.  False, recording
+// nothing, on the same conditions as ggml_backend_sycl_load_record_compute_term.
+// Proc name: "ggml_backend_sycl_load_record_state_term".
+GGML_BACKEND_API bool ggml_backend_sycl_load_record_state_term(struct ggml_sycl_load_txn txn,
+                                                               int32_t                   device,
+                                                               uint64_t                  bytes,
+                                                               uint32_t                  n_ctx);
+
+// The late measure's state for device against the state term the early stage recorded (llama.cpp-p6i0), under the
+// rule of ggml_backend_sycl_load_late_check and with the state term's own name in its lines: a state is compared with
+// a state, never with the compute term.  Fail-closed the same way.
+// Proc name: "ggml_backend_sycl_load_late_check_state".
+GGML_BACKEND_API enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check_state(struct ggml_sycl_load_txn txn,
+                                                                                          int32_t  device,
+                                                                                          uint64_t state_bytes);
+
+// The planned state term the backend holds for device (llama.cpp-p6i0): the RUNTIME bytes the loads reserved for the
+// context memory on the device's plain buffer type, merged across live models the way the reservation merges it,
+// written to *out.  It reads that value only.  A context compares it at init with the state its memory allocated,
+// which the load measured at n_seq_max 1 and cannot see for a context with more sequences.  False, writing nothing,
+// when out is null or device is out of range.
+// Proc name: "ggml_backend_sycl_planned_state_term".
+GGML_BACKEND_API bool ggml_backend_sycl_planned_state_term(int32_t device, uint64_t * out);
+
 // The residency probe (llama.cpp-moua L4 step 3d, llama.cpp-5cim).  Which layers would this context's plan leave in
 // host memory?  A pure plan query: it takes no replan lock, publishes nothing and changes nothing, and works with no
 // tenants and no published section (the caller asks before it publishes).
@@ -1841,15 +1920,37 @@ GGML_BACKEND_API bool ggml_backend_sycl_has_active_placement_plan(void);
 // calling thread answers from the plan named by `stage` for the load `load_txn`,
 // and nothing is published.  Written only by these two functions; llama reaches them
 // through one RAII guard.  Install returns false (and installs nothing) when an
-// override is already installed on this thread or no plan is staged for the load.
+// override is already installed on this thread, no plan is staged for the load, or
+// the KV re-fit for `kv_shape` refuses (it says why at WARN).
 enum ggml_sycl_measure_stage {
     GGML_SYCL_MEASURE_STAGE_PROBE       = 0,  // (a): the probe placement's unpublished plan
     GGML_SYCL_MEASURE_STAGE_CANDIDATE_B = 1,  // (b): the load's candidate plan
     GGML_SYCL_MEASURE_STAGE_CANDIDATE_C = 2,  // (c): the load's candidate plan, after the sync
 };
 
-GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_override_install(uint64_t                     load_txn,
-                                                                      enum ggml_sycl_measure_stage stage);
+// The KV shape of the context a measure builds (llama.cpp-p6i0).  Given one, install re-fits the staged plan's KV
+// residency for that shape before it holds the plan, with the fit a context's runtime-context transaction runs
+// (plan_runtime_kv_residency), against the KV headroom the plan leaves in the shared zone rather than the live one,
+// which does not exist before the weights are allocated.  The measure's KV then sits where the context's will: a
+// layer the fit demotes to the host KV tier moves its attention to the CPU, and the measure sees those splits.
+// NULL holds the plan as staged.
+struct ggml_sycl_measure_kv_shape {
+    uint32_t n_ctx;
+    uint32_t n_ubatch;
+    uint32_t n_seq_max;
+    bool     kv_unified;
+    bool     swa_full;
+};
+
+GGML_SYCL_ABI_ASSERT(sizeof(struct ggml_sycl_measure_kv_shape) == 16, "measure KV shape layout changed");
+
+// Proc name: "ggml_backend_sycl_measure_plan_override_install_kv".  The name changed when `kv_shape` was added: a
+// libllama built for the two-argument form finds no proc under it and its measure refuses by name, where the same
+// name would have handed this function garbage for `kv_shape`.
+GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_override_install_kv(
+    uint64_t                                  load_txn,
+    enum ggml_sycl_measure_stage              stage,
+    const struct ggml_sycl_measure_kv_shape * kv_shape);
 GGML_BACKEND_API void ggml_backend_sycl_measure_plan_override_clear(void);
 
 // === Per-context chunk-cap copy and plan scopes ===

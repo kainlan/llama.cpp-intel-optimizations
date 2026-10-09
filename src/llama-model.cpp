@@ -752,6 +752,16 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader &  ml,
     LLAMA_LOG_INFO("%s: SYCL tensor inventory: %zu tensors, %.2f GiB (enables unified placement before allocation)\n",
                    log_func, tensors.size(), total_size / (1024.0 * 1024.0 * 1024.0));
 }
+
+// The weights a load stage's measure (probe, admitted or late, llama.cpp-p6i0) puts its stand-ins on: every
+// (buffer type, context) of the loader, whose tensors are not allocated yet when each stage measures.
+static std::vector<llama_measure_dummy_entry> llama_model_measure_weights(const llama_model_loader & ml) {
+    std::vector<llama_measure_dummy_entry> weights;
+    for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+        weights.push_back({ ctx_key.buft, ctx_ptr.get() });
+    }
+    return weights;
+}
 #endif  // GGML_USE_SYCL || GGML_BACKEND_DL
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -2592,7 +2602,77 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     const bool sycl_model_backend = sycl_model_loading_guard.txn.id != 0 && has_sycl_weight_buft;
     if (sycl_model_backend) {
+        // (a) the probe measure, llama.cpp-p6i0: the probe placement's compute term C-hat, before the late plan
+        // packs the weights, handed to the backend as a planned RUNTIME term so the pack leaves the compute buffer
+        // its room. It is measured at n_ctx_train and ubatch 512: the caller's -c and -ub do not reach the load
+        // (fkpg (a)), so the term is that shape's, not the context's. A dense model's default auto ubatch climbs
+        // above 512 into whatever room is left; that part is not reserved.
+        const std::vector<llama_measure_dummy_entry> probe_weights = llama_model_measure_weights(ml);
+
+        const int64_t                 probe_t0 = ggml_time_us();
+        const llama_load_probe_result probe    = llama_load_probe_bound(
+            *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, probe_weights);
+        const int64_t probe_ms = (ggml_time_us() - probe_t0) / 1000;
+        if (!probe.unsupported.empty()) {
+            // not a refusal of the load: this model cannot be measured, so it goes on the unplanned path
+            LLAMA_LOG_WARN("%s: probe compute-slot measure skipped, the load continues on the unplanned path: %s\n",
+                           __func__, probe.unsupported.c_str());
+        }
+        if (!probe.refusal.empty()) {
+            throw std::runtime_error(probe.refusal);
+        }
+
         llama_model_sycl_set_late_inventory(ml, hparams, __func__);
+
+        // (b) the admitted measure, llama.cpp-p6i0: c(P) at the placement the late plan just packed, before the
+        // dev_layer sync, so the late check below compares the final placement with it. Refused when it outgrew
+        // the probe bound the pack reserved; recorded otherwise. Only a model the probe measured gets here.
+        if (probe.measured) {
+            const std::vector<llama_measure_dummy_entry> admitted_weights = llama_model_measure_weights(ml);
+
+            const int64_t                     admitted_t0 = ggml_time_us();
+            const llama_admitted_check_result admitted =
+                llama_load_admitted_check(*this, llama_model_sycl_make_placement_envelope().n_ctx,
+                                          sycl_model_loading_guard.txn, admitted_weights, probe);
+            const int64_t admitted_ms = (ggml_time_us() - admitted_t0) / 1000;
+            if (!admitted.unsupported.empty()) {
+                LLAMA_LOG_WARN("%s: admitted compute-slot measure skipped, the load continues: %s\n", __func__,
+                               admitted.unsupported.c_str());
+            }
+            if (!admitted.refusal.empty()) {
+                throw std::runtime_error(admitted.refusal);
+            }
+            for (const llama_admitted_term & t : admitted.terms) {
+                LLAMA_LOG_WARN(
+                    "%s: [LOAD-PLAN] compute slot on device %d: probe bound %.1f MiB %s, admitted %.1f MiB (%zu of "
+                    "%zu recorded); measured at n_ctx %u ubatch %u, the caller's -c and -ub are not transported "
+                    "(fkpg); measure %lld ms probe, %lld ms admitted\n",
+                    __func__, (int) t.device, t.probe_term / 1024.0 / 1024.0,
+                    t.reserved ? "reserved in RUNTIME" : "NOT reserved (the backend said why), not compared",
+                    t.admitted_term / 1024.0 / 1024.0, admitted.n_recorded, admitted.terms.size(), admitted.n_ctx,
+                    admitted.n_ubatch, (long long) probe_ms, (long long) admitted_ms);
+                if (t.kv_excess != 0) {
+                    LLAMA_LOG_WARN(
+                        "%s: [LOAD-PLAN] compute slot on device %d: admitted %.1f MiB exceeds the probe bound by %.1f "
+                        "MiB because the KV residency moved between the measures (probe %u device / %u host / %u "
+                        "CPU layers, admitted %u / %u / %u); the excess is not reserved and can land outside the "
+                        "RUNTIME zone\n",
+                        __func__, (int) t.device, t.admitted_term / 1024.0 / 1024.0, t.kv_excess / 1024.0 / 1024.0,
+                        admitted.probe_kv.n_device, admitted.probe_kv.n_host, admitted.probe_kv.n_cpu,
+                        admitted.admitted_kv.n_device, admitted.admitted_kv.n_host, admitted.admitted_kv.n_cpu);
+                }
+                if (t.state_bytes != 0) {
+                    // the state term, on its own line: the compute line above never includes it
+                    LLAMA_LOG_WARN(
+                        "%s: [LOAD-PLAN] state term on device %d: %.1f MiB of recurrent state %s, %s; measured at "
+                        "n_seq_max 1, so a context with more sequences allocates more state than this holds\n",
+                        __func__, (int) t.device, t.state_bytes / 1024.0 / 1024.0,
+                        t.state_reserved ? "reserved in RUNTIME as its own term" :
+                                           "NOT reserved (the backend said why)",
+                        t.state_recorded ? "recorded for the late check" : "not recorded");
+                }
+            }
+        }
 
         // llama.cpp-30h4: dev_layer(il)/dev_output() go stale the moment a
         // layer is tiered to host by any route OTHER than -ngl. get_layer_buft_list()
@@ -2744,10 +2824,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // (c) the late measure: the final placement's compute term, over stand-ins for the weights
         // that are not yet allocated, handed to the backend to compare with the term it admitted.
         // Inert until the backend exports the L4 entry points; a refusal is the load's.
-        std::vector<llama_measure_dummy_entry> late_weights;
-        for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
-            late_weights.push_back({ ctx_key.buft, ctx_ptr.get() });
-        }
+        const std::vector<llama_measure_dummy_entry> late_weights = llama_model_measure_weights(ml);
         const llama_late_check_result late = llama_load_late_check(
             *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, late_weights);
         if (!late.unsupported.empty()) {
@@ -2759,6 +2836,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // nothing was compared for this device, which is not a pass; the text carries the measured term
             const std::string text =
                 llama_late_check_not_recorded_text(late.not_recorded[i], late.n_ubatch, late.not_recorded_bytes[i]);
+            LLAMA_LOG_WARN("%s: %s\n", __func__, text.c_str());
+        }
+        for (size_t i = 0; i < late.state_not_recorded.size(); ++i) {
+            const std::string text =
+                llama_late_check_state_not_recorded_text(late.state_not_recorded[i], late.state_not_recorded_bytes[i]);
             LLAMA_LOG_WARN("%s: %s\n", __func__, text.c_str());
         }
         if (!late.refusal.empty()) {

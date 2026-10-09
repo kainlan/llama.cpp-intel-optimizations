@@ -2493,9 +2493,10 @@ the hold kept it out (`unified_cache_note_planned_hold_spill`, in-arena), in the
 one of each kind per context is a WARN naming the requester tag and the bytes; the counts are taken at teardown and
 printed as `hold_spills_raw` / `hold_spills_kv_zone` / `hold_spills_kv_zone_full` (with bytes) in the `[SCRATCH-STATS]`
 line, whichever of the three is non-zero. The counters restart at every publish, so the figures a finished context
-prints are its own and not the auto-ubatch ladder's (the once-only WARN latches do not restart). Each flagged scheduler compute buffer also prints one line as it is
-allocated, `[SCRATCH-STATS] device=D compute_buffer=<buffer type name> size=<MB> zone=<kv|runtime|...|raw|host-pinned>`
-(`ggml_sycl_log_compute_buffer_landing`), so a throughput difference between two builds can be attributed to where
+prints are its own and not the auto-ubatch ladder's (the once-only WARN latches do not restart). Each flagged scheduler
+compute buffer also prints one line as it is allocated, `[SCRATCH-STATS] device=D compute_buffer=<buffer type name>
+size=<MB> zone=<kv|runtime|...|raw|host-pinned> planned_compute_term=<MiB>` (`ggml_sycl_log_compute_buffer_landing`), so
+a throughput difference between two builds can be attributed to where
 a buffer physically sits. A buffer the arena placed is logged where it is placed; one nothing in the arena placed is
 placed by the legacy path in the allocator, which logs the buffer it makes, so the line names the FINAL landing (raw
 device memory, or host-pinned) and never `none` for a buffer that then lives somewhere. A raw
@@ -2739,6 +2740,124 @@ is a table lookup, and a per-node cache would need per-graph storage on this pat
 Host tests: `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` Case 14 pins the arithmetic and Case 15 the held-back branch,
 the route after a decline and the merged inputs;
 `tests/test-sycl-mmq-src1-plan-source.py` pins the wiring, with a mutation witness per check.
+
+### A load-time consumer: the measured compute term (`llama.cpp-p6i0`)
+
+The scheduler's compute buffer is a named RUNTIME consumer. Before p6i0 nobody planned it. The weight pack filled the
+shared zone, and the buffer took whatever the allocator found. On the B70 with Qwen3.8 IQ3_XXS at `-ub 512` and no
+`-c`, its 1543.1 MB chunk landed raw and its 512 MB chunk fit no tier, so the context was refused.
+
+**How it is sized.** The load measures the compute buffer at three stages.
+
+- At the **probe** stage, after `create_tensor` and before the late plan packs the weights, the loader measures C-hat
+  over the weight stand-ins. It hands each SYCL device's per-chunk peaks to
+  `ggml_backend_sycl_load_reserve_compute_term`.
+- The backend sizes the term with `zone_compute_term_bytes`. Each chunk is rounded by the RUNTIME TLSF's own
+  `round_request` at the alignment the buffer type requests (`GGML_SYCL_BUFFER_BASE_ALIGNMENT`), and the rounded
+  chunks are summed. That is the allocator's grain and nothing more: there is no headroom in the term.
+- `unified_cache_get_planned_runtime_zone_requirement` adds the term, with the overflow checked, so
+  `ensure_planned_arena_zones` sizes RUNTIME for the buffer before `compute_placement_plan` packs the weights.
+- The compute buffer is not the only thing the context puts in RUNTIME first. A hybrid or recurrent model's state
+  (`cache_r_l*`, `cache_s_l*`) sits in the plain device buffer type, outside the compute scope, and the real context
+  allocates it after the load and before the compute buffer. On the B70, Qwen3.8's 112.6 MiB of state took that room
+  out of the term, so the 512 MB chunk landed raw beside a 2055.1 MiB term. So the probe also reads the context memory
+  the measure placed on each device's plain buffer type (its no_alloc size, from `memory_breakdown`) and hands it to
+  `ggml_backend_sycl_load_reserve_state_term` first. The backend sizes it as one allocation at the same grain and
+  stores it as its own planned **state term**, which the requirement adds after the compute term. A device whose state
+  is declined is not offered its compute term.
+- At the **admitted** stage, right after the pack, the loader measures c(P) at the packed placement. It compares c(P)
+  with C-hat in the reservation's units: both are sized by `ggml_backend_sycl_load_compute_term_bytes`, the reserve's
+  own rule, not as raw sums. c(P) above C-hat, or a device with no probe bound, refuses the load as
+  `compute-slot-exceeds-probe-bound`. Otherwise c(P) is recorded in the load's ledger, and the **late** check compares
+  the final placement against it.
+- One growth is admitted: the **KV-residency delta**. The probe re-fits the KV residency for the room left before the
+  term is carved, and the admitted measure re-fits it after RUNTIME grew by the term and the weights were packed, so KV
+  layers can move between device, host and CPU from one measure to the other, and the compute graph moves with them. A
+  graph's peak is not monotone in placement, so C-hat cannot be proven to bound c(P) then. GPT-OSS on the B50 moved from
+  3 device and 21 host KV layers at the probe to 1 and 23 at the admitted stage, and its 404.0 MiB term did not change.
+  When the residencies differ, c(P) above C-hat is admitted and recorded, and the loader WARNs `compute slot on device
+  N: admitted X MiB exceeds the probe bound by Y MiB because the KV residency moved`. That excess is not reserved,
+  because the arena is already packed, so that part of the buffer can land outside RUNTIME. With the same residency on
+  both sides, growth is still refused. A device the backend declined to reserve for is not compared and not recorded:
+  its compute buffer stays unplanned, as before p6i0.
+- A late check that matches prints one WARN per device and load:
+  `[LOAD-PLAN] late check on device N: compute term equal (X MiB), early reservation stands`. A pass that printed
+  nothing could not be told from a check that never ran.
+- The state term is recorded in the same ledger under its own name, never added to c(P), so the late check still
+  compares compute with compute. At the admitted stage each device whose state was reserved records the probe's state,
+  the value the reservation holds (`ggml_backend_sycl_load_record_state_term`). The state's own reservation decides, not
+  the compute term's: a state reserved beside a declined compute term is real RUNTIME memory the backend holds a term
+  for, so it is recorded and late-checked like any other. The late check compares the late measure's state with it under
+  the same rule (`ggml_backend_sycl_load_late_check_state`): larger refuses the load as `term state in zone RUNTIME`,
+  smaller is admitted with the shrink WARN, and equal WARNs `late state check on device N: state term equal`. That
+  catches a state that moves at the dev_layer sync, which can retier recurrent layers to the CPU. A late state with no
+  record WARNs `late state check on device N: no state term was recorded`, because that state is allocated in RUNTIME
+  unplanned. A device whose late state is zero is not asked, so a state that leaves a device entirely gives no shrink
+  WARN. The loader prints `state term on device N` on its own line beside the compute-slot line.
+
+**Invariant: every RUNTIME-first consumer at context time is named in the reserve.** The real context allocates
+some memory in the RUNTIME zone first, after the load and before its compute buffer. Each such consumer needs a planned
+term of its own, or it draws down the compute term and a compute chunk lands outside the zone. In the Qwen3.8 B70
+trace, the RUNTIME allocations between the KV placement and the compute buffer were the recurrent state (the state
+term) and the dense MMQ Q8_1 src1 scratch (`llama.cpp-g6yk`'s term). A new consumer of that kind must add its own term.
+`tests/test-sycl-load-measure-source.py` pins the recurrent state at every hop, from `memory_breakdown` in the measure
+through the probe reservation and the admitted record to the late check. A mutant that drops it at any hop fails.
+
+**How it is drawn and dropped.**
+
+- The compute buffer's first tier is already the RUNTIME zone, so the term is drawn by the path the buffer takes.
+- The ring re-plan counts the term, and the state term, as pending RUNTIME demand, beside the dense scratch, so the
+  ring does not take their room. A re-publish while they are live counts them twice, which is conservative.
+- The term is device-global and merges like the dense terms: while another model is live, the larger term stays.
+- It is dropped where no model is live, with the state term (`unified_cache_clear_planned_load_terms`): at the outer
+  load entry, at a load abort, and at a teardown with no other model live and no load in flight.
+- The `[SCRATCH-STATS] ... compute_buffer=` landing line ends with `planned_compute_term=<MiB>`. That is the positive
+  control. A buffer that lands `zone=runtime` beside a nonzero term is the reservation at work. One that lands
+  `zone=raw` beside a nonzero term is a reservation that did not hold it.
+
+**What it costs, and where those bytes used to come from.** The compute buffer used to live raw, outside the arena,
+in the external headroom. zhcn D9 found that on the B50 with GPT-OSS, and the B70 logs for Qwen3.8 show the same.
+The external headroom is the driver's working memory, and it is kept whole and disjoint from this term. So the bytes
+the buffer used to borrow now come out of the weight zone, which can tier weights to host. `llama.cpp-gpdj` is the
+recovery path: it measures the driver's working set and sizes the headroom from it.
+
+**Limits.**
+
+- The term is measured at the load's measure shape, `n_ctx_train` and ubatch 512, because the caller's `-c` and `-ub` do
+  not reach the load (`llama.cpp-fkpg`). A `-c` below `n_ctx_train`, llama-bench's small `n_ctx` and `-ub 256` all
+  over-reserve. Above 512 the term under-reserves, and that is the **default** for a dense model, not only an explicit
+  `-ub`: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch` of 2048 a dense model's auto pick
+  climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a 448.0 MB compute buffer at the auto 2048,
+  `zone=runtime`, in RUNTIME slack. Nothing keeps that true where the slack is smaller. The ladder's per-rung trial
+  (`try_candidate`) does not consult the reserved RUNTIME room. It loses a rung only when the runtime-context
+  transaction is busy or not the published model's, when the probe refuses the rung, when the rung would demote KV, when
+  the candidate publish is refused, when the rung's compute buffers fail to allocate, when one falls back to host
+  memory, or when the rung would leave the card under the driver headroom (the hold-spill fit). A compute buffer that
+  does not fit RUNTIME takes the KV zone next, then raw device memory outside the arena, and the trial accepts both. So
+  a dense auto pick above 512 can land `zone=raw`, in the external headroom. That is an open finding, not an invariant
+  of this design, tracked as `llama.cpp-nkr8`. MoE models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the
+  auto pick's. `llama.cpp-fkpg` (a) transports the caller's shape.
+- Every load-time path runs at `n_seq_max` 1 and cannot see the context's sequence count. The probe, the admitted stage
+  and the late check all build their measure context from the default parameters. So the state term holds one sequence's
+  state, and the late check compares one sequence's state with one sequence's state. A context with `-np` above 1
+  allocates about `n_seq_max` times that state, RUNTIME-first and before its compute buffer. The excess takes RUNTIME
+  room from the compute term, and the buffer's last chunk can land `zone=raw`. The context constructor names it. Right
+  after its memory exists, it compares each SYCL device's state with the planned state term the backend holds
+  (`ggml_backend_sycl_planned_state_term`). The state is the memory's bytes for that device's buffer type. When the
+  state is larger, it WARNs `[LOAD-PLAN] state term exceeded on device N` with `n_seq_max`, both sizes and the excess. A
+  load that planned no state term at all (a model the measure cannot run, a backend without the load procs, or a
+  declined reservation) gets its own line instead, `[LOAD-PLAN] state term not planned on device N`, which does not
+  blame the one-sequence measure. It never refuses: `-np` is a normal user option, and a context the user asked for is
+  placed and warned, never shrunk or refused. `tests/test-sycl-load-measure-source.py` pins the WARN and pins that
+  neither the comparison nor its text helper refuses. The fix is to transport the caller's `n_seq_max` into the load's
+  measure, the same gap `llama.cpp-fkpg` records for `-c` and `-ub`. It is tracked as `llama.cpp-0zyy`. The state is
+  summed per buffer type, so a type holding several buffers can round up by one grain per extra buffer beyond the term.
+- A second model whose term is larger than the live one's raises the RUNTIME requirement. The late zone rebuild is
+  refused while the first model holds allocations, so that load reaches the abort in
+  `compute_and_store_plan_for_inventory`. `llama.cpp-ouur` refuses it by name instead.
+- This is a stepping stone. moua L6 retires both planned RUNTIME terms into the `FIRST_CONTEXT` head slot in the
+  shared zone: the compute term and the recurrent-state term, which the RUNTIME requirement adds after it. Then only
+  the bodies of `ggml_backend_sycl_load_reserve_compute_term` and `ggml_backend_sycl_load_reserve_state_term` change.
 
 ### Known limits (load-bearing — read before changing any of this)
 

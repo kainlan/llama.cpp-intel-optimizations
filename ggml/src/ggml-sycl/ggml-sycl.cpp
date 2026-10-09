@@ -12598,6 +12598,14 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
     g_sycl_lifecycle_release_slot_last_slot.store(slot, std::memory_order_relaxed);
     g_sycl_lifecycle_release_slot_last_reclaimed.store(reclaimed, std::memory_order_relaxed);
     g_sycl_lifecycle_release_slot_calls.fetch_add(1, std::memory_order_relaxed);
+    // llama.cpp-p6i0: the planned load terms (compute and state) are device-global and merged across live models, so a
+    // teardown drops them only when no other model is live and no load is in flight (a load in flight has reserved its
+    // own).
+    const uint32_t others_live =
+        ggml_sycl::lifecycle::global_registry().live_mask() & (slot < 32 ? ~(1u << slot) : ~0u);
+    if (others_live == 0 && !g_sycl_in_model_load.load(std::memory_order_acquire)) {
+        ggml_sycl::unified_cache_clear_planned_load_terms();
+    }
     // llama.cpp-fzem: WARN, not INFO -- GGML_LOG_LEVEL_INFO maps below the
     // default verbosity threshold (67b2b7f2f, common/log.cpp:444), so an INFO
     // line here is invisible in a normal run and its absence in a capture
@@ -12824,6 +12832,11 @@ static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
             // constructor reserves the arena when vram_arena_enabled().
             const int      total_gpus = ggml_sycl_info().total_gpu_count;
             const uint32_t live_mask  = ggml_sycl::lifecycle::global_registry().live_mask();
+            // llama.cpp-p6i0: with no model live, no context can draw a planned load term, so a term left by a load
+            // that never committed (or by a teardown that raced a load) is dropped before this load reserves.
+            if (live_mask == 0) {
+                ggml_sycl::unified_cache_clear_planned_load_terms();
+            }
             for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
                 auto * cache = ggml_sycl::get_unified_cache_for_device(d);
                 if (cache) {
@@ -13113,6 +13126,11 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
         // Abort discards only loader-thread candidate state. The previously active
         // LIVE execution authority remains continuously published.
         ggml_sycl_reset_model_load_scratch_state(true);
+        // llama.cpp-p6i0: the aborted load's planned load terms go with it when no model is live; with one live, the
+        // merged terms stay (each is at least the live model's).
+        if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) {
+            ggml_sycl::unified_cache_clear_planned_load_terms();
+        }
     } catch (...) {
         clean = false;
     }
@@ -13427,18 +13445,25 @@ static bool ggml_sycl_load_txn_is_open(uint64_t txn) {
 // then answers NOT_RECORDED) or when `txn` is not the open load, which the same lock that guards the
 // ledger decides, so no term lands after the clear of a load that ended.
 //
-// NO PRODUCTION CALLER UNTIL L6.  llama.cpp-moua L6 (moua design 2.4.2 (b)) adds the llama-side
-// early measure call site that reaches this; until fkpg(a) puts a non-zero n_ctx in the envelope the
-// only caller is the private test hook below.  It is the single entry on purpose and is not dead
-// code to delete: scripts/check-sycl-l4-proc-registration.py pins that no other function writes the
-// ledger.
-[[maybe_unused]] static bool ggml_sycl_load_record_compute_term(uint64_t txn,
-                                                                int32_t  device,
-                                                                uint64_t bytes,
-                                                                uint32_t n_ctx) {
+// Its callers are the export ggml_backend_sycl_load_record_compute_term (llama.cpp-p6i0), which the
+// loader reaches with c(P) measured at the admitted placement and the n_ctx that measure ran with, and
+// the private test hook below.  It is the single entry on purpose: scripts/check-sycl-l4-proc-registration.py
+// pins that no other function writes the ledger and that nothing else calls this.
+static bool ggml_sycl_load_record_compute_term(uint64_t txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
     ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
     std::lock_guard<std::mutex>   lock(state.mutex);
     return state.ledger.record(txn, device, bytes, n_ctx, ggml_sycl_load_txn_is_open(txn));
+}
+
+// The one writer of the ledger's state terms (llama.cpp-p6i0): the recurrent state the probe reserved in RUNTIME for
+// (load transaction, device), kept under the state term's own key and name beside c(P), so the late check compares a
+// late state with it and never with the compute term.  It refuses on the compute writer's conditions, decided under
+// the same lock.  Its one caller is the export ggml_backend_sycl_load_record_state_term.
+static bool ggml_sycl_load_record_state_term(uint64_t txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
+    ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+    std::lock_guard<std::mutex>   lock(state.mutex);
+    return state.ledger.record(txn, device, ggml_sycl::LOAD_LEDGER_TERM_STATE, bytes, n_ctx,
+                               ggml_sycl_load_txn_is_open(txn));
 }
 
 // One ledger line, at the level the ledger chose for it.
@@ -15664,7 +15689,113 @@ bool ggml_backend_sycl_has_active_placement_plan(void) {
 // written only here.  Install builds nothing: it finds the plan moua staged for the
 // load -- the probe placement's at (a), the load's candidate at (b) and (c) -- and
 // holds it, in the candidate's shape, for this thread until clear.
-bool ggml_backend_sycl_measure_plan_override_install(uint64_t load_txn, ggml_sycl_measure_stage stage) {
+// llama.cpp-p6i0: the KV residency a context of `shape` would get under the staged plan, as a copy of the
+// snapshot. It runs the runtime-context transaction's own fit (plan_runtime_kv_residency) on the same input
+// that transaction builds, with one difference: a device's headroom is what the plan leaves for KV in the
+// shared zone (its capacity less the plan's non-KV device bytes), not the live free space the transaction
+// reads, because a measure runs before any weight is allocated, and optional layout copies are not counted
+// as headroom, since none exists yet either. The two headrooms can differ (the live one sees allocations
+// as they landed, the planned one the pack's charges); where they do, the measure's residency can differ
+// from the context's. Returns null, with the reason in `why`, where the transaction would refuse.
+static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_measure_refit_kv(
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & staged,
+    const ggml_sycl_measure_kv_shape &                                shape,
+    std::string &                                                     why) {
+    const ggml_sycl::placement_plan & load_plan = *staged->plan;
+    std::vector<int>    devices = load_plan.multi_device ? load_plan.devices : std::vector<int>{ load_plan.device_id };
+    // the plan's own non-KV device bytes, at the load-time KV shape it was packed with
+    std::vector<size_t> headroom;
+    for (size_t i = 0; i < devices.size(); ++i) {
+        const int    device = devices[i];
+        const size_t budget = load_plan.multi_device && i < load_plan.per_device_vram_budgets.size() ?
+                                  load_plan.per_device_vram_budgets[i] :
+                                  load_plan.vram_budget;
+        size_t       non_kv = load_plan.weight_vram_bytes;
+        if (load_plan.multi_device) {
+            const size_t used = i < load_plan.per_device_vram.size() ? load_plan.per_device_vram[i] : 0;
+            const size_t kv   = load_plan.device_kv_vram_bytes(device);
+            non_kv            = used > kv ? used - kv : 0;
+        }
+        const size_t capacity = ggml_sycl::unified_cache_kv_weight_capacity(device, budget, load_plan.multi_device);
+        headroom.push_back(capacity > non_kv ? capacity - non_kv : 0);
+    }
+
+    ggml_sycl::placement_kv_info kv_info = staged->kv_info;
+    if (shape.n_ubatch > 0) {
+        kv_info.n_ubatch = shape.n_ubatch;
+    }
+    kv_info.n_ctx            = shape.n_ctx;
+    kv_info.n_ctx_is_runtime = true;
+    kv_info.n_seq_max        = shape.n_seq_max;
+    kv_info.kv_unified       = shape.kv_unified;
+    kv_info.swa_full         = shape.swa_full;
+
+    ggml_sycl::placement_plan plan(load_plan);
+    plan.planner_n_ctx      = shape.n_ctx;
+    plan.planner_n_ubatch   = kv_info.n_ubatch;
+    plan.planner_n_seq_max  = shape.n_seq_max;
+    plan.planner_kv_unified = shape.kv_unified;
+    plan.planner_swa_full   = shape.swa_full;
+    plan.update_runtime_kv_sizes(shape.n_ctx, kv_info.kv_bytes_per_layer(), kv_info.kv_bytes_per_swa_layer());
+    if (!plan.load_kv_device_valid) {
+        plan.load_kv_device       = plan.kv_device;
+        plan.load_kv_device_valid = true;
+    }
+
+    const size_t                  n_kv_layers = plan.kv_layer_count();
+    ggml_sycl::kv_residency_input fit_in;
+    fit_in.load_kv_device.resize(n_kv_layers);
+    fit_in.layer_kv_bytes.resize(n_kv_layers);
+    fit_in.swa_layer_mask.assign(plan.swa_layer_mask.begin(), plan.swa_layer_mask.end());
+    for (size_t l = 0; l < n_kv_layers; ++l) {
+        const auto load_it       = plan.load_kv_device.find((int) l);
+        fit_in.load_kv_device[l] = load_it == plan.load_kv_device.end() ? -1 : load_it->second;
+        fit_in.layer_kv_bytes[l] = plan.kv_size_for_layer(static_cast<uint32_t>(l));
+    }
+    fit_in.devices   = devices;
+    fit_in.available = headroom;
+
+    const ggml_sycl::kv_residency_result fit = ggml_sycl::plan_runtime_kv_residency(fit_in);
+    if (!fit.fits) {
+        why = "the KV of n_ctx " + std::to_string(shape.n_ctx) + " does not fit device " +
+              std::to_string(fit.refused_device) + " even with every layer on the host tier";
+        return nullptr;
+    }
+    plan.kv_device = plan.load_kv_device;
+    for (size_t l = 0; l < n_kv_layers; ++l) {
+        if (fit.kv_device[l] != fit_in.load_kv_device[l]) {
+            plan.kv_device[(int) l] = fit.kv_device[l];
+        }
+    }
+    plan.refresh_kv_byte_totals();
+    plan.refresh_layer_block_kv_devices();
+    if (!plan.rebuild_runtime_per_device_vram()) {
+        why = "the per-device KV accounting failed for n_ctx " + std::to_string(shape.n_ctx);
+        return nullptr;
+    }
+
+    auto out     = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*staged);
+    out->kv_info = kv_info;
+    out->plan    = std::make_shared<const ggml_sycl::placement_plan>(std::move(plan));
+    return out;
+}
+
+// A measure stage's name in a log line: the names the loader's refusal text gives the same stages (llama.cpp-p6i0).
+static const char * ggml_sycl_measure_stage_name(ggml_sycl_measure_stage stage) {
+    switch (stage) {
+        case GGML_SYCL_MEASURE_STAGE_PROBE:
+            return "probe";
+        case GGML_SYCL_MEASURE_STAGE_CANDIDATE_B:
+            return "admitted";
+        case GGML_SYCL_MEASURE_STAGE_CANDIDATE_C:
+            return "late";
+    }
+    return "unknown";
+}
+
+bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                                  load_txn,
+                                                        ggml_sycl_measure_stage                   stage,
+                                                        const struct ggml_sycl_measure_kv_shape * kv_shape) {
     if (g_measure_plan_override) {
         GGML_LOG_WARN("[CONTEXT-PLAN-BUG] measure plan override nested\n");
         if (ggml_sycl::ggml_sycl_strict_enabled()) {
@@ -15687,6 +15818,40 @@ bool ggml_backend_sycl_measure_plan_override_install(uint64_t load_txn, ggml_syc
                       (unsigned long long) load_txn, (int) stage);
         return false;
     }
+    if (kv_shape != nullptr) {
+        std::string why;
+        try {
+            snapshot = ggml_sycl_measure_refit_kv(snapshot, *kv_shape, why);
+        } catch (const ggml_sycl_fallback_error &) {
+            // The alloc-zone contract's sanctioned form: ggml_sycl_fallback_error derives from std::exception, so it
+            // is caught first and rethrown, or the handler below would turn a planned refusal into a re-fit WARN.
+            // That makes this the one load-path export an exception can cross. The llama side would not name it:
+            // llama_load_measure_run constructs its llama_measure_plan_override guard, which calls this export,
+            // before the try around the measure context, so a crossing error would leave the run unnamed and fail
+            // the load from the caller's handler. It is unreachable today. Every throw of ggml_sycl_fallback_error
+            // sits in op dispatch or graph compute, and ggml_sycl_measure_refit_kv and its callees only do plan
+            // arithmetic, so none of them throws it.
+            throw;
+        } catch (const std::exception & e) {
+            snapshot.reset();
+            why = e.what();
+        }
+        if (!snapshot) {
+            GGML_LOG_WARN(
+                "[LOAD-PLAN] measure plan override: the KV re-fit for load %llu at the %s stage refused: %s\n",
+                (unsigned long long) load_txn, ggml_sycl_measure_stage_name(stage), why.c_str());
+            return false;
+        }
+    }
+    // llama.cpp-p6i0, for the compute trace: the placement each stage's measure runs over, so a difference between
+    // the stages' compute terms can be read against what the plan put on the host.
+    GGML_LOG_INFO(
+        "[LOAD-PLAN] measure plan override: load %llu stage %s: weights %.1f MiB device, %.1f MiB host; "
+        "kv %.1f MiB device, %.1f MiB host; kv n_ctx %u n_ubatch %u\n",
+        (unsigned long long) load_txn, ggml_sycl_measure_stage_name(stage),
+        snapshot->plan->weight_vram_bytes / 1024.0 / 1024.0, snapshot->plan->weight_host_bytes / 1024.0 / 1024.0,
+        snapshot->plan->kv_vram_bytes / 1024.0 / 1024.0, snapshot->plan->kv_host_bytes / 1024.0 / 1024.0,
+        snapshot->kv_info.n_ctx, snapshot->kv_info.n_ubatch);
     g_measure_plan_override = std::move(snapshot);
     return true;
 }
@@ -17228,6 +17393,10 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
     }
     if (ggml_sycl::get_unified_cache_for_device(ctx->device) &&
         !ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device)) {
+        // The zones cannot be rebuilt while another live model holds allocations in them, and the load's planned
+        // compute term (llama.cpp-p6i0) raises the RUNTIME requirement, so a second model whose term is larger than
+        // the live one's reaches this abort where it loaded before. Refusing that load by name instead of aborting
+        // is llama.cpp-ouur.
         GGML_ABORT("[SYCL-PLAN] failed to size VRAM arena zones from tensor inventory");
     }
     const bool   is_moe = g_moe_n_experts_total > 0;
@@ -17875,6 +18044,17 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
                 throw std::runtime_error("deterministic stage_inventory_plan failure");
             }
 #endif
+        }
+        if (early) {
+            // llama.cpp-p6i0: the early plan is the load's probe placement. Stage a copy for the PROBE-stage
+            // measure, which runs after create_tensor and before the late plan replaces the candidate. It is
+            // dropped with the candidate (lifecycle_publish_placement_plan, lifecycle_abort_placement_plan).
+            const uint64_t txn       = effect.owner.load.value;
+            const auto     candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(txn);
+            if (candidate && candidate->plan) {
+                ggml_sycl::lifecycle_stage_probe_placement_plan(txn, ggml_sycl::placement_plan(*candidate->plan),
+                                                                candidate->kv_info, candidate->model_n_layer);
+            }
         }
         rollback.released = true;
         return ggml_backend_sycl_get_device_count() == 0 ? GGML_SYCL_LIFECYCLE_NOT_FOUND : GGML_SYCL_LIFECYCLE_OK;
@@ -20075,6 +20255,13 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // The dense scratch planned above lives in the RUNTIME zone too (counted twice when this context already
     // materialized it, like the pools below: conservative), so the ring leaves it that room.
     ring_kv_zone.runtime_pending_bytes += dense_scratch_runtime_bytes;
+    // The load's planned compute term (llama.cpp-p6i0) is the room the scheduler's compute buffer takes in the RUNTIME
+    // zone after this transaction, so the ring leaves it too. A re-publish while the buffer is live counts it twice,
+    // like the dense scratch above: conservative.
+    ring_kv_zone.runtime_pending_bytes += ggml_sycl::unified_cache_get_planned_compute_term_bytes(ctx->device);
+    // And the load's planned state term: the context memory (the recurrent state) the RUNTIME zone takes before the
+    // compute buffer. Counted twice on a re-publish while it is live, like the term above: conservative.
+    ring_kv_zone.runtime_pending_bytes += ggml_sycl::unified_cache_get_planned_state_term_bytes(ctx->device);
     // The current plan's pools, still allocated, are already missing from the
     // RUNTIME zone's free space, so they are counted twice here: conservative,
     // and only in a build where the route is reachable.
@@ -20828,6 +21015,75 @@ enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check(ggml_sycl_loa
     } catch (...) {
         return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
     }
+}
+
+// The early stage's record of a load's compute term (llama.cpp-p6i0): the production caller of the ledger's one
+// writer.  The writer decides, under the ledger's lock, whether txn is the open load and whether n_ctx carries a
+// shape; this adds the module admission and keeps an allocation failure from crossing the C boundary.
+bool ggml_backend_sycl_load_record_compute_term(ggml_sycl_load_txn txn,
+                                                int32_t            device,
+                                                uint64_t           bytes,
+                                                uint32_t           n_ctx) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return false;
+    }
+    try {
+        return ggml_sycl_load_record_compute_term(txn.id, device, bytes, n_ctx);
+    } catch (...) {
+        return false;
+    }
+}
+
+// The early stage's record of a load's state term (llama.cpp-p6i0): the production caller of the ledger's state
+// writer, under the module admission, with an allocation failure kept from crossing the C boundary.
+bool ggml_backend_sycl_load_record_state_term(ggml_sycl_load_txn txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return false;
+    }
+    try {
+        return ggml_sycl_load_record_state_term(txn.id, device, bytes, n_ctx);
+    } catch (...) {
+        return false;
+    }
+}
+
+// The late measure's state against the state term the early stage recorded (llama.cpp-p6i0): the late check's rule
+// and lines, with the state term's own name, compared with the state term only.  A state shrink says its WARN and is
+// not counted in late_term_shrink_admitted, which counts the compute term's shrinks.  Fail-closed like the compute
+// term's check: NOT_RECORDED is the answer to everything this cannot compare.
+enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check_state(ggml_sycl_load_txn txn,
+                                                                         int32_t            device,
+                                                                         uint64_t           state_bytes) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
+    try {
+        ggml_sycl::load_compute_ledger::check_result r;
+        {
+            ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+            std::lock_guard<std::mutex>   lock(state.mutex);
+            r = state.ledger.check(txn.id, device, ggml_sycl::LOAD_LEDGER_TERM_STATE, state_bytes,
+                                   ggml_sycl_load_txn_is_open(txn.id));
+        }
+        ggml_sycl_load_ledger_log(r);
+        return r.result;
+    } catch (...) {
+        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
+}
+
+// The planned state term on device (llama.cpp-p6i0), for the context-init comparison with the state a context's memory
+// allocated.  A read of the planner's term and nothing else: a bounds check and an atomic load, so it takes no lock
+// and cannot throw.
+bool ggml_backend_sycl_planned_state_term(int32_t device, uint64_t * out) {
+    if (out == nullptr || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    *out = ggml_sycl::unified_cache_get_planned_state_term_bytes(device);
+    return true;
 }
 
 // The residency probe (llama.cpp-moua L4 step 3d, llama.cpp-5cim): which layers would this context's plan leave in host
@@ -39875,9 +40131,134 @@ static const char * ggml_sycl_compute_buffer_zone(const ggml_sycl::alloc_handle 
     return zone;
 }
 
+// The landing line names the planned compute term the buffer drew against (llama.cpp-p6i0): a buffer that lands
+// in `runtime` with a nonzero term is the load's reservation at work, and one that lands `raw` beside a nonzero term
+// is a reservation that did not hold it.
 static void ggml_sycl_log_compute_buffer_landing(int device, const std::string & name, size_t size, const char * zone) {
-    GGML_LOG_WARN("[SCRATCH-STATS] device=%d compute_buffer=%s size=%.1f MB zone=%s\n", device, name.c_str(),
-                  size / (1024.0 * 1024.0), zone);
+    GGML_LOG_WARN("[SCRATCH-STATS] device=%d compute_buffer=%s size=%.1f MB zone=%s planned_compute_term=%.1f MiB\n",
+                  device, name.c_str(), size / (1024.0 * 1024.0), zone,
+                  ggml_sycl::unified_cache_get_planned_compute_term_bytes(device) / (1024.0 * 1024.0));
+}
+
+// The reservation's units (llama.cpp-p6i0): what a chunk list occupies in the RUNTIME zone's TLSF at the alignment the
+// compute buffer's type requests.  The reserve below sizes its term with it, and the admitted check sizes C-hat and
+// c(P) with it through ggml_backend_sycl_load_compute_term_bytes, so the two compare in the reservation's own units.
+static bool ggml_sycl_load_compute_term_size(const uint64_t * chunk_bytes, uint32_t n_chunks, size_t * out) {
+    return ggml_sycl::zone_compute_term_bytes(chunk_bytes, n_chunks, GGML_SYCL_BUFFER_BASE_ALIGNMENT, out);
+}
+
+// The reservation's units of a chunk list, with no state read or written (llama.cpp-p6i0).
+bool ggml_backend_sycl_load_compute_term_bytes(const uint64_t * chunk_bytes, uint32_t n_chunks, uint64_t * out) {
+    size_t bytes = 0;
+    if (out == nullptr || !ggml_sycl_load_compute_term_size(chunk_bytes, n_chunks, &bytes)) {
+        return false;
+    }
+    *out = static_cast<uint64_t>(bytes);
+    return true;
+}
+
+// The load's compute reservation (llama.cpp-p6i0): the planned RUNTIME term for the scheduler's compute buffer on
+// `device`, from the probe measure's chunks.  The bytes are what those chunks occupy in the RUNTIME zone's TLSF at the
+// alignment this buffer type requests (ggml_sycl_load_compute_term_size): the allocator's grain, and no headroom.  It
+// writes the planner term only, never the ledger; c(P) is recorded at the admitted stage by
+// ggml_backend_sycl_load_record_compute_term.  The term is measured at the load's measure shape (n_ctx, ubatch 512),
+// not the caller's -c and -ub, which fkpg (a) transports.  False, reserving nothing, when txn is not the open load,
+// n_ctx is 0, the device is out of range or has no VRAM arena, or the chunk list is unusable; the load then goes on
+// with its compute buffer unplanned, as it did before this entry existed.
+bool ggml_backend_sycl_load_reserve_compute_term(ggml_sycl_load_txn txn,
+                                                 int32_t            device,
+                                                 const uint64_t *   chunk_bytes,
+                                                 uint32_t           n_chunks,
+                                                 uint32_t           n_ctx) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return false;
+    }
+    try {
+        const char * why   = nullptr;
+        size_t       bytes = 0;
+        if (!ggml_sycl_load_txn_is_open(txn.id)) {
+            why = "not the open load transaction";
+        } else if (n_ctx == 0) {
+            why = "the measure carries no n_ctx";
+        } else if (device < 0 || device >= ggml_sycl_info().total_gpu_count || device >= GGML_SYCL_MAX_DEVICES) {
+            why = "device out of range";
+        } else {
+            auto * cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+            if (cache == nullptr || !cache->arena_active()) {
+                why = "no VRAM arena on the device";
+            } else if (!ggml_sycl_load_compute_term_size(chunk_bytes, n_chunks, &bytes)) {
+                why = "the chunk list is null or overflows";
+            } else if (!ggml_sycl::unified_cache_set_planned_compute_term(
+                           device, bytes, ggml_sycl::lifecycle::global_registry().live_mask() != 0)) {
+                why = "the term was not stored";
+            }
+        }
+        if (why != nullptr) {
+            GGML_LOG_WARN(
+                "[LOAD-PLAN] compute term not reserved on device %d: %s (the compute buffer stays unplanned)\n", device,
+                why);
+            return false;
+        }
+        GGML_LOG_INFO(
+            "[LOAD-PLAN] compute term reserved in RUNTIME on device %d: %.1f MiB planned (%.1f MiB for this "
+            "load, %u chunk(s), n_ctx %u)\n",
+            device, ggml_sycl::unified_cache_get_planned_compute_term_bytes(device) / (1024.0 * 1024.0),
+            bytes / (1024.0 * 1024.0), n_chunks, n_ctx);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// The load's state reservation (llama.cpp-p6i0): the planned RUNTIME term for the context memory the probe measure
+// placed on `device`'s plain buffer type, the recurrent state of a hybrid or recurrent model.  The real context
+// allocates that memory RUNTIME-first and outside the compute scope, after this load and before the scheduler's
+// compute buffer, so it is its own planned consumer: without it the compute term is drawn down by the state and the
+// buffer's last chunk lands outside the arena (Qwen3.8 on the B70: 112.6 MiB of state, a 512 MiB chunk raw).  Sized
+// as one buffer at the reservation's grain (ggml_sycl_load_compute_term_size), with no headroom; it writes the
+// planner term only.  False, reserving nothing, when txn is not the open load, the device is out of range or has no
+// VRAM arena, or the size overflows; the device's compute buffer then stays unplanned too (the loader offers no
+// compute term for it).
+bool ggml_backend_sycl_load_reserve_state_term(ggml_sycl_load_txn txn, int32_t device, uint64_t state_bytes) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return false;
+    }
+    try {
+        const char * why   = nullptr;
+        size_t       bytes = 0;
+        if (!ggml_sycl_load_txn_is_open(txn.id)) {
+            why = "not the open load transaction";
+        } else if (device < 0 || device >= ggml_sycl_info().total_gpu_count || device >= GGML_SYCL_MAX_DEVICES) {
+            why = "device out of range";
+        } else {
+            auto * cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+            if (cache == nullptr || !cache->arena_active()) {
+                why = "no VRAM arena on the device";
+            } else if (!ggml_sycl_load_compute_term_size(&state_bytes, 1, &bytes)) {
+                why = "the size overflows";
+            } else if (!ggml_sycl::unified_cache_set_planned_state_term(
+                           device, bytes, ggml_sycl::lifecycle::global_registry().live_mask() != 0)) {
+                why = "the term was not stored";
+            }
+        }
+        if (why != nullptr) {
+            GGML_LOG_WARN(
+                "[LOAD-PLAN] state term not reserved on device %d: %s (the context memory and the compute buffer stay "
+                "unplanned)\n",
+                device, why);
+            return false;
+        }
+        GGML_LOG_INFO(
+            "[LOAD-PLAN] state term reserved in RUNTIME on device %d: %.1f MiB planned (%.1f MiB for this load, the "
+            "context memory on the device buffer type)\n",
+            device, ggml_sycl::unified_cache_get_planned_state_term_bytes(device) / (1024.0 * 1024.0),
+            bytes / (1024.0 * 1024.0));
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
@@ -116563,8 +116944,8 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_has_active_placement_plan") == 0) {
         return (void *) ggml_backend_sycl_has_active_placement_plan;
     }
-    if (strcmp(name, "ggml_backend_sycl_measure_plan_override_install") == 0) {
-        return (void *) ggml_backend_sycl_measure_plan_override_install;
+    if (strcmp(name, "ggml_backend_sycl_measure_plan_override_install_kv") == 0) {
+        return (void *) ggml_backend_sycl_measure_plan_override_install_kv;
     }
     if (strcmp(name, "ggml_backend_sycl_measure_plan_override_clear") == 0) {
         return (void *) ggml_backend_sycl_measure_plan_override_clear;
@@ -116727,9 +117108,10 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_for_model") == 0) {
         return (void *) ggml_backend_sycl_set_runtime_context_for_model;
     }
-    // The L4 descriptor publish, the coverage read, the late check and the residency probe.  Each name is the
-    // "Proc name:" its declaration in ggml-sycl.h carries; scripts/check-sycl-l4-proc-registration.py pins that
-    // every such name in the header has an arm here.
+    // The L4 descriptor publish, the coverage read, the late check and the residency probe; the load's compute-term
+    // record, reservation and units; and the state term's reservation, record, late check and planned-state read
+    // (llama.cpp-p6i0).  Each name is the "Proc name:" its declaration in ggml-sycl.h carries;
+    // scripts/check-sycl-l4-proc-registration.py pins that every such name in the header has an arm here.
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_desc") == 0) {
         return (void *) ggml_backend_sycl_set_runtime_context_desc;
     }
@@ -116741,6 +117123,27 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_probe_residency") == 0) {
         return (void *) ggml_backend_sycl_probe_residency;
+    }
+    if (strcmp(name, "ggml_backend_sycl_load_record_compute_term") == 0) {
+        return (void *) ggml_backend_sycl_load_record_compute_term;
+    }
+    if (strcmp(name, "ggml_backend_sycl_load_reserve_compute_term") == 0) {
+        return (void *) ggml_backend_sycl_load_reserve_compute_term;
+    }
+    if (strcmp(name, "ggml_backend_sycl_load_compute_term_bytes") == 0) {
+        return (void *) ggml_backend_sycl_load_compute_term_bytes;
+    }
+    if (strcmp(name, "ggml_backend_sycl_load_reserve_state_term") == 0) {
+        return (void *) ggml_backend_sycl_load_reserve_state_term;
+    }
+    if (strcmp(name, "ggml_backend_sycl_load_record_state_term") == 0) {
+        return (void *) ggml_backend_sycl_load_record_state_term;
+    }
+    if (strcmp(name, "ggml_backend_sycl_load_late_check_state") == 0) {
+        return (void *) ggml_backend_sycl_load_late_check_state;
+    }
+    if (strcmp(name, "ggml_backend_sycl_planned_state_term") == 0) {
+        return (void *) ggml_backend_sycl_planned_state_term;
     }
     if (strcmp(name, "ggml_backend_sycl_supports_op_capability") == 0) {
         return (void *) ggml_backend_sycl_supports_op_capability;

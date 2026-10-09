@@ -251,6 +251,7 @@ void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept {
     try {
         std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
         g_lifecycle_plan_candidates.erase(load_txn_id);
+        g_lifecycle_probe_plans.erase(load_txn_id);  // the probe placement lives as long as the candidate
     } catch (...) {
     }
 }
@@ -292,11 +293,13 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
         published->version = lifecycle_next_plan_publication_id();
         if (published->version == 0) {
             g_lifecycle_plan_candidates.erase(candidate);
+            g_lifecycle_probe_plans.erase(load_txn_id);
             return false;
         }
         std::shared_ptr<const lifecycle_plan_snapshot> immutable = std::move(published);
         g_lifecycle_plan_models[model_id][load_txn_id] = immutable;
         g_lifecycle_plan_candidates.erase(candidate);
+        g_lifecycle_probe_plans.erase(load_txn_id);  // the probe placement lives as long as the candidate
         if (published_out) {
             *published_out = std::move(immutable);
         }
@@ -822,6 +825,12 @@ static std::atomic<size_t>   g_planned_mmq_src1_bytes_per_token[GGML_SYCL_MAX_DE
 static std::atomic<size_t>   g_planned_dequant_f16_weight_bytes_max[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_dequant_f16_src1_bytes_per_token[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<uint32_t> g_planned_dense_scratch_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-p6i0: the load's planned compute term (the scheduler's compute buffer, measured at the load's measure
+// shape and rounded to the RUNTIME TLSF's grain), folded into the same RUNTIME zone requirement.
+static std::atomic<size_t>   g_planned_compute_term_bytes[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-p6i0: the load's planned state term (the context memory the measure placed on the device's plain buffer
+// type, the recurrent state, which takes the RUNTIME zone before the compute buffer), at the same grain.
+static std::atomic<size_t>   g_planned_state_term_bytes[GGML_SYCL_MAX_DEVICES]{};
 
 // llama.cpp-kpjw: everything about the hold that must move together, per device, behind one mutex: the held bytes and
 // the context that published them (a context id, never an address: an address is reused after a free), the
@@ -2115,6 +2124,52 @@ size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id) {
     return g_planned_mmq_src1_scratch_bytes[device_id].load(std::memory_order_acquire);
 }
 
+bool unified_cache_set_planned_compute_term(int device_id, size_t bytes, bool other_model_live) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    // The term is device-global: while another model is live on the device its larger term stays, so a draft
+    // loaded beside its target does not shrink the zone the target's compute buffer already sits in.
+    g_planned_compute_term_bytes[device_id].store(
+        zone_dense_scratch_merge_input(g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire), bytes,
+                                       other_model_live),
+        std::memory_order_release);
+    return true;
+}
+
+size_t unified_cache_get_planned_compute_term_bytes(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire);
+}
+
+bool unified_cache_set_planned_state_term(int device_id, size_t bytes, bool other_model_live) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    // Merged like the compute term: while another model is live its larger state term stays.
+    g_planned_state_term_bytes[device_id].store(
+        zone_dense_scratch_merge_input(g_planned_state_term_bytes[device_id].load(std::memory_order_acquire), bytes,
+                                       other_model_live),
+        std::memory_order_release);
+    return true;
+}
+
+size_t unified_cache_get_planned_state_term_bytes(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_state_term_bytes[device_id].load(std::memory_order_acquire);
+}
+
+void unified_cache_clear_planned_load_terms() {
+    for (int device_id = 0; device_id < GGML_SYCL_MAX_DEVICES; ++device_id) {
+        g_planned_compute_term_bytes[device_id].store(0, std::memory_order_release);
+        g_planned_state_term_bytes[device_id].store(0, std::memory_order_release);
+    }
+}
+
 bool unified_cache_set_planned_dequant_f16_scratch(int      device_id,
                                                    size_t   max_weight_bytes,
                                                    size_t   src1_bytes_per_token,
@@ -2651,10 +2706,17 @@ bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * 
     const size_t mmq_src1 = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);
     // The dense f16 dequant buffer lives in this zone too (llama.cpp-479i), checked the same way.
     const size_t dequant_f16 = unified_cache_get_planned_dequant_f16_scratch_bytes(device_id);
-    if (mmq_src1 > SIZE_MAX - base || dequant_f16 > SIZE_MAX - base - mmq_src1) {
+    // The scheduler's compute buffer lives in this zone too (llama.cpp-p6i0), checked the same way.
+    const size_t compute     = unified_cache_get_planned_compute_term_bytes(device_id);
+    // The context memory the load measured on the device's plain buffer type (the recurrent state) is allocated in
+    // this zone before the compute buffer (llama.cpp-p6i0), checked the same way.
+    const size_t state       = unified_cache_get_planned_state_term_bytes(device_id);
+    if (mmq_src1 > SIZE_MAX - base || dequant_f16 > SIZE_MAX - base - mmq_src1 ||
+        compute > SIZE_MAX - base - mmq_src1 - dequant_f16 ||
+        state > SIZE_MAX - base - mmq_src1 - dequant_f16 - compute) {
         return false;
     }
-    *out = base + mmq_src1 + dequant_f16;
+    *out = base + mmq_src1 + dequant_f16 + compute + state;
     return true;
 }
 
@@ -6433,9 +6495,11 @@ bool unified_cache::ensure_planned_arena_zones() {
         runtime_zone = planned_runtime_scratch;
         GGML_LOG_INFO(
             "[UNIFIED-CACHE] Runtime zone raised to %.1f MB for PP scratch planning "
-            "(pipeline=%.1f MB, moe_onednn=%.1f MB, moe_control=%.1f MB)\n",
+            "(pipeline=%.1f MB, moe_onednn=%.1f MB, moe_control=%.1f MB, compute=%.1f MB, state=%.1f MB)\n",
             runtime_zone / (1024.0 * 1024.0), planned_pp_pipeline / (1024.0 * 1024.0),
-            planned_pp_moe_onednn / (1024.0 * 1024.0), planned_moe_control.bytes / (1024.0 * 1024.0));
+            planned_pp_moe_onednn / (1024.0 * 1024.0), planned_moe_control.bytes / (1024.0 * 1024.0),
+            unified_cache_get_planned_compute_term_bytes(dev_id) / (1024.0 * 1024.0),
+            unified_cache_get_planned_state_term_bytes(dev_id) / (1024.0 * 1024.0));
     }
 
     auto bind_compute_arena = [&]() {

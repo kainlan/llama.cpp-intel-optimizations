@@ -318,7 +318,7 @@ static int    g_run_installs  = 0;
 static int    g_run_clears    = 0;
 static size_t g_live_at_clear = 0;  // ggml-backend's live buffers at the moment of the last clear
 
-static bool fake_install_ok(uint64_t, enum ggml_sycl_measure_stage) {
+static bool fake_install_ok(uint64_t, enum ggml_sycl_measure_stage, const ggml_sycl_measure_kv_shape *) {
     g_run_installs++;
     return true;
 }
@@ -459,7 +459,8 @@ static void check_run_paths() {
         g_run_installs                           = 0;
         g_run_clears                             = 0;
         llama_measure_context_args         args  = cpu_args();
-        const llama_measure_override_procs procs = { [](uint64_t, enum ggml_sycl_measure_stage) {
+        const llama_measure_override_procs procs = { [](uint64_t, enum ggml_sycl_measure_stage,
+                                                        const ggml_sycl_measure_kv_shape *) {
                                                         g_run_installs++;
                                                         return false;
                                                     },

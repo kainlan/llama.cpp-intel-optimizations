@@ -4298,6 +4298,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-p6i0: the load's planned compute term is a named RUNTIME consumer. The reservation sizes it from the probe
+# measure's chunks at the RUNTIME TLSF's grain and writes only the planner term; the RUNTIME zone requirement folds it
+# in; the ring re-plan leaves it room; the compute buffer's landing line names it; and it is dropped where no model is
+# live. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-load-compute-term-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-load-compute-term-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-pyu4: executes the pure helpers in src/llama-auto-ubatch.h --
 # llama_auto_ubatch_ladder_has_candidate(), the predicate behind the trial's
 # early exit before its ladder loop, on the shapes where no rung lies in

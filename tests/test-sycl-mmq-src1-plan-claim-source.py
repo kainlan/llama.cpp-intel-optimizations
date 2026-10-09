@@ -195,7 +195,7 @@ def claim_zone_requirement_folds_in_the_dense_plans(cache: str) -> bool:
     req = body(t, REQ_SIG)
     return (bool(req) and "const size_t mmq_src1 = unified_cache_get_planned_mmq_src1_scratch_bytes(device_id);" in req
             and "const size_t dequant_f16 = unified_cache_get_planned_dequant_f16_scratch_bytes(device_id);" in req
-            and "*out = base + mmq_src1 + dequant_f16;" in req
+            and "*out = base + mmq_src1 + dequant_f16 + compute + state;" in req
             and re.search(r"unified_cache_get_planned_runtime_zone_requirement\(dev_id, &planned_runtime_scratch\).*?"
                           r"runtime_zone = planned_runtime_scratch;", t) is not None)
 
@@ -337,7 +337,7 @@ def test_mutant_ring_admitted_against_the_raw_free_bytes_fails():
 
 def test_mutant_zone_requirement_without_the_q8_plan_fails():
     assert not claim_zone_requirement_folds_in_the_dense_plans(
-        _once(CACHE, "*out = base + mmq_src1 + dequant_f16;", "*out = base + dequant_f16;"))
+        _once(CACHE, "*out = base + mmq_src1 + dequant_f16 + compute + state;", "*out = base + dequant_f16 + compute + state;"))
 
 
 if __name__ == "__main__":

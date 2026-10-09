@@ -10,9 +10,10 @@ It checks, over ggml/include/ggml-sycl.h and ggml/src/ggml-sycl/ggml-sycl.cpp:
 
   * every `Proc name: "X"` in the header has an arm `strcmp(name, "X") == 0` in the registration
     that returns `(void *) X` itself, outside any build switch, and a definition of X;
-  * the compute-term ledger has one writer: `.record(` is called only in
-    ggml_sycl_load_record_compute_term, `.clear(` only in ggml_sycl_load_clear_compute_terms, and
-    the ledger accessor is named only by those two, the late check and the test count hook;
+  * the ledger has one writer per term: `.record(` is called only in ggml_sycl_load_record_compute_term
+    (the compute term) and in ggml_sycl_load_record_state_term (the state term, under LOAD_LEDGER_TERM_STATE),
+    `.clear(` only in ggml_sycl_load_clear_compute_terms, and the ledger accessor is named only by those three,
+    the two late checks (compute, state) and the test count hook;
   * the load's end call clears the ledger after the registry ended the transaction, on every path: a
     guard created after the finisher check clears on a normal exit and skips while unwinding, and the
     one catch (...) arms `after_end` as its first statement, sets its transaction before the end call
@@ -111,6 +112,13 @@ SIG_LATE = r"\benum\s+ggml_sycl_late_check_result\s+ggml_backend_sycl_load_late_
 SIG_COUNT = r'\bextern\s+"C"\s+size_t\s+ggml_backend_sycl_test_compute_term_count\s*\('
 SIG_COVERAGE = r"\benum\s+ggml_sycl_tenant_coverage\s+ggml_backend_sycl_tenant_coverage\s*\("
 SIG_PROBE = r"\benum\s+ggml_sycl_residency_probe_status\s+ggml_backend_sycl_probe_residency\s*\("
+SIG_RECORD_EXPORT = r"\bbool\s+ggml_backend_sycl_load_record_compute_term\s*\("
+SIG_RESERVE_EXPORT = r"\bbool\s+ggml_backend_sycl_load_reserve_compute_term\s*\("
+SIG_RECORD_HOOK = r'\bextern\s+"C"\s+bool\s+ggml_backend_sycl_test_record_compute_term\s*\('
+SIG_RECORD_STATE = r"\bbool\s+ggml_sycl_load_record_state_term\s*\("
+SIG_RECORD_STATE_EXPORT = r"\bbool\s+ggml_backend_sycl_load_record_state_term\s*\("
+SIG_LATE_STATE = r"\benum\s+ggml_sycl_late_check_result\s+ggml_backend_sycl_load_late_check_state\s*\("
+SIG_RESERVE_STATE_EXPORT = r"\bbool\s+ggml_backend_sycl_load_reserve_state_term\s*\("
 
 HEADER = "ggml/include/ggml-sycl.h"
 SOURCE = "ggml/src/ggml-sycl/ggml-sycl.cpp"
@@ -707,6 +715,84 @@ DOOR_SYMBOL = re.compile(r"(?<!decltype\(&)\bggml_backend_sycl_probe_residency\b
 DOOR_CALL = re.compile(r"(?:\.|->)\s*probe_residency\s*\)?\s*\(")
 
 
+LOAD_TERM_PROCS = ("ggml_backend_sycl_load_record_compute_term", "ggml_backend_sycl_load_reserve_compute_term",
+                   "ggml_backend_sycl_load_compute_term_bytes", "ggml_backend_sycl_load_reserve_state_term",
+                   "ggml_backend_sycl_load_record_state_term", "ggml_backend_sycl_load_late_check_state")
+
+
+def load_term_pins(header_raw, source, fails):
+    """The load's compute-term entries (llama.cpp-p6i0).  The header names all six procs: the record, the reserve,
+    the reservation's units, the state reserve, the state record and the state late check.  The record export is the production caller of the one ledger
+    writer: it reaches the writer, under the module guard, and never the ledger itself; the writer is called only by
+    it and by the private test hook, and is no longer marked unused.  The reserve export hands the probe bound to the
+    planner and touches neither the ledger nor its writer, so c(P) is recorded at one stage only.  The state term
+    mirrors it: the state record export reaches the state writer under the module guard and never the ledger itself,
+    the state writer has no other caller, and the state reserve export reaches neither the ledger nor a writer."""
+    names = header_proc_names(header_raw)
+    for name in LOAD_TERM_PROCS:
+        if name not in names:
+            fails.append("L4 load terms: the header does not name the proc %s" % name)
+    if re.search(r"\[\[maybe_unused\]\]\s*static\s+bool\s+ggml_sycl_load_record_compute_term\s*\(", source):
+        fails.append("L4 load terms: the ledger writer is still marked [[maybe_unused]]")
+    rec = function_body(source, SIG_RECORD_EXPORT)
+    if rec is None:
+        fails.append("L4 load terms: the record export ggml_backend_sycl_load_record_compute_term is not defined")
+    else:
+        g = rec.find("sycl_module_mutation_guard module_guard;")
+        chk = rec.find("if (!module_guard)")
+        call = rec.find("return ggml_sycl_load_record_compute_term(txn.id, device, bytes, n_ctx);")
+        if not (0 <= g < chk < call) or "ggml_sycl_load_ledger" in rec:
+            fails.append("L4 load terms: the record export does not reach the writer under the module guard")
+    spans = [function_span(source, SIG_RECORD_EXPORT), function_span(source, SIG_RECORD_HOOK)]
+    spans = [sp for sp in spans if sp is not None]
+    stray = 0
+    for m in re.finditer(r"\bggml_sycl_load_record_compute_term\s*\(", source):
+        if re.match(r"[^;{]*\)\s*\{", source[m.end():]) and re.search(r"\bbool\s+$", source[:m.start()]):
+            continue  # the writer's own definition
+        if not any(a <= m.start() < b for a, b in spans):
+            stray += 1
+    if stray:
+        fails.append("L4 load terms: the ledger writer is called outside the record export and the test hook "
+                     "(%d call(s))" % stray)
+    res = function_body(source, SIG_RESERVE_EXPORT)
+    if res is None:
+        fails.append("L4 load terms: the reserve export ggml_backend_sycl_load_reserve_compute_term is not defined")
+    elif "ggml_sycl_load_ledger" in res or "ggml_sycl_load_record_compute_term" in res:
+        fails.append("L4 load terms: the reserve export reaches the ledger or its writer")
+    rec_state = function_body(source, SIG_RECORD_STATE_EXPORT)
+    if rec_state is None:
+        fails.append("L4 state term: the record export ggml_backend_sycl_load_record_state_term is not defined")
+    else:
+        g = rec_state.find("sycl_module_mutation_guard module_guard;")
+        chk = rec_state.find("if (!module_guard)")
+        call = rec_state.find("return ggml_sycl_load_record_state_term(txn.id, device, bytes, n_ctx);")
+        if not (0 <= g < chk < call) or "ggml_sycl_load_ledger" in rec_state:
+            fails.append("L4 state term: the record export does not reach the state writer under the module guard")
+    state_spans = [sp for sp in (function_span(source, SIG_RECORD_STATE_EXPORT),) if sp is not None]
+    stray = 0
+    for m in re.finditer(r"\bggml_sycl_load_record_state_term\s*\(", source):
+        if re.match(r"[^;{]*\)\s*\{", source[m.end():]) and re.search(r"\bbool\s+$", source[:m.start()]):
+            continue  # the writer's own definition
+        if not any(a <= m.start() < b for a, b in state_spans):
+            stray += 1
+    if stray:
+        fails.append("L4 state term: the state writer is called outside the state record export (%d call(s))" % stray)
+    res_state = function_body(source, SIG_RESERVE_STATE_EXPORT)
+    if res_state is None:
+        fails.append("L4 state term: the reserve export ggml_backend_sycl_load_reserve_state_term is not defined")
+    elif "ggml_sycl_load_ledger" in res_state or "ggml_sycl_load_record_" in res_state:
+        fails.append("L4 state term: the state reserve export reaches the ledger or a writer")
+    # llama.cpp-p6i0: a reservation writes a planner term and allocates nothing, so it looks up the device's cache
+    # without creating one (a miss would create the cache and reserve its arena); an absent cache declines.
+    for label, body in (("compute", res), ("state", res_state)):
+        if body is None:
+            continue
+        if (body.count("ggml_sycl::get_existing_unified_cache_for_device(device)") != 1
+                or re.search(r"\bget_unified_cache_for_device\s*\(", body)):
+            fails.append("L4 load terms: the %s reserve export does not look up the existing cache only "
+                         "(get_existing_unified_cache_for_device)" % label)
+
+
 def door_texts(root):
     """Every source file under src/ except the door's own, comment-stripped: the files that must never reach the probe."""
     out = {}
@@ -772,8 +858,19 @@ def check(header_raw, source):
     if clr_fn is None:
         fails.append("L4 ledger: ggml_sycl_load_clear_compute_terms not found")
         clr_fn = ""
-    if source.count(".ledger.record(") != 1 or rec_fn.count(".ledger.record(") != 1:
-        fails.append("L4 ledger: the ledger is written (record) outside ggml_sycl_load_record_compute_term")
+    rec_state_fn = function_body(source, SIG_RECORD_STATE)
+    if rec_state_fn is None:
+        fails.append("L4 ledger: ggml_sycl_load_record_state_term not found")
+        rec_state_fn = ""
+    if (source.count(".ledger.record(") != 2 or rec_fn.count(".ledger.record(") != 1 or
+            rec_state_fn.count(".ledger.record(") != 1):
+        fails.append("L4 ledger: the ledger is written (record) outside ggml_sycl_load_record_compute_term and "
+                     "ggml_sycl_load_record_state_term")
+    if "LOAD_LEDGER_TERM_" in rec_fn:
+        fails.append("L4 ledger: the compute writer names a term (it records the compute term through the default)")
+    if not re.search(r"state\.ledger\.record\(txn,\s*device,\s*ggml_sycl::LOAD_LEDGER_TERM_STATE,\s*bytes,\s*n_ctx,\s*"
+                     r"ggml_sycl_load_txn_is_open\(txn\)\);", rec_state_fn):
+        fails.append("L4 ledger: the state writer does not record the state term, gated by the open transaction")
     if source.count(".ledger.clear(") != 1 or clr_fn.count(".ledger.clear(") != 1:
         fails.append("L4 ledger: the ledger is cleared outside ggml_sycl_load_clear_compute_terms")
     ledger_fns = (
@@ -783,6 +880,8 @@ def check(header_raw, source):
          r"\benum\s+ggml_sycl_late_check_result\s+ggml_backend_sycl_load_late_check\s*\("),
         ("ggml_backend_sycl_test_compute_term_count",
          r'\bextern\s+"C"\s+size_t\s+ggml_backend_sycl_test_compute_term_count\s*\('),
+        ("ggml_sycl_load_record_state_term", SIG_RECORD_STATE),
+        ("ggml_backend_sycl_load_late_check_state", SIG_LATE_STATE),
     )
     spans = {}
     for name, sig in ledger_fns:
@@ -799,7 +898,7 @@ def check(header_raw, source):
         if not any(a <= m.start() < b for a, b in spans.values()):
             stray.add(m.start())
     if stray:
-        fails.append("L4 ledger: the ledger accessor is named outside the four sanctioned functions (%d use(s))" % len(stray))
+        fails.append("L4 ledger: the ledger accessor is named outside the sanctioned functions (%d use(s))" % len(stray))
     for name, (a, b) in spans.items():
         if "ggml_sycl_load_ledger()" not in source[a:b]:
             fails.append("L4 ledger: %s no longer reaches the ledger through its accessor" % name)
@@ -821,7 +920,8 @@ def check(header_raw, source):
                 held = False  # the guard is the substatement of an `if`/`for`/`while`/`else`: not unconditional
         if not held:
             fails.append("L4 ledger lock: %s uses the ledger without state.mutex held at the use" % name)
-    for name in ("ggml_sycl_load_record_compute_term", "ggml_backend_sycl_load_late_check"):
+    for name in ("ggml_sycl_load_record_compute_term", "ggml_backend_sycl_load_late_check",
+                 "ggml_sycl_load_record_state_term", "ggml_backend_sycl_load_late_check_state"):
         if name in spans:
             body = source[spans[name][0]:spans[name][1]]
             lk = re.search(lock_re, body)
@@ -850,6 +950,21 @@ def check(header_raw, source):
         fails.append("L4 late: the late check does not answer the ledger's result (it must end `return r.result;`)")
     if "ggml_sycl_load_ledger_log(r);" not in late_body:
         fails.append("L4 log level: the late check does not log through the ledger's level")
+    # the state term's late check (llama.cpp-p6i0): the compute check's fail-closed shape, comparing the state term
+    late_state = function_body(source, SIG_LATE_STATE) or ""
+    if len(re.findall(r"catch\s*\(\.\.\.\)", late_state)) != 1 or not re.search(
+            r"catch\s*\(\.\.\.\)\s*\{\s*return GGML_SYCL_LATE_CHECK_NOT_RECORDED;\s*\}", late_state):
+        fails.append("L4 state term: the state late check's catch does not answer NOT_RECORDED")
+    if not re.search(r"sycl_module_mutation_guard module_guard;\s*if \(!module_guard\) \{\s*return GGML_SYCL_LATE_CHECK_NOT_RECORDED;",
+                     late_state):
+        fails.append("L4 state term: the state late check lost its module guard (a closed module answers NOT_RECORDED)")
+    if not re.search(r"return r\.result;\s*\}\s*catch\s*\(\.\.\.\)", late_state):
+        fails.append("L4 state term: the state late check does not answer the ledger's result")
+    if "ggml_sycl_load_ledger_log(r);" not in late_state:
+        fails.append("L4 state term: the state late check does not log through the ledger's level")
+    if not re.search(r"state\.ledger\.check\(txn\.id,\s*device,\s*ggml_sycl::LOAD_LEDGER_TERM_STATE,\s*state_bytes,\s*"
+                     r"ggml_sycl_load_txn_is_open\(txn\.id\)\);", late_state):
+        fails.append("L4 state term: the state late check does not compare the state term, gated by the open transaction")
     cov_body = function_body(source, r"\benum\s+ggml_sycl_tenant_coverage\s+ggml_backend_sycl_tenant_coverage\s*\(") or ""
     if len(re.findall(r"catch\s*\(\.\.\.\)", cov_body)) != 1 or not re.search(
             r"catch\s*\(\.\.\.\)\s*\{\s*return GGML_SYCL_TENANT_COVERAGE_GROWTH;\s*\}", cov_body):
@@ -1112,6 +1227,7 @@ def check(header_raw, source):
     if len(re.findall(r"dump_counter::late_term_shrink_admitted", source)) != 1:
         fails.append("L4 late: late_term_shrink_admitted has more or fewer than one producer")
     probe_pins(source, fails)
+    load_term_pins(header_raw, source, fails)
     return fails
 
 
@@ -1132,7 +1248,7 @@ def mutations(header_raw, source):
         ("a second clearer of the ledger", "cleared outside",
          "static size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {",
          "static void h_second_clearer() { ggml_sycl_load_ledger().ledger.clear(1); }\nstatic size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {"),
-        ("the ledger read by a stray function", "outside the four sanctioned",
+        ("the ledger read by a stray function", "outside the sanctioned functions",
          "static size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {",
          "static size_t h_stray() { return ggml_sycl_load_ledger().ledger.size(); }\nstatic size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {"),
         ("the end call's clear guard dropped", "no guard",
@@ -1734,6 +1850,85 @@ def mutations(header_raw, source):
                   "auto release_rung_buffers = [&]() {\n        synchronize();\n", "auto release_rung_buffers = [&]() {\n"))
     pairs.append(("the backend interface wires cpy_tensor_async", "cpy_tensor_async is referenced beyond its definition",
                   CPY_ASYNC_DEF, "static void h_wire_cpy() { (void) ggml_backend_sycl_cpy_tensor_async; }\n" + CPY_ASYNC_DEF))
+    # llama.cpp-p6i0: the load's compute-term entries
+    pairs.append(("the writer marked unused again", "still marked [[maybe_unused]]",
+                  "static bool ggml_sycl_load_record_compute_term(",
+                  "[[maybe_unused]] static bool ggml_sycl_load_record_compute_term("))
+    pairs.append(("a second caller of the state writer", "the state writer is called outside the state record export",
+                  "static size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {",
+                  "static void h_second_state_caller() { (void) ggml_sycl_load_record_state_term(1, 0, 1, 1); }\n"
+                  "static size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {"))
+    pairs.append(("a third caller of the ledger writer", "called outside the record export",
+                  "static size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {",
+                  "static void h_third_writer_caller() { (void) ggml_sycl_load_record_compute_term(1, 0, 1, 1); }\n"
+                  "static size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {"))
+    for label, msg, sig, old, new in (
+            ("the record export skips the module guard", "does not reach the writer under the module guard",
+             SIG_RECORD_EXPORT, "if (!module_guard)", "if (false)"),
+            ("the record export writes the ledger itself", "does not reach the writer under the module guard",
+             SIG_RECORD_EXPORT, "return ggml_sycl_load_record_compute_term(txn.id, device, bytes, n_ctx);",
+             "return ggml_sycl_load_ledger().ledger.size() == 0;"),
+            ("the reserve export records c(P)", "reserve export reaches the ledger or its writer",
+             SIG_RESERVE_EXPORT, "sycl_module_mutation_guard module_guard;",
+             "sycl_module_mutation_guard module_guard; (void) ggml_sycl_load_record_compute_term(txn.id, device, 0, n_ctx);"),
+            # llama.cpp-p6i0: the state term, under its own name
+            ("the state writer records the compute term", "the state writer does not record the state term",
+             SIG_RECORD_STATE, "ggml_sycl::LOAD_LEDGER_TERM_STATE", "ggml_sycl::LOAD_LEDGER_TERM_COMPUTE"),
+            ("the state writer not gated by the open transaction", "the state writer does not record the state term",
+             SIG_RECORD_STATE, "ggml_sycl_load_txn_is_open(txn)", "true"),
+            ("the lock dropped from the state writer", "ggml_sycl_load_record_state_term uses the ledger without state.mutex",
+             SIG_RECORD_STATE, "    std::lock_guard<std::mutex> lock(state.mutex);\n", ""),
+            ("the compute writer records the state term", "the compute writer names a term",
+             SIG_RECORD, "state.ledger.record(txn, device, bytes,", "state.ledger.record(txn, device, ggml_sycl::LOAD_LEDGER_TERM_STATE, bytes,"),
+            ("the state late check compares the compute term", "does not compare the state term",
+             SIG_LATE_STATE, "ggml_sycl::LOAD_LEDGER_TERM_STATE", "ggml_sycl::LOAD_LEDGER_TERM_COMPUTE"),
+            ("the state late check not gated by the open transaction", "does not compare the state term",
+             SIG_LATE_STATE, "ggml_sycl_load_txn_is_open(txn.id)", "true"),
+            ("the lock dropped from the state late check",
+             "ggml_backend_sycl_load_late_check_state uses the ledger without state.mutex",
+             SIG_LATE_STATE, "            std::lock_guard<std::mutex> lock(state.mutex);\n", ""),
+            ("the open read moved before the lock in the state late check",
+             "ggml_backend_sycl_load_late_check_state reads the open transaction outside",
+             SIG_LATE_STATE, "            std::lock_guard<std::mutex> lock(state.mutex);\n",
+             "            const bool open_early = ggml_sycl_load_txn_is_open(txn.id);\n            (void) open_early;\n"
+             "            std::lock_guard<std::mutex> lock(state.mutex);\n"),
+            ("the state late check's catch answers EQUAL", "the state late check's catch does not answer NOT_RECORDED",
+             SIG_LATE_STATE, "catch (...) {\n        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;",
+             "catch (...) {\n        return GGML_SYCL_LATE_CHECK_EQUAL;"),
+            ("the state late check's closed module answers EQUAL", "the state late check lost its module guard",
+             SIG_LATE_STATE, "    if (!module_guard) {\n        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;",
+             "    if (!module_guard) {\n        return GGML_SYCL_LATE_CHECK_EQUAL;"),
+            ("the state late check answers EQUAL for every result", "the state late check does not answer the ledger's result",
+             SIG_LATE_STATE, "        return r.result;\n", "        return GGML_SYCL_LATE_CHECK_EQUAL;\n"),
+            ("the state late check bypasses the ledger's level", "the state late check does not log through the ledger's level",
+             SIG_LATE_STATE, "ggml_sycl_load_ledger_log(r);", "GGML_LOG_INFO(\"%s\\n\", r.line.c_str());"),
+            ("the state record export skips the module guard", "does not reach the state writer under the module guard",
+             SIG_RECORD_STATE_EXPORT, "if (!module_guard)", "if (false)"),
+            ("the state record export writes the ledger itself", "does not reach the state writer under the module guard",
+             SIG_RECORD_STATE_EXPORT, "return ggml_sycl_load_record_state_term(txn.id, device, bytes, n_ctx);",
+             "return ggml_sycl_load_ledger().ledger.size() == 0;"),
+            ("the compute reserve export creates a cache on a miss", "the compute reserve export does not look up the existing cache only",
+             SIG_RESERVE_EXPORT, "ggml_sycl::get_existing_unified_cache_for_device(device)",
+             "ggml_sycl::get_unified_cache_for_device(device)"),
+            ("the state reserve export creates a cache on a miss", "the state reserve export does not look up the existing cache only",
+             SIG_RESERVE_STATE_EXPORT, "ggml_sycl::get_existing_unified_cache_for_device(device)",
+             "ggml_sycl::get_unified_cache_for_device(device)"),
+            ("the state reserve export records the state", "the state reserve export reaches the ledger or a writer",
+             SIG_RESERVE_STATE_EXPORT, "sycl_module_mutation_guard module_guard;",
+             "sycl_module_mutation_guard module_guard; (void) ggml_sycl_load_record_state_term(txn.id, device, 0, 1);")):
+        span = function_span(src, sig)
+        if span is None or src[span[0]:span[1]].count(old) != 1:
+            muts.append(("PATTERN NOT FOUND: " + label, "PATTERN", header_raw, src))
+        else:
+            a, b = span
+            muts.append((label, msg, header_raw, src[:a] + src[a:b].replace(old, new, 1) + src[b:]))
+    for name in LOAD_TERM_PROCS:
+        line = '// Proc name: "%s".' % name
+        if header_raw.count(line) != 1:
+            muts.append(("PATTERN NOT FOUND: the header's proc name " + name, "PATTERN", header_raw, src))
+        else:
+            muts.append(("the header forgets " + name, "the header does not name the proc " + name,
+                         header_raw.replace(line, "", 1), src))
     for label, msg, old, new in pairs:
         if label == "the first publish reserves under L1":
             lock = ("        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);\n"

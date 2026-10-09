@@ -33,11 +33,34 @@ struct llama_sycl_l4_procs {
     decltype(&ggml_backend_sycl_tenant_coverage)          coverage        = nullptr;
     decltype(&ggml_backend_sycl_load_late_check)          late_check      = nullptr;
     decltype(&ggml_backend_sycl_probe_residency)          probe_residency = nullptr;
+    // The load's compute-term record, compute reservation, the reservation's units, and the state term's
+    // reservation, record and late check (llama.cpp-p6i0). Not part of available(): the context side and the late
+    // check keep their gate, and the loader gates its two steps on load_terms_available().
+    decltype(&ggml_backend_sycl_load_record_compute_term)  record_term      = nullptr;
+    decltype(&ggml_backend_sycl_load_reserve_compute_term) reserve_term     = nullptr;
+    decltype(&ggml_backend_sycl_load_compute_term_bytes)   term_bytes       = nullptr;
+    decltype(&ggml_backend_sycl_load_reserve_state_term)   reserve_state    = nullptr;
+    decltype(&ggml_backend_sycl_load_record_state_term)    record_state     = nullptr;
+    decltype(&ggml_backend_sycl_load_late_check_state)     late_check_state = nullptr;
+    // The planned state term, read at context init to compare with the state the context's memory allocated
+    // (llama.cpp-p6i0). In neither gate: a WARN-only comparison, which a null proc simply skips.
+    decltype(&ggml_backend_sycl_planned_state_term)        planned_state    = nullptr;
 
     // A planned context needs all four: a publish that cannot be covered-checked, a load that
     // cannot be late-checked, or a plan whose residency cannot be probed, is half a plan.
     bool available() const {
         return publish != nullptr && coverage != nullptr && late_check != nullptr && probe_residency != nullptr;
+    }
+
+    // The loader reserves the probe bound and records the admitted term only with all four: a reservation that is
+    // never recorded leaves the late check nothing to compare, a record with no reservation compares a term the
+    // pack never made room for, without the reservation's units the admitted check cannot compare c(P) with
+    // what was reserved, and without the state reservation a model with recurrent state has its compute term drawn
+    // down by that state before the compute buffer is allocated. The state term's record and late check are the
+    // state's half of the same pair: a state reserved and never recorded leaves its late check nothing to compare.
+    bool load_terms_available() const {
+        return record_term != nullptr && reserve_term != nullptr && term_bytes != nullptr && reserve_state != nullptr &&
+               record_state != nullptr && late_check_state != nullptr;
     }
 };
 
@@ -102,6 +125,106 @@ inline ggml_sycl_late_check_result llama_sycl_l4_late_check(const llama_sycl_l4_
     }
 }
 
+// The load's compute-term record (llama.cpp-p6i0). False is "not recorded", and a null proc reads as it: the late
+// check then answers NOT_RECORDED for the device, which no caller reads as a pass.
+inline bool llama_sycl_l4_record_compute_term(const llama_sycl_l4_procs & procs,
+                                              struct ggml_sycl_load_txn   txn,
+                                              int32_t                     device,
+                                              uint64_t                    bytes,
+                                              uint32_t                    n_ctx) {
+    if (procs.record_term == nullptr) {
+        return false;
+    }
+    return procs.record_term(txn, device, bytes, n_ctx);
+}
+
+// The load's compute reservation (llama.cpp-p6i0): the probe measure's per-chunk peaks for one device, handed to the
+// backend at its width. False is "not reserved", and a null proc reads as it: the load goes on with its compute buffer
+// unplanned, as it did before the entry existed.
+inline bool llama_sycl_l4_reserve_compute_term(const llama_sycl_l4_procs & procs,
+                                               struct ggml_sycl_load_txn   txn,
+                                               int32_t                     device,
+                                               const std::vector<size_t> & chunk_bytes,
+                                               uint32_t                    n_ctx) {
+    if (procs.reserve_term == nullptr || chunk_bytes.size() > UINT32_MAX) {
+        return false;
+    }
+    const std::vector<uint64_t> chunks(chunk_bytes.begin(), chunk_bytes.end());
+    return procs.reserve_term(txn, device, chunks.data(), static_cast<uint32_t>(chunks.size()), n_ctx);
+}
+
+// The load's state reservation (llama.cpp-p6i0): the context memory the probe measure placed on one device's plain
+// buffer type. False is "not reserved", and a null proc reads as it.
+inline bool llama_sycl_l4_reserve_state_term(const llama_sycl_l4_procs & procs,
+                                             struct ggml_sycl_load_txn   txn,
+                                             int32_t                     device,
+                                             uint64_t                    state_bytes) {
+    if (procs.reserve_state == nullptr) {
+        return false;
+    }
+    return procs.reserve_state(txn, device, state_bytes);
+}
+
+// The load's state-term record (llama.cpp-p6i0): the state the probe reserved for one device, under the state term's
+// own name. False is "not recorded", and a null proc reads as it: the state's late check then answers NOT_RECORDED.
+inline bool llama_sycl_l4_record_state_term(const llama_sycl_l4_procs & procs,
+                                            struct ggml_sycl_load_txn   txn,
+                                            int32_t                     device,
+                                            uint64_t                    bytes,
+                                            uint32_t                    n_ctx) {
+    if (procs.record_state == nullptr) {
+        return false;
+    }
+    return procs.record_state(txn, device, bytes, n_ctx);
+}
+
+// The state term's late check (llama.cpp-p6i0): a late state against the recorded state, never against the compute
+// term. NOT_RECORDED is "nothing was checked"; a null proc and a value outside the enum both read as it.
+inline ggml_sycl_late_check_result llama_sycl_l4_late_check_state(const llama_sycl_l4_procs & procs,
+                                                                  struct ggml_sycl_load_txn   txn,
+                                                                  int32_t                     device,
+                                                                  uint64_t                    state_bytes) {
+    if (procs.late_check_state == nullptr) {
+        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
+    const ggml_sycl_late_check_result r = procs.late_check_state(txn, device, state_bytes);
+    switch (r) {
+        case GGML_SYCL_LATE_CHECK_EQUAL:
+        case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED:
+        case GGML_SYCL_LATE_CHECK_REFUSED:
+            return r;
+        default:
+            return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
+}
+
+// The planned state term the backend holds for one device (llama.cpp-p6i0). False is "not read", and a null proc or a
+// null out reads as it, writing nothing: the context-init comparison then compares nothing for the device.
+inline bool llama_sycl_l4_planned_state_term(const llama_sycl_l4_procs & procs, int32_t device, uint64_t * out) {
+    if (procs.planned_state == nullptr || out == nullptr) {
+        return false;
+    }
+    return procs.planned_state(device, out);
+}
+
+// The reservation's units of one measured device's chunks (llama.cpp-p6i0). False is "not sized", and a null proc
+// reads as it: the admitted check then refuses the load by name rather than compare raw sums with a reservation.
+inline bool llama_sycl_l4_compute_term_bytes(const llama_sycl_l4_procs & procs,
+                                             const std::vector<size_t> & chunk_bytes,
+                                             size_t *                    out) {
+    if (procs.term_bytes == nullptr || out == nullptr || chunk_bytes.size() > UINT32_MAX) {
+        return false;
+    }
+    const std::vector<uint64_t> chunks(chunk_bytes.begin(), chunk_bytes.end());
+    uint64_t                    bytes = 0;
+    if (!procs.term_bytes(chunks.data(), static_cast<uint32_t>(chunks.size()), &bytes) ||
+        static_cast<uint64_t>(static_cast<size_t>(bytes)) != bytes) {
+        return false;
+    }
+    *out = static_cast<size_t>(bytes);
+    return true;
+}
+
 // The residency probe's one door: no other code calls the proc pointer or the symbol
 // (scripts/check-sycl-l4-proc-registration.py pins it). NOT_ANSWERED is the answer to anything this reader cannot
 // vouch for: a null proc, and a value outside the enum (a newer backend's status is not "OK" to an older reader).
@@ -156,6 +279,9 @@ struct llama_tenant_buft_caps {
     size_t              max_chunk_size = 0;  // the largest chunk the buft's allocator allowed
     std::vector<size_t> chunk_bytes;         // the peak of each chunk over the measured graphs
     size_t              total = 0;           // their sum
+    // A device buft only (llama.cpp-p6i0): the context memory the context placed in this buffer type (a hybrid or
+    // recurrent model's state), which the backend allocates RUNTIME-first outside the compute scope.
+    size_t              state_bytes = 0;
 };
 
 // A buft's compute term from the peaks each measured graph left in each chunk (`peaks[g][c]`): the peak of
