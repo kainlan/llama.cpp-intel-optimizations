@@ -2,7 +2,6 @@
   "schema": 1,
   "_doc": "Read by scripts/check-sycl-alloc-zone-contract.py (clauses a-h and q; no clause (i)-(p) finding may be debt). Shrink-only: a violation not listed fails, and a listed entry that no longer violates fails. Every E-RAW and E-LIBC entry carries a fate (deleted-by-*, converted-by-*, sanctioned-internal, sanctioned-vendored or pending-disposition) and a cite, so an entry no step will ever shrink is visible as a mislabelled allowlist entry; the one G-CATCH entry for the CHECK_TRY_ERROR macro carries converted-by-5.4a and no other fate. Regenerate with `python3 scripts/check-sycl-alloc-zone-contract.py --write-debt` (it refuses to add entries); see README.md.",
   "violations": [
-    {"code": "B-BRACE", "key": "cpu-expert-pool.cpp::CpuExpertPool::init::declaration:c:49299edc#0"},
     {"code": "B-BRACE", "key": "ggml-sycl.cpp::ggml_sycl_attn_host_staging_get::declaration:c:e2526092#0"},
     {"code": "B-BRACE", "key": "ggml-sycl.cpp::ggml_sycl_attn_host_staging_get::declaration:c:e2526092#1"},
     {"code": "B-BRACE", "key": "ggml-sycl.cpp::ggml_sycl_attn_host_staging_get::declaration:c:e2526092#2"},

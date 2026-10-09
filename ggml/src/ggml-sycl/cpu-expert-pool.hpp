@@ -7,8 +7,6 @@
 #pragma once
 
 #include "cpu-dispatch.hpp"
-#include "mem-handle.hpp"
-#include "unified-cache.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -22,14 +20,14 @@
 namespace ggml_sycl {
 
 // Persistent thread pool for CPU expert computation.
-// Replaces per-call std::async with pre-spawned workers and ring-buffered
-// staging slots to avoid per-token allocation overhead.
+// Replaces per-call std::async with pre-spawned workers.
 //
 // Thread count default: hardware_concurrency - 2 (reserve for GPU driver).
 // Override: GGML_SYCL_CPU_EXPERT_THREADS=N
 //
-// Ring buffer provides RING_SLOTS pre-allocated staging slots (pinned host
-// memory via unified_alloc) for activation inputs and output buffers.
+// The pool owns threads and a work queue, no memory. CPU expert staging comes
+// from the PinnedBufferPool, with a per-dispatch managed fallback
+// (llama.cpp-sfal).
 class CpuExpertPool {
   public:
     CpuExpertPool() = default;
@@ -41,14 +39,10 @@ class CpuExpertPool {
     CpuExpertPool & operator=(CpuExpertPool &&)      = delete;
 
     // Initialize the pool. Must be called once (e.g. from moe_hybrid_init_once).
-    //   n_threads:    worker thread count (0 = auto: hardware_concurrency - 2)
-    //   max_experts:  max expert dispatches per MUL_MAT_ID (for ring sizing)
-    //   act_dim:      activation vector dimension (floats)
-    //   out_dim:      output vector dimension (floats)
-    //   q:            SYCL queue for pinned host allocation
-    void init(int n_threads, size_t max_experts, size_t act_dim, size_t out_dim, sycl::queue & q);
+    //   n_threads: worker thread count (0 = auto: hardware_concurrency - 2)
+    void init(int n_threads);
 
-    // Shut down all workers and free ring buffer memory.
+    // Shut down all workers.
     void shutdown();
 
     // Submit a batch of CPU expert tasks. Takes ownership of the tasks
@@ -59,23 +53,13 @@ class CpuExpertPool {
     // overwrote / moved / destroyed the backing vector.
     std::future<void> submit_batch(std::vector<cpu_expert_task> tasks);
 
-    // Ring buffer: acquire a staging slot for up to max_experts_ experts.
-    struct StagingSlot {
-        float * act     = nullptr;  // Activation input buffer (pinned host)
-        float * out     = nullptr;  // Output buffer (pinned host)
-        int     slot_id = -1;
-    };
-
-    StagingSlot acquire_staging();
-    void        release_staging(int slot_id);
-
     bool is_active() const { return active_.load(std::memory_order_acquire); }
 
   private:
     void worker_thread();
     // Signal and join the workers. Touches no unified-cache state, so it is
-    // safe during static destruction; shutdown() does this and then releases
-    // the ring buffer.
+    // safe during static destruction; shutdown() does this and then marks the
+    // pool inactive.
     void stop_workers();
 
     std::vector<std::thread>          threads_;
@@ -84,22 +68,32 @@ class CpuExpertPool {
     std::condition_variable           cv_;
     std::atomic<bool>                 active_{ false };
     std::atomic<bool>                 shutting_down_{ false };
-
-    // Ring buffer for staging memory
-    static constexpr int RING_SLOTS = 4;
-
-    struct RingEntry {
-        float * act    = nullptr;
-        float * out    = nullptr;
-        bool    in_use = false;
-    };
-
-    RingEntry  ring_[RING_SLOTS] = {};
-    std::mutex ring_mutex_;
-    size_t     act_stride_  = 0;  // floats per expert activation
-    size_t     out_stride_  = 0;  // floats per expert output
-    size_t     max_experts_ = 0;
-    mem_handle ring_handle_;      // Single unified_alloc-backed owner for all ring buffers
 };
+
+// Totals over every pool's jobs since the last take (llama.cpp-b2jc), kept
+// only while ggml_sycl_cpu_expert_trace_enabled(). The decode wait census
+// takes them once per token. Times are sums over jobs:
+//   wake     submit to a worker starting the job
+//   quant/setup/fanout/compute  the job's batched-kernel phases
+//   wall     submit to the job's result being published
+// joins counts submitting-thread joins of a pool job; joins_ready the ones
+// that found the job already finished.
+struct cpu_expert_pool_trace_totals {
+    uint64_t jobs        = 0;
+    uint64_t tasks       = 0;
+    uint64_t rows        = 0;
+    uint64_t threads     = 0;
+    uint64_t joins       = 0;
+    uint64_t joins_ready = 0;
+    double   wake_us     = 0.0;
+    double   quant_us    = 0.0;
+    double   setup_us    = 0.0;
+    double   fanout_us   = 0.0;
+    double   compute_us  = 0.0;
+    double   wall_us     = 0.0;
+};
+
+void cpu_expert_pool_trace_take(cpu_expert_pool_trace_totals & out);
+void cpu_expert_pool_trace_note_join(bool was_ready);
 
 }  // namespace ggml_sycl

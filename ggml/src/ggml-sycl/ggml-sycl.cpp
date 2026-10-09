@@ -2661,7 +2661,7 @@ static void ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_m
 #include "ggml-sycl/moe-discovery-state.hpp"
 // Owner-keyed ownership for the MoE expert-bias and fused-activation cluster
 #include "ggml-sycl/moe-bias-state.hpp"
-// Persistent CPU expert thread pool with ring-buffered staging
+// Persistent CPU expert thread pool
 #include "ggml-sycl/cpu-expert-pool.hpp"
 // TKV-13 (B2): dedicated persistent thread pool for demoted-layer attention.
 // Its OWN class, not a CpuExpertPool generalization (owner ruling
@@ -9396,8 +9396,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     // via GGML_SYCL_CPU_EXPERT_THREADS=N.
     if (max_K > 0 && max_N > 0 && max_dispatch_count > 0) {
         auto & cpu_pool = g_cpu_expert_pools[device];
-        cpu_pool.init(0 /* auto thread count */, static_cast<size_t>(max_dispatch_count), static_cast<size_t>(max_K),
-                      static_cast<size_t>(max_N), q);
+        cpu_pool.init(0 /* auto thread count */);
     }
 
     // -----------------------------------------------------------------------
@@ -23966,6 +23965,17 @@ static void moe_hostpath_waits_readback(int layer) {
         }
         GGML_LOG_WARN("[MOE-HOSTPATH-WAITS] token=%llu readbacks=%d%s total=%llu/%.0fus\n",
                       (unsigned long long) w.token, w.readbacks, line, (unsigned long long) total_n, total_us);
+        // The same token's CpuExpertPool jobs (llama.cpp-b2jc): how many, and where each
+        // job's time went between its submit and its result.
+        ggml_sycl::cpu_expert_pool_trace_totals pt;
+        ggml_sycl::cpu_expert_pool_trace_take(pt);
+        GGML_LOG_WARN(
+            "[CPU-EXPERT-POOL-TRACE] token=%llu jobs=%llu tasks=%llu rows=%llu threads=%llu wake=%.0fus "
+            "quant=%.0fus setup=%.0fus fanout=%.0fus compute=%.0fus wall=%.0fus joins=%llu joins_ready=%llu\n",
+            (unsigned long long) w.token, (unsigned long long) pt.jobs, (unsigned long long) pt.tasks,
+            (unsigned long long) pt.rows, (unsigned long long) pt.threads, pt.wake_us, pt.quant_us, pt.setup_us,
+            pt.fanout_us, pt.compute_us, pt.wall_us, (unsigned long long) pt.joins,
+            (unsigned long long) pt.joins_ready);
         for (int c = 0; c < MOE_WAIT_COUNT; ++c) {
             w.count[c] = 0;
             w.us[c]    = 0.0;
@@ -25460,6 +25470,10 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
     try {
         // Wait for CPU compute to finish
         if (slot.future.valid()) {
+            if (moe_hostpath_waits_enabled()) {
+                ggml_sycl::cpu_expert_pool_trace_note_join(slot.future.wait_for(std::chrono::seconds(0)) ==
+                                                           std::future_status::ready);
+            }
             moe_hostpath_wait_timer wait_timer(MOE_WAIT_JOIN, slot.dst_tensor);
             slot.future.get();
         }
@@ -88546,10 +88560,11 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     // thread is a global resource tied to split config; it self-terminates
     // via static destructor at program exit.
     // Shut down ExpertPrefetcher, CpuExpertPool and PinnedBufferPool instances
-    // while the unified cache and SYCL context are still alive.  All pools use
-    // unified_alloc for their VRAM buffers; if we leave this to the static
-    // destructor, the unified cache statics may already be destroyed → SIGSEGV
-    // or BCS CAT error (in-flight DMA targeting freed VRAM).
+    // while the unified cache and SYCL context are still alive.  The
+    // ExpertPrefetcher and PinnedBufferPool hold unified-cache allocations; if
+    // we leave them to the static destructor, the unified cache statics may
+    // already be destroyed → SIGSEGV or BCS CAT error (in-flight DMA targeting
+    // freed VRAM).  CpuExpertPool holds no memory, only workers to join.
     // shutdown() is idempotent and a no-op for pools that were never started.
     // ExpertPrefetcher must be shut down first: cancel_all() waits for
     // in-flight BCS DMAs whose destinations are VRAM owned by the unified
@@ -116541,7 +116556,7 @@ static bool ggml_backend_sycl_test_seed_global_runtime_pinned_owners() {
     auto & q = ggml_sycl_get_device(0).default_queue();
     g_expert_prefetchers[0].init(q);
     g_pinned_buffer_pools[0].init(q, 0, 2, 4, 4);
-    g_cpu_expert_pools[0].init(1, 2, 4, 4, q);
+    g_cpu_expert_pools[0].init(1);
     void * staging = ggml_sycl_staging_pool().acquire(256, q);
     if (!staging) {
         return false;
