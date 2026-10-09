@@ -948,8 +948,7 @@ static std::vector<uint8_t> qwen38_attention_mask() {
 }
 
 static void test_qwen38_indexer_keys_budgeted_and_sized_per_buffer() {
-    printf("(p) Qwen3.8: budgets add the indexer keys; each of the two buffers is sized from its own cache
-");
+    printf("(p) Qwen3.8: budgets add the indexer keys; each of the two buffers is sized from its own cache\n");
     const size_t mib = 1024u * 1024u;
 
     placement_kv_info kv = make_qwen38(262144, 256);
