@@ -116018,8 +116018,12 @@ static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device) 
         }
     }
 
+    // Only a host MUL_MAT producer keeps a GLU or ADD_ID on the CPU backend; a
+    // MUL_MAT_ID's output is device memory even when its experts are on the host
+    // (moe_glu_input_host_produced).
     if ((op->op == GGML_OP_ADD_ID || op->op == GGML_OP_GLU) &&
-        ggml_sycl_tensor_depends_on_planned_host_weight(op, device)) {
+        ggml_sycl::moe_glu_input_host_produced(
+            op, [device](const ggml_tensor * w) { return ggml_sycl_weight_executes_on_host(w, device); })) {
         if (ggml_sycl_moe_multi_gpu_for_executor() && op->op == GGML_OP_GLU) {
             return n04bq_tr_final(false, "multi_gpu_moe_glu");
         }

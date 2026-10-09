@@ -38,8 +38,8 @@
 
     {"id": "MOE-MMID", "op": "MUL_MAT_ID", "expect": "SYCL", "verdict": "SUPPORTED", "count": 144,
      "cite": "residency-blind MUL_MAT_ID admission, Q8_0 in the MMID tables (:108134-108176, ggml-sycl/moe-mmvq-tables.hpp:78); host experts run in the backend's CpuExpertPool, which the scheduler dump cannot see"},
-    {"id": "MOE-GLU", "op": "SWIGLU", "expect": "SYCL", "verdict": "PLACEMENT",
-     "cite": "GLU f32 contiguous_1 (:108244-108269); declined by addid_glu_depends_host (:109207) for a layer whose experts the planner put on the host, so CPU here is a placement outcome, not a capability gap"},
+    {"id": "MOE-GLU", "op": "SWIGLU", "expect": "SYCL", "verdict": "SUPPORTED",
+     "cite": "GLU f32 contiguous_1; a host-expert MUL_MAT_ID writes device memory, so its GLU stays on SYCL (moe_glu_input_host_produced, llama.cpp-z4kd); only a host dense MUL_MAT producer keeps a GLU on the CPU"},
     {"id": "MOE-ARGSORT", "op": "ARGSORT", "expect": "SYCL", "verdict": "SUPPORTED", "count": 48,
      "cite": "ARGSORT while ne0*sizeof(int) <= smpbo (:108681-108682); 512 experts = 2 KiB"},
     {"id": "MOE-SOFTMAX", "op": "SOFT_MAX", "expect": "SYCL", "verdict": "SUPPORTED", "count": 48,

@@ -338,10 +338,74 @@ static int test_sibling_pending() {
     return 0;
 }
 
+// GLU placement: only a host MUL_MAT producer is host-produced; a MUL_MAT_ID is device-produced
+// and ends the walk (llama.cpp-z4kd).  Plain tensors, no context: the walk reads op and src only.
+static int test_glu_input_host_produced() {
+    ggml_tensor host_w{};
+    ggml_tensor dev_w{};
+    ggml_tensor act{};
+    act.op = GGML_OP_NONE;
+
+    auto on_host = [&](const ggml_tensor * w) {
+        return w == &host_w;
+    };
+
+    // A dense FFN whose gate/up weights are on the host: GLU follows its producers.
+    ggml_tensor gate{};
+    gate.op     = GGML_OP_MUL_MAT;
+    gate.src[0] = &host_w;
+    gate.src[1] = &act;
+    ggml_tensor glu{};
+    glu.op     = GGML_OP_GLU;
+    glu.src[0] = &gate;
+    CHECK(ggml_sycl::moe_glu_input_host_produced(&glu, on_host), "a GLU fed by a host MUL_MAT is host-produced");
+
+    // The same with device weights.
+    gate.src[0] = &dev_w;
+    CHECK(!ggml_sycl::moe_glu_input_host_produced(&glu, on_host), "a GLU fed by a device MUL_MAT is not host-produced");
+
+    // A MoE layer whose experts are on the host: the MUL_MAT_ID writes device memory.
+    ggml_tensor mmid{};
+    mmid.op     = GGML_OP_MUL_MAT_ID;
+    mmid.src[0] = &host_w;
+    mmid.src[1] = &act;
+    glu.src[0]  = &mmid;
+    CHECK(!ggml_sycl::moe_glu_input_host_produced(&glu, on_host),
+          "a GLU fed by a host-expert MUL_MAT_ID is not host-produced");
+
+    // A host MUL_MAT upstream of the MUL_MAT_ID's activation is behind it, so it does not count.
+    ggml_tensor up_proj{};
+    up_proj.op     = GGML_OP_MUL_MAT;
+    up_proj.src[0] = &host_w;
+    up_proj.src[1] = &act;
+    mmid.src[0]    = &dev_w;
+    mmid.src[1]    = &up_proj;
+    CHECK(!ggml_sycl::moe_glu_input_host_produced(&glu, on_host), "the walk does not descend through a MUL_MAT_ID");
+
+    // Through an elementwise op, a host MUL_MAT still counts (the dense case keeps its reach).
+    ggml_tensor scale{};
+    scale.op     = GGML_OP_MUL;
+    scale.src[0] = &up_proj;
+    scale.src[1] = &act;
+    glu.src[0]   = &scale;
+    CHECK(ggml_sycl::moe_glu_input_host_produced(&glu, on_host), "a host MUL_MAT behind an elementwise op counts");
+
+    // An ADD_ID after a host-expert MUL_MAT_ID (bias add) is not host-produced either.
+    mmid.src[0] = &host_w;
+    mmid.src[1] = &act;
+    ggml_tensor add_id{};
+    add_id.op     = GGML_OP_ADD_ID;
+    add_id.src[0] = &mmid;
+    CHECK(!ggml_sycl::moe_glu_input_host_produced(&add_id, on_host),
+          "an ADD_ID fed by a host-expert MUL_MAT_ID is not host-produced");
+    return 0;
+}
+
 int main() {
     if (test_direct_request() != 0 || test_direct_stamp() != 0 || test_direct_layout() != 0 ||
         test_direct_retry_cap() != 0 || test_pool_ring() != 0 || test_gather_runs() != 0 ||
-        test_shared_activation() != 0 || test_shared_act_sibling() != 0 || test_sibling_pending() != 0) {
+        test_shared_activation() != 0 || test_shared_act_sibling() != 0 || test_sibling_pending() != 0 ||
+        test_glu_input_host_produced() != 0) {
         return 1;
     }
     std::printf("OK: moe decode host path decisions\n");

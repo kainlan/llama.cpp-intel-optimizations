@@ -15,8 +15,11 @@
 // SYCL-free on purpose so tests/test-sycl-moe-decode-hostpath.cpp can run it
 // without a device.
 
+#include "ggml.h"
+
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace ggml_sycl {
@@ -270,6 +273,50 @@ inline bool moe_sibling_pending_keep(const moe_sibling_pending_request & r) {
         return true;  // one side owns separate buffers
     }
     return r.same_row_geometry && moe_pool_spans_disjoint(r.pending_first, r.pending_count, r.op_first, r.op_count);
+}
+
+// Where a GLU or ADD_ID runs follows where its input was produced.  The input
+// is host-produced when, within 8 levels, it comes from a MUL_MAT whose weight
+// executes on the host: that MUL_MAT runs on the CPU backend, so the GLU stays
+// there with it.  A MUL_MAT_ID ends the walk and counts as device-produced, host
+// experts or not: this backend always admits it and writes its output to device
+// memory (the host experts' rows arrive by the scatter H2D).  Counting it as a
+// host producer moved the GLU of every host-expert layer to the CPU backend,
+// which costs two scheduler copies and two split boundaries per layer.  The
+// split also starts the down projection in a new graph_compute, whose entry
+// clears the per-layer ids cache, so down read the expert ids back a second
+// time (llama.cpp-z4kd).
+inline bool moe_glu_input_walk(const ggml_tensor *                              t,
+                               const std::function<bool(const ggml_tensor *)> & weight_on_host,
+                               int                                              depth,
+                               std::vector<const ggml_tensor *> &               visited) {
+    if (!t || depth > 8) {
+        return false;
+    }
+    for (const ggml_tensor * v : visited) {
+        if (v == t) {
+            return false;
+        }
+    }
+    visited.push_back(t);
+    if (t->op == GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    if (t->op == GGML_OP_MUL_MAT && t->src[0] != nullptr && weight_on_host(t->src[0])) {
+        return true;
+    }
+    for (int s = 0; s < GGML_MAX_SRC && t->src[s] != nullptr; ++s) {
+        if (moe_glu_input_walk(t->src[s], weight_on_host, depth + 1, visited)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline bool moe_glu_input_host_produced(const ggml_tensor *                              op,
+                                        const std::function<bool(const ggml_tensor *)> & weight_on_host) {
+    std::vector<const ggml_tensor *> visited;
+    return moe_glu_input_walk(op, weight_on_host, 0, visited);
 }
 
 }  // namespace ggml_sycl
