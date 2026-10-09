@@ -355,9 +355,10 @@ struct ggml_sycl_tensor_inventory {
     // indexer cache: libllama always passes the array, zero for every memory without one.
     // It is a second KV buffer over the same cells as the layer's K/V, kept apart from kv_k_width_per_layer so every
     // budget adds both while the allocator sizes each buffer from its own cache. Appended: the struct grew from 176
-    // to 184 bytes, which ggml-sycl.cpp pins with static_asserts. The inventory is one struct passed by pointer, never
-    // an array indexed across the dlopen boundary, but a stale libllama would leave these 8 bytes unwritten, so
-    // libllama and libggml-sycl must be rebuilt together.
+    // to 184 bytes, which ggml-sycl.cpp pins with static_asserts. The struct carries no size field, so a libllama
+    // built before this field passes a 176-byte object: libggml-sycl then reads these 8 bytes past the end of the
+    // caller's object, and with kv_layer_count > 0 dereferences whatever lies there as an array of kv_layer_count
+    // widths. libllama and libggml-sycl must be rebuilt together.
     const uint32_t *               kv_idx_k_width_per_layer;
 };
 
