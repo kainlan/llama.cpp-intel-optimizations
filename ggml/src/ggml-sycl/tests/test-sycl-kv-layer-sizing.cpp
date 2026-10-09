@@ -1014,6 +1014,7 @@ static void test_qwen38_indexer_keys_budgeted_and_sized_per_buffer() {
         kv_tier_manager   mgr;
         mgr.configure_from_plan(0, plan, kv.n_layer, kv_slice_size::from_layer_mask(12u * 512 * mib, 12), &mask);
         setenv("GGML_SYCL_KV_HOT_LAYERS", "48", 1);
+        g_log.clear();
         mgr.configure_from_plan(0, plan, kv.n_layer, kv_slice_size::from_layer_mask(12u * 64 * mib, 12), &mask);
         if (prior != nullptr) {
             setenv("GGML_SYCL_KV_HOT_LAYERS", prior_val.c_str(), 1);
@@ -1023,6 +1024,11 @@ static void test_qwen38_indexer_keys_budgeted_and_sized_per_buffer() {
         check_eq("qwen38: under GGML_SYCL_KV_HOT_LAYERS the indexer buffer is sized from its own cache",
                  mgr.kv_layer_size(3), 64 * mib);
         check_eq("qwen38: and a recurrent layer still holds none of it", mgr.kv_layer_size(0), 0u);
+        // Positive control: the override bound (all 48 layers hot), so a renamed variable or a parse change fails
+        // here rather than leaving the sizing checks above to pass on the planned placement. 12 x 64 MiB on device.
+        check_true("qwen38: the override placed all 48 layers on the device, 768 MB of indexer keys",
+                   g_log.find("[KV-TIER] Plan-driven (env override): 48/48 layers on device (sizing=per-layer, "
+                              "768.0 MB device, 0.0 MB host)") != std::string::npos);
     }
 }
 
