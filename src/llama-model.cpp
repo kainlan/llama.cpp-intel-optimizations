@@ -2645,6 +2645,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t.reserved ? "reserved in RUNTIME" : "NOT reserved (the backend said why), not compared",
                     t.admitted_term / 1024.0 / 1024.0, admitted.n_recorded, admitted.terms.size(), admitted.n_ctx,
                     admitted.n_ubatch, (long long) probe_ms, (long long) admitted_ms);
+                if (t.kv_excess != 0) {
+                    LLAMA_LOG_WARN(
+                        "%s: [LOAD-PLAN] compute slot on device %d: admitted %.1f MiB exceeds the probe bound by %.1f "
+                        "MiB because the KV residency moved between the measures (probe %u device / %u host / %u "
+                        "CPU layers, admitted %u / %u / %u); the excess is not reserved and can land outside the "
+                        "RUNTIME zone\n",
+                        __func__, (int) t.device, t.admitted_term / 1024.0 / 1024.0, t.kv_excess / 1024.0 / 1024.0,
+                        admitted.probe_kv.n_device, admitted.probe_kv.n_host, admitted.probe_kv.n_cpu,
+                        admitted.admitted_kv.n_device, admitted.admitted_kv.n_host, admitted.admitted_kv.n_cpu);
+                }
             }
         }
 

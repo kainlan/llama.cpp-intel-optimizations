@@ -5,6 +5,7 @@
 #include "ggml.h"
 #include "llama-auto-ubatch.h"
 #include "llama-context-tenant.h"
+#include "llama-kv-cache.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -244,6 +245,7 @@ struct llama_load_measure_result {
     std::string                            refusal;              // the named refusal when !ok
     std::vector<llama_load_measure_device> devices;
     int                                    n_splits = 0;         // the most splits any measured graph took
+    llama_kv_residency_tally               kv;                   // the KV residency of the caches the measure built
     // llama.cpp-p6i0 (the compute trace): the measure's per-buffer-type, per-graph chunk peaks and splits, its
     // shape and its KV residency, as INFO lines. The measure-only context is quiet while it lives, so
     // llama_load_measure prints them once the context is gone.
@@ -356,6 +358,7 @@ struct llama_load_probe_result {
     bool                                   measured = false;
     std::vector<llama_load_measure_device> devices;      // C-hat per device when measured
     std::vector<int32_t>                   not_reserved;  // SYCL devices the backend declined to reserve for
+    llama_kv_residency_tally               kv;            // the probe measure's KV residency (the admitted fold's)
 };
 
 // The probe's reservations (llama.cpp-p6i0), per measured SYCL device and in order: its state term first, when the
@@ -395,7 +398,19 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
 // units (ggml_backend_sycl_load_compute_term_bytes: each chunk at the RUNTIME allocator's grain, summed), so the
 // comparison is the one the reservation can honour, not one between raw sums. c(P) <= C-hat is admitted and c(P),
 // never C-hat, is what the ledger records for the late check to compare; c(P) > C-hat, a device with no probe bound,
-// or a term the backend cannot size refuses the load by name. A device the backend declined to reserve for
+// or a term the backend cannot size refuses the load by name.
+//
+// The one exception is the KV-residency delta. The probe re-fits the KV residency for the room the zones leave
+// before the term is carved; the admitted measure re-fits it after RUNTIME grew by the term and the late plan packed
+// the weights. Neither room is guaranteed larger, so KV layers can move between device, host and CPU from one measure
+// to the other, and the compute graph moves with them: C-hat does not bound c(P) then, and no monotone bound exists
+// (a graph's peak is not monotone in placement; GPT-OSS on the B50 moved two KV layers to the host and c(P) stayed
+// equal). So c(P) > C-hat with a residency that moved is admitted, its excess in the reservation's units named on the
+// term (`kv_excess`) for the loader's WARN, and c(P) is recorded as usual. The excess is not reserved: the arena is
+// already packed, and that part of the compute buffer can land outside the RUNTIME zone, as every byte of it did
+// before the reservation existed. With an unmoved residency the growth is a planning defect and still refuses.
+//
+// A device the backend declined to reserve for
 // (`not_reserved`) has no reservation to compare with: it is listed, not compared and not recorded, so its compute
 // buffer stays unplanned and its late check answers NOT_RECORDED, as before the reservation existed. The host tier
 // is skipped, as in the late fold.
@@ -405,6 +420,7 @@ struct llama_admitted_term {
     size_t  probe_term     = 0;     // C-hat in the reservation's units: the room the pack left
     size_t  admitted_term  = 0;     // c(P) in the reservation's units, compared with probe_term
     size_t  admitted_bytes = 0;     // c(P) as the measure's total: what the ledger records and the late check compares
+    size_t  kv_excess      = 0;     // admitted_term - probe_term, admitted because the KV residency moved; unreserved
 };
 
 struct llama_admitted_check_result {
@@ -414,17 +430,28 @@ struct llama_admitted_check_result {
     uint32_t                         n_ctx      = 0;  // the n_ctx and ubatch the measure ran at
     uint32_t                         n_ubatch   = 0;
     size_t                           n_recorded = 0;  // the terms the backend recorded
+    llama_kv_residency_tally         probe_kv;        // the KV residency each measure saw
+    llama_kv_residency_tally         admitted_kv;
 };
+
+inline bool llama_kv_residency_same(const llama_kv_residency_tally & a, const llama_kv_residency_tally & b) {
+    return a.n_device == b.n_device && a.n_host == b.n_host && a.n_cpu == b.n_cpu;
+}
 
 inline llama_admitted_check_result llama_admitted_check_fold(const llama_sycl_l4_procs &                    procs,
                                                              const std::vector<llama_load_measure_device> & probe,
                                                              const std::vector<int32_t> & not_reserved,
                                                              const std::vector<llama_load_measure_device> & admitted,
                                                              uint32_t                                       n_ctx,
-                                                             uint32_t                                       n_ubatch) {
+                                                             uint32_t                                       n_ubatch,
+                                                             const llama_kv_residency_tally &               probe_kv,
+                                                             const llama_kv_residency_tally & admitted_kv) {
     llama_admitted_check_result out;
-    out.n_ctx    = n_ctx;
-    out.n_ubatch = n_ubatch;
+    out.n_ctx           = n_ctx;
+    out.n_ubatch        = n_ubatch;
+    out.probe_kv        = probe_kv;
+    out.admitted_kv     = admitted_kv;
+    const bool kv_moved = !llama_kv_residency_same(probe_kv, admitted_kv);
     const auto refuse = [&](int32_t device, const std::string & why) {
         out.refusal = "[LOAD-PLAN] compute-slot-exceeds-probe-bound on device " + std::to_string(device) + ": " + why +
                       " at n_ctx " + std::to_string(n_ctx) + " ubatch " + std::to_string(n_ubatch) + " (refused)";
@@ -456,9 +483,12 @@ inline llama_admitted_check_result llama_admitted_check_fold(const llama_sycl_l4
             return out;
         }
         if (t.reserved && t.admitted_term > t.probe_term) {
-            refuse(d.device, "c(P) " + std::to_string(t.admitted_term) + " B > probe bound C-hat " +
-                                 std::to_string(t.probe_term) + " B in the reservation's units");
-            return out;
+            if (!kv_moved) {
+                refuse(d.device, "c(P) " + std::to_string(t.admitted_term) + " B > probe bound C-hat " +
+                                     std::to_string(t.probe_term) + " B in the reservation's units");
+                return out;
+            }
+            t.kv_excess = t.admitted_term - t.probe_term;
         }
         out.terms.push_back(t);
     }

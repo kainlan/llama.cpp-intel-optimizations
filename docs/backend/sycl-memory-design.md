@@ -2768,7 +2768,16 @@ shared zone, and the buffer took whatever the allocator found. On the B70 with Q
   with C-hat in the reservation's units: both are sized by `ggml_backend_sycl_load_compute_term_bytes`, the reserve's
   own rule, not as raw sums. c(P) above C-hat, or a device with no probe bound, refuses the load as
   `compute-slot-exceeds-probe-bound`. Otherwise c(P) is recorded in the load's ledger, and the **late** check compares
-  the final placement against it. A device the backend declined to reserve for is not compared and not recorded: its
+  the final placement against it.
+- One growth is admitted: the **KV-residency delta**. The probe re-fits the KV residency for the room left before the
+  term is carved, and the admitted measure re-fits it after RUNTIME grew by the term and the weights were packed, so
+  KV layers can move between device, host and CPU from one measure to the other, and the compute graph moves with
+  them. A graph's peak is not monotone in placement, so C-hat cannot be proven to bound c(P) then. GPT-OSS on the B50
+  moved from 3 device and 21 host KV layers at the probe to 1 and 23 at the admitted stage, and its 404.0 MiB term did
+  not change. When the residencies differ, c(P) above C-hat is admitted and recorded, and the loader WARNs
+  `compute slot on device N: admitted X MiB exceeds the probe bound by Y MiB because the KV residency moved`. That
+  excess is not reserved, because the arena is already packed, so that part of the buffer can land outside RUNTIME.
+  With the same residency on both sides, growth is still refused. A device the backend declined to reserve for is not compared and not recorded: its
   compute buffer stays unplanned, as before p6i0.
 - A late check that matches prints one WARN per device and load:
   `[LOAD-PLAN] late check on device N: compute term equal (X MiB), early reservation stands`. A pass that printed

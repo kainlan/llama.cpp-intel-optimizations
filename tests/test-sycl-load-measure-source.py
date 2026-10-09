@@ -283,6 +283,8 @@ def probe_ok(code: str) -> bool:
         and pos == sorted(pos)
         and z("out.devices = measured.devices;") in b
         and z("out.measured = true;") in b
+        # the admitted fold compares the residency the probe saw with its own
+        and z("out.kv = measured.kv;") in b
         and b.count(z("llama_load_probe_reserve(")) == 1
         # every reservation goes through the helper, so its order cannot be bypassed here
         and "reserve_compute_term" not in b
@@ -311,6 +313,8 @@ def admit_ok(code: str) -> bool:
     return (
         -1 not in pos
         and pos == sorted(pos)
+        # the KV-residency delta is judged on the residencies the two measures saw, probe first
+        and z("measured_n_ctx, n_ubatch, probe.kv, measured.kv);") in b
         and b.count(z("llama_admitted_record(")) == 1
         and "GGML_SYCL_MEASURE_STAGE_PROBE" not in b
         and "GGML_SYCL_MEASURE_STAGE_CANDIDATE_C" not in b
@@ -659,6 +663,7 @@ def test_probe_mutants():
         ("measured at the admitted stage", "GGML_SYCL_MEASURE_STAGE_PROBE)", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_B)"),
         ("no reservation", "out.not_reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);", "(void) measured_n_ctx;"),
         ("the envelope's n_ctx reserved", "llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx)", "llama_load_probe_reserve(procs, txn, measured.devices, n_ctx)"),
+        ("the probe's residency not kept", "out.kv = measured.kv;", ""),
         ("the declined devices dropped", "out.not_reserved = llama_load_probe_reserve(", "(void) llama_load_probe_reserve("),
         ("the compute term reserved past the helper", "out.not_reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);", "out.not_reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);\n    (void) llama_sycl_l4_reserve_compute_term(procs, txn, measured.devices[0], measured_n_ctx);"),
         ("no proc gate", "if (!procs.load_terms_available())", "if (false)"),
@@ -682,6 +687,8 @@ def test_admit_mutants():
         ("the fold bypassed", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, measured.devices,", "llama_admitted_check_fold(procs, measured.devices, probe.not_reserved, measured.devices,"),
         ("the admitted stage reserves", "    if (!out.refusal.empty()) {\n        return out;\n    }", "    (void) llama_sycl_l4_reserve_compute_term(procs, txn, measured.devices[0], measured_n_ctx);\n    if (!out.refusal.empty()) {\n        return out;\n    }"),
         ("unreserved devices compared", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, measured.devices,", "llama_admitted_check_fold(procs, probe.devices, {}, measured.devices,"),
+        ("the residencies swapped", "probe.kv, measured.kv);", "measured.kv, probe.kv);"),
+        ("the probe's residency judged against itself", "probe.kv, measured.kv);", "probe.kv, probe.kv);"),
         ("the admitted stage reserves state", "    if (!out.refusal.empty()) {\n        return out;\n    }", "    (void) llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);\n    if (!out.refusal.empty()) {\n        return out;\n    }"),
     ]:
         assert not admit_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"

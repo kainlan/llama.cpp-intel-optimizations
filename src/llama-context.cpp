@@ -3996,6 +3996,7 @@ llama_load_measure_result llama_load_measure_run(const llama_model &            
         out.devices.push_back(std::move(d));
     }
     out.n_splits = holder->get_measure_plan().n_splits_max;
+    out.kv       = kv_tally;
 
     out.trace = llama_load_measure_trace(holder->get_measure_plan(), stage, holder->n_ctx(), holder->n_ubatch(),
                                          holder->n_seq_max(), kv_tally);
@@ -4092,7 +4093,9 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
         return out;
     }
     out.devices  = measured.devices;
+    out.kv       = measured.kv;
     out.measured = true;
+
     const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
     // each SYCL device's state term, then its compute term; a declined device's compute buffer stays unplanned
     out.not_reserved              = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);
@@ -4139,8 +4142,8 @@ llama_admitted_check_result llama_load_admitted_check(const llama_model &       
     const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
     const uint32_t n_ubatch       = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train).n_ubatch;
 
-    out =
-        llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, measured.devices, measured_n_ctx, n_ubatch);
+    out = llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, measured.devices, measured_n_ctx,
+                                    n_ubatch, probe.kv, measured.kv);
     if (!out.refusal.empty()) {
         return out;
     }
