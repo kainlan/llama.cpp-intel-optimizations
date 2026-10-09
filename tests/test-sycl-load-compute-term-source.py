@@ -292,13 +292,18 @@ def test_the_term_is_dropped_where_no_model_is_live():
 # ---- mutants: every claim must fail against the thing it forbids --------------------------------------------------
 
 
-def _once(raw: str, old: str, new: str) -> str:
-    assert raw.count(old) >= 1, f"mutant anchor not found: {old!r}"
-    return raw.replace(old, new, 1)
+def _once(raw: str, old: str, new: str, within: str = "") -> str:
+    """The mutant: `old` replaced by `new` in the source, all three compared as norm() text so a clang-format re-wrap
+    of the source moves no anchor. The anchor must match exactly once, in the body of `within` when it is given (for
+    an anchor the file repeats), else in the whole file. The claims norm() their input, so they read the result."""
+    text, o, n = norm(raw), norm(old), norm(new)
+    scope = body(text, within) if within else text
+    assert scope.count(o) == 1, f"mutant anchor must match exactly once: {old!r} x{scope.count(o)}"
+    return text.replace(scope, scope.replace(o, n, 1), 1) if within else text.replace(o, n, 1)
 
 
-_TERM_SET = ("            } else if (!ggml_sycl::unified_cache_set_planned_compute_term(\n"
-             "                           device, bytes, ggml_sycl::lifecycle::global_registry().live_mask() != 0)) {")
+_TERM_SET = ("} else if (!ggml_sycl::unified_cache_set_planned_compute_term("
+             "device, bytes, ggml_sycl::lifecycle::global_registry().live_mask() != 0)) {")
 
 
 def test_mutant_reserve_with_headroom_fails():
@@ -329,8 +334,8 @@ def test_mutant_units_export_with_its_own_rule_fails():
 
 def test_mutant_units_export_writing_the_planner_term_fails():
     assert not claim_the_units_export_is_the_reserves_rule_and_stateless(
-        _once(SYCL, "    *out = static_cast<uint64_t>(bytes);\n",
-              "    *out = static_cast<uint64_t>(bytes);\n    (void) ggml_sycl::unified_cache_set_planned_compute_term(0, bytes);\n"))
+        _once(SYCL, "*out = static_cast<uint64_t>(bytes);",
+              "*out = static_cast<uint64_t>(bytes); (void) ggml_sycl::unified_cache_set_planned_compute_term(0, bytes);"))
 
 
 def test_mutant_units_proc_not_answered_fails():
@@ -341,18 +346,18 @@ def test_mutant_units_proc_not_answered_fails():
 
 def test_mutant_reserve_on_a_closed_txn_fails():
     assert not claim_reserve_sizes_at_the_grain_and_writes_only_the_term(
-        _once(SYCL, "if (!ggml_sycl_load_txn_is_open(txn.id)) {", "if (false) {"))
+        _once(SYCL, "if (!ggml_sycl_load_txn_is_open(txn.id)) {", "if (false) {", within=RESERVE_SIG))
 
 
 def test_mutant_reserve_without_the_arena_check_fails():
     assert not claim_reserve_sizes_at_the_grain_and_writes_only_the_term(
-        _once(SYCL, "if (cache == nullptr || !cache->arena_active()) {", "if (cache == nullptr) {"))
+        _once(SYCL, "if (cache == nullptr || !cache->arena_active()) {", "if (cache == nullptr) {", within=RESERVE_SIG))
 
 
 def test_mutant_reserve_writing_the_ledger_fails():
     assert not claim_reserve_sizes_at_the_grain_and_writes_only_the_term(
         _once(SYCL, _TERM_SET,
-              _TERM_SET + "\n                (void) ggml_sycl_load_record_compute_term(txn.id, device, bytes, n_ctx);"))
+              _TERM_SET + " (void) ggml_sycl_load_record_compute_term(txn.id, device, bytes, n_ctx);"))
 
 
 def test_mutant_reserve_replacing_a_live_models_term_fails():
@@ -362,8 +367,8 @@ def test_mutant_reserve_replacing_a_live_models_term_fails():
 
 def test_mutant_setter_overwriting_fails():
     assert not claim_setter_merges_like_the_dense_terms(
-        _once(CACHE, "zone_dense_scratch_merge_input(g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire), bytes,\n"
-                     "                                       other_model_live)",
+        _once(CACHE, "zone_dense_scratch_merge_input(g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire), "
+                     "bytes, other_model_live)",
               "bytes"))
 
 
@@ -390,14 +395,13 @@ def test_mutant_landing_line_without_the_term_fails():
 
 def test_mutant_load_entry_clear_dropped_fails():
     assert not claim_load_entry_clears_with_no_model_live(
-        _once(SYCL, "            if (live_mask == 0) {\n                ggml_sycl::unified_cache_clear_planned_load_terms();",
-              "            if (live_mask == 0) {\n                ;"))
+        _once(SYCL, "if (live_mask == 0) { ggml_sycl::unified_cache_clear_planned_load_terms();", "if (live_mask == 0) { ;"))
 
 
 def test_mutant_load_entry_clears_beside_a_live_model_fails():
     assert not claim_load_entry_clears_with_no_model_live(
-        _once(SYCL, "            if (live_mask == 0) {\n                ggml_sycl::unified_cache_clear_planned_load_terms();",
-              "            if (true) {\n                ggml_sycl::unified_cache_clear_planned_load_terms();"))
+        _once(SYCL, "if (live_mask == 0) { ggml_sycl::unified_cache_clear_planned_load_terms();",
+              "if (true) { ggml_sycl::unified_cache_clear_planned_load_terms();"))
 
 
 def test_mutant_teardown_clears_during_a_load_fails():
@@ -408,16 +412,16 @@ def test_mutant_teardown_clears_during_a_load_fails():
 
 def test_mutant_abort_clear_dropped_fails():
     assert not claim_abort_clears_with_no_model_live(
-        _once(SYCL, "        if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) {\n"
-                    "            ggml_sycl::unified_cache_clear_planned_load_terms();",
-              "        if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) {\n            ;"))
+        _once(SYCL, "if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) { "
+                    "ggml_sycl::unified_cache_clear_planned_load_terms();",
+              "if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) { ;", within=ABORT_SIG))
 
 
 
 def test_mutant_backend_answering_the_old_install_name_fails():
-    arm = "    if (strcmp(name, " + INSTALL_KV + ") == 0) {"
+    arm = "if (strcmp(name, " + INSTALL_KV + ") == 0) {"
     assert not claim_install_proc_answers_only_its_kv_name(
-        _once(SYCL, arm, "    if (strcmp(name, " + INSTALL_OLD + ") == 0) {\n        return nullptr;\n    }\n" + arm),
+        _once(SYCL, arm, "if (strcmp(name, " + INSTALL_OLD + ") == 0) { return nullptr; } " + arm),
         LLAMA_CTX)
 
 
@@ -426,24 +430,24 @@ def test_mutant_llama_asking_the_old_install_name_fails():
 
 
 
-_STAGE_RAW = ("                ggml_sycl::lifecycle_stage_probe_placement_plan(txn, ggml_sycl::placement_plan(*candidate->plan),\n"
-              "                                                                candidate->kv_info, candidate->model_n_layer);\n")
+_STAGE_CALL = ("ggml_sycl::lifecycle_stage_probe_placement_plan(txn, ggml_sycl::placement_plan(*candidate->plan), "
+               "candidate->kv_info, candidate->model_n_layer);")
 
 
 def test_mutant_probe_plan_not_staged_fails():
-    assert not claim_early_plan_stages_the_probe_plan(_once(SYCL, _STAGE_RAW, ""))
+    assert not claim_early_plan_stages_the_probe_plan(_once(SYCL, _STAGE_CALL, ""))
 
 
 def test_mutant_probe_plan_staged_by_the_late_arm_fails():
     assert not claim_early_plan_stages_the_probe_plan(
-        _once(SYCL, "        if (early) {\n            // llama.cpp-p6i0: the early plan is the load's probe placement.",
-              "        if (!early) {\n            // llama.cpp-p6i0: the early plan is the load's probe placement."))
+        _once(SYCL, "if (early) { const uint64_t txn = effect.owner.load.value;",
+              "if (!early) { const uint64_t txn = effect.owner.load.value;", within=STAGE_SIG))
 
 
 def test_mutant_probe_plan_staged_for_another_load_fails():
     assert not claim_early_plan_stages_the_probe_plan(
-        _once(SYCL, "            const uint64_t txn       = effect.owner.load.value;",
-              "            const uint64_t txn       = effect.owner.load.value + 1;"))
+        _once(SYCL, "const uint64_t txn = effect.owner.load.value;", "const uint64_t txn = effect.owner.load.value + 1;",
+              within=STAGE_SIG))
 
 
 # ---- (d) the state term: the context memory the RUNTIME zone takes before the compute buffer ----------------------
@@ -526,8 +530,8 @@ def test_the_clear_drops_both_terms():
     assert claim_clear_drops_both_terms(CACHE)
 
 
-_STATE_SET = ("            } else if (!ggml_sycl::unified_cache_set_planned_state_term(\n"
-              "                           device, bytes, ggml_sycl::lifecycle::global_registry().live_mask() != 0)) {")
+_STATE_SET = ("} else if (!ggml_sycl::unified_cache_set_planned_state_term("
+              "device, bytes, ggml_sycl::lifecycle::global_registry().live_mask() != 0)) {")
 
 
 def test_mutant_state_reserve_with_headroom_fails():
@@ -542,14 +546,13 @@ def test_mutant_state_reserve_into_the_compute_term_fails():
 
 def test_mutant_state_reserve_without_the_grain_fails():
     assert not claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(
-        _once(SYCL, "            } else if (!ggml_sycl_load_compute_term_size(&state_bytes, 1, &bytes)) {",
-              "            } else if (!(bytes = state_bytes, true)) {"))
+        _once(SYCL, "} else if (!ggml_sycl_load_compute_term_size(&state_bytes, 1, &bytes)) {",
+              "} else if (!(bytes = state_bytes, true)) {"))
 
 
 def test_mutant_state_reserve_on_a_closed_txn_fails():
-    b = body(SYCL, RESERVE_STATE_SIG)
-    assert b and not claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(
-        SYCL.replace(b, b.replace("if (!ggml_sycl_load_txn_is_open(txn.id)) {", "if (false) {", 1), 1))
+    assert not claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(
+        _once(SYCL, "if (!ggml_sycl_load_txn_is_open(txn.id)) {", "if (false) {", within=RESERVE_STATE_SIG))
 
 
 def test_mutant_state_proc_not_answered_fails():
@@ -560,8 +563,8 @@ def test_mutant_state_proc_not_answered_fails():
 
 def test_mutant_state_setter_overwriting_fails():
     assert not claim_state_setter_merges_like_the_compute_term(
-        _once(CACHE, "zone_dense_scratch_merge_input(g_planned_state_term_bytes[device_id].load(std::memory_order_acquire), bytes,\n"
-                     "                                       other_model_live)",
+        _once(CACHE, "zone_dense_scratch_merge_input(g_planned_state_term_bytes[device_id].load(std::memory_order_acquire), "
+                     "bytes, other_model_live)",
               "bytes"))
 
 
@@ -583,7 +586,7 @@ def test_mutant_ring_not_charged_the_state_fails():
 
 def test_mutant_clear_keeping_the_state_fails():
     assert not claim_clear_drops_both_terms(
-        _once(CACHE, "        g_planned_state_term_bytes[device_id].store(0, std::memory_order_release);\n", ""))
+        _once(CACHE, "g_planned_state_term_bytes[device_id].store(0, std::memory_order_release);", "", within=CLEAR_SIG))
 
 
 if __name__ == "__main__":
