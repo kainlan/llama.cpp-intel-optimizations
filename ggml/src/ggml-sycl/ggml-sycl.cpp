@@ -25449,16 +25449,16 @@ static bool ggml_sycl_pipeline_moe_enabled() {
 // one-entry slot that was flushed only when a later op consumed its output
 // (llama.cpp-3oju9).  Up does not consume gate, so the second job of a layer
 // found the slot full and aborted (llama.cpp-ytc9) on every model that runs gate
-// and up as separate MUL_MAT_IDs.  The scatter slots already defer each flush to
-// the first consumer, so the separate slot is gone (llama.cpp-z4kd).  A run that
+// and up as separate MUL_MAT_IDs.  The 2026-10-08 acceptance run of the opt-in
+// arm aborted the same way, so the slot is retired (llama.cpp-z4kd).  A run that
 // still sets the variable is told once that it has no effect.
-static void ggml_sycl_pipeline_cpu_warn_subsumed() {
+static void ggml_sycl_pipeline_cpu_warn_retired() {
     static const bool set = [] {
         const bool present = getenv("GGML_SYCL_PIPELINE_CPU") != nullptr;
         if (present) {
             GGML_LOG_WARN(
-                "GGML_SYCL_PIPELINE_CPU is retired: the scatter slots already defer each flush to its first "
-                "consumer (llama.cpp-z4kd); ignored\n");
+                "GGML_SYCL_PIPELINE_CPU is retired and ignored (llama.cpp-z4kd): its opt-in path aborted at the "
+                "llama.cpp-ytc9 assert; see docs/backend/sycl-env-vars.md\n");
         }
         return present;
     }();
@@ -81114,7 +81114,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             "dispatch_cpu_compute returned an invalid result for a "
                             "non-empty dispatch; its host-expert rows would be dropped "
                             "(llama.cpp-93tw)");
-                ggml_sycl_pipeline_cpu_warn_subsumed();
+                ggml_sycl_pipeline_cpu_warn_retired();
                 apply_cpu_result_to_scatter(cpu_result);
             } else if (have_cpu_experts) {
                 do_cpu_dispatch();
