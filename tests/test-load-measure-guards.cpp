@@ -670,6 +670,136 @@ static void test_probe_reserve() {
     g_reserve_decline_compute.clear();
 }
 
+// --- the state term in the ledger (llama.cpp-p6i0) --------------------------------------------------
+//
+// The recurrent state the probe reserved is recorded under its own name at the admitted stage and checked against
+// itself at the late stage: never folded into c(P), so the compute check still compares compute with compute.
+
+static std::vector<std::string> g_state_seq;
+static bool                     g_state_record_ok = true;
+static std::vector<int>         g_state_answers;  // indexed by device
+
+static bool fake_record_state(struct ggml_sycl_load_txn txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
+    g_state_seq.push_back("record " + std::to_string(device) + " " + std::to_string(bytes) + " " +
+                          std::to_string(n_ctx) + " txn " + std::to_string(txn.id));
+    return g_state_record_ok;
+}
+
+static ggml_sycl_late_check_result fake_late_check_state(struct ggml_sycl_load_txn, int32_t device, uint64_t bytes) {
+    g_state_seq.push_back("check " + std::to_string(device) + " " + std::to_string(bytes));
+    return (ggml_sycl_late_check_result) g_state_answers[(size_t) device];
+}
+
+static ggml_sycl_late_check_result fake_late_check_equal(struct ggml_sycl_load_txn, int32_t, uint64_t) {
+    return GGML_SYCL_LATE_CHECK_EQUAL;
+}
+
+static void test_state_terms() {
+    // the admitted fold carries the probe's state, the one the reservation holds, not the admitted measure's
+    {
+        llama_sycl_l4_procs procs;
+        procs.term_bytes                                      = &fake_term_bytes;
+        const std::vector<llama_load_measure_device> probe    = { with_state(chunked(0, false, { 1000 }), 500),
+                                                                  with_state(chunked(1, false, { 1000 }), 300) };
+        const std::vector<llama_load_measure_device> admitted = { with_state(chunked(0, false, { 900 }), 400),
+                                                                  with_state(chunked(1, false, { 900 }), 300) };
+        const llama_admitted_check_result            r =
+            llama_admitted_check_fold(procs, probe, { 1 }, admitted, 4096, 512, {}, {});
+        CHECK(r.refusal.empty() && r.terms.size() == 2, "the fold refused: %s", r.refusal.c_str());
+        CHECK(r.terms.size() == 2 && r.terms[0].state_bytes == 500, "the term does not carry the probe's state");
+        CHECK(r.terms.size() == 2 && r.terms[1].state_bytes == 300 && !r.terms[1].reserved,
+              "a declined device's state is carried but the device is not reserved");
+    }
+
+    // each reserved device with state records it under the state term at the measure's n_ctx; a device with no state
+    // or no reservation records nothing, and each term says whether its state was recorded
+    {
+        llama_sycl_l4_procs procs;
+        procs.record_state = &fake_record_state;
+        llama_admitted_check_result admitted;
+        admitted.terms                = { admitted_term(0, true, 100, 90), admitted_term(1, true, 200, 200),
+                                          admitted_term(2, false, 300, 300) };
+        admitted.terms[0].state_bytes = 118038528;
+        admitted.terms[2].state_bytes = 77;
+        g_state_seq.clear();
+        g_state_record_ok = true;
+        CHECK(llama_admitted_record_state(procs, ggml_sycl_load_txn{ 7 }, admitted, 262144) == 1,
+              "not exactly one state recorded");
+        CHECK(g_state_seq == std::vector<std::string>({ "record 0 118038528 262144 txn 7" }),
+              "the state record visited the wrong devices or carried the wrong bytes: %zu call(s)", g_state_seq.size());
+        CHECK(
+            admitted.terms[0].state_recorded && !admitted.terms[1].state_recorded && !admitted.terms[2].state_recorded,
+            "the recorded flags are wrong");
+        g_state_record_ok                = false;
+        admitted.terms[0].state_recorded = false;
+        CHECK(llama_admitted_record_state(procs, ggml_sycl_load_txn{ 7 }, admitted, 262144) == 0 &&
+                  !admitted.terms[0].state_recorded,
+              "a refused state record was counted");
+        llama_sycl_l4_procs none;
+        CHECK(llama_admitted_record_state(none, ggml_sycl_load_txn{ 7 }, admitted, 262144) == 0,
+              "a missing proc was counted as a state record");
+        g_state_record_ok = true;
+    }
+
+    // the late fold checks each SYCL device's state against the state term, with the state bytes, never the compute
+    // total; a device with no state is not asked, the host tier is not asked, and a NOT_RECORDED state is listed on
+    // its own
+    {
+        llama_sycl_l4_procs procs;
+        procs.late_check       = &fake_late_check_equal;
+        procs.late_check_state = &fake_late_check_state;
+        g_state_seq.clear();
+        g_state_answers = { GGML_SYCL_LATE_CHECK_EQUAL, GGML_SYCL_LATE_CHECK_EQUAL, GGML_SYCL_LATE_CHECK_NOT_RECORDED,
+                            GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED };
+        const std::vector<llama_load_measure_device> devs = {
+            with_state(measured(0, false, 10), 100), measured(1, false, 20), with_state(measured(2, false, 30), 50),
+            with_state(measured(-1, true, 40), 9), with_state(measured(3, false, 60), 70)
+        };
+        const llama_late_check_result r = llama_late_check_fold(procs, ggml_sycl_load_txn{ 9 }, devs, 512);
+        CHECK(r.refusal.empty(), "refused: %s", r.refusal.c_str());
+        CHECK(g_state_seq == std::vector<std::string>({ "check 0 100", "check 2 50", "check 3 70" }),
+              "the state checks visited the wrong devices or carried the wrong bytes: %zu call(s)", g_state_seq.size());
+        CHECK(r.not_recorded.empty(), "a state miss was listed as a compute miss");
+        CHECK(r.state_not_recorded == std::vector<int32_t>({ 2 }) &&
+                  r.state_not_recorded_bytes == std::vector<size_t>({ 50 }),
+              "the state miss is not listed with its measured state");
+    }
+
+    // a state above its record refuses the load by name; the compute check of the same device passed
+    {
+        llama_sycl_l4_procs procs;
+        procs.late_check       = &fake_late_check_equal;
+        procs.late_check_state = &fake_late_check_state;
+        g_state_seq.clear();
+        g_state_answers = { GGML_SYCL_LATE_CHECK_EQUAL, GGML_SYCL_LATE_CHECK_REFUSED, GGML_SYCL_LATE_CHECK_EQUAL };
+        const std::vector<llama_load_measure_device> devs = { with_state(measured(0, false, 1), 5),
+                                                              with_state(measured(1, false, 2), 6),
+                                                              with_state(measured(2, false, 3), 7) };
+        const llama_late_check_result r = llama_late_check_fold(procs, ggml_sycl_load_txn{ 9 }, devs, 512);
+        CHECK(r.refusal ==
+                  "[LOAD-PLAN] compute-slot measure failed at late on device 1: the final placement needs more "
+                  "recurrent state than the reserved state term (refused)",
+              "state refusal text: %s", r.refusal.c_str());
+        CHECK(g_state_seq.size() == 2, "the fold went on past a state refusal");
+    }
+
+    // a table without the state check compares no state: a device with state is listed, never passed
+    {
+        llama_sycl_l4_procs procs;
+        procs.late_check                                  = &fake_late_check_equal;
+        const std::vector<llama_load_measure_device> devs = { with_state(measured(0, false, 1), 5) };
+        const llama_late_check_result r = llama_late_check_fold(procs, ggml_sycl_load_txn{ 9 }, devs, 512);
+        CHECK(r.refusal.empty() && r.state_not_recorded == std::vector<int32_t>({ 0 }),
+              "a missing state proc was read as a pass");
+    }
+
+    // the loader's WARN for a state nothing was compared with
+    const std::string t = llama_late_check_state_not_recorded_text(2, 118038528);
+    CHECK(t == "[LOAD-PLAN] late state check on device 2: no state term was recorded for this load, nothing was "
+               "compared (measured state 112.6 MiB on device 2; it is allocated in the RUNTIME zone unplanned)",
+          "the state text: %s", t.c_str());
+}
+
 static void test_measure_kv_shape() {
     for (uint32_t n_ctx : { 0u, 4096u }) {
         llama_context_params params            = llama_load_measure_context_params(n_ctx, 262144);
@@ -844,6 +974,7 @@ int main() {
     test_admitted_fold();
     test_admitted_record();
     test_probe_reserve();
+    test_state_terms();
     if (n_failed != 0) {
         fprintf(stderr, "%d check(s) failed\n", n_failed);
         return 1;

@@ -8,7 +8,8 @@
 //   (3) coverage: EQUAL / COVERED / GROWTH, fail-closed, with one arm per way a candidate can
 //       need more than the published section;
 //   (4) the ledger: an early term is recorded only for a load that carries an n_ctx, and the late
-//       check answers EQUAL / SHRINK_ADMITTED / REFUSED / NOT_RECORDED under the one rule;
+//       check answers EQUAL / SHRINK_ADMITTED / REFUSED / NOT_RECORDED under the one rule; the
+//       recurrent state term is its own entry under its own name, compared with itself only;
 //   (5) the registry entry that holds a published section: read, replace, drop, and never a final
 //       drop under the registry's leaf lock.
 //
@@ -828,6 +829,61 @@ void case_ledger_clear() {
     CHECK(l.clear(7) == 0, "a second clear is a no-op");
 }
 
+// The recurrent state term (llama.cpp-p6i0) is its own entry under its own name: a compute record never answers a
+// state check, a state record never answers a compute check, and each is compared with itself only, under the same
+// rule. A load's clear drops both.
+void case_ledger_state_term_is_its_own() {
+    load_compute_ledger l;
+    CHECK(l.record(7, 0, 1000, 8192, true), "compute recorded on device 0");
+    CHECK(l.record(7, 0, LOAD_LEDGER_TERM_STATE, 500, 8192, true), "state recorded on device 0");
+    CHECK(l.size() == 2, "two entries for one (load, device)");
+    CHECK(l.check(7, 0, 1000, true).result == GGML_SYCL_LATE_CHECK_EQUAL, "compute compares with compute");
+    const load_compute_ledger::check_result eq = l.check(7, 0, LOAD_LEDGER_TERM_STATE, 500, true);
+    CHECK(eq.result == GGML_SYCL_LATE_CHECK_EQUAL, "state compares with state");
+    CHECK(eq.line == "[LOAD-PLAN] late check on device 0: state term equal (0.0 MiB), early reservation stands",
+          "the state's equal WARN names the state term");
+    CHECK(eq.level == LOAD_LOG_LEVEL_WARN, "at WARN");
+
+    const load_compute_ledger::check_result big = l.check(7, 0, LOAD_LEDGER_TERM_STATE, 1000, true);
+    CHECK(big.result == GGML_SYCL_LATE_CHECK_REFUSED, "a state above its record is refused, though compute is 1000");
+    CHECK(big.line ==
+              "[LOAD-PLAN] the late inventory changes the zones admitted at the early stage: term state in zone "
+              "RUNTIME on device 0, early 500 B, late 1000 B (refused)",
+          "the refusal names the state term and the RUNTIME zone");
+    CHECK(l.check(7, 0, 1000, true).result == GGML_SYCL_LATE_CHECK_EQUAL, "and the compute term is untouched");
+    CHECK(l.check(7, 0, 999, true).result == GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED, "compute shrinks on its own");
+    const load_compute_ledger::check_result small = l.check(7, 0, LOAD_LEDGER_TERM_STATE, 400, true);
+    CHECK(small.result == GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED && small.shrink_counted,
+          "the state's first shrink is its own once-only, after the compute term's");
+    CHECK(small.line ==
+              "[ZONE-PLAN-BUG] the late inventory shrinks term state on device 0: early 500 B, late 400 B (admitted; "
+              "the early reservation stands)",
+          "the shrink names the state term");
+
+    CHECK(l.record(7, 1, 2000, 8192, true), "only compute recorded on device 1");
+    const load_compute_ledger::check_result miss = l.check(7, 1, LOAD_LEDGER_TERM_STATE, 2000, true);
+    CHECK(miss.result == GGML_SYCL_LATE_CHECK_NOT_RECORDED, "a compute record does not answer a state check");
+    CHECK(miss.line ==
+              "[LOAD-PLAN] late state check on device 1: no early term was recorded for transaction 7, nothing was "
+              "compared",
+          "the not-recorded line names the state check");
+    CHECK(l.check(7, 1, 2000, true).result == GGML_SYCL_LATE_CHECK_EQUAL,
+          "and the compute term's own once-only lines are separate from the state's");
+    CHECK(l.record(7, 2, LOAD_LEDGER_TERM_STATE, 300, 8192, true), "only state recorded on device 2");
+    CHECK(l.check(7, 2, 300, true).result == GGML_SYCL_LATE_CHECK_NOT_RECORDED,
+          "a state record does not answer a compute check");
+    CHECK(!l.check(8, 0, 1, true).line.empty() && !l.check(8, 0, LOAD_LEDGER_TERM_STATE, 1, true).line.empty(),
+          "with neither term recorded, each term's not-recorded line is said once on its own");
+    CHECK(l.check(8, 0, LOAD_LEDGER_TERM_STATE, 1, true).line.empty(), "and the state's is not said twice");
+    CHECK(l.check(7, 0, LOAD_LEDGER_TERM_STATE, 1, false).line.find("late state check") != std::string::npos,
+          "a closed transaction's WARN names the state check");
+    CHECK(
+        !l.record(7, 0, LOAD_LEDGER_TERM_STATE, 1, 0, true) && !l.record(7, 0, LOAD_LEDGER_TERM_STATE, 1, 8192, false),
+        "a state record refuses a zero n_ctx and a closed transaction like a compute record");
+    CHECK(l.clear(7) == 4, "a load's clear drops its compute and state terms");
+    CHECK(l.size() == 0, "and leaves none");
+}
+
 // ---- (5) the registry entry's published section -------------------------------------------------
 
 // A section whose last drop records whether the registry's leaf lock was held at that instant.
@@ -950,6 +1006,7 @@ int main() {
     case_ledger_record_needs_an_open_txn();
     case_ledger_log_levels();
     case_ledger_clear();
+    case_ledger_state_term_is_its_own();
     case_registry_published_section();
     std::printf("test-runtime-context-section: all cases passed\n");
     return 0;

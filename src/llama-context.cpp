@@ -805,8 +805,9 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
     return procs;
 }
 
-// The L4 entry points (the tenant publish, coverage query, load-time late check and residency probe) and the load's
-// compute-term record and compute reservation (llama.cpp-p6i0). The backend declares them in ggml-sycl.h; a backend that does not define
+// The L4 entry points (the tenant publish, coverage query, load-time late check and residency probe), the load's
+// compute-term record and compute reservation, and the state term's reservation, record and late check
+// (llama.cpp-p6i0). The backend declares them in ggml-sycl.h; a backend that does not define
 // them answers a null proc address and the readers in llama-context-tenant.h then fail closed. Every link mode
 // resolves them the same way, through the SYCL reg's proc address by the names ggml-sycl-l4-procs.h pins, from the
 // first SYCL backend of the context. No weak reference, no direct reference: one path.
@@ -831,6 +832,10 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
         llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_COMPUTE_TERM_BYTES));
     procs.reserve_state = reinterpret_cast<decltype(procs.reserve_state)>(
         llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_RESERVE_STATE_TERM));
+    procs.record_state = reinterpret_cast<decltype(procs.record_state)>(
+        llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_RECORD_STATE_TERM));
+    procs.late_check_state = reinterpret_cast<decltype(procs.late_check_state)>(
+        llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_LATE_CHECK_STATE));
     return procs;
 }
 
@@ -4148,6 +4153,8 @@ llama_admitted_check_result llama_load_admitted_check(const llama_model &       
         return out;
     }
     out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);
+    // the reserved state of each device, under its own name beside c(P), for the late state check
+    out.n_state_recorded = llama_admitted_record_state(procs, txn, out, measured_n_ctx);
 #else
     GGML_UNUSED(model);
     GGML_UNUSED(n_ctx);

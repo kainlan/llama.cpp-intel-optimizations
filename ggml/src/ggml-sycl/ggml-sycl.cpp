@@ -13454,6 +13454,17 @@ static bool ggml_sycl_load_record_compute_term(uint64_t txn, int32_t device, uin
     return state.ledger.record(txn, device, bytes, n_ctx, ggml_sycl_load_txn_is_open(txn));
 }
 
+// The one writer of the ledger's state terms (llama.cpp-p6i0): the recurrent state the probe reserved in RUNTIME for
+// (load transaction, device), kept under the state term's own key and name beside c(P), so the late check compares a
+// late state with it and never with the compute term.  It refuses on the compute writer's conditions, decided under
+// the same lock.  Its one caller is the export ggml_backend_sycl_load_record_state_term.
+static bool ggml_sycl_load_record_state_term(uint64_t txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
+    ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+    std::lock_guard<std::mutex>   lock(state.mutex);
+    return state.ledger.record(txn, device, ggml_sycl::LOAD_LEDGER_TERM_STATE, bytes, n_ctx,
+                               ggml_sycl_load_txn_is_open(txn));
+}
+
 // One ledger line, at the level the ledger chose for it.
 static void ggml_sycl_load_ledger_log(const ggml_sycl::load_compute_ledger::check_result & r) {
     if (r.line.empty()) {
@@ -15797,6 +15808,8 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
         std::string why;
         try {
             snapshot = ggml_sycl_measure_refit_kv(snapshot, *kv_shape, why);
+        } catch (const ggml_sycl_fallback_error &) {
+            throw;  // a planned refusal is the caller's, never a re-fit WARN
         } catch (const std::exception & e) {
             snapshot.reset();
             why = e.what();
@@ -20995,6 +21008,46 @@ bool ggml_backend_sycl_load_record_compute_term(ggml_sycl_load_txn txn,
         return ggml_sycl_load_record_compute_term(txn.id, device, bytes, n_ctx);
     } catch (...) {
         return false;
+    }
+}
+
+// The early stage's record of a load's state term (llama.cpp-p6i0): the production caller of the ledger's state
+// writer, under the module admission, with an allocation failure kept from crossing the C boundary.
+bool ggml_backend_sycl_load_record_state_term(ggml_sycl_load_txn txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return false;
+    }
+    try {
+        return ggml_sycl_load_record_state_term(txn.id, device, bytes, n_ctx);
+    } catch (...) {
+        return false;
+    }
+}
+
+// The late measure's state against the state term the early stage recorded (llama.cpp-p6i0): the late check's rule
+// and lines, with the state term's own name, compared with the state term only.  A state shrink says its WARN and is
+// not counted in late_term_shrink_admitted, which counts the compute term's shrinks.  Fail-closed like the compute
+// term's check: NOT_RECORDED is the answer to everything this cannot compare.
+enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check_state(ggml_sycl_load_txn txn,
+                                                                         int32_t            device,
+                                                                         uint64_t           state_bytes) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
+    try {
+        ggml_sycl::load_compute_ledger::check_result r;
+        {
+            ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
+            std::lock_guard<std::mutex>   lock(state.mutex);
+            r = state.ledger.check(txn.id, device, ggml_sycl::LOAD_LEDGER_TERM_STATE, state_bytes,
+                                   ggml_sycl_load_txn_is_open(txn.id));
+        }
+        ggml_sycl_load_ledger_log(r);
+        return r.result;
+    } catch (...) {
+        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
     }
 }
 
@@ -117142,6 +117195,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_load_reserve_state_term") == 0) {
         return (void *) ggml_backend_sycl_load_reserve_state_term;
+    }
+    if (strcmp(name, "ggml_backend_sycl_load_record_state_term") == 0) {
+        return (void *) ggml_backend_sycl_load_record_state_term;
+    }
+    if (strcmp(name, "ggml_backend_sycl_load_late_check_state") == 0) {
+        return (void *) ggml_backend_sycl_load_late_check_state;
     }
     if (strcmp(name, "ggml_backend_sycl_supports_op_capability") == 0) {
         return (void *) ggml_backend_sycl_supports_op_capability;

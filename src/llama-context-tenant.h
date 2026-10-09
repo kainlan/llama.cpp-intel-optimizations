@@ -33,13 +33,15 @@ struct llama_sycl_l4_procs {
     decltype(&ggml_backend_sycl_tenant_coverage)          coverage        = nullptr;
     decltype(&ggml_backend_sycl_load_late_check)          late_check      = nullptr;
     decltype(&ggml_backend_sycl_probe_residency)          probe_residency = nullptr;
-    // The load's compute-term record, compute reservation, the reservation's units and the state reservation
-    // (llama.cpp-p6i0). Not part of available(): the context side and the late check keep their gate, and the loader
-    // gates its two steps on load_terms_available().
-    decltype(&ggml_backend_sycl_load_record_compute_term)  record_term     = nullptr;
-    decltype(&ggml_backend_sycl_load_reserve_compute_term) reserve_term    = nullptr;
-    decltype(&ggml_backend_sycl_load_compute_term_bytes)   term_bytes      = nullptr;
-    decltype(&ggml_backend_sycl_load_reserve_state_term)   reserve_state   = nullptr;
+    // The load's compute-term record, compute reservation, the reservation's units, and the state term's
+    // reservation, record and late check (llama.cpp-p6i0). Not part of available(): the context side and the late
+    // check keep their gate, and the loader gates its two steps on load_terms_available().
+    decltype(&ggml_backend_sycl_load_record_compute_term)  record_term      = nullptr;
+    decltype(&ggml_backend_sycl_load_reserve_compute_term) reserve_term     = nullptr;
+    decltype(&ggml_backend_sycl_load_compute_term_bytes)   term_bytes       = nullptr;
+    decltype(&ggml_backend_sycl_load_reserve_state_term)   reserve_state    = nullptr;
+    decltype(&ggml_backend_sycl_load_record_state_term)    record_state     = nullptr;
+    decltype(&ggml_backend_sycl_load_late_check_state)     late_check_state = nullptr;
 
     // A planned context needs all four: a publish that cannot be covered-checked, a load that
     // cannot be late-checked, or a plan whose residency cannot be probed, is half a plan.
@@ -51,9 +53,11 @@ struct llama_sycl_l4_procs {
     // never recorded leaves the late check nothing to compare, a record with no reservation compares a term the
     // pack never made room for, without the reservation's units the admitted check cannot compare c(P) with
     // what was reserved, and without the state reservation a model with recurrent state has its compute term drawn
-    // down by that state before the compute buffer is allocated.
+    // down by that state before the compute buffer is allocated. The state term's record and late check are the
+    // state's half of the same pair: a state reserved and never recorded leaves its late check nothing to compare.
     bool load_terms_available() const {
-        return record_term != nullptr && reserve_term != nullptr && term_bytes != nullptr && reserve_state != nullptr;
+        return record_term != nullptr && reserve_term != nullptr && term_bytes != nullptr && reserve_state != nullptr &&
+               record_state != nullptr && late_check_state != nullptr;
     }
 };
 
@@ -156,6 +160,39 @@ inline bool llama_sycl_l4_reserve_state_term(const llama_sycl_l4_procs & procs,
         return false;
     }
     return procs.reserve_state(txn, device, state_bytes);
+}
+
+// The load's state-term record (llama.cpp-p6i0): the state the probe reserved for one device, under the state term's
+// own name. False is "not recorded", and a null proc reads as it: the state's late check then answers NOT_RECORDED.
+inline bool llama_sycl_l4_record_state_term(const llama_sycl_l4_procs & procs,
+                                            struct ggml_sycl_load_txn   txn,
+                                            int32_t                     device,
+                                            uint64_t                    bytes,
+                                            uint32_t                    n_ctx) {
+    if (procs.record_state == nullptr) {
+        return false;
+    }
+    return procs.record_state(txn, device, bytes, n_ctx);
+}
+
+// The state term's late check (llama.cpp-p6i0): a late state against the recorded state, never against the compute
+// term. NOT_RECORDED is "nothing was checked"; a null proc and a value outside the enum both read as it.
+inline ggml_sycl_late_check_result llama_sycl_l4_late_check_state(const llama_sycl_l4_procs & procs,
+                                                                  struct ggml_sycl_load_txn   txn,
+                                                                  int32_t                     device,
+                                                                  uint64_t                    state_bytes) {
+    if (procs.late_check_state == nullptr) {
+        return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
+    const ggml_sycl_late_check_result r = procs.late_check_state(txn, device, state_bytes);
+    switch (r) {
+        case GGML_SYCL_LATE_CHECK_EQUAL:
+        case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED:
+        case GGML_SYCL_LATE_CHECK_REFUSED:
+            return r;
+        default:
+            return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
 }
 
 // The reservation's units of one measured device's chunks (llama.cpp-p6i0). False is "not sized", and a null proc

@@ -26,7 +26,12 @@ one measure-only context over a load's placement. This gate pins, on comment-str
 - llama_load_measure asks the unsupported question before it creates any backend;
 - `llama_late_check_result` carries only what production reads (no `checked`, no `shrunk`; the measured
   term of each not-recorded device is read by the WARN), and the ubatch reaches it through the fold, where a
-  host test can see it.
+  host test can see it;
+- (llama.cpp-p6i0) every RUNTIME-first consumer at context time is named in the reserve, and the recurrent state
+  is one: the measure reads the context memory's size per buffer type (memory_breakdown) into each SYCL device's
+  caps, the run carries it on the measured device and never on the host tier, the probe reserve hands it to the
+  state reservation before the compute term, the admitted stage records it under its own name, and the late fold
+  checks it with the state bytes, never the compute total.
 
 Every clause has a mutant that must fail it. Host-only; collected by pytest.
 """
@@ -198,13 +203,31 @@ def fold_ok(code: str) -> bool:
             "out.not_recorded_bytes.push_back(d.total); break;"
         )
         in b
-        and z("case GGML_SYCL_LATE_CHECK_EQUAL: case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED: break;") in b
-        and z("case GGML_SYCL_LATE_CHECK_REFUSED:") in b
+        # each switch, the compute term's and the state term's, admits EQUAL and SHRINK and handles REFUSED itself
+        and z(
+            "switch (llama_sycl_l4_late_check(procs, txn, d.device, d.total)) { case GGML_SYCL_LATE_CHECK_EQUAL: "
+            "case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED: break; case GGML_SYCL_LATE_CHECK_REFUSED:"
+        )
+        in b
+        and z(
+            "switch (llama_sycl_l4_late_check_state(procs, txn, d.device, d.state_bytes)) { "
+            "case GGML_SYCL_LATE_CHECK_EQUAL: case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED: break; "
+            "case GGML_SYCL_LATE_CHECK_REFUSED:"
+        )
+        in b
         and "default:" not in b
         and z("if (d.host) { continue; }") in b
         and z("out.n_ubatch = n_ubatch;") in b
-        and b.count("return") == 2
+        # the compute refusal and the state refusal (llama.cpp-p6i0) each end the fold; the end returns the rest
+        and b.count("return") == 3
         and z("llama_load_measure_refusal_text( GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, d.device,") in b
+        and z('"the final placement needs more recurrent state than the reserved state term"); return out;') in b
+        # a state nothing was compared with is its own list, never a compute miss and never a pass
+        and z(
+            "case GGML_SYCL_LATE_CHECK_NOT_RECORDED: out.state_not_recorded.push_back(d.device); "
+            "out.state_not_recorded_bytes.push_back(d.state_bytes); break;"
+        )
+        in b
     )
 
 
@@ -308,6 +331,8 @@ def admit_ok(code: str) -> bool:
         "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, measured.devices, measured_n_ctx,",
         "if (!out.refusal.empty()) { return out; }",
         "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);",
+        # llama.cpp-p6i0: the reserved state under its own name, at the same n_ctx
+        "out.n_state_recorded = llama_admitted_record_state(procs, txn, out, measured_n_ctx);",
     ]
     pos = [b.find(z(t)) for t in order]
     return (
@@ -316,6 +341,7 @@ def admit_ok(code: str) -> bool:
         # the KV-residency delta is judged on the residencies the two measures saw, probe first
         and z("measured_n_ctx, n_ubatch, probe.kv, measured.kv);") in b
         and b.count(z("llama_admitted_record(")) == 1
+        and b.count(z("llama_admitted_record_state(")) == 1
         and "GGML_SYCL_MEASURE_STAGE_PROBE" not in b
         and "GGML_SYCL_MEASURE_STAGE_CANDIDATE_C" not in b
         # the admitted stage reserves nothing: the probe's reservation is the one it compares with
@@ -396,7 +422,8 @@ def result_fields_ok(raw: str) -> bool:
     i = code.index("struct llama_late_check_result {")
     body = code[i : code.index("};", i)]
     names = set(re.findall(r"(?:std::string|uint32_t|std::vector<int32_t>|std::vector<size_t>|bool)\s+(\w+)", body))
-    return names == {"refusal", "unsupported", "n_ubatch", "not_recorded", "not_recorded_bytes"}
+    return names == {"refusal", "unsupported", "n_ubatch", "not_recorded", "not_recorded_bytes", "state_not_recorded",
+                     "state_not_recorded_bytes"}
 
 
 _NEEDS_OTHER = "bool llama_model_needs_ctx_other(const llama_model & model)"
@@ -561,9 +588,13 @@ def test_fold_mutants():
     for name, old, new in [
         ("not recorded read as equal", "case GGML_SYCL_LATE_CHECK_NOT_RECORDED:\n                out.not_recorded.push_back(d.device);\n                out.not_recorded_bytes.push_back(d.total);\n                break;", "case GGML_SYCL_LATE_CHECK_NOT_RECORDED:\n                break;"),
         ("the measured term dropped", "out.not_recorded_bytes.push_back(d.total);", ""),
-        ("shrink unhandled", "case GGML_SYCL_LATE_CHECK_EQUAL:\n            case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED:", "case GGML_SYCL_LATE_CHECK_EQUAL:"),
-        ("a default arm", "case GGML_SYCL_LATE_CHECK_REFUSED:", "default:\n                break;\n            case GGML_SYCL_LATE_CHECK_REFUSED:"),
+        ("shrink unhandled", "switch (llama_sycl_l4_late_check(procs, txn, d.device, d.total)) {\n            case GGML_SYCL_LATE_CHECK_EQUAL:\n            case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED:", "switch (llama_sycl_l4_late_check(procs, txn, d.device, d.total)) {\n            case GGML_SYCL_LATE_CHECK_EQUAL:"),
+        ("the state's shrink unhandled", "switch (llama_sycl_l4_late_check_state(procs, txn, d.device, d.state_bytes)) {\n            case GGML_SYCL_LATE_CHECK_EQUAL:\n            case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED:", "switch (llama_sycl_l4_late_check_state(procs, txn, d.device, d.state_bytes)) {\n            case GGML_SYCL_LATE_CHECK_EQUAL:"),
+        ("a default arm", "switch (llama_sycl_l4_late_check(procs, txn, d.device, d.total)) {", "switch (llama_sycl_l4_late_check(procs, txn, d.device, d.total)) {\n            default:\n                break;"),
+        ("a default arm in the state switch", "switch (llama_sycl_l4_late_check_state(procs, txn, d.device, d.state_bytes)) {", "switch (llama_sycl_l4_late_check_state(procs, txn, d.device, d.state_bytes)) {\n            default:\n                break;"),
         ("the host tier compared", "if (d.host) {\n            continue;\n        }", ""),
+        ("a state refusal does not end the fold", "the reserved state term\");\n                return out;", "the reserved state term\");\n                break;"),
+        ("a state miss read as equal", "                out.state_not_recorded.push_back(d.device);\n", ""),
     ]:
         assert not fold_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
 
@@ -614,6 +645,7 @@ def test_the_result_carries_only_what_production_reads():
     assert result_fields_ok(MEASURE_H)
     assert not result_fields_ok(MEASURE_H.replace("std::vector<int32_t> not_recorded;", "std::vector<int32_t> not_recorded;\n    bool checked = false;", 1))
     assert not result_fields_ok(MEASURE_H.replace("std::vector<size_t>  not_recorded_bytes;", "", 1))
+    assert not result_fields_ok(MEASURE_H.replace("std::vector<size_t>  state_not_recorded_bytes;", "", 1))
 
 
 def test_the_fold_sets_the_ubatch_and_the_caller_passes_it():
@@ -690,8 +722,92 @@ def test_admit_mutants():
         ("the residencies swapped", "probe.kv, measured.kv);", "measured.kv, probe.kv);"),
         ("the probe's residency judged against itself", "probe.kv, measured.kv);", "probe.kv, probe.kv);"),
         ("the admitted stage reserves state", "    if (!out.refusal.empty()) {\n        return out;\n    }", "    (void) llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);\n    if (!out.refusal.empty()) {\n        return out;\n    }"),
+        ("the state never recorded", "out.n_state_recorded = llama_admitted_record_state(procs, txn, out, measured_n_ctx);", ""),
+        ("the state recorded at n_ctx 0", "out.n_state_recorded = llama_admitted_record_state(procs, txn, out, measured_n_ctx);", "out.n_state_recorded = llama_admitted_record_state(procs, txn, out, n_ctx);"),
+        ("the state recorded before the refusal check", "    if (!out.refusal.empty()) {\n        return out;\n    }\n    out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);\n    out.n_state_recorded = llama_admitted_record_state(procs, txn, out, measured_n_ctx);", "    out.n_state_recorded = llama_admitted_record_state(procs, txn, out, measured_n_ctx);\n    if (!out.refusal.empty()) {\n        return out;\n    }\n    out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);"),
     ]:
         assert not admit_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
+
+
+_CAPS = "std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sched_measure_plan & plan) const"
+_PROBE_RESERVE = (
+    "inline std::vector<int32_t> llama_load_probe_reserve(const llama_sycl_l4_procs & procs, "
+    "struct ggml_sycl_load_txn txn, const std::vector<llama_load_measure_device> & devices, uint32_t n_ctx)"
+)
+_RECORD_STATE = (
+    "inline size_t llama_admitted_record_state(const llama_sycl_l4_procs & procs, struct ggml_sycl_load_txn txn, "
+    "llama_admitted_check_result & admitted, uint32_t n_ctx)"
+)
+
+
+def state_consumer_ok(ctx_code: str, measure_code: str) -> bool:
+    """llama.cpp-p6i0: the recurrent state is a named RUNTIME-first consumer of the reserve, at every hop from the
+    measure to the late check. A hop that drops it leaves the state allocated RUNTIME-first with nothing reserved
+    for it, and a compute chunk lands outside the RUNTIME zone (Qwen3.8 on the B70)."""
+    caps = function_body(ctx_code, _CAPS)
+    run = function_body(ctx_code, _RUN)
+    res = function_body(measure_code, _PROBE_RESERVE)
+    rec = function_body(measure_code, _RECORD_STATE)
+    fold = function_body(measure_code, _FOLD)
+    # the measure: the memory's size per buffer type, read once, then each SYCL device's caps take its buft's entry
+    caps_order = [
+        "memory_bytes = memory->memory_breakdown();",
+        "for (const auto & entry : plan.bufts)",
+        "const auto state = memory_bytes.find(entry.buft);",
+        "c.state_bytes = state != memory_bytes.end() ? state->second : 0;",
+        "out.push_back(c);",
+    ]
+    pos = [caps.find(z(t)) for t in caps_order]
+    if -1 in pos or pos != sorted(pos) or caps.count(z("c.state_bytes =")) != 1:
+        return False
+    # the run: on the measured device, never on the host tier
+    if z("d.state_bytes = c.host ? 0 : c.state_bytes;") not in run:
+        return False
+    # the probe reserve: the state's own reservation, before the compute term, for a device that has state
+    st = res.find(z("if (d.state_bytes != 0 && !llama_sycl_l4_reserve_state_term(procs, txn, d.device, d.state_bytes))"))
+    co = res.find(z("llama_sycl_l4_reserve_compute_term(procs, txn, d, n_ctx)"))
+    if st == -1 or co == -1 or st > co:
+        return False
+    # the admitted fold carries the probe's state (the reserved one); the record names it as the state term
+    if z("t.state_bytes = bound->state_bytes;") not in measure_code:
+        return False
+    if z("llama_sycl_l4_record_state_term(procs, txn, t.device, t.state_bytes, n_ctx)") not in rec:
+        return False
+    # the late fold: the state check with the state bytes, never the compute total
+    return z("llama_sycl_l4_late_check_state(procs, txn, d.device, d.state_bytes)") in fold
+
+
+def test_the_recurrent_state_is_a_named_runtime_consumer():
+    assert state_consumer_ok(code_of(CONTEXT_CPP), code_of(MEASURE_H))
+
+
+def test_state_consumer_mutants():
+    ctx = code_of(CONTEXT_CPP)
+    meas = code_of(MEASURE_H)
+    caps = function_body(ctx, _CAPS)
+    run = function_body(ctx, _RUN)
+    res = function_body(meas, _PROBE_RESERVE)
+    rec = function_body(meas, _RECORD_STATE)
+    fold = function_body(meas, _FOLD)
+    for name, body, old, new, in_ctx in [
+        ("the measure never reads the memory", caps, "memory_bytes = memory->memory_breakdown();", "", True),
+        ("the caps drop the state", caps, "c.state_bytes = state != memory_bytes.end() ? state->second : 0;", "", True),
+        ("the caps take another buft's state", caps, "const auto state = memory_bytes.find(entry.buft);", "const auto state = memory_bytes.begin();", True),
+        ("the run drops the state", run, "d.state_bytes = c.host ? 0 : c.state_bytes;", "", True),
+        ("the run carries the host tier's state", run, "d.state_bytes = c.host ? 0 : c.state_bytes;", "d.state_bytes = c.state_bytes;", True),
+        ("the probe reserve drops the state", res, "if (d.state_bytes != 0 && !llama_sycl_l4_reserve_state_term(procs, txn, d.device, d.state_bytes)) {", "if (false) {", False),
+        ("the probe reserve hands over the compute total", res, "llama_sycl_l4_reserve_state_term(procs, txn, d.device, d.state_bytes)", "llama_sycl_l4_reserve_state_term(procs, txn, d.device, d.total)", False),
+        ("the admitted fold carries the admitted state", meas, "t.state_bytes = bound->state_bytes;", "t.state_bytes = d.state_bytes;", False),
+        ("the record drops the state", rec, "llama_sycl_l4_record_state_term(procs, txn, t.device, t.state_bytes, n_ctx)", "false", False),
+        ("the late fold checks the compute total", fold, "llama_sycl_l4_late_check_state(procs, txn, d.device, d.state_bytes)", "llama_sycl_l4_late_check_state(procs, txn, d.device, d.total)", False),
+    ]:
+        if body is meas:
+            c2, m2 = ctx, mutate(meas, old, new)
+        elif in_ctx:
+            c2, m2 = ctx.replace(body, mutate(body, old, new), 1), meas
+        else:
+            c2, m2 = ctx, meas.replace(body, mutate(body, old, new), 1)
+        assert not state_consumer_ok(c2, m2), f"mutant {name!r} slipped through"
 
 
 def test_one_n_ctx_rule():

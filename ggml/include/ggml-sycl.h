@@ -1724,6 +1724,24 @@ GGML_BACKEND_API bool ggml_backend_sycl_load_reserve_state_term(struct ggml_sycl
                                                                 int32_t                   device,
                                                                 uint64_t                  state_bytes);
 
+// The early stage's record of a load's state term (llama.cpp-p6i0): the state bytes the probe reserved for device, at
+// the n_ctx that measure ran with, recorded in the ledger under the state term's own name beside c(P), never added to
+// it.  ggml_backend_sycl_load_late_check_state compares the late measure's state against it.  False, recording
+// nothing, on the same conditions as ggml_backend_sycl_load_record_compute_term.
+// Proc name: "ggml_backend_sycl_load_record_state_term".
+GGML_BACKEND_API bool ggml_backend_sycl_load_record_state_term(struct ggml_sycl_load_txn txn,
+                                                               int32_t                   device,
+                                                               uint64_t                  bytes,
+                                                               uint32_t                  n_ctx);
+
+// The late measure's state for device against the state term the early stage recorded (llama.cpp-p6i0), under the
+// rule of ggml_backend_sycl_load_late_check and with the state term's own name in its lines: a state is compared with
+// a state, never with the compute term.  Fail-closed the same way.
+// Proc name: "ggml_backend_sycl_load_late_check_state".
+GGML_BACKEND_API enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check_state(struct ggml_sycl_load_txn txn,
+                                                                                          int32_t  device,
+                                                                                          uint64_t state_bytes);
+
 // The residency probe (llama.cpp-moua L4 step 3d, llama.cpp-5cim).  Which layers would this context's plan leave in
 // host memory?  A pure plan query: it takes no replan lock, publishes nothing and changes nothing, and works with no
 // tenants and no published section (the caller asks before it publishes).

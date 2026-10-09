@@ -165,6 +165,34 @@ static bool fake_reserve_state(struct ggml_sycl_load_txn txn, int32_t device, ui
     return g_state_answer;
 }
 
+// The state record and the state late check (llama.cpp-p6i0): they record what they were handed and answer what the
+// test picks.
+static bool     g_srec_answer = true;
+static int      g_srec_calls  = 0;
+static uint64_t g_srec_txn    = 0;
+static int32_t  g_srec_dev    = -2;
+static uint64_t g_srec_bytes  = 0;
+static uint32_t g_srec_n_ctx  = 0;
+
+static bool fake_record_state(struct ggml_sycl_load_txn txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
+    g_srec_calls++;
+    g_srec_txn   = txn.id;
+    g_srec_dev   = device;
+    g_srec_bytes = bytes;
+    g_srec_n_ctx = n_ctx;
+    return g_srec_answer;
+}
+
+static int      g_slate_answer = GGML_SYCL_LATE_CHECK_EQUAL;
+static int      g_slate_calls  = 0;
+static uint64_t g_slate_bytes  = 0;
+
+static ggml_sycl_late_check_result fake_late_check_state(struct ggml_sycl_load_txn, int32_t, uint64_t bytes) {
+    g_slate_calls++;
+    g_slate_bytes = bytes;
+    return (ggml_sycl_late_check_result) g_slate_answer;
+}
+
 // The reservation's units: answers a value the test picks, and records the chunk list it was handed.
 static bool                  g_term_answer = true;
 static uint64_t              g_term_value  = 0;
@@ -437,7 +465,11 @@ int main() {
         CHECK(!procs.load_terms_available(),
               "the three compute-term procs without the state reserve report the load terms");
         procs.reserve_state = &fake_reserve_state;
-        CHECK(procs.load_terms_available(), "the four load procs do not report the load terms");
+        CHECK(!procs.load_terms_available(), "the four load procs without the state record report the load terms");
+        procs.record_state = &fake_record_state;
+        CHECK(!procs.load_terms_available(), "the five load procs without the state late check report the load terms");
+        procs.late_check_state = &fake_late_check_state;
+        CHECK(procs.load_terms_available(), "the six load procs do not report the load terms");
         CHECK(!procs.available(), "the load procs made the table L4");
         llama_sycl_l4_procs record_only;
         record_only.record_term = &fake_record;
@@ -495,6 +527,47 @@ int main() {
               "a refused state reservation was read as reserved");
         g_state_answer = true;
         CHECK(!procs.load_terms_available() && !procs.available(), "the state reserve proc alone reports a gate");
+    }
+
+    // (16) the state term's record and late check doors (llama.cpp-p6i0): the state under its own name
+    {
+        llama_sycl_l4_procs none;
+        g_srec_calls  = 0;
+        g_slate_calls = 0;
+        CHECK(!llama_sycl_l4_record_state_term(none, ggml_sycl_load_txn{ 9 }, 0, 1, 4096),
+              "a null state record proc was read as recorded");
+        CHECK(llama_sycl_l4_late_check_state(none, ggml_sycl_load_txn{ 9 }, 0, 1) == GGML_SYCL_LATE_CHECK_NOT_RECORDED,
+              "a null state late check was read as a comparison");
+        CHECK(g_srec_calls == 0 && g_slate_calls == 0, "a null proc was called");
+
+        llama_sycl_l4_procs procs;
+        procs.record_state     = &fake_record_state;
+        procs.late_check_state = &fake_late_check_state;
+        g_srec_answer          = true;
+        CHECK(llama_sycl_l4_record_state_term(procs, ggml_sycl_load_txn{ 44 }, 1, 118038528, 262144),
+              "a recorded state was read as not recorded");
+        CHECK(g_srec_calls == 1 && g_srec_txn == 44 && g_srec_dev == 1 && g_srec_bytes == 118038528ull &&
+                  g_srec_n_ctx == 262144,
+              "the state record arguments were not forwarded");
+        g_srec_answer = false;
+        CHECK(!llama_sycl_l4_record_state_term(procs, ggml_sycl_load_txn{ 44 }, 1, 1, 262144),
+              "a refused state record was read as recorded");
+        g_srec_answer = true;
+
+        const int answers[] = { GGML_SYCL_LATE_CHECK_EQUAL, GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED,
+                                GGML_SYCL_LATE_CHECK_REFUSED, GGML_SYCL_LATE_CHECK_NOT_RECORDED };
+        for (int a : answers) {
+            g_slate_answer = a;
+            CHECK(llama_sycl_l4_late_check_state(procs, ggml_sycl_load_txn{ 44 }, 1, 118038528) == a,
+                  "a state late-check answer did not pass through");
+        }
+        CHECK(g_slate_bytes == 118038528ull, "the state bytes were not forwarded");
+        g_slate_answer = 77;
+        CHECK(
+            llama_sycl_l4_late_check_state(procs, ggml_sycl_load_txn{ 44 }, 1, 1) == GGML_SYCL_LATE_CHECK_NOT_RECORDED,
+            "a value outside the enum was read as a comparison");
+        g_slate_answer = GGML_SYCL_LATE_CHECK_EQUAL;
+        CHECK(!procs.load_terms_available() && !procs.available(), "the state record and check alone report a gate");
     }
 
     // (4) the section builder

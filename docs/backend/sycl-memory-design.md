@@ -2782,6 +2782,23 @@ shared zone, and the buffer took whatever the allocator found. On the B70 with Q
 - A late check that matches prints one WARN per device and load:
   `[LOAD-PLAN] late check on device N: compute term equal (X MiB), early reservation stands`. A pass that printed
   nothing could not be told from a check that never ran.
+- The state term is recorded in the same ledger under its own name, never added to c(P), so the late check still
+  compares compute with compute. At the admitted stage each reserved device records the probe's state, the value the
+  reservation holds (`ggml_backend_sycl_load_record_state_term`). The late check compares the late measure's state with
+  it under the same rule (`ggml_backend_sycl_load_late_check_state`): larger refuses the load as `term state in zone
+  RUNTIME`, smaller is admitted with the shrink WARN, and equal WARNs `state term equal`. That catches a state that
+  moves at the dev_layer sync, which can retier recurrent layers to the CPU. A late state with no record WARNs
+  `late state check on device N: no state term was recorded`, because that state is allocated in RUNTIME unplanned. A
+  device whose late state is zero is not asked, so a state that leaves a device entirely gives no shrink WARN. The
+  loader prints `state term on device N` on its own line beside the compute-slot line.
+
+**Invariant: every RUNTIME-first consumer at context time is named in the reserve.** The real context allocates
+some memory in the RUNTIME zone first, after the load and before its compute buffer. Each such consumer needs a planned
+term of its own, or it draws down the compute term and a compute chunk lands outside the zone. In the Qwen3.8 B70
+trace, the RUNTIME allocations between the KV placement and the compute buffer were the recurrent state (the state
+term) and the dense MMQ Q8_1 src1 scratch (`llama.cpp-g6yk`'s term). A new consumer of that kind must add its own term.
+`tests/test-sycl-load-measure-source.py` pins the recurrent state at every hop, from `memory_breakdown` in the measure
+through the probe reservation and the admitted record to the late check. A mutant that drops it at any hop fails.
 
 **How it is drawn and dropped.**
 
@@ -2815,10 +2832,13 @@ recovery path: it measures the driver's working set and sizes the headroom from 
   trial accepts both. So a dense auto pick above 512 can land `zone=raw`, in the external headroom. That is an open
   finding, not an invariant of this design. MoE models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the
   auto pick's. `llama.cpp-fkpg` (a) transports the caller's shape.
-- The state term is read at the measure's `n_seq_max` of 1, so `-np` above 1 under-reserves it, like the caller's
-  `-c` and `-ub` above (`llama.cpp-fkpg`). It is summed per buffer type, so a type holding several buffers can round
-  up by one grain per extra buffer beyond the term. It is reserved at the probe and is not re-checked at the admitted
-  or late stage.
+- The state term is measured at the measure's `n_seq_max` of 1, so a context with `-np` above 1 allocates more state
+  than the term holds. No load-time check sees that. The late check also measures at `n_seq_max` 1, so its refusal and
+  its shrink WARN compare one sequence's state with one sequence's state. The excess takes RUNTIME room from the
+  compute buffer, and the buffer's last chunk can land `zone=raw`. Today that landing line is the only signal. Catching
+  it needs either a context-side comparison of the real state with the planned term, or the caller's shape at the load
+  (`llama.cpp-fkpg`). The state is summed per buffer type, so a type holding several buffers can round up by one grain
+  per extra buffer beyond the term.
 - A second model whose term is larger than the live one's raises the RUNTIME requirement. The late zone rebuild is
   refused while the first model holds allocations, so that load reaches the abort in
   `compute_and_store_plan_for_inventory`. `llama.cpp-ouur` refuses it by name instead.

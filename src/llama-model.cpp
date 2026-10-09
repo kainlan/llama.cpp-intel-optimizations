@@ -2655,6 +2655,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         admitted.probe_kv.n_device, admitted.probe_kv.n_host, admitted.probe_kv.n_cpu,
                         admitted.admitted_kv.n_device, admitted.admitted_kv.n_host, admitted.admitted_kv.n_cpu);
                 }
+                if (t.state_bytes != 0) {
+                    // the state term, on its own line: the compute line above never includes it
+                    LLAMA_LOG_WARN(
+                        "%s: [LOAD-PLAN] state term on device %d: %.1f MiB of recurrent state %s, %s; measured at "
+                        "n_seq_max 1, so a context with more sequences allocates more state than this holds\n",
+                        __func__, (int) t.device, t.state_bytes / 1024.0 / 1024.0,
+                        t.reserved ? "reserved in RUNTIME beside the compute term" :
+                                     "NOT reserved (the backend said why)",
+                        t.state_recorded ? "recorded for the late check" : "not recorded");
+                }
             }
         }
 
@@ -2823,6 +2833,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // nothing was compared for this device, which is not a pass; the text carries the measured term
             const std::string text =
                 llama_late_check_not_recorded_text(late.not_recorded[i], late.n_ubatch, late.not_recorded_bytes[i]);
+            LLAMA_LOG_WARN("%s: %s\n", __func__, text.c_str());
+        }
+        for (size_t i = 0; i < late.state_not_recorded.size(); ++i) {
+            const std::string text =
+                llama_late_check_state_not_recorded_text(late.state_not_recorded[i], late.state_not_recorded_bytes[i]);
             LLAMA_LOG_WARN("%s: %s\n", __func__, text.c_str());
         }
         if (!late.refusal.empty()) {

@@ -294,6 +294,9 @@ struct llama_late_check_result {
     // the measured compute term c(P) of each not_recorded device, in the same order: what the late measure found,
     // printed so a load can be read against the real compute buffer even though nothing was compared
     std::vector<size_t>  not_recorded_bytes;
+    // devices whose late state had no state term to compare (llama.cpp-p6i0), and that state, in the same order
+    std::vector<int32_t> state_not_recorded;
+    std::vector<size_t>  state_not_recorded_bytes;
 };
 
 // The WARN the loader prints for a device the backend recorded nothing for: nothing was compared, which is
@@ -305,6 +308,16 @@ inline std::string llama_late_check_not_recorded_text(int32_t device, uint32_t n
            ": no early compute term was recorded for this load, nothing was compared (ubatch " +
            std::to_string(n_ubatch) + "; measured compute term " + mib + " MiB on device " + std::to_string(device) +
            ")";
+}
+
+// The WARN the loader prints for a device whose late state had no state term to compare (llama.cpp-p6i0): that state
+// is allocated in the RUNTIME zone with nothing reserved for it, the defect the state term exists to prevent.
+inline std::string llama_late_check_state_not_recorded_text(int32_t device, size_t measured_bytes) {
+    char mib[32];
+    std::snprintf(mib, sizeof(mib), "%.1f", measured_bytes / 1024.0 / 1024.0);
+    return "[LOAD-PLAN] late state check on device " + std::to_string(device) +
+           ": no state term was recorded for this load, nothing was compared (measured state " + mib +
+           " MiB on device " + std::to_string(device) + "; it is allocated in the RUNTIME zone unplanned)";
 }
 
 // Folds the measured devices through the backend's late check. A device the backend recorded nothing for
@@ -319,6 +332,11 @@ inline std::string llama_late_check_not_recorded_text(int32_t device, uint32_t n
 // device field is the first SYCL device's, so a host-tier refusal reads "on device N" while its reason names
 // SYCL_Host or SYCL_CpuActivation, whichever is the compute buft. The probe and admitted stages skip the host tier
 // the same way (llama_load_probe_bound, llama_admitted_check_fold): no host term is reserved or recorded.
+//
+// A device whose late measure placed recurrent state on it (llama.cpp-p6i0) then has that state checked against the
+// state term under its own name, never against c(P): REFUSED ends the fold by name, NOT_RECORDED lists the device in
+// `state_not_recorded`. A device whose late state is zero is not asked, so a state that left a device entirely (its
+// layers moved to the CPU at the dev_layer sync) gives no shrink WARN; its reservation stands, as a shrink's does.
 inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs &                    procs,
                                                      struct ggml_sycl_load_txn                      txn,
                                                      const std::vector<llama_load_measure_device> & devices,
@@ -341,6 +359,23 @@ inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs &
             case GGML_SYCL_LATE_CHECK_NOT_RECORDED:
                 out.not_recorded.push_back(d.device);
                 out.not_recorded_bytes.push_back(d.total);
+                break;
+        }
+        if (d.state_bytes == 0) {
+            continue;
+        }
+        switch (llama_sycl_l4_late_check_state(procs, txn, d.device, d.state_bytes)) {
+            case GGML_SYCL_LATE_CHECK_EQUAL:
+            case GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED:
+                break;
+            case GGML_SYCL_LATE_CHECK_REFUSED:
+                out.refusal = llama_load_measure_refusal_text(
+                    GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, d.device,
+                    "the final placement needs more recurrent state than the reserved state term");
+                return out;
+            case GGML_SYCL_LATE_CHECK_NOT_RECORDED:
+                out.state_not_recorded.push_back(d.device);
+                out.state_not_recorded_bytes.push_back(d.state_bytes);
                 break;
         }
     }
@@ -421,6 +456,8 @@ struct llama_admitted_term {
     size_t  admitted_term  = 0;     // c(P) in the reservation's units, compared with probe_term
     size_t  admitted_bytes = 0;     // c(P) as the measure's total: what the ledger records and the late check compares
     size_t  kv_excess      = 0;     // admitted_term - probe_term, admitted because the KV residency moved; unreserved
+    size_t  state_bytes    = 0;     // the probe's state, the one the reservation holds: recorded under its own name
+    bool    state_recorded = false;  // the backend recorded state_bytes as this device's state term
 };
 
 struct llama_admitted_check_result {
@@ -430,6 +467,7 @@ struct llama_admitted_check_result {
     uint32_t                         n_ctx      = 0;  // the n_ctx and ubatch the measure ran at
     uint32_t                         n_ubatch   = 0;
     size_t                           n_recorded = 0;  // the terms the backend recorded
+    size_t                           n_state_recorded = 0;  // the state terms the backend recorded
     llama_kv_residency_tally         probe_kv;        // the KV residency each measure saw
     llama_kv_residency_tally         admitted_kv;
 };
@@ -476,6 +514,7 @@ inline llama_admitted_check_result llama_admitted_check_fold(const llama_sycl_l4
         t.device         = d.device;
         t.admitted_bytes = d.total;
         t.reserved       = std::find(not_reserved.begin(), not_reserved.end(), d.device) == not_reserved.end();
+        t.state_bytes    = bound->state_bytes;
         const bool sized = llama_sycl_l4_compute_term_bytes(procs, bound->chunk_bytes, &t.probe_term) &&
                            llama_sycl_l4_compute_term_bytes(procs, d.chunk_bytes, &t.admitted_term);
         if (t.reserved && !sized) {
@@ -507,6 +546,23 @@ inline size_t llama_admitted_record(const llama_sycl_l4_procs &         procs,
         if (t.reserved && llama_sycl_l4_record_compute_term(procs, txn, t.device, t.admitted_bytes, n_ctx)) {
             ++n;
         }
+    }
+    return n;
+}
+
+// Records each reserved device's state, the probe's (the one the reservation holds), under the state term's own name
+// at the measure's n_ctx (llama.cpp-p6i0), and marks each term whose state the backend recorded. A device with no
+// state or no reservation records nothing. Returns how many were recorded. The state is never added to c(P): the
+// late check compares a late state with this record and a late c(P) with c(P).
+inline size_t llama_admitted_record_state(const llama_sycl_l4_procs &   procs,
+                                          struct ggml_sycl_load_txn     txn,
+                                          llama_admitted_check_result & admitted,
+                                          uint32_t                      n_ctx) {
+    size_t n = 0;
+    for (auto & t : admitted.terms) {
+        t.state_recorded = t.reserved && t.state_bytes != 0 &&
+                           llama_sycl_l4_record_state_term(procs, txn, t.device, t.state_bytes, n_ctx);
+        n += t.state_recorded ? 1 : 0;
     }
     return n;
 }
