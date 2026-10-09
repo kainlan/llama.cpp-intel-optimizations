@@ -2661,7 +2661,7 @@ static void ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_m
 #include "ggml-sycl/moe-discovery-state.hpp"
 // Owner-keyed ownership for the MoE expert-bias and fused-activation cluster
 #include "ggml-sycl/moe-bias-state.hpp"
-// Persistent CPU expert thread pool with ring-buffered staging
+// Persistent CPU expert thread pool
 #include "ggml-sycl/cpu-expert-pool.hpp"
 // TKV-13 (B2): dedicated persistent thread pool for demoted-layer attention.
 // Its OWN class, not a CpuExpertPool generalization (owner ruling
@@ -88179,10 +88179,11 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     // thread is a global resource tied to split config; it self-terminates
     // via static destructor at program exit.
     // Shut down ExpertPrefetcher, CpuExpertPool and PinnedBufferPool instances
-    // while the unified cache and SYCL context are still alive.  All pools use
-    // unified_alloc for their VRAM buffers; if we leave this to the static
-    // destructor, the unified cache statics may already be destroyed → SIGSEGV
-    // or BCS CAT error (in-flight DMA targeting freed VRAM).
+    // while the unified cache and SYCL context are still alive.  The
+    // ExpertPrefetcher and PinnedBufferPool hold unified-cache allocations; if
+    // we leave them to the static destructor, the unified cache statics may
+    // already be destroyed → SIGSEGV or BCS CAT error (in-flight DMA targeting
+    // freed VRAM).  CpuExpertPool holds no memory, only workers to join.
     // shutdown() is idempotent and a no-op for pools that were never started.
     // ExpertPrefetcher must be shut down first: cancel_all() waits for
     // in-flight BCS DMAs whose destinations are VRAM owned by the unified

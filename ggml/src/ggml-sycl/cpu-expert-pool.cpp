@@ -180,8 +180,8 @@ void CpuExpertPool::shutdown() {
 }
 
 CpuExpertPool::~CpuExpertPool() {
-    // Skip cleanup during static destruction — unified cache statics
-    // (g_runtime_alloc_registry etc.) may already be destroyed.
+    // During static destruction run only stop_workers(): shutdown() also logs
+    // through the installed log callback, whose owner may already be destroyed.
     if (!ggml_sycl_is_shutting_down()) {
         shutdown();
         return;

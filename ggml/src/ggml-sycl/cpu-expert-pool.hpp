@@ -39,7 +39,7 @@ class CpuExpertPool {
     CpuExpertPool & operator=(CpuExpertPool &&)      = delete;
 
     // Initialize the pool. Must be called once (e.g. from moe_hybrid_init_once).
-    //   n_threads:    worker thread count (0 = auto: hardware_concurrency - 2)
+    //   n_threads: worker thread count (0 = auto: hardware_concurrency - 2)
     void init(int n_threads);
 
     // Shut down all workers.
