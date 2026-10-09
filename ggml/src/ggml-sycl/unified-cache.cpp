@@ -30941,10 +30941,10 @@ static void plan_single_device_layer_kv(placement_plan &            plan,
 // whose KV does not fit beside the dense weights still opens: the runtime context transaction re-places the overflow to
 // the host tier.
 //
-// The context is the one the caller asked for (llama_model_params::n_ctx_hint, llama.cpp-ak0p), or n_ctx_train when no
-// request reached the load. A context created smaller than that leaves the rest of the room unused, and the experts it
-// displaced stay on the host tier, because experts are placed once, at load, and nothing promotes them when the
-// context turns out smaller.
+// The context is the one the caller asked for (llama_model_params::n_ctx_hint, llama.cpp-ak0p). With no request no room
+// is held, and the KV beyond the planning n_ctx is placed when the context is created. A context created smaller than
+// the request leaves the rest of the room unused, and the experts it displaced stay on the host tier, because experts
+// are placed once, at load, and nothing promotes them when the context turns out smaller.
 struct kv_context_room {
     size_t wanted   = 0;  // the extra KV of every layer whose KV is on the device
     size_t held     = 0;  // min(wanted, what was left)
@@ -30989,26 +30989,32 @@ static kv_context_room hold_kv_context_room(placement_plan &          plan,
 
 // The room's line, after the experts are packed, so it can say what the room cost: the device bytes of routed
 // experts the pack placed against those the same pack places with the room added back. A WARN when it cost experts or
-// could not hold all it wanted, so a default run shows it.
+// could not hold all it wanted, so a default run shows it. With no requested context, one INFO line says no room is
+// held.
 static void log_kv_context_room(const kv_context_room & room, const placement_kv_info & kv_info, int device_id) {
+    if (kv_info.n_ctx_context == 0) {
+        GGML_LOG_INFO(
+            "[PLACEMENT] no KV context room on device %d: no requested n_ctx reached the load "
+            "(planner n_ctx=%u); KV beyond it is placed at context creation\n",
+            device_id, kv_info.n_ctx);
+        return;
+    }
     if (room.wanted == 0) {
         return;
     }
     const double mb         = 1024.0 * 1024.0;  // MB as the sibling [PLACEMENT] lines print it
     const bool   warn       = room.displaced_bytes() > 0 || room.held < room.wanted;
     const char * short_note = room.held < room.wanted ? ", all that was left; the context's overflow is re-placed" : "";
-    const char * source =
-        kv_info.n_ctx_context_requested ? "the requested n_ctx" : "the default n_ctx_train (no -c reached the load)";
     // ggml_log_internal, not the GGML_LOG_* macros, so the level is chosen at run time and the arguments are written
     // once.
     ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
                       "[PLACEMENT] KV context room on device %d: held %.1f MB of %.1f MB for n_ctx_context=%u over "
                       "planner n_ctx=%u (%zu layer(s)), before the routed experts%s; it cost %.1f MB of "
                       "device-resident routed experts: %.1f MB (%zu triplet(s)) on the device, against %.1f MB (%zu) "
-                      "with the room added back. n_ctx_context is %s.\n",
+                      "with the room added back. n_ctx_context is the requested n_ctx.\n",
                       device_id, room.held / mb, room.wanted / mb, kv_info.n_ctx_context, kv_info.n_ctx, room.n_layers,
                       short_note, room.displaced_bytes() / mb, room.expert_bytes / mb, room.expert_groups,
-                      room.expert_bytes_without / mb, room.expert_groups_without, source);
+                      room.expert_bytes_without / mb, room.expert_groups_without);
 }
 
 placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,

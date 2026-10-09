@@ -703,9 +703,10 @@ static bool run_kv_context_room_cost_is_net_test() {
     return true;
 }
 
-// llama.cpp-ak0p: the room is for the context the caller asked for, not the training context. A requested n_ctx 4096
-// holds the KV of (4096 - planner n_ctx 512) cells on each device layer, and the experts keep what is left. A room for
-// a training context of 32768 on the same budget takes everything the dense weights and their KV leave.
+// llama.cpp-ak0p: the room is for the context the caller asked for, and there is none without a request. A requested
+// n_ctx 4096 holds the KV of (4096 - planner n_ctx 512) cells on each device layer, and the experts keep what is left.
+// With no request (n_ctx_context 0) the planner holds nothing, and the experts take every byte the dense weights and
+// their KV leave, as they did before the room existed.
 static bool run_kv_context_room_follows_the_requested_context_test() {
     using namespace kv_order_case;
     constexpr size_t cell_bytes = (kv_width + kv_width) * 2;      // f16 K and V of one cell of one layer
@@ -721,13 +722,17 @@ static bool run_kv_context_room_follows_the_requested_context_test() {
             requested.kv_context_reserve_bytes, room_4096, device_triplets(requested));
         return false;
     }
-    const auto train = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(32768), nullptr, n_experts);
-    if (train.kv_context_reserve_bytes != left || device_triplets(train) != 0) {
-        printf("FAIL: the training context's room holds all %zu bytes left, held %zu, %zu device triplets (want 0)\n",
-               left, train.kv_context_reserve_bytes, device_triplets(train));
+    const size_t no_room_triplets = left / triplet_bytes;  // every triplet that fits what is left: 6 of the 8
+    const auto   none = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(0), nullptr, n_experts);
+    if (none.kv_context_reserve_bytes != 0 || none.kv_context_room_displaced_bytes != 0 ||
+        device_triplets(none) != no_room_triplets) {
+        printf(
+            "FAIL: with no requested context the planner holds %zu bytes (want 0) and keeps %zu device triplets "
+            "(want %zu)\n",
+            none.kv_context_reserve_bytes, device_triplets(none), no_room_triplets);
         return false;
     }
-    printf("PASS: the KV context room follows the requested context, not n_ctx_train\n");
+    printf("PASS: the KV context room follows the requested context, and there is none without one\n");
     return true;
 }
 

@@ -352,9 +352,9 @@ struct ggml_sycl_tensor_inventory {
     uint32_t                       kv_layer_count;        // Length of the three arrays above (0 = not populated)
     // llama.cpp-8ecj: the context the model opens with, whose KV room the planner holds on the device ahead of the
     // routed experts; n_ctx above stays the load's own planning shape. llama.cpp-ak0p: libllama fills it with the
-    // context the caller is about to create (llama_model_params::n_ctx_hint), or n_ctx_train when no request reached
-    // the load; n_ctx_context_requested below says which. 0 = unknown: no room is held. libllama and libggml-sycl must
-    // be rebuilt together for the planner to see it (see kv_idx_k_width_per_layer for the layout).
+    // context the caller is about to create (llama_model_params::n_ctx_hint), padded as llama_context pads n_ctx.
+    // 0 = no request reached the load: no room is held. libllama and libggml-sycl must be rebuilt together for the
+    // planner to see it (see kv_idx_k_width_per_layer for the layout).
     uint32_t                       n_ctx_context;
     // llama.cpp-8ecj: the key width of each layer's indexer key cache (llama_memory_hybrid_idx, qwen4exp: one key head
     // of indexer_head_size, no V) [kv_layer_count]; 0 where a layer has none. NULL and an all-zero array both mean no
@@ -366,10 +366,6 @@ struct ggml_sycl_tensor_inventory {
     // caller's object, and with kv_layer_count > 0 dereferences whatever lies there as an array of kv_layer_count
     // widths. libllama and libggml-sycl must be rebuilt together.
     const uint32_t *               kv_idx_k_width_per_layer;
-    // llama.cpp-ak0p: 1 when n_ctx_context is the context the caller asked for (llama_model_params::n_ctx_hint), 0
-    // when no request reached the load and it is n_ctx_train. Only the room's log line reads it. Appended: the struct
-    // grew from 184 to 192 bytes, which ggml-sycl.cpp pins; libllama and libggml-sycl must be rebuilt together.
-    uint8_t                        n_ctx_context_requested;
 };
 
 // SYCL-side projection of the four placement-envelope fields the llama

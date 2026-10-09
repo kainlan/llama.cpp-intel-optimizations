@@ -955,7 +955,7 @@ static void test_qwen38_indexer_keys_budgeted_and_sized_per_buffer() {
     check_eq("qwen38: the indexer keys alone", kv.kv_idx_bytes_for_layer_at(3, 262144), 64 * mib);
     check_eq("qwen38: a recurrent layer holds no KV", kv.kv_bytes_for_layer(0), 0u);
 
-    // the load's view: charged at n_ctx=512, the room for n_ctx_train=262144 on top
+    // the load's view: charged at n_ctx=512, the room for a requested -c 262144 (n_ctx_train) on top
     placement_kv_info load = make_qwen38(512, 512);
     load.n_ctx_context     = 262144;
     check_eq("qwen38: the load charges both caches at n_ctx", load.kv_bytes_for_layer(3), 1152u * 1024u);

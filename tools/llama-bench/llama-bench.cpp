@@ -1223,9 +1223,7 @@ struct cmd_params_instance {
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
 
-        // llama.cpp-ak0p: the SYCL load holds this context's KV room ahead of the routed experts. equal_mparams leaves
-        // the hint out, so a context change does not reload the model: a later instance on the same model keeps the
-        // room of the instance that loaded it, and a larger context's overflow is re-placed when its context opens.
+        // llama.cpp-ak0p: the SYCL load holds this context's KV room ahead of the routed experts (see equal_mparams).
         mparams.n_ctx_hint = n_ctx();
 
         mparams.n_gpu_layers = n_gpu_layers;
@@ -1279,6 +1277,8 @@ struct cmd_params_instance {
         return mparams;
     }
 
+    // n_ctx_hint is left out, so a context change does not reload the model: a reused model keeps the first
+    // instance's room, and a larger later context is re-placed at context creation (llama.cpp-ak0p).
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                split_mode == other.split_mode &&

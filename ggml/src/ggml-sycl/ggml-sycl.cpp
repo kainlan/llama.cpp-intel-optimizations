@@ -17018,11 +17018,10 @@ static bool ggml_sycl_other_backend_context_live(int device, const ggml_backend_
 
 // The inventory crosses from libllama into this library by pointer, so a field that moves would be read from the wrong
 // place without any error. These pin the KV tail of the layout (llama.cpp-8ecj).
-static_assert(sizeof(ggml_sycl_tensor_inventory) == 192, "ggml_sycl_tensor_inventory layout changed");
+static_assert(sizeof(ggml_sycl_tensor_inventory) == 184, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168, "kv_layer_count moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172, "n_ctx_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176, "kv_idx_k_width_per_layer moved");
-static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_requested) == 184, "n_ctx_context_requested moved");
 
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
 // snapshot.  Idempotent — safe to call from both the early pre-create_tensor
@@ -17236,8 +17235,6 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     g_placement_kv_info.n_ctx_is_runtime = false;
     // llama.cpp-8ecj: the context the model opens with, whose KV room the planner holds ahead of the routed experts.
     g_placement_kv_info.n_ctx_context    = inventory->n_ctx_context;
-    // llama.cpp-ak0p: whether that context is the caller's request or n_ctx_train, for the room's line.
-    g_placement_kv_info.n_ctx_context_requested = inventory->n_ctx_context_requested != 0;
     if (g_placement_kv_info.valid()) {
         GGML_LOG_INFO(
             "[SYCL-PLAN] KV inputs: n_layer=%u n_embd_k_gqa=%u n_embd_v_gqa=%u n_ctx=%u (%s) kv_per_layer=%.1f MB "

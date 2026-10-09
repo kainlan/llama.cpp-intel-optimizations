@@ -431,13 +431,14 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     inventory.n_ctx                   = inventory.n_ubatch;
     // llama.cpp-8ecj: ...except the room for it. The planner holds the KV room of the context the model opens with on
     // the device ahead of the routed experts, so the experts fill only what the dense weights and that KV leave.
-    // llama.cpp-ak0p: that context is the one the caller is about to create (llama_model_params::n_ctx_hint). With no
-    // hint the caller creates n_ctx_train (a context n_ctx of 0 is the training context), so the room is for that. A
-    // hint above n_ctx_train (a rope-extended -c) is honoured: the caller asked for that context, and the room is
-    // already capped at what the dense weights and their KV leave. Only the room reads the hint: the planning shape
-    // above and the load measures (the placement envelope's n_ctx, still 0) keep their inputs.
-    inventory.n_ctx_context             = n_ctx_hint != 0 ? n_ctx_hint : hparams.n_ctx_train;
-    inventory.n_ctx_context_requested   = n_ctx_hint != 0;
+    // llama.cpp-ak0p: that context is the one the caller is about to create (llama_model_params::n_ctx_hint), padded
+    // as llama_context pads n_ctx (src/llama-context.cpp: cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256)), so the room
+    // is never short of it. With no hint no room is held (0): a run without -c places as it did before the room, and
+    // its KV beyond the planning shape is placed when the context is created. A hint above n_ctx_train (a
+    // rope-extended -c) is honoured: the caller asked for that context, and the room is already capped at what the
+    // dense weights and their KV leave. Only the room reads the hint: the planning shape above and the load measures
+    // (the placement envelope's n_ctx, still 0) keep their inputs.
+    inventory.n_ctx_context             = n_ctx_hint != 0 ? GGML_PAD(n_ctx_hint, 256) : 0;
     if (hparams.n_expert > 0 && hparams.n_expert_used_max() > 0) {
         // llama.cpp-sr83 (C3): the batched executor repacks straight to a
         // {nibbles,e8m0-scales} WOQ shape by default and deletes the f16

@@ -18,11 +18,10 @@ one helper kv_buffer_device_bytes(). test-kv-runtime-demotion runs that helper o
 Nothing budgeted the indexer cache either: the inventory published the attention widths only, so the planner, the KV
 context room, the runtime transaction and the largest-fitting -c hint all left its 768 MiB out, and the 748.6 MiB
 the room left could not take it. The fix this gate pins: the indexer key width travels as its own per-layer field
-(ggml_sycl_tensor_inventory::kv_idx_k_width_per_layer, appended, its offset and the struct size pinned at the
-consumer), every budget (placement_kv_info::kv_bytes_for_layer_at, placement_plan::kv_size_for_layer, the -c hint)
-adds the indexer keys to the layer's K/V, and the tier manager compares each buffer with its own cache's sum, never
-with the layers' total, which no single buffer holds. test-sycl-kv-layer-sizing runs the two buffers through
-configure_from_plan.
+(ggml_sycl_tensor_inventory::kv_idx_k_width_per_layer, appended, sizeof 184 pinned at the consumer), every budget
+(placement_kv_info::kv_bytes_for_layer_at, placement_plan::kv_size_for_layer, the -c hint) adds the indexer keys to
+the layer's K/V, and the tier manager compares each buffer with its own cache's sum, never with the layers' total,
+which no single buffer holds. test-sycl-kv-layer-sizing runs the two buffers through configure_from_plan.
 
 The GGML_SYCL_KV_HOT_LAYERS override used to return from configure_from_plan before the per-layer sizing, so the
 manager the allocator reuses kept the previous buffer's sizes and the backstop charged the indexer buffer the K/V
@@ -127,12 +126,11 @@ REFUSE = "if (ggml_sycl::kv_admission_mismatch(planned_device_bytes, kv_vram_cap
 HELPER_SUM = "if (l < member.size() && member[l] != 0 && layer_owner[l] == device) { total += layer_bytes[l]; }"
 
 
-# llama.cpp-ak0p appended n_ctx_context_requested after it, so the struct no longer ends here and is 192 bytes.
-FIELD = "uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer;"
+FIELD = "uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; };"
 READ = ("g_placement_kv_info.layer_idx_k_width.assign(inventory->kv_idx_k_width_per_layer, "
         "inventory->kv_idx_k_width_per_layer + inventory->kv_layer_count);")
 LAYOUT = (
-    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,",
+    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 184,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176,",

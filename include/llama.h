@@ -354,9 +354,9 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
 
-        // the context the caller is about to create (llama_context_params::n_ctx); 0 = unknown, the load then plans
-        // for n_ctx_train. A placement hint: a backend that places weights at load (SYCL) holds this context's KV
-        // room on the device ahead of the routed experts. The context itself may still be created at any size.
+        // the context the caller is about to create (llama_context_params::n_ctx); 0 = unknown. A placement hint: a
+        // backend that places weights at load (SYCL) holds this context's KV room on the device ahead of the routed
+        // experts, and holds none for 0. The context itself may still be created at any size.
         uint32_t n_ctx_hint;
     };
 
