@@ -300,9 +300,11 @@ void kv_tier_manager::configure_from_plan(int                          device,
     active_ = (hot_layers_ < total_layers_);
 
     // Per-layer KV sizes (llama.cpp-7yv9).  The plan's per-layer truth --
-    // placement_plan::kv_size_for_layer(): FULL / SWA / SHARED kind and that
-    // layer's own K/V width -- is what every other consumer of the KV budget
-    // sizes from; sizing here from the uniform scalars instead gave every SWA
+    // FULL / SWA / SHARED kind and that layer's own widths, summed by
+    // placement_plan::kv_size_for_layer() -- is what every other consumer of
+    // the KV budget sizes from.  A buffer takes its own part of it:
+    // kv_main_size_for_layer() for the K/V, kv_idx_size_for_layer() for the
+    // indexer keys.  Sizing here from the uniform scalars instead gave every SWA
     // layer of a Gemma 4 E4B buffer plan.kv_per_swa_layer (computed at the
     // global full-attention width) and reserved 2x its real bytes.
     //
@@ -398,9 +400,10 @@ void kv_tier_manager::configure_from_plan(int                          device,
     // above: returning before it would leave the sizes the previous buffer set on this reused manager, and the
     // tiered allocator's backstop would charge an indexer buffer its K/V buffer's layers (llama.cpp-8ecj).
     const char * hot_layers_env = std::getenv("GGML_SYCL_KV_HOT_LAYERS");
-    const bool   hot_override   = hot_layers_env != nullptr && std::atoi(hot_layers_env) >= 0;
+    const int    hot_env_layers = hot_layers_env != nullptr ? std::atoi(hot_layers_env) : -1;
+    const bool   hot_override   = hot_env_layers >= 0;
     if (hot_override) {
-        hot_layers_ = std::min(static_cast<uint32_t>(std::atoi(hot_layers_env)), n_layers);
+        hot_layers_ = std::min(static_cast<uint32_t>(hot_env_layers), n_layers);
         layer_on_device_.assign(n_layers, false);
         for (uint32_t l = 0; l < hot_layers_; l++) {
             layer_on_device_[l] = true;
