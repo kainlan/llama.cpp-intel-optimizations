@@ -828,6 +828,15 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-dispatch-fail-closed-source.py --self-test)
     set_tests_properties(test-sycl-moe-cpu-dispatch-fail-closed-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+    # The host-expert MoE decode levers (llama.cpp-z4kd): the GLU of a host-expert
+    # layer asks moe_glu_input_host_produced (not the stale MUL_MAT_ID walk), the
+    # wait census times B1 around the id readback and classifies only when on,
+    # pending_any reads every scatter slot, and the retired GGML_SYCL_PIPELINE_CPU
+    # warns at init. WITH --self-test (15 mutants, ~13 s at load 10).
+    add_test(NAME test-sycl-moe-hostpath-levers-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-hostpath-levers-source.py --self-test)
+    set_tests_properties(test-sycl-moe-hostpath-levers-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # A hybrid MXFP4 xmx_tiled expert must be decoded by a kernel that reads
     # xmx_tiled: the grouped executor accepts partial cover, and the per-expert
     # direct path refuses layouts it cannot decode (llama.cpp-4hg7). WITH --self-test.
