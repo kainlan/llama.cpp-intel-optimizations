@@ -344,8 +344,9 @@ struct llama_model_sycl_kv_layer_arrays {
 // swa_layer_mask just below -- the inventory only stores raw pointers, and
 // must remain valid through the caller's llama_model_sycl_apply_inventory
 // call). Kind and width must agree with what the tensor loader actually
-// created: SHARED (llama_hparams::has_kv(il) == false, e.g. Gemma 4/3n's
-// trailing reused-KV layers) gets width 0; SWA/FULL both use
+// created: SHARED (every layer the KV cache does not own -- Gemma 4/3n's
+// trailing reused-KV layers, a hybrid model's recurrent layers, see the
+// paragraph below) gets width 0; SWA/FULL both use
 // hparams.n_embd_{k,v}_gqa(il), which is already per-layer (switches on
 // is_swa(il) internally -- see llama-hparams.cpp).
 // llama.cpp-8ecj: whether a layer owns K/V comes from the memory the default

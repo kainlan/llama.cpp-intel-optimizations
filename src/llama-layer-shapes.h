@@ -140,7 +140,10 @@ llama_kv_layer_shapes_result llama_kv_layer_shapes(const llama_model &         m
 // keeps hparams.has_kv(). When it is true, a layer whose `owns` is false has no K/V of its own: filtered (a hybrid
 // model's recurrent layers), reused or shared, or the memory has no KV cache at all (a recurrent or encoder model).
 // Which layers a cache owns does not depend on the cache type, the sequence count or flash attention, so the default
-// context's answer holds for every main context of the model.
+// context's answer holds for every main context of the model. It does depend on mem_other, which the default context
+// leaves null: a context built over another context's memory does not own the layers it shares from there, so a
+// Gemma 4 assistant context, which shares every layer from its target, owns none, while this answer says it owns them
+// all, the same over-count. For such a model the SYCL inventory still charges KV its context will not allocate.
 struct llama_kv_layer_owners {
     bool              modelled = false;
     std::vector<bool> owns;  // indexed by the model's layer index, size n_layer_all when modelled
