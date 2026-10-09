@@ -3998,8 +3998,9 @@ llama_load_measure_result llama_load_measure_run(const llama_model &            
     // exit it clears first and the context (which owns the backends once its constructor has taken them
     // from `args`) goes after; on a throw from the constructor the context has already unwound, and the
     // override clears next.
-    // The KV residency of the caches the measure context builds (the compute trace's KV line); declared
-    // before the holder so the count outlives the context.
+    // The KV residency of the caches the measure context builds: the compute trace's KV line, and the input the
+    // admitted fold judges a compute term above the probe bound by (llama_admitted_check_fold). Declared before the
+    // holder so the count outlives the context.
     llama_kv_residency_tally         kv_tally;
     llama_kv_residency_tally_scope   kv_tally_scope(kv_tally);
     std::unique_ptr<llama_context> holder;
