@@ -1197,6 +1197,21 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
         trace_t2                           = cpu_expert_trace_clock::now();
         g_cpu_expert_batched_last.setup_us = cpu_expert_trace_us(trace_t1, trace_t2);
         g_cpu_expert_batched_last.rows     = total_rows;
+        // The rows' weight type (GGML_TYPE_COUNT when they mix types) and bytes,
+        // over the tasks counted in total_rows: those given a row stride above.
+        bool first                         = true;
+        for (int i = 0; i < n_tasks; i++) {
+            if (meta[i].row_stride == 0) {
+                continue;
+            }
+            g_cpu_expert_batched_last.bytes += static_cast<uint64_t>(tasks[i].N) * meta[i].row_stride;
+            if (first) {
+                g_cpu_expert_batched_last.type = tasks[i].type;
+                first                          = false;
+            } else if (tasks[i].type != g_cpu_expert_batched_last.type) {
+                g_cpu_expert_batched_last.type = GGML_TYPE_COUNT;
+            }
+        }
     }
     ggml_sycl_cpu_arena().execute([&] {
         ggml_sycl_tbb::parallel_for(

@@ -176,6 +176,11 @@ struct cpu_expert_batched_phase_times {
     double compute_us = 0.0;  // first row range start to the parallel loop's return
     int    rows       = 0;
     int    threads    = 0;    // distinct threads that ran a row range
+    // Weight type of every row above, or GGML_TYPE_COUNT when the call's rows mix
+    // types, and their weight bytes (llama.cpp-y9i6): with compute_us they give
+    // the in-model rate of one quant type's kernel.
+    ggml_type type       = GGML_TYPE_COUNT;
+    uint64_t  bytes      = 0;
 };
 
 cpu_expert_batched_phase_times ggml_sycl_cpu_expert_batched_last_phase_times();

@@ -14,6 +14,7 @@
 #include <future>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -91,9 +92,41 @@ struct cpu_expert_pool_trace_totals {
     double   fanout_us   = 0.0;
     double   compute_us  = 0.0;
     double   wall_us     = 0.0;
+
+    // The same jobs split by the weight type of their rows (llama.cpp-y9i6).
+    // Slot GGML_TYPE_COUNT holds the jobs whose rows mix types.
+    //   threads_max  most threads one job of the type ran on
+    //   overlapped   jobs that started while another pool job was running: the
+    //                pools share one CPU arena, so those jobs' compute times
+    //                overlap and their sum overstates the time they took
+    struct type_totals {
+        uint64_t jobs        = 0;
+        uint64_t rows        = 0;
+        uint64_t bytes       = 0;
+        uint64_t threads     = 0;
+        uint64_t threads_max = 0;
+        uint64_t overlapped  = 0;
+        double   compute_us  = 0.0;
+    };
+
+    type_totals by_type[GGML_TYPE_COUNT + 1];
 };
 
 void cpu_expert_pool_trace_take(cpu_expert_pool_trace_totals & out);
 void cpu_expert_pool_trace_note_join(bool was_ready);
+
+// Adds one finished job to `totals`, in the job's type slot as well.
+void cpu_expert_pool_trace_add_job(cpu_expert_pool_trace_totals &         totals,
+                                   size_t                                 n_tasks,
+                                   const cpu_expert_batched_phase_times & ph,
+                                   double                                 wake_us,
+                                   double                                 wall_us,
+                                   bool                                   overlapped);
+
+// The per-type summary: for each type with a job, in enum order and the mixed
+// slot last, " <type>:jobs=J,rows=R,bytes=B,compute=Cus,gbps=G,thr=A/M,ovl=O",
+// where G is bytes over the summed compute time (decimal GB/s), A the mean and
+// M the most threads per job. Empty when there were no jobs.
+std::string cpu_expert_pool_trace_format_types(const cpu_expert_pool_trace_totals & totals);
 
 }  // namespace ggml_sycl
