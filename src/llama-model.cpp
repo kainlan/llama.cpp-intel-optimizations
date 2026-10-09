@@ -335,6 +335,7 @@ struct llama_model_sycl_kv_layer_arrays {
     std::unique_ptr<uint32_t[]> k_width;
     std::unique_ptr<uint32_t[]> v_width;
     std::unique_ptr<uint8_t[]>  kind;
+    std::unique_ptr<uint32_t[]> idx_k_width;  // indexer key width per layer (llama_kv_layer_owners::idx_k_width)
 };
 
 // llama.cpp-3aos: per-layer (attention kind, K width, V width) for the SYCL
@@ -354,6 +355,11 @@ struct llama_model_sycl_kv_layer_arrays {
 // hybrid model's recurrent layers pass has_kv() but the KV cache holds none of
 // them, and charging them KV made the planner reserve and demote 4x the KV
 // Qwen3-Next allocates. A memory kind the shapes do not model keeps has_kv().
+// The indexer key cache of a llama_memory_hybrid_idx (qwen4exp) is a second
+// buffer over the same cells: its key width goes out per layer beside the K/V
+// widths, so the planner budgets both buffers and the allocator sizes each one
+// from its own cache. A layer whose only KV is indexer keys is FULL with zero
+// K/V widths, so it is still charged.
 static llama_model_sycl_kv_layer_arrays llama_model_sycl_build_kv_layer_arrays(const llama_model & model,
                                                                                uint32_t            n_layer) {
     const llama_hparams &            hparams = model.hparams;
@@ -362,10 +368,13 @@ static llama_model_sycl_kv_layer_arrays llama_model_sycl_build_kv_layer_arrays(c
     out.k_width.reset(new uint32_t[n_layer]);
     out.v_width.reset(new uint32_t[n_layer]);
     out.kind.reset(new uint8_t[n_layer]);
+    out.idx_k_width.reset(new uint32_t[n_layer]);
     for (uint32_t il = 0; il < n_layer; ++il) {
         const bool owns_kv = owners.modelled ? il < owners.owns.size() && owners.owns[il] : hparams.has_kv(il);
+        const uint32_t idx_k_width = il < owners.idx_k_width.size() ? owners.idx_k_width[il] : 0;
+        out.idx_k_width[il]        = idx_k_width;
         if (!owns_kv) {
-            out.kind[il]    = GGML_SYCL_KV_LAYER_SHARED;
+            out.kind[il]    = idx_k_width > 0 ? GGML_SYCL_KV_LAYER_FULL : GGML_SYCL_KV_LAYER_SHARED;
             out.k_width[il] = 0;
             out.v_width[il] = 0;
         } else {
@@ -383,6 +392,7 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
                                                 const uint32_t *                     kv_k_width_per_layer,
                                                 const uint32_t *                     kv_v_width_per_layer,
                                                 const uint8_t *                      kv_layer_kind,
+                                                const uint32_t *                     kv_idx_k_width_per_layer,
                                                 size_t                               total_size,
                                                 size_t                               max_pp_pipeline_weight_bytes,
                                                 const llama_hparams &                hparams) {
@@ -564,6 +574,7 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     inventory.kv_v_width_per_layer = kv_v_width_per_layer;
     inventory.kv_layer_kind        = kv_layer_kind;
     inventory.kv_layer_count       = n_layer;
+    inventory.kv_idx_k_width_per_layer = kv_idx_k_width_per_layer;
 
     uint32_t    n_head_ctx_max        = 0;
     uint32_t    n_head_swa_max        = 0;
@@ -700,8 +711,9 @@ static void llama_model_sycl_compute_early_plan(llama_model_loader & ml,
 
     ggml_sycl_tensor_inventory inventory = {};
     llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(),
-                                        kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(), total_size,
-                                        max_pp_pipeline_weight_bytes, hparams);
+                                        kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(),
+                                        kv_layer_arrays.idx_k_width.get(), total_size, max_pp_pipeline_weight_bytes,
+                                        hparams);
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
     llama_model_sycl_apply_inventory(inventory, envelope, true);
 
@@ -755,8 +767,9 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader & ml,
 
     ggml_sycl_tensor_inventory inventory = {};
     llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(),
-                                        kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(), total_size,
-                                        max_pp_pipeline_weight_bytes, hparams);
+                                        kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(),
+                                        kv_layer_arrays.idx_k_width.get(), total_size, max_pp_pipeline_weight_bytes,
+                                        hparams);
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
     llama_model_sycl_apply_inventory(inventory, envelope, false);
 

@@ -282,27 +282,6 @@ void kv_tier_manager::configure_from_plan(int                          device,
         kv_per_layer_ = slice.bytes();
     }
 
-    // Explicit debug override remains higher priority than planned placement.
-    const char * hot_layers_env = std::getenv("GGML_SYCL_KV_HOT_LAYERS");
-    if (hot_layers_env) {
-        int val = std::atoi(hot_layers_env);
-        if (val >= 0) {
-            hot_layers_ = std::min(static_cast<uint32_t>(val), n_layers);
-            layer_on_device_.assign(n_layers, false);
-            for (uint32_t l = 0; l < hot_layers_; l++) {
-                layer_on_device_[l] = true;
-            }
-            active_ = (hot_layers_ < total_layers_);
-            const size_t dev_bytes  = std::min(static_cast<size_t>(hot_layers_) * kv_per_layer_, slice.total_bytes());
-            const size_t host_bytes = slice.total_bytes() - dev_bytes;
-            GGML_LOG_INFO(
-                "[KV-TIER] Plan-driven (env override): %u/%u layers on device "
-                "(%.1f MB device, %.1f MB host)\n",
-                hot_layers_, total_layers_, dev_bytes / (1024.0 * 1024.0), host_bytes / (1024.0 * 1024.0));
-            return;
-        }
-    }
-
     // Build per-layer placement.
     layer_on_device_.assign(n_layers, false);
     // assign(), not resize(): kv_tier_manager is a per-device singleton reused
@@ -321,9 +300,11 @@ void kv_tier_manager::configure_from_plan(int                          device,
     active_ = (hot_layers_ < total_layers_);
 
     // Per-layer KV sizes (llama.cpp-7yv9).  The plan's per-layer truth --
-    // placement_plan::kv_size_for_layer(): FULL / SWA / SHARED kind and that
-    // layer's own K/V width -- is what every other consumer of the KV budget
-    // sizes from; sizing here from the uniform scalars instead gave every SWA
+    // FULL / SWA / SHARED kind and that layer's own widths, summed by
+    // placement_plan::kv_size_for_layer() -- is what every other consumer of
+    // the KV budget sizes from.  A buffer takes its own part of it:
+    // kv_main_size_for_layer() for the K/V, kv_idx_size_for_layer() for the
+    // indexer keys.  Sizing here from the uniform scalars instead gave every SWA
     // layer of a Gemma 4 E4B buffer plan.kv_per_swa_layer (computed at the
     // global full-attention width) and reserved 2x its real bytes.
     //
@@ -339,8 +320,16 @@ void kv_tier_manager::configure_from_plan(int                          device,
     const auto in_buffer = [&](uint32_t l) {
         return buffer_layer_mask == nullptr || (l < buffer_layer_mask->size() && (*buffer_layer_mask)[l] != 0);
     };
+
+    // A llama_memory_hybrid_idx (qwen4exp) holds each attention layer in two
+    // buffers over the same cells: the K/V and the indexer keys. This buffer
+    // is one of them, so it is compared with that cache's own sum, never with
+    // the layers' total, which no single buffer holds (llama.cpp-8ecj). It is
+    // the indexer buffer when its size matches the indexer keys and not the
+    // K/V; every other memory has no indexer keys and keeps the K/V sum.
     bool     truth_covers_buffer = true;
-    size_t   truth_sum           = 0;
+    size_t   main_sum            = 0;
+    size_t   idx_sum             = 0;
     uint32_t buffer_layers       = 0;
     for (uint32_t l = 0; l < n_layers; ++l) {
         if (!in_buffer(l)) {
@@ -351,14 +340,22 @@ void kv_tier_manager::configure_from_plan(int                          device,
             truth_covers_buffer = false;
             break;
         }
-        truth_sum += plan.kv_size_for_layer(l);
+        main_sum += plan.kv_main_size_for_layer(l);
+        idx_sum += plan.kv_idx_size_for_layer(l);
     }
+
+    const size_t total     = slice.total_bytes();
+    const size_t slack     = static_cast<size_t>(buffer_layers) * kv_layer_align_bytes;
+    const auto   describes = [&](size_t sum) {
+        return sum > 0 && sum <= total && total - sum <= slack;
+    };
+    // By byte total: both caches push the same layer mask, until a role travels with it (llama.cpp-n9r3).
+    const bool   is_idx_buffer = idx_sum > 0 && !describes(main_sum) && describes(idx_sum);
+    const size_t truth_sum     = is_idx_buffer ? idx_sum : main_sum;
 
     bool use_truth     = truth_covers_buffer && buffer_layers > 0 && truth_sum > 0;
     bool truth_refused = false;
     if (use_truth) {
-        const size_t total = slice.total_bytes();
-        const size_t slack = static_cast<size_t>(buffer_layers) * kv_layer_align_bytes;
         if (truth_sum > total) {
             GGML_LOG_WARN(
                 "[KV-TIER] per-layer KV truth sum %zu B exceeds this buffer's %zu B (%u layers); "
@@ -381,7 +378,7 @@ void kv_tier_manager::configure_from_plan(int                          device,
         // regions of layers outside the buffer before allocating.
         for (uint32_t l = 0; l < n_layers; ++l) {
             if (plan.has_per_layer_kv_truth(l)) {
-                per_layer_kv_bytes_[l] = plan.kv_size_for_layer(l);
+                per_layer_kv_bytes_[l] = is_idx_buffer ? plan.kv_idx_size_for_layer(l) : plan.kv_main_size_for_layer(l);
             }
         }
     } else if (truth_refused) {
@@ -397,6 +394,21 @@ void kv_tier_manager::configure_from_plan(int                          device,
             const bool is_swa      = l < plan.swa_layer_mask.size() && plan.swa_layer_mask[l];
             per_layer_kv_bytes_[l] = is_swa ? plan.kv_per_swa_layer : kv_per_layer_;
         }
+    }
+
+    // Explicit debug override, higher priority than the planned placement. It moves placement only, after the sizing
+    // above: returning before it would leave the sizes the previous buffer set on this reused manager, and the
+    // tiered allocator's backstop would charge an indexer buffer its K/V buffer's layers (llama.cpp-8ecj).
+    const char * hot_layers_env = std::getenv("GGML_SYCL_KV_HOT_LAYERS");
+    const int    hot_env_layers = hot_layers_env != nullptr ? std::atoi(hot_layers_env) : -1;
+    const bool   hot_override   = hot_env_layers >= 0;
+    if (hot_override) {
+        hot_layers_ = std::min(static_cast<uint32_t>(hot_env_layers), n_layers);
+        layer_on_device_.assign(n_layers, false);
+        for (uint32_t l = 0; l < hot_layers_; l++) {
+            layer_on_device_[l] = true;
+        }
+        active_ = (hot_layers_ < total_layers_);
     }
 
     // Byte totals for this buffer's layers, using the per-layer sizes.
@@ -416,6 +428,13 @@ void kv_tier_manager::configure_from_plan(int                          device,
     // class guards against was invisible because the only logged per-layer
     // figure came from a value the allocator never used (llama.cpp-2120).
     // sizing= says which of the two paths above produced the per-layer sizes.
+    if (hot_override) {
+        GGML_LOG_INFO(
+            "[KV-TIER] Plan-driven (env override): %u/%u layers on device (sizing=%s, %.1f MB device, %.1f MB host)\n",
+            hot_layers_, total_layers_, use_truth ? "per-layer" : "uniform", dev_bytes / (1024.0 * 1024.0),
+            host_bytes / (1024.0 * 1024.0));
+        return;
+    }
     GGML_LOG_INFO(
         "[KV-TIER] Plan-driven: %u/%u layers on device "
         "(planner_n_ctx=%u, kv_layers=%u, kv_per_layer=%zu, sizing=%s, %.1f MB device, %.1f MB host)\n",

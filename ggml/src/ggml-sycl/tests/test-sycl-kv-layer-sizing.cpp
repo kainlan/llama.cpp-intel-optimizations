@@ -900,10 +900,143 @@ static void test_kv_layer_bytes_for_kind_keeps_its_results() {
     check_eq("kv_layer_tensor_bytes (f16, unpadded, ggml_row_size) results that differ", n_cells, 0);
 }
 
+// ---------------------------------------------------------------------------
+// (p) Qwen3.8 (qwen4exp, llama_memory_hybrid_idx), llama.cpp-8ecj: 48 layers,
+//     every 4th an attention layer holding K/V (512 + 512 wide) AND indexer
+//     keys (one 128-wide head, no V) in a second buffer over the same cells;
+//     the other 36 are recurrent and hold neither. At 262144 cells a layer's
+//     K/V is 512 MiB and its indexer keys 64 MiB.
+//
+//     Every budget (the planner's charge, the plan's per-layer size) must
+//     count 576 MiB a layer: without the indexer keys, -c 10240 kept all 12
+//     attention layers on the device with 27.6 MiB left for the 30 MiB
+//     indexer buffer and the context failed. And
+//     each of llama's two buffers must be sized from its own cache with no
+//     WARN: measured against the 576 MiB total, both would read as truth
+//     exceeding the buffer on every load.
+// ---------------------------------------------------------------------------
+static placement_kv_info make_qwen38(uint32_t n_ctx, uint32_t n_ubatch) {
+    placement_kv_info kv{};
+    kv.n_layer      = 48;
+    kv.n_embd_k_gqa = 512;
+    kv.n_embd_v_gqa = 512;
+    kv.n_ctx        = n_ctx;
+    kv.n_ubatch     = n_ubatch;
+    kv.n_seq_max    = 1;
+    kv.layer_kind.resize(48);
+    kv.layer_k_width.assign(48, 0);
+    kv.layer_v_width.assign(48, 0);
+    kv.layer_idx_k_width.assign(48, 0);
+    for (uint32_t il = 0; il < 48; ++il) {
+        const bool attention = il % 4 == 3;
+        kv.layer_kind[il]    = attention ? GGML_SYCL_KV_LAYER_FULL : GGML_SYCL_KV_LAYER_SHARED;
+        if (attention) {
+            kv.layer_k_width[il]     = 512;
+            kv.layer_v_width[il]     = 512;
+            kv.layer_idx_k_width[il] = 128;
+        }
+    }
+    return kv;
+}
+
+static std::vector<uint8_t> qwen38_attention_mask() {
+    std::vector<uint8_t> mask(48, 0);
+    for (uint32_t il = 3; il < 48; il += 4) {
+        mask[il] = 1;
+    }
+    return mask;
+}
+
+static void test_qwen38_indexer_keys_budgeted_and_sized_per_buffer() {
+    printf("(p) Qwen3.8: budgets add the indexer keys; each of the two buffers is sized from its own cache\n");
+    const size_t mib = 1024u * 1024u;
+
+    placement_kv_info kv = make_qwen38(262144, 256);
+    check_eq("qwen38: an attention layer's KV is its K/V plus its indexer keys", kv.kv_bytes_for_layer(3), 576 * mib);
+    check_eq("qwen38: the indexer keys alone", kv.kv_idx_bytes_for_layer_at(3, 262144), 64 * mib);
+    check_eq("qwen38: a recurrent layer holds no KV", kv.kv_bytes_for_layer(0), 0u);
+
+    // the load's view: both caches charged at its n_ctx=512
+    placement_kv_info load = make_qwen38(512, 512);
+    check_eq("qwen38: the load charges both caches at n_ctx", load.kv_bytes_for_layer(3), 1152u * 1024u);
+
+    placement_plan plan{};
+    plan.swa_layer_mask.assign(48, false);
+    for (uint32_t il = 0; il < 48; ++il) {
+        plan.kv_device[static_cast<int>(il)] = 0;
+    }
+    plan.kv_per_layer      = kv.kv_bytes_per_layer();
+    plan.layer_kind        = kv.layer_kind;
+    plan.layer_k_width     = kv.layer_k_width;
+    plan.layer_v_width     = kv.layer_v_width;
+    plan.layer_idx_k_width = kv.layer_idx_k_width;
+    plan.planner_n_ctx     = kv.n_ctx;
+    plan.planner_n_ubatch  = kv.n_ubatch;
+    plan.planner_n_seq_max = 1;
+    check_eq("qwen38: the plan's per-layer KV matches kv_info", plan.kv_size_for_layer(3), 576 * mib);
+    check_eq("qwen38: the plan's K/V buffer share", plan.kv_main_size_for_layer(3), 512 * mib);
+    check_eq("qwen38: the plan's indexer buffer share", plan.kv_idx_size_for_layer(3), 64 * mib);
+
+    const auto mask = qwen38_attention_mask();
+
+    struct buffer_case {
+        const char * name;
+        size_t       per_layer;
+    };
+
+    const buffer_case buffers[] = {
+        { "K/V buffer",     512 * mib },
+        { "indexer buffer", 64 * mib  },
+    };
+    for (const buffer_case & b : buffers) {
+        g_log.clear();
+        const size_t total = 12u * b.per_layer;
+        const auto   slice = kv_slice_size::from_layer_mask(total, 12);
+
+        kv_tier_manager mgr;
+        mgr.configure_from_plan(0, plan, kv.n_layer, slice, &mask);
+
+        printf("  %s\n", b.name);
+        check_eq("qwen38: an attention layer sized from this buffer's own cache", mgr.kv_layer_size(3), b.per_layer);
+        check_eq("qwen38: a recurrent layer holds none of it", mgr.kv_layer_size(0), 0u);
+        const auto layout = mgr.compute_region_layout(total);
+        check_eq("qwen38: device bytes reserved equal the buffer", device_bytes_in_mask(layout, mask), total);
+        check_true("qwen38: no sizing WARN for a buffer that matches its own cache",
+                   g_log.find("[KV-TIER] per-layer KV truth") == std::string::npos);
+    }
+
+    // GGML_SYCL_KV_HOT_LAYERS overrides which layers are on the device, not what a layer costs: each buffer is still
+    // sized from its own cache. The manager is a per-device singleton the allocator copies for each buffer, so the
+    // indexer buffer is configured on the one the K/V buffer left, as here.
+    {
+        const char *      prior     = std::getenv("GGML_SYCL_KV_HOT_LAYERS");
+        const std::string prior_val = prior != nullptr ? prior : "";
+        kv_tier_manager   mgr;
+        mgr.configure_from_plan(0, plan, kv.n_layer, kv_slice_size::from_layer_mask(12u * 512 * mib, 12), &mask);
+        setenv("GGML_SYCL_KV_HOT_LAYERS", "48", 1);
+        g_log.clear();
+        mgr.configure_from_plan(0, plan, kv.n_layer, kv_slice_size::from_layer_mask(12u * 64 * mib, 12), &mask);
+        if (prior != nullptr) {
+            setenv("GGML_SYCL_KV_HOT_LAYERS", prior_val.c_str(), 1);
+        } else {
+            unsetenv("GGML_SYCL_KV_HOT_LAYERS");
+        }
+        check_eq("qwen38: under GGML_SYCL_KV_HOT_LAYERS the indexer buffer is sized from its own cache",
+                 mgr.kv_layer_size(3), 64 * mib);
+        check_eq("qwen38: and a recurrent layer still holds none of it", mgr.kv_layer_size(0), 0u);
+        // Positive control: the override bound (all 48 layers hot), so a renamed variable or a parse change fails
+        // here rather than leaving the sizing checks above to pass on the planned placement. 12 x 64 MiB on device.
+        check_true("qwen38: the override placed all 48 layers on the device, 768 MB of indexer keys",
+                   g_log.find("[KV-TIER] Plan-driven (env override): 48/48 layers on device (sizing=per-layer, "
+                              "768.0 MB device, 0.0 MB host)") != std::string::npos);
+    }
+}
+
 int main() {
-    // Hermetic: GGML_SYCL_KV_HOT_LAYERS short-circuits configure_from_plan()
-    // before any per-layer sizing, so a stray value in the environment would
-    // quietly change what cases (h)-(k) measure.
+    // Hermetic: GGML_SYCL_KV_HOT_LAYERS overrides which layers
+    // configure_from_plan() puts on the device, so a stray value in the
+    // environment would quietly change the device/host split cases (h)-(k)
+    // and (p) measure.
     if (const char * env = std::getenv("GGML_SYCL_KV_HOT_LAYERS")) {
         printf("unsetting GGML_SYCL_KV_HOT_LAYERS=%s for a hermetic run\n", env);
         unsetenv("GGML_SYCL_KV_HOT_LAYERS");
@@ -937,6 +1070,9 @@ int main() {
     test_plan_kv_size_for_layer_honours_swa_full();
     test_tier_manager_honours_swa_full();
     test_tier_manager_swa_full_false_unchanged();
+
+    printf("=== a hybrid_idx memory's two KV buffers, budgeted together and sized apart (llama.cpp-8ecj) ===\n");
+    test_qwen38_indexer_keys_budgeted_and_sized_per_buffer();
 
     printf("=== %d checks, %d failures ===\n", g_checks, g_fail);
     if (g_fail > 0) {

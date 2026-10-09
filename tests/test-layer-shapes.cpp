@@ -284,6 +284,7 @@ static bool kind_is_modelled(const memory_view & mv) {
 // where its cache holds 12.
 static int n_owner_layers_equal    = 0;
 static int n_owner_overcount_cases = 0;  // memories where has_kv() would charge a layer the cache does not hold
+static int n_owner_idx_layers_equal = 0;  // indexer layers whose owners width matched the created indexer K
 
 static void check_kv_owners(const char * arch_name, const config & cfg, llama_context * ctx, const memory_view & mv) {
     const llama_model &         model   = ctx->get_model();
@@ -309,6 +310,19 @@ static void check_kv_owners(const char * arch_name, const config & cfg, llama_co
         overcount = overcount || (model.hparams.has_kv((uint32_t) il) && !r.owned);
     }
     n_owner_overcount_cases += overcount ? 1 : 0;
+
+    // the indexer key width each layer's second buffer was created with (llama.cpp-8ecj), 0 where there is none
+    CHECK((int) owners.idx_k_width.size() == n_layer, "%s/%s: %zu indexer widths for %d layers", arch_name, cfg.name,
+          owners.idx_k_width.size(), n_layer);
+    for (int il = 0; il < n_layer && il < (int) owners.idx_k_width.size(); ++il) {
+        const ggml_tensor * k     = nullptr;
+        const ggml_tensor * v     = nullptr;
+        const bool          owned = mv.idx != nullptr && mv.idx->get_layer_tensors(il, &k, &v);
+        const uint32_t      want  = owned ? (uint32_t) k->ne[0] : 0;
+        CHECK(owners.idx_k_width[il] == want, "%s/%s: layer %d indexer width %u but the memory created %u", arch_name,
+              cfg.name, il, owners.idx_k_width[il], want);
+        n_owner_idx_layers_equal += owned && owners.idx_k_width[il] == want ? 1 : 0;
+    }
 }
 
 static int n_rs_layers_equal  = 0;
@@ -775,12 +789,16 @@ int main() {
     CHECK(n_owner_layers_equal > 0 && n_owner_overcount_cases > 0,
           "VOID: %d layers compared with the KV owners, %d memories where has_kv() over-counts", n_owner_layers_equal,
           n_owner_overcount_cases);
+    // the owners' indexer widths were compared on real indexer layers (qwen4exp reaches llama_memory_hybrid_idx)
+    CHECK(n_owner_idx_layers_equal > 0, "VOID: %d indexer layers compared with the KV owners' widths",
+          n_owner_idx_layers_equal);
     CHECK(shift_kinds_nonempty.count("kv") == 1 && shift_kinds_nonempty.count("iswa") == 1,
           "VOID: the shift check found no shifting cache in a plain or an iSWA memory");
     CHECK(shift_kinds_checked.count("recurrent") == 1 && shift_kinds_checked.count("hybrid") == 1,
           "VOID: the shift check never saw a recurrent and a hybrid memory");
     fprintf(stderr, "  %zu kinds refused no_alloc through create_memory; %zu kinds with shift caches; %d gated off\n",
             refused_kinds.size(), shift_kinds_nonempty.size(), n_shift_gated_off);
+    fprintf(stderr, "  %d indexer layers matched the KV owners' indexer widths\n", n_owner_idx_layers_equal);
 
     if (n_failed != 0) {
         fprintf(stderr, "%d check(s) failed\n", n_failed);

@@ -147,6 +147,10 @@ llama_kv_layer_shapes_result llama_kv_layer_shapes(const llama_model &         m
 struct llama_kv_layer_owners {
     bool              modelled = false;
     std::vector<bool> owns;  // indexed by the model's layer index, size n_layer_all when modelled
+    // The key width of the layer's indexer key cache (llama_memory_hybrid_idx, layers_idx above), 0 where the memory
+    // keeps none: a second KV buffer over the same cells, which the SYCL inventory publishes beside the K/V widths so
+    // the planner budgets it. Indexed like `owns`.
+    std::vector<uint32_t> idx_k_width;
 };
 
 llama_kv_layer_owners llama_kv_layer_owners_default(const llama_model & model);

@@ -17016,6 +17016,12 @@ static constexpr bool ggml_sycl_dequant_f16_scratch_drawable() {
 // question a plan merge asks. Defined with the context list below.
 static bool ggml_sycl_other_backend_context_live(int device, const ggml_backend_sycl_context * self);
 
+// The inventory crosses from libllama into this library by pointer, so a field that moves would be read from the wrong
+// place without any error. These pin the KV tail of the layout (llama.cpp-8ecj).
+static_assert(sizeof(ggml_sycl_tensor_inventory) == 184, "ggml_sycl_tensor_inventory layout changed");
+static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168, "kv_layer_count moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176, "kv_idx_k_width_per_layer moved");
+
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
 // snapshot.  Idempotent — safe to call from both the early pre-create_tensor
 // entry point and the late set_tensor_inventory entry.  Caller must hold
@@ -17217,6 +17223,13 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         g_placement_kv_info.layer_kind.clear();
         g_placement_kv_info.layer_k_width.clear();
         g_placement_kv_info.layer_v_width.clear();
+    }
+    // llama.cpp-8ecj: the indexer key cache's width per layer, a second KV buffer every budget adds to the K/V.
+    if (inventory->kv_layer_count > 0 && inventory->kv_idx_k_width_per_layer != nullptr) {
+        g_placement_kv_info.layer_idx_k_width.assign(inventory->kv_idx_k_width_per_layer,
+                                                     inventory->kv_idx_k_width_per_layer + inventory->kv_layer_count);
+    } else {
+        g_placement_kv_info.layer_idx_k_width.clear();
     }
     g_placement_kv_info.n_ctx_is_runtime = false;
     if (g_placement_kv_info.valid()) {
@@ -18115,8 +18128,10 @@ static uint32_t ggml_sycl_largest_fitting_n_ctx(const ggml_sycl::placement_plan 
                 swa_bytes += kv_info.kv_bytes_for_layer(layer);
                 continue;
             }
-            full_bytes_per_cell +=
-                static_cast<size_t>(kv_info.layer_k_width[layer] + kv_info.layer_v_width[layer]) * sizeof(ggml_fp16_t);
+            // the indexer keys (llama.cpp-8ecj) grow with n_ctx exactly like the layer's K/V
+            const uint32_t widths =
+                kv_info.layer_k_width[layer] + kv_info.layer_v_width[layer] + kv_info.idx_k_width(layer);
+            full_bytes_per_cell += static_cast<size_t>(widths) * sizeof(ggml_fp16_t);
         } else {
             // Fallback: legacy uniform-width, global SWA/full split (an
             // inventory built before this ticket, or a homogeneous model).
@@ -42689,6 +42704,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
                   planner_swa_kv / (1024.0 * 1024.0), n_kv_layers, n_layers);
 
     ggml_sycl::placement_plan runtime_kv_plan;
+    bool                      runtime_plan_owned = false;  // kv_plan points at runtime_kv_plan
     if (kv_plan && kv_geometry.valid()) {
         runtime_kv_plan = *kv_plan;
         runtime_kv_plan.update_runtime_kv_sizes(kv_geometry.n_ctx, planner_full_kv, planner_swa_kv);
@@ -42724,23 +42740,49 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
             }
         }
 
-        // Counted by the allocation loop's owner rule, so GGML_SYCL_KV_HOST=1
-        // (every layer in host memory) plans no device bytes.
-        size_t planned_device_bytes = 0;
-        for (uint32_t l = 0; l < n_layers; ++l) {
-            const int owner = ggml_sycl::kv_buffer_layer_owner(true, runtime_kv_plan.get_kv_device(static_cast<int>(l)),
-                                                               false, device, kv_host_val == 1);
-            if (layer_in_this_kv_buffer(l) && owner == device) {
-                planned_device_bytes += runtime_kv_plan.kv_size_for_layer(l);
-            }
-        }
+        kv_plan            = &runtime_kv_plan;
+        runtime_plan_owned = true;
+    }
 
-        // The runtime-context transaction admitted this KV against this same
-        // headroom (unified_cache_kv_vram_available), so a device-planned
-        // layer that no longer fits is an accounting mismatch, not a
-        // placement choice. Refuse instead of demoting it to host memory
-        // under a device buffer, where attention would read it over PCIe
-        // (the zero-copy route).
+    // Which model layers this buffer holds, however that was decided above
+    // (llama's explicit mask, or the size-matched buffer kind), so the tier
+    // manager sizes each of them from the plan's per-layer truth and bounds
+    // their sum by this buffer alone (llama.cpp-7yv9).
+    std::vector<uint8_t> buffer_layer_mask(n_layers, 0);
+    for (uint32_t l = 0; l < n_layers; ++l) {
+        buffer_layer_mask[l] = layer_in_this_kv_buffer(l) ? 1 : 0;
+    }
+
+    // Configure a copy of the device's tier manager and commit it only once
+    // this buffer is accepted, so the refusal below has no side effects.
+    ggml_sycl::kv_tier_manager staged = mgr;
+    if (kv_plan) {
+        staged.configure_from_plan(device, *kv_plan, n_layers, kv_slice, &buffer_layer_mask);
+    } else {
+        staged.configure_with_weights(device, n_layers, kv_vram_cap, kv_slice);
+    }
+
+    // The runtime-context transaction admitted this KV against this same
+    // headroom (unified_cache_kv_vram_available), so a device-planned layer
+    // that no longer fits is an accounting mismatch, not a placement choice.
+    // Refuse instead of demoting it to host memory under a device buffer,
+    // where attention would read it over PCIe (the zero-copy route). Each
+    // layer counts at the size THIS buffer allocates for it, which the tier
+    // manager configured above knows: a memory that holds one layer in two
+    // buffers (the qwen4exp attention K/V and indexer keys) would otherwise
+    // charge the second buffer the first one's bytes (llama.cpp-8ecj). Owners
+    // follow the allocation loop's rule, so GGML_SYCL_KV_HOST=1 (every layer
+    // in host memory) plans no device bytes.
+    if (runtime_plan_owned) {
+        std::vector<int>    layer_owner(n_layers, -1);
+        std::vector<size_t> layer_bytes(n_layers, 0);
+        for (uint32_t l = 0; l < n_layers; ++l) {
+            layer_owner[l] = ggml_sycl::kv_buffer_layer_owner(true, runtime_kv_plan.get_kv_device(static_cast<int>(l)),
+                                                              false, device, kv_host_val == 1);
+            layer_bytes[l] = staged.kv_layer_size(l);
+        }
+        const size_t planned_device_bytes =
+            ggml_sycl::kv_buffer_device_bytes(layer_owner, buffer_layer_mask, layer_bytes, device);
         if (ggml_sycl::kv_admission_mismatch(planned_device_bytes, kv_vram_cap)) {
             GGML_LOG_ERROR(
                 "[KV-TIER] device %d: device-planned KV %.1f MB exceeds the %.1f MB free for KV, although the "
@@ -42750,24 +42792,6 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
                 device, planned_device_bytes / (1024.0 * 1024.0), kv_vram_cap / (1024.0 * 1024.0));
             return nullptr;
         }
-        kv_plan = &runtime_kv_plan;
-    }
-
-    // Configure a copy of the device's tier manager and commit it only once
-    // this buffer is accepted, so the refusal below has no side effects.
-    ggml_sycl::kv_tier_manager staged = mgr;
-    if (kv_plan) {
-        // Which model layers this buffer holds, however that was decided
-        // above (llama's explicit mask, or the size-matched buffer kind), so
-        // the tier manager sizes each of them from the plan's per-layer truth
-        // and bounds their sum by this buffer alone (llama.cpp-7yv9).
-        std::vector<uint8_t> buffer_layer_mask(n_layers, 0);
-        for (uint32_t l = 0; l < n_layers; ++l) {
-            buffer_layer_mask[l] = layer_in_this_kv_buffer(l) ? 1 : 0;
-        }
-        staged.configure_from_plan(device, *kv_plan, n_layers, kv_slice, &buffer_layer_mask);
-    } else {
-        staged.configure_with_weights(device, n_layers, kv_vram_cap, kv_slice);
     }
 
     // Compute per-layer layout from the tier manager.

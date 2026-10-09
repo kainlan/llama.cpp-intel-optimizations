@@ -10,7 +10,9 @@ planner charged and the runtime transaction demoted 4x the KV the cache allocate
 The fix this gate pins:
   - the inventory's per-layer KV kind comes from llama_kv_layer_owners_default(): the layers the memory a default
     context builds holds K/V for, from llama_kv_layer_shapes(), the source the KV cache is sized from. A layer it
-    does not hold is SHARED, with zero widths;
+    does not hold is SHARED, with zero widths, unless its indexer key cache holds it (FULL, zero K/V widths);
+  - the indexer key width of a llama_memory_hybrid_idx (qwen4exp) travels from the shapes' layers_idx through the
+    owners and the per-layer arrays into ggml_sycl_tensor_inventory::kv_idx_k_width_per_layer, from both builders;
   - a memory kind the shapes do not model reports itself unmodelled, and only then does the inventory keep has_kv();
   - both inventory builders (the early plan and the late inventory) derive the arrays from the model;
   - a SHARED layer costs zero cells, so the planner charges it nothing and the demotion walk skips it.
@@ -113,6 +115,12 @@ OWNS_KV = "const bool owns_kv = owners.modelled ? il < owners.owns.size() && own
 UNMODELLED = "if (!kv.unsupported.empty()) { return out; }"
 BUILD_FROM_MODEL = "llama_model_sycl_build_kv_layer_arrays(model, n_layer);"
 SHARED_CELLS = "if (kind == KV_CELLS_SHARED) { return 0; }"
+# A layer the K/V cache does not hold is SHARED, unless the indexer cache holds it: then it is FULL with zero widths.
+UNOWNED_KIND = "out.kind[il] = idx_k_width > 0 ? GGML_SYCL_KV_LAYER_FULL : GGML_SYCL_KV_LAYER_SHARED;"
+IDX_OWNERS = "out.idx_k_width[il] = kv.layers_idx[il].has_kv ? kv.layers_idx[il].n_embd_k_gqa : 0;"
+IDX_ARRAY = "out.idx_k_width[il] = idx_k_width;"
+IDX_FILL = "inventory.kv_idx_k_width_per_layer = kv_idx_k_width_per_layer;"
+IDX_PASS = "kv_layer_arrays.kind.get(), kv_layer_arrays.idx_k_width.get(),"
 
 
 def claim_kind_comes_from_the_default_memory(model: str, shapes: str) -> bool:
@@ -121,7 +129,7 @@ def claim_kind_comes_from_the_default_memory(model: str, shapes: str) -> bool:
     owners = body(norm(shapes), OWNERS_SIG)
     return (bool(arrays) and ordered(
         arrays, "const llama_kv_layer_owners owners = llama_kv_layer_owners_default(model);", OWNS_KV,
-        "if (!owns_kv) {", "out.kind[il] = GGML_SYCL_KV_LAYER_SHARED;", "out.k_width[il] = 0;", "out.v_width[il] = 0;")
+        "if (!owns_kv) {", UNOWNED_KIND, "out.k_width[il] = 0;", "out.v_width[il] = 0;")
             and bool(owners) and ordered(
                 owners, "const llama_kv_layer_shapes_result kv = llama_kv_layer_shapes(model, params_mem, cparams);",
                 "out.owns[il] = kv.layers[il].has_kv;"))
@@ -137,6 +145,16 @@ def claim_both_builders_use_the_model(model: str) -> bool:
     """The early plan and the late inventory both build the arrays from the model, never from its hparams alone."""
     n = norm(model)
     return n.count(BUILD_FROM_MODEL) == 2 and "llama_model_sycl_build_kv_layer_arrays(hparams" not in n
+
+
+def claim_indexer_width_reaches_the_inventory(model: str, shapes: str) -> bool:
+    """The indexer key cache of a hybrid_idx memory is KV too: the owners carry its per-layer key width from the
+    shapes, the array builder copies it per layer, both inventory builders pass it, and the fill publishes it."""
+    owners = body(norm(shapes), OWNERS_SIG)
+    arrays = body(norm(model), ARRAYS_SIG)
+    n = norm(model)
+    return (bool(owners) and ordered(owners, "out.idx_k_width.assign(model.hparams.n_layer_all, 0);", IDX_OWNERS)
+            and bool(arrays) and IDX_ARRAY in arrays and n.count(IDX_PASS) == 2 and IDX_FILL in n)
 
 
 def claim_shared_layer_costs_nothing(demotion_hpp: str) -> bool:
@@ -159,6 +177,10 @@ def test_both_builders_use_the_model():
 
 def test_shared_layer_costs_nothing():
     assert claim_shared_layer_costs_nothing(DEMOTION_HPP)
+
+
+def test_indexer_width_reaches_the_inventory():
+    assert claim_indexer_width_reaches_the_inventory(MODEL, SHAPES)
 
 
 # ---- mutants: each must turn its claim red --------------------------------------------------------------------------
@@ -184,8 +206,8 @@ def test_mutant_owners_ignore_the_shapes_fails():
 
 def test_mutant_unowned_layer_keeps_its_width_fails():
     assert not claim_kind_comes_from_the_default_memory(
-        _once(MODEL, "out.kind[il] = GGML_SYCL_KV_LAYER_SHARED; out.k_width[il] = 0;",
-              "out.kind[il] = GGML_SYCL_KV_LAYER_SHARED; out.k_width[il] = hparams.n_embd_k_gqa(il);"), SHAPES)
+        _once(MODEL, UNOWNED_KIND + " out.k_width[il] = 0;",
+              UNOWNED_KIND + " out.k_width[il] = hparams.n_embd_k_gqa(il);"), SHAPES)
 
 
 def test_mutant_unmodelled_kind_counted_as_modelled_fails():
@@ -204,3 +226,26 @@ def test_mutant_one_builder_from_hparams_fails():
 def test_mutant_shared_layer_charged_fails():
     assert not claim_shared_layer_costs_nothing(
         _once(DEMOTION_HPP, SHARED_CELLS, "if (kind == KV_CELLS_SHARED) { return n_ctx; }"))
+
+
+def test_mutant_owners_drop_the_indexer_fails():
+    assert not claim_indexer_width_reaches_the_inventory(MODEL, _once(SHAPES, IDX_OWNERS, ""))
+
+
+def test_mutant_inventory_fill_forgets_the_indexer_fails():
+    """A producer that forgets the field leaves it null: the planner would budget no indexer cache again."""
+    assert not claim_indexer_width_reaches_the_inventory(_once(MODEL, IDX_FILL, ""), SHAPES)
+
+
+def test_mutant_one_builder_passes_no_indexer_fails():
+    n = norm(MODEL)
+    at = n.find(IDX_PASS)
+    assert at >= 0
+    mutated = n[:at] + "kv_layer_arrays.kind.get(), nullptr," + n[at + len(IDX_PASS):]
+    assert not claim_indexer_width_reaches_the_inventory(mutated, SHAPES)
+
+
+def test_mutant_indexer_only_layer_shared_fails():
+    """A layer holding only indexer keys published SHARED would cost nothing, and its keys would not be budgeted."""
+    assert not claim_kind_comes_from_the_default_memory(
+        _once(MODEL, UNOWNED_KIND, "out.kind[il] = GGML_SYCL_KV_LAYER_SHARED;"), SHAPES)

@@ -647,8 +647,13 @@ struct placement_kv_info {
     std::vector<uint8_t>  layer_kind;     // enum ggml_sycl_kv_layer_kind per layer
     std::vector<uint32_t> layer_k_width;  // Per-layer K width (elements); 0 for SHARED layers
     std::vector<uint32_t> layer_v_width;  // Per-layer V width (elements); symmetric
+    // llama.cpp-8ecj: ggml_sycl_tensor_inventory::kv_idx_k_width_per_layer, the key width of each layer's indexer
+    // key cache (a second buffer over the layer's cells, K only); empty or 0 where a layer has none.
+    std::vector<uint32_t> layer_idx_k_width;
 
     bool valid() const { return n_layer > 0 && n_embd_k_gqa > 0 && n_embd_v_gqa > 0 && n_ctx > 0; }
+
+    uint32_t idx_k_width(uint32_t il) const { return il < layer_idx_k_width.size() ? layer_idx_k_width[il] : 0; }
 
     bool has_per_layer_kv_truth(uint32_t il) const {
         return il < layer_kind.size() && il < layer_k_width.size() && il < layer_v_width.size();
@@ -716,9 +721,21 @@ struct placement_kv_info {
         }
         if (has_per_layer_kv_truth(il)) {
             return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,
-                                           n_seq_max, kv_unified, swa_full);
+                                           n_seq_max, kv_unified, swa_full) +
+                   kv_idx_bytes_for_layer_at(il, n_ctx);
         }
         return is_swa_layer(static_cast<int>(il)) ? kv_bytes_per_swa_layer() : kv_bytes_per_layer();
+    }
+
+    // The indexer keys of layer `il` at `ctx` tokens: the same cells as the layer's K/V, K only. Part of
+    // kv_bytes_for_layer(), which is what every budget charges; on its own for the allocator, which sizes the
+    // indexer buffer apart from the K/V one (llama.cpp-8ecj).
+    size_t kv_idx_bytes_for_layer_at(uint32_t il, uint32_t ctx) const {
+        if (!valid() || ctx == 0 || !has_per_layer_kv_truth(il) || idx_k_width(il) == 0) {
+            return 0;
+        }
+        return kv_layer_bytes_for_kind(layer_kind[il], idx_k_width(il), 0, ctx, n_swa, n_ubatch, n_seq_max, kv_unified,
+                                       swa_full);
     }
 };
 
@@ -816,6 +833,8 @@ struct placement_plan {
     std::vector<uint8_t>                       layer_kind;
     std::vector<uint32_t>                      layer_k_width;
     std::vector<uint32_t>                      layer_v_width;
+    // llama.cpp-8ecj: mirrors placement_kv_info::layer_idx_k_width, the indexer key cache's width per layer.
+    std::vector<uint32_t>                      layer_idx_k_width;
     uint32_t                     planner_n_ctx            = 0;
     uint32_t                     planner_n_ubatch         = 0;
     uint32_t                     planner_n_seq_max        = 0;
@@ -1084,13 +1103,30 @@ struct placement_plan {
         if (has_per_layer_kv_truth(layer_id)) {
             return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],
                                            planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,
-                                           planner_kv_unified, planner_swa_full);
+                                           planner_kv_unified, planner_swa_full) +
+                   kv_idx_size_for_layer(layer_id);
         }
         // Fallback: legacy uniform-per-class split (no per-layer truth populated).
         if (kv_per_swa_layer > 0 && layer_id < swa_layer_mask.size() && swa_layer_mask[layer_id]) {
             return kv_per_swa_layer;
         }
         return kv_per_layer;
+    }
+
+    // The layer's indexer keys (llama.cpp-8ecj): part of kv_size_for_layer(), the layer's KV every budget charges;
+    // kv_tier_manager::configure_from_plan() sizes the indexer buffer from it alone.
+    size_t kv_idx_size_for_layer(uint32_t layer_id) const {
+        const uint32_t width = layer_id < layer_idx_k_width.size() ? layer_idx_k_width[layer_id] : 0;
+        if (width == 0 || !has_per_layer_kv_truth(layer_id)) {
+            return 0;
+        }
+        return kv_layer_bytes_for_kind(layer_kind[layer_id], width, 0, planner_n_ctx, planner_n_swa, planner_n_ubatch,
+                                       planner_n_seq_max, planner_kv_unified, planner_swa_full);
+    }
+
+    // The layer's K/V buffer alone: its KV without the indexer keys, which llama allocates in a buffer of their own.
+    size_t kv_main_size_for_layer(uint32_t layer_id) const {
+        return kv_size_for_layer(layer_id) - kv_idx_size_for_layer(layer_id);
     }
 
     size_t kv_layer_count() const {
