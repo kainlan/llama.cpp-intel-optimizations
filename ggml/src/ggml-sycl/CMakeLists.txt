@@ -5339,6 +5339,15 @@ set_tests_properties(test-sycl-cpu-dispatch PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
 )
+# The same binary's host-expert trace tests (llama.cpp-y9i6). The trace flag is
+# read once per process, so they run in a process of their own with it set,
+# and the registration above covers the production path untraced.
+add_test(NAME test-sycl-cpu-dispatch-trace COMMAND test-sycl-cpu-dispatch --trace-tests)
+set_tests_properties(test-sycl-cpu-dispatch-trace PROPERTIES
+    LABELS "sycl;dispatch;tdd;0igs-batch2"
+    ENVIRONMENT "GGML_SYCL_MOE_IDS_COPY_TRACE=1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
 
 # Host-only CPU expert matvec bandwidth bench (llama.cpp-cego). Not part of
 # `all`, not a test: it opens no SYCL queue, like test-sycl-cpu-dispatch above,

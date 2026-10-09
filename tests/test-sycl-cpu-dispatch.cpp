@@ -380,10 +380,6 @@ static bool test_config_functions() {
 }
 
 // ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Test 5: a traced batched call records the weight type and bytes of its rows
 // ---------------------------------------------------------------------------
 
@@ -551,15 +547,31 @@ static bool test_pool_trace_overlap_both_ends() {
     return true;
 }
 
-int main() {
-    // Tracing is decided once, at the first batched call, so it is switched on
-    // before any test runs one. It only adds timing to the other tests.
-    setenv("GGML_SYCL_MOE_IDS_COPY_TRACE", "1", 1);
+// ---------------------------------------------------------------------------
+// Main
+//
+// GGML_SYCL_MOE_IDS_COPY_TRACE is read once per process, at the first batched
+// call, so one process cannot test both the traced and the untraced path. The
+// default run covers the production path, untraced: tests 1-4. --trace-tests
+// runs only tests 5-7; its ctest registration (test-sycl-cpu-dispatch-trace)
+// sets the variable.
+// ---------------------------------------------------------------------------
+
+int main(int argc, char ** argv) {
+    const bool trace_tests = argc > 1 && strcmp(argv[1], "--trace-tests") == 0;
+    if (argc > 1 && !trace_tests) {
+        fprintf(stderr, "usage: %s [--trace-tests]\n", argv[0]);
+        return 2;
+    }
+    if (!trace_tests) {
+        unsetenv("GGML_SYCL_MOE_IDS_COPY_TRACE");
+    }
 
     // Initialize CPU backend (populates FP16->FP32 lookup table required by vec_dot)
     ggml_cpu_init();
 
-    printf("=== test-sycl-cpu-dispatch: T8 Mixed-Precision Cache Miss Loading ===\n\n");
+    printf("=== test-sycl-cpu-dispatch%s: T8 Mixed-Precision Cache Miss Loading ===\n\n",
+           trace_tests ? " --trace-tests" : "");
 
     int n_pass = 0;
     int n_fail = 0;
@@ -568,13 +580,22 @@ int main() {
         if (fn()) { n_pass++; } else { n_fail++; }
     };
 
-    run(test_int4_kernel_correctness);
-    run(test_adaptive_split);
-    run(test_non_q4_0_fallback);
-    run(test_config_functions);
-    run(test_trace_phase_type_key);
-    run(test_pool_trace_per_type);
-    run(test_pool_trace_overlap_both_ends);
+    if (trace_tests) {
+        run(test_trace_phase_type_key);
+        run(test_pool_trace_per_type);
+        run(test_pool_trace_overlap_both_ends);
+    } else {
+        run(test_int4_kernel_correctness);
+        run(test_adaptive_split);
+        run(test_non_q4_0_fallback);
+        run(test_config_functions);
+        // Tests 1-4 count only if they ran untraced, as production does.
+        if (ggml_sycl_cpu_expert_trace_enabled()) {
+            printf("FAIL (tracing was on: tests 1-4 did not cover the untraced path)\n");
+            n_fail++;
+        }
+        printf("(trace tests 5-7 run only with --trace-tests)\n");
+    }
 
     printf("\n%d passed, %d failed\n", n_pass, n_fail);
     return n_fail > 0 ? 1 : 0;
