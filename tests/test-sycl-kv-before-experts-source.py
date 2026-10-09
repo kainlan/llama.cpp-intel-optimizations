@@ -303,6 +303,16 @@ def test_mutant_experts_first_fails():
     assert not claim_phases_are_dense_kv_experts(mutant)
 
 
+def test_mutant_layer_kv_after_the_pack_fails():
+    """The per-layer KV charge moved after the expert pack: the experts would take the KV's bytes first."""
+    pack_end = "plan.kv_context_room_displaced_bytes = room.displaced_bytes();"
+    mutant = _once(CACHE, LAYER_KV_CALL + " ", "")
+    assert mutant.count(pack_end) == 1
+    mutant = mutant.replace(pack_end, LAYER_KV_CALL + " " + pack_end, 1)
+    assert mutant.count(LAYER_KV_CALL) == 1
+    assert not claim_phases_are_dense_kv_experts(mutant)
+
+
 def test_mutant_room_held_under_the_pin_fails():
     """The room held whatever the pin says: pinned mode would lose experts to a room it never had."""
     mutant = _once(CACHE, KV_PHASE, "kv_context_room room; if (!planner_kv_pin_device_enabled()) { " + LAYER_KV_CALL
