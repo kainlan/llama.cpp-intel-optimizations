@@ -439,6 +439,14 @@ static int test_scratch_bytes() {
 // Whether a flush takes the compact form: only when it issues fewer device submissions (copies plus kernels) than
 // the per-run copies. When the rows already arrive as one run per destination, the per-run copies are the cheaper
 // form, and taking it is not a decline.
+struct compact_census {
+    int flushes = 0;
+    int compact = 0;  // flushes that take the compact form; on the GPU, the cohort's uses= count
+    int kernels = 0;  // placement kernels those flushes submit, one per chunk; a compact flush may have several
+};
+
+static compact_census g_compact_census;
+
 static int compact_choice(const std::vector<dispatch> & ds, size_t scratch_bytes, size_t * runs, bool * pays) {
     std::vector<moe_scatter_row> rows;
     for (const dispatch & d : ds) {
@@ -450,6 +458,9 @@ static int compact_choice(const std::vector<dispatch> & ds, size_t scratch_bytes
     CHECK(ggml_sycl::moe_scatter_plan_build(rows, scratch_bytes, &plan), "the routing takes a compact plan");
     *runs = run_list.size();
     *pays = ggml_sycl::moe_scatter_compact_pays(run_list.size(), plan);
+    g_compact_census.flushes += 1;
+    g_compact_census.compact += *pays ? 1 : 0;
+    g_compact_census.kernels += *pays ? (int) plan.chunks.size() : 0;
     return 0;
 }
 
@@ -495,6 +506,12 @@ static int test_compact_pays() {
                          gate_scratch, &runs, &pays) == 0,
           "gate+up, shared pool");
     CHECK(runs == 6 && pays, "six runs against one merged copy and one kernel");
+
+    // Positive control for the GPU census: the compact form is taken on exactly the flushes where it pays.
+    std::printf("compact form taken on %d of %d flushes, %d placement kernels\n", g_compact_census.compact,
+                g_compact_census.flushes, g_compact_census.kernels);
+    CHECK(g_compact_census.flushes == 8 && g_compact_census.compact == 3, "three of eight flushes pay");
+    CHECK(g_compact_census.kernels >= g_compact_census.compact, "each compact flush submits at least one kernel");
     return 0;
 }
 
