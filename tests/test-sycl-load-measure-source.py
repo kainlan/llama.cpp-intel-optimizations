@@ -264,8 +264,9 @@ _N_CTX = "inline uint32_t llama_load_measure_n_ctx(uint32_t n_ctx, uint32_t n_ct
 
 
 def probe_ok(code: str) -> bool:
-    """Stage (a), llama.cpp-p6i0: C-hat is measured at PROBE over the weight stand-ins, and each SYCL device's term
-    is handed to the planner at the n_ctx the measure ran at (never the envelope's 0)."""
+    """Stage (a), llama.cpp-p6i0: C-hat is measured at PROBE over the weight stand-ins, and the measured devices are
+    handed to llama_load_probe_reserve at the n_ctx the measure ran at (never the envelope's 0), which reserves each
+    SYCL device's state then its compute term and skips the host tier (pinned by test-load-measure-guards)."""
     b = function_body(code, _PROBE)
     order = [
         "if (!procs.load_terms_available())",
@@ -274,8 +275,7 @@ def probe_ok(code: str) -> bool:
         "llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_PROBE)",
         "if (!measured.ok) { (measured.unsupported ? out.unsupported : out.refusal) = measured.refusal; return out; }",
         "const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);",
-        "if (d.host) { continue; }",
-        "llama_sycl_l4_reserve_compute_term(procs, txn, d, measured_n_ctx)",
+        "out.not_reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);",
     ]
     pos = [b.find(z(t)) for t in order]
     return (
@@ -283,6 +283,10 @@ def probe_ok(code: str) -> bool:
         and pos == sorted(pos)
         and z("out.devices = measured.devices;") in b
         and z("out.measured = true;") in b
+        and b.count(z("llama_load_probe_reserve(")) == 1
+        # every reservation goes through the helper, so its order cannot be bypassed here
+        and "reserve_compute_term" not in b
+        and "reserve_state_term" not in b
         # the probe never writes the ledger: c(P) is recorded at the admitted placement only
         and "record" not in b
         and "GGML_SYCL_MEASURE_STAGE_CANDIDATE" not in b
@@ -313,6 +317,8 @@ def admit_ok(code: str) -> bool:
         # the admitted stage reserves nothing: the probe's reservation is the one it compares with
         and "reserve_compute_term" not in b
         and "reserve_term" not in b
+        and "reserve_state" not in b
+        and "llama_load_probe_reserve" not in b
     )
 
 
@@ -651,9 +657,10 @@ def test_probe_mutants():
     b = function_body(code, _PROBE)
     for name, old, new in [
         ("measured at the admitted stage", "GGML_SYCL_MEASURE_STAGE_PROBE)", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_B)"),
-        ("no reservation", "llama_sycl_l4_reserve_compute_term(procs, txn, d, measured_n_ctx)", "(void) d"),
-        ("the envelope's n_ctx reserved", "llama_sycl_l4_reserve_compute_term(procs, txn, d, measured_n_ctx)", "llama_sycl_l4_reserve_compute_term(procs, txn, d, n_ctx)"),
-        ("the host tier reserved", "if (d.host) {\n            continue;\n        }", ""),
+        ("no reservation", "out.not_reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);", "(void) measured_n_ctx;"),
+        ("the envelope's n_ctx reserved", "llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx)", "llama_load_probe_reserve(procs, txn, measured.devices, n_ctx)"),
+        ("the declined devices dropped", "out.not_reserved = llama_load_probe_reserve(", "(void) llama_load_probe_reserve("),
+        ("the compute term reserved past the helper", "out.not_reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);", "out.not_reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);\n    (void) llama_sycl_l4_reserve_compute_term(procs, txn, measured.devices[0], measured_n_ctx);"),
         ("no proc gate", "if (!procs.load_terms_available())", "if (false)"),
         ("stand-ins dropped", "llama_measure_dummy_scope dummies(weights);", ""),
     ]:
@@ -675,6 +682,7 @@ def test_admit_mutants():
         ("the fold bypassed", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, measured.devices,", "llama_admitted_check_fold(procs, measured.devices, probe.not_reserved, measured.devices,"),
         ("the admitted stage reserves", "    if (!out.refusal.empty()) {\n        return out;\n    }", "    (void) llama_sycl_l4_reserve_compute_term(procs, txn, measured.devices[0], measured_n_ctx);\n    if (!out.refusal.empty()) {\n        return out;\n    }"),
         ("unreserved devices compared", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, measured.devices,", "llama_admitted_check_fold(procs, probe.devices, {}, measured.devices,"),
+        ("the admitted stage reserves state", "    if (!out.refusal.empty()) {\n        return out;\n    }", "    (void) llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);\n    if (!out.refusal.empty()) {\n        return out;\n    }"),
     ]:
         assert not admit_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
 

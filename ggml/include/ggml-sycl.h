@@ -1712,6 +1712,18 @@ GGML_BACKEND_API bool ggml_backend_sycl_load_compute_term_bytes(const uint64_t *
                                                                 uint32_t         n_chunks,
                                                                 uint64_t *       out);
 
+// The load's state reservation (llama.cpp-p6i0): the context memory the probe measure placed on device's plain buffer
+// type (the recurrent state of a hybrid or recurrent model), handed to the planner before the weight pack as its own
+// planned RUNTIME term.  The real context allocates that memory in the RUNTIME zone before the scheduler's compute
+// buffer, so without it the compute term does not hold the buffer.  The backend sizes state_bytes as one allocation at
+// its allocator's grain, with no headroom, and never touches the ledger.  False, reserving nothing, when txn is not the
+// open load transaction, when device is out of range or has no VRAM arena, when the size overflows, or while the
+// backend admits no mutation; the loader then offers no compute term for the device either.
+// Proc name: "ggml_backend_sycl_load_reserve_state_term".
+GGML_BACKEND_API bool ggml_backend_sycl_load_reserve_state_term(struct ggml_sycl_load_txn txn,
+                                                                int32_t                   device,
+                                                                uint64_t                  state_bytes);
+
 // The residency probe (llama.cpp-moua L4 step 3d, llama.cpp-5cim).  Which layers would this context's plan leave in
 // host memory?  A pure plan query: it takes no replan lock, publishes nothing and changes nothing, and works with no
 // tenants and no published section (the caller asks before it publishes).

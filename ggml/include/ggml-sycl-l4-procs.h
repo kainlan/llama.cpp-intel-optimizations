@@ -12,8 +12,8 @@
 // A backend that does not define one of them answers null, which every reader treats as
 // inert: UNSUPPORTED for the publish, GROWTH for the coverage query, NOT_RECORDED for the
 // late check, NOT_ANSWERED for the residency probe, "not recorded" for the load's
-// compute-term record, "not reserved" for its compute reservation and "not sized" for the reservation's units
-// (llama.cpp-p6i0).
+// compute-term record, "not reserved" for its compute and state reservations and "not sized" for the reservation's
+// units (llama.cpp-p6i0).
 
 #define GGML_SYCL_PROC_SET_RUNTIME_CONTEXT_DESC "ggml_backend_sycl_set_runtime_context_desc"
 #define GGML_SYCL_PROC_TENANT_COVERAGE          "ggml_backend_sycl_tenant_coverage"
@@ -22,3 +22,4 @@
 #define GGML_SYCL_PROC_LOAD_RECORD_COMPUTE_TERM  "ggml_backend_sycl_load_record_compute_term"
 #define GGML_SYCL_PROC_LOAD_RESERVE_COMPUTE_TERM "ggml_backend_sycl_load_reserve_compute_term"
 #define GGML_SYCL_PROC_LOAD_COMPUTE_TERM_BYTES   "ggml_backend_sycl_load_compute_term_bytes"
+#define GGML_SYCL_PROC_LOAD_RESERVE_STATE_TERM   "ggml_backend_sycl_load_reserve_state_term"

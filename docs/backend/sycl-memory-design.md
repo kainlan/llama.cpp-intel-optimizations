@@ -2756,6 +2756,14 @@ shared zone, and the buffer took whatever the allocator found. On the B70 with Q
   chunks are summed. That is the allocator's grain and nothing more: there is no headroom in the term.
 - `unified_cache_get_planned_runtime_zone_requirement` adds the term, with the overflow checked, so
   `ensure_planned_arena_zones` sizes RUNTIME for the buffer before `compute_placement_plan` packs the weights.
+- The compute buffer is not the only thing the context puts in RUNTIME first. A hybrid or recurrent model's state
+  (`cache_r_l*`, `cache_s_l*`) sits in the plain device buffer type, outside the compute scope, and the real context
+  allocates it after the load and before the compute buffer. On the B70, Qwen3.8's 112.6 MiB of state took that room
+  out of the term, so the 512 MB chunk landed raw beside a 2055.1 MiB term. So the probe also reads the context memory
+  the measure placed on each device's plain buffer type (its no_alloc size, from `memory_breakdown`) and hands it to
+  `ggml_backend_sycl_load_reserve_state_term` first. The backend sizes it as one allocation at the same grain and
+  stores it as its own planned **state term**, which the requirement adds after the compute term. A device whose state
+  is declined is not offered its compute term.
 - At the **admitted** stage, right after the pack, the loader measures c(P) at the packed placement. It compares c(P)
   with C-hat in the reservation's units: both are sized by `ggml_backend_sycl_load_compute_term_bytes`, the reserve's
   own rule, not as raw sums. c(P) above C-hat, or a device with no probe bound, refuses the load as
@@ -2769,11 +2777,11 @@ shared zone, and the buffer took whatever the allocator found. On the B70 with Q
 **How it is drawn and dropped.**
 
 - The compute buffer's first tier is already the RUNTIME zone, so the term is drawn by the path the buffer takes.
-- The ring re-plan counts the term as pending RUNTIME demand, beside the dense scratch, so the ring does not take the
-  buffer's room. A re-publish while the buffer is live counts it twice, which is conservative.
+- The ring re-plan counts the term, and the state term, as pending RUNTIME demand, beside the dense scratch, so the
+  ring does not take their room. A re-publish while they are live counts them twice, which is conservative.
 - The term is device-global and merges like the dense terms: while another model is live, the larger term stays.
-- It is dropped where no model is live: at the outer load entry, at a load abort, and at a teardown with no other
-  model live and no load in flight.
+- It is dropped where no model is live, with the state term (`unified_cache_clear_planned_load_terms`): at the outer
+  load entry, at a load abort, and at a teardown with no other model live and no load in flight.
 - The `[SCRATCH-STATS] ... compute_buffer=` landing line ends with `planned_compute_term=<MiB>`. That is the positive
   control. A buffer that lands `zone=runtime` beside a nonzero term is the reservation at work. One that lands
   `zone=raw` beside a nonzero term is a reservation that did not hold it.
@@ -2794,6 +2802,10 @@ recovery path: it measures the driver's working set and sizes the headroom from 
   2048, `zone=runtime`, in RUNTIME slack. Where no slack is left, the ladder's own fit check keeps the pick lower. MoE
   models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the auto pick's. `llama.cpp-fkpg` (a) transports
   the caller's shape.
+- The state term is read at the measure's `n_seq_max` of 1, so `-np` above 1 under-reserves it, like the caller's
+  `-c` and `-ub` above (`llama.cpp-fkpg`). It is summed per buffer type, so a type holding several buffers can round
+  up by one grain per extra buffer beyond the term. It is reserved at the probe and is not re-checked at the admitted
+  or late stage.
 - A second model whose term is larger than the live one's raises the RUNTIME requirement. The late zone rebuild is
   refused while the first model holds allocations, so that load reaches the abort in
   `compute_and_store_plan_for_inventory`. `llama.cpp-ouur` refuses it by name instead.

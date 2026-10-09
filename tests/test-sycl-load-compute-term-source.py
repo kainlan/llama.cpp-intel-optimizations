@@ -14,6 +14,12 @@ landing line names it; and it is dropped where no model is live, so a next load 
 early inventory plan stages the probe plan the PROBE measure installs, the admitted check's units export answers the
 reserve's own sizing rule, and the measure override's install proc answers only the name of its kv_shape form.
 
+The state term beside it: the context memory the measure placed on a device's plain buffer type (Qwen3.8's recurrent
+state, 112.6 MiB on the B70) is allocated RUNTIME-first before the compute buffer, so the term alone did not hold the
+buffer (the 512 MB chunk landed raw). ggml_backend_sycl_load_reserve_state_term sizes it at the same grain and stores
+it as its own planned RUNTIME term, which the requirement and the ring count beside the compute term and the clear
+drops with it.
+
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
 Pytest-style (module-level test_* functions): register with llama_test_pytest.
@@ -110,7 +116,7 @@ LANDING_SIG = "static void ggml_sycl_log_compute_buffer_landing(int device, cons
 LOAD_SIG = "static void ggml_sycl_model_loading_effects(bool loading, bool outer)"
 TEARDOWN_SIG = "static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner)"
 ABORT_SIG = "static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelToken owner,"
-CLEAR = "ggml_sycl::unified_cache_clear_planned_compute_terms();"
+CLEAR = "ggml_sycl::unified_cache_clear_planned_load_terms();"
 STAGE_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory * inventory,"
 STAGE_PROBE = ("if (early) { const uint64_t txn = effect.owner.load.value; "
                "const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(txn); "
@@ -173,8 +179,8 @@ def claim_requirement_folds_in_the_term(cache: str) -> bool:
     req = body(norm(cache), REQ_SIG)
     return (bool(req) and ordered(
         req, "const size_t compute = unified_cache_get_planned_compute_term_bytes(device_id);",
-        "compute > SIZE_MAX - base - mmq_src1 - dequant_f16) { return false; }",
-        "*out = base + mmq_src1 + dequant_f16 + compute;"))
+        "compute > SIZE_MAX - base - mmq_src1 - dequant_f16 ||",
+        "*out = base + mmq_src1 + dequant_f16 + compute + state;"))
 
 
 def claim_ring_leaves_the_term_room(sycl: str) -> bool:
@@ -363,7 +369,7 @@ def test_mutant_setter_overwriting_fails():
 
 def test_mutant_requirement_without_the_term_fails():
     assert not claim_requirement_folds_in_the_term(
-        _once(CACHE, "*out = base + mmq_src1 + dequant_f16 + compute;", "*out = base + mmq_src1 + dequant_f16;"))
+        _once(CACHE, "*out = base + mmq_src1 + dequant_f16 + compute + state;", "*out = base + mmq_src1 + dequant_f16 + state;"))
 
 
 def test_mutant_requirement_unchecked_fails():
@@ -384,14 +390,14 @@ def test_mutant_landing_line_without_the_term_fails():
 
 def test_mutant_load_entry_clear_dropped_fails():
     assert not claim_load_entry_clears_with_no_model_live(
-        _once(SYCL, "            if (live_mask == 0) {\n                ggml_sycl::unified_cache_clear_planned_compute_terms();",
+        _once(SYCL, "            if (live_mask == 0) {\n                ggml_sycl::unified_cache_clear_planned_load_terms();",
               "            if (live_mask == 0) {\n                ;"))
 
 
 def test_mutant_load_entry_clears_beside_a_live_model_fails():
     assert not claim_load_entry_clears_with_no_model_live(
-        _once(SYCL, "            if (live_mask == 0) {\n                ggml_sycl::unified_cache_clear_planned_compute_terms();",
-              "            if (true) {\n                ggml_sycl::unified_cache_clear_planned_compute_terms();"))
+        _once(SYCL, "            if (live_mask == 0) {\n                ggml_sycl::unified_cache_clear_planned_load_terms();",
+              "            if (true) {\n                ggml_sycl::unified_cache_clear_planned_load_terms();"))
 
 
 def test_mutant_teardown_clears_during_a_load_fails():
@@ -403,7 +409,7 @@ def test_mutant_teardown_clears_during_a_load_fails():
 def test_mutant_abort_clear_dropped_fails():
     assert not claim_abort_clears_with_no_model_live(
         _once(SYCL, "        if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) {\n"
-                    "            ggml_sycl::unified_cache_clear_planned_compute_terms();",
+                    "            ggml_sycl::unified_cache_clear_planned_load_terms();",
               "        if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) {\n            ;"))
 
 
@@ -438,6 +444,146 @@ def test_mutant_probe_plan_staged_for_another_load_fails():
     assert not claim_early_plan_stages_the_probe_plan(
         _once(SYCL, "            const uint64_t txn       = effect.owner.load.value;",
               "            const uint64_t txn       = effect.owner.load.value + 1;"))
+
+
+# ---- (d) the state term: the context memory the RUNTIME zone takes before the compute buffer ----------------------
+
+RESERVE_STATE_SIG = "bool ggml_backend_sycl_load_reserve_state_term(ggml_sycl_load_txn txn, int32_t device, uint64_t state_bytes)"
+STATE_SETTER_SIG = "bool unified_cache_set_planned_state_term(int device_id, size_t bytes, bool other_model_live)"
+CLEAR_SIG = "void unified_cache_clear_planned_load_terms()"
+
+
+def claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(sycl: str) -> bool:
+    """The state export admits the mutation, refuses a closed txn, a bad device and a device with no arena, sizes the
+    one buffer at the reservation's grain and stores that as the state term: no headroom, no ledger, no compute
+    term; and the backend answers its proc name."""
+    b = body(norm(sycl), RESERVE_STATE_SIG)
+    return (claim_the_units_are_the_grain_at_the_buffer_alignment(sycl) and bool(b) and ordered(
+        b, "sycl_module_mutation_guard module_guard;", "if (!module_guard) { return false; }",
+        "if (!ggml_sycl_load_txn_is_open(txn.id))",
+        "else if (device < 0 || device >= ggml_sycl_info().total_gpu_count || device >= GGML_SYCL_MAX_DEVICES)",
+        "if (cache == nullptr || !cache->arena_active())",
+        "else if (!ggml_sycl_load_compute_term_size(&state_bytes, 1, &bytes))",
+        "else if (!ggml_sycl::unified_cache_set_planned_state_term(device, bytes, "
+        "ggml_sycl::lifecycle::global_registry().live_mask() != 0))",
+        "if (why != nullptr)", "return false;", "return true;")
+        and b.count("unified_cache_set_planned_state_term(") == 1
+        and "unified_cache_set_planned_compute_term" not in b
+        and "ledger" not in b and "ggml_sycl_load_record_compute_term" not in b
+        and ('strcmp(name, "ggml_backend_sycl_load_reserve_state_term") == 0) { '
+             "return (void *) ggml_backend_sycl_load_reserve_state_term; }") in norm(sycl))
+
+
+def claim_state_setter_merges_like_the_compute_term(cache: str) -> bool:
+    b = body(norm(cache), STATE_SETTER_SIG)
+    return (bool(b) and "if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) { return false; }" in b
+            and "zone_dense_scratch_merge_input(g_planned_state_term_bytes[device_id].load(std::memory_order_acquire), "
+                "bytes, other_model_live)" in b)
+
+
+def claim_requirement_folds_in_the_state_term(cache: str) -> bool:
+    """The RUNTIME zone requirement adds the state term after the compute term, with the overflow checked."""
+    req = body(norm(cache), REQ_SIG)
+    return (bool(req) and ordered(
+        req, "const size_t compute = unified_cache_get_planned_compute_term_bytes(device_id);",
+        "const size_t state = unified_cache_get_planned_state_term_bytes(device_id);",
+        "state > SIZE_MAX - base - mmq_src1 - dequant_f16 - compute) { return false; }",
+        "*out = base + mmq_src1 + dequant_f16 + compute + state;"))
+
+
+def claim_ring_leaves_the_state_room(sycl: str) -> bool:
+    txn = body(norm(sycl), TXN_SIG)
+    return bool(txn) and ordered(
+        txn, "ring_kv_zone.runtime_pending_bytes += ggml_sycl::unified_cache_get_planned_compute_term_bytes(ctx->device);",
+        "ring_kv_zone.runtime_pending_bytes += ggml_sycl::unified_cache_get_planned_state_term_bytes(ctx->device);",
+        "ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone)")
+
+
+def claim_clear_drops_both_terms(cache: str) -> bool:
+    b = body(norm(cache), CLEAR_SIG)
+    return (bool(b) and "g_planned_compute_term_bytes[device_id].store(0, std::memory_order_release);" in b
+            and "g_planned_state_term_bytes[device_id].store(0, std::memory_order_release);" in b
+            and "unified_cache_clear_planned_compute_terms" not in cache)
+
+
+def test_the_state_reservation_sizes_at_the_grain_and_writes_only_the_term():
+    assert claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(SYCL)
+
+
+def test_the_state_setter_merges_like_the_compute_term():
+    assert claim_state_setter_merges_like_the_compute_term(CACHE)
+
+
+def test_the_requirement_folds_in_the_state_term():
+    assert claim_requirement_folds_in_the_state_term(CACHE)
+
+
+def test_the_ring_leaves_the_state_room():
+    assert claim_ring_leaves_the_state_room(SYCL)
+
+
+def test_the_clear_drops_both_terms():
+    assert claim_clear_drops_both_terms(CACHE)
+
+
+_STATE_SET = ("            } else if (!ggml_sycl::unified_cache_set_planned_state_term(\n"
+              "                           device, bytes, ggml_sycl::lifecycle::global_registry().live_mask() != 0)) {")
+
+
+def test_mutant_state_reserve_with_headroom_fails():
+    assert not claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(
+        _once(SYCL, _STATE_SET, _STATE_SET.replace("device, bytes,", "device, bytes + bytes / 8,")))
+
+
+def test_mutant_state_reserve_into_the_compute_term_fails():
+    assert not claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(
+        _once(SYCL, _STATE_SET, _STATE_SET.replace("unified_cache_set_planned_state_term(", "unified_cache_set_planned_compute_term(")))
+
+
+def test_mutant_state_reserve_without_the_grain_fails():
+    assert not claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(
+        _once(SYCL, "            } else if (!ggml_sycl_load_compute_term_size(&state_bytes, 1, &bytes)) {",
+              "            } else if (!(bytes = state_bytes, true)) {"))
+
+
+def test_mutant_state_reserve_on_a_closed_txn_fails():
+    b = body(SYCL, RESERVE_STATE_SIG)
+    assert b and not claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(
+        SYCL.replace(b, b.replace("if (!ggml_sycl_load_txn_is_open(txn.id)) {", "if (false) {", 1), 1))
+
+
+def test_mutant_state_proc_not_answered_fails():
+    assert not claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(
+        _once(SYCL, 'if (strcmp(name, "ggml_backend_sycl_load_reserve_state_term") == 0) {',
+              'if (strcmp(name, "ggml_backend_sycl_load_reserve_state_term_unused") == 0) {'))
+
+
+def test_mutant_state_setter_overwriting_fails():
+    assert not claim_state_setter_merges_like_the_compute_term(
+        _once(CACHE, "zone_dense_scratch_merge_input(g_planned_state_term_bytes[device_id].load(std::memory_order_acquire), bytes,\n"
+                     "                                       other_model_live)",
+              "bytes"))
+
+
+def test_mutant_requirement_without_the_state_term_fails():
+    assert not claim_requirement_folds_in_the_state_term(
+        _once(CACHE, "*out = base + mmq_src1 + dequant_f16 + compute + state;", "*out = base + mmq_src1 + dequant_f16 + compute;"))
+
+
+def test_mutant_requirement_state_unchecked_fails():
+    assert not claim_requirement_folds_in_the_state_term(
+        _once(CACHE, "state > SIZE_MAX - base - mmq_src1 - dequant_f16 - compute", "false"))
+
+
+def test_mutant_ring_not_charged_the_state_fails():
+    assert not claim_ring_leaves_the_state_room(
+        _once(SYCL, "ring_kv_zone.runtime_pending_bytes += ggml_sycl::unified_cache_get_planned_state_term_bytes(ctx->device);",
+              ";"))
+
+
+def test_mutant_clear_keeping_the_state_fails():
+    assert not claim_clear_drops_both_terms(
+        _once(CACHE, "        g_planned_state_term_bytes[device_id].store(0, std::memory_order_release);\n", ""))
 
 
 if __name__ == "__main__":

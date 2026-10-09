@@ -829,6 +829,8 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
         llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_RESERVE_COMPUTE_TERM));
     procs.term_bytes = reinterpret_cast<decltype(procs.term_bytes)>(
         llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_COMPUTE_TERM_BYTES));
+    procs.reserve_state = reinterpret_cast<decltype(procs.reserve_state)>(
+        llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_RESERVE_STATE_TERM));
     return procs;
 }
 
@@ -3197,6 +3199,13 @@ void llama_context::tenant_host_hold_measure_and_fold(const std::vector<ggml_syc
 std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sched_measure_plan & plan) const {
     std::vector<llama_tenant_buft_caps> out;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    // llama.cpp-p6i0: the context memory each buffer type holds (a hybrid or recurrent model's state sits in the plain
+    // device buffer type, which is also the device's compute buft). In a measure-only context the memory is no_alloc,
+    // so this is the size its buffers will have, summed per buffer type.
+    std::map<ggml_backend_buffer_type_t, size_t> memory_bytes;
+    if (memory) {
+        memory_bytes = memory->memory_breakdown();
+    }
     for (const auto & entry : plan.bufts) {
         for (size_t i = 0, sycl_ordinal = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
@@ -3209,6 +3218,8 @@ std::vector<llama_tenant_buft_caps> llama_context::measure_tenant_caps(const sch
                     c.cap    = entry.cap;
                     c.max_chunk_size = entry.max_chunk_size;
                     llama_tenant_caps_set_peaks(c, entry.peaks);
+                    const auto state = memory_bytes.find(entry.buft);
+                    c.state_bytes    = state != memory_bytes.end() ? state->second : 0;
                     out.push_back(c);
                     break;
                 }
@@ -3981,6 +3992,7 @@ llama_load_measure_result llama_load_measure_run(const llama_model &            
         d.chunk_bytes = c.chunk_bytes;
         d.total       = c.total;
         d.cap         = c.max_chunk_size;
+        d.state_bytes = c.host ? 0 : c.state_bytes;
         out.devices.push_back(std::move(d));
     }
     out.n_splits = holder->get_measure_plan().n_splits_max;
@@ -4082,15 +4094,8 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
     out.devices  = measured.devices;
     out.measured = true;
     const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
-    for (const llama_load_measure_device & d : measured.devices) {
-        if (d.host) {
-            continue;
-        }
-        // false: the backend said why at WARN, and this device's compute buffer stays unplanned
-        if (!llama_sycl_l4_reserve_compute_term(procs, txn, d, measured_n_ctx)) {
-            out.not_reserved.push_back(d.device);
-        }
-    }
+    // each SYCL device's state term, then its compute term; a declined device's compute buffer stays unplanned
+    out.not_reserved              = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);
 #else
     GGML_UNUSED(model);
     GGML_UNUSED(n_ctx);

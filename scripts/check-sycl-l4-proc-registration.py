@@ -711,14 +711,14 @@ DOOR_CALL = re.compile(r"(?:\.|->)\s*probe_residency\s*\)?\s*\(")
 
 
 def load_term_pins(header_raw, source, fails):
-    """The load's compute-term entries (llama.cpp-p6i0).  The header names all three procs: the record, the reserve
-    and the reservation's units.  The record export is the production caller of the one ledger writer: it reaches the
-    writer, under the module guard, and never the ledger itself; the writer is called only by it and by the private
-    test hook, and is no longer marked unused.  The reserve export hands the probe bound to the planner and touches
-    neither the ledger nor its writer, so c(P) is recorded at one stage only."""
+    """The load's compute-term entries (llama.cpp-p6i0).  The header names all four procs: the record, the reserve,
+    the reservation's units and the state reserve.  The record export is the production caller of the one ledger
+    writer: it reaches the writer, under the module guard, and never the ledger itself; the writer is called only by
+    it and by the private test hook, and is no longer marked unused.  The reserve export hands the probe bound to the
+    planner and touches neither the ledger nor its writer, so c(P) is recorded at one stage only."""
     names = header_proc_names(header_raw)
     for name in ("ggml_backend_sycl_load_record_compute_term", "ggml_backend_sycl_load_reserve_compute_term",
-                 "ggml_backend_sycl_load_compute_term_bytes"):
+                 "ggml_backend_sycl_load_compute_term_bytes", "ggml_backend_sycl_load_reserve_state_term"):
         if name not in names:
             fails.append("L4 load terms: the header does not name the proc %s" % name)
     if re.search(r"\[\[maybe_unused\]\]\s*static\s+bool\s+ggml_sycl_load_record_compute_term\s*\(", source):
@@ -1802,7 +1802,7 @@ def mutations(header_raw, source):
             a, b = span
             muts.append((label, msg, header_raw, src[:a] + src[a:b].replace(old, new, 1) + src[b:]))
     for name in ("ggml_backend_sycl_load_record_compute_term", "ggml_backend_sycl_load_reserve_compute_term",
-                 "ggml_backend_sycl_load_compute_term_bytes"):
+                 "ggml_backend_sycl_load_compute_term_bytes", "ggml_backend_sycl_load_reserve_state_term"):
         line = '// Proc name: "%s".' % name
         if header_raw.count(line) != 1:
             muts.append(("PATTERN NOT FOUND: the header's proc name " + name, "PATTERN", header_raw, src))

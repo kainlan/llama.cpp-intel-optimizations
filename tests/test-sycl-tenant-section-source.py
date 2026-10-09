@@ -162,6 +162,7 @@ _L4_NAMES = {
     "record_term": "GGML_SYCL_PROC_LOAD_RECORD_COMPUTE_TERM",  # llama.cpp-p6i0
     "reserve_term": "GGML_SYCL_PROC_LOAD_RESERVE_COMPUTE_TERM",  # llama.cpp-p6i0
     "term_bytes": "GGML_SYCL_PROC_LOAD_COMPUTE_TERM_BYTES",  # llama.cpp-p6i0
+    "reserve_state": "GGML_SYCL_PROC_LOAD_RESERVE_STATE_TERM",  # llama.cpp-p6i0
 }
 
 

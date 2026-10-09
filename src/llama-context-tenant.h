@@ -33,12 +33,13 @@ struct llama_sycl_l4_procs {
     decltype(&ggml_backend_sycl_tenant_coverage)          coverage        = nullptr;
     decltype(&ggml_backend_sycl_load_late_check)          late_check      = nullptr;
     decltype(&ggml_backend_sycl_probe_residency)          probe_residency = nullptr;
-    // The load's compute-term record, compute reservation and the reservation's units (llama.cpp-p6i0). Not part of
-    // available(): the context side and the late check keep their gate, and the loader gates its two steps on
-    // load_terms_available().
+    // The load's compute-term record, compute reservation, the reservation's units and the state reservation
+    // (llama.cpp-p6i0). Not part of available(): the context side and the late check keep their gate, and the loader
+    // gates its two steps on load_terms_available().
     decltype(&ggml_backend_sycl_load_record_compute_term)  record_term     = nullptr;
     decltype(&ggml_backend_sycl_load_reserve_compute_term) reserve_term    = nullptr;
     decltype(&ggml_backend_sycl_load_compute_term_bytes)   term_bytes      = nullptr;
+    decltype(&ggml_backend_sycl_load_reserve_state_term)   reserve_state   = nullptr;
 
     // A planned context needs all four: a publish that cannot be covered-checked, a load that
     // cannot be late-checked, or a plan whose residency cannot be probed, is half a plan.
@@ -46,12 +47,13 @@ struct llama_sycl_l4_procs {
         return publish != nullptr && coverage != nullptr && late_check != nullptr && probe_residency != nullptr;
     }
 
-    // The loader reserves the probe bound and records the admitted term only with all three: a reservation that is
+    // The loader reserves the probe bound and records the admitted term only with all four: a reservation that is
     // never recorded leaves the late check nothing to compare, a record with no reservation compares a term the
-    // pack never made room for, and without the reservation's units the admitted check cannot compare c(P) with
-    // what was reserved.
+    // pack never made room for, without the reservation's units the admitted check cannot compare c(P) with
+    // what was reserved, and without the state reservation a model with recurrent state has its compute term drawn
+    // down by that state before the compute buffer is allocated.
     bool load_terms_available() const {
-        return record_term != nullptr && reserve_term != nullptr && term_bytes != nullptr;
+        return record_term != nullptr && reserve_term != nullptr && term_bytes != nullptr && reserve_state != nullptr;
     }
 };
 
@@ -144,6 +146,18 @@ inline bool llama_sycl_l4_reserve_compute_term(const llama_sycl_l4_procs & procs
     return procs.reserve_term(txn, device, chunks.data(), static_cast<uint32_t>(chunks.size()), n_ctx);
 }
 
+// The load's state reservation (llama.cpp-p6i0): the context memory the probe measure placed on one device's plain
+// buffer type. False is "not reserved", and a null proc reads as it.
+inline bool llama_sycl_l4_reserve_state_term(const llama_sycl_l4_procs & procs,
+                                             struct ggml_sycl_load_txn   txn,
+                                             int32_t                     device,
+                                             uint64_t                    state_bytes) {
+    if (procs.reserve_state == nullptr) {
+        return false;
+    }
+    return procs.reserve_state(txn, device, state_bytes);
+}
+
 // The reservation's units of one measured device's chunks (llama.cpp-p6i0). False is "not sized", and a null proc
 // reads as it: the admitted check then refuses the load by name rather than compare raw sums with a reservation.
 inline bool llama_sycl_l4_compute_term_bytes(const llama_sycl_l4_procs & procs,
@@ -216,6 +230,9 @@ struct llama_tenant_buft_caps {
     size_t              max_chunk_size = 0;  // the largest chunk the buft's allocator allowed
     std::vector<size_t> chunk_bytes;         // the peak of each chunk over the measured graphs
     size_t              total = 0;           // their sum
+    // A device buft only (llama.cpp-p6i0): the context memory the context placed in this buffer type (a hybrid or
+    // recurrent model's state), which the backend allocates RUNTIME-first outside the compute scope.
+    size_t              state_bytes = 0;
 };
 
 // A buft's compute term from the peaks each measured graph left in each chunk (`peaks[g][c]`): the peak of

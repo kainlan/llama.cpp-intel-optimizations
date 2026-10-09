@@ -12597,12 +12597,13 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
     g_sycl_lifecycle_release_slot_last_slot.store(slot, std::memory_order_relaxed);
     g_sycl_lifecycle_release_slot_last_reclaimed.store(reclaimed, std::memory_order_relaxed);
     g_sycl_lifecycle_release_slot_calls.fetch_add(1, std::memory_order_relaxed);
-    // llama.cpp-p6i0: the planned compute term is device-global and merged across live models, so a teardown drops it
-    // only when no other model is live and no load is in flight (a load in flight has reserved its own term).
+    // llama.cpp-p6i0: the planned load terms (compute and state) are device-global and merged across live models, so a
+    // teardown drops them only when no other model is live and no load is in flight (a load in flight has reserved its
+    // own).
     const uint32_t others_live =
         ggml_sycl::lifecycle::global_registry().live_mask() & (slot < 32 ? ~(1u << slot) : ~0u);
     if (others_live == 0 && !g_sycl_in_model_load.load(std::memory_order_acquire)) {
-        ggml_sycl::unified_cache_clear_planned_compute_terms();
+        ggml_sycl::unified_cache_clear_planned_load_terms();
     }
     // llama.cpp-fzem: WARN, not INFO -- GGML_LOG_LEVEL_INFO maps below the
     // default verbosity threshold (67b2b7f2f, common/log.cpp:444), so an INFO
@@ -12830,10 +12831,10 @@ static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
             // constructor reserves the arena when vram_arena_enabled().
             const int      total_gpus = ggml_sycl_info().total_gpu_count;
             const uint32_t live_mask  = ggml_sycl::lifecycle::global_registry().live_mask();
-            // llama.cpp-p6i0: with no model live, no context can draw a planned compute term, so a term left by a
-            // load that never committed (or by a teardown that raced a load) is dropped before this load reserves.
+            // llama.cpp-p6i0: with no model live, no context can draw a planned load term, so a term left by a load
+            // that never committed (or by a teardown that raced a load) is dropped before this load reserves.
             if (live_mask == 0) {
-                ggml_sycl::unified_cache_clear_planned_compute_terms();
+                ggml_sycl::unified_cache_clear_planned_load_terms();
             }
             for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
                 auto * cache = ggml_sycl::get_unified_cache_for_device(d);
@@ -13124,10 +13125,10 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
         // Abort discards only loader-thread candidate state. The previously active
         // LIVE execution authority remains continuously published.
         ggml_sycl_reset_model_load_scratch_state(true);
-        // llama.cpp-p6i0: the aborted load's planned compute term goes with it when no model is live; with one live,
-        // the merged term stays (it is at least the live model's).
+        // llama.cpp-p6i0: the aborted load's planned load terms go with it when no model is live; with one live, the
+        // merged terms stay (each is at least the live model's).
         if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) {
-            ggml_sycl::unified_cache_clear_planned_compute_terms();
+            ggml_sycl::unified_cache_clear_planned_load_terms();
         }
     } catch (...) {
         clean = false;
@@ -20221,6 +20222,9 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // zone after this transaction, so the ring leaves it too. A re-publish while the buffer is live counts it twice,
     // like the dense scratch above: conservative.
     ring_kv_zone.runtime_pending_bytes += ggml_sycl::unified_cache_get_planned_compute_term_bytes(ctx->device);
+    // And the load's planned state term: the context memory (the recurrent state) the RUNTIME zone takes before the
+    // compute buffer. Counted twice on a re-publish while it is live, like the term above: conservative.
+    ring_kv_zone.runtime_pending_bytes += ggml_sycl::unified_cache_get_planned_state_term_bytes(ctx->device);
     // The current plan's pools, still allocated, are already missing from the
     // RUNTIME zone's free space, so they are counted twice here: conservative,
     // and only in a build where the route is reachable.
@@ -40176,6 +40180,56 @@ bool ggml_backend_sycl_load_reserve_compute_term(ggml_sycl_load_txn txn,
             "load, %u chunk(s), n_ctx %u)\n",
             device, ggml_sycl::unified_cache_get_planned_compute_term_bytes(device) / (1024.0 * 1024.0),
             bytes / (1024.0 * 1024.0), n_chunks, n_ctx);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// The load's state reservation (llama.cpp-p6i0): the planned RUNTIME term for the context memory the probe measure
+// placed on `device`'s plain buffer type, the recurrent state of a hybrid or recurrent model.  The real context
+// allocates that memory RUNTIME-first and outside the compute scope, after this load and before the scheduler's
+// compute buffer, so it is its own planned consumer: without it the compute term is drawn down by the state and the
+// buffer's last chunk lands outside the arena (Qwen3.8 on the B70: 112.6 MiB of state, a 512 MiB chunk raw).  Sized
+// as one buffer at the reservation's grain (ggml_sycl_load_compute_term_size), with no headroom; it writes the
+// planner term only.  False, reserving nothing, when txn is not the open load, the device is out of range or has no
+// VRAM arena, or the size overflows; the device's compute buffer then stays unplanned too (the loader offers no
+// compute term for it).
+bool ggml_backend_sycl_load_reserve_state_term(ggml_sycl_load_txn txn, int32_t device, uint64_t state_bytes) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return false;
+    }
+    try {
+        const char * why   = nullptr;
+        size_t       bytes = 0;
+        if (!ggml_sycl_load_txn_is_open(txn.id)) {
+            why = "not the open load transaction";
+        } else if (device < 0 || device >= ggml_sycl_info().total_gpu_count || device >= GGML_SYCL_MAX_DEVICES) {
+            why = "device out of range";
+        } else {
+            auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+            if (cache == nullptr || !cache->arena_active()) {
+                why = "no VRAM arena on the device";
+            } else if (!ggml_sycl_load_compute_term_size(&state_bytes, 1, &bytes)) {
+                why = "the size overflows";
+            } else if (!ggml_sycl::unified_cache_set_planned_state_term(
+                           device, bytes, ggml_sycl::lifecycle::global_registry().live_mask() != 0)) {
+                why = "the term was not stored";
+            }
+        }
+        if (why != nullptr) {
+            GGML_LOG_WARN(
+                "[LOAD-PLAN] state term not reserved on device %d: %s (the context memory and the compute buffer stay "
+                "unplanned)\n",
+                device, why);
+            return false;
+        }
+        GGML_LOG_INFO(
+            "[LOAD-PLAN] state term reserved in RUNTIME on device %d: %.1f MiB planned (%.1f MiB for this load, the "
+            "context memory on the device buffer type)\n",
+            device, ggml_sycl::unified_cache_get_planned_state_term_bytes(device) / (1024.0 * 1024.0),
+            bytes / (1024.0 * 1024.0));
         return true;
     } catch (...) {
         return false;
@@ -117085,6 +117139,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_load_compute_term_bytes") == 0) {
         return (void *) ggml_backend_sycl_load_compute_term_bytes;
+    }
+    if (strcmp(name, "ggml_backend_sycl_load_reserve_state_term") == 0) {
+        return (void *) ggml_backend_sycl_load_reserve_state_term;
     }
     if (strcmp(name, "ggml_backend_sycl_supports_op_capability") == 0) {
         return (void *) ggml_backend_sycl_supports_op_capability;

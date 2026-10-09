@@ -224,6 +224,9 @@ struct llama_load_measure_device {
     std::vector<size_t> chunk_bytes;  // llama_measure_peak_per_chunk(): the peak of each gallocr chunk
     size_t              total = 0;    // llama_measure_peak_total(chunk_bytes)
     size_t              cap   = 0;    // the largest chunk the scope allowed
+    // A device only: the context memory the measure placed on this device's plain buffer type (a hybrid or recurrent
+    // model's state). The real context allocates it in the RUNTIME zone before the compute buffer (llama.cpp-p6i0).
+    size_t              state_bytes = 0;
 };
 
 // The reservation's door for one measured device (llama.cpp-p6i0): its per-chunk peaks, at the n_ctx it was
@@ -354,6 +357,33 @@ struct llama_load_probe_result {
     std::vector<llama_load_measure_device> devices;      // C-hat per device when measured
     std::vector<int32_t>                   not_reserved;  // SYCL devices the backend declined to reserve for
 };
+
+// The probe's reservations (llama.cpp-p6i0), per measured SYCL device and in order: its state term first, when the
+// measure placed context memory on its plain buffer type, then its compute term. The state goes first because the real
+// context allocates it in the RUNTIME zone before the compute buffer: a compute term reserved without it is drawn down
+// by the state, and the buffer's last chunk lands outside the arena (Qwen3.8 on the B70). A device whose state the
+// backend declines is declined whole and is not offered its compute term; one whose compute term is declined keeps
+// its state term, which is real memory either way. The host tier reserves nothing. Returns the declined devices.
+inline std::vector<int32_t> llama_load_probe_reserve(const llama_sycl_l4_procs &                    procs,
+                                                     struct ggml_sycl_load_txn                      txn,
+                                                     const std::vector<llama_load_measure_device> & devices,
+                                                     uint32_t                                       n_ctx) {
+    std::vector<int32_t> declined;
+    for (const llama_load_measure_device & d : devices) {
+        if (d.host) {
+            continue;
+        }
+        if (d.state_bytes != 0 && !llama_sycl_l4_reserve_state_term(procs, txn, d.device, d.state_bytes)) {
+            declined.push_back(d.device);
+            continue;
+        }
+        // false: the backend said why at WARN, and this device's compute buffer stays unplanned
+        if (!llama_sycl_l4_reserve_compute_term(procs, txn, d, n_ctx)) {
+            declined.push_back(d.device);
+        }
+    }
+    return declined;
+}
 
 llama_load_probe_result llama_load_probe_bound(const llama_model &                            model,
                                                uint32_t                                       n_ctx,

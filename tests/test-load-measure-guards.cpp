@@ -18,6 +18,7 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -504,6 +505,106 @@ static void test_admitted_record() {
 
 // The KV shape the override's re-fit sizes for is the measure context's own: every field from the params the
 // measure builds the context with (llama.cpp-p6i0).
+// --- the probe's reservations (stage (a), llama.cpp-p6i0) ------------------------------------------
+//
+// Each measured SYCL device reserves the context memory the measure placed on its plain buffer type (the recurrent
+// state) BEFORE its compute term: the real context allocates that memory RUNTIME-first before the compute buffer, so
+// a compute reservation it was not counted beside does not hold the buffer (Qwen3.8 on the B70: the 112.6 MiB state
+// took the room of the 512 MiB chunk, which landed raw). A device with no such memory reserves no state; a declined
+// state is a declined device, and its compute term is not offered; the host tier reserves nothing.
+
+static std::vector<std::string> g_reserve_seq;
+static std::vector<int32_t>     g_reserve_decline_state;
+static std::vector<int32_t>     g_reserve_decline_compute;
+
+static bool fake_reserve_compute(struct ggml_sycl_load_txn,
+                                 int32_t          device,
+                                 const uint64_t * chunks,
+                                 uint32_t         n,
+                                 uint32_t         n_ctx) {
+    uint64_t sum = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        sum += chunks[i];
+    }
+    g_reserve_seq.push_back("compute " + std::to_string(device) + " " + std::to_string(sum) + " " +
+                            std::to_string(n_ctx));
+    return std::find(g_reserve_decline_compute.begin(), g_reserve_decline_compute.end(), device) ==
+           g_reserve_decline_compute.end();
+}
+
+static bool fake_reserve_state(struct ggml_sycl_load_txn txn, int32_t device, uint64_t bytes) {
+    g_reserve_seq.push_back("state " + std::to_string(device) + " " + std::to_string(bytes) + " txn " +
+                            std::to_string(txn.id));
+    return std::find(g_reserve_decline_state.begin(), g_reserve_decline_state.end(), device) ==
+           g_reserve_decline_state.end();
+}
+
+static llama_load_measure_device with_state(llama_load_measure_device d, size_t state_bytes) {
+    d.state_bytes = state_bytes;
+    return d;
+}
+
+static void test_probe_reserve() {
+    llama_sycl_l4_procs procs;
+    procs.reserve_term  = &fake_reserve_compute;
+    procs.reserve_state = &fake_reserve_state;
+
+    // state first, then compute, per device and in order; a device with no state reserves only its compute term;
+    // the host tier reserves nothing
+    {
+        g_reserve_seq.clear();
+        g_reserve_decline_state.clear();
+        g_reserve_decline_compute.clear();
+        const std::vector<llama_load_measure_device> devs = {
+            with_state(chunked(0, false, { 1618052864, 536870912 }), 118038528), chunked(1, false, { 100 }),
+            with_state(chunked(-1, true, { 900 }), 77)
+        };
+        const std::vector<int32_t> declined = llama_load_probe_reserve(procs, ggml_sycl_load_txn{ 5 }, devs, 262144);
+        CHECK(declined.empty(), "a device was declined");
+        CHECK(g_reserve_seq == std::vector<std::string>({ "state 0 118038528 txn 5", "compute 0 2154923776 262144",
+                                                          "compute 1 100 262144" }),
+              "the reservations were not state-then-compute per device: %zu call(s)", g_reserve_seq.size());
+    }
+    // a declined state declines the device, and its compute term is not offered
+    {
+        g_reserve_seq.clear();
+        g_reserve_decline_state = { 0 };
+        g_reserve_decline_compute.clear();
+        const std::vector<llama_load_measure_device> devs = { with_state(chunked(0, false, { 200 }), 64),
+                                                              with_state(chunked(1, false, { 300 }), 32) };
+        const std::vector<int32_t> declined = llama_load_probe_reserve(procs, ggml_sycl_load_txn{ 5 }, devs, 4096);
+        CHECK(declined == std::vector<int32_t>({ 0 }), "a declined state did not decline its device");
+        CHECK(
+            g_reserve_seq == std::vector<std::string>({ "state 0 64 txn 5", "state 1 32 txn 5", "compute 1 300 4096" }),
+            "a device whose state was declined was offered its compute term");
+    }
+    // a declined compute term declines the device; its state, already reserved, stays (the memory is real)
+    {
+        g_reserve_seq.clear();
+        g_reserve_decline_state.clear();
+        g_reserve_decline_compute                         = { 1 };
+        const std::vector<llama_load_measure_device> devs = { with_state(chunked(1, false, { 300 }), 32) };
+        const std::vector<int32_t> declined = llama_load_probe_reserve(procs, ggml_sycl_load_txn{ 5 }, devs, 4096);
+        CHECK(declined == std::vector<int32_t>({ 1 }), "a declined compute term did not decline its device");
+        CHECK(g_reserve_seq.size() == 2, "the state and the compute term were not both asked");
+    }
+    // with no state proc a device with state is declined, never reserved as compute alone
+    {
+        llama_sycl_l4_procs compute_only;
+        compute_only.reserve_term = &fake_reserve_compute;
+        g_reserve_seq.clear();
+        g_reserve_decline_state.clear();
+        g_reserve_decline_compute.clear();
+        const std::vector<llama_load_measure_device> devs = { with_state(chunked(0, false, { 300 }), 32) };
+        const std::vector<int32_t>                   declined =
+            llama_load_probe_reserve(compute_only, ggml_sycl_load_txn{ 5 }, devs, 4096);
+        CHECK(declined == std::vector<int32_t>({ 0 }) && g_reserve_seq.empty(),
+              "a device with state was reserved as compute alone");
+    }
+    g_reserve_decline_state.clear();
+    g_reserve_decline_compute.clear();
+}
+
 static void test_measure_kv_shape() {
     for (uint32_t n_ctx : { 0u, 4096u }) {
         llama_context_params params            = llama_load_measure_context_params(n_ctx, 262144);
@@ -677,6 +778,7 @@ int main() {
     test_measure_n_ctx();
     test_admitted_fold();
     test_admitted_record();
+    test_probe_reserve();
     if (n_failed != 0) {
         fprintf(stderr, "%d check(s) failed\n", n_failed);
         return 1;
