@@ -149,7 +149,7 @@ def params_ok(code: str) -> bool:
     b = function_body(code, _PARAMS)
     return (
         z("params.n_ubatch = llama_auto_ubatch_ladder[0];") in b
-        and z("params.n_ctx = n_ctx != 0 ? n_ctx : n_ctx_train;") in b
+        and z("params.n_ctx = llama_load_measure_n_ctx(n_ctx, n_ctx_train);") in b
         and z("params.n_batch = std::max(params.n_batch, params.n_ubatch);") in b
         and "512" not in b
         and '#include"llama-auto-ubatch.h"' in code
@@ -248,6 +248,116 @@ def site_ok(code: str) -> bool:
         in not_recorded
         and z("if (!late.refusal.empty()) { throw std::runtime_error(late.refusal); }") in seg
         and seg.count("throw") == 1
+    )
+
+
+_PROBE = (
+    "llama_load_probe_result llama_load_probe_bound(const llama_model & model, uint32_t n_ctx, "
+    "struct ggml_sycl_load_txn txn, const std::vector<llama_measure_dummy_entry> & weights)"
+)
+_ADMIT = (
+    "llama_admitted_check_result llama_load_admitted_check(const llama_model & model, uint32_t n_ctx, "
+    "struct ggml_sycl_load_txn txn, const std::vector<llama_measure_dummy_entry> & weights, "
+    "const std::vector<llama_load_measure_device> & probe)"
+)
+_N_CTX = "inline uint32_t llama_load_measure_n_ctx(uint32_t n_ctx, uint32_t n_ctx_train)"
+
+
+def probe_ok(code: str) -> bool:
+    """Stage (a), llama.cpp-p6i0: C-hat is measured at PROBE over the weight stand-ins, and each SYCL device's term
+    is handed to the planner at the n_ctx the measure ran at (never the envelope's 0)."""
+    b = function_body(code, _PROBE)
+    order = [
+        "if (!procs.load_terms_available())",
+        "llama_measure_dummy_scope dummies(weights);",
+        "if (dummies.failed())",
+        "llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_PROBE)",
+        "if (!measured.ok) { (measured.unsupported ? out.unsupported : out.refusal) = measured.refusal; return out; }",
+        "const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);",
+        "if (d.host) { continue; }",
+        "llama_sycl_l4_reserve_compute_term(procs, txn, d, measured_n_ctx)",
+    ]
+    pos = [b.find(z(t)) for t in order]
+    return (
+        -1 not in pos
+        and pos == sorted(pos)
+        and z("out.devices = measured.devices;") in b
+        and z("out.measured = true;") in b
+        # the probe never writes the ledger: c(P) is recorded at the admitted placement only
+        and "record" not in b
+        and "GGML_SYCL_MEASURE_STAGE_CANDIDATE" not in b
+    )
+
+
+def admit_ok(code: str) -> bool:
+    """Stage (b), llama.cpp-p6i0: c(P) is measured at the admitted placement, folded against the probe bound, and
+    only an admitted result is recorded, at the measure's n_ctx."""
+    b = function_body(code, _ADMIT)
+    order = [
+        "llama_measure_dummy_scope dummies(weights);",
+        "if (dummies.failed())",
+        "llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B)",
+        "if (!measured.ok)",
+        "const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);",
+        "llama_admitted_check_fold(probe, measured.devices, measured_n_ctx,",
+        "if (!out.refusal.empty()) { return out; }",
+        "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);",
+    ]
+    pos = [b.find(z(t)) for t in order]
+    return (
+        -1 not in pos
+        and pos == sorted(pos)
+        and b.count(z("llama_admitted_record(")) == 1
+        and "GGML_SYCL_MEASURE_STAGE_PROBE" not in b
+        and "GGML_SYCL_MEASURE_STAGE_CANDIDATE_C" not in b
+        and "reserve" not in b
+    )
+
+
+def n_ctx_ok(code: str) -> bool:
+    """One n_ctx rule: the measure's params and the recorded/reserved n_ctx read the same helper."""
+    b = function_body(code, _N_CTX)
+    p = function_body(code, _PARAMS)
+    return z("return n_ctx != 0 ? n_ctx : n_ctx_train;") in b and z(
+        "params.n_ctx = llama_load_measure_n_ctx(n_ctx, n_ctx_train);"
+    ) in p
+
+
+def stage_order_ok(code: str) -> bool:
+    """The loader's order (llama.cpp-p6i0): the tensors exist, the probe bound is measured and handed to the planner,
+    the late inventory packs, c(P) is measured and recorded at the admitted placement, the dev_layer sync runs, and
+    the late check compares. Each new call is made once, with the same n_ctx and transaction the late check passes,
+    and each refusal is thrown."""
+    c = code
+    done = c.find(z("ml.done_getting_tensors();"))
+    probe = c.find(z("llama_load_probe_bound("))
+    late_inv = c.find(z("llama_model_sycl_set_late_inventory(ml, hparams, __func__);"))
+    admit = c.find(z("llama_load_admitted_check("))
+    sync = c.find(z("dev_layer sync: corrected"))
+    late = c.find(z("llama_load_late_check("))
+    if min(done, probe, late_inv, admit, sync, late) == -1:
+        return False
+    if not (done < probe < late_inv < admit < sync < late):
+        return False
+    if c.count(z("llama_load_probe_bound(")) != 1 or c.count(z("llama_load_admitted_check(")) != 1:
+        return False
+    if c.count(z("llama_model_sycl_set_late_inventory(ml, hparams, __func__);")) != 1:
+        return False
+    args = z("llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn,")
+    probe_seg = c[probe:late_inv]
+    admit_seg = c[admit:sync]
+    unsupported = block_after(probe_seg, "if (!probe.unsupported.empty())")
+    return (
+        args in c[probe : probe + 300]
+        and args in c[admit : admit + 300]
+        and z("probe.devices)") in c[admit : admit + 400]
+        and "LLAMA_LOG_WARN(" in unsupported
+        and "unplanned path" in unsupported
+        and "throw" not in unsupported
+        and z("if (!probe.refusal.empty()) { throw std::runtime_error(probe.refusal); }") in probe_seg
+        and z("if (!admitted.refusal.empty()) { throw std::runtime_error(admitted.refusal); }") in admit_seg
+        # stage (b) runs only when the probe measured: an unsupported model stays on master's unplanned path
+        and z("if (probe.measured)") in c[late_inv:admit]
     )
 
 
@@ -528,6 +638,78 @@ def test_the_measure_asks_the_unsupported_question_before_any_backend():
     b = function_body(code, _MEASURE)
     moved = mutate(b, "if (const std::string why = llama_measure_unsupported_reason(model); !why.empty()) {", "if (false) {")
     assert not measure_ok(code.replace(b, moved, 1))
+
+
+def test_the_probe_bound_is_measured_and_reserved():
+    assert probe_ok(code_of(CONTEXT_CPP))
+
+
+def test_probe_mutants():
+    code = code_of(CONTEXT_CPP)
+    b = function_body(code, _PROBE)
+    for name, old, new in [
+        ("measured at the admitted stage", "GGML_SYCL_MEASURE_STAGE_PROBE)", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_B)"),
+        ("no reservation", "llama_sycl_l4_reserve_compute_term(procs, txn, d, measured_n_ctx)", "(void) d"),
+        ("the envelope's n_ctx reserved", "llama_sycl_l4_reserve_compute_term(procs, txn, d, measured_n_ctx)", "llama_sycl_l4_reserve_compute_term(procs, txn, d, n_ctx)"),
+        ("the host tier reserved", "if (d.host) {\n            continue;\n        }", ""),
+        ("no proc gate", "if (!procs.load_terms_available())", "if (false)"),
+        ("stand-ins dropped", "llama_measure_dummy_scope dummies(weights);", ""),
+    ]:
+        assert not probe_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
+
+
+def test_the_admitted_term_is_checked_then_recorded():
+    assert admit_ok(code_of(CONTEXT_CPP))
+
+
+def test_admit_mutants():
+    code = code_of(CONTEXT_CPP)
+    b = function_body(code, _ADMIT)
+    for name, old, new in [
+        ("measured at the late stage", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_B)", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_C)"),
+        ("recorded despite a refusal", "if (!out.refusal.empty()) {\n        return out;\n    }", ""),
+        ("never recorded", "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);", ""),
+        ("recorded at n_ctx 0", "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);", "out.n_recorded = llama_admitted_record(procs, txn, out, n_ctx);"),
+        ("the fold bypassed", "llama_admitted_check_fold(probe, measured.devices, measured_n_ctx,", "llama_admitted_check_fold(measured.devices, measured.devices, measured_n_ctx,"),
+    ]:
+        assert not admit_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
+
+
+def test_one_n_ctx_rule():
+    code = code_of(MEASURE_H)
+    assert n_ctx_ok(code)
+    p = function_body(code, _PARAMS)
+    assert not n_ctx_ok(code.replace(p, mutate(p, "llama_load_measure_n_ctx(n_ctx, n_ctx_train)", "n_ctx"), 1))
+    b = function_body(code, _N_CTX)
+    assert not n_ctx_ok(code.replace(b, mutate(b, "return n_ctx != 0 ? n_ctx : n_ctx_train;", "return n_ctx;"), 1))
+
+
+def test_the_loader_orders_probe_pack_admit_sync_late():
+    assert stage_order_ok(code_of(MODEL_CPP))
+
+
+def test_stage_order_mutants():
+    code = code_of(MODEL_CPP)
+    probe_call_start = code.find(z("llama_load_probe_bound("))
+    admit_call_start = code.find(z("llama_load_admitted_check("))
+    assert probe_call_start != -1 and admit_call_start != -1
+    late_inv = z("llama_model_sycl_set_late_inventory(ml, hparams, __func__);")
+    # the probe after the pack: the late inventory moved in front of the probe
+    moved_pack = code.replace(late_inv, "", 1)
+    moved_pack = moved_pack.replace(z("ml.done_getting_tensors();"), z("ml.done_getting_tensors();") + late_inv, 1)
+    assert not stage_order_ok(moved_pack), "the pack before the probe slipped through"
+    # the admitted measure after the dev_layer sync
+    sync = z("dev_layer sync: corrected")
+    moved_admit = code.replace(z("llama_load_admitted_check("), z("llama_load_admitted_check_x("), 1)
+    moved_admit = moved_admit.replace(sync, sync + z("llama_load_admitted_check("), 1)
+    assert not stage_order_ok(moved_admit), "the admitted measure after the sync slipped through"
+    # a refusal swallowed
+    assert not stage_order_ok(code.replace(z("throw std::runtime_error(probe.refusal);"), "", 1))
+    assert not stage_order_ok(code.replace(z("throw std::runtime_error(admitted.refusal);"), "", 1))
+    # the admitted check run for a model the probe could not measure
+    assert not stage_order_ok(code.replace(z("if (probe.measured)"), z("if (true)"), 1))
+    # a second probe call
+    assert not stage_order_ok(code + z("llama_load_probe_bound(*this, 0, sycl_model_loading_guard.txn, w);"))
 
 
 if __name__ == "__main__":

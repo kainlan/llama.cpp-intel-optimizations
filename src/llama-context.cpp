@@ -4059,6 +4059,10 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
     if (!procs.available()) {
         return out;
     }
+    // a bound that cannot be both reserved and recorded is not measured: the load takes master's unplanned path
+    if (!procs.load_terms_available()) {
+        return out;
+    }
 
     llama_measure_dummy_scope dummies(weights);
     if (dummies.failed()) {
@@ -4074,11 +4078,70 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
     }
     out.devices  = measured.devices;
     out.measured = true;
+    const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
+    for (const llama_load_measure_device & d : measured.devices) {
+        if (d.host) {
+            continue;
+        }
+        // false: the backend said why at WARN, and this device's compute buffer stays unplanned
+        if (!llama_sycl_l4_reserve_compute_term(procs, txn, d, measured_n_ctx)) {
+            out.not_reserved.push_back(d.device);
+        }
+    }
 #else
     GGML_UNUSED(model);
     GGML_UNUSED(n_ctx);
     GGML_UNUSED(txn);
     GGML_UNUSED(weights);
+#endif
+    return out;
+}
+
+llama_admitted_check_result llama_load_admitted_check(const llama_model &                            model,
+                                                      uint32_t                                       n_ctx,
+                                                      struct ggml_sycl_load_txn                      txn,
+                                                      const std::vector<llama_measure_dummy_entry> & weights,
+                                                      const std::vector<llama_load_measure_device> & probe) {
+    llama_admitted_check_result out;
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    llama_sycl_l4_procs procs;
+    for (const auto & d : model.devices) {
+        if (llama_context_dev_is_sycl(d.dev)) {
+            procs = llama_context_sycl_l4_procs_for_dev(d.dev);
+            break;
+        }
+    }
+    if (!procs.available() || !procs.load_terms_available()) {
+        return out;
+    }
+
+    llama_measure_dummy_scope dummies(weights);
+    if (dummies.failed()) {
+        out.refusal = llama_load_measure_refusal_text(GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, -1,
+                                                      "a weight stand-in buffer was refused");
+        return out;
+    }
+    const llama_load_measure_result measured =
+        llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B);
+    llama_load_measure_log_trace(measured);
+    if (!measured.ok) {
+        (measured.unsupported ? out.unsupported : out.refusal) = measured.refusal;
+        return out;
+    }
+    const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
+    const uint32_t n_ubatch       = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train).n_ubatch;
+
+    out = llama_admitted_check_fold(probe, measured.devices, measured_n_ctx, n_ubatch);
+    if (!out.refusal.empty()) {
+        return out;
+    }
+    out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);
+#else
+    GGML_UNUSED(model);
+    GGML_UNUSED(n_ctx);
+    GGML_UNUSED(txn);
+    GGML_UNUSED(weights);
+    GGML_UNUSED(probe);
 #endif
     return out;
 }

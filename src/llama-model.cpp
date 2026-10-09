@@ -2593,26 +2593,61 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool sycl_model_backend = sycl_model_loading_guard.txn.id != 0 && has_sycl_weight_buft;
     if (sycl_model_backend) {
         // (a) the probe measure, llama.cpp-p6i0: the probe placement's compute term C-hat, before the late plan
-        // packs the weights. R2 discriminator only: it is measured and logged, nothing is reserved or recorded,
-        // and a failure is a WARN, so the load behaves as before.
+        // packs the weights, handed to the backend as a planned RUNTIME term so the pack leaves the compute buffer
+        // its room. It is measured at n_ctx_train and ubatch 512: the caller's -c and -ub do not reach the load
+        // (fkpg (a)), so the term is that shape's, not the context's (R2).
         std::vector<llama_measure_dummy_entry> probe_weights;
         for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
             probe_weights.push_back({ ctx_key.buft, ctx_ptr.get() });
         }
-        const llama_load_probe_result probe = llama_load_probe_bound(
+        const int64_t                 probe_t0 = ggml_time_us();
+        const llama_load_probe_result probe    = llama_load_probe_bound(
             *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, probe_weights);
-        if (!probe.unsupported.empty() || !probe.refusal.empty()) {
-            LLAMA_LOG_WARN("%s: probe compute-slot measure skipped, the load continues: %s\n", __func__,
-                           (probe.unsupported.empty() ? probe.refusal : probe.unsupported).c_str());
+        const int64_t probe_ms = (ggml_time_us() - probe_t0) / 1000;
+        if (!probe.unsupported.empty()) {
+            // not a refusal of the load: this model cannot be measured, so it goes on the unplanned path
+            LLAMA_LOG_WARN("%s: probe compute-slot measure skipped, the load continues on the unplanned path: %s\n",
+                           __func__, probe.unsupported.c_str());
         }
-        for (const llama_load_measure_device & d : probe.devices) {
-            if (!d.host) {
-                LLAMA_LOG_INFO("%s: [LOAD-PLAN] probe compute term %.1f MiB on device %d (measured only)\n", __func__,
-                               d.total / 1024.0 / 1024.0, (int) d.device);
-            }
+        if (!probe.refusal.empty()) {
+            throw std::runtime_error(probe.refusal);
         }
 
         llama_model_sycl_set_late_inventory(ml, hparams, __func__);
+
+        // (b) the admitted measure, llama.cpp-p6i0: c(P) at the placement the late plan just packed, before the
+        // dev_layer sync, so the late check below compares the final placement with it. Refused when it outgrew
+        // the probe bound the pack reserved; recorded otherwise. Only a model the probe measured gets here.
+        if (probe.measured) {
+            std::vector<llama_measure_dummy_entry> admitted_weights;
+            for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+                admitted_weights.push_back({ ctx_key.buft, ctx_ptr.get() });
+            }
+            const int64_t                     admitted_t0 = ggml_time_us();
+            const llama_admitted_check_result admitted =
+                llama_load_admitted_check(*this, llama_model_sycl_make_placement_envelope().n_ctx,
+                                          sycl_model_loading_guard.txn, admitted_weights, probe.devices);
+            const int64_t admitted_ms = (ggml_time_us() - admitted_t0) / 1000;
+            if (!admitted.unsupported.empty()) {
+                LLAMA_LOG_WARN("%s: admitted compute-slot measure skipped, the load continues: %s\n", __func__,
+                               admitted.unsupported.c_str());
+            }
+            if (!admitted.refusal.empty()) {
+                throw std::runtime_error(admitted.refusal);
+            }
+            for (const llama_admitted_term & t : admitted.terms) {
+                const bool reserved = std::find(probe.not_reserved.begin(), probe.not_reserved.end(), t.device) ==
+                                      probe.not_reserved.end();
+                LLAMA_LOG_WARN(
+                    "%s: [LOAD-PLAN] compute slot on device %d: probe bound %.1f MiB %s, admitted %.1f MiB (%zu of "
+                    "%zu recorded); measured at n_ctx %u ubatch %u, the caller's -c and -ub are not transported "
+                    "(fkpg); measure %lld ms probe, %lld ms admitted\n",
+                    __func__, (int) t.device, t.probe_bytes / 1024.0 / 1024.0,
+                    reserved ? "reserved in RUNTIME" : "NOT reserved (the backend said why)",
+                    t.admitted_bytes / 1024.0 / 1024.0, admitted.n_recorded, admitted.terms.size(), admitted.n_ctx,
+                    admitted.n_ubatch, (long long) probe_ms, (long long) admitted_ms);
+            }
+        }
 
         // llama.cpp-30h4: dev_layer(il)/dev_output() go stale the moment a
         // layer is tiered to host by any route OTHER than -ngl. get_layer_buft_list()

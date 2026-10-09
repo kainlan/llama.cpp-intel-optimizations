@@ -304,6 +304,117 @@ static void test_late_check_fold() {
     }
 }
 
+// --- the admitted check (stage (b), llama.cpp-p6i0) ----------------------------------------------
+//
+// c(P), measured at the admitted placement, is compared per device with the probe bound C-hat measured before
+// the pack: c(P) <= C-hat is admitted and c(P) (never C-hat) is what is recorded; c(P) > C-hat refuses the load by
+// name with both values. The host tier is skipped, as in the late fold.
+
+static void test_measure_n_ctx() {
+    CHECK(llama_load_measure_n_ctx(0, 262144) == 262144, "n_ctx 0 did not become the training context");
+    CHECK(llama_load_measure_n_ctx(4096, 262144) == 4096, "the caller's n_ctx was replaced");
+    // the params use the same helper, so the recorded n_ctx is the one the measure ran at
+    CHECK(llama_load_measure_context_params(0, 262144).n_ctx == llama_load_measure_n_ctx(0, 262144),
+          "the measure's n_ctx and the recorded n_ctx disagree");
+}
+
+static void test_admitted_fold() {
+    // equal and shrink are admitted; each records c(P); the host tier is skipped
+    {
+        const std::vector<llama_load_measure_device> probe    = { measured(0, false, 100), measured(1, false, 200),
+                                                                  measured(-1, true, 999) };
+        const std::vector<llama_load_measure_device> admitted = { measured(0, false, 100), measured(1, false, 150),
+                                                                  measured(-1, true, 5000) };
+        const llama_admitted_check_result            r        = llama_admitted_check_fold(probe, admitted, 262144, 512);
+        CHECK(r.refusal.empty(), "refused: %s", r.refusal.c_str());
+        CHECK(r.terms.size() == 2, "%zu terms for two SYCL devices", r.terms.size());
+        if (r.terms.size() == 2) {
+            CHECK(r.terms[0].device == 0 && r.terms[0].probe_bytes == 100 && r.terms[0].admitted_bytes == 100,
+                  "device 0's term is wrong");
+            CHECK(r.terms[1].device == 1 && r.terms[1].probe_bytes == 200 && r.terms[1].admitted_bytes == 150,
+                  "a shrink must record c(P), not the probe bound");
+        }
+    }
+
+    // c(P) > C-hat refuses by name, with both values, the n_ctx and the ubatch the measure ran at
+    {
+        const std::vector<llama_load_measure_device> probe    = { measured(0, false, 100), measured(1, false, 200) };
+        const std::vector<llama_load_measure_device> admitted = { measured(0, false, 100), measured(1, false, 201) };
+        const llama_admitted_check_result            r        = llama_admitted_check_fold(probe, admitted, 262144, 512);
+        CHECK(r.refusal.rfind("[LOAD-PLAN] compute-slot-exceeds-probe-bound on device 1: ", 0) == 0, "refusal text: %s",
+              r.refusal.c_str());
+        CHECK(r.refusal.find("201 B") != std::string::npos && r.refusal.find("200 B") != std::string::npos,
+              "the refusal does not print both values: %s", r.refusal.c_str());
+        CHECK(r.refusal.find("n_ctx 262144") != std::string::npos && r.refusal.find("ubatch 512") != std::string::npos,
+              "the refusal does not print the measure's shape: %s", r.refusal.c_str());
+        CHECK(r.refusal.size() > 10 && r.refusal.compare(r.refusal.size() - 10, 10, " (refused)") == 0,
+              "refusal tail: %s", r.refusal.c_str());
+        CHECK(r.terms.empty(), "a refused check still hands out terms to record");
+    }
+
+    // a device measured at the admitted placement with no probe bound has nothing that bounds it: refused
+    {
+        const std::vector<llama_load_measure_device> probe    = { measured(0, false, 100) };
+        const std::vector<llama_load_measure_device> admitted = { measured(0, false, 100), measured(1, false, 1) };
+        const llama_admitted_check_result            r        = llama_admitted_check_fold(probe, admitted, 4096, 512);
+        CHECK(r.refusal.rfind("[LOAD-PLAN] compute-slot-exceeds-probe-bound on device 1: ", 0) == 0,
+              "a device without a probe bound was admitted: %s", r.refusal.c_str());
+        CHECK(r.refusal.find("no probe bound") != std::string::npos, "the refusal does not say why: %s",
+              r.refusal.c_str());
+    }
+
+    // nothing on a SYCL device: nothing to record, nothing refused
+    {
+        const llama_admitted_check_result r = llama_admitted_check_fold({}, { measured(-1, true, 7) }, 4096, 512);
+        CHECK(r.refusal.empty() && r.terms.empty(), "a host-only measure produced a term or a refusal");
+    }
+}
+
+static std::vector<int32_t>  g_record_seen;
+static std::vector<uint64_t> g_record_bytes;
+static std::vector<uint32_t> g_record_n_ctx;
+static uint64_t              g_record_txn = 0;
+static bool                  g_record_ok  = true;
+
+static bool fake_record(struct ggml_sycl_load_txn txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
+    g_record_txn = txn.id;
+    g_record_seen.push_back(device);
+    g_record_bytes.push_back(bytes);
+    g_record_n_ctx.push_back(n_ctx);
+    return g_record_ok;
+}
+
+static void test_admitted_record() {
+    llama_admitted_check_result admitted;
+    admitted.terms = {
+        { 0, 100, 90  },
+        { 1, 200, 200 }
+    };
+
+    llama_sycl_l4_procs procs;
+    procs.record_term = &fake_record;
+
+    // each admitted device records c(P) at the measure's n_ctx, never the probe bound and never n_ctx 0
+    g_record_seen.clear();
+    g_record_bytes.clear();
+    g_record_n_ctx.clear();
+    g_record_ok = true;
+    CHECK(llama_admitted_record(procs, ggml_sycl_load_txn{ 7 }, admitted, 262144) == 2, "not every term recorded");
+    CHECK(g_record_txn == 7, "the record went to transaction %llu", (unsigned long long) g_record_txn);
+    CHECK(g_record_seen == std::vector<int32_t>({ 0, 1 }), "the record visited the wrong devices");
+    CHECK(g_record_bytes == std::vector<uint64_t>({ 90, 200 }), "the record carried the probe bound, not c(P)");
+    CHECK(g_record_n_ctx == std::vector<uint32_t>({ 262144, 262144 }), "the record carried the wrong n_ctx");
+
+    // a record the backend refuses is counted as not recorded (the late check then says NOT_RECORDED)
+    g_record_ok = false;
+    CHECK(llama_admitted_record(procs, ggml_sycl_load_txn{ 7 }, admitted, 262144) == 0, "a refused record was counted");
+
+    // a table without the record proc records nothing, and says so by its count
+    llama_sycl_l4_procs none;
+    CHECK(llama_admitted_record(none, ggml_sycl_load_txn{ 7 }, admitted, 262144) == 0,
+          "a missing proc was counted as a record");
+}
+
 // The KV shape the override's re-fit sizes for is the measure context's own: every field from the params the
 // measure builds the context with (llama.cpp-p6i0).
 static void test_measure_kv_shape() {
@@ -476,6 +587,9 @@ int main() {
     test_refusal_text();
     test_measure_params_tie_to_the_ladder();
     test_measure_kv_shape();
+    test_measure_n_ctx();
+    test_admitted_fold();
+    test_admitted_record();
     if (n_failed != 0) {
         fprintf(stderr, "%d check(s) failed\n", n_failed);
         return 1;
