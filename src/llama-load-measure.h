@@ -631,8 +631,9 @@ inline size_t llama_admitted_record(const llama_sycl_l4_procs &         procs,
 // Records each reserved state, the probe's (the one the reservation holds), under the state term's own name at the
 // measure's n_ctx (llama.cpp-p6i0), and marks each term whose state the backend recorded. The state's own reservation
 // decides, never the compute term's: a state reserved beside a declined compute term is still real RUNTIME memory the
-// backend holds a term for. A device with no state or no state reservation records nothing. Returns how many were recorded. The state is never added to c(P): the
-// late check compares a late state with this record and a late c(P) with c(P).
+// backend holds a term for. A device with no state or no state reservation records nothing. Returns how many were
+// recorded. The state is never added to c(P): the late check compares a late state with this record and a late c(P)
+// with c(P).
 inline size_t llama_admitted_record_state(const llama_sycl_l4_procs &   procs,
                                           struct ggml_sycl_load_txn     txn,
                                           llama_admitted_check_result & admitted,

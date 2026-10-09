@@ -1681,11 +1681,11 @@ GGML_BACKEND_API enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_ch
                                                                                     int32_t                   device,
                                                                                     uint64_t compute_bytes);
 
-// The early stage's record of a load's compute term (llama.cpp-p6i0): c(P), the compute term measured for device at
-// the load's admitted placement, at the n_ctx that measure ran with.  ggml_backend_sycl_load_late_check compares
-// the late measure against it.  False, recording nothing, when txn is not the open load transaction, when n_ctx is
-// 0 (a measure with no shape has no c(P)), or while the backend admits no mutation (a reactivation or a shutdown is
-// in progress); the late check then answers NOT_RECORDED for the device.  A load's commit or rollback drops what it recorded.
+// The early stage's record of a load's compute term (llama.cpp-p6i0): c(P), the compute term measured for device at the
+// load's admitted placement, at the n_ctx that measure ran with.  ggml_backend_sycl_load_late_check compares the late
+// measure against it.  False, recording nothing, when txn is not the open load transaction, when n_ctx is 0 (a measure
+// with no shape has no c(P)), or while the backend admits no mutation (a reactivation or a shutdown is in progress);
+// the late check then answers NOT_RECORDED for the device.  A load's commit or rollback drops what it recorded.
 // Proc name: "ggml_backend_sycl_load_record_compute_term".
 GGML_BACKEND_API bool ggml_backend_sycl_load_record_compute_term(struct ggml_sycl_load_txn txn,
                                                                  int32_t                   device,

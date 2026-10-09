@@ -40187,9 +40187,9 @@ static void ggml_sycl_log_compute_buffer_landing(int device, const std::string &
                   ggml_sycl::unified_cache_get_planned_compute_term_bytes(device) / (1024.0 * 1024.0));
 }
 
-// The reservation's units (llama.cpp-p6i0): what a chunk list occupies in the RUNTIME zone's TLSF at the alignment
-// the compute buffer's type requests.  The reserve below sizes its term with it, and the admitted check sizes C-hat and
-// c(P) with it through ggml_backend_sycl_load_compute_term_bytes, so the two compare in the units the reservation is in.
+// The reservation's units (llama.cpp-p6i0): what a chunk list occupies in the RUNTIME zone's TLSF at the alignment the
+// compute buffer's type requests.  The reserve below sizes its term with it, and the admitted check sizes C-hat and
+// c(P) with it through ggml_backend_sycl_load_compute_term_bytes, so the two compare in the reservation's own units.
 static bool ggml_sycl_load_compute_term_size(const uint64_t * chunk_bytes, uint32_t n_chunks, size_t * out) {
     return ggml_sycl::zone_compute_term_bytes(chunk_bytes, n_chunks, GGML_SYCL_BUFFER_BASE_ALIGNMENT, out);
 }
@@ -40206,8 +40206,8 @@ bool ggml_backend_sycl_load_compute_term_bytes(const uint64_t * chunk_bytes, uin
 
 // The load's compute reservation (llama.cpp-p6i0): the planned RUNTIME term for the scheduler's compute buffer on
 // `device`, from the probe measure's chunks.  The bytes are what those chunks occupy in the RUNTIME zone's TLSF at the
-// alignment this buffer type requests (ggml_sycl_load_compute_term_size): the allocator's grain, and no headroom.  It writes
-// the planner term only, never the ledger; c(P) is recorded at the admitted stage by
+// alignment this buffer type requests (ggml_sycl_load_compute_term_size): the allocator's grain, and no headroom.  It
+// writes the planner term only, never the ledger; c(P) is recorded at the admitted stage by
 // ggml_backend_sycl_load_record_compute_term.  The term is measured at the load's measure shape (n_ctx, ubatch 512),
 // not the caller's -c and -ub, which fkpg (a) transports.  False, reserving nothing, when txn is not the open load,
 // n_ctx is 0, the device is out of range or has no VRAM arena, or the chunk list is unusable; the load then goes on

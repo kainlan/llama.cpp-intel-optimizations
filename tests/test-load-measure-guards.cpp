@@ -307,11 +307,11 @@ static void test_late_check_fold() {
 
 // --- the admitted check (stage (b), llama.cpp-p6i0) ----------------------------------------------
 //
-// c(P), measured at the admitted placement, is compared per device with the probe bound C-hat measured before
-// the pack, both in the reservation's units (the backend's term-bytes proc): c(P) <= C-hat is admitted and c(P)
-// (never C-hat, and as the measure's raw total) is what is recorded; c(P) > C-hat refuses the load by name with
-// both values, unless the KV residency moved between the two measures, which admits it with the excess named. A device the backend declined to reserve for is neither compared nor recorded. The host tier is
-// skipped, as in the late fold.
+// c(P), measured at the admitted placement, is compared per device with the probe bound C-hat measured before the pack,
+// both in the reservation's units (the backend's term-bytes proc): c(P) <= C-hat is admitted and c(P) (never C-hat, and
+// as the measure's raw total) is what is recorded; c(P) > C-hat refuses the load by name with both values, unless the
+// KV residency moved between the two measures, which admits it with the excess named. A device the backend declined to
+// reserve for is neither compared nor recorded. The host tier is skipped, as in the late fold.
 
 static void test_measure_n_ctx() {
     CHECK(llama_load_measure_n_ctx(0, 262144) == 262144, "n_ctx 0 did not become the training context");

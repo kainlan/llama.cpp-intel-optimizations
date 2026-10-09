@@ -855,8 +855,8 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
 // llama.cpp-p6i0: the context-init comparison of each SYCL device's recurrent state with the load's planned state term.
 // The state sits in the device's plain buffer type (the KV cache has its own), which is the device's compute buft, so
 // the memory's bytes for backend_buft[i] are that device's state, the quantity the load's probe measured and reserved.
-// The load measured it at n_seq_max 1; a context with more sequences allocates more, and llama_context_state_excess_text
-// names the excess at WARN. Never a refusal: the context stays as the user asked for it.
+// The load measured it at n_seq_max 1; a context with more sequences allocates more, and
+// llama_context_state_excess_text names the excess at WARN. Never a refusal: the context stays as the user asked.
 [[maybe_unused]] static void llama_context_sycl_warn_state_excess(
     const llama_sycl_l4_procs &                          procs,
     const std::vector<ggml_backend_t> &                  backend_ptrs,
