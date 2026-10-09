@@ -2608,6 +2608,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // (fkpg (a)), so the term is that shape's, not the context's. A dense model's default auto ubatch climbs
         // above 512 into whatever room is left; that part is not reserved.
         const std::vector<llama_measure_dummy_entry> probe_weights = llama_model_measure_weights(ml);
+
         const int64_t                 probe_t0 = ggml_time_us();
         const llama_load_probe_result probe    = llama_load_probe_bound(
             *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, probe_weights);
@@ -2628,6 +2629,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // the probe bound the pack reserved; recorded otherwise. Only a model the probe measured gets here.
         if (probe.measured) {
             const std::vector<llama_measure_dummy_entry> admitted_weights = llama_model_measure_weights(ml);
+
             const int64_t                     admitted_t0 = ggml_time_us();
             const llama_admitted_check_result admitted =
                 llama_load_admitted_check(*this, llama_model_sycl_make_placement_envelope().n_ctx,
