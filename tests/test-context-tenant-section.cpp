@@ -112,6 +112,117 @@ static ggml_sycl_late_check_result wild_late(struct ggml_sycl_load_txn, int32_t,
     return (ggml_sycl_late_check_result) 99;
 }
 
+// The record proc (llama.cpp-p6i0): it keeps what it was handed and answers what the test picks.
+static bool     g_record_answer = true;
+static int      g_record_calls  = 0;
+static uint64_t g_record_txn    = 0;
+static int32_t  g_record_dev    = -2;
+static uint64_t g_record_bytes  = 0;
+static uint32_t g_record_n_ctx  = 0;
+
+static bool fake_record(struct ggml_sycl_load_txn txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
+    g_record_calls++;
+    g_record_txn   = txn.id;
+    g_record_dev   = device;
+    g_record_bytes = bytes;
+    g_record_n_ctx = n_ctx;
+    return g_record_answer;
+}
+
+// The reserve proc (llama.cpp-p6i0): it copies the chunk list it was handed and answers what the test picks.
+static bool                  g_reserve_answer = true;
+static int                   g_reserve_calls  = 0;
+static uint64_t              g_reserve_txn    = 0;
+static int32_t               g_reserve_dev    = -2;
+static std::vector<uint64_t> g_reserve_chunks;
+static uint32_t              g_reserve_n_ctx = 0;
+
+static bool fake_reserve(struct ggml_sycl_load_txn txn,
+                         int32_t                   device,
+                         const uint64_t *          chunk_bytes,
+                         uint32_t                  n_chunks,
+                         uint32_t                  n_ctx) {
+    g_reserve_calls++;
+    g_reserve_txn = txn.id;
+    g_reserve_dev = device;
+    g_reserve_chunks.assign(chunk_bytes, chunk_bytes + n_chunks);
+    g_reserve_n_ctx = n_ctx;
+    return g_reserve_answer;
+}
+
+// The state reserve proc (llama.cpp-p6i0): it records what it was handed and answers what the test picks.
+static bool     g_state_answer = true;
+static int      g_state_calls  = 0;
+static uint64_t g_state_txn    = 0;
+static int32_t  g_state_dev    = -2;
+static uint64_t g_state_bytes  = 0;
+
+static bool fake_reserve_state(struct ggml_sycl_load_txn txn, int32_t device, uint64_t state_bytes) {
+    g_state_calls++;
+    g_state_txn   = txn.id;
+    g_state_dev   = device;
+    g_state_bytes = state_bytes;
+    return g_state_answer;
+}
+
+// The state record and the state late check (llama.cpp-p6i0): they record what they were handed and answer what the
+// test picks.
+static bool     g_srec_answer = true;
+static int      g_srec_calls  = 0;
+static uint64_t g_srec_txn    = 0;
+static int32_t  g_srec_dev    = -2;
+static uint64_t g_srec_bytes  = 0;
+static uint32_t g_srec_n_ctx  = 0;
+
+static bool fake_record_state(struct ggml_sycl_load_txn txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
+    g_srec_calls++;
+    g_srec_txn   = txn.id;
+    g_srec_dev   = device;
+    g_srec_bytes = bytes;
+    g_srec_n_ctx = n_ctx;
+    return g_srec_answer;
+}
+
+static int      g_slate_answer = GGML_SYCL_LATE_CHECK_EQUAL;
+static int      g_slate_calls  = 0;
+static uint64_t g_slate_bytes  = 0;
+
+static ggml_sycl_late_check_result fake_late_check_state(struct ggml_sycl_load_txn, int32_t, uint64_t bytes) {
+    g_slate_calls++;
+    g_slate_bytes = bytes;
+    return (ggml_sycl_late_check_result) g_slate_answer;
+}
+
+// The reservation's units: answers a value the test picks, and records the chunk list it was handed.
+static bool                  g_term_answer = true;
+static uint64_t              g_term_value  = 0;
+static int                   g_term_calls  = 0;
+static std::vector<uint64_t> g_term_chunks;
+
+static bool fake_term_bytes(const uint64_t * chunk_bytes, uint32_t n_chunks, uint64_t * out) {
+    g_term_calls++;
+    g_term_chunks.assign(chunk_bytes, chunk_bytes + n_chunks);
+    if (g_term_answer) {
+        *out = g_term_value;
+    }
+    return g_term_answer;
+}
+
+// The planned state term read: answers a value the test picks, and records the device it was asked about.
+static bool     g_pstate_answer = true;
+static uint64_t g_pstate_value  = 0;
+static int      g_pstate_calls  = 0;
+static int32_t  g_pstate_dev    = -2;
+
+static bool fake_planned_state(int32_t device, uint64_t * out) {
+    g_pstate_calls++;
+    g_pstate_dev = device;
+    if (g_pstate_answer) {
+        *out = g_pstate_value;
+    }
+    return g_pstate_answer;
+}
+
 // The probe procs: one that answers a status the test picks and writes n_layer the way the backend's proc does
 // (never host_resident), and one that answers a value outside the enum.
 static ggml_sycl_residency_probe_status g_probe_answer = GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED;
@@ -297,6 +408,204 @@ int main() {
         three.coverage   = &fake_coverage;
         three.late_check = &fake_late;
         CHECK(!three.available(), "the three older procs without the probe are not L4");
+    }
+
+    // (12) the load's compute-term record door (llama.cpp-p6i0)
+    {
+        // a null proc records nothing and says so
+        llama_sycl_l4_procs none;
+        g_record_calls = 0;
+        CHECK(!llama_sycl_l4_record_compute_term(none, ggml_sycl_load_txn{ 9 }, 0, 100, 4096),
+              "a null record proc was read as recorded");
+        CHECK(g_record_calls == 0, "a null proc was called");
+
+        // the proc's answer and every argument pass through
+        llama_sycl_l4_procs procs;
+        procs.record_term = &fake_record;
+        g_record_answer   = true;
+        CHECK(llama_sycl_l4_record_compute_term(procs, ggml_sycl_load_txn{ 43 }, 1, 2154901504ull, 262144),
+              "a recorded term was read as not recorded");
+        CHECK(g_record_calls == 1 && g_record_txn == 43 && g_record_dev == 1 && g_record_bytes == 2154901504ull &&
+                  g_record_n_ctx == 262144,
+              "the record arguments were not forwarded");
+        g_record_answer = false;
+        CHECK(!llama_sycl_l4_record_compute_term(procs, ggml_sycl_load_txn{ 43 }, 1, 1, 262144),
+              "a refused record was read as recorded");
+        g_record_answer = true;
+
+        // the record is not part of the context's L4 gate, either way
+        CHECK(!procs.available(), "the record proc alone made the table L4");
+        llama_sycl_l4_procs four;
+        four.publish         = &fake_publish;
+        four.coverage        = &fake_coverage;
+        four.late_check      = &fake_late;
+        four.probe_residency = &fake_probe;
+        CHECK(four.available(), "the four L4 procs without the record are no longer L4");
+    }
+
+    // (13) the load's compute reservation door, and the loader's own gate over its two procs (llama.cpp-p6i0)
+    {
+        // a null proc reserves nothing and says so
+        llama_sycl_l4_procs none;
+        g_reserve_calls = 0;
+        CHECK(!llama_sycl_l4_reserve_compute_term(none, ggml_sycl_load_txn{ 9 }, 0, { 100 }, 4096),
+              "a null reserve proc was read as reserved");
+        CHECK(g_reserve_calls == 0, "a null reserve proc was called");
+        CHECK(!none.load_terms_available(), "an empty table reports the load terms");
+
+        // the chunk list goes through whole and in order, at the backend's width
+        llama_sycl_l4_procs procs;
+        procs.reserve_term = &fake_reserve;
+        g_reserve_answer   = true;
+        CHECK(llama_sycl_l4_reserve_compute_term(procs, ggml_sycl_load_txn{ 44 }, 1, { 1618052864, 536870912 }, 262144),
+              "a reserved term was read as not reserved");
+        CHECK(g_reserve_calls == 1 && g_reserve_txn == 44 && g_reserve_dev == 1 && g_reserve_n_ctx == 262144 &&
+                  g_reserve_chunks == std::vector<uint64_t>({ 1618052864ull, 536870912ull }),
+              "the reserve arguments were not forwarded");
+        // an empty list is forwarded as an empty list (the backend decides), not dropped here
+        CHECK(llama_sycl_l4_reserve_compute_term(procs, ggml_sycl_load_txn{ 44 }, 0, {}, 262144) &&
+                  g_reserve_calls == 2 && g_reserve_chunks.empty(),
+              "an empty chunk list was not forwarded");
+        g_reserve_answer = false;
+        CHECK(!llama_sycl_l4_reserve_compute_term(procs, ggml_sycl_load_txn{ 44 }, 1, { 1 }, 262144),
+              "a refused reservation was read as reserved");
+        g_reserve_answer = true;
+
+        // the loader runs its reserve and record steps only with all three load procs; none is part of available()
+        CHECK(!procs.load_terms_available(), "the reserve proc alone reports the load terms");
+        CHECK(!procs.available(), "the reserve proc alone made the table L4");
+        procs.record_term = &fake_record;
+        CHECK(!procs.load_terms_available(), "the reserve and record procs without the units report the load terms");
+        procs.term_bytes = &fake_term_bytes;
+        CHECK(!procs.load_terms_available(),
+              "the three compute-term procs without the state reserve report the load terms");
+        procs.reserve_state = &fake_reserve_state;
+        CHECK(!procs.load_terms_available(), "the four load procs without the state record report the load terms");
+        procs.record_state = &fake_record_state;
+        CHECK(!procs.load_terms_available(), "the five load procs without the state late check report the load terms");
+        procs.late_check_state = &fake_late_check_state;
+        CHECK(procs.load_terms_available(), "the six load procs do not report the load terms");
+        CHECK(!procs.available(), "the load procs made the table L4");
+        llama_sycl_l4_procs record_only;
+        record_only.record_term = &fake_record;
+        CHECK(!record_only.load_terms_available(), "the record proc alone reports the load terms");
+    }
+
+    // (14) the reservation's units door (llama.cpp-p6i0)
+    {
+        // a null proc sizes nothing and says so
+        llama_sycl_l4_procs none;
+        size_t              out = 7;
+        g_term_calls            = 0;
+        CHECK(!llama_sycl_l4_compute_term_bytes(none, { 100 }, &out), "a null units proc was read as sized");
+        CHECK(g_term_calls == 0 && out == 7, "a null units proc was called or wrote the answer");
+
+        // the chunk list goes through whole and in order, at the backend's width, and the answer comes back
+        llama_sycl_l4_procs procs;
+        procs.term_bytes = &fake_term_bytes;
+        g_term_answer    = true;
+        g_term_value     = 2154925056ull;
+        CHECK(llama_sycl_l4_compute_term_bytes(procs, { 1618052864, 536870912 }, &out) && out == 2154925056ull,
+              "the sized term did not come back");
+        CHECK(g_term_calls == 1 && g_term_chunks == std::vector<uint64_t>({ 1618052864ull, 536870912ull }),
+              "the chunk list was not forwarded");
+
+        // a refusal is "not sized" and leaves the answer alone; a null out is refused before the proc is called
+        g_term_answer = false;
+        out           = 7;
+        CHECK(!llama_sycl_l4_compute_term_bytes(procs, { 1 }, &out) && out == 7, "a refused sizing was read as sized");
+        g_term_answer = true;
+        CHECK(!llama_sycl_l4_compute_term_bytes(procs, { 1 }, nullptr) && g_term_calls == 2,
+              "a null out reached the proc");
+    }
+
+    // (15) the load's state reservation door (llama.cpp-p6i0): the context memory the measure placed on a device's
+    // plain buffer type, which the RUNTIME zone takes before the compute buffer
+    {
+        // a null proc reserves nothing and says so
+        llama_sycl_l4_procs none;
+        g_state_calls = 0;
+        CHECK(!llama_sycl_l4_reserve_state_term(none, ggml_sycl_load_txn{ 9 }, 0, 118038528),
+              "a null state reserve proc was read as reserved");
+        CHECK(g_state_calls == 0, "a null state reserve proc was called");
+
+        // the bytes go through at the backend's width, with the txn and the device
+        llama_sycl_l4_procs procs;
+        procs.reserve_state = &fake_reserve_state;
+        g_state_answer      = true;
+        CHECK(llama_sycl_l4_reserve_state_term(procs, ggml_sycl_load_txn{ 44 }, 1, 118038528),
+              "a reserved state term was read as not reserved");
+        CHECK(g_state_calls == 1 && g_state_txn == 44 && g_state_dev == 1 && g_state_bytes == 118038528ull,
+              "the state reserve arguments were not forwarded");
+        g_state_answer = false;
+        CHECK(!llama_sycl_l4_reserve_state_term(procs, ggml_sycl_load_txn{ 44 }, 1, 1),
+              "a refused state reservation was read as reserved");
+        g_state_answer = true;
+        CHECK(!procs.load_terms_available() && !procs.available(), "the state reserve proc alone reports a gate");
+    }
+
+    // (16) the state term's record and late check doors (llama.cpp-p6i0): the state under its own name
+    {
+        llama_sycl_l4_procs none;
+        g_srec_calls  = 0;
+        g_slate_calls = 0;
+        CHECK(!llama_sycl_l4_record_state_term(none, ggml_sycl_load_txn{ 9 }, 0, 1, 4096),
+              "a null state record proc was read as recorded");
+        CHECK(llama_sycl_l4_late_check_state(none, ggml_sycl_load_txn{ 9 }, 0, 1) == GGML_SYCL_LATE_CHECK_NOT_RECORDED,
+              "a null state late check was read as a comparison");
+        CHECK(g_srec_calls == 0 && g_slate_calls == 0, "a null proc was called");
+
+        llama_sycl_l4_procs procs;
+        procs.record_state     = &fake_record_state;
+        procs.late_check_state = &fake_late_check_state;
+        g_srec_answer          = true;
+        CHECK(llama_sycl_l4_record_state_term(procs, ggml_sycl_load_txn{ 44 }, 1, 118038528, 262144),
+              "a recorded state was read as not recorded");
+        CHECK(g_srec_calls == 1 && g_srec_txn == 44 && g_srec_dev == 1 && g_srec_bytes == 118038528ull &&
+                  g_srec_n_ctx == 262144,
+              "the state record arguments were not forwarded");
+        g_srec_answer = false;
+        CHECK(!llama_sycl_l4_record_state_term(procs, ggml_sycl_load_txn{ 44 }, 1, 1, 262144),
+              "a refused state record was read as recorded");
+        g_srec_answer = true;
+
+        const int answers[] = { GGML_SYCL_LATE_CHECK_EQUAL, GGML_SYCL_LATE_CHECK_SHRINK_ADMITTED,
+                                GGML_SYCL_LATE_CHECK_REFUSED, GGML_SYCL_LATE_CHECK_NOT_RECORDED };
+        for (int a : answers) {
+            g_slate_answer = a;
+            CHECK(llama_sycl_l4_late_check_state(procs, ggml_sycl_load_txn{ 44 }, 1, 118038528) == a,
+                  "a state late-check answer did not pass through");
+        }
+        CHECK(g_slate_bytes == 118038528ull, "the state bytes were not forwarded");
+        g_slate_answer = 77;
+        CHECK(
+            llama_sycl_l4_late_check_state(procs, ggml_sycl_load_txn{ 44 }, 1, 1) == GGML_SYCL_LATE_CHECK_NOT_RECORDED,
+            "a value outside the enum was read as a comparison");
+        g_slate_answer = GGML_SYCL_LATE_CHECK_EQUAL;
+        CHECK(!procs.load_terms_available() && !procs.available(), "the state record and check alone report a gate");
+    }
+
+    // (17) the planned state term door (llama.cpp-p6i0): what the context-init comparison reads, outside both gates
+    {
+        llama_sycl_l4_procs none;
+        g_pstate_calls = 0;
+        uint64_t got   = 7;
+        CHECK(!llama_sycl_l4_planned_state_term(none, 0, &got), "a null planned-state proc was read as an answer");
+        CHECK(got == 7 && g_pstate_calls == 0, "a null planned-state proc wrote or was called");
+
+        llama_sycl_l4_procs procs;
+        procs.planned_state = &fake_planned_state;
+        CHECK(!llama_sycl_l4_planned_state_term(procs, 0, nullptr), "a null out was read as an answer");
+        CHECK(g_pstate_calls == 0, "the proc was called with a null out");
+        g_pstate_answer = true;
+        g_pstate_value  = 118063104;
+        CHECK(llama_sycl_l4_planned_state_term(procs, 1, &got) && got == 118063104ull && g_pstate_dev == 1,
+              "the planned state term was not read through");
+        g_pstate_answer = false;
+        got             = 7;
+        CHECK(!llama_sycl_l4_planned_state_term(procs, 1, &got) && got == 7, "a refused read was read as an answer");
+        g_pstate_answer = true;
+        CHECK(!procs.load_terms_available() && !procs.available(), "the planned-state read alone reports a gate");
     }
 
     // (4) the section builder

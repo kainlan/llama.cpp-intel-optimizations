@@ -159,6 +159,12 @@ _L4_NAMES = {
     "coverage": "GGML_SYCL_PROC_TENANT_COVERAGE",
     "late_check": "GGML_SYCL_PROC_LOAD_LATE_CHECK",
     "probe_residency": "GGML_SYCL_PROC_PROBE_RESIDENCY",
+    "record_term": "GGML_SYCL_PROC_LOAD_RECORD_COMPUTE_TERM",  # llama.cpp-p6i0
+    "reserve_term": "GGML_SYCL_PROC_LOAD_RESERVE_COMPUTE_TERM",  # llama.cpp-p6i0
+    "term_bytes": "GGML_SYCL_PROC_LOAD_COMPUTE_TERM_BYTES",  # llama.cpp-p6i0
+    "reserve_state": "GGML_SYCL_PROC_LOAD_RESERVE_STATE_TERM",  # llama.cpp-p6i0
+    "record_state": "GGML_SYCL_PROC_LOAD_RECORD_STATE_TERM",  # llama.cpp-p6i0
+    "late_check_state": "GGML_SYCL_PROC_LOAD_LATE_CHECK_STATE",  # llama.cpp-p6i0
 }
 
 
@@ -195,7 +201,7 @@ def test_l4_table_mutants():
     b = function_body(code, _L4)
     for name, old, new in [
         ("a direct reference", "llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_TENANT_COVERAGE)", "&ggml_backend_sycl_tenant_coverage"),
-        ("a string literal name", "GGML_SYCL_PROC_LOAD_LATE_CHECK", '"ggml_backend_sycl_load_late_check"'),
+        ("a string literal name", "GGML_SYCL_PROC_LOAD_LATE_CHECK)", '"ggml_backend_sycl_load_late_check")'),
         ("a link-mode split", "procs.publish = reinterpret_cast", "\n#ifdef GGML_USE_SYCL\n procs.publish = reinterpret_cast"),
     ]:
         assert not l4_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"

@@ -609,6 +609,13 @@ bool zone_route_draws_scratch(bool decision_valid,
 // while another model is live; with none live the new input replaces the old, so a model swap shrinks the plan.
 size_t zone_dense_scratch_merge_input(size_t prev, size_t next, bool other_model_live);
 
+// llama.cpp-p6i0: the RUNTIME-zone bytes a scheduler compute buffer measured as `chunk_bytes[0..n_chunks)` takes.
+// Each gallocr chunk is one backend buffer and so one allocation in the zone, which occupies
+// tlsf_allocator::round_request(chunk, alignment) -- the zone allocator's own rule, read from it, not restated. A zero
+// chunk allocates nothing (ggml_backend_buft_alloc_buffer answers a size-0 request without the backend). No headroom
+// is added. False, with *out untouched, when the sum or a rounding would wrap: never a smaller term.
+bool zone_compute_term_bytes(const uint64_t * chunk_bytes, size_t n_chunks, size_t alignment, size_t * out);
+
 // ---------------------------------------------------------------------------
 // Mispredict accounting
 // ---------------------------------------------------------------------------

@@ -13,9 +13,10 @@
 //   runtime_context_tenant_key   the tenant key, the same digest llama computes;
 //   classify_tenant_coverage     EQUAL / COVERED / GROWTH of a candidate against the
 //                                published section, fail-closed;
-//   load_compute_ledger          the term the early stage admitted per (load, device),
-//                                and the late-check rule that compares a late measure
-//                                with it.
+//   load_compute_ledger          the terms the early stage admitted per (load, device, term):
+//                                the compute term and, under its own name, the recurrent
+//                                state term; and the late-check rule that compares a late
+//                                measure of a term with the same term.
 //
 // Nothing here is synchronized: the registry entry that holds a section is read and
 // written under the registry's leaf mutex.  The ledger is a plain value keyed by (load
@@ -398,9 +399,18 @@ enum load_log_level {
     LOAD_LOG_LEVEL_ERROR = 3,
 };
 
+// The terms of a load the ledger keeps, each under its own name.  A late measure of a term is compared
+// with the same term only: the compute term never absorbs the state term, so the late check still compares
+// compute against compute (llama.cpp-p6i0).
+enum load_ledger_term {
+    LOAD_LEDGER_TERM_COMPUTE = 0,  // c(P), the compute buffer's term
+    LOAD_LEDGER_TERM_STATE   = 1,  // the recurrent state the RUNTIME reservation carries beside the compute term
+};
+
 // The compute term the early stage admitted, per (load transaction, device): c(P) of zhcn's
 // measure (zhcn design 2.10, call site (b)).  The late check (call site (c)) compares the
-// late measure with it under the one late-check rule moua and 23mk share.
+// late measure with it under the one late-check rule moua and 23mk share.  The recurrent state
+// term (llama.cpp-p6i0) is kept beside it under its own key and name, under the same rule.
 //
 // The term is recorded only when the load carries an n_ctx.  An envelope with n_ctx == 0 has
 // no candidate shape to measure, so a value recorded for it would be a guess; the record is
@@ -419,6 +429,16 @@ class load_compute_ledger {
     // lookup of an enumerator below GGML_SYCL_CONTEXT_COHORT_COUNT cannot fail, and the test pins the name.
     static const char * zone() { return ggml_sycl_context_cohort_lookup(GGML_SYCL_CONTEXT_COHORT_COMPUTE)->name; }
 
+    // The state term's name, and its zone in the refusal line.  The cohort table has no cohort for the recurrent
+    // state, which the context allocates in the RUNTIME zone, so its zone is that zone's name as vram_zone_name()
+    // in unified-cache.cpp spells it.
+    static constexpr const char * STATE_TERM = "state";
+    static constexpr const char * STATE_ZONE = "RUNTIME";
+
+    static const char * term_name(load_ledger_term term) { return term == LOAD_LEDGER_TERM_STATE ? STATE_TERM : TERM; }
+
+    static const char * zone(load_ledger_term term) { return term == LOAD_LEDGER_TERM_STATE ? STATE_ZONE : zone(); }
+
     struct check_result {
         ggml_sycl_late_check_result result = GGML_SYCL_LATE_CHECK_NOT_RECORDED;
         std::string                 line;                         // the line to log, empty for none
@@ -432,10 +452,15 @@ class load_compute_ledger {
     // second record of the same key replaces the first: the early stage can stage a candidate again, and the late
     // check reads the admitted one.
     bool record(uint64_t txn, int32_t device, uint64_t bytes, uint32_t n_ctx, bool txn_is_open) {
+        return record(txn, device, LOAD_LEDGER_TERM_COMPUTE, bytes, n_ctx, txn_is_open);
+    }
+
+    // The same record for `term`: each term of a (txn, device) is its own entry.
+    bool record(uint64_t txn, int32_t device, load_ledger_term term, uint64_t bytes, uint32_t n_ctx, bool txn_is_open) {
         if (n_ctx == 0 || txn == 0 || device < 0 || !txn_is_open) {
             return false;
         }
-        terms_[key{ txn, device }].admitted = bytes;
+        terms_[key{ txn, device, term }].admitted = bytes;
         return true;
     }
 
@@ -444,37 +469,46 @@ class load_compute_ledger {
     // this ledger.
     //   not open                                    NOT_RECORDED, WARN on every call (a transaction
     //                                               that is no load is a caller defect)
-    //   open, nothing recorded for the key          NOT_RECORDED, INFO ONCE per (load, device): this is the
-    //                                               expected answer until L6 records anything, a load that
-    //                                               records nothing asks every device once, and the line
-    //                                               would repeat per call
-    //   late == admitted                            EQUAL, no line
+    //   open, nothing recorded for the key          NOT_RECORDED, INFO ONCE per (load, device, term): the
+    //                                               answer for a device the admitted stage did not record (an
+    //                                               unmeasurable model, a device with no reservation, a
+    //                                               backend without the load procs), which the loader
+    //                                               reports at WARN itself; the line would repeat per call
+    //   late == admitted                            EQUAL, the equal WARN once per (load, device, term): a
+    //                                               pass that printed nothing could not be told from a check
+    //                                               that never ran
     //   late  > admitted                            REFUSED, the late string, ERROR
     //   late  < admitted                            SHRINK_ADMITTED, the shrink WARN once per
     //                                               (load, device, term); the admitted term stands
     check_result check(uint64_t txn, int32_t device, uint64_t late_bytes, bool txn_is_open) {
+        return check(txn, device, LOAD_LEDGER_TERM_COMPUTE, late_bytes, txn_is_open);
+    }
+
+    // The same check of `term` against the same term's record, never another's.  The compute term's lines are the
+    // canonical ones above; the state term's lines name it ("late state check", "term state in zone RUNTIME").
+    check_result check(uint64_t txn, int32_t device, load_ledger_term term, uint64_t late_bytes, bool txn_is_open) {
         check_result r;
         char         line[320];
+        const char * name  = term_name(term);
+        const char * label = term == LOAD_LEDGER_TERM_STATE ? "late state check" : "late check";
         if (!txn_is_open) {
-            std::snprintf(
-                line, sizeof(line),
-                "[LOAD-PLAN] late check on device %d: transaction %llu is not the open load transaction, nothing was "
-                "compared",
-                (int) device, (unsigned long long) txn);
+            std::snprintf(line, sizeof(line),
+                          "[LOAD-PLAN] %s on device %d: transaction %llu is not the open load transaction, nothing was "
+                          "compared",
+                          label, (int) device, (unsigned long long) txn);
             r.line  = line;
             r.level = LOAD_LOG_LEVEL_WARN;
             return r;
         }
-        auto it = terms_.find(key{ txn, device });
+        auto it = terms_.find(key{ txn, device, term });
         if (it == terms_.end()) {
-            if (!unrecorded_logged_.insert(key{ txn, device }).second) {
-                return r;  // already said once for this (load, device)
+            if (!unrecorded_logged_.insert(key{ txn, device, term }).second) {
+                return r;  // already said once for this (load, device, term)
             }
-            std::snprintf(
-                line, sizeof(line),
-                "[LOAD-PLAN] late check on device %d: no early term was recorded for transaction %llu, nothing was "
-                "compared",
-                (int) device, (unsigned long long) txn);
+            std::snprintf(line, sizeof(line),
+                          "[LOAD-PLAN] %s on device %d: no early term was recorded for transaction %llu, nothing was "
+                          "compared",
+                          label, (int) device, (unsigned long long) txn);
             r.line  = line;
             r.level = LOAD_LOG_LEVEL_INFO;
             return r;
@@ -485,7 +519,7 @@ class load_compute_ledger {
                 line, sizeof(line),
                 "[LOAD-PLAN] the late inventory changes the zones admitted at the early stage: term %s in zone %s on "
                 "device %d, early %zu B, late %zu B (refused)",
-                TERM, zone(), (int) device, (size_t) e.admitted, (size_t) late_bytes);
+                name, zone(term), (int) device, (size_t) e.admitted, (size_t) late_bytes);
             r.result = GGML_SYCL_LATE_CHECK_REFUSED;
             r.line   = line;
             r.level  = LOAD_LOG_LEVEL_ERROR;
@@ -499,7 +533,7 @@ class load_compute_ledger {
                     line, sizeof(line),
                     "[ZONE-PLAN-BUG] the late inventory shrinks term %s on device %d: early %zu B, late %zu B "
                     "(admitted; the early reservation stands)",
-                    TERM, (int) device, (size_t) e.admitted, (size_t) late_bytes);
+                    name, (int) device, (size_t) e.admitted, (size_t) late_bytes);
                 r.line           = line;
                 r.level          = LOAD_LOG_LEVEL_WARN;
                 r.shrink_counted = true;
@@ -507,10 +541,18 @@ class load_compute_ledger {
             return r;
         }
         r.result = GGML_SYCL_LATE_CHECK_EQUAL;
+        if (!e.equal_logged) {
+            e.equal_logged = true;
+            std::snprintf(line, sizeof(line),
+                          "[LOAD-PLAN] %s on device %d: %s term equal (%.1f MiB), early reservation stands", label,
+                          (int) device, name, (double) e.admitted / (1024.0 * 1024.0));
+            r.line  = line;
+            r.level = LOAD_LOG_LEVEL_WARN;
+        }
         return r;
     }
 
-    // The load's commit or rollback drops its terms.  Returns how many it dropped.
+    // The load's commit or rollback drops its terms, of every kind.  Returns how many it dropped.
     size_t clear(uint64_t txn) {
         size_t dropped = 0;
         for (auto it = unrecorded_logged_.begin(); it != unrecorded_logged_.end();) {
@@ -531,19 +573,26 @@ class load_compute_ledger {
 
   private:
     struct key {
-        uint64_t txn;
-        int32_t  device;
+        uint64_t         txn;
+        int32_t          device;
+        load_ledger_term term;
 
-        bool operator<(const key & o) const { return txn != o.txn ? txn < o.txn : device < o.device; }
+        bool operator<(const key & o) const {
+            if (txn != o.txn) {
+                return txn < o.txn;
+            }
+            return device != o.device ? device < o.device : term < o.term;
+        }
     };
 
     struct entry {
         uint64_t admitted      = 0;
         bool     shrink_logged = false;
+        bool     equal_logged  = false;
     };
 
     std::map<key, entry> terms_;
-    std::set<key>        unrecorded_logged_;  // the (load, device) pairs whose NOT_RECORDED line was given
+    std::set<key>        unrecorded_logged_;  // the (load, device, term) keys whose NOT_RECORDED line was given
 };
 
 }  // namespace ggml_sycl

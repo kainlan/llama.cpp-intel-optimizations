@@ -22,6 +22,7 @@
 //
 
 #include "compute-alloc-scope.hpp"
+#include "tlsf-allocator.hpp"
 #include "unified-types.hpp"
 #include "zone-sizing.hpp"
 
@@ -1711,6 +1712,40 @@ int main() {
         CHECK(ggml_sycl::compute_alloc_scope_active(), "nested: still open after the inner leave");
         ggml_sycl::compute_alloc_scope_leave();
         CHECK(!ggml_sycl::compute_alloc_scope_active(), "closed after the matching leaves");
+    }
+
+    // ---- Case 33: the compute term is the RUNTIME allocator's occupancy of each chunk, summed (llama.cpp-p6i0) ----
+    // The scheduler's compute buffer arrives as one allocation per gallocr chunk, so the zone must hold each chunk as
+    // the TLSF rounds it, and nothing more: no headroom.
+    {
+        const size_t grain = ggml_sycl::tlsf_allocator::block_grain;
+        // the rule is the allocator's: a 128-aligned request rounds to the 256 B grain
+        CHECK(ggml_sycl::tlsf_allocator::round_request(1, 128) == grain, "the grain is not the TLSF's");
+        // the Qwen3.8 B70 no -c ub512 buffer: a 1543.1 MB chunk and a 512 MB chunk
+        const uint64_t qwen[] = { 1618052864ull, 536870912ull };
+        size_t         term   = 0;
+        CHECK(ggml_sycl::zone_compute_term_bytes(qwen, 2, 128, &term), "a two-chunk term was refused");
+        CHECK(term == ggml_sycl::tlsf_allocator::round_request(1618052864ull, 128) +
+                          ggml_sycl::tlsf_allocator::round_request(536870912ull, 128),
+              "the term is not the sum of the allocator's per-chunk occupancy");
+        // each chunk rounds on its own: two odd chunks take two grains each, not the rounding of their sum
+        const uint64_t odd[] = { grain + 1, grain + 1 };
+        CHECK(ggml_sycl::zone_compute_term_bytes(odd, 2, 128, &term) && term == 4 * grain,
+              "chunks were summed before rounding");
+        // an exact multiple of the grain takes exactly itself: no headroom
+        const uint64_t exact[] = { 4 * grain };
+        CHECK(ggml_sycl::zone_compute_term_bytes(exact, 1, 128, &term) && term == 4 * grain, "headroom was added");
+        // a zero chunk allocates nothing; no chunks is a zero term
+        const uint64_t zero[] = { 0, grain };
+        CHECK(ggml_sycl::zone_compute_term_bytes(zero, 2, 128, &term) && term == grain, "a zero chunk was charged");
+        CHECK(ggml_sycl::zone_compute_term_bytes(nullptr, 0, 128, &term) && term == 0, "no chunks is not zero");
+        // a wrap refuses, and leaves the answer untouched: never a smaller term
+        term                 = 12345;
+        const uint64_t big[] = { SIZE_MAX - grain, SIZE_MAX - grain };
+        CHECK(!ggml_sycl::zone_compute_term_bytes(big, 2, 128, &term) && term == 12345, "a wrapped sum was accepted");
+        const uint64_t top[] = { SIZE_MAX };
+        CHECK(!ggml_sycl::zone_compute_term_bytes(top, 1, 128, &term), "a chunk the rounding wraps was accepted");
+        CHECK(!ggml_sycl::zone_compute_term_bytes(nullptr, 1, 128, &term), "a null chunk list was accepted");
     }
 
     std::printf("PASS: zone-sizing structural path-scoped maxima\n");

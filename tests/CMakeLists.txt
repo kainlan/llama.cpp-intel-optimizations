@@ -822,6 +822,13 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-capacity-source.py --self-test)
     set_tests_properties(test-sycl-cpu-expert-pool-capacity-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+    # CpuExpertPool is a thread pool and owns no memory: its four staging ring
+    # slots had no callers and were removed (llama.cpp-b2jc). Run WITH --self-test
+    # so each ring name, allocation and init() parameter is proven to be caught.
+    add_test(NAME test-sycl-cpu-expert-pool-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-source.py --self-test)
+    set_tests_properties(test-sycl-cpu-expert-pool-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # Host MoE experts must read the activation row of their own slot, not row 0
     # (llama.cpp-4hg7: GPT-OSS down-projection decode garbage under host-tiered
     # experts). Run WITH --self-test so each anchor is proven load-bearing.
@@ -4303,6 +4310,18 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-mmq-src1-plan-claim-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mmq-src1-plan-claim-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-p6i0: the load's planned compute term is a named RUNTIME consumer. The reservation sizes it from the probe
+# measure's chunks at the RUNTIME TLSF's grain and writes only the planner term; the RUNTIME zone requirement folds it
+# in; the ring re-plan leaves it room; the compute buffer's landing line names it; and it is dropped where no model is
+# live. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-load-compute-term-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-load-compute-term-source.py
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()

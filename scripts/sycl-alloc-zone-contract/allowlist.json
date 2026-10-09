@@ -317,6 +317,46 @@
       "reason": "ggml_backend_sycl_load_late_check is a C-ABI comparison of two byte counts through the ledger: its try body reads the open load transaction from the lifecycle registry (admission_diagnostics), takes the ledger mutex and formats a log line, with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and answers NOT_RECORDED, the fail-closed value. Permanent; llama.cpp-moua L4 step 3."
     },
     {
+      "id": "E-P6I0-RECORD-COMPUTE-TERM",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_backend_sycl_load_record_compute_term",
+      "count": 1,
+      "reason": "ggml_backend_sycl_load_record_compute_term is the C-ABI record of c(P) in the load's ledger: its try body calls the one compute writer, which takes the ledger mutex, reads the open load transaction from the lifecycle registry (admission_diagnostics) and inserts one entry in a std::map, with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and answers false (not recorded), the fail-closed value. Permanent; llama.cpp-p6i0."
+    },
+    {
+      "id": "E-P6I0-RECORD-STATE-TERM",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_backend_sycl_load_record_state_term",
+      "count": 1,
+      "reason": "ggml_backend_sycl_load_record_state_term is the C-ABI record of the state term in the load's ledger: its try body calls the one state writer, which takes the ledger mutex, reads the open load transaction from the lifecycle registry (admission_diagnostics) and inserts one entry in a std::map, with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and answers false (not recorded), the fail-closed value. Permanent; llama.cpp-p6i0."
+    },
+    {
+      "id": "E-P6I0-LATE-CHECK-STATE",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_backend_sycl_load_late_check_state",
+      "count": 1,
+      "reason": "ggml_backend_sycl_load_late_check_state is the C-ABI comparison of two state byte counts through the ledger: its try body takes the ledger mutex, reads the open load transaction from the lifecycle registry (admission_diagnostics) and formats a log line, with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and answers NOT_RECORDED, the fail-closed value. Permanent; llama.cpp-p6i0."
+    },
+    {
+      "id": "E-P6I0-RESERVE-COMPUTE-TERM",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_backend_sycl_load_reserve_compute_term",
+      "count": 1,
+      "reason": "ggml_backend_sycl_load_reserve_compute_term is the C-ABI compute reservation: its try body reads the open load transaction from the lifecycle registry, looks up the device's existing unified cache (get_existing_unified_cache_for_device, which never creates a cache or reserves an arena; an absent cache declines with a WARN), sizes the term with the RUNTIME allocator's round_request arithmetic and stores it in the planner's per-device atomic term (unified_cache_set_planned_compute_term), with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and answers false (not reserved), so the load goes on with that memory unplanned. Permanent; llama.cpp-p6i0."
+    },
+    {
+      "id": "E-P6I0-RESERVE-STATE-TERM",
+      "code": "G-CATCH",
+      "file": "ggml-sycl.cpp",
+      "function": "ggml_backend_sycl_load_reserve_state_term",
+      "count": 1,
+      "reason": "ggml_backend_sycl_load_reserve_state_term is the C-ABI state reservation: its try body reads the open load transaction from the lifecycle registry, looks up the device's existing unified cache (get_existing_unified_cache_for_device, which never creates a cache or reserves an arena; an absent cache declines with a WARN), sizes the term with the RUNTIME allocator's round_request arithmetic and stores it in the planner's per-device atomic term (unified_cache_set_planned_state_term), with no allocation of backend memory and no planned-refusal path, and the handler is the C-ABI boundary, which cannot let an exception cross and answers false (not reserved), so the load goes on with that memory unplanned. Permanent; llama.cpp-p6i0."
+    },
+    {
       "id": "E-L4-CLAIM-SCOPE-OPEN",
       "code": "G-CATCH",
       "file": "ggml-sycl.cpp",

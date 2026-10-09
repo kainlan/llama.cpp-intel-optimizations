@@ -11,9 +11,18 @@
 //
 // A backend that does not define one of them answers null, which every reader treats as
 // inert: UNSUPPORTED for the publish, GROWTH for the coverage query, NOT_RECORDED for the
-// late check, NOT_ANSWERED for the residency probe.
+// late check (of the compute term and of the state term), NOT_ANSWERED for the residency probe, "not recorded" for
+// the load's compute-term and state-term records, "not reserved" for its compute and state reservations, "not
+// sized" for the reservation's units and "not read" for the planned state term (llama.cpp-p6i0).
 
 #define GGML_SYCL_PROC_SET_RUNTIME_CONTEXT_DESC "ggml_backend_sycl_set_runtime_context_desc"
 #define GGML_SYCL_PROC_TENANT_COVERAGE          "ggml_backend_sycl_tenant_coverage"
 #define GGML_SYCL_PROC_LOAD_LATE_CHECK          "ggml_backend_sycl_load_late_check"
 #define GGML_SYCL_PROC_PROBE_RESIDENCY          "ggml_backend_sycl_probe_residency"
+#define GGML_SYCL_PROC_LOAD_RECORD_COMPUTE_TERM  "ggml_backend_sycl_load_record_compute_term"
+#define GGML_SYCL_PROC_LOAD_RESERVE_COMPUTE_TERM "ggml_backend_sycl_load_reserve_compute_term"
+#define GGML_SYCL_PROC_LOAD_COMPUTE_TERM_BYTES   "ggml_backend_sycl_load_compute_term_bytes"
+#define GGML_SYCL_PROC_LOAD_RESERVE_STATE_TERM   "ggml_backend_sycl_load_reserve_state_term"
+#define GGML_SYCL_PROC_LOAD_RECORD_STATE_TERM    "ggml_backend_sycl_load_record_state_term"
+#define GGML_SYCL_PROC_LOAD_LATE_CHECK_STATE     "ggml_backend_sycl_load_late_check_state"
+#define GGML_SYCL_PROC_PLANNED_STATE_TERM        "ggml_backend_sycl_planned_state_term"
