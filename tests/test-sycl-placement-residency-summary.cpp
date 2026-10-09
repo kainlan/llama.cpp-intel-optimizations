@@ -23,12 +23,15 @@
 //    std::string key built per query shows up there.
 //  - A name without "blk." parses to layer -1 and must be answered without
 //    undefined behaviour (built with -fsanitize=undefined, see CMakeLists).
+//  - Large layer ids (1 << 20, 1 << 24, INT32_MAX) keep groups of their own:
+//    a key narrowed to 32 bits would fold layer 1 << 24 onto layer 0.
 //
 // Host-only: synthetic plans, no queue, no device, no model.
 
 #include "ggml-sycl.h"
 #include "ggml-sycl/unified-cache.hpp"
 
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -221,11 +224,13 @@ const std::vector<std::string> & query_names() {
     return names;
 }
 
-void compare(const placement_plan & plan, const std::string & stage) {
+void compare(const placement_plan &           plan,
+             const std::string &              stage,
+             const std::vector<std::string> & names = query_names()) {
     const oracle  o(plan);
     const int64_t ns[]      = { 0, 1, 3, kExperts - 1, kExperts, kExperts + 1 };
     const int     devices[] = { -1, 0, 1, 2 };
-    for (const std::string & name : query_names()) {
+    for (const std::string & name : names) {
         const char * cname = name.c_str();
         for (int64_t n : ns) {
             const std::string at = name + " n=" + std::to_string(n);
@@ -355,6 +360,64 @@ placement_plan synthetic_plan() {
     return plan;
 }
 
+// Layers far from the synthetic plan's: 1 << 20, 1 << 24 (whose key, shifted
+// left by 8 in 32 bits, wraps onto layer 0's) and INT32_MAX, next to a layer 0
+// group with a different residency so any key collision changes an answer.
+void check_large_layer_ids() {
+    struct big_layer {
+        int                layer;
+        expert_tensor_role role;
+        const char *       role_name;
+    };
+
+    const big_layer layers[] = {
+        { 0,         expert_tensor_role::UP,   "up"   },
+        { 1 << 20,   expert_tensor_role::UP,   "up"   },
+        { 1 << 24,   expert_tensor_role::UP,   "up"   },
+        { INT32_MAX, expert_tensor_role::GATE, "gate" },
+    };
+    placement_plan           plan{};
+    std::vector<std::string> names;
+    plan.multi_device = true;
+    for (const big_layer & l : layers) {
+        const std::string name = "blk." + std::to_string(l.layer) + ".ffn_" + l.role_name + "_exps.weight";
+        names.push_back(name);
+        check(ggml_sycl::expert_layer_from_tensor_name(name.c_str()) == l.layer, "large layer ids",
+              name + " parses to its own layer");
+        for (int e = 0; e < kExperts; ++e) {
+            bool on     = true;
+            int  target = 0;
+            if (l.layer == (1 << 20)) {
+                on     = e < 6;  // experts 6..7 on host
+                target = on ? 0 : -1;
+            } else if (l.layer == (1 << 24)) {
+                on     = false;  // all on host, unlike layer 0
+                target = -1;
+            } else if (l.layer == INT32_MAX) {
+                target = 1;
+            }
+            add_expert(plan, name, l.layer, e, l.role, on, target);
+        }
+    }
+    names.push_back("blk.2147483647.ffn_up_exps.weight");  // a role the big layer does not have
+    names.push_back("blk.1048576.ffn_down_exps.weight");   // likewise
+    plan.build_index();
+
+    const oracle o(plan);
+    check(o.all_local("blk.0.ffn_up_exps.weight", kExperts, 0), "large layer ids", "layer 0 up is all on device 0");
+    check(o.has_host("blk.16777216.ffn_up_exps.weight", kExperts), "large layer ids", "layer 1 << 24 up is on host");
+    compare(plan, "large layer ids", names);
+
+    plan.update_expert_placement(1 << 24, 0, expert_tensor_role::UP, true, 0);
+    compare(plan, "large layer ids: 1 << 24 host -> device0", names);
+    plan.update_expert_placement(INT32_MAX, 3, expert_tensor_role::GATE, false, -1);
+    compare(plan, "large layer ids: INT32_MAX device1 -> host", names);
+    plan.update_expert_placement(0, 5, expert_tensor_role::UP, false, -1);
+    compare(plan, "large layer ids: layer 0 device0 -> host", names);
+    plan.build_index();
+    compare(plan, "large layer ids: rebuild", names);
+}
+
 void flip(placement_plan &   plan,
           int                layer,
           int                expert,
@@ -427,6 +490,8 @@ int main() {
         std::printf("  FAIL [flip] update_expert_placement accepted an unclassified key\n");
         ++failures;
     }
+
+    check_large_layer_ids();
 
     const placement_plan copy = plan;
     compare(copy, "copy");

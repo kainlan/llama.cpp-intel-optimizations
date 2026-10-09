@@ -149,13 +149,41 @@ struct ggml_sycl_fattn_xmx_packed_k_sidecar_entry {
 std::mutex                                                               g_packed_k_sidecar_mutex;
 std::vector<std::unique_ptr<ggml_sycl_fattn_xmx_packed_k_sidecar_entry>> g_packed_k_sidecars;
 
-// Read once per process: the caller runs for every K-cache set_rows (llama.cpp-5tdy).
+// The FA environment knobs, each read once per process (llama.cpp-5tdy). They
+// are plain functions, not statics inside the templated dispatcher, so every
+// instantiation of ggml_sycl_flash_attn_ext_dispatch_ncols and the sidecar
+// check share one read. The dispatcher runs for every attention op and the
+// sidecar check for every K-cache set_rows.
+
+// GGML_SYCL_FA_FORCE_PATH, or nullptr when unset. The value is copied, so a
+// later setenv cannot leave the returned pointer dangling.
+static const char * ggml_sycl_fattn_force_path() {
+    static const std::pair<bool, std::string> force_path = [] {
+        const char * env = std::getenv("GGML_SYCL_FA_FORCE_PATH");
+        return std::make_pair(env != nullptr, std::string(env ? env : ""));
+    }();
+    return force_path.first ? force_path.second.c_str() : nullptr;
+}
+
+static bool ggml_sycl_fattn_dispatch_debug_env() {
+    static const bool enabled = std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG") != nullptr;
+    return enabled;
+}
+
+static int ggml_sycl_fattn_dispatch_debug_limit() {
+    static const int limit = [] {
+        const char * env = std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT");
+        return env ? std::atoi(env) : 32;
+    }();
+    return limit;
+}
+
 static bool ggml_sycl_fattn_xmx_sidecar_enabled() {
     static const bool enabled = [] {
         if (std::getenv("GGML_SYCL_PACKED_K_SIDECAR") != nullptr) {
             return true;
         }
-        const char * force = std::getenv("GGML_SYCL_FA_FORCE_PATH");
+        const char * force = ggml_sycl_fattn_force_path();
         return force && std::strstr(force, "split-packed") != nullptr;
     }();
     return enabled;
@@ -2576,17 +2604,12 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     }
 
     // ---- Debug trace: gated by GGML_SYCL_FA_DISPATCH_DEBUG, limited by GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT ----
-    // Both variables are read once per process; this dispatcher runs for every
-    // attention op (llama.cpp-5tdy).
+    // Both variables are read once per process by the accessors above.
     static std::atomic<int> fattn_dispatch_debug_count = 0;
-    static const int        fattn_dispatch_debug_limit = [] {
-        const char * env = std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT");
-        return env ? std::atoi(env) : 32;
-    }();
-    static const bool fattn_dispatch_debug_env = std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG") != nullptr;
+    const bool              fattn_dispatch_debug_env   = ggml_sycl_fattn_dispatch_debug_env();
 
     int        dispatch_debug_counter = fattn_dispatch_debug_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    int        debug_limit            = fattn_dispatch_debug_limit;
+    int        debug_limit            = ggml_sycl_fattn_dispatch_debug_limit();
     const bool dispatch_debug_enabled = fattn_dispatch_debug_env && dispatch_debug_counter <= debug_limit;
 
     auto dispatch_debug_kernel = [&](const char * kernel) {
@@ -2773,13 +2796,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
 
     // ---- GGML_SYCL_FA_FORCE_PATH: override all shape-based kernel selection ----
     {
-        // Read once per process (llama.cpp-5tdy); a copy, so a later setenv
-        // cannot leave a dangling pointer.
-        static const std::pair<bool, std::string> fattn_force_path_env = [] {
-            const char * env = std::getenv("GGML_SYCL_FA_FORCE_PATH");
-            return std::make_pair(env != nullptr, std::string(env ? env : ""));
-        }();
-        const char * force = fattn_force_path_env.first ? fattn_force_path_env.second.c_str() : nullptr;
+        const char * force = ggml_sycl_fattn_force_path();  // read once per process
         if (force) {
             bool force_known = false;
 
@@ -3918,7 +3935,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         // graph_compute; mirrors the debug_limit-style latching at the top
         // of ggml_sycl_flash_attn_ext_dispatch_ncols). Shared by both the
         // oneDNN and tile debug prints below.
-        static const bool d512_dispatch_debug_enabled = std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG") != nullptr;
+        static const bool d512_dispatch_debug_enabled = ggml_sycl_fattn_dispatch_debug_env();
 #if GGML_SYCL_DNNL
         static const bool d512_onednn_enabled = ggml_sycl_fa_onednn_d512_enabled();
         if (d512_onednn_enabled && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {

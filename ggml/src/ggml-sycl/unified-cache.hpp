@@ -734,8 +734,6 @@ struct moe_mmid_owner_workspace_plan {
     size_t                      host_pool_bytes   = 0;
 };
 
-// Complete placement plan for all model weights.
-// Supports single-device (P4) and multi-device (P4.5) planning.
 // llama.cpp-5tdy: residency counts for one group of expert entries -- one
 // (layer, role) of the semantic expert index, or one tensor name of the
 // name-keyed fallback index -- so the per-op residency predicates read a count
@@ -791,6 +789,8 @@ struct expert_residency_counts {
     int64_t on_target = 0;  // found, on_device and target_device == the queried device
 };
 
+// Complete placement plan for all model weights.
+// Supports single-device (P4) and multi-device (P4.5) planning.
 struct placement_plan {
     std::vector<placement_entry> entries;            // All weights, sorted by priority
     size_t                       vram_bytes;         // Total planned bytes on device(s), including KV

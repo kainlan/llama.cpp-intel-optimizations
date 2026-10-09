@@ -10,8 +10,9 @@ the tensor name and copies a std::string plus a std::vector per expert. On
 Qwen3.8 decode (512 experts) that was 8.8% of the saturated submitting thread.
 
 Clauses (the walk is textual, over comment- and string-stripped source):
-  1. placement_plan::has_host_experts (every overload, unified-cache.hpp)
-     contains no loop statement and no lookup_expert_placement call: it reads
+  1. The summary readers in unified-cache.hpp -- has_host_experts,
+     all_experts_on_device and count_experts_on_device, every overload --
+     contain no loop statement and no lookup_expert_placement call: they read
      the per-(layer, role) residency summary.
   2. In ggml_sycl_mul_mat_id (ggml-sycl.cpp), the two residency predicates
      planner_tensor_all_local_for_primary_fastpaths and
@@ -19,6 +20,11 @@ Clauses (the walk is textual, over comment- and string-stripped source):
      lookup_expert_placement call, and each calls all_experts_on_device(.
   3. ggml_sycl_mul_mat_id contains no lookup_expert_placement call at all:
      its per-expert reads use the non-copying find_expert_entry view.
+  4. The readers that may walk a strict prefix -- count_planned_experts,
+     fallback_has_host_experts and count_fallback_experts_on_device -- answer
+     the full range first: every loop statement in them is preceded by an
+     `if` whose condition reads expert_span and whose block returns, and they
+     call no lookup_expert_placement. Each must have such a shortcut.
 
 The gate refuses to pass vacuously (every named body must be found and
 non-empty) and proves itself on mutants of the real source: each mutant must
@@ -38,6 +44,9 @@ LOOP = re.compile(r"\b(for|while|do)\b")
 LOOKUP = re.compile(r"\blookup_expert_placement\s*\(")
 ALL_ON_DEVICE = re.compile(r"\ball_experts_on_device\s*\(")
 PREDICATES = ("planner_tensor_all_local_for_primary_fastpaths", "planner_tensor_all_local_for_primary")
+SUMMARY_READERS = ("has_host_experts", "all_experts_on_device", "count_experts_on_device")
+PREFIX_READERS = ("count_planned_experts", "fallback_has_host_experts", "count_fallback_experts_on_device")
+IF_STMT = re.compile(r"\bif\s*\(")
 
 
 def scrub(text):
@@ -104,6 +113,27 @@ def function_bodies(c, name):
     return spans
 
 
+def full_range_shortcuts(c, lo, hi):
+    """Offsets of each `if (... expert_span ...) { ... return ... }` in c[lo:hi]."""
+    out = []
+    for m in IF_STMT.finditer(c, lo, hi):
+        paren = m.end() - 1
+        end_paren = close_of(c, paren, "(", ")")
+        if end_paren < 0 or end_paren > hi:
+            continue
+        if not re.search(r"\bexpert_span\b", c[paren:end_paren]):
+            continue
+        k = end_paren + 1
+        while k < hi and c[k].isspace():
+            k += 1
+        if k >= hi or c[k] != "{":
+            continue
+        close = close_of(c, k)
+        if close > k and re.search(r"\breturn\b", c[k:close]):
+            out.append(m.start())
+    return out
+
+
 def lambda_body(c, lo, hi, name):
     m = re.compile(r"\b" + re.escape(name) + r"\s*=\s*\[[^\]]*\]\s*\([^)]*\)\s*(?:->\s*\w+\s*)?\{").search(c, lo, hi)
     if not m:
@@ -118,17 +148,34 @@ def violations(hpp_text, cpp_text):
     h = scrub(hpp_text)
     c = scrub(cpp_text)
 
-    hhe = function_bodies(h, "has_host_experts")
-    if not hhe:
-        bad.append("clause 1: no definition of has_host_experts found in unified-cache.hpp")
-    for lo, hi in hhe:
-        body = h[lo + 1:hi]
-        if not body.strip():
-            bad.append("clause 1: has_host_experts body at offset %d is empty" % lo)
-        if LOOP.search(body):
-            bad.append("clause 1: has_host_experts has a loop statement (per-expert sweep)")
-        if LOOKUP.search(body):
-            bad.append("clause 1: has_host_experts calls lookup_expert_placement")
+    for name in SUMMARY_READERS:
+        spans = function_bodies(h, name)
+        if not spans:
+            bad.append("clause 1: no definition of %s found in unified-cache.hpp" % name)
+        for lo, hi in spans:
+            body = h[lo + 1:hi]
+            if not body.strip():
+                bad.append("clause 1: %s body at offset %d is empty" % (name, lo))
+            if LOOP.search(body):
+                bad.append("clause 1: %s has a loop statement (per-expert sweep)" % name)
+            if LOOKUP.search(body):
+                bad.append("clause 1: %s calls lookup_expert_placement" % name)
+
+    for name in PREFIX_READERS:
+        spans = function_bodies(h, name)
+        if not spans:
+            bad.append("clause 4: no definition of %s found in unified-cache.hpp" % name)
+        n_shortcuts = 0
+        for lo, hi in spans:
+            shortcuts = full_range_shortcuts(h, lo, hi)
+            n_shortcuts += len(shortcuts)
+            if LOOKUP.search(h, lo, hi):
+                bad.append("clause 4: %s calls lookup_expert_placement" % name)
+            loop = LOOP.search(h, lo, hi)
+            if loop and not any(pos < loop.start() for pos in shortcuts):
+                bad.append("clause 4: %s walks before answering the full range from the counts" % name)
+        if spans and n_shortcuts == 0:
+            bad.append("clause 4: %s has no full-range shortcut on expert_span" % name)
 
     mmid = function_bodies(c, "ggml_sycl_mul_mat_id")
     if len(mmid) != 1:
@@ -172,6 +219,39 @@ def mutants(hpp_text, cpp_text):
                     insert_after_open(hpp_text, span, "\n        while (false) {}\n"), cpp_text))
         out.append(("lookup in has_host_experts", "clause 1: has_host_experts calls lookup_expert_placement",
                     insert_after_open(hpp_text, span, "\n        (void) lookup_expert_placement(0, 0, expert_tensor_role::GATE);\n"),
+                    cpp_text))
+    for name in SUMMARY_READERS[1:]:
+        spans = function_bodies(h, name)
+        if spans:
+            out.append(("loop in " + name, "clause 1: %s has a loop" % name,
+                        insert_after_open(hpp_text, spans[0], "\n        for (int64_t e = 0; e < 1; ++e) { (void) e; }\n"),
+                        cpp_text))
+            out.append(("lookup in " + name, "clause 1: %s calls lookup_expert_placement" % name,
+                        insert_after_open(hpp_text, spans[0],
+                                          "\n        (void) lookup_expert_placement(0, 0, expert_tensor_role::GATE);\n"),
+                        cpp_text))
+    for name in PREFIX_READERS:
+        spans = function_bodies(h, name)
+        target = None
+        for lo, hi in spans:
+            shortcuts = full_range_shortcuts(h, lo, hi)
+            if shortcuts and LOOP.search(h, lo, hi):
+                target = (lo, hi, shortcuts[0])
+                break
+        if target is None:
+            continue
+        lo, hi, pos = target
+        paren = h.index("(", pos)
+        k = close_of(h, paren, "(", ")") + 1
+        while h[k].isspace():
+            k += 1
+        block_end = close_of(h, k) + 1
+        # Delete the shortcut: every query walks.
+        out.append(("shortcut deleted in " + name, "clause 4: %s has no full-range shortcut" % name,
+                    hpp_text[:pos] + hpp_text[block_end:], cpp_text))
+        # Walk first, then answer from the counts.
+        out.append(("walk before shortcut in " + name, "clause 4: %s walks before answering" % name,
+                    insert_after_open(hpp_text, (lo, hi), "\n        for (int64_t w = 0; w < 1; ++w) { (void) w; }\n"),
                     cpp_text))
     mmid = function_bodies(c, "ggml_sycl_mul_mat_id")
     if len(mmid) == 1:
@@ -221,7 +301,7 @@ def main(argv):
         return 1
 
     built = mutants(hpp_text, cpp_text)
-    want_min = 3 + 3 * len(PREDICATES) + 1
+    want_min = 3 + 2 * (len(SUMMARY_READERS) - 1) + 3 * len(PREDICATES) + 1 + 2 * len(PREFIX_READERS)
     if len(built) < want_min:
         print("FAIL: only %d of %d mutants could be built (anchors missing)" % (len(built), want_min))
         return 1
