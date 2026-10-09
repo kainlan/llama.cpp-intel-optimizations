@@ -38,7 +38,7 @@ struct llama_measure_unsupported : std::runtime_error {
 // The two backend entry points the plan-override guard calls, taken together from one function so a
 // missing one is a named refusal and an override can never be installed without its clear.
 struct llama_measure_override_procs {
-    decltype(&ggml_backend_sycl_measure_plan_override_install) install = nullptr;
+    decltype(&ggml_backend_sycl_measure_plan_override_install_kv) install = nullptr;
     decltype(&ggml_backend_sycl_measure_plan_override_clear)   clear   = nullptr;
 };
 
@@ -49,8 +49,8 @@ llama_measure_override_procs llama_context_sycl_measure_override_procs(ggml_back
 #ifdef LLAMA_PRIVATE_TEST_OBJECTS
 // The vehicle's build replaces the pair (null, null restores the backend's own).
 void llama_context_sycl_measure_override_procs_override_for_testing(
-    decltype(&ggml_backend_sycl_measure_plan_override_install) install_fn,
-    decltype(&ggml_backend_sycl_measure_plan_override_clear)   clear_fn);
+    decltype(&ggml_backend_sycl_measure_plan_override_install_kv) install_fn,
+    decltype(&ggml_backend_sycl_measure_plan_override_clear)      clear_fn);
 #endif
 
 // The plan override of one measure, as a scope. Its constructor installs, its destructor clears, and

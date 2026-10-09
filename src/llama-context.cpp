@@ -3817,7 +3817,7 @@ std::vector<llama_tenant_buft_caps> llama_context::get_measure_tenant_caps() con
     return measure_tenant_caps(measure_plan);
 }
 
-static decltype(&ggml_backend_sycl_measure_plan_override_install) g_measure_install_override = nullptr;
+static decltype(&ggml_backend_sycl_measure_plan_override_install_kv) g_measure_install_override = nullptr;
 static decltype(&ggml_backend_sycl_measure_plan_override_clear)   g_measure_clear_override   = nullptr;
 
 llama_measure_override_procs llama_context_sycl_measure_override_procs(ggml_backend_dev_t dev) {
@@ -3833,11 +3833,11 @@ llama_measure_override_procs llama_context_sycl_measure_override_procs(ggml_back
         return procs;
     }
 #ifdef GGML_USE_SYCL
-    procs.install = &ggml_backend_sycl_measure_plan_override_install;
+    procs.install = &ggml_backend_sycl_measure_plan_override_install_kv;
     procs.clear   = &ggml_backend_sycl_measure_plan_override_clear;
 #elif defined(GGML_BACKEND_DL)
     procs.install = reinterpret_cast<decltype(procs.install)>(
-        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_plan_override_install"));
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_plan_override_install_kv"));
     procs.clear = reinterpret_cast<decltype(procs.clear)>(
         llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_measure_plan_override_clear"));
 #endif
@@ -3846,8 +3846,8 @@ llama_measure_override_procs llama_context_sycl_measure_override_procs(ggml_back
 
 #ifdef LLAMA_PRIVATE_TEST_OBJECTS
 void llama_context_sycl_measure_override_procs_override_for_testing(
-    decltype(&ggml_backend_sycl_measure_plan_override_install) install_fn,
-    decltype(&ggml_backend_sycl_measure_plan_override_clear)   clear_fn) {
+    decltype(&ggml_backend_sycl_measure_plan_override_install_kv) install_fn,
+    decltype(&ggml_backend_sycl_measure_plan_override_clear)      clear_fn) {
     g_measure_install_override = install_fn;
     g_measure_clear_override   = clear_fn;
 }

@@ -15767,9 +15767,9 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_measu
     return out;
 }
 
-bool ggml_backend_sycl_measure_plan_override_install(uint64_t                                  load_txn,
-                                                     ggml_sycl_measure_stage                   stage,
-                                                     const struct ggml_sycl_measure_kv_shape * kv_shape) {
+bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                                  load_txn,
+                                                        ggml_sycl_measure_stage                   stage,
+                                                        const struct ggml_sycl_measure_kv_shape * kv_shape) {
     if (g_measure_plan_override) {
         GGML_LOG_WARN("[CONTEXT-PLAN-BUG] measure plan override nested\n");
         if (ggml_sycl::ggml_sycl_strict_enabled()) {
@@ -116882,8 +116882,8 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_has_active_placement_plan") == 0) {
         return (void *) ggml_backend_sycl_has_active_placement_plan;
     }
-    if (strcmp(name, "ggml_backend_sycl_measure_plan_override_install") == 0) {
-        return (void *) ggml_backend_sycl_measure_plan_override_install;
+    if (strcmp(name, "ggml_backend_sycl_measure_plan_override_install_kv") == 0) {
+        return (void *) ggml_backend_sycl_measure_plan_override_install_kv;
     }
     if (strcmp(name, "ggml_backend_sycl_measure_plan_override_clear") == 0) {
         return (void *) ggml_backend_sycl_measure_plan_override_clear;

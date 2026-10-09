@@ -1892,7 +1892,10 @@ struct ggml_sycl_measure_kv_shape {
 
 GGML_SYCL_ABI_ASSERT(sizeof(struct ggml_sycl_measure_kv_shape) == 16, "measure KV shape layout changed");
 
-GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_override_install(
+// Proc name: "ggml_backend_sycl_measure_plan_override_install_kv".  The name changed when `kv_shape` was added: a
+// libllama built for the two-argument form finds no proc under it and its measure refuses by name, where the same
+// name would have handed this function garbage for `kv_shape`.
+GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_override_install_kv(
     uint64_t                                  load_txn,
     enum ggml_sycl_measure_stage              stage,
     const struct ggml_sycl_measure_kv_shape * kv_shape);

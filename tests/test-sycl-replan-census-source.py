@@ -949,11 +949,11 @@ def gate36(files, bad):
         bad("gate 36: the measure plan override is not a thread_local shared_ptr")
     for m in re.finditer(r"\bg_measure_plan_override\s*(?:=(?!=)|\.reset\s*\(|\.swap\s*\()", c):
         fn = enclosing_top(c, m.start())
-        if fn not in ("ggml_backend_sycl_measure_plan_override_install", "ggml_backend_sycl_measure_plan_override_clear"):
+        if fn not in ("ggml_backend_sycl_measure_plan_override_install_kv", "ggml_backend_sycl_measure_plan_override_clear"):
             bad("gate 36: g_measure_plan_override is written in %s" % fn)
-    inst = body_text(c, "ggml_backend_sycl_measure_plan_override_install", bad, "gate 36")
-    kinst = text_of(keep(files, MAIN), only_body(keep(files, MAIN), "ggml_backend_sycl_measure_plan_override_install", [], "")) \
-        if func_bodies(keep(files, MAIN), "ggml_backend_sycl_measure_plan_override_install") else ""
+    inst = body_text(c, "ggml_backend_sycl_measure_plan_override_install_kv", bad, "gate 36")
+    kinst = text_of(keep(files, MAIN), only_body(keep(files, MAIN), "ggml_backend_sycl_measure_plan_override_install_kv", [], "")) \
+        if func_bodies(keep(files, MAIN), "ggml_backend_sycl_measure_plan_override_install_kv") else ""
     if inst:
         first = inst.find("g_measure_plan_override")
         if first < 0 or "return false" not in inst[:inst.find("g_measure_plan_override =") if "g_measure_plan_override =" in inst else 0]:
@@ -961,7 +961,7 @@ def gate36(files, bad):
         if 'GGML_LOG_WARN("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst or \
                 'GGML_ABORT("[CONTEXT-PLAN-BUG] measure plan override nested' not in kinst:
             bad("gate 36: install lacks its nesting witness")
-    for fn in ("ggml_backend_sycl_measure_plan_override_install", "lifecycle_make_candidate_snapshot"):
+    for fn in ("ggml_backend_sycl_measure_plan_override_install_kv", "lifecycle_make_candidate_snapshot"):
         t = ""
         for path in (MAIN, UC_C):
             cc = code(files, path)

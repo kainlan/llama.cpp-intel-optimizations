@@ -54,6 +54,7 @@ def read(rel: str) -> str:
 
 SYCL = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 CACHE = read("ggml/src/ggml-sycl/unified-cache.cpp")
+LLAMA_CTX = read("src/llama-context.cpp")
 
 
 def body(text: str, signature: str) -> str:
@@ -190,6 +191,23 @@ def claim_abort_clears_with_no_model_live(sycl: str) -> bool:
         "if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) { " + CLEAR + " }")
 
 
+# ---- (b) the measure's plan override is reached only under the name of its kv_shape form ---------------------------
+
+INSTALL_OLD = '"ggml_backend_sycl_measure_plan_override_install"'
+INSTALL_KV = '"ggml_backend_sycl_measure_plan_override_install_kv"'
+
+
+def claim_install_proc_answers_only_its_kv_name(sycl: str, llama: str) -> bool:
+    """The install entry gained `kv_shape`, so it is exported, and looked up, under a new name only: a libllama built
+    for the two-argument form then finds no proc and its measure refuses by name instead of passing garbage."""
+    return (("strcmp(name, " + INSTALL_KV + ") == 0") in norm(sycl) and INSTALL_OLD not in sycl
+            and INSTALL_KV in llama and INSTALL_OLD not in llama)
+
+
+def test_the_install_proc_answers_only_its_kv_name():
+    assert claim_install_proc_answers_only_its_kv_name(SYCL, LLAMA_CTX)
+
+
 def test_the_reservation_sizes_at_the_grain_and_writes_only_the_term():
     assert claim_reserve_sizes_at_the_grain_and_writes_only_the_term(SYCL)
 
@@ -311,6 +329,18 @@ def test_mutant_abort_clear_dropped_fails():
         _once(SYCL, "        if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) {\n"
                     "            ggml_sycl::unified_cache_clear_planned_compute_terms();",
               "        if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) {\n            ;"))
+
+
+
+def test_mutant_backend_answering_the_old_install_name_fails():
+    arm = "    if (strcmp(name, " + INSTALL_KV + ") == 0) {"
+    assert not claim_install_proc_answers_only_its_kv_name(
+        _once(SYCL, arm, "    if (strcmp(name, " + INSTALL_OLD + ") == 0) {\n        return nullptr;\n    }\n" + arm),
+        LLAMA_CTX)
+
+
+def test_mutant_llama_asking_the_old_install_name_fails():
+    assert not claim_install_proc_answers_only_its_kv_name(SYCL, _once(LLAMA_CTX, INSTALL_KV, INSTALL_OLD))
 
 
 if __name__ == "__main__":

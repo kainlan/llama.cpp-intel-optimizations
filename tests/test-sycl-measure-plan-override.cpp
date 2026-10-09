@@ -83,9 +83,10 @@ placement_plan make_plan(bool secondary_expert, size_t marker_bytes) {
 
 void test_install_finds_the_staged_plan() {
     // Nothing staged: refused, nothing installed.
-    CHECK(!ggml_backend_sycl_measure_plan_override_install(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
+    CHECK(!ggml_backend_sycl_measure_plan_override_install_kv(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
           "no probe plan staged: install refuses");
-    CHECK(!ggml_backend_sycl_measure_plan_override_install(CANDIDATE_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, nullptr),
+    CHECK(!ggml_backend_sycl_measure_plan_override_install_kv(CANDIDATE_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B,
+                                                              nullptr),
           "no candidate staged: install refuses");
     CHECK(!ggml_backend_sycl_has_active_placement_plan(), "a refused install leaves no plan");
 
@@ -93,9 +94,9 @@ void test_install_finds_the_staged_plan() {
     lifecycle_stage_placement_plan(CANDIDATE_TXN, make_plan(false, 222));
 
     // A probe plan is not a candidate: the stages read different registries.
-    CHECK(!ggml_backend_sycl_measure_plan_override_install(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, nullptr),
+    CHECK(!ggml_backend_sycl_measure_plan_override_install_kv(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, nullptr),
           "a probe plan is not found as a candidate");
-    CHECK(!ggml_backend_sycl_measure_plan_override_install(CANDIDATE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
+    CHECK(!ggml_backend_sycl_measure_plan_override_install_kv(CANDIDATE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
           "a candidate plan is not found as a probe plan");
 }
 
@@ -103,7 +104,7 @@ void test_accessors_follow_the_override() {
     const auto real_owner = global_placement_plan_owner();
     CHECK(real_owner && real_owner->entries.empty(), "baseline: no published plan");
 
-    CHECK(ggml_backend_sycl_measure_plan_override_install(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
+    CHECK(ggml_backend_sycl_measure_plan_override_install_kv(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
           "probe install succeeds");
     {
         const auto owner = global_placement_plan_owner();
@@ -128,17 +129,19 @@ void test_accessors_follow_the_override() {
     CHECK(cache_placement_coherence(nullptr).coherence == placement_cache_coherence::GENUINE_NO_PLAN,
           "clear restores the coherence answer");
 
-    CHECK(ggml_backend_sycl_measure_plan_override_install(CANDIDATE_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, nullptr),
-          "candidate install succeeds");
+    CHECK(
+        ggml_backend_sycl_measure_plan_override_install_kv(CANDIDATE_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, nullptr),
+        "candidate install succeeds");
     CHECK(global_placement_plan_owner()->weight_host_bytes == 222, "the candidate stage answers from the candidate");
     ggml_backend_sycl_measure_plan_override_clear();
     ggml_backend_sycl_measure_plan_override_clear();  // clearing a clear override is harmless
 }
 
 void test_nest_is_refused() {
-    CHECK(ggml_backend_sycl_measure_plan_override_install(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
+    CHECK(ggml_backend_sycl_measure_plan_override_install_kv(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
           "outer install succeeds");
-    CHECK(!ggml_backend_sycl_measure_plan_override_install(CANDIDATE_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, nullptr),
+    CHECK(!ggml_backend_sycl_measure_plan_override_install_kv(CANDIDATE_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B,
+                                                              nullptr),
           "a nested install is refused");
     CHECK(global_placement_plan_owner()->weight_host_bytes == 111, "the outer override is still the one in place");
     ggml_backend_sycl_measure_plan_override_clear();
@@ -147,7 +150,7 @@ void test_nest_is_refused() {
 
 void test_publish_is_refused_under_the_override() {
     const auto before = global_placement_plan_owner();
-    CHECK(ggml_backend_sycl_measure_plan_override_install(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
+    CHECK(ggml_backend_sycl_measure_plan_override_install_kv(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
           "install for the publish arm");
     // Any store is refused, whatever it carries; this is not the override's own pointer.
     test_set_kv_placement_plan(make_plan(false, 333), 4, 1024);
@@ -173,21 +176,22 @@ void test_latch_read_follows_the_plan() {
     CHECK(test_moe_multi_gpu_wanted(make_plan(true, 0)), "a plan with a secondary expert wants multi-GPU");
     CHECK(!test_moe_multi_gpu_wanted(make_plan(false, 0)), "a plan with none does not");
 
-    CHECK(ggml_backend_sycl_measure_plan_override_install(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
+    CHECK(ggml_backend_sycl_measure_plan_override_install_kv(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
           "install the secondary-expert probe plan");
     CHECK(test_moe_multi_gpu_for_executor(), "under the override the read answers from the plan, not the latch");
     CHECK(test_moe_multi_gpu_latch() == latch_before, "the process latch itself is untouched");
     ggml_backend_sycl_measure_plan_override_clear();
 
-    CHECK(ggml_backend_sycl_measure_plan_override_install(CANDIDATE_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, nullptr),
-          "install the primary-only candidate plan");
+    CHECK(
+        ggml_backend_sycl_measure_plan_override_install_kv(CANDIDATE_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, nullptr),
+        "install the primary-only candidate plan");
     CHECK(!test_moe_multi_gpu_for_executor(), "a primary-only plan reads false under the override");
     ggml_backend_sycl_measure_plan_override_clear();
 
     // The env switch is part of "wanted", as it is for the writer.
     setenv("GGML_SYCL_MOE_MULTI_GPU", "0", 1);
     CHECK(!test_moe_multi_gpu_wanted(make_plan(true, 0)), "GGML_SYCL_MOE_MULTI_GPU=0 turns the want off");
-    CHECK(ggml_backend_sycl_measure_plan_override_install(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
+    CHECK(ggml_backend_sycl_measure_plan_override_install_kv(PROBE_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
           "install again under the env switch");
     CHECK(!test_moe_multi_gpu_for_executor(), "the executor read honours the switch under the override");
     ggml_backend_sycl_measure_plan_override_clear();
@@ -249,12 +253,13 @@ void test_install_refits_kv_for_the_shape() {
         lifecycle_stage_placement_plan(REFIT_TXN, make_kv_plan(a.budget, 0), make_kv_info(), 2);
 
         // no shape: the plan as staged, every layer where the load put it
-        CHECK(ggml_backend_sycl_measure_plan_override_install(REFIT_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, nullptr),
-              "install without a shape succeeds");
+        CHECK(
+            ggml_backend_sycl_measure_plan_override_install_kv(REFIT_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, nullptr),
+            "install without a shape succeeds");
         CHECK(kv_on_device(0) && kv_on_device(1), "without a shape the staged residency stands");
         ggml_backend_sycl_measure_plan_override_clear();
 
-        CHECK(ggml_backend_sycl_measure_plan_override_install(REFIT_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, &big),
+        CHECK(ggml_backend_sycl_measure_plan_override_install_kv(REFIT_TXN, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, &big),
               "install with a shape succeeds");
         std::snprintf(msg, sizeof(msg), "budget %zu: layer 0 on device should be %d, layer 1 %d", a.budget, (int) a.on0,
                       (int) a.on1);
@@ -285,7 +290,7 @@ void test_probe_plan_goes_with_the_candidate() {
     CHECK(lifecycle_find_probe_placement_plan(DROP_TXN) != nullptr, "the probe plan was not staged");
     lifecycle_abort_placement_plan(DROP_TXN);
     CHECK(lifecycle_find_probe_placement_plan(DROP_TXN) == nullptr, "an aborted load left its probe plan behind");
-    CHECK(!ggml_backend_sycl_measure_plan_override_install(DROP_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
+    CHECK(!ggml_backend_sycl_measure_plan_override_install_kv(DROP_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
           "a measure found the probe plan of an aborted load");
 
     // the publish path
