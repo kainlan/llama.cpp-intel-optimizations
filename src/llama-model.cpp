@@ -2592,6 +2592,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     const bool sycl_model_backend = sycl_model_loading_guard.txn.id != 0 && has_sycl_weight_buft;
     if (sycl_model_backend) {
+        // (a) the probe measure, llama.cpp-p6i0: the probe placement's compute term C-hat, before the late plan
+        // packs the weights. R2 discriminator only: it is measured and logged, nothing is reserved or recorded,
+        // and a failure is a WARN, so the load behaves as before.
+        std::vector<llama_measure_dummy_entry> probe_weights;
+        for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+            probe_weights.push_back({ ctx_key.buft, ctx_ptr.get() });
+        }
+        const llama_load_probe_result probe = llama_load_probe_bound(
+            *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, probe_weights);
+        if (!probe.unsupported.empty() || !probe.refusal.empty()) {
+            LLAMA_LOG_WARN("%s: probe compute-slot measure skipped, the load continues: %s\n", __func__,
+                           (probe.unsupported.empty() ? probe.refusal : probe.unsupported).c_str());
+        }
+        for (const llama_load_measure_device & d : probe.devices) {
+            if (!d.host) {
+                LLAMA_LOG_INFO("%s: [LOAD-PLAN] probe compute term %.1f MiB on device %d (measured only)\n", __func__,
+                               d.total / 1024.0 / 1024.0, (int) d.device);
+            }
+        }
+
         llama_model_sycl_set_late_inventory(ml, hparams, __func__);
 
         // llama.cpp-30h4: dev_layer(il)/dev_output() go stale the moment a

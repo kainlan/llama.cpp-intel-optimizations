@@ -15686,6 +15686,14 @@ bool ggml_backend_sycl_measure_plan_override_install(uint64_t load_txn, ggml_syc
                       (unsigned long long) load_txn, (int) stage);
         return false;
     }
+    // llama.cpp-p6i0 (R2 discriminator): the placement each stage's measure runs over, so a difference between
+    // the stages' compute terms can be read against what the plan put on the host.
+    GGML_LOG_INFO(
+        "[LOAD-PLAN] measure plan override: load %llu stage %d: weights %.1f MiB device, %.1f MiB host; "
+        "kv %.1f MiB device, %.1f MiB host; kv n_ctx %u n_ubatch %u\n",
+        (unsigned long long) load_txn, (int) stage, snapshot->plan->weight_vram_bytes / 1024.0 / 1024.0,
+        snapshot->plan->weight_host_bytes / 1024.0 / 1024.0, snapshot->plan->kv_vram_bytes / 1024.0 / 1024.0,
+        snapshot->plan->kv_host_bytes / 1024.0 / 1024.0, snapshot->kv_info.n_ctx, snapshot->kv_info.n_ubatch);
     g_measure_plan_override = std::move(snapshot);
     return true;
 }
@@ -17874,6 +17882,17 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
                 throw std::runtime_error("deterministic stage_inventory_plan failure");
             }
 #endif
+        }
+        if (early) {
+            // llama.cpp-p6i0: the early plan is the load's probe placement. Stage a copy for the PROBE-stage
+            // measure, which runs after create_tensor and before the late plan replaces the candidate. It is
+            // dropped with the candidate (lifecycle_publish_placement_plan, lifecycle_abort_placement_plan).
+            const uint64_t txn       = effect.owner.load.value;
+            const auto     candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(txn);
+            if (candidate && candidate->plan) {
+                ggml_sycl::lifecycle_stage_probe_placement_plan(txn, ggml_sycl::placement_plan(*candidate->plan),
+                                                                candidate->kv_info, candidate->model_n_layer);
+            }
         }
         rollback.released = true;
         return ggml_backend_sycl_get_device_count() == 0 ? GGML_SYCL_LIFECYCLE_NOT_FOUND : GGML_SYCL_LIFECYCLE_OK;

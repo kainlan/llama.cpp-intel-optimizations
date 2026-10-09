@@ -207,6 +207,10 @@ struct llama_load_measure_result {
     std::string                            refusal;              // the named refusal when !ok
     std::vector<llama_load_measure_device> devices;
     int                                    n_splits = 0;         // the most splits any measured graph took
+    // llama.cpp-p6i0 (R2 discriminator): the measure's per-buffer-type, per-graph chunk peaks and splits, its
+    // shape and its KV residency, as INFO lines. The measure-only context is quiet while it lives, so
+    // llama_load_measure prints them once the context is gone.
+    std::vector<std::string>               trace;
 };
 
 // Whether a context of this model cannot be built without a second context to read from: the gemma4 assistant
@@ -303,6 +307,22 @@ inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs &
     }
     return out;
 }
+
+// The probe measure (stage (a), llama.cpp-p6i0): after create_tensor and before the late plan packs the
+// weights, measure the probe placement's compute term C-hat over the weights' stand-ins. Measured and logged
+// only (the R2 discriminator): nothing is reserved or recorded from it yet. Inert, like the late check, unless
+// the backend exports the L4 entry points.
+struct llama_load_probe_result {
+    std::string                            refusal;      // non-empty: the measure failed, by this named text
+    std::string                            unsupported;  // non-empty: the model cannot be measured
+    bool                                   measured = false;
+    std::vector<llama_load_measure_device> devices;      // C-hat per device when measured
+};
+
+llama_load_probe_result llama_load_probe_bound(const llama_model &                            model,
+                                               uint32_t                                       n_ctx,
+                                               struct ggml_sycl_load_txn                      txn,
+                                               const std::vector<llama_measure_dummy_entry> & weights);
 
 // The late check (stage (c)): after the dev_layer sync and before the mappings are initialised, measure
 // the load's final placement over the real weights' dummies and hand each device's term to the backend.

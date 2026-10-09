@@ -82,6 +82,25 @@ static bool llama_kv_cache_dev_is_sycl(ggml_backend_dev_t dev) {
 }
 #endif
 
+static thread_local llama_kv_residency_tally * g_kv_residency_tally = nullptr;
+
+llama_kv_residency_tally_scope::llama_kv_residency_tally_scope(llama_kv_residency_tally & tally) :
+    prev_(g_kv_residency_tally) {
+    g_kv_residency_tally = &tally;
+}
+
+llama_kv_residency_tally_scope::~llama_kv_residency_tally_scope() {
+    g_kv_residency_tally = prev_;
+}
+
+void llama_kv_residency_tally_scope::add(const llama_kv_residency_tally & cache) {
+    if (g_kv_residency_tally != nullptr) {
+        g_kv_residency_tally->n_device += cache.n_device;
+        g_kv_residency_tally->n_host += cache.n_host;
+        g_kv_residency_tally->n_cpu += cache.n_cpu;
+    }
+}
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -234,6 +253,8 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    llama_kv_residency_tally residency;
+
     for (uint32_t il = 0; il < n_layer; il++) {
         // the one decision for this layer, shared with llama_kv_layer_shapes() (llama-layer-shapes.h)
         const llama_kv_layer_decision dec =
@@ -323,6 +344,14 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
+        if (!offload) {
+            residency.n_cpu++;
+        } else if (kv_host_layer) {
+            residency.n_host++;
+        } else {
+            residency.n_device++;
+        }
+
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for kv cache");
@@ -368,6 +397,13 @@ llama_kv_cache::llama_kv_cache(
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
     }
+
+    // llama.cpp-p6i0 (R2 discriminator): where this cache's KV layers went. The SYCL planner can demote a layer's KV
+    // to the host-tier buffer, which moves that layer's attention to the CPU and adds graph splits.
+    LLAMA_LOG_INFO("%s: [LOAD-PLAN] kv residency: %u layer(s) on device, %u on the host KV tier, %u on CPU%s\n",
+                   __func__, residency.n_device, residency.n_host, residency.n_cpu,
+                   this->no_alloc ? " (no_alloc)" : "");
+    llama_kv_residency_tally_scope::add(residency);
 
     if (reuse) {
         LLAMA_LOG_DEBUG("%s: reusing layers:\n", __func__);

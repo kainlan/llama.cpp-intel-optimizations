@@ -78,7 +78,7 @@ def types_ok(header: str) -> bool:
         "llama_cparams & cparams; sched_measure_plan * measure = nullptr; fused_resolution * resolution = nullptr; };",
         # the measure's plan
         "struct sched_measure_buft { ggml_backend_buffer_type_t buft = nullptr; size_t max_chunk_size = 0; std::vector<std::vector<size_t>> peaks; std::vector<size_t> cap; };",
-        "struct sched_measure_plan { std::vector<llama_measure_graph> graphs; std::vector<sched_measure_buft> bufts; uint32_t n_measured = 0; double measure_ms = 0.0; int n_splits_max = 0; };",
+        "struct sched_measure_plan { std::vector<llama_measure_graph> graphs; std::vector<sched_measure_buft> bufts; uint32_t n_measured = 0; double measure_ms = 0.0; int n_splits_max = 0; std::vector<int> n_splits; };",
         # the storage a MEASURE writes: the scheduler is declared first, so it dies last
         "struct sched_measure_storage { ggml_backend_sched_ptr sched;",
         "return { sched, gf_res_prev, gf_res_reserve, gf_res_prev_active, n_outputs, n_input_tensors, cparams, &plan, &resolution };",

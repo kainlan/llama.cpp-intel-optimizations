@@ -251,6 +251,7 @@ void lifecycle_abort_placement_plan(uint64_t load_txn_id) noexcept {
     try {
         std::lock_guard<std::mutex> lock(g_lifecycle_plan_mutex);
         g_lifecycle_plan_candidates.erase(load_txn_id);
+        g_lifecycle_probe_plans.erase(load_txn_id);  // the probe placement lives as long as the candidate
     } catch (...) {
     }
 }
@@ -292,11 +293,13 @@ bool lifecycle_publish_placement_plan(uint64_t model_id,
         published->version = lifecycle_next_plan_publication_id();
         if (published->version == 0) {
             g_lifecycle_plan_candidates.erase(candidate);
+            g_lifecycle_probe_plans.erase(load_txn_id);
             return false;
         }
         std::shared_ptr<const lifecycle_plan_snapshot> immutable = std::move(published);
         g_lifecycle_plan_models[model_id][load_txn_id] = immutable;
         g_lifecycle_plan_candidates.erase(candidate);
+        g_lifecycle_probe_plans.erase(load_txn_id);  // the probe placement lives as long as the candidate
         if (published_out) {
             *published_out = std::move(immutable);
         }

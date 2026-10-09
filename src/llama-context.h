@@ -80,6 +80,7 @@ struct sched_measure_plan {
     uint32_t                         n_measured = 0;
     double                           measure_ms = 0.0;
     int                              n_splits_max = 0;  // the most splits any measured graph took
+    std::vector<int>                 n_splits;          // [graph] the splits each measured graph took
 };
 
 // Everything a reserve reads and writes about the scheduler it reserves on:
