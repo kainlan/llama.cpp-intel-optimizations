@@ -31182,8 +31182,12 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     // Planner contract:
     //   - dense non-layer tensors (embeddings/output/etc.) may pack individually
     //   - dense per-layer tensors move as a single execution unit
-    //   - KV for a layer is charged alongside that dense layer
-    //   - MoE experts remain individually placeable
+    //   - device residency goes dense weights, then KV, then routed experts: the dense pass charges weights only;
+    //     the KV phase (plan_single_device_layer_kv) then puts a layer's KV on the device only when its dense layer
+    //     is there and the KV fits, and holds the room the opening context adds (hold_kv_context_room), so KV that
+    //     does not fit goes to the host tier and never moves a dense layer there
+    //   - the GGML_SYCL_KV_PIN_DEVICE diagnostic charges each layer's KV ahead of its weights inside the dense pass
+    //   - MoE experts remain individually placeable, packed (as whole triplets) into what the KV phase leaves
     //
     // When the VRAM arena is active, subtract compute scratch and oneDNN
     // scratch zone capacities from the budget BEFORE packing weights.
