@@ -3130,8 +3130,8 @@ static int case_qwen38_indexer_buffer_backstop() {
     const int    device   = 0;
     const size_t attn_kv  = 512 * mb;  // per attention layer: 262144 cells x (512 K + 512 V) x f16
     const size_t index_kv = 64 * mb;   // per attention layer: 262144 cells x 128 x f16, K only
-    // What is left on the device once the attention buffer has landed: the 768 MiB the plan budgets for the indexer
-    // keys, plus 748 MiB to spare.
+    // What is left on the device once the attention buffer has landed: the 748.6 MB master had left, which budgeted
+    // the indexer keys nowhere, plus the 768 MiB the plan now budgets for them (748.6 + 768, rounded down).
     const size_t headroom = 1516 * mb;
 
     std::vector<int>     owner(n_layers, -1);

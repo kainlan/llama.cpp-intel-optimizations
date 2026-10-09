@@ -27518,8 +27518,9 @@ static bool planner_moe_gateup_bundle4_enabled() {
 // in the single-device planner. By default the dense pass charges every layer's weights, and the KV phase after it
 // charges each device layer's KV and holds the opening context's room before the routed experts (llama.cpp-8ecj).
 // Pinned, the dense pass charges each attention layer's KV ahead of that layer's weights, so the weight decision sees
-// what the KV left; the KV phase does nothing, and no context room is held. In both modes a layer's KV and weights
-// are charged separately and each goes to the host tier on its own when it does not fit.
+// what the KV left; the KV phase does nothing, and no context room is held. By default a layer's KV is on the device
+// only with its weights, and KV that does not fit goes to the host tier without moving them; pinned, KV and weights
+// each go to the host tier on their own when they do not fit.
 static bool planner_kv_pin_device_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_KV_PIN_DEVICE");

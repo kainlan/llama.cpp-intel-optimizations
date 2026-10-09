@@ -423,7 +423,7 @@ def test_mutant_loader_keeps_the_planning_context_fails():
               "inventory.n_ctx"), SYCL, SYCL_H)
 
 
-def test_mutant_field_appended_after_padding_fails():
+def test_mutant_field_inserted_before_the_indexer_widths_fails():
     """A field inserted into the KV tail moves the fields the consumer reads at pinned offsets."""
     mutant = _once(SYCL_H, "uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; };",
                    "uint32_t n_ctx_context; size_t spare; const uint32_t * kv_idx_k_width_per_layer; };")

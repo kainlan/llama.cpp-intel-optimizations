@@ -399,7 +399,9 @@ struct placement_entry {
     int64_t            ne[GGML_MAX_DIMS] = {};
     size_t             src_size          = 0;  // AOS source bytes
     size_t             dst_size          = 0;  // Layout-converted destination bytes (SOA/COALESCED)
-    size_t             kv_size           = 0;  // KV bytes charged by this entry (usually 0)
+    // The layer's KV bytes, on one anchor entry per layer (its attention entry when it has one) and 0 on the rest. It
+    // is the cost, not the placement: kv_device[layer_id] says where that KV lives, which can differ from on_device.
+    size_t             kv_size           = 0;
     placement_priority priority          = placement_priority::COUNT;  // Sort key
     int                layer_id          = -1;  // Layer number (earlier = higher priority within same level)
     int                expert_id         = -1;  // -1 for dense weights, >=0 for individual MoE experts
