@@ -27514,12 +27514,12 @@ static bool planner_moe_gateup_bundle4_enabled() {
     return enabled;
 }
 
-// GGML_SYCL_KV_PIN_DEVICE=1 (diagnostic, default off, llama.cpp-h8hw): decouple
-// the weight/KV co-assignment in the dense-layer packing loop below so an
-// attention layer's KV can be charged and placed independently of that same
-// layer's dense weights, instead of the two being summed into one on/off-device
-// decision. Pinned, the planner also holds no KV context room before the routed experts (llama.cpp-8ecj); default
-// off, the dense pass charges weights only and the KV phase after it charges the KV and holds that room.
+// GGML_SYCL_KV_PIN_DEVICE=1 (diagnostic, default off, llama.cpp-h8hw): changes which charge claims `remaining` first
+// in the single-device planner. By default the dense pass charges every layer's weights, and the KV phase after it
+// charges each device layer's KV and holds the opening context's room before the routed experts (llama.cpp-8ecj).
+// Pinned, the dense pass charges each attention layer's KV ahead of that layer's weights, so the weight decision sees
+// what the KV left; the KV phase does nothing, and no context room is held. In both modes a layer's KV and weights
+// are charged separately and each goes to the host tier on its own when it does not fit.
 static bool planner_kv_pin_device_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_KV_PIN_DEVICE");
