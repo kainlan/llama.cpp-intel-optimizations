@@ -33,6 +33,7 @@
 #include <deque>
 #include <functional>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -1567,8 +1568,11 @@ struct placement_plan {
     }
 
   private:
-    static int64_t expert_residency_group_key(int layer_id, expert_tensor_role role) {
-        return (static_cast<int64_t>(layer_id) << 8) | static_cast<int64_t>(static_cast<uint8_t>(role));
+    // Computed in unsigned arithmetic: a name without "blk." parses to layer -1,
+    // and left-shifting a negative signed value is undefined before C++20.
+    static uint64_t expert_residency_group_key(int layer_id, expert_tensor_role role) {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(layer_id)) << 8) |
+               static_cast<uint64_t>(static_cast<uint8_t>(role));
     }
 
     const expert_residency_group * find_expert_group(int layer_id, expert_tensor_role role) const {
@@ -1577,9 +1581,12 @@ struct placement_plan {
     }
 
     // The name-keyed entry a by-name query falls back to when the semantic
-    // index misses ("tensor_name:eN").
+    // index misses ("tensor_name:eN"). Such an entry is named tensor_name and
+    // missed the semantic index when build_index() ran, so build_index() put it
+    // in tensor_name's fallback group: without that group there is nothing to
+    // find, and the key string is never built.
     const placement_entry * find_fallback_expert_entry(const char * tensor_name, int expert_id) const {
-        if (expert_index_.empty() || !tensor_name) {
+        if (expert_index_.empty() || !find_fallback_group(tensor_name)) {
             return nullptr;
         }
         const std::string key = std::string(tensor_name) + ":e" + std::to_string(expert_id);
@@ -1591,7 +1598,7 @@ struct placement_plan {
         if (expert_fallback_groups_.empty() || !tensor_name) {
             return nullptr;
         }
-        auto it = expert_fallback_groups_.find(tensor_name);
+        auto it = expert_fallback_groups_.find(tensor_name);  // std::less<>: no std::string temporary
         return it == expert_fallback_groups_.end() ? nullptr : &it->second;
     }
 
@@ -1652,9 +1659,12 @@ struct placement_plan {
            expert_placement_index_;                         // MoE experts: (layer, expert, role) -> index
     size_t expert_placement_duplicate_count_    = 0;
     size_t expert_placement_unclassified_count_ = 0;
-    std::unordered_map<int64_t, expert_residency_group>     expert_groups_;            // (layer, role) -> residency
-    std::unordered_map<std::string, expert_residency_group> expert_fallback_groups_;   // name -> fallback residency
-    std::unordered_set<size_t>                              expert_fallback_entries_;  // entries counted there
+    std::unordered_map<uint64_t, expert_residency_group>       expert_groups_;  // (layer, role) -> residency
+    // name -> fallback residency. An ordered map with a transparent comparator,
+    // because unordered_map's heterogeneous find() is C++20: a by-name query
+    // looks a const char * up here per op without building a std::string.
+    std::map<std::string, expert_residency_group, std::less<>> expert_fallback_groups_;
+    std::unordered_set<size_t>                                 expert_fallback_entries_;  // entries counted there
 };
 
 struct moe_mmid_queue_binding {

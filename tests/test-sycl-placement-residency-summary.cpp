@@ -14,6 +14,16 @@
 // is counted in BOTH a semantic group and a fallback group), after a copy, and
 // after a direct entry mutation followed by a build_index() rebuild.
 //
+// Three properties beyond the answers themselves:
+//  - The full-range queries are O(1): a direct mutation that skips
+//    build_index() must stay invisible to them while a prefix query (which
+//    walks the view) sees it, so a refactor that always walks is caught.
+//  - The per-op queries allocate nothing. A replaced global operator new
+//    counts allocations on this thread inside a window; a by-value lookup or a
+//    std::string key built per query shows up there.
+//  - A name without "blk." parses to layer -1 and must be answered without
+//    undefined behaviour (built with -fsanitize=undefined, see CMakeLists).
+//
 // Host-only: synthetic plans, no queue, no device, no model.
 
 #include "ggml-sycl.h"
@@ -21,12 +31,67 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
+#include <new>
 #include <string>
 #include <tuple>
 #include <vector>
 
 namespace {
+
+thread_local bool    g_count_allocs = false;
+thread_local int64_t g_allocs       = 0;
+
+void * counted_alloc(std::size_t size) {
+    if (g_count_allocs) {
+        ++g_allocs;
+    }
+    void * ptr = std::malloc(size ? size : 1);
+    if (!ptr) {
+        throw std::bad_alloc();
+    }
+    return ptr;
+}
+
+}  // namespace
+
+void * operator new(std::size_t size) {
+    return counted_alloc(size);
+}
+
+void * operator new[](std::size_t size) {
+    return counted_alloc(size);
+}
+
+void operator delete(void * ptr) noexcept {
+    std::free(ptr);
+}
+
+void operator delete[](void * ptr) noexcept {
+    std::free(ptr);
+}
+
+void operator delete(void * ptr, std::size_t) noexcept {
+    std::free(ptr);
+}
+
+void operator delete[](void * ptr, std::size_t) noexcept {
+    std::free(ptr);
+}
+
+namespace {
+
+// Allocations made on this thread between alloc_window_begin() and _end().
+void alloc_window_begin() {
+    g_allocs       = 0;
+    g_count_allocs = true;
+}
+
+int64_t alloc_window_end() {
+    g_count_allocs = false;
+    return g_allocs;
+}
 
 using ggml_sycl::expert_residency_counts;
 using ggml_sycl::expert_tensor_role;
@@ -190,6 +255,46 @@ void compare(const placement_plan & plan, const std::string & stage) {
     }
 }
 
+// The per-op queries allocate nothing: every full-range summary query for
+// every name, and the non-copying view. expert_on_device() is also checked for
+// every name that has no name-keyed fallback group (a fallback lookup builds
+// its "name:eN" key by design, as the by-value lookup always did).
+void check_no_allocations(const placement_plan & plan, const std::string & stage) {
+    const oracle  o(plan);
+    const int64_t ns[]      = { kExperts, kExperts + 1 };
+    const int     devices[] = { -1, 0, 1 };
+    for (const std::string & name : query_names()) {
+        const char * cname        = name.c_str();
+        const bool   has_fallback = name == "blk.5.ffn_custom_exps.weight" || name == "ffn_gate_exps.weight" ||
+                                  name == "blk.7.ffn_up_exps.weight";
+        for (int64_t n : ns) {
+            for (int dev : devices) {
+                alloc_window_begin();
+                const bool                    host   = plan.has_host_experts(cname, n, dev);
+                const bool                    all    = plan.all_experts_on_device(cname, n, dev);
+                const int64_t                 count  = plan.count_experts_on_device(cname, n, dev);
+                const expert_residency_counts counts = plan.count_planned_experts(cname, n, dev);
+                const int64_t                 allocs = alloc_window_end();
+                const std::string             at     = name + " n=" + std::to_string(n) + " dev=" + std::to_string(dev);
+                check(allocs == 0, stage, "summary queries allocated " + std::to_string(allocs) + "x: " + at);
+                check(host == o.has_host(name, n) && all == o.all_local(name, n, dev) &&
+                          count == o.count_on_device(name, n, dev) && counts.host == o.planned(name, n, dev).host,
+                      stage, "summary answers under the allocation window: " + at);
+            }
+        }
+        for (int e = 0; e < kExperts + 1; ++e) {
+            alloc_window_begin();
+            const placement_entry * view   = plan.find_expert_entry(cname, e);
+            const bool              on     = has_fallback ? false : plan.expert_on_device(cname, e, 0);
+            const int64_t           allocs = alloc_window_end();
+            const std::string       at     = name + " e=" + std::to_string(e);
+            check(allocs == 0, stage, "view queries allocated " + std::to_string(allocs) + "x: " + at);
+            check(view == o.semantic_entry(name, e) && (has_fallback || on == o.on_device(name, e, 0)), stage,
+                  "view answers under the allocation window: " + at);
+        }
+    }
+}
+
 void add_expert(placement_plan &    plan,
                 const std::string & name,
                 int                 layer,
@@ -284,6 +389,26 @@ int main() {
     }
 
     compare(plan, "build_index");
+    check_no_allocations(plan, "allocations after build_index");
+
+    // Layer -1: a name without "blk." parses to it, and the semantic index
+    // never holds it (build_index drops layer < 0), even though entries with
+    // layer_id -1 exist ("ffn_gate_exps.weight"). Every role must miss.
+    {
+        const expert_tensor_role roles[] = { expert_tensor_role::UNKNOWN, expert_tensor_role::GATE,
+                                             expert_tensor_role::UP, expert_tensor_role::DOWN };
+        for (expert_tensor_role role : roles) {
+            for (int dev : { -1, 0 }) {
+                const expert_residency_counts c = plan.count_planned_experts(-1, role, kExperts, dev);
+                check(c.found == 0 && c.host == 0 && c.on_device == 0 && c.on_target == 0, "layer -1",
+                      "count_planned_experts(-1, role " + std::to_string(static_cast<int>(role)) + ") is empty");
+            }
+        }
+        check(ggml_sycl::expert_layer_from_tensor_name("ffn_gate_exps.weight") == -1, "layer -1",
+              "a name without blk. parses to layer -1");
+        check(plan.has_host_experts("ffn_gate_exps.weight", kExperts), "layer -1",
+              "the layer -1 name still answers through its fallback group");
+    }
 
     flip(plan, 0, 4, expert_tensor_role::UP, false, -1, "device0 -> host");
     flip(plan, 0, 4, expert_tensor_role::UP, true, 0, "host -> device0");
@@ -305,6 +430,40 @@ int main() {
 
     const placement_plan copy = plan;
     compare(copy, "copy");
+    check_no_allocations(copy, "allocations after copy");
+
+    // The full range answers from the counts, never by walking the experts.
+    // A direct mutation (outside the contract, on purpose) must stay invisible
+    // to a full-range query and visible to a prefix query, which walks.
+    {
+        placement_plan probe = plan;
+        for (placement_entry & e : probe.entries) {
+            if (e.name == "blk.0.ffn_up_exps.weight" && e.expert_id == 2) {
+                e.on_device     = false;
+                e.target_device = -1;
+            }
+            if (e.name == "blk.5.ffn_custom_exps.weight" && e.expert_id >= 4) {
+                e.on_device     = true;
+                e.target_device = 1;
+            }
+        }
+        const char * up     = "blk.0.ffn_up_exps.weight";
+        const char * custom = "blk.5.ffn_custom_exps.weight";
+        const char * stage  = "full range is O(1)";
+        check(!probe.has_host_experts(up, kExperts), stage, "semantic has_host_experts reads the counts");
+        check(probe.all_experts_on_device(up, kExperts, 0), stage, "all_experts_on_device reads the counts");
+        check(probe.count_planned_experts(up, kExperts, 0).host == 0, stage, "count_planned_experts reads the counts");
+        check(probe.count_experts_on_device(up, kExperts, 0) == kExperts, stage,
+              "semantic count_experts_on_device reads the counts");
+        check(probe.has_host_experts(custom, kExperts), stage, "fallback has_host_experts reads the counts");
+        check(probe.count_experts_on_device(custom, kExperts, 1) == 4, stage,
+              "fallback count_experts_on_device reads the counts");
+        // Controls: a strict prefix walks the view and sees the mutation.
+        check(probe.has_host_experts(up, 3), stage, "control: semantic prefix walk sees the mutation");
+        check(probe.count_planned_experts(up, 3, 0).host == 1, stage, "control: prefix count sees the mutation");
+        check(!probe.has_host_experts(custom, 5), stage, "control: fallback prefix walk sees the mutation");
+        check(probe.count_experts_on_device(custom, 5, 1) == 5, stage, "control: fallback prefix count sees it");
+    }
 
     // A direct mutation is invisible to the summary until build_index() runs.
     for (placement_entry & e : plan.entries) {

@@ -4834,6 +4834,27 @@ target_link_libraries(test-sycl-placement-residency-summary PRIVATE ggml-base gg
 if (IntelSYCL_FOUND)
     target_link_libraries(test-sycl-placement-residency-summary PRIVATE IntelSYCL::SYCL_CXX)
 endif()
+# Built with UndefinedBehaviorSanitizer, fatal on the first report. The
+# residency-summary key is computed for layer -1 on every query of a name
+# without "blk.", and a signed shift of -1 there is undefined yet invisible to a
+# plain build. Host code only: icpx ignores the flag for the SPIR-V device pass
+# and warns, hence -Wno-option-ignored. UBSan leaves operator new alone, so the
+# test's allocation counter still runs. Without UBSan support the test is still
+# registered, and its layer -1 checks then pin the answers only.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_FLAGS "-fsanitize=undefined")
+set(CMAKE_REQUIRED_LINK_OPTIONS "-fsanitize=undefined")
+check_cxx_source_compiles("int main(int argc, char **) { return (argc << 1) == 0; }" GGML_SYCL_HAVE_UBSAN)
+unset(CMAKE_REQUIRED_FLAGS)
+unset(CMAKE_REQUIRED_LINK_OPTIONS)
+if (GGML_SYCL_HAVE_UBSAN)
+    target_compile_options(test-sycl-placement-residency-summary PRIVATE
+        -fsanitize=undefined -fno-sanitize-recover=undefined -Wno-option-ignored)
+    target_link_options(test-sycl-placement-residency-summary PRIVATE -fsanitize=undefined -Wno-option-ignored)
+else()
+    message(STATUS "ggml-sycl: no UndefinedBehaviorSanitizer support in this compiler; "
+                   "test-sycl-placement-residency-summary is built without it")
+endif()
 add_test(NAME sycl-placement-residency-summary COMMAND test-sycl-placement-residency-summary)
 set_tests_properties(sycl-placement-residency-summary PROPERTIES
     LABELS "sycl;plan;host;tdd"
