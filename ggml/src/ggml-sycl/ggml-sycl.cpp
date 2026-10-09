@@ -23609,7 +23609,6 @@ struct pending_cpu_scatter {
         out_pinned(nullptr),
         act_pinned(nullptr),
         weight_pinned(nullptr),
-        scatter_events(),
         stream(nullptr),
         sycl_ctx(),
         device_id(-1),
