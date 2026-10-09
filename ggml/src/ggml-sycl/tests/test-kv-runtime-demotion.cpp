@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <csignal>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <set>
@@ -40,6 +41,20 @@
             return 1;                                                                                                  \
         }                                                                                                              \
     } while (0)
+
+// The key figure a case reports on its PASS line (run_case clears it before the case and prints it after a pass), so a
+// gate can score one case by its own line instead of by the binary's closing "all ok".
+static std::string g_case_figure;
+
+// Sets g_case_figure, printf-style.
+static void case_figure(const char * fmt, ...) {
+    char    buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    g_case_figure = buf;
+}
 
 using ggml_sycl::context_demand_reconcile;
 using ggml_sycl::context_side_demand;
@@ -3100,6 +3115,7 @@ static int case_qwen3next_kv_owner_shape() {
     const kv_demotion_result over = demote(false);
     CHECK_EQ(over.demoted_layers.size(), 48, "qwen3next: charging every has_kv() layer demotes 48");
     CHECK_EQ(over.host_kv_bytes_added, 24576 * mb, "qwen3next: and 24576 MiB the cache never allocates");
+    case_figure("%zu layer(s) demoted, %zu MiB host KV", owned.demoted_layers.size(), owned.host_kv_bytes_added / mb);
     return 0;
 }
 
@@ -3146,6 +3162,7 @@ static int case_qwen38_indexer_buffer_backstop() {
     std::vector<uint8_t> fewer = member;
     fewer[3]                   = 0;
     CHECK_EQ(kv_buffer_device_bytes(owner, fewer, index_bytes, device), 704 * mb, "qwen38: a non-member layer");
+    case_figure("indexer buffer %zu MiB against %zu MiB free", index_device / mb, headroom / mb);
     return 0;
 }
 
@@ -3210,6 +3227,7 @@ static int case_qwen38_indexer_budget_c10240() {
     CHECK(with.fits, "qwen38 c10240: fits with the indexer keys budgeted");
     CHECK(with.demoted_layers == (std::vector<int>{ 47 }), "qwen38 c10240: the last attention layer is demoted");
     CHECK(indexer_fits(with), "qwen38 c10240: and both buffers land");
+    case_figure("layer %d demoted, both buffers land", with.demoted_layers[0]);
     return 0;
 }
 
@@ -3219,6 +3237,7 @@ static int run_case(const char * name, int (*fn)()) {
     if (only != nullptr && std::string(only) != name) {
         return 0;
     }
+    g_case_figure.clear();
     const int rc = fn();
     if (rc == LLAMA_TEST_EXIT_SKIP) {  // ctest's skip code: say so, so a skipped case is never mistaken for a pass
         std::fprintf(stderr, "case %s SKIPPED: it proves nothing on this platform\n", name);
@@ -3226,6 +3245,8 @@ static int run_case(const char * name, int (*fn)()) {
     }
     if (rc != 0) {
         std::fprintf(stderr, "case %s failed\n", name);
+    } else {
+        std::printf("PASS: case %s%s%s\n", name, g_case_figure.empty() ? "" : ": ", g_case_figure.c_str());
     }
     return rc;
 }
