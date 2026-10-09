@@ -27518,7 +27518,8 @@ static bool planner_moe_gateup_bundle4_enabled() {
 // the weight/KV co-assignment in the dense-layer packing loop below so an
 // attention layer's KV can be charged and placed independently of that same
 // layer's dense weights, instead of the two being summed into one on/off-device
-// decision. Default off reproduces today's combined-charge behavior exactly.
+// decision. Pinned, the planner also holds no KV context room before the routed experts (llama.cpp-8ecj); default
+// off, the dense pass charges weights only and the KV phase after it charges the KV and holds that room.
 static bool planner_kv_pin_device_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_KV_PIN_DEVICE");
@@ -31187,6 +31188,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     //     is there and the KV fits, and holds the room the opening context adds (hold_kv_context_room), so KV that
     //     does not fit goes to the host tier and never moves a dense layer there
     //   - the GGML_SYCL_KV_PIN_DEVICE diagnostic charges each layer's KV ahead of its weights inside the dense pass
+    //     and holds no context room
     //   - MoE experts remain individually placeable, packed (as whole triplets) into what the KV phase leaves
     //
     // When the VRAM arena is active, subtract compute scratch and oneDNN
@@ -31372,11 +31374,13 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     // The KV phase: device residency goes dense weights, then KV, then routed experts. Every dense layer has had its
     // claim above; each device layer's KV is charged here, then the room the context the model opens with needs on
     // top of that is held, and only then are the experts packed into what is left. With the KV pinned ahead of the
-    // weights (GGML_SYCL_KV_PIN_DEVICE) the per-layer charge already ran inside the dense loop.
+    // weights (GGML_SYCL_KV_PIN_DEVICE) the per-layer charge already ran inside the dense loop and no room is held:
+    // the diagnostic keeps the placement it had before the room.
+    kv_context_room room;
     if (!planner_kv_pin_device_enabled()) {
         plan_single_device_layer_kv(plan, kv_info, layer_has_attention, device_id, remaining);
+        room = hold_kv_context_room(plan, kv_info, device_id, remaining);
     }
-    kv_context_room room = hold_kv_context_room(plan, kv_info, device_id, remaining);
 
     // MoE expert entries: budget-aware placement at (layer, expert) triplet
     // granularity.  A layer executor consumes gate/up/down for the same routed

@@ -10,7 +10,9 @@ test-sycl-kv-layer-owners-source pins.)
 The fix this gate pins:
   - compute_placement_plan packs in three phases, in order: the dense pass charges weights only; the KV phase charges
     each device layer's KV and then holds the room the context the model opens with needs on top of it; only then
-    are the routed experts packed into what is left;
+    are the routed experts packed into what is left. Under the GGML_SYCL_KV_PIN_DEVICE diagnostic the dense pass
+    charges each layer's KV itself and the KV phase does nothing: no per-layer charge and no room, so pinned mode
+    keeps the behaviour it had before the room;
   - the room is capped at what is left and counted in the plan's device bytes, and the runtime transaction's KV
     re-derivation drops it;
   - the expert pack runs a second first-fit budget with the room added back, and the room's cost is NET: the device
@@ -119,7 +121,7 @@ INVENTORY_STRUCT = "struct ggml_sycl_tensor_inventory {"
 
 DENSE_LOOP = "for (const auto & [layer_id, indices] : dense_layer_indices) {"
 LAYER_KV_CALL = "plan_single_device_layer_kv(plan, kv_info, layer_has_attention, device_id, remaining);"
-ROOM_CALL = "kv_context_room room = hold_kv_context_room(plan, kv_info, device_id, remaining);"
+ROOM_CALL = "room = hold_kv_context_room(plan, kv_info, device_id, remaining);"
 EXPERT_PASS = "auto moe_groups = build_moe_triplet_groups(plan, moe_indices, &hotness_source);"
 WEIGHTS_ONLY = "on_device = weight_charge <= remaining; target = on_device ? device_id : -1; kv_on_device = false;"
 
@@ -127,12 +129,15 @@ WEIGHTS_ONLY = "on_device = weight_charge <= remaining; target = on_device ? dev
 # ---- (a) the three phases, in order -------------------------------------------------------------------------------
 
 
+KV_PHASE = ("kv_context_room room; if (!planner_kv_pin_device_enabled()) { " + LAYER_KV_CALL + " " + ROOM_CALL
+            + " }")
+
+
 def claim_phases_are_dense_kv_experts(cache: str) -> bool:
-    """Dense pass, then the per-layer KV charge (outside the pin diagnostic), then the context's room, then experts:
-    each exactly once."""
+    """Dense pass, then the KV phase (the per-layer KV charge and the context's room, both outside the pin
+    diagnostic, so pinned mode holds no room), then experts: each exactly once."""
     b = body(norm(cache), PLAN_SIG)
-    return (bool(b) and ordered(b, DENSE_LOOP, "if (!planner_kv_pin_device_enabled()) { " + LAYER_KV_CALL + " }",
-                                ROOM_CALL, EXPERT_PASS)
+    return (bool(b) and ordered(b, DENSE_LOOP, KV_PHASE, EXPERT_PASS)
             and b.count(LAYER_KV_CALL) == 1 and b.count(ROOM_CALL) == 1 and b.count(EXPERT_PASS) == 1)
 
 
@@ -295,6 +300,13 @@ def test_mutant_experts_first_fails():
     mutant = mutant.replace("add_dense_woq_alternates(plan, remaining, device_id);",
                             ROOM_CALL + " add_dense_woq_alternates(plan, remaining, device_id);", 1)
     assert ROOM_CALL in mutant
+    assert not claim_phases_are_dense_kv_experts(mutant)
+
+
+def test_mutant_room_held_under_the_pin_fails():
+    """The room held whatever the pin says: pinned mode would lose experts to a room it never had."""
+    mutant = _once(CACHE, KV_PHASE, "kv_context_room room; if (!planner_kv_pin_device_enabled()) { " + LAYER_KV_CALL
+                   + " } " + ROOM_CALL)
     assert not claim_phases_are_dense_kv_experts(mutant)
 
 
