@@ -808,7 +808,7 @@ void case_ledger_log_levels() {
     CHECK(l.check(7, 0, 1000, false).level == LOAD_LOG_LEVEL_WARN,
           "a transaction that is not the open load is a caller defect: WARN");
     CHECK(l.check(7, 0, 1000, true).level == LOAD_LOG_LEVEL_INFO,
-          "no early term recorded is the expected answer until L6: INFO, once");
+          "no early term recorded: INFO, once (the loader WARNs it)");
     CHECK(l.check(7, 0, 1000, true).level == LOAD_LOG_LEVEL_NONE, "and silent the second time");
     CHECK(l.record(7, 0, 1000, 8192, true), "recorded");
     CHECK(l.check(7, 0, 1000, true).level == LOAD_LOG_LEVEL_WARN, "equal: WARN, so a default run shows the pass");

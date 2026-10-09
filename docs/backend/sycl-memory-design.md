@@ -2756,9 +2756,12 @@ shared zone, and the buffer took whatever the allocator found. On the B70 with Q
   chunks are summed. That is the allocator's grain and nothing more: there is no headroom in the term.
 - `unified_cache_get_planned_runtime_zone_requirement` adds the term, with the overflow checked, so
   `ensure_planned_arena_zones` sizes RUNTIME for the buffer before `compute_placement_plan` packs the weights.
-- At the **admitted** stage, right after the pack, the loader measures c(P) at the packed placement. c(P) above C-hat,
-  or a device with no probe bound, refuses the load as `compute-slot-exceeds-probe-bound`. Otherwise c(P) is recorded
-  in the load's ledger, and the **late** check compares the final placement against it.
+- At the **admitted** stage, right after the pack, the loader measures c(P) at the packed placement. It compares c(P)
+  with C-hat in the reservation's units: both are sized by `ggml_backend_sycl_load_compute_term_bytes`, the reserve's
+  own rule, not as raw sums. c(P) above C-hat, or a device with no probe bound, refuses the load as
+  `compute-slot-exceeds-probe-bound`. Otherwise c(P) is recorded in the load's ledger, and the **late** check compares
+  the final placement against it. A device the backend declined to reserve for is not compared and not recorded: its
+  compute buffer stays unplanned, as before p6i0.
 - A late check that matches prints one WARN per device and load:
   `[LOAD-PLAN] late check on device N: compute term equal (X MiB), early reservation stands`. A pass that printed
   nothing could not be told from a check that never ran.
@@ -2784,8 +2787,12 @@ recovery path: it measures the driver's working set and sizes the headroom from 
 **Limits.**
 
 - The term is measured at the load's measure shape, `n_ctx_train` and ubatch 512, because the caller's `-c` and `-ub`
-  do not reach the load (R2). A `-c` below `n_ctx_train`, llama-bench's small `n_ctx` and `-ub 256` all over-reserve.
-  A `-ub` above 512 under-reserves, and the excess takes the legacy chain as before. `llama.cpp-fkpg` (a) transports
+  do not reach the load (`llama.cpp-fkpg`). A `-c` below `n_ctx_train`, llama-bench's small `n_ctx` and `-ub 256` all
+  over-reserve. Above 512 the term under-reserves, and that is the **default** for a dense model, not only an explicit
+  `-ub`: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch` of 2048 a dense model's auto pick
+  climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a 448.0 MB compute buffer at the auto
+  2048, `zone=runtime`, in RUNTIME slack. Where no slack is left, the ladder's own fit check keeps the pick lower. MoE
+  models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the auto pick's. `llama.cpp-fkpg` (a) transports
   the caller's shape.
 - A second model whose term is larger than the live one's raises the RUNTIME requirement. The late zone rebuild is
   refused while the first model holds allocations, so that load reaches the abort in

@@ -15806,7 +15806,7 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
             return false;
         }
     }
-    // llama.cpp-p6i0 (R2 discriminator): the placement each stage's measure runs over, so a difference between
+    // llama.cpp-p6i0, for the compute trace: the placement each stage's measure runs over, so a difference between
     // the stages' compute terms can be read against what the plan put on the host.
     GGML_LOG_INFO(
         "[LOAD-PLAN] measure plan override: load %llu stage %d: weights %.1f MiB device, %.1f MiB host; "

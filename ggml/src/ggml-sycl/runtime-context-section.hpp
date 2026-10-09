@@ -444,10 +444,11 @@ class load_compute_ledger {
     // this ledger.
     //   not open                                    NOT_RECORDED, WARN on every call (a transaction
     //                                               that is no load is a caller defect)
-    //   open, nothing recorded for the key          NOT_RECORDED, INFO ONCE per (load, device): this is the
-    //                                               expected answer until L6 records anything, a load that
-    //                                               records nothing asks every device once, and the line
-    //                                               would repeat per call
+    //   open, nothing recorded for the key          NOT_RECORDED, INFO ONCE per (load, device): the answer
+    //                                               for a device the admitted stage did not record (an
+    //                                               unmeasurable model, a device with no reservation, a
+    //                                               backend without the load procs), which the loader
+    //                                               reports at WARN itself; the line would repeat per call
     //   late == admitted                            EQUAL, the equal WARN once per (load, device): a pass that
     //                                               printed nothing could not be told from a check that never ran
     //   late  > admitted                            REFUSED, the late string, ERROR

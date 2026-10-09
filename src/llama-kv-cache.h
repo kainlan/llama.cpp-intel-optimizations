@@ -13,8 +13,8 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
-// The KV residency of every llama_kv_cache built on this thread while a tally is open (llama.cpp-p6i0, R2
-// discriminator): how many KV layers a cache put in a device buffer, in the SYCL host-tier KV buffer, and in a
+// The KV residency of every llama_kv_cache built on this thread while a tally is open (llama.cpp-p6i0, for the
+// compute trace): how many KV layers a cache put in a device buffer, in the SYCL host-tier KV buffer, and in a
 // CPU buffer because the layer is not offloaded. A real cache also prints its count; a load-time measure's
 // cache prints nothing (the measure-only context is quiet below ERROR), so the measure reads its count here.
 struct llama_kv_residency_tally {

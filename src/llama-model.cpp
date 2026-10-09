@@ -2595,7 +2595,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // (a) the probe measure, llama.cpp-p6i0: the probe placement's compute term C-hat, before the late plan
         // packs the weights, handed to the backend as a planned RUNTIME term so the pack leaves the compute buffer
         // its room. It is measured at n_ctx_train and ubatch 512: the caller's -c and -ub do not reach the load
-        // (fkpg (a)), so the term is that shape's, not the context's (R2).
+        // (fkpg (a)), so the term is that shape's, not the context's. A dense model's default auto ubatch climbs
+        // above 512 into whatever room is left; that part is not reserved.
         std::vector<llama_measure_dummy_entry> probe_weights;
         for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
             probe_weights.push_back({ ctx_key.buft, ctx_ptr.get() });

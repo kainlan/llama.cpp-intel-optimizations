@@ -3271,9 +3271,10 @@ void llama_context::tenant_plan_report(const sched_measure_plan & plan, uint32_t
     }
 }
 
-// llama.cpp-p6i0 (R2 discriminator): the compute trace, one line per compute buffer type and graph, in one
-// format for the load-time measure (side=measure) and the allocating reserve (side=reserve), so the measured
-// term and the real compute buffer can be compared chunk by chunk.
+// llama.cpp-p6i0: the compute trace, one line per compute buffer type and graph, in one format for the load-time
+// measure (side=measure) and the allocating reserve (side=reserve), so the measured term and the real compute buffer
+// can be compared chunk by chunk. A difference in the shape line is the caller's -c and -ub, which do not reach the
+// load (fkpg); a difference at the same shape is the placement.
 static const char * llama_compute_trace_kind_name(llama_measure_kind kind) {
     switch (kind) {
         case LLAMA_MEASURE_KIND_PP:
@@ -3885,7 +3886,7 @@ std::string llama_measure_unsupported_reason(const llama_model & model) {
     return "";
 }
 
-// The measure's side of the compute trace (llama.cpp-p6i0, R2 discriminator): its shape and KV residency, then
+// The measure's side of the compute trace (llama.cpp-p6i0): its shape and KV residency, then
 // one line per compute buffer type and graph, then each buffer type's per-chunk peak, which is the term.
 static std::vector<std::string> llama_load_measure_trace(const sched_measure_plan &       plan,
                                                          enum ggml_sycl_measure_stage     stage,
@@ -3940,7 +3941,7 @@ llama_load_measure_result llama_load_measure_run(const llama_model &            
     // exit it clears first and the context (which owns the backends once its constructor has taken them
     // from `args`) goes after; on a throw from the constructor the context has already unwound, and the
     // override clears next.
-    // The KV residency of the caches the measure context builds (the R2 discriminator's KV line); declared
+    // The KV residency of the caches the measure context builds (the compute trace's KV line); declared
     // before the holder so the count outlives the context.
     llama_kv_residency_tally       kv_tally;
     llama_kv_residency_tally_scope kv_tally_scope(kv_tally);

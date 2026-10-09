@@ -398,7 +398,7 @@ llama_kv_cache::llama_kv_cache(
         layers.push_back({ il, k, v, k_stream, v_stream, });
     }
 
-    // llama.cpp-p6i0 (R2 discriminator): where this cache's KV layers went. The SYCL planner can demote a layer's KV
+    // llama.cpp-p6i0, for the compute trace: where this cache's KV layers went. The SYCL planner can demote a layer's KV
     // to the host-tier buffer, which moves that layer's attention to the CPU and adds graph splits.
     LLAMA_LOG_INFO("%s: [LOAD-PLAN] kv residency: %u layer(s) on device, %u on the host KV tier, %u on CPU%s\n",
                    __func__, residency.n_device, residency.n_host, residency.n_cpu,

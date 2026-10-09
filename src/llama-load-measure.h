@@ -184,9 +184,6 @@ inline std::string llama_load_measure_refusal_text(enum ggml_sycl_measure_stage 
            " on device " + std::to_string(device) + ": " + reason + " (refused)";
 }
 
-// The shape a load-time measure uses: n_ubatch is the auto ladder's bottom rung (the smallest ubatch any
-// context of this load can end up with, from the helper the real context's trial reads), and the caller's
-// n_ctx, the training context for 0; every other parameter is the default.
 // The KV shape of a measure context built with `params`, which the plan override's KV re-fit sizes for
 // (llama.cpp-p6i0). Every field is the params' own, so the re-fit and the context agree.
 inline struct ggml_sycl_measure_kv_shape llama_load_measure_kv_shape(const llama_context_params & params) {
@@ -206,6 +203,11 @@ inline uint32_t llama_load_measure_n_ctx(uint32_t n_ctx, uint32_t n_ctx_train) {
     return n_ctx != 0 ? n_ctx : n_ctx_train;
 }
 
+// The shape a load-time measure uses: n_ubatch is the auto ladder's bottom rung (from the helper the real context's
+// trial reads), and the caller's n_ctx, the training context for 0; every other parameter is the default. The bottom
+// rung is the ubatch a MoE model's auto pick stays at (its cap is MOE_GPU_UBATCH_MAX) and the one a pinned -ub 512
+// runs at. A dense model's auto pick climbs above it, to 2048 at the default n_batch, into whatever room the zones
+// have left: that larger buffer is not reserved. The caller's -c and -ub do not reach the load (fkpg).
 inline llama_context_params llama_load_measure_context_params(uint32_t n_ctx, uint32_t n_ctx_train) {
     llama_context_params params = llama_context_default_params();
     params.n_ctx                = llama_load_measure_n_ctx(n_ctx, n_ctx_train);
@@ -239,7 +241,7 @@ struct llama_load_measure_result {
     std::string                            refusal;              // the named refusal when !ok
     std::vector<llama_load_measure_device> devices;
     int                                    n_splits = 0;         // the most splits any measured graph took
-    // llama.cpp-p6i0 (R2 discriminator): the measure's per-buffer-type, per-graph chunk peaks and splits, its
+    // llama.cpp-p6i0 (the compute trace): the measure's per-buffer-type, per-graph chunk peaks and splits, its
     // shape and its KV residency, as INFO lines. The measure-only context is quiet while it lives, so
     // llama_load_measure prints them once the context is gone.
     std::vector<std::string>               trace;
@@ -310,8 +312,8 @@ inline std::string llama_late_check_not_recorded_text(int32_t device, uint32_t n
 // buft's when the peaks need more chunks than allowed, and that comes back as the measure's own failure
 // naming the stage. (SYCL_CpuOffloadCompute does refuse under a plan scope, by design.) The refusal text's
 // device field is the first SYCL device's, so a host-tier refusal reads "on device N" while its reason names
-// SYCL_Host or SYCL_CpuActivation, whichever is the compute buft. (llama has no probe or admitted call site
-// yet; the backend planner's stages will read the host term from the same result.)
+// SYCL_Host or SYCL_CpuActivation, whichever is the compute buft. The probe and admitted stages skip the host tier
+// the same way (llama_load_probe_bound, llama_admitted_check_fold): no host term is reserved or recorded.
 inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs &                    procs,
                                                      struct ggml_sycl_load_txn                      txn,
                                                      const std::vector<llama_load_measure_device> & devices,
