@@ -43,11 +43,15 @@ static int                          g_clears     = 0;
 static uint64_t                     g_txn        = 0;
 static enum ggml_sycl_measure_stage g_stage      = GGML_SYCL_MEASURE_STAGE_PROBE;
 static bool                         g_install_ok = true;
+static const ggml_sycl_measure_kv_shape * g_kv_shape   = nullptr;
 
-static bool fake_install(uint64_t load_txn, enum ggml_sycl_measure_stage stage) {
+static bool fake_install(uint64_t                           load_txn,
+                         enum ggml_sycl_measure_stage       stage,
+                         const ggml_sycl_measure_kv_shape * kv_shape) {
     g_installs++;
-    g_txn   = load_txn;
-    g_stage = stage;
+    g_txn      = load_txn;
+    g_stage    = stage;
+    g_kv_shape = kv_shape;
     return g_install_ok;
 }
 
@@ -64,14 +68,18 @@ static void reset_fakes(bool install_ok) {
 }
 
 static void test_guard() {
-    // installed: the entry sees the load and the stage, and the destructor clears once
+    const ggml_sycl_measure_kv_shape shape = { 4096, 512, 1, false, false };
+
+    // installed: the entry sees the load, the stage and the KV shape, and the destructor clears once
     reset_fakes(true);
     {
-        llama_measure_plan_override guard({ &fake_install, &fake_clear }, 42, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B);
+        llama_measure_plan_override guard({ &fake_install, &fake_clear }, 42, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B,
+                                          &shape);
         CHECK(guard.installed(), "the override did not install");
         CHECK(guard.failure() == nullptr, "an installed guard names a failure");
         CHECK(g_installs == 1 && g_txn == 42 && g_stage == GGML_SYCL_MEASURE_STAGE_CANDIDATE_B,
               "install saw txn %llu stage %d", (unsigned long long) g_txn, (int) g_stage);
+        CHECK(g_kv_shape == &shape, "install did not see the measure's KV shape");
         CHECK(g_clears == 0, "cleared while still held");
     }
     CHECK(g_clears == 1, "the destructor cleared %d times", g_clears);
@@ -79,7 +87,7 @@ static void test_guard() {
     // a throw through the scope clears once
     reset_fakes(true);
     try {
-        llama_measure_plan_override guard({ &fake_install, &fake_clear }, 7, GGML_SYCL_MEASURE_STAGE_PROBE);
+        llama_measure_plan_override guard({ &fake_install, &fake_clear }, 7, GGML_SYCL_MEASURE_STAGE_PROBE, &shape);
         throw std::runtime_error("unwind");
     } catch (const std::runtime_error &) {
     }
@@ -88,7 +96,7 @@ static void test_guard() {
     // a refused install (a nest, or no plan staged) names itself and never clears
     reset_fakes(false);
     {
-        llama_measure_plan_override guard({ &fake_install, &fake_clear }, 1, GGML_SYCL_MEASURE_STAGE_PROBE);
+        llama_measure_plan_override guard({ &fake_install, &fake_clear }, 1, GGML_SYCL_MEASURE_STAGE_PROBE, &shape);
         CHECK(!guard.installed(), "a refused install reads as installed");
         CHECK(guard.failure() != nullptr && std::strcmp(guard.failure(), "plan override nested") == 0,
               "the refusal is named %s", guard.failure() ? guard.failure() : "(null)");
@@ -104,7 +112,7 @@ static void test_guard() {
             procs = { nullptr, nullptr };
         }
         {
-            llama_measure_plan_override guard(procs, 1, GGML_SYCL_MEASURE_STAGE_PROBE);
+            llama_measure_plan_override guard(procs, 1, GGML_SYCL_MEASURE_STAGE_PROBE, &shape);
             CHECK(!guard.installed(), "case %d: installed with a missing proc", which);
             CHECK(guard.failure() != nullptr && std::strcmp(guard.failure(), "plan override proc missing") == 0,
                   "case %d: the refusal is named %s", which, guard.failure() ? guard.failure() : "(null)");
@@ -296,6 +304,26 @@ static void test_late_check_fold() {
     }
 }
 
+// The KV shape the override's re-fit sizes for is the measure context's own: every field from the params the
+// measure builds the context with (llama.cpp-p6i0).
+static void test_measure_kv_shape() {
+    for (uint32_t n_ctx : { 0u, 4096u }) {
+        llama_context_params params            = llama_load_measure_context_params(n_ctx, 262144);
+        params.n_seq_max                       = 3;
+        params.kv_unified                      = true;
+        params.swa_full                        = true;
+        const ggml_sycl_measure_kv_shape shape = llama_load_measure_kv_shape(params);
+        CHECK(shape.n_ctx == params.n_ctx && shape.n_ubatch == params.n_ubatch && shape.n_seq_max == 3 &&
+                  shape.kv_unified && shape.swa_full,
+              "n_ctx %u: the shape is %u/%u/%u/%d/%d", n_ctx, shape.n_ctx, shape.n_ubatch, shape.n_seq_max,
+              (int) shape.kv_unified, (int) shape.swa_full);
+    }
+    const ggml_sycl_measure_kv_shape d = llama_load_measure_kv_shape(llama_load_measure_context_params(0, 262144));
+    CHECK(d.n_ctx == 262144 && !d.kv_unified == !llama_context_default_params().kv_unified &&
+              !d.swa_full == !llama_context_default_params().swa_full,
+          "the default shape is %u/%d/%d", d.n_ctx, (int) d.kv_unified, (int) d.swa_full);
+}
+
 static void test_refusal_text() {
     CHECK(llama_load_measure_refusal_text(GGML_SYCL_MEASURE_STAGE_PROBE, 2, "r") ==
               "[LOAD-PLAN] compute-slot measure failed at probe on device 2: r (refused)",
@@ -447,6 +475,7 @@ int main() {
     test_quiet_scope();
     test_refusal_text();
     test_measure_params_tie_to_the_ladder();
+    test_measure_kv_shape();
     if (n_failed != 0) {
         fprintf(stderr, "%d check(s) failed\n", n_failed);
         return 1;

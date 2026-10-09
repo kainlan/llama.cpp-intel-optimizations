@@ -3939,7 +3939,10 @@ llama_load_measure_result llama_load_measure_run(const llama_model &            
     llama_kv_residency_tally       kv_tally;
     llama_kv_residency_tally_scope kv_tally_scope(kv_tally);
     std::unique_ptr<llama_context> holder;
-    llama_measure_plan_override    guard(procs, load_txn, stage);
+    // The context's params come first: the override re-fits the plan's KV residency for their KV shape.
+    const llama_context_params       params   = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train);
+    const ggml_sycl_measure_kv_shape kv_shape = llama_load_measure_kv_shape(params);
+    llama_measure_plan_override      guard(procs, load_txn, stage, &kv_shape);
     if (!guard.installed()) {
         out.refusal = llama_load_measure_refusal_text(stage, first_device, guard.failure());
         return out;
@@ -3947,7 +3950,6 @@ llama_load_measure_result llama_load_measure_run(const llama_model &            
 
     args.stage = stage;
 
-    const llama_context_params params = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train);
     try {
         holder.reset(new llama_context(model, params, &args));
     } catch (const llama_measure_unsupported & e) {

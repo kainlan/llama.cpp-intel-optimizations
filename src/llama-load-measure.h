@@ -59,20 +59,24 @@ void llama_context_sycl_measure_override_procs_override_for_testing(
 // KV read see it, and on every exit, a throw included, it clears first, then the context goes, then the
 // backends.
 //
-// A missing proc installs nothing and names itself; an install that answers false (a nest, or no plan
-// staged for the load) installs nothing and names itself. The measure then refuses by that name and
-// never runs without the override.
+// `kv_shape` is the measure context's KV shape (llama_load_measure_kv_shape): the backend re-fits the
+// staged plan's KV residency for it, so the measure's KV sits where the context's will (llama.cpp-p6i0).
+//
+// A missing proc installs nothing and names itself; an install that answers false (a nest, no plan
+// staged for the load, or a KV re-fit the backend refused) installs nothing and names itself. The
+// measure then refuses by that name and never runs without the override.
 class llama_measure_plan_override {
   public:
-    llama_measure_plan_override(const llama_measure_override_procs & procs,
-                                uint64_t                             load_txn,
-                                enum ggml_sycl_measure_stage         stage) :
+    llama_measure_plan_override(const llama_measure_override_procs &      procs,
+                                uint64_t                                  load_txn,
+                                enum ggml_sycl_measure_stage              stage,
+                                const struct ggml_sycl_measure_kv_shape * kv_shape) :
         clear_fn(procs.clear) {
         if (procs.install == nullptr || procs.clear == nullptr) {
             failure_text = "plan override proc missing";
             return;
         }
-        if (!procs.install(load_txn, stage)) {
+        if (!procs.install(load_txn, stage, kv_shape)) {
             failure_text = "plan override nested";
             return;
         }
@@ -183,6 +187,18 @@ inline std::string llama_load_measure_refusal_text(enum ggml_sycl_measure_stage 
 // The shape a load-time measure uses: n_ubatch is the auto ladder's bottom rung (the smallest ubatch any
 // context of this load can end up with, from the helper the real context's trial reads), and the caller's
 // n_ctx, the training context for 0; every other parameter is the default.
+// The KV shape of a measure context built with `params`, which the plan override's KV re-fit sizes for
+// (llama.cpp-p6i0). Every field is the params' own, so the re-fit and the context agree.
+inline struct ggml_sycl_measure_kv_shape llama_load_measure_kv_shape(const llama_context_params & params) {
+    struct ggml_sycl_measure_kv_shape shape;
+    shape.n_ctx      = params.n_ctx;
+    shape.n_ubatch   = params.n_ubatch;
+    shape.n_seq_max  = params.n_seq_max;
+    shape.kv_unified = params.kv_unified;
+    shape.swa_full   = params.swa_full;
+    return shape;
+}
+
 inline llama_context_params llama_load_measure_context_params(uint32_t n_ctx, uint32_t n_ctx_train) {
     llama_context_params params = llama_context_default_params();
     params.n_ctx                = n_ctx != 0 ? n_ctx : n_ctx_train;

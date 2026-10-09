@@ -15663,7 +15663,100 @@ bool ggml_backend_sycl_has_active_placement_plan(void) {
 // written only here.  Install builds nothing: it finds the plan moua staged for the
 // load -- the probe placement's at (a), the load's candidate at (b) and (c) -- and
 // holds it, in the candidate's shape, for this thread until clear.
-bool ggml_backend_sycl_measure_plan_override_install(uint64_t load_txn, ggml_sycl_measure_stage stage) {
+// llama.cpp-p6i0: the KV residency a context of `shape` would get under the staged plan, as a copy of the
+// snapshot. It runs the runtime-context transaction's own fit (plan_runtime_kv_residency) on the same input
+// that transaction builds, with one difference: a device's headroom is what the plan leaves for KV in the
+// shared zone (its capacity less the plan's non-KV device bytes), not the live free space the transaction
+// reads, because a measure runs before any weight is allocated, and optional layout copies are not counted
+// as headroom, since none exists yet either. The two headrooms can differ (the live one sees allocations
+// as they landed, the planned one the pack's charges); where they do, the measure's residency can differ
+// from the context's. Returns null, with the reason in `why`, where the transaction would refuse.
+static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_measure_refit_kv(
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & staged,
+    const ggml_sycl_measure_kv_shape &                                shape,
+    std::string &                                                     why) {
+    const ggml_sycl::placement_plan & load_plan = *staged->plan;
+    std::vector<int>    devices = load_plan.multi_device ? load_plan.devices : std::vector<int>{ load_plan.device_id };
+    // the plan's own non-KV device bytes, at the load-time KV shape it was packed with
+    std::vector<size_t> headroom;
+    for (size_t i = 0; i < devices.size(); ++i) {
+        const int    device = devices[i];
+        const size_t budget = load_plan.multi_device && i < load_plan.per_device_vram_budgets.size() ?
+                                  load_plan.per_device_vram_budgets[i] :
+                                  load_plan.vram_budget;
+        size_t       non_kv = load_plan.weight_vram_bytes;
+        if (load_plan.multi_device) {
+            const size_t used = i < load_plan.per_device_vram.size() ? load_plan.per_device_vram[i] : 0;
+            const size_t kv   = load_plan.device_kv_vram_bytes(device);
+            non_kv            = used > kv ? used - kv : 0;
+        }
+        const size_t capacity = ggml_sycl::unified_cache_kv_weight_capacity(device, budget, load_plan.multi_device);
+        headroom.push_back(capacity > non_kv ? capacity - non_kv : 0);
+    }
+
+    ggml_sycl::placement_kv_info kv_info = staged->kv_info;
+    if (shape.n_ubatch > 0) {
+        kv_info.n_ubatch = shape.n_ubatch;
+    }
+    kv_info.n_ctx            = shape.n_ctx;
+    kv_info.n_ctx_is_runtime = true;
+    kv_info.n_seq_max        = shape.n_seq_max;
+    kv_info.kv_unified       = shape.kv_unified;
+    kv_info.swa_full         = shape.swa_full;
+
+    ggml_sycl::placement_plan plan(load_plan);
+    plan.planner_n_ctx      = shape.n_ctx;
+    plan.planner_n_ubatch   = kv_info.n_ubatch;
+    plan.planner_n_seq_max  = shape.n_seq_max;
+    plan.planner_kv_unified = shape.kv_unified;
+    plan.planner_swa_full   = shape.swa_full;
+    plan.update_runtime_kv_sizes(shape.n_ctx, kv_info.kv_bytes_per_layer(), kv_info.kv_bytes_per_swa_layer());
+    if (!plan.load_kv_device_valid) {
+        plan.load_kv_device       = plan.kv_device;
+        plan.load_kv_device_valid = true;
+    }
+
+    const size_t                  n_kv_layers = plan.kv_layer_count();
+    ggml_sycl::kv_residency_input fit_in;
+    fit_in.load_kv_device.resize(n_kv_layers);
+    fit_in.layer_kv_bytes.resize(n_kv_layers);
+    fit_in.swa_layer_mask.assign(plan.swa_layer_mask.begin(), plan.swa_layer_mask.end());
+    for (size_t l = 0; l < n_kv_layers; ++l) {
+        const auto load_it       = plan.load_kv_device.find((int) l);
+        fit_in.load_kv_device[l] = load_it == plan.load_kv_device.end() ? -1 : load_it->second;
+        fit_in.layer_kv_bytes[l] = plan.kv_size_for_layer(static_cast<uint32_t>(l));
+    }
+    fit_in.devices   = devices;
+    fit_in.available = headroom;
+
+    const ggml_sycl::kv_residency_result fit = ggml_sycl::plan_runtime_kv_residency(fit_in);
+    if (!fit.fits) {
+        why = "the KV of n_ctx " + std::to_string(shape.n_ctx) + " does not fit device " +
+              std::to_string(fit.refused_device) + " even with every layer on the host tier";
+        return nullptr;
+    }
+    plan.kv_device = plan.load_kv_device;
+    for (size_t l = 0; l < n_kv_layers; ++l) {
+        if (fit.kv_device[l] != fit_in.load_kv_device[l]) {
+            plan.kv_device[(int) l] = fit.kv_device[l];
+        }
+    }
+    plan.refresh_kv_byte_totals();
+    plan.refresh_layer_block_kv_devices();
+    if (!plan.rebuild_runtime_per_device_vram()) {
+        why = "the per-device KV accounting failed for n_ctx " + std::to_string(shape.n_ctx);
+        return nullptr;
+    }
+
+    auto out     = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*staged);
+    out->kv_info = kv_info;
+    out->plan    = std::make_shared<const ggml_sycl::placement_plan>(std::move(plan));
+    return out;
+}
+
+bool ggml_backend_sycl_measure_plan_override_install(uint64_t                                  load_txn,
+                                                     ggml_sycl_measure_stage                   stage,
+                                                     const struct ggml_sycl_measure_kv_shape * kv_shape) {
     if (g_measure_plan_override) {
         GGML_LOG_WARN("[CONTEXT-PLAN-BUG] measure plan override nested\n");
         if (ggml_sycl::ggml_sycl_strict_enabled()) {
@@ -15685,6 +15778,20 @@ bool ggml_backend_sycl_measure_plan_override_install(uint64_t load_txn, ggml_syc
         GGML_LOG_WARN("[LOAD-PLAN] measure plan override: no plan staged for load %llu at stage %d\n",
                       (unsigned long long) load_txn, (int) stage);
         return false;
+    }
+    if (kv_shape != nullptr) {
+        std::string why;
+        try {
+            snapshot = ggml_sycl_measure_refit_kv(snapshot, *kv_shape, why);
+        } catch (const std::exception & e) {
+            snapshot.reset();
+            why = e.what();
+        }
+        if (!snapshot) {
+            GGML_LOG_WARN("[LOAD-PLAN] measure plan override: the KV re-fit for load %llu at stage %d refused: %s\n",
+                          (unsigned long long) load_txn, (int) stage, why.c_str());
+            return false;
+        }
     }
     // llama.cpp-p6i0 (R2 discriminator): the placement each stage's measure runs over, so a difference between
     // the stages' compute terms can be read against what the plan put on the host.

@@ -102,10 +102,12 @@ def run_ok(code: str) -> bool:
     order = [
         "llama_measure_unsupported_reason(model)",
         "std::unique_ptr<llama_context> holder;",
-        "llama_measure_plan_override guard(procs, load_txn, stage);",
+        # llama.cpp-p6i0: the params come first, so the override re-fits the plan's KV for their KV shape
+        "const llama_context_params params = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train);",
+        "const ggml_sycl_measure_kv_shape kv_shape = llama_load_measure_kv_shape(params);",
+        "llama_measure_plan_override guard(procs, load_txn, stage, &kv_shape);",
         "if (!guard.installed())",
         "args.stage = stage;",
-        "llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train)",
         "holder.reset(new llama_context(model, params, &args));",
         "catch (const llama_measure_unsupported & e)",
         "catch (const std::exception & e)",
@@ -339,6 +341,8 @@ def test_run_mutants():
         ("unsupported read as a refusal", "catch (const llama_measure_unsupported & e) {\n        out.unsupported = true;\n        out.refusal", "catch (const llama_measure_unsupported & e) {\n        out.refusal"),
         ("a refusal outside the text", "out.refusal = llama_load_measure_refusal_text(stage, first_device, e.what());\n        return out;\n    }\n\n    const", "out.refusal = e.what();\n        return out;\n    }\n\n    const"),
         ("the shape hand-written", "llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train)", "llama_context_default_params()"),
+        ("no KV shape for the re-fit", "guard(procs, load_txn, stage, &kv_shape);", "guard(procs, load_txn, stage, nullptr);"),
+        ("the KV shape not the context's", "llama_load_measure_kv_shape(params);", "llama_load_measure_kv_shape(llama_context_default_params());"),
     ]:
         assert not run_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
 
@@ -360,6 +364,34 @@ def test_the_refusal_text_is_one():
     b = function_body(code, _REFUSAL)
     assert not refusal_ok(code.replace(b, mutate(b, "(refused)", "(failed)"), 1))
     assert not refusal_ok(code.replace(z('return "late";'), z('return "later";'), 1))
+
+
+_KV_SHAPE = "inline struct ggml_sycl_measure_kv_shape llama_load_measure_kv_shape(const llama_context_params & params)"
+
+
+def kv_shape_ok(code: str) -> bool:
+    """llama.cpp-p6i0: the re-fit's KV shape is every KV field of the measure context's params, and nothing else."""
+    b = function_body(code, _KV_SHAPE)
+    want = [
+        "shape.n_ctx = params.n_ctx;",
+        "shape.n_ubatch = params.n_ubatch;",
+        "shape.n_seq_max = params.n_seq_max;",
+        "shape.kv_unified = params.kv_unified;",
+        "shape.swa_full = params.swa_full;",
+    ]
+    return all(b.count(z(w)) == 1 for w in want) and b.count("shape.") == len(want)
+
+
+def test_the_kv_shape_is_the_contexts():
+    code = code_of(MEASURE_H)
+    assert kv_shape_ok(code)
+    b = function_body(code, _KV_SHAPE)
+    for old, new in [
+        ("shape.n_ctx = params.n_ctx;", "shape.n_ctx = 512;"),
+        ("shape.swa_full = params.swa_full;", "shape.swa_full = false;"),
+        ("shape.n_seq_max = params.n_seq_max;", "shape.n_seq_max = 1;"),
+    ]:
+        assert not kv_shape_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {old!r} slipped through"
 
 
 def test_the_measure_shape_comes_from_the_ladder():

@@ -1841,15 +1841,34 @@ GGML_BACKEND_API bool ggml_backend_sycl_has_active_placement_plan(void);
 // calling thread answers from the plan named by `stage` for the load `load_txn`,
 // and nothing is published.  Written only by these two functions; llama reaches them
 // through one RAII guard.  Install returns false (and installs nothing) when an
-// override is already installed on this thread or no plan is staged for the load.
+// override is already installed on this thread, no plan is staged for the load, or
+// the KV re-fit for `kv_shape` refuses (it says why at WARN).
 enum ggml_sycl_measure_stage {
     GGML_SYCL_MEASURE_STAGE_PROBE       = 0,  // (a): the probe placement's unpublished plan
     GGML_SYCL_MEASURE_STAGE_CANDIDATE_B = 1,  // (b): the load's candidate plan
     GGML_SYCL_MEASURE_STAGE_CANDIDATE_C = 2,  // (c): the load's candidate plan, after the sync
 };
 
-GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_override_install(uint64_t                     load_txn,
-                                                                      enum ggml_sycl_measure_stage stage);
+// The KV shape of the context a measure builds (llama.cpp-p6i0).  Given one, install re-fits the staged plan's KV
+// residency for that shape before it holds the plan, with the fit a context's runtime-context transaction runs
+// (plan_runtime_kv_residency), against the KV headroom the plan leaves in the shared zone rather than the live one,
+// which does not exist before the weights are allocated.  The measure's KV then sits where the context's will: a
+// layer the fit demotes to the host KV tier moves its attention to the CPU, and the measure sees those splits.
+// NULL holds the plan as staged.
+struct ggml_sycl_measure_kv_shape {
+    uint32_t n_ctx;
+    uint32_t n_ubatch;
+    uint32_t n_seq_max;
+    bool     kv_unified;
+    bool     swa_full;
+};
+
+GGML_SYCL_ABI_ASSERT(sizeof(struct ggml_sycl_measure_kv_shape) == 16, "measure KV shape layout changed");
+
+GGML_BACKEND_API bool ggml_backend_sycl_measure_plan_override_install(
+    uint64_t                                  load_txn,
+    enum ggml_sycl_measure_stage              stage,
+    const struct ggml_sycl_measure_kv_shape * kv_shape);
 GGML_BACKEND_API void ggml_backend_sycl_measure_plan_override_clear(void);
 
 // === Per-context chunk-cap copy and plan scopes ===
