@@ -16,7 +16,10 @@ calls them, and calls them the way the tests assume.
   C. Wait census.  The expert-id readback (ggml_sycl_copy_ids_to_host) is timed as B1 in its own
      block; the per-token line is a GGML_LOG_WARN, so it survives the default log threshold; a CPU
      job join is timed as MOE_WAIT_JOIN and classified only inside moe_hostpath_wait_end, after the
-     enabled check, so a run without GGML_SYCL_MOE_IDS_COPY_TRACE reads no tensor name.
+     enabled check, so a run without GGML_SYCL_MOE_IDS_COPY_TRACE reads no tensor name.  The down
+     activation gather's wait is B4; the graph-boundary flush (ggml_sycl_cpu_tg_flush_pending) opens
+     with the B7 context and the hot-group flush runs under the B4b context, which are the B7 and B4b
+     figures the lane's acceptance reads.
 
   P. pending_any.  ggml_sycl_cpu_tg_pending_any reads every slot that can hold scatter state between
      graphs: the direct-scatter list, the pending slot and its sibling (each with its previous
@@ -24,7 +27,9 @@ calls them, and calls them the way the tests assume.
      recording call reach its exit with state the exit hook does not see.
 
   R. Retired GGML_SYCL_PIPELINE_CPU.  ggml_check_sycl calls ggml_sycl_pipeline_cpu_warn_retired at
-     init, so the WARN does not depend on a host-expert decode reaching the CPU dispatch.  The WARN
+     init, in the settings-report block itself and not under its `if (!overrides.empty())`, so a run
+     that sets only the retired variable still hears about it.  The helper latches through a
+     `static const bool`, so the init call and the dispatch-site call log one WARN between them.  The WARN
      and the env-var row cite llama.cpp-ytc9 and defer the direction under llama.cpp-3oju9.
 
 WHAT THIS DOES NOT PROVE.  It reads source text with comments blanked.  It does not show which
@@ -184,6 +189,20 @@ def check_census(src: Source) -> None:
     joins = re.findall(r"moe_hostpath_wait_timer\s+\w+\(\s*MOE_WAIT_JOIN\s*,\s*slot\.dst_tensor\s*\)\s*;", code)
     if len(joins) != 1:
         raise ContractError(f"C: expected one MOE_WAIT_JOIN timer on slot.dst_tensor, found {len(joins)}")
+    flat = squash(code)
+    gather = re.findall(r"moe_hostpath_wait_timer \w+\(MOE_WAIT_B4\); sycl::event::wait\(copy_events\);", flat)
+    if len(gather) != 1:
+        raise ContractError(f"C: expected the down activation gather's wait timed as B4 once, found {len(gather)}")
+    _, boundary = src.body(r"void ggml_sycl_cpu_tg_flush_pending\(\)")
+    if not re.match(r"\{\s*moe_hostpath_wait_context\s+\w+\(\s*MOE_WAIT_B7\s*\)\s*;", boundary):
+        raise ContractError("C: ggml_sycl_cpu_tg_flush_pending does not open with the B7 wait context")
+    hot = re.findall(
+        r"dispatch_cpu_and_scatter\(hot_entries, hot_first, pregather\); "
+        r"moe_hostpath_wait_context \w+\(MOE_WAIT_B4B\); flush_pending_cpu_scatter\(\);",
+        flat,
+    )
+    if len(hot) != 1:
+        raise ContractError(f"C: expected the hot-group flush under the B4b wait context once, found {len(hot)}")
     _, end = src.body(
         r"static void moe_hostpath_wait_end\(int natural, const ggml_tensor \* joined, moe_hostpath_clock::time_point t0\)"
     )
@@ -230,10 +249,16 @@ def check_pending_any(src: Source) -> None:
 
 
 def check_retired(src: Source, doc: str) -> None:
-    _, init = src.body(r"static void ggml_check_sycl\(\)")
-    if not re.search(r"\bggml_sycl_pipeline_cpu_warn_retired\(\)\s*;", init):
-        raise ContractError("R: ggml_check_sycl does not call ggml_sycl_pipeline_cpu_warn_retired at init")
+    init_at, init = src.body(r"static void ggml_check_sycl\(\)")
+    calls = list(re.finditer(r"\bggml_sycl_pipeline_cpu_warn_retired\(\)\s*;", init))
+    if len(calls) != 1:
+        raise ContractError(f"R: ggml_check_sycl must call ggml_sycl_pipeline_cpu_warn_retired once, found {len(calls)}")
+    block = squash(src.innermost_block(init_at + calls[0].start()))
+    if not block.startswith("{ std::string overrides;"):
+        raise ContractError(f"R: the init call is not in the settings-report block itself: {block[:120]}")
     _, helper = src.body(r"static void ggml_sycl_pipeline_cpu_warn_retired\(\)")
+    if not re.search(r"\bstatic\s+const\s+bool\s+set\s*=\s*\[", helper):
+        raise ContractError("R: the retired WARN no longer latches through `static const bool set`")
     text = "".join(re.findall(r"\"((?:[^\"\\]|\\.)*)\"", helper))
     for need in ("GGML_SYCL_PIPELINE_CPU is retired", "llama.cpp-ytc9", "llama.cpp-3oju9"):
         if need not in text:
@@ -325,6 +350,24 @@ MUTANTS = [
         "    const int cls = ggml_sycl::moe_hostpath_wait_classify(",
     ),
     (
+        "C6 down activation gather retagged B2",
+        BACKEND,
+        "moe_hostpath_wait_timer wait_timer(MOE_WAIT_B4);\n                sycl::event::wait(copy_events);",
+        "moe_hostpath_wait_timer wait_timer(MOE_WAIT_B2);\n                sycl::event::wait(copy_events);",
+    ),
+    (
+        "C7 boundary flush's B7 context dropped",
+        BACKEND,
+        "void ggml_sycl_cpu_tg_flush_pending() {\n    moe_hostpath_wait_context boundary_waits(MOE_WAIT_B7);\n",
+        "void ggml_sycl_cpu_tg_flush_pending() {\n",
+    ),
+    (
+        "C8 hot-group flush's B4b context dropped",
+        BACKEND,
+        "                        moe_hostpath_wait_context hot_join(MOE_WAIT_B4B);\n",
+        "",
+    ),
+    (
         "P1 (M2) sibling slot dropped from pending_any",
         BACKEND,
         "g_pending_scatter_sibling.active || g_pending_scatter_sibling.prev_bufs.pending ||",
@@ -348,6 +391,24 @@ MUTANTS = [
         BACKEND,
         "            ggml_sycl_pipeline_cpu_warn_retired();\n        }\n",
         "        }\n",
+    ),
+    (
+        "R4 (A) retired WARN no longer latched: init and dispatch would each log",
+        BACKEND,
+        "    static const bool set = [] {\n        const bool present = getenv(\"GGML_SYCL_PIPELINE_CPU\")",
+        "    const bool set = [] {\n        const bool present = getenv(\"GGML_SYCL_PIPELINE_CPU\")",
+    ),
+    (
+        "R5 (H) init call only when another setting is non-default",
+        BACKEND,
+        "                GGML_LOG_WARN(\"[SYCL] non-default settings in effect: %s\\n\", overrides.c_str());\n"
+        "            }\n"
+        "            // A retired variable is not in sycl_env_settings; say it is ignored here, once,\n"
+        "            // rather than only when a host-expert decode first reaches the CPU dispatch.\n"
+        "            ggml_sycl_pipeline_cpu_warn_retired();\n",
+        "                GGML_LOG_WARN(\"[SYCL] non-default settings in effect: %s\\n\", overrides.c_str());\n"
+        "                ggml_sycl_pipeline_cpu_warn_retired();\n"
+        "            }\n",
     ),
     (
         "R2 WARN no longer cites 3oju9",
