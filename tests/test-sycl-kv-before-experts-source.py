@@ -214,8 +214,9 @@ def claim_runtime_rederivation_drops_the_room(hpp: str) -> bool:
 
 
 def claim_loader_hands_the_opening_context(model: str, sycl: str, header: str) -> bool:
-    """The inventory carries the probe measure's own n_ctx (n_ctx_train for an unspecified -c), in the struct's tail
-    padding, and the backend copies it into its KV inputs."""
+    """The inventory carries the probe measure's own n_ctx (n_ctx_train for an unspecified -c), right after
+    kv_layer_count and before the indexer widths (the KV tail ggml-sycl.cpp pins with static_asserts), and the backend
+    copies it into its KV inputs."""
     pop = body(norm(model), POPULATE_SIG)
     h   = norm(header)
     at  = h.find(INVENTORY_STRUCT)
@@ -223,7 +224,8 @@ def claim_loader_hands_the_opening_context(model: str, sycl: str, header: str) -
     want = ("inventory.n_ctx_context = llama_load_measure_n_ctx(llama_model_sycl_make_placement_envelope()"
             ".n_ctx, hparams.n_ctx_train);")
     return (bool(pop) and want in pop
-            and inv.endswith("uint32_t kv_layer_count; uint32_t n_ctx_context; }")
+            and inv.endswith("uint32_t kv_layer_count; uint32_t n_ctx_context; "
+                             "const uint32_t * kv_idx_k_width_per_layer; }")
             and "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;" in norm(sycl))
 
 
@@ -353,8 +355,9 @@ def test_mutant_loader_keeps_the_planning_context_fails():
 
 
 def test_mutant_field_appended_after_padding_fails():
-    """A field after a new member moves the struct's tail, which this layout rule forbids."""
-    mutant = _once(SYCL_H, "uint32_t n_ctx_context; };", "uint32_t n_ctx_context; size_t spare; };")
+    """A field inserted into the KV tail moves the fields the consumer reads at pinned offsets."""
+    mutant = _once(SYCL_H, "uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; };",
+                   "uint32_t n_ctx_context; size_t spare; const uint32_t * kv_idx_k_width_per_layer; };")
     assert not claim_loader_hands_the_opening_context(MODEL, SYCL, mutant)
 
 

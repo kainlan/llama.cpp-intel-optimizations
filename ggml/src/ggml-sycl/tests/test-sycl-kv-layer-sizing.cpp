@@ -907,10 +907,9 @@ static void test_kv_layer_bytes_for_kind_keeps_its_results() {
 //     the other 36 are recurrent and hold neither. At 262144 cells a layer's
 //     K/V is 512 MiB and its indexer keys 64 MiB.
 //
-//     Every budget (the planner's charge, the plan's per-layer size) must
-//     count 576 MiB a layer: without the indexer keys, -c 10240 kept all 12
-//     attention layers on the device with 27.6 MiB left for the 30 MiB
-//     indexer buffer and the context failed. And
+//     Every budget (the planner's charge and room, the plan's per-layer size)
+//     must count 576 MiB a layer: without the indexer keys the room left
+//     748.6 MiB for the 768 MiB indexer buffer and the context failed. And
 //     each of llama's two buffers must be sized from its own cache with no
 //     WARN: measured against the 576 MiB total, both would read as truth
 //     exceeding the buffer on every load.
@@ -956,9 +955,12 @@ static void test_qwen38_indexer_keys_budgeted_and_sized_per_buffer() {
     check_eq("qwen38: the indexer keys alone", kv.kv_idx_bytes_for_layer_at(3, 262144), 64 * mib);
     check_eq("qwen38: a recurrent layer holds no KV", kv.kv_bytes_for_layer(0), 0u);
 
-    // the load's view: both caches charged at its n_ctx=512
+    // the load's view: charged at n_ctx=512, the room for n_ctx_train=262144 on top
     placement_kv_info load = make_qwen38(512, 512);
+    load.n_ctx_context     = 262144;
     check_eq("qwen38: the load charges both caches at n_ctx", load.kv_bytes_for_layer(3), 1152u * 1024u);
+    check_eq("qwen38: the room holds both caches' growth", load.kv_context_extra_bytes_for_layer(3),
+             576 * mib - 1152u * 1024u);
 
     placement_plan plan{};
     plan.swa_layer_mask.assign(48, false);

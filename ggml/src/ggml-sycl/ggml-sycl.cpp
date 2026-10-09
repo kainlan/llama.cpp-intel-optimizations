@@ -17020,6 +17020,7 @@ static bool ggml_sycl_other_backend_context_live(int device, const ggml_backend_
 // place without any error. These pin the KV tail of the layout (llama.cpp-8ecj).
 static_assert(sizeof(ggml_sycl_tensor_inventory) == 184, "ggml_sycl_tensor_inventory layout changed");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168, "kv_layer_count moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172, "n_ctx_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176, "kv_idx_k_width_per_layer moved");
 
 // Phase A helper: populate inventory + KV + MoE globals from the inventory

@@ -742,16 +742,8 @@ struct placement_kv_info {
                                        n_seq_max, kv_unified, swa_full);
     }
 
-    // What the context the model opens with needs on top of the KV charged at n_ctx for layer `il`: 0 when that
-    // context is unknown or no larger.
-    size_t kv_context_extra_bytes_for_layer(uint32_t il) const {
-        const size_t at_context = kv_bytes_for_layer_at(il, n_ctx_context);
-        const size_t charged    = kv_bytes_for_layer(il);
-        return at_context > charged ? at_context - charged : 0;
-    }
-
     // The indexer keys of layer `il` at `ctx` tokens: the same cells as the layer's K/V, K only. Part of
-    // kv_bytes_for_layer(), which is what every budget charges; on its own for the allocator, which sizes the
+    // kv_bytes_for_layer_at(), which is what every budget charges; on its own for the allocator, which sizes the
     // indexer buffer apart from the K/V one (llama.cpp-8ecj).
     size_t kv_idx_bytes_for_layer_at(uint32_t il, uint32_t ctx) const {
         if (!valid() || ctx == 0 || !has_per_layer_kv_truth(il) || idx_k_width(il) == 0) {
@@ -759,6 +751,14 @@ struct placement_kv_info {
         }
         return kv_layer_bytes_for_kind(layer_kind[il], idx_k_width(il), 0, ctx, n_swa, n_ubatch, n_seq_max, kv_unified,
                                        swa_full);
+    }
+
+    // What the context the model opens with needs on top of the KV charged at n_ctx for layer `il`: 0 when that
+    // context is unknown or no larger.
+    size_t kv_context_extra_bytes_for_layer(uint32_t il) const {
+        const size_t at_context = kv_bytes_for_layer_at(il, n_ctx_context);
+        const size_t charged    = kv_bytes_for_layer(il);
+        return at_context > charged ? at_context - charged : 0;
     }
 };
 
