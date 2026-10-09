@@ -677,20 +677,27 @@ struct placement_kv_info {
         return swa_layer_mask[layer_id];
     }
 
-    size_t kv_bytes_per_layer() const {
-        if (!valid()) {
+    size_t kv_bytes_per_layer() const { return kv_bytes_per_layer(n_ctx); }
+
+    // A representative full-attention layer at a context of `ctx` tokens, at the global width. The uniform fallback
+    // of kv_bytes_for_layer_at() forwards here, so this formula is the only one for it (llama.cpp-8ecj).
+    size_t kv_bytes_per_layer(uint32_t ctx) const {
+        if (!valid() || ctx == 0) {
             return 0;
         }
         // llama.cpp-3aos: routed through kv_layer_bytes_for_kind()'s FULL
         // branch (numerically identical -- that branch does not consult
         // n_swa/n_ubatch/n_seq_max/kv_unified/swa_full) so the arithmetic
         // lives in exactly one place, matching kv_bytes_per_swa_layer() below.
-        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_FULL, n_embd_k_gqa, n_embd_v_gqa, n_ctx, n_swa, n_ubatch,
+        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_FULL, n_embd_k_gqa, n_embd_v_gqa, ctx, n_swa, n_ubatch,
                                        n_seq_max, kv_unified, swa_full);
     }
 
-    size_t kv_bytes_per_swa_layer() const {
-        if (!valid() || n_swa == 0) {
+    size_t kv_bytes_per_swa_layer() const { return kv_bytes_per_swa_layer(n_ctx); }
+
+    // A representative SWA layer at a context of `ctx` tokens; 0 when the model has no window.
+    size_t kv_bytes_per_swa_layer(uint32_t ctx) const {
+        if (!valid() || ctx == 0 || n_swa == 0) {
             return 0;
         }
         // Must match the actual SWA KV size from llama_kv_cache_iswa:
@@ -705,7 +712,7 @@ struct placement_kv_info {
         // kv_bytes_for_layer() below once layer_kind/layer_k_width/
         // layer_v_width are populated.
         // Tensor per layer: K=[n_embd_k_gqa, size_swa] + V=[n_embd_v_gqa, size_swa], both fp16.
-        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_SWA, n_embd_k_gqa, n_embd_v_gqa, n_ctx, n_swa, n_ubatch,
+        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_SWA, n_embd_k_gqa, n_embd_v_gqa, ctx, n_swa, n_ubatch,
                                        n_seq_max, kv_unified, swa_full);
     }
 
@@ -733,13 +740,7 @@ struct placement_kv_info {
                                            n_seq_max, kv_unified, swa_full) +
                    kv_idx_bytes_for_layer_at(il, ctx);
         }
-        if (is_swa_layer(static_cast<int>(il))) {
-            return n_swa == 0 ? 0 :
-                                kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_SWA, n_embd_k_gqa, n_embd_v_gqa, ctx, n_swa,
-                                                        n_ubatch, n_seq_max, kv_unified, swa_full);
-        }
-        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_FULL, n_embd_k_gqa, n_embd_v_gqa, ctx, n_swa, n_ubatch,
-                                       n_seq_max, kv_unified, swa_full);
+        return is_swa_layer(static_cast<int>(il)) ? kv_bytes_per_swa_layer(ctx) : kv_bytes_per_layer(ctx);
     }
 
     // The indexer keys of layer `il` at `ctx` tokens: the same cells as the layer's K/V, K only. Part of

@@ -222,6 +222,22 @@ def claim_extra_is_the_context_minus_the_charge(hpp: str) -> bool:
                         "return at_context > charged ? at_context - charged : 0;"))
 
 
+KV_AT_SIG = "size_t kv_bytes_for_layer_at(uint32_t il, uint32_t ctx) const"
+UNIFORM_FALLBACK = "return is_swa_layer(static_cast<int>(il)) ? kv_bytes_per_swa_layer(ctx) : kv_bytes_per_layer(ctx);"
+
+
+def claim_uniform_fallback_has_one_formula(hpp: str) -> bool:
+    """Without per-layer truth, a layer at `ctx` is the representative full or SWA layer at `ctx`: the room and the
+    charge forward to kv_bytes_per_layer(ctx)/kv_bytes_per_swa_layer(ctx) and never restate their formula."""
+    n = norm(hpp)
+    at = body(n, KV_AT_SIG)
+    full = body(n, "size_t kv_bytes_per_layer(uint32_t ctx) const")
+    return (bool(at) and UNIFORM_FALLBACK in at and "n_embd_k_gqa" not in at
+            and "size_t kv_bytes_per_layer() const { return kv_bytes_per_layer(n_ctx); }" in n
+            and "size_t kv_bytes_per_swa_layer() const { return kv_bytes_per_swa_layer(n_ctx); }" in n
+            and "n_embd_k_gqa, n_embd_v_gqa, ctx," in full)
+
+
 def claim_runtime_rederivation_drops_the_room(hpp: str) -> bool:
     """Once the runtime transaction re-derives the KV totals for its real shape, the room is no longer counted."""
     b = body(norm(hpp), REFRESH_SIG)
@@ -273,6 +289,10 @@ def test_room_line_is_visible_and_names_its_limit():
 
 def test_extra_is_the_context_minus_the_charge():
     assert claim_extra_is_the_context_minus_the_charge(CACHE_HPP)
+
+
+def test_uniform_fallback_has_one_formula():
+    assert claim_uniform_fallback_has_one_formula(CACHE_HPP)
 
 
 def test_runtime_rederivation_drops_the_room():
@@ -413,3 +433,21 @@ def test_mutant_field_appended_after_padding_fails():
 def test_mutant_backend_drops_the_context_fails():
     assert not claim_loader_hands_the_opening_context(
         MODEL, _once(SYCL, "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;", ""), SYCL_H)
+
+
+def test_mutant_uniform_fallback_restated_fails():
+    """The fallback's own copy of the full-attention formula, as before: two sources for one layer's KV."""
+    assert not claim_uniform_fallback_has_one_formula(
+        _once(CACHE_HPP, UNIFORM_FALLBACK,
+              "return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_FULL, n_embd_k_gqa, n_embd_v_gqa, ctx, n_swa, "
+              "n_ubatch, n_seq_max, kv_unified, swa_full);"))
+
+
+def test_mutant_helper_ignores_ctx_fails():
+    """The helper sized at the planning n_ctx whatever context it is asked about: the room would be 0."""
+    n = norm(CACHE_HPP)
+    full = body(n, "size_t kv_bytes_per_layer(uint32_t ctx) const")
+    at_ctx = "n_embd_k_gqa, n_embd_v_gqa, ctx,"
+    assert full.count(at_ctx) == 1
+    mutant = n.replace(full, full.replace(at_ctx, "n_embd_k_gqa, n_embd_v_gqa, n_ctx,"), 1)
+    assert not claim_uniform_fallback_has_one_formula(mutant)
