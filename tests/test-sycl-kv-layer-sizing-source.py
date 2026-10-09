@@ -1022,7 +1022,11 @@ def kv_headroom_wiring_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
             not re.search(r"\bkv_multi_device\s*=\s*lifecycle_owner\s*&&\s*lifecycle_owner->plan\s*&&\s*"
                           r"lifecycle_owner->plan->multi_device\s*;", alloc):
         found.append("the allocator's KV headroom is not asked for the plan's multi_device")
-    counted = alloc[alloc.find("std::vector<int>    layer_owner(n_layers, -1);"):alloc.find("kv_admission_mismatch(")]
+    # The owner walk, from layer_owner's declaration (alignment whitespace free) to the backstop; empty when either
+    # end is missing, so the claim below fails instead of reading a slice of the wrong text.
+    owner_decl = re.search(r"std::vector<int>\s+layer_owner\(", alloc)
+    counted_end = alloc.find("kv_admission_mismatch(")
+    counted = alloc[owner_decl.start():counted_end] if owner_decl and counted_end > owner_decl.start() else ""
     if not re.search(r"kv_buffer_layer_owner\([^;]*,\s*kv_host_val\s*==\s*1\s*\)\s*;", counted):
         found.append("planned_device_bytes does not count GGML_SYCL_KV_HOST=1 as host-owned")
     backstop = re.search(r"if\s*\(\s*ggml_sycl::kv_admission_mismatch\(\s*planned_device_bytes\s*,\s*kv_vram_cap\s*\)"
