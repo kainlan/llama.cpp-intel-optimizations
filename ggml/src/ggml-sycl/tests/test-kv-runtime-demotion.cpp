@@ -3060,6 +3060,47 @@ static int case_i6_single_gap_oracle() {
 }
 
 // Runs a case unless KRT_ONLY names another one (a RED capture runs one case alone).
+// llama.cpp-8ecj: what the overflow re-placement demotes for a Qwen3-Next-shaped model at its trained context
+// (48 layers, full attention on every 4th, KV width 512 for K and V, f16, n_ctx 262144) on a device whose KV room
+// after the weights is 287.8 MB, under one 512 MiB layer. When the inventory charges only the layers the KV cache
+// holds, the other 36 have 0 bytes and the walk skips them: 12 layers, 6144 MiB, layers 3..47. When it charges
+// every layer has_kv() passes, the same walk demotes 48 layers and 24576 MiB of KV the cache never allocates.
+static int case_qwen3next_kv_owner_shape() {
+    const size_t   mb       = 1024 * 1024;
+    const int      n_layers = 48;
+    const uint32_t n_ctx    = 262144;
+    const size_t   width    = 512;
+    auto           demote   = [&](bool owners_only) {
+        kv_device_fit_input in;
+        in.device   = 0;
+        in.capacity = 287 * mb + 8 * mb / 10;
+        in.layer_kv_bytes.assign(n_layers, 0);
+        in.kv_device.assign(n_layers, 0);
+        in.swa_layer_mask.assign(n_layers, 0);
+        for (int il = 0; il < n_layers; ++il) {
+            const bool    owns    = !owners_only || il % 4 == 3;
+            const uint8_t kind    = owns ? ggml_sycl::KV_CELLS_FULL : ggml_sycl::KV_CELLS_SHARED;
+            in.layer_kv_bytes[il] = kv_layer_cells(kind, n_ctx, 512, 1, true, false, 0) * (width + width) * 2;
+        }
+        return plan_device_kv_fit(in);
+    };
+
+    const kv_demotion_result owned = demote(true);
+    CHECK(owned.fits, "qwen3next: fits with the attention layers on the host tier");
+    CHECK_EQ(owned.demoted_layers.size(), 12, "qwen3next: the 12 layers the KV cache holds are demoted");
+    CHECK_EQ(owned.host_kv_bytes_added, 6144 * mb, "qwen3next: 6144 MiB of host KV");
+    CHECK_EQ(*std::min_element(owned.demoted_layers.begin(), owned.demoted_layers.end()), 3, "qwen3next: first 3");
+    CHECK_EQ(*std::max_element(owned.demoted_layers.begin(), owned.demoted_layers.end()), 47, "qwen3next: last 47");
+    for (int l : owned.demoted_layers) {
+        CHECK(l % 4 == 3, "qwen3next: only full-attention layers are demoted");
+    }
+
+    const kv_demotion_result over = demote(false);
+    CHECK_EQ(over.demoted_layers.size(), 48, "qwen3next: charging every has_kv() layer demotes 48");
+    CHECK_EQ(over.host_kv_bytes_added, 24576 * mb, "qwen3next: and 24576 MiB the cache never allocates");
+    return 0;
+}
+
 static int run_case(const char * name, int (*fn)()) {
     const char * only = std::getenv("KRT_ONLY");
     if (only != nullptr && std::string(only) != name) {
@@ -4047,6 +4088,9 @@ int main() {
         return rc;
     }
     if (int rc = run_case("i7_yield_span_under_a_range", case_i7_yield_span_under_a_range)) {
+        return rc;
+    }
+    if (int rc = run_case("qwen3next_kv_owner_shape", case_qwen3next_kv_owner_shape)) {
         return rc;
     }
     std::printf("test-kv-runtime-demotion: all ok\n");

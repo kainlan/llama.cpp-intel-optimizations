@@ -4338,6 +4338,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-8ecj: the SYCL inventory charges KV only for the layers the KV cache holds. The per-layer KV kind comes
+# from the memory a default context builds (llama_kv_layer_owners_default), so a hybrid model's recurrent layers cost
+# nothing; has_kv() stays only for a memory kind the shapes do not model. A mutant per claim, the has_kv() rule among
+# them. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-kv-layer-owners-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kv-layer-owners-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-pyu4: executes the pure helpers in src/llama-auto-ubatch.h --
 # llama_auto_ubatch_ladder_has_candidate(), the predicate behind the trial's
 # early exit before its ladder loop, on the shapes where no rung lies in
