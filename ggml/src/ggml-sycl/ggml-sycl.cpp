@@ -116174,7 +116174,7 @@ static bool ggml_backend_sycl_test_seed_global_runtime_pinned_owners() {
     auto & q = ggml_sycl_get_device(0).default_queue();
     g_expert_prefetchers[0].init(q);
     g_pinned_buffer_pools[0].init(q, 0, 2, 4, 4);
-    g_cpu_expert_pools[0].init(1, 2, 4, 4, q);
+    g_cpu_expert_pools[0].init(1);
     void * staging = ggml_sycl_staging_pool().acquire(256, q);
     if (!staging) {
         return false;
