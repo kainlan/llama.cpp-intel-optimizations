@@ -943,18 +943,19 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
         GGML_ASSERT(tasks[i].type != GGML_TYPE_Q1_0 && tasks[i].type != GGML_TYPE_NVFP4 &&
                     "Q1_0/NVFP4 MoE must use its admitted host recipe");
     }
-    if (n_tasks <= 0 || !tasks) {
-        return;
-    }
-
-    GGML_UNUSED(n_threads);  // TBB arena size set globally via ggml_sycl_cpu_threads_hint
-
+    // Reset before any return, so a call that computes nothing reports no rows
+    // rather than the previous call's.
     const bool                         trace = ggml_sycl_cpu_expert_trace_enabled();
     cpu_expert_trace_clock::time_point trace_t0;
     if (trace) {
         g_cpu_expert_batched_last = {};
         trace_t0                  = cpu_expert_trace_clock::now();
     }
+    if (n_tasks <= 0 || !tasks) {
+        return;
+    }
+
+    GGML_UNUSED(n_threads);  // TBB arena size set globally via ggml_sycl_cpu_threads_hint
 
     // --- Phase 1: Pre-quantize unique activation vectors ---
     // Multiple experts in the same layer share the same activation input.

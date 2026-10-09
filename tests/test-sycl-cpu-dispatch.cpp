@@ -433,6 +433,15 @@ static bool test_trace_phase_type_key() {
         return false;
     }
 
+    // A call with no tasks reports no rows, not the previous call's.
+    ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), 0, 0);
+    ph = ggml_sycl_cpu_expert_batched_last_phase_times();
+    if (ph.rows != 0 || ph.bytes != 0 || ph.type != GGML_TYPE_COUNT) {
+        printf("FAIL (empty call: type=%d rows=%d bytes=%llu, want no rows)\n", (int) ph.type, ph.rows,
+               (unsigned long long) ph.bytes);
+        return false;
+    }
+
     printf("OK\n");
     return true;
 }
@@ -462,10 +471,12 @@ static bool test_pool_trace_per_type() {
     ggml_sycl::cpu_expert_pool_trace_add_job(t, 10, trace_job(GGML_TYPE_Q2_0, 25600, 6000000, 22, 2000.0), 5, 2100,
                                              false);
     ggml_sycl::cpu_expert_pool_trace_add_job(t, 2, trace_job(GGML_TYPE_COUNT, 100, 1000, 3, 10.0), 5, 20, false);
+    // A job that ran no row loop goes to the no-row slot, not to mixed.
+    ggml_sycl::cpu_expert_pool_trace_add_job(t, 1, trace_job(GGML_TYPE_COUNT, 0, 0, 0, 0.0), 5, 7, false);
 
     // The all-type totals are unchanged by the split.
-    if (t.jobs != 4 || t.tasks != 32 || t.rows != 38500 || t.threads != 57 || t.compute_us != 3510.0 ||
-        t.wake_us != 20.0 || t.wall_us != 3820.0) {
+    if (t.jobs != 5 || t.tasks != 33 || t.rows != 38500 || t.threads != 57 || t.compute_us != 3510.0 ||
+        t.wake_us != 25.0 || t.wall_us != 3827.0) {
         printf("FAIL (all-type totals: jobs=%llu rows=%llu compute=%.0f)\n", (unsigned long long) t.jobs,
                (unsigned long long) t.rows, t.compute_us);
         return false;
@@ -480,9 +491,11 @@ static bool test_pool_trace_per_type() {
         return false;
     }
     if (t.by_type[GGML_TYPE_Q2_0].jobs != 1 || t.by_type[GGML_TYPE_COUNT].jobs != 1 ||
-        t.by_type[GGML_TYPE_Q4_0].jobs != 0) {
-        printf("FAIL (slots: q2_0=%llu mixed=%llu q4_0=%llu)\n", (unsigned long long) t.by_type[GGML_TYPE_Q2_0].jobs,
+        t.by_type[GGML_TYPE_COUNT + 1].jobs != 1 || t.by_type[GGML_TYPE_Q4_0].jobs != 0) {
+        printf("FAIL (slots: q2_0=%llu mixed=%llu none=%llu q4_0=%llu)\n",
+               (unsigned long long) t.by_type[GGML_TYPE_Q2_0].jobs,
                (unsigned long long) t.by_type[GGML_TYPE_COUNT].jobs,
+               (unsigned long long) t.by_type[GGML_TYPE_COUNT + 1].jobs,
                (unsigned long long) t.by_type[GGML_TYPE_Q4_0].jobs);
         return false;
     }
@@ -491,7 +504,8 @@ static bool test_pool_trace_per_type() {
     const std::string want =
         " iq3_s:jobs=2,rows=12800,bytes=3000000,compute=1500us,gbps=2.00,thr=16.0/20,ovl=1"
         " q2_0:jobs=1,rows=25600,bytes=6000000,compute=2000us,gbps=3.00,thr=22.0/22,ovl=0"
-        " mixed:jobs=1,rows=100,bytes=1000,compute=10us,gbps=0.10,thr=3.0/3,ovl=0";
+        " mixed:jobs=1,rows=100,bytes=1000,compute=10us,gbps=0.10,thr=3.0/3,ovl=0"
+        " none:jobs=1,rows=0,bytes=0,compute=0us,gbps=0.00,thr=0.0/0,ovl=0";
     if (got != want) {
         printf("FAIL (summary)\n  got:  '%s'\n  want: '%s'\n", got.c_str(), want.c_str());
         return false;

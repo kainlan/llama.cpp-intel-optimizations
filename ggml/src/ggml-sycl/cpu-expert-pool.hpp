@@ -94,7 +94,9 @@ struct cpu_expert_pool_trace_totals {
     double   wall_us     = 0.0;
 
     // The same jobs split by the weight type of their rows (llama.cpp-y9i6).
-    // Slot GGML_TYPE_COUNT holds the jobs whose rows mix types.
+    // Slot GGML_TYPE_COUNT holds the jobs whose rows mix types, and slot
+    // GGML_TYPE_COUNT + 1 the jobs that ran no row loop: the batched kernel
+    // returned before it, or every task took the MXFP4 multi-activation path.
     //   threads_max  most threads one job of the type ran on
     //   overlapped   jobs that started while another pool job was running: the
     //                pools share one CPU arena, so those jobs' compute times
@@ -109,13 +111,14 @@ struct cpu_expert_pool_trace_totals {
         double   compute_us  = 0.0;
     };
 
-    type_totals by_type[GGML_TYPE_COUNT + 1];
+    type_totals by_type[GGML_TYPE_COUNT + 2];
 };
 
 void cpu_expert_pool_trace_take(cpu_expert_pool_trace_totals & out);
 void cpu_expert_pool_trace_note_join(bool was_ready);
 
-// Adds one finished job to `totals`, in the job's type slot as well.
+// Adds one finished job to `totals`, in the job's type slot as well (the
+// no-row slot when ph.rows is 0, whatever ph.type says).
 void cpu_expert_pool_trace_add_job(cpu_expert_pool_trace_totals &         totals,
                                    size_t                                 n_tasks,
                                    const cpu_expert_batched_phase_times & ph,
@@ -123,8 +126,9 @@ void cpu_expert_pool_trace_add_job(cpu_expert_pool_trace_totals &         totals
                                    double                                 wall_us,
                                    bool                                   overlapped);
 
-// The per-type summary: for each type with a job, in enum order and the mixed
-// slot last, " <type>:jobs=J,rows=R,bytes=B,compute=Cus,gbps=G,thr=A/M,ovl=O",
+// The per-type summary: for each type with a job, in enum order, then "mixed"
+// and "none" for the two extra slots,
+// " <type>:jobs=J,rows=R,bytes=B,compute=Cus,gbps=G,thr=A/M,ovl=O",
 // where G is bytes over the summed compute time (decimal GB/s), A the mean and
 // M the most threads per job. Empty when there were no jobs.
 std::string cpu_expert_pool_trace_format_types(const cpu_expert_pool_trace_totals & totals);
