@@ -385,8 +385,9 @@ static void test_admitted_fold() {
         const llama_admitted_check_result            r =
             llama_admitted_check_fold(procs, probe, {}, {}, admitted, 4096, 512, kv_probe, kv_probe);
         CHECK(!r.refusal.empty(), "a c(P) larger than the reservation in its own units was admitted");
-        CHECK(r.refusal.find("768 B") != std::string::npos && r.refusal.find("512 B") != std::string::npos,
-              "the refusal does not print both values in the reservation's units: %s", r.refusal.c_str());
+        CHECK(r.refusal.find("more than the") != std::string::npos &&
+                  r.refusal.find("reserved before the pack") != std::string::npos,
+              "the refusal does not compare the two values: %s", r.refusal.c_str());
     }
     // and the other way: 250 B is above 200 B raw, but both occupy one 256 B grain, so it is admitted
     {
@@ -398,17 +399,23 @@ static void test_admitted_fold() {
         CHECK(r.terms.size() == 1 && r.terms[0].admitted_bytes == 250, "the recorded c(P) is not the raw total");
     }
 
-    // c(P) > C-hat refuses by name, with both values, the n_ctx and the ubatch the measure ran at
+    // c(P) > C-hat refuses by its stable tag, in plain words and MiB, with the n_ctx and the ubatch the measure ran at
     {
-        const std::vector<llama_load_measure_device> probe = { chunked(0, false, { 100 }), chunked(1, false, { 512 }) };
+        const size_t                                 mib      = 1024 * 1024;
+        const std::vector<llama_load_measure_device> probe    = { chunked(0, false, { 100 }),
+                                                                  chunked(1, false, { 512 * mib }) };
         const std::vector<llama_load_measure_device> admitted = { chunked(0, false, { 100 }),
-                                                                  chunked(1, false, { 513 }) };
+                                                                  chunked(1, false, { 513 * mib }) };
         const llama_admitted_check_result            r =
             llama_admitted_check_fold(procs, probe, {}, {}, admitted, 262144, 512, kv_probe, kv_probe);
         CHECK(r.refusal.rfind("[LOAD-PLAN] compute-slot-exceeds-probe-bound on device 1: ", 0) == 0, "refusal text: %s",
               r.refusal.c_str());
-        CHECK(r.refusal.find("c(P) 768 B > probe bound C-hat 512 B") != std::string::npos,
-              "the refusal does not print both values: %s", r.refusal.c_str());
+        CHECK(r.refusal.find("the compute buffer measured at the packed placement needs 513.0 MiB, 1.0 MiB more than "
+                             "the 512.0 MiB reserved before the pack, and the KV residency did not move") !=
+                  std::string::npos,
+              "the refusal does not say it in plain words: %s", r.refusal.c_str());
+        CHECK(r.refusal.find("c(P)") == std::string::npos && r.refusal.find("C-hat") == std::string::npos,
+              "the refusal is written in internal notation: %s", r.refusal.c_str());
         CHECK(r.refusal.find("n_ctx 262144") != std::string::npos && r.refusal.find("ubatch 512") != std::string::npos,
               "the refusal does not print the measure's shape: %s", r.refusal.c_str());
         CHECK(r.refusal.size() > 10 && r.refusal.compare(r.refusal.size() - 10, 10, " (refused)") == 0,
@@ -425,8 +432,8 @@ static void test_admitted_fold() {
             llama_admitted_check_fold(procs, probe, {}, {}, admitted, 4096, 512, kv_probe, kv_probe);
         CHECK(r.refusal.rfind("[LOAD-PLAN] compute-slot-exceeds-probe-bound on device 1: ", 0) == 0,
               "a device without a probe bound was admitted: %s", r.refusal.c_str());
-        CHECK(r.refusal.find("no probe bound") != std::string::npos, "the refusal does not say why: %s",
-              r.refusal.c_str());
+        CHECK(r.refusal.find("the probe measured nothing on this device to reserve room for it") != std::string::npos,
+              "the refusal does not say why: %s", r.refusal.c_str());
     }
 
     // a device the backend declined to reserve for has no reservation to compare with: listed, not compared
@@ -449,7 +456,7 @@ static void test_admitted_fold() {
         const std::vector<llama_load_measure_device> admitted = { chunked(0, false, { 100 }) };
         const llama_admitted_check_result            r =
             llama_admitted_check_fold(none, probe, {}, {}, admitted, 4096, 512, kv_probe, kv_probe);
-        CHECK(r.refusal.find("cannot be sized in the reservation's units") != std::string::npos,
+        CHECK(r.refusal.find("cannot size the compute buffer in the units room is reserved in") != std::string::npos,
               "an unsized term was compared as raw bytes: %s", r.refusal.c_str());
         const llama_admitted_check_result u =
             llama_admitted_check_fold(none, probe, { 0 }, {}, admitted, 4096, 512, kv_probe, kv_probe);
@@ -509,7 +516,7 @@ static void test_admitted_fold() {
         const std::vector<llama_load_measure_device> unbound = { chunked(0, false, { 100 }), chunked(1, false, { 1 }) };
         const llama_admitted_check_result            r_unb =
             llama_admitted_check_fold(procs, probe, {}, {}, unbound, 4096, 512, kv_probe, kv_moved);
-        CHECK(r_unb.refusal.find("no probe bound") != std::string::npos,
+        CHECK(r_unb.refusal.find("the probe measured nothing on this device") != std::string::npos,
               "a device with no probe bound was tolerated: %s", r_unb.refusal.c_str());
     }
     // the residency is judged per device: on a two-card split the probe demoted a layer on SYCL0 and the admitted fit

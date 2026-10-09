@@ -556,7 +556,12 @@ inline llama_admitted_check_result llama_admitted_check_fold(const llama_sycl_l4
     out.probe_kv        = probe_kv;
     out.admitted_kv     = admitted_kv;
     const bool kv_moved = !llama_kv_residency_same(probe_kv, admitted_kv);
-    const auto refuse   = [&](int32_t device, const std::string & why) {
+    const auto mib      = [](size_t bytes) {
+        char text[32];
+        std::snprintf(text, sizeof(text), "%.1f MiB", bytes / 1024.0 / 1024.0);
+        return std::string(text);
+    };
+    const auto refuse = [&](int32_t device, const std::string & why) {
         out.refusal = "[LOAD-PLAN] compute-slot-exceeds-probe-bound on device " + std::to_string(device) + ": " + why +
                       " at n_ctx " + std::to_string(n_ctx) + " ubatch " + std::to_string(n_ubatch) + " (refused)";
         out.terms.clear();
@@ -573,7 +578,8 @@ inline llama_admitted_check_result llama_admitted_check_fold(const llama_sycl_l4
             }
         }
         if (bound == nullptr) {
-            refuse(d.device, "c(P) " + std::to_string(d.total) + " B and no probe bound");
+            refuse(d.device, "the compute buffer measured at the packed placement needs " + mib(d.total) +
+                                 ", and the probe measured nothing on this device to reserve room for it");
             return out;
         }
         llama_admitted_term t;
@@ -586,13 +592,17 @@ inline llama_admitted_check_result llama_admitted_check_fold(const llama_sycl_l4
         const bool sized = llama_sycl_l4_compute_term_bytes(procs, bound->chunk_bytes, &t.probe_term) &&
                            llama_sycl_l4_compute_term_bytes(procs, d.chunk_bytes, &t.admitted_term);
         if (t.reserved && !sized) {
-            refuse(d.device, "the compute term cannot be sized in the reservation's units");
+            refuse(d.device,
+                   "the backend cannot size the compute buffer in the units room is reserved in, so "
+                   "it cannot be compared with the room reserved before the pack");
             return out;
         }
         if (t.reserved && t.admitted_term > t.probe_term) {
             if (!kv_moved) {
-                refuse(d.device, "c(P) " + std::to_string(t.admitted_term) + " B > probe bound C-hat " +
-                                     std::to_string(t.probe_term) + " B in the reservation's units");
+                refuse(d.device, "the compute buffer measured at the packed placement needs " + mib(t.admitted_term) +
+                                     ", " + mib(t.admitted_term - t.probe_term) + " more than the " +
+                                     mib(t.probe_term) +
+                                     " reserved before the pack, and the KV residency did not move");
                 return out;
             }
             t.kv_excess = t.admitted_term - t.probe_term;
