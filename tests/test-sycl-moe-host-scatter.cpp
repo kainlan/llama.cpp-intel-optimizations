@@ -4,10 +4,36 @@
 // the copies and the kernel's row placement on host buffers, without a device.
 #include "ggml-sycl/moe-host-scatter.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <vector>
+
+// Counts every heap allocation, so a test can measure what one flush allocates. GCC inlines these into the standard
+// containers and then pairs the malloc with the free as if they were new and free; they are not mismatched.
+#if defined(__GNUC__) && !defined(__clang__)
+#    pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+static size_t g_n_allocs = 0;
+
+void * operator new(size_t n) {
+    ++g_n_allocs;
+    if (void * p = std::malloc(n ? n : 1)) {
+        return p;
+    }
+    throw std::bad_alloc();
+}
+
+void operator delete(void * p) noexcept {
+    std::free(p);
+}
+
+void operator delete(void * p, size_t) noexcept {
+    std::free(p);
+}
 
 #define CHECK(cond, msg)                      \
     do {                                      \
@@ -289,6 +315,17 @@ static int test_gate_up_merge() {
                          scratch_for(2 * k_n_used, k_n_gate), 2, 1) != 0) {
         return 1;
     }
+    // Two destination buffers that meet offset for offset: gate's last row ends at byte 10 * N of buffer 0, and up's
+    // row starts at byte 10 * N of buffer 1, with their sources contiguous. Only the destination buffer keeps the
+    // per-run form from merging them into one copy that writes up's row into gate's buffer.
+    dispatch adjacent_up = decode(0, 1, 2, k_n_gate, { 0 });
+    adjacent_up.view     = static_cast<size_t>(k_n_used * k_n_gate) * sizeof(float);
+    if (check_equivalent("gate+up, adjacent offsets in two buffers",
+                         { decode(0, 0, 0, k_n_gate, { 8, 9 }), adjacent_up }, scratch_for(2 * k_n_used, k_n_gate), 1,
+                         1, &runs) != 0) {
+        return 1;
+    }
+    CHECK(runs == 2, "rows in two destination buffers are two per-run copies even when their offsets meet");
     // A wrapped pool ring (up reserved back at entry 0, gate further on): two copies, one kernel.
     if (check_equivalent("gate+up, wrapped ring",
                          { decode(0, 0, 16, k_n_gate, { 2, 3, 6, 9 }), decode(0, 1, 0, k_n_gate, { 0, 5, 8 }) },
@@ -399,9 +436,121 @@ static int test_scratch_bytes() {
     return 0;
 }
 
+// Each reason a flush declines the compact form is reported once, and an earlier reason does not hide a later one.
+static int test_decline_reported_once_per_reason() {
+    std::atomic<uint32_t> seen{ 0 };
+    CHECK(ggml_sycl::moe_scatter_decline_first(seen, ggml_sycl::MOE_SCATTER_DECLINE_GRAPH_RECORDING),
+          "the first decline of a reason is reported");
+    CHECK(!ggml_sycl::moe_scatter_decline_first(seen, ggml_sycl::MOE_SCATTER_DECLINE_GRAPH_RECORDING),
+          "a repeated reason is not reported again");
+    CHECK(ggml_sycl::moe_scatter_decline_first(seen, ggml_sycl::MOE_SCATTER_DECLINE_NO_SCRATCH),
+          "a different reason after the first is still reported");
+    CHECK(!ggml_sycl::moe_scatter_decline_first(seen, ggml_sycl::MOE_SCATTER_DECLINE_NO_SCRATCH),
+          "the second reason is reported once too");
+    for (uint32_t r = 0; r < ggml_sycl::MOE_SCATTER_DECLINE_COUNT; ++r) {
+        CHECK(ggml_sycl::moe_scatter_decline_name(static_cast<ggml_sycl::moe_scatter_decline>(r))[0] != '\0',
+              "every reason has a name for the WARN");
+    }
+    return 0;
+}
+
+// The scratch is planned only for a device whose layers keep experts on the host: an all-VRAM placement plans
+// nothing, so nothing is claimed and nothing warns.
+static int test_scratch_bytes_for_device() {
+    using ggml_sycl::moe_host_scatter_tensor;
+    moe_host_scatter_tensor gate;
+    gate.split_gate_up = true;
+    gate.row_elems     = 640;
+    moe_host_scatter_tensor down;
+    down.row_elems = 2560;
+    size_t bytes   = 1;
+
+    gate.device = 0;
+    down.device = 0;
+    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ gate, down }, 0, 10, &bytes) && bytes == 0,
+          "every expert on the device: no scratch is planned");
+
+    down.has_host_experts = true;
+    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ gate, down }, 0, 10, &bytes) &&
+              bytes == 10 * 2560 * sizeof(float),
+          "host experts on device 0: the scratch covers their rows");
+
+    down.device = 1;
+    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ gate, down }, 0, 10, &bytes) && bytes == 0,
+          "host experts scattered by device 1 plan nothing on device 0");
+    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ gate, down }, 1, 10, &bytes) &&
+              bytes == 10 * 2560 * sizeof(float),
+          "they plan on device 1");
+
+    gate.has_host_experts = true;
+    gate.device           = -1;
+    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ gate }, 0, 10, &bytes) &&
+              bytes == 20 * 640 * sizeof(float),
+          "a tensor whose layer has no planned device plans on every device (device 0)");
+    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ gate }, 1, 10, &bytes) &&
+              bytes == 20 * 640 * sizeof(float),
+          "a tensor whose layer has no planned device plans on every device (device 1)");
+
+    down.device                 = 0;
+    moe_host_scatter_tensor bad = down;
+    bad.row_elems               = SIZE_MAX / 8;
+    CHECK(!ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ down, bad }, 0, 10, &bytes),
+          "an overflowing figure is refused, not wrapped");
+    return 0;
+}
+
+// What one decode flush allocates to build its rows and plan. The flush used to build both afresh every call; it now
+// reuses one workspace, so after the first flush a decode token allocates nothing here, including for a routing whose
+// overlap check has to sort.
+static int test_flush_allocations() {
+    const std::vector<dispatch> in_order  = { decode(0, 0, 0, k_n_gate, { 2, 3, 6, 9 }),
+                                              decode(0, 1, 4, k_n_gate, { 0, 5, 8 }) };
+    const std::vector<dispatch> unordered = { decode(0, 0, 0, k_n_gate, { 9, 2, 6, 3 }),
+                                              decode(0, 1, 4, k_n_gate, { 8, 0, 5 }) };
+    const size_t                scratch   = scratch_for(2 * k_n_used, k_n_gate);
+    const int                   n_flushes = 64;
+    for (const std::vector<dispatch> * flush : { &in_order, &unordered }) {
+        const size_t fresh_before = g_n_allocs;
+        for (int i = 0; i < n_flushes; ++i) {
+            std::vector<moe_scatter_row> rows;
+            moe_scatter_plan             plan;
+            for (const dispatch & d : *flush) {
+                append_rows(d, rows);
+            }
+            CHECK(ggml_sycl::moe_scatter_plan_build(rows, scratch, &plan), "a decode flush takes the compact form");
+        }
+        const size_t fresh = (g_n_allocs - fresh_before) / n_flushes;
+
+        std::vector<moe_scatter_row> rows;
+        moe_scatter_plan             plan;
+        for (int i = 0; i < 2; ++i) {  // the first flush sizes the workspace
+            rows.clear();
+            for (const dispatch & d : *flush) {
+                append_rows(d, rows);
+            }
+            CHECK(ggml_sycl::moe_scatter_plan_build(rows, scratch, &plan), "a decode flush takes the compact form");
+        }
+        const size_t reused_before = g_n_allocs;
+        for (int i = 0; i < n_flushes; ++i) {
+            rows.clear();
+            for (const dispatch & d : *flush) {
+                append_rows(d, rows);
+            }
+            CHECK(ggml_sycl::moe_scatter_plan_build(rows, scratch, &plan), "a decode flush takes the compact form");
+        }
+        const size_t reused = g_n_allocs - reused_before;
+        std::printf("allocations per decode flush building rows and plan (%s): fresh %zu, reused workspace %zu\n",
+                    flush == &in_order ? "slot order" : "needs the overlap sort", fresh,
+                    reused / static_cast<size_t>(n_flushes));
+        CHECK(reused == 0, "a reused workspace allocates nothing per decode flush");
+    }
+    return 0;
+}
+
 int main() {
     if (test_decode_edges() != 0 || test_gate_up_merge() != 0 || test_chunking() != 0 || test_refusals() != 0 ||
-        test_scratch_bytes() != 0) {
+        test_scratch_bytes() != 0 || test_decline_reported_once_per_reason() != 0 ||
+        test_scratch_bytes_for_device() != 0 || test_flush_allocations() != 0) {
         return 1;
     }
     std::printf("OK: moe host scatter compaction\n");

@@ -21,6 +21,7 @@
 // without a device.
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -97,11 +98,16 @@ struct moe_scatter_plan {
     std::vector<moe_scatter_copy>  copies;
     std::vector<moe_scatter_chunk> chunks;
     size_t                         row_bytes = 0;
+    // Workspace for the overlap check when the rows are not already in destination order. Kept, like the vectors
+    // above, so a plan reused across flushes allocates nothing once it has seen the largest flush.
+    std::vector<uint32_t>          by_dst;
 };
 
 // Builds the compact plan for `rows` through a scratch of `scratch_bytes`.
 // False, with the plan cleared, when the rows cannot take the compact form and
-// the caller must use the per-run copies.
+// the caller must use the per-run copies. Clearing keeps every vector's
+// capacity, so a caller that reuses one plan allocates nothing per flush once
+// the plan has grown to its largest flush.
 inline bool moe_scatter_plan_build(const std::vector<moe_scatter_row> & rows,
                                    size_t                               scratch_bytes,
                                    moe_scatter_plan *                   plan) {
@@ -129,17 +135,30 @@ inline bool moe_scatter_plan_build(const std::vector<moe_scatter_row> & rows,
     }
     // The per-run copies land in order, so two rows over the same bytes leave the later one; the rows of one kernel
     // launch land in no order. Every row a MUL_MAT_ID dispatch scatters owns its own (slot, token) row, so this only
-    // turns away a routing that is already wrong.
-    std::vector<const moe_scatter_row *> by_dst;
-    by_dst.reserve(rows.size());
-    for (const moe_scatter_row & row : rows) {
-        by_dst.push_back(&row);
+    // turns away a routing that is already wrong. Rows already in destination order (gate before up, slots
+    // ascending) are checked in one pass; only others are sorted, by index into the plan's kept workspace.
+    if (rows.size() > UINT32_MAX) {
+        return false;
     }
-    std::sort(by_dst.begin(), by_dst.end(), [](const moe_scatter_row * a, const moe_scatter_row * b) {
-        return a->dst != b->dst ? a->dst < b->dst : a->dst_offset < b->dst_offset;
-    });
-    for (size_t i = 1; i < by_dst.size(); ++i) {
-        if (by_dst[i]->dst == by_dst[i - 1]->dst && by_dst[i - 1]->dst_offset + row_bytes > by_dst[i]->dst_offset) {
+    auto before = [&rows](uint32_t a, uint32_t b) {
+        return rows[a].dst != rows[b].dst ? rows[a].dst < rows[b].dst : rows[a].dst_offset < rows[b].dst_offset;
+    };
+    bool in_dst_order = true;
+    for (size_t i = 1; i < rows.size() && in_dst_order; ++i) {
+        in_dst_order = !before(static_cast<uint32_t>(i), static_cast<uint32_t>(i - 1));
+    }
+    plan->by_dst.clear();
+    plan->by_dst.reserve(rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+        plan->by_dst.push_back(static_cast<uint32_t>(i));
+    }
+    if (!in_dst_order) {
+        std::sort(plan->by_dst.begin(), plan->by_dst.end(), before);
+    }
+    for (size_t i = 1; i < plan->by_dst.size(); ++i) {
+        const moe_scatter_row & prev = rows[plan->by_dst[i - 1]];
+        const moe_scatter_row & cur  = rows[plan->by_dst[i]];
+        if (cur.dst == prev.dst && prev.dst_offset + row_bytes > cur.dst_offset) {
             return false;
         }
     }
@@ -172,6 +191,62 @@ inline bool moe_scatter_plan_build(const std::vector<moe_scatter_row> & rows,
     return true;
 }
 
+// Why a flush did not take the compact form; each reason is reported once (llama.cpp-cre6).
+enum moe_scatter_decline : uint32_t {
+    MOE_SCATTER_DECLINE_NO_SCRATCH = 0,
+    MOE_SCATTER_DECLINE_QUEUE_NOT_IN_ORDER,
+    MOE_SCATTER_DECLINE_GRAPH_RECORDING,
+    MOE_SCATTER_DECLINE_TOO_MANY_DSTS,
+    MOE_SCATTER_DECLINE_NOT_COMPACT,
+    MOE_SCATTER_DECLINE_SCRATCH_UNRESOLVED,
+    MOE_SCATTER_DECLINE_DST_UNRESOLVED,
+    MOE_SCATTER_DECLINE_DST_OUT_OF_RANGE,
+    MOE_SCATTER_DECLINE_COUNT,
+};
+
+static_assert(MOE_SCATTER_DECLINE_COUNT <= 32, "one bit per decline reason");
+
+inline const char * moe_scatter_decline_name(moe_scatter_decline why) {
+    switch (why) {
+        case MOE_SCATTER_DECLINE_NO_SCRATCH:
+            return "no planned scratch was claimed for this context";
+        case MOE_SCATTER_DECLINE_QUEUE_NOT_IN_ORDER:
+            return "the queue is not in order";
+        case MOE_SCATTER_DECLINE_GRAPH_RECORDING:
+            return "a SYCL graph is recording";
+        case MOE_SCATTER_DECLINE_TOO_MANY_DSTS:
+            return "the rows have more destination buffers than one kernel takes";
+        case MOE_SCATTER_DECLINE_NOT_COMPACT:
+            return "the rows do not take the compact form";
+        case MOE_SCATTER_DECLINE_SCRATCH_UNRESOLVED:
+            return "the scratch does not resolve on the device";
+        case MOE_SCATTER_DECLINE_DST_UNRESOLVED:
+            return "a destination does not resolve on the device";
+        case MOE_SCATTER_DECLINE_DST_OUT_OF_RANGE:
+            return "a destination row lies outside its buffer";
+        case MOE_SCATTER_DECLINE_COUNT:
+            break;
+    }
+    return "unknown";
+}
+
+// True the first time `why` is reported through `seen` and false after: each reason is reported once, and an
+// earlier reason does not hide a later, different one.
+inline bool moe_scatter_decline_first(std::atomic<uint32_t> & seen, moe_scatter_decline why) {
+    const uint32_t bit = 1u << static_cast<uint32_t>(why);
+    return (seen.fetch_or(bit, std::memory_order_relaxed) & bit) == 0;
+}
+
+// One expert tensor as the scratch plan sees it: which device's MUL_MAT_ID scatters its host-expert rows (-1 when
+// its layer has no planned device, which counts for every device), whether its layer splits gate and up, its row
+// length, and whether the placement keeps any of its experts on the host.
+struct moe_host_scatter_tensor {
+    int    device           = -1;
+    bool   split_gate_up    = false;
+    size_t row_elems        = 0;
+    bool   has_host_experts = false;
+};
+
 // Bytes of the planned scratch: the rows one flush places (both halves of a
 // decode gate/up pair when the layer has split gate and up tensors, else one
 // op's n_expert_used rows), capped at one kernel launch, times the row bytes.
@@ -186,6 +261,27 @@ inline bool moe_host_scatter_scratch_bytes(size_t n_expert_used, bool split_gate
         return false;
     }
     *out = rows * row_elems * sizeof(float);
+    return true;
+}
+
+// Bytes of the planned scratch on `device`: the largest flush among the tensors that keep experts on the host and
+// are scattered by that device. Zero when there are none, as for an all-VRAM placement: the scatter never runs
+// there, so nothing is planned, claimed or reported. False on overflow.
+inline bool moe_host_scatter_scratch_bytes_for_device(const std::vector<moe_host_scatter_tensor> & tensors,
+                                                      int                                          device,
+                                                      size_t                                       n_expert_used,
+                                                      size_t *                                     out) {
+    *out = 0;
+    for (const moe_host_scatter_tensor & t : tensors) {
+        if (!t.has_host_experts || (t.device >= 0 && t.device != device)) {
+            continue;
+        }
+        size_t bytes = 0;
+        if (!moe_host_scatter_scratch_bytes(n_expert_used, t.split_gate_up, t.row_elems, &bytes)) {
+            return false;
+        }
+        *out = std::max(*out, bytes);
+    }
     return true;
 }
 
