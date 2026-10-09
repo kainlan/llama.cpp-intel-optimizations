@@ -632,10 +632,12 @@ struct placement_kv_info {
     // this is threaded to next.
     uint32_t          n_head_all_max   = 0;
     bool              n_ctx_is_runtime = false;
-    // llama.cpp-8ecj: the context the model opens with when the caller names none (n_ctx_train), from
-    // ggml_sycl_tensor_inventory::n_ctx_context. n_ctx above stays the load's own planning shape; this one only sizes
-    // the KV room the planner holds ahead of the routed experts. 0 = unknown: no room is held.
+    // llama.cpp-8ecj: the context the model opens with, from ggml_sycl_tensor_inventory::n_ctx_context: the caller's
+    // request (llama.cpp-ak0p), or n_ctx_train when none reached the load. n_ctx above stays the load's own planning
+    // shape; this one only sizes the KV room the planner holds ahead of the routed experts. 0 = unknown: no room is
+    // held. n_ctx_context_requested says which of the two it is, for the room's line.
     uint32_t              n_ctx_context    = 0;
+    bool                  n_ctx_context_requested = false;
     // MoE hyperparameters (0 for dense models)
     int               n_expert_used    = 0;  // Top-k experts selected per token
     // SWA (Sliding Window Attention) — 0 means all layers use full attention

@@ -703,6 +703,34 @@ static bool run_kv_context_room_cost_is_net_test() {
     return true;
 }
 
+// llama.cpp-ak0p: the room is for the context the caller asked for, not the training context. A requested n_ctx 4096
+// holds the KV of (4096 - planner n_ctx 512) cells on each device layer, and the experts keep what is left. A room for
+// a training context of 32768 on the same budget takes everything the dense weights and their KV leave.
+static bool run_kv_context_room_follows_the_requested_context_test() {
+    using namespace kv_order_case;
+    constexpr size_t cell_bytes = (kv_width + kv_width) * 2;      // f16 K and V of one cell of one layer
+    constexpr size_t room_4096  = 2 * (4096 - 512) * cell_bytes;  // two device layers
+    const size_t     left       = room_4096 + 2 * triplet_bytes;
+    const size_t     budget     = 2 * dense_bytes + 2 * kv_at_512 + left;
+
+    const auto requested = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(4096), nullptr, n_experts);
+    if (requested.kv_context_reserve_bytes != room_4096 || device_triplets(requested) != 2) {
+        printf(
+            "FAIL: a requested n_ctx 4096 holds %zu bytes (want %zu, 3584 cells on 2 layers), %zu device triplets "
+            "(want 2)\n",
+            requested.kv_context_reserve_bytes, room_4096, device_triplets(requested));
+        return false;
+    }
+    const auto train = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(32768), nullptr, n_experts);
+    if (train.kv_context_reserve_bytes != left || device_triplets(train) != 0) {
+        printf("FAIL: the training context's room holds all %zu bytes left, held %zu, %zu device triplets (want 0)\n",
+               left, train.kv_context_reserve_bytes, device_triplets(train));
+        return false;
+    }
+    printf("PASS: the KV context room follows the requested context, not n_ctx_train\n");
+    return true;
+}
+
 // A budget that fits both dense weights and one layer's KV: the dense weights are placed first, so the second layer
 // keeps its weights on the device and only its KV goes to the host tier.
 static bool run_dense_weights_before_kv_test() {
@@ -2537,7 +2565,8 @@ int main() {
         if (!run_moe_triplet_planner_test()) {
             return 1;
         }
-        if (!run_kv_context_room_before_experts_test() || !run_kv_context_room_cost_is_net_test()) {
+        if (!run_kv_context_room_before_experts_test() || !run_kv_context_room_cost_is_net_test() ||
+            !run_kv_context_room_follows_the_requested_context_test()) {
             return 1;
         }
         if (!run_dense_weights_before_kv_test()) {

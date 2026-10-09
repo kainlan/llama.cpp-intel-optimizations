@@ -19,9 +19,11 @@ The fix this gate pins:
     bytes of routed experts that budget places minus the ones the real pack places (a larger first-fit budget can
     take a larger triplet and then skip smaller ones the real pack did place, so counting only the triplets that fit
     it and not the real budget over-states the cost); the plan keeps that figure, and the room's line reports both
-    packs in MiB after the pack, as a WARN when the room cost experts, naming its limit: the room is for n_ctx_train;
-  - the loader hands the backend that context (n_ctx_train, the probe measure's own n_ctx, since the caller's -c
-    does not reach the load, fkpg).
+    packs in MiB after the pack, as a WARN when the room cost experts, naming where its context came from;
+  - the loader hands the backend that context (llama.cpp-ak0p): the one the caller is about to create
+    (llama_model_params::n_ctx_hint, which common sets from -c and llama-bench from its test's context), or
+    n_ctx_train when no request reached the load, with a flag saying which. The placement envelope's n_ctx stays 0,
+    so the load measures and the planning shape keep their inputs.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -68,6 +70,10 @@ CACHE_HPP = read("ggml/src/ggml-sycl/unified-cache.hpp")
 SYCL = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 SYCL_H = read("ggml/include/ggml-sycl.h")
 MODEL = read("src/llama-model.cpp")
+MODEL_H = read("src/llama-model.h")
+LLAMA_H = read("include/llama.h")
+COMMON = read("common/common.cpp")
+BENCH = read("tools/llama-bench/llama-bench.cpp")
 
 
 def body(text: str, signature: str) -> str:
@@ -117,6 +123,7 @@ ROOM_SIG = "static kv_context_room hold_kv_context_room(placement_plan & plan,"
 ROOM_LOG_SIG = "static void log_kv_context_room(const kv_context_room & room,"
 REFRESH_SIG = "void refresh_kv_byte_totals()"
 POPULATE_SIG = "static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory & inventory,"
+ENVELOPE_SIG = "static ggml_sycl_placement_envelope llama_model_sycl_make_placement_envelope()"
 INVENTORY_STRUCT = "struct ggml_sycl_tensor_inventory {"
 
 DENSE_LOOP = "for (const auto & [layer_id, indices] : dense_layer_indices) {"
@@ -201,15 +208,23 @@ def claim_room_displacement_is_counted_and_logged(cache: str) -> bool:
             and b.count("room.expert_bytes_without +=") == 1 and b.count("room.expert_bytes =") == 1)
 
 
-def claim_room_line_is_visible_and_names_its_limit(cache: str) -> bool:
-    """The line is in MiB, says the room is for n_ctx_train because the load does not see -c, and is a WARN whenever
-    the room cost experts or could not hold all it wanted, so a default run shows it."""
+ROOM_SOURCE = ('const char * source = kv_info.n_ctx_context_requested ? "the requested n_ctx" : '
+               '"the default n_ctx_train (no -c reached the load)";')
+
+
+def claim_room_line_is_visible_and_names_its_source(cache: str) -> bool:
+    """The line is in MiB, says where its context came from (the caller's request, or n_ctx_train when none reached
+    the load), and is a WARN whenever the room cost experts or could not hold all it wanted, so a default run shows
+    it."""
     b = body(norm(cache), ROOM_LOG_SIG)
     return (bool(b) and "const bool warn = room.displaced_bytes() > 0 || room.held < room.wanted;" in b
             and "ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO," in b
             and "held %.1f MB of %.1f MB for n_ctx_context=%u over \" \"planner n_ctx=%u" in b
             and "it cost %.1f MB of \" \"device-resident routed experts" in b
-            and "with the room added back. The room is for n_ctx_train: the load does not see -c." in b)
+            and ROOM_SOURCE in b
+            and "with the room added back. n_ctx_context is %s.\\n\"," in b
+            and "room.expert_groups_without, source);" in b
+            and "The room is for n_ctx_train" not in b)
 
 
 def claim_extra_is_the_context_minus_the_charge(hpp: str) -> bool:
@@ -247,20 +262,83 @@ def claim_runtime_rederivation_drops_the_room(hpp: str) -> bool:
 # ---- (b) the context comes from libllama ----------------------------------------------------------------------------
 
 
-def claim_loader_hands_the_opening_context(model: str, sycl: str, header: str) -> bool:
-    """The inventory carries the probe measure's own n_ctx (n_ctx_train for an unspecified -c), right after
-    kv_layer_count and before the indexer widths (the KV tail ggml-sycl.cpp pins with static_asserts), and the backend
-    copies it into its KV inputs."""
-    pop = body(norm(model), POPULATE_SIG)
+HINT_PICK = "inventory.n_ctx_context = n_ctx_hint != 0 ? n_ctx_hint : hparams.n_ctx_train;"
+HINT_FLAG = "inventory.n_ctx_context_requested = n_ctx_hint != 0;"
+HINT_PASS = "max_pp_pipeline_weight_bytes, hparams, model.get_n_ctx_hint());"
+INV_TAIL = ("uint32_t kv_layer_count; uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; "
+            "uint8_t n_ctx_context_requested; }")
+COPY_CTX = "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;"
+COPY_FLAG = "g_placement_kv_info.n_ctx_context_requested = inventory->n_ctx_context_requested != 0;"
+TAIL_ASSERTS = (
+    "static_assert(sizeof(ggml_sycl_tensor_inventory) == 192,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context_requested) == 184,",
+)
+
+
+def claim_loader_hands_the_requested_context(model: str, model_h: str, sycl: str, header: str) -> bool:
+    """The inventory carries the context the caller is about to create (llama_model_params::n_ctx_hint), or
+    n_ctx_train when no request reached the load, with a flag saying which; both plan builders pass the model's hint.
+    The context sits right after kv_layer_count and the flag is appended after the indexer widths (the KV tail
+    ggml-sycl.cpp pins with static_asserts), and the backend copies both into its KV inputs."""
+    m   = norm(model)
+    pop = body(m, POPULATE_SIG)
     h   = norm(header)
     at  = h.find(INVENTORY_STRUCT)
     inv = body(h[at:], "struct ggml_sycl_tensor_inventory") if at >= 0 else ""
-    want = ("inventory.n_ctx_context = llama_load_measure_n_ctx(llama_model_sycl_make_placement_envelope()"
-            ".n_ctx, hparams.n_ctx_train);")
-    return (bool(pop) and want in pop
-            and inv.endswith("uint32_t kv_layer_count; uint32_t n_ctx_context; "
-                             "const uint32_t * kv_idx_k_width_per_layer; }")
-            and "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;" in norm(sycl))
+    s   = norm(sycl)
+    return (bool(pop) and HINT_PICK in pop and HINT_FLAG in pop and "llama_load_measure_n_ctx" not in pop
+            and m.count(HINT_PASS) == 2
+            and "uint32_t get_n_ctx_hint() const { return params.n_ctx_hint; }" in norm(model_h)
+            and inv.endswith(INV_TAIL)
+            and COPY_CTX in s and COPY_FLAG in s and all(a in s for a in TAIL_ASSERTS))
+
+
+def claim_envelope_keeps_no_context(model: str) -> bool:
+    """The hint reaches the room only: the placement envelope still carries n_ctx 0, so the probe, admitted and late
+    measures (llama_load_measure_n_ctx of the envelope's n_ctx) and the planning shape keep n_ctx_train and 512."""
+    env = body(norm(model), ENVELOPE_SIG)
+    return bool(env) and "envelope.n_ctx = 0;" in env and "n_ctx_hint" not in env
+
+
+def claim_api_carries_the_hint(llama_h: str, model: str) -> bool:
+    """llama_model_params ends with the hint, after the booleans, and it defaults to 0 (no request)."""
+    return ("bool load_mtp; uint32_t n_ctx_hint; };" in norm(llama_h)
+            and re.search(r"/\*\.load_mtp\s*=\*/\s*false,\s*/\*\.n_ctx_hint\s*=\*/\s*0,\s*\};", model) is not None)
+
+
+COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_params & params)"
+COMMON_HINT = "mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : 0;"
+COMMON_FIT = "common_fit_params(params.model.path.c_str(), &mparams, &cparams,"
+FIT_REFRESH = "mparams.n_ctx_hint = cparams.n_ctx;"
+COMMON_LOAD = "llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);"
+
+
+def claim_common_hands_the_requested_context(common: str) -> bool:
+    """common passes -c as the hint (0, the training context, stays 0), and after a fit, which resolves a context of
+    0 and may shrink it, the hint is the context the fit chose, before the model loads."""
+    n = norm(common)
+    b = body(n, COMMON_SIG)
+    return bool(b) and COMMON_HINT in b and ordered(n, COMMON_FIT, FIT_REFRESH, COMMON_LOAD)
+
+
+BENCH_CTX = "uint32_t n_ctx() const { return n_prompt + n_gen + n_depth; }"
+BENCH_FIT = ("cparams.n_ctx = std::max(cparams.n_ctx, inst.n_ctx());",
+             "common_fit_params(inst.model.c_str(), &mparams, &cparams,", FIT_REFRESH,
+             "lmodel = llama_model_load_from_file(inst.model.c_str(), mparams);")
+
+
+def claim_bench_hint_is_its_context(bench: str) -> bool:
+    """llama-bench's hint and its context's n_ctx come from one formula (prompt + generated + depth), and its fit
+    path refreshes the hint from the context it fitted, before the model loads."""
+    n = norm(bench)
+    mp = body(n, "llama_model_params to_llama_mparams() const")
+    cp = body(n, "llama_context_params to_llama_cparams() const")
+    return (BENCH_CTX in n and n.count("n_prompt + n_gen + n_depth") == 1
+            and bool(mp) and "mparams.n_ctx_hint = n_ctx();" in mp
+            and bool(cp) and "cparams.n_ctx = n_ctx();" in cp
+            and ordered(n, *BENCH_FIT))
 
 
 def test_phases_are_dense_kv_experts():
@@ -283,8 +361,8 @@ def test_room_displacement_is_counted_and_logged():
     assert claim_room_displacement_is_counted_and_logged(CACHE)
 
 
-def test_room_line_is_visible_and_names_its_limit():
-    assert claim_room_line_is_visible_and_names_its_limit(CACHE)
+def test_room_line_is_visible_and_names_its_source():
+    assert claim_room_line_is_visible_and_names_its_source(CACHE)
 
 
 def test_extra_is_the_context_minus_the_charge():
@@ -299,8 +377,24 @@ def test_runtime_rederivation_drops_the_room():
     assert claim_runtime_rederivation_drops_the_room(CACHE_HPP)
 
 
-def test_loader_hands_the_opening_context():
-    assert claim_loader_hands_the_opening_context(MODEL, SYCL, SYCL_H)
+def test_loader_hands_the_requested_context():
+    assert claim_loader_hands_the_requested_context(MODEL, MODEL_H, SYCL, SYCL_H)
+
+
+def test_envelope_keeps_no_context():
+    assert claim_envelope_keeps_no_context(MODEL)
+
+
+def test_api_carries_the_hint():
+    assert claim_api_carries_the_hint(LLAMA_H, MODEL)
+
+
+def test_common_hands_the_requested_context():
+    assert claim_common_hands_the_requested_context(COMMON)
+
+
+def test_bench_hint_is_its_context():
+    assert claim_bench_hint_is_its_context(BENCH)
 
 
 # ---- mutants: each must turn its claim red --------------------------------------------------------------------------
@@ -401,9 +495,20 @@ def test_mutant_room_logged_before_the_pack_fails():
 
 
 def test_mutant_room_line_only_info_fails():
-    assert not claim_room_line_is_visible_and_names_its_limit(
+    assert not claim_room_line_is_visible_and_names_its_source(
         _once(CACHE, "const bool warn = room.displaced_bytes() > 0 || room.held < room.wanted;",
               "const bool warn = false;"))
+
+
+def test_mutant_room_line_ignores_the_flag_fails():
+    """The line names n_ctx_train whatever the caller asked for."""
+    assert not claim_room_line_is_visible_and_names_its_source(
+        _once(CACHE, 'kv_info.n_ctx_context_requested ? "the requested n_ctx"', 'false ? "the requested n_ctx"'))
+
+
+def test_mutant_room_line_keeps_the_old_limit_fails():
+    assert not claim_room_line_is_visible_and_names_its_source(
+        _once(CACHE, "n_ctx_context is %s.", "The room is for n_ctx_train: the load does not see -c. %s"))
 
 
 def test_mutant_extra_at_the_planning_context_fails():
@@ -417,22 +522,85 @@ def test_mutant_room_survives_the_runtime_shape_fails():
               "vram_bytes = weight_vram_bytes"))
 
 
-def test_mutant_loader_keeps_the_planning_context_fails():
-    assert not claim_loader_hands_the_opening_context(
-        _once(MODEL, "llama_load_measure_n_ctx(llama_model_sycl_make_placement_envelope().n_ctx, hparams.n_ctx_train)",
-              "inventory.n_ctx"), SYCL, SYCL_H)
+def test_mutant_loader_ignores_the_hint_fails():
+    """The room for n_ctx_train whatever the caller asked for: the defect this ticket fixes."""
+    assert not claim_loader_hands_the_requested_context(
+        _once(MODEL, HINT_PICK, "inventory.n_ctx_context = hparams.n_ctx_train;"), MODEL_H, SYCL, SYCL_H)
+
+
+def test_mutant_loader_rides_the_measure_context_fails():
+    """The room keyed to the probe measure's n_ctx again, with the hint only on the flag."""
+    assert not claim_loader_hands_the_requested_context(
+        _once(MODEL, HINT_PICK, "inventory.n_ctx_context = llama_load_measure_n_ctx("
+              "llama_model_sycl_make_placement_envelope().n_ctx, hparams.n_ctx_train);"), MODEL_H, SYCL, SYCL_H)
+
+
+def test_mutant_late_builder_drops_the_hint_fails():
+    """One builder passes no hint: the late plan would undo the early plan's room."""
+    n = norm(MODEL)
+    at = n.find("static void llama_model_sycl_set_late_inventory(")
+    assert at >= 0 and n.find(HINT_PASS, at) >= 0
+    k = n.find(HINT_PASS, at)
+    mutant = n[:k] + "max_pp_pipeline_weight_bytes, hparams, 0);" + n[k + len(HINT_PASS):]
+    assert not claim_loader_hands_the_requested_context(mutant, MODEL_H, SYCL, SYCL_H)
+
+
+def test_mutant_flag_not_set_fails():
+    assert not claim_loader_hands_the_requested_context(_once(MODEL, HINT_FLAG, ""), MODEL_H, SYCL, SYCL_H)
 
 
 def test_mutant_field_inserted_before_the_indexer_widths_fails():
     """A field inserted into the KV tail moves the fields the consumer reads at pinned offsets."""
-    mutant = _once(SYCL_H, "uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; };",
-                   "uint32_t n_ctx_context; size_t spare; const uint32_t * kv_idx_k_width_per_layer; };")
-    assert not claim_loader_hands_the_opening_context(MODEL, SYCL, mutant)
+    mutant = _once(SYCL_H, "uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer;",
+                   "uint32_t n_ctx_context; size_t spare; const uint32_t * kv_idx_k_width_per_layer;")
+    assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, SYCL, mutant)
+
+
+def test_mutant_size_assert_stale_fails():
+    """The consumer still pins the 184-byte layout: an old libllama's object would pass for the new one."""
+    assert not claim_loader_hands_the_requested_context(
+        MODEL, MODEL_H, _once(SYCL, TAIL_ASSERTS[0], "static_assert(sizeof(ggml_sycl_tensor_inventory) == 184,"),
+        SYCL_H)
 
 
 def test_mutant_backend_drops_the_context_fails():
-    assert not claim_loader_hands_the_opening_context(
-        MODEL, _once(SYCL, "g_placement_kv_info.n_ctx_context = inventory->n_ctx_context;", ""), SYCL_H)
+    assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, _once(SYCL, COPY_CTX, ""), SYCL_H)
+
+
+def test_mutant_backend_drops_the_flag_fails():
+    assert not claim_loader_hands_the_requested_context(MODEL, MODEL_H, _once(SYCL, COPY_FLAG, ""), SYCL_H)
+
+
+def test_mutant_envelope_carries_the_hint_fails():
+    """The hint routed through envelope.n_ctx would move the load measures' compute term too."""
+    assert not claim_envelope_keeps_no_context(_once(MODEL, "envelope.n_ctx = 0;", "envelope.n_ctx = n_ctx_hint;"))
+
+
+def test_mutant_api_hint_not_last_fails():
+    assert not claim_api_carries_the_hint(
+        _once(LLAMA_H, "bool load_mtp; uint32_t n_ctx_hint; };", "uint32_t n_ctx_hint; bool load_mtp; };"), MODEL)
+
+
+def test_mutant_common_drops_the_hint_fails():
+    assert not claim_common_hands_the_requested_context(_once(COMMON, COMMON_HINT, ""))
+
+
+def test_mutant_common_fit_keeps_the_unfitted_hint_fails():
+    assert not claim_common_hands_the_requested_context(_once(COMMON, FIT_REFRESH, ""))
+
+
+def test_mutant_bench_hint_drops_the_depth_fails():
+    """A second formula for the bench's context, without the depth: the room would miss the depth's KV."""
+    assert not claim_bench_hint_is_its_context(
+        _once(BENCH, "mparams.n_ctx_hint = n_ctx();", "mparams.n_ctx_hint = n_prompt + n_gen;"))
+
+
+def test_mutant_bench_drops_the_hint_fails():
+    assert not claim_bench_hint_is_its_context(_once(BENCH, "mparams.n_ctx_hint = n_ctx();", ""))
+
+
+def test_mutant_bench_fit_keeps_the_unfitted_hint_fails():
+    assert not claim_bench_hint_is_its_context(_once(BENCH, FIT_REFRESH, ""))
 
 
 def test_mutant_uniform_fallback_restated_fails():

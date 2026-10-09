@@ -11,6 +11,11 @@
 #include <sstream>
 #include <unordered_set>
 
+#ifndef _WIN32
+#    include <sys/wait.h>
+#    include <unistd.h>
+#endif
+
 #undef NDEBUG
 #include <cassert>
 
@@ -374,6 +379,44 @@ static void test(void) {
     argv = {"binary_name", "-lm", "dio"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
+    // llama.cpp-ak0p: -c reaches the model load as llama_model_params::n_ctx_hint, so the SYCL load holds that
+    // context's KV room; without -c the hint is 0 and the load plans for n_ctx_train.
+    {
+        common_params ctx_params;
+        argv = { "binary_name", "-m", "model_file.gguf", "-c", "2048" };
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), ctx_params, LLAMA_EXAMPLE_COMMON));
+        assert(common_model_params_to_llama(ctx_params).n_ctx_hint == 2048);
+
+        common_params no_ctx_params;
+        argv = { "binary_name", "-m", "model_file.gguf" };
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), no_ctx_params, LLAMA_EXAMPLE_COMMON));
+        assert(common_model_params_to_llama(no_ctx_params).n_ctx_hint == 0);
+    }
+
+#ifndef _WIN32
+    // --help and --version stay metadata-only with -c given: they exit inside the parse, so nothing after it (the
+    // model parameters, the load) runs. Each runs in a child, because both call exit(0).
+    for (const char * flag : { "--help", "--version" }) {
+        const pid_t pid = fork();
+        assert(pid >= 0);
+        if (pid == 0) {
+            if (freopen("/dev/null", "w", stdout) == nullptr || freopen("/dev/null", "w", stderr) == nullptr) {
+                _exit(2);
+            }
+            common_params            meta_params;
+            std::vector<std::string> meta_argv = { "binary_name", "-c", "2048", flag };
+            common_params_parse(meta_argv.size(), list_str_to_char(meta_argv).data(), meta_params,
+                                LLAMA_EXAMPLE_COMMON);
+            _exit(3);  // the parse returned instead of exiting
+        }
+        int status = 0;
+        assert(waitpid(pid, &status, 0) == pid);
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+#endif
 
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
