@@ -450,6 +450,78 @@ def test_mutant_probe_plan_staged_for_another_load_fails():
               within=STAGE_SIG))
 
 
+# ---- (b1) the load-time logs say what ran: the stage by name, the pp trace's n_seqs as reserved ---------------------
+
+INSTALL_SIG = "bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t load_txn,"
+STAGE_NAME_SIG = "static const char * ggml_sycl_measure_stage_name(ggml_sycl_measure_stage stage)"
+PP_N_SEQS = "uint32_t pp_n_seqs = n_seqs;"
+
+
+def claim_install_logs_name_the_stage(sycl: str) -> bool:
+    """The KV re-fit WARN and the placement trace name the stage as the loader's refusal text does, never as an
+    integer."""
+    t = norm(sycl)
+    name = body(t, STAGE_NAME_SIG)
+    b = body(t, INSTALL_SIG)
+    return (bool(name) and bool(b)
+            and 'case GGML_SYCL_MEASURE_STAGE_PROBE: return "probe";' in name
+            and 'case GGML_SYCL_MEASURE_STAGE_CANDIDATE_B: return "admitted";' in name
+            and 'case GGML_SYCL_MEASURE_STAGE_CANDIDATE_C: return "late";' in name
+            and ordered(b, "the KV re-fit for load %llu at the %s stage refused: %s",
+                        "(unsigned long long) load_txn, ggml_sycl_measure_stage_name(stage), why.c_str());")
+            and ordered(b, "measure plan override: load %llu stage %s: weights",
+                        "(unsigned long long) load_txn, ggml_sycl_measure_stage_name(stage),")
+            and "re-fit for load %llu at stage %d" not in b and "load %llu stage %d" not in b)
+
+
+def claim_pp_trace_reads_the_reserved_n_seqs(llama: str) -> bool:
+    """The closing pp reserve's compute trace records the n_seqs the graph was reserved with, from the one variable
+    both reserve calls pass, rather than re-deriving the architecture condition."""
+    t = norm(llama)
+    at = t.find(PP_N_SEQS)
+    blk = t[at:at + 2000] if at >= 0 else ""
+    return (t.count(PP_N_SEQS) == 1 and ordered(
+        blk, PP_N_SEQS, "case LLM_ARCH_KIMI_LINEAR: case LLM_ARCH_MINIMAX_01:", "pp_n_seqs = 1;",
+        "gf = graph_reserve(state, n_tokens, pp_n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);",
+        "default: gf = graph_reserve(state, n_tokens, pp_n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);",
+        "g.kind = LLAMA_MEASURE_KIND_PP_AGAIN;", "g.n_seqs = pp_n_seqs;")
+        and "? 1 : n_seqs" not in blk)
+
+
+def test_the_install_logs_name_the_stage():
+    assert claim_install_logs_name_the_stage(SYCL)
+
+
+def test_the_pp_trace_reads_the_reserved_n_seqs():
+    assert claim_pp_trace_reads_the_reserved_n_seqs(LLAMA_CTX)
+
+
+def test_mutant_refit_warn_with_an_integer_stage_fails():
+    assert not claim_install_logs_name_the_stage(
+        _once(SYCL, "load %llu at the %s stage refused: %s\\n\", (unsigned long long) load_txn, "
+                    "ggml_sycl_measure_stage_name(stage), why.c_str());",
+              "load %llu at stage %d refused: %s\\n\", (unsigned long long) load_txn, (int) stage, why.c_str());",
+              within=INSTALL_SIG))
+
+
+def test_mutant_stage_names_swapped_fails():
+    assert not claim_install_logs_name_the_stage(
+        _once(SYCL, 'case GGML_SYCL_MEASURE_STAGE_CANDIDATE_B: return "admitted";',
+              'case GGML_SYCL_MEASURE_STAGE_CANDIDATE_B: return "late";', within=STAGE_NAME_SIG))
+
+
+def test_mutant_pp_trace_rederiving_the_arch_fails():
+    assert not claim_pp_trace_reads_the_reserved_n_seqs(
+        _once(LLAMA_CTX, "g.n_seqs = pp_n_seqs;",
+              "g.n_seqs = (model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01) ? 1 : n_seqs;"))
+
+
+def test_mutant_pp_reserve_not_passing_its_n_seqs_fails():
+    assert not claim_pp_trace_reads_the_reserved_n_seqs(
+        _once(LLAMA_CTX, "pp_n_seqs = 1; gf = graph_reserve(state, n_tokens, pp_n_seqs,",
+              "pp_n_seqs = 1; gf = graph_reserve(state, n_tokens, 1,"))
+
+
 # ---- (d) the state term: the context memory the RUNTIME zone takes before the compute buffer ----------------------
 
 RESERVE_STATE_SIG = "bool ggml_backend_sycl_load_reserve_state_term(ggml_sycl_load_txn txn, int32_t device, uint64_t state_bytes)"

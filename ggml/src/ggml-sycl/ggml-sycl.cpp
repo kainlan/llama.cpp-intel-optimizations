@@ -15779,6 +15779,19 @@ static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_measu
     return out;
 }
 
+// A measure stage's name in a log line: the names the loader's refusal text gives the same stages (llama.cpp-p6i0).
+static const char * ggml_sycl_measure_stage_name(ggml_sycl_measure_stage stage) {
+    switch (stage) {
+        case GGML_SYCL_MEASURE_STAGE_PROBE:
+            return "probe";
+        case GGML_SYCL_MEASURE_STAGE_CANDIDATE_B:
+            return "admitted";
+        case GGML_SYCL_MEASURE_STAGE_CANDIDATE_C:
+            return "late";
+    }
+    return "unknown";
+}
+
 bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                                  load_txn,
                                                         ggml_sycl_measure_stage                   stage,
                                                         const struct ggml_sycl_measure_kv_shape * kv_shape) {
@@ -15823,19 +15836,21 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
             why = e.what();
         }
         if (!snapshot) {
-            GGML_LOG_WARN("[LOAD-PLAN] measure plan override: the KV re-fit for load %llu at stage %d refused: %s\n",
-                          (unsigned long long) load_txn, (int) stage, why.c_str());
+            GGML_LOG_WARN(
+                "[LOAD-PLAN] measure plan override: the KV re-fit for load %llu at the %s stage refused: %s\n",
+                (unsigned long long) load_txn, ggml_sycl_measure_stage_name(stage), why.c_str());
             return false;
         }
     }
     // llama.cpp-p6i0, for the compute trace: the placement each stage's measure runs over, so a difference between
     // the stages' compute terms can be read against what the plan put on the host.
     GGML_LOG_INFO(
-        "[LOAD-PLAN] measure plan override: load %llu stage %d: weights %.1f MiB device, %.1f MiB host; "
+        "[LOAD-PLAN] measure plan override: load %llu stage %s: weights %.1f MiB device, %.1f MiB host; "
         "kv %.1f MiB device, %.1f MiB host; kv n_ctx %u n_ubatch %u\n",
-        (unsigned long long) load_txn, (int) stage, snapshot->plan->weight_vram_bytes / 1024.0 / 1024.0,
-        snapshot->plan->weight_host_bytes / 1024.0 / 1024.0, snapshot->plan->kv_vram_bytes / 1024.0 / 1024.0,
-        snapshot->plan->kv_host_bytes / 1024.0 / 1024.0, snapshot->kv_info.n_ctx, snapshot->kv_info.n_ubatch);
+        (unsigned long long) load_txn, ggml_sycl_measure_stage_name(stage),
+        snapshot->plan->weight_vram_bytes / 1024.0 / 1024.0, snapshot->plan->weight_host_bytes / 1024.0 / 1024.0,
+        snapshot->plan->kv_vram_bytes / 1024.0 / 1024.0, snapshot->plan->kv_host_bytes / 1024.0 / 1024.0,
+        snapshot->kv_info.n_ctx, snapshot->kv_info.n_ubatch);
     g_measure_plan_override = std::move(snapshot);
     return true;
 }

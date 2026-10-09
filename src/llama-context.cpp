@@ -3552,16 +3552,19 @@ sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, 
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
         //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
         ggml_cgraph * gf = nullptr;
+        // the n_seqs the pp graph is reserved with; the compute trace below reads it rather than re-derive it
+        uint32_t      pp_n_seqs = n_seqs;
         switch (model.arch) {
             case LLM_ARCH_KIMI_LINEAR:
             case LLM_ARCH_MINIMAX_01:
                 // [TAG_RESERVE_DIAG_DECAY]
                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(state, n_tokens, 1, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                pp_n_seqs = 1;
+                gf        = graph_reserve(state, n_tokens, pp_n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
                 break;
             default:
-                gf = graph_reserve(state, n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(state, n_tokens, pp_n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         };
 
         if (!gf) {
@@ -3574,7 +3577,7 @@ sched_reserve_result llama_context::sched_reserve_impl(sched_reserve_mode mode, 
         llama_measure_graph g;
         g.kind      = LLAMA_MEASURE_KIND_PP_AGAIN;
         g.n_tokens  = n_tokens;
-        g.n_seqs    = (model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_MINIMAX_01) ? 1 : n_seqs;
+        g.n_seqs    = pp_n_seqs;
         g.n_outputs = n_outputs_pp;
         llama_compute_trace_reserve(state.sched.get(), backend_ptrs, backend_buft, 2, g);
     }
