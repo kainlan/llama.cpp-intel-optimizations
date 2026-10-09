@@ -3122,16 +3122,18 @@ static int case_qwen3next_kv_owner_shape() {
 // Qwen3.8's llama_memory_hybrid_idx holds each of its 12 attention layers in two KV buffers: the attention K/V (512 MiB
 // a layer at 262144 cells) and the indexer keys (64 MiB). The backstop counts the buffer being allocated at its own
 // layer sizes: the indexer buffer is 768 MiB, which fits the headroom the attention buffer leaves. Charged the plan's
-// per-layer KV, it read as 6144 MiB, the attention buffer's, and was refused. The shape is a device that keeps all 12
-// layers' KV at 262144 cells; the measured refusal is the -c 10240 shape of the next case.
+// per-layer KV, as the room-first Part 2 tree did before a7e671858, it read as 6144 MiB and was refused
+// ("device-planned KV 6144.0 MB exceeds the 748.6 MB free for KV"). Master never reached this: at this context it
+// moves all 12 layers' KV to the host tier, and its refusal is the -c 10240 shape of the next case.
 static int case_qwen38_indexer_buffer_backstop() {
     const size_t mb       = 1024 * 1024;
     const int    n_layers = 48;
     const int    device   = 0;
     const size_t attn_kv  = 512 * mb;  // per attention layer: 262144 cells x (512 K + 512 V) x f16
     const size_t index_kv = 64 * mb;   // per attention layer: 262144 cells x 128 x f16, K only
-    // What is left on the device once the attention buffer has landed: the 748.6 MB master had left, which budgeted
-    // the indexer keys nowhere, plus the 768 MiB the plan now budgets for them (748.6 + 768, rounded down).
+    // What is left on the device once the attention buffer has landed: the 748.6 MB the room-first Part 2 tree
+    // (before a7e671858) left, which budgeted the indexer keys nowhere, plus the 768 MiB indexer budget
+    // (748.6 + 768, rounded down).
     const size_t headroom = 1516 * mb;
 
     std::vector<int>     owner(n_layers, -1);

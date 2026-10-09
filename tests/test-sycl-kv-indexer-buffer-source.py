@@ -3,15 +3,15 @@ buffer by buffer.
 
 Host-only: reads sources, builds nothing, loads no model and touches no device.
 
-The defect (B70, Qwen3.8 IQ3_XXS, -c 10240, -ub 256): the attention K/V landed on the device, then the indexer key
-cache of llama_memory_hybrid_idx asked for its 30 MiB and was refused with
-  "[KV-TIER] device 0: device-planned KV 240.0 MB exceeds the 27.6 MB free for KV"
-and no context. (At the default context the fit moves all 12 attention layers' KV to the host tier, so neither buffer
-has a device layer and the backstop has nothing to refuse.)
+The defect (B70, Qwen3.8 IQ3_XXS, no -c, -ub 256, on the room-first Part 2 tree before a7e671858; master moves all 12
+layers' KV to the host tier at that shape and is refused at -c 10240 instead): the attention K/V landed on the device,
+then the indexer key cache of llama_memory_hybrid_idx asked for its 768 MiB and was refused with
+  "[KV-TIER] device 0: device-planned KV 6144.0 MB exceeds the 748.6 MB free for KV"
+then "alloc_tensor_range: failed to allocate SYCL_KV_Tiered buffer of size 805306368" and no context.
 
 The tiered allocator's backstop summed the plan's per-layer KV, which is the layer's KV and not one buffer's, for
-every device layer of whichever buffer it was allocating, so the indexer buffer was charged the attention buffer's
-bytes. The fix this gate pins: the backstop runs after the tier manager is configured for this buffer
+every device layer of whichever buffer it was allocating, so the 768 MiB indexer buffer was charged the 6144 MiB of
+the attention buffer. The fix this gate pins: the backstop runs after the tier manager is configured for this buffer
 and counts each member layer at the size this buffer allocates for it (kv_tier_manager::kv_layer_size), through the
 one helper kv_buffer_device_bytes(). test-kv-runtime-demotion runs that helper on the Qwen3.8 two-buffer shape.
 
