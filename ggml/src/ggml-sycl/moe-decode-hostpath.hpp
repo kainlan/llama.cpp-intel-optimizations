@@ -288,11 +288,16 @@ inline bool moe_sibling_pending_keep(const moe_sibling_pending_request & r) {
 // time (llama.cpp-z4kd).
 //
 // The residency question is a callback (function pointer plus context) so the
-// walk runs without a device.  The walk remembers up to
+// walk runs without a device.  The walk descends at most
+// MOE_GLU_INPUT_WALK_MAX_DEPTH producer levels below the GLU and remembers up to
 // MOE_GLU_INPUT_WALK_MAX_VISITED nodes; a graph that needs more ends the walk as
 // device-produced, which keeps the GLU on SYCL and costs at most a copy.
+//
+// A MUL_MAT whose weight is on the device does not end the walk yet, so the walk
+// can reach an earlier layer's host MUL_MAT through it (llama.cpp-p8p0).
 typedef bool (*moe_weight_on_host_fn)(const ggml_tensor * weight, void * ctx);
 
+constexpr int MOE_GLU_INPUT_WALK_MAX_DEPTH   = 8;
 constexpr int MOE_GLU_INPUT_WALK_MAX_VISITED = 256;
 
 struct moe_glu_input_walk_state {
@@ -303,7 +308,7 @@ struct moe_glu_input_walk_state {
 };
 
 inline bool moe_glu_input_walk(const ggml_tensor * t, moe_glu_input_walk_state & st, int depth) {
-    if (!t || depth > 8) {
+    if (!t || depth > MOE_GLU_INPUT_WALK_MAX_DEPTH) {
         return false;
     }
     for (int i = 0; i < st.n_visited; ++i) {
@@ -347,9 +352,12 @@ inline bool moe_glu_input_host_produced(const ggml_tensor * op, moe_weight_on_ho
 //   B5  join of a down CPU job at a flush
 //   B6  wait for an earlier scatter H2D (flush prologue, sibling join)
 //   B7  any of the above inside the graph-boundary flush or drain
-// MOE_WAIT_JOIN is not a class: it marks a CPU job join whose class (B3 or B5)
-// is read from the joined op's name, and only when the census is on.
+// MOE_WAIT_NONE and MOE_WAIT_JOIN are not classes.  MOE_WAIT_NONE is the flush
+// context outside any flush that forces a class.  MOE_WAIT_JOIN marks a CPU job
+// join whose class (B3 or B5) is read from the joined op's name, and only when
+// the census is on.
 enum moe_hostpath_wait_class : int {
+    MOE_WAIT_NONE = -2,
     MOE_WAIT_JOIN = -1,
     MOE_WAIT_B1,
     MOE_WAIT_B2,
@@ -368,7 +376,7 @@ inline int moe_hostpath_join_class(const char * joined_name) {
 }
 
 // The class one wait is counted under.  `context` is the class an enclosing
-// flush forces (-1 for none): inside the graph-boundary flush every wait is B7;
+// flush forces (MOE_WAIT_NONE for none): inside the graph-boundary flush every wait is B7;
 // inside the hot-group flush a job join (B3 or B5) is B4b and other waits keep
 // their own class.
 inline int moe_hostpath_wait_classify(int natural, const char * joined_name, int context) {

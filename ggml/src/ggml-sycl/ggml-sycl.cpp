@@ -23600,8 +23600,10 @@ static thread_local uint64_t g_cpu_scatter_serial = 0;
 //   - token 0 also carries every wait of the prompt's ubatches;
 //   - B4b counts any hot-group join, so during prefill it also counts the
 //     gate/up jobs a multi-row hot group joins, not only down.
-// When the variable is unset, a wait costs one cached flag test: the timer
-// reads no clock and classifies nothing.
+// When the variable is unset, a timed wait costs two cached flag tests (one
+// when the timer starts, one when it ends) and reads no clock and classifies
+// nothing; a flush context still saves and restores the thread-local context
+// field unconditionally.
 // ---------------------------------------------------------------------------
 using ggml_sycl::MOE_WAIT_B1;
 using ggml_sycl::MOE_WAIT_B2;
@@ -23613,6 +23615,7 @@ using ggml_sycl::MOE_WAIT_B6;
 using ggml_sycl::MOE_WAIT_B7;
 using ggml_sycl::MOE_WAIT_COUNT;
 using ggml_sycl::MOE_WAIT_JOIN;
+using ggml_sycl::MOE_WAIT_NONE;
 
 struct moe_hostpath_wait_census {
     uint64_t count[MOE_WAIT_COUNT] = {};
@@ -23620,7 +23623,7 @@ struct moe_hostpath_wait_census {
     uint64_t token                 = 0;
     int      last_layer            = -1;
     int      readbacks             = 0;
-    int      context               = -1;  // class forced on the waits inside a flush (B4b, B7)
+    int      context               = MOE_WAIT_NONE;  // class forced on the waits inside a flush (B4b, B7)
 };
 
 static thread_local moe_hostpath_wait_census g_moe_hostpath_waits;
@@ -23698,6 +23701,9 @@ static void moe_hostpath_waits_readback(int layer) {
         uint64_t                  total_n  = 0;
         double                    total_us = 0.0;
         for (int c = 0; c < MOE_WAIT_COUNT; ++c) {
+            if (at >= (int) sizeof(line)) {
+                break;
+            }
             at += snprintf(line + at, sizeof(line) - at, " %s=%llu/%.0fus", names[c], (unsigned long long) w.count[c],
                            w.us[c]);
             total_n += w.count[c];
@@ -25455,7 +25461,7 @@ static bool ggml_sycl_pipeline_moe_enabled() {
 // event-chained host path, where a CPU job's completion is an event that the
 // scatter H2D depends on, so no later op has to join the job on the submitting
 // thread.  A run that still sets the variable is told once, at backend init,
-// that it has no effect.
+// that it has no effect; the static latch keeps a second init from repeating it.
 static void ggml_sycl_pipeline_cpu_warn_retired() {
     static const bool set = [] {
         const bool present = getenv("GGML_SYCL_PIPELINE_CPU") != nullptr;
@@ -27908,8 +27914,8 @@ static void ggml_check_sycl() try {
             if (!overrides.empty()) {
                 GGML_LOG_WARN("[SYCL] non-default settings in effect: %s\n", overrides.c_str());
             }
-            // A retired variable is not in sycl_env_settings; say it is ignored here, once,
-            // rather than only when a host-expert decode first reaches the CPU dispatch.
+            // A retired variable is not in sycl_env_settings, so it gets its own line here,
+            // whether or not any other setting is non-default.
             ggml_sycl_pipeline_cpu_warn_retired();
         }
 
@@ -81123,7 +81129,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             "dispatch_cpu_compute returned an invalid result for a "
                             "non-empty dispatch; its host-expert rows would be dropped "
                             "(llama.cpp-93tw)");
-                ggml_sycl_pipeline_cpu_warn_retired();
                 apply_cpu_result_to_scatter(cpu_result);
             } else if (have_cpu_experts) {
                 do_cpu_dispatch();

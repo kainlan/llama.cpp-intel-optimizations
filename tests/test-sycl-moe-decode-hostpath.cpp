@@ -404,6 +404,34 @@ static int test_glu_input_host_produced() {
     CHECK(!moe_glu_input_host_produced(&glu, weight_is, on_host),
           "a GLU fed by a bias add over a host-expert MUL_MAT_ID is not host-produced");
 
+    // The depth bound: a host MUL_MAT 8 levels below the GLU counts, one level deeper it does not.  The
+    // literal 8 is the documented reach ("within 8 levels"), so a change to MOE_GLU_INPUT_WALK_MAX_DEPTH
+    // must change this test too.  The chain is elementwise ops, so only the bound decides.
+    {
+        constexpr int      max_depth = 8;
+        static ggml_tensor chain[max_depth];
+        ggml_tensor        deep{};
+        deep.op     = GGML_OP_MUL_MAT;
+        deep.src[0] = &host_w;
+        deep.src[1] = &act;
+        ggml_tensor top{};
+        top.op = GGML_OP_GLU;
+        // n elementwise nodes between the GLU (depth 0) and the MUL_MAT put the MUL_MAT at depth n + 1.
+        for (int n = max_depth - 1; n <= max_depth; ++n) {
+            for (int i = 0; i < n; ++i) {
+                chain[i]        = ggml_tensor{};
+                chain[i].op     = GGML_OP_ADD;
+                chain[i].src[0] = i + 1 < n ? &chain[i + 1] : &deep;
+                chain[i].src[1] = &act;
+            }
+            top.src[0]          = &chain[0];
+            const bool found    = moe_glu_input_host_produced(&top, weight_is, on_host);
+            const bool expected = n + 1 <= max_depth;
+            CHECK(found == expected, expected ? "a host MUL_MAT at the depth bound counts" :
+                                                "a host MUL_MAT one level past the depth bound does not count");
+        }
+    }
+
     // A walk that would need more than MOE_GLU_INPUT_WALK_MAX_VISITED nodes gives up as device-produced:
     // three levels of ten-way fan-out (1 + 10 + 100 + 1000 nodes), the host MUL_MAT reachable only last.
     static ggml_tensor fan1[10];
@@ -449,7 +477,8 @@ static int test_wait_census_classes() {
     CHECK(moe_hostpath_join_class("ffn_moe_up-29") == MOE_WAIT_B3, "an up job join is B3");
     CHECK(moe_hostpath_join_class(nullptr) == MOE_WAIT_B3, "an unnamed job join is B3");
 
-    const int none = -1;
+    const int none = MOE_WAIT_NONE;
+    CHECK(none != MOE_WAIT_JOIN && none < 0 && MOE_WAIT_JOIN < 0, "neither marker is a class");
     CHECK(moe_hostpath_wait_classify(MOE_WAIT_B1, nullptr, none) == MOE_WAIT_B1, "a readback is B1");
     CHECK(moe_hostpath_wait_classify(MOE_WAIT_B6, nullptr, none) == MOE_WAIT_B6, "a scatter wait is B6");
     CHECK(moe_hostpath_wait_classify(MOE_WAIT_JOIN, "ffn_moe_down-3", none) == MOE_WAIT_B5,
