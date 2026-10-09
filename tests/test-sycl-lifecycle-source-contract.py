@@ -935,10 +935,10 @@ checks = {
     "DL early and late inventory planning parity": "ggml_backend_sycl_stage_inventory_plan" in public
     and "hooks.stage_inventory(&inventory, &envelope, early)" in llama
     and "defined(GGML_BACKEND_DL)" in llama
-    and "llama_model_sycl_compute_early_plan(ml, hparams, __func__)" in llama
+    and "llama_model_sycl_compute_early_plan(ml, *this, __func__)" in llama
     and "ggml_backend_reg_get_proc_address(reg, \"ggml_backend_sycl_stage_inventory_plan\")" in llama
     and "strcmp(name, \"ggml_backend_sycl_stage_inventory_plan\")" in backend
-    and "llama_model_sycl_set_late_inventory(ml, hparams, __func__)" in llama
+    and "llama_model_sycl_set_late_inventory(ml, *this, __func__)" in llama
     and "sycl_model_loading_guard.txn.id != 0 && has_sycl_weight_buft" in llama
     and "if (sycl_model_backend && ml.use_mmap)" in llama
     and "disabling mmap for SYCL weight layout upload" in llama

@@ -252,11 +252,13 @@ struct ggml_sycl_tensor_info {
 // ggml_sycl_tensor_inventory::kv_layer_kind[] below. SHARED covers layers
 // with no K/V tensors of their own (Gemma 4/3n's reuse pattern,
 // llama_hparams::has_kv() == false); the planner must charge them 0 bytes
-// instead of the SWA or FULL formula.
+// instead of the SWA or FULL formula. Since llama.cpp-8ecj it also covers a
+// layer the memory's KV cache does not hold (a hybrid model's recurrent
+// layers, every layer of a recurrent model).
 enum ggml_sycl_kv_layer_kind {
     GGML_SYCL_KV_LAYER_FULL   = 0,  // full n_ctx-window attention, has its own K/V
     GGML_SYCL_KV_LAYER_SWA    = 1,  // sliding-window attention, has its own K/V
-    GGML_SYCL_KV_LAYER_SHARED = 2,  // no K/V of its own -- reuses an earlier layer's
+    GGML_SYCL_KV_LAYER_SHARED = 2,  // no K/V of its own -- reuses an earlier layer's, or the KV cache holds none
 };
 
 struct ggml_sycl_tensor_inventory {

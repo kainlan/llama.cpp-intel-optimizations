@@ -348,14 +348,22 @@ struct llama_model_sycl_kv_layer_arrays {
 // trailing reused-KV layers) gets width 0; SWA/FULL both use
 // hparams.n_embd_{k,v}_gqa(il), which is already per-layer (switches on
 // is_swa(il) internally -- see llama-hparams.cpp).
-static llama_model_sycl_kv_layer_arrays llama_model_sycl_build_kv_layer_arrays(const llama_hparams & hparams,
-                                                                               uint32_t              n_layer) {
+// llama.cpp-8ecj: whether a layer owns K/V comes from the memory the default
+// context builds (llama_kv_layer_owners_default), not from has_kv() alone: a
+// hybrid model's recurrent layers pass has_kv() but the KV cache holds none of
+// them, and charging them KV made the planner reserve and demote 4x the KV
+// Qwen3-Next allocates. A memory kind the shapes do not model keeps has_kv().
+static llama_model_sycl_kv_layer_arrays llama_model_sycl_build_kv_layer_arrays(const llama_model & model,
+                                                                               uint32_t            n_layer) {
+    const llama_hparams &            hparams = model.hparams;
+    const llama_kv_layer_owners      owners  = llama_kv_layer_owners_default(model);
     llama_model_sycl_kv_layer_arrays out;
     out.k_width.reset(new uint32_t[n_layer]);
     out.v_width.reset(new uint32_t[n_layer]);
     out.kind.reset(new uint8_t[n_layer]);
     for (uint32_t il = 0; il < n_layer; ++il) {
-        if (!hparams.has_kv(il)) {
+        const bool owns_kv = owners.modelled ? il < owners.owns.size() && owners.owns[il] : hparams.has_kv(il);
+        if (!owns_kv) {
             out.kind[il]    = GGML_SYCL_KV_LAYER_SHARED;
             out.k_width[il] = 0;
             out.v_width[il] = 0;
@@ -658,9 +666,10 @@ static void llama_model_sycl_mark_get_rows_only(std::vector<ggml_sycl_tensor_inf
     }
 }
 
-static void llama_model_sycl_compute_early_plan(llama_model_loader &  ml,
-                                                const llama_hparams & hparams,
-                                                const char *          log_func) {
+static void llama_model_sycl_compute_early_plan(llama_model_loader & ml,
+                                                const llama_model &  model,
+                                                const char *         log_func) {
+    const llama_hparams & hparams = model.hparams;
     if (!llama_model_sycl_hooks_enabled()) {
         return;
     }
@@ -686,7 +695,7 @@ static void llama_model_sycl_compute_early_plan(llama_model_loader &  ml,
     for (uint32_t il = 0; il < n_layer; ++il) {
         swa_layer_mask[il] = hparams.is_swa(il);
     }
-    llama_model_sycl_kv_layer_arrays kv_layer_arrays = llama_model_sycl_build_kv_layer_arrays(hparams, n_layer);
+    llama_model_sycl_kv_layer_arrays kv_layer_arrays = llama_model_sycl_build_kv_layer_arrays(model, n_layer);
 
     ggml_sycl_tensor_inventory inventory = {};
     llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(),
@@ -699,9 +708,10 @@ static void llama_model_sycl_compute_early_plan(llama_model_loader &  ml,
                    tensors.size(), total_size / (1024.0 * 1024.0 * 1024.0));
 }
 
-static void llama_model_sycl_set_late_inventory(llama_model_loader &  ml,
-                                                const llama_hparams & hparams,
-                                                const char *          log_func) {
+static void llama_model_sycl_set_late_inventory(llama_model_loader & ml,
+                                                const llama_model &  model,
+                                                const char *         log_func) {
+    const llama_hparams & hparams = model.hparams;
     if (!llama_model_sycl_hooks_enabled()) {
         return;
     }
@@ -740,7 +750,7 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader &  ml,
     for (uint32_t il = 0; il < n_layer; ++il) {
         swa_layer_mask[il] = hparams.is_swa(il);
     }
-    llama_model_sycl_kv_layer_arrays kv_layer_arrays = llama_model_sycl_build_kv_layer_arrays(hparams, n_layer);
+    llama_model_sycl_kv_layer_arrays kv_layer_arrays = llama_model_sycl_build_kv_layer_arrays(model, n_layer);
 
     ggml_sycl_tensor_inventory inventory = {};
     llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(),
@@ -2277,7 +2287,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool                     resolved_sycl_weight_owner = sycl_layer_assignment || sycl_tensor_override;
     llama_model_sycl_loading_guard sycl_model_loading_guard(resolved_sycl_weight_owner, &sycl_model_token);
     if (sycl_model_loading_guard.active) {
-        llama_model_sycl_compute_early_plan(ml, hparams, __func__);
+        llama_model_sycl_compute_early_plan(ml, *this, __func__);
     }
 #endif
 
@@ -2622,7 +2632,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             throw std::runtime_error(probe.refusal);
         }
 
-        llama_model_sycl_set_late_inventory(ml, hparams, __func__);
+        llama_model_sycl_set_late_inventory(ml, *this, __func__);
 
         // (b) the admitted measure, llama.cpp-p6i0: c(P) at the placement the late plan just packed, before the
         // dev_layer sync, so the late check below compares the final placement with it. Refused when it outgrew

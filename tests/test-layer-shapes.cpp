@@ -272,6 +272,40 @@ static bool all_on_arena(const llama_model &, uint32_t) {
     return true;
 }
 
+// llama.cpp-8ecj: the SYCL placement inventory charges KV for the layers llama_kv_layer_owners_default() says own
+// K/V. They must be exactly the layers the context's memory created K/V for, in every config: a hybrid model's
+// recurrent layers pass hparams.has_kv() but own none, which is how Qwen3-Next came to be charged 48 KV layers
+// where its cache holds 12.
+static int n_owner_layers_equal    = 0;
+static int n_owner_overcount_cases = 0;  // memories where has_kv() would charge a layer the cache does not hold
+
+static void check_kv_owners(const char * arch_name, const config & cfg, llama_context * ctx, const memory_view & mv) {
+    const llama_model &         model   = ctx->get_model();
+    const llama_kv_layer_owners owners  = llama_kv_layer_owners_default(model);
+    const int                   n_layer = (int) model.hparams.n_layer_all;
+
+    const bool modelled = mv.kind == "kv" || mv.kind == "iswa" || mv.kind == "hybrid" || mv.kind == "hybrid_iswa" ||
+                          mv.kind == "hybrid_idx" || mv.kind == "recurrent" || mv.kind == "none";
+    CHECK(owners.modelled == modelled, "%s/%s: kind '%s' owners modelled=%d", arch_name, cfg.name, mv.kind.c_str(),
+          (int) owners.modelled);
+    if (!owners.modelled) {
+        CHECK(owners.owns.empty(), "%s/%s: an unmodelled kind published owners", arch_name, cfg.name);
+        return;
+    }
+    CHECK((int) owners.owns.size() == n_layer, "%s/%s: %zu owners for %d layers", arch_name, cfg.name,
+          owners.owns.size(), n_layer);
+    bool overcount = false;
+    for (int il = 0; il < n_layer && il < (int) owners.owns.size(); ++il) {
+        bool                 amb = false;
+        const realised_layer r   = realise_kv(mv, il, amb);
+        CHECK(owners.owns[il] == r.owned, "%s/%s: layer %d owner=%d but the memory %s K/V", arch_name, cfg.name, il,
+              (int) owners.owns[il], r.owned ? "created" : "created no");
+        n_owner_layers_equal += owners.owns[il] == r.owned ? 1 : 0;
+        overcount = overcount || (model.hparams.has_kv((uint32_t) il) && !r.owned);
+    }
+    n_owner_overcount_cases += overcount ? 1 : 0;
+}
+
 static int n_rs_layers_equal  = 0;
 static int n_idx_layers_equal = 0;
 
@@ -704,6 +738,7 @@ int main() {
             dump_arch(dump, arch_name, cfg, mv, (int) ctx->get_model().hparams.n_layer_all);
             check_shapes(arch_name, cfg, ctx, mv);
             check_no_alloc(arch_name, cfg, ctx, mv);
+            check_kv_owners(arch_name, cfg, ctx, mv);
             check_shift_caches(arch_name, cfg, ctx, mv);
         }
     }
@@ -731,6 +766,11 @@ int main() {
     // the recurrent equality compared real layers, and the shift check saw a memory that shifts
     CHECK(n_rs_layers_equal >= 20, "VOID: only %d recurrent layers were compared with the realised r/s tensors",
           n_rs_layers_equal);
+    // the owner comparison ran on real layers, and on a memory where has_kv() over-counts (a hybrid or a
+    // recurrent model), which is the case the owners exist for
+    CHECK(n_owner_layers_equal > 0 && n_owner_overcount_cases > 0,
+          "VOID: %d layers compared with the KV owners, %d memories where has_kv() over-counts", n_owner_layers_equal,
+          n_owner_overcount_cases);
     CHECK(shift_kinds_nonempty.count("kv") == 1 && shift_kinds_nonempty.count("iswa") == 1,
           "VOID: the shift check found no shifting cache in a plain or an iSWA memory");
     CHECK(shift_kinds_checked.count("recurrent") == 1 && shift_kinds_checked.count("hybrid") == 1,

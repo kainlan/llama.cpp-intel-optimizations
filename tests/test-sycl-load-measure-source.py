@@ -422,7 +422,7 @@ def stage_order_ok(code: str) -> bool:
     c = code
     done = c.find(z("ml.done_getting_tensors();"))
     probe = c.find(z("llama_load_probe_bound("))
-    late_inv = c.find(z("llama_model_sycl_set_late_inventory(ml, hparams, __func__);"))
+    late_inv = c.find(z("llama_model_sycl_set_late_inventory(ml, *this, __func__);"))
     admit = c.find(z("llama_load_admitted_check("))
     sync = c.find(z("dev_layer sync: corrected"))
     late = c.find(z("llama_load_late_check("))
@@ -432,7 +432,7 @@ def stage_order_ok(code: str) -> bool:
         return False
     if c.count(z("llama_load_probe_bound(")) != 1 or c.count(z("llama_load_admitted_check(")) != 1:
         return False
-    if c.count(z("llama_model_sycl_set_late_inventory(ml, hparams, __func__);")) != 1:
+    if c.count(z("llama_model_sycl_set_late_inventory(ml, *this, __func__);")) != 1:
         return False
     args = z("llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn,")
     probe_seg = c[probe:late_inv]
@@ -1035,7 +1035,7 @@ def test_stage_order_mutants():
     probe_call_start = code.find(z("llama_load_probe_bound("))
     admit_call_start = code.find(z("llama_load_admitted_check("))
     assert probe_call_start != -1 and admit_call_start != -1
-    late_inv = z("llama_model_sycl_set_late_inventory(ml, hparams, __func__);")
+    late_inv = z("llama_model_sycl_set_late_inventory(ml, *this, __func__);")
     # the probe after the pack: the late inventory moved in front of the probe
     moved_pack = code.replace(late_inv, "", 1)
     moved_pack = moved_pack.replace(z("ml.done_getting_tensors();"), z("ml.done_getting_tensors();") + late_inv, 1)

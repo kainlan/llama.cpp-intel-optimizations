@@ -134,6 +134,20 @@ llama_kv_layer_shapes_result llama_kv_layer_shapes(const llama_model &         m
                                                    const llama_memory_params & params_mem,
                                                    const llama_cparams &       cparams);
 
+// Which layers own K/V in the memory a default context of this model builds (llama.cpp-8ecj): what the SYCL placement
+// inventory publishes as each layer's KV kind, so the planner charges KV for exactly the layers the KV cache holds.
+// `modelled` is false for the kinds llama_kv_layer_shapes() does not model (MSA, DSA, DSA_ISWA, DSV4), and the caller
+// keeps hparams.has_kv(). When it is true, a layer whose `owns` is false has no K/V of its own: filtered (a hybrid
+// model's recurrent layers), reused or shared, or the memory has no KV cache at all (a recurrent or encoder model).
+// Which layers a cache owns does not depend on the cache type, the sequence count or flash attention, so the default
+// context's answer holds for every main context of the model.
+struct llama_kv_layer_owners {
+    bool              modelled = false;
+    std::vector<bool> owns;  // indexed by the model's layer index, size n_layer_all when modelled
+};
+
+llama_kv_layer_owners llama_kv_layer_owners_default(const llama_model & model);
+
 // One recurrent-state layer: exactly the arguments llama_memory_recurrent passes to ggml_new_tensor_2d
 // for r_l and s_l.
 struct llama_rs_layer_shape {

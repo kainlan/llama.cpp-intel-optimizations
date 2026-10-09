@@ -149,6 +149,34 @@ llama_kv_layer_shapes_result llama_kv_layer_shapes(const llama_model &         m
     return res;
 }
 
+llama_kv_layer_owners llama_kv_layer_owners_default(const llama_model & model) {
+    llama_kv_layer_owners out;
+
+    const llama_memory_params params_mem = {
+        /*.type_k    =*/GGML_TYPE_F16,
+        /*.type_v    =*/GGML_TYPE_F16,
+        /*.swa_full  =*/false,
+        /*.ctx_type  =*/LLAMA_CONTEXT_TYPE_DEFAULT,
+        /*.mem_other =*/nullptr,
+    };
+    llama_cparams cparams = {};
+    cparams.n_seq_max     = 1;
+    cparams.ctx_type      = LLAMA_CONTEXT_TYPE_DEFAULT;
+
+    const llama_kv_layer_shapes_result kv = llama_kv_layer_shapes(model, params_mem, cparams);
+    if (!kv.unsupported.empty()) {
+        return out;
+    }
+
+    // a kind with no KV cache (recurrent, none) publishes no layers: every layer owns none
+    out.modelled = true;
+    out.owns.assign(model.hparams.n_layer_all, false);
+    for (size_t il = 0; il < kv.layers.size() && il < out.owns.size(); ++il) {
+        out.owns[il] = kv.layers[il].has_kv;
+    }
+    return out;
+}
+
 llama_rs_layer_shapes_result llama_rs_layer_shapes_for(const llama_model &         model,
                                                        const llama_memory_params & params_mem,
                                                        const llama_cparams &       cparams,
