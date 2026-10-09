@@ -98,9 +98,10 @@ struct cpu_expert_pool_trace_totals {
     // GGML_TYPE_COUNT + 1 the jobs that ran no row loop: the batched kernel
     // returned before it, or every task took the MXFP4 multi-activation path.
     //   threads_max  most threads one job of the type ran on
-    //   overlapped   jobs that started while another pool job was running: the
-    //                pools share one CPU arena, so those jobs' compute times
-    //                overlap and their sum overstates the time they took
+    //   overlapped   jobs that ran at the same time as another pool job at some
+    //                point (both jobs of an overlapping pair count): the pools
+    //                share one CPU arena, so those jobs' compute times overlap
+    //                and their sum overstates the time they took
     struct type_totals {
         uint64_t jobs        = 0;
         uint64_t rows        = 0;
@@ -117,6 +118,23 @@ struct cpu_expert_pool_trace_totals {
 void cpu_expert_pool_trace_take(cpu_expert_pool_trace_totals & out);
 void cpu_expert_pool_trace_note_join(bool was_ready);
 
+// Whether a pool job ran at the same time as another at any point of its run
+// (llama.cpp-y9i6): another job was running when it began, or another began
+// before it ended. Both jobs of an overlapping pair see it. Used only while
+// tracing.
+struct cpu_expert_pool_overlap_clock {
+    std::atomic<int>      running{ 0 };
+    std::atomic<uint64_t> starts{ 0 };
+};
+
+struct cpu_expert_pool_overlap_ticket {
+    bool     running_at_start = false;
+    uint64_t start            = 0;
+};
+
+cpu_expert_pool_overlap_ticket cpu_expert_pool_overlap_begin(cpu_expert_pool_overlap_clock & clock);
+bool cpu_expert_pool_overlap_end(cpu_expert_pool_overlap_clock & clock, const cpu_expert_pool_overlap_ticket & ticket);
+
 // Adds one finished job to `totals`, in the job's type slot as well (the
 // no-row slot when ph.rows is 0, whatever ph.type says).
 void cpu_expert_pool_trace_add_job(cpu_expert_pool_trace_totals &         totals,
@@ -130,7 +148,8 @@ void cpu_expert_pool_trace_add_job(cpu_expert_pool_trace_totals &         totals
 // and "none" for the two extra slots,
 // " <type>:jobs=J,rows=R,bytes=B,compute=Cus,gbps=G,thr=A/M,ovl=O",
 // where G is bytes over the summed compute time (decimal GB/s), A the mean and
-// M the most threads per job. Empty when there were no jobs.
+// M the most threads per job, and O the jobs that overlapped another pool job.
+// Empty when there were no jobs.
 std::string cpu_expert_pool_trace_format_types(const cpu_expert_pool_trace_totals & totals);
 
 }  // namespace ggml_sycl

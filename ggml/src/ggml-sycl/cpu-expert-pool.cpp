@@ -157,8 +157,23 @@ std::string cpu_expert_pool_trace_format_types(const cpu_expert_pool_trace_total
     return out;
 }
 
-// Pool jobs running now, over every pool (they share one CPU arena).
-static std::atomic<int> g_pool_trace_running{ 0 };
+cpu_expert_pool_overlap_ticket cpu_expert_pool_overlap_begin(cpu_expert_pool_overlap_clock & clock) {
+    cpu_expert_pool_overlap_ticket ticket;
+    ticket.running_at_start = clock.running.fetch_add(1) > 0;
+    ticket.start            = clock.starts.fetch_add(1);
+    return ticket;
+}
+
+bool cpu_expert_pool_overlap_end(cpu_expert_pool_overlap_clock & clock, const cpu_expert_pool_overlap_ticket & ticket) {
+    // Read the starts before leaving, so a job that begins after this one ended
+    // is not counted against it.
+    const bool started_during = clock.starts.load() > ticket.start + 1;
+    clock.running.fetch_sub(1);
+    return ticket.running_at_start || started_during;
+}
+
+// Pool jobs over every pool (they share one CPU arena).
+static cpu_expert_pool_overlap_clock g_pool_trace_overlap;
 
 static void pool_trace_record_job(size_t                       n_tasks,
                                   pool_trace_clock::time_point t_submit,
@@ -188,10 +203,13 @@ std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task> tasks
         // arena (simd_mxfp4_q8_0_16row reading a stale weight_host).
         work_queue_.push([tasks = std::move(tasks), promise, trace, t_submit]() mutable {
             const pool_trace_clock::time_point t_start = trace ? pool_trace_clock::now() : t_submit;
-            const bool overlapped = trace && g_pool_trace_running.fetch_add(1, std::memory_order_relaxed) > 0;
+            cpu_expert_pool_overlap_ticket     ticket;
+            if (trace) {
+                ticket = cpu_expert_pool_overlap_begin(g_pool_trace_overlap);
+            }
             ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
             if (trace) {
-                g_pool_trace_running.fetch_sub(1, std::memory_order_relaxed);
+                const bool overlapped = cpu_expert_pool_overlap_end(g_pool_trace_overlap, ticket);
                 pool_trace_record_job(tasks.size(), t_submit, t_start, pool_trace_clock::now(), overlapped);
             }
             promise->set_value();

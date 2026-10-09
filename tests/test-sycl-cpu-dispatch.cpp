@@ -519,6 +519,38 @@ static bool test_pool_trace_per_type() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Test 7: both jobs of an overlapping pair are marked as overlapped
+// ---------------------------------------------------------------------------
+
+static bool test_pool_trace_overlap_both_ends() {
+    printf("test_pool_trace_overlap_both_ends ... ");
+    using ggml_sycl::cpu_expert_pool_overlap_begin;
+    using ggml_sycl::cpu_expert_pool_overlap_end;
+
+    ggml_sycl::cpu_expert_pool_overlap_clock clock;
+
+    // B starts and ends inside A.
+    const auto a     = cpu_expert_pool_overlap_begin(clock);
+    const auto b     = cpu_expert_pool_overlap_begin(clock);
+    const bool b_ovl = cpu_expert_pool_overlap_end(clock, b);
+    const bool a_ovl = cpu_expert_pool_overlap_end(clock, a);
+    // D starts inside C and ends after it.
+    const auto c     = cpu_expert_pool_overlap_begin(clock);
+    const auto d     = cpu_expert_pool_overlap_begin(clock);
+    const bool c_ovl = cpu_expert_pool_overlap_end(clock, c);
+    const bool d_ovl = cpu_expert_pool_overlap_end(clock, d);
+    // E runs alone.
+    const auto e     = cpu_expert_pool_overlap_begin(clock);
+    const bool e_ovl = cpu_expert_pool_overlap_end(clock, e);
+    if (!a_ovl || !b_ovl || !c_ovl || !d_ovl || e_ovl) {
+        printf("FAIL (a=%d b=%d c=%d d=%d e=%d, want 1 1 1 1 0)\n", a_ovl, b_ovl, c_ovl, d_ovl, e_ovl);
+        return false;
+    }
+    printf("OK\n");
+    return true;
+}
+
 int main() {
     // Tracing is decided once, at the first batched call, so it is switched on
     // before any test runs one. It only adds timing to the other tests.
@@ -542,6 +574,7 @@ int main() {
     run(test_config_functions);
     run(test_trace_phase_type_key);
     run(test_pool_trace_per_type);
+    run(test_pool_trace_overlap_both_ends);
 
     printf("\n%d passed, %d failed\n", n_pass, n_fail);
     return n_fail > 0 ? 1 : 0;
