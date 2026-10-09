@@ -30992,23 +30992,19 @@ static void log_kv_context_room(const kv_context_room & room, const placement_kv
     if (room.wanted == 0) {
         return;
     }
-    const double mib  = 1024.0 * 1024.0;
-    const bool   warn = room.displaced_bytes() > 0 || room.held < room.wanted;
-    const char * fmt =
-        "[PLACEMENT] KV context room on device %d: held %.1f MiB of %.1f MiB for n_ctx=%u over n_ctx=%u (%zu "
-        "layer(s)), before the routed experts%s; it cost %.1f MiB of device-resident routed experts: %.1f MiB (%zu "
-        "triplet(s)) on the device, against %.1f MiB (%zu) with the room added back. "
-        "The room is for n_ctx_train: the load does not see -c.\n";
+    const double mb         = 1024.0 * 1024.0;  // MB as the sibling [PLACEMENT] lines print it
+    const bool   warn       = room.displaced_bytes() > 0 || room.held < room.wanted;
     const char * short_note = room.held < room.wanted ? ", all that was left; the context's overflow is re-placed" : "";
-    if (warn) {
-        GGML_LOG_WARN(fmt, device_id, room.held / mib, room.wanted / mib, kv_info.n_ctx_context, kv_info.n_ctx,
-                      room.n_layers, short_note, room.displaced_bytes() / mib, room.expert_bytes / mib,
-                      room.expert_groups, room.expert_bytes_without / mib, room.expert_groups_without);
-    } else {
-        GGML_LOG_INFO(fmt, device_id, room.held / mib, room.wanted / mib, kv_info.n_ctx_context, kv_info.n_ctx,
-                      room.n_layers, short_note, room.displaced_bytes() / mib, room.expert_bytes / mib,
-                      room.expert_groups, room.expert_bytes_without / mib, room.expert_groups_without);
-    }
+    // ggml_log_internal, not the GGML_LOG_* macros, so the level is chosen at run time and the arguments are written
+    // once.
+    ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
+                      "[PLACEMENT] KV context room on device %d: held %.1f MB of %.1f MB for n_ctx_context=%u over "
+                      "planner n_ctx=%u (%zu layer(s)), before the routed experts%s; it cost %.1f MB of "
+                      "device-resident routed experts: %.1f MB (%zu triplet(s)) on the device, against %.1f MB (%zu) "
+                      "with the room added back. The room is for n_ctx_train: the load does not see -c.\n",
+                      device_id, room.held / mb, room.wanted / mb, kv_info.n_ctx_context, kv_info.n_ctx, room.n_layers,
+                      short_note, room.displaced_bytes() / mb, room.expert_bytes / mb, room.expert_groups,
+                      room.expert_bytes_without / mb, room.expert_groups_without);
 }
 
 placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,

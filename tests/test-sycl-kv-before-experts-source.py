@@ -206,10 +206,10 @@ def claim_room_line_is_visible_and_names_its_limit(cache: str) -> bool:
     the room cost experts or could not hold all it wanted, so a default run shows it."""
     b = body(norm(cache), ROOM_LOG_SIG)
     return (bool(b) and "const bool warn = room.displaced_bytes() > 0 || room.held < room.wanted;" in b
-            and ordered(b, "if (warn) { GGML_LOG_WARN(fmt,", "} else { GGML_LOG_INFO(fmt,")
-            and "held %.1f MiB of %.1f MiB" in b and "it cost %.1f MiB of device-resident routed experts" in b
-            and "with the room added back" in b
-            and "The room is for n_ctx_train: the load does not see -c." in b)
+            and "ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO," in b
+            and "held %.1f MB of %.1f MB for n_ctx_context=%u over \" \"planner n_ctx=%u" in b
+            and "it cost %.1f MB of \" \"device-resident routed experts" in b
+            and "with the room added back. The room is for n_ctx_train: the load does not see -c." in b)
 
 
 def claim_extra_is_the_context_minus_the_charge(hpp: str) -> bool:
