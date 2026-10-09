@@ -16,20 +16,20 @@ blanked:
   * none of the ring's names: acquire_staging, release_staging, StagingSlot,
     RingEntry, RING_SLOTS, ring_, ring_handle_, ring_mutex_, or the
     "cpu_expert_ring" allocation tag;
-  * no allocation: no unified_allocate, unified_alloc or alloc_request in
-    either file, and no mem_handle, alloc_handle or alloc_owner in the class
-    body or anywhere in the .cpp, in any form (a member of any name, a
-    container of handles, a file-scope handle), so the pool owns no memory;
-  * CpuExpertPool::init() takes no SYCL queue and no buffer geometry, only
-    its thread count.
+  * no allocation: no unified_allocate, unified_alloc or alloc_request, and
+    no mem_handle, alloc_handle or alloc_owner anywhere in either file, in
+    any form (a member of any name, a container of handles, a file-scope
+    handle, an alias such as `using pool_handle = mem_handle;`), so the pool
+    owns no memory;
+  * the class declares exactly one init(), and it takes only `int n_threads`:
+    no SYCL queue and no buffer geometry, in any overload.
 
 NOT VACUOUS.  --self-test runs the gate on in-memory mutants (each ring name
 declared again, the allocation tag, an allocation call, an alloc_request, each
-handle type in several forms, a queue parameter on init) and requires each to
-FAIL; it
-then requires a comment that mentions the ring to PASS, which shows the check
-reads code rather than prose, and finally requires the unmodified tree to
-pass.  The mutants are inserted at whitespace-tolerant regex anchors that
+handle type in several forms including an alias, a queue parameter on init, a
+second init overload) and requires each to FAIL.  It then requires a comment
+that mentions the ring to PASS, which shows the check reads code rather than
+prose, and finally requires the unmodified tree to pass.  The mutants are inserted at whitespace-tolerant regex anchors that
 must match exactly once, so a clang-format re-wrap of the pool does not break
 the self-test.  --root runs the gate on another tree, which is how the mutants
 were also checked against a git-archive copy.
@@ -139,11 +139,7 @@ def check(hpp_raw: str | None, cpp_raw: str | None) -> None:
                     f"and CPU expert staging comes from the PinnedBufferPool ({TAG})"
                 )
 
-    hpp, cpp = files[0][1], files[1][1]
-    body = class_body(hpp)
-    if body is None:
-        raise ContractError(f"FAIL: cpu-expert-pool.hpp declares no class CpuExpertPool body ({TAG})")
-    for name, src in (("class CpuExpertPool", body), ("cpu-expert-pool.cpp", cpp)):
+    for name, src in files:
         m = OWNERSHIP_TYPES.search(src)
         if m:
             raise ContractError(
@@ -151,13 +147,19 @@ def check(hpp_raw: str | None, cpp_raw: str | None) -> None:
                 f"allocation handle or owner ({TAG})"
             )
 
-    m = re.search(r"\bvoid\s+init\s*\(([^)]*)\)\s*;", hpp)
-    if not m:
-        raise ContractError(f"FAIL: cpu-expert-pool.hpp declares no CpuExpertPool::init() ({TAG})")
-    params = [p.strip() for p in m.group(1).split(",") if p.strip()]
-    if len(params) != 1 or not re.match(r"int\s+n_threads\b", params[0]):
+    body = class_body(files[0][1])
+    if body is None:
+        raise ContractError(f"FAIL: cpu-expert-pool.hpp declares no class CpuExpertPool body ({TAG})")
+    inits = re.findall(r"\binit\s*\(([^)]*)\)", body)
+    if len(inits) != 1:
         raise ContractError(
-            f"FAIL: CpuExpertPool::init({m.group(1).strip()}) takes more than its thread count; buffer geometry or "
+            f"FAIL: class CpuExpertPool declares {len(inits)} init() overloads; it must declare exactly one, taking "
+            f"only its thread count ({TAG})"
+        )
+    params = [p.strip() for p in inits[0].split(",") if p.strip()]
+    if len(params) != 1 or not re.fullmatch(r"int\s+n_threads(?:\s*=\s*\w+)?", params[0]):
+        raise ContractError(
+            f"FAIL: CpuExpertPool::init({inits[0].strip()}) takes more than its thread count; buffer geometry or "
             f"a SYCL queue means the pool is allocating again ({TAG})"
         )
 
@@ -214,6 +216,13 @@ def mutants(hpp: str, cpp: str) -> list[tuple[str, str, str]]:
         ("cpp file-scope alloc_owner", "static alloc_owner g_ring_owner;\n"),
     ):
         out.append((name, hpp, insert_after(cpp, NS_ANCHOR, line, name)))
+    out.append(("header aliases mem_handle and the class holds the alias",
+                insert_after(insert_after(hpp, NS_ANCHOR, "using pool_handle = mem_handle;\n", "alias"),
+                             CLASS_ANCHOR, "    pool_handle h_;\n", "alias member"), cpp))
+    out.append(("header-level alloc_owner outside the class",
+                insert_after(hpp, NS_ANCHOR, "inline alloc_owner * g_pool_owner = nullptr;\n", "hpp owner"), cpp))
+    out.append(("second init overload takes a queue",
+                insert_after(hpp, CLASS_ANCHOR, "    void init(int n_threads, sycl::queue & q);\n", "overload"), cpp))
     out.append(("init takes a queue again", replace_once(
         hpp, INIT_DECL, "void init(int n_threads, size_t max_experts, sycl::queue & q);", "init"), cpp))
     return out
@@ -226,6 +235,9 @@ def harmless(hpp: str, cpp: str) -> list[tuple[str, str, str]]:
 
 
 def self_test(root: Path) -> int:
+    if not (root / HPP_REL).exists() or not (root / CPP_REL).exists():
+        print(f"SELF-TEST FAIL: no {HPP_REL} / {CPP_REL} under {root}")
+        return 1
     hpp = (root / HPP_REL).read_text()
     cpp = (root / CPP_REL).read_text()
     caught = 0
@@ -237,14 +249,15 @@ def self_test(root: Path) -> int:
             continue
         print(f"SELF-TEST FAIL: mutant '{name}' passed the gate")
         return 1
-    for name, h, c in harmless(hpp, cpp):
+    probes = harmless(hpp, cpp)
+    for name, h, c in probes:
         try:
             check(h, c)
         except ContractError as e:
             print(f"SELF-TEST FAIL: harmless probe '{name}' failed the gate: {e}")
             return 1
     run(root)
-    print(f"SELF-TEST PASS: {caught} mutants caught, 1 harmless probe passed, unmodified tree passes")
+    print(f"SELF-TEST PASS: {caught} mutants caught, {len(probes)} harmless probe(s) passed, unmodified tree passes")
     return 0
 
 
