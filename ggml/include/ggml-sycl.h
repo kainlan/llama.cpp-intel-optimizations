@@ -350,6 +350,14 @@ struct ggml_sycl_tensor_inventory {
     const uint32_t *               kv_v_width_per_layer;  // Per-layer V width (elements) [kv_layer_count]; symmetric
     const uint8_t *                kv_layer_kind;         // Per-layer enum ggml_sycl_kv_layer_kind [kv_layer_count]
     uint32_t                       kv_layer_count;        // Length of the three arrays above (0 = not populated)
+    // llama.cpp-8ecj: the key width of each layer's indexer key cache (llama_memory_hybrid_idx, qwen4exp: one key head
+    // of indexer_head_size, no V) [kv_layer_count]; 0 where a layer has none, NULL for a memory with no indexer cache.
+    // It is a second KV buffer over the same cells as the layer's K/V, kept apart from kv_k_width_per_layer so every
+    // budget adds both while the allocator sizes each buffer from its own cache. Appended: the struct grew from 176
+    // to 184 bytes, which ggml-sycl.cpp pins with static_asserts. The inventory is one struct passed by pointer, never
+    // an array indexed across the dlopen boundary, but a stale libllama would leave these 8 bytes unwritten, so
+    // libllama and libggml-sycl must be rebuilt together.
+    const uint32_t *               kv_idx_k_width_per_layer;
 };
 
 // SYCL-side projection of the four placement-envelope fields the llama

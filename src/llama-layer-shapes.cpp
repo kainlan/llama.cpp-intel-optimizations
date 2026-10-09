@@ -174,6 +174,10 @@ llama_kv_layer_owners llama_kv_layer_owners_default(const llama_model & model) {
     for (size_t il = 0; il < kv.layers.size() && il < out.owns.size(); ++il) {
         out.owns[il] = kv.layers[il].has_kv;
     }
+    out.idx_k_width.assign(model.hparams.n_layer_all, 0);
+    for (size_t il = 0; il < kv.layers_idx.size() && il < out.idx_k_width.size(); ++il) {
+        out.idx_k_width[il] = kv.layers_idx[il].has_kv ? kv.layers_idx[il].n_embd_k_gqa : 0;
+    }
     return out;
 }
 

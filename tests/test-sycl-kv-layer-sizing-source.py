@@ -603,9 +603,9 @@ def test_mutation_kv_bytes_for_layer_stops_forwarding_kv_unified_is_witnessed() 
     hpp = UNIFIED_CACHE_HPP.read_text()
     mutated = hpp.replace(
         "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
-        "                                           n_seq_max, kv_unified, swa_full);",
+        "                                           n_seq_max, kv_unified, swa_full) +",
         "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
-        "                                           n_seq_max, false, swa_full);", 1)
+        "                                           n_seq_max, false, swa_full) +", 1)
     _assert_witnessed(hpp, mutated, kv_bytes_for_layer_violations, "without forwarding kv_unified",
                       "kv_bytes_for_layer stops forwarding kv_unified")
 
@@ -614,7 +614,7 @@ def test_mutation_kv_bytes_for_layer_stops_forwarding_swa_full_is_witnessed() ->
     hpp = UNIFIED_CACHE_HPP.read_text()
     mutated = hpp.replace(
         "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
-        "                                           n_seq_max, kv_unified, swa_full);",
+        "                                           n_seq_max, kv_unified, swa_full) +",
         "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
         "                                           n_seq_max, kv_unified, false);", 1)
     _assert_witnessed(hpp, mutated, kv_bytes_for_layer_violations, "without forwarding swa_full",
@@ -626,10 +626,10 @@ def test_mutation_kv_size_for_layer_stops_forwarding_kv_unified_is_witnessed() -
     mutated = hpp.replace(
         "return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],\n"
         "                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,\n"
-        "                                           planner_kv_unified, planner_swa_full);",
+        "                                           planner_kv_unified, planner_swa_full) +",
         "return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],\n"
         "                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,\n"
-        "                                           false, planner_swa_full);", 1)
+        "                                           false, planner_swa_full) +", 1)
     _assert_witnessed(hpp, mutated, kv_size_for_layer_violations, "without forwarding planner_kv_unified",
                       "kv_size_for_layer stops forwarding planner_kv_unified")
 
@@ -639,7 +639,7 @@ def test_mutation_kv_size_for_layer_stops_forwarding_planner_swa_full_is_witness
     mutated = hpp.replace(
         "return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],\n"
         "                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,\n"
-        "                                           planner_kv_unified, planner_swa_full);",
+        "                                           planner_kv_unified, planner_swa_full) +",
         "return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],\n"
         "                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,\n"
         "                                           planner_kv_unified, false);", 1)

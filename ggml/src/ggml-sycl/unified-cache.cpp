@@ -30937,6 +30937,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.layer_kind                          = kv_info.layer_kind;
     plan.layer_k_width                       = kv_info.layer_k_width;
     plan.layer_v_width                       = kv_info.layer_v_width;
+    plan.layer_idx_k_width                   = kv_info.layer_idx_k_width;
     plan.planner_n_ctx                       = kv_info.n_ctx;
     plan.planner_n_ubatch                    = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max =
@@ -32330,6 +32331,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.layer_kind               = kv_info.layer_kind;
     plan.layer_k_width            = kv_info.layer_k_width;
     plan.layer_v_width            = kv_info.layer_v_width;
+    plan.layer_idx_k_width        = kv_info.layer_idx_k_width;
     plan.planner_n_ctx            = kv_info.n_ctx;
     plan.planner_n_ubatch         = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max =

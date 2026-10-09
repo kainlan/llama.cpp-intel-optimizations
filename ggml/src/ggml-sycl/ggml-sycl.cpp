@@ -17016,6 +17016,12 @@ static constexpr bool ggml_sycl_dequant_f16_scratch_drawable() {
 // question a plan merge asks. Defined with the context list below.
 static bool ggml_sycl_other_backend_context_live(int device, const ggml_backend_sycl_context * self);
 
+// The inventory crosses from libllama into this library by pointer, so a field that moves would be read from the wrong
+// place without any error. These pin the KV tail of the layout (llama.cpp-8ecj).
+static_assert(sizeof(ggml_sycl_tensor_inventory) == 184, "ggml_sycl_tensor_inventory layout changed");
+static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168, "kv_layer_count moved");
+static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176, "kv_idx_k_width_per_layer moved");
+
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
 // snapshot.  Idempotent — safe to call from both the early pre-create_tensor
 // entry point and the late set_tensor_inventory entry.  Caller must hold
@@ -17217,6 +17223,13 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         g_placement_kv_info.layer_kind.clear();
         g_placement_kv_info.layer_k_width.clear();
         g_placement_kv_info.layer_v_width.clear();
+    }
+    // llama.cpp-8ecj: the indexer key cache's width per layer, a second KV buffer every budget adds to the K/V.
+    if (inventory->kv_layer_count > 0 && inventory->kv_idx_k_width_per_layer != nullptr) {
+        g_placement_kv_info.layer_idx_k_width.assign(inventory->kv_idx_k_width_per_layer,
+                                                     inventory->kv_idx_k_width_per_layer + inventory->kv_layer_count);
+    } else {
+        g_placement_kv_info.layer_idx_k_width.clear();
     }
     g_placement_kv_info.n_ctx_is_runtime = false;
     if (g_placement_kv_info.valid()) {
@@ -18115,8 +18128,10 @@ static uint32_t ggml_sycl_largest_fitting_n_ctx(const ggml_sycl::placement_plan 
                 swa_bytes += kv_info.kv_bytes_for_layer(layer);
                 continue;
             }
-            full_bytes_per_cell +=
-                static_cast<size_t>(kv_info.layer_k_width[layer] + kv_info.layer_v_width[layer]) * sizeof(ggml_fp16_t);
+            // the indexer keys (llama.cpp-8ecj) grow with n_ctx exactly like the layer's K/V
+            const uint32_t widths =
+                kv_info.layer_k_width[layer] + kv_info.layer_v_width[layer] + kv_info.idx_k_width(layer);
+            full_bytes_per_cell += static_cast<size_t>(widths) * sizeof(ggml_fp16_t);
         } else {
             // Fallback: legacy uniform-width, global SWA/full split (an
             // inventory built before this ticket, or a homogeneous model).

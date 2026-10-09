@@ -339,8 +339,16 @@ void kv_tier_manager::configure_from_plan(int                          device,
     const auto in_buffer = [&](uint32_t l) {
         return buffer_layer_mask == nullptr || (l < buffer_layer_mask->size() && (*buffer_layer_mask)[l] != 0);
     };
+
+    // A llama_memory_hybrid_idx (qwen4exp) holds each attention layer in two
+    // buffers over the same cells: the K/V and the indexer keys. This buffer
+    // is one of them, so it is compared with that cache's own sum, never with
+    // the layers' total, which no single buffer holds (llama.cpp-8ecj). It is
+    // the indexer buffer when its size matches the indexer keys and not the
+    // K/V; every other memory has no indexer keys and keeps the K/V sum.
     bool     truth_covers_buffer = true;
-    size_t   truth_sum           = 0;
+    size_t   main_sum            = 0;
+    size_t   idx_sum             = 0;
     uint32_t buffer_layers       = 0;
     for (uint32_t l = 0; l < n_layers; ++l) {
         if (!in_buffer(l)) {
@@ -351,14 +359,21 @@ void kv_tier_manager::configure_from_plan(int                          device,
             truth_covers_buffer = false;
             break;
         }
-        truth_sum += plan.kv_size_for_layer(l);
+        main_sum += plan.kv_main_size_for_layer(l);
+        idx_sum += plan.kv_idx_size_for_layer(l);
     }
+
+    const size_t total     = slice.total_bytes();
+    const size_t slack     = static_cast<size_t>(buffer_layers) * kv_layer_align_bytes;
+    const auto   describes = [&](size_t sum) {
+        return sum > 0 && sum <= total && total - sum <= slack;
+    };
+    const bool   is_idx_buffer = idx_sum > 0 && !describes(main_sum) && describes(idx_sum);
+    const size_t truth_sum     = is_idx_buffer ? idx_sum : main_sum;
 
     bool use_truth     = truth_covers_buffer && buffer_layers > 0 && truth_sum > 0;
     bool truth_refused = false;
     if (use_truth) {
-        const size_t total = slice.total_bytes();
-        const size_t slack = static_cast<size_t>(buffer_layers) * kv_layer_align_bytes;
         if (truth_sum > total) {
             GGML_LOG_WARN(
                 "[KV-TIER] per-layer KV truth sum %zu B exceeds this buffer's %zu B (%u layers); "
@@ -381,7 +396,7 @@ void kv_tier_manager::configure_from_plan(int                          device,
         // regions of layers outside the buffer before allocating.
         for (uint32_t l = 0; l < n_layers; ++l) {
             if (plan.has_per_layer_kv_truth(l)) {
-                per_layer_kv_bytes_[l] = plan.kv_size_for_layer(l);
+                per_layer_kv_bytes_[l] = is_idx_buffer ? plan.kv_idx_size_for_layer(l) : plan.kv_main_size_for_layer(l);
             }
         }
     } else if (truth_refused) {
