@@ -4307,6 +4307,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-cre6: the host-expert MoE result scatter scratch is the third planned RUNTIME-zone buffer, in the g6yk
+# shape: a planned term published with the MoE control requirement and folded into the RUNTIME zone requirement and
+# the dense fit, claimed whole at publish (after the Q8_1 claim, before the hold is recomputed), charged to the ring
+# re-plan, and never allocated by the scatter itself. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-host-scatter-plan-claim-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-host-scatter-plan-claim-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-pyu4: executes the pure helpers in src/llama-auto-ubatch.h --
 # llama_auto_ubatch_ladder_has_candidate(), the predicate behind the trial's
 # early exit before its ladder loop, on the shapes where no rung lies in
