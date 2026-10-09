@@ -1475,11 +1475,12 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runti
 
 // ---------------------------------------------------------------------------
 // The measured-tenant publish, its coverage query and the load-time late check
-// (llama.cpp-moua L4, doc 2.4.2 and 2.4.4).  DECLARATIONS ONLY: no export in
-// this tree defines them yet and no proc address answers to their names.
-// A null proc address means the backend predates the entry point; the caller
-// then treats it as GROWTH (coverage), NOT_RECORDED (late check) and
-// GGML_SYCL_LIFECYCLE_UNSUPPORTED (publish).  Resolve them with
+// (llama.cpp-moua L4, doc 2.4.2 and 2.4.4), and the load's compute-term record
+// (llama.cpp-p6i0).  The SYCL reg's get_proc_address answers each of them under
+// the "Proc name:" its declaration carries.  A null proc address means the
+// backend predates the entry point; the caller then treats it as GROWTH
+// (coverage), NOT_RECORDED (late check), GGML_SYCL_LIFECYCLE_UNSUPPORTED
+// (publish) and not recorded (the record).  Resolve them with
 // ggml_backend_reg_get_proc_address() under the exact names below.
 //
 // Layout rules, which moua owns: fields are only appended; a reader treats a
@@ -1674,6 +1675,17 @@ GGML_BACKEND_API enum ggml_sycl_tenant_coverage ggml_backend_sycl_tenant_coverag
 GGML_BACKEND_API enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check(struct ggml_sycl_load_txn txn,
                                                                                     int32_t                   device,
                                                                                     uint64_t compute_bytes);
+
+// The early stage's record of a load's compute term (llama.cpp-p6i0): c(P), the compute term measured for device at
+// the load's admitted placement, at the n_ctx that measure ran with.  ggml_backend_sycl_load_late_check compares
+// the late measure against it.  False, recording nothing, when txn is not the open load transaction, when n_ctx is
+// 0 (a measure with no shape has no c(P)), or while the backend admits no mutation (a reactivation or a shutdown is
+// in progress); the late check then answers NOT_RECORDED for the device.  A load's commit or rollback drops what it recorded.
+// Proc name: "ggml_backend_sycl_load_record_compute_term".
+GGML_BACKEND_API bool ggml_backend_sycl_load_record_compute_term(struct ggml_sycl_load_txn txn,
+                                                                 int32_t                   device,
+                                                                 uint64_t                  bytes,
+                                                                 uint32_t                  n_ctx);
 
 // The residency probe (llama.cpp-moua L4 step 3d, llama.cpp-5cim).  Which layers would this context's plan leave in
 // host memory?  A pure plan query: it takes no replan lock, publishes nothing and changes nothing, and works with no

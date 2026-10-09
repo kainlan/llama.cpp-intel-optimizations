@@ -33,6 +33,9 @@ struct llama_sycl_l4_procs {
     decltype(&ggml_backend_sycl_tenant_coverage)          coverage        = nullptr;
     decltype(&ggml_backend_sycl_load_late_check)          late_check      = nullptr;
     decltype(&ggml_backend_sycl_probe_residency)          probe_residency = nullptr;
+    // The load's compute-term record (llama.cpp-p6i0). Not part of available(): the context side and the late
+    // check keep their gate, and the loader's record step checks this member through its own door below.
+    decltype(&ggml_backend_sycl_load_record_compute_term) record_term     = nullptr;
 
     // A planned context needs all four: a publish that cannot be covered-checked, a load that
     // cannot be late-checked, or a plan whose residency cannot be probed, is half a plan.
@@ -100,6 +103,19 @@ inline ggml_sycl_late_check_result llama_sycl_l4_late_check(const llama_sycl_l4_
         default:
             return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
     }
+}
+
+// The load's compute-term record (llama.cpp-p6i0). False is "not recorded", and a null proc reads as it: the late
+// check then answers NOT_RECORDED for the device, which no caller reads as a pass.
+inline bool llama_sycl_l4_record_compute_term(const llama_sycl_l4_procs & procs,
+                                              struct ggml_sycl_load_txn   txn,
+                                              int32_t                     device,
+                                              uint64_t                    bytes,
+                                              uint32_t                    n_ctx) {
+    if (procs.record_term == nullptr) {
+        return false;
+    }
+    return procs.record_term(txn, device, bytes, n_ctx);
 }
 
 // The residency probe's one door: no other code calls the proc pointer or the symbol

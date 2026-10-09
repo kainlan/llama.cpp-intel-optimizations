@@ -13426,15 +13426,11 @@ static bool ggml_sycl_load_txn_is_open(uint64_t txn) {
 // then answers NOT_RECORDED) or when `txn` is not the open load, which the same lock that guards the
 // ledger decides, so no term lands after the clear of a load that ended.
 //
-// NO PRODUCTION CALLER UNTIL L6.  llama.cpp-moua L6 (moua design 2.4.2 (b)) adds the llama-side
-// early measure call site that reaches this; until fkpg(a) puts a non-zero n_ctx in the envelope the
-// only caller is the private test hook below.  It is the single entry on purpose and is not dead
-// code to delete: scripts/check-sycl-l4-proc-registration.py pins that no other function writes the
-// ledger.
-[[maybe_unused]] static bool ggml_sycl_load_record_compute_term(uint64_t txn,
-                                                                int32_t  device,
-                                                                uint64_t bytes,
-                                                                uint32_t n_ctx) {
+// Its callers are the export ggml_backend_sycl_load_record_compute_term (llama.cpp-p6i0), which the
+// loader reaches with c(P) measured at the admitted placement and the n_ctx that measure ran with, and
+// the private test hook below.  It is the single entry on purpose: scripts/check-sycl-l4-proc-registration.py
+// pins that no other function writes the ledger and that nothing else calls this.
+static bool ggml_sycl_load_record_compute_term(uint64_t txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
     ggml_sycl_load_ledger_state & state = ggml_sycl_load_ledger();
     std::lock_guard<std::mutex>   lock(state.mutex);
     return state.ledger.record(txn, device, bytes, n_ctx, ggml_sycl_load_txn_is_open(txn));
@@ -20952,6 +20948,24 @@ enum ggml_sycl_late_check_result ggml_backend_sycl_load_late_check(ggml_sycl_loa
         return r.result;
     } catch (...) {
         return GGML_SYCL_LATE_CHECK_NOT_RECORDED;
+    }
+}
+
+// The early stage's record of a load's compute term (llama.cpp-p6i0): the production caller of the ledger's one
+// writer.  The writer decides, under the ledger's lock, whether txn is the open load and whether n_ctx carries a
+// shape; this adds the module admission and keeps an allocation failure from crossing the C boundary.
+bool ggml_backend_sycl_load_record_compute_term(ggml_sycl_load_txn txn,
+                                                int32_t            device,
+                                                uint64_t           bytes,
+                                                uint32_t           n_ctx) {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return false;
+    }
+    try {
+        return ggml_sycl_load_record_compute_term(txn.id, device, bytes, n_ctx);
+    } catch (...) {
+        return false;
     }
 }
 
@@ -116948,9 +116962,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_for_model") == 0) {
         return (void *) ggml_backend_sycl_set_runtime_context_for_model;
     }
-    // The L4 descriptor publish, the coverage read, the late check and the residency probe.  Each name is the
-    // "Proc name:" its declaration in ggml-sycl.h carries; scripts/check-sycl-l4-proc-registration.py pins that
-    // every such name in the header has an arm here.
+    // The L4 descriptor publish, the coverage read, the late check, the residency probe and the load's compute-term
+    // record (llama.cpp-p6i0).  Each name is the "Proc name:" its declaration in ggml-sycl.h carries;
+    // scripts/check-sycl-l4-proc-registration.py pins that every such name in the header has an arm here.
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_desc") == 0) {
         return (void *) ggml_backend_sycl_set_runtime_context_desc;
     }
@@ -116962,6 +116976,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_probe_residency") == 0) {
         return (void *) ggml_backend_sycl_probe_residency;
+    }
+    if (strcmp(name, "ggml_backend_sycl_load_record_compute_term") == 0) {
+        return (void *) ggml_backend_sycl_load_record_compute_term;
     }
     if (strcmp(name, "ggml_backend_sycl_supports_op_capability") == 0) {
         return (void *) ggml_backend_sycl_supports_op_capability;

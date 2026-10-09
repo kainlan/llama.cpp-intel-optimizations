@@ -805,10 +805,10 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
     return procs;
 }
 
-// The L4 entry points (the tenant publish, coverage query, load-time late check and residency probe). The backend
-// declares them in ggml-sycl.h; a backend that does not define them answers a null proc address
-// and the readers in llama-context-tenant.h then fail closed. Every link mode resolves them the
-// same way, through the SYCL reg's proc address by the names ggml-sycl-l4-procs.h pins, from the
+// The L4 entry points (the tenant publish, coverage query, load-time late check and residency probe) and the load's
+// compute-term record (llama.cpp-p6i0). The backend declares them in ggml-sycl.h; a backend that does not define
+// them answers a null proc address and the readers in llama-context-tenant.h then fail closed. Every link mode
+// resolves them the same way, through the SYCL reg's proc address by the names ggml-sycl-l4-procs.h pins, from the
 // first SYCL backend of the context. No weak reference, no direct reference: one path.
 [[maybe_unused]] static llama_sycl_l4_procs llama_context_sycl_l4_procs_for_dev(ggml_backend_dev_t dev) {
     llama_sycl_l4_procs procs;
@@ -823,6 +823,8 @@ static llama_context_sycl_plan_procs llama_context_sycl_plan_procs_for(const std
         reinterpret_cast<decltype(procs.late_check)>(llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_LATE_CHECK));
     procs.probe_residency = reinterpret_cast<decltype(procs.probe_residency)>(
         llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_PROBE_RESIDENCY));
+    procs.record_term = reinterpret_cast<decltype(procs.record_term)>(
+        llama_context_sycl_proc_addr(dev, GGML_SYCL_PROC_LOAD_RECORD_COMPUTE_TERM));
     return procs;
 }
 

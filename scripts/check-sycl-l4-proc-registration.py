@@ -111,6 +111,8 @@ SIG_LATE = r"\benum\s+ggml_sycl_late_check_result\s+ggml_backend_sycl_load_late_
 SIG_COUNT = r'\bextern\s+"C"\s+size_t\s+ggml_backend_sycl_test_compute_term_count\s*\('
 SIG_COVERAGE = r"\benum\s+ggml_sycl_tenant_coverage\s+ggml_backend_sycl_tenant_coverage\s*\("
 SIG_PROBE = r"\benum\s+ggml_sycl_residency_probe_status\s+ggml_backend_sycl_probe_residency\s*\("
+SIG_RECORD_EXPORT = r"\bbool\s+ggml_backend_sycl_load_record_compute_term\s*\("
+SIG_RECORD_HOOK = r'\bextern\s+"C"\s+bool\s+ggml_backend_sycl_test_record_compute_term\s*\('
 
 HEADER = "ggml/include/ggml-sycl.h"
 SOURCE = "ggml/src/ggml-sycl/ggml-sycl.cpp"
@@ -707,6 +709,38 @@ DOOR_SYMBOL = re.compile(r"(?<!decltype\(&)\bggml_backend_sycl_probe_residency\b
 DOOR_CALL = re.compile(r"(?:\.|->)\s*probe_residency\s*\)?\s*\(")
 
 
+def load_term_pins(header_raw, source, fails):
+    """The load's compute-term record (llama.cpp-p6i0).  The record export is the production caller of the one
+    ledger writer: it reaches the writer, under the module guard, and never the ledger itself; the writer is called
+    only by it and by the private test hook, and is no longer marked unused."""
+    names = header_proc_names(header_raw)
+    for name in ("ggml_backend_sycl_load_record_compute_term",):
+        if name not in names:
+            fails.append("L4 load terms: the header does not name the proc %s" % name)
+    if re.search(r"\[\[maybe_unused\]\]\s*static\s+bool\s+ggml_sycl_load_record_compute_term\s*\(", source):
+        fails.append("L4 load terms: the ledger writer is still marked [[maybe_unused]]")
+    rec = function_body(source, SIG_RECORD_EXPORT)
+    if rec is None:
+        fails.append("L4 load terms: the record export ggml_backend_sycl_load_record_compute_term is not defined")
+    else:
+        g = rec.find("sycl_module_mutation_guard module_guard;")
+        chk = rec.find("if (!module_guard)")
+        call = rec.find("return ggml_sycl_load_record_compute_term(txn.id, device, bytes, n_ctx);")
+        if not (0 <= g < chk < call) or "ggml_sycl_load_ledger" in rec:
+            fails.append("L4 load terms: the record export does not reach the writer under the module guard")
+    spans = [function_span(source, SIG_RECORD_EXPORT), function_span(source, SIG_RECORD_HOOK)]
+    spans = [sp for sp in spans if sp is not None]
+    stray = 0
+    for m in re.finditer(r"\bggml_sycl_load_record_compute_term\s*\(", source):
+        if re.match(r"[^;{]*\)\s*\{", source[m.end():]) and re.search(r"\bbool\s+$", source[:m.start()]):
+            continue  # the writer's own definition
+        if not any(a <= m.start() < b for a, b in spans):
+            stray += 1
+    if stray:
+        fails.append("L4 load terms: the ledger writer is called outside the record export and the test hook "
+                     "(%d call(s))" % stray)
+
+
 def door_texts(root):
     """Every source file under src/ except the door's own, comment-stripped: the files that must never reach the probe."""
     out = {}
@@ -1112,6 +1146,7 @@ def check(header_raw, source):
     if len(re.findall(r"dump_counter::late_term_shrink_admitted", source)) != 1:
         fails.append("L4 late: late_term_shrink_admitted has more or fewer than one producer")
     probe_pins(source, fails)
+    load_term_pins(header_raw, source, fails)
     return fails
 
 
@@ -1734,6 +1769,33 @@ def mutations(header_raw, source):
                   "auto release_rung_buffers = [&]() {\n        synchronize();\n", "auto release_rung_buffers = [&]() {\n"))
     pairs.append(("the backend interface wires cpy_tensor_async", "cpy_tensor_async is referenced beyond its definition",
                   CPY_ASYNC_DEF, "static void h_wire_cpy() { (void) ggml_backend_sycl_cpy_tensor_async; }\n" + CPY_ASYNC_DEF))
+    # llama.cpp-p6i0: the load's compute-term record
+    pairs.append(("the writer marked unused again", "still marked [[maybe_unused]]",
+                  "static bool ggml_sycl_load_record_compute_term(",
+                  "[[maybe_unused]] static bool ggml_sycl_load_record_compute_term("))
+    pairs.append(("a third caller of the ledger writer", "called outside the record export",
+                  "static size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {",
+                  "static void h_third_writer_caller() { (void) ggml_sycl_load_record_compute_term(1, 0, 1, 1); }\n"
+                  "static size_t ggml_sycl_load_clear_compute_terms(uint64_t txn) noexcept {"))
+    for label, msg, sig, old, new in (
+            ("the record export skips the module guard", "does not reach the writer under the module guard",
+             SIG_RECORD_EXPORT, "if (!module_guard)", "if (false)"),
+            ("the record export writes the ledger itself", "does not reach the writer under the module guard",
+             SIG_RECORD_EXPORT, "return ggml_sycl_load_record_compute_term(txn.id, device, bytes, n_ctx);",
+             "return ggml_sycl_load_ledger().ledger.size() == 0;")):
+        span = function_span(src, sig)
+        if span is None or src[span[0]:span[1]].count(old) != 1:
+            muts.append(("PATTERN NOT FOUND: " + label, "PATTERN", header_raw, src))
+        else:
+            a, b = span
+            muts.append((label, msg, header_raw, src[:a] + src[a:b].replace(old, new, 1) + src[b:]))
+    for name in ("ggml_backend_sycl_load_record_compute_term",):
+        line = '// Proc name: "%s".' % name
+        if header_raw.count(line) != 1:
+            muts.append(("PATTERN NOT FOUND: the header's proc name " + name, "PATTERN", header_raw, src))
+        else:
+            muts.append(("the header forgets " + name, "the header does not name the proc " + name,
+                         header_raw.replace(line, "", 1), src))
     for label, msg, old, new in pairs:
         if label == "the first publish reserves under L1":
             lock = ("        std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);\n"

@@ -11,9 +11,11 @@
 //
 // A backend that does not define one of them answers null, which every reader treats as
 // inert: UNSUPPORTED for the publish, GROWTH for the coverage query, NOT_RECORDED for the
-// late check, NOT_ANSWERED for the residency probe.
+// late check, NOT_ANSWERED for the residency probe, and "not recorded" for the load's
+// compute-term record (llama.cpp-p6i0).
 
 #define GGML_SYCL_PROC_SET_RUNTIME_CONTEXT_DESC "ggml_backend_sycl_set_runtime_context_desc"
 #define GGML_SYCL_PROC_TENANT_COVERAGE          "ggml_backend_sycl_tenant_coverage"
 #define GGML_SYCL_PROC_LOAD_LATE_CHECK          "ggml_backend_sycl_load_late_check"
 #define GGML_SYCL_PROC_PROBE_RESIDENCY          "ggml_backend_sycl_probe_residency"
+#define GGML_SYCL_PROC_LOAD_RECORD_COMPUTE_TERM "ggml_backend_sycl_load_record_compute_term"

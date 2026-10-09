@@ -112,6 +112,23 @@ static ggml_sycl_late_check_result wild_late(struct ggml_sycl_load_txn, int32_t,
     return (ggml_sycl_late_check_result) 99;
 }
 
+// The record proc (llama.cpp-p6i0): it keeps what it was handed and answers what the test picks.
+static bool     g_record_answer = true;
+static int      g_record_calls  = 0;
+static uint64_t g_record_txn    = 0;
+static int32_t  g_record_dev    = -2;
+static uint64_t g_record_bytes  = 0;
+static uint32_t g_record_n_ctx  = 0;
+
+static bool fake_record(struct ggml_sycl_load_txn txn, int32_t device, uint64_t bytes, uint32_t n_ctx) {
+    g_record_calls++;
+    g_record_txn   = txn.id;
+    g_record_dev   = device;
+    g_record_bytes = bytes;
+    g_record_n_ctx = n_ctx;
+    return g_record_answer;
+}
+
 // The probe procs: one that answers a status the test picks and writes n_layer the way the backend's proc does
 // (never host_resident), and one that answers a value outside the enum.
 static ggml_sycl_residency_probe_status g_probe_answer = GGML_SYCL_RESIDENCY_PROBE_NOT_ANSWERED;
@@ -297,6 +314,39 @@ int main() {
         three.coverage   = &fake_coverage;
         three.late_check = &fake_late;
         CHECK(!three.available(), "the three older procs without the probe are not L4");
+    }
+
+    // (12) the load's compute-term record door (llama.cpp-p6i0)
+    {
+        // a null proc records nothing and says so
+        llama_sycl_l4_procs none;
+        g_record_calls = 0;
+        CHECK(!llama_sycl_l4_record_compute_term(none, ggml_sycl_load_txn{ 9 }, 0, 100, 4096),
+              "a null record proc was read as recorded");
+        CHECK(g_record_calls == 0, "a null proc was called");
+
+        // the proc's answer and every argument pass through
+        llama_sycl_l4_procs procs;
+        procs.record_term = &fake_record;
+        g_record_answer   = true;
+        CHECK(llama_sycl_l4_record_compute_term(procs, ggml_sycl_load_txn{ 43 }, 1, 2154901504ull, 262144),
+              "a recorded term was read as not recorded");
+        CHECK(g_record_calls == 1 && g_record_txn == 43 && g_record_dev == 1 && g_record_bytes == 2154901504ull &&
+                  g_record_n_ctx == 262144,
+              "the record arguments were not forwarded");
+        g_record_answer = false;
+        CHECK(!llama_sycl_l4_record_compute_term(procs, ggml_sycl_load_txn{ 43 }, 1, 1, 262144),
+              "a refused record was read as recorded");
+        g_record_answer = true;
+
+        // the record is not part of the context's L4 gate, either way
+        CHECK(!procs.available(), "the record proc alone made the table L4");
+        llama_sycl_l4_procs four;
+        four.publish         = &fake_publish;
+        four.coverage        = &fake_coverage;
+        four.late_check      = &fake_late;
+        four.probe_residency = &fake_probe;
+        CHECK(four.available(), "the four L4 procs without the record are no longer L4");
     }
 
     // (4) the section builder

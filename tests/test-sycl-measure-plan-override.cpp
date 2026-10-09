@@ -272,6 +272,32 @@ void test_install_refits_kv_for_the_shape() {
     lifecycle_abort_placement_plan(REFIT_TXN);
 }
 
+// llama.cpp-p6i0: the probe plan the early stage stages beside the load's candidate lives exactly as long as the
+// candidate. A load that ends either way, by abort or by publish, leaves no probe plan behind for a later load's
+// measure to find.
+void test_probe_plan_goes_with_the_candidate() {
+    constexpr uint64_t DROP_TXN   = 41004;
+    constexpr uint64_t DROP_MODEL = 0x9e6f0004ull;
+
+    // the abort path
+    lifecycle_stage_placement_plan(DROP_TXN, make_plan(false, 444));
+    lifecycle_stage_probe_placement_plan(DROP_TXN, make_plan(false, 445));
+    CHECK(lifecycle_find_probe_placement_plan(DROP_TXN) != nullptr, "the probe plan was not staged");
+    lifecycle_abort_placement_plan(DROP_TXN);
+    CHECK(lifecycle_find_probe_placement_plan(DROP_TXN) == nullptr, "an aborted load left its probe plan behind");
+    CHECK(!ggml_backend_sycl_measure_plan_override_install(DROP_TXN, GGML_SYCL_MEASURE_STAGE_PROBE, nullptr),
+          "a measure found the probe plan of an aborted load");
+
+    // the publish path
+    lifecycle_stage_placement_plan(DROP_TXN, make_plan(false, 446));
+    lifecycle_stage_probe_placement_plan(DROP_TXN, make_plan(false, 447));
+    CHECK(lifecycle_publish_placement_plan(DROP_MODEL, DROP_TXN, 0, 1, 0, 0, false, nullptr),
+          "the candidate did not publish");
+    CHECK(lifecycle_find_probe_placement_plan(DROP_TXN) == nullptr, "a published load left its probe plan behind");
+    CHECK(lifecycle_find_candidate_placement_plan(DROP_TXN) == nullptr, "the published candidate is still staged");
+    lifecycle_erase_placement_plan(DROP_MODEL, DROP_TXN);
+}
+
 }  // namespace
 
 int main() {
@@ -282,6 +308,7 @@ int main() {
     test_publish_is_refused_under_the_override();
     test_latch_read_follows_the_plan();
     test_install_refits_kv_for_the_shape();
+    test_probe_plan_goes_with_the_candidate();
     lifecycle_abort_probe_placement_plan(PROBE_TXN);
     lifecycle_abort_placement_plan(CANDIDATE_TXN);
     if (g_failures != 0) {
