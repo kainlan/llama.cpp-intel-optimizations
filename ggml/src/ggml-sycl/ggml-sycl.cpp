@@ -15809,7 +15809,15 @@ bool ggml_backend_sycl_measure_plan_override_install_kv(uint64_t                
         try {
             snapshot = ggml_sycl_measure_refit_kv(snapshot, *kv_shape, why);
         } catch (const ggml_sycl_fallback_error &) {
-            throw;  // a planned refusal is the caller's, never a re-fit WARN
+            // The alloc-zone contract's sanctioned form: ggml_sycl_fallback_error derives from std::exception, so it
+            // is caught first and rethrown, or the handler below would turn a planned refusal into a re-fit WARN.
+            // That makes this the one load-path export an exception can cross. The llama side would not name it:
+            // llama_load_measure_run constructs its llama_measure_plan_override guard, which calls this export,
+            // before the try around the measure context, so a crossing error would leave the run unnamed and fail
+            // the load from the caller's handler. It is unreachable today. Every throw of ggml_sycl_fallback_error
+            // sits in op dispatch or graph compute, and ggml_sycl_measure_refit_kv and its callees only do plan
+            // arithmetic, so none of them throws it.
+            throw;
         } catch (const std::exception & e) {
             snapshot.reset();
             why = e.what();
@@ -40223,7 +40231,7 @@ bool ggml_backend_sycl_load_reserve_compute_term(ggml_sycl_load_txn txn,
         } else if (device < 0 || device >= ggml_sycl_info().total_gpu_count || device >= GGML_SYCL_MAX_DEVICES) {
             why = "device out of range";
         } else {
-            auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+            auto * cache = ggml_sycl::get_existing_unified_cache_for_device(device);
             if (cache == nullptr || !cache->arena_active()) {
                 why = "no VRAM arena on the device";
             } else if (!ggml_sycl_load_compute_term_size(chunk_bytes, n_chunks, &bytes)) {
@@ -40272,7 +40280,7 @@ bool ggml_backend_sycl_load_reserve_state_term(ggml_sycl_load_txn txn, int32_t d
         } else if (device < 0 || device >= ggml_sycl_info().total_gpu_count || device >= GGML_SYCL_MAX_DEVICES) {
             why = "device out of range";
         } else {
-            auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+            auto * cache = ggml_sycl::get_existing_unified_cache_for_device(device);
             if (cache == nullptr || !cache->arena_active()) {
                 why = "no VRAM arena on the device";
             } else if (!ggml_sycl_load_compute_term_size(&state_bytes, 1, &bytes)) {

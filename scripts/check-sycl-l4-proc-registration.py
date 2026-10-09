@@ -782,6 +782,15 @@ def load_term_pins(header_raw, source, fails):
         fails.append("L4 state term: the reserve export ggml_backend_sycl_load_reserve_state_term is not defined")
     elif "ggml_sycl_load_ledger" in res_state or "ggml_sycl_load_record_" in res_state:
         fails.append("L4 state term: the state reserve export reaches the ledger or a writer")
+    # llama.cpp-p6i0: a reservation writes a planner term and allocates nothing, so it looks up the device's cache
+    # without creating one (a miss would create the cache and reserve its arena); an absent cache declines.
+    for label, body in (("compute", res), ("state", res_state)):
+        if body is None:
+            continue
+        if (body.count("ggml_sycl::get_existing_unified_cache_for_device(device)") != 1
+                or re.search(r"\bget_unified_cache_for_device\s*\(", body)):
+            fails.append("L4 load terms: the %s reserve export does not look up the existing cache only "
+                         "(get_existing_unified_cache_for_device)" % label)
 
 
 def door_texts(root):
@@ -1898,6 +1907,12 @@ def mutations(header_raw, source):
             ("the state record export writes the ledger itself", "does not reach the state writer under the module guard",
              SIG_RECORD_STATE_EXPORT, "return ggml_sycl_load_record_state_term(txn.id, device, bytes, n_ctx);",
              "return ggml_sycl_load_ledger().ledger.size() == 0;"),
+            ("the compute reserve export creates a cache on a miss", "the compute reserve export does not look up the existing cache only",
+             SIG_RESERVE_EXPORT, "ggml_sycl::get_existing_unified_cache_for_device(device)",
+             "ggml_sycl::get_unified_cache_for_device(device)"),
+            ("the state reserve export creates a cache on a miss", "the state reserve export does not look up the existing cache only",
+             SIG_RESERVE_STATE_EXPORT, "ggml_sycl::get_existing_unified_cache_for_device(device)",
+             "ggml_sycl::get_unified_cache_for_device(device)"),
             ("the state reserve export records the state", "the state reserve export reaches the ledger or a writer",
              SIG_RESERVE_STATE_EXPORT, "sycl_module_mutation_guard module_guard;",
              "sycl_module_mutation_guard module_guard; (void) ggml_sycl_load_record_state_term(txn.id, device, 0, 1);")):
