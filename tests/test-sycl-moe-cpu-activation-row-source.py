@@ -490,7 +490,8 @@ def check_sibling_join(code: str, hostpath_src: str | None = None) -> None:
             "rewritten staging or shares pool bytes with this op (llama.cpp-yx28)"
         )
     if not re.search(
-        r"\} else \{ flush_pending_cpu_scatter\(\); sycl::event::wait\(g_pending_scatter_sibling\.prev_bufs\.scatter_events\); "
+        r"\} else \{ flush_pending_cpu_scatter\(\); (?:moe_hostpath_wait_timer \w+\(MOE_WAIT_B6\); )?"
+        r"sycl::event::wait\(g_pending_scatter_sibling\.prev_bufs\.scatter_events\); "
         r"sycl::event::wait\(g_pending_scatter\.prev_bufs\.scatter_events\); \} \}$",
         block,
     ) or not tail.startswith("auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);"):

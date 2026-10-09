@@ -23587,6 +23587,135 @@ static thread_local pending_cpu_scatter g_pending_scatter_sibling = {};
 // count it was made at; see moe_shared_act_reusable().
 static thread_local uint64_t g_cpu_scatter_serial = 0;
 
+// ---------------------------------------------------------------------------
+// Submitting-thread wait census for the host-expert MoE decode path
+// (llama.cpp-z4kd).  Under GGML_SYCL_MOE_IDS_COPY_TRACE, one WARN line per
+// decode token reports, for each wait class, how many times this thread
+// blocked and for how long:
+//   B1  expert-id readback (synchronous D2H)
+//   B2  activation copy and host-lease producer waits before a CPU job
+//   B3  join of a gate/up CPU job at a flush
+//   B4  down-projection activation gather
+//   B4b join of the hot down group right after issuing it
+//   B5  join of a down CPU job at a flush
+//   B6  wait for an earlier scatter H2D (flush prologue, sibling join)
+//   B7  any of the above inside the graph-boundary flush or drain
+// A token's line is printed when the next token's first id readback arrives
+// (the layer id drops), so it includes the boundary flushes in between.  The
+// last token of a run is not printed.
+// ---------------------------------------------------------------------------
+enum moe_hostpath_wait_class : int {
+    MOE_WAIT_B1,
+    MOE_WAIT_B2,
+    MOE_WAIT_B3,
+    MOE_WAIT_B4,
+    MOE_WAIT_B4B,
+    MOE_WAIT_B5,
+    MOE_WAIT_B6,
+    MOE_WAIT_B7,
+    MOE_WAIT_COUNT,
+};
+
+struct moe_hostpath_wait_census {
+    uint64_t count[MOE_WAIT_COUNT] = {};
+    double   us[MOE_WAIT_COUNT]    = {};
+    uint64_t token                 = 0;
+    int      last_layer            = -1;
+    int      readbacks             = 0;
+    int      context               = -1;  // class forced on the waits inside a flush (B4b, B7)
+};
+
+static thread_local moe_hostpath_wait_census g_moe_hostpath_waits;
+
+static bool moe_hostpath_waits_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_IDS_COPY_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+using moe_hostpath_clock = std::chrono::steady_clock;
+
+static moe_hostpath_clock::time_point moe_hostpath_wait_begin() {
+    return moe_hostpath_waits_enabled() ? moe_hostpath_clock::now() : moe_hostpath_clock::time_point{};
+}
+
+// Inside the graph-boundary flush every wait is B7; inside the hot-group flush a job join is B4b.
+static void moe_hostpath_wait_end(int natural, moe_hostpath_clock::time_point t0) {
+    if (!moe_hostpath_waits_enabled()) {
+        return;
+    }
+    moe_hostpath_wait_census & w   = g_moe_hostpath_waits;
+    int                        cls = natural;
+    if (w.context == MOE_WAIT_B7) {
+        cls = MOE_WAIT_B7;
+    } else if (w.context == MOE_WAIT_B4B && (natural == MOE_WAIT_B3 || natural == MOE_WAIT_B5)) {
+        cls = MOE_WAIT_B4B;
+    }
+    w.count[cls] += 1;
+    w.us[cls] += std::chrono::duration<double, std::micro>(moe_hostpath_clock::now() - t0).count();
+}
+
+struct moe_hostpath_wait_timer {
+    int                            natural;
+    moe_hostpath_clock::time_point t0;
+
+    explicit moe_hostpath_wait_timer(int cls) : natural(cls), t0(moe_hostpath_wait_begin()) {}
+
+    ~moe_hostpath_wait_timer() { moe_hostpath_wait_end(natural, t0); }
+};
+
+// Counts the waits inside one flush under `cls`, unless an enclosing boundary flush already does.
+struct moe_hostpath_wait_context {
+    int saved;
+
+    explicit moe_hostpath_wait_context(int cls) : saved(g_moe_hostpath_waits.context) {
+        if (saved != MOE_WAIT_B7) {
+            g_moe_hostpath_waits.context = cls;
+        }
+    }
+
+    ~moe_hostpath_wait_context() { g_moe_hostpath_waits.context = saved; }
+};
+
+// A CPU job join is B5 for a down projection and B3 otherwise.
+static int moe_hostpath_join_class(const ggml_tensor * dst) {
+    return dst && strstr(dst->name, "down") ? MOE_WAIT_B5 : MOE_WAIT_B3;
+}
+
+// Called at each expert-id readback.  A layer id lower than the last one starts a new token, so the
+// previous token's line is printed and the counts restart.
+static void moe_hostpath_waits_readback(int layer) {
+    if (!moe_hostpath_waits_enabled()) {
+        return;
+    }
+    moe_hostpath_wait_census & w = g_moe_hostpath_waits;
+    if (w.last_layer >= 0 && layer < w.last_layer) {
+        static const char * const names[MOE_WAIT_COUNT] = { "B1", "B2", "B3", "B4", "B4b", "B5", "B6", "B7" };
+        char                      line[512];
+        int                       at       = 0;
+        uint64_t                  total_n  = 0;
+        double                    total_us = 0.0;
+        for (int c = 0; c < MOE_WAIT_COUNT; ++c) {
+            at += snprintf(line + at, sizeof(line) - at, " %s=%llu/%.0fus", names[c], (unsigned long long) w.count[c],
+                           w.us[c]);
+            total_n += w.count[c];
+            total_us += w.us[c];
+        }
+        GGML_LOG_WARN("[MOE-HOSTPATH-WAITS] token=%llu readbacks=%d%s total=%llu/%.0fus\n",
+                      (unsigned long long) w.token, w.readbacks, line, (unsigned long long) total_n, total_us);
+        for (int c = 0; c < MOE_WAIT_COUNT; ++c) {
+            w.count[c] = 0;
+            w.us[c]    = 0.0;
+        }
+        w.readbacks = 0;
+        ++w.token;
+    }
+    w.last_layer = layer;
+    ++w.readbacks;
+}
+
 // Neither counter is ever reset, so a value names one event for the life of
 // the thread: a serial names one rewrite of the shared activation staging, an
 // epoch one graph compute. A reset would let a new copy or graph repeat an
@@ -25013,6 +25142,7 @@ static void flush_prev_scatter_bufs(pending_cpu_scatter & slot) {
         return;
     }
     if (!pb.scatter_events.empty()) {
+        moe_hostpath_wait_timer wait_timer(MOE_WAIT_B6);
         sycl::event::wait(pb.scatter_events);
         pb.scatter_events.clear();
     }
@@ -25069,6 +25199,7 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
     try {
         // Wait for CPU compute to finish
         if (slot.future.valid()) {
+            moe_hostpath_wait_timer wait_timer(moe_hostpath_join_class(slot.dst_tensor));
             slot.future.get();
         }
 
@@ -25397,6 +25528,7 @@ static void flush_prev_cpu_pipeline_bufs() {
         return;
     }
     if (!pb.scatter_events.empty()) {
+        moe_hostpath_wait_timer wait_timer(MOE_WAIT_B6);
         sycl::event::wait(pb.scatter_events);
         pb.scatter_events.clear();
     }
@@ -25432,6 +25564,7 @@ static void flush_pending_cpu_pipeline() {
     flush_prev_cpu_pipeline_bufs();
     try {
         if (g_pending_cpu_pipeline.future.valid()) {
+            moe_hostpath_wait_timer wait_timer(moe_hostpath_join_class(g_pending_cpu_pipeline.dst_tensor));
             g_pending_cpu_pipeline.future.get();
         }
         g_pending_cpu_pipeline.scatter_events.clear();
@@ -26089,7 +26222,9 @@ static void pipeline_scatter_start_async(int device) {
 
 // Public entry point for graph boundary flush
 void ggml_sycl_cpu_tg_flush_pending() {
+    moe_hostpath_wait_context boundary_waits(MOE_WAIT_B7);
     if (!g_cpu_tg_direct_pending_scatter.empty()) {
+        moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
         sycl::event::wait(g_cpu_tg_direct_pending_scatter);
         g_cpu_tg_direct_pending_scatter.clear();
     }
@@ -77944,7 +78079,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             return env && std::atoi(env) != 0;
         }();
         auto copy_start = std::chrono::high_resolution_clock::now();
-        if (!ggml_sycl_copy_ids_to_host(ctx, ids, ids_host)) {
+        moe_hostpath_waits_readback(blk_layer_id);
+        bool ids_copied = false;
+        {
+            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B1);
+            ids_copied = ggml_sycl_copy_ids_to_host(ctx, ids, ids_host);
+        }
+        if (!ids_copied) {
             GGML_LOG_ERROR("[MoE] Failed to copy ids to host for %s\n", src0->name ? src0->name : "?");
             throw ggml_sycl_fallback_error("MUL_MAT_ID expert ID admission failed");
         }
@@ -79757,6 +79898,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     copy_events.push_back(ggml_sycl::mem_copy_async(act_handle, run.dst_offset, src1_storage.handle,
                                                                     run.src_offset, run.bytes, *stream));
                 }
+                moe_hostpath_wait_timer wait_timer(MOE_WAIT_B4);
                 sycl::event::wait(copy_events);
             };
 
@@ -80029,6 +80171,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // Wait for deferred activation D2H before CPU tasks read it.
                 // This wait was moved here from the D2H submission site above
                 // to overlap the transfer with task struct building.
+                const moe_hostpath_clock::time_point job_wait_t0 = moe_hostpath_wait_begin();
                 if (act_deferred_pending) {
                     act_deferred_evt.wait();
                 }
@@ -80044,6 +80187,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         ready.wait();
                     }
                 }
+                moe_hostpath_wait_end(MOE_WAIT_B2, job_wait_t0);
 
                 // Submit to CPU thread pool — move the tasks vector into
                 // the worker so storage outlives every possible caller action.
@@ -80940,6 +81084,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                     if (!hot_entries.empty()) {
                         dispatch_cpu_and_scatter(hot_entries, hot_first, pregather);
+                        moe_hostpath_wait_context hot_join(MOE_WAIT_B4B);
                         flush_pending_cpu_scatter();
                     }
                     dispatch_cpu_and_scatter(cold_entries, cold_first, pregather);
@@ -81186,6 +81331,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         // This op made no activation copy, so nothing orders the
                         // scatter just enqueued ahead of this op's writes to its
                         // pool entries: wait for that scatter itself.
+                        moe_hostpath_wait_timer wait_timer(MOE_WAIT_B6);
                         sycl::event::wait(g_pending_scatter_sibling.prev_bufs.scatter_events);
                         sycl::event::wait(g_pending_scatter.prev_bufs.scatter_events);
                     }
@@ -96947,6 +97093,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // pointers until thread exit.  Reset after wait to consume.
     if (g_pending_scatter_sibling.future.valid()) {
         try {
+            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
             g_pending_scatter_sibling.future.wait();
         } catch (...) {
         }
@@ -96954,6 +97101,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     }
     if (g_pending_scatter.future.valid()) {
         try {
+            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
             g_pending_scatter.future.wait();
         } catch (...) {
         }
@@ -96961,6 +97109,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     }
     if (g_pending_cpu_pipeline.future.valid()) {
         try {
+            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
             g_pending_cpu_pipeline.future.wait();
         } catch (...) {
         }
