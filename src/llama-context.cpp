@@ -4000,8 +4000,8 @@ llama_load_measure_result llama_load_measure_run(const llama_model &            
     // override clears next.
     // The KV residency of the caches the measure context builds (the compute trace's KV line); declared
     // before the holder so the count outlives the context.
-    llama_kv_residency_tally       kv_tally;
-    llama_kv_residency_tally_scope kv_tally_scope(kv_tally);
+    llama_kv_residency_tally         kv_tally;
+    llama_kv_residency_tally_scope   kv_tally_scope(kv_tally);
     std::unique_ptr<llama_context> holder;
     // The context's params come first: the override re-fits the plan's KV residency for their KV shape.
     const llama_context_params       params   = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train);
@@ -4142,10 +4142,10 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
     out.kv       = measured.kv;
     out.measured = true;
 
-    const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
+    const uint32_t                measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
     // each SYCL device's state term, then its compute term; a declined device's compute buffer stays unplanned
     llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);
-    out.compute_declined                         = std::move(reserved.compute_declined);
+    out.compute_declined                   = std::move(reserved.compute_declined);
     out.state_reserved                     = std::move(reserved.state_reserved);
 #else
     GGML_UNUSED(model);
@@ -4195,7 +4195,7 @@ llama_admitted_check_result llama_load_admitted_check(const llama_model &       
     if (!out.refusal.empty()) {
         return out;
     }
-    out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);
+    out.n_recorded       = llama_admitted_record(procs, txn, out, measured_n_ctx);
     // the reserved state of each device, under its own name beside c(P), for the late state check
     out.n_state_recorded = llama_admitted_record_state(procs, txn, out, measured_n_ctx);
 #else

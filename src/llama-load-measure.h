@@ -422,13 +422,13 @@ inline llama_late_check_result llama_late_check_fold(const llama_sycl_l4_procs &
 // compute buffer. A device the backend does not reserve for (it says why at WARN) keeps its compute buffer
 // unplanned. Inert, like the late check, unless the backend exports the L4 entry points and both load terms.
 struct llama_load_probe_result {
-    std::string                            refusal;      // non-empty: the measure failed, by this named text
-    std::string                            unsupported;  // non-empty: the model cannot be measured
+    std::string                            refusal;           // non-empty: the measure failed, by this named text
+    std::string                            unsupported;       // non-empty: the model cannot be measured
     bool                                   measured = false;
-    std::vector<llama_load_measure_device> devices;      // C-hat per device when measured
+    std::vector<llama_load_measure_device> devices;           // C-hat per device when measured
     std::vector<int32_t>                   compute_declined;  // SYCL devices whose compute term the backend declined
-    std::vector<int32_t>                   state_reserved;  // SYCL devices whose state term the backend reserved
-    llama_kv_residency_tally               kv;            // the probe measure's KV residency (the admitted fold's)
+    std::vector<int32_t>                   state_reserved;    // SYCL devices whose state term the backend reserved
+    llama_kv_residency_tally               kv;                // the probe measure's KV residency (the admitted fold's)
 };
 
 // The probe's reservations (llama.cpp-p6i0), per measured SYCL device and in order: its state term first, when the
@@ -496,25 +496,25 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
 // skipped, as in the late fold.
 struct llama_admitted_term {
     int32_t device         = -1;
-    bool    reserved       = true;  // false: the backend declined the compute term; neither compared nor recorded
-    size_t  probe_term     = 0;     // C-hat in the reservation's units: the room the pack left
-    size_t  admitted_term  = 0;     // c(P) in the reservation's units, compared with probe_term
-    size_t  admitted_bytes = 0;     // c(P) as the measure's total: what the ledger records and the late check compares
-    size_t  kv_excess      = 0;     // admitted_term - probe_term, admitted because the KV residency moved; unreserved
-    size_t  state_bytes    = 0;     // the probe's state, the one the reservation holds: recorded under its own name
+    bool    reserved       = true;   // false: the backend declined the compute term; neither compared nor recorded
+    size_t  probe_term     = 0;      // C-hat in the reservation's units: the room the pack left
+    size_t  admitted_term  = 0;      // c(P) in the reservation's units, compared with probe_term
+    size_t  admitted_bytes = 0;      // c(P) as the measure's total: what the ledger records and the late check compares
+    size_t  kv_excess      = 0;      // admitted_term - probe_term, admitted because the KV residency moved; unreserved
+    size_t  state_bytes    = 0;      // the probe's state, the one the reservation holds: recorded under its own name
     bool    state_reserved = false;  // the backend reserved state_bytes as this device's state term
     bool    state_recorded = false;  // the backend recorded state_bytes as this device's state term
 };
 
 struct llama_admitted_check_result {
-    std::string                      refusal;         // non-empty: the load is refused, by this named text
-    std::string                      unsupported;     // non-empty: the model cannot be measured; the load goes on
-    std::vector<llama_admitted_term> terms;           // one per SYCL device, when admitted
-    uint32_t                         n_ctx      = 0;  // the n_ctx and ubatch the measure ran at
-    uint32_t                         n_ubatch   = 0;
-    size_t                           n_recorded = 0;  // the terms the backend recorded
+    std::string                      refusal;               // non-empty: the load is refused, by this named text
+    std::string                      unsupported;           // non-empty: the model cannot be measured; the load goes on
+    std::vector<llama_admitted_term> terms;                 // one per SYCL device, when admitted
+    uint32_t                         n_ctx            = 0;  // the n_ctx and ubatch the measure ran at
+    uint32_t                         n_ubatch         = 0;
+    size_t                           n_recorded       = 0;  // the terms the backend recorded
     size_t                           n_state_recorded = 0;  // the state terms the backend recorded
-    llama_kv_residency_tally         probe_kv;        // the KV residency each measure saw
+    llama_kv_residency_tally         probe_kv;              // the KV residency each measure saw
     llama_kv_residency_tally         admitted_kv;
 };
 
@@ -537,7 +537,7 @@ inline llama_admitted_check_result llama_admitted_check_fold(const llama_sycl_l4
     out.probe_kv        = probe_kv;
     out.admitted_kv     = admitted_kv;
     const bool kv_moved = !llama_kv_residency_same(probe_kv, admitted_kv);
-    const auto refuse = [&](int32_t device, const std::string & why) {
+    const auto refuse   = [&](int32_t device, const std::string & why) {
         out.refusal = "[LOAD-PLAN] compute-slot-exceeds-probe-bound on device " + std::to_string(device) + ": " + why +
                       " at n_ctx " + std::to_string(n_ctx) + " ubatch " + std::to_string(n_ubatch) + " (refused)";
         out.terms.clear();
@@ -560,8 +560,8 @@ inline llama_admitted_check_result llama_admitted_check_fold(const llama_sycl_l4
         llama_admitted_term t;
         t.device         = d.device;
         t.admitted_bytes = d.total;
-        t.reserved = std::find(compute_declined.begin(), compute_declined.end(), d.device) == compute_declined.end();
-        t.state_bytes    = bound->state_bytes;
+        t.reserved    = std::find(compute_declined.begin(), compute_declined.end(), d.device) == compute_declined.end();
+        t.state_bytes = bound->state_bytes;
         t.state_reserved = t.state_bytes != 0 &&
                            std::find(state_reserved.begin(), state_reserved.end(), d.device) != state_reserved.end();
         const bool sized = llama_sycl_l4_compute_term_bytes(procs, bound->chunk_bytes, &t.probe_term) &&
