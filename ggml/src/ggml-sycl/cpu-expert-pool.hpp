@@ -101,7 +101,9 @@ struct cpu_expert_pool_trace_totals {
     //   overlapped   jobs that ran at the same time as another pool job at some
     //                point (both jobs of an overlapping pair count): the pools
     //                share one CPU arena, so those jobs' compute times overlap
-    //                and their sum overstates the time they took
+    //                and their sum overstates the time they took. Batched calls
+    //                that ggml-sycl.cpp makes directly share the arena too but
+    //                are not pool jobs, so they are not counted
     struct type_totals {
         uint64_t jobs        = 0;
         uint64_t rows        = 0;
@@ -124,8 +126,8 @@ void cpu_expert_pool_trace_note_join(bool was_ready);
 
 // Whether a pool job ran at the same time as another at any point of its run
 // (llama.cpp-y9i6): another job was running when it began, or another began
-// before it ended. Both jobs of an overlapping pair see it. Used only while
-// tracing.
+// before it ended. Both jobs of an overlapping pair see it (a near-simultaneous
+// start can rarely go uncounted). Used only while tracing.
 struct cpu_expert_pool_overlap_clock {
     std::atomic<int>      running{ 0 };
     std::atomic<uint64_t> starts{ 0 };
