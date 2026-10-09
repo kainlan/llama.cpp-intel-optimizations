@@ -746,8 +746,8 @@ struct placement_kv_info {
     }
 
     // The indexer keys of layer `il` at `ctx` tokens: the same cells as the layer's K/V, K only. Part of
-    // kv_bytes_for_layer_at(), which is what every budget charges; on its own for the allocator, which sizes the
-    // indexer buffer apart from the K/V one (llama.cpp-8ecj).
+    // kv_bytes_for_layer_at(), which is what every budget charges. The allocator sizes the indexer buffer apart from
+    // the K/V one through placement_plan::kv_idx_size_for_layer(), not through this helper (llama.cpp-8ecj).
     size_t kv_idx_bytes_for_layer_at(uint32_t il, uint32_t ctx) const {
         if (!valid() || ctx == 0 || !has_per_layer_kv_truth(il) || idx_k_width(il) == 0) {
             return 0;

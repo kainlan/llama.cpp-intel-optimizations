@@ -909,9 +909,10 @@ static void test_kv_layer_bytes_for_kind_keeps_its_results() {
 //
 //     Every budget (the planner's charge and room, the plan's per-layer size)
 //     must count 576 MiB a layer: without the indexer keys the room left
-//     748.6 MiB for the 768 MiB indexer buffer and the context failed. And
-//     each of llama's two buffers must be sized from its own cache with no
-//     WARN: measured against the 576 MiB total, both would read as truth
+//     748.6 MiB for the 768 MiB indexer buffer and the context failed.
+//
+//     Each of llama's two buffers must also be sized from its own cache with
+//     no WARN: measured against the 576 MiB total, both would read as truth
 //     exceeding the buffer on every load.
 // ---------------------------------------------------------------------------
 static placement_kv_info make_qwen38(uint32_t n_ctx, uint32_t n_ubatch) {
