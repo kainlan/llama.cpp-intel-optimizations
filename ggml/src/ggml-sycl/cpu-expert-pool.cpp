@@ -130,9 +130,54 @@ void CpuExpertPool::worker_thread() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Job timing (llama.cpp-b2jc): see cpu_expert_pool_trace_totals.
+// ---------------------------------------------------------------------------
+using pool_trace_clock = std::chrono::steady_clock;
+
+static std::mutex                   g_pool_trace_mutex;
+static cpu_expert_pool_trace_totals g_pool_trace;
+
+static double pool_trace_us(pool_trace_clock::time_point a, pool_trace_clock::time_point b) {
+    return std::chrono::duration<double, std::micro>(b - a).count();
+}
+
+void cpu_expert_pool_trace_take(cpu_expert_pool_trace_totals & out) {
+    std::lock_guard<std::mutex> lock(g_pool_trace_mutex);
+    out          = g_pool_trace;
+    g_pool_trace = {};
+}
+
+void cpu_expert_pool_trace_note_join(bool was_ready) {
+    std::lock_guard<std::mutex> lock(g_pool_trace_mutex);
+    g_pool_trace.joins += 1;
+    g_pool_trace.joins_ready += was_ready ? 1 : 0;
+}
+
+static void pool_trace_record_job(size_t                       n_tasks,
+                                  pool_trace_clock::time_point t_submit,
+                                  pool_trace_clock::time_point t_start,
+                                  pool_trace_clock::time_point t_done) {
+    const cpu_expert_batched_phase_times ph = ggml_sycl_cpu_expert_batched_last_phase_times();
+    std::lock_guard<std::mutex>          lock(g_pool_trace_mutex);
+    g_pool_trace.jobs += 1;
+    g_pool_trace.tasks += n_tasks;
+    g_pool_trace.rows += static_cast<uint64_t>(ph.rows);
+    g_pool_trace.threads += static_cast<uint64_t>(ph.threads);
+    g_pool_trace.wake_us += pool_trace_us(t_submit, t_start);
+    g_pool_trace.quant_us += ph.quant_us;
+    g_pool_trace.setup_us += ph.setup_us;
+    g_pool_trace.fanout_us += ph.fanout_us;
+    g_pool_trace.compute_us += ph.compute_us;
+    g_pool_trace.wall_us += pool_trace_us(t_submit, t_done);
+}
+
 std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task> tasks) {
     auto promise = std::make_shared<std::promise<void>>();
     auto future  = promise->get_future();
+
+    const bool                         trace    = ggml_sycl_cpu_expert_trace_enabled();
+    const pool_trace_clock::time_point t_submit = trace ? pool_trace_clock::now() : pool_trace_clock::time_point{};
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -142,8 +187,12 @@ std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task> tasks
         // for keeping the backing vector alive — a contract that was
         // violated by several call sites, producing a UAF in the TBB
         // arena (simd_mxfp4_q8_0_16row reading a stale weight_host).
-        work_queue_.push([tasks = std::move(tasks), promise]() mutable {
+        work_queue_.push([tasks = std::move(tasks), promise, trace, t_submit]() mutable {
+            const pool_trace_clock::time_point t_start = trace ? pool_trace_clock::now() : t_submit;
             ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
+            if (trace) {
+                pool_trace_record_job(tasks.size(), t_submit, t_start, pool_trace_clock::now());
+            }
             promise->set_value();
         });
     }

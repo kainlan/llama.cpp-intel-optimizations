@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -917,6 +918,26 @@ bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
     return true;
 }
 
+bool ggml_sycl_cpu_expert_trace_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_IDS_COPY_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static thread_local cpu_expert_batched_phase_times g_cpu_expert_batched_last;
+
+cpu_expert_batched_phase_times ggml_sycl_cpu_expert_batched_last_phase_times() {
+    return g_cpu_expert_batched_last;
+}
+
+using cpu_expert_trace_clock = std::chrono::steady_clock;
+
+static double cpu_expert_trace_us(cpu_expert_trace_clock::time_point a, cpu_expert_trace_clock::time_point b) {
+    return std::chrono::duration<double, std::micro>(b - a).count();
+}
+
 void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_tasks, int n_threads) {
     for (int i = 0; tasks && i < n_tasks; ++i) {
         GGML_ASSERT(tasks[i].type != GGML_TYPE_Q1_0 && tasks[i].type != GGML_TYPE_NVFP4 &&
@@ -927,6 +948,13 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
     }
 
     GGML_UNUSED(n_threads);  // TBB arena size set globally via ggml_sycl_cpu_threads_hint
+
+    const bool                         trace = ggml_sycl_cpu_expert_trace_enabled();
+    cpu_expert_trace_clock::time_point trace_t0;
+    if (trace) {
+        g_cpu_expert_batched_last = {};
+        trace_t0                  = cpu_expert_trace_clock::now();
+    }
 
     // --- Phase 1: Pre-quantize unique activation vectors ---
     // Multiple experts in the same layer share the same activation input.
@@ -985,6 +1013,11 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
         if (it != act_q_map.end()) {
             task_act_q[i] = it->second.data();
         }
+    }
+    cpu_expert_trace_clock::time_point trace_t1;
+    if (trace) {
+        trace_t1                           = cpu_expert_trace_clock::now();
+        g_cpu_expert_batched_last.quant_us = cpu_expert_trace_us(trace_t0, trace_t1);
     }
 
     // --- Phase 1.5: Multi-activation GEMM for PP mode (MXFP4) ---
@@ -1154,10 +1187,34 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
     // Dynamic grain: ~2 tasks per thread for load balance without TBB overhead
     const int n_thr = ggml_sycl_cpu_threads_hint();
     const int grain = std::max(64, total_rows / std::max(1, n_thr * 2));
+    // Trace only: when the first row range starts, and which arena slots ran one.
+    std::atomic<int64_t>               trace_first_ns{ INT64_MAX };
+    std::atomic<uint64_t>              trace_slots{ 0 };
+    std::atomic<int64_t> *             trace_first_p = &trace_first_ns;
+    std::atomic<uint64_t> *            trace_slots_p = &trace_slots;
+    cpu_expert_trace_clock::time_point trace_t2;
+    if (trace) {
+        trace_t2                           = cpu_expert_trace_clock::now();
+        g_cpu_expert_batched_last.setup_us = cpu_expert_trace_us(trace_t1, trace_t2);
+        g_cpu_expert_batched_last.rows     = total_rows;
+    }
     ggml_sycl_cpu_arena().execute([&] {
         ggml_sycl_tbb::parallel_for(
             ggml_sycl_tbb::blocked_range<int>(0, total_rows, grain),
-            [tasks_ptr, q8_ptrs, meta_ptr, n_tasks](const ggml_sycl_tbb::blocked_range<int> & range) {
+            [tasks_ptr, q8_ptrs, meta_ptr, n_tasks, trace, trace_first_p,
+             trace_slots_p](const ggml_sycl_tbb::blocked_range<int> & range) {
+                if (trace) {
+                    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           cpu_expert_trace_clock::now().time_since_epoch())
+                                           .count();
+                    int64_t seen = trace_first_p->load(std::memory_order_relaxed);
+                    while (ns < seen && !trace_first_p->compare_exchange_weak(seen, ns, std::memory_order_relaxed)) {
+                    }
+                    const int slot = ggml_sycl_tbb::this_task_arena::current_thread_index();
+                    if (slot >= 0 && slot < 64) {
+                        trace_slots_p->fetch_or(uint64_t(1) << slot, std::memory_order_relaxed);
+                    }
+                }
                 // This lambda runs on a TBB arena worker thread, which is
                 // NOT necessarily the thread that called
                 // ggml_sycl_cpu_expert_mul_mat_batched() -- and the MXFP4
@@ -1406,6 +1463,15 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
                 }
             });
     });
+    if (trace) {
+        const auto    trace_t3 = cpu_expert_trace_clock::now();
+        const int64_t first    = trace_first_ns.load(std::memory_order_relaxed);
+        const auto    t_first =
+            first == INT64_MAX ? trace_t3 : cpu_expert_trace_clock::time_point(std::chrono::nanoseconds(first));
+        g_cpu_expert_batched_last.fanout_us  = cpu_expert_trace_us(trace_t2, t_first);
+        g_cpu_expert_batched_last.compute_us = cpu_expert_trace_us(t_first, trace_t3);
+        g_cpu_expert_batched_last.threads    = __builtin_popcountll(trace_slots.load(std::memory_order_relaxed));
+    }
 #else
     // No-TBB fallback: sequential over flattened rows.
     int cur_task = 0;

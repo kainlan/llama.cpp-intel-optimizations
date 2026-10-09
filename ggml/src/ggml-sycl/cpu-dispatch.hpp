@@ -162,6 +162,24 @@ void ggml_sycl_cpu_expert_mul_mat_batched(
     const cpu_expert_task * tasks, int n_tasks,
     int n_threads = 0);
 
+// Host-expert job timing (llama.cpp-b2jc), on under GGML_SYCL_MOE_IDS_COPY_TRACE
+// like the decode wait census. Off, it costs one cached flag test per call and
+// reads no clock.
+bool ggml_sycl_cpu_expert_trace_enabled();
+
+// Phases of the calling thread's last ggml_sycl_cpu_expert_mul_mat_batched()
+// call, written only while tracing is on.
+struct cpu_expert_batched_phase_times {
+    double quant_us   = 0.0;  // serial activation quantize on the calling thread
+    double setup_us   = 0.0;  // grouping and row metadata before the parallel loop
+    double fanout_us  = 0.0;  // parallel loop entry to the first row range starting on any thread
+    double compute_us = 0.0;  // first row range start to the parallel loop's return
+    int    rows       = 0;
+    int    threads    = 0;    // distinct threads that ran a row range
+};
+
+cpu_expert_batched_phase_times ggml_sycl_cpu_expert_batched_last_phase_times();
+
 // ---------------------------------------------------------------------------
 // CPU PP GEMM — batched GEMM on host-resident quantized weights for PP
 // ---------------------------------------------------------------------------

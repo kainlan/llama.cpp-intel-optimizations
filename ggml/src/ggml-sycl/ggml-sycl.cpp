@@ -23710,6 +23710,17 @@ static void moe_hostpath_waits_readback(int layer) {
         }
         GGML_LOG_WARN("[MOE-HOSTPATH-WAITS] token=%llu readbacks=%d%s total=%llu/%.0fus\n",
                       (unsigned long long) w.token, w.readbacks, line, (unsigned long long) total_n, total_us);
+        // The same token's CpuExpertPool jobs (llama.cpp-b2jc): how many, and where each
+        // job's time went between its submit and its result.
+        ggml_sycl::cpu_expert_pool_trace_totals pt;
+        ggml_sycl::cpu_expert_pool_trace_take(pt);
+        GGML_LOG_WARN(
+            "[CPU-EXPERT-POOL-TRACE] token=%llu jobs=%llu tasks=%llu rows=%llu threads=%llu wake=%.0fus "
+            "quant=%.0fus setup=%.0fus fanout=%.0fus compute=%.0fus wall=%.0fus joins=%llu joins_ready=%llu\n",
+            (unsigned long long) w.token, (unsigned long long) pt.jobs, (unsigned long long) pt.tasks,
+            (unsigned long long) pt.rows, (unsigned long long) pt.threads, pt.wake_us, pt.quant_us, pt.setup_us,
+            pt.fanout_us, pt.compute_us, pt.wall_us, (unsigned long long) pt.joins,
+            (unsigned long long) pt.joins_ready);
         for (int c = 0; c < MOE_WAIT_COUNT; ++c) {
             w.count[c] = 0;
             w.us[c]    = 0.0;
@@ -25204,6 +25215,10 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
     try {
         // Wait for CPU compute to finish
         if (slot.future.valid()) {
+            if (moe_hostpath_waits_enabled()) {
+                ggml_sycl::cpu_expert_pool_trace_note_join(slot.future.wait_for(std::chrono::seconds(0)) ==
+                                                           std::future_status::ready);
+            }
             moe_hostpath_wait_timer wait_timer(MOE_WAIT_JOIN, slot.dst_tensor);
             slot.future.get();
         }

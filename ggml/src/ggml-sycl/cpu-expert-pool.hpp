@@ -102,4 +102,30 @@ class CpuExpertPool {
     mem_handle ring_handle_;      // Single unified_alloc-backed owner for all ring buffers
 };
 
+// Totals over every pool's jobs since the last take (llama.cpp-b2jc), kept
+// only while ggml_sycl_cpu_expert_trace_enabled(). The decode wait census
+// takes them once per token. Times are sums over jobs:
+//   wake     submit to a worker starting the job
+//   quant/setup/fanout/compute  the job's batched-kernel phases
+//   wall     submit to the job's result being published
+// joins counts submitting-thread joins of a pool job; joins_ready the ones
+// that found the job already finished.
+struct cpu_expert_pool_trace_totals {
+    uint64_t jobs        = 0;
+    uint64_t tasks       = 0;
+    uint64_t rows        = 0;
+    uint64_t threads     = 0;
+    uint64_t joins       = 0;
+    uint64_t joins_ready = 0;
+    double   wake_us     = 0.0;
+    double   quant_us    = 0.0;
+    double   setup_us    = 0.0;
+    double   fanout_us   = 0.0;
+    double   compute_us  = 0.0;
+    double   wall_us     = 0.0;
+};
+
+void cpu_expert_pool_trace_take(cpu_expert_pool_trace_totals & out);
+void cpu_expert_pool_trace_note_join(bool was_ready);
+
 }  // namespace ggml_sycl
