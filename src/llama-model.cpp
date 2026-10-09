@@ -752,6 +752,16 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader &  ml,
     LLAMA_LOG_INFO("%s: SYCL tensor inventory: %zu tensors, %.2f GiB (enables unified placement before allocation)\n",
                    log_func, tensors.size(), total_size / (1024.0 * 1024.0 * 1024.0));
 }
+
+// The weights a load stage's measure (probe, admitted or late, llama.cpp-p6i0) puts its stand-ins on: every
+// (buffer type, context) of the loader, whose tensors are not allocated yet when each stage measures.
+static std::vector<llama_measure_dummy_entry> llama_model_measure_weights(const llama_model_loader & ml) {
+    std::vector<llama_measure_dummy_entry> weights;
+    for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+        weights.push_back({ ctx_key.buft, ctx_ptr.get() });
+    }
+    return weights;
+}
 #endif  // GGML_USE_SYCL || GGML_BACKEND_DL
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -2597,10 +2607,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // its room. It is measured at n_ctx_train and ubatch 512: the caller's -c and -ub do not reach the load
         // (fkpg (a)), so the term is that shape's, not the context's. A dense model's default auto ubatch climbs
         // above 512 into whatever room is left; that part is not reserved.
-        std::vector<llama_measure_dummy_entry> probe_weights;
-        for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
-            probe_weights.push_back({ ctx_key.buft, ctx_ptr.get() });
-        }
+        const std::vector<llama_measure_dummy_entry> probe_weights = llama_model_measure_weights(ml);
         const int64_t                 probe_t0 = ggml_time_us();
         const llama_load_probe_result probe    = llama_load_probe_bound(
             *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, probe_weights);
@@ -2620,10 +2627,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // dev_layer sync, so the late check below compares the final placement with it. Refused when it outgrew
         // the probe bound the pack reserved; recorded otherwise. Only a model the probe measured gets here.
         if (probe.measured) {
-            std::vector<llama_measure_dummy_entry> admitted_weights;
-            for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
-                admitted_weights.push_back({ ctx_key.buft, ctx_ptr.get() });
-            }
+            const std::vector<llama_measure_dummy_entry> admitted_weights = llama_model_measure_weights(ml);
             const int64_t                     admitted_t0 = ggml_time_us();
             const llama_admitted_check_result admitted =
                 llama_load_admitted_check(*this, llama_model_sycl_make_placement_envelope().n_ctx,
@@ -2818,10 +2822,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // (c) the late measure: the final placement's compute term, over stand-ins for the weights
         // that are not yet allocated, handed to the backend to compare with the term it admitted.
         // Inert until the backend exports the L4 entry points; a refusal is the load's.
-        std::vector<llama_measure_dummy_entry> late_weights;
-        for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
-            late_weights.push_back({ ctx_key.buft, ctx_ptr.get() });
-        }
+        const std::vector<llama_measure_dummy_entry> late_weights = llama_model_measure_weights(ml);
         const llama_late_check_result late = llama_load_late_check(
             *this, llama_model_sycl_make_placement_envelope().n_ctx, sycl_model_loading_guard.txn, late_weights);
         if (!late.unsupported.empty()) {

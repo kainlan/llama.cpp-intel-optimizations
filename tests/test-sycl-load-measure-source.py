@@ -14,8 +14,11 @@ one measure-only context over a load's placement. This gate pins, on comment-str
 - the shape is the auto-ubatch ladder's bottom rung (no literal 512) and the caller's n_ctx (the training
   context for 0);
 - the compute term is the one per-chunk peak helper of llama-measure-plan.h (no second reduction);
-- `llama_load_late_check` measures only when the backend exports the L4 entry points, puts the weight
-  stand-ins up before the measure, measures at stage (c), and hands the devices to the one fold, in which
+- the probe, admitted and late stages measure through one helper, `llama_load_stage_measure`, which puts the
+  weight stand-ins up before the measure and logs its trace, and split a failed measure through one
+  `llama_load_stage_fail`; each stage keeps only its gate and its fold;
+- `llama_load_late_check` measures only when the backend exports the L4 entry points, measures at stage (c),
+  and hands the devices to the one fold, in which
   NOT_RECORDED is its own list and never an EQUAL, and the first REFUSED is the load's refusal;
 - the loader calls the late check exactly once, after the dev_layer sync and before the mappings are
   initialised; it WARNs for an unsupported model (the WARN pinned inside its own block) and, through one
@@ -73,6 +76,17 @@ _LATE = (
     "llama_late_check_result llama_load_late_check(const llama_model & model, uint32_t n_ctx, "
     "struct ggml_sycl_load_txn txn, const std::vector<llama_measure_dummy_entry> & weights)"
 )
+_STAGE_MEASURE = (
+    "static llama_load_measure_result llama_load_stage_measure(const llama_model & model, uint32_t n_ctx, "
+    "uint64_t load_txn, enum ggml_sycl_measure_stage stage, const std::vector<llama_measure_dummy_entry> & weights)"
+)
+_STAGE_FAIL = (
+    "static void llama_load_stage_fail(const llama_load_measure_result & measured, std::string & unsupported, "
+    "std::string & refusal)"
+)
+# every stage's procs, and every stage's failed measure, go through the one helper each
+_STAGE_PROCS = "const llama_sycl_l4_procs procs = llama_load_stage_procs(model);"
+_STAGE_FAILED = "if (!measured.ok) { llama_load_stage_fail(measured, out.unsupported, out.refusal); return out; }"
 _REFUSAL = (
     "inline std::string llama_load_measure_refusal_text(enum ggml_sycl_measure_stage stage, int device, "
     "const std::string & reason)"
@@ -181,14 +195,46 @@ def peak_ok(tenant_code: str, ctx_code: str) -> bool:
     )
 
 
+def stage_measure_ok(code: str) -> bool:
+    """The one stage measure: the stand-ins go up before the measure (a refused one refuses by name), the measure
+    runs at the caller's stage and txn, its trace is logged, and every stage calls it rather than its own scaffold.
+    The failure split sends only an unsupported measure to `unsupported`."""
+    b = function_body(code, _STAGE_MEASURE)
+    order = [
+        "llama_measure_dummy_scope dummies(weights);",
+        "if (dummies.failed())",
+        'out.refusal = llama_load_measure_refusal_text(stage, -1, "a weight stand-in buffer was refused"); return out;',
+        "llama_load_measure_result measured = llama_load_measure(model, n_ctx, load_txn, stage);",
+        "llama_load_measure_log_trace(measured);",
+        "return measured;",
+    ]
+    pos = [b.find(z(t)) for t in order]
+    fail = function_body(code, _STAGE_FAIL)
+    stages = [function_body(code, sig) for sig in (_PROBE, _ADMIT, _LATE)]
+    return (
+        -1 not in pos
+        and pos == sorted(pos)
+        and fail.endswith("{" + z("(measured.unsupported ? unsupported : refusal) = measured.refusal;") + "}")
+        and all(
+            z(_STAGE_PROCS) in st
+            and st.count(z("llama_load_stage_measure(")) == 1
+            and z(_STAGE_FAILED) in st
+            and "llama_measure_dummy_scope" not in st
+            and z("llama_load_measure(") not in st
+            and "llama_load_measure_log_trace" not in st
+            and "llama_context_sycl_l4_procs_for_dev" not in st
+            for st in stages
+        )
+    )
+
+
 def late_ok(code: str) -> bool:
     b = function_body(code, _LATE)
     order = [
+        _STAGE_PROCS,
         "if (!procs.available())",
-        "llama_measure_dummy_scope dummies(weights);",
-        "if (dummies.failed())",
-        "llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C)",
-        "if (!measured.ok) { (measured.unsupported ? out.unsupported : out.refusal) = measured.refusal; return out; }",
+        "llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, weights)",
+        _STAGE_FAILED,
         "llama_late_check_fold(procs, txn, measured.devices, n_ubatch)",
     ]
     pos = [b.find(z(t)) for t in order]
@@ -297,11 +343,10 @@ def probe_ok(code: str) -> bool:
     SYCL device's state then its compute term and skips the host tier (pinned by test-load-measure-guards)."""
     b = function_body(code, _PROBE)
     order = [
-        "if (!procs.load_terms_available())",
-        "llama_measure_dummy_scope dummies(weights);",
-        "if (dummies.failed())",
-        "llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_PROBE)",
-        "if (!measured.ok) { (measured.unsupported ? out.unsupported : out.refusal) = measured.refusal; return out; }",
+        _STAGE_PROCS,
+        "if (!procs.available() || !procs.load_terms_available())",
+        "llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_PROBE, weights)",
+        _STAGE_FAILED,
         "const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);",
         "llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);",
         # both outcomes kept: the declined compute terms and, apart from them, the reserved states
@@ -331,10 +376,10 @@ def admit_ok(code: str) -> bool:
     only an admitted result is recorded, at the measure's n_ctx."""
     b = function_body(code, _ADMIT)
     order = [
-        "llama_measure_dummy_scope dummies(weights);",
-        "if (dummies.failed())",
-        "llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B)",
-        "if (!measured.ok)",
+        _STAGE_PROCS,
+        "if (!procs.available() || !procs.load_terms_available())",
+        "llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, weights)",
+        _STAGE_FAILED,
         "const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);",
         "llama_admitted_check_fold(procs, probe.devices, probe.compute_declined, probe.state_reserved, measured.devices, measured_n_ctx,",
         "if (!out.refusal.empty()) { return out; }",
@@ -569,6 +614,67 @@ def test_one_per_chunk_peak():
     assert not peak_ok(tenant, ctx.replace(z("llama_tenant_caps_set_peaks(c, entry.peaks);"), "", 1))
 
 
+def test_the_stages_share_one_measure():
+    assert stage_measure_ok(code_of(CONTEXT_CPP))
+
+
+def test_stage_measure_mutants():
+    code = code_of(CONTEXT_CPP)
+    b = function_body(code, _STAGE_MEASURE)
+    for name, old, new in [
+        ("stand-ins dropped", "llama_measure_dummy_scope dummies(weights);", ""),
+        ("a refused stand-in ignored", "if (dummies.failed()) {", "if (false) {"),
+        ("the measure at a fixed stage", "llama_load_measure(model, n_ctx, load_txn, stage);", "llama_load_measure(model, n_ctx, load_txn, GGML_SYCL_MEASURE_STAGE_PROBE);"),
+        ("the trace not logged", "llama_load_measure_log_trace(measured);", ""),
+    ]:
+        assert not stage_measure_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
+    f = function_body(code, _STAGE_FAIL)
+    swapped = mutate(f, "measured.unsupported ? unsupported : refusal", "measured.unsupported ? refusal : unsupported")
+    assert not stage_measure_ok(code.replace(f, swapped, 1)), "a swapped failure split slipped through"
+    # a stage that rebuilds its own scaffold instead of calling the helper
+    late = function_body(code, _LATE)
+    own = mutate(late, "const llama_sycl_l4_procs procs = llama_load_stage_procs(model);", "const llama_sycl_l4_procs procs = llama_load_stage_procs(model);\n    llama_measure_dummy_scope dummies(weights);")
+    assert not stage_measure_ok(code.replace(late, own, 1)), "a stage's own stand-in scope slipped through"
+    admit = function_body(code, _ADMIT)
+    lookup = mutate(admit, "llama_load_stage_procs(model);", "llama_context_sycl_l4_procs_for_dev(model.devices[0].dev);")
+    assert not stage_measure_ok(code.replace(admit, lookup, 1)), "a stage's own procs lookup slipped through"
+
+
+_WEIGHTS = "static std::vector<llama_measure_dummy_entry> llama_model_measure_weights(const llama_model_loader & ml)"
+
+
+def weights_ok(code: str) -> bool:
+    """The loader builds the stages' stand-in list in one helper, over every (buffer type, context), and each of
+    the three stages takes its list from it."""
+    b = function_body(code, _WEIGHTS)
+    return (
+        z("for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) { weights.push_back({ ctx_key.buft, ctx_ptr.get() }); }")
+        in b
+        and code.count(z(".push_back({ ctx_key.buft, ctx_ptr.get() });")) == 1
+        and all(
+            z(f"const std::vector<llama_measure_dummy_entry> {v} = llama_model_measure_weights(ml);") in code
+            for v in ("probe_weights", "admitted_weights", "late_weights")
+        )
+    )
+
+
+def test_the_stages_share_one_stand_in_list():
+    assert weights_ok(code_of(MODEL_CPP))
+
+
+def test_weights_mutants():
+    code = code_of(MODEL_CPP)
+    b = function_body(code, _WEIGHTS)
+    assert not weights_ok(code.replace(b, mutate(b, "weights.push_back({ ctx_key.buft, ctx_ptr.get() });", ""), 1))
+    copy = mutate(
+        code,
+        "const std::vector<llama_measure_dummy_entry> late_weights = llama_model_measure_weights(ml);",
+        "std::vector<llama_measure_dummy_entry> late_weights;\n"
+        "for (const auto & [ctx_key, ctx_ptr] : ml.ctx_map) { late_weights.push_back({ ctx_key.buft, ctx_ptr.get() }); }",
+    )
+    assert not weights_ok(copy), "a stage's own copy of the stand-in list slipped through"
+
+
 def test_the_late_check_measures_only_with_l4_and_at_stage_c():
     assert late_ok(code_of(CONTEXT_CPP))
 
@@ -578,10 +684,10 @@ def test_late_mutants():
     b = function_body(code, _LATE)
     for name, old, new in [
         ("no L4 gate", "if (!procs.available())", "if (false)"),
-        ("measured at stage b", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_C)", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_B)"),
-        ("a failed measure ignored", "if (!measured.ok) {\n        (measured.unsupported ? out.unsupported : out.refusal) = measured.refusal;\n        return out;\n    }", ""),
+        ("measured at stage b", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, weights)", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, weights)"),
+        ("a failed measure ignored", "if (!measured.ok) {\n        llama_load_stage_fail(measured, out.unsupported, out.refusal);\n        return out;\n    }", ""),
         ("the fold bypassed", "return llama_late_check_fold(procs, txn, measured.devices, n_ubatch);", "return out;"),
-        ("stand-ins after the measure", "llama_measure_dummy_scope dummies(weights);", ""),
+        ("no procs", "const llama_sycl_l4_procs procs = llama_load_stage_procs(model);", "const llama_sycl_l4_procs procs = {};"),
     ]:
         assert not late_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
 
@@ -700,7 +806,7 @@ def test_probe_mutants():
     code = code_of(CONTEXT_CPP)
     b = function_body(code, _PROBE)
     for name, old, new in [
-        ("measured at the admitted stage", "GGML_SYCL_MEASURE_STAGE_PROBE)", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_B)"),
+        ("measured at the admitted stage", "GGML_SYCL_MEASURE_STAGE_PROBE, weights)", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, weights)"),
         ("no reservation", "llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);", "(void) measured_n_ctx;"),
         ("the envelope's n_ctx reserved", "llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx)", "llama_load_probe_reserve(procs, txn, measured.devices, n_ctx)"),
         ("the probe's residency not kept", "out.kv = measured.kv;", ""),
@@ -708,8 +814,8 @@ def test_probe_mutants():
         ("the reserved states dropped", "out.state_reserved = std::move(reserved.state_reserved);", ""),
         ("the reserved states read from the declined list", "out.state_reserved = std::move(reserved.state_reserved);", "out.state_reserved = reserved.compute_declined;"),
         ("the compute term reserved past the helper", "llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);", "llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);\n    (void) llama_sycl_l4_reserve_compute_term(procs, txn, measured.devices[0], measured_n_ctx);"),
-        ("no proc gate", "if (!procs.load_terms_available())", "if (false)"),
-        ("stand-ins dropped", "llama_measure_dummy_scope dummies(weights);", ""),
+        ("no proc gate", "if (!procs.available() || !procs.load_terms_available())", "if (false)"),
+        ("no load-term gate", "if (!procs.available() || !procs.load_terms_available())", "if (!procs.available())"),
     ]:
         assert not probe_ok(code.replace(b, mutate(b, old, new), 1)), f"mutant {name!r} slipped through"
 
@@ -722,7 +828,7 @@ def test_admit_mutants():
     code = code_of(CONTEXT_CPP)
     b = function_body(code, _ADMIT)
     for name, old, new in [
-        ("measured at the late stage", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_B)", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_C)"),
+        ("measured at the late stage", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, weights)", "GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, weights)"),
         ("recorded despite a refusal", "if (!out.refusal.empty()) {\n        return out;\n    }", ""),
         ("never recorded", "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);", ""),
         ("recorded at n_ctx 0", "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);", "out.n_recorded = llama_admitted_record(procs, txn, out, n_ctx);"),

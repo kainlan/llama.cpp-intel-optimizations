@@ -4106,37 +4106,62 @@ llama_load_measure_result llama_load_measure(const llama_model &          model,
 #endif
 }
 
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+// The L4 entry points of the model's first SYCL device, or none: each load stage gates on them before it measures.
+static llama_sycl_l4_procs llama_load_stage_procs(const llama_model & model) {
+    for (const auto & d : model.devices) {
+        if (llama_context_dev_is_sycl(d.dev)) {
+            return llama_context_sycl_l4_procs_for_dev(d.dev);
+        }
+    }
+    return {};
+}
+
+// One load stage's measure, shared by the probe, admitted and late stages: the weights' stand-ins, the measure at
+// `stage` and its trace. A result that is not `ok` measured nothing the stage can fold, and carries why (a refused
+// stand-in buffer refuses by name like any measure failure). The stand-ins are size-0 buffers that only let the
+// measure context see a buffer on every weight, so they end with the measure. Each stage keeps its gate before this
+// and its fold after it.
+static llama_load_measure_result llama_load_stage_measure(const llama_model &                            model,
+                                                          uint32_t                                       n_ctx,
+                                                          uint64_t                                       load_txn,
+                                                          enum ggml_sycl_measure_stage                   stage,
+                                                          const std::vector<llama_measure_dummy_entry> & weights) {
+    llama_measure_dummy_scope dummies(weights);
+    if (dummies.failed()) {
+        llama_load_measure_result out;
+        out.refusal = llama_load_measure_refusal_text(stage, -1, "a weight stand-in buffer was refused");
+        return out;
+    }
+    llama_load_measure_result measured = llama_load_measure(model, n_ctx, load_txn, stage);
+    llama_load_measure_log_trace(measured);
+    return measured;
+}
+
+// A stage measure that is not `ok` ends the stage: a model the measure cannot walk is unsupported (the load takes the
+// unplanned path with a WARN), anything else refuses the load, under the measure's own text either way.
+static void llama_load_stage_fail(const llama_load_measure_result & measured,
+                                  std::string &                     unsupported,
+                                  std::string &                     refusal) {
+    (measured.unsupported ? unsupported : refusal) = measured.refusal;
+}
+#endif
+
 llama_load_probe_result llama_load_probe_bound(const llama_model &                            model,
                                                uint32_t                                       n_ctx,
                                                struct ggml_sycl_load_txn                      txn,
                                                const std::vector<llama_measure_dummy_entry> & weights) {
     llama_load_probe_result out;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-    llama_sycl_l4_procs procs;
-    for (const auto & d : model.devices) {
-        if (llama_context_dev_is_sycl(d.dev)) {
-            procs = llama_context_sycl_l4_procs_for_dev(d.dev);
-            break;
-        }
-    }
-    if (!procs.available()) {
-        return out;
-    }
+    const llama_sycl_l4_procs procs = llama_load_stage_procs(model);
     // a bound that cannot be both reserved and recorded is not measured: the load takes master's unplanned path
-    if (!procs.load_terms_available()) {
+    if (!procs.available() || !procs.load_terms_available()) {
         return out;
     }
-
-    llama_measure_dummy_scope dummies(weights);
-    if (dummies.failed()) {
-        out.refusal =
-            llama_load_measure_refusal_text(GGML_SYCL_MEASURE_STAGE_PROBE, -1, "a weight stand-in buffer was refused");
-        return out;
-    }
-    const llama_load_measure_result measured = llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_PROBE);
-    llama_load_measure_log_trace(measured);
+    const llama_load_measure_result measured =
+        llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_PROBE, weights);
     if (!measured.ok) {
-        (measured.unsupported ? out.unsupported : out.refusal) = measured.refusal;
+        llama_load_stage_fail(measured, out.unsupported, out.refusal);
         return out;
     }
     out.devices  = measured.devices;
@@ -4164,28 +4189,14 @@ llama_admitted_check_result llama_load_admitted_check(const llama_model &       
                                                       const llama_load_probe_result &                probe) {
     llama_admitted_check_result out;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-    llama_sycl_l4_procs procs;
-    for (const auto & d : model.devices) {
-        if (llama_context_dev_is_sycl(d.dev)) {
-            procs = llama_context_sycl_l4_procs_for_dev(d.dev);
-            break;
-        }
-    }
+    const llama_sycl_l4_procs procs = llama_load_stage_procs(model);
     if (!procs.available() || !procs.load_terms_available()) {
         return out;
     }
-
-    llama_measure_dummy_scope dummies(weights);
-    if (dummies.failed()) {
-        out.refusal = llama_load_measure_refusal_text(GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, -1,
-                                                      "a weight stand-in buffer was refused");
-        return out;
-    }
     const llama_load_measure_result measured =
-        llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B);
-    llama_load_measure_log_trace(measured);
+        llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B, weights);
     if (!measured.ok) {
-        (measured.unsupported ? out.unsupported : out.refusal) = measured.refusal;
+        llama_load_stage_fail(measured, out.unsupported, out.refusal);
         return out;
     }
     const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
@@ -4215,28 +4226,14 @@ llama_late_check_result llama_load_late_check(const llama_model &               
                                               const std::vector<llama_measure_dummy_entry> & weights) {
     llama_late_check_result out;
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-    llama_sycl_l4_procs procs;
-    for (const auto & d : model.devices) {
-        if (llama_context_dev_is_sycl(d.dev)) {
-            procs = llama_context_sycl_l4_procs_for_dev(d.dev);
-            break;
-        }
-    }
+    const llama_sycl_l4_procs procs = llama_load_stage_procs(model);
     if (!procs.available()) {
         return out;  // no c(P) can have been recorded without the L4 entry points
     }
-
-    llama_measure_dummy_scope dummies(weights);
-    if (dummies.failed()) {
-        out.refusal = llama_load_measure_refusal_text(GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, -1,
-                                                      "a weight stand-in buffer was refused");
-        return out;
-    }
     const llama_load_measure_result measured =
-        llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C);
-    llama_load_measure_log_trace(measured);
+        llama_load_stage_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_C, weights);
     if (!measured.ok) {
-        (measured.unsupported ? out.unsupported : out.refusal) = measured.refusal;
+        llama_load_stage_fail(measured, out.unsupported, out.refusal);
         return out;
     }
 
