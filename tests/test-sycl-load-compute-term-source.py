@@ -10,7 +10,9 @@ The fix this gate pins: the load measures the compute buffer at the probe placem
 ggml_backend_sycl_load_reserve_compute_term, which sizes a planned RUNTIME term from them at the RUNTIME TLSF's grain
 (zone_compute_term_bytes, no headroom) and stores it beside the dense scratch terms. The RUNTIME zone requirement
 folds it in, so the zone is sized for the buffer before the weight pack; the ring re-plan leaves it that room; the
-landing line names it; and it is dropped where no model is live, so a next load never inherits it.
+landing line names it; and it is dropped where no model is live, so a next load never inherits it. Around it: the
+early inventory plan stages the probe plan the PROBE measure installs, the admitted check's units export answers the
+reserve's own sizing rule, and the measure override's install proc answers only the name of its kv_shape form.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -109,6 +111,11 @@ LOAD_SIG = "static void ggml_sycl_model_loading_effects(bool loading, bool outer
 TEARDOWN_SIG = "static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner)"
 ABORT_SIG = "static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelToken owner,"
 CLEAR = "ggml_sycl::unified_cache_clear_planned_compute_terms();"
+STAGE_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory * inventory,"
+STAGE_PROBE = ("if (early) { const uint64_t txn = effect.owner.load.value; "
+               "const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(txn); "
+               "if (candidate && candidate->plan) { ggml_sycl::lifecycle_stage_probe_placement_plan(txn, "
+               "ggml_sycl::placement_plan(*candidate->plan), candidate->kv_info, candidate->model_n_layer); } }")
 
 
 # ---- (a) the reservation: refusals first, the allocator's grain, the planner term only ----------------------------
@@ -210,6 +217,23 @@ def claim_abort_clears_with_no_model_live(sycl: str) -> bool:
     return bool(b) and ordered(
         b, "ggml_sycl_reset_model_load_scratch_state(true);",
         "if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) { " + CLEAR + " }")
+
+
+# ---- (b0) the probe plan is staged by the early inventory plan -----------------------------------------------------
+
+
+def claim_early_plan_stages_the_probe_plan(sycl: str) -> bool:
+    """The PROBE-stage measure installs the probe plan, and only the early arm of the inventory plan stages it: a copy
+    of the load's early candidate, after every device planned it. Without it every SYCL load's probe measure refuses
+    (no plan staged), and nothing on the host would notice."""
+    b = body(norm(sycl), STAGE_SIG)
+    return (bool(b) and ordered(b, "if (early) { ggml_backend_sycl_compute_placement_plan_early(backend, inventory); }",
+                                STAGE_PROBE)
+            and b.count("lifecycle_stage_probe_placement_plan(") == 1)
+
+
+def test_the_early_plan_stages_the_probe_plan():
+    assert claim_early_plan_stages_the_probe_plan(SYCL)
 
 
 # ---- (b) the measure's plan override is reached only under the name of its kv_shape form ---------------------------
@@ -393,6 +417,27 @@ def test_mutant_backend_answering_the_old_install_name_fails():
 
 def test_mutant_llama_asking_the_old_install_name_fails():
     assert not claim_install_proc_answers_only_its_kv_name(SYCL, _once(LLAMA_CTX, INSTALL_KV, INSTALL_OLD))
+
+
+
+_STAGE_RAW = ("                ggml_sycl::lifecycle_stage_probe_placement_plan(txn, ggml_sycl::placement_plan(*candidate->plan),\n"
+              "                                                                candidate->kv_info, candidate->model_n_layer);\n")
+
+
+def test_mutant_probe_plan_not_staged_fails():
+    assert not claim_early_plan_stages_the_probe_plan(_once(SYCL, _STAGE_RAW, ""))
+
+
+def test_mutant_probe_plan_staged_by_the_late_arm_fails():
+    assert not claim_early_plan_stages_the_probe_plan(
+        _once(SYCL, "        if (early) {\n            // llama.cpp-p6i0: the early plan is the load's probe placement.",
+              "        if (!early) {\n            // llama.cpp-p6i0: the early plan is the load's probe placement."))
+
+
+def test_mutant_probe_plan_staged_for_another_load_fails():
+    assert not claim_early_plan_stages_the_probe_plan(
+        _once(SYCL, "            const uint64_t txn       = effect.owner.load.value;",
+              "            const uint64_t txn       = effect.owner.load.value + 1;"))
 
 
 if __name__ == "__main__":
