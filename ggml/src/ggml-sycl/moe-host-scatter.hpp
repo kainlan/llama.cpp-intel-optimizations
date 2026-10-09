@@ -2,23 +2,20 @@
 
 // How the host-expert MoE results travel back to the device (llama.cpp-cre6).
 //
-// A MUL_MAT_ID whose experts run on the CPU writes its result rows into one
-// compact host-pinned block: row i of the dispatch at src_offset = (first + i)
-// * N floats. Each row belongs at its own destination row, dst + i1 * nb1 +
-// i2 * nb2, where i1 is the expert slot and i2 the token. The scatter used to
-// issue one H2D copy per run of rows whose destinations happen to be adjacent
-// (moe_scatter_runs_build), which on a decode token is about one copy per
-// host-resident expert: ~12 copies per MoE layer on Qwen3.8.
+// A MUL_MAT_ID whose experts run on the CPU writes its result rows into one compact host-pinned block: row i of the
+// dispatch at src_offset = (first + i) * N floats. Each row belongs at its own destination row, dst + i1 * nb1 + i2 *
+// nb2, where i1 is the expert slot and i2 the token. The per-run form (moe_scatter_runs_build) issues one H2D copy per
+// run of rows whose sources and destinations are both adjacent. Rows arrive token by token and slot by slot, so a
+// layer whose every selected expert is on the host is one run; one whose host experts are interleaved with device
+// experts is about one run per host expert.
 //
-// The compact form (moe_scatter_plan_build) copies the contiguous source block
-// to a planned device scratch in as few copies as the sources allow (one, when
-// gate and up share a pool), then one small kernel places each scratch row at
-// its destination. The row -> destination map travels as kernel arguments, so
-// it costs no copy. Rows beyond what the scratch or one kernel's arguments can
-// hold go in further chunks of the same shape.
+// The compact form (moe_scatter_plan_build) copies the contiguous source block to a planned device scratch in as few
+// copies as the sources allow (one, when gate and up share a pool), then one small kernel places each scratch row at
+// its destination. The row -> destination map travels as kernel arguments, so it costs no copy. Rows beyond what the
+// scratch or one kernel's arguments can hold go in further chunks of the same shape. A flush takes it only when it
+// issues fewer device submissions than the per-run form (moe_scatter_compact_pays).
 //
-// SYCL-free on purpose so tests/test-sycl-moe-host-scatter.cpp can run it
-// without a device.
+// SYCL-free on purpose so tests/test-sycl-moe-host-scatter.cpp can run it without a device.
 
 #include <algorithm>
 #include <atomic>
@@ -28,9 +25,8 @@
 
 namespace ggml_sycl {
 
-// One result row: `bytes` at `src_offset` in source staging `src`, bound for
-// `dst_offset` in destination `dst`. `src` and `dst` are small indices the
-// caller maps to its handles.
+// One result row: `bytes` at `src_offset` in source staging `src`, bound for `dst_offset` in destination `dst`. `src`
+// and `dst` are small indices the caller maps to its handles.
 struct moe_scatter_row {
     int    src        = 0;
     size_t src_offset = 0;
@@ -39,15 +35,9 @@ struct moe_scatter_row {
     size_t bytes      = 0;
 };
 
-// The per-run copy: rows merge while source and destination both stay
-// contiguous and in the same buffers.
-struct moe_scatter_run {
-    int    src        = 0;
-    size_t src_offset = 0;
-    int    dst        = 0;
-    size_t dst_offset = 0;
-    size_t bytes      = 0;
-};
+// The per-run copy has a row's fields, its bytes covering every row merged into it: rows merge while source and
+// destination both stay contiguous and in the same buffers.
+using moe_scatter_run = moe_scatter_row;
 
 inline void moe_scatter_runs_build(const std::vector<moe_scatter_row> & rows, std::vector<moe_scatter_run> & runs) {
     runs.clear();
@@ -70,8 +60,7 @@ inline void moe_scatter_runs_build(const std::vector<moe_scatter_row> & rows, st
     }
 }
 
-// Rows one scatter kernel launch places: the row -> destination map is a
-// fixed array in the kernel's arguments.
+// Rows one scatter kernel launch places: the row -> destination map is a fixed array in the kernel's arguments.
 constexpr size_t MOE_SCATTER_MAX_ROWS = 64;
 // Destination buffers one compact scatter can write: a layer's gate and up.
 constexpr int    MOE_SCATTER_MAX_DSTS = 2;
@@ -84,9 +73,8 @@ struct moe_scatter_copy {
     size_t bytes          = 0;
 };
 
-// One copy-then-kernel step: copies [first_copy, first_copy + n_copies) fill
-// scratch rows 0..n_rows-1 with input rows [first_row, first_row + n_rows),
-// then one kernel places scratch row r at rows[first_row + r]'s destination.
+// One copy-then-kernel step: copies [first_copy, first_copy + n_copies) fill scratch rows 0..n_rows-1 with input rows
+// [first_row, first_row + n_rows), then one kernel places scratch row r at rows[first_row + r]'s destination.
 struct moe_scatter_chunk {
     size_t first_copy = 0;
     size_t n_copies   = 0;
@@ -103,11 +91,9 @@ struct moe_scatter_plan {
     std::vector<uint32_t>          by_dst;
 };
 
-// Builds the compact plan for `rows` through a scratch of `scratch_bytes`.
-// False, with the plan cleared, when the rows cannot take the compact form and
-// the caller must use the per-run copies. Clearing keeps every vector's
-// capacity, so a caller that reuses one plan allocates nothing per flush once
-// the plan has grown to its largest flush.
+// Builds the compact plan for `rows` through a scratch of `scratch_bytes`. False, with the plan cleared, when the rows
+// cannot take the compact form and the caller must use the per-run copies. Clearing keeps every vector's capacity, so
+// a caller that reuses one plan allocates nothing per flush once the plan has grown to its largest flush.
 inline bool moe_scatter_plan_build(const std::vector<moe_scatter_row> & rows,
                                    size_t                               scratch_bytes,
                                    moe_scatter_plan *                   plan) {
@@ -191,6 +177,13 @@ inline bool moe_scatter_plan_build(const std::vector<moe_scatter_row> & rows,
     return true;
 }
 
+// Whether the compact form is worth taking: it issues one copy per plan copy and one kernel per chunk, the per-run
+// form one copy per run of the same rows. It pays only when it issues fewer, and a tie keeps the per-run copies, which
+// need no scratch and no kernel. Choosing the per-run copies this way is not a decline.
+inline bool moe_scatter_compact_pays(size_t n_runs, const moe_scatter_plan & plan) {
+    return n_runs > plan.copies.size() + plan.chunks.size();
+}
+
 // Why a flush did not take the compact form; each reason is reported once (llama.cpp-cre6).
 enum moe_scatter_decline : uint32_t {
     MOE_SCATTER_DECLINE_NO_SCRATCH = 0,
@@ -247,9 +240,8 @@ struct moe_host_scatter_tensor {
     bool   has_host_experts = false;
 };
 
-// Bytes of the planned scratch: the rows one flush places (both halves of a
-// decode gate/up pair when the layer has split gate and up tensors, else one
-// op's n_expert_used rows), capped at one kernel launch, times the row bytes.
+// Bytes of the planned scratch: the rows one flush places (both halves of a decode gate/up pair when the layer has
+// split gate and up tensors, else one op's n_expert_used rows), capped at one kernel launch, times the row bytes.
 // False on overflow.
 inline bool moe_host_scatter_scratch_bytes(size_t n_expert_used, bool split_gate_up, size_t row_elems, size_t * out) {
     const size_t per_op = split_gate_up ? 2 : 1;

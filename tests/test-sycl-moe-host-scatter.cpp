@@ -436,6 +436,68 @@ static int test_scratch_bytes() {
     return 0;
 }
 
+// Whether a flush takes the compact form: only when it issues fewer device submissions (copies plus kernels) than
+// the per-run copies. When the rows already arrive as one run per destination, the per-run copies are the cheaper
+// form, and taking it is not a decline.
+static int compact_choice(const std::vector<dispatch> & ds, size_t scratch_bytes, size_t * runs, bool * pays) {
+    std::vector<moe_scatter_row> rows;
+    for (const dispatch & d : ds) {
+        append_rows(d, rows);
+    }
+    std::vector<moe_scatter_run> run_list;
+    ggml_sycl::moe_scatter_runs_build(rows, run_list);
+    moe_scatter_plan plan;
+    CHECK(ggml_sycl::moe_scatter_plan_build(rows, scratch_bytes, &plan), "the routing takes a compact plan");
+    *runs = run_list.size();
+    *pays = ggml_sycl::moe_scatter_compact_pays(run_list.size(), plan);
+    return 0;
+}
+
+static int test_compact_pays() {
+    const size_t               down_scratch  = scratch_for(k_n_used, k_n_down);
+    const size_t               gate_scratch  = scratch_for(2 * k_n_used, k_n_gate);
+    const std::vector<int64_t> all_slots     = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const std::vector<int64_t> routing_order = { 4, 0, 9, 2, 7, 1, 8, 3, 6, 5 };
+    size_t                     runs          = 0;
+    bool                       pays          = true;
+
+    // Per-run branch.
+    CHECK(compact_choice({ decode(0, 0, 0, k_n_down, { 7 }) }, down_scratch, &runs, &pays) == 0, "single host expert");
+    CHECK(runs == 1 && !pays, "a single host expert: one copy beats one copy and one kernel");
+    CHECK(compact_choice({ decode(0, 0, 0, k_n_down, all_slots) }, down_scratch, &runs, &pays) == 0,
+          "all host, slot order");
+    CHECK(runs == 1 && !pays, "every expert on the host in slot order is already one copy");
+    CHECK(compact_choice({ decode(0, 0, 0, k_n_down, { 1, 4 }) }, down_scratch, &runs, &pays) == 0, "two runs");
+    CHECK(runs == 2 && !pays, "two runs against one copy and one kernel is a tie, and a tie keeps the per-run copies");
+    CHECK(compact_choice({ decode(0, 0, 0, k_n_gate, all_slots), decode(0, 1, 10, k_n_gate, all_slots) }, gate_scratch,
+                         &runs, &pays) == 0,
+          "gate+up, all host");
+    CHECK(runs == 2 && !pays, "an all-host gate+up pair is one copy per half, a tie with the merged form");
+    dispatch prompt;
+    prompt.N      = k_n_down;
+    prompt.n_used = k_n_used;
+    for (int64_t t = 0; t < 58; ++t) {
+        for (int64_t slot = 0; slot < k_n_used; ++slot) {
+            prompt.entries.push_back({ slot, t });
+        }
+    }
+    CHECK(compact_choice({ prompt }, down_scratch, &runs, &pays) == 0, "all-host prompt");
+    CHECK(runs == 1 && !pays, "an all-host prompt is one copy; the compact form would cut it into 58 chunks");
+
+    // Compact branch.
+    CHECK(compact_choice({ decode(0, 0, 0, k_n_down, { 1, 4, 5, 8 }) }, down_scratch, &runs, &pays) == 0,
+          "four host experts");
+    CHECK(runs == 3 && pays, "three runs against one copy and one kernel");
+    CHECK(compact_choice({ decode(0, 0, 3, k_n_down, routing_order) }, down_scratch, &runs, &pays) == 0,
+          "all host, routing order");
+    CHECK(runs == 10 && pays, "ten runs against one copy and one kernel");
+    CHECK(compact_choice({ decode(0, 0, 0, k_n_gate, { 2, 3, 6, 9 }), decode(0, 1, 4, k_n_gate, { 0, 5, 8 }) },
+                         gate_scratch, &runs, &pays) == 0,
+          "gate+up, shared pool");
+    CHECK(runs == 6 && pays, "six runs against one merged copy and one kernel");
+    return 0;
+}
+
 // Each reason a flush declines the compact form is reported once, and an earlier reason does not hide a later one.
 static int test_decline_reported_once_per_reason() {
     std::atomic<uint32_t> seen{ 0 };
@@ -447,6 +509,8 @@ static int test_decline_reported_once_per_reason() {
           "a different reason after the first is still reported");
     CHECK(!ggml_sycl::moe_scatter_decline_first(seen, ggml_sycl::MOE_SCATTER_DECLINE_NO_SCRATCH),
           "the second reason is reported once too");
+    CHECK(!ggml_sycl::moe_scatter_decline_first(seen, ggml_sycl::MOE_SCATTER_DECLINE_GRAPH_RECORDING),
+          "the first reason stays reported after a different one was raised");
     for (uint32_t r = 0; r < ggml_sycl::MOE_SCATTER_DECLINE_COUNT; ++r) {
         CHECK(ggml_sycl::moe_scatter_decline_name(static_cast<ggml_sycl::moe_scatter_decline>(r))[0] != '\0',
               "every reason has a name for the WARN");
@@ -520,6 +584,8 @@ static int test_flush_allocations() {
             CHECK(ggml_sycl::moe_scatter_plan_build(rows, scratch, &plan), "a decode flush takes the compact form");
         }
         const size_t fresh = (g_n_allocs - fresh_before) / n_flushes;
+        // Positive control: without it, a counter that never counts reads as a workspace that never allocates.
+        CHECK(fresh > 0, "building rows and a plan afresh allocates, so the counter counts");
 
         std::vector<moe_scatter_row> rows;
         moe_scatter_plan             plan;
@@ -548,8 +614,8 @@ static int test_flush_allocations() {
 }
 
 int main() {
-    if (test_decode_edges() != 0 || test_gate_up_merge() != 0 || test_chunking() != 0 || test_refusals() != 0 ||
-        test_scratch_bytes() != 0 || test_decline_reported_once_per_reason() != 0 ||
+    if (test_decode_edges() != 0 || test_gate_up_merge() != 0 || test_compact_pays() != 0 || test_chunking() != 0 ||
+        test_refusals() != 0 || test_scratch_bytes() != 0 || test_decline_reported_once_per_reason() != 0 ||
         test_scratch_bytes_for_device() != 0 || test_flush_allocations() != 0) {
         return 1;
     }

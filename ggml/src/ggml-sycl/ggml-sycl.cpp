@@ -23535,7 +23535,6 @@ struct pending_cpu_scatter {
     float *                      out_pinned;     // Output buffer to scatter from
     float *                      act_pinned;     // Activation buffer (for deferred release)
     uint8_t *                    weight_pinned;  // Optional D2H-staged weights for unsupported device kernels
-    std::vector<sycl::event>     scatter_events;
     sycl::queue *                stream;         // GPU queue for H2D copies
     std::optional<sycl::context> sycl_ctx;       // Retain context only while deferred work is live.
 
@@ -24948,12 +24947,13 @@ struct moe_profile_state {
                 print_row("    CPU future.get()", dtok_scat_cpu, dtok.n_moe_layers);
                 print_row("    memcpy submit", dtok_scat_sub, dtok.n_moe_layers);
                 print_row("    event::wait()", dtok_scat_wait, dtok.n_moe_layers);
-                // "entries" counts H2D copies only (llama.cpp-cre6): the compact scatter's placement kernels are not
-                // in it, so compare copies with copies across builds, and count kernels from the kernel profiler.
-                fprintf(
-                    stderr,
-                    "    Scatter: %d calls, %d entries (H2D copies, placement kernels not counted), %.1f KB total\n",
-                    dtok_scat_calls, dtok_scat_ent, dtok_scat_bytes / 1024.0);
+                // "calls" counts flushes, and a merged gate+up pair is one flush; "entries" counts H2D copies only
+                // (llama.cpp-cre6): the compact scatter's placement kernels are not in it, so compare copies with
+                // copies across builds, and count kernels from the kernel profiler.
+                fprintf(stderr,
+                        "    Scatter: %d calls (flushes; a merged gate+up pair is one), %d entries (H2D copies, "
+                        "placement kernels not counted), %.1f KB total\n",
+                        dtok_scat_calls, dtok_scat_ent, dtok_scat_bytes / 1024.0);
                 if (dtok_scat_calls > 0) {
                     double per_call_us    = (dtok_scat_cpu + dtok_scat_sub + dtok_scat_wait) / dtok_scat_calls;
                     double per_call_bytes = dtok_scat_bytes / dtok_scat_calls;
@@ -25312,47 +25312,56 @@ struct moe_host_scatter_rows {
     float * row[ggml_sycl::MOE_SCATTER_MAX_ROWS];
 };
 
-// The compact scatter of `slots` (llama.cpp-cre6): one copy per run of contiguous sources into the planned scratch
-// the producer bound, then one kernel placing each scratch row at its destination, per chunk of the plan. The raw
-// pointers the kernel takes are views resolved here, at submission, from handles that are retained until the kernel
-// completes. Returns false having submitted nothing when the rows cannot take this form here; `why` names the reason
-// and the caller makes the per-run copies instead.
-static bool moe_host_scatter_submit_compact(pending_cpu_scatter * const *    slots,
-                                            int                              n_slots,
-                                            moe_host_scatter_workspace &     ws,
-                                            size_t *                         n_copies,
-                                            ggml_sycl::moe_scatter_decline * why) {
-    const pending_cpu_scatter & lead   = *slots[0];
-    sycl::queue &               queue  = *lead.stream;
-    const int                   device = lead.device_id;
+// How a flush sends its rows to the device (llama.cpp-cre6).
+enum class moe_host_scatter_form {
+    COMPACT,   // copies into the planned scratch and one placement kernel per chunk
+    PER_RUN,   // one copy per run: the rows need no more submissions that way, so this is a choice, not a decline
+    DECLINED,  // one copy per run, because the compact form cannot run here
+};
+
+// The compact scatter of the rows the flush collected into `ws` (llama.cpp-cre6): one copy per run of contiguous
+// sources into the planned scratch the producer bound, then one kernel placing each scratch row at its destination,
+// per chunk of the plan. It is taken only when it issues fewer device submissions than ws.runs, the per-run copies of
+// the same rows; rows that already arrive as one run per destination (every selected expert on the host, in slot
+// order) return PER_RUN. The raw pointers the kernel takes are views resolved here, at submission, from handles that
+// are retained until the kernel completes. Returns PER_RUN or DECLINED having submitted nothing, DECLINED with `why`
+// naming the reason; the caller then makes the per-run copies.
+static moe_host_scatter_form moe_host_scatter_submit_compact(const pending_cpu_scatter &      lead,
+                                                             moe_host_scatter_workspace &     ws,
+                                                             size_t *                         n_copies,
+                                                             ggml_sycl::moe_scatter_decline * why) {
+    sycl::queue &                                   queue  = *lead.stream;
+    const int                                       device = lead.device_id;
+    const std::vector<ggml_sycl::mem_handle> &      srcs   = ws.srcs;
+    const std::vector<ggml_sycl::mem_handle> &      dsts   = ws.dsts;
+    const std::vector<ggml_sycl::moe_scatter_row> & rows   = ws.rows;
+    const ggml_sycl::moe_scatter_plan &             plan   = ws.plan;
     if (!lead.scatter_scratch.valid() || lead.scatter_scratch_bytes == 0) {
         *why = ggml_sycl::MOE_SCATTER_DECLINE_NO_SCRATCH;
-        return false;
+        return moe_host_scatter_form::DECLINED;
+    }
+    if (dsts.size() > static_cast<size_t>(ggml_sycl::MOE_SCATTER_MAX_DSTS)) {
+        *why = ggml_sycl::MOE_SCATTER_DECLINE_TOO_MANY_DSTS;
+        return moe_host_scatter_form::DECLINED;
+    }
+    if (!ggml_sycl::moe_scatter_plan_build(rows, lead.scatter_scratch_bytes, &ws.plan)) {
+        *why = ggml_sycl::MOE_SCATTER_DECLINE_NOT_COMPACT;
+        return moe_host_scatter_form::DECLINED;
+    }
+    if (!ggml_sycl::moe_scatter_compact_pays(ws.runs.size(), plan)) {
+        return moe_host_scatter_form::PER_RUN;
     }
     // The scratch is reused by the next chunk and the next flush: only an in-order queue orders their copies after
     // this kernel.
     if (!queue.has_property<sycl::property::queue::in_order>()) {
         *why = ggml_sycl::MOE_SCATTER_DECLINE_QUEUE_NOT_IN_ORDER;
-        return false;
+        return moe_host_scatter_form::DECLINED;
     }
     // A recorded kernel would replay this flush's scratch contents into dst on every replay; the per-run copies
     // keep whatever a recording does with them today.
     if (ggml_sycl_graph_recording_active()) {
         *why = ggml_sycl::MOE_SCATTER_DECLINE_GRAPH_RECORDING;
-        return false;
-    }
-    moe_host_scatter_rows_collect(slots, n_slots, ws);
-    const std::vector<ggml_sycl::mem_handle> &      srcs = ws.srcs;
-    const std::vector<ggml_sycl::mem_handle> &      dsts = ws.dsts;
-    const std::vector<ggml_sycl::moe_scatter_row> & rows = ws.rows;
-    const ggml_sycl::moe_scatter_plan &             plan = ws.plan;
-    if (dsts.size() > static_cast<size_t>(ggml_sycl::MOE_SCATTER_MAX_DSTS)) {
-        *why = ggml_sycl::MOE_SCATTER_DECLINE_TOO_MANY_DSTS;
-        return false;
-    }
-    if (!ggml_sycl::moe_scatter_plan_build(rows, lead.scatter_scratch_bytes, &ws.plan)) {
-        *why = ggml_sycl::MOE_SCATTER_DECLINE_NOT_COMPACT;
-        return false;
+        return moe_host_scatter_form::DECLINED;
     }
 
     // Resolve every endpoint the kernels write or read before anything is submitted.
@@ -25363,7 +25372,7 @@ static bool moe_host_scatter_submit_compact(pending_cpu_scatter * const *    slo
     const ggml_sycl::resolved_ptr scratch = lead.scatter_scratch.resolve(device);
     if (!scratch.ptr || !scratch.on_device || scratch.extent < scratch_used) {
         *why = ggml_sycl::MOE_SCATTER_DECLINE_SCRATCH_UNRESOLVED;
-        return false;
+        return moe_host_scatter_form::DECLINED;
     }
     char * dst_base[ggml_sycl::MOE_SCATTER_MAX_DSTS]   = {};
     size_t dst_extent[ggml_sycl::MOE_SCATTER_MAX_DSTS] = {};
@@ -25371,7 +25380,7 @@ static bool moe_host_scatter_submit_compact(pending_cpu_scatter * const *    slo
         const ggml_sycl::resolved_ptr r = dsts[d].resolve(device);
         if (!r.ptr || !r.on_device || r.extent == 0) {
             *why = ggml_sycl::MOE_SCATTER_DECLINE_DST_UNRESOLVED;
-            return false;
+            return moe_host_scatter_form::DECLINED;
         }
         dst_base[d]   = static_cast<char *>(r.ptr);
         dst_extent[d] = r.extent;
@@ -25379,7 +25388,7 @@ static bool moe_host_scatter_submit_compact(pending_cpu_scatter * const *    slo
     for (const ggml_sycl::moe_scatter_row & row : rows) {
         if (row.dst_offset > dst_extent[row.dst] || plan.row_bytes > dst_extent[row.dst] - row.dst_offset) {
             *why = ggml_sycl::MOE_SCATTER_DECLINE_DST_OUT_OF_RANGE;
-            return false;
+            return moe_host_scatter_form::DECLINED;
         }
     }
 
@@ -25428,12 +25437,11 @@ static bool moe_host_scatter_submit_compact(pending_cpu_scatter * const *    slo
     retained.insert(retained.end(), dsts.begin(), dsts.end());
     retained.push_back(lead.scatter_scratch);
     ggml_sycl::retain_handles_until_event(std::move(retained), placed_last);
-    ws.release_handles();
     *n_copies = plan.copies.size();
     if (lead.scatter_stats) {
         lead.scatter_stats->note_use(scratch_used);
     }
-    return true;
+    return moe_host_scatter_form::COMPACT;
 }
 
 // The flush hands the slot's buffers to prev_bufs: the scatter's copies are submitted but may not have run yet, so
@@ -25474,8 +25482,7 @@ static void pending_cpu_scatter_retire(pending_cpu_scatter & slot, const std::ve
     slot.out_handle    = {};
     slot.act_handle    = {};
     slot.weight_handle = {};
-    slot.scatter_events.clear();
-    slot.stream = nullptr;
+    slot.stream        = nullptr;
     slot.sycl_ctx.reset();
     slot.active                = false;
     slot.owns_buffers          = true;
@@ -25566,33 +25573,35 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
             }
         }
 
-        // One copy of the compact result block into the planned scratch and one kernel placing its rows; when the
-        // rows cannot take that form, one copy per run of rows whose destinations are adjacent, slot by slot, older
-        // first. Both go through mem_handle, so ownership and event retention stay centralized.
+        // The rows go to the device in the compact form (copies into the planned scratch, then one kernel placing
+        // them, per chunk) when that issues fewer device submissions than the per-run form, and otherwise as one copy
+        // per run of rows whose sources and destinations are both adjacent, in slot order, older first. A merged
+        // group shares one stream. Both go through mem_handle, so ownership and event retention stay centralized.
+        moe_host_scatter_rows_collect(group, n_group, ws);
+        ggml_sycl::moe_scatter_runs_build(ws.rows, ws.runs);
         size_t                         n_copies = 0;
         ggml_sycl::moe_scatter_decline why      = ggml_sycl::MOE_SCATTER_DECLINE_COUNT;
-        if (!moe_host_scatter_submit_compact(group, n_group, ws, &n_copies, &why)) {
-            // Once per reason: a later decline for a different reason is still reported.
-            static std::atomic<uint32_t> reported{ 0 };
-            if (ggml_sycl::moe_scatter_decline_first(reported, why)) {
+        const moe_host_scatter_form    form     = moe_host_scatter_submit_compact(slot, ws, &n_copies, &why);
+        if (form == moe_host_scatter_form::DECLINED) {
+            // Once per reason and device: a later decline for a different reason, or on another device, is still
+            // reported.
+            static std::atomic<uint32_t> reported[GGML_SYCL_MAX_DEVICES];
+            GGML_ASSERT(slot.device_id >= 0 && slot.device_id < GGML_SYCL_MAX_DEVICES);
+            if (ggml_sycl::moe_scatter_decline_first(reported[slot.device_id], why)) {
                 GGML_LOG_WARN(
                     "[MOE-SCATTER] host-expert results on device %d scatter with one copy per run of "
-                    "adjacent rows: %s (llama.cpp-cre6); reported once per reason\n",
+                    "adjacent rows: %s (llama.cpp-cre6); reported once per reason and device\n",
                     slot.device_id, ggml_sycl::moe_scatter_decline_name(why));
             }
-            for (int k = 0; k < n_group; ++k) {
-                pending_cpu_scatter &       s      = *group[k];
-                pending_cpu_scatter * const one[1] = { &s };
-                moe_host_scatter_rows_collect(one, 1, ws);
-                ggml_sycl::moe_scatter_runs_build(ws.rows, ws.runs);
-                for (const ggml_sycl::moe_scatter_run & run : ws.runs) {
-                    ws.events.push_back(ggml_sycl::mem_copy_async(ws.dsts[run.dst], run.dst_offset, ws.srcs[run.src],
-                                                                  run.src_offset, run.bytes, *s.stream));
-                }
-                n_copies += ws.runs.size();
-                ws.release_handles();
-            }
         }
+        if (form != moe_host_scatter_form::COMPACT) {
+            for (const ggml_sycl::moe_scatter_run & run : ws.runs) {
+                ws.events.push_back(ggml_sycl::mem_copy_async(ws.dsts[run.dst], run.dst_offset, ws.srcs[run.src],
+                                                              run.src_offset, run.bytes, *slot.stream));
+            }
+            n_copies = ws.runs.size();
+        }
+        ws.release_handles();
 
         auto t2 = hrc::now();  // After memcpy submissions
 
@@ -25627,30 +25636,30 @@ static void move_pending_cpu_scatter_to_sibling() {
     pending_cpu_scatter & from = g_pending_scatter;
     pending_cpu_scatter & to   = g_pending_scatter_sibling;
     GGML_ASSERT(from.active && !to.active && "sibling CPU scatter slot is occupied (llama.cpp-yx28)");
-    to.future            = std::move(from.future);
-    to.out_pinned        = from.out_pinned;
-    to.act_pinned        = from.act_pinned;
-    to.weight_pinned     = from.weight_pinned;
-    to.out_handle        = std::move(from.out_handle);
-    to.act_handle        = std::move(from.act_handle);
-    to.weight_handle     = std::move(from.weight_handle);
-    to.entries           = std::move(from.entries);
-    to.stream            = from.stream;
-    to.sycl_ctx          = std::move(from.sycl_ctx);
-    to.device_id         = from.device_id;
-    to.from_pool         = from.from_pool;
-    to.owns_buffers      = from.owns_buffers;
-    to.dst_tensor        = from.dst_tensor;
-    to.pool_first        = from.pool_first;
-    to.pool_count        = from.pool_count;
-    to.row_k             = from.row_k;
-    to.row_n             = from.row_n;
-    to.act_serial        = from.act_serial;
-    to.shares_activation = from.shares_activation;
+    to.future                = std::move(from.future);
+    to.out_pinned            = from.out_pinned;
+    to.act_pinned            = from.act_pinned;
+    to.weight_pinned         = from.weight_pinned;
+    to.out_handle            = std::move(from.out_handle);
+    to.act_handle            = std::move(from.act_handle);
+    to.weight_handle         = std::move(from.weight_handle);
+    to.entries               = std::move(from.entries);
+    to.stream                = from.stream;
+    to.sycl_ctx              = std::move(from.sycl_ctx);
+    to.device_id             = from.device_id;
+    to.from_pool             = from.from_pool;
+    to.owns_buffers          = from.owns_buffers;
+    to.dst_tensor            = from.dst_tensor;
+    to.pool_first            = from.pool_first;
+    to.pool_count            = from.pool_count;
+    to.row_k                 = from.row_k;
+    to.row_n                 = from.row_n;
+    to.act_serial            = from.act_serial;
+    to.shares_activation     = from.shares_activation;
     to.scatter_scratch       = std::move(from.scatter_scratch);
     to.scatter_scratch_bytes = from.scatter_scratch_bytes;
     to.scatter_stats         = from.scatter_stats;
-    to.active            = true;
+    to.active                = true;
 
     from.future = {};
     from.entries.clear();
@@ -25662,15 +25671,15 @@ static void move_pending_cpu_scatter_to_sibling() {
     from.weight_handle = {};
     from.stream        = nullptr;
     from.sycl_ctx.reset();
-    from.active            = false;
-    from.owns_buffers      = true;
-    from.dst_tensor        = nullptr;
-    from.pool_first        = 0;
-    from.pool_count        = 0;
-    from.row_k             = 0;
-    from.row_n             = 0;
-    from.act_serial        = 0;
-    from.shares_activation = false;
+    from.active                = false;
+    from.owns_buffers          = true;
+    from.dst_tensor            = nullptr;
+    from.pool_first            = 0;
+    from.pool_count            = 0;
+    from.row_k                 = 0;
+    from.row_n                 = 0;
+    from.act_serial            = 0;
+    from.shares_activation     = false;
     from.scatter_scratch       = {};
     from.scatter_scratch_bytes = 0;
     from.scatter_stats         = nullptr;
