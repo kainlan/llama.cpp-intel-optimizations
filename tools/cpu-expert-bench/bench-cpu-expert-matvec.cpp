@@ -24,8 +24,13 @@
 //               disassembly can be inspected. NOT the production kernel: no
 //               2-block unroll, F16C instead of the table for the fp16 scale.
 //   q2          Q2_0 prototype that keeps the weights packed and uses AVX-VNNI
-//               on four activation planes; ggml-cpu has only a scalar kernel.
-//               Single row per call: no row tiling.
+//               on four activation planes, written when ggml-cpu had only a
+//               scalar Q2_0 kernel (it has an AVX2/AVX-VNNI one since
+//               42f592105). Single row per call: no row tiling.
+//   rows2,      IQ3_S / Q2_0 / IQ4_NL: ggml-cpu's one-row x86 kernel run on 2 or
+//   rows4       4 weight rows per activation step, the activation's loads and
+//               per-block work shared by the rows, each row keeping the one-row
+//               arithmetic; leftover rows by vec_dot. The row-tiled `vecdot`.
 //
 // Pinning is a per-variant suffix, applied inside the process just before that
 // variant's calls of a burst and undone for the unsuffixed variants, so a
@@ -45,7 +50,8 @@
 //
 // Before timing, every config is checked: `prod` and each producing variant is
 // run once over NaN-filled outputs and compared row by row to ggml-cpu's own
-// vec_dot on the same weights; a skipped row (NaN) or a mismatch FAILS the run
+// vec_dot on the same weights (the oracle line also counts the rows that match
+// bit for bit); a skipped row (NaN) or a mismatch FAILS the run
 // (exit 3) rather than printing a plausibly high GB/s. Other non-zero exits:
 // 2 bad arguments, 4 an --oracle-selftest corruption the oracle failed to reject
 // (or nothing to exercise), 5 threads > 1 but no arena worker ran in 5 discovery
@@ -279,8 +285,8 @@ static NOINLINE void mxfp4_rows(int K, const uint8_t * w, size_t row_stride, con
 }
 
 // Q2_0 (64 weights = fp16 d + 16 B of 2-bit values {0,1,2,3} -> {-1,0,1,2}, byte b
-// holds weights 4b..4b+3). ggml-cpu has no x86 kernel for it: the scalar C
-// reference runs. This prototype keeps the weights packed in memory (no repack):
+// holds weights 4b..4b+3). Written when ggml-cpu ran only the scalar C reference
+// for it. This prototype keeps the weights packed in memory (no repack):
 //   activation, once per call set: for every Q2_0 block, split the 64 Q8_0
 //   activation bytes into 4 planes P_m[b] = y[4b+m] (m=0..3, b=0..15), the
 //   int32x4 lane sums of y (the -1 offset), and the per-lane Q8_0 scales;
@@ -348,6 +354,226 @@ static NOINLINE float q2_0_row(int K, const uint8_t * w, const q2_act_block * a)
     acc = _mm_add_ps(acc, _mm_movehl_ps(acc, acc));
     acc = _mm_add_ss(acc, _mm_movehdup_ps(acc));
     return _mm_cvtss_f32(acc);
+}
+
+// ---------------------------------------------------------------------------
+// Row tiles of ggml-cpu's one-row x86 vec_dot (ggml-cpu/arch/x86/quants.c) for
+// the types that carry Qwen3.8's host-expert bytes: IQ3_S (gate/up), Q2_0 and
+// IQ4_NL (down). Each step loads the activation block once and runs the one-row
+// kernel's arithmetic on R weight rows, each row with its own accumulators, so
+// a row's operations and their order are the one-row kernel's. What is shared
+// is the activation side: its loads and scales, and for Q2_0 the dot of the
+// activation with the -1 offset, an integer identical for every row.
+// ---------------------------------------------------------------------------
+static inline float h2f(const ggml_half & h) {
+    uint16_t bits;
+    memcpy(&bits, &h, sizeof(bits));
+    return f16(bits);
+}
+
+// ggml-cpu's q2_0_unpack_codes: the 64 2-bit codes of one block as u8 in [0, 3],
+// weights 0..31 in *lo and 32..63 in *hi, in the order of the Q8_0 halves.
+static inline void q2_0_codes(const uint8_t * qs, __m256i * lo, __m256i * hi) {
+    const __m256i q     = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) qs));
+    const __m256i m3    = _mm256_set1_epi8(3);
+    const __m256i sh_02 = _mm256_setr_epi32(0, 0, 0, 0, 4, 4, 4, 4);
+    const __m256i sh_13 = _mm256_setr_epi32(2, 2, 2, 2, 6, 6, 6, 6);
+    const __m256i f02   = _mm256_and_si256(_mm256_srlv_epi32(q, sh_02), m3);
+    const __m256i f13   = _mm256_and_si256(_mm256_srlv_epi32(q, sh_13), m3);
+    const __m256i u_lo  = _mm256_unpacklo_epi8(f02, f13);
+    const __m256i u_hi  = _mm256_unpackhi_epi8(f02, f13);
+    const __m256i p_lo  = _mm256_permute4x64_epi64(u_lo, _MM_SHUFFLE(3, 1, 2, 0));
+    const __m256i p_hi  = _mm256_permute4x64_epi64(u_hi, _MM_SHUFFLE(3, 1, 2, 0));
+    const __m256i ord = _mm256_setr_epi8(0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15, 0, 1, 8, 9, 2, 3, 10, 11,
+                                         4, 5, 12, 13, 6, 7, 14, 15);
+    *lo               = _mm256_shuffle_epi8(p_lo, ord);
+    *hi               = _mm256_shuffle_epi8(p_hi, ord);
+}
+
+// ggml_vec_dot_q2_0_q8_0 on R rows. Per row and half: (codes . y) - (1 . y), the
+// second term once per block for all rows (AVX-VNNI, as ggml-cpu built for this
+// host; the integers are exact either way).
+template <int R>
+static NOINLINE void q2_0_rows(int K, const uint8_t * w, size_t row_stride, const void * vy, float * out) {
+    const int          nb     = K / QK2_0;
+    const block_q8_0 * y      = (const block_q8_0 *) vy;
+    const __m256i      ones_8 = _mm256_set1_epi8(1);
+    const __m256i      zero   = _mm256_setzero_si256();
+    const block_q2_0 * x[R];
+    __m256             acc0[R], acc1[R];
+    for (int r = 0; r < R; r++) {
+        x[r]    = (const block_q2_0 *) (w + (size_t) r * row_stride);
+        acc0[r] = _mm256_setzero_ps();
+        acc1[r] = _mm256_setzero_ps();
+    }
+    for (int ib = 0; ib < nb; ++ib) {
+        const block_q8_0 * yb  = &y[2 * ib];
+        const __m256i      qy0 = _mm256_loadu_si256((const __m256i *) yb[0].qs);
+        const __m256i      qy1 = _mm256_loadu_si256((const __m256i *) yb[1].qs);
+        const __m256i      ys0 = _mm256_dpbusd_avx_epi32(zero, ones_8, qy0);
+        const __m256i      ys1 = _mm256_dpbusd_avx_epi32(zero, ones_8, qy1);
+        const float        dy0 = h2f(yb[0].d);
+        const float        dy1 = h2f(yb[1].d);
+        for (int r = 0; r < R; r++) {
+            const float d0 = h2f(x[r][ib].d);
+            __m256i     c0, c1;
+            q2_0_codes(x[r][ib].qs, &c0, &c1);
+            const __m256i s0 = _mm256_sub_epi32(_mm256_dpbusd_avx_epi32(zero, c0, qy0), ys0);
+            const __m256i s1 = _mm256_sub_epi32(_mm256_dpbusd_avx_epi32(zero, c1, qy1), ys1);
+            acc0[r]          = _mm256_fmadd_ps(_mm256_set1_ps(d0 * dy0), _mm256_cvtepi32_ps(s0), acc0[r]);
+            acc1[r]          = _mm256_fmadd_ps(_mm256_set1_ps(d0 * dy1), _mm256_cvtepi32_ps(s1), acc1[r]);
+        }
+    }
+    for (int r = 0; r < R; r++) {
+        out[r] = hsum8(_mm256_add_ps(acc0[r], acc1[r]));
+    }
+}
+
+// ggml_vec_dot_iq4_nl_q8_0 (AVX2 branch, two blocks per step, scalar tail) on R rows.
+static inline __m256i mul_add_epi8(const __m256i x, const __m256i y) {
+    return _mm256_maddubs_epi16(_mm256_sign_epi8(x, x), _mm256_sign_epi8(y, x));
+}
+
+template <int R>
+static NOINLINE void iq4_nl_rows(int K, const uint8_t * w, size_t row_stride, const void * vy, float * out) {
+    const int            nb        = K / QK4_NL;
+    const block_q8_0 *   y         = (const block_q8_0 *) vy;
+    const __m128i        values128 = _mm_loadu_si128((const __m128i *) kvalues_iq4nl);
+    const __m128i        m4b       = _mm_set1_epi8(0x0f);
+    const __m256i        mone      = _mm256_set1_epi16(1);
+    const block_iq4_nl * x[R];
+    __m256               acc1[R], acc2[R];
+    for (int r = 0; r < R; r++) {
+        x[r]    = (const block_iq4_nl *) (w + (size_t) r * row_stride);
+        acc1[r] = _mm256_setzero_ps();
+        acc2[r] = _mm256_setzero_ps();
+    }
+    int ib = 0;
+    for (; ib + 1 < nb; ib += 2) {
+        const __m256i q8b_1 = _mm256_loadu_si256((const __m256i *) y[ib + 0].qs);
+        const __m256i q8b_2 = _mm256_loadu_si256((const __m256i *) y[ib + 1].qs);
+        const float   dy1   = h2f(y[ib + 0].d);
+        const float   dy2   = h2f(y[ib + 1].d);
+        for (int r = 0; r < R; r++) {
+            const __m128i q4bits_1 = _mm_loadu_si128((const __m128i *) x[r][ib + 0].qs);
+            const __m128i q4bits_2 = _mm_loadu_si128((const __m128i *) x[r][ib + 1].qs);
+            const __m256i q4b_1 =
+                _mm256_set_m128i(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_1, 4), m4b)),
+                                 _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
+            const __m256i q4b_2 =
+                _mm256_set_m128i(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
+                                 _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
+            const __m256i p_1 = _mm256_madd_epi16(mul_add_epi8(q4b_1, q8b_1), mone);
+            const __m256i p_2 = _mm256_madd_epi16(mul_add_epi8(q4b_2, q8b_2), mone);
+            acc1[r] = _mm256_fmadd_ps(_mm256_set1_ps(dy1 * h2f(x[r][ib + 0].d)), _mm256_cvtepi32_ps(p_1), acc1[r]);
+            acc2[r] = _mm256_fmadd_ps(_mm256_set1_ps(dy2 * h2f(x[r][ib + 1].d)), _mm256_cvtepi32_ps(p_2), acc2[r]);
+        }
+    }
+    for (int r = 0; r < R; r++) {
+        float sumf = hsum8(_mm256_add_ps(acc1[r], acc2[r]));
+        for (int jb = ib; jb < nb; ++jb) {
+            const float d     = h2f(y[jb].d) * h2f(x[r][jb].d);
+            int         sumi1 = 0, sumi2 = 0;
+            for (int j = 0; j < QK4_NL / 2; ++j) {
+                sumi1 += y[jb].qs[j + 0] * kvalues_iq4nl[x[r][jb].qs[j] & 0xf];
+                sumi2 += y[jb].qs[j + QK4_NL / 2] * kvalues_iq4nl[x[r][jb].qs[j] >> 4];
+            }
+            sumf += d * (sumi1 + sumi2);
+        }
+        out[r] = sumf;
+    }
+}
+
+// ggml_vec_dot_iq3_s_q8_K (AVX2 branch) on R rows: the 256-weight superblock's
+// Q8_K scale and its 32-byte activation loads are shared, the grid lookups,
+// sign masks and block scales are per row.
+template <int R>
+static NOINLINE void iq3_s_rows(int K, const uint8_t * w, size_t row_stride, const void * vy, float * out) {
+    static const uint8_t k_mask1[32] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01,
+                                         0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+                                         0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03 };
+    static const uint8_t k_mask2[32] = { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04,
+                                         0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20,
+                                         0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
+
+    const __m256i      mask1     = _mm256_loadu_si256((const __m256i *) k_mask1);
+    const __m256i      mask2     = _mm256_loadu_si256((const __m256i *) k_mask2);
+    const __m256i      idx_shift = _mm256_set_epi32(1, 2, 3, 4, 5, 6, 7, 8);
+    const __m256i      idx_mask  = _mm256_set1_epi32(256);
+    const int          nb        = K / QK_K;
+    const block_q8_K * y         = (const block_q8_K *) vy;
+
+    union index_t {
+        __m256i  vec[2];
+        uint32_t index[16];
+    };
+
+    const block_iq3_s * x[R];
+    __m256              accumf[R];
+    for (int r = 0; r < R; r++) {
+        x[r]      = (const block_iq3_s *) (w + (size_t) r * row_stride);
+        accumf[r] = _mm256_setzero_ps();
+    }
+    for (int i = 0; i < nb; ++i) {
+        const int8_t *   q8 = y[i].qs;
+        const uint8_t *  qs[R];
+        const uint16_t * signs[R];
+        __m256i          sumi1[R], sumi2[R];
+        for (int r = 0; r < R; r++) {
+            qs[r]    = x[r][i].qs;
+            signs[r] = (const uint16_t *) x[r][i].signs;
+            sumi1[r] = _mm256_setzero_si256();
+            sumi2[r] = _mm256_setzero_si256();
+        }
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *) q8);
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *) (q8 + 32));
+            q8 += 64;
+            for (int r = 0; r < R; r++) {
+                const uint8_t * qh    = x[r][i].qh;
+                const __m256i   idx_l = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *) qs[r]));
+                qs[r] += 16;
+                index_t idx;
+                idx.vec[0] = _mm256_and_si256(_mm256_sllv_epi32(_mm256_set1_epi32(qh[ib32 + 0]), idx_shift), idx_mask);
+                idx.vec[1] = _mm256_and_si256(_mm256_sllv_epi32(_mm256_set1_epi32(qh[ib32 + 1]), idx_shift), idx_mask);
+                idx.vec[0] = _mm256_or_si256(idx.vec[0], _mm256_cvtepi16_epi32(_mm256_castsi256_si128(idx_l)));
+                idx.vec[1] = _mm256_or_si256(idx.vec[1], _mm256_cvtepi16_epi32(_mm256_extractf128_si256(idx_l, 1)));
+                const __m256i q2_1 = _mm256_set_epi32(
+                    iq3s_grid[idx.index[7]], iq3s_grid[idx.index[6]], iq3s_grid[idx.index[5]], iq3s_grid[idx.index[4]],
+                    iq3s_grid[idx.index[3]], iq3s_grid[idx.index[2]], iq3s_grid[idx.index[1]], iq3s_grid[idx.index[0]]);
+                const __m256i q2_2 =
+                    _mm256_set_epi32(iq3s_grid[idx.index[15]], iq3s_grid[idx.index[14]], iq3s_grid[idx.index[13]],
+                                     iq3s_grid[idx.index[12]], iq3s_grid[idx.index[11]], iq3s_grid[idx.index[10]],
+                                     iq3s_grid[idx.index[9]], iq3s_grid[idx.index[8]]);
+
+                const uint16_t * sg     = signs[r];
+                __m256i          aux256 = _mm256_set1_epi32(sg[0] | (sg[1] << 16));
+                aux256                  = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+                const __m256i s2_1      = _mm256_cmpeq_epi8(aux256, mask2);
+                const __m256i q8s_1     = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1);
+                aux256                  = _mm256_set1_epi32(sg[2] | (sg[3] << 16));
+                aux256                  = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+                const __m256i s2_2      = _mm256_cmpeq_epi8(aux256, mask2);
+                const __m256i q8s_2     = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);
+                signs[r] += 4;
+
+                const __m256i  dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
+                const __m256i  dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
+                const uint16_t ls1  = x[r][i].scales[ib32 / 2] & 0xf;
+                const uint16_t ls2  = x[r][i].scales[ib32 / 2] >> 4;
+                sumi1[r] = _mm256_add_epi32(sumi1[r], _mm256_madd_epi16(dot1, _mm256_set1_epi16(2 * ls1 + 1)));
+                sumi2[r] = _mm256_add_epi32(sumi2[r], _mm256_madd_epi16(dot2, _mm256_set1_epi16(2 * ls2 + 1)));
+            }
+        }
+        for (int r = 0; r < R; r++) {
+            const float d = h2f(x[r][i].d) * y[i].d;
+            accumf[r] =
+                _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1[r], sumi2[r])), accumf[r]);
+        }
+    }
+    for (int r = 0; r < R; r++) {
+        out[r] = hsum8(accumf[r]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -825,6 +1051,35 @@ template <int PF> static float kern_q84(const job_ctx & c, int e, int row, int l
     return 0;
 }
 
+// R rows per tile call, the leftover rows of a range by ggml-cpu's vec_dot.
+typedef void (*row_tile)(int K, const uint8_t * w, size_t row_stride, const void * vy, float * out);
+
+template <int R, row_tile T> static float kern_tile(const job_ctx & c, int e, int row, int left, float * o) {
+    const uint8_t * w = row_ptr(c, e, row);
+    int             j = 0;
+    for (; j + R <= left; j += R) {
+        T(c.K, w + (size_t) j * c.row_bytes, c.row_bytes, c.actq, o + j);
+    }
+    for (; j < left; j++) {
+        c.tr->vec_dot(c.K, o + j, sizeof(float), w + (size_t) j * c.row_bytes, 0, c.actq, 0, 1);
+    }
+    return 0;
+}
+
+// The tiled kernel of `rows2` / `rows4` for a type, or nullptr when it has none.
+static row_kernel rows_kernel(ggml_type type, int R) {
+    switch (type) {
+        case GGML_TYPE_IQ3_S:
+            return R == 2 ? kern_tile<2, iq3_s_rows<2>> : kern_tile<4, iq3_s_rows<4>>;
+        case GGML_TYPE_Q2_0:
+            return R == 2 ? kern_tile<2, q2_0_rows<2>> : kern_tile<4, q2_0_rows<4>>;
+        case GGML_TYPE_IQ4_NL:
+            return R == 2 ? kern_tile<2, iq4_nl_rows<2>> : kern_tile<4, iq4_nl_rows<4>>;
+        default:
+            return nullptr;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // One benchmark configuration: shape x matrix x type.
 // ---------------------------------------------------------------------------
@@ -884,6 +1139,10 @@ static bool ap_r8(const config & c) {
     return c.pool_r != nullptr;
 }
 
+static bool ap_rows(const config & c) {
+    return rows_kernel(c.type, 2) != nullptr;
+}
+
 static const variant_def k_variants[] = {
     { "prod",       nullptr,       false, true,  ap_always },
     { "read",       kern_read,     true,  false, ap_always },
@@ -893,8 +1152,11 @@ static const variant_def k_variants[] = {
     { "mx8",        kern_mx<8>,    true,  true,  ap_mxfp4  },
     { "mx16",       kern_mx<16>,   true,  true,  ap_mxfp4  },
     { "q2",         kern_q2,       true,  true,  ap_q2     },
-    // r8 picks its kernel from the type below; the table entry is a placeholder.
+    // r8, rows2 and rows4 pick their kernel from the type below; the table
+    // entries are placeholders.
     { "r8",         nullptr,       true,  true,  ap_r8     },
+    { "rows2",      nullptr,       true,  true,  ap_rows   },
+    { "rows4",      nullptr,       true,  true,  ap_rows   },
 };
 
 struct variant_inst {
@@ -1069,12 +1331,14 @@ static void reference_rows(const config & cfg, const float * act_row, std::vecto
     }
 }
 
+// `exact` gains the rows equal to the reference bit for bit.
 static bool compare_block(const char *               what,
                           const config &             cfg,
                           const float *              got,
                           const std::vector<float> & ref,
                           int                        expert,
-                          bool                       expected_fail) {
+                          bool                       expected_fail,
+                          int &                      exact) {
     double maxr = 0, maxd = 0;
     int    bad = 0;
     for (int r = 0; r < cfg.N; r++) {
@@ -1085,6 +1349,9 @@ static bool compare_block(const char *               what,
         const double d = std::fabs((double) got[r] - ref[r]);
         if (!(d <= tol)) {  // also true for NaN: an unwritten row fails
             bad++;
+        }
+        if (memcmp(&got[r], &ref[r], sizeof(float)) == 0) {
+            exact++;
         }
         if (d == d) {
             maxd = std::max(maxd, d);
@@ -1111,7 +1378,8 @@ static bool oracle_check(runner & R, config & cfg, const variant_inst & v, bool 
         cfg.outv[5] = std::nanf("");
         cfg.outv[(size_t) cfg.N * (cfg.k - 1) + 7] += 1.0f;
     }
-    bool               ok = true;
+    bool               ok    = true;
+    int                exact = 0;
     std::vector<float> ref;
     const bool         is_prod = !v.def->kernel && !v.kernel;
     if (!is_prod) {
@@ -1121,11 +1389,12 @@ static bool oracle_check(runner & R, config & cfg, const variant_inst & v, bool 
         if (is_prod) {  // down has one activation per expert, gate/up share row 0
             reference_rows(cfg, cfg.act.data() + (cfg.mat == "down" ? (size_t) e * cfg.K : 0), ref);
         }
-        ok = compare_block(v.name.c_str(), cfg, cfg.outv.data() + (size_t) e * cfg.N, ref, e, corrupt) && ok;
+        ok = compare_block(v.name.c_str(), cfg, cfg.outv.data() + (size_t) e * cfg.N, ref, e, corrupt, exact) && ok;
     }
     cfg.call_ctr = 0;
-    fprintf(stderr, "oracle %s %s %s %s: %s\n", cfg.shp->name, cfg.mat.c_str(), cfg.tname.c_str(), v.name.c_str(),
-            ok ? "ok" : (corrupt ? "rejected the corrupted run" : "FAIL"));
+    fprintf(stderr, "oracle %s %s %s %s: %s (%d of %d rows bit-exact)\n", cfg.shp->name, cfg.mat.c_str(),
+            cfg.tname.c_str(), v.name.c_str(), ok ? "ok" : (corrupt ? "rejected the corrupted run" : "FAIL"), exact,
+            cfg.k * cfg.N);
     return ok;
 }
 
@@ -1284,6 +1553,10 @@ static std::vector<variant_inst> select_variants(const options & o, const config
         }
         if (std::string(v.def->name) == "r8") {
             v.kernel = cfg.type == GGML_TYPE_MXFP4 ? kern_r8_mxfp4 : kern_r8_iq4_nl;
+        } else if (std::string(v.def->name) == "rows2") {
+            v.kernel = rows_kernel(cfg.type, 2);
+        } else if (std::string(v.def->name) == "rows4") {
+            v.kernel = rows_kernel(cfg.type, 4);
         }
         out.push_back(v);
     }
