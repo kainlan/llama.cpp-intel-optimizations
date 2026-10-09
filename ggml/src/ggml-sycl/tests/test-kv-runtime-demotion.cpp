@@ -3149,6 +3149,70 @@ static int case_qwen38_indexer_buffer_backstop() {
     return 0;
 }
 
+// The same two buffers at -c 10240, the size master was run at: 20 MiB of attention K/V and 2.5 MiB of indexer keys
+// for each of the 12 attention layers. The runtime fit had 247.6 MiB for KV, and once the attention buffer landed the
+// backstop saw 27.6 MiB free ("device-planned KV 240.0 MB exceeds the 27.6 MB free for KV" on master, where the
+// backstop also charged the indexer buffer the attention buffer's 240 MiB). Budgeted without the indexer keys, all 12
+// layers stay on the device, and the 30 MiB indexer buffer still does not fit the 27.6 MiB left even counted at its own
+// size. Budgeted with them, the fit demotes the last attention layer and both buffers land.
+static int case_qwen38_indexer_budget_c10240() {
+    const size_t mb         = 1024 * 1024;
+    const int    n_layers   = 48;
+    const int    device     = 0;
+    const size_t cells      = 10240;
+    const size_t f16        = 2;
+    const size_t attn_kv    = cells * (512 + 512) * f16;  // 20 MiB
+    const size_t index_kv   = cells * 128 * f16;          // 2.5 MiB, K only
+    const size_t fit_cap    = 247 * mb + 6 * mb / 10;     // the runtime fit's KV capacity
+    const size_t free_after = 27 * mb + 6 * mb / 10;      // the backstop's free once 12 attention layers landed
+    const size_t free_kv    = free_after + 12 * attn_kv;  // the same free, before the attention buffer
+
+    auto fit = [&](bool with_indexer) {
+        kv_device_fit_input in;
+        in.device   = device;
+        in.capacity = fit_cap;
+        in.layer_kv_bytes.assign(n_layers, 0);
+        in.kv_device.assign(n_layers, -1);
+        in.swa_layer_mask.assign(n_layers, 0);
+        for (int il = 3; il < n_layers; il += 4) {
+            in.layer_kv_bytes[il] = attn_kv + (with_indexer ? index_kv : 0);
+            in.kv_device[il]      = device;
+        }
+        return plan_device_kv_fit(in);
+    };
+    // The attention buffer lands first, then the backstop checks the indexer buffer against what it left.
+    auto indexer_fits = [&](const kv_demotion_result & r) {
+        std::vector<int>     owner(n_layers, -1);
+        std::vector<uint8_t> member(n_layers, 0);
+        std::vector<size_t>  attn_bytes(n_layers, 0);
+        std::vector<size_t>  index_bytes(n_layers, 0);
+        for (int il = 3; il < n_layers; il += 4) {
+            const bool demoted =
+                std::find(r.demoted_layers.begin(), r.demoted_layers.end(), il) != r.demoted_layers.end();
+            owner[il]       = demoted ? -1 : device;
+            member[il]      = 1;
+            attn_bytes[il]  = attn_kv;
+            index_bytes[il] = index_kv;
+        }
+        const size_t attn_device = kv_buffer_device_bytes(owner, member, attn_bytes, device);
+        if (kv_admission_mismatch(attn_device, free_kv)) {
+            return false;
+        }
+        return !kv_admission_mismatch(kv_buffer_device_bytes(owner, member, index_bytes, device),
+                                      free_kv - attn_device);
+    };
+
+    const kv_demotion_result without = fit(false);
+    CHECK(without.fits && without.demoted_layers.empty(), "qwen38 c10240: without the indexer keys nothing demotes");
+    CHECK(!indexer_fits(without), "qwen38 c10240: and the 30 MiB indexer buffer is refused against 27.6 MiB");
+
+    const kv_demotion_result with = fit(true);
+    CHECK(with.fits, "qwen38 c10240: fits with the indexer keys budgeted");
+    CHECK(with.demoted_layers == (std::vector<int>{ 47 }), "qwen38 c10240: the last attention layer is demoted");
+    CHECK(indexer_fits(with), "qwen38 c10240: and both buffers land");
+    return 0;
+}
+
 // Runs a case unless KRT_ONLY names another one (a RED capture runs one case alone).
 static int run_case(const char * name, int (*fn)()) {
     const char * only = std::getenv("KRT_ONLY");
@@ -4143,6 +4207,9 @@ int main() {
         return rc;
     }
     if (int rc = run_case("qwen38_indexer_buffer_backstop", case_qwen38_indexer_buffer_backstop)) {
+        return rc;
+    }
+    if (int rc = run_case("qwen38_indexer_budget_c10240", case_qwen38_indexer_budget_c10240)) {
         return rc;
     }
     std::printf("test-kv-runtime-demotion: all ok\n");
