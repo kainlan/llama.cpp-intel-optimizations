@@ -2854,8 +2854,9 @@ recovery path: it measures the driver's working set and sizes the headroom from 
 - A second model whose term is larger than the live one's raises the RUNTIME requirement. The late zone rebuild is
   refused while the first model holds allocations, so that load reaches the abort in
   `compute_and_store_plan_for_inventory`. `llama.cpp-ouur` refuses it by name instead.
-- This is a stepping stone. moua L6 retires the term into the `FIRST_CONTEXT` head slot in the shared zone, and then
-  only the body of `ggml_backend_sycl_load_reserve_compute_term` changes.
+- This is a stepping stone. moua L6 retires both planned RUNTIME terms into the `FIRST_CONTEXT` head slot in the
+  shared zone: the compute term and the recurrent-state term, which the RUNTIME requirement adds after it. Then only
+  the bodies of `ggml_backend_sycl_load_reserve_compute_term` and `ggml_backend_sycl_load_reserve_state_term` change.
 
 ### Known limits (load-bearing — read before changing any of this)
 

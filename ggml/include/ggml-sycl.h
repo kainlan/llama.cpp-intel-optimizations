@@ -1475,14 +1475,18 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runti
 
 // ---------------------------------------------------------------------------
 // The measured-tenant publish, its coverage query and the load-time late check
-// (llama.cpp-moua L4, doc 2.4.2 and 2.4.4), and the load's compute-term record
-// and reservation (llama.cpp-p6i0).  The SYCL reg's get_proc_address answers
-// each of them under the "Proc name:" its declaration carries.  A null proc
-// address means the backend predates the entry point; the caller then treats it
-// as GROWTH (coverage), NOT_RECORDED (late check), GGML_SYCL_LIFECYCLE_UNSUPPORTED
-// (publish), not recorded (the record) and not reserved (the reservation).
-// Resolve them with
-// ggml_backend_reg_get_proc_address() under the exact names below.
+// (llama.cpp-moua L4, doc 2.4.2 and 2.4.4); the load's compute term, its record,
+// its reservation and the reservation's units; and the load's recurrent-state
+// term, its reservation, its record, its late check and the planned-state read
+// (llama.cpp-p6i0).  The SYCL reg's get_proc_address answers each of them under
+// the "Proc name:" its declaration carries.  A null proc address means the
+// backend predates the entry point; the caller then treats it as GROWTH
+// (coverage), NOT_RECORDED (either late check), GGML_SYCL_LIFECYCLE_UNSUPPORTED
+// (publish), not recorded (either record), not reserved (either reservation),
+// not sized (the units) and not read (the planned state, whose context-init
+// comparison is then skipped).  A loader missing any of the six load-term
+// entry points measures nothing and takes the unplanned path.  Resolve them
+// with ggml_backend_reg_get_proc_address() under the exact names below.
 //
 // Layout rules, which moua owns: fields are only appended; a reader treats a
 // field beyond the publisher's struct_size as absent and refuses a version it
