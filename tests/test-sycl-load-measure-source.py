@@ -305,7 +305,7 @@ def probe_ok(code: str) -> bool:
         "const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);",
         "llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);",
         # both outcomes kept: the declined compute terms and, apart from them, the reserved states
-        "out.not_reserved = std::move(reserved.compute_declined);",
+        "out.compute_declined = std::move(reserved.compute_declined);",
         "out.state_reserved = std::move(reserved.state_reserved);",
     ]
     pos = [b.find(z(t)) for t in order]
@@ -336,7 +336,7 @@ def admit_ok(code: str) -> bool:
         "llama_load_measure(model, n_ctx, txn.id, GGML_SYCL_MEASURE_STAGE_CANDIDATE_B)",
         "if (!measured.ok)",
         "const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);",
-        "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, probe.state_reserved, measured.devices, measured_n_ctx,",
+        "llama_admitted_check_fold(procs, probe.devices, probe.compute_declined, probe.state_reserved, measured.devices, measured_n_ctx,",
         "if (!out.refusal.empty()) { return out; }",
         "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);",
         # llama.cpp-p6i0: the reserved state under its own name, at the same n_ctx
@@ -704,7 +704,7 @@ def test_probe_mutants():
         ("no reservation", "llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);", "(void) measured_n_ctx;"),
         ("the envelope's n_ctx reserved", "llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx)", "llama_load_probe_reserve(procs, txn, measured.devices, n_ctx)"),
         ("the probe's residency not kept", "out.kv = measured.kv;", ""),
-        ("the declined devices dropped", "out.not_reserved = std::move(reserved.compute_declined);", ""),
+        ("the declined devices dropped", "out.compute_declined = std::move(reserved.compute_declined);", ""),
         ("the reserved states dropped", "out.state_reserved = std::move(reserved.state_reserved);", ""),
         ("the reserved states read from the declined list", "out.state_reserved = std::move(reserved.state_reserved);", "out.state_reserved = reserved.compute_declined;"),
         ("the compute term reserved past the helper", "llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);", "llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);\n    (void) llama_sycl_l4_reserve_compute_term(procs, txn, measured.devices[0], measured_n_ctx);"),
@@ -726,11 +726,11 @@ def test_admit_mutants():
         ("recorded despite a refusal", "if (!out.refusal.empty()) {\n        return out;\n    }", ""),
         ("never recorded", "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);", ""),
         ("recorded at n_ctx 0", "out.n_recorded = llama_admitted_record(procs, txn, out, measured_n_ctx);", "out.n_recorded = llama_admitted_record(procs, txn, out, n_ctx);"),
-        ("the fold bypassed", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, probe.state_reserved, measured.devices,", "llama_admitted_check_fold(procs, measured.devices, probe.not_reserved, probe.state_reserved, measured.devices,"),
+        ("the fold bypassed", "llama_admitted_check_fold(procs, probe.devices, probe.compute_declined, probe.state_reserved, measured.devices,", "llama_admitted_check_fold(procs, measured.devices, probe.compute_declined, probe.state_reserved, measured.devices,"),
         ("the admitted stage reserves", "    if (!out.refusal.empty()) {\n        return out;\n    }", "    (void) llama_sycl_l4_reserve_compute_term(procs, txn, measured.devices[0], measured_n_ctx);\n    if (!out.refusal.empty()) {\n        return out;\n    }"),
-        ("unreserved devices compared", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, probe.state_reserved, measured.devices,", "llama_admitted_check_fold(procs, probe.devices, {}, probe.state_reserved, measured.devices,"),
-        ("the fold given no reserved state", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, probe.state_reserved, measured.devices,", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, {}, measured.devices,"),
-        ("the fold given the declined list as the states", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, probe.state_reserved, measured.devices,", "llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, probe.not_reserved, measured.devices,"),
+        ("unreserved devices compared", "llama_admitted_check_fold(procs, probe.devices, probe.compute_declined, probe.state_reserved, measured.devices,", "llama_admitted_check_fold(procs, probe.devices, {}, probe.state_reserved, measured.devices,"),
+        ("the fold given no reserved state", "llama_admitted_check_fold(procs, probe.devices, probe.compute_declined, probe.state_reserved, measured.devices,", "llama_admitted_check_fold(procs, probe.devices, probe.compute_declined, {}, measured.devices,"),
+        ("the fold given the declined list as the states", "llama_admitted_check_fold(procs, probe.devices, probe.compute_declined, probe.state_reserved, measured.devices,", "llama_admitted_check_fold(procs, probe.devices, probe.compute_declined, probe.compute_declined, measured.devices,"),
         ("the residencies swapped", "probe.kv, measured.kv);", "measured.kv, probe.kv);"),
         ("the probe's residency judged against itself", "probe.kv, measured.kv);", "probe.kv, probe.kv);"),
         ("the admitted stage reserves state", "    if (!out.refusal.empty()) {\n        return out;\n    }", "    (void) llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);\n    if (!out.refusal.empty()) {\n        return out;\n    }"),

@@ -426,7 +426,7 @@ struct llama_load_probe_result {
     std::string                            unsupported;  // non-empty: the model cannot be measured
     bool                                   measured = false;
     std::vector<llama_load_measure_device> devices;      // C-hat per device when measured
-    std::vector<int32_t>                   not_reserved;    // SYCL devices whose compute term the backend declined
+    std::vector<int32_t>                   compute_declined;  // SYCL devices whose compute term the backend declined
     std::vector<int32_t>                   state_reserved;  // SYCL devices whose state term the backend reserved
     llama_kv_residency_tally               kv;            // the probe measure's KV residency (the admitted fold's)
 };
@@ -489,11 +489,11 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
 // already packed, and that part of the compute buffer can land outside the RUNTIME zone, as every byte of it did
 // before the reservation existed. With an unmoved residency the growth is a planning defect and still refuses.
 //
-// A device whose compute term the backend declined
-// (`not_reserved`) has no reservation to compare with: it is listed, not compared and not recorded, so its compute
-// buffer stays unplanned and its late check answers NOT_RECORDED, as before the reservation existed. Its state is
-// judged apart: a state the backend reserved (`state_reserved`) is marked on the term, recorded and late-checked
-// whatever the compute term did. The host tier is skipped, as in the late fold.
+// A device whose compute term the backend declined (`compute_declined`) has no reservation to compare with: it is
+// listed, not compared and not recorded, so its compute buffer stays unplanned and its late check answers
+// NOT_RECORDED, as before the reservation existed. Its state is judged apart: a state the backend reserved
+// (`state_reserved`) is marked on the term, recorded and late-checked whatever the compute term did. The host tier is
+// skipped, as in the late fold.
 struct llama_admitted_term {
     int32_t device         = -1;
     bool    reserved       = true;  // false: the backend declined the compute term; neither compared nor recorded
@@ -524,7 +524,7 @@ inline bool llama_kv_residency_same(const llama_kv_residency_tally & a, const ll
 
 inline llama_admitted_check_result llama_admitted_check_fold(const llama_sycl_l4_procs &                    procs,
                                                              const std::vector<llama_load_measure_device> & probe,
-                                                             const std::vector<int32_t> & not_reserved,
+                                                             const std::vector<int32_t> & compute_declined,
                                                              const std::vector<int32_t> & state_reserved,
                                                              const std::vector<llama_load_measure_device> & admitted,
                                                              uint32_t                                       n_ctx,
@@ -560,7 +560,7 @@ inline llama_admitted_check_result llama_admitted_check_fold(const llama_sycl_l4
         llama_admitted_term t;
         t.device         = d.device;
         t.admitted_bytes = d.total;
-        t.reserved       = std::find(not_reserved.begin(), not_reserved.end(), d.device) == not_reserved.end();
+        t.reserved = std::find(compute_declined.begin(), compute_declined.end(), d.device) == compute_declined.end();
         t.state_bytes    = bound->state_bytes;
         t.state_reserved = t.state_bytes != 0 &&
                            std::find(state_reserved.begin(), state_reserved.end(), d.device) != state_reserved.end();

@@ -4145,7 +4145,7 @@ llama_load_probe_result llama_load_probe_bound(const llama_model &              
     const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
     // each SYCL device's state term, then its compute term; a declined device's compute buffer stays unplanned
     llama_load_probe_reservations reserved = llama_load_probe_reserve(procs, txn, measured.devices, measured_n_ctx);
-    out.not_reserved                       = std::move(reserved.compute_declined);
+    out.compute_declined                         = std::move(reserved.compute_declined);
     out.state_reserved                     = std::move(reserved.state_reserved);
 #else
     GGML_UNUSED(model);
@@ -4190,8 +4190,8 @@ llama_admitted_check_result llama_load_admitted_check(const llama_model &       
     const uint32_t measured_n_ctx = llama_load_measure_n_ctx(n_ctx, model.hparams.n_ctx_train);
     const uint32_t n_ubatch       = llama_load_measure_context_params(n_ctx, model.hparams.n_ctx_train).n_ubatch;
 
-    out = llama_admitted_check_fold(procs, probe.devices, probe.not_reserved, probe.state_reserved, measured.devices,
-                                    measured_n_ctx, n_ubatch, probe.kv, measured.kv);
+    out = llama_admitted_check_fold(procs, probe.devices, probe.compute_declined, probe.state_reserved,
+                                    measured.devices, measured_n_ctx, n_ubatch, probe.kv, measured.kv);
     if (!out.refusal.empty()) {
         return out;
     }
