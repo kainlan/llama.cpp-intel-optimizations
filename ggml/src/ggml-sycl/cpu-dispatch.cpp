@@ -943,18 +943,19 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
         GGML_ASSERT(tasks[i].type != GGML_TYPE_Q1_0 && tasks[i].type != GGML_TYPE_NVFP4 &&
                     "Q1_0/NVFP4 MoE must use its admitted host recipe");
     }
-    if (n_tasks <= 0 || !tasks) {
-        return;
-    }
-
-    GGML_UNUSED(n_threads);  // TBB arena size set globally via ggml_sycl_cpu_threads_hint
-
+    // Reset before any return, so a call that computes nothing reports no rows
+    // rather than the previous call's.
     const bool                         trace = ggml_sycl_cpu_expert_trace_enabled();
     cpu_expert_trace_clock::time_point trace_t0;
     if (trace) {
         g_cpu_expert_batched_last = {};
         trace_t0                  = cpu_expert_trace_clock::now();
     }
+    if (n_tasks <= 0 || !tasks) {
+        return;
+    }
+
+    GGML_UNUSED(n_threads);  // TBB arena size set globally via ggml_sycl_cpu_threads_hint
 
     // --- Phase 1: Pre-quantize unique activation vectors ---
     // Multiple experts in the same layer share the same activation input.
@@ -1197,6 +1198,21 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
         trace_t2                           = cpu_expert_trace_clock::now();
         g_cpu_expert_batched_last.setup_us = cpu_expert_trace_us(trace_t1, trace_t2);
         g_cpu_expert_batched_last.rows     = total_rows;
+        // The rows' weight type (GGML_TYPE_COUNT when they mix types) and bytes,
+        // over the tasks counted in total_rows: those given a row stride above.
+        bool first                         = true;
+        for (int i = 0; i < n_tasks; i++) {
+            if (meta[i].row_stride == 0) {
+                continue;
+            }
+            g_cpu_expert_batched_last.bytes += static_cast<uint64_t>(tasks[i].N) * meta[i].row_stride;
+            if (first) {
+                g_cpu_expert_batched_last.type = tasks[i].type;
+                first                          = false;
+            } else if (tasks[i].type != g_cpu_expert_batched_last.type) {
+                g_cpu_expert_batched_last.type = GGML_TYPE_COUNT;
+            }
+        }
     }
     ggml_sycl_cpu_arena().execute([&] {
         ggml_sycl_tbb::parallel_for(

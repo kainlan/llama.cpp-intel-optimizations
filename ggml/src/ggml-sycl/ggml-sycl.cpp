@@ -24030,6 +24030,9 @@ static void moe_hostpath_waits_readback(int layer) {
             (unsigned long long) pt.rows, (unsigned long long) pt.threads, pt.wake_us, pt.quant_us, pt.setup_us,
             pt.fanout_us, pt.compute_us, pt.wall_us, (unsigned long long) pt.joins,
             (unsigned long long) pt.joins_ready);
+        // The same jobs split by the quant type of their weight rows (llama.cpp-y9i6).
+        GGML_LOG_WARN("[CPU-EXPERT-POOL-TRACE-TYPES] token=%llu%s\n", (unsigned long long) w.token,
+                      ggml_sycl::cpu_expert_pool_trace_format_types(pt).c_str());
         for (int c = 0; c < MOE_WAIT_COUNT; ++c) {
             w.count[c] = 0;
             w.us[c]    = 0.0;

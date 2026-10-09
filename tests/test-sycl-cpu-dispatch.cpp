@@ -9,8 +9,11 @@
 // - Adaptive dispatch split (full precision + INT4 reduced)
 // - Non-Q4_0 fallback to full precision
 // - Config functions (env var parsing)
+// - Host-expert trace: the per-type key of a batched call and the per-type
+//   summary of the pool's jobs (llama.cpp-y9i6)
 
 #include "cpu-dispatch.hpp"
+#include "cpu-expert-pool.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -22,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -376,14 +380,198 @@ static bool test_config_functions() {
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// Test 5: a traced batched call records the weight type and bytes of its rows
 // ---------------------------------------------------------------------------
 
-int main() {
+static bool test_trace_phase_type_key() {
+    printf("test_trace_phase_type_key ... ");
+    if (!ggml_sycl_cpu_expert_trace_enabled()) {
+        printf("FAIL (tracing is off: GGML_SYCL_MOE_IDS_COPY_TRACE must be set before the first batched call)\n");
+        return false;
+    }
+
+    std::vector<float> weight_f(N * K);
+    std::vector<float> act_f(K);
+    fill_random(weight_f.data(), N * K, 11);
+    fill_random(act_f.data(), K, 12);
+    const std::vector<uint8_t> w_q6 = quantize_q6_K(weight_f.data(), N, K);
+    const std::vector<uint8_t> w_q4 = quantize_q4_0(weight_f.data(), N, K);
+    const uint64_t             r_q6 = ggml_row_size(GGML_TYPE_Q6_K, K);
+    const uint64_t             r_q4 = ggml_row_size(GGML_TYPE_Q4_0, K);
+
+    std::vector<float>           out0(N), out1(N);
+    std::vector<cpu_expert_task> tasks(2);
+    tasks[0].weight_host = w_q6.data();
+    tasks[0].act_host    = act_f.data();
+    tasks[0].output_host = out0.data();
+    tasks[0].type        = GGML_TYPE_Q6_K;
+    tasks[0].K           = K;
+    tasks[0].N           = N;
+    tasks[1]             = tasks[0];
+    tasks[1].output_host = out1.data();
+
+    ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), 2, 0);
+    cpu_expert_batched_phase_times ph = ggml_sycl_cpu_expert_batched_last_phase_times();
+    if (ph.type != GGML_TYPE_Q6_K || ph.rows != 2 * N || ph.bytes != 2 * N * r_q6) {
+        printf("FAIL (one type: type=%d rows=%d bytes=%llu, want type=%d rows=%d bytes=%llu)\n", (int) ph.type, ph.rows,
+               (unsigned long long) ph.bytes, (int) GGML_TYPE_Q6_K, 2 * N, (unsigned long long) (2 * N * r_q6));
+        return false;
+    }
+
+    tasks[1].weight_host = w_q4.data();
+    tasks[1].type        = GGML_TYPE_Q4_0;
+    ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), 2, 0);
+    ph = ggml_sycl_cpu_expert_batched_last_phase_times();
+    if (ph.type != GGML_TYPE_COUNT || ph.rows != 2 * N || ph.bytes != N * r_q6 + N * r_q4) {
+        printf("FAIL (mixed types: type=%d rows=%d bytes=%llu, want type=%d rows=%d bytes=%llu)\n", (int) ph.type,
+               ph.rows, (unsigned long long) ph.bytes, (int) GGML_TYPE_COUNT, 2 * N,
+               (unsigned long long) (N * r_q6 + N * r_q4));
+        return false;
+    }
+
+    // A call with no tasks reports no rows, not the previous call's.
+    ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), 0, 0);
+    ph = ggml_sycl_cpu_expert_batched_last_phase_times();
+    if (ph.rows != 0 || ph.bytes != 0 || ph.type != GGML_TYPE_COUNT) {
+        printf("FAIL (empty call: type=%d rows=%d bytes=%llu, want no rows)\n", (int) ph.type, ph.rows,
+               (unsigned long long) ph.bytes);
+        return false;
+    }
+
+    printf("OK\n");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: the pool trace splits its jobs by weight type and prints the split
+// ---------------------------------------------------------------------------
+
+static cpu_expert_batched_phase_times trace_job(ggml_type type, int rows, uint64_t bytes, int threads, double us) {
+    cpu_expert_batched_phase_times ph;
+    ph.type       = type;
+    ph.rows       = rows;
+    ph.bytes      = bytes;
+    ph.threads    = threads;
+    ph.compute_us = us;
+    return ph;
+}
+
+static bool test_pool_trace_per_type() {
+    printf("test_pool_trace_per_type ... ");
+    using ggml_sycl::cpu_expert_pool_trace_totals;
+
+    cpu_expert_pool_trace_totals t;
+    ggml_sycl::cpu_expert_pool_trace_add_job(t, 10, trace_job(GGML_TYPE_IQ3_S, 6400, 2000000, 12, 1000.0), 5, 1100,
+                                             false);
+    ggml_sycl::cpu_expert_pool_trace_add_job(t, 10, trace_job(GGML_TYPE_IQ3_S, 6400, 1000000, 20, 500.0), 5, 600, true);
+    ggml_sycl::cpu_expert_pool_trace_add_job(t, 10, trace_job(GGML_TYPE_Q2_0, 25600, 6000000, 22, 2000.0), 5, 2100,
+                                             false);
+    ggml_sycl::cpu_expert_pool_trace_add_job(t, 2, trace_job(GGML_TYPE_COUNT, 100, 1000, 3, 10.0), 5, 20, false);
+    // A job that ran no row loop goes to the no-row slot, not to mixed.
+    ggml_sycl::cpu_expert_pool_trace_add_job(t, 1, trace_job(GGML_TYPE_COUNT, 0, 0, 0, 0.0), 5, 7, false);
+
+    // The all-type totals are unchanged by the split.
+    if (t.jobs != 5 || t.tasks != 33 || t.rows != 38500 || t.threads != 57 || t.compute_us != 3510.0 ||
+        t.wake_us != 25.0 || t.wall_us != 3827.0) {
+        printf("FAIL (all-type totals: jobs=%llu rows=%llu compute=%.0f)\n", (unsigned long long) t.jobs,
+               (unsigned long long) t.rows, t.compute_us);
+        return false;
+    }
+    const cpu_expert_pool_trace_totals::type_totals & s = t.by_type[GGML_TYPE_IQ3_S];
+    if (s.jobs != 2 || s.rows != 12800 || s.bytes != 3000000 || s.threads != 32 || s.threads_max != 20 ||
+        s.overlapped != 1 || s.compute_us != 1500.0) {
+        printf("FAIL (iq3_s slot: jobs=%llu rows=%llu bytes=%llu threads=%llu/%llu ovl=%llu compute=%.0f)\n",
+               (unsigned long long) s.jobs, (unsigned long long) s.rows, (unsigned long long) s.bytes,
+               (unsigned long long) s.threads, (unsigned long long) s.threads_max, (unsigned long long) s.overlapped,
+               s.compute_us);
+        return false;
+    }
+    if (t.by_type[GGML_TYPE_Q2_0].jobs != 1 || t.by_type[cpu_expert_pool_trace_totals::slot_mixed].jobs != 1 ||
+        t.by_type[cpu_expert_pool_trace_totals::slot_none].jobs != 1 || t.by_type[GGML_TYPE_Q4_0].jobs != 0) {
+        printf("FAIL (slots: q2_0=%llu mixed=%llu none=%llu q4_0=%llu)\n",
+               (unsigned long long) t.by_type[GGML_TYPE_Q2_0].jobs,
+               (unsigned long long) t.by_type[cpu_expert_pool_trace_totals::slot_mixed].jobs,
+               (unsigned long long) t.by_type[cpu_expert_pool_trace_totals::slot_none].jobs,
+               (unsigned long long) t.by_type[GGML_TYPE_Q4_0].jobs);
+        return false;
+    }
+
+    const std::string got = ggml_sycl::cpu_expert_pool_trace_format_types(t);
+    const std::string want =
+        " iq3_s:jobs=2,rows=12800,bytes=3000000,compute=1500us,gbps=2.00,thr=16.0/20,ovl=1"
+        " q2_0:jobs=1,rows=25600,bytes=6000000,compute=2000us,gbps=3.00,thr=22.0/22,ovl=0"
+        " mixed:jobs=1,rows=100,bytes=1000,compute=10us,gbps=0.10,thr=3.0/3,ovl=0"
+        " none:jobs=1,rows=0,bytes=0,compute=0us,gbps=0.00,thr=0.0/0,ovl=0";
+    if (got != want) {
+        printf("FAIL (summary)\n  got:  '%s'\n  want: '%s'\n", got.c_str(), want.c_str());
+        return false;
+    }
+    if (!ggml_sycl::cpu_expert_pool_trace_format_types(cpu_expert_pool_trace_totals()).empty()) {
+        printf("FAIL (summary of no jobs is not empty)\n");
+        return false;
+    }
+
+    printf("OK\n");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: both jobs of an overlapping pair are marked as overlapped
+// ---------------------------------------------------------------------------
+
+static bool test_pool_trace_overlap_both_ends() {
+    printf("test_pool_trace_overlap_both_ends ... ");
+    using ggml_sycl::cpu_expert_pool_overlap_begin;
+    using ggml_sycl::cpu_expert_pool_overlap_end;
+
+    ggml_sycl::cpu_expert_pool_overlap_clock clock;
+
+    // B starts and ends inside A.
+    const auto a     = cpu_expert_pool_overlap_begin(clock);
+    const auto b     = cpu_expert_pool_overlap_begin(clock);
+    const bool b_ovl = cpu_expert_pool_overlap_end(clock, b);
+    const bool a_ovl = cpu_expert_pool_overlap_end(clock, a);
+    // D starts inside C and ends after it.
+    const auto c     = cpu_expert_pool_overlap_begin(clock);
+    const auto d     = cpu_expert_pool_overlap_begin(clock);
+    const bool c_ovl = cpu_expert_pool_overlap_end(clock, c);
+    const bool d_ovl = cpu_expert_pool_overlap_end(clock, d);
+    // E runs alone.
+    const auto e     = cpu_expert_pool_overlap_begin(clock);
+    const bool e_ovl = cpu_expert_pool_overlap_end(clock, e);
+    if (!a_ovl || !b_ovl || !c_ovl || !d_ovl || e_ovl) {
+        printf("FAIL (a=%d b=%d c=%d d=%d e=%d, want 1 1 1 1 0)\n", a_ovl, b_ovl, c_ovl, d_ovl, e_ovl);
+        return false;
+    }
+    printf("OK\n");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+//
+// GGML_SYCL_MOE_IDS_COPY_TRACE is read once per process, at the first batched
+// call, so one process cannot test both the traced and the untraced path. The
+// default run covers the production path, untraced: tests 1-4. --trace-tests
+// runs only tests 5-7; its ctest registration (test-sycl-cpu-dispatch-trace)
+// sets the variable.
+// ---------------------------------------------------------------------------
+
+int main(int argc, char ** argv) {
+    const bool trace_tests = argc > 1 && strcmp(argv[1], "--trace-tests") == 0;
+    if (argc > 1 && !trace_tests) {
+        fprintf(stderr, "usage: %s [--trace-tests]\n", argv[0]);
+        return 2;
+    }
+    if (!trace_tests) {
+        unsetenv("GGML_SYCL_MOE_IDS_COPY_TRACE");
+    }
+
     // Initialize CPU backend (populates FP16->FP32 lookup table required by vec_dot)
     ggml_cpu_init();
 
-    printf("=== test-sycl-cpu-dispatch: T8 Mixed-Precision Cache Miss Loading ===\n\n");
+    printf("=== test-sycl-cpu-dispatch%s: T8 Mixed-Precision Cache Miss Loading ===\n\n",
+           trace_tests ? " --trace-tests" : "");
 
     int n_pass = 0;
     int n_fail = 0;
@@ -392,10 +580,22 @@ int main() {
         if (fn()) { n_pass++; } else { n_fail++; }
     };
 
-    run(test_int4_kernel_correctness);
-    run(test_adaptive_split);
-    run(test_non_q4_0_fallback);
-    run(test_config_functions);
+    if (trace_tests) {
+        run(test_trace_phase_type_key);
+        run(test_pool_trace_per_type);
+        run(test_pool_trace_overlap_both_ends);
+    } else {
+        run(test_int4_kernel_correctness);
+        run(test_adaptive_split);
+        run(test_non_q4_0_fallback);
+        run(test_config_functions);
+        // Tests 1-4 count only if they ran untraced, as production does.
+        if (ggml_sycl_cpu_expert_trace_enabled()) {
+            printf("FAIL (tracing was on: tests 1-4 did not cover the untraced path)\n");
+            n_fail++;
+        }
+        printf("(trace tests 5-7 run only with --trace-tests)\n");
+    }
 
     printf("\n%d passed, %d failed\n", n_pass, n_fail);
     return n_fail > 0 ? 1 : 0;
