@@ -42689,6 +42689,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
                   planner_swa_kv / (1024.0 * 1024.0), n_kv_layers, n_layers);
 
     ggml_sycl::placement_plan runtime_kv_plan;
+    bool                      runtime_plan_owned = false;  // kv_plan points at runtime_kv_plan
     if (kv_plan && kv_geometry.valid()) {
         runtime_kv_plan = *kv_plan;
         runtime_kv_plan.update_runtime_kv_sizes(kv_geometry.n_ctx, planner_full_kv, planner_swa_kv);
@@ -42724,23 +42725,49 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
             }
         }
 
-        // Counted by the allocation loop's owner rule, so GGML_SYCL_KV_HOST=1
-        // (every layer in host memory) plans no device bytes.
-        size_t planned_device_bytes = 0;
-        for (uint32_t l = 0; l < n_layers; ++l) {
-            const int owner = ggml_sycl::kv_buffer_layer_owner(true, runtime_kv_plan.get_kv_device(static_cast<int>(l)),
-                                                               false, device, kv_host_val == 1);
-            if (layer_in_this_kv_buffer(l) && owner == device) {
-                planned_device_bytes += runtime_kv_plan.kv_size_for_layer(l);
-            }
-        }
+        kv_plan            = &runtime_kv_plan;
+        runtime_plan_owned = true;
+    }
 
-        // The runtime-context transaction admitted this KV against this same
-        // headroom (unified_cache_kv_vram_available), so a device-planned
-        // layer that no longer fits is an accounting mismatch, not a
-        // placement choice. Refuse instead of demoting it to host memory
-        // under a device buffer, where attention would read it over PCIe
-        // (the zero-copy route).
+    // Which model layers this buffer holds, however that was decided above
+    // (llama's explicit mask, or the size-matched buffer kind), so the tier
+    // manager sizes each of them from the plan's per-layer truth and bounds
+    // their sum by this buffer alone (llama.cpp-7yv9).
+    std::vector<uint8_t> buffer_layer_mask(n_layers, 0);
+    for (uint32_t l = 0; l < n_layers; ++l) {
+        buffer_layer_mask[l] = layer_in_this_kv_buffer(l) ? 1 : 0;
+    }
+
+    // Configure a copy of the device's tier manager and commit it only once
+    // this buffer is accepted, so the refusal below has no side effects.
+    ggml_sycl::kv_tier_manager staged = mgr;
+    if (kv_plan) {
+        staged.configure_from_plan(device, *kv_plan, n_layers, kv_slice, &buffer_layer_mask);
+    } else {
+        staged.configure_with_weights(device, n_layers, kv_vram_cap, kv_slice);
+    }
+
+    // The runtime-context transaction admitted this KV against this same
+    // headroom (unified_cache_kv_vram_available), so a device-planned layer
+    // that no longer fits is an accounting mismatch, not a placement choice.
+    // Refuse instead of demoting it to host memory under a device buffer,
+    // where attention would read it over PCIe (the zero-copy route). Each
+    // layer counts at the size THIS buffer allocates for it, which the tier
+    // manager configured above knows: a memory that holds one layer in two
+    // buffers (the qwen4exp attention K/V and indexer keys) would otherwise
+    // charge the second buffer the first one's bytes (llama.cpp-8ecj). Owners
+    // follow the allocation loop's rule, so GGML_SYCL_KV_HOST=1 (every layer
+    // in host memory) plans no device bytes.
+    if (runtime_plan_owned) {
+        std::vector<int>    layer_owner(n_layers, -1);
+        std::vector<size_t> layer_bytes(n_layers, 0);
+        for (uint32_t l = 0; l < n_layers; ++l) {
+            layer_owner[l] = ggml_sycl::kv_buffer_layer_owner(true, runtime_kv_plan.get_kv_device(static_cast<int>(l)),
+                                                              false, device, kv_host_val == 1);
+            layer_bytes[l] = staged.kv_layer_size(l);
+        }
+        const size_t planned_device_bytes =
+            ggml_sycl::kv_buffer_device_bytes(layer_owner, buffer_layer_mask, layer_bytes, device);
         if (ggml_sycl::kv_admission_mismatch(planned_device_bytes, kv_vram_cap)) {
             GGML_LOG_ERROR(
                 "[KV-TIER] device %d: device-planned KV %.1f MB exceeds the %.1f MB free for KV, although the "
@@ -42750,24 +42777,6 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
                 device, planned_device_bytes / (1024.0 * 1024.0), kv_vram_cap / (1024.0 * 1024.0));
             return nullptr;
         }
-        kv_plan = &runtime_kv_plan;
-    }
-
-    // Configure a copy of the device's tier manager and commit it only once
-    // this buffer is accepted, so the refusal below has no side effects.
-    ggml_sycl::kv_tier_manager staged = mgr;
-    if (kv_plan) {
-        // Which model layers this buffer holds, however that was decided
-        // above (llama's explicit mask, or the size-matched buffer kind), so
-        // the tier manager sizes each of them from the plan's per-layer truth
-        // and bounds their sum by this buffer alone (llama.cpp-7yv9).
-        std::vector<uint8_t> buffer_layer_mask(n_layers, 0);
-        for (uint32_t l = 0; l < n_layers; ++l) {
-            buffer_layer_mask[l] = layer_in_this_kv_buffer(l) ? 1 : 0;
-        }
-        staged.configure_from_plan(device, *kv_plan, n_layers, kv_slice, &buffer_layer_mask);
-    } else {
-        staged.configure_with_weights(device, n_layers, kv_vram_cap, kv_slice);
     }
 
     // Compute per-layer layout from the tier manager.

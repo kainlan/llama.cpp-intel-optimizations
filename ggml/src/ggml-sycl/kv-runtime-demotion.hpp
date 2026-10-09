@@ -170,6 +170,24 @@ inline bool kv_admission_mismatch(size_t planned_device_bytes, size_t kv_vram_ca
     return planned_device_bytes > kv_vram_cap;
 }
 
+// What one KV buffer puts on `device`, the backstop's input: each layer the buffer holds (member[l] != 0) whose owner
+// (kv_buffer_layer_owner) is `device`, at the size this buffer allocates for it (layer_bytes[l]). A memory can hold one
+// layer in more than one buffer -- llama_memory_hybrid_idx keeps the attention K/V and the indexer keys apart -- so the
+// plan's per-layer KV is not one buffer's size: summing it charged Qwen3.8's 768 MiB indexer buffer the 6144 MiB of the
+// attention buffer and refused it (llama.cpp-8ecj).
+inline size_t kv_buffer_device_bytes(const std::vector<int> &     layer_owner,
+                                     const std::vector<uint8_t> & member,
+                                     const std::vector<size_t> &  layer_bytes,
+                                     int                          device) {
+    size_t total = 0;
+    for (size_t l = 0; l < layer_owner.size() && l < layer_bytes.size(); ++l) {
+        if (l < member.size() && member[l] != 0 && layer_owner[l] == device) {
+            total += layer_bytes[l];
+        }
+    }
+    return total;
+}
+
 // Where the tiered KV allocator puts one layer of a KV buffer created for
 // `device`: the device whose VRAM holds it, or -1 for host memory. With a plan
 // that is the plan's KV owner, so a layer another device owns is in that

@@ -1022,16 +1022,20 @@ def kv_headroom_wiring_violations(sycl_cpp: str, cache_cpp: str) -> list[str]:
             not re.search(r"\bkv_multi_device\s*=\s*lifecycle_owner\s*&&\s*lifecycle_owner->plan\s*&&\s*"
                           r"lifecycle_owner->plan->multi_device\s*;", alloc):
         found.append("the allocator's KV headroom is not asked for the plan's multi_device")
-    counted = alloc[alloc.find("size_t planned_device_bytes = 0;"):alloc.find("kv_admission_mismatch(")]
+    counted = alloc[alloc.find("std::vector<int>    layer_owner(n_layers, -1);"):alloc.find("kv_admission_mismatch(")]
     if not re.search(r"kv_buffer_layer_owner\([^;]*,\s*kv_host_val\s*==\s*1\s*\)\s*;", counted):
         found.append("planned_device_bytes does not count GGML_SYCL_KV_HOST=1 as host-owned")
     backstop = re.search(r"if\s*\(\s*ggml_sycl::kv_admission_mismatch\(\s*planned_device_bytes\s*,\s*kv_vram_cap\s*\)"
                          r"\s*\)\s*\{[^{}]*return\s+nullptr\s*;", alloc)
+    # The backstop runs after the tier manager is configured for this buffer (it counts each layer at the size this
+    # buffer allocates, llama.cpp-8ecj), under the flag the plan-owned block sets on every planned allocation.
     block = alloc.find(PLAN_OWNED_BLOCK)
+    owned = alloc.find("runtime_plan_owned = true;")
     staged = alloc.find("ggml_sycl::kv_tier_manager staged = mgr;")
+    guard = alloc.find("if (runtime_plan_owned) {")
     if backstop is None:
         found.append("the allocator's kv_admission_mismatch backstop is missing or does not refuse")
-    elif block < 0 or not block < backstop.start() < staged or \
+    elif block < 0 or not block < owned < staged < guard < backstop.start() or \
             re.search(r"\breturn\s+nullptr\b|\bgoto\b", alloc[block:backstop.start()]):
         found.append("the allocator's backstop is not reached on every planned allocation")
     if re.search(r"runtime_kv_plan\.kv_device\[[^\]]*\]\s*=\s*-1", alloc):
@@ -1303,15 +1307,15 @@ def test_mutation_backstop_removed_is_witnessed() -> None:
 def test_mutation_backstop_bypassed_is_witnessed() -> None:
     cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
     body = function(cpp, TIERED_KV_ALLOC_SIGNATURE)
-    at = body.index("        // Counted by the allocation loop's owner rule")
-    new_body = body[:at] + "        if (kv_vram_cap > 0) {\n            return nullptr;\n        }\n" + body[at:]
+    at = body.index("    // Which model layers this buffer holds")
+    new_body = body[:at] + "    if (kv_vram_cap > 0) {\n        return nullptr;\n    }\n" + body[at:]
     _assert_witnessed(cpp, cpp.replace(body, new_body, 1), _headroom_checker(cache),
                       "backstop is not reached on every planned allocation", "an early return ahead of the backstop")
 
 
 def test_mutation_allocator_resize_restored_is_witnessed() -> None:
     cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
-    mutated = cpp.replace("        kv_plan = &runtime_kv_plan;",
+    mutated = cpp.replace("        kv_plan            = &runtime_kv_plan;",
                           "        runtime_kv_plan.kv_device[0] = -1;\n        kv_plan = &runtime_kv_plan;", 1)
     _assert_witnessed(cpp, mutated, _headroom_checker(cache), "the allocator demotes device-planned KV itself",
                       "the allocator's own resize restored")
@@ -1396,7 +1400,7 @@ def test_mutation_headroom_multi_device_dropped_is_witnessed() -> None:
 
 def test_mutation_planned_bytes_ignore_kv_host_is_witnessed() -> None:
     cpp, cache = GGML_SYCL_CPP.read_text(), UNIFIED_CACHE_CPP.read_text()
-    old = "false, device, kv_host_val == 1);\n            if (layer_in_this_kv_buffer(l) && owner == device)"
+    old = "false, device, kv_host_val == 1);\n            layer_bytes[l] = staged.kv_layer_size(l);"
     mutated = cpp.replace(old, old.replace("kv_host_val == 1", "false", 1), 1)
     _assert_witnessed(cpp, mutated, _headroom_checker(cache),
                       "planned_device_bytes does not count GGML_SYCL_KV_HOST=1 as host-owned",

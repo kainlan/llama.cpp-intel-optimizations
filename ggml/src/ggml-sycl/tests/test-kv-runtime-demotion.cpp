@@ -47,6 +47,7 @@ using ggml_sycl::demand_scope;
 using ggml_sycl::held_slot;
 using ggml_sycl::kv_admission_mismatch;
 using ggml_sycl::kv_alloc_slack_per_layer;
+using ggml_sycl::kv_buffer_device_bytes;
 using ggml_sycl::kv_buffer_layer_owner;
 using ggml_sycl::kv_demotion_input;
 using ggml_sycl::kv_demotion_result;
@@ -3102,6 +3103,52 @@ static int case_qwen3next_kv_owner_shape() {
     return 0;
 }
 
+// Qwen3.8's llama_memory_hybrid_idx holds each of its 12 attention layers in two KV buffers: the attention K/V (512 MiB
+// a layer at 262144 cells) and the indexer keys (64 MiB). The backstop counts the buffer being allocated at its own
+// layer sizes: the indexer buffer is 768 MiB, which fits the headroom the attention buffer leaves. Charged the plan's
+// per-layer KV, as before llama.cpp-8ecj, it read as 6144 MiB and was refused ("device-planned KV 6144.0 MB exceeds
+// the 748.6 MB free for KV").
+static int case_qwen38_indexer_buffer_backstop() {
+    const size_t mb       = 1024 * 1024;
+    const int    n_layers = 48;
+    const int    device   = 0;
+    const size_t attn_kv  = 512 * mb;   // per attention layer: 262144 cells x (512 K + 512 V) x f16
+    const size_t index_kv = 64 * mb;    // per attention layer: 262144 cells x 128 x f16, K only
+    const size_t headroom = 1516 * mb;  // what is left on the device once the attention buffer has landed
+
+    std::vector<int>     owner(n_layers, -1);
+    std::vector<uint8_t> member(n_layers, 0);
+    std::vector<size_t>  attn_bytes(n_layers, 0);
+    std::vector<size_t>  index_bytes(n_layers, 0);
+    std::vector<size_t>  plan_bytes(n_layers, 0);
+    for (int il = 0; il < n_layers; ++il) {
+        if (il % 4 != 3) {
+            continue;  // recurrent: in neither buffer
+        }
+        owner[il]       = device;
+        member[il]      = 1;
+        attn_bytes[il]  = attn_kv;
+        index_bytes[il] = index_kv;
+        plan_bytes[il]  = attn_kv;
+    }
+
+    CHECK_EQ(kv_buffer_device_bytes(owner, member, attn_bytes, device), 6144 * mb, "qwen38: attention buffer");
+    const size_t index_device = kv_buffer_device_bytes(owner, member, index_bytes, device);
+    CHECK_EQ(index_device, 768 * mb, "qwen38: the indexer buffer is 768 MiB, not the attention buffer's 6144");
+    CHECK(!kv_admission_mismatch(index_device, headroom), "qwen38: the indexer buffer fits what is left");
+    CHECK(kv_admission_mismatch(kv_buffer_device_bytes(owner, member, plan_bytes, device), headroom),
+          "qwen38: charged the plan's per-layer KV it would be refused");
+
+    // a layer the buffer does not hold, or another device owns, costs this buffer nothing
+    std::vector<int> other = owner;
+    other[47]              = 1;
+    CHECK_EQ(kv_buffer_device_bytes(other, member, index_bytes, device), 704 * mb, "qwen38: device 1's layer");
+    std::vector<uint8_t> fewer = member;
+    fewer[3]                   = 0;
+    CHECK_EQ(kv_buffer_device_bytes(owner, fewer, index_bytes, device), 704 * mb, "qwen38: a non-member layer");
+    return 0;
+}
+
 // Runs a case unless KRT_ONLY names another one (a RED capture runs one case alone).
 static int run_case(const char * name, int (*fn)()) {
     const char * only = std::getenv("KRT_ONLY");
@@ -4093,6 +4140,9 @@ int main() {
         return rc;
     }
     if (int rc = run_case("qwen3next_kv_owner_shape", case_qwen3next_kv_owner_shape)) {
+        return rc;
+    }
+    if (int rc = run_case("qwen38_indexer_buffer_backstop", case_qwen38_indexer_buffer_backstop)) {
         return rc;
     }
     std::printf("test-kv-runtime-demotion: all ok\n");

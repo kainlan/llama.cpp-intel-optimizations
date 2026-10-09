@@ -4350,6 +4350,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-8ecj: a memory that holds one layer in two KV buffers (qwen4exp's llama_memory_hybrid_idx: attention K/V
+# and indexer keys) is budgeted and allocated buffer by buffer. The tiered allocator's backstop counts the buffer it is
+# allocating at its own layer sizes, not the plan's per-layer KV. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-kv-indexer-buffer-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kv-indexer-buffer-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-pyu4: executes the pure helpers in src/llama-auto-ubatch.h --
 # llama_auto_ubatch_ladder_has_candidate(), the predicate behind the trial's
 # early exit before its ladder loop, on the shapes where no rung lies in
