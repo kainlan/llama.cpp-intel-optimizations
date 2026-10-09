@@ -2494,7 +2494,8 @@ one of each kind per context is a WARN naming the requester tag and the bytes; t
 printed as `hold_spills_raw` / `hold_spills_kv_zone` / `hold_spills_kv_zone_full` (with bytes) in the `[SCRATCH-STATS]`
 line, whichever of the three is non-zero. The counters restart at every publish, so the figures a finished context
 prints are its own and not the auto-ubatch ladder's (the once-only WARN latches do not restart). Each flagged scheduler compute buffer also prints one line as it is
-allocated, `[SCRATCH-STATS] device=D compute_buffer=<buffer type name> size=<MB> zone=<kv|runtime|...|raw|host-pinned>`
+allocated, `[SCRATCH-STATS] device=D compute_buffer=<buffer type name> size=<MB> zone=<kv|runtime|...|raw|host-pinned>
+planned_compute_term=<MiB>`
 (`ggml_sycl_log_compute_buffer_landing`), so a throughput difference between two builds can be attributed to where
 a buffer physically sits. A buffer the arena placed is logged where it is placed; one nothing in the arena placed is
 placed by the legacy path in the allocator, which logs the buffer it makes, so the line names the FINAL landing (raw
@@ -2739,6 +2740,55 @@ is a table lookup, and a per-node cache would need per-graph storage on this pat
 Host tests: `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` Case 14 pins the arithmetic and Case 15 the held-back branch,
 the route after a decline and the merged inputs;
 `tests/test-sycl-mmq-src1-plan-source.py` pins the wiring, with a mutation witness per check.
+
+### A load-time consumer: the measured compute term (`llama.cpp-p6i0`)
+
+The scheduler's compute buffer is a named RUNTIME consumer. Before p6i0 nobody planned it. The weight pack filled the
+shared zone, and the buffer took whatever the allocator found. On the B70 with Qwen3.8 IQ3_XXS at `-ub 512` and no
+`-c`, its 1543.1 MB chunk landed raw and its 512 MB chunk fit no tier, so the context was refused.
+
+**How it is sized.** The load measures the compute buffer at three stages.
+
+- At the **probe** stage, after `create_tensor` and before the late plan packs the weights, the loader measures C-hat
+  over the weight stand-ins. It hands each SYCL device's per-chunk peaks to `ggml_backend_sycl_load_reserve_compute_term`.
+- The backend sizes the term with `zone_compute_term_bytes`. Each chunk is rounded by the RUNTIME TLSF's own
+  `round_request` at the alignment the buffer type requests (`GGML_SYCL_BUFFER_BASE_ALIGNMENT`), and the rounded
+  chunks are summed. That is the allocator's grain and nothing more: there is no headroom in the term.
+- `unified_cache_get_planned_runtime_zone_requirement` adds the term, with the overflow checked, so
+  `ensure_planned_arena_zones` sizes RUNTIME for the buffer before `compute_placement_plan` packs the weights.
+- At the **admitted** stage, right after the pack, the loader measures c(P) at the packed placement. c(P) above C-hat,
+  or a device with no probe bound, refuses the load as `compute-slot-exceeds-probe-bound`. Otherwise c(P) is recorded
+  in the load's ledger, and the **late** check compares the final placement against it.
+
+**How it is drawn and dropped.**
+
+- The compute buffer's first tier is already the RUNTIME zone, so the term is drawn by the path the buffer takes.
+- The ring re-plan counts the term as pending RUNTIME demand, beside the dense scratch, so the ring does not take the
+  buffer's room. A re-publish while the buffer is live counts it twice, which is conservative.
+- The term is device-global and merges like the dense terms: while another model is live, the larger term stays.
+- It is dropped where no model is live: at the outer load entry, at a load abort, and at a teardown with no other
+  model live and no load in flight.
+- The `[SCRATCH-STATS] ... compute_buffer=` landing line ends with `planned_compute_term=<MiB>`. That is the positive
+  control. A buffer that lands `zone=runtime` beside a nonzero term is the reservation at work. One that lands
+  `zone=raw` beside a nonzero term is a reservation that did not hold it.
+
+**What it costs, and where those bytes used to come from.** The compute buffer used to live raw, outside the arena,
+in the external headroom. zhcn D9 found that on the B50 with GPT-OSS, and the B70 logs for Qwen3.8 show the same.
+The external headroom is the driver's working memory, and it is kept whole and disjoint from this term. So the bytes
+the buffer used to borrow now come out of the weight zone, which can tier weights to host. `llama.cpp-gpdj` is the
+recovery path: it measures the driver's working set and sizes the headroom from it.
+
+**Limits.**
+
+- The term is measured at the load's measure shape, `n_ctx_train` and ubatch 512, because the caller's `-c` and `-ub`
+  do not reach the load (R2). A `-c` below `n_ctx_train`, llama-bench's small `n_ctx` and `-ub 256` all over-reserve.
+  A `-ub` above 512 under-reserves, and the excess takes the legacy chain as before. `llama.cpp-fkpg` (a) transports
+  the caller's shape.
+- A second model whose term is larger than the live one's raises the RUNTIME requirement. The late zone rebuild is
+  refused while the first model holds allocations, so that load reaches the abort in
+  `compute_and_store_plan_for_inventory`. `llama.cpp-ouur` refuses it by name instead.
+- This is a stepping stone. moua L6 retires the term into the `FIRST_CONTEXT` head slot in the shared zone, and then
+  only the body of `ggml_backend_sycl_load_reserve_compute_term` changes.
 
 ### Known limits (load-bearing — read before changing any of this)
 
