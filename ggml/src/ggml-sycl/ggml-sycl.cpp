@@ -19286,6 +19286,32 @@ static void ggml_sycl_mmq_src1_claim_plan(ggml_backend_sycl_context & ctx) {
         (cache ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : 0) / (1024.0 * 1024.0));
 }
 
+// llama.cpp-cre6: claim the planned host-expert MoE scatter scratch at its whole plan when the runtime-context
+// transaction publishes, as the Q8_1 src1 buffer is claimed above and through the same allocator (RUNTIME zone, spill
+// forbidden). The scatter never allocates it: a flush stages through what is claimed here, in chunks when it has more
+// rows than the plan, so no op grows it. A claim the zone cannot meet is reported, not fatal: the producers then bind
+// no scratch and the flush makes one copy per run of adjacent rows, which is slower and equally correct.
+static void ggml_sycl_moe_host_scatter_claim_plan(ggml_backend_sycl_context & ctx) {
+    const int    d       = ctx.device;
+    const size_t planned = ggml_sycl::unified_cache_get_planned_moe_host_scatter_scratch_bytes(d);
+    if (planned == 0 || ctx.moe_host_scatter_scratch.capacity(d) >= planned) {
+        return;
+    }
+    if (ctx.moe_host_scatter_scratch.ensure_buffer(planned, d, *ctx.stream(d, 0)) != nullptr) {
+        GGML_LOG_INFO(
+            "[SYCL-PLAN] MoE host scatter scratch claimed on device %d: %.1f KB (plan %.1f KB, RUNTIME zone)\n", d,
+            ctx.moe_host_scatter_scratch.capacity(d) / 1024.0, planned / 1024.0);
+        return;
+    }
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(d);
+    GGML_LOG_WARN(
+        "[MOE-SCATTER] device %d: the planned host-expert scatter scratch (%.1f KB) could not be claimed when the plan "
+        "was published (it holds %.1f KB, RUNTIME zone has %.1f MB free); host-expert results scatter with one copy "
+        "per run of adjacent rows (llama.cpp-cre6)\n",
+        d, planned / 1024.0, ctx.moe_host_scatter_scratch.capacity(d) / 1024.0,
+        (cache ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : 0) / (1024.0 * 1024.0));
+}
+
 // llama.cpp-kpjw: the runtime-context transaction re-plans the dense scratch at the runtime n_ubatch and drops the
 // hold while it materializes its own pools; this restores both on every exit that is not the success tail. A probe
 // changes nothing, so its guard is inert. The hold is the OWNER's: the guard zeroes it for this context and puts
@@ -20075,6 +20101,15 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // The dense scratch planned above lives in the RUNTIME zone too (counted twice when this context already
     // materialized it, like the pools below: conservative), so the ring leaves it that room.
     ring_kv_zone.runtime_pending_bytes += dense_scratch_runtime_bytes;
+    // The host-expert MoE scatter scratch (llama.cpp-cre6) is claimed after the ring as well; the part this context
+    // does not hold yet is what is still to be placed.
+    {
+        const size_t moe_host_scatter_planned =
+            ggml_sycl::unified_cache_get_planned_moe_host_scatter_scratch_bytes(ctx->device);
+        const size_t moe_host_scatter_held = ctx->moe_host_scatter_scratch.capacity(ctx->device);
+        ring_kv_zone.runtime_pending_bytes +=
+            moe_host_scatter_planned > moe_host_scatter_held ? moe_host_scatter_planned - moe_host_scatter_held : 0;
+    }
     // The current plan's pools, still allocated, are already missing from the
     // RUNTIME zone's free space, so they are counted twice here: conservative,
     // and only in a build where the route is reachable.
@@ -20238,6 +20273,8 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     dense_guard.commit();
     // The plan stands, so its Q8_1 src1 buffer is claimed now, before any graph; the hold below then sees it at plan.
     ggml_sycl_mmq_src1_claim_plan(*ctx);
+    // So is the host-expert MoE scatter scratch (llama.cpp-cre6); the ring re-plan above left it that room.
+    ggml_sycl_moe_host_scatter_claim_plan(*ctx);
     ggml_sycl_planned_scratch_hold_refresh(*ctx);
     // This plan's own reserve is what the realized-spill check (try_candidate, after sched_reserve()) must see, not a losing rung's.
     ggml_sycl::unified_cache_begin_planned_hold_epoch(ctx->device, ctx->planned_scratch_owner, next_kv_info.n_ubatch,
@@ -23535,6 +23572,13 @@ struct pending_cpu_scatter {
     uint64_t act_serial        = 0;
     bool     shares_activation = false;
 
+    // The planned device scratch the compact scatter stages through (llama.cpp-cre6), bound by the producer from its
+    // backend context (pending_cpu_scatter_bind_scratch). Empty when the context holds none, and the flush then makes
+    // the per-run copies. `scatter_stats` is that context's counter and lives as long as `stream` does.
+    ggml_sycl::mem_handle   scatter_scratch;
+    size_t                  scatter_scratch_bytes = 0;
+    planned_scratch_stats * scatter_stats         = nullptr;
+
     // Deferred scatter tracking: the MUL_MAT_ID output tensor that this
     // scatter writes to.  Used by selective flush to skip flushing when
     // the next op doesn't consume our destination tensor.
@@ -23585,6 +23629,14 @@ static thread_local pending_cpu_scatter g_pending_scatter_sibling = {};
 // Counts flushes that enqueued a scatter H2D. An activation copy records the
 // count it was made at; see moe_shared_act_reusable().
 static thread_local uint64_t g_cpu_scatter_serial = 0;
+
+// The producer's backend context lends the pending scatter its planned scratch (llama.cpp-cre6). The handle is a
+// reference, so the backing outlives the slot even if the context re-claims a larger one meanwhile.
+static void pending_cpu_scatter_bind_scratch(pending_cpu_scatter & slot, ggml_backend_sycl_context & ctx) {
+    slot.scatter_scratch       = ctx.moe_host_scatter_scratch.handle(ctx.device);
+    slot.scatter_scratch_bytes = ctx.moe_host_scatter_scratch.capacity(ctx.device);
+    slot.scatter_stats         = &ctx.moe_host_scatter_scratch.stats(ctx.device);
+}
 
 // ---------------------------------------------------------------------------
 // Submitting-thread wait census for the host-expert MoE decode path
@@ -25188,106 +25240,164 @@ static void flush_prev_scatter_bufs() {
     flush_prev_scatter_bufs(g_pending_scatter);
 }
 
-static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
-    if (!slot.active) {
-        return;
-    }
-
-    // Free buffers from the PREVIOUS async scatter (safe now — in-order
-    // queue has processed past those memcpys).
-    flush_prev_scatter_bufs(slot);
-    ++g_cpu_scatter_serial;
-
-    using hrc = std::chrono::high_resolution_clock;
-    auto t0   = hrc::now();
-
-    try {
-        // Wait for CPU compute to finish
-        if (slot.future.valid()) {
-            moe_hostpath_wait_timer wait_timer(MOE_WAIT_JOIN, slot.dst_tensor);
-            slot.future.get();
-        }
-
-        auto t1 = hrc::now();  // After CPU future.get()
-
-        // Scatter results H2D — submit memcpys to the in-order compute queue.
-        // Subsequent GPU kernels on this queue will wait for the copies to
-        // complete (same-device in-order guarantee).  We skip stream->wait()
-        // to let the host proceed to dispatch the next layer immediately.
-        double total_bytes = 0;
-        int    n_entries   = 0;
-        slot.scatter_events.clear();
-        // Both producers of an active pending scatter set a stream and an output buffer.  A pending
-        // scatter without them used to be skipped quietly, which loses its host-expert rows
-        // (llama.cpp-93tw).
-        GGML_ASSERT(slot.stream && slot.out_pinned &&
-                    "pending CPU scatter has no stream or output staging; its host-expert rows would be dropped "
-                    "(llama.cpp-93tw)");
-        {
-            // Batch contiguous scatter entries into single memcpy calls.
-            // Source (out_pinned) is always contiguous; check if destination
-            // addresses are also contiguous to merge.
-            const auto &  entries  = slot.entries;
-            const float * src_base = slot.out_pinned;
-            size_t        i        = 0;
-            while (i < entries.size()) {
-                // Every entry names its destination; skipping one would drop that row (llama.cpp-93tw).
-                GGML_ASSERT(entries[i].dst_device &&
-                            "pending CPU scatter entry has no destination; its row would be dropped (llama.cpp-93tw)");
-                if (!entries[i].dst_handle.valid() || !slot.out_handle.valid()) {
-                    GGML_ABORT("[CPU-TG] Deferred scatter missing smart mem_handle for dst=%p device=%d",
-                               entries[i].dst_device, slot.device_id);
-                }
-                // Start a new batch from entry i. Raw dst pointers are retained
-                // for contiguity checks only; the copy is submitted through
-                // mem_handle so ownership, cross-device staging, and event
-                // retention stay centralized.
-                char *                      batch_dst        = entries[i].dst_device;
-                const ggml_sycl::mem_handle batch_dst_handle = entries[i].dst_handle;
-                size_t                      batch_dst_offset = entries[i].dst_offset;
-                size_t                      batch_src_offset = entries[i].src_offset;
-                size_t                      batch_N          = static_cast<size_t>(entries[i].N);
-                src_base += entries[i].N;
-                size_t j = i + 1;
-                // Merge subsequent entries if dst is contiguous
-                while (j < entries.size() && entries[j].dst_device && entries[j].dst_handle == batch_dst_handle &&
-                       entries[j].dst_offset == batch_dst_offset + batch_N * sizeof(float) &&
-                       entries[j].src_offset == batch_src_offset + batch_N * sizeof(float) &&
-                       entries[j].dst_device == batch_dst + batch_N * sizeof(float)) {
-                    batch_N += static_cast<size_t>(entries[j].N);
-                    src_base += entries[j].N;
-                    j++;
-                }
-                slot.scatter_events.push_back(ggml_sycl::mem_copy_async(batch_dst_handle, batch_dst_offset,
-                                                                        slot.out_handle, batch_src_offset,
-                                                                        batch_N * sizeof(float), *slot.stream));
-                total_bytes += static_cast<double>(batch_N) * sizeof(float);
-                n_entries++;
-                i = j;
-            }
-
-            auto t2 = hrc::now();  // After memcpy submissions
-
-            // Record scatter timing (no event_wait since we skip stream->wait)
-            if (g_moe_profile_enabled) {
-                double cpu_wait_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-                double submit_us   = std::chrono::duration<double, std::micro>(t2 - t1).count();
-                g_moe_profile.moe_scatter_detail(cpu_wait_us, submit_us, 0, n_entries, total_bytes);
+// The rows of one scatter as moe-host-scatter.hpp sees them (llama.cpp-cre6): every entry of `slots`, in order, with
+// its staging and destination named by index into `srcs` / `dsts`, one index per allocation (stable identity, never
+// the resolved address). A shared pool is one source and gate and up are at most two destinations, so the compact plan
+// can merge the copy and keep the kernel to two destination buffers.
+static void moe_host_scatter_rows_collect(pending_cpu_scatter * const *             slots,
+                                          int                                       n_slots,
+                                          std::vector<ggml_sycl::mem_handle> &      srcs,
+                                          std::vector<ggml_sycl::mem_handle> &      dsts,
+                                          std::vector<ggml_sycl::moe_scatter_row> & rows) {
+    auto index_of = [](std::vector<ggml_sycl::mem_handle> & set, const ggml_sycl::mem_handle & h) {
+        for (size_t i = 0; i < set.size(); ++i) {
+            if (set[i].stable_identity_equal(h)) {
+                return static_cast<int>(i);
             }
         }
-    } catch (const std::exception & ex) {
-        // Logging and carrying on cleared the pending state below, so a throwing CPU worker or a
-        // failed scatter submission lost every host-expert row of this op (llama.cpp-93tw).
-        GGML_ABORT("[CPU-TG] Deferred scatter failed: %s; its host-expert rows would be dropped (llama.cpp-93tw)",
-                   ex.what());
+        set.push_back(h);
+        return static_cast<int>(set.size() - 1);
+    };
+    for (int k = 0; k < n_slots; ++k) {
+        const pending_cpu_scatter & s   = *slots[k];
+        const int                   src = index_of(srcs, s.out_handle);
+        for (const pending_cpu_scatter::scatter_entry & e : s.entries) {
+            ggml_sycl::moe_scatter_row row;
+            row.src        = src;
+            row.src_offset = e.src_offset;
+            row.dst        = index_of(dsts, e.dst_handle);
+            row.dst_offset = e.dst_offset;
+            row.bytes      = static_cast<size_t>(e.N) * sizeof(float);
+            rows.push_back(row);
+        }
+    }
+}
+
+// The kernel's row -> destination map, passed by value: one launch places at most MOE_SCATTER_MAX_ROWS rows.
+struct moe_host_scatter_rows {
+    float * row[ggml_sycl::MOE_SCATTER_MAX_ROWS];
+};
+
+// The compact scatter of `slots` (llama.cpp-cre6): one copy per run of contiguous sources into the planned scratch
+// the producer bound, then one kernel placing each scratch row at its destination, per chunk of the plan. The raw
+// pointers the kernel takes are views resolved here, at submission, from handles that are retained until the kernel
+// completes. Returns false having submitted nothing when the rows cannot take this form here; `why` names the reason
+// and the caller makes the per-run copies instead.
+static bool moe_host_scatter_submit_compact(pending_cpu_scatter * const * slots,
+                                            int                           n_slots,
+                                            std::vector<sycl::event> &    events,
+                                            size_t *                      n_copies,
+                                            const char **                 why) {
+    const pending_cpu_scatter & lead   = *slots[0];
+    sycl::queue &               queue  = *lead.stream;
+    const int                   device = lead.device_id;
+    if (!lead.scatter_scratch.valid() || lead.scatter_scratch_bytes == 0) {
+        *why = "no planned scratch was claimed for this context";
+        return false;
+    }
+    // The scratch is reused by the next chunk and the next flush: only an in-order queue orders their copies after
+    // this kernel.
+    if (!queue.has_property<sycl::property::queue::in_order>()) {
+        *why = "the queue is not in order";
+        return false;
+    }
+    // A recorded kernel would replay this flush's scratch contents into dst on every replay; the per-run copies
+    // keep whatever a recording does with them today.
+    if (ggml_sycl_graph_recording_active()) {
+        *why = "a SYCL graph is recording";
+        return false;
+    }
+    std::vector<ggml_sycl::mem_handle>      srcs;
+    std::vector<ggml_sycl::mem_handle>      dsts;
+    std::vector<ggml_sycl::moe_scatter_row> rows;
+    moe_host_scatter_rows_collect(slots, n_slots, srcs, dsts, rows);
+    ggml_sycl::moe_scatter_plan plan;
+    if (dsts.size() > static_cast<size_t>(ggml_sycl::MOE_SCATTER_MAX_DSTS) ||
+        !ggml_sycl::moe_scatter_plan_build(rows, lead.scatter_scratch_bytes, &plan)) {
+        *why = "the rows do not take the compact form";
+        return false;
     }
 
-    // Defer buffer cleanup: memcpys are submitted but may not have executed
-    // yet.  Move buffers to prev_bufs for cleanup at the next flush call
-    // (by then, the in-order queue guarantees completion).
+    // Resolve every endpoint the kernels write or read before anything is submitted.
+    size_t scratch_used = 0;
+    for (const ggml_sycl::moe_scatter_chunk & chunk : plan.chunks) {
+        scratch_used = std::max(scratch_used, chunk.n_rows * plan.row_bytes);
+    }
+    const ggml_sycl::resolved_ptr scratch = lead.scatter_scratch.resolve(device);
+    if (!scratch.ptr || !scratch.on_device || scratch.extent < scratch_used) {
+        *why = "the scratch does not resolve on the device";
+        return false;
+    }
+    char * dst_base[ggml_sycl::MOE_SCATTER_MAX_DSTS]   = {};
+    size_t dst_extent[ggml_sycl::MOE_SCATTER_MAX_DSTS] = {};
+    for (size_t d = 0; d < dsts.size(); ++d) {
+        const ggml_sycl::resolved_ptr r = dsts[d].resolve(device);
+        if (!r.ptr || !r.on_device || r.extent == 0) {
+            *why = "a destination does not resolve on the device";
+            return false;
+        }
+        dst_base[d]   = static_cast<char *>(r.ptr);
+        dst_extent[d] = r.extent;
+    }
+    for (const ggml_sycl::moe_scatter_row & row : rows) {
+        if (row.dst_offset > dst_extent[row.dst] || plan.row_bytes > dst_extent[row.dst] - row.dst_offset) {
+            *why = "a destination row lies outside its buffer";
+            return false;
+        }
+    }
+
+    std::vector<ggml_sycl::mem_handle> retained = dsts;
+    retained.push_back(lead.scatter_scratch);
+    const float *  scratch_rows = static_cast<const float *>(scratch.ptr);
+    const uint32_t row_elems    = static_cast<uint32_t>(plan.row_bytes / sizeof(float));
+    for (const ggml_sycl::moe_scatter_chunk & chunk : plan.chunks) {
+        std::vector<sycl::event> copied;
+        copied.reserve(chunk.n_copies);
+        for (size_t c = chunk.first_copy; c < chunk.first_copy + chunk.n_copies; ++c) {
+            const ggml_sycl::moe_scatter_copy & copy = plan.copies[c];
+            copied.push_back(ggml_sycl::mem_copy_async(lead.scatter_scratch, copy.scratch_offset, srcs[copy.src],
+                                                       copy.src_offset, copy.bytes, queue));
+        }
+        moe_host_scatter_rows placed_at{};
+        for (size_t r = 0; r < chunk.n_rows; ++r) {
+            const ggml_sycl::moe_scatter_row & row = rows[chunk.first_row + r];
+            placed_at.row[r]                       = reinterpret_cast<float *>(dst_base[row.dst] + row.dst_offset);
+        }
+        const uint32_t          n_elems = static_cast<uint32_t>(chunk.n_rows) * row_elems;
+        ggml_sycl_profile_label label{};
+        label.name         = "moe.host_scatter";
+        label.category     = "moe.host_scatter";
+        label.queue_kind   = "compute";
+        label.metadata     = "role=host_expert_result_scatter";
+        label.device       = device;
+        label.bytes        = chunk.n_rows * plan.row_bytes;
+        sycl::event placed = ggml_sycl_profile_submit(queue, label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
+                cgh.depends_on(copied);
+                cgh.parallel_for(sycl::range<1>(n_elems), [=](sycl::id<1> idx) {
+                    const uint32_t i                    = static_cast<uint32_t>(idx[0]);
+                    const uint32_t r                    = i / row_elems;
+                    placed_at.row[r][i - r * row_elems] = scratch_rows[i];
+                });
+            });
+        });
+        ggml_sycl::retain_handles_until_event(retained, placed);
+        events.insert(events.end(), copied.begin(), copied.end());
+        events.push_back(placed);
+    }
+    *n_copies = plan.copies.size();
+    if (lead.scatter_stats) {
+        lead.scatter_stats->note_use(scratch_used);
+    }
+    return true;
+}
+
+// The flush hands the slot's buffers to prev_bufs: the scatter's copies are submitted but may not have run yet, so
+// the buffers are released at the next flush, by when the in-order queue has passed them.
+static void pending_cpu_scatter_retire(pending_cpu_scatter & slot, const std::vector<sycl::event> & scatter_events) {
     {
         auto & pb         = slot.prev_bufs;
-        pb.scatter_events = std::move(slot.scatter_events);
+        pb.scatter_events = scatter_events;
         if (slot.owns_buffers) {
             pb.out           = slot.out_pinned;
             pb.act           = slot.act_pinned;
@@ -25323,15 +25433,142 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
     slot.scatter_events.clear();
     slot.stream = nullptr;
     slot.sycl_ctx.reset();
-    slot.active            = false;
-    slot.owns_buffers      = true;
-    slot.dst_tensor        = nullptr;
-    slot.pool_first        = 0;
-    slot.pool_count        = 0;
-    slot.row_k             = 0;
-    slot.row_n             = 0;
-    slot.act_serial        = 0;
-    slot.shares_activation = false;
+    slot.active                = false;
+    slot.owns_buffers          = true;
+    slot.dst_tensor            = nullptr;
+    slot.pool_first            = 0;
+    slot.pool_count            = 0;
+    slot.row_k                 = 0;
+    slot.row_n                 = 0;
+    slot.act_serial            = 0;
+    slot.shares_activation     = false;
+    slot.scatter_scratch       = {};
+    slot.scatter_scratch_bytes = 0;
+    slot.scatter_stats         = nullptr;
+}
+
+// May the sibling slot's flush take the primary along (llama.cpp-cre6)? flush_pending_cpu_scatter() flushes the
+// sibling and then the primary with nothing between, so flushing both from the sibling's call moves no work across
+// another. The two share one copy and one kernel only through one queue and one scratch.
+static bool pending_cpu_scatter_takes_partner(const pending_cpu_scatter & slot, const pending_cpu_scatter & next) {
+    return &slot == &g_pending_scatter_sibling && &next == &g_pending_scatter && next.active && next.stream &&
+           next.out_pinned && next.out_handle.valid() && next.stream == slot.stream &&
+           next.device_id == slot.device_id && slot.scatter_scratch.valid() &&
+           next.scatter_scratch.stable_identity_equal(slot.scatter_scratch);
+}
+
+// Waits for the slot's CPU experts; a worker's exception propagates to the caller's catch, which aborts.
+static void pending_cpu_scatter_join(pending_cpu_scatter & slot) {
+    if (slot.future.valid()) {
+        moe_hostpath_wait_timer wait_timer(MOE_WAIT_JOIN, slot.dst_tensor);
+        slot.future.get();
+    }
+}
+
+static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
+    if (!slot.active) {
+        return;
+    }
+
+    // A layer's decode gate (in the sibling slot) and up (in the primary) are flushed together when they can share
+    // the copy and the kernel (llama.cpp-cre6); the primary's own flush then finds nothing to do.
+    pending_cpu_scatter * const partner =
+        pending_cpu_scatter_takes_partner(slot, g_pending_scatter) ? &g_pending_scatter : nullptr;
+    pending_cpu_scatter * const group[2] = { &slot, partner };
+    const int                   n_group  = partner ? 2 : 1;
+
+    // Free buffers from the PREVIOUS async scatter (safe now — in-order
+    // queue has processed past those memcpys).
+    for (int k = 0; k < n_group; ++k) {
+        flush_prev_scatter_bufs(*group[k]);
+        ++g_cpu_scatter_serial;
+    }
+
+    using hrc = std::chrono::high_resolution_clock;
+    auto t0   = hrc::now();
+
+    std::vector<sycl::event> scatter_events;
+    try {
+        // Wait for CPU compute to finish
+        for (int k = 0; k < n_group; ++k) {
+            pending_cpu_scatter_join(*group[k]);
+        }
+
+        auto t1 = hrc::now();  // After CPU future.get()
+
+        // Scatter results H2D — submitted to the in-order compute queue.
+        // Subsequent GPU kernels on this queue will wait for them (same-device
+        // in-order guarantee).  We skip stream->wait() to let the host proceed
+        // to dispatch the next layer immediately.
+        double total_bytes = 0;
+        // Both producers of an active pending scatter set a stream and an output buffer.  A pending
+        // scatter without them used to be skipped quietly, which loses its host-expert rows
+        // (llama.cpp-93tw).
+        GGML_ASSERT(slot.stream && slot.out_pinned &&
+                    "pending CPU scatter has no stream or output staging; its host-expert rows would be dropped "
+                    "(llama.cpp-93tw)");
+        for (int k = 0; k < n_group; ++k) {
+            const auto & entries = group[k]->entries;
+            for (size_t i = 0; i < entries.size(); ++i) {
+                // Every entry names its destination; skipping one would drop that row (llama.cpp-93tw).
+                GGML_ASSERT(entries[i].dst_device &&
+                            "pending CPU scatter entry has no destination; its row would be dropped (llama.cpp-93tw)");
+                if (!entries[i].dst_handle.valid() || !group[k]->out_handle.valid()) {
+                    GGML_ABORT("[CPU-TG] Deferred scatter missing smart mem_handle for dst=%p device=%d",
+                               entries[i].dst_device, group[k]->device_id);
+                }
+                total_bytes += static_cast<double>(entries[i].N) * sizeof(float);
+            }
+        }
+
+        // One copy of the compact result block into the planned scratch and one kernel placing its rows; when the
+        // rows cannot take that form, one copy per run of rows whose destinations are adjacent, slot by slot, older
+        // first. Both go through mem_handle, so ownership and event retention stay centralized.
+        size_t       n_copies = 0;
+        const char * why      = nullptr;
+        if (!moe_host_scatter_submit_compact(group, n_group, scatter_events, &n_copies, &why)) {
+            static std::atomic<bool> warned{ false };
+            if (!warned.exchange(true, std::memory_order_relaxed)) {
+                GGML_LOG_WARN(
+                    "[MOE-SCATTER] host-expert results on device %d scatter with one copy per run of "
+                    "adjacent rows: %s (llama.cpp-cre6); reported once\n",
+                    slot.device_id, why ? why : "unknown");
+            }
+            for (int k = 0; k < n_group; ++k) {
+                pending_cpu_scatter &                   s = *group[k];
+                std::vector<ggml_sycl::mem_handle>      srcs;
+                std::vector<ggml_sycl::mem_handle>      dsts;
+                std::vector<ggml_sycl::moe_scatter_row> rows;
+                std::vector<ggml_sycl::moe_scatter_run> runs;
+                pending_cpu_scatter * const             one[1] = { &s };
+                moe_host_scatter_rows_collect(one, 1, srcs, dsts, rows);
+                ggml_sycl::moe_scatter_runs_build(rows, runs);
+                for (const ggml_sycl::moe_scatter_run & run : runs) {
+                    scatter_events.push_back(ggml_sycl::mem_copy_async(dsts[run.dst], run.dst_offset, srcs[run.src],
+                                                                       run.src_offset, run.bytes, *s.stream));
+                }
+                n_copies += runs.size();
+            }
+        }
+
+        auto t2 = hrc::now();  // After memcpy submissions
+
+        // Record scatter timing (no event_wait since we skip stream->wait)
+        if (g_moe_profile_enabled) {
+            double cpu_wait_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+            double submit_us   = std::chrono::duration<double, std::micro>(t2 - t1).count();
+            g_moe_profile.moe_scatter_detail(cpu_wait_us, submit_us, 0, static_cast<int>(n_copies), total_bytes);
+        }
+    } catch (const std::exception & ex) {
+        // Logging and carrying on cleared the pending state below, so a throwing CPU worker or a
+        // failed scatter submission lost every host-expert row of this op (llama.cpp-93tw).
+        GGML_ABORT("[CPU-TG] Deferred scatter failed: %s; its host-expert rows would be dropped (llama.cpp-93tw)",
+                   ex.what());
+    }
+
+    for (int k = 0; k < n_group; ++k) {
+        pending_cpu_scatter_retire(*group[k], scatter_events);
+    }
 }
 
 // Older slot first: gate's scatter is enqueued ahead of up's.
@@ -25366,6 +25603,9 @@ static void move_pending_cpu_scatter_to_sibling() {
     to.row_n             = from.row_n;
     to.act_serial        = from.act_serial;
     to.shares_activation = from.shares_activation;
+    to.scatter_scratch       = std::move(from.scatter_scratch);
+    to.scatter_scratch_bytes = from.scatter_scratch_bytes;
+    to.scatter_stats         = from.scatter_stats;
     to.active            = true;
 
     from.future = {};
@@ -25387,6 +25627,9 @@ static void move_pending_cpu_scatter_to_sibling() {
     from.row_n             = 0;
     from.act_serial        = 0;
     from.shares_activation = false;
+    from.scatter_scratch       = {};
+    from.scatter_scratch_bytes = 0;
+    from.scatter_stats         = nullptr;
 }
 
 // Selective flush: only flush if the pending scatter's destination tensor
@@ -47076,6 +47319,8 @@ void ggml_backend_sycl_context::log_planned_scratch_stats() {
              ggml_sycl::unified_cache_get_planned_dequant_f16_buffer_bytes(dev, false) },
             { "mul-mat-dequant-f16-src1", &dequant_f16_src1_scratch.stats(dev), dequant_f16_src1_scratch.capacity(dev),
              ggml_sycl::unified_cache_get_planned_dequant_f16_buffer_bytes(dev, true) },
+            { "moe-host-scatter", &moe_host_scatter_scratch.stats(dev), moe_host_scatter_scratch.capacity(dev),
+             ggml_sycl::unified_cache_get_planned_moe_host_scatter_scratch_bytes(dev) },
         };
         for (const cohort_t & c : cohorts) {
             if (c.stats->uses == 0) {
@@ -47145,6 +47390,7 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     mmvq_q8_activation_cache.release();
     dequant_f16_src0_scratch.release();
     dequant_f16_src1_scratch.release();
+    moe_host_scatter_scratch.release();
     // The buffers this context was owed are gone with it; nothing is left to hold the zone for. Only a hold this
     // context published: another live context's hold is not ours to clear.
     (void) ggml_sycl::unified_cache_release_planned_scratch_hold(device, planned_scratch_owner);
@@ -80085,6 +80331,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 g_pending_scatter.row_n             = r.row_n;
                 g_pending_scatter.act_serial        = r.act_serial;
                 g_pending_scatter.shares_activation = r.shares_activation;
+                pending_cpu_scatter_bind_scratch(g_pending_scatter, ctx);
             };
 
             // Synchronous dispatch + scatter setup: used by the sequential
@@ -81452,6 +81699,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 g_pending_scatter.owns_buffers  = true;
                 g_pending_scatter.active        = true;
                 g_pending_scatter.dst_tensor    = dst;
+                pending_cpu_scatter_bind_scratch(g_pending_scatter, ctx);
 
                 flush_pending_cpu_scatter();
             };

@@ -27,6 +27,7 @@
 #include "moe-decode-hostpath.hpp"
 #include "moe-graph-preload-stamp.hpp"
 #include "moe-graph-retention.hpp"
+#include "moe-host-scatter.hpp"
 #include "moe-layer-plan.hpp"
 #include "moe-route-table.hpp"
 #include "orchestrator.hpp"
@@ -5841,6 +5842,9 @@ struct ggml_sycl_mmvq_q8_retire_marker_kernel;
 // Kernel name for the marker that retires a grown dense f16 dequant backing.
 struct ggml_sycl_dequant_f16_retire_marker_kernel;
 
+// Kernel name for the marker that retires a grown host-expert MoE scatter scratch backing (llama.cpp-cre6).
+struct ggml_sycl_moe_host_scatter_retire_marker_kernel;
+
 // Counters for one planned RUNTIME-zone scratch slot (llama.cpp-479i). They exist so a normal run can PROVE the
 // planned buffer was used, at WARN level (INFO is invisible at default verbosity): a perplexity that is the same
 // with the arm on and off proves nothing about whether the arm ran.
@@ -7193,6 +7197,58 @@ struct ggml_backend_sycl_context {
             return ptr;
         }
     } dequant_f16_src0_scratch{ "mul-mat-dequant-f16-src0" }, dequant_f16_src1_scratch{ "mul-mat-dequant-f16-src1" };
+
+    // Per-context, per-device scratch the host-expert MoE result scatter stages through (llama.cpp-cre6): the CPU's
+    // compact result block is copied here in one H2D copy, and one kernel places each row at its slot of dst. Sized
+    // by unified_cache_get_planned_moe_host_scatter_scratch_bytes() and claimed whole when the runtime-context
+    // transaction publishes (ggml_sycl_moe_host_scatter_claim_plan); the scatter itself never allocates it, so a
+    // flush larger than the plan goes through in chunks rather than growing it. Same ownership story as the dense
+    // scratch above (see ggml_sycl_runtime_scratch_ensure): unified cache backing, mem_handle identity, RUNTIME
+    // zone, raw-malloc spill forbidden.
+    struct moe_host_scatter_scratch_t {
+        struct slot_t {
+            ggml_sycl::mem_handle backing_handle;
+            size_t                backing_capacity = 0;
+            planned_scratch_stats stats;
+        };
+
+        std::array<slot_t, GGML_SYCL_MAX_DEVICES> slots;
+
+        slot_t & slot(int device) {
+            GGML_ASSERT(device >= 0 && device < GGML_SYCL_MAX_DEVICES);
+            return slots[device];
+        }
+
+        const slot_t & slot(int device) const {
+            GGML_ASSERT(device >= 0 && device < GGML_SYCL_MAX_DEVICES);
+            return slots[device];
+        }
+
+        void release() {
+            for (slot_t & s : slots) {
+                s.backing_handle   = {};
+                s.backing_capacity = 0;
+            }
+        }
+
+        // Bytes the device's backing holds; zero before the claim.
+        size_t capacity(int device) const { return slot(device).backing_capacity; }
+
+        ggml_sycl::mem_handle handle(int device) const { return slot(device).backing_handle; }
+
+        planned_scratch_stats & stats(int device) { return slot(device).stats; }
+
+        void * ensure_buffer(size_t required_size, int device, sycl::queue & queue) {
+            slot_t & s    = slot(device);
+            bool     grew = false;
+            void *   ptr  = ggml_sycl_runtime_scratch_ensure<ggml_sycl_moe_host_scatter_retire_marker_kernel>(
+                s.backing_handle, s.backing_capacity, required_size, device, queue, "moe-host-scatter", &grew);
+            if (grew) {
+                s.stats.allocs++;
+            }
+            return ptr;
+        }
+    } moe_host_scatter_scratch;
 
     // One WARN-level line per planned scratch cohort and device that was used (uses, allocs, capacity against the
     // plan, peak demand). Emitted once, at teardown, so a normal run proves the planned buffers were exercised.

@@ -2376,6 +2376,14 @@ uint32_t unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(size_t   capac
 void unified_cache_set_planned_moe_control_requirement(int device_id, const moe_control_requirement & requirement);
 moe_control_requirement unified_cache_get_planned_moe_control_requirement(int device_id);
 
+// llama.cpp-cre6: the per-context device scratch the host-expert MoE result scatter copies its compact block into
+// before one kernel places the rows (moe_host_scatter_scratch_bytes: a decode gate/up pair's rows, capped at one
+// kernel launch). Published by populate_host_zone_sizing beside the CONTROL requirement, folded into
+// unified_cache_get_planned_runtime_zone_requirement(), and claimed whole when the runtime-context transaction
+// publishes. It does not follow n_ubatch: a larger flush goes through it in chunks.
+void   unified_cache_set_planned_moe_host_scatter_scratch_bytes(int device_id, size_t bytes);
+size_t unified_cache_get_planned_moe_host_scatter_scratch_bytes(int device_id);
+
 // pp_pipeline + pp_moe_onednn + MoE CONTROL for one device, with every addition
 // checked. Returns false without writing *out when the device's CONTROL
 // requirement could not be computed, which is what stops an unsizable plan from
