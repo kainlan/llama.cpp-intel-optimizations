@@ -848,9 +848,9 @@ struct placement_plan {
     // experts, for the KV the context the model opens with adds on top of the KV charged at planner_n_ctx. Counted in
     // vram_bytes until the runtime context transaction re-derives the KV totals for its real shape.
     size_t                                     kv_context_reserve_bytes        = 0;
-    // The stored bytes of the routed-expert triplets that room put on the host tier: the ones a first-fit pack with
-    // the room added back would have put on the device. A load fact, for the log and the planner tests; the runtime
-    // never promotes them back (fkpg).
+    // The device bytes of routed experts that room cost: the stored bytes a first-fit pack with the room added back
+    // puts on the device, minus those the real pack put there (net). A load fact, for the log and the planner tests;
+    // the runtime never promotes the experts back (fkpg).
     size_t                                     kv_context_room_displaced_bytes = 0;
     std::vector<bool>            swa_layer_mask;  // swa_layer_mask[l] == true → SWA layer
     // llama.cpp-3aos: mirrors placement_kv_info::layer_kind/layer_k_width/

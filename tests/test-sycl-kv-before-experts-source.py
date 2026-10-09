@@ -13,9 +13,11 @@ The fix this gate pins:
     are the routed experts packed into what is left;
   - the room is capped at what is left and counted in the plan's device bytes, and the runtime transaction's KV
     re-derivation drops it;
-  - the expert pack counts the triplets the room displaced (a second first-fit budget with the room added back), the
-    plan keeps that figure, and the room's line reports it in MiB after the pack, as a WARN when the room cost
-    experts, naming its limit: the room is for n_ctx_train;
+  - the expert pack runs a second first-fit budget with the room added back, and the room's cost is NET: the device
+    bytes of routed experts that budget places minus the ones the real pack places (a larger first-fit budget can
+    take a larger triplet and then skip smaller ones the real pack did place, so counting only the triplets that fit
+    it and not the real budget over-states the cost); the plan keeps that figure, and the room's line reports both
+    packs in MiB after the pack, as a WARN when the room cost experts, naming its limit: the room is for n_ctx_train;
   - the loader hands the backend that context (n_ctx_train, the probe measure's own n_ctx, since the caller's -c
     does not reach the load, fkpg).
 
@@ -117,7 +119,7 @@ INVENTORY_STRUCT = "struct ggml_sycl_tensor_inventory {"
 
 DENSE_LOOP = "for (const auto & [layer_id, indices] : dense_layer_indices) {"
 LAYER_KV_CALL = "plan_single_device_layer_kv(plan, kv_info, layer_has_attention, device_id, remaining);"
-ROOM_CALL = "const kv_context_room room = hold_kv_context_room(plan, kv_info, device_id, remaining);"
+ROOM_CALL = "kv_context_room room = hold_kv_context_room(plan, kv_info, device_id, remaining);"
 EXPERT_PASS = "auto moe_groups = build_moe_triplet_groups(plan, moe_indices, &hotness_source);"
 WEIGHTS_ONLY = "on_device = weight_charge <= remaining; target = on_device ? device_id : -1; kv_on_device = false;"
 
@@ -169,28 +171,39 @@ def claim_room_is_the_context_extra_capped_and_counted(cache: str) -> bool:
 
 
 ROOM_PACK = ("if (group.charge_bytes <= without_room) { without_room -= group.charge_bytes; "
-             "if (!on_device) { room_displaced_bytes += group.bytes; room_displaced_groups++; } }")
+             "room.expert_bytes_without += group.bytes; room.expert_groups_without++; }")
+ROOM_REAL = "room.expert_bytes = stats.device_bytes; room.expert_groups = stats.device_groups;"
+ROOM_NET = ("size_t displaced_bytes() const { return expert_bytes_without > expert_bytes ? "
+            "expert_bytes_without - expert_bytes : 0; }")
+ROOM_STRUCT = "struct kv_context_room {"
 
 
 def claim_room_displacement_is_counted_and_logged(cache: str) -> bool:
-    """The expert pack runs a second first-fit budget with the room added back; a triplet that fits it and went to the
-    host tier is one the room displaced. The plan keeps that figure and the room's line reports it after the pack."""
-    b = body(norm(cache), PLAN_SIG)
-    return bool(b) and ordered(
-        b, ROOM_CALL, "size_t without_room = remaining + room.held;",
-        "const bool on_device = group.charge_bytes <= remaining;", ROOM_PACK,
-        "log_moe_triplet_pack_stats(\"PLACEMENT-MOE\", stats, remaining);",
-        "plan.kv_context_room_displaced_bytes = room_displaced_bytes;",
-        "log_kv_context_room(room, kv_info, device_id, room_displaced_bytes, room_displaced_groups);")
+    """The expert pack runs a second first-fit budget with the room added back and records the device bytes each pack
+    placed; the room's cost is the difference (net, never the triplets that fit the second budget alone). The plan
+    keeps that figure and the room's line reports it after the pack."""
+    n = norm(cache)
+    b = body(n, PLAN_SIG)
+    at = n.find(ROOM_STRUCT)
+    room = body(n[at:], ROOM_STRUCT[:-2]) if at >= 0 else ""
+    return (bool(b) and ROOM_NET in room
+            and ordered(
+                b, ROOM_CALL, "size_t without_room = remaining + room.held;",
+                "const bool on_device = group.charge_bytes <= remaining;", ROOM_PACK, ROOM_REAL,
+                "log_moe_triplet_pack_stats(\"PLACEMENT-MOE\", stats, remaining);",
+                "plan.kv_context_room_displaced_bytes = room.displaced_bytes();",
+                "log_kv_context_room(room, kv_info, device_id);")
+            and b.count("room.expert_bytes_without +=") == 1 and b.count("room.expert_bytes =") == 1)
 
 
 def claim_room_line_is_visible_and_names_its_limit(cache: str) -> bool:
     """The line is in MiB, says the room is for n_ctx_train because the load does not see -c, and is a WARN whenever
     the room cost experts or could not hold all it wanted, so a default run shows it."""
     b = body(norm(cache), ROOM_LOG_SIG)
-    return (bool(b) and "const bool warn = displaced_bytes > 0 || room.held < room.wanted;" in b
+    return (bool(b) and "const bool warn = room.displaced_bytes() > 0 || room.held < room.wanted;" in b
             and ordered(b, "if (warn) { GGML_LOG_WARN(fmt,", "} else { GGML_LOG_INFO(fmt,")
-            and "held %.1f MiB of %.1f MiB" in b and "displaced %.1f MiB of routed experts" in b
+            and "held %.1f MiB of %.1f MiB" in b and "it cost %.1f MiB of device-resident routed experts" in b
+            and "with the room added back" in b
             and "The room is for n_ctx_train: the load does not see -c." in b)
 
 
@@ -319,22 +332,36 @@ def test_mutant_displacement_without_the_room_fails():
         _once(CACHE, "size_t without_room = remaining + room.held;", "size_t without_room = remaining;"))
 
 
-def test_mutant_displacement_counts_device_triplets_fails():
+def test_mutant_displacement_gross_fails():
+    """The gross count: the second budget counts only the triplets the real pack put on the host."""
     assert not claim_room_displacement_is_counted_and_logged(
-        _once(CACHE, "if (!on_device) { room_displaced_bytes += group.bytes;",
-              "if (on_device) { room_displaced_bytes += group.bytes;"))
+        _once(CACHE, "room.expert_bytes_without += group.bytes; room.expert_groups_without++;",
+              "if (!on_device) { room.expert_bytes_without += group.bytes; room.expert_groups_without++; }"))
+
+
+def test_mutant_displacement_not_net_fails():
+    """The figure is the second budget's device bytes alone, with the real pack's not subtracted."""
+    assert not claim_room_displacement_is_counted_and_logged(
+        _once(CACHE, "expert_bytes_without > expert_bytes ? expert_bytes_without - expert_bytes : 0;",
+              "expert_bytes_without;"))
+
+
+def test_mutant_displacement_misses_the_real_pack_fails():
+    assert not claim_room_displacement_is_counted_and_logged(
+        _once(CACHE, "room.expert_bytes = stats.device_bytes;", "room.expert_bytes = 0;"))
 
 
 def test_mutant_room_logged_before_the_pack_fails():
     n = norm(CACHE)
-    call = "log_kv_context_room(room, kv_info, device_id, room_displaced_bytes, room_displaced_groups);"
+    call = "log_kv_context_room(room, kv_info, device_id);"
     mutant = _once(n, call, "").replace(ROOM_CALL, ROOM_CALL + " " + call, 1)
     assert not claim_room_displacement_is_counted_and_logged(mutant)
 
 
 def test_mutant_room_line_only_info_fails():
     assert not claim_room_line_is_visible_and_names_its_limit(
-        _once(CACHE, "const bool warn = displaced_bytes > 0 || room.held < room.wanted;", "const bool warn = false;"))
+        _once(CACHE, "const bool warn = room.displaced_bytes() > 0 || room.held < room.wanted;",
+              "const bool warn = false;"))
 
 
 def test_mutant_extra_at_the_planning_context_fails():

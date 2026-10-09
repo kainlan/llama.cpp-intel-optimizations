@@ -640,6 +640,53 @@ static bool run_kv_context_room_before_experts_test() {
     return true;
 }
 
+// Layer 0's triplets are four times layer 1's. The room's cost is net: with the room added back, the first-fit pack
+// takes a second large triplet and then has no space for the small ones the real pack placed, so counting only the
+// triplets that fit the larger budget and not the real one (one large triplet) over-states what the room cost.
+static bool run_kv_context_room_cost_is_net_test() {
+    using namespace kv_order_case;
+    constexpr size_t small_bytes   = expert_bytes / 4;
+    constexpr size_t small_triplet = 3 * small_bytes;
+    constexpr size_t room_bytes    = 2 * 576 * (kv_width + kv_width) * 2;  // n_ctx 1088 over 512, two layers
+
+    std::vector<std::pair<std::string, size_t>> inv;
+    for (int l = 0; l < 2; ++l) {
+        const std::string blk  = "blk." + std::to_string(l) + ".";
+        const size_t      role = l == 0 ? expert_bytes : small_bytes;
+        inv.push_back({ blk + "attn_q.weight", dense_bytes });
+        inv.push_back({ blk + "ffn_gate_exps.weight", n_experts * role });
+        inv.push_back({ blk + "ffn_up_exps.weight", n_experts * role });
+        inv.push_back({ blk + "ffn_down_exps.weight", n_experts * role });
+    }
+    if (2 * kv_info(1088).kv_context_extra_bytes_for_layer(0) != room_bytes) {
+        printf("FAIL: the n_ctx 1088 room is %zu bytes, want %zu\n",
+               2 * kv_info(1088).kv_context_extra_bytes_for_layer(0), room_bytes);
+        return false;
+    }
+    // Left for the experts: one large triplet and two small ones. With the room added back: two large and one small.
+    const size_t left   = triplet_bytes + 2 * small_triplet;
+    const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + room_bytes + left;
+    const auto   plan   = ggml_sycl::compute_placement_plan(inv, budget, 0, kv_info(1088), nullptr, n_experts);
+    if (plan.kv_context_reserve_bytes != room_bytes) {
+        printf("FAIL: the planner must hold the whole %zu byte room, held %zu\n", room_bytes,
+               plan.kv_context_reserve_bytes);
+        return false;
+    }
+    if (device_triplets(plan) != 3) {
+        printf("FAIL: the real pack places one large and two small triplets: %zu device triplets, want 3\n",
+               device_triplets(plan));
+        return false;
+    }
+    // Net: (2 large + 1 small) - (1 large + 2 small) = the room's bytes. The gross count would be one large triplet.
+    if (plan.kv_context_room_displaced_bytes != triplet_bytes - small_triplet) {
+        printf("FAIL: the room cost %zu device bytes of routed experts net, logged %zu (gross would be %zu)\n",
+               triplet_bytes - small_triplet, plan.kv_context_room_displaced_bytes, triplet_bytes);
+        return false;
+    }
+    printf("PASS: the KV context room's cost is the net device bytes of routed experts\n");
+    return true;
+}
+
 // A budget that fits both dense weights and one layer's KV: the dense weights are placed first, so the second layer
 // keeps its weights on the device and only its KV goes to the host tier.
 static bool run_dense_weights_before_kv_test() {
@@ -2474,7 +2521,7 @@ int main() {
         if (!run_moe_triplet_planner_test()) {
             return 1;
         }
-        if (!run_kv_context_room_before_experts_test()) {
+        if (!run_kv_context_room_before_experts_test() || !run_kv_context_room_cost_is_net_test()) {
             return 1;
         }
         if (!run_dense_weights_before_kv_test()) {

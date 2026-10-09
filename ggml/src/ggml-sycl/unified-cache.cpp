@@ -30946,6 +30946,19 @@ struct kv_context_room {
     size_t wanted   = 0;  // the extra KV of every layer whose KV is on the device
     size_t held     = 0;  // min(wanted, what was left)
     size_t n_layers = 0;  // layers with extra KV
+
+    // The stored bytes and count of the routed-expert triplets the pack put on the device, and of the ones the same
+    // first-fit pack puts there with the room added back. The room's cost is the difference. Counting instead the
+    // triplets that fit the second budget and not the real one over-states it: the larger budget can take a larger
+    // triplet and then skip smaller ones the real pack did place.
+    size_t expert_bytes          = 0;
+    size_t expert_groups         = 0;
+    size_t expert_bytes_without  = 0;
+    size_t expert_groups_without = 0;
+
+    size_t displaced_bytes() const {
+        return expert_bytes_without > expert_bytes ? expert_bytes_without - expert_bytes : 0;
+    }
 };
 
 static kv_context_room hold_kv_context_room(placement_plan &          plan,
@@ -30971,30 +30984,29 @@ static kv_context_room hold_kv_context_room(placement_plan &          plan,
     return room;
 }
 
-// The room's line, after the experts are packed, so it can say what the room cost: the routed-expert triplets that
-// fit the budget with the room added back and went to the host tier without it. A WARN when it cost experts or could
-// not hold all it wanted, so a default run shows it.
-static void log_kv_context_room(const kv_context_room &   room,
-                                const placement_kv_info & kv_info,
-                                int                       device_id,
-                                size_t                    displaced_bytes,
-                                size_t                    displaced_groups) {
+// The room's line, after the experts are packed, so it can say what the room cost: the device bytes of routed
+// experts the pack placed against those the same pack places with the room added back. A WARN when it cost experts or
+// could not hold all it wanted, so a default run shows it.
+static void log_kv_context_room(const kv_context_room & room, const placement_kv_info & kv_info, int device_id) {
     if (room.wanted == 0) {
         return;
     }
     const double mib  = 1024.0 * 1024.0;
-    const bool   warn = displaced_bytes > 0 || room.held < room.wanted;
+    const bool   warn = room.displaced_bytes() > 0 || room.held < room.wanted;
     const char * fmt =
         "[PLACEMENT] KV context room on device %d: held %.1f MiB of %.1f MiB for n_ctx=%u over n_ctx=%u (%zu "
-        "layer(s)), before the routed experts; displaced %.1f MiB of routed experts (%zu triplet(s)) to the host "
-        "tier%s. The room is for n_ctx_train: the load does not see -c.\n";
-    const char * short_note = room.held < room.wanted ? "; all that was left, the context's overflow is re-placed" : "";
+        "layer(s)), before the routed experts%s; it cost %.1f MiB of device-resident routed experts: %.1f MiB (%zu "
+        "triplet(s)) on the device, against %.1f MiB (%zu) with the room added back. "
+        "The room is for n_ctx_train: the load does not see -c.\n";
+    const char * short_note = room.held < room.wanted ? ", all that was left; the context's overflow is re-placed" : "";
     if (warn) {
         GGML_LOG_WARN(fmt, device_id, room.held / mib, room.wanted / mib, kv_info.n_ctx_context, kv_info.n_ctx,
-                      room.n_layers, displaced_bytes / mib, displaced_groups, short_note);
+                      room.n_layers, short_note, room.displaced_bytes() / mib, room.expert_bytes / mib,
+                      room.expert_groups, room.expert_bytes_without / mib, room.expert_groups_without);
     } else {
         GGML_LOG_INFO(fmt, device_id, room.held / mib, room.wanted / mib, kv_info.n_ctx_context, kv_info.n_ctx,
-                      room.n_layers, displaced_bytes / mib, displaced_groups, short_note);
+                      room.n_layers, short_note, room.displaced_bytes() / mib, room.expert_bytes / mib,
+                      room.expert_groups, room.expert_bytes_without / mib, room.expert_groups_without);
     }
 }
 
@@ -31360,9 +31372,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     if (!planner_kv_pin_device_enabled()) {
         plan_single_device_layer_kv(plan, kv_info, layer_has_attention, device_id, remaining);
     }
-    const kv_context_room room                  = hold_kv_context_room(plan, kv_info, device_id, remaining);
-    size_t                room_displaced_bytes  = 0;
-    size_t                room_displaced_groups = 0;
+    kv_context_room room = hold_kv_context_room(plan, kv_info, device_id, remaining);
 
     // MoE expert entries: budget-aware placement at (layer, expert) triplet
     // granularity.  A layer executor consumes gate/up/down for the same routed
@@ -31406,8 +31416,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         moe_triplet_pack_stats stats;
         stats.groups  = moe_groups.size();
         stats.hotness = hotness_source != nullptr ? hotness_source : stats.hotness;
-        // The same first-fit pack with the KV context room added back: a triplet that fits it and not the real budget
-        // is one the room displaced to the host tier.
+        // The same first-fit pack with the KV context room added back, so the room's line can say what it cost.
         size_t without_room = remaining + room.held;
         for (const auto & group : moe_groups) {
             if (moe_triplet_complete(group)) {
@@ -31420,10 +31429,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             const int  target    = on_device ? device_id : -1;
             if (group.charge_bytes <= without_room) {
                 without_room -= group.charge_bytes;
-                if (!on_device) {
-                    room_displaced_bytes += group.bytes;
-                    room_displaced_groups++;
-                }
+                room.expert_bytes_without += group.bytes;
+                room.expert_groups_without++;
             }
             if (on_device) {
                 remaining -= group.charge_bytes;
@@ -31457,6 +31464,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 }
             }
         }
+        room.expert_bytes  = stats.device_bytes;
+        room.expert_groups = stats.device_groups;
         // Prompt cannot consume XMX_TILED gate/up by default. The planner
         // rewrites those primaries to SOA before packing so single-B50 GPT-OSS
         // does not budget duplicate full-model PP alternates and spill experts.
@@ -31475,8 +31484,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         log_moe_triplet_pack_stats("PLACEMENT-MOE", stats, remaining);
         reorder_plan_entries_for_moe_materialization(plan, moe_groups);
     }
-    plan.kv_context_room_displaced_bytes = room_displaced_bytes;
-    log_kv_context_room(room, kv_info, device_id, room_displaced_bytes, room_displaced_groups);
+    plan.kv_context_room_displaced_bytes = room.displaced_bytes();
+    log_kv_context_room(room, kv_info, device_id);
 
     // llama.cpp-21jd: dense WOQ extra copies for this single-device plan
     // (compute_multi_device_plan makes the same per-device call).
