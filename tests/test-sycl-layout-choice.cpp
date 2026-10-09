@@ -664,9 +664,25 @@ static bool run_kv_context_room_cost_is_net_test() {
         return false;
     }
     // Left for the experts: one large triplet and two small ones. With the room added back: two large and one small.
+    // That holds in (layer, expert) order. The expert popularity ranks are process-global and an earlier case in this
+    // binary ranks layer 1's experts 0 and 1 first, which changes what each pack takes (the real pack takes s0 s1 g0,
+    // the second s0 s1 g0 s2 s3: 384 KiB net). So the case ranks its own eight triplets in (layer, expert) order, and
+    // puts the earlier ranks back after the plan.
+    int prior_rank[2][n_experts];
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_experts; ++e) {
+            prior_rank[l][e] = ggml_sycl::get_expert_popularity_rank(l, e);
+            ggml_sycl::set_expert_popularity_rank(l, e, l * n_experts + e);
+        }
+    }
     const size_t left   = triplet_bytes + 2 * small_triplet;
     const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + room_bytes + left;
     const auto   plan   = ggml_sycl::compute_placement_plan(inv, budget, 0, kv_info(1088), nullptr, n_experts);
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_experts; ++e) {
+            ggml_sycl::set_expert_popularity_rank(l, e, prior_rank[l][e]);
+        }
+    }
     if (plan.kv_context_reserve_bytes != room_bytes) {
         printf("FAIL: the planner must hold the whole %zu byte room, held %zu\n", room_bytes,
                plan.kv_context_reserve_bytes);
