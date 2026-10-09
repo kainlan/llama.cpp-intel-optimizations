@@ -448,7 +448,8 @@ class load_compute_ledger {
     //                                               expected answer until L6 records anything, a load that
     //                                               records nothing asks every device once, and the line
     //                                               would repeat per call
-    //   late == admitted                            EQUAL, no line
+    //   late == admitted                            EQUAL, the equal WARN once per (load, device): a pass that
+    //                                               printed nothing could not be told from a check that never ran
     //   late  > admitted                            REFUSED, the late string, ERROR
     //   late  < admitted                            SHRINK_ADMITTED, the shrink WARN once per
     //                                               (load, device, term); the admitted term stands
@@ -507,6 +508,14 @@ class load_compute_ledger {
             return r;
         }
         r.result = GGML_SYCL_LATE_CHECK_EQUAL;
+        if (!e.equal_logged) {
+            e.equal_logged = true;
+            std::snprintf(line, sizeof(line),
+                          "[LOAD-PLAN] late check on device %d: %s term equal (%.1f MiB), early reservation stands",
+                          (int) device, TERM, (double) e.admitted / (1024.0 * 1024.0));
+            r.line  = line;
+            r.level = LOAD_LOG_LEVEL_WARN;
+        }
         return r;
     }
 
@@ -540,6 +549,7 @@ class load_compute_ledger {
     struct entry {
         uint64_t admitted      = 0;
         bool     shrink_logged = false;
+        bool     equal_logged  = false;
     };
 
     std::map<key, entry> terms_;

@@ -2759,6 +2759,9 @@ shared zone, and the buffer took whatever the allocator found. On the B70 with Q
 - At the **admitted** stage, right after the pack, the loader measures c(P) at the packed placement. c(P) above C-hat,
   or a device with no probe bound, refuses the load as `compute-slot-exceeds-probe-bound`. Otherwise c(P) is recorded
   in the load's ledger, and the **late** check compares the final placement against it.
+- A late check that matches prints one WARN per device and load:
+  `[LOAD-PLAN] late check on device N: compute term equal (X MiB), early reservation stands`. A pass that printed
+  nothing could not be told from a check that never ran.
 
 **How it is drawn and dropped.**
 

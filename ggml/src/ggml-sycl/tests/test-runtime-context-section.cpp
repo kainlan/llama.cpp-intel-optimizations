@@ -716,7 +716,8 @@ void case_ledger_rule() {
     load_compute_ledger l;
     CHECK(l.record(7, 0, 1000, 8192, true) && l.record(7, 1, 2000, 8192, true), "two devices recorded");
     const load_compute_ledger::check_result eq = l.check(7, 0, 1000, true);
-    CHECK(eq.result == GGML_SYCL_LATE_CHECK_EQUAL && eq.line.empty() && !eq.shrink_counted, "equal: EQUAL, no line");
+    CHECK(eq.result == GGML_SYCL_LATE_CHECK_EQUAL && eq.level == LOAD_LOG_LEVEL_WARN && !eq.shrink_counted,
+          "equal: EQUAL, the equal WARN");
 
     const load_compute_ledger::check_result big = l.check(7, 0, 1001, true);
     CHECK(big.result == GGML_SYCL_LATE_CHECK_REFUSED, "larger: REFUSED");
@@ -744,6 +745,27 @@ void case_ledger_rule() {
     CHECK(l.check(7, 1, 2000, true).result == GGML_SYCL_LATE_CHECK_EQUAL, "and still equals itself");
     // the other device's shrink is its own once-only
     CHECK(l.check(7, 0, 5, true).shrink_counted, "another device's first shrink counts");
+}
+
+// A pass that prints nothing cannot be told from a late check that never ran, so EQUAL says it once per
+// (load, device) at WARN, like the landing line.
+void case_ledger_equal_line() {
+    load_compute_ledger l;
+    const uint64_t      bytes = 3670016;  // 3.5 MiB
+    CHECK(l.record(7, 0, bytes, 8192, true) && l.record(7, 1, bytes, 8192, true), "two devices recorded");
+    const load_compute_ledger::check_result eq = l.check(7, 0, bytes, true);
+    CHECK(eq.result == GGML_SYCL_LATE_CHECK_EQUAL, "equal: EQUAL");
+    CHECK(eq.line == "[LOAD-PLAN] late check on device 0: compute term equal (3.5 MiB), early reservation stands",
+          "the canonical equal WARN");
+    CHECK(eq.level == LOAD_LOG_LEVEL_WARN, "at WARN, which a default-verbosity run shows");
+    CHECK(!eq.shrink_counted, "an equal term counts no shrink");
+    const load_compute_ledger::check_result again = l.check(7, 0, bytes, true);
+    CHECK(again.result == GGML_SYCL_LATE_CHECK_EQUAL && again.line.empty() && again.level == LOAD_LOG_LEVEL_NONE,
+          "a second equal on the same (load, device) is silent");
+    CHECK(!l.check(7, 1, bytes, true).line.empty(), "another device of the same load says it once itself");
+    CHECK(l.check(7, 0, bytes - 1, true).level == LOAD_LOG_LEVEL_WARN, "a shrink after an equal gives its own WARN");
+    l.clear(7);
+    CHECK(l.record(8, 0, bytes, 8192, true) && !l.check(8, 0, bytes, true).line.empty(), "a new load says it again");
 }
 
 void case_ledger_fails_closed() {
@@ -789,7 +811,8 @@ void case_ledger_log_levels() {
           "no early term recorded is the expected answer until L6: INFO, once");
     CHECK(l.check(7, 0, 1000, true).level == LOAD_LOG_LEVEL_NONE, "and silent the second time");
     CHECK(l.record(7, 0, 1000, 8192, true), "recorded");
-    CHECK(l.check(7, 0, 1000, true).level == LOAD_LOG_LEVEL_NONE, "equal: no line");
+    CHECK(l.check(7, 0, 1000, true).level == LOAD_LOG_LEVEL_WARN, "equal: WARN, so a default run shows the pass");
+    CHECK(l.check(7, 0, 1000, true).level == LOAD_LOG_LEVEL_NONE, "and silent the second time");
     CHECK(l.check(7, 0, 1001, true).level == LOAD_LOG_LEVEL_ERROR, "a refusal is ERROR");
     CHECK(l.check(7, 0, 999, true).level == LOAD_LOG_LEVEL_WARN, "the first shrink is WARN");
     CHECK(l.check(7, 0, 998, true).level == LOAD_LOG_LEVEL_NONE, "and the second is silent");
@@ -922,6 +945,7 @@ int main() {
     case_coverage_slots();
     case_ledger_records_only_with_an_n_ctx();
     case_ledger_rule();
+    case_ledger_equal_line();
     case_ledger_fails_closed();
     case_ledger_record_needs_an_open_txn();
     case_ledger_log_levels();
