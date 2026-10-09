@@ -428,6 +428,11 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     // unified cache once llama_context provides the real n_ctx.
     inventory.n_ubatch                = 512;
     inventory.n_ctx                   = inventory.n_ubatch;
+    // llama.cpp-8ecj: ...except the room for it. The planner holds the KV room of the context the model opens with
+    // (the probe measure's own n_ctx: n_ctx_train, since the caller's -c does not reach the load, fkpg) on the device
+    // ahead of the routed experts, so the experts fill only what the dense weights and that KV leave.
+    inventory.n_ctx_context =
+        llama_load_measure_n_ctx(llama_model_sycl_make_placement_envelope().n_ctx, hparams.n_ctx_train);
     if (hparams.n_expert > 0 && hparams.n_expert_used_max() > 0) {
         // llama.cpp-sr83 (C3): the batched executor repacks straight to a
         // {nibbles,e8m0-scales} WOQ shape by default and deletes the f16

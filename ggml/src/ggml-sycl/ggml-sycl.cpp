@@ -17232,12 +17232,15 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         g_placement_kv_info.layer_idx_k_width.clear();
     }
     g_placement_kv_info.n_ctx_is_runtime = false;
+    // llama.cpp-8ecj: the context the model opens with, whose KV room the planner holds ahead of the routed experts.
+    g_placement_kv_info.n_ctx_context    = inventory->n_ctx_context;
     if (g_placement_kv_info.valid()) {
         GGML_LOG_INFO(
-            "[SYCL-PLAN] KV inputs: n_layer=%u n_embd_k_gqa=%u n_embd_v_gqa=%u n_ctx=%u (%s) kv_per_layer=%.1f MB\n",
+            "[SYCL-PLAN] KV inputs: n_layer=%u n_embd_k_gqa=%u n_embd_v_gqa=%u n_ctx=%u (%s) kv_per_layer=%.1f MB "
+            "n_ctx_context=%u\n",
             g_placement_kv_info.n_layer, g_placement_kv_info.n_embd_k_gqa, g_placement_kv_info.n_embd_v_gqa,
             g_placement_kv_info.n_ctx, g_placement_kv_info.n_ctx_is_runtime ? "runtime" : "conservative",
-            g_placement_kv_info.kv_bytes_per_layer() / (1024.0 * 1024.0));
+            g_placement_kv_info.kv_bytes_per_layer() / (1024.0 * 1024.0), g_placement_kv_info.n_ctx_context);
     }
 
     g_moe_n_experts_total             = inventory->n_expert;

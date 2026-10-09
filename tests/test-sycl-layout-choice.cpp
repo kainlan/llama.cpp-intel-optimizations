@@ -512,6 +512,161 @@ static bool run_moe_triplet_planner_test() {
     return true;
 }
 
+// llama.cpp-8ecj: the single-device planner places in the order dense weights, then KV, then routed experts. The
+// synthetic model has two layers, each with one dense attention weight and four routed experts, and a KV of two FULL
+// layers planned at n_ctx 512 for a model that opens at n_ctx 4096.
+namespace kv_order_case {
+constexpr int    n_experts      = 4;
+constexpr size_t dense_bytes    = 64 * 1024;
+constexpr size_t expert_bytes   = 256 * 1024;                       // one role of one expert
+constexpr size_t triplet_bytes  = 3 * expert_bytes;
+constexpr size_t kv_width       = 128;                              // K and V elements per cell
+constexpr size_t kv_at_512      = 512 * (kv_width + kv_width) * 2;  // f16
+constexpr size_t kv_at_4096     = 4096 * (kv_width + kv_width) * 2;
+constexpr size_t kv_extra_layer = kv_at_4096 - kv_at_512;
+
+static std::vector<std::pair<std::string, size_t>> inventory() {
+    std::vector<std::pair<std::string, size_t>> inv;
+    for (int l = 0; l < 2; ++l) {
+        const std::string blk = "blk." + std::to_string(l) + ".";
+        inv.push_back({ blk + "attn_q.weight", dense_bytes });
+        inv.push_back({ blk + "ffn_gate_exps.weight", n_experts * expert_bytes });
+        inv.push_back({ blk + "ffn_up_exps.weight", n_experts * expert_bytes });
+        inv.push_back({ blk + "ffn_down_exps.weight", n_experts * expert_bytes });
+    }
+    return inv;
+}
+
+static ggml_sycl::placement_kv_info kv_info(uint32_t n_ctx_context) {
+    ggml_sycl::placement_kv_info kv{};
+    kv.n_layer       = 2;
+    kv.n_embd_k_gqa  = kv_width;
+    kv.n_embd_v_gqa  = kv_width;
+    kv.n_ctx         = 512;
+    kv.n_ubatch      = 512;
+    kv.n_ctx_context = n_ctx_context;
+    kv.layer_kind    = { GGML_SYCL_KV_LAYER_FULL, GGML_SYCL_KV_LAYER_FULL };
+    kv.layer_k_width = { kv_width, kv_width };
+    kv.layer_v_width = { kv_width, kv_width };
+    return kv;
+}
+
+static size_t device_triplets(const ggml_sycl::placement_plan & plan) {
+    size_t n = 0;
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_experts; ++e) {
+            const auto gate = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::GATE);
+            const auto up   = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::UP);
+            const auto down = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::DOWN);
+            n += gate.found() && up.found() && down.found() && gate.on_device && up.on_device && down.on_device;
+        }
+    }
+    return n;
+}
+}  // namespace kv_order_case
+
+// Dense weights, their KV, the room of the context the model opens with, then two triplets fill the budget exactly:
+// the experts take what is left after the context's KV room, not the room itself.
+static bool run_kv_context_room_before_experts_test() {
+    using namespace kv_order_case;
+    if (kv_info(4096).kv_context_extra_bytes_for_layer(0) != kv_extra_layer) {
+        printf("FAIL: the context's extra KV for a FULL layer is %zu bytes, want %zu\n",
+               kv_info(4096).kv_context_extra_bytes_for_layer(0), kv_extra_layer);
+        return false;
+    }
+    const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + 2 * kv_extra_layer + 2 * triplet_bytes;
+    const auto   plan   = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(4096), nullptr, n_experts);
+
+    const size_t placed = plan.weight_vram_bytes + plan.kv_vram_bytes;
+    const size_t left   = budget > placed ? budget - placed : 0;
+    if (plan.get_layer_device(0) != 0 || plan.get_layer_device(1) != 0 || plan.get_kv_device(0) != 0 ||
+        plan.get_kv_device(1) != 0) {
+        printf("FAIL: dense weights and their KV must be on the device first, got layer %d/%d kv %d/%d\n",
+               plan.get_layer_device(0), plan.get_layer_device(1), plan.get_kv_device(0), plan.get_kv_device(1));
+        return false;
+    }
+    if (plan.kv_context_reserve_bytes != 2 * kv_extra_layer || left < 2 * kv_extra_layer) {
+        printf(
+            "FAIL: the planner must hold %zu bytes for the n_ctx 4096 KV before the experts, held %zu and left "
+            "%zu\n",
+            2 * kv_extra_layer, plan.kv_context_reserve_bytes, left);
+        return false;
+    }
+    if (device_triplets(plan) != 2) {
+        printf("FAIL: the experts must fill only what the context's KV room leaves: %zu device triplets, want 2\n",
+               device_triplets(plan));
+        return false;
+    }
+    if (plan.kv_context_room_displaced_bytes != 4 * triplet_bytes) {
+        printf("FAIL: the room displaced 4 triplets (6 fit without it, 2 with it): logged %zu bytes, want %zu\n",
+               plan.kv_context_room_displaced_bytes, 4 * triplet_bytes);
+        return false;
+    }
+    if (plan.vram_bytes != placed + plan.kv_context_reserve_bytes) {
+        printf("FAIL: the held room must count in the plan's device bytes: vram=%zu weights+kv=%zu room=%zu\n",
+               plan.vram_bytes, placed, plan.kv_context_reserve_bytes);
+        return false;
+    }
+
+    // No context known: no room, and the same budget puts every expert that fits on the device.
+    const auto unknown = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(0), nullptr, n_experts);
+    if (unknown.kv_context_reserve_bytes != 0 || device_triplets(unknown) != 6 ||
+        unknown.kv_context_room_displaced_bytes != 0) {
+        printf("FAIL: with no context known the planner holds no room: held %zu, %zu device triplets, want 0 and 6\n",
+               unknown.kv_context_reserve_bytes, device_triplets(unknown));
+        return false;
+    }
+
+    // A context whose KV does not fit beside the dense weights: the room is what is left, and no expert is on the
+    // device; the context's overflow is the runtime transaction's to re-place.
+    const size_t tight    = 2 * dense_bytes + 2 * kv_at_512 + kv_extra_layer;
+    const auto short_plan = ggml_sycl::compute_placement_plan(inventory(), tight, 0, kv_info(4096), nullptr, n_experts);
+    if (short_plan.kv_context_reserve_bytes != kv_extra_layer || device_triplets(short_plan) != 0 ||
+        short_plan.get_kv_device(1) != 0) {
+        printf(
+            "FAIL: a room larger than what is left holds all of it and keeps both layers' KV on the device: held "
+            "%zu, %zu device triplets, kv layer 1 on %d\n",
+            short_plan.kv_context_reserve_bytes, device_triplets(short_plan), short_plan.get_kv_device(1));
+        return false;
+    }
+    // Without the room, the extra KV of one layer (1.75 MiB) would hold two triplets.
+    if (short_plan.kv_context_room_displaced_bytes != 2 * triplet_bytes) {
+        printf("FAIL: the tight room displaced 2 triplets: logged %zu bytes, want %zu\n",
+               short_plan.kv_context_room_displaced_bytes, 2 * triplet_bytes);
+        return false;
+    }
+
+    printf("PASS: the planner holds the opening context's KV room before the routed experts\n");
+    return true;
+}
+
+// A budget that fits both dense weights and one layer's KV: the dense weights are placed first, so the second layer
+// keeps its weights on the device and only its KV goes to the host tier.
+static bool run_dense_weights_before_kv_test() {
+    using namespace kv_order_case;
+    const std::vector<std::pair<std::string, size_t>> dense_only = {
+        { "blk.0.attn_q.weight", dense_bytes },
+        { "blk.1.attn_q.weight", dense_bytes },
+    };
+    const size_t budget = 2 * dense_bytes + kv_at_512;
+    const auto   plan   = ggml_sycl::compute_placement_plan(dense_only, budget, 0, kv_info(0), nullptr, 0);
+    if (plan.get_layer_device(0) != 0 || plan.get_layer_device(1) != 0) {
+        printf("FAIL: KV must never push a dense layer to the host: layer devices %d/%d\n", plan.get_layer_device(0),
+               plan.get_layer_device(1));
+        return false;
+    }
+    if (plan.get_kv_device(0) != 0 || plan.get_kv_device(1) != -1 || plan.kv_vram_bytes != kv_at_512 ||
+        plan.kv_host_bytes != kv_at_512) {
+        printf(
+            "FAIL: the KV that does not fit beside the dense weights goes to the host tier: kv %d/%d vram=%zu "
+            "host=%zu\n",
+            plan.get_kv_device(0), plan.get_kv_device(1), plan.kv_vram_bytes, plan.kv_host_bytes);
+        return false;
+    }
+    printf("PASS: dense weights are placed before KV\n");
+    return true;
+}
+
 static bool run_multi_device_layer_block_plan_test() {
     constexpr size_t mib = 1024u * 1024u;
 
@@ -2317,6 +2472,12 @@ int main() {
             return 1;
         }
         if (!run_moe_triplet_planner_test()) {
+            return 1;
+        }
+        if (!run_kv_context_room_before_experts_test()) {
+            return 1;
+        }
+        if (!run_dense_weights_before_kv_test()) {
             return 1;
         }
         if (!run_multi_device_layer_block_plan_test()) {

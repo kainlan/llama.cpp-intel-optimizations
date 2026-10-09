@@ -630,6 +630,10 @@ struct placement_kv_info {
     // this is threaded to next.
     uint32_t          n_head_all_max   = 0;
     bool              n_ctx_is_runtime = false;
+    // llama.cpp-8ecj: the context the model opens with when the caller names none (n_ctx_train), from
+    // ggml_sycl_tensor_inventory::n_ctx_context. n_ctx above stays the load's own planning shape; this one only sizes
+    // the KV room the planner holds ahead of the routed experts. 0 = unknown: no room is held.
+    uint32_t              n_ctx_context    = 0;
     // MoE hyperparameters (0 for dense models)
     int               n_expert_used    = 0;  // Top-k experts selected per token
     // SWA (Sliding Window Attention) — 0 means all layers use full attention
@@ -715,16 +719,35 @@ struct placement_kv_info {
     // aggregate split when layer_kind/layer_k_width/layer_v_width are not
     // populated (an inventory built before this ticket, or a homogeneous
     // model that never needed per-layer truth).
-    size_t kv_bytes_for_layer(uint32_t il) const {
-        if (!valid()) {
+    size_t kv_bytes_for_layer(uint32_t il) const { return kv_bytes_for_layer_at(il, n_ctx); }
+
+    // Layer `il`'s KV at a context of `ctx` tokens, every other input of the shape as this struct carries it. The
+    // planner sizes the KV room of the context the model opens with from it (llama.cpp-8ecj), so that room and the
+    // per-layer charge above come from the same rule.
+    size_t kv_bytes_for_layer_at(uint32_t il, uint32_t ctx) const {
+        if (!valid() || ctx == 0) {
             return 0;
         }
         if (has_per_layer_kv_truth(il)) {
-            return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,
+            return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], ctx, n_swa, n_ubatch,
                                            n_seq_max, kv_unified, swa_full) +
-                   kv_idx_bytes_for_layer_at(il, n_ctx);
+                   kv_idx_bytes_for_layer_at(il, ctx);
         }
-        return is_swa_layer(static_cast<int>(il)) ? kv_bytes_per_swa_layer() : kv_bytes_per_layer();
+        if (is_swa_layer(static_cast<int>(il))) {
+            return n_swa == 0 ? 0 :
+                                kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_SWA, n_embd_k_gqa, n_embd_v_gqa, ctx, n_swa,
+                                                        n_ubatch, n_seq_max, kv_unified, swa_full);
+        }
+        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_FULL, n_embd_k_gqa, n_embd_v_gqa, ctx, n_swa, n_ubatch,
+                                       n_seq_max, kv_unified, swa_full);
+    }
+
+    // What the context the model opens with needs on top of the KV charged at n_ctx for layer `il`: 0 when that
+    // context is unknown or no larger.
+    size_t kv_context_extra_bytes_for_layer(uint32_t il) const {
+        const size_t at_context = kv_bytes_for_layer_at(il, n_ctx_context);
+        const size_t charged    = kv_bytes_for_layer(il);
+        return at_context > charged ? at_context - charged : 0;
     }
 
     // The indexer keys of layer `il` at `ctx` tokens: the same cells as the layer's K/V, K only. Part of
@@ -821,6 +844,14 @@ struct placement_plan {
     bool                         multi_device;       // True if plan spans multiple GPUs
     size_t                       kv_per_layer     = 0;
     size_t                       kv_per_swa_layer = 0;
+    // llama.cpp-8ecj: device room the load plan held, after the dense weights and their KV and before the routed
+    // experts, for the KV the context the model opens with adds on top of the KV charged at planner_n_ctx. Counted in
+    // vram_bytes until the runtime context transaction re-derives the KV totals for its real shape.
+    size_t                                     kv_context_reserve_bytes        = 0;
+    // The stored bytes of the routed-expert triplets that room put on the host tier: the ones a first-fit pack with
+    // the room added back would have put on the device. A load fact, for the log and the planner tests; the runtime
+    // never promotes them back (fkpg).
+    size_t                                     kv_context_room_displaced_bytes = 0;
     std::vector<bool>            swa_layer_mask;  // swa_layer_mask[l] == true → SWA layer
     // llama.cpp-3aos: mirrors placement_kv_info::layer_kind/layer_k_width/
     // layer_v_width -- see that struct's field comments. Copied in at plan
@@ -1161,8 +1192,10 @@ struct placement_plan {
             }
         }
 
-        vram_bytes = weight_vram_bytes + kv_vram_bytes;
-        host_bytes = weight_host_bytes + kv_host_bytes;
+        // The KV of this shape replaces the room the load plan held for the context it expected.
+        kv_context_reserve_bytes = 0;
+        vram_bytes               = weight_vram_bytes + kv_vram_bytes;
+        host_bytes               = weight_host_bytes + kv_host_bytes;
         if (kv_host_bytes > host_zone_kv_bytes) {
             host_zone_kv_bytes = kv_host_bytes;
         }
