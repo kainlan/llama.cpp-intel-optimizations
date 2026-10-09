@@ -29,8 +29,8 @@ calls them, and calls them the way the tests assume.
   R. Retired GGML_SYCL_PIPELINE_CPU.  ggml_check_sycl calls ggml_sycl_pipeline_cpu_warn_retired at
      init, in the settings-report block itself and not under its `if (!overrides.empty())`, so a run
      that sets only the retired variable still hears about it.  The helper latches through a
-     `static const bool`, so the init call and the dispatch-site call log one WARN between them.  The WARN
-     and the env-var row cite llama.cpp-ytc9 and defer the direction under llama.cpp-3oju9.
+     `static const bool`, so a second backend init in the same process does not repeat the WARN.  The
+     WARN and the env-var row cite llama.cpp-ytc9 and defer the direction under llama.cpp-3oju9.
 
 WHAT THIS DOES NOT PROVE.  It reads source text with comments blanked.  It does not show which
 executor a GLU ran on (that needs a GPU run) and cannot see a conditional hidden behind a macro.
@@ -132,22 +132,28 @@ def squash(s: str) -> str:
 
 
 def check_glu(src: Source) -> None:
-    _, body = src.body(r"static bool ggml_sycl_op_is_planned_on_host\(const ggml_tensor \* op, int device\)")
+    body_at, body = src.body(r"static bool ggml_sycl_op_is_planned_on_host\(const ggml_tensor \* op, int device\)")
     if "ggml_sycl_tensor_depends_on_planned_host_weight" in body:
         raise ContractError("G: ggml_sycl_op_is_planned_on_host calls ggml_sycl_tensor_depends_on_planned_host_weight")
     m = re.search(r"if\s*\(\s*op->op\s*==\s*GGML_OP_GLU\b", body)
     if not m:
         raise ContractError("G: no `if (op->op == GGML_OP_GLU` branch in ggml_sycl_op_is_planned_on_host")
     open_at = body.index("(", m.start())
-    cond = squash(body[open_at : _paren_end(body, open_at) + 1])
+    cond_end = _paren_end(body, open_at)
+    cond = squash(body[open_at : cond_end + 1])
     want = "ggml_sycl::moe_glu_input_host_produced(op, ggml_sycl_glu_weight_executes_on_host, &device)"
     if want not in cond:
         raise ContractError(f"G: the GLU branch condition does not call {want}: {cond}")
     if cond != f"(op->op == GGML_OP_GLU && {want})":
         raise ContractError(f"G: the GLU branch condition carries more than GLU and the walk: {cond}")
-    # The branch's true outcome keeps the GLU on the host (unless multi-GPU MoE).
-    after = body[m.start() : m.start() + 600]
-    if not re.search(r"return\s+n04bq_tr_final\(\s*true\s*,", after):
+    # The branch's true outcome keeps the GLU on the host (unless multi-GPU MoE), read from the branch's
+    # own braced block, however long its comments are.
+    brace = re.match(r"\s*\{", body[cond_end + 1 :])
+    if not brace:
+        raise ContractError("G: the GLU branch has no braced body")
+    block_open = body_at + cond_end + 1 + brace.end() - 1
+    branch = src.code[block_open : src.match_close(block_open, "{", "}") + 1]
+    if not re.search(r"return\s+n04bq_tr_final\(\s*true\s*,", branch):
         raise ContractError("G: the GLU branch no longer returns n04bq_tr_final(true, ...)")
 
     _, cb = src.body(r"static bool ggml_sycl_glu_weight_executes_on_host\(const ggml_tensor \* weight, void \* ctx\)")
@@ -312,7 +318,13 @@ MUTANTS = [
         "return ggml_sycl_weight_executes_on_host(weight, 0);",
     ),
     (
-        "C1 (M4b) B1 readback recorded as B6",
+        "G5 the GLU branch's true outcome turned false",
+        BACKEND,
+        'return n04bq_tr_final(true, "glu_input_host_produced");',
+        'return n04bq_tr_final(false, "glu_input_host_produced");',
+    ),
+    (
+        "C1 B1 readback recorded as B6",
         BACKEND,
         "moe_hostpath_wait_timer wait_timer(MOE_WAIT_B1);",
         "moe_hostpath_wait_timer wait_timer(MOE_WAIT_B6);",
@@ -368,7 +380,7 @@ MUTANTS = [
         "",
     ),
     (
-        "P1 (M2) sibling slot dropped from pending_any",
+        "P1 sibling slot dropped from pending_any",
         BACKEND,
         "g_pending_scatter_sibling.active || g_pending_scatter_sibling.prev_bufs.pending ||",
         "false || false ||",
@@ -387,24 +399,24 @@ MUTANTS = [
         "        if (slot.submitted.load(std::memory_order_acquire) && false) {\n            return true;",
     ),
     (
-        "R1 (M3) init-time retired WARN call removed",
+        "R1 init-time retired WARN call removed",
         BACKEND,
         "            ggml_sycl_pipeline_cpu_warn_retired();\n        }\n",
         "        }\n",
     ),
     (
-        "R4 (A) retired WARN no longer latched: init and dispatch would each log",
+        "R4 retired WARN no longer latched: a second backend init would repeat it",
         BACKEND,
         "    static const bool set = [] {\n        const bool present = getenv(\"GGML_SYCL_PIPELINE_CPU\")",
         "    const bool set = [] {\n        const bool present = getenv(\"GGML_SYCL_PIPELINE_CPU\")",
     ),
     (
-        "R5 (H) init call only when another setting is non-default",
+        "R5 init call only when another setting is non-default",
         BACKEND,
         "                GGML_LOG_WARN(\"[SYCL] non-default settings in effect: %s\\n\", overrides.c_str());\n"
         "            }\n"
-        "            // A retired variable is not in sycl_env_settings; say it is ignored here, once,\n"
-        "            // rather than only when a host-expert decode first reaches the CPU dispatch.\n"
+        "            // A retired variable is not in sycl_env_settings, so it gets its own line here,\n"
+        "            // whether or not any other setting is non-default.\n"
         "            ggml_sycl_pipeline_cpu_warn_retired();\n",
         "                GGML_LOG_WARN(\"[SYCL] non-default settings in effect: %s\\n\", overrides.c_str());\n"
         "                ggml_sycl_pipeline_cpu_warn_retired();\n"
@@ -424,10 +436,38 @@ MUTANTS = [
     ),
 ]
 
+# (name, file, old, new): harmless edits each must leave run() passing.
+PROBES = [
+    (
+        "a 400-character comment inside the GLU branch, before the multi-GPU check",
+        BACKEND,
+        "        if (ggml_sycl_moe_multi_gpu_for_executor()) {\n"
+        '            return n04bq_tr_final(false, "multi_gpu_moe_glu");',
+        "".join("        // " + "x" * 77 + "\n" for _ in range(5))
+        + "        if (ggml_sycl_moe_multi_gpu_for_executor()) {\n"
+        '            return n04bq_tr_final(false, "multi_gpu_moe_glu");',
+    ),
+]
+
 
 def self_test() -> int:
     base = load()
     failures = 0
+    for name, path, old, new in PROBES:
+        n = base[path].count(old)
+        if n != 1:
+            print(f"SELF-TEST BROKEN: probe {name!r} anchor found {n} times in {path}")
+            failures += 1
+            continue
+        files = dict(base)
+        files[path] = base[path].replace(old, new)
+        try:
+            run(files)
+        except ContractError as e:
+            print(f"SELF-TEST FAIL: harmless probe {name!r} failed the gate: {e}")
+            failures += 1
+            continue
+        print(f"  passed probe: {name}")
     for name, path, old, new in MUTANTS:
         n = base[path].count(old)
         if n != 1:
@@ -445,7 +485,7 @@ def self_test() -> int:
         failures += 1
     if failures:
         return 1
-    print(f"self-test: all {len(MUTANTS)} mutants caught")
+    print(f"self-test: all {len(MUTANTS)} mutants caught, {len(PROBES)} harmless probe(s) passed")
     return 0
 
 

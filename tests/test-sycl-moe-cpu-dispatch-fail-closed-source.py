@@ -260,12 +260,10 @@ def check_backend(backend_src: str) -> None:
     # 6. the deferred flushes do not swallow a failed CPU future or scatter submission.
     # Since llama.cpp-yx28 each pending CPU scatter lives in a slot (primary and sibling) and the
     # per-slot flush carries the body; flush_pending_cpu_scatter only drains both slots.
-    for fn, params, tagname in (
-        ("flush_pending_cpu_scatter_slot", r"pending_cpu_scatter & slot", "[CPU-TG]"),
-    ):
-        body = block_after(code, r"static void " + fn + r"\(" + params + r"\)\s*", fn)
-        catch = block_after(body, r"catch\s*\(\s*const std::exception\s*&\s*ex\s*\)", f"the catch block of {fn}")
-        require_abort(catch, f"the catch block of {fn} ({tagname})")
+    fn = "flush_pending_cpu_scatter_slot"
+    body = block_after(code, r"static void " + fn + r"\(pending_cpu_scatter & slot\)\s*", fn)
+    catch = block_after(body, r"catch\s*\(\s*const std::exception\s*&\s*ex\s*\)", f"the catch block of {fn}")
+    require_abort(catch, f"the catch block of {fn} ([CPU-TG])")
 
     # 8. the scatter flush does not skip quietly.
     drain = squash(block_after(code, r"static void flush_pending_cpu_scatter\(\)\s*", "flush_pending_cpu_scatter"))
