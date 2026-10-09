@@ -347,6 +347,7 @@ void kv_tier_manager::configure_from_plan(int                          device,
     const auto   describes = [&](size_t sum) {
         return sum > 0 && sum <= total && total - sum <= slack;
     };
+    // By byte total: both caches push the same layer mask, until a role travels with it (llama.cpp-n9r3).
     const bool   is_idx_buffer = idx_sum > 0 && !describes(main_sum) && describes(idx_sum);
     const size_t truth_sum     = is_idx_buffer ? idx_sum : main_sum;
 
