@@ -2808,9 +2808,13 @@ recovery path: it measures the driver's working set and sizes the headroom from 
   over-reserve. Above 512 the term under-reserves, and that is the **default** for a dense model, not only an explicit
   `-ub`: the auto ladder's cap is `min(n_batch, n_ctx)`, so with the default `n_batch` of 2048 a dense model's auto pick
   climbs to 2048. Mistral 7B Q4_0 measures a 112.0 MiB term at 512 and lands a 448.0 MB compute buffer at the auto
-  2048, `zone=runtime`, in RUNTIME slack. Where no slack is left, the ladder's own fit check keeps the pick lower. MoE
-  models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the auto pick's. `llama.cpp-fkpg` (a) transports
-  the caller's shape.
+  2048, `zone=runtime`, in RUNTIME slack. Nothing keeps that true where the slack is smaller. The ladder's per-rung
+  trial does not consult the reserved RUNTIME room. It refuses a rung only when the rung's compute buffers fail to
+  allocate, fall back to host memory, or would leave the card under the driver headroom (the hold-spill fit). A
+  compute buffer that does not fit RUNTIME takes the KV zone next, then raw device memory outside the arena, and the
+  trial accepts both. So a dense auto pick above 512 can land `zone=raw`, in the external headroom. That is an open
+  finding, not an invariant of this design. MoE models are capped at 512 (`MOE_GPU_UBATCH_MAX`), so their term is the
+  auto pick's. `llama.cpp-fkpg` (a) transports the caller's shape.
 - The state term is read at the measure's `n_seq_max` of 1, so `-np` above 1 under-reserves it, like the caller's
   `-c` and `-ub` above (`llama.cpp-fkpg`). It is summed per buffer type, so a type holding several buffers can round
   up by one grain per extra buffer beyond the term. It is reserved at the probe and is not re-checked at the admitted
