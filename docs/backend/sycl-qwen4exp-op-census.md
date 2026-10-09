@@ -58,7 +58,7 @@ not a ticket:
 - a `MUL_MAT` whose weight the planner executes on the host (:109185-109191);
 - a layer-plan op with a host-planned source (:109193-109199);
 - every op of a layer with `layer_device < 0` (:109225-109227);
-- MoE `SWIGLU`/`ADD_ID` for a layer whose experts are host-planned (`addid_glu_depends_host`, :109207).
+- a `GLU` (e.g. `SWIGLU`) fed by a dense `MUL_MAT` whose weight executes on the host (`glu_input_host_produced`). A GLU after a host-expert `MUL_MAT_ID` stays on SYCL, because that `MUL_MAT_ID` writes device memory (`moe_glu_input_host_produced`, llama.cpp-z4kd).
 
 The KV-host residency check (:108067-108131) also declines `FLASH_ATTN_EXT` over demoted KV. On the
 full model, the experts are host-resident but `MUL_MAT_ID` is admitted residency-blind (:108134), so

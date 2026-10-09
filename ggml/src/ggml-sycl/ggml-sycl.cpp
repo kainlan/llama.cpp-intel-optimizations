@@ -23590,31 +23590,29 @@ static thread_local uint64_t g_cpu_scatter_serial = 0;
 // ---------------------------------------------------------------------------
 // Submitting-thread wait census for the host-expert MoE decode path
 // (llama.cpp-z4kd).  Under GGML_SYCL_MOE_IDS_COPY_TRACE, one WARN line per
-// decode token reports, for each wait class, how many times this thread
-// blocked and for how long:
-//   B1  expert-id readback (synchronous D2H)
-//   B2  activation copy and host-lease producer waits before a CPU job
-//   B3  join of a gate/up CPU job at a flush
-//   B4  down-projection activation gather
-//   B4b join of the hot down group right after issuing it
-//   B5  join of a down CPU job at a flush
-//   B6  wait for an earlier scatter H2D (flush prologue, sibling join)
-//   B7  any of the above inside the graph-boundary flush or drain
+// decode token reports, for each wait class (B1..B7, listed with the
+// classifiers in moe-decode-hostpath.hpp), how many times this thread blocked
+// and for how long.
 // A token's line is printed when the next token's first id readback arrives
 // (the layer id drops), so it includes the boundary flushes in between.  The
-// last token of a run is not printed.
+// last token of a run is not printed.  Counters are never reset between
+// prefill and decode, so two readings need care:
+//   - token 0 also carries every wait of the prompt's ubatches;
+//   - B4b counts any hot-group join, so during prefill it also counts the
+//     gate/up jobs a multi-row hot group joins, not only down.
+// When the variable is unset, a wait costs one cached flag test: the timer
+// reads no clock and classifies nothing.
 // ---------------------------------------------------------------------------
-enum moe_hostpath_wait_class : int {
-    MOE_WAIT_B1,
-    MOE_WAIT_B2,
-    MOE_WAIT_B3,
-    MOE_WAIT_B4,
-    MOE_WAIT_B4B,
-    MOE_WAIT_B5,
-    MOE_WAIT_B6,
-    MOE_WAIT_B7,
-    MOE_WAIT_COUNT,
-};
+using ggml_sycl::MOE_WAIT_B1;
+using ggml_sycl::MOE_WAIT_B2;
+using ggml_sycl::MOE_WAIT_B3;
+using ggml_sycl::MOE_WAIT_B4;
+using ggml_sycl::MOE_WAIT_B4B;
+using ggml_sycl::MOE_WAIT_B5;
+using ggml_sycl::MOE_WAIT_B6;
+using ggml_sycl::MOE_WAIT_B7;
+using ggml_sycl::MOE_WAIT_COUNT;
+using ggml_sycl::MOE_WAIT_JOIN;
 
 struct moe_hostpath_wait_census {
     uint64_t count[MOE_WAIT_COUNT] = {};
@@ -23641,29 +23639,36 @@ static moe_hostpath_clock::time_point moe_hostpath_wait_begin() {
     return moe_hostpath_waits_enabled() ? moe_hostpath_clock::now() : moe_hostpath_clock::time_point{};
 }
 
-// Inside the graph-boundary flush every wait is B7; inside the hot-group flush a job join is B4b.
-static void moe_hostpath_wait_end(int natural, moe_hostpath_clock::time_point t0) {
+// Classification (moe_hostpath_wait_classify) runs only past the enabled check, so a join's name
+// is not read when the census is off.  `joined` names the op of a MOE_WAIT_JOIN wait.
+static void moe_hostpath_wait_end(int natural, const ggml_tensor * joined, moe_hostpath_clock::time_point t0) {
     if (!moe_hostpath_waits_enabled()) {
         return;
     }
-    moe_hostpath_wait_census & w   = g_moe_hostpath_waits;
-    int                        cls = natural;
-    if (w.context == MOE_WAIT_B7) {
-        cls = MOE_WAIT_B7;
-    } else if (w.context == MOE_WAIT_B4B && (natural == MOE_WAIT_B3 || natural == MOE_WAIT_B5)) {
-        cls = MOE_WAIT_B4B;
-    }
+    moe_hostpath_wait_census & w = g_moe_hostpath_waits;
+    const int cls = ggml_sycl::moe_hostpath_wait_classify(natural, joined ? joined->name : nullptr, w.context);
     w.count[cls] += 1;
     w.us[cls] += std::chrono::duration<double, std::micro>(moe_hostpath_clock::now() - t0).count();
 }
 
+static void moe_hostpath_wait_end(int natural, moe_hostpath_clock::time_point t0) {
+    moe_hostpath_wait_end(natural, nullptr, t0);
+}
+
 struct moe_hostpath_wait_timer {
     int                            natural;
+    const ggml_tensor *            joined;
     moe_hostpath_clock::time_point t0;
 
-    explicit moe_hostpath_wait_timer(int cls) : natural(cls), t0(moe_hostpath_wait_begin()) {}
+    explicit moe_hostpath_wait_timer(int cls) : natural(cls), joined(nullptr), t0(moe_hostpath_wait_begin()) {}
 
-    ~moe_hostpath_wait_timer() { moe_hostpath_wait_end(natural, t0); }
+    // A CPU job join; its class is read from `op` when the wait ends.
+    moe_hostpath_wait_timer(int cls, const ggml_tensor * op) :
+        natural(cls),
+        joined(op),
+        t0(moe_hostpath_wait_begin()) {}
+
+    ~moe_hostpath_wait_timer() { moe_hostpath_wait_end(natural, joined, t0); }
 };
 
 // Counts the waits inside one flush under `cls`, unless an enclosing boundary flush already does.
@@ -23678,11 +23683,6 @@ struct moe_hostpath_wait_context {
 
     ~moe_hostpath_wait_context() { g_moe_hostpath_waits.context = saved; }
 };
-
-// A CPU job join is B5 for a down projection and B3 otherwise.
-static int moe_hostpath_join_class(const ggml_tensor * dst) {
-    return dst && strstr(dst->name, "down") ? MOE_WAIT_B5 : MOE_WAIT_B3;
-}
 
 // Called at each expert-id readback.  A layer id lower than the last one starts a new token, so the
 // previous token's line is printed and the counts restart.
@@ -25199,7 +25199,7 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
     try {
         // Wait for CPU compute to finish
         if (slot.future.valid()) {
-            moe_hostpath_wait_timer wait_timer(moe_hostpath_join_class(slot.dst_tensor));
+            moe_hostpath_wait_timer wait_timer(MOE_WAIT_JOIN, slot.dst_tensor);
             slot.future.get();
         }
 
@@ -25450,15 +25450,20 @@ static bool ggml_sycl_pipeline_moe_enabled() {
 // (llama.cpp-3oju9).  Up does not consume gate, so the second job of a layer
 // found the slot full and aborted (llama.cpp-ytc9) on every model that runs gate
 // and up as separate MUL_MAT_IDs.  The 2026-10-08 acceptance run of the opt-in
-// arm aborted the same way, so the slot is retired (llama.cpp-z4kd).  A run that
-// still sets the variable is told once that it has no effect.
+// arm aborted the same way, so the slot is retired (llama.cpp-z4kd).  The
+// direction it was a step toward stays open under llama.cpp-3oju9: an
+// event-chained host path, where a CPU job's completion is an event that the
+// scatter H2D depends on, so no later op has to join the job on the submitting
+// thread.  A run that still sets the variable is told once, at backend init,
+// that it has no effect.
 static void ggml_sycl_pipeline_cpu_warn_retired() {
     static const bool set = [] {
         const bool present = getenv("GGML_SYCL_PIPELINE_CPU") != nullptr;
         if (present) {
             GGML_LOG_WARN(
                 "GGML_SYCL_PIPELINE_CPU is retired and ignored (llama.cpp-z4kd): its opt-in path aborted at the "
-                "llama.cpp-ytc9 assert; see docs/backend/sycl-env-vars.md\n");
+                "llama.cpp-ytc9 assert; the event-chained host path it led toward is deferred under "
+                "llama.cpp-3oju9; see docs/backend/sycl-env-vars.md\n");
         }
         return present;
     }();
@@ -26050,8 +26055,9 @@ void ggml_sycl_cpu_tg_flush_pending() {
 }
 
 // True when any of the thread-local MoE scatter and CPU-expert lists holds
-// state: the four lists whose entries carry compute-buffer slices between graphs,
-// plus the direct-scatter event list.  A recording call must never reach its exit
+// state: the direct-scatter event list, the pending scatter slot and its sibling
+// (each with its previous-scatter buffers), the deferred secondary-GPU scatter,
+// and the pipeline scatter ring.  A recording call must never reach its exit
 // with one non-empty (recorded scatter state is the recording sink's, or the
 // record is refused), so the exit hook reads this before it flushes.
 bool ggml_sycl_cpu_tg_pending_any() {
@@ -27902,6 +27908,9 @@ static void ggml_check_sycl() try {
             if (!overrides.empty()) {
                 GGML_LOG_WARN("[SYCL] non-default settings in effect: %s\n", overrides.c_str());
             }
+            // A retired variable is not in sycl_env_settings; say it is ignored here, once,
+            // rather than only when a host-expert decode first reaches the CPU dispatch.
+            ggml_sycl_pipeline_cpu_warn_retired();
         }
 
         GGML_LOG_INFO("Running with Environment Variables:\n");
@@ -115577,6 +115586,10 @@ static bool ggml_sycl_op_is_host_gate_activation_chain(const ggml_tensor * op, i
     }
 }
 
+// The MUL_MAT_ID clause below is stale: a MUL_MAT_ID always runs in this backend and its output is device
+// memory, host experts or not (see moe_glu_input_host_produced, which the GLU branch of
+// ggml_sycl_op_is_planned_on_host uses instead).  Left as is here because it feeds the ADD/MUL/NORM/RMS_NORM
+// host-gate chain, should_dispatch_to_cpu and classify_cpu_layer_blocks; llama.cpp-2w4f measures and fixes it.
 static bool ggml_sycl_tensor_depends_on_planned_host_weight(const ggml_tensor * tensor, int device, int depth = 0) {
     // Memoize visited tensors to avoid redundant graph traversals.
     // Cleared at the top-level call (depth == 0) so each per-op query gets a
@@ -115732,6 +115745,11 @@ static bool ggml_sycl_layer_plan_applies_to_op(const ggml_tensor * op) {
     }
 }
 
+// moe_glu_input_host_produced's residency callback; ctx points at the device index.
+static bool ggml_sycl_glu_weight_executes_on_host(const ggml_tensor * weight, void * ctx) {
+    return ggml_sycl_weight_executes_on_host(weight, *static_cast<const int *>(ctx));
+}
+
 static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device) {
     if (!op || device < 0) {
         return false;
@@ -115775,16 +115793,16 @@ static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device) 
         }
     }
 
-    // Only a host MUL_MAT producer keeps a GLU or ADD_ID on the CPU backend; a
-    // MUL_MAT_ID's output is device memory even when its experts are on the host
-    // (moe_glu_input_host_produced).
-    if ((op->op == GGML_OP_ADD_ID || op->op == GGML_OP_GLU) &&
-        ggml_sycl::moe_glu_input_host_produced(
-            op, [device](const ggml_tensor * w) { return ggml_sycl_weight_executes_on_host(w, device); })) {
-        if (ggml_sycl_moe_multi_gpu_for_executor() && op->op == GGML_OP_GLU) {
+    // Only a host MUL_MAT producer keeps a GLU on the CPU backend; a MUL_MAT_ID's
+    // output is device memory even when its experts are on the host
+    // (moe_glu_input_host_produced).  ADD_ID never reaches this function:
+    // supports_op and offload_op answer for it first.
+    if (op->op == GGML_OP_GLU &&
+        ggml_sycl::moe_glu_input_host_produced(op, ggml_sycl_glu_weight_executes_on_host, &device)) {
+        if (ggml_sycl_moe_multi_gpu_for_executor()) {
             return n04bq_tr_final(false, "multi_gpu_moe_glu");
         }
-        return n04bq_tr_final(true, "addid_glu_depends_host");
+        return n04bq_tr_final(true, "glu_input_host_produced");
     }
 
     auto * cache = ggml_sycl::get_unified_cache_for_device(device);

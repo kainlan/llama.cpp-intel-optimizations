@@ -19,7 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
+#include <cstring>
 #include <vector>
 
 namespace ggml_sycl {
@@ -275,8 +275,8 @@ inline bool moe_sibling_pending_keep(const moe_sibling_pending_request & r) {
     return r.same_row_geometry && moe_pool_spans_disjoint(r.pending_first, r.pending_count, r.op_first, r.op_count);
 }
 
-// Where a GLU or ADD_ID runs follows where its input was produced.  The input
-// is host-produced when, within 8 levels, it comes from a MUL_MAT whose weight
+// Where a GLU runs follows where its input was produced.  The input is
+// host-produced when, within 8 levels, it comes from a MUL_MAT whose weight
 // executes on the host: that MUL_MAT runs on the CPU backend, so the GLU stays
 // there with it.  A MUL_MAT_ID ends the walk and counts as device-produced, host
 // experts or not: this backend always admits it and writes its output to device
@@ -286,37 +286,100 @@ inline bool moe_sibling_pending_keep(const moe_sibling_pending_request & r) {
 // split also starts the down projection in a new graph_compute, whose entry
 // clears the per-layer ids cache, so down read the expert ids back a second
 // time (llama.cpp-z4kd).
-inline bool moe_glu_input_walk(const ggml_tensor *                              t,
-                               const std::function<bool(const ggml_tensor *)> & weight_on_host,
-                               int                                              depth,
-                               std::vector<const ggml_tensor *> &               visited) {
+//
+// The residency question is a callback (function pointer plus context) so the
+// walk runs without a device.  The walk remembers up to
+// MOE_GLU_INPUT_WALK_MAX_VISITED nodes; a graph that needs more ends the walk as
+// device-produced, which keeps the GLU on SYCL and costs at most a copy.
+typedef bool (*moe_weight_on_host_fn)(const ggml_tensor * weight, void * ctx);
+
+constexpr int MOE_GLU_INPUT_WALK_MAX_VISITED = 256;
+
+struct moe_glu_input_walk_state {
+    moe_weight_on_host_fn weight_on_host;
+    void *                ctx;
+    const ggml_tensor *   visited[MOE_GLU_INPUT_WALK_MAX_VISITED];
+    int                   n_visited;
+};
+
+inline bool moe_glu_input_walk(const ggml_tensor * t, moe_glu_input_walk_state & st, int depth) {
     if (!t || depth > 8) {
         return false;
     }
-    for (const ggml_tensor * v : visited) {
-        if (v == t) {
+    for (int i = 0; i < st.n_visited; ++i) {
+        if (st.visited[i] == t) {
             return false;
         }
     }
-    visited.push_back(t);
+    if (st.n_visited == MOE_GLU_INPUT_WALK_MAX_VISITED) {
+        return false;
+    }
+    st.visited[st.n_visited++] = t;
     if (t->op == GGML_OP_MUL_MAT_ID) {
         return false;
     }
-    if (t->op == GGML_OP_MUL_MAT && t->src[0] != nullptr && weight_on_host(t->src[0])) {
+    if (t->op == GGML_OP_MUL_MAT && t->src[0] != nullptr && st.weight_on_host(t->src[0], st.ctx)) {
         return true;
     }
     for (int s = 0; s < GGML_MAX_SRC && t->src[s] != nullptr; ++s) {
-        if (moe_glu_input_walk(t->src[s], weight_on_host, depth + 1, visited)) {
+        if (moe_glu_input_walk(t->src[s], st, depth + 1)) {
             return true;
         }
     }
     return false;
 }
 
-inline bool moe_glu_input_host_produced(const ggml_tensor *                              op,
-                                        const std::function<bool(const ggml_tensor *)> & weight_on_host) {
-    std::vector<const ggml_tensor *> visited;
-    return moe_glu_input_walk(op, weight_on_host, 0, visited);
+inline bool moe_glu_input_host_produced(const ggml_tensor * op, moe_weight_on_host_fn weight_on_host, void * ctx) {
+    moe_glu_input_walk_state st;
+    st.weight_on_host = weight_on_host;
+    st.ctx            = ctx;
+    st.n_visited      = 0;
+    return moe_glu_input_walk(op, st, 0);
+}
+
+// Wait classes of the host-expert MoE decode path's submitting-thread census
+// (llama.cpp-z4kd), printed under GGML_SYCL_MOE_IDS_COPY_TRACE:
+//   B1  expert-id readback (synchronous D2H)
+//   B2  activation copy and host-lease producer waits before a CPU job
+//   B3  join of a gate/up CPU job at a flush
+//   B4  down-projection activation gather
+//   B4b join of the hot down group right after issuing it
+//   B5  join of a down CPU job at a flush
+//   B6  wait for an earlier scatter H2D (flush prologue, sibling join)
+//   B7  any of the above inside the graph-boundary flush or drain
+// MOE_WAIT_JOIN is not a class: it marks a CPU job join whose class (B3 or B5)
+// is read from the joined op's name, and only when the census is on.
+enum moe_hostpath_wait_class : int {
+    MOE_WAIT_JOIN = -1,
+    MOE_WAIT_B1,
+    MOE_WAIT_B2,
+    MOE_WAIT_B3,
+    MOE_WAIT_B4,
+    MOE_WAIT_B4B,
+    MOE_WAIT_B5,
+    MOE_WAIT_B6,
+    MOE_WAIT_B7,
+    MOE_WAIT_COUNT,
+};
+
+// A CPU job join is B5 for a down projection and B3 otherwise.
+inline int moe_hostpath_join_class(const char * joined_name) {
+    return joined_name && strstr(joined_name, "down") ? MOE_WAIT_B5 : MOE_WAIT_B3;
+}
+
+// The class one wait is counted under.  `context` is the class an enclosing
+// flush forces (-1 for none): inside the graph-boundary flush every wait is B7;
+// inside the hot-group flush a job join (B3 or B5) is B4b and other waits keep
+// their own class.
+inline int moe_hostpath_wait_classify(int natural, const char * joined_name, int context) {
+    const int cls = natural == MOE_WAIT_JOIN ? moe_hostpath_join_class(joined_name) : natural;
+    if (context == MOE_WAIT_B7) {
+        return MOE_WAIT_B7;
+    }
+    if (context == MOE_WAIT_B4B && (cls == MOE_WAIT_B3 || cls == MOE_WAIT_B5)) {
+        return MOE_WAIT_B4B;
+    }
+    return cls;
 }
 
 }  // namespace ggml_sycl
