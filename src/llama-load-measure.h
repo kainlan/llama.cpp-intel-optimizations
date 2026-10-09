@@ -324,7 +324,9 @@ inline std::string llama_late_check_state_not_recorded_text(int32_t device, size
 // (llama.cpp-p6i0). Every load-time measure runs at n_seq_max 1, the only shape a load sees, so a context with more
 // sequences allocates more state than the term holds, RUNTIME-first and before the compute buffer, and the excess
 // draws down the compute term. -np is a normal user option: the context is kept as asked and this is a WARN, never a
-// refusal. The comparison is exact (one byte over warns). Empty when the state fits the term.
+// refusal. The comparison is exact (one byte over warns). A planned term of 0 means the load measured or reserved no
+// state at all (a model the measure cannot run, a backend without the load procs, or a declined reservation), so that
+// case has its own line, which does not blame the n_seq_max 1 measure. Empty when the state fits the term.
 inline std::string llama_context_state_excess_text(int32_t  device,
                                                    uint32_t n_seq_max,
                                                    uint64_t planned_bytes,
@@ -336,6 +338,13 @@ inline std::string llama_context_state_excess_text(int32_t  device,
     char planned_mib[32];
     char excess_mib[32];
     std::snprintf(real_mib, sizeof(real_mib), "%.1f", real_bytes / 1024.0 / 1024.0);
+    if (planned_bytes == 0) {
+        return "[LOAD-PLAN] state term not planned on device " + std::to_string(device) + ": this context holds " +
+               real_mib + " MiB of recurrent state at n_seq_max " + std::to_string(n_seq_max) +
+               " and the load planned no state term (it was not measured, or no state term was reserved), so all of "
+               "it is allocated in the RUNTIME zone unplanned and draws down the compute term. The context is kept "
+               "as asked";
+    }
     std::snprintf(planned_mib, sizeof(planned_mib), "%.1f", planned_bytes / 1024.0 / 1024.0);
     std::snprintf(excess_mib, sizeof(excess_mib), "%.1f", (real_bytes - planned_bytes) / 1024.0 / 1024.0);
     return "[LOAD-PLAN] state term exceeded on device " + std::to_string(device) + ": this context holds " + real_mib +

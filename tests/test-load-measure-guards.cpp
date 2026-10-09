@@ -995,9 +995,20 @@ static void test_state_excess() {
 
     // one byte over still warns: the comparison is exact, not rounded
     CHECK(!llama_context_state_excess_text(0, 2, 1048576, 1048577).empty(), "one byte over did not warn");
-    // nothing planned (the load reserved no state term) and a real state: still named
-    const std::string z = llama_context_state_excess_text(0, 1, 0, 1048576);
-    CHECK(z.find("planned 0.0 MiB") != std::string::npos, "an unplanned state was not named: %s", z.c_str());
+    // nothing planned (the model was not measured, or the backend reserved no state term) and a real state: its own
+    // line, which never blames the n_seq_max 1 measure that did not happen
+    const std::string z = llama_context_state_excess_text(0, 4, 0, 1048576);
+    CHECK(z.find("[LOAD-PLAN] state term not planned on device 0") == 0, "an unplanned state was not named: %s",
+          z.c_str());
+    CHECK(z.find("1.0 MiB of recurrent state at n_seq_max 4") != std::string::npos,
+          "the unplanned line does not name the state and n_seq_max: %s", z.c_str());
+    CHECK(z.find("no state term") != std::string::npos, "the unplanned line does not say none was planned: %s",
+          z.c_str());
+    CHECK(z.find("measured at n_seq_max 1") == std::string::npos, "the unplanned line blames the measure: %s",
+          z.c_str());
+    CHECK(z.find("kept as asked") != std::string::npos, "the unplanned line does not say the context is kept: %s",
+          z.c_str());
+    CHECK(llama_context_state_excess_text(0, 4, 0, 0).empty(), "no state and no term warned");
 }
 
 int main() {

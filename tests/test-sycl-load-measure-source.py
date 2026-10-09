@@ -35,8 +35,8 @@ one measure-only context over a load's placement. This gate pins, on comment-str
   late fold checks it with the state bytes, never the compute total;
 - (llama.cpp-p6i0) the load measures that state at n_seq_max 1, so the context constructor compares, once and right
   after its memory exists, each SYCL device's state (the memory's bytes for that device's buffer type) with the
-  planned state term the backend holds, and WARNs by name through one text helper when the state is larger. It is
-  never a refusal: neither the comparison nor the helper throws, returns a failure, or reaches the scheduler.
+  planned state term the backend holds, and WARNs by name through one text helper when the state is larger, on a
+  line of its own when the load planned no state term at all. It is never a refusal: neither the comparison nor the helper throws, returns a failure, or reaches the scheduler.
 
 Every clause has a mutant that must fail it. Host-only; collected by pytest.
 """
@@ -875,7 +875,10 @@ def state_excess_ok(ctx_code: str, measure_code: str) -> bool:
     # never a refusal, in the comparison or the helper
     if any(r in warn or r in text for r in _REFUSALS):
         return False
-    return z("if (real_bytes <= planned_bytes) {return {};}") in text
+    # a load that planned no state term has its own line, after the fit check: it never blames the n_seq_max 1 measure
+    fit = text.find(z("if (real_bytes <= planned_bytes) {return {};}"))
+    unplanned = text.find(z('if (planned_bytes == 0) {return "[LOAD-PLAN] state term not planned on device "'))
+    return -1 not in (fit, unplanned) and fit < unplanned
 
 
 def test_a_larger_state_is_warned_never_refused():
@@ -899,6 +902,7 @@ def test_state_excess_mutants():
         ("the planned term is not read", warn, "llama_sycl_l4_planned_state_term(procs, device, &planned)", "true", True),
         ("the helper refuses", text, "if (real_bytes <= planned_bytes) {", "if (real_bytes > planned_bytes) {throw std::runtime_error(\"state\");}if (real_bytes <= planned_bytes) {", False),
         ("the helper compares loosely", text, "if (real_bytes <= planned_bytes) {", "if (real_bytes < planned_bytes) {", False),
+        ("the unplanned line is dropped", text, "if (planned_bytes == 0) {", "if (false) {", False),
     ]:
         if in_ctx:
             c2, m2 = ctx.replace(body, mutate(body, old, new), 1), meas

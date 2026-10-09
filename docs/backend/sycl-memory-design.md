@@ -2842,7 +2842,9 @@ recovery path: it measures the driver's working set and sizes the headroom from 
   The context constructor names it. Right after its memory exists, it compares each SYCL device's state with the
   planned state term the backend holds (`ggml_backend_sycl_planned_state_term`). The state is the memory's bytes for
   that device's buffer type. When the state is larger, it WARNs `[LOAD-PLAN] state term exceeded on device N` with
-  `n_seq_max`, both sizes and the excess. It never refuses: `-np` is a normal user option, and a context the user
+  `n_seq_max`, both sizes and the excess. A load that planned no state term at all (a model the measure cannot run, a
+  backend without the load procs, or a declined reservation) gets its own line instead, `[LOAD-PLAN] state term not
+  planned on device N`, which does not blame the one-sequence measure. It never refuses: `-np` is a normal user option, and a context the user
   asked for is placed and warned, never shrunk or refused. `tests/test-sycl-load-measure-source.py` pins the WARN and
   pins that neither the comparison nor its text helper refuses.
   The fix is to transport the caller's `n_seq_max` into the load's measure, the same gap `llama.cpp-fkpg` records for
