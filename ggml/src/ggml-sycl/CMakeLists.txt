@@ -7044,7 +7044,11 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         # Cold B70 AOT/submit can exceed the backend's 30 s default watchdog.
         # Keep the inner watchdog 10 s below CTest's hard bound so a real hang
         # is still diagnosed by the backend before CTest terminates the process.
-        ENVIRONMENT "GGML_SYCL_OP_TIMEOUT_MS=110000"
+        # Pinned to the B70 (level_zero:1 selects the B50 for a second run): the
+        # closed route covers primary residency only, and an unpinned run also
+        # enumerates the iGPU. A two-card run of the binary must SKIP (77) with
+        # the reason or pass, never abort (llama.cpp-n8da).
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;GGML_SYCL_OP_TIMEOUT_MS=110000"
         TIMEOUT 120)
 
     # llama.cpp-moua L4 step 3c: a context's held host-tier reservation and the claim scope, through the public
