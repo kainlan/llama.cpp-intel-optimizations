@@ -265,6 +265,7 @@ def test_mutant_bound_declared_after_first_use():
     assert not bound_is_helper(m)
     assert declared_once(m) and no_physical_count(m) and every_call_passes_bound(m, 1)
 
+
 if __name__ == "__main__":
     import sys
 
