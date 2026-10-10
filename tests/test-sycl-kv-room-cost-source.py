@@ -18,8 +18,10 @@ The fix this gate pins:
   - the three parameters are placement_kv_info fields, filled once where the backend copies the inventory in, from
     GGML_SYCL_PLAN_CTX_FILL_PCT / GGML_SYCL_PLAN_HOST_ATTN_GBPS / GGML_SYCL_PLAN_CPU_EXPERT_GBPS (defaults 50 / 30 /
     40, a nonsense value keeps the default, a fill above 100 is 100), and catalogued in docs/backend/sycl-env-vars.md;
-  - the room's line states the decision: layers held and refused by cost, and the deciding layer's A and B in
-    microseconds per token with the three parameters; a fully refused room logs one WARN saying so;
+  - under this cost every full-attention layer decides alike (its KV per cell cancels out of A/B), so only a SWA
+    layer can differ; the room's line therefore states the decision per attention class ("held all N full-attention
+    layer(s)" / "refused all N full-attention layer(s) by cost", and the same for SWA) and gives the deciding layer's A
+    and B in microseconds per token with the three parameters; a fully refused room logs one WARN saying so;
   - the requested context still never becomes the planning n_ctx (llama.cpp-fkpg c-sc3u).
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
@@ -234,6 +236,15 @@ def claim_room_holds_only_the_layers_that_pass(cache: str) -> bool:
             and ROOM_CALL in body(norm(cache), PLAN_SIG))
 
 
+SWA_COUNT = "if (swa_pass) { room.n_swa_layers++; room.n_swa_held += cost.held ? 1 : 0; }"
+
+
+def claim_room_counts_each_attention_class(cache: str) -> bool:
+    """The SWA layers are counted apart, so the line can say what each attention class did."""
+    b = body(norm(cache), ROOM_SIG)
+    return bool(b) and ordered(b, WEIGH_CALL, "room.n_layers++;", SWA_COUNT, COUNT_HELD)
+
+
 DEVICE_LAYERS = "if (layer_id >= 0 && owner == device_id) { layers.push_back(layer_id); }"
 SORT = "std::sort(layers.begin(), layers.end());"
 PASSES = "for (const bool swa_pass : { false, true }) {"
@@ -274,7 +285,15 @@ def claim_context_never_becomes_the_planning_n_ctx(cache: str, hpp: str, sycl: s
 # ---- the line -------------------------------------------------------------------------------------------------------
 
 
-DECISION = "held %zu of %zu layer(s), refused %zu layer(s) by cost"
+SUMMARY_SIG = "static std::string kv_context_room_class_summary(size_t n_held, size_t n_layers, const char * kind)"
+SUMMARY_FORMS = ('"no %s layer with a room", kind', '"held all %zu %s layer(s)", n_layers, kind',
+                 '"refused all %zu %s layer(s) by cost", n_layers, kind',
+                 '"held %zu of %zu %s layer(s), refused %zu by cost", n_held, n_layers, kind, n_layers - n_held')
+FULL_SUMMARY = ('const std::string full = kv_context_room_class_summary(room.n_held - room.n_swa_held, '
+                'room.n_layers - room.n_swa_layers, "full-attention");')
+SWA_SUMMARY = 'const std::string swa = kv_context_room_class_summary(room.n_swa_held, room.n_swa_layers, "SWA");'
+DECISION = "[PLACEMENT] KV context room on device %d: %s, %s"
+DECISION_ARGS = "device_id, full.c_str(), swa.c_str(), room.refused / mb,"
 COSTS = ("host attention %.1f us/token vs displaced experts %.1f us/token (fill %.4g%%, host-attn %.4g GB/s, "
          "cpu-expert %.4g GB/s)")
 COST_ARGS = ("room.decision.host_attn_us, room.decision.expert_us, kv_info.ctx_fill_pct, kv_info.host_attn_gbps, "
@@ -286,20 +305,27 @@ WARN = "const bool warn = room.displaced_bytes() > 0 || room.held < room.wanted 
 
 
 def claim_room_line_states_the_decision(cache: str) -> bool:
-    """Both lines say how many layers were held and refused by cost, and give the deciding layer's A and B in
-    microseconds per token with the three parameters; a fully refused room is one WARN saying every room was refused
-    and that the runtime re-places the overflow; otherwise the line is a WARN whenever the room cost experts, could
-    not hold all it wanted, or refused a layer."""
-    b = body(norm(cache), ROOM_LOG_SIG)
-    if not b or "if (room.n_layers == 0) { return; }" not in b:
+    """Both lines say, per attention class, whether its layers were held or refused by cost ("held all N" or "refused
+    all N" for the full-attention layers, which decide alike), and give the deciding layer's A and B in microseconds
+    per token with the three parameters; a fully refused room is one WARN saying every room was refused and that the
+    runtime re-places the overflow; otherwise the line is a WARN whenever the room cost experts, could not hold all it
+    wanted, or refused a layer."""
+    n = norm(cache)
+    b = body(n, ROOM_LOG_SIG)
+    summary = body(n, SUMMARY_SIG)
+    if not b or not summary or "if (room.n_layers == 0) { return; }" not in b:
+        return False
+    if not ordered(summary, *SUMMARY_FORMS) or not ordered(b, FULL_SUMMARY, SWA_SUMMARY, ALL_REFUSED):
         return False
     at = b.find(ALL_REFUSED)
     if at < 0:
         return False
     refused = body(b[at:], "if (room.n_held == 0)")
     rest = b[b.find(refused, at) + len(refused):] if refused else ""
-    return (bool(rest) and all(s in refused for s in (DECISION, COSTS, COST_ARGS, TAIL, "return;") + ALL_REFUSED_SAYS)
-            and all(s in rest for s in (DECISION, COSTS, COST_ARGS, TAIL, WARN))
+    return (bool(rest)
+            and all(s in refused
+                    for s in (DECISION, DECISION_ARGS, COSTS, COST_ARGS, TAIL, "return;") + ALL_REFUSED_SAYS)
+            and all(s in rest for s in (DECISION, DECISION_ARGS, COSTS, COST_ARGS, TAIL, WARN))
             and "ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO," in rest)
 
 
@@ -341,6 +367,10 @@ def test_context_never_becomes_the_planning_n_ctx():
 
 def test_room_line_states_the_decision():
     assert claim_room_line_states_the_decision(CACHE)
+
+
+def test_room_counts_each_attention_class():
+    assert claim_room_counts_each_attention_class(CACHE)
 
 
 # ---- mutants: each must turn its claim red --------------------------------------------------------------------------
@@ -554,5 +584,25 @@ def test_mutant_line_drops_the_parameters_fails():
 
 def test_mutant_line_drops_the_decision_fails():
     n = norm(CACHE)
-    assert n.count(DECISION) == 2
-    assert not claim_room_line_states_the_decision(n.replace(DECISION, "held %zu of %zu layer(s)%.0zu"))
+    assert n.count(DECISION) == 2 and n.count(DECISION_ARGS) == 2
+    mutant = n.replace(DECISION, "[PLACEMENT] KV context room on device %d").replace(DECISION_ARGS,
+                                                                                 "device_id, room.refused / mb,")
+    assert not claim_room_line_states_the_decision(mutant)
+
+
+def test_mutant_full_summary_counts_every_layer_fails():
+    """The full-attention part counts the SWA layers too: a held SWA layer would read as a held full-attention one."""
+    assert not claim_room_line_states_the_decision(
+        _once(CACHE, FULL_SUMMARY, 'const std::string full = kv_context_room_class_summary(room.n_held, '
+              'room.n_layers, "full-attention");'))
+
+
+def test_mutant_summary_hides_a_full_refusal_fails():
+    """No "refused all" form: a class whose every room was refused reads as a partial split."""
+    assert not claim_room_line_states_the_decision(
+        _once(CACHE, '} else if (n_held == 0) { snprintf(text, sizeof(text), "refused all %zu %s layer(s) by cost", '
+              'n_layers, kind); }', "}"))
+
+
+def test_mutant_swa_not_counted_fails():
+    assert not claim_room_counts_each_attention_class(_once(CACHE, SWA_COUNT, ""))

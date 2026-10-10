@@ -30964,6 +30964,9 @@ struct kv_context_room {
     size_t n_held    = 0;  // of those, the ones whose room passed the cost test
     size_t n_refused = 0;  // and the ones whose room was refused by cost
     size_t refused   = 0;  // the extra KV of the refused layers
+    // The SWA layers among n_layers and n_held; the rest are full-attention layers, which decide alike.
+    size_t n_swa_layers = 0;
+    size_t n_swa_held   = 0;
 
     // The layer the line reports A and B for: the first refused one in the runtime's demotion order, or the first
     // held one when none was refused.
@@ -31018,9 +31021,12 @@ static kv_context_room hold_kv_context_room(placement_plan &          plan,
     if (kv_info.n_ctx_context == 0) {
         return room;
     }
-    // The device layers in the order the runtime demotes KV when a context does not fit (plan_runtime_kv_demotion,
-    // kv-runtime-demotion.cpp): full attention latest first, then SWA latest first. Under the uniform cost every FULL
-    // layer decides alike, so the refused rooms are the layers that demotion moves first.
+    // Under this cost every full-attention layer decides alike: its KV per cell is in both A (F cells read) and B (a
+    // room of n_ctx_context - n_ctx cells), so it cancels, and the full-attention layers are all held or all refused.
+    // Only a SWA layer, whose room and host read are both capped by its window, can decide otherwise. The layers are
+    // still weighed one by one, in the order the runtime demotes KV when a context does not fit
+    // (plan_runtime_kv_demotion, kv-runtime-demotion.cpp: full attention latest first, then SWA latest first): that is
+    // what the runtime moves, and the loop stays right once a per-layer term (a frequency-weighted p_hit) appears.
     std::vector<int> layers;
     for (const auto & [layer_id, owner] : plan.kv_device) {
         if (layer_id >= 0 && owner == device_id) {
@@ -31040,6 +31046,10 @@ static kv_context_room hold_kv_context_room(placement_plan &          plan,
             }
             const kv_context_room_cost cost = weigh_kv_context_room(kv_info, layer_id, extra, n_experts);
             room.n_layers++;
+            if (swa_pass) {
+                room.n_swa_layers++;
+                room.n_swa_held += cost.held ? 1 : 0;
+            }
             if (cost.held) {
                 room.wanted += std::min(extra, SIZE_MAX - room.wanted);
                 room.n_held++;
@@ -31059,11 +31069,28 @@ static kv_context_room hold_kv_context_room(placement_plan &          plan,
     return room;
 }
 
-// The room's line, after the experts are packed, so it can say what the room cost: the layers held and refused by
-// cost, the deciding layer's A and B with the parameters that produced them, and the device bytes of routed experts the
-// pack placed against those the same pack places with the room added back. A WARN when it cost experts, could not
-// hold all it wanted or refused a layer, so a default run shows it; a fully refused room is one WARN. With no requested
-// context, one INFO line says no room is held.
+// One attention class's part of the room's line. The full-attention part reads "held all" or "refused all" under the
+// uniform cost (see hold_kv_context_room); the mixed form is there for a per-layer term.
+static std::string kv_context_room_class_summary(size_t n_held, size_t n_layers, const char * kind) {
+    char text[128];
+    if (n_layers == 0) {
+        snprintf(text, sizeof(text), "no %s layer with a room", kind);
+    } else if (n_held == n_layers) {
+        snprintf(text, sizeof(text), "held all %zu %s layer(s)", n_layers, kind);
+    } else if (n_held == 0) {
+        snprintf(text, sizeof(text), "refused all %zu %s layer(s) by cost", n_layers, kind);
+    } else {
+        snprintf(text, sizeof(text), "held %zu of %zu %s layer(s), refused %zu by cost", n_held, n_layers, kind,
+                 n_layers - n_held);
+    }
+    return text;
+}
+
+// The room's line, after the experts are packed, so it can say what the room cost: the full-attention and SWA layers
+// held and refused by cost, the deciding layer's A and B with the parameters that produced them, and the device bytes
+// of routed experts the pack placed against those the same pack places with the room added back. A WARN when it cost
+// experts, could not hold all it wanted or refused a layer, so a default run shows it; a fully refused room is one
+// WARN. With no requested context, one INFO line says no room is held.
 static void log_kv_context_room(const kv_context_room & room, const placement_kv_info & kv_info, int device_id) {
     if (kv_info.n_ctx_context == 0) {
         GGML_LOG_INFO(
@@ -31075,17 +31102,20 @@ static void log_kv_context_room(const kv_context_room & room, const placement_kv
     if (room.n_layers == 0) {
         return;
     }
-    const double mb = 1024.0 * 1024.0;  // MB as the sibling [PLACEMENT] lines print it
+    const double      mb   = 1024.0 * 1024.0;  // MB as the sibling [PLACEMENT] lines print it
+    const std::string full = kv_context_room_class_summary(room.n_held - room.n_swa_held,
+                                                           room.n_layers - room.n_swa_layers, "full-attention");
+    const std::string swa  = kv_context_room_class_summary(room.n_swa_held, room.n_swa_layers, "SWA");
     if (room.n_held == 0) {
         GGML_LOG_WARN(
-            "[PLACEMENT] KV context room on device %d: held %zu of %zu layer(s), refused %zu layer(s) by cost: "
-            "every layer's room was refused by cost, so none of the %.1f MB for n_ctx_context=%u over planner "
-            "n_ctx=%u is held, the routed experts keep it, and the runtime re-places the overflow at context "
-            "creation; deciding layer %d: host attention %.1f us/token vs displaced experts %.1f us/token (fill "
-            "%.4g%%, host-attn %.4g GB/s, cpu-expert %.4g GB/s). n_ctx_context is the requested n_ctx.\n",
-            device_id, room.n_held, room.n_layers, room.n_refused, room.refused / mb, kv_info.n_ctx_context,
-            kv_info.n_ctx, room.decision.layer_id, room.decision.host_attn_us, room.decision.expert_us,
-            kv_info.ctx_fill_pct, kv_info.host_attn_gbps, kv_info.cpu_expert_gbps);
+            "[PLACEMENT] KV context room on device %d: %s, %s: every layer's room was refused by cost, so none of "
+            "the %.1f MB for n_ctx_context=%u over planner n_ctx=%u is held, the routed experts keep it, and the "
+            "runtime re-places the overflow at context creation; deciding layer %d: host attention %.1f us/token vs "
+            "displaced experts %.1f us/token (fill %.4g%%, host-attn %.4g GB/s, cpu-expert %.4g GB/s). "
+            "n_ctx_context is the requested n_ctx.\n",
+            device_id, full.c_str(), swa.c_str(), room.refused / mb, kv_info.n_ctx_context, kv_info.n_ctx,
+            room.decision.layer_id, room.decision.host_attn_us, room.decision.expert_us, kv_info.ctx_fill_pct,
+            kv_info.host_attn_gbps, kv_info.cpu_expert_gbps);
         return;
     }
     const bool   warn       = room.displaced_bytes() > 0 || room.held < room.wanted || room.n_refused > 0;
@@ -31093,14 +31123,14 @@ static void log_kv_context_room(const kv_context_room & room, const placement_kv
     // ggml_log_internal, not the GGML_LOG_* macros, so the level is chosen at run time and the arguments are written
     // once.
     ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
-                      "[PLACEMENT] KV context room on device %d: held %zu of %zu layer(s), refused %zu layer(s) by "
-                      "cost (%.1f MB); held %.1f MB of %.1f MB for n_ctx_context=%u over planner n_ctx=%u, before the "
+                      "[PLACEMENT] KV context room on device %d: %s, %s (%.1f MB refused by cost); "
+                      "held %.1f MB of %.1f MB for n_ctx_context=%u over planner n_ctx=%u, before the "
                       "routed experts%s; deciding layer %d %s: host attention %.1f us/token vs displaced experts "
                       "%.1f us/token (fill %.4g%%, host-attn %.4g GB/s, cpu-expert %.4g GB/s); it cost %.1f MB of "
                       "device-resident routed experts: %.1f MB (%zu triplet(s)) on the device, against %.1f MB (%zu) "
                       "with the room added back. n_ctx_context is the requested n_ctx.\n",
-                      device_id, room.n_held, room.n_layers, room.n_refused, room.refused / mb, room.held / mb,
-                      room.wanted / mb, kv_info.n_ctx_context, kv_info.n_ctx, short_note, room.decision.layer_id,
+                      device_id, full.c_str(), swa.c_str(), room.refused / mb, room.held / mb, room.wanted / mb,
+                      kv_info.n_ctx_context, kv_info.n_ctx, short_note, room.decision.layer_id,
                       room.decision.held ? "held" : "refused", room.decision.host_attn_us, room.decision.expert_us,
                       kv_info.ctx_fill_pct, kv_info.host_attn_gbps, kv_info.cpu_expert_gbps,
                       room.displaced_bytes() / mb, room.expert_bytes / mb, room.expert_groups,
