@@ -86,7 +86,9 @@ void test_both_terms_are_one_owners_and_leave_together() {
     check(state(t, 0) == 12 * kMiB && compute(t, 0) == 0, "the state term does not read as a compute term");
     check(t.set(0, kA, planned_load_term::COMPUTE, 40 * kMiB), "the compute term is stored beside it");
     check(state(t, 0) == 12 * kMiB && compute(t, 0) == 40 * kMiB, "storing compute left state alone");
-    check(t.drop(kA) && state(t, 0) == 0 && compute(t, 0) == 0, "one drop removes both");
+    check(t.drop(kA), "one drop removes A");
+    check(state(t, 0) == 0, "the drop removed A's state term");
+    check(compute(t, 0) == 0, "and A's compute term");
 }
 
 void test_two_devices_are_independent() {
@@ -115,12 +117,14 @@ void test_owners_that_are_not_model_slots_are_refused() {
     check(!t.set(0, past_the_table, planned_load_term::COMPUTE, 900 * kMiB), "slot model_slot_count is refused");
     check(!t.set(0, unminted, planned_load_term::COMPUTE, 900 * kMiB), "generation 0 (never minted) is refused");
     check(compute(t, 0) == 50 * kMiB && state(t, 0) == 0, "nothing was stored: the device still reads A's 50 only");
-    check(!t.drop(buffer_owner) && !t.drop(no_model) && !t.drop(unminted), "and none of them can drop anything");
+    check(!t.drop(buffer_owner), "buffer_owner_slot cannot drop anything");
+    check(!t.drop(no_model), "no_model_slot cannot drop anything");
+    check(!t.drop(unminted), "generation 0 cannot drop anything");
     check(compute(t, 0) == 50 * kMiB, "A's term survived the refused drops");
-    check(!t.set(-1, kA, planned_load_term::COMPUTE, 1) &&
-              !t.set(GGML_SYCL_MAX_DEVICES, kA, planned_load_term::COMPUTE, 1),
-          "a device out of range is refused");
-    check(compute(t, -1) == 0 && compute(t, GGML_SYCL_MAX_DEVICES) == 0, "and reads 0");
+    check(!t.set(-1, kA, planned_load_term::COMPUTE, 1), "device -1 is refused");
+    check(!t.set(GGML_SYCL_MAX_DEVICES, kA, planned_load_term::COMPUTE, 1), "device GGML_SYCL_MAX_DEVICES is refused");
+    check(compute(t, -1) == 0, "device -1 reads 0");
+    check(compute(t, GGML_SYCL_MAX_DEVICES) == 0, "device GGML_SYCL_MAX_DEVICES reads 0");
 }
 
 void test_a_slot_generation_is_its_own_owner() {
@@ -159,7 +163,9 @@ void test_a_newer_owner_replaces_a_stale_contribution_and_names_it() {
           "the newer owner's store reports generation 1 replaced on device 0");
     check(compute(t, 0) == 100 * kMiB && state(t, 0) == 0,
           "the predecessor's 300 and 40 are gone whole, not merged into the newer owner's value");
-    check(!t.drop(old_gen) && t.drop(new_gen) && compute(t, 0) == 0, "only the newer owner's key drops it now");
+    check(!t.drop(old_gen), "generation 1's key drops nothing now");
+    check(t.drop(new_gen), "generation 2's key drops its contribution");
+    check(compute(t, 0) == 0, "and the device reads 0 after it");
 }
 
 void test_a_newer_owner_sweeps_the_slot_on_every_device() {
@@ -184,8 +190,7 @@ void test_a_newer_owner_sweeps_the_slot_on_every_device() {
     check(compute(t, 1) == 50 * kMiB && state(t, 1) == 0,
           "device 1 reads B's 50, not generation 1's leftover 200, and its leftover state is gone");
     check(!t.drop(old_gen), "nothing of generation 1 is left to drop");
-    const SlotToken stale_gen{ 9, 1 };
-    check(!t.set(3, stale_gen, planned_load_term::COMPUTE, 900 * kMiB),
+    check(!t.set(3, old_gen, planned_load_term::COMPUTE, 900 * kMiB),
           "generation 1 cannot store on a device the slot holds nothing on, once generation 2 exists anywhere");
     check(compute(t, 3) == 0, "device 3 still reads 0");
 }

@@ -169,9 +169,10 @@ defaulted const-reference parameters, which grammar ABI 15 misparses.
 These are **explicit raw-parser recovery sites**, not silently discarded
 regions. Each of the 67 nodes must receive a structural proof category. In the
 current inputs, 24 are confined to parsed function signature/storage spans,
-35 are in parsed or unambiguously recovered function bodies, and 5 are the
+35 are in parsed or unambiguously recovered function bodies, 5 are the
 defaulted const-reference parameter shape, which is proved by an anchored
-spelling match and fails closed on every near miss. Recovered function
+spelling match and fails closed on every near miss, and 3 are
+preprocessor-condition non-declarations. Recovered function
 regions end at the lexically balanced closing brace (with comments and literals
 masked); an oversized `ERROR` node's tail must independently consist of parsed
 top-level constructs or the census fails. Parsed `function_definition` and `lambda_expression` nodes receive the same
@@ -185,8 +186,8 @@ functions, preventing later file-scope declarations from inheriting the
 recovered function's scope. Only the signature span exempts a function's own
 `static` storage-class marker. Body recovery is accepted only when every
 `static`/`thread_local` marker in it independently belongs to a parsed
-declaration; an unparsed marker fails the census. The remaining 3 sites are
-confined to `#if` condition lines, which cannot contain a declaration.
+declaration; an unparsed marker fails the census. The 3 preprocessor-condition
+sites are confined to `#if` condition lines, which cannot contain a declaration.
 Structural preprocessor recovery spanning a conditional body is not exempt. Any
 other namespace/file recovery is rejected because it could conceal an
 implicit-static object of a user-defined type or direct-initialization spelling.

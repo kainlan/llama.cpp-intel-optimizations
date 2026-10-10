@@ -2031,7 +2031,9 @@ size_t           unified_cache_get_planned_state_term_bytes(int device_id);
 // Drops `owner`'s compute and state terms on every device and republishes the merge; every other owner's stay
 // (llama.cpp-ihk6). Called where the owner ends: its load's rollback and its slot's release. True when something was
 // dropped. noexcept, so the rollback calls it outside any try stage and no failed stage before it can skip it: it
-// takes one leaf mutex and stores atomics, and allocates nothing.
+// takes one leaf mutex and stores atomics, and allocates nothing. std::mutex::lock() is not itself noexcept, so a lock
+// failure here terminates; that is acceptable because a leaf lock, under which nothing is called, can fail only on a
+// self-deadlock.
 bool             unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner) noexcept;
 // Whether the dense scratch at `n_ubatch` fits the RUNTIME zone's CAPACITY beside the other n_ubatch-independent
 // planned consumers. Capacity, not free space: free space depends on which compute buffers are live, capacity is
