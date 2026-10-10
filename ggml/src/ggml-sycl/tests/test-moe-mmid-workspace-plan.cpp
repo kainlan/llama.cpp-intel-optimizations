@@ -1385,7 +1385,9 @@ static void owner_admissible_only_on_an_exposed_device() {
     constexpr int exposed_default = 1;
     check(moe_mmid_owner_admissible(0, exposed_default), "the exposed primary must be an admissible MMID owner");
     check(!moe_mmid_owner_admissible(1, exposed_default), "a hidden physical GPU must not be an admissible MMID owner");
-    // Passing the physical count instead would admit the hidden device: that is the wrong quantity.
+    // Passing the physical count instead would admit the hidden device: that is the wrong quantity. This case pins
+    // only the predicate; which count the planner call sites pass is pinned by
+    // tests/test-sycl-mmid-owner-exposed-count-source.py.
     check(moe_mmid_owner_admissible(1, physical_gpus) != moe_mmid_owner_admissible(1, exposed_default),
           "owner 1's answer must depend on whether the count is exposed or physical");
     // Split modes expose every GPU (exposed == physical), so a secondary owner is a real backend device there.

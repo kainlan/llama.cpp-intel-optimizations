@@ -4376,6 +4376,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-n8da: the two MMID owner checks in the planner bound owners by the registry's exposed count
+# (ggml_sycl_info().device_count), never the physical total_gpu_count. test-moe-mmid-workspace-plan pins the predicate;
+# this pins which count the call sites pass. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-mmid-owner-exposed-count-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mmid-owner-exposed-count-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-8ecj: a memory that holds one layer in two KV buffers (qwen4exp's llama_memory_hybrid_idx: attention K/V
 # and indexer keys) is budgeted and allocated buffer by buffer. The tiered allocator's backstop counts the buffer it is
 # allocating at its own layer sizes, not the plan's per-layer KV. A mutant per claim. Text only: no device, no model.

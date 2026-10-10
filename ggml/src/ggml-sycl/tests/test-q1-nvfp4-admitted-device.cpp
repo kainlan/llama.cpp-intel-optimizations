@@ -1,4 +1,10 @@
 // BUILD_TESTING-only live regression for the closed Q1/NVFP4 production MMID route.
+//
+// Scoring (llama.cpp-n8da): the registration pins one card, and on it the run must report Passed with Skipped=0. A skip
+// there is not an environment gap but a regression to read: SKIP[off-primary] means the plan moved a selected expert
+// off the primary card (to the host or another card), which the closed route cannot reach; SKIP[no-backend] means no
+// backend could be created for an owner device. Each skip line carries its tag so a log grep can tell them apart from
+// the no-GPU skip.
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "q1-nvfp4-production-route-test-seam.hpp"
 #include "ggml-quants.h"
@@ -24,9 +30,12 @@ constexpr int32_t route_selected_experts[route_top_k] = { 3, 1, 3 };  // repeate
 
 void require(bool condition, const char * message) { if (!condition) throw std::runtime_error(message); }
 
-// The environment cannot exercise what this test covers; main() reports it as ctest's skip (77), never as a pass.
+// The environment cannot exercise what this test covers; main() reports it as ctest's skip (77), never as a pass, on a
+// line prefixed SKIP[<tag>] so each cause stays distinguishable in a log.
 struct test_skip : std::runtime_error {
-    using std::runtime_error::runtime_error;
+    test_skip(const char * tag, const std::string & why) : std::runtime_error(why), tag(tag) {}
+
+    const char * tag;
 };
 
 struct synthetic_inventory {
@@ -112,12 +121,13 @@ struct lifecycle_fixture {
                     }
                     found = true;
                     if (!entry.on_device || entry.target_device != primary_device) {
-                        throw test_skip("selected expert " + std::to_string(expert) + " is planned on " +
-                                        (entry.on_device ? "device " + std::to_string(entry.target_device) :
-                                                           std::string("the host")) +
-                                        ", not primary device " + std::to_string(primary_device) +
-                                        "; the closed route covers primary residency only "
-                                        "(pin ONEAPI_DEVICE_SELECTOR to one card)");
+                        throw test_skip("off-primary",
+                                        "selected expert " + std::to_string(expert) + " is planned on " +
+                                            (entry.on_device ? "device " + std::to_string(entry.target_device) :
+                                                               std::string("the host")) +
+                                            ", not primary device " + std::to_string(primary_device) +
+                                            "; the closed route covers primary residency only "
+                                            "(pin ONEAPI_DEVICE_SELECTOR to one card)");
                     }
                 }
                 require(found, "selected expert has no gate placement entry in the candidate plan");
@@ -131,8 +141,8 @@ struct lifecycle_fixture {
                 using backend_owner = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
                 backend_owner retained(ggml_backend_sycl_init(device), &ggml_backend_free);
                 if (retained == nullptr) {
-                    throw test_skip("no backend for candidate owner device " + std::to_string(device) +
-                                    " (ggml_backend_sycl_init returned null)");
+                    throw test_skip("no-backend", "no backend for candidate owner device " + std::to_string(device) +
+                                                      " (ggml_backend_sycl_init returned null)");
                 }
                 retained_backends.push_back(retained.get());
                 if (!backend || device == primary_device) {
@@ -405,7 +415,7 @@ int main() {
         injected_async_terminal_failure_case();
         std::cout << "Q1/NVFP4 scoped production-route lifecycle: PASS\n"; return 0;
     } catch (const test_skip & e) {
-        std::cerr << "SKIP: " << e.what() << '\n';
+        std::cerr << "SKIP[" << e.tag << "]: " << e.what() << '\n';
         return LLAMA_TEST_EXIT_SKIP;
     } catch (const sycl::exception & e) {
         std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n';
