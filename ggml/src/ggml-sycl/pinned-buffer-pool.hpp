@@ -68,7 +68,11 @@ class PinnedBufferPool {
     //       any pending scatter at op entry, consumed or not, ahead of that D2H); and
     //   (2) the caller does not write the region (zero it, or let the CPU kernels fill it)
     //       until that activation D2H has completed.  Completing an event on an in-order queue
-    //       completes every earlier command on it, the H2D included.
+    //       completes every earlier command on it, the H2D included.  The CPU job's prologue
+    //       waits that D2H and then zeroes, on the pool worker (llama.cpp-z4kd); and
+    //   (3) a scatter flushed AFTER that D2H, which the D2H does not order, is ordered by the job
+    //       itself: moe_cpu_job_order_decide (moe-decode-hostpath.hpp) adds that flush's H2D events,
+    //       or a queue barrier, to the waits the prologue runs (llama.cpp-z4kd).
     // (1) covers a scatter left pending by an op that nothing consumed (up's, with gate next)
     // (llama.cpp-3bww).  The same flush also keeps the shared activation staging buffer safe: the
     // pending CPU workers read it directly and the next op's D2H rewrites it.  A caller that kept
@@ -78,7 +82,7 @@ class PinnedBufferPool {
     // The one such caller is the decode sibling slot (llama.cpp-yx28): up is issued while gate's
     // job is still pending, without a flush.  It is admitted only when up does no activation D2H
     // (it reuses gate's staging, unrewritten), no scatter was enqueued since that D2H, so (1)
-    // and (2) still hold through it, and reserve_peek() shows up's span disjoint from gate's.  Gate
+    // to (3) still hold through it, and reserve_peek() shows up's span disjoint from gate's.  Gate
     // keeps its own slice and staging until its scatter is flushed; see moe_sibling_pending_keep()
     // in moe-decode-hostpath.hpp.
     //
