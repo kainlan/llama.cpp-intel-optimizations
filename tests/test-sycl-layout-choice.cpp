@@ -844,7 +844,7 @@ static bool run_kv_context_room_is_cost_based_test() {
         printf("PASS: (a) a full context with p_hit 1/4 holds every layer's KV context room\n");
     }
 
-    // (e) No request: no room, whatever the cost parameters say. Six triplets fit what the dense weights and their KV
+    // (e) No request: no room, decided before any cost is weighed. Six triplets fit what the dense weights and their KV
     //     leave (2 x 1.75 MiB + 2 x 768 KiB = 5 MiB: six 768 KiB triplets). (b) compares against this plan's set.
     const auto none = ggml_sycl::compute_placement_plan(inventory(), budget, 0, moe(0, 1.0, 1), nullptr, n_experts);
     if (none.kv_context_reserve_bytes != 0 || none.kv_context_room_displaced_bytes != 0 || device_triplets(none) != 6) {
@@ -854,7 +854,7 @@ static bool run_kv_context_room_is_cost_based_test() {
             none.kv_context_reserve_bytes, none.kv_context_room_displaced_bytes, device_triplets(none));
         ok = false;
     } else {
-        printf("PASS: (e) with no requested context no KV context room is held, whatever the cost parameters\n");
+        printf("PASS: (e) with no requested context no KV context room is held before any cost is weighed\n");
     }
 
     // (b) GPT-OSS-shaped: a short chat in a large context. F = floor(4096 x 1 / 100) = 40 cells, so

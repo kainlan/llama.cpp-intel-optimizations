@@ -115,6 +115,8 @@ def ordered(text: str, *needles: str) -> bool:
 
 
 PLAN_SIG = "placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,"
+MULTI_PLAN_SIG = ("placement_plan compute_multi_device_plan(const std::vector<device_budget> & device_budgets, "
+                  "const std::vector<placement_tensor_info> & tensor_inventory,")
 ROOM_SIG = "static kv_context_room hold_kv_context_room(placement_plan & plan,"
 WEIGH_SIG = "static kv_context_room_cost weigh_kv_context_room(const placement_kv_info & kv_info,"
 ROOM_LOG_SIG = "static void log_kv_context_room(const kv_context_room & room,"
@@ -275,9 +277,10 @@ COPY_N_CTX = "g_placement_kv_info.n_ctx = inventory->n_ctx;"
 
 def claim_context_never_becomes_the_planning_n_ctx(cache: str, hpp: str, sycl: str) -> bool:
     """The requested context sizes the room and its cost only: no assignment carries it into an n_ctx (the planner's,
-    kv_info's, the oneDNN Graph-scratch floor's), so the load's planning shape keeps its own (llama.cpp-fkpg)."""
+    kv_info's, the oneDNN Graph-scratch floor's), so the load's planning shape keeps its own (llama.cpp-fkpg). The
+    needle takes any identifier that ends in n_ctx, so planner_n_ctx is covered in both plan builders."""
     texts = [norm(t) for t in (cache, hpp, sycl)]
-    leak = re.compile(r"\bn_ctx\s*=[^;=]*\bn_ctx_context\b")
+    leak = re.compile(r"\b\w*n_ctx\s*=[^;=]*\bn_ctx_context\b")
     return (all(leak.search(t) is None for t in texts) and PLANNER_N_CTX in body(texts[0], PLAN_SIG)
             and COPY_N_CTX in body(texts[2], FILL_SIG))
 
@@ -546,6 +549,16 @@ def test_mutant_planner_n_ctx_from_the_context_fails():
     mutant edits the single-device body only)."""
     n = norm(CACHE)
     b = body(n, PLAN_SIG)
+    assert b.count(PLANNER_N_CTX) == 1
+    mutant = n.replace(b, b.replace(PLANNER_N_CTX, "plan.planner_n_ctx = kv_info.n_ctx_context;"), 1)
+    assert not claim_context_never_becomes_the_planning_n_ctx(mutant, CACHE_HPP, SYCL)
+
+
+def test_mutant_multi_device_planner_n_ctx_from_the_context_fails():
+    """The multi-device plan's planning n_ctx taken from the request: the leak needle must reach an identifier that
+    only ends in n_ctx, since nothing else pins this site."""
+    n = norm(CACHE)
+    b = body(n, MULTI_PLAN_SIG)
     assert b.count(PLANNER_N_CTX) == 1
     mutant = n.replace(b, b.replace(PLANNER_N_CTX, "plan.planner_n_ctx = kv_info.n_ctx_context;"), 1)
     assert not claim_context_never_becomes_the_planning_n_ctx(mutant, CACHE_HPP, SYCL)
