@@ -1287,36 +1287,58 @@ static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_act
         return false;
     }
 
-    // The charge is the sum of every on-device layout the plan holds, so with no gate/up alternates it excludes any
-    // SOA copy of an XMX_TILED primary.
+    // The layout charge is the sum of every on-device layout the plan holds, so with no gate/up alternates it excludes
+    // any SOA copy of an XMX_TILED primary. It must equal weight_vram_bytes. vram_bytes is the single-device total:
+    // weights, KV, the KV context room, and the MoE MMID workspace device pool that account_moe_mmid_workspaces() adds
+    // after packing (reject_moe_mmid_workspaces() zeroes that pool when it does not fit the budget).
+    auto plan_vram_composition = [](const ggml_sycl::placement_plan & p) {
+        return p.weight_vram_bytes + p.kv_vram_bytes + p.kv_context_reserve_bytes + p.moe_mmid_device_pool_bytes;
+    };
     const size_t planned_charge = planned_weight_charge_for_device(plan, 0);
-    if (plan.weight_vram_bytes != planned_charge || plan.vram_bytes != planned_charge) {
-        printf("FAIL: route %s: planner under/over-counted MoE layout charge, plan weight=%zu vram=%zu actual=%zu\n",
-               route_name, plan.weight_vram_bytes, plan.vram_bytes, planned_charge);
+    if (plan.weight_vram_bytes != planned_charge || plan.vram_bytes != plan_vram_composition(plan)) {
+        printf(
+            "FAIL: route %s: planner under/over-counted MoE layout charge, plan weight=%zu actual=%zu; vram=%zu want "
+            "weight+kv=%zu+room=%zu+mmid=%zu\n",
+            route_name, plan.weight_vram_bytes, planned_charge, plan.vram_bytes, plan.kv_vram_bytes,
+            plan.kv_context_reserve_bytes, plan.moe_mmid_device_pool_bytes);
         return false;
     }
-    if (planned_charge > devices[0].vram_budget) {
+    // Positive control for the composition: with n_expert_used set and a roomy budget the MMID pool is planned and
+    // charged, so the vram term above is not vacuously equal to the weight term.
+    if (!plan.moe_mmid_workspace_valid || plan.moe_mmid_device_pool_bytes == 0) {
+        printf("FAIL: route %s: expected a charged MoE MMID workspace pool, valid=%d pool=%zu\n", route_name,
+               plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes);
+        return false;
+    }
+    if (plan.vram_bytes > devices[0].vram_budget) {
         printf("FAIL: route %s: planner charged beyond device budget, charged=%zu budget=%zu\n", route_name,
-               planned_charge, devices[0].vram_budget);
+               plan.vram_bytes, devices[0].vram_budget);
         return false;
     }
 
+    // One MiB short of the layout charge: the expert pack cannot hold every triplet, so the pack boundary is hit.
     const std::vector<ggml_sycl::device_budget> tight_devices = {
         { 0, planned_charge - mib, planned_charge - mib, 4.0, true },
     };
     auto tight_plan = ggml_sycl::compute_multi_device_plan(
         tight_devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info, nullptr, n_experts);
     const size_t tight_charge = planned_weight_charge_for_device(tight_plan, 0);
-    if (tight_plan.weight_vram_bytes != tight_charge || tight_plan.vram_bytes != tight_charge) {
+    if (tight_plan.weight_vram_bytes != tight_charge || tight_plan.vram_bytes != plan_vram_composition(tight_plan)) {
         printf(
-            "FAIL: route %s: tight-budget planner under/over-counted MoE layout charge, plan weight=%zu vram=%zu "
-            "actual=%zu\n",
-            route_name, tight_plan.weight_vram_bytes, tight_plan.vram_bytes, tight_charge);
+            "FAIL: route %s: tight-budget planner under/over-counted MoE layout charge, plan weight=%zu actual=%zu; "
+            "vram=%zu want weight+kv=%zu+room=%zu+mmid=%zu\n",
+            route_name, tight_plan.weight_vram_bytes, tight_charge, tight_plan.vram_bytes, tight_plan.kv_vram_bytes,
+            tight_plan.kv_context_reserve_bytes, tight_plan.moe_mmid_device_pool_bytes);
         return false;
     }
-    if (tight_charge > tight_devices[0].vram_budget) {
+    if (tight_charge >= planned_charge) {
+        printf("FAIL: route %s: tight budget did not reach the pack boundary, charged=%zu roomy=%zu\n", route_name,
+               tight_charge, planned_charge);
+        return false;
+    }
+    if (tight_plan.vram_bytes > tight_devices[0].vram_budget) {
         printf("FAIL: route %s: tight-budget planner exceeded budget, charged=%zu budget=%zu\n", route_name,
-               tight_charge, tight_devices[0].vram_budget);
+               tight_plan.vram_bytes, tight_devices[0].vram_budget);
         return false;
     }
 
