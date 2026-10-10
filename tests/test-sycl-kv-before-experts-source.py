@@ -19,7 +19,7 @@ The fix this gate pins:
     bytes of routed experts that budget places minus the ones the real pack places (a larger first-fit budget can
     take a larger triplet and then skip smaller ones the real pack did place, so counting only the triplets that fit
     it and not the real budget over-states the cost); the plan keeps that figure, and the room's line reports both
-    packs in MiB after the pack, as a WARN when the room cost experts; with no requested context it logs one INFO
+    packs in MB after the pack, as a WARN when the room cost experts; with no requested context it logs one INFO
     line saying no room is held;
   - the loader hands the backend that context (llama.cpp-ak0p): the one the caller is about to create
     (llama_model_params::n_ctx_hint, which common sets from -c and llama-bench from its test's context), padded the
@@ -218,7 +218,7 @@ ROOM_EMPTY = "if (room.wanted == 0) { return; }"
 
 
 def claim_room_line_is_visible_and_names_its_source(cache: str) -> bool:
-    """With no requested context the line says no room is held (INFO, one per device); otherwise it is in MiB, says
+    """With no requested context the line says no room is held (INFO, one per device); otherwise it is in MB, says
     the context is the requested one, and is a WARN whenever the room cost experts or could not hold all it wanted, so
     a default run shows it."""
     b = body(norm(cache), ROOM_LOG_SIG)
@@ -323,15 +323,18 @@ COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_para
 COMMON_HINT = "mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : 0;"
 COMMON_FIT = "common_fit_params(params.model.path.c_str(), &mparams, &cparams,"
 FIT_REFRESH = "mparams.n_ctx_hint = cparams.n_ctx;"
+COMMON_FIT_REFRESH = "if (params.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
 COMMON_LOAD = "llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);"
 
 
 def claim_common_hands_the_requested_context(common: str) -> bool:
-    """common passes -c as the hint (0, the training context, stays 0), and after a fit, which resolves a context of
-    0 and may shrink it, the hint is the context the fit chose, before the model loads."""
+    """common passes -c as the hint (0, the training context, stays 0). After a fit, which may shrink a requested
+    context, the hint is the context the fit chose, before the model loads; without -c the fit resolves the training
+    context and the hint stays 0, so no room is held (owner ruling, llama.cpp-ak0p)."""
     n = norm(common)
     b = body(n, COMMON_SIG)
-    return bool(b) and COMMON_HINT in b and ordered(n, COMMON_FIT, FIT_REFRESH, COMMON_LOAD)
+    return (bool(b) and COMMON_HINT in b and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD)
+            and n.count(FIT_REFRESH) == 1)
 
 
 BENCH_CTX = "uint32_t n_ctx() const { return n_prompt + n_gen + n_depth; }"
@@ -620,7 +623,12 @@ def test_mutant_common_drops_the_hint_fails():
 
 
 def test_mutant_common_fit_keeps_the_unfitted_hint_fails():
-    assert not claim_common_hands_the_requested_context(_once(COMMON, FIT_REFRESH, ""))
+    assert not claim_common_hands_the_requested_context(_once(COMMON, COMMON_FIT_REFRESH, ""))
+
+
+def test_mutant_common_fit_refresh_unguarded_fails():
+    """Restores the defect: without -c the fit's training context becomes the hint and reinstalls its room."""
+    assert not claim_common_hands_the_requested_context(_once(COMMON, COMMON_FIT_REFRESH, FIT_REFRESH))
 
 
 def test_mutant_bench_hint_drops_the_depth_fails():

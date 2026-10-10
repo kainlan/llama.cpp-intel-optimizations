@@ -1282,8 +1282,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 
-        // the fit resolves a context of 0 and may shrink it: the load plans for the context the fit chose
-        mparams.n_ctx_hint = cparams.n_ctx;
+        // a fit may shrink a requested context: the load then plans for the context the fit chose. Without -c the fit
+        // resolves the training context, and the hint stays 0: no room is held for a context nobody asked for (owner
+        // ruling, llama.cpp-ak0p).
+        if (params.n_ctx > 0) {
+            mparams.n_ctx_hint = cparams.n_ctx;
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
