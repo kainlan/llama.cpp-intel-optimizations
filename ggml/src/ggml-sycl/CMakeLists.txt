@@ -52,7 +52,9 @@ endif()
 
 option(GGML_SYCL_MMQ_XMX "Enable experimental XMX MMQ kernels for SYCL backend" OFF)
 option(GGML_SYCL_XMX_GEMM "Enable experimental XMX GEMM for quantized matmul (known to be slower)" OFF)
-option(GGML_SYCL_MMQ_ESIMD "Build the opt-in ESIMD Q4_0 mmq kernels (GGML_SYCL_MMQ_ESIMD=<n> at runtime). OFF by default: ocloc 26.35.39758.11 / IGC 2.41.9 segfault compiling them (llama.cpp-xtvl)" OFF)
+# Runtime selector is GGML_SYCL_MMQ_ESIMD=<n>. Default OFF: ocloc 26.35.39758.11 / IGC 2.41.9 segfault compiling
+# these kernels (llama.cpp-xtvl); see the block that consumes the option below.
+option(GGML_SYCL_MMQ_ESIMD "Build the opt-in ESIMD Q4_0 mmq kernels" OFF)
 option(GGML_SYCL_DEBUG_SOA_LAYOUT "Enable SoA layout verification debug checks" OFF)
 option(GGML_SYCL_QUANTIZER_DEBUG "Enable quantizer kernel debug output" OFF)
 option(GGML_SYCL_ASAN_PARTIAL "Enable ASan for ggml-sycl.cpp and unified-cache.cpp only" OFF)

@@ -956,7 +956,7 @@ inline bool mmq_esimd_available() {
     return true;
 }
 
-#else  // !SYCL_ESIMD_MMQ_AVAILABLE
+#else   // !SYCL_ESIMD_MMQ_AVAILABLE
 
 // Stub implementations when the ESIMD kernels are not compiled in. Every symbol mmq.cpp calls is
 // declared here with the real signature, so the dispatch site compiles unchanged.
