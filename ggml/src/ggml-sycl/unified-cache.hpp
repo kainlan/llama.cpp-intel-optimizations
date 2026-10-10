@@ -648,7 +648,8 @@ struct placement_kv_info {
     // displaces: the host would read the layer's KV at ctx_fill_pct percent of n_ctx_context at host_attn_gbps, and
     // the displaced experts would be read at cpu_expert_gbps, each with probability n_expert_used / n_expert. The
     // backend fills all three once, where it copies the inventory in, from GGML_SYCL_PLAN_CTX_FILL_PCT,
-    // GGML_SYCL_PLAN_HOST_ATTN_GBPS and GGML_SYCL_PLAN_CPU_EXPERT_GBPS; a test sets them directly. All three > 0.
+    // GGML_SYCL_PLAN_HOST_ATTN_GBPS and GGML_SYCL_PLAN_CPU_EXPERT_GBPS; a test sets them directly. The two rates must
+    // be finite and > 0 (the planner asserts it, since each divides); the fill is clamped to [0, 100] where it is used.
     double                ctx_fill_pct     = PLACEMENT_CTX_FILL_PCT_DEFAULT;
     double                host_attn_gbps   = PLACEMENT_HOST_ATTN_GBPS_DEFAULT;
     double                cpu_expert_gbps  = PLACEMENT_CPU_EXPERT_GBPS_DEFAULT;

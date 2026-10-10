@@ -8,20 +8,23 @@ Why: with the room always held, GPT-OSS 20B on the B50 at its full requested con
 
 The fix this gate pins:
   - hold_kv_context_room decides each device layer's room on its own, in the order the runtime demotes KV layers
-    (plan_runtime_kv_demotion: full attention latest first, then SWA latest first), so a refused room is what that
-    demotion would move;
+    (plan_runtime_kv_demotion: full attention latest first, then SWA latest first, read from kv-runtime-demotion.cpp);
+    the order picks only the deciding layer the line reports, not what is held;
   - a layer's room is held iff A > B, per decode token:
       A = host attention    = the layer's KV at F cells / host_attn_gbps, F = n_ctx_context x ctx_fill_pct / 100
       B = displaced experts = the layer's room x n_expert_used / n_expert / cpu_expert_gbps
-    and a dense model (no expert to displace) holds its room as before;
+    and a dense model (no expert to displace) holds its room as before; both rates are asserted finite and positive
+    before they divide, so a zero cannot refuse a room through a NaN;
   - with no requested context (n_ctx_context 0) it returns before weighing anything;
   - the three parameters are placement_kv_info fields, filled once where the backend copies the inventory in, from
     GGML_SYCL_PLAN_CTX_FILL_PCT / GGML_SYCL_PLAN_HOST_ATTN_GBPS / GGML_SYCL_PLAN_CPU_EXPERT_GBPS (defaults 50 / 30 /
     40, a nonsense value keeps the default, a fill above 100 is 100), and catalogued in docs/backend/sycl-env-vars.md;
+    no other C/C++ source of the backend names them;
   - under this cost every full-attention layer decides alike (its KV per cell cancels out of A/B), so only a SWA
     layer can differ; the room's line therefore states the decision per attention class ("held all N full-attention
     layer(s)" / "refused all N full-attention layer(s) by cost", and the same for SWA) and gives the deciding layer's A
-    and B in microseconds per token with the three parameters; a fully refused room logs one WARN saying so;
+    and B in microseconds per token with the three parameters, and the refused bytes only when a layer was refused;
+    a fully refused room logs one WARN saying so;
   - the requested context still never becomes the planning n_ctx (llama.cpp-fkpg c-sc3u).
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
@@ -67,10 +70,23 @@ def read(rel: str) -> str:
     return (ROOT / rel).read_text()
 
 
-CACHE = read("ggml/src/ggml-sycl/unified-cache.cpp")
-CACHE_HPP = read("ggml/src/ggml-sycl/unified-cache.hpp")
-SYCL = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
+CACHE_REL = "ggml/src/ggml-sycl/unified-cache.cpp"
+CACHE_HPP_REL = "ggml/src/ggml-sycl/unified-cache.hpp"
+SYCL_REL = "ggml/src/ggml-sycl/ggml-sycl.cpp"
+FATTN_REL = "ggml/src/ggml-sycl/fattn.cpp"
+DEMOTION_REL = "ggml/src/ggml-sycl/kv-runtime-demotion.cpp"
+
+CACHE = read(CACHE_REL)
+CACHE_HPP = read(CACHE_HPP_REL)
+SYCL = read(SYCL_REL)
+DEMOTION = read(DEMOTION_REL)
 DOC = read("docs/backend/sycl-env-vars.md")
+# Every C/C++ source of the SYCL backend, by path from the repository root: where a second reader would hide.
+SYCL_TREE = {
+    p.relative_to(ROOT).as_posix(): p.read_text(errors="replace")
+    for p in sorted((ROOT / "ggml/src/ggml-sycl").rglob("*"))
+    if p.is_file() and p.suffix in (".c", ".cpp", ".h", ".hpp")
+}
 
 
 def body(text: str, signature: str) -> str:
@@ -174,16 +190,19 @@ def claim_params_are_documented(doc: str, hpp: str) -> bool:
     return True
 
 
-def claim_fill_site_reads_each_once(sycl: str, cache: str, hpp: str) -> bool:
+def claim_fill_site_reads_each_once(tree: dict[str, str]) -> bool:
     """The backend reads each variable once, where it copies the inventory into its KV inputs, right after the
-    requested context; nothing else reads them."""
-    s = norm(sycl)
+    requested context; nothing else reads them. Every C/C++ source of the backend is scanned (comments stripped): the
+    name occurs once in ggml-sycl.cpp, in that site, and in no other file."""
+    if not all(rel in tree for rel in (SYCL_REL, CACHE_REL, CACHE_HPP_REL)):
+        return False
+    s = norm(tree[SYCL_REL])
     site = body(s, FILL_SIG)
-    others = norm(cache) + norm(hpp)
+    others = [norm(text) for rel, text in tree.items() if rel != SYCL_REL]
     if not site:
         return False
     for name in PARAMS:
-        if s.count(f'"{name}"') != 1 or name in others:
+        if s.count(name) != 1 or any(name in text for text in others):
             return False
         if not ordered(site, COPY_CTX, fill(name)):
             return False
@@ -205,6 +224,8 @@ def claim_nonsense_keeps_the_default(sycl: str) -> bool:
 # ---- the decision ---------------------------------------------------------------------------------------------------
 
 
+HOST_GUARD = "GGML_ASSERT(std::isfinite(kv_info.host_attn_gbps) && kv_info.host_attn_gbps > 0.0);"
+CPU_GUARD = "GGML_ASSERT(std::isfinite(kv_info.cpu_expert_gbps) && kv_info.cpu_expert_gbps > 0.0);"
 FILLED = ("const uint32_t filled = static_cast<uint32_t>(static_cast<double>(kv_info.n_ctx_context) * "
           "std::clamp(kv_info.ctx_fill_pct, 0.0, 100.0) / 100.0);")
 HOST_READ = "const size_t host_read = kv_info.kv_bytes_for_layer_at(static_cast<uint32_t>(layer_id), filled);"
@@ -217,9 +238,11 @@ HOLD_IFF = "cost.held = !moe || cost.host_attn_us > cost.expert_us;"
 
 def claim_room_weighs_attention_against_experts(cache: str) -> bool:
     """A = the layer's KV at the expected fill, read at the host-attention rate; B = the layer's room times the chance
-    a token uses a displaced expert, read at the CPU expert rate; held iff A > B, or always for a dense model."""
+    a token uses a displaced expert, read at the CPU expert rate; held iff A > B, or always for a dense model. Both
+    rates are asserted finite and positive before anything is weighed, as the fill is clamped: a zero rate would make
+    A or B inf or NaN, and NaN > B is false, so the room would be refused without a word."""
     b = body(norm(cache), WEIGH_SIG)
-    return bool(b) and ordered(b, FILLED, HOST_READ, MOE, P_HIT, A_US, B_US, HOLD_IFF)
+    return bool(b) and ordered(b, HOST_GUARD, CPU_GUARD, FILLED, HOST_READ, MOE, P_HIT, A_US, B_US, HOLD_IFF)
 
 
 WEIGH_CALL = "const kv_context_room_cost cost = weigh_kv_context_room(kv_info, layer_id, extra, n_experts);"
@@ -256,9 +279,27 @@ PASS_FILTER = "if (kv_info.is_swa_layer(layer_id) != swa_pass) { continue; }"
 
 def claim_decision_iterates_latest_first(cache: str) -> bool:
     """The device layers are weighed in the runtime's demotion order: full attention latest first, then SWA latest
-    first."""
+    first. The order picks only the deciding layer the line reports; the runtime's own order is pinned at its owner by
+    claim_runtime_demotes_full_then_swa_latest_first."""
     b = body(norm(cache), ROOM_SIG)
     return bool(b) and ordered(b, DEVICE_LAYERS, SORT, PASSES, LATEST_FIRST, PASS_FILTER, WEIGH_CALL)
+
+
+DEMOTE_SIG = "kv_demotion_result plan_runtime_kv_demotion(const kv_demotion_input & in)"
+DEMOTE_PASS = "auto demote_pass = [&](bool swa_pass) {"
+DEMOTE_LATEST_FIRST = "for (int l = n_layers - 1; l >= 0; --l) {"
+DEMOTE_FILTER = "if (is_swa != swa_pass) { continue; }"
+DEMOTE_FULL = "demote_pass(false);"
+DEMOTE_SWA = "demote_pass(true);"
+
+
+def claim_runtime_demotes_full_then_swa_latest_first(demotion: str) -> bool:
+    """The order the planner's loop, its comment and the catalog row name is the runtime's own: plan_runtime_kv_demotion
+    demotes full-attention layers latest first, then SWA layers latest first. Read from its owner, so a change there
+    turns this red instead of leaving the planner describing an order nothing follows."""
+    b = body(norm(demotion), DEMOTE_SIG)
+    return (bool(b) and b.count(DEMOTE_FULL) == 1 and b.count(DEMOTE_SWA) == 1
+            and ordered(b, DEMOTE_PASS, DEMOTE_LATEST_FIRST, DEMOTE_FILTER, DEMOTE_FULL, DEMOTE_SWA))
 
 
 NO_REQUEST = "kv_context_room room; if (kv_info.n_ctx_context == 0) { return room; }"
@@ -296,7 +337,11 @@ FULL_SUMMARY = ('const std::string full = kv_context_room_class_summary(room.n_h
                 'room.n_layers - room.n_swa_layers, "full-attention");')
 SWA_SUMMARY = 'const std::string swa = kv_context_room_class_summary(room.n_swa_held, room.n_swa_layers, "SWA");'
 DECISION = "[PLACEMENT] KV context room on device %d: %s, %s"
-DECISION_ARGS = "device_id, full.c_str(), swa.c_str(), room.refused / mb,"
+DECISION_ARGS = "device_id, full.c_str(), swa.c_str(),"
+REFUSED_NOTE = ('char refused_note[64] = ""; if (room.refused > 0) { snprintf(refused_note, sizeof(refused_note), '
+                '" (%.1f MB refused by cost)", room.refused / mb); }')
+REFUSED_SLOT = "[PLACEMENT] KV context room on device %d: %s, %s%s; held %.1f MB of %.1f MB"
+REFUSED_ARGS = "device_id, full.c_str(), swa.c_str(), refused_note, room.held / mb, room.wanted / mb,"
 COSTS = ("host attention %.1f us/token vs displaced experts %.1f us/token (fill %.4g%%, host-attn %.4g GB/s, "
          "cpu-expert %.4g GB/s)")
 COST_ARGS = ("room.decision.host_attn_us, room.decision.expert_us, kv_info.ctx_fill_pct, kv_info.host_attn_gbps, "
@@ -312,7 +357,7 @@ def claim_room_line_states_the_decision(cache: str) -> bool:
     all N" for the full-attention layers, which decide alike), and give the deciding layer's A and B in microseconds
     per token with the three parameters; a fully refused room is one WARN saying every room was refused and that the
     runtime re-places the overflow; otherwise the line is a WARN whenever the room cost experts, could not hold all it
-    wanted, or refused a layer."""
+    wanted, or refused a layer, and gives the refused bytes in parentheses only when a layer was refused."""
     n = norm(cache)
     b = body(n, ROOM_LOG_SIG)
     summary = body(n, SUMMARY_SIG)
@@ -329,6 +374,7 @@ def claim_room_line_states_the_decision(cache: str) -> bool:
             and all(s in refused
                     for s in (DECISION, DECISION_ARGS, COSTS, COST_ARGS, TAIL, "return;") + ALL_REFUSED_SAYS)
             and all(s in rest for s in (DECISION, DECISION_ARGS, COSTS, COST_ARGS, TAIL, WARN))
+            and ordered(rest, REFUSED_NOTE, REFUSED_SLOT, REFUSED_ARGS)
             and "ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO," in rest)
 
 
@@ -341,7 +387,7 @@ def test_params_are_documented():
 
 
 def test_fill_site_reads_each_once():
-    assert claim_fill_site_reads_each_once(SYCL, CACHE, CACHE_HPP)
+    assert claim_fill_site_reads_each_once(SYCL_TREE)
 
 
 def test_nonsense_keeps_the_default():
@@ -358,6 +404,10 @@ def test_room_holds_only_the_layers_that_pass():
 
 def test_decision_iterates_latest_first():
     assert claim_decision_iterates_latest_first(CACHE)
+
+
+def test_runtime_demotes_full_then_swa_latest_first():
+    assert claim_runtime_demotes_full_then_swa_latest_first(DEMOTION)
 
 
 def test_no_request_returns_before_any_cost():
@@ -422,22 +472,36 @@ def test_mutant_doc_row_without_source_fails():
                                            CACHE_HPP)
 
 
+def _tree_with(rel: str, text: str) -> dict[str, str]:
+    """The backend's sources with the file at `rel` replaced by `text`."""
+    assert rel in SYCL_TREE, f"mutant target must be a scanned source: {rel}"
+    tree = dict(SYCL_TREE)
+    tree[rel] = text
+    return tree
+
+
 def test_mutant_second_reader_fails():
     """The planner reads a variable itself as well: two sources for one parameter."""
     mutant = CACHE + '\nstatic const char * g_w013_mutant = std::getenv("GGML_SYCL_PLAN_HOST_ATTN_GBPS");\n'
-    assert not claim_fill_site_reads_each_once(SYCL, mutant, CACHE_HPP)
+    assert not claim_fill_site_reads_each_once(_tree_with(CACHE_REL, mutant))
+
+
+def test_mutant_reader_in_another_tu_fails():
+    """The flash-attention TU reads a variable too: a reader outside the planner's own files is still a second
+    source."""
+    mutant = SYCL_TREE[FATTN_REL] + '\nstatic const char * g_w013_mutant = std::getenv("GGML_SYCL_PLAN_CTX_FILL_PCT");\n'
+    assert not claim_fill_site_reads_each_once(_tree_with(FATTN_REL, mutant))
 
 
 def test_mutant_fill_site_drops_a_param_fails():
-    assert not claim_fill_site_reads_each_once(
-        _once(SYCL, fill("GGML_SYCL_PLAN_CPU_EXPERT_GBPS"), ""), CACHE, CACHE_HPP)
+    assert not claim_fill_site_reads_each_once(_tree_with(SYCL_REL, _once(SYCL, fill("GGML_SYCL_PLAN_CPU_EXPERT_GBPS"), "")))
 
 
 def test_mutant_fill_unclamped_fails():
     """A fill above 100% would expect more cells filled than the context has."""
     assert not claim_fill_site_reads_each_once(
-        _once(SYCL, fill("GGML_SYCL_PLAN_CTX_FILL_PCT"),
-              fill("GGML_SYCL_PLAN_CTX_FILL_PCT").replace("100.0);", NO_DOUBLE_MAX + ");")), CACHE, CACHE_HPP)
+        _tree_with(SYCL_REL, _once(SYCL, fill("GGML_SYCL_PLAN_CTX_FILL_PCT"),
+                                   fill("GGML_SYCL_PLAN_CTX_FILL_PCT").replace("100.0);", NO_DOUBLE_MAX + ");"))))
 
 
 def test_mutant_param_read_before_the_context_fails():
@@ -446,7 +510,7 @@ def test_mutant_param_read_before_the_context_fails():
     n = _once(SYCL, fill("GGML_SYCL_PLAN_HOST_ATTN_GBPS"), "")
     assert n.count(COPY_CTX) == 1
     mutant = n.replace(COPY_CTX, fill("GGML_SYCL_PLAN_HOST_ATTN_GBPS") + " " + COPY_CTX, 1)
-    assert not claim_fill_site_reads_each_once(mutant, CACHE, CACHE_HPP)
+    assert not claim_fill_site_reads_each_once(_tree_with(SYCL_REL, mutant))
 
 
 def test_mutant_zero_accepted_fails():
@@ -471,6 +535,16 @@ def test_mutant_garbage_accepted_fails():
 
 def test_mutant_no_bound_fails():
     assert not claim_nonsense_keeps_the_default(_param_mutant(PARSE_CLAMP, "return value;"))
+
+
+def test_mutant_host_rate_unguarded_fails():
+    """A test that sets host_attn_gbps to 0 would refuse every MoE room through a NaN instead of stopping."""
+    assert not claim_room_weighs_attention_against_experts(_once(CACHE, HOST_GUARD, ""))
+
+
+def test_mutant_cpu_rate_zero_admitted_fails():
+    assert not claim_room_weighs_attention_against_experts(
+        _once(CACHE, CPU_GUARD, CPU_GUARD.replace("cpu_expert_gbps > 0.0", "cpu_expert_gbps >= 0.0")))
 
 
 def test_mutant_host_read_undivided_fails():
@@ -539,6 +613,18 @@ def test_mutant_unsorted_fails():
     assert not claim_decision_iterates_latest_first(_once(CACHE, SORT, ""))
 
 
+def test_mutant_runtime_demotes_earliest_first_fails():
+    assert not claim_runtime_demotes_full_then_swa_latest_first(
+        _once(DEMOTION, DEMOTE_LATEST_FIRST, "for (int l = 0; l < n_layers; ++l) {"))
+
+
+def test_mutant_runtime_demotes_swa_first_fails():
+    n = norm(DEMOTION)
+    assert n.count(DEMOTE_FULL) == 1 and n.count(DEMOTE_SWA) == 1
+    mutant = n.replace(DEMOTE_FULL, "@@").replace(DEMOTE_SWA, DEMOTE_FULL).replace("@@", DEMOTE_SWA)
+    assert not claim_runtime_demotes_full_then_swa_latest_first(mutant)
+
+
 def test_mutant_no_early_return_fails():
     assert not claim_no_request_returns_before_any_cost(
         _once(CACHE, NO_REQUEST, "kv_context_room room;"))
@@ -598,9 +684,16 @@ def test_mutant_line_drops_the_parameters_fails():
 def test_mutant_line_drops_the_decision_fails():
     n = norm(CACHE)
     assert n.count(DECISION) == 2 and n.count(DECISION_ARGS) == 2
-    mutant = n.replace(DECISION, "[PLACEMENT] KV context room on device %d").replace(DECISION_ARGS,
-                                                                                 "device_id, room.refused / mb,")
+    mutant = n.replace(DECISION, "[PLACEMENT] KV context room on device %d").replace(DECISION_ARGS, "device_id,")
     assert not claim_room_line_states_the_decision(mutant)
+
+
+def test_mutant_refused_note_always_printed_fails():
+    """The parenthetical printed whatever was refused: a room held whole would read "(0.0 MB refused by cost)"."""
+    unconditional = ('snprintf(refused_note, sizeof(refused_note), " (%.1f MB refused by cost)", '
+                     'room.refused / mb);')
+    assert not claim_room_line_states_the_decision(
+        _once(CACHE, REFUSED_NOTE, 'char refused_note[64] = ""; ' + unconditional))
 
 
 def test_mutant_full_summary_counts_every_layer_fails():

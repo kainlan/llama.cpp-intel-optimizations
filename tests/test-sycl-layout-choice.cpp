@@ -825,6 +825,7 @@ static std::vector<std::pair<int, int>> device_triplet_set(const ggml_sycl::plac
 static bool run_kv_context_room_is_cost_based_test() {
     using namespace kv_cost_case;
     bool ok = true;
+    // The sub-cases run a, e, b, c, d, f: (b) compares against the triplet set (e) plans, so (e) runs before it.
 
     // (a) Qwen-shaped: the context is expected full and a token uses few experts. F = 4096 cells, so
     //     A = 4096 x 512 B / 30 GB/s = 69.9 us and B = 1.75 MiB x 1/4 / 40 GB/s = 11.5 us on each layer: A > B, both
@@ -922,6 +923,32 @@ static bool run_kv_context_room_is_cost_based_test() {
         ok = false;
     } else {
         printf("PASS: (d) a dense model holds every layer's KV context room, even at a zero expected fill\n");
+    }
+
+    // (f) The SWA window caps the host read, and the cap decides. Fill 100%: F = 4096 cells, past layer 0's window of
+    //     1536; p_hit 4/4; the host reads at 80 GB/s. Layer 1 (FULL): A = 4096 x 512 B / 80 GB/s = 26.2 us against
+    //     B = 1.75 MiB x 1 / 40 GB/s = 45.9 us: refused. Layer 0 (SWA): the host reads min(4096, 1536) = 1536 cells,
+    //     so A = 1536 x 512 B / 80 GB/s = 9.8 us against B = 512 KiB x 1 / 40 GB/s = 13.1 us: refused. Read uncapped,
+    //     A would be 26.2 us and the SWA room held (512 KiB, four triplets, one displaced, as in (c)). With (c)'s
+    //     budget and nothing held, the experts get 512 KiB + 1.75 MiB + 1.5 MiB = 3.75 MiB: five 768 KiB triplets.
+    ggml_sycl::placement_kv_info capped_kv = swa_then_full(4096, 100.0, n_experts);
+    capped_kv.host_attn_gbps               = 80.0;
+    if (capped_kv.kv_bytes_for_layer_at(0, 4096) != 1536 * cell_bytes) {
+        printf("FAIL: (f) the fixture's SWA layer reads %zu bytes at 4096 cells, want %zu (its 1536-cell window)\n",
+               capped_kv.kv_bytes_for_layer_at(0, 4096), 1536 * cell_bytes);
+        ok = false;
+    }
+    const auto capped = ggml_sycl::compute_placement_plan(inventory(), mixed_budget, 0, capped_kv, nullptr, n_experts);
+    if (capped.kv_context_reserve_bytes != 0 || device_triplets(capped) != 5 ||
+        capped.kv_context_room_displaced_bytes != 0 || capped.get_kv_device(0) != 0 || capped.get_kv_device(1) != 0) {
+        printf(
+            "FAIL: (f) past its window a SWA layer's room is refused by the capped read: held %zu (want 0; read "
+            "uncapped it would be %zu), %zu device triplets (want 5), displaced %zu (want 0), kv %d/%d (want 0/0)\n",
+            capped.kv_context_reserve_bytes, swa_room, device_triplets(capped), capped.kv_context_room_displaced_bytes,
+            capped.get_kv_device(0), capped.get_kv_device(1));
+        ok = false;
+    } else {
+        printf("PASS: (f) past its window a SWA layer's host read is capped, so its KV context room is refused\n");
     }
     return ok;
 }

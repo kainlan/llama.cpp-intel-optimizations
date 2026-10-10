@@ -30999,6 +30999,11 @@ static kv_context_room_cost weigh_kv_context_room(const placement_kv_info & kv_i
                                                   int                       layer_id,
                                                   size_t                    extra,
                                                   int                       n_experts) {
+    // Both rates divide, so each must be finite and positive: a zero would make A or B inf or NaN, and NaN > B is
+    // false, so the room would be refused without a word. The backend's parser keeps its default for such a value; a
+    // test that sets the fields directly must do the same.
+    GGML_ASSERT(std::isfinite(kv_info.host_attn_gbps) && kv_info.host_attn_gbps > 0.0);
+    GGML_ASSERT(std::isfinite(kv_info.cpu_expert_gbps) && kv_info.cpu_expert_gbps > 0.0);
     kv_context_room_cost cost;
     cost.layer_id            = layer_id;
     const uint32_t filled    = static_cast<uint32_t>(static_cast<double>(kv_info.n_ctx_context) *
@@ -31023,10 +31028,11 @@ static kv_context_room hold_kv_context_room(placement_plan &          plan,
     }
     // Under this cost every full-attention layer decides alike: its KV per cell is in both A (F cells read) and B (a
     // room of n_ctx_context - n_ctx cells), so it cancels, and the full-attention layers are all held or all refused.
-    // Only a SWA layer, whose room and host read are both capped by its window, can decide otherwise. The layers are
-    // still weighed one by one, in the order the runtime demotes KV when a context does not fit
-    // (plan_runtime_kv_demotion, kv-runtime-demotion.cpp: full attention latest first, then SWA latest first): that is
-    // what the runtime moves, and the loop stays right once a per-layer term (a frequency-weighted p_hit) appears.
+    // Only a SWA layer, whose room and host read are both capped by its window, can decide otherwise. Each layer is
+    // decided on its own and the bound below applies to their sum, so what is held does not depend on the order. The
+    // order is the runtime's KV demotion order (plan_runtime_kv_demotion, kv-runtime-demotion.cpp: full attention
+    // latest first, then SWA latest first; the source gate reads it there), and it only picks the deciding layer the
+    // line reports: the first refused, else the first held.
     std::vector<int> layers;
     for (const auto & [layer_id, owner] : plan.kv_device) {
         if (layer_id >= 0 && owner == device_id) {
@@ -31118,18 +31124,22 @@ static void log_kv_context_room(const kv_context_room & room, const placement_kv
             kv_info.host_attn_gbps, kv_info.cpu_expert_gbps);
         return;
     }
+    char refused_note[64] = "";  // the refused bytes only when a layer was refused
+    if (room.refused > 0) {
+        snprintf(refused_note, sizeof(refused_note), " (%.1f MB refused by cost)", room.refused / mb);
+    }
     const bool   warn       = room.displaced_bytes() > 0 || room.held < room.wanted || room.n_refused > 0;
     const char * short_note = room.held < room.wanted ? ", all that was left; the context's overflow is re-placed" : "";
     // ggml_log_internal, not the GGML_LOG_* macros, so the level is chosen at run time and the arguments are written
     // once.
     ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
-                      "[PLACEMENT] KV context room on device %d: %s, %s (%.1f MB refused by cost); "
+                      "[PLACEMENT] KV context room on device %d: %s, %s%s; "
                       "held %.1f MB of %.1f MB for n_ctx_context=%u over planner n_ctx=%u, before the "
                       "routed experts%s; deciding layer %d %s: host attention %.1f us/token vs displaced experts "
                       "%.1f us/token (fill %.4g%%, host-attn %.4g GB/s, cpu-expert %.4g GB/s); it cost %.1f MB of "
                       "device-resident routed experts: %.1f MB (%zu triplet(s)) on the device, against %.1f MB (%zu) "
                       "with the room added back. n_ctx_context is the requested n_ctx.\n",
-                      device_id, full.c_str(), swa.c_str(), room.refused / mb, room.held / mb, room.wanted / mb,
+                      device_id, full.c_str(), swa.c_str(), refused_note, room.held / mb, room.wanted / mb,
                       kv_info.n_ctx_context, kv_info.n_ctx, short_note, room.decision.layer_id,
                       room.decision.held ? "held" : "refused", room.decision.host_attn_us, room.decision.expert_us,
                       kv_info.ctx_fill_pct, kv_info.host_attn_gbps, kv_info.cpu_expert_gbps,
