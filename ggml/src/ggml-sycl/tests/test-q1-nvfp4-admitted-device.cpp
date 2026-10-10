@@ -30,6 +30,32 @@ constexpr int32_t route_selected_experts[route_top_k] = { 3, 1, 3 };  // repeate
 
 void require(bool condition, const char * message) { if (!condition) throw std::runtime_error(message); }
 
+// How far the route got since a case started, in stage order. `candidate` counts at the direct gate after the batch
+// query offered the DIRECT recipe; `executed` counts in the host task that runs after the kernel completed. The first
+// stage whose delta is short of the expected count names the blocker (llama.cpp-1sxq).
+std::string stage_counters(const ggml_sycl_q1_nvfp4_test_counters & before,
+                           const ggml_sycl_q1_nvfp4_test_counters & now) {
+    const auto delta = [](uint64_t from, uint64_t to) {
+        return std::to_string(to - from);
+    };
+    return " stages since case start: candidate=+" + delta(before.candidate, now.candidate) + " admitted=+" +
+           delta(before.admit, now.admit) + " submitted=+" + delta(before.submit, now.submit) + " executed=+" +
+           delta(before.terminal, now.terminal) + " recycled=+" + delta(before.recycle, now.recycle) +
+           " quarantined=+" + delta(before.quarantine, now.quarantine);
+}
+
+[[noreturn]] void fail_stages(const std::string & message, const ggml_sycl_q1_nvfp4_test_counters & before) {
+    ggml_sycl_q1_nvfp4_test_counters now{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&now);
+    throw std::runtime_error(message + ";" + stage_counters(before, now));
+}
+
+void require_stages(bool condition, const std::string & message, const ggml_sycl_q1_nvfp4_test_counters & before) {
+    if (!condition) {
+        fail_stages(message, before);
+    }
+}
+
 // The environment cannot exercise what this test covers; main() reports it as ctest's skip (77), never as a pass, on a
 // line prefixed SKIP[<tag>] so each cause stays distinguishable in a log.
 struct test_skip : std::runtime_error {
@@ -306,13 +332,20 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
 void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11) {
     std::vector<float> oracle; size_t count = 0; auto c = make_graph(life.backend, type, ne11, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, first{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    const std::string where = std::string(" (type=") + ggml_type_name(type) + " ne11=" + std::to_string(ne11);
     for (int pass = 0; pass < 2; ++pass) {
-        require(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS, "production graph compute failed");
+        const std::string at = where + " pass=" + std::to_string(pass) + ")";
+        require_stages(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
+                       "production graph compute failed" + at, before);
         ggml_backend_synchronize(life.backend);
         std::vector<float> got(count); ggml_backend_tensor_get(c.out, got.data(), 0, count * sizeof(float));
         for (size_t i = 0; i < count; ++i) {
             const float tolerance = 0.08f * (1.0f + std::fabs(oracle[i]));
-            require(std::isfinite(got[i]) && std::fabs(got[i] - oracle[i]) <= tolerance, "CPU oracle mismatch");
+            if (!std::isfinite(got[i]) || std::fabs(got[i] - oracle[i]) > tolerance) {
+                fail_stages("CPU oracle mismatch" + at + " at " + std::to_string(i) + ": got " +
+                                std::to_string(got[i]) + ", expected " + std::to_string(oracle[i]),
+                            before);
+            }
         }
         if (pass == 0) ggml_sycl_q1_nvfp4_test_counters_read(&first);
     }
@@ -370,19 +403,21 @@ void injected_failure_case(ggml_sycl_q1_nvfp4_test_failure failure, bool expect_
     auto c = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
     ggml_sycl_q1_nvfp4_test_failure_once(failure);
-    require(ggml_backend_graph_compute(life.backend, c.graph) != GGML_STATUS_SUCCESS, "injected failure was not reported");
+    require_stages(ggml_backend_graph_compute(life.backend, c.graph) != GGML_STATUS_SUCCESS,
+                   "injected failure was not reported", before);
     ggml_sycl_execution_snapshot state{};
     require(ggml_backend_sycl_execution_context_extract(life.context, &state) == GGML_SYCL_EXECUTION_OK,
             "failure context snapshot unavailable");
     require(state.graph_state == GGML_SYCL_EXECUTION_GRAPH_QUARANTINED ||
             state.graph_state == GGML_SYCL_EXECUTION_GRAPH_RETIRED, "failure graph was not terminal/quarantined");
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
-    require(after.failure_consumed == before.failure_consumed + 1, "failpoint was not consumed exactly once");
-    require(after.candidate == before.candidate + 1 && after.admit == before.admit + 1,
-            "failure admission deltas were not exact");
-    require(after.submit == before.submit, "injected failure reached kernel submit");
-    require(after.quarantine == before.quarantine + (expect_quarantine ? 1 : 0),
-            "failure quarantine delta was not exact");
+    require_stages(after.failure_consumed == before.failure_consumed + 1, "failpoint was not consumed exactly once",
+                   before);
+    require_stages(after.candidate == before.candidate + 1 && after.admit == before.admit + 1,
+                   "failure admission deltas were not exact", before);
+    require_stages(after.submit == before.submit, "injected failure reached kernel submit", before);
+    require_stages(after.quarantine == before.quarantine + (expect_quarantine ? 1 : 0),
+                   "failure quarantine delta was not exact", before);
 }
 
 void injected_async_terminal_failure_case() {
@@ -390,14 +425,14 @@ void injected_async_terminal_failure_case() {
     auto c = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
     ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL);
-    require(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
-            "async terminal fixture failed before submission");
+    require_stages(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
+                   "async terminal fixture failed before submission", before);
     ggml_backend_synchronize(life.backend);
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
-    require(after.failure_consumed == before.failure_consumed + 1 && after.submit == before.submit + 1,
-            "async failpoint did not reach exactly one submitted terminal");
-    require(after.quarantine == before.quarantine + 1 && after.recycle == before.recycle,
-            "failed asynchronous terminal recycled its workspace");
+    require_stages(after.failure_consumed == before.failure_consumed + 1 && after.submit == before.submit + 1,
+                   "async failpoint did not reach exactly one submitted terminal", before);
+    require_stages(after.quarantine == before.quarantine + 1 && after.recycle == before.recycle,
+                   "failed asynchronous terminal recycled its workspace", before);
 }
 } // namespace
 
