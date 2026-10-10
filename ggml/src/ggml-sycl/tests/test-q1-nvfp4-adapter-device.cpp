@@ -116,14 +116,18 @@ struct lifecycle_fixture {
         require(ggml_backend_sycl_stage_inventory_plan(&fixture.inventory, &fixture.envelope, false) ==
                     GGML_SYCL_LIFECYCLE_OK,
                 "synthetic lifecycle inventory staging failed");
+        // This binary links the ordinary backend, where the MMID direct route is closed, so the planner must plan
+        // and charge no MMID workspace for it (llama.cpp-84ck). wrapper_exact_plan_identity() covers materialization
+        // with a hand-built plan.
         const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(load.id);
-        require(candidate && candidate->plan && !candidate->plan->moe_mmid_workspaces.empty(),
-                "synthetic inventory produced no MMID demand");
+        require(candidate && candidate->plan && candidate->plan->moe_mmid_workspaces.empty() &&
+                    candidate->plan->moe_mmid_device_pool_bytes == 0,
+                "closed MMID route still planned an MMID workspace pool");
         require(ggml_backend_sycl_model_load_end(load, true, &model) == GGML_SYCL_LIFECYCLE_OK,
                 "synthetic lifecycle load commit failed");
         const auto exact = ggml_sycl::lifecycle_find_placement_plan(model.model_id, model.load_txn_id);
-        require(exact && exact->plan && !exact->plan->moe_mmid_workspaces.empty(),
-                "committed lifecycle plan lost MMID demand");
+        require(exact && exact->plan && exact->plan->moe_mmid_workspaces.empty(),
+                "committed lifecycle plan gained an MMID workspace pool");
         require(ggml_backend_sycl_execution_context_create(&context) == GGML_SYCL_EXECUTION_OK,
                 "execution context create failed");
         require(ggml_backend_sycl_execution_context_bind_backend(backend, context) == GGML_SYCL_EXECUTION_OK,

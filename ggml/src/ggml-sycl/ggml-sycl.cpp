@@ -11954,6 +11954,10 @@ void test_restore_moe_mmid_route_reachable_override(int previous) {
 // Full admission predicate, mirrored exactly -- compile-time half plus the
 // per-context runtime authorization the admission site also consults.
 static bool ggml_sycl_moe_mmid_route_reachable(const ggml_backend_sycl_context & ctx) {
+    // A route this build cannot execute has no pool planned for it (llama.cpp-84ck), so no context may materialize one.
+    if (!ggml_sycl_moe_mmid_route_reachable_in_build()) {
+        return false;
+    }
     if (k_moe_mmid_direct_route_validated) {
         return true;
     }
@@ -14059,8 +14063,9 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         // VRAM for a route that cannot execute. No backend context exists here
         // to answer the per-context half of ggml_sycl_moe_mmid_route_reachable(),
         // so only a Q1_NVFP4 route-testing build can materialize here for a
-        // context the bind hook and the runtime transaction would not.
-        if (k_moe_mmid_route_reachable_compiled) {
+        // context the bind hook and the runtime transaction would not. The
+        // build-level half is the predicate the planner charges the pools on.
+        if (ggml_sycl_moe_mmid_route_reachable_in_build()) {
             ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
             if (!ggml_sycl_materialize_published_mmid_workspaces(ticket.token, plan_snapshot, &mmid_reason)) {
                 // Deferred, not failed. Silent at INFO-and-below on purpose: the
