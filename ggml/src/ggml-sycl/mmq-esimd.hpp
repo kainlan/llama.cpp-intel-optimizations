@@ -966,18 +966,8 @@ inline int mmq_esimd_version() {
 }
 
 inline bool mmq_esimd_enabled() {
-    // GGML_SYCL_MMQ_ESIMD is an opt-in; say once that this build cannot honour it rather than
-    // letting the request silently no-op.
-    static const bool warned = []() {
-        const char * env = std::getenv("GGML_SYCL_MMQ_ESIMD");
-        if (env != nullptr && std::atoi(env) > 0) {
-            GGML_LOG_WARN(
-                "GGML_SYCL_MMQ_ESIMD requested but the ESIMD mmq kernels are compiled out "
-                "(GGML_SYCL_MMQ_ESIMD=OFF at build time); using the regular mmq kernels\n");
-        }
-        return true;
-    }();
-    GGML_UNUSED(warned);
+    // The "requested but compiled out" warning is emitted once at backend init by ggml_check_sycl()
+    // (ggml-sycl.cpp), not here: this dispatch site is not reached by every vehicle.
     return false;
 }
 

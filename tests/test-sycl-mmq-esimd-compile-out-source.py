@@ -17,6 +17,7 @@ SYCL = ROOT / "ggml/src/ggml-sycl"
 HEADER = (SYCL / "mmq-esimd.hpp").read_text()
 CMAKE = (SYCL / "CMakeLists.txt").read_text()
 MMQ = (SYCL / "mmq.cpp").read_text()
+BACKEND = (SYCL / "ggml-sycl.cpp").read_text()
 
 KERNEL_LAUNCHES = ("launch_mmq_q4_0_esimd", "launch_mmq_q4_0_esimd_v2", "launch_mmq_q4_0_esimd_v3")
 HELPERS = ("mmq_esimd_enabled", "mmq_esimd_available", "mmq_esimd_version", "mmq_esimd_supported")
@@ -127,6 +128,50 @@ def check_only_mmq_includes_header():
     return None if users == ["mmq.cpp"] else "mmq-esimd.hpp includers changed: %r" % users
 
 
+def function_body(code, name):
+    """Brace-matched body of the (single) definition 'static ... name(...) ... {' in comment-stripped code."""
+    m = re.search(r"^static\s+[^\n;]*\b" + re.escape(name) + r"\s*\([^)]*\)[^;{]*\{", code, flags=re.M)
+    if not m:
+        return None
+    depth, i = 1, m.end()
+    in_str = None
+    while i < len(code) and depth:
+        ch = code[i]
+        if in_str:
+            if ch == "\\":
+                i += 1
+            elif ch == in_str:
+                in_str = None
+        elif ch in "\"'":
+            in_str = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        i += 1
+    return code[m.end() : i]
+
+
+def check_init_warn(backend):
+    """The 'requested but compiled out' WARN is emitted once at backend init (ggml_check_sycl), only in a build
+    without GGML_SYCL_MMQ_ESIMD_KERNELS, only when the env var parses > 0."""
+    code = strip_comments(backend)
+    body = function_body(code, "ggml_check_sycl")
+    if body is None:
+        return "ggml_check_sycl definition not found"
+    blocks = re.findall(r"#ifndef\s+GGML_SYCL_MMQ_ESIMD_KERNELS\b(.*?)#endif", body, flags=re.S)
+    if len(blocks) != 1:
+        return "expected exactly one #ifndef GGML_SYCL_MMQ_ESIMD_KERNELS block in ggml_check_sycl, found %d" % len(blocks)
+    blk = blocks[0]
+    if 'getenv("GGML_SYCL_MMQ_ESIMD")' not in blk or "atoi" not in blk or "> 0" not in blk:
+        return "the block does not gate on getenv(GGML_SYCL_MMQ_ESIMD) parsing > 0"
+    if not re.search(r"GGML_LOG_WARN\s*\(", blk) or "compiled out" not in blk:
+        return "the block does not GGML_LOG_WARN that the kernels are compiled out"
+    if body.count("compiled out") != blk.count("compiled out") or len(re.findall(r"ESIMD mmq kernels are compiled out", code)) != 1:
+        return "the compiled-out warning also appears outside the guarded block"
+    return None
+
+
 # ---- the real checks -------------------------------------------------------------------------------
 
 
@@ -150,13 +195,17 @@ def test_only_mmq_cpp_includes_the_header():
     assert check_only_mmq_includes_header() is None, check_only_mmq_includes_header()
 
 
-def test_stub_warns_once_naming_the_option():
+def test_stub_enabled_is_false_and_warns_nowhere():
     _, stub, _ = split_regions(HEADER)
     enabled = re.search(r"inline\s+bool\s+mmq_esimd_enabled\s*\(\s*\)\s*\{.*?\n\}", stub, flags=re.S)
     assert enabled, "stub mmq_esimd_enabled not found"
-    body = enabled.group(0)
-    assert "GGML_LOG_WARN" in body and "static" in body and "GGML_SYCL_MMQ_ESIMD" in body
-    assert re.search(r"return\s+false\s*;\s*\}\s*$", body), "stub mmq_esimd_enabled must return false"
+    assert "return false;" in enabled.group(0)
+    # mmq.cpp's dispatch site is not reached by every vehicle: the contract warning lives at init.
+    assert "GGML_LOG" not in enabled.group(0)
+
+
+def test_init_path_warns_when_the_kernels_are_compiled_out():
+    assert check_init_warn(BACKEND) is None, check_init_warn(BACKEND)
 
 
 # ---- mutants: each check must fire on the thing it forbids -------------------------------------------
@@ -203,3 +252,37 @@ def test_mutant_missing_option_is_caught():
     mutant = CMAKE.replace("option(GGML_SYCL_MMQ_ESIMD ", "option(GGML_SYCL_MMQ_ESIMD_RENAMED ", 1)
     assert mutant != CMAKE
     assert check_cmake_option(mutant) is not None
+
+
+def test_mutant_init_warn_unconditional_is_caught():
+    mutant = BACKEND.replace("#ifndef GGML_SYCL_MMQ_ESIMD_KERNELS\n", "#if 1\n", 1)
+    assert mutant != BACKEND
+    assert check_init_warn(mutant) is not None
+
+
+def test_mutant_init_warn_removed_is_caught():
+    mutant = BACKEND.replace("ESIMD mmq kernels are compiled out", "ESIMD mmq kernels are gone", 1)
+    assert mutant != BACKEND
+    assert check_init_warn(mutant) is not None
+
+
+def test_mutant_init_warn_moved_out_of_init_is_caught():
+    code = BACKEND
+    i = code.index("#ifndef GGML_SYCL_MMQ_ESIMD_KERNELS")
+    j = code.index("#endif", i) + len("#endif")
+    block = code[i:j]
+    moved = code[:i] + code[j:]
+    # re-insert the block into a different function: right after the first function that is not ggml_check_sycl
+    k = moved.index("static void ggml_sycl_pipeline_cpu_warn_retired") if "static void ggml_sycl_pipeline_cpu_warn_retired" in moved else -1
+    if k < 0:
+        k = moved.index("\nstatic ", moved.index("static void ggml_check_sycl()") + 10)
+    k = moved.index("{", k) + 1
+    mutant = moved[:k] + "\n" + block + "\n" + moved[k:]
+    assert mutant != BACKEND
+    assert check_init_warn(mutant) is not None
+
+
+def test_mutant_init_warn_without_env_gate_is_caught():
+    mutant = BACKEND.replace('getenv("GGML_SYCL_MMQ_ESIMD")', 'getenv("GGML_SYCL_MMQ_OTHER")', 1)
+    assert mutant != BACKEND
+    assert check_init_warn(mutant) is not None
