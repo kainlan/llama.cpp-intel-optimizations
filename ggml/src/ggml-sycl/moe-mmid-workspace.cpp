@@ -287,6 +287,10 @@ bool moe_mmid_debit_device_budget(size_t workspace_bytes, size_t * remaining_byt
     return true;
 }
 
+bool moe_mmid_owner_admissible(int owner_device, int exposed_device_count) noexcept {
+    return owner_device >= 0 && owner_device < exposed_device_count;
+}
+
 bool moe_mmid_account_actual_owners(const std::vector<std::pair<int, size_t>> & charges,
                                     std::vector<moe_mmid_owner_accounting> *    owners,
                                     size_t *                                    total_vram_bytes) noexcept {
