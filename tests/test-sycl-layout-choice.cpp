@@ -704,25 +704,42 @@ static bool run_kv_context_room_cost_is_net_test() {
 }
 
 // llama.cpp-ak0p: the room is for the context the caller asked for, and there is none without a request. A requested
-// n_ctx 4096 holds the KV of (4096 - planner n_ctx 512) cells on each device layer, and the experts keep what is left.
-// With no request (n_ctx_context 0) the planner holds nothing, and the experts take every byte the dense weights and
-// their KV leave, as they did before the room existed.
+// n_ctx 2304 (a room unlike the 4096 one above: 1792 cells a layer, and three and a half triplets left after it)
+// holds exactly what that context's KV needs beyond the planner's n_ctx 512 on each device layer, and the experts keep
+// what is left. With no request (n_ctx_context 0) the planner holds nothing, and the experts take every byte the
+// dense weights and their KV leave, as they did before the room existed. libllama pads the hint as llama_context pads
+// n_ctx before it reaches the planner (populate_inventory, pinned by test-sycl-kv-before-experts-source), so a hint of
+// 4000 arrives as 4096 and holds the 4096 room, which an unpadded 4000 would fall short of.
 static bool run_kv_context_room_follows_the_requested_context_test() {
     using namespace kv_order_case;
-    constexpr size_t cell_bytes = (kv_width + kv_width) * 2;      // f16 K and V of one cell of one layer
-    constexpr size_t room_4096  = 2 * (4096 - 512) * cell_bytes;  // two device layers
-    const size_t     left       = room_4096 + 2 * triplet_bytes;
-    const size_t     budget     = 2 * dense_bytes + 2 * kv_at_512 + left;
-
-    const auto requested = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(4096), nullptr, n_experts);
-    if (requested.kv_context_reserve_bytes != room_4096 || device_triplets(requested) != 2) {
-        printf(
-            "FAIL: a requested n_ctx 4096 holds %zu bytes (want %zu, 3584 cells on 2 layers), %zu device triplets "
-            "(want 2)\n",
-            requested.kv_context_reserve_bytes, room_4096, device_triplets(requested));
+    const ggml_sycl::placement_kv_info hint_2304 = kv_info(2304);
+    size_t                             room_2304 = 0;
+    for (uint32_t il = 0; il < 2; ++il) {
+        room_2304 += hint_2304.kv_bytes_for_layer_at(il, 2304) - hint_2304.kv_bytes_for_layer_at(il, 512);
+    }
+    constexpr size_t cell_bytes = (kv_width + kv_width) * 2;  // f16 K and V of one cell of one layer
+    if (room_2304 != 2 * (2304 - 512) * cell_bytes || room_2304 == 2 * kv_extra_layer) {
+        printf("FAIL: the n_ctx 2304 room is %zu bytes, want %zu (1792 cells on 2 layers)\n", room_2304,
+               2 * (2304 - 512) * cell_bytes);
         return false;
     }
-    const size_t no_room_triplets = left / triplet_bytes;  // every triplet that fits what is left: 6 of the 8
+    const size_t left   = room_2304 + 3 * triplet_bytes + triplet_bytes / 2;
+    const size_t budget = 2 * dense_bytes + 2 * kv_at_512 + left;
+
+    const auto requested = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(2304), nullptr, n_experts);
+    if (requested.kv_context_reserve_bytes != room_2304 || device_triplets(requested) != 3) {
+        printf("FAIL: a requested n_ctx 2304 holds %zu bytes (want %zu), %zu device triplets (want 3)\n",
+               requested.kv_context_reserve_bytes, room_2304, device_triplets(requested));
+        return false;
+    }
+    // Without the room the same budget holds five triplets (5.83 fit), with it three (3.5 fit): two displaced.
+    if (requested.kv_context_room_displaced_bytes != 2 * triplet_bytes) {
+        printf("FAIL: the n_ctx 2304 room displaced 2 triplets: logged %zu bytes, want %zu\n",
+               requested.kv_context_room_displaced_bytes, 2 * triplet_bytes);
+        return false;
+    }
+
+    const size_t no_room_triplets = left / triplet_bytes;  // every triplet that fits what is left: 5 of the 8
     const auto   none = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(0), nullptr, n_experts);
     if (none.kv_context_reserve_bytes != 0 || none.kv_context_room_displaced_bytes != 0 ||
         device_triplets(none) != no_room_triplets) {
@@ -730,6 +747,24 @@ static bool run_kv_context_room_follows_the_requested_context_test() {
             "FAIL: with no requested context the planner holds %zu bytes (want 0) and keeps %zu device triplets "
             "(want %zu)\n",
             none.kv_context_reserve_bytes, device_triplets(none), no_room_triplets);
+        return false;
+    }
+
+    // A hint of 4000 reaches the planner as libllama pads it: 4096, the same room and the same pack as a hint of 4096.
+    const uint32_t padded_4000 = GGML_PAD(4000u, 256u);
+    const auto     plan_4000 =
+        ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(padded_4000), nullptr, n_experts);
+    const auto plan_4096 = ggml_sycl::compute_placement_plan(inventory(), budget, 0, kv_info(4096), nullptr, n_experts);
+    const size_t unpadded_room_4000 = 2 * kv_info(4000).kv_context_extra_bytes_for_layer(0);
+    if (padded_4000 != 4096 || plan_4000.kv_context_reserve_bytes != plan_4096.kv_context_reserve_bytes ||
+        plan_4000.kv_context_reserve_bytes != 2 * kv_extra_layer ||
+        device_triplets(plan_4000) != device_triplets(plan_4096) ||
+        unpadded_room_4000 >= plan_4000.kv_context_reserve_bytes) {
+        printf(
+            "FAIL: a hint of 4000 pads to %u and holds %zu bytes with %zu device triplets; 4096 holds %zu with %zu; "
+            "unpadded 4000 would hold %zu\n",
+            padded_4000, plan_4000.kv_context_reserve_bytes, device_triplets(plan_4000),
+            plan_4096.kv_context_reserve_bytes, device_triplets(plan_4096), unpadded_room_4000);
         return false;
     }
     printf("PASS: the KV context room follows the requested context, and there is none without one\n");
