@@ -579,6 +579,13 @@ inline size_t kv_layer_bytes_for_kind(uint8_t  kind,
         [](int32_t, int64_t n_elements) { return static_cast<size_t>(n_elements) * sizeof(ggml_fp16_t); });
 }
 
+// llama.cpp-w013: the defaults of the KV context room's three cost parameters (placement_kv_info::ctx_fill_pct,
+// host_attn_gbps and cpu_expert_gbps). docs/backend/sycl-env-vars.md gives the measurement behind each one and the
+// variable that overrides it.
+constexpr double PLACEMENT_CTX_FILL_PCT_DEFAULT    = 50.0;  // percent of the requested context expected to be filled
+constexpr double PLACEMENT_HOST_ATTN_GBPS_DEFAULT  = 30.0;  // GB/s at which the CPU reads a host layer's KV
+constexpr double PLACEMENT_CPU_EXPERT_GBPS_DEFAULT = 40.0;  // GB/s at which the CPU expert kernels read weights
+
 // Explicit planner inputs used for KV sizing and placement.
 struct placement_kv_info {
     uint32_t              n_layer      = 0;
@@ -636,6 +643,16 @@ struct placement_kv_info {
     // request (llama.cpp-ak0p). n_ctx above stays the load's own planning shape; this one only sizes the KV room the
     // planner holds ahead of the routed experts. 0 = no request reached the load: no room is held.
     uint32_t              n_ctx_context    = 0;
+    // llama.cpp-w013: what the planner weighs a layer's room by (owner ruling 2026-10-10). The room is held for a
+    // layer only when the attention it keeps on the device is worth more per decode token than the routed experts it
+    // displaces: the host would read the layer's KV at ctx_fill_pct percent of n_ctx_context at host_attn_gbps, and
+    // the displaced experts would be read at cpu_expert_gbps, each with probability n_expert_used / n_expert. The
+    // backend fills all three once, where it copies the inventory in, from GGML_SYCL_PLAN_CTX_FILL_PCT,
+    // GGML_SYCL_PLAN_HOST_ATTN_GBPS and GGML_SYCL_PLAN_CPU_EXPERT_GBPS; a test sets them directly. The two rates must
+    // be finite and > 0 (the planner asserts it, since each divides); the fill is clamped to [0, 100] where it is used.
+    double                ctx_fill_pct     = PLACEMENT_CTX_FILL_PCT_DEFAULT;
+    double                host_attn_gbps   = PLACEMENT_HOST_ATTN_GBPS_DEFAULT;
+    double                cpu_expert_gbps  = PLACEMENT_CPU_EXPERT_GBPS_DEFAULT;
     // MoE hyperparameters (0 for dense models)
     int               n_expert_used    = 0;  // Top-k experts selected per token
     // SWA (Sliding Window Attention) — 0 means all layers use full attention

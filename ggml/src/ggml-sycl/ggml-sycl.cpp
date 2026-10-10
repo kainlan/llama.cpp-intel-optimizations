@@ -17023,6 +17023,22 @@ static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168, "kv_l
 static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172, "n_ctx_context moved");
 static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176, "kv_idx_k_width_per_layer moved");
 
+// llama.cpp-w013: one of the KV context room's cost parameters (placement_kv_info::ctx_fill_pct, host_attn_gbps and
+// cpu_expert_gbps) from its environment variable. Unset, unparsable, not finite, zero or negative keeps the default;
+// above `max` is `max` (docs/backend/sycl-env-vars.md). The room's line prints the value each run used.
+static double ggml_sycl_plan_cost_param(const char * name, double def, double max) {
+    const char * env = std::getenv(name);
+    if (env == nullptr) {
+        return def;
+    }
+    char *       end   = nullptr;
+    const double value = std::strtod(env, &end);
+    if (end == env || !std::isfinite(value) || value <= 0.0) {
+        return def;
+    }
+    return std::min(value, max);
+}
+
 // Phase A helper: populate inventory + KV + MoE globals from the inventory
 // snapshot.  Idempotent — safe to call from both the early pre-create_tensor
 // entry point and the late set_tensor_inventory entry.  Caller must hold
@@ -17235,6 +17251,16 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     g_placement_kv_info.n_ctx_is_runtime = false;
     // llama.cpp-8ecj: the context the model opens with, whose KV room the planner holds ahead of the routed experts.
     g_placement_kv_info.n_ctx_context    = inventory->n_ctx_context;
+    // llama.cpp-w013: what the planner weighs that room by, layer by layer: the share of the requested context a
+    // conversation is expected to fill (a percent, so at most 100), and the two host read rates.
+    g_placement_kv_info.ctx_fill_pct =
+        ggml_sycl_plan_cost_param("GGML_SYCL_PLAN_CTX_FILL_PCT", ggml_sycl::PLACEMENT_CTX_FILL_PCT_DEFAULT, 100.0);
+    g_placement_kv_info.host_attn_gbps =
+        ggml_sycl_plan_cost_param("GGML_SYCL_PLAN_HOST_ATTN_GBPS", ggml_sycl::PLACEMENT_HOST_ATTN_GBPS_DEFAULT,
+                                  std::numeric_limits<double>::max());
+    g_placement_kv_info.cpu_expert_gbps =
+        ggml_sycl_plan_cost_param("GGML_SYCL_PLAN_CPU_EXPERT_GBPS", ggml_sycl::PLACEMENT_CPU_EXPERT_GBPS_DEFAULT,
+                                  std::numeric_limits<double>::max());
     if (g_placement_kv_info.valid()) {
         GGML_LOG_INFO(
             "[SYCL-PLAN] KV inputs: n_layer=%u n_embd_k_gqa=%u n_embd_v_gqa=%u n_ctx=%u (%s) kv_per_layer=%.1f MB "

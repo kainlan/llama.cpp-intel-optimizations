@@ -4364,6 +4364,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-w013: the KV context room is cost-based (owner ruling 2026-10-10). Each device layer's room is weighed in
+# the runtime's demotion order and held only when its host attention cost outweighs the routed experts it displaces;
+# the three cost parameters are read once at the inventory fill site and catalogued. A mutant per claim. Text only: no
+# device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-kv-room-cost-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kv-room-cost-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-8ecj: a memory that holds one layer in two KV buffers (qwen4exp's llama_memory_hybrid_idx: attention K/V
 # and indexer keys) is budgeted and allocated buffer by buffer. The tiered allocator's backstop counts the buffer it is
 # allocating at its own layer sizes, not the plan's per-layer KV. A mutant per claim. Text only: no device, no model.
