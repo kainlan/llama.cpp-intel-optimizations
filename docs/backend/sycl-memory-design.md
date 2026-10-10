@@ -2832,9 +2832,11 @@ through the probe reservation and the admitted record to the late check. A mutan
 - An owner's terms leave only by its own key: the load's rollback, or the slot's release at teardown. Each drop
   republishes the merge, so a model that stays live beside one that unloaded reads its own term again, not the larger
   one that left. There is no whole-table clear and none at the load entry.
-- A newer generation of a slot that finds its predecessor's terms still standing replaces them and WARNs
+- A newer generation of a slot that finds its predecessor's terms still standing removes them on every device, not only
+  the one it reserves on, and WARNs once per device
   `[LOAD-PLAN] planned load terms of slot S generation G were still standing on device N`, because those are terms
-  that a rollback or a release did not drop.
+  that a rollback or a release did not drop. A slot is reserved again only after its release, so an older generation's
+  term on any device has no owner left to drop it.
 - The `[SCRATCH-STATS] ... compute_buffer=` landing line ends with `planned_compute_term=<MiB>`. That is the positive
   control. A buffer that lands `zone=runtime` beside a nonzero term is the reservation at work. One that lands
   `zone=raw` beside a nonzero term is a reservation that did not hold it.

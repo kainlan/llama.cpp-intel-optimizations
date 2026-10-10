@@ -13163,13 +13163,10 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
     } catch (...) {
         clean = false;
     }
-    try {
-        // llama.cpp-ihk6: the aborted load's planned load terms leave by its own key (canonical contract 12.4); the
-        // live models' contributions, and the device's merge of them, are what remains.
-        (void) ggml_sycl::unified_cache_drop_planned_load_terms(owner.owner);
-    } catch (...) {
-        clean = false;
-    }
+    // llama.cpp-ihk6: the aborted load's planned load terms leave by its own key (canonical contract 12.4); the live
+    // models' contributions, and the device's merge of them, are what remains. The drop is noexcept and runs after
+    // every stage unconditionally, so no failed stage above can skip it.
+    (void) ggml_sycl::unified_cache_drop_planned_load_terms(owner.owner);
     return clean;
 }
 
@@ -40581,7 +40578,9 @@ bool ggml_backend_sycl_load_reserve_compute_term(ggml_sycl_load_txn txn,
         size_t       bytes  = 0;
         const auto   effect = ggml_sycl::lifecycle::global_registry().acquire_load_effect({ txn.id });
         if (!effect) {
-            why = "not the open load transaction";
+            why = effect.code == ggml_sycl::lifecycle::error::ALLOCATION_FAILED ?
+                      "the load effect could not be recorded" :
+                      "not the open load transaction";
         } else if (n_ctx == 0) {
             why = "the measure carries no n_ctx";
         } else if (device < 0 || device >= ggml_sycl_info().total_gpu_count || device >= GGML_SYCL_MAX_DEVICES) {
@@ -40632,7 +40631,9 @@ bool ggml_backend_sycl_load_reserve_state_term(ggml_sycl_load_txn txn, int32_t d
         size_t       bytes  = 0;
         const auto   effect = ggml_sycl::lifecycle::global_registry().acquire_load_effect({ txn.id });
         if (!effect) {
-            why = "not the open load transaction";
+            why = effect.code == ggml_sycl::lifecycle::error::ALLOCATION_FAILED ?
+                      "the load effect could not be recorded" :
+                      "not the open load transaction";
         } else if (device < 0 || device >= ggml_sycl_info().total_gpu_count || device >= GGML_SYCL_MAX_DEVICES) {
             why = "device out of range";
         } else {

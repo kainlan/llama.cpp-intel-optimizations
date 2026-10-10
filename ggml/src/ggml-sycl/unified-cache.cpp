@@ -2158,13 +2158,16 @@ size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id) {
     return g_planned_mmq_src1_scratch_bytes[device_id].load(std::memory_order_acquire);
 }
 
-// The merge over the owners on `device_id`, published with release semantics for the readers. Called with
-// g_planned_load_terms.mutex held.
-static void planned_load_terms_publish_locked(int device_id) {
-    g_planned_compute_term_bytes[device_id].store(
-        g_planned_load_terms.owners.merged(device_id, planned_load_term::COMPUTE), std::memory_order_release);
-    g_planned_state_term_bytes[device_id].store(g_planned_load_terms.owners.merged(device_id, planned_load_term::STATE),
-                                                std::memory_order_release);
+// The merge over the owners on every device, published with release semantics for the readers. Every device, because
+// a store can sweep a stale contribution off devices other than the one it stores on, and a drop removes an owner from
+// every device. Called with g_planned_load_terms.mutex held.
+static void planned_load_terms_publish_locked() {
+    for (int device_id = 0; device_id < GGML_SYCL_MAX_DEVICES; ++device_id) {
+        g_planned_compute_term_bytes[device_id].store(
+            g_planned_load_terms.owners.merged(device_id, planned_load_term::COMPUTE), std::memory_order_release);
+        g_planned_state_term_bytes[device_id].store(
+            g_planned_load_terms.owners.merged(device_id, planned_load_term::STATE), std::memory_order_release);
+    }
 }
 
 // One owner's term on one device (llama.cpp-ihk6): replaces that owner's earlier value, so a draft loaded beside its
@@ -2173,21 +2176,25 @@ static bool unified_cache_set_planned_load_term(int                  device_id,
                                                 lifecycle::SlotToken owner,
                                                 planned_load_term    term,
                                                 size_t               bytes) {
-    uint64_t replaced = 0;
+    planned_load_terms_replaced replaced;
     {
         std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
         if (!g_planned_load_terms.owners.set(device_id, owner, term, bytes, &replaced)) {
             return false;
         }
-        planned_load_terms_publish_locked(device_id);
+        planned_load_terms_publish_locked();
     }
-    if (replaced != 0) {
+    for (int stale_device = 0; stale_device < GGML_SYCL_MAX_DEVICES; ++stale_device) {
+        if (replaced.generation[stale_device] == 0) {
+            continue;
+        }
         // A contribution can leave only by its owner's key, so one still standing when the slot's next generation
-        // reserves is one its owner's rollback or release did not drop. It is replaced, and named, never merged.
+        // reserves is one its owner's rollback or release did not drop. It is removed, and named, never merged.
         GGML_LOG_WARN(
             "[LOAD-PLAN] planned load terms of slot %u generation %llu were still standing on device %d when "
-            "generation %llu reserved; replaced (the owner ended without dropping them)\n",
-            owner.slot, (unsigned long long) replaced, device_id, (unsigned long long) owner.generation);
+            "generation %llu reserved on device %d; replaced (the owner ended without dropping them)\n",
+            owner.slot, (unsigned long long) replaced.generation[stale_device], stale_device,
+            (unsigned long long) owner.generation, device_id);
     }
     return true;
 }
@@ -2214,14 +2221,12 @@ size_t unified_cache_get_planned_state_term_bytes(int device_id) {
     return g_planned_state_term_bytes[device_id].load(std::memory_order_acquire);
 }
 
-bool unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner) {
+bool unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner) noexcept {
     std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
     if (!g_planned_load_terms.owners.drop(owner)) {
         return false;
     }
-    for (int device_id = 0; device_id < GGML_SYCL_MAX_DEVICES; ++device_id) {
-        planned_load_terms_publish_locked(device_id);
-    }
+    planned_load_terms_publish_locked();
     return true;
 }
 

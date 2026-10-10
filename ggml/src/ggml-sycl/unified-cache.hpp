@@ -2019,19 +2019,20 @@ bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_
 // term of the owners on the device. False, storing nothing, for a device out of range, an owner that is not a model
 // slot (buffer_owner_slot, no_model_slot), generation 0, or an owner older than the slot's current one
 // (planned_load_terms::set).
-bool     unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes);
-size_t   unified_cache_get_planned_compute_term_bytes(int device_id);
+bool             unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes);
+size_t           unified_cache_get_planned_compute_term_bytes(int device_id);
 // llama.cpp-p6i0: the load's planned state term, the bytes the context memory the probe measure placed on the
 // device's plain buffer type occupies in the RUNTIME zone (the recurrent state: the real context allocates it there,
 // RUNTIME-first and outside the compute scope, before the compute buffer, so a compute term alone does not hold the
 // buffer). Folded into unified_cache_get_planned_runtime_zone_requirement() beside the compute term, keyed by owner
 // and merged the same way, with the same refusals.
-bool     unified_cache_set_planned_state_term(int device_id, lifecycle::SlotToken owner, size_t bytes);
-size_t   unified_cache_get_planned_state_term_bytes(int device_id);
+bool             unified_cache_set_planned_state_term(int device_id, lifecycle::SlotToken owner, size_t bytes);
+size_t           unified_cache_get_planned_state_term_bytes(int device_id);
 // Drops `owner`'s compute and state terms on every device and republishes the merge; every other owner's stay
 // (llama.cpp-ihk6). Called where the owner ends: its load's rollback and its slot's release. True when something was
-// dropped.
-bool     unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner);
+// dropped. noexcept, so the rollback calls it outside any try stage and no failed stage before it can skip it: it
+// takes one leaf mutex and stores atomics, and allocates nothing.
+bool             unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner) noexcept;
 // Whether the dense scratch at `n_ubatch` fits the RUNTIME zone's CAPACITY beside the other n_ubatch-independent
 // planned consumers. Capacity, not free space: free space depends on which compute buffers are live, capacity is
 // the fact the plan can be held to. `largest_ubatch` (optional) receives n_ubatch when it fits, else the largest

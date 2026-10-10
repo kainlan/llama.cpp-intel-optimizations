@@ -7,7 +7,8 @@
 // (model slot, slot generation) keeps its own contribution, the device reads the merge over the owners on it, and an
 // owner's contribution leaves only by its own key.
 //
-// Host-only: the header is plain C++ with no SYCL or backend dependency, and the table is a local value.
+// Host-only, no SYCL: the header takes GGML_SYCL_MAX_DEVICES from ggml-sycl.h (the public include directory) and
+// nothing else from the backend, and the table is a local value.
 
 #include "planned-load-terms.hpp"
 
@@ -16,6 +17,7 @@
 
 using ggml_sycl::planned_load_term;
 using ggml_sycl::planned_load_terms;
+using ggml_sycl::planned_load_terms_replaced;
 using ggml_sycl::lifecycle::SlotToken;
 
 namespace {
@@ -133,21 +135,59 @@ void test_a_slot_generation_is_its_own_owner() {
     check(compute(t, 0) == 80 * kMiB, "still 80");
 }
 
+bool replaced_none(const planned_load_terms_replaced & r) {
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        if (r.generation[d] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void test_a_newer_owner_replaces_a_stale_contribution_and_names_it() {
     printf("a newer generation of a slot replaces a contribution its predecessor left, and says whose it was\n");
-    planned_load_terms t;
-    const SlotToken    old_gen{ 7, 1 };
-    const SlotToken    new_gen{ 7, 2 };
-    uint64_t           replaced = 99;
-    check(t.set(0, old_gen, planned_load_term::COMPUTE, 300 * kMiB, &replaced) && replaced == 0,
+    planned_load_terms          t;
+    const SlotToken             old_gen{ 7, 1 };
+    const SlotToken             new_gen{ 7, 2 };
+    planned_load_terms_replaced replaced;
+    replaced.generation[0] = 99;
+    check(t.set(0, old_gen, planned_load_term::COMPUTE, 300 * kMiB, &replaced) && replaced_none(replaced),
           "a first store replaces nothing");
-    check(t.set(0, old_gen, planned_load_term::STATE, 40 * kMiB, &replaced) && replaced == 0,
+    check(t.set(0, old_gen, planned_load_term::STATE, 40 * kMiB, &replaced) && replaced_none(replaced),
           "the same owner's second term replaces nothing");
-    check(t.set(0, new_gen, planned_load_term::COMPUTE, 100 * kMiB, &replaced) && replaced == 1,
-          "the newer owner's store reports generation 1 replaced");
+    check(t.set(0, new_gen, planned_load_term::COMPUTE, 100 * kMiB, &replaced) && replaced.generation[0] == 1,
+          "the newer owner's store reports generation 1 replaced on device 0");
     check(compute(t, 0) == 100 * kMiB && state(t, 0) == 0,
           "the predecessor's 300 and 40 are gone whole, not merged into the newer owner's value");
     check(!t.drop(old_gen) && t.drop(new_gen) && compute(t, 0) == 0, "only the newer owner's key drops it now");
+}
+
+void test_a_newer_owner_sweeps_the_slot_on_every_device() {
+    printf("a newer generation that stores on one device removes its predecessor's leftovers on every device\n");
+    planned_load_terms          t;
+    const SlotToken             old_gen{ 9, 1 };
+    const SlotToken             new_gen{ 9, 2 };
+    planned_load_terms_replaced replaced;
+    check(t.set(0, old_gen, planned_load_term::COMPUTE, 300 * kMiB) &&
+              t.set(1, old_gen, planned_load_term::COMPUTE, 200 * kMiB) &&
+              t.set(1, old_gen, planned_load_term::STATE, 30 * kMiB),
+          "generation 1 left terms on devices 0 and 1 without a drop");
+    check(t.set(1, kB, planned_load_term::COMPUTE, 50 * kMiB), "B, another slot, is live on device 1 with 50");
+    check(t.set(0, new_gen, planned_load_term::COMPUTE, 100 * kMiB, &replaced), "generation 2 stores on device 0 only");
+    check(replaced.generation[0] == 1 && replaced.generation[1] == 1, "the store names generation 1 on both devices");
+    bool others_untouched = true;
+    for (int d = 2; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        others_untouched = others_untouched && replaced.generation[d] == 0;
+    }
+    check(others_untouched, "and on no device it held nothing on");
+    check(compute(t, 0) == 100 * kMiB, "device 0 reads generation 2's 100");
+    check(compute(t, 1) == 50 * kMiB && state(t, 1) == 0,
+          "device 1 reads B's 50, not generation 1's leftover 200, and its leftover state is gone");
+    check(!t.drop(old_gen), "nothing of generation 1 is left to drop");
+    const SlotToken stale_gen{ 9, 1 };
+    check(!t.set(3, stale_gen, planned_load_term::COMPUTE, 900 * kMiB),
+          "generation 1 cannot store on a device the slot holds nothing on, once generation 2 exists anywhere");
+    check(compute(t, 3) == 0, "device 3 still reads 0");
 }
 
 }  // namespace
@@ -161,6 +201,7 @@ int main() {
     test_owners_that_are_not_model_slots_are_refused();
     test_a_slot_generation_is_its_own_owner();
     test_a_newer_owner_replaces_a_stale_contribution_and_names_it();
+    test_a_newer_owner_sweeps_the_slot_on_every_device();
 
     printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;

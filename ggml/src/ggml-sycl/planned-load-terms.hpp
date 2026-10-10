@@ -13,6 +13,11 @@
 // to have the same key and nothing moves at commit. An owner's contribution leaves only by its own key: the load's
 // rollback, or the slot's release at teardown.
 //
+// A slot is reserved again only after its release, so once a newer generation of a slot stores, every contribution an
+// older generation left, on any device, is one its owner's rollback or release did not drop. The store sweeps them all,
+// not only the device it stores on: a stale term left on a device the new owner never reserves on would otherwise stand
+// in that device's merge with no owner left to drop it.
+//
 // An unlocked value type with no SYCL dependency: unified-cache.cpp holds the process's table under a leaf mutex and
 // publishes the merge to the atomics its readers load, and tests/test-planned-load-terms.cpp drives it directly.
 
@@ -35,37 +40,46 @@ struct planned_load_term_contribution {
     size_t   state_bytes   = 0;
 };
 
+// What a store swept: per device, the generation of the older contribution it removed for the owner's slot (0: none).
+struct planned_load_terms_replaced {
+    uint64_t generation[GGML_SYCL_MAX_DEVICES] = {};
+};
+
 class planned_load_terms {
   public:
     // Store `bytes` as `owner`'s `term` on `device`, replacing the value that owner stored before: a re-measure within
     // one owner replaces, it does not merge with itself. False, storing nothing, for a device out of range, a slot that
     // is not a model slot (lifecycle::buffer_owner_slot and lifecycle::no_model_slot among them), generation 0, or an
-    // owner older than the one the slot's contribution already belongs to. A newer owner of the slot replaces the
-    // older contribution whole; its generation is then written to `replaced_generation`, since an older contribution
-    // still standing is one its owner's rollback or release did not drop.
-    bool set(int                  device,
-             lifecycle::SlotToken owner,
-             planned_load_term    term,
-             size_t               bytes,
-             uint64_t *           replaced_generation = nullptr) {
-        if (replaced_generation != nullptr) {
-            *replaced_generation = 0;
+    // owner older than a contribution the slot holds on any device. A newer owner of the slot removes every older
+    // contribution of the slot, on every device, whole; the generation removed on each device is written to `replaced`.
+    bool set(int                           device,
+             lifecycle::SlotToken          owner,
+             planned_load_term             term,
+             size_t                        bytes,
+             planned_load_terms_replaced * replaced = nullptr) {
+        if (replaced != nullptr) {
+            *replaced = planned_load_terms_replaced{};
         }
         if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || owner.slot >= lifecycle::model_slot_count ||
             owner.generation == 0) {
             return false;
         }
-        planned_load_term_contribution & c = contributions_[device][owner.slot];
-        if (c.generation > owner.generation) {
-            return false;
-        }
-        if (c.generation != owner.generation) {
-            if (c.generation != 0 && replaced_generation != nullptr) {
-                *replaced_generation = c.generation;
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            if (contributions_[d][owner.slot].generation > owner.generation) {
+                return false;
             }
-            c            = planned_load_term_contribution{};
-            c.generation = owner.generation;
         }
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            planned_load_term_contribution & old = contributions_[d][owner.slot];
+            if (old.generation != 0 && old.generation < owner.generation) {
+                if (replaced != nullptr) {
+                    replaced->generation[d] = old.generation;
+                }
+                old = planned_load_term_contribution{};
+            }
+        }
+        planned_load_term_contribution & c = contributions_[device][owner.slot];
+        c.generation                       = owner.generation;
         if (term == planned_load_term::COMPUTE) {
             c.compute_bytes = bytes;
         } else {
