@@ -352,9 +352,9 @@ struct ggml_sycl_tensor_inventory {
     uint32_t                       kv_layer_count;        // Length of the three arrays above (0 = not populated)
     // llama.cpp-8ecj: the context the model opens with, whose KV room the planner holds on the device ahead of the
     // routed experts; n_ctx above stays the load's own planning shape. llama.cpp-ak0p: libllama fills it with the
-    // context the caller is about to create (llama_model_params::n_ctx_hint), padded as llama_context pads n_ctx.
-    // 0 = no request reached the load: no room is held. libllama and libggml-sycl must be rebuilt together for the
-    // planner to see it (see kv_idx_k_width_per_layer for the layout).
+    // context the caller is about to create (llama_model_params::n_ctx_hint), padded as llama_context pads n_ctx for
+    // a single sequence. 0 = no request reached the load: no room is held. libllama and libggml-sycl must be rebuilt
+    // together for the planner to see it (see kv_idx_k_width_per_layer for the layout).
     uint32_t                       n_ctx_context;
     // llama.cpp-8ecj: the key width of each layer's indexer key cache (llama_memory_hybrid_idx, qwen4exp: one key head
     // of indexer_head_size, no V) [kv_layer_count]; 0 where a layer has none. NULL and an all-zero array both mean no

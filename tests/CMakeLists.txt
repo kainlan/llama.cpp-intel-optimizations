@@ -4353,8 +4353,9 @@ endif()
 # llama.cpp-8ecj: the single-device planner places dense weights, then KV (each device layer's KV, then the room the
 # context the model opens with needs on top of it), then routed experts, and logs what the room displaced. The room is
 # for the context the caller asked for (llama_model_params::n_ctx_hint, from -c in common and from the test's context
-# in llama-bench, padded as llama_context pads n_ctx); none is held when no request reached the load (llama.cpp-ak0p).
-# A mutant per claim, experts-first among them. Text only: no device, no model.
+# in llama-bench, padded as llama_context pads n_ctx for a single sequence; a non-unified multi-slot context can exceed
+# it, and the runtime transaction re-places the overflow); none is held when no request reached the load
+# (llama.cpp-ak0p). A mutant per claim, experts-first among them. Text only: no device, no model.
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-kv-before-experts-source

@@ -23,9 +23,9 @@ The fix this gate pins:
     line saying no room is held;
   - the loader hands the backend that context (llama.cpp-ak0p): the one the caller is about to create
     (llama_model_params::n_ctx_hint, which common sets from -c and llama-bench from its test's context), padded the
-    way llama_context pads n_ctx, or 0 when no request reached the load, so a run without -c holds no room and places
-    as master does. The placement envelope's n_ctx stays 0, so the load measures and the planning shape keep their
-    inputs.
+    way llama_context pads n_ctx for a single sequence, or 0 when no request reached the load, so a run without -c
+    holds no room and places as master does. The placement envelope's n_ctx stays 0, so the load measures and the
+    planning shape keep their inputs.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -300,7 +300,9 @@ def claim_loader_hands_the_requested_context(model: str, model_h: str, sycl: str
 
 def claim_hint_is_padded_like_the_context(model: str, context: str) -> bool:
     """The room's context is padded with the constant llama_context pads n_ctx with (src/llama-context.cpp,
-    cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256)), so the room is never short of the context it is for."""
+    cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256)), so the room covers a single-sequence context of the requested size.
+    A non-unified multi-slot context can exceed it (each sequence's share is padded, SWA cells grow with the streams);
+    the runtime transaction re-places that overflow."""
     pad = CONTEXT_PAD_RE.findall(norm(context))
     pick = HINT_PICK_RE.findall(body(norm(model), POPULATE_SIG))
     return len(pad) == 1 and len(pick) == 1 and pad[0] == pick[0]
