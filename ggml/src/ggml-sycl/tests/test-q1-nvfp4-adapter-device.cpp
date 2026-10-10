@@ -120,8 +120,17 @@ struct lifecycle_fixture {
         // and charge no MMID workspace for it (llama.cpp-84ck). wrapper_exact_plan_identity() covers materialization
         // with a hand-built plan.
         const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(load.id);
-        require(candidate && candidate->plan && candidate->plan->moe_mmid_workspaces.empty() &&
-                    candidate->plan->moe_mmid_device_pool_bytes == 0,
+        require(candidate && candidate->plan, "synthetic lifecycle produced no candidate plan");
+        // Precondition: the plan put experts on the device, so the empty pool below means "experts present, no pool"
+        // and not "no experts planned at all".
+        size_t device_experts = 0;
+        for (const auto & entry : candidate->plan->entries) {
+            if (entry.expert_id >= 0 && entry.on_device) {
+                ++device_experts;
+            }
+        }
+        require(device_experts > 0, "synthetic inventory placed no expert on the device");
+        require(candidate->plan->moe_mmid_workspaces.empty() && candidate->plan->moe_mmid_device_pool_bytes == 0,
                 "closed MMID route still planned an MMID workspace pool");
         require(ggml_backend_sycl_model_load_end(load, true, &model) == GGML_SYCL_LIFECYCLE_OK,
                 "synthetic lifecycle load commit failed");

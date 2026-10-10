@@ -11927,8 +11927,11 @@ static std::atomic<int> g_test_moe_mmid_route_reachable_override{ -1 };
 // The build-level half of MMID route reachability: can ANY context of this build execute the route? The planner has no
 // context, so the workspace pools' planning charge and the runtime re-plan of their demand ask this (declared in
 // common.hpp, llama.cpp-84ck), as do load_end's materialization and the per-context predicate below. In an ordinary
-// build it is false, so no pool is planned, charged or materialized. A forced-open override cannot compile the route
-// in; it only makes the planner charge the pool.
+// build it is false, so no pool is planned, charged or materialized. The PRIVATE_TESTING override governs every one of
+// those sites: forced open, the planner plans and charges the pool, load_end materializes it, and the per-context
+// predicate lets the context-bind hook and the runtime transaction materialize it. Admission still needs the route
+// compiled in (its own gate reads the constants), so forcing it open in an ordinary build cannot execute anything.
+// Only test-sycl-layout-choice sets the override, and only around planning and the runtime re-plan, with no context.
 bool ggml_sycl_moe_mmid_route_reachable_in_build() {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     const int forced = g_test_moe_mmid_route_reachable_override.load(std::memory_order_acquire);
