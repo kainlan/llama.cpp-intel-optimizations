@@ -142,7 +142,10 @@ def violations(source: str) -> list[str]:
             and "q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated" in source,
         "Q1/NVFP4 recipe is decode-only": "phase == moe_route_phase::DECODE && rows == 1" in capability,
         "Q1/NVFP4 recipe is exact primary": "route_device == submit_device" in capability,
-        "Q1/NVFP4 recipe requires stable owner": "direct_recipe_candidate->has_stable_owner_identity()" in capability,
+        # The recipe asks the binder for an exact allocation identity, the test bind() applies; a handle-kind
+        # test refused every arena-slice lease (llama.cpp-1sxq).
+        "Q1/NVFP4 recipe requires exact identity":
+            "canonical_allocation_integration::exact_identity(*direct_recipe_candidate)" in capability,
     }
     failures.extend(name for name, ok in requirements.items() if not ok)
     # A renamed anchor must read differently from a genuine reorder.

@@ -101,11 +101,26 @@ struct mmid_batch_binding {
     retained_allocation_owner owner;
 };
 
+// The exact allocation identity a handle carries: the allocator-minted id,
+// generation and extent of its allocation, and the device that owns it.
+struct canonical_allocation_identity {
+    uint64_t allocation_id = 0;
+    uint64_t generation    = 0;
+    int      device        = -1;
+    size_t   extent        = 0;
+};
+
 class canonical_allocation_integration final {
   public:
-    // Mint retention capabilities only from a smart handle's allocator/cache
-    // identity. Raw DIRECT handles and caller-provided identity labels are
-    // deliberately rejected.
+    // The one identity test. It answers whether a handle carries an exact,
+    // allocator-minted allocation identity, and returns that identity. An arena
+    // slice and an owner-backed handle qualify; an id-less WEIGHT handle, an
+    // ownerless DIRECT handle and a compatibility CHUNK_LEASE do not. Any code
+    // that needs to know whether retain() would accept a handle asks this
+    // instead of testing the handle's kind (llama.cpp-1sxq).
+    static std::optional<canonical_allocation_identity> exact_identity(const ggml_sycl::mem_handle & handle) noexcept;
+    // Mint retention capabilities only from the identity exact_identity()
+    // returns. Caller-provided identity labels are deliberately rejected.
     static std::optional<retained_allocation_owner> retain(const ggml_sycl::mem_handle & handle) noexcept;
     static std::optional<mmid_batch_binding> bind(const ggml_sycl::mem_handle & handle,
                                                   uint64_t                       layout_id,

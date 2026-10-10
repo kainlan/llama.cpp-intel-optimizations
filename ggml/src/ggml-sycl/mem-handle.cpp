@@ -948,40 +948,49 @@ void mem_handle::set_canonical_identity_for_test(uint64_t allocation_id, uint64_
 }
 #endif
 
+// Every read below is a field load, an atomic spin lock or a noexcept owner
+// query, so the test cannot throw and needs no catch of its own.
+std::optional<moe::canonical_allocation_identity> moe::canonical_allocation_integration::exact_identity(
+    const mem_handle & handle) noexcept {
+    canonical_allocation_identity identity;
+    {
+        mem_handle_lock_guard guard(handle.lock_);
+        if (!handle.cached_.ptr) {
+            return std::nullopt;
+        }
+        identity.device        = handle.owned_alloc_ ? handle.owned_alloc_.metadata().device : handle.device_;
+        identity.allocation_id = handle.canonical_allocation_id_;
+        identity.generation    = handle.canonical_generation_;
+        identity.extent        = handle.canonical_extent_;
+        if (handle.kind_ == mem_handle_kind::WEIGHT && identity.allocation_id == 0) {
+            // Cache-entry minted IDs/replacement generations are not yet
+            // propagated by unified-cache. Never substitute a key hash.
+            return std::nullopt;
+        }
+        if (!handle.owned_alloc_ && !handle.is_arena() && handle.kind_ != mem_handle_kind::WEIGHT) {
+            // Non-owning DIRECT and compatibility CHUNK_LEASE handles do
+            // not carry an exact allocation identity/range.
+            return std::nullopt;
+        }
+    }
+    if (identity.allocation_id == 0 || identity.generation == 0 || identity.device < 0 ||
+        identity.device >= static_cast<int>(execution::max_devices) || identity.extent == 0) {
+        return std::nullopt;
+    }
+    return identity;
+}
+
 std::optional<moe::retained_allocation_owner> moe::canonical_allocation_integration::retain(
     const mem_handle & handle) noexcept {
     try {
-        uint64_t allocation_id = 0;
-        uint64_t generation    = 0;
-        int      device        = mem_handle::HOST_DEVICE;
-        size_t   extent        = 0;
-        {
-            mem_handle_lock_guard guard(handle.lock_);
-            if (!handle.cached_.ptr) {
-                return std::nullopt;
-            }
-            device        = handle.owned_alloc_ ? handle.owned_alloc_.metadata().device : handle.device_;
-            allocation_id = handle.canonical_allocation_id_;
-            generation    = handle.canonical_generation_;
-            extent        = handle.canonical_extent_;
-            if (handle.kind_ == mem_handle_kind::WEIGHT && allocation_id == 0) {
-                // Cache-entry minted IDs/replacement generations are not yet
-                // propagated by unified-cache. Never substitute a key hash.
-                return std::nullopt;
-            }
-            if (!handle.owned_alloc_ && !handle.is_arena() && handle.kind_ != mem_handle_kind::WEIGHT) {
-                // Non-owning DIRECT and compatibility CHUNK_LEASE handles do
-                // not carry an exact allocation identity/range.
-                return std::nullopt;
-            }
-        }
-        if (allocation_id == 0 || generation == 0 || device < 0 ||
-            device >= static_cast<int>(execution::max_devices) || extent == 0) {
+        const auto identity = exact_identity(handle);
+        if (!identity) {
             return std::nullopt;
         }
         auto retained_handle = std::make_shared<mem_handle>(handle);
         std::shared_ptr<const void> owner = retained_handle;
-        return retained_allocation_owner(allocation_id, generation, device, extent, std::move(owner));
+        return retained_allocation_owner(identity->allocation_id, identity->generation, identity->device,
+                                         identity->extent, std::move(owner));
     } catch (...) {
         return std::nullopt;
     }
