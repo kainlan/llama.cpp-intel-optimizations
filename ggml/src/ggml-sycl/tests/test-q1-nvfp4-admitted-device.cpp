@@ -59,8 +59,9 @@ void require_stages(bool condition, const std::string & message, const ggml_sycl
     }
 }
 
-// The case running now, for report_terminate(). Markers are only appended: std::deque::push_back keeps references to
-// existing elements valid, so a terminate on a SYCL worker thread never reads a marker the main thread is rewriting.
+// The case running now and the last case that ended, for report_terminate(). Markers are only appended:
+// std::deque::push_back keeps references to existing elements valid, so a terminate on a SYCL worker thread never
+// reads a marker the main thread is rewriting.
 struct case_marker {
     std::string                      name;
     ggml_sycl_q1_nvfp4_test_counters before{};
@@ -68,25 +69,48 @@ struct case_marker {
 
 std::deque<case_marker>          g_case_markers;
 std::atomic<const case_marker *> g_running_case{ nullptr };
+std::atomic<const case_marker *> g_ended_case{ nullptr };
 std::terminate_handler           g_previous_terminate = nullptr;
 
-void begin_case(std::string name, const ggml_sycl_q1_nvfp4_test_counters & before) {
-    g_case_markers.push_back({ std::move(name), before });
-    g_running_case.store(&g_case_markers.back(), std::memory_order_release);
-}
+// Publishes a case as the running one for as long as it is in scope. On scope exit, by return or by a throw, the case
+// becomes the last ended one, so a terminate in the code between cases (graph churn, the next case's fixture and graph
+// setup, teardown) is reported as after that case rather than during it.
+struct case_scope {
+    case_scope(std::string name, const ggml_sycl_q1_nvfp4_test_counters & before) {
+        g_case_markers.push_back({ std::move(name), before });
+        marker = &g_case_markers.back();
+        g_running_case.store(marker, std::memory_order_release);
+    }
+
+    ~case_scope() {
+        g_ended_case.store(marker, std::memory_order_release);
+        g_running_case.store(nullptr, std::memory_order_release);
+    }
+
+    case_scope(const case_scope &)             = delete;
+    case_scope & operator=(const case_scope &) = delete;
+
+    const case_marker * marker = nullptr;
+};
 
 // The seventh case, injected_async_terminal_failure_case, terminates instead of failing a check: its injected
 // host-task exception reaches the SYCL default async handler, which calls std::terminate, because the backend's
-// execution queues carry no async_handler (llama.cpp-kjoc). Name the running case and print its stage deltas first,
-// then hand over to the previous handler (ggml's, which prints a backtrace), so the run still aborts red (rc 134).
+// execution queues carry no async_handler (llama.cpp-kjoc). Name the running case, or the last one that ended when
+// none is running, and print its stage deltas first. Then hand over to the previous handler (ggml's, which prints a
+// backtrace), so the run still aborts red (rc 134).
 [[noreturn]] void report_terminate() {
-    if (const case_marker * marker = g_running_case.load(std::memory_order_acquire)) {
+    if (const case_marker * running = g_running_case.load(std::memory_order_acquire)) {
         ggml_sycl_q1_nvfp4_test_counters now{};
         ggml_sycl_q1_nvfp4_test_counters_read(&now);
-        std::cerr << "FAIL: terminated during case " << marker->name
-                  << "; stages since case start: " << stage_deltas(marker->before, now) << std::endl;
+        std::cerr << "FAIL: terminated during case " << running->name
+                  << "; stages since case start: " << stage_deltas(running->before, now) << std::endl;
+    } else if (const case_marker * ended = g_ended_case.load(std::memory_order_acquire)) {
+        ggml_sycl_q1_nvfp4_test_counters now{};
+        ggml_sycl_q1_nvfp4_test_counters_read(&now);
+        std::cerr << "FAIL: terminated after case " << ended->name
+                  << " ended; stages since that case started: " << stage_deltas(ended->before, now) << std::endl;
     } else {
-        std::cerr << "FAIL: terminated outside a case" << std::endl;
+        std::cerr << "FAIL: terminated before any case started" << std::endl;
     }
     if (g_previous_terminate) {
         g_previous_terminate();
@@ -367,13 +391,22 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
     return c;
 }
 
-void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11) {
+// `graph` tags the graph in every label, so graph A and graph B of one churn regression stay distinguishable.
+void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11, const char * graph) {
     std::vector<float> oracle; size_t count = 0; auto c = make_graph(life.backend, type, ne11, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, first{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
-    const std::string where = std::string(" (type=") + ggml_type_name(type) + " ne11=" + std::to_string(ne11);
-    begin_case("successful_reuse_case" + where + ")", before);
+    constexpr int no_pass = -1;
+    const auto    label   = [&](int pass) {
+        std::string text =
+            std::string(" (type=") + ggml_type_name(type) + " ne11=" + std::to_string(ne11) + " graph=" + graph;
+        if (pass != no_pass) {
+            text += " pass=" + std::to_string(pass);
+        }
+        return text + ")";
+    };
+    const case_scope scope("successful_reuse_case" + label(no_pass), before);
     for (int pass = 0; pass < 2; ++pass) {
-        const std::string at = where + " pass=" + std::to_string(pass) + ")";
+        const std::string at = label(pass);
         require_stages(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
                        "production graph compute failed" + at, before);
         ggml_backend_synchronize(life.backend);
@@ -390,7 +423,7 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11) {
     }
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
     const auto observed = [&]() {
-        return where + "): observed first=(slot=" + std::to_string(first.workspace_slot) +
+        return label(no_pass) + ": observed first=(slot=" + std::to_string(first.workspace_slot) +
                ", generation=" + std::to_string(first.workspace_generation) +
                ") after=(slot=" + std::to_string(after.workspace_slot) +
                ", generation=" + std::to_string(after.workspace_generation) +
@@ -411,7 +444,7 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11) {
 
 void graph_churn_regression(lifecycle_fixture & life, ggml_type type, int ne11) {
     // Graph A publishes metadata, runs twice, and is destroyed by the helper.
-    successful_reuse_case(life, type, ne11);
+    successful_reuse_case(life, type, ne11, "A");
 
     // Force allocator/address churn before graph B reuses the same tensor name.
     // A persistent borrowed tensor/extra/data pointer is likely to become stale.
@@ -426,16 +459,16 @@ void graph_churn_regression(lifecycle_fixture & life, ggml_type type, int ne11) 
     }
 
     // Graph B must resolve the canonical value key and run twice independently.
-    successful_reuse_case(life, type, ne11);
+    successful_reuse_case(life, type, ne11, "B");
 }
 
 void injected_failure_case(ggml_sycl_q1_nvfp4_test_failure failure, bool expect_quarantine) {
     lifecycle_fixture life; std::vector<float> oracle; size_t count = 0;
     auto c = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
-    begin_case(failure == GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK ? "injected_failure_case (pre-mark)" :
-                                                                     "injected_failure_case (post-mark)",
-               before);
+    const case_scope scope(failure == GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK ? "injected_failure_case (pre-mark)" :
+                                                                                 "injected_failure_case (post-mark)",
+                           before);
     ggml_sycl_q1_nvfp4_test_failure_once(failure);
     require_stages(ggml_backend_graph_compute(life.backend, c.graph) != GGML_STATUS_SUCCESS,
                    "injected failure was not reported", before);
@@ -459,7 +492,7 @@ void injected_async_terminal_failure_case() {
     lifecycle_fixture life; std::vector<float> oracle; size_t count = 0;
     auto c = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
-    begin_case("injected_async_terminal_failure_case", before);
+    const case_scope scope("injected_async_terminal_failure_case", before);
     ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL);
     require_stages(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
                    "async terminal fixture failed before submission", before);
