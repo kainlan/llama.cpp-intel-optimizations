@@ -64,7 +64,7 @@ def function(text: str, signature: str) -> str:
     raise AssertionError(f"unclosed function {signature}")
 
 
-def before(text: str, first: str, second: str) -> bool:
+def before(text: str, first: str, second: str, missing: list[str]) -> bool:
     """True iff both anchors occur and `first` precedes `second`.
 
     Fail closed: a missing anchor is a False claim (a named FAIL), never a
@@ -72,11 +72,13 @@ def before(text: str, first: str, second: str) -> bool:
     """
     a = text.find(first)
     b = text.find(second)
+    missing.extend(anchor for anchor, at in ((first, a), (second, b)) if at < 0)
     return a >= 0 and b >= 0 and a < b
 
 
 def violations(source: str) -> list[str]:
     failures: list[str] = []
+    missing_anchors: list[str] = []
     publish = function(source, "static bool ggml_sycl_publish_backend_aos_expert_handles")
     invalidate = function(source, "static void ggml_sycl_invalidate_backend_weight_mutation")
     invalidate_buffer = function(source, "static void ggml_sycl_invalidate_backend_buffer_weights")
@@ -125,10 +127,10 @@ def violations(source: str) -> list[str]:
         "clear invalidates": "ggml_sycl_invalidate_backend_buffer_weights(ctx)" in clearer,
         "complete upload readiness": "is_moe_expert && offset == 0 && size == ggml_nbytes(tensor)" in setter,
         "withdraw before publish": setter.find("ggml_sycl_invalidate_backend_weight_mutation") < setter.find("ggml_sycl_publish_backend_aos_expert_handles"),
-        "resolver checks plan before registered handles": before(route, "plan_owner->find_expert_entry(", "ggml_sycl_try_moe_storage_handle_route"),
+        "resolver checks plan before registered handles": before(route, "plan_owner->find_expert_entry(", "ggml_sycl_try_moe_storage_handle_route", missing_anchors),
         "active plan rejects unnamed tensors": "if (!src0->name || src0->name[0] == '\\0')" in route and "route.plan_missing = true" in route,
-        "resolver checks registered handles before requiring key": before(route, "ggml_sycl_try_moe_storage_handle_route", "if (!base_key.valid)"),
-        "resolver requires key only for cache fallback": before(route, "if (!base_key.valid)", "expert_resolve_result resolved = cache->resolve_expert(req);"),
+        "resolver checks registered handles before requiring key": before(route, "ggml_sycl_try_moe_storage_handle_route", "if (!base_key.valid)", missing_anchors),
+        "resolver requires key only for cache fallback": before(route, "if (!base_key.valid)", "expert_resolve_result resolved = cache->resolve_expert(req);", missing_anchors),
         # The call is anchored by its declaration, not by "cache->resolve_expert": the fast-path comment above
         # the key check (cd374e392, llama.cpp-iikr) names that call in prose and sat before the guard.
         "resolver retains canonical lease": "route.lease" in route and "logical.logical_handle" in storage_route,
@@ -143,6 +145,8 @@ def violations(source: str) -> list[str]:
         "Q1/NVFP4 recipe requires stable owner": "direct_recipe_candidate->has_stable_owner_identity()" in capability,
     }
     failures.extend(name for name, ok in requirements.items() if not ok)
+    # A renamed anchor must read differently from a genuine reorder.
+    failures.extend(f"missing anchor: {anchor}" for anchor in missing_anchors)
 
     forbidden = ("from_chunk_ptr", "from_direct", "query_registered_location", "unified_lookup", "register_ready")
     for token in forbidden:
@@ -204,6 +208,13 @@ def test_admission_pin_and_ordering_claims_reject_mutants() -> None:
             assert mutant != source, f"{claim}[{i}]: mutation did not change the source"
             failures = violations(mutant)
             assert claim in failures, f"{claim}[{i}]: mutant not rejected by that claim: {failures}"
+            # Odd variants rename an anchor (ordering) or are pin mutants; only a
+            # rename must additionally name the absent anchor.
+            has_missing = any(f.startswith("missing anchor: ") for f in failures)
+            if claim.startswith("resolver") and i == 1:
+                assert has_missing, f"{claim}[{i}]: absent anchor not named: {failures}"
+            else:
+                assert not has_missing, f"{claim}[{i}]: spurious missing-anchor report: {failures}"
 
 
 def test_moe_metadata_registry_is_value_only_and_consumers_retain_sources() -> None:
