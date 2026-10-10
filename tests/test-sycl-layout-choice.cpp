@@ -1873,6 +1873,134 @@ static bool run_multi_device_no_p2p_cohesive_moe_layer_test() {
     return true;
 }
 
+// llama.cpp-n8da: with two physical GPUs the backend exposes only device 0 to the registry by default, yet the
+// multi-device planner budgets both, so experts (or their decode alternates) may land on device 1. An MMID workspace is
+// admitted only by a backend context on its owner, and no backend context can exist for a hidden device, so the plan
+// must not carry a workspace for device 1, nor refuse the pool because device 1's experts have no owner. The second arm
+// exposes both devices (a split mode) and is the control that the rule keys on exposure, not on "secondary".
+static bool run_multi_device_mmid_owner_exposure_test() {
+    constexpr size_t mib           = 1024u * 1024u;
+    constexpr int    n_expert_used = 4;
+
+    const std::vector<ggml_sycl::placement_tensor_info> inventory = moe_pp_inventory();
+    const std::vector<ggml_sycl::device_budget>         devices   = {
+        { 0, 1024u * mib, 1024u * mib, 4.0, true },
+        { 1, 1024u * mib, 1024u * mib, 4.0, true },
+    };
+    ggml_sycl::placement_kv_info kv_info{};
+    kv_info.n_ubatch      = 512;
+    kv_info.n_expert_used = n_expert_used;
+
+    ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
+
+    auto plan_with_exposed = [&](int exposed) {
+        ggml_sycl_device_info info = make_mock_sycl_info(2);
+        info.device_count          = exposed;  // total_gpu_count stays 2
+        ggml_sycl::test_sycl_info_override_guard info_guard(info);
+        return ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
+                                                    nullptr, moe_pp_n_experts);
+    };
+    // Expert entries whose on-device placement, or one of whose alternates, targets `device`.
+    auto experts_on = [](const ggml_sycl::placement_plan & plan, int device) {
+        size_t count = 0;
+        for (const auto & entry : plan.entries) {
+            if (entry.expert_id < 0) {
+                continue;
+            }
+            bool on = entry.on_device && entry.target_device == device;
+            for (const auto & alternate : entry.alternate_layouts) {
+                const int target = alternate.target_device >= 0 ? alternate.target_device : entry.target_device;
+                on               = on || target == device;
+            }
+            count += on ? 1 : 0;
+        }
+        return count;
+    };
+    auto has_owner = [](const ggml_sycl::placement_plan & plan, int device) {
+        for (const auto & workspace : plan.moe_mmid_workspaces) {
+            if (workspace.valid && workspace.owner_device == device) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // Re-runs the planner's workspace pass (the runtime re-plan reuses plan_moe_mmid_workspaces) on `replanned` with
+    // every device exposed. When it succeeds, a workspace on a device means the placement gives that device an
+    // executable expert owner, so a tree that ignored exposure would have planned one at load. The re-plan also
+    // re-checks the budgets, so a refusal says nothing about ownership; the caller reports it on its own.
+    auto replan_all_exposed = [&](ggml_sycl::placement_plan & replanned, ggml_sycl::moe_mmid_runtime_reason * reason) {
+        ggml_sycl_device_info info = make_mock_sycl_info(2);
+        info.device_count          = 2;
+        ggml_sycl::test_sycl_info_override_guard info_guard(info);
+        return ggml_sycl::replan_moe_mmid_workspaces_for_runtime(replanned, inventory, n_expert_used, reason);
+    };
+
+    bool ok = true;
+    {
+        const auto                         plan          = plan_with_exposed(1);
+        const size_t                       on0           = experts_on(plan, 0);
+        const size_t                       on1           = experts_on(plan, 1);
+        bool                               arm           = true;
+        // Positive control: this placement gives device 1 an EXECUTABLE expert owner (an on-device expert or an
+        // executable alternate there), not just an entry naming it, so a tree that ignored exposure would plan a
+        // workspace on device 1 and fail below.
+        ggml_sycl::placement_plan          replanned     = plan;
+        ggml_sycl::moe_mmid_runtime_reason replan_reason = ggml_sycl::moe_mmid_runtime_reason::OK;
+        if (!replan_all_exposed(replanned, &replan_reason)) {
+            printf(
+                "FAIL: MMID owner exposure, 1 of 2 exposed: the all-exposed re-plan refused (reason=%s), so whether "
+                "device 1 has an executable expert owner is unknown\n",
+                ggml_sycl::moe_mmid_runtime_reason_name(replan_reason));
+            arm = false;
+        } else if (on1 == 0 || !has_owner(replanned, 1)) {
+            printf(
+                "FAIL: MMID owner exposure, 1 of 2 exposed: vacuous fixture, no executable expert owner on device 1 "
+                "(entries targeting device1=%zu, all-exposed re-plan owner1=%d)\n",
+                on1, has_owner(replanned, 1) ? 1 : 0);
+            arm = false;
+        }
+        for (const auto & workspace : plan.moe_mmid_workspaces) {
+            if (workspace.owner_device != 0) {
+                printf(
+                    "FAIL: MMID owner exposure, 1 of 2 exposed: workspace planned for hidden device %d "
+                    "(no backend context can bind or admit it)\n",
+                    workspace.owner_device);
+                arm = false;
+            }
+        }
+        if (!plan.moe_mmid_workspace_valid || (on0 > 0 && !has_owner(plan, 0))) {
+            printf(
+                "FAIL: MMID owner exposure, 1 of 2 exposed: primary pool not planned, valid=%d owner0=%d "
+                "experts on device0=%zu device1=%zu\n",
+                plan.moe_mmid_workspace_valid ? 1 : 0, has_owner(plan, 0) ? 1 : 0, on0, on1);
+            arm = false;
+        }
+        if (arm) {
+            printf(
+                "PASS: MMID owner exposure, 1 of 2 exposed: %zu expert entries on hidden device 1, an executable "
+                "owner there, and no workspace there; %zu workspace(s), primary owner=%d\n",
+                on1, plan.moe_mmid_workspaces.size(), has_owner(plan, 0) ? 1 : 0);
+        }
+        ok = arm && ok;
+    }
+    {
+        const auto plan = plan_with_exposed(2);
+        const bool arm  = experts_on(plan, 1) > 0 && plan.moe_mmid_workspace_valid && has_owner(plan, 1);
+        if (arm) {
+            printf(
+                "PASS: MMID owner exposure, 2 of 2 exposed (control): device 1 is an exposed owner and keeps its "
+                "workspace\n");
+        } else {
+            printf(
+                "FAIL: MMID owner exposure, 2 of 2 exposed (control): expected a workspace for device 1, "
+                "experts on device1=%zu valid=%d owner1=%d\n",
+                experts_on(plan, 1), plan.moe_mmid_workspace_valid ? 1 : 0, has_owner(plan, 1) ? 1 : 0);
+        }
+        ok = arm && ok;
+    }
+    return ok;
+}
+
 static bool run_regression_guard_policy_test() {
     if (ggml_sycl::test_moe_primary_uses_expert_handles(
             /*planner_primary_fastpath_guard_active=*/false,
@@ -3121,6 +3249,8 @@ int main() {
         mock_ok = run_multi_device_no_p2p_cohesive_moe_layer_test() && mock_ok;
         mock_ok = run_regression_guard_policy_test() && mock_ok;
     }
+    // Its own device-info overrides (1 and 2 exposed of 2 physical), so it runs outside the shared mock's guard.
+    mock_ok = run_multi_device_mmid_owner_exposure_test() && mock_ok;
     if (!mock_ok) {
         return 1;
     }

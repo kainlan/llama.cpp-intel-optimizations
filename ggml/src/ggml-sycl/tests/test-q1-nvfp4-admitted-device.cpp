@@ -1,4 +1,10 @@
 // BUILD_TESTING-only live regression for the closed Q1/NVFP4 production MMID route.
+//
+// Scoring (llama.cpp-n8da): the registration pins one card, and on it the run must report Passed with Skipped=0. A skip
+// there is not an environment gap but a regression to read: SKIP[off-primary] means the plan moved a selected expert
+// off the primary card (to the host or another card), which the closed route cannot reach; SKIP[no-backend] means no
+// backend could be created for an owner device. Each skip line carries its tag so a log grep can tell them apart from
+// the no-GPU skip.
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "q1-nvfp4-production-route-test-seam.hpp"
 #include "ggml-quants.h"
@@ -18,9 +24,19 @@
 #include <sycl/sycl.hpp>
 
 namespace {
-constexpr int gate_output_n = 96;
+constexpr int     gate_output_n                       = 96;
+constexpr int     route_top_k                         = 3;
+constexpr int32_t route_selected_experts[route_top_k] = { 3, 1, 3 };  // repeated, non-monotonic
 
 void require(bool condition, const char * message) { if (!condition) throw std::runtime_error(message); }
+
+// The environment cannot exercise what this test covers; main() reports it as ctest's skip (77), never as a pass, on a
+// line prefixed SKIP[<tag>] so each cause stays distinguishable in a log.
+struct test_skip : std::runtime_error {
+    test_skip(const char * tag, const std::string & why) : std::runtime_error(why), tag(tag) {}
+
+    const char * tag;
+};
 
 struct synthetic_inventory {
     ggml_sycl_tensor_info tensors[3]{};
@@ -72,28 +88,73 @@ struct lifecycle_fixture {
             require(candidate && candidate->plan && !candidate->plan->moe_mmid_workspaces.empty(),
                     "inventory candidate has no MMID workspace owners");
 
-            // Inventory staging uses temporary backends. Create fresh retained
-            // backends afterwards, one per unique owner device, so load_end's
-            // exact-queue lookup cannot observe a transient context that was cleared.
+            // An MMID owner is a device the registry exposes (llama.cpp-n8da): admission names the submitting
+            // backend context's device, and ggml_backend_sycl_init takes only a registry index. With two cards the
+            // backend exposes device 0 alone while the planner budgets both, so an owner past the registry is a
+            // planner defect this test must report, not an index to hand to the registry.
+            const int    exposed_devices = ggml_backend_sycl_get_device_count();
+            // A multi-device plan carries device_id -1; its primary is the first planned device, the same rule
+            // plan_moe_mmid_workspaces() and the materialization's submit device use.
+            const auto & plan            = *candidate->plan;
+            const int    primary_device  = plan.device_id >= 0   ? plan.device_id :
+                                           !plan.devices.empty() ? plan.devices.front() :
+                                                                   -1;
+            require(primary_device >= 0 && primary_device < exposed_devices,
+                    "candidate plan has no primary device the registry exposes");
             std::unordered_set<int> owner_devices;
             for (const auto & workspace : candidate->plan->moe_mmid_workspaces) {
                 require(workspace.valid && workspace.owner_device >= 0, "invalid candidate MMID owner");
+                if (workspace.owner_device >= exposed_devices) {
+                    throw std::runtime_error("candidate MMID owner device " + std::to_string(workspace.owner_device) +
+                                             " is not a registry device (registry exposes " +
+                                             std::to_string(exposed_devices) + "): planner/registry owner contract");
+                }
                 owner_devices.insert(workspace.owner_device);
             }
+            // The closed route admits primary residency only; a selected expert the plan put elsewhere (a secondary
+            // card or the host) cannot reach it, so this environment cannot exercise the route.
+            for (int expert : route_selected_experts) {
+                bool found = false;
+                for (const auto & entry : candidate->plan->entries) {
+                    if (entry.expert_id != expert || entry.name != "blk.0.ffn_gate_exps.weight") {
+                        continue;
+                    }
+                    found = true;
+                    if (!entry.on_device || entry.target_device != primary_device) {
+                        throw test_skip("off-primary",
+                                        "selected expert " + std::to_string(expert) + " is planned on " +
+                                            (entry.on_device ? "device " + std::to_string(entry.target_device) :
+                                                               std::string("the host")) +
+                                            ", not primary device " + std::to_string(primary_device) +
+                                            "; the closed route covers primary residency only "
+                                            "(pin ONEAPI_DEVICE_SELECTOR to one card)");
+                    }
+                }
+                require(found, "selected expert has no gate placement entry in the candidate plan");
+            }
+
+            // Inventory staging uses temporary backends. Create fresh retained
+            // backends afterwards, one per unique owner device, so load_end's
+            // exact-queue lookup cannot observe a transient context that was cleared.
             retained_backends.reserve(owner_devices.size());
             for (int device : owner_devices) {
                 using backend_owner = std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)>;
                 backend_owner retained(ggml_backend_sycl_init(device), &ggml_backend_free);
-                require(retained != nullptr, "candidate owner backend initialization failed");
+                if (retained == nullptr) {
+                    throw test_skip("no-backend", "no backend for candidate owner device " + std::to_string(device) +
+                                                      " (ggml_backend_sycl_init returned null)");
+                }
                 retained_backends.push_back(retained.get());
-                if (!backend || device == candidate->plan->device_id) backend = retained.get();
+                if (!backend || device == primary_device) {
+                    backend = retained.get();
+                }
                 retained.release();
             }
             require(backend != nullptr, "no primary candidate owner backend");
 
             // Same-device registry is a stack: a short-lived newer backend B
             // must not erase the retained backend A selected above.
-            ggml_backend_t shadow = ggml_backend_sycl_init(candidate->plan->device_id);
+            ggml_backend_t shadow = ggml_backend_sycl_init(primary_device);
             require(shadow != nullptr && shadow != backend, "same-device backend B initialization failed");
             ggml_backend_free(shadow);
 
@@ -192,7 +253,7 @@ struct graph_case {
 
 graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
                       std::vector<float> & oracle, size_t & output_count) {
-    constexpr int experts = 4, top_k = 3, tokens = 1;
+    constexpr int experts = 4, top_k = route_top_k, tokens = 1;
     const int K = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
     graph_case c;
     c.ctx = ggml_init({ 8 * 1024 * 1024, nullptr, true }); require(c.ctx, "ggml_init failed");
@@ -226,7 +287,7 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
     }
     std::vector<float> activation(static_cast<size_t>(ne11) * K);
     for (size_t i = 0; i < activation.size(); ++i) activation[i] = 0.2f + float((i * 5) % 19) / 31.0f;
-    const int32_t selected[top_k] = { 3, 1, 3 }; // repeated, non-monotonic
+    const auto & selected = route_selected_experts;  // an array reference, so sizeof(selected) is the array's size
     ggml_backend_tensor_set(weights, packed.data(), 0, packed.size());
     ggml_backend_tensor_set(input, activation.data(), 0, activation.size() * sizeof(float));
     ggml_backend_tensor_set(ids, selected, 0, sizeof(selected));
@@ -353,6 +414,14 @@ int main() {
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK, true);
         injected_async_terminal_failure_case();
         std::cout << "Q1/NVFP4 scoped production-route lifecycle: PASS\n"; return 0;
-    } catch (const sycl::exception & e) { std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n'; return LLAMA_TEST_EXIT_SKIP; }
-      catch (const std::exception & e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
+    } catch (const test_skip & e) {
+        std::cerr << "SKIP[" << e.tag << "]: " << e.what() << '\n';
+        return LLAMA_TEST_EXIT_SKIP;
+    } catch (const sycl::exception & e) {
+        std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n';
+        return LLAMA_TEST_EXIT_SKIP;
+    } catch (const std::exception & e) {
+        std::cerr << "FAIL: " << e.what() << '\n';
+        return 1;
+    }
 }

@@ -29829,6 +29829,15 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
     return zone_inventory;
 }
 
+// The bound on MMID workspace owners (llama.cpp-n8da). Owners are planner (logical GPU) indices, and the multi-GPU
+// planner budgets every physical GPU (ggml_sycl_info().total_gpu_count), so an expert may sit on a device the registry
+// does not expose. A workspace there could never be bound or admitted: ggml_backend_sycl_init() refuses any index at or
+// past the registry's count. That count is ggml_sycl_info().device_count, the one ggml_backend_sycl_reg() builds its
+// device list from, so it is the bound; the physical count is wrong here.
+static int moe_mmid_exposed_owner_count() {
+    return ggml_sycl_info().device_count;
+}
+
 static void plan_moe_mmid_workspaces(placement_plan &                           plan,
                                      const std::vector<placement_tensor_info> & tensor_inventory,
                                      int                                        n_expert_used) {
@@ -29847,6 +29856,7 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
     }
 
     const int primary_device = plan.device_id >= 0 ? plan.device_id : (plan.devices.empty() ? -1 : plan.devices.front());
+    const int exposed_devices = moe_mmid_exposed_owner_count();
     std::map<int, moe_mmid_workspace_geometry> maxima;
     for (const placement_tensor_info & item : tensor_inventory) {
         if (!item.has_shape() || expert_tensor_role_from_tensor_name(item.name.c_str()) == expert_tensor_role::UNKNOWN ||
@@ -29894,6 +29904,9 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
         for (const auto & owner_entry : actual_owners) {
             const int  owner     = owner_entry.first;
             const bool secondary = owner_entry.second;
+            if (!moe_mmid_owner_admissible(owner, exposed_devices)) {
+                continue;
+            }
             moe_mmid_shape shape;
             shape.ne10  = static_cast<size_t>(item.ne[0]);
             shape.ne01  = static_cast<size_t>(item.ne[1]);
@@ -30109,16 +30122,20 @@ static void validate_moe_mmid_execution_owners(placement_plan & plan) {
                                return workspace.valid && workspace.owner_device == device;
                            });
     };
+    // An expert on a device the registry does not expose needs no owner: no admission can name that device, and
+    // plan_moe_mmid_workspaces() planned none there (same bound).
+    const int exposed_devices = moe_mmid_exposed_owner_count();
     for (const placement_entry & entry : plan.entries) {
         if (entry.expert_id < 0) {
             continue;
         }
-        if (entry.on_device && entry.target_device >= 0 && !has_owner(entry.target_device)) {
+        if (entry.on_device && moe_mmid_owner_admissible(entry.target_device, exposed_devices) &&
+            !has_owner(entry.target_device)) {
             plan.moe_mmid_workspace_valid = false;
         }
         for (const placement_alternate_layout & alternate : entry.alternate_layouts) {
             const int target = alternate.target_device >= 0 ? alternate.target_device : entry.target_device;
-            if (target < 0) {
+            if (!moe_mmid_owner_admissible(target, exposed_devices)) {
                 continue;
             }
             const bool primary = target == plan.device_id;

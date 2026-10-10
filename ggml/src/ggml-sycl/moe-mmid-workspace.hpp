@@ -85,6 +85,14 @@ bool moe_mmid_checked_pool_bytes(const moe_mmid_workspace_geometry & geometry,
 bool moe_mmid_checked_zone_total(size_t base_bytes, size_t workspace_bytes, size_t * out) noexcept;
 bool moe_mmid_checked_product(size_t count, size_t bytes, size_t * out) noexcept;
 bool moe_mmid_debit_device_budget(size_t workspace_bytes, size_t * remaining_bytes) noexcept;
+// Can an MMID workspace for owner_device ever be bound and admitted? Admission names the submitting backend context's
+// device as the owner, and a backend context exists only for a device the backend registry exposes
+// (exposed_device_count = ggml_sycl_info().device_count, the count ggml_backend_sycl_reg() sizes its device list from,
+// never the physical ggml_sycl_info().total_gpu_count): ggml_backend_sycl_init refuses any index at or past it. With
+// two physical GPUs the default exposes device 0 alone, so a workspace for a hidden device is VRAM nothing can use, and
+// its missing queue binding fails the all-or-nothing materialization for every owner. The planner plans a workspace,
+// and requires one for an executing expert, only where this holds (llama.cpp-n8da).
+bool moe_mmid_owner_admissible(int owner_device, int exposed_device_count) noexcept;
 
 // Mints [1, UINT64_MAX-1] exactly once. Saturates fail-closed at exhaustion.
 // The caller-owned atomic permits deterministic near-overflow testing.
