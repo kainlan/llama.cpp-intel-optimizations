@@ -535,3 +535,11 @@ def test_mutant_init_warn_moved_out_of_ggml_check_sycl():
     k = moved.index("{", nxt) + 1
     m = moved[:k] + "\n" + block + "\n" + moved[k:]
     expect(check_init_warn(m), "expected exactly one #ifndef GGML_SYCL_MMQ_ESIMD_KERNELS block in ggml_check_sycl, found 0")
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

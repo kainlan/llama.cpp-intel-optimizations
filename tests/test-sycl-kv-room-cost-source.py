@@ -712,3 +712,11 @@ def test_mutant_summary_hides_a_full_refusal_fails():
 
 def test_mutant_swa_not_counted_fails():
     assert not claim_room_counts_each_attention_class(_once(CACHE, SWA_COUNT, ""))
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

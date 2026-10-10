@@ -292,3 +292,11 @@ def test_mutant_hot_layers_override_before_the_sizing_fails():
     assert cfg.count(HOT_ENV) == 1 and cfg.count(SIZES_RESET) == 1
     moved = cfg.replace(HOT_ENV, "", 1).replace(SIZES_RESET, HOT_ENV + " " + SIZES_RESET, 1)
     assert not claim_hot_layers_override_keeps_the_sizes(n.replace(cfg, moved, 1))
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

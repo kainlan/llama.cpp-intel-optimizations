@@ -665,3 +665,11 @@ def test_mutant_helper_ignores_ctx_fails():
     assert full.count(at_ctx) == 1
     mutant = n.replace(full, full.replace(at_ctx, "n_embd_k_gqa, n_embd_v_gqa, n_ctx,"), 1)
     assert not claim_uniform_fallback_has_one_formula(mutant)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))

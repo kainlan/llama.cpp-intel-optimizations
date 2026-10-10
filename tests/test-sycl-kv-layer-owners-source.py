@@ -249,3 +249,11 @@ def test_mutant_indexer_only_layer_shared_fails():
     """A layer holding only indexer keys published SHARED would cost nothing, and its keys would not be budgeted."""
     assert not claim_kind_comes_from_the_default_memory(
         _once(MODEL, UNOWNED_KIND, "out.kind[il] = GGML_SYCL_KV_LAYER_SHARED;"), SHAPES)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-q"]))
