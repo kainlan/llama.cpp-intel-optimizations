@@ -496,6 +496,10 @@ void test_clear_sycl_info_override();
 // test_restore_xmx_tiled_pp_route_override() to put back.
 int  test_set_xmx_tiled_pp_route_override(bool active);
 void test_restore_xmx_tiled_pp_route_override(int previous);
+// Forces ggml_sycl_moe_mmid_route_reachable_in_build() (defined in ggml-sycl.cpp) on or off. The setter returns the
+// override it replaced (-1 none, 0 closed, 1 open), for test_restore_moe_mmid_route_reachable_override() to put back.
+int  test_set_moe_mmid_route_reachable_override(bool reachable);
+void test_restore_moe_mmid_route_reachable_override(int previous);
 #endif
 int test_physical_device_count();
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -530,6 +534,20 @@ struct test_xmx_tiled_pp_route_override_guard {
 
     test_xmx_tiled_pp_route_override_guard(const test_xmx_tiled_pp_route_override_guard &)             = delete;
     test_xmx_tiled_pp_route_override_guard & operator=(const test_xmx_tiled_pp_route_override_guard &) = delete;
+
+    const int previous;
+};
+
+// Restores the override it replaced, so guards nest.
+struct test_moe_mmid_route_reachable_override_guard {
+    explicit test_moe_mmid_route_reachable_override_guard(bool reachable) :
+        previous(test_set_moe_mmid_route_reachable_override(reachable)) {}
+
+    ~test_moe_mmid_route_reachable_override_guard() { test_restore_moe_mmid_route_reachable_override(previous); }
+
+    test_moe_mmid_route_reachable_override_guard(const test_moe_mmid_route_reachable_override_guard &) = delete;
+    test_moe_mmid_route_reachable_override_guard & operator=(const test_moe_mmid_route_reachable_override_guard &) =
+        delete;
 
     const int previous;
 };

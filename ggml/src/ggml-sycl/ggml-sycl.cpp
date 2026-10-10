@@ -11918,6 +11918,39 @@ constexpr bool k_moe_mmid_route_compiled = false;
 #endif
 constexpr bool k_moe_mmid_route_reachable_compiled = k_moe_mmid_direct_route_validated || k_moe_mmid_route_compiled;
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Test-only: forces ggml_sycl_moe_mmid_route_reachable_in_build() so one test binary can plan under both answers.
+// -1 means no override (the compile-time constants decide), 0 forces the route closed, 1 forces it open.
+static std::atomic<int> g_test_moe_mmid_route_reachable_override{ -1 };
+#endif
+
+// The build-level half of MMID route reachability: can ANY context of this build execute the route? The planner has no
+// context, so the workspace pools' planning charge and the runtime re-plan of their demand ask this (declared in
+// common.hpp, llama.cpp-84ck), as do load_end's materialization and the per-context predicate below. In an ordinary
+// build it is false, so no pool is planned, charged or materialized. A forced-open override cannot compile the route
+// in; it only makes the planner charge the pool.
+bool ggml_sycl_moe_mmid_route_reachable_in_build() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    const int forced = g_test_moe_mmid_route_reachable_override.load(std::memory_order_acquire);
+    if (forced >= 0) {
+        return forced != 0;
+    }
+#endif
+    return k_moe_mmid_route_reachable_compiled;
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+namespace ggml_sycl {
+int test_set_moe_mmid_route_reachable_override(bool reachable) {
+    return g_test_moe_mmid_route_reachable_override.exchange(reachable ? 1 : 0, std::memory_order_acq_rel);
+}
+
+void test_restore_moe_mmid_route_reachable_override(int previous) {
+    g_test_moe_mmid_route_reachable_override.store(previous, std::memory_order_release);
+}
+}  // namespace ggml_sycl
+#endif
+
 // Full admission predicate, mirrored exactly -- compile-time half plus the
 // per-context runtime authorization the admission site also consults.
 static bool ggml_sycl_moe_mmid_route_reachable(const ggml_backend_sycl_context & ctx) {
