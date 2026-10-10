@@ -30,24 +30,24 @@ constexpr int32_t route_selected_experts[route_top_k] = { 3, 1, 3 };  // repeate
 
 void require(bool condition, const char * message) { if (!condition) throw std::runtime_error(message); }
 
-// How far the route got since a case started, in stage order. `candidate` counts at the direct gate after the batch
-// query offered the DIRECT recipe; `executed` counts in the host task that runs after the kernel completed. The first
-// stage whose delta is short of the expected count names the blocker (llama.cpp-1sxq).
-std::string stage_counters(const ggml_sycl_q1_nvfp4_test_counters & before,
-                           const ggml_sycl_q1_nvfp4_test_counters & now) {
+// How far the route got between two counter reads, in stage order. `candidate` counts at the direct gate after the
+// batch query offered the DIRECT recipe; `executed` counts in the host task that runs after the kernel completed. The
+// first stage whose delta is short of the expected count names the blocker (llama.cpp-1sxq).
+std::string stage_deltas(const ggml_sycl_q1_nvfp4_test_counters & before,
+                         const ggml_sycl_q1_nvfp4_test_counters & now) {
     const auto delta = [](uint64_t from, uint64_t to) {
         return std::to_string(to - from);
     };
-    return " stages since case start: candidate=+" + delta(before.candidate, now.candidate) + " admitted=+" +
-           delta(before.admit, now.admit) + " submitted=+" + delta(before.submit, now.submit) + " executed=+" +
-           delta(before.terminal, now.terminal) + " recycled=+" + delta(before.recycle, now.recycle) +
-           " quarantined=+" + delta(before.quarantine, now.quarantine);
+    return "candidate=+" + delta(before.candidate, now.candidate) + " admitted=+" + delta(before.admit, now.admit) +
+           " submitted=+" + delta(before.submit, now.submit) + " executed=+" + delta(before.terminal, now.terminal) +
+           " recycled=+" + delta(before.recycle, now.recycle) + " quarantined=+" +
+           delta(before.quarantine, now.quarantine);
 }
 
 [[noreturn]] void fail_stages(const std::string & message, const ggml_sycl_q1_nvfp4_test_counters & before) {
     ggml_sycl_q1_nvfp4_test_counters now{};
     ggml_sycl_q1_nvfp4_test_counters_read(&now);
-    throw std::runtime_error(message + ";" + stage_counters(before, now));
+    throw std::runtime_error(message + "; stages since case start: " + stage_deltas(before, now));
 }
 
 void require_stages(bool condition, const std::string & message, const ggml_sycl_q1_nvfp4_test_counters & before) {
@@ -341,7 +341,7 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11) {
         std::vector<float> got(count); ggml_backend_tensor_get(c.out, got.data(), 0, count * sizeof(float));
         for (size_t i = 0; i < count; ++i) {
             const float tolerance = 0.08f * (1.0f + std::fabs(oracle[i]));
-            if (!std::isfinite(got[i]) || std::fabs(got[i] - oracle[i]) > tolerance) {
+            if (!(std::isfinite(got[i]) && std::fabs(got[i] - oracle[i]) <= tolerance)) {
                 fail_stages("CPU oracle mismatch" + at + " at " + std::to_string(i) + ": got " +
                                 std::to_string(got[i]) + ", expected " + std::to_string(oracle[i]),
                             before);
@@ -351,30 +351,22 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11) {
     }
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
     const auto observed = [&]() {
-        return " observed first=(slot=" + std::to_string(first.workspace_slot) +
-               ", generation=" + std::to_string(first.workspace_generation) + ") after=(slot=" +
-               std::to_string(after.workspace_slot) + ", generation=" +
-               std::to_string(after.workspace_generation) + ") counters before/first/after=" +
-               std::to_string(before.candidate) + "/" + std::to_string(first.candidate) + "/" +
-               std::to_string(after.candidate) + " candidate, " + std::to_string(before.admit) + "/" +
-               std::to_string(first.admit) + "/" + std::to_string(after.admit) + " admit, " +
-               std::to_string(before.submit) + "/" + std::to_string(first.submit) + "/" +
-               std::to_string(after.submit) + " submit, " + std::to_string(before.terminal) + "/" +
-               std::to_string(first.terminal) + "/" + std::to_string(after.terminal) + " terminal, " +
-               std::to_string(before.recycle) + "/" + std::to_string(first.recycle) + "/" +
-               std::to_string(after.recycle) + " recycle";
+        return where + "): observed first=(slot=" + std::to_string(first.workspace_slot) +
+               ", generation=" + std::to_string(first.workspace_generation) +
+               ") after=(slot=" + std::to_string(after.workspace_slot) +
+               ", generation=" + std::to_string(after.workspace_generation) +
+               "); stages after pass 0: " + stage_deltas(before, first);
     };
     if (first.workspace_slot == UINT32_MAX || first.workspace_generation == 0 ||
         first.workspace_generation == std::numeric_limits<uint64_t>::max() ||
         after.workspace_slot != first.workspace_slot ||
         after.workspace_generation != first.workspace_generation + 1) {
-        throw std::runtime_error("second submission did not reuse the same workspace slot at generation+1;" +
-                                 observed());
+        fail_stages("second submission did not reuse the same workspace slot at generation+1" + observed(), before);
     }
     if (after.candidate < before.candidate + 2 || after.admit < before.admit + 2 ||
         after.submit < before.submit + 2 || after.terminal < before.terminal + 2 ||
         after.recycle < before.recycle + 2) {
-        throw std::runtime_error("two-submit lifecycle counters did not prove slot reuse;" + observed());
+        fail_stages("two-submit lifecycle counters did not prove slot reuse" + observed(), before);
     }
 }
 
@@ -406,10 +398,11 @@ void injected_failure_case(ggml_sycl_q1_nvfp4_test_failure failure, bool expect_
     require_stages(ggml_backend_graph_compute(life.backend, c.graph) != GGML_STATUS_SUCCESS,
                    "injected failure was not reported", before);
     ggml_sycl_execution_snapshot state{};
-    require(ggml_backend_sycl_execution_context_extract(life.context, &state) == GGML_SYCL_EXECUTION_OK,
-            "failure context snapshot unavailable");
-    require(state.graph_state == GGML_SYCL_EXECUTION_GRAPH_QUARANTINED ||
-            state.graph_state == GGML_SYCL_EXECUTION_GRAPH_RETIRED, "failure graph was not terminal/quarantined");
+    require_stages(ggml_backend_sycl_execution_context_extract(life.context, &state) == GGML_SYCL_EXECUTION_OK,
+                   "failure context snapshot unavailable", before);
+    require_stages(state.graph_state == GGML_SYCL_EXECUTION_GRAPH_QUARANTINED ||
+                       state.graph_state == GGML_SYCL_EXECUTION_GRAPH_RETIRED,
+                   "failure graph was not terminal/quarantined", before);
     ggml_sycl_q1_nvfp4_test_counters_read(&after);
     require_stages(after.failure_consumed == before.failure_consumed + 1, "failpoint was not consumed exactly once",
                    before);
