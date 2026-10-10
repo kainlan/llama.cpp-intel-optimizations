@@ -29946,8 +29946,10 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
     };
     if (reason) *reason = moe_mmid_runtime_reason::OK;
     try {
-        // A pool the load plan rejected (reject_moe_mmid_workspaces(): it did not fit the budget the experts left, or
-        // an owner or a size was invalid) stays rejected for the plan's lifetime. Nothing materializes it, so its demand
+        // A pool the load plan rejected stays rejected for the plan's lifetime. A plan is invalid from either of two
+        // sources: reject_moe_mmid_workspaces() (it did not fit the budget the experts left, an owner or a size was
+        // invalid, or the host scratch zone overflowed), which also clears the workspaces, or a host staging-zone
+        // sizing overflow in populate_host_zone_sizing(), which keeps them. Nothing materializes either, so its demand
         // is not re-planned, and above all not sent to the growth admission below: GROWTH_BUDGET_EXCEEDED there makes the
         // runtime transaction demote KV or refuse the context for a pool that was never going to exist
         // (llama.cpp-84ck). The stable budget check still runs, because it is the KV refresh's own check. A closed
@@ -30032,7 +30034,8 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
         plan.moe_mmid_workspaces = std::move(demand.moe_mmid_workspaces);
         plan.moe_mmid_device_pool_bytes = demand.moe_mmid_device_pool_bytes;
         plan.moe_mmid_host_pool_bytes = demand.moe_mmid_host_pool_bytes;
-        plan.moe_mmid_workspace_valid = true;
+        // A rejected pool never reaches this growth tail (the pool_rejected return above), so it is never revived here.
+        GGML_ASSERT(plan.moe_mmid_workspace_valid);
         plan.vram_bytes = new_vram;
         plan.per_device_vram = std::move(new_per_device);
         return true;

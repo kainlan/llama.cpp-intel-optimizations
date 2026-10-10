@@ -11930,8 +11930,9 @@ static std::atomic<int> g_test_moe_mmid_route_reachable_override{ -1 };
 // build it is false, so no pool is planned, charged or materialized. The PRIVATE_TESTING override governs every one of
 // those sites: forced open, the planner plans and charges the pool, load_end materializes it, and the per-context
 // predicate lets the context-bind hook and the runtime transaction materialize it. Admission still needs the route
-// compiled in (its own gate reads the constants), so forcing it open in an ordinary build cannot execute anything.
-// Only test-sycl-layout-choice sets the override, and only around planning and the runtime re-plan, with no context.
+// validated (its own gate reads k_moe_mmid_direct_route_validated) or, in a route-testing build, a test-authorized
+// context, so forcing the override open cannot execute anything. The layout-choice test sets it around planning and
+// the runtime re-plan, with no context.
 bool ggml_sycl_moe_mmid_route_reachable_in_build() {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     const int forced = g_test_moe_mmid_route_reachable_override.load(std::memory_order_acquire);
@@ -11954,8 +11955,11 @@ void test_restore_moe_mmid_route_reachable_override(int previous) {
 }  // namespace ggml_sycl
 #endif
 
-// Full admission predicate, mirrored exactly -- compile-time half plus the
-// per-context runtime authorization the admission site also consults.
+// The per-context form: ggml_sycl_moe_mmid_route_reachable_in_build() AND the
+// admission site's own condition (validated, or a test-authorized context), so
+// it is a strict refinement of the build-level answer. Without the test
+// override it equals the admission predicate exactly, because the build-level
+// answer is then k_moe_mmid_route_reachable_compiled, which either half implies.
 static bool ggml_sycl_moe_mmid_route_reachable(const ggml_backend_sycl_context & ctx) {
     // A route this build cannot execute has no pool planned for it (llama.cpp-84ck), so no context may materialize one.
     if (!ggml_sycl_moe_mmid_route_reachable_in_build()) {

@@ -2337,8 +2337,8 @@ runtime `n_ubatch` through `pp_moe_onednn_admit_ring()`
   plan for a route that could run, and the runtime keeps it rejected.
   `reject_moe_mmid_workspaces()` clears its workspaces, so the materialization
   wrapper returns `NOT_APPLICABLE` before the implementation's `INVALID` check
-  is reached. A plan whose host-zone sizing overflowed keeps its workspaces but
-  is marked invalid, and that check refuses it.
+  is reached. A host staging-zone sizing overflow keeps the workspaces but
+  marks the plan invalid, and that check refuses it.
 - The KV-zone part may use only `headroom - reserve`. `headroom` is the device's
   KV capacity less the plan's device KV (with the allocator's per-layer slack).
   The capacity is `ggml_sycl_kv_capacity_live()`, the one number the KV re-fit

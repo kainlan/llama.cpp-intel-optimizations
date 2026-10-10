@@ -1562,11 +1562,12 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
         return true;
     }
 
+    constexpr int n_expert_used = 4;
+
     const std::vector<ggml_sycl::placement_tensor_info> inventory = moe_pp_inventory();
     ggml_sycl::placement_kv_info                        kv_info{};
-    kv_info.n_ubatch            = 512;
-    kv_info.n_expert_used       = 4;
-    constexpr int n_expert_used = 4;
+    kv_info.n_ubatch      = 512;
+    kv_info.n_expert_used = n_expert_used;
 
     auto plan_on = [&](size_t budget) {
         const std::vector<ggml_sycl::device_budget> devices = {
@@ -1669,8 +1670,9 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
 
         const auto   plan         = plan_on(tight_budget);
         const size_t tight_charge = planned_weight_charge_for_device(plan, 0);
+        bool         arm_ok       = true;
         // Precondition of the case: the pool was rejected with experts still on device. Without it the re-plan below
-        // proves nothing about a rejected pool.
+        // proves nothing about a rejected pool, so it is not run.
         if (tight_charge == 0 || tight_charge >= roomy_charge || plan.moe_mmid_workspace_valid ||
             plan.moe_mmid_device_pool_bytes != 0 || !plan.moe_mmid_workspaces.empty()) {
             printf(
@@ -1678,19 +1680,19 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
                 "roomy=%zu valid=%d pool=%zu workspaces=%zu\n",
                 tight_charge, roomy_charge, plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes,
                 plan.moe_mmid_workspaces.size());
-            ok = false;
+            arm_ok = false;
         } else {
             // The rejected pool stays rejected: the re-plan must not ask the growth admission for it, so it must not
             // return GROWTH_BUDGET_EXCEEDED.
-            if (expect_stable_replan(plan, "open MMID route, tight plan with a rejected pool")) {
-                printf(
-                    "PASS: open MMID route, tight plan: pool rejected with %zu of %zu layout bytes on device, and the "
-                    "runtime re-plan accepts the plan without asking the growth admission\n",
-                    tight_charge, roomy_charge);
-            } else {
-                ok = false;
-            }
+            arm_ok = expect_stable_replan(plan, "open MMID route, tight plan with a rejected pool");
         }
+        if (arm_ok) {
+            printf(
+                "PASS: open MMID route, tight plan: pool rejected with %zu of %zu layout bytes on device, and the "
+                "runtime re-plan accepts the plan without asking the growth admission\n",
+                tight_charge, roomy_charge);
+        }
+        ok = arm_ok && ok;
     }
     {
         ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
@@ -1700,16 +1702,18 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
         if (!plan.moe_mmid_workspace_valid || plan.moe_mmid_device_pool_bytes != 0 ||
             !plan.moe_mmid_workspaces.empty() || plan.vram_bytes != vram_composed(plan)) {
             printf(
-                "FAIL: closed MMID route, tight plan: expected no workspace pool, valid=%d pool=%zu workspaces=%zu\n",
-                plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes,
-                plan.moe_mmid_workspaces.size());
+                "FAIL: closed MMID route, tight plan: expected no workspace pool, valid=%d pool=%zu workspaces=%zu "
+                "vram=%zu want weight=%zu+kv=%zu+room=%zu\n",
+                plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes, plan.moe_mmid_workspaces.size(),
+                plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes, plan.kv_context_reserve_bytes);
             arm_ok = false;
         }
         arm_ok = expect_stable_replan(plan, "closed MMID route, tight plan") && arm_ok;
         if (arm_ok) {
             printf(
-                "PASS: closed MMID route, tight plan: valid with no pool (not rejected), and the runtime re-plan keeps "
-                "it\n");
+                "PASS: closed MMID route, tight plan: valid with no pool (not rejected), vram=%zu = weight %zu + "
+                "kv %zu + room %zu, and the runtime re-plan keeps it\n",
+                plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes, plan.kv_context_reserve_bytes);
         }
         ok = arm_ok && ok;
     }
