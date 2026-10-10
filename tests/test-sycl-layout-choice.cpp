@@ -1184,10 +1184,20 @@ static bool run_multi_device_moe_i8_executor_support_test() {
 //   add_single_moe_pp_executable_alternates() reserves no SOA copy. A duplicate SOA reservation next to an XMX_TILED
 //   primary would give the weight two layout owners.
 // - Route inactive: the same predicate returns true, so gate/up primaries are rewritten to SOA before packing and the
-//   plan records moe_pp_soa_promoted. (An ambient GGML_SYCL_XMX_TILED_PP_PROOF=1 would keep XMX_TILED here too.)
-// - Down under ggml_sycl_moe_pp_onednn_batched_route_selected() (default on): maybe_upgrade_moe_down_layouts_to_i8()
-//   returns before upgrading, so down keeps its SOA primary and carries no MXFP4_I8 copy. With that route opted out,
-//   the same function upgrades down to an MXFP4_I8 primary and keeps the SOA bytes as its PP alternate.
+//   plan records moe_pp_soa_promoted.
+// - Down under ggml_sycl_moe_pp_onednn_batched_route_selected() (default on, pinned below):
+//   maybe_upgrade_moe_down_layouts_to_i8() returns before upgrading, so down keeps its SOA primary and carries no
+//   MXFP4_I8 copy. With that route opted out (GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED=0), the same function upgrades down
+//   to an MXFP4_I8 primary and keeps the SOA bytes as its PP alternate. That arm is derived from the code and does not
+//   run at default.
+//
+// Ambient env the route override does not neutralize, each of which changes these expectations:
+// - GGML_SYCL_XMX_TILED_PP_PROOF=1 keeps XMX_TILED in the inactive arm.
+// - GGML_SYCL_MOE_GATEUP_BUNDLE4=1 starts gate/up as XMX_TILED_BUNDLE4.
+// - GGML_SYCL_XMX_MOE_TILED=0 starts gate/up as SOA.
+// - GGML_SYCL_XMX_MOE=1 skips the pre-pack SOA promotion (planner_xmx_moe_forced()). Together with
+//   GGML_SYCL_MOE_GATEUP_SINGLE_XMX and GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP=1 it admits the single-XMX gate/up policy
+//   (planner_single_xmx_gateup_policy()), which reserves no SOA in either arm.
 static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_active) {
     constexpr size_t mib       = 1024u * 1024u;
     constexpr int    n_experts = 2;
@@ -1243,6 +1253,13 @@ static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_act
     const bool             down_batched     = ggml_sycl_moe_pp_onednn_batched_route_selected();
     const ggml_layout_mode want_down        = down_batched ? GGML_LAYOUT_SOA : GGML_LAYOUT_MXFP4_I8;
     const size_t           want_down_n_alts = down_batched ? 0 : 1;
+
+    // The down expectation follows the predicate the planner branches on, so pin its default here: a flipped default
+    // must fail, not be followed silently into the unexecuted I8 arm.
+    if (std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED") == nullptr && !down_batched) {
+        printf("FAIL: route %s: the oneDNN batched MoE PP route is no longer selected by default\n", route_name);
+        return false;
+    }
 
     for (int e = 0; e < n_experts; ++e) {
         const auto gate = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::GATE);
@@ -1331,9 +1348,47 @@ static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_act
             tight_plan.kv_context_reserve_bytes, tight_plan.moe_mmid_device_pool_bytes);
         return false;
     }
-    if (tight_charge >= planned_charge) {
+    if (tight_charge == 0 || tight_charge >= planned_charge) {
         printf("FAIL: route %s: tight budget did not reach the pack boundary, charged=%zu roomy=%zu\n", route_name,
                tight_charge, planned_charge);
+        return false;
+    }
+    // At the boundary the pack keeps exactly one complete triplet on device (each triplet is half the layout charge)
+    // and the other wholly on host, and the device triplet keeps the same layout contract as the roomy plan.
+    int tight_device_triplets = 0;
+    for (int e = 0; e < n_experts; ++e) {
+        const auto gate      = tight_plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::GATE);
+        const auto up        = tight_plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::UP);
+        const auto down      = tight_plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::DOWN);
+        const int  on_device = (gate.on_device ? 1 : 0) + (up.on_device ? 1 : 0) + (down.on_device ? 1 : 0);
+        if (!gate.found() || !up.found() || !down.found() || (on_device != 0 && on_device != 3)) {
+            printf("FAIL: route %s: tight-budget expert %d is not one placement domain, found=%d/%d/%d on_device=%d\n",
+                   route_name, e, gate.found() ? 1 : 0, up.found() ? 1 : 0, down.found() ? 1 : 0, on_device);
+            return false;
+        }
+        if (on_device == 0) {
+            continue;
+        }
+        tight_device_triplets++;
+        if (gate.target_device != 0 || up.target_device != 0 || down.target_device != 0 ||
+            gate.layout != want_gate_up || up.layout != want_gate_up || !gate.alternate_layouts.empty() ||
+            !up.alternate_layouts.empty()) {
+            printf(
+                "FAIL: route %s: tight-budget device expert %d must keep gate/up layout %d with no alternates, got "
+                "target=%d/%d/%d layout=%d/%d alternates=%zu/%zu\n",
+                route_name, e, (int) want_gate_up, gate.target_device, up.target_device, down.target_device,
+                (int) gate.layout, (int) up.layout, gate.alternate_layouts.size(), up.alternate_layouts.size());
+            return false;
+        }
+    }
+    if (tight_device_triplets != 1) {
+        printf("FAIL: route %s: tight budget should keep exactly one complete triplet on device, got %d\n", route_name,
+               tight_device_triplets);
+        return false;
+    }
+    if (tight_plan.moe_pp_soa_promoted != !xmx_tiled_pp_route_active) {
+        printf("FAIL: route %s: tight-budget moe_pp_soa_promoted=%d, want %d\n", route_name,
+               tight_plan.moe_pp_soa_promoted ? 1 : 0, xmx_tiled_pp_route_active ? 0 : 1);
         return false;
     }
     if (tight_plan.vram_bytes > tight_devices[0].vram_budget) {

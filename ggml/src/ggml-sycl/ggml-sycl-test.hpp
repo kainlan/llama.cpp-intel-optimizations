@@ -492,8 +492,9 @@ bool test_moe_multi_gpu_wanted(const placement_plan & plan);
 void test_set_sycl_info_override(const ggml_sycl_device_info & info);
 void test_clear_sycl_info_override();
 // Forces the planner's XMX_TILED grouped-DPAS PP route predicate on or off (its env read is latched per process).
-void test_set_xmx_tiled_pp_route_override(bool active);
-void test_clear_xmx_tiled_pp_route_override();
+// The setter returns the override it replaced (-1 none, 0 off, 1 on), for test_restore_ to put back.
+int  test_set_xmx_tiled_pp_route_override(bool active);
+void test_restore_xmx_tiled_pp_route_override(int previous);
 #endif
 int test_physical_device_count();
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -519,10 +520,17 @@ struct test_sycl_info_override_guard {
     ~test_sycl_info_override_guard() { test_clear_sycl_info_override(); }
 };
 
+// Restores the override it replaced, so guards nest.
 struct test_xmx_tiled_pp_route_override_guard {
-    explicit test_xmx_tiled_pp_route_override_guard(bool active) { test_set_xmx_tiled_pp_route_override(active); }
+    explicit test_xmx_tiled_pp_route_override_guard(bool active) :
+        previous(test_set_xmx_tiled_pp_route_override(active)) {}
 
-    ~test_xmx_tiled_pp_route_override_guard() { test_clear_xmx_tiled_pp_route_override(); }
+    ~test_xmx_tiled_pp_route_override_guard() { test_restore_xmx_tiled_pp_route_override(previous); }
+
+    test_xmx_tiled_pp_route_override_guard(const test_xmx_tiled_pp_route_override_guard &)             = delete;
+    test_xmx_tiled_pp_route_override_guard & operator=(const test_xmx_tiled_pp_route_override_guard &) = delete;
+
+    const int previous;
 };
 #endif
 

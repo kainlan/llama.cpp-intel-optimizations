@@ -27478,12 +27478,12 @@ static bool planner_xmx_tiled_pp_route_active() {
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-void test_set_xmx_tiled_pp_route_override(bool active) {
-    g_test_xmx_tiled_pp_route_override.store(active ? 1 : 0, std::memory_order_release);
+int test_set_xmx_tiled_pp_route_override(bool active) {
+    return g_test_xmx_tiled_pp_route_override.exchange(active ? 1 : 0, std::memory_order_acq_rel);
 }
 
-void test_clear_xmx_tiled_pp_route_override() {
-    g_test_xmx_tiled_pp_route_override.store(-1, std::memory_order_release);
+void test_restore_xmx_tiled_pp_route_override(int previous) {
+    g_test_xmx_tiled_pp_route_override.store(previous, std::memory_order_release);
 }
 #endif
 
