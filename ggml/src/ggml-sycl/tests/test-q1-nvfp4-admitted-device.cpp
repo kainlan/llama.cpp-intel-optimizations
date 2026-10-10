@@ -24,7 +24,7 @@
 #include <sycl/sycl.hpp>
 
 namespace {
-constexpr int gate_output_n = 96;
+constexpr int     gate_output_n                       = 96;
 constexpr int     route_top_k                         = 3;
 constexpr int32_t route_selected_experts[route_top_k] = { 3, 1, 3 };  // repeated, non-monotonic
 
@@ -287,10 +287,10 @@ graph_case make_graph(ggml_backend_t backend, ggml_type type, int ne11,
     }
     std::vector<float> activation(static_cast<size_t>(ne11) * K);
     for (size_t i = 0; i < activation.size(); ++i) activation[i] = 0.2f + float((i * 5) % 19) / 31.0f;
-    const int32_t * selected = route_selected_experts;
+    const auto & selected = route_selected_experts;  // an array reference, so sizeof(selected) is the array's size
     ggml_backend_tensor_set(weights, packed.data(), 0, packed.size());
     ggml_backend_tensor_set(input, activation.data(), 0, activation.size() * sizeof(float));
-    ggml_backend_tensor_set(ids, selected, 0, sizeof(route_selected_experts));
+    ggml_backend_tensor_set(ids, selected, 0, sizeof(selected));
     c.graph = ggml_new_graph(c.ctx); ggml_build_forward_expand(c.graph, c.out);
     output_count = static_cast<size_t>(gate_output_n) * top_k; oracle.resize(output_count);
     for (int slot = 0; slot < top_k; ++slot) for (int n = 0; n < gate_output_n; ++n) {

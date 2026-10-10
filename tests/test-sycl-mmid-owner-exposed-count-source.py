@@ -9,12 +9,16 @@ device list from and the bound ggml_backend_sycl_init() refuses at. The wrong on
 the physical count the multi-GPU planner budgets: passing it would plan an MMID workspace on a hidden GPU that no
 backend context can bind, and materialization is all-or-nothing, so the primary's pool would be withheld too.
 
-This gate pins, in plan_moe_mmid_workspaces() and validate_moe_mmid_execution_owners():
-  - the bound is declared once as `const int exposed_devices = ggml_sycl_info().device_count;`, before the first
+This gate pins:
+  - moe_mmid_exposed_owner_count(), the one place the bound and its rationale live, returns exactly
+    ggml_sycl_info().device_count;
+  - in plan_moe_mmid_workspaces() and validate_moe_mmid_execution_owners(), `exposed_devices` is declared exactly once
+    (no shadowing redeclaration), as `const int exposed_devices = moe_mmid_exposed_owner_count();`, before the first
     admission check;
-  - every moe_mmid_owner_admissible() call passes exactly `exposed_devices` as its count (at least one call in the
-    planner, at least two in the validator: the on-device owner and the alternate owner);
-  - the body never names total_gpu_count.
+  - every moe_mmid_owner_admissible() call passes exactly `exposed_devices` as its count, so a call that bypasses the
+    helper fails (at least one call in the planner, at least two in the validator: the on-device owner and the
+    alternate owner);
+  - neither function names total_gpu_count anywhere.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -86,9 +90,13 @@ CACHE = norm((ROOT / "ggml/src/ggml-sycl/unified-cache.cpp").read_text())
 
 PLAN_SIG = "static void plan_moe_mmid_workspaces(placement_plan & plan,"
 VALIDATE_SIG = "static void validate_moe_mmid_execution_owners(placement_plan & plan)"
+HELPER_SIG = "static int moe_mmid_exposed_owner_count()"
 
-BOUND_DECL = "const int exposed_devices = ggml_sycl_info().device_count;"
+HELPER_BODY_EXPECTED = "{ return ggml_sycl_info().device_count; }"
+BOUND_DECL = "const int exposed_devices = moe_mmid_exposed_owner_count();"
 ADMISSIBLE_CALL = re.compile(r"moe_mmid_owner_admissible\(")
+# Any declaration of the name, whatever its qualifiers: a second one shadows the bound.
+ANY_DECL = re.compile(r"\b(?:int|auto|long|unsigned|size_t|int32_t|int64_t)\s+exposed_devices\s*[={]")
 
 
 def admissible_counts(b: str) -> list:
@@ -116,40 +124,78 @@ def admissible_counts(b: str) -> list:
     return counts
 
 
-def claim_bound_is_the_registry_count(b: str, min_calls: int) -> bool:
-    """The body declares the registry bound once, before its first admission check; every admission check passes
-    exactly that bound; and the physical count is never named."""
-    if not b or b.count(BOUND_DECL) != 1 or "total_gpu_count" in b:
+# ---- one predicate per claim ----------------------------------------------------------------------------------------
+
+
+def helper_returns_registry_count(helper_body: str) -> bool:
+    """The helper is the registry's exposed count and nothing else."""
+    return helper_body == HELPER_BODY_EXPECTED
+
+
+def declared_once(b: str) -> bool:
+    """`exposed_devices` is declared exactly once in the body: no shadowing redeclaration."""
+    return bool(b) and len(ANY_DECL.findall(b)) == 1
+
+
+def bound_is_helper(b: str) -> bool:
+    """That declaration takes the helper's value, before the first admission check reads it."""
+    if not b or b.count(BOUND_DECL) != 1:
         return False
     first_call = ADMISSIBLE_CALL.search(b)
-    if first_call is None or b.find(BOUND_DECL) > first_call.start():
-        return False
+    return first_call is not None and b.find(BOUND_DECL) < first_call.start()
+
+
+def no_physical_count(b: str) -> bool:
+    """The physical count is never named in the body."""
+    return bool(b) and "total_gpu_count" not in b
+
+
+def every_call_passes_bound(b: str, min_calls: int) -> bool:
+    """Every admission check passes exactly the bound (a call that bypasses the helper fails), and none was dropped."""
     counts = admissible_counts(b)
     return len(counts) >= min_calls and all(c == "exposed_devices" for c in counts)
 
 
+HELPER_BODY = body(CACHE, HELPER_SIG)
 PLAN_BODY = body(CACHE, PLAN_SIG)
 VALIDATE_BODY = body(CACHE, VALIDATE_SIG)
+BODIES = ((PLAN_BODY, 1), (VALIDATE_BODY, 2))
 
 
 def test_bodies_are_found():
+    assert HELPER_BODY, "moe_mmid_exposed_owner_count() not found: the signature this gate keys on moved"
     assert PLAN_BODY, "plan_moe_mmid_workspaces() not found: the signature this gate keys on moved"
     assert VALIDATE_BODY, "validate_moe_mmid_execution_owners() not found: the signature this gate keys on moved"
 
 
+def test_helper_is_the_registry_count():
+    assert helper_returns_registry_count(HELPER_BODY), (
+        "moe_mmid_exposed_owner_count() must return ggml_sycl_info().device_count (the registry's exposed count), "
+        f"got {HELPER_BODY!r}")
+
+
 def test_planner_bounds_owners_by_the_registry_count():
-    assert claim_bound_is_the_registry_count(PLAN_BODY, 1), (
-        "plan_moe_mmid_workspaces() must bound MMID owners by ggml_sycl_info().device_count (the registry's exposed "
-        "count) in every moe_mmid_owner_admissible() call, never by total_gpu_count")
+    assert declared_once(PLAN_BODY), "plan_moe_mmid_workspaces() declares exposed_devices more than once (shadowing)"
+    assert bound_is_helper(PLAN_BODY), (
+        "plan_moe_mmid_workspaces() must take exposed_devices from moe_mmid_exposed_owner_count() before its first "
+        "admission check")
+    assert no_physical_count(PLAN_BODY), "plan_moe_mmid_workspaces() must never name total_gpu_count"
+    assert every_call_passes_bound(PLAN_BODY, 1), (
+        "every moe_mmid_owner_admissible() call in plan_moe_mmid_workspaces() must pass exposed_devices")
 
 
 def test_validator_bounds_owners_by_the_registry_count():
-    assert claim_bound_is_the_registry_count(VALIDATE_BODY, 2), (
-        "validate_moe_mmid_execution_owners() must bound both owner checks by ggml_sycl_info().device_count (the "
-        "registry's exposed count), never by total_gpu_count")
+    assert declared_once(VALIDATE_BODY), (
+        "validate_moe_mmid_execution_owners() declares exposed_devices more than once (shadowing)")
+    assert bound_is_helper(VALIDATE_BODY), (
+        "validate_moe_mmid_execution_owners() must take exposed_devices from moe_mmid_exposed_owner_count() before "
+        "its first admission check")
+    assert no_physical_count(VALIDATE_BODY), "validate_moe_mmid_execution_owners() must never name total_gpu_count"
+    assert every_call_passes_bound(VALIDATE_BODY, 2), (
+        "both moe_mmid_owner_admissible() calls in validate_moe_mmid_execution_owners() must pass exposed_devices")
 
 
-# ---- mutants: each must turn the claim red --------------------------------------------------------------------------
+# ---- mutants: each must turn its own claim red, and only that claim where the edit allows -------------------------
 
 
 def _mutate(b: str, old: str, new: str) -> str:
@@ -157,35 +203,67 @@ def _mutate(b: str, old: str, new: str) -> str:
     return b.replace(old, new, 1)
 
 
+PLAN_CALL = "moe_mmid_owner_admissible(owner, exposed_devices)"
+VALIDATE_CALL = "moe_mmid_owner_admissible(target, exposed_devices)"
+PLAN_CHECK = "if (!" + PLAN_CALL + ") { continue; }"
+VALIDATE_CHECK = "if (!" + VALIDATE_CALL + ") { continue; }"
+
+
+def test_mutant_helper_returns_physical_count():
+    m = _mutate(HELPER_BODY, "ggml_sycl_info().device_count", "ggml_sycl_info().total_gpu_count")
+    assert not helper_returns_registry_count(m)
+
+
+def test_mutant_shadowing_redeclaration():
+    for b, n in BODIES:
+        m = _mutate(b, BOUND_DECL, BOUND_DECL + " const int exposed_devices = 2;")
+        assert not declared_once(m)
+        assert bound_is_helper(m) and no_physical_count(m) and every_call_passes_bound(m, n)
+
+
+def test_mutant_bound_not_from_helper():
+    for b, n in BODIES:
+        m = _mutate(b, BOUND_DECL, "const int exposed_devices = 2;")
+        assert not bound_is_helper(m)
+        assert declared_once(m) and no_physical_count(m) and every_call_passes_bound(m, n)
+
+
 def test_mutant_physical_count_declared():
-    for b, n in ((PLAN_BODY, 1), (VALIDATE_BODY, 2)):
+    for b, _ in BODIES:
         m = _mutate(b, BOUND_DECL, "const int exposed_devices = ggml_sycl_info().total_gpu_count;")
-        assert not claim_bound_is_the_registry_count(m, n)
+        assert not bound_is_helper(m)
+        assert not no_physical_count(m)
 
 
-def test_mutant_physical_count_passed_at_a_call():
-    m = _mutate(PLAN_BODY, "moe_mmid_owner_admissible(owner, exposed_devices)",
-                "moe_mmid_owner_admissible(owner, ggml_sycl_info().total_gpu_count)")
-    assert not claim_bound_is_the_registry_count(m, 1)
-    m = _mutate(VALIDATE_BODY, "moe_mmid_owner_admissible(target, exposed_devices)",
-                "moe_mmid_owner_admissible(target, total_gpus)")
-    assert not claim_bound_is_the_registry_count(m, 2)
+def test_mutant_physical_count_named_anywhere():
+    for b, n in BODIES:
+        m = _mutate(b, BOUND_DECL, BOUND_DECL + " (void) ggml_sycl_info().total_gpu_count;")
+        assert not no_physical_count(m)
+        assert declared_once(m) and bound_is_helper(m) and every_call_passes_bound(m, n)
+
+
+def test_mutant_call_bypasses_the_bound():
+    # A local that is not the bound, and the registry count read directly past the helper: neither names
+    # total_gpu_count, so only the per-call check can catch them.
+    for b, n, call, owner in ((PLAN_BODY, 1, PLAN_CALL, "owner"), (VALIDATE_BODY, 2, VALIDATE_CALL, "target")):
+        for bypass in ("total_gpus", "ggml_sycl_info().device_count"):
+            m = _mutate(b, call, f"moe_mmid_owner_admissible({owner}, {bypass})")
+            assert not every_call_passes_bound(m, n)
+            assert declared_once(m) and bound_is_helper(m) and no_physical_count(m)
 
 
 def test_mutant_admission_check_dropped():
-    m = _mutate(PLAN_BODY, "if (!moe_mmid_owner_admissible(owner, exposed_devices)) { continue; }", "")
-    assert not claim_bound_is_the_registry_count(m, 1)
-    m = _mutate(VALIDATE_BODY, "if (!moe_mmid_owner_admissible(target, exposed_devices)) { continue; }", "")
-    assert not claim_bound_is_the_registry_count(m, 2)
+    for b, n, check in ((PLAN_BODY, 1, PLAN_CHECK), (VALIDATE_BODY, 2, VALIDATE_CHECK)):
+        m = _mutate(b, check, "")
+        assert not every_call_passes_bound(m, n)
 
 
 def test_mutant_bound_declared_after_first_use():
     # Declared once, but past the admission check that reads it.
     m = _mutate(PLAN_BODY, BOUND_DECL + " ", "")
-    m = _mutate(m, "if (!moe_mmid_owner_admissible(owner, exposed_devices)) { continue; }",
-                "if (!moe_mmid_owner_admissible(owner, exposed_devices)) { continue; } " + BOUND_DECL)
-    assert not claim_bound_is_the_registry_count(m, 1)
-
+    m = _mutate(m, PLAN_CHECK, PLAN_CHECK + " " + BOUND_DECL)
+    assert not bound_is_helper(m)
+    assert declared_once(m) and no_physical_count(m) and every_call_passes_bound(m, 1)
 
 if __name__ == "__main__":
     import sys

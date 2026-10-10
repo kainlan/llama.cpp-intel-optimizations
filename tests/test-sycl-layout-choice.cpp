@@ -1900,7 +1900,7 @@ static bool run_multi_device_mmid_owner_exposure_test() {
         return ggml_sycl::compute_multi_device_plan(devices, inventory, 1, ggml_sycl::multi_gpu_mode::EXPERT, kv_info,
                                                     nullptr, moe_pp_n_experts);
     };
-    // Expert entries (primary placement or an alternate) that target `device` on device.
+    // Expert entries whose on-device placement, or one of whose alternates, targets `device`.
     auto experts_on = [](const ggml_sycl::placement_plan & plan, int device) {
         size_t count = 0;
         for (const auto & entry : plan.entries) {
@@ -1924,36 +1924,39 @@ static bool run_multi_device_mmid_owner_exposure_test() {
         }
         return false;
     };
-    // The planner's own executability judgment applied to `plan`'s placement with every device exposed: re-run its
-    // workspace pass (the runtime re-plan reuses plan_moe_mmid_workspaces) on a copy, so a device-1 workspace appears
-    // exactly when this placement gives device 1 an executable expert owner, i.e. when a tree that ignored exposure
-    // would have planned one at load.
-    auto executable_owner_if_all_exposed = [&](const ggml_sycl::placement_plan & plan, int device,
-                                               ggml_sycl::moe_mmid_runtime_reason * reason) {
+    // Re-runs the planner's workspace pass (the runtime re-plan reuses plan_moe_mmid_workspaces) on `replanned` with
+    // every device exposed. When it succeeds, a workspace on a device means the placement gives that device an
+    // executable expert owner, so a tree that ignored exposure would have planned one at load. The re-plan also
+    // re-checks the budgets, so a refusal says nothing about ownership; the caller reports it on its own.
+    auto replan_all_exposed = [&](ggml_sycl::placement_plan & replanned, ggml_sycl::moe_mmid_runtime_reason * reason) {
         ggml_sycl_device_info info = make_mock_sycl_info(2);
         info.device_count          = 2;
         ggml_sycl::test_sycl_info_override_guard info_guard(info);
-        ggml_sycl::placement_plan                replanned = plan;
-        return ggml_sycl::replan_moe_mmid_workspaces_for_runtime(replanned, inventory, n_expert_used, reason) &&
-               has_owner(replanned, device);
+        return ggml_sycl::replan_moe_mmid_workspaces_for_runtime(replanned, inventory, n_expert_used, reason);
     };
 
     bool ok = true;
     {
-        const auto   plan = plan_with_exposed(1);
-        const size_t on0  = experts_on(plan, 0);
-        const size_t on1  = experts_on(plan, 1);
-        bool         arm  = true;
+        const auto                         plan          = plan_with_exposed(1);
+        const size_t                       on0           = experts_on(plan, 0);
+        const size_t                       on1           = experts_on(plan, 1);
+        bool                               arm           = true;
         // Positive control: this placement gives device 1 an EXECUTABLE expert owner (an on-device expert or an
         // executable alternate there), not just an entry naming it, so a tree that ignored exposure would plan a
         // workspace on device 1 and fail below.
+        ggml_sycl::placement_plan          replanned     = plan;
         ggml_sycl::moe_mmid_runtime_reason replan_reason = ggml_sycl::moe_mmid_runtime_reason::OK;
-        const bool                         executable1   = executable_owner_if_all_exposed(plan, 1, &replan_reason);
-        if (on1 == 0 || !executable1) {
+        if (!replan_all_exposed(replanned, &replan_reason)) {
+            printf(
+                "FAIL: MMID owner exposure, 1 of 2 exposed: the all-exposed re-plan refused (reason=%s), so whether "
+                "device 1 has an executable expert owner is unknown\n",
+                ggml_sycl::moe_mmid_runtime_reason_name(replan_reason));
+            arm = false;
+        } else if (on1 == 0 || !has_owner(replanned, 1)) {
             printf(
                 "FAIL: MMID owner exposure, 1 of 2 exposed: vacuous fixture, no executable expert owner on device 1 "
-                "(entries targeting device1=%zu, all-exposed re-plan owner1=%d reason=%s)\n",
-                on1, executable1 ? 1 : 0, ggml_sycl::moe_mmid_runtime_reason_name(replan_reason));
+                "(entries targeting device1=%zu, all-exposed re-plan owner1=%d)\n",
+                on1, has_owner(replanned, 1) ? 1 : 0);
             arm = false;
         }
         for (const auto & workspace : plan.moe_mmid_workspaces) {
