@@ -10,8 +10,12 @@
 #include "common.hpp"
 #include "vecdotq.hpp"
 
-// Check for ESIMD availability
-#if __has_include(<sycl/ext/intel/esimd.hpp>)
+// The opt-in ESIMD Q4_0 mmq kernels are compiled only when the build asks for them
+// (CMake option GGML_SYCL_MMQ_ESIMD -> GGML_SYCL_MMQ_ESIMD_KERNELS). They are OFF by default:
+// ocloc 26.35.39758.11 / IGC 2.41.9 segfault compiling them, which fails every ggml-sycl device
+// link (llama.cpp-xtvl). Without the define the stub block at the end of this header is compiled
+// instead and mmq_esimd_available() is false, so dispatch uses the regular mmq kernels.
+#if __has_include(<sycl/ext/intel/esimd.hpp>) && defined(GGML_SYCL_MMQ_ESIMD_KERNELS)
 #define SYCL_ESIMD_MMQ_AVAILABLE 1
 #include <sycl/ext/intel/esimd.hpp>
 #include <vector>  // For trace mode CPU-side debugging
@@ -952,11 +956,18 @@ inline bool mmq_esimd_available() {
     return true;
 }
 
-#else // !SYCL_ESIMD_MMQ_AVAILABLE
+#else   // !SYCL_ESIMD_MMQ_AVAILABLE
 
-// Stub implementations when ESIMD is not available
+// Stub implementations when the ESIMD kernels are not compiled in. Every symbol mmq.cpp calls is
+// declared here with the real signature, so the dispatch site compiles unchanged.
+
+inline int mmq_esimd_version() {
+    return 0;
+}
 
 inline bool mmq_esimd_enabled() {
+    // The "requested but compiled out" warning is emitted once at backend init by ggml_check_sycl()
+    // (ggml-sycl.cpp), not here: this dispatch site is not reached by every vehicle.
     return false;
 }
 
@@ -969,16 +980,14 @@ inline bool mmq_esimd_available() {
     return false;
 }
 
-inline bool launch_mmq_q4_0_esimd(
-    const block_q4_0 * __restrict__ x,
-    const block_q8_1 * __restrict__ y,
-    float * __restrict__ dst,
-    const int64_t nrows,
-    const int64_t ncols,
-    const int64_t k,
-    const int64_t nrows_dst,
-    sycl::queue & stream)
-{
+inline bool launch_mmq_q4_0_esimd(const block_q4_0 * __restrict__ x,
+                                  const block_q8_1 * __restrict__ y,
+                                  float * __restrict__ dst,
+                                  const int64_t nrows,
+                                  const int64_t ncols,
+                                  const int64_t k,
+                                  const int64_t nrows_dst,
+                                  sycl::queue & stream) {
     GGML_UNUSED(x);
     GGML_UNUSED(y);
     GGML_UNUSED(dst);
@@ -987,9 +996,47 @@ inline bool launch_mmq_q4_0_esimd(
     GGML_UNUSED(k);
     GGML_UNUSED(nrows_dst);
     GGML_UNUSED(stream);
-    return false;  // ESIMD not available, use fallback
+    return false;  // ESIMD kernels compiled out, use fallback
 }
 
-#endif // SYCL_ESIMD_MMQ_AVAILABLE
+inline bool launch_mmq_q4_0_esimd_v2(const block_q4_0 * __restrict__ x,
+                                     const block_q8_1 * __restrict__ y,
+                                     float * __restrict__ dst,
+                                     const int64_t nrows,
+                                     const int64_t ncols,
+                                     const int64_t k,
+                                     const int64_t nrows_dst,
+                                     sycl::queue & stream) {
+    GGML_UNUSED(x);
+    GGML_UNUSED(y);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(nrows);
+    GGML_UNUSED(ncols);
+    GGML_UNUSED(k);
+    GGML_UNUSED(nrows_dst);
+    GGML_UNUSED(stream);
+    return false;  // ESIMD kernels compiled out, use fallback
+}
 
-#endif // GGML_SYCL_MMQ_ESIMD_HPP
+inline bool launch_mmq_q4_0_esimd_v3(const block_q4_0 * __restrict__ x,
+                                     const block_q8_1 * __restrict__ y,
+                                     float * __restrict__ dst,
+                                     const int64_t nrows,
+                                     const int64_t ncols,
+                                     const int64_t k,
+                                     const int64_t nrows_dst,
+                                     sycl::queue & stream) {
+    GGML_UNUSED(x);
+    GGML_UNUSED(y);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(nrows);
+    GGML_UNUSED(ncols);
+    GGML_UNUSED(k);
+    GGML_UNUSED(nrows_dst);
+    GGML_UNUSED(stream);
+    return false;  // ESIMD kernels compiled out, use fallback
+}
+
+#endif  // SYCL_ESIMD_MMQ_AVAILABLE
+
+#endif  // GGML_SYCL_MMQ_ESIMD_HPP
