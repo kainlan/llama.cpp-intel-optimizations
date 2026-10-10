@@ -64,6 +64,17 @@ def function(text: str, signature: str) -> str:
     raise AssertionError(f"unclosed function {signature}")
 
 
+def before(text: str, first: str, second: str) -> bool:
+    """True iff both anchors occur and `first` precedes `second`.
+
+    Fail closed: a missing anchor is a False claim (a named FAIL), never a
+    ValueError that would abort the whole requirements dict unevaluated.
+    """
+    a = text.find(first)
+    b = text.find(second)
+    return a >= 0 and b >= 0 and a < b
+
+
 def violations(source: str) -> list[str]:
     failures: list[str] = []
     publish = function(source, "static bool ggml_sycl_publish_backend_aos_expert_handles")
@@ -114,10 +125,10 @@ def violations(source: str) -> list[str]:
         "clear invalidates": "ggml_sycl_invalidate_backend_buffer_weights(ctx)" in clearer,
         "complete upload readiness": "is_moe_expert && offset == 0 && size == ggml_nbytes(tensor)" in setter,
         "withdraw before publish": setter.find("ggml_sycl_invalidate_backend_weight_mutation") < setter.find("ggml_sycl_publish_backend_aos_expert_handles"),
-        "resolver checks plan before registered handles": route.index("lookup_expert_placement") < route.index("ggml_sycl_try_moe_storage_handle_route"),
+        "resolver checks plan before registered handles": before(route, "plan_owner->find_expert_entry(", "ggml_sycl_try_moe_storage_handle_route"),
         "active plan rejects unnamed tensors": "if (!src0->name || src0->name[0] == '\\0')" in route and "route.plan_missing = true" in route,
-        "resolver checks registered handles before requiring key": route.index("ggml_sycl_try_moe_storage_handle_route") < route.index("if (!base_key.valid)"),
-        "resolver requires key only for cache fallback": route.index("if (!base_key.valid)") < route.index("expert_resolve_result resolved = cache->resolve_expert(req);"),
+        "resolver checks registered handles before requiring key": before(route, "ggml_sycl_try_moe_storage_handle_route", "if (!base_key.valid)"),
+        "resolver requires key only for cache fallback": before(route, "if (!base_key.valid)", "expert_resolve_result resolved = cache->resolve_expert(req);"),
         # The call is anchored by its declaration, not by "cache->resolve_expert": the fast-path comment above
         # the key check (cd374e392, llama.cpp-iikr) names that call in prose and sat before the guard.
         "resolver retains canonical lease": "route.lease" in route and "logical.logical_handle" in storage_route,
@@ -147,6 +158,52 @@ def violations(source: str) -> list[str]:
 def test_canonical_backend_aos_expert_handle_contract() -> None:
     source = SOURCE.read_text()
     assert not violations(source), violations(source)
+
+
+def test_admission_pin_and_ordering_claims_reject_mutants() -> None:
+    source = SOURCE.read_text()
+    assert not violations(source), violations(source)
+    route_sig = "static moe_expert_route ggml_sycl_resolve_moe_expert_route_core"
+    route = function(source, route_sig)
+    plan = "plan_owner->find_expert_entry("
+    handle = "ggml_sycl_try_moe_storage_handle_route"
+    key = "if (!base_key.valid)"
+    fallback = "expert_resolve_result resolved = cache->resolve_expert(req);"
+
+    def swap(text: str, a: str, b: str) -> str:
+        tmp = "\0SWAP\0"
+        return text.replace(a, tmp, 1).replace(b, a, 1).replace(tmp, b, 1)
+
+    def respell(text: str, old: str, new: str) -> str:
+        assert old in text, f"anchor missing: {old}"
+        return text.replace(old, new, 1)
+
+    mutants = {
+        "Q1/NVFP4 executor gate remains disabled": [
+            # gate flipped on
+            respell(source, "k_moe_mmid_direct_route_validated = false", "k_moe_mmid_direct_route_validated = true"),
+            # admission site re-spelled as a literal
+            respell(source, "q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated",
+                    "q1_nvfp4_direct_b70_validated = false"),
+        ],
+        "resolver checks plan before registered handles": [
+            source.replace(route, swap(route, plan, handle), 1),
+            source.replace(route, route.replace(plan, "plan_owner->renamed_lookup(", 1), 1),
+        ],
+        "resolver checks registered handles before requiring key": [
+            source.replace(route, swap(route, handle, key), 1),
+            source.replace(route, route.replace(key, "if (!base_key.ok)", 1), 1),
+        ],
+        "resolver requires key only for cache fallback": [
+            source.replace(route, swap(route, key, fallback), 1),
+            source.replace(route, route.replace(fallback, "expert_resolve_result resolved = cache->resolve(req);", 1), 1),
+        ],
+    }
+    for claim, variants in mutants.items():
+        for i, mutant in enumerate(variants):
+            assert mutant != source, f"{claim}[{i}]: mutation did not change the source"
+            failures = violations(mutant)
+            assert claim in failures, f"{claim}[{i}]: mutant not rejected by that claim: {failures}"
 
 
 def test_moe_metadata_registry_is_value_only_and_consumers_retain_sources() -> None:
