@@ -30958,12 +30958,12 @@ struct kv_context_room_cost {
 };
 
 struct kv_context_room {
-    size_t wanted    = 0;  // the extra KV of every device layer whose room passed the cost test
-    size_t held      = 0;  // min(wanted, what was left)
-    size_t n_layers  = 0;  // device layers with extra KV
-    size_t n_held    = 0;  // of those, the ones whose room passed the cost test
-    size_t n_refused = 0;  // and the ones whose room was refused by cost
-    size_t refused   = 0;  // the extra KV of the refused layers
+    size_t wanted       = 0;  // the extra KV of every device layer whose room passed the cost test
+    size_t held         = 0;  // min(wanted, what was left)
+    size_t n_layers     = 0;  // device layers with extra KV
+    size_t n_held       = 0;  // of those, the ones whose room passed the cost test
+    size_t n_refused    = 0;  // and the ones whose room was refused by cost
+    size_t refused      = 0;  // the extra KV of the refused layers
     // The SWA layers among n_layers and n_held; the rest are full-attention layers, which decide alike.
     size_t n_swa_layers = 0;
     size_t n_swa_held   = 0;
