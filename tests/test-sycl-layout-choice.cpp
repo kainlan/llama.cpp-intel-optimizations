@@ -771,6 +771,155 @@ static bool run_kv_context_room_follows_the_requested_context_test() {
     return true;
 }
 
+// llama.cpp-w013: the room is cost-based (owner ruling 2026-10-10). A layer's room is held only when the attention it
+// keeps on the device is worth more per decode token than the routed experts it displaces:
+//   A = host attention    = kv_bytes_for_layer_at(layer, F) / host_attn_gbps, F = n_ctx_context x ctx_fill_pct / 100
+//   B = displaced experts = the layer's room x n_expert_used / n_expert / cpu_expert_gbps
+// Every number below comes from the kv_order_case constants: one cell of one layer is 512 bytes (128 + 128 f16
+// elements), a FULL layer's room at n_ctx 4096 over the planner's 512 is 3584 cells (1.75 MiB), and GB/s is 1e3 bytes
+// per microsecond. The triplets are all one size, so the popularity ranks earlier cases left behind decide which
+// triplets a pack takes but not how many: the case sets no rank, and compares counts and the hint-0 plan's set.
+namespace kv_cost_case {
+using namespace kv_order_case;
+constexpr size_t cell_bytes = (kv_width + kv_width) * 2;
+constexpr size_t full_room  = (4096 - 512) * cell_bytes;  // kv_extra_layer
+constexpr size_t swa_room   = (1536 - 512) * cell_bytes;  // window n_swa 1024 + n_ubatch 512 = 1536 cells
+// Dense weights, their KV at 512, and a budget whose experts get two triplets with both FULL rooms held, six without.
+constexpr size_t budget     = 2 * dense_bytes + 2 * kv_at_512 + 2 * full_room + 2 * triplet_bytes;
+
+static ggml_sycl::placement_kv_info moe(uint32_t n_ctx_context, double fill_pct, int n_expert_used) {
+    ggml_sycl::placement_kv_info kv = kv_info(n_ctx_context);
+    kv.ctx_fill_pct                 = fill_pct;
+    kv.host_attn_gbps               = 30.0;
+    kv.cpu_expert_gbps              = 40.0;
+    kv.n_expert_used                = n_expert_used;
+    return kv;
+}
+
+// Layer 0 slides a 1024-token window; layer 1 attends to the whole context.
+static ggml_sycl::placement_kv_info swa_then_full(uint32_t n_ctx_context, double fill_pct, int n_expert_used) {
+    ggml_sycl::placement_kv_info kv = moe(n_ctx_context, fill_pct, n_expert_used);
+    kv.n_swa                        = 1024;
+    kv.n_swa_layers                 = 1;
+    kv.swa_layer_mask               = { true, false };
+    kv.layer_kind                   = { GGML_SYCL_KV_LAYER_SWA, GGML_SYCL_KV_LAYER_FULL };
+    return kv;
+}
+
+static std::vector<std::pair<int, int>> device_triplet_set(const ggml_sycl::placement_plan & plan) {
+    std::vector<std::pair<int, int>> set;
+    for (int l = 0; l < 2; ++l) {
+        for (int e = 0; e < n_experts; ++e) {
+            const auto gate = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::GATE);
+            const auto up   = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::UP);
+            const auto down = plan.lookup_expert_placement(l, e, ggml_sycl::expert_tensor_role::DOWN);
+            if (gate.found() && up.found() && down.found() && gate.on_device && up.on_device && down.on_device) {
+                set.push_back({ l, e });
+            }
+        }
+    }
+    return set;
+}
+}  // namespace kv_cost_case
+
+static bool run_kv_context_room_is_cost_based_test() {
+    using namespace kv_cost_case;
+    bool ok = true;
+
+    // (a) Qwen-shaped: the context is expected full and a token uses few experts. F = 4096 cells, so
+    //     A = 4096 x 512 B / 30 GB/s = 69.9 us and B = 1.75 MiB x 1/4 / 40 GB/s = 11.5 us on each layer: A > B, both
+    //     rooms held (2 x 1.75 MiB), two triplets fit beside them and six without them, so four are displaced. The
+    //     fixture's four experts make 1/4 its smallest p_hit; Qwen's 10/512 is smaller still and holds by more.
+    const auto qwen =
+        ggml_sycl::compute_placement_plan(inventory(), budget, 0, moe(4096, 100.0, 1), nullptr, n_experts);
+    if (qwen.kv_context_reserve_bytes != 2 * full_room || device_triplets(qwen) != 2 ||
+        qwen.kv_context_room_displaced_bytes != 4 * triplet_bytes) {
+        printf(
+            "FAIL: (a) a full context with p_hit 1/4 holds every layer's room: held %zu (want %zu), %zu device "
+            "triplets (want 2), displaced %zu (want %zu)\n",
+            qwen.kv_context_reserve_bytes, 2 * full_room, device_triplets(qwen), qwen.kv_context_room_displaced_bytes,
+            4 * triplet_bytes);
+        ok = false;
+    }
+
+    // (e) No request: no room, whatever the cost parameters say. Six triplets fit what the dense weights and their KV
+    //     leave (2 x 1.75 MiB + 2 x 768 KiB = 5 MiB: six 768 KiB triplets). (b) compares against this plan's set.
+    const auto none = ggml_sycl::compute_placement_plan(inventory(), budget, 0, moe(0, 1.0, 1), nullptr, n_experts);
+    if (none.kv_context_reserve_bytes != 0 || none.kv_context_room_displaced_bytes != 0 || device_triplets(none) != 6) {
+        printf(
+            "FAIL: (e) with no requested context no room is held: held %zu, displaced %zu, %zu device triplets "
+            "(want 0, 0, 6)\n",
+            none.kv_context_reserve_bytes, none.kv_context_room_displaced_bytes, device_triplets(none));
+        ok = false;
+    }
+
+    // (b) GPT-OSS-shaped: a short chat in a large context. F = floor(4096 x 1 / 100) = 40 cells, so
+    //     A = 40 x 512 B / 30 GB/s = 0.68 us against B = 11.5 us on each layer: every room is refused, nothing is
+    //     held or displaced, and the experts take exactly what they take with no request.
+    const auto gptoss =
+        ggml_sycl::compute_placement_plan(inventory(), budget, 0, moe(4096, 1.0, 1), nullptr, n_experts);
+    if (gptoss.kv_context_reserve_bytes != 0 || gptoss.kv_context_room_displaced_bytes != 0 ||
+        device_triplet_set(gptoss) != device_triplet_set(none) || gptoss.get_kv_device(0) != 0 ||
+        gptoss.get_kv_device(1) != 0) {
+        printf(
+            "FAIL: (b) a 1%% fill refuses every layer's room: held %zu, displaced %zu (want 0, 0), %zu device "
+            "triplets against %zu with no request, kv %d/%d (want 0/0)\n",
+            gptoss.kv_context_reserve_bytes, gptoss.kv_context_room_displaced_bytes, device_triplets(gptoss),
+            device_triplets(none), gptoss.get_kv_device(0), gptoss.get_kv_device(1));
+        ok = false;
+    }
+
+    // (c) Mixed: the decision flips between a SWA layer and a FULL one, not between two FULL layers, whose widths
+    //     cancel (A/B = F / (4096 - 512) x 40 / (30 x p_hit) for every FULL layer). Fill 25%: F = 1024 cells; p_hit
+    //     2/4. Layer 1 (FULL, latest, demoted first): A = 1024 x 512 B / 30 GB/s = 17.5 us, B = 1.75 MiB x 1/2 /
+    //     40 GB/s = 22.9 us: refused. Layer 0 (SWA): its room is the window, 1536 - 512 = 1024 cells = 512 KiB, and the
+    //     host reads min(1024, 1536) = 1024 cells, so A = 17.5 us against B = 512 KiB x 1/2 / 40 GB/s = 6.6 us: held.
+    //     The budget leaves both rooms and two triplets: held 512 KiB, so the experts get 1.75 MiB + 1.5 MiB = 4.33
+    //     triplets (4), and 5 with the SWA room added back: one displaced.
+    const ggml_sycl::placement_kv_info mixed_kv = swa_then_full(4096, 25.0, 2);
+    if (mixed_kv.kv_context_extra_bytes_for_layer(0) != swa_room ||
+        mixed_kv.kv_context_extra_bytes_for_layer(1) != full_room) {
+        printf("FAIL: (c) the fixture's rooms are %zu (SWA) and %zu (FULL), want %zu and %zu\n",
+               mixed_kv.kv_context_extra_bytes_for_layer(0), mixed_kv.kv_context_extra_bytes_for_layer(1), swa_room,
+               full_room);
+        ok = false;
+    }
+    const size_t mixed_budget = 2 * dense_bytes + 2 * kv_at_512 + swa_room + full_room + 2 * triplet_bytes;
+    const auto   mixed = ggml_sycl::compute_placement_plan(inventory(), mixed_budget, 0, mixed_kv, nullptr, n_experts);
+    if (mixed.kv_context_reserve_bytes != swa_room || device_triplets(mixed) != 4 ||
+        mixed.kv_context_room_displaced_bytes != triplet_bytes || mixed.get_kv_device(0) != 0 ||
+        mixed.get_kv_device(1) != 0) {
+        printf(
+            "FAIL: (c) the latest (FULL) layer's room is refused and the SWA layer's held: held %zu (want %zu), %zu "
+            "device triplets (want 4), displaced %zu (want %zu), kv %d/%d (want 0/0)\n",
+            mixed.kv_context_reserve_bytes, swa_room, device_triplets(mixed), mixed.kv_context_room_displaced_bytes,
+            triplet_bytes, mixed.get_kv_device(0), mixed.get_kv_device(1));
+        ok = false;
+    }
+
+    // (d) Dense (n_expert 0): no expert to displace, so the room is held as before, even at a fill so small that
+    //     F = floor(4096 x 0.01 / 100) = 0 and the host attention it saves is 0 us. The n_expert_used the kv info
+    //     carries does not make it MoE; n_expert decides.
+    const std::vector<std::pair<std::string, size_t>> dense_only = {
+        { "blk.0.attn_q.weight", dense_bytes },
+        { "blk.1.attn_q.weight", dense_bytes },
+    };
+    const size_t dense_budget = 2 * dense_bytes + 2 * kv_at_512 + 2 * full_room;
+    const auto   dense = ggml_sycl::compute_placement_plan(dense_only, dense_budget, 0, moe(4096, 0.01, 1), nullptr, 0);
+    if (dense.kv_context_reserve_bytes != 2 * full_room) {
+        printf("FAIL: (d) a dense model holds every layer's room: held %zu, want %zu\n", dense.kv_context_reserve_bytes,
+               2 * full_room);
+        ok = false;
+    }
+
+    if (ok) {
+        printf(
+            "PASS: the KV context room is held per layer only where the attention it keeps outweighs the experts it "
+            "displaces\n");
+    }
+    return ok;
+}
+
 // A budget that fits both dense weights and one layer's KV: the dense weights are placed first, so the second layer
 // keeps its weights on the device and only its KV goes to the host tier.
 static bool run_dense_weights_before_kv_test() {
@@ -2606,7 +2755,7 @@ int main() {
             return 1;
         }
         if (!run_kv_context_room_before_experts_test() || !run_kv_context_room_cost_is_net_test() ||
-            !run_kv_context_room_follows_the_requested_context_test()) {
+            !run_kv_context_room_follows_the_requested_context_test() || !run_kv_context_room_is_cost_based_test()) {
             return 1;
         }
         if (!run_dense_weights_before_kv_test()) {
