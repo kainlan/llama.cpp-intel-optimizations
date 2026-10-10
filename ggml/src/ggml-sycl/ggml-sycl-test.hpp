@@ -491,6 +491,9 @@ bool test_moe_multi_gpu_latch();
 bool test_moe_multi_gpu_wanted(const placement_plan & plan);
 void test_set_sycl_info_override(const ggml_sycl_device_info & info);
 void test_clear_sycl_info_override();
+// Forces the planner's XMX_TILED grouped-DPAS PP route predicate on or off (its env read is latched per process).
+void test_set_xmx_tiled_pp_route_override(bool active);
+void test_clear_xmx_tiled_pp_route_override();
 #endif
 int test_physical_device_count();
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -514,6 +517,12 @@ struct test_layout_override_guard {
 struct test_sycl_info_override_guard {
     explicit test_sycl_info_override_guard(const ggml_sycl_device_info & info) { test_set_sycl_info_override(info); }
     ~test_sycl_info_override_guard() { test_clear_sycl_info_override(); }
+};
+
+struct test_xmx_tiled_pp_route_override_guard {
+    explicit test_xmx_tiled_pp_route_override_guard(bool active) { test_set_xmx_tiled_pp_route_override(active); }
+
+    ~test_xmx_tiled_pp_route_override_guard() { test_clear_xmx_tiled_pp_route_override(); }
 };
 #endif
 

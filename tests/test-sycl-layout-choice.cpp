@@ -1169,20 +1169,34 @@ static bool run_multi_device_moe_i8_executor_support_test() {
     return true;
 }
 
-static bool run_single_device_moe_pp_complete_soa_layout_test() {
-    const auto & info = ggml_sycl_info();
-    if (info.device_count <= 0 ||
-        !xmx_capabilities_match_int8_tile(info.devices[0].xmx_caps, GGML_SYCL_MXFP4_MOE_XMX_M,
-                                          GGML_SYCL_MXFP4_MOE_XMX_N, GGML_SYCL_MXFP4_MOE_XMX_K) ||
-        !xmx_capabilities_support_sub_group(info.devices[0].xmx_caps, GGML_SYCL_MXFP4_MOE_XMX_SG)) {
-        printf("PASS: single-device XMX PP alternate test skipped on non-XMX device\n");
-        return true;
-    }
-
+// The single-device MoE plan's layout contract for MXFP4 gate/up/down, under one state of the planner's XMX_TILED
+// grouped-DPAS PP route. Each expectation names the function that decides it; the test asserts what the planner
+// materializes, one layout owner per weight (CLAUDE.md "THE LOADED LAYOUT IS THE ANSWER").
+//
+// - Gate/up start XMX_TILED on this mock: planner_default_device_layout() takes planner_mxfp4_xmx_tiled_supported(),
+//   whose capability chokepoint (ggml_sycl_select_mxfp4_moe_layout) picks XMX_TILED for an int8-XMX device and a
+//   QK_MXFP4-aligned shape.
+// - Down starts SOA: planner_mxfp4_xmx_tiled_supported() admits only GATE/UP, so down falls to
+//   layout_policy::get_optimal(MXFP4, MOE_EXPERT_WEIGHT), which is SOA.
+// - Route active: planner_moe_layout_needs_pp_soa_on_device() returns !pp_supported for an XMX_TILED primary, and
+//   planner_moe_primary_executor_supports_pp_layout_on_device() proves PP here (the mock caps can chunk the grouped-DPAS
+//   row list), so prepare_single_moe_pp_gate_up_primary_layouts_for_pack() promotes nothing and
+//   add_single_moe_pp_executable_alternates() reserves no SOA copy. A duplicate SOA reservation next to an XMX_TILED
+//   primary would give the weight two layout owners.
+// - Route inactive: the same predicate returns true, so gate/up primaries are rewritten to SOA before packing and the
+//   plan records moe_pp_soa_promoted. (An ambient GGML_SYCL_XMX_TILED_PP_PROOF=1 would keep XMX_TILED here too.)
+// - Down under ggml_sycl_moe_pp_onednn_batched_route_selected() (default on): maybe_upgrade_moe_down_layouts_to_i8()
+//   returns before upgrading, so down keeps its SOA primary and carries no MXFP4_I8 copy. With that route opted out,
+//   the same function upgrades down to an MXFP4_I8 primary and keeps the SOA bytes as its PP alternate.
+static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_active) {
     constexpr size_t mib       = 1024u * 1024u;
     constexpr int    n_experts = 2;
     constexpr int    ncols     = 2880;
     constexpr int    nrows     = 2880;
+
+    const char * route_name = xmx_tiled_pp_route_active ? "on" : "off";
+
+    ggml_sycl::test_xmx_tiled_pp_route_override_guard route_guard(xmx_tiled_pp_route_active);
 
     auto make_mxfp4 = [&](const char * name) {
         ggml_sycl::placement_tensor_info tensor;
@@ -1225,48 +1239,65 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
         return false;
     };
 
+    const ggml_layout_mode want_gate_up     = xmx_tiled_pp_route_active ? GGML_LAYOUT_XMX_TILED : GGML_LAYOUT_SOA;
+    const bool             down_batched     = ggml_sycl_moe_pp_onednn_batched_route_selected();
+    const ggml_layout_mode want_down        = down_batched ? GGML_LAYOUT_SOA : GGML_LAYOUT_MXFP4_I8;
+    const size_t           want_down_n_alts = down_batched ? 0 : 1;
+
     for (int e = 0; e < n_experts; ++e) {
         const auto gate = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::GATE);
         const auto up   = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::UP);
         const auto down = plan.lookup_expert_placement(0, e, ggml_sycl::expert_tensor_role::DOWN);
         if (!gate.found() || !up.found() || !down.found() || !gate.on_device || !up.on_device || !down.on_device ||
             gate.target_device != 0 || up.target_device != 0 || down.target_device != 0) {
-            printf("FAIL: expected complete local MoE triplet for expert %d, gate=%d/%d/%d up=%d/%d/%d down=%d/%d/%d\n",
-                   e, gate.found() ? 1 : 0, gate.on_device ? 1 : 0, gate.target_device, up.found() ? 1 : 0,
-                   up.on_device ? 1 : 0, up.target_device, down.found() ? 1 : 0, down.on_device ? 1 : 0,
-                   down.target_device);
+            printf(
+                "FAIL: route %s: expected complete local MoE triplet for expert %d, gate=%d/%d/%d up=%d/%d/%d "
+                "down=%d/%d/%d\n",
+                route_name, e, gate.found() ? 1 : 0, gate.on_device ? 1 : 0, gate.target_device, up.found() ? 1 : 0,
+                up.on_device ? 1 : 0, up.target_device, down.found() ? 1 : 0, down.on_device ? 1 : 0,
+                down.target_device);
             return false;
         }
-        if (gate.layout != GGML_LAYOUT_SOA || up.layout != GGML_LAYOUT_SOA) {
-            printf("FAIL: prompt gate/up expert %d must use PP-safe SOA primaries, gate=%d up=%d\n", e,
-                   (int) gate.layout, (int) up.layout);
+        if (gate.layout != want_gate_up || up.layout != want_gate_up) {
+            printf("FAIL: route %s: gate/up expert %d primaries must be layout %d, gate=%d up=%d\n", route_name, e,
+                   (int) want_gate_up, (int) gate.layout, (int) up.layout);
             return false;
         }
-        if (!has_layout_on_target(gate, GGML_LAYOUT_SOA) || !has_layout_on_target(up, GGML_LAYOUT_SOA) ||
+        if (!gate.alternate_layouts.empty() || !up.alternate_layouts.empty()) {
+            printf(
+                "FAIL: route %s: gate/up expert %d must have one layout owner, got %zu/%zu alternates (gate SOA=%d "
+                "up SOA=%d)\n",
+                route_name, e, gate.alternate_layouts.size(), up.alternate_layouts.size(),
+                has_layout_on_target(gate, GGML_LAYOUT_SOA) ? 1 : 0, has_layout_on_target(up, GGML_LAYOUT_SOA) ? 1 : 0);
+            return false;
+        }
+        if (down.layout != want_down || down.alternate_layouts.size() != want_down_n_alts ||
             !has_layout_on_target(down, GGML_LAYOUT_SOA)) {
-            printf("FAIL: expert %d is missing complete SOA PP executable coverage, gate=%d up=%d down=%d\n", e,
-                   (int) gate.layout, (int) up.layout, (int) down.layout);
-            return false;
-        }
-        if (down.layout != GGML_LAYOUT_MXFP4_I8) {
-            printf("FAIL: down expert %d should retain MXFP4_I8 TG primary after reserving SOA PP alternate, got %d\n",
-                   e, (int) down.layout);
+            printf(
+                "FAIL: route %s: down expert %d must be layout %d with %zu alternate(s) and SOA PP coverage "
+                "(oneDNN batched route=%d), got layout=%d alternates=%zu soa=%d\n",
+                route_name, e, (int) want_down, want_down_n_alts, down_batched ? 1 : 0, (int) down.layout,
+                down.alternate_layouts.size(), has_layout_on_target(down, GGML_LAYOUT_SOA) ? 1 : 0);
             return false;
         }
     }
+    if (plan.moe_pp_soa_promoted != !xmx_tiled_pp_route_active) {
+        printf("FAIL: route %s: moe_pp_soa_promoted=%d, want %d\n", route_name, plan.moe_pp_soa_promoted ? 1 : 0,
+               xmx_tiled_pp_route_active ? 0 : 1);
+        return false;
+    }
+
+    // The charge is the sum of every on-device layout the plan holds, so with no gate/up alternates it excludes any
+    // SOA copy of an XMX_TILED primary.
     const size_t planned_charge = planned_weight_charge_for_device(plan, 0);
     if (plan.weight_vram_bytes != planned_charge || plan.vram_bytes != planned_charge) {
-        printf("FAIL: planner under/over-counted PP-safe MoE layout charge, plan weight=%zu vram=%zu actual=%zu\n",
-               plan.weight_vram_bytes, plan.vram_bytes, planned_charge);
+        printf("FAIL: route %s: planner under/over-counted MoE layout charge, plan weight=%zu vram=%zu actual=%zu\n",
+               route_name, plan.weight_vram_bytes, plan.vram_bytes, planned_charge);
         return false;
     }
     if (planned_charge > devices[0].vram_budget) {
-        printf("FAIL: planner charged beyond device budget, charged=%zu budget=%zu\n", planned_charge,
-               devices[0].vram_budget);
-        return false;
-    }
-    if (!plan.moe_pp_soa_promoted) {
-        printf("FAIL: planner should record PP SOA promotion for prompt-incompatible gate/up primaries\n");
+        printf("FAIL: route %s: planner charged beyond device budget, charged=%zu budget=%zu\n", route_name,
+               planned_charge, devices[0].vram_budget);
         return false;
     }
 
@@ -1278,16 +1309,43 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
     const size_t tight_charge = planned_weight_charge_for_device(tight_plan, 0);
     if (tight_plan.weight_vram_bytes != tight_charge || tight_plan.vram_bytes != tight_charge) {
         printf(
-            "FAIL: tight-budget planner under/over-counted PP-safe MoE layout charge, plan weight=%zu vram=%zu "
+            "FAIL: route %s: tight-budget planner under/over-counted MoE layout charge, plan weight=%zu vram=%zu "
             "actual=%zu\n",
-            tight_plan.weight_vram_bytes, tight_plan.vram_bytes, tight_charge);
+            route_name, tight_plan.weight_vram_bytes, tight_plan.vram_bytes, tight_charge);
         return false;
     }
     if (tight_charge > tight_devices[0].vram_budget) {
-        printf("FAIL: tight-budget planner exceeded budget, charged=%zu budget=%zu\n", tight_charge,
-               tight_devices[0].vram_budget);
+        printf("FAIL: route %s: tight-budget planner exceeded budget, charged=%zu budget=%zu\n", route_name,
+               tight_charge, tight_devices[0].vram_budget);
         return false;
     }
+
+    printf("PASS: single-device MoE plan with the XMX_TILED PP route %s: gate/up %s, %s\n", route_name,
+           xmx_tiled_pp_route_active ? "stay XMX_TILED with no SOA copy" : "promoted to SOA primaries",
+           down_batched ? "down SOA with no I8 copy" : "down MXFP4_I8 with an SOA PP alternate");
+    return true;
+}
+
+static bool run_single_device_moe_pp_complete_soa_layout_test() {
+    const auto & info = ggml_sycl_info();
+    if (info.device_count <= 0 ||
+        !xmx_capabilities_match_int8_tile(info.devices[0].xmx_caps, GGML_SYCL_MXFP4_MOE_XMX_M,
+                                          GGML_SYCL_MXFP4_MOE_XMX_N, GGML_SYCL_MXFP4_MOE_XMX_K) ||
+        !xmx_capabilities_support_sub_group(info.devices[0].xmx_caps, GGML_SYCL_MXFP4_MOE_XMX_SG)) {
+        printf("PASS: single-device XMX PP alternate test skipped on non-XMX device\n");
+        return true;
+    }
+
+    // Both route states run, each reporting its own line, before either result decides this case.
+    const bool route_on_ok  = run_single_device_moe_pp_plan_route_test(/*xmx_tiled_pp_route_active=*/true);
+    const bool route_off_ok = run_single_device_moe_pp_plan_route_test(/*xmx_tiled_pp_route_active=*/false);
+    if (!route_on_ok || !route_off_ok) {
+        return false;
+    }
+
+    constexpr int n_experts = 2;
+    constexpr int ncols     = 2880;
+    constexpr int nrows     = 2880;
 
     ggml_tensor down_tensor{};
     down_tensor.type  = GGML_TYPE_MXFP4;
@@ -1363,8 +1421,11 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
     gate_tensor.ne[3] = 1;
     ggml_set_name(&gate_tensor, "blk.0.ffn_gate_exps.weight");
 
+    // test_xmx_moe_allow_unsafe_pp_from_env() is only the two legacy names' lookup. The production default is decided
+    // by ggml_sycl_xmx_moe_allow_unsafe_pp(), which reads GGML_SYCL_XMX_TILED_PP first and is ON when all three names
+    // are unset, so these checks pin the legacy names' precedence, not the route's default.
     if (ggml_sycl::test_xmx_moe_allow_unsafe_pp_from_env(nullptr, nullptr)) {
-        printf("FAIL: prompt XMX MoE PP must be disabled by default\n");
+        printf("FAIL: the legacy unsafe-PP name lookup must return false when both names are unset\n");
         return false;
     }
     if (ggml_sycl::test_xmx_moe_allow_unsafe_pp_from_env("0", "1")) {
@@ -1373,10 +1434,13 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
     }
     if (!ggml_sycl::test_xmx_moe_allow_unsafe_pp_from_env("1", nullptr) ||
         !ggml_sycl::test_xmx_moe_allow_unsafe_pp_from_env(nullptr, "1")) {
-        printf("FAIL: prompt XMX MoE PP should remain opt-in through explicit or legacy env\n");
+        printf("FAIL: the legacy unsafe-PP name lookup should honor either name set to 1\n");
         return false;
     }
 
+    // Prompt gate XMX_TILED keeps XMX only when the prompt route is on AND an authoritative planner residency proves a
+    // complete XMX cover (ggml_sycl_moe_layout_for_selected_rows). This process has no planner residency, and the
+    // opt-outs below apply if the route's latched env read has not happened yet, so either way prompt falls to SOA.
     setenv("GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP", "0", 1);
     setenv("GGML_SYCL_XMX_MOE_PP", "0", 1);
     ggml_sycl::test_clear_moe_planned_layout_probe_overrides();
@@ -1385,7 +1449,7 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
     if (ggml_sycl::test_moe_layout_for_selected_rows(&gate_tensor, 0, GGML_LAYOUT_XMX_TILED,
                                                      /*selected_rows=*/512, /*exact_override=*/false,
                                                      /*n_tokens=*/512) != GGML_LAYOUT_SOA) {
-        printf("FAIL: prompt gate XMX_TILED should fall back to planned SOA by default\n");
+        printf("FAIL: prompt gate XMX_TILED without a proven planned XMX cover should fall back to planned SOA\n");
         return false;
     }
     if (ggml_sycl::test_moe_layout_for_selected_rows(&gate_tensor, 0, GGML_LAYOUT_XMX_TILED,
@@ -1395,7 +1459,7 @@ static bool run_single_device_moe_pp_complete_soa_layout_test() {
         return false;
     }
 
-    printf("PASS: single-device MoE planner budgets and proves complete PP-safe SOA executable layouts\n");
+    printf("PASS: single-device MoE prompt layout selection is proof-gated on complete planned SOA coverage\n");
     return true;
 }
 
@@ -1458,6 +1522,7 @@ static bool run_moe_decode_down_phase_split_policy_test() {
         return false;
     }
 
+    printf("PASS: MoE decode down layout policy requires the explicit DPAS env and keeps an I8 candidate\n");
     return true;
 }
 
@@ -2768,6 +2833,7 @@ int main() {
         return 1;
     }
     bool room_cost_ok = true;
+    bool tail_ok      = true;
     {
         const ggml_sycl_device_info              mock_info = make_mock_sycl_info();
         ggml_sycl::test_sycl_info_override_guard info_guard(mock_info);
@@ -2807,20 +2873,14 @@ int main() {
         if (!run_multi_device_moe_i8_executor_support_test()) {
             return 1;
         }
-        if (!run_single_device_moe_pp_complete_soa_layout_test()) {
-            return 1;
-        }
-        if (!run_moe_decode_down_phase_split_policy_test()) {
-            return 1;
-        }
-        if (!run_multi_device_no_p2p_cohesive_moe_layer_test()) {
-            return 1;
-        }
-        if (!run_regression_guard_policy_test()) {
-            return 1;
-        }
+        // These cases each print their own PASS or FAIL, and a failure does not stop the run: a stale expectation in
+        // one case once hid every case after it. The binary still fails at the end.
+        tail_ok = run_single_device_moe_pp_complete_soa_layout_test();
+        tail_ok = run_moe_decode_down_phase_split_policy_test() && tail_ok;
+        tail_ok = run_multi_device_no_p2p_cohesive_moe_layer_test() && tail_ok;
+        tail_ok = run_regression_guard_policy_test() && tail_ok;
     }
-    if (!room_cost_ok) {
+    if (!room_cost_ok || !tail_ok) {
         return 1;
     }
 
