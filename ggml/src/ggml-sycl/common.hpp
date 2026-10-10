@@ -2451,6 +2451,9 @@ bool   ggml_sycl_dense_woq_alternate_eligible(ggml_type type, bool is_contiguous
 // and GGML_SYCL_SKIP_ONEDNN_Q4_0). Defined next to ggml_sycl_onednn_pp_candidate, which asks the same two gates; the
 // planner calls it because it cannot see that TU's statics.
 bool   ggml_sycl_onednn_pp_type_admitted(ggml_type type);
+// llama.cpp-84ck: whether this build can execute the MoE MMID direct route at all. Defined in ggml-sycl.cpp from the
+// same constants the admission gate reads; the planner charges and re-plans the MMID workspace pools only when it holds.
+bool   ggml_sycl_moe_mmid_route_reachable_in_build();
 // Same predicate, with placement safety judged for `plan` rather than the current global
 // plan -- the planner's form, since the plan it is building is not global yet.
 bool   ggml_sycl_dense_woq_alternate_eligible_for_plan(ggml_type                         type,

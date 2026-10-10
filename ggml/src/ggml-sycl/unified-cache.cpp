@@ -29796,6 +29796,12 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
     if (n_expert_used <= 0) {
         return;
     }
+    // llama.cpp-84ck: plan a pool only for a route that can consume one. Its device bytes are charged into vram_bytes
+    // (account_moe_mmid_workspaces), so a pool for a closed route takes VRAM that experts and KV could use and that
+    // nothing ever touches. The runtime re-plan computes its demand here too, so a closed route never grows a pool.
+    if (!ggml_sycl_moe_mmid_route_reachable_in_build()) {
+        return;
+    }
 
     const int primary_device = plan.device_id >= 0 ? plan.device_id : (plan.devices.empty() ? -1 : plan.devices.front());
     std::map<int, moe_mmid_workspace_geometry> maxima;
@@ -29940,9 +29946,22 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
     };
     if (reason) *reason = moe_mmid_runtime_reason::OK;
     try {
-        placement_plan demand = plan;
-        plan_moe_mmid_workspaces(demand, tensor_inventory, n_expert_used);
-        if (!demand.moe_mmid_workspace_valid) return refuse(moe_mmid_runtime_reason::DEMAND_INVALID);
+        // A pool the load plan rejected stays rejected for the plan's lifetime. A plan is invalid from either of two
+        // sources: reject_moe_mmid_workspaces() (it did not fit the budget the experts left, an owner or a size was
+        // invalid, or the host scratch zone overflowed), which also clears the workspaces, or a host staging-zone
+        // sizing overflow in populate_host_zone_sizing(), which keeps them. Nothing materializes either, so its demand
+        // is not re-planned, and above all not sent to the growth admission below: GROWTH_BUDGET_EXCEEDED there makes the
+        // runtime transaction demote KV or refuse the context for a pool that was never going to exist
+        // (llama.cpp-84ck). The stable budget check still runs, because it is the KV refresh's own check. A closed
+        // route needs no case of its own: plan_moe_mmid_workspaces() plans no demand for it.
+        const bool     pool_rejected = !plan.moe_mmid_workspace_valid;
+        placement_plan demand        = plan;
+        if (!pool_rejected) {
+            plan_moe_mmid_workspaces(demand, tensor_inventory, n_expert_used);
+            if (!demand.moe_mmid_workspace_valid) {
+                return refuse(moe_mmid_runtime_reason::DEMAND_INVALID);
+            }
+        }
         // Runtime KV refresh has already restored the existing global MMID
         // charge. Stable geometry is not a budget bypass: validate before the
         // early return, accepting the exact boundary and rejecting budget+1.
@@ -29954,6 +29973,9 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
                 return refuse(verdict == moe_mmid_runtime_reason::OK ? moe_mmid_runtime_reason::BUDGET_EXCEEDED :
                                                                        verdict);
             }
+        }
+        if (pool_rejected) {
+            return true;
         }
         bool fits = demand.moe_mmid_workspaces.size() == plan.moe_mmid_workspaces.size();
         for (const auto & required : demand.moe_mmid_workspaces) {
@@ -30012,7 +30034,8 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
         plan.moe_mmid_workspaces = std::move(demand.moe_mmid_workspaces);
         plan.moe_mmid_device_pool_bytes = demand.moe_mmid_device_pool_bytes;
         plan.moe_mmid_host_pool_bytes = demand.moe_mmid_host_pool_bytes;
-        plan.moe_mmid_workspace_valid = true;
+        // A rejected pool never reaches this growth tail (the pool_rejected return above), so it is never revived here.
+        GGML_ASSERT(plan.moe_mmid_workspace_valid);
         plan.vram_bytes = new_vram;
         plan.per_device_vram = std::move(new_per_device);
         return true;
@@ -30032,6 +30055,11 @@ static void reject_moe_mmid_workspaces(placement_plan & plan) {
 }
 
 static void validate_moe_mmid_execution_owners(placement_plan & plan) {
+    // An owner workspace is what MMID admission needs on a device. With no route to admit, no device needs one, and
+    // plan_moe_mmid_workspaces() planned none (llama.cpp-84ck).
+    if (!ggml_sycl_moe_mmid_route_reachable_in_build()) {
+        return;
+    }
     auto has_owner = [&](int device) {
         return std::any_of(plan.moe_mmid_workspaces.begin(), plan.moe_mmid_workspaces.end(),
                            [&](const moe_mmid_owner_workspace_plan & workspace) {

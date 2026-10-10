@@ -2324,6 +2324,21 @@ runtime `n_ubatch` through `pp_moe_onednn_admit_ring()`
   them. It materializes them only for a route that can run them, the predicate
   `load_end` and the context-bind hook already use. In an ordinary build that
   route is closed, so this is 0.
+- The plan charges the MMID pools on the same fact. `plan_moe_mmid_workspaces()`
+  plans them, and `vram_bytes` carries their device bytes, only when
+  `ggml_sycl_moe_mmid_route_reachable_in_build()` holds (`llama.cpp-84ck`). So
+  in an ordinary build no pool bytes are charged. A pool rejected by the load
+  plan (budget, geometry or owner) stays rejected: the runtime re-plan neither
+  re-plans its demand nor asks the growth admission for it, so it cannot demote
+  KV or refuse a context.
+  A closed route is not a rejection. Its plan is valid and empty
+  (`moe_mmid_workspace_valid` stays true, and no owner check runs), because a
+  closed route is a fact about the build. A rejection is an outcome of one load
+  plan for a route that could run, and the runtime keeps it rejected.
+  `reject_moe_mmid_workspaces()` clears its workspaces, so the materialization
+  wrapper returns `NOT_APPLICABLE` before the implementation's `INVALID` check
+  is reached. A host staging-zone sizing overflow keeps the workspaces but
+  marks the plan invalid, and that check refuses it.
 - The KV-zone part may use only `headroom - reserve`. `headroom` is the device's
   KV capacity less the plan's device KV (with the allocator's per-layer slack).
   The capacity is `ggml_sycl_kv_capacity_live()`, the one number the KV re-fit

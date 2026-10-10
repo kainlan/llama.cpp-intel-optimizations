@@ -70,6 +70,17 @@ guarded = {
         "int  test_set_xmx_tiled_pp_route_override(bool active);",
         "void test_restore_xmx_tiled_pp_route_override(int previous);",
         "struct test_xmx_tiled_pp_route_override_guard {",
+        "int  test_set_moe_mmid_route_reachable_override(bool reachable);",
+        "void test_restore_moe_mmid_route_reachable_override(int previous);",
+        "struct test_moe_mmid_route_reachable_override_guard {",
+    ),
+    # The MMID route reachability override (llama.cpp-84ck): the override, its read inside
+    # ggml_sycl_moe_mmid_route_reachable_in_build(), and the setters. Outside a test build the predicate must be the
+    # compile-time constants alone.
+    SYCL / "ggml-sycl.cpp": (
+        "g_test_moe_mmid_route_reachable_override",
+        "int test_set_moe_mmid_route_reachable_override(",
+        "void test_restore_moe_mmid_route_reachable_override(",
     ),
 }
 for path, targets in guarded.items():
@@ -108,6 +119,9 @@ if len(sys.argv) > 1:
         "test_set_xmx_tiled_pp_route_override",
         "test_restore_xmx_tiled_pp_route_override",
         "g_test_xmx_tiled_pp_route_override",
+        "test_set_moe_mmid_route_reachable_override",
+        "test_restore_moe_mmid_route_reachable_override",
+        "g_test_moe_mmid_route_reachable_override",
     )
     leaked = [name for name in forbidden_symbols if name in nm]
     if leaked:
