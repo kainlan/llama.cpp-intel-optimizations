@@ -12,6 +12,7 @@
 #include "ggml-sycl.h"
 #include "kv-runtime-demotion.hpp"
 #include "mem-handle.hpp"
+#include "model-lifecycle.hpp"
 #include "moe-control-plan.hpp"
 #include "moe-mmid-workspace.hpp"
 #include "moe-scratch-admission.hpp"
@@ -2011,20 +2012,26 @@ bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_
 // zone (zone_compute_term_bytes over the probe measure's chunks), a named RUNTIME consumer folded into
 // unified_cache_get_planned_runtime_zone_requirement() so the zone is sized for the buffer before the weight pack.
 // It is measured at the load's measure shape (n_ctx_train and ubatch 512 until fkpg (a) transports the caller's
-// -c and -ub), so it is the planned term for that shape, not for every context. `other_model_live` merges like the
-// dense terms: the larger of the stored and the new term stays while another model is live on the device.
-// False for a device out of range (nothing stored). moua L6 retires it into the FIRST_CONTEXT head slot.
-bool             unified_cache_set_planned_compute_term(int device_id, size_t bytes, bool other_model_live = false);
-size_t           unified_cache_get_planned_compute_term_bytes(int device_id);
+// -c and -ub), so it is the planned term for that shape, not for every context. moua L6 retires it into the
+// FIRST_CONTEXT head slot.
+// Owner-keyed (llama.cpp-ihk6, canonical contract 12.4): `owner` is the model slot and slot generation of the load
+// that measured it, and the setter replaces that owner's term on the device. The getter answers the merge, the largest
+// term of the owners on the device. False, storing nothing, for a device out of range, an owner that is not a model
+// slot (buffer_owner_slot, no_model_slot), generation 0, or an owner older than the slot's current one
+// (planned_load_terms::set).
+bool     unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes);
+size_t   unified_cache_get_planned_compute_term_bytes(int device_id);
 // llama.cpp-p6i0: the load's planned state term, the bytes the context memory the probe measure placed on the
 // device's plain buffer type occupies in the RUNTIME zone (the recurrent state: the real context allocates it there,
 // RUNTIME-first and outside the compute scope, before the compute buffer, so a compute term alone does not hold the
-// buffer). Folded into unified_cache_get_planned_runtime_zone_requirement() beside the compute term, merged the same
-// way, and false for a device out of range.
-bool             unified_cache_set_planned_state_term(int device_id, size_t bytes, bool other_model_live = false);
-size_t           unified_cache_get_planned_state_term_bytes(int device_id);
-// Drops every device's load terms, compute and state. Called where no model is live, so no context can still draw one.
-void             unified_cache_clear_planned_load_terms();
+// buffer). Folded into unified_cache_get_planned_runtime_zone_requirement() beside the compute term, keyed by owner
+// and merged the same way, with the same refusals.
+bool     unified_cache_set_planned_state_term(int device_id, lifecycle::SlotToken owner, size_t bytes);
+size_t   unified_cache_get_planned_state_term_bytes(int device_id);
+// Drops `owner`'s compute and state terms on every device and republishes the merge; every other owner's stay
+// (llama.cpp-ihk6). Called where the owner ends: its load's rollback and its slot's release. True when something was
+// dropped.
+bool     unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner);
 // Whether the dense scratch at `n_ubatch` fits the RUNTIME zone's CAPACITY beside the other n_ubatch-independent
 // planned consumers. Capacity, not free space: free space depends on which compute buffers are live, capacity is
 // the fact the plan can be held to. `largest_ubatch` (optional) receives n_ubatch when it fits, else the largest

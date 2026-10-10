@@ -12641,14 +12641,10 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
     g_sycl_lifecycle_release_slot_last_slot.store(slot, std::memory_order_relaxed);
     g_sycl_lifecycle_release_slot_last_reclaimed.store(reclaimed, std::memory_order_relaxed);
     g_sycl_lifecycle_release_slot_calls.fetch_add(1, std::memory_order_relaxed);
-    // llama.cpp-p6i0: the planned load terms (compute and state) are device-global and merged across live models, so a
-    // teardown drops them only when no other model is live and no load is in flight (a load in flight has reserved its
-    // own).
-    const uint32_t others_live =
-        ggml_sycl::lifecycle::global_registry().live_mask() & (slot < 32 ? ~(1u << slot) : ~0u);
-    if (others_live == 0 && !g_sycl_in_model_load.load(std::memory_order_acquire)) {
-        ggml_sycl::unified_cache_clear_planned_load_terms();
-    }
+    // llama.cpp-ihk6: the planned load terms (compute and state) are keyed by owner (canonical contract 12.4), so the
+    // released slot drops exactly its own contribution and the device's merge is recomputed from the owners still
+    // live on it. Another live model's terms stay, and so do a load in flight's.
+    (void) ggml_sycl::unified_cache_drop_planned_load_terms(owner.owner);
     // llama.cpp-fzem: WARN, not INFO -- GGML_LOG_LEVEL_INFO maps below the
     // default verbosity threshold (67b2b7f2f, common/log.cpp:444), so an INFO
     // line here is invisible in a normal run and its absence in a capture
@@ -12875,11 +12871,6 @@ static void ggml_sycl_model_loading_effects(bool loading, bool outer) {
             // constructor reserves the arena when vram_arena_enabled().
             const int      total_gpus = ggml_sycl_info().total_gpu_count;
             const uint32_t live_mask  = ggml_sycl::lifecycle::global_registry().live_mask();
-            // llama.cpp-p6i0: with no model live, no context can draw a planned load term, so a term left by a load
-            // that never committed (or by a teardown that raced a load) is dropped before this load reserves.
-            if (live_mask == 0) {
-                ggml_sycl::unified_cache_clear_planned_load_terms();
-            }
             for (int d = 0; d < total_gpus && d < GGML_SYCL_MAX_DEVICES; d++) {
                 auto * cache = ggml_sycl::get_unified_cache_for_device(d);
                 if (cache) {
@@ -13169,11 +13160,13 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
         // Abort discards only loader-thread candidate state. The previously active
         // LIVE execution authority remains continuously published.
         ggml_sycl_reset_model_load_scratch_state(true);
-        // llama.cpp-p6i0: the aborted load's planned load terms go with it when no model is live; with one live, the
-        // merged terms stay (each is at least the live model's).
-        if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) {
-            ggml_sycl::unified_cache_clear_planned_load_terms();
-        }
+    } catch (...) {
+        clean = false;
+    }
+    try {
+        // llama.cpp-ihk6: the aborted load's planned load terms leave by its own key (canonical contract 12.4); the
+        // live models' contributions, and the device's merge of them, are what remains.
+        (void) ggml_sycl::unified_cache_drop_planned_load_terms(owner.owner);
     } catch (...) {
         clean = false;
     }
@@ -40570,6 +40563,10 @@ bool ggml_backend_sycl_load_compute_term_bytes(const uint64_t * chunk_bytes, uin
 // not the caller's -c and -ub, which fkpg (a) transports.  False, reserving nothing, when txn is not the open load,
 // n_ctx is 0, the device is out of range or has no VRAM arena, or the chunk list is unusable; the load then goes on
 // with its compute buffer unplanned, as it did before this entry existed.
+// The term is stored as the load's own contribution, keyed by the model slot and slot generation the transaction was
+// given at its begin (llama.cpp-ihk6, canonical contract 12.4): the load effect admits only the exact open
+// transaction and names that owner, and it is held across the store, so the load's end, which waits load effects
+// out, cannot run its rollback's drop before the store lands.
 bool ggml_backend_sycl_load_reserve_compute_term(ggml_sycl_load_txn txn,
                                                  int32_t            device,
                                                  const uint64_t *   chunk_bytes,
@@ -40580,9 +40577,10 @@ bool ggml_backend_sycl_load_reserve_compute_term(ggml_sycl_load_txn txn,
         return false;
     }
     try {
-        const char * why   = nullptr;
-        size_t       bytes = 0;
-        if (!ggml_sycl_load_txn_is_open(txn.id)) {
+        const char * why    = nullptr;
+        size_t       bytes  = 0;
+        const auto   effect = ggml_sycl::lifecycle::global_registry().acquire_load_effect({ txn.id });
+        if (!effect) {
             why = "not the open load transaction";
         } else if (n_ctx == 0) {
             why = "the measure carries no n_ctx";
@@ -40594,8 +40592,7 @@ bool ggml_backend_sycl_load_reserve_compute_term(ggml_sycl_load_txn txn,
                 why = "no VRAM arena on the device";
             } else if (!ggml_sycl_load_compute_term_size(chunk_bytes, n_chunks, &bytes)) {
                 why = "the chunk list is null or overflows";
-            } else if (!ggml_sycl::unified_cache_set_planned_compute_term(
-                           device, bytes, ggml_sycl::lifecycle::global_registry().live_mask() != 0)) {
+            } else if (!ggml_sycl::unified_cache_set_planned_compute_term(device, effect.owner.owner, bytes)) {
                 why = "the term was not stored";
             }
         }
@@ -40624,16 +40621,17 @@ bool ggml_backend_sycl_load_reserve_compute_term(ggml_sycl_load_txn txn,
 // as one buffer at the reservation's grain (ggml_sycl_load_compute_term_size), with no headroom; it writes the
 // planner term only.  False, reserving nothing, when txn is not the open load, the device is out of range or has no
 // VRAM arena, or the size overflows; the device's compute buffer then stays unplanned too (the loader offers no
-// compute term for it).
+// compute term for it).  Keyed by the open load's owner and stored under its load effect, as the compute term is.
 bool ggml_backend_sycl_load_reserve_state_term(ggml_sycl_load_txn txn, int32_t device, uint64_t state_bytes) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) {
         return false;
     }
     try {
-        const char * why   = nullptr;
-        size_t       bytes = 0;
-        if (!ggml_sycl_load_txn_is_open(txn.id)) {
+        const char * why    = nullptr;
+        size_t       bytes  = 0;
+        const auto   effect = ggml_sycl::lifecycle::global_registry().acquire_load_effect({ txn.id });
+        if (!effect) {
             why = "not the open load transaction";
         } else if (device < 0 || device >= ggml_sycl_info().total_gpu_count || device >= GGML_SYCL_MAX_DEVICES) {
             why = "device out of range";
@@ -40643,8 +40641,7 @@ bool ggml_backend_sycl_load_reserve_state_term(ggml_sycl_load_txn txn, int32_t d
                 why = "no VRAM arena on the device";
             } else if (!ggml_sycl_load_compute_term_size(&state_bytes, 1, &bytes)) {
                 why = "the size overflows";
-            } else if (!ggml_sycl::unified_cache_set_planned_state_term(
-                           device, bytes, ggml_sycl::lifecycle::global_registry().live_mask() != 0)) {
+            } else if (!ggml_sycl::unified_cache_set_planned_state_term(device, effect.owner.owner, bytes)) {
                 why = "the term was not stored";
             }
         }
