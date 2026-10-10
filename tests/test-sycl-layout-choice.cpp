@@ -840,6 +840,8 @@ static bool run_kv_context_room_is_cost_based_test() {
             qwen.kv_context_reserve_bytes, 2 * full_room, device_triplets(qwen), qwen.kv_context_room_displaced_bytes,
             4 * triplet_bytes);
         ok = false;
+    } else {
+        printf("PASS: (a) a full context with p_hit 1/4 holds every layer's KV context room\n");
     }
 
     // (e) No request: no room, whatever the cost parameters say. Six triplets fit what the dense weights and their KV
@@ -851,6 +853,8 @@ static bool run_kv_context_room_is_cost_based_test() {
             "(want 0, 0, 6)\n",
             none.kv_context_reserve_bytes, none.kv_context_room_displaced_bytes, device_triplets(none));
         ok = false;
+    } else {
+        printf("PASS: (e) with no requested context no KV context room is held, whatever the cost parameters\n");
     }
 
     // (b) GPT-OSS-shaped: a short chat in a large context. F = floor(4096 x 1 / 100) = 40 cells, so
@@ -867,10 +871,14 @@ static bool run_kv_context_room_is_cost_based_test() {
             gptoss.kv_context_reserve_bytes, gptoss.kv_context_room_displaced_bytes, device_triplets(gptoss),
             device_triplets(none), gptoss.get_kv_device(0), gptoss.get_kv_device(1));
         ok = false;
+    } else {
+        printf("PASS: (b) a 1%% fill refuses every layer's KV context room and packs the experts of no request\n");
     }
 
-    // (c) Mixed: the decision flips between a SWA layer and a FULL one, not between two FULL layers, whose widths
-    //     cancel (A/B = F / (4096 - 512) x 40 / (30 x p_hit) for every FULL layer). Fill 25%: F = 1024 cells; p_hit
+    // (c) Mixed: under the uniform cost every full-attention layer decides alike, all held or all refused: a layer's
+    //     KV per cell is in both A and B and cancels (A/B = F / (4096 - 512) x 40 / (30 x p_hit) for every FULL
+    //     layer), so no constants make two FULL layers split. Only a SWA layer, whose room and host read are capped by
+    //     its window, can decide otherwise, so the case flips between a SWA and a FULL layer. Fill 25%: F = 1024; p_hit
     //     2/4. Layer 1 (FULL, latest, demoted first): A = 1024 x 512 B / 30 GB/s = 17.5 us, B = 1.75 MiB x 1/2 /
     //     40 GB/s = 22.9 us: refused. Layer 0 (SWA): its room is the window, 1536 - 512 = 1024 cells = 512 KiB, and the
     //     host reads min(1024, 1536) = 1024 cells, so A = 17.5 us against B = 512 KiB x 1/2 / 40 GB/s = 6.6 us: held.
@@ -895,6 +903,8 @@ static bool run_kv_context_room_is_cost_based_test() {
             mixed.kv_context_reserve_bytes, swa_room, device_triplets(mixed), mixed.kv_context_room_displaced_bytes,
             triplet_bytes, mixed.get_kv_device(0), mixed.get_kv_device(1));
         ok = false;
+    } else {
+        printf("PASS: (c) the latest (FULL) layer's KV context room is refused and the SWA layer's held\n");
     }
 
     // (d) Dense (n_expert 0): no expert to displace, so the room is held as before, even at a fill so small that
@@ -910,12 +920,8 @@ static bool run_kv_context_room_is_cost_based_test() {
         printf("FAIL: (d) a dense model holds every layer's room: held %zu, want %zu\n", dense.kv_context_reserve_bytes,
                2 * full_room);
         ok = false;
-    }
-
-    if (ok) {
-        printf(
-            "PASS: the KV context room is held per layer only where the attention it keeps outweighs the experts it "
-            "displaces\n");
+    } else {
+        printf("PASS: (d) a dense model holds every layer's KV context room, even at a zero expected fill\n");
     }
     return ok;
 }
@@ -2734,6 +2740,7 @@ int main() {
     if (!run_vram_budget_authority_test()) {
         return 1;
     }
+    bool room_cost_ok = true;
     {
         const ggml_sycl_device_info              mock_info = make_mock_sycl_info();
         ggml_sycl::test_sycl_info_override_guard info_guard(mock_info);
@@ -2755,9 +2762,12 @@ int main() {
             return 1;
         }
         if (!run_kv_context_room_before_experts_test() || !run_kv_context_room_cost_is_net_test() ||
-            !run_kv_context_room_follows_the_requested_context_test() || !run_kv_context_room_is_cost_based_test()) {
+            !run_kv_context_room_follows_the_requested_context_test()) {
             return 1;
         }
+        // Each cost sub-case prints its own PASS or FAIL, and a failure does not stop the run, so the cases after it
+        // still report; the binary fails at the end instead.
+        room_cost_ok = run_kv_context_room_is_cost_based_test();
         if (!run_dense_weights_before_kv_test()) {
             return 1;
         }
@@ -2782,6 +2792,9 @@ int main() {
         if (!run_regression_guard_policy_test()) {
             return 1;
         }
+    }
+    if (!room_cost_ok) {
+        return 1;
     }
 
     const char * run_backend_layout_test = std::getenv("GGML_SYCL_TEST_LAYOUT_CHOICE_BACKEND");
