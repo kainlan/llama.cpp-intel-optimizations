@@ -407,6 +407,7 @@ static void test(void) {
         const pid_t pid = fork();
         assert(pid >= 0);
         if (pid == 0) {
+            alarm(30);  // a child that hangs on its way out (e.g. joining a logger thread) dies, and the assert fires
             if (freopen("/dev/null", "w", stdout) == nullptr || freopen("/dev/null", "w", stderr) == nullptr) {
                 _exit(2);
             }
