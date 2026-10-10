@@ -92,11 +92,12 @@ if (GGML_SYCL_MMQ_XMX)
     list(APPEND GGML_HEADERS_SYCL mmq_xmx.hpp)
 endif()
 
-# The opt-in ESIMD Q4_0 mmq kernels (mmq-esimd.hpp, included only by mmq.cpp) are compiled only when this
+# The opt-in ESIMD Q4_0 mmq kernels (mmq-esimd.hpp; within the ggml-sycl build only mmq.cpp includes it, and the
+# one other includer, a tools/sycl-kernel-bench tier2 file, is in no target) are compiled only when this
 # option is ON. ocloc 26.35.39758.11 / IGC 2.41.9 segfault on the SPIR-V image holding them, which fails the
 # device link of libggml-sycl and of every test target carrying its own device image (llama.cpp-xtvl). With the
 # option OFF the header compiles its stubs, mmq_esimd_available() is false, and the runtime env
-# GGML_SYCL_MMQ_ESIMD logs one warning and falls back to the regular mmq kernels.
+# GGML_SYCL_MMQ_ESIMD=<n> (> 0) logs one warning at backend init (ggml_check_sycl) and the regular mmq kernels run.
 if (GGML_SYCL_MMQ_ESIMD)
     message(STATUS "Compiling with the opt-in GGML_SYCL_MMQ_ESIMD Q4_0 kernels.")
     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_MMQ_ESIMD_KERNELS)
