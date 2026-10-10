@@ -23,8 +23,9 @@ ships.
   index then folds to `tile[load_idx]`.
 - **Our code?** No. The kernel is in-spec ESIMD. The ESIMD extension spec's own
   `local_accessor` example writes `LocalAcc[LID * VL + I] = ...` and calls
-  `Item.barrier()` inside an ESIMD kernel, which is exactly what V3 does. V3
-  does not mix `local_accessor` with `slm_init` or `slm_allocator`, the one
+  `Item.barrier()` inside an ESIMD kernel. V3 does the same through
+  `get_multi_ptr<>().get()`, indexing the raw pointer instead of subscripting
+  the accessor, and calls `item.barrier()`. V3 does not mix `local_accessor` with `slm_init` or `slm_allocator`, the one
   documented restriction.
 - **Our API use?** No. The crash reproduces through `local_accessor::operator[]`,
   the most canonical form, as well as through `get_multi_ptr<>().get()`.
@@ -101,11 +102,17 @@ libigc.so.2 build-id `7efd11dfd1868800521b7b347368984d009c5acd`, icpx
 | reduced kernel, store stride 32 / load stride 33 | compiles |
 | SLM allocation size changed independently of stride | no effect |
 | reduced kernel without the loop, or without the SLM read-back | compiles |
-| `-internal_options "-llvm-options='-enable-add3=false'"`, real image and minimal, bmg_g21 and bmg_g31 | rc=0 (all four) |
+| `-internal_options "-llvm-options='-enable-add3=false'"`, real image and published reproducer, bmg_g21 and bmg_g31 | rc=0 (all four) |
 | same with `-enable-add3=true` | rc=139 (all four) |
-| minimal SPIR-V on dg2-g10, pvc, mtl-u, lnl-m, ptl-h, bmg_g21, bmg_g31 | rc=139 |
-| minimal SPIR-V on tgllp (no add3 instruction) | rc=0 |
-| `-options -g`, `-cl-opt-disable`, `-vc-disable-indvars-opt`, `-vc-disable-non-overlapping-region-opt` | still rc=139 |
+| published reproducer's SPIR-V on dg2-g10, pvc, mtl-u, lnl-m, ptl-h, bmg_g21, bmg_g31 | rc=139 |
+| published reproducer's SPIR-V on tgllp (no add3 instruction) | rc=0 |
+| published reproducer's SPIR-V with `-options -g`, `-cl-opt-disable`, `-vc-disable-indvars-opt`, `-vc-disable-non-overlapping-region-opt` | still rc=139 |
+
+"Published reproducer" means the source at the end of this file. Its SPIR-V,
+as IGC receives it, is 1 276 bytes. The pass trace, the IR excerpt, the
+register state and every published-reproducer row above were taken on that
+SPIR-V. The "reduced kernel" rows come from earlier knob-driven reductions of
+the same kernel.
 
 The device sweep separates hardware-specific lowering from the front end. The
 matcher only runs where `ST->hasAdd3Bfn()` is true, which is why every
@@ -148,8 +155,11 @@ by its loop: `isa<Constant>`, then vector type then `getSplatValue()`, else
 1. **Compile-out (in force, llama.cpp-xtvl).** The ESIMD mmq kernels are not
    built by default. They are opt-in, AOS-only, and the losing variant per
    CLAUDE.md. No default path loses anything.
-2. **V3 as a plain SYCL kernel.** V3 calls no ESIMD API; the comment above its
-   constants already calls it a "Standard SYCL kernel". Dropping
+2. **V3 as a plain SYCL kernel.** V3 calls no ESIMD API. The source comments
+   disagree about what V3 is meant to be. The comment above its constants calls
+   it a "Standard SYCL kernel", while the comment directly above the kernel
+   calls it "ESIMD-native" and says it "uses only ESIMD-compatible operations".
+   Dropping
    `SYCL_ESIMD_KERNEL` from its lambda and `SYCL_ESIMD_FUNCTION` from
    `v3_dp4a` sends it through the scalar IGC backend, and a standalone copy
    then compiles on IGC 2.41. This changes the execution model from one
@@ -157,7 +167,8 @@ by its loop: `isa<Constant>`, then vector type then `getSplatValue()`, else
    same, but it needs the GPU oracle before anyone ships it, and it would no
    longer be an ESIMD kernel at all.
 3. **Build flag.** Pass
-   `-Xsycl-target-backend=intel_gpu_bmg_g2x "-internal_options -llvm-options=-enable-add3=false"`.
+   `-Xsycl-target-backend=intel_gpu_bmg_g21 "-internal_options -llvm-options=-enable-add3=false"`
+   and the same for `intel_gpu_bmg_g31`, the two AOT targets the build uses.
    It works and SIMT images accept it, but it removes `add3` from every VC
    kernel in libggml-sycl, including the default-on ESIMD attention and MoE
    kernels. It also does not cover the spir64 JIT image. Not recommended.
@@ -184,7 +195,7 @@ icpx -fsycl -fsycl-targets=spir64_gen -Xs "-device bmg_g21" \
 
 To get the SPIR-V that IGC sees, run the first command with
 `IGC_ShaderDumpEnable=1 IGC_DumpToCustomDir=<dir>` and take
-`VC_*_igc_input.spv` (1 268 bytes for this source). Then:
+`VC_*_igc_input.spv` (1 276 bytes for this source). Then:
 
 ```bash
 ocloc compile -file VC_<hash>_igc_input.spv -spirv_input -device bmg_g21   # rc=139
@@ -196,14 +207,16 @@ libggml-sycl device link fails with the same segfault.
 ## Upstream issue text
 
 **Title:** VC: SIGSEGV in GenXPatternMatch `Add3Matcher::isProfitable` —
-`getUniqueInteger()` on a ConstantExpr SLM base (IGC 2.41, regression vs 2.40.13)
+`getUniqueInteger()` on a ConstantExpr SLM base (IGC 2.41; the affected kernel linked on 2.40.13)
 
 **Body:**
 
 > **Versions.** IGC 2.41.9 (Ubuntu PPA `2.41.9+ds1-1~26.04`, linked LLVM
-> 22.1.8), intel-ocloc 26.35.39758.11, icpx 2026.1.1. Last good: IGC 2.40.13
-> (LLVM 17.0.6) with the same source and compiler. The matcher code is
-> unchanged on v2.42.3 and master.
+> 22.1.8), intel-ocloc 26.35.39758.11, icpx 2026.1.1. The full application
+> image that contains the affected kernel linked with IGC 2.40.13 (LLVM 17.0.6)
+> and ocloc 26.31. The minimal reproducer below was not compiled on 2.40.13,
+> because the host was upgraded before it existed. `Add3Matcher::isProfitable`
+> is identical in v2.40.13, v2.41.9, v2.42.3 and master.
 >
 > **Summary.** An ESIMD kernel that stores to a `sycl::local_accessor` in a loop
 > with a padded index, `slm[(i / 32) * 33 + i % 32] = v`, crashes the VC
@@ -212,7 +225,7 @@ libggml-sycl device link fails with the same segfault.
 >
 > **Reproducer.** (source below)
 > `icpx -fsycl -fsycl-targets=spir64_gen -Xs "-device bmg_g21" repro.cpp` gives
-> `llvm-foreach: Segmentation fault`. The extracted 1 268-byte SPIR-V crashes
+> `llvm-foreach: Segmentation fault`. The extracted 1 276-byte SPIR-V crashes
 > `ocloc compile -spirv_input` on bmg_g21, bmg_g31, dg2-g10, pvc, mtl-u, lnl-m
 > and ptl-h, and compiles on tgllp. `-DSTRIDE=32` compiles.
 > `-internal_options "-llvm-options=-enable-add3=false"` compiles.
