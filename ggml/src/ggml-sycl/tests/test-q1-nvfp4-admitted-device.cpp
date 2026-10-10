@@ -12,8 +12,11 @@
 #include "unified-cache.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -54,6 +57,41 @@ void require_stages(bool condition, const std::string & message, const ggml_sycl
     if (!condition) {
         fail_stages(message, before);
     }
+}
+
+// The case running now, for report_terminate(). Markers are only appended: std::deque::push_back keeps references to
+// existing elements valid, so a terminate on a SYCL worker thread never reads a marker the main thread is rewriting.
+struct case_marker {
+    std::string                      name;
+    ggml_sycl_q1_nvfp4_test_counters before{};
+};
+
+std::deque<case_marker>          g_case_markers;
+std::atomic<const case_marker *> g_running_case{ nullptr };
+std::terminate_handler           g_previous_terminate = nullptr;
+
+void begin_case(std::string name, const ggml_sycl_q1_nvfp4_test_counters & before) {
+    g_case_markers.push_back({ std::move(name), before });
+    g_running_case.store(&g_case_markers.back(), std::memory_order_release);
+}
+
+// The seventh case, injected_async_terminal_failure_case, terminates instead of failing a check: its injected
+// host-task exception reaches the SYCL default async handler, which calls std::terminate, because the backend's
+// execution queues carry no async_handler (llama.cpp-kjoc). Name the running case and print its stage deltas first,
+// then hand over to the previous handler (ggml's, which prints a backtrace), so the run still aborts red (rc 134).
+[[noreturn]] void report_terminate() {
+    if (const case_marker * marker = g_running_case.load(std::memory_order_acquire)) {
+        ggml_sycl_q1_nvfp4_test_counters now{};
+        ggml_sycl_q1_nvfp4_test_counters_read(&now);
+        std::cerr << "FAIL: terminated during case " << marker->name
+                  << "; stages since case start: " << stage_deltas(marker->before, now) << std::endl;
+    } else {
+        std::cerr << "FAIL: terminated outside a case" << std::endl;
+    }
+    if (g_previous_terminate) {
+        g_previous_terminate();
+    }
+    std::abort();
 }
 
 // The environment cannot exercise what this test covers; main() reports it as ctest's skip (77), never as a pass, on a
@@ -333,6 +371,7 @@ void successful_reuse_case(lifecycle_fixture & life, ggml_type type, int ne11) {
     std::vector<float> oracle; size_t count = 0; auto c = make_graph(life.backend, type, ne11, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, first{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
     const std::string where = std::string(" (type=") + ggml_type_name(type) + " ne11=" + std::to_string(ne11);
+    begin_case("successful_reuse_case" + where + ")", before);
     for (int pass = 0; pass < 2; ++pass) {
         const std::string at = where + " pass=" + std::to_string(pass) + ")";
         require_stages(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
@@ -394,6 +433,9 @@ void injected_failure_case(ggml_sycl_q1_nvfp4_test_failure failure, bool expect_
     lifecycle_fixture life; std::vector<float> oracle; size_t count = 0;
     auto c = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    begin_case(failure == GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PRE_MARK ? "injected_failure_case (pre-mark)" :
+                                                                     "injected_failure_case (post-mark)",
+               before);
     ggml_sycl_q1_nvfp4_test_failure_once(failure);
     require_stages(ggml_backend_graph_compute(life.backend, c.graph) != GGML_STATUS_SUCCESS,
                    "injected failure was not reported", before);
@@ -417,6 +459,7 @@ void injected_async_terminal_failure_case() {
     lifecycle_fixture life; std::vector<float> oracle; size_t count = 0;
     auto c = make_graph(life.backend, GGML_TYPE_Q1_0, 1, oracle, count);
     ggml_sycl_q1_nvfp4_test_counters before{}, after{}; ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    begin_case("injected_async_terminal_failure_case", before);
     ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL);
     require_stages(ggml_backend_graph_compute(life.backend, c.graph) == GGML_STATUS_SUCCESS,
                    "async terminal fixture failed before submission", before);
@@ -430,6 +473,7 @@ void injected_async_terminal_failure_case() {
 } // namespace
 
 int main() {
+    g_previous_terminate = std::set_terminate(report_terminate);
     try {
         bool have_gpu = false;
         for (const auto & device : sycl::device::get_devices()) have_gpu |= device.is_gpu();
