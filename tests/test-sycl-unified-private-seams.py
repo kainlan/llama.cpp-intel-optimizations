@@ -59,6 +59,18 @@ guarded = {
         "GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset",
         "GGML_BACKEND_API bool ggml_sycl_test_scratchpad_site_counts",
     ),
+    # The planner's XMX_TILED PP route override: the override itself, its read inside the route predicate, and the
+    # setters. Outside a test build the predicate must be the env-latched one alone.
+    SYCL / "unified-cache.cpp": (
+        "g_test_xmx_tiled_pp_route_override",
+        "int test_set_xmx_tiled_pp_route_override(",
+        "void test_restore_xmx_tiled_pp_route_override(",
+    ),
+    SYCL / "ggml-sycl-test.hpp": (
+        "int  test_set_xmx_tiled_pp_route_override(bool active);",
+        "void test_restore_xmx_tiled_pp_route_override(int previous);",
+        "struct test_xmx_tiled_pp_route_override_guard {",
+    ),
 }
 for path, targets in guarded.items():
     text = path.read_text(encoding="utf-8")
@@ -93,6 +105,9 @@ if len(sys.argv) > 1:
         "ggml_sycl_test_scratchpad_sites_reset",
         "ggml_sycl_test_scratchpad_site_counts",
         "ggml_sycl_scratchpad_site_hook",
+        "test_set_xmx_tiled_pp_route_override",
+        "test_restore_xmx_tiled_pp_route_override",
+        "g_test_xmx_tiled_pp_route_override",
     )
     leaked = [name for name in forbidden_symbols if name in nm]
     if leaked:

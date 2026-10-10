@@ -27443,6 +27443,13 @@ static bool planner_moe_xmx_tiled_pp_proof_enabled() {
     return enabled;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Test-only: the env read in planner_xmx_tiled_pp_route_active() is latched once per process, so a test that must
+// plan under both values of the route sets it here instead. -1 means no override (the env decides), 0 forces the route
+// off, 1 forces it on.
+static std::atomic<int> g_test_xmx_tiled_pp_route_override{ -1 };
+#endif
+
 // llama.cpp-rzy7: mirrors ggml_sycl_xmx_moe_allow_unsafe_pp() in ggml-sycl.cpp
 // (not visible from this TU, so replicated rather than shared). The XMX_TILED
 // grouped-DPAS PP route for MXFP4 gate/up is default ON (measured
@@ -27450,6 +27457,12 @@ static bool planner_moe_xmx_tiled_pp_proof_enabled() {
 // GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP / GGML_SYCL_XMX_MOE_PP names are honored as
 // a compatibility fallback when the new variable is unset.
 static bool planner_xmx_tiled_pp_route_active() {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    const int forced = g_test_xmx_tiled_pp_route_override.load(std::memory_order_acquire);
+    if (forced >= 0) {
+        return forced != 0;
+    }
+#endif
     static const bool active = [] {
         if (const char * tiled_env = std::getenv("GGML_SYCL_XMX_TILED_PP")) {
             return std::atoi(tiled_env) != 0;
@@ -27464,6 +27477,16 @@ static bool planner_xmx_tiled_pp_route_active() {
     }();
     return active;
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+int test_set_xmx_tiled_pp_route_override(bool active) {
+    return g_test_xmx_tiled_pp_route_override.exchange(active ? 1 : 0, std::memory_order_acq_rel);
+}
+
+void test_restore_xmx_tiled_pp_route_override(int previous) {
+    g_test_xmx_tiled_pp_route_override.store(previous, std::memory_order_release);
+}
+#endif
 
 static bool planner_moe_xmx_moe_forced_from_env(const char * env) {
     return env != nullptr && std::atoi(env) != 0;
