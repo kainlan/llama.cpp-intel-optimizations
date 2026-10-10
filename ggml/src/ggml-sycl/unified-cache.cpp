@@ -29848,7 +29848,9 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
 
     const int primary_device = plan.device_id >= 0 ? plan.device_id : (plan.devices.empty() ? -1 : plan.devices.front());
     // llama.cpp-n8da: owners are planner (logical GPU) indices, and the planner budgets hidden GPUs too, so an expert may
-    // sit on a device the registry does not expose. A workspace there could never be bound or admitted.
+    // sit on a device the registry does not expose. A workspace there could never be bound or admitted. The exposed
+    // count is ggml_sycl_info().device_count, the count ggml_backend_sycl_reg() builds its device list from; the
+    // physical count is ggml_sycl_info().total_gpu_count, which the multi-GPU planner budgets and which is wrong here.
     const int exposed_devices = ggml_sycl_info().device_count;
     std::map<int, moe_mmid_workspace_geometry> maxima;
     for (const placement_tensor_info & item : tensor_inventory) {
@@ -30116,7 +30118,8 @@ static void validate_moe_mmid_execution_owners(placement_plan & plan) {
                            });
     };
     // An expert on a device the registry does not expose needs no owner: no admission can name that device
-    // (llama.cpp-n8da), and plan_moe_mmid_workspaces() planned none there.
+    // (llama.cpp-n8da), and plan_moe_mmid_workspaces() planned none there. Same exposed count as there: the registry's
+    // ggml_sycl_info().device_count, not the physical total_gpu_count.
     const int exposed_devices = ggml_sycl_info().device_count;
     for (const placement_entry & entry : plan.entries) {
         if (entry.expert_id < 0) {
