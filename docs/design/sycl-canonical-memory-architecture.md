@@ -1435,6 +1435,7 @@ Every reset/clear/free operation must take an explicit owner tuple and match it:
 | Resource | Minimum reset key | Required behavior |
 |---|---|---|
 | Model load scratch | `LoadTxnId` | Clear/rollback only the attempt; committed model state is immutable |
+| Planned load terms (compute, state) | `(slot, SlotGeneration)`, minted when the load transaction begins, so the load in flight and the model it commits to share one key; only the open `LoadTxnId` (its load-effect lease) may write | The device reads the largest contribution of the owners on it; a re-measure replaces that owner's own value; rollback and slot release remove only that owner's contribution; no whole-table clear |
 | Weight/cache owner | `ModelId` plus `(slot, SlotGeneration)` during slot migration | Remove only that owner; shared/deduplicated entries survive while any owner/lease remains |
 | KV and context arenas | `ContextId` (and `SessionId` for sequence rows) | Never reset every context on the device |
 | Recorded graph | `(ContextId, GraphEpoch)` | Clear only the matching epoch; stale clear/callback is ignored/rejected |
