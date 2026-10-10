@@ -175,10 +175,11 @@ def claim_fill_site_reads_each_once(sycl: str, cache: str, hpp: str) -> bool:
     requested context; nothing else reads them."""
     s = norm(sycl)
     site = body(s, FILL_SIG)
+    others = norm(cache) + norm(hpp)
     if not site:
         return False
     for name in PARAMS:
-        if s.count(f'"{name}"') != 1 or name in cache or name in hpp:
+        if s.count(f'"{name}"') != 1 or name in others:
             return False
         if not ordered(site, COPY_CTX, fill(name)):
             return False
@@ -296,8 +297,8 @@ def claim_room_line_states_the_decision(cache: str) -> bool:
     if at < 0:
         return False
     refused = body(b[at:], "if (room.n_held == 0)")
-    rest = b[at + len(refused):]
-    return (all(s in refused for s in (DECISION, COSTS, COST_ARGS, TAIL, "return;") + ALL_REFUSED_SAYS)
+    rest = b[b.find(refused, at) + len(refused):] if refused else ""
+    return (bool(rest) and all(s in refused for s in (DECISION, COSTS, COST_ARGS, TAIL, "return;") + ALL_REFUSED_SAYS)
             and all(s in rest for s in (DECISION, COSTS, COST_ARGS, TAIL, WARN))
             and "ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO," in rest)
 
@@ -417,16 +418,26 @@ def test_mutant_param_read_before_the_context_fails():
 
 def test_mutant_zero_accepted_fails():
     """A zero bandwidth would divide by zero; a zero fill would refuse every MoE room."""
-    assert not claim_nonsense_keeps_the_default(_once(SYCL, "value <= 0.0) { return def; }",
-                                                      "value < 0.0) { return def; }"))
+    assert not claim_nonsense_keeps_the_default(_param_mutant("value <= 0.0) { return def; }",
+                                                              "value < 0.0) { return def; }"))
+
+
+def _param_mutant(old: str, new: str) -> str:
+    """ggml-sycl.cpp with `old` replaced by `new` inside ggml_sycl_plan_cost_param only (other parsers in the file
+    share its idioms)."""
+    n = norm(SYCL)
+    b = body(n, PARAM_SIG)
+    assert b.count(old) == 1, f"mutant anchor must match exactly once in the parser: {old!r} x{b.count(old)}"
+    return n.replace(b, b.replace(old, new, 1), 1)
 
 
 def test_mutant_garbage_accepted_fails():
-    assert not claim_nonsense_keeps_the_default(_once(SYCL, "end == env || ", ""))
+    """An unparsable value read as 0 by strtod and then kept as 0: the reject must test that strtod parsed anything."""
+    assert not claim_nonsense_keeps_the_default(_param_mutant("end == env || ", ""))
 
 
 def test_mutant_no_bound_fails():
-    assert not claim_nonsense_keeps_the_default(_once(SYCL, PARSE_CLAMP, "return value;"))
+    assert not claim_nonsense_keeps_the_default(_param_mutant(PARSE_CLAMP, "return value;"))
 
 
 def test_mutant_host_read_undivided_fails():
