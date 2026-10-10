@@ -14,7 +14,8 @@ The fix this gate pins:
     charges each layer's KV itself and the KV phase does nothing: no per-layer charge and no room, so pinned mode
     keeps the behaviour it had before the room;
   - the room is capped at what is left and counted in the plan's device bytes, and the runtime transaction's KV
-    re-derivation drops it;
+    re-derivation drops it; which layers' rooms are held at all is a cost decision (llama.cpp-w013), pinned by
+    test-sycl-kv-room-cost-source;
   - the expert pack runs a second first-fit budget with the room added back, and the room's cost is NET: the device
     bytes of routed experts that budget places minus the ones the real pack places (a larger first-fit budget can
     take a larger triplet and then skip smaller ones the real pack did place, so counting only the triplets that fit
@@ -131,7 +132,7 @@ INVENTORY_STRUCT = "struct ggml_sycl_tensor_inventory {"
 
 DENSE_LOOP = "for (const auto & [layer_id, indices] : dense_layer_indices) {"
 LAYER_KV_CALL = "plan_single_device_layer_kv(plan, kv_info, layer_has_attention, device_id, remaining);"
-ROOM_CALL = "room = hold_kv_context_room(plan, kv_info, device_id, remaining);"
+ROOM_CALL = "room = hold_kv_context_room(plan, kv_info, device_id, n_experts, remaining);"
 EXPERT_PASS = "auto moe_groups = build_moe_triplet_groups(plan, moe_indices, &hotness_source);"
 WEIGHTS_ONLY = "on_device = weight_charge <= remaining; target = on_device ? device_id : -1; kv_on_device = false;"
 
@@ -175,11 +176,11 @@ def claim_layer_kv_follows_the_dense_layer(cache: str) -> bool:
 
 
 def claim_room_is_the_context_extra_capped_and_counted(cache: str) -> bool:
-    """The room sums the context's extra KV over the layers whose KV is on the device, takes no more than is left,
-    and counts in the plan's device bytes."""
+    """The room sums the context's extra KV over the layers whose KV is on the device (those whose room passes the
+    cost test, llama.cpp-w013), takes no more than is left, and counts in the plan's device bytes."""
     b = body(norm(cache), ROOM_SIG)
     return (bool(b) and ordered(
-        b, "if (layer_id < 0 || owner != device_id) { continue; }",
+        b, "if (layer_id >= 0 && owner == device_id) { layers.push_back(layer_id); }",
         "kv_info.kv_context_extra_bytes_for_layer(static_cast<uint32_t>(layer_id));",
         "room.held = std::min(room.wanted, remaining);", "remaining -= room.held;",
         "plan.kv_context_reserve_bytes = room.held;", "plan.vram_bytes += room.held;"))
@@ -214,18 +215,18 @@ def claim_room_displacement_is_counted_and_logged(cache: str) -> bool:
 NO_ROOM = ('if (kv_info.n_ctx_context == 0) { GGML_LOG_INFO("[PLACEMENT] no KV context room on device %d: no '
            'requested n_ctx reached the load \" \"(planner n_ctx=%u); KV beyond it is placed at context '
            'creation\\n\", device_id, kv_info.n_ctx); return; }')
-ROOM_EMPTY = "if (room.wanted == 0) { return; }"
+ROOM_EMPTY = "if (room.n_layers == 0) { return; }"
 
 
 def claim_room_line_is_visible_and_names_its_source(cache: str) -> bool:
     """With no requested context the line says no room is held (INFO, one per device); otherwise it is in MB, says
-    the context is the requested one, and is a WARN whenever the room cost experts or could not hold all it wanted, so
-    a default run shows it."""
+    the context is the requested one, and is a WARN whenever the room cost experts or could not hold all it wanted (or
+    refused a layer by cost, llama.cpp-w013), so a default run shows it."""
     b = body(norm(cache), ROOM_LOG_SIG)
     return (bool(b) and ordered(b, NO_ROOM, ROOM_EMPTY)
-            and "const bool warn = room.displaced_bytes() > 0 || room.held < room.wanted;" in b
+            and "const bool warn = room.displaced_bytes() > 0 || room.held < room.wanted || room.n_refused > 0;" in b
             and "ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO," in b
-            and "held %.1f MB of %.1f MB for n_ctx_context=%u over \" \"planner n_ctx=%u" in b
+            and "held %.1f MB of %.1f MB for n_ctx_context=%u over planner n_ctx=%u" in b
             and "it cost %.1f MB of \" \"device-resident routed experts" in b
             and "with the room added back. n_ctx_context is the requested n_ctx.\\n\"," in b
             and "n_ctx_train" not in b)
@@ -516,7 +517,7 @@ def test_mutant_room_logged_before_the_pack_fails():
 
 def test_mutant_room_line_only_info_fails():
     assert not claim_room_line_is_visible_and_names_its_source(
-        _once(CACHE, "const bool warn = room.displaced_bytes() > 0 || room.held < room.wanted;",
+        _once(CACHE, "const bool warn = room.displaced_bytes() > 0 || room.held < room.wanted || room.n_refused > 0;",
               "const bool warn = false;"))
 
 
@@ -527,7 +528,8 @@ def test_mutant_no_room_line_missing_fails():
 
 def test_mutant_room_line_keeps_the_old_limit_fails():
     assert not claim_room_line_is_visible_and_names_its_source(
-        _once(CACHE, "n_ctx_context is the requested n_ctx.", "The room is for n_ctx_train: the load does not see -c."))
+        _once(CACHE, "with the room added back. n_ctx_context is the requested n_ctx.",
+              "with the room added back. The room is for n_ctx_train: the load does not see -c."))
 
 
 def test_mutant_extra_at_the_planning_context_fails():

@@ -30936,19 +30936,38 @@ static void plan_single_device_layer_kv(placement_plan &            plan,
 }
 
 // The KV phase's room for the context the model opens with (kv_info.n_ctx_context, llama.cpp-8ecj): what that
-// context's KV adds over the KV charged at the planning n_ctx, for every layer whose KV is on `device_id`, held out of
-// `remaining` before the routed experts are packed, and capped at what the dense weights and their KV left. A context
-// whose KV does not fit beside the dense weights still opens: the runtime context transaction re-places the overflow to
-// the host tier.
+// context's KV adds over the KV charged at the planning n_ctx, for every layer whose KV is on `device_id` and whose
+// room is worth its cost, held out of `remaining` before the routed experts are packed, and capped at what the dense
+// weights and their KV left. A context whose KV does not fit beside the dense weights still opens: the runtime context
+// transaction re-places the overflow to the host tier.
 //
 // The context is the one the caller asked for (llama_model_params::n_ctx_hint, llama.cpp-ak0p). With no request no room
 // is held, and the KV beyond the planning n_ctx is placed when the context is created. A context created smaller than
 // the request leaves the rest of the room unused, and the experts it displaced stay on the host tier, because experts
 // are placed once, at load, and nothing promotes them when the context turns out smaller.
+//
+// The room is weighed layer by layer (llama.cpp-w013, owner ruling 2026-10-10). A layer whose room is refused keeps its
+// KV at the planning n_ctx on the device, and its room's bytes go to the routed experts; when the context opens, the
+// runtime demotes whole layers to the host tier until the KV fits. So the trade is the layer's attention on the host
+// against the experts its room would push to the host, and it is judged per decode token by weigh_kv_context_room().
+struct kv_context_room_cost {
+    int    layer_id     = -1;
+    bool   held         = false;
+    double host_attn_us = 0.0;  // A: what running the layer's attention on the host costs a decode token
+    double expert_us    = 0.0;  // B: what the routed experts the layer's room displaces cost a decode token
+};
+
 struct kv_context_room {
-    size_t wanted   = 0;  // the extra KV of every layer whose KV is on the device
-    size_t held     = 0;  // min(wanted, what was left)
-    size_t n_layers = 0;  // layers with extra KV
+    size_t wanted    = 0;  // the extra KV of every device layer whose room passed the cost test
+    size_t held      = 0;  // min(wanted, what was left)
+    size_t n_layers  = 0;  // device layers with extra KV
+    size_t n_held    = 0;  // of those, the ones whose room passed the cost test
+    size_t n_refused = 0;  // and the ones whose room was refused by cost
+    size_t refused   = 0;  // the extra KV of the refused layers
+
+    // The layer the line reports A and B for: the first refused one in the runtime's demotion order, or the first
+    // held one when none was refused.
+    kv_context_room_cost decision;
 
     // The stored bytes and count of the routed-expert triplets the pack put on the device, and of the ones the same
     // first-fit pack puts there with the room added back. The room's cost is the difference. Counting instead the
@@ -30964,21 +30983,74 @@ struct kv_context_room {
     }
 };
 
+// One layer's room, weighed per decode token (llama.cpp-w013):
+//   A = the host reads the layer's KV at the expected fill, F = n_ctx_context x ctx_fill_pct / 100 cells (a SWA layer
+//       reads at most its window), at host_attn_gbps;
+//   B = the room displaces as many bytes of routed experts, and a token reads each with probability
+//       n_expert_used / n_expert, at cpu_expert_gbps. Uniform: first-fit displaces the least popular triplets, so this
+//       is an upper bound on their hit rate.
+// Held iff A > B. The device bandwidth is in neither: holding the room and refusing it both lose one device read per
+// token, so it cancels to first order. A dense model displaces no expert, so its room is held as before, whatever the
+// fill. GB/s is 1e3 bytes per microsecond.
+static kv_context_room_cost weigh_kv_context_room(const placement_kv_info & kv_info,
+                                                  int                       layer_id,
+                                                  size_t                    extra,
+                                                  int                       n_experts) {
+    kv_context_room_cost cost;
+    cost.layer_id            = layer_id;
+    const uint32_t filled    = static_cast<uint32_t>(static_cast<double>(kv_info.n_ctx_context) *
+                                                     std::clamp(kv_info.ctx_fill_pct, 0.0, 100.0) / 100.0);
+    const size_t   host_read = kv_info.kv_bytes_for_layer_at(static_cast<uint32_t>(layer_id), filled);
+    const bool     moe       = n_experts > 0 && kv_info.n_expert_used > 0;
+    const double   p_hit     = moe ? std::min(1.0, static_cast<double>(kv_info.n_expert_used) / n_experts) : 0.0;
+    cost.host_attn_us        = static_cast<double>(host_read) / (kv_info.host_attn_gbps * 1e3);
+    cost.expert_us           = static_cast<double>(extra) * p_hit / (kv_info.cpu_expert_gbps * 1e3);
+    cost.held                = !moe || cost.host_attn_us > cost.expert_us;
+    return cost;
+}
+
 static kv_context_room hold_kv_context_room(placement_plan &          plan,
                                             const placement_kv_info & kv_info,
                                             int                       device_id,
+                                            int                       n_experts,
                                             size_t &                  remaining) {
     kv_context_room room;
+    if (kv_info.n_ctx_context == 0) {
+        return room;
+    }
+    // The device layers in the order the runtime demotes KV when a context does not fit (plan_runtime_kv_demotion,
+    // kv-runtime-demotion.cpp): full attention latest first, then SWA latest first. Under the uniform cost every FULL
+    // layer decides alike, so the refused rooms are the layers that demotion moves first.
+    std::vector<int> layers;
     for (const auto & [layer_id, owner] : plan.kv_device) {
-        if (layer_id < 0 || owner != device_id) {
-            continue;
+        if (layer_id >= 0 && owner == device_id) {
+            layers.push_back(layer_id);
         }
-        const size_t extra = kv_info.kv_context_extra_bytes_for_layer(static_cast<uint32_t>(layer_id));
-        if (extra == 0) {
-            continue;
+    }
+    std::sort(layers.begin(), layers.end());
+    for (const bool swa_pass : { false, true }) {
+        for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
+            const int layer_id = *it;
+            if (kv_info.is_swa_layer(layer_id) != swa_pass) {
+                continue;
+            }
+            const size_t extra = kv_info.kv_context_extra_bytes_for_layer(static_cast<uint32_t>(layer_id));
+            if (extra == 0) {
+                continue;
+            }
+            const kv_context_room_cost cost = weigh_kv_context_room(kv_info, layer_id, extra, n_experts);
+            room.n_layers++;
+            if (cost.held) {
+                room.wanted += std::min(extra, SIZE_MAX - room.wanted);
+                room.n_held++;
+            } else {
+                room.refused += std::min(extra, SIZE_MAX - room.refused);
+                room.n_refused++;
+            }
+            if (room.decision.layer_id < 0 || (room.decision.held && !cost.held)) {
+                room.decision = cost;
+            }
         }
-        room.wanted += std::min(extra, SIZE_MAX - room.wanted);
-        room.n_layers++;
     }
     room.held = std::min(room.wanted, remaining);
     remaining -= room.held;
@@ -30987,10 +31059,11 @@ static kv_context_room hold_kv_context_room(placement_plan &          plan,
     return room;
 }
 
-// The room's line, after the experts are packed, so it can say what the room cost: the device bytes of routed
-// experts the pack placed against those the same pack places with the room added back. A WARN when it cost experts or
-// could not hold all it wanted, so a default run shows it. With no requested context, one INFO line says no room is
-// held.
+// The room's line, after the experts are packed, so it can say what the room cost: the layers held and refused by
+// cost, the deciding layer's A and B with the parameters that produced them, and the device bytes of routed experts the
+// pack placed against those the same pack places with the room added back. A WARN when it cost experts, could not
+// hold all it wanted or refused a layer, so a default run shows it; a fully refused room is one WARN. With no requested
+// context, one INFO line says no room is held.
 static void log_kv_context_room(const kv_context_room & room, const placement_kv_info & kv_info, int device_id) {
     if (kv_info.n_ctx_context == 0) {
         GGML_LOG_INFO(
@@ -30999,21 +31072,38 @@ static void log_kv_context_room(const kv_context_room & room, const placement_kv
             device_id, kv_info.n_ctx);
         return;
     }
-    if (room.wanted == 0) {
+    if (room.n_layers == 0) {
         return;
     }
-    const double mb         = 1024.0 * 1024.0;  // MB as the sibling [PLACEMENT] lines print it
-    const bool   warn       = room.displaced_bytes() > 0 || room.held < room.wanted;
+    const double mb = 1024.0 * 1024.0;  // MB as the sibling [PLACEMENT] lines print it
+    if (room.n_held == 0) {
+        GGML_LOG_WARN(
+            "[PLACEMENT] KV context room on device %d: held %zu of %zu layer(s), refused %zu layer(s) by cost: "
+            "every layer's room was refused by cost, so none of the %.1f MB for n_ctx_context=%u over planner "
+            "n_ctx=%u is held, the routed experts keep it, and the runtime re-places the overflow at context "
+            "creation; deciding layer %d: host attention %.1f us/token vs displaced experts %.1f us/token (fill "
+            "%.4g%%, host-attn %.4g GB/s, cpu-expert %.4g GB/s). n_ctx_context is the requested n_ctx.\n",
+            device_id, room.n_held, room.n_layers, room.n_refused, room.refused / mb, kv_info.n_ctx_context,
+            kv_info.n_ctx, room.decision.layer_id, room.decision.host_attn_us, room.decision.expert_us,
+            kv_info.ctx_fill_pct, kv_info.host_attn_gbps, kv_info.cpu_expert_gbps);
+        return;
+    }
+    const bool   warn       = room.displaced_bytes() > 0 || room.held < room.wanted || room.n_refused > 0;
     const char * short_note = room.held < room.wanted ? ", all that was left; the context's overflow is re-placed" : "";
     // ggml_log_internal, not the GGML_LOG_* macros, so the level is chosen at run time and the arguments are written
     // once.
     ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
-                      "[PLACEMENT] KV context room on device %d: held %.1f MB of %.1f MB for n_ctx_context=%u over "
-                      "planner n_ctx=%u (%zu layer(s)), before the routed experts%s; it cost %.1f MB of "
+                      "[PLACEMENT] KV context room on device %d: held %zu of %zu layer(s), refused %zu layer(s) by "
+                      "cost (%.1f MB); held %.1f MB of %.1f MB for n_ctx_context=%u over planner n_ctx=%u, before the "
+                      "routed experts%s; deciding layer %d %s: host attention %.1f us/token vs displaced experts "
+                      "%.1f us/token (fill %.4g%%, host-attn %.4g GB/s, cpu-expert %.4g GB/s); it cost %.1f MB of "
                       "device-resident routed experts: %.1f MB (%zu triplet(s)) on the device, against %.1f MB (%zu) "
                       "with the room added back. n_ctx_context is the requested n_ctx.\n",
-                      device_id, room.held / mb, room.wanted / mb, kv_info.n_ctx_context, kv_info.n_ctx, room.n_layers,
-                      short_note, room.displaced_bytes() / mb, room.expert_bytes / mb, room.expert_groups,
+                      device_id, room.n_held, room.n_layers, room.n_refused, room.refused / mb, room.held / mb,
+                      room.wanted / mb, kv_info.n_ctx_context, kv_info.n_ctx, short_note, room.decision.layer_id,
+                      room.decision.held ? "held" : "refused", room.decision.host_attn_us, room.decision.expert_us,
+                      kv_info.ctx_fill_pct, kv_info.host_attn_gbps, kv_info.cpu_expert_gbps,
+                      room.displaced_bytes() / mb, room.expert_bytes / mb, room.expert_groups,
                       room.expert_bytes_without / mb, room.expert_groups_without);
 }
 
@@ -31385,7 +31475,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     kv_context_room room;
     if (!planner_kv_pin_device_enabled()) {
         plan_single_device_layer_kv(plan, kv_info, layer_has_attention, device_id, remaining);
-        room = hold_kv_context_room(plan, kv_info, device_id, remaining);
+        room = hold_kv_context_room(plan, kv_info, device_id, n_experts, remaining);
     }
 
     // MoE expert entries: budget-aware placement at (layer, expert) triplet
