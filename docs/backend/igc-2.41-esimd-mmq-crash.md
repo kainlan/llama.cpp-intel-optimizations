@@ -25,8 +25,8 @@ ships.
   `local_accessor` example writes `LocalAcc[LID * VL + I] = ...` and calls
   `Item.barrier()` inside an ESIMD kernel. V3 does the same through
   `get_multi_ptr<>().get()`, indexing the raw pointer instead of subscripting
-  the accessor, and calls `item.barrier()`. V3 does not mix `local_accessor` with `slm_init` or `slm_allocator`, the one
-  documented restriction.
+  the accessor, and calls `item.barrier()`. V3 does not mix `local_accessor`
+  with `slm_init` or `slm_allocator`, the one documented restriction.
 - **Our API use?** No. The crash reproduces through `local_accessor::operator[]`,
   the most canonical form, as well as through `get_multi_ptr<>().get()`.
 - **The compiler?** Yes. IGC's Vector Compiler (the ESIMD backend) crashes in
