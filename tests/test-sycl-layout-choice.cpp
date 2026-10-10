@@ -1231,12 +1231,14 @@ static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_act
     const char * route_name = xmx_tiled_pp_route_active ? "on" : "off";
 
     ggml_sycl::test_xmx_tiled_pp_route_override_guard route_guard(xmx_tiled_pp_route_active);
+
     // The MMID direct route is closed in an ordinary build, so these plans are made as production makes them. This
     // binary is a route-testing build, where the route compiles in; run_single_device_moe_mmid_pool_charge_test()
     // plans the open state.
     ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
 
     const std::vector<ggml_sycl::placement_tensor_info> inventory = moe_pp_inventory();
+
     const std::vector<ggml_sycl::device_budget> devices = {
         { 0, 1024u * mib, 1024u * mib, 4.0, true },
     };
@@ -1329,7 +1331,8 @@ static bool run_single_device_moe_pp_plan_route_test(bool xmx_tiled_pp_route_act
             printf(
                 "FAIL: route %s, %s plan: closed MMID route still planned a workspace pool, device=%zu host=%zu "
                 "workspaces=%zu\n",
-                route_name, arm, p.moe_mmid_device_pool_bytes, p.moe_mmid_host_pool_bytes, p.moe_mmid_workspaces.size());
+                route_name, arm, p.moe_mmid_device_pool_bytes, p.moe_mmid_host_pool_bytes,
+                p.moe_mmid_workspaces.size());
             return false;
         }
         if (p.moe_pp_soa_promoted != !xmx_tiled_pp_route_active) {
@@ -1560,9 +1563,9 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
     }
 
     const std::vector<ggml_sycl::placement_tensor_info> inventory = moe_pp_inventory();
-    ggml_sycl::placement_kv_info                         kv_info{};
-    kv_info.n_ubatch      = 512;
-    kv_info.n_expert_used = 4;
+    ggml_sycl::placement_kv_info                        kv_info{};
+    kv_info.n_ubatch            = 512;
+    kv_info.n_expert_used       = 4;
     constexpr int n_expert_used = 4;
 
     auto plan_on = [&](size_t budget) {
@@ -1577,8 +1580,8 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
     };
     // The runtime re-plan of a plan whose KV did not change. It must accept, and leave the plan's charge and pool alone.
     auto expect_stable_replan = [&](const ggml_sycl::placement_plan & p, const char * arm) {
-        ggml_sycl::placement_plan       replanned = p;
-        ggml_sycl::moe_mmid_runtime_reason reason = ggml_sycl::moe_mmid_runtime_reason::OK;
+        ggml_sycl::placement_plan          replanned = p;
+        ggml_sycl::moe_mmid_runtime_reason reason    = ggml_sycl::moe_mmid_runtime_reason::OK;
         const bool ok = ggml_sycl::replan_moe_mmid_workspaces_for_runtime(replanned, inventory, n_expert_used, &reason);
         if (!ok || reason != ggml_sycl::moe_mmid_runtime_reason::OK || replanned.vram_bytes != p.vram_bytes ||
             replanned.moe_mmid_device_pool_bytes != p.moe_mmid_device_pool_bytes ||
@@ -1601,25 +1604,37 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
     size_t roomy_charge = 0;
     {
         ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
+
         const auto plan = plan_on(1024u * mib);
         roomy_charge    = planned_weight_charge_for_device(plan, 0);
+        bool arm_ok     = true;
         if (!plan.moe_mmid_workspace_valid || plan.moe_mmid_device_pool_bytes == 0 ||
             plan.moe_mmid_workspaces.empty() || plan.vram_bytes != vram_composed(plan)) {
             printf(
                 "FAIL: open MMID route, roomy plan: expected a charged workspace pool, valid=%d pool=%zu "
                 "workspaces=%zu vram=%zu want weight=%zu+kv=%zu+room=%zu+mmid=%zu\n",
-                plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes,
-                plan.moe_mmid_workspaces.size(), plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes,
-                plan.kv_context_reserve_bytes, plan.moe_mmid_device_pool_bytes);
-            ok = false;
+                plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes, plan.moe_mmid_workspaces.size(),
+                plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes, plan.kv_context_reserve_bytes,
+                plan.moe_mmid_device_pool_bytes);
+            arm_ok = false;
         }
-        ok = expect_stable_replan(plan, "open MMID route, roomy plan") && ok;
+        arm_ok = expect_stable_replan(plan, "open MMID route, roomy plan") && arm_ok;
+        if (arm_ok) {
+            printf(
+                "PASS: open MMID route, roomy plan (positive control): pool=%zu charged, vram=%zu = weight %zu + kv "
+                "%zu + room %zu + pool, and the runtime re-plan keeps it\n",
+                plan.moe_mmid_device_pool_bytes, plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes,
+                plan.kv_context_reserve_bytes);
+        }
+        ok = arm_ok && ok;
     }
 
     // Route closed (an ordinary build): nothing is planned, so nothing is charged, and the plan stays valid.
     {
         ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
-        const auto plan = plan_on(1024u * mib);
+
+        const auto plan   = plan_on(1024u * mib);
+        bool       arm_ok = true;
         if (!plan.moe_mmid_workspace_valid || plan.moe_mmid_device_pool_bytes != 0 ||
             plan.moe_mmid_host_pool_bytes != 0 || !plan.moe_mmid_workspaces.empty() ||
             plan.vram_bytes != vram_composed(plan)) {
@@ -1629,9 +1644,16 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
                 plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes, plan.moe_mmid_host_pool_bytes,
                 plan.moe_mmid_workspaces.size(), plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes,
                 plan.kv_context_reserve_bytes);
-            ok = false;
+            arm_ok = false;
         }
-        ok = expect_stable_replan(plan, "closed MMID route, roomy plan") && ok;
+        arm_ok = expect_stable_replan(plan, "closed MMID route, roomy plan") && arm_ok;
+        if (arm_ok) {
+            printf(
+                "PASS: closed MMID route, roomy plan: valid with no pool, vram=%zu = weight %zu + kv %zu + room %zu, "
+                "and the runtime re-plan keeps it\n",
+                plan.vram_bytes, plan.weight_vram_bytes, plan.kv_vram_bytes, plan.kv_context_reserve_bytes);
+        }
+        ok = arm_ok && ok;
     }
 
     if (roomy_charge <= mib) {
@@ -1644,6 +1666,7 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
     const size_t tight_budget = roomy_charge - mib;
     {
         ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/true);
+
         const auto   plan         = plan_on(tight_budget);
         const size_t tight_charge = planned_weight_charge_for_device(plan, 0);
         // Precondition of the case: the pool was rejected with experts still on device. Without it the re-plan below
@@ -1659,20 +1682,36 @@ static bool run_single_device_moe_mmid_pool_charge_test() {
         } else {
             // The rejected pool stays rejected: the re-plan must not ask the growth admission for it, so it must not
             // return GROWTH_BUDGET_EXCEEDED.
-            ok = expect_stable_replan(plan, "open MMID route, tight plan with a rejected pool") && ok;
+            if (expect_stable_replan(plan, "open MMID route, tight plan with a rejected pool")) {
+                printf(
+                    "PASS: open MMID route, tight plan: pool rejected with %zu of %zu layout bytes on device, and the "
+                    "runtime re-plan accepts the plan without asking the growth admission\n",
+                    tight_charge, roomy_charge);
+            } else {
+                ok = false;
+            }
         }
     }
     {
         ggml_sycl::test_moe_mmid_route_reachable_override_guard mmid_guard(/*reachable=*/false);
-        const auto plan = plan_on(tight_budget);
+
+        const auto plan   = plan_on(tight_budget);
+        bool       arm_ok = true;
         if (!plan.moe_mmid_workspace_valid || plan.moe_mmid_device_pool_bytes != 0 ||
             !plan.moe_mmid_workspaces.empty() || plan.vram_bytes != vram_composed(plan)) {
-            printf("FAIL: closed MMID route, tight plan: expected no workspace pool, valid=%d pool=%zu workspaces=%zu\n",
-                   plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes,
-                   plan.moe_mmid_workspaces.size());
-            ok = false;
+            printf(
+                "FAIL: closed MMID route, tight plan: expected no workspace pool, valid=%d pool=%zu workspaces=%zu\n",
+                plan.moe_mmid_workspace_valid ? 1 : 0, plan.moe_mmid_device_pool_bytes,
+                plan.moe_mmid_workspaces.size());
+            arm_ok = false;
         }
-        ok = expect_stable_replan(plan, "closed MMID route, tight plan") && ok;
+        arm_ok = expect_stable_replan(plan, "closed MMID route, tight plan") && arm_ok;
+        if (arm_ok) {
+            printf(
+                "PASS: closed MMID route, tight plan: valid with no pool (not rejected), and the runtime re-plan keeps "
+                "it\n");
+        }
+        ok = arm_ok && ok;
     }
 
     if (ok) {

@@ -2330,6 +2330,11 @@ runtime `n_ubatch` through `pp_moe_onednn_admit_ring()`
   in an ordinary build no pool bytes are charged. A pool the load plan rejected
   for budget stays rejected: the runtime re-plan neither re-plans its demand nor
   asks the growth admission for it, so it cannot demote KV or refuse a context.
+  A closed route is not a rejection. Its plan is valid and empty
+  (`moe_mmid_workspace_valid` stays true, and no owner check runs), because a
+  closed route is a fact about the build. A rejection is an outcome of one load
+  plan for a route that could run: materialization refuses it, and the runtime
+  keeps it rejected.
 - The KV-zone part may use only `headroom - reserve`. `headroom` is the device's
   KV capacity less the plan's device KV (with the allocator's per-layer slack).
   The capacity is `ggml_sycl_kv_capacity_live()`, the one number the KV re-fit
