@@ -126,7 +126,7 @@ def violations(source: str) -> list[str]:
         "copy invalidates": "ggml_sycl_invalidate_backend_weight_mutation(dst_ctx, dst)" in copier,
         "clear invalidates": "ggml_sycl_invalidate_backend_buffer_weights(ctx)" in clearer,
         "complete upload readiness": "is_moe_expert && offset == 0 && size == ggml_nbytes(tensor)" in setter,
-        "withdraw before publish": setter.find("ggml_sycl_invalidate_backend_weight_mutation") < setter.find("ggml_sycl_publish_backend_aos_expert_handles"),
+        "withdraw before publish": before(setter, "ggml_sycl_invalidate_backend_weight_mutation", "ggml_sycl_publish_backend_aos_expert_handles", missing_anchors),
         "resolver checks plan before registered handles": before(route, "plan_owner->find_expert_entry(", "ggml_sycl_try_moe_storage_handle_route", missing_anchors),
         "active plan rejects unnamed tensors": "if (!src0->name || src0->name[0] == '\\0')" in route and "route.plan_missing = true" in route,
         "resolver checks registered handles before requiring key": before(route, "ggml_sycl_try_moe_storage_handle_route", "if (!base_key.valid)", missing_anchors),
@@ -146,7 +146,7 @@ def violations(source: str) -> list[str]:
     }
     failures.extend(name for name, ok in requirements.items() if not ok)
     # A renamed anchor must read differently from a genuine reorder.
-    failures.extend(f"missing anchor: {anchor}" for anchor in missing_anchors)
+    failures.extend(f"missing anchor: {anchor}" for anchor in dict.fromkeys(missing_anchors))
 
     forbidden = ("from_chunk_ptr", "from_direct", "query_registered_location", "unified_lookup", "register_ready")
     for token in forbidden:
@@ -182,39 +182,53 @@ def test_admission_pin_and_ordering_claims_reject_mutants() -> None:
         assert old in text, f"anchor missing: {old}"
         return text.replace(old, new, 1)
 
+    setter = function(source, "static void ggml_backend_sycl_buffer_set_tensor")
+    withdraw = "ggml_sycl_invalidate_backend_weight_mutation"
+    publish = "ggml_sycl_publish_backend_aos_expert_handles"
+
+    def in_route(mutated_route: str) -> str:
+        return source.replace(route, mutated_route, 1)
+
+    # claim -> [(label, mutant source, the one anchor the mutant removes, or None)]
     mutants = {
         "Q1/NVFP4 executor gate remains disabled": [
-            # gate flipped on
-            respell(source, "k_moe_mmid_direct_route_validated = false", "k_moe_mmid_direct_route_validated = true"),
-            # admission site re-spelled as a literal
-            respell(source, "q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated",
-                    "q1_nvfp4_direct_b70_validated = false"),
+            ("gate flipped on",
+             respell(source, "k_moe_mmid_direct_route_validated = false", "k_moe_mmid_direct_route_validated = true"),
+             None),
+            ("admission site re-spelled as a literal",
+             respell(source, "q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated",
+                     "q1_nvfp4_direct_b70_validated = false"),
+             None),
         ],
         "resolver checks plan before registered handles": [
-            source.replace(route, swap(route, plan, handle), 1),
-            source.replace(route, route.replace(plan, "plan_owner->renamed_lookup(", 1), 1),
+            ("plan and handle anchors swapped", in_route(swap(route, plan, handle)), None),
+            ("plan anchor renamed", in_route(route.replace(plan, "plan_owner->renamed_lookup(", 1)), plan),
         ],
         "resolver checks registered handles before requiring key": [
-            source.replace(route, swap(route, handle, key), 1),
-            source.replace(route, route.replace(key, "if (!base_key.ok)", 1), 1),
+            ("handle and key anchors swapped", in_route(swap(route, handle, key)), None),
+            ("key anchor renamed", in_route(route.replace(key, "if (!base_key.ok)", 1)), key),
         ],
         "resolver requires key only for cache fallback": [
-            source.replace(route, swap(route, key, fallback), 1),
-            source.replace(route, route.replace(fallback, "expert_resolve_result resolved = cache->resolve(req);", 1), 1),
+            ("key and fallback anchors swapped", in_route(swap(route, key, fallback)), None),
+            ("fallback anchor renamed",
+             in_route(route.replace(fallback, "expert_resolve_result resolved = cache->resolve(req);", 1)), fallback),
+        ],
+        "withdraw before publish": [
+            ("withdraw and publish anchors swapped",
+             source.replace(setter, swap(setter, withdraw, publish), 1), None),
+            ("withdraw anchor renamed",
+             source.replace(setter, setter.replace(withdraw, "ggml_sycl_renamed_withdraw"), 1), withdraw),
         ],
     }
     for claim, variants in mutants.items():
-        for i, mutant in enumerate(variants):
-            assert mutant != source, f"{claim}[{i}]: mutation did not change the source"
+        for label, mutant, removed_anchor in variants:
+            where = f"{claim} / {label}"
+            assert mutant != source, f"{where}: mutation did not change the source"
             failures = violations(mutant)
-            assert claim in failures, f"{claim}[{i}]: mutant not rejected by that claim: {failures}"
-            # Odd variants rename an anchor (ordering) or are pin mutants; only a
-            # rename must additionally name the absent anchor.
-            has_missing = any(f.startswith("missing anchor: ") for f in failures)
-            if claim.startswith("resolver") and i == 1:
-                assert has_missing, f"{claim}[{i}]: absent anchor not named: {failures}"
-            else:
-                assert not has_missing, f"{claim}[{i}]: spurious missing-anchor report: {failures}"
+            assert claim in failures, f"{where}: mutant not rejected by that claim: {failures}"
+            reported = [f for f in failures if f.startswith("missing anchor: ")]
+            expected = [] if removed_anchor is None else [f"missing anchor: {removed_anchor}"]
+            assert reported == expected, f"{where}: missing-anchor report {reported} != {expected}"
 
 
 def test_moe_metadata_registry_is_value_only_and_consumers_retain_sources() -> None:
