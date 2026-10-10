@@ -355,8 +355,12 @@ def test_host_reorder_establishes_source_dependencies_before_cpu_read() -> None:
 def test_private_production_route_has_graph_churn_regression() -> None:
     test_source = (ROOT / "ggml/src/ggml-sycl/tests/test-q1-nvfp4-admitted-device.cpp").read_text()
     churn = function(test_source, "void graph_churn_regression")
-    assert churn.count("successful_reuse_case(life, type, ne11)") == 2
-    assert "ggml_free(churn)" in churn
+    # Graph A runs before the allocator churn and graph B after it; each is tagged so their labels differ.
+    assert churn.count("successful_reuse_case(") == 2
+    graph_a = churn.find('successful_reuse_case(life, type, ne11, "A")')
+    freed = churn.find("ggml_free(churn)")
+    graph_b = churn.find('successful_reuse_case(life, type, ne11, "B")')
+    assert 0 <= graph_a < freed < graph_b
     main = function(test_source, "int main()")
     for type_name in ("GGML_TYPE_Q1_0", "GGML_TYPE_NVFP4"):
         for ne11 in (1, 3):
