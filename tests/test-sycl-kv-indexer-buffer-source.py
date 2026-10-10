@@ -3,25 +3,25 @@ buffer by buffer.
 
 Host-only: reads sources, builds nothing, loads no model and touches no device.
 
-The defect (B70, Qwen3.8 IQ3_XXS, -c 10240, -ub 256): the attention K/V landed on the device, then the indexer key
-cache of llama_memory_hybrid_idx asked for its 30 MiB and was refused with
-  "[KV-TIER] device 0: device-planned KV 240.0 MB exceeds the 27.6 MB free for KV"
-and no context. (At the default context the fit moves all 12 attention layers' KV to the host tier, so neither buffer
-has a device layer and the backstop has nothing to refuse.)
+The defect (B70, Qwen3.8 IQ3_XXS, no -c, -ub 256, on the room-first Part 2 tree before a7e671858; master moves all 12
+layers' KV to the host tier at that shape and is refused at -c 10240 instead): the attention K/V landed on the device,
+then the indexer key cache of llama_memory_hybrid_idx asked for its 768 MiB and was refused with
+  "[KV-TIER] device 0: device-planned KV 6144.0 MB exceeds the 748.6 MB free for KV"
+then "alloc_tensor_range: failed to allocate SYCL_KV_Tiered buffer of size 805306368" and no context.
 
 The tiered allocator's backstop summed the plan's per-layer KV, which is the layer's KV and not one buffer's, for
-every device layer of whichever buffer it was allocating, so the indexer buffer was charged the attention buffer's
-bytes. The fix this gate pins: the backstop runs after the tier manager is configured for this buffer
+every device layer of whichever buffer it was allocating, so the 768 MiB indexer buffer was charged the 6144 MiB of
+the attention buffer. The fix this gate pins: the backstop runs after the tier manager is configured for this buffer
 and counts each member layer at the size this buffer allocates for it (kv_tier_manager::kv_layer_size), through the
 one helper kv_buffer_device_bytes(). test-kv-runtime-demotion runs that helper on the Qwen3.8 two-buffer shape.
 
-Nothing budgeted the indexer cache either: the inventory published the attention widths only, so the planner, the
-runtime transaction and the largest-fitting -c hint all left it out, and at -c 10240 the fit kept all 12 attention
-layers on the device with 27.6 MiB left for the 30 MiB indexer buffer. The fix this gate pins: the indexer key width
-travels as its own per-layer field (ggml_sycl_tensor_inventory::kv_idx_k_width_per_layer, appended, sizeof 184 pinned at
-the consumer), every budget (placement_kv_info::kv_bytes_for_layer, placement_plan::kv_size_for_layer, the -c hint) adds
-the indexer keys to the layer's K/V, and the tier manager compares each buffer with its own cache's sum, never with the
-layers' total, which no single buffer holds. test-sycl-kv-layer-sizing runs the two buffers through configure_from_plan.
+Nothing budgeted the indexer cache either: the inventory published the attention widths only, so the planner, the KV
+context room, the runtime transaction and the largest-fitting -c hint all left its 768 MiB out, and the 748.6 MiB
+the room left could not take it. The fix this gate pins: the indexer key width travels as its own per-layer field
+(ggml_sycl_tensor_inventory::kv_idx_k_width_per_layer, appended, sizeof 184 pinned at the consumer), every budget
+(placement_kv_info::kv_bytes_for_layer_at, placement_plan::kv_size_for_layer, the -c hint) adds the indexer keys to
+the layer's K/V, and the tier manager compares each buffer with its own cache's sum, never with the layers' total,
+which no single buffer holds. test-sycl-kv-layer-sizing runs the two buffers through configure_from_plan.
 
 The GGML_SYCL_KV_HOT_LAYERS override used to return from configure_from_plan before the per-layer sizing, so the
 manager the allocator reuses kept the previous buffer's sizes and the backstop charged the indexer buffer the K/V
@@ -126,17 +126,18 @@ REFUSE = "if (ggml_sycl::kv_admission_mismatch(planned_device_bytes, kv_vram_cap
 HELPER_SUM = "if (l < member.size() && member[l] != 0 && layer_owner[l] == device) { total += layer_bytes[l]; }"
 
 
-FIELD = "uint32_t kv_layer_count; const uint32_t * kv_idx_k_width_per_layer; };"
+FIELD = "uint32_t n_ctx_context; const uint32_t * kv_idx_k_width_per_layer; };"
 READ = ("g_placement_kv_info.layer_idx_k_width.assign(inventory->kv_idx_k_width_per_layer, "
         "inventory->kv_idx_k_width_per_layer + inventory->kv_layer_count);")
 LAYOUT = (
     "static_assert(sizeof(ggml_sycl_tensor_inventory) == 184,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_layer_count) == 168,",
+    "static_assert(offsetof(ggml_sycl_tensor_inventory, n_ctx_context) == 172,",
     "static_assert(offsetof(ggml_sycl_tensor_inventory, kv_idx_k_width_per_layer) == 176,",
 )
-KV_AT_SIG = "size_t kv_bytes_for_layer(uint32_t il) const"
+KV_AT_SIG = "size_t kv_bytes_for_layer_at(uint32_t il, uint32_t ctx) const"
 KV_SIZE_SIG = "size_t kv_size_for_layer(uint32_t layer_id) const"
-AT_ADDS = "+ kv_idx_bytes_for_layer_at(il, n_ctx);"
+AT_ADDS = "+ kv_idx_bytes_for_layer_at(il, ctx);"
 SIZE_ADDS = "+ kv_idx_size_for_layer(layer_id);"
 PLAN_COPY = "plan.layer_idx_k_width = kv_info.layer_idx_k_width;"
 HINT = ("const uint32_t widths = kv_info.layer_k_width[layer] + kv_info.layer_v_width[layer] + "
@@ -151,13 +152,13 @@ HOT_ENV = "const char * hot_layers_env = std::getenv(\"GGML_SYCL_KV_HOT_LAYERS\"
 
 
 def claim_inventory_carries_the_indexer_width(header: str, sycl_cpp: str) -> bool:
-    """The field is appended after kv_layer_count, the backend copies it, and the consumer pins the layout."""
+    """The field is appended after n_ctx_context, the backend copies it, and the consumer pins the layout."""
     n = norm(sycl_cpp)
     return FIELD in norm(header) and READ in n and all(a in n for a in LAYOUT)
 
 
 def claim_budgets_add_the_indexer(cache_hpp: str, cache_cpp: str, sycl_cpp: str) -> bool:
-    """Every budget adds the indexer keys to the layer's K/V: the planner's per-layer charge, the plan's
+    """Every budget adds the indexer keys to the layer's K/V: the planner's per-layer charge and room, the plan's
     per-layer size (the transaction, the host zone, the per-device charges), and the -c hint's bytes per cell."""
     n = norm(cache_hpp)
     at = body(n, KV_AT_SIG)
@@ -257,7 +258,7 @@ def test_mutant_layout_unpinned_fails():
 
 
 def test_mutant_planner_charge_without_the_indexer_fails():
-    """Restores the defect: the per-layer charge leaves the indexer keys out."""
+    """Restores the defect: the room and the per-layer charge leave the indexer keys out."""
     assert not claim_budgets_add_the_indexer(_once(CACHE_HPP, AT_ADDS, ";"), CACHE_CPP, SYCL_CPP)
 
 

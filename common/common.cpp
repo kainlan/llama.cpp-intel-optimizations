@@ -1281,6 +1281,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        // a fit may shrink a requested context: the load then plans for the context the fit chose. Without -c the fit
+        // resolves the training context, and the hint stays 0: no room is held for a context nobody asked for (owner
+        // ruling, llama.cpp-ak0p).
+        if (params.n_ctx > 0) {
+            mparams.n_ctx_hint = cparams.n_ctx;
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1670,6 +1677,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+    // the context the caller will create (llama.cpp-ak0p): -c, or 0 for the training context. It is the context's
+    // whole cell count, which llama_context divides among the slots when the KV is not unified (llama-server
+    // --parallel), so it is never multiplied by n_parallel.
+    mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : 0;
 
     return mparams;
 }

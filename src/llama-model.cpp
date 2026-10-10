@@ -395,7 +395,8 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
                                                 const uint32_t *                     kv_idx_k_width_per_layer,
                                                 size_t                               total_size,
                                                 size_t                               max_pp_pipeline_weight_bytes,
-                                                const llama_hparams &                hparams) {
+                                                const llama_hparams &                hparams,
+                                                uint32_t                             n_ctx_hint) {
     const uint32_t n_layer             = hparams.n_layer();
     inventory                         = {};
     inventory.tensors                 = tensors.data();
@@ -428,6 +429,18 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     // unified cache once llama_context provides the real n_ctx.
     inventory.n_ubatch                = 512;
     inventory.n_ctx                   = inventory.n_ubatch;
+    // llama.cpp-8ecj: ...except the room for it. The planner holds the KV room of the context the model opens with on
+    // the device ahead of the routed experts, so the experts fill only what the dense weights and that KV leave.
+    // llama.cpp-ak0p: that context is the one the caller is about to create (llama_model_params::n_ctx_hint), padded
+    // as llama_context pads n_ctx for a single sequence (src/llama-context.cpp: cparams.n_ctx = GGML_PAD(cparams.n_ctx,
+    // 256)). A non-unified multi-slot context can exceed it: llama_context pads each sequence's share, and SWA cells
+    // grow with the streams, while the load plans for one sequence. The runtime transaction re-places that overflow.
+    // With no hint no room is held (0): a run without -c places as it did before the room, and
+    // its KV beyond the planning shape is placed when the context is created. A hint above n_ctx_train (a
+    // rope-extended -c) is honoured: the caller asked for that context, and the room is already capped at what the
+    // dense weights and their KV leave. Only the room reads the hint: the planning shape above and the load measures
+    // (the placement envelope's n_ctx, still 0) keep their inputs.
+    inventory.n_ctx_context             = n_ctx_hint != 0 ? GGML_PAD(n_ctx_hint, 256) : 0;
     if (hparams.n_expert > 0 && hparams.n_expert_used_max() > 0) {
         // llama.cpp-sr83 (C3): the batched executor repacks straight to a
         // {nibbles,e8m0-scales} WOQ shape by default and deletes the f16
@@ -713,7 +726,7 @@ static void llama_model_sycl_compute_early_plan(llama_model_loader & ml,
     llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(),
                                         kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(),
                                         kv_layer_arrays.idx_k_width.get(), total_size, max_pp_pipeline_weight_bytes,
-                                        hparams);
+                                        hparams, model.get_n_ctx_hint());
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
     llama_model_sycl_apply_inventory(inventory, envelope, true);
 
@@ -769,7 +782,7 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader & ml,
     llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(),
                                         kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(),
                                         kv_layer_arrays.idx_k_width.get(), total_size, max_pp_pipeline_weight_bytes,
-                                        hparams);
+                                        hparams, model.get_n_ctx_hint());
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
     llama_model_sycl_apply_inventory(inventory, envelope, false);
 
@@ -3931,6 +3944,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 //
 
 llama_model_params llama_model_default_params() {
+    // clang-format off
     llama_model_params result = {
         /*.devices                     =*/ nullptr,
         /*.tensor_buft_overrides       =*/ nullptr,
@@ -3949,7 +3963,9 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.n_ctx_hint                  =*/ 0,
     };
+    // clang-format on
 
     return result;
 }

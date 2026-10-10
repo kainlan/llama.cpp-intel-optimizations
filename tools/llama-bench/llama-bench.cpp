@@ -1217,8 +1217,14 @@ struct cmd_params_instance {
     size_t             fit_target;
     uint32_t           fit_min_ctx;
 
+    // the context every test of this instance creates: the prompt, the generated tokens and the depth
+    uint32_t n_ctx() const { return n_prompt + n_gen + n_depth; }
+
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
+
+        // llama.cpp-ak0p: the SYCL load holds this context's KV room ahead of the routed experts (see equal_mparams).
+        mparams.n_ctx_hint = n_ctx();
 
         mparams.n_gpu_layers = n_gpu_layers;
         if (!devices.empty()) {
@@ -1271,6 +1277,8 @@ struct cmd_params_instance {
         return mparams;
     }
 
+    // n_ctx_hint is left out, so a context change does not reload the model: a reused model keeps the first
+    // instance's room, and a larger later context is re-placed at context creation (llama.cpp-ak0p).
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
                split_mode == other.split_mode &&
@@ -1283,7 +1291,7 @@ struct cmd_params_instance {
     llama_context_params to_llama_cparams() const {
         llama_context_params cparams = llama_context_default_params();
 
-        cparams.n_ctx           = n_prompt + n_gen + n_depth;
+        cparams.n_ctx           = n_ctx();
         cparams.n_batch         = n_batch;
         // llama.cpp-nphx: n_ubatch < 0 is the "-ub auto" sentinel. Leave
         // cparams.n_ubatch at whatever llama_context_default_params() just
@@ -2348,8 +2356,7 @@ int llama_bench(int argc, char ** argv) {
 
             std::vector<size_t> margins(llama_max_devices(), inst.fit_target * 1024 * 1024);
 
-            uint32_t n_ctx_needed = inst.n_prompt + inst.n_gen + inst.n_depth;
-            cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
+            cparams.n_ctx = std::max(cparams.n_ctx, inst.n_ctx());
 
             common_fit_params(inst.model.c_str(), &mparams, &cparams,
                 fit_tensor_split.data(),
@@ -2358,6 +2365,9 @@ int llama_bench(int argc, char ** argv) {
                 inst.fit_min_ctx,
                 nullptr,
                 params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+            // the load plans for the context the fit chose
+            mparams.n_ctx_hint = cparams.n_ctx;
        }
 
         // keep the same model between tests when possible

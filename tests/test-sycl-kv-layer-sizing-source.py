@@ -254,10 +254,17 @@ def kv_bytes_for_layer_violations(source: str) -> list[str]:
     own copy -- the exact "two independent formulas can drift" shape this
     ticket fixes. Must also forward kv_unified, not just n_seq_max.
     """
-    body = function_or_none(source, "size_t kv_bytes_for_layer(uint32_t il) const")
-    if body is None:
+    delegate = function_or_none(source, "size_t kv_bytes_for_layer(uint32_t il) const")
+    if delegate is None:
         return ["placement_kv_info::kv_bytes_for_layer is missing"]
     found: list[str] = []
+    # llama.cpp-8ecj: the formula lives in kv_bytes_for_layer_at(il, ctx), which also sizes the KV room of the
+    # context the model opens with; kv_bytes_for_layer() charges it at the planned n_ctx.
+    if not re.search(r"return\s+kv_bytes_for_layer_at\(\s*il\s*,\s*n_ctx\s*\)\s*;", delegate):
+        found.append("kv_bytes_for_layer does not forward to kv_bytes_for_layer_at at n_ctx")
+    body = function_or_none(source, "size_t kv_bytes_for_layer_at(uint32_t il, uint32_t ctx) const")
+    if body is None:
+        return found + ["placement_kv_info::kv_bytes_for_layer_at is missing"]
     # A real CALL, not merely a comment mentioning the function's name --
     # `kv_layer_bytes_for_kind()` also appears in this function's own prose.
     call = re.search(re.escape(KV_LAYER_BYTES_FOR_KIND) + r"\(\s*layer_kind\[il\][^;]*\)", body, re.S)
@@ -602,9 +609,9 @@ def test_mutation_kv_layer_bytes_for_kind_grows_a_second_cell_formula_is_witness
 def test_mutation_kv_bytes_for_layer_stops_forwarding_kv_unified_is_witnessed() -> None:
     hpp = UNIFIED_CACHE_HPP.read_text()
     mutated = hpp.replace(
-        "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
+        "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], ctx, n_swa, n_ubatch,\n"
         "                                           n_seq_max, kv_unified, swa_full) +",
-        "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
+        "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], ctx, n_swa, n_ubatch,\n"
         "                                           n_seq_max, false, swa_full) +", 1)
     _assert_witnessed(hpp, mutated, kv_bytes_for_layer_violations, "without forwarding kv_unified",
                       "kv_bytes_for_layer stops forwarding kv_unified")
@@ -613,12 +620,20 @@ def test_mutation_kv_bytes_for_layer_stops_forwarding_kv_unified_is_witnessed() 
 def test_mutation_kv_bytes_for_layer_stops_forwarding_swa_full_is_witnessed() -> None:
     hpp = UNIFIED_CACHE_HPP.read_text()
     mutated = hpp.replace(
-        "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
+        "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], ctx, n_swa, n_ubatch,\n"
         "                                           n_seq_max, kv_unified, swa_full) +",
-        "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
+        "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], ctx, n_swa, n_ubatch,\n"
         "                                           n_seq_max, kv_unified, false);", 1)
     _assert_witnessed(hpp, mutated, kv_bytes_for_layer_violations, "without forwarding swa_full",
                       "kv_bytes_for_layer stops forwarding swa_full")
+
+
+def test_mutation_kv_bytes_for_layer_charges_the_opening_context_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace("return kv_bytes_for_layer_at(il, n_ctx); }",
+                          "return kv_bytes_for_layer_at(il, n_ctx_context); }", 1)
+    _assert_witnessed(hpp, mutated, kv_bytes_for_layer_violations, "does not forward to kv_bytes_for_layer_at at n_ctx",
+                      "kv_bytes_for_layer charges the opening context instead of n_ctx")
 
 
 def test_mutation_kv_size_for_layer_stops_forwarding_kv_unified_is_witnessed() -> None:

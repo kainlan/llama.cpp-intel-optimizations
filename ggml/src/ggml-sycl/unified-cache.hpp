@@ -399,7 +399,9 @@ struct placement_entry {
     int64_t            ne[GGML_MAX_DIMS] = {};
     size_t             src_size          = 0;  // AOS source bytes
     size_t             dst_size          = 0;  // Layout-converted destination bytes (SOA/COALESCED)
-    size_t             kv_size           = 0;  // KV bytes charged by this entry (usually 0)
+    // The layer's KV bytes, on one anchor entry per layer (its attention entry when it has one) and 0 on the rest. It
+    // is the cost, not the placement: kv_device[layer_id] says where that KV lives, which can differ from on_device.
+    size_t             kv_size           = 0;
     placement_priority priority          = placement_priority::COUNT;  // Sort key
     int                layer_id          = -1;  // Layer number (earlier = higher priority within same level)
     int                expert_id         = -1;  // -1 for dense weights, >=0 for individual MoE experts
@@ -630,6 +632,10 @@ struct placement_kv_info {
     // this is threaded to next.
     uint32_t          n_head_all_max   = 0;
     bool              n_ctx_is_runtime = false;
+    // llama.cpp-8ecj: the context the model opens with, from ggml_sycl_tensor_inventory::n_ctx_context: the caller's
+    // request (llama.cpp-ak0p). n_ctx above stays the load's own planning shape; this one only sizes the KV room the
+    // planner holds ahead of the routed experts. 0 = no request reached the load: no room is held.
+    uint32_t              n_ctx_context    = 0;
     // MoE hyperparameters (0 for dense models)
     int               n_expert_used    = 0;  // Top-k experts selected per token
     // SWA (Sliding Window Attention) — 0 means all layers use full attention
@@ -673,20 +679,27 @@ struct placement_kv_info {
         return swa_layer_mask[layer_id];
     }
 
-    size_t kv_bytes_per_layer() const {
-        if (!valid()) {
+    size_t kv_bytes_per_layer() const { return kv_bytes_per_layer(n_ctx); }
+
+    // A representative full-attention layer at a context of `ctx` tokens, at the global width. The uniform fallback
+    // of kv_bytes_for_layer_at() forwards here, so this formula is the only one for it (llama.cpp-8ecj).
+    size_t kv_bytes_per_layer(uint32_t ctx) const {
+        if (!valid() || ctx == 0) {
             return 0;
         }
         // llama.cpp-3aos: routed through kv_layer_bytes_for_kind()'s FULL
         // branch (numerically identical -- that branch does not consult
         // n_swa/n_ubatch/n_seq_max/kv_unified/swa_full) so the arithmetic
         // lives in exactly one place, matching kv_bytes_per_swa_layer() below.
-        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_FULL, n_embd_k_gqa, n_embd_v_gqa, n_ctx, n_swa, n_ubatch,
+        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_FULL, n_embd_k_gqa, n_embd_v_gqa, ctx, n_swa, n_ubatch,
                                        n_seq_max, kv_unified, swa_full);
     }
 
-    size_t kv_bytes_per_swa_layer() const {
-        if (!valid() || n_swa == 0) {
+    size_t kv_bytes_per_swa_layer() const { return kv_bytes_per_swa_layer(n_ctx); }
+
+    // A representative SWA layer at a context of `ctx` tokens; 0 when the model has no window.
+    size_t kv_bytes_per_swa_layer(uint32_t ctx) const {
+        if (!valid() || ctx == 0 || n_swa == 0) {
             return 0;
         }
         // Must match the actual SWA KV size from llama_kv_cache_iswa:
@@ -701,7 +714,7 @@ struct placement_kv_info {
         // kv_bytes_for_layer() below once layer_kind/layer_k_width/
         // layer_v_width are populated.
         // Tensor per layer: K=[n_embd_k_gqa, size_swa] + V=[n_embd_v_gqa, size_swa], both fp16.
-        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_SWA, n_embd_k_gqa, n_embd_v_gqa, n_ctx, n_swa, n_ubatch,
+        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_SWA, n_embd_k_gqa, n_embd_v_gqa, ctx, n_swa, n_ubatch,
                                        n_seq_max, kv_unified, swa_full);
     }
 
@@ -715,27 +728,40 @@ struct placement_kv_info {
     // aggregate split when layer_kind/layer_k_width/layer_v_width are not
     // populated (an inventory built before this ticket, or a homogeneous
     // model that never needed per-layer truth).
-    size_t kv_bytes_for_layer(uint32_t il) const {
-        if (!valid()) {
+    size_t kv_bytes_for_layer(uint32_t il) const { return kv_bytes_for_layer_at(il, n_ctx); }
+
+    // Layer `il`'s KV at a context of `ctx` tokens, every other input of the shape as this struct carries it. The
+    // planner sizes the KV room of the context the model opens with from it (llama.cpp-8ecj), so that room and the
+    // per-layer charge above come from the same rule.
+    size_t kv_bytes_for_layer_at(uint32_t il, uint32_t ctx) const {
+        if (!valid() || ctx == 0) {
             return 0;
         }
         if (has_per_layer_kv_truth(il)) {
-            return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,
+            return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], ctx, n_swa, n_ubatch,
                                            n_seq_max, kv_unified, swa_full) +
-                   kv_idx_bytes_for_layer_at(il, n_ctx);
+                   kv_idx_bytes_for_layer_at(il, ctx);
         }
-        return is_swa_layer(static_cast<int>(il)) ? kv_bytes_per_swa_layer() : kv_bytes_per_layer();
+        return is_swa_layer(static_cast<int>(il)) ? kv_bytes_per_swa_layer(ctx) : kv_bytes_per_layer(ctx);
     }
 
     // The indexer keys of layer `il` at `ctx` tokens: the same cells as the layer's K/V, K only. Part of
-    // kv_bytes_for_layer(), which is what every budget charges; on its own for the allocator, which sizes the
-    // indexer buffer apart from the K/V one (llama.cpp-8ecj).
+    // kv_bytes_for_layer_at(), which is what every budget charges. The allocator sizes the indexer buffer apart from
+    // the K/V one through placement_plan::kv_idx_size_for_layer(), not through this helper (llama.cpp-8ecj).
     size_t kv_idx_bytes_for_layer_at(uint32_t il, uint32_t ctx) const {
         if (!valid() || ctx == 0 || !has_per_layer_kv_truth(il) || idx_k_width(il) == 0) {
             return 0;
         }
         return kv_layer_bytes_for_kind(layer_kind[il], idx_k_width(il), 0, ctx, n_swa, n_ubatch, n_seq_max, kv_unified,
                                        swa_full);
+    }
+
+    // What the context the model opens with needs on top of the KV charged at n_ctx for layer `il`: 0 when that
+    // context is unknown or no larger.
+    size_t kv_context_extra_bytes_for_layer(uint32_t il) const {
+        const size_t at_context = kv_bytes_for_layer_at(il, n_ctx_context);
+        const size_t charged    = kv_bytes_for_layer(il);
+        return at_context > charged ? at_context - charged : 0;
     }
 };
 
@@ -821,6 +847,14 @@ struct placement_plan {
     bool                         multi_device;       // True if plan spans multiple GPUs
     size_t                       kv_per_layer     = 0;
     size_t                       kv_per_swa_layer = 0;
+    // llama.cpp-8ecj: device room the load plan held, after the dense weights and their KV and before the routed
+    // experts, for the KV the context the model opens with adds on top of the KV charged at planner_n_ctx. Counted in
+    // vram_bytes until the runtime context transaction re-derives the KV totals for its real shape.
+    size_t                                     kv_context_reserve_bytes        = 0;
+    // The device bytes of routed experts that room cost: the stored bytes a first-fit pack with the room added back
+    // puts on the device, minus those the real pack put there (net). A load fact, for the log and the planner tests;
+    // the runtime never promotes the experts back (fkpg).
+    size_t                                     kv_context_room_displaced_bytes = 0;
     std::vector<bool>            swa_layer_mask;  // swa_layer_mask[l] == true → SWA layer
     // llama.cpp-3aos: mirrors placement_kv_info::layer_kind/layer_k_width/
     // layer_v_width -- see that struct's field comments. Copied in at plan
@@ -1161,8 +1195,10 @@ struct placement_plan {
             }
         }
 
-        vram_bytes = weight_vram_bytes + kv_vram_bytes;
-        host_bytes = weight_host_bytes + kv_host_bytes;
+        // The KV of this shape replaces the room the load plan held for the context it expected.
+        kv_context_reserve_bytes = 0;
+        vram_bytes               = weight_vram_bytes + kv_vram_bytes;
+        host_bytes               = weight_host_bytes + kv_host_bytes;
         if (kv_host_bytes > host_zone_kv_bytes) {
             host_zone_kv_bytes = kv_host_bytes;
         }

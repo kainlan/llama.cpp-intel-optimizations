@@ -4350,6 +4350,20 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-8ecj: the single-device planner places dense weights, then KV (each device layer's KV, then the room the
+# context the model opens with needs on top of it), then routed experts, and logs what the room displaced. The room is
+# for the context the caller asked for (llama_model_params::n_ctx_hint, from -c in common and from the test's context
+# in llama-bench, padded as llama_context pads n_ctx for a single sequence; a non-unified multi-slot context can exceed
+# it, and the runtime transaction re-places the overflow); none is held when no request reached the load
+# (llama.cpp-ak0p). A mutant per claim, experts-first among them. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-kv-before-experts-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kv-before-experts-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-8ecj: a memory that holds one layer in two KV buffers (qwen4exp's llama_memory_hybrid_idx: attention K/V
 # and indexer keys) is budgeted and allocated buffer by buffer. The tiered allocator's backstop counts the buffer it is
 # allocating at its own layer sizes, not the plan's per-layer KV. A mutant per claim. Text only: no device, no model.

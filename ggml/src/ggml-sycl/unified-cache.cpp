@@ -27514,11 +27514,13 @@ static bool planner_moe_gateup_bundle4_enabled() {
     return enabled;
 }
 
-// GGML_SYCL_KV_PIN_DEVICE=1 (diagnostic, default off, llama.cpp-h8hw): decouple
-// the weight/KV co-assignment in the dense-layer packing loop below so an
-// attention layer's KV can be charged and placed independently of that same
-// layer's dense weights, instead of the two being summed into one on/off-device
-// decision. Default off reproduces today's combined-charge behavior exactly.
+// GGML_SYCL_KV_PIN_DEVICE=1 (diagnostic, default off, llama.cpp-h8hw): changes which charge claims `remaining` first
+// in the single-device planner. By default the dense pass charges every layer's weights, and the KV phase after it
+// charges each device layer's KV and holds the opening context's room before the routed experts (llama.cpp-8ecj).
+// Pinned, the dense pass charges each attention layer's KV ahead of that layer's weights, so the weight decision sees
+// what the KV left; the KV phase does nothing, and no context room is held. By default a layer's KV is on the device
+// only with its weights, and KV that does not fit goes to the host tier without moving them; pinned, KV and weights
+// each go to the host tier on their own when they do not fit.
 static bool planner_kv_pin_device_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_KV_PIN_DEVICE");
@@ -30907,6 +30909,114 @@ placement_plan compute_placement_plan(const std::vector<std::pair<std::string, s
                                   kv_info, envelope, n_experts);
 }
 
+// The KV phase's per-layer charge (llama.cpp-8ecj): each layer whose dense weights the dense pass put on `device_id`
+// gets its KV there, in layer order, while `remaining` holds it. A layer whose KV does not fit keeps its weights on the
+// device and has its KV on the host tier; a host layer's KV is on the host tier with it.
+static void plan_single_device_layer_kv(placement_plan &            plan,
+                                        const placement_kv_info &   kv_info,
+                                        const std::map<int, bool> & layer_has_attention,
+                                        int                         device_id,
+                                        size_t &                    remaining) {
+    for (const auto & [layer_id, has_attention] : layer_has_attention) {
+        const size_t kv_cost = has_attention ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
+        if (kv_cost == 0) {
+            continue;
+        }
+        const bool kv_on_device = plan.get_layer_device(layer_id) == device_id && kv_cost <= remaining;
+        if (kv_on_device) {
+            remaining -= kv_cost;
+            plan.kv_vram_bytes += kv_cost;
+            plan.vram_bytes += kv_cost;
+        } else {
+            plan.kv_host_bytes += kv_cost;
+            plan.host_bytes += kv_cost;
+        }
+        plan.kv_device[layer_id] = kv_on_device ? device_id : -1;
+    }
+}
+
+// The KV phase's room for the context the model opens with (kv_info.n_ctx_context, llama.cpp-8ecj): what that
+// context's KV adds over the KV charged at the planning n_ctx, for every layer whose KV is on `device_id`, held out of
+// `remaining` before the routed experts are packed, and capped at what the dense weights and their KV left. A context
+// whose KV does not fit beside the dense weights still opens: the runtime context transaction re-places the overflow to
+// the host tier.
+//
+// The context is the one the caller asked for (llama_model_params::n_ctx_hint, llama.cpp-ak0p). With no request no room
+// is held, and the KV beyond the planning n_ctx is placed when the context is created. A context created smaller than
+// the request leaves the rest of the room unused, and the experts it displaced stay on the host tier, because experts
+// are placed once, at load, and nothing promotes them when the context turns out smaller.
+struct kv_context_room {
+    size_t wanted   = 0;  // the extra KV of every layer whose KV is on the device
+    size_t held     = 0;  // min(wanted, what was left)
+    size_t n_layers = 0;  // layers with extra KV
+
+    // The stored bytes and count of the routed-expert triplets the pack put on the device, and of the ones the same
+    // first-fit pack puts there with the room added back. The room's cost is the difference. Counting instead the
+    // triplets that fit the second budget and not the real one over-states it: the larger budget can take a larger
+    // triplet and then skip smaller ones the real pack did place.
+    size_t expert_bytes          = 0;
+    size_t expert_groups         = 0;
+    size_t expert_bytes_without  = 0;
+    size_t expert_groups_without = 0;
+
+    size_t displaced_bytes() const {
+        return expert_bytes_without > expert_bytes ? expert_bytes_without - expert_bytes : 0;
+    }
+};
+
+static kv_context_room hold_kv_context_room(placement_plan &          plan,
+                                            const placement_kv_info & kv_info,
+                                            int                       device_id,
+                                            size_t &                  remaining) {
+    kv_context_room room;
+    for (const auto & [layer_id, owner] : plan.kv_device) {
+        if (layer_id < 0 || owner != device_id) {
+            continue;
+        }
+        const size_t extra = kv_info.kv_context_extra_bytes_for_layer(static_cast<uint32_t>(layer_id));
+        if (extra == 0) {
+            continue;
+        }
+        room.wanted += std::min(extra, SIZE_MAX - room.wanted);
+        room.n_layers++;
+    }
+    room.held = std::min(room.wanted, remaining);
+    remaining -= room.held;
+    plan.kv_context_reserve_bytes = room.held;
+    plan.vram_bytes += room.held;
+    return room;
+}
+
+// The room's line, after the experts are packed, so it can say what the room cost: the device bytes of routed
+// experts the pack placed against those the same pack places with the room added back. A WARN when it cost experts or
+// could not hold all it wanted, so a default run shows it. With no requested context, one INFO line says no room is
+// held.
+static void log_kv_context_room(const kv_context_room & room, const placement_kv_info & kv_info, int device_id) {
+    if (kv_info.n_ctx_context == 0) {
+        GGML_LOG_INFO(
+            "[PLACEMENT] no KV context room on device %d: no requested n_ctx reached the load "
+            "(planner n_ctx=%u); KV beyond it is placed at context creation\n",
+            device_id, kv_info.n_ctx);
+        return;
+    }
+    if (room.wanted == 0) {
+        return;
+    }
+    const double mb         = 1024.0 * 1024.0;  // MB as the sibling [PLACEMENT] lines print it
+    const bool   warn       = room.displaced_bytes() > 0 || room.held < room.wanted;
+    const char * short_note = room.held < room.wanted ? ", all that was left; the context's overflow is re-placed" : "";
+    // ggml_log_internal, not the GGML_LOG_* macros, so the level is chosen at run time and the arguments are written
+    // once.
+    ggml_log_internal(warn ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
+                      "[PLACEMENT] KV context room on device %d: held %.1f MB of %.1f MB for n_ctx_context=%u over "
+                      "planner n_ctx=%u (%zu layer(s)), before the routed experts%s; it cost %.1f MB of "
+                      "device-resident routed experts: %.1f MB (%zu triplet(s)) on the device, against %.1f MB (%zu) "
+                      "with the room added back. n_ctx_context is the requested n_ctx.\n",
+                      device_id, room.held / mb, room.wanted / mb, kv_info.n_ctx_context, kv_info.n_ctx, room.n_layers,
+                      short_note, room.displaced_bytes() / mb, room.expert_bytes / mb, room.expert_groups,
+                      room.expert_bytes_without / mb, room.expert_groups_without);
+}
+
 placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,
                                       size_t                                     vram_budget,
                                       int                                        device_id,
@@ -31079,8 +31189,13 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     // Planner contract:
     //   - dense non-layer tensors (embeddings/output/etc.) may pack individually
     //   - dense per-layer tensors move as a single execution unit
-    //   - KV for a layer is charged alongside that dense layer
-    //   - MoE experts remain individually placeable
+    //   - device residency goes dense weights, then KV, then routed experts: the dense pass charges weights only;
+    //     the KV phase (plan_single_device_layer_kv) then puts a layer's KV on the device only when its dense layer
+    //     is there and the KV fits, and holds the room the opening context adds (hold_kv_context_room), so KV that
+    //     does not fit goes to the host tier and never moves a dense layer there
+    //   - the GGML_SYCL_KV_PIN_DEVICE diagnostic charges each layer's KV ahead of its weights inside the dense pass
+    //     and holds no context room
+    //   - MoE experts remain individually placeable, packed (as whole triplets) into what the KV phase leaves
     //
     // When the VRAM arena is active, subtract compute scratch and oneDNN
     // scratch zone capacities from the budget BEFORE packing weights.
@@ -31225,20 +31340,19 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                     kv_cost / (1024.0 * 1024.0));
             }
         } else {
-            const size_t total_cost = weight_charge + kv_cost;
-            on_device               = total_cost <= remaining;
-            target                  = on_device ? device_id : -1;
-            kv_on_device            = on_device;
+            // Weights only: this layer's KV is charged by the KV phase below, once every dense layer has had its
+            // claim, so KV that does not fit costs the layer its device KV and never its dense weights.
+            on_device    = weight_charge <= remaining;
+            target       = on_device ? device_id : -1;
+            kv_on_device = false;
 
             if (on_device) {
-                remaining -= total_cost;
+                remaining -= weight_charge;
                 plan.weight_vram_bytes += weight_charge;
-                plan.kv_vram_bytes += kv_cost;
-                plan.vram_bytes += total_cost;
+                plan.vram_bytes += weight_charge;
             } else {
                 plan.weight_host_bytes += weight_bytes;
-                plan.kv_host_bytes += kv_cost;
-                plan.host_bytes += total_cost;
+                plan.host_bytes += weight_bytes;
             }
         }
 
@@ -31261,6 +31375,17 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             entry.target_device = target;
             entry.kv_size       = idx == kv_anchor ? kv_cost : 0;
         }
+    }
+
+    // The KV phase: device residency goes dense weights, then KV, then routed experts. Every dense layer has had its
+    // claim above; each device layer's KV is charged here, then the room the context the model opens with needs on
+    // top of that is held, and only then are the experts packed into what is left. With the KV pinned ahead of the
+    // weights (GGML_SYCL_KV_PIN_DEVICE) the per-layer charge already ran inside the dense loop and no room is held:
+    // the diagnostic keeps the placement it had before the room.
+    kv_context_room room;
+    if (!planner_kv_pin_device_enabled()) {
+        plan_single_device_layer_kv(plan, kv_info, layer_has_attention, device_id, remaining);
+        room = hold_kv_context_room(plan, kv_info, device_id, remaining);
     }
 
     // MoE expert entries: budget-aware placement at (layer, expert) triplet
@@ -31305,6 +31430,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         moe_triplet_pack_stats stats;
         stats.groups  = moe_groups.size();
         stats.hotness = hotness_source != nullptr ? hotness_source : stats.hotness;
+        // The same first-fit pack with the KV context room added back, so the room's line can say what it cost.
+        size_t without_room = remaining + room.held;
         for (const auto & group : moe_groups) {
             if (moe_triplet_complete(group)) {
                 stats.complete_groups++;
@@ -31314,6 +31441,11 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
 
             const bool on_device = group.charge_bytes <= remaining;
             const int  target    = on_device ? device_id : -1;
+            if (group.charge_bytes <= without_room) {
+                without_room -= group.charge_bytes;
+                room.expert_bytes_without += group.bytes;
+                room.expert_groups_without++;
+            }
             if (on_device) {
                 remaining -= group.charge_bytes;
                 plan.weight_vram_bytes += group.charge_bytes;
@@ -31346,6 +31478,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 }
             }
         }
+        room.expert_bytes  = stats.device_bytes;
+        room.expert_groups = stats.device_groups;
         // Prompt cannot consume XMX_TILED gate/up by default. The planner
         // rewrites those primaries to SOA before packing so single-B50 GPT-OSS
         // does not budget duplicate full-model PP alternates and spill experts.
@@ -31364,6 +31498,8 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         log_moe_triplet_pack_stats("PLACEMENT-MOE", stats, remaining);
         reorder_plan_entries_for_moe_materialization(plan, moe_groups);
     }
+    plan.kv_context_room_displaced_bytes = room.displaced_bytes();
+    log_kv_context_room(room, kv_info, device_id);
 
     // llama.cpp-21jd: dense WOQ extra copies for this single-device plan
     // (compute_multi_device_plan makes the same per-device call).

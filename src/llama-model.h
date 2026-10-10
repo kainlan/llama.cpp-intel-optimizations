@@ -812,6 +812,9 @@ struct llama_model {
 
     const llama_sycl_model_token & get_sycl_model_token() const { return sycl_model_token; }
 
+    // llama_model_params::n_ctx_hint, for the SYCL plan builders, which take the model by reference.
+    uint32_t get_n_ctx_hint() const { return params.n_ctx_hint; }
+
   protected:
     llama_model_params params;
 
