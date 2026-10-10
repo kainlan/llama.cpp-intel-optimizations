@@ -2823,9 +2823,20 @@ through the probe reservation and the admitted record to the late check. A mutan
 - The compute buffer's first tier is already the RUNTIME zone, so the term is drawn by the path the buffer takes.
 - The ring re-plan counts the term, and the state term, as pending RUNTIME demand, beside the dense scratch, so the
   ring does not take their room. A re-publish while they are live counts them twice, which is conservative.
-- The term is device-global and merges like the dense terms: while another model is live, the larger term stays.
-- It is dropped where no model is live, with the state term (`unified_cache_clear_planned_load_terms`): at the outer
-  load entry, at a load abort, and at a teardown with no other model live and no load in flight.
+- Each model owns its own compute and state term per device, keyed by its model slot and slot generation (canonical
+  contract 12.4, `llama.cpp-ihk6`). The slot is reserved and its generation minted when the load transaction begins,
+  before the reserves run, so a load in flight and the model it commits to have one key and nothing moves at commit.
+  The reserve stores only while it holds the open transaction's load-effect lease.
+- A device reads the merge: the largest term of the owners on it. A re-measure within one owner replaces that owner's
+  term; it does not merge with itself.
+- An owner's terms leave only by its own key: the load's rollback, or the slot's release at teardown. Each drop
+  republishes the merge, so a model that stays live beside one that unloaded reads its own term again, not the larger
+  one that left. There is no whole-table clear and none at the load entry.
+- A newer generation of a slot that finds its predecessor's terms still standing removes them on every device, not only
+  the one it reserves on, and WARNs once per device
+  `[LOAD-PLAN] planned load terms of slot S generation G were still standing on device N`, because those are terms
+  that a rollback or a release did not drop. A slot is reserved again only after its release, so an older generation's
+  term on any device has no owner left to drop it.
 - The `[SCRATCH-STATS] ... compute_buffer=` landing line ends with `planned_compute_term=<MiB>`. That is the positive
   control. A buffer that lands `zone=runtime` beside a nonzero term is the reservation at work. One that lands
   `zone=raw` beside a nonzero term is a reservation that did not hold it.

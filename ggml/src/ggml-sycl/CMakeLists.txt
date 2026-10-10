@@ -6637,6 +6637,25 @@ set_tests_properties(sycl-compute-refusal-advice PROPERTIES
     TIMEOUT 30
 )
 
+# The planned load terms by owner (llama.cpp-ihk6, canonical contract 12.4): each model's compute and state term per
+# device keyed by (slot, generation), the merge a device reads, and drops that remove only the owner's own. Header-only,
+# no SYCL: the header takes GGML_SYCL_MAX_DEVICES from ggml-sycl.h, hence the public include directory. Deliberately no
+# ONEAPI_DEVICE_SELECTOR: it never enumerates or submits to a device.
+add_executable(test-planned-load-terms
+    tests/test-planned-load-terms.cpp
+)
+target_include_directories(test-planned-load-terms PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+set_target_properties(test-planned-load-terms PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-planned-load-terms COMMAND test-planned-load-terms)
+set_tests_properties(sycl-planned-load-terms PROPERTIES
+    LABELS "sycl;memory;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
 # Ordered address-range index behind the runtime allocation registry's containment lookup (llama.cpp-ii25): innermost
 # containing range, bounds, nesting, erase/rekey, a brute-force oracle over random ranges, and a 100k-row microbench
 # against the linear scan it replaces. Header-only, no SYCL.

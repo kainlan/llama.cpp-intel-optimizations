@@ -131,11 +131,11 @@ explicitly labeled **unscoped lexical candidates**: they do not resolve C++
 bindings and therefore never establish lifecycle reset/teardown. An empty
 candidate search is likewise not proof of no access.
 
-At audited source commit `fefb929808417c662a1e976f018bfb783c0b6281`, the
-census emits **1,451 object rows**: 516 explicitly-static non-local objects,
-87 non-local objects with implicit static storage duration, 841 function-local
-static/thread-local objects, and 7 class static declarations. Per-file rows are 1,160
-(`ggml-sycl.cpp`), 231 (`unified-cache.cpp`), 11 (`unified-cache.hpp`), 47
+At audited source commit `b15c1ef55468296a71519730b20e7bee1163b321`, the
+census emits **1,566 object rows**: 579 explicitly-static non-local objects,
+106 non-local objects with implicit static storage duration, 874 function-local
+static/thread-local objects, and 7 class static declarations. Per-file rows are 1,217
+(`ggml-sycl.cpp`), 280 (`unified-cache.cpp`), 16 (`unified-cache.hpp`), 51
 (`fattn.cpp`), and 2 (`layer-streaming.cpp`). The script prints SHA-256 for
 every input so this result can be tied to exact source bytes.
 
@@ -151,27 +151,28 @@ so a row-for-row comparison would be invented. Structurally, they expand in
 both directions: multi-object declarations produce multiple object rows,
 while static functions/prototypes are not storage objects; the parser also
 adds the objects a column-zero lexical pass does not cover (at the audited
-commit above: 87 implicit non-local objects, 841 function-local
+commit above: 106 implicit non-local objects, 874 function-local
 static/thread-local objects, and 7 class statics). No comparison is made to the
 historical 329 figure because it likewise lacks a source SHA and method.
 
 ### Parse coverage and fail-closed behavior
 
 Tree-sitter reports 50 raw recovery/missing nodes in `ggml-sycl.cpp`, 10 in
-`fattn.cpp`, 3 in `unified-cache.hpp`, and 2 in `unified-cache.cpp` (one
+`fattn.cpp`, 5 in `unified-cache.hpp`, and 2 in `unified-cache.cpp` (one
 function signature, one function body); `layer-streaming.cpp` parses without
 recovery. The `ggml-sycl.cpp` sites are
 from nested preprocessor alternatives, declaration-prefix macros
 (`GGML_API`, `__dpct_inline__`), conditional `else` arms, and formatting-macro
 tokens such as `PRId64`; the `fattn.cpp` ones are dispatch macro invocations and a label
-next to a conditional compilation boundary; the three `unified-cache.hpp` sites are
+next to a conditional compilation boundary; the five `unified-cache.hpp` sites are
 defaulted const-reference parameters, which grammar ABI 15 misparses.
 These are **explicit raw-parser recovery sites**, not silently discarded
-regions. Each of the 65 nodes must receive a structural proof category. In the
+regions. Each of the 67 nodes must receive a structural proof category. In the
 current inputs, 24 are confined to parsed function signature/storage spans,
-35 are in parsed or unambiguously recovered function bodies, and 3 are the
+35 are in parsed or unambiguously recovered function bodies, 5 are the
 defaulted const-reference parameter shape, which is proved by an anchored
-spelling match and fails closed on every near miss. Recovered function
+spelling match and fails closed on every near miss, and 3 are
+preprocessor-condition non-declarations. Recovered function
 regions end at the lexically balanced closing brace (with comments and literals
 masked); an oversized `ERROR` node's tail must independently consist of parsed
 top-level constructs or the census fails. Parsed `function_definition` and `lambda_expression` nodes receive the same
@@ -185,8 +186,8 @@ functions, preventing later file-scope declarations from inheriting the
 recovered function's scope. Only the signature span exempts a function's own
 `static` storage-class marker. Body recovery is accepted only when every
 `static`/`thread_local` marker in it independently belongs to a parsed
-declaration; an unparsed marker fails the census. The remaining 3 sites are
-confined to `#if` condition lines, which cannot contain a declaration.
+declaration; an unparsed marker fails the census. The 3 preprocessor-condition
+sites are confined to `#if` condition lines, which cannot contain a declaration.
 Structural preprocessor recovery spanning a conditional body is not exempt. Any
 other namespace/file recovery is rejected because it could conceal an
 implicit-static object of a user-defined type or direct-initialization spelling.
@@ -323,6 +324,7 @@ awk 'NR>=4614 && NR<=4615 { print NR ":" $0 }' ggml/src/ggml-sycl/common.hpp
 | recorded/replayed graph and pointer tables | `(ContextId, GraphEpoch)` | retiring completion releases only old-epoch resources and cannot mutate current state |
 | async kernel/copy lifetime | exact mem/backing handles plus copied `(device, ModelId, ContextId, GraphEpoch, InvocationId)` token | one context/epoch; each device is OPEN→SEALED→COMPLETE or QUARANTINED with registered producer/submit counts; no root release while OPEN |
 | tier verdict | `LoadTxnId`/`ModelId` immutable report | reporting only; no placement, routing, reset, or teardown branch |
+| planned load terms (compute, state; `g_planned_load_terms`, merged into `g_planned_compute_term_bytes`/`g_planned_state_term_bytes`) | `(slot, SlotGeneration)`, minted at `begin_outer` before the reserves run; the write needs the open `LoadTxnId`'s load-effect lease | decided in `llama.cpp-ihk6` (owner ruling 2026-10-10, owner-keyed): each owner keeps its own contribution per device and the device reads the max over live owners; rollback and slot release drop only that owner; the load-entry and last-model-out whole-table clears are removed |
 
 IDs/generations, including `InvocationId` and `SessionResetEpoch`, are checked
 and nonwrapping. Slot 33 fails with typed `SLOT_EXHAUSTED` before LOADING and

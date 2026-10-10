@@ -9,16 +9,21 @@ outside the arena, in the external headroom, while its 512 MB chunk fit no tier 
 The fix this gate pins: the load measures the compute buffer at the probe placement and hands its per-chunk peaks to
 ggml_backend_sycl_load_reserve_compute_term, which sizes a planned RUNTIME term from them at the RUNTIME TLSF's grain
 (zone_compute_term_bytes, no headroom) and stores it beside the dense scratch terms. The RUNTIME zone requirement
-folds it in, so the zone is sized for the buffer before the weight pack; the ring re-plan leaves it that room; the
-landing line names it; and it is dropped where no model is live, so a next load never inherits it. Around it: the
-early inventory plan stages the probe plan the PROBE measure installs, the admitted check's units export answers the
-reserve's own sizing rule, and the measure override's install proc answers only the name of its kv_shape form.
+folds it in, so the zone is sized for the buffer before the weight pack; the ring re-plan leaves it that room; and the
+landing line names it. Around it: the early inventory plan stages the probe plan the PROBE measure installs, the
+admitted check's units export answers the reserve's own sizing rule, and the measure override's install proc answers
+only the name of its kv_shape form.
 
 The state term beside it: the context memory the measure placed on a device's plain buffer type (Qwen3.8's recurrent
 state, 112.6 MiB on the B70) is allocated RUNTIME-first before the compute buffer, so the term alone did not hold the
 buffer (the 512 MB chunk landed raw). ggml_backend_sycl_load_reserve_state_term sizes it at the same grain and stores
-it as its own planned RUNTIME term, which the requirement and the ring count beside the compute term and the clear
-drops with it.
+it as its own planned RUNTIME term, which the requirement and the ring count beside the compute term.
+
+Owner-keyed (llama.cpp-ihk6, canonical contract 12.4): both terms are each owner's own contribution, keyed by the model
+slot and slot generation of the load that measured them; the device reads the merge over its owners. The reserve keys
+its store by the open load's owner under that load's effect; a load's rollback and a slot's release each drop only
+their owner's contribution and republish the merge; and no production code clears the whole table. The table itself
+is unit-tested in ggml/src/ggml-sycl/tests/test-planned-load-terms.cpp; this gate pins how the backend reaches it.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -106,17 +111,73 @@ def ordered(text: str, *needles: str) -> bool:
     return True
 
 
+def _skip_literal(text: str, i: int) -> int:
+    """The index just past the string or character literal that opens at `i`."""
+    quote, j, n = text[i], i + 1, len(text)
+    while j < n and text[j] != quote:
+        j += 2 if text[j] == "\\" else 1
+    return j + 1
+
+
+def depth_at(text: str, pos: int) -> int:
+    """The brace depth at `pos` (literals skipped). In a body() result a statement of the function itself is at 1."""
+    depth, i = 0, 0
+    while 0 <= i < pos:
+        if text[i] in "\"'":
+            i = _skip_literal(text, i)
+            continue
+        depth += {"{": 1, "}": -1}.get(text[i], 0)
+        i += 1
+    return depth
+
+
+def block_end(text: str, pos: int) -> int:
+    """The index of the brace closing the innermost block that contains `pos` (literals skipped); -1 when none."""
+    depth, i = 0, pos
+    while 0 <= i < len(text):
+        if text[i] in "\"'":
+            i = _skip_literal(text, i)
+            continue
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            if depth == 0:
+                return i
+            depth -= 1
+        i += 1
+    return -1
+
+
 RESERVE_SIG = "bool ggml_backend_sycl_load_reserve_compute_term(ggml_sycl_load_txn txn,"
+OPEN_EFFECT = "const auto effect = ggml_sycl::lifecycle::global_registry().acquire_load_effect({ txn.id });"
 SIZE_SIG = "static bool ggml_sycl_load_compute_term_size(const uint64_t * chunk_bytes, uint32_t n_chunks, size_t * out)"
 UNITS_SIG = "bool ggml_backend_sycl_load_compute_term_bytes(const uint64_t * chunk_bytes, uint32_t n_chunks, uint64_t * out)"
-SETTER_SIG = "bool unified_cache_set_planned_compute_term(int device_id, size_t bytes, bool other_model_live)"
+SETTER_SIG = "bool unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes)"
+SET_TERM_SIG = "static bool unified_cache_set_planned_load_term(int device_id, lifecycle::SlotToken owner,"
+PUBLISH_SIG = "static void planned_load_terms_publish_locked()"
+DROP_SIG = "bool unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner)"
 REQ_SIG = "bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out)"
 TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
 LANDING_SIG = "static void ggml_sycl_log_compute_buffer_landing(int device, const std::string & name, size_t size,"
 LOAD_SIG = "static void ggml_sycl_model_loading_effects(bool loading, bool outer)"
 TEARDOWN_SIG = "static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner)"
 ABORT_SIG = "static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelToken owner,"
-CLEAR = "ggml_sycl::unified_cache_clear_planned_load_terms();"
+DROP_CALL = "(void) ggml_sycl::unified_cache_drop_planned_load_terms(owner.owner);"
+DROP_DECL = "bool unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner) noexcept;"
+DROP_DEF = "bool unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner) noexcept {"
+STALE_LOOP = "for (int stale_device = 0; stale_device < GGML_SYCL_MAX_DEVICES; ++stale_device) {"
+# The owner store's shape, with its local names captured rather than pinned.
+GUARD_RE = re.compile(r"std::lock_guard<std::mutex> \w+\(g_planned_load_terms\.mutex\);")
+OWNER_SET_RE = re.compile(
+    r"if \(!g_planned_load_terms\.owners\.set\(device_id, owner, term, bytes, &(\w+)\)\) \{ return false; \}")
+PUBLISH_CALL = "planned_load_terms_publish_locked();"
+DEVICE_LOOP_RE = re.compile(r"for \(int (\w+) = 0; \1 < GGML_SYCL_MAX_DEVICES; \+\+\1\) \{")
+# Every way to write the merged atomics: the atomic writers, assignment and compound assignment, and increments.
+MERGE_WRITE_RE = re.compile(
+    r"(?:\+\+|--)\s*g_planned_(?:compute|state)_term_bytes\b"
+    r"|\bg_planned_(?:compute|state)_term_bytes\s*\[[^\]]*\]\s*"
+    r"(?:\.\s*(?:store|exchange|fetch_\w+|compare_exchange_\w+)\s*\(|(?:<<|>>|[-+*/%&|^])?=(?!=)|\+\+|--)")
+HEADER = read("ggml/src/ggml-sycl/unified-cache.hpp")
 STAGE_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory * inventory,"
 STAGE_PROBE = ("if (early) { const uint64_t txn = effect.owner.load.value; "
                "const auto candidate = ggml_sycl::lifecycle_find_candidate_placement_plan(txn); "
@@ -135,18 +196,20 @@ def claim_the_units_are_the_grain_at_the_buffer_alignment(sycl: str) -> bool:
 
 def claim_reserve_sizes_at_the_grain_and_writes_only_the_term(sycl: str) -> bool:
     """The export admits the mutation, refuses a closed txn, n_ctx 0, a bad device and a device with no arena, then
-    stores exactly what the reservation's units answered: no headroom, no ledger."""
+    stores exactly what the reservation's units answered as the open load's own contribution: no headroom, no ledger.
+    The load effect is the one source for both "is this the open load" and "who owns it" (llama.cpp-ihk6): no second
+    open-transaction read, no live-model mask."""
     b = body(norm(sycl), RESERVE_SIG)
     return (claim_the_units_are_the_grain_at_the_buffer_alignment(sycl) and bool(b) and ordered(
-        b, "sycl_module_mutation_guard module_guard;", "if (!module_guard) { return false; }",
-        "if (!ggml_sycl_load_txn_is_open(txn.id))", "else if (n_ctx == 0)",
+        b, "sycl_module_mutation_guard module_guard;", "if (!module_guard) { return false; }", OPEN_EFFECT,
+        "if (!effect) {", "else if (n_ctx == 0)",
         "else if (device < 0 || device >= ggml_sycl_info().total_gpu_count || device >= GGML_SYCL_MAX_DEVICES)",
         "if (cache == nullptr || !cache->arena_active())",
         "else if (!ggml_sycl_load_compute_term_size(chunk_bytes, n_chunks, &bytes))",
-        "else if (!ggml_sycl::unified_cache_set_planned_compute_term(device, bytes, "
-        "ggml_sycl::lifecycle::global_registry().live_mask() != 0))",
+        "else if (!ggml_sycl::unified_cache_set_planned_compute_term(device, effect.owner.owner, bytes))",
         "if (why != nullptr)", "return false;", "return true;")
-        and b.count("unified_cache_set_planned_compute_term(") == 1
+        and b.count("unified_cache_set_planned_compute_term(") == 1 and b.count("acquire_load_effect(") == 1
+        and "ggml_sycl_load_txn_is_open" not in b and "live_mask" not in b
         and "ledger" not in b and "ggml_sycl_load_record_compute_term" not in b)
 
 
@@ -163,12 +226,48 @@ def claim_the_units_export_is_the_reserves_rule_and_stateless(sycl: str) -> bool
                  "return (void *) ggml_backend_sycl_load_compute_term_bytes; }") in norm(sycl))
 
 
-def claim_setter_merges_like_the_dense_terms(cache: str) -> bool:
-    """Device-global term: while another model is live the larger of the stored and the new term stays."""
-    b = body(norm(cache), SETTER_SIG)
-    return (bool(b) and "if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) { return false; }" in b
-            and "zone_dense_scratch_merge_input(g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire), "
-                "bytes, other_model_live)" in b)
+def claim_owner_store_republishes_under_the_lock(cache: str) -> bool:
+    """One owner's term (llama.cpp-ihk6): the owner table replaces that owner's value, and the merge the readers load is
+    republished for every device in the same locked step, so a merge computed before a later contribution cannot be
+    published over it, and a device the store swept a stale contribution off is republished too. Each swept device is
+    named after the lock is released. No device-global merge input and no live-model flag remain."""
+    t = norm(cache)
+    b = body(t, SET_TERM_SIG)
+    guard = GUARD_RE.search(b) if b else None
+    if guard is None or b.count(PUBLISH_CALL) != 1:
+        return False
+    scope_end = block_end(b, guard.end())
+    stored = OWNER_SET_RE.search(b, guard.end())
+    published = b.find(PUBLISH_CALL, guard.end())
+    loop = DEVICE_LOOP_RE.search(b, scope_end) if scope_end >= 0 else None
+    if stored is None or loop is None or not (stored.end() <= published < scope_end):
+        return False
+    loop_body = b[loop.end():block_end(b, loop.end())]
+    swept = "%s.generation[%s]" % (stored.group(1), loop.group(1))
+    return ("GGML_LOG_WARN(" in loop_body and "were still standing on device %d" in loop_body and swept in loop_body
+            and "zone_dense_scratch_merge_input" not in b and "other_model_live" not in b)
+
+
+def claim_publish_is_the_merge_with_release(cache: str) -> bool:
+    """The device-visible terms are the owner table's merge on every device, both stored with release semantics, and
+    nothing else writes them: no whole-table clear, no second writer, whether by store, exchange, read-modify-write,
+    assignment or increment."""
+    t = norm(cache)
+    b = body(t, PUBLISH_SIG)
+    return (bool(b) and ordered(
+        b, "for (int device_id = 0; device_id < GGML_SYCL_MAX_DEVICES; ++device_id) {",
+        "g_planned_compute_term_bytes[device_id].store("
+        "g_planned_load_terms.owners.merged(device_id, planned_load_term::COMPUTE), std::memory_order_release);",
+        "g_planned_state_term_bytes[device_id].store(g_planned_load_terms.owners.merged(device_id, "
+        "planned_load_term::STATE), std::memory_order_release);")
+            and len(MERGE_WRITE_RE.findall(t)) == 2 and len(MERGE_WRITE_RE.findall(b)) == 2)
+
+
+def claim_setter_stores_the_owners_term(cache: str) -> bool:
+    """The compute setter is the owner store for the compute term, and carries the owner instead of a live flag."""
+    return (body(norm(cache), SETTER_SIG)
+            == "{ return unified_cache_set_planned_load_term(device_id, owner, planned_load_term::COMPUTE, bytes); }"
+            and claim_owner_store_republishes_under_the_lock(cache) and claim_publish_is_the_merge_with_release(cache))
 
 
 # ---- (b) the term is drawn against: requirement, ring admission, landing line --------------------------------------
@@ -199,30 +298,63 @@ def claim_landing_line_names_the_term(sycl: str) -> bool:
             and "ggml_sycl::unified_cache_get_planned_compute_term_bytes(device)" in b)
 
 
-# ---- (c) the term is dropped where no model is live ----------------------------------------------------------------
+# ---- (c) the terms leave by their owner's key (llama.cpp-ihk6, canonical contract 12.4) ---------------------------
 
 
-def claim_load_entry_clears_with_no_model_live(sycl: str) -> bool:
-    b = body(norm(sycl), LOAD_SIG)
-    return bool(b) and ordered(
-        b, "if (outer) {", "const uint32_t live_mask = ggml_sycl::lifecycle::global_registry().live_mask();",
-        "if (live_mask == 0) { " + CLEAR + " }")
+def claim_drop_removes_the_owner_and_republishes(cache: str) -> bool:
+    """A drop removes one owner's contributions and republishes every device's merge under the same lock."""
+    return body(norm(cache), DROP_SIG) == (
+        "{ std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex); "
+        "if (!g_planned_load_terms.owners.drop(owner)) { return false; } "
+        "planned_load_terms_publish_locked(); return true; }")
 
 
-def claim_teardown_clears_with_no_other_model_and_no_load(sycl: str) -> bool:
+def claim_the_drop_cannot_throw(cache: str, header: str) -> bool:
+    """The drop is noexcept where it is declared and where it is defined, which is what lets the rollback call it
+    outside every try stage (and outside the frozen catch-handler debt of that function)."""
+    return DROP_DECL in norm(header) and DROP_DEF in norm(cache)
+
+
+def claim_teardown_drops_only_its_slot(sycl: str) -> bool:
+    """The released slot drops its own contribution, unconditionally: whether another model is live or a load is in
+    flight decides nothing, because neither owns this slot's term."""
     b = body(norm(sycl), TEARDOWN_SIG)
-    return bool(b) and ordered(
-        b, "const size_t reclaimed = ggml_sycl::unified_cache_release_model_slot(slot);",
-        "const uint32_t others_live = ggml_sycl::lifecycle::global_registry().live_mask() & "
-        "(slot < 32 ? ~(1u << slot) : ~0u);",
-        "if (others_live == 0 && !g_sycl_in_model_load.load(std::memory_order_acquire)) { " + CLEAR + " }")
+    return (bool(b) and b.count(DROP_CALL) == 1 and b.count("unified_cache_drop_planned_load_terms(") == 1
+            and depth_at(b, b.find(DROP_CALL)) == 1 and "live_mask" not in b and "g_sycl_in_model_load" not in b)
 
 
-def claim_abort_clears_with_no_model_live(sycl: str) -> bool:
+def claim_abort_drops_only_its_owner(sycl: str) -> bool:
+    """The aborted load drops its own contribution after the last try stage, whichever stage that is, unconditionally
+    and outside any try, so no failed stage before it skips it and no catch handler is added for it; whatever is live
+    is left alone."""
     b = body(norm(sycl), ABORT_SIG)
-    return bool(b) and ordered(
-        b, "ggml_sycl_reset_model_load_scratch_state(true);",
-        "if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) { " + CLEAR + " }")
+    return (bool(b) and b.endswith("} catch (...) { clean = false; } " + DROP_CALL + " return clean; }")
+            and b.count("unified_cache_drop_planned_load_terms(") == 1 and depth_at(b, b.find(DROP_CALL)) == 1
+            and "live_mask" not in b)
+
+
+def claim_load_entry_leaves_the_terms_alone(sycl: str) -> bool:
+    """A new load's entry is no reset point for anybody's terms: a contribution without a live owner cannot exist,
+    so there is nothing for it to clear."""
+    b = body(norm(sycl), LOAD_SIG)
+    return (bool(b) and "if (outer) {" in b and "planned_load_terms" not in b
+            and "planned_compute_term" not in b and "planned_state_term" not in b)
+
+
+def claim_only_the_owner_ends_drop(sycl: str, cache: str, header: str) -> bool:
+    """No whole-table clear survives anywhere, and the only drops are the two owner ends: the slot release and the
+    rollback."""
+    t = norm(sycl)
+    calls = [m.start() for m in re.finditer(r"\bunified_cache_drop_planned_load_terms\(", t)]
+    spans = []
+    for sig in (TEARDOWN_SIG, ABORT_SIG):
+        b = body(t, sig)
+        at = t.find(b) if b else -1
+        spans.append((at, at + len(b)) if at >= 0 else (-1, -1))
+    return (len(calls) == 2 and all(any(a <= c < z for a, z in spans) for c in calls)
+            and all(sum(1 for c in calls if a <= c < z) == 1 for a, z in spans)
+            and all("clear_planned_load_terms" not in norm(x) for x in (sycl, cache, header))
+            and len(re.findall(r"\bunified_cache_drop_planned_load_terms\(", norm(cache))) == 1)
 
 
 # ---- (b0) the probe plan is staged by the early inventory plan -----------------------------------------------------
@@ -267,8 +399,8 @@ def test_the_units_export_is_the_reserves_rule_and_stateless():
     assert claim_the_units_export_is_the_reserves_rule_and_stateless(SYCL)
 
 
-def test_the_setter_merges_like_the_dense_terms():
-    assert claim_setter_merges_like_the_dense_terms(CACHE)
+def test_the_setter_stores_the_owners_term():
+    assert claim_setter_stores_the_owners_term(CACHE)
 
 
 def test_the_requirement_folds_in_the_term():
@@ -283,10 +415,28 @@ def test_the_landing_line_names_the_term():
     assert claim_landing_line_names_the_term(SYCL)
 
 
-def test_the_term_is_dropped_where_no_model_is_live():
-    assert claim_load_entry_clears_with_no_model_live(SYCL)
-    assert claim_teardown_clears_with_no_other_model_and_no_load(SYCL)
-    assert claim_abort_clears_with_no_model_live(SYCL)
+def test_the_drop_removes_the_owner_and_republishes():
+    assert claim_drop_removes_the_owner_and_republishes(CACHE)
+
+
+def test_the_slot_release_drops_only_its_slot():
+    assert claim_teardown_drops_only_its_slot(SYCL)
+
+
+def test_the_abort_drops_only_its_owner():
+    assert claim_abort_drops_only_its_owner(SYCL)
+
+
+def test_the_drop_cannot_throw():
+    assert claim_the_drop_cannot_throw(CACHE, HEADER)
+
+
+def test_the_load_entry_leaves_the_terms_alone():
+    assert claim_load_entry_leaves_the_terms_alone(SYCL)
+
+
+def test_only_the_owner_ends_drop_and_nothing_clears_the_table():
+    assert claim_only_the_owner_ends_drop(SYCL, CACHE, HEADER)
 
 
 # ---- mutants: every claim must fail against the thing it forbids --------------------------------------------------
@@ -302,13 +452,12 @@ def _once(raw: str, old: str, new: str, within: str = "") -> str:
     return text.replace(scope, scope.replace(o, n, 1), 1) if within else text.replace(o, n, 1)
 
 
-_TERM_SET = ("} else if (!ggml_sycl::unified_cache_set_planned_compute_term("
-             "device, bytes, ggml_sycl::lifecycle::global_registry().live_mask() != 0)) {")
+_TERM_SET = "} else if (!ggml_sycl::unified_cache_set_planned_compute_term(device, effect.owner.owner, bytes)) {"
 
 
 def test_mutant_reserve_with_headroom_fails():
     assert not claim_reserve_sizes_at_the_grain_and_writes_only_the_term(
-        _once(SYCL, _TERM_SET, _TERM_SET.replace("device, bytes,", "device, bytes + bytes / 8,")))
+        _once(SYCL, _TERM_SET, _TERM_SET.replace("effect.owner.owner, bytes)", "effect.owner.owner, bytes + bytes / 8)")))
 
 
 _SIZE_CALL = "return ggml_sycl::zone_compute_term_bytes(chunk_bytes, n_chunks, GGML_SYCL_BUFFER_BASE_ALIGNMENT, out);"
@@ -335,7 +484,8 @@ def test_mutant_units_export_with_its_own_rule_fails():
 def test_mutant_units_export_writing_the_planner_term_fails():
     assert not claim_the_units_export_is_the_reserves_rule_and_stateless(
         _once(SYCL, "*out = static_cast<uint64_t>(bytes);",
-              "*out = static_cast<uint64_t>(bytes); (void) ggml_sycl::unified_cache_set_planned_compute_term(0, bytes);"))
+              "*out = static_cast<uint64_t>(bytes); (void) ggml_sycl::unified_cache_set_planned_compute_term("
+              "0, ggml_sycl::lifecycle::SlotToken{ 0, 1 }, bytes);"))
 
 
 def test_mutant_units_proc_not_answered_fails():
@@ -346,7 +496,12 @@ def test_mutant_units_proc_not_answered_fails():
 
 def test_mutant_reserve_on_a_closed_txn_fails():
     assert not claim_reserve_sizes_at_the_grain_and_writes_only_the_term(
-        _once(SYCL, "if (!ggml_sycl_load_txn_is_open(txn.id)) {", "if (false) {", within=RESERVE_SIG))
+        _once(SYCL, "if (!effect) {", "if (false) {", within=RESERVE_SIG))
+
+
+def test_mutant_reserve_asking_the_open_txn_twice_fails():
+    assert not claim_reserve_sizes_at_the_grain_and_writes_only_the_term(
+        _once(SYCL, "if (!effect) {", "if (!effect || !ggml_sycl_load_txn_is_open(txn.id)) {", within=RESERVE_SIG))
 
 
 def test_mutant_reserve_without_the_arena_check_fails():
@@ -360,16 +515,107 @@ def test_mutant_reserve_writing_the_ledger_fails():
               _TERM_SET + " (void) ggml_sycl_load_record_compute_term(txn.id, device, bytes, n_ctx);"))
 
 
-def test_mutant_reserve_replacing_a_live_models_term_fails():
+def test_mutant_reserve_keyed_by_a_fixed_owner_fails():
     assert not claim_reserve_sizes_at_the_grain_and_writes_only_the_term(
-        _once(SYCL, _TERM_SET, _TERM_SET.replace("live_mask() != 0", "live_mask() != 0 && false")))
+        _once(SYCL, _TERM_SET, _TERM_SET.replace("effect.owner.owner", "ggml_sycl::lifecycle::SlotToken{ 0, 1 }")))
 
 
-def test_mutant_setter_overwriting_fails():
-    assert not claim_setter_merges_like_the_dense_terms(
-        _once(CACHE, "zone_dense_scratch_merge_input(g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire), "
-                     "bytes, other_model_live)",
-              "bytes"))
+def test_mutant_reserve_keyed_by_the_live_mask_fails():
+    assert not claim_reserve_sizes_at_the_grain_and_writes_only_the_term(
+        _once(SYCL, _TERM_SET, _TERM_SET.replace(
+            "effect.owner.owner", "ggml_sycl::lifecycle::SlotToken{ ggml_sycl::lifecycle::global_registry().live_mask(), 1 }")))
+
+
+_OWNER_SET = "if (!g_planned_load_terms.owners.set(device_id, owner, term, bytes, &replaced)) { return false; }"
+_PUBLISH_ONE = "planned_load_terms_publish_locked(); }"
+
+
+def test_mutant_setter_back_to_a_device_global_merge_fails():
+    assert not claim_setter_stores_the_owners_term(
+        _once(CACHE, _OWNER_SET,
+              "g_planned_compute_term_bytes[device_id].store(zone_dense_scratch_merge_input("
+              "g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire), bytes, other_model_live), "
+              "std::memory_order_release);", within=SET_TERM_SIG))
+
+
+def test_mutant_setter_not_republishing_fails():
+    assert not claim_setter_stores_the_owners_term(_once(CACHE, _PUBLISH_ONE, "}", within=SET_TERM_SIG))
+
+
+def test_mutant_setter_republishing_outside_the_lock_fails():
+    assert not claim_setter_stores_the_owners_term(
+        _once(CACHE, _OWNER_SET + " " + _PUBLISH_ONE, _OWNER_SET + " } planned_load_terms_publish_locked();",
+              within=SET_TERM_SIG))
+
+
+def _rename(raw: str, within: str, old: str, new: str) -> str:
+    """Every whole-word `old` renamed to `new` in the body of `within`, on norm() text: a refactor, not a mutant."""
+    text = norm(raw)
+    scope = body(text, within)
+    assert re.search(r"\b%s\b" % re.escape(old), scope), f"rename target {old!r} absent"
+    return text.replace(scope, re.sub(r"\b%s\b" % re.escape(old), new, scope), 1)
+
+
+def test_control_setter_with_its_locals_renamed_passes():
+    """Property, not spelling: the guard, the swept record and the loop index may take any name."""
+    renamed = _rename(_rename(_rename(CACHE, SET_TERM_SIG, "lock", "guard"), SET_TERM_SIG, "replaced", "swept"),
+                      SET_TERM_SIG, "stale_device", "d")
+    assert claim_owner_store_republishes_under_the_lock(renamed)
+    assert claim_setter_stores_the_owners_term(renamed)
+
+
+def test_mutant_setter_naming_only_the_storing_device_fails():
+    assert not claim_setter_stores_the_owners_term(
+        _once(CACHE, STALE_LOOP, "for (int stale_device = device_id; stale_device == device_id; ++stale_device) {",
+              within=SET_TERM_SIG))
+
+
+def test_mutant_compute_setter_storing_the_state_term_fails():
+    assert not claim_setter_stores_the_owners_term(
+        _once(CACHE, "return unified_cache_set_planned_load_term(device_id, owner, planned_load_term::COMPUTE, bytes);",
+              "return unified_cache_set_planned_load_term(device_id, owner, planned_load_term::STATE, bytes);"))
+
+
+def test_mutant_setter_carrying_the_live_flag_fails():
+    assert not claim_setter_stores_the_owners_term(
+        _once(CACHE, SETTER_SIG, "bool unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, "
+                                 "size_t bytes, bool other_model_live)"))
+
+
+def test_mutant_publish_relaxed_fails():
+    assert not claim_publish_is_the_merge_with_release(
+        _once(CACHE, "g_planned_load_terms.owners.merged(device_id, planned_load_term::COMPUTE), std::memory_order_release);",
+              "g_planned_load_terms.owners.merged(device_id, planned_load_term::COMPUTE), std::memory_order_relaxed);"))
+
+
+def test_mutant_a_second_writer_of_the_merge_fails():
+    assert not claim_publish_is_the_merge_with_release(
+        _once(CACHE, "size_t unified_cache_get_planned_state_term_bytes(int device_id) {",
+              "void unified_cache_zero_planned_state_terms() { for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) { "
+              "g_planned_state_term_bytes[d].store(0, std::memory_order_release); } } "
+              "size_t unified_cache_get_planned_state_term_bytes(int device_id) {"))
+
+
+def test_mutant_an_exchange_writer_of_the_merge_fails():
+    assert not claim_publish_is_the_merge_with_release(
+        _once(CACHE, "size_t unified_cache_get_planned_state_term_bytes(int device_id) {",
+              "void unified_cache_zero_planned_state_terms() { for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) { "
+              "(void) g_planned_state_term_bytes[d].exchange(0, std::memory_order_acq_rel); } } "
+              "size_t unified_cache_get_planned_state_term_bytes(int device_id) {"))
+
+
+def test_mutant_an_assignment_writer_of_the_merge_fails():
+    assert not claim_publish_is_the_merge_with_release(
+        _once(CACHE, "size_t unified_cache_get_planned_compute_term_bytes(int device_id) {",
+              "void unified_cache_zero_planned_compute_terms() { for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) { "
+              "g_planned_compute_term_bytes[d] = 0; } } "
+              "size_t unified_cache_get_planned_compute_term_bytes(int device_id) {"))
+
+
+def test_mutant_publish_for_one_device_only_fails():
+    assert not claim_publish_is_the_merge_with_release(
+        _once(CACHE, "for (int device_id = 0; device_id < GGML_SYCL_MAX_DEVICES; ++device_id) {",
+              "for (int device_id = 0; device_id < 1; ++device_id) {", within=PUBLISH_SIG))
 
 
 def test_mutant_requirement_without_the_term_fails():
@@ -393,28 +639,112 @@ def test_mutant_landing_line_without_the_term_fails():
         _once(SYCL, "zone=%s planned_compute_term=%.1f MiB\\n", "zone=%s\\n"))
 
 
-def test_mutant_load_entry_clear_dropped_fails():
-    assert not claim_load_entry_clears_with_no_model_live(
-        _once(SYCL, "if (live_mask == 0) { ggml_sycl::unified_cache_clear_planned_load_terms();", "if (live_mask == 0) { ;"))
+_RELEASE_CALLS = "g_sycl_lifecycle_release_slot_calls.fetch_add(1, std::memory_order_relaxed);"
+_RESET_STAGE_END = "ggml_sycl_reset_model_load_scratch_state(true); } catch (...) { clean = false; }"
 
 
-def test_mutant_load_entry_clears_beside_a_live_model_fails():
-    assert not claim_load_entry_clears_with_no_model_live(
-        _once(SYCL, "if (live_mask == 0) { ggml_sycl::unified_cache_clear_planned_load_terms();",
-              "if (true) { ggml_sycl::unified_cache_clear_planned_load_terms();"))
+def test_mutant_drop_not_republishing_fails():
+    assert not claim_drop_removes_the_owner_and_republishes(
+        _once(CACHE, "planned_load_terms_publish_locked(); return true;", "return true;", within=DROP_SIG))
 
 
-def test_mutant_teardown_clears_during_a_load_fails():
-    assert not claim_teardown_clears_with_no_other_model_and_no_load(
-        _once(SYCL, "if (others_live == 0 && !g_sycl_in_model_load.load(std::memory_order_acquire)) {",
-              "if (others_live == 0) {"))
+def test_mutant_drop_declared_throwing_fails():
+    assert not claim_the_drop_cannot_throw(CACHE, _once(HEADER, DROP_DECL, DROP_DECL.replace(" noexcept;", ";")))
 
 
-def test_mutant_abort_clear_dropped_fails():
-    assert not claim_abort_clears_with_no_model_live(
-        _once(SYCL, "if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) { "
-                    "ggml_sycl::unified_cache_clear_planned_load_terms();",
-              "if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) { ;", within=ABORT_SIG))
+def test_mutant_drop_defined_throwing_fails():
+    assert not claim_the_drop_cannot_throw(_once(CACHE, DROP_DEF, DROP_DEF.replace(" noexcept {", " {")), HEADER)
+
+
+def test_mutant_drop_clearing_every_owner_fails():
+    assert not claim_drop_removes_the_owner_and_republishes(
+        _once(CACHE, "if (!g_planned_load_terms.owners.drop(owner)) { return false; }",
+              "g_planned_load_terms.owners = planned_load_terms{};", within=DROP_SIG))
+
+
+def test_control_slot_release_dropping_first_passes():
+    """Property, not position: the release may drop its slot's terms anywhere at its top level."""
+    moved = _once(_once(SYCL, DROP_CALL, "", within=TEARDOWN_SIG), "const uint32_t slot = owner.owner.slot;",
+                  DROP_CALL + " const uint32_t slot = owner.owner.slot;", within=TEARDOWN_SIG)
+    assert claim_teardown_drops_only_its_slot(moved)
+    assert claim_only_the_owner_ends_drop(moved, CACHE, HEADER)
+
+
+def test_mutant_slot_release_not_dropping_fails():
+    assert not claim_teardown_drops_only_its_slot(_once(SYCL, DROP_CALL, "", within=TEARDOWN_SIG))
+
+
+def test_mutant_slot_release_dropping_only_when_alone_fails():
+    assert not claim_teardown_drops_only_its_slot(
+        _once(SYCL, DROP_CALL, "if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) { " + DROP_CALL + " }",
+              within=TEARDOWN_SIG))
+
+
+def test_mutant_slot_release_dropping_the_load_in_flight_fails():
+    assert not claim_teardown_drops_only_its_slot(
+        _once(SYCL, DROP_CALL,
+              "(void) ggml_sycl::unified_cache_drop_planned_load_terms("
+              "ggml_sycl::lifecycle::global_registry().current_active_slot());", within=TEARDOWN_SIG))
+
+
+def test_control_abort_with_a_stage_added_before_the_drop_passes():
+    """Property, not the stage's name: a new last try stage leaves the drop after it, still outside any try."""
+    assert claim_abort_drops_only_its_owner(
+        _once(SYCL, "} catch (...) { clean = false; } " + DROP_CALL,
+              "} catch (...) { clean = false; } try { (void) owner; } catch (...) { clean = false; } " + DROP_CALL,
+              within=ABORT_SIG))
+
+
+def test_mutant_abort_not_dropping_fails():
+    assert not claim_abort_drops_only_its_owner(_once(SYCL, DROP_CALL, "", within=ABORT_SIG))
+
+
+def test_mutant_abort_dropping_only_when_alone_fails():
+    assert not claim_abort_drops_only_its_owner(
+        _once(SYCL, DROP_CALL, "if (ggml_sycl::lifecycle::global_registry().live_mask() == 0) { " + DROP_CALL + " }",
+              within=ABORT_SIG))
+
+
+def test_mutant_abort_drop_skipped_by_a_failed_reset_fails():
+    assert not claim_abort_drops_only_its_owner(
+        _once(SYCL, _RESET_STAGE_END + " " + DROP_CALL,
+              "ggml_sycl_reset_model_load_scratch_state(true); " + DROP_CALL + " } catch (...) { clean = false; }",
+              within=ABORT_SIG))
+
+
+def test_mutant_abort_drop_in_a_try_stage_of_its_own_fails():
+    assert not claim_abort_drops_only_its_owner(
+        _once(SYCL, DROP_CALL, "try { " + DROP_CALL + " } catch (...) { clean = false; }", within=ABORT_SIG))
+
+
+def test_mutant_abort_drop_before_the_reset_fails():
+    assert not claim_abort_drops_only_its_owner(
+        _once(SYCL, "try { " + _RESET_STAGE_END + " " + DROP_CALL, DROP_CALL + " try { " + _RESET_STAGE_END,
+              within=ABORT_SIG))
+
+
+_LIVE_MASK_READ = "const uint32_t live_mask = ggml_sycl::lifecycle::global_registry().live_mask();"
+
+
+def test_mutant_load_entry_clearing_again_fails():
+    mutant = _once(SYCL, _LIVE_MASK_READ,
+                   _LIVE_MASK_READ + " if (live_mask == 0) { ggml_sycl::unified_cache_clear_planned_load_terms(); }",
+                   within=LOAD_SIG)
+    assert not claim_load_entry_leaves_the_terms_alone(mutant)
+    assert not claim_only_the_owner_ends_drop(mutant, CACHE, HEADER)
+
+
+def test_mutant_a_third_drop_site_fails():
+    assert not claim_only_the_owner_ends_drop(
+        _once(SYCL, _LIVE_MASK_READ,
+              _LIVE_MASK_READ + " (void) ggml_sycl::unified_cache_drop_planned_load_terms("
+              "ggml_sycl::lifecycle::global_registry().current_active_slot());", within=LOAD_SIG),
+        CACHE, HEADER)
+
+
+def test_mutant_a_whole_table_clear_declared_fails():
+    assert not claim_only_the_owner_ends_drop(
+        SYCL, CACHE, _once(HEADER, DROP_DECL, DROP_DECL + " void unified_cache_clear_planned_load_terms();"))
 
 
 
@@ -525,36 +855,35 @@ def test_mutant_pp_reserve_not_passing_its_n_seqs_fails():
 # ---- (d) the state term: the context memory the RUNTIME zone takes before the compute buffer ----------------------
 
 RESERVE_STATE_SIG = "bool ggml_backend_sycl_load_reserve_state_term(ggml_sycl_load_txn txn, int32_t device, uint64_t state_bytes)"
-STATE_SETTER_SIG = "bool unified_cache_set_planned_state_term(int device_id, size_t bytes, bool other_model_live)"
-CLEAR_SIG = "void unified_cache_clear_planned_load_terms()"
+STATE_SETTER_SIG = "bool unified_cache_set_planned_state_term(int device_id, lifecycle::SlotToken owner, size_t bytes)"
 
 
 def claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(sycl: str) -> bool:
     """The state export admits the mutation, refuses a closed txn, a bad device and a device with no arena, sizes the
-    one buffer at the reservation's grain and stores that as the state term: no headroom, no ledger, no compute
-    term; and the backend answers its proc name."""
+    one buffer at the reservation's grain and stores that as the open load's own state term: no headroom, no ledger,
+    no compute term; and the backend answers its proc name."""
     b = body(norm(sycl), RESERVE_STATE_SIG)
     return (claim_the_units_are_the_grain_at_the_buffer_alignment(sycl) and bool(b) and ordered(
-        b, "sycl_module_mutation_guard module_guard;", "if (!module_guard) { return false; }",
-        "if (!ggml_sycl_load_txn_is_open(txn.id))",
+        b, "sycl_module_mutation_guard module_guard;", "if (!module_guard) { return false; }", OPEN_EFFECT,
+        "if (!effect) {",
         "else if (device < 0 || device >= ggml_sycl_info().total_gpu_count || device >= GGML_SYCL_MAX_DEVICES)",
         "if (cache == nullptr || !cache->arena_active())",
         "else if (!ggml_sycl_load_compute_term_size(&state_bytes, 1, &bytes))",
-        "else if (!ggml_sycl::unified_cache_set_planned_state_term(device, bytes, "
-        "ggml_sycl::lifecycle::global_registry().live_mask() != 0))",
+        "else if (!ggml_sycl::unified_cache_set_planned_state_term(device, effect.owner.owner, bytes))",
         "if (why != nullptr)", "return false;", "return true;")
-        and b.count("unified_cache_set_planned_state_term(") == 1
+        and b.count("unified_cache_set_planned_state_term(") == 1 and b.count("acquire_load_effect(") == 1
+        and "ggml_sycl_load_txn_is_open" not in b and "live_mask" not in b
         and "unified_cache_set_planned_compute_term" not in b
         and "ledger" not in b and "ggml_sycl_load_record_compute_term" not in b
         and ('strcmp(name, "ggml_backend_sycl_load_reserve_state_term") == 0) { '
              "return (void *) ggml_backend_sycl_load_reserve_state_term; }") in norm(sycl))
 
 
-def claim_state_setter_merges_like_the_compute_term(cache: str) -> bool:
-    b = body(norm(cache), STATE_SETTER_SIG)
-    return (bool(b) and "if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) { return false; }" in b
-            and "zone_dense_scratch_merge_input(g_planned_state_term_bytes[device_id].load(std::memory_order_acquire), "
-                "bytes, other_model_live)" in b)
+def claim_state_setter_stores_the_owners_term(cache: str) -> bool:
+    """The state setter is the same owner store, for the state term."""
+    return (body(norm(cache), STATE_SETTER_SIG)
+            == "{ return unified_cache_set_planned_load_term(device_id, owner, planned_load_term::STATE, bytes); }"
+            and claim_owner_store_republishes_under_the_lock(cache) and claim_publish_is_the_merge_with_release(cache))
 
 
 def claim_requirement_folds_in_the_state_term(cache: str) -> bool:
@@ -575,19 +904,12 @@ def claim_ring_leaves_the_state_room(sycl: str) -> bool:
         "ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode, &ring_kv_zone)")
 
 
-def claim_clear_drops_both_terms(cache: str) -> bool:
-    b = body(norm(cache), CLEAR_SIG)
-    return (bool(b) and "g_planned_compute_term_bytes[device_id].store(0, std::memory_order_release);" in b
-            and "g_planned_state_term_bytes[device_id].store(0, std::memory_order_release);" in b
-            and "unified_cache_clear_planned_compute_terms" not in cache)
-
-
 def test_the_state_reservation_sizes_at_the_grain_and_writes_only_the_term():
     assert claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(SYCL)
 
 
-def test_the_state_setter_merges_like_the_compute_term():
-    assert claim_state_setter_merges_like_the_compute_term(CACHE)
+def test_the_state_setter_stores_the_owners_term():
+    assert claim_state_setter_stores_the_owners_term(CACHE)
 
 
 def test_the_requirement_folds_in_the_state_term():
@@ -598,17 +920,12 @@ def test_the_ring_leaves_the_state_room():
     assert claim_ring_leaves_the_state_room(SYCL)
 
 
-def test_the_clear_drops_both_terms():
-    assert claim_clear_drops_both_terms(CACHE)
-
-
-_STATE_SET = ("} else if (!ggml_sycl::unified_cache_set_planned_state_term("
-              "device, bytes, ggml_sycl::lifecycle::global_registry().live_mask() != 0)) {")
+_STATE_SET = "} else if (!ggml_sycl::unified_cache_set_planned_state_term(device, effect.owner.owner, bytes)) {"
 
 
 def test_mutant_state_reserve_with_headroom_fails():
     assert not claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(
-        _once(SYCL, _STATE_SET, _STATE_SET.replace("device, bytes,", "device, bytes + bytes / 8,")))
+        _once(SYCL, _STATE_SET, _STATE_SET.replace("effect.owner.owner, bytes)", "effect.owner.owner, bytes + bytes / 8)")))
 
 
 def test_mutant_state_reserve_into_the_compute_term_fails():
@@ -624,7 +941,12 @@ def test_mutant_state_reserve_without_the_grain_fails():
 
 def test_mutant_state_reserve_on_a_closed_txn_fails():
     assert not claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(
-        _once(SYCL, "if (!ggml_sycl_load_txn_is_open(txn.id)) {", "if (false) {", within=RESERVE_STATE_SIG))
+        _once(SYCL, "if (!effect) {", "if (false) {", within=RESERVE_STATE_SIG))
+
+
+def test_mutant_state_reserve_keyed_by_a_fixed_owner_fails():
+    assert not claim_state_reserve_sizes_at_the_grain_and_writes_only_the_term(
+        _once(SYCL, _STATE_SET, _STATE_SET.replace("effect.owner.owner", "ggml_sycl::lifecycle::SlotToken{ 0, 1 }")))
 
 
 def test_mutant_state_proc_not_answered_fails():
@@ -633,11 +955,17 @@ def test_mutant_state_proc_not_answered_fails():
               'if (strcmp(name, "ggml_backend_sycl_load_reserve_state_term_unused") == 0) {'))
 
 
-def test_mutant_state_setter_overwriting_fails():
-    assert not claim_state_setter_merges_like_the_compute_term(
-        _once(CACHE, "zone_dense_scratch_merge_input(g_planned_state_term_bytes[device_id].load(std::memory_order_acquire), "
-                     "bytes, other_model_live)",
-              "bytes"))
+def test_mutant_state_setter_storing_the_compute_term_fails():
+    assert not claim_state_setter_stores_the_owners_term(
+        _once(CACHE, "return unified_cache_set_planned_load_term(device_id, owner, planned_load_term::STATE, bytes);",
+              "return unified_cache_set_planned_load_term(device_id, owner, planned_load_term::COMPUTE, bytes);"))
+
+
+def test_mutant_state_publish_not_the_merge_fails():
+    assert not claim_state_setter_stores_the_owners_term(
+        _once(CACHE, "g_planned_state_term_bytes[device_id].store(g_planned_load_terms.owners.merged(device_id, "
+                     "planned_load_term::STATE), std::memory_order_release);",
+              "g_planned_state_term_bytes[device_id].store(0, std::memory_order_release);"))
 
 
 def test_mutant_requirement_without_the_state_term_fails():
@@ -654,11 +982,6 @@ def test_mutant_ring_not_charged_the_state_fails():
     assert not claim_ring_leaves_the_state_room(
         _once(SYCL, "ring_kv_zone.runtime_pending_bytes += ggml_sycl::unified_cache_get_planned_state_term_bytes(ctx->device);",
               ";"))
-
-
-def test_mutant_clear_keeping_the_state_fails():
-    assert not claim_clear_drops_both_terms(
-        _once(CACHE, "g_planned_state_term_bytes[device_id].store(0, std::memory_order_release);", "", within=CLEAR_SIG))
 
 
 if __name__ == "__main__":

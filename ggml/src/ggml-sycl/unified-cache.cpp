@@ -23,6 +23,7 @@
 #include "moe-host-scatter.hpp"
 #include "moe-resolved-batch.hpp"
 #include "onednn-woq.hpp"
+#include "planned-load-terms.hpp"
 #include "range-index.hpp"
 #include "sycl-timeline.hpp"
 #include "unified-types.hpp"
@@ -828,10 +829,26 @@ static std::atomic<size_t>   g_planned_dequant_f16_src1_bytes_per_token[GGML_SYC
 static std::atomic<uint32_t> g_planned_dense_scratch_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
 // llama.cpp-p6i0: the load's planned compute term (the scheduler's compute buffer, measured at the load's measure
 // shape and rounded to the RUNTIME TLSF's grain), folded into the same RUNTIME zone requirement.
+// llama.cpp-ihk6: this is the MERGE over the owners on the device (g_planned_load_terms below), published there; it is
+// what every reader loads.
 static std::atomic<size_t>   g_planned_compute_term_bytes[GGML_SYCL_MAX_DEVICES]{};
 // llama.cpp-p6i0: the load's planned state term (the context memory the measure placed on the device's plain buffer
-// type, the recurrent state, which takes the RUNTIME zone before the compute buffer), at the same grain.
+// type, the recurrent state, which takes the RUNTIME zone before the compute buffer), at the same grain. The merge
+// over the owners on the device, like the compute term.
 static std::atomic<size_t>   g_planned_state_term_bytes[GGML_SYCL_MAX_DEVICES]{};
+
+// llama.cpp-ihk6: the planned load terms by owner (canonical contract 12.4): each live model's contribution, and the
+// load in flight's, per device, keyed by model slot and slot generation. A set or a drop and the republish of the
+// merge above happen under `mutex`, so a merge cannot be published over by one computed before a later contribution
+// landed. The writers run on different threads (the loader thread reserves and rolls back, the unloading thread or the
+// quarantine reaper releases a slot) and their call sites share no exclusive lock, which is why this has its own.
+// The mutex is a leaf: nothing is called while it is held, and readers never take it.
+struct planned_load_terms_state {
+    std::mutex         mutex;
+    planned_load_terms owners;
+};
+
+static planned_load_terms_state g_planned_load_terms;
 
 // llama.cpp-kpjw: everything about the hold that must move together, per device, behind one mutex: the held bytes and
 // the context that published them (a context id, never an address: an address is reused after a free), the
@@ -2141,17 +2158,49 @@ size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id) {
     return g_planned_mmq_src1_scratch_bytes[device_id].load(std::memory_order_acquire);
 }
 
-bool unified_cache_set_planned_compute_term(int device_id, size_t bytes, bool other_model_live) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return false;
+// The merge over the owners on every device, published with release semantics for the readers. Every device, because
+// a store can sweep a stale contribution off devices other than the one it stores on, and a drop removes an owner from
+// every device. Called with g_planned_load_terms.mutex held.
+static void planned_load_terms_publish_locked() {
+    for (int device_id = 0; device_id < GGML_SYCL_MAX_DEVICES; ++device_id) {
+        g_planned_compute_term_bytes[device_id].store(
+            g_planned_load_terms.owners.merged(device_id, planned_load_term::COMPUTE), std::memory_order_release);
+        g_planned_state_term_bytes[device_id].store(
+            g_planned_load_terms.owners.merged(device_id, planned_load_term::STATE), std::memory_order_release);
     }
-    // The term is device-global: while another model is live on the device its larger term stays, so a draft
-    // loaded beside its target does not shrink the zone the target's compute buffer already sits in.
-    g_planned_compute_term_bytes[device_id].store(
-        zone_dense_scratch_merge_input(g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire), bytes,
-                                       other_model_live),
-        std::memory_order_release);
+}
+
+// One owner's term on one device (llama.cpp-ihk6): replaces that owner's earlier value, so a draft loaded beside its
+// target adds its own contribution and leaves the target's standing, and the device reads the larger of the two.
+static bool unified_cache_set_planned_load_term(int                  device_id,
+                                                lifecycle::SlotToken owner,
+                                                planned_load_term    term,
+                                                size_t               bytes) {
+    planned_load_terms_replaced replaced;
+    {
+        std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
+        if (!g_planned_load_terms.owners.set(device_id, owner, term, bytes, &replaced)) {
+            return false;
+        }
+        planned_load_terms_publish_locked();
+    }
+    for (int stale_device = 0; stale_device < GGML_SYCL_MAX_DEVICES; ++stale_device) {
+        if (replaced.generation[stale_device] == 0) {
+            continue;
+        }
+        // A contribution can leave only by its owner's key, so one still standing when the slot's next generation
+        // reserves is one its owner's rollback or release did not drop. It is removed, and named, never merged.
+        GGML_LOG_WARN(
+            "[LOAD-PLAN] planned load terms of slot %u generation %llu were still standing on device %d when "
+            "generation %llu reserved on device %d; replaced (the owner ended without dropping them)\n",
+            owner.slot, (unsigned long long) replaced.generation[stale_device], stale_device,
+            (unsigned long long) owner.generation, device_id);
+    }
     return true;
+}
+
+bool unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes) {
+    return unified_cache_set_planned_load_term(device_id, owner, planned_load_term::COMPUTE, bytes);
 }
 
 size_t unified_cache_get_planned_compute_term_bytes(int device_id) {
@@ -2161,16 +2210,8 @@ size_t unified_cache_get_planned_compute_term_bytes(int device_id) {
     return g_planned_compute_term_bytes[device_id].load(std::memory_order_acquire);
 }
 
-bool unified_cache_set_planned_state_term(int device_id, size_t bytes, bool other_model_live) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return false;
-    }
-    // Merged like the compute term: while another model is live its larger state term stays.
-    g_planned_state_term_bytes[device_id].store(
-        zone_dense_scratch_merge_input(g_planned_state_term_bytes[device_id].load(std::memory_order_acquire), bytes,
-                                       other_model_live),
-        std::memory_order_release);
-    return true;
+bool unified_cache_set_planned_state_term(int device_id, lifecycle::SlotToken owner, size_t bytes) {
+    return unified_cache_set_planned_load_term(device_id, owner, planned_load_term::STATE, bytes);
 }
 
 size_t unified_cache_get_planned_state_term_bytes(int device_id) {
@@ -2180,11 +2221,13 @@ size_t unified_cache_get_planned_state_term_bytes(int device_id) {
     return g_planned_state_term_bytes[device_id].load(std::memory_order_acquire);
 }
 
-void unified_cache_clear_planned_load_terms() {
-    for (int device_id = 0; device_id < GGML_SYCL_MAX_DEVICES; ++device_id) {
-        g_planned_compute_term_bytes[device_id].store(0, std::memory_order_release);
-        g_planned_state_term_bytes[device_id].store(0, std::memory_order_release);
+bool unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner) noexcept {
+    std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
+    if (!g_planned_load_terms.owners.drop(owner)) {
+        return false;
     }
+    planned_load_terms_publish_locked();
+    return true;
 }
 
 bool unified_cache_set_planned_dequant_f16_scratch(int      device_id,
