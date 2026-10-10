@@ -58,8 +58,8 @@ real corruption and still fails.
      refuses a LIVE one, and is the only registry-presence check before the emplace at either
      site; the claim is logged under the lifetime trace (stale_claim_report), and a release
      records its thread (release_tid, "release-begin" line);
-  8. flush_pending_cpu_scatter asserts a stream, an output buffer and a destination for every
-     entry instead of skipping quietly;
+  8. flush_pending_cpu_scatter asserts a stream, an output buffer and a CPU job for every slot it
+     flushes, and a destination for every entry, instead of skipping quietly;
   9. every expert_dispatch_entry the HYBRID branch builds (the region between the first and the
      second `std::vector<expert_dispatch_entry> cpu_entries;`) passes allow_cpu_fallback=false.
      That is what keeps dispatch_cpu_compute's allow_cpu_fallback=true arm of the `!host_weight`
@@ -223,7 +223,7 @@ def check_backend(backend_src: str) -> None:
     d_and_s = block_after(code, r"auto dispatch_cpu_and_scatter\s*=\s*\[&\]\s*\(", "dispatch_cpu_and_scatter")
     d_sq = squash(d_and_s)
     m = re.search(
-        r"if \(entries\.empty\(\)\) \{ return; \} auto r = dispatch_cpu_compute\(entries, pool_first_entry(?:, \w+)?\); "
+        r"if \(entries\.empty\(\)\) \{ return; \} auto r = dispatch_cpu_compute\(entries, pool_first_entry(?:, \w+)*\); "
         r"GGML_ASSERT\(r\.valid &&",
         d_sq,
     )
@@ -275,10 +275,16 @@ def check_backend(backend_src: str) -> None:
     scatter = block_after(code, r"static void flush_pending_cpu_scatter_slot\(pending_cpu_scatter & slot\)\s*",
                           "flush_pending_cpu_scatter_slot")
     sc = squash(scatter)
-    if not re.search(r"GGML_ASSERT\(slot\.stream && slot\.out_pinned &&", sc):
+    # Every slot of the flush group (the slot and the partner it takes along) carries a stream, an output
+    # buffer and the CPU job its join waits for (llama.cpp-z4kd).
+    if not re.search(
+        r"for \(int k = 0; k < n_group; \+\+k\) \{ GGML_ASSERT\(group\[k\]->stream && group\[k\]->out_pinned && "
+        r"group\[k\]->future\.valid\(\) &&",
+        sc,
+    ):
         raise ContractError(
-            f"FAIL: flush_pending_cpu_scatter does not GGML_ASSERT a stream and an output buffer; a pending scatter "
-            f"without them would be skipped and its rows lost ({TAG})"
+            f"FAIL: flush_pending_cpu_scatter does not GGML_ASSERT a stream, an output buffer and a CPU job for "
+            f"every slot it flushes; a pending scatter without them would be skipped and its rows lost ({TAG})"
         )
     if not re.search(r"GGML_ASSERT\(entries\[i\]\.dst_device &&", sc):
         raise ContractError(
@@ -287,7 +293,7 @@ def check_backend(backend_src: str) -> None:
         )
     if re.search(r"if \(!entries\[i\]\.dst_device\)", sc):
         raise ContractError(f"FAIL: flush_pending_cpu_scatter skips a destination-less entry again ({TAG})")
-    if re.search(r"if \(slot\.stream && slot\.out_pinned\)", sc):
+    if re.search(r"if \((slot\.|group\[k\]->)stream && (slot\.|group\[k\]->)out_pinned", sc):
         raise ContractError(f"FAIL: flush_pending_cpu_scatter makes the scatter conditional on a stream again ({TAG})")
 
     # 9. the hybrid branch builds only allow_cpu_fallback=false entries.
@@ -443,14 +449,14 @@ def mutants(backend: str, cache: str):
         backend, 'GGML_ABORT("[CPU-TG] Deferred scatter failed', 'GGML_LOG_ERROR("[CPU-TG] Deferred scatter failed'
     ), cache
     yield "scatter flush skips a missing stream quietly again", mutate(
-        backend, "GGML_ASSERT(slot.stream && slot.out_pinned &&", "GGML_ASSERT(true &&"
+        backend, "GGML_ASSERT(group[k]->stream && group[k]->out_pinned &&", "GGML_ASSERT(true &&"
     ), cache
     yield "scatter flush drains only one slot", mutate(
         backend, "    flush_pending_cpu_scatter_slot(g_pending_scatter_sibling);\n", ""
     ), cache
     yield "scatter flush makes the stream conditional again", mutate(
-        backend, "GGML_ASSERT(slot.stream && slot.out_pinned &&",
-        "if (slot.stream && slot.out_pinned) GGML_ASSERT(true &&"
+        backend, "GGML_ASSERT(group[k]->stream && group[k]->out_pinned &&",
+        "if (group[k]->stream && group[k]->out_pinned) GGML_ASSERT(true &&"
     ), cache
     yield "scatter flush skips a destination-less entry again", mutate(
         backend, "GGML_ASSERT(entries[i].dst_device &&", "if (!entries[i].dst_device) { i++; continue; } GGML_ASSERT(true &&"

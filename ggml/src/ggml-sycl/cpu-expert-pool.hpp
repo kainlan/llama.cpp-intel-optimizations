@@ -52,7 +52,13 @@ class CpuExpertPool {
     // completes. This closes a UAF where a raw pointer into caller-owned
     // storage was retained by the worker lambda while the caller
     // overwrote / moved / destroyed the backing vector.
-    std::future<void> submit_batch(std::vector<cpu_expert_task> tasks);
+    //
+    // `prologue`, when set, runs on the worker before the batch kernel
+    // (llama.cpp-z4kd): the waits a job needs before it may read its inputs
+    // and write its output run there, never on the submitting thread. Neither
+    // is expected to throw; one that does ends the process on the worker, as a
+    // throwing kernel always has, because no caller is left to hand it to.
+    std::future<void> submit_batch(std::vector<cpu_expert_task> tasks, std::function<void()> prologue = {});
 
     bool is_active() const { return active_.load(std::memory_order_acquire); }
 
@@ -76,9 +82,11 @@ class CpuExpertPool {
 // takes them once per token. Times are sums over jobs:
 //   wake     submit to a worker starting the job
 //   quant/setup/fanout/compute  the job's batched-kernel phases
-//   wall     submit to the job's result being published
-// joins counts submitting-thread joins of a pool job; joins_ready the ones
-// that found the job already finished.
+//   wall     submit to the job's result being published, including the
+//            prologue's input waits (llama.cpp-z4kd)
+// joins counts joins of a pool job, which run on the host_task that orders the
+// job's scatter, not on the submitting thread (llama.cpp-z4kd); joins_ready
+// the ones that found the job already finished.
 struct cpu_expert_pool_trace_totals {
     uint64_t jobs        = 0;
     uint64_t tasks       = 0;

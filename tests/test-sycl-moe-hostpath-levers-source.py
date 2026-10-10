@@ -15,11 +15,14 @@ calls them, and calls them the way the tests assume.
 
   C. Wait census.  The expert-id readback (ggml_sycl_copy_ids_to_host) is timed as B1 in its own
      block; the per-token line is a GGML_LOG_WARN, so it survives the default log threshold; a CPU
-     job join is timed as MOE_WAIT_JOIN and classified only inside moe_hostpath_wait_end, after the
-     enabled check, so a run without GGML_SYCL_MOE_IDS_COPY_TRACE reads no tensor name.  The down
-     activation gather's wait is B4; the graph-boundary flush (ggml_sycl_cpu_tg_flush_pending) opens
-     with the B7 context and the hot-group flush runs under the B4b context, which are the B7 and B4b
-     figures the lane's acceptance reads.
+     job join is classified only inside moe_hostpath_wait_end, after the enabled check, so a run
+     without GGML_SYCL_MOE_IDS_COPY_TRACE reads no tensor name.  The graph-boundary flush
+     (ggml_sycl_cpu_tg_flush_pending) opens with the B7 context and the hot-group flush runs under
+     the B4b context, which are the B7 and B4b figures the lane's acceptance reads.  The B2..B6
+     waits, the down activation gather's among them, and the flush's CPU job join no longer run on
+     the submitting thread (llama.cpp-z4kd), so they carry no timer;
+     test-sycl-moe-hostpath-no-host-wait-source pins their absence.  The B4b context stays so that a
+     wait brought back into the hot-group flush is counted as the hot join it would be.
 
   P. pending_any.  ggml_sycl_cpu_tg_pending_any reads every slot that can hold scatter state between
      graphs: the direct-scatter list, the pending slot and its sibling (each with its previous
@@ -193,18 +196,12 @@ def check_census(src: Source) -> None:
 
     if "moe_hostpath_join_class(" in code:
         raise ContractError("C: ggml-sycl.cpp classifies a join itself; only moe_hostpath_wait_end may, past its check")
-    joins = re.findall(r"moe_hostpath_wait_timer\s+\w+\(\s*MOE_WAIT_JOIN\s*,\s*slot\.dst_tensor\s*\)\s*;", code)
-    if len(joins) != 1:
-        raise ContractError(f"C: expected one MOE_WAIT_JOIN timer on slot.dst_tensor, found {len(joins)}")
     flat = squash(code)
-    gather = re.findall(r"moe_hostpath_wait_timer \w+\(MOE_WAIT_B4\); sycl::event::wait\(copy_events\);", flat)
-    if len(gather) != 1:
-        raise ContractError(f"C: expected the down activation gather's wait timed as B4 once, found {len(gather)}")
     _, boundary = src.body(r"void ggml_sycl_cpu_tg_flush_pending\(\)")
     if not re.match(r"\{\s*moe_hostpath_wait_context\s+\w+\(\s*MOE_WAIT_B7\s*\)\s*;", boundary):
         raise ContractError("C: ggml_sycl_cpu_tg_flush_pending does not open with the B7 wait context")
     hot = re.findall(
-        r"dispatch_cpu_and_scatter\(hot_entries, hot_first, pregather\); "
+        r"dispatch_cpu_and_scatter\(hot_entries, hot_first, pregather, pregather_events, pregather_serial\); "
         r"moe_hostpath_wait_context \w+\(MOE_WAIT_B4B\); flush_pending_cpu_scatter\(\);",
         flat,
     )
@@ -353,10 +350,11 @@ MUTANTS = [
         'GGML_LOG_INFO("[MOE-HOSTPATH-WAITS]',
     ),
     (
-        "C4 join classified at the timer (strstr per flush when off)",
+        "C4 join classified at a timer (strstr per wait when off)",
         BACKEND,
-        "moe_hostpath_wait_timer wait_timer(MOE_WAIT_JOIN, slot.dst_tensor);",
-        "moe_hostpath_wait_timer wait_timer(ggml_sycl::moe_hostpath_join_class(slot.dst_tensor->name));",
+        "            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);\n            g_pending_scatter.future.wait();",
+        "            moe_hostpath_wait_timer wait_timer(ggml_sycl::moe_hostpath_join_class(g_pending_scatter.dst_tensor->name));\n"
+        "            g_pending_scatter.future.wait();",
     ),
     (
         "C5 classification before the enabled check",
@@ -369,12 +367,6 @@ MUTANTS = [
         "    if (!moe_hostpath_waits_enabled()) {\n        return;\n    }\n"
         "    moe_hostpath_wait_census & w = g_moe_hostpath_waits;\n"
         "    const int cls = ggml_sycl::moe_hostpath_wait_classify(",
-    ),
-    (
-        "C6 down activation gather retagged B2",
-        BACKEND,
-        "moe_hostpath_wait_timer wait_timer(MOE_WAIT_B4);\n                sycl::event::wait(copy_events);",
-        "moe_hostpath_wait_timer wait_timer(MOE_WAIT_B2);\n                sycl::event::wait(copy_events);",
     ),
     (
         "C7 boundary flush's B7 context dropped",

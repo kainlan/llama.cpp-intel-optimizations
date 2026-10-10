@@ -834,7 +834,7 @@ if (Python3_Interpreter_FOUND)
     # experts). Run WITH --self-test so each anchor is proven load-bearing.
     add_test(NAME test-sycl-moe-cpu-activation-row-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-activation-row-source.py --self-test)
-    # TIMEOUT: the 56-mutant self-test (61 when measured) took 32 s wall at host load 7.5.
+    # TIMEOUT: the 79-mutant self-test took 37 s wall at host load 9.5.
     set_tests_properties(test-sycl-moe-cpu-activation-row-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
     # A hybrid MoE CPU-expert dispatch must never drop host-expert rows when its
@@ -848,11 +848,19 @@ if (Python3_Interpreter_FOUND)
     # layer asks moe_glu_input_host_produced (not the stale MUL_MAT_ID walk), the
     # wait census times B1 around the id readback and classifies only when on,
     # pending_any reads every scatter slot, and the retired GGML_SYCL_PIPELINE_CPU
-    # warns at init. WITH --self-test (22 mutants and 1 harmless probe, ~14 s at load 10).
+    # warns at init. WITH --self-test (21 mutants and 1 harmless probe, ~19 s at load 9.5).
     add_test(NAME test-sycl-moe-hostpath-levers-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-hostpath-levers-source.py --self-test)
     set_tests_properties(test-sycl-moe-hostpath-levers-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # After the ids readback, the hybrid MUL_MAT_ID branch and the CPU scatter
+    # flushes it calls must not block the submitting thread: the CPU jobs' input
+    # waits run on the pool worker and their joins are host_tasks on the queue
+    # (llama.cpp-z4kd). WITH --self-test so each anchor is proven load-bearing.
+    add_test(NAME test-sycl-moe-hostpath-no-host-wait-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-hostpath-no-host-wait-source.py --self-test)
+    set_tests_properties(test-sycl-moe-hostpath-no-host-wait-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
     # A hybrid MXFP4 xmx_tiled expert must be decoded by a kernel that reads
     # xmx_tiled: the grouped executor accepts partial cover, and the per-expert
     # direct path refuses layouts it cannot decode (llama.cpp-4hg7). WITH --self-test.

@@ -352,6 +352,10 @@ inline bool moe_glu_input_host_produced(const ggml_tensor * op, moe_weight_on_ho
 //   B5  join of a down CPU job at a flush
 //   B6  wait for an earlier scatter H2D (flush prologue, sibling join)
 //   B7  any of the above inside the graph-boundary flush or drain
+// The classes are the waits the path paid before its CPU jobs were event-chained
+// (llama.cpp-z4kd).  Only B1 and the graph-boundary B7 still wait on the
+// submitting thread; B2..B6 read 0, and a change that brings one of those waits
+// back shows in its class.
 // MOE_WAIT_NONE and MOE_WAIT_JOIN are not classes.  MOE_WAIT_NONE is the flush
 // context outside any flush that forces a class.  MOE_WAIT_JOIN marks a CPU job
 // join whose class (B3 or B5) is read from the joined op's name, and only when
@@ -388,6 +392,66 @@ inline int moe_hostpath_wait_classify(int natural, const char * joined_name, int
         return MOE_WAIT_B4B;
     }
     return cls;
+}
+
+// What a CPU job must wait for, on the pool worker, before it writes its pool
+// span (llama.cpp-z4kd). The submitting thread no longer waits for a job or for
+// a scatter, so a job can be issued while an earlier scatter H2D that reads the
+// same pool entries is still queued (the pool is disjoint only within one op).
+// The job's activation copy completing proves every scatter enqueued before the
+// copy has run, because the copy and the scatters share one in-order queue. A
+// scatter flushed after the copy needs its own wait unless it reads entries this
+// job does not write. Only the most recent flush's H2D events are kept, so two
+// or more flushes since the copy are covered by a barrier on the queue instead.
+enum moe_cpu_job_order {
+    MOE_CPU_JOB_ORDER_BY_COPY,          // the activation copy orders every earlier scatter
+    MOE_CPU_JOB_ORDER_DISJOINT,         // the one later scatter reads other entries
+    MOE_CPU_JOB_ORDER_OWN_BUFFERS,      // off the pool: fresh buffers no scatter reads
+    MOE_CPU_JOB_ORDER_WAIT_LAST_FLUSH,  // wait the H2D events of the one later flush
+    MOE_CPU_JOB_ORDER_WAIT_QUEUE,       // wait a barrier submitted on the queue now
+};
+
+struct moe_cpu_job_order_request {
+    bool     op_from_pool           = false;
+    size_t   op_first               = 0;  // pool entries this job writes
+    size_t   op_count               = 0;
+    int64_t  row_k                  = 0;
+    int64_t  row_n                  = 0;
+    bool     has_activation_copy    = false;  // the job reads rows a queued D2H copied
+    uint64_t copy_scatter_serial    = 0;      // scatter flushes enqueued before that copy
+    uint64_t current_scatter_serial = 0;      // scatter flushes enqueued now
+    bool     flush_from_pool        = false;  // the most recent flush read pool entries ...
+    size_t   flush_first            = 0;      // ... these
+    size_t   flush_count            = 0;
+    int64_t  flush_row_k            = 0;
+    int64_t  flush_row_n            = 0;
+};
+
+inline moe_cpu_job_order moe_cpu_job_order_decide(const moe_cpu_job_order_request & r) {
+    if (!r.op_from_pool) {
+        return MOE_CPU_JOB_ORDER_OWN_BUFFERS;
+    }
+    if (!r.has_activation_copy || r.current_scatter_serial < r.copy_scatter_serial) {
+        return MOE_CPU_JOB_ORDER_WAIT_QUEUE;
+    }
+    if (r.current_scatter_serial == r.copy_scatter_serial) {
+        return MOE_CPU_JOB_ORDER_BY_COPY;
+    }
+    if (r.current_scatter_serial - r.copy_scatter_serial > 1) {
+        return MOE_CPU_JOB_ORDER_WAIT_QUEUE;
+    }
+    if (!r.flush_from_pool) {
+        return MOE_CPU_JOB_ORDER_DISJOINT;
+    }
+    const bool same_geometry = r.row_k == r.flush_row_k && r.row_n == r.flush_row_n;
+    if (same_geometry && moe_pool_spans_disjoint(r.flush_first, r.flush_count, r.op_first, r.op_count)) {
+        return MOE_CPU_JOB_ORDER_DISJOINT;
+    }
+    return MOE_CPU_JOB_ORDER_WAIT_LAST_FLUSH;
+}
+
+inline bool moe_cpu_job_order_waits(moe_cpu_job_order o) {
+    return o == MOE_CPU_JOB_ORDER_WAIT_LAST_FLUSH || o == MOE_CPU_JOB_ORDER_WAIT_QUEUE;
 }
 
 }  // namespace ggml_sycl

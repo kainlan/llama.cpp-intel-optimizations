@@ -326,7 +326,9 @@ def gate23(files, bad):
 # --------------------------------------------------------------------------------------
 # gate 29: the host_task capture census
 # --------------------------------------------------------------------------------------
-HOST_TASK_CENSUS = {CPUD: 10, MAIN: 3, DPCT: 2}
+# MAIN 3 -> 4: moe_cpu_scatter_join_on_queue, the CPU expert job join; captures a std::shared_future
+# only (llama.cpp-z4kd).
+HOST_TASK_CENSUS = {CPUD: 10, MAIN: 4, DPCT: 2}
 FORBIDDEN_CAPTURE = ("managed_handle", "tp_handles", "data_handle", "find_tensor_storage_handle")
 
 
