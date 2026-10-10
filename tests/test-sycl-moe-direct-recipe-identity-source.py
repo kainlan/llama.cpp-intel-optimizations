@@ -14,11 +14,15 @@ This gate pins one source for that fact:
   - canonical_allocation_integration declares exact_identity(), the one identity test;
   - the capability query's DIRECT candidate asks exact_identity() of the lease and asks no other identity question
     (no mem_handle_kind test, no has_stable_owner_identity());
-  - retain() mints only from what exact_identity() returns and reads none of the identity fields itself;
+  - retain() mints only from what exact_identity() returns: it names the handle only to ask exact_identity() and to
+    copy it into the owner, and reads members only of the predicate's result. This is an allowlist of uses, so a
+    second identity check cannot come back through an accessor spelling nobody listed;
   - bind() still mints through retain();
-  - exact_identity() refuses exactly what retain() refused before: an unresolved handle, an id-less WEIGHT handle,
-    an ownerless non-arena handle (ownerless DIRECT, compatibility CHUNK_LEASE), and a zero id, generation or extent
-    or an out-of-range device.
+  - exact_identity() keeps every refusal retain() had before, each one unconditional: an unresolved handle, an id-less
+    WEIGHT handle, an ownerless non-arena handle (ownerless DIRECT, compatibility CHUNK_LEASE), and a zero id,
+    generation or extent or an out-of-range device;
+  - exact_identity() accepts in one place only, its last statement `return exact;`, so no early accept can skip a
+    refusal.
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must make it fail.
 
@@ -105,11 +109,15 @@ QUERY_IDENTITY = ("direct_recipe_candidate && "
 RETAIN_CALL = "const auto identity = exact_identity(handle);"
 RETAIN_MINT = ("retained_allocation_owner(identity->allocation_id, identity->generation, identity->device, "
                "identity->extent, std::move(owner))")
-# What an identity test reads: the private fields, and the public accessors that expose the same facts. A retain()
-# that names any of them is checking identity a second way, whichever spelling it uses.
-IDENTITY_FIELDS = ("canonical_allocation_id_", "canonical_generation_", "canonical_extent_", "owned_alloc_",
-                   "is_arena()", "kind_", "cached_", "device_")
-IDENTITY_ACCESSORS = ("kind()", "mem_handle_kind::", "has_stable_owner_identity", "device()", "is_weight()")
+RETAIN_COPY = "auto retained_handle = std::make_shared<mem_handle>(handle);"
+# retain() may name the handle in exactly these two places: once to ask the predicate, once to copy it into the owner.
+# Any other use reads the handle a second way, whatever field or accessor it goes through. A list of forbidden fields
+# and accessors fails open on every spelling nobody listed (valid(), owns_allocation(), identity()), so the claim is an
+# allowlist of uses instead.
+RETAIN_HANDLE_USES = ("exact_identity(handle)", "std::make_shared<mem_handle>(handle)")
+# Every member retain() reads is on the predicate's result. This also covers the copy of the handle and any alias of
+# it, which the allowlist above cannot see because they do not spell `handle`.
+RETAIN_MEMBER_RECEIVER = "identity"
 
 REFUSE_UNRESOLVED = "if (!handle.cached_.ptr) { return std::nullopt; }"
 REFUSE_IDLESS_WEIGHT = ("if (handle.kind_ == mem_handle_kind::WEIGHT && exact.allocation_id == 0) "
@@ -119,6 +127,10 @@ REFUSE_OWNERLESS = ("if (!handle.owned_alloc_ && !handle.is_arena() && handle.ki
 REFUSE_INCOMPLETE = ("if (exact.allocation_id == 0 || exact.generation == 0 || exact.device < 0 || "
                      "exact.device >= static_cast<int>(execution::max_devices) || exact.extent == 0) "
                      "{ return std::nullopt; }")
+REFUSALS = (REFUSE_UNRESOLVED, REFUSE_IDLESS_WEIGHT, REFUSE_OWNERLESS, REFUSE_INCOMPLETE)
+PREDICATE_ACCEPT = "return exact;"
+PREDICATE_REFUSE = "return std::nullopt;"
+PREDICATE_GUARD = "mem_handle_lock_guard guard(handle.lock_);"
 
 
 def static_candidate(query_body: str) -> str:
@@ -151,14 +163,32 @@ def retain_mints_only_from_the_predicate(retain_body: str) -> bool:
     return retain_body.count("exact_identity(") == 1 and RETAIN_CALL in retain_body and RETAIN_MINT in retain_body
 
 
-def retain_identity_reads(retain_body: str) -> list:
-    """The identity fields and accessors retain() names itself, in IDENTITY_FIELDS + IDENTITY_ACCESSORS order."""
-    return [read for read in IDENTITY_FIELDS + IDENTITY_ACCESSORS if read in retain_body]
+def _context(text: str, start: int, end: int) -> str:
+    return text[max(0, start - 24):end + 24].strip()
 
 
-def retain_reads_no_identity_field(retain_body: str) -> bool:
-    """retain() keeps no parallel copy of the identity checks: it reads none of the fields or accessors they read."""
-    return bool(retain_body) and not retain_identity_reads(retain_body)
+def retain_stray_handle_uses(retain_body: str) -> list:
+    """Where retain() names `handle` outside RETAIN_HANDLE_USES (each allowed use is consumed once), with context."""
+    rest = retain_body
+    for use in RETAIN_HANDLE_USES:
+        rest = rest.replace(use, "", 1)
+    return [_context(rest, m.start(), m.end()) for m in re.finditer(r"\bhandle\b", rest)]
+
+
+def retain_stray_member_reads(retain_body: str) -> list:
+    """The member reads (`.m`, `->m`) retain() makes on anything but RETAIN_MEMBER_RECEIVER, with context."""
+    receiver = re.compile(r"\b" + RETAIN_MEMBER_RECEIVER + r"\s*$")
+    return [
+        _context(retain_body, m.start(), m.end()) for m in re.finditer(r"(?:\.|->)\s*[A-Za-z_]", retain_body)
+        if not receiver.search(retain_body[:m.start()])
+    ]
+
+
+def retain_reads_the_handle_only_through_the_predicate(retain_body: str) -> bool:
+    """retain() keeps no parallel copy of the identity checks: it names the handle once in each allowed use and nowhere
+    else, and reads members only of what exact_identity() returned."""
+    return (bool(retain_body) and all(retain_body.count(use) == 1 for use in RETAIN_HANDLE_USES)
+            and not retain_stray_handle_uses(retain_body) and not retain_stray_member_reads(retain_body))
 
 
 def bind_goes_through_retain(bind_body: str) -> bool:
@@ -166,10 +196,49 @@ def bind_goes_through_retain(bind_body: str) -> bool:
     return "auto owner = retain(handle);" in bind_body and "exact_identity(" not in bind_body
 
 
+def enclosing_block_opener(text: str, at: int):
+    """The text before the innermost `{` that encloses position `at`, right-stripped; None when nothing encloses it."""
+    depth = 0
+    for i in range(at - 1, -1, -1):
+        if text[i] == "}":
+            depth += 1
+        elif text[i] == "{":
+            if depth == 0:
+                return text[:i].rstrip()
+            depth -= 1
+    return None
+
+
+def _starts_a_statement(before: str) -> bool:
+    return before == "" or before.endswith((";", "{", "}"))
+
+
+def refusal_is_unconditional(exact_body: str, refusal: str) -> bool:
+    """`refusal` is present, starts a statement of its own, and sits in the function body or a bare scope block: no
+    if, else, loop or lambda (braced or not) decides whether it runs."""
+    at = exact_body.find(refusal)
+    if at < 0:
+        return False
+    opener = enclosing_block_opener(exact_body, at)
+    return opener is not None and _starts_a_statement(opener) and _starts_a_statement(exact_body[:at].rstrip())
+
+
 def predicate_refuses_what_retain_refused(exact_body: str) -> bool:
-    """exact_identity() keeps every refusal retain() had: unresolved, id-less WEIGHT, ownerless non-arena, and an
-    incomplete identity (zero id, generation or extent, or an out-of-range device)."""
-    return all(r in exact_body for r in (REFUSE_UNRESOLVED, REFUSE_IDLESS_WEIGHT, REFUSE_OWNERLESS, REFUSE_INCOMPLETE))
+    """exact_identity() keeps every refusal retain() had, each unconditional: unresolved, id-less WEIGHT, ownerless
+    non-arena, and an incomplete identity (zero id, generation or extent, or an out-of-range device)."""
+    return all(refusal_is_unconditional(exact_body, r) for r in REFUSALS)
+
+
+def predicate_returns(exact_body: str) -> list:
+    return re.findall(r"\breturn\b[^;]*;", exact_body)
+
+
+def predicate_accepts_only_after_every_refusal(exact_body: str) -> bool:
+    """exact_identity() accepts in one place: its last statement is `return exact;` and every earlier return is
+    `return std::nullopt;`. An early accept, in any spelling, would skip the refusals after it."""
+    returns = predicate_returns(exact_body)
+    return (bool(returns) and returns[-1] == PREDICATE_ACCEPT and all(r == PREDICATE_REFUSE for r in returns[:-1])
+            and exact_body.endswith(PREDICATE_ACCEPT + " }"))
 
 
 CLASS_BODY = body(RETENTION, CLASS_SIG)
@@ -210,9 +279,11 @@ def test_query_asks_no_handle_kind():
 def test_retain_mints_only_from_the_predicate():
     assert retain_mints_only_from_the_predicate(RETAIN_BODY), (
         "retain() must call exact_identity(handle) once and mint retained_allocation_owner from its result")
-    assert retain_reads_no_identity_field(RETAIN_BODY), (
-        "retain() must not read identity fields or accessors itself; a parallel copy of the checks is a second "
-        "source. It reads: " + ", ".join(retain_identity_reads(RETAIN_BODY)))
+    assert retain_reads_the_handle_only_through_the_predicate(RETAIN_BODY), (
+        "retain() may name the handle only in " + " and ".join(RETAIN_HANDLE_USES) + ", each once, and may read "
+        "members only of the predicate's result; any other read is a parallel copy of the identity checks, a second "
+        "source. Stray handle uses: " + "; ".join(retain_stray_handle_uses(RETAIN_BODY)) + ". Stray member reads: "
+        + "; ".join(retain_stray_member_reads(RETAIN_BODY)))
 
 
 def test_bind_goes_through_retain():
@@ -222,7 +293,14 @@ def test_bind_goes_through_retain():
 def test_predicate_refuses_what_retain_refused():
     assert predicate_refuses_what_retain_refused(EXACT_BODY), (
         "exact_identity() must refuse unresolved, id-less WEIGHT, ownerless non-arena (ownerless DIRECT, "
-        "CHUNK_LEASE) and incomplete identities; widening it widens what the DIRECT route binds")
+        "CHUNK_LEASE) and incomplete identities, each unconditionally; widening it widens what the DIRECT route binds")
+
+
+def test_predicate_accepts_only_after_every_refusal():
+    assert predicate_accepts_only_after_every_refusal(EXACT_BODY), (
+        "exact_identity() must accept only in its last statement `return exact;`, with every earlier return "
+        "`return std::nullopt;`; an early accept skips the refusals after it. Returns: "
+        + " | ".join(predicate_returns(EXACT_BODY)))
 
 
 # ---- mutants: each must turn its own claim red ----------------------------------------------------------------------
@@ -264,7 +342,7 @@ def test_mutant_retain_bypasses_the_predicate():
                 "handle.canonical_allocation_id_, handle.canonical_generation_, handle.device_, "
                 "handle.canonical_extent_ });")
     assert not retain_mints_only_from_the_predicate(m), "retain() bypassing exact_identity() must be caught"
-    assert not retain_reads_no_identity_field(m)
+    assert not retain_reads_the_handle_only_through_the_predicate(m)
 
 
 def test_mutant_retain_keeps_a_parallel_check():
@@ -272,7 +350,8 @@ def test_mutant_retain_keeps_a_parallel_check():
     m = _mutate(RETAIN_BODY, RETAIN_CALL, RETAIN_CALL + " if (handle.kind_ == mem_handle_kind::WEIGHT) { return "
                 "std::nullopt; }")
     assert retain_mints_only_from_the_predicate(m)
-    assert not retain_reads_no_identity_field(m), "a parallel identity check left in retain() must be caught"
+    assert not retain_reads_the_handle_only_through_the_predicate(m), (
+        "a parallel identity check left in retain() must be caught")
 
 
 def test_mutant_retain_keeps_a_parallel_kind_check_through_accessors():
@@ -280,16 +359,53 @@ def test_mutant_retain_keeps_a_parallel_kind_check_through_accessors():
     m = _mutate(RETAIN_BODY, RETAIN_CALL, RETAIN_CALL + " if (handle.kind() == mem_handle_kind::CHUNK_LEASE) { return "
                 "std::nullopt; }")
     assert retain_mints_only_from_the_predicate(m)
-    assert not retain_reads_no_identity_field(m), "an accessor-form kind check left in retain() must be caught"
-    assert {"kind()", "mem_handle_kind::"} <= set(retain_identity_reads(m))
+    assert not retain_reads_the_handle_only_through_the_predicate(m), (
+        "an accessor-form kind check left in retain() must be caught")
+    assert any("handle.kind()" in use for use in retain_stray_handle_uses(m))
 
 
 def test_mutant_retain_keeps_a_parallel_owner_check_through_accessors():
     m = _mutate(RETAIN_BODY, RETAIN_CALL, RETAIN_CALL + " if (!handle.has_stable_owner_identity() || handle.device() < "
                 "0) { return std::nullopt; }")
     assert retain_mints_only_from_the_predicate(m)
-    assert not retain_reads_no_identity_field(m), "an accessor-form owner/device check in retain() must be caught"
-    assert {"has_stable_owner_identity", "device()"} <= set(retain_identity_reads(m))
+    assert not retain_reads_the_handle_only_through_the_predicate(m), (
+        "an accessor-form owner/device check in retain() must be caught")
+    assert len(retain_stray_handle_uses(m)) == 2
+
+
+def test_mutant_retain_checks_ownership_through_accessors():
+    # Neither name was on the old forbidden-field list, so that list let this through.
+    m = _mutate(RETAIN_BODY, RETAIN_CALL, RETAIN_CALL + " if (!handle.owns_allocation() && !handle.valid()) { return "
+                "std::nullopt; }")
+    assert retain_mints_only_from_the_predicate(m)
+    assert not retain_reads_the_handle_only_through_the_predicate(m), (
+        "an owns_allocation()/valid() check left in retain() must be caught")
+
+
+def test_mutant_retain_checks_the_identity_through_its_accessor():
+    for check in ("if (handle.identity().allocation_id == 0) { return std::nullopt; }",
+                  "if (!handle.identity().valid()) { return std::nullopt; }"):
+        m = _mutate(RETAIN_BODY, RETAIN_CALL, RETAIN_CALL + " " + check)
+        assert retain_mints_only_from_the_predicate(m)
+        assert not retain_reads_the_handle_only_through_the_predicate(m), (
+            "an identity() check left in retain() must be caught: " + check)
+
+
+def test_mutant_retain_checks_its_copy_of_the_handle():
+    # The copy does not spell `handle`, so only the member-read allowlist sees this.
+    m = _mutate(RETAIN_BODY, RETAIN_COPY, RETAIN_COPY + " if (!retained_handle->owns_allocation()) { return "
+                "std::nullopt; }")
+    assert not retain_stray_handle_uses(m)
+    assert retain_stray_member_reads(m), "an identity check on retain()'s copy of the handle must be caught"
+    assert not retain_reads_the_handle_only_through_the_predicate(m)
+
+
+def test_mutant_retain_hands_the_handle_to_a_second_check():
+    # No member read at all, so only the handle-use allowlist sees this.
+    m = _mutate(RETAIN_BODY, RETAIN_CALL, RETAIN_CALL + " if (!has_exact_range(handle)) { return std::nullopt; }")
+    assert not retain_stray_member_reads(m)
+    assert retain_stray_handle_uses(m), "the handle passed to a second identity check must be caught"
+    assert not retain_reads_the_handle_only_through_the_predicate(m)
 
 
 def test_mutant_bind_bypasses_retain():
@@ -315,6 +431,35 @@ def test_mutant_predicate_accepts_an_ownerless_handle():
 def test_mutant_predicate_accepts_an_unresolved_handle():
     m = _mutate(EXACT_BODY, REFUSE_UNRESOLVED, "")
     assert not predicate_refuses_what_retain_refused(m), "accepting an unresolved handle must be caught"
+
+
+def test_mutant_predicate_accepts_early():
+    # Every refusal string is still present, so presence alone missed this.
+    m = _mutate(EXACT_BODY, PREDICATE_GUARD, PREDICATE_GUARD + " if (handle.kind_ == mem_handle_kind::CHUNK_LEASE) { "
+                "return exact; }")
+    assert predicate_refuses_what_retain_refused(m)
+    assert not predicate_accepts_only_after_every_refusal(m), "an early accept must be caught"
+
+
+def test_mutant_predicate_accepts_early_in_another_spelling():
+    # `return exact;` still occurs exactly once and last, so a count of it alone would miss this.
+    m = _mutate(EXACT_BODY, PREDICATE_GUARD, PREDICATE_GUARD + " if (handle.kind_ == mem_handle_kind::CHUNK_LEASE) { "
+                "return std::make_optional(exact); }")
+    assert m.count(PREDICATE_ACCEPT) == 1 and m.endswith(PREDICATE_ACCEPT + " }")
+    assert not predicate_accepts_only_after_every_refusal(m), "an early accept in any spelling must be caught"
+
+
+def test_mutant_predicate_refusal_under_a_condition():
+    m = _mutate(EXACT_BODY, REFUSE_OWNERLESS, "if (handle.kind_ != mem_handle_kind::CHUNK_LEASE) { " + REFUSE_OWNERLESS
+                + " }")
+    assert predicate_accepts_only_after_every_refusal(m)
+    assert not predicate_refuses_what_retain_refused(m), "a refusal skipped for one handle kind must be caught"
+
+
+def test_mutant_predicate_refusal_under_a_braceless_condition():
+    m = _mutate(EXACT_BODY, REFUSE_UNRESOLVED, "if (handle.kind_ != mem_handle_kind::CHUNK_LEASE) " + REFUSE_UNRESOLVED)
+    assert predicate_accepts_only_after_every_refusal(m)
+    assert not predicate_refuses_what_retain_refused(m), "a refusal under a braceless if must be caught"
 
 
 def test_mutant_declaration_dropped():
