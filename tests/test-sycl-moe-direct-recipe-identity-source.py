@@ -105,9 +105,11 @@ QUERY_IDENTITY = ("direct_recipe_candidate && "
 RETAIN_CALL = "const auto identity = exact_identity(handle);"
 RETAIN_MINT = ("retained_allocation_owner(identity->allocation_id, identity->generation, identity->device, "
                "identity->extent, std::move(owner))")
-# The fields an identity test reads. A retain() that names any of them is checking identity a second way.
+# What an identity test reads: the private fields, and the public accessors that expose the same facts. A retain()
+# that names any of them is checking identity a second way, whichever spelling it uses.
 IDENTITY_FIELDS = ("canonical_allocation_id_", "canonical_generation_", "canonical_extent_", "owned_alloc_",
                    "is_arena()", "kind_", "cached_", "device_")
+IDENTITY_ACCESSORS = ("kind()", "mem_handle_kind::", "has_stable_owner_identity", "device()", "is_weight()")
 
 REFUSE_UNRESOLVED = "if (!handle.cached_.ptr) { return std::nullopt; }"
 REFUSE_IDLESS_WEIGHT = ("if (handle.kind_ == mem_handle_kind::WEIGHT && exact.allocation_id == 0) "
@@ -149,9 +151,14 @@ def retain_mints_only_from_the_predicate(retain_body: str) -> bool:
     return retain_body.count("exact_identity(") == 1 and RETAIN_CALL in retain_body and RETAIN_MINT in retain_body
 
 
+def retain_identity_reads(retain_body: str) -> list:
+    """The identity fields and accessors retain() names itself, in IDENTITY_FIELDS + IDENTITY_ACCESSORS order."""
+    return [read for read in IDENTITY_FIELDS + IDENTITY_ACCESSORS if read in retain_body]
+
+
 def retain_reads_no_identity_field(retain_body: str) -> bool:
-    """retain() keeps no parallel copy of the identity checks: it reads none of the fields they read."""
-    return bool(retain_body) and not any(field in retain_body for field in IDENTITY_FIELDS)
+    """retain() keeps no parallel copy of the identity checks: it reads none of the fields or accessors they read."""
+    return bool(retain_body) and not retain_identity_reads(retain_body)
 
 
 def bind_goes_through_retain(bind_body: str) -> bool:
@@ -204,7 +211,8 @@ def test_retain_mints_only_from_the_predicate():
     assert retain_mints_only_from_the_predicate(RETAIN_BODY), (
         "retain() must call exact_identity(handle) once and mint retained_allocation_owner from its result")
     assert retain_reads_no_identity_field(RETAIN_BODY), (
-        "retain() must not read the identity fields itself; a parallel copy of the checks is a second source")
+        "retain() must not read identity fields or accessors itself; a parallel copy of the checks is a second "
+        "source. It reads: " + ", ".join(retain_identity_reads(RETAIN_BODY)))
 
 
 def test_bind_goes_through_retain():
@@ -265,6 +273,23 @@ def test_mutant_retain_keeps_a_parallel_check():
                 "std::nullopt; }")
     assert retain_mints_only_from_the_predicate(m)
     assert not retain_reads_no_identity_field(m), "a parallel identity check left in retain() must be caught"
+
+
+def test_mutant_retain_keeps_a_parallel_kind_check_through_accessors():
+    # The private-field list alone missed this spelling of the same check.
+    m = _mutate(RETAIN_BODY, RETAIN_CALL, RETAIN_CALL + " if (handle.kind() == mem_handle_kind::CHUNK_LEASE) { return "
+                "std::nullopt; }")
+    assert retain_mints_only_from_the_predicate(m)
+    assert not retain_reads_no_identity_field(m), "an accessor-form kind check left in retain() must be caught"
+    assert {"kind()", "mem_handle_kind::"} <= set(retain_identity_reads(m))
+
+
+def test_mutant_retain_keeps_a_parallel_owner_check_through_accessors():
+    m = _mutate(RETAIN_BODY, RETAIN_CALL, RETAIN_CALL + " if (!handle.has_stable_owner_identity() || handle.device() < "
+                "0) { return std::nullopt; }")
+    assert retain_mints_only_from_the_predicate(m)
+    assert not retain_reads_no_identity_field(m), "an accessor-form owner/device check in retain() must be caught"
+    assert {"has_stable_owner_identity", "device()"} <= set(retain_identity_reads(m))
 
 
 def test_mutant_bind_bypasses_retain():
