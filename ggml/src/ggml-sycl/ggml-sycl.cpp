@@ -28522,6 +28522,23 @@ static void ggml_check_sycl() try {
 
         GGML_SYCL_DEBUG("[SYCL] call ggml_check_sycl\n");
 
+#ifndef GGML_SYCL_MMQ_ESIMD_KERNELS
+        // The opt-in ESIMD Q4_0 mmq kernels are compiled out of this build (CMake option
+        // GGML_SYCL_MMQ_ESIMD, OFF by default; ocloc 26.35 / IGC 2.41 segfault compiling them,
+        // llama.cpp-xtvl). The dispatch site that would consult the variable is not reached by
+        // every vehicle, so say so here, once at init, rather than letting the request silently
+        // no-op. getenv() is the right source for the same reason as GGML_SYCL_ASYNC_MEM above:
+        // no parsed global exists in this build to read back.
+        {
+            const char * mmq_esimd_env = getenv("GGML_SYCL_MMQ_ESIMD");
+            if (mmq_esimd_env != nullptr && atoi(mmq_esimd_env) > 0) {
+                GGML_LOG_WARN(
+                    "[SYCL] GGML_SYCL_MMQ_ESIMD requested but the ESIMD mmq kernels are compiled out "
+                    "(GGML_SYCL_MMQ_ESIMD=OFF at build time); using the regular mmq kernels\n");
+            }
+        }
+#endif
+
         // Visible report of the settings this function actually PARSED.
         //
         // The GGML_LOG_INFO table below it is invisible at default verbosity,

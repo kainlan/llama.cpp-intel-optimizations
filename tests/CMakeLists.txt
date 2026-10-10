@@ -893,6 +893,13 @@ if (Python3_Interpreter_FOUND)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-q2-0-wiring-source.py
         LABEL "sycl;quant;source;hostonly;python"
         TIMEOUT 30)
+    # The opt-in ESIMD Q4_0 mmq kernels crash ocloc 26.35 / IGC 2.41 and are compiled out unless the CMake option
+    # GGML_SYCL_MMQ_ESIMD is ON (llama.cpp-xtvl). Structural half; the proof is that the device link succeeds.
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-mmq-esimd-compile-out-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mmq-esimd-compile-out-source.py
+        LABEL "sycl;quant;source;hostonly;python"
+        TIMEOUT 30)
     add_test(NAME test-sycl-lifecycle-g1-harness
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-g1-harness.py)
     set_tests_properties(test-sycl-lifecycle-g1-harness PROPERTIES
