@@ -492,7 +492,8 @@ bool test_moe_multi_gpu_wanted(const placement_plan & plan);
 void test_set_sycl_info_override(const ggml_sycl_device_info & info);
 void test_clear_sycl_info_override();
 // Forces the planner's XMX_TILED grouped-DPAS PP route predicate on or off (its env read is latched per process).
-// The setter returns the override it replaced (-1 none, 0 off, 1 on), for test_restore_ to put back.
+// The setter returns the override it replaced (-1 none, 0 off, 1 on), for
+// test_restore_xmx_tiled_pp_route_override() to put back.
 int  test_set_xmx_tiled_pp_route_override(bool active);
 void test_restore_xmx_tiled_pp_route_override(int previous);
 #endif

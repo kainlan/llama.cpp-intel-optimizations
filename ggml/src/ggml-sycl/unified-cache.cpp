@@ -27443,18 +27443,19 @@ static bool planner_moe_xmx_tiled_pp_proof_enabled() {
     return enabled;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Test-only: the env read in planner_xmx_tiled_pp_route_active() is latched once per process, so a test that must
+// plan under both values of the route sets it here instead. -1 means no override (the env decides), 0 forces the route
+// off, 1 forces it on.
+static std::atomic<int> g_test_xmx_tiled_pp_route_override{ -1 };
+#endif
+
 // llama.cpp-rzy7: mirrors ggml_sycl_xmx_moe_allow_unsafe_pp() in ggml-sycl.cpp
 // (not visible from this TU, so replicated rather than shared). The XMX_TILED
 // grouped-DPAS PP route for MXFP4 gate/up is default ON (measured
 // llama.cpp-e3xj 2026-08-17); GGML_SYCL_XMX_TILED_PP=0 opts out, and the older
 // GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP / GGML_SYCL_XMX_MOE_PP names are honored as
 // a compatibility fallback when the new variable is unset.
-#if defined(GGML_SYCL_PRIVATE_TESTING)
-// Test-only: the env read below is latched once per process, so a test that must plan under both values of the route
-// sets it here instead. -1 means no override (the env decides), 0 forces the route off, 1 forces it on.
-static std::atomic<int> g_test_xmx_tiled_pp_route_override{ -1 };
-#endif
-
 static bool planner_xmx_tiled_pp_route_active() {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     const int forced = g_test_xmx_tiled_pp_route_override.load(std::memory_order_acquire);
