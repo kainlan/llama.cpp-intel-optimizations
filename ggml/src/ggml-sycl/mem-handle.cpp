@@ -952,17 +952,17 @@ void mem_handle::set_canonical_identity_for_test(uint64_t allocation_id, uint64_
 // query, so the test cannot throw and needs no catch of its own.
 std::optional<moe::canonical_allocation_identity> moe::canonical_allocation_integration::exact_identity(
     const mem_handle & handle) noexcept {
-    canonical_allocation_identity identity;
+    canonical_allocation_identity exact;
     {
         mem_handle_lock_guard guard(handle.lock_);
         if (!handle.cached_.ptr) {
             return std::nullopt;
         }
-        identity.device        = handle.owned_alloc_ ? handle.owned_alloc_.metadata().device : handle.device_;
-        identity.allocation_id = handle.canonical_allocation_id_;
-        identity.generation    = handle.canonical_generation_;
-        identity.extent        = handle.canonical_extent_;
-        if (handle.kind_ == mem_handle_kind::WEIGHT && identity.allocation_id == 0) {
+        exact.device        = handle.owned_alloc_ ? handle.owned_alloc_.metadata().device : handle.device_;
+        exact.allocation_id = handle.canonical_allocation_id_;
+        exact.generation    = handle.canonical_generation_;
+        exact.extent        = handle.canonical_extent_;
+        if (handle.kind_ == mem_handle_kind::WEIGHT && exact.allocation_id == 0) {
             // Cache-entry minted IDs/replacement generations are not yet
             // propagated by unified-cache. Never substitute a key hash.
             return std::nullopt;
@@ -973,11 +973,11 @@ std::optional<moe::canonical_allocation_identity> moe::canonical_allocation_inte
             return std::nullopt;
         }
     }
-    if (identity.allocation_id == 0 || identity.generation == 0 || identity.device < 0 ||
-        identity.device >= static_cast<int>(execution::max_devices) || identity.extent == 0) {
+    if (exact.allocation_id == 0 || exact.generation == 0 || exact.device < 0 ||
+        exact.device >= static_cast<int>(execution::max_devices) || exact.extent == 0) {
         return std::nullopt;
     }
-    return identity;
+    return exact;
 }
 
 std::optional<moe::retained_allocation_owner> moe::canonical_allocation_integration::retain(

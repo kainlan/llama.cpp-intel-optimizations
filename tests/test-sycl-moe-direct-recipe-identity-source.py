@@ -110,12 +110,12 @@ IDENTITY_FIELDS = ("canonical_allocation_id_", "canonical_generation_", "canonic
                    "is_arena()", "kind_", "cached_", "device_")
 
 REFUSE_UNRESOLVED = "if (!handle.cached_.ptr) { return std::nullopt; }"
-REFUSE_IDLESS_WEIGHT = ("if (handle.kind_ == mem_handle_kind::WEIGHT && identity.allocation_id == 0) "
+REFUSE_IDLESS_WEIGHT = ("if (handle.kind_ == mem_handle_kind::WEIGHT && exact.allocation_id == 0) "
                         "{ return std::nullopt; }")
 REFUSE_OWNERLESS = ("if (!handle.owned_alloc_ && !handle.is_arena() && handle.kind_ != mem_handle_kind::WEIGHT) "
                     "{ return std::nullopt; }")
-REFUSE_INCOMPLETE = ("if (identity.allocation_id == 0 || identity.generation == 0 || identity.device < 0 || "
-                     "identity.device >= static_cast<int>(execution::max_devices) || identity.extent == 0) "
+REFUSE_INCOMPLETE = ("if (exact.allocation_id == 0 || exact.generation == 0 || exact.device < 0 || "
+                     "exact.device >= static_cast<int>(execution::max_devices) || exact.extent == 0) "
                      "{ return std::nullopt; }")
 
 
@@ -273,7 +273,7 @@ def test_mutant_bind_bypasses_retain():
 
 
 def test_mutant_predicate_accepts_an_idless_handle():
-    m = _mutate(EXACT_BODY, "identity.allocation_id == 0 || identity.generation", "identity.generation")
+    m = _mutate(EXACT_BODY, "exact.allocation_id == 0 || exact.generation", "exact.generation")
     assert not predicate_refuses_what_retain_refused(m), "accepting a zero allocation id must be caught"
 
 
