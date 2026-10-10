@@ -52,6 +52,7 @@ endif()
 
 option(GGML_SYCL_MMQ_XMX "Enable experimental XMX MMQ kernels for SYCL backend" OFF)
 option(GGML_SYCL_XMX_GEMM "Enable experimental XMX GEMM for quantized matmul (known to be slower)" OFF)
+option(GGML_SYCL_MMQ_ESIMD "Build the opt-in ESIMD Q4_0 mmq kernels (GGML_SYCL_MMQ_ESIMD=<n> at runtime). OFF by default: ocloc 26.35.39758.11 / IGC 2.41.9 segfault compiling them (llama.cpp-xtvl)" OFF)
 option(GGML_SYCL_DEBUG_SOA_LAYOUT "Enable SoA layout verification debug checks" OFF)
 option(GGML_SYCL_QUANTIZER_DEBUG "Enable quantizer kernel debug output" OFF)
 option(GGML_SYCL_ASAN_PARTIAL "Enable ASan for ggml-sycl.cpp and unified-cache.cpp only" OFF)
@@ -89,6 +90,16 @@ if (GGML_SYCL_MMQ_XMX)
     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_MMQ_XMX)
     list(APPEND GGML_SOURCES_SYCL mmq_xmx.cpp)
     list(APPEND GGML_HEADERS_SYCL mmq_xmx.hpp)
+endif()
+
+# The opt-in ESIMD Q4_0 mmq kernels (mmq-esimd.hpp, included only by mmq.cpp) are compiled only when this
+# option is ON. ocloc 26.35.39758.11 / IGC 2.41.9 segfault on the SPIR-V image holding them, which fails the
+# device link of libggml-sycl and of every test target carrying its own device image (llama.cpp-xtvl). With the
+# option OFF the header compiles its stubs, mmq_esimd_available() is false, and the runtime env
+# GGML_SYCL_MMQ_ESIMD logs one warning and falls back to the regular mmq kernels.
+if (GGML_SYCL_MMQ_ESIMD)
+    message(STATUS "Compiling with the opt-in GGML_SYCL_MMQ_ESIMD Q4_0 kernels.")
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_MMQ_ESIMD_KERNELS)
 endif()
 
 if (GGML_SYCL_DEBUG_SOA_LAYOUT)
