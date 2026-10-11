@@ -141,12 +141,11 @@ BOUNDARY = {
     ),
     "ggml_sycl_info": "the device-info singleton: a function-local static, initialised once per process",
     "ggml_sycl_upload_moe_transient_ptr_table": (
-        "the GPU expert route's pointer table, outside this ticket's host path.  It fills the table once when "
-        "it is created, and its payload staging is a synchronous host mem_copy that drains the queue "
-        "whenever a routed GPU expert's slot is new or changed.  On a Qwen3.8 decode that wait runs on "
-        "the submitting thread on every token that routes a GPU-resident expert for the first time, "
-        "until each such expert has a slot, and again after a placement change; it is not per token "
-        "once the table is full"
+        "the GPU expert route's pointer table, outside this ticket's host path.  Its queue waits are the zero "
+        "fill when ggml_sycl_ensure_moe_ptr_table creates the table and the queue drain on that function's "
+        "allocation-failure path (ggml_sycl_drain_direct_stage_queue).  Its payload staging calls the "
+        "synchronous mem_copy host to host, the payload into pinned staging, which mem-ops.cpp serves with a "
+        "memcpy and no dependency, so it waits on no device work"
     ),
 }
 
