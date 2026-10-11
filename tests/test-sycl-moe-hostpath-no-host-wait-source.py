@@ -892,8 +892,9 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
         "auto task = [job]() { moe_cpu_job_join(job); }; cgh.host_task(task);")
     sub("N2", "prologue definition renamed away", "static std::function<void()> moe_cpu_job_prologue(",
         "static std::function<void()> moe_cpu_job_prologue_v2(")
+    # Every caller: the hybrid block and the event-chained route (llama.cpp-7pvo) each build one.
     sub("N2", "CPU dispatch stops building its jobs' prologue", "moe_cpu_job_prologue(std::move(job_inputs))",
-        "moe_cpu_job_prologue_unused(std::move(job_inputs))")
+        "moe_cpu_job_prologue_unused(std::move(job_inputs))", count=-1)
     # A lambda called on the submitting thread to build the handed-off closure runs there: only its result
     # is handed off.
     sub("N1", "join builds its host_task closure by calling a lambda", "cgh.host_task([job]() { moe_cpu_job_join(job); });",
@@ -942,10 +943,10 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
         "    if (ggml_sycl_moe_hybrid_decode_event_chained(ctx, src0, src1, dst)) {\n    }\n")
     sub("N7", "route renamed away", "static bool ggml_sycl_moe_hybrid_decode_event_chained(",
         "static bool ggml_sycl_moe_hybrid_decode_event_chained_v2(")
-    ids_copy = "const sycl::event ids_d2h = ggml_sycl::mem_copy_async(pool.ids_handle(),"
+    # Up to the call's open paren, so the anchor holds wherever clang-format breaks the arguments.
+    ids_copy = "    const sycl::event ids_d2h = ggml_sycl::mem_copy_async("
     sub("N1", "route copies the ids synchronously", ids_copy,
-        "ggml_sycl::mem_copy(pool.ids_handle(), 0, ids_storage.handle, 0, 0, *stream);\n"
-        "    const sycl::event ids_d2h = ggml_sycl::mem_copy_async(pool.ids_handle(),")
+        "    ggml_sycl::mem_copy(pool.ids_handle(), 0, ids_storage.handle, 0, 0, *stream);\n" + ids_copy)
     sub("N7", "ids copy's event left out of the job inputs", "    job_inputs.events.push_back(ids_d2h);\n", "")
     sub("N1", "route waits for the ids copy", "    job_inputs.events.push_back(ids_d2h);\n",
         "    job_inputs.events.push_back(ids_d2h);\n    ids_d2h.wait();\n")

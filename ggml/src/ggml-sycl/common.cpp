@@ -1284,6 +1284,8 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
             extra->weight_ext->moe_device_table_valid[i]        = false;
             extra->weight_ext->moe_expert_handles[i].clear();
             extra->weight_ext->moe_expert_ptrs_leases[i].clear();
+            extra->weight_ext->moe_hybrid_decode[i].reset();
+            extra->weight_ext->moe_hybrid_decode_stamp[i] = {};
 
             extra->weight_ext->moe_expert_ptrs_compact_handle[i]        = {};
             extra->weight_ext->moe_expert_ptrs_compact_size[i]          = 0;
