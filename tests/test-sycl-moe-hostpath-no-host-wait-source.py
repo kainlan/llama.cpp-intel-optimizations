@@ -68,6 +68,14 @@ only shrink:
       the flagged rows through moe_host_scatter_submit_flagged, whose copies N5 checks like the
       compact form's.  ROUTE_BOUNDARY is N7's own exception list: each entry must be defined and
       reached.
+  N8. that route takes the op in the default configuration (llama.cpp-7pvo).  None of its refusals
+      names a mode that is always on: the MoE dispatch stats are hardwired on, and a refusal on them
+      turned the route off for every op while N7 still passed.  Instead the route keeps the retained
+      CPU-TG block's per-op observations: its CPU job's resolve step records the dispatch stats'
+      residency and the predictor's actual experts on the pool worker, where the ids are, reading the
+      ids for the predictor before moe_host_slots_from_ids overwrites them with flags; and the route
+      ticks the stats' token on the submitting thread through the one tracker the retained block uses
+      too, so a token split between the two routes ticks once.
 
 ALLOWLIST (exact statement, at most once; both its calls are BOUNDARY entries, so N2 fails once it is
 gone): `wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());` at op entry, taken
@@ -145,6 +153,15 @@ B1_TIMER = re.compile(r"moe_hostpath_wait_timer\s+\w+\(\s*MOE_WAIT_B1\s*\)\s*;")
 # The ids copy into the pinned pool's ids slots, bound to the event the job inputs must hold.
 IDS_COPY = re.compile(r"\bsycl::event\s+(\w+)\s*=\s*ggml_sycl::mem_copy_async\(\s*pool\.ids_handle\(\)")
 FLAGGED_FN = "moe_host_scatter_submit_flagged("
+# N8: the route's refusals, the modes that are always on, its CPU job's resolve step, and the token tracker the
+# route shares with the retained CPU-TG block.
+ROUTE_REFUSAL = re.compile(r"\bif \(([^{}]*?)\) \{ return false; \}")
+ALWAYS_ON = ("MoeDispatchStats",)
+RESOLVE_INTRO = re.compile(r"\bauto\s+resolve\s*=\s*\[")
+TOKEN_TRACKER = "g_moe_cputg_last_seq_layer"
+# A user of the tracker both compares against it (the wrap test) and stores its own layer into it.
+TRACKER_USES = (re.compile(r"<=\s*" + TOKEN_TRACKER + r"\b"), re.compile(r"\b" + TOKEN_TRACKER + r"\s*=(?!=)"))
+RETIRED_TRACKER = re.compile(r"\bstatic\s+thread_local\s+int\s+last_seq_layer_cputg\b")
 FLAGGED_DEF = "static void moe_host_scatter_submit_flagged("
 # N7's own exception list: functions the route calls that the scan does not descend into, each with the reason.
 # Kept apart from BOUNDARY so that a tree without the route fails N7, not N2.
@@ -774,9 +791,48 @@ def check_n7(scan: Scan) -> None:
         )
 
 
+def check_n8(scan: Scan) -> None:
+    """The route takes a split-placement decode op in the default configuration (llama.cpp-7pvo): no refusal
+    names a mode that is always on, and the route keeps the retained CPU-TG block's per-op observations rather
+    than refusing to run without them.  N7 has already required the route to be defined once."""
+    _, body = scan.defs[ROUTE][0]
+    for m in ROUTE_REFUSAL.finditer(squash(body)):
+        for name in ALWAYS_ON:
+            if name in m.group(1):
+                raise ContractError(
+                    f"FAIL [N8]: {ROUTE} refuses an op when `{name}` is on, and it is always on, so the route "
+                    f"never takes an op and every host-expert decode op still reads its ids back ({TAG_7PVO})"
+                )
+    intro = RESOLVE_INTRO.search(body)
+    span = lambda_body(body, body.find("[", intro.start())) if intro else None
+    if not span:
+        raise ContractError(
+            f"FAIL [N8]: {ROUTE} has no `auto resolve = [...](...) {{...}}` step for its CPU job, so nothing on "
+            f"the pool worker records what the job saw in the ids ({TAG_7PVO})"
+        )
+    resolve = body[span[0] : span[1]]
+    actual_at = resolve.find("record_actual(")
+    slots_at = resolve.find("moe_host_slots_from_ids(")
+    if "record_route_residency(" not in resolve or actual_at < 0 or slots_at < 0 or actual_at > slots_at:
+        raise ContractError(
+            f"FAIL [N8]: {ROUTE}'s resolve step does not record the dispatch stats' residency and, before "
+            f"moe_host_slots_from_ids turns the ids into flags, the predictor's actual experts; the retained "
+            f"CPU-TG block records both for every op it takes ({TAG_7PVO})"
+        )
+    outside = body[: span[0]] + body[span[1] :]
+    _, fn = function_body(scan.code, ENCLOSING_DEF)
+    if (not re.search(r"\btick_token\s*\(\s*\)", outside) or RETIRED_TRACKER.search(scan.code)
+            or not all(use.search(outside) and use.search(fn) for use in TRACKER_USES)):
+        raise ContractError(
+            f"FAIL [N8]: {ROUTE} does not tick the dispatch stats' token on the submitting thread through "
+            f"`{TOKEN_TRACKER}`, or the retained CPU-TG block keeps a tracker of its own, so a token whose "
+            f"host-expert layers split between the two routes ticks twice or not at all ({TAG_7PVO})"
+        )
+
+
 def check(backend_src: str) -> None:
     scan = Scan(backend_src)
-    for rule in (check_n1, check_n2, check_n3, check_n4, check_n5, check_n6, check_n7):
+    for rule in (check_n1, check_n2, check_n3, check_n4, check_n5, check_n6, check_n7, check_n8):
         rule(scan)
 
 
@@ -960,6 +1016,27 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     sub("N5", "flagged scatter copies drop their dependency", "rows_bytes, queue, deps);", "rows_bytes, queue);")
     sub("N7", "record build no longer reached", "ggml_sycl_moe_hybrid_decode_record_build(ctx, src0,",
         "ggml_sycl_moe_hybrid_decode_record_build_retired(ctx, src0,")
+    # llama.cpp-7pvo (N8): the route takes the op in the default configuration.
+    sub("N8", "route refuses while the always-on dispatch stats are on", "g_moe_pp_profile_enabled) {\n        return false;",
+        "g_moe_pp_profile_enabled || ggml_sycl::MoeDispatchStats::enabled()) {\n        return false;")
+    sub("N8", "CPU job records no dispatch-stats residency", "stats->record_route_residency(",
+        "stats->record_route_residency_retired(")
+    predictor_block = (
+        "        if (predictor) {\n"
+        "            predictor->record_actual(seq_layer, std::vector<int>(ids_rows, ids_rows + n_ids));\n        }\n"
+    )
+    residency_open = "        if (stats) {\n            const int n_host"
+    if predictor_block in src and residency_open in src:
+        late = src.replace(predictor_block, "", 1).replace(residency_open, predictor_block + residency_open, 1)
+        out.append(("predictor reads the flags, not the ids", late, "N8"))
+    else:
+        raise ContractError(f"FAIL: self-test anchor for the predictor-order mutant not found ({TAG_7PVO})")
+    sub("N8", "route ticks no token", "            stats->tick_token();\n", "")
+    sub("N8", "route keeps no token tracker", "        g_moe_cputg_last_seq_layer = seq_layer;\n", "")
+    sub("N8", "retained block keeps a token tracker of its own",
+        "                    // Token boundary: tick when seq_layer wraps (ALWAYS, even without predictor)\n",
+        "                    // Token boundary: tick when seq_layer wraps (ALWAYS, even without predictor)\n"
+        "                    static thread_local int last_seq_layer_cputg = -1;\n")
     sub("setup", "hybrid block renamed away", HYBRID_MARKER, "        if (moe_hybrid_with_plan && true) {")
     return out
 
