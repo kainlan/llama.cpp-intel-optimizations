@@ -26156,24 +26156,26 @@ static bool ggml_sycl_pipeline_moe_enabled() {
 }
 
 // GGML_SYCL_PIPELINE_CPU used to park every CPU expert job in a separate
-// one-entry slot that was flushed only when a later op consumed its output
-// (llama.cpp-3oju9).  Up does not consume gate, so the second job of a layer
-// found the slot full and aborted (llama.cpp-ytc9) on every model that runs gate
-// and up as separate MUL_MAT_IDs.  The 2026-10-08 acceptance run of the opt-in
-// arm aborted the same way, so the slot is retired (llama.cpp-z4kd).  The
-// direction it was a step toward stays open under llama.cpp-3oju9: an
-// event-chained host path, where a CPU job's completion is an event that the
-// scatter H2D depends on, so no later op has to join the job on the submitting
-// thread.  A run that still sets the variable is told once, at backend init,
-// that it has no effect; the static latch keeps a second init from repeating it.
+// one-entry slot that was flushed only when a later op consumed its output.
+// Up does not consume gate, so the second job of a layer found the slot full
+// and aborted (llama.cpp-ytc9) on every model that runs gate and up as separate
+// MUL_MAT_IDs.  The 2026-10-08 acceptance run of the opt-in arm aborted the
+// same way, so the slot is retired.  The event-chained host path
+// (llama.cpp-z4kd) supersedes the direction it was a step toward: a host_task
+// on the queue joins each CPU job and the scatter H2D depends on that join, so
+// no later op joins the job on the submitting thread.  llama.cpp-3oju9 still
+// tracks the overlap goal itself, hiding the CPU expert compute behind the next
+// layer's attention.  A run that still sets the variable is told once, at
+// backend init, that it has no effect; the static latch keeps a second init
+// from repeating it.
 static void ggml_sycl_pipeline_cpu_warn_retired() {
     static const bool set = [] {
         const bool present = getenv("GGML_SYCL_PIPELINE_CPU") != nullptr;
         if (present) {
             GGML_LOG_WARN(
-                "GGML_SYCL_PIPELINE_CPU is retired and ignored (llama.cpp-z4kd): its opt-in path aborted at the "
-                "llama.cpp-ytc9 assert; the event-chained host path it led toward is deferred under "
-                "llama.cpp-3oju9; see docs/backend/sycl-env-vars.md\n");
+                "GGML_SYCL_PIPELINE_CPU is retired and ignored: its opt-in path aborted at the llama.cpp-ytc9 "
+                "assert, and it is superseded by the event-chained host path (llama.cpp-z4kd); see "
+                "docs/backend/sycl-env-vars.md\n");
         }
         return present;
     }();

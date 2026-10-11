@@ -34,7 +34,8 @@ calls them, and calls them the way the tests assume.
      under its `if (!overrides.empty())`, so a run that sets only the retired variable still hears
      about it.  The helper latches through a `static const bool`, so a second backend init in the
      same process does not repeat the WARN.  The WARN and the env-var row cite llama.cpp-ytc9 and
-     defer the direction under llama.cpp-3oju9.
+     say the event-chained host path (llama.cpp-z4kd) supersedes the direction.  Neither defers it
+     under llama.cpp-3oju9, which now tracks only the overlap goal.
 
 WHAT THIS DOES NOT PROVE.  It reads source text with comments blanked.  It does not show which
 executor a GLU ran on (that needs a GPU run) and cannot see a conditional hidden behind a macro.
@@ -272,16 +273,23 @@ def check_retired(src: Source, doc: str) -> None:
     if not re.search(r"\bstatic\s+const\s+bool\s+set\s*=\s*\[", helper):
         raise ContractError("R: the retired WARN no longer latches through `static const bool set`")
     text = "".join(re.findall(r"\"((?:[^\"\\]|\\.)*)\"", helper))
-    for need in ("GGML_SYCL_PIPELINE_CPU is retired", "llama.cpp-ytc9", "llama.cpp-3oju9"):
+    superseded = "superseded by the event-chained host path (llama.cpp-z4kd)"
+    for need in ("GGML_SYCL_PIPELINE_CPU is retired", "llama.cpp-ytc9", superseded):
         if need not in text:
             raise ContractError(f"R: the retired WARN does not say {need!r}")
+    for stale in ("llama.cpp-3oju9", "deferred"):
+        if stale in text:
+            raise ContractError(f"R: the retired WARN still says {stale!r}; z4kd supersedes the direction")
     if not re.search(r"GGML_LOG_WARN\(\s*\"GGML_SYCL_PIPELINE_CPU is retired", helper):
         raise ContractError("R: the retired message is not a GGML_LOG_WARN")
     rows = [line for line in doc.splitlines() if line.startswith("| ~~`GGML_SYCL_PIPELINE_CPU=1`~~")]
     if len(rows) != 1:
         raise ContractError(f"R: expected one retired GGML_SYCL_PIPELINE_CPU row in {ENV_DOC}, found {len(rows)}")
-    if "llama.cpp-3oju9" not in rows[0] or "deferred under llama.cpp-z4kd" in rows[0]:
-        raise ContractError("R: the env-var row must defer the direction under llama.cpp-3oju9, not z4kd")
+    if superseded not in rows[0]:
+        raise ContractError(f"R: the env-var row does not say the direction is {superseded}")
+    for stale in ("stays open under llama.cpp-3oju9", "deferred under"):
+        if stale in rows[0]:
+            raise ContractError(f"R: the env-var row still says {stale!r}; z4kd supersedes the direction")
 
 
 def run(files: dict[str, str]) -> None:
@@ -431,16 +439,28 @@ MUTANTS = [
         "            }\n",
     ),
     (
-        "R2 WARN no longer cites 3oju9",
+        "R2 WARN defers the direction under 3oju9 again",
         BACKEND,
-        "deferred under \"\n                \"llama.cpp-3oju9;",
-        "deferred under \"\n                \"llama.cpp-z4kd;",
+        "it is superseded by the event-chained host path (llama.cpp-z4kd); see ",
+        "the event-chained host path it led toward is deferred under llama.cpp-3oju9; see ",
     ),
     (
-        "R3 env-var row defers under z4kd again",
+        "R7 WARN keeps the z4kd text but adds the 3oju9 deferral",
+        BACKEND,
+        "(llama.cpp-z4kd); see ",
+        "(llama.cpp-z4kd), deferred under llama.cpp-3oju9; see ",
+    ),
+    (
+        "R3 env-var row says the direction stays open under 3oju9 again",
         ENV_DOC,
-        "The design direction stays open under llama.cpp-3oju9:",
-        "The design direction is deferred under llama.cpp-z4kd:",
+        "the direction is superseded by the event-chained host path (llama.cpp-z4kd):",
+        "the direction stays open under llama.cpp-3oju9:",
+    ),
+    (
+        "R8 env-var row keeps the z4kd text but defers under 3oju9",
+        ENV_DOC,
+        "llama.cpp-3oju9 still tracks the overlap goal itself",
+        "The direction is deferred under llama.cpp-3oju9, which tracks the overlap goal itself",
     ),
 ]
 
