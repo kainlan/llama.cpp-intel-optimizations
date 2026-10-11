@@ -360,7 +360,7 @@ inline bool moe_glu_input_host_produced(const ggml_tensor * op, moe_weight_on_ho
 // context outside any flush that forces a class.  MOE_WAIT_JOIN is an input the
 // classifier keeps for a CPU job join, whose class (B3 or B5) it reads from the
 // joined op's name.  No live wait passes it since the joins left the submitting
-// thread (llama.cpp-z4kd); test-sycl-moe-decode-hostpath covers the format.
+// thread (llama.cpp-z4kd); test-sycl-moe-decode-hostpath covers its classification.
 enum moe_hostpath_wait_class : int {
     MOE_WAIT_NONE = -2,
     MOE_WAIT_JOIN = -1,
