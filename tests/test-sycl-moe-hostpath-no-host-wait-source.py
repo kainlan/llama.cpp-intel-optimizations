@@ -29,8 +29,9 @@ this contract; an entry the file no longer defines or the scan no longer reaches
 moe_cpu_job_prologue and moe_cpu_scatter_join_on_queue are scanned like any other callee, apart from the
 body of the closure each hands to another thread (OFF_THREAD_SPANS: the lambda the prologue returns runs
 on the pool worker, the lambda the join gives host_task runs on the queue's host-task thread).  A
-closure's capture list stays in the scan, since it is evaluated where the closure is built, and the gate
-fails when the closure can no longer be found.  One
+closure's capture list stays in the scan, since it is evaluated where the closure is built.  The gate
+fails when the closure can no longer be found, or when it is not the whole expression handed off (a
+lambda the submitting thread calls to build the closure runs there, not on the other thread).  One
 wait inside the scanned code predates this ticket and is excused by name in KNOWN_WAITS, at exactly one
 match, with the ticket that removes it; an entry that matches nothing fails the gate, so that list can
 only shrink:
@@ -61,9 +62,12 @@ follow a call into another file (mem-ops.cpp's synchronous mem_copy/mem_fill are
 name), through a function pointer, a std::function value or a lambda another function holds, into a
 macro's body (a macro call is read as written, unexpanded), into a definition whose `template <...>`
 header shares its line (DEF_SKIP drops such lines; the scanned code calls none today), or into a
-BOUNDARY entry.  A helper defined twice is scanned in every definition.  It does not show the event
-chain is complete (a missing dependency is a race, not a wait), and it does not measure anything.  The
-lead-run GPU arms (Qwen3.8 md5, ABBA llama-bench, chat and Mistral gates) do.
+BOUNDARY entry.  Of ggml_sycl_mul_mat_id's lambdas it follows only those bound as `auto name = [...]`:
+not one bound by reference (`auto && name = [...]`), and not one called through an alias (`auto other =
+name;` then `other()`); no code uses either form today.  A helper defined twice is scanned in every
+definition.  It does not show the event chain is complete (a missing dependency is a race, not a wait),
+and it does not measure anything.  The lead-run GPU arms (Qwen3.8 md5, ABBA llama-bench, chat and
+Mistral gates) do.
 
 NOT VACUOUS.  --self-test first requires the unmodified tree to pass (otherwise every mutant would fail
 for the tree's own reason), then runs the gate on in-memory mutants of the real source, each re-adding
@@ -158,12 +162,21 @@ BOUNDARY = {
 
 # Functions the submitting thread runs only in part: each is scanned like any other callee, callees
 # followed, apart from the body of the closure named here, which another thread runs.  The closure's
-# capture list stays in the scan (it is evaluated where the closure is built).  The gate fails when the
-# pattern no longer finds exactly one closure, so a rewrite cannot blank the wrong code or none.
+# capture list stays in the scan (it is evaluated where the closure is built).  Each entry is the
+# pattern that opens the closure, the character that must follow the closure's body (the `;` ending the
+# return, the `)` closing host_task), and what the closure is.  The gate fails when the pattern no
+# longer finds exactly one closure, or when the closure is followed by anything else, such as the `(`
+# of a lambda called on the submitting thread to build the closure; so a rewrite cannot blank the wrong
+# code or none.
 OFF_THREAD_SPANS = {
-    "moe_cpu_job_prologue": (r"\breturn\s*\[", "the lambda it returns, which the pool worker runs before the job"),
+    "moe_cpu_job_prologue": (
+        r"\breturn\s*\[",
+        ";",
+        "the lambda it returns, which the pool worker runs before the job",
+    ),
     "moe_cpu_scatter_join_on_queue": (
         r"\bhost_task\s*\(\s*\[",
+        ")",
         "the lambda it hands host_task, which the queue's host-task thread runs",
     ),
 }
@@ -306,7 +319,7 @@ def lambda_body(text: str, intro: int) -> tuple[int, int] | None:
 def off_thread_blanked(name: str, body: str) -> tuple[str, str | None]:
     """`body` with the body of the closure OFF_THREAD_SPANS names blanked, and None; or `body` unchanged
     and why the closure could not be found."""
-    pattern, _ = OFF_THREAD_SPANS[name]
+    pattern, terminator, _ = OFF_THREAD_SPANS[name]
     found = [m.end() - 1 for m in re.finditer(pattern, body)]
     if len(found) != 1:
         return body, f"{name} has {len(found)} closures matching `{pattern}`; the gate needs exactly one"
@@ -314,6 +327,12 @@ def off_thread_blanked(name: str, body: str) -> tuple[str, str | None]:
     if span is None:
         return body, f"the closure in {name} has no body the gate can find"
     open_at, close_at = span
+    after = body[close_at + 1 :].lstrip()[:1]
+    if after != terminator:
+        return body, (
+            f"the closure in {name} is followed by `{after}`, not `{terminator}`, so it is not the whole "
+            f"handed-off expression"
+        )
     inner = "".join("\n" if c == "\n" else " " for c in body[open_at + 1 : close_at])
     return body[: open_at + 1] + inner + body[close_at:], None
 
@@ -503,7 +522,7 @@ def check(backend_src: str) -> None:
     if off_thread_problems:
         name, problem = off_thread_problems[0]
         raise ContractError(
-            f"FAIL [N1]: {problem}, so the scan cannot set apart {OFF_THREAD_SPANS[name][1]} ({TAG})"
+            f"FAIL [N1]: {problem}, so the scan cannot set apart {OFF_THREAD_SPANS[name][2]} ({TAG})"
         )
     for name in OFF_THREAD_SPANS:
         if name not in followed:
@@ -764,6 +783,14 @@ def mutants(src: str) -> list[tuple[str, str]]:
         "auto task = [job]() { moe_cpu_job_join(job); }; cgh.host_task(task);")
     sub("prologue definition renamed away", "static std::function<void()> moe_cpu_job_prologue(",
         "static std::function<void()> moe_cpu_job_prologue_v2(")
+    # A lambda called on the submitting thread to build the handed-off closure runs there: only its result
+    # is handed off.
+    sub("join builds its host_task closure by calling a lambda", "cgh.host_task([job]() { moe_cpu_job_join(job); });",
+        "cgh.host_task([job]() { job.wait(); return [job]() { moe_cpu_job_join(job); }; }());")
+    sub("prologue builds its closure by calling a lambda",
+        "    return [inputs = std::move(inputs)]() {\n        moe_cpu_job_wait_inputs(inputs);\n    };\n",
+        "    return [&]() { sycl::event::wait(inputs.events); return std::function<void()>([inputs]() "
+        "{ moe_cpu_job_wait_inputs(inputs); }); }();\n")
     # A lambda of ggml_sycl_mul_mat_id that the hybrid block calls runs on the submitting thread too.
     expert_id_line = "        local_extra.moe_expert_id     = expert_id;\n"
     sub("wait in a lambda of ggml_sycl_mul_mat_id the hybrid block calls", expert_id_line,
