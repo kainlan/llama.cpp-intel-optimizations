@@ -593,9 +593,9 @@ def check_n5(scan: Scan) -> None:
     flushes = [(n, t) for n, _, t in scan.regions if n in JOINING_FLUSHES]
     for fname, flush_text in flushes:
         dep_vars = set()
-        for m in re.finditer(r"(?:const\s+)?sycl::event\s+(\w+)\s*=\s*moe_cpu_job_join_on_queue\s*\(", flush_text):
+        for m in re.finditer(r"(?:const\s+)?sycl::event\s+(\w+)\s*=\s*" + re.escape(JOIN) + r"\s*\(", flush_text):
             dep_vars.add(m.group(1))
-        for m in re.finditer(r"(\w+)\s*\.\s*push_back\s*\(\s*moe_cpu_job_join_on_queue\s*\(", flush_text):
+        for m in re.finditer(r"(\w+)\s*\.\s*push_back\s*\(\s*" + re.escape(JOIN) + r"\s*\(", flush_text):
             dep_vars.add(m.group(1))
         if not dep_vars:
             raise ContractError(f"FAIL [N5]: {fname} does not keep the join events ({TAG})")
@@ -639,7 +639,8 @@ def check_n6(scan: Scan) -> None:
     boundary_at = code.find(BOUNDARY_FN)
     # The drain's own definitions (the per-slot overload and the all-slots drain that calls it).
     drain_bodies = []
-    for m in re.finditer(r"^static\s+void\s+pending_cpu_scatter_wait_prev_events\s*\([^)]*\)\s*\{", code, re.M):
+    drain_def = r"^static\s+void\s+" + re.escape(BOUNDARY_WAIT.rstrip("(")) + r"\s*\([^)]*\)\s*\{"
+    for m in re.finditer(drain_def, code, re.M):
         drain_bodies.append((m.start(), matching(code, m.end() - 1)))
     outside = []
     for c in calls:
