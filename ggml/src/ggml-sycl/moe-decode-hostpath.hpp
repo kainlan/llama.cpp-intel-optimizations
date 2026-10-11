@@ -455,4 +455,41 @@ inline bool moe_cpu_job_order_waits(moe_cpu_job_order o) {
     return o == MOE_CPU_JOB_ORDER_WAIT_LAST_FLUSH || o == MOE_CPU_JOB_ORDER_WAIT_QUEUE;
 }
 
+// ---------------------------------------------------------------------------
+// The event-chained hybrid decode route (llama.cpp-7pvo). A decode op whose
+// experts split between the device and the host no longer reads its expert ids
+// on the submitting thread: the ids are copied asynchronously into pinned
+// staging, and the CPU job, once that copy has landed, decides which slots are
+// the host's. The device kernel computes every slot from a pointer table whose
+// host slots name a device expert, and the scatter overwrites the slots this
+// decision flags.
+// ---------------------------------------------------------------------------
+
+// host_weight[e] is expert e's host weight, nullptr when e runs on the device.
+// flags[k] becomes 1 for a host slot and 0 otherwise, and host_slots is rebuilt
+// as the host slots in slot order. flags may be ids itself: each id is read
+// before its flag is written. Returns false when an id lies outside [0, n_as);
+// that slot is flagged 0 and listed nowhere, and the caller must stop, since
+// the device kernel read the table at that id too.
+inline bool moe_host_slots_from_ids(const int32_t *        ids,
+                                    size_t                 n_ids,
+                                    const void * const *   host_weight,
+                                    size_t                 n_as,
+                                    int32_t *              flags,
+                                    std::vector<int32_t> & host_slots) {
+    host_slots.clear();
+    bool in_range = true;
+    for (size_t k = 0; k < n_ids; ++k) {
+        const int32_t e    = ids[k];
+        const bool    ok   = e >= 0 && static_cast<size_t>(e) < n_as;
+        const bool    host = ok && host_weight[e] != nullptr;
+        in_range           = in_range && ok;
+        flags[k]           = host ? 1 : 0;
+        if (host) {
+            host_slots.push_back(static_cast<int32_t>(k));
+        }
+    }
+    return in_range;
+}
+
 }  // namespace ggml_sycl

@@ -597,11 +597,49 @@ static int test_cpu_job_order() {
     return 0;
 }
 
+// The event-chained hybrid decode route (llama.cpp-7pvo): the CPU job, not the submitting thread, reads the op's
+// expert ids and decides which slots are the host's. Each host slot gets a flag of 1 and a task; every other slot
+// keeps the device's row.
+static int test_host_slots_from_ids() {
+    using ggml_sycl::moe_host_slots_from_ids;
+    int                  w[4]       = {};
+    const void * const   host_w[6]  = { nullptr, &w[0], nullptr, &w[1], &w[2], nullptr };
+    const int32_t        ids[5]     = { 3, 0, 1, 5, 4 };
+    int32_t              flags[5]   = { 7, 7, 7, 7, 7 };
+    std::vector<int32_t> host_slots = { 99 };
+    CHECK(moe_host_slots_from_ids(ids, 5, host_w, 6, flags, host_slots), "in-range ids are accepted");
+    CHECK(flags[0] == 1 && flags[1] == 0 && flags[2] == 1 && flags[3] == 0 && flags[4] == 1,
+          "a slot is flagged exactly when its expert has a host weight");
+    CHECK(host_slots.size() == 3 && host_slots[0] == 0 && host_slots[1] == 2 && host_slots[2] == 4,
+          "host slots are listed in slot order, and the list is rebuilt, not appended to");
+
+    int32_t in_place[5] = { 3, 0, 1, 5, 4 };
+    CHECK(moe_host_slots_from_ids(in_place, 5, host_w, 6, in_place, host_slots), "the flags may overwrite the ids");
+    CHECK(in_place[0] == 1 && in_place[1] == 0 && in_place[2] == 1 && in_place[3] == 0 && in_place[4] == 1,
+          "in place, each id is read before its flag is written");
+    CHECK(host_slots.size() == 3 && host_slots[2] == 4, "in place lists the same host slots");
+
+    const int32_t device_only[2] = { 0, 2 };
+    int32_t       none[2]        = { 7, 7 };
+    CHECK(moe_host_slots_from_ids(device_only, 2, host_w, 6, none, host_slots) && host_slots.empty() && none[0] == 0 &&
+              none[1] == 0,
+          "a token routed only to device experts gives the job no task and flags nothing");
+
+    const int32_t bad[3]       = { 1, 6, -1 };
+    int32_t       bad_flags[3] = { 7, 7, 7 };
+    CHECK(!moe_host_slots_from_ids(bad, 3, host_w, 6, bad_flags, host_slots),
+          "an id outside [0, n_as) is refused, so the job can stop instead of reading past the table");
+    CHECK(bad_flags[0] == 1 && bad_flags[1] == 0 && bad_flags[2] == 0 && host_slots.size() == 1 && host_slots[0] == 0,
+          "a refused id is flagged 0 and gets no task; the valid slots are still decided");
+    return 0;
+}
+
 int main() {
     if (test_direct_request() != 0 || test_direct_stamp() != 0 || test_direct_layout() != 0 ||
         test_direct_retry_cap() != 0 || test_pool_ring() != 0 || test_gather_runs() != 0 ||
         test_shared_activation() != 0 || test_shared_act_sibling() != 0 || test_sibling_pending() != 0 ||
-        test_glu_input_host_produced() != 0 || test_wait_census_classes() != 0 || test_cpu_job_order() != 0) {
+        test_glu_input_host_produced() != 0 || test_wait_census_classes() != 0 || test_cpu_job_order() != 0 ||
+        test_host_slots_from_ids() != 0) {
         return 1;
     }
     std::printf("OK: moe decode host path decisions\n");
