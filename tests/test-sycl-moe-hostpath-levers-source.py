@@ -14,9 +14,10 @@ calls them, and calls them the way the tests assume.
      GLU of every host-expert layer on the CPU backend (19 CPU splits per graph on Qwen3.8).
 
   C. Wait census.  The expert-id readback (ggml_sycl_copy_ids_to_host) is timed as B1 in its own
-     block; the per-token line is a GGML_LOG_WARN, so it survives the default log threshold; a CPU
-     job join is classified only inside moe_hostpath_wait_end, after the enabled check, so a run
-     without GGML_SYCL_MOE_IDS_COPY_TRACE reads no tensor name.  The graph-boundary flush
+     block; the per-token line is a GGML_LOG_WARN, so it survives the default log threshold; a wait
+     is classified only inside moe_hostpath_wait_end, after the enabled check, so a run without
+     GGML_SYCL_MOE_IDS_COPY_TRACE classifies nothing.  moe_hostpath_wait_end takes no joined op,
+     because no CPU job join runs on the submitting thread any more.  The graph-boundary flush
      (ggml_sycl_cpu_tg_flush_pending) opens with the B7 context and the hot-group flush runs under
      the B4b context, which are the B7 and B4b figures the lane's acceptance reads.  The B2..B6
      waits, the down activation gather's among them, and the flush's CPU job join no longer run on
@@ -208,9 +209,7 @@ def check_census(src: Source) -> None:
     )
     if len(hot) != 1:
         raise ContractError(f"C: expected the hot-group flush under the B4b wait context once, found {len(hot)}")
-    _, end = src.body(
-        r"static void moe_hostpath_wait_end\(int natural, const ggml_tensor \* joined, moe_hostpath_clock::time_point t0\)"
-    )
+    _, end = src.body(r"static void moe_hostpath_wait_end\(int natural, moe_hostpath_clock::time_point t0\)")
     m = re.match(r"\{\s*if\s*\(\s*!moe_hostpath_waits_enabled\(\)\s*\)\s*\{\s*return;\s*\}", end)
     if not m:
         raise ContractError("C: moe_hostpath_wait_end does not start with the enabled check")
@@ -369,12 +368,12 @@ MUTANTS = [
         BACKEND,
         "    if (!moe_hostpath_waits_enabled()) {\n        return;\n    }\n"
         "    moe_hostpath_wait_census & w = g_moe_hostpath_waits;\n"
-        "    const int cls = ggml_sycl::moe_hostpath_wait_classify(",
-        "    const int pre = ggml_sycl::moe_hostpath_wait_classify(natural, joined ? joined->name : nullptr, -1);\n"
+        "    const int                  cls = ggml_sycl::moe_hostpath_wait_classify(",
+        "    const int pre = ggml_sycl::moe_hostpath_wait_classify(natural, nullptr, -1);\n"
         "    (void) pre;\n"
         "    if (!moe_hostpath_waits_enabled()) {\n        return;\n    }\n"
         "    moe_hostpath_wait_census & w = g_moe_hostpath_waits;\n"
-        "    const int cls = ggml_sycl::moe_hostpath_wait_classify(",
+        "    const int                  cls = ggml_sycl::moe_hostpath_wait_classify(",
     ),
     (
         "C7 boundary flush's B7 context dropped",

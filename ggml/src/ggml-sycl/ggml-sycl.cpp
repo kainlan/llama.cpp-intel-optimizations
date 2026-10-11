@@ -23979,25 +23979,20 @@ static void pending_cpu_scatter_bind_scratch(pending_cpu_scatter & slot, ggml_ba
 // A token's line is printed when the next token's first id readback arrives
 // (the layer id drops), so it includes the boundary flushes in between.  The
 // last token of a run is not printed.  Counters are never reset between
-// prefill and decode, so two readings need care:
-//   - token 0 also carries every wait of the prompt's ubatches;
-//   - B4b counts any hot-group join, so during prefill it also counts the
-//     gate/up jobs a multi-row hot group joins, not only down.
+// prefill and decode, so token 0 also carries every wait of the prompt's
+// ubatches.  B4b reads 0: the hot-group flush no longer joins its jobs on this
+// thread, and its context only labels a wait that someone brings back into
+// that flush, as the hot join it would be.
 // When the variable is unset, a timed wait costs two cached flag tests (one
 // when the timer starts, one when it ends) and reads no clock and classifies
 // nothing; a flush context still saves and restores the thread-local context
 // field unconditionally.
 // ---------------------------------------------------------------------------
 using ggml_sycl::MOE_WAIT_B1;
-using ggml_sycl::MOE_WAIT_B2;
-using ggml_sycl::MOE_WAIT_B3;
-using ggml_sycl::MOE_WAIT_B4;
 using ggml_sycl::MOE_WAIT_B4B;
-using ggml_sycl::MOE_WAIT_B5;
 using ggml_sycl::MOE_WAIT_B6;
 using ggml_sycl::MOE_WAIT_B7;
 using ggml_sycl::MOE_WAIT_COUNT;
-using ggml_sycl::MOE_WAIT_JOIN;
 using ggml_sycl::MOE_WAIT_NONE;
 
 struct moe_hostpath_wait_census {
@@ -24025,36 +24020,26 @@ static moe_hostpath_clock::time_point moe_hostpath_wait_begin() {
     return moe_hostpath_waits_enabled() ? moe_hostpath_clock::now() : moe_hostpath_clock::time_point{};
 }
 
-// Classification (moe_hostpath_wait_classify) runs only past the enabled check, so a join's name
-// is not read when the census is off.  `joined` names the op of a MOE_WAIT_JOIN wait.
-static void moe_hostpath_wait_end(int natural, const ggml_tensor * joined, moe_hostpath_clock::time_point t0) {
+// Classification (moe_hostpath_wait_classify) runs only past the enabled check, so nothing is
+// classified when the census is off.  No timer names a joined op: no CPU job join runs on the
+// submitting thread (llama.cpp-z4kd).
+static void moe_hostpath_wait_end(int natural, moe_hostpath_clock::time_point t0) {
     if (!moe_hostpath_waits_enabled()) {
         return;
     }
     moe_hostpath_wait_census & w = g_moe_hostpath_waits;
-    const int cls = ggml_sycl::moe_hostpath_wait_classify(natural, joined ? joined->name : nullptr, w.context);
+    const int                  cls = ggml_sycl::moe_hostpath_wait_classify(natural, nullptr, w.context);
     w.count[cls] += 1;
     w.us[cls] += std::chrono::duration<double, std::micro>(moe_hostpath_clock::now() - t0).count();
 }
 
-static void moe_hostpath_wait_end(int natural, moe_hostpath_clock::time_point t0) {
-    moe_hostpath_wait_end(natural, nullptr, t0);
-}
-
 struct moe_hostpath_wait_timer {
     int                            natural;
-    const ggml_tensor *            joined;
     moe_hostpath_clock::time_point t0;
 
-    explicit moe_hostpath_wait_timer(int cls) : natural(cls), joined(nullptr), t0(moe_hostpath_wait_begin()) {}
+    explicit moe_hostpath_wait_timer(int cls) : natural(cls), t0(moe_hostpath_wait_begin()) {}
 
-    // A CPU job join; its class is read from `op` when the wait ends.
-    moe_hostpath_wait_timer(int cls, const ggml_tensor * op) :
-        natural(cls),
-        joined(op),
-        t0(moe_hostpath_wait_begin()) {}
-
-    ~moe_hostpath_wait_timer() { moe_hostpath_wait_end(natural, joined, t0); }
+    ~moe_hostpath_wait_timer() { moe_hostpath_wait_end(natural, t0); }
 };
 
 // Counts the waits inside one flush under `cls`, unless an enclosing boundary flush already does.
