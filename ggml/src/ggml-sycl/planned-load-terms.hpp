@@ -19,6 +19,12 @@
 // for that buffer was accepted (merged_accepted): one model's overflow does not invalidate the plan of a model already
 // running (llama.cpp-kpjw), and the rejected owner adds nothing to that buffer's plan while it is live.
 //
+// An owner's planned n_ubatch is the largest of the values its live backend contexts last published, each context's
+// own entry replaced by its own later publish, or the load's n_ubatch when no context is live (planned_n_ubatch).
+// Neither a latch nor a floor: the auto-ubatch ladder publishes each rung for real, so a rung that wins the transaction
+// and then loses elsewhere must not leave the plan above the rung the ladder settles on, and a context running below
+// the load's n_ubatch must not be held to it.
+//
 // A slot is reserved again only after its release, so once a newer generation of a slot stores, every contribution an
 // older generation left, on any device, is one its owner's rollback or release did not drop. The store sweeps them all,
 // not only the device it stores on: a stale term left on a device the new owner never reserves on would otherwise stand
@@ -45,6 +51,7 @@ enum class planned_load_term {
     DEQUANT_F16_WEIGHT_BYTES,          // the dense f16 dequant src0 copy: the largest weight it holds
     DEQUANT_F16_SRC1_BYTES_PER_TOKEN,  // the dense f16 dequant src1 copy's bytes per token
     DENSE_SCRATCH_N_UBATCH,            // the n_ubatch both dense scratch plans are sized at (llama.cpp-kpjw)
+    DENSE_SCRATCH_LOAD_N_UBATCH,       // the n_ubatch the load planned at: the plan's with no live context
     MMQ_SRC1_REJECTED,                 // 1: the Q8_1 src1 figure overflowed its sizing
     DEQUANT_F16_REJECTED,              // 1: the f16 dequant figure overflowed its sizing
     COUNT,                             // not a term: the number of terms, so a term added above is counted with it
@@ -58,10 +65,23 @@ struct planned_load_term_value {
     size_t            value;
 };
 
-// One owner's contribution on one device. generation 0: no owner holds it (no slot generation is ever 0).
+// The n_ubatch one backend context last published for its owner's dense scratch plan. context 0: a free entry (the
+// backend's context ids are minted from 1).
+struct planned_context_n_ubatch {
+    uint64_t context  = 0;
+    size_t   n_ubatch = 0;
+};
+
+// How many backend contexts of one model on one device can each record a published n_ubatch. A context past it is
+// refused by name (context_room) rather than left out of the plan its buffers are sized from.
+constexpr int planned_context_capacity = 8;
+
+// One owner's contribution on one device. generation 0: no owner holds it (no slot generation is ever 0). The context
+// entries leave with the contribution, so a drop or a newer owner's sweep clears them too.
 struct planned_load_term_contribution {
-    uint64_t generation                      = 0;
-    size_t   values[planned_load_term_count] = {};
+    uint64_t                 generation                         = 0;
+    size_t                   values[planned_load_term_count]    = {};
+    planned_context_n_ubatch contexts[planned_context_capacity] = {};
 };
 
 // What a store swept: per device, the generation of the older contribution it removed for the owner's slot (0: none).
@@ -155,17 +175,70 @@ class planned_load_terms {
         return value > others ? value : others;
     }
 
-    // The value `owner` holds for `term` on `device` once it may only rise while the owner lives: the larger of `value`
-    // and what the owner holds now, `value` when it holds nothing there (another generation of its slot is another
-    // owner) or an argument is out of range. A dense scratch n_ubatch is such a term: two contexts of one model share
-    // their owner's contribution, so a second context at a smaller n_ubatch must not shrink the plan the first one's
-    // buffers were sized from. It leaves only with the owner.
-    size_t raised_value(int device, lifecycle::SlotToken owner, planned_load_term term, size_t value) const {
-        size_t current = 0;
-        if (!get(device, owner, term, &current)) {
-            return value;
+    // Record `n_ubatch` as the value backend context `context` last published for `owner` on `device`. The context's
+    // own earlier value is replaced, so the auto-ubatch ladder's settle lowers what a losing rung raised; every other
+    // context's value stays. False, recording nothing, when the owner holds no contribution there (another generation
+    // of its slot is another owner), for context 0 or n_ubatch 0, an argument out of range, or no room (context_room).
+    bool set_context_n_ubatch(int device, lifecycle::SlotToken owner, uint64_t context, size_t n_ubatch) {
+        planned_load_term_contribution * c = owned(device, owner);
+        if (c == nullptr || context == 0 || n_ubatch == 0) {
+            return false;
         }
-        return current > value ? current : value;
+        int i = context_index(*c, context);
+        if (i < 0) {
+            i = context_index(*c, 0);
+        }
+        if (i < 0) {
+            return false;
+        }
+        c->contexts[i] = planned_context_n_ubatch{ context, n_ubatch };
+        return true;
+    }
+
+    // Whether `context` can record a value for `owner` on `device`: it holds an entry there, one is free, or the owner
+    // holds no contribution there (nothing is recorded then, and nothing is refused for want of room).
+    bool context_room(int device, lifecycle::SlotToken owner, uint64_t context) const {
+        const planned_load_term_contribution * c = owned(device, owner);
+        return c == nullptr || context == 0 || context_index(*c, context) >= 0 || context_index(*c, 0) >= 0;
+    }
+
+    // Remove backend context `context`'s entry on `device` (the context released its hold or is destroyed), writing
+    // the owner it was recorded for to `*owner` (may be null). A backend context publishes for one model, so at most
+    // one owner holds it. True when an entry was removed.
+    bool drop_context(int device, uint64_t context, lifecycle::SlotToken * owner) {
+        if (!device_in_range(device) || context == 0) {
+            return false;
+        }
+        for (uint32_t slot = 0; slot < lifecycle::model_slot_count; ++slot) {
+            planned_load_term_contribution & c = contributions_[device][slot];
+            const int                        i = c.generation != 0 ? context_index(c, context) : -1;
+            if (i < 0) {
+                continue;
+            }
+            c.contexts[i] = planned_context_n_ubatch{};
+            if (owner != nullptr) {
+                *owner = lifecycle::SlotToken{ slot, c.generation };
+            }
+            return true;
+        }
+        return false;
+    }
+
+    // The n_ubatch `owner`'s dense scratch is planned at on `device`: the largest value its live contexts last
+    // published, or its DENSE_SCRATCH_LOAD_N_UBATCH when none is live. 0 when the owner holds no contribution there
+    // or an argument is out of range.
+    size_t planned_n_ubatch(int device, lifecycle::SlotToken owner) const {
+        const planned_load_term_contribution * c = owned(device, owner);
+        if (c == nullptr) {
+            return 0;
+        }
+        size_t out = 0;
+        for (const planned_context_n_ubatch & entry : c->contexts) {
+            if (entry.context != 0 && entry.n_ubatch > out) {
+                out = entry.n_ubatch;
+            }
+        }
+        return out != 0 ? out : c->values[static_cast<int>(planned_load_term::DENSE_SCRATCH_LOAD_N_UBATCH)];
     }
 
     // `owner`'s own value of `term` on `device`, into `*out`. False, writing 0, when the owner holds no contribution
@@ -200,6 +273,31 @@ class planned_load_terms {
 
     static bool is_model_owner(lifecycle::SlotToken owner) {
         return owner.slot < lifecycle::model_slot_count && owner.generation != 0;
+    }
+
+    // `owner`'s contribution on `device`, or null when another generation of its slot (or none) holds it or the
+    // arguments are out of range.
+    const planned_load_term_contribution * owned(int device, lifecycle::SlotToken owner) const {
+        if (!device_in_range(device) || !is_model_owner(owner)) {
+            return nullptr;
+        }
+        const planned_load_term_contribution & c = contributions_[device][owner.slot];
+        return c.generation == owner.generation ? &c : nullptr;
+    }
+
+    planned_load_term_contribution * owned(int device, lifecycle::SlotToken owner) {
+        return const_cast<planned_load_term_contribution *>(
+            static_cast<const planned_load_terms *>(this)->owned(device, owner));
+    }
+
+    // The index of `c`'s entry recorded for `context` (0: the first free entry), or -1.
+    static int context_index(const planned_load_term_contribution & c, uint64_t context) {
+        for (int i = 0; i < planned_context_capacity; ++i) {
+            if (c.contexts[i].context == context) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     // Clear `slot`'s contribution on every device where it is held by `generation` (EXACT, a drop) or by a generation

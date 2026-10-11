@@ -357,27 +357,76 @@ void test_a_rejected_owner_contributes_nothing_to_the_accepted_merge() {
     check(t.merged_accepted(0, ubatch, f16_flag) == 512, "B's n_ubatch left with it");
 }
 
-// An owner's n_ubatch only rises while the owner lives (lead ruling on llama.cpp-45qo): two contexts of one model on a
-// device share the owner's contribution, so a second context at a smaller n_ubatch must not shrink the plan the first
-// one's buffers were sized from. It leaves only with the owner.
-void test_an_owners_n_ubatch_only_rises_until_it_drops() {
-    printf(
-        "raised_value: an owner's n_ubatch only rises while it lives, and a fresh owner starts from its own value\n");
-    planned_load_terms      t;
-    const planned_load_term ubatch = planned_load_term::DENSE_SCRATCH_N_UBATCH;
-    check(t.raised_value(0, kA, ubatch, 2048) == 2048, "A holds nothing yet: its first context's 2048 stands");
-    check(store_q8(t, 0, kA, kQ8Small, t.raised_value(0, kA, ubatch, 2048)), "A's first context plans at 2048");
-    check(t.raised_value(0, kA, ubatch, 512) == 2048, "A's second context at 512 keeps A's 2048");
-    check(store_q8(t, 0, kA, kQ8Small, t.raised_value(0, kA, ubatch, 512)), "A's second context re-plans");
-    check(n_ubatch(t, 0) == 2048, "the device still reads 2048: the first context's buffers stay planned");
-    check(t.raised_value(0, kA, ubatch, 4096) == 4096, "a larger context raises it");
-    check(t.raised_value(1, kA, ubatch, 512) == 512, "on a device A holds nothing on, the value stands");
+// An owner's planned n_ubatch is the largest of the values its live backend contexts last published, each context's
+// own entry replaced by its own later publish, and the load's n_ubatch when no context is live (lead ruling on
+// llama.cpp-45qo). A latch kept the plan at a losing auto-ubatch rung after the ladder settled lower, and treating the
+// load's value as a floor held a context running below it to the load's n_ubatch.
+constexpr uint64_t kCtx1 = 1;  // backend context ids, minted from 1
+constexpr uint64_t kCtx2 = 2;
+
+bool load_q8(planned_load_terms & t, int device, SlotToken owner, size_t ubatch) {
+    const planned_load_term_value values[] = {
+        { planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN,    kQ8Small },
+        { planned_load_term::DENSE_SCRATCH_N_UBATCH,      ubatch   },
+        { planned_load_term::DENSE_SCRATCH_LOAD_N_UBATCH, ubatch   },
+    };
+    return t.set(device, owner, values, 3);
+}
+
+void test_an_owner_plans_at_the_largest_live_context() {
+    printf("planned_n_ubatch: the largest of the live contexts' last published values, the load's with none live\n");
+    planned_load_terms t;
+    check(load_q8(t, 0, kA, 512), "A loads at n_ubatch 512");
+    check(t.planned_n_ubatch(0, kA) == 512, "with no live context A plans at the load's 512");
+    check(t.set_context_n_ubatch(0, kA, kCtx1, 4096), "context 1 publishes 4096");
+    check(t.set_context_n_ubatch(0, kA, kCtx2, 2048), "context 2 publishes 2048");
+    check(t.planned_n_ubatch(0, kA) == 4096, "A plans at 4096, the larger");
+    check(t.set_context_n_ubatch(0, kA, kCtx1, 1024), "context 1 publishes again, at 1024");
+    check(t.planned_n_ubatch(0, kA) == 2048, "its own entry was replaced: A plans at context 2's 2048");
+    SlotToken dropped{};
+    check(t.drop_context(0, kCtx2, &dropped), "context 2 is destroyed");
+    check(dropped.slot == kA.slot && dropped.generation == kA.generation, "the drop names A, the owner it held");
+    check(t.planned_n_ubatch(0, kA) == 1024, "A falls to context 1's 1024");
+    check(t.drop_context(0, kCtx1, nullptr), "context 1 is destroyed");
+    check(t.planned_n_ubatch(0, kA) == 512, "with none live A plans at the load's 512 again");
+    check(!t.drop_context(0, kCtx1, nullptr), "a context dropped twice removes nothing the second time");
+}
+
+void test_the_ladder_settle_lowers_its_own_rung() {
+    printf("set_context_n_ubatch: a context's later publish replaces its own, below the load's value too\n");
+    planned_load_terms t;
+    check(load_q8(t, 0, kA, 512), "A loads at n_ubatch 512");
+    check(t.set_context_n_ubatch(0, kA, kCtx1, 4096), "the ladder publishes rung 4096, which then loses");
+    check(t.set_context_n_ubatch(0, kA, kCtx1, 2048), "the settle republishes the winner, 2048");
+    check(t.planned_n_ubatch(0, kA) == 2048, "A plans at 2048, not the losing 4096");
+    check(t.set_context_n_ubatch(0, kA, kCtx1, 256), "a context at -ub 256");
+    check(t.planned_n_ubatch(0, kA) == 256, "A plans at 256: the load's 512 is not a floor");
+}
+
+void test_context_entries_are_bounded_and_owned() {
+    printf("context entries: one owner's, a bounded set, refused when full, and gone with the owner\n");
+    planned_load_terms t;
+    check(!t.set_context_n_ubatch(0, kA, kCtx1, 512), "A holds nothing on device 0: nothing is recorded");
+    check(t.context_room(0, kA, kCtx1), "and nothing is refused for want of room");
+    check(load_q8(t, 0, kA, 512) && load_q8(t, 0, kB, 512), "A and B load on device 0");
+    check(!t.set_context_n_ubatch(0, kA, 0, 512), "context 0 is the free marker, never an entry");
+    check(!t.set_context_n_ubatch(0, kA, kCtx1, 0), "n_ubatch 0 is never recorded");
+    for (int i = 0; i < ggml_sycl::planned_context_capacity; ++i) {
+        check(t.set_context_n_ubatch(0, kA, 100 + i, 128), "a context of A records its value");
+    }
+    check(!t.context_room(0, kA, 999), "a context past the capacity has no room");
+    check(!t.set_context_n_ubatch(0, kA, 999, 4096), "and records nothing");
+    check(t.planned_n_ubatch(0, kA) == 128, "the refused 4096 is not in A's plan");
+    check(t.context_room(0, kA, 100) && t.set_context_n_ubatch(0, kA, 100, 256), "a recorded context still replaces");
+    check(t.context_room(0, kB, 999), "B's entries are its own: B has room");
+    check(t.set_context_n_ubatch(0, kB, kCtx1, 1024) && t.planned_n_ubatch(0, kA) == 256,
+          "a context of B does not move A's plan");
+    check(t.planned_n_ubatch(1, kA) == 0, "on a device A holds nothing on, A plans at 0");
     const SlotToken a_next{ kA.slot, kA.generation + 1 };
-    check(t.raised_value(0, a_next, ubatch, 512) == 512, "another generation of A's slot is another owner");
-    check(t.raised_value(GGML_SYCL_MAX_DEVICES, kA, ubatch, 512) == 512, "a device out of range: the value stands");
+    check(t.planned_n_ubatch(0, a_next) == 0, "another generation of A's slot is another owner");
     check(t.drop(kA), "A unloads");
-    check(store_q8(t, 0, kB, kQ8Small, t.raised_value(0, kB, ubatch, 512)), "a fresh owner B plans at 512");
-    check(n_ubatch(t, 0) == 512, "the device reads B's 512: A's 2048 left with A");
+    check(!t.drop_context(0, 100, nullptr), "A's context entries left with A");
+    check(load_q8(t, 0, kA, 512) && t.planned_n_ubatch(0, kA) == 512, "A reloaded starts from its load's value");
 }
 
 void test_the_term_count_is_the_enum_count() {
@@ -430,7 +479,9 @@ int main() {
     test_a_rejected_figure_is_an_owner_flag();
     test_a_rejected_owner_contributes_nothing_to_the_accepted_merge();
     test_a_newer_owner_sweeps_stale_dense_scratch_inputs();
-    test_an_owners_n_ubatch_only_rises_until_it_drops();
+    test_an_owner_plans_at_the_largest_live_context();
+    test_the_ladder_settle_lowers_its_own_rung();
+    test_context_entries_are_bounded_and_owned();
     test_the_term_count_is_the_enum_count();
 
     printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);

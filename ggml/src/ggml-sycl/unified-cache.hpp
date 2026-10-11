@@ -2003,18 +2003,31 @@ bool     unified_cache_set_planned_dequant_f16_scratch(int                  devi
 // ensures each buffer at max(its own plan, the graph's demand).
 size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id);
 size_t unified_cache_get_planned_dequant_f16_buffer_bytes(int device_id, bool src1);
-// llama.cpp-kpjw: re-derive both dense scratch plans at `n_ubatch`. The runtime-context transaction calls it with the
-// runtime n_ubatch (auto-ubatch picks it after load). llama.cpp-45qo: from `owner`'s own inputs, changing only that
-// owner's n_ubatch, which only rises while the owner lives: the owner stores the larger of its current n_ubatch and
-// `n_ubatch`, so a second context of the same model at a smaller n_ubatch cannot shrink the plan the first one's
-// buffers were sized from, and the value drops only with the owner. Another live model's contribution is left as it
-// is. False when the owner planned nothing on the device, when the owner's own figure for either buffer was rejected
-// (its inputs for that buffer read 0, so it refuses while it is live; another owner's rejection does not refuse it),
-// or when a figure overflows.
-bool     unified_cache_replan_planned_dense_scratch(int device_id, lifecycle::SlotToken owner, uint32_t n_ubatch);
+// llama.cpp-kpjw: re-derive both dense scratch plans when backend context `context` (its minted planned-scratch id)
+// publishes `n_ubatch`. The runtime-context transaction calls it with the runtime n_ubatch (auto-ubatch picks it after
+// load). llama.cpp-45qo: from `owner`'s own inputs, at the owner's planned n_ubatch, the largest of the values its live
+// contexts last published. The context's own earlier value is replaced, so the auto-ubatch ladder's settle lowers what
+// a losing rung raised, and another live context of the model keeps its own. Another live model's contribution is left
+// as it is. `owner_n_ubatch` (optional) receives the owner's planned n_ubatch. False when the owner planned nothing on
+// the device, when the owner's own figure for either buffer was rejected (its inputs for that buffer read 0, so it
+// refuses while it is live; another owner's rejection does not refuse it), when the model has no room for another
+// context's value (unified_cache_planned_dense_scratch_context_room), or when a figure overflows.
+bool     unified_cache_replan_planned_dense_scratch(int                  device_id,
+                                                    lifecycle::SlotToken owner,
+                                                    uint64_t             context,
+                                                    uint32_t             n_ubatch,
+                                                    uint32_t *           owner_n_ubatch);
+// Remove backend context `context`'s published n_ubatch on `device_id` (the context is destroyed, releasing its hold)
+// and re-derive its model's plan, which may fall: to the largest of the model's remaining live contexts, or to the
+// load's n_ubatch when none is left. True when the context had published one.
+bool     unified_cache_release_planned_dense_scratch_context(int device_id, uint64_t context);
+// Whether backend context `context` can record a published n_ubatch for `owner` on `device_id`: it has one already,
+// the model has room for another (planned_context_capacity contexts per model per device), or the model holds nothing
+// there. The runtime-context transaction refuses a context without room by name rather than leave it out of the plan.
+bool     unified_cache_planned_dense_scratch_context_room(int device_id, lifecycle::SlotToken owner, uint64_t context);
 // The n_ubatch one half of the published plan is sized at (f16 false: the Q8_1 src1 half; true: the f16 dequant half):
-// the largest of the owners' on the device whose figure for that half was accepted. Each owner's own value only rises
-// while it lives.
+// the largest of the owners' on the device whose figure for that half was accepted. Each owner's own value is the
+// largest of its live contexts' last published values, or the load's when none is live.
 uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id, bool f16);
 // Whether `owner`'s own figure for either half of the dense scratch plan on `device_id` was rejected, and which (either
 // out may be null). Such an owner has no dense scratch planned, so the runtime-context transaction refuses its context

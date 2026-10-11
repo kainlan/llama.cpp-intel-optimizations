@@ -2341,9 +2341,13 @@ bool unified_cache_set_planned_mmq_src1_scratch(int                  device_id,
                                                 lifecycle::SlotToken owner,
                                                 size_t               bytes_per_token,
                                                 uint32_t             n_ubatch) {
+    // The load's n_ubatch is also recorded on its own: the owner plans at it again once no context of the model is
+    // live.
     bool       planned = false;
     const bool stored  = planned_load_terms_store(device_id, owner, [&](planned_load_terms_replaced * replaced) {
-        return planned_mmq_src1_scratch_store_locked(device_id, owner, bytes_per_token, n_ubatch, &planned, replaced);
+        return planned_mmq_src1_scratch_store_locked(device_id, owner, bytes_per_token, n_ubatch, &planned, replaced) &&
+               g_planned_load_terms.owners.set(device_id, owner, planned_load_term::DENSE_SCRATCH_LOAD_N_UBATCH,
+                                                n_ubatch);
     });
     return stored && planned;
 }
@@ -2356,7 +2360,9 @@ bool unified_cache_set_planned_dequant_f16_scratch(int                  device_i
     bool       planned = false;
     const bool stored  = planned_load_terms_store(device_id, owner, [&](planned_load_terms_replaced * replaced) {
         return planned_dequant_f16_scratch_store_locked(device_id, owner, max_weight_bytes, src1_bytes_per_token,
-                                                         n_ubatch, &planned, replaced);
+                                                         n_ubatch, &planned, replaced) &&
+               g_planned_load_terms.owners.set(device_id, owner, planned_load_term::DENSE_SCRATCH_LOAD_N_UBATCH,
+                                                n_ubatch);
     });
     return stored && planned;
 }
@@ -2396,22 +2402,15 @@ static bool planned_dense_scratch_owner_rejected_locked(int                  dev
     return q8 != 0 || f16 != 0;
 }
 
-bool unified_cache_replan_planned_dense_scratch(int device_id, lifecycle::SlotToken owner, uint32_t n_ubatch) {
-    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || n_ubatch == 0) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
-    // An owner whose figure was rejected had its inputs for that half overwritten with 0, so re-deriving from them
-    // would plan nothing for a model that needs scratch: its re-plan refuses while it is live (llama.cpp-kpjw). Only
-    // its own flags count. Another owner's rejection leaves this owner's plan valid and re-plannable.
-    if (planned_dense_scratch_owner_rejected_locked(device_id, owner, nullptr, nullptr)) {
-        return false;
-    }
-    // The owner's OWN inputs (llama.cpp-45qo), fed to the same two plan stores as the load-time plan: one formula, two
-    // callers. Only the owner's n_ubatch changes; another model live on the device keeps its own contribution, so a
-    // draft context at a small n_ubatch cannot shrink the plan the live target's buffers were sized from, and the
-    // device reads the merge. An owner that planned nothing here (no n_ubatch: every accepted figure stores one) has
-    // nothing to re-derive.
+// Re-derive `owner`'s dense scratch plan on `device_id` from the owner's OWN inputs (llama.cpp-45qo), fed to the same
+// two plan stores as the load-time plan: one formula, two callers. It is sized at the owner's planned n_ubatch (the
+// largest value its live backend contexts last published, the load's when none is live), so another model live on the
+// device keeps its own contribution and the device reads the merge. An owner that planned nothing here (no n_ubatch:
+// every accepted figure stores one) has nothing to re-derive. `*stored`: whether a store changed the table, which the
+// caller publishes even when the other store was refused. Called with g_planned_load_terms.mutex held, for an owner
+// whose own figure was not rejected.
+static bool planned_dense_scratch_replan_locked(int device_id, lifecycle::SlotToken owner, bool * stored) {
+    *stored               = false;
     size_t owner_n_ubatch = 0;
     size_t q8_per_token   = 0;
     size_t f16_weights    = 0;
@@ -2426,16 +2425,12 @@ bool unified_cache_replan_planned_dense_scratch(int device_id, lifecycle::SlotTo
                                          &f16_per_token)) {
         return false;
     }
-    // The owner's n_ubatch only rises while it lives: two contexts of one model on one device share this owner's
-    // contribution, so a second context at a smaller n_ubatch must not shrink the plan the first one's buffers were
-    // sized from (lead ruling on llama.cpp-45qo). It drops only with the owner. Every stored value came from a
-    // uint32_t, so the larger of two fits one.
-    const size_t raised =
-        g_planned_load_terms.owners.raised_value(device_id, owner, planned_load_term::DENSE_SCRATCH_N_UBATCH, n_ubatch);
-    if (raised > UINT32_MAX) {
+    // Every recorded value came from a uint32_t, so the largest of them fits one.
+    const size_t planned_n_ubatch = g_planned_load_terms.owners.planned_n_ubatch(device_id, owner);
+    if (planned_n_ubatch == 0 || planned_n_ubatch > UINT32_MAX) {
         return false;
     }
-    const uint32_t next_n_ubatch = static_cast<uint32_t>(raised);
+    const uint32_t next_n_ubatch = static_cast<uint32_t>(planned_n_ubatch);
     bool           q8            = false;
     bool           f16           = false;
     const bool     q8_stored =
@@ -2443,12 +2438,67 @@ bool unified_cache_replan_planned_dense_scratch(int device_id, lifecycle::SlotTo
     const bool f16_stored =
         q8_stored && planned_dequant_f16_scratch_store_locked(device_id, owner, f16_weights, f16_per_token,
                                                               next_n_ubatch, &f16, nullptr);
+    *stored = q8_stored;
+    return f16_stored && q8 && f16;
+}
+
+bool unified_cache_replan_planned_dense_scratch(int                  device_id,
+                                                lifecycle::SlotToken owner,
+                                                uint64_t             context,
+                                                uint32_t             n_ubatch,
+                                                uint32_t *           owner_n_ubatch) {
+    if (owner_n_ubatch != nullptr) {
+        *owner_n_ubatch = 0;
+    }
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || n_ubatch == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
+    // An owner whose figure was rejected had its inputs for that half overwritten with 0, so re-deriving from them
+    // would plan nothing for a model that needs scratch: its re-plan refuses while it is live (llama.cpp-kpjw). Only
+    // its own flags count. Another owner's rejection leaves this owner's plan valid and re-plannable.
+    if (planned_dense_scratch_owner_rejected_locked(device_id, owner, nullptr, nullptr)) {
+        return false;
+    }
+    // The context's own entry is replaced, so the auto-ubatch ladder's settle lowers what a losing rung raised, and
+    // another live context of the model keeps its own: the model plans at the largest (lead ruling on llama.cpp-45qo).
+    if (!g_planned_load_terms.owners.set_context_n_ubatch(device_id, owner, context, n_ubatch)) {
+        return false;
+    }
+    bool       stored  = false;
+    const bool planned = planned_dense_scratch_replan_locked(device_id, owner, &stored);
     // A store that changed the table is published even when the other one was refused, so the table and the
     // atomics the readers load never disagree.
-    if (q8_stored) {
+    if (stored) {
         planned_load_terms_publish_locked();
     }
-    return f16_stored && q8 && f16;
+    if (owner_n_ubatch != nullptr) {
+        *owner_n_ubatch = static_cast<uint32_t>(g_planned_load_terms.owners.planned_n_ubatch(device_id, owner));
+    }
+    return planned;
+}
+
+bool unified_cache_release_planned_dense_scratch_context(int device_id, uint64_t context) {
+    lifecycle::SlotToken        owner{};
+    std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
+    if (!g_planned_load_terms.owners.drop_context(device_id, context, &owner)) {
+        return false;
+    }
+    // The model now plans at its remaining live contexts' largest, or at its load's n_ubatch, so its plan may fall.
+    // A rejected owner's plan is left as the rejection stored it.
+    bool stored = false;
+    if (!planned_dense_scratch_owner_rejected_locked(device_id, owner, nullptr, nullptr)) {
+        (void) planned_dense_scratch_replan_locked(device_id, owner, &stored);
+    }
+    if (stored) {
+        planned_load_terms_publish_locked();
+    }
+    return true;
+}
+
+bool unified_cache_planned_dense_scratch_context_room(int device_id, lifecycle::SlotToken owner, uint64_t context) {
+    std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
+    return g_planned_load_terms.owners.context_room(device_id, owner, context);
 }
 
 uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id, bool f16) {
