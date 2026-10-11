@@ -30783,12 +30783,18 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
         // Recipe availability is narrower than executor capability. It merely
         // lets an exact primary decode candidate reach DIRECT admission;
         // choose_moe_batch_executor still requires the admitted bundle.
+        //
+        // Whether the lease can be bound is the binder's question, so ask the
+        // binder. A handle-kind test here was a second, narrower answer: every
+        // expert lease published from a unified-cache device buffer is a slice
+        // of that buffer's arena-zone handle, which bind() accepts, so a
+        // DIRECT-only test closed the route on every card (llama.cpp-1sxq).
         const int64_t qk = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
-        const bool static_candidate = phase == moe_route_phase::DECODE && rows == 1 && layout == GGML_LAYOUT_AOS &&
-                                      route_device == submit_device && direct_recipe_candidate &&
-                                      direct_recipe_candidate->kind() == ggml_sycl::mem_handle_kind::DIRECT &&
-                                      direct_recipe_candidate->has_stable_owner_identity() && K % qk == 0 &&
-                                      K % QK8_1 == 0 && K <= INT32_MAX && N <= INT32_MAX;
+        const bool    static_candidate =
+            phase == moe_route_phase::DECODE && rows == 1 && layout == GGML_LAYOUT_AOS &&
+            route_device == submit_device && direct_recipe_candidate &&
+            ggml_sycl::moe::canonical_allocation_integration::exact_identity(*direct_recipe_candidate).has_value() &&
+            K % qk == 0 && K % QK8_1 == 0 && K <= INT32_MAX && N <= INT32_MAX;
         // Authority belongs to the invocation that is building this batch.
         // Never rediscover a same-device backend/queue through global state:
         // multiple contexts may legitimately coexist on one device.

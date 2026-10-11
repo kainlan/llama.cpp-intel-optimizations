@@ -4394,6 +4394,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-1sxq: the Q1_0/NVFP4 DIRECT recipe asks canonical_allocation_integration::exact_identity() whether a lease
+# can be bound, the same test retain() and bind() apply, instead of testing the handle kind. A DIRECT-only test refused
+# every arena-slice expert lease. A mutant per claim. Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-moe-direct-recipe-identity-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-direct-recipe-identity-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-8ecj: a memory that holds one layer in two KV buffers (qwen4exp's llama_memory_hybrid_idx: attention K/V
 # and indexer keys) is budgeted and allocated buffer by buffer. The tiered allocator's backstop counts the buffer it is
 # allocating at its own layer sizes, not the plan's per-layer KV. A mutant per claim. Text only: no device, no model.

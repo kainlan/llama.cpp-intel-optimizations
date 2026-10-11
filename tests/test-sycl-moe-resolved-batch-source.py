@@ -220,7 +220,10 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
             "if (type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4)",
         "direct recipe decode-only": "phase == moe_route_phase::DECODE && rows == 1",
         "direct recipe primary-only": "route_device == submit_device && direct_recipe_candidate",
-        "direct recipe owned stable": "direct_recipe_candidate->has_stable_owner_identity()",
+        # The candidate asks the binder whether the lease has an exact allocation identity, the same test
+        # bind() applies (llama.cpp-1sxq).
+        "direct recipe exact identity":
+            "ggml_sycl::moe::canonical_allocation_integration::exact_identity(*direct_recipe_candidate).has_value()",
         "direct recipe explicit invocation authority":
             "queue_capability && queue_capability->valid()",
         "opaque admitted recipe ticket": "moe_admitted_recipe_ticket admitted_recipe_ticket",
@@ -620,14 +623,17 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
         "phase == moe_route_phase::DECODE && rows == 1",
         "layout == GGML_LAYOUT_AOS",
         "route_device == submit_device",
-        "direct_recipe_candidate->kind() == ggml_sycl::mem_handle_kind::DIRECT",
-        "direct_recipe_candidate->has_stable_owner_identity()",
+        "ggml_sycl::moe::canonical_allocation_integration::exact_identity(*direct_recipe_candidate).has_value()",
         "K % qk == 0",
         "invocation_backend && invocation_queue",
         "queue_capability && queue_capability->valid()",
         "queue_capability->owner_device() == submit_device",
     ):
         assert witness in query, witness
+    # A handle-kind test is a second answer to the binder's question. Every expert lease published from a
+    # unified-cache device buffer is an arena slice, so a DIRECT-only test refused the route on every card
+    # (llama.cpp-1sxq).
+    assert "mem_handle_kind::DIRECT" not in query
     # Vertical alignment pads this assignment, so match on tokens -- a literal
     # single-space spelling breaks the next time clang-format realigns the block.
     assert has_tokens(query, 'cap.reason = "direct-recipe-candidate"')
@@ -688,7 +694,8 @@ def test_contract_and_mutation_witnesses() -> None:
          source.replace("route_device == submit_device && direct_recipe_candidate",
                         "route_device >= 0 && direct_recipe_candidate", 1), host_test, mem_source),
         ("recipe-allows-ownerless", header,
-         source.replace("direct_recipe_candidate->has_stable_owner_identity()", "true", 1), host_test, mem_source),
+         source.replace("ggml_sycl::moe::canonical_allocation_integration::exact_identity(*direct_recipe_candidate).has_value()",
+                        "true", 1), host_test, mem_source),
         ("recipe-drops-explicit-queue-authority", header,
          source.replace("queue_capability && queue_capability->valid()",
                         "queue_capability", 1), host_test, mem_source),
