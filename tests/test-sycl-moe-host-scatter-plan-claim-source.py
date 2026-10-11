@@ -351,6 +351,9 @@ def claim_decline_reported_once_per_reason(sycl: str, hdr: str = HDR) -> bool:
             and "return (seen.fetch_or(bit, std::memory_order_relaxed) & bit) == 0;" in first)
 
 
+_JOB_RETAIN = "ggml_sycl::retain_handles_until_event(std::move(job_buffers), joins[k]);"
+
+
 def claim_flush_reuses_one_workspace(sycl: str) -> bool:
     """A decode flush builds no workspace of its own once the thread's workspace is sized: the rows, the runs, the
     plan, the handle lists, the copy events and the flush's events live in one thread-local workspace.  The only
@@ -372,6 +375,7 @@ def claim_flush_reuses_one_workspace(sycl: str) -> bool:
             and "moe_host_scatter_workspace & ws = g_moe_host_scatter_ws; ws.events.clear();" in flush
             and "std::vector<sycl::event> & copied = ws.copied; copied.clear();" in compact
             and compact.count("retain_handles_until_event(") == 1 and 0 <= last < retain
+            and _JOB_RETAIN in flush
             and ALLOC_RE.search(code_only(flush)) is None)
 
 
@@ -588,6 +592,15 @@ def test_mutant_retention_per_chunk_fails():
     assert not claim_flush_reuses_one_workspace(
         _once(SYCL, "placed_last = placed;",
               "placed_last = placed; ggml_sycl::retain_handles_until_event({ lead.scatter_scratch }, placed);"))
+
+
+def test_mutant_job_buffers_not_retained_fails():
+    assert not claim_flush_reuses_one_workspace(_once(SYCL, _JOB_RETAIN, "(void) job_buffers;", within=FLUSH_SIG))
+
+
+def test_mutant_job_buffers_retained_until_another_join_fails():
+    assert not claim_flush_reuses_one_workspace(
+        _once(SYCL, _JOB_RETAIN, _JOB_RETAIN.replace("joins[k]", "joins.back()"), within=FLUSH_SIG))
 
 
 def test_mutant_workspace_not_thread_local_fails():
