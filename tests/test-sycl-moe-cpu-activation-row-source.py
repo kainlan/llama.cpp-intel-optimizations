@@ -778,7 +778,7 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
         at = nxt
 
     # 10. no host wait of any kind in the split.
-    if re.search(r"event::wait|\.wait\(\)|wait_prev_scatter_events|stream->wait|wait_and_throw", body):
+    if re.search(r"event::wait|\.wait\(\)|pending_cpu_scatter_wait_prev_events|stream->wait|wait_and_throw", body):
         raise ContractError("FAIL [pin S4]: do_cpu_dispatch waits on the host; the hot/cold hazard is closed by disjoint regions, not a wait (llama.cpp-4hg7)")
 
 

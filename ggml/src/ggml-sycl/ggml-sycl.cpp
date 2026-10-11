@@ -23929,8 +23929,8 @@ struct pending_cpu_scatter {
     // The last flush's scatter H2D events.  The buffers that flush read are
     // retained until its join event (retain_handles_until_event), so nothing
     // is freed here; the graph boundary waits these events
-    // (wait_prev_scatter_events, llama.cpp-z4kd).  A scatter is still owed
-    // that wait while the list is not empty.
+    // (pending_cpu_scatter_wait_prev_events, llama.cpp-z4kd).  A scatter is
+    // still owed that wait while the list is not empty.
     struct prev_scatter_state {
         std::vector<sycl::event> scatter_events;
     } prev_scatter;
@@ -24245,7 +24245,7 @@ static void moe_cpu_job_join(const std::shared_future<void> & job) noexcept {
 
 // Submits the join of a CPU job on `queue` and returns its event.  The host_task
 // holds the job's shared future.
-static sycl::event moe_cpu_scatter_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {
+static sycl::event moe_cpu_job_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {
     return queue.submit([&](sycl::handler & cgh) { cgh.host_task([job]() { moe_cpu_job_join(job); }); });
 }
 
@@ -25628,7 +25628,7 @@ static bool ggml_sycl_moe_fusion_enabled() {
 // earlier join and CPU job on that in-order queue, which is what the graph
 // boundary needs before the host zones are reset.  This is a host wait, so it
 // is only called from ggml_sycl_cpu_tg_flush_pending(), never from a flush.
-static void wait_prev_scatter_events(pending_cpu_scatter & slot) {
+static void pending_cpu_scatter_wait_prev_events(pending_cpu_scatter & slot) {
     std::vector<sycl::event> & events = slot.prev_scatter.scatter_events;
     if (!events.empty()) {
         moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
@@ -25841,7 +25841,7 @@ static moe_host_scatter_form moe_host_scatter_submit_compact(const pending_cpu_s
 // The flush is done with the slot (llama.cpp-z4kd).  Its scatter is submitted behind the CPU job's join and nothing
 // has waited for either; the flush retained every buffer the job uses until that join, so clearing the slot frees
 // nothing still in use.  prev_scatter keeps only the scatter's events, which the graph boundary waits
-// (wait_prev_scatter_events).
+// (pending_cpu_scatter_wait_prev_events).
 static void pending_cpu_scatter_retire(pending_cpu_scatter & slot, const std::vector<sycl::event> & scatter_events) {
     slot.prev_scatter.scatter_events = scatter_events;
 
@@ -25920,7 +25920,7 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
         std::vector<sycl::event> & joins = ws.joins;
         joins.clear();
         for (int k = 0; k < n_group; ++k) {
-            joins.push_back(moe_cpu_scatter_join_on_queue(*slot.stream, group[k]->future.share()));
+            joins.push_back(moe_cpu_job_join_on_queue(*slot.stream, group[k]->future.share()));
         }
 
         auto t1 = hrc::now();  // After the join submissions (no wait)
@@ -26176,9 +26176,9 @@ static void ggml_sycl_pipeline_cpu_warn_retired() {
     (void) set;
 }
 
-static void wait_prev_scatter_events() {
-    wait_prev_scatter_events(g_pending_scatter_sibling);
-    wait_prev_scatter_events(g_pending_scatter);
+static void pending_cpu_scatter_wait_prev_events() {
+    pending_cpu_scatter_wait_prev_events(g_pending_scatter_sibling);
+    pending_cpu_scatter_wait_prev_events(g_pending_scatter);
     g_cpu_scatter_last_flush.events.clear();
 }
 
@@ -26757,8 +26757,8 @@ void ggml_sycl_cpu_tg_flush_pending() {
         g_cpu_tg_direct_pending_scatter.clear();
     }
     flush_pending_cpu_scatter();
-    wait_prev_scatter_events();      // The graph-boundary wait for the last joins and scatters of every slot
-    moe_shared_act_new_graph();      // graph-local: src1 storage is rewritten by the next graph
+    pending_cpu_scatter_wait_prev_events();  // The graph-boundary wait for the last joins and scatters of every slot
+    moe_shared_act_new_graph();              // graph-local: src1 storage is rewritten by the next graph
     if (ggml_sycl_pipeline_moe_enabled()) {
         pipeline_scatter_drain();
     }

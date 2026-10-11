@@ -16,7 +16,7 @@ the one host block per layer.  Everything after it is event-chained:
     of its host weight leases, an earlier scatter H2D it would alias) run on the pool worker, through
     moe_cpu_job_wait_inputs, which only moe_cpu_job_prologue's returned closure calls;
   * a CPU job's completion is joined by a host_task on the op's in-order queue
-    (moe_cpu_scatter_join_on_queue, whose host_task calls moe_cpu_job_join, the one function that takes
+    (moe_cpu_job_join_on_queue, whose host_task calls moe_cpu_job_join, the one function that takes
     the job's future.get()), and the scatter H2D copies are submitted with that host_task's event as a
     dependency.
 
@@ -26,7 +26,7 @@ block calls (defined before it and in scope there), the submitting-thread helper
 scatter-slot flushes and the sibling move), and, transitively, every function defined in ggml-sycl.cpp
 that any of those calls, except the BOUNDARY entries (each listed with the reason its waits fall outside
 this contract; an entry the file no longer defines or the scan no longer reaches fails the gate).
-moe_cpu_job_prologue and moe_cpu_scatter_join_on_queue are scanned like any other callee, apart from the
+moe_cpu_job_prologue and moe_cpu_job_join_on_queue are scanned like any other callee, apart from the
 body of the closure each hands to another thread (OFF_THREAD_SPANS: the lambda the prologue returns runs
 on the pool worker, the lambda the join gives host_task runs on the queue's host-task thread).  A
 closure's capture list stays in the scan, since it is evaluated where the closure is built.  The gate
@@ -39,17 +39,17 @@ only shrink:
   N1. no `.get()`, `.wait(`, `::wait(`, `wait_and_throw`, `wait_for`, `wait_until`, `*_sync(` call and
       no synchronous `mem_copy(`/`mem_fill(`, except the one allowlisted multi-GPU statement below;
   N2. moe_cpu_job_wait_inputs and the join's future are never touched there directly: the scanned code
-      calls only moe_cpu_job_prologue (which builds the worker closure) and moe_cpu_scatter_join_on_queue;
+      calls only moe_cpu_job_prologue (which builds the worker closure) and moe_cpu_job_join_on_queue;
   N3. in moe_cpu_job_prologue the wait call sits inside the returned lambda, not in the factory body;
   N4. moe_cpu_job_join takes the job's `.get()`, and every call of it, like every `.get()` in
-      moe_cpu_scatter_join_on_queue, sits inside a `host_task(` argument of moe_cpu_scatter_join_on_queue;
+      moe_cpu_job_join_on_queue, sits inside a `host_task(` argument of moe_cpu_job_join_on_queue;
   N5. flush_pending_cpu_scatter_slot submits its H2D copies with the join events among their deps, both
       its own per-run copies and the compact form's (moe_host_scatter_submit_compact, whose every copy
       takes the dependency list it is handed).
       It is the only flush that submits a CPU job's scatter: the opt-in pipeline slot that had a
       flush of its own (GGML_SYCL_PIPELINE_CPU) is gone, subsumed by this one.
-  N6. the graph-boundary wait for the last scatters (wait_prev_scatter_events) is called only from
-      ggml_sycl_cpu_tg_flush_pending, which still calls it.
+  N6. the graph-boundary wait for the last scatters (pending_cpu_scatter_wait_prev_events) is called
+      only from ggml_sycl_cpu_tg_flush_pending, which still calls it.
 
 ALLOWLIST (exact statement, exactly once): `wait_pending_secondary_scatter_events(
 flush_pending_secondary_scatter());` at op entry, taken only when the secondary-GPU merge ring is full.
@@ -107,14 +107,14 @@ HELPERS = (
 JOINING_FLUSHES = ("flush_pending_cpu_scatter_slot",)
 PROLOGUE_FN = "moe_cpu_job_prologue("
 WAIT_FN = "moe_cpu_job_wait_inputs("
-JOIN_FN = "moe_cpu_scatter_join_on_queue("
+JOIN_FN = "moe_cpu_job_join_on_queue("
 PROLOGUE_DEF = "static std::function<void()> moe_cpu_job_prologue("
-JOIN_DEF = "static sycl::event moe_cpu_scatter_join_on_queue("
+JOIN_DEF = "static sycl::event moe_cpu_job_join_on_queue("
 JOINER_FN = "moe_cpu_job_join("
 JOINER_DEF = "static void moe_cpu_job_join("
 COMPACT_FN = "moe_host_scatter_submit_compact("
 COMPACT_DEF = "static moe_host_scatter_form moe_host_scatter_submit_compact("
-BOUNDARY_WAIT = "wait_prev_scatter_events("
+BOUNDARY_WAIT = "pending_cpu_scatter_wait_prev_events("
 BOUNDARY_FN = "void ggml_sycl_cpu_tg_flush_pending() {"
 
 ALLOWED = ("wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());",)
@@ -174,7 +174,7 @@ OFF_THREAD_SPANS = {
         ";",
         "the lambda it returns, which the pool worker runs before the job",
     ),
-    "moe_cpu_scatter_join_on_queue": (
+    "moe_cpu_job_join_on_queue": (
         r"\bhost_task\s*\(\s*\[",
         ")",
         "the lambda it hands host_task, which the queue's host-task thread runs",
@@ -582,13 +582,13 @@ def check(backend_src: str) -> None:
     joins_in_task = [m.start() for m in re.finditer(r"(\.|->)\s*get\s*\(\s*\)|\b" + re.escape(JOINER_FN), join)]
     if not joins_in_task or any(not inside_call(join, g, "host_task") for g in joins_in_task):
         raise ContractError(
-            f"FAIL [N4]: moe_cpu_scatter_join_on_queue joins the CPU job outside its host_task, on the "
+            f"FAIL [N4]: moe_cpu_job_join_on_queue joins the CPU job outside its host_task, on the "
             f"submitting thread ({TAG})"
         )
     for pat, what in FORBIDDEN[1:]:
         for m in pat.finditer(join):
             if not inside_call(join, m.start(), "host_task"):
-                raise ContractError(f"FAIL [N4]: moe_cpu_scatter_join_on_queue makes a {what} outside its host_task ({TAG})")
+                raise ContractError(f"FAIL [N4]: moe_cpu_job_join_on_queue makes a {what} outside its host_task ({TAG})")
     stray = []
     for m in re.finditer(r"\b" + re.escape(JOINER_FN), code):
         if code.startswith(JOINER_DEF, m.start() - len("static void ")):
@@ -606,9 +606,9 @@ def check(backend_src: str) -> None:
     # N5: the scatter H2D depends on the join events, in every joining flush and in the compact form.
     for fname, flush_text in flushes:
         dep_vars = set()
-        for m in re.finditer(r"(?:const\s+)?sycl::event\s+(\w+)\s*=\s*moe_cpu_scatter_join_on_queue\s*\(", flush_text):
+        for m in re.finditer(r"(?:const\s+)?sycl::event\s+(\w+)\s*=\s*moe_cpu_job_join_on_queue\s*\(", flush_text):
             dep_vars.add(m.group(1))
-        for m in re.finditer(r"(\w+)\s*\.\s*push_back\s*\(\s*moe_cpu_scatter_join_on_queue\s*\(", flush_text):
+        for m in re.finditer(r"(\w+)\s*\.\s*push_back\s*\(\s*moe_cpu_job_join_on_queue\s*\(", flush_text):
             dep_vars.add(m.group(1))
         if not dep_vars:
             raise ContractError(f"FAIL [N5]: {fname} does not keep the join events ({TAG})")
@@ -648,7 +648,7 @@ def check(backend_src: str) -> None:
     boundary_at = code.find(BOUNDARY_FN)
     # The drain's own definitions (the per-slot overload and the all-slots drain that calls it).
     drain_bodies = []
-    for m in re.finditer(r"^static\s+void\s+wait_prev_scatter_events\s*\([^)]*\)\s*\{", code, re.M):
+    for m in re.finditer(r"^static\s+void\s+pending_cpu_scatter_wait_prev_events\s*\([^)]*\)\s*\{", code, re.M):
         drain_bodies.append((m.start(), matching(code, m.end() - 1)))
     outside = []
     for c in calls:
@@ -660,7 +660,7 @@ def check(backend_src: str) -> None:
         outside.append(line_of(code, c))
     if outside:
         raise ContractError(
-            f"FAIL [N6]: wait_prev_scatter_events is called outside ggml_sycl_cpu_tg_flush_pending (line(s) "
+            f"FAIL [N6]: pending_cpu_scatter_wait_prev_events is called outside ggml_sycl_cpu_tg_flush_pending (line(s) "
             f"{outside}); it is a host wait for the graph boundary only ({TAG})"
         )
     if BOUNDARY_WAIT + ")" not in boundary:
@@ -700,7 +700,7 @@ def mutants(src: str) -> list[tuple[str, str]]:
     sub("future.get in the slot flush", slot_open, slot_open + "    slot.future.get();\n")
     sub("previous-scatter wait in the slot flush", slot_open,
         slot_open + "    sycl::event::wait(slot.prev_scatter.scatter_events);\n")
-    sub("slot flush stops joining through the queue", "moe_cpu_scatter_join_on_queue(*slot.stream",
+    sub("slot flush stops joining through the queue", "moe_cpu_job_join_on_queue(*slot.stream",
         "moe_cpu_scatter_join_on_queue_unused(*slot.stream")
     sub("scatter H2D loses the join dependency", "run.src_offset, run.bytes, *slot.stream, joins));",
         "run.src_offset, run.bytes, *slot.stream, {}));")
@@ -708,19 +708,19 @@ def mutants(src: str) -> list[tuple[str, str]]:
         "moe_host_scatter_submit_compact(slot, ws, {}, &n_copies, &why)")
     sub("compact copies drop their dependency", "copy.src_offset, copy.bytes, queue, deps));",
         "copy.src_offset, copy.bytes, queue));")
-    sub("join get() outside its host_task", "static sycl::event moe_cpu_scatter_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {\n",
-        "static sycl::event moe_cpu_scatter_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {\n    job.get();\n")
-    sub("job join called outside its host_task", "static sycl::event moe_cpu_scatter_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {\n",
-        "static sycl::event moe_cpu_scatter_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {\n    moe_cpu_job_join(job);\n")
+    sub("join get() outside its host_task", "static sycl::event moe_cpu_job_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {\n",
+        "static sycl::event moe_cpu_job_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {\n    job.get();\n")
+    sub("job join called outside its host_task", "static sycl::event moe_cpu_job_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {\n",
+        "static sycl::event moe_cpu_job_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {\n    moe_cpu_job_join(job);\n")
     sub("job join called from the slot flush", slot_open, slot_open + "    moe_cpu_job_join(slot.future.share());\n")
     sub("join helper stops taking get()", "std::future_status::ready);\n    }\n    job.get();\n",
         "std::future_status::ready);\n    }\n")
     sub("prologue waits in the factory body", "static std::function<void()> moe_cpu_job_prologue(moe_cpu_job_inputs inputs) {\n",
         "static std::function<void()> moe_cpu_job_prologue(moe_cpu_job_inputs inputs) {\n    moe_cpu_job_wait_inputs(inputs);\n")
     sub("boundary wait called from a flush", "        ++g_cpu_scatter_serial;\n",
-        "        ++g_cpu_scatter_serial;\n        wait_prev_scatter_events(slot);\n")
+        "        ++g_cpu_scatter_serial;\n        pending_cpu_scatter_wait_prev_events(slot);\n")
     sub("boundary wait dropped from the graph-boundary flush",
-        "    wait_prev_scatter_events();      // The graph-boundary wait", "    // The graph-boundary wait")
+        "    pending_cpu_scatter_wait_prev_events();  // The graph-boundary wait", "    // The graph-boundary wait")
     # A wait moved into a helper is still a wait.  Each helper is new, defined at file scope just before
     # the flush, and called from scanned code; none matches the wait_* helper pattern by name.
     sub("future.wait in a helper the slot flush calls", slot_open,
@@ -741,9 +741,9 @@ def mutants(src: str) -> list[tuple[str, str]]:
                + settle[s_g + len(g_line) :])
     # Positive control for the helper mutants: the same join wait written inline in the flush.
     sub("group future wait inline in the slot flush",
-        "            joins.push_back(moe_cpu_scatter_join_on_queue(*slot.stream, group[k]->future.share()));\n",
+        "            joins.push_back(moe_cpu_job_join_on_queue(*slot.stream, group[k]->future.share()));\n",
         "            group[k]->future.wait();\n"
-        "            joins.push_back(moe_cpu_scatter_join_on_queue(*slot.stream, group[k]->future.share()));\n")
+        "            joins.push_back(moe_cpu_job_join_on_queue(*slot.stream, group[k]->future.share()));\n")
     # Two calls deep: flush_pending_cpu_scatter_if_consumed -> ggml_sycl_moe_precomputed_mmid_skip_pending ->
     # ggml_sycl_moe_precomputed_skip_contains.
     deep = ("    moe_precomputed_skip_key key{};\n"
@@ -765,7 +765,7 @@ def mutants(src: str) -> list[tuple[str, str]]:
     # passing is the other half: both closures hold a wait (moe_cpu_job_wait_inputs, moe_cpu_job_join's
     # get()) that the scan would report if it read them.
     join_def = (
-        "static sycl::event moe_cpu_scatter_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {\n"
+        "static sycl::event moe_cpu_job_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {\n"
     )
     sub("wait in a helper the join calls before its submit", join_def,
         "static void moe_join_settle(const std::shared_future<void> & j) {\n    j.wait();\n}\n\n"
