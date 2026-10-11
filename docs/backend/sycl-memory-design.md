@@ -2709,17 +2709,16 @@ would be a second heuristic beside the aggregate one rather than a contiguity pr
 
 *Plan inputs are per owner (llama.cpp-45qo).* The per-token and weight maxima and the `n_ubatch` are each model's own
 terms in the planned load terms' owner table (`planned-load-terms.hpp`, canonical contract 12.4), keyed by the model's
-slot and slot generation, which the load-time plan takes from the open load's effect. The device plans each buffer from
+slot and slot generation, which the load-time plan takes from the owner of the load effect the stage holds. The
+device plans each buffer from
 the largest of each input over the owners on it, so a draft loaded beside a target does not shrink the target's plan,
 and a model live on another device is no part of the merge. An owner's inputs leave with it, at its load's rollback or
 its slot's release, so a model that unloads while another stays live leaves nothing behind. (Until llama.cpp-45qo the
 inputs were device-global: `zone_dense_scratch_merge_input` kept the larger input while another backend context was live
 and replaced it when none was, so a larger model's inputs outlived it beside a live one, and a model loaded beside a
 live but contextless one shrank that one's plan.) The runtime re-plan changes only the published model's own
-`n_ubatch`, so a draft context at a small `n_ubatch` does not shrink a live target's plan either, and a rollback
-restores that owner's exact earlier value. Two contexts of one model on one device are still unsupported (canonical
-contract section 5), so that owner's `n_ubatch` is the last transaction's. A store validates its figure on the merge it
-will publish before it stores anything. A rejected (overflowing) figure overwrites that owner's earlier inputs for the
+`n_ubatch`, so a draft context at a small `n_ubatch` does not shrink a live target's plan either. A store validates its
+figure on the merge it will publish before it stores anything. A rejected (overflowing) figure overwrites that owner's earlier inputs for the
 buffer with 0 and raises the owner's flag for it, keeping the owner's `n_ubatch`.
 
 *One model's overflow does not invalidate the plan of a model already running (llama.cpp-kpjw, kept per owner).* Each
@@ -2731,6 +2730,21 @@ the fit check refuses by name, only when the accepted owners' merged inputs cann
 owner-keyed form, in which any live owner's flag marked the device's plan invalid and refused every owner's re-plan
 until the rejected owner dropped. That form undid the property llama.cpp-kpjw had pinned, by letting a model that
 failed to plan stop a running model from re-planning at its runtime `n_ubatch`.
+
+A model whose own figure was rejected has no dense scratch planned, and an overflowing figure must not become a small
+plan that the other owners' figures carry through the fit check. So the runtime-context transaction refuses that
+model's context by name (`unified_cache_planned_dense_scratch_owner_rejected`, a WARN naming the model's slot, slot
+generation and the rejected half). It checks before the fit check, and again after a re-plan that a rejection refused.
+
+*An owner's `n_ubatch` only rises while the owner lives.* Two contexts of one model on one device share that model's
+contribution, so a second context created at `-ub 512` while a first at `-ub 2048` is live would otherwise shrink the
+plan the first context's buffers were sized from. The re-plan therefore stores the larger of the owner's current
+`n_ubatch` and the new one (`planned_load_terms::raised_value`), and the value drops only with the owner, at its load's
+rollback or its slot's release. No per-owner context count is kept: the over-estimate this allows is the same shape as
+the one the max-over-owners plan already has. A transaction that rolls back after its re-plan leaves the raised value in
+place, so the guard restores only the hold. Each half's published `n_ubatch` is its own accepted owners' largest, and
+the logs that print one name the half they print. Before this rule, the last transaction's `n_ubatch` replaced the
+owner's, and a rollback restored the exact earlier value.
 
 **D2: the plan followed the load-time `n_ubatch`.** Auto-ubatch chooses the real one at context creation, after load.
 The plan is a function of `n_ubatch` (`zone_dense_scratch_total_bytes()`), so the runtime-context transaction, the
