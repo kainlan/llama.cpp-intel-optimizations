@@ -385,6 +385,9 @@ def evaluate(backend, common, cache, zone):
     hold_refresh = function_body(backend, r"static void ggml_sycl_planned_scratch_hold_refresh\([^)]*\)\s*\{")
     txn_guard = function_body(backend, r"struct ggml_sycl_dense_scratch_txn_guard\s*\{")
     replan_fn = function_body(cache, r"bool unified_cache_replan_planned_dense_scratch\([^)]*\)\s*\{")
+    # llama.cpp-45qo: the public re-plan records the publishing context's n_ubatch, and this locked helper re-derives
+    # the owner's plan from its own inputs (also called when a context is destroyed).
+    replan_locked_fn = function_body(cache, r"static bool planned_dense_scratch_replan_locked\([^)]*\)\s*\{")
     fit_fn = function_body(cache, r"bool unified_cache_dense_scratch_runtime_fit\([^)]*\)\s*\{")
     quantizing_route = function_body(backend, r"static bool ggml_sycl_mul_mat_src1_quantizing_route\([^)]*\)\s*\{")
     fallback_decision = function_body(
@@ -422,12 +425,14 @@ def evaluate(backend, common, cache, zone):
     results["anchor: hold refresh exists"] = hold_refresh is not None
     results["anchor: transaction guard exists"] = txn_guard is not None
     results["anchor: dense replan exists"] = replan_fn is not None
+    results["anchor: dense locked replan exists"] = replan_locked_fn is not None
     results["anchor: dense runtime fit exists"] = fit_fn is not None
     results["anchor: src1-quantizing route exists"] = quantizing_route is not None
     results["anchor: legacy fallback decision exists"] = fallback_decision is not None
     # No early return: a missing anchor must not hide which contract checks fail (a RED run lists every one).
-    txn, hold_refresh, txn_guard, replan_fn, fit_fn, quantizing_route, fallback_decision = (
-        b or "" for b in (txn, hold_refresh, txn_guard, replan_fn, fit_fn, quantizing_route, fallback_decision))
+    txn, hold_refresh, txn_guard, replan_fn, replan_locked_fn, fit_fn, quantizing_route, fallback_decision = (
+        b or "" for b in (txn, hold_refresh, txn_guard, replan_fn, replan_locked_fn, fit_fn, quantizing_route,
+                          fallback_decision))
 
     # D1: planned but not RESERVED. A spill-capable RUNTIME request (a compute buffer) must leave the planned
     # bytes alone; the planned consumers themselves forbid the spill and are the claimants.
@@ -469,8 +474,9 @@ def evaluate(backend, common, cache, zone):
         all(n in cache for n in ("g_planned_mmq_src1_bytes_per_token", "g_planned_dequant_f16_weight_bytes_max",
                                  "g_planned_dequant_f16_src1_bytes_per_token", "g_planned_dense_scratch_n_ubatch"))
     results["the re-plan goes through the same two plan stores as the load-time setters"] = \
-        "planned_mmq_src1_scratch_store_locked(" in replan_fn and \
-        "planned_dequant_f16_scratch_store_locked(" in replan_fn and \
+        "planned_dense_scratch_replan_locked(device_id, owner, &stored)" in replan_fn and \
+        "planned_mmq_src1_scratch_store_locked(" in replan_locked_fn and \
+        "planned_dequant_f16_scratch_store_locked(" in replan_locked_fn and \
         "planned_mmq_src1_scratch_store_locked(" in set_q8_fn and \
         "planned_dequant_f16_scratch_store_locked(" in set_f16_fn
     results["the fit check uses the pure largest-ubatch helper"] = "zone_dense_scratch_largest_ubatch(" in fit_fn
@@ -642,9 +648,10 @@ def evaluate(backend, common, cache, zone):
     # nothing (its n_ubatch included), and only that owner's own re-plan refuses while it is live.
     results["the dense replan re-derives only its owner's inputs"] = \
         re.search(r"bool unified_cache_replan_planned_dense_scratch\([^)]*lifecycle::SlotToken owner", cache) \
-        is not None and "g_planned_load_terms.owners.get(device_id, owner," in replan_fn
+        is not None and "g_planned_load_terms.owners.get(device_id, owner," in replan_locked_fn
     results["the transaction re-plans the published model's own plan"] = \
-        "unified_cache_replan_planned_dense_scratch(ctx->device, current_token.owner," in txn
+        re.search(r"unified_cache_replan_planned_dense_scratch\(\s*ctx->device,\s*current_token\.owner,", txn) \
+        is not None
     results["a rejected figure overwrites its owner's inputs with 0 and raises its flag"] = all(
         0 <= f.find("if (!*planned) {") < f.find("return owners.set(device_id, owner, rejected,") <
         f.find("const planned_load_term_value accepted[]") for f in (store_q8_fn, store_f16_fn))
@@ -659,7 +666,7 @@ def evaluate(backend, common, cache, zone):
         re.search(r"owners\.merged\(", dense_publish_fn) is None and \
         "planned_load_term::MMQ_SRC1_REJECTED)" in store_q8_fn and \
         "planned_load_term::DEQUANT_F16_REJECTED)" in store_f16_fn and \
-        "g_planned_dense_scratch_invalid" not in replan_fn
+        "g_planned_dense_scratch_invalid" not in replan_fn + replan_locked_fn
     rejected_locked_fn = function_body(
         cache, r"static bool planned_dense_scratch_owner_rejected_locked\([^)]*\)\s*\{") or ""
     refusal_re = (r"if\s*\(\s*planned_dense_scratch_owner_rejected_locked\(\s*device_id\s*,\s*owner\s*,\s*nullptr\s*,"
@@ -670,7 +677,7 @@ def evaluate(backend, common, cache, zone):
                       + flag + r"\s*,\s*&" + var + r"\s*\)", rejected_locked_fn) is not None
             for flag, var in (("MMQ_SRC1_REJECTED", "q8"), ("DEQUANT_F16_REJECTED", "f16"))) and \
         re.search(r"return\s+q8\s*!=\s*0\s*\|\|\s*f16\s*!=\s*0\s*;", rejected_locked_fn) is not None and \
-        refusal is not None and refusal.start() < replan_fn.find("planned_mmq_src1_scratch_store_locked(")
+        refusal is not None and refusal.start() < replan_fn.find("planned_dense_scratch_replan_locked(")
 
     # M-d / M-e: the owner is a monotonic id, and the hold state moves as one unit.
     results["the owner token is a monotonic context id, not an address"] = \
@@ -1619,14 +1626,15 @@ if args.self_test:
          (backend, common, mutate_in_func(cache, r"bool unified_alloc\(const alloc_request & req_in, alloc_handle \* out\)",
                                           "unified_cache_note_runtime_request(", "unified_cache_XXXX("), zone)),
         ("replan ignores its owner", "the dense replan re-derives only its owner's inputs",
-         (backend, common, mutate_all_in_func(cache, r"bool unified_cache_replan_planned_dense_scratch\(",
+         (backend, common, mutate_all_in_func(cache, r"static bool planned_dense_scratch_replan_locked\(",
                                               "g_planned_load_terms.owners.get(device_id, owner,",
                                               "g_planned_load_terms.owners.get(device_id, lifecycle::SlotToken{},", 4),
           zone)),
         ("transaction re-plans another owner", "the transaction re-plans the published model's own plan",
-         (mutate_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
-                         "unified_cache_replan_planned_dense_scratch(ctx->device, current_token.owner,",
-                         "unified_cache_replan_planned_dense_scratch(ctx->device, ggml_sycl::lifecycle::SlotToken{},"),
+         (mutate_re_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
+                            r"unified_cache_replan_planned_dense_scratch\(\s*ctx->device,\s*current_token\.owner,",
+                            "unified_cache_replan_planned_dense_scratch(ctx->device, "
+                            "ggml_sycl::lifecycle::SlotToken{},"),
           common, cache, zone)),
         ("Q8 overflow stores the input", "a rejected figure overwrites its owner's inputs with 0 and raises its flag",
          (backend, common, mutate_in_func(cache, r"static bool planned_mmq_src1_scratch_store_locked\(",

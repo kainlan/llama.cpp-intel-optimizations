@@ -23,21 +23,28 @@ The fix this gate pins: the inputs are terms in the owner table llama.cpp-ihk6 b
   D4. the dense atomics the readers load are published from the merge of the owners whose figure for each buffer was
       accepted (merged_accepted), each half's n_ubatch from its own merge, by one function, and nothing else writes
       them; the publish runs on every set and every drop, so an owner's inputs leave with it;
-  D5. the runtime re-plan takes the owner and re-derives from that owner's own inputs, refuses only when that owner's
-      own figure was rejected (llama.cpp-kpjw: one model's overflow does not invalidate the plan of a model already
-      running), and publishes whenever it changed the table;
-  D5a. an owner's n_ubatch only rises while the owner lives (raised_value): two contexts of one model share it, so a
-      second context at a smaller n_ubatch cannot shrink the plan the first one's buffers were sized from;
+  D5. the runtime re-plan takes the owner and the publishing context and re-derives from that owner's own inputs,
+      refuses only when that owner's own figure was rejected (llama.cpp-kpjw: one model's overflow does not invalidate
+      the plan of a model already running), and publishes whenever it changed the table;
+  D5a. an owner plans at the largest n_ubatch its live backend contexts last published (planned_n_ubatch), or at the
+      load's n_ubatch when none is live: a context's own publish replaces its own entry, so the auto-ubatch ladder's
+      settle lowers what a losing rung raised, the load's value is no floor, and a destroyed context's entry leaves,
+      after which the plan may fall;
   D6. no device-global merge remains: no zone_dense_scratch_merge_input, no other_model_live, no
       ggml_sycl_other_backend_context_live;
   D7. the load-time plan is keyed by the owner of the load effect stage_inventory_plan holds on this thread, passed
       down beside its transaction id, so the stores land under that held effect and no second lease is taken;
-  D8. the runtime-context transaction re-plans the published model's own plan, and its guard restores only the hold
-      (the owner's n_ubatch only rises, so there is no earlier plan to put back);
+  D8. the runtime-context transaction re-plans the published model's own plan for its own context, logs the context's
+      published n_ubatch beside the model's and each half's, and its guard restores only the hold;
   D9. the decision is recorded in canonical contract 12.4 and in the cross-model state audit;
   D10. a model whose own figure was rejected has no dense scratch planned, so the runtime transaction refuses its
-      context by name, with a WARN naming the owner and the half, before the fit check and after a re-plan that a
-      rejection refused, instead of letting the other owners' plan pass it through.
+      context by name, with a WARN naming the owner and the half (INFO for a probe, which still refuses), before the
+      fit check and after a re-plan that a rejection refused, instead of letting the other owners' plan pass it
+      through;
+  D11. a context the model has no room to record (planned_context_capacity per model per device) is refused by name
+      the same way, before the fit check, rather than left out of the plan its buffers are sized from;
+  D12. each reader of the published n_ubatch asks for its own half: the Q8_1 claim and ensure read the Q8_1 half, the
+      f16 ensure reads the f16 half.
 
 The table itself is unit-tested in ggml/src/ggml-sycl/tests/test-planned-load-terms.cpp; this gate pins how the
 backend reaches it. Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text and has a mutant that must
@@ -157,7 +164,18 @@ F16_STORE_SIG = "static bool planned_dequant_f16_scratch_store_locked(int device
 PUBLISH_SIG = "static void planned_load_terms_publish_locked()"
 DENSE_PUBLISH_SIG = "static void planned_dense_scratch_publish_locked(int device_id)"
 REPLAN_SIG = ("bool unified_cache_replan_planned_dense_scratch(int device_id, lifecycle::SlotToken owner, "
-              "uint32_t n_ubatch)")
+              "uint64_t context, uint32_t n_ubatch, uint32_t * owner_n_ubatch)")
+REPLAN_LOCKED_SIG = ("static bool planned_dense_scratch_replan_locked(int device_id, lifecycle::SlotToken owner, "
+                     "bool * stored)")
+RELEASE_SIG = "bool unified_cache_release_planned_dense_scratch_context(int device_id, uint64_t context)"
+ROOM_SIG = ("bool unified_cache_planned_dense_scratch_context_room(int device_id, lifecycle::SlotToken owner, "
+            "uint64_t context)")
+CTX_REFUSED_SIG = ("static bool ggml_sycl_dense_scratch_context_refused(int device, ggml_sycl::lifecycle::SlotToken "
+                   "owner, uint64_t context, bool probe_mode)")
+DTOR_SIG = "ggml_backend_sycl_context::~ggml_backend_sycl_context() {"
+Q8_CLAIM_SIG = "static void ggml_sycl_mmq_src1_claim_plan(ggml_backend_sycl_context & ctx)"
+Q8_ENSURE_SIG = "static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,"
+F16_ENSURE_SIG = "static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & ctx,"
 POPULATE_SIG = ("static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
                 "const ggml_sycl_tensor_inventory * inventory)")
 STAGE_SIG = ("ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_sycl_tensor_inventory * "
@@ -170,8 +188,10 @@ REJECTED_SIG = ("bool unified_cache_planned_dense_scratch_owner_rejected(int dev
                 "bool * q8_rejected, bool * f16_rejected)")
 REFUSED_SIG = ("static bool ggml_sycl_dense_scratch_owner_refused(int device, ggml_sycl::lifecycle::SlotToken owner, "
                "bool probe_mode)")
-RAISED_SIG = ("size_t raised_value(int device, lifecycle::SlotToken owner, planned_load_term term, size_t value) "
-              "const")
+SET_CTX_SIG = "bool set_context_n_ubatch(int device, lifecycle::SlotToken owner, uint64_t context, size_t n_ubatch)"
+PLANNED_NUB_SIG = "size_t planned_n_ubatch(int device, lifecycle::SlotToken owner) const"
+DROP_CTX_SIG = "bool drop_context(int device, uint64_t context, lifecycle::SlotToken * owner)"
+ROOM_T_SIG = "bool context_room(int device, lifecycle::SlotToken owner, uint64_t context) const"
 TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backend_t backend,"
 GUARD_SIG = "struct ggml_sycl_dense_scratch_txn_guard {"
 
@@ -184,7 +204,7 @@ DENSE_READS = (("MMQ_SRC1_BYTES_PER_TOKEN", "q8_flag"), ("DENSE_SCRATCH_N_UBATCH
                ("DENSE_SCRATCH_N_UBATCH", "f16_flag"))
 
 DENSE_TERMS = ("MMQ_SRC1_BYTES_PER_TOKEN", "DEQUANT_F16_WEIGHT_BYTES", "DEQUANT_F16_SRC1_BYTES_PER_TOKEN",
-               "DENSE_SCRATCH_N_UBATCH", "MMQ_SRC1_REJECTED", "DEQUANT_F16_REJECTED")
+               "DENSE_SCRATCH_N_UBATCH", "DENSE_SCRATCH_LOAD_N_UBATCH", "MMQ_SRC1_REJECTED", "DEQUANT_F16_REJECTED")
 
 # The published dense values: each one's only writer is planned_dense_scratch_publish_locked.
 DENSE_ATOMICS = ("g_planned_mmq_src1_scratch_bytes", "g_planned_dequant_f16_src0_bytes",
@@ -254,12 +274,18 @@ def _setter_is_owner_store(cache: str, sig: str, store_call: str) -> bool:
             and LOCK not in b and PUBLISH_CALL not in b and ".store(" not in b and "other_model_live" not in b)
 
 
+# The load-time setters also record the load's n_ubatch, which the owner plans at once none of its contexts is live.
+LOAD_N_UBATCH_SET = ("g_planned_load_terms.owners.set(device_id, owner, "
+                     "planned_load_term::DENSE_SCRATCH_LOAD_N_UBATCH, n_ubatch);")
+
+
 def claim_q8_setter_is_the_owner_store(cache: str) -> bool:
-    """The Q8_1 setter stores the owner's inputs under the leaf mutex, republishes in that locked step, and names a
-    swept stale contribution after it."""
+    """The Q8_1 setter stores the owner's inputs under the leaf mutex, records the load's n_ubatch in the same locked
+    store, republishes in that locked step, and names a swept stale contribution after it."""
     return _setter_is_owner_store(
         cache, Q8_SET_SIG,
-        "planned_mmq_src1_scratch_store_locked(device_id, owner, bytes_per_token, n_ubatch, &planned, replaced);")
+        "planned_mmq_src1_scratch_store_locked(device_id, owner, bytes_per_token, n_ubatch, &planned, replaced) && "
+        + LOAD_N_UBATCH_SET)
 
 
 def claim_f16_setter_is_the_owner_store(cache: str) -> bool:
@@ -267,7 +293,7 @@ def claim_f16_setter_is_the_owner_store(cache: str) -> bool:
     return _setter_is_owner_store(
         cache, F16_SET_SIG,
         "planned_dequant_f16_scratch_store_locked(device_id, owner, max_weight_bytes, src1_bytes_per_token, n_ubatch, "
-        "&planned, replaced);")
+        "&planned, replaced) && " + LOAD_N_UBATCH_SET)
 
 
 # ---- D3: validate on the merge, then store ------------------------------------------------------------------------
@@ -349,46 +375,82 @@ def claim_dense_plan_is_published_from_the_merge(cache: str) -> bool:
 
 
 def claim_replan_rederives_the_owners_own_inputs(cache: str) -> bool:
-    """The re-plan reads only the owner's own inputs, in the same locked step as both plan stores and the publish; an
-    owner that planned nothing on the device re-derives nothing, and an owner whose own figure was rejected refuses
-    (its inputs for that buffer read 0). The device-wide flag refuses no owner's re-plan. A store that changed the
-    table is published even when the other store was refused, so the table and the published atomics never
-    disagree."""
-    b = body(norm(cache), REPLAN_SIG)
-    gets = ("if (planned_dense_scratch_owner_rejected_locked(device_id, owner, nullptr, nullptr)) { return false; }",
-            "planned_load_term::DENSE_SCRATCH_N_UBATCH, &owner_n_ubatch)", "owner_n_ubatch == 0 ||",
+    """The re-plan, under the leaf mutex, refuses an owner whose own figure was rejected (its inputs for that buffer
+    read 0) before it records the publishing context's n_ubatch; the locked helper then reads only the owner's own
+    inputs and feeds both plan stores; an owner that planned nothing on the device re-derives nothing. The device-wide
+    flag refuses no owner's re-plan. A store that changed the table is published even when the other store was
+    refused, so the table and the published atomics never disagree."""
+    t = norm(cache)
+    b = body(t, REPLAN_SIG)
+    h = body(t, REPLAN_LOCKED_SIG)
+    gets = ("planned_load_term::DENSE_SCRATCH_N_UBATCH, &owner_n_ubatch)", "owner_n_ubatch == 0 ||",
             "planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, &q8_per_token)",
             "planned_load_term::DEQUANT_F16_WEIGHT_BYTES, &f16_weights)",
             "planned_load_term::DEQUANT_F16_SRC1_BYTES_PER_TOKEN, &f16_per_token)")
-    return (bool(b) and ordered(b, LOCK, *gets,
-                                "const bool q8_stored = planned_mmq_src1_scratch_store_locked(device_id, owner, "
-                                "q8_per_token, next_n_ubatch, &q8, nullptr);",
-                                "const bool f16_stored = q8_stored && planned_dequant_f16_scratch_store_locked("
-                                "device_id, owner, f16_weights, f16_per_token, next_n_ubatch, &f16, nullptr);",
-                                "if (q8_stored) { " + PUBLISH_CALL + " }", "return f16_stored && q8 && f16;")
+    return (bool(b) and bool(h)
+            and ordered(b, LOCK, "if (planned_dense_scratch_owner_rejected_locked(device_id, owner, nullptr, nullptr)) "
+                                 "{ return false; }",
+                        "if (!g_planned_load_terms.owners.set_context_n_ubatch(device_id, owner, context, n_ubatch)) "
+                        "{ return false; }",
+                        "bool stored = false;",
+                        "const bool planned = planned_dense_scratch_replan_locked(device_id, owner, &stored);",
+                        "if (stored) { " + PUBLISH_CALL + " }", "return planned;")
             and b.count(PUBLISH_CALL) == 1
-            and b.count("g_planned_load_terms.owners.get(device_id, owner,") == 4
-            and "g_planned_dense_scratch_invalid" not in b
-            and ".merged(" not in b and "_bytes_per_token[device_id]" not in b
-            and "_weight_bytes_max[device_id]" not in b)
+            and ordered(h, "*stored = false;", *gets,
+                        "const bool q8_stored = planned_mmq_src1_scratch_store_locked(device_id, owner, "
+                        "q8_per_token, next_n_ubatch, &q8, nullptr);",
+                        "const bool f16_stored = q8_stored && planned_dequant_f16_scratch_store_locked("
+                        "device_id, owner, f16_weights, f16_per_token, next_n_ubatch, &f16, nullptr);",
+                        "*stored = q8_stored;", "return f16_stored && q8 && f16;")
+            and LOCK not in h and PUBLISH_CALL not in h
+            and h.count("g_planned_load_terms.owners.get(device_id, owner,") == 4
+            and "g_planned_dense_scratch_invalid" not in b + h
+            and ".merged(" not in h and "_bytes_per_token[device_id]" not in h
+            and "_weight_bytes_max[device_id]" not in h)
 
 
-def claim_owner_n_ubatch_only_rises(cache: str, table: str) -> bool:
-    """An owner's n_ubatch only rises while it lives: the re-plan stores the larger of the owner's current value and
-    the new one (raised_value) into both plan stores, never the new value alone, and nothing lowers it short of the
-    owner's drop."""
-    b = body(norm(cache), REPLAN_SIG)
-    raised = body(norm(table), RAISED_SIG)
-    return (bool(b) and bool(raised)
-            and ordered(b, "const size_t raised = g_planned_load_terms.owners.raised_value(device_id, owner, "
-                           "planned_load_term::DENSE_SCRATCH_N_UBATCH, n_ubatch);",
-                        "if (raised > UINT32_MAX) { return false; }",
-                        "const uint32_t next_n_ubatch = static_cast<uint32_t>(raised);",
-                        "q8_per_token, next_n_ubatch, &q8, nullptr);", "f16_per_token, next_n_ubatch, &f16, nullptr);")
-            and ", n_ubatch, &q8" not in b and ", n_ubatch, &f16" not in b
-            and ordered(raised, "size_t current = 0;", "if (!get(device, owner, term, &current)) { return value; }",
-                        "return current > value ? current : value;")
-            and "unified_cache_get_planned_dense_scratch_owner_n_ubatch" not in norm(cache))
+def claim_owner_plans_at_its_live_contexts_largest(cache: str, table: str, sycl: str) -> bool:
+    """An owner plans at the largest n_ubatch its live backend contexts last published, or at the load's when none is
+    live. The table replaces a context's own entry outright (no per-context latch), takes a free entry for a new
+    context and refuses one past the capacity, starts the largest from 0 (the load's value is no floor), and removes a
+    context's entry by its id. The re-plan sizes both stores at that value, and the context's destruction removes its
+    entry and re-plans its model, whose plan may then fall."""
+    c = norm(cache)
+    tb = norm(table)
+    t = norm(sycl)
+    setc = body(tb, SET_CTX_SIG)
+    planned = body(tb, PLANNED_NUB_SIG)
+    dropc = body(tb, DROP_CTX_SIG)
+    h = body(c, REPLAN_LOCKED_SIG)
+    rel = body(c, RELEASE_SIG)
+    dtor = body(t, DTOR_SIG)
+    return (bool(setc) and bool(planned) and bool(dropc) and bool(h) and bool(rel) and bool(dtor)
+            and "planned_context_n_ubatch contexts[planned_context_capacity] = {};" in tb
+            and ordered(setc, "planned_load_term_contribution * c = owned(device, owner);",
+                        "if (c == nullptr || context == 0 || n_ubatch == 0) { return false; }",
+                        "int i = context_index(*c, context);", "if (i < 0) { i = context_index(*c, 0); }",
+                        "if (i < 0) { return false; } c->contexts[i] = planned_context_n_ubatch{ context, n_ubatch }; "
+                        "return true;")
+            and ordered(planned, "size_t out = 0;", "for (const planned_context_n_ubatch & entry : c->contexts) {",
+                        "if (entry.context != 0 && entry.n_ubatch > out) { out = entry.n_ubatch; }",
+                        "return out != 0 ? out : c->values[static_cast<int>(planned_load_term::"
+                        "DENSE_SCRATCH_LOAD_N_UBATCH)];")
+            and ordered(dropc, "c.contexts[i] = planned_context_n_ubatch{};",
+                        "*owner = lifecycle::SlotToken{ slot, c.generation };", "return true;")
+            and ordered(h, "const size_t planned_n_ubatch = g_planned_load_terms.owners.planned_n_ubatch(device_id, "
+                           "owner);", "if (planned_n_ubatch == 0 || planned_n_ubatch > UINT32_MAX) { return false; }",
+                        "const uint32_t next_n_ubatch = static_cast<uint32_t>(planned_n_ubatch);")
+            and ordered(rel, LOCK, "if (!g_planned_load_terms.owners.drop_context(device_id, context, &owner)) "
+                                   "{ return false; }", "bool stored = false;",
+                        "if (!planned_dense_scratch_owner_rejected_locked(device_id, owner, nullptr, nullptr)) { "
+                        "(void) planned_dense_scratch_replan_locked(device_id, owner, &stored); }",
+                        "if (stored) { " + PUBLISH_CALL + " }", "return true;")
+            and ordered(dtor, "(void) ggml_sycl::unified_cache_release_planned_scratch_hold(device, "
+                              "planned_scratch_owner);",
+                        "(void) ggml_sycl::unified_cache_release_planned_dense_scratch_context(device, "
+                        "planned_scratch_owner);")
+            and t.count("unified_cache_release_planned_dense_scratch_context(") == 1
+            and "raised_value" not in c + tb)
 
 
 # ---- D6: no device-global merge remains -----------------------------------------------------------------------------
@@ -435,15 +497,27 @@ def claim_load_plan_is_keyed_by_the_open_load(sycl: str) -> bool:
 
 
 def claim_runtime_txn_replans_the_published_models_own_plan(sycl: str) -> bool:
-    """The transaction re-plans the published plan's model's own inputs and nothing else in the backend re-plans. Its
-    guard restores only the hold: the owner's n_ubatch only rises, so a rollback has no earlier plan to put back."""
+    """The transaction re-plans the published plan's model's own inputs for its own context, and nothing else in the
+    backend re-plans. A successful re-plan logs the context's published n_ubatch, the model's planned n_ubatch and each
+    half's published n_ubatch, so a run can score the settle's value against the plan's. The guard restores only the
+    hold: a rollback leaves the context's entry until its next publish or its destruction."""
     t = norm(sycl)
     txn = body(t, TXN_SIG)
     guard = body(t, GUARD_SIG)
+    joined = re.sub(r'"\s*"', "", txn)
     return (bool(txn) and bool(guard)
             and ordered(txn, "ggml_sycl_dense_scratch_txn_guard dense_guard(*ctx, !probe_mode);",
                         "const bool replanned = ggml_sycl::unified_cache_replan_planned_dense_scratch(ctx->device, "
-                        "current_token.owner, next_kv_info.n_ubatch);")
+                        "current_token.owner, ctx->planned_scratch_owner, next_kv_info.n_ubatch, &model_n_ubatch);")
+            and ordered(joined, "if (replanned) { GGML_LOG_INFO(\"[SYCL-PLAN] dense scratch re-planned on device %d: "
+                                "context %llu published n_ubatch=%u; model slot %u generation %llu plans at "
+                                "n_ubatch=%u; the device plans Q8_1 src1 at n_ubatch=%u and f16 dequant at "
+                                "n_ubatch=%u\\n\",",
+                        "ctx->device, (unsigned long long) ctx->planned_scratch_owner, (unsigned) "
+                        "next_kv_info.n_ubatch, current_token.owner.slot, (unsigned long long) "
+                        "current_token.owner.generation, (unsigned) model_n_ubatch, (unsigned) "
+                        "ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(ctx->device, false), (unsigned) "
+                        "ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(ctx->device, true));")
             and "unified_cache_set_planned_scratch_hold(device, prev_hold, prev_owner);" in guard
             and "unified_cache_replan_planned_dense_scratch(" not in guard
             and "n_ubatch" not in guard and "plan_owner" not in guard
@@ -491,10 +565,64 @@ def claim_rejected_owner_is_refused_by_name(sycl: str, cache: str) -> bool:
             and ordered(query, LOCK, "return planned_dense_scratch_owner_rejected_locked(device_id, owner, "
                                      "q8_rejected, f16_rejected);")
             and ordered(helper, "if (!ggml_sycl::unified_cache_planned_dense_scratch_owner_rejected(device, owner, "
-                                "&q8, &f16)) { return false; }", "GGML_LOG_WARN(", "owner.slot,", "return true;")
+                                "&q8, &f16)) { return false; }",
+                        "if (!probe_mode) { GGML_LOG_WARN(fmt, half, owner.slot, (unsigned long long) "
+                        "owner.generation, device); return true; } GGML_LOG_INFO(fmt, half, owner.slot, (unsigned "
+                        "long long) owner.generation, device); return true; }")
             and "model slot %u generation %llu" in helper and "Q8_1 src1" in helper and "f16 dequant" in helper
             and 0 <= txn.find(refusal) < fit_at
             and ordered(txn, "const bool replanned = ", after_replan))
+
+
+# ---- D11: a context without room is refused by name --------------------------------------------------------------
+
+
+def claim_context_without_room_is_refused_by_name(sycl: str, cache: str, table: str) -> bool:
+    """The room query asks the table under the leaf mutex; the table has room for a context it already records, a free
+    entry, or an owner that holds nothing on the device; the backend helper WARNs naming the model's slot, generation
+    and the context (INFO for a probe, which still refuses); and the transaction refuses through it after the rejected
+    owner's refusal and before the fit check."""
+    c = norm(cache)
+    t = norm(sycl)
+    room = body(c, ROOM_SIG)
+    room_t = body(norm(table), ROOM_T_SIG)
+    helper = body(t, CTX_REFUSED_SIG)
+    txn = body(t, TXN_SIG)
+    owner_refusal = ("if (ggml_sycl_dense_scratch_owner_refused(ctx->device, current_token.owner, probe_mode)) { "
+                     "return refuse(\"a dense scratch figure of this model overflowed its sizing\"); }")
+    refusal = ("if (ggml_sycl_dense_scratch_context_refused(ctx->device, current_token.owner, "
+               "ctx->planned_scratch_owner, probe_mode)) { return refuse(\"this model has no room for another "
+               "context's dense scratch n_ubatch\"); }")
+    fit_at = txn.find("unified_cache_dense_scratch_runtime_fit(")
+    return (bool(room) and bool(room_t) and bool(helper) and fit_at >= 0
+            and ordered(room, LOCK, "return g_planned_load_terms.owners.context_room(device_id, owner, context);")
+            and "return c == nullptr || context == 0 || context_index(*c, context) >= 0 || context_index(*c, 0) >= 0;" \
+            in room_t
+            and ordered(helper, "if (ggml_sycl::unified_cache_planned_dense_scratch_context_room(device, owner, "
+                                "context)) { return false; }",
+                        "if (!probe_mode) { GGML_LOG_WARN(fmt, owner.slot, (unsigned long long) owner.generation, "
+                        "device, (unsigned long long) context); return true; } GGML_LOG_INFO(fmt, owner.slot, "
+                        "(unsigned long long) owner.generation, device, (unsigned long long) context); return true; }")
+            and "model slot %u generation %llu" in helper and "(context %llu)" in helper
+            and 0 <= txn.find(owner_refusal) < txn.find(refusal) < fit_at)
+
+
+# ---- D12: each reader asks for its own half -----------------------------------------------------------------------
+
+
+def claim_readers_ask_for_their_own_half(sycl: str) -> bool:
+    """The Q8_1 claim (both of its log lines) and the Q8_1 ensure read the Q8_1 half's n_ubatch; the f16 ensure reads
+    the f16 half's. Outside the transaction's re-plan line, which prints both, there is no other reader."""
+    t = norm(sycl)
+    read = "ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d, "
+    claim = body(t, Q8_CLAIM_SIG)
+    q8 = body(t, Q8_ENSURE_SIG)
+    f16 = body(t, F16_ENSURE_SIG)
+    return (bool(claim) and bool(q8) and bool(f16)
+            and claim.count(read + "false)") == 2 and read + "true)" not in claim
+            and q8.count(read + "false)") == 1 and read + "true)" not in q8
+            and f16.count(read + "true)") == 1 and read + "false)" not in f16
+            and t.count("unified_cache_get_planned_dense_scratch_n_ubatch(") == 6)
 
 
 # ---- positive runs --------------------------------------------------------------------------------------------------
@@ -528,8 +656,16 @@ def test_replan_rederives_the_owners_own_inputs():
     assert claim_replan_rederives_the_owners_own_inputs(CACHE)
 
 
-def test_owner_n_ubatch_only_rises():
-    assert claim_owner_n_ubatch_only_rises(CACHE, TABLE)
+def test_owner_plans_at_its_live_contexts_largest():
+    assert claim_owner_plans_at_its_live_contexts_largest(CACHE, TABLE, SYCL)
+
+
+def test_context_without_room_is_refused_by_name():
+    assert claim_context_without_room_is_refused_by_name(SYCL, CACHE, TABLE)
+
+
+def test_readers_ask_for_their_own_half():
+    assert claim_readers_ask_for_their_own_half(SYCL)
 
 
 def test_owner_stores_share_one_helper():
@@ -694,23 +830,39 @@ def test_mutant_replan_from_the_merged_inputs_fails():
     assert not claim_replan_rederives_the_owners_own_inputs(
         _once(CACHE, "planned_mmq_src1_scratch_store_locked(device_id, owner, q8_per_token,",
               "planned_mmq_src1_scratch_store_locked(device_id, owner, "
-              "g_planned_mmq_src1_bytes_per_token[device_id].load(std::memory_order_acquire),", within=REPLAN_SIG))
+              "g_planned_mmq_src1_bytes_per_token[device_id].load(std::memory_order_acquire),",
+              within=REPLAN_LOCKED_SIG))
 
 
 def test_mutant_replan_for_an_owner_that_planned_nothing_fails():
     assert not claim_replan_rederives_the_owners_own_inputs(
-        _once(CACHE, "owner_n_ubatch == 0 ||", "", within=REPLAN_SIG))
+        _once(CACHE, "owner_n_ubatch == 0 ||", "", within=REPLAN_LOCKED_SIG))
 
 
 def test_mutant_replan_not_republishing_fails():
     assert not claim_replan_rederives_the_owners_own_inputs(
-        _once(CACHE, "if (q8_stored) { planned_load_terms_publish_locked(); }", "", within=REPLAN_SIG))
+        _once(CACHE, "if (stored) { planned_load_terms_publish_locked(); }", "", within=REPLAN_SIG))
 
 
 def test_mutant_replan_publishing_only_when_both_stored_fails():
     assert not claim_replan_rederives_the_owners_own_inputs(
-        _once(CACHE, "if (q8_stored) { planned_load_terms_publish_locked(); }",
-              "if (!f16_stored) { return false; } planned_load_terms_publish_locked();", within=REPLAN_SIG))
+        _once(CACHE, "if (stored) { planned_load_terms_publish_locked(); }",
+              "if (!planned) { return false; } planned_load_terms_publish_locked();", within=REPLAN_SIG))
+
+
+def test_mutant_replan_helper_reporting_no_store_fails():
+    assert not claim_replan_rederives_the_owners_own_inputs(
+        _once(CACHE, "*stored = q8_stored;", "*stored = f16_stored;", within=REPLAN_LOCKED_SIG))
+
+
+def test_mutant_replan_recording_the_context_before_the_rejection_fails():
+    assert not claim_replan_rederives_the_owners_own_inputs(
+        _once(CACHE, "if (planned_dense_scratch_owner_rejected_locked(device_id, owner, nullptr, nullptr)) { "
+              "return false; } if (!g_planned_load_terms.owners.set_context_n_ubatch(device_id, owner, context, "
+              "n_ubatch)) { return false; }",
+              "if (!g_planned_load_terms.owners.set_context_n_ubatch(device_id, owner, context, n_ubatch)) { "
+              "return false; } if (planned_dense_scratch_owner_rejected_locked(device_id, owner, nullptr, nullptr)) "
+              "{ return false; }", within=REPLAN_SIG))
 
 
 def test_mutant_replan_ignoring_the_owners_rejection_fails():
@@ -726,15 +878,59 @@ def test_mutant_replan_refusing_every_owner_on_an_invalid_device_fails():
               "g_planned_dense_scratch_invalid[device_id][0].load(std::memory_order_acquire)) {", within=REPLAN_SIG))
 
 
-def test_mutant_replan_storing_the_new_n_ubatch_unconditionally_fails():
-    assert not claim_owner_n_ubatch_only_rises(
-        _once(CACHE, "q8_per_token, next_n_ubatch, &q8, nullptr);", "q8_per_token, n_ubatch, &q8, nullptr);",
-              within=REPLAN_SIG), TABLE)
+def test_mutant_set_context_keeping_its_larger_value_fails():
+    assert not claim_owner_plans_at_its_live_contexts_largest(
+        CACHE, _once(TABLE, "c->contexts[i] = planned_context_n_ubatch{ context, n_ubatch };",
+                     "if (n_ubatch > c->contexts[i].n_ubatch) { c->contexts[i] = planned_context_n_ubatch{ context, "
+                     "n_ubatch }; }", within=SET_CTX_SIG), SYCL)
 
 
-def test_mutant_raised_value_taking_the_new_value_fails():
-    assert not claim_owner_n_ubatch_only_rises(
-        CACHE, _once(TABLE, "return current > value ? current : value;", "return value;", within=RAISED_SIG))
+def test_mutant_set_context_overwriting_another_context_fails():
+    assert not claim_owner_plans_at_its_live_contexts_largest(
+        CACHE, _once(TABLE, "if (i < 0) { i = context_index(*c, 0); }", "if (i < 0) { i = 0; }", within=SET_CTX_SIG),
+        SYCL)
+
+
+def test_mutant_planned_n_ubatch_with_the_load_as_a_floor_fails():
+    assert not claim_owner_plans_at_its_live_contexts_largest(
+        CACHE, _once(TABLE, "size_t out = 0;",
+                     "size_t out = c->values[static_cast<int>(planned_load_term::DENSE_SCRATCH_LOAD_N_UBATCH)];",
+                     within=PLANNED_NUB_SIG), SYCL)
+
+
+def test_mutant_replan_latching_the_owners_value_fails():
+    assert not claim_owner_plans_at_its_live_contexts_largest(
+        _once(CACHE, "const size_t planned_n_ubatch = g_planned_load_terms.owners.planned_n_ubatch(device_id, owner);",
+              "const size_t planned_n_ubatch = owner_n_ubatch > g_planned_load_terms.owners.planned_n_ubatch("
+              "device_id, owner) ? owner_n_ubatch : g_planned_load_terms.owners.planned_n_ubatch(device_id, owner);",
+              within=REPLAN_LOCKED_SIG), TABLE, SYCL)
+
+
+def test_mutant_drop_context_keeping_the_entry_fails():
+    assert not claim_owner_plans_at_its_live_contexts_largest(
+        CACHE, _once(TABLE, "c.contexts[i] = planned_context_n_ubatch{};", "", within=DROP_CTX_SIG), SYCL)
+
+
+def test_mutant_release_not_re_planning_fails():
+    assert not claim_owner_plans_at_its_live_contexts_largest(
+        _once(CACHE, "(void) planned_dense_scratch_replan_locked(device_id, owner, &stored);", "",
+              within=RELEASE_SIG), TABLE, SYCL)
+
+
+def test_mutant_release_not_republishing_fails():
+    assert not claim_owner_plans_at_its_live_contexts_largest(
+        _once(CACHE, "if (stored) { planned_load_terms_publish_locked(); }", "", within=RELEASE_SIG), TABLE, SYCL)
+
+
+def test_mutant_destructor_keeping_the_contexts_entry_fails():
+    assert not claim_owner_plans_at_its_live_contexts_largest(
+        CACHE, TABLE, _once(SYCL, "(void) ggml_sycl::unified_cache_release_planned_dense_scratch_context(device, "
+                                  "planned_scratch_owner);", "", within=DTOR_SIG))
+
+
+def test_mutant_q8_setter_not_recording_the_load_n_ubatch_fails():
+    assert not claim_q8_setter_is_the_owner_store(
+        _once(CACHE, "&planned, replaced) && " + LOAD_N_UBATCH_SET, "&planned, replaced);", within=Q8_SET_SIG))
 
 
 def test_mutant_merge_helper_back_fails():
@@ -781,11 +977,24 @@ def test_mutant_txn_replanning_another_owner_fails():
               "unified_cache_replan_planned_dense_scratch(ctx->device, ggml_sycl::lifecycle::SlotToken{ 0, 1 },"))
 
 
+def test_mutant_txn_replanning_another_context_fails():
+    assert not claim_runtime_txn_replans_the_published_models_own_plan(
+        _once(SYCL, "current_token.owner, ctx->planned_scratch_owner, next_kv_info.n_ubatch, &model_n_ubatch);",
+              "current_token.owner, 1, next_kv_info.n_ubatch, &model_n_ubatch);", within=TXN_SIG))
+
+
+def test_mutant_replan_line_printing_the_published_value_as_the_plan_fails():
+    assert not claim_runtime_txn_replans_the_published_models_own_plan(
+        _once(SYCL, "(unsigned long long) current_token.owner.generation, (unsigned) model_n_ubatch,",
+              "(unsigned long long) current_token.owner.generation, (unsigned) next_kv_info.n_ubatch,",
+              within=TXN_SIG))
+
+
 def test_mutant_guard_re_planning_an_earlier_n_ubatch_fails():
     assert not claim_runtime_txn_replans_the_published_models_own_plan(
         _once(SYCL, "ggml_sycl::unified_cache_set_planned_scratch_hold(device, prev_hold, prev_owner);",
               "(void) ggml_sycl::unified_cache_replan_planned_dense_scratch(device, ggml_sycl::lifecycle::SlotToken{}, "
-              "512); ggml_sycl::unified_cache_set_planned_scratch_hold(device, prev_hold, prev_owner);",
+              "owner, 512, nullptr); ggml_sycl::unified_cache_set_planned_scratch_hold(device, prev_hold, prev_owner);",
               within=GUARD_SIG))
 
 
@@ -795,7 +1004,7 @@ def test_mutant_a_second_replan_site_fails():
               "const ggml_sycl_tensor_inventory * inventory) {",
               "static void populate_inventory_globals(ggml_backend_sycl_context * ctx, "
               "const ggml_sycl_tensor_inventory * inventory) { (void) ggml_sycl::unified_cache_replan_planned_dense_"
-              "scratch(ctx->device, ggml_sycl::lifecycle::SlotToken{}, 512);"))
+              "scratch(ctx->device, ggml_sycl::lifecycle::SlotToken{}, 1, 512, nullptr);"))
 
 
 def test_mutant_txn_without_the_rejected_owner_refusal_fails():
@@ -814,6 +1023,68 @@ def test_mutant_txn_discarding_the_replan_result_fails():
 def test_mutant_refusal_helper_silent_fails():
     assert not claim_rejected_owner_is_refused_by_name(
         _once(SYCL, "GGML_LOG_WARN(", "GGML_LOG_DEBUG(", within=REFUSED_SIG), CACHE)
+
+
+def test_mutant_refusal_probe_branch_warning_fails():
+    assert not claim_rejected_owner_is_refused_by_name(
+        _once(SYCL, "GGML_LOG_INFO(fmt, half,", "GGML_LOG_WARN(fmt, half,", within=REFUSED_SIG), CACHE)
+
+
+def test_mutant_refusal_probe_branch_returning_false_fails():
+    assert not claim_rejected_owner_is_refused_by_name(
+        _once(SYCL, "GGML_LOG_INFO(fmt, half, owner.slot, (unsigned long long) owner.generation, device); return true;",
+              "GGML_LOG_INFO(fmt, half, owner.slot, (unsigned long long) owner.generation, device); return false;",
+              within=REFUSED_SIG), CACHE)
+
+
+def test_mutant_txn_without_the_context_room_refusal_fails():
+    assert not claim_context_without_room_is_refused_by_name(
+        _once(SYCL, "if (ggml_sycl_dense_scratch_context_refused(ctx->device, current_token.owner, "
+              "ctx->planned_scratch_owner, probe_mode)) {", "if (false) {", within=TXN_SIG), CACHE, TABLE)
+
+
+def test_mutant_context_room_helper_silent_fails():
+    assert not claim_context_without_room_is_refused_by_name(
+        _once(SYCL, "GGML_LOG_WARN(", "GGML_LOG_DEBUG(", within=CTX_REFUSED_SIG), CACHE, TABLE)
+
+
+def test_mutant_context_room_probe_branch_warning_fails():
+    assert not claim_context_without_room_is_refused_by_name(
+        _once(SYCL, "GGML_LOG_INFO(fmt, owner.slot,", "GGML_LOG_WARN(fmt, owner.slot,", within=CTX_REFUSED_SIG), CACHE,
+        TABLE)
+
+
+def test_mutant_context_room_probe_branch_returning_false_fails():
+    assert not claim_context_without_room_is_refused_by_name(
+        _once(SYCL, "GGML_LOG_INFO(fmt, owner.slot, (unsigned long long) owner.generation, device, (unsigned long "
+              "long) context); return true;",
+              "GGML_LOG_INFO(fmt, owner.slot, (unsigned long long) owner.generation, device, (unsigned long long) "
+              "context); return false;", within=CTX_REFUSED_SIG), CACHE, TABLE)
+
+
+def test_mutant_context_room_ignoring_a_free_entry_fails():
+    assert not claim_context_without_room_is_refused_by_name(
+        SYCL, CACHE, _once(TABLE, " || context_index(*c, 0) >= 0;", ";", within=ROOM_T_SIG))
+
+
+def test_mutant_q8_claim_reading_the_f16_half_fails():
+    assert not claim_readers_ask_for_their_own_half(
+        _once(SYCL, "planned / (1024.0 * 1024.0), (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_"
+              "n_ubatch(d, false), ctx.mmvq_q8_activation_cache.capacity(d)",
+              "planned / (1024.0 * 1024.0), (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_"
+              "n_ubatch(d, true), ctx.mmvq_q8_activation_cache.capacity(d)", within=Q8_CLAIM_SIG))
+
+
+def test_mutant_q8_ensure_reading_the_f16_half_fails():
+    assert not claim_readers_ask_for_their_own_half(
+        _once(SYCL, "unified_cache_get_planned_dense_scratch_n_ubatch(d, false)",
+              "unified_cache_get_planned_dense_scratch_n_ubatch(d, true)", within=Q8_ENSURE_SIG))
+
+
+def test_mutant_f16_ensure_reading_the_q8_half_fails():
+    assert not claim_readers_ask_for_their_own_half(
+        _once(SYCL, "unified_cache_get_planned_dense_scratch_n_ubatch(d, true)",
+              "unified_cache_get_planned_dense_scratch_n_ubatch(d, false)", within=F16_ENSURE_SIG))
 
 
 def test_mutant_owner_query_reading_only_the_q8_flag_fails():
