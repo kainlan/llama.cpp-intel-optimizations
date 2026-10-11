@@ -23921,6 +23921,20 @@ struct pending_cpu_scatter {
     size_t                  scatter_scratch_bytes = 0;
     planned_scratch_stats * scatter_stats         = nullptr;
 
+    // The event-chained hybrid decode route's rows (llama.cpp-7pvo), active instead of `entries`. No host code read
+    // that op's expert ids, so the slot cannot name its host rows. Its job wrote the row_n-float row of each host
+    // slot into its pool output span (pool_first .. pool_first + pool_count; a device slot's row is left unwritten),
+    // and overwrote the same pool entries of flags_handle, which held the slots' expert ids, with 1 for a host slot
+    // and 0 otherwise. The flush places only the flagged rows: slot r goes to dst_offset + r * dst_row_stride of
+    // dst_handle (moe_host_scatter_submit_flagged).
+    struct flagged_rows {
+        bool                  active = false;
+        ggml_sycl::mem_handle flags_handle;
+        ggml_sycl::mem_handle dst_handle;
+        size_t                dst_offset     = 0;
+        size_t                dst_row_stride = 0;
+    } flagged;
+
     // Deferred scatter tracking: the MUL_MAT_ID output tensor that this
     // scatter writes to.  Used by selective flush to skip flushing when
     // the next op doesn't consume our destination tensor.
@@ -25838,6 +25852,87 @@ static moe_host_scatter_form moe_host_scatter_submit_compact(const pending_cpu_s
     return moe_host_scatter_form::COMPACT;
 }
 
+// The flagged scatter of an event-chained hybrid decode route's slot (llama.cpp-7pvo; pending_cpu_scatter::flagged_rows
+// says what its job left). Its rows and flags are copied into the planned scratch behind `deps`, the joins of the job
+// that wrote them, and one kernel places each flagged row at its destination; the device kernel already wrote the
+// rows of the device slots. The raw pointers the kernel takes are views resolved here, at submission, from handles
+// retained until it completes. The scratch is reused by the next flush and by the next route op's table copy, so
+// only an in-order queue orders them after this kernel. Aborts rather than drop the rows when it cannot run: nothing
+// else knows which rows are the host's.
+static void moe_host_scatter_submit_flagged(const pending_cpu_scatter &      slot,
+                                            const std::vector<sycl::event> & deps,
+                                            std::vector<sycl::event> &       events) {
+    const pending_cpu_scatter::flagged_rows & f           = slot.flagged;
+    sycl::queue &                             queue       = *slot.stream;
+    const int                                 device      = slot.device_id;
+    const size_t                              n_rows      = slot.pool_count;
+    const size_t                              row_bytes   = static_cast<size_t>(slot.row_n) * sizeof(float);
+    const size_t                              rows_bytes  = n_rows * row_bytes;
+    const size_t                              flags_bytes = n_rows * sizeof(int32_t);
+    if (n_rows == 0 || slot.row_n <= 0 || n_rows * static_cast<size_t>(slot.row_n) > UINT32_MAX) {
+        GGML_ABORT(
+            "[CPU-TG] flagged scatter has %zu rows of %lld floats; its host-expert rows would be dropped "
+            "(llama.cpp-7pvo)",
+            n_rows, (long long) slot.row_n);
+    }
+    // A recorded kernel would replay this flush's scratch contents on every replay. The route refuses while
+    // recording, and a segmented replay flushes every slot its segment reads before recording it (llama.cpp-7pm2).
+    if (!queue.has_property<sycl::property::queue::in_order>() || ggml_sycl_graph_recording_active()) {
+        GGML_ABORT(
+            "[CPU-TG] flagged scatter needs an in-order queue outside graph recording (in_order=%d "
+            "recording=%d); its host-expert rows would be dropped (llama.cpp-7pvo)",
+            queue.has_property<sycl::property::queue::in_order>() ? 1 : 0, ggml_sycl_graph_recording_active() ? 1 : 0);
+    }
+    const ggml_sycl::resolved_ptr scratch =
+        slot.scatter_scratch.valid() ? slot.scatter_scratch.resolve(device) : ggml_sycl::resolved_ptr{};
+    const ggml_sycl::resolved_ptr dst = f.dst_handle.valid() ? f.dst_handle.resolve(device) : ggml_sycl::resolved_ptr{};
+    const size_t                  dst_end = f.dst_offset + (n_rows - 1) * f.dst_row_stride + row_bytes;
+    if (!scratch.ptr || !scratch.on_device || scratch.extent < rows_bytes + flags_bytes || !dst.ptr || !dst.on_device ||
+        dst.extent < dst_end || !slot.out_handle.valid() || !f.flags_handle.valid()) {
+        GGML_ABORT(
+            "[CPU-TG] flagged scatter on device %d cannot resolve its scratch (%zu of %zu bytes) or "
+            "destination (%zu of %zu bytes); its host-expert rows would be dropped (llama.cpp-7pvo)",
+            device, scratch.extent, rows_bytes + flags_bytes, dst.extent, dst_end);
+    }
+
+    const sycl::event rows_copied  = ggml_sycl::mem_copy_async(slot.scatter_scratch, 0, slot.out_handle,
+                                                               slot.pool_first * row_bytes, rows_bytes, queue, deps);
+    const sycl::event flags_copied = ggml_sycl::mem_copy_async(
+        slot.scatter_scratch, rows_bytes, f.flags_handle, slot.pool_first * sizeof(int32_t), flags_bytes, queue, deps);
+    const float *   rows       = static_cast<const float *>(scratch.ptr);
+    const int32_t * flags      = reinterpret_cast<const int32_t *>(static_cast<const char *>(scratch.ptr) + rows_bytes);
+    char *          dst_rows   = static_cast<char *>(dst.ptr) + f.dst_offset;
+    const size_t    dst_stride = f.dst_row_stride;
+    const uint32_t  row_elems  = static_cast<uint32_t>(slot.row_n);
+    const uint32_t  n_elems    = static_cast<uint32_t>(n_rows) * row_elems;
+    ggml_sycl_profile_label label{};
+    label.name         = "moe.host_scatter";
+    label.category     = "moe.host_scatter";
+    label.queue_kind   = "compute";
+    label.metadata     = "role=host_expert_result_scatter";
+    label.device       = device;
+    label.bytes        = rows_bytes;
+    sycl::event placed = ggml_sycl_profile_submit(queue, label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            cgh.depends_on({ rows_copied, flags_copied });
+            cgh.parallel_for(sycl::range<1>(n_elems), [=](sycl::id<1> idx) {
+                const uint32_t i = static_cast<uint32_t>(idx[0]);
+                const uint32_t r = i / row_elems;
+                if (flags[r] != 0) {
+                    reinterpret_cast<float *>(dst_rows + r * dst_stride)[i - r * row_elems] = rows[i];
+                }
+            });
+        });
+    });
+    events.push_back(rows_copied);
+    events.push_back(flags_copied);
+    events.push_back(placed);
+    ggml_sycl::retain_handles_until_event({ f.dst_handle, slot.scatter_scratch }, placed);
+    if (slot.scatter_stats) {
+        slot.scatter_stats->note_use(rows_bytes + flags_bytes);
+    }
+}
+
 // The flush is done with the slot (llama.cpp-z4kd).  Its scatter is submitted behind the CPU job's join and nothing
 // has waited for either; the flush retained every buffer the job uses until that join, so clearing the slot frees
 // nothing still in use.  prev_scatter keeps only the scatter's events, which the graph boundary waits
@@ -25869,15 +25964,17 @@ static void pending_cpu_scatter_retire(pending_cpu_scatter & slot, const std::ve
     slot.scatter_scratch       = {};
     slot.scatter_scratch_bytes = 0;
     slot.scatter_stats         = nullptr;
+    slot.flagged               = {};
 }
 
 // May the sibling slot's flush take the primary along (llama.cpp-cre6)? flush_pending_cpu_scatter() flushes the
 // sibling and then the primary with nothing between, so flushing both from the sibling's call moves no work across
-// another. The two share one copy and one kernel only through one queue and one scratch.
+// another. The two share one copy and one kernel only through one queue and one scratch. A flagged slot
+// (llama.cpp-7pvo) has no rows to share: its job, not the host, chose them.
 static bool pending_cpu_scatter_takes_partner(const pending_cpu_scatter & slot, const pending_cpu_scatter & next) {
-    return &slot == &g_pending_scatter_sibling && &next == &g_pending_scatter && next.active && next.stream &&
-           next.out_pinned && next.out_handle.valid() && next.stream == slot.stream &&
-           next.device_id == slot.device_id && slot.scatter_scratch.valid() &&
+    return &slot == &g_pending_scatter_sibling && &next == &g_pending_scatter && !slot.flagged.active &&
+           !next.flagged.active && next.active && next.stream && next.out_pinned && next.out_handle.valid() &&
+           next.stream == slot.stream && next.device_id == slot.device_id && slot.scatter_scratch.valid() &&
            next.scatter_scratch.stable_identity_equal(slot.scatter_scratch);
 }
 
@@ -25971,6 +26068,12 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
             }
             n_copies = ws.runs.size();
         }
+        // A flagged slot (llama.cpp-7pvo) has no entries, so nothing above placed a row of it: its job chose its
+        // host rows, and the flagged form places them.  It never shares a flush (pending_cpu_scatter_takes_partner).
+        if (slot.flagged.active) {
+            moe_host_scatter_submit_flagged(slot, joins, ws.events);
+            n_copies += 2;
+        }
         // A flush with no rows to place still leaves its joins for the graph boundary to wait.
         if (ws.events.empty()) {
             ws.events.insert(ws.events.end(), joins.begin(), joins.end());
@@ -25983,7 +26086,7 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
             const pending_cpu_scatter &        s = *group[k];
             std::vector<ggml_sycl::mem_handle> job_buffers;
             for (const ggml_sycl::mem_handle * h :
-                 { &s.out_handle, &s.act_handle, &s.weight_handle, &s.act_keepalive }) {
+                 { &s.out_handle, &s.act_handle, &s.weight_handle, &s.act_keepalive, &s.flagged.flags_handle }) {
                 if (h->valid()) {
                     job_buffers.push_back(*h);
                 }
@@ -26061,6 +26164,7 @@ static void move_pending_cpu_scatter_to_sibling() {
     to.scatter_scratch       = std::move(from.scatter_scratch);
     to.scatter_scratch_bytes = from.scatter_scratch_bytes;
     to.scatter_stats         = from.scatter_stats;
+    to.flagged               = std::move(from.flagged);
     to.active                = true;
 
     from.future = {};
@@ -26086,6 +26190,7 @@ static void move_pending_cpu_scatter_to_sibling() {
     from.scatter_scratch       = {};
     from.scatter_scratch_bytes = 0;
     from.scatter_stats         = nullptr;
+    from.flagged               = {};
 }
 
 // Selective flush: only flush if the pending scatter's destination tensor
