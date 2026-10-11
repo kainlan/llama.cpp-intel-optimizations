@@ -24162,6 +24162,11 @@ static thread_local moe_shared_act_state g_moe_shared_act;
 // decode route (llama.cpp-7pvo) share it, so either one's up can read the other's gate copy.
 static thread_local managed_host_pinned_buffer g_moe_shared_act_staging;
 
+// The MoE sequence layer of the last CPU-TG decode op on this thread, for the dispatch stats' token tick. The
+// retained hybrid block and the event-chained hybrid decode route (llama.cpp-7pvo) share it, so a token whose
+// host-expert layers split between the two routes still ticks once.
+static thread_local int g_moe_cputg_last_seq_layer = -1;
+
 // A new graph compute: the staging no longer holds a row of this graph, and
 // node pointers may repeat (graph reuse), so the epoch moves on. compute_impl
 // reaches it through ggml_sycl_cpu_tg_flush_pending(); segmented replay and
@@ -76833,8 +76838,11 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
 // enqueued after this op's flushes on the in-order queue, so every scatter that read those entries earlier has run;
 // a pending job kept beside this op holds disjoint entries (moe_sibling_pending_keep). So unlike the retained route
 // the job needs no moe_cpu_job_order_decide() wait.
-// Observations: the job records the expert-popularity counts on the pool worker, so a rerank on this thread may miss
-// the jobs still in flight; the next rerank counts them. Warmup, whose counts drive placement, never routes here.
+// Observations: the retained CPU-TG block's per-op records are kept, not refused (the dispatch stats are always on).
+// The job records the expert-popularity counts, the predictor's actual experts and the dispatch stats' residency on
+// the pool worker, where the ids are, so a rerank or a stats interval on this thread may miss the jobs still in
+// flight; the next one counts them. The token tick stays on this thread, on the tracker the retained block uses.
+// Warmup, whose counts drive placement, never routes here.
 // Returns false, having taken nothing that changes the retained route's result, when the route does not apply.
 static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context & ctx,
                                                       const ggml_tensor *         src0,
@@ -76870,7 +76878,7 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     if (!cpu_traits || !cpu_traits->vec_dot || g_moe_multi_gpu_active.load(std::memory_order_acquire) ||
         g_pending_secondary_scatter.active || !g_moe_warmup.warmup_done.load(std::memory_order_acquire) ||
         g_adaptive_prestage.enabled.load(std::memory_order_acquire) || g_moe_profile_enabled ||
-        g_moe_pp_profile_enabled || ggml_sycl::MoeDispatchStats::enabled()) {
+        g_moe_pp_profile_enabled) {
         return false;
     }
     std::shared_ptr<const moe_hybrid_decode_record> record;
@@ -77061,19 +77069,29 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
         job_inputs.events.push_back(record->ready);
     }
 
+    // What the retained CPU-TG block observes per op, keyed by the op's MoE sequence layer: the warmup counts
+    // (while reranking), the predictor's actual experts and the dispatch stats.
     int seq_layer = -1;
-    if (g_moe_warmup.reranking_enabled.load(std::memory_order_acquire)) {
+    {
         const auto it = g_moe_layer_seq[device].find(record->cache_layer);
         seq_layer     = it != g_moe_layer_seq[device].end() ? it->second : -1;
     }
+    const bool record_warmup = seq_layer >= 0 && g_moe_warmup.reranking_enabled.load(std::memory_order_acquire);
+    ggml_sycl::ExpertPredictor * const predictor =
+        seq_layer >= 0 && g_expert_predictors[device].is_active() ? &g_expert_predictors[device] : nullptr;
+    ggml_sycl::MoeDispatchStats * const stats =
+        ggml_sycl::MoeDispatchStats::enabled() ? &ggml_sycl::get_moe_dispatch_stats(device) : nullptr;
     int32_t * const ids_rows = pool.ids() + first;
     const ggml_type type     = src0->type;
 
     // Runs on the pool worker after the prologue: the ids have landed and nothing else writes these entries.
-    auto resolve = [record, ids_rows, act_host, out_rows, shares_row, n_ids, K, N, type,
-                    seq_layer](std::vector<cpu_expert_task> & tasks) {
-        if (seq_layer >= 0) {
+    auto resolve = [record, ids_rows, act_host, out_rows, shares_row, n_ids, K, N, type, seq_layer, record_warmup,
+                    predictor, stats](std::vector<cpu_expert_task> & tasks) {
+        if (record_warmup) {
             g_moe_warmup.record(seq_layer, ids_rows, static_cast<int>(n_ids));
+        }
+        if (predictor) {
+            predictor->record_actual(seq_layer, std::vector<int>(ids_rows, ids_rows + n_ids));
         }
         std::vector<ggml_sycl::moe_host_slot> host_slots;
         host_slots.reserve(static_cast<size_t>(n_ids));
@@ -77083,6 +77101,10 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
                 "[CPU-TG] hybrid decode route read an expert id outside [0, %zu); the device kernel read the "
                 "table there too (llama.cpp-7pvo)",
                 record->n_as);
+        }
+        if (stats) {
+            const int n_host = static_cast<int>(host_slots.size());
+            stats->record_route_residency(static_cast<int>(n_ids) - n_host, 0, n_host, 0, 0, 0);
         }
         tasks.reserve(host_slots.size());
         for (const ggml_sycl::moe_host_slot & hs : host_slots) {
@@ -77098,8 +77120,14 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
         }
     };
     std::future<void> job = cpu_pool.submit_batch({}, moe_cpu_job_prologue(std::move(job_inputs)), std::move(resolve));
-    if (seq_layer >= 0 && g_moe_warmup.tick_epoch()) {
+    if (record_warmup && g_moe_warmup.tick_epoch()) {
         moe_periodic_rerank();
+    }
+    if (stats) {
+        if (seq_layer >= 0 && seq_layer <= g_moe_cputg_last_seq_layer) {
+            stats->tick_token();
+        }
+        g_moe_cputg_last_seq_layer = seq_layer;
     }
 
     // One pending slot: a scatter still held here would be overwritten and its host-expert rows never placed; the
@@ -82005,11 +82033,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
 
                     // Token boundary: tick when seq_layer wraps (ALWAYS, even without predictor)
-                    static thread_local int last_seq_layer_cputg = -1;
-                    if (seq_layer_id_cputg >= 0 && seq_layer_id_cputg <= last_seq_layer_cputg) {
+                    if (seq_layer_id_cputg >= 0 && seq_layer_id_cputg <= g_moe_cputg_last_seq_layer) {
                         stats.tick_token();
                     }
-                    last_seq_layer_cputg = seq_layer_id_cputg;
+                    g_moe_cputg_last_seq_layer = seq_layer_id_cputg;
 
                     // Predictor recording (only when active)
                     auto & predictor_cputg = g_expert_predictors[ctx.device];
