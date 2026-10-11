@@ -131,7 +131,7 @@ explicitly labeled **unscoped lexical candidates**: they do not resolve C++
 bindings and therefore never establish lifecycle reset/teardown. An empty
 candidate search is likewise not proof of no access.
 
-At audited source commit `c536d84a8268c5bc8ed507002a0e05efae01fe6b`, the
+At audited source commit `ae57e884f2a6be0f079ef386043cc2759de4fff2`, the
 census emits **1,568 object rows**: 581 explicitly-static non-local objects,
 106 non-local objects with implicit static storage duration, 874 function-local
 static/thread-local objects, and 7 class static declarations. Per-file rows are 1,219
