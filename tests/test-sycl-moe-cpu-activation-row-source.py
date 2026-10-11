@@ -1005,8 +1005,6 @@ def self_test(backend_src: str) -> int:
     expect_fail("keep-request-drops-staging-serial", sub(
         "keep.current_act_serial = g_moe_shared_act.record.serial;", "keep.current_act_serial = gate.act_serial;",
         in_lambda=False, after=JOIN_ANCHOR), None, "J1")
-    wait_pair = ("                        sycl::event::wait(g_pending_scatter_sibling.prev_bufs.scatter_events);\n"
-                 "                        sycl::event::wait(g_pending_scatter.prev_bufs.scatter_events);\n")
     join_else = ("                        flush_pending_cpu_scatter();\n                    }\n                }\n"
                  "                auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);\n")
     expect_fail("join-else-drops-flush", sub(
