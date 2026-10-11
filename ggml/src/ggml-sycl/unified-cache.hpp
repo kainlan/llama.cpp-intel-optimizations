@@ -1977,35 +1977,41 @@ void   unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t
 size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
 // llama.cpp-479i: plan the per-context dense MMQ/MMVQ Q8_1 src1 buffer from the inventory's
 // bytes-per-token (zone_scoped_maxima().mmq_src1_bytes_per_token) at n_ubatch. Folded into
-// unified_cache_get_planned_runtime_zone_requirement(). False on overflow (nothing published).
-// `other_model_live`: the inputs are device-global, so while another model is live on the device the larger of
-// the old and the new input is kept (a draft loaded beside a target must not shrink the target's plan). The
-// figure is validated BEFORE anything is stored: a rejected one leaves the stored inputs alone, publishes a zero
-// plan and marks the dense scratch invalid, so the fit check refuses instead of trusting stale inputs.
-bool         unified_cache_set_planned_mmq_src1_scratch(int      device_id,
-                                                        size_t   bytes_per_token,
-                                                        uint32_t n_ubatch,
-                                                        bool     other_model_live = false);
+// unified_cache_get_planned_runtime_zone_requirement(). False on overflow or a refused owner.
+// llama.cpp-45qo: the inputs are `owner`'s own contribution (its model slot and slot generation, canonical contract
+// 12.4), replacing what that owner stored before; another model live on the device keeps its own, the published plan
+// is sized from the merge of the owners' inputs, and an owner's inputs leave with it (unified_cache_drop_planned_load_
+// terms). The figure is validated on that merge BEFORE anything is stored: a rejected one stores only the owner's flag,
+// so the published plan for the buffer is zero and marked invalid while that owner is live, and the fit check refuses
+// instead of trusting stale inputs.
+bool     unified_cache_set_planned_mmq_src1_scratch(int                  device_id,
+                                                    lifecycle::SlotToken owner,
+                                                    size_t               bytes_per_token,
+                                                    uint32_t             n_ubatch);
 size_t unified_cache_get_planned_mmq_src1_scratch_bytes(int device_id);
 // llama.cpp-479i: plan the per-context dense f16 dequant buffers (src0 copy + src1 copy) from
 // the inventory maxima (zone_scoped_maxima().dequant_f16_weight_bytes / _src1_bytes_per_token) at
-// n_ubatch. Folded into unified_cache_get_planned_runtime_zone_requirement(). False on overflow.
-bool         unified_cache_set_planned_dequant_f16_scratch(int      device_id,
-                                                           size_t   max_weight_bytes,
-                                                           size_t   src1_bytes_per_token,
-                                                           uint32_t n_ubatch,
-                                                           bool     other_model_live = false);
+// n_ubatch. Folded into unified_cache_get_planned_runtime_zone_requirement(). False on overflow or a refused owner.
+// Owner-keyed and validated like the Q8_1 plan (llama.cpp-45qo).
+bool     unified_cache_set_planned_dequant_f16_scratch(int                  device_id,
+                                                       lifecycle::SlotToken owner,
+                                                       size_t               max_weight_bytes,
+                                                       size_t               src1_bytes_per_token,
+                                                       uint32_t             n_ubatch);
 // Both buffers' bytes together (what the RUNTIME zone requirement folds in), and each alone: the graph walk
 // ensures each buffer at max(its own plan, the graph's demand).
 size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id);
 size_t unified_cache_get_planned_dequant_f16_buffer_bytes(int device_id, bool src1);
-// llama.cpp-kpjw: re-derive both dense scratch plans at `n_ubatch` from the inputs the load-time setters were last
-// given. The runtime-context transaction calls it with the runtime n_ubatch (auto-ubatch picks it after load).
-// False when nothing was planned for the device or a figure overflowed.
-// `other_model_live`: another context is live on THIS device, so the plan's n_ubatch is the larger of the stored
-// and the new one (a rollback that restores an exact earlier value passes false).
-bool     unified_cache_replan_planned_dense_scratch(int device_id, uint32_t n_ubatch, bool other_model_live = false);
+// llama.cpp-kpjw: re-derive both dense scratch plans at `n_ubatch`. The runtime-context transaction calls it with the
+// runtime n_ubatch (auto-ubatch picks it after load). llama.cpp-45qo: from `owner`'s own inputs, changing only that
+// owner's n_ubatch (a rollback that restores an exact earlier value passes that value); another live model's
+// contribution is left as it is. False when the owner planned nothing on the device or a figure overflowed.
+bool     unified_cache_replan_planned_dense_scratch(int device_id, lifecycle::SlotToken owner, uint32_t n_ubatch);
+// The n_ubatch the published plan is sized at: the largest of the owners' on the device.
 uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id);
+// `owner`'s own n_ubatch on the device, 0 when it planned nothing there (llama.cpp-45qo): what a rolled-back
+// runtime-context transaction restores.
+uint32_t unified_cache_get_planned_dense_scratch_owner_n_ubatch(int device_id, lifecycle::SlotToken owner);
 // The plan's total bytes at `n_ubatch` without changing the published plan (a probe asks this).
 bool     unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_ubatch, size_t * out);
 // llama.cpp-p6i0: the load's planned compute term, the bytes the scheduler's compute buffer occupies in the RUNTIME

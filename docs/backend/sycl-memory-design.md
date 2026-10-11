@@ -2707,19 +2707,22 @@ cannot place the buffer and the graph is refused before submission, naming the z
 is not consulted: `largest_free_block()` is the head of the largest size class (approximate, by its own comment), so it
 would be a second heuristic beside the aggregate one rather than a contiguity proof.
 
-*Plan inputs are per device.* The per-token and weight maxima the setters keep are one set per device, and the last
-model loaded would win. While another backend context is live on the SAME device
-(`ggml_sycl_other_backend_context_live`, which reads the per-device context list, not the process-wide model registry),
-the larger of the old and the new input is kept (`zone_dense_scratch_merge_input`, tested on the host), so a draft loaded
-beside a target does not shrink the target's plan, and a model live on another device is no reason to merge; with no
-other context live the new inputs replace the old, so a model swap shrinks it. The runtime re-plan takes the same
-per-device answer, so a draft context at a small `n_ubatch` does not shrink a live target's plan either, and a rollback
-that restores an exact earlier value passes "none live". Two contexts on one device are
-still unsupported (canonical contract section 5), so the plan's `n_ubatch` is the last transaction's. A setter validates
-its figure before it stores anything: a rejected (overflowing) figure leaves the stored inputs alone and, with no other
-context live, publishes a zero plan and marks the plan invalid, so the fit check and a re-plan refuse instead of
-re-deriving a plan from stale inputs. With another context live the plan and its inputs are left standing: one model's
-overflow does not invalidate the plan of the model already running.
+*Plan inputs are per owner (llama.cpp-45qo).* The per-token and weight maxima and the `n_ubatch` are each model's own
+terms in the planned load terms' owner table (`planned-load-terms.hpp`, canonical contract 12.4), keyed by the model's
+slot and slot generation, which the load-time plan takes from the open load's effect. The device plans each buffer from
+the largest of each input over the owners on it, so a draft loaded beside a target does not shrink the target's plan,
+and a model live on another device is no part of the merge. An owner's inputs leave with it, at its load's rollback or
+its slot's release, so a model that unloads while another stays live leaves nothing behind. (Until llama.cpp-45qo the
+inputs were device-global: `zone_dense_scratch_merge_input` kept the larger input while another backend context was live
+and replaced it when none was, so a larger model's inputs outlived it beside a live one, and a model loaded beside a
+live but contextless one shrank that one's plan.) The runtime re-plan changes only the published model's own
+`n_ubatch`, so a draft context at a small `n_ubatch` does not shrink a live target's plan either, and a rollback
+restores that owner's exact earlier value. Two contexts of one model on one device are still unsupported (canonical
+contract section 5), so that owner's `n_ubatch` is the last transaction's. A store validates its figure on the merge it
+will publish before it stores anything: a rejected (overflowing) figure stores only that owner's flag, none of its
+inputs, and the published plan for the buffer is zero and marked invalid while that owner is live, so the fit check and
+a re-plan refuse instead of re-deriving a plan from stale inputs. The other owners' inputs stand, and the plan is valid
+again once the rejected owner's next figure is accepted or it is dropped.
 
 **D2: the plan followed the load-time `n_ubatch`.** Auto-ubatch chooses the real one at context creation, after load.
 The plan is a function of `n_ubatch` (`zone_dense_scratch_total_bytes()`), so the runtime-context transaction, the

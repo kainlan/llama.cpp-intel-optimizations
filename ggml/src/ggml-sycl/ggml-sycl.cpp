@@ -17046,10 +17046,10 @@ static constexpr bool ggml_sycl_dequant_f16_scratch_drawable() {
     return GGML_SYCL_DEQUANT_F16_ARM != 0;
 }
 
-// llama.cpp-kpjw: whether a backend context other than `self` is live on `device`. The plan inputs and the hold are
-// per device, so this (and not the process-wide model registry, which counts models on other devices too) is the
-// question a plan merge asks. Defined with the context list below.
-static bool ggml_sycl_other_backend_context_live(int device, const ggml_backend_sycl_context * self);
+// llama.cpp-45qo: the load effect of the open load whose inventory plan the stage runs on this thread
+// (g_sycl_plan_load_effect_txn), empty outside a staged load. Its owner keys the load's dense scratch plan. Defined
+// beside that thread-local below.
+static ggml_sycl::lifecycle::load_effect_lease ggml_sycl_acquire_plan_load_effect();
 
 // The inventory crosses from libllama into this library by pointer, so a field that moves would be read from the wrong
 // place without any error. These pin the KV tail of the layout (llama.cpp-8ecj).
@@ -17147,18 +17147,23 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     // llama.cpp-479i: the dense MMQ/MMVQ Q8_1 src1 buffer is a planned byte. Sized here from the
     // same inventory maxima, at the load-time n_ubatch (512 when the loader says 0); the graph-entry
     // check ggml_sycl_mmq_src1_ensure_for_graph() sizes the exact demand at the real n_ubatch.
-    // The plan inputs are per device: another context that is live on THIS device keeps its larger inputs (a draft
-    // loaded beside a target must not under-plan the target); a model live on another device is no reason to merge.
-    // The loading context is already in the device's context list, so it is excluded by identity.
-    const bool other_model_live = ggml_sycl_other_backend_context_live(ctx->device, ctx);
+    // llama.cpp-45qo: the plan inputs are this load's own contribution on the device, keyed by the model slot and slot
+    // generation of the open load the stage runs under (canonical contract 12.4), the owner its load effect names. The
+    // effect is held across both stores, so the load's end, which waits load effects out, cannot run its rollback's
+    // drop before they land. A model live on the device keeps its own inputs and the device plans for the merge; a model
+    // that unloads takes its inputs with it. Without an open load (the legacy direct setter) nothing owns a plan and
+    // nothing is planned.
+    const auto   plan_effect = ggml_sycl_acquire_plan_load_effect();
+    const char * unplanned =
+        plan_effect ? " -- sizing overflowed, nothing planned" : " -- no open load owns it, nothing planned";
     {
         const uint32_t mmq_src1_n_ubatch = inventory->n_ubatch != 0 ? inventory->n_ubatch : 512;
-        const bool     mmq_src1_planned  = ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(
-            ctx->device, inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch, other_model_live);
+        const bool     mmq_src1_planned  = plan_effect && ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(
+                                                         ctx->device, plan_effect.owner.owner,
+                                                         inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch);
         GGML_LOG_INFO("[SYCL-PLAN] dense MMQ src1 Q8_1 scratch: %.1f MB (%zu B/token x n_ubatch=%u, RUNTIME zone)%s\n",
                       ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(ctx->device) / (1024.0 * 1024.0),
-                      inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch,
-                      mmq_src1_planned ? "" : " -- sizing overflowed, nothing planned");
+                      inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch, mmq_src1_planned ? "" : unplanned);
     }
     // llama.cpp-479i: the dense f16 dequant buffers (src0 and src1 copies) are planned the same way, from
     // the inventory maxima the adapter marked (dense Q8_0 weights, and Q4_0 / MXFP4 weights the oneDNN PP scratch
@@ -17168,16 +17173,17 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     {
         const uint32_t dequant_n_ubatch = inventory->n_ubatch != 0 ? inventory->n_ubatch : 512;
         const bool     f16_drawable     = ggml_sycl_dequant_f16_scratch_drawable();
-        const bool     dequant_planned  = ggml_sycl::unified_cache_set_planned_dequant_f16_scratch(
-            ctx->device, f16_drawable ? inventory_maxima.dequant_f16_weight_bytes : 0,
-            f16_drawable ? inventory_maxima.dequant_f16_src1_bytes_per_token : 0, dequant_n_ubatch, other_model_live);
+        const bool     dequant_planned =
+            plan_effect &&
+            ggml_sycl::unified_cache_set_planned_dequant_f16_scratch(
+                ctx->device, plan_effect.owner.owner, f16_drawable ? inventory_maxima.dequant_f16_weight_bytes : 0,
+                f16_drawable ? inventory_maxima.dequant_f16_src1_bytes_per_token : 0, dequant_n_ubatch);
         GGML_LOG_INFO(
             "[SYCL-PLAN] dense f16 dequant scratch: %.1f MB (weights %.1f MB + %zu B/token x n_ubatch=%u, RUNTIME "
             "zone)%s\n",
             ggml_sycl::unified_cache_get_planned_dequant_f16_scratch_bytes(ctx->device) / (1024.0 * 1024.0),
             inventory_maxima.dequant_f16_weight_bytes / (1024.0 * 1024.0),
-            inventory_maxima.dequant_f16_src1_bytes_per_token, dequant_n_ubatch,
-            dequant_planned ? "" : " -- sizing overflowed, nothing planned");
+            inventory_maxima.dequant_f16_src1_bytes_per_token, dequant_n_ubatch, dequant_planned ? "" : unplanned);
     }
     {
         const bool pp_pipeline_enabled               = pp_pipeline_env_enabled();
@@ -17454,6 +17460,11 @@ static double ggml_sycl_dense_capability_score_for_device(int device_id) {
 }
 
 thread_local uint64_t g_sycl_plan_load_effect_txn = 0;
+
+static ggml_sycl::lifecycle::load_effect_lease ggml_sycl_acquire_plan_load_effect() {
+    // Txn 0 (no staged load on this thread) is refused by the registry like any transaction that is not the open one.
+    return ggml_sycl::lifecycle::global_registry().acquire_load_effect({ g_sycl_plan_load_effect_txn });
+}
 
 // Phase C helper: run compute_placement_plan (single- or multi-device) and
 // store the plan into per-device unified caches.  Idempotent — replaces any
@@ -19579,21 +19590,27 @@ static void ggml_sycl_moe_host_scatter_claim_plan(ggml_backend_sycl_context & ct
 // hold while it materializes its own pools; this restores both on every exit that is not the success tail. A probe
 // changes nothing, so its guard is inert. The hold is the OWNER's: the guard zeroes it for this context and puts
 // back whatever (hold, owner) pair it found.
+// llama.cpp-45qo: the plan it re-plans and restores is the model's own (`plan_owner`, the published plan's model slot
+// and slot generation), so a rollback puts back that owner's n_ubatch and leaves another live model's alone.
 struct ggml_sycl_dense_scratch_txn_guard {
-    int      device;
-    uint64_t owner;
-    bool     active;
-    bool     committed     = false;
-    uint32_t prev_n_ubatch = 0;
-    size_t   prev_hold     = 0;
-    uint64_t prev_owner    = 0;
+    int                             device;
+    uint64_t                        owner;
+    ggml_sycl::lifecycle::SlotToken plan_owner;
+    bool                            active;
+    bool                            committed     = false;
+    uint32_t                        prev_n_ubatch = 0;
+    size_t                          prev_hold     = 0;
+    uint64_t                        prev_owner    = 0;
 
-    ggml_sycl_dense_scratch_txn_guard(ggml_backend_sycl_context & ctx, bool publish) :
+    ggml_sycl_dense_scratch_txn_guard(ggml_backend_sycl_context &     ctx,
+                                      ggml_sycl::lifecycle::SlotToken model_owner,
+                                      bool                            publish) :
         device(ctx.device),
         owner(ctx.planned_scratch_owner),
+        plan_owner(model_owner),
         active(publish) {
         if (active) {
-            prev_n_ubatch = ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(device);
+            prev_n_ubatch = ggml_sycl::unified_cache_get_planned_dense_scratch_owner_n_ubatch(device, plan_owner);
             ggml_sycl::unified_cache_get_planned_scratch_hold_state(device, &prev_hold, &prev_owner);
             // The transaction places the MoE MMID pools in this zone; they are not the compute buffers the hold
             // exists to keep out, and the ring admission already counts the plan against the zone.
@@ -19606,8 +19623,8 @@ struct ggml_sycl_dense_scratch_txn_guard {
     ~ggml_sycl_dense_scratch_txn_guard() {
         if (active && !committed) {
             if (prev_n_ubatch != 0) {
-                // A rollback restores an exact earlier plan, not a merge, so it never keeps a larger input.
-                (void) ggml_sycl::unified_cache_replan_planned_dense_scratch(device, prev_n_ubatch, false);
+                // A rollback restores the owner's exact earlier n_ubatch; its re-plan replaces, it does not merge.
+                (void) ggml_sycl::unified_cache_replan_planned_dense_scratch(device, plan_owner, prev_n_ubatch);
             }
             ggml_sycl::unified_cache_set_planned_scratch_hold(device, prev_hold, prev_owner);
         }
@@ -20317,11 +20334,12 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         }
         dense_scratch_runtime_bytes = needed;
     }
-    ggml_sycl_dense_scratch_txn_guard dense_guard(*ctx, !probe_mode);
+    ggml_sycl_dense_scratch_txn_guard dense_guard(*ctx, current_token.owner, !probe_mode);
     if (!probe_mode && next_kv_info.n_ubatch != 0) {
-        // Another context live on this device keeps the larger n_ubatch in the plan it is running on.
-        (void) ggml_sycl::unified_cache_replan_planned_dense_scratch(
-            ctx->device, next_kv_info.n_ubatch, ggml_sycl_other_backend_context_live(ctx->device, ctx));
+        // The published plan's model re-plans its own inputs (llama.cpp-45qo); another model live on this device keeps
+        // its own, and the device plans for the merge.
+        (void) ggml_sycl::unified_cache_replan_planned_dense_scratch(ctx->device, current_token.owner,
+                                                                     next_kv_info.n_ubatch);
     }
 
     // llama.cpp-ibj0: the PP MoE oneDNN scratch ring was sized at model load
@@ -28899,19 +28917,6 @@ static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int 
     std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
     const auto & contexts = g_backend_context_by_device[device];
     return contexts.empty() ? nullptr : contexts.back();
-}
-
-static bool ggml_sycl_other_backend_context_live(int device, const ggml_backend_sycl_context * self) {
-    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
-    for (const ggml_backend_sycl_context * c : g_backend_context_by_device[device]) {
-        if (c != self) {
-            return true;
-        }
-    }
-    return false;
 }
 
 // Check if a tensor's buffer allocation is in device VRAM (not host-pinned fallback).

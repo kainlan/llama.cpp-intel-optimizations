@@ -155,6 +155,7 @@ UNITS_SIG = "bool ggml_backend_sycl_load_compute_term_bytes(const uint64_t * chu
 SETTER_SIG = "bool unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes)"
 SET_TERM_SIG = "static bool unified_cache_set_planned_load_term(int device_id, lifecycle::SlotToken owner,"
 PUBLISH_SIG = "static void planned_load_terms_publish_locked()"
+NAME_REPLACED_SIG = "static void planned_load_terms_name_replaced(lifecycle::SlotToken owner, int device_id,"
 DROP_SIG = "bool unified_cache_drop_planned_load_terms(lifecycle::SlotToken owner)"
 REQ_SIG = "bool unified_cache_get_planned_runtime_zone_requirement(int device_id, size_t * out)"
 TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
@@ -230,7 +231,8 @@ def claim_owner_store_republishes_under_the_lock(cache: str) -> bool:
     """One owner's term (llama.cpp-ihk6): the owner table replaces that owner's value, and the merge the readers load is
     republished for every device in the same locked step, so a merge computed before a later contribution cannot be
     published over it, and a device the store swept a stale contribution off is republished too. Each swept device is
-    named after the lock is released. No device-global merge input and no live-model flag remain."""
+    named after the lock is released, by the helper every owner store shares (llama.cpp-45qo), which walks every
+    device. No device-global merge input and no live-model flag remain."""
     t = norm(cache)
     b = body(t, SET_TERM_SIG)
     guard = GUARD_RE.search(b) if b else None
@@ -239,11 +241,15 @@ def claim_owner_store_republishes_under_the_lock(cache: str) -> bool:
     scope_end = block_end(b, guard.end())
     stored = OWNER_SET_RE.search(b, guard.end())
     published = b.find(PUBLISH_CALL, guard.end())
-    loop = DEVICE_LOOP_RE.search(b, scope_end) if scope_end >= 0 else None
-    if stored is None or loop is None or not (stored.end() <= published < scope_end):
+    if stored is None or scope_end < 0 or not (stored.end() <= published < scope_end):
         return False
-    loop_body = b[loop.end():block_end(b, loop.end())]
-    swept = "%s.generation[%s]" % (stored.group(1), loop.group(1))
+    named = b.find("planned_load_terms_name_replaced(owner, device_id, %s);" % stored.group(1), scope_end)
+    helper = body(t, NAME_REPLACED_SIG)
+    loop = DEVICE_LOOP_RE.search(helper) if helper else None
+    if named < 0 or loop is None:
+        return False
+    loop_body = helper[loop.end():block_end(helper, loop.end())]
+    swept = "replaced.generation[%s]" % loop.group(1)
     return ("GGML_LOG_WARN(" in loop_body and "were still standing on device %d" in loop_body and swept in loop_body
             and "zone_dense_scratch_merge_input" not in b and "other_model_live" not in b)
 
@@ -559,7 +565,7 @@ def _rename(raw: str, within: str, old: str, new: str) -> str:
 def test_control_setter_with_its_locals_renamed_passes():
     """Property, not spelling: the guard, the swept record and the loop index may take any name."""
     renamed = _rename(_rename(_rename(CACHE, SET_TERM_SIG, "lock", "guard"), SET_TERM_SIG, "replaced", "swept"),
-                      SET_TERM_SIG, "stale_device", "d")
+                      NAME_REPLACED_SIG, "stale_device", "d")
     assert claim_owner_store_republishes_under_the_lock(renamed)
     assert claim_setter_stores_the_owners_term(renamed)
 
@@ -567,7 +573,12 @@ def test_control_setter_with_its_locals_renamed_passes():
 def test_mutant_setter_naming_only_the_storing_device_fails():
     assert not claim_setter_stores_the_owners_term(
         _once(CACHE, STALE_LOOP, "for (int stale_device = device_id; stale_device == device_id; ++stale_device) {",
-              within=SET_TERM_SIG))
+              within=NAME_REPLACED_SIG))
+
+
+def test_mutant_setter_never_naming_the_sweep_fails():
+    assert not claim_setter_stores_the_owners_term(
+        _once(CACHE, "planned_load_terms_name_replaced(owner, device_id, replaced);", "", within=SET_TERM_SIG))
 
 
 def test_mutant_compute_setter_storing_the_state_term_fails():
