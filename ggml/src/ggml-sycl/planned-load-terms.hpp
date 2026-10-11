@@ -47,9 +47,10 @@ enum class planned_load_term {
     DENSE_SCRATCH_N_UBATCH,            // the n_ubatch both dense scratch plans are sized at (llama.cpp-kpjw)
     MMQ_SRC1_REJECTED,                 // 1: the Q8_1 src1 figure overflowed its sizing
     DEQUANT_F16_REJECTED,              // 1: the f16 dequant figure overflowed its sizing
+    COUNT,                             // not a term: the number of terms, so a term added above is counted with it
 };
 
-constexpr int planned_load_term_count = 8;
+constexpr int planned_load_term_count = static_cast<int>(planned_load_term::COUNT);
 
 // One term and the value an owner stores for it.
 struct planned_load_term_value {
@@ -152,6 +153,19 @@ class planned_load_terms {
         }
         const size_t others = merged_over(device, term, owner.slot, static_cast<int>(rejected));
         return value > others ? value : others;
+    }
+
+    // The value `owner` holds for `term` on `device` once it may only rise while the owner lives: the larger of `value`
+    // and what the owner holds now, `value` when it holds nothing there (another generation of its slot is another
+    // owner) or an argument is out of range. A dense scratch n_ubatch is such a term: two contexts of one model share
+    // their owner's contribution, so a second context at a smaller n_ubatch must not shrink the plan the first one's
+    // buffers were sized from. It leaves only with the owner.
+    size_t raised_value(int device, lifecycle::SlotToken owner, planned_load_term term, size_t value) const {
+        size_t current = 0;
+        if (!get(device, owner, term, &current)) {
+            return value;
+        }
+        return current > value ? current : value;
     }
 
     // `owner`'s own value of `term` on `device`, into `*out`. False, writing 0, when the owner holds no contribution

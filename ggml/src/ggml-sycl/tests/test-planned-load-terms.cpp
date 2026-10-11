@@ -357,6 +357,37 @@ void test_a_rejected_owner_contributes_nothing_to_the_accepted_merge() {
     check(t.merged_accepted(0, ubatch, f16_flag) == 512, "B's n_ubatch left with it");
 }
 
+// An owner's n_ubatch only rises while the owner lives (lead ruling on llama.cpp-45qo): two contexts of one model on a
+// device share the owner's contribution, so a second context at a smaller n_ubatch must not shrink the plan the first
+// one's buffers were sized from. It leaves only with the owner.
+void test_an_owners_n_ubatch_only_rises_until_it_drops() {
+    printf(
+        "raised_value: an owner's n_ubatch only rises while it lives, and a fresh owner starts from its own value\n");
+    planned_load_terms      t;
+    const planned_load_term ubatch = planned_load_term::DENSE_SCRATCH_N_UBATCH;
+    check(t.raised_value(0, kA, ubatch, 2048) == 2048, "A holds nothing yet: its first context's 2048 stands");
+    check(store_q8(t, 0, kA, kQ8Small, t.raised_value(0, kA, ubatch, 2048)), "A's first context plans at 2048");
+    check(t.raised_value(0, kA, ubatch, 512) == 2048, "A's second context at 512 keeps A's 2048");
+    check(store_q8(t, 0, kA, kQ8Small, t.raised_value(0, kA, ubatch, 512)), "A's second context re-plans");
+    check(n_ubatch(t, 0) == 2048, "the device still reads 2048: the first context's buffers stay planned");
+    check(t.raised_value(0, kA, ubatch, 4096) == 4096, "a larger context raises it");
+    check(t.raised_value(1, kA, ubatch, 512) == 512, "on a device A holds nothing on, the value stands");
+    const SlotToken a_next{ kA.slot, kA.generation + 1 };
+    check(t.raised_value(0, a_next, ubatch, 512) == 512, "another generation of A's slot is another owner");
+    check(t.raised_value(GGML_SYCL_MAX_DEVICES, kA, ubatch, 512) == 512, "a device out of range: the value stands");
+    check(t.drop(kA), "A unloads");
+    check(store_q8(t, 0, kB, kQ8Small, t.raised_value(0, kB, ubatch, 512)), "a fresh owner B plans at 512");
+    check(n_ubatch(t, 0) == 512, "the device reads B's 512: A's 2048 left with A");
+}
+
+void test_the_term_count_is_the_enum_count() {
+    printf("planned_load_term_count follows the enum, so a term added to it is in range without a second edit\n");
+    planned_load_terms t;
+    check(ggml_sycl::planned_load_term_count == static_cast<int>(planned_load_term::COUNT), "the count is COUNT");
+    check(t.set(0, kA, planned_load_term::DEQUANT_F16_REJECTED, 1), "the last real term is in range");
+    check(!t.set(0, kB, planned_load_term::COUNT, 1), "COUNT itself is not a term");
+}
+
 void test_a_newer_owner_sweeps_stale_dense_scratch_inputs() {
     printf("a newer generation sweeps its predecessor's dense scratch inputs on every device\n");
     planned_load_terms          t;
@@ -399,6 +430,8 @@ int main() {
     test_a_rejected_figure_is_an_owner_flag();
     test_a_rejected_owner_contributes_nothing_to_the_accepted_merge();
     test_a_newer_owner_sweeps_stale_dense_scratch_inputs();
+    test_an_owners_n_ubatch_only_rises_until_it_drops();
+    test_the_term_count_is_the_enum_count();
 
     printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;
