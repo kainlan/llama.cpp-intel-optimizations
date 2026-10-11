@@ -816,20 +816,22 @@ static size_t onednn_pp_pair_bound_for(int device_id, size_t capacity_bytes) {
 // (n_ubatch * bytes-per-token from the inventory, 256-aligned), folded into the
 // RUNTIME zone requirement so the zone the buffer lives in is sized for it.
 // llama.cpp-45qo: this and every dense scratch value below is PUBLISHED from the owner table (g_planned_load_terms
-// below): the plan sized from the merge of the owners' inputs on the device. planned_load_terms_publish_locked is
-// their only writer.
+// below): the plan sized from the merge of the accepted owners' inputs on the device.
+// planned_dense_scratch_publish_locked is their only writer.
 static std::atomic<size_t>   g_planned_mmq_src1_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 // llama.cpp-479i: planned bytes of the per-context dense f16 dequant buffers (the src0 copy
 // plus the src1 copy, see zone_dequant_f16_*), folded into the same RUNTIME zone requirement.
 static std::atomic<size_t>   g_planned_dequant_f16_src0_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_dequant_f16_src1_bytes[GGML_SYCL_MAX_DEVICES]{};
 // llama.cpp-kpjw: the INPUTS the plan is sized from (per-token and weight maxima, n_ubatch), the merge over the
-// owners on the device (llama.cpp-45qo), read by the fit check and the plan-at-n_ubatch query. Each owner's own
-// inputs stay in the owner table, which is what a re-plan at the runtime n_ubatch re-derives from.
+// accepted owners on the device (llama.cpp-45qo), read by the fit check and the plan-at-n_ubatch query. Each owner's
+// own inputs stay in the owner table, which is what a re-plan at the runtime n_ubatch re-derives from. The n_ubatch
+// is each half's own, [0] the Q8_1 half and [1] the f16 half, because each half is merged over its own accepted
+// owners.
 static std::atomic<size_t>   g_planned_mmq_src1_bytes_per_token[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_dequant_f16_weight_bytes_max[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_dequant_f16_src1_bytes_per_token[GGML_SYCL_MAX_DEVICES]{};
-static std::atomic<uint32_t> g_planned_dense_scratch_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<uint32_t> g_planned_dense_scratch_n_ubatch[GGML_SYCL_MAX_DEVICES][2]{};
 // llama.cpp-p6i0: the load's planned compute term (the scheduler's compute buffer, measured at the load's measure
 // shape and rounded to the RUNTIME TLSF's grain), folded into the same RUNTIME zone requirement.
 // llama.cpp-ihk6: this is the MERGE over the owners on the device (g_planned_load_terms below), published there; it is
@@ -842,10 +844,10 @@ static std::atomic<size_t>   g_planned_state_term_bytes[GGML_SYCL_MAX_DEVICES]{}
 
 // llama.cpp-ihk6: the planned load terms by owner (canonical contract 12.4): each live model's contribution, and the
 // load in flight's, per device, keyed by model slot and slot generation. Since llama.cpp-45qo they include the dense
-// scratch plan's inputs. A set or a drop and the republish of the
-// merge above happen under `mutex`, so a merge cannot be published over by one computed before a later contribution
-// landed. The writers run on different threads (the loader thread reserves and rolls back, the unloading thread or the
-// quarantine reaper releases a slot) and their call sites share no exclusive lock, which is why this has its own.
+// scratch plan's inputs. A set or a drop and the republish of the merge above happen under `mutex`, so a merge cannot
+// be published over by one computed before a later contribution landed. The writers run on different threads (the
+// loader thread reserves and rolls back, the unloading thread or the quarantine reaper releases a slot) and their call
+// sites share no exclusive lock, which is why this has its own.
 // The mutex is a leaf: nothing is called while it is held, and readers never take it.
 struct planned_load_terms_state {
     std::mutex         mutex;
@@ -2146,7 +2148,6 @@ static void planned_dense_scratch_publish_locked(int device_id) {
     const size_t f16_per_tok =
         owners.merged_accepted(device_id, planned_load_term::DEQUANT_F16_SRC1_BYTES_PER_TOKEN, f16_flag);
     const size_t f16_n_ubatch = owners.merged_accepted(device_id, planned_load_term::DENSE_SCRATCH_N_UBATCH, f16_flag);
-    const size_t n_ubatch     = q8_n_ubatch > f16_n_ubatch ? q8_n_ubatch : f16_n_ubatch;
     size_t       q8_bytes     = 0;
     size_t       src0_bytes   = 0;
     size_t       src1_bytes   = 0;
@@ -2158,8 +2159,10 @@ static void planned_dense_scratch_publish_locked(int device_id) {
     g_planned_mmq_src1_bytes_per_token[device_id].store(q8_per_tok, std::memory_order_release);
     g_planned_dequant_f16_weight_bytes_max[device_id].store(f16_weights, std::memory_order_release);
     g_planned_dequant_f16_src1_bytes_per_token[device_id].store(f16_per_tok, std::memory_order_release);
-    g_planned_dense_scratch_n_ubatch[device_id].store(n_ubatch <= UINT32_MAX ? static_cast<uint32_t>(n_ubatch) : 0,
-                                                      std::memory_order_release);
+    g_planned_dense_scratch_n_ubatch[device_id][0].store(
+        q8_n_ubatch <= UINT32_MAX ? static_cast<uint32_t>(q8_n_ubatch) : 0, std::memory_order_release);
+    g_planned_dense_scratch_n_ubatch[device_id][1].store(
+        f16_n_ubatch <= UINT32_MAX ? static_cast<uint32_t>(f16_n_ubatch) : 0, std::memory_order_release);
     g_planned_mmq_src1_scratch_bytes[device_id].store(q8_valid ? q8_bytes : 0, std::memory_order_release);
     g_planned_dequant_f16_src0_bytes[device_id].store(f16_valid ? src0_bytes : 0, std::memory_order_release);
     g_planned_dequant_f16_src1_bytes[device_id].store(f16_valid ? src1_bytes : 0, std::memory_order_release);
@@ -2198,22 +2201,34 @@ static void planned_load_terms_name_replaced(lifecycle::SlotToken               
     }
 }
 
-// One owner's term on one device (llama.cpp-ihk6): replaces that owner's earlier value, so a draft loaded beside its
-// target adds its own contribution and leaves the target's standing, and the device reads the larger of the two.
-static bool unified_cache_set_planned_load_term(int                  device_id,
-                                                lifecycle::SlotToken owner,
-                                                planned_load_term    term,
-                                                size_t               bytes) {
+// The owner store every planned load term setter shares (llama.cpp-45qo): `store_locked(&replaced)` stores the
+// owner's terms under the table's leaf mutex (false: the table refused the owner and nothing was stored). The merge the
+// readers load is republished for every device in the same locked step, so a merge computed before a later
+// contribution cannot be published over it, and each device the store swept a stale contribution off is named after
+// the lock is released.
+template <typename F>
+static bool planned_load_terms_store(int device_id, lifecycle::SlotToken owner, F && store_locked) {
     planned_load_terms_replaced replaced;
     {
         std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
-        if (!g_planned_load_terms.owners.set(device_id, owner, term, bytes, &replaced)) {
+        if (!store_locked(&replaced)) {
             return false;
         }
         planned_load_terms_publish_locked();
     }
     planned_load_terms_name_replaced(owner, device_id, replaced);
     return true;
+}
+
+// One owner's term on one device (llama.cpp-ihk6): replaces that owner's earlier value, so a draft loaded beside its
+// target adds its own contribution and leaves the target's standing, and the device reads the larger of the two.
+static bool unified_cache_set_planned_load_term(int                  device_id,
+                                                lifecycle::SlotToken owner,
+                                                planned_load_term    term,
+                                                size_t               bytes) {
+    return planned_load_terms_store(device_id, owner, [&](planned_load_terms_replaced * replaced) {
+        return g_planned_load_terms.owners.set(device_id, owner, term, bytes, replaced);
+    });
 }
 
 bool unified_cache_set_planned_compute_term(int device_id, lifecycle::SlotToken owner, size_t bytes) {
@@ -2326,17 +2341,11 @@ bool unified_cache_set_planned_mmq_src1_scratch(int                  device_id,
                                                 lifecycle::SlotToken owner,
                                                 size_t               bytes_per_token,
                                                 uint32_t             n_ubatch) {
-    planned_load_terms_replaced replaced;
-    bool                        planned = false;
-    {
-        std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
-        if (!planned_mmq_src1_scratch_store_locked(device_id, owner, bytes_per_token, n_ubatch, &planned, &replaced)) {
-            return false;
-        }
-        planned_load_terms_publish_locked();
-    }
-    planned_load_terms_name_replaced(owner, device_id, replaced);
-    return planned;
+    bool       planned = false;
+    const bool stored  = planned_load_terms_store(device_id, owner, [&](planned_load_terms_replaced * replaced) {
+        return planned_mmq_src1_scratch_store_locked(device_id, owner, bytes_per_token, n_ubatch, &planned, replaced);
+    });
+    return stored && planned;
 }
 
 bool unified_cache_set_planned_dequant_f16_scratch(int                  device_id,
@@ -2344,18 +2353,12 @@ bool unified_cache_set_planned_dequant_f16_scratch(int                  device_i
                                                    size_t               max_weight_bytes,
                                                    size_t               src1_bytes_per_token,
                                                    uint32_t             n_ubatch) {
-    planned_load_terms_replaced replaced;
-    bool                        planned = false;
-    {
-        std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
-        if (!planned_dequant_f16_scratch_store_locked(device_id, owner, max_weight_bytes, src1_bytes_per_token,
-                                                      n_ubatch, &planned, &replaced)) {
-            return false;
-        }
-        planned_load_terms_publish_locked();
-    }
-    planned_load_terms_name_replaced(owner, device_id, replaced);
-    return planned;
+    bool       planned = false;
+    const bool stored  = planned_load_terms_store(device_id, owner, [&](planned_load_terms_replaced * replaced) {
+        return planned_dequant_f16_scratch_store_locked(device_id, owner, max_weight_bytes, src1_bytes_per_token,
+                                                         n_ubatch, &planned, replaced);
+    });
+    return stored && planned;
 }
 
 size_t unified_cache_get_planned_dequant_f16_buffer_bytes(int device_id, bool src1) {
@@ -2373,6 +2376,26 @@ size_t unified_cache_get_planned_dequant_f16_scratch_bytes(int device_id) {
     return src0 > SIZE_MAX - src1 ? SIZE_MAX : src0 + src1;
 }
 
+// Whether `owner`'s own figure for either half of the dense scratch plan on `device_id` was rejected, and which
+// (either out may be null). Reads only the owner's own flags: another owner's rejection is not this owner's. False
+// when the owner holds nothing on the device. Called with g_planned_load_terms.mutex held.
+static bool planned_dense_scratch_owner_rejected_locked(int                  device_id,
+                                                        lifecycle::SlotToken owner,
+                                                        bool *               q8_rejected,
+                                                        bool *               f16_rejected) {
+    size_t q8  = 0;
+    size_t f16 = 0;
+    (void) g_planned_load_terms.owners.get(device_id, owner, planned_load_term::MMQ_SRC1_REJECTED, &q8);
+    (void) g_planned_load_terms.owners.get(device_id, owner, planned_load_term::DEQUANT_F16_REJECTED, &f16);
+    if (q8_rejected != nullptr) {
+        *q8_rejected = q8 != 0;
+    }
+    if (f16_rejected != nullptr) {
+        *f16_rejected = f16 != 0;
+    }
+    return q8 != 0 || f16 != 0;
+}
+
 bool unified_cache_replan_planned_dense_scratch(int device_id, lifecycle::SlotToken owner, uint32_t n_ubatch) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES || n_ubatch == 0) {
         return false;
@@ -2380,12 +2403,8 @@ bool unified_cache_replan_planned_dense_scratch(int device_id, lifecycle::SlotTo
     std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
     // An owner whose figure was rejected had its inputs for that half overwritten with 0, so re-deriving from them
     // would plan nothing for a model that needs scratch: its re-plan refuses while it is live (llama.cpp-kpjw). Only
-    // its own flag counts. Another owner's rejection leaves this owner's plan valid and re-plannable.
-    size_t                      q8_rejected  = 0;
-    size_t                      f16_rejected = 0;
-    (void) g_planned_load_terms.owners.get(device_id, owner, planned_load_term::MMQ_SRC1_REJECTED, &q8_rejected);
-    (void) g_planned_load_terms.owners.get(device_id, owner, planned_load_term::DEQUANT_F16_REJECTED, &f16_rejected);
-    if (q8_rejected != 0 || f16_rejected != 0) {
+    // its own flags count. Another owner's rejection leaves this owner's plan valid and re-plannable.
+    if (planned_dense_scratch_owner_rejected_locked(device_id, owner, nullptr, nullptr)) {
         return false;
     }
     // The owner's OWN inputs (llama.cpp-45qo), fed to the same two plan stores as the load-time plan: one formula, two
@@ -2407,32 +2426,44 @@ bool unified_cache_replan_planned_dense_scratch(int device_id, lifecycle::SlotTo
                                          &f16_per_token)) {
         return false;
     }
-    bool q8  = false;
-    bool f16 = false;
-    if (!planned_mmq_src1_scratch_store_locked(device_id, owner, q8_per_token, n_ubatch, &q8, nullptr) ||
-        !planned_dequant_f16_scratch_store_locked(device_id, owner, f16_weights, f16_per_token, n_ubatch, &f16,
-                                                  nullptr)) {
+    // The owner's n_ubatch only rises while it lives: two contexts of one model on one device share this owner's
+    // contribution, so a second context at a smaller n_ubatch must not shrink the plan the first one's buffers were
+    // sized from (lead ruling on llama.cpp-45qo). It drops only with the owner. Every stored value came from a
+    // uint32_t, so the larger of two fits one.
+    const size_t raised =
+        g_planned_load_terms.owners.raised_value(device_id, owner, planned_load_term::DENSE_SCRATCH_N_UBATCH, n_ubatch);
+    if (raised > UINT32_MAX) {
         return false;
     }
-    planned_load_terms_publish_locked();
-    return q8 && f16;
+    const uint32_t next_n_ubatch = static_cast<uint32_t>(raised);
+    bool           q8            = false;
+    bool           f16           = false;
+    const bool     q8_stored =
+        planned_mmq_src1_scratch_store_locked(device_id, owner, q8_per_token, next_n_ubatch, &q8, nullptr);
+    const bool f16_stored =
+        q8_stored && planned_dequant_f16_scratch_store_locked(device_id, owner, f16_weights, f16_per_token,
+                                                              next_n_ubatch, &f16, nullptr);
+    // A store that changed the table is published even when the other one was refused, so the table and the
+    // atomics the readers load never disagree.
+    if (q8_stored) {
+        planned_load_terms_publish_locked();
+    }
+    return f16_stored && q8 && f16;
 }
 
-uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id) {
+uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id, bool f16) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return 0;
     }
-    return g_planned_dense_scratch_n_ubatch[device_id].load(std::memory_order_acquire);
+    return g_planned_dense_scratch_n_ubatch[device_id][f16 ? 1 : 0].load(std::memory_order_acquire);
 }
 
-uint32_t unified_cache_get_planned_dense_scratch_owner_n_ubatch(int device_id, lifecycle::SlotToken owner) {
+bool unified_cache_planned_dense_scratch_owner_rejected(int                  device_id,
+                                                        lifecycle::SlotToken owner,
+                                                        bool *               q8_rejected,
+                                                        bool *               f16_rejected) {
     std::lock_guard<std::mutex> lock(g_planned_load_terms.mutex);
-    size_t                      n_ubatch = 0;
-    if (!g_planned_load_terms.owners.get(device_id, owner, planned_load_term::DENSE_SCRATCH_N_UBATCH, &n_ubatch) ||
-        n_ubatch > UINT32_MAX) {
-        return 0;
-    }
-    return static_cast<uint32_t>(n_ubatch);
+    return planned_dense_scratch_owner_rejected_locked(device_id, owner, q8_rejected, f16_rejected);
 }
 
 bool unified_cache_planned_dense_scratch_bytes_at(int device_id, uint32_t n_ubatch, size_t * out) {
