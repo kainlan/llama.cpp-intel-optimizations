@@ -131,10 +131,10 @@ explicitly labeled **unscoped lexical candidates**: they do not resolve C++
 bindings and therefore never establish lifecycle reset/teardown. An empty
 candidate search is likewise not proof of no access.
 
-At audited source commit `b15c1ef55468296a71519730b20e7bee1163b321`, the
-census emits **1,566 object rows**: 579 explicitly-static non-local objects,
+At audited source commit `c22a508947719280aaf35710a1fd5e35e6292f1b`, the
+census emits **1,567 object rows**: 580 explicitly-static non-local objects,
 106 non-local objects with implicit static storage duration, 874 function-local
-static/thread-local objects, and 7 class static declarations. Per-file rows are 1,217
+static/thread-local objects, and 7 class static declarations. Per-file rows are 1,218
 (`ggml-sycl.cpp`), 280 (`unified-cache.cpp`), 16 (`unified-cache.hpp`), 51
 (`fattn.cpp`), and 2 (`layer-streaming.cpp`). The script prints SHA-256 for
 every input so this result can be tied to exact source bytes.
