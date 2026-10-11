@@ -239,33 +239,43 @@ inline bool moe_scatter_decline_first(std::atomic<uint32_t> & seen, moe_scatter_
 
 // One expert tensor as the scratch plan sees it: which device's MUL_MAT_ID scatters its host-expert rows (-1 when
 // its layer has no planned device, which counts for every device), whether its layer splits gate and up, its row
-// length, and whether the placement keeps any of its experts on the host.
+// length, whether the placement keeps any of its experts on the host, and its expert count.
 struct moe_host_scatter_tensor {
     int    device           = -1;
     bool   split_gate_up    = false;
     size_t row_elems        = 0;
     bool   has_host_experts = false;
+    size_t n_experts        = 0;
 };
 
 // Bytes of the planned scratch: the rows one flush places (both halves of a decode gate/up pair when the layer has
-// split gate and up tensors, else one op's n_expert_used rows), capped at one kernel launch, times the row bytes.
-// False on overflow.
+// split gate and up tensors, else one op's n_expert_used rows), capped at one kernel launch, times the row bytes and
+// one int32 flag per row. The flag is the event-chained decode route's (llama.cpp-7pvo): its CPU job decides which
+// slots are the host's, and the flush stages those flags beside the rows so one kernel places exactly the flagged
+// rows. False on overflow.
 inline bool moe_host_scatter_scratch_bytes(size_t n_expert_used, bool split_gate_up, size_t row_elems, size_t * out) {
     const size_t per_op = split_gate_up ? 2 : 1;
     if (n_expert_used > MOE_SCATTER_MAX_ROWS) {
         n_expert_used = MOE_SCATTER_MAX_ROWS;
     }
     const size_t rows = std::min(per_op * n_expert_used, MOE_SCATTER_MAX_ROWS);
-    if (row_elems > SIZE_MAX / sizeof(float) || (rows != 0 && row_elems * sizeof(float) > SIZE_MAX / rows)) {
+    if (row_elems > (SIZE_MAX - sizeof(int32_t)) / sizeof(float)) {
         return false;
     }
-    *out = rows * row_elems * sizeof(float);
+    const size_t row_bytes = row_elems * sizeof(float) + sizeof(int32_t);
+    if (rows != 0 && row_bytes > SIZE_MAX / rows) {
+        return false;
+    }
+    *out = rows * row_bytes;
     return true;
 }
 
 // Bytes of the planned scratch on `device`: the largest flush among the tensors that keep experts on the host and
-// are scattered by that device. Zero when there are none, as for an all-VRAM placement: the scatter never runs
-// there, so nothing is planned, claimed or reported. False on overflow.
+// are scattered by that device, or the largest of their expert pointer tables if that is more. The event-chained
+// decode route uploads a tensor's n_experts-entry table into the scratch before its kernel (llama.cpp-7pvo); on the
+// in-order queue that upload and a flush's copies never use the scratch at once, so it holds the larger of the two.
+// Zero when no tensor qualifies, as for an all-VRAM placement: neither the scatter nor the route runs there, so
+// nothing is planned, claimed or reported. False on overflow.
 inline bool moe_host_scatter_scratch_bytes_for_device(const std::vector<moe_host_scatter_tensor> & tensors,
                                                       int                                          device,
                                                       size_t                                       n_expert_used,
@@ -276,10 +286,11 @@ inline bool moe_host_scatter_scratch_bytes_for_device(const std::vector<moe_host
             continue;
         }
         size_t bytes = 0;
-        if (!moe_host_scatter_scratch_bytes(n_expert_used, t.split_gate_up, t.row_elems, &bytes)) {
+        if (!moe_host_scatter_scratch_bytes(n_expert_used, t.split_gate_up, t.row_elems, &bytes) ||
+            t.n_experts > SIZE_MAX / sizeof(const void *)) {
             return false;
         }
-        *out = std::max(*out, bytes);
+        *out = std::max(*out, std::max(bytes, t.n_experts * sizeof(const void *)));
     }
     return true;
 }
