@@ -56,8 +56,18 @@ class CpuExpertPool {
     // `prologue`, when set, runs on the worker before the batch kernel
     // (llama.cpp-z4kd): the waits a job needs before it may read its inputs
     // and write its output run there, never on the submitting thread. Neither
-    // is expected to throw; one that does ends the process on the worker, as a
-    // throwing kernel always has, because no caller is left to hand it to.
+    // is expected to throw, and the worker catches nothing, so a throw from
+    // either ends the process on the worker. For the kernel that is how it has
+    // always been. For the input waits it is narrower than before: while they
+    // ran on the submitting thread, a sycl::exception from one reached
+    // ggml_sycl_mul_mat_id's catch and the compute_forward catch, which hand
+    // it to ggml_sycl_try_dispatch_resource_exhaustion_fallback and otherwise
+    // print the failing op and exit. On the worker that MUL_MAT_ID has already
+    // returned and later ops depend on the job, so no op is left to re-place.
+    // The copies the waits are for are still submitted on the submitting
+    // thread, inside those catches, and kernel-submission resource exhaustion
+    // is raised at submit (llama.cpp-o3h1). No catch is added here: the
+    // alloc-zone contract's G-CATCH rule forbids a new handler.
     std::future<void> submit_batch(std::vector<cpu_expert_task> tasks, std::function<void()> prologue = {});
 
     bool is_active() const { return active_.load(std::memory_order_acquire); }

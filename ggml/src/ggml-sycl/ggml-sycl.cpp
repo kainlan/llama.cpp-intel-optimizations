@@ -24237,11 +24237,18 @@ static std::function<void()> moe_cpu_job_prologue(moe_cpu_job_inputs inputs) {
 
 // Runs on the join host_task, never on the submitting thread.  By then the
 // MUL_MAT_ID that submitted the job has returned, so a job that threw has no
-// caller left to refuse to, and its rows are needed (llama.cpp-93tw).  The
-// function is noexcept, so such a job ends the process here and the terminate
-// handler reports what it threw; letting the exception out of the host_task
-// would hand it to the SYCL async handler instead.  The jobs' own refusals
-// abort with a named message before they get here.
+// caller left to refuse to, and its rows are needed (llama.cpp-93tw).  The pool
+// stores no exception in the future today: a throw in a job's prologue or
+// kernel ends the process on the worker (CpuExpertPool::submit_batch).  The
+// function is noexcept so that a future that ever carries one ends the process
+// here too, with the terminate handler reporting what it threw, rather than
+// handing it to the SYCL async handler.  That error path is narrower than it
+// was for the input waits now in the job prologue: on the submitting thread a
+// sycl::exception from them reached ggml_sycl_mul_mat_id's catch and the
+// compute_forward catch, which route it to
+// ggml_sycl_try_dispatch_resource_exhaustion_fallback.  No catch is added for
+// it (alloc-zone contract, G-CATCH).  The jobs' own refusals abort with a named
+// message before they get here.
 static void moe_cpu_job_join(const std::shared_future<void> & job) noexcept {
     if (moe_hostpath_waits_enabled()) {
         ggml_sycl::cpu_expert_pool_trace_note_join(job.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
@@ -87168,8 +87175,9 @@ static void ggml_sycl_attn_host_cpu_backend_free() {
 // MoE dispatch already proves in production: submit without waiting, defer
 // the join to the point a real consumer needs the result (or graph end),
 // and let the input-side D2H join happen INSIDE the worker thread instead
-// of on the submitting thread (mirrors act_deferred_evt/act_deferred_pending,
-// ~70378-70393/70517-70520).
+// of on the submitting thread (the same shape as the MoE host path, whose
+// moe_cpu_job_prologue waits a CPU job's input events on the pool worker,
+// llama.cpp-z4kd).
 //
 // A SEPARATE pending slot from g_pending_scatter
 // (owner ruling 2026-08-27, llama.cpp-sbky): two independent producers
@@ -87425,9 +87433,10 @@ static bool ggml_sycl_dispatch_host_flash_attn_async(ggml_backend_sycl_context &
     // D2H: capture the events but do NOT wait here -- the wait is deferred
     // to immediately before the CPU task actually reads the data, INSIDE
     // the worker thread below, so GPU submission for other graph regions
-    // in between is never blocked by it. Mirrors act_deferred_evt/
-    // act_deferred_pending (~70378-70393, 70517-70520). K/V need no copy or
-    // event -- already pinned host memory.
+    // in between is never blocked by it. The MoE host path waits a CPU job's
+    // input events the same way, in moe_cpu_job_prologue on the pool worker
+    // (llama.cpp-z4kd). K/V need no copy or event -- already pinned host
+    // memory.
     sycl::event q_evt = ggml_sycl::mem_copy_ptr_async(q_ptr, q_src->data, q_bytes, q_dev);
     sycl::event mask_evt;
     bool        have_mask_evt = false;
