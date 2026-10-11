@@ -24224,12 +24224,12 @@ static std::function<void()> moe_cpu_job_prologue(moe_cpu_job_inputs inputs) {
 // caller left to refuse to, and its rows are needed (llama.cpp-93tw).
 // CpuExpertPool stores no exception in its future: a throw in a job's prologue
 // or kernel ends the process on the worker (CpuExpertPool::submit_batch).  The
-// std::async forms dispatch_cpu_compute uses for the host AOS recipe and when
-// the pool is inactive do store one: a sycl::exception from the prologue's
-// sycl::event::wait, or a throw from the kernel, reaches this get().  The
-// function is noexcept so that such a throw ends the process here, with the
-// terminate handler reporting what it threw, rather than reaching the SYCL
-// async handler.  That error path is narrower than it
+// std::async forms store one: dispatch_cpu_compute's, for the host AOS recipe
+// and while the pool is inactive, and the planner CPU dispatch's pool-inactive
+// form.  A sycl::exception from a prologue's sycl::event::wait, or a throw from
+// a kernel, reaches this get().  The function is noexcept, so such a throw
+// ends the process here, with the terminate handler reporting what it threw,
+// not in the SYCL async handler.  That error path is narrower than it
 // was for the input waits now in the job prologue: on the submitting thread a
 // sycl::exception from them reached ggml_sycl_mul_mat_id's catch and the
 // compute_forward catch, which route it to
