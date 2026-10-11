@@ -847,8 +847,10 @@ if (Python3_Interpreter_FOUND)
     # The host-expert MoE decode levers (llama.cpp-z4kd): the GLU of a host-expert
     # layer asks moe_glu_input_host_produced (not the stale MUL_MAT_ID walk), the
     # wait census times B1 around the id readback and classifies only when on,
-    # pending_any reads every scatter slot, and the retired GGML_SYCL_PIPELINE_CPU
-    # warns at init. WITH --self-test (23 mutants and 1 harmless probe, ~24 s at load 19).
+    # pending_any reads every scatter slot, the graph-entry drain resets a slot's
+    # job future only while the slot is inactive, and the retired
+    # GGML_SYCL_PIPELINE_CPU warns at init. WITH --self-test (26 mutants and
+    # 1 harmless probe, ~28 s at load 16-20).
     add_test(NAME test-sycl-moe-hostpath-levers-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-hostpath-levers-source.py --self-test)
     set_tests_properties(test-sycl-moe-hostpath-levers-source PROPERTIES

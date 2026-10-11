@@ -30,6 +30,13 @@ calls them, and calls them the way the tests assume.
      scatter's events), the deferred secondary scatter, and the pipeline scatter ring.  Missing one lets a
      recording call reach its exit with state the exit hook does not see.
 
+  D. Graph-entry drain.  ggml_backend_sycl_graph_compute_impl waits the CPU job future of each
+     pending scatter slot (the sibling and the slot itself) and resets that future only when the
+     slot is not active.  Every assignment to a slot's future in that function sits in a block
+     opened by `if (!slot.active)`, and each slot has one.  An active slot's flush joins its job
+     through the future on the queue and refuses a slot without one, so resetting it at graph
+     entry would drop that slot's rows (llama.cpp-z4kd).
+
   R. Retired GGML_SYCL_PIPELINE_CPU.  ggml_sycl_pipeline_cpu_warn_retired has exactly one call in
      the whole file.  It is in ggml_check_sycl at init, in the settings-report block itself and not
      under its `if (!overrides.empty())`, so a run that sets only the retired variable still hears
@@ -119,8 +126,8 @@ class Source:
         close_at = self.match_close(open_at, "{", "}")
         return open_at, self.code[open_at : close_at + 1]
 
-    def innermost_block(self, at: int) -> str:
-        """The smallest braced block of `code` that contains offset `at`."""
+    def innermost_open(self, at: int) -> int:
+        """The offset of the `{` that opens the smallest braced block containing offset `at`."""
         depth = 0
         for k in range(at, -1, -1):
             c = self.bare[k]
@@ -128,9 +135,14 @@ class Source:
                 depth += 1
             elif c == "{":
                 if depth == 0:
-                    return self.code[k : self.match_close(k, "{", "}") + 1]
+                    return k
                 depth -= 1
         raise ContractError(f"offset {at} is not inside a block")
+
+    def innermost_block(self, at: int) -> str:
+        """The smallest braced block of `code` that contains offset `at`."""
+        k = self.innermost_open(at)
+        return self.code[k : self.match_close(k, "{", "}") + 1]
 
 
 def squash(s: str) -> str:
@@ -252,6 +264,26 @@ def check_pending_any(src: Source) -> None:
             raise ContractError(f"P: pending_any no longer reads the pipeline ring ({need})")
 
 
+DRAIN_SLOTS = ("g_pending_scatter_sibling", "g_pending_scatter")
+
+
+def check_drain(src: Source) -> None:
+    body_at, body = src.body(
+        r"static void ggml_backend_sycl_graph_compute_impl\(ggml_backend_sycl_context \* sycl_ctx, ggml_cgraph \* cgraph\)"
+    )
+    for slot in DRAIN_SLOTS:
+        resets = [m.start() for m in re.finditer(rf"\b{slot}\.future\s*=(?!=)", body)]
+        if not resets:
+            raise ContractError(f"D: the graph-entry drain no longer resets {slot}'s future")
+        for at in resets:
+            open_at = src.innermost_open(body_at + at)
+            if not re.search(rf"\bif\s*\(\s*!\s*{slot}\.active\s*\)\s*\Z", src.code[:open_at]):
+                line = src.code.count("\n", 0, body_at + at) + 1
+                raise ContractError(
+                    f"D: the graph-entry drain resets {slot}'s future at line {line} outside `if (!{slot}.active)`"
+                )
+
+
 def check_retired(src: Source, doc: str) -> None:
     # Whole file, not just ggml_check_sycl: a second call anywhere (a dispatch site, say) would
     # still be latched to one WARN, but it is dead code that costs a static-guard check per call.
@@ -296,6 +328,7 @@ def run(files: dict[str, str]) -> None:
     check_glu(src)
     check_census(src)
     check_pending_any(src)
+    check_drain(src)
     check_retired(src, files[ENV_DOC])
 
 
@@ -405,6 +438,24 @@ MUTANTS = [
         "        if (slot.submitted.load(std::memory_order_acquire) && !slot.done.load(std::memory_order_acquire)) {\n"
         "            return true;",
         "        if (slot.submitted.load(std::memory_order_acquire) && false) {\n            return true;",
+    ),
+    (
+        "D1 graph-entry drain resets the sibling's future while the sibling is active",
+        BACKEND,
+        "        if (!g_pending_scatter_sibling.active) {\n            g_pending_scatter_sibling.future = {};\n        }\n",
+        "        g_pending_scatter_sibling.future = {};\n",
+    ),
+    (
+        "D2 graph-entry drain resets the slot's future while the slot is active",
+        BACKEND,
+        "        if (!g_pending_scatter.active) {\n            g_pending_scatter.future = {};\n        }\n",
+        "        g_pending_scatter.future = {};\n",
+    ),
+    (
+        "D3 graph-entry drain stops resetting an inactive slot's future",
+        BACKEND,
+        "        if (!g_pending_scatter.active) {\n            g_pending_scatter.future = {};\n        }\n",
+        "",
     ),
     (
         "R1 init-time retired WARN call removed",
@@ -525,7 +576,10 @@ def main() -> int:
     except ContractError as e:
         print(f"FAIL: {e}")
         return 1
-    print("PASS: z4kd hostpath lever pins hold (GLU walk, wait census, pending_any, retired PIPELINE_CPU)")
+    print(
+        "PASS: z4kd hostpath lever pins hold "
+        "(GLU walk, wait census, pending_any, graph-entry drain, retired PIPELINE_CPU)"
+    )
     return 0
 
 
