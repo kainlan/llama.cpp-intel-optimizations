@@ -76,6 +76,14 @@ only shrink:
       ids for the predictor before moe_host_slots_from_ids overwrites them with flags; and the route
       ticks the stats' token on the submitting thread through the one tracker the retained block uses
       too, so a token split between the two routes ticks once.
+  N9. that route admits a tensor whose experts all live on the host (llama.cpp-7pvo).  The placement
+      fills MoE layers in order, so most host-expert layers hold no device expert at all: on Qwen3.8
+      IQ3_XXS two of the 24 do.  A record that required a device expert served those two and left the
+      other 22 reading their ids back, while N7 and N8 passed.  So the record carries `all_host`; the
+      builder decides it from the plan (`counts.on_device == 0`) and records it; no builder refusal
+      tests the device lookup (`materialized`, `substitute`) without `!all_host`, and none refuses on
+      the all-host case itself; and the route runs its table copy and device kernel only inside
+      `if (!record->all_host) {...}` and never refuses an all-host record.
 
 ALLOWLIST (exact statement, at most once; both its calls are BOUNDARY entries, so N2 fails once it is
 gone): `wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());` at op entry, taken
@@ -162,6 +170,19 @@ TOKEN_TRACKER = "g_moe_cputg_last_seq_layer"
 # A user of the tracker both compares against it (the wrap test) and stores its own layer into it.
 TRACKER_USES = (re.compile(r"<=\s*" + TOKEN_TRACKER + r"\b"), re.compile(r"\b" + TOKEN_TRACKER + r"\s*=(?!=)"))
 RETIRED_TRACKER = re.compile(r"\bstatic\s+thread_local\s+int\s+last_seq_layer_cputg\b")
+# N9: the record's all-host mode, decided from the plan in the builder, and the route's device half kept out of it.
+RECORD_DEF = "struct moe_hybrid_decode_record {"
+RECORD_BUILD = "ggml_sycl_moe_hybrid_decode_record_build"
+ALL_HOST_FIELD = re.compile(r"\bbool\s+all_host\s*=\s*false\s*;")
+ALL_HOST_DECIDED = re.compile(r"\bconst\s+bool\s+all_host\s*=\s*counts\.on_device\s*==\s*0\s*;")
+ALL_HOST_RECORDED = re.compile(r"\brecord->all_host\s*=\s*all_host\s*;")
+BUILD_REFUSAL = re.compile(r"\bif \(([^{}]*?)\) \{ return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED; \}")
+# What the builder learns only from a device expert: its materialized layout and the table's substitute pointer.
+DEVICE_LOOKUP = re.compile(r"\b(materialized|substitute)\b")
+# A refusal whose whole condition is the all-host case.
+ALL_HOST_ITSELF = re.compile(r"^[(\s]*(all_host|counts\.on_device\s*(==|<=)\s*0|!\s*counts\.on_device)[)\s]*$")
+DEVICE_HALF_GUARD = "if (!record->all_host) {"
+DEVICE_HALF = ("mmvq_moe_batched_dispatch(", "record->table")
 FLAGGED_DEF = "static void moe_host_scatter_submit_flagged("
 # N7's own exception list: functions the route calls that the scan does not descend into, each with the reason.
 # Kept apart from BOUNDARY so that a tree without the route fails N7, not N2.
@@ -830,9 +851,66 @@ def check_n8(scan: Scan) -> None:
         )
 
 
+def check_n9(scan: Scan) -> None:
+    """The route admits a tensor whose experts all live on the host (llama.cpp-7pvo): the record has an all-host
+    mode the builder decides from the plan, no builder refusal needs a device expert outside that mode, and the
+    route keeps its table copy and device kernel out of it.  N7 has already required the route to be defined once."""
+    code = scan.code
+    at = code.find(RECORD_DEF)
+    record = code[at : matching(code, at + len(RECORD_DEF) - 1) + 1] if at >= 0 else ""
+    builds = scan.defs.get(RECORD_BUILD, [])
+    if not ALL_HOST_FIELD.search(record) or len(builds) != 1:
+        raise ContractError(
+            f"FAIL [N9]: moe_hybrid_decode_record has no `bool all_host = false;` mode, or `{RECORD_BUILD}` is "
+            f"not defined once, so a tensor with no device expert gets no record and every all-host layer still "
+            f"reads its expert ids back ({TAG_7PVO})"
+        )
+    _, build = builds[0]
+    if not ALL_HOST_DECIDED.search(build) or not ALL_HOST_RECORDED.search(build):
+        raise ContractError(
+            f"FAIL [N9]: {RECORD_BUILD} does not decide `const bool all_host = counts.on_device == 0;` from the "
+            f"plan and store it with `record->all_host = all_host;`, so the route cannot tell an all-host record "
+            f"from a split one ({TAG_7PVO})"
+        )
+    for m in BUILD_REFUSAL.finditer(squash(build)):
+        cond = m.group(1)
+        if DEVICE_LOOKUP.search(cond) and "!all_host" not in cond.replace(" ", ""):
+            raise ContractError(
+                f"FAIL [N9]: {RECORD_BUILD} refuses on `{cond}`, which only a device expert can satisfy, without "
+                f"`!all_host`, so every tensor whose experts all live on the host is refused ({TAG_7PVO})"
+            )
+        if ALL_HOST_ITSELF.match(cond):
+            raise ContractError(
+                f"FAIL [N9]: {RECORD_BUILD} refuses on `{cond}`, the all-host case itself, so the layers the "
+                f"placement leaves entirely on the host keep their readback ({TAG_7PVO})"
+            )
+    _, route = scan.defs[ROUTE][0]
+    guard = route.find(DEVICE_HALF_GUARD)
+    if guard < 0:
+        raise ContractError(
+            f"FAIL [N9]: {ROUTE} has no `{DEVICE_HALF_GUARD}...}}` block, so it would copy a table an all-host "
+            f"record does not have and run the device kernel for experts that are not on the device ({TAG_7PVO})"
+        )
+    close = matching(route, guard + len(DEVICE_HALF_GUARD) - 1)
+    inside = route[guard:close]
+    outside = route[:guard] + route[close:]
+    for token in DEVICE_HALF:
+        if token not in inside or token in outside:
+            raise ContractError(
+                f"FAIL [N9]: `{token}` in {ROUTE} is not confined to its `{DEVICE_HALF_GUARD}...}}` block, so an "
+                f"all-host record would reach the device half ({TAG_7PVO})"
+            )
+    for m in ROUTE_REFUSAL.finditer(squash(route)):
+        if re.search(r"\ball_host\b", m.group(1)):
+            raise ContractError(
+                f"FAIL [N9]: {ROUTE} refuses on `{m.group(1)}`, so an all-host record is built and then never "
+                f"taken ({TAG_7PVO})"
+            )
+
+
 def check(backend_src: str) -> None:
     scan = Scan(backend_src)
-    for rule in (check_n1, check_n2, check_n3, check_n4, check_n5, check_n6, check_n7, check_n8):
+    for rule in (check_n1, check_n2, check_n3, check_n4, check_n5, check_n6, check_n7, check_n8, check_n9):
         rule(scan)
 
 
@@ -1037,6 +1115,24 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
         "                    // Token boundary: tick when seq_layer wraps (ALWAYS, even without predictor)\n",
         "                    // Token boundary: tick when seq_layer wraps (ALWAYS, even without predictor)\n"
         "                    static thread_local int last_seq_layer_cputg = -1;\n")
+    # llama.cpp-7pvo (N9): the route admits a tensor whose experts all live on the host.
+    sub("N9", "record has no all-host mode", "    bool                               all_host    = false;",
+        "    bool                               all_host_v2 = false;")
+    sub("N9", "builder never records the all-host mode", "    record->all_host    = all_host;\n", "")
+    sub("N9", "builder decides all-host from nothing", "    const bool all_host = counts.on_device == 0;",
+        "    const bool all_host = false;")
+    sub("N9", "builder refuses the all-host case", "    const bool all_host = counts.on_device == 0;\n",
+        "    const bool all_host = counts.on_device == 0;\n"
+        "    if (all_host) {\n        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;\n    }\n")
+    sub("N9", "builder refuses a tensor with no device layout", "    if (!all_host && materialized < 0) {",
+        "    if (materialized < 0) {")
+    sub("N9", "builder refuses a tensor with no substitute", "    if ((!all_host && !substitute) || !any_host) {",
+        "    if (!substitute || !any_host) {")
+    sub("N9", "route runs the device half for an all-host record", "    if (!record->all_host) {",
+        "    if (true) {")
+    sub("N9", "route refuses an all-host record",
+        "    if (!ggml_sycl_moe_hybrid_decode_record_current(ctx, src0, n_ids, &record)) {",
+        "    if (!ggml_sycl_moe_hybrid_decode_record_current(ctx, src0, n_ids, &record) || record->all_host) {")
     sub("setup", "hybrid block renamed away", HYBRID_MARKER, "        if (moe_hybrid_with_plan && true) {")
     return out
 
