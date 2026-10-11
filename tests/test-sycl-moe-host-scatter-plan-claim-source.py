@@ -286,7 +286,7 @@ def claim_compact_scatter_never_allocates(sycl: str) -> bool:
             and "!ggml_sycl::moe_scatter_plan_build(rows, lead.scatter_scratch_bytes, &ws.plan)" in compact
             and "const ggml_sycl::resolved_ptr scratch = lead.scatter_scratch.resolve(device);" in compact
             and "ggml_sycl::mem_copy_async(lead.scatter_scratch, copy.scratch_offset, srcs[copy.src], "
-                "copy.src_offset, copy.bytes, queue)" in compact
+                "copy.src_offset, copy.bytes, queue, deps)" in compact
             and ALLOC_RE.search(code_only(compact)) is None)
 
 
@@ -304,11 +304,11 @@ def claim_compact_taken_only_when_it_pays(sycl: str, hdr: str = HDR) -> bool:
     if not (flush and compact and pays):
         return False
     collect = flush.find("moe_host_scatter_rows_collect(group, n_group, ws); ggml_sycl::moe_scatter_runs_build(ws.rows, ws.runs);")
-    submit = flush.find("const moe_host_scatter_form form = moe_host_scatter_submit_compact(slot, ws, &n_copies, &why);",
+    submit = flush.find("const moe_host_scatter_form form = moe_host_scatter_submit_compact(slot, ws, joins, &n_copies, &why);",
                         collect)
     per_run = flush.find("if (form != moe_host_scatter_form::COMPACT) { for (const ggml_sycl::moe_scatter_run & run : ws.runs) "
                          "{ ws.events.push_back(ggml_sycl::mem_copy_async(ws.dsts[run.dst], run.dst_offset, "
-                         "ws.srcs[run.src], run.src_offset, run.bytes, *slot.stream)); } n_copies = ws.runs.size(); }",
+                         "ws.srcs[run.src], run.src_offset, run.bytes, *slot.stream, joins)); } n_copies = ws.runs.size(); }",
                          submit)
     choice = compact.find("if (!ggml_sycl::moe_scatter_compact_pays(ws.runs.size(), plan)) "
                           "{ return moe_host_scatter_form::PER_RUN; }")
@@ -352,10 +352,11 @@ def claim_decline_reported_once_per_reason(sycl: str, hdr: str = HDR) -> bool:
 
 
 def claim_flush_reuses_one_workspace(sycl: str) -> bool:
-    """A decode flush allocates nothing of its own once the thread's workspace is sized: the rows, the runs, the
-    plan, the handle lists, the copy events and the flush's events live in one thread-local workspace, the only
-    container a flush builds is the retention list the retention API takes by value, and the flush retains once,
-    after its last kernel, not once per chunk."""
+    """A decode flush builds no workspace of its own once the thread's workspace is sized: the rows, the runs, the
+    plan, the handle lists, the copy events and the flush's events live in one thread-local workspace.  The only
+    containers a flush builds are the retention lists the retention API takes by value: the compact form's one,
+    retained once after its last kernel, not once per chunk, and one per joined job, retained until that job's join
+    (llama.cpp-z4kd)."""
     t = norm(sycl)
     compact = body(t, COMPACT_SIG)
     rows = body(t, ROWS_SIG)
@@ -366,7 +367,7 @@ def claim_flush_reuses_one_workspace(sycl: str) -> bool:
              VECTOR_LOCAL_RE.findall(code_only(flush)))
     last = compact.find("placed_last = placed; }")
     retain = compact.find("ggml_sycl::retain_handles_until_event(std::move(retained), placed_last);")
-    return (owned == (["retained"], [], [])
+    return (owned == (["retained"], [], ["job_buffers"])
             and "static thread_local moe_host_scatter_workspace g_moe_host_scatter_ws;" in t
             and "moe_host_scatter_workspace & ws = g_moe_host_scatter_ws; ws.events.clear();" in flush
             and "std::vector<sycl::event> & copied = ws.copied; copied.clear();" in compact
@@ -567,7 +568,7 @@ def test_mutant_flush_without_the_runs_fails():
 
 def test_mutant_flush_bypasses_the_compact_path_fails():
     assert not claim_compact_taken_only_when_it_pays(
-        _once(SYCL, "const moe_host_scatter_form form = moe_host_scatter_submit_compact(slot, ws, &n_copies, &why);",
+        _once(SYCL, "const moe_host_scatter_form form = moe_host_scatter_submit_compact(slot, ws, joins, &n_copies, &why);",
               "const moe_host_scatter_form form = moe_host_scatter_form::PER_RUN;"))
 
 
