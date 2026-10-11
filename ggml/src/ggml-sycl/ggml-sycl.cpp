@@ -24222,12 +24222,15 @@ static std::function<void()> moe_cpu_job_prologue(moe_cpu_job_inputs inputs) {
 
 // Runs on the join host_task, never on the submitting thread.  By then the
 // MUL_MAT_ID that submitted the job has returned, so a job that threw has no
-// caller left to refuse to, and its rows are needed (llama.cpp-93tw).  The pool
-// stores no exception in the future today: a throw in a job's prologue or
-// kernel ends the process on the worker (CpuExpertPool::submit_batch).  The
-// function is noexcept so that a future that ever carries one ends the process
-// here too, with the terminate handler reporting what it threw, rather than
-// handing it to the SYCL async handler.  That error path is narrower than it
+// caller left to refuse to, and its rows are needed (llama.cpp-93tw).
+// CpuExpertPool stores no exception in its future: a throw in a job's prologue
+// or kernel ends the process on the worker (CpuExpertPool::submit_batch).  The
+// std::async forms dispatch_cpu_compute uses for the host AOS recipe and when
+// the pool is inactive do store one: a sycl::exception from the prologue's
+// sycl::event::wait, or a throw from the kernel, reaches this get().  The
+// function is noexcept so that such a throw ends the process here, with the
+// terminate handler reporting what it threw, rather than reaching the SYCL
+// async handler.  That error path is narrower than it
 // was for the input waits now in the job prologue: on the submitting thread a
 // sycl::exception from them reached ggml_sycl_mul_mat_id's catch and the
 // compute_forward catch, which route it to
@@ -25636,9 +25639,11 @@ static void wait_prev_scatter_events(pending_cpu_scatter & slot) {
     pb.pending = false;
 }
 
-// Everything one host-expert scatter flush builds, kept across flushes so a decode token's flushes allocate nothing
-// once the first has sized it (llama.cpp-cre6). Thread-local like the pending slots it serves. The handle vectors
-// are cleared when each flush is done with them, so they never hold an allocation past its flush.
+// Everything one host-expert scatter flush builds, kept across flushes so a decode token's flushes need no new
+// workspace once the first has sized it (llama.cpp-cre6). The flush still builds one handle list per joined job,
+// the buffers it hands retain_handles_until_event (flush_pending_cpu_scatter_slot). Thread-local like the pending
+// slots it serves. The handle vectors are cleared when each flush is done with them, so they never hold an
+// allocation past its flush.
 struct moe_host_scatter_workspace {
     std::vector<ggml_sycl::mem_handle>      srcs;
     std::vector<ggml_sycl::mem_handle>      dsts;
@@ -87204,9 +87209,9 @@ struct pending_attn_dispatch {
 // it has been flushed. The stale slot exists because flush's own H2D
 // publish (below) is submitted async and deliberately not waited on -- the
 // backing dst_handle must not be released while that DMA could still be
-// reading it. Releasing it one dispatch (or one graph boundary) later
-// mirrors g_pending_scatter's prev_bufs deferred-release pattern
-// (~20105-20135), the same problem MoE's own async scatter already solved.
+// reading it. Releasing it one dispatch (or one graph boundary) later keeps
+// it alive past that DMA. The MoE CPU scatter meets the same need by
+// retaining its buffers until its copies' events (retain_handles_until_event).
 // rev-2gag S2: these are thread_local while g_attn_host_staging is
 // process-global -- the "one dispatch in flight per device" invariant that
 // makes slot reuse safe is enforced per-thread against a per-process
