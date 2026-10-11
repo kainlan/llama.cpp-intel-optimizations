@@ -1015,7 +1015,7 @@ def self_test(backend_src: str) -> int:
                    "                flush_pending_cpu_scatter();\n", in_lambda=False, after=JOIN_ANCHOR), None, "J2")
     expect_fail("join-else-waits-again", sub(
         join_else, "                        flush_pending_cpu_scatter();\n"
-                   "                        sycl::event::wait(g_pending_scatter.prev_bufs.scatter_events);\n"
+                   "                        sycl::event::wait(g_pending_scatter.prev_scatter.scatter_events);\n"
                    "                    }\n                }\n"
                    "                auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);\n",
         in_lambda=False, after=JOIN_ANCHOR), None, "J2")

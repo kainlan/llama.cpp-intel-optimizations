@@ -27,7 +27,7 @@ calls them, and calls them the way the tests assume.
 
   P. pending_any.  ggml_sycl_cpu_tg_pending_any reads every slot that can hold scatter state between
      graphs: the direct-scatter list, the pending slot and its sibling (each with its previous
-     buffers), the deferred secondary scatter, and the pipeline scatter ring.  Missing one lets a
+     scatter's events), the deferred secondary scatter, and the pipeline scatter ring.  Missing one lets a
      recording call reach its exit with state the exit hook does not see.
 
   R. Retired GGML_SYCL_PIPELINE_CPU.  ggml_sycl_pipeline_cpu_warn_retired has exactly one call in
@@ -220,9 +220,9 @@ def check_census(src: Source) -> None:
 PENDING_TERMS = {
     "!g_cpu_tg_direct_pending_scatter.empty()",
     "g_pending_scatter.active",
-    "g_pending_scatter.prev_bufs.pending",
+    "!g_pending_scatter.prev_scatter.scatter_events.empty()",
     "g_pending_scatter_sibling.active",
-    "g_pending_scatter_sibling.prev_bufs.pending",
+    "!g_pending_scatter_sibling.prev_scatter.scatter_events.empty()",
     "ggml_sycl_pending_secondary_scatter_active()",
 }
 
@@ -390,8 +390,8 @@ MUTANTS = [
     (
         "P1 sibling slot dropped from pending_any",
         BACKEND,
-        "g_pending_scatter_sibling.active || g_pending_scatter_sibling.prev_bufs.pending ||",
-        "false || false ||",
+        "g_pending_scatter_sibling.active ||\n        !g_pending_scatter_sibling.prev_scatter.scatter_events.empty() ||",
+        "false ||\n        false ||",
     ),
     (
         "P2 secondary scatter dropped from pending_any",

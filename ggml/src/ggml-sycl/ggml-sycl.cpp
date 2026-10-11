@@ -23929,11 +23929,11 @@ struct pending_cpu_scatter {
     // The last flush's scatter H2D events.  The buffers that flush read are
     // retained until its join event (retain_handles_until_event), so nothing
     // is freed here; the graph boundary waits these events
-    // (wait_prev_scatter_events, llama.cpp-z4kd).
-    struct deferred_bufs {
+    // (wait_prev_scatter_events, llama.cpp-z4kd).  A scatter is still owed
+    // that wait while the list is not empty.
+    struct prev_scatter_state {
         std::vector<sycl::event> scatter_events;
-        bool                     pending = false;
-    } prev_bufs;
+    } prev_scatter;
 
     pending_cpu_scatter() :
         out_pinned(nullptr),
@@ -23955,7 +23955,7 @@ static thread_local std::vector<sycl::event> g_cpu_tg_direct_pending_scatter;
 // when up is issued without joining it (moe_sibling_pending_keep() in
 // moe-decode-hostpath.hpp states when that is safe). It is always the older
 // of the two, so every flush drains it first. Each slot keeps its own
-// prev_bufs.
+// prev_scatter.
 static thread_local pending_cpu_scatter g_pending_scatter_sibling = {};
 
 // Counts flushes that enqueued a scatter H2D. An activation copy records the
@@ -25623,19 +25623,18 @@ static bool ggml_sycl_moe_fusion_enabled() {
 //  - At graph boundaries (graph_compute_impl)
 //
 // The graph-boundary drain (llama.cpp-z4kd).  A slot flush keeps only its H2D
-// events in prev_bufs; the buffers it read are retained by event, so nothing
+// events in prev_scatter; the buffers it read are retained by event, so nothing
 // here frees memory.  Completing the last scatter of each slot completes every
 // earlier join and CPU job on that in-order queue, which is what the graph
 // boundary needs before the host zones are reset.  This is a host wait, so it
 // is only called from ggml_sycl_cpu_tg_flush_pending(), never from a flush.
 static void wait_prev_scatter_events(pending_cpu_scatter & slot) {
-    auto & pb = slot.prev_bufs;
-    if (!pb.scatter_events.empty()) {
+    std::vector<sycl::event> & events = slot.prev_scatter.scatter_events;
+    if (!events.empty()) {
         moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
-        sycl::event::wait(pb.scatter_events);
-        pb.scatter_events.clear();
+        sycl::event::wait(events);
+        events.clear();
     }
-    pb.pending = false;
 }
 
 // Everything one host-expert scatter flush builds, kept across flushes so a decode token's flushes need no new
@@ -25841,11 +25840,10 @@ static moe_host_scatter_form moe_host_scatter_submit_compact(const pending_cpu_s
 
 // The flush is done with the slot (llama.cpp-z4kd).  Its scatter is submitted behind the CPU job's join and nothing
 // has waited for either; the flush retained every buffer the job uses until that join, so clearing the slot frees
-// nothing still in use.  prev_bufs keeps only the scatter's events, which the graph boundary waits
+// nothing still in use.  prev_scatter keeps only the scatter's events, which the graph boundary waits
 // (wait_prev_scatter_events).
 static void pending_cpu_scatter_retire(pending_cpu_scatter & slot, const std::vector<sycl::event> & scatter_events) {
-    slot.prev_bufs.scatter_events = scatter_events;
-    slot.prev_bufs.pending        = !scatter_events.empty();
+    slot.prev_scatter.scatter_events = scatter_events;
 
     slot.future = {};
     slot.entries.clear();
@@ -26034,7 +26032,7 @@ static void flush_pending_cpu_scatter() {
 }
 
 // Hands the primary slot's pending job to the empty sibling slot; each slot
-// keeps its own prev_bufs.
+// keeps its own prev_scatter.
 static void move_pending_cpu_scatter_to_sibling() {
     pending_cpu_scatter & from = g_pending_scatter;
     pending_cpu_scatter & to   = g_pending_scatter_sibling;
@@ -26770,13 +26768,14 @@ void ggml_sycl_cpu_tg_flush_pending() {
 
 // True when any of the thread-local MoE scatter and CPU-expert lists holds
 // state: the direct-scatter event list, the pending scatter slot and its sibling
-// (each with its previous-scatter buffers), the deferred secondary-GPU scatter,
+// (each with its previous scatter's events), the deferred secondary-GPU scatter,
 // and the pipeline scatter ring.  A recording call must never reach its exit
 // with one non-empty (recorded scatter state is the recording sink's, or the
 // record is refused), so the exit hook reads this before it flushes.
 bool ggml_sycl_cpu_tg_pending_any() {
-    if (!g_cpu_tg_direct_pending_scatter.empty() || g_pending_scatter.active || g_pending_scatter.prev_bufs.pending ||
-        g_pending_scatter_sibling.active || g_pending_scatter_sibling.prev_bufs.pending ||
+    if (!g_cpu_tg_direct_pending_scatter.empty() || g_pending_scatter.active ||
+        !g_pending_scatter.prev_scatter.scatter_events.empty() || g_pending_scatter_sibling.active ||
+        !g_pending_scatter_sibling.prev_scatter.scatter_events.empty() ||
         ggml_sycl_pending_secondary_scatter_active()) {
         return true;
     }

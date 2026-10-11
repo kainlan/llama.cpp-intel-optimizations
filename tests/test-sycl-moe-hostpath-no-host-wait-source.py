@@ -698,8 +698,8 @@ def mutants(src: str) -> list[tuple[str, str]]:
         graphs_off + "            wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());\n")
     slot_open = "static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {\n"
     sub("future.get in the slot flush", slot_open, slot_open + "    slot.future.get();\n")
-    sub("prev-bufs wait in the slot flush", slot_open,
-        slot_open + "    sycl::event::wait(slot.prev_bufs.scatter_events);\n")
+    sub("previous-scatter wait in the slot flush", slot_open,
+        slot_open + "    sycl::event::wait(slot.prev_scatter.scatter_events);\n")
     sub("slot flush stops joining through the queue", "moe_cpu_scatter_join_on_queue(*slot.stream",
         "moe_cpu_scatter_join_on_queue_unused(*slot.stream")
     sub("scatter H2D loses the join dependency", "run.src_offset, run.bytes, *slot.stream, joins));",
@@ -728,7 +728,7 @@ def mutants(src: str) -> list[tuple[str, str]]:
         + slot_open + "    pending_cpu_scatter_join(slot);\n")
     sub("prev-scatter wait in a helper the slot flush calls", slot_open,
         "static void drain_prev_scatter(pending_cpu_scatter & slot) {\n"
-        "    sycl::event::wait(slot.prev_bufs.scatter_events);\n}\n\n"
+        "    sycl::event::wait(slot.prev_scatter.scatter_events);\n}\n\n"
         + slot_open + "    drain_prev_scatter(slot);\n")
     sub("activation wait in a helper the hybrid block calls", slot_open,
         "static void moe_settle_activation(sycl::event evt) {\n    evt.wait();\n}\n\n" + slot_open)
