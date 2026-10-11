@@ -23990,7 +23990,6 @@ static void pending_cpu_scatter_bind_scratch(pending_cpu_scatter & slot, ggml_ba
 // ---------------------------------------------------------------------------
 using ggml_sycl::MOE_WAIT_B1;
 using ggml_sycl::MOE_WAIT_B4B;
-using ggml_sycl::MOE_WAIT_B6;
 using ggml_sycl::MOE_WAIT_B7;
 using ggml_sycl::MOE_WAIT_COUNT;
 using ggml_sycl::MOE_WAIT_NONE;
@@ -25632,7 +25631,7 @@ static bool ggml_sycl_moe_fusion_enabled() {
 static void wait_prev_scatter_events(pending_cpu_scatter & slot) {
     auto & pb = slot.prev_bufs;
     if (!pb.scatter_events.empty()) {
-        moe_hostpath_wait_timer wait_timer(MOE_WAIT_B6);
+        moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
         sycl::event::wait(pb.scatter_events);
         pb.scatter_events.clear();
     }
