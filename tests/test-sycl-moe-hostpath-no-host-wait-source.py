@@ -21,10 +21,16 @@ the one host block per layer.  Everything after it is event-chained:
     dependency.
 
 Pinned with comments and string literals blanked, over the scanned code: the live hybrid block (the
-inner `if (moe_hybrid_with_plan)` of ggml_sycl_mul_mat_id), the submitting-thread helpers it calls (the
+inner `if (moe_hybrid_with_plan)` of ggml_sycl_mul_mat_id), the lambdas of ggml_sycl_mul_mat_id that the
+block calls (defined before it and in scope there), the submitting-thread helpers it calls (the
 scatter-slot flushes and the sibling move), and, transitively, every function defined in ggml-sycl.cpp
 that any of those calls, except the BOUNDARY entries (each listed with the reason its waits fall outside
-this contract; an entry the file no longer defines or the scan no longer reaches fails the gate).  One
+this contract; an entry the file no longer defines or the scan no longer reaches fails the gate).
+moe_cpu_job_prologue and moe_cpu_scatter_join_on_queue are scanned like any other callee, apart from the
+body of the closure each hands to another thread (OFF_THREAD_SPANS: the lambda the prologue returns runs
+on the pool worker, the lambda the join gives host_task runs on the queue's host-task thread).  A
+closure's capture list stays in the scan, since it is evaluated where the closure is built, and the gate
+fails when the closure can no longer be found.  One
 wait inside the scanned code predates this ticket and is excused by name in KNOWN_WAITS, at exactly one
 match, with the ticket that removes it; an entry that matches nothing fails the gate, so that list can
 only shrink:
@@ -50,11 +56,14 @@ That ring is filled only by the opt-in multi-GPU MoE path (GGML_SYCL_MOE_MULTI_G
 on a second card, not on the CPU, and is outside this ticket.
 
 WHAT THIS DOES NOT PROVE.  It reads source text.  It follows a call only into a function defined at
-column 0 of ggml-sycl.cpp: not into another file (mem-ops.cpp's synchronous mem_copy/mem_fill are caught
-at the call by name), not through a function pointer or a std::function value, and not into a BOUNDARY
-entry.  A helper defined twice is scanned in every definition.  It does not show the event chain is
-complete (a missing dependency is a race, not a wait), and it does not measure anything.  The lead-run
-GPU arms (Qwen3.8 md5, ABBA llama-bench, chat and Mistral gates) do.
+column 0 of ggml-sycl.cpp, or from the hybrid block into a lambda of ggml_sycl_mul_mat_id.  It does not
+follow a call into another file (mem-ops.cpp's synchronous mem_copy/mem_fill are caught at the call by
+name), through a function pointer, a std::function value or a lambda another function holds, into a
+macro's body (a macro call is read as written, unexpanded), into a definition whose `template <...>`
+header shares its line (DEF_SKIP drops such lines; the scanned code calls none today), or into a
+BOUNDARY entry.  A helper defined twice is scanned in every definition.  It does not show the event
+chain is complete (a missing dependency is a race, not a wait), and it does not measure anything.  The
+lead-run GPU arms (Qwen3.8 md5, ABBA llama-bench, chat and Mistral gates) do.
 
 NOT VACUOUS.  --self-test first requires the unmodified tree to pass (otherwise every mutant would fail
 for the tree's own reason), then runs the gate on in-memory mutants of the real source, each re-adding
@@ -110,8 +119,6 @@ ALLOWED = ("wait_pending_secondary_scatter_events(flush_pending_secondary_scatte
 # contract.  The gate fails on an entry the file no longer defines or the scan no longer reaches, so the
 # list cannot outlive the code it excuses.
 BOUNDARY = {
-    "moe_cpu_job_prologue": "builds the pool-worker closure; N3 pins that its wait runs only inside it",
-    "moe_cpu_scatter_join_on_queue": "submits the join host_task; N4 pins that the job's get() runs only inside it",
     "ggml_sycl_mul_mat": (
         "the GPU expert route's per-entry fallback, the generic MUL_MAT dispatch, taken only when no pointer "
         "table is uploaded (a cross-device plan, or several routable cards without a cohesive plan) or "
@@ -148,6 +155,25 @@ BOUNDARY = {
         "memcpy and no dependency, so it waits on no device work"
     ),
 }
+
+# Functions the submitting thread runs only in part: each is scanned like any other callee, callees
+# followed, apart from the body of the closure named here, which another thread runs.  The closure's
+# capture list stays in the scan (it is evaluated where the closure is built).  The gate fails when the
+# pattern no longer finds exactly one closure, so a rewrite cannot blank the wrong code or none.
+OFF_THREAD_SPANS = {
+    "moe_cpu_job_prologue": (r"\breturn\s*\[", "the lambda it returns, which the pool worker runs before the job"),
+    "moe_cpu_scatter_join_on_queue": (
+        r"\bhost_task\s*\(\s*\[",
+        "the lambda it hands host_task, which the queue's host-task thread runs",
+    ),
+}
+
+# The function the hybrid block sits in.  The block calls some of its lambdas, which run on the
+# submitting thread like the block, so the scan follows a call from the block into one defined before
+# the block and in scope there.
+ENCLOSING_DEF = "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {"
+HYBRID_LABEL = "the hybrid MUL_MAT_ID block"
+LOCAL_LAMBDA = re.compile(r"\bauto\s+(\w+)\s*=\s*\[")
 
 # Waits the scan finds inside the contract that predate llama.cpp-z4kd and stay for now, each keyed by
 # (function, FORBIDDEN label) and excused at exactly one match.  An entry that matches nothing fails the
@@ -263,6 +289,72 @@ def line_of(src: str, pos: int) -> int:
     return src.count("\n", 0, pos) + 1
 
 
+def lambda_body(text: str, intro: int) -> tuple[int, int] | None:
+    """The offsets of the `{` and `}` of the body of the lambda whose capture list opens at `intro`."""
+    j = matching(text, intro, "[", "]") + 1
+    while j < len(text) and text[j].isspace():
+        j += 1
+    if j < len(text) and text[j] == "(":
+        j = matching(text, j, "(", ")") + 1
+    brace = text.find("{", j)
+    semi = text.find(";", j)
+    if brace < 0 or 0 <= semi < brace:
+        return None
+    return brace, matching(text, brace)
+
+
+def off_thread_blanked(name: str, body: str) -> tuple[str, str | None]:
+    """`body` with the body of the closure OFF_THREAD_SPANS names blanked, and None; or `body` unchanged
+    and why the closure could not be found."""
+    pattern, _ = OFF_THREAD_SPANS[name]
+    found = [m.end() - 1 for m in re.finditer(pattern, body)]
+    if len(found) != 1:
+        return body, f"{name} has {len(found)} closures matching `{pattern}`; the gate needs exactly one"
+    span = lambda_body(body, found[0])
+    if span is None:
+        return body, f"the closure in {name} has no body the gate can find"
+    open_at, close_at = span
+    inner = "".join("\n" if c == "\n" else " " for c in body[open_at + 1 : close_at])
+    return body[: open_at + 1] + inner + body[close_at:], None
+
+
+def enclosing_lambdas(code: str, block_at: int) -> dict[str, tuple[int, str]]:
+    """The `auto name = [...](...) {...}` lambdas of ggml_sycl_mul_mat_id defined before the hybrid block
+    and in scope at it: name -> (offset of the body's `{`, body)."""
+    fn_at, fn = function_body(code, ENCLOSING_DEF)
+    fn_brace = code.find("{", fn_at)
+    rel = block_at - fn_brace
+    if not 0 < rel < len(fn):
+        raise ContractError(
+            f"FAIL: the hybrid block is not inside `{ENCLOSING_DEF}`; the gate cannot find the lambdas it calls ({TAG})"
+        )
+    head = fn[:rel]
+    found = [(m.start(), m.group(1), m.end() - 1) for m in LOCAL_LAMBDA.finditer(head)]
+    # The innermost brace open at each definition; the definition is in scope at the block when that
+    # brace is still open there.
+    scope_of: list[int] = []
+    stack: list[int] = []
+    k = 0
+    for b in re.finditer(r"[{}]", head):
+        while k < len(found) and found[k][0] < b.start():
+            scope_of.append(stack[-1])
+            k += 1
+        if b.group() == "{":
+            stack.append(b.start())
+        else:
+            stack.pop()
+    while k < len(found):
+        scope_of.append(stack[-1])
+        k += 1
+    open_at_block = set(stack)
+    out: dict[str, tuple[int, str]] = {}
+    for (_, name, intro), scope in zip(found, scope_of):
+        span = lambda_body(head, intro) if scope in open_at_block else None
+        if span is not None:
+            out[name] = (fn_brace + span[0], head[span[0] : span[1] + 1])
+    return out
+
+
 def file_functions(code: str) -> dict[str, list[tuple[int, str]]]:
     """Every function defined at column 0 of `code`: name -> [(offset of its `{`, body)], one per definition.
 
@@ -291,37 +383,44 @@ def file_functions(code: str) -> dict[str, list[tuple[int, str]]]:
 
 
 def scanned_code(
-    regions: list[tuple[str, int, str]], defs: dict[str, list[tuple[int, str]]]
-) -> tuple[list[tuple[str, int, str]], set[str]]:
-    """The regions plus every in-file function they call, transitively, short of BOUNDARY.
+    regions: list[tuple[str, int, str]],
+    defs: dict[str, list[tuple[int, str]]],
+    lambdas: dict[str, tuple[int, str]],
+) -> tuple[list[tuple[str, int, str]], set[str], set[str]]:
+    """The regions plus every in-file function they call, transitively, short of BOUNDARY, and the
+    enclosing function's lambdas the hybrid block calls (and those lambdas call).
 
     Returns the scanned (label, offset, text) list, each callee labelled with the call chain that reached
-    it, and the BOUNDARY names some scanned code calls.
+    it, the BOUNDARY names some scanned code calls, and the names of everything scanned.
     """
     out = list(regions)
     via: dict[str, str | None] = {name: None for name, _, _ in regions}
     reached: set[str] = set()
-    queue = [(name, text) for name, _, text in regions]
+    queue = [(name, text, name == HYBRID_LABEL) for name, _, text in regions]
     while queue:
-        caller, text = queue.pop(0)
+        caller, text, sees_lambdas = queue.pop(0)
         for m in CALL.finditer(text):
             callee = m.group(1)
-            if callee not in defs:
+            if sees_lambdas and callee in lambdas:
+                key, bodies, local = f"lambda {callee}", [lambdas[callee]], True
+            elif callee in defs:
+                if callee in BOUNDARY:
+                    reached.add(callee)
+                    continue
+                key, bodies, local = callee, defs[callee], False
+            else:
                 continue
-            if callee in BOUNDARY:
-                reached.add(callee)
+            if key in via:
                 continue
-            if callee in via:
-                continue
-            via[callee] = caller
-            chain = [callee]
+            via[key] = caller
+            chain = [key]
             while via.get(chain[-1]) is not None:
                 chain.append(via[chain[-1]])
-            label = f"{callee} (reached via {' <- '.join(chain[1:])})"
-            for offset, body in defs[callee]:
+            label = f"{key} (reached via {' <- '.join(chain[1:])})"
+            for offset, body in bodies:
                 out.append((label, offset, body))
-                queue.append((callee, body))
-    return out, reached
+                queue.append((key, body, local))
+    return out, reached, set(via)
 
 
 def inside_call(text: str, pos: int, callee: str) -> bool:
@@ -349,12 +448,24 @@ def check(backend_src: str) -> None:
 
     regions: list[tuple[str, int, str]] = []
     at, block = hybrid_block(code)
-    regions.append(("the hybrid MUL_MAT_ID block", at, block))
+    regions.append((HYBRID_LABEL, at, block))
     for sig in HELPERS:
         found = function_body(code, sig)
         regions.append((sig.replace("static ", "").split("(")[0].split()[-1], found[0], found[1]))
     defs = file_functions(code)
-    scanned, reached = scanned_code(regions, defs)
+    # A function that is missing, or whose closure cannot be found, is scanned whole (stricter) and
+    # reported after N1, so a tree without the event chain still shows its waits.
+    off_thread_problems = []
+    for name in OFF_THREAD_SPANS:
+        bodies = defs.get(name, [])
+        if len(bodies) != 1:
+            off_thread_problems.append((name, f"{name} is defined {len(bodies)} times in ggml-sycl.cpp"))
+            continue
+        blanked, problem = off_thread_blanked(name, bodies[0][1])
+        if problem:
+            off_thread_problems.append((name, problem))
+        defs[name] = [(bodies[0][0], blanked)]
+    scanned, reached, followed = scanned_code(regions, defs, enclosing_lambdas(code, at))
 
     # N1: no host wait, apart from the exact allowlisted statement, in the regions or any function they
     # reach short of BOUNDARY.
@@ -388,6 +499,16 @@ def check(backend_src: str) -> None:
         if n == 0:
             raise ContractError(
                 f"FAIL [N1]: KNOWN_WAITS entry `{fn}` / {what} matches nothing in the scanned code; drop it ({TAG})"
+            )
+    if off_thread_problems:
+        name, problem = off_thread_problems[0]
+        raise ContractError(
+            f"FAIL [N1]: {problem}, so the scan cannot set apart {OFF_THREAD_SPANS[name][1]} ({TAG})"
+        )
+    for name in OFF_THREAD_SPANS:
+        if name not in followed:
+            raise ContractError(
+                f"FAIL [N1]: OFF_THREAD_SPANS entry `{name}` is no longer called from the scanned code; drop it ({TAG})"
             )
     for name in BOUNDARY:
         if name not in defs:
@@ -620,6 +741,35 @@ def mutants(src: str) -> list[tuple[str, str]]:
     sub("KNOWN_WAITS entry matches nothing", fill, "")
     sub("second fill beside the known one", "    *out = std::move(handle);\n    return true;\n}\n",
         "    ggml_sycl::mem_fill(handle, 0, bytes, q);\n    *out = std::move(handle);\n    return true;\n}\n")
+    # The prologue and the join run on the submitting thread apart from the closure each hands off; the
+    # rest of each body, its closures' capture lists and its callees are scanned.  The unmodified tree
+    # passing is the other half: both closures hold a wait (moe_cpu_job_wait_inputs, moe_cpu_job_join's
+    # get()) that the scan would report if it read them.
+    join_def = (
+        "static sycl::event moe_cpu_scatter_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {\n"
+    )
+    sub("wait in a helper the join calls before its submit", join_def,
+        "static void moe_join_settle(const std::shared_future<void> & j) {\n    j.wait();\n}\n\n"
+        + join_def + "    moe_join_settle(job);\n")
+    pro_def = "static std::function<void()> moe_cpu_job_prologue(moe_cpu_job_inputs inputs) {\n"
+    sub("event wait in a helper the prologue factory calls", pro_def,
+        "static void moe_settle_inputs(const moe_cpu_job_inputs & in) {\n    sycl::event::wait(in.events);\n}\n\n"
+        + pro_def + "    moe_settle_inputs(inputs);\n")
+    sub("worker wait behind a wrapper the prologue factory calls", pro_def,
+        "static void moe_inputs_ready(const moe_cpu_job_inputs & in) {\n    moe_cpu_job_wait_inputs(in);\n}\n\n"
+        + pro_def + "    moe_inputs_ready(inputs);\n")
+    sub("wait in the host_task closure's capture list", "cgh.host_task([job]() { moe_cpu_job_join(job); });",
+        "cgh.host_task([job = (job.wait(), job)]() { moe_cpu_job_join(job); });")
+    sub("join hands host_task a named closure", "cgh.host_task([job]() { moe_cpu_job_join(job); });",
+        "auto task = [job]() { moe_cpu_job_join(job); }; cgh.host_task(task);")
+    sub("prologue definition renamed away", "static std::function<void()> moe_cpu_job_prologue(",
+        "static std::function<void()> moe_cpu_job_prologue_v2(")
+    # A lambda of ggml_sycl_mul_mat_id that the hybrid block calls runs on the submitting thread too.
+    expert_id_line = "        local_extra.moe_expert_id     = expert_id;\n"
+    sub("wait in a lambda of ggml_sycl_mul_mat_id the hybrid block calls", expert_id_line,
+        expert_id_line + "        sycl::event{}.wait();\n")
+    layout_line = "        return layout_bytes != 0 ? layout_bytes : expert_size;\n"
+    sub("wait in a lambda that lambda calls", layout_line, "        sycl::event{}.wait();\n" + layout_line)
     sib = "static void move_pending_cpu_scatter_to_sibling() {\n"
     sub("future.get in the sibling move", sib, sib + "    g_pending_scatter.future.get();\n")
     sub("hybrid block renamed away", HYBRID_MARKER, "        if (moe_hybrid_with_plan && true) {")
