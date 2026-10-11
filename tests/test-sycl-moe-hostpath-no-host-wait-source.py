@@ -9,8 +9,9 @@ future.get() on the hot down group straight after issuing it, future.get() on th
 weighted sum, and an event wait on the previous scatter H2D at every flush.  Each one drained the GPU
 queue and idled it while the host woke up and submitted the next op.
 
-THE CONTRACT.  The expert-id readback (ggml_sycl_copy_ids_to_host, before the hybrid branch) stays as
-the one host block per layer.  Everything after it is event-chained:
+THE CONTRACT.  The expert-id readback (ggml_sycl_copy_ids_to_host, before the hybrid branch) is the one
+host block per layer left on the retained route, and a decode op the event-chained hybrid route admits
+does not reach it (N7).  Everything after it is event-chained:
 
   * the waits a CPU job needs before it writes its pool span (its activation copy, the producer events
     of its host weight leases, an earlier scatter H2D it would alias) run on the pool worker, through
@@ -50,12 +51,23 @@ only shrink:
       code is already an N1 wait, since the scan follows it into the get());
   N5. flush_pending_cpu_scatter_slot submits its H2D copies with the join events among their deps, both
       its own per-run copies and the compact form's (moe_host_scatter_submit_compact, whose every copy
-      takes the dependency list it is handed).
+      takes the dependency list it is handed), and the flagged form's (moe_host_scatter_submit_flagged,
+      likewise) once it exists.
       It is the only flush that submits a CPU job's scatter: the opt-in pipeline slot that had a
       flush of its own (GGML_SYCL_PIPELINE_CPU) is gone, subsumed by this one.
   N6. the graph-boundary wait for the last scatters (pending_cpu_scatter_wait_prev_events) is called
       only from ggml_sycl_cpu_tg_flush_pending, which still calls it (a call from the scanned code is
       already an N1 wait).
+  N7. the expert-id readback is not a wait on the submitting thread for a decode op whose experts
+      split between the device and the host (llama.cpp-7pvo).  ggml_sycl_mul_mat_id calls
+      ggml_sycl_moe_hybrid_decode_event_chained, and returns when it takes the op, before the B1
+      readback.  That route is a scanned region, so N1 covers it and everything it calls.  It copies
+      the ids into the pinned pool's ids slots with mem_copy_async, and that copy's event is one of the
+      CPU job's inputs, so the pool worker waits it, not this thread.  The job, not the host, then
+      decides which slots are the host's and flags them, and flush_pending_cpu_scatter_slot places
+      the flagged rows through moe_host_scatter_submit_flagged, whose copies N5 checks like the
+      compact form's.  ROUTE_BOUNDARY is N7's own exception list: each entry must be defined and
+      reached.
 
 ALLOWLIST (exact statement, at most once; both its calls are BOUNDARY entries, so N2 fails once it is
 gone): `wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());` at op entry, taken
@@ -123,6 +135,27 @@ COMPACT_FN = "moe_host_scatter_submit_compact("
 COMPACT_DEF = "static moe_host_scatter_form moe_host_scatter_submit_compact("
 BOUNDARY_WAIT = "pending_cpu_scatter_wait_prev_events("
 BOUNDARY_FN = "void ggml_sycl_cpu_tg_flush_pending() {"
+
+# llama.cpp-7pvo (N7): the event-chained hybrid decode route and what it must look like.
+TAG_7PVO = "llama.cpp-7pvo"
+ROUTE = "ggml_sycl_moe_hybrid_decode_event_chained"
+# The call, whitespace squashed: it returns when the route takes the op.
+ROUTE_CALL = re.compile(r"if \(" + ROUTE + r"\(ctx, src0, src1, dst\)\) \{ return; \}")
+B1_TIMER = re.compile(r"moe_hostpath_wait_timer\s+\w+\(\s*MOE_WAIT_B1\s*\)\s*;")
+# The ids copy into the pinned pool's ids slots, bound to the event the job inputs must hold.
+IDS_COPY = re.compile(r"\bsycl::event\s+(\w+)\s*=\s*ggml_sycl::mem_copy_async\(\s*pool\.ids_handle\(\)")
+FLAGGED_FN = "moe_host_scatter_submit_flagged("
+FLAGGED_DEF = "static void moe_host_scatter_submit_flagged("
+# N7's own exception list: functions the route calls that the scan does not descend into, each with the reason.
+# Kept apart from BOUNDARY so that a tree without the route fails N7, not N2.
+ROUTE_BOUNDARY = {
+    "ggml_sycl_moe_hybrid_decode_record_build": (
+        "the route's per-tensor record: built once per (replan epoch, expert storage generation, selected rows) "
+        "stamp, not per token.  It resolves every expert's route through ggml_sycl_build_moe_resolved_batch and "
+        "allocates the record's host-pinned pointer table, so it reaches the resolvers' and the allocator's "
+        "synchronous paths; a steady decode reuses the record and calls none of it"
+    ),
+}
 
 ALLOWED = ("wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());",)
 # Each ALLOWED statement as a pattern that takes any whitespace between its tokens.
@@ -416,6 +449,7 @@ def scanned_code(
     regions: list[tuple[str, int, str]],
     defs: dict[str, list[tuple[int, str]]],
     lambdas: dict[str, tuple[int, str]],
+    boundary: set[str] | None = None,
 ) -> tuple[list[tuple[str, int, str]], set[str], set[str]]:
     """The regions plus every in-file function they call, transitively, short of BOUNDARY, and the
     enclosing function's lambdas the hybrid block calls (and those lambdas call).
@@ -423,6 +457,7 @@ def scanned_code(
     Returns the scanned (label, offset, text) list, each callee labelled with the call chain that reached
     it, the BOUNDARY names some scanned code calls, and the names of everything scanned.
     """
+    boundary = set(BOUNDARY) if boundary is None else boundary
     out = list(regions)
     via: dict[str, str | None] = {name: None for name, _, _ in regions}
     reached: set[str] = set()
@@ -434,7 +469,7 @@ def scanned_code(
             if sees_lambdas and callee in lambdas:
                 key, bodies, local = f"lambda {callee}", [lambdas[callee]], True
             elif callee in defs:
-                if callee in BOUNDARY:
+                if callee in boundary:
                     reached.add(callee)
                     continue
                 key, bodies, local = callee, defs[callee], False
@@ -465,6 +500,11 @@ class Scan:
             at, body = function_body(code, sig)
             self.regions.append((sig.replace("static ", "").split("(")[0].split()[-1], at, body))
         self.defs = file_functions(code)
+        # The event-chained hybrid decode route (llama.cpp-7pvo) runs on the submitting thread like the
+        # block; when it is defined once it is a region of its own.  N7 fails when it is not.
+        route_defs = self.defs.get(ROUTE, [])
+        if len(route_defs) == 1:
+            self.regions.append((ROUTE, route_defs[0][0], route_defs[0][1]))
         # A function that is missing, or whose closure cannot be found, is scanned whole (stricter) and
         # reported under N2, after N1, so a tree without the event chain still shows its waits.
         self.closures: dict[str, tuple[int, int]] = {}
@@ -484,7 +524,7 @@ class Scan:
             inner = "".join("\n" if c == "\n" else " " for c in body[open_at + 1 : close_at])
             self.defs[name] = [(brace, body[: open_at + 1] + inner + body[close_at:])]
         self.scanned, self.reached, self.followed = scanned_code(
-            self.regions, self.defs, enclosing_lambdas(code, self.block_at)
+            self.regions, self.defs, enclosing_lambdas(code, self.block_at), set(BOUNDARY) | set(ROUTE_BOUNDARY)
         )
         self.waits: list[str] = []
         self.allowed_seen = {a: 0 for a in ALLOWED}
@@ -602,7 +642,12 @@ def check_n5(scan: Scan) -> None:
         for ev in sorted(dep_vars):
             for m in re.finditer(r"std::vector<sycl::event>\s+(\w+)\s*\{\s*" + re.escape(ev) + r"\s*\}", flush_text):
                 dep_vars.add(m.group(1))
-        calls = [m.start() for m in re.finditer(r"\bmem_copy_async\s*\(|\b" + re.escape(COMPACT_FN), flush_text)]
+        calls = [
+            m.start()
+            for m in re.finditer(
+                r"\bmem_copy_async\s*\(|\b" + re.escape(COMPACT_FN) + r"|\b" + re.escape(FLAGGED_FN), flush_text
+            )
+        ]
         if not calls:
             raise ContractError(f"FAIL [N5]: {fname} submits no scatter copy ({TAG})")
         for c in calls:
@@ -613,21 +658,27 @@ def check_n5(scan: Scan) -> None:
                     f"FAIL [N5]: a scatter H2D in {fname} does not depend on the join events "
                     f"`{'/'.join(sorted(dep_vars))}`; the copy could read the output before the CPU job wrote it ({TAG})"
                 )
-    compact_at, compact = function_body(code, COMPACT_DEF)
-    params = code[compact_at : code.find("{", compact_at)]
-    deps = re.search(r"const\s+std::vector<sycl::event>\s*&\s*(\w+)", params)
-    if not deps:
-        raise ContractError(f"FAIL [N5]: moe_host_scatter_submit_compact takes no dependency list for its copies ({TAG})")
-    copies = [m.start() for m in re.finditer(r"\bmem_copy_async\s*\(", compact)]
-    if not copies:
-        raise ContractError(f"FAIL [N5]: moe_host_scatter_submit_compact submits no copy; the gate is blind ({TAG})")
-    for c in copies:
-        args = compact[c : matching(compact, compact.find("(", c), "(", ")")]
-        if not re.search(r"\b" + re.escape(deps.group(1)) + r"\b", args):
-            raise ContractError(
-                f"FAIL [N5]: a copy in moe_host_scatter_submit_compact does not depend on `{deps.group(1)}`, the "
-                f"joins it is handed; it could read the output before the CPU job wrote it ({TAG})"
-            )
+    # The compact form always; the flagged form (llama.cpp-7pvo) once it exists, and N7 requires it to.
+    forms = [COMPACT_DEF]
+    if FLAGGED_DEF in code:
+        forms.append(FLAGGED_DEF)
+    for form_def in forms:
+        form = form_def.split("(")[0].split()[-1]
+        form_at, form_body = function_body(code, form_def)
+        params = code[form_at : code.find("{", form_at)]
+        deps = re.search(r"const\s+std::vector<sycl::event>\s*&\s*(\w+)", params)
+        if not deps:
+            raise ContractError(f"FAIL [N5]: {form} takes no dependency list for its copies ({TAG})")
+        copies = [m.start() for m in re.finditer(r"\bmem_copy_async\s*\(", form_body)]
+        if not copies:
+            raise ContractError(f"FAIL [N5]: {form} submits no copy; the gate is blind ({TAG})")
+        for c in copies:
+            args = form_body[c : matching(form_body, form_body.find("(", c), "(", ")")]
+            if not re.search(r"\b" + re.escape(deps.group(1)) + r"\b", args):
+                raise ContractError(
+                    f"FAIL [N5]: a copy in {form} does not depend on `{deps.group(1)}`, the joins it is handed; it "
+                    f"could read the output before the CPU job wrote it ({TAG})"
+                )
 
 
 def check_n6(scan: Scan) -> None:
@@ -661,9 +712,71 @@ def check_n6(scan: Scan) -> None:
         )
 
 
+def squash(text: str) -> str:
+    return " ".join(text.split())
+
+
+def check_n7(scan: Scan) -> None:
+    """A decode op whose experts split between the device and the host does not read its expert ids on the
+    submitting thread (llama.cpp-7pvo): the event-chained route runs ahead of the B1 readback and returns when
+    it takes the op, copies the ids asynchronously into the job's inputs, and its scatter goes through the
+    flagged form.  N1 already covers the route's body and callees, since it is a scanned region."""
+    code = scan.code
+    route_defs = scan.defs.get(ROUTE, [])
+    if len(route_defs) != 1:
+        raise ContractError(
+            f"FAIL [N7]: `{ROUTE}` is defined {len(route_defs)} times in ggml-sycl.cpp, so every decode op with "
+            f"host experts reads its expert ids back on the submitting thread (the B1 wait, ~0.36 ms per MoE "
+            f"layer on Qwen3.8) ({TAG_7PVO})"
+        )
+    _, fn = function_body(code, ENCLOSING_DEF)
+    flat = squash(fn)
+    calls = [m.start() for m in ROUTE_CALL.finditer(flat)]
+    b1 = [m.start() for m in B1_TIMER.finditer(flat)]
+    if len(calls) != 1:
+        raise ContractError(
+            f"FAIL [N7]: ggml_sycl_mul_mat_id has {len(calls)} `if ({ROUTE}(ctx, src0, src1, dst)) {{ return; }}` "
+            f"statements; it needs exactly one, so an op the route takes ends there ({TAG_7PVO})"
+        )
+    if len(b1) != 1 or calls[0] > b1[0]:
+        raise ContractError(
+            f"FAIL [N7]: the route call is not ahead of the B1 expert-id readback in ggml_sycl_mul_mat_id "
+            f"({len(b1)} B1 timer(s)), so an op it takes would still read its ids back first ({TAG_7PVO})"
+        )
+    _, body = route_defs[0]
+    ids_events = IDS_COPY.findall(body)
+    if len(ids_events) != 1:
+        raise ContractError(
+            f"FAIL [N7]: {ROUTE} has {len(ids_events)} `sycl::event x = ggml_sycl::mem_copy_async(pool.ids_handle(), "
+            f"...)` copies; it needs one, the asynchronous ids copy into the pool's ids slots ({TAG_7PVO})"
+        )
+    if not re.search(r"\bjob_inputs\.events\.push_back\(\s*" + re.escape(ids_events[0]) + r"\s*\)", body):
+        raise ContractError(
+            f"FAIL [N7]: the ids copy's event `{ids_events[0]}` is not one of the CPU job's inputs, so the job could "
+            f"read the ids before they land ({TAG_7PVO})"
+        )
+    for name in ROUTE_BOUNDARY:
+        if name not in scan.defs:
+            raise ContractError(
+                f"FAIL [N7]: ROUTE_BOUNDARY entry `{name}` is not defined in ggml-sycl.cpp; drop it or rename it "
+                f"({TAG_7PVO})"
+            )
+        if name not in scan.reached:
+            raise ContractError(
+                f"FAIL [N7]: ROUTE_BOUNDARY entry `{name}` is no longer called from the scanned code; drop it "
+                f"({TAG_7PVO})"
+            )
+    flush_text = next(t for n, _, t in scan.regions if n == "flush_pending_cpu_scatter_slot")
+    if FLAGGED_DEF not in code or not re.search(r"\b" + re.escape(FLAGGED_FN), flush_text):
+        raise ContractError(
+            f"FAIL [N7]: flush_pending_cpu_scatter_slot does not place flagged rows through "
+            f"{FLAGGED_FN.rstrip('(')}, so the rows the route's CPU job selects are never scattered ({TAG_7PVO})"
+        )
+
+
 def check(backend_src: str) -> None:
     scan = Scan(backend_src)
-    for rule in (check_n1, check_n2, check_n3, check_n4, check_n5, check_n6):
+    for rule in (check_n1, check_n2, check_n3, check_n4, check_n5, check_n6, check_n7):
         rule(scan)
 
 
@@ -812,6 +925,40 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     pending_any_open = "bool ggml_sycl_cpu_tg_pending_any() {\n"
     sub("N6", "boundary wait called from pending_any, outside the scanned code", pending_any_open,
         pending_any_open + "    pending_cpu_scatter_wait_prev_events();\n")
+    # llama.cpp-7pvo (N7): the event-chained hybrid decode route.
+    route_call = "    if (ggml_sycl_moe_hybrid_decode_event_chained(ctx, src0, src1, dst)) {\n        return;\n    }\n"
+    b1_block = (
+        "        {\n            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B1);\n"
+        "            ids_copied = ggml_sycl_copy_ids_to_host(ctx, ids, ids_host);\n        }\n"
+    )
+    if route_call in src and b1_block in src:
+        moved = src.replace(route_call, "", 1)
+        moved = moved.replace(b1_block, b1_block + route_call.replace("    ", "        ", 1), 1)
+        out.append(("route call moved after the B1 readback", moved, "N7"))
+    else:
+        raise ContractError(f"FAIL: self-test anchor for the route-call mutants not found ({TAG_7PVO})")
+    sub("N7", "route call dropped", route_call, "")
+    sub("N7", "route call no longer returns", route_call,
+        "    if (ggml_sycl_moe_hybrid_decode_event_chained(ctx, src0, src1, dst)) {\n    }\n")
+    sub("N7", "route renamed away", "static bool ggml_sycl_moe_hybrid_decode_event_chained(",
+        "static bool ggml_sycl_moe_hybrid_decode_event_chained_v2(")
+    ids_copy = "const sycl::event ids_d2h = ggml_sycl::mem_copy_async(pool.ids_handle(),"
+    sub("N1", "route copies the ids synchronously", ids_copy,
+        "ggml_sycl::mem_copy(pool.ids_handle(), 0, ids_storage.handle, 0, 0, *stream);\n"
+        "    const sycl::event ids_d2h = ggml_sycl::mem_copy_async(pool.ids_handle(),")
+    sub("N7", "ids copy's event left out of the job inputs", "    job_inputs.events.push_back(ids_d2h);\n", "")
+    sub("N1", "route waits for the ids copy", "    job_inputs.events.push_back(ids_d2h);\n",
+        "    job_inputs.events.push_back(ids_d2h);\n    ids_d2h.wait();\n")
+    sub("N1", "route reads the ids back through the retained readback", "    job_inputs.events.push_back(ids_d2h);\n",
+        "    job_inputs.events.push_back(ids_d2h);\n"
+        "    {\n        std::vector<int32_t> ids_probe;\n        ggml_sycl_copy_ids_to_host(ctx, ids, ids_probe);\n    }\n")
+    sub("N7", "slot flush stops placing flagged rows", "moe_host_scatter_submit_flagged(slot, joins, ws.events);",
+        "moe_host_scatter_submit_flagged_unused(slot, joins, ws.events);")
+    sub("N5", "flagged scatter handed no joins", "moe_host_scatter_submit_flagged(slot, joins, ws.events);",
+        "moe_host_scatter_submit_flagged(slot, {}, ws.events);")
+    sub("N5", "flagged scatter copies drop their dependency", "rows_bytes, queue, deps);", "rows_bytes, queue);")
+    sub("N7", "record build no longer reached", "ggml_sycl_moe_hybrid_decode_record_build(ctx, src0,",
+        "ggml_sycl_moe_hybrid_decode_record_build_retired(ctx, src0,")
     sub("setup", "hybrid block renamed away", HYBRID_MARKER, "        if (moe_hybrid_with_plan && true) {")
     return out
 
