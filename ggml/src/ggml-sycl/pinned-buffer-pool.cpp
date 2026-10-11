@@ -108,15 +108,34 @@ void PinnedBufferPool::init(sycl::queue & q, int device_id, size_t max_experts, 
     }
     out_pool_ = static_cast<float *>(out_resolved.ptr);
 
-    GGML_LOG_INFO("[MOE-POOL] Pinned buffer pool: act=%zu KB, out=%zu KB, max_experts=%zu\n", act_bytes / 1024,
-                  out_bytes / 1024, max_experts);
+    // The ids entries (llama.cpp-7pvo). A failure here leaves act and out serving the CPU dispatch; only the
+    // event-chained decode route needs these, and it refuses without them.
+    alloc_request req_ids    = req_act;
+    req_ids.size             = max_experts * sizeof(int32_t);
+    req_ids.intent.cohort_id = "moe_ids_pool";
+    ids_handle_              = unified_allocate(req_ids);
+    auto ids_resolved        = ids_handle_.valid() ? ids_handle_.resolve(device_id) : resolved_ptr{};
+    if (ids_resolved.ptr) {
+        ids_pool_ = static_cast<int32_t *>(ids_resolved.ptr);
+    } else {
+        GGML_LOG_WARN(
+            "[MOE-POOL] Failed to allocate the expert-id entries (%zu bytes); host-expert decode reads its "
+            "ids back on the submitting thread\n",
+            req_ids.size);
+        ids_handle_ = {};
+    }
+
+    GGML_LOG_INFO("[MOE-POOL] Pinned buffer pool: act=%zu KB, out=%zu KB, ids=%zu B, max_experts=%zu\n",
+                  act_bytes / 1024, out_bytes / 1024, ids_pool_ ? req_ids.size : 0, max_experts);
 }
 
 void PinnedBufferPool::shutdown() {
     act_handle_ = {};
     out_handle_ = {};
+    ids_handle_ = {};
     act_pool_   = nullptr;
     out_pool_   = nullptr;
+    ids_pool_   = nullptr;
     next_entry_ = 0;
 }
 
@@ -149,6 +168,10 @@ mem_handle PinnedBufferPool::act_handle() const {
 
 mem_handle PinnedBufferPool::out_handle() const {
     return out_handle_;
+}
+
+mem_handle PinnedBufferPool::ids_handle() const {
+    return ids_handle_;
 }
 
 }  // namespace ggml_sycl
