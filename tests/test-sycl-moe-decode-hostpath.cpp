@@ -602,22 +602,27 @@ static int test_cpu_job_order() {
 // keeps the device's row.
 static int test_host_slots_from_ids() {
     using ggml_sycl::moe_host_slots_from_ids;
-    int                  w[4]       = {};
-    const void * const   host_w[6]  = { nullptr, &w[0], nullptr, &w[1], &w[2], nullptr };
-    const int32_t        ids[5]     = { 3, 0, 1, 5, 4 };
-    int32_t              flags[5]   = { 7, 7, 7, 7, 7 };
-    std::vector<int32_t> host_slots = { 99 };
+    int                                   w[4]       = {};
+    const void * const                    host_w[6]  = { nullptr, &w[0], nullptr, &w[1], &w[2], nullptr };
+    const int32_t                         ids[5]     = { 3, 0, 1, 5, 4 };
+    int32_t                               flags[5]   = { 7, 7, 7, 7, 7 };
+    std::vector<ggml_sycl::moe_host_slot> host_slots = {
+        { 99, 99 }
+    };
     CHECK(moe_host_slots_from_ids(ids, 5, host_w, 6, flags, host_slots), "in-range ids are accepted");
     CHECK(flags[0] == 1 && flags[1] == 0 && flags[2] == 1 && flags[3] == 0 && flags[4] == 1,
           "a slot is flagged exactly when its expert has a host weight");
-    CHECK(host_slots.size() == 3 && host_slots[0] == 0 && host_slots[1] == 2 && host_slots[2] == 4,
+    CHECK(host_slots.size() == 3 && host_slots[0].slot == 0 && host_slots[1].slot == 2 && host_slots[2].slot == 4,
           "host slots are listed in slot order, and the list is rebuilt, not appended to");
+    CHECK(host_slots[0].expert == 3 && host_slots[1].expert == 1 && host_slots[2].expert == 4,
+          "each host slot carries its expert, which the job needs to build the slot's task");
 
     int32_t in_place[5] = { 3, 0, 1, 5, 4 };
     CHECK(moe_host_slots_from_ids(in_place, 5, host_w, 6, in_place, host_slots), "the flags may overwrite the ids");
     CHECK(in_place[0] == 1 && in_place[1] == 0 && in_place[2] == 1 && in_place[3] == 0 && in_place[4] == 1,
           "in place, each id is read before its flag is written");
-    CHECK(host_slots.size() == 3 && host_slots[2] == 4, "in place lists the same host slots");
+    CHECK(host_slots.size() == 3 && host_slots[2].slot == 4 && host_slots[0].expert == 3 && host_slots[2].expert == 4,
+          "in place, the experts survive the ids being overwritten by the flags");
 
     const int32_t device_only[2] = { 0, 2 };
     int32_t       none[2]        = { 7, 7 };
@@ -629,7 +634,8 @@ static int test_host_slots_from_ids() {
     int32_t       bad_flags[3] = { 7, 7, 7 };
     CHECK(!moe_host_slots_from_ids(bad, 3, host_w, 6, bad_flags, host_slots),
           "an id outside [0, n_as) is refused, so the job can stop instead of reading past the table");
-    CHECK(bad_flags[0] == 1 && bad_flags[1] == 0 && bad_flags[2] == 0 && host_slots.size() == 1 && host_slots[0] == 0,
+    CHECK(bad_flags[0] == 1 && bad_flags[1] == 0 && bad_flags[2] == 0 && host_slots.size() == 1 &&
+              host_slots[0].slot == 0 && host_slots[0].expert == 1,
           "a refused id is flagged 0 and gets no task; the valid slots are still decided");
     return 0;
 }
