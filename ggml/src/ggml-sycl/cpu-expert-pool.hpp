@@ -68,7 +68,16 @@ class CpuExpertPool {
     // thread, inside those catches, and kernel-submission resource exhaustion
     // is raised at submit (llama.cpp-o3h1). No catch is added here: the
     // alloc-zone contract's G-CATCH rule forbids a new handler.
-    std::future<void> submit_batch(std::vector<cpu_expert_task> tasks, std::function<void()> prologue = {});
+    //
+    // `resolve`, when set, runs on the worker after the prologue and before the
+    // batch kernel, and may add to `tasks` (llama.cpp-7pvo). It is for a job
+    // submitted before its tasks can be known: the event-chained hybrid decode
+    // route's prologue waits for the expert-id copy, and resolve then reads the
+    // ids and builds a task per host slot. The kernel computes what resolve
+    // leaves in the vector. Like the prologue, it is not expected to throw.
+    std::future<void> submit_batch(std::vector<cpu_expert_task>                        tasks,
+                                   std::function<void()>                               prologue = {},
+                                   std::function<void(std::vector<cpu_expert_task> &)> resolve  = {});
 
     bool is_active() const { return active_.load(std::memory_order_acquire); }
 
