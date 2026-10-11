@@ -2719,10 +2719,18 @@ live but contextless one shrank that one's plan.) The runtime re-plan changes on
 `n_ubatch`, so a draft context at a small `n_ubatch` does not shrink a live target's plan either, and a rollback
 restores that owner's exact earlier value. Two contexts of one model on one device are still unsupported (canonical
 contract section 5), so that owner's `n_ubatch` is the last transaction's. A store validates its figure on the merge it
-will publish before it stores anything: a rejected (overflowing) figure stores only that owner's flag, none of its
-inputs, and the published plan for the buffer is zero and marked invalid while that owner is live, so the fit check and
-a re-plan refuse instead of re-deriving a plan from stale inputs. The other owners' inputs stand, and the plan is valid
-again once the rejected owner's next figure is accepted or it is dropped.
+will publish before it stores anything. A rejected (overflowing) figure overwrites that owner's earlier inputs for the
+buffer with 0 and raises the owner's flag for it, keeping the owner's `n_ubatch`.
+
+*One model's overflow does not invalidate the plan of a model already running (llama.cpp-kpjw, kept per owner).* Each
+buffer is sized from the owners whose figure for it was accepted (`planned_load_terms::merged_accepted`), so a rejected
+owner contributes nothing to that buffer's plan, its `n_ubatch` included. The other owners' plans stay valid and
+re-plannable. Only the rejected owner's own re-plan refuses while it is live, because its inputs for the buffer read 0
+and re-deriving from them would plan nothing for a model that needs scratch. The published plan is marked invalid, and
+the fit check refuses by name, only when the accepted owners' merged inputs cannot be sized. This replaced the first
+owner-keyed form, in which any live owner's flag marked the device's plan invalid and refused every owner's re-plan
+until the rejected owner dropped. That form undid the property llama.cpp-kpjw had pinned, by letting a model that
+failed to plan stop a running model from re-planning at its runtime `n_ubatch`.
 
 **D2: the plan followed the load-time `n_ubatch`.** Auto-ubatch chooses the real one at context creation, after load.
 The plan is a function of `n_ubatch` (`zone_dense_scratch_total_bytes()`), so the runtime-context transaction, the

@@ -15,8 +15,9 @@
 //
 // The dense scratch plan's inputs live here too (llama.cpp-45qo): the Q8_1 src1 bytes per token, the f16 dequant
 // weight maximum and src1 bytes per token, the n_ubatch they are sized at, and a flag per buffer for a figure the
-// sizing rejected. unified-cache.cpp sizes the plan from the merge of each input, as it did from the device-global
-// inputs these replace, and a flag reads set while any owner that raised it is live.
+// sizing rejected. unified-cache.cpp sizes each buffer's plan from the merge of each input over the owners whose figure
+// for that buffer was accepted (merged_accepted): one model's overflow does not invalidate the plan of a model already
+// running (llama.cpp-kpjw), and the rejected owner adds nothing to that buffer's plan while it is live.
 //
 // A slot is reserved again only after its release, so once a newer generation of a slot stores, every contribution an
 // older generation left, on any device, is one its owner's rollback or release did not drop. The store sweeps them all,
@@ -125,16 +126,31 @@ class planned_load_terms {
     }
 
     // The merge over the owners on `device`: the largest contribution of `term`, 0 with none (or out of range).
-    size_t merged(int device, planned_load_term term) const { return merged_without_slot(device, term, no_slot); }
+    size_t merged(int device, planned_load_term term) const { return merged_over(device, term, no_slot, no_filter); }
 
-    // What merged(device, term) would read once `owner` stored `value` for `term` on `device`: the owner's own earlier
-    // value, and anything an older generation of its slot left, would be replaced, so neither counts. Lets a caller
-    // validate the merged figure before it stores. 0 for a device or term out of range.
-    size_t merged_if_set(int device, lifecycle::SlotToken owner, planned_load_term term, size_t value) const {
-        if (!device_in_range(device) || !term_in_range(term)) {
+    // The merge over the owners on `device` whose `rejected` flag term reads 0: an owner whose figure was rejected
+    // contributes none of its terms, so its overflow leaves the merge of the owners already running as it was. 0 with
+    // none, or for an argument out of range.
+    size_t merged_accepted(int device, planned_load_term term, planned_load_term rejected) const {
+        if (!term_in_range(rejected)) {
             return 0;
         }
-        const size_t others = merged_without_slot(device, term, owner.slot);
+        return merged_over(device, term, no_slot, static_cast<int>(rejected));
+    }
+
+    // What merged_accepted(device, term, rejected) would read once `owner` stored `value` for `term` as an accepted
+    // figure: the owner's own earlier value and flag, and anything an older generation of its slot left, would be
+    // replaced, so none of them counts. Lets a caller validate the merged figure before it stores. 0 for an argument
+    // out of range.
+    size_t merged_accepted_if_set(int                  device,
+                                  lifecycle::SlotToken owner,
+                                  planned_load_term    term,
+                                  size_t               value,
+                                  planned_load_term    rejected) const {
+        if (!device_in_range(device) || !term_in_range(term) || !term_in_range(rejected)) {
+            return 0;
+        }
+        const size_t others = merged_over(device, term, owner.slot, static_cast<int>(rejected));
         return value > others ? value : others;
     }
 
@@ -159,7 +175,8 @@ class planned_load_terms {
   private:
     enum class slot_generations { EXACT, OLDER };
 
-    static constexpr uint32_t no_slot = UINT32_MAX;
+    static constexpr uint32_t no_slot   = UINT32_MAX;
+    static constexpr int      no_filter = -1;
 
     static bool device_in_range(int device) { return device >= 0 && device < GGML_SYCL_MAX_DEVICES; }
 
@@ -194,15 +211,16 @@ class planned_load_terms {
         return cleared;
     }
 
-    // The largest `term` over the owners on `device`, leaving out `skipped` (no_slot: leave out none).
-    size_t merged_without_slot(int device, planned_load_term term, uint32_t skipped) const {
+    // The largest `term` over the owners on `device`, leaving out `skipped` (no_slot: leave out none) and every owner
+    // whose `filter` term is nonzero (no_filter: leave out none).
+    size_t merged_over(int device, planned_load_term term, uint32_t skipped, int filter) const {
         if (!device_in_range(device) || !term_in_range(term)) {
             return 0;
         }
         size_t out = 0;
         for (uint32_t slot = 0; slot < lifecycle::model_slot_count; ++slot) {
             const planned_load_term_contribution & c = contributions_[device][slot];
-            if (slot == skipped || c.generation == 0) {
+            if (slot == skipped || c.generation == 0 || (filter != no_filter && c.values[filter] != 0)) {
                 continue;
             }
             const size_t value = c.values[static_cast<int>(term)];

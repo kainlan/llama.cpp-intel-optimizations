@@ -4344,10 +4344,11 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
-# llama.cpp-45qo: the dense scratch plan's inputs (Q8_1 src1, f16 dequant, their n_ubatch, the rejected-figure flags) are
-# owner terms in the planned load terms table, keyed by (slot, generation) per canonical contract 12.4: stored by the
-# open load's owner, validated on the merge before they land, published by one writer from the owners' merge,
-# re-planned per owner, and dropped with the owner; the device-global live-flag merge is gone. A mutant per claim.
+# llama.cpp-45qo: the dense scratch plan's inputs (Q8_1 src1, f16 dequant, their n_ubatch, the rejected-figure
+# flags) are owner terms in the planned load terms table, keyed by (slot, generation) per canonical contract 12.4:
+# stored by the open load's owner, validated on the merge before they land, published by one writer from the merge of
+# the accepted owners, re-planned per owner, and dropped with the owner; the device-global live-flag merge is gone.
+# A mutant per claim.
 # Text only: no device, no model.
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}

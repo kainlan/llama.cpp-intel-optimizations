@@ -275,18 +275,25 @@ void test_a_multi_term_store_is_all_or_nothing() {
 }
 
 void test_the_merge_if_an_owner_stores() {
-    printf("merged_if_set: what the device reads if the owner stores a value, ignoring the owner's own earlier one\n");
+    printf(
+        "merged_accepted_if_set: what the device reads if the owner stores an accepted value, ignoring its own "
+        "earlier one\n");
     planned_load_terms t;
     check(store_q8(t, 0, kA, kQ8Small, 512) && store_q8(t, 0, kB, 8192, 512), "A=4096 and B=8192");
-    check(t.merged_if_set(0, kA, planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, kQ8Large) == kQ8Large,
+    const planned_load_term per_token = planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN;
+    const planned_load_term rejected  = planned_load_term::MMQ_SRC1_REJECTED;
+    check(t.merged_accepted_if_set(0, kA, per_token, kQ8Large, rejected) == kQ8Large,
           "A storing 19584 would read 19584");
-    check(t.merged_if_set(0, kB, planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, 1024) == kQ8Small,
+    check(t.merged_accepted_if_set(0, kB, per_token, 1024, rejected) == kQ8Small,
           "B storing 1024 would read A's 4096: B's own 8192 is replaced, not merged");
     const SlotToken b_next{ kB.slot, kB.generation + 1 };
-    check(t.merged_if_set(0, b_next, planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, 0) == kQ8Small,
+    check(t.merged_accepted_if_set(0, b_next, per_token, 0, rejected) == kQ8Small,
           "B's next generation would sweep B's 8192, so it does not count");
-    check(t.merged_if_set(GGML_SYCL_MAX_DEVICES, kA, planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, 5) == 0,
+    check(t.merged_accepted_if_set(GGML_SYCL_MAX_DEVICES, kA, per_token, 5, rejected) == 0,
           "an out-of-range device reads 0");
+    check(t.merged_accepted_if_set(0, kA, per_token, 5,
+                                   static_cast<planned_load_term>(ggml_sycl::planned_load_term_count)) == 0,
+          "an out-of-range rejected term reads 0");
     check(q8_input(t, 0) == 8192, "asking stored nothing");
 }
 
@@ -316,6 +323,38 @@ void test_a_rejected_figure_is_an_owner_flag() {
     check(q8_input(t, 0) == kQ8Large, "A's input stands beside the flag");
     check(t.drop(kB), "B's rollback");
     check(t.merged(0, planned_load_term::MMQ_SRC1_REJECTED) == 0, "the flag left with B");
+}
+
+// llama.cpp-kpjw, kept owner-keyed: one model's overflow does not invalidate the plan of the model already running.
+// The plan is sized from the accepted owners only, so a rejected owner adds none of its terms (its n_ubatch among
+// them) to that buffer's merge, while it still counts for the other buffer, whose figure was accepted.
+void test_a_rejected_owner_contributes_nothing_to_the_accepted_merge() {
+    printf(
+        "merged_accepted: a rejected owner contributes nothing to that buffer's merge; the running model's stands\n");
+    planned_load_terms      t;
+    const planned_load_term per_token = planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN;
+    const planned_load_term ubatch    = planned_load_term::DENSE_SCRATCH_N_UBATCH;
+    const planned_load_term q8_flag   = planned_load_term::MMQ_SRC1_REJECTED;
+    const planned_load_term f16_flag  = planned_load_term::DEQUANT_F16_REJECTED;
+    check(store_q8(t, 0, kA, kQ8Small, 512), "A runs on device 0 at n_ubatch 512");
+    const planned_load_term_value b_rejected[] = {
+        { per_token, 0        },
+        { ubatch,    1u << 20 },
+        { q8_flag,   1        },
+    };
+    check(t.set(0, kB, b_rejected, 3), "B's Q8_1 figure overflowed at n_ubatch 1048576 (its f16 figure was accepted)");
+    check(t.merged_accepted(0, per_token, q8_flag) == kQ8Small, "the Q8_1 merge reads A's input");
+    check(t.merged_accepted(0, ubatch, q8_flag) == 512, "and A's n_ubatch: B's 1048576 is not in the Q8_1 merge");
+    check(t.merged_accepted(0, ubatch, f16_flag) == (1u << 20), "B still counts in the f16 merge it was accepted for");
+    check(t.merged_accepted_if_set(0, kA, ubatch, 256, q8_flag) == 256,
+          "A re-planning at 256 reads its own 256: the rejected B does not hold the Q8_1 plan up");
+    check(t.merged_accepted_if_set(0, kB, per_token, kQ8Large, q8_flag) == kQ8Large,
+          "B storing an accepted figure would count: its own flag is replaced with the store");
+    check(t.merged_accepted(1, per_token, q8_flag) == 0, "device 1 has no owner and reads 0");
+    check(t.merged_accepted(0, per_token, static_cast<planned_load_term>(ggml_sycl::planned_load_term_count)) == 0,
+          "an out-of-range rejected term reads 0");
+    check(t.drop(kB), "B's rollback");
+    check(t.merged_accepted(0, ubatch, f16_flag) == 512, "B's n_ubatch left with it");
 }
 
 void test_a_newer_owner_sweeps_stale_dense_scratch_inputs() {
@@ -358,6 +397,7 @@ int main() {
     test_the_merge_if_an_owner_stores();
     test_an_owner_reads_back_only_its_own_value();
     test_a_rejected_figure_is_an_owner_flag();
+    test_a_rejected_owner_contributes_nothing_to_the_accepted_merge();
     test_a_newer_owner_sweeps_stale_dense_scratch_inputs();
 
     printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);

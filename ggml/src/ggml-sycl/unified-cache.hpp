@@ -1981,9 +1981,10 @@ size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
 // llama.cpp-45qo: the inputs are `owner`'s own contribution (its model slot and slot generation, canonical contract
 // 12.4), replacing what that owner stored before; another model live on the device keeps its own, the published plan
 // is sized from the merge of the owners' inputs, and an owner's inputs leave with it (unified_cache_drop_planned_load_
-// terms). The figure is validated on that merge BEFORE anything is stored: a rejected one stores only the owner's flag,
-// so the published plan for the buffer is zero and marked invalid while that owner is live, and the fit check refuses
-// instead of trusting stale inputs.
+// terms). The figure is validated on that merge BEFORE anything is stored. A rejected one overwrites the owner's
+// earlier input for the buffer with 0 and raises its flag, keeping its n_ubatch. The buffer is sized from the owners
+// whose figure was accepted, so the rejected owner contributes nothing and another live model's plan stays valid
+// (llama.cpp-kpjw); the plan is marked invalid only when the accepted inputs themselves cannot be sized.
 bool     unified_cache_set_planned_mmq_src1_scratch(int                  device_id,
                                                     lifecycle::SlotToken owner,
                                                     size_t               bytes_per_token,
@@ -2005,7 +2006,9 @@ size_t unified_cache_get_planned_dequant_f16_buffer_bytes(int device_id, bool sr
 // llama.cpp-kpjw: re-derive both dense scratch plans at `n_ubatch`. The runtime-context transaction calls it with the
 // runtime n_ubatch (auto-ubatch picks it after load). llama.cpp-45qo: from `owner`'s own inputs, changing only that
 // owner's n_ubatch (a rollback that restores an exact earlier value passes that value); another live model's
-// contribution is left as it is. False when the owner planned nothing on the device or a figure overflowed.
+// contribution is left as it is. False when the owner planned nothing on the device, when the owner's own figure for
+// either buffer was rejected (its inputs for that buffer read 0, so it refuses while it is live; another owner's
+// rejection does not refuse it), or when a figure overflows at `n_ubatch`.
 bool     unified_cache_replan_planned_dense_scratch(int device_id, lifecycle::SlotToken owner, uint32_t n_ubatch);
 // The n_ubatch the published plan is sized at: the largest of the owners' on the device.
 uint32_t unified_cache_get_planned_dense_scratch_n_ubatch(int device_id);

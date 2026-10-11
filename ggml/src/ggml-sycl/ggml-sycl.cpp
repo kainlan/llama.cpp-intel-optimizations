@@ -17150,9 +17150,9 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     // llama.cpp-45qo: the plan inputs are this load's own contribution on the device, keyed by the model slot and slot
     // generation of the open load the stage runs under (canonical contract 12.4), the owner its load effect names. The
     // effect is held across both stores, so the load's end, which waits load effects out, cannot run its rollback's
-    // drop before they land. A model live on the device keeps its own inputs and the device plans for the merge; a model
-    // that unloads takes its inputs with it. Without an open load (the legacy direct setter) nothing owns a plan and
-    // nothing is planned.
+    // drop before they land. A model live on the device keeps its own inputs and the device plans for the merge; a
+    // model that unloads takes its inputs with it. Without an open load (the legacy direct setter) nothing owns a plan
+    // and nothing is planned.
     const auto   plan_effect = ggml_sycl_acquire_plan_load_effect();
     const char * unplanned =
         plan_effect ? " -- sizing overflowed, nothing planned" : " -- no open load owns it, nothing planned";

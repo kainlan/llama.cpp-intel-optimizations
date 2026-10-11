@@ -465,7 +465,7 @@ def evaluate(backend, common, cache, zone):
     # D2: the plan follows the runtime n_ubatch, decided in the runtime-context transaction (before any graph
     # records, so it is not mid-recording growth), and a rung the RUNTIME zone cannot hold is refused there --
     # the auto-ubatch probe is that same transaction, so rung selection consults the plan without a second source.
-    results["the load-time setters keep their per-token inputs for a re-plan"] = \
+    results["the plan's merged inputs are published for the readers"] = \
         all(n in cache for n in ("g_planned_mmq_src1_bytes_per_token", "g_planned_dequant_f16_weight_bytes_max",
                                  "g_planned_dequant_f16_src1_bytes_per_token", "g_planned_dense_scratch_n_ubatch"))
     results["the re-plan goes through the same two plan stores as the load-time setters"] = \
@@ -585,19 +585,20 @@ def evaluate(backend, common, cache, zone):
     # test-sycl-dense-scratch-owner-source).
     results["the load-time plan keeps another live model's inputs"] = \
         "plan_effect.owner.owner" in backend[max(0, plan_f16_at - 2400):plan_f16_at + 400] and \
-        "owners.merged_if_set(" in store_q8_fn and "owners.merged_if_set(" in store_f16_fn
+        "owners.merged_accepted_if_set(" in store_q8_fn and "owners.merged_accepted_if_set(" in store_f16_fn
 
-    # M8: validate first, then store: a rejected figure leaves the stored inputs alone.
+    # M8: validate first, then store. llama.cpp-45qo: a rejected figure overwrites its owner's inputs for that buffer
+    # with 0 and raises the owner's flag; the published flag marks the plan invalid only when the accepted owners'
+    # merged inputs cannot be sized.
     results["the Q8 setter validates before it stores"] = \
         0 <= store_q8_fn.find("zone_mmq_src1_scratch_bytes(") < store_q8_fn.find("owners.set(")
     results["the f16 setter validates before it stores"] = \
         0 <= store_f16_fn.find("zone_dequant_f16_plan_bytes(") < store_f16_fn.find("owners.set(")
     bytes_at_fn = function_body(cache, r"bool unified_cache_planned_dense_scratch_bytes_at\([^)]*\)\s*\{") or ""
-    results["a rejected figure is flagged, so no plan is derived from the stale inputs"] = \
+    results["a rejected figure is flagged, and an unsizable plan is refused by name"] = \
         re.search(r"planned_load_term::MMQ_SRC1_REJECTED,\s*1\s*\}", store_q8_fn) is not None and \
         re.search(r"planned_load_term::DEQUANT_F16_REJECTED,\s*1\s*\}", store_f16_fn) is not None and \
-        "g_planned_dense_scratch_invalid" in dense_publish_fn and \
-        "g_planned_dense_scratch_invalid" in bytes_at_fn and "g_planned_dense_scratch_invalid" in replan_fn
+        "g_planned_dense_scratch_invalid" in dense_publish_fn and "g_planned_dense_scratch_invalid" in bytes_at_fn
 
     # --- llama.cpp-kpjw review r2 ---------------------------------------------------------------------------
     # F1: held back means the zone ALONE would have served the request and the hold is what keeps it out. A
@@ -633,8 +634,9 @@ def evaluate(backend, common, cache, zone):
 
     # M-a / M-b: the plan inputs are merged per device, at re-plan too, and one model's overflow does not
     # invalidate another live model's plan. llama.cpp-45qo: the merge is over owners, so a re-plan changes only its
-    # owner's inputs, and a rejected figure stores its owner's flag and none of its inputs, leaving another live
-    # model's inputs standing (the flag marks the plan invalid while that owner is live, not after it).
+    # owner's inputs. A rejected figure overwrites its owner's inputs for that buffer with 0 and raises the owner's
+    # flag. Each buffer is sized from the owners whose figure for it was accepted, so the rejected owner contributes
+    # nothing (its n_ubatch included), and only that owner's own re-plan refuses while it is live.
     results["the dense replan re-derives only its owner's inputs"] = \
         re.search(r"bool unified_cache_replan_planned_dense_scratch\([^)]*lifecycle::SlotToken owner", cache) \
         is not None and "g_planned_load_terms.owners.get(device_id, owner," in replan_fn
@@ -643,6 +645,25 @@ def evaluate(backend, common, cache, zone):
     results["a rejected figure stores only its owner's flag, never its inputs"] = all(
         0 <= f.find("if (!*planned) {") < f.find("return owners.set(device_id, owner, rejected,") <
         f.find("const planned_load_term_value accepted[]") for f in (store_q8_fn, store_f16_fn))
+    accepted_merge = r"owners\.merged_accepted\(\s*device_id\s*,\s*planned_load_term::{term}\s*,\s*{flag}\s*\)"
+    results["a rejected figure does not invalidate another live model's plan"] = \
+        all(re.search(accepted_merge.format(term=t, flag="q8_flag"), dense_publish_fn) is not None
+            for t in ("MMQ_SRC1_BYTES_PER_TOKEN", "DENSE_SCRATCH_N_UBATCH")) and \
+        all(re.search(accepted_merge.format(term=t, flag="f16_flag"), dense_publish_fn) is not None
+            for t in ("DEQUANT_F16_WEIGHT_BYTES", "DEQUANT_F16_SRC1_BYTES_PER_TOKEN", "DENSE_SCRATCH_N_UBATCH")) and \
+        re.search(r"\bq8_flag\s*=\s*planned_load_term::MMQ_SRC1_REJECTED;", dense_publish_fn) is not None and \
+        re.search(r"\bf16_flag\s*=\s*planned_load_term::DEQUANT_F16_REJECTED;", dense_publish_fn) is not None and \
+        re.search(r"owners\.merged\(", dense_publish_fn) is None and \
+        "planned_load_term::MMQ_SRC1_REJECTED)" in store_q8_fn and \
+        "planned_load_term::DEQUANT_F16_REJECTED)" in store_f16_fn and \
+        "g_planned_dense_scratch_invalid" not in replan_fn
+    results["a rejected owner's own re-plan refuses while it is live"] = \
+        all(re.search(r"g_planned_load_terms\.owners\.get\(\s*device_id\s*,\s*owner\s*,\s*planned_load_term::"
+                      + flag + r"\s*,\s*&" + var + r"\s*\)", replan_fn) is not None
+            for flag, var in (("MMQ_SRC1_REJECTED", "q8_rejected"), ("DEQUANT_F16_REJECTED", "f16_rejected"))) and \
+        re.search(r"if\s*\(\s*q8_rejected\s*!=\s*0\s*\|\|\s*f16_rejected\s*!=\s*0\s*\)\s*\{\s*return false;",
+                  replan_fn) is not None and \
+        0 <= replan_fn.find("q8_rejected != 0") < replan_fn.find("planned_mmq_src1_scratch_store_locked(")
 
     # M-d / M-e: the owner is a monotonic id, and the hold state moves as one unit.
     results["the owner token is a monotonic context id, not an address"] = \
@@ -1483,7 +1504,7 @@ if args.self_test:
         ("no rollback guard", "a refused or rolled-back transaction restores the plan and the hold",
          (mutate_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
                          "ggml_sycl_dense_scratch_txn_guard", "ggml_sycl_XXXX_guard"), common, cache, zone)),
-        ("load-time inputs dropped", "the load-time setters keep their per-token inputs for a re-plan",
+        ("load-time inputs dropped", "the plan's merged inputs are published for the readers",
          (backend, common, mutate(cache, "g_planned_dense_scratch_n_ubatch", "g_planned_XXXX_n_ubatch", 99), zone)),
         ("Q8 walk back to select()", "the Q8 walk no longer asks select() on its own",
          (mutate_in_func(backend, r"static bool ggml_sycl_mmq_src1_ensure_for_graph\(",
@@ -1553,14 +1574,15 @@ if args.self_test:
          (mutate_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
                          "ggml_sycl_dense_scratch_txn_guard dense_guard(*ctx, current_token.owner, !probe_mode);",
                          "ggml_sycl_materialize_published_mmid_workspaces(); "
-                         "ggml_sycl_dense_scratch_txn_guard dense_guard(*ctx, current_token.owner, !probe_mode);"), common, cache, zone)),
+                         "ggml_sycl_dense_scratch_txn_guard dense_guard(*ctx, current_token.owner, !probe_mode);"),
+          common, cache, zone)),
         ("guard keeps the hold", "the guard zeroes the hold for its owner",
          (mutate_after(backend, "struct ggml_sycl_dense_scratch_txn_guard",
                        "unified_cache_set_planned_scratch_hold(device, 0, owner);", "(void) owner;"),
           common, cache, zone)),
         ("inputs not merged across models", "the load-time plan keeps another live model's inputs",
          (backend, common, mutate_all_in_func(cache, r"static bool planned_mmq_src1_scratch_store_locked\(",
-                                              "owners.merged_if_set(", "owners.XXXX(", 2), zone)),
+                                              "owners.merged_accepted_if_set(", "owners.XXXX(", 2), zone)),
         ("planning ignores the load's owner", "the load-time plan keeps another live model's inputs",
          (mutate_all_in_func(backend, r"static void populate_inventory_globals\(", "plan_effect.owner.owner",
                              "ggml_sycl::lifecycle::SlotToken{ 0, 1 }", 2), common, cache, zone)),
@@ -1585,7 +1607,7 @@ if args.self_test:
         ("replan ignores its owner", "the dense replan re-derives only its owner's inputs",
          (backend, common, mutate_all_in_func(cache, r"bool unified_cache_replan_planned_dense_scratch\(",
                                               "g_planned_load_terms.owners.get(device_id, owner,",
-                                              "g_planned_load_terms.owners.get(device_id, lifecycle::SlotToken{},", 4),
+                                              "g_planned_load_terms.owners.get(device_id, lifecycle::SlotToken{},", 6),
           zone)),
         ("transaction re-plans another owner", "the transaction re-plans the published model's own plan",
          (mutate_in_func(backend, r"static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction\(",
@@ -1598,6 +1620,37 @@ if args.self_test:
         ("f16 overflow stores the input", "a rejected figure stores only its owner's flag, never its inputs",
          (backend, common, mutate_in_func(cache, r"static bool planned_dequant_f16_scratch_store_locked\(",
                                           "if (!*planned) {", "if (false) {"), zone)),
+        ("Q8 overflow invalidates every model", "a rejected figure does not invalidate another live model's plan",
+         (backend, common, mutate_in_func(cache, r"static void planned_dense_scratch_publish_locked\(",
+                                          "q8_n_ubatch <= UINT32_MAX &&",
+                                          "owners.merged(device_id, q8_flag) == 0 && q8_n_ubatch <= UINT32_MAX &&"),
+          zone)),
+        ("f16 overflow invalidates every model", "a rejected figure does not invalidate another live model's plan",
+         (backend, common, mutate_in_func(cache, r"static void planned_dense_scratch_publish_locked\(",
+                                          "f16_n_ubatch <= UINT32_MAX &&",
+                                          "owners.merged(device_id, f16_flag) == 0 && f16_n_ubatch <= UINT32_MAX &&"),
+          zone)),
+        ("rejected owner's n_ubatch sizes the Q8 plan",
+         "a rejected figure does not invalidate another live model's plan",
+         (backend, common, mutate_in_func(cache, r"static void planned_dense_scratch_publish_locked\(",
+                                          "planned_load_term::DENSE_SCRATCH_N_UBATCH, q8_flag)",
+                                          "planned_load_term::DENSE_SCRATCH_N_UBATCH, f16_flag)"), zone)),
+        ("store validates against rejected owners", "a rejected figure does not invalidate another live model's plan",
+         (backend, common, mutate_all_in_func(cache, r"static bool planned_mmq_src1_scratch_store_locked\(",
+                                              "planned_load_term::MMQ_SRC1_REJECTED)",
+                                              "planned_load_term::DEQUANT_F16_REJECTED)", 2), zone)),
+        ("replan refuses every owner on the device", "a rejected figure does not invalidate another live model's plan",
+         (backend, common, mutate_in_func(cache, r"bool unified_cache_replan_planned_dense_scratch\(",
+                                          "if (q8_rejected != 0 || f16_rejected != 0) {",
+                                          "if (q8_rejected != 0 || f16_rejected != 0 || "
+                                          "g_planned_dense_scratch_invalid[device_id][0].load()) {"), zone)),
+        ("rejected owner re-plans from zeroed inputs", "a rejected owner's own re-plan refuses while it is live",
+         (backend, common, mutate_in_func(cache, r"bool unified_cache_replan_planned_dense_scratch\(",
+                                          "if (q8_rejected != 0 || f16_rejected != 0) {", "if (false) {"), zone)),
+        ("replan reads another owner's flag", "a rejected owner's own re-plan refuses while it is live",
+         (backend, common, mutate_in_func(cache, r"bool unified_cache_replan_planned_dense_scratch\(",
+                                          "planned_load_term::MMQ_SRC1_REJECTED, &q8_rejected",
+                                          "planned_load_term::DEQUANT_F16_REJECTED, &q8_rejected"), zone)),
         ("owner is not minted", "the owner token is a monotonic context id, not an address",
          (backend, mutate(common, "unified_cache_mint_planned_scratch_owner()", "0"), cache, zone)),
         ("owner is an address again", "the owner token is a monotonic context id, not an address",
@@ -1661,10 +1714,10 @@ if args.self_test:
         ("stats do not split the landing site", "the hold-spill counters are split by where the buffer landed (raw outside the arena, KV zone)",
          (mutate_in_func(backend, r"void ggml_backend_sycl_context::log_planned_scratch_stats\(\)",
                          "hold_spills_kv_zone=", "hold_XXXX="), common, cache, zone)),
-        ("replan trusts stale inputs", "a rejected figure is flagged, so no plan is derived from the stale inputs",
-         (backend, common, mutate_in_func(mutate_in_func(cache, r"bool unified_cache_replan_planned_dense_scratch\(",
+        ("fit check trusts an unsizable plan", "a rejected figure is flagged, and an unsizable plan is refused by name",
+         (backend, common, mutate_in_func(mutate_in_func(cache, r"bool unified_cache_planned_dense_scratch_bytes_at\(",
                                                          "g_planned_dense_scratch_invalid", "g_planned_XXXX"),
-                                          r"bool unified_cache_replan_planned_dense_scratch\(",
+                                          r"bool unified_cache_planned_dense_scratch_bytes_at\(",
                                           "g_planned_dense_scratch_invalid", "g_planned_XXXX"), zone)),
 
         # r3 backend-side mutants
