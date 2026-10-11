@@ -861,7 +861,7 @@ if (Python3_Interpreter_FOUND)
     # (llama.cpp-z4kd). WITH --self-test so each anchor is proven load-bearing.
     add_test(NAME test-sycl-moe-hostpath-no-host-wait-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-hostpath-no-host-wait-source.py --self-test)
-    # The self-test re-scans the whole backend, callees included, for each of ~40 mutants (~27 s at load 11).
+    # The self-test re-scans the whole backend, callees included, for each of 47 mutants (~27 s at load 4-10).
     set_tests_properties(test-sycl-moe-hostpath-no-host-wait-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
     # A hybrid MXFP4 xmx_tiled expert must be decoded by a kernel that reads
