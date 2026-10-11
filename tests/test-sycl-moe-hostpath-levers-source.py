@@ -14,24 +14,36 @@ calls them, and calls them the way the tests assume.
      GLU of every host-expert layer on the CPU backend (19 CPU splits per graph on Qwen3.8).
 
   C. Wait census.  The expert-id readback (ggml_sycl_copy_ids_to_host) is timed as B1 in its own
-     block; the per-token line is a GGML_LOG_WARN, so it survives the default log threshold; a CPU
-     job join is timed as MOE_WAIT_JOIN and classified only inside moe_hostpath_wait_end, after the
-     enabled check, so a run without GGML_SYCL_MOE_IDS_COPY_TRACE reads no tensor name.  The down
-     activation gather's wait is B4; the graph-boundary flush (ggml_sycl_cpu_tg_flush_pending) opens
-     with the B7 context and the hot-group flush runs under the B4b context, which are the B7 and B4b
-     figures the lane's acceptance reads.
+     block; the per-token line is a GGML_LOG_WARN, so it survives the default log threshold; a wait
+     is classified only inside moe_hostpath_wait_end, after the enabled check, so a run without
+     GGML_SYCL_MOE_IDS_COPY_TRACE classifies nothing.  moe_hostpath_wait_end takes no joined op,
+     because no CPU job join runs on the submitting thread any more.  The graph-boundary flush
+     (ggml_sycl_cpu_tg_flush_pending) opens with the B7 context and the hot-group flush runs under
+     the B4b context, which are the B7 and B4b figures the lane's acceptance reads.  The B2..B6
+     waits, the down activation gather's among them, and the flush's CPU job join no longer run on
+     the submitting thread (llama.cpp-z4kd), so they carry no timer;
+     test-sycl-moe-hostpath-no-host-wait-source pins their absence.  The B4b context stays so that a
+     wait brought back into the hot-group flush is counted as the hot join it would be.
 
   P. pending_any.  ggml_sycl_cpu_tg_pending_any reads every slot that can hold scatter state between
      graphs: the direct-scatter list, the pending slot and its sibling (each with its previous
-     buffers), the deferred secondary scatter, and the pipeline scatter ring.  Missing one lets a
+     scatter's events), the deferred secondary scatter, and the pipeline scatter ring.  Missing one lets a
      recording call reach its exit with state the exit hook does not see.
+
+  D. Graph-entry drain.  ggml_backend_sycl_graph_compute_impl waits the CPU job future of each
+     pending scatter slot (the sibling and the slot itself) and resets that future only when the
+     slot is not active.  Every assignment to a slot's future in that function sits in a block
+     opened by `if (!slot.active)`, and each slot has one.  An active slot's flush joins its job
+     through the future on the queue and refuses a slot without one, so resetting it at graph
+     entry would drop that slot's rows (llama.cpp-z4kd).
 
   R. Retired GGML_SYCL_PIPELINE_CPU.  ggml_sycl_pipeline_cpu_warn_retired has exactly one call in
      the whole file.  It is in ggml_check_sycl at init, in the settings-report block itself and not
      under its `if (!overrides.empty())`, so a run that sets only the retired variable still hears
      about it.  The helper latches through a `static const bool`, so a second backend init in the
      same process does not repeat the WARN.  The WARN and the env-var row cite llama.cpp-ytc9 and
-     defer the direction under llama.cpp-3oju9.
+     say the event-chained host path (llama.cpp-z4kd) supersedes the direction.  Neither defers it
+     under llama.cpp-3oju9, which now tracks only the overlap goal.
 
 WHAT THIS DOES NOT PROVE.  It reads source text with comments blanked.  It does not show which
 executor a GLU ran on (that needs a GPU run) and cannot see a conditional hidden behind a macro.
@@ -114,8 +126,8 @@ class Source:
         close_at = self.match_close(open_at, "{", "}")
         return open_at, self.code[open_at : close_at + 1]
 
-    def innermost_block(self, at: int) -> str:
-        """The smallest braced block of `code` that contains offset `at`."""
+    def innermost_open(self, at: int) -> int:
+        """The offset of the `{` that opens the smallest braced block containing offset `at`."""
         depth = 0
         for k in range(at, -1, -1):
             c = self.bare[k]
@@ -123,9 +135,14 @@ class Source:
                 depth += 1
             elif c == "{":
                 if depth == 0:
-                    return self.code[k : self.match_close(k, "{", "}") + 1]
+                    return k
                 depth -= 1
         raise ContractError(f"offset {at} is not inside a block")
+
+    def innermost_block(self, at: int) -> str:
+        """The smallest braced block of `code` that contains offset `at`."""
+        k = self.innermost_open(at)
+        return self.code[k : self.match_close(k, "{", "}") + 1]
 
 
 def squash(s: str) -> str:
@@ -193,26 +210,18 @@ def check_census(src: Source) -> None:
 
     if "moe_hostpath_join_class(" in code:
         raise ContractError("C: ggml-sycl.cpp classifies a join itself; only moe_hostpath_wait_end may, past its check")
-    joins = re.findall(r"moe_hostpath_wait_timer\s+\w+\(\s*MOE_WAIT_JOIN\s*,\s*slot\.dst_tensor\s*\)\s*;", code)
-    if len(joins) != 1:
-        raise ContractError(f"C: expected one MOE_WAIT_JOIN timer on slot.dst_tensor, found {len(joins)}")
     flat = squash(code)
-    gather = re.findall(r"moe_hostpath_wait_timer \w+\(MOE_WAIT_B4\); sycl::event::wait\(copy_events\);", flat)
-    if len(gather) != 1:
-        raise ContractError(f"C: expected the down activation gather's wait timed as B4 once, found {len(gather)}")
     _, boundary = src.body(r"void ggml_sycl_cpu_tg_flush_pending\(\)")
     if not re.match(r"\{\s*moe_hostpath_wait_context\s+\w+\(\s*MOE_WAIT_B7\s*\)\s*;", boundary):
         raise ContractError("C: ggml_sycl_cpu_tg_flush_pending does not open with the B7 wait context")
     hot = re.findall(
-        r"dispatch_cpu_and_scatter\(hot_entries, hot_first, pregather\); "
+        r"dispatch_cpu_and_scatter\(hot_entries, hot_first, pregather, pregather_events, pregather_serial\); "
         r"moe_hostpath_wait_context \w+\(MOE_WAIT_B4B\); flush_pending_cpu_scatter\(\);",
         flat,
     )
     if len(hot) != 1:
         raise ContractError(f"C: expected the hot-group flush under the B4b wait context once, found {len(hot)}")
-    _, end = src.body(
-        r"static void moe_hostpath_wait_end\(int natural, const ggml_tensor \* joined, moe_hostpath_clock::time_point t0\)"
-    )
+    _, end = src.body(r"static void moe_hostpath_wait_end\(int natural, moe_hostpath_clock::time_point t0\)")
     m = re.match(r"\{\s*if\s*\(\s*!moe_hostpath_waits_enabled\(\)\s*\)\s*\{\s*return;\s*\}", end)
     if not m:
         raise ContractError("C: moe_hostpath_wait_end does not start with the enabled check")
@@ -223,9 +232,9 @@ def check_census(src: Source) -> None:
 PENDING_TERMS = {
     "!g_cpu_tg_direct_pending_scatter.empty()",
     "g_pending_scatter.active",
-    "g_pending_scatter.prev_bufs.pending",
+    "!g_pending_scatter.prev_scatter.scatter_events.empty()",
     "g_pending_scatter_sibling.active",
-    "g_pending_scatter_sibling.prev_bufs.pending",
+    "!g_pending_scatter_sibling.prev_scatter.scatter_events.empty()",
     "ggml_sycl_pending_secondary_scatter_active()",
 }
 
@@ -255,6 +264,26 @@ def check_pending_any(src: Source) -> None:
             raise ContractError(f"P: pending_any no longer reads the pipeline ring ({need})")
 
 
+DRAIN_SLOTS = ("g_pending_scatter_sibling", "g_pending_scatter")
+
+
+def check_drain(src: Source) -> None:
+    body_at, body = src.body(
+        r"static void ggml_backend_sycl_graph_compute_impl\(ggml_backend_sycl_context \* sycl_ctx, ggml_cgraph \* cgraph\)"
+    )
+    for slot in DRAIN_SLOTS:
+        resets = [m.start() for m in re.finditer(rf"\b{slot}\.future\s*=(?!=)", body)]
+        if not resets:
+            raise ContractError(f"D: the graph-entry drain no longer resets {slot}'s future")
+        for at in resets:
+            open_at = src.innermost_open(body_at + at)
+            if not re.search(rf"\bif\s*\(\s*!\s*{slot}\.active\s*\)\s*\Z", src.code[:open_at]):
+                line = src.code.count("\n", 0, body_at + at) + 1
+                raise ContractError(
+                    f"D: the graph-entry drain resets {slot}'s future at line {line} outside `if (!{slot}.active)`"
+                )
+
+
 def check_retired(src: Source, doc: str) -> None:
     # Whole file, not just ggml_check_sycl: a second call anywhere (a dispatch site, say) would
     # still be latched to one WARN, but it is dead code that costs a static-guard check per call.
@@ -275,16 +304,23 @@ def check_retired(src: Source, doc: str) -> None:
     if not re.search(r"\bstatic\s+const\s+bool\s+set\s*=\s*\[", helper):
         raise ContractError("R: the retired WARN no longer latches through `static const bool set`")
     text = "".join(re.findall(r"\"((?:[^\"\\]|\\.)*)\"", helper))
-    for need in ("GGML_SYCL_PIPELINE_CPU is retired", "llama.cpp-ytc9", "llama.cpp-3oju9"):
+    superseded = "superseded by the event-chained host path (llama.cpp-z4kd)"
+    for need in ("GGML_SYCL_PIPELINE_CPU is retired", "llama.cpp-ytc9", superseded):
         if need not in text:
             raise ContractError(f"R: the retired WARN does not say {need!r}")
+    for stale in ("llama.cpp-3oju9", "deferred"):
+        if stale in text:
+            raise ContractError(f"R: the retired WARN still says {stale!r}; z4kd supersedes the direction")
     if not re.search(r"GGML_LOG_WARN\(\s*\"GGML_SYCL_PIPELINE_CPU is retired", helper):
         raise ContractError("R: the retired message is not a GGML_LOG_WARN")
     rows = [line for line in doc.splitlines() if line.startswith("| ~~`GGML_SYCL_PIPELINE_CPU=1`~~")]
     if len(rows) != 1:
         raise ContractError(f"R: expected one retired GGML_SYCL_PIPELINE_CPU row in {ENV_DOC}, found {len(rows)}")
-    if "llama.cpp-3oju9" not in rows[0] or "deferred under llama.cpp-z4kd" in rows[0]:
-        raise ContractError("R: the env-var row must defer the direction under llama.cpp-3oju9, not z4kd")
+    if superseded not in rows[0]:
+        raise ContractError(f"R: the env-var row does not say the direction is {superseded}")
+    for stale in ("stays open under llama.cpp-3oju9", "deferred under"):
+        if stale in rows[0]:
+            raise ContractError(f"R: the env-var row still says {stale!r}; z4kd supersedes the direction")
 
 
 def run(files: dict[str, str]) -> None:
@@ -292,6 +328,7 @@ def run(files: dict[str, str]) -> None:
     check_glu(src)
     check_census(src)
     check_pending_any(src)
+    check_drain(src)
     check_retired(src, files[ENV_DOC])
 
 
@@ -353,28 +390,23 @@ MUTANTS = [
         'GGML_LOG_INFO("[MOE-HOSTPATH-WAITS]',
     ),
     (
-        "C4 join classified at the timer (strstr per flush when off)",
+        "C4 join classified at a timer (strstr per wait when off)",
         BACKEND,
-        "moe_hostpath_wait_timer wait_timer(MOE_WAIT_JOIN, slot.dst_tensor);",
-        "moe_hostpath_wait_timer wait_timer(ggml_sycl::moe_hostpath_join_class(slot.dst_tensor->name));",
+        "            moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);\n            g_pending_scatter.future.wait();",
+        "            moe_hostpath_wait_timer wait_timer(ggml_sycl::moe_hostpath_join_class(g_pending_scatter.dst_tensor->name));\n"
+        "            g_pending_scatter.future.wait();",
     ),
     (
         "C5 classification before the enabled check",
         BACKEND,
         "    if (!moe_hostpath_waits_enabled()) {\n        return;\n    }\n"
         "    moe_hostpath_wait_census & w = g_moe_hostpath_waits;\n"
-        "    const int cls = ggml_sycl::moe_hostpath_wait_classify(",
-        "    const int pre = ggml_sycl::moe_hostpath_wait_classify(natural, joined ? joined->name : nullptr, -1);\n"
+        "    const int                  cls = ggml_sycl::moe_hostpath_wait_classify(",
+        "    const int pre = ggml_sycl::moe_hostpath_wait_classify(natural, nullptr, -1);\n"
         "    (void) pre;\n"
         "    if (!moe_hostpath_waits_enabled()) {\n        return;\n    }\n"
         "    moe_hostpath_wait_census & w = g_moe_hostpath_waits;\n"
-        "    const int cls = ggml_sycl::moe_hostpath_wait_classify(",
-    ),
-    (
-        "C6 down activation gather retagged B2",
-        BACKEND,
-        "moe_hostpath_wait_timer wait_timer(MOE_WAIT_B4);\n                sycl::event::wait(copy_events);",
-        "moe_hostpath_wait_timer wait_timer(MOE_WAIT_B2);\n                sycl::event::wait(copy_events);",
+        "    const int                  cls = ggml_sycl::moe_hostpath_wait_classify(",
     ),
     (
         "C7 boundary flush's B7 context dropped",
@@ -391,8 +423,8 @@ MUTANTS = [
     (
         "P1 sibling slot dropped from pending_any",
         BACKEND,
-        "g_pending_scatter_sibling.active || g_pending_scatter_sibling.prev_bufs.pending ||",
-        "false || false ||",
+        "g_pending_scatter_sibling.active ||\n        !g_pending_scatter_sibling.prev_scatter.scatter_events.empty() ||",
+        "false ||\n        false ||",
     ),
     (
         "P2 secondary scatter dropped from pending_any",
@@ -406,6 +438,24 @@ MUTANTS = [
         "        if (slot.submitted.load(std::memory_order_acquire) && !slot.done.load(std::memory_order_acquire)) {\n"
         "            return true;",
         "        if (slot.submitted.load(std::memory_order_acquire) && false) {\n            return true;",
+    ),
+    (
+        "D1 graph-entry drain resets the sibling's future while the sibling is active",
+        BACKEND,
+        "        if (!g_pending_scatter_sibling.active) {\n            g_pending_scatter_sibling.future = {};\n        }\n",
+        "        g_pending_scatter_sibling.future = {};\n",
+    ),
+    (
+        "D2 graph-entry drain resets the slot's future while the slot is active",
+        BACKEND,
+        "        if (!g_pending_scatter.active) {\n            g_pending_scatter.future = {};\n        }\n",
+        "        g_pending_scatter.future = {};\n",
+    ),
+    (
+        "D3 graph-entry drain stops resetting an inactive slot's future",
+        BACKEND,
+        "        if (!g_pending_scatter.active) {\n            g_pending_scatter.future = {};\n        }\n",
+        "",
     ),
     (
         "R1 init-time retired WARN call removed",
@@ -439,16 +489,28 @@ MUTANTS = [
         "            }\n",
     ),
     (
-        "R2 WARN no longer cites 3oju9",
+        "R2 WARN defers the direction under 3oju9 again",
         BACKEND,
-        "deferred under \"\n                \"llama.cpp-3oju9;",
-        "deferred under \"\n                \"llama.cpp-z4kd;",
+        "it is superseded by the event-chained host path (llama.cpp-z4kd); see ",
+        "the event-chained host path it led toward is deferred under llama.cpp-3oju9; see ",
     ),
     (
-        "R3 env-var row defers under z4kd again",
+        "R7 WARN keeps the z4kd text but adds the 3oju9 deferral",
+        BACKEND,
+        "(llama.cpp-z4kd); see ",
+        "(llama.cpp-z4kd), deferred under llama.cpp-3oju9; see ",
+    ),
+    (
+        "R3 env-var row says the direction stays open under 3oju9 again",
         ENV_DOC,
-        "The design direction stays open under llama.cpp-3oju9:",
-        "The design direction is deferred under llama.cpp-z4kd:",
+        "the direction is superseded by the event-chained host path (llama.cpp-z4kd):",
+        "the direction stays open under llama.cpp-3oju9:",
+    ),
+    (
+        "R8 env-var row keeps the z4kd text but defers under 3oju9",
+        ENV_DOC,
+        "llama.cpp-3oju9 still tracks the overlap goal itself",
+        "The direction is deferred under llama.cpp-3oju9, which tracks the overlap goal itself",
     ),
 ]
 
@@ -514,7 +576,10 @@ def main() -> int:
     except ContractError as e:
         print(f"FAIL: {e}")
         return 1
-    print("PASS: z4kd hostpath lever pins hold (GLU walk, wait census, pending_any, retired PIPELINE_CPU)")
+    print(
+        "PASS: z4kd hostpath lever pins hold "
+        "(GLU walk, wait census, pending_any, graph-entry drain, retired PIPELINE_CPU)"
+    )
     return 0
 
 

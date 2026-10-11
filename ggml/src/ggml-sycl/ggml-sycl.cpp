@@ -23876,6 +23876,10 @@ struct pending_cpu_scatter {
     ggml_sycl::mem_handle out_handle;            // Host-pinned CPU output staging
     ggml_sycl::mem_handle act_handle;            // Host-pinned CPU activation staging
     ggml_sycl::mem_handle weight_handle;         // Optional host-pinned weight staging
+    // A buffer the CPU job reads that the slot does not otherwise own: the
+    // shared decode activation staging, which ensure() may replace while the
+    // job still reads it (llama.cpp-z4kd).  Retained until the job's join event.
+    ggml_sycl::mem_handle act_keepalive;
 
     // Per-expert scatter metadata
     struct scatter_entry {
@@ -23922,23 +23926,14 @@ struct pending_cpu_scatter {
     // the next op doesn't consume our destination tensor.
     const ggml_tensor * dst_tensor;
 
-    // Deferred buffer cleanup: when we skip stream->wait() (async scatter),
-    // the source buffers can't be freed until the memcpys complete.  We defer
-    // cleanup to the next flush call — by then, at least one kernel on the
-    // in-order queue has executed, guaranteeing the memcpys finished.
-    struct deferred_bufs {
-        float *                      out    = nullptr;
-        float *                      act    = nullptr;
-        uint8_t *                    weight = nullptr;
-        ggml_sycl::mem_handle        out_handle;
-        ggml_sycl::mem_handle        act_handle;
-        ggml_sycl::mem_handle        weight_handle;
-        std::vector<sycl::event>     scatter_events;
-        std::optional<sycl::context> ctx;
-        int                          dev_id  = -1;
-        bool                         pool    = false;
-        bool                         pending = false;
-    } prev_bufs;
+    // The last flush's scatter H2D events.  The buffers that flush read are
+    // retained until its join event (retain_handles_until_event), so nothing
+    // is freed here; the graph boundary waits these events
+    // (pending_cpu_scatter_wait_prev_events, llama.cpp-z4kd).  A scatter is
+    // still owed that wait while the list is not empty.
+    struct prev_scatter_state {
+        std::vector<sycl::event> scatter_events;
+    } prev_scatter;
 
     pending_cpu_scatter() :
         out_pinned(nullptr),
@@ -23960,7 +23955,7 @@ static thread_local std::vector<sycl::event> g_cpu_tg_direct_pending_scatter;
 // when up is issued without joining it (moe_sibling_pending_keep() in
 // moe-decode-hostpath.hpp states when that is safe). It is always the older
 // of the two, so every flush drains it first. Each slot keeps its own
-// prev_bufs.
+// prev_scatter.
 static thread_local pending_cpu_scatter g_pending_scatter_sibling = {};
 
 // Counts flushes that enqueued a scatter H2D. An activation copy records the
@@ -23984,25 +23979,19 @@ static void pending_cpu_scatter_bind_scratch(pending_cpu_scatter & slot, ggml_ba
 // A token's line is printed when the next token's first id readback arrives
 // (the layer id drops), so it includes the boundary flushes in between.  The
 // last token of a run is not printed.  Counters are never reset between
-// prefill and decode, so two readings need care:
-//   - token 0 also carries every wait of the prompt's ubatches;
-//   - B4b counts any hot-group join, so during prefill it also counts the
-//     gate/up jobs a multi-row hot group joins, not only down.
+// prefill and decode, so token 0 also carries every wait of the prompt's
+// ubatches.  B4b reads 0: the hot-group flush no longer joins its jobs on this
+// thread, and its context only labels a wait that someone brings back into
+// that flush, as the hot join it would be.
 // When the variable is unset, a timed wait costs two cached flag tests (one
 // when the timer starts, one when it ends) and reads no clock and classifies
 // nothing; a flush context still saves and restores the thread-local context
 // field unconditionally.
 // ---------------------------------------------------------------------------
 using ggml_sycl::MOE_WAIT_B1;
-using ggml_sycl::MOE_WAIT_B2;
-using ggml_sycl::MOE_WAIT_B3;
-using ggml_sycl::MOE_WAIT_B4;
 using ggml_sycl::MOE_WAIT_B4B;
-using ggml_sycl::MOE_WAIT_B5;
-using ggml_sycl::MOE_WAIT_B6;
 using ggml_sycl::MOE_WAIT_B7;
 using ggml_sycl::MOE_WAIT_COUNT;
-using ggml_sycl::MOE_WAIT_JOIN;
 using ggml_sycl::MOE_WAIT_NONE;
 
 struct moe_hostpath_wait_census {
@@ -24030,36 +24019,26 @@ static moe_hostpath_clock::time_point moe_hostpath_wait_begin() {
     return moe_hostpath_waits_enabled() ? moe_hostpath_clock::now() : moe_hostpath_clock::time_point{};
 }
 
-// Classification (moe_hostpath_wait_classify) runs only past the enabled check, so a join's name
-// is not read when the census is off.  `joined` names the op of a MOE_WAIT_JOIN wait.
-static void moe_hostpath_wait_end(int natural, const ggml_tensor * joined, moe_hostpath_clock::time_point t0) {
+// Classification (moe_hostpath_wait_classify) runs only past the enabled check, so nothing is
+// classified when the census is off.  No timer names a joined op: no CPU job join runs on the
+// submitting thread (llama.cpp-z4kd).
+static void moe_hostpath_wait_end(int natural, moe_hostpath_clock::time_point t0) {
     if (!moe_hostpath_waits_enabled()) {
         return;
     }
     moe_hostpath_wait_census & w = g_moe_hostpath_waits;
-    const int cls = ggml_sycl::moe_hostpath_wait_classify(natural, joined ? joined->name : nullptr, w.context);
+    const int                  cls = ggml_sycl::moe_hostpath_wait_classify(natural, nullptr, w.context);
     w.count[cls] += 1;
     w.us[cls] += std::chrono::duration<double, std::micro>(moe_hostpath_clock::now() - t0).count();
 }
 
-static void moe_hostpath_wait_end(int natural, moe_hostpath_clock::time_point t0) {
-    moe_hostpath_wait_end(natural, nullptr, t0);
-}
-
 struct moe_hostpath_wait_timer {
     int                            natural;
-    const ggml_tensor *            joined;
     moe_hostpath_clock::time_point t0;
 
-    explicit moe_hostpath_wait_timer(int cls) : natural(cls), joined(nullptr), t0(moe_hostpath_wait_begin()) {}
+    explicit moe_hostpath_wait_timer(int cls) : natural(cls), t0(moe_hostpath_wait_begin()) {}
 
-    // A CPU job join; its class is read from `op` when the wait ends.
-    moe_hostpath_wait_timer(int cls, const ggml_tensor * op) :
-        natural(cls),
-        joined(op),
-        t0(moe_hostpath_wait_begin()) {}
-
-    ~moe_hostpath_wait_timer() { moe_hostpath_wait_end(natural, joined, t0); }
+    ~moe_hostpath_wait_timer() { moe_hostpath_wait_end(natural, t0); }
 };
 
 // Counts the waits inside one flush under `cls`, unless an enclosing boundary flush already does.
@@ -24124,6 +24103,21 @@ static void moe_hostpath_waits_readback(int layer) {
     ++w.readbacks;
 }
 
+// The most recent slot flush (llama.cpp-z4kd): the pool entries its H2D reads
+// and that H2D's events.  A CPU job issued after it whose activation copy came
+// before it waits for these events on the pool worker when it would write the
+// same entries (moe_cpu_job_order_decide in moe-decode-hostpath.hpp).
+struct moe_cpu_scatter_flush_record {
+    std::vector<sycl::event> events;
+    bool                     from_pool = false;
+    size_t                   first     = 0;
+    size_t                   count     = 0;
+    int64_t                  row_k     = 0;
+    int64_t                  row_n     = 0;
+};
+
+static thread_local moe_cpu_scatter_flush_record g_cpu_scatter_last_flush;
+
 // Neither counter is ever reset, so a value names one event for the life of
 // the thread: a serial names one rewrite of the shared activation staging, an
 // epoch one graph compute. A reset would let a new copy or graph repeat an
@@ -24162,6 +24156,7 @@ struct cpu_dispatch_result {
     float *                                         act_pinned = nullptr;
     ggml_sycl::mem_handle                           out_handle;
     ggml_sycl::mem_handle                           act_handle;
+    ggml_sycl::mem_handle                           act_keepalive;  // see pending_cpu_scatter
     std::vector<cpu_expert_task>                    tasks;  // must outlive future
     std::vector<pending_cpu_scatter::scatter_entry> entries;
     int                                             device_id    = -1;
@@ -24176,6 +24171,83 @@ struct cpu_dispatch_result {
     uint64_t                                        act_serial        = 0;
     bool                                            shares_activation = false;
 };
+
+// ---------------------------------------------------------------------------
+// The CPU expert path is event-chained after the ids readback (llama.cpp-z4kd).
+//
+// The submitting thread used to block 4-6 times per decode MoE layer after the
+// expert-id readback: on the activation copy and the host-lease producer events
+// before submitting a job, on the gate/up jobs when GLU consumed them, on the
+// down activation gather, on the hot down group right after issuing it, on the
+// cold group at the weighted sum, and on the previous scatter H2D at every
+// flush.  Each drained the GPU queue and left it idle while the host woke up.
+// Now the ids readback is the one host block per layer:
+//  - a job's input waits (and the zeroing of its output span, which must follow
+//    them) run on the pool worker, in the closure moe_cpu_job_prologue builds;
+//  - a job is joined by a host_task on the op's in-order queue, and its scatter
+//    H2D copies depend on that host_task's event.
+// No cycle: a prologue waits only for queue work submitted before its job, a
+// join only for a job submitted before it, and the pool runs jobs in order, so
+// every wait points back in submission order (one pool worker and one SYCL
+// host-task thread are enough).
+// Lifetime: nothing here waits, so nothing here may free.  Every buffer a
+// pending job reads or writes (output, activation and weight staging, the
+// activation keepalive) is retained by handle until the job's join event, and every
+// scatter H2D retains its source and destination handles until its own event
+// (mem_copy_async).  The raw pointers a job uses are transient views of those
+// handles and are never held past them.
+// ---------------------------------------------------------------------------
+struct moe_cpu_job_inputs {
+    std::vector<sycl::event> events;                // activation copies, lease producers, ordering deps
+    float *                  zero_out   = nullptr;  // output span to clear after the events (transient view)
+    size_t                   zero_bytes = 0;
+};
+
+// Runs on the pool worker, never on the submitting thread.
+static void moe_cpu_job_wait_inputs(const moe_cpu_job_inputs & inputs) {
+    if (!inputs.events.empty()) {
+        sycl::event::wait(inputs.events);
+    }
+    if (inputs.zero_out && inputs.zero_bytes > 0) {
+        std::memset(inputs.zero_out, 0, inputs.zero_bytes);
+    }
+}
+
+static std::function<void()> moe_cpu_job_prologue(moe_cpu_job_inputs inputs) {
+    return [inputs = std::move(inputs)]() {
+        moe_cpu_job_wait_inputs(inputs);
+    };
+}
+
+// Runs on the join host_task, never on the submitting thread.  By then the
+// MUL_MAT_ID that submitted the job has returned, so a job that threw has no
+// caller left to refuse to, and its rows are needed (llama.cpp-93tw).
+// CpuExpertPool stores no exception in its future: a throw in a job's prologue
+// or kernel ends the process on the worker (CpuExpertPool::submit_batch).  The
+// std::async forms store one: dispatch_cpu_compute's, for the host AOS recipe
+// and while the pool is inactive, and the planner CPU dispatch's pool-inactive
+// form.  A sycl::exception from a prologue's sycl::event::wait, or a throw from
+// a kernel, reaches this get().  The function is noexcept, so such a throw
+// ends the process here, with the terminate handler reporting what it threw,
+// not in the SYCL async handler.  That error path is narrower than it
+// was for the input waits now in the job prologue: on the submitting thread a
+// sycl::exception from them reached ggml_sycl_mul_mat_id's catch and the
+// compute_forward catch, which route it to
+// ggml_sycl_try_dispatch_resource_exhaustion_fallback.  No catch is added for
+// it (alloc-zone contract, G-CATCH).  The jobs' own refusals abort with a named
+// message before they get here.
+static void moe_cpu_job_join(const std::shared_future<void> & job) noexcept {
+    if (moe_hostpath_waits_enabled()) {
+        ggml_sycl::cpu_expert_pool_trace_note_join(job.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
+    }
+    job.get();
+}
+
+// Submits the join of a CPU job on `queue` and returns its event.  The host_task
+// holds the job's shared future.
+static sycl::event moe_cpu_job_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {
+    return queue.submit([&](sycl::handler & cgh) { cgh.host_task([job]() { moe_cpu_job_join(job); }); });
+}
 
 // ---------------------------------------------------------------------------
 // MoE gate+up+SiLU fusion state — Phase 4 simplified state machine.
@@ -25549,59 +25621,27 @@ static bool ggml_sycl_moe_fusion_enabled() {
 // Flush any pending deferred CPU scatter.  Called:
 //  - At the start of each CPU-TG MUL_MAT_ID entry
 //  - At graph boundaries (graph_compute_impl)
-// Free deferred buffers from a previous async scatter.  By the time this
-// is called, the in-order compute queue has processed at least one kernel
-// after the memcpys, guaranteeing the copies have completed.
-static void flush_prev_scatter_bufs(pending_cpu_scatter & slot) {
-    auto & pb = slot.prev_bufs;
-    if (!pb.pending) {
-        return;
+//
+// The graph-boundary drain (llama.cpp-z4kd).  A slot flush keeps only its H2D
+// events in prev_scatter; the buffers it read are retained by event, so nothing
+// here frees memory.  Completing the last scatter of each slot completes every
+// earlier join and CPU job on that in-order queue, which is what the graph
+// boundary needs before the host zones are reset.  This is a host wait, so it
+// is only called from ggml_sycl_cpu_tg_flush_pending(), never from a flush.
+static void pending_cpu_scatter_wait_prev_events(pending_cpu_scatter & slot) {
+    std::vector<sycl::event> & events = slot.prev_scatter.scatter_events;
+    if (!events.empty()) {
+        moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
+        sycl::event::wait(events);
+        events.clear();
     }
-    if (!pb.scatter_events.empty()) {
-        moe_hostpath_wait_timer wait_timer(MOE_WAIT_B6);
-        sycl::event::wait(pb.scatter_events);
-        pb.scatter_events.clear();
-    }
-    if (pb.pool) {
-        g_pinned_buffer_pools[pb.dev_id].release({ pb.act, pb.out });
-    } else if (pb.act_handle.valid() || pb.out_handle.valid() || pb.weight_handle.valid()) {
-        pb.act_handle    = {};
-        pb.out_handle    = {};
-        pb.weight_handle = {};
-    } else {
-        // Legacy sycl::free path — dead code after migration to unified_alloc
-        if (pb.act) {
-            GGML_ASSERT(false && "pending_cpu_scatter.act: legacy sycl::free path — act_handle should always be set");
-        }
-        if (pb.out) {
-            GGML_ASSERT(false && "pending_cpu_scatter.out: legacy sycl::free path — out_handle should always be set");
-        }
-        if (pb.weight) {
-            GGML_ASSERT(false &&
-                        "pending_cpu_scatter.weight: legacy sycl::free path — weight_handle should always be set");
-        }
-    }
-    pb.out           = nullptr;
-    pb.act           = nullptr;
-    pb.weight        = nullptr;
-    pb.out_handle    = {};
-    pb.act_handle    = {};
-    pb.weight_handle = {};
-    pb.scatter_events.clear();
-    pb.ctx.reset();
-    pb.dev_id  = -1;
-    pb.pool    = false;
-    pb.pending = false;
 }
 
-static void flush_prev_scatter_bufs() {
-    flush_prev_scatter_bufs(g_pending_scatter_sibling);
-    flush_prev_scatter_bufs(g_pending_scatter);
-}
-
-// Everything one host-expert scatter flush builds, kept across flushes so a decode token's flushes allocate nothing
-// once the first has sized it (llama.cpp-cre6). Thread-local like the pending slots it serves. The handle vectors
-// are cleared when each flush is done with them, so they never hold an allocation past its flush.
+// Everything one host-expert scatter flush builds, kept across flushes so a decode token's flushes need no new
+// workspace once the first has sized it (llama.cpp-cre6). The flush still builds one handle list per joined job,
+// the buffers it hands retain_handles_until_event (flush_pending_cpu_scatter_slot). Thread-local like the pending
+// slots it serves. The handle vectors are cleared when each flush is done with them, so they never hold an
+// allocation past its flush.
 struct moe_host_scatter_workspace {
     std::vector<ggml_sycl::mem_handle>      srcs;
     std::vector<ggml_sycl::mem_handle>      dsts;
@@ -25610,6 +25650,7 @@ struct moe_host_scatter_workspace {
     ggml_sycl::moe_scatter_plan             plan;
     std::vector<sycl::event>                copied;
     std::vector<sycl::event>                events;
+    std::vector<sycl::event>                joins;  // each slot's CPU job join (llama.cpp-z4kd)
 
     void release_handles() {
         srcs.clear();
@@ -25674,8 +25715,10 @@ enum class moe_host_scatter_form {
 // return PER_RUN, two runs or fewer before any scratch or plan is looked at. The raw pointers the kernel takes are
 // views resolved here, at submission, from handles that are retained until the kernel completes. Returns PER_RUN or
 // DECLINED having submitted nothing, DECLINED with `why` naming the reason; the caller then makes the per-run copies.
+// Every copy depends on `deps`, the joins of the CPU jobs that wrote the staging (llama.cpp-z4kd).
 static moe_host_scatter_form moe_host_scatter_submit_compact(const pending_cpu_scatter &      lead,
                                                              moe_host_scatter_workspace &     ws,
+                                                             const std::vector<sycl::event> & deps,
                                                              size_t *                         n_copies,
                                                              ggml_sycl::moe_scatter_decline * why) {
     sycl::queue &                                   queue  = *lead.stream;
@@ -25752,7 +25795,7 @@ static moe_host_scatter_form moe_host_scatter_submit_compact(const pending_cpu_s
         for (size_t c = chunk.first_copy; c < chunk.first_copy + chunk.n_copies; ++c) {
             const ggml_sycl::moe_scatter_copy & copy = plan.copies[c];
             copied.push_back(ggml_sycl::mem_copy_async(lead.scatter_scratch, copy.scratch_offset, srcs[copy.src],
-                                                       copy.src_offset, copy.bytes, queue));
+                                                       copy.src_offset, copy.bytes, queue, deps));
         }
         moe_host_scatter_rows placed_at{};
         for (size_t r = 0; r < chunk.n_rows; ++r) {
@@ -25795,36 +25838,14 @@ static moe_host_scatter_form moe_host_scatter_submit_compact(const pending_cpu_s
     return moe_host_scatter_form::COMPACT;
 }
 
-// The flush hands the slot's buffers to prev_bufs: the scatter's copies are submitted but may not have run yet, so
-// the buffers are released at the next flush, by when the in-order queue has passed them.
+// The flush is done with the slot (llama.cpp-z4kd).  Its scatter is submitted behind the CPU job's join and nothing
+// has waited for either; the flush retained every buffer the job uses until that join, so clearing the slot frees
+// nothing still in use.  prev_scatter keeps only the scatter's events, which the graph boundary waits
+// (pending_cpu_scatter_wait_prev_events).
 static void pending_cpu_scatter_retire(pending_cpu_scatter & slot, const std::vector<sycl::event> & scatter_events) {
-    {
-        auto & pb         = slot.prev_bufs;
-        pb.scatter_events = scatter_events;
-        if (slot.owns_buffers) {
-            pb.out           = slot.out_pinned;
-            pb.act           = slot.act_pinned;
-            pb.weight        = slot.weight_pinned;
-            pb.out_handle    = std::move(slot.out_handle);
-            pb.act_handle    = std::move(slot.act_handle);
-            pb.weight_handle = std::move(slot.weight_handle);
-            pb.ctx           = slot.sycl_ctx;
-            pb.dev_id        = slot.device_id;
-            pb.pool          = slot.from_pool;
-        } else {
-            pb.out           = nullptr;
-            pb.act           = nullptr;
-            pb.weight        = nullptr;
-            pb.out_handle    = {};
-            pb.act_handle    = {};
-            pb.weight_handle = {};
-            pb.ctx.reset();
-            pb.dev_id = slot.device_id;
-            pb.pool   = false;
-        }
-        pb.pending = !pb.scatter_events.empty() || slot.owns_buffers;
-    }
+    slot.prev_scatter.scatter_events = scatter_events;
 
+    slot.future = {};
     slot.entries.clear();
     slot.tasks.clear();
     slot.out_pinned    = nullptr;
@@ -25833,6 +25854,7 @@ static void pending_cpu_scatter_retire(pending_cpu_scatter & slot, const std::ve
     slot.out_handle    = {};
     slot.act_handle    = {};
     slot.weight_handle = {};
+    slot.act_keepalive = {};
     slot.stream        = nullptr;
     slot.sycl_ctx.reset();
     slot.active                = false;
@@ -25859,18 +25881,6 @@ static bool pending_cpu_scatter_takes_partner(const pending_cpu_scatter & slot, 
            next.scatter_scratch.stable_identity_equal(slot.scatter_scratch);
 }
 
-// Waits for the slot's CPU experts; a worker's exception propagates to the caller's catch, which aborts.
-static void pending_cpu_scatter_join(pending_cpu_scatter & slot) {
-    if (slot.future.valid()) {
-        if (moe_hostpath_waits_enabled()) {
-            ggml_sycl::cpu_expert_pool_trace_note_join(slot.future.wait_for(std::chrono::seconds(0)) ==
-                                                       std::future_status::ready);
-        }
-        moe_hostpath_wait_timer wait_timer(MOE_WAIT_JOIN, slot.dst_tensor);
-        slot.future.get();
-    }
-}
-
 static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
     if (!slot.active) {
         return;
@@ -25883,10 +25893,9 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
     pending_cpu_scatter * const group[2] = { &slot, partner };
     const int                   n_group  = partner ? 2 : 1;
 
-    // Free buffers from the PREVIOUS async scatter (safe now — in-order
-    // queue has processed past those memcpys).
+    // One serial per slot, so a group counts as two flushes (moe_cpu_job_order_decide).  Nothing from an
+    // earlier flush is released or waited here (llama.cpp-z4kd): its buffers are retained until its events.
     for (int k = 0; k < n_group; ++k) {
-        flush_prev_scatter_bufs(*group[k]);
         ++g_cpu_scatter_serial;
     }
 
@@ -25896,24 +25905,30 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
     moe_host_scatter_workspace & ws = g_moe_host_scatter_ws;
     ws.events.clear();
     try {
-        // Wait for CPU compute to finish
+        // Both producers of an active pending scatter set a stream, an output buffer and the CPU job's
+        // future.  A pending scatter without them used to be skipped quietly, which loses its host-expert
+        // rows (llama.cpp-93tw).
         for (int k = 0; k < n_group; ++k) {
-            pending_cpu_scatter_join(*group[k]);
+            GGML_ASSERT(group[k]->stream && group[k]->out_pinned && group[k]->future.valid() &&
+                        "pending CPU scatter has no stream, output staging or CPU job; its host-expert rows would be "
+                        "dropped (llama.cpp-93tw)");
         }
 
-        auto t1 = hrc::now();  // After CPU future.get()
+        // Join each CPU job on the in-order queue instead of on this thread (llama.cpp-z4kd).  The scatter
+        // below depends on the joins, so it reads the staging only after the jobs wrote it, and the GPU work
+        // that follows on this queue sees the rows.  This thread goes on submitting.
+        std::vector<sycl::event> & joins = ws.joins;
+        joins.clear();
+        for (int k = 0; k < n_group; ++k) {
+            joins.push_back(moe_cpu_job_join_on_queue(*slot.stream, group[k]->future.share()));
+        }
 
-        // Scatter results H2D — submitted to the in-order compute queue.
+        auto t1 = hrc::now();  // After the join submissions (no wait)
+
+        // Scatter results H2D — submitted to the in-order compute queue behind the joins.
         // Subsequent GPU kernels on this queue will wait for them (same-device
-        // in-order guarantee).  We skip stream->wait() to let the host proceed
-        // to dispatch the next layer immediately.
+        // in-order guarantee).
         double total_bytes = 0;
-        // Both producers of an active pending scatter set a stream and an output buffer.  A pending
-        // scatter without them used to be skipped quietly, which loses its host-expert rows
-        // (llama.cpp-93tw).
-        GGML_ASSERT(slot.stream && slot.out_pinned &&
-                    "pending CPU scatter has no stream or output staging; its host-expert rows would be dropped "
-                    "(llama.cpp-93tw)");
         for (int k = 0; k < n_group; ++k) {
             const auto & entries = group[k]->entries;
             for (size_t i = 0; i < entries.size(); ++i) {
@@ -25936,7 +25951,7 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
         ggml_sycl::moe_scatter_runs_build(ws.rows, ws.runs);
         size_t                         n_copies = 0;
         ggml_sycl::moe_scatter_decline why      = ggml_sycl::MOE_SCATTER_DECLINE_COUNT;
-        const moe_host_scatter_form    form     = moe_host_scatter_submit_compact(slot, ws, &n_copies, &why);
+        const moe_host_scatter_form    form     = moe_host_scatter_submit_compact(slot, ws, joins, &n_copies, &why);
         if (form == moe_host_scatter_form::DECLINED) {
             // Once per reason and device: a later decline for a different reason, or on another device, is still
             // reported.
@@ -25952,15 +25967,36 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
         if (form != moe_host_scatter_form::COMPACT) {
             for (const ggml_sycl::moe_scatter_run & run : ws.runs) {
                 ws.events.push_back(ggml_sycl::mem_copy_async(ws.dsts[run.dst], run.dst_offset, ws.srcs[run.src],
-                                                              run.src_offset, run.bytes, *slot.stream));
+                                                              run.src_offset, run.bytes, *slot.stream, joins));
             }
             n_copies = ws.runs.size();
+        }
+        // A flush with no rows to place still leaves its joins for the graph boundary to wait.
+        if (ws.events.empty()) {
+            ws.events.insert(ws.events.end(), joins.begin(), joins.end());
+        }
+
+        // A job reads its activation buffers and writes its output until its join completes; the copies
+        // above retain only what they read.  Retain everything each job touches until its own join, so
+        // retiring the slots below frees nothing a running job still uses.
+        for (int k = 0; k < n_group; ++k) {
+            const pending_cpu_scatter &        s = *group[k];
+            std::vector<ggml_sycl::mem_handle> job_buffers;
+            for (const ggml_sycl::mem_handle * h :
+                 { &s.out_handle, &s.act_handle, &s.weight_handle, &s.act_keepalive }) {
+                if (h->valid()) {
+                    job_buffers.push_back(*h);
+                }
+            }
+            if (!job_buffers.empty()) {
+                ggml_sycl::retain_handles_until_event(std::move(job_buffers), joins[k]);
+            }
         }
         ws.release_handles();
 
         auto t2 = hrc::now();  // After memcpy submissions
 
-        // Record scatter timing (no event_wait since we skip stream->wait)
+        // Record scatter timing.  cpu_wait_us is the join submission: nothing waits here any more.
         if (g_moe_profile_enabled) {
             double cpu_wait_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
             double submit_us   = std::chrono::duration<double, std::micro>(t2 - t1).count();
@@ -25968,11 +26004,21 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
             g_moe_profile.moe_scatter_detail(cpu_wait_us, submit_us, 0, static_cast<int>(n_copies), total_bytes);
         }
     } catch (const std::exception & ex) {
-        // Logging and carrying on cleared the pending state below, so a throwing CPU worker or a
-        // failed scatter submission lost every host-expert row of this op (llama.cpp-93tw).
+        // Logging and carrying on cleared the pending state below, so a failed join or scatter
+        // submission lost every host-expert row of this op (llama.cpp-93tw).
         GGML_ABORT("[CPU-TG] Deferred scatter failed: %s; its host-expert rows would be dropped (llama.cpp-93tw)",
                    ex.what());
     }
+
+    // What a later CPU job may have to order its pool writes after (moe_cpu_job_order_decide), and what
+    // the graph boundary waits for.  A group advanced the serial once per slot, so a job whose activation
+    // copy came before it sees two flushes and waits a queue barrier without reading this span.
+    g_cpu_scatter_last_flush.events    = ws.events;
+    g_cpu_scatter_last_flush.from_pool = slot.from_pool;
+    g_cpu_scatter_last_flush.first     = slot.pool_first;
+    g_cpu_scatter_last_flush.count     = slot.pool_count;
+    g_cpu_scatter_last_flush.row_k     = slot.row_k;
+    g_cpu_scatter_last_flush.row_n     = slot.row_n;
 
     for (int k = 0; k < n_group; ++k) {
         pending_cpu_scatter_retire(*group[k], ws.events);
@@ -25986,7 +26032,7 @@ static void flush_pending_cpu_scatter() {
 }
 
 // Hands the primary slot's pending job to the empty sibling slot; each slot
-// keeps its own prev_bufs.
+// keeps its own prev_scatter.
 static void move_pending_cpu_scatter_to_sibling() {
     pending_cpu_scatter & from = g_pending_scatter;
     pending_cpu_scatter & to   = g_pending_scatter_sibling;
@@ -25998,6 +26044,7 @@ static void move_pending_cpu_scatter_to_sibling() {
     to.out_handle            = std::move(from.out_handle);
     to.act_handle            = std::move(from.act_handle);
     to.weight_handle         = std::move(from.weight_handle);
+    to.act_keepalive         = std::move(from.act_keepalive);
     to.entries               = std::move(from.entries);
     to.stream                = from.stream;
     to.sycl_ctx              = std::move(from.sycl_ctx);
@@ -26024,6 +26071,7 @@ static void move_pending_cpu_scatter_to_sibling() {
     from.out_handle    = {};
     from.act_handle    = {};
     from.weight_handle = {};
+    from.act_keepalive = {};
     from.stream        = nullptr;
     from.sycl_ctx.reset();
     from.active                = false;
@@ -26102,28 +26150,36 @@ static bool ggml_sycl_pipeline_moe_enabled() {
 }
 
 // GGML_SYCL_PIPELINE_CPU used to park every CPU expert job in a separate
-// one-entry slot that was flushed only when a later op consumed its output
-// (llama.cpp-3oju9).  Up does not consume gate, so the second job of a layer
-// found the slot full and aborted (llama.cpp-ytc9) on every model that runs gate
-// and up as separate MUL_MAT_IDs.  The 2026-10-08 acceptance run of the opt-in
-// arm aborted the same way, so the slot is retired (llama.cpp-z4kd).  The
-// direction it was a step toward stays open under llama.cpp-3oju9: an
-// event-chained host path, where a CPU job's completion is an event that the
-// scatter H2D depends on, so no later op has to join the job on the submitting
-// thread.  A run that still sets the variable is told once, at backend init,
-// that it has no effect; the static latch keeps a second init from repeating it.
+// one-entry slot that was flushed only when a later op consumed its output.
+// Up does not consume gate, so the second job of a layer found the slot full
+// and aborted (llama.cpp-ytc9) on every model that runs gate and up as separate
+// MUL_MAT_IDs.  The 2026-10-08 acceptance run of the opt-in arm aborted the
+// same way, so the slot is retired.  The event-chained host path
+// (llama.cpp-z4kd) supersedes the direction it was a step toward: a host_task
+// on the queue joins each CPU job and the scatter H2D depends on that join, so
+// no later op joins the job on the submitting thread.  llama.cpp-3oju9 still
+// tracks the overlap goal itself, hiding the CPU expert compute behind the next
+// layer's attention.  A run that still sets the variable is told once, at
+// backend init, that it has no effect; the static latch keeps a second init
+// from repeating it.
 static void ggml_sycl_pipeline_cpu_warn_retired() {
     static const bool set = [] {
         const bool present = getenv("GGML_SYCL_PIPELINE_CPU") != nullptr;
         if (present) {
             GGML_LOG_WARN(
-                "GGML_SYCL_PIPELINE_CPU is retired and ignored (llama.cpp-z4kd): its opt-in path aborted at the "
-                "llama.cpp-ytc9 assert; the event-chained host path it led toward is deferred under "
-                "llama.cpp-3oju9; see docs/backend/sycl-env-vars.md\n");
+                "GGML_SYCL_PIPELINE_CPU is retired and ignored: its opt-in path aborted at the llama.cpp-ytc9 "
+                "assert, and it is superseded by the event-chained host path (llama.cpp-z4kd); see "
+                "docs/backend/sycl-env-vars.md\n");
         }
         return present;
     }();
     (void) set;
+}
+
+static void pending_cpu_scatter_wait_prev_events() {
+    pending_cpu_scatter_wait_prev_events(g_pending_scatter_sibling);
+    pending_cpu_scatter_wait_prev_events(g_pending_scatter);
+    g_cpu_scatter_last_flush.events.clear();
 }
 
 // ----- Deferred secondary GPU scatter (async B50 dispatch) -----
@@ -26701,8 +26757,8 @@ void ggml_sycl_cpu_tg_flush_pending() {
         g_cpu_tg_direct_pending_scatter.clear();
     }
     flush_pending_cpu_scatter();
-    flush_prev_scatter_bufs();       // Final cleanup for last async scatter
-    moe_shared_act_new_graph();      // graph-local: src1 storage is rewritten by the next graph
+    pending_cpu_scatter_wait_prev_events();  // The graph-boundary wait for the last joins and scatters of every slot
+    moe_shared_act_new_graph();              // graph-local: src1 storage is rewritten by the next graph
     if (ggml_sycl_pipeline_moe_enabled()) {
         pipeline_scatter_drain();
     }
@@ -26712,13 +26768,14 @@ void ggml_sycl_cpu_tg_flush_pending() {
 
 // True when any of the thread-local MoE scatter and CPU-expert lists holds
 // state: the direct-scatter event list, the pending scatter slot and its sibling
-// (each with its previous-scatter buffers), the deferred secondary-GPU scatter,
+// (each with its previous scatter's events), the deferred secondary-GPU scatter,
 // and the pipeline scatter ring.  A recording call must never reach its exit
 // with one non-empty (recorded scatter state is the recording sink's, or the
 // record is refused), so the exit hook reads this before it flushes.
 bool ggml_sycl_cpu_tg_pending_any() {
-    if (!g_cpu_tg_direct_pending_scatter.empty() || g_pending_scatter.active || g_pending_scatter.prev_bufs.pending ||
-        g_pending_scatter_sibling.active || g_pending_scatter_sibling.prev_bufs.pending ||
+    if (!g_cpu_tg_direct_pending_scatter.empty() || g_pending_scatter.active ||
+        !g_pending_scatter.prev_scatter.scatter_events.empty() || g_pending_scatter_sibling.active ||
+        !g_pending_scatter_sibling.prev_scatter.scatter_events.empty() ||
         ggml_sycl_pending_secondary_scatter_active()) {
         return true;
     }
@@ -80324,8 +80381,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         (long) ne12, moe_hybrid_active ? 1 : 0, plan_hybrid ? 1 : 0, cpu_expert_tg_active ? 1 : 0,
                         use_expert_cache ? 1 : 0);
         if (moe_hybrid_with_plan) {
-            // Hybrid dispatch uses host sync (future.get, stream.wait) which
-            // is incompatible with SYCL graph recording.
+            // Not recordable: each token's partition comes from the host ids
+            // readback (itself a blocking copy, illegal while recording), the
+            // CPU jobs are submitted to CpuExpertPool from host code, and pool
+            // spans are reserved per op.  A replay would repeat one token's
+            // routing, and its join host_tasks would wait for jobs nobody
+            // resubmits (llama.cpp-z4kd).
             ctx.moe_graphs_disabled_once = true;
 
             // Selective flush: only flush deferred CPU scatter if the current
@@ -80361,17 +80422,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // bias-less MoE (qwen2moe/qwen3moe/qwen3vlmoe/qwen3next) runs up and
             // then gate with no ADD_ID between, so gate does not consume up's
             // output and would overwrite it, dropping up's host-expert rows
-            // (llama.cpp-3bww).  It is a blocking flush because a no-wait
-            // chain would first need the two protections below to be replaced
-            // (llama.cpp-8k68).  It has to be HERE, ahead of the shared
+            // (llama.cpp-3bww).  The flush does not block (llama.cpp-z4kd): it
+            // enqueues the pending job's join host_task and its H2D on the
+            // in-order queue.  It has to be HERE, ahead of the shared
             // activation D2H, for two reasons:
             //  - the pool ring is disjoint only within one op, so this op's CPU
             //    kernels would write pinned bytes the pending H2D has not read;
-            //    flushing enqueues that H2D first, and the D2H completing
-            //    proves it ran;
+            //    flushing enqueues that H2D first, and this op's job waits (on
+            //    the pool worker) for the D2H, whose completion proves it ran;
             //  - the pending CPU workers read the shared activation staging
             //    buffer directly (task.activations), and this op's D2H rewrites
-            //    it and may reallocate it in ensure().
+            //    it: the D2H runs after the join host_task, so after the job.
+            //    ensure() may also replace the staging; each job retains the
+            //    staging it reads (act_keepalive) until its join.
             // The one exception (llama.cpp-yx28) is decode up after gate: up
             // reuses gate's activation copy, so it does no D2H at all, and its
             // job may then run beside gate's (defer_entry_flush below; the
@@ -80490,9 +80553,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // Copies each entry's src1 row into consecutive act staging rows
             // from act_first_byte, one copy per contiguous source run: the
             // decode down projection's rows are one [n_ff, n_used] block, so
-            // its gather is a single copy (llama.cpp-yx28).
+            // its gather is a single copy (llama.cpp-yx28).  Returns the copy
+            // events; the CPU job waits for them on the pool worker
+            // (llama.cpp-z4kd).
             auto gather_activation_rows = [&](const std::vector<const expert_dispatch_entry *> & rows,
-                                              const ggml_sycl::mem_handle & act_handle, size_t act_first_byte) {
+                                              const ggml_sycl::mem_handle &                      act_handle,
+                                              size_t act_first_byte) -> std::vector<sycl::event> {
                 ggml_sycl_tensor_storage_handle src1_storage{};
                 if (!ggml_sycl_ensure_tensor_storage_handle(src1, ctx.device, &src1_storage,
                                                             "MUL_MAT_ID CPU activation gather", "src1")) {
@@ -80513,15 +80579,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     copy_events.push_back(ggml_sycl::mem_copy_async(act_handle, run.dst_offset, src1_storage.handle,
                                                                     run.src_offset, run.bytes, *stream));
                 }
-                moe_hostpath_wait_timer wait_timer(MOE_WAIT_B4);
-                sycl::event::wait(copy_events);
+                return copy_events;
             };
 
             // act_pregathered: the caller already gathered this dispatch's
-            // per-row activations into its pool slice (gather_activation_rows).
+            // per-row activations into its pool slice (gather_activation_rows);
+            // pregather_events are that gather's copies and pregather_serial the
+            // scatter serial when it was issued (llama.cpp-z4kd).
             auto dispatch_cpu_compute = [&](const std::vector<expert_dispatch_entry> & entries,
-                                            size_t pool_first_entry = pool_entry_npos,
-                                            bool   act_pregathered  = false) -> cpu_dispatch_result {
+                                            size_t pool_first_entry = pool_entry_npos, bool act_pregathered = false,
+                                            const std::vector<sycl::event> & pregather_events =
+                                                std::vector<sycl::event>(),
+                                            uint64_t pregather_serial = 0) -> cpu_dispatch_result {
                 cpu_dispatch_result result;
                 if (entries.empty()) {
                     return result;
@@ -80600,18 +80669,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         from_pool ? 1 : 0, act_pinned ? 1 : 0, out_pinned ? 1 : 0);
                 }
 
-                // The output region is zeroed further down, after the activation wait.  Across
-                // ops the pool is NOT kept disjoint (entry offsets use each op's own K/N, and a
-                // top-K-sized pool restarts at entry 0 every op), so this region can be the
-                // source of an earlier op's scatter H2D.  What makes the write safe is ordering:
+                // The output region is zeroed by the job's prologue on the pool worker, after
+                // the job's input waits (llama.cpp-z4kd).  Across ops the pool is NOT kept
+                // disjoint (entry offsets use each op's own K/N, and a top-K-sized pool restarts
+                // at entry 0 every op), so this region can be the source of an earlier op's
+                // scatter H2D.  What makes the write safe is ordering:
                 //   (1) that op's scatter was flushed -- its H2D enqueued on the in-order
-                //       compute queue -- BEFORE this op's activation D2H was enqueued (the
-                //       op-entry flushes of any pending scatter run ahead of that D2H), and
-                //   (2) the memset and the CPU kernels run only after that D2H completed, and
+                //       compute queue -- BEFORE this op's activation copy was enqueued (the
+                //       op-entry flushes of any pending scatter run ahead of that copy), and
+                //   (2) the memset and the CPU kernels run only after that copy completed, and
                 //       completing an event on an in-order queue completes every earlier
                 //       command, the H2D included.
-                // Within ONE op the hot and cold groups are slices of one reservation and are
-                // disjoint (PinnedBufferPool::reserve).
+                // A scatter flushed AFTER the copy (up after gate's flush, cold after hot's) is
+                // not covered by (2); moe_cpu_job_order_decide says whether the job must also
+                // wait for it, or whether it reads other entries.  Within ONE op the hot and
+                // cold groups are slices of one reservation and are disjoint
+                // (PinnedBufferPool::reserve).
                 const bool zero_out_after_act_wait = from_pool || !out_owner.valid();
 
                 ggml_sycl_tensor_storage_handle src1_storage{};
@@ -80651,37 +80724,37 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     throw ggml_sycl_fallback_error("MUL_MAT_ID CPU dispatch output staging missing smart handle");
                 }
 
-                // D2H copy activations for each expert dispatch.
-                // Optimization: when act_on_host (batch=1), use the shared
-                // activation D2H with event-level wait instead of stream->wait()
-                // to avoid draining the B580 compute pipeline.
-                // Track deferred D2H event — wait is deferred until just before
-                // CPU pool submission to overlap D2H with task struct building.
-                sycl::event act_deferred_evt;
-                bool        act_deferred_pending = false;
+                // D2H copy activations for each expert dispatch.  Nothing here waits: the copy
+                // events go to the job's prologue, which waits for them on the pool worker
+                // (llama.cpp-z4kd).  copy_serial is the scatter serial the copy was issued at.
+                moe_cpu_job_inputs job_inputs;
+                bool               has_activation_copy = true;
+                uint64_t           copy_serial         = g_cpu_scatter_serial;
 
                 if (act_on_host && cpu_shared_act) {
-                    // Use shared activation — defer wait until after task building.
-                    // Tasks will point directly to shared_act_host.
-                    act_deferred_evt     = act_d2h_event;
-                    act_deferred_pending = true;
+                    // The shared activation staging: tasks point directly at shared_act_host,
+                    // and the job keeps the staging alive (ensure() may replace it).
+                    job_inputs.events.push_back(act_d2h_event);
+                    copy_serial          = g_moe_shared_act.record.scatter_serial;
+                    result.act_keepalive = shared_act_handle;
                 } else if (cpu_shared_act && n_cpu > 1) {
                     // Single D2H: all experts share the same activation at offset 0.
-                    // Submit async — wait deferred until just before CPU pool submission
-                    // to overlap D2H with task struct building below.
-                    act_deferred_evt = ggml_sycl::mem_copy_async(
+                    job_inputs.events.push_back(ggml_sycl::mem_copy_async(
                         act_handle, pool_base * static_cast<size_t>(K) * sizeof(float), src1_storage.handle,
-                        src1_storage.view_offset, static_cast<size_t>(K) * sizeof(float), *stream);
-                    act_deferred_pending = true;
+                        src1_storage.view_offset, static_cast<size_t>(K) * sizeof(float), *stream));
                 } else if (!act_pregathered) {
-                    // Per-row activations: coalesced copies, batch-waited
-                    // instead of draining the GPU queue with stream->wait().
+                    // Per-row activations: coalesced copies.
                     std::vector<const expert_dispatch_entry *> rows;
                     rows.reserve(n_cpu);
                     for (const expert_dispatch_entry & entry : entries) {
                         rows.push_back(&entry);
                     }
-                    gather_activation_rows(rows, act_handle, pool_base * static_cast<size_t>(K) * sizeof(float));
+                    job_inputs.events =
+                        gather_activation_rows(rows, act_handle, pool_base * static_cast<size_t>(K) * sizeof(float));
+                } else {
+                    job_inputs.events   = pregather_events;
+                    copy_serial         = pregather_serial;
+                    has_activation_copy = !pregather_events.empty();
                 }
 
                 // Build CPU tasks from mmap host weight pointers.
@@ -80783,46 +80856,76 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     batch_tasks.push_back(std::move(t));
                 }
 
-                // Wait for deferred activation D2H before CPU tasks read it.
-                // This wait was moved here from the D2H submission site above
-                // to overlap the transfer with task struct building.
-                const moe_hostpath_clock::time_point job_wait_t0 = moe_hostpath_wait_begin();
-                if (act_deferred_pending) {
-                    act_deferred_evt.wait();
-                }
-                if (zero_out_after_act_wait) {
-                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));
-                }
                 // Host CPU traits consume the retained host handle only after
                 // its producer event is complete. The lease then moves into
                 // the future-owned task vector through completion.
                 for (const expert_dispatch_entry & entry : entries) {
                     if (entry.has_ready_event) {
-                        sycl::event ready = entry.ready_event;
-                        ready.wait();
+                        job_inputs.events.push_back(entry.ready_event);
                     }
                 }
-                moe_hostpath_wait_end(MOE_WAIT_B2, job_wait_t0);
+
+                // Order this job's pool writes after any earlier scatter H2D that reads the same
+                // entries and that its activation copy does not already order (llama.cpp-z4kd).
+                ggml_sycl::moe_cpu_job_order_request order_req;
+                order_req.op_from_pool           = from_pool;
+                order_req.op_first               = pool_base;
+                order_req.op_count               = n_cpu;
+                order_req.row_k                  = K;
+                order_req.row_n                  = N;
+                order_req.has_activation_copy    = has_activation_copy;
+                order_req.copy_scatter_serial    = copy_serial;
+                order_req.current_scatter_serial = g_cpu_scatter_serial;
+                order_req.flush_from_pool        = g_cpu_scatter_last_flush.from_pool;
+                order_req.flush_first            = g_cpu_scatter_last_flush.first;
+                order_req.flush_count            = g_cpu_scatter_last_flush.count;
+                order_req.flush_row_k            = g_cpu_scatter_last_flush.row_k;
+                order_req.flush_row_n            = g_cpu_scatter_last_flush.row_n;
+                switch (ggml_sycl::moe_cpu_job_order_decide(order_req)) {
+                    case ggml_sycl::MOE_CPU_JOB_ORDER_WAIT_LAST_FLUSH:
+                        job_inputs.events.insert(job_inputs.events.end(), g_cpu_scatter_last_flush.events.begin(),
+                                                 g_cpu_scatter_last_flush.events.end());
+                        break;
+                    case ggml_sycl::MOE_CPU_JOB_ORDER_WAIT_QUEUE:
+                        job_inputs.events.push_back(stream->ext_oneapi_submit_barrier());
+                        break;
+                    default:
+                        break;
+                }
+                if (zero_out_after_act_wait) {
+                    job_inputs.zero_out   = out_pinned;
+                    job_inputs.zero_bytes = n_cpu * static_cast<size_t>(N) * sizeof(float);
+                }
 
                 // Submit to CPU thread pool — move the tasks vector into
                 // the worker so storage outlives every possible caller action.
+                // Every path runs the job's prologue first, on the worker.
+                std::function<void()> job_prologue = moe_cpu_job_prologue(std::move(job_inputs));
                 auto & cpu_pool = g_cpu_expert_pools[ctx.device];
                 if (immutable_host_recipe) {
-                    result.future = std::async(
-                        std::launch::async,
-                        [tasks = std::move(recipe_tasks), workspace_owner = std::move(recipe_workspace_owner)]() mutable {
-                            GGML_UNUSED(workspace_owner);
-                            for (const cpu_moe_host_aos_task & task : tasks) {
-                                ggml_sycl::moe_batch_reject_reason reject;
-                                if (!ggml_sycl_cpu_moe_host_aos_execute(task, &reject)) {
-                                    throw std::runtime_error(ggml_sycl::moe_batch_reject_reason_name(reject));
-                                }
+                    result.future = std::async(std::launch::async, [tasks           = std::move(recipe_tasks),
+                                                                    workspace_owner = std::move(recipe_workspace_owner),
+                                                                    prologue = std::move(job_prologue)]() mutable {
+                        GGML_UNUSED(workspace_owner);
+                        prologue();
+                        for (const cpu_moe_host_aos_task & task : tasks) {
+                            ggml_sycl::moe_batch_reject_reason reject;
+                            if (!ggml_sycl_cpu_moe_host_aos_execute(task, &reject)) {
+                                // The job runs after its MUL_MAT_ID returned, so no caller is left to
+                                // refuse to, and its rows are needed (llama.cpp-93tw, llama.cpp-z4kd).
+                                GGML_ABORT(
+                                    "[CPU-TG] host AOS expert recipe refused: %s; its host-expert rows would be "
+                                    "dropped (llama.cpp-93tw)",
+                                    ggml_sycl::moe_batch_reject_reason_name(reject));
                             }
-                        });
+                        }
+                    });
                 } else if (cpu_pool.is_active()) {
-                    result.future = cpu_pool.submit_batch(std::move(batch_tasks));
+                    result.future = cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue));
                 } else {
-                    result.future = std::async(std::launch::async, [tasks = std::move(batch_tasks)]() mutable {
+                    result.future = std::async(std::launch::async, [tasks    = std::move(batch_tasks),
+                                                                    prologue = std::move(job_prologue)]() mutable {
+                        prologue();
                         ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
                     });
                 }
@@ -80890,6 +80993,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 g_pending_scatter.out_handle    = std::move(r.out_handle);
                 g_pending_scatter.act_handle    = std::move(r.act_handle);
                 g_pending_scatter.weight_handle = {};
+                g_pending_scatter.act_keepalive = std::move(r.act_keepalive);
                 g_pending_scatter.stream        = stream;
                 g_pending_scatter.sycl_ctx      = stream->get_context();
                 g_pending_scatter.device_id     = r.device_id;
@@ -80910,12 +81014,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // Synchronous dispatch + scatter setup: used by the sequential
             // (PP) path and the hot/cold deferral path.
             auto dispatch_cpu_and_scatter = [&](const std::vector<expert_dispatch_entry> & entries,
-                                                size_t pool_first_entry = pool_entry_npos,
-                                                bool   act_pregathered  = false) {
+                                                size_t pool_first_entry = pool_entry_npos, bool act_pregathered = false,
+                                                const std::vector<sycl::event> & pregather_events =
+                                                    std::vector<sycl::event>(),
+                                                uint64_t pregather_serial = 0) {
                 if (entries.empty()) {
                     return;
                 }
-                auto r = dispatch_cpu_compute(entries, pool_first_entry, act_pregathered);
+                auto r = dispatch_cpu_compute(entries, pool_first_entry, act_pregathered, pregather_events,
+                                              pregather_serial);
                 // A non-empty dispatch always yields a valid result or aborts inside; an invalid one
                 // here would be dropped by apply_cpu_result_to_scatter (llama.cpp-93tw).
                 GGML_ASSERT(r.valid &&
@@ -81658,6 +81765,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // pool, so gather them in one pass (one copy for the
                     // decode down projection) before either dispatch.
                     const bool   pregather  = split_needs_pool && !cpu_shared_act;
+                    std::vector<sycl::event> pregather_events;
+                    const uint64_t           pregather_serial = g_cpu_scatter_serial;
                     if (pregather) {
                         std::vector<const expert_dispatch_entry *> rows;
                         rows.reserve(n_cpu_entries);
@@ -81667,22 +81776,26 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         for (const expert_dispatch_entry & e : cold_entries) {
                             rows.push_back(&e);
                         }
-                        gather_activation_rows(rows, hc_pool.act_handle(),
-                                               hot_first * static_cast<size_t>(K) * sizeof(float));
+                        pregather_events = gather_activation_rows(rows, hc_pool.act_handle(),
+                                                                  hot_first * static_cast<size_t>(K) * sizeof(float));
                     }
+                    // The hot flush enqueues hot's join and scatter; it does not wait for the hot
+                    // job (llama.cpp-z4kd), so hot and cold run side by side on the pool.  The B4b
+                    // context stays so that a wait brought back into this flush counts as the hot join.
                     if (!hot_entries.empty()) {
-                        dispatch_cpu_and_scatter(hot_entries, hot_first, pregather);
+                        dispatch_cpu_and_scatter(hot_entries, hot_first, pregather, pregather_events, pregather_serial);
                         moe_hostpath_wait_context hot_join(MOE_WAIT_B4B);
                         flush_pending_cpu_scatter();
                     }
-                    dispatch_cpu_and_scatter(cold_entries, cold_first, pregather);
+                    dispatch_cpu_and_scatter(cold_entries, cold_first, pregather, pregather_events, pregather_serial);
                 }
             };
 
             // TG path: the CPU job is issued at the join below, on this
-            // thread, after the GPU0 submissions. dispatch_cpu_compute only
-            // waits the activation copy submitted above and hands the tasks to
-            // the persistent CpuExpertPool, so no OS thread is spawned per op
+            // thread, after the GPU0 submissions. dispatch_cpu_compute waits
+            // nothing: it hands the tasks to the persistent CpuExpertPool with
+            // a prologue that waits the activation copy on the pool worker
+            // (llama.cpp-z4kd), so no OS thread is spawned per op
             // (llama.cpp-yx28).
 
             // ----- GPU0 path (B580): batched MMVQ dispatch -----
@@ -81887,7 +82000,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (defer_entry_flush) {
                     // Gate's job is still pending (see the op-entry flush). Issue
                     // up's beside it when their pool spans and the activation
-                    // staging allow it; otherwise join gate now.
+                    // staging allow it; otherwise flush gate now, which queues
+                    // its join and does not wait for it (llama.cpp-z4kd).
                     auto &                      sib_pool   = g_pinned_buffer_pools[ctx.device];
                     const size_t                n_cpu_rows = cpu_entries.size();
                     const bool                  op_pool    = sib_pool.can_serve(n_cpu_rows) && !immutable_host_recipe;
@@ -81914,13 +82028,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             GGML_ASSERT(cpu_pool_first == keep.op_first);
                         }
                     } else {
-                        flush_pending_cpu_scatter();
                         // This op made no activation copy, so nothing orders the
-                        // scatter just enqueued ahead of this op's writes to its
-                        // pool entries: wait for that scatter itself.
-                        moe_hostpath_wait_timer wait_timer(MOE_WAIT_B6);
-                        sycl::event::wait(g_pending_scatter_sibling.prev_bufs.scatter_events);
-                        sycl::event::wait(g_pending_scatter.prev_bufs.scatter_events);
+                        // scatter enqueued here ahead of this op's writes to its
+                        // pool entries.  dispatch_cpu_compute sees the scatter
+                        // serial move past the copy's and makes the job wait
+                        // for that scatter on the pool worker when the entries
+                        // overlap (llama.cpp-z4kd).
+                        flush_pending_cpu_scatter();
                     }
                 }
                 auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);
@@ -87055,8 +87169,9 @@ static void ggml_sycl_attn_host_cpu_backend_free() {
 // MoE dispatch already proves in production: submit without waiting, defer
 // the join to the point a real consumer needs the result (or graph end),
 // and let the input-side D2H join happen INSIDE the worker thread instead
-// of on the submitting thread (mirrors act_deferred_evt/act_deferred_pending,
-// ~70378-70393/70517-70520).
+// of on the submitting thread (the same shape as the MoE host path, whose
+// moe_cpu_job_prologue waits a CPU job's input events on the pool worker,
+// llama.cpp-z4kd).
 //
 // A SEPARATE pending slot from g_pending_scatter
 // (owner ruling 2026-08-27, llama.cpp-sbky): two independent producers
@@ -87098,9 +87213,9 @@ struct pending_attn_dispatch {
 // it has been flushed. The stale slot exists because flush's own H2D
 // publish (below) is submitted async and deliberately not waited on -- the
 // backing dst_handle must not be released while that DMA could still be
-// reading it. Releasing it one dispatch (or one graph boundary) later
-// mirrors g_pending_scatter's prev_bufs deferred-release pattern
-// (~20105-20135), the same problem MoE's own async scatter already solved.
+// reading it. Releasing it one dispatch (or one graph boundary) later keeps
+// it alive past that DMA. The MoE CPU scatter meets the same need by
+// retaining its buffers until its copies' events (retain_handles_until_event).
 // rev-2gag S2: these are thread_local while g_attn_host_staging is
 // process-global -- the "one dispatch in flight per device" invariant that
 // makes slot reuse safe is enforced per-thread against a per-process
@@ -87312,9 +87427,10 @@ static bool ggml_sycl_dispatch_host_flash_attn_async(ggml_backend_sycl_context &
     // D2H: capture the events but do NOT wait here -- the wait is deferred
     // to immediately before the CPU task actually reads the data, INSIDE
     // the worker thread below, so GPU submission for other graph regions
-    // in between is never blocked by it. Mirrors act_deferred_evt/
-    // act_deferred_pending (~70378-70393, 70517-70520). K/V need no copy or
-    // event -- already pinned host memory.
+    // in between is never blocked by it. The MoE host path waits a CPU job's
+    // input events the same way, in moe_cpu_job_prologue on the pool worker
+    // (llama.cpp-z4kd). K/V need no copy or event -- already pinned host
+    // memory.
     sycl::event q_evt = ggml_sycl::mem_copy_ptr_async(q_ptr, q_src->data, q_bytes, q_dev);
     sycl::event mask_evt;
     bool        have_mask_evt = false;
@@ -97671,15 +97787,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // wait() blocks until ready but leaves the future valid() with the
     // lambda's captured task vector alive.  If the next graph has no
     // MUL_MAT_ID (so flush_pending_cpu_scatter is never called), the lambda
-    // would linger with stale weight_host
-    // pointers until thread exit.  Reset after wait to consume.
+    // would linger with stale weight_host pointers until thread exit, so an
+    // inactive slot's future is reset after the wait.  An active slot keeps
+    // its future: its flush joins the job through it on the queue and
+    // refuses a slot without one, which would otherwise drop its rows
+    // (llama.cpp-z4kd).
     if (g_pending_scatter_sibling.future.valid()) {
         try {
             moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
             g_pending_scatter_sibling.future.wait();
         } catch (...) {
         }
-        g_pending_scatter_sibling.future = {};
+        if (!g_pending_scatter_sibling.active) {
+            g_pending_scatter_sibling.future = {};
+        }
     }
     if (g_pending_scatter.future.valid()) {
         try {
@@ -97687,7 +97808,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             g_pending_scatter.future.wait();
         } catch (...) {
         }
-        g_pending_scatter.future = {};
+        if (!g_pending_scatter.active) {
+            g_pending_scatter.future = {};
+        }
     }
     // TKV-13 (B2) final increment: unconditional graph-boundary drain for
     // the attention pending slot, mirroring the two drains immediately

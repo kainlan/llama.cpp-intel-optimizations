@@ -56,24 +56,33 @@ scatter events and was rejected for that reason).  It is DISJOINT REGIONS:
      hot then cold rows once, at the start of that span, and both dispatches skip their own
      gather (llama.cpp-yx28);
   8. the out-region memset is not before the activation D2H wait (that wait, on the
-     in-order queue, is what proves an earlier scatter's H2D from this region has run);
+     in-order queue, is what proves an earlier scatter's H2D from this region has run).
+     Since llama.cpp-z4kd both run on the pool worker, in the job's prologue, not on the
+     submitting thread;
   9. no host wait is (re)introduced in do_cpu_dispatch;
  10. CROSS-OP safety is by ORDERING, not by the ring (entry offsets scale with each op's own K/N
-     and a top-K pool restarts at entry 0, so different ops DO alias).  Three premises are pinned:
-     the deferred activation wait is exactly `if (act_deferred_pending) { act_deferred_evt.wait(); }`
-     (pin W1: with an extra conjunct such as n_cpu > 1 the memset and the CPU read run before the
-     D2H lands); the memset is the very next statement after it at the same nesting level (pin W2:
-     it follows the wait in control flow, not only in the text); and the op-entry flushes --
+     and a top-K pool restarts at entry 0, so different ops DO alias).  The premises pinned since
+     llama.cpp-z4kd moved the waits off the submitting thread: the job's prologue
+     (moe_cpu_job_wait_inputs) waits every input event and only then zeroes the out region, and
+     dispatch_cpu_compute zeroes nothing itself (pin W1: with an extra conjunct on the wait, or the
+     memset first, the zeroing and the CPU read run before the D2H lands); every job form -- the
+     CpuExpertPool worker and both std::async forms -- runs that prologue before its kernel (pin W2);
+     every activation-copy branch hands its copy events, and every lease producer its ready event,
+     to the prologue, unconditionally (pin W4); a scatter flushed AFTER the copy is ordered by
+     moe_cpu_job_order_decide, whose WAIT_LAST_FLUSH / WAIT_QUEUE answers add the last flush's events
+     or a queue barrier to the job's inputs (pin O1); and the op-entry flushes --
      flush_pending_cpu_scatter_if_consumed, then flush_pending_cpu_scatter -- precede the shared
      activation D2H (pins F1/F3: the earlier scatter's H2D must be enqueued before this op's D2H;
      F2 pinned the opt-in pipeline slot's flush between them, and that slot was removed by
      llama.cpp-z4kd).  Three more pins
      close the ways a pinned statement can be present and still not run: W3 (the memset's guard is
-     defined exactly once as `from_pool || !out_owner.valid()`, so `= false` cannot drop the zeroing),
-     and, for W2, F1 and F3, a structural test of each pinned statement -- it follows a statement or
+     defined exactly once as `from_pool || !out_owner.valid()`, so `= false` cannot drop the zeroing,
+     and the zeroing request it guards covers all n_cpu * N floats),
+     and, for W2, W3, O1, F1 and F3, a structural test of each pinned statement -- it follows a statement or
      block boundary (`;`, `{`, `}`), so it is not the body of an `if (...)`/`else`/loop header, and
-     the innermost block that holds it is the expected one (the lambda body for the wait+memset pair,
-     `if (moe_hybrid_with_plan)` for the three flushes), so it is not wrapped in a block of its own.
+     the innermost block that holds it is the expected one (the lambda body for the prologue, the
+     zeroing request and the order decision, `if (moe_hybrid_with_plan)` for the three flushes), so
+     it is not wrapped in a block of its own.
      These are TEXTUAL and STRUCTURAL pins (brace and statement adjacency), not control-flow analysis:
      a conditional hidden behind a macro or a helper function, or an early `return` above the
      statement, is outside what they can see.
@@ -102,8 +111,10 @@ scatter events and was rejected for that reason).  It is DISJOINT REGIONS:
      join, ahead of dispatch_cpu_compute's pool writes: J1, the deferred path asks
      moe_sibling_pending_keep, which refuses unless the staging serial is unchanged and, when both
      sides use the pool, their spans are disjoint; on keep, gate's job moves to the sibling slot.
-     J2, otherwise gate is flushed and both slots' scatter_events are waited before the
-     dispatch_cpu_compute call that writes up's pool entries.  J3, every flush drains the older
+     J2, otherwise gate is flushed before the dispatch_cpu_compute call that writes up's pool
+     entries.  Until llama.cpp-z4kd the join then waited both slots' scatter_events on the host;
+     now the flush only enqueues, and up's order decision (O1) sees the scatter serial move past its
+     copy's and makes up's job wait for gate's scatter on the pool worker when the spans overlap.  J3, every flush drains the older
      (sibling) slot first, and a consumed slot of either kind flushes both.  A1 is unchanged and
      still makes an unflushed primary slot at apply time an abort.
 
@@ -242,7 +253,8 @@ def require_unconditional(text: str, pos: int, *, header: str | None, pin: str, 
         )
 
 
-def check(backend_src: str, pool_src: str | None = None, hostpath_src: str | None = None) -> None:
+def check(backend_src: str, pool_src: str | None = None, hostpath_src: str | None = None,
+          expert_pool_src: str | None = None) -> None:
     code = blank_comments(backend_src)
     hostpath_src = hostpath_src if hostpath_src is not None else HOSTPATH_HPP.read_text()
 
@@ -292,7 +304,7 @@ def check(backend_src: str, pool_src: str | None = None, hostpath_src: str | Non
     if not re.search(
         r"\} else if \(!act_pregathered\) \{ std::vector<const expert_dispatch_entry \*> rows; rows\.reserve\(n_cpu\); "
         r"for \(const expert_dispatch_entry & entry : entries\) \{ rows\.push_back\(&entry\); \} "
-        r"gather_activation_rows\(rows, act_handle, pool_base \* static_cast<size_t>\(K\) \* sizeof\(float\)\); \}",
+        r"job_inputs\.events = gather_activation_rows\(rows, act_handle, pool_base \* static_cast<size_t>\(K\) \* sizeof\(float\)\); \}",
         body,
     ):
         raise ContractError(
@@ -301,7 +313,7 @@ def check(backend_src: str, pool_src: str | None = None, hostpath_src: str | Non
         )
     check_gather(code, lam_at, hostpath_src)
 
-    check_hot_cold(code, hostpath_src)
+    check_hot_cold(code, hostpath_src, expert_pool_src if expert_pool_src is not None else EXPERT_POOL_CPP.read_text())
     check_pending_scatter(code)
     check_pool_ring(pool_src if pool_src is not None else POOL_CPP.read_text(), hostpath_src)
 
@@ -343,6 +355,10 @@ def check_gather(code: str, lam_at: int, hostpath_src: str) -> None:
 
 DISPATCH_MARKER = "auto do_cpu_dispatch = [&]("
 POOL_CPP = ROOT / "ggml/src/ggml-sycl/pinned-buffer-pool.cpp"
+EXPERT_POOL_CPP = ROOT / "ggml/src/ggml-sycl/cpu-expert-pool.cpp"
+WAIT_INPUTS_DEF = "static void moe_cpu_job_wait_inputs(const moe_cpu_job_inputs & inputs) "
+PROLOGUE_DEF = "static std::function<void()> moe_cpu_job_prologue(moe_cpu_job_inputs inputs) "
+SLOT_FLUSH_DEF = "static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) "
 
 
 def check_pool_ring(pool_src: str, hostpath_src: str) -> None:
@@ -473,16 +489,13 @@ def check_sibling_join(code: str, hostpath_src: str | None = None) -> None:
             "require equal geometry and disjoint pool spans. A changed predicate could keep a job that reads "
             "rewritten staging or shares pool bytes with this op (llama.cpp-yx28)"
         )
-    if not re.search(
-        r"\} else \{ flush_pending_cpu_scatter\(\); (?:moe_hostpath_wait_timer \w+\(MOE_WAIT_B6\); )?"
-        r"sycl::event::wait\(g_pending_scatter_sibling\.prev_bufs\.scatter_events\); "
-        r"sycl::event::wait\(g_pending_scatter\.prev_bufs\.scatter_events\); \} \}$",
-        block,
-    ) or not tail.startswith("auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);"):
+    if not re.search(r"\} else \{ flush_pending_cpu_scatter\(\); \} \}$", block) \
+            or not tail.startswith("auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);"):
         raise ContractError(
-            "FAIL [pin J2]: when gate is not kept, the join does not flush it and wait both slots' scatter_events "
-            "before the dispatch_cpu_compute call that writes this op's pool entries; this op made no activation "
-            "copy, so nothing else orders that scatter ahead of the writes (llama.cpp-yx28)"
+            "FAIL [pin J2]: when gate is not kept, the join does not flush it (enqueue its join and scatter, no "
+            "host wait) before the dispatch_cpu_compute call that writes this op's pool entries; that call's order "
+            "decision (pin O1) is what makes the job wait for the flushed scatter when the entries overlap "
+            "(llama.cpp-yx28, llama.cpp-z4kd)"
         )
     drain = squash(brace_block_from(code, code.find("static void flush_pending_cpu_scatter() ")))
     consumed_at = code.find("static bool flush_pending_cpu_scatter_if_consumed(")
@@ -496,7 +509,7 @@ def check_sibling_join(code: str, hostpath_src: str | None = None) -> None:
         )
 
 
-def check_hot_cold(code: str, hostpath_src: str | None = None) -> None:
+def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: str = "") -> None:
     lam_at = code.find(LAMBDA_MARKER)
     lam = squash(brace_block_from(code, lam_at))
     head = squash(code[lam_at : code.find("{", lam_at)])
@@ -517,42 +530,161 @@ def check_hot_cold(code: str, hostpath_src: str | None = None) -> None:
         if needle not in lam:
             raise ContractError(f"FAIL [pin R2]: dispatch_cpu_compute: {why} (llama.cpp-4hg7)")
 
-    # 8. (I2) the deferred activation wait and the memset that depends on it.
-    #    The wait runs whenever the D2H is pending -- no extra conjunct: with n_cpu == 1 the memset
-    #    and the CPU read would otherwise race the D2H.  The memset is the very next statement at
-    #    the same nesting level, so it follows the wait in control flow, not only in the text.
-    memsets = [m.start() for m in re.finditer(r"std::memset\(\s*out_pinned\b", lam)]
-    if len(memsets) != 1:
-        raise ContractError("FAIL [pin W1]: the out-region memset must occur exactly once in dispatch_cpu_compute (llama.cpp-4hg7)")
-    if "if (act_deferred_pending) { act_deferred_evt.wait(); }" not in lam:
+    # 8. (I2, llama.cpp-z4kd) the job's input waits and the out-region memset that depends on them run
+    #    on the pool worker, in the job's prologue, never on the submitting thread.  W1: the prologue
+    #    waits every input event and only then zeroes, and dispatch_cpu_compute never zeroes the region
+    #    itself.  W2: every way the job can run (pool worker, recipe std::async, inactive-pool std::async)
+    #    runs the prologue before the kernel.  W3: the zeroing is requested on every path that needs it.
+    #    W4: every activation-copy branch hands its copy events to the prologue, unconditionally.
+    def one_body(sig: str, pin: str) -> str:
+        if code.count(sig) != 1:
+            raise ContractError(f"FAIL [pin {pin}]: `{sig.strip()}` is not defined exactly once -- renamed or moved? (llama.cpp-z4kd)")
+        return squash(brace_block_from(code, code.find(sig)))
+
+    wait_body = one_body(WAIT_INPUTS_DEF, "W1")
+    if wait_body != ("{ if (!inputs.events.empty()) { sycl::event::wait(inputs.events); } "
+                     "if (inputs.zero_out && inputs.zero_bytes > 0) { std::memset(inputs.zero_out, 0, inputs.zero_bytes); } }"):
         raise ContractError(
-            "FAIL [pin W1]: the deferred activation wait is not exactly `if (act_deferred_pending) { "
-            "act_deferred_evt.wait(); }` -- an extra conjunct (e.g. n_cpu > 1) lets the memset and the CPU "
-            "read run before the D2H lands (llama.cpp-4hg7)"
+            "FAIL [pin W1]: moe_cpu_job_wait_inputs is not exactly `wait every input event, then zero the output "
+            "span`; zeroing before the activation copy lands can clear a region an earlier scatter's H2D has not "
+            "read yet (llama.cpp-4hg7, llama.cpp-z4kd)"
         )
-    if not re.search(
-        r"if \(act_deferred_pending\) \{ act_deferred_evt\.wait\(\); \} "
-        r"if \(zero_out_after_act_wait\) \{ std::memset\(out_pinned, 0, n_cpu \* static_cast<size_t>\(N\) \* sizeof\(float\)\); \}",
-        lam,
-    ):
+    if one_body(PROLOGUE_DEF, "W1") != "{ return [inputs = std::move(inputs)]() { moe_cpu_job_wait_inputs(inputs); }; }":
         raise ContractError(
-            "FAIL [pin W2]: the out-region memset is not the statement that directly follows the activation "
-            "wait at the same nesting level; before it, or under a condition that skips it, it can zero a "
-            "region an earlier scatter's H2D has not read yet (llama.cpp-4hg7)"
+            "FAIL [pin W1]: moe_cpu_job_prologue is not exactly a closure that runs moe_cpu_job_wait_inputs; the "
+            "job's input waits would not run, or would run on the submitting thread (llama.cpp-z4kd)"
+        )
+    if re.search(r"std::memset\(", lam):
+        raise ContractError(
+            "FAIL [pin W1]: dispatch_cpu_compute zeroes memory itself; the out region is zeroed only by the job's "
+            "prologue, after the job's input events (llama.cpp-4hg7, llama.cpp-z4kd)"
         )
 
-    # The guard of that memset is a one-line definition; `= false` would silently drop the zeroing
-    # while every textual neighbour (W1/W2) still matches.
+    prologue_def = "std::function<void()> job_prologue = moe_cpu_job_prologue(std::move(job_inputs));"
+    submits = (
+        "prologue = std::move(job_prologue)]() mutable { GGML_UNUSED(workspace_owner); prologue(); "
+        "for (const cpu_moe_host_aos_task & task : tasks) {",
+        "result.future = cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue));",
+        "prologue = std::move(job_prologue)]() mutable { prologue(); "
+        "ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size())); }",
+    )
+    if lam.count(prologue_def) != 1 or lam.count("result.future = ") != 3 or any(lam.count(n) != 1 for n in submits):
+        raise ContractError(
+            "FAIL [pin W2]: dispatch_cpu_compute does not build one job prologue and hand it to each of its three "
+            "job forms (recipe std::async, CpuExpertPool::submit_batch, inactive-pool std::async), each running it "
+            "before the kernel (llama.cpp-z4kd)"
+        )
+    require_unconditional(lam, lam.find(prologue_def), header=None, pin="W2", what="the job prologue")
+    ep = squash(blank_comments(expert_pool_src))
+    push = "work_queue_.push([tasks = std::move(tasks), prologue = std::move(prologue), promise, trace, t_submit]() mutable {"
+    push_at = ep.find(push)
+    worker = ep[push_at : ep.find("promise->set_value(); });", push_at)] if push_at >= 0 else ""
+    run_prologue = "if (prologue) { prologue(); }"
+    kernel = "ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));"
+    if (ep.count(push) != 1 or worker.count(run_prologue) != 1 or worker.count(kernel) != 1
+            or worker.find(run_prologue) > worker.find(kernel)):
+        raise ContractError(
+            "FAIL [pin W2]: the CpuExpertPool worker does not run the batch's prologue before the kernel "
+            "(llama.cpp-z4kd)"
+        )
+    worker_body = worker[worker.find("{"):] + "}"
+    require_unconditional(worker_body, worker_body.find(run_prologue), header=None, pin="W2",
+                          what="the pool worker's prologue call")
+
+    # The guard of the zeroing is a one-line definition; `= false` would silently drop it.
     if lam.count("const bool zero_out_after_act_wait = from_pool || !out_owner.valid();") != 1:
         raise ContractError(
             "FAIL [pin W3]: zero_out_after_act_wait is not defined exactly once as `from_pool || "
             "!out_owner.valid()` in dispatch_cpu_compute; the memset it guards is the zeroing of a region the "
             "CPU kernels accumulate into (llama.cpp-4hg7)"
         )
-    # W2, structural half: the wait+memset pair is a direct statement of the lambda body -- not under an
-    # `if (...)`, an `else`, or a block of its own.
-    require_unconditional(lam, lam.find("if (act_deferred_pending) { act_deferred_evt.wait(); }"),
-                          header=None, pin="W2", what="the activation wait + out-region memset pair")
+    zero_req = ("if (zero_out_after_act_wait) { job_inputs.zero_out = out_pinned; "
+                "job_inputs.zero_bytes = n_cpu * static_cast<size_t>(N) * sizeof(float); }")
+    if lam.count(zero_req) != 1 or lam.find(zero_req) > lam.find(prologue_def):
+        raise ContractError(
+            "FAIL [pin W3]: the job is not asked to zero all n_cpu * N floats of its out region exactly when "
+            "zero_out_after_act_wait holds, before its prologue is built (llama.cpp-4hg7, llama.cpp-z4kd)"
+        )
+    require_unconditional(lam, lam.find(zero_req), header=None, pin="W3", what="the out-region zeroing request")
+
+    shared = ("if (act_on_host && cpu_shared_act) { job_inputs.events.push_back(act_d2h_event); "
+              "copy_serial = g_moe_shared_act.record.scatter_serial; result.act_keepalive = shared_act_handle; }")
+    single = ("} else if (cpu_shared_act && n_cpu > 1) { job_inputs.events.push_back(ggml_sycl::mem_copy_async("
+              "act_handle, pool_base * static_cast<size_t>(K) * sizeof(float), src1_storage.handle, "
+              "src1_storage.view_offset, static_cast<size_t>(K) * sizeof(float), *stream)); }")
+    pregathered = ("} else { job_inputs.events = pregather_events; copy_serial = pregather_serial; "
+                   "has_activation_copy = !pregather_events.empty(); }")
+    lease = "if (entry.has_ready_event) { job_inputs.events.push_back(entry.ready_event); }"
+    if (lam.count("moe_cpu_job_inputs job_inputs;") != 1 or any(lam.count(n) != 1 for n in (shared, single, pregathered, lease))
+            or lam.count("job_inputs.events = ") != 2):
+        raise ContractError(
+            "FAIL [pin W4]: not every activation-copy branch hands its copy events to the job's prologue (shared "
+            "staging, single D2H, per-row gather, pregathered rows), with the copy's scatter serial, plus every "
+            "lease producer event; or a later assignment overwrites them.  A job that does not wait its copy reads "
+            "and zeroes before the D2H lands (llama.cpp-4hg7, llama.cpp-z4kd)"
+        )
+
+    # O1 (llama.cpp-z4kd): a scatter flushed AFTER this job's activation copy is not ordered by that copy.
+    # The job asks moe_cpu_job_order_decide (moe-decode-hostpath.hpp, behaviour pinned by
+    # test-sycl-moe-decode-hostpath) and adds the last flush's events, or a queue barrier, to its inputs.
+    order_fields = (
+        "uint64_t copy_serial = g_cpu_scatter_serial;",
+        "bool has_activation_copy = true;",
+        "order_req.op_from_pool = from_pool;",
+        "order_req.op_first = pool_base;",
+        "order_req.op_count = n_cpu;",
+        "order_req.row_k = K;",
+        "order_req.row_n = N;",
+        "order_req.has_activation_copy = has_activation_copy;",
+        "order_req.copy_scatter_serial = copy_serial;",
+        "order_req.current_scatter_serial = g_cpu_scatter_serial;",
+        "order_req.flush_from_pool = g_cpu_scatter_last_flush.from_pool;",
+        "order_req.flush_first = g_cpu_scatter_last_flush.first;",
+        "order_req.flush_count = g_cpu_scatter_last_flush.count;",
+        "order_req.flush_row_k = g_cpu_scatter_last_flush.row_k;",
+        "order_req.flush_row_n = g_cpu_scatter_last_flush.row_n;",
+    )
+    for needle in order_fields:
+        if lam.count(needle) != 1:
+            raise ContractError(f"FAIL [pin O1]: dispatch_cpu_compute no longer builds its order request with `{needle}` (llama.cpp-z4kd)")
+    switch = ("switch (ggml_sycl::moe_cpu_job_order_decide(order_req)) { "
+              "case ggml_sycl::MOE_CPU_JOB_ORDER_WAIT_LAST_FLUSH: job_inputs.events.insert(job_inputs.events.end(), "
+              "g_cpu_scatter_last_flush.events.begin(), g_cpu_scatter_last_flush.events.end()); break; "
+              "case ggml_sycl::MOE_CPU_JOB_ORDER_WAIT_QUEUE: job_inputs.events.push_back(stream->ext_oneapi_submit_barrier()); "
+              "break; default: break; }")
+    sw_at = lam.find(switch)
+    if lam.count(switch) != 1 or sw_at > lam.find(prologue_def) or sw_at < lam.find(lease):
+        raise ContractError(
+            "FAIL [pin O1]: the job does not add the last flush's events (WAIT_LAST_FLUSH) or a queue barrier "
+            "(WAIT_QUEUE) to its inputs, after its copy and lease events and before its prologue is built; its pool "
+            "writes could overtake an earlier scatter H2D that reads the same entries (llama.cpp-z4kd)"
+        )
+    require_unconditional(lam, sw_at, header=None, pin="O1", what="the job order decision")
+    sq_code = squash(code)
+    flush = one_body(SLOT_FLUSH_DEF, "O1")
+    recorded = (
+        "g_cpu_scatter_last_flush.events = ws.events;",
+        "g_cpu_scatter_last_flush.from_pool = slot.from_pool;",
+        "g_cpu_scatter_last_flush.first = slot.pool_first;",
+        "g_cpu_scatter_last_flush.count = slot.pool_count;",
+        "g_cpu_scatter_last_flush.row_k = slot.row_k;",
+        "g_cpu_scatter_last_flush.row_n = slot.row_n;",
+    )
+    # A flush that takes its partner along (llama.cpp-cre6) counts as one flush per slot, so the serial
+    # advances once per group member, unconditionally, ahead of everything that can throw.
+    serial_advance = "for (int k = 0; k < n_group; ++k) { ++g_cpu_scatter_serial; }"
+    advance_at = flush.find(serial_advance)
+    if (not flush.startswith("{ if (!slot.active) { return; }")
+            or flush.count(serial_advance) != 1 or advance_at > flush.find("try {")
+            or flush.count("const int n_group = partner ? 2 : 1;") != 1
+            or any(flush.count(n) != 1 for n in recorded)
+            or sq_code.count("record.scatter_serial = g_cpu_scatter_serial;") != 1):
+        raise ContractError(
+            "FAIL [pin O1]: a scatter flush no longer advances g_cpu_scatter_serial and records its events, span "
+            "and geometry as the last flush, or the shared activation copy no longer records the serial it was "
+            "issued at; the order decision would read stale facts (llama.cpp-z4kd)"
+        )
+    require_unconditional(flush, advance_at, header=None, pin="O1", what="the flush's serial advance")
 
     # 9. (I2) the flushes that make the ordering argument true come before the shared D2H.
     entry_marker = '"[MoE-HYBRID] ne12=%ld hybrid_active=%d plan_hybrid=%d cpu_tg=%d expert_cache=%d\\n"'
@@ -623,13 +755,16 @@ def check_hot_cold(code: str, hostpath_src: str | None = None) -> None:
         # llama.cpp-yx28: per-slot rows of both groups are gathered once, hot then cold, at the span's
         # start, so cold's rows land at cold_first; both dispatches are told they are pregathered.
         "const bool pregather = split_needs_pool && !cpu_shared_act;",
+        # llama.cpp-z4kd: the gather's events and the scatter serial it was issued at go to both jobs'
+        # prologues instead of a host wait.
+        "std::vector<sycl::event> pregather_events; const uint64_t pregather_serial = g_cpu_scatter_serial;",
         "if (pregather) { std::vector<const expert_dispatch_entry *> rows; rows.reserve(n_cpu_entries); "
         "for (const expert_dispatch_entry & e : hot_entries) { rows.push_back(&e); } "
         "for (const expert_dispatch_entry & e : cold_entries) { rows.push_back(&e); } "
-        "gather_activation_rows(rows, hc_pool.act_handle(), hot_first * static_cast<size_t>(K) * sizeof(float)); }",
-        "dispatch_cpu_and_scatter(hot_entries, hot_first, pregather)",
+        "pregather_events = gather_activation_rows(rows, hc_pool.act_handle(), hot_first * static_cast<size_t>(K) * sizeof(float)); }",
+        "dispatch_cpu_and_scatter(hot_entries, hot_first, pregather, pregather_events, pregather_serial);",
         "flush_pending_cpu_scatter()",
-        "dispatch_cpu_and_scatter(cold_entries, cold_first, pregather)",
+        "dispatch_cpu_and_scatter(cold_entries, cold_first, pregather, pregather_events, pregather_serial);",
     ]
     at = -1
     for needle in order:
@@ -643,7 +778,7 @@ def check_hot_cold(code: str, hostpath_src: str | None = None) -> None:
         at = nxt
 
     # 10. no host wait of any kind in the split.
-    if re.search(r"event::wait|\.wait\(\)|wait_prev_scatter_events|stream->wait|wait_and_throw", body):
+    if re.search(r"event::wait|\.wait\(\)|pending_cpu_scatter_wait_prev_events|stream->wait|wait_and_throw", body):
         raise ContractError("FAIL [pin S4]: do_cpu_dispatch waits on the host; the hot/cold hazard is closed by disjoint regions, not a wait (llama.cpp-4hg7)")
 
 
@@ -651,19 +786,21 @@ def self_test(backend_src: str) -> int:
     failures: list[str] = []
     pool_src = POOL_CPP.read_text()
     hostpath_src = HOSTPATH_HPP.read_text()
+    expert_pool_src = EXPERT_POOL_CPP.read_text()
     n_mutants = 0
 
     def expect_fail(name: str, mutated: str, mutated_pool: str | None = None, pin: str | None = None,
-                    mutated_hostpath: str | None = None) -> None:
+                    mutated_hostpath: str | None = None, mutated_expert_pool: str | None = None) -> None:
         nonlocal n_mutants
         n_mutants += 1
         if mutated == backend_src and (mutated_pool is None or mutated_pool == pool_src) and (
-                mutated_hostpath is None or mutated_hostpath == hostpath_src):
+                mutated_hostpath is None or mutated_hostpath == hostpath_src) and (
+                mutated_expert_pool is None or mutated_expert_pool == expert_pool_src):
             failures.append(f"{name}: mutation did not change the source (anchor stale)")
             print(f"  mutant {name}: NOT APPLIED")
             return
         try:
-            check(mutated, mutated_pool, mutated_hostpath)
+            check(mutated, mutated_pool, mutated_hostpath, mutated_expert_pool)
         except ContractError as e:
             if pin is not None and f"[pin {pin}]" not in str(e):
                 failures.append(f"{name}: failed, but not on pin {pin}: {str(e)[:120]}")
@@ -721,7 +858,7 @@ def self_test(backend_src: str) -> int:
                                               "const size_t cold_first = hot_first;",
                                               in_lambda=False, after=DISPATCH_MARKER), None, "S3")
     # m11: the hot group is not handed its slice (it would reserve its own and the cold one overlaps).
-    expect_fail("hot-not-given-slice", sub("dispatch_cpu_and_scatter(hot_entries, hot_first, pregather);",
+    expect_fail("hot-not-given-slice", sub("dispatch_cpu_and_scatter(hot_entries, hot_first, pregather, pregather_events, pregather_serial);",
                                            "dispatch_cpu_and_scatter(hot_entries);",
                                            in_lambda=False, after=DISPATCH_MARKER), None, "S3")
     # m12: no single reservation for the split.
@@ -748,34 +885,86 @@ def self_test(backend_src: str) -> int:
     expect_fail("recipe-types-reserve-pool", sub("const bool   split_needs_pool = !immutable_host_recipe;",
                                                  "const bool   split_needs_pool = true;",
                                                  in_lambda=False, after=DISPATCH_MARKER), None, "S2")
-    # m14: the memset returns to before the activation wait.
-    expect_fail("memset-before-act-wait", sub(
+    # m14 (W1): the memset comes back into dispatch_cpu_compute, on the submitting thread.
+    expect_fail("memset-back-in-dispatch", sub(
         "const bool zero_out_after_act_wait = from_pool || !out_owner.valid();",
         "const bool zero_out_after_act_wait = from_pool || !out_owner.valid();\n"
         "                if (zero_out_after_act_wait) { std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float)); }"),
         None, "W1")
-    # I2(c): the deferred wait gains a conjunct -- with n_cpu == 1 the memset and the CPU read run before the D2H lands.
-    expect_fail("act-wait-needs-n-cpu-gt-1", sub("if (act_deferred_pending) {\n                    act_deferred_evt.wait();",
-                                                 "if (act_deferred_pending && n_cpu > 1) {\n                    act_deferred_evt.wait();"),
+    wait_then_zero = ("    if (!inputs.events.empty()) {\n        sycl::event::wait(inputs.events);\n    }\n"
+                      "    if (inputs.zero_out && inputs.zero_bytes > 0) {\n        std::memset(inputs.zero_out, 0, inputs.zero_bytes);\n    }\n")
+    zero_then_wait = ("    if (inputs.zero_out && inputs.zero_bytes > 0) {\n        std::memset(inputs.zero_out, 0, inputs.zero_bytes);\n    }\n"
+                      "    if (!inputs.events.empty()) {\n        sycl::event::wait(inputs.events);\n    }\n")
+    # W1: the prologue zeroes before it waits the activation copy.
+    expect_fail("prologue-zeroes-before-wait", sub(wait_then_zero, zero_then_wait, in_lambda=False, after=WAIT_INPUTS_DEF),
                 None, "W1")
-    # I2: the memset moves under the wait's own block -- the guard is no longer exactly the wait.
-    expect_fail("memset-inside-wait-block", sub(
-        "if (act_deferred_pending) {\n                    act_deferred_evt.wait();\n                }\n                if (zero_out_after_act_wait) {\n                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));\n                }",
-        "if (act_deferred_pending) {\n                    act_deferred_evt.wait();\n                    if (zero_out_after_act_wait) {\n                        std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));\n                    }\n                }"),
-        None, "W1")
-    # I2: the wait is exact, but the memset that must follow it in control flow can be skipped.
-    expect_fail("memset-conditioned-away", sub(
-        "if (zero_out_after_act_wait) {\n                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));",
-        "if (zero_out_after_act_wait && n_cpu > 1) {\n                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));"),
+    # W1 (I2(c) analogue): the prologue's wait gains a conjunct, so a one-event job skips it.
+    expect_fail("prologue-wait-needs-two-events", sub("if (!inputs.events.empty()) {", "if (inputs.events.size() > 1) {",
+                                                      in_lambda=False, after=WAIT_INPUTS_DEF), None, "W1")
+    # W1: the closure no longer runs the waits.
+    expect_fail("prologue-closure-empty", sub("() {\n        moe_cpu_job_wait_inputs(inputs);\n    };", "() {};",
+                                              in_lambda=False, after=PROLOGUE_DEF), None, "W1")
+    # W2: one job form stops running the prologue, or the pool submission drops it.
+    expect_fail("fallback-skips-prologue", sub(
+        "prologue();\n                        ggml_sycl_cpu_expert_mul_mat_batched", "ggml_sycl_cpu_expert_mul_mat_batched"),
         None, "W2")
-    # W3: the memset's guard is defined away, so the zeroing is silently dropped (W1/W2 text still matches).
+    expect_fail("recipe-skips-prologue", sub("GGML_UNUSED(workspace_owner);\n                        prologue();\n",
+                                             "GGML_UNUSED(workspace_owner);\n"), None, "W2")
+    expect_fail("pool-submit-drops-prologue", sub("cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue))",
+                                                  "cpu_pool.submit_batch(std::move(batch_tasks))"), None, "W2")
+    worker_prologue = "                if (prologue) {\n                    prologue();\n                }\n"
+    worker_kernel = "                ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));\n"
+    expect_fail("pool-worker-skips-prologue", backend_src, None, "W2", None,
+                expert_pool_src.replace(worker_prologue, "", 1))
+    expect_fail("pool-worker-prologue-after-kernel", backend_src, None, "W2", None,
+                expert_pool_src.replace(worker_prologue, "", 1).replace(worker_kernel, worker_kernel + worker_prologue, 1))
+    expect_fail("pool-worker-prologue-conditioned-away", backend_src, None, "W2", None,
+                expert_pool_src.replace(worker_prologue,
+                                        "                if (prologue && !trace) {\n                    prologue();\n                }\n", 1))
+    # W3: the zeroing request is skipped on some paths, defined away, or wrapped in a block of its own.
+    expect_fail("zero-request-conditioned-away", sub(
+        "if (zero_out_after_act_wait) {\n                    job_inputs.zero_out",
+        "if (zero_out_after_act_wait && n_cpu > 1) {\n                    job_inputs.zero_out"), None, "W3")
     expect_fail("memset-guard-defined-false", sub(
         "const bool zero_out_after_act_wait = from_pool || !out_owner.valid();",
         "const bool zero_out_after_act_wait = false;"), None, "W3")
-    # W2 (structure): the wait+memset pair, textually adjacent and exact, wrapped in a block of its own.
-    pair = ("if (act_deferred_pending) {\n                    act_deferred_evt.wait();\n                }\n"
-            "                if (zero_out_after_act_wait) {\n                    std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float));\n                }")
-    expect_fail("wait-memset-pair-wrapped-in-if-false", sub(pair, "if (false) {\n                " + pair + "\n                }"), None, "W2")
+    zr_start = backend_src.find("                if (zero_out_after_act_wait) {\n", backend_src.find(LAMBDA_MARKER))
+    zero_req = backend_src[zr_start : backend_src.find("                }\n", zr_start) + len("                }\n")] \
+        if zr_start >= 0 else "<zeroing request missing>"
+    expect_fail("zero-request-wrapped-in-if-false", sub(zero_req, "                if (false) {\n" + zero_req + "                }\n"),
+                None, "W3")
+    # W4 (I2(c) analogue): the shared staging's copy event reaches the job only when n_cpu > 1.
+    expect_fail("shared-act-event-needs-n-cpu-gt-1", sub(
+        "job_inputs.events.push_back(act_d2h_event);", "if (n_cpu > 1) { job_inputs.events.push_back(act_d2h_event); }"),
+        None, "W4")
+    expect_fail("pregather-events-dropped", sub("job_inputs.events   = pregather_events;", "job_inputs.events.clear();"),
+                None, "W4")
+    expect_fail("lease-events-dropped", sub("job_inputs.events.push_back(entry.ready_event);", "(void) entry;"), None, "W4")
+    expect_fail("copy-events-overwritten", sub("                // Order this job's pool writes",
+                                               "                job_inputs.events = {};\n                // Order this job's pool writes"),
+                None, "W4")
+    # O1: the order decision loses a fact or an action.
+    expect_fail("order-ignores-last-flush", sub(
+        "job_inputs.events.insert(job_inputs.events.end(), g_cpu_scatter_last_flush.events.begin(),\n"
+        "                                                 g_cpu_scatter_last_flush.events.end());\n", ""), None, "O1")
+    expect_fail("order-queue-without-barrier", sub("job_inputs.events.push_back(stream->ext_oneapi_submit_barrier());", ""),
+                None, "O1")
+    expect_fail("order-current-serial-is-copy", sub("order_req.current_scatter_serial = g_cpu_scatter_serial;",
+                                                    "order_req.current_scatter_serial = copy_serial;"), None, "O1")
+    expect_fail("shared-copy-serial-fresh", sub("copy_serial          = g_moe_shared_act.record.scatter_serial;", ""), None, "W4")
+    expect_fail("flush-skips-serial", sub("        ++g_cpu_scatter_serial;\n", "", in_lambda=False, after=SLOT_FLUSH_DEF),
+                None, "O1")
+    expect_fail("flush-advances-serial-once-per-group", sub("for (int k = 0; k < n_group; ++k) {\n        ++g_cpu_scatter_serial;",
+                                                            "for (int k = 0; k < 1; ++k) {\n        ++g_cpu_scatter_serial;",
+                                                            in_lambda=False, after=SLOT_FLUSH_DEF), None, "O1")
+    expect_fail("flush-serial-conditioned-away", sub("    for (int k = 0; k < n_group; ++k) {\n        ++g_cpu_scatter_serial;\n    }\n",
+                                                     "    if (partner) {\n        for (int k = 0; k < n_group; ++k) {\n"
+                                                     "            ++g_cpu_scatter_serial;\n        }\n    }\n",
+                                                     in_lambda=False, after=SLOT_FLUSH_DEF), None, "O1")
+    expect_fail("flush-not-recorded", sub("    g_cpu_scatter_last_flush.events    = ws.events;\n", "",
+                                          in_lambda=False, after=SLOT_FLUSH_DEF), None, "O1")
+    expect_fail("shared-copy-serial-not-recorded", sub("record.scatter_serial   = g_cpu_scatter_serial;",
+                                                       "record.scatter_serial   = 0;", in_lambda=False), None, "O1")
     consumed = "            flush_pending_cpu_scatter_if_consumed(dst, ctx.device);\n"
     # F3/F1 (structure): present, in order, exactly once -- but dead (the body of `if (false)`).
     expect_fail("entry-flush-under-if-false", sub("            flush_pending_cpu_scatter();\n",
@@ -816,16 +1005,20 @@ def self_test(backend_src: str) -> int:
     expect_fail("keep-request-drops-staging-serial", sub(
         "keep.current_act_serial = g_moe_shared_act.record.serial;", "keep.current_act_serial = gate.act_serial;",
         in_lambda=False, after=JOIN_ANCHOR), None, "J1")
-    wait_pair = ("                        sycl::event::wait(g_pending_scatter_sibling.prev_bufs.scatter_events);\n"
-                 "                        sycl::event::wait(g_pending_scatter.prev_bufs.scatter_events);\n")
-    expect_fail("join-else-drops-wait", sub(
-        "                        sycl::event::wait(g_pending_scatter.prev_bufs.scatter_events);\n", "",
+    join_else = ("                        flush_pending_cpu_scatter();\n                    }\n                }\n"
+                 "                auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);\n")
+    expect_fail("join-else-drops-flush", sub(
+        join_else, "                    }\n                }\n                auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);\n",
         in_lambda=False, after=JOIN_ANCHOR), None, "J2")
-    no_wait = sub(wait_pair, "", in_lambda=False, after=JOIN_ANCHOR)
-    dispatch_line = "                auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);\n"
-    late = dispatch_line + wait_pair.replace("                        ", "                ")
-    expect_fail("join-wait-after-pool-writes",
-                no_wait.replace(dispatch_line, late, 1) if no_wait != backend_src else backend_src, None, "J2")
+    expect_fail("join-flush-after-pool-writes", sub(
+        join_else, "                    }\n                }\n                auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);\n"
+                   "                flush_pending_cpu_scatter();\n", in_lambda=False, after=JOIN_ANCHOR), None, "J2")
+    expect_fail("join-else-waits-again", sub(
+        join_else, "                        flush_pending_cpu_scatter();\n"
+                   "                        sycl::event::wait(g_pending_scatter.prev_scatter.scatter_events);\n"
+                   "                    }\n                }\n"
+                   "                auto cpu_result = dispatch_cpu_compute(cpu_entries, cpu_pool_first);\n",
+        in_lambda=False, after=JOIN_ANCHOR), None, "J2")
     expect_fail("drain-drops-older-slot", sub("    flush_pending_cpu_scatter_slot(g_pending_scatter_sibling);\n", "",
                                               in_lambda=False, after="static void flush_pending_cpu_scatter() {"), None, "J3")
     expect_fail("consumed-check-ignores-sibling", sub(
@@ -863,12 +1056,20 @@ def self_test(backend_src: str) -> int:
         "act_handle, pool_base * static_cast<size_t>(K) * sizeof(float), src1_storage.handle,",
         "act_handle, 0, src1_storage.handle,"), None, "R2")
     expect_fail("per-expert-d2h-ignores-pool-entry", sub(
-        "gather_activation_rows(rows, act_handle, pool_base * static_cast<size_t>(K) * sizeof(float));",
-        "gather_activation_rows(rows, act_handle, 0);"))
+        "rows, act_handle, pool_base * static_cast<size_t>(K) * sizeof(float));",
+        "rows, act_handle, 0);"))
     # m20: a host wait comes back into the split.
-    expect_fail("host-wait-in-split", sub("flush_pending_cpu_scatter();\n                    }\n                    dispatch_cpu_and_scatter(cold_entries, cold_first, pregather);",
-                                          "flush_pending_cpu_scatter();\n                        sycl::event::wait(g_pending_scatter.prev_bufs.scatter_events);\n                    }\n                    dispatch_cpu_and_scatter(cold_entries, cold_first, pregather);",
+    cold_call = "dispatch_cpu_and_scatter(cold_entries, cold_first, pregather, pregather_events, pregather_serial);"
+    expect_fail("host-wait-in-split", sub("flush_pending_cpu_scatter();\n                    }\n                    " + cold_call,
+                                          "flush_pending_cpu_scatter();\n                        sycl::event::wait(pregather_events);\n"
+                                          "                    }\n                    " + cold_call,
                                           in_lambda=False, after=DISPATCH_MARKER), None, "S4")
+    # z4kd: cold is not handed the pregather's events, so its prologue does not wait the gather.
+    expect_fail("cold-not-given-pregather-events", sub(cold_call, "dispatch_cpu_and_scatter(cold_entries, cold_first, pregather);",
+                                                       in_lambda=False, after=DISPATCH_MARKER), None, "S3")
+    expect_fail("pregather-events-not-kept", sub("pregather_events = gather_activation_rows(rows, hc_pool.act_handle(),",
+                                                 "gather_activation_rows(rows, hc_pool.act_handle(),",
+                                                 in_lambda=False, after=DISPATCH_MARKER), None, "S3")
     # m21/m22: the ring itself.
     expect_fail("ring-never-wraps", backend_src, None, None,
                 hostpath_src.replace("return cursor + n > capacity ? 0 : cursor;", "return cursor;", 1))

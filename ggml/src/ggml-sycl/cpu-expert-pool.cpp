@@ -187,7 +187,7 @@ static void pool_trace_record_job(size_t                       n_tasks,
                                   pool_trace_us(t_submit, t_done), overlapped);
 }
 
-std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task> tasks) {
+std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task> tasks, std::function<void()> prologue) {
     auto promise = std::make_shared<std::promise<void>>();
     auto future  = promise->get_future();
 
@@ -202,19 +202,27 @@ std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task> tasks
         // for keeping the backing vector alive — a contract that was
         // violated by several call sites, producing a UAF in the TBB
         // arena (simd_mxfp4_q8_0_16row reading a stale weight_host).
-        work_queue_.push([tasks = std::move(tasks), promise, trace, t_submit]() mutable {
-            const pool_trace_clock::time_point t_start = trace ? pool_trace_clock::now() : t_submit;
-            cpu_expert_pool_overlap_ticket     ticket;
-            if (trace) {
-                ticket = cpu_expert_pool_overlap_begin(g_pool_trace_overlap);
-            }
-            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
-            if (trace) {
-                const bool overlapped = cpu_expert_pool_overlap_end(g_pool_trace_overlap, ticket);
-                pool_trace_record_job(tasks.size(), t_submit, t_start, pool_trace_clock::now(), overlapped);
-            }
-            promise->set_value();
-        });
+        // The prologue runs first, on this worker: the waits the job needs before it may read
+        // its inputs and write its output (llama.cpp-z4kd). The job is timed from the worker
+        // picking it up, so `wall` includes those waits and `wake` does not; the overlap clock
+        // covers the kernel only.
+        work_queue_.push(
+            [tasks = std::move(tasks), prologue = std::move(prologue), promise, trace, t_submit]() mutable {
+                const pool_trace_clock::time_point t_start = trace ? pool_trace_clock::now() : t_submit;
+                if (prologue) {
+                    prologue();
+                }
+                cpu_expert_pool_overlap_ticket ticket;
+                if (trace) {
+                    ticket = cpu_expert_pool_overlap_begin(g_pool_trace_overlap);
+                }
+                ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
+                if (trace) {
+                    const bool overlapped = cpu_expert_pool_overlap_end(g_pool_trace_overlap, ticket);
+                    pool_trace_record_job(tasks.size(), t_submit, t_start, pool_trace_clock::now(), overlapped);
+                }
+                promise->set_value();
+            });
     }
     cv_.notify_one();
     return future;

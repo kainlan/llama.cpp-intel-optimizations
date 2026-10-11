@@ -504,11 +504,104 @@ static int test_wait_census_classes() {
     return 0;
 }
 
+// A CPU job writes its pool span on the pool worker, after the submitting thread
+// has moved on (llama.cpp-z4kd). Nothing on the submitting thread waits for an
+// earlier scatter's H2D any more, so the job itself must not write entries that
+// H2D has yet to read. Its activation copy completing proves every scatter
+// enqueued before the copy has run (in-order queue); a scatter enqueued after
+// the copy is covered only by waiting for it, unless it reads other entries.
+static ggml_sycl::moe_cpu_job_order_request job_request() {
+    ggml_sycl::moe_cpu_job_order_request r;
+    r.op_from_pool           = true;
+    r.op_first               = 10;
+    r.op_count               = 10;
+    r.row_k                  = 2560;
+    r.row_n                  = 640;
+    r.has_activation_copy    = true;
+    r.copy_scatter_serial    = 7;
+    r.current_scatter_serial = 7;
+    r.flush_from_pool        = true;
+    r.flush_first            = 0;
+    r.flush_count            = 10;
+    r.flush_row_k            = 2560;
+    r.flush_row_n            = 640;
+    return r;
+}
+
+static int test_cpu_job_order() {
+    using ggml_sycl::moe_cpu_job_order_decide;
+    using ggml_sycl::moe_cpu_job_order_waits;
+    ggml_sycl::moe_cpu_job_order_request r = job_request();
+    CHECK(moe_cpu_job_order_decide(r) == ggml_sycl::MOE_CPU_JOB_ORDER_BY_COPY,
+          "gate after its own copy: the copy completing orders every earlier scatter");
+    CHECK(!moe_cpu_job_order_waits(moe_cpu_job_order_decide(r)), "an order proven by the copy needs no extra wait");
+
+    // up reuses gate's copy; gate was flushed after it (the yx28 keep refused).
+    r                        = job_request();
+    r.current_scatter_serial = 8;
+    r.op_first               = 0;
+    CHECK(moe_cpu_job_order_decide(r) == ggml_sycl::MOE_CPU_JOB_ORDER_WAIT_LAST_FLUSH,
+          "up writing gate's entries after gate's flush waits that flush's H2D");
+    CHECK(moe_cpu_job_order_waits(moe_cpu_job_order_decide(r)), "waiting the flush is a wait");
+
+    // cold after hot: one reservation, so the spans are disjoint.
+    r                        = job_request();
+    r.current_scatter_serial = 8;
+    CHECK(moe_cpu_job_order_decide(r) == ggml_sycl::MOE_CPU_JOB_ORDER_DISJOINT,
+          "cold after hot's flush writes entries hot's H2D does not read");
+    CHECK(!moe_cpu_job_order_waits(moe_cpu_job_order_decide(r)), "disjoint spans need no wait");
+
+    r                        = job_request();
+    r.current_scatter_serial = 8;
+    r.flush_row_n            = 2560;
+    CHECK(moe_cpu_job_order_decide(r) == ggml_sycl::MOE_CPU_JOB_ORDER_WAIT_LAST_FLUSH,
+          "entry spans of different row sizes cannot be compared, so the flush is waited");
+
+    r                        = job_request();
+    r.current_scatter_serial = 8;
+    r.op_first               = 0;
+    r.flush_from_pool        = false;
+    CHECK(moe_cpu_job_order_decide(r) == ggml_sycl::MOE_CPU_JOB_ORDER_DISJOINT,
+          "a flush from managed buffers reads no pool entry");
+
+    r                        = job_request();
+    r.current_scatter_serial = 9;
+    CHECK(moe_cpu_job_order_decide(r) == ggml_sycl::MOE_CPU_JOB_ORDER_WAIT_QUEUE,
+          "two flushes since the copy: only the last one's events are kept, so wait the queue");
+    CHECK(moe_cpu_job_order_waits(moe_cpu_job_order_decide(r)), "a queue barrier is a wait");
+
+    r                        = job_request();
+    r.current_scatter_serial = 6;
+    CHECK(moe_cpu_job_order_decide(r) == ggml_sycl::MOE_CPU_JOB_ORDER_WAIT_QUEUE,
+          "a serial behind the copy is not a proof of anything");
+
+    r                     = job_request();
+    r.has_activation_copy = false;
+    CHECK(moe_cpu_job_order_decide(r) == ggml_sycl::MOE_CPU_JOB_ORDER_WAIT_QUEUE,
+          "a pool job with no activation copy has nothing ordering it");
+
+    r                        = job_request();
+    r.op_from_pool           = false;
+    r.current_scatter_serial = 9;
+    r.has_activation_copy    = false;
+    CHECK(moe_cpu_job_order_decide(r) == ggml_sycl::MOE_CPU_JOB_ORDER_OWN_BUFFERS,
+          "a job off the pool writes fresh buffers no scatter reads");
+    CHECK(!moe_cpu_job_order_waits(moe_cpu_job_order_decide(r)), "own buffers need no wait");
+
+    r                        = job_request();
+    r.op_count               = 0;
+    r.current_scatter_serial = 8;
+    r.op_first               = 0;
+    CHECK(moe_cpu_job_order_decide(r) == ggml_sycl::MOE_CPU_JOB_ORDER_DISJOINT,
+          "a job that writes no entries overlaps nothing");
+    return 0;
+}
+
 int main() {
     if (test_direct_request() != 0 || test_direct_stamp() != 0 || test_direct_layout() != 0 ||
         test_direct_retry_cap() != 0 || test_pool_ring() != 0 || test_gather_runs() != 0 ||
         test_shared_activation() != 0 || test_shared_act_sibling() != 0 || test_sibling_pending() != 0 ||
-        test_glu_input_host_produced() != 0 || test_wait_census_classes() != 0) {
+        test_glu_input_host_produced() != 0 || test_wait_census_classes() != 0 || test_cpu_job_order() != 0) {
         return 1;
     }
     std::printf("OK: moe decode host path decisions\n");
