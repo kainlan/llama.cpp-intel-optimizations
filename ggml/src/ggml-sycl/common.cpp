@@ -54,22 +54,32 @@ static std::atomic<uint64_t> g_layout_ptr_host_arena_miss{ 0 };
 static std::mutex                                   g_opt_feature_registry_mutex;
 static std::unordered_set<const optimize_feature *> g_opt_feature_registry;
 
+// Both helpers forward their caller's site to mem_ops (GGML_SYCL_MEMCPY_SITE_CENSUS, llama.cpp-th86).
 static sycl::event ggml_sycl_common_mem_copy_async(sycl::queue &                    queue,
                                                    void *                           dst,
                                                    const void *                     src,
                                                    size_t                           bytes,
-                                                   const std::vector<sycl::event> & deps = {}) {
+                                                   const std::vector<sycl::event> & deps     = {},
+                                                   const char *                     file     = __builtin_FILE(),
+                                                   int                              line     = __builtin_LINE(),
+                                                   const char *                     function = __builtin_FUNCTION()) {
     const int queue_device = ggml_sycl_get_device_id_from_queue(queue);
     auto      dst_handle   = ggml_sycl_memcpy_handle_for_raw_ptr(dst, queue_device);
     auto      src_handle   = ggml_sycl_memcpy_handle_for_raw_ptr(src, queue_device);
-    return ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, deps);
+    return ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, deps, file, line, function);
 }
 
-static void ggml_sycl_common_mem_copy(sycl::queue & queue, void * dst, const void * src, size_t bytes) {
+static void ggml_sycl_common_mem_copy(sycl::queue & queue,
+                                      void *        dst,
+                                      const void *  src,
+                                      size_t        bytes,
+                                      const char *  file     = __builtin_FILE(),
+                                      int           line     = __builtin_LINE(),
+                                      const char *  function = __builtin_FUNCTION()) {
     const int queue_device = ggml_sycl_get_device_id_from_queue(queue);
     auto      dst_handle   = ggml_sycl_memcpy_handle_for_raw_ptr(dst, queue_device);
     auto      src_handle   = ggml_sycl_memcpy_handle_for_raw_ptr(src, queue_device);
-    ggml_sycl::mem_copy(dst_handle, src_handle, bytes, queue);
+    ggml_sycl::mem_copy(dst_handle, src_handle, bytes, queue, {}, file, line, function);
 }
 
 bool ggml_sycl_is_optimize_feature_live(const optimize_feature * feature) {

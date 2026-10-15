@@ -402,7 +402,15 @@ inline bool ggml_sycl_mem_handle_has_identity(const ggml_sycl::mem_handle & hand
 // to avoid memcpy nodes that L0 Mutable Command List cannot update.
 // Outside recording, use canonical mem_handle copy submission.
 // ALL queue memcpy calls in op dispatch code should use this instead of raw queue.memcpy.
-inline sycl::event ggml_sycl_graph_safe_memcpy(sycl::queue & q, void * dst, const void * src, size_t nbytes) {
+// file/line/function default-capture the caller and are forwarded to mem_copy_async, so the copy census
+// (GGML_SYCL_MEMCPY_SITE_CENSUS) names the op that asked for the copy rather than this helper.
+inline sycl::event ggml_sycl_graph_safe_memcpy(sycl::queue & q,
+                                               void *        dst,
+                                               const void *  src,
+                                               size_t        nbytes,
+                                               const char *  file     = __builtin_FILE(),
+                                               int           line     = __builtin_LINE(),
+                                               const char *  function = __builtin_FUNCTION()) {
     if (nbytes == 0) {
         return sycl::event{};
     }
@@ -465,8 +473,8 @@ inline sycl::event ggml_sycl_graph_safe_memcpy(sycl::queue & q, void * dst, cons
     profile_label.metadata   = "graph_recording=0";
     profile_label.device     = queue_device;
     profile_label.bytes      = nbytes;
-    return ggml_sycl_profile_record_returned_event(profile_label,
-                                                   ggml_sycl::mem_copy_async(dst_handle, src_handle, nbytes, q));
+    return ggml_sycl_profile_record_returned_event(
+        profile_label, ggml_sycl::mem_copy_async(dst_handle, src_handle, nbytes, q, {}, file, line, function));
 }
 
 // Is ANY thread currently recording a command graph?
@@ -4654,7 +4662,13 @@ inline const ggml_tensor_layout * ggml_sycl_get_layout_info(const ggml_tensor * 
 // Get the correct data pointer for a tensor on a specific device
 // For TP buffers, returns device-specific pointer; otherwise returns tensor->data
 // In TP mode, if returning tensor->data, stages it to USM memory first
-inline void ggml_sycl_refresh_cached_input_ptr(void * dst, const void * src, size_t bytes, int device) {
+inline void ggml_sycl_refresh_cached_input_ptr(void *       dst,
+                                               const void * src,
+                                               size_t       bytes,
+                                               int          device,
+                                               const char * file     = __builtin_FILE(),
+                                               int          line     = __builtin_LINE(),
+                                               const char * function = __builtin_FUNCTION()) {
     if (dst == nullptr || src == nullptr || bytes == 0) {
         return;
     }
@@ -4673,9 +4687,9 @@ inline void ggml_sycl_refresh_cached_input_ptr(void * dst, const void * src, siz
         ggml_sycl::mem_handle dst_handle = ggml_sycl_memcpy_handle_for_raw_ptr(dst, device);
         ggml_sycl::mem_handle src_handle = ggml_sycl_memcpy_handle_for_raw_ptr(const_cast<void *>(src), device);
         if (avoid_wait) {
-            (void) ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, q);
+            (void) ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, q, {}, file, line, function);
         } else {
-            ggml_sycl::mem_copy(dst_handle, src_handle, bytes, q);
+            ggml_sycl::mem_copy(dst_handle, src_handle, bytes, q, {}, file, line, function);
         }
         return;
     }
