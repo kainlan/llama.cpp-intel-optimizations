@@ -421,14 +421,20 @@ static int test_refusals() {
     return 0;
 }
 
+// Each planned row carries its float32 row and one int32 flag: the event-chained decode route stages the CPU job's
+// per-slot flags beside the rows it places (llama.cpp-7pvo).
+static constexpr size_t k_row_bytes(size_t row_elems) {
+    return row_elems * sizeof(float) + sizeof(int32_t);
+}
+
 static int test_scratch_bytes() {
     size_t bytes = 0;
-    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes(10, true, 640, &bytes) && bytes == 20 * 640 * sizeof(float),
+    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes(10, true, 640, &bytes) && bytes == 20 * k_row_bytes(640),
           "split gate/up: both halves of a decode pair");
-    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes(10, false, 2560, &bytes) && bytes == 10 * 2560 * sizeof(float),
-          "down (or fused gate_up): one op's rows");
+    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes(10, false, 2560, &bytes) && bytes == 10 * k_row_bytes(2560),
+          "down (or fused gate_up): one op's rows, each with its flag");
     CHECK(ggml_sycl::moe_host_scatter_scratch_bytes(40, true, 640, &bytes) &&
-              bytes == ggml_sycl::MOE_SCATTER_MAX_ROWS * 640 * sizeof(float),
+              bytes == ggml_sycl::MOE_SCATTER_MAX_ROWS * k_row_bytes(640),
           "capped at one kernel launch's rows");
     CHECK(ggml_sycl::moe_host_scatter_scratch_bytes(0, true, 640, &bytes) && bytes == 0, "a dense model plans nothing");
     CHECK(!ggml_sycl::moe_host_scatter_scratch_bytes(10, true, SIZE_MAX / 8, &bytes),
@@ -573,24 +579,45 @@ static int test_scratch_bytes_for_device() {
 
     down.has_host_experts = true;
     CHECK(ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ gate, down }, 0, 10, &bytes) &&
-              bytes == 10 * 2560 * sizeof(float),
+              bytes == 10 * k_row_bytes(2560),
           "host experts on device 0: the scratch covers their rows");
 
     down.device = 1;
     CHECK(ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ gate, down }, 0, 10, &bytes) && bytes == 0,
           "host experts scattered by device 1 plan nothing on device 0");
     CHECK(ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ gate, down }, 1, 10, &bytes) &&
-              bytes == 10 * 2560 * sizeof(float),
+              bytes == 10 * k_row_bytes(2560),
           "they plan on device 1");
 
     gate.has_host_experts = true;
     gate.device           = -1;
-    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ gate }, 0, 10, &bytes) &&
-              bytes == 20 * 640 * sizeof(float),
-          "a tensor whose layer has no planned device plans on every device (device 0)");
-    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ gate }, 1, 10, &bytes) &&
-              bytes == 20 * 640 * sizeof(float),
-          "a tensor whose layer has no planned device plans on every device (device 1)");
+    CHECK(
+        ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ gate }, 0, 10, &bytes) && bytes == 20 * k_row_bytes(640),
+        "a tensor whose layer has no planned device plans on every device (device 0)");
+    CHECK(
+        ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ gate }, 1, 10, &bytes) && bytes == 20 * k_row_bytes(640),
+        "a tensor whose layer has no planned device plans on every device (device 1)");
+
+    // The event-chained decode route uploads its n_experts-entry pointer table into the same scratch before its
+    // kernel (llama.cpp-7pvo). The table and a flush's rows never share it at once, so it holds the larger.
+    moe_host_scatter_tensor many = down;
+    many.device                  = 0;
+    many.row_elems               = 16;
+    many.n_experts               = 512;
+    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ many }, 0, 2, &bytes) &&
+              bytes == 512 * sizeof(const void *),
+          "many experts with short rows: the pointer table sets the size");
+    many.n_experts = 4;
+    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ many }, 0, 2, &bytes) && bytes == 2 * k_row_bytes(16),
+          "few experts: the rows set the size");
+    many.has_host_experts = false;
+    many.n_experts        = 512;
+    CHECK(ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ many }, 0, 2, &bytes) && bytes == 0,
+          "a tensor with no host experts never takes the route, so its table plans nothing");
+    many.has_host_experts = true;
+    many.n_experts        = SIZE_MAX / 4;
+    CHECK(!ggml_sycl::moe_host_scatter_scratch_bytes_for_device({ many }, 0, 2, &bytes),
+          "an overflowing table is refused, not wrapped");
 
     down.device                 = 0;
     moe_host_scatter_tensor bad = down;

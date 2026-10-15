@@ -97,7 +97,7 @@ module_sources_flat = "\n".join(strip_comments(text) for text in sycl_dir_source
 PROVIDER_FILES = ("cpu-traits-support.cpp", "cpu-traits-support.hpp")
 # Comment-blind call-site inventory of the private provider's wrapper, per consumer file. A new consumer, or
 # a consumer growing a call, is a deliberate edit here rather than a drifting literal total.
-EXPECTED_PRIVATE_TRAIT_CALLS = {"cpu-dispatch.cpp": 24, "ggml-sycl.cpp": 7, "unified-cache.cpp": 1}
+EXPECTED_PRIVATE_TRAIT_CALLS = {"cpu-dispatch.cpp": 24, "ggml-sycl.cpp": 8, "unified-cache.cpp": 1}
 private_trait_calls, raw_trait_calls = {}, {}
 for p in sorted(sycl_dir.rglob("*")):
     if p.suffix not in (".cpp", ".hpp") or "tests" in p.parts or p.name in PROVIDER_FILES:

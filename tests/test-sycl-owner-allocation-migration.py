@@ -171,6 +171,10 @@ NAMED_OWNER_FIRST_SITES = (
      "moua L4 step 3c: the host tier of a context's tenants -- one owner-first carve per host slot (must_host_pinned, "
      "pinned pool, category HOST_COMPUTE, the cohort's own name), held by the registry entry that carries the table, "
      "so no raw pointer or side cache holds the room; refuses on failure, handed over via from_owned_alloc"),
+    ("ggml_sycl_moe_hybrid_decode_table_allocate",
+     "llama.cpp-7pvo: the event-chained hybrid decode record's host-pinned pointer table (n_as device weight "
+     "pointers by expert id, copied to the planned scratch per op), owned by the record alone; refuses on failure, "
+     "handed over via from_owned_alloc"),
 )
 
 

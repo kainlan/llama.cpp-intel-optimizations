@@ -10,6 +10,7 @@
 #include "unified-cache.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <sycl/sycl.hpp>
 
 namespace ggml_sycl {
@@ -107,11 +108,24 @@ class PinnedBufferPool {
     mem_handle act_handle() const;
     mem_handle out_handle() const;
 
+    // One int32 per entry, addressed like act and out: entry i is ids() + i (llama.cpp-7pvo). The event-chained
+    // hybrid decode route copies a decode op's expert ids into its reserved entries asynchronously, and its CPU job
+    // overwrites them in place with the host-slot flags the flush reads back. The same ordering as act and out keeps
+    // it safe across ops: the job writes only after its ids copy completed, which completes every scatter enqueued
+    // before that copy. Optional: when it could not be allocated the pool still serves act and out, and has_ids()
+    // is false.
+    mem_handle ids_handle() const;
+
+    int32_t * ids() const { return ids_pool_; }
+
+    bool has_ids() const { return ids_pool_ != nullptr; }
+
     bool is_initialized() const { return act_pool_ != nullptr && out_pool_ != nullptr; }
 
   private:
     float *    act_pool_    = nullptr;
     float *    out_pool_    = nullptr;
+    int32_t *  ids_pool_    = nullptr;
     size_t     act_stride_  = 0;  // floats per expert (K)
     size_t     out_stride_  = 0;  // floats per expert (N)
     size_t     max_experts_ = 0;
@@ -119,6 +133,7 @@ class PinnedBufferPool {
     int        device_id_   = -1;
     mem_handle act_handle_;
     mem_handle out_handle_;
+    mem_handle ids_handle_;
 };
 
 }  // namespace ggml_sycl

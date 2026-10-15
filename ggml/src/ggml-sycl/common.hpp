@@ -3521,6 +3521,9 @@ static inline bool ggml_sycl_valid_device_index(int dev) {
 // carries is paid only by tensors that actually use it, not by the 838
 // activation/view extras a single graph rebuild allocates and releases
 // (llama.cpp-dfo0 plan task L1/L2 hardware evidence).
+// Defined in ggml-sycl.cpp with the route that builds it (llama.cpp-7pvo).
+struct moe_hybrid_decode_record;
+
 struct ggml_tensor_extra_gpu_weight_ext {
     dpct::event_ptr  events[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS];  // events for synchronizing multiple GPUs
 
@@ -3983,6 +3986,11 @@ struct ggml_tensor_extra_gpu_weight_ext {
     // Batch-1 decode direct-dispatch eligibility and layout, per device; see
     // moe-decode-hostpath.hpp (llama.cpp-yx28).
     ggml_sycl::moe_decode_direct_stamp moe_decode_direct[GGML_SYCL_MAX_DEVICES];
+    // The event-chained hybrid decode route's per-device record of every expert's executor and weight view, and the
+    // stamp of the decision that built it (llama.cpp-7pvo). The record holds every expert's lease, as
+    // moe_expert_handles holds the device experts', and is dropped where they are.
+    ggml_sycl::moe_decode_direct_stamp              moe_hybrid_decode_stamp[GGML_SYCL_MAX_DEVICES];
+    std::shared_ptr<const moe_hybrid_decode_record> moe_hybrid_decode[GGML_SYCL_MAX_DEVICES];
     uint64_t                           moe_planned_layout_generation[GGML_SYCL_MAX_DEVICES][2][2]      = {};
     ggml_layout_mode                   moe_planned_layout_cache[GGML_SYCL_MAX_DEVICES][2][2]           = {};
     bool                               moe_planned_layout_valid[GGML_SYCL_MAX_DEVICES][2][2]           = {};

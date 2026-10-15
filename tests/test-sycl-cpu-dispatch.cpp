@@ -11,6 +11,8 @@
 // - Config functions (env var parsing)
 // - Host-expert trace: the per-type key of a batched call and the per-type
 //   summary of the pool's jobs (llama.cpp-y9i6)
+// - CpuExpertPool's resolve step, which builds a job's tasks on the worker after
+//   its prologue (llama.cpp-7pvo)
 
 #include "cpu-dispatch.hpp"
 #include "cpu-expert-pool.hpp"
@@ -24,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <random>
 #include <string>
 #include <vector>
@@ -557,6 +560,70 @@ static bool test_pool_trace_overlap_both_ends() {
 // sets the variable.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Test 8: CpuExpertPool resolve step (llama.cpp-7pvo)
+// ---------------------------------------------------------------------------
+// The event-chained hybrid decode route submits a job before the expert ids
+// are on the host. Its prologue waits for the ids copy, and its resolve step
+// then reads them and builds the tasks, on the worker. So resolve must run
+// after the prologue and before the batched kernel, and the kernel must compute
+// the tasks resolve built, not the (empty) vector submitted.
+
+static bool test_pool_resolve_step() {
+    printf("test_pool_resolve_step ... ");
+
+    std::vector<float> weight_f(N * K);
+    std::vector<float> act_f(K);
+    fill_random(weight_f.data(), N * K, 7);
+    fill_random(act_f.data(), K, 8);
+    auto weight_q = quantize_q4_0(weight_f.data(), N, K);
+
+    std::vector<float> baseline(N, 0.0f);
+    cpu_expert_task    task;
+    task.weight_host = weight_q.data();
+    task.act_host    = act_f.data();
+    task.output_host = baseline.data();
+    task.type        = GGML_TYPE_Q4_0;
+    task.K           = K;
+    task.N           = N;
+    ggml_sycl_cpu_expert_mul_mat_batched(&task, 1, 0);
+
+    std::vector<float>       resolved_out(N, 0.0f);
+    std::atomic<int>         step{ 0 };
+    int                      prologue_at = -1;
+    int                      resolve_at  = -1;
+    size_t                   submitted   = 99;
+    ggml_sycl::CpuExpertPool pool;
+    pool.init(1);
+    std::future<void> done = pool.submit_batch(
+        {}, [&]() { prologue_at = step.fetch_add(1); },
+        [&](std::vector<cpu_expert_task> & tasks) {
+            resolve_at        = step.fetch_add(1);
+            submitted         = tasks.size();
+            cpu_expert_task t = task;
+            t.output_host     = resolved_out.data();
+            tasks.push_back(t);
+        });
+    done.get();
+    pool.shutdown();
+
+    if (prologue_at != 0 || resolve_at != 1) {
+        printf("FAIL (prologue ran at step %d and resolve at step %d; want 0 then 1)\n", prologue_at, resolve_at);
+        return false;
+    }
+    if (submitted != 0) {
+        printf("FAIL (resolve saw %zu submitted tasks; want the empty vector)\n", submitted);
+        return false;
+    }
+    const float diff = max_abs_diff(baseline.data(), resolved_out.data(), N);
+    if (diff > 1e-5f || mean_abs(resolved_out.data(), N) < 1.0f) {
+        printf("FAIL (the task resolve built was not computed: max_diff=%.6f)\n", diff);
+        return false;
+    }
+    printf("OK\n");
+    return true;
+}
+
 int main(int argc, char ** argv) {
     const bool trace_tests = argc > 1 && strcmp(argv[1], "--trace-tests") == 0;
     if (argc > 1 && !trace_tests) {
@@ -589,9 +656,10 @@ int main(int argc, char ** argv) {
         run(test_adaptive_split);
         run(test_non_q4_0_fallback);
         run(test_config_functions);
-        // Tests 1-4 count only if they ran untraced, as production does.
+        run(test_pool_resolve_step);
+        // Tests 1-4 and 8 count only if they ran untraced, as production does.
         if (ggml_sycl_cpu_expert_trace_enabled()) {
-            printf("FAIL (tracing was on: tests 1-4 did not cover the untraced path)\n");
+            printf("FAIL (tracing was on: tests 1-4 and 8 did not cover the untraced path)\n");
             n_fail++;
         }
         printf("(trace tests 5-7 run only with --trace-tests)\n");
