@@ -256,7 +256,12 @@ def check_kernels(cpp: str | None) -> None:
     if gather.count("sycl::exclusive_scan_over_group(") < 2:
         fail("O2", "the radix gather is not an ordered compaction (exclusive_scan_over_group for both the "
                    "greater and the equal flags)")
+    # The loads are pinned with the comparator: swapping only the index loads (ia from ixj, ib from col)
+    # inverts the tiebreak to the higher column while the comparator text stays intact, and
+    # test-backend-ops scores tie rows as multisets, so nothing else would notice.
     for needle in ["keys[col]=col<ncols?top_k_ordered_key(x_row[col]):0u;idxs[col]=col;",
+                   "const uint32_t ka=keys[col];const uint32_t kb=keys[ixj];const int32_t ia=idxs[col];"
+                   "const int32_t ib=idxs[ixj];",
                    "const bool b_first=kb>ka||(kb==ka&&ib<ia);",
                    "if(((col&kk)==0)==b_first){"]:
         if needle not in bit:
@@ -466,6 +471,12 @@ def self_test(s: dict[str, str | None]) -> int:
                 "sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device> a(cnt[0]);\n"
                 "                const uint32_t pre_gt =", "O1")
     expect_fail("bitonic-tie-to-higher-column", "cpp", "(kb == ka && ib < ia)", "(kb == ka && ib > ia)", "O3")
+    expect_fail("bitonic-index-loads-swapped", "cpp",
+                "const int32_t  ia      = idxs[col];\n"
+                "                                const int32_t  ib      = idxs[ixj];",
+                "const int32_t  ia      = idxs[ixj];\n"
+                "                                const int32_t  ib      = idxs[col];",
+                "O3")
     expect_fail("bitonic-no-index-tiebreak", "cpp", "kb > ka || (kb == ka && ib < ia)", "kb > ka", "O3")
     expect_fail("gather-eq-unbounded", "cpp", "if (is_eq && base_eq + pre_eq < rank) {", "if (is_eq) {", "O4")
     expect_fail("gather-eq-later-ranges-first", "cpp", "for (int64_t b2 = tid; b2 < b; b2 += top_k_radix_block) {",
