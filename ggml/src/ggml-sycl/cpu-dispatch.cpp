@@ -260,6 +260,11 @@ static sycl::event cpu_submit_async(sycl::queue * cpu_q, const std::vector<sycl:
         }
         fn(cgh);
     });
+    if (!submit_on_cpu_queue) {
+        // Off the CPU queue every caller submits a host task, which a CPU expert job's join on the MoE join
+        // queue must wait (llama.cpp-wfsl).
+        ggml_sycl::unified_cache_note_host_task(*cpu_q, evt);
+    }
     if (ggml_sycl_cpu_offload_async_enabled()) {
         g_cpu_chain_event        = evt;
         g_cpu_chain_event_valid  = true;

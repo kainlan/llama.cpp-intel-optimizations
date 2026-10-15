@@ -3453,6 +3453,34 @@ class unified_cache {
     // event_complete() query for that one entry.
     sycl::queue * get_event_watch_queue();
 
+    // --- MoE join queue: the host-task joins of CPU expert jobs (llama.cpp-wfsl) ---
+    // In-order and non-profiling, on queue_'s context and device, created on first use and drained with the
+    // other queues. The hybrid MoE decode route joins each CPU expert job with a host task, submitted here
+    // instead of on queue_. A host task's command has no queue of its own, so before posting it the SYCL
+    // runtime queries the status of each device event it depends on, and the Level Zero driver answers a
+    // query on an unsignaled event with a sched_yield on the submitting thread. On queue_ every join depended
+    // that way on the device-expert kernel just submitted. Here a join's in-order predecessor is the previous
+    // join, a host-task event with no native handle, which the runtime never queries. So this queue holds
+    // joins only: a device command submitted here would become a join's predecessor. Returns nullptr if
+    // construction failed (logged once); the joins then stay on queue_.
+    sycl::queue * get_moe_join_queue();
+
+    // The join queue, with the latest host task note_compute_host_task() recorded in *after (and *has_after
+    // set) when there is one, which the join must depend on (llama.cpp-wfsl). A join on the join queue is
+    // posted as soon as its predecessors complete, before its job's inputs are ready, and holds the runtime's
+    // host-task thread until the job ends; a host task those inputs waited on that was posted after it could
+    // never run. The latest one suffices: queue_ is in-order, so every earlier host task on it runs on the
+    // worker before the latest, and a job's inputs are submitted before its join, so every host task they
+    // reach was submitted, and recorded, before the join reads the record. The record is written on the
+    // submitting thread right after each submit returns, so a later join on that thread cannot read a stale
+    // event. Reached through unified_cache_moe_join_queue_for(), which checks that no host task is anywhere
+    // else.
+    sycl::queue * moe_join_queue_after(sycl::event * after, bool * has_after);
+
+    // Records `e`, a host task just submitted on queue_ (llama.cpp-wfsl). Reached through
+    // unified_cache_note_host_task().
+    void note_compute_host_task(const sycl::event & e);
+
     // Ensure a weight is cached, loading from src_ptr if needed
     // Returns device pointer, or nullptr if cache is full and eviction failed
     //
@@ -5082,6 +5110,14 @@ class unified_cache {
     // get_event_watch_queue().
     std::unique_ptr<sycl::queue> event_watch_queue_;
     std::once_flag               event_watch_queue_once_;
+    // llama.cpp-wfsl: see get_moe_join_queue(). last_host_task_, last_host_task_valid_ and
+    // moe_join_queue_announced_ are read and written only under moe_join_mutex_.
+    std::unique_ptr<sycl::queue> moe_join_queue_;
+    std::once_flag               moe_join_queue_once_;
+    std::mutex                   moe_join_mutex_;
+    sycl::event                  last_host_task_;
+    bool                         last_host_task_valid_     = false;
+    bool                         moe_join_queue_announced_ = false;
     size_t                       budget_;                   // Total GPU memory budget (after reservations)
     size_t                       base_budget_;              // Raw cache budget before reservations
     size_t                       reserved_;                 // Runtime reservation applied to budget_
@@ -6141,6 +6177,20 @@ unified_cache * get_unified_cache_for_device(int device_id);
 // Use from destructors and shutdown paths where creating a new cache would
 // re-enter allocator/static teardown.
 unified_cache * get_existing_unified_cache_for_device(int device_id);
+
+// The MoE join queue for a CPU expert job whose scatter goes on `stream`, or nullptr to join on `stream`
+// (llama.cpp-wfsl); see unified_cache::get_moe_join_queue() and moe_join_queue_after() for *after. It is used
+// only while every host task of the process has been submitted on one cache's queue_, so that the latest one
+// recorded covers them all. A join or host task on any other queue, or on a second cache's queue_, refuses it
+// for the rest of the process. Creates no cache.
+sycl::queue * unified_cache_moe_join_queue_for(sycl::queue & stream, sycl::event * after, bool * has_after);
+
+// Records `e`, a host task just submitted on `q`, for the join queue's guard (llama.cpp-wfsl). Every host task
+// the backend submits, other than the joins on the join queue, is recorded here.
+void unified_cache_note_host_task(sycl::queue & q, const sycl::event & e);
+
+// Returns the CPU expert joins to the compute streams for the rest of the process, logging `why` once.
+void unified_cache_moe_join_queue_refuse(const char * why);
 
 #if GGML_SYCL_DNNL
 // oneDNN Graph SYCL allocator callbacks (llama.cpp-gwno). Free functions, not

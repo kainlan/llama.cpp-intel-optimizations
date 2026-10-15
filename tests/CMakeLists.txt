@@ -863,6 +863,14 @@ if (Python3_Interpreter_FOUND)
     # TIMEOUT: its mutant self-test took 29.5 s wall at host load 43, against the old 30 s.
     set_tests_properties(test-sycl-cpu-expert-pool-stamps-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # CPU expert job joins go on the cache's join-only queue behind GGML_SYCL_MOE_JOIN_QUEUE, after the latest
+    # recorded host task, and the scatter still depends on them (llama.cpp-wfsl). Run WITH --self-test so each
+    # pin is proven to catch its mutant.
+    add_test(NAME test-sycl-moe-join-queue-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-join-queue-source.py --self-test)
+    set_tests_properties(test-sycl-moe-join-queue-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # Host MoE experts must read the activation row of their own slot, not row 0
     # (llama.cpp-4hg7: GPT-OSS down-projection decode garbage under host-tiered
     # experts). Run WITH --self-test so each anchor is proven load-bearing.

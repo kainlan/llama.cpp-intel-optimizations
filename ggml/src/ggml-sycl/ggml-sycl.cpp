@@ -24401,15 +24401,60 @@ static void moe_cpu_job_join(const std::shared_future<void> & job, ggml_sycl::cp
     }
 }
 
-// Submits the join of a CPU job on `queue` and returns its event.  The host_task
-// holds the job's shared future, and its stamp record when there is one: the
-// record is shared, so it outlives the job's slot however late the join runs.
+// GGML_SYCL_MOE_JOIN_QUEUE, read once (llama.cpp-wfsl): unset or non-zero joins CPU expert jobs on the cache's
+// join-only queue, 0 joins them on the compute stream as before.
+static bool moe_join_queue_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_JOIN_QUEUE");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Whether a CPU job's join may go on the join queue instead of `stream` (llama.cpp-wfsl): the knob is on, and
+// neither the backend nor `stream` itself records a command graph, since the scatter would record a dependency on
+// a join outside the graph.  When this is false every join is on the stream, exactly as without the join queue.
+static bool moe_cpu_job_join_may_leave_stream(sycl::queue & stream) {
+    return moe_join_queue_enabled() && !ggml_sycl_graph_recording_active() &&
+           stream.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording;
+}
+
+// The queue a CPU job's join goes on instead of `stream`, or null to join on `stream` (llama.cpp-wfsl).  A host
+// task's command has no queue, so before posting it the SYCL runtime queries the status of each device event it
+// depends on, and the driver answers a query on an unsignaled event with a sched_yield on this thread.  On the
+// stream the join depended that way on the device-expert kernel just submitted.  On the join queue it depends on
+// the previous join and on `*after`, both host-task events, which are never queried.
+static sycl::queue * moe_cpu_job_join_queue(sycl::queue & stream, sycl::event * after, bool * has_after) {
+    if (!moe_cpu_job_join_may_leave_stream(stream)) {
+        return nullptr;
+    }
+    return ggml_sycl::unified_cache_moe_join_queue_for(stream, after, has_after);
+}
+
+// Submits the join of a CPU job and returns its event.  The host_task holds the
+// job's shared future, and its stamp record when there is one: the record is
+// shared, so it outlives the job's slot however late the join runs.  `queue` is
+// the in-order stream the job's scatter goes on.  The join goes on the join queue
+// when moe_cpu_job_join_queue() returns one, after the latest other host task on
+// the stream (llama.cpp-wfsl); otherwise it goes on `queue`, and is recorded as
+// one of the stream's host tasks, which a later join on the join queue must wait.
 static sycl::event moe_cpu_job_join_on_queue(sycl::queue &                                     queue,
                                              std::shared_future<void>                          job,
                                              std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> stamps) {
-    return queue.submit([&](sycl::handler & cgh) {
+    sycl::event         after;
+    bool                has_after = false;
+    sycl::queue * const join_q    = moe_cpu_job_join_queue(queue, &after, &has_after);
+    sycl::queue &       target    = join_q ? *join_q : queue;
+    sycl::event         join      = target.submit([&](sycl::handler & cgh) {
+        if (has_after) {
+            cgh.depends_on(after);
+        }
         cgh.host_task([job, stamps = std::move(stamps)]() { moe_cpu_job_join(job, stamps.get()); });
     });
+    if (!join_q) {
+        ggml_sycl::unified_cache_note_host_task(queue, join);
+    }
+    return join;
 }
 
 // Fills `req` with the pool job's trace label and returns it while tracing, else
@@ -26237,9 +26282,14 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
             moe_host_scatter_submit_flagged(slot, joins, ws.events);
             n_copies += 2;
         }
-        // A flush with no rows to place still leaves its joins for the graph boundary to wait.
+        // A flush with no rows to place still leaves its joins for the graph boundary to wait.  When the joins may
+        // be on the join-only queue (moe_cpu_job_join_on_queue), a barrier keeps this stream's later commands
+        // behind them, as when they were on it; when they cannot be, the stream is left as it was without it.
         if (ws.events.empty()) {
             ws.events.insert(ws.events.end(), joins.begin(), joins.end());
+            if (moe_cpu_job_join_may_leave_stream(*slot.stream)) {
+                slot.stream->ext_oneapi_submit_barrier(joins);
+            }
         }
 
         // A job reads its activation buffers and writes its output until its join completes; the copies
