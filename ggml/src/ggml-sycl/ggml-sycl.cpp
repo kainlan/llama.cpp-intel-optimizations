@@ -19602,15 +19602,12 @@ static bool ggml_sycl_dense_scratch_owner_refused(int device, ggml_sycl::lifecyc
         return false;
     }
     const char * half = q8 && f16 ? "Q8_1 src1 and f16 dequant" : (q8 ? "Q8_1 src1" : "f16 dequant");
-    const char * fmt =
+    ggml_log_internal(
+        probe_mode ? GGML_LOG_LEVEL_INFO : GGML_LOG_LEVEL_WARN,
         "[SYCL-PLAN] runtime KV update rejected: the dense %s scratch figure of model slot %u generation %llu "
         "overflowed its sizing on device %d, so no dense scratch is planned for it; an overflowing figure is "
-        "refused rather than planned as a smaller one\n";
-    if (!probe_mode) {
-        GGML_LOG_WARN(fmt, half, owner.slot, (unsigned long long) owner.generation, device);
-        return true;
-    }
-    GGML_LOG_INFO(fmt, half, owner.slot, (unsigned long long) owner.generation, device);
+        "refused rather than planned as a smaller one\n",
+        half, owner.slot, (unsigned long long) owner.generation, device);
     return true;
 }
 
@@ -19625,15 +19622,12 @@ static bool ggml_sycl_dense_scratch_context_refused(int                         
     if (ggml_sycl::unified_cache_planned_dense_scratch_context_room(device, owner, context)) {
         return false;
     }
-    const char * fmt =
+    ggml_log_internal(
+        probe_mode ? GGML_LOG_LEVEL_INFO : GGML_LOG_LEVEL_WARN,
         "[SYCL-PLAN] runtime KV update rejected: model slot %u generation %llu has no room on device %d for another "
         "backend context's dense scratch n_ubatch (context %llu); a context is refused rather than left out of the "
-        "plan its buffers are sized from\n";
-    if (!probe_mode) {
-        GGML_LOG_WARN(fmt, owner.slot, (unsigned long long) owner.generation, device, (unsigned long long) context);
-        return true;
-    }
-    GGML_LOG_INFO(fmt, owner.slot, (unsigned long long) owner.generation, device, (unsigned long long) context);
+        "plan its buffers are sized from\n",
+        owner.slot, (unsigned long long) owner.generation, device, (unsigned long long) context);
     return true;
 }
 
