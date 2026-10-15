@@ -137,6 +137,7 @@
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
 #include "ggml-sycl/tenant-claim-scope.hpp"
+#include "ggml-sycl/topk.hpp"
 #include "model-lifecycle.hpp"
 #include "sycl-kernel-profiler.hpp"
 #include "sycl-timeline.hpp"
@@ -49402,10 +49403,11 @@ static void argmax_f32_i32_sycl(const float * x, int * dst, const int ncols, con
 }
 
 // TOP_K kernel for MoE expert gating
-// For small K (2-8), uses register-based parallel reduction
+// For small K (2-8), uses register-based parallel reduction. Larger k runs in
+// topk.cpp; ggml_sycl_top_k_select_path (topk.hpp) chooses between them.
 
 #define SYCL_TOPK_BLOCK_SIZE 256
-#define SYCL_TOPK_MAX_K      32
+#define SYCL_TOPK_MAX_K      ggml_sycl_top_k_gating_max_k
 
 static void topk_f32_i32_sycl(const float * x,
                               int *         dst,
@@ -50664,7 +50666,21 @@ inline void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_
     const int64_t nrows   = ggml_nrows(src0.raw());
     const int64_t k       = dst.ne(0);  // Output dimension 0 is K
 
-    topk_f32_i32_sycl(src0_dd, dst_dd, ncols, nrows, k, main_stream);
+    // the same selector, with the same inputs, that supports_op accepted the op by
+    const ggml_sycl_top_k_path path = ggml_sycl_top_k_select_path(ncols, k, ggml_sycl_info().devices[ctx.device].smpbo);
+    switch (path) {
+        case GGML_SYCL_TOP_K_PATH_GATING:
+            topk_f32_i32_sycl(src0_dd, dst_dd, ncols, nrows, k, main_stream);
+            break;
+        case GGML_SYCL_TOP_K_PATH_BITONIC:
+        case GGML_SYCL_TOP_K_PATH_RADIX:
+            ggml_sycl_top_k_large(ctx, src0_dd, dst_dd, ncols, nrows, k, path);
+            break;
+        case GGML_SYCL_TOP_K_PATH_NONE:
+        default:
+            GGML_ABORT("[TOP_K] no SYCL path for ncols=%lld k=%lld; supports_op should have declined it",
+                       (long long) ncols, (long long) k);
+    }
 }
 
 inline void ggml_sycl_op_diag_mask_inf(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
@@ -117000,9 +117016,12 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
             return op->src[0]->ne[0] * sizeof(int) <= ggml_sycl_info().devices[device].smpbo;
 
         case GGML_OP_TOP_K:
-            // TOP_K uses shared memory: BLOCK_SIZE * MAX_K * (sizeof(float) + sizeof(int))
-            // = 256 * 32 * 8 = 64KB (well within typical 128KB SLM limit)
-            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32 && op->ne[0] <= SYCL_TOPK_MAX_K;
+            // The selector (topk.hpp) names a kernel for every k <= ncols: the MoE
+            // gating kernel, a bitonic sort in SLM, or a multi-work-group radix
+            // select. ggml_sycl_op_top_k dispatches by the same call.
+            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
+                   ggml_sycl_top_k_select_path(op->src[0]->ne[0], op->ne[0], ggml_sycl_info().devices[device].smpbo) !=
+                       GGML_SYCL_TOP_K_PATH_NONE;
         case GGML_OP_POOL_2D:
             return true;
 

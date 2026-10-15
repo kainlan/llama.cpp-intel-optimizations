@@ -11248,7 +11248,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 256, 64, 1, 1}, 8, false, n_finite));
     }
     // k = 1 leaves no room to order anything, and k = 32 is the largest k the
-    // SYCL path accepts before it hands off to the CPU.
+    // SYCL MoE-gating kernel takes before the bitonic and radix paths do.
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {256, 64, 1, 1},  1, false, 0));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {256, 64, 1, 1}, 32, false, 0));
     // control: exactly k values above -inf, so the surplus-slot path is unreachable
@@ -11263,6 +11263,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  2, 1, 1 }, 2051, true));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051, true));
+
+    // llama.cpp-1b6u: the SYCL k > 32 paths. The sparse-attention indexer asks
+    // for k = min(n_kv, indexer_top_k + r - 1) of n_kv columns, so k = ncols is
+    // its short-context shape. 256 and 4096 columns fit SLM (bitonic), 262144
+    // does not (multi-work-group radix select), and 262144 + 11 is not a power of two.
+    for (int k : { 64, 256, 2048 }) {
+        for (int64_t ncols : { 256, 4096, 262144, 262144 + 11 }) {
+            if (k > ncols) {
+                continue;
+            }
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { ncols, 1, 1, 1 }, k));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { ncols, 3, 1, 1 }, k, true));
+        }
+    }
+    // fewer finite values than k (a causal mask over the cells): the -inf ties fill
+    // the surplus, on the bitonic path and on the radix path
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 4096, 1, 1, 1 }, 2051, false, 1000));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 262144, 1, 1, 1 }, 2051, false, 1000));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 65536 + 3, 2, 1, 1 }, 2051, false, 3000));
 
     // qwen4exp QSA indexer top-k fusion (get_rows + f16 mask + top_k)
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  1, 1, 1500));
