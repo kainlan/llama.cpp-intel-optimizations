@@ -73,7 +73,11 @@ struct planned_context_n_ubatch {
 };
 
 // How many backend contexts of one model on one device can each record a published n_ubatch. A context past it is
-// refused by name (context_room) rather than left out of the plan its buffers are sized from.
+// refused by name (context_room) rather than left out of the plan its buffers are sized from. One llama_context is
+// one backend context per device. The in-tree vehicles create few per model: test-thread-safety registers -np 4 (four
+// contexts per model), llama-server makes one context (its slots are sequences of it) plus one draft context when
+// speculative decoding is on, and the speculative code makes at most one draft context from a model. 8 covers those
+// with room; a by-name refusal for the ninth context of a model means raise this constant.
 constexpr int planned_context_capacity = 8;
 
 // One owner's contribution on one device. generation 0: no owner holds it (no slot generation is ever 0). The context
@@ -196,10 +200,11 @@ class planned_load_terms {
     }
 
     // Whether `context` can record a value for `owner` on `device`: it holds an entry there, one is free, or the owner
-    // holds no contribution there (nothing is recorded then, and nothing is refused for want of room).
+    // holds no contribution there (nothing is recorded then, and nothing is refused for want of room). Context 0 is
+    // never a backend context's id and set_context_n_ubatch refuses it, so it has no room either.
     bool context_room(int device, lifecycle::SlotToken owner, uint64_t context) const {
         const planned_load_term_contribution * c = owned(device, owner);
-        return c == nullptr || context == 0 || context_index(*c, context) >= 0 || context_index(*c, 0) >= 0;
+        return c == nullptr || (context != 0 && (context_index(*c, context) >= 0 || context_index(*c, 0) >= 0));
     }
 
     // Remove backend context `context`'s entry on `device` (the context released its hold or is destroyed), writing

@@ -426,6 +426,10 @@ void test_context_entries_are_bounded_and_owned() {
     check(t.planned_n_ubatch(0, a_next) == 0, "another generation of A's slot is another owner");
     check(t.drop(kA), "A unloads");
     check(!t.drop_context(0, 100, nullptr), "A's context entries left with A");
+    check(!t.context_room(0, kB, 0), "context 0 has no room, as set_context_n_ubatch refuses it");
+    check(!t.drop_context(0, 0, nullptr), "context 0 is the free marker: dropping it removes nothing");
+    check(!t.drop_context(-1, kCtx1, nullptr) && !t.drop_context(GGML_SYCL_MAX_DEVICES, kCtx1, nullptr),
+          "a device out of range removes nothing");
     check(load_q8(t, 0, kA, 512) && t.planned_n_ubatch(0, kA) == 512, "A reloaded starts from its load's value");
 }
 
