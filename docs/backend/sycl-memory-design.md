@@ -2746,8 +2746,9 @@ first at `-ub 2048` is live does not shrink the plan the first context's buffers
 ladder is the case that rules out a latch: it publishes each rung for real, ascending, so a rung that passes the
 transaction and then loses at `sched_reserve` or to the host fallback has already raised the plan. The settle
 republishes the winner from the same context, which replaces that context's record, so the plan falls back to the
-winner instead of holding the losing rung's f16 dequant and Q8_1 src1 bytes off the winner's compute buffers. A
-context's record leaves when the context is destroyed, releasing its hold
+winner instead of holding the losing rung's f16 dequant and Q8_1 src1 bytes off the winner's compute buffers.
+
+A context's record leaves when the context is destroyed, releasing its hold
 (`unified_cache_release_planned_dense_scratch_context`), and the model is re-planned, so its plan may fall. With no
 context live the model plans at its load's `n_ubatch` again (`DENSE_SCRATCH_LOAD_N_UBATCH`). The load's value is no
 floor while a context is live: a context at `-ub 256` plans at 256, not at the load's 512. A model has room for
