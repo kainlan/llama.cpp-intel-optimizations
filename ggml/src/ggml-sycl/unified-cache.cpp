@@ -6902,9 +6902,11 @@ bool unified_cache::drain_all_queues_noexcept() noexcept {
     // mem_handle has already been destroyed and its host-USM freed --
     // writing through a dangling pointer. Every caller of this function
     // must run it before any member destructor of this class can run.
-    std::array<sycl::queue *, 5> queues{ &queue_, compute_queue_, dma_queue_.get(), bcs_queue_.get(),
-                                         event_watch_queue_.get() };
-    std::array<const char *, 5>  names{ "main", "compute", "DMA", "BCS", "event-watch" };
+    // llama.cpp-wfsl: moe_join_queue_ holds the CPU expert jobs' joins; draining it waits every job the backend
+    // still joins.
+    std::array<sycl::queue *, 6> queues{ &queue_,          compute_queue_,           dma_queue_.get(),
+                                         bcs_queue_.get(), event_watch_queue_.get(), moe_join_queue_.get() };
+    std::array<const char *, 6>  names{ "main", "compute", "DMA", "BCS", "event-watch", "MoE-join" };
     for (size_t i = 0; i < queues.size(); ++i) {
         sycl::queue * q = queues[i];
         if (!q) continue;
@@ -11972,6 +11974,50 @@ sycl::queue * unified_cache::get_event_watch_queue() {
     return event_watch_queue_.get();
 }
 
+sycl::queue * unified_cache::get_moe_join_queue() {
+    // llama.cpp-wfsl: created on first use, in-order so the joins keep their jobs' order, and non-profiling
+    // because a status query on a profiling queue's in-flight event busy-waits (see event_complete()).
+    // std::call_once for the same reason as get_event_watch_queue(): this getter takes no lock of its own.
+    std::call_once(moe_join_queue_once_, [this]() {
+        try {
+            moe_join_queue_ = std::make_unique<sycl::queue>(queue_.get_context(), queue_.get_device(),
+                                                            sycl::property::queue::in_order{});
+        } catch (const sycl::exception & e) {
+            GGML_LOG_WARN(
+                "[MOE-JOIN-QUEUE] Failed to create the CPU expert join queue; the joins stay on the compute "
+                "stream: %s (llama.cpp-wfsl)\n",
+                e.what());
+            moe_join_queue_.reset();
+        }
+    });
+    return moe_join_queue_.get();
+}
+
+sycl::queue * unified_cache::moe_join_queue_after(sycl::event * after, bool * has_after) {
+    sycl::queue * q = get_moe_join_queue();
+    if (!q) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(moe_join_mutex_);
+    if (last_host_task_valid_) {
+        *after     = last_host_task_;
+        *has_after = true;
+    }
+    if (!moe_join_queue_announced_) {
+        moe_join_queue_announced_ = true;
+        GGML_LOG_INFO(
+            "[MOE-JOIN-QUEUE] CPU expert joins go on a join-only queue (GGML_SYCL_MOE_JOIN_QUEUE=1) "
+            "(llama.cpp-wfsl)\n");
+    }
+    return q;
+}
+
+void unified_cache::note_compute_host_task(const sycl::event & e) {
+    std::lock_guard<std::mutex> lock(moe_join_mutex_);
+    last_host_task_       = e;
+    last_host_task_valid_ = true;
+}
+
 // get_or_wait REMOVED — legacy synchronous blocking pattern
 // get_by_data_ptr REMOVED — O(N) scan with zero callers
 
@@ -16708,6 +16754,76 @@ static unified_cache * get_existing_cache_for_device(int device_id) {
 unified_cache * get_existing_unified_cache_for_device(int device_id) {
     std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
     return get_existing_cache_for_device(device_id);
+}
+
+// llama.cpp-wfsl: the cache whose queue_ every host task of this process has been submitted on so far, or null
+// before the first; and whether the MoE join queue is refused for the rest of the process. A join on the join
+// queue waits only the latest host task recorded on that one queue_, so a host task anywhere else could be
+// posted behind a join whose job's inputs wait on it. See unified_cache_moe_join_queue_for().
+static std::atomic<unified_cache *> g_moe_join_queue_owner{ nullptr };
+static std::atomic<bool>            g_moe_join_queue_refused{ false };
+
+// Returns the CPU expert joins to the compute streams for the rest of the process, logging `why` once.
+static void unified_cache_moe_join_queue_refuse(const char * why) {
+    if (!g_moe_join_queue_refused.exchange(true, std::memory_order_acq_rel)) {
+        GGML_LOG_WARN(
+            "[MOE-JOIN-QUEUE] CPU expert joins go on the compute stream for the rest of the process: %s "
+            "(llama.cpp-wfsl)\n",
+            why);
+    }
+}
+
+// The cache whose queue_ is `q`, or null. Creates no cache.
+static unified_cache * moe_join_queue_cache_of(sycl::queue & q) {
+    const int       device = get_effective_mode() == unified_cache_mode::GLOBAL ? 0 : get_device_id_from_queue(q);
+    unified_cache * cache  = get_existing_unified_cache_for_device(device);
+    return cache && cache->get_queue() == q ? cache : nullptr;
+}
+
+// True when every host task so far was on `cache`'s queue_, or there was none, claiming them for it.
+static bool moe_join_queue_claim(unified_cache * cache) {
+    unified_cache * expected = nullptr;
+    return g_moe_join_queue_owner.compare_exchange_strong(expected, cache, std::memory_order_acq_rel) ||
+           expected == cache;
+}
+
+void unified_cache_note_host_task(sycl::queue & q, const sycl::event & e) {
+    if (g_moe_join_queue_refused.load(std::memory_order_acquire)) {
+        return;
+    }
+    // A host task submitted while `q` records is a graph node: no join outside the graph may depend on its event,
+    // and it runs at each replay of the graph, which no record covers.
+    if (q.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording) {
+        unified_cache_moe_join_queue_refuse("a host task was recorded into a command graph");
+        return;
+    }
+    unified_cache * cache = moe_join_queue_cache_of(q);
+    if (!cache) {
+        unified_cache_moe_join_queue_refuse(
+            "a host task was submitted on a queue that is not a cache's compute stream");
+        return;
+    }
+    if (!moe_join_queue_claim(cache)) {
+        unified_cache_moe_join_queue_refuse("host tasks were submitted on two devices' compute streams");
+        return;
+    }
+    cache->note_compute_host_task(e);
+}
+
+sycl::queue * unified_cache_moe_join_queue_for(sycl::queue & stream, sycl::event * after, bool * has_after) {
+    if (g_moe_join_queue_refused.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+    unified_cache * cache = moe_join_queue_cache_of(stream);
+    if (!cache) {
+        unified_cache_moe_join_queue_refuse("a CPU expert job's stream is not a cache's compute stream");
+        return nullptr;
+    }
+    if (!moe_join_queue_claim(cache)) {
+        unified_cache_moe_join_queue_refuse("CPU expert jobs or host tasks are on two devices' compute streams");
+        return nullptr;
+    }
+    return cache->moe_join_queue_after(after, has_after);
 }
 
 // Direct arena zone query — caller MUST hold g_cache_rw_mutex.
@@ -22572,6 +22688,10 @@ bool shutdown_unified_cache() {
         // unregister/free pinned backing exactly once.
         g_device_caches.clear();
         g_cache_mode_locked.store(false, std::memory_order_release);
+        // The join queue's owner was one of these caches, and a refusal was about their streams (llama.cpp-wfsl):
+        // a rebuilt backend starts the join queue's guard afresh rather than keeping a stale owner or refusal.
+        g_moe_join_queue_owner.store(nullptr, std::memory_order_release);
+        g_moe_join_queue_refused.store(false, std::memory_order_release);
     }
     // Cache destruction tears down host_arena_/pinned_chunk_pool while their
     // SYCL queues and single-device contexts are still valid. Only after every

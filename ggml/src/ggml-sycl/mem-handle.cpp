@@ -1024,12 +1024,27 @@ void mem_handle::set_ready_event(const sycl::event & event) {
     mem_handle_lock_guard g(lock_);
     cached_.has_ready_event = true;
     cached_.ready_event     = event;
+    // A producer recorded with an earlier event does not describe this one (llama.cpp-wfsl).
+    cached_.has_ready_queue = false;
+    cached_.ready_queue     = 0;
+}
+
+void mem_handle::set_ready_event(const sycl::event & event, const sycl::queue & producer) {
+    size_t                identity = 0;
+    const bool            known    = ready_queue_identity(producer, &identity);
+    mem_handle_lock_guard g(lock_);
+    cached_.has_ready_event = true;
+    cached_.ready_event     = event;
+    cached_.has_ready_queue = known;
+    cached_.ready_queue     = identity;
 }
 
 void mem_handle::clear_ready_event() {
     mem_handle_lock_guard g(lock_);
     cached_.has_ready_event = false;
     cached_.ready_event     = {};
+    cached_.has_ready_queue = false;
+    cached_.ready_queue     = 0;
 }
 
 // === resolve ===

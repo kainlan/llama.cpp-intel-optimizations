@@ -386,8 +386,8 @@ MUTANTS = [
     (
         "C3 census line demoted to INFO",
         BACKEND,
-        'GGML_LOG_WARN("[MOE-HOSTPATH-WAITS]',
-        'GGML_LOG_INFO("[MOE-HOSTPATH-WAITS]',
+        'GGML_LOG_WARN(\n            "[MOE-HOSTPATH-WAITS]',
+        'GGML_LOG_INFO(\n            "[MOE-HOSTPATH-WAITS]',
     ),
     (
         "C4 join classified at a timer (strstr per wait when off)",

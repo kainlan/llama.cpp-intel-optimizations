@@ -96,7 +96,7 @@ inline sycl::event preprocess_tokens_q8_async(const sycl::half * tokens,
     int64_t num_blocks = batch * (in_dim / QK8_0);
 
     return queue.submit([&](sycl::handler & cgh) {
-        if (ggml_sycl_should_add_dependency(dep_event)) {
+        if (ggml_sycl_should_add_dependency(dep_event, GGML_SYCL_READY_QUERY_SITE_MOE_XMX)) {
             cgh.depends_on(dep_event);
         }
         cgh.parallel_for(sycl::nd_range<1>(num_blocks * SG_SIZE, SG_SIZE),

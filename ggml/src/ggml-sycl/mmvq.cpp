@@ -21831,7 +21831,10 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
             return false;
         }
         if (resolved.has_ready_event) {
-            ggml_sycl_chain_ready_event_if_needed(*stream, resolved);
+            size_t stream_identity = 0;
+            ggml_sycl_chain_ready_event_if_needed(*stream, resolved,
+                                                  ggml_sycl_chain_same_queue_identity(*stream, &stream_identity),
+                                                  GGML_SYCL_READY_QUERY_SITE_MMVQ_MOE_WEIGHT);
         }
         src0_d = resolved.ptr;
     }
@@ -23994,7 +23997,10 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx,
     // Unified weight resolution: single O(1) cache lookup
     auto resolved = ggml_sycl_resolve(src0, device_id);
     if (resolved && resolved.has_ready_event) {
-        ggml_sycl_chain_ready_event_if_needed(*stream, resolved);
+        size_t stream_identity = 0;
+        ggml_sycl_chain_ready_event_if_needed(*stream, resolved,
+                                              ggml_sycl_chain_same_queue_identity(*stream, &stream_identity),
+                                              GGML_SYCL_READY_QUERY_SITE_MMVQ_WEIGHT);
     }
     if (resolved && (resolved.layout == GGML_LAYOUT_SOA || resolved.layout == GGML_LAYOUT_COALESCED)) {
         layout      = resolved.layout;

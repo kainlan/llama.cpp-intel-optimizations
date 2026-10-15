@@ -174,7 +174,7 @@ enum class offload_wait_reason : uint8_t {
 
 static inline bool offload_event_waitable(const sycl::event & evt) {
     try {
-        return ggml_sycl_should_add_dependency(evt);
+        return ggml_sycl_should_add_dependency(evt, GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH);
     } catch (...) {
         return false;
     }
@@ -209,7 +209,7 @@ static inline void wait_dependency_if_needed(const sycl::event & evt) {
 
 static inline void append_dependency(std::vector<sycl::event> & deps, const sycl::event & evt) {
     try {
-        if (ggml_sycl_should_add_dependency(evt)) {
+        if (ggml_sycl_should_add_dependency(evt, GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH)) {
             deps.push_back(evt);
         }
     } catch (...) {
@@ -260,6 +260,11 @@ static sycl::event cpu_submit_async(sycl::queue * cpu_q, const std::vector<sycl:
         }
         fn(cgh);
     });
+    if (!submit_on_cpu_queue) {
+        // Off the CPU queue every caller submits a host task, which a CPU expert job's join on the MoE join
+        // queue must wait (llama.cpp-wfsl).
+        ggml_sycl::unified_cache_note_host_task(*cpu_q, evt);
+    }
     if (ggml_sycl_cpu_offload_async_enabled()) {
         g_cpu_chain_event        = evt;
         g_cpu_chain_event_valid  = true;
@@ -2645,7 +2650,7 @@ bool ggml_sycl_batched_mode_active() {
 
 static void staging_track_cpu_event(const sycl::event & evt) {
     try {
-        if (!ggml_sycl_should_add_dependency(evt)) {
+        if (!ggml_sycl_should_add_dependency(evt, GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH)) {
             return;
         }
     } catch (...) {

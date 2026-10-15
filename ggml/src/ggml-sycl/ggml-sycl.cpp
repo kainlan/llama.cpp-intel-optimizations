@@ -24099,6 +24099,13 @@ struct moe_hostpath_wait_census {
     int      readbacks             = 0;
     int      readbacks_async       = 0;              // ids copies left on the queue (llama.cpp-7pvo)
     int      context               = MOE_WAIT_NONE;  // class forced on the waits inside a flush (B4b, B7)
+    // Source ready events the per-op chain met (llama.cpp-wfsl): queried as before, or skipped because the op's
+    // own in-order stream produced them (GGML_SYCL_CHAIN_SAME_QUEUE_SKIP).
+    uint64_t ready_queries         = 0;
+    uint64_t ready_skipped         = 0;
+    // CPU expert job joins by the queue they went on (llama.cpp-wfsl): the join-only queue or the compute stream.
+    uint64_t joins_join_queue      = 0;
+    uint64_t joins_stream          = 0;
 };
 
 static thread_local moe_hostpath_wait_census g_moe_hostpath_waits;
@@ -24161,6 +24168,27 @@ struct moe_hostpath_wait_context {
     ~moe_hostpath_wait_context() { g_moe_hostpath_waits.context = saved; }
 };
 
+// Adds one op's source ready-event counts to the token's census (llama.cpp-wfsl).
+static void moe_hostpath_waits_ready(const ggml_sycl_chain_ready_counts & c) {
+    if (!moe_hostpath_waits_enabled()) {
+        return;
+    }
+    g_moe_hostpath_waits.ready_queries += c.queries;
+    g_moe_hostpath_waits.ready_skipped += c.skipped;
+}
+
+// Counts one CPU expert job join in the token's census by the queue it went on (llama.cpp-wfsl).
+static void moe_hostpath_waits_join(bool on_join_queue) {
+    if (!moe_hostpath_waits_enabled()) {
+        return;
+    }
+    if (on_join_queue) {
+        g_moe_hostpath_waits.joins_join_queue += 1;
+    } else {
+        g_moe_hostpath_waits.joins_stream += 1;
+    }
+}
+
 // Called at each expert-id readback.  A layer id lower than the last one starts a new token, so the
 // previous token's line is printed and the counts restart.  `async` names an ids copy this thread
 // enqueued and did not wait for: the event-chained hybrid decode route's (llama.cpp-7pvo), one per op.
@@ -24184,9 +24212,32 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
             total_n += w.count[c];
             total_us += w.us[c];
         }
-        GGML_LOG_WARN("[MOE-HOSTPATH-WAITS] token=%llu readbacks=%d async=%d%s total=%llu/%.0fus\n",
-                      (unsigned long long) w.token, w.readbacks, w.readbacks_async, line, (unsigned long long) total_n,
-                      total_us);
+        // The other sites' status queries, by name and only those that asked, and the summed time of every query
+        // that found its event unfinished, the per-op chain's included (llama.cpp-wfsl).
+        ggml_sycl_ready_query_census & rq = ggml_sycl_ready_query_census_this_thread();
+        char                           other_sites[512];
+        int                            other_at = 0;
+        for (int site = 0; site < GGML_SYCL_READY_QUERY_SITE_COUNT; ++site) {
+            if (site == GGML_SYCL_READY_QUERY_SITE_PER_OP_CHAIN || rq.count[site] == 0 ||
+                other_at >= (int) sizeof(other_sites)) {
+                continue;
+            }
+            other_at +=
+                snprintf(other_sites + other_at, sizeof(other_sites) - other_at, "%s%s=%llu", other_at > 0 ? "," : "",
+                         ggml_sycl_ready_query_site_name((ggml_sycl_ready_query_site) site),
+                         (unsigned long long) rq.count[site]);
+        }
+        if (other_at == 0) {
+            snprintf(other_sites, sizeof(other_sites), "none");
+        }
+        // joinq=1 when every CPU expert job join of the token went on the join-only queue.
+        const int joinq = w.joins_join_queue > 0 && w.joins_stream == 0 ? 1 : 0;
+        GGML_LOG_WARN(
+            "[MOE-HOSTPATH-WAITS] token=%llu readbacks=%d async=%d%s total=%llu/%.0fus ready_queries=%llu "
+            "ready_skipped=%llu ready_queries_other=%s ready_query_us=%.0f joinq=%d\n",
+            (unsigned long long) w.token, w.readbacks, w.readbacks_async, line, (unsigned long long) total_n, total_us,
+            (unsigned long long) w.ready_queries, (unsigned long long) w.ready_skipped, other_sites, rq.pending_us,
+            joinq);
         // The same token's CpuExpertPool jobs (llama.cpp-b2jc): how many, and where each
         // job's time went between its submit and its result.
         ggml_sycl::cpu_expert_pool_trace_totals pt;
@@ -24224,6 +24275,11 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
         }
         w.readbacks       = 0;
         w.readbacks_async = 0;
+        w.ready_queries    = 0;
+        w.ready_skipped    = 0;
+        w.joins_join_queue = 0;
+        w.joins_stream     = 0;
+        rq                 = ggml_sycl_ready_query_census{};
         ++w.token;
     }
     w.last_layer = layer;
@@ -24401,15 +24457,61 @@ static void moe_cpu_job_join(const std::shared_future<void> & job, ggml_sycl::cp
     }
 }
 
-// Submits the join of a CPU job on `queue` and returns its event.  The host_task
-// holds the job's shared future, and its stamp record when there is one: the
-// record is shared, so it outlives the job's slot however late the join runs.
+// GGML_SYCL_MOE_JOIN_QUEUE, read once (llama.cpp-wfsl): unset or non-zero joins CPU expert jobs on the cache's
+// join-only queue, 0 joins them on the compute stream as before.
+static bool moe_join_queue_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_JOIN_QUEUE");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Whether a CPU job's join may go on the join queue instead of `stream` (llama.cpp-wfsl): the knob is on, and
+// neither the backend nor `stream` itself records a command graph, since the scatter would record a dependency on
+// a join outside the graph.  When this is false every join is on the stream, exactly as without the join queue.
+static bool moe_cpu_job_join_may_leave_stream(sycl::queue & stream) {
+    return moe_join_queue_enabled() && !ggml_sycl_graph_recording_active() &&
+           stream.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording;
+}
+
+// The queue a CPU job's join goes on instead of `stream`, or null to join on `stream` (llama.cpp-wfsl).  A host
+// task's command has no queue, so before posting it the SYCL runtime queries the status of each device event it
+// depends on, and the driver answers a query on an unsignaled event with a sched_yield on this thread.  On the
+// stream the join depended that way on the device-expert kernel just submitted.  On the join queue it depends on
+// the previous join and on `*after`, both host-task events, which are never queried.
+static sycl::queue * moe_cpu_job_join_queue(sycl::queue & stream, sycl::event * after, bool * has_after) {
+    if (!moe_cpu_job_join_may_leave_stream(stream)) {
+        return nullptr;
+    }
+    return ggml_sycl::unified_cache_moe_join_queue_for(stream, after, has_after);
+}
+
+// Submits the join of a CPU job and returns its event.  The host_task holds the
+// job's shared future, and its stamp record when there is one: the record is
+// shared, so it outlives the job's slot however late the join runs.  `queue` is
+// the in-order stream the job's scatter goes on.  The join goes on the join queue
+// when moe_cpu_job_join_queue() returns one, after the latest other host task on
+// the stream (llama.cpp-wfsl); otherwise it goes on `queue`, and is recorded as
+// one of the stream's host tasks, which a later join on the join queue must wait.
 static sycl::event moe_cpu_job_join_on_queue(sycl::queue &                                     queue,
                                              std::shared_future<void>                          job,
                                              std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> stamps) {
-    return queue.submit([&](sycl::handler & cgh) {
+    sycl::event         after;
+    bool                has_after = false;
+    sycl::queue * const join_q    = moe_cpu_job_join_queue(queue, &after, &has_after);
+    sycl::queue &       target    = join_q ? *join_q : queue;
+    moe_hostpath_waits_join(join_q != nullptr);
+    sycl::event         join      = target.submit([&](sycl::handler & cgh) {
+        if (has_after) {
+            cgh.depends_on(after);
+        }
         cgh.host_task([job, stamps = std::move(stamps)]() { moe_cpu_job_join(job, stamps.get()); });
     });
+    if (!join_q) {
+        ggml_sycl::unified_cache_note_host_task(queue, join);
+    }
+    return join;
 }
 
 // Fills `req` with the pool job's trace label and returns it while tracing, else
@@ -26174,9 +26276,10 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
                         "dropped (llama.cpp-93tw)");
         }
 
-        // Join each CPU job on the in-order queue instead of on this thread (llama.cpp-z4kd).  The scatter
-        // below depends on the joins, so it reads the staging only after the jobs wrote it, and the GPU work
-        // that follows on this queue sees the rows.  This thread goes on submitting.
+        // Join each CPU job with a host task instead of on this thread (llama.cpp-z4kd), on the cache's join-only
+        // queue or on the stream (moe_cpu_job_join_on_queue, llama.cpp-wfsl).  The scatter below depends on the
+        // join events, so it reads the staging only after the jobs wrote it, and the GPU work that follows on the
+        // stream sees the rows.  This thread goes on submitting.
         std::vector<sycl::event> & joins = ws.joins;
         joins.clear();
         for (int k = 0; k < n_group; ++k) {
@@ -26185,9 +26288,8 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
 
         auto t1 = hrc::now();  // After the join submissions (no wait)
 
-        // Scatter results H2D — submitted to the in-order compute queue behind the joins.
-        // Subsequent GPU kernels on this queue will wait for them (same-device
-        // in-order guarantee).
+        // Scatter results H2D, submitted on the in-order stream and depending on the join events wherever the
+        // joins went.  Later GPU kernels on the stream run after the scatter (in-order guarantee).
         double total_bytes = 0;
         for (int k = 0; k < n_group; ++k) {
             const auto & entries = group[k]->entries;
@@ -26237,9 +26339,14 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
             moe_host_scatter_submit_flagged(slot, joins, ws.events);
             n_copies += 2;
         }
-        // A flush with no rows to place still leaves its joins for the graph boundary to wait.
+        // A flush with no rows to place still leaves its joins for the graph boundary to wait.  When the joins may
+        // be on the join-only queue (moe_cpu_job_join_on_queue), a barrier keeps this stream's later commands
+        // behind them, as when they were on it; when they cannot be, the stream is left as it was without it.
         if (ws.events.empty()) {
             ws.events.insert(ws.events.end(), joins.begin(), joins.end());
+            if (moe_cpu_job_join_may_leave_stream(*slot.stream)) {
+                slot.stream->ext_oneapi_submit_barrier(joins);
+            }
         }
 
         // A job reads its activation buffers and writes its output until its join completes; the copies
@@ -51290,7 +51397,10 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                     resolved = ggml_sycl_resolve(src0, i);
                 }
                 if (resolved && resolved.has_ready_event && resolved.layout == src0_layout) {
-                    ggml_sycl_chain_ready_event_if_needed(*stream, resolved);
+                    size_t stream_identity = 0;
+                    ggml_sycl_chain_ready_event_if_needed(
+                        *stream, resolved, ggml_sycl_chain_same_queue_identity(*stream, &stream_identity),
+                        GGML_SYCL_READY_QUERY_SITE_MUL_MAT_WEIGHT);
                 }
                 if (resolved && resolved.on_device && resolved.layout == src0_layout) {
                     dev[i].src0_dd                = (char *) resolved.ptr;
@@ -77601,7 +77711,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return;
             }
             try {
-                ggml_sycl_set_tensor_ready_event(dst, ctx->device, ggml_sycl_submit_queue_sync_event(*stream));
+                ggml_sycl_set_tensor_ready_event(dst, ctx->device, ggml_sycl_submit_queue_sync_event(*stream), stream);
             } catch (...) {
             }
         }
@@ -80302,7 +80412,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                         ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_node_skip, pair.glu_dst, ctx.device);
                         if (glu_event_set) {
-                            ggml_sycl_set_tensor_ready_event(pair.glu_dst, ctx.device, glu_event);
+                            // Every completion event of the pair GLU dispatch is submitted on ctx.stream().
+                            ggml_sycl_set_tensor_ready_event(pair.glu_dst, ctx.device, glu_event, ctx.stream());
                         }
 
                         // Down: attempt the cached-Q8 consumer that pairs with the GLU
@@ -80432,7 +80543,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_mmid_skip, pair.down_dst,
                                                                       ctx.device);
                                 if (down_event_set) {
-                                    ggml_sycl_set_tensor_ready_event(pair.down_dst, ctx.device, down_event);
+                                    // The cached-Q8 down dispatch submits on ctx.stream().
+                                    ggml_sycl_set_tensor_ready_event(pair.down_dst, ctx.device, down_event,
+                                                                     ctx.stream());
                                 }
                             }
                         } else if (decode_pair_path_trace_enabled != 0) {
@@ -89151,7 +89264,9 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
         split_merge_drain();
     }
     if (ctx.stream() != nullptr) {
-        ggml_sycl_chain_source_ready_events_if_needed(*ctx.stream(), dst, ctx.device);
+        ggml_sycl_chain_ready_counts ready_counts;
+        ggml_sycl_chain_source_ready_events_if_needed(*ctx.stream(), dst, ctx.device, &ready_counts);
+        moe_hostpath_waits_ready(ready_counts);
     }
     if (dt.enabled) {
         dt.resolve_us = dt.elapsed_us();
@@ -91480,10 +91595,10 @@ static bool ggml_sycl_try_fuse_moe_down_weighted_sum(ggml_backend_sycl_context &
         down->nb[2], bias->nb[1], ids->nb[0], ids->nb[1], weights->nb[1], weights->nb[2], final->nb[1],
         final_token_stride);
     if (!ggml_sycl_graph_recording_active()) {
-        ggml_sycl_set_tensor_ready_event(final, ctx.device, evt);
+        ggml_sycl_set_tensor_ready_event(final, ctx.device, evt, ctx.stream());
         if (std::getenv("GGML_SYCL_MOE_DOWN_SUM_WRITE_BIASED")) {
-            ggml_sycl_set_tensor_ready_event(down, ctx.device, evt);
-            ggml_sycl_set_tensor_ready_event(down_biased, ctx.device, evt);
+            ggml_sycl_set_tensor_ready_event(down, ctx.device, evt, ctx.stream());
+            ggml_sycl_set_tensor_ready_event(down_biased, ctx.device, evt, ctx.stream());
         }
     }
     if (down_sum_drain) {

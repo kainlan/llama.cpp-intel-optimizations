@@ -320,7 +320,8 @@ static sycl::event ggml_sycl_fattn_xmx_submit_set_rows_update(const ggml_tensor 
     constexpr int block_size     = 64;
     const int64_t grid_size      = (total_elements + block_size - 1) / block_size;
 
-    const bool add_set_rows_dep = ggml_sycl_should_add_dependency(set_rows_event);
+    const bool add_set_rows_dep =
+        ggml_sycl_should_add_dependency(set_rows_event, GGML_SYCL_READY_QUERY_SITE_FATTN_SET_ROWS);
 
     ggml_sycl_profile_label profile_label{};
     profile_label.name       = "fattn.xmx_pack_k_set_rows";
@@ -643,10 +644,11 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
             packed.n_blocks    = n_blocks;
             packed.total_bytes = total_bytes;
             GGML_SYCL_FATTN_PRIVATE_FAILPOINT("sidecar-zero-to-update");
-            add_zero_dep = ggml_sycl_should_add_dependency(zero_event);
+            add_zero_dep = ggml_sycl_should_add_dependency(zero_event, GGML_SYCL_READY_QUERY_SITE_FATTN_PACKED_ZERO);
         } else {
             try {
-                add_prev_dep = ggml_sycl_should_add_dependency(packed.ready_event);
+                add_prev_dep =
+                    ggml_sycl_should_add_dependency(packed.ready_event, GGML_SYCL_READY_QUERY_SITE_FATTN_PACKED_PREV);
             } catch (...) {
                 add_prev_dep = true;
             }
@@ -1710,7 +1712,7 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
     bool              add_prev_dep = false;
     if (reuse_alloc) {
         try {
-            add_prev_dep = ggml_sycl_should_add_dependency(previous_use);
+            add_prev_dep = ggml_sycl_should_add_dependency(previous_use, GGML_SYCL_READY_QUERY_SITE_FATTN_PREV_USE);
         } catch (...) {
             add_prev_dep = true;
         }

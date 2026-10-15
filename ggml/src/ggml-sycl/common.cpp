@@ -2915,6 +2915,24 @@ void ggml_sycl_pp_reset_stats() {
     g_sycl_pp_config.total_sync_waits      = 0;
 }
 
+// GGML_SYCL_CHAIN_SAME_QUEUE_SKIP, read once (llama.cpp-wfsl): unset or non-zero lets an op skip the source ready
+// events its own in-order stream produced (the per-op source chain and ggml_sycl_chain_ready_event_if_needed's callers
+// that pass their queue's identity), 0 queries every one as before.
+bool ggml_sycl_chain_same_queue_skip_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_CHAIN_SAME_QUEUE_SKIP");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// One census per thread (llama.cpp-wfsl): a query is counted where it was asked, and only the submitting thread
+// prints and resets its own.
+ggml_sycl_ready_query_census & ggml_sycl_ready_query_census_this_thread() {
+    static thread_local ggml_sycl_ready_query_census census;
+    return census;
+}
+
 // --- Scratchpad decline seam (llama.cpp-23mk S3-3) ---
 namespace {
 const char * const g_scratchpad_site_names[GGML_SYCL_SCRATCHPAD_SITE_COUNT] = {

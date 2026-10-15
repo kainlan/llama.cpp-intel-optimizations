@@ -304,7 +304,7 @@ sycl::event moe_count_tokens_per_expert_async(const char *  ids_base,
                                               sycl::event   dep_event = {}) {
     // Zero counts (with dependency on previous event if provided)
     std::vector<sycl::event> deps;
-    if (ggml_sycl_should_add_dependency(dep_event)) {
+    if (ggml_sycl_should_add_dependency(dep_event, GGML_SYCL_READY_QUERY_SITE_MOE_SORT)) {
         deps.push_back(dep_event);
     }
     sycl::event memset_event = ggml_sycl::mem_fill_async(ggml_sycl_moe_sort_direct_handle(expert_counts, queue, MAX_EXPERTS * sizeof(int32_t)), 0,
@@ -339,7 +339,7 @@ inline sycl::event moe_compute_expert_offsets_gpu(const int32_t * expert_counts,
     // Output: expert_offsets[i] = sum of counts[0..i-1] (exclusive)
     //         expert_offsets[n_experts] = total (inclusive sum)
     return queue.submit([&](sycl::handler & cgh) {
-        if (ggml_sycl_should_add_dependency(dep_event)) {
+        if (ggml_sycl_should_add_dependency(dep_event, GGML_SYCL_READY_QUERY_SITE_MOE_SORT)) {
             cgh.depends_on(dep_event);
         }
 
@@ -396,7 +396,7 @@ inline sycl::event moe_compute_expert_offsets_gpu_simple(const int32_t * expert_
                                                          sycl::queue &   queue,
                                                          sycl::event     dep_event = {}) {
     return queue.submit([&](sycl::handler & cgh) {
-        if (ggml_sycl_should_add_dependency(dep_event)) {
+        if (ggml_sycl_should_add_dependency(dep_event, GGML_SYCL_READY_QUERY_SITE_MOE_SORT)) {
             cgh.depends_on(dep_event);
         }
 
@@ -429,7 +429,7 @@ sycl::event moe_sort_tokens_by_expert_async(const T *         tokens_in,
                                             sycl::queue &     queue,
                                             sycl::event       dep_event = {}) {
     return queue.submit([&](sycl::handler & cgh) {
-        if (ggml_sycl_should_add_dependency(dep_event)) {
+        if (ggml_sycl_should_add_dependency(dep_event, GGML_SYCL_READY_QUERY_SITE_MOE_SORT)) {
             cgh.depends_on(dep_event);
         }
 
@@ -476,7 +476,7 @@ inline sycl::event moe_scatter_results_f16_to_f32_async(const sycl::half *      
                                                         sycl::queue &           queue,
                                                         sycl::event             dep_event = {}) {
     return queue.submit([&](sycl::handler & cgh) {
-        if (ggml_sycl_should_add_dependency(dep_event)) {
+        if (ggml_sycl_should_add_dependency(dep_event, GGML_SYCL_READY_QUERY_SITE_MOE_SORT)) {
             cgh.depends_on(dep_event);
         }
 
@@ -511,7 +511,7 @@ inline sycl::event moe_compute_tile_mapping(const int32_t * expert_counts,      
                                             sycl::queue &   queue,
                                             sycl::event     dep_event = {}) {
     return queue.submit([&](sycl::handler & cgh) {
-        if (ggml_sycl_should_add_dependency(dep_event)) {
+        if (ggml_sycl_should_add_dependency(dep_event, GGML_SYCL_READY_QUERY_SITE_MOE_SORT)) {
             cgh.depends_on(dep_event);
         }
 
