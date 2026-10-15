@@ -23,7 +23,8 @@ namespace ggml_sycl {
 // Persistent thread pool for CPU expert computation.
 // Replaces per-call std::async with pre-spawned workers.
 //
-// Thread count default: hardware_concurrency - 2 (reserve for GPU driver).
+// Worker count default: 1 (each job's row loop already spans the shared TBB arena;
+// see get_cpu_expert_thread_count()).
 // Override: GGML_SYCL_CPU_EXPERT_THREADS=N
 //
 // The pool owns threads and a work queue, no memory. CPU expert staging comes

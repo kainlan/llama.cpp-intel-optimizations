@@ -30,9 +30,13 @@ static int get_cpu_expert_thread_count() {
             return n;
         }
     }
-    // Default: hardware_concurrency - 2 (reserve for GPU driver threads)
-    int hw = static_cast<int>(std::thread::hardware_concurrency());
-    return std::max(1, hw - 2);
+    // Default: one worker.  Each job's row loop is a parallel_for into the backend's ONE TBB
+    // arena (ggml_sycl_cpu_threads_hint(), GGML_SYCL_CPU_THREADS), so a second worker does
+    // not add threads; it splits the arena between overlapping jobs.  The jobs gain nothing
+    // from running together: the layer chain already orders them (gate/up, then down, then
+    // the next layer).  Measured 2026-10-15 on Qwen3.8 decode (B70, -c 4096): 22 workers
+    // 8.1 t/s, 4 workers 9.4 t/s, 1 worker 10.5 t/s.
+    return 1;
 }
 
 // ---------------------------------------------------------------------------

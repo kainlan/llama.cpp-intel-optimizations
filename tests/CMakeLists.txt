@@ -829,6 +829,13 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-source.py --self-test)
     set_tests_properties(test-sycl-cpu-expert-pool-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+    # CpuExpertPool defaults to one worker: every job's row loop shares the one
+    # TBB arena, and the layer chain already orders the jobs (llama.cpp-w4e9).
+    # Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-cpu-expert-pool-default-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-default-source.py --self-test)
+    set_tests_properties(test-sycl-cpu-expert-pool-default-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # Host MoE experts must read the activation row of their own slot, not row 0
     # (llama.cpp-4hg7: GPT-OSS down-projection decode garbage under host-tiered
     # experts). Run WITH --self-test so each anchor is proven load-bearing.
