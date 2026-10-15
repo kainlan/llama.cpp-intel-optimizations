@@ -475,6 +475,16 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-moe-decode-hostpath PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# The CPU expert pool trace's per-job stamp sums and per-job line (llama.cpp-j6jf).
+# ggml-sycl/cpu-expert-pool-stamps.hpp includes only the standard library, so the
+# test links nothing: no SYCL runtime is loaded and no device is opened.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-cpu-expert-pool-stamps test-sycl-cpu-expert-pool-stamps.cpp)
+    target_include_directories(test-sycl-cpu-expert-pool-stamps PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    add_test(NAME test-sycl-cpu-expert-pool-stamps COMMAND test-sycl-cpu-expert-pool-stamps)
+    set_tests_properties(test-sycl-cpu-expert-pool-stamps PROPERTIES LABELS "sycl;moe;hostonly" TIMEOUT 30)
+endif()
+
 # Host-expert MoE result scatter (llama.cpp-cre6): the compact form (one copy into the planned scratch, one kernel
 # placing rows by slot) against the per-run copies it replaces, on synthetic routings. ggml-sycl/moe-host-scatter.hpp
 # includes only the standard library, so this needs no device.
@@ -844,6 +854,15 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-row-workers-source.py --self-test)
     set_tests_properties(test-sycl-cpu-row-workers-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+    # Every CPU expert pool job stamp is taken inside a trace guard, the trace line
+    # carries the six per-token sums, and =2 is the only per-job printer
+    # (llama.cpp-j6jf). Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-cpu-expert-pool-stamps-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-stamps-source.py --self-test)
+    # TIMEOUT: its mutant self-test took 29.5 s wall at host load 43, against the old 30 s.
+    set_tests_properties(test-sycl-cpu-expert-pool-stamps-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # Host MoE experts must read the activation row of their own slot, not row 0
     # (llama.cpp-4hg7: GPT-OSS down-projection decode garbage under host-tiered
     # experts). Run WITH --self-test so each anchor is proven load-bearing.

@@ -544,7 +544,10 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
         return squash(brace_block_from(code, code.find(sig)))
 
     wait_body = one_body(WAIT_INPUTS_DEF, "W1")
+    # Between the wait and the zeroing sits only the trace's inputs-ready stamp (llama.cpp-j6jf), which reads
+    # the clock and writes the pool job's record; it neither waits nor touches the output span.
     if wait_body != ("{ if (!inputs.events.empty()) { sycl::event::wait(inputs.events); } "
+                     "if (moe_hostpath_waits_enabled()) { ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready(); } "
                      "if (inputs.zero_out && inputs.zero_bytes > 0) { std::memset(inputs.zero_out, 0, inputs.zero_bytes); } }"):
         raise ContractError(
             "FAIL [pin W1]: moe_cpu_job_wait_inputs is not exactly `wait every input event, then zero the output "
@@ -566,7 +569,8 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
     submits = (
         "prologue = std::move(job_prologue)]() mutable { GGML_UNUSED(workspace_owner); prologue(); "
         "for (const cpu_moe_host_aos_task & task : tasks) {",
-        "result.future = cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue));",
+        "result.future = cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue), {}, "
+        "moe_cpu_job_trace_request(job_trace, src0));",
         "prologue = std::move(job_prologue)]() mutable { prologue(); "
         "ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size())); }",
     )
@@ -579,7 +583,7 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
     require_unconditional(lam, lam.find(prologue_def), header=None, pin="W2", what="the job prologue")
     ep = squash(blank_comments(expert_pool_src))
     push = ("work_queue_.push([this, tasks = std::move(tasks), prologue = std::move(prologue), "
-            "resolve = std::move(resolve), promise, trace, t_submit]() mutable {")
+            "resolve = std::move(resolve), promise, trace, t_submit, stamps = std::move(stamps)]() mutable {")
     push_at = ep.find(push)
     worker = ep[push_at : ep.find("promise->set_value(); });", push_at)] if push_at >= 0 else ""
     run_prologue = "if (prologue) { prologue(); }"
@@ -589,8 +593,9 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
     if ep.count(push) != 1:
         raise ContractError(
             "FAIL [pin W2]: CpuExpertPool::submit_batch does not queue exactly one worker lambda with the capture "
-            "list `[this, tasks, prologue, resolve, promise, trace, t_submit]`; the worker needs `this` to run the "
-            "row loop on the pool's row workers (llama.cpp-z4kd, llama.cpp-w4e9)"
+            "list `[this, tasks, prologue, resolve, promise, trace, t_submit, stamps]`; the worker needs `this` to run "
+            "the row loop on the pool's row workers and `stamps` to record the job's critical path (llama.cpp-z4kd, "
+            "llama.cpp-w4e9, llama.cpp-j6jf)"
         )
     if worker.count(kernel) != 1:
         raise ContractError(
@@ -927,10 +932,13 @@ def self_test(backend_src: str) -> int:
         "const bool zero_out_after_act_wait = from_pool || !out_owner.valid();\n"
         "                if (zero_out_after_act_wait) { std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float)); }"),
         None, "W1")
-    wait_then_zero = ("    if (!inputs.events.empty()) {\n        sycl::event::wait(inputs.events);\n    }\n"
+    stamp_inputs = ("    // The job's inputs-ready stamp (llama.cpp-j6jf); a no-op off a traced pool job.\n"
+                    "    if (moe_hostpath_waits_enabled()) {\n"
+                    "        ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready();\n    }\n")
+    wait_then_zero = ("    if (!inputs.events.empty()) {\n        sycl::event::wait(inputs.events);\n    }\n" + stamp_inputs +
                       "    if (inputs.zero_out && inputs.zero_bytes > 0) {\n        std::memset(inputs.zero_out, 0, inputs.zero_bytes);\n    }\n")
     zero_then_wait = ("    if (inputs.zero_out && inputs.zero_bytes > 0) {\n        std::memset(inputs.zero_out, 0, inputs.zero_bytes);\n    }\n"
-                      "    if (!inputs.events.empty()) {\n        sycl::event::wait(inputs.events);\n    }\n")
+                      "    if (!inputs.events.empty()) {\n        sycl::event::wait(inputs.events);\n    }\n" + stamp_inputs)
     # W1: the prologue zeroes before it waits the activation copy.
     expect_fail("prologue-zeroes-before-wait", sub(wait_then_zero, zero_then_wait, in_lambda=False, after=WAIT_INPUTS_DEF),
                 None, "W1")
@@ -946,14 +954,17 @@ def self_test(backend_src: str) -> int:
         None, "W2")
     expect_fail("recipe-skips-prologue", sub("GGML_UNUSED(workspace_owner);\n                        prologue();\n",
                                              "GGML_UNUSED(workspace_owner);\n"), None, "W2")
-    expect_fail("pool-submit-drops-prologue", sub("cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue))",
-                                                  "cpu_pool.submit_batch(std::move(batch_tasks))"), None, "W2")
+    expect_fail("pool-submit-drops-prologue", sub("cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue), {},",
+                                                  "cpu_pool.submit_batch(std::move(batch_tasks), {}, {},"), None, "W2")
     worker_prologue = "            if (prologue) {\n                prologue();\n            }\n"
     worker_resolve = "            if (resolve) {\n                resolve(tasks);\n            }\n"
     worker_kernel = ("            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()), "
                      "row_workers_);\n")
     expect_fail("pool-worker-skips-prologue", backend_src, None, "W2", None,
                 expert_pool_src.replace(worker_prologue, "", 1))
+    expect_fail("pool-worker-drops-the-stamps-capture", backend_src, None, "W2", None,
+                expert_pool_src.replace("t_submit, stamps = std::move(stamps)]() mutable {",
+                                        "t_submit]() mutable {", 1))
     expect_fail("pool-worker-kernel-on-the-arena", backend_src, None, "W2", None,
                 expert_pool_src.replace(worker_kernel, "            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), "
                                         "static_cast<int>(tasks.size()));\n", 1))

@@ -24028,6 +24028,10 @@ struct pending_cpu_scatter {
         std::vector<sycl::event> scatter_events;
     } prev_scatter;
 
+    // The pool job's stamp record while GGML_SYCL_MOE_IDS_COPY_TRACE is set, else empty; handed to the job's join
+    // host_task beside `future` (llama.cpp-j6jf).
+    std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> job_stamps;
+
     pending_cpu_scatter() :
         out_pinned(nullptr),
         act_pinned(nullptr),
@@ -24107,6 +24111,15 @@ static bool moe_hostpath_waits_enabled() {
     return enabled;
 }
 
+// GGML_SYCL_MOE_IDS_COPY_TRACE's value: 2 and above also print one line per pool job (llama.cpp-j6jf).
+static int moe_hostpath_trace_level() {
+    static const int level = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_IDS_COPY_TRACE");
+        return env ? std::atoi(env) : 0;
+    }();
+    return level;
+}
+
 using moe_hostpath_clock = std::chrono::steady_clock;
 
 static moe_hostpath_clock::time_point moe_hostpath_wait_begin() {
@@ -24178,13 +24191,30 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
         // job's time went between its submit and its result.
         ggml_sycl::cpu_expert_pool_trace_totals pt;
         ggml_sycl::cpu_expert_pool_trace_take(pt);
+        // Then the per-token sums of the jobs' critical-path stamps (llama.cpp-j6jf); stamped counts the jobs
+        // with a record, stamped_joined those whose join host_task had run by now.  inputs_wait, pre_compute,
+        // compute, join_lat and join_wake add up to the jobs' spans; chain_gap and join_waited_us overlap them
+        // (cpu_expert_job_stamp_sums).
+        const ggml_sycl::cpu_expert_job_stamp_sums js = ggml_sycl::cpu_expert_job_stamps_sum(pt.job_stamps);
         GGML_LOG_WARN(
             "[CPU-EXPERT-POOL-TRACE] token=%llu jobs=%llu tasks=%llu rows=%llu threads=%llu wake=%.0fus "
-            "quant=%.0fus setup=%.0fus fanout=%.0fus compute=%.0fus wall=%.0fus joins=%llu joins_ready=%llu\n",
+            "quant=%.0fus setup=%.0fus fanout=%.0fus compute=%.0fus wall=%.0fus joins=%llu joins_ready=%llu "
+            "stamped=%llu stamped_joined=%llu inputs_wait=%.0fus chain_gap=%.0fus join_lat=%.0fus "
+            "join_waited_us=%.0fus join_wake=%.0fus pre_compute=%.0fus\n",
             (unsigned long long) w.token, (unsigned long long) pt.jobs, (unsigned long long) pt.tasks,
             (unsigned long long) pt.rows, (unsigned long long) pt.threads, pt.wake_us, pt.quant_us, pt.setup_us,
-            pt.fanout_us, pt.compute_us, pt.wall_us, (unsigned long long) pt.joins,
-            (unsigned long long) pt.joins_ready);
+            pt.fanout_us, pt.compute_us, pt.wall_us, (unsigned long long) pt.joins, (unsigned long long) pt.joins_ready,
+            (unsigned long long) js.jobs, (unsigned long long) js.joined, js.inputs_wait_us, js.chain_gap_us,
+            js.join_lat_us, js.join_waited_us, js.join_wake_us, js.pre_compute_us);
+        if (moe_hostpath_trace_level() >= 2) {
+            // Each job's stamps relative to the token's first submit, in submission order.
+            const int64_t t0 = pt.job_stamps.empty() ? 0 : pt.job_stamps.front().t_submit_ns;
+            char          job_line[384];
+            for (size_t i = 0; i < pt.job_stamps.size(); ++i) {
+                ggml_sycl::cpu_expert_job_stamps_format(job_line, sizeof(job_line), i, pt.job_stamps[i], t0);
+                GGML_LOG_WARN("[CPU-EXPERT-POOL-JOB] token=%llu %s\n", (unsigned long long) w.token, job_line);
+            }
+        }
         // The same jobs split by the quant type of their weight rows (llama.cpp-y9i6).
         GGML_LOG_WARN("[CPU-EXPERT-POOL-TRACE-TYPES] token=%llu%s\n", (unsigned long long) w.token,
                       ggml_sycl::cpu_expert_pool_trace_format_types(pt).c_str());
@@ -24280,6 +24310,8 @@ struct cpu_dispatch_result {
     int64_t                                         row_n             = 0;
     uint64_t                                        act_serial        = 0;
     bool                                            shares_activation = false;
+
+    std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> job_stamps;  // see pending_cpu_scatter
 };
 
 // ---------------------------------------------------------------------------
@@ -24318,6 +24350,10 @@ static void moe_cpu_job_wait_inputs(const moe_cpu_job_inputs & inputs) {
     if (!inputs.events.empty()) {
         sycl::event::wait(inputs.events);
     }
+    // The job's inputs-ready stamp (llama.cpp-j6jf); a no-op off a traced pool job.
+    if (moe_hostpath_waits_enabled()) {
+        ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready();
+    }
     if (inputs.zero_out && inputs.zero_bytes > 0) {
         std::memset(inputs.zero_out, 0, inputs.zero_bytes);
     }
@@ -24346,17 +24382,47 @@ static std::function<void()> moe_cpu_job_prologue(moe_cpu_job_inputs inputs) {
 // ggml_sycl_try_dispatch_resource_exhaustion_fallback.  No catch is added for
 // it (alloc-zone contract, G-CATCH).  The jobs' own refusals abort with a named
 // message before they get here.
-static void moe_cpu_job_join(const std::shared_future<void> & job) noexcept {
+// `stamps` is the pool job's record while tracing (llama.cpp-j6jf), else null: the join stamps its entry
+// and the return of its job.get() there.  It reads the clock and takes the trace lock only then.
+static void moe_cpu_job_join(const std::shared_future<void> & job, ggml_sycl::cpu_expert_job_stamps * stamps) noexcept {
+    int64_t join_entry_ns = 0;
+    bool    was_ready     = false;
     if (moe_hostpath_waits_enabled()) {
-        ggml_sycl::cpu_expert_pool_trace_note_join(job.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
+        if (stamps) {
+            join_entry_ns = ggml_sycl::cpu_expert_pool_trace_now_ns();
+        }
+        was_ready = job.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        ggml_sycl::cpu_expert_pool_trace_note_join(was_ready);
     }
     job.get();
+    if (stamps) {
+        ggml_sycl::cpu_expert_pool_trace_note_join_stamps(*stamps, join_entry_ns,
+                                                          ggml_sycl::cpu_expert_pool_trace_now_ns(), was_ready);
+    }
 }
 
 // Submits the join of a CPU job on `queue` and returns its event.  The host_task
-// holds the job's shared future.
-static sycl::event moe_cpu_job_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {
-    return queue.submit([&](sycl::handler & cgh) { cgh.host_task([job]() { moe_cpu_job_join(job); }); });
+// holds the job's shared future, and its stamp record when there is one: the
+// record is shared, so it outlives the job's slot however late the join runs.
+static sycl::event moe_cpu_job_join_on_queue(sycl::queue &                                     queue,
+                                             std::shared_future<void>                          job,
+                                             std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> stamps) {
+    return queue.submit([&](sycl::handler & cgh) {
+        cgh.host_task([job, stamps = std::move(stamps)]() { moe_cpu_job_join(job, stamps.get()); });
+    });
+}
+
+// Fills `req` with the pool job's trace label and returns it while tracing, else
+// returns null and reads nothing (llama.cpp-j6jf).
+static ggml_sycl::cpu_expert_job_trace * moe_cpu_job_trace_request(ggml_sycl::cpu_expert_job_trace & req,
+                                                                   const ggml_tensor *               src0) {
+    if (!moe_hostpath_waits_enabled()) {
+        return nullptr;
+    }
+    const char * name = src0 && src0->name ? src0->name : "";
+    req.tag.layer     = parse_layer_id_from_name(name);
+    req.tag.kind      = ggml_sycl::cpu_expert_job_kind_from_name(name);
+    return &req;
 }
 
 // ---------------------------------------------------------------------------
@@ -26037,6 +26103,7 @@ static void pending_cpu_scatter_retire(pending_cpu_scatter & slot, const std::ve
     slot.prev_scatter.scatter_events = scatter_events;
 
     slot.future = {};
+    slot.job_stamps.reset();
     slot.entries.clear();
     slot.tasks.clear();
     slot.out_pinned    = nullptr;
@@ -26113,7 +26180,7 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
         std::vector<sycl::event> & joins = ws.joins;
         joins.clear();
         for (int k = 0; k < n_group; ++k) {
-            joins.push_back(moe_cpu_job_join_on_queue(*slot.stream, group[k]->future.share()));
+            joins.push_back(moe_cpu_job_join_on_queue(*slot.stream, group[k]->future.share(), group[k]->job_stamps));
         }
 
         auto t1 = hrc::now();  // After the join submissions (no wait)
@@ -26237,6 +26304,7 @@ static void move_pending_cpu_scatter_to_sibling() {
     pending_cpu_scatter & to   = g_pending_scatter_sibling;
     GGML_ASSERT(from.active && !to.active && "sibling CPU scatter slot is occupied (llama.cpp-yx28)");
     to.future                = std::move(from.future);
+    to.job_stamps            = std::move(from.job_stamps);
     to.out_pinned            = from.out_pinned;
     to.act_pinned            = from.act_pinned;
     to.weight_pinned         = from.weight_pinned;
@@ -77295,7 +77363,9 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
             tasks.push_back(std::move(task));
         }
     };
-    std::future<void> job = cpu_pool.submit_batch({}, moe_cpu_job_prologue(std::move(job_inputs)), std::move(resolve));
+    ggml_sycl::cpu_expert_job_trace job_trace;
+    std::future<void> job = cpu_pool.submit_batch({}, moe_cpu_job_prologue(std::move(job_inputs)), std::move(resolve),
+                                                  moe_cpu_job_trace_request(job_trace, src0));
     if (record_warmup && g_moe_warmup.tick_epoch()) {
         moe_periodic_rerank();
     }
@@ -77311,6 +77381,7 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     GGML_ASSERT(!g_pending_scatter.active && "hybrid decode route found a pending scatter it did not flush");
     pending_cpu_scatter & slot = g_pending_scatter;
     slot.future                = std::move(job);
+    slot.job_stamps            = std::move(job_trace.stamps);
     slot.out_pinned            = out_rows;
     slot.act_pinned            = act_rows;
     slot.weight_pinned         = nullptr;
@@ -81789,7 +81860,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                     });
                 } else if (cpu_pool.is_active()) {
-                    result.future = cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue));
+                    ggml_sycl::cpu_expert_job_trace job_trace;
+                    result.future     = cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue), {},
+                                                              moe_cpu_job_trace_request(job_trace, src0));
+                    result.job_stamps = std::move(job_trace.stamps);
                 } else {
                     result.future = std::async(std::launch::async, [tasks    = std::move(batch_tasks),
                                                                     prologue = std::move(job_prologue)]() mutable {
@@ -81875,6 +81949,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 g_pending_scatter.row_k             = r.row_k;
                 g_pending_scatter.row_n             = r.row_n;
                 g_pending_scatter.act_serial        = r.act_serial;
+                g_pending_scatter.job_stamps        = std::move(r.job_stamps);
                 g_pending_scatter.shares_activation = r.shares_activation;
                 pending_cpu_scatter_bind_scratch(g_pending_scatter, ctx);
             };
@@ -83230,15 +83305,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                           ci * static_cast<size_t>(N) * sizeof(float) });
                 }
 
-                auto & cpu_pool = g_cpu_expert_pools[ctx.device];
+                auto &                          cpu_pool = g_cpu_expert_pools[ctx.device];
+                ggml_sycl::cpu_expert_job_trace job_trace;
                 if (cpu_pool.is_active()) {
-                    g_pending_scatter.future = cpu_pool.submit_batch(std::move(batch_tasks));
+                    g_pending_scatter.future = cpu_pool.submit_batch(std::move(batch_tasks), {}, {},
+                                                                     moe_cpu_job_trace_request(job_trace, src0));
                 } else {
                     g_pending_scatter.future =
                         std::async(std::launch::async, [tasks = std::move(batch_tasks)]() mutable {
                             ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
                         });
                 }
+                g_pending_scatter.job_stamps = std::move(job_trace.stamps);
 
                 g_pending_scatter.out_pinned    = out_pinned;
                 g_pending_scatter.act_pinned    = act_pinned;
@@ -84069,7 +84147,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             auto & cpu_pool    = g_cpu_expert_pools[ctx.device];
             auto   t_cpu_begin = host_phase_now();
             if (cpu_pool.is_active()) {
-                cpu_pool.submit_batch(std::move(tasks)).get();
+                ggml_sycl::cpu_expert_job_trace job_trace;  // a label only: this job is joined here, not on a queue
+                cpu_pool.submit_batch(std::move(tasks), {}, {}, moe_cpu_job_trace_request(job_trace, src0)).get();
             } else {
                 ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
             }
