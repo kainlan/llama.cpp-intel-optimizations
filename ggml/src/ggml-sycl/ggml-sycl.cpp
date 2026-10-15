@@ -81949,8 +81949,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 g_pending_scatter.row_k             = r.row_k;
                 g_pending_scatter.row_n             = r.row_n;
                 g_pending_scatter.act_serial        = r.act_serial;
-                g_pending_scatter.shares_activation = r.shares_activation;
                 g_pending_scatter.job_stamps        = std::move(r.job_stamps);
+                g_pending_scatter.shares_activation = r.shares_activation;
                 pending_cpu_scatter_bind_scratch(g_pending_scatter, ctx);
             };
 
