@@ -1079,6 +1079,8 @@ if (NOT WIN32)
     # only the default "main" label, lane sets that select policy or host-only
     # gates by label never ran it, so a violation merged unseen. Labels match
     # test-sycl-handle-policy plus "hostonly": it is bash and grep, no device.
+    # Setting LABELS replaces the default "main", so `ctest -L main` no longer
+    # selects it; host-only tests in this fork do not carry "main".
     set_tests_properties(test-sycl-alloc-policy PROPERTIES
         LABELS "sycl;policy;hostonly"
         SKIP_RETURN_CODE 77
