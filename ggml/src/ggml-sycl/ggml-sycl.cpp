@@ -24099,6 +24099,10 @@ struct moe_hostpath_wait_census {
     int      readbacks             = 0;
     int      readbacks_async       = 0;              // ids copies left on the queue (llama.cpp-7pvo)
     int      context               = MOE_WAIT_NONE;  // class forced on the waits inside a flush (B4b, B7)
+    // Source ready events the per-op chain met (llama.cpp-wfsl): queried as before, or skipped because the op's
+    // own in-order stream produced them (GGML_SYCL_CHAIN_SAME_QUEUE_SKIP).
+    uint64_t ready_queries         = 0;
+    uint64_t ready_skipped         = 0;
 };
 
 static thread_local moe_hostpath_wait_census g_moe_hostpath_waits;
@@ -24161,6 +24165,26 @@ struct moe_hostpath_wait_context {
     ~moe_hostpath_wait_context() { g_moe_hostpath_waits.context = saved; }
 };
 
+// GGML_SYCL_CHAIN_SAME_QUEUE_SKIP, read once (llama.cpp-wfsl): unset or non-zero lets an op skip the source ready
+// events its own in-order stream produced (ggml_sycl_chain_source_ready_events_if_needed), 0 queries every one
+// as before.
+static bool chain_same_queue_skip_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_CHAIN_SAME_QUEUE_SKIP");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Adds one op's source ready-event counts to the token's census (llama.cpp-wfsl).
+static void moe_hostpath_waits_ready(const ggml_sycl_chain_ready_counts & c) {
+    if (!moe_hostpath_waits_enabled()) {
+        return;
+    }
+    g_moe_hostpath_waits.ready_queries += c.queries;
+    g_moe_hostpath_waits.ready_skipped += c.skipped;
+}
+
 // Called at each expert-id readback.  A layer id lower than the last one starts a new token, so the
 // previous token's line is printed and the counts restart.  `async` names an ids copy this thread
 // enqueued and did not wait for: the event-chained hybrid decode route's (llama.cpp-7pvo), one per op.
@@ -24184,9 +24208,11 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
             total_n += w.count[c];
             total_us += w.us[c];
         }
-        GGML_LOG_WARN("[MOE-HOSTPATH-WAITS] token=%llu readbacks=%d async=%d%s total=%llu/%.0fus\n",
-                      (unsigned long long) w.token, w.readbacks, w.readbacks_async, line, (unsigned long long) total_n,
-                      total_us);
+        GGML_LOG_WARN(
+            "[MOE-HOSTPATH-WAITS] token=%llu readbacks=%d async=%d%s total=%llu/%.0fus ready_queries=%llu "
+            "ready_skipped=%llu\n",
+            (unsigned long long) w.token, w.readbacks, w.readbacks_async, line, (unsigned long long) total_n, total_us,
+            (unsigned long long) w.ready_queries, (unsigned long long) w.ready_skipped);
         // The same token's CpuExpertPool jobs (llama.cpp-b2jc): how many, and where each
         // job's time went between its submit and its result.
         ggml_sycl::cpu_expert_pool_trace_totals pt;
@@ -24224,6 +24250,8 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
         }
         w.readbacks       = 0;
         w.readbacks_async = 0;
+        w.ready_queries   = 0;
+        w.ready_skipped   = 0;
         ++w.token;
     }
     w.last_layer = layer;
@@ -77651,7 +77679,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return;
             }
             try {
-                ggml_sycl_set_tensor_ready_event(dst, ctx->device, ggml_sycl_submit_queue_sync_event(*stream));
+                ggml_sycl_set_tensor_ready_event(dst, ctx->device, ggml_sycl_submit_queue_sync_event(*stream), stream);
             } catch (...) {
             }
         }
@@ -80352,7 +80380,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                         ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_node_skip, pair.glu_dst, ctx.device);
                         if (glu_event_set) {
-                            ggml_sycl_set_tensor_ready_event(pair.glu_dst, ctx.device, glu_event);
+                            // Every completion event of the pair GLU dispatch is submitted on ctx.stream().
+                            ggml_sycl_set_tensor_ready_event(pair.glu_dst, ctx.device, glu_event, ctx.stream());
                         }
 
                         // Down: attempt the cached-Q8 consumer that pairs with the GLU
@@ -80482,7 +80511,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_mmid_skip, pair.down_dst,
                                                                       ctx.device);
                                 if (down_event_set) {
-                                    ggml_sycl_set_tensor_ready_event(pair.down_dst, ctx.device, down_event);
+                                    // The cached-Q8 down dispatch submits on ctx.stream().
+                                    ggml_sycl_set_tensor_ready_event(pair.down_dst, ctx.device, down_event,
+                                                                     ctx.stream());
                                 }
                             }
                         } else if (decode_pair_path_trace_enabled != 0) {
@@ -89201,7 +89232,10 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
         split_merge_drain();
     }
     if (ctx.stream() != nullptr) {
-        ggml_sycl_chain_source_ready_events_if_needed(*ctx.stream(), dst, ctx.device);
+        ggml_sycl_chain_ready_counts ready_counts;
+        ggml_sycl_chain_source_ready_events_if_needed(*ctx.stream(), dst, ctx.device, chain_same_queue_skip_enabled(),
+                                                      &ready_counts);
+        moe_hostpath_waits_ready(ready_counts);
     }
     if (dt.enabled) {
         dt.resolve_us = dt.elapsed_us();
@@ -91530,10 +91564,10 @@ static bool ggml_sycl_try_fuse_moe_down_weighted_sum(ggml_backend_sycl_context &
         down->nb[2], bias->nb[1], ids->nb[0], ids->nb[1], weights->nb[1], weights->nb[2], final->nb[1],
         final_token_stride);
     if (!ggml_sycl_graph_recording_active()) {
-        ggml_sycl_set_tensor_ready_event(final, ctx.device, evt);
+        ggml_sycl_set_tensor_ready_event(final, ctx.device, evt, ctx.stream());
         if (std::getenv("GGML_SYCL_MOE_DOWN_SUM_WRITE_BIASED")) {
-            ggml_sycl_set_tensor_ready_event(down, ctx.device, evt);
-            ggml_sycl_set_tensor_ready_event(down_biased, ctx.device, evt);
+            ggml_sycl_set_tensor_ready_event(down, ctx.device, evt, ctx.stream());
+            ggml_sycl_set_tensor_ready_event(down_biased, ctx.device, evt, ctx.stream());
         }
     }
     if (down_sum_drain) {

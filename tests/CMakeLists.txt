@@ -871,6 +871,14 @@ if (Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-join-queue-source.py --self-test)
     set_tests_properties(test-sycl-moe-join-queue-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The per-op source chain skips the ready events its own in-order stream produced, behind
+    # GGML_SYCL_CHAIN_SAME_QUEUE_SKIP, and queries every other one as before (llama.cpp-wfsl). Run WITH
+    # --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-chain-same-queue-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-chain-same-queue-source.py --self-test)
+    set_tests_properties(test-sycl-chain-same-queue-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
     # Host MoE experts must read the activation row of their own slot, not row 0
     # (llama.cpp-4hg7: GPT-OSS down-projection decode garbage under host-tiered
     # experts). Run WITH --self-test so each anchor is proven load-bearing.

@@ -108,6 +108,20 @@ namespace detail {
 mem_handle from_legacy_owned_alloc(alloc_handle && handle, ggml_layout_mode layout = GGML_LAYOUT_AOS);
 } // namespace detail
 
+// The identity of in-order queue `q`, in *out, for asking whether two commands were submitted on one in-order
+// queue (llama.cpp-wfsl); false for an out-of-order queue, whose commands are not ordered by submission. It is
+// std::hash<sycl::queue>, which SYCL requires to agree for every copy of one queue. In DPC++ 2026.1 it returns a
+// per-queue id field of the queue's implementation, not an address (libsycl.so.9, std::hash<queue>::operator()
+// loads queue_impl+0x1d8), so the compute streams, which live for the process, never share one. Any value,
+// including 0, is a valid identity; re-check the hash after a oneAPI upgrade.
+inline bool ready_queue_identity(const sycl::queue & q, size_t * out) {
+    if (!q.has_property<sycl::property::queue::in_order>()) {
+        return false;
+    }
+    *out = std::hash<sycl::queue>{}(q);
+    return true;
+}
+
 // === Resolved pointer ===
 // The result of resolving a mem_handle.  Contains the current pointer and
 // metadata needed by the caller.
@@ -124,6 +138,12 @@ struct resolved_ptr {
     // Optional authority retained with a fallback resolution. Consumers that
     // outlive this value must transfer it to graph/event retention.
     std::shared_ptr<mem_handle> retention;
+    // The in-order queue whose command produced ready_event, as ready_queue_identity(), when has_ready_queue
+    // (llama.cpp-wfsl). Unset when the producer is unknown, out of order, or a host task. Only compared for
+    // equality with a consuming queue's identity: never dereferenced and never a key. mem_handle sets and clears
+    // it with ready_event. Last, so positional initialisers keep naming the fields above.
+    bool                        has_ready_queue = false;
+    size_t                      ready_queue     = 0;
 
     explicit operator bool() const { return ptr != nullptr; }
 };
@@ -446,7 +466,11 @@ class mem_handle {
     // every resolve, after the backing handle's generation/stale checks.
     mem_handle slice(size_t byte_offset, size_t byte_size) const;
 
+    // Sets the ready event with no recorded producer: every consumer queries it as before.
     void set_ready_event(const sycl::event & event);
+    // Sets the ready event of a command submitted on `producer` (llama.cpp-wfsl), recording the queue's identity
+    // when it is in-order, so the per-op source chain need not query it for an op on that same queue.
+    void set_ready_event(const sycl::event & event, const sycl::queue & producer);
     void clear_ready_event();
 
     // Resolve for a dispatch device. Device-resident pointers must belong to

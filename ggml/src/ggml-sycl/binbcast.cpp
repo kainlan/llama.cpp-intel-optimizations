@@ -1013,7 +1013,7 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
 
     if (dst && dst->op == GGML_OP_MUL && !g_ggml_sycl_graph_recording) {
         try {
-            ggml_sycl_set_tensor_ready_event(dst, device, ensure_done_event());
+            ggml_sycl_set_tensor_ready_event(dst, device, ensure_done_event(), main_stream);
         } catch (...) {
             // The op itself has already been submitted.  If event publication
             // fails, leave the tensor without an async ready edge rather than

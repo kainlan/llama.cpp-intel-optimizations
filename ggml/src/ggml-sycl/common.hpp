@@ -5627,29 +5627,72 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve_no_materialize(const ggml_tenso
     return result;
 }
 
-inline void ggml_sycl_chain_tensor_ready_event_if_needed(sycl::queue & q, const ggml_tensor * tensor, int device) {
+// One op's source ready events, as ggml_sycl_chain_source_ready_events_if_needed() met them (llama.cpp-wfsl).
+struct ggml_sycl_chain_ready_counts {
+    uint64_t queries = 0;  // events whose status was queried, and chained if unfinished, as before
+    uint64_t skipped = 0;  // events the consuming in-order queue produced itself: neither queried nor chained
+};
+
+// `same_queue`, when not null, is the identity of `q`, an in-order queue; `counts`, when not null, receives one
+// count per ready event met.
+inline void ggml_sycl_chain_tensor_ready_event_if_needed(sycl::queue &                  q,
+                                                         const ggml_tensor *            tensor,
+                                                         int                            device,
+                                                         const size_t *                 same_queue = nullptr,
+                                                         ggml_sycl_chain_ready_counts * counts     = nullptr) {
     const ggml_tensor * cur = tensor;
     for (int depth = 0; cur != nullptr && depth < GGML_MAX_SRC; ++depth) {
         auto resolved = ggml_sycl_resolve(cur, device);
         if (resolved.has_ready_event) {
-            ggml_sycl_chain_ready_event_if_needed(q, resolved);
+            if (same_queue && resolved.has_ready_queue && resolved.ready_queue == *same_queue) {
+                // The event's command was submitted on `q`, and `q` is in-order, so everything submitted on `q`
+                // from now on starts after that command ends: the dependency already holds. The status query is
+                // not free: on a profiling queue the driver answers it for an unfinished kernel by busy-waiting
+                // on the kernel's timestamp packet. An event from another queue, from a host task or with no
+                // recorded producer is not ordered by `q`'s submission order, so it is queried and chained below.
+                if (counts) {
+                    counts->skipped += 1;
+                }
+            } else {
+                if (counts) {
+                    counts->queries += 1;
+                }
+                ggml_sycl_chain_ready_event_if_needed(q, resolved);
+            }
         }
         cur = cur->view_src;
     }
 }
 
-inline void ggml_sycl_chain_source_ready_events_if_needed(sycl::queue & q, const ggml_tensor * dst, int device) {
+// Before `dst` is computed on `q`, makes `q` wait for each source's unfinished ready event. With
+// `skip_same_queue` (GGML_SYCL_CHAIN_SAME_QUEUE_SKIP, llama.cpp-wfsl) it skips the events `q` produced itself
+// when `q` is in-order. Never while a command graph records: a recorded command's dependencies become edges of
+// a graph that replays wherever it is submitted, not where this queue's order stands now, so recording keeps
+// every query and dependency as before. `counts`, when not null, receives the op's counts.
+inline void ggml_sycl_chain_source_ready_events_if_needed(sycl::queue &                  q,
+                                                          const ggml_tensor *            dst,
+                                                          int                            device,
+                                                          bool                           skip_same_queue = false,
+                                                          ggml_sycl_chain_ready_counts * counts          = nullptr) {
     if (!dst) {
         return;
     }
+    size_t     q_identity = 0;
+    const bool same =
+        skip_same_queue && !ggml_sycl_graph_recording_active() && ggml_sycl::ready_queue_identity(q, &q_identity);
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         if (dst->src[i] != nullptr) {
-            ggml_sycl_chain_tensor_ready_event_if_needed(q, dst->src[i], device);
+            ggml_sycl_chain_tensor_ready_event_if_needed(q, dst->src[i], device, same ? &q_identity : nullptr, counts);
         }
     }
 }
 
-inline void ggml_sycl_set_tensor_ready_event(ggml_tensor * tensor, int device, const sycl::event & event) {
+// Sets `tensor`'s ready event on `device`. Pass `producer`, the queue `event`'s command was submitted on, when it
+// is known (llama.cpp-wfsl): an op later submitted on that same in-order queue then neither queries nor chains it.
+inline void ggml_sycl_set_tensor_ready_event(ggml_tensor *       tensor,
+                                             int                 device,
+                                             const sycl::event & event,
+                                             const sycl::queue * producer = nullptr) {
     if (!tensor || !ggml_sycl_valid_device_index(device)) {
         return;
     }
@@ -5663,7 +5706,11 @@ inline void ggml_sycl_set_tensor_ready_event(ggml_tensor * tensor, int device, c
     auto * extra = static_cast<ggml_tensor_extra_gpu *>(cur->extra);
     auto & handle = extra->data_handle[device];
     if (handle.valid()) {
-        handle.set_ready_event(event);
+        if (producer) {
+            handle.set_ready_event(event, *producer);
+        } else {
+            handle.set_ready_event(event);
+        }
     }
 }
 
