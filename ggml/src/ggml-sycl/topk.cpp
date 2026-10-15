@@ -13,12 +13,19 @@
 // ties broken by the lower column. That makes the selected set a pure
 // function of the row, and the same set on either path.
 
+// The ordering is total over bit patterns, not over float values: +0.0 ranks
+// above -0.0, and a NaN ranks above +inf or below -inf by its sign bit. So
+// "ties to the lower column" is exact only for equal bit patterns. CPU top_k
+// leaves both ties and NaN unspecified, so this stays within its contract.
 static inline uint32_t top_k_ordered_key(float v) {
     const uint32_t bits = sycl::bit_cast<uint32_t>(v);
     return bits ^ ((bits >> 31) ? 0xFFFFFFFFu : 0x80000000u);
 }
 
-static ggml_sycl_profile_label top_k_label(sycl::queue & q, const char * name, const char * metadata, size_t bytes) {
+ggml_sycl_profile_label ggml_sycl_top_k_profile_label(sycl::queue & q,
+                                                      const char *  name,
+                                                      const char *  metadata,
+                                                      size_t        bytes) {
     ggml_sycl_profile_label label{};
     if (!ggml_sycl_kernel_profile_enabled()) {
         return label;
@@ -57,7 +64,8 @@ static void top_k_bitonic_f32_i32_sycl(const float * x,
     const sycl::nd_range<1> range(sycl::range<1>((size_t) nrows * nth), sycl::range<1>(nth));
     const size_t            bytes = (size_t) nrows * (ncols * sizeof(float) + k * sizeof(int32_t));
 
-    const ggml_sycl_profile_label label = top_k_label(*stream, "sycl.top_k.bitonic", "role=top_k;path=bitonic", bytes);
+    const ggml_sycl_profile_label label =
+        ggml_sycl_top_k_profile_label(*stream, "sycl.top_k.bitonic", "role=top_k;path=bitonic", bytes);
     ggml_sycl_profile_submit(*stream, label, [&](sycl::queue & q) {
         return q.submit([&](sycl::handler & cgh) {
             sycl::local_accessor<uint32_t, 1> keys(sycl::range<1>(ncols_pad), cgh);
@@ -132,6 +140,11 @@ static constexpr int     top_k_radix_state_stride    = 4;
 static constexpr int64_t top_k_radix_cols_per_group  = 2048;
 static constexpr int64_t top_k_radix_groups_per_call = 256;
 
+// The histogram kernel zeroes and stores one digit bin per work-item, and the
+// select kernel scans one bin per work-item, so the work-group is exactly as
+// wide as a digit has bins.
+static_assert(top_k_radix_block == top_k_radix_bins, "TOP_K radix: one work-item per digit bin");
+
 struct top_k_radix_geometry {
     int64_t bpr;   // column ranges (work-groups) per row
     int64_t span;  // columns per range
@@ -159,8 +172,8 @@ static void top_k_radix_histogram(const float *              x,
                                   sycl::range<1>(top_k_radix_block));
     const size_t            bytes = (size_t) nrows * ncols * sizeof(float);
 
-    const ggml_sycl_profile_label label =
-        top_k_label(*stream, "sycl.top_k.radix_histogram", "role=top_k;path=radix;kind=histogram", bytes);
+    const ggml_sycl_profile_label label = ggml_sycl_top_k_profile_label(*stream, "sycl.top_k.radix_histogram",
+                                                                        "role=top_k;path=radix;kind=histogram", bytes);
     ggml_sycl_profile_submit(*stream, label, [&](sycl::queue & q) {
         return q.submit([&](sycl::handler & cgh) {
             sycl::local_accessor<uint32_t, 1> local_hist(sycl::range<1>(top_k_radix_bins), cgh);
@@ -209,7 +222,7 @@ static void top_k_radix_select(const uint32_t *           hist,
     const size_t            bytes = (size_t) nrows * bpr * top_k_radix_bins * sizeof(uint32_t);
 
     const ggml_sycl_profile_label label =
-        top_k_label(*stream, "sycl.top_k.radix_select", "role=top_k;path=radix;kind=select", bytes);
+        ggml_sycl_top_k_profile_label(*stream, "sycl.top_k.radix_select", "role=top_k;path=radix;kind=select", bytes);
     ggml_sycl_profile_submit(*stream, label, [&](sycl::queue & q) {
         return q.submit([&](sycl::handler & cgh) {
             cgh.parallel_for(range, [=](sycl::nd_item<1> it) {
@@ -257,7 +270,7 @@ static void top_k_radix_count(const float *              x,
     const size_t            bytes = (size_t) nrows * ncols * sizeof(float);
 
     const ggml_sycl_profile_label label =
-        top_k_label(*stream, "sycl.top_k.radix_count", "role=top_k;path=radix;kind=count", bytes);
+        ggml_sycl_top_k_profile_label(*stream, "sycl.top_k.radix_count", "role=top_k;path=radix;kind=count", bytes);
     ggml_sycl_profile_submit(*stream, label, [&](sycl::queue & q) {
         return q.submit([&](sycl::handler & cgh) {
             cgh.parallel_for(range, [=](sycl::nd_item<1> it) {
@@ -304,7 +317,7 @@ static void top_k_radix_gather(const float *              x,
     const size_t            bytes = (size_t) nrows * (ncols * sizeof(float) + k * sizeof(int32_t));
 
     const ggml_sycl_profile_label label =
-        top_k_label(*stream, "sycl.top_k.radix_gather", "role=top_k;path=radix;kind=gather", bytes);
+        ggml_sycl_top_k_profile_label(*stream, "sycl.top_k.radix_gather", "role=top_k;path=radix;kind=gather", bytes);
     ggml_sycl_profile_submit(*stream, label, [&](sycl::queue & q) {
         return q.submit([&](sycl::handler & cgh) {
             cgh.parallel_for(range, [=](sycl::nd_item<1> it) {
@@ -371,6 +384,7 @@ void ggml_sycl_top_k_large(ggml_backend_sycl_context & ctx,
         return;
     }
     GGML_ASSERT(path == GGML_SYCL_TOP_K_PATH_RADIX);
+    GGML_ASSERT(top_k_radix_block <= ggml_sycl_info().max_work_group_sizes[ctx.device]);
 
     const top_k_radix_geometry geo           = top_k_radix_geometry_for(ncols, nrows);
     const size_t               state_elems   = (size_t) nrows * top_k_radix_state_stride;

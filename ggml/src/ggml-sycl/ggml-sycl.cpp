@@ -49425,93 +49425,99 @@ static void topk_f32_i32_sycl(const float * x,
     const size_t         shared_floats = SYCL_TOPK_BLOCK_SIZE * SYCL_TOPK_MAX_K;
 
     const size_t shared_ints = SYCL_TOPK_BLOCK_SIZE * SYCL_TOPK_MAX_K;
-    stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<float, 1> shared_vals(sycl::range<1>(shared_floats), cgh);
-        sycl::local_accessor<int, 1>   shared_idxs(sycl::range<1>(shared_ints), cgh);
-        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-            const int tid        = item_ct1.get_local_id(2);
-            const int row        = item_ct1.get_global_id(1);
-            const int block_size = item_ct1.get_local_range(2);
+    const size_t bytes       = (size_t) nrows * ((size_t) ncols * sizeof(float) + (size_t) k * sizeof(int));
 
-            // Initialize local top-K with -inf. A slot with a negative index is
-            // empty and ranks below every real column, including a -inf one --
-            // CPU top_k seeds all ne00 indices and so never returns an empty
-            // slot, and ggml_top_k guarantees ncols >= k real columns exist.
-            float local_vals[SYCL_TOPK_MAX_K];
-            int   local_idxs[SYCL_TOPK_MAX_K];
-            for (int i = 0; i < k; i++) {
-                local_vals[i] = -INFINITY;
-                local_idxs[i] = -1;
-            }
-            // Each thread scans its portion and maintains local top-K
-            // Using insertion sort since K is small
+    const ggml_sycl_profile_label label =
+        ggml_sycl_top_k_profile_label(*stream, "sycl.top_k.gating", "role=top_k;path=gating", bytes);
+    ggml_sycl_profile_submit(*stream, label, [&](sycl::queue & q) {
+        return q.submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<float, 1> shared_vals(sycl::range<1>(shared_floats), cgh);
+            sycl::local_accessor<int, 1>   shared_idxs(sycl::range<1>(shared_ints), cgh);
+            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
+                const int tid        = item_ct1.get_local_id(2);
+                const int row        = item_ct1.get_global_id(1);
+                const int block_size = item_ct1.get_local_range(2);
 
-            for (int col = tid; col < ncols; col += block_size) {
-                float val = x[row * ncols + col];
-                // Check if this value should be in top-K
-                if (local_idxs[k - 1] < 0 || val > local_vals[k - 1]) {
-                    // Find insertion position
-                    int pos = k - 1;
-                    while (pos > 0 && (local_idxs[pos - 1] < 0 || val > local_vals[pos - 1])) {
-                        pos--;
-                    }
-                    // Shift elements down
-                    for (int j = k - 1; j > pos; j--) {
-                        local_vals[j] = local_vals[j - 1];
-                        local_idxs[j] = local_idxs[j - 1];
-                    }
-
-                    // Insert new value
-                    local_vals[pos] = val;
-                    local_idxs[pos] = col;
+                // Initialize local top-K with -inf. A slot with a negative index is
+                // empty and ranks below every real column, including a -inf one --
+                // CPU top_k seeds all ne00 indices and so never returns an empty
+                // slot, and ggml_top_k guarantees ncols >= k real columns exist.
+                float local_vals[SYCL_TOPK_MAX_K];
+                int   local_idxs[SYCL_TOPK_MAX_K];
+                for (int i = 0; i < k; i++) {
+                    local_vals[i] = -INFINITY;
+                    local_idxs[i] = -1;
                 }
-            }
-            // Store local top-K to shared memory
-            for (int i = 0; i < k; i++) {
-                shared_vals[tid * SYCL_TOPK_MAX_K + i] = local_vals[i];
-                shared_idxs[tid * SYCL_TOPK_MAX_K + i] = local_idxs[i];
-            }
-            item_ct1.barrier(sycl::access::fence_space::local_space);
-            // Reduce: merge top-K lists from pairs of threads
-            // Each iteration halves the number of active threads
-            for (int stride = block_size / 2; stride > 0; stride >>= 1) {
-                if (tid < stride) {
-                    // Merge two sorted top-K lists into one
-                    float merged_vals[SYCL_TOPK_MAX_K];
-                    int   merged_idxs[SYCL_TOPK_MAX_K];
-                    int   i = 0, j = 0, m = 0;
-                    while (m < k && (i < k || j < k)) {
-                        float v1 = (i < k) ? shared_vals[tid * SYCL_TOPK_MAX_K + i] : -INFINITY;
-                        int   c1 = (i < k) ? shared_idxs[tid * SYCL_TOPK_MAX_K + i] : -1;
-                        float v2 = (j < k) ? shared_vals[(tid + stride) * SYCL_TOPK_MAX_K + j] : -INFINITY;
-                        int   c2 = (j < k) ? shared_idxs[(tid + stride) * SYCL_TOPK_MAX_K + j] : -1;
-                        // an empty slot carries -inf just like a real -inf column does,
-                        // so occupancy has to decide before the value does
-                        if ((c1 >= 0) != (c2 >= 0) ? c1 >= 0 : v1 >= v2) {
-                            merged_vals[m] = v1;
-                            merged_idxs[m] = c1;
-                            i++;
-                        } else {
-                            merged_vals[m] = v2;
-                            merged_idxs[m] = c2;
-                            j++;
+                // Each thread scans its portion and maintains local top-K
+                // Using insertion sort since K is small
+
+                for (int col = tid; col < ncols; col += block_size) {
+                    float val = x[row * ncols + col];
+                    // Check if this value should be in top-K
+                    if (local_idxs[k - 1] < 0 || val > local_vals[k - 1]) {
+                        // Find insertion position
+                        int pos = k - 1;
+                        while (pos > 0 && (local_idxs[pos - 1] < 0 || val > local_vals[pos - 1])) {
+                            pos--;
                         }
-                        m++;
+                        // Shift elements down
+                        for (int j = k - 1; j > pos; j--) {
+                            local_vals[j] = local_vals[j - 1];
+                            local_idxs[j] = local_idxs[j - 1];
+                        }
+
+                        // Insert new value
+                        local_vals[pos] = val;
+                        local_idxs[pos] = col;
                     }
-                    // Write merged result back to shared memory
-                    for (int idx = 0; idx < k; idx++) {
-                        shared_vals[tid * SYCL_TOPK_MAX_K + idx] = merged_vals[idx];
-                        shared_idxs[tid * SYCL_TOPK_MAX_K + idx] = merged_idxs[idx];
-                    }
+                }
+                // Store local top-K to shared memory
+                for (int i = 0; i < k; i++) {
+                    shared_vals[tid * SYCL_TOPK_MAX_K + i] = local_vals[i];
+                    shared_idxs[tid * SYCL_TOPK_MAX_K + i] = local_idxs[i];
                 }
                 item_ct1.barrier(sycl::access::fence_space::local_space);
-            }
-            // Thread 0 writes the final top-K indices to output
-            if (tid == 0) {
-                for (int i = 0; i < k; i++) {
-                    dst[row * k + i] = shared_idxs[i];
+                // Reduce: merge top-K lists from pairs of threads
+                // Each iteration halves the number of active threads
+                for (int stride = block_size / 2; stride > 0; stride >>= 1) {
+                    if (tid < stride) {
+                        // Merge two sorted top-K lists into one
+                        float merged_vals[SYCL_TOPK_MAX_K];
+                        int   merged_idxs[SYCL_TOPK_MAX_K];
+                        int   i = 0, j = 0, m = 0;
+                        while (m < k && (i < k || j < k)) {
+                            float v1 = (i < k) ? shared_vals[tid * SYCL_TOPK_MAX_K + i] : -INFINITY;
+                            int   c1 = (i < k) ? shared_idxs[tid * SYCL_TOPK_MAX_K + i] : -1;
+                            float v2 = (j < k) ? shared_vals[(tid + stride) * SYCL_TOPK_MAX_K + j] : -INFINITY;
+                            int   c2 = (j < k) ? shared_idxs[(tid + stride) * SYCL_TOPK_MAX_K + j] : -1;
+                            // an empty slot carries -inf just like a real -inf column does,
+                            // so occupancy has to decide before the value does
+                            if ((c1 >= 0) != (c2 >= 0) ? c1 >= 0 : v1 >= v2) {
+                                merged_vals[m] = v1;
+                                merged_idxs[m] = c1;
+                                i++;
+                            } else {
+                                merged_vals[m] = v2;
+                                merged_idxs[m] = c2;
+                                j++;
+                            }
+                            m++;
+                        }
+                        // Write merged result back to shared memory
+                        for (int idx = 0; idx < k; idx++) {
+                            shared_vals[tid * SYCL_TOPK_MAX_K + idx] = merged_vals[idx];
+                            shared_idxs[tid * SYCL_TOPK_MAX_K + idx] = merged_idxs[idx];
+                        }
+                    }
+                    item_ct1.barrier(sycl::access::fence_space::local_space);
                 }
-            }
+                // Thread 0 writes the final top-K indices to output
+                if (tid == 0) {
+                    for (int i = 0; i < k; i++) {
+                        dst[row * k + i] = shared_idxs[i];
+                    }
+                }
+            });
         });
     });
 }

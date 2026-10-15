@@ -22,7 +22,9 @@ THE CONTRACT.
   M. (topk.cpp) the memory contract: scratch only through ggml_sycl_pool_alloc on ctx.pool() (the
      unified-cache SCRATCH zone, mem_handle-owned, released behind a marker event); no sycl::malloc_*,
      sycl::free, host wait (.wait / wait_and_throw); the bitonic SLM request is the selector's
-     ggml_sycl_top_k_bitonic_slm_bytes, so the bound supports_op checked is the one dispatch uses.
+     ggml_sycl_top_k_bitonic_slm_bytes, so the bound supports_op checked is the one dispatch uses; the
+     radix work-group is one work-item per digit bin (static_assert block == bins) and is bounded by
+     the device's max work-group size at launch, as the bitonic path bounds its own.
   O. (topk.cpp) the radix gather is an ordered compaction (exclusive_scan_over_group, no atomics), so
      the index set it returns is a pure function of the input: the k largest ordered keys, ties
      broken by the lower column -- the same set the bitonic path returns.  Both halves of that tie
@@ -30,7 +32,9 @@ THE CONTRACT.
      tie rule: the bitonic comparator ranks an equal key with the lower column first (O3), and the
      gather takes the `rank` equal-key columns lowest column first -- earlier ranges before later
      ones, lower lanes before higher ones within a round, and none past rank (O4).
-  L. (topk.cpp) every kernel submit goes through ggml_sycl_profile_submit under a sycl.top_k.* label.
+  L. (topk.cpp) every kernel submit goes through ggml_sycl_profile_submit under a sycl.top_k.* label,
+     and so does the k <= 32 gating kernel in ggml-sycl.cpp (sycl.top_k.gating), through the same
+     label helper (ggml_sycl_top_k_profile_label, declared in topk.hpp).
   T. (test-backend-ops) the TOP_K cases cover k in {64, 256, 2048} x ncols in {256, 4096, 262144}
      plus a non-power-of-two ncols, with ties and with fewer than k finite values.
 
@@ -241,6 +245,11 @@ def check_kernels(cpp: str | None) -> None:
             "GGML_ASSERT(slm_bytes<=ggml_sycl_info().devices[device].smpbo);" not in bit:
         fail("M4", "the bitonic kernel's SLM is not the selector's ggml_sycl_top_k_bitonic_slm_bytes(ncols), "
                    "asserted against smpbo")
+    if not re.search(r"static_assert\(top_k_radix_block==top_k_radix_bins,", squash(code)):
+        fail("M5", "nothing couples the radix work-group width to the digit bin count: the histogram and "
+                   "select kernels index one bin per work-item")
+    if "GGML_ASSERT(top_k_radix_block<=ggml_sycl_info().max_work_group_sizes[ctx.device]);" not in large:
+        fail("M6", "the radix launch is not bounded by the device's max work-group size")
     gather = squash(body_of(code, "static void top_k_radix_gather(", "O1"))
     if "atomic" in gather:
         fail("O1", "the radix gather uses an atomic: the tie-broken index set would depend on scheduling")
@@ -267,6 +276,8 @@ def check_kernels(cpp: str | None) -> None:
                        f"(missing {needle!r}): a tie would pick a different set than the bitonic sort")
     if '#include "sycl-kernel-profiler.hpp"' not in cpp:
         fail("L0", "topk.cpp does not include the kernel profiler")
+    if "ggml_sycl_profile_label ggml_sycl_top_k_profile_label(sycl::queue&q,const char*name," not in squash(code):
+        fail("L0", "topk.cpp does not define the shared label helper ggml_sycl_top_k_profile_label")
     for label in LABELS:
         if f'"{label}"' not in code:
             fail("L1", f"kernel label {label} is missing")
@@ -275,6 +286,22 @@ def check_kernels(cpp: str | None) -> None:
     if submits == 0 or profiled < submits:
         fail("L2", f"{submits} queue submits but {profiled} ggml_sycl_profile_submit wrappers: a top-k kernel "
                    f"runs unlabelled")
+
+
+GATING_SIG = "static void topk_f32_i32_sycl(const float * x,"
+
+
+def check_gating_label(hpp: str | None, backend: str) -> None:
+    if hpp is None or "ggml_sycl_profile_label ggml_sycl_top_k_profile_label(" not in blank_comments(hpp):
+        fail("L3", "topk.hpp does not declare ggml_sycl_top_k_profile_label for the gating kernel")
+    gating = squash(body_of(blank_comments(backend), GATING_SIG, "L3"))
+    if 'const ggml_sycl_profile_label label=ggml_sycl_top_k_profile_label(*stream,"sycl.top_k.gating",' \
+            not in gating or "ggml_sycl_profile_submit(*stream,label,[&](sycl::queue&q){return q.submit(" \
+            not in gating:
+        fail("L3", "the k <= 32 gating kernel is not submitted through ggml_sycl_profile_submit under "
+                   "sycl.top_k.gating")
+    if gating.count("submit(") != gating.count("ggml_sycl_profile_submit(") * 2:
+        fail("L3", "the gating kernel has a queue submit outside ggml_sycl_profile_submit")
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -315,6 +342,7 @@ def check(s: dict[str, str | None]) -> None:
     check_supports_op(s["backend"])
     check_dispatch(s["backend"])
     check_kernels(s["cpp"])
+    check_gating_label(s["hpp"], s["backend"])
     check_tbo(s["tbo"])
 
 
@@ -335,7 +363,9 @@ def test_dispatch() -> None:
 
 
 def test_kernels() -> None:
-    check_kernels(read_sources()["cpp"])
+    s = read_sources()
+    check_kernels(s["cpp"])
+    check_gating_label(s["hpp"], s["backend"])
 
 
 def test_backend_ops_shapes() -> None:
@@ -442,6 +472,14 @@ def self_test(s: dict[str, str | None]) -> int:
                 "for (int64_t b2 = b + 1 + tid; b2 < bpr; b2 += top_k_radix_block) {", "O4")
     expect_fail("gather-eq-higher-lanes-first", "cpp", "const int64_t  c     = c0 + tid;",
                 "const int64_t  c     = c0 + (top_k_radix_block - 1 - tid);", "O4")
+    expect_fail("radix-block-unbound-to-bins", "cpp",
+                "static_assert(top_k_radix_block == top_k_radix_bins,", "static_assert(true,", "M5")
+    expect_fail("radix-launch-unbounded", "cpp",
+                "GGML_ASSERT(top_k_radix_block <= ggml_sycl_info().max_work_group_sizes[ctx.device]);", "", "M6")
+    expect_fail("gating-unlabelled", "backend",
+                "ggml_sycl_profile_submit(*stream, label, [&](sycl::queue & q) {\n        return q.submit(",
+                "stream->submit([&](sycl::handler & h0) {});\n    ggml_sycl_profile_submit(*stream, label, "
+                "[&](sycl::queue & q) {\n        return q.submit(", "L3")
     expect_fail("label-missing", "cpp", '"sycl.top_k.radix_count"', '"sycl.top_k.count"', "L1")
     expect_fail("unlabelled-submit", "cpp", "    top_k_radix_gather(",
                 "    stream->submit([&](sycl::handler & cgh) { cgh.single_task([=]() {}); });\n    top_k_radix_gather(",

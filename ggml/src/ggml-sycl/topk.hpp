@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.hpp"
+#include "sycl-kernel-profiler.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -22,6 +23,12 @@
 // values, ties broken by the lower column. CPU top_k's order within the k is
 // unspecified, and its consumers (the sparse-attention indexer unmasks the
 // selected cells with SET_ROWS) do not depend on it.
+//
+// BITONIC is not the ARGSORT kernel reused: that one keeps only indices in SLM
+// and compares x reloaded from global memory with no index tiebreak, so its
+// tie order is the network's, not the lower column, and it writes all ncols,
+// which would need an ncols-wide scratch row plus a copy of the first k. This
+// one keeps keys and indices in SLM under a total order and writes only k.
 
 constexpr int ggml_sycl_top_k_gating_max_k = 32;
 
@@ -55,6 +62,14 @@ inline ggml_sycl_top_k_path ggml_sycl_top_k_select_path(int64_t ncols, int64_t k
     }
     return GGML_SYCL_TOP_K_PATH_RADIX;
 }
+
+// The profiler label for a TOP_K kernel submitted on q: category "top_k",
+// empty while the kernel profiler is off. The gating kernel in ggml-sycl.cpp
+// and the kernels in topk.cpp all take their label from here.
+ggml_sycl_profile_label ggml_sycl_top_k_profile_label(sycl::queue & q,
+                                                      const char *  name,
+                                                      const char *  metadata,
+                                                      size_t        bytes);
 
 // BITONIC and RADIX paths. src is nrows contiguous rows of ncols floats, dst is
 // nrows contiguous rows of k indices; both resolved for ctx.device.
