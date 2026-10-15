@@ -36,6 +36,11 @@ static int get_cpu_expert_thread_count() {
     // from running together: the layer chain already orders them (gate/up, then down, then
     // the next layer).  Measured 2026-10-15 on Qwen3.8 decode (B70, -c 4096): 22 workers
     // 8.1 t/s, 4 workers 9.4 t/s, 1 worker 10.5 t/s.
+    // One worker cannot deadlock because every wait points back in submission order (the
+    // z4kd block in ggml-sycl.cpp).  That argument assumes ONE context per device's pool:
+    // two contexts on one device would interleave their jobs in this FIFO behind each
+    // other's joins, and same-device concurrent inference is unsupported (canonical
+    // memory contract, section 5).
     return 1;
 }
 
