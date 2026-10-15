@@ -599,7 +599,8 @@ def claim_context_without_room_is_refused_by_name(sycl: str, cache: str, table: 
     fit_at = txn.find("unified_cache_dense_scratch_runtime_fit(")
     return (bool(room) and bool(room_t) and bool(helper) and fit_at >= 0
             and ordered(room, LOCK, "return g_planned_load_terms.owners.context_room(device_id, owner, context);")
-            and "return c == nullptr || (context != 0 && (context_index(*c, context) >= 0 || context_index(*c, 0) >= 0));" \
+            and "return c == nullptr || (context != 0 && (context_index(*c, context) >= 0 || "
+            "context_index(*c, 0) >= 0));" \
             in room_t
             and ordered(helper, "if (ggml_sycl::unified_cache_planned_dense_scratch_context_room(device, owner, "
                                 "context)) { return false; }",
