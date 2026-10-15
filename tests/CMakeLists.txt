@@ -1073,7 +1073,17 @@ if (NOT WIN32)
     )
     # The script exits 77 (skip) when neither ripgrep nor GNU grep is available
     # (e.g. macOS BSD grep runners); treat that as a skip, not a failure.
-    set_tests_properties(test-sycl-alloc-policy PROPERTIES SKIP_RETURN_CODE 77)
+    #
+    # This wrapper is the registration of scripts/check-sycl-alloc-usage.sh: it
+    # runs the checker on ggml/src/ggml-sycl, then on every planted fixture. With
+    # only the default "main" label, lane sets that select policy or host-only
+    # gates by label never ran it, so a violation merged unseen. Labels match
+    # test-sycl-handle-policy plus "hostonly": it is bash and grep, no device.
+    set_tests_properties(test-sycl-alloc-policy PROPERTIES
+        LABELS "sycl;policy;hostonly"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
 endif()
 
 if (NOT WIN32)
