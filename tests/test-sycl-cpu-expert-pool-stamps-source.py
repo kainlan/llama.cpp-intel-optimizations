@@ -28,12 +28,17 @@ THE CONTRACT.  With comments blanked:
      batched-last phase times; moe_cpu_job_join_on_queue's host_task captures the
      job's record.
   L. (ggml-sycl.cpp) the [CPU-EXPERT-POOL-TRACE] token= line carries inputs_wait=,
-     chain_gap=, join_lat=, join_waited_us= and pre_compute=.
+     chain_gap=, join_lat=, join_waited_us=, join_wake= and pre_compute=, with join_wake=
+     right after join_waited_us=.
+  W. (cpu-expert-pool-stamps.hpp cpu_expert_job_stamps_sum) join_wake sums t_join_exit -
+     t_compute_end over the joins that waited, the else branch of `if (j.join_found_ready)`,
+     so the additive terms close on each job's span.
   P. (ggml/src/ggml-sycl) [CPU-EXPERT-POOL-JOB] is printed at exactly one site, inside
      `if (moe_hostpath_trace_level() >= 2)`: GGML_SYCL_MOE_IDS_COPY_TRACE=2 is the only
      per-job printer, and =1 prints no per-job line.
   C. (docs/backend/sycl-env-vars.md) the GGML_SYCL_MOE_IDS_COPY_TRACE row names the =2
-     level and the five sums.
+     level and the six sums, and says which are additive and which are overlapping
+     diagnostics.
 
 NOT VACUOUS.  --self-test runs the gate on in-memory mutants of the real sources and
 requires each to FAIL on its own pin, then requires the unmodified tree to pass.
@@ -52,6 +57,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SYCL = ROOT / "ggml" / "src" / "ggml-sycl"
 POOL = SYCL / "cpu-expert-pool.cpp"
 DISPATCH = SYCL / "cpu-dispatch.cpp"
+STAMPS = SYCL / "cpu-expert-pool-stamps.hpp"
 BACKEND = SYCL / "ggml-sycl.cpp"
 DOC = ROOT / "docs" / "backend" / "sycl-env-vars.md"
 TAG = "(llama.cpp-j6jf)"
@@ -60,7 +66,7 @@ TRACE_GUARD = r"if\s*\(\s*trace\s*\)"
 WAITS_GUARD = r"if\s*\(\s*moe_hostpath_waits_enabled\s*\(\s*\)\s*\)"
 STAMPS_GUARD = r"if\s*\(\s*stamps\s*\)"
 LEVEL2_GUARD = r"if\s*\(\s*moe_hostpath_trace_level\s*\(\s*\)\s*>=\s*2\s*\)"
-FIELDS = ("inputs_wait=", "chain_gap=", "join_lat=", "join_waited_us=", "pre_compute=")
+FIELDS = ("inputs_wait=", "chain_gap=", "join_lat=", "join_waited_us=", "join_wake=", "pre_compute=")
 
 
 class ContractError(Exception):
@@ -257,6 +263,23 @@ def check_line(backend: str) -> None:
     for field in FIELDS:
         if not re.search(r"(?:^|\s)" + re.escape(field), line):
             fail("L", f"the [CPU-EXPERT-POOL-TRACE] line does not carry {field}")
+    if line.index("join_wake=") < line.index("join_waited_us="):
+        fail("L", "the [CPU-EXPERT-POOL-TRACE] line prints join_wake= before join_waited_us=")
+
+
+SUM_SIG = r"inline\s+cpu_expert_job_stamp_sums\s+cpu_expert_job_stamps_sum\s*\([^)]*\)\s*\{"
+
+
+def check_join_wake(stamps: str) -> None:
+    code = blank_comments(stamps)
+    body, off = body_of(code, SUM_SIG, "W")
+    wake = re.search(r"\bjoin_wake_us\s*\+=\s*cpu_expert_job_stamps_span_us\s*\(\s*j\.t_compute_end_ns\s*,"
+                     r"\s*j\.t_join_exit_ns\s*,", body)
+    if not wake:
+        fail("W", "cpu_expert_job_stamps_sum does not sum join_wake as t_join_exit - t_compute_end")
+    heads = enclosing_headers(code, off + wake.start())
+    if not heads or heads[0] != "else" or not re.search(r"if\s*\(\s*j\.join_found_ready\s*\)", body):
+        fail("W", "join_wake is not summed in the else branch of `if (j.join_found_ready)` (the joins that waited)")
 
 
 def check_per_job(sources: dict[str, str]) -> None:
@@ -282,24 +305,26 @@ def check_doc(doc: str) -> None:
     for field in FIELDS:
         if f"`{field}" not in row:
             fail("C", f"the GGML_SYCL_MOE_IDS_COPY_TRACE row does not name `{field}`")
+    if "**Additive**" not in row or "**Overlapping diagnostics" not in row:
+        fail("C", "the GGML_SYCL_MOE_IDS_COPY_TRACE row does not say which sums are additive and which overlap")
 
 
 def read_sources(root: Path = ROOT) -> dict[str, str | None]:
     out: dict[str, str | None] = {}
-    for key, path in (("pool", POOL), ("dispatch", DISPATCH), ("backend", BACKEND), ("doc", DOC)):
+    for key, path in (("pool", POOL), ("dispatch", DISPATCH), ("backend", BACKEND), ("doc", DOC), ("stamps", STAMPS)):
         p = root / path.relative_to(ROOT)
         out[key] = p.read_text(encoding="utf-8") if p.exists() else None
     others = {}
     sycl = root / SYCL.relative_to(ROOT)
     for p in sorted(sycl.glob("*.[ch]pp")):
-        if p.name not in ("cpu-expert-pool.cpp", "cpu-dispatch.cpp", "ggml-sycl.cpp"):
+        if p.name not in ("cpu-expert-pool.cpp", "cpu-dispatch.cpp", "ggml-sycl.cpp", "cpu-expert-pool-stamps.hpp"):
             others[p.name] = p.read_text(encoding="utf-8", errors="replace")
     out["others"] = others  # type: ignore[assignment]
     return out
 
 
 def check(s: dict) -> None:
-    for key, path in (("pool", POOL), ("dispatch", DISPATCH), ("backend", BACKEND), ("doc", DOC)):
+    for key, path in (("pool", POOL), ("dispatch", DISPATCH), ("backend", BACKEND), ("doc", DOC), ("stamps", STAMPS)):
         if s[key] is None:
             fail("0", f"{path.relative_to(ROOT)} is missing")
     check_submit(s["pool"])
@@ -307,9 +332,10 @@ def check(s: dict) -> None:
     check_compute(s["dispatch"])
     check_join(s["backend"])
     check_line(s["backend"])
+    check_join_wake(s["stamps"])
     printers = dict(s["others"])
     printers.update({"cpu-expert-pool.cpp": s["pool"], "cpu-dispatch.cpp": s["dispatch"],
-                     "ggml-sycl.cpp": s["backend"]})
+                     "ggml-sycl.cpp": s["backend"], "cpu-expert-pool-stamps.hpp": s["stamps"]})
     check_per_job(printers)
     check_doc(s["doc"])
 
@@ -357,6 +383,15 @@ def self_test(s: dict) -> int:
              "host_task([job]() { moe_cpu_job_join(job, nullptr);")),
         ("L", "backend", "chain_gap missing from the line", sub(r" chain_gap=%", " chain_wait=%")),
         ("L", "backend", "join_waited_us missing from the line", sub(r'"join_waited_us=%', '"join_waits=%')),
+        ("L", "backend", "join_wake missing from the line", sub(r" join_wake=%", " join_tail=%")),
+        ("L", "backend", "join_wake printed before join_waited_us",
+         sub(r'"join_waited_us=%\.0fus join_wake=%\.0fus', '"join_wake=%.0fus join_waited_us=%.0fus')),
+        ("W", "stamps", "join_wake summed from the join entry",
+         sub(r"join_wake_us \+= cpu_expert_job_stamps_span_us\(j\.t_compute_end_ns",
+             "join_wake_us += cpu_expert_job_stamps_span_us(j.t_join_entry_ns")),
+        ("W", "stamps", "join_wake summed over ready joins",
+         sub(r"(s\.join_lat_us \+= [^\n]*\n)((?:.|\n)*?)\n\s*(s\.join_wake_us \+= [^\n]*)",
+             r"\1            \3\n\2")),
         ("P", "backend", "per-job line at level 1",
          sub(r"if \(moe_hostpath_trace_level\(\) >= 2\)", "if (moe_hostpath_trace_level() >= 1)")),
         ("P", "backend", "a second per-job printer",
@@ -365,7 +400,9 @@ def self_test(s: dict) -> int:
         ("C", "doc", "doc row loses =2",
          sub(r"(\| `GGML_SYCL_MOE_IDS_COPY_TRACE[^\n]*?)`=2`", r"\1`=1`")),
         ("C", "doc", "doc row loses pre_compute",
-         sub(r"(\| `GGML_SYCL_MOE_IDS_COPY_TRACE[^\n]*?)pre_compute", r"\1pre_kernel")),
+         sub(r"(\| `GGML_SYCL_MOE_IDS_COPY_TRACE[^\n]*?)`pre_compute=`", r"\1`pre_kernel=`")),
+        ("C", "doc", "doc row stops saying what overlaps",
+         sub(r"(\| `GGML_SYCL_MOE_IDS_COPY_TRACE[^\n]*?)\*\*Overlapping diagnostics", r"\1**Also")),
     ]
     failures = []
     caught = 0
@@ -415,7 +452,7 @@ def main(argv: list[str]) -> int:
     except ContractError as e:
         print(e)
         return 1
-    print("PASS: every CPU expert pool job stamp is taken inside a trace guard, the trace line carries the five "
+    print("PASS: every CPU expert pool job stamp is taken inside a trace guard, the trace line carries the six "
           f"per-token sums, and GGML_SYCL_MOE_IDS_COPY_TRACE=2 is the only per-job printer {TAG}")
     return 0
 

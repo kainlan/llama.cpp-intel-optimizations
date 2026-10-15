@@ -1130,15 +1130,18 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     sub("N5", "compact copies drop their dependency", "copy.src_offset, copy.bytes, queue, deps));",
         "copy.src_offset, copy.bytes, queue));")
     join_def = (
-        "static sycl::event moe_cpu_job_join_on_queue(sycl::queue & queue, std::shared_future<void> job) {\n"
+        "static sycl::event moe_cpu_job_join_on_queue(sycl::queue &                                     queue,\n"
+        "                                             std::shared_future<void>                          job,\n"
+        "                                             std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> stamps) {\n"
     )
     pro_def = "static std::function<void()> moe_cpu_job_prologue(moe_cpu_job_inputs inputs) {\n"
     sub("N1", "join get() outside its host_task", join_def, join_def + "    job.get();\n")
-    sub("N1", "job join called outside its host_task", join_def, join_def + "    moe_cpu_job_join(job);\n")
+    sub("N1", "job join called outside its host_task", join_def, join_def + "    moe_cpu_job_join(job, nullptr);\n")
     sub("N1", "job join called from the slot flush", slot_open,
-        slot_open + "    moe_cpu_job_join(slot.future.share());\n")
-    sub("N4", "join helper stops taking get()", "std::future_status::ready);\n    }\n    job.get();\n",
-        "std::future_status::ready);\n    }\n")
+        slot_open + "    moe_cpu_job_join(slot.future.share(), nullptr);\n")
+    sub("N4", "join helper stops taking get()",
+        "ggml_sycl::cpu_expert_pool_trace_note_join(was_ready);\n    }\n    job.get();\n",
+        "ggml_sycl::cpu_expert_pool_trace_note_join(was_ready);\n    }\n")
     sub("N1", "prologue waits in the factory body", pro_def, pro_def + "    moe_cpu_job_wait_inputs(inputs);\n")
     sub("N1", "boundary wait called from a flush", "        ++g_cpu_scatter_serial;\n",
         "        ++g_cpu_scatter_serial;\n        pending_cpu_scatter_wait_prev_events(slot);\n")
@@ -1162,11 +1165,13 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     s_g = settle.find(g_line, s_h)
     out[-1] = (out[-1][0], settle[: s_g + len(g_line)] + "            moe_settle_activation(sycl::event{});\n"
                + settle[s_g + len(g_line) :], out[-1][2])
+    # The join host_task and the slot flush's join push, as the backend writes them.
+    join_task = "cgh.host_task([job, stamps = std::move(stamps)]() { moe_cpu_job_join(job, stamps.get()); });"
+    slot_join = ("            joins.push_back(moe_cpu_job_join_on_queue(*slot.stream, group[k]->future.share(), "
+                 "group[k]->job_stamps));\n")
     # Positive control for the helper mutants: the same join wait written inline in the flush.
-    sub("N1", "group future wait inline in the slot flush",
-        "            joins.push_back(moe_cpu_job_join_on_queue(*slot.stream, group[k]->future.share()));\n",
-        "            group[k]->future.wait();\n"
-        "            joins.push_back(moe_cpu_job_join_on_queue(*slot.stream, group[k]->future.share()));\n")
+    sub("N1", "group future wait inline in the slot flush", slot_join,
+        "            group[k]->future.wait();\n" + slot_join)
     # Two calls deep: flush_pending_cpu_scatter_if_consumed -> ggml_sycl_moe_precomputed_mmid_skip_pending ->
     # ggml_sycl_moe_precomputed_skip_contains.
     deep = ("    moe_precomputed_skip_key key{};\n"
@@ -1196,10 +1201,12 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     sub("N1", "worker wait behind a wrapper the prologue factory calls", pro_def,
         "static void moe_inputs_ready(const moe_cpu_job_inputs & in) {\n    moe_cpu_job_wait_inputs(in);\n}\n\n"
         + pro_def + "    moe_inputs_ready(inputs);\n")
-    sub("N1", "wait in the host_task closure's capture list", "cgh.host_task([job]() { moe_cpu_job_join(job); });",
-        "cgh.host_task([job = (job.wait(), job)]() { moe_cpu_job_join(job); });")
-    sub("N1", "join hands host_task a named closure", "cgh.host_task([job]() { moe_cpu_job_join(job); });",
-        "auto task = [job]() { moe_cpu_job_join(job); }; cgh.host_task(task);")
+    sub("N1", "wait in the host_task closure's capture list", join_task,
+        "cgh.host_task([job = (job.wait(), job), stamps = std::move(stamps)]() "
+        "{ moe_cpu_job_join(job, stamps.get()); });")
+    sub("N1", "join hands host_task a named closure", join_task,
+        "auto task = [job, stamps = std::move(stamps)]() { moe_cpu_job_join(job, stamps.get()); }; "
+        "cgh.host_task(task);")
     sub("N2", "prologue definition renamed away", "static std::function<void()> moe_cpu_job_prologue(",
         "static std::function<void()> moe_cpu_job_prologue_v2(")
     # Every caller: the hybrid block and the event-chained route (llama.cpp-7pvo) each build one.
@@ -1207,8 +1214,9 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
         "moe_cpu_job_prologue_unused(std::move(job_inputs))", count=-1)
     # A lambda called on the submitting thread to build the handed-off closure runs there: only its result
     # is handed off.
-    sub("N1", "join builds its host_task closure by calling a lambda", "cgh.host_task([job]() { moe_cpu_job_join(job); });",
-        "cgh.host_task([job]() { job.wait(); return [job]() { moe_cpu_job_join(job); }; }());")
+    sub("N1", "join builds its host_task closure by calling a lambda", join_task,
+        "cgh.host_task([job, stamps]() { job.wait(); return [job, stamps]() "
+        "{ moe_cpu_job_join(job, stamps.get()); }; }());")
     sub("N1", "prologue builds its closure by calling a lambda",
         "    return [inputs = std::move(inputs)]() {\n        moe_cpu_job_wait_inputs(inputs);\n    };\n",
         "    return [&]() { sycl::event::wait(inputs.events); return std::function<void()>([inputs]() "
@@ -1226,13 +1234,13 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     sub("N3", "prologue closure stops waiting for its inputs",
         "    return [inputs = std::move(inputs)]() {\n        moe_cpu_job_wait_inputs(inputs);\n    };\n",
         "    return [inputs = std::move(inputs)]() {\n        (void) inputs;\n    };\n")
-    sub("N4", "join host_task closure stops joining the job", "cgh.host_task([job]() { moe_cpu_job_join(job); });",
-        "cgh.host_task([job]() { (void) job; });")
+    sub("N4", "join host_task closure stops joining the job", join_task,
+        "cgh.host_task([job, stamps = std::move(stamps)]() { (void) job; });")
     boundary_open = (
         "void ggml_sycl_cpu_tg_flush_pending() {\n    moe_hostpath_wait_context boundary_waits(MOE_WAIT_B7);\n"
     )
     sub("N4", "job join called from the graph-boundary flush, outside the scanned code", boundary_open,
-        boundary_open + "    moe_cpu_job_join(g_pending_scatter.future.share());\n")
+        boundary_open + "    moe_cpu_job_join(g_pending_scatter.future.share(), nullptr);\n")
     pending_any_open = "bool ggml_sycl_cpu_tg_pending_any() {\n"
     sub("N6", "boundary wait called from pending_any, outside the scanned code", pending_any_open,
         pending_any_open + "    pending_cpu_scatter_wait_prev_events();\n")

@@ -81,13 +81,18 @@ static void test_sums() {
     expect_near("join_lat_us", s.join_lat_us, 80.0);
     // join_waited over joins that waited: B 1810-1700 = 110
     expect_near("join_waited_us", s.join_waited_us, 110.0);
+    // join_wake over joins that waited: B 1810-1800 = 10
+    expect_near("join_wake_us", s.join_wake_us, 10.0);
+    // compute: 250 + 280 + 85 + 90
+    expect_near("compute_us", s.compute_us, 705.0);
     // pre_compute: 50 + 20 + 10 + 10
     expect_near("pre_compute_us", s.pre_compute_us, 90.0);
 }
 
 static void test_clamps() {
-    // A ready join whose entry stamp precedes the compute end (clock skew between
-    // threads) adds 0 latency, not a negative one.
+    // A ready join whose entry stamp precedes the compute end adds 0 latency, not a
+    // negative one. The join stamps its entry before its wait_for(0), so a job that
+    // finishes in between is found ready with its compute end after that entry.
     std::vector<cpu_expert_job_stamps> jobs;
     jobs.push_back(job(1000, 1010, 1020, 1100, 1090, 1095, true));
     // compute start before inputs ready cannot happen, but clamps to 0 if it does.
@@ -108,6 +113,29 @@ static void test_clamps() {
     const cpu_expert_job_stamp_sums e = ggml_sycl::cpu_expert_job_stamps_sum({});
     expect_eq("empty jobs", e.jobs, 0);
     expect_near("empty chain_gap_us", e.chain_gap_us, 0.0);
+}
+
+// The additive terms close: per job, inputs_wait + pre_compute + compute + join_lat
+// (ready join) or join_wake (waited join) is its span from t_submit to t_join_entry
+// (ready), t_join_exit (waited) or t_compute_end (never joined). The diagnostics
+// chain_gap and join_waited are not part of it.
+static void test_partition() {
+    std::vector<cpu_expert_job_stamps> jobs;
+    jobs.push_back(job(1000, 1130, 1137, 1400, 1425, 1426, true));   // ready join
+    jobs.push_back(job(1005, 1300, 1310, 1620, 1350, 1641, false));  // waited join
+    jobs.push_back(job(1010, 1650, 1655, 1700, -1, -1, false));      // never joined
+    jobs.push_back(job(1020, 1660, 1662, 1800, 1700, 1833, false));  // waited join
+    const double want = (1425 - 1000) + (1641 - 1005) + (1700 - 1010) + (1833 - 1020);
+
+    const cpu_expert_job_stamp_sums s = ggml_sycl::cpu_expert_job_stamps_sum(jobs);
+    const double additive = s.inputs_wait_us + s.pre_compute_us + s.compute_us + s.join_lat_us + s.join_wake_us;
+    expect_near("partition closes on the jobs' spans", additive, want);
+    expect_near("partition join_lat_us", s.join_lat_us, 25.0);
+    expect_near("partition join_wake_us", s.join_wake_us, (1641 - 1620) + (1833 - 1800));
+    // The diagnostics are non-zero here, and adding them would overshoot.
+    expect_true("chain_gap is a non-zero diagnostic", s.chain_gap_us > 0.0);
+    expect_true("join_waited is a non-zero diagnostic", s.join_waited_us > 0.0);
+    expect_true("diagnostics overlap the partition", additive + s.chain_gap_us + s.join_waited_us > want + 1.0);
 }
 
 static void test_kind() {
@@ -154,6 +182,7 @@ static void test_format() {
 int main() {
     test_sums();
     test_clamps();
+    test_partition();
     test_kind();
     test_format();
     if (g_failures != 0) {

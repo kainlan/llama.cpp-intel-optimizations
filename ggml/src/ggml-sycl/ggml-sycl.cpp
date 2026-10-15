@@ -23946,9 +23946,6 @@ static float ggml_sycl_moe_prob_threshold() {
 
 struct pending_cpu_scatter {
     std::future<void>            future;         // CPU compute completion
-    // The pool job's stamp record while GGML_SYCL_MOE_IDS_COPY_TRACE is set, else empty;
-    // handed to the job's join host_task (llama.cpp-j6jf).
-    std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> job_stamps;
     float *                      out_pinned;     // Output buffer to scatter from
     float *                      act_pinned;     // Activation buffer (for deferred release)
     uint8_t *                    weight_pinned;  // Optional D2H-staged weights for unsupported device kernels
@@ -24030,6 +24027,10 @@ struct pending_cpu_scatter {
     struct prev_scatter_state {
         std::vector<sycl::event> scatter_events;
     } prev_scatter;
+
+    // The pool job's stamp record while GGML_SYCL_MOE_IDS_COPY_TRACE is set, else empty; handed to the job's join
+    // host_task beside `future` (llama.cpp-j6jf).
+    std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> job_stamps;
 
     pending_cpu_scatter() :
         out_pinned(nullptr),
@@ -24191,18 +24192,20 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
         ggml_sycl::cpu_expert_pool_trace_totals pt;
         ggml_sycl::cpu_expert_pool_trace_take(pt);
         // Then the per-token sums of the jobs' critical-path stamps (llama.cpp-j6jf); stamped counts the jobs
-        // with a record, stamped_joined those whose join host_task had run by now.
+        // with a record, stamped_joined those whose join host_task had run by now.  inputs_wait, pre_compute,
+        // compute, join_lat and join_wake add up to the jobs' spans; chain_gap and join_waited_us overlap them
+        // (cpu_expert_job_stamp_sums).
         const ggml_sycl::cpu_expert_job_stamp_sums js = ggml_sycl::cpu_expert_job_stamps_sum(pt.job_stamps);
         GGML_LOG_WARN(
             "[CPU-EXPERT-POOL-TRACE] token=%llu jobs=%llu tasks=%llu rows=%llu threads=%llu wake=%.0fus "
             "quant=%.0fus setup=%.0fus fanout=%.0fus compute=%.0fus wall=%.0fus joins=%llu joins_ready=%llu "
             "stamped=%llu stamped_joined=%llu inputs_wait=%.0fus chain_gap=%.0fus join_lat=%.0fus "
-            "join_waited_us=%.0fus pre_compute=%.0fus\n",
+            "join_waited_us=%.0fus join_wake=%.0fus pre_compute=%.0fus\n",
             (unsigned long long) w.token, (unsigned long long) pt.jobs, (unsigned long long) pt.tasks,
             (unsigned long long) pt.rows, (unsigned long long) pt.threads, pt.wake_us, pt.quant_us, pt.setup_us,
             pt.fanout_us, pt.compute_us, pt.wall_us, (unsigned long long) pt.joins, (unsigned long long) pt.joins_ready,
             (unsigned long long) js.jobs, (unsigned long long) js.joined, js.inputs_wait_us, js.chain_gap_us,
-            js.join_lat_us, js.join_waited_us, js.pre_compute_us);
+            js.join_lat_us, js.join_waited_us, js.join_wake_us, js.pre_compute_us);
         if (moe_hostpath_trace_level() >= 2) {
             // Each job's stamps relative to the token's first submit, in submission order.
             const int64_t t0 = pt.job_stamps.empty() ? 0 : pt.job_stamps.front().t_submit_ns;
@@ -24289,7 +24292,6 @@ static void moe_shared_act_new_graph() {
 // visible from the async thread).
 struct cpu_dispatch_result {
     std::future<void>                               future;  // CPU compute future (may still be running)
-    std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> job_stamps;  // see pending_cpu_scatter
     float *                                         out_pinned = nullptr;
     float *                                         act_pinned = nullptr;
     ggml_sycl::mem_handle                           out_handle;
@@ -24308,6 +24310,8 @@ struct cpu_dispatch_result {
     int64_t                                         row_n             = 0;
     uint64_t                                        act_serial        = 0;
     bool                                            shares_activation = false;
+
+    std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> job_stamps;  // see pending_cpu_scatter
 };
 
 // ---------------------------------------------------------------------------
@@ -24346,8 +24350,8 @@ static void moe_cpu_job_wait_inputs(const moe_cpu_job_inputs & inputs) {
     if (!inputs.events.empty()) {
         sycl::event::wait(inputs.events);
     }
+    // The job's inputs-ready stamp (llama.cpp-j6jf); a no-op off a traced pool job.
     if (moe_hostpath_waits_enabled()) {
-        // The job's inputs-ready stamp (llama.cpp-j6jf); a no-op off a traced pool job.
         ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready();
     }
     if (inputs.zero_out && inputs.zero_bytes > 0) {

@@ -92,27 +92,45 @@ struct cpu_expert_job_stamps {
     uint64_t            bytes              = 0;
 };
 
-// Per-token sums over the jobs' stamps, in us:
+// Per-token sums over the jobs' stamps, in us.
+//
+// Additive: per job these split its span from t_submit to the end of its join, so
+// their sum over a token is the sum of the jobs' spans.
 //   inputs_wait   sum(t_inputs_ready - t_submit): the device chain ahead of each
 //                 job, plus the worker's wake (the queue wait before pickup)
+//   pre_compute   sum(t_compute_start - t_inputs_ready): output zeroing, task
+//                 resolve, activation quantise, row setup and fan-out
+//   compute       sum(t_compute_end - t_compute_start): the row loop; the same
+//                 stamps as the pool line's compute=
+//   join_lat      sum(t_join_entry - t_compute_end) over joins that found the job
+//                 finished; such a job's span ends at t_join_entry, since its
+//                 job.get() returns at once
+//   join_wake     sum(t_join_exit - t_compute_end) over joins that waited for the
+//                 job: from the row loop's return to the waiting join's return
+// A job that was never joined has neither join term; its span ends at
+// t_compute_end.
+//
+// Diagnostics, which overlap the terms above and must not be added to them:
 //   chain_gap     sum over consecutive jobs, in submission order, of
 //                 max(0, t_inputs_ready[N] - t_join_exit[N-1]); a pair whose
-//                 earlier job was never joined adds nothing
-//   join_lat      sum(max(0, t_join_entry - t_compute_end)) over joins that found
-//                 the job finished
-//   join_waited   sum(t_join_exit - t_join_entry) over joins that waited for it
-//   pre_compute   sum(max(0, t_compute_start - t_inputs_ready)): output zeroing,
-//                 task resolve, activation quantise, row setup and fan-out
-// A difference whose either stamp is missing adds nothing.
+//                 earlier job was never joined adds nothing. It lies inside job N's
+//                 inputs_wait whenever job N was submitted before job N-1's join
+//                 returned.
+//   join_waited   sum(t_join_exit - t_join_entry) over joins that waited for their
+//                 job; it overlaps that job's own inputs_wait, pre_compute,
+//                 compute and join_wake.
+// Every difference clamps at 0, and one whose either stamp is missing adds nothing.
 struct cpu_expert_job_stamp_sums {
     uint64_t jobs           = 0;
     uint64_t joined         = 0;
     uint64_t joins_waited   = 0;
     double   inputs_wait_us = 0.0;
-    double   chain_gap_us   = 0.0;
-    double   join_lat_us    = 0.0;
-    double   join_waited_us = 0.0;
     double   pre_compute_us = 0.0;
+    double   compute_us     = 0.0;
+    double   join_lat_us    = 0.0;
+    double   join_wake_us   = 0.0;
+    double   chain_gap_us   = 0.0;
+    double   join_waited_us = 0.0;
 };
 
 inline void cpu_expert_job_stamps_sort(std::vector<cpu_expert_job_stamps> & jobs) {
@@ -137,6 +155,7 @@ inline cpu_expert_job_stamp_sums cpu_expert_job_stamps_sum(std::vector<cpu_exper
         s.jobs += 1;
         s.inputs_wait_us += cpu_expert_job_stamps_span_us(j.t_submit_ns, j.t_inputs_ready_ns, true);
         s.pre_compute_us += cpu_expert_job_stamps_span_us(j.t_inputs_ready_ns, j.t_compute_start_ns, true);
+        s.compute_us += cpu_expert_job_stamps_span_us(j.t_compute_start_ns, j.t_compute_end_ns, true);
         if (i > 0 && jobs[i - 1].t_join_exit_ns != 0) {
             s.chain_gap_us += cpu_expert_job_stamps_span_us(jobs[i - 1].t_join_exit_ns, j.t_inputs_ready_ns, true);
         }
@@ -149,6 +168,7 @@ inline cpu_expert_job_stamp_sums cpu_expert_job_stamps_sum(std::vector<cpu_exper
         } else {
             s.joins_waited += 1;
             s.join_waited_us += cpu_expert_job_stamps_span_us(j.t_join_entry_ns, j.t_join_exit_ns, true);
+            s.join_wake_us += cpu_expert_job_stamps_span_us(j.t_compute_end_ns, j.t_join_exit_ns, true);
         }
     }
     return s;

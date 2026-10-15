@@ -101,13 +101,24 @@ void CpuExpertPool::worker_thread() {
 // ---------------------------------------------------------------------------
 using pool_trace_clock = std::chrono::steady_clock;
 
-static std::mutex                   g_pool_trace_mutex;
-static cpu_expert_pool_trace_totals g_pool_trace;
+static std::mutex g_pool_trace_mutex;
 
-// The stamp records of the jobs finished since the last take (llama.cpp-j6jf), under
-// g_pool_trace_mutex. Each is shared with its job's join host_task, which may write
-// its join stamps after the job is listed here.
-static std::vector<std::shared_ptr<cpu_expert_job_stamps>> g_pool_trace_jobs;
+// The trace's totals, and the stamp records of the jobs finished since the last take
+// (llama.cpp-j6jf), both under g_pool_trace_mutex. Each record is shared with its job's
+// join host_task, which may write its join stamps after the job is listed here.
+// Made once and never destroyed: both members hold vectors, so as TU statics they would
+// run destructors at exit, while ~CpuExpertPool, whose pools are statics of
+// ggml-sycl.cpp and so die in an order unspecified relative to this TU's, can still be
+// draining a worker that records a traced job into them.
+struct pool_trace_state {
+    cpu_expert_pool_trace_totals                        totals;
+    std::vector<std::shared_ptr<cpu_expert_job_stamps>> jobs;
+};
+
+static pool_trace_state & pool_trace() {
+    static pool_trace_state * const state = new pool_trace_state();
+    return *state;
+}
 
 // The traced job this pool worker is running, for its prologue's inputs-ready stamp.
 static thread_local cpu_expert_job_stamps * g_pool_current_job = nullptr;
@@ -126,14 +137,15 @@ int64_t cpu_expert_pool_trace_now_ns() {
 
 void cpu_expert_pool_trace_take(cpu_expert_pool_trace_totals & out) {
     std::lock_guard<std::mutex> lock(g_pool_trace_mutex);
-    out          = g_pool_trace;
-    g_pool_trace = {};
+    pool_trace_state &          st = pool_trace();
+    out                            = st.totals;
+    st.totals                      = {};
     out.job_stamps.clear();
-    out.job_stamps.reserve(g_pool_trace_jobs.size());
-    for (const std::shared_ptr<cpu_expert_job_stamps> & job : g_pool_trace_jobs) {
+    out.job_stamps.reserve(st.jobs.size());
+    for (const std::shared_ptr<cpu_expert_job_stamps> & job : st.jobs) {
         out.job_stamps.push_back(*job);
     }
-    g_pool_trace_jobs.clear();
+    st.jobs.clear();
     cpu_expert_job_stamps_sort(out.job_stamps);
 }
 
@@ -155,8 +167,8 @@ void cpu_expert_pool_trace_note_join_stamps(cpu_expert_job_stamps & stamps,
 
 void cpu_expert_pool_trace_note_join(bool was_ready) {
     std::lock_guard<std::mutex> lock(g_pool_trace_mutex);
-    g_pool_trace.joins += 1;
-    g_pool_trace.joins_ready += was_ready ? 1 : 0;
+    pool_trace().totals.joins += 1;
+    pool_trace().totals.joins_ready += was_ready ? 1 : 0;
 }
 
 void cpu_expert_pool_trace_add_job(cpu_expert_pool_trace_totals &         totals,
@@ -250,10 +262,10 @@ static void pool_trace_record_job(size_t                                        
         stamps->bytes              = ph.bytes;
     }
     std::lock_guard<std::mutex> lock(g_pool_trace_mutex);
-    cpu_expert_pool_trace_add_job(g_pool_trace, n_tasks, ph, pool_trace_us(t_submit, t_start),
+    cpu_expert_pool_trace_add_job(pool_trace().totals, n_tasks, ph, pool_trace_us(t_submit, t_start),
                                   pool_trace_us(t_submit, t_done), overlapped);
     if (stamps) {
-        g_pool_trace_jobs.push_back(stamps);
+        pool_trace().jobs.push_back(stamps);
     }
 }
 
