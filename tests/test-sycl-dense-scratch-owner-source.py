@@ -537,6 +537,9 @@ def claim_decision_is_recorded(contract: str, audit: str) -> bool:
             and "llama.cpp-45qo" in audit and "zone_dense_scratch_merge_input" in audit)
 
 
+# The refusal helpers pick the level once, in one call with a literal format, so the format attribute type-checks it.
+LEVEL_BY_PROBE = "ggml_log_internal(probe_mode ? GGML_LOG_LEVEL_INFO : GGML_LOG_LEVEL_WARN,"
+
 # ---- D10: a rejected owner's context is refused by name -----------------------------------------------------------
 
 
@@ -566,9 +569,9 @@ def claim_rejected_owner_is_refused_by_name(sycl: str, cache: str) -> bool:
                                      "q8_rejected, f16_rejected);")
             and ordered(helper, "if (!ggml_sycl::unified_cache_planned_dense_scratch_owner_rejected(device, owner, "
                                 "&q8, &f16)) { return false; }",
-                        "if (!probe_mode) { GGML_LOG_WARN(fmt, half, owner.slot, (unsigned long long) "
-                        "owner.generation, device); return true; } GGML_LOG_INFO(fmt, half, owner.slot, (unsigned "
-                        "long long) owner.generation, device); return true; }")
+                        LEVEL_BY_PROBE, "half, owner.slot, (unsigned long long) owner.generation, device); "
+                                        "return true; }")
+            and "const char * fmt" not in helper
             and "model slot %u generation %llu" in helper and "Q8_1 src1" in helper and "f16 dequant" in helper
             and 0 <= txn.find(refusal) < fit_at
             and ordered(txn, "const bool replanned = ", after_replan))
@@ -596,13 +599,13 @@ def claim_context_without_room_is_refused_by_name(sycl: str, cache: str, table: 
     fit_at = txn.find("unified_cache_dense_scratch_runtime_fit(")
     return (bool(room) and bool(room_t) and bool(helper) and fit_at >= 0
             and ordered(room, LOCK, "return g_planned_load_terms.owners.context_room(device_id, owner, context);")
-            and "return c == nullptr || context == 0 || context_index(*c, context) >= 0 || context_index(*c, 0) >= 0;" \
+            and "return c == nullptr || (context != 0 && (context_index(*c, context) >= 0 || context_index(*c, 0) >= 0));" \
             in room_t
             and ordered(helper, "if (ggml_sycl::unified_cache_planned_dense_scratch_context_room(device, owner, "
                                 "context)) { return false; }",
-                        "if (!probe_mode) { GGML_LOG_WARN(fmt, owner.slot, (unsigned long long) owner.generation, "
-                        "device, (unsigned long long) context); return true; } GGML_LOG_INFO(fmt, owner.slot, "
-                        "(unsigned long long) owner.generation, device, (unsigned long long) context); return true; }")
+                        LEVEL_BY_PROBE, "owner.slot, (unsigned long long) owner.generation, device, (unsigned long "
+                                        "long) context); return true; }")
+            and "const char * fmt" not in helper
             and "model slot %u generation %llu" in helper and "(context %llu)" in helper
             and 0 <= txn.find(owner_refusal) < txn.find(refusal) < fit_at)
 
@@ -612,17 +615,20 @@ def claim_context_without_room_is_refused_by_name(sycl: str, cache: str, table: 
 
 def claim_readers_ask_for_their_own_half(sycl: str) -> bool:
     """The Q8_1 claim (both of its log lines) and the Q8_1 ensure read the Q8_1 half's n_ubatch; the f16 ensure reads
-    the f16 half's. Outside the transaction's re-plan line, which prints both, there is no other reader."""
+    the f16 half's. The transaction's re-plan line prints both; no reader exists outside these four bodies."""
     t = norm(sycl)
     read = "ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d, "
     claim = body(t, Q8_CLAIM_SIG)
     q8 = body(t, Q8_ENSURE_SIG)
     f16 = body(t, F16_ENSURE_SIG)
-    return (bool(claim) and bool(q8) and bool(f16)
+    replan = body(t, TXN_SIG)
+    any_read = "unified_cache_get_planned_dense_scratch_n_ubatch("
+    return (bool(claim) and bool(q8) and bool(f16) and bool(replan)
             and claim.count(read + "false)") == 2 and read + "true)" not in claim
             and q8.count(read + "false)") == 1 and read + "true)" not in q8
             and f16.count(read + "true)") == 1 and read + "false)" not in f16
-            and t.count("unified_cache_get_planned_dense_scratch_n_ubatch(") == 6)
+            and replan.count(any_read) == 2
+            and t.count(any_read) == sum(x.count(any_read) for x in (claim, q8, f16, replan)))
 
 
 # ---- positive runs --------------------------------------------------------------------------------------------------
@@ -933,6 +939,11 @@ def test_mutant_q8_setter_not_recording_the_load_n_ubatch_fails():
         _once(CACHE, "&planned, replaced) && " + LOAD_N_UBATCH_SET, "&planned, replaced);", within=Q8_SET_SIG))
 
 
+def test_mutant_f16_setter_not_recording_the_load_n_ubatch_fails():
+    assert not claim_f16_setter_is_the_owner_store(
+        _once(CACHE, "&planned, replaced) && " + LOAD_N_UBATCH_SET, "&planned, replaced);", within=F16_SET_SIG))
+
+
 def test_mutant_merge_helper_back_fails():
     assert not claim_no_device_global_merge_remains(
         SYCL, CACHE, CACHE_H, ZONE + "\nsize_t zone_dense_scratch_merge_input(size_t prev, size_t next, "
@@ -1022,19 +1033,24 @@ def test_mutant_txn_discarding_the_replan_result_fails():
 
 def test_mutant_refusal_helper_silent_fails():
     assert not claim_rejected_owner_is_refused_by_name(
-        _once(SYCL, "GGML_LOG_WARN(", "GGML_LOG_DEBUG(", within=REFUSED_SIG), CACHE)
+        _once(SYCL, "GGML_LOG_LEVEL_WARN,", "GGML_LOG_LEVEL_DEBUG,", within=REFUSED_SIG), CACHE)
 
 
-def test_mutant_refusal_probe_branch_warning_fails():
+def test_mutant_refusal_probe_logging_at_warn_fails():
     assert not claim_rejected_owner_is_refused_by_name(
-        _once(SYCL, "GGML_LOG_INFO(fmt, half,", "GGML_LOG_WARN(fmt, half,", within=REFUSED_SIG), CACHE)
+        _once(SYCL, LEVEL_BY_PROBE, "ggml_log_internal(GGML_LOG_LEVEL_WARN,", within=REFUSED_SIG), CACHE)
+
+
+def test_mutant_refusal_real_transaction_logging_at_info_fails():
+    assert not claim_rejected_owner_is_refused_by_name(
+        _once(SYCL, LEVEL_BY_PROBE, "ggml_log_internal(probe_mode ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,",
+              within=REFUSED_SIG), CACHE)
 
 
 def test_mutant_refusal_probe_branch_returning_false_fails():
     assert not claim_rejected_owner_is_refused_by_name(
-        _once(SYCL, "GGML_LOG_INFO(fmt, half, owner.slot, (unsigned long long) owner.generation, device); return true;",
-              "GGML_LOG_INFO(fmt, half, owner.slot, (unsigned long long) owner.generation, device); return false;",
-              within=REFUSED_SIG), CACHE)
+        _once(SYCL, "(unsigned long long) owner.generation, device); return true;",
+              "(unsigned long long) owner.generation, device); return !probe_mode;", within=REFUSED_SIG), CACHE)
 
 
 def test_mutant_txn_without_the_context_room_refusal_fails():
@@ -1045,26 +1061,29 @@ def test_mutant_txn_without_the_context_room_refusal_fails():
 
 def test_mutant_context_room_helper_silent_fails():
     assert not claim_context_without_room_is_refused_by_name(
-        _once(SYCL, "GGML_LOG_WARN(", "GGML_LOG_DEBUG(", within=CTX_REFUSED_SIG), CACHE, TABLE)
+        _once(SYCL, "GGML_LOG_LEVEL_WARN,", "GGML_LOG_LEVEL_DEBUG,", within=CTX_REFUSED_SIG), CACHE, TABLE)
 
 
-def test_mutant_context_room_probe_branch_warning_fails():
+def test_mutant_context_room_probe_logging_at_warn_fails():
     assert not claim_context_without_room_is_refused_by_name(
-        _once(SYCL, "GGML_LOG_INFO(fmt, owner.slot,", "GGML_LOG_WARN(fmt, owner.slot,", within=CTX_REFUSED_SIG), CACHE,
-        TABLE)
+        _once(SYCL, LEVEL_BY_PROBE, "ggml_log_internal(GGML_LOG_LEVEL_WARN,", within=CTX_REFUSED_SIG), CACHE, TABLE)
+
+
+def test_mutant_context_room_real_transaction_logging_at_info_fails():
+    assert not claim_context_without_room_is_refused_by_name(
+        _once(SYCL, LEVEL_BY_PROBE, "ggml_log_internal(probe_mode ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,",
+              within=CTX_REFUSED_SIG), CACHE, TABLE)
 
 
 def test_mutant_context_room_probe_branch_returning_false_fails():
     assert not claim_context_without_room_is_refused_by_name(
-        _once(SYCL, "GGML_LOG_INFO(fmt, owner.slot, (unsigned long long) owner.generation, device, (unsigned long "
-              "long) context); return true;",
-              "GGML_LOG_INFO(fmt, owner.slot, (unsigned long long) owner.generation, device, (unsigned long long) "
-              "context); return false;", within=CTX_REFUSED_SIG), CACHE, TABLE)
+        _once(SYCL, "(unsigned long long) context); return true;", "(unsigned long long) context); return !probe_mode;",
+              within=CTX_REFUSED_SIG), CACHE, TABLE)
 
 
 def test_mutant_context_room_ignoring_a_free_entry_fails():
     assert not claim_context_without_room_is_refused_by_name(
-        SYCL, CACHE, _once(TABLE, " || context_index(*c, 0) >= 0;", ";", within=ROOM_T_SIG))
+        SYCL, CACHE, _once(TABLE, " || context_index(*c, 0) >= 0));", "));", within=ROOM_T_SIG))
 
 
 def test_mutant_q8_claim_reading_the_f16_half_fails():
