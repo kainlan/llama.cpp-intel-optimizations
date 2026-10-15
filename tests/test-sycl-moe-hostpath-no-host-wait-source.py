@@ -1171,7 +1171,8 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
         "    job_inputs.events.push_back(ids_d2h);\n    ids_d2h.wait();\n")
     sub("N1", "route reads the ids back through the retained readback", "    job_inputs.events.push_back(ids_d2h);\n",
         "    job_inputs.events.push_back(ids_d2h);\n"
-        "    {\n        std::vector<int32_t> ids_probe;\n        ggml_sycl_copy_ids_to_host(ctx, ids, ids_probe);\n    }\n")
+        "    {\n        std::vector<int32_t> ids_probe;\n"
+        "        ggml_sycl_copy_ids_to_host(ctx, ids, ids_probe);\n    }\n")
     sub("N7", "slot flush stops placing flagged rows", "moe_host_scatter_submit_flagged(slot, joins, ws.events);",
         "moe_host_scatter_submit_flagged_unused(slot, joins, ws.events);")
     sub("N5", "flagged scatter handed no joins", "moe_host_scatter_submit_flagged(slot, joins, ws.events);",
@@ -1180,7 +1181,8 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     sub("N7", "record build no longer reached", "ggml_sycl_moe_hybrid_decode_record_build(ctx, src0,",
         "ggml_sycl_moe_hybrid_decode_record_build_retired(ctx, src0,")
     # llama.cpp-7pvo (N8): the route takes the op in the default configuration.
-    sub("N8", "route refuses while the always-on dispatch stats are on", "g_moe_pp_profile_enabled) {\n        return false;",
+    sub("N8", "route refuses while the always-on dispatch stats are on",
+        "g_moe_pp_profile_enabled) {\n        return false;",
         "g_moe_pp_profile_enabled || ggml_sycl::MoeDispatchStats::enabled()) {\n        return false;")
     sub("N8", "CPU job records no dispatch-stats residency", "stats->record_route_residency(",
         "stats->record_route_residency_retired(")

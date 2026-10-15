@@ -593,7 +593,8 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
         )
     # The resolve step reads what the prologue waited for and builds the tasks the kernel computes, so it sits
     # between the two (llama.cpp-7pvo).
-    if worker.count(run_resolve) != 1 or not (worker.find(run_prologue) < worker.find(run_resolve) < worker.find(kernel)):
+    if worker.count(run_resolve) != 1 or not (worker.find(run_prologue) < worker.find(run_resolve)
+                                               < worker.find(kernel)):
         raise ContractError(
             "FAIL [pin W2]: the CpuExpertPool worker does not run a job's resolve step after its prologue and "
             "before the kernel; it would read expert ids that have not landed, or build tasks the kernel never "
@@ -945,16 +946,20 @@ def self_test(backend_src: str) -> int:
                 expert_pool_src.replace(worker_prologue, "", 1).replace(worker_kernel, worker_kernel + worker_prologue, 1))
     expect_fail("pool-worker-prologue-conditioned-away", backend_src, None, "W2", None,
                 expert_pool_src.replace(worker_prologue,
-                                        "            if (prologue && !trace) {\n                prologue();\n            }\n", 1))
+                                        "            if (prologue && !trace) {\n"
+                                        "                prologue();\n            }\n", 1))
     expect_fail("pool-worker-skips-resolve", backend_src, None, "W2", None,
                 expert_pool_src.replace(worker_resolve, "", 1))
     expect_fail("pool-worker-resolve-before-prologue", backend_src, None, "W2", None,
-                expert_pool_src.replace(worker_resolve, "", 1).replace(worker_prologue, worker_resolve + worker_prologue, 1))
+                expert_pool_src.replace(worker_resolve, "", 1)
+                .replace(worker_prologue, worker_resolve + worker_prologue, 1))
     expect_fail("pool-worker-resolve-after-kernel", backend_src, None, "W2", None,
-                expert_pool_src.replace(worker_resolve, "", 1).replace(worker_kernel, worker_kernel + worker_resolve, 1))
+                expert_pool_src.replace(worker_resolve, "", 1)
+                .replace(worker_kernel, worker_kernel + worker_resolve, 1))
     expect_fail("pool-worker-resolve-conditioned-away", backend_src, None, "W2", None,
                 expert_pool_src.replace(worker_resolve,
-                                        "            if (resolve && trace) {\n                resolve(tasks);\n            }\n", 1))
+                                        "            if (resolve && trace) {\n"
+                                        "                resolve(tasks);\n            }\n", 1))
     # W3: the zeroing request is skipped on some paths, defined away, or wrapped in a block of its own.
     expect_fail("zero-request-conditioned-away", sub(
         "if (zero_out_after_act_wait) {\n                    job_inputs.zero_out",
