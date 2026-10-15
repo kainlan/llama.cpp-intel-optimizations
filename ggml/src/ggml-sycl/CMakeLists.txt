@@ -2997,6 +2997,41 @@ set_tests_properties(mem-ops PROPERTIES
     TIMEOUT 120
 )
 
+# Per-call-site memcpy census (llama.cpp-th86, GGML_SYCL_MEMCPY_SITE_CENSUS):
+# copies between two plain host buffers through mem_copy / mem_copy_async take
+# mem_copy_direct_submit's host-host branch, and the flushed table must name
+# this test's own lines with their counts and direction H2H. It has no device
+# kernel of its own, so it takes SYCL_LINK_ONLY_TEST_OPTIONS per rule 1 (the
+# no-options form above is test-mem-ops' inherited exception, not a pattern).
+# It opens a SYCL queue (the API needs one), so it is a device test pinned like
+# test-mem-ops, not a host-only one.
+add_executable(test-mem-copy-site-census
+    tests/test-mem-copy-site-census.cpp
+)
+target_include_directories(test-mem-copy-site-census PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-mem-copy-site-census PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-mem-copy-site-census PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-mem-copy-site-census PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-mem-copy-site-census PRIVATE ggml-base ggml ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-mem-copy-site-census PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME mem-copy-site-census COMMAND test-mem-copy-site-census)
+set_tests_properties(mem-copy-site-census PROPERTIES
+    LABELS "sycl;memory-ops;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_MEMCPY_SITE_CENSUS=1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
+
 # Unregistered-external-pointer byte-contract authority (llama.cpp-fxrg).
 # Regression for the P0 where several ggml-sycl.cpp call sites minted
 # mem_handles for unregistered external pointers with a 3-arg call against the

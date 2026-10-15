@@ -34775,12 +34775,16 @@ static bool ggml_sycl_reorder_weight_cpu(void * dst, const void * src, const ggm
     return false;
 }
 
-// Forward declaration - handles mmap'd source memory by staging through pinned host memory
+// Forward declaration - handles mmap'd source memory by staging through pinned host memory.
+// The site defaults live here, on the first declaration, and name the caller for the copy census.
 static sycl::event ggml_sycl_safe_memcpy(sycl::queue &                    queue,
                                          void *                           dst,
                                          const void *                     src,
                                          size_t                           bytes,
-                                         const std::vector<sycl::event> & deps);
+                                         const std::vector<sycl::event> & deps,
+                                         const char *                     file     = __builtin_FILE(),
+                                         int                              line     = __builtin_LINE(),
+                                         const char *                     function = __builtin_FUNCTION());
 
 static sycl::event ggml_sycl_fill_reordered_host(sycl::queue &                    queue,
                                                  void *                           dst,
@@ -35451,12 +35455,17 @@ static ggml_sycl::mem_handle ggml_sycl_copy_handle_for_raw_ptr(const void *     
     return ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(ptr), layout, fallback_device, operation_bytes);
 }
 
-// Helper: Safe memcpy that handles mmap'd source memory via host staging
+// Helper: Safe memcpy that handles mmap'd source memory via host staging.
+// This helper and the three below forward their caller's file/line/function to mem_ops, so the
+// GGML_SYCL_MEMCPY_SITE_CENSUS table names the caller rather than the helper (llama.cpp-th86).
 static sycl::event ggml_sycl_safe_memcpy(sycl::queue &                    queue,
                                          void *                           dst,
                                          const void *                     src,
                                          size_t                           bytes,
-                                         const std::vector<sycl::event> & deps) {
+                                         const std::vector<sycl::event> & deps,
+                                         const char *                     file,
+                                         int                              line,
+                                         const char *                     function) {
     if (bytes == 0) {
         return deps.empty() ? sycl::event() : queue.ext_oneapi_submit_barrier(deps);
     }
@@ -35466,14 +35475,17 @@ static sycl::event ggml_sycl_safe_memcpy(sycl::queue &                    queue,
         ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, queue_device, bytes);
     ggml_sycl::mem_handle src_handle =
         ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS, queue_device, bytes);
-    return ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, deps);
+    return ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, deps, file, line, function);
 }
 
 static void ggml_sycl_safe_memcpy_sync(sycl::queue &                    queue,
                                        void *                           dst,
                                        const void *                     src,
                                        size_t                           bytes,
-                                       const std::vector<sycl::event> & deps = {}) {
+                                       const std::vector<sycl::event> & deps     = {},
+                                       const char *                     file     = __builtin_FILE(),
+                                       int                              line     = __builtin_LINE(),
+                                       const char *                     function = __builtin_FUNCTION()) {
     if (bytes == 0) {
         return;
     }
@@ -35483,7 +35495,7 @@ static void ggml_sycl_safe_memcpy_sync(sycl::queue &                    queue,
         ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, queue_device, bytes);
     ggml_sycl::mem_handle src_handle =
         ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS, queue_device, bytes);
-    ggml_sycl::mem_copy(dst_handle, src_handle, bytes, queue, deps);
+    ggml_sycl::mem_copy(dst_handle, src_handle, bytes, queue, deps, file, line, function);
 }
 
 static dpct::err0 ggml_sycl_submit_mem_copy(void *        dst,
@@ -35491,7 +35503,10 @@ static dpct::err0 ggml_sycl_submit_mem_copy(void *        dst,
                                             size_t        bytes,
                                             sycl::queue & queue,
                                             int           dst_fallback_device = -1,
-                                            int           src_fallback_device = -1) {
+                                            int           src_fallback_device = -1,
+                                            const char *  file                = __builtin_FILE(),
+                                            int           line                = __builtin_LINE(),
+                                            const char *  function            = __builtin_FUNCTION()) {
     if (bytes == 0) {
         return 0;
     }
@@ -35506,7 +35521,7 @@ static dpct::err0 ggml_sycl_submit_mem_copy(void *        dst,
         ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, dst_fallback_device, bytes);
     ggml_sycl::mem_handle src_handle =
         ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS, src_fallback_device, bytes);
-    (void) ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue);
+    (void) ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, {}, file, line, function);
     return 0;
 }
 
@@ -35518,7 +35533,10 @@ static dpct::err0 ggml_sycl_submit_mem_copy_2d(void *        dst,
                                                int64_t       rows,
                                                sycl::queue & queue,
                                                int           dst_fallback_device = -1,
-                                               int           src_fallback_device = -1) {
+                                               int           src_fallback_device = -1,
+                                               const char *  file                = __builtin_FILE(),
+                                               int           line                = __builtin_LINE(),
+                                               const char *  function            = __builtin_FUNCTION()) {
     if (row_bytes == 0 || rows <= 0) {
         return 0;
     }
@@ -35536,7 +35554,7 @@ static dpct::err0 ggml_sycl_submit_mem_copy_2d(void *        dst,
             ggml_sycl_copy_handle_for_raw_ptr(dst_row, GGML_LAYOUT_AOS, dst_fallback_device, row_bytes);
         ggml_sycl::mem_handle src_handle = ggml_sycl_copy_handle_for_raw_ptr(
             const_cast<char *>(src_row), GGML_LAYOUT_AOS, src_fallback_device, row_bytes);
-        (void) ggml_sycl::mem_copy_async(dst_handle, src_handle, row_bytes, queue);
+        (void) ggml_sycl::mem_copy_async(dst_handle, src_handle, row_bytes, queue, {}, file, line, function);
     }
     return 0;
 }
@@ -90043,6 +90061,7 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     // drain while device/cache teardown effects are still available.
     ggml_sycl_quarantine_drain_shutdown();
     ggml_sycl_kernel_profile_flush(true, "backend-free");
+    ggml_sycl::mem_copy_site_census_flush("backend-free");
     if (ggml_sycl::sycl_timeline_enabled() && !ggml_sycl::sycl_timeline_has_flushed_file()) {
         ggml_sycl::sycl_timeline_flush("backend-free");
     }

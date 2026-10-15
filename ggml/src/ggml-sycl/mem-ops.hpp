@@ -10,11 +10,21 @@
 
 namespace ggml_sycl {
 
+// mem_copy_async and mem_copy default-capture their CALLER's file, line and
+// function (llama.cpp-th86). Every copy below reaches mem_copy_direct_submit
+// from inside mem-ops.cpp, so a site captured there would always name
+// mem-ops.cpp; capturing it here names the code that asked for the copy, which
+// is what the GGML_SYCL_MEMCPY_SITE_CENSUS table and the kernel profiler's
+// callsite need. A wrapper that copies on behalf of its own callers should take
+// the same three defaulted parameters and pass them on.
 sycl::event mem_copy_async(const mem_handle &               dst,
                            const mem_handle &               src,
                            size_t                           size,
                            sycl::queue &                    queue,
-                           const std::vector<sycl::event> & deps = {});
+                           const std::vector<sycl::event> & deps     = {},
+                           const char *                     file     = __builtin_FILE(),
+                           int                              line     = __builtin_LINE(),
+                           const char *                     function = __builtin_FUNCTION());
 
 // Async copy over raw transient views (canonical contract: raw pointers are
 // ABI views resolved from a mem_handle for immediate submission only). The
@@ -33,7 +43,10 @@ sycl::event mem_copy_async(const mem_handle &               dst,
                            size_t                           src_offset,
                            size_t                           size,
                            sycl::queue &                    queue,
-                           const std::vector<sycl::event> & deps = {});
+                           const std::vector<sycl::event> & deps     = {},
+                           const char *                     file     = __builtin_FILE(),
+                           int                              line     = __builtin_LINE(),
+                           const char *                     function = __builtin_FUNCTION());
 
 sycl::event mem_fill_async(const mem_handle &               h,
                            int                              value,
@@ -57,7 +70,10 @@ void mem_copy(const mem_handle &               dst,
               const mem_handle &               src,
               size_t                           size,
               sycl::queue &                    queue,
-              const std::vector<sycl::event> & deps = {});
+              const std::vector<sycl::event> & deps     = {},
+              const char *                     file     = __builtin_FILE(),
+              int                              line     = __builtin_LINE(),
+              const char *                     function = __builtin_FUNCTION());
 
 void mem_copy(const mem_handle &               dst,
               size_t                           dst_offset,
@@ -65,7 +81,10 @@ void mem_copy(const mem_handle &               dst,
               size_t                           src_offset,
               size_t                           size,
               sycl::queue &                    queue,
-              const std::vector<sycl::event> & deps = {});
+              const std::vector<sycl::event> & deps     = {},
+              const char *                     file     = __builtin_FILE(),
+              int                              line     = __builtin_LINE(),
+              const char *                     function = __builtin_FUNCTION());
 
 void mem_fill(const mem_handle &               h,
               int                              value,
@@ -90,6 +109,18 @@ void mem_fill(const mem_handle &               h,
 //
 // No-op and allocation-free when tracing is disabled.
 void stage_trace_mark(const char * tag);
+
+// Diagnostic for llama.cpp-th86, off unless GGML_SYCL_MEMCPY_SITE_CENSUS=1.
+//
+// Print the per-call-site copy census to stderr: one row per (caller
+// file:line, direction, profile path) with its call and byte counts, sorted by
+// calls. Every copy that reaches mem_copy_direct_submit is counted, including
+// the host-host std::memcpy branch (direction H2H), which the kernel profiler
+// never sees. The table is cumulative over the process. The SYCL backend's free
+// path calls this right after the kernel-profile flush, and the first recorded
+// copy registers an exit printer that prints again only if copies were
+// recorded since the last print. No-op when the census is disabled.
+void mem_copy_site_census_flush(const char * reason);
 
 // Allocate a host-pinned staging buffer for a TERMINAL attempt -- one whose
 // caller has no further fallback and will abort or fail if it returns false.

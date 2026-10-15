@@ -844,6 +844,16 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-dispatch-fail-closed-source.py --self-test)
     set_tests_properties(test-sycl-moe-cpu-dispatch-fail-closed-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+    # The opt-in per-call-site memcpy census (llama.cpp-th86,
+    # GGML_SYCL_MEMCPY_SITE_CENSUS): gated on the env through one static bool,
+    # the caller's file:line forwarded from mem_copy_async/mem_copy and the
+    # generic copy wrappers into mem_copy_direct_submit, the host-host branch
+    # tagged H2H, printed to stderr at backend free and at exit. WITH --self-test
+    # (25 mutants, 1 harmless probe).
+    add_test(NAME test-sycl-memcpy-site-census-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-memcpy-site-census-source.py --self-test)
+    set_tests_properties(test-sycl-memcpy-site-census-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
     # The host-expert MoE decode levers (llama.cpp-z4kd): the GLU of a host-expert
     # layer asks moe_glu_input_host_produced (not the stale MUL_MAT_ID walk), the
     # wait census times B1 around the id readback and classifies only when on,
