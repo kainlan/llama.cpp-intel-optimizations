@@ -83,7 +83,10 @@ only shrink:
       builder decides it from the plan (`counts.on_device == 0`) and records it; no builder refusal
       tests the device lookup (`materialized`, `substitute`) without `!all_host`, and none refuses on
       the all-host case itself; and the route runs its table copy and device kernel only inside
-      `if (!record->all_host) {...}` and never refuses an all-host record.
+      `if (!record->all_host) {...}` and never refuses an all-host record.  A refusal returns the
+      outcome itself or through the builder's `refuse("reason")` helper, and every one of them must sit
+      in an `if (...) {...}` the scan reads, the helper's own body or a final `else`, so a refusal
+      written in another form fails the rule instead of escaping it.
 
 ALLOWLIST (exact statement, at most once; both its calls are BOUNDARY entries, so N2 fails once it is
 gone): `wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());` at op entry, taken
@@ -176,7 +179,13 @@ RECORD_BUILD = "ggml_sycl_moe_hybrid_decode_record_build"
 ALL_HOST_FIELD = re.compile(r"\bbool\s+all_host\s*=\s*false\s*;")
 ALL_HOST_DECIDED = re.compile(r"\bconst\s+bool\s+all_host\s*=\s*counts\.on_device\s*==\s*0\s*;")
 ALL_HOST_RECORDED = re.compile(r"\brecord->all_host\s*=\s*all_host\s*;")
-BUILD_REFUSAL = re.compile(r"\bif \(([^{}]*?)\) \{ return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED; \}")
+# A refusal returns the outcome itself or through the builder's `refuse("reason")` helper, which names the reason
+# for the once-per-stamp log line.
+REFUSAL_RETURN = r"return (?:ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED|refuse\([^;]*\));"
+BUILD_REFUSAL = re.compile(r"\bif \(([^{}]*?)\) \{ " + REFUSAL_RETURN + r" \}")
+# Every refusal return, and the ones that have no condition to read: the helper's own body and a final `else`.
+REFUSAL_RETURNS = re.compile(REFUSAL_RETURN)
+REFUSAL_UNCONDITIONED = re.compile(r"(?:\{ \*reason = why; |\} else \{ )" + REFUSAL_RETURN)
 # What the builder learns only from a device expert: its materialized layout and the table's substitute pointer.
 DEVICE_LOOKUP = re.compile(r"\b(materialized|substitute)\b")
 # A refusal whose whole condition is the all-host case.
@@ -872,7 +881,15 @@ def check_n9(scan: Scan) -> None:
             f"plan and store it with `record->all_host = all_host;`, so the route cannot tell an all-host record "
             f"from a split one ({TAG_7PVO})"
         )
-    for m in BUILD_REFUSAL.finditer(squash(build)):
+    squashed = squash(build)
+    read = len(BUILD_REFUSAL.findall(squashed)) + len(REFUSAL_UNCONDITIONED.findall(squashed))
+    if read != len(REFUSAL_RETURNS.findall(squashed)):
+        raise ContractError(
+            f"FAIL [N9]: {RECORD_BUILD} has a refusal outside an `if (...) {{...}}` this rule reads, the "
+            f"`refuse` helper's body or a final `else`, so its condition goes unchecked and could refuse every "
+            f"all-host tensor unseen ({TAG_7PVO})"
+        )
+    for m in BUILD_REFUSAL.finditer(squashed):
         cond = m.group(1)
         if DEVICE_LOOKUP.search(cond) and "!all_host" not in cond.replace(" ", ""):
             raise ContractError(
@@ -1128,6 +1145,12 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
         "    if (materialized < 0) {")
     sub("N9", "builder refuses a tensor with no substitute", "    if ((!all_host && !substitute) || !any_host) {",
         "    if (!substitute || !any_host) {")
+    sub("N9", "builder refusal hides its condition from the scan",
+        "    if (!all_host && materialized < 0) {\n"
+        "        return refuse(\"no device expert is materialized in a layout the batched kernel reads\");\n"
+        "    }\n",
+        "    if (materialized < 0)\n"
+        "        return refuse(\"no device expert is materialized in a layout the batched kernel reads\");\n")
     sub("N9", "route runs the device half for an all-host record", "    if (!record->all_host) {",
         "    if (true) {")
     sub("N9", "route refuses an all-host record",
