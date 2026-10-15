@@ -25,7 +25,11 @@ THE CONTRACT.
      ggml_sycl_top_k_bitonic_slm_bytes, so the bound supports_op checked is the one dispatch uses.
   O. (topk.cpp) the radix gather is an ordered compaction (exclusive_scan_over_group, no atomics), so
      the index set it returns is a pure function of the input: the k largest ordered keys, ties
-     broken by the lower column -- the same set the bitonic path returns.
+     broken by the lower column -- the same set the bitonic path returns.  Both halves of that tie
+     rule are pinned, because test-backend-ops scores tie rows as value multisets and passes any
+     tie rule: the bitonic comparator ranks an equal key with the lower column first (O3), and the
+     gather takes the `rank` equal-key columns lowest column first -- earlier ranges before later
+     ones, lower lanes before higher ones within a round, and none past rank (O4).
   L. (topk.cpp) every kernel submit goes through ggml_sycl_profile_submit under a sycl.top_k.* label.
   T. (test-backend-ops) the TOP_K cases cover k in {64, 256, 2048} x ncols in {256, 4096, 262144}
      plus a non-power-of-two ncols, with ties and with fewer than k finite values.
@@ -243,6 +247,24 @@ def check_kernels(cpp: str | None) -> None:
     if gather.count("sycl::exclusive_scan_over_group(") < 2:
         fail("O2", "the radix gather is not an ordered compaction (exclusive_scan_over_group for both the "
                    "greater and the equal flags)")
+    for needle in ["keys[col]=col<ncols?top_k_ordered_key(x_row[col]):0u;idxs[col]=col;",
+                   "const bool b_first=kb>ka||(kb==ka&&ib<ia);",
+                   "if(((col&kk)==0)==b_first){"]:
+        if needle not in bit:
+            fail("O3", f"the bitonic comparator does not rank an equal key with the lower column first "
+                       f"(missing {needle!r}): a tie would pick a different set than the radix gather")
+    for needle in ["const uint32_t n_gt=(uint32_t)k-rank;",
+                   "for(int64_t b2=tid;b2<b;b2+=top_k_radix_block){prev_gt+=cnt[(row*bpr+b2)*2+0];"
+                   "prev_eq+=cnt[(row*bpr+b2)*2+1];}",
+                   "const int64_t c=c0+tid;",
+                   "const uint32_t key=c<end?top_k_ordered_key(x_row[c]):0u;",
+                   "const uint32_t pre_eq=sycl::exclusive_scan_over_group(it.get_group(),is_eq,"
+                   "sycl::plus<uint32_t>());",
+                   "if(is_eq&&base_eq+pre_eq<rank){dst_row[n_gt+base_eq+pre_eq]=(int32_t)c;}",
+                   "base_eq+=sycl::reduce_over_group(it.get_group(),is_eq,sycl::plus<uint32_t>());"]:
+        if needle not in gather:
+            fail("O4", f"the radix gather does not take the first `rank` equal-key columns in column order "
+                       f"(missing {needle!r}): a tie would pick a different set than the bitonic sort")
     if '#include "sycl-kernel-profiler.hpp"' not in cpp:
         fail("L0", "topk.cpp does not include the kernel profiler")
     for label in LABELS:
@@ -378,7 +400,9 @@ def self_test(s: dict[str, str | None]) -> int:
                 "ggml_sycl_top_k_select_path(op->src[0]->ne[0], op->ne[0], ggml_sycl_info().devices[0].smpbo)", "P1")
     expect_fail("supports-op-name-test", "backend",
                 "        case GGML_OP_TOP_K:\n            // The selector",
-                "        case GGML_OP_TOP_K:\n            if (op->name[0] == 'x') { return false; }\n            // The selector",
+                "        case GGML_OP_TOP_K:\n"
+                "            if (op->name[0] == 'x') { return false; }\n"
+                "            // The selector",
                 "P3")
     # D
     expect_fail("dispatch-without-selector", "backend",
@@ -411,6 +435,13 @@ def self_test(s: dict[str, str | None]) -> int:
     expect_fail("gather-atomic", "cpp", "const uint32_t pre_gt =",
                 "sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device> a(cnt[0]);\n"
                 "                const uint32_t pre_gt =", "O1")
+    expect_fail("bitonic-tie-to-higher-column", "cpp", "(kb == ka && ib < ia)", "(kb == ka && ib > ia)", "O3")
+    expect_fail("bitonic-no-index-tiebreak", "cpp", "kb > ka || (kb == ka && ib < ia)", "kb > ka", "O3")
+    expect_fail("gather-eq-unbounded", "cpp", "if (is_eq && base_eq + pre_eq < rank) {", "if (is_eq) {", "O4")
+    expect_fail("gather-eq-later-ranges-first", "cpp", "for (int64_t b2 = tid; b2 < b; b2 += top_k_radix_block) {",
+                "for (int64_t b2 = b + 1 + tid; b2 < bpr; b2 += top_k_radix_block) {", "O4")
+    expect_fail("gather-eq-higher-lanes-first", "cpp", "const int64_t  c     = c0 + tid;",
+                "const int64_t  c     = c0 + (top_k_radix_block - 1 - tid);", "O4")
     expect_fail("label-missing", "cpp", '"sycl.top_k.radix_count"', '"sycl.top_k.count"', "L1")
     expect_fail("unlabelled-submit", "cpp", "    top_k_radix_gather(",
                 "    stream->submit([&](sycl::handler & cgh) { cgh.single_task([=]() {}); });\n    top_k_radix_gather(",
