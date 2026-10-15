@@ -84,9 +84,12 @@ only shrink:
       tests the device lookup (`materialized`, `substitute`) without `!all_host`, and none refuses on
       the all-host case itself; and the route runs its table copy and device kernel only inside
       `if (!record->all_host) {...}` and never refuses an all-host record.  A refusal returns the
-      outcome itself or through the builder's `refuse("reason")` helper, and every one of them must sit
-      in an `if (...) {...}` the scan reads, the helper's own body or a final `else`, so a refusal
-      written in another form fails the rule instead of escaping it.
+      outcome itself or through the builder's `refuse("reason")` helper, and a retry counts as one,
+      since a retry that keeps failing settles as a refusal (moe_decode_direct_stamp_settle).  Every
+      one of them must sit in an `if (...) {...}` the scan reads, the helper's own body or the final
+      `else` of an if-chain, whose links the rule reads in place of a condition: a `!all_host` link
+      makes the else the all-host case, and a device-lookup link needs an `all_host || ...` link
+      beside it.  A refusal written in another form fails the rule instead of escaping it.
 
 ALLOWLIST (exact statement, at most once; both its calls are BOUNDARY entries, so N2 fails once it is
 gone): `wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());` at op entry, taken
@@ -180,12 +183,20 @@ ALL_HOST_FIELD = re.compile(r"\bbool\s+all_host\s*=\s*false\s*;")
 ALL_HOST_DECIDED = re.compile(r"\bconst\s+bool\s+all_host\s*=\s*counts\.on_device\s*==\s*0\s*;")
 ALL_HOST_RECORDED = re.compile(r"\brecord->all_host\s*=\s*all_host\s*;")
 # A refusal returns the outcome itself or through the builder's `refuse("reason")` helper, which names the reason
-# for the once-per-stamp log line.
-REFUSAL_RETURN = r"return (?:ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED|refuse\([^;]*\));"
+# for the once-per-stamp log line. A retry counts as a refusal: one that fails moe_decode_direct_retry_limit times in
+# a row for the same inputs settles as one (moe_decode_direct_stamp_settle), so a retry every all-host tensor takes
+# refuses them all as surely.
+REFUSAL_RETURN = r"return (?:ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_(?:REFUSED|RETRY)|refuse\([^;]*\));"
 BUILD_REFUSAL = re.compile(r"\bif \(([^{}]*?)\) \{ " + REFUSAL_RETURN + r" \}")
-# Every refusal return, and the ones that have no condition to read: the helper's own body and a final `else`.
 REFUSAL_RETURNS = re.compile(REFUSAL_RETURN)
-REFUSAL_UNCONDITIONED = re.compile(r"(?:\{ \*reason = why; |\} else \{ )" + REFUSAL_RETURN)
+# The helper's own body, the one refusal with no condition.
+REFUSAL_HELPER = re.compile(r"\{ \*reason = why; " + REFUSAL_RETURN)
+# A refusal that is the whole final `else` of an if-chain: it fires when every link of the chain is false.
+REFUSAL_ELSE = re.compile(r"\} else \{ " + REFUSAL_RETURN + r" \}")
+# A link false exactly for an all-host tensor, so the final else after it fires only for one.
+NOT_ALL_HOST = re.compile(r"^[(\s]*(!\s*all_host|counts\.on_device\s*(!=|>)\s*0|counts\.on_device)[)\s]*$")
+# A link true for every all-host tensor, so none of them reaches the final else after it.
+ALL_HOST_LINK = re.compile(r"(^|\|\|)[(\s]*all_host[)\s]*(\|\||$)")
 # What the builder learns only from a device expert: its materialized layout and the table's substitute pointer.
 DEVICE_LOOKUP = re.compile(r"\b(materialized|substitute)\b")
 # A refusal whose whole condition is the all-host case.
@@ -860,6 +871,40 @@ def check_n8(scan: Scan) -> None:
         )
 
 
+def matching_back(src: str, close_at: int, open_ch: str = "{", close_ch: str = "}") -> int:
+    """The opening bracket that the one at `close_at` closes, scanning backwards."""
+    depth = 0
+    for k in range(close_at, -1, -1):
+        c = src[k]
+        if c == close_ch:
+            depth += 1
+        elif c == open_ch:
+            depth -= 1
+            if depth == 0:
+                return k
+    raise ContractError(f"FAIL: unbalanced {open_ch}{close_ch} block ({TAG})")
+
+
+def if_chain_links(text: str, close_at: int) -> list[str] | None:
+    """The conditions of the if-chain whose last block closes at `close_at` in squashed code, last link first, or
+    None when the code before it is not a plain `if (...) {...} else if (...) {...}` chain."""
+    links: list[str] = []
+    while True:
+        head = text[: matching_back(text, close_at)].rstrip()
+        if not head.endswith(")"):
+            return None
+        cond_open = matching_back(text, len(head) - 1, "(", ")")
+        links.append(text[cond_open + 1 : len(head) - 1].strip())
+        lead = text[:cond_open].rstrip()
+        chained = re.search(r"\}\s*else\s+if$", lead)
+        if chained:
+            close_at = chained.start()
+        elif re.search(r"(^|[^\w])if$", lead):
+            return links
+        else:
+            return None
+
+
 def check_n9(scan: Scan) -> None:
     """The route admits a tensor whose experts all live on the host (llama.cpp-7pvo): the record has an all-host
     mode the builder decides from the plan, no builder refusal needs a device expert outside that mode, and the
@@ -882,24 +927,47 @@ def check_n9(scan: Scan) -> None:
             f"from a split one ({TAG_7PVO})"
         )
     squashed = squash(build)
-    read = len(BUILD_REFUSAL.findall(squashed)) + len(REFUSAL_UNCONDITIONED.findall(squashed))
+    elses = list(REFUSAL_ELSE.finditer(squashed))
+    read = len(BUILD_REFUSAL.findall(squashed)) + len(REFUSAL_HELPER.findall(squashed)) + len(elses)
     if read != len(REFUSAL_RETURNS.findall(squashed)):
         raise ContractError(
-            f"FAIL [N9]: {RECORD_BUILD} has a refusal outside an `if (...) {{...}}` this rule reads, the "
-            f"`refuse` helper's body or a final `else`, so its condition goes unchecked and could refuse every "
-            f"all-host tensor unseen ({TAG_7PVO})"
+            f"FAIL [N9]: {RECORD_BUILD} has a refusal or retry outside an `if (...) {{...}}` this rule reads, "
+            f"the `refuse` helper's body or a final `else`, so its condition goes unchecked and could refuse "
+            f"every all-host tensor unseen ({TAG_7PVO})"
         )
     for m in BUILD_REFUSAL.finditer(squashed):
         cond = m.group(1)
         if DEVICE_LOOKUP.search(cond) and "!all_host" not in cond.replace(" ", ""):
             raise ContractError(
-                f"FAIL [N9]: {RECORD_BUILD} refuses on `{cond}`, which only a device expert can satisfy, without "
-                f"`!all_host`, so every tensor whose experts all live on the host is refused ({TAG_7PVO})"
+                f"FAIL [N9]: {RECORD_BUILD} refuses or retries on `{cond}`, which only a device expert can "
+                f"satisfy, without `!all_host`, so every tensor whose experts all live on the host is refused "
+                f"({TAG_7PVO})"
             )
         if ALL_HOST_ITSELF.match(cond):
             raise ContractError(
-                f"FAIL [N9]: {RECORD_BUILD} refuses on `{cond}`, the all-host case itself, so the layers the "
-                f"placement leaves entirely on the host keep their readback ({TAG_7PVO})"
+                f"FAIL [N9]: {RECORD_BUILD} refuses or retries on `{cond}`, the all-host case itself, so the "
+                f"layers the placement leaves entirely on the host keep their readback ({TAG_7PVO})"
+            )
+    for m in elses:
+        links = if_chain_links(squashed, m.start())
+        if links is None:
+            raise ContractError(
+                f"FAIL [N9]: {RECORD_BUILD} refuses or retries in a final `else` that closes no plain "
+                f"`if (...) {{...}} else if (...) {{...}}` chain, so the rule cannot read when it fires ({TAG_7PVO})"
+            )
+        for link in links:
+            if NOT_ALL_HOST.match(link):
+                raise ContractError(
+                    f"FAIL [N9]: {RECORD_BUILD} refuses or retries in the final `else` after `if ({link})`, so "
+                    f"it fires only for a tensor whose experts all live on the host: the all-host case itself "
+                    f"({TAG_7PVO})"
+                )
+        lookups = [link for link in links if DEVICE_LOOKUP.search(link)]
+        if lookups and not any(ALL_HOST_LINK.search(link) for link in links):
+            raise ContractError(
+                f"FAIL [N9]: {RECORD_BUILD} refuses or retries in the final `else` of a chain that tests "
+                f"`{lookups[0]}`, which only a device expert can satisfy, with no `all_host || ...` link to keep "
+                f"an all-host tensor out of it ({TAG_7PVO})"
             )
     _, route = scan.defs[ROUTE][0]
     guard = route.find(DEVICE_HALF_GUARD)
@@ -1145,6 +1213,19 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
         "    if (materialized < 0) {")
     sub("N9", "builder refuses a tensor with no substitute", "    if ((!all_host && !substitute) || !any_host) {",
         "    if (!substitute || !any_host) {")
+    no_layout = (
+        "    if (!all_host && materialized < 0) {\n"
+        "        return refuse(\"no device expert is materialized in a layout the batched kernel reads\");\n"
+        "    }\n"
+    )
+    sub("N9", "builder retries a tensor with no device layout", no_layout,
+        "    if (materialized < 0) {\n        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY;\n    }\n")
+    sub("N9", "builder refuses the all-host case in a final else", no_layout,
+        "    if (!all_host) {\n        (void) materialized;\n    } else {\n"
+        "        return refuse(\"all host\");\n    }\n")
+    sub("N9", "builder refuses a tensor with no device layout in a final else", no_layout,
+        "    if (materialized >= 0) {\n        (void) materialized;\n    } else {\n"
+        "        return refuse(\"no device layout\");\n    }\n")
     sub("N9", "builder refusal hides its condition from the scan",
         "    if (!all_host && materialized < 0) {\n"
         "        return refuse(\"no device expert is materialized in a layout the batched kernel reads\");\n"
