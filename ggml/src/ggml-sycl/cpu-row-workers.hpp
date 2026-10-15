@@ -35,9 +35,9 @@ class CpuRowWorkers {
   public:
     // How long a worker keeps polling after its last chunk before it blocks is start()'s spin_us:
     // spin_us_default unless CpuExpertPool reads GGML_SYCL_CPU_ROW_SPIN_US, and never more than
-    // spin_us_max. 0 blocks at once. Measured on the decode shape with a host microbench
-    // (llama.cpp-w4e9): when the budget is shorter than the gap between jobs, the workers block
-    // between jobs and a job reads ~19 GB/s instead of ~27-30.
+    // spin_us_max. 0 blocks at once. In a host microbench of the decode shape (llama.cpp-w4e9) a
+    // job read 21-29 GB/s at the default and 11-15 GB/s at 0, against 9-15 on the TBB arena. The
+    // GGML_SYCL_CPU_ROW_SPIN_US row of docs/backend/sycl-env-vars.md gives the in-situ figures.
     static constexpr int spin_us_default = 2000;
     static constexpr int spin_us_max     = 10000;
     // Rows per chunk. A run of more than max_chunks * chunk_rows_min rows uses larger chunks, so that

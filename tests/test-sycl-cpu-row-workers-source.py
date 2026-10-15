@@ -44,7 +44,9 @@ WHAT IT CHECKS, with comments blanked:
   R4  run()'s wait for the chunks other workers claimed also pauses and yields,
       so a worker preempted mid-chunk gets a core back.
   C1  docs/backend/sycl-env-vars.md has one GGML_SYCL_CPU_ROW_SPIN_US row, and
-      it states the code's default and maximum and the cores the default spends.
+      it states the code's default and maximum, that the cost is per pool, and
+      the default's in-situ cost; it does not state a microbench figure as a
+      decode figure.
   C2  the GGML_SYCL_CPU_THREADS and GGML_SYCL_CPU_EXPERT_THREADS rows no longer
       say that a pool job's row loop enters the TBB arena.
 
@@ -164,7 +166,7 @@ def check(src: dict[str, str]) -> None:
     joined, stopped = stop.find("threads_.clear();"), stop.find("row_workers_.stop();")
     if stop.count("row_workers_.stop();") != 1 or not 0 <= joined < stopped:
         fail("P3", "CpuExpertPool::stop_workers does not stop its row workers once, after joining its own workers; "
-             "a job still running would lose its row workers mid-loop")
+             "a job that still runs after the stop would run its whole row loop on its own worker")
     calls = re.findall(r"ggml_sycl_cpu_expert_mul_mat_batched\s*\([^;]*;", code["pool_cpp"])
     want = "ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()), row_workers_);"
     if len(calls) != 1 or squash(calls[0]) != want:
@@ -246,10 +248,13 @@ def check(src: dict[str, str]) -> None:
 
     # C1-C2: the catalog states the knob as the code has it, and no longer routes pool jobs into the arena.
     rows = [l for l in src["doc"].splitlines() if l.startswith("| `GGML_SYCL_CPU_ROW_SPIN_US")]
-    if (len(rows) != 1 or f"Default **{dflt[0]}**" not in rows[0] or f"clamped to [0, {smax[0]}]" not in rows[0]
-            or "**The default spends roughly 6-10 cores during decode on this host**" not in rows[0]):
+    row = rows[0] if len(rows) == 1 else ""
+    if (len(rows) != 1 or f"Default **{dflt[0]}**" not in row or f"clamped to [0, {smax[0]}]" not in row
+            or "**The cost is per pool.**" not in row or "**In situ the default costs " not in row
+            or "during decode on this host" in row):
         fail("C1", "docs/backend/sycl-env-vars.md has no one GGML_SYCL_CPU_ROW_SPIN_US row stating the code's "
-             "default and maximum and the cores the default spends during decode")
+             "default and maximum, that the cost is per pool, and the default's in-situ cost without passing a "
+             "microbench figure off as a decode figure")
     for l in src["doc"].splitlines():
         if l.startswith(("| `GGML_SYCL_CPU_THREADS", "| `GGML_SYCL_CPU_EXPERT_THREADS")) and (
                 "enters the TBB arena above for the row loop" in l
@@ -350,8 +355,12 @@ def mutants(s: dict[str, str]) -> list[tuple[str, dict[str, str]]]:
                                                   "C1a")),
         ("C1 doc disagrees with the max", sub(s, "rw_hpp", "spin_us_max     = 10000;", "spin_us_max     = 5000;",
                                               "C1b")),
-        ("C1 cores statement dropped", sub(s, "doc", "**The default spends roughly 6-10 cores during decode on this "
-                                           "host**", "The default spins", "C1c")),
+        ("C1 in-situ cost dropped", sub(s, "doc", "**In situ the default costs 8-15 more CPU-seconds per 117-token "
+                                        "run than the arena**", "The default costs more", "C1c")),
+        ("C1 per-pool cost dropped", sub(s, "doc", "**The cost is per pool.** ", "", "C1e")),
+        ("C1 microbench as a decode figure", sub(s, "doc", "Its 6-11 cores in total at the default",
+                                                 "The default spends roughly 6-10 cores during decode on this host. "
+                                                 "Its 6-11 cores in total at the default", "C1f")),
         ("C1 row missing", sub(s, "doc", "| `GGML_SYCL_CPU_ROW_SPIN_US=N` |", "| `GGML_SYCL_CPU_ROW_SPINS=N` |",
                                "C1d")),
         ("C2 arena wording restored", sub(s, "doc", new_row, "then enters the TBB arena above for the row loop).",

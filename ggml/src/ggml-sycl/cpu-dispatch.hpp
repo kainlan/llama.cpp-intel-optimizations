@@ -168,7 +168,10 @@ void ggml_sycl_cpu_expert_mul_mat_batched(
 
 // The same computation, with the flattened row loop on row_workers, a
 // CpuExpertPool's own row-worker set, instead of the shared TBB arena
-// (llama.cpp-w4e9). Every row runs the same kernel either way.
+// (llama.cpp-w4e9). For a type with no multi-row tile, such as every IQ type,
+// each row runs the same kernel either way. For Q4_0, Q6_K and MXFP4 a row's
+// tile, or the single-row remainder, follows the range it falls in, and the row
+// workers' 64-row chunks cut the rows differently from the arena's grain.
 void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task *    tasks,
                                           int                        n_tasks,
                                           ggml_sycl::CpuRowWorkers & row_workers);

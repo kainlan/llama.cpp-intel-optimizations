@@ -586,8 +586,18 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
     run_resolve = "if (resolve) { resolve(tasks); }"
     # The pool's kernel call runs the row loop on the pool's own row workers (llama.cpp-w4e9).
     kernel = "ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()), row_workers_);"
-    if (ep.count(push) != 1 or worker.count(run_prologue) != 1 or worker.count(kernel) != 1
-            or worker.find(run_prologue) > worker.find(kernel)):
+    if ep.count(push) != 1:
+        raise ContractError(
+            "FAIL [pin W2]: CpuExpertPool::submit_batch does not queue exactly one worker lambda with the capture "
+            "list `[this, tasks, prologue, resolve, promise, trace, t_submit]`; the worker needs `this` to run the "
+            "row loop on the pool's row workers (llama.cpp-z4kd, llama.cpp-w4e9)"
+        )
+    if worker.count(kernel) != 1:
+        raise ContractError(
+            "FAIL [pin W2]: the CpuExpertPool worker does not make exactly one kernel call "
+            f"`{kernel}`; the row loop of a pool job runs on the pool's row workers (llama.cpp-w4e9)"
+        )
+    if worker.count(run_prologue) != 1 or worker.find(run_prologue) > worker.find(kernel):
         raise ContractError(
             "FAIL [pin W2]: the CpuExpertPool worker does not run the batch's prologue before the kernel "
             "(llama.cpp-z4kd)"
@@ -944,6 +954,9 @@ def self_test(backend_src: str) -> int:
                      "row_workers_);\n")
     expect_fail("pool-worker-skips-prologue", backend_src, None, "W2", None,
                 expert_pool_src.replace(worker_prologue, "", 1))
+    expect_fail("pool-worker-kernel-on-the-arena", backend_src, None, "W2", None,
+                expert_pool_src.replace(worker_kernel, "            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), "
+                                        "static_cast<int>(tasks.size()));\n", 1))
     expect_fail("pool-worker-prologue-after-kernel", backend_src, None, "W2", None,
                 expert_pool_src.replace(worker_prologue, "", 1).replace(worker_kernel, worker_kernel + worker_prologue, 1))
     expect_fail("pool-worker-prologue-conditioned-away", backend_src, None, "W2", None,
