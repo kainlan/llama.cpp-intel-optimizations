@@ -628,6 +628,18 @@ static bool mem_copy_site_matches(const mem_copy_site_entry & e,
 
 // Trim a __builtin_FILE() path to its repo-relative tail ("ggml/src/..."), or
 // to its basename when it has none.
+//
+// With icpx 2026.1.1 the census prints bare basenames ("site=mem-ops.cpp:758"),
+// and it is the basename branch below that runs, returning the string whole.
+// The compile commands do carry a path (ninja passes the absolute source path,
+// which ccache's base_dir turns into "../ggml/src/..."), and __FILE__ keeps it,
+// but this compiler's __builtin_FILE() yields only the basename of the presumed
+// file, with or without -fsycl and for header call sites too (checked
+// 2026-10-15 by compiling probes and reading the literal from .rodata). So the
+// "ggml/src/" branch never matches here; it is kept for a toolchain whose
+// __builtin_FILE() returns a path. Rows are keyed on that string, so two files
+// with the same basename and the same line would share a row; the fn= column
+// tells them apart.
 static const char * mem_copy_site_short_file(const char * file) {
     const char * best = nullptr;
     for (const char * p = std::strstr(file, "ggml/src/"); p != nullptr; p = std::strstr(p + 1, "ggml/src/")) {
@@ -669,7 +681,9 @@ void mem_copy_site_census_flush(const char * reason) {
     });
 
     // mem_ops_device_calls is the figure to set against the kernel profiler's
-    // sycl.memcpy.mem_ops launch count; H2H copies never reach the profiler.
+    // sycl.memcpy.mem_ops launches, which in its CSV are count + failed_timestamps:
+    // the count column leaves out launches whose timestamps could not be read.
+    // H2H copies never reach the profiler.
     std::fprintf(stderr,
                  "[SYCL-MEMCPY-SITE-CENSUS] %s: sites=%zu calls=%" PRIu64 " bytes=%" PRIu64
                  " mem_ops_device_calls=%" PRIu64 " mem_ops_host_calls=%" PRIu64 " overflow_calls=%" PRIu64
@@ -747,12 +761,12 @@ static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
                                           size_t                           size,
                                           sycl::queue &                    queue,
                                           const std::vector<sycl::event> & deps,
-                                          const char *                     profile_name = "sycl.memcpy.mem_ops",
-                                          const char * profile_metadata = "role=memcpy;path=mem_ops",
-                                          const char * profile_queue_kind = "copy",
-                                          const char * file               = __builtin_FILE(),
-                                          int          line               = __builtin_LINE(),
-                                          const char * function           = __builtin_FUNCTION()) {
+                                          const char *                     profile_name,
+                                          const char *                     profile_metadata,
+                                          const char *                     profile_queue_kind,
+                                          const char *                     file,
+                                          int                              line,
+                                          const char *                     function) {
     // llama.cpp-dyi3 round 3b: census of copies that reach this NON-graph-
     // capturable path (profile label "sycl.memcpy.mem_ops", as opposed to
     // ggml_sycl_graph_safe_memcpy's "sycl.memcpy.graph_safe") while a SYCL
@@ -762,11 +776,12 @@ static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
     // during recording executes ONCE at record time and is never re-issued
     // on replay -- if its destination is read by any replayed kernel, that
     // kernel sees the record-time value forever. Warn once per call site
-    // (file:line default-captures the CALLER via __builtin_FILE/LINE, not
-    // this function's own location, for every caller that does not
-    // override those defaults) so this census does not have to be
-    // re-derived by hand; this does not fix anything by itself, it only
-    // names the suspects for round 3c to check individually.
+    // (file:line is the caller of the public mem_copy_async/mem_copy, whose
+    // __builtin defaults capture it and mem_copy_submit forwards it here; this
+    // function takes it with no default, so no copy can name mem-ops.cpp) so
+    // this census does not have to be re-derived by hand; this does not fix
+    // anything by itself, it only names the suspects for round 3c to check
+    // individually.
     // llama.cpp-dyi3 round 7: this census used to fire unconditionally, so any
     // model whose SYCL command graph engages at all printed it in ordinary
     // runs. Gate it behind an explicit opt-in -- it stays a WARN once enabled,

@@ -849,7 +849,7 @@ if (Python3_Interpreter_FOUND)
     # the caller's file:line forwarded from mem_copy_async/mem_copy and the
     # generic copy wrappers into mem_copy_direct_submit, the host-host branch
     # tagged H2H, printed to stderr at backend free and at exit. WITH --self-test
-    # (24 mutants, 1 harmless probe).
+    # (25 mutants, 1 harmless probe).
     add_test(NAME test-sycl-memcpy-site-census-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-memcpy-site-census-source.py --self-test)
     set_tests_properties(test-sycl-memcpy-site-census-source PROPERTIES

@@ -77,6 +77,35 @@ static std::string row_for_line(const std::string & table, int line, int * match
     return found;
 }
 
+// Does any H2H row's site name `file`, with or without a directory in front?
+// Sites print as bare basenames with icpx ("site=mem-ops.cpp:758"): its
+// __builtin_FILE() yields no directory, so mem_copy_site_short_file returns the
+// string whole (see the comment there). A toolchain that yields a path would
+// print one, so this matches "site=" + any prefix ending in '/' + file + ':'.
+static bool h2h_row_names_file(const std::string & table, const std::string & file) {
+    size_t pos = 0;
+    while (pos < table.size()) {
+        size_t end = table.find('\n', pos);
+        if (end == std::string::npos) {
+            end = table.size();
+        }
+        const std::string l = table.substr(pos, end - pos);
+        pos                 = end + 1;
+        const size_t at     = l.find(" site=");
+        if (l.find(" dir=H2H ") == std::string::npos || at == std::string::npos) {
+            continue;
+        }
+        const size_t      begin = at + 6;
+        const size_t      stop  = l.find(' ', begin);
+        const std::string site  = l.substr(begin, stop == std::string::npos ? std::string::npos : stop - begin);
+        const size_t      hit   = site.find(file + ":");
+        if (hit != std::string::npos && (hit == 0 || site[hit - 1] == '/')) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool check_row(const std::string & table, int line, uint64_t calls, uint64_t bytes, const char * label) {
     int               matches = 0;
     const std::string row     = row_for_line(table, line, &matches);
@@ -155,7 +184,7 @@ int main() {
         failed = 1;
     }
     // A site captured inside mem-ops.cpp instead of forwarded from the caller.
-    if (table.find("dir=H2H path=sycl.memcpy.mem_ops site=ggml/src/ggml-sycl/mem-ops.cpp:") != std::string::npos) {
+    if (h2h_row_names_file(table, "mem-ops.cpp")) {
         std::fprintf(stderr, "FAIL: an H2H row names mem-ops.cpp, not its caller:\n%s\n", table.c_str());
         failed = 1;
     }

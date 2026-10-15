@@ -20,6 +20,8 @@ tell apart from a broken census that still prints a table.
      declarations carry the __builtin defaults, their definitions forward
      `file, line, function` into mem_copy_submit, every mem_copy_direct_submit
      call in mem_copy_submit passes them on, and the record calls use them.
+     mem_copy_direct_submit itself defaults nothing, so a caller that forgets
+     the site fails to compile instead of naming mem-ops.cpp.
      The generic copy wrappers (graph-safe memcpy, the safe-memcpy family, the
      submit helpers, the common.cpp helpers and the cached-input refresh)
      carry the same defaults and forward them, so their callers are named
@@ -222,8 +224,12 @@ def check_env_gate(mem: Source) -> None:
 
 def check_site(mem: Source, hpp: Source, files: dict[str, str]) -> None:
     params, _, body = mem.definition("mem_copy_direct_submit")
-    if not has_builtin_defaults(params):
-        raise ContractError("S: mem_copy_direct_submit lost its __builtin_FILE/LINE/FUNCTION defaults")
+    # No defaults at all: every caller is in mem_copy_submit and must pass the site it was handed, so a
+    # default here could only ever name mem-ops.cpp. Without one the compiler rejects a call that forgets it.
+    if not takes_site(params):
+        raise ContractError("S: mem_copy_direct_submit takes no caller site")
+    if "=" in blank(params, strings=True):
+        raise ContractError(f"S: mem_copy_direct_submit defaults a parameter: {squash(params)}")
     for call in mem.calls(body, "mem_copy_site_census_record"):
         if not FORWARD.search(squash(call[:-1]) + ")"):
             raise ContractError(f"S: a census record call does not pass the caller's file, line, function: {squash(call)}")
@@ -378,8 +384,18 @@ MUTANTS = [
     ("E5 flush prints when off", MEMOPS,
      "    if (!mem_copy_site_census_enabled()) {\n        return;\n    }\n    mem_copy_site_census_state & st",
      "    mem_copy_site_census_state & st"),
-    ("S1 direct submit default dropped", MEMOPS,
-     "const char * file               = __builtin_FILE(),", "const char * file               = \"mem-ops.cpp\","),
+    ("S1 direct submit site default re-added", MEMOPS,
+     "                                          const char *                     file,\n"
+     "                                          int                              line,\n"
+     "                                          const char *                     function) {\n"
+     "    // llama.cpp-dyi3 round 3b",
+     "                                          const char *                     file     = __builtin_FILE(),\n"
+     "                                          int                              line     = __builtin_LINE(),\n"
+     "                                          const char *                     function = __builtin_FUNCTION()) {\n"
+     "    // llama.cpp-dyi3 round 3b"),
+    ("S1b direct submit profile-name default re-added", MEMOPS,
+     "                                          const char *                     profile_name,\n",
+     "                                          const char *                     profile_name = \"sycl.memcpy.mem_ops\",\n"),
     ("S2 record passes its own line", MEMOPS,
      "mem_copy_site_dir::H2H, size, file, line, function);",
      "mem_copy_site_dir::H2H, size, file, __LINE__, function);"),
