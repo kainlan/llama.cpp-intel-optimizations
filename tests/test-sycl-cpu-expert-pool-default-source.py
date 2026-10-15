@@ -16,7 +16,9 @@ THE CONTRACT.
      and it no longer derives the count from hardware_concurrency.
   E. (same function) GGML_SYCL_CPU_EXPERT_THREADS=N still overrides the default for N > 0.
   I. (CpuExpertPool::init) a non-positive request still takes get_cpu_expert_thread_count(), so
-     the production init(0) gets the default above.
+     a pool initialised with 0 gets the default above.
+  P. (ggml-sycl.cpp moe_hybrid_init_once) the production pool is initialised with init(0), so it
+     takes that default; no other count is passed there.
   C. (docs/backend/sycl-env-vars.md) the GGML_SYCL_CPU_EXPERT_THREADS row states default 1 and
      no longer states the hardware_concurrency - 2 default.
 
@@ -36,6 +38,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 POOL = ROOT / "ggml" / "src" / "ggml-sycl" / "cpu-expert-pool.cpp"
 DOC  = ROOT / "docs" / "backend" / "sycl-env-vars.md"
+BACKEND = ROOT / "ggml" / "src" / "ggml-sycl" / "ggml-sycl.cpp"
 TAG  = "(llama.cpp-w4e9)"
 
 
@@ -106,9 +109,30 @@ def check_env(pool: str) -> None:
 
 def check_init(pool: str) -> None:
     body = body_of(blank_comments(pool), INIT_SIG, "I")
-    if not re.search(r"if\s*\(\s*n_threads\s*<=\s*0\s*\)\s*\{?\s*n_threads\s*=\s*get_cpu_expert_thread_count\s*\(\s*\)\s*;",
-                     body):
+    fallback = (r"if\s*\(\s*n_threads\s*<=\s*0\s*\)\s*\{?\s*"
+                r"n_threads\s*=\s*get_cpu_expert_thread_count\s*\(\s*\)\s*;")
+    if not re.search(fallback, body):
         fail("I", "CpuExpertPool::init no longer takes get_cpu_expert_thread_count() for n_threads <= 0")
+
+
+HYBRID_INIT_SIG = r"static\s+void\s+moe_hybrid_init_once\s*\([^)]*\)\s*\{"
+
+
+def check_production_init(backend: str) -> None:
+    code = blank_comments(backend)
+    m = re.search(HYBRID_INIT_SIG, code)
+    if not m:
+        fail("P", "no definition of moe_hybrid_init_once in ggml-sycl.cpp")
+    # The function ends at the first closing brace in column 0 (the file's formatting); this
+    # avoids brace-matching across string literals in a 100k-line file.
+    end = code.find("\n}\n", m.end())
+    body = code[m.end() : end if end >= 0 else len(code)]
+    inits = re.findall(r"\bcpu_pool\s*\.\s*init\s*\(([^)]*)\)", body)
+    if not inits:
+        fail("P", "moe_hybrid_init_once no longer initialises the CPU expert pool with cpu_pool.init(...)")
+    if any(arg.strip() != "0" for arg in inits):
+        fail("P", "moe_hybrid_init_once initialises the CPU expert pool with a count other than 0 "
+                  "(it must take get_cpu_expert_thread_count()'s default)")
 
 
 def check_doc(doc: str) -> None:
@@ -124,7 +148,7 @@ def check_doc(doc: str) -> None:
 
 def read_sources() -> dict[str, str | None]:
     out: dict[str, str | None] = {}
-    for key, path in (("pool", POOL), ("doc", DOC)):
+    for key, path in (("pool", POOL), ("doc", DOC), ("backend", BACKEND)):
         out[key] = path.read_text(encoding="utf-8") if path.exists() else None
     return out
 
@@ -134,9 +158,12 @@ def check(s: dict[str, str | None]) -> None:
         fail("D0", f"{POOL.relative_to(ROOT)} is missing")
     if s["doc"] is None:
         fail("C0", f"{DOC.relative_to(ROOT)} is missing")
+    if s["backend"] is None:
+        fail("P0", f"{BACKEND.relative_to(ROOT)} is missing")
     check_default(s["pool"])
     check_env(s["pool"])
     check_init(s["pool"])
+    check_production_init(s["backend"])
     check_doc(s["doc"])
 
 
@@ -144,23 +171,27 @@ def check(s: dict[str, str | None]) -> None:
 
 
 def self_test(s: dict[str, str | None]) -> int:
-    pool = s["pool"] or ""
-    doc  = s["doc"] or ""
+    hw_default = ("int hw = static_cast<int>(std::thread::hardware_concurrency());\n"
+                  "    return std::max(1, hw - 2);")
     mutants = [
         ("D", "pool", "default back to hardware_concurrency - 2",
          lambda p: re.sub(r"(if\s*\(\s*env\s*\)\s*\{.*?\n    \}\n)(.*?)return\s+1\s*;",
-                          r"\1\2int hw = static_cast<int>(std::thread::hardware_concurrency());\n    return std::max(1, hw - 2);",
-                          p, count=1, flags=re.S)),
+                          lambda mo: mo.group(1) + mo.group(2) + hw_default, p, count=1, flags=re.S)),
         ("D", "pool", "default of two workers",
          lambda p: re.sub(r"(if\s*\(\s*env\s*\)\s*\{.*?\n    \}\n)(.*?)return\s+1\s*;", r"\1\2return 2;", p,
                           count=1, flags=re.S)),
         ("E", "pool", "env override dropped",
-         lambda p: p.replace('std::getenv("GGML_SYCL_CPU_EXPERT_THREADS")', 'std::getenv("GGML_SYCL_CPU_EXPERT_X")', 1)),
+         lambda p: p.replace('std::getenv("GGML_SYCL_CPU_EXPERT_THREADS")',
+                             'std::getenv("GGML_SYCL_CPU_EXPERT_X")', 1)),
         ("E", "pool", "override ignores N",
          lambda p: re.sub(r"if\s*\(\s*n\s*>\s*0\s*\)\s*\{\s*return\s+n\s*;", "if (n > 0) {\n            return 1;", p,
                           count=1)),
         ("I", "pool", "init no longer falls back",
          lambda p: p.replace("n_threads = get_cpu_expert_thread_count();", "n_threads = 4;", 1)),
+        ("P", "backend", "production init passes 22",
+         lambda b: re.sub(r"cpu_pool\.init\(0\b", "cpu_pool.init(22", b, count=1)),
+        ("P", "backend", "production init passes n_threads",
+         lambda b: re.sub(r"cpu_pool\.init\(0 /\* auto thread count \*/\)", "cpu_pool.init(n_threads)", b, count=1)),
         ("C", "doc", "doc row back to hardware_concurrency - 2",
          lambda d: re.sub(r"(\| `GGML_SYCL_CPU_EXPERT_THREADS[^\n]*?)Default \*\*1\*\*",
                           r"\1Default `max(1, hardware_concurrency - 2)`", d, count=1)),
@@ -169,7 +200,7 @@ def self_test(s: dict[str, str | None]) -> int:
     caught = 0
     for pin, key, name, mutate in mutants:
         m = dict(s)
-        m[key] = mutate(pool if key == "pool" else doc)
+        m[key] = mutate(s[key] or "")
         if m[key] == s[key]:
             failures.append(f"mutant '{name}' did not apply")
             print(f"  self-test: mutant '{name}' did not apply")
