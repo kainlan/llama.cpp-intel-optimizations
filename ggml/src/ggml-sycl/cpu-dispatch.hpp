@@ -181,6 +181,10 @@ struct cpu_expert_batched_phase_times {
     // compute_us they give the in-model rate of one quant type's kernel.
     ggml_type type       = GGML_TYPE_COUNT;
     uint64_t  bytes      = 0;
+    // When compute_us began and ended, in steady_clock ns since its epoch (llama.cpp-j6jf);
+    // 0 when the call ran no row loop.
+    int64_t   t_compute_start_ns = 0;
+    int64_t   t_compute_end_ns   = 0;
 };
 
 cpu_expert_batched_phase_times ggml_sycl_cpu_expert_batched_last_phase_times();

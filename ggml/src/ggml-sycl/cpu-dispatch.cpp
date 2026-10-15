@@ -1487,6 +1487,11 @@ void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_t
         g_cpu_expert_batched_last.fanout_us  = cpu_expert_trace_us(trace_t2, t_first);
         g_cpu_expert_batched_last.compute_us = cpu_expert_trace_us(t_first, trace_t3);
         g_cpu_expert_batched_last.threads    = __builtin_popcountll(trace_slots.load(std::memory_order_relaxed));
+        // The same two stamps as compute_us, for the pool job's critical-path record (llama.cpp-j6jf).
+        g_cpu_expert_batched_last.t_compute_start_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t_first.time_since_epoch()).count();
+        g_cpu_expert_batched_last.t_compute_end_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(trace_t3.time_since_epoch()).count();
     }
 #else
     // No-TBB fallback: sequential over flattened rows.

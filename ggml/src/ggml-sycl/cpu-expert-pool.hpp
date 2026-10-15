@@ -7,11 +7,13 @@
 #pragma once
 
 #include "cpu-dispatch.hpp"
+#include "cpu-expert-pool-stamps.hpp"
 
 #include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -19,6 +21,15 @@
 #include <vector>
 
 namespace ggml_sycl {
+
+// A submitter's trace request for one job (llama.cpp-j6jf). While tracing is on,
+// submit_batch makes the job's stamp record, labels it with `tag` and hands it
+// back in `stamps`; the submitter gives the record to the job's join host_task.
+// While tracing is off it leaves `stamps` empty and touches nothing.
+struct cpu_expert_job_trace {
+    cpu_expert_job_tag                     tag;
+    std::shared_ptr<cpu_expert_job_stamps> stamps;
+};
 
 // Persistent thread pool for CPU expert computation.
 // Replaces per-call std::async with pre-spawned workers.
@@ -76,9 +87,16 @@ class CpuExpertPool {
     // route's prologue waits for the expert-id copy, and resolve then reads the
     // ids and builds a task per host slot. The kernel computes what resolve
     // leaves in the vector. Like the prologue, it is not expected to throw.
+    //
+    // `job_trace`, when set, receives the job's stamp record while tracing is on
+    // (cpu_expert_job_trace). The record is shared by the worker, the token's
+    // trace list and the join host_task that holds a copy, so it lives until the
+    // last of them lets go: reading or writing it in the join is safe however long
+    // after the job the join runs.
     std::future<void> submit_batch(std::vector<cpu_expert_task>                        tasks,
-                                   std::function<void()>                               prologue = {},
-                                   std::function<void(std::vector<cpu_expert_task> &)> resolve  = {});
+                                   std::function<void()>                               prologue  = {},
+                                   std::function<void(std::vector<cpu_expert_task> &)> resolve   = {},
+                                   cpu_expert_job_trace *                              job_trace = nullptr);
 
     bool is_active() const { return active_.load(std::memory_order_acquire); }
 
@@ -106,7 +124,10 @@ class CpuExpertPool {
 //            prologue's input waits (llama.cpp-z4kd)
 // joins counts joins of a pool job, which run on the host_task that orders the
 // job's scatter, not on the submitting thread (llama.cpp-z4kd); joins_ready
-// the ones that found the job already finished.
+// the ones that found the job already finished. job_stamps holds the stamp
+// records of the jobs that finished since the last take, in submission order
+// (llama.cpp-j6jf); a join that has not run by the take leaves its job's join
+// stamps unset there.
 struct cpu_expert_pool_trace_totals {
     uint64_t jobs        = 0;
     uint64_t tasks       = 0;
@@ -147,10 +168,27 @@ struct cpu_expert_pool_trace_totals {
     static constexpr int n_slots    = GGML_TYPE_COUNT + 2;
 
     type_totals by_type[n_slots];
+
+    std::vector<cpu_expert_job_stamps> job_stamps;
 };
 
 void cpu_expert_pool_trace_take(cpu_expert_pool_trace_totals & out);
 void cpu_expert_pool_trace_note_join(bool was_ready);
+
+// The trace clock (steady_clock) in ns since its epoch, as the stamps hold it.
+int64_t cpu_expert_pool_trace_now_ns();
+
+// Stamps t_inputs_ready on the pool job the calling thread is running, if any.
+// The job's prologue calls it after its input wait returns; on any thread that is
+// not running a traced pool job it does nothing.
+void cpu_expert_pool_trace_stamp_inputs_ready();
+
+// Records a join's stamps on its job's record, under the trace lock, so a take on
+// another thread reads them whole.
+void cpu_expert_pool_trace_note_join_stamps(cpu_expert_job_stamps & stamps,
+                                            int64_t                 entry_ns,
+                                            int64_t                 exit_ns,
+                                            bool                    found_ready);
 
 // Whether a pool job ran at the same time as another at any point of its run
 // (llama.cpp-y9i6): another job was running when it began, or another began
