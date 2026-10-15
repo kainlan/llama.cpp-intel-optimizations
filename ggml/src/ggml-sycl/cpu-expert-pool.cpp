@@ -56,8 +56,10 @@ void CpuExpertPool::init(int n_threads) {
     for (int i = 0; i < n_threads; i++) {
         threads_.emplace_back(&CpuExpertPool::worker_thread, this);
     }
+    row_workers_.start(ggml_sycl_cpu_row_loop_threads());
 
-    GGML_LOG_INFO("[CPU-EXPERT-POOL] Initialized: %d threads\n", n_threads);
+    GGML_LOG_INFO("[CPU-EXPERT-POOL] Initialized: %d threads, row loop on %d threads\n", n_threads,
+                  row_workers_.n_threads());
 }
 
 void CpuExpertPool::worker_thread() {
@@ -209,7 +211,7 @@ std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task>      
         // picking it up, so `wall` includes those waits and `wake` does not; the overlap clock
         // covers the kernel only. resolve, after the prologue, builds the tasks of a job
         // submitted before they were known (llama.cpp-7pvo).
-        work_queue_.push([tasks = std::move(tasks), prologue = std::move(prologue), resolve = std::move(resolve),
+        work_queue_.push([this, tasks = std::move(tasks), prologue = std::move(prologue), resolve = std::move(resolve),
                           promise, trace, t_submit]() mutable {
             const pool_trace_clock::time_point t_start = trace ? pool_trace_clock::now() : t_submit;
             if (prologue) {
@@ -222,7 +224,7 @@ std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task>      
             if (trace) {
                 ticket = cpu_expert_pool_overlap_begin(g_pool_trace_overlap);
             }
-            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
+            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()), row_workers_);
             if (trace) {
                 const bool overlapped = cpu_expert_pool_overlap_end(g_pool_trace_overlap, ticket);
                 pool_trace_record_job(tasks.size(), t_submit, t_start, pool_trace_clock::now(), overlapped);
@@ -251,6 +253,8 @@ void CpuExpertPool::stop_workers() {
         }
     }
     threads_.clear();
+    // After the workers: a job still running uses the row workers until it returns.
+    row_workers_.stop();
 }
 
 void CpuExpertPool::shutdown() {

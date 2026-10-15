@@ -7,6 +7,7 @@
 #pragma once
 
 #include "cpu-dispatch.hpp"
+#include "cpu-row-workers.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -29,6 +30,13 @@ namespace ggml_sycl {
 // The pool owns threads and a work queue, no memory. CPU expert staging comes
 // from the PinnedBufferPool, with a per-dispatch managed fallback
 // (llama.cpp-sfal).
+//
+// A job's row loop runs on the pool's row workers (llama.cpp-w4e9), not the
+// shared TBB arena: ggml_sycl_cpu_row_loop_threads() threads, the job's own
+// worker included, which stay awake for CpuRowWorkers::idle_budget_us after a
+// job so that the next job of a decode token starts on all of them. The jobs of
+// one pool take the row workers one at a time. Each pool has its own set, so
+// pools of two devices that both hold host experts run two such sets.
 class CpuExpertPool {
   public:
     CpuExpertPool() = default;
@@ -94,6 +102,7 @@ class CpuExpertPool {
     std::condition_variable           cv_;
     std::atomic<bool>                 active_{ false };
     std::atomic<bool>                 shutting_down_{ false };
+    CpuRowWorkers                     row_workers_;
 };
 
 // Totals over every pool's jobs since the last take (llama.cpp-b2jc), kept
