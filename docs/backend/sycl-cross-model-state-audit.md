@@ -131,10 +131,10 @@ explicitly labeled **unscoped lexical candidates**: they do not resolve C++
 bindings and therefore never establish lifecycle reset/teardown. An empty
 candidate search is likewise not proof of no access.
 
-At audited source commit `b15c1ef55468296a71519730b20e7bee1163b321`, the
-census emits **1,566 object rows**: 579 explicitly-static non-local objects,
+At audited source commit `ae57e884f2a6be0f079ef386043cc2759de4fff2`, the
+census emits **1,568 object rows**: 581 explicitly-static non-local objects,
 106 non-local objects with implicit static storage duration, 874 function-local
-static/thread-local objects, and 7 class static declarations. Per-file rows are 1,217
+static/thread-local objects, and 7 class static declarations. Per-file rows are 1,219
 (`ggml-sycl.cpp`), 280 (`unified-cache.cpp`), 16 (`unified-cache.hpp`), 51
 (`fattn.cpp`), and 2 (`layer-streaming.cpp`). The script prints SHA-256 for
 every input so this result can be tied to exact source bytes.
@@ -325,6 +325,7 @@ awk 'NR>=4614 && NR<=4615 { print NR ":" $0 }' ggml/src/ggml-sycl/common.hpp
 | async kernel/copy lifetime | exact mem/backing handles plus copied `(device, ModelId, ContextId, GraphEpoch, InvocationId)` token | one context/epoch; each device is OPEN→SEALED→COMPLETE or QUARANTINED with registered producer/submit counts; no root release while OPEN |
 | tier verdict | `LoadTxnId`/`ModelId` immutable report | reporting only; no placement, routing, reset, or teardown branch |
 | planned load terms (compute, state; `g_planned_load_terms`, merged into `g_planned_compute_term_bytes`/`g_planned_state_term_bytes`) | `(slot, SlotGeneration)`, minted at `begin_outer` before the reserves run; the write needs the open `LoadTxnId`'s load-effect lease | decided in `llama.cpp-ihk6` (owner ruling 2026-10-10, owner-keyed): each owner keeps its own contribution per device and the device reads the max over live owners; rollback and slot release drop only that owner; the load-entry and last-model-out whole-table clears are removed |
+| planned dense scratch inputs (Q8_1 src1 bytes per token, f16 dequant weight and src1 maxima, `n_ubatch`, rejected-figure flags; terms of `g_planned_load_terms`, published into `g_planned_mmq_src1_*`, `g_planned_dequant_f16_*`, `g_planned_dense_scratch_n_ubatch` and `g_planned_dense_scratch_invalid`) | `(slot, SlotGeneration)`, the planned load terms' key; the load-time plan writes under the open `LoadTxnId`'s load-effect lease, the runtime re-plan under the published model's live-update lease | decided in `llama.cpp-45qo` (follow-up to `llama.cpp-ihk6`, same owner ruling): each owner keeps its own inputs per device and the device plans each buffer from the max of each input over the live owners whose figure for it was accepted, so a rejected owner contributes nothing, refuses only its own re-plan and has its context refused by name (`llama.cpp-kpjw`); an owner plans at the largest `n_ubatch` its live contexts last published, or the load's with none live; a re-plan replaces only that owner's inputs; rollback and slot release drop only that owner; the device-global `zone_dense_scratch_merge_input` merge, which kept the larger input while another backend context was live and replaced it when none was, is removed |
 
 IDs/generations, including `InvocationId` and `SessionResetEpoch`, are checked
 and nonwrapping. Slot 33 fails with typed `SLOT_EXHAUSTED` before LOADING and

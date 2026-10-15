@@ -654,10 +654,6 @@ bool zone_route_draws_scratch(bool decision_valid,
     return fallback_valid && fallback_draws;
 }
 
-size_t zone_dense_scratch_merge_input(size_t prev, size_t next, bool other_model_live) {
-    return other_model_live && prev > next ? prev : next;
-}
-
 bool zone_compute_term_bytes(const uint64_t * chunk_bytes, size_t n_chunks, size_t alignment, size_t * out) {
     if (out == nullptr || (chunk_bytes == nullptr && n_chunks != 0)) {
         return false;

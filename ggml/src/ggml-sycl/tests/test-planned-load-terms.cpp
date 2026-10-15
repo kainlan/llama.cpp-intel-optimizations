@@ -7,6 +7,12 @@
 // (model slot, slot generation) keeps its own contribution, the device reads the merge over the owners on it, and an
 // owner's contribution leaves only by its own key.
 //
+// The dense scratch plan's inputs (llama.cpp-45qo) had the same defect one step removed: the Q8_1 src1 and f16 dequant
+// inputs and their n_ubatch were device-global, kept at the larger value while another backend context was live and
+// replaced when none was. So a model unloaded beside one that stayed live left its larger inputs in every later
+// context's RUNTIME zone, and a model loaded beside a live but contextless one replaced, and shrank, that one's plan.
+// They are owner terms in the same table now, merged and dropped like the compute and state terms.
+//
 // Host-only, no SYCL: the header takes GGML_SYCL_MAX_DEVICES from ggml-sycl.h (the public include directory) and
 // nothing else from the backend, and the table is a local value.
 
@@ -16,6 +22,7 @@
 #include <cstdio>
 
 using ggml_sycl::planned_load_term;
+using ggml_sycl::planned_load_term_value;
 using ggml_sycl::planned_load_terms;
 using ggml_sycl::planned_load_terms_replaced;
 using ggml_sycl::lifecycle::SlotToken;
@@ -195,6 +202,266 @@ void test_a_newer_owner_sweeps_the_slot_on_every_device() {
     check(compute(t, 3) == 0, "device 3 still reads 0");
 }
 
+// ---- the dense scratch plan's inputs (llama.cpp-45qo) --------------------------------------------------------------
+
+constexpr size_t kQ8Large = 19584;  // Q8_1 src1 bytes per token of a wide model
+constexpr size_t kQ8Small = 4096;   // and of a narrow one
+
+size_t q8_input(const planned_load_terms & t, int device) {
+    return t.merged(device, planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN);
+}
+
+size_t n_ubatch(const planned_load_terms & t, int device) {
+    return t.merged(device, planned_load_term::DENSE_SCRATCH_N_UBATCH);
+}
+
+bool store_q8(planned_load_terms & t, int device, SlotToken owner, size_t bytes_per_token, size_t ubatch) {
+    const planned_load_term_value values[] = {
+        { planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, bytes_per_token },
+        { planned_load_term::DENSE_SCRATCH_N_UBATCH,   ubatch          },
+    };
+    return t.set(device, owner, values, 2);
+}
+
+void test_dense_scratch_inputs_are_owner_terms() {
+    printf("the dense scratch inputs are each owner's own: the device reads the largest, a re-plan replaces its own\n");
+    planned_load_terms t;
+    check(store_q8(t, 0, kA, kQ8Large, 512) && store_q8(t, 0, kB, kQ8Small, 512), "A and B plan on device 0");
+    check(q8_input(t, 0) == kQ8Large, "the device reads A's larger input");
+    check(store_q8(t, 0, kB, kQ8Small, 2048), "B re-plans at n_ubatch 2048");
+    check(n_ubatch(t, 0) == 2048, "the device's n_ubatch is the larger of the two owners'");
+    check(store_q8(t, 0, kB, kQ8Small, 128), "B re-plans down to 128");
+    check(n_ubatch(t, 0) == 512, "B's own value was replaced: the device reads A's 512, not B's earlier 2048");
+}
+
+void test_a_live_model_keeps_no_input_of_an_unloaded_one() {
+    printf("the 12.4 defect: a model unloaded beside one that stays live leaves none of its inputs behind\n");
+    planned_load_terms t;
+    check(store_q8(t, 0, kA, kQ8Large, 512), "A (wide) plans on device 0");
+    check(store_q8(t, 0, kB, kQ8Small, 512), "B (narrow) plans beside it while A is live");
+    check(t.drop(kA), "A unloads; B stays live");
+    check(q8_input(t, 0) == kQ8Small, "the device reads B's own input, not A's leftover (the old merge kept 19584)");
+    check(t.merged(0, planned_load_term::DEQUANT_F16_WEIGHT_BYTES) == 0, "A stored no f16 input and none appears");
+    check(t.drop(kB), "B unloads");
+    check(q8_input(t, 0) == 0 && n_ubatch(t, 0) == 0, "nothing is left on the device");
+}
+
+void test_a_new_model_cannot_shrink_a_live_ones_inputs() {
+    printf("the 12.4 defect, other side: a model loaded beside a live one keeps the live one's inputs standing\n");
+    planned_load_terms t;
+    check(store_q8(t, 0, kA, kQ8Large, 512), "A plans and stays live (with or without a context)");
+    check(store_q8(t, 0, kB, kQ8Small, 256), "B loads beside it");
+    check(q8_input(t, 0) == kQ8Large && n_ubatch(t, 0) == 512,
+          "A's inputs stand (the old replace-when-no-context-live rule shrank them to B's)");
+}
+
+void test_a_multi_term_store_is_all_or_nothing() {
+    printf("a store of several terms stores all of them or none\n");
+    planned_load_terms t;
+    check(store_q8(t, 0, kA, kQ8Large, 512), "A's baseline");
+    const SlotToken               unminted{ 4, 0 };
+    const planned_load_term_value bad_term[] = {
+        { planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN,                        1 },
+        { static_cast<planned_load_term>(ggml_sycl::planned_load_term_count), 7 },
+    };
+    check(!store_q8(t, 0, unminted, 99999, 4096), "an unminted owner stores none of its terms");
+    check(!t.set(0, kB, bad_term, 2), "a term out of range refuses the whole store");
+    check(!t.set(0, kB, bad_term, -1), "a negative count is refused");
+    check(!t.set(0, kB, nullptr, 1), "a null value list is refused");
+    check(q8_input(t, 0) == kQ8Large && n_ubatch(t, 0) == 512, "nothing of the refused stores is visible");
+    size_t b_value = 1;
+    check(!t.get(0, kB, planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, &b_value) && b_value == 0,
+          "B holds no contribution: its refused first term was not stored");
+}
+
+void test_the_merge_if_an_owner_stores() {
+    printf(
+        "merged_accepted_if_set: what the device reads if the owner stores an accepted value, ignoring its own "
+        "earlier one\n");
+    planned_load_terms t;
+    check(store_q8(t, 0, kA, kQ8Small, 512) && store_q8(t, 0, kB, 8192, 512), "A=4096 and B=8192");
+    const planned_load_term per_token = planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN;
+    const planned_load_term rejected  = planned_load_term::MMQ_SRC1_REJECTED;
+    check(t.merged_accepted_if_set(0, kA, per_token, kQ8Large, rejected) == kQ8Large,
+          "A storing 19584 would read 19584");
+    check(t.merged_accepted_if_set(0, kB, per_token, 1024, rejected) == kQ8Small,
+          "B storing 1024 would read A's 4096: B's own 8192 is replaced, not merged");
+    const SlotToken b_next{ kB.slot, kB.generation + 1 };
+    check(t.merged_accepted_if_set(0, b_next, per_token, 0, rejected) == kQ8Small,
+          "B's next generation would sweep B's 8192, so it does not count");
+    check(t.merged_accepted_if_set(GGML_SYCL_MAX_DEVICES, kA, per_token, 5, rejected) == 0,
+          "an out-of-range device reads 0");
+    check(t.merged_accepted_if_set(0, kA, per_token, 5,
+                                   static_cast<planned_load_term>(ggml_sycl::planned_load_term_count)) == 0,
+          "an out-of-range rejected term reads 0");
+    check(q8_input(t, 0) == 8192, "asking stored nothing");
+}
+
+void test_an_owner_reads_back_only_its_own_value() {
+    printf("get: an owner reads back its own stored value, never another owner's or another generation's\n");
+    planned_load_terms t;
+    check(store_q8(t, 0, kA, kQ8Large, 512) && store_q8(t, 0, kB, kQ8Small, 256), "A and B planned");
+    size_t v = 0;
+    check(t.get(0, kB, planned_load_term::DENSE_SCRATCH_N_UBATCH, &v) && v == 256, "B reads its own 256");
+    check(t.get(0, kB, planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, &v) && v == kQ8Small, "and its own 4096");
+    const SlotToken a_old{ kA.slot, kA.generation + 7 };
+    v = 9;
+    check(!t.get(0, a_old, planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, &v) && v == 0,
+          "another generation of A's slot reads nothing");
+    v = 9;
+    check(!t.get(1, kA, planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, &v) && v == 0, "A holds nothing on device 1");
+}
+
+void test_a_rejected_figure_is_an_owner_flag() {
+    printf(
+        "a rejected figure is the owner's flag: the device reads it while that owner is live, and it leaves with it\n");
+    planned_load_terms t;
+    check(store_q8(t, 0, kA, kQ8Large, 512), "A planned");
+    check(t.set(0, kB, planned_load_term::MMQ_SRC1_REJECTED, 1), "B's figure overflowed and is flagged");
+    check(t.merged(0, planned_load_term::MMQ_SRC1_REJECTED) == 1, "the device reads the flag");
+    check(t.merged(0, planned_load_term::DEQUANT_F16_REJECTED) == 0, "the f16 flag is a separate term");
+    check(q8_input(t, 0) == kQ8Large, "A's input stands beside the flag");
+    check(t.drop(kB), "B's rollback");
+    check(t.merged(0, planned_load_term::MMQ_SRC1_REJECTED) == 0, "the flag left with B");
+}
+
+// llama.cpp-kpjw, kept owner-keyed: one model's overflow does not invalidate the plan of the model already running.
+// The plan is sized from the accepted owners only, so a rejected owner adds none of its terms (its n_ubatch among
+// them) to that buffer's merge, while it still counts for the other buffer, whose figure was accepted.
+void test_a_rejected_owner_contributes_nothing_to_the_accepted_merge() {
+    printf(
+        "merged_accepted: a rejected owner contributes nothing to that buffer's merge; the running model's stands\n");
+    planned_load_terms      t;
+    const planned_load_term per_token = planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN;
+    const planned_load_term ubatch    = planned_load_term::DENSE_SCRATCH_N_UBATCH;
+    const planned_load_term q8_flag   = planned_load_term::MMQ_SRC1_REJECTED;
+    const planned_load_term f16_flag  = planned_load_term::DEQUANT_F16_REJECTED;
+    check(store_q8(t, 0, kA, kQ8Small, 512), "A runs on device 0 at n_ubatch 512");
+    const planned_load_term_value b_rejected[] = {
+        { per_token, 0        },
+        { ubatch,    1u << 20 },
+        { q8_flag,   1        },
+    };
+    check(t.set(0, kB, b_rejected, 3), "B's Q8_1 figure overflowed at n_ubatch 1048576 (its f16 figure was accepted)");
+    check(t.merged_accepted(0, per_token, q8_flag) == kQ8Small, "the Q8_1 merge reads A's input");
+    check(t.merged_accepted(0, ubatch, q8_flag) == 512, "and A's n_ubatch: B's 1048576 is not in the Q8_1 merge");
+    check(t.merged_accepted(0, ubatch, f16_flag) == (1u << 20), "B still counts in the f16 merge it was accepted for");
+    check(t.merged_accepted_if_set(0, kA, ubatch, 256, q8_flag) == 256,
+          "A re-planning at 256 reads its own 256: the rejected B does not hold the Q8_1 plan up");
+    check(t.merged_accepted_if_set(0, kB, per_token, kQ8Large, q8_flag) == kQ8Large,
+          "B storing an accepted figure would count: its own flag is replaced with the store");
+    check(t.merged_accepted(1, per_token, q8_flag) == 0, "device 1 has no owner and reads 0");
+    check(t.merged_accepted(0, per_token, static_cast<planned_load_term>(ggml_sycl::planned_load_term_count)) == 0,
+          "an out-of-range rejected term reads 0");
+    check(t.drop(kB), "B's rollback");
+    check(t.merged_accepted(0, ubatch, f16_flag) == 512, "B's n_ubatch left with it");
+}
+
+// An owner's planned n_ubatch is the largest of the values its live backend contexts last published, each context's
+// own entry replaced by its own later publish, and the load's n_ubatch when no context is live (lead ruling on
+// llama.cpp-45qo). A latch kept the plan at a losing auto-ubatch rung after the ladder settled lower, and treating the
+// load's value as a floor held a context running below it to the load's n_ubatch.
+constexpr uint64_t kCtx1 = 1;  // backend context ids, minted from 1
+constexpr uint64_t kCtx2 = 2;
+
+bool load_q8(planned_load_terms & t, int device, SlotToken owner, size_t ubatch) {
+    const planned_load_term_value values[] = {
+        { planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN,    kQ8Small },
+        { planned_load_term::DENSE_SCRATCH_N_UBATCH,      ubatch   },
+        { planned_load_term::DENSE_SCRATCH_LOAD_N_UBATCH, ubatch   },
+    };
+    return t.set(device, owner, values, 3);
+}
+
+void test_an_owner_plans_at_the_largest_live_context() {
+    printf("planned_n_ubatch: the largest of the live contexts' last published values, the load's with none live\n");
+    planned_load_terms t;
+    check(load_q8(t, 0, kA, 512), "A loads at n_ubatch 512");
+    check(t.planned_n_ubatch(0, kA) == 512, "with no live context A plans at the load's 512");
+    check(t.set_context_n_ubatch(0, kA, kCtx1, 4096), "context 1 publishes 4096");
+    check(t.set_context_n_ubatch(0, kA, kCtx2, 2048), "context 2 publishes 2048");
+    check(t.planned_n_ubatch(0, kA) == 4096, "A plans at 4096, the larger");
+    check(t.set_context_n_ubatch(0, kA, kCtx1, 1024), "context 1 publishes again, at 1024");
+    check(t.planned_n_ubatch(0, kA) == 2048, "its own entry was replaced: A plans at context 2's 2048");
+    SlotToken dropped{};
+    check(t.drop_context(0, kCtx2, &dropped), "context 2 is destroyed");
+    check(dropped.slot == kA.slot && dropped.generation == kA.generation, "the drop names A, the owner it held");
+    check(t.planned_n_ubatch(0, kA) == 1024, "A falls to context 1's 1024");
+    check(t.drop_context(0, kCtx1, nullptr), "context 1 is destroyed");
+    check(t.planned_n_ubatch(0, kA) == 512, "with none live A plans at the load's 512 again");
+    check(!t.drop_context(0, kCtx1, nullptr), "a context dropped twice removes nothing the second time");
+}
+
+void test_the_ladder_settle_lowers_its_own_rung() {
+    printf("set_context_n_ubatch: a context's later publish replaces its own, below the load's value too\n");
+    planned_load_terms t;
+    check(load_q8(t, 0, kA, 512), "A loads at n_ubatch 512");
+    check(t.set_context_n_ubatch(0, kA, kCtx1, 4096), "the ladder publishes rung 4096, which then loses");
+    check(t.set_context_n_ubatch(0, kA, kCtx1, 2048), "the settle republishes the winner, 2048");
+    check(t.planned_n_ubatch(0, kA) == 2048, "A plans at 2048, not the losing 4096");
+    check(t.set_context_n_ubatch(0, kA, kCtx1, 256), "a context at -ub 256");
+    check(t.planned_n_ubatch(0, kA) == 256, "A plans at 256: the load's 512 is not a floor");
+}
+
+void test_context_entries_are_bounded_and_owned() {
+    printf("context entries: one owner's, a bounded set, refused when full, and gone with the owner\n");
+    planned_load_terms t;
+    check(!t.set_context_n_ubatch(0, kA, kCtx1, 512), "A holds nothing on device 0: nothing is recorded");
+    check(t.context_room(0, kA, kCtx1), "and nothing is refused for want of room");
+    check(load_q8(t, 0, kA, 512) && load_q8(t, 0, kB, 512), "A and B load on device 0");
+    check(!t.set_context_n_ubatch(0, kA, 0, 512), "context 0 is the free marker, never an entry");
+    check(!t.set_context_n_ubatch(0, kA, kCtx1, 0), "n_ubatch 0 is never recorded");
+    for (int i = 0; i < ggml_sycl::planned_context_capacity; ++i) {
+        check(t.set_context_n_ubatch(0, kA, 100 + i, 128), "a context of A records its value");
+    }
+    check(!t.context_room(0, kA, 999), "a context past the capacity has no room");
+    check(!t.set_context_n_ubatch(0, kA, 999, 4096), "and records nothing");
+    check(t.planned_n_ubatch(0, kA) == 128, "the refused 4096 is not in A's plan");
+    check(t.context_room(0, kA, 100) && t.set_context_n_ubatch(0, kA, 100, 256), "a recorded context still replaces");
+    check(t.context_room(0, kB, 999), "B's entries are its own: B has room");
+    check(t.set_context_n_ubatch(0, kB, kCtx1, 1024) && t.planned_n_ubatch(0, kA) == 256,
+          "a context of B does not move A's plan");
+    check(t.planned_n_ubatch(1, kA) == 0, "on a device A holds nothing on, A plans at 0");
+    const SlotToken a_next{ kA.slot, kA.generation + 1 };
+    check(t.planned_n_ubatch(0, a_next) == 0, "another generation of A's slot is another owner");
+    check(t.drop(kA), "A unloads");
+    check(!t.drop_context(0, 100, nullptr), "A's context entries left with A");
+    check(!t.context_room(0, kB, 0), "context 0 has no room, as set_context_n_ubatch refuses it");
+    check(!t.drop_context(0, 0, nullptr), "context 0 is the free marker: dropping it removes nothing");
+    check(!t.drop_context(-1, kCtx1, nullptr) && !t.drop_context(GGML_SYCL_MAX_DEVICES, kCtx1, nullptr),
+          "a device out of range removes nothing");
+    check(load_q8(t, 0, kA, 512) && t.planned_n_ubatch(0, kA) == 512, "A reloaded starts from its load's value");
+}
+
+void test_the_term_count_is_the_enum_count() {
+    printf("planned_load_term_count follows the enum, so a term added to it is in range without a second edit\n");
+    planned_load_terms t;
+    check(ggml_sycl::planned_load_term_count == static_cast<int>(planned_load_term::COUNT), "the count is COUNT");
+    check(t.set(0, kA, planned_load_term::DEQUANT_F16_REJECTED, 1), "the last real term is in range");
+    check(!t.set(0, kB, planned_load_term::COUNT, 1), "COUNT itself is not a term");
+}
+
+void test_a_newer_owner_sweeps_stale_dense_scratch_inputs() {
+    printf("a newer generation sweeps its predecessor's dense scratch inputs on every device\n");
+    planned_load_terms          t;
+    const SlotToken             old_gen{ 11, 1 };
+    const SlotToken             new_gen{ 11, 2 };
+    planned_load_terms_replaced replaced;
+    check(store_q8(t, 0, old_gen, kQ8Large, 512) && store_q8(t, 2, old_gen, kQ8Large, 2048),
+          "generation 1 left inputs on devices 0 and 2");
+    check(store_q8(t, 2, kB, kQ8Small, 256), "B is live on device 2");
+    const planned_load_term_value values[] = {
+        { planned_load_term::MMQ_SRC1_BYTES_PER_TOKEN, kQ8Small },
+        { planned_load_term::DENSE_SCRATCH_N_UBATCH,   128      },
+    };
+    check(t.set(0, new_gen, values, 2, &replaced), "generation 2 plans on device 0 only");
+    check(replaced.generation[0] == 1 && replaced.generation[2] == 1,
+          "the store names generation 1 on devices 0 and 2");
+    check(q8_input(t, 0) == kQ8Small && n_ubatch(t, 0) == 128, "device 0 reads generation 2's own inputs");
+    check(q8_input(t, 2) == kQ8Small && n_ubatch(t, 2) == 256,
+          "device 2 reads B's inputs, not generation 1's leftover 19584 and 2048");
+}
+
 }  // namespace
 
 int main() {
@@ -207,6 +474,19 @@ int main() {
     test_a_slot_generation_is_its_own_owner();
     test_a_newer_owner_replaces_a_stale_contribution_and_names_it();
     test_a_newer_owner_sweeps_the_slot_on_every_device();
+    test_dense_scratch_inputs_are_owner_terms();
+    test_a_live_model_keeps_no_input_of_an_unloaded_one();
+    test_a_new_model_cannot_shrink_a_live_ones_inputs();
+    test_a_multi_term_store_is_all_or_nothing();
+    test_the_merge_if_an_owner_stores();
+    test_an_owner_reads_back_only_its_own_value();
+    test_a_rejected_figure_is_an_owner_flag();
+    test_a_rejected_owner_contributes_nothing_to_the_accepted_merge();
+    test_a_newer_owner_sweeps_stale_dense_scratch_inputs();
+    test_an_owner_plans_at_the_largest_live_context();
+    test_the_ladder_settle_lowers_its_own_rung();
+    test_context_entries_are_bounded_and_owned();
+    test_the_term_count_is_the_enum_count();
 
     printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;

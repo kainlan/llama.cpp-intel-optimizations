@@ -2707,19 +2707,58 @@ cannot place the buffer and the graph is refused before submission, naming the z
 is not consulted: `largest_free_block()` is the head of the largest size class (approximate, by its own comment), so it
 would be a second heuristic beside the aggregate one rather than a contiguity proof.
 
-*Plan inputs are per device.* The per-token and weight maxima the setters keep are one set per device, and the last
-model loaded would win. While another backend context is live on the SAME device
-(`ggml_sycl_other_backend_context_live`, which reads the per-device context list, not the process-wide model registry),
-the larger of the old and the new input is kept (`zone_dense_scratch_merge_input`, tested on the host), so a draft loaded
-beside a target does not shrink the target's plan, and a model live on another device is no reason to merge; with no
-other context live the new inputs replace the old, so a model swap shrinks it. The runtime re-plan takes the same
-per-device answer, so a draft context at a small `n_ubatch` does not shrink a live target's plan either, and a rollback
-that restores an exact earlier value passes "none live". Two contexts on one device are
-still unsupported (canonical contract section 5), so the plan's `n_ubatch` is the last transaction's. A setter validates
-its figure before it stores anything: a rejected (overflowing) figure leaves the stored inputs alone and, with no other
-context live, publishes a zero plan and marks the plan invalid, so the fit check and a re-plan refuse instead of
-re-deriving a plan from stale inputs. With another context live the plan and its inputs are left standing: one model's
-overflow does not invalidate the plan of the model already running.
+*Plan inputs are per owner (llama.cpp-45qo).* The per-token and weight maxima and the `n_ubatch` are each model's own
+terms in the planned load terms' owner table (`planned-load-terms.hpp`, canonical contract 12.4), keyed by the model's
+slot and slot generation, which the load-time plan takes from the owner of the load effect the stage holds. The device
+plans each buffer from the largest of each input over the owners on it, so a draft loaded beside a target does not
+shrink the target's plan, and a model live on another device is no part of the merge. An owner's inputs leave with it,
+at its load's rollback or its slot's release, so a model that unloads while another stays live leaves nothing behind.
+(Until llama.cpp-45qo the inputs were device-global: `zone_dense_scratch_merge_input` kept the larger input while
+another backend context was live and replaced it when none was, so a larger model's inputs outlived it beside a live
+one, and a model loaded beside a live but contextless one shrank that one's plan.) The runtime re-plan changes only the
+published model's own `n_ubatch`, so a draft context at a small `n_ubatch` does not shrink a live target's plan either.
+A store validates its figure on the merge it will publish before it stores anything. A rejected (overflowing) figure
+overwrites that owner's earlier inputs for the buffer with 0 and raises the owner's flag for it, keeping the owner's
+`n_ubatch`.
+
+*One model's overflow does not invalidate the plan of a model already running (llama.cpp-kpjw, kept per owner).* Each
+buffer is sized from the owners whose figure for it was accepted (`planned_load_terms::merged_accepted`), so a rejected
+owner contributes nothing to that buffer's plan, its `n_ubatch` included. The other owners' plans stay valid and
+re-plannable. Only the rejected owner's own re-plan refuses while it is live, because its inputs for the buffer read 0
+and re-deriving from them would plan nothing for a model that needs scratch. The published plan is marked invalid, and
+the fit check refuses by name, only when the accepted owners' merged inputs cannot be sized. This replaced the first
+owner-keyed form, in which any live owner's flag marked the device's plan invalid and refused every owner's re-plan
+until the rejected owner dropped. That form undid the property llama.cpp-kpjw had pinned, by letting a model that
+failed to plan stop a running model from re-planning at its runtime `n_ubatch`.
+
+A model whose own figure was rejected has no dense scratch planned, and an overflowing figure must not become a small
+plan that the other owners' figures carry through the fit check. So the runtime-context transaction refuses that
+model's context by name (`unified_cache_planned_dense_scratch_owner_rejected`, a WARN naming the model's slot, slot
+generation and the rejected half; INFO for a probe, which still refuses). It checks before the fit check, and again
+after a re-plan that a rejection refused. A context the model has no room to record (below) is refused by name the
+same way, before the fit check, rather than left out of the plan its buffers are sized from.
+
+*A model plans at the largest `n_ubatch` its live contexts last published.* Each backend context records, in its
+model's row, the `n_ubatch` it last published (keyed by its minted planned-scratch id, never an address), and the model
+plans at the largest of those records (`planned_load_terms::planned_n_ubatch`). A context's own later publish replaces
+its own record, and another context can only add or replace its own, so a second context created at `-ub 512` while a
+first at `-ub 2048` is live does not shrink the plan the first context's buffers were sized from. The auto-ubatch
+ladder is the case that rules out a latch: it publishes each rung for real, ascending, so a rung that passes the
+transaction and then loses at `sched_reserve` or to the host fallback has already raised the plan. The settle
+republishes the winner from the same context, which replaces that context's record, so the plan falls back to the
+winner instead of holding the losing rung's f16 dequant and Q8_1 src1 bytes off the winner's compute buffers.
+
+A context's record leaves when the context is destroyed, releasing its hold
+(`unified_cache_release_planned_dense_scratch_context`), and the model is re-planned, so its plan may fall. With no
+context live the model plans at its load's `n_ubatch` again (`DENSE_SCRATCH_LOAD_N_UBATCH`). The load's value is no
+floor while a context is live: a context at `-ub 256` plans at 256, not at the load's 512. A model has room for
+`planned_context_capacity` records per device; a context past that is refused by name. A transaction that rolls back
+after its re-plan leaves the context's record until its next publish or its destruction, so the guard restores only
+the hold. Each half's published `n_ubatch` is its own accepted owners' largest. A successful re-plan logs, at INFO, the
+context's published `n_ubatch`, the model's planned `n_ubatch` and each half's (`[SYCL-PLAN] dense scratch re-planned
+on device`), so a run scores the settle's published value against the plan's. Before this rule, the latch kept the
+larger of the model's current and new values, the load's value included, which held the losing rung's plan after the
+ladder settled lower and held a context running below the load's `n_ubatch` to the load's value.
 
 **D2: the plan followed the load-time `n_ubatch`.** Auto-ubatch chooses the real one at context creation, after load.
 The plan is a function of `n_ubatch` (`zone_dense_scratch_total_bytes()`), so the runtime-context transaction, the
@@ -2730,8 +2769,8 @@ recording. The transaction refuses a rung whose plan the RUNTIME zone cannot hol
 (`unified_cache_dense_scratch_runtime_fit()`, against zone capacity, not free space, because free space depends on which
 compute buffers happen to be live) and names the largest `-ub` that fits, so the ladder keeps the last rung that fits
 and an explicit `-ub` fails context creation with the arithmetic. The ring admission is told the figure as pending
-RUNTIME demand and leaves it room. A probe changes nothing; a refused or rolled-back publish restores the plan and the
-hold (`ggml_sycl_dense_scratch_txn_guard`).
+RUNTIME demand and leaves it room. A probe changes nothing; a refused or rolled-back publish restores the hold
+(`ggml_sycl_dense_scratch_txn_guard`), and leaves the context's published `n_ubatch` in its model's plan (above).
 
 Why not make rung selection consult the plan separately: the probe *is* the transaction, so the ladder already asks
 the one source. No edit to `src/llama-auto-ubatch.h` or the ladder is needed, and none was made.

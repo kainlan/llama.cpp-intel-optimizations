@@ -4344,6 +4344,20 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-45qo: the dense scratch plan's inputs (Q8_1 src1, f16 dequant, their n_ubatch, the rejected-figure
+# flags) are owner terms in the planned load terms table, keyed by (slot, generation) per canonical contract 12.4:
+# stored by the open load's owner, validated on the merge before they land, published by one writer from the merge of
+# the accepted owners, re-planned per owner, and dropped with the owner; the device-global live-flag merge is gone.
+# A mutant per claim.
+# Text only: no device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-dense-scratch-owner-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-dense-scratch-owner-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-cre6: the host-expert MoE result scatter scratch is the third planned RUNTIME-zone buffer, in the g6yk
 # shape: a planned term published with the MoE control requirement and folded into the RUNTIME zone requirement and
 # the dense fit, claimed whole at publish (after the Q8_1 claim, before the hold is recomputed), charged to the ring

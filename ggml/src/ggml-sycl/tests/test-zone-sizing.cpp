@@ -1372,14 +1372,8 @@ int main() {
               "a decline with no valid legacy fallback draws nothing");
         CHECK(!ggml_sycl::zone_route_draws_scratch(false, false, true, true, true), "an invalid decision draws nothing");
 
-        // Plan inputs are device-global. A second model on the device must not shrink the first one's plan.
-        CHECK(ggml_sycl::zone_dense_scratch_merge_input(19584, 4096, true) == 19584,
-              "another live model's larger plan input survives the load of a smaller one (draft + target)");
-        CHECK(ggml_sycl::zone_dense_scratch_merge_input(4096, 19584, true) == 19584,
-              "the larger of two live models wins either way");
-        CHECK(ggml_sycl::zone_dense_scratch_merge_input(19584, 4096, false) == 4096,
-              "with no other live model the new inputs replace the old: a model swap shrinks the plan");
-        CHECK(ggml_sycl::zone_dense_scratch_merge_input(0, 0, true) == 0, "nothing planned stays nothing");
+        // The plan inputs' merge across live models is the owner table's (planned-load-terms.hpp, llama.cpp-45qo),
+        // unit-tested in tests/test-planned-load-terms.cpp.
     }
 
     // ---- Case 16: review r2/r3 (hardware): a rung is refused for its hold-induced spill only when that spill is

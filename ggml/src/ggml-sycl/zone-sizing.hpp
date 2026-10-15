@@ -604,11 +604,6 @@ bool zone_route_draws_scratch(bool decision_valid,
                               bool fallback_valid,
                               bool fallback_draws);
 
-// The planned dense scratch's inputs are device-global, so a second model loaded on a device while another is
-// live must not shrink the first one's plan (a draft and a target on one card). The larger input survives
-// while another model is live; with none live the new input replaces the old, so a model swap shrinks the plan.
-size_t zone_dense_scratch_merge_input(size_t prev, size_t next, bool other_model_live);
-
 // llama.cpp-p6i0: the RUNTIME-zone bytes a scheduler compute buffer measured as `chunk_bytes[0..n_chunks)` takes.
 // Each gallocr chunk is one backend buffer and so one allocation in the zone, which occupies
 // tlsf_allocator::round_request(chunk, alignment) -- the zone allocator's own rule, read from it, not restated. A zero

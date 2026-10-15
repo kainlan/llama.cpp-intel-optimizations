@@ -17046,10 +17046,12 @@ static constexpr bool ggml_sycl_dequant_f16_scratch_drawable() {
     return GGML_SYCL_DEQUANT_F16_ARM != 0;
 }
 
-// llama.cpp-kpjw: whether a backend context other than `self` is live on `device`. The plan inputs and the hold are
-// per device, so this (and not the process-wide model registry, which counts models on other devices too) is the
-// question a plan merge asks. Defined with the context list below.
-static bool ggml_sycl_other_backend_context_live(int device, const ggml_backend_sycl_context * self);
+// llama.cpp-45qo: the owner of the load effect ggml_backend_sycl_stage_inventory_plan holds while it runs on this
+// thread, set and restored by its scope together with g_sycl_plan_load_effect_txn; empty outside a staged load. The
+// load's dense scratch plan is keyed by it. The stage holds that effect across the whole stage, so the stores land
+// under it and the load's end, which waits load effects out, cannot run its rollback's drop before they do; no second
+// lease is taken, so a failed acquire cannot read as "no open load".
+static thread_local ggml_sycl::lifecycle::SlotToken g_sycl_plan_load_effect_owner{};
 
 // The inventory crosses from libllama into this library by pointer, so a field that moves would be read from the wrong
 // place without any error. These pin the KV tail of the layout (llama.cpp-8ecj).
@@ -17147,18 +17149,23 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     // llama.cpp-479i: the dense MMQ/MMVQ Q8_1 src1 buffer is a planned byte. Sized here from the
     // same inventory maxima, at the load-time n_ubatch (512 when the loader says 0); the graph-entry
     // check ggml_sycl_mmq_src1_ensure_for_graph() sizes the exact demand at the real n_ubatch.
-    // The plan inputs are per device: another context that is live on THIS device keeps its larger inputs (a draft
-    // loaded beside a target must not under-plan the target); a model live on another device is no reason to merge.
-    // The loading context is already in the device's context list, so it is excluded by identity.
-    const bool other_model_live = ggml_sycl_other_backend_context_live(ctx->device, ctx);
+    // llama.cpp-45qo: the plan inputs are this load's own contribution on the device, keyed by the model slot and slot
+    // generation of the open load the stage runs under (canonical contract 12.4), the owner of the load effect the
+    // stage holds (g_sycl_plan_load_effect_owner). A model live on the device keeps its own inputs and the device plans
+    // for the merge; a model that unloads takes its inputs with it. Outside a staged load (the legacy direct setter)
+    // nothing owns a plan and nothing is planned.
+    const ggml_sycl::lifecycle::SlotToken plan_owner = g_sycl_plan_load_effect_owner;
+    const bool                            owned      = plan_owner.generation != 0;
+    const char *                          unplanned =
+        owned ? " -- sizing overflowed, nothing planned" : " -- no staged load owns it, nothing planned";
     {
         const uint32_t mmq_src1_n_ubatch = inventory->n_ubatch != 0 ? inventory->n_ubatch : 512;
-        const bool     mmq_src1_planned  = ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(
-            ctx->device, inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch, other_model_live);
+        const bool     mmq_src1_planned =
+            owned && ggml_sycl::unified_cache_set_planned_mmq_src1_scratch(
+                         ctx->device, plan_owner, inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch);
         GGML_LOG_INFO("[SYCL-PLAN] dense MMQ src1 Q8_1 scratch: %.1f MB (%zu B/token x n_ubatch=%u, RUNTIME zone)%s\n",
                       ggml_sycl::unified_cache_get_planned_mmq_src1_scratch_bytes(ctx->device) / (1024.0 * 1024.0),
-                      inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch,
-                      mmq_src1_planned ? "" : " -- sizing overflowed, nothing planned");
+                      inventory_maxima.mmq_src1_bytes_per_token, mmq_src1_n_ubatch, mmq_src1_planned ? "" : unplanned);
     }
     // llama.cpp-479i: the dense f16 dequant buffers (src0 and src1 copies) are planned the same way, from
     // the inventory maxima the adapter marked (dense Q8_0 weights, and Q4_0 / MXFP4 weights the oneDNN PP scratch
@@ -17168,16 +17175,16 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     {
         const uint32_t dequant_n_ubatch = inventory->n_ubatch != 0 ? inventory->n_ubatch : 512;
         const bool     f16_drawable     = ggml_sycl_dequant_f16_scratch_drawable();
-        const bool     dequant_planned  = ggml_sycl::unified_cache_set_planned_dequant_f16_scratch(
-            ctx->device, f16_drawable ? inventory_maxima.dequant_f16_weight_bytes : 0,
-            f16_drawable ? inventory_maxima.dequant_f16_src1_bytes_per_token : 0, dequant_n_ubatch, other_model_live);
+        const bool     dequant_planned =
+            owned && ggml_sycl::unified_cache_set_planned_dequant_f16_scratch(
+                         ctx->device, plan_owner, f16_drawable ? inventory_maxima.dequant_f16_weight_bytes : 0,
+                         f16_drawable ? inventory_maxima.dequant_f16_src1_bytes_per_token : 0, dequant_n_ubatch);
         GGML_LOG_INFO(
             "[SYCL-PLAN] dense f16 dequant scratch: %.1f MB (weights %.1f MB + %zu B/token x n_ubatch=%u, RUNTIME "
             "zone)%s\n",
             ggml_sycl::unified_cache_get_planned_dequant_f16_scratch_bytes(ctx->device) / (1024.0 * 1024.0),
             inventory_maxima.dequant_f16_weight_bytes / (1024.0 * 1024.0),
-            inventory_maxima.dequant_f16_src1_bytes_per_token, dequant_n_ubatch,
-            dequant_planned ? "" : " -- sizing overflowed, nothing planned");
+            inventory_maxima.dequant_f16_src1_bytes_per_token, dequant_n_ubatch, dequant_planned ? "" : unplanned);
     }
     {
         const bool pp_pipeline_enabled               = pp_pipeline_env_enabled();
@@ -18048,14 +18055,21 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
         }
 
         struct plan_effect_scope {
-            uint64_t previous;
+            uint64_t                        previous;
+            ggml_sycl::lifecycle::SlotToken previous_owner;
 
-            explicit plan_effect_scope(uint64_t txn) : previous(g_sycl_plan_load_effect_txn) {
-                g_sycl_plan_load_effect_txn = txn;
+            plan_effect_scope(uint64_t txn, ggml_sycl::lifecycle::SlotToken owner) :
+                previous(g_sycl_plan_load_effect_txn),
+                previous_owner(g_sycl_plan_load_effect_owner) {
+                g_sycl_plan_load_effect_txn   = txn;
+                g_sycl_plan_load_effect_owner = owner;
             }
 
-            ~plan_effect_scope() { g_sycl_plan_load_effect_txn = previous; }
-        } authority{ effect.owner.load.value };
+            ~plan_effect_scope() {
+                g_sycl_plan_load_effect_txn   = previous;
+                g_sycl_plan_load_effect_owner = previous_owner;
+            }
+        } authority{ effect.owner.load.value, effect.owner.owner };
         struct owner_rollback_guard {
             ggml_sycl::lifecycle::ModelToken owner{};
             bool started = false;
@@ -19531,7 +19545,7 @@ static void ggml_sycl_mmq_src1_claim_plan(ggml_backend_sycl_context & ctx) {
             "[SYCL-PLAN] dense MMQ src1 Q8_1 scratch claimed on device %d: %.1f MB (plan %.1f MB at "
             "n_ubatch=%u, RUNTIME zone)\n",
             d, ctx.mmvq_q8_activation_cache.capacity(d) / (1024.0 * 1024.0), planned / (1024.0 * 1024.0),
-            (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d));
+            (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d, /*f16=*/false));
         return;
     }
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(d);
@@ -19540,7 +19554,8 @@ static void ggml_sycl_mmq_src1_claim_plan(ggml_backend_sycl_context & ctx) {
         "plan was published (buffer holds %.1f MB, RUNTIME zone has %.1f MB free); the hold keeps its bytes off "
         "spill-capable allocations, a node the graph-entry walk counts is refused before submission, and a node it "
         "does not count still meets the 479i plan-breach abort (llama.cpp-g6yk)\n",
-        d, planned / (1024.0 * 1024.0), (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d),
+        d, planned / (1024.0 * 1024.0),
+        (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d, /*f16=*/false),
         ctx.mmvq_q8_activation_cache.capacity(d) / (1024.0 * 1024.0),
         (cache ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : 0) / (1024.0 * 1024.0));
 }
@@ -19575,25 +19590,67 @@ static void ggml_sycl_moe_host_scatter_claim_plan(ggml_backend_sycl_context & ct
         (cache ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : 0) / (1024.0 * 1024.0));
 }
 
+// llama.cpp-kpjw, kept per owner (llama.cpp-45qo): a model whose own dense scratch figure overflowed its sizing
+// contributes nothing to the device's plan, so another live model's plan stays valid, and has no dense scratch planned
+// for it. An overflowing figure must not become a SMALL plan, so the runtime-context transaction refuses that model's
+// context by name instead of letting the other owners' plan pass it through the fit check. True, and logged (at INFO
+// for a probe, as the transaction's other refusals are), when `owner`'s own figure for either half was rejected.
+static bool ggml_sycl_dense_scratch_owner_refused(int device, ggml_sycl::lifecycle::SlotToken owner, bool probe_mode) {
+    bool q8  = false;
+    bool f16 = false;
+    if (!ggml_sycl::unified_cache_planned_dense_scratch_owner_rejected(device, owner, &q8, &f16)) {
+        return false;
+    }
+    const char * half = q8 && f16 ? "Q8_1 src1 and f16 dequant" : (q8 ? "Q8_1 src1" : "f16 dequant");
+    ggml_log_internal(
+        probe_mode ? GGML_LOG_LEVEL_INFO : GGML_LOG_LEVEL_WARN,
+        "[SYCL-PLAN] runtime KV update rejected: the dense %s scratch figure of model slot %u generation %llu "
+        "overflowed its sizing on device %d, so no dense scratch is planned for it; an overflowing figure is "
+        "refused rather than planned as a smaller one\n",
+        half, owner.slot, (unsigned long long) owner.generation, device);
+    return true;
+}
+
+// llama.cpp-45qo: each backend context of a model records the n_ubatch it last published, and the model's dense
+// scratch is planned at the largest. A context the model has no room to record would be left out of the plan its
+// buffers are sized from, so the runtime-context transaction refuses it by name. True, and logged (at INFO for a
+// probe, as the transaction's other refusals are), when `context` has no room.
+static bool ggml_sycl_dense_scratch_context_refused(int                             device,
+                                                    ggml_sycl::lifecycle::SlotToken owner,
+                                                    uint64_t                        context,
+                                                    bool                            probe_mode) {
+    if (ggml_sycl::unified_cache_planned_dense_scratch_context_room(device, owner, context)) {
+        return false;
+    }
+    ggml_log_internal(
+        probe_mode ? GGML_LOG_LEVEL_INFO : GGML_LOG_LEVEL_WARN,
+        "[SYCL-PLAN] runtime KV update rejected: model slot %u generation %llu has no room on device %d for another "
+        "backend context's dense scratch n_ubatch (context %llu); a context is refused rather than left out of the "
+        "plan its buffers are sized from\n",
+        owner.slot, (unsigned long long) owner.generation, device, (unsigned long long) context);
+    return true;
+}
+
 // llama.cpp-kpjw: the runtime-context transaction re-plans the dense scratch at the runtime n_ubatch and drops the
-// hold while it materializes its own pools; this restores both on every exit that is not the success tail. A probe
+// hold while it materializes its own pools; this restores the hold on every exit that is not the success tail. A probe
 // changes nothing, so its guard is inert. The hold is the OWNER's: the guard zeroes it for this context and puts
 // back whatever (hold, owner) pair it found.
+// llama.cpp-45qo: the guard restores only the hold. The model's re-plan records this context's n_ubatch as the value
+// it last published; a rollback leaves that value in place until the context's next publish replaces it or the
+// context is destroyed and its value is removed.
 struct ggml_sycl_dense_scratch_txn_guard {
     int      device;
     uint64_t owner;
     bool     active;
-    bool     committed     = false;
-    uint32_t prev_n_ubatch = 0;
-    size_t   prev_hold     = 0;
-    uint64_t prev_owner    = 0;
+    bool     committed  = false;
+    size_t   prev_hold  = 0;
+    uint64_t prev_owner = 0;
 
     ggml_sycl_dense_scratch_txn_guard(ggml_backend_sycl_context & ctx, bool publish) :
         device(ctx.device),
         owner(ctx.planned_scratch_owner),
         active(publish) {
         if (active) {
-            prev_n_ubatch = ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(device);
             ggml_sycl::unified_cache_get_planned_scratch_hold_state(device, &prev_hold, &prev_owner);
             // The transaction places the MoE MMID pools in this zone; they are not the compute buffers the hold
             // exists to keep out, and the ring admission already counts the plan against the zone.
@@ -19605,10 +19662,6 @@ struct ggml_sycl_dense_scratch_txn_guard {
 
     ~ggml_sycl_dense_scratch_txn_guard() {
         if (active && !committed) {
-            if (prev_n_ubatch != 0) {
-                // A rollback restores an exact earlier plan, not a merge, so it never keeps a larger input.
-                (void) ggml_sycl::unified_cache_replan_planned_dense_scratch(device, prev_n_ubatch, false);
-            }
             ggml_sycl::unified_cache_set_planned_scratch_hold(device, prev_hold, prev_owner);
         }
     }
@@ -20296,6 +20349,13 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // HERE, so the ladder keeps the last rung that fits instead of publishing a plan the first graph cannot meet,
     // and the refusal names the largest -ub that does. The compute-buffer reserve that comes after this is what
     // the hold (ggml_sycl_planned_scratch_hold_refresh) keeps off the planned bytes.
+    if (ggml_sycl_dense_scratch_owner_refused(ctx->device, current_token.owner, probe_mode)) {
+        return refuse("a dense scratch figure of this model overflowed its sizing");
+    }
+    if (ggml_sycl_dense_scratch_context_refused(ctx->device, current_token.owner, ctx->planned_scratch_owner,
+                                                probe_mode)) {
+        return refuse("this model has no room for another context's dense scratch n_ubatch");
+    }
     size_t dense_scratch_runtime_bytes = 0;
     {
         size_t   needed        = 0;
@@ -20319,9 +20379,27 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     }
     ggml_sycl_dense_scratch_txn_guard dense_guard(*ctx, !probe_mode);
     if (!probe_mode && next_kv_info.n_ubatch != 0) {
-        // Another context live on this device keeps the larger n_ubatch in the plan it is running on.
-        (void) ggml_sycl::unified_cache_replan_planned_dense_scratch(
-            ctx->device, next_kv_info.n_ubatch, ggml_sycl_other_backend_context_live(ctx->device, ctx));
+        // The published plan's model re-plans its own inputs (llama.cpp-45qo) at the largest n_ubatch its live
+        // contexts last published, this context's replacing its own earlier one; another model live on this device
+        // keeps its own, and the device plans for the merge. A re-plan a rejection refused leaves this model with no
+        // dense scratch planned, so it is refused by name like the check above.
+        uint32_t   model_n_ubatch = 0;
+        const bool replanned      = ggml_sycl::unified_cache_replan_planned_dense_scratch(
+            ctx->device, current_token.owner, ctx->planned_scratch_owner, next_kv_info.n_ubatch, &model_n_ubatch);
+        if (!replanned && ggml_sycl_dense_scratch_owner_refused(ctx->device, current_token.owner, probe_mode)) {
+            return refuse("a dense scratch figure of this model overflowed its sizing");
+        }
+        if (replanned) {
+            GGML_LOG_INFO(
+                "[SYCL-PLAN] dense scratch re-planned on device %d: context %llu published n_ubatch=%u; model slot %u "
+                "generation %llu plans at n_ubatch=%u; the device plans Q8_1 src1 at n_ubatch=%u and f16 dequant at "
+                "n_ubatch=%u\n",
+                ctx->device, (unsigned long long) ctx->planned_scratch_owner, (unsigned) next_kv_info.n_ubatch,
+                current_token.owner.slot, (unsigned long long) current_token.owner.generation,
+                (unsigned) model_n_ubatch,
+                (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(ctx->device, /*f16=*/false),
+                (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(ctx->device, /*f16=*/true));
+        }
     }
 
     // llama.cpp-ibj0: the PP MoE oneDNN scratch ring was sized at model load
@@ -28899,19 +28977,6 @@ static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int 
     std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
     const auto & contexts = g_backend_context_by_device[device];
     return contexts.empty() ? nullptr : contexts.back();
-}
-
-static bool ggml_sycl_other_backend_context_live(int device, const ggml_backend_sycl_context * self) {
-    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(g_backend_context_by_device_mutex);
-    for (const ggml_backend_sycl_context * c : g_backend_context_by_device[device]) {
-        if (c != self) {
-            return true;
-        }
-    }
-    return false;
 }
 
 // Check if a tensor's buffer allocation is in device VRAM (not host-pinned fallback).
@@ -48024,6 +48089,9 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
     // The buffers this context was owed are gone with it; nothing is left to hold the zone for. Only a hold this
     // context published: another live context's hold is not ours to clear.
     (void) ggml_sycl::unified_cache_release_planned_scratch_hold(device, planned_scratch_owner);
+    // And the n_ubatch it last published leaves its model's dense scratch plan, which may fall to the model's other
+    // live contexts' largest, or to the load's n_ubatch (llama.cpp-45qo).
+    (void) ggml_sycl::unified_cache_release_planned_dense_scratch_context(device, planned_scratch_owner);
     for (auto & [tensor, extra] : runtime_tensor_extras) {
         (void) tensor;
         release_extra_gpu(extra);
@@ -104718,7 +104786,7 @@ static bool ggml_sycl_mmq_src1_ensure_for_graph(ggml_backend_sycl_context & ctx,
             "is a plan-accounting refusal, not a missing kernel (llama.cpp-479i)\n",
             d, target_bytes / (1024.0 * 1024.0), demand[d].node && demand[d].node->name[0] ? demand[d].node->name : "?",
             (long long) demand[d].rows, (long long) demand[d].ne10, planned_bytes / (1024.0 * 1024.0),
-            (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d),
+            (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d, /*f16=*/false),
             ctx.mmvq_q8_activation_cache.capacity(d) / (1024.0 * 1024.0),
             (cache ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : 0) / (1024.0 * 1024.0));
         return false;
@@ -104863,7 +104931,7 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
                 d, b.role, target / (1024.0 * 1024.0),
                 demand[d].node && demand[d].node->name[0] ? demand[d].node->name : "?",
                 ggml_sycl::unified_cache_get_planned_dequant_f16_scratch_bytes(d) / (1024.0 * 1024.0),
-                (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d),
+                (unsigned) ggml_sycl::unified_cache_get_planned_dense_scratch_n_ubatch(d, /*f16=*/true),
                 b.buffer.capacity(d) / (1024.0 * 1024.0),
                 (cache ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : 0) / (1024.0 * 1024.0));
             return false;
