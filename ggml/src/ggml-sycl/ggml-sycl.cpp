@@ -77114,10 +77114,10 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
                                        nullptr, nullptr, nullptr, static_cast<int>(n_ids), static_cast<int>(n_as),
                                        n_ids, record->layout, ids_dev, ids->nb[0], ids->nb[1], nullptr, 0, nullptr,
                                        nullptr, &kernel_deps)) {
-            // The retained route still computes the same result. The copies land in this op's own pool entries, and
-            // the staging record names what the staging now holds. The flushes are what that route does on entry.
-            // The kept job is not, but that route's entry flush places it, since the sibling slot is occupied. The
-            // pool span reserved here goes unused until the ring wraps.
+            // The retained route computes the same result. The copies land in this op's own pool entries, and the
+            // staging record names what the staging now holds. A flush made here is one that route makes at entry or
+            // defers to its dispatch-time keep, so flushing early costs overlap, not the result. A kept job is placed
+            // by that route's entry flush, as the sibling slot is occupied. This op's span idles until the ring wraps.
             static std::atomic<int> declined_log{ 0 };
             if (declined_log.fetch_add(1, std::memory_order_relaxed) < 8) {
                 GGML_LOG_WARN(
