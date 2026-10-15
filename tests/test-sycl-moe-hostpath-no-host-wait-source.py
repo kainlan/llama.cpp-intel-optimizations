@@ -82,7 +82,10 @@ only shrink:
       other 22 reading their ids back, while N7 and N8 passed.  So the record carries `all_host`; the
       builder decides it from the plan (`counts.on_device == 0`) and records it; no builder refusal
       tests the device lookup (`materialized`, `substitute`) without `!all_host`, and none refuses on
-      the all-host case itself; and the route runs its table copy and device kernel only inside
+      the all-host case itself, even as one `||` operand of its condition (`n_as < 0 || all_host`,
+      `all_host == true`, `counts.on_device == 0`, either way round), unless it sits in an `if` only
+      a device expert enters, where `all_host` means the plan counted no device expert yet one
+      resolved there; and the route runs its table copy and device kernel only inside
       `if (!record->all_host) {...}` and never refuses an all-host record.  A refusal returns the
       outcome itself or through the builder's `refuse("reason")` helper, and a retry counts as one,
       since a retry that keeps failing settles as a refusal (moe_decode_direct_stamp_settle).  Every
@@ -212,8 +215,16 @@ NOT_ALL_HOST = re.compile(
 ALL_HOST_LINK = re.compile(r"(^|\|\|)[(\s]*all_host[)\s]*(\|\||$)")
 # What the builder learns only from a device expert: its materialized layout and the table's substitute pointer.
 DEVICE_LOOKUP = re.compile(r"\b(materialized|substitute)\b")
-# A refusal whose whole condition is the all-host case.
-ALL_HOST_ITSELF = re.compile(r"^[(\s]*(all_host|counts\.on_device\s*(==|<=)\s*0|!\s*counts\.on_device)[)\s]*$")
+# The all-host test itself, matched against one whole `||` operand of a refusal's condition: every all-host tensor
+# that reaches the refusal satisfies that operand, whatever the others test.
+ALL_HOST_ITSELF = re.compile(
+    r"(?:record->)?all_host(?:\s*(?:==\s*true|!=\s*false))?"
+    r"|(?:true\s*==|false\s*!=)\s*(?:record->)?all_host"
+    r"|counts\.on_device\s*(?:==|<=)\s*0|0\s*(?:==|>=)\s*counts\.on_device|!\s*counts\.on_device"
+)
+# One `&&` operand of an `if` only a device expert enters. A refusal on `all_host` inside it fires only when the plan
+# counted no device expert yet one resolved on the device; an all-host tensor whose plan holds never gets there.
+DEVICE_EXPERT_ONLY = re.compile(r"(?:\w+\.)?executor\s*==\s*(?:\w+::)*PRIMARY_DEVICE")
 DEVICE_HALF_GUARD = "if (!record->all_host) {"
 DEVICE_HALF = ("mmvq_moe_batched_dispatch(", "record->table")
 FLAGGED_DEF = "static void moe_host_scatter_submit_flagged("
@@ -918,6 +929,71 @@ def if_chain_links(text: str, close_at: int) -> list[str] | None:
             return None
 
 
+def split_top_level(cond: str, op: str) -> list[str]:
+    """`cond`'s operands of its top-level `op` (`||` or `&&`), each without enclosing parentheses; an operand that is
+    itself a parenthesized `op` expression is expanded in place."""
+    cond = cond.strip()
+    while cond.startswith("(") and matching(cond, 0, "(", ")") == len(cond) - 1:
+        cond = cond[1:-1].strip()
+    parts: list[str] = []
+    depth = start = k = 0
+    while k < len(cond):
+        c = cond[k]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif depth == 0 and cond.startswith(op, k):
+            parts.append(cond[start:k])
+            k += len(op)
+            start = k
+            continue
+        k += 1
+    if not parts:
+        return [cond]
+    parts.append(cond[start:])
+    out: list[str] = []
+    for part in parts:
+        out.extend(split_top_level(part, op))
+    return out
+
+
+def all_host_operand(cond: str) -> str | None:
+    """The `||` operand of `cond` that is the all-host test itself, or None."""
+    for operand in split_top_level(cond, "||"):
+        if ALL_HOST_ITSELF.fullmatch(operand):
+            return operand
+    return None
+
+
+def enclosing_if_conditions(text: str, at: int) -> list[str]:
+    """The conditions of the `if (...) {...}` blocks that enclose position `at` in squashed code, innermost first."""
+    conds: list[str] = []
+    depth = 0
+    for k in range(at - 1, -1, -1):
+        c = text[k]
+        if c == "}":
+            depth += 1
+        elif c == "{":
+            if depth:
+                depth -= 1
+                continue
+            head = text[:k].rstrip()
+            if head.endswith(")"):
+                cond_open = matching_back(text, len(head) - 1, "(", ")")
+                if re.search(r"(^|[^\w])if$", text[:cond_open].rstrip()):
+                    conds.append(text[cond_open + 1 : len(head) - 1].strip())
+    return conds
+
+
+def device_expert_only(text: str, at: int) -> bool:
+    """Whether position `at` sits in an `if` whose condition requires the expert's executor to be this device."""
+    for cond in enclosing_if_conditions(text, at):
+        if any(DEVICE_EXPERT_ONLY.fullmatch(part) for part in split_top_level(cond, "&&")):
+            return True
+    return False
+
+
 def check_n9(scan: Scan) -> None:
     """The route admits a tensor whose experts all live on the host (llama.cpp-7pvo): the record has an all-host
     mode the builder decides from the plan, no builder refusal needs a device expert outside that mode, and the
@@ -956,10 +1032,12 @@ def check_n9(scan: Scan) -> None:
                 f"satisfy, without `!all_host`, so every tensor whose experts all live on the host is refused "
                 f"({TAG_7PVO})"
             )
-        if ALL_HOST_ITSELF.match(cond):
+        operand = all_host_operand(cond)
+        if operand is not None and not device_expert_only(squashed, m.start()):
             raise ContractError(
-                f"FAIL [N9]: {RECORD_BUILD} refuses or retries on `{cond}`, the all-host case itself, so the "
-                f"layers the placement leaves entirely on the host keep their readback ({TAG_7PVO})"
+                f"FAIL [N9]: {RECORD_BUILD} refuses or retries on `{cond}`, whose `||` operand `{operand}` is the "
+                f"all-host case itself, outside any `if` only a device expert enters, so the layers the placement "
+                f"leaves entirely on the host keep their readback ({TAG_7PVO})"
             )
     for m in elses:
         links = if_chain_links(squashed, m.start())
@@ -1247,6 +1325,13 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
     sub("N9", "builder refuses a tensor with no device layout in a final else", no_layout,
         "    if (materialized >= 0) {\n        (void) materialized;\n    } else {\n"
         "        return refuse(\"no device layout\");\n    }\n")
+    sub("N9", "builder refuses on a condition that ors in all_host", no_layout,
+        "    if (n_as < 0 || all_host) {\n        return refuse(\"all host\");\n    }\n")
+    sub("N9", "builder refuses an all-host tensor's host expert",
+        "            if (!view.ptr || view.on_device || view.retention) {\n"
+        "                return refuse(\"a host expert has no plain host view\");",
+        "            if (all_host || !view.ptr || view.on_device || view.retention) {\n"
+        "                return refuse(\"a host expert has no plain host view\");")
     sub("N9", "builder refusal hides its condition from the scan",
         "    if (!all_host && materialized < 0) {\n"
         "        return refuse(\"no device expert is materialized in a layout the batched kernel reads\");\n"
