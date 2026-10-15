@@ -833,7 +833,8 @@ if (Python3_Interpreter_FOUND)
     # TBB arena, and the layer chain already orders the jobs (llama.cpp-w4e9).
     # Run WITH --self-test so each pin is proven to catch its mutant.
     add_test(NAME test-sycl-cpu-expert-pool-default-source
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-default-source.py --self-test)
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-default-source.py --self-test)
     set_tests_properties(test-sycl-cpu-expert-pool-default-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # Host MoE experts must read the activation row of their own slot, not row 0
