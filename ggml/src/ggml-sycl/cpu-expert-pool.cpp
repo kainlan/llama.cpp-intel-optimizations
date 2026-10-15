@@ -30,9 +30,11 @@ static int get_cpu_expert_thread_count() {
             return n;
         }
     }
-    // Default: one worker.  Each job's row loop is a parallel_for into the backend's ONE TBB
-    // arena (ggml_sycl_cpu_threads_hint(), GGML_SYCL_CPU_THREADS), so a second worker does
-    // not add threads; it splits the arena between overlapping jobs.  The jobs gain nothing
+    // Default: one worker.  Each job's row loop runs on the pool's ONE row-worker set
+    // (row_workers_, ggml_sycl_cpu_row_loop_threads() threads), which takes one job at a time,
+    // so a second worker does not add threads; it queues behind the running job.  When the
+    // measurement below was taken the row loop was a parallel_for into the backend's TBB arena,
+    // where a second worker split the arena between overlapping jobs.  The jobs gain nothing
     // from running together: the layer chain already orders them (gate/up, then down, then
     // the next layer).  Measured 2026-10-15 on Qwen3.8 decode (B70, -c 4096, -t 4, host
     // load 25-32): one worker was never slower than 22, and was +14% to +29% faster
@@ -46,6 +48,26 @@ static int get_cpu_expert_thread_count() {
     // other's joins, and same-device concurrent inference is unsupported (canonical
     // memory contract, section 5).
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Env var: GGML_SYCL_CPU_ROW_SPIN_US=N sets how long the row workers keep polling after a job
+// before they block, in microseconds (0 = block at once; start() clamps to spin_us_max).
+// Unset, empty, or not a whole number >= 0: CpuRowWorkers::spin_us_default.
+// ---------------------------------------------------------------------------
+static int get_cpu_row_spin_us() {
+    const char * env = std::getenv("GGML_SYCL_CPU_ROW_SPIN_US");
+    if (env == nullptr || *env == '\0') {
+        return CpuRowWorkers::spin_us_default;
+    }
+    char *     end = nullptr;
+    const long us  = std::strtol(env, &end, 10);
+    if (*end != '\0' || us < 0) {
+        GGML_LOG_WARN("[CPU-EXPERT-POOL] GGML_SYCL_CPU_ROW_SPIN_US=%s is not a whole number >= 0, using %d\n", env,
+                      CpuRowWorkers::spin_us_default);
+        return CpuRowWorkers::spin_us_default;
+    }
+    return static_cast<int>(std::min<long>(us, CpuRowWorkers::spin_us_max));
 }
 
 // ---------------------------------------------------------------------------
@@ -69,8 +91,10 @@ void CpuExpertPool::init(int n_threads) {
     for (int i = 0; i < n_threads; i++) {
         threads_.emplace_back(&CpuExpertPool::worker_thread, this);
     }
+    row_workers_.start(ggml_sycl_cpu_row_loop_threads(), get_cpu_row_spin_us());
 
-    GGML_LOG_INFO("[CPU-EXPERT-POOL] Initialized: %d threads\n", n_threads);
+    GGML_LOG_INFO("[CPU-EXPERT-POOL] Initialized: %d threads, row loop on %d threads, spin %d us\n", n_threads,
+                  row_workers_.n_threads(), row_workers_.spin_us());
 }
 
 void CpuExpertPool::worker_thread() {
@@ -222,7 +246,7 @@ std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task>      
         // picking it up, so `wall` includes those waits and `wake` does not; the overlap clock
         // covers the kernel only. resolve, after the prologue, builds the tasks of a job
         // submitted before they were known (llama.cpp-7pvo).
-        work_queue_.push([tasks = std::move(tasks), prologue = std::move(prologue), resolve = std::move(resolve),
+        work_queue_.push([this, tasks = std::move(tasks), prologue = std::move(prologue), resolve = std::move(resolve),
                           promise, trace, t_submit]() mutable {
             const pool_trace_clock::time_point t_start = trace ? pool_trace_clock::now() : t_submit;
             if (prologue) {
@@ -235,7 +259,7 @@ std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task>      
             if (trace) {
                 ticket = cpu_expert_pool_overlap_begin(g_pool_trace_overlap);
             }
-            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()));
+            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()), row_workers_);
             if (trace) {
                 const bool overlapped = cpu_expert_pool_overlap_end(g_pool_trace_overlap, ticket);
                 pool_trace_record_job(tasks.size(), t_submit, t_start, pool_trace_clock::now(), overlapped);
@@ -264,6 +288,18 @@ void CpuExpertPool::stop_workers() {
         }
     }
     threads_.clear();
+    // After the workers: a job still running uses the row workers until it returns.
+    //
+    // Destruction order.  ggml_backend_sycl_free() reaches shutdown() through
+    // ggml_sycl_shutdown_global_runtime_pinned_owners(), so in a normal exit the row workers stop
+    // here while the backend's TBB arena (ggml_sycl_cpu_arena(), cpu-dispatch.cpp) is still alive.
+    // When a process exits without freeing its backend, ~CpuExpertPool runs during static
+    // destruction, and the arena, if anything used it, is already gone: it is a function-local
+    // static first used after g_cpu_expert_pools (ggml-sycl.cpp, namespace scope) was constructed,
+    // so it is destroyed first.  Stopping the row workers then is still safe because they never enter the arena (a
+    // job's Phase 1.5 GEMM, MXFP4 with several activation rows, does, on the pool worker's own
+    // thread), and stop() waits for a run in flight before it joins them.
+    row_workers_.stop();
 }
 
 void CpuExpertPool::shutdown() {

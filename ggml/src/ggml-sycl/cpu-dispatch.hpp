@@ -14,6 +14,10 @@
 #include "common.hpp"
 #include "moe-resolved-batch.hpp"
 
+namespace ggml_sycl {
+class CpuRowWorkers;  // cpu-row-workers.hpp
+}
+
 // Dispatch a single ggml operation to the CPU SYCL device.
 // Returns true if handled, false if the op is unsupported on CPU.
 bool ggml_sycl_compute_forward_cpu(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst);
@@ -161,6 +165,21 @@ bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
 void ggml_sycl_cpu_expert_mul_mat_batched(
     const cpu_expert_task * tasks, int n_tasks,
     int n_threads = 0);
+
+// The same computation, with the flattened row loop on row_workers, a
+// CpuExpertPool's own row-worker set, instead of the shared TBB arena
+// (llama.cpp-w4e9). For a type with no multi-row tile, such as every IQ type,
+// each row runs the same kernel either way. For Q4_0, Q6_K and MXFP4 a row's
+// tile, or the single-row remainder, follows the range it falls in, and the row
+// workers' 64-row chunks cut the rows differently from the arena's grain.
+void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task *    tasks,
+                                          int                        n_tasks,
+                                          ggml_sycl::CpuRowWorkers & row_workers);
+
+// Threads in one row loop: the TBB arena's size, which is GGML_SYCL_CPU_THREADS
+// (default hardware threads - 2, at most 32). A CpuExpertPool sizes its row
+// workers with it.
+int ggml_sycl_cpu_row_loop_threads();
 
 // Host-expert job timing (llama.cpp-b2jc), on under GGML_SYCL_MOE_IDS_COPY_TRACE
 // like the decode wait census. Off, it costs one cached flag test per call and

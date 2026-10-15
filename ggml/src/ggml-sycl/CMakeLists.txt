@@ -6381,6 +6381,22 @@ set_tests_properties(graph-safe-memcpy-width PROPERTIES
     TIMEOUT 60
 )
 
+# Test: the CpuExpertPool's row-worker set (llama.cpp-w4e9). cpu-row-workers.hpp names only the standard
+# library, so this compiles the same cpu-row-workers.cpp libggml-sycl gets from this directory's file(GLOB),
+# with no -fsycl, no device and no libggml-sycl link.
+add_executable(test-cpu-row-workers
+    tests/test-cpu-row-workers.cpp
+    cpu-row-workers.cpp
+)
+target_include_directories(test-cpu-row-workers PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+find_package(Threads REQUIRED)
+target_link_libraries(test-cpu-row-workers PRIVATE Threads::Threads)
+add_test(NAME cpu-row-workers COMMAND test-cpu-row-workers)
+set_tests_properties(cpu-row-workers PROPERTIES
+    LABELS "sycl;moe;hostonly;tdd"
+    TIMEOUT 120
+)
+
 # Test: per-context memo of declined graph signatures (llama.cpp-qhfp). Host-only, same arrangement as
 # test-graph-safe-memcpy-width above: graph-prestage-decline-memo.hpp is pure C++.
 add_executable(test-graph-prestage-decline-memo
