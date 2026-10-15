@@ -829,6 +829,14 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-source.py --self-test)
     set_tests_properties(test-sycl-cpu-expert-pool-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+    # CpuExpertPool defaults to one worker: every job's row loop shares the one
+    # TBB arena, and the layer chain already orders the jobs (llama.cpp-w4e9).
+    # Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-cpu-expert-pool-default-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-default-source.py --self-test)
+    set_tests_properties(test-sycl-cpu-expert-pool-default-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # A CpuExpertPool job runs its row loop on the pool's own row workers, which poll for a
     # bounded idle budget between jobs and then block (llama.cpp-w4e9). WITH --self-test.
     add_test(NAME test-sycl-cpu-row-workers-source

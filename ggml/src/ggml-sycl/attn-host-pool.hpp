@@ -52,9 +52,10 @@ class AttnHostPool {
     AttnHostPool & operator=(AttnHostPool &&)      = delete;
 
     // n_threads: worker thread count (0 = auto: hardware_concurrency - 2,
-    // reserving cores for the GPU driver -- same default policy as
-    // CpuExpertPool, deliberately reimplemented rather than shared code; see
-    // the class comment for why the two pools stay separate).
+    // reserving cores for the GPU driver). CpuExpertPool used the same policy
+    // until its default became one worker, because its jobs share one TBB
+    // arena; this pool is reimplemented rather than shared code, and is sized
+    // independently (see the class comment for why the two pools stay separate).
     // `q` is accepted now (not yet used) so step 3 can add pinned-staging
     // allocation without changing this signature.
     void init(int n_threads, sycl::queue & q);

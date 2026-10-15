@@ -30,9 +30,22 @@ static int get_cpu_expert_thread_count() {
             return n;
         }
     }
-    // Default: hardware_concurrency - 2 (reserve for GPU driver threads)
-    int hw = static_cast<int>(std::thread::hardware_concurrency());
-    return std::max(1, hw - 2);
+    // Default: one worker.  Each job's row loop is a parallel_for into the backend's ONE TBB
+    // arena (ggml_sycl_cpu_threads_hint(), GGML_SYCL_CPU_THREADS), so a second worker does
+    // not add threads; it splits the arena between overlapping jobs.  The jobs gain nothing
+    // from running together: the layer chain already orders them (gate/up, then down, then
+    // the next layer).  Measured 2026-10-15 on Qwen3.8 decode (B70, -c 4096, -t 4, host
+    // load 25-32): one worker was never slower than 22, and was +14% to +29% faster
+    // depending on host load (22 vs 1 worker, two windows: 8.49 vs 9.69 t/s over the valid
+    // arms of four alternated pairs, 8.1 vs 10.5 t/s over two reps).  The pool finishes
+    // sooner (job wall per token 54.1 -> 39.1 ms), but much of that time overlaps device
+    // work, so the end-to-end gain is smaller than the pool's saving and varies with load.
+    // One worker cannot deadlock because every wait points back in submission order (the
+    // z4kd block in ggml-sycl.cpp).  That argument assumes ONE context per device's pool:
+    // two contexts on one device would interleave their jobs in this FIFO behind each
+    // other's joins, and same-device concurrent inference is unsupported (canonical
+    // memory contract, section 5).
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
