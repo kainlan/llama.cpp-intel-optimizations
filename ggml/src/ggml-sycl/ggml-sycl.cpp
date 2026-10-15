@@ -9393,7 +9393,7 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
     }
 
     // Initialize CPU expert thread pool for persistent async dispatch.
-    // Thread count auto-detected (hardware_concurrency - 2) or overridden
+    // One worker by default (get_cpu_expert_thread_count()), or N workers
     // via GGML_SYCL_CPU_EXPERT_THREADS=N.
     if (max_K > 0 && max_N > 0 && max_dispatch_count > 0) {
         auto & cpu_pool = g_cpu_expert_pools[device];
