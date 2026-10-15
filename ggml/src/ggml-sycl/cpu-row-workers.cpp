@@ -38,17 +38,19 @@ CpuRowWorkers::~CpuRowWorkers() {
     stop();
 }
 
-void CpuRowWorkers::start(int n_threads) {
+void CpuRowWorkers::start(int n_threads, int spin_us) {
     std::lock_guard<std::mutex> run_lock(run_mutex_);
     if (!threads_.empty() || n_threads < 2) {
         return;
     }
+    const int      budget_us = std::min(std::max(spin_us, 0), spin_us_max);
     // A new worker has seen every run so far, so it waits for the next one.
-    const uint32_t gen = claim_gen(claim_.load(std::memory_order_acquire));
+    const uint32_t gen       = claim_gen(claim_.load(std::memory_order_acquire));
     threads_.reserve(static_cast<size_t>(n_threads - 1));
     for (int slot = 1; slot < n_threads; slot++) {
-        threads_.emplace_back(&CpuRowWorkers::worker, this, slot, gen);
+        threads_.emplace_back(&CpuRowWorkers::worker, this, slot, gen, budget_us);
     }
+    spin_us_.store(budget_us, std::memory_order_release);
     n_threads_.store(n_threads, std::memory_order_release);
 }
 
@@ -103,8 +105,10 @@ void CpuRowWorkers::run(int n_rows, const row_body & body) {
     }
     run_chunks(gen, 0);
     // The chunks other workers claimed are the only ones left; they finish without waiting on anything.
+    // Yielding here too lets a worker that was preempted mid-chunk get a core back sooner.
     while (chunks_done_.load(std::memory_order_acquire) < n_chunks) {
         GGML_SYCL_ROW_WORKERS_PAUSE();
+        std::this_thread::yield();
     }
     body_ = nullptr;
 }
@@ -127,14 +131,11 @@ void CpuRowWorkers::run_chunks(uint32_t gen, int slot) {
     }
 }
 
-bool CpuRowWorkers::wait_for_run(uint32_t seen_gen, uint32_t & gen) {
-    // Pauses between clock reads while polling; the clock decides when the idle budget is spent.
-    constexpr int spins_per_check = 64;
-    using clock                   = std::chrono::steady_clock;
-    const auto budget             = std::chrono::microseconds(idle_budget_us);
-    auto       idle_since         = clock::now();
-    int        spins              = 0;
-    const auto new_run_or_stop    = [&] {
+bool CpuRowWorkers::wait_for_run(uint32_t seen_gen, uint32_t & gen, int spin_us) {
+    using clock                = std::chrono::steady_clock;
+    const auto budget          = std::chrono::microseconds(spin_us);
+    auto       idle_since      = clock::now();
+    const auto new_run_or_stop = [&] {
         return claim_gen(claim_.load(std::memory_order_seq_cst)) != seen_gen ||
                stopping_.load(std::memory_order_seq_cst);
     };
@@ -146,16 +147,14 @@ bool CpuRowWorkers::wait_for_run(uint32_t seen_gen, uint32_t & gen) {
         if (stopping_.load(std::memory_order_acquire)) {
             return false;
         }
-        if (++spins < spins_per_check) {
-            GGML_SYCL_ROW_WORKERS_PAUSE();
-            continue;
-        }
-        spins = 0;
         if (clock::now() - idle_since < budget) {
+            // Every poll gives the core away: a runnable thread of another pool, such as the host
+            // attention workers of a token's CPU-resident KV layers, runs before this one polls again.
+            GGML_SYCL_ROW_WORKERS_PAUSE();
             std::this_thread::yield();
             continue;
         }
-        // The budget is spent: block until run() or stop() wakes this worker.
+        // The budget is spent (at once when it is 0): block until run() or stop() wakes this worker.
         std::unique_lock<std::mutex> lock(sleep_mutex_);
         sleepers_.fetch_add(1, std::memory_order_seq_cst);
         sleep_cv_.wait(lock, new_run_or_stop);
@@ -164,9 +163,9 @@ bool CpuRowWorkers::wait_for_run(uint32_t seen_gen, uint32_t & gen) {
     }
 }
 
-void CpuRowWorkers::worker(int slot, uint32_t seen_gen) {
+void CpuRowWorkers::worker(int slot, uint32_t seen_gen, int spin_us) {
     uint32_t gen = seen_gen;
-    while (wait_for_run(seen_gen, gen)) {
+    while (wait_for_run(seen_gen, gen, spin_us)) {
         run_chunks(gen, slot);
         seen_gen = gen;
     }

@@ -24,8 +24,8 @@ namespace ggml_sycl {
 // Persistent thread pool for CPU expert computation.
 // Replaces per-call std::async with pre-spawned workers.
 //
-// Worker count default: 1 (each job's row loop already spans the shared TBB arena;
-// see get_cpu_expert_thread_count()).
+// Worker count default: 1 (each job's row loop already spans the pool's row
+// workers; see get_cpu_expert_thread_count()).
 // Override: GGML_SYCL_CPU_EXPERT_THREADS=N
 //
 // The pool owns threads and a work queue, no memory. CPU expert staging comes
@@ -34,10 +34,11 @@ namespace ggml_sycl {
 //
 // A job's row loop runs on the pool's row workers (llama.cpp-w4e9), not the
 // shared TBB arena: ggml_sycl_cpu_row_loop_threads() threads, the job's own
-// worker included, which stay awake for CpuRowWorkers::idle_budget_us after a
-// job so that the next job of a decode token starts on all of them. The jobs of
-// one pool take the row workers one at a time. Each pool has its own set, so
-// pools of two devices that both hold host experts run two such sets.
+// worker included, which keep polling for GGML_SYCL_CPU_ROW_SPIN_US
+// (default CpuRowWorkers::spin_us_default) after a job so that the next job of
+// a decode token starts on all of them. The jobs of one pool take the row
+// workers one at a time. Each pool has its own set, so pools of two devices
+// that both hold host experts run two such sets.
 class CpuExpertPool {
   public:
     CpuExpertPool() = default;

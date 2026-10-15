@@ -1,7 +1,8 @@
 // The CpuExpertPool's row-worker set (llama.cpp-w4e9): every row of a run is computed exactly once, in
 // chunks that depend only on the row count, by the caller and the workers; callers on several threads
-// run one after another; the workers stop polling once the idle budget is spent, wake for the next run,
-// and stop() joins them. Host only: cpu-row-workers.hpp names only the standard library.
+// run one after another; the workers stop polling once the spin budget is spent (at once when it is 0),
+// wake for the next run, and stop() joins them, also while they are blocked; start() clamps the budget.
+// Host only: cpu-row-workers.hpp names only the standard library.
 
 #include "../cpu-row-workers.hpp"
 
@@ -170,20 +171,21 @@ int main() {
     // 5. Idle: once the budget is spent the workers block. Polling, 7 workers would burn ~7 CPU-ms per
     //    wall-ms; blocked, the process burns next to nothing.
     {
-        std::this_thread::sleep_for(std::chrono::microseconds(CpuRowWorkers::idle_budget_us) +
+        CHECK(w.spin_us() == CpuRowWorkers::spin_us_default, "start() without a budget did not take the default");
+        std::this_thread::sleep_for(std::chrono::microseconds(CpuRowWorkers::spin_us_default) +
                                     std::chrono::milliseconds(50));
         const double cpu0 = process_cpu_ms();
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         const double idle_cpu_ms = process_cpu_ms() - cpu0;
         std::printf("idle window: 200 ms wall, %.1f ms CPU over %d threads\n", idle_cpu_ms, w.n_threads());
-        CHECK(idle_cpu_ms < 50.0, "the workers keep polling after the idle budget");
+        CHECK(idle_cpu_ms < 50.0, "the workers keep polling after the spin budget");
     }
 
     // 6. Blocked workers wake for the next run and take part in it.
     {
         bool worker_ran = false;
         for (int rep = 0; rep < 20 && !worker_ran; rep++) {
-            std::this_thread::sleep_for(std::chrono::microseconds(CpuRowWorkers::idle_budget_us) +
+            std::this_thread::sleep_for(std::chrono::microseconds(CpuRowWorkers::spin_us_default) +
                                         std::chrono::milliseconds(5));
             run_record rec;
             record_run(w, 64 * 200, rec, 50);
@@ -209,6 +211,57 @@ int main() {
         run_record rec2;
         record_run(w, 12480, rec2, 0);
         CHECK(every_row_once(rec2, 12480), "a row ran zero times or more than once after a restart");
+    }
+
+    // 8. A budget of 0 blocks at once: the workers still take part in every run (each run wakes them),
+    //    and right after a run the process burns next to nothing.
+    {
+        CpuRowWorkers z;
+        z.start(8, 0);
+        CHECK(z.spin_us() == 0, "start(n, 0) did not keep a budget of 0");
+        bool worker_ran = false;
+        for (int rep = 0; rep < 50; rep++) {
+            run_record rec;
+            record_run(z, 64 * 64, rec, 50);
+            CHECK(every_row_once(rec, 64 * 64), "a row ran zero times or more than once at a budget of 0");
+            worker_ran = worker_ran || rec.slots.size() > 1 || rec.slots.count(0) == 0;
+        }
+        CHECK(worker_ran, "no chunk ran on a worker in 50 runs at a budget of 0");
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const double cpu0 = process_cpu_ms();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const double idle_cpu_ms = process_cpu_ms() - cpu0;
+        std::printf("budget 0: 200 ms wall, %.1f ms CPU over %d threads\n", idle_cpu_ms, z.n_threads());
+        CHECK(idle_cpu_ms < 50.0, "the workers poll after a run at a budget of 0");
+    }
+
+    // 9. start() clamps the budget to [0, spin_us_max].
+    {
+        CpuRowWorkers c;
+        c.start(4, -5);
+        CHECK(c.spin_us() == 0, "a negative budget was not clamped to 0");
+        c.stop();
+        c.start(4, 999999);
+        CHECK(c.spin_us() == CpuRowWorkers::spin_us_max, "a budget above spin_us_max was not clamped to it");
+        run_record rec;
+        record_run(c, 12480, rec, 0);
+        CHECK(every_row_once(rec, 12480), "a row ran zero times or more than once at the largest budget");
+    }
+
+    // 10. stop() joins workers that are blocked on the condition variable, and returns promptly.
+    {
+        CpuRowWorkers p;
+        p.start(8);
+        run_record rec;
+        record_run(p, 12480, rec, 0);
+        std::this_thread::sleep_for(std::chrono::microseconds(CpuRowWorkers::spin_us_default) +
+                                    std::chrono::milliseconds(50));
+        const auto t0 = steady::now();
+        p.stop();
+        const double stop_ms = std::chrono::duration<double, std::milli>(steady::now() - t0).count();
+        std::printf("stop with blocked workers: %.2f ms\n", stop_ms);
+        CHECK(p.n_threads() == 1, "n_threads() after stopping blocked workers is not 1");
+        CHECK(stop_ms < 1000.0, "stop() took over a second to join blocked workers");
     }
 
     std::printf("PASS: cpu row workers\n");
