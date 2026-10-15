@@ -174,7 +174,7 @@ enum class offload_wait_reason : uint8_t {
 
 static inline bool offload_event_waitable(const sycl::event & evt) {
     try {
-        return ggml_sycl_should_add_dependency(evt);
+        return ggml_sycl_should_add_dependency(evt, GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH);
     } catch (...) {
         return false;
     }
@@ -209,7 +209,7 @@ static inline void wait_dependency_if_needed(const sycl::event & evt) {
 
 static inline void append_dependency(std::vector<sycl::event> & deps, const sycl::event & evt) {
     try {
-        if (ggml_sycl_should_add_dependency(evt)) {
+        if (ggml_sycl_should_add_dependency(evt, GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH)) {
             deps.push_back(evt);
         }
     } catch (...) {
@@ -2650,7 +2650,7 @@ bool ggml_sycl_batched_mode_active() {
 
 static void staging_track_cpu_event(const sycl::event & evt) {
     try {
-        if (!ggml_sycl_should_add_dependency(evt)) {
+        if (!ggml_sycl_should_add_dependency(evt, GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH)) {
             return;
         }
     } catch (...) {

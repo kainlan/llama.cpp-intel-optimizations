@@ -2104,7 +2104,8 @@ static sycl::event launch_fattn_xmx_v2_decode_gqa_split_leaf(const fattn_params 
     const int64_t     nb33               = params.nb33;
     const sycl::event packed_ready_event = packed_k_ready_event ? *packed_k_ready_event : sycl::event{};
     const bool        add_packed_dep =
-        PACKED_K && packed_k_ready_event != nullptr && ggml_sycl_should_add_dependency(packed_ready_event);
+        PACKED_K && packed_k_ready_event != nullptr &&
+        ggml_sycl_should_add_dependency(packed_ready_event, GGML_SYCL_READY_QUERY_SITE_FATTN_XMX_PACKED_K);
 
     sycl::range<3> first_grid(params.ne12 * params.ne03, n_partitions, n_query_blocks);
     sycl::range<3> first_block(1, 1, nthreads);

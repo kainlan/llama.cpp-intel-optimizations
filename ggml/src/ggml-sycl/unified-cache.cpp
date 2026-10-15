@@ -16763,7 +16763,8 @@ unified_cache * get_existing_unified_cache_for_device(int device_id) {
 static std::atomic<unified_cache *> g_moe_join_queue_owner{ nullptr };
 static std::atomic<bool>            g_moe_join_queue_refused{ false };
 
-void unified_cache_moe_join_queue_refuse(const char * why) {
+// Returns the CPU expert joins to the compute streams for the rest of the process, logging `why` once.
+static void unified_cache_moe_join_queue_refuse(const char * why) {
     if (!g_moe_join_queue_refused.exchange(true, std::memory_order_acq_rel)) {
         GGML_LOG_WARN(
             "[MOE-JOIN-QUEUE] CPU expert joins go on the compute stream for the rest of the process: %s "
@@ -22687,6 +22688,10 @@ bool shutdown_unified_cache() {
         // unregister/free pinned backing exactly once.
         g_device_caches.clear();
         g_cache_mode_locked.store(false, std::memory_order_release);
+        // The join queue's owner was one of these caches, and a refusal was about their streams (llama.cpp-wfsl):
+        // a rebuilt backend starts the join queue's guard afresh rather than keeping a stale owner or refusal.
+        g_moe_join_queue_owner.store(nullptr, std::memory_order_release);
+        g_moe_join_queue_refused.store(false, std::memory_order_release);
     }
     // Cache destruction tears down host_arena_/pinned_chunk_pool while their
     // SYCL queues and single-device contexts are still valid. Only after every

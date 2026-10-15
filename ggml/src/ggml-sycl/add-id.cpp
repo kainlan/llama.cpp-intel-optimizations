@@ -247,7 +247,7 @@ void ggml_sycl_add_id(ggml_backend_sycl_context& ctx, ggml_sycl::sycl_tensor dst
           auto resolved = ggml_sycl_resolve(cur, ctx.device);
           if (resolved.has_ready_event) {
               try {
-                  if (ggml_sycl_should_add_dependency(resolved.ready_event)) {
+                  if (ggml_sycl_should_add_dependency(resolved.ready_event, GGML_SYCL_READY_QUERY_SITE_ADD_ID)) {
                       deps.push_back(resolved.ready_event);
                   }
               } catch (...) {

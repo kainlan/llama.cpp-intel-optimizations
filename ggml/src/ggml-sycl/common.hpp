@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
@@ -597,11 +598,98 @@ inline ggml_sycl::alloc_intent ggml_sycl_transient_host_pinned_intent(const char
     return intent;
 }
 
+// GGML_SYCL_CHAIN_SAME_QUEUE_SKIP, read once (common.cpp, llama.cpp-wfsl).
+bool ggml_sycl_chain_same_queue_skip_enabled();
+
+// GGML_SYCL_MOE_IDS_COPY_TRACE is on (cpu-dispatch.cpp). Declared here as well, since cpu-dispatch.hpp includes this
+// header.
+bool ggml_sycl_cpu_expert_trace_enabled();
+
+// The caller of a ready-event status query (ggml_sycl_should_add_dependency), for the trace's count of queries per
+// site on the [MOE-HOSTPATH-WAITS] line (llama.cpp-wfsl). PER_OP_CHAIN is the per-op source chain, which that line
+// reports as ready_queries= instead.
+enum ggml_sycl_ready_query_site {
+    GGML_SYCL_READY_QUERY_SITE_OTHER = 0,
+    GGML_SYCL_READY_QUERY_SITE_PER_OP_CHAIN,
+    GGML_SYCL_READY_QUERY_SITE_BINBCAST_SRC0,
+    GGML_SYCL_READY_QUERY_SITE_BINBCAST_SRC1,
+    GGML_SYCL_READY_QUERY_SITE_MMVQ_MOE_WEIGHT,
+    GGML_SYCL_READY_QUERY_SITE_MMVQ_WEIGHT,
+    GGML_SYCL_READY_QUERY_SITE_MUL_MAT_WEIGHT,
+    GGML_SYCL_READY_QUERY_SITE_ADD_ID,
+    GGML_SYCL_READY_QUERY_SITE_FATTN_SET_ROWS,
+    GGML_SYCL_READY_QUERY_SITE_FATTN_PACKED_ZERO,
+    GGML_SYCL_READY_QUERY_SITE_FATTN_PACKED_PREV,
+    GGML_SYCL_READY_QUERY_SITE_FATTN_PREV_USE,
+    GGML_SYCL_READY_QUERY_SITE_FATTN_XMX_PACKED_K,
+    GGML_SYCL_READY_QUERY_SITE_MOE_SORT,
+    GGML_SYCL_READY_QUERY_SITE_MOE_XMX,
+    GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH,
+    GGML_SYCL_READY_QUERY_SITE_COUNT,
+};
+
+// The site's name on the [MOE-HOSTPATH-WAITS] line.
+inline const char * ggml_sycl_ready_query_site_name(ggml_sycl_ready_query_site site) {
+    switch (site) {
+        case GGML_SYCL_READY_QUERY_SITE_PER_OP_CHAIN:
+            return "per_op_chain";
+        case GGML_SYCL_READY_QUERY_SITE_BINBCAST_SRC0:
+            return "binbcast_src0";
+        case GGML_SYCL_READY_QUERY_SITE_BINBCAST_SRC1:
+            return "binbcast_src1";
+        case GGML_SYCL_READY_QUERY_SITE_MMVQ_MOE_WEIGHT:
+            return "mmvq_moe_weight";
+        case GGML_SYCL_READY_QUERY_SITE_MMVQ_WEIGHT:
+            return "mmvq_weight";
+        case GGML_SYCL_READY_QUERY_SITE_MUL_MAT_WEIGHT:
+            return "mul_mat_weight";
+        case GGML_SYCL_READY_QUERY_SITE_ADD_ID:
+            return "add_id";
+        case GGML_SYCL_READY_QUERY_SITE_FATTN_SET_ROWS:
+            return "fattn_set_rows";
+        case GGML_SYCL_READY_QUERY_SITE_FATTN_PACKED_ZERO:
+            return "fattn_packed_zero";
+        case GGML_SYCL_READY_QUERY_SITE_FATTN_PACKED_PREV:
+            return "fattn_packed_prev";
+        case GGML_SYCL_READY_QUERY_SITE_FATTN_PREV_USE:
+            return "fattn_prev_use";
+        case GGML_SYCL_READY_QUERY_SITE_FATTN_XMX_PACKED_K:
+            return "fattn_xmx_packed_k";
+        case GGML_SYCL_READY_QUERY_SITE_MOE_SORT:
+            return "moe_sort";
+        case GGML_SYCL_READY_QUERY_SITE_MOE_XMX:
+            return "moe_xmx";
+        case GGML_SYCL_READY_QUERY_SITE_CPU_DISPATCH:
+            return "cpu_dispatch";
+        case GGML_SYCL_READY_QUERY_SITE_OTHER:
+        case GGML_SYCL_READY_QUERY_SITE_COUNT:
+            break;
+    }
+    return "other";
+}
+
+// The calling thread's ready-event status queries while ggml_sycl_cpu_expert_trace_enabled() (llama.cpp-wfsl): how
+// many each site asked, and the summed wall time of the queries that found their event unfinished. The submitting
+// thread prints its own on each [MOE-HOSTPATH-WAITS] line and then resets it.
+struct ggml_sycl_ready_query_census {
+    uint64_t count[GGML_SYCL_READY_QUERY_SITE_COUNT] = {};
+    double   pending_us                              = 0.0;
+};
+
+ggml_sycl_ready_query_census & ggml_sycl_ready_query_census_this_thread();
+
 // Helper to check if we should add an event dependency.
 // During graph recording, we MUST always add depends_on() to capture the dependency edge.
 // Event status queries are unreliable during recording (events haven't executed yet).
 // Outside graph recording, we only add the dependency if the event is not complete.
-inline bool ggml_sycl_should_add_dependency(const sycl::event & dep_event) {
+// `site` names the caller in the trace's query census (llama.cpp-wfsl); with the trace off the census costs one
+// cached flag test and reads no clock.
+inline bool ggml_sycl_should_add_dependency(const sycl::event &        dep_event,
+                                            ggml_sycl_ready_query_site site = GGML_SYCL_READY_QUERY_SITE_OTHER) {
+    const bool traced = ggml_sycl_cpu_expert_trace_enabled();
+    if (traced) {
+        ggml_sycl_ready_query_census_this_thread().count[site] += 1;
+    }
     if (ggml_sycl_graph_recording_active()) {
         // During graph recording, avoid depending on already-complete events (e.g., default/ready events),
         // but preserve dependencies for in-flight events to capture correct graph edges.
@@ -616,12 +704,54 @@ inline bool ggml_sycl_should_add_dependency(const sycl::event & dep_event) {
         return true;
     }
     // Outside graph recording, check if event is already complete
-    return dep_event.get_info<sycl::info::event::command_execution_status>() !=
-           sycl::info::event_command_status::complete;
+    if (!traced) {
+        return dep_event.get_info<sycl::info::event::command_execution_status>() !=
+               sycl::info::event_command_status::complete;
+    }
+    // On a profiling queue the driver can answer the query for an unfinished kernel by busy-waiting on the kernel's
+    // timestamp packet, so the census sums the time of the queries that found their event unfinished.
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool pending =
+        dep_event.get_info<sycl::info::event::command_execution_status>() != sycl::info::event_command_status::complete;
+    if (pending) {
+        ggml_sycl_ready_query_census_this_thread().pending_us +=
+            std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    }
+    return pending;
 }
 
-inline void ggml_sycl_chain_ready_event_if_needed(sycl::queue & q, const ggml_sycl::resolved_ptr & resolved) {
-    if (resolved.has_ready_event && ggml_sycl_should_add_dependency(resolved.ready_event)) {
+// Was `resolved`'s ready event produced by the queue whose identity `same_queue` holds (llama.cpp-wfsl)? Null
+// `same_queue` means skipping does not apply; see ggml_sycl_chain_same_queue_identity().
+inline bool ggml_sycl_ready_event_from_queue(const ggml_sycl::resolved_ptr & resolved, const size_t * same_queue) {
+    return same_queue && resolved.has_ready_queue && resolved.ready_queue == *same_queue;
+}
+
+// Fills `identity` with `q`'s and returns it when an event `q` itself produced may go unqueried and unchained before
+// a command on `q` (llama.cpp-wfsl): GGML_SYCL_CHAIN_SAME_QUEUE_SKIP is on, no command graph records, and `q` is
+// in-order, so everything later submitted on `q` starts after that command ends. Otherwise returns null. Never while a
+// graph records: a recorded command's dependencies become edges of a graph that replays wherever it is submitted, not
+// where this queue's order stands now.
+inline const size_t * ggml_sycl_chain_same_queue_identity(const sycl::queue & q, size_t * identity) {
+    if (ggml_sycl_chain_same_queue_skip_enabled() && !ggml_sycl_graph_recording_active() &&
+        ggml_sycl::ready_queue_identity(q, identity)) {
+        return identity;
+    }
+    return nullptr;
+}
+
+// Makes `q` wait for `resolved`'s ready event when that event is unfinished. `same_queue`, when not null, is `q`'s
+// identity from ggml_sycl_chain_same_queue_identity(): an event `q` itself produced is then neither queried nor
+// chained (llama.cpp-wfsl). An event from another queue, from a host task or with no recorded producer is not ordered
+// by `q`'s submission order, so it is queried and chained as before. `site` names the caller in the trace's query
+// census.
+inline void ggml_sycl_chain_ready_event_if_needed(sycl::queue &                   q,
+                                                  const ggml_sycl::resolved_ptr & resolved,
+                                                  const size_t *                  same_queue = nullptr,
+                                                  ggml_sycl_ready_query_site site = GGML_SYCL_READY_QUERY_SITE_OTHER) {
+    if (!resolved.has_ready_event || ggml_sycl_ready_event_from_queue(resolved, same_queue)) {
+        return;
+    }
+    if (ggml_sycl_should_add_dependency(resolved.ready_event, site)) {
         q.ext_oneapi_submit_barrier({ resolved.ready_event });
     }
 }
@@ -5644,7 +5774,7 @@ inline void ggml_sycl_chain_tensor_ready_event_if_needed(sycl::queue &          
     for (int depth = 0; cur != nullptr && depth < GGML_MAX_SRC; ++depth) {
         auto resolved = ggml_sycl_resolve(cur, device);
         if (resolved.has_ready_event) {
-            if (same_queue && resolved.has_ready_queue && resolved.ready_queue == *same_queue) {
+            if (ggml_sycl_ready_event_from_queue(resolved, same_queue)) {
                 // The event's command was submitted on `q`, and `q` is in-order, so everything submitted on `q`
                 // from now on starts after that command ends: the dependency already holds. The status query is
                 // not free: on a profiling queue the driver answers it for an unfinished kernel by busy-waiting
@@ -5657,32 +5787,28 @@ inline void ggml_sycl_chain_tensor_ready_event_if_needed(sycl::queue &          
                 if (counts) {
                     counts->queries += 1;
                 }
-                ggml_sycl_chain_ready_event_if_needed(q, resolved);
+                ggml_sycl_chain_ready_event_if_needed(q, resolved, nullptr, GGML_SYCL_READY_QUERY_SITE_PER_OP_CHAIN);
             }
         }
         cur = cur->view_src;
     }
 }
 
-// Before `dst` is computed on `q`, makes `q` wait for each source's unfinished ready event. With
-// `skip_same_queue` (GGML_SYCL_CHAIN_SAME_QUEUE_SKIP, llama.cpp-wfsl) it skips the events `q` produced itself
-// when `q` is in-order. Never while a command graph records: a recorded command's dependencies become edges of
-// a graph that replays wherever it is submitted, not where this queue's order stands now, so recording keeps
-// every query and dependency as before. `counts`, when not null, receives the op's counts.
+// Before `dst` is computed on `q`, makes `q` wait for each source's unfinished ready event, skipping the events `q`
+// itself produced when ggml_sycl_chain_same_queue_identity() hands out `q`'s identity (llama.cpp-wfsl): the knob is
+// on, no command graph records, and `q` is in-order. `counts`, when not null, receives the op's counts.
 inline void ggml_sycl_chain_source_ready_events_if_needed(sycl::queue &                  q,
                                                           const ggml_tensor *            dst,
                                                           int                            device,
-                                                          bool                           skip_same_queue = false,
-                                                          ggml_sycl_chain_ready_counts * counts          = nullptr) {
+                                                          ggml_sycl_chain_ready_counts * counts = nullptr) {
     if (!dst) {
         return;
     }
-    size_t     q_identity = 0;
-    const bool same =
-        skip_same_queue && !ggml_sycl_graph_recording_active() && ggml_sycl::ready_queue_identity(q, &q_identity);
+    size_t         q_identity = 0;
+    const size_t * same       = ggml_sycl_chain_same_queue_identity(q, &q_identity);
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         if (dst->src[i] != nullptr) {
-            ggml_sycl_chain_tensor_ready_event_if_needed(q, dst->src[i], device, same ? &q_identity : nullptr, counts);
+            ggml_sycl_chain_tensor_ready_event_if_needed(q, dst->src[i], device, same, counts);
         }
     }
 }

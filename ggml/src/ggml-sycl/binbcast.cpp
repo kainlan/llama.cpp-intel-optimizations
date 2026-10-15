@@ -770,11 +770,18 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx,
     void *    src0_d        = src0_resolved ? src0_resolved.ptr : ggml_sycl_resolve_tensor_ptr(src0, device);
     void *    src1_d        = src1_resolved ? src1_resolved.ptr : ggml_sycl_resolve_tensor_ptr(src1, device);
     void *    dst_d         = ggml_sycl_resolve_tensor_ptr(dst, device);
+    // A source event main_stream itself produced (a MUL's, an ADD_ID's) is neither queried nor chained
+    // (llama.cpp-wfsl).
+    size_t    main_stream_identity = 0;
     if (src0_resolved && src0_resolved.has_ready_event) {
-        ggml_sycl_chain_ready_event_if_needed(*main_stream, src0_resolved);
+        ggml_sycl_chain_ready_event_if_needed(*main_stream, src0_resolved,
+                                              ggml_sycl_chain_same_queue_identity(*main_stream, &main_stream_identity),
+                                              GGML_SYCL_READY_QUERY_SITE_BINBCAST_SRC0);
     }
     if (src1_resolved && src1_resolved.has_ready_event) {
-        ggml_sycl_chain_ready_event_if_needed(*main_stream, src1_resolved);
+        ggml_sycl_chain_ready_event_if_needed(*main_stream, src1_resolved,
+                                              ggml_sycl_chain_same_queue_identity(*main_stream, &main_stream_identity),
+                                              GGML_SYCL_READY_QUERY_SITE_BINBCAST_SRC1);
     }
 
     ggml_sycl_binbcast_tracef("entry op=%s device=%d dst=%s src0=%s src1=%s src0_d=%p src1_d=%p dst_d=%p",

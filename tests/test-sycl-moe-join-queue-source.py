@@ -20,7 +20,11 @@ job.get().  Any host task those inputs reach that the runtime posts after it can
 never run.  So every other host task the backend submits is recorded with its
 cache, each join depends on the latest one on the stream, and anything the record
 cannot cover (a host task on another queue or another device) turns the join
-queue off for the rest of the process.
+queue off for the rest of the process.  The census covers the backend's own sources;
+the host tasks third-party libraries post are outside it: the oneDNN and oneMKL ones
+are on their CPU-engine paths, the oneMath batch route that could post one is dead
+(ggml-sycl.cpp, the batched GEMM route near line 55375), and oneCCL's are only under
+tensor parallelism, where the joins are on two devices' streams and the latch refuses.
 
 THE CONTRACT.  With comments blanked:
   K. (ggml-sycl.cpp moe_join_queue_enabled) GGML_SYCL_MOE_JOIN_QUEUE is read once,
@@ -46,7 +50,12 @@ THE CONTRACT.  With comments blanked:
      cache's queue_, or on a second cache, refuses the join queue for the process, as
      does a host task submitted while its queue records (a graph node, which no join
      outside the graph may depend on and which runs at each replay); the refusal is
-     sticky (exchange(true)).
+     sticky (exchange(true)) and file-static, with no declaration in unified-cache.hpp.
+  U. (unified-cache.cpp shutdown_unified_cache) the owner and the refusal are reset
+     when the caches are detached, so a rebuilt backend starts the guard afresh.
+  W. (ggml-sycl.cpp) the [MOE-HOSTPATH-WAITS] line prints joinq=, 1 when every join of
+     the token went on the join queue: each join is counted by where it went, under the
+     trace only, and the counts are reset with the token's.
   O. (unified-cache) the cache owns the join queue: a unique_ptr member made once under
      std::call_once, in_order, without enable_profiling, on queue_'s context and device,
      and drained by drain_all_queues_noexcept.
@@ -56,7 +65,8 @@ THE CONTRACT.  With comments blanked:
      the joins while they may be off it (the selector's own predicate), so the stream's
      later commands still follow them and GGML_SYCL_MOE_JOIN_QUEUE=0 adds no command.
   C. (docs/backend/sycl-env-vars.md) the GGML_SYCL_MOE_JOIN_QUEUE row states the
-     mechanism, the guard and fallbacks, and the oneAPI 2026.1 / driver 26.35 caveat.
+     mechanism, the guard and fallbacks, the joinq= field, the atoi parse, and the
+     oneAPI 2026.1 / driver 26.35 caveat.
 
 NOT VACUOUS.  --self-test runs the gate on in-memory mutants of the real sources and
 requires each to FAIL on its own pin, then requires the unmodified tree to pass.
@@ -183,6 +193,10 @@ GET_QUEUE_SIG = r"sycl::queue\s*\*\s*unified_cache::get_moe_join_queue\s*\(\s*\)
 AFTER_SIG = r"sycl::queue\s*\*\s*unified_cache::moe_join_queue_after\s*\([^)]*\)\s*\{"
 RECORD_SIG = r"void\s+unified_cache::note_compute_host_task\s*\([^)]*\)\s*\{"
 DRAIN_SIG = r"bool\s+unified_cache::drain_all_queues_noexcept\s*\(\s*\)\s*noexcept\s*\{"
+SHUTDOWN_SIG = r"\bbool\s+shutdown_unified_cache\s*\(\s*\)\s*\{"
+CENSUS_SIG = r"struct\s+moe_hostpath_wait_census\s*\{"
+COUNT_JOIN_SIG = r"static\s+void\s+moe_hostpath_waits_join\s*\(\s*bool\s+on_join_queue\s*\)\s*\{"
+READBACK_SIG = r"static\s+void\s+moe_hostpath_waits_readback\s*\([^)]*\)\s*\{"
 JOIN_TASK = "cgh.host_task([job, stamps = std::move(stamps)]() { moe_cpu_job_join(job, stamps.get()); });"
 
 
@@ -332,6 +346,8 @@ def check_latch(cache_cpp: str) -> None:
     body, _ = body_of(code, REFUSE_SIG, "L")
     if not re.search(r"!\s*g_moe_join_queue_refused\.exchange\s*\(\s*true", body):
         fail("L", "the join queue's refusal is not a sticky exchange(true)")
+    if not re.search(r"\bstatic\s+" + REFUSE_SIG, code):
+        fail("L", "unified_cache_moe_join_queue_refuse is not file-static")
     for sig, what, last in ((NOTE_SIG, "a host task", r"cache->note_compute_host_task\s*\(\s*e\s*\)"),
                             (FOR_SIG, "a join", r"return\s+cache->moe_join_queue_after\s*\(\s*after\s*,\s*has_after\s*\)")):
         body, _ = body_of(code, sig, "L")
@@ -358,6 +374,8 @@ def check_latch(cache_cpp: str) -> None:
 
 def check_owner(cache_hpp: str, cache_cpp: str) -> None:
     hpp = blank_comments(cache_hpp)
+    if re.search(r"\bunified_cache_moe_join_queue_refuse\b", hpp):
+        fail("L", "unified-cache.hpp declares unified_cache_moe_join_queue_refuse, which only the latch may call")
     if not re.search(r"sycl::queue\s*\*\s*get_moe_join_queue\s*\(\s*\)\s*;", hpp):
         fail("O", "unified_cache declares no get_moe_join_queue()")
     if not re.search(r"std::unique_ptr\s*<\s*sycl::queue\s*>\s+moe_join_queue_\s*;", hpp):
@@ -410,6 +428,44 @@ def check_scatter(backend: str) -> None:
         fail("D", "the empty flush's barrier is submitted even when the joins cannot have left the stream")
 
 
+def check_unload(cache_cpp: str) -> None:
+    code = blank_comments(cache_cpp)
+    body, _ = body_of(code, SHUTDOWN_SIG, "U")
+    clear = re.search(r"g_device_caches\.clear\(\)\s*;", body)
+    owner = re.search(r"g_moe_join_queue_owner\.store\s*\(\s*nullptr\b", body)
+    refused = re.search(r"g_moe_join_queue_refused\.store\s*\(\s*false\b", body)
+    if not clear or not owner or not refused or owner.start() < clear.end() or refused.start() < clear.end():
+        fail("U", "shutdown_unified_cache does not reset the join queue's owner and refusal when it detaches the caches")
+
+
+def check_trace(backend: str) -> None:
+    code = blank_comments(backend)
+    body, _ = body_of(code, CENSUS_SIG, "W")
+    for field in ("joins_join_queue", "joins_stream"):
+        if not re.search(r"\buint64_t\s+" + field + r"\s*=\s*0\s*;", body):
+            fail("W", f"moe_hostpath_wait_census does not hold {field}")
+    body, _ = body_of(code, COUNT_JOIN_SIG, "W")
+    flat = re.sub(r"\s+", " ", body)
+    if not re.search(r"if \(!moe_hostpath_waits_enabled\(\)\) \{ return; \} if \(on_join_queue\) \{ "
+                     r"g_moe_hostpath_waits\.joins_join_queue \+= 1; \} else \{ g_moe_hostpath_waits\.joins_stream \+= 1; \}",
+                     flat):
+        fail("W", "moe_hostpath_waits_join does not count a join by where it went, under the trace only")
+    body, _ = body_of(code, JOIN_ON_QUEUE_SIG, "W")
+    if not re.search(r"moe_hostpath_waits_join\s*\(\s*join_q\s*!=\s*nullptr\s*\)\s*;", body):
+        fail("W", "moe_cpu_job_join_on_queue does not count its join by where it went")
+    body, _ = body_of(code, READBACK_SIG, "W")
+    flat = re.sub(r"\s+", " ", body)
+    m = re.search(r'GGML_LOG_WARN\(\s*((?:"[^"]*"\s*)+)', flat)
+    fmt = "".join(re.findall(r'"([^"]*)"', m.group(1))) if m else ""
+    if not fmt.startswith("[MOE-HOSTPATH-WAITS]") or not fmt.endswith(" joinq=%d\\n"):
+        fail("W", "the [MOE-HOSTPATH-WAITS] line does not end with joinq=")
+    if "const int joinq = w.joins_join_queue > 0 && w.joins_stream == 0 ? 1 : 0;" not in flat or \
+            not re.search(r"rq\.pending_us, joinq\);", flat):
+        fail("W", "joinq= is not 1 exactly when every join of the token went on the join queue")
+    if not re.search(r"w\.joins_join_queue\s*=\s*0;", flat) or not re.search(r"w\.joins_stream\s*=\s*0;", flat):
+        fail("W", "the join counts are not reset with the token's other counts")
+
+
 def check_doc(doc: str) -> None:
     row = None
     for line in doc.splitlines():
@@ -422,6 +478,8 @@ def check_doc(doc: str) -> None:
                          ("sched_yield", "the driver's yield"),
                          ("never queried", "why a host-task predecessor costs nothing"),
                          ("compute stream", "the fallback"),
+                         ("joinq=", "the trace field that shows the join queue in use"),
+                         ("atoi", "how the value is parsed"),
                          ("oneAPI 2026.1", "the oneAPI version it was verified on"),
                          ("26.35", "the driver it was verified on"),
                          ("re-measure", "the re-measure caveat")):
@@ -463,6 +521,8 @@ def check(s: dict) -> None:
     check_latch(s["cache_cpp"])
     check_owner(s["cache_hpp"], s["cache_cpp"])
     check_scatter(s["backend"])
+    check_unload(s["cache_cpp"])
+    check_trace(s["backend"])
     check_doc(s["doc"])
 
 
@@ -545,6 +605,23 @@ def self_test(s: dict) -> int:
         ("D", "backend", "buffers retained until the scatter instead of the join",
          sub(r"retain_handles_until_event\(std::move\(job_buffers\), joins\[k\]\);",
              "retain_handles_until_event(std::move(job_buffers), ws.events.front());")),
+        ("L", "cache_cpp", "refusal exported",
+         sub(r"static void unified_cache_moe_join_queue_refuse\(", "void unified_cache_moe_join_queue_refuse(")),
+        ("L", "cache_hpp", "refusal declared for other callers",
+         sub(r"(void unified_cache_note_host_task\(sycl::queue & q, const sycl::event & e\);\n)",
+             r"\1void unified_cache_moe_join_queue_refuse(const char * why);\n")),
+        ("U", "cache_cpp", "owner kept across shutdown", sub(r"g_moe_join_queue_owner\.store\(nullptr,[^;]*;", ";")),
+        ("U", "cache_cpp", "refusal kept across shutdown", sub(r"g_moe_join_queue_refused\.store\(false,[^;]*;", ";")),
+        ("W", "backend", "line loses joinq", sub(r" joinq=%d", "")),
+        ("W", "backend", "join not counted", sub(r"moe_hostpath_waits_join\(join_q != nullptr\);", ";")),
+        ("W", "backend", "joins counted with the trace off",
+         sub(r"(static void moe_hostpath_waits_join\(bool on_join_queue\) \{\n)\s*if \(!moe_hostpath_waits_enabled\(\)\) \{\n\s*return;\n\s*\}\n",
+             r"\1")),
+        ("W", "backend", "joinq=1 with some joins on the stream", sub(r" && w\.joins_stream == 0 \? 1 : 0;", " ? 1 : 0;")),
+        ("W", "backend", "join counts not reset", sub(r"w\.joins_stream(\s*)= 0;", r"(void) w\1;")),
+        ("C", "doc", "doc row loses joinq",
+         sub(r"(\| `GGML_SYCL_MOE_JOIN_QUEUE[^\n]*?)joinq=1([^\n]*?)joinq=0", r"\1join_q=1\2join_q=0")),
+        ("C", "doc", "doc row loses the parse", sub(r"(\| `GGML_SYCL_MOE_JOIN_QUEUE[^\n]*?)atoi", r"\1a_to_i")),
         ("C", "doc", "doc row missing", sub(r"\| `GGML_SYCL_MOE_JOIN_QUEUE", "| `GGML_SYCL_MOE_JOIN_Q")),
         ("C", "doc", "doc row loses the version caveat",
          sub(r"(\| `GGML_SYCL_MOE_JOIN_QUEUE[^\n]*?)oneAPI 2026\.1", r"\1oneAPI")),

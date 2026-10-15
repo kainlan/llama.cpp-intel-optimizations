@@ -6189,9 +6189,6 @@ sycl::queue * unified_cache_moe_join_queue_for(sycl::queue & stream, sycl::event
 // the backend submits, other than the joins on the join queue, is recorded here.
 void unified_cache_note_host_task(sycl::queue & q, const sycl::event & e);
 
-// Returns the CPU expert joins to the compute streams for the rest of the process, logging `why` once.
-void unified_cache_moe_join_queue_refuse(const char * why);
-
 #if GGML_SYCL_DNNL
 // oneDNN Graph SYCL allocator callbacks (llama.cpp-gwno). Free functions, not
 // unified_cache members: dnnl_graph_sycl_interop_allocator_create() takes only
