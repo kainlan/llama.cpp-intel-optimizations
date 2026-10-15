@@ -30153,11 +30153,11 @@ static void validate_moe_mmid_execution_owners(placement_plan & plan) {
 // llama.cpp-cre6: the host-expert MoE scatter scratch, published per device. One flush places one op's rows, or a
 // decode gate/up pair's when the layer splits gate and up (the sibling slot then flushes both through one copy and
 // one kernel); each expert matrix's row is its ne[1] floats, plus the int32 flag the event-chained decode route
-// stages per row, and that route also uploads the tensor's ne[2]-entry expert pointer table here (llama.cpp-7pvo). Only a tensor whose MUL_MAT_ID takes the host path
-// scatters anything, and only on the device whose layer runs it, so a dense model or an all-VRAM placement plans 0
-// there and nothing is claimed or reported. Whether a tensor takes the host path is the plan's own
-// has_host_experts(), the query the MUL_MAT_ID dispatch asks, which is why this runs after build_index() and not
-// inside populate_host_zone_sizing().
+// stages per row, and that route also uploads the tensor's ne[2]-entry expert pointer table here (llama.cpp-7pvo).
+// Only a tensor whose MUL_MAT_ID takes the host path scatters anything, and only on the device whose layer runs it,
+// so a dense model or an all-VRAM placement plans 0 there and nothing is claimed or reported. Whether a tensor takes
+// the host path is the plan's own has_host_experts(), the query the MUL_MAT_ID dispatch asks, which is why this runs
+// after build_index() and not inside populate_host_zone_sizing().
 static void publish_moe_host_scatter_term(const placement_plan &                     plan,
                                           const std::vector<placement_tensor_info> & tensor_inventory,
                                           int                                        n_experts,
