@@ -214,7 +214,8 @@ def check_env_gate(mem: Source) -> None:
             k -= 1
         head = squash(mem.code[at + max(0, k - 160) : at + k])
         if not re.search(r"if \( ?mem_copy_site_census_enabled\(\) ?\)$", head):
-            raise ContractError(f"E: a census record call is not directly under if (mem_copy_site_census_enabled()): ...{head[-80:]}")
+            raise ContractError(f"E: a census record call is not directly under if (mem_copy_site_census_enabled()): "
+                                f"...{head[-80:]}")
 
     _, _, flush = mem.definition("mem_copy_site_census_flush")
     first = squash(flush[1:]).split(";")[0]
@@ -232,7 +233,8 @@ def check_site(mem: Source, hpp: Source, files: dict[str, str]) -> None:
         raise ContractError(f"S: mem_copy_direct_submit defaults a parameter: {squash(params)}")
     for call in mem.calls(body, "mem_copy_site_census_record"):
         if not FORWARD.search(squash(call[:-1]) + ")"):
-            raise ContractError(f"S: a census record call does not pass the caller's file, line, function: {squash(call)}")
+            raise ContractError(f"S: a census record call does not pass the caller's file, line, function: "
+                                f"{squash(call)}")
 
     subs = mem.definitions("mem_copy_submit")
     if len(subs) != 2:
@@ -331,7 +333,8 @@ def check_print(mem: Source, hpp: Source, backend: Source) -> None:
     tagged = flush.count('"[SYCL-MEMCPY-SITE-CENSUS]')
     to_stderr = len(re.findall(r'std::fprintf\(stderr,\s*"\[SYCL-MEMCPY-SITE-CENSUS\]', flush))
     if tagged < 2 or tagged != to_stderr:
-        raise ContractError(f"P: mem_copy_site_census_flush prints {tagged} tagged lines, {to_stderr} through std::fprintf(stderr")
+        raise ContractError(f"P: mem_copy_site_census_flush prints {tagged} tagged lines, {to_stderr} through "
+                            f"std::fprintf(stderr")
     if re.search(r"\bcatch\b", flush):
         raise ContractError("P: mem_copy_site_census_flush carries a catch (alloc-zone G-CATCH territory)")
     _, _, rec = mem.definition("mem_copy_site_census_record")
@@ -376,7 +379,8 @@ MUTANTS = [
      "    bool enabled = [] {\n        const char * env = std::getenv(\"GGML_SYCL_MEMCPY_SITE_CENSUS\");"),
     ("E2 env renamed", MEMOPS, 'std::getenv("GGML_SYCL_MEMCPY_SITE_CENSUS")', 'std::getenv("GGML_SYCL_MEMCPY_CENSUS")'),
     ("E3 host-host record ungated", MEMOPS,
-     "        if (mem_copy_site_census_enabled()) {\n            mem_copy_site_census_record(profile_name, mem_copy_site_dir::H2H",
+     "        if (mem_copy_site_census_enabled()) "
+     "{\n            mem_copy_site_census_record(profile_name, mem_copy_site_dir::H2H",
      "        {\n            mem_copy_site_census_record(profile_name, mem_copy_site_dir::H2H"),
     ("E4 device record gated on something else", MEMOPS,
      "    if (mem_copy_site_census_enabled()) {\n        const mem_copy_site_dir dir",
@@ -395,18 +399,21 @@ MUTANTS = [
      "    // llama.cpp-dyi3 round 3b"),
     ("S1b direct submit profile-name default re-added", MEMOPS,
      "                                          const char *                     profile_name,\n",
-     "                                          const char *                     profile_name = \"sycl.memcpy.mem_ops\",\n"),
+     "                                          const char *                     profile_name = "
+     "\"sycl.memcpy.mem_ops\",\n"),
     ("S2 record passes its own line", MEMOPS,
      "mem_copy_site_dir::H2H, size, file, line, function);",
      "mem_copy_site_dir::H2H, size, file, __LINE__, function);"),
     ("S3 plain direct submit loses the forward", MEMOPS,
      "    sycl::event event =\n"
-     "        mem_copy_direct_submit(dst, dst_offset, src, src_offset, size, *copy_queue, deps, \"sycl.memcpy.mem_ops\",\n"
+     "        mem_copy_direct_submit(dst, dst_offset, src, src_offset, size, *copy_queue, deps, "
+     "\"sycl.memcpy.mem_ops\",\n"
      "                               \"role=memcpy;path=mem_ops\", \"copy\", file, line, function);",
      "    sycl::event event = mem_copy_direct_submit(dst, dst_offset, src, src_offset, size, *copy_queue, deps);"),
     ("S4 staged h2d chunk loses the forward", MEMOPS,
      "            event =\n"
-     "                mem_copy_direct_submit(dst, dst_offset + copied, stage, 0, cur, *copy_queue, {}, \"sycl.memcpy.mem_ops\",\n"
+     "                mem_copy_direct_submit(dst, dst_offset + copied, stage, 0, cur, *copy_queue, {}, "
+     "\"sycl.memcpy.mem_ops\",\n"
      "                                       \"role=memcpy;path=mem_ops\", \"copy\", file, line, function);",
      "            event = mem_copy_direct_submit(dst, dst_offset + copied, stage, 0, cur, *copy_queue, {});"),
     ("S5 public mem_copy_async stops forwarding", MEMOPS,
@@ -414,10 +421,12 @@ MUTANTS = [
      "    return mem_copy_submit(dst, src, size, queue, deps, true, __FILE__, __LINE__, __func__);"),
     ("S6 header default dropped on mem_copy", MEMOPS_HPP,
      "              const mem_handle &               src,\n              size_t                           size,\n"
-     "              sycl::queue &                    queue,\n              const std::vector<sycl::event> & deps     = {},\n"
+     "              sycl::queue &                    queue,\n              const std::vector<sycl::event> & deps     "
+     "= {},\n"
      "              const char *                     file     = __builtin_FILE(),",
      "              const mem_handle &               src,\n              size_t                           size,\n"
-     "              sycl::queue &                    queue,\n              const std::vector<sycl::event> & deps     = {},\n"
+     "              sycl::queue &                    queue,\n              const std::vector<sycl::event> & deps     "
+     "= {},\n"
      "              const char *                     file     = \"\","),
     ("S7 graph-safe memcpy stops forwarding", COMMON_HPP,
      "ggml_sycl::mem_copy_async(dst_handle, src_handle, nbytes, q, {}, file, line, function));",
@@ -464,9 +473,11 @@ MUTANTS = [
 # (name, file, old, new): harmless edits each must leave run() passing.
 PROBES = [
     ("a comment between the env check and the host-host record", MEMOPS,
-     "        if (mem_copy_site_census_enabled()) {\n            mem_copy_site_census_record(profile_name, mem_copy_site_dir::H2H",
+     "        if (mem_copy_site_census_enabled()) "
+     "{\n            mem_copy_site_census_record(profile_name, mem_copy_site_dir::H2H",
      "        // a comment (with braces { }) that the gate must ignore\n"
-     "        if (mem_copy_site_census_enabled()) {\n            mem_copy_site_census_record(profile_name, mem_copy_site_dir::H2H"),
+     "        if (mem_copy_site_census_enabled()) "
+     "{\n            mem_copy_site_census_record(profile_name, mem_copy_site_dir::H2H"),
 ]
 
 
