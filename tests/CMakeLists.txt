@@ -874,6 +874,12 @@ if (Python3_Interpreter_FOUND)
     # The self-test re-scans the whole backend, callees included, for each of 47 mutants (~27 s at load 4-10).
     set_tests_properties(test-sycl-moe-hostpath-no-host-wait-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
+    # TOP_K runs on the device for every k <= ncols: one shape selector decides the
+    # kernel for supports_op and dispatch alike (llama.cpp-1b6u). WITH --self-test.
+    add_test(NAME test-sycl-topk-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-topk-source.py --self-test)
+    set_tests_properties(test-sycl-topk-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
     # A hybrid MXFP4 xmx_tiled expert must be decoded by a kernel that reads
     # xmx_tiled: the grouped executor accepts partial cover, and the per-expert
     # direct path refuses layouts it cannot decode (llama.cpp-4hg7). WITH --self-test.
