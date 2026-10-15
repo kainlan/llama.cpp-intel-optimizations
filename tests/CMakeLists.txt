@@ -855,13 +855,14 @@ if (Python3_Interpreter_FOUND)
     set_tests_properties(test-sycl-cpu-row-workers-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
     # Every CPU expert pool job stamp is taken inside a trace guard, the trace line
-    # carries the five per-token sums, and =2 is the only per-job printer
+    # carries the six per-token sums, and =2 is the only per-job printer
     # (llama.cpp-j6jf). Run WITH --self-test so each pin is proven to catch its mutant.
     add_test(NAME test-sycl-cpu-expert-pool-stamps-source
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-stamps-source.py --self-test)
+    # TIMEOUT: the 24-mutant self-test took 29.5 s wall at host load 43.
     set_tests_properties(test-sycl-cpu-expert-pool-stamps-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 30)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # Host MoE experts must read the activation row of their own slot, not row 0
     # (llama.cpp-4hg7: GPT-OSS down-projection decode garbage under host-tiered
     # experts). Run WITH --self-test so each anchor is proven load-bearing.
