@@ -76606,12 +76606,14 @@ static bool ggml_sycl_moe_validate_retained_role_bundle(const ggml_sycl::moe_ret
 // llama.cpp-7pvo: one expert tensor's route on one device for ggml_sycl_moe_hybrid_decode_event_chained(). Built
 // once per (replan epoch, expert storage generation, selected rows) stamp. It holds every expert's lease, so the
 // device pointers in `table` and the views in `host_weight` stay valid while it lives; a replaced record keeps its
-// handles until the queue passes the replacement (ggml_sycl_moe_hybrid_decode_record_current).
+// handles until the queue passes the replacement (ggml_sycl_moe_hybrid_decode_record_current). An all-host record
+// has no device expert, so no layout of its own, no table and no device kernel.
 struct moe_hybrid_decode_record {
     layout_mode                        layout      = GGML_LAYOUT_AOS;  // the device experts' materialized layout
     size_t                             n_as        = 0;
     int                                layer       = -1;               // blk.N, for the wait census
     int                                cache_layer = -1;  // moe_cache_layer_id(), for the expert observations
+    bool                               all_host    = false;
     ggml_sycl::mem_handle              table;             // host-pinned: n_as device weight pointers, by expert id
     std::vector<const void *>          host_weight;       // expert e's host weight, nullptr for a device expert
     std::vector<ggml_sycl::mem_handle> lease;             // every expert's route lease
@@ -76619,38 +76621,78 @@ struct moe_hybrid_decode_record {
     bool                               has_ready = false;
 };
 
-// Builds the record of src0 on ctx.device (llama.cpp-7pvo). The device experts' layout is the one the first expert
-// with a readable on-device record is materialized in, what the unified cache loaded and not a policy's pick, and
-// every device expert must resolve in it. Each expert's executor is the retained decode route's choice for it
-// (choose_moe_batch_executor over the same resolved batch), so the record and that route place every expert alike.
-// A host expert's table slot names the first device expert: the device kernel computes a row for every slot, and
-// the CPU job's flagged rows replace the host slots' rows. Refuses, and the retained route keeps the tensor, when
-// there is no host expert, no device expert, an expert planned on another device, or more than one routable card.
+// The record's table (llama.cpp-7pvo): host-pinned, n_as device weight pointers by expert id, copied to the planned
+// scratch per op. Owner-first, so the record's handle is the allocation's only owner from the start.
+static bool ggml_sycl_moe_hybrid_decode_table_allocate(sycl::queue &           queue,
+                                                       int                     device,
+                                                       size_t                  bytes,
+                                                       ggml_sycl::mem_handle * out) {
+    ggml_sycl::alloc_request req{};
+    req.queue                               = &queue;
+    req.device                              = device;
+    req.size                                = bytes;
+    req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
+    req.intent.category                     = ggml_sycl::runtime_category::EXPERT_CACHE;
+    req.intent.cohort_id                    = "moe_hybrid_decode_table";
+    req.intent.constraints.must_host_pinned = true;
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
+        return false;
+    }
+    ggml_sycl::mem_handle table = ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const ggml_sycl::resolved_ptr view = table.resolve(device);
+    if (!view.ptr || view.on_device) {
+        return false;
+    }
+    *out = std::move(table);
+    return true;
+}
+
+// Builds the record of src0 on ctx.device (llama.cpp-7pvo). Each expert's executor is the retained decode route's
+// choice for it (choose_moe_batch_executor over the same resolved batch), so the record and that route place every
+// expert alike. Two shapes:
+//  - split: the device experts' layout is the one the first expert with a readable on-device record is materialized
+//    in, what the unified cache loaded and not a policy's pick, and every device expert must resolve in it. A host
+//    expert's table slot names the first device expert: the device kernel computes a row for every slot, and the CPU
+//    job's flagged rows replace the host slots' rows.
+//  - all-host, when the plan puts none of the tensor's experts on a device: no table and no device kernel; every slot
+//    is a host slot, and the flagged scatter writes every row. The placement fills MoE layers in order, so most
+//    host-expert layers have this shape.
+// Refuses, and the retained route keeps the tensor, when there is no host expert, a device expert with no readable
+// layout, an expert planned on another device, or more than one routable card.
 static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_build(
     ggml_backend_sycl_context &                       ctx,
     const ggml_tensor *                               src0,
-    std::shared_ptr<const moe_hybrid_decode_record> * out) {
+    std::shared_ptr<const moe_hybrid_decode_record> * out,
+    const char **                                     reason) {
+    // Each refusal names its reason, for the caller's once-per-stamp line.
+    const auto refuse = [reason](const char * why) {
+        *reason = why;
+        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+    };
     const int     device = ctx.device;
     const auto *  extra  = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     const int64_t n_as   = src0->ne[2];
     if (n_as <= 0 || ggml_sycl_get_tensor_usage(src0) != tensor_usage::MOE_EXPERT_WEIGHT ||
         ggml_sycl_routable_device_count() != 1) {
-        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+        return refuse("not an expert weight tensor, or more than one routable card");
     }
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
     const auto                 plan  = ggml_sycl_cache_plan_owner(cache);
     if (!plan->has_host_experts(src0->name, n_as, device)) {
-        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+        return refuse("the plan puts no expert of it on the host");
     }
     const ggml_sycl::expert_residency_counts counts = plan->count_planned_experts(src0->name, n_as, device);
     if (counts.on_device > counts.on_target) {
-        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+        return refuse("the plan puts an expert on another device");
     }
+    const bool all_host = counts.on_device == 0;
 
+    // The device experts' layout; an all-host tensor has none to look up.
     std::vector<int> layouts;
     std::vector<int> readable;
     int              materialized = -1;
-    for (int64_t e = 0; e < n_as && materialized < 0; ++e) {
+    for (int64_t e = 0; !all_host && e < n_as && materialized < 0; ++e) {
         layouts.clear();
         readable.clear();
         extra->moe_storage_layouts_on_device(static_cast<int>(e), device, layouts);
@@ -76664,14 +76706,16 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
         }
         int layout = 0;
         if (!ggml_sycl::moe_decode_direct_layout_from_materialized(readable, &layout)) {
-            return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+            return refuse("a device expert holds more than one layout the batched kernel reads");
         }
         materialized = layout;
     }
-    if (materialized < 0) {
-        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+    if (!all_host && materialized < 0) {
+        return refuse("no device expert is materialized in a layout the batched kernel reads");
     }
-    const layout_mode layout = static_cast<layout_mode>(materialized);
+    // A host-planned expert resolves in AOS whatever layout is requested (ggml_sycl_moe_resolve_layouts), and AOS is
+    // what the CPU job reads, so an all-host record requests it.
+    const layout_mode layout = all_host ? GGML_LAYOUT_AOS : static_cast<layout_mode>(materialized);
 
     std::vector<int32_t> all_experts(static_cast<size_t>(n_as));
     for (int64_t e = 0; e < n_as; ++e) {
@@ -76689,6 +76733,7 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
     record->n_as        = static_cast<size_t>(n_as);
     record->layer       = parse_layer_id_from_name(src0->name);
     record->cache_layer = moe_cache_layer_id(src0->name);
+    record->all_host    = all_host;
     record->host_weight.assign(record->n_as, nullptr);
     record->lease.resize(record->n_as);
     std::vector<const void *> device_weight(record->n_as, nullptr);
@@ -76697,19 +76742,21 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
     for (size_t e = 0; e < record->n_as; ++e) {
         const ggml_sycl::moe_resolved_operand & operand = resolved.batch.operands[e];
         if (operand.expert_id != static_cast<int32_t>(e)) {
-            return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+            return refuse("the resolved batch is not in expert order");
         }
         const bool queue_available = operand.residency() != ggml_sycl::moe_batch_residency::SECONDARY_DEVICE;
         const ggml_sycl::moe_batch_executor_choice choice = ggml_sycl::choose_moe_batch_executor(
             operand, device, queue_available, operand.recipe().workspace.total_bytes);
         if (!choice) {
-            return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+            return refuse("an expert has no executor");
         }
         if (choice.executor == ggml_sycl::moe_batch_executor::PRIMARY_DEVICE) {
+            // An all-host record has no table slot for a device expert, and its plan said there is none.
             const ggml_sycl::resolved_ptr view = operand.lease().resolve(device);
-            if (operand.owning_device() != device || operand.actual_layout() != layout || !view.ptr ||
+            if (all_host || operand.owning_device() != device || operand.actual_layout() != layout || !view.ptr ||
                 !view.on_device || view.layout != layout || view.retention) {
-                return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+                return refuse(all_host ? "the plan puts no expert on a device, yet one resolves there" :
+                                         "a device expert does not resolve on this device in the record's layout");
             }
             device_weight[e] = view.ptr;
             substitute       = substitute ? substitute : view.ptr;
@@ -76719,14 +76766,14 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
         } else if (choice.executor == ggml_sycl::moe_batch_executor::HOST_CPU) {
             const ggml_sycl::resolved_ptr view = operand.lease().resolve(ggml_sycl::mem_handle::HOST_DEVICE);
             if (!view.ptr || view.on_device || view.retention) {
-                return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+                return refuse("a host expert has no plain host view");
             }
             record->host_weight[e] = view.ptr;
             if (view.has_ready_event) {
                 ready.push_back(view.ready_event);
             }
         } else {
-            return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+            return refuse("an expert runs on neither this device nor the CPU");
         }
         if (operand.has_ready_event()) {
             ready.push_back(operand.ready_event());
@@ -76735,32 +76782,34 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
     }
     const bool any_host = std::find_if(record->host_weight.begin(), record->host_weight.end(),
                                        [](const void * w) { return w != nullptr; }) != record->host_weight.end();
-    if (!substitute || !any_host) {
-        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;
+    if ((!all_host && !substitute) || !any_host) {
+        return refuse(any_host ? "no device expert pointer stands in for the host slots" : "no expert runs on the CPU");
     }
 
     sycl::queue & queue = *ctx.stream();
-    if (!allocate_managed_host_pinned(queue, device, record->n_as * sizeof(const void *),
-                                      ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::EXPERT_CACHE,
-                                      "moe_hybrid_decode_table", &record->table)) {
-        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY;
-    }
-    const void ** table = static_cast<const void **>(record->table.resolve().ptr);
-    if (!table) {
-        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY;
-    }
-    for (size_t e = 0; e < record->n_as; ++e) {
-        table[e] = device_weight[e] ? device_weight[e] : substitute;
+    if (!all_host) {
+        if (!ggml_sycl_moe_hybrid_decode_table_allocate(queue, device, record->n_as * sizeof(const void *),
+                                                        &record->table)) {
+            return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY;
+        }
+        const void ** table = static_cast<const void **>(record->table.resolve().ptr);
+        if (!table) {
+            return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY;
+        }
+        for (size_t e = 0; e < record->n_as; ++e) {
+            table[e] = device_weight[e] ? device_weight[e] : substitute;
+        }
     }
     if (!ready.empty()) {
         record->ready     = queue.ext_oneapi_submit_barrier(ready);
         record->has_ready = true;
     }
     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
-        GGML_LOG_INFO("[MOE-ROUTE] hybrid decode record tensor=%s device=%d layout=%s experts=%zu host=%zu\n",
-                      src0->name, device, ggml_sycl_layout_mode_name(layout), record->n_as,
-                      static_cast<size_t>(std::count_if(record->host_weight.begin(), record->host_weight.end(),
-                                                        [](const void * w) { return w != nullptr; })));
+        GGML_LOG_INFO(
+            "[MOE-ROUTE] hybrid decode record tensor=%s device=%d all_host=%d layout=%s experts=%zu host=%zu\n",
+            src0->name, device, all_host ? 1 : 0, ggml_sycl_layout_mode_name(layout), record->n_as,
+            static_cast<size_t>(std::count_if(record->host_weight.begin(), record->host_weight.end(),
+                                              [](const void * w) { return w != nullptr; })));
     }
     *out = std::move(record);
     return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE;
@@ -76789,7 +76838,16 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
     }
 
     std::shared_ptr<const moe_hybrid_decode_record> built;
-    const ggml_sycl::moe_decode_direct_outcome outcome = ggml_sycl_moe_hybrid_decode_record_build(ctx, src0, &built);
+    const char *                                    refusal = "unnamed";
+    const ggml_sycl::moe_decode_direct_outcome      outcome =
+        ggml_sycl_moe_hybrid_decode_record_build(ctx, src0, &built, &refusal);
+    if (outcome == ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED) {
+        // A refusal is cached under the stamp, so this prints once per stamp and never on a steady decode op.
+        GGML_LOG_INFO(
+            "[MOE-ROUTE] hybrid decode tensor=%s device=%d refused: %s; the retained route keeps it, with its "
+            "expert-id readback, until the plan or expert storage changes\n",
+            src0->name, device, refusal);
+    }
     const ggml_sycl::moe_decode_direct_outcome settled = ggml_sycl::moe_decode_direct_stamp_settle(
         stamp, replan_epoch, storage_generation, selected_rows, built ? static_cast<int>(built->layout) : 0, outcome);
     if (settled != outcome) {
@@ -76802,7 +76860,9 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
     if (held) {
         // The replaced record's table and device leases may back a table copy or kernel still on the queue.
         std::vector<ggml_sycl::mem_handle> handles = held->lease;
-        handles.push_back(held->table);
+        if (held->table.valid()) {
+            handles.push_back(held->table);
+        }
         ggml_sycl::retain_handles_until_event(std::move(handles), ctx.stream()->ext_oneapi_submit_barrier());
     }
     if (settled == ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE) {
@@ -76816,11 +76876,12 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
 
 // llama.cpp-7pvo: the event-chained hybrid decode route, ahead of the retained route's expert-id readback.
 //
-// A batch-1 decode op whose experts the placement splits between this device and the host used to read its expert
-// ids back on the submitting thread (the B1 wait, ~0.36 ms per layer on Qwen3.8), because the host partitioned the
-// slots before it could submit either half. Here nothing partitions on the host:
-//  - the device kernel reads the device ids tensor and the record's table, indexed by expert id, whose host experts'
-//    slots name a device expert; it computes a row for every slot, and the host slots' rows are placeholders;
+// A batch-1 decode op with host experts, split between this device and the host or all on the host, used to read
+// its expert ids back on the submitting thread (the B1 wait, ~0.36 ms per layer on Qwen3.8), because the host
+// partitioned the slots before it could submit either half. Here nothing partitions on the host:
+//  - for a split record, the device kernel reads the device ids tensor and the record's table, indexed by expert id,
+//    whose host experts' slots name a device expert; it computes a row for every slot, and the host slots' rows are
+//    placeholders. An all-host record has no table and runs no device kernel: every slot is a host slot;
 //  - the ids are copied asynchronously into the CPU job's pool entries; the job's prologue waits for that copy on
 //    the pool worker, then the job picks its host slots from the ids, computes them, and overwrites each slot's id
 //    with a flag, 1 for a host slot (moe_host_slots_from_ids);
@@ -76829,9 +76890,10 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
 // What stays inherent: layer L+1 consumes layer L's scattered MoE output, so the first consumer's flush orders the
 // GPU after this op's CPU job, as on the retained route. Until then the GPU runs this op's device kernel, the
 // layer's other MoE ops and the attention ahead of that consumer, and the submitting thread never stops for the ids.
-// Graph record/replay (llama.cpp-7pm2): refused while recording (moe_decode_direct_request_admissible), and the op
-// keeps graph capture off for its graph (moe_graphs_disabled_once), as the retained hybrid block does; a segmented
-// replay flushes every slot its segment reads before recording it.
+// Graph record/replay (llama.cpp-7pm2): refused while any thread records and on a queue that is not in order, the
+// two cases the flagged scatter aborts on (moe_host_scatter_submit_flagged), and the op keeps graph capture off for
+// its graph (moe_graphs_disabled_once), as the retained hybrid block does; a segmented replay flushes every slot its
+// segment reads before recording it.
 // Placement is unchanged: device experts run on this device from their materialized layout and host experts on the
 // CPU from host memory. No weight is streamed and the GPU reads no host memory; the table is copied to the device.
 // Pool entries: the job writes its entries (host rows, flags) only after its ids copy completed, and that copy is
@@ -76858,7 +76920,7 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     request.src1_tokens     = src1->ne[2];
     request.ids_tokens      = ids->ne[1];
     request.ids_selected    = ids->ne[0];
-    request.graph_recording = g_ggml_sycl_graph_recording;
+    request.graph_recording = ggml_sycl_graph_recording_active();
     request.layout_override = ggml_sycl_layout_override_active(override_layout);
     request.dedicated_decode_route =
         src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_NVFP4;
@@ -76870,7 +76932,8 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     // n_ids <= 32: the expert observations take at most 32 ids per op, as the retained route records them.
     if (!ggml_sycl::moe_decode_direct_request_admissible(request) || src1->type != GGML_TYPE_F32 ||
         dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) || n_ids > 32 ||
-        n_as <= 0 || ne11 <= 0 || dst->ne[1] != n_ids || ggml_backend_buffer_is_sycl_split(src0->buffer)) {
+        n_as <= 0 || ne11 <= 0 || dst->ne[1] != n_ids || ggml_backend_buffer_is_sycl_split(src0->buffer) ||
+        !ctx.stream()->has_property<sycl::property::queue::in_order>()) {
         return false;
     }
     // Modes in which the retained route does more per op than this route reproduces.
@@ -76888,7 +76951,7 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     auto &       pool        = g_pinned_buffer_pools[device];
     auto &       cpu_pool    = g_cpu_expert_pools[device];
     const size_t row_bytes   = static_cast<size_t>(N) * sizeof(float);
-    const size_t table_bytes = record->n_as * sizeof(const void *);
+    const size_t table_bytes = record->all_host ? 0 : record->n_as * sizeof(const void *);
     const size_t ids_bytes   = static_cast<size_t>(n_ids) * sizeof(int32_t);
     if (!pool.can_serve(static_cast<size_t>(n_ids)) || !pool.has_ids() || !cpu_pool.is_active() ||
         ctx.moe_host_scatter_scratch.capacity(device) <
@@ -77035,30 +77098,35 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
         }
     }
 
-    // The ids, into this op's pool entries, and the table, into the planned scratch; neither is waited here.
+    // The ids, into this op's pool entries; not waited here.
     const sycl::event ids_d2h = ggml_sycl::mem_copy_async(
         pool.ids_handle(), first * sizeof(int32_t), ids_storage.handle, ids_storage.view_offset, ids_bytes, *stream);
-    const sycl::event table_h2d = ggml_sycl::mem_copy_async(scratch, 0, record->table, 0, table_bytes, *stream);
 
-    std::vector<sycl::event> kernel_deps{ table_h2d };
-    if (record->has_ready) {
-        kernel_deps.push_back(record->ready);
-    }
-    if (!mmvq_moe_batched_dispatch(ctx, src0, src1, dst, static_cast<const void * const *>(scratch_dev.ptr), nullptr,
-                                   nullptr, nullptr, static_cast<int>(n_ids), static_cast<int>(n_as), n_ids,
-                                   record->layout, ids_dev, ids->nb[0], ids->nb[1], nullptr, 0, nullptr, nullptr,
-                                   &kernel_deps)) {
-        // Nothing above changes what the retained route computes: the copies land in this op's own pool entries,
-        // the staging record names what the staging now holds, and the flushes and the kept job are what that
-        // route would do on entry.
-        static std::atomic<int> declined_log{ 0 };
-        if (declined_log.fetch_add(1, std::memory_order_relaxed) < 8) {
-            GGML_LOG_WARN(
-                "[MOE-ROUTE] hybrid decode tensor=%s device=%d layout=%s: the batched device kernel declined; this op "
-                "takes the retained route, with its expert-id readback (llama.cpp-7pvo)\n",
-                src0->name, device, ggml_sycl_layout_mode_name(record->layout));
+    // A split record's device half: the table, into the planned scratch, and the device kernel over every slot.
+    if (!record->all_host) {
+        const sycl::event table_h2d = ggml_sycl::mem_copy_async(scratch, 0, record->table, 0, table_bytes, *stream);
+
+        std::vector<sycl::event> kernel_deps{ table_h2d };
+        if (record->has_ready) {
+            kernel_deps.push_back(record->ready);
         }
-        return false;
+        if (!mmvq_moe_batched_dispatch(ctx, src0, src1, dst, static_cast<const void * const *>(scratch_dev.ptr),
+                                       nullptr, nullptr, nullptr, static_cast<int>(n_ids), static_cast<int>(n_as),
+                                       n_ids, record->layout, ids_dev, ids->nb[0], ids->nb[1], nullptr, 0, nullptr,
+                                       nullptr, &kernel_deps)) {
+            // The retained route still computes the same result. The copies land in this op's own pool entries, and
+            // the staging record names what the staging now holds. The flushes are what that route does on entry.
+            // The kept job is not, but that route's entry flush places it, since the sibling slot is occupied. The
+            // pool span reserved here goes unused until the ring wraps.
+            static std::atomic<int> declined_log{ 0 };
+            if (declined_log.fetch_add(1, std::memory_order_relaxed) < 8) {
+                GGML_LOG_WARN(
+                    "[MOE-ROUTE] hybrid decode tensor=%s device=%d layout=%s: the batched device kernel declined; "
+                    "this op takes the retained route, with its expert-id readback (llama.cpp-7pvo)\n",
+                    src0->name, device, ggml_sycl_layout_mode_name(record->layout));
+            }
+            return false;
+        }
     }
     moe_hostpath_waits_readback(record->layer, /*async=*/true);
 
@@ -77098,8 +77166,8 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
         if (!ggml_sycl::moe_host_slots_from_ids(ids_rows, static_cast<size_t>(n_ids), record->host_weight.data(),
                                                 record->n_as, ids_rows, host_slots)) {
             GGML_ABORT(
-                "[CPU-TG] hybrid decode route read an expert id outside [0, %zu); the device kernel read the "
-                "table there too (llama.cpp-7pvo)",
+                "[CPU-TG] hybrid decode route read an expert id outside [0, %zu); that slot has no expert to "
+                "compute its row (llama.cpp-7pvo)",
                 record->n_as);
         }
         if (stats) {
@@ -79422,8 +79490,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     };
     pp_phase_log("planner-entry", GGML_LAYOUT_AOS);
 
-    // llama.cpp-7pvo: a decode op whose experts split between this device and the host reads no expert ids on
-    // this thread when the event-chained route takes it.
+    // llama.cpp-7pvo: a decode op with host experts, split with this device or all on the host, reads no expert ids
+    // on this thread when the event-chained route takes it.
     if (ggml_sycl_moe_hybrid_decode_event_chained(ctx, src0, src1, dst)) {
         return;
     }

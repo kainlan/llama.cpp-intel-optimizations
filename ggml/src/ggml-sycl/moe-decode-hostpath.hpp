@@ -477,7 +477,8 @@ struct moe_host_slot {
 // as the host slots in slot order, each with its expert. flags may be ids
 // itself: each id is read before its flag is written. Returns false when an id
 // lies outside [0, n_as); that slot is flagged 0 and listed nowhere, and the
-// caller must stop, since the device kernel read the table at that id too.
+// caller must stop: no expert computes that slot's row, and when the record
+// has a device half its kernel read the table at that id too.
 inline bool moe_host_slots_from_ids(const int32_t *              ids,
                                     size_t                       n_ids,
                                     const void * const *         host_weight,
