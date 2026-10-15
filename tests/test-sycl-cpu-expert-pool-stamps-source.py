@@ -20,8 +20,11 @@ THE CONTRACT.  With comments blanked:
      inside `if (moe_hostpath_waits_enabled())`; and (cpu-expert-pool.cpp) that
      function writes t_inputs_ready_ns only through the worker's current-job pointer,
      inside an `if` on that pointer.
-  K. (cpu-dispatch.cpp ggml_sycl_cpu_expert_mul_mat_batched) t_compute_start_ns and
-     t_compute_end_ns are written inside `if (trace)`, from the same stamps as compute_us.
+  K. (cpu-dispatch.cpp) t_compute_start_ns and t_compute_end_ns are written inside
+     `if (trace)`, from the same stamps as compute_us, in the one definition of the
+     batched row loop that times Phase 2. Since the row-worker set, the two public
+     ggml_sycl_cpu_expert_mul_mat_batched overloads forward to cpu_expert_mul_mat_batched_run,
+     so the pin finds the body by what it does, not by the first matching name.
   J. (ggml-sycl.cpp moe_cpu_job_join) the join reads the clock only inside `if (stamps)`,
      once before job.get() and once after, hands both to
      cpu_expert_pool_trace_note_join_stamps, and never reads the shared
@@ -125,6 +128,15 @@ def body_of(code: str, signature: str, pin: str) -> tuple[str, int]:
     m = re.search(signature, code)
     if not m:
         fail(pin, f"no definition matching {signature!r}")
+    return body_at(code, m, signature, pin)
+
+
+def bodies_of(code: str, signature: str, pin: str) -> list[tuple[str, int]]:
+    """The body and offset of every definition matching `signature`."""
+    return [body_at(code, m, signature, pin) for m in re.finditer(signature, code)]
+
+
+def body_at(code: str, m: re.Match, signature: str, pin: str) -> tuple[str, int]:
     i = code.index("{", m.end() - 1)
     depth = 0
     flat = strip_strings(code)
@@ -166,7 +178,8 @@ def guarded(code: str, pos: int, guard: str) -> bool:
 SUBMIT_SIG = r"std::future<void>\s+CpuExpertPool::submit_batch\s*\([^{]*\)\s*\{"
 STAMP_INPUTS_SIG = r"void\s+cpu_expert_pool_trace_stamp_inputs_ready\s*\(\s*\)\s*\{"
 WAIT_INPUTS_SIG = r"static\s+void\s+moe_cpu_job_wait_inputs\s*\([^)]*\)\s*\{"
-BATCHED_SIG = r"void\s+ggml_sycl_cpu_expert_mul_mat_batched\s*\([^)]*\)\s*\{"
+# Either public overload or the static row loop they forward to.
+BATCHED_SIG = r"void\s+(?:ggml_sycl_cpu_expert_mul_mat_batched|cpu_expert_mul_mat_batched_run)\s*\([^)]*\)\s*\{"
 JOIN_SIG = r"static\s+void\s+moe_cpu_job_join\s*\([^)]*\)\s*noexcept\s*\{"
 JOIN_ON_QUEUE_SIG = r"static\s+sycl::event\s+moe_cpu_job_join_on_queue\s*\([^)]*\)\s*\{"
 
@@ -214,14 +227,17 @@ def check_inputs(pool: str, backend: str) -> None:
 
 def check_compute(dispatch: str) -> None:
     code = blank_comments(dispatch)
-    body, off = body_of(code, BATCHED_SIG, "K")
+    timed = [(b, o) for b, o in bodies_of(code, BATCHED_SIG, "K") if re.search(r"\bcompute_us\s*=", b)]
+    if len(timed) != 1:
+        fail("K", f"{len(timed)} definitions of the batched row loop time Phase 2 (`compute_us =`); want exactly one")
+    body, off = timed[0]
     for name in ("t_compute_start_ns", "t_compute_end_ns"):
         hits = list(re.finditer(r"\b" + name + r"\s*=", body))
         if not hits:
-            fail("K", f"ggml_sycl_cpu_expert_mul_mat_batched does not stamp {name}")
+            fail("K", f"the batched row loop does not stamp {name}")
         for m in hits:
             if not guarded(code, off + m.start(), TRACE_GUARD):
-                fail("K", f"ggml_sycl_cpu_expert_mul_mat_batched stamps {name} outside `if (trace)`")
+                fail("K", f"the batched row loop stamps {name} outside `if (trace)`")
 
 
 def check_join(backend: str) -> None:
@@ -367,6 +383,7 @@ def self_test(s: dict) -> int:
              r"{\n\1g_pool_current_job->t_inputs_ready_ns")),
         ("K", "dispatch", "compute start not stamped",
          sub(r"\.t_compute_start_ns(\s*)=", r".t_compute_first_ns\1=")),
+        ("K", "dispatch", "row loop stops timing Phase 2", sub(r"\.compute_us(\s*)=", r".kernel_us\1=")),
         ("K", "dispatch", "compute end stamped untraced",
          sub(r"(\n(\s*)if \(trace\) \{\n)((?:(?!\n\2\}).)*?)"
              r"(\n\s*g_cpu_expert_batched_last\.t_compute_end_ns\s*=[^;]*;)",

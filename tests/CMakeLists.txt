@@ -860,7 +860,7 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-sycl-cpu-expert-pool-stamps-source
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-stamps-source.py --self-test)
-    # TIMEOUT: the 24-mutant self-test took 29.5 s wall at host load 43.
+    # TIMEOUT: its mutant self-test took 29.5 s wall at host load 43, against the old 30 s.
     set_tests_properties(test-sycl-cpu-expert-pool-stamps-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # Host MoE experts must read the activation row of their own slot, not row 0
