@@ -879,6 +879,14 @@ if (Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-chain-same-queue-source.py --self-test)
     set_tests_properties(test-sycl-chain-same-queue-source PROPERTIES
         LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # Every synchronous wait mem_copy_submit makes is counted by kind and by the copy's caller under the MoE trace,
+    # and the [MOE-HOSTPATH-WAITS] line prints the census (llama.cpp-qwn5). Run WITH --self-test so each pin is
+    # proven to catch its mutant.
+    add_test(NAME test-sycl-mem-ops-staged-wait-census-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mem-ops-staged-wait-census-source.py --self-test)
+    set_tests_properties(test-sycl-mem-ops-staged-wait-census-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
     # Host MoE experts must read the activation row of their own slot, not row 0
     # (llama.cpp-4hg7: GPT-OSS down-projection decode garbage under host-tiered
     # experts). Run WITH --self-test so each anchor is proven load-bearing.

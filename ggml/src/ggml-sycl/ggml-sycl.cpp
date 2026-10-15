@@ -24230,14 +24230,20 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
         if (other_at == 0) {
             snprintf(other_sites, sizeof(other_sites), "none");
         }
+        // The synchronous waits mem_copy_submit made on this thread, by kind and by the copy's caller, and the copies
+        // that took a staged branch (llama.cpp-qwn5).
+        ggml_sycl::mem_copy_staged_wait_census & sw = ggml_sycl::mem_copy_staged_wait_census_this_thread();
+        ggml_sycl::mem_copy_staged_wait_text     st;
+        ggml_sycl::mem_copy_staged_wait_census_format(sw, st);
         // joinq=1 when every CPU expert job join of the token went on the join-only queue.
         const int joinq = w.joins_join_queue > 0 && w.joins_stream == 0 ? 1 : 0;
         GGML_LOG_WARN(
             "[MOE-HOSTPATH-WAITS] token=%llu readbacks=%d async=%d%s total=%llu/%.0fus ready_queries=%llu "
-            "ready_skipped=%llu ready_queries_other=%s ready_query_us=%.0f joinq=%d\n",
+            "ready_skipped=%llu ready_queries_other=%s ready_query_us=%.0f staged_copies=%s staged_waits=%s "
+            "staged_sites=%s joinq=%d\n",
             (unsigned long long) w.token, w.readbacks, w.readbacks_async, line, (unsigned long long) total_n, total_us,
             (unsigned long long) w.ready_queries, (unsigned long long) w.ready_skipped, other_sites, rq.pending_us,
-            joinq);
+            st.copies, st.waits, st.sites, joinq);
         // The same token's CpuExpertPool jobs (llama.cpp-b2jc): how many, and where each
         // job's time went between its submit and its result.
         ggml_sycl::cpu_expert_pool_trace_totals pt;
@@ -24280,6 +24286,7 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
         w.joins_join_queue = 0;
         w.joins_stream     = 0;
         rq                 = ggml_sycl_ready_query_census{};
+        sw                 = ggml_sycl::mem_copy_staged_wait_census{};
         ++w.token;
     }
     w.last_layer = layer;

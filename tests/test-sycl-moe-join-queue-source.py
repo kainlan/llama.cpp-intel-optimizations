@@ -460,7 +460,7 @@ def check_trace(backend: str) -> None:
     if not fmt.startswith("[MOE-HOSTPATH-WAITS]") or not fmt.endswith(" joinq=%d\\n"):
         fail("W", "the [MOE-HOSTPATH-WAITS] line does not end with joinq=")
     if "const int joinq = w.joins_join_queue > 0 && w.joins_stream == 0 ? 1 : 0;" not in flat or \
-            not re.search(r"rq\.pending_us, joinq\);", flat):
+            not re.search(r", joinq\);", flat):
         fail("W", "joinq= is not 1 exactly when every join of the token went on the join queue")
     if not re.search(r"w\.joins_join_queue\s*=\s*0;", flat) or not re.search(r"w\.joins_stream\s*=\s*0;", flat):
         fail("W", "the join counts are not reset with the token's other counts")

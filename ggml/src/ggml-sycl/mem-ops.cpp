@@ -754,6 +754,132 @@ static void mem_copy_site_census_record(const char *      path,
     st.overflow_bytes += bytes;
 }
 
+// One census per thread (llama.cpp-qwn5): a wait is counted on the thread it held, and only the submitting thread
+// prints and resets its own.
+mem_copy_staged_wait_census & mem_copy_staged_wait_census_this_thread() {
+    static thread_local mem_copy_staged_wait_census census;
+    return census;
+}
+
+static const char * mem_copy_staged_wait_kind_name(int kind) {
+    switch (kind) {
+        case MEM_COPY_STAGED_WAIT_KIND_H2D_DEPS:
+            return "h2d_deps";
+        case MEM_COPY_STAGED_WAIT_KIND_H2D_CHUNK:
+            return "h2d_chunk";
+        case MEM_COPY_STAGED_WAIT_KIND_H2D_FINAL:
+            return "h2d_final";
+        case MEM_COPY_STAGED_WAIT_KIND_D2H:
+            return "d2h";
+        case MEM_COPY_STAGED_WAIT_KIND_H2H_DEPS:
+            return "h2h_deps";
+        case MEM_COPY_STAGED_WAIT_KIND_CROSS:
+            return "cross";
+    }
+    return "?";
+}
+
+// Called only under the trace. The table matches a site on its text, as mem_copy_site_matches does, since one call
+// site can reach here with different string addresses.
+static void staged_wait_record(mem_copy_staged_wait_kind kind, const char * file, int line, double us) {
+    mem_copy_staged_wait_census & c = mem_copy_staged_wait_census_this_thread();
+    c.count[kind] += 1;
+    c.us[kind] += us;
+    file = file != nullptr ? file : "?";
+    for (mem_copy_staged_wait_site & s : c.sites) {
+        if (s.file == nullptr) {
+            s.file = file;
+            s.line = line;
+            s.kind = kind;
+        }
+        if (s.line == line && s.kind == kind && (s.file == file || std::strcmp(s.file, file) == 0)) {
+            s.count += 1;
+            s.us += us;
+            return;
+        }
+    }
+    c.overflow_count += 1;
+    c.overflow_us += us;
+}
+
+static double staged_wait_us_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// mem_copy_submit's synchronous wait on one event, counted by kind and by the copy's caller under the trace.
+static void staged_wait_event(sycl::event & event, mem_copy_staged_wait_kind kind, const char * file, int line) {
+    if (!ggml_sycl_cpu_expert_trace_enabled()) {
+        event.wait_and_throw();
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    event.wait_and_throw();
+    staged_wait_record(kind, file, line, staged_wait_us_since(t0));
+}
+
+// mem_copy_submit's synchronous wait on a copy's deps, counted the same way. An empty list does not wait.
+static void staged_wait_deps(const std::vector<sycl::event> & deps,
+                             mem_copy_staged_wait_kind        kind,
+                             const char *                     file,
+                             int                              line) {
+    if (deps.empty()) {
+        return;
+    }
+    if (!ggml_sycl_cpu_expert_trace_enabled()) {
+        wait_deps(deps);
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    wait_deps(deps);
+    staged_wait_record(kind, file, line, staged_wait_us_since(t0));
+}
+
+// A copy that took a staged branch, by direction, under the trace.
+static void staged_copy_note(bool device_to_host) {
+    if (!ggml_sycl_cpu_expert_trace_enabled()) {
+        return;
+    }
+    mem_copy_staged_wait_census & c = mem_copy_staged_wait_census_this_thread();
+    if (device_to_host) {
+        c.staged_d2h += 1;
+    } else {
+        c.staged_h2d += 1;
+    }
+}
+
+void mem_copy_staged_wait_census_format(const mem_copy_staged_wait_census & census, mem_copy_staged_wait_text & out) {
+    std::snprintf(out.copies, sizeof(out.copies), "d2h:%" PRIu64 ",h2d:%" PRIu64, census.staged_d2h, census.staged_h2d);
+
+    int at = 0;
+    for (int kind = 0; kind < MEM_COPY_STAGED_WAIT_KIND_COUNT; ++kind) {
+        if (census.count[kind] == 0 || at >= (int) sizeof(out.waits)) {
+            continue;
+        }
+        at += std::snprintf(out.waits + at, sizeof(out.waits) - at, "%s%s:%" PRIu64 "/%.0fus", at > 0 ? "," : "",
+                            mem_copy_staged_wait_kind_name(kind), census.count[kind], census.us[kind]);
+    }
+    if (at == 0) {
+        std::snprintf(out.waits, sizeof(out.waits), "none");
+    }
+
+    at = 0;
+    for (const mem_copy_staged_wait_site & s : census.sites) {
+        if (s.file == nullptr || s.count == 0 || at >= (int) sizeof(out.sites)) {
+            continue;
+        }
+        at += std::snprintf(out.sites + at, sizeof(out.sites) - at, "%s%s:%d:%s=%" PRIu64 "/%.0fus", at > 0 ? "," : "",
+                            mem_copy_site_short_file(s.file), s.line, mem_copy_staged_wait_kind_name(s.kind), s.count,
+                            s.us);
+    }
+    if (census.overflow_count != 0 && at < (int) sizeof(out.sites)) {
+        at += std::snprintf(out.sites + at, sizeof(out.sites) - at, "%soverflow=%" PRIu64 "/%.0fus", at > 0 ? "," : "",
+                            census.overflow_count, census.overflow_us);
+    }
+    if (at == 0) {
+        std::snprintf(out.sites, sizeof(out.sites), "none");
+    }
+}
+
 static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
                                           size_t                           dst_offset,
                                           const mem_handle &               src,
@@ -819,7 +945,7 @@ static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
         if (mem_copy_site_census_enabled()) {
             mem_copy_site_census_record(profile_name, mem_copy_site_dir::H2H, size, file, line, function);
         }
-        wait_deps(deps);
+        staged_wait_deps(deps, MEM_COPY_STAGED_WAIT_KIND_H2H_DEPS, file, line);
         std::memcpy(dst_ptr, src_ptr, size);
         return sycl::event{};
     }
@@ -892,12 +1018,12 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
             if (retain_until_event) {
                 retain_handles_until_event({ dst, src, src_stage }, h2d, std::move(publish_ticket));
             } else {
-                h2d.wait_and_throw();
+                staged_wait_event(h2d, MEM_COPY_STAGED_WAIT_KIND_CROSS, file, line);
             }
             return h2d;
         }
 
-        d2h.wait_and_throw();
+        staged_wait_event(d2h, MEM_COPY_STAGED_WAIT_KIND_CROSS, file, line);
 
         mem_handle dst_stage;
         if (!alloc_pinned_stage_handle(size, dst_queue, dst_device, "mem-copy-cross-device-dst",
@@ -919,7 +1045,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         if (retain_until_event) {
             retain_handles_until_event({ dst, src, src_stage, dst_stage }, h2d, std::move(publish_ticket));
         } else {
-            h2d.wait_and_throw();
+            staged_wait_event(h2d, MEM_COPY_STAGED_WAIT_KIND_CROSS, file, line);
         }
         return h2d;
     }
@@ -935,6 +1061,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
     }
 
     if (d.on_device && !s.on_device && !host_ptr_is_usm_accessible(s.ptr)) {
+        staged_copy_note(/*device_to_host=*/false);
         constexpr size_t max_stage_bytes = 64ull * 1024ull * 1024ull;
         const size_t     stage_bytes     = std::min(size, max_stage_bytes);
         mem_handle stage;
@@ -943,14 +1070,14 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
             GGML_ABORT("[MEM-OPS] failed to allocate %zu byte host-pinned staging buffer for host -> device %d copy",
                        stage_bytes, dst_device);
         }
-        wait_deps(deps);
+        staged_wait_deps(deps, MEM_COPY_STAGED_WAIT_KIND_H2D_DEPS, file, line);
         resolved_ptr stage_ptr = stage.resolve();
         GGML_ASSERT(stage_ptr && !stage_ptr.on_device);
         sycl::event event;
         size_t      copied = 0;
         while (copied < size) {
             if (copied != 0) {
-                event.wait_and_throw();
+                staged_wait_event(event, MEM_COPY_STAGED_WAIT_KIND_H2D_CHUNK, file, line);
             }
             const size_t cur = std::min(stage_bytes, size - copied);
             std::memcpy(stage_ptr.ptr, static_cast<const char *>(s.ptr) + src_offset + copied, cur);
@@ -965,12 +1092,13 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
             retain_handles_until_event({ dst, src, stage }, event, std::move(publish_ticket));
         } else {
             g_stage_waited.fetch_add(1, std::memory_order_relaxed);
-            event.wait_and_throw();
+            staged_wait_event(event, MEM_COPY_STAGED_WAIT_KIND_H2D_FINAL, file, line);
         }
         return event;
     }
 
     if (!d.on_device && s.on_device && !host_ptr_is_usm_accessible(d.ptr)) {
+        staged_copy_note(/*device_to_host=*/true);
         constexpr size_t max_stage_bytes = 64ull * 1024ull * 1024ull;
         const size_t     stage_bytes     = std::min(size, max_stage_bytes);
         mem_handle stage;
@@ -987,7 +1115,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
             sycl::event  event = mem_copy_direct_submit(
                 stage, 0, src, src_offset + copied, cur, *copy_queue, copied == 0 ? deps : std::vector<sycl::event>{},
                 "sycl.memcpy.mem_ops", "role=memcpy;path=mem_ops", "copy", file, line, function);
-            event.wait_and_throw();
+            staged_wait_event(event, MEM_COPY_STAGED_WAIT_KIND_D2H, file, line);
             std::memcpy(static_cast<char *>(d.ptr) + dst_offset + copied, stage_ptr.ptr, cur);
             copied += cur;
         }
