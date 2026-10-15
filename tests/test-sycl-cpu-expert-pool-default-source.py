@@ -5,11 +5,13 @@ Companion of test-sycl-cpu-expert-pool-source.py, which pins that the pool owns 
 
 THE DEFECT.  get_cpu_expert_thread_count() (cpu-expert-pool.cpp) defaulted the pool to
 hardware_concurrency - 2 workers (22 on this host).  Each worker runs one host-expert job at a
-time, and each job's row loop is a parallel_for into the ONE TBB arena the backend owns
-(ggml_sycl_cpu_threads_hint(), cpu-dispatch.cpp, also 22 threads).  Concurrent jobs split that
-arena between overlapping parallel_fors, and buy nothing, because the layer chain already
-serialises the jobs (gate/up, then down, then the next layer).  Measured 2026-10-15 on Qwen3.8
-decode: one worker was never slower than 22, and +6% to +29% faster depending on host load.
+time.  When the default was set, each job's row loop was a parallel_for into the ONE TBB arena
+the backend owns (ggml_sycl_cpu_threads_hint(), cpu-dispatch.cpp, also 22 threads), and
+concurrent jobs split that arena between overlapping parallel_fors.  They buy nothing, because
+the layer chain already serialises the jobs (gate/up, then down, then the next layer).  The row
+loop now runs on the pool's own row workers, which take one job at a time, so a second worker
+only queues behind the running job (llama.cpp-w4e9).  Measured 2026-10-15 on Qwen3.8
+decode: one worker was never slower than 22, and +14% to +29% faster depending on host load.
 
 THE CONTRACT.
   D. (cpu-expert-pool.cpp get_cpu_expert_thread_count) with no override the function returns 1,
