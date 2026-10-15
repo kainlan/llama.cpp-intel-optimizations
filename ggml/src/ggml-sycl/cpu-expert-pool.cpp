@@ -35,7 +35,7 @@ static int get_cpu_expert_thread_count() {
     // not add threads; it splits the arena between overlapping jobs.  The jobs gain nothing
     // from running together: the layer chain already orders them (gate/up, then down, then
     // the next layer).  Measured 2026-10-15 on Qwen3.8 decode (B70, -c 4096, -t 4, host
-    // load 26-32): one worker was never slower than 22, and was +6% to +29% faster
+    // load 25-32): one worker was never slower than 22, and was +6% to +29% faster
     // depending on host load (22 vs 1 worker, two windows: 9.06 vs 9.58 t/s over four
     // alternated pairs, 8.1 vs 10.5 t/s over two reps).  The pool finishes sooner (job wall
     // per token 54.1 -> 39.1 ms), but much of that time overlaps device work, so the end-to-end gain
