@@ -9,7 +9,7 @@ time, and each job's row loop is a parallel_for into the ONE TBB arena the backe
 (ggml_sycl_cpu_threads_hint(), cpu-dispatch.cpp, also 22 threads).  Concurrent jobs split that
 arena between overlapping parallel_fors, and buy nothing, because the layer chain already
 serialises the jobs (gate/up, then down, then the next layer).  Measured 2026-10-15 on Qwen3.8
-decode: 22 workers 8.1 t/s, 1 worker 10.5 t/s.
+decode: one worker was never slower than 22, and +6% to +29% faster depending on host load.
 
 THE CONTRACT.
   D. (cpu-expert-pool.cpp get_cpu_expert_thread_count) with no override the function returns 1,
