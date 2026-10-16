@@ -77,7 +77,11 @@ struct cpu_expert_job_tag {
 //   t_compute_start  the job's first row range started (the batched kernel's
 //                    compute phase); t_compute_end its parallel loop returned
 //   t_join_entry     the join host_task began; t_join_exit its job.get() returned
-// A job that is never joined on a queue (a synchronous get()) has no join stamps.
+//   t_signal         the job signalled its native device event (llama.cpp-qwn5), after
+//                    its last host write; the device commands that wait on it may run
+// A job that is never joined on a queue (a synchronous get(), or a flush that made
+// the device wait on its native event) has no join stamps. A job the producer gave no
+// native event has no signal stamp.
 struct cpu_expert_job_stamps {
     int64_t             t_submit_ns        = 0;
     int64_t             t_inputs_ready_ns  = 0;
@@ -85,6 +89,7 @@ struct cpu_expert_job_stamps {
     int64_t             t_compute_end_ns   = 0;
     int64_t             t_join_entry_ns    = 0;
     int64_t             t_join_exit_ns     = 0;
+    int64_t             t_signal_ns        = 0;
     bool                join_found_ready   = false;  // the join found the job already finished
     int                 layer              = -1;
     cpu_expert_job_kind kind               = CPU_EXPERT_JOB_KIND_OTHER;
@@ -107,15 +112,18 @@ struct cpu_expert_job_stamps {
 //                 job.get() returns at once
 //   join_wake     sum(t_join_exit - t_compute_end) over joins that waited for the
 //                 job: from the row loop's return to the waiting join's return
-// A job that was never joined has neither join term; its span ends at
-// t_compute_end.
+//   signal_lat    sum(t_signal - t_compute_end) over jobs never joined that
+//                 signalled their device event (counted in `signalled`): from the
+//                 row loop's return to the release of the commands waiting on it
+// A job that was never joined has no join term; its span ends at t_signal, or at
+// t_compute_end when it signalled nothing. A joined job's signal adds to no term.
 //
 // Diagnostics, which overlap the terms above and must not be added to them:
 //   chain_gap     sum over consecutive jobs, in submission order, of
-//                 max(0, t_inputs_ready[N] - t_join_exit[N-1]); a pair whose
-//                 earlier job was never joined adds nothing. It lies inside job N's
-//                 inputs_wait whenever job N was submitted before job N-1's join
-//                 returned.
+//                 max(0, t_inputs_ready[N] - end[N-1]), where a job's end is its
+//                 t_join_exit, else its t_signal; a pair whose earlier job has
+//                 neither adds nothing. It lies inside job N's inputs_wait whenever
+//                 job N was submitted before job N-1 ended.
 //   join_waited   sum(t_join_exit - t_join_entry) over joins that waited for their
 //                 job; it overlaps that job's own inputs_wait, pre_compute,
 //                 compute and join_wake.
@@ -124,11 +132,13 @@ struct cpu_expert_job_stamp_sums {
     uint64_t jobs           = 0;
     uint64_t joined         = 0;
     uint64_t joins_waited   = 0;
+    uint64_t signalled      = 0;
     double   inputs_wait_us = 0.0;
     double   pre_compute_us = 0.0;
     double   compute_us     = 0.0;
     double   join_lat_us    = 0.0;
     double   join_wake_us   = 0.0;
+    double   signal_lat_us  = 0.0;
     double   chain_gap_us   = 0.0;
     double   join_waited_us = 0.0;
 };
@@ -156,10 +166,18 @@ inline cpu_expert_job_stamp_sums cpu_expert_job_stamps_sum(std::vector<cpu_exper
         s.inputs_wait_us += cpu_expert_job_stamps_span_us(j.t_submit_ns, j.t_inputs_ready_ns, true);
         s.pre_compute_us += cpu_expert_job_stamps_span_us(j.t_inputs_ready_ns, j.t_compute_start_ns, true);
         s.compute_us += cpu_expert_job_stamps_span_us(j.t_compute_start_ns, j.t_compute_end_ns, true);
-        if (i > 0 && jobs[i - 1].t_join_exit_ns != 0) {
-            s.chain_gap_us += cpu_expert_job_stamps_span_us(jobs[i - 1].t_join_exit_ns, j.t_inputs_ready_ns, true);
+        if (i > 0) {
+            const cpu_expert_job_stamps & prev     = jobs[i - 1];
+            const int64_t                 prev_end = prev.t_join_exit_ns != 0 ? prev.t_join_exit_ns : prev.t_signal_ns;
+            if (prev_end != 0) {
+                s.chain_gap_us += cpu_expert_job_stamps_span_us(prev_end, j.t_inputs_ready_ns, true);
+            }
         }
         if (j.t_join_entry_ns == 0 || j.t_join_exit_ns == 0) {
+            if (j.t_signal_ns != 0) {
+                s.signalled += 1;
+                s.signal_lat_us += cpu_expert_job_stamps_span_us(j.t_compute_end_ns, j.t_signal_ns, true);
+            }
             continue;
         }
         s.joined += 1;
@@ -175,16 +193,17 @@ inline cpu_expert_job_stamp_sums cpu_expert_job_stamps_sum(std::vector<cpu_exper
 }
 
 // The per-job line's fields: each stamp in us relative to t0_ns (the token's first
-// submit), "-" for a stamp not taken, and join=ready|waited|none.
+// submit), "-" for a stamp not taken, and join=ready|waited|none. signal= comes last,
+// so the fields before it keep their places.
 inline int cpu_expert_job_stamps_format(char *                        buf,
                                         size_t                        size,
                                         size_t                        index,
                                         const cpu_expert_job_stamps & j,
                                         int64_t                       t0_ns) {
-    char          rel[6][32];
-    const int64_t stamps[6] = { j.t_submit_ns,      j.t_inputs_ready_ns, j.t_compute_start_ns,
-                                j.t_compute_end_ns, j.t_join_entry_ns,   j.t_join_exit_ns };
-    for (int i = 0; i < 6; ++i) {
+    char          rel[7][32];
+    const int64_t stamps[7] = { j.t_submit_ns,     j.t_inputs_ready_ns, j.t_compute_start_ns, j.t_compute_end_ns,
+                                j.t_join_entry_ns, j.t_join_exit_ns,    j.t_signal_ns };
+    for (int i = 0; i < 7; ++i) {
         if (stamps[i] == 0) {
             std::snprintf(rel[i], sizeof(rel[i]), "-");
         } else {
@@ -195,9 +214,9 @@ inline int cpu_expert_job_stamps_format(char *                        buf,
     const char * join   = !joined ? "none" : j.join_found_ready ? "ready" : "waited";
     return std::snprintf(buf, size,
                          "job=%zu layer=%d kind=%s rows=%d bytes=%llu submit=%s inputs_ready=%s compute_start=%s "
-                         "compute_end=%s join_entry=%s join_exit=%s join=%s",
+                         "compute_end=%s join_entry=%s join_exit=%s join=%s signal=%s",
                          index, j.layer, cpu_expert_job_kind_name(j.kind), j.rows, (unsigned long long) j.bytes, rel[0],
-                         rel[1], rel[2], rel[3], rel[4], rel[5], join);
+                         rel[1], rel[2], rel[3], rel[4], rel[5], join, rel[6]);
 }
 
 }  // namespace ggml_sycl

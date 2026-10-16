@@ -32,7 +32,8 @@ THE CONTRACT.  With comments blanked:
      job's record.
   L. (ggml-sycl.cpp) the [CPU-EXPERT-POOL-TRACE] token= line carries inputs_wait=,
      chain_gap=, join_lat=, join_waited_us=, join_wake= and pre_compute=, with join_wake=
-     right after join_waited_us=.
+     right after join_waited_us=, and signalled= and signal_lat=, the jobs whose span
+     ended at their native device event's signal (llama.cpp-qwn5).
   W. (cpu-expert-pool-stamps.hpp cpu_expert_job_stamps_sum) join_wake sums t_join_exit -
      t_compute_end over the joins that waited, the else branch of `if (j.join_found_ready)`,
      so the additive terms close on each job's span.
@@ -40,8 +41,8 @@ THE CONTRACT.  With comments blanked:
      `if (moe_hostpath_trace_level() >= 2)`: GGML_SYCL_MOE_IDS_COPY_TRACE=2 is the only
      per-job printer, and =1 prints no per-job line.
   C. (docs/backend/sycl-env-vars.md) the GGML_SYCL_MOE_IDS_COPY_TRACE row names the =2
-     level and the six sums, and says which are additive and which are overlapping
-     diagnostics.
+     level, the six sums, signalled= and signal_lat=, and says which are additive and
+     which are overlapping diagnostics.
 
 NOT VACUOUS.  --self-test runs the gate on in-memory mutants of the real sources and
 requires each to FAIL on its own pin, then requires the unmodified tree to pass.
@@ -69,7 +70,8 @@ TRACE_GUARD = r"if\s*\(\s*trace\s*\)"
 WAITS_GUARD = r"if\s*\(\s*moe_hostpath_waits_enabled\s*\(\s*\)\s*\)"
 STAMPS_GUARD = r"if\s*\(\s*stamps\s*\)"
 LEVEL2_GUARD = r"if\s*\(\s*moe_hostpath_trace_level\s*\(\s*\)\s*>=\s*2\s*\)"
-FIELDS = ("inputs_wait=", "chain_gap=", "join_lat=", "join_waited_us=", "join_wake=", "pre_compute=")
+FIELDS = ("inputs_wait=", "chain_gap=", "join_lat=", "join_waited_us=", "join_wake=", "pre_compute=", "signalled=",
+          "signal_lat=")
 
 
 class ContractError(Exception):
@@ -401,6 +403,8 @@ def self_test(s: dict) -> int:
         ("L", "backend", "chain_gap missing from the line", sub(r" chain_gap=%", " chain_wait=%")),
         ("L", "backend", "join_waited_us missing from the line", sub(r'"join_waited_us=%', '"join_waits=%')),
         ("L", "backend", "join_wake missing from the line", sub(r" join_wake=%", " join_tail=%")),
+        ("L", "backend", "signal_lat missing from the line", sub(r" signal_lat=%", " signal_tail=%")),
+        ("L", "backend", "signalled missing from the line", sub(r" signalled=%", " signals=%")),
         ("L", "backend", "join_wake printed before join_waited_us",
          sub(r'"join_waited_us=%\.0fus join_wake=%\.0fus', '"join_wake=%.0fus join_waited_us=%.0fus')),
         ("W", "stamps", "join_wake summed from the join entry",
@@ -418,6 +422,8 @@ def self_test(s: dict) -> int:
          sub(r"(\| `GGML_SYCL_MOE_IDS_COPY_TRACE[^\n]*?)`=2`", r"\1`=1`")),
         ("C", "doc", "doc row loses pre_compute",
          sub(r"(\| `GGML_SYCL_MOE_IDS_COPY_TRACE[^\n]*?)`pre_compute=`", r"\1`pre_kernel=`")),
+        # The row names signal_lat= twice (the line's fields, then the sum's definition): drop both.
+        ("C", "doc", "doc row loses signal_lat", lambda text: text.replace("`signal_lat=`", "`signal_tail=`")),
         ("C", "doc", "doc row stops saying what overlaps",
          sub(r"(\| `GGML_SYCL_MOE_IDS_COPY_TRACE[^\n]*?)\*\*Overlapping diagnostics", r"\1**Also")),
     ]
@@ -469,7 +475,7 @@ def main(argv: list[str]) -> int:
     except ContractError as e:
         print(e)
         return 1
-    print("PASS: every CPU expert pool job stamp is taken inside a trace guard, the trace line carries the six "
+    print("PASS: every CPU expert pool job stamp is taken inside a trace guard, the trace line carries the "
           f"per-token sums, and GGML_SYCL_MOE_IDS_COPY_TRACE=2 is the only per-job printer {TAG}")
     return 0
 

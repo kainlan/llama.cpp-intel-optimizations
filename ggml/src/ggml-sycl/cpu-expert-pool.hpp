@@ -8,6 +8,7 @@
 
 #include "cpu-dispatch.hpp"
 #include "cpu-expert-pool-stamps.hpp"
+#include "cpu-job-signal.hpp"
 #include "cpu-row-workers.hpp"
 
 #include <atomic>
@@ -87,8 +88,13 @@ class CpuExpertPool {
     // returned and later ops depend on the job, so no op is left to re-place.
     // The copies the waits are for are still submitted on the submitting
     // thread, inside those catches, and kernel-submission resource exhaustion
-    // is raised at submit (llama.cpp-o3h1). No catch is added here: the
-    // alloc-zone contract's G-CATCH rule forbids a new handler.
+    // is raised at submit (llama.cpp-o3h1). The worker's one pair of handlers
+    // does not change that: both rethrow, the first being the
+    // `catch (const ggml_sycl_fallback_error &) { throw; }` the alloc-zone
+    // contract's G-CATCH rule requires ahead of a catch-all. They exist so the
+    // throw unwinds the job's frame, which signals the job's device event (see
+    // `device_signal`) before the process ends; with no handler on the stack the
+    // runtime ends it without unwinding.
     //
     // `resolve`, when set, runs on the worker after the prologue and before the
     // batch kernel, and may add to `tasks` (llama.cpp-7pvo). It is for a job
@@ -102,10 +108,19 @@ class CpuExpertPool {
     // trace list and the join host_task that holds a copy, so it lives until the
     // last of them lets go: reading or writing it in the join is safe however long
     // after the job the join runs.
+    //
+    // `device_signal`, when set, is the job half of the job's native device event
+    // (llama.cpp-qwn5). The worker signals it after the kernel's last host write
+    // and before the promise, so the device commands that wait on the event (the
+    // host-expert scatter's H2D copy) need no join host_task. A throw from the
+    // prologue, resolve or the kernel signals it while unwinding, and a job
+    // destroyed unrun signals it from the destructor: the xe job timeout does not
+    // end a device command parked on such an event.
     std::future<void> submit_batch(std::vector<cpu_expert_task>                        tasks,
-                                   std::function<void()>                               prologue  = {},
-                                   std::function<void(std::vector<cpu_expert_task> &)> resolve   = {},
-                                   cpu_expert_job_trace *                              job_trace = nullptr);
+                                   std::function<void()>                               prologue      = {},
+                                   std::function<void(std::vector<cpu_expert_task> &)> resolve       = {},
+                                   cpu_expert_job_trace *                              job_trace     = nullptr,
+                                   cpu_job_signal                                      device_signal = {});
 
     bool is_active() const { return active_.load(std::memory_order_acquire); }
 

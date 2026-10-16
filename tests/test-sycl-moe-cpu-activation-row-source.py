@@ -583,9 +583,10 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
     require_unconditional(lam, lam.find(prologue_def), header=None, pin="W2", what="the job prologue")
     ep = squash(blank_comments(expert_pool_src))
     push = ("work_queue_.push([this, tasks = std::move(tasks), prologue = std::move(prologue), "
-            "resolve = std::move(resolve), promise, trace, t_submit, stamps = std::move(stamps)]() mutable {")
+            "resolve = std::move(resolve), promise, trace, t_submit, signal_box, stamps = std::move(stamps)]() "
+            "mutable {")
     push_at = ep.find(push)
-    worker = ep[push_at : ep.find("promise->set_value(); });", push_at)] if push_at >= 0 else ""
+    worker = ep[push_at : ep.find("promise->set_value();", push_at)] if push_at >= 0 else ""
     run_prologue = "if (prologue) { prologue(); }"
     run_resolve = "if (resolve) { resolve(tasks); }"
     # The pool's kernel call runs the row loop on the pool's own row workers (llama.cpp-w4e9).
@@ -593,9 +594,10 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
     if ep.count(push) != 1:
         raise ContractError(
             "FAIL [pin W2]: CpuExpertPool::submit_batch does not queue exactly one worker lambda with the capture "
-            "list `[this, tasks, prologue, resolve, promise, trace, t_submit, stamps]`; the worker needs `this` to run "
-            "the row loop on the pool's row workers and `stamps` to record the job's critical path (llama.cpp-z4kd, "
-            "llama.cpp-w4e9, llama.cpp-j6jf)"
+            "list `[this, tasks, prologue, resolve, promise, trace, t_submit, signal_box, stamps]`; the worker needs "
+            "`this` to run the row loop on the pool's row workers, `signal_box` to signal the job's device event and "
+            "`stamps` to record the job's critical path (llama.cpp-z4kd, llama.cpp-w4e9, llama.cpp-j6jf, "
+            "llama.cpp-qwn5)"
         )
     if worker.count(kernel) != 1:
         raise ContractError(
@@ -616,7 +618,10 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
             "before the kernel; it would read expert ids that have not landed, or build tasks the kernel never "
             "computes (llama.cpp-7pvo)"
         )
-    worker_body = worker[worker.find("{"):] + "}"
+    # The worker's body is one try block, which the device-signal gate pins (llama.cpp-qwn5); its statements are
+    # unconditional inside it, so the block they must sit in is the try block's.
+    try_at = worker.find("mutable { try {")
+    worker_body = (worker[try_at + len("mutable { try "):] if try_at >= 0 else worker[worker.find("{"):]) + "}"
     require_unconditional(worker_body, worker_body.find(run_prologue), header=None, pin="W2",
                           what="the pool worker's prologue call")
     require_unconditional(worker_body, worker_body.find(run_resolve), header=None, pin="W2",
@@ -956,24 +961,24 @@ def self_test(backend_src: str) -> int:
                                              "GGML_UNUSED(workspace_owner);\n"), None, "W2")
     expect_fail("pool-submit-drops-prologue", sub("cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue), {},",
                                                   "cpu_pool.submit_batch(std::move(batch_tasks), {}, {},"), None, "W2")
-    worker_prologue = "            if (prologue) {\n                prologue();\n            }\n"
-    worker_resolve = "            if (resolve) {\n                resolve(tasks);\n            }\n"
-    worker_kernel = ("            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()), "
-                     "row_workers_);\n")
+    worker_prologue = "                if (prologue) {\n                    prologue();\n                }\n"
+    worker_resolve = "                if (resolve) {\n                    resolve(tasks);\n                }\n"
+    worker_kernel = ("                ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), "
+                     "static_cast<int>(tasks.size()), row_workers_);\n")
     expect_fail("pool-worker-skips-prologue", backend_src, None, "W2", None,
                 expert_pool_src.replace(worker_prologue, "", 1))
     expect_fail("pool-worker-drops-the-stamps-capture", backend_src, None, "W2", None,
-                expert_pool_src.replace("t_submit, stamps = std::move(stamps)]() mutable {",
-                                        "t_submit]() mutable {", 1))
+                expert_pool_src.replace("t_submit, signal_box, stamps = std::move(stamps)]() mutable {",
+                                        "t_submit, signal_box]() mutable {", 1))
     expect_fail("pool-worker-kernel-on-the-arena", backend_src, None, "W2", None,
-                expert_pool_src.replace(worker_kernel, "            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), "
-                                        "static_cast<int>(tasks.size()));\n", 1))
+                expert_pool_src.replace(worker_kernel, "                ggml_sycl_cpu_expert_mul_mat_batched("
+                                        "tasks.data(), static_cast<int>(tasks.size()));\n", 1))
     expect_fail("pool-worker-prologue-after-kernel", backend_src, None, "W2", None,
                 expert_pool_src.replace(worker_prologue, "", 1).replace(worker_kernel, worker_kernel + worker_prologue, 1))
     expect_fail("pool-worker-prologue-conditioned-away", backend_src, None, "W2", None,
                 expert_pool_src.replace(worker_prologue,
-                                        "            if (prologue && !trace) {\n"
-                                        "                prologue();\n            }\n", 1))
+                                        "                if (prologue && !trace) {\n"
+                                        "                    prologue();\n                }\n", 1))
     expect_fail("pool-worker-skips-resolve", backend_src, None, "W2", None,
                 expert_pool_src.replace(worker_resolve, "", 1))
     expect_fail("pool-worker-resolve-before-prologue", backend_src, None, "W2", None,
@@ -984,8 +989,8 @@ def self_test(backend_src: str) -> int:
                 .replace(worker_kernel, worker_kernel + worker_resolve, 1))
     expect_fail("pool-worker-resolve-conditioned-away", backend_src, None, "W2", None,
                 expert_pool_src.replace(worker_resolve,
-                                        "            if (resolve && trace) {\n"
-                                        "                resolve(tasks);\n            }\n", 1))
+                                        "                if (resolve && trace) {\n"
+                                        "                    resolve(tasks);\n                }\n", 1))
     # W3: the zeroing request is skipped on some paths, defined away, or wrapped in a block of its own.
     expect_fail("zero-request-conditioned-away", sub(
         "if (zero_out_after_act_wait) {\n                    job_inputs.zero_out",

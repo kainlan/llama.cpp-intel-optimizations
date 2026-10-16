@@ -24249,20 +24249,22 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
         ggml_sycl::cpu_expert_pool_trace_totals pt;
         ggml_sycl::cpu_expert_pool_trace_take(pt);
         // Then the per-token sums of the jobs' critical-path stamps (llama.cpp-j6jf); stamped counts the jobs
-        // with a record, stamped_joined those whose join host_task had run by now.  inputs_wait, pre_compute,
-        // compute, join_lat and join_wake add up to the jobs' spans; chain_gap and join_waited_us overlap them
+        // with a record, stamped_joined those whose join host_task had run by now, signalled those never joined
+        // whose span ended at their device event's signal (llama.cpp-qwn5).  inputs_wait, pre_compute, compute,
+        // join_lat, join_wake and signal_lat add up to the jobs' spans; chain_gap and join_waited_us overlap them
         // (cpu_expert_job_stamp_sums).
         const ggml_sycl::cpu_expert_job_stamp_sums js = ggml_sycl::cpu_expert_job_stamps_sum(pt.job_stamps);
         GGML_LOG_WARN(
             "[CPU-EXPERT-POOL-TRACE] token=%llu jobs=%llu tasks=%llu rows=%llu threads=%llu wake=%.0fus "
             "quant=%.0fus setup=%.0fus fanout=%.0fus compute=%.0fus wall=%.0fus joins=%llu joins_ready=%llu "
             "stamped=%llu stamped_joined=%llu inputs_wait=%.0fus chain_gap=%.0fus join_lat=%.0fus "
-            "join_waited_us=%.0fus join_wake=%.0fus pre_compute=%.0fus\n",
+            "join_waited_us=%.0fus join_wake=%.0fus pre_compute=%.0fus signalled=%llu signal_lat=%.0fus\n",
             (unsigned long long) w.token, (unsigned long long) pt.jobs, (unsigned long long) pt.tasks,
             (unsigned long long) pt.rows, (unsigned long long) pt.threads, pt.wake_us, pt.quant_us, pt.setup_us,
             pt.fanout_us, pt.compute_us, pt.wall_us, (unsigned long long) pt.joins, (unsigned long long) pt.joins_ready,
             (unsigned long long) js.jobs, (unsigned long long) js.joined, js.inputs_wait_us, js.chain_gap_us,
-            js.join_lat_us, js.join_waited_us, js.join_wake_us, js.pre_compute_us);
+            js.join_lat_us, js.join_waited_us, js.join_wake_us, js.pre_compute_us, (unsigned long long) js.signalled,
+            js.signal_lat_us);
         if (moe_hostpath_trace_level() >= 2) {
             // Each job's stamps relative to the token's first submit, in submission order.
             const int64_t t0 = pt.job_stamps.empty() ? 0 : pt.job_stamps.front().t_submit_ns;
