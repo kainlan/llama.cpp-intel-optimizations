@@ -54,8 +54,9 @@ THE CONTRACT.  With comments blanked:
      overflow=N/USus when non-zero; waits and sites read none when empty.
   P. (ggml-sycl.cpp moe_hostpath_waits_readback) the [MOE-HOSTPATH-WAITS] line
      prints staged_copies=, staged_waits= and staged_sites= from the submitting
-     thread's census, after ready_query_us= and before joinq=, and the census is
-     reset with the token's other counts.
+     thread's census, after ready_query_us= and before devsig= and joinq= (the
+     device-signal count, llama.cpp-qwn5), and the census is reset with the token's
+     other counts.
   D. (docs/backend/sycl-env-vars.md) the GGML_SYCL_MOE_IDS_COPY_TRACE row names the
      three fields, the six kinds, the 16-slot table and its overflow, and none.
 
@@ -341,14 +342,15 @@ def check_print(s: dict) -> None:
     m = re.search(r'GGML_LOG_WARN\( ((?:"[^"]*" ?)+)', body)
     fmt = "".join(re.findall(r'"([^"]*)"', m.group(1))) if m else ""
     if not fmt.startswith("[MOE-HOSTPATH-WAITS]") or \
-            "ready_query_us=%.0f staged_copies=%s staged_waits=%s staged_sites=%s joinq=%d" not in fmt:
+            "ready_query_us=%.0f staged_copies=%s staged_waits=%s staged_sites=%s devsig=%llu joinq=%d" not in fmt:
         fail("P", "the [MOE-HOSTPATH-WAITS] line does not print staged_copies=, staged_waits= and staged_sites= "
-                  "between ready_query_us= and joinq=")
+                  "between ready_query_us= and devsig=")
     for want, what in (
             ("ggml_sycl::mem_copy_staged_wait_census & sw = ggml_sycl::mem_copy_staged_wait_census_this_thread(); "
              "ggml_sycl::mem_copy_staged_wait_text st; ggml_sycl::mem_copy_staged_wait_census_format(sw, st);",
              "formats the submitting thread's census"),
-            ("other_sites, rq.pending_us, st.copies, st.waits, st.sites, joinq);", "prints the three fields in order"),
+            ("other_sites, rq.pending_us, st.copies, st.waits, st.sites, (unsigned long long) w.joins_device_signal, "
+             "joinq);", "prints the three fields in order"),
             ("sw = ggml_sycl::mem_copy_staged_wait_census{};", "resets the census with the token's counts")):
         if want not in body:
             fail("P", f"the [MOE-HOSTPATH-WAITS] line does not {what}")

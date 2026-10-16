@@ -569,8 +569,9 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
     submits = (
         "prologue = std::move(job_prologue)]() mutable { GGML_UNUSED(workspace_owner); prologue(); "
         "for (const cpu_moe_host_aos_task & task : tasks) {",
+        # The last argument is the job's device-signal half (llama.cpp-qwn5); the prologue is the same one.
         "result.future = cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue), {}, "
-        "moe_cpu_job_trace_request(job_trace, src0));",
+        "moe_cpu_job_trace_request(job_trace, src0), std::move(job_signal));",
         "prologue = std::move(job_prologue)]() mutable { prologue(); "
         "ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size())); }",
     )

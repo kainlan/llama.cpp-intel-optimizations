@@ -23957,7 +23957,8 @@ struct pending_cpu_scatter {
     ggml_sycl::mem_handle weight_handle;         // Optional host-pinned weight staging
     // A buffer the CPU job reads that the slot does not otherwise own: the
     // shared decode activation staging, which ensure() may replace while the
-    // job still reads it (llama.cpp-z4kd).  Retained until the job's join event.
+    // job still reads it (llama.cpp-z4kd).  Retained until the job's join event,
+    // or the flush's last event when the device waited the job (llama.cpp-qwn5).
     ggml_sycl::mem_handle act_keepalive;
 
     // Per-expert scatter metadata
@@ -24024,13 +24025,21 @@ struct pending_cpu_scatter {
     // is freed here; the graph boundary waits these events
     // (pending_cpu_scatter_wait_prev_events, llama.cpp-z4kd).  A scatter is
     // still owed that wait while the list is not empty.
+    // signal_mark names the device waits that flush made on its jobs' events (llama.cpp-qwn5); the graph boundary
+    // recycles them after it has waited scatter_events (cpu_job_signal_recycle).
     struct prev_scatter_state {
-        std::vector<sycl::event> scatter_events;
+        std::vector<sycl::event>       scatter_events;
+        ggml_sycl::cpu_job_signal_mark signal_mark;
     } prev_scatter;
 
     // The pool job's stamp record while GGML_SYCL_MOE_IDS_COPY_TRACE is set, else empty; handed to the job's join
     // host_task beside `future` (llama.cpp-j6jf).
     std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> job_stamps;
+
+    // The pending half of the job's device event, when its producer took one (llama.cpp-qwn5): the flush makes the
+    // scatter wait on that event, which the job signals after its last write, instead of joining `future` with a
+    // host task. Empty for a job joined by a host task.
+    ggml_sycl::cpu_job_signal_ref device_signal;
 
     pending_cpu_scatter() :
         out_pinned(nullptr),
@@ -24106,6 +24115,8 @@ struct moe_hostpath_wait_census {
     // CPU expert job joins by the queue they went on (llama.cpp-wfsl): the join-only queue or the compute stream.
     uint64_t joins_join_queue      = 0;
     uint64_t joins_stream          = 0;
+    // CPU expert jobs the device waited on their own event, with no join host task (llama.cpp-qwn5).
+    uint64_t joins_device_signal   = 0;
 };
 
 static thread_local moe_hostpath_wait_census g_moe_hostpath_waits;
@@ -24189,6 +24200,14 @@ static void moe_hostpath_waits_join(bool on_join_queue) {
     }
 }
 
+// Counts one CPU expert job the device waited on its own event, which no host task joined (llama.cpp-qwn5).
+static void moe_hostpath_waits_device_signal() {
+    if (!moe_hostpath_waits_enabled()) {
+        return;
+    }
+    g_moe_hostpath_waits.joins_device_signal += 1;
+}
+
 // Called at each expert-id readback.  A layer id lower than the last one starts a new token, so the
 // previous token's line is printed and the counts restart.  `async` names an ids copy this thread
 // enqueued and did not wait for: the event-chained hybrid decode route's (llama.cpp-7pvo), one per op.
@@ -24235,15 +24254,16 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
         ggml_sycl::mem_copy_staged_wait_census & sw = ggml_sycl::mem_copy_staged_wait_census_this_thread();
         ggml_sycl::mem_copy_staged_wait_text     st;
         ggml_sycl::mem_copy_staged_wait_census_format(sw, st);
-        // joinq=1 when every CPU expert job join of the token went on the join-only queue.
+        // joinq=1 when every CPU expert job join of the token went on the join-only queue; devsig= counts the jobs
+        // the device waited on their own event instead, which took no join (llama.cpp-qwn5).
         const int joinq = w.joins_join_queue > 0 && w.joins_stream == 0 ? 1 : 0;
         GGML_LOG_WARN(
             "[MOE-HOSTPATH-WAITS] token=%llu readbacks=%d async=%d%s total=%llu/%.0fus ready_queries=%llu "
             "ready_skipped=%llu ready_queries_other=%s ready_query_us=%.0f staged_copies=%s staged_waits=%s "
-            "staged_sites=%s joinq=%d\n",
+            "staged_sites=%s devsig=%llu joinq=%d\n",
             (unsigned long long) w.token, w.readbacks, w.readbacks_async, line, (unsigned long long) total_n, total_us,
             (unsigned long long) w.ready_queries, (unsigned long long) w.ready_skipped, other_sites, rq.pending_us,
-            st.copies, st.waits, st.sites, joinq);
+            st.copies, st.waits, st.sites, (unsigned long long) w.joins_device_signal, joinq);
         // The same token's CpuExpertPool jobs (llama.cpp-b2jc): how many, and where each
         // job's time went between its submit and its result.
         ggml_sycl::cpu_expert_pool_trace_totals pt;
@@ -24287,6 +24307,7 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
         w.ready_skipped    = 0;
         w.joins_join_queue = 0;
         w.joins_stream     = 0;
+        w.joins_device_signal = 0;
         rq                 = ggml_sycl_ready_query_census{};
         sw                 = ggml_sycl::mem_copy_staged_wait_census{};
         ++w.token;
@@ -24376,7 +24397,8 @@ struct cpu_dispatch_result {
     uint64_t                                        act_serial        = 0;
     bool                                            shares_activation = false;
 
-    std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> job_stamps;  // see pending_cpu_scatter
+    std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> job_stamps;     // see pending_cpu_scatter
+    ggml_sycl::cpu_job_signal_ref                     device_signal;  // see pending_cpu_scatter
 };
 
 // ---------------------------------------------------------------------------
@@ -24391,15 +24413,22 @@ struct cpu_dispatch_result {
 // Now the ids readback is the one host block per layer:
 //  - a job's input waits (and the zeroing of its output span, which must follow
 //    them) run on the pool worker, in the closure moe_cpu_job_prologue builds;
-//  - a job is joined by a host_task on the op's in-order queue, and its scatter
-//    H2D copies depend on that host_task's event.
+//  - a job signals its entry of the stream's ring of host-signalled device
+//    events after its last write, and its scatter H2D copies depend on a fresh
+//    wrapper of that event, which the device waits itself (llama.cpp-qwn5);
+//  - a job the device may not wait (a graph records, the knob
+//    GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL=0, no entry) is joined by a host_task
+//    on the op's in-order queue, and its scatter H2D copies depend on that
+//    host_task's event.
 // No cycle: a prologue waits only for queue work submitted before its job, a
-// join only for a job submitted before it, and the pool runs jobs in order, so
-// every wait points back in submission order (one pool worker and one SYCL
-// host-task thread are enough).
+// join or a device wait only for a job submitted before it, and the pool runs
+// jobs in order, so every wait points back in submission order (one pool worker
+// and one SYCL host-task thread are enough).
 // Lifetime: nothing here waits, so nothing here may free.  Every buffer a
 // pending job reads or writes (output, activation and weight staging, the
-// activation keepalive) is retained by handle until the job's join event, and every
+// activation keepalive) is retained by handle until the job's join event, or,
+// for a job the device waited, until the last event of the flush that placed
+// its rows, which follows every command that waited on it; and every
 // scatter H2D retains its source and destination handles until its own event
 // (mem_copy_async).  The raw pointers a job uses are transient views of those
 // handles and are never held past them.
@@ -24521,6 +24550,36 @@ static sycl::event moe_cpu_job_join_on_queue(sycl::queue &                      
         ggml_sycl::unified_cache_note_host_task(queue, join);
     }
     return join;
+}
+
+// GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL, read once (llama.cpp-qwn5): unset or non-zero lets a CPU expert pool job's
+// scatter wait on a host-signalled Level Zero event the job signals after its last write; 0 joins every job with a
+// host task as before.
+static bool moe_cpu_job_device_signal_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Whether the scatter on `stream` may wait on a CPU job's own event (llama.cpp-qwn5): the knob is on, and neither the
+// backend nor `stream` records a command graph, since a recorded scatter cannot depend on an event outside the graph.
+// The same recording test as moe_cpu_job_join_may_leave_stream. Asked at submit and again at the flush.
+static bool moe_cpu_job_device_signal_may(sycl::queue & stream) {
+    return moe_cpu_job_device_signal_enabled() && !ggml_sycl_graph_recording_active() &&
+           stream.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording;
+}
+
+// The two halves of a pool job's device event (llama.cpp-qwn5): *job goes to submit_batch, *ref to the pending slot.
+// Both stay empty when the device may not wait on the job or the ring has no entry; the flush then joins the job with
+// a host task.
+static void moe_cpu_job_device_signal_acquire(sycl::queue &                   stream,
+                                              ggml_sycl::cpu_job_signal *     job,
+                                              ggml_sycl::cpu_job_signal_ref * ref) {
+    if (moe_cpu_job_device_signal_may(stream)) {
+        (void) ggml_sycl::unified_cache_cpu_job_signal_acquire(stream, job, ref);
+    }
 }
 
 // Fills `req` with the pool job's trace label and returns it while tracing, else
@@ -25915,13 +25974,17 @@ static bool ggml_sycl_moe_fusion_enabled() {
 // earlier join and CPU job on that in-order queue, which is what the graph
 // boundary needs before the host zones are reset.  This is a host wait, so it
 // is only called from ggml_sycl_cpu_tg_flush_pending(), never from a flush.
+// Once the slot's last scatter is waited, the device has executed every command that waited on a job event of that
+// flush or an earlier one on its stream, so those events may be reset and reused (llama.cpp-qwn5).
 static void pending_cpu_scatter_wait_prev_events(pending_cpu_scatter & slot) {
     std::vector<sycl::event> & events = slot.prev_scatter.scatter_events;
     if (!events.empty()) {
         moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
         sycl::event::wait(events);
         events.clear();
+        ggml_sycl::cpu_job_signal_recycle(slot.prev_scatter.signal_mark);
     }
+    slot.prev_scatter.signal_mark = {};
 }
 
 // Everything one host-expert scatter flush builds, kept across flushes so a decode token's flushes need no new
@@ -26210,11 +26273,17 @@ static void moe_host_scatter_submit_flagged(const pending_cpu_scatter &      slo
 // has waited for either; the flush retained every buffer the job uses until that join, so clearing the slot frees
 // nothing still in use.  prev_scatter keeps only the scatter's events, which the graph boundary waits
 // (pending_cpu_scatter_wait_prev_events).
-static void pending_cpu_scatter_retire(pending_cpu_scatter & slot, const std::vector<sycl::event> & scatter_events) {
+static void pending_cpu_scatter_retire(pending_cpu_scatter &                  slot,
+                                       const std::vector<sycl::event> &       scatter_events,
+                                       const ggml_sycl::cpu_job_signal_mark & signal_mark) {
     slot.prev_scatter.scatter_events = scatter_events;
+    // Replaced even when this flush made no device wait: a mark is recycled only after the boundary waited events of
+    // its own flush, and a dropped one leaves its entries for the next mark of their ring (llama.cpp-qwn5).
+    slot.prev_scatter.signal_mark    = signal_mark;
 
     slot.future = {};
     slot.job_stamps.reset();
+    slot.device_signal.reset();
     slot.entries.clear();
     slot.tasks.clear();
     slot.out_pinned    = nullptr;
@@ -26275,6 +26344,10 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
 
     moe_host_scatter_workspace & ws = g_moe_host_scatter_ws;
     ws.events.clear();
+    // Which members the device waits on their own event (llama.cpp-qwn5), and the flush's mark of those waits.
+    bool                           native[2] = { false, false };
+    int                            n_native  = 0;
+    ggml_sycl::cpu_job_signal_mark signal_mark;
     try {
         // Both producers of an active pending scatter set a stream, an output buffer and the CPU job's
         // future.  A pending scatter without them used to be skipped quietly, which loses its host-expert
@@ -26285,13 +26358,25 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
                         "dropped (llama.cpp-93tw)");
         }
 
-        // Join each CPU job with a host task instead of on this thread (llama.cpp-z4kd), on the cache's join-only
-        // queue or on the stream (moe_cpu_job_join_on_queue, llama.cpp-wfsl).  The scatter below depends on the
-        // join events, so it reads the staging only after the jobs wrote it, and the GPU work that follows on the
-        // stream sees the rows.  This thread goes on submitting.
+        // A job whose producer took a device event is waited by the device itself: the dependency is a fresh wrapper
+        // of the event the job signals after its last write, so no host task stands between the job and the
+        // scatter (llama.cpp-qwn5).  Any other job is joined with a host task instead of on this thread
+        // (llama.cpp-z4kd), on the cache's join-only queue or on the stream (moe_cpu_job_join_on_queue,
+        // llama.cpp-wfsl).  The scatter below depends on these events, so it reads the staging only after the jobs
+        // wrote it, and the GPU work that follows on the stream sees the rows.  This thread goes on submitting.
         std::vector<sycl::event> & joins = ws.joins;
         joins.clear();
+        const bool may_signal = moe_cpu_job_device_signal_may(*slot.stream);
         for (int k = 0; k < n_group; ++k) {
+            sycl::event device_wait;
+            if (may_signal && group[k]->device_signal &&
+                ggml_sycl::cpu_job_signal_wrap(group[k]->device_signal, signal_mark, &device_wait)) {
+                native[k] = true;
+                ++n_native;
+                moe_hostpath_waits_device_signal();
+                joins.push_back(std::move(device_wait));
+                continue;
+            }
             joins.push_back(moe_cpu_job_join_on_queue(*slot.stream, group[k]->future.share(), group[k]->job_stamps));
         }
 
@@ -26351,16 +26436,26 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
         // A flush with no rows to place still leaves its joins for the graph boundary to wait.  When the joins may
         // be on the join-only queue (moe_cpu_job_join_on_queue), a barrier keeps this stream's later commands
         // behind them, as when they were on it; when they cannot be, the stream is left as it was without it.
+        // When the device waits a member's own event, the barrier is that member's only edge to the stream, so it
+        // is always submitted, and its event, never a wrapper, is what the boundary and the next job wait: a wrapper
+        // must not outlive this flush, since its event is reset once recycled (llama.cpp-qwn5).
         if (ws.events.empty()) {
-            ws.events.insert(ws.events.end(), joins.begin(), joins.end());
-            if (moe_cpu_job_join_may_leave_stream(*slot.stream)) {
-                slot.stream->ext_oneapi_submit_barrier(joins);
+            if (n_native == 0) {
+                ws.events.insert(ws.events.end(), joins.begin(), joins.end());
+                if (moe_cpu_job_join_may_leave_stream(*slot.stream)) {
+                    slot.stream->ext_oneapi_submit_barrier(joins);
+                }
+            } else {
+                ws.events.push_back(slot.stream->ext_oneapi_submit_barrier(joins));
             }
         }
 
         // A job reads its activation buffers and writes its output until its join completes; the copies
         // above retain only what they read.  Retain everything each job touches until its own join, so
-        // retiring the slots below frees nothing a running job still uses.
+        // retiring the slots below frees nothing a running job still uses.  A job the device waited on its own
+        // event is retained until the flush's last event instead (llama.cpp-qwn5): that command ran after the
+        // device passed the wait on the job's event, so after the job's last write, and it is the stream's own
+        // event, which a recycle never resets.
         for (int k = 0; k < n_group; ++k) {
             const pending_cpu_scatter &        s = *group[k];
             std::vector<ggml_sycl::mem_handle> job_buffers;
@@ -26370,11 +26465,18 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
                     job_buffers.push_back(*h);
                 }
             }
-            if (!job_buffers.empty()) {
+            if (job_buffers.empty()) {
+                continue;
+            }
+            if (native[k]) {
+                ggml_sycl::retain_handles_until_event(std::move(job_buffers), ws.events.back());
+            } else {
                 ggml_sycl::retain_handles_until_event(std::move(job_buffers), joins[k]);
             }
         }
         ws.release_handles();
+        // The wrappers were for the commands above only (cpu_job_signal_wrap).
+        joins.clear();
 
         auto t2 = hrc::now();  // After memcpy submissions
 
@@ -26403,7 +26505,7 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
     g_cpu_scatter_last_flush.row_n     = slot.row_n;
 
     for (int k = 0; k < n_group; ++k) {
-        pending_cpu_scatter_retire(*group[k], ws.events);
+        pending_cpu_scatter_retire(*group[k], ws.events, signal_mark);
     }
 }
 
@@ -26421,6 +26523,7 @@ static void move_pending_cpu_scatter_to_sibling() {
     GGML_ASSERT(from.active && !to.active && "sibling CPU scatter slot is occupied (llama.cpp-yx28)");
     to.future                = std::move(from.future);
     to.job_stamps            = std::move(from.job_stamps);
+    to.device_signal         = std::move(from.device_signal);
     to.out_pinned            = from.out_pinned;
     to.act_pinned            = from.act_pinned;
     to.weight_pinned         = from.weight_pinned;
@@ -77464,8 +77567,11 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
         }
     };
     ggml_sycl::cpu_expert_job_trace job_trace;
+    ggml_sycl::cpu_job_signal       job_signal;
+    ggml_sycl::cpu_job_signal_ref   job_signal_ref;
+    moe_cpu_job_device_signal_acquire(*stream, &job_signal, &job_signal_ref);
     std::future<void> job = cpu_pool.submit_batch({}, moe_cpu_job_prologue(std::move(job_inputs)), std::move(resolve),
-                                                  moe_cpu_job_trace_request(job_trace, src0));
+                                                  moe_cpu_job_trace_request(job_trace, src0), std::move(job_signal));
     if (record_warmup && g_moe_warmup.tick_epoch()) {
         moe_periodic_rerank();
     }
@@ -77482,6 +77588,7 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     pending_cpu_scatter & slot = g_pending_scatter;
     slot.future                = std::move(job);
     slot.job_stamps            = std::move(job_trace.stamps);
+    slot.device_signal         = std::move(job_signal_ref);
     slot.out_pinned            = out_rows;
     slot.act_pinned            = act_rows;
     slot.weight_pinned         = nullptr;
@@ -81964,8 +82071,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     });
                 } else if (cpu_pool.is_active()) {
                     ggml_sycl::cpu_expert_job_trace job_trace;
-                    result.future     = cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue), {},
-                                                              moe_cpu_job_trace_request(job_trace, src0));
+                    ggml_sycl::cpu_job_signal       job_signal;
+                    moe_cpu_job_device_signal_acquire(*stream, &job_signal, &result.device_signal);
+                    result.future =
+                        cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue), {},
+                                              moe_cpu_job_trace_request(job_trace, src0), std::move(job_signal));
                     result.job_stamps = std::move(job_trace.stamps);
                 } else {
                     result.future = std::async(std::launch::async, [tasks    = std::move(batch_tasks),
@@ -82053,6 +82163,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 g_pending_scatter.row_n             = r.row_n;
                 g_pending_scatter.act_serial        = r.act_serial;
                 g_pending_scatter.job_stamps        = std::move(r.job_stamps);
+                g_pending_scatter.device_signal     = std::move(r.device_signal);
                 g_pending_scatter.shares_activation = r.shares_activation;
                 pending_cpu_scatter_bind_scratch(g_pending_scatter, ctx);
             };
@@ -83411,8 +83522,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 auto &                          cpu_pool = g_cpu_expert_pools[ctx.device];
                 ggml_sycl::cpu_expert_job_trace job_trace;
                 if (cpu_pool.is_active()) {
-                    g_pending_scatter.future = cpu_pool.submit_batch(std::move(batch_tasks), {}, {},
-                                                                     moe_cpu_job_trace_request(job_trace, src0));
+                    ggml_sycl::cpu_job_signal job_signal;
+                    moe_cpu_job_device_signal_acquire(*stream, &job_signal, &g_pending_scatter.device_signal);
+                    g_pending_scatter.future =
+                        cpu_pool.submit_batch(std::move(batch_tasks), {}, {},
+                                              moe_cpu_job_trace_request(job_trace, src0), std::move(job_signal));
                 } else {
                     g_pending_scatter.future =
                         std::async(std::launch::async, [tasks = std::move(batch_tasks)]() mutable {
