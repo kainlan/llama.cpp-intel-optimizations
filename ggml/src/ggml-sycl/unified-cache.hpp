@@ -7,6 +7,7 @@
 #ifndef GGML_SYCL_UNIFIED_CACHE_HPP
 #define GGML_SYCL_UNIFIED_CACHE_HPP
 
+#include "cpu-job-signal.hpp"
 #include "device-pool.hpp"
 #include "dpct/helper.hpp"
 #include "ggml-sycl.h"
@@ -3481,6 +3482,13 @@ class unified_cache {
     // unified_cache_note_host_task().
     void note_compute_host_task(const sycl::event & e);
 
+    // --- CPU expert job device signals (llama.cpp-qwn5) ---
+    // The ring of host-signalled Level Zero events for the CPU expert jobs whose scatter goes on queue_, created on
+    // queue_'s context on first use (see cpu-job-signal.hpp). Null when the ring cannot be made (logged once): the
+    // jobs then keep their host-task joins. Shut down after the queues drain, abandoned with the other driver state
+    // when SYCL is already gone. Reached through unified_cache_cpu_job_signal_acquire().
+    std::shared_ptr<cpu_job_signal_ring> get_cpu_job_signal_ring();
+
     // Ensure a weight is cached, loading from src_ptr if needed
     // Returns device pointer, or nullptr if cache is full and eviction failed
     //
@@ -5118,6 +5126,11 @@ class unified_cache {
     sycl::event                  last_host_task_;
     bool                         last_host_task_valid_     = false;
     bool                         moe_join_queue_announced_ = false;
+    // llama.cpp-qwn5: see get_cpu_job_signal_ring(). Both are read and written only under cpu_job_signal_mutex_,
+    // because shutdown_resources() reads the ring on the tearing-down thread.
+    std::mutex                           cpu_job_signal_mutex_;
+    std::shared_ptr<cpu_job_signal_ring> cpu_job_signal_ring_;
+    bool                                 cpu_job_signal_ring_tried_ = false;
     size_t                       budget_;                   // Total GPU memory budget (after reservations)
     size_t                       base_budget_;              // Raw cache budget before reservations
     size_t                       reserved_;                 // Runtime reservation applied to budget_
@@ -6188,6 +6201,35 @@ sycl::queue * unified_cache_moe_join_queue_for(sycl::queue & stream, sycl::event
 // Records `e`, a host task just submitted on `q`, for the join queue's guard (llama.cpp-wfsl). Every host task
 // the backend submits, other than the joins on the join queue, is recorded here.
 void unified_cache_note_host_task(sycl::queue & q, const sycl::event & e);
+
+// --- CPU expert job device signals (llama.cpp-qwn5); see cpu-job-signal.hpp ---
+// Takes an entry of the ring of the cache whose queue_ is `stream`: *job is the half the job signals, *ref the half
+// the pending scatter keeps. False, leaving both empty, when `stream` is not a cache's queue_ (logged once), the ring
+// cannot be made, or it is full; the job is then joined by a host task. Never blocks on the device. Creates no cache.
+bool unified_cache_cpu_job_signal_acquire(sycl::queue & stream, cpu_job_signal * job, cpu_job_signal_ref * ref);
+
+// Makes a fresh sycl::event wrapping the entry's native event, for the flush's device commands to depend on, and
+// records in `mark` the flush that waits on it: the first wrap of a flush sets mark's ring and serial, and a later
+// one must name the same ring. On success *ref is consumed. A fresh wrapper per use is required: the SYCL runtime
+// caches a completed status on an event, so a wrapper kept across a recycle would read complete for the next job.
+// So the wrapper must never be stored past the flush that submits its commands. False leaves *ref unchanged, and the
+// caller joins the job with a host task instead.
+bool cpu_job_signal_wrap(cpu_job_signal_ref & ref, cpu_job_signal_mark & mark, sycl::event * out);
+
+// Frees the entries the device waited on in flushes up to mark's serial, resetting their native events, and clears
+// `mark`. Call it only after the host has waited an event of mark's flush on the ring's stream: on that in-order
+// stream it completes after every command that waited on those entries.
+void cpu_job_signal_recycle(cpu_job_signal_mark & mark) noexcept;
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// A ring on `q`'s context outside any cache, for the device test; null when the ring cannot be made.
+std::shared_ptr<cpu_job_signal_ring> cpu_job_signal_ring_create_for_testing(sycl::queue & q);
+bool                        cpu_job_signal_acquire_for_testing(const std::shared_ptr<cpu_job_signal_ring> & ring,
+                                                               cpu_job_signal *                             job,
+                                                               cpu_job_signal_ref *                         ref);
+cpu_job_signal_book::counts cpu_job_signal_ring_counts_for_testing(const std::shared_ptr<cpu_job_signal_ring> & ring);
+void                        cpu_job_signal_ring_shutdown_for_testing(const std::shared_ptr<cpu_job_signal_ring> & ring);
+#endif
 
 #if GGML_SYCL_DNNL
 // oneDNN Graph SYCL allocator callbacks (llama.cpp-gwno). Free functions, not

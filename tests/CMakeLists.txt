@@ -485,6 +485,17 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     set_tests_properties(test-sycl-cpu-expert-pool-stamps PROPERTIES LABELS "sycl;moe;hostonly" TIMEOUT 30)
 endif()
 
+# The book of the CPU expert job signal ring (llama.cpp-qwn5): an entry's host-signalled device event is reset and
+# reused only after its job signalled it, the pending scatter's half is gone, and the host waited a flush at least as
+# late as the one that made the device wait on it. ggml-sycl/cpu-job-signal.hpp includes only the standard library,
+# so the test links nothing: no SYCL runtime is loaded and no device is opened.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-cpu-job-signal-book test-sycl-cpu-job-signal-book.cpp)
+    target_include_directories(test-sycl-cpu-job-signal-book PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    add_test(NAME test-sycl-cpu-job-signal-book COMMAND test-sycl-cpu-job-signal-book)
+    set_tests_properties(test-sycl-cpu-job-signal-book PROPERTIES LABELS "sycl;moe;hostonly" TIMEOUT 30)
+endif()
+
 # Host-expert MoE result scatter (llama.cpp-cre6): the compact form (one copy into the planned scratch, one kernel
 # placing rows by slot) against the per-run copies it replaces, on synthetic routings. ggml-sycl/moe-host-scatter.hpp
 # includes only the standard library, so this needs no device.

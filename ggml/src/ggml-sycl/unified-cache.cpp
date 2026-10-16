@@ -30,6 +30,9 @@
 #include "vram-headroom.hpp"
 #include "zone-sizing.hpp"
 
+#include <dlfcn.h>
+#include <level_zero/ze_api.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -45,7 +48,9 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <optional>
 #include <stdexcept>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include <thread>
 #include <type_traits>
 #include <unordered_set>
@@ -6879,6 +6884,10 @@ bool unified_cache::ensure_planned_arena_zones() {
     return true;
 }
 
+// llama.cpp-qwn5: shuts the cache's CPU expert job signal ring down (after the queues drained) or abandons it (SYCL
+// already gone); defined with the ring below.
+static void cpu_job_signal_ring_end(const std::shared_ptr<cpu_job_signal_ring> & ring, bool sycl_gone) noexcept;
+
 unified_cache::~unified_cache() {
     if (!shutdown_resources()) {
         GGML_LOG_ERROR(
@@ -7036,6 +7045,11 @@ bool unified_cache::shutdown_resources() {
         // Leak host_arena_ to prevent pinned_chunk_pool destructor calling sycl::free
         // on an invalid SYCL context (safe shutdown pattern).
         (void) host_arena_.release();
+        // llama.cpp-qwn5: no driver call on an invalid context; the ring keeps only its book.
+        {
+            std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
+            cpu_job_signal_ring_end(cpu_job_signal_ring_, /*sycl_gone=*/true);
+        }
         // llama.cpp-0oxf: onednn_graph_scratch_reuse_pool_
         // is not touched here, unlike the owner members just above -- it does
         // not need to be. Its entries are destroyed the same way any other
@@ -7086,6 +7100,11 @@ bool unified_cache::shutdown_resources() {
 #endif
         // Leak host_arena_ to avoid sycl::free on an invalid context.
         (void) host_arena_.release();
+        // llama.cpp-qwn5: same as the g_sycl_shutting_down branch above.
+        {
+            std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
+            cpu_job_signal_ring_end(cpu_job_signal_ring_, /*sycl_gone=*/true);
+        }
         // llama.cpp-0oxf: same reasoning as the
         // g_sycl_shutting_down branch above -- onednn_graph_scratch_reuse_pool_'s
         // entries are mem_handles, whose own destructor is already
@@ -7101,6 +7120,13 @@ bool unified_cache::shutdown_resources() {
     // before releasing scratch, staging, canonical, or arena owners. A failure
     // on one queue never prevents the remaining queues from being drained.
     if (!drain_all_queues_noexcept()) return false;
+
+    // llama.cpp-qwn5: after the drain no device command waits on a CPU expert job's event, so the ring's driver
+    // objects can go. The halves jobs and pending scatters still hold then only update its book.
+    {
+        std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
+        cpu_job_signal_ring_end(cpu_job_signal_ring_, /*sycl_gone=*/false);
+    }
 
 #if GGML_SYCL_DNNL
     // llama.cpp-0oxf: real release of every pooled DIRECT Graph-scratch
@@ -16825,6 +16851,504 @@ sycl::queue * unified_cache_moe_join_queue_for(sycl::queue & stream, sycl::event
     }
     return cache->moe_join_queue_after(after, has_after);
 }
+
+// --- CPU expert job device signals (llama.cpp-qwn5); see cpu-job-signal.hpp ---
+
+// The Level Zero entry points the ring uses, resolved once from the loader the SYCL runtime has already loaded
+// (RTLD_NOLOAD: no library is loaded here, and ggml-sycl does not link ze_loader), as vmem-kv.cpp does.
+struct cpu_job_signal_l0 {
+    decltype(&zeEventPoolCreate)  pool_create   = nullptr;
+    decltype(&zeEventPoolDestroy) pool_destroy  = nullptr;
+    decltype(&zeEventCreate)      event_create  = nullptr;
+    decltype(&zeEventDestroy)     event_destroy = nullptr;
+    decltype(&zeEventHostSignal)  host_signal   = nullptr;
+    decltype(&zeEventHostReset)   host_reset    = nullptr;
+
+    bool ok() const {
+        return pool_create && pool_destroy && event_create && event_destroy && host_signal && host_reset;
+    }
+};
+
+static const cpu_job_signal_l0 & cpu_job_signal_l0_get() {
+    static const cpu_job_signal_l0 fns = []() {
+        cpu_job_signal_l0 f;
+        void *            lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);
+        if (!lib) {
+            lib = dlopen("libze_loader.so", RTLD_NOW | RTLD_NOLOAD);
+        }
+        if (!lib) {
+            return f;
+        }
+        f.pool_create   = reinterpret_cast<decltype(&zeEventPoolCreate)>(dlsym(lib, "zeEventPoolCreate"));
+        f.pool_destroy  = reinterpret_cast<decltype(&zeEventPoolDestroy)>(dlsym(lib, "zeEventPoolDestroy"));
+        f.event_create  = reinterpret_cast<decltype(&zeEventCreate)>(dlsym(lib, "zeEventCreate"));
+        f.event_destroy = reinterpret_cast<decltype(&zeEventDestroy)>(dlsym(lib, "zeEventDestroy"));
+        f.host_signal   = reinterpret_cast<decltype(&zeEventHostSignal)>(dlsym(lib, "zeEventHostSignal"));
+        f.host_reset    = reinterpret_cast<decltype(&zeEventHostReset)>(dlsym(lib, "zeEventHostReset"));
+        return f;
+    }();
+    return fns;
+}
+
+static void cpu_job_signal_registry_add(const std::shared_ptr<cpu_job_signal_ring> & ring);
+static void cpu_job_signal_registry_prune();
+
+// One device's events: pools of block_events host-visible events with host signal and wait scopes, on the context of
+// the stream whose device commands wait on them, with the book of what each entry is doing. Every member is read and
+// written only under mutex_. live_ is false once the ring is shut down or abandoned: no driver call is made after
+// that, and the halves still held only update the book.
+class cpu_job_signal_ring {
+  public:
+    static constexpr uint32_t block_events = 64;
+    // A Qwen3.8 decode token takes 72 entries (24 host-expert layers times gate, up and down) and the graph-boundary
+    // drain frees them every graph. Past this many entries something is not recycling; the jobs then take host-task
+    // joins rather than the ring growing without bound.
+    static constexpr uint32_t max_events   = 1024;
+
+    static std::shared_ptr<cpu_job_signal_ring> create(const sycl::queue & q, const char ** why) {
+        const cpu_job_signal_l0 & l0 = cpu_job_signal_l0_get();
+        if (!l0.ok()) {
+            *why = "the Level Zero loader's event entry points are not available";
+            return nullptr;
+        }
+        sycl::context ctx = q.get_context();
+        if (ctx.get_backend() != sycl::backend::ext_oneapi_level_zero) {
+            *why = "the stream is not on the Level Zero backend";
+            return nullptr;
+        }
+        ze_context_handle_t zctx = nullptr;
+        try {
+            zctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(ctx);
+        } catch (const sycl::exception &) {
+            zctx = nullptr;
+        }
+        if (!zctx) {
+            *why = "the stream's context has no native Level Zero context";
+            return nullptr;
+        }
+        std::shared_ptr<cpu_job_signal_ring> ring(new cpu_job_signal_ring(std::move(ctx), zctx, l0));
+        {
+            std::lock_guard<std::timed_mutex> lock(ring->mutex_);
+            if (!ring->grow_locked()) {
+                ring->live_ = false;
+                *why        = "creating the first host-visible event pool failed";
+                return nullptr;
+            }
+        }
+        cpu_job_signal_registry_add(ring);
+        return ring;
+    }
+
+    cpu_job_signal_ring(const cpu_job_signal_ring &)             = delete;
+    cpu_job_signal_ring & operator=(const cpu_job_signal_ring &) = delete;
+
+    // The last half let go. A cache shuts its ring down before this; a ring that was not (the device test's) is shut
+    // down here unless the SYCL runtime is already going away.
+    ~cpu_job_signal_ring() {
+        if (ggml_sycl_is_shutting_down()) {
+            abandon();
+        } else {
+            shutdown();
+        }
+        cpu_job_signal_registry_prune();
+    }
+
+    bool acquire(uint32_t * id, uint32_t * generation) {
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        if (!live_) {
+            return false;
+        }
+        if (book_.acquire(id, generation)) {
+            return true;
+        }
+        if (!grow_locked()) {
+            if (!full_warned_) {
+                full_warned_ = true;
+                GGML_LOG_WARN(
+                    "[MOE-DEVSIG] the CPU expert job signal ring cannot grow past %zu entries; jobs past that are "
+                    "joined by host tasks (llama.cpp-qwn5)\n",
+                    book_.size());
+            }
+            return false;
+        }
+        return book_.acquire(id, generation);
+    }
+
+    void signal(uint32_t id, uint32_t generation) noexcept {
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        if (book_.signal(id, generation) && live_) {
+            signal_native_locked(id);
+        }
+    }
+
+    void drop(uint32_t id, uint32_t generation) noexcept {
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        book_.drop(id, generation);
+    }
+
+    // *serial is the flush's serial, or 0 for the first wrap of a flush, which takes a new one.
+    bool wrap(uint32_t id, uint32_t generation, uint64_t * serial, sycl::event * out) {
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        if (!live_ || id >= book_.size()) {
+            return false;
+        }
+        const cpu_job_signal_book::entry & e = book_.at(id);
+        if (e.generation != generation || !e.ref_live) {
+            return false;
+        }
+        sycl::event ev;
+        try {
+            ev = sycl::make_event<sycl::backend::ext_oneapi_level_zero>(
+                { events_[id], sycl::ext::oneapi::level_zero::ownership::keep }, *ctx_);
+        } catch (const sycl::exception & ex) {
+            if (!wrap_warned_) {
+                wrap_warned_ = true;
+                GGML_LOG_WARN(
+                    "[MOE-DEVSIG] wrapping a CPU expert job's event failed; that job is joined by a host "
+                    "task: %s (llama.cpp-qwn5)\n",
+                    ex.what());
+            }
+            return false;
+        }
+        const uint64_t s = *serial != 0 ? *serial : book_.begin_flush();
+        if (!book_.consume(id, generation, s)) {
+            return false;
+        }
+        *serial = s;
+        *out    = std::move(ev);
+        return true;
+    }
+
+    size_t recycle(uint64_t upto) noexcept {
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        return book_.recycle(upto, [this](uint32_t id) {
+            if (!live_) {
+                return true;
+            }
+            const ze_result_t r = l0_->host_reset(events_[id]);
+            if (r != ZE_RESULT_SUCCESS && !reset_warned_) {
+                reset_warned_ = true;
+                GGML_LOG_ERROR(
+                    "[MOE-DEVSIG] zeEventHostReset failed (%d); the entry is retired rather than reused signalled, "
+                    "which would let the next job's scatter read its outputs early (llama.cpp-qwn5)\n",
+                    (int) r);
+            }
+            return r == ZE_RESULT_SUCCESS;
+        });
+    }
+
+    // Bounded lock: this runs from the abort callback, possibly on a thread that already holds mutex_.
+    size_t signal_all() noexcept {
+        std::unique_lock<std::timed_mutex> lock(mutex_, std::defer_lock);
+        if (!lock.try_lock_for(std::chrono::milliseconds(200))) {
+            return 0;
+        }
+        return book_.signal_all([this](uint32_t id) {
+            if (live_) {
+                signal_native_locked(id);
+            }
+        });
+    }
+
+    // After the cache's queues drained, no device command waits on an entry. Signals what is still acquired (a job
+    // that has not run releases nothing then), destroys the driver objects and keeps only the book. Idempotent.
+    void shutdown() noexcept {
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        if (!live_) {
+            return;
+        }
+        book_.signal_all([this](uint32_t id) { signal_native_locked(id); });
+        for (ze_event_handle_t ev : events_) {
+            (void) l0_->event_destroy(ev);
+        }
+        for (ze_event_pool_handle_t pool : pools_) {
+            (void) l0_->pool_destroy(pool);
+        }
+        events_.clear();
+        pools_.clear();
+        live_ = false;
+    }
+
+    // The SYCL runtime is gone: no driver call, the handles are left to the process exit.
+    void abandon() noexcept {
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        events_.clear();
+        pools_.clear();
+        live_ = false;
+    }
+
+    cpu_job_signal_book::counts counts() {
+        std::lock_guard<std::timed_mutex> lock(mutex_);
+        return book_.count();
+    }
+
+  private:
+    cpu_job_signal_ring(sycl::context ctx, ze_context_handle_t zctx, const cpu_job_signal_l0 & l0) :
+        ctx_(std::move(ctx)),
+        zctx_(zctx),
+        l0_(&l0) {}
+
+    // The release fence orders the job's host writes before the device can observe the signal.
+    void signal_native_locked(uint32_t id) noexcept {
+        std::atomic_thread_fence(std::memory_order_release);
+        const ze_result_t r = l0_->host_signal(events_[id]);
+        if (r != ZE_RESULT_SUCCESS && !signal_warned_) {
+            signal_warned_ = true;
+            GGML_LOG_ERROR(
+                "[MOE-DEVSIG] zeEventHostSignal failed (%d): a device command waiting on this CPU expert job stays "
+                "parked (llama.cpp-qwn5)\n",
+                (int) r);
+        }
+    }
+
+    bool grow_locked() {
+        if (book_.size() + block_events > max_events) {
+            return false;
+        }
+        ze_event_pool_desc_t pd{};
+        pd.stype                    = ZE_STRUCTURE_TYPE_EVENT_POOL_DESC;
+        pd.flags                    = ZE_EVENT_POOL_FLAG_HOST_VISIBLE;
+        pd.count                    = block_events;
+        ze_event_pool_handle_t pool = nullptr;
+        if (l0_->pool_create(zctx_, &pd, 0, nullptr, &pool) != ZE_RESULT_SUCCESS || !pool) {
+            return false;
+        }
+        std::vector<ze_event_handle_t> made;
+        made.reserve(block_events);
+        for (uint32_t i = 0; i < block_events; ++i) {
+            ze_event_desc_t ed{};
+            ed.stype             = ZE_STRUCTURE_TYPE_EVENT_DESC;
+            ed.index             = i;
+            ed.signal            = ZE_EVENT_SCOPE_FLAG_HOST;
+            ed.wait              = ZE_EVENT_SCOPE_FLAG_HOST;
+            ze_event_handle_t ev = nullptr;
+            if (l0_->event_create(pool, &ed, &ev) != ZE_RESULT_SUCCESS || !ev) {
+                for (ze_event_handle_t m : made) {
+                    (void) l0_->event_destroy(m);
+                }
+                (void) l0_->pool_destroy(pool);
+                return false;
+            }
+            made.push_back(ev);
+        }
+        pools_.push_back(pool);
+        events_.insert(events_.end(), made.begin(), made.end());
+        (void) book_.add(block_events);
+        return true;
+    }
+
+    std::timed_mutex                    mutex_;
+    cpu_job_signal_book                 book_;
+    std::vector<ze_event_pool_handle_t> pools_;
+    std::vector<ze_event_handle_t>      events_;  // index = book entry
+    std::optional<sycl::context>        ctx_;
+    ze_context_handle_t                 zctx_          = nullptr;
+    const cpu_job_signal_l0 *           l0_            = nullptr;
+    bool                                live_          = true;
+    bool                                full_warned_   = false;
+    bool                                wrap_warned_   = false;
+    bool                                reset_warned_  = false;
+    bool                                signal_warned_ = false;
+};
+
+// The live rings, for cpu_job_signal_signal_all(), and the ggml abort callback they install. Made once and never
+// destroyed: a ring can be released during static destruction (a CPU expert pool, a static of ggml-sycl.cpp, can still
+// hold a job's half then), after this TU's statics would be gone.
+struct cpu_job_signal_registry {
+    std::timed_mutex                                mutex;
+    std::vector<std::weak_ptr<cpu_job_signal_ring>> rings;
+    std::atomic<ggml_abort_callback_t>              previous{ nullptr };
+    bool                                            installed = false;
+};
+
+static cpu_job_signal_registry & cpu_job_signal_registry_get() {
+    static cpu_job_signal_registry * registry = new cpu_job_signal_registry();
+    return *registry;
+}
+
+// GGML_ABORT and GGML_ASSERT end the process with abort(), and no destructor runs: release every device command
+// parked on a CPU expert job first, then do what the abort would have done without this callback.
+static void cpu_job_signal_abort_callback(const char * message) {
+    cpu_job_signal_signal_all();
+    const ggml_abort_callback_t previous = cpu_job_signal_registry_get().previous.load(std::memory_order_acquire);
+    if (previous) {
+        previous(message);
+    } else {
+        fprintf(stderr, "%s\n", message);
+        ggml_print_backtrace();
+    }
+}
+
+static void cpu_job_signal_registry_add(const std::shared_ptr<cpu_job_signal_ring> & ring) {
+    cpu_job_signal_registry &         r = cpu_job_signal_registry_get();
+    std::lock_guard<std::timed_mutex> lock(r.mutex);
+    r.rings.push_back(ring);
+    if (!r.installed) {
+        r.previous.store(ggml_set_abort_callback(cpu_job_signal_abort_callback), std::memory_order_release);
+        r.installed = true;
+    }
+}
+
+// Drops the expired rings. With none left, puts the previous abort callback back, unless something replaced this
+// one meanwhile: then that one stays, so the library can be unloaded with no callback of its own installed only when
+// nothing else took over.
+static void cpu_job_signal_registry_prune() {
+    cpu_job_signal_registry &         r = cpu_job_signal_registry_get();
+    std::lock_guard<std::timed_mutex> lock(r.mutex);
+    r.rings.erase(std::remove_if(r.rings.begin(), r.rings.end(),
+                                 [](const std::weak_ptr<cpu_job_signal_ring> & w) { return w.expired(); }),
+                  r.rings.end());
+    if (r.rings.empty() && r.installed) {
+        const ggml_abort_callback_t current = ggml_set_abort_callback(r.previous.load(std::memory_order_acquire));
+        if (current != cpu_job_signal_abort_callback) {
+            (void) ggml_set_abort_callback(current);
+        }
+        r.installed = false;
+    }
+}
+
+void cpu_job_signal_signal_all() noexcept {
+    cpu_job_signal_registry &          r = cpu_job_signal_registry_get();
+    std::unique_lock<std::timed_mutex> lock(r.mutex, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::milliseconds(200))) {
+        return;
+    }
+    // Released after the registry lock: dropping the last owner of a ring prunes the registry under that lock.
+    std::vector<std::shared_ptr<cpu_job_signal_ring>> live;
+    live.reserve(r.rings.size());
+    for (const std::weak_ptr<cpu_job_signal_ring> & w : r.rings) {
+        if (std::shared_ptr<cpu_job_signal_ring> ring = w.lock()) {
+            live.push_back(std::move(ring));
+        }
+    }
+    lock.unlock();
+    for (const std::shared_ptr<cpu_job_signal_ring> & ring : live) {
+        (void) ring->signal_all();
+    }
+}
+
+static void cpu_job_signal_ring_end(const std::shared_ptr<cpu_job_signal_ring> & ring, bool sycl_gone) noexcept {
+    if (!ring) {
+        return;
+    }
+    if (sycl_gone) {
+        ring->abandon();
+    } else {
+        ring->shutdown();
+    }
+}
+
+void cpu_job_signal::signal() noexcept {
+    if (ring_) {
+        ring_->signal(id_, generation_);
+        ring_.reset();
+    }
+}
+
+void cpu_job_signal_ref::reset() noexcept {
+    if (ring_) {
+        ring_->drop(id_, generation_);
+        ring_.reset();
+    }
+}
+
+std::shared_ptr<cpu_job_signal_ring> unified_cache::get_cpu_job_signal_ring() {
+    std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
+    if (!cpu_job_signal_ring_tried_) {
+        cpu_job_signal_ring_tried_ = true;
+        const char * why           = "unknown";
+        cpu_job_signal_ring_       = cpu_job_signal_ring::create(queue_, &why);
+        if (cpu_job_signal_ring_) {
+            GGML_LOG_INFO(
+                "[MOE-DEVSIG] CPU expert jobs release the device with host-signalled events on device %d "
+                "(llama.cpp-qwn5)\n",
+                get_device_id_from_queue(queue_));
+        } else {
+            GGML_LOG_WARN("[MOE-DEVSIG] CPU expert jobs keep their host-task joins on device %d: %s (llama.cpp-qwn5)\n",
+                          get_device_id_from_queue(queue_), why);
+        }
+    }
+    return cpu_job_signal_ring_;
+}
+
+// Set once a CPU expert job asked for a ring on a stream that is not a cache's queue_; that is logged once.
+static std::atomic<bool> g_cpu_job_signal_foreign_stream_logged{ false };
+
+bool unified_cache_cpu_job_signal_acquire(sycl::queue & stream, cpu_job_signal * job, cpu_job_signal_ref * ref) {
+    unified_cache * cache = moe_join_queue_cache_of(stream);
+    if (!cache) {
+        if (!g_cpu_job_signal_foreign_stream_logged.exchange(true, std::memory_order_acq_rel)) {
+            GGML_LOG_WARN(
+                "[MOE-DEVSIG] a CPU expert job's stream is not a cache's compute stream; such jobs are joined by host "
+                "tasks (llama.cpp-qwn5)\n");
+        }
+        return false;
+    }
+    std::shared_ptr<cpu_job_signal_ring> ring = cache->get_cpu_job_signal_ring();
+    uint32_t                             id   = 0;
+    uint32_t                             gen  = 0;
+    if (!ring || !ring->acquire(&id, &gen)) {
+        return false;
+    }
+    *job = cpu_job_signal(ring, id, gen);
+    *ref = cpu_job_signal_ref(std::move(ring), id, gen);
+    return true;
+}
+
+bool cpu_job_signal_wrap(cpu_job_signal_ref & ref, cpu_job_signal_mark & mark, sycl::event * out) {
+    if (!ref || (mark.ring && mark.ring != ref.ring())) {
+        return false;
+    }
+    uint64_t serial = mark.ring ? mark.serial : 0;
+    if (!ref.ring()->wrap(ref.id(), ref.generation(), &serial, out)) {
+        return false;
+    }
+    mark.ring   = ref.ring();
+    mark.serial = serial;
+    ref.release();
+    return true;
+}
+
+void cpu_job_signal_recycle(cpu_job_signal_mark & mark) noexcept {
+    if (mark) {
+        (void) mark.ring->recycle(mark.serial);
+    }
+    mark = cpu_job_signal_mark{};
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+std::shared_ptr<cpu_job_signal_ring> cpu_job_signal_ring_create_for_testing(sycl::queue & q) {
+    const char * why = "unknown";
+    auto         r   = cpu_job_signal_ring::create(q, &why);
+    if (!r) {
+        GGML_LOG_WARN("[MOE-DEVSIG] test ring not created: %s\n", why);
+    }
+    return r;
+}
+
+bool cpu_job_signal_acquire_for_testing(const std::shared_ptr<cpu_job_signal_ring> & ring,
+                                        cpu_job_signal *                             job,
+                                        cpu_job_signal_ref *                         ref) {
+    uint32_t id  = 0;
+    uint32_t gen = 0;
+    if (!ring || !ring->acquire(&id, &gen)) {
+        return false;
+    }
+    *job = cpu_job_signal(ring, id, gen);
+    *ref = cpu_job_signal_ref(ring, id, gen);
+    return true;
+}
+
+cpu_job_signal_book::counts cpu_job_signal_ring_counts_for_testing(const std::shared_ptr<cpu_job_signal_ring> & ring) {
+    return ring ? ring->counts() : cpu_job_signal_book::counts{};
+}
+
+void cpu_job_signal_ring_shutdown_for_testing(const std::shared_ptr<cpu_job_signal_ring> & ring) {
+    if (ring) {
+        ring->shutdown();
+    }
+}
+#endif
 
 // Direct arena zone query — caller MUST hold g_cache_rw_mutex.
 // Accesses g_device_caches without re-acquiring the lock.
