@@ -103372,9 +103372,10 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
 // pinned-pool H2D (and a host join) into the graph. So the same per-node checks run here, on the host, for every
 // node of the segment before it is recorded and before it is replayed: exactly the slots one of its nodes reads
 // are published, in node order, and the rest stay deferred (a shared-expert run after the MoE section keeps
-// overlapping the CPU experts). Nothing the segment reads is then pending while it records. The H2D copies go to
-// the same in-order queue the segment is submitted to, which orders them ahead of it without a host wait on the
-// device. Direct segments and MoE boundary nodes keep the per-node flushes and do not call this.
+// overlapping the CPU experts). Nothing the segment reads is then deferred while it records. The H2D copies go to
+// the same in-order queue the segment is submitted to, which orders them ahead of a replay without a host wait on
+// the device. A recording needs more than that order: moe_graph_segment_record_drain, below, on the record path
+// only. Direct segments and MoE boundary nodes keep the per-node flushes and do not call this.
 static void moe_graph_segment_boundary_flush(const ggml_cgraph * cgraph, int start, int end, int device) {
     for (int i = start; i < end; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
@@ -103385,6 +103386,21 @@ static void moe_graph_segment_boundary_flush(const ggml_cgraph * cgraph, int sta
         flush_pending_secondary_scatter_if_consumed(node, device);
         flush_pending_attn_if_consumed(node, device);
     }
+}
+
+// Before a segment records, everything earlier on its stream must be complete (llama.cpp-qwn5). A recorded graph
+// cannot depend on an event from outside itself: while a graph records, a source whose ready event is still pending
+// is chained (ggml_sycl_should_add_dependency keeps in-flight events then), the graph API rejects an edge to a
+// command outside the graph, and the segment runs directly on every later token. No such edge is needed either:
+// each segment slot replays on the stream it recorded on, which is in-order, after a boundary flush that republishes
+// what the segment reads on that stream, so the stream's order carries every pre-record command at replay. The
+// record-time state must therefore be "everything earlier on this stream is complete", which the boundary flush's
+// H2D used to provide as a side effect while it took mem_copy_submit's staged branch, whose host wait covered the
+// copy and, the queue being in-order, everything before it. Waiting the stream also covers the join host tasks the
+// flushed scatter depends on. This is a setup wait, once per segment recording: a replay, and a token that records
+// nothing, reach no wait and submit no command.
+static void moe_graph_segment_record_drain(sycl::queue & stream) {
+    stream.wait_and_throw();
 }
 
 // A segmented record or replay bypasses compute_impl, so it owns the per-graph work compute_impl does at its
@@ -103863,8 +103879,9 @@ static void moe_graph_record_segment_slot(ggml_backend_sycl_context *           
             continue;
         }
 
-        // Publish what the segment reads before the queue enters recording mode.
+        // Publish what the segment reads before the queue enters recording mode, and let it land (see the drain).
         moe_graph_segment_boundary_flush(cgraph, item.start, item.end, sycl_ctx->device);
+        moe_graph_segment_record_drain(*stream);
         // The recording quantizes its own activations: no hit on a Q8 buffer some other dispatch filled.
         sycl_ctx->mmvq_q8_activation_cache.invalidate();
         const size_t                                     retained_baseline = slot.retained_handles.size();
@@ -104165,8 +104182,9 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
             continue;
         }
 
-        // Publish what the segment reads before the queue enters recording mode (see the helper).
+        // Publish what the segment reads before the queue enters recording mode, and let it land (see the helpers).
         moe_graph_segment_boundary_flush(cgraph, seg.start, seg.end, sycl_ctx->device);
+        moe_graph_segment_record_drain(*stream);
         const size_t retained_baseline = sycl_ctx->graph_retained_handles.size();
         bool segment_submitted = false;
         struct recording_depth_owner {

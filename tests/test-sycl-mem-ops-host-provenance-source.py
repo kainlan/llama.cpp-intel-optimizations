@@ -32,7 +32,13 @@ when the DMA runs.  Each mem_copy_async site whose host endpoint can be in scope
     flush's events or a queue barrier when its copy does not order the scatter, and every job buffer is retained
     until its join;
   - backend-buffer storage stays out of scope (pin T): the SYCL device buffers' owners carry roles COMPUTE, KV and
-    WEIGHT, and the SYCL_Host buffer's in-scope owner is held only as the buffer's identity, never as a copy endpoint.
+    WEIGHT, and the SYCL_Host buffer's in-scope owner is held only as the buffer's identity, never as a copy endpoint;
+  - segment graph recording relied on the staged H2D's host wait as an ordering assumption (pin D): the boundary
+    flush ran just before begin_recording, and its staged copy left everything earlier on the in-order stream
+    complete.  Direct, the copy and the MoE output's ready event are still pending when the segment records, the
+    recording chains that event, the graph API rejects an edge to a command outside the graph, and the segment runs
+    directly on every token (25 to 30 of 61 segments on the Qwen hybrid decode, 2.1 to 2.3x slower).  Both segment
+    record paths now drain the stream between the flush and begin_recording; replays do not.
 
 THE CONTRACT.  With comments blanked:
   O. (mem-handle.hpp, mem-handle.cpp) bool owner_metadata(alloc_metadata * out) const is declared; its definition
@@ -63,12 +69,16 @@ THE CONTRACT.  With comments blanked:
      flushes the sibling then the primary, records its events as the last flush and retains every job buffer until
      its join; the retained route waits the last flush's events or a queue barrier as moe_cpu_job_order_decide says,
      which answers WAIT_QUEUE for a job that made no activation copy.
+  D. (ggml-sycl.cpp) moe_graph_segment_record_drain waits its stream; moe_graph_record_segment_slot and
+     moe_graph_record_segments each call it once on *stream, after the segment's boundary flush and before
+     begin_recording; nothing else calls it, so no replay (moe_graph_replay_segment_slot, moe_graph_replay_segments),
+     no boundary flush and no segmented-call prologue reaches a wait.
 
 NOT VACUOUS.  --self-test runs the gate on in-memory mutants of the real sources and requires each to FAIL on its
 own pin, then requires the unmodified tree to pass.
 
-RED on the tree before the change: O, S, H, M, F and I fail; R, T and G pass, because they pin text the change
-keeps.
+RED on the tree before the change (0c0780428): O, S, H, M, F, I and D fail; R, T and G pass, because they pin
+text the change keeps.  On e4e36a693, which made the copies direct before the drain existed, only D fails.
 """
 
 from __future__ import annotations
@@ -111,6 +121,15 @@ FLUSH_SIG = r"static void flush_pending_cpu_scatter\(\)\s*\{"
 KEEP_SIG = r"inline bool moe_sibling_pending_keep\(const moe_sibling_pending_request & r\)\s*\{"
 DISJOINT_SIG = r"inline bool moe_pool_spans_disjoint\(size_t a_first, size_t a_count, size_t b_first, size_t b_count\)\s*\{"
 ORDER_SIG = r"inline moe_cpu_job_order moe_cpu_job_order_decide\(const moe_cpu_job_order_request & r\)\s*\{"
+DRAIN_SIG = r"static void moe_graph_segment_record_drain\(sycl::queue & stream\)\s*\{"
+RECORD_SLOT_SIG = r"static void moe_graph_record_segment_slot\([^)]*\)\s*\{"
+RECORD_SEGS_SIG = r"static bool moe_graph_record_segments\([^)]*\)\s*\{"
+NO_DRAIN_SIGS = (
+    (r"static void moe_graph_replay_segment_slot\([^)]*\)\s*\{", "moe_graph_replay_segment_slot"),
+    (r"static void moe_graph_replay_segments\([^)]*\)\s*\{", "moe_graph_replay_segments"),
+    (r"static void moe_graph_segment_boundary_flush\([^)]*\)\s*\{", "moe_graph_segment_boundary_flush"),
+    (r"static void moe_graph_segmented_call_begin\([^)]*\)\s*\{", "moe_graph_segmented_call_begin"),
+)
 
 H2D_TEST = "if (d.on_device && !s.on_device && !host_endpoint_is_usm_accessible(src, s.ptr, *copy_queue)) {"
 D2H_TEST = "if (!d.on_device && s.on_device && !host_endpoint_is_usm_accessible(dst, d.ptr, *copy_queue)) {"
@@ -165,6 +184,14 @@ ORDER_SWITCH = ("switch (ggml_sycl::moe_cpu_job_order_decide(order_req)) { case 
                 "job_inputs.events.insert(job_inputs.events.end(), g_cpu_scatter_last_flush.events.begin(), "
                 "g_cpu_scatter_last_flush.events.end()); break; case ggml_sycl::MOE_CPU_JOB_ORDER_WAIT_QUEUE: "
                 "job_inputs.events.push_back(stream->ext_oneapi_submit_barrier()); break; default: break; }")
+DRAIN_BODY = "stream.wait_and_throw();"
+DRAIN_CALL = "moe_graph_segment_record_drain(*stream);"
+RECORD_STEPS = (
+    (RECORD_SLOT_SIG, "moe_graph_record_segment_slot",
+     "moe_graph_segment_boundary_flush(cgraph, item.start, item.end, sycl_ctx->device);"),
+    (RECORD_SEGS_SIG, "moe_graph_record_segments",
+     "moe_graph_segment_boundary_flush(cgraph, seg.start, seg.end, sycl_ctx->device);"),
+)
 ORDER_HEAD = ("if (!r.op_from_pool) { return MOE_CPU_JOB_ORDER_OWN_BUFFERS; } if (!r.has_activation_copy || "
               "r.current_scatter_serial < r.copy_scatter_serial) { return MOE_CPU_JOB_ORDER_WAIT_QUEUE; }")
 
@@ -507,6 +534,28 @@ def check_ring(s: dict) -> None:
         fail("G", "moe_cpu_job_order_decide no longer answers WAIT_QUEUE for a pool job without an activation copy")
 
 
+
+def check_drain(s: dict) -> None:
+    if flat_body(s["backend"], DRAIN_SIG, "D") != DRAIN_BODY:
+        fail("D", "moe_graph_segment_record_drain no longer waits its stream, so a segment can record while the "
+                  "boundary flush's copies are pending and fall back to direct dispatch")
+    for sig, name in NO_DRAIN_SIGS:
+        if "moe_graph_segment_record_drain(" in flat_body(s["backend"], sig, "D"):
+            fail("D", f"{name} drains the stream, which puts a host wait on every replay or token")
+    backend = flat(blank_comments(s["backend"]))
+    if backend.count("moe_graph_segment_record_drain(") != 3:
+        fail("D", "moe_graph_segment_record_drain is not defined once and called exactly twice, once per segment "
+                  "record path")
+    for sig, name, flush in RECORD_STEPS:
+        body = flat_body(s["backend"], sig, "D")
+        if body.count(DRAIN_CALL) != 1:
+            fail("D", f"{name} does not drain its stream exactly once before recording")
+        in_order(body, ((flush, "publishes no segment inputs"),
+                        (DRAIN_CALL, "does not drain its stream after the boundary flush"),
+                        ("seg_graph.begin_recording(*stream);", "does not begin recording after the drain")),
+                 "D", name)
+
+
 CHECKS = (
     ("O", check_owner),
     ("S", check_scope),
@@ -517,6 +566,7 @@ CHECKS = (
     ("I", check_ids),
     ("T", check_storage),
     ("G", check_ring),
+    ("D", check_drain),
 )
 
 
@@ -686,6 +736,50 @@ def self_test(s: dict) -> int:
              r"\1")),
         ("G", "hostpath", "job without an activation copy not ordered",
          sub(r"if \(!r\.has_activation_copy \|\| r\.current_scatter_serial", "if (r.current_scatter_serial")),
+        ("D", "backend", "record-time drain waits nothing",
+         sub(r"(static void moe_graph_segment_record_drain\(sycl::queue & stream\) \{\n\s*)stream\.wait_and_throw\(\);",
+             r"\1(void) stream;")),
+        ("D", "backend", "slot record path skips the drain",
+         sub(r"(moe_graph_segment_boundary_flush\(cgraph, item\.start, item\.end, sycl_ctx->device\);)\n\s*"
+             r"moe_graph_segment_record_drain\(\*stream\);", r"\1")),
+        ("D", "backend", "single-slot record path skips the drain",
+         sub(r"(moe_graph_segment_boundary_flush\(cgraph, seg\.start, seg\.end, sycl_ctx->device\);)\n\s*"
+             r"moe_graph_segment_record_drain\(\*stream\);", r"\1")),
+        ("D", "backend", "drain before the boundary flush",
+         sub(r"(\n\s*)(moe_graph_segment_boundary_flush\(cgraph, item\.start, item\.end, sycl_ctx->device\);)"
+             r"(\n\s*)(moe_graph_segment_record_drain\(\*stream\);)", r"\1\4\3\2")),
+        ("D", "backend", "drain after begin_recording",
+         chain(sub(r"(moe_graph_segment_boundary_flush\(cgraph, item\.start, item\.end, sycl_ctx->device\);)\n\s*"
+                   r"moe_graph_segment_record_drain\(\*stream\);", r"\1"),
+               sub(r"(\n(\s*)seg_graph\.begin_recording\(\*stream\);\n\s*end_guard\.open = true;)",
+                   r"\1\n\2moe_graph_segment_record_drain(*stream);"))),
+        ("D", "backend", "drain moved to the slot replay",
+         chain(sub(r"(moe_graph_segment_boundary_flush\(cgraph, item\.start, item\.end, sycl_ctx->device\);)\n\s*"
+                   r"moe_graph_segment_record_drain\(\*stream\);", r"\1"),
+               sub(r"(moe_graph_segment_boundary_flush\(cgraph, seg\.start_node, seg\.end_node, sycl_ctx->device\);)"
+                   r"(\n(\s*)ggml_sycl::graph_exec_submit\(\*stream, \*seg\.exec_graph\);)",
+                   r"\1\n\3moe_graph_segment_record_drain(*stream);\2"))),
+        ("D", "backend", "drain moved into the boundary flush, so every replay waits",
+         chain(sub(r"(moe_graph_segment_boundary_flush\(cgraph, item\.start, item\.end, sycl_ctx->device\);)\n\s*"
+                   r"moe_graph_segment_record_drain\(\*stream\);", r"\1"),
+               sub(r"(static void moe_graph_segment_boundary_flush\(const ggml_cgraph \* cgraph, int start, int end, "
+                   r"int device\) \{\n)", r"\1    moe_graph_segment_record_drain(*ggml_sycl_get_device(device)"
+                   r".default_queue());\n"))),
+        ("D", "backend", "drain added to the slot replay",
+         sub(r"(moe_graph_segment_boundary_flush\(cgraph, seg\.start_node, seg\.end_node, sycl_ctx->device\);)"
+             r"(\n(\s*)ggml_sycl::graph_exec_submit\(\*stream, \*seg\.exec_graph\);)",
+             r"\1\n\3moe_graph_segment_record_drain(*stream);\2")),
+        ("D", "backend", "drain added to the graph-boundary flush, so every token waits",
+         sub(r"(void ggml_sycl_cpu_tg_flush_pending\(\) \{\n\s*moe_hostpath_wait_context boundary_waits\(MOE_WAIT_B7\);\n)",
+             r"\1    moe_graph_segment_record_drain(*ggml_sycl_get_device(0).default_queue());\n")),
+        ("D", "backend", "slot record drain moved to the graph-boundary flush",
+         chain(sub(r"(moe_graph_segment_boundary_flush\(cgraph, item\.start, item\.end, sycl_ctx->device\);)\n\s*"
+                   r"moe_graph_segment_record_drain\(\*stream\);", r"\1"),
+               sub(r"(void ggml_sycl_cpu_tg_flush_pending\(\) \{\n\s*moe_hostpath_wait_context boundary_waits\(MOE_WAIT_B7\);\n)",
+                   r"\1    moe_graph_segment_record_drain(*ggml_sycl_get_device(0).default_queue());\n"))),
+        ("D", "backend", "drain added to every segmented call",
+         sub(r"(static void moe_graph_segmented_call_begin\(ggml_backend_sycl_context \* sycl_ctx, ggml_cgraph \* "
+             r"cgraph\) \{\n)", r"\1    moe_graph_segment_record_drain(*sycl_ctx->stream());\n")),
     ]
     failures = []
     caught = 0
@@ -742,7 +836,8 @@ def main(argv: list[str]) -> int:
         print(f"FAIL: {failed} of {len(CHECKS)} pins {TAG}")
         return 1
     print("PASS: mem_copy_submit asks an in-scope host endpoint's owner before the registry, the MoE ids stage is "
-          f"fresh per call, backend storage stays out of scope and the ring is rewritten only behind its events {TAG}")
+          "fresh per call, backend storage stays out of scope, the ring is rewritten only behind its events and a "
+          f"segment records only after its stream drains {TAG}")
     return 0
 
 
