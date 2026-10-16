@@ -3336,6 +3336,41 @@ set_tests_properties(test-sycl-retained-reap PROPERTIES
     TIMEOUT 120
 )
 
+# Test: a device command waiting on a CPU expert job's ring entry runs only after the entry is signalled -- by the
+# job half, its destructor, or signal-all -- a recycled entry parks the next job's command again, an entry whose
+# stream was not waited stays in use, and a pool job whose prologue throws releases the device before the process
+# ends (llama.cpp-qwn5). It opens a Level Zero GPU, so it is labelled cache (lead-run) and pinned to the B70: no
+# iGPU, whose "VRAM" is host RAM (CLAUDE.md, llama.cpp-403s). ENVIRONMENT replaces an outer ONEAPI_DEVICE_SELECTOR,
+# so the card is this one. It exits 77 without a GPU. The child arms re-exec the binary through /proc/self/exe and
+# inherit the selector.
+add_executable(test-sycl-cpu-job-signal-ring
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-cpu-job-signal-ring.cpp
+)
+target_include_directories(test-sycl-cpu-job-signal-ring PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-cpu-job-signal-ring PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-cpu-job-signal-ring PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-cpu-job-signal-ring PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-cpu-job-signal-ring PRIVATE ggml-sycl-private-fixtures Threads::Threads)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-cpu-job-signal-ring PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-cpu-job-signal-ring COMMAND test-sycl-cpu-job-signal-ring)
+set_tests_properties(test-sycl-cpu-job-signal-ring PROPERTIES
+    LABELS "sycl;moe;cache;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 180
+)
+
 # Test: the host pool's inference-phase gate (grow_zone, grow_into) skips only
 # for a TRANSACTION-kind L0 token, and its warning names the calling site. A real
 # pinned_chunk_pool on the OpenCL CPU device with 1 MB chunks, so the selector is

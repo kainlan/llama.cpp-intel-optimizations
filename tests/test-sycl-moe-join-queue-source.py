@@ -64,6 +64,9 @@ THE CONTRACT.  With comments blanked:
      until joins[k], and a flush that places no rows puts a barrier on the stream behind
      the joins while they may be off it (the selector's own predicate), so the stream's
      later commands still follow them and GGML_SYCL_MOE_JOIN_QUEUE=0 adds no command.
+     This covers the members that are joined.  A member the device waits on its job's
+     own event takes no join (llama.cpp-qwn5); test-sycl-moe-cpu-job-device-signal-source.py
+     pins that path, its retention and its empty flush.
   C. (docs/backend/sycl-env-vars.md) the GGML_SYCL_MOE_JOIN_QUEUE row states the
      mechanism, the guard and fallbacks, the joinq= field, the atoi parse, and the
      oneAPI 2026.1 / driver 26.35 caveat.
