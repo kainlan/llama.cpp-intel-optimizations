@@ -33,12 +33,15 @@
 //   on the ring's stream whose serial is at least the one that made the device wait on it. On an in-order stream that
 //   event completes after every earlier command, so no command still waits on the entry when its native event is reset.
 //
-// This header includes only the standard library, so tests/test-sycl-cpu-job-signal-book.cpp checks the book without
-// a device.
+// This header includes only the standard library, so tests/test-sycl-cpu-job-signal-book.cpp checks the book and the
+// gate list without a device.
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace ggml_sycl {
@@ -188,6 +191,109 @@ class cpu_job_signal_book {
     uint64_t              serial_ = 0;
 };
 
+// The gates of one ring (llama.cpp-qwn5): the future of each CPU expert job the device waits on its own event, so that
+// a host thread about to wait on the device behind such a job first sleeps until the job is done.
+//
+// Why. With the job's event waited by the device itself, a host wait on the stream behind the job is a wait inside the
+// driver, which polls for the job's whole length. On the B70 at -ngl 40 two threads polled there: the one running the
+// backend's synchronize, which the scheduler calls for every cross-backend input of a single-device run (by the code
+// path about 196 times a token), and the retained-handle reaper. Both took CPU from the job's own row threads. Sleeping
+// on the job's future first leaves the driver only the device work after the job.
+//
+// A gate decides only how a host thread waits, never whether: the device wait after it is what orders the host. So a
+// gate dropped early (past max_gates, or cleared by a serial that covers it) costs only that sleep.
+//
+// A gate holds only the job's shared_future: no job, no buffer, no event. wait() returns once the job's promise holds a
+// value or an exception, a broken promise included, and never throws; nothing calls get(), wait_for() or wait_until()
+// on a gate. The waits run on a snapshot taken under the list's lock and released before the first wait, so a producer
+// pushing a gate never blocks behind a sleeper; a caller holds no other lock across them either.
+//
+// The hazard. A gate opens when its job ends, and every path that ends a job reaches that (the worker after the kernel,
+// a throw that unwinds the job, the job destroyed unrun), except one: CpuExpertPool::stop_workers detaches a worker
+// that did not join within 5 s, and that worker's job may never end. Its gate then never opens, and a waiter that
+// reaches it sleeps for good. The device command parked on that job's event does not end either, so the device wait
+// the gate stands in front of would not have returned.
+class cpu_job_gate_list {
+  public:
+    // Past this many gates something is not clearing; a push then drops the oldest.
+    static constexpr size_t max_gates = 1024;
+
+    // Adds a job's future and returns its serial, which grows with each push. An empty future is not kept: 0.
+    uint64_t push(std::shared_future<void> future) {
+        if (!future.valid()) {
+            return 0;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (gates_.size() >= max_gates) {
+            gates_.pop_front();
+        }
+        gates_.push_back({ ++serial_, std::move(future) });
+        return serial_;
+    }
+
+    // Sleeps until every gate pushed before the call has opened. *newest is the newest serial it covered, 0 for none,
+    // for clear_upto() once the caller's own device wait has returned. Returns how many gates it waited.
+    size_t wait_all(uint64_t * newest) const { return sleep_on(snapshot(UINT64_MAX, newest)); }
+
+    // Sleeps until every gate up to serial `upto` has opened; later gates are not waited. Returns how many it waited.
+    size_t wait_upto(uint64_t upto) const {
+        uint64_t newest = 0;
+        return sleep_on(snapshot(upto, &newest));
+    }
+
+    // Drops the gates up to serial `upto`, all of which the caller waited.
+    void clear_upto(uint64_t upto) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        while (!gates_.empty() && gates_.front().serial <= upto) {
+            gates_.pop_front();
+        }
+    }
+
+    // Drops every gate. For a ring that is shut down: its jobs no longer hold the device.
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        gates_.clear();
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return gates_.size();
+    }
+
+  private:
+    struct gate {
+        uint64_t                 serial = 0;
+        std::shared_future<void> future;
+    };
+
+    // The futures up to serial `upto`, in push order, copied under the lock.
+    std::vector<std::shared_future<void>> snapshot(uint64_t upto, uint64_t * newest) const {
+        std::vector<std::shared_future<void>> futures;
+        std::lock_guard<std::mutex>           lock(mutex_);
+        *newest = 0;
+        for (const gate & g : gates_) {
+            if (g.serial > upto) {
+                break;
+            }
+            futures.push_back(g.future);
+            *newest = g.serial;
+        }
+        return futures;
+    }
+
+    // Called with no lock held.
+    static size_t sleep_on(const std::vector<std::shared_future<void>> & futures) {
+        for (const std::shared_future<void> & future : futures) {
+            future.wait();
+        }
+        return futures.size();
+    }
+
+    mutable std::mutex mutex_;
+    std::deque<gate>   gates_;  // in serial order
+    uint64_t           serial_ = 0;
+};
+
 // The ring itself is defined in unified-cache.cpp; these halves only name an entry in it.
 class cpu_job_signal_ring;
 
@@ -232,10 +338,12 @@ class cpu_job_signal {
 
 // The flush that makes the device wait on entries: the ring and the flush's serial. Set by the first
 // cpu_job_signal_wrap() of a flush, carried with the flush's events, and handed to cpu_job_signal_recycle() once the
-// host has waited one of them.
+// host has waited one of them. gate_serial is set by cpu_job_signal_gate_push() for the same flush; the host sleeps on
+// the ring's gates up to it before it waits those events, and the recycle clears them.
 struct cpu_job_signal_mark {
     std::shared_ptr<cpu_job_signal_ring> ring;
-    uint64_t                             serial = 0;
+    uint64_t                             serial      = 0;
+    uint64_t                             gate_serial = 0;  // the newest gate the flush pushed (cpu_job_gate_list)
 
     explicit operator bool() const { return ring != nullptr && serial != 0; }
 };

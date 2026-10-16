@@ -415,7 +415,11 @@ void CpuExpertPool::stop_workers() {
                 // outputs that a device copy waiting on the event reads, and teardown frees those buffers once the
                 // queues drain. The job signals when it ends, which is when a host_task join would have returned.
                 // A process killed while teardown waits leaves that copy parked; probed on the B50, such a process
-                // is reaped at once and the card and its other tenants keep working.
+                // is reaped at once and the card and its other tenants keep working. Its future stays unset too, so
+                // the job's gate (cpu_job_gate_list) stays shut: a host wait that sleeps on it first does not return
+                // until the job ends, as the device wait behind it would not. Every other job completes its future:
+                // a worker drains the queue before it exits, and a job still queued when the pool is destroyed breaks
+                // its promise.
                 GGML_LOG_WARN(
                     "[CPU-EXPERT-POOL] Worker thread did not exit within 5s; a device copy waiting on its job "
                     "stays parked until the job ends\n");

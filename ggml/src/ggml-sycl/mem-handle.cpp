@@ -53,6 +53,9 @@ struct retained_handle_record {
     // handles[i].owner_control_id(), read when the record is published, so a
     // reap matches under the store mutex without asking any handle.
     std::vector<uint64_t>   ids;
+    // The futures of the CPU expert jobs the event waits behind, from the
+    // publisher's retained_handle_gate_scope (llama.cpp-qwn5); usually none.
+    std::vector<std::shared_future<void>> gates;
 };
 
 struct retained_handle_state {
@@ -141,6 +144,49 @@ struct graph_recording_sink_state {
 
 std::atomic<uint64_t>                   g_graph_retention_token_counter{ 0 };
 thread_local graph_recording_sink_state g_graph_recording_sink;
+// The innermost open retained_handle_gate_scope's gates on this thread, or null (llama.cpp-qwn5).
+thread_local const std::vector<std::shared_future<void>> * g_retained_handle_gates = nullptr;
+
+// The drain worker's waits for the trace (retained_handle_drain_census): counted once the trace turned the census on,
+// taken and zeroed by the thread that prints the trace's waits line (llama.cpp-qwn5).
+std::atomic<bool>     g_retained_drain_census_on{ false };
+std::atomic<uint64_t> g_retained_drain_census_records{ 0 };
+std::atomic<uint64_t> g_retained_drain_census_gates{ 0 };
+std::atomic<uint64_t> g_retained_drain_census_gate_sleep_ns{ 0 };
+std::atomic<uint64_t> g_retained_drain_census_driver_ns{ 0 };
+
+// Times one record's wait for the census: from the timer to the end of the gate sleep, and from there to the end of
+// the event wait. Reads no clock while the census is off; a wait that throws is not counted.
+struct retained_drain_wait_timer {
+    using clock = std::chrono::steady_clock;
+
+    bool              on      = g_retained_drain_census_on.load(std::memory_order_relaxed);
+    clock::time_point t_begin = on ? clock::now() : clock::time_point{};
+    clock::time_point t_slept;
+    uint64_t          gates = 0;
+
+    void slept(size_t n) {
+        if (on) {
+            t_slept = clock::now();
+            gates   = n;
+        }
+    }
+
+    void waited() const {
+        if (!on) {
+            return;
+        }
+        const clock::time_point t_end = clock::now();
+        g_retained_drain_census_records.fetch_add(1, std::memory_order_relaxed);
+        g_retained_drain_census_gates.fetch_add(gates, std::memory_order_relaxed);
+        g_retained_drain_census_gate_sleep_ns.fetch_add(
+            (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t_slept - t_begin).count(),
+            std::memory_order_relaxed);
+        g_retained_drain_census_driver_ns.fetch_add(
+            (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_slept).count(),
+            std::memory_order_relaxed);
+    }
+};
 // Compatibility alias used only inside this translation unit; epoch identity is
 // always checked by terminal_retention_ticket before publication.
 #define g_graph_retained_handle_sink g_graph_recording_sink.sink
@@ -238,7 +284,16 @@ void retained_handle_drain_loop() {
                 ~event_wait_watchdog_guard() { ggml_sycl_watchdog_non_graph_end(); }
             } watchdog_guard;
 
+            // Asleep on the jobs first, then in the driver only for the device work after them (llama.cpp-qwn5).
+            retained_drain_wait_timer wait_timer;
+            for (const std::shared_future<void> & gate : record.gates) {
+                if (gate.valid()) {
+                    gate.wait();
+                }
+            }
+            wait_timer.slept(record.gates.size());
             record.event.wait_and_throw();
+            wait_timer.waited();
 #if defined(GGML_SYCL_PRIVATE_TESTING)
             switch (g_retained_drain_test_fail_wait.exchange(RETAINED_DRAIN_TEST_WAIT_OK)) {
                 case RETAINED_DRAIN_TEST_WAIT_COMMAND_GRAPH:
@@ -2611,13 +2666,39 @@ static void publish_handles_until_event(std::vector<mem_handle> handles, sycl::e
 
     std::call_once(g_retained_drain_worker_once, start_retained_handle_drain_worker);
 
-    std::vector<uint64_t> ids = owner_control_ids(handles);
+    std::vector<uint64_t>                 ids = owner_control_ids(handles);
+    std::vector<std::shared_future<void>> gates;
+    if (g_retained_handle_gates) {
+        gates = *g_retained_handle_gates;
+    }
     {
         auto &              state = *g_retained_handles_state;
         retained_store_lock lock(state);
-        state.queue.push_back({ std::move(handles), std::move(event), std::move(ids) });
+        state.queue.push_back({ std::move(handles), std::move(event), std::move(ids), std::move(gates) });
     }
     g_retained_handles_state->cv.notify_one();
+}
+
+retained_handle_gate_scope::retained_handle_gate_scope(const std::vector<std::shared_future<void>> & gates) noexcept :
+    saved_(g_retained_handle_gates) {
+    g_retained_handle_gates = gates.empty() ? nullptr : &gates;
+}
+
+retained_handle_gate_scope::~retained_handle_gate_scope() noexcept {
+    g_retained_handle_gates = saved_;
+}
+
+void retained_handle_drain_census_enable() noexcept {
+    g_retained_drain_census_on.store(true, std::memory_order_relaxed);
+}
+
+retained_handle_drain_census retained_handle_drain_census_take() noexcept {
+    retained_handle_drain_census c;
+    c.records       = g_retained_drain_census_records.exchange(0, std::memory_order_relaxed);
+    c.gate_waits    = g_retained_drain_census_gates.exchange(0, std::memory_order_relaxed);
+    c.gate_sleep_us = (double) g_retained_drain_census_gate_sleep_ns.exchange(0, std::memory_order_relaxed) / 1000.0;
+    c.driver_us     = (double) g_retained_drain_census_driver_ns.exchange(0, std::memory_order_relaxed) / 1000.0;
+    return c;
 }
 
 void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event event) {

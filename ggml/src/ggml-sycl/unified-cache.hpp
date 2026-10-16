@@ -3489,6 +3489,10 @@ class unified_cache {
     // when SYCL is already gone. Reached through unified_cache_cpu_job_signal_acquire().
     std::shared_ptr<cpu_job_signal_ring> get_cpu_job_signal_ring();
 
+    // The ring if one was made, else null; never makes one. For a host wait on queue_ that sleeps on the ring's gates
+    // first (unified_cache_cpu_job_gates()), which must not create driver state as a side effect.
+    std::shared_ptr<cpu_job_signal_ring> existing_cpu_job_signal_ring();
+
     // Ensure a weight is cached, loading from src_ptr if needed
     // Returns device pointer, or nullptr if cache is full and eviction failed
     //
@@ -6216,10 +6220,22 @@ bool unified_cache_cpu_job_signal_acquire(sycl::queue & stream, cpu_job_signal *
 // caller joins the job with a host task instead.
 bool cpu_job_signal_wrap(cpu_job_signal_ref & ref, cpu_job_signal_mark & mark, sycl::event * out);
 
-// Frees the entries the device waited on in flushes up to mark's serial, resetting their native events, and clears
-// `mark`. Call it only after the host has waited an event of mark's flush on the ring's stream: on that in-order
-// stream it completes after every command that waited on those entries.
+// Frees the entries the device waited on in flushes up to mark's serial, resetting their native events, drops the
+// ring's gates up to mark's gate_serial, and clears `mark`. Call it only after the host has waited an event of mark's
+// flush on the ring's stream: on that in-order stream it completes after every command that waited on those entries.
 void cpu_job_signal_recycle(cpu_job_signal_mark & mark) noexcept;
+
+// The flush makes the device wait on the job whose future is `gate` (cpu_job_gate_list): adds it to the gates of
+// mark's ring and records its serial in mark.gate_serial. Only after a cpu_job_signal_wrap() set `mark`, for the job
+// it wrapped; with an empty mark it keeps nothing. Never waits.
+void cpu_job_signal_gate_push(cpu_job_signal_mark & mark, std::shared_future<void> gate);
+
+// The gates of mark's ring, or null for a mark without one. The pointer shares the ring's ownership.
+std::shared_ptr<cpu_job_gate_list> cpu_job_signal_gates(const cpu_job_signal_mark & mark);
+
+// The gates of the ring of the cache whose queue_ is `stream`, or null when `stream` is not a cache's queue_ or that
+// cache made no ring. Creates no ring and no cache, and holds no lock once it returns.
+std::shared_ptr<cpu_job_gate_list> unified_cache_cpu_job_gates(sycl::queue & stream);
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // A ring on `q`'s context outside any cache, for the device test; null when the ring cannot be made.

@@ -16894,9 +16894,11 @@ static void cpu_job_signal_registry_add(const std::shared_ptr<cpu_job_signal_rin
 static void cpu_job_signal_registry_prune();
 
 // One device's events: pools of block_events host-visible events with host signal and wait scopes, on the context of
-// the stream whose device commands wait on them, with the book of what each entry is doing. Every member is read and
-// written only under mutex_. live_ is false once the ring is shut down or abandoned: no driver call is made after
-// that, and the halves still held only update the book.
+// the stream whose device commands wait on them, with the book of what each entry is doing. Every member but gates_ is
+// read and written only under mutex_. live_ is false once the ring is shut down or abandoned: no driver call is made
+// after that, and the halves still held only update the book. gates_ holds the futures of the jobs whose events the
+// device waits (cpu_job_gate_list) under its own lock, so a host thread sleeping on one never holds mutex_ and never
+// keeps a job's own signal from taking it.
 class cpu_job_signal_ring {
   public:
     static constexpr uint32_t block_events = 64;
@@ -17067,6 +17069,7 @@ class cpu_job_signal_ring {
         events_.clear();
         pools_.clear();
         live_ = false;
+        gates_.clear();
     }
 
     // The SYCL runtime is gone: no driver call, the handles are left to the process exit.
@@ -17075,12 +17078,16 @@ class cpu_job_signal_ring {
         events_.clear();
         pools_.clear();
         live_ = false;
+        gates_.clear();
     }
 
     cpu_job_signal_book::counts counts() {
         std::lock_guard<std::timed_mutex> lock(mutex_);
         return book_.count();
     }
+
+    // Not under mutex_: the list has its own lock (see the class comment).
+    cpu_job_gate_list & gates() { return gates_; }
 
   private:
     cpu_job_signal_ring(sycl::context ctx, ze_context_handle_t zctx, const cpu_job_signal_l0 & l0) :
@@ -17149,6 +17156,7 @@ class cpu_job_signal_ring {
     bool                                wrap_warned_   = false;
     bool                                reset_warned_  = false;
     bool                                signal_warned_ = false;
+    cpu_job_gate_list                   gates_;
 };
 
 // The live rings, for cpu_job_signal_signal_all(), and the ggml abort callback they install. Made once and never
@@ -17271,6 +17279,11 @@ std::shared_ptr<cpu_job_signal_ring> unified_cache::get_cpu_job_signal_ring() {
     return cpu_job_signal_ring_;
 }
 
+std::shared_ptr<cpu_job_signal_ring> unified_cache::existing_cpu_job_signal_ring() {
+    std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
+    return cpu_job_signal_ring_;
+}
+
 // Set once a CPU expert job asked for a ring on a stream that is not a cache's queue_; that is logged once.
 static std::atomic<bool> g_cpu_job_signal_foreign_stream_logged{ false };
 
@@ -17312,8 +17325,39 @@ bool cpu_job_signal_wrap(cpu_job_signal_ref & ref, cpu_job_signal_mark & mark, s
 void cpu_job_signal_recycle(cpu_job_signal_mark & mark) noexcept {
     if (mark) {
         (void) mark.ring->recycle(mark.serial);
+        // The boundary slept on these gates before it waited the flush's events (pending_cpu_scatter_wait_prev_events).
+        mark.ring->gates().clear_upto(mark.gate_serial);
     }
     mark = cpu_job_signal_mark{};
+}
+
+void cpu_job_signal_gate_push(cpu_job_signal_mark & mark, std::shared_future<void> gate) {
+    if (!mark) {
+        return;
+    }
+    const uint64_t serial = mark.ring->gates().push(std::move(gate));
+    if (serial != 0) {
+        mark.gate_serial = serial;
+    }
+}
+
+std::shared_ptr<cpu_job_gate_list> cpu_job_signal_gates(const cpu_job_signal_mark & mark) {
+    if (!mark.ring) {
+        return nullptr;
+    }
+    return std::shared_ptr<cpu_job_gate_list>(mark.ring, &mark.ring->gates());
+}
+
+std::shared_ptr<cpu_job_gate_list> unified_cache_cpu_job_gates(sycl::queue & stream) {
+    unified_cache * cache = moe_join_queue_cache_of(stream);
+    if (!cache) {
+        return nullptr;
+    }
+    std::shared_ptr<cpu_job_signal_ring> ring = cache->existing_cpu_job_signal_ring();
+    if (!ring) {
+        return nullptr;
+    }
+    return std::shared_ptr<cpu_job_gate_list>(ring, &ring->gates());
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)

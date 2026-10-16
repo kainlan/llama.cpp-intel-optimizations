@@ -7,15 +7,30 @@
 // scatter's half is gone, and the host has waited an event of a flush at least as late as the one that made the device
 // wait on it. Each case below breaks one of those conditions.
 //
+// The gate list (llama.cpp-qwn5) is the jobs' futures, which a host wait on the device sleeps on first. Its cases
+// check that a waiter sleeps rather than spins, that it holds no lock a producer needs while it sleeps, that a job
+// that failed or was destroyed unrun still lets it go, and which gates a wait and a clear cover.
+//
 // ggml-sycl/cpu-job-signal.hpp includes only the standard library, so this test links nothing and opens no device.
 
 #include "ggml-sycl/cpu-job-signal.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <exception>
+#include <functional>
+#include <future>
+#include <memory>
 #include <set>
+#include <stdexcept>
+#include <thread>
 #include <vector>
 
+using ggml_sycl::cpu_job_gate_list;
 using ggml_sycl::cpu_job_signal_book;
 using entry_state = cpu_job_signal_book::entry_state;
 
@@ -225,6 +240,170 @@ static void test_signal_all() {
     expect_eq("a second signal_all sends nothing", b.signal_all([](uint32_t) {}), 0);
 }
 
+// --- The gate list ---
+
+using test_clock = std::chrono::steady_clock;
+
+static double ms_since(test_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(test_clock::now() - t0).count();
+}
+
+// The calling thread's CPU time: what a waiter that polls instead of sleeping would burn.
+static double thread_cpu_ms() {
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+static std::shared_future<void> ready_gate() {
+    std::promise<void> p;
+    p.set_value();
+    return p.get_future().share();
+}
+
+// Runs fn on its own thread and fails the test at once if it has not returned within `ms`: a wait that never returns
+// would otherwise hang the test until its ctest TIMEOUT.
+static void expect_returns_within(const char * what, const std::function<void()> & fn, int ms) {
+    auto              done = std::make_shared<std::promise<void>>();
+    std::future<void> f    = done->get_future();
+    std::thread       t([fn, done] {
+        fn();
+        done->set_value();
+    });
+    if (f.wait_for(std::chrono::milliseconds(ms)) != std::future_status::ready) {
+        std::printf("FAIL: %s (still waiting after %d ms)\n", what, ms);
+        std::fflush(stdout);
+        std::_Exit(1);
+    }
+    t.join();
+}
+
+// A waiter sleeps through a 200 ms job: it uses under 20 ms of CPU, and a producer pushing a gate meanwhile is not
+// held behind it, so the list's lock is not held across the wait.
+static void test_gate_sleeps() {
+    cpu_job_gate_list  gates;
+    std::promise<void> job;
+    std::promise<void> later;
+    const uint64_t     s1 = gates.push(job.get_future().share());
+    expect_true("a pushed gate gets a serial", s1 != 0);
+    std::atomic<bool>            started{ false };
+    std::atomic<bool>            returned{ false };
+    double                       wall_ms = 0.0;
+    double                       cpu_ms  = 0.0;
+    size_t                       waited  = 0;
+    uint64_t                     newest  = 0;
+    const test_clock::time_point t0      = test_clock::now();
+    std::thread                  waiter([&] {
+        const double c0 = thread_cpu_ms();
+        started         = true;
+        waited          = gates.wait_all(&newest);
+        cpu_ms          = thread_cpu_ms() - c0;
+        wall_ms         = ms_since(t0);
+        returned        = true;
+    });
+    while (!started) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    // From a third thread: if the waiter held the lock, this push would wait for the job, not for this thread.
+    double      push_ms = 0.0;
+    uint64_t    s2      = 0;
+    std::thread pusher([&] {
+        const test_clock::time_point p0 = test_clock::now();
+        s2                              = gates.push(later.get_future().share());
+        push_ms                         = ms_since(p0);
+    });
+    std::this_thread::sleep_until(t0 + std::chrono::milliseconds(200));
+    expect_true("the waiter is still asleep while its job runs", !returned);
+    job.set_value();
+    later.set_value();
+    waiter.join();
+    pusher.join();
+    expect_true("the waiter returned only after its job ended", wall_ms >= 150.0);
+    if (!(cpu_ms < 20.0)) {
+        std::printf("FAIL: the waiter used %.1f ms of CPU over a %.0f ms job; it must sleep\n", cpu_ms, wall_ms);
+        g_failures++;
+    }
+    if (!(push_ms < 100.0)) {
+        std::printf("FAIL: a push took %.1f ms while a waiter slept; the wait holds the list's lock\n", push_ms);
+        g_failures++;
+    }
+    expect_true("it waited the gate pushed before it", waited >= 1 && newest >= s1);
+    expect_true("a later gate has a larger serial", s2 > s1);
+}
+
+// A job destroyed unrun breaks its promise, and a job that threw stores its exception: either way the gate opens,
+// and the waiter returns without throwing.
+static void test_gate_failed_job() {
+    cpu_job_gate_list gates;
+    {
+        std::promise<void> unrun;
+        gates.push(unrun.get_future().share());
+    }
+    std::promise<void> threw;
+    gates.push(threw.get_future().share());
+    threw.set_exception(std::make_exception_ptr(std::runtime_error("job failed")));
+    bool     thrown = false;
+    size_t   waited = 0;
+    uint64_t newest = 0;
+    expect_returns_within(
+        "a waiter returns from a broken promise and from a job's exception",
+        [&] {
+            try {
+                waited = gates.wait_all(&newest);
+            } catch (...) {
+                thrown = true;
+            }
+        },
+        2000);
+    expect_true("the wait does not throw the job's failure", !thrown);
+    expect_eq("both gates were waited", waited, 2);
+}
+
+// wait_all covers the gates pushed before it and names the newest; wait_upto ignores later ones; clear_upto drops
+// only what it covers; an empty future is not kept.
+static void test_gate_cover() {
+    cpu_job_gate_list gates;
+    uint64_t          newest = 7;
+    expect_eq("an empty list waits nothing", gates.wait_all(&newest), 0);
+    expect_eq("and covers no serial", newest, 0);
+    expect_eq("an empty future is not kept", gates.push(std::shared_future<void>{}), 0);
+    expect_eq("so the list stays empty", gates.size(), 0);
+    const uint64_t     s1 = gates.push(ready_gate());
+    std::promise<void> open_later;
+    const uint64_t     s2 = gates.push(open_later.get_future().share());
+    size_t             w  = 0;
+    expect_returns_within("wait_upto does not wait a later gate", [&] { w = gates.wait_upto(s1); }, 2000);
+    expect_eq("wait_upto waited the gate it covers", w, 1);
+    open_later.set_value();
+    const uint64_t s3 = gates.push(ready_gate());
+    expect_eq("wait_all waits every gate", gates.wait_all(&newest), 3);
+    expect_eq("and names the newest", newest, s3);
+    gates.clear_upto(s2);
+    expect_eq("clear_upto drops the gates it covers and keeps the later one", gates.size(), 1);
+    expect_eq("a wait up to a cleared serial waits nothing", gates.wait_upto(s2), 0);
+    gates.clear_upto(s3);
+    expect_eq("clear_upto of the newest empties the list", gates.size(), 0);
+    gates.push(ready_gate());
+    gates.clear();
+    expect_eq("clear empties the list", gates.size(), 0);
+}
+
+// Past max_gates a push drops the oldest gate, never the new one.
+static void test_gate_cap() {
+    cpu_job_gate_list gates;
+    const size_t      n = cpu_job_gate_list::max_gates + 3;
+    for (size_t i = 0; i < n; ++i) {
+        gates.push(ready_gate());
+    }
+    expect_eq("the list holds at most max_gates", gates.size(), cpu_job_gate_list::max_gates);
+    expect_eq("the three oldest were dropped", gates.wait_upto(3), 0);
+    expect_eq("the fourth is kept", gates.wait_upto(4), 1);
+    uint64_t newest = 0;
+    expect_eq("every kept gate is waited", gates.wait_all(&newest), cpu_job_gate_list::max_gates);
+    expect_eq("and the newest is the last pushed", newest, n);
+}
+
 int main() {
     test_acquire();
     test_signal_once();
@@ -236,6 +415,10 @@ int main() {
     test_stale_generation_after_recycle();
     test_failed_reset_retires();
     test_signal_all();
+    test_gate_sleeps();
+    test_gate_failed_job();
+    test_gate_cover();
+    test_gate_cap();
     if (g_failures != 0) {
         std::printf("test-sycl-cpu-job-signal-book: %d failure(s)\n", g_failures);
         return 1;

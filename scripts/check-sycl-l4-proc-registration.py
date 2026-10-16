@@ -58,7 +58,8 @@ It checks, over ggml/include/ggml-sycl.h and ggml/src/ggml-sycl/ggml-sycl.cpp:
     every queue that can touch a slot is the device's one execution queue, which that synchronize drains.
     Pinned: the synchronize before each path (~llama_context first; sched_reserve_impl as a statement of
     its own on the ALLOC path, after the MEASURE branch; release_rung_buffers), the backend synchronize's
-    contiguous sequence (stream, CPU-expert flush, deferred-event choice, drain), the aliasing that
+    contiguous sequence (stream, CPU-expert flush, the CPU expert jobs' gate sleep when present,
+    deferred-event choice, drain), the aliasing that
     ggml_backend_sycl_context::stream(device, idx) answers the device's one execution queue (the TP queue
     or the unified cache's own) for every idx, the scheduler-level premises in the vendored ggml-backend.cpp
     and ggml-alloc.c (reserve and reserve_size synchronize first, the alloc_splits realloc synchronizes
@@ -518,7 +519,8 @@ def free_path_pins(source, freeb, fails):
       * ~llama_context synchronizes (every backend) before its members, the scheduler among them, are destroyed
       * sched_reserve_impl synchronizes as a statement of its own on the ALLOC path (not under an `if`, not in the
         MEASURE branch) before it touches the scheduler, and so does release_rung_buffers
-      * ggml_backend_sycl_synchronize's contiguous sequence: stream 0, the CPU-expert flush, the deferred-event
+      * ggml_backend_sycl_synchronize's contiguous sequence: stream 0, the CPU-expert flush, the CPU expert jobs'
+        gate sleep when present (llama.cpp-qwn5; it only sleeps, the drain still follows), the deferred-event
         choice, the drain
       * ggml_backend_sycl_context::stream(device, idx) answers the one execution queue for every idx
       * the scheduler's own premises (ggml-backend.cpp, ggml-alloc.c, llama-context.cpp), see check()
@@ -548,11 +550,14 @@ def free_path_pins(source, freeb, fails):
         "L4 free path: release_rung_buffers does not synchronize() before it frees the rung's buffers")
     # the backend's synchronize: the one contiguous sequence is pinned whole, so no statement of it can sit under a
     # condition, in a ternary arm or behind another name and still match: the stream, the CPU-expert flush (unless
-    # the test flag skips it), the deferred-event choice, the drain
+    # the test flag skips it), the CPU expert jobs' gate sleep (llama.cpp-qwn5), the deferred-event choice, the drain.
+    # The sleep is admitted as exactly its one statement: it waits nothing the drain does not, and whether it is
+    # there is pinned by tests/test-sycl-moe-cpu-job-device-signal-source.py, not here.
     sync = function_body(source, SYNC_SIG)
     pin(fails, sync,
         r"const queue_ptr stream = sycl_ctx->stream\(sycl_ctx->device, 0\);\s*"
         r"if \(!ggml_sycl_cpu_tg_synchronize_flush_skipped_for_test\(\)\) \{\s*ggml_sycl_cpu_tg_flush_pending\(\);\s*\}\s*"
+        r"(?:const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep\(\*stream\);\s*)?"
         r"const bool use_deferred_decode_event =\s*"
         r"sycl_ctx->last_graph_event\.has_value\(\) && sycl_ctx->last_graph_event_deferred_decode;\s*"
         r"auto err = use_deferred_decode_event \? CHECK_TRY_ERROR\(sycl_ctx->last_graph_event->wait_and_throw\(\)\) :\s*"
@@ -1421,6 +1426,8 @@ def mutations(header_raw, source):
          "use_deferred_decode_event ? CHECK_TRY_ERROR(", "false ? CHECK_TRY_ERROR("),
         ("the backend synchronize returns before the drain", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
          "        auto err = use_deferred_decode_event", "        if (sycl_ctx->has_pending_barrier) {\n            return;\n        }\n        auto err = use_deferred_decode_event"),
+        ("the backend synchronize returns after its gate sleep", "the backend synchronize no longer drains, in sequence and unconditionally", SYNC_SIG,
+         "ggml_sycl_cpu_job_gates_sleep(*stream);\n", "ggml_sycl_cpu_job_gates_sleep(*stream);\n        if (gate_sleep.waited != 0) {\n            return;\n        }\n"),
         # ---- the queue aliasing: one execution queue per device, answered for every idx
         ("stream() answers a private queue for idx > 0 ahead of the execution queue", "no longer answers the device's one execution queue for every idx", STREAM_SIG,
          "if (sycl::queue * execution_queue = ggml_sycl_execution_queue_for_device(device)) {",
