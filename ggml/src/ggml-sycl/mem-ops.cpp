@@ -136,6 +136,55 @@ static bool host_ptr_is_usm_accessible(const void * ptr) {
     return alloc == sycl::usm::alloc::host || alloc == sycl::usm::alloc::shared;
 }
 
+// Whether a copy endpoint's owner, by its provenance alone, is host USM in the
+// context of its device's cache queue. Only one provenance qualifies: a runtime
+// stage (role STAGING or EXPERT_STAGING) or expert-path buffer (category
+// EXPERT_CACHE) that is a host-pinned slice of a device cache's host zone.
+//   - A host-zone slice comes from that cache's pinned arena, allocated on the
+//     cache's own queue, so its context is the one queue_for_device_or_fallback()
+//     names for its device. A standalone pinned base (require_host_usm_base) is
+//     allocated on the requesting queue, whose context the owner does not
+//     record, so it does not qualify. Nor does a pinned-pool allocation made
+//     before the host zones are configured: its metadata cannot be told from a
+//     standalone base's, so it keeps the registry answer.
+//   - SYCL device buffers' owners (roles WEIGHT, KV and COMPUTE) never
+//     qualify, even when the buffer fell back to host-pinned memory. The
+//     SYCL_Host buffer's owner (role STAGING outside model load, category
+//     HOST_COMPUTE) would, but the backend holds it only as the buffer's
+//     identity: its tensors' copies pass views without an owner, so they keep
+//     the registry answer.
+static bool host_endpoint_owner_in_scope(const alloc_metadata & owner) {
+    if (owner.tier != alloc_tier::HOST_PINNED || owner.host_zone == host_zone_id::COUNT || owner.device < 0) {
+        return false;
+    }
+    return owner.role == alloc_role::STAGING || owner.role == alloc_role::EXPERT_STAGING ||
+           owner.category == runtime_category::EXPERT_CACHE;
+}
+
+// Whether the host endpoint `h` of a copy on `copy_queue` can be read or written
+// by the device directly, so the copy needs no host bounce. The handle's retained
+// owner answers first: pinned-pool and host-zone memory is host USM but never
+// enters the pointer registry, so asking the registry alone sends every copy to
+// or from it down the synchronous staged path. The owner's answer is taken only
+// in scope (above) and when the owner device's cache queue shares a context with
+// copy_queue, because pinned memory is USM only in the context that allocated
+// it, and Level Zero may fault importing an interior pinned slice into another
+// device's copy (the require_host_usm_base note in unified_alloc). While any
+// thread records a command graph the owner is not asked: a recorded copy keeps
+// the endpoint's pointer for every replay, and an in-scope endpoint is a
+// host-zone slice the zone may reclaim between replays, so recorded copies keep
+// the registry answer and the branch they took before. Everything else falls
+// back to the registry, which still calls mmap and external host memory unknown
+// and keeps it staged.
+static bool host_endpoint_is_usm_accessible(const mem_handle & h, const void * ptr, sycl::queue & copy_queue) {
+    alloc_metadata owner{};
+    if (!ggml_sycl_graph_recording_active() && h.owner_metadata(&owner) && host_endpoint_owner_in_scope(owner) &&
+        queues_share_context(copy_queue, queue_for_device_or_fallback(owner.device, copy_queue))) {
+        return true;
+    }
+    return host_ptr_is_usm_accessible(ptr);
+}
+
 static bool mem_copy_trace_enabled() {
     static const bool enabled = []() {
         const char * v = std::getenv("GGML_SYCL_MEM_COPY_TRACE");
@@ -1060,7 +1109,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         copy_queue = requested_queue_device == dst_device ? &queue : &queue_for_device_or_fallback(dst_device, queue);
     }
 
-    if (d.on_device && !s.on_device && !host_ptr_is_usm_accessible(s.ptr)) {
+    if (d.on_device && !s.on_device && !host_endpoint_is_usm_accessible(src, s.ptr, *copy_queue)) {
         staged_copy_note(/*device_to_host=*/false);
         constexpr size_t max_stage_bytes = 64ull * 1024ull * 1024ull;
         const size_t     stage_bytes     = std::min(size, max_stage_bytes);
@@ -1097,7 +1146,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         return event;
     }
 
-    if (!d.on_device && s.on_device && !host_ptr_is_usm_accessible(d.ptr)) {
+    if (!d.on_device && s.on_device && !host_endpoint_is_usm_accessible(dst, d.ptr, *copy_queue)) {
         staged_copy_note(/*device_to_host=*/true);
         constexpr size_t max_stage_bytes = 64ull * 1024ull * 1024ull;
         const size_t     stage_bytes     = std::min(size, max_stage_bytes);

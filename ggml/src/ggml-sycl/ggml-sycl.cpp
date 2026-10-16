@@ -48465,15 +48465,12 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
         }
     }
 
-    // Release cached MoE ids buffers (device + pinned host staging).
+    // Release cached MoE ids device buffers.
     for (auto & pair : moe_ids_cache) {
-        auto & entry         = pair.second;
-        entry.device_handle  = {};
-        entry.device_ids     = nullptr;
-        entry.device_bytes   = 0;
-        entry.staging_handle = {};
-        entry.staging_ids    = nullptr;
-        entry.staging_bytes  = 0;
+        auto & entry        = pair.second;
+        entry.device_handle = {};
+        entry.device_ids    = nullptr;
+        entry.device_bytes  = 0;
     }
     moe_ids_cache.clear();
 
@@ -62531,9 +62528,6 @@ static const int32_t * ggml_sycl_get_moe_ids_device_ptr_exact(ggml_backend_sycl_
             if (entry.device_handle.valid()) {
                 ctx.graph_retained_handles.push_back(entry.device_handle);
             }
-            if (entry.staging_handle.valid()) {
-                ctx.graph_retained_handles.push_back(entry.staging_handle);
-            }
         }
     };
 
@@ -62582,48 +62576,35 @@ static const int32_t * ggml_sycl_get_moe_ids_device_ptr_exact(ggml_backend_sycl_
     const bool need_staging = (ptr_type != sycl::usm::alloc::device);
 
     if (need_staging) {
-        // Use pinned host staging buffer for non-device sources
-        if (!entry.staging_ids || entry.staging_bytes < ids_bytes) {
-            const auto alloc_t0 = ids_stage_now();
-            if (entry.staging_ids) {
-                entry.staging_handle = {};
-                entry.staging_ids    = nullptr;
-            }
-            ggml_sycl::alloc_request req{};
-            req.queue                               = stream;
-            req.device                              = ctx.device;
-            req.size                                = ids_bytes;
-            req.intent.role                         = ggml_sycl::alloc_role::STAGING;
-            req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
-            req.intent.constraints.must_host_pinned = true;
-            req.intent.constraints.use_pinned_pool  = true;
-            ggml_sycl::alloc_handle staging_owner{};
-            if (ggml_sycl::unified_alloc(req, &staging_owner) && staging_owner.ptr) {
-                entry.staging_handle =
-                    ggml_sycl::detail::from_legacy_owned_alloc(std::move(staging_owner), GGML_LAYOUT_AOS);
-            }
-            entry.staging_ids   = entry.staging_ids_ptr(ctx.device);
-            entry.staging_bytes = ids_bytes;
-            if (!entry.staging_ids) {
-                return nullptr;
-            }
-            ids_stage_alloc_us += ids_stage_us(alloc_t0, ids_stage_now());
-        }
-
-        ggml_sycl::mem_handle ids_staging_handle = entry.staging_handle;
-        if (!ids_staging_handle.valid()) {
+        // A fresh pinned stage per call, never one kept on the cache entry. The
+        // H2D below reads the stage in place: it is pinned-pool host USM, which
+        // mem_copy_async copies directly. On the async return that copy may still
+        // be pending when the next call (gate, up and down share this ids
+        // entry) writes its ids, so a stage shared across calls would be
+        // rewritten under a pending DMA. mem_copy_async retains this handle until
+        // the copy's event completes, and the terminal helper keeps the stage a
+        // standalone USM base while a graph is recording.
+        const auto            alloc_t0 = ids_stage_now();
+        ggml_sycl::mem_handle ids_staging_handle;
+        if (!ggml_sycl::alloc_pinned_stage_handle_terminal(ids_bytes, *stream, ctx.device, "moe-ids-stage",
+                                                           /*require_host_usm_base=*/false, &ids_staging_handle)) {
             return nullptr;
         }
+        const auto ids_stage = ids_staging_handle.resolve(ctx.device);
+        if (!ids_stage.ptr || ids_stage.on_device) {
+            return nullptr;
+        }
+        ids_stage_alloc_us += ids_stage_us(alloc_t0, ids_stage_now());
 
         // IDs are tiny control tensors on a hot MoE path.  Keep the host leg as
         // a plain CPU copy into pinned staging and submit one raw H2D memcpy,
         // matching the fast path before the smart-handle refactor.
         const auto host_t0 = ids_stage_now();
         if (ids->nb[1] == static_cast<int64_t>(row_bytes)) {
-            std::memcpy(entry.staging_ids, ids_base, ids_bytes);
+            std::memcpy(ids_stage.ptr, ids_base, ids_bytes);
         } else {
             for (int64_t row = 0; row < n_tokens; ++row) {
-                std::memcpy(static_cast<char *>(entry.staging_ids) + row * row_bytes, ids_base + row * ids->nb[1],
+                std::memcpy(static_cast<char *>(ids_stage.ptr) + row * row_bytes, ids_base + row * ids->nb[1],
                             row_bytes);
             }
         }

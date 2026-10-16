@@ -146,6 +146,11 @@ with gate('fattn-failure-atomicity'):
 # round-tripped 25->27->26, but the comment-blind count never moved off 25. Bisected
 # with `git log -S'<token>(' -- ggml/src/ggml-sycl/ggml-sycl.cpp`; verified per-commit
 # with `git show <sha>:ggml/src/ggml-sycl/ggml-sycl.cpp | grep -o '<token>(' | wc -l`.
+# llama.cpp-qwn5 retired one more legacy pair: the MoE ids cache entry's persistent
+# pinned stage became a per-call alloc_pinned_stage_handle_terminal() stage, because
+# mem_copy_async now copies pinned-pool memory in place and a stage shared across
+# calls would be rewritten under a pending H2D -- 54->53 unified_alloc( and
+# 42->41 from_legacy_owned_alloc( code sites.
 RUNTIME_CODE     = _blank_comments(RUNTIME)
 COMMON_CODE      = _blank_comments(COMMON)
 COMMON_IMPL_CODE = _blank_comments(COMMON_IMPL)
@@ -270,7 +275,7 @@ with gate("every named owner-first site in ggml-sycl.cpp is a guarded, owner-fir
         RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner(") + len(_spans)
 
 for _label, _code, _pins in (
-    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (54, 42, OWNER_FIRST_BASELINE_SITES)),
+    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (53, 41, OWNER_FIRST_BASELINE_SITES)),
     ("common.hpp", COMMON_CODE, (3, 4, 3)),
     ("common.cpp", COMMON_IMPL_CODE, (8, 8, 4)),
 ):

@@ -871,6 +871,17 @@ uint32_t mem_handle::owner_use_count() const noexcept {
     return owned_alloc_.use_count();
 }
 
+bool mem_handle::owner_metadata(alloc_metadata * out) const {
+    // Under lock_ for the reason owner_use_count() takes it: assignment replaces
+    // owned_alloc_ under lock_.
+    mem_handle_lock_guard g(lock_);
+    if (!owned_alloc_ || !out) {
+        return false;
+    }
+    *out = owned_alloc_.metadata();
+    return true;
+}
+
 mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {
     // An ownerless DIRECT may derive a view only when its creator explicitly
     // minted a finite extent. This is bounded address authority, not lifetime

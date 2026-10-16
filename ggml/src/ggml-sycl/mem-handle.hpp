@@ -524,6 +524,13 @@ class mem_handle {
     // Never a release decision: release happens only through a handle.
     uint32_t owner_use_count() const noexcept;
 
+    // Copies the retained allocation owner's metadata into *out and answers
+    // true: tier, device, host zone, role and category as the allocator fixed
+    // them, which is the allocation's provenance, never something read off the
+    // pointer. Answers false and leaves *out alone when the handle retains no
+    // owner (from_direct, from_chunk_ptr).
+    bool owner_metadata(alloc_metadata * out) const;
+
     // Identity of the allocation owner control this handle retains: the one
     // from_owned_alloc() adopted, shared by every copy and slice of it. It is
     // minted once per control and never reused, so it cannot name a later

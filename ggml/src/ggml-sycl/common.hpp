@@ -6186,19 +6186,11 @@ struct ggml_backend_sycl_context {
         void *                device_ids   = nullptr;  // Cached ABI view derived from device_handle.
         size_t                device_bytes = 0;
         ggml_sycl::mem_handle device_handle;
-        ggml_sycl::mem_handle staging_handle;
-        void *                staging_ids   = nullptr;  // Cached ABI view derived from staging_handle.
-        size_t                staging_bytes = 0;
-        bool                  from_prealloc = false;    // true if device_ids came from Phase 4 pre-allocation
+        bool                  from_prealloc = false;  // true if device_ids came from Phase 4 pre-allocation
 
         void * device_ids_ptr(int device) const {
             auto resolved = device_handle.resolve(device);
             return resolved.ptr ? resolved.ptr : device_ids;
-        }
-
-        void * staging_ids_ptr(int device) const {
-            auto resolved = staging_handle.resolve(device);
-            return resolved.ptr ? resolved.ptr : staging_ids;
         }
     };
 

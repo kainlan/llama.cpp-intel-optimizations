@@ -197,7 +197,8 @@ void mem_copy_staged_wait_census_format(const mem_copy_staged_wait_census & cens
 // submission-completion authority, not allocation attempts.  Same English word,
 // different subsystem; there is no relationship to infer.
 //
-// ONLY THE ggml-sycl.cpp PAYLOAD-STAGING SITE USES THIS.  The four staging
+// ONLY ggml-sycl.cpp CALLS THIS: the payload-staging site, the block-exec
+// dense host stage and the per-call MoE ids stage.  The staging
 // sites inside mem-ops.cpp still call the static alloc_pinned_stage_handle()
 // directly with k_stage_alloc_retries, and that is deliberate rather than a
 // half-finished migration: they are in the same TU as the static, so routing
