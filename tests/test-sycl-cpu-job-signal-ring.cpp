@@ -272,6 +272,10 @@ static int child_main(const char * arm) {
     }
     std::this_thread::sleep_for(std::chrono::seconds(20));
     std::printf("CHILD NO_TERMINATE\n");
+    std::fflush(stdout);
+    // A regression that swallows the throw must not end the child with a parked command either.
+    ggml_sycl::cpu_job_signal_signal_all();
+    (void) wait_flag(g_child_flag, 5, 5000);
     return 3;
 }
 

@@ -40,9 +40,10 @@ THE CONTRACT.  With comments blanked:
      pending_cpu_scatter_wait_prev_events(slot), after its sycl::event::wait(events);
      the slot-pair wait is called only from ggml_sycl_cpu_tg_flush_pending.
   F. (unified-cache.cpp cpu_job_signal_ring::wrap) each wrap makes a fresh
-     sycl::make_event with ownership::keep; the ring holds no sycl::event member; the
-     flush clears its dependency list after the retention, and the wrap's out-parameter
-     is a local of the member loop.
+     sycl::make_event with ownership::keep; nothing the ring class declares outside its
+     function bodies and parameter lists names sycl::event, so no member holds a wrapper,
+     bare or in a container; the flush clears its dependency list after the retention,
+     and the wrap's out-parameter is a local of the member loop.
   G. The abort callback signals every ring before it calls the previous callback, and
      the SYCL watchdog signals every ring before it frees host allocations and exits.
      The pool's stop_workers signals nothing: a worker it detaches may still write the
@@ -51,9 +52,22 @@ THE CONTRACT.  With comments blanked:
   H. GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL is read once, into a function-local static,
      default on, and is the only getenv of that name; the catalog row documents =0; the
      [MOE-HOSTPATH-WAITS] line prints devsig=, counted under the trace only.
+  I. No host waits on the new events.  The flush body and the ring section of
+     unified-cache.cpp (from its section comment to the testing hooks' #endif) call no
+     wait, wait_and_throw, wait_for or wait_until, no get_info<...> and name neither
+     zeEventHostSynchronize nor zeEventQueryStatus; the flush gets no future.  On this
+     stack a status query on an in-flight event can itself be a host wait.  The ring
+     resolves exactly its six entry points by dlsym and calls no Level Zero function
+     directly; every host signal is the one in signal_native_locked, whose first
+     statement is the release fence that orders the job's writes before the device can
+     see the signal.
 
 NOT VACUOUS.  --self-test runs the gate on in-memory mutants of the real sources and
 requires each to FAIL on its own pin, then requires the unmodified tree to pass.
+
+GATE RUNTIME.  Comment blanking is memoized, and the two scans over every backend source
+skip a file that does not contain the name the scan looks for (cpu_job_signal_recycle, or
+the knob): blanking only removes text, so such a file cannot match either way.
 
 RED on the tree before the change:
   FAIL [pin A]: the flush does not wrap a member's device event under
@@ -62,6 +76,7 @@ RED on the tree before the change:
 
 from __future__ import annotations
 
+import functools
 import re
 import sys
 from pathlib import Path
@@ -86,6 +101,8 @@ def fail(pin: str, msg: str) -> None:
     raise ContractError(f"FAIL [pin {pin}]: {msg} {TAG}")
 
 
+# Every check blanks the same few large sources again; one check per mutant reads at most six of them.
+@functools.lru_cache(maxsize=8)
 def blank_comments(src: str) -> str:
     """Blank // and /* */ comments, keeping string literals and offsets."""
     out = []
@@ -184,6 +201,17 @@ SUBMIT_SIG = r"std::future<void>\s+CpuExpertPool::submit_batch\s*\([^{]*\)\s*\{"
 RING_WRAP_SIG = r"\n    bool\s+wrap\s*\(\s*uint32_t\s+id\s*,[^)]*\)\s*\{"
 RING_CLASS_SIG = r"class\s+cpu_job_signal_ring\s*\{"
 WATCHDOG_EXIT = r"ggml_sycl_cleanup_host_allocations\s*\(\s*\)\s*;"
+
+RING_SECTION_START = "// --- CPU expert job device signals (llama.cpp-qwn5)"
+RING_SECTION_LAST = r"void\s+cpu_job_signal_ring_shutdown_for_testing\s*\([^)]*\)\s*\{"
+L0_ENTRY_POINTS = ("zeEventPoolCreate", "zeEventPoolDestroy", "zeEventCreate", "zeEventDestroy", "zeEventHostSignal",
+                   "zeEventHostReset")
+SIGNAL_NATIVE_SIG = r"void\s+signal_native_locked\s*\(\s*uint32_t\s+id\s*\)\s*noexcept\s*\{"
+# A host wait, or a status query (on an in-flight event from a profiling queue one busy-waits), by any spelling.
+HOST_WAITS = ((r"\bwait(?:_and_throw|_for|_until)?\s*\(", "a host wait"),
+              (r"\bget_info\s*<", "a status query"),
+              (r"\bzeEventHostSynchronize\b", "a host synchronize"),
+              (r"\bzeEventQueryStatus\b", "a status query"))
 
 NATIVE_IF = ("if (may_signal && group[k]->device_signal && "
              "ggml_sycl::cpu_job_signal_wrap(group[k]->device_signal, signal_mark, &device_wait)) {")
@@ -295,7 +323,8 @@ def check_recycle(backend: str, sources: dict) -> None:
     if len(sites) != 1:
         fail("E", f"{len(sites)} calls of cpu_job_signal_recycle in ggml-sycl.cpp; want one")
     for name, src in sources.items():
-        if re.search(r"\bcpu_job_signal_recycle\s*\(", blank_comments(src)):
+        # Blanking only removes text, so a source without the name cannot call it.
+        if "cpu_job_signal_recycle" in src and re.search(r"\bcpu_job_signal_recycle\s*\(", blank_comments(src)):
             fail("E", f"{name} recycles ring entries")
     body, off = body_of(code, WAIT_SLOT_SIG, "E")
     if not (off <= sites[0] < off + len(body)):
@@ -312,12 +341,26 @@ def check_recycle(backend: str, sources: dict) -> None:
         fail("E", "the boundary waits of both slots are called outside ggml_sycl_cpu_tg_flush_pending")
 
 
+def declarations_only(text: str) -> str:
+    """What a class declares outside its function bodies and parameter lists."""
+    text = strip_strings(text)
+    prev = None
+    while prev != text:
+        prev = text
+        text = re.sub(r"\{[^{}]*\}", ";", text)
+    prev = None
+    while prev != text:
+        prev = text
+        text = re.sub(r"\([^()]*\)", " ", text)
+    return text
+
+
 def check_ring(cache_cpp: str) -> None:
     code = blank_comments(cache_cpp)
     cls, coff = body_of(code, RING_CLASS_SIG, "F")
-    if re.search(r"\bsycl::event\s+\w+\s*(?:=[^;]*)?;", re.sub(r"\{[^{}]*\}", "{}", cls)) and \
-            re.search(r"^\s{4}sycl::event\s+\w+_\s*;", cls, re.M):
-        fail("F", "the ring holds a sycl::event member, a wrapper that would outlive its flush")
+    if re.search(r"\bsycl::event\b", declarations_only(cls)):
+        fail("F", "the ring declares a sycl::event member, bare or in a container: a wrapper that would outlive its "
+                  "flush")
     m = re.search(RING_WRAP_SIG, cls)
     if not m:
         fail("F", "cpu_job_signal_ring has no wrap(id, ...) member")
@@ -328,6 +371,48 @@ def check_ring(cache_cpp: str) -> None:
         fail("F", "wrap does not make a fresh wrapper with ownership::keep for each use")
     if "*out = std::move(ev);" not in wf:
         fail("F", "wrap does not hand the fresh wrapper to its caller")
+
+
+def ring_section(cache_cpp: str) -> str:
+    """unified-cache.cpp from the ring's section comment to the testing hooks' #endif, comments blanked."""
+    start = cache_cpp.find(RING_SECTION_START)
+    m = re.search(RING_SECTION_LAST, cache_cpp[start:]) if start >= 0 else None
+    end = cache_cpp.find("\n#endif", start + m.end()) if m else -1
+    if start < 0 or end < 0:
+        fail("I", "unified-cache.cpp has no ring section ending at the testing hooks' #endif")
+    return blank_comments(cache_cpp)[start:end]
+
+
+def check_no_host_wait(backend: str, cache_cpp: str) -> None:
+    code = blank_comments(backend)
+    body, _ = body_of(code, FLUSH_SIG, "I")
+    body = strip_strings(body)
+    ring = ring_section(cache_cpp)
+    for where, text in (("the flush", body), ("the ring section", strip_strings(ring))):
+        for pattern, what in HOST_WAITS:
+            m = re.search(pattern, text)
+            if m:
+                fail("I", f"{where} makes {what} (`{m.group(0).strip()}`); the device waits a job's event itself")
+    m = re.search(r"\.\s*get\s*\(\s*\)", body)
+    if m:
+        fail("I", "the flush gets a value (`.get()`), which waits for a job on this thread")
+    names = sorted(re.findall(r"\bdlsym\s*\(\s*\w+\s*,\s*\"(\w+)\"\s*\)", ring))
+    if names != sorted(L0_ENTRY_POINTS):
+        fail("I", f"the ring resolves {names}; want exactly its six entry points")
+    flat_ring = strip_strings(ring)
+    m = re.search(r"\bze[A-Z]\w*\s*\(", flat_ring)
+    if m:
+        fail("I", f"the ring calls a Level Zero function directly (`{m.group(0)}`), outside its resolved entry points")
+    sites = [m.start() for m in re.finditer(r"\bhost_signal\s*\(", flat_ring)]
+    sn = re.search(SIGNAL_NATIVE_SIG, flat_ring)
+    if not sn:
+        fail("I", "the ring has no signal_native_locked(id)")
+    sbody, soff = block_at(flat_ring, flat_ring.index("{", sn.end() - 1), "I")
+    if len(sites) != 1 or not (soff <= sites[0] < soff + len(sbody)):
+        fail("I", f"{len(sites)} host_signal calls in the ring; want only the one in signal_native_locked")
+    if not flat(sbody).strip().startswith("std::atomic_thread_fence(std::memory_order_release); "
+                                          "const ze_result_t r = l0_->host_signal(events_[id]);"):
+        fail("I", "signal_native_locked does not fence the job's writes (release) before the host signal")
 
 
 STOP_WORKERS_SIG = r"void\s+CpuExpertPool::stop_workers\s*\(\s*\)\s*\{"
@@ -359,7 +444,8 @@ def check_knob(backend: str, sources: dict, doc: str) -> None:
     if not re.search(r"static const bool enabled = \[\] \{ const char \* env = std::getenv\(\"" + KNOB +
                      r"\"\); return env == nullptr \|\| std::atoi\(env\) != 0; \}\(\); return enabled;", flat(body)):
         fail("H", f"{KNOB} is not read once into a function-local static, default on")
-    n = sum(len(re.findall(r"getenv\s*\(\s*\"" + KNOB + "\"", blank_comments(s))) for s in sources.values())
+    n = sum(len(re.findall(r"getenv\s*\(\s*\"" + KNOB + "\"", blank_comments(s)))
+            for s in sources.values() if KNOB in s)
     n += len(re.findall(r"getenv\s*\(\s*\"" + KNOB + "\"", code))
     if n != 1:
         fail("H", f"{n} getenv calls of {KNOB}; want one")
@@ -403,6 +489,7 @@ def check(s: dict) -> None:
     check_signal_all(s["cache_cpp"], s["common_cpp"], s["pool"])
     getenvs = {k: v for k, v in others.items()}
     check_knob(s["backend"], getenvs, s["doc"])
+    check_no_host_wait(s["backend"], s["cache_cpp"])
 
 
 def self_test(s: dict) -> int:
@@ -471,6 +558,10 @@ def self_test(s: dict) -> int:
          sub(r"\*out    = std::move\(ev\);", "*out    = cached_;")),
         ("F", "cache_cpp", "the ring keeps a wrapper",
          sub(r"(class cpu_job_signal_ring \{\n  public:\n)", r"\1    sycl::event cached_;\n")),
+        ("F", "cache_cpp", "the ring keeps a vector of wrappers",
+         sub(r"(class cpu_job_signal_ring \{\n  public:\n)", r"\1    std::vector<sycl::event> cache_;\n")),
+        ("F", "cache_cpp", "the ring keeps an optional wrapper",
+         sub(r"(class cpu_job_signal_ring \{\n  public:\n)", r"\1    std::optional<sycl::event> cached_;\n")),
         ("F", "backend", "the dependency list outlives the flush",
          sub(r"\n\s*joins\.clear\(\);\n(\s*auto t2)", r"\n\1")),
         ("G", "cache_cpp", "abort callback without signal-all",
@@ -496,6 +587,31 @@ def self_test(s: dict) -> int:
          sub(r"(static void moe_hostpath_waits_device_signal\(\) \{\n)\s*if \(!moe_hostpath_waits_enabled\(\)\) "
              r"\{\n\s*return;\n\s*\}\n", r"\1")),
         ("H", "backend", "line loses devsig", sub(r" devsig=%llu", "")),
+        ("I", "backend", "the native branch host-waits its wrapper",
+         sub(r"\n(\s*)joins\.push_back\(std::move\(device_wait\)\);",
+             r"\n\1device_wait.wait();\n\1joins.push_back(std::move(device_wait));")),
+        ("I", "backend", "the flush host-waits its dependencies",
+         sub(r"\n(\s*)auto t1 = hrc::now\(\);", r"\n\1sycl::event::wait(joins);\n\1auto t1 = hrc::now();")),
+        ("I", "backend", "the native branch queries its wrapper's status",
+         sub(r"\n(\s*)joins\.push_back\(std::move\(device_wait\)\);",
+             r"\n\1(void) device_wait.get_info<sycl::info::event::command_execution_status>();"
+             r"\n\1joins.push_back(std::move(device_wait));")),
+        ("I", "backend", "the flush gets a job's future",
+         sub(r"\n(\s*)auto t1 = hrc::now\(\);", r"\n\1group[0]->future.share().get();\n\1auto t1 = hrc::now();")),
+        ("I", "cache_cpp", "wrap host-synchronizes the event",
+         sub(r"\n(\s*)sycl::event ev;\n(\s*)try \{\n(\s*)ev = sycl::make_event",
+             r"\n\1(void) zeEventHostSynchronize(events_[id], UINT64_MAX);\n\1sycl::event ev;\n\2try {\n\3"
+             r"ev = sycl::make_event")),
+        ("I", "cache_cpp", "the ring resolves a status query",
+         sub(r'(\n(\s*)f\.host_reset    = reinterpret_cast<decltype\(&zeEventHostReset\)>\(dlsym\(lib, '
+             r'"zeEventHostReset"\)\);)',
+             r'\1\n\2(void) dlsym(lib, "zeEventQueryStatus");')),
+        ("I", "cache_cpp", "the signal is not fenced",
+         sub(r"\n\s*std::atomic_thread_fence\(std::memory_order_release\);\n(\s*const ze_result_t r = "
+             r"l0_->host_signal)", r"\n\1")),
+        ("I", "cache_cpp", "a signal bypasses the fence",
+         sub(r"(if \(book_\.signal\(id, generation\) && live_\) \{\n\s*)signal_native_locked\(id\);",
+             r"\1(void) l0_->host_signal(events_[id]);")),
     ]
     failures, caught = [], 0
     for pin, key, name, mutate in mutants:

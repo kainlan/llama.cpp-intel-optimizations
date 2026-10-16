@@ -10,8 +10,8 @@
 //
 // Why. A device command that depends on an unfinished host_task is held by the SYCL runtime as a blocked user, and so
 // is every command submitted after it on the same in-order queue. When the host_task ends, the runtime's single
-// host-task thread enqueues that whole backlog serially, about 4 us per command (probe P1, B70, oneAPI 2026.1, driver
-// 26.35: 3.3-3.8 ms for 1000 queued kernels against 0.05 ms behind a native event). The decode's scatter used to
+// host-task thread enqueues that whole backlog serially, about 4 us per command (measured on the B70, oneAPI 2026.1,
+// driver 26.35: 3.3-3.8 ms for 1000 queued kernels against 0.05 ms behind a native event). The decode's scatter used to
 // depend on a join host_task per CPU expert job, so the next layer's GPU work started only after that thread had
 // enqueued it. A Level Zero event created host-visible with host signal and wait scopes is waited by the device itself:
 // the runtime treats a command that depends on it as enqueued, and the job's own thread releases the device with
@@ -29,8 +29,8 @@
 //   FREE -> ACQUIRED (acquire: the producer gets the job half and the slot half)
 //        -> SIGNALLED (the job half signals, once)
 //   the slot half either makes the device wait on it in a flush (consume, with that flush's serial) or is dropped;
-//   FREE again (recycle) only when it is SIGNALLED, the slot half is gone, and the host has waited an event of a flush on
-//   the ring's stream whose serial is at least the one that made the device wait on it. On an in-order stream that
+//   FREE again (recycle) only when it is SIGNALLED, the slot half is gone, and the host has waited an event of a flush
+//   on the ring's stream whose serial is at least the one that made the device wait on it. On an in-order stream that
 //   event completes after every earlier command, so no command still waits on the entry when its native event is reset.
 //
 // This header includes only the standard library, so tests/test-sycl-cpu-job-signal-book.cpp checks the book without
@@ -292,8 +292,9 @@ class cpu_job_signal_ref {
 };
 
 // Signals every acquired entry of every live ring. For the paths that end the process (the ggml abort callback the
-// rings install, and the SYCL watchdog's exit), so no device command stays parked on a job that will never signal. Takes each lock with a bounded wait and skips a ring it cannot lock: it must not deadlock an abort
-// raised while that lock is held.
+// rings install, and the SYCL watchdog's exit), so no device command stays parked on a job that will never signal.
+// Takes each lock with a bounded wait and skips a ring it cannot lock: it must not deadlock an abort raised while that
+// lock is held.
 void cpu_job_signal_signal_all() noexcept;
 
 }  // namespace ggml_sycl

@@ -385,6 +385,10 @@ std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task>      
                     pool_trace_record_job(tasks.size(), t_submit, t_start, t_done, overlapped, stamps);
                 }
                 promise->set_value();
+                // A throw above signals the job half while it unwinds, and both handlers rethrow it. worker_thread
+                // has no handler, so std::terminate runs ggml's terminate handler (a gdb backtrace, then abort). In
+                // that window the device can scatter the job's stale staging and one token can be sampled before
+                // the abort; the exit is abnormal, so no silent wrong answer persists.
             } catch (const ggml_sycl_fallback_error &) {
                 throw;
             } catch (...) {

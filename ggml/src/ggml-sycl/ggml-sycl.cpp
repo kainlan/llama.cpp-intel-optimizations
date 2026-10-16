@@ -103509,14 +103509,17 @@ static void moe_graph_segment_boundary_flush(const ggml_cgraph * cgraph, int sta
 // is chained (ggml_sycl_should_add_dependency keeps in-flight events then), the graph API rejects an edge to a
 // command outside the graph, and the segment runs directly on every later token. No such edge is needed either:
 // a recorded segment, a keyed slot's or the slotless recorder's, replays on the stream it recorded on, after a
-// boundary flush that republishes what the segment reads on that stream. That stream is in-order (both host-scatter
-// submit forms, moe_host_scatter_submit_compact and moe_host_scatter_submit_flagged, abort on any other queue), so
-// its order carries every pre-record command at replay. The record-time state must therefore be "everything earlier
-// on this stream is complete", which the boundary flush's H2D used to provide as a side effect while it took
-// mem_copy_submit's staged branch, whose host wait covered the copy and, the queue being in-order, everything before
-// it. Waiting the stream also covers what the flushed scatter depends on: the join host tasks, or the CPU jobs' own
-// device events (llama.cpp-qwn5). This is a setup wait, once per segment recording: a replay, and a token that
-// records nothing, reach no wait and submit no command.
+// boundary flush that republishes what the segment reads on that stream. That stream is in-order, so its order
+// carries every pre-record command at replay: the backend makes its compute streams with default_queue_properties()
+// (common.hpp), and dpct's default queue, the one used before a cache exists, is its in-order queue. The host
+// scatter checks the property only where its own form needs it: the flagged form (moe_host_scatter_submit_flagged)
+// aborts on any other queue, and the compact form (moe_host_scatter_submit_compact) declines there, so the flush
+// submits one copy per run instead. The record-time state must therefore be "everything earlier on this stream is
+// complete", which the boundary flush's H2D used to provide as a side effect while it took mem_copy_submit's staged
+// branch, whose host wait covered the copy and, the queue being in-order, everything before it. Waiting the stream also
+// covers what the flushed scatter depends on: the join host tasks, or the CPU jobs' own device events (llama.cpp-qwn5).
+// This is a setup wait, once per segment recording: a replay, and a token that records nothing, reach no wait and
+// submit no command.
 static void moe_graph_segment_record_drain(sycl::queue & stream) {
     stream.wait_and_throw();
 }
