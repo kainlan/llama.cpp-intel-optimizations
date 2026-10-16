@@ -972,7 +972,10 @@ with gate('segment-boundary-flush'):
     _rcall = SEG_FLUSH_CALLS["record"]
     _pcall = SEG_FLUSH_CALLS["replay"]
     _kcall = SEG_FLUSH_CALLS["keyed record"]
-    _record_flush = "        " + _rcall + "\n        const size_t retained_baseline"
+    # The record path drains its stream between the flush and the recording (moe_graph_segment_record_drain); the
+    # flush controls below drop or move only the flush and keep the drain where it is.
+    _record_drain = "        moe_graph_segment_record_drain(*stream);\n"
+    _record_flush = "        " + _rcall + "\n" + _record_drain + "        const size_t retained_baseline"
     _replay_flush = "                " + _pcall + "\n                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);"
     # The legacy replay is the first of the two replay sites; the keyed replay is the second.
     assert RUNTIME_CODE.count(_record_flush) == 1 and RUNTIME_CODE.count(_replay_flush) == 2
@@ -997,8 +1000,8 @@ with gate('segment-boundary-flush'):
                    "    wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());\n"
                    "    flush_pending_attn_dispatch(device);\n")
     controls = {
-        "record flush dropped": RUNTIME_CODE.replace(_record_flush, "        const size_t retained_baseline"),
-        "record flush inside the recording": RUNTIME_CODE.replace(_record_flush, "        const size_t retained_baseline")
+        "record flush dropped": RUNTIME_CODE.replace(_record_flush, _record_drain + "        const size_t retained_baseline"),
+        "record flush inside the recording": RUNTIME_CODE.replace(_record_flush, _record_drain + "        const size_t retained_baseline")
             .replace(_begin, _begin + "            " + _rcall + "\n"),
         "record flush covers the wrong nodes": RUNTIME_CODE.replace(
             _rcall, _rcall.replace("seg.start, seg.end", "seg.start, seg.start + 1"), 1),
