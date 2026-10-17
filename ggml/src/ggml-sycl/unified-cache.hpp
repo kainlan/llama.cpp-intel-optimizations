@@ -3493,6 +3493,16 @@ class unified_cache {
     // first (unified_cache_cpu_job_gates()), which must not create driver state as a side effect.
     std::shared_ptr<cpu_job_signal_ring> existing_cpu_job_signal_ring();
 
+    // --- CPU expert job input markers (llama.cpp-42zj) ---
+    // Arms *out on queue_ after `after` (see cpu_job_input_marker in cpu-job-signal.hpp). The host-pinned word is
+    // made on first use; the serial is the next one, and the marker's device task is submitted under the same lock,
+    // so on the in-order queue_ the word only advances. False, leaving *out unarmed and *why set, when queue_ is not
+    // in order, the word cannot be made (tried once) or was let go at teardown, or the submit throws. Never waits.
+    // Reached through unified_cache_cpu_job_input_marker_arm().
+    bool arm_cpu_job_input_marker(const std::vector<sycl::event> & after,
+                                  cpu_job_input_marker *           out,
+                                  const char **                    why);
+
     // Ensure a weight is cached, loading from src_ptr if needed
     // Returns device pointer, or nullptr if cache is full and eviction failed
     //
@@ -5135,6 +5145,16 @@ class unified_cache {
     std::mutex                           cpu_job_signal_mutex_;
     std::shared_ptr<cpu_job_signal_ring> cpu_job_signal_ring_;
     bool                                 cpu_job_signal_ring_tried_ = false;
+
+    // llama.cpp-42zj: see arm_cpu_job_input_marker(). All four are read and written only under
+    // cpu_job_input_marker_mutex_, because shutdown_resources() lets the word go on the tearing-down thread. The
+    // owner is the word's allocation; the jobs share only cpu_job_input_marker_word_, never the owner.
+    std::mutex                                 cpu_job_input_marker_mutex_;
+    mem_handle                                 cpu_job_input_marker_owner_;
+    std::shared_ptr<cpu_job_input_marker_word> cpu_job_input_marker_word_;
+    uint32_t                                   cpu_job_input_marker_serial_ = 0;
+    bool                                       cpu_job_input_marker_tried_  = false;
+
     size_t                       budget_;                   // Total GPU memory budget (after reservations)
     size_t                       base_budget_;              // Raw cache budget before reservations
     size_t                       reserved_;                 // Runtime reservation applied to budget_
@@ -6237,6 +6257,14 @@ std::shared_ptr<cpu_job_gate_list> cpu_job_signal_gates(const cpu_job_signal_mar
 // cache made no ring. Creates no ring and no cache, and holds no lock once it returns.
 std::shared_ptr<cpu_job_gate_list> unified_cache_cpu_job_gates(sycl::queue & stream);
 
+// Arms a CPU expert job's input marker on `stream` after `after` (llama.cpp-42zj), through the cache whose queue_ is
+// `stream`; see unified_cache::arm_cpu_job_input_marker(). False, with *out unarmed and *why set, when `stream` is not
+// a cache's queue_ or that cache refuses; the caller then waits `after` itself. Never waits. Creates no cache.
+bool unified_cache_cpu_job_input_marker_arm(sycl::queue &                    stream,
+                                            const std::vector<sycl::event> & after,
+                                            cpu_job_input_marker *           out,
+                                            const char **                    why);
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // A ring on `q`'s context outside any cache, for the device test; null when the ring cannot be made.
 std::shared_ptr<cpu_job_signal_ring> cpu_job_signal_ring_create_for_testing(sycl::queue & q);
@@ -6245,6 +6273,15 @@ bool                        cpu_job_signal_acquire_for_testing(const std::shared
                                                                cpu_job_signal_ref *                         ref);
 cpu_job_signal_book::counts cpu_job_signal_ring_counts_for_testing(const std::shared_ptr<cpu_job_signal_ring> & ring);
 void                        cpu_job_signal_ring_shutdown_for_testing(const std::shared_ptr<cpu_job_signal_ring> & ring);
+
+// Arms *out on `q` after `after` with `serial`, against `word`, a word the test made and keeps alive past every wait,
+// through the device task the cache's arm submits. The cache, its lock and its word are not used. False when the
+// submit throws.
+bool cpu_job_input_marker_arm_for_testing(sycl::queue &                                      q,
+                                          const std::shared_ptr<cpu_job_input_marker_word> & word,
+                                          uint32_t                                           serial,
+                                          const std::vector<sycl::event> &                   after,
+                                          cpu_job_input_marker *                             out);
 #endif
 
 #if GGML_SYCL_DNNL

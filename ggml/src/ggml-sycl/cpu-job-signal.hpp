@@ -33,15 +33,17 @@
 //   on the ring's stream whose serial is at least the one that made the device wait on it. On an in-order stream that
 //   event completes after every earlier command, so no command still waits on the entry when its native event is reset.
 //
-// This header includes only the standard library, so tests/test-sycl-cpu-job-signal-book.cpp checks the book and the
-// gate list without a device.
+// This header includes only the standard library, so tests/test-sycl-cpu-job-signal-book.cpp checks the book, the
+// gate list and the input marker's wait without a device.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace ggml_sycl {
@@ -203,13 +205,15 @@ class cpu_job_signal_book {
 // sleeps the same way, though its stream wait was short there: its own CPU-expert flush runs the graph-boundary drain
 // first, and that drain sleeps on the gates and drops them.
 //
-// A gate also decides whether such a host wait returns at all. The job's prologue checks its input events through
-// the same driver path that a host wait on an event behind the job may take, and on the B70 that path holds a
-// device-level lock while it polls the device: a host thread waiting there before the job has started keeps the job
-// from starting, and the wait never returns (llama.cpp-42zj). So every host wait on an event that may stand behind a
-// running job sleeps on that job's gate first, the retained-handle drain worker's included: each record it drains
-// carries the gates of every live ring (cpu_job_signal_gates_outstanding). And a gate leaves its list only once its job
-// is known to have ended: cleared by a serial that covers it after a sleep that waited it, or by a recycle, which the
+// A host wait inside the driver may also hold a device-level lock while it polls the device (on driver 26.35, the one
+// hostSynchronize takes). A job that needed that lock before it could signal would never start behind such a wait,
+// and the wait would never return: that was the first prompt graph of llama.cpp-42zj, with the job's prologue waiting
+// its input events natively. The prologue now waits its inputs on a device-written marker with host loads
+// (cpu_job_input_marker, below), and the job's one driver call is its signal, which takes no such lock. The gates still
+// keep a host wait from polling in front of a running job: every host wait on an event that may stand behind one
+// sleeps on that job's gate first, the retained-handle drain worker's included, since each record it drains carries
+// the gates of every live ring (cpu_job_signal_gates_outstanding). A gate leaves its list only once its job is known
+// to have ended: cleared by a serial that covers it after a sleep that waited it, or by a recycle, which the
 // boundary's sleep on the same gates precedes, or with its ring's shutdown, after which no device command waits on the
 // ring's events. The list's drop of its oldest gate never runs: one gate is pushed per wrapped entry and a recycle
 // clears its entries' gates, so a list holds no more gates than its ring has entries in use, and max_gates is at least
@@ -430,6 +434,82 @@ class cpu_job_signal_ref {
     uint32_t                             id_         = 0;
     uint32_t                             generation_ = 0;
 };
+
+// The input marker of a CPU expert job (llama.cpp-42zj): how the pool worker learns that the job's inputs have
+// landed without entering the driver.
+//
+// Why. The retained-handle drain worker waited a record's event natively, and libze held a device-level lock across
+// that wait while it polled the device. The device work behind the event stood behind a CPU expert job, and the job's
+// prologue, waiting its input events natively on the pool's worker, blocked on the same lock: the job could not
+// signal, so the drain worker's wait could not end. Any thread that waits inside the driver may be the holder, so the
+// job must not need the lock at all.
+//
+// How. The submitting thread arms the marker on the op's in-order stream right after the job's last input: one
+// device task that depends on the job's input events, then makes the device's earlier writes visible to the host
+// with a system-scope release fence and stores the marker's serial into a host-pinned word that the unified cache
+// owns (unified_cache_cpu_job_input_marker_arm). Discrete BMG has no host-USM atomics, so the device side is a fence
+// and a plain store. Each arm on that stream takes the next serial, and the in-order stream runs the tasks in that
+// order, so the word only advances: a word at or past a job's serial means its inputs are complete. The word is 32
+// bits, which the device stores in one write, and it is compared modulo 2^32, so the serial may wrap. The worker reads
+// the word with acquire loads, pausing and then yielding between them: no sleep, no lock and no driver call. Its job's
+// one driver call is its signal (zeEventHostSignal), which on driver 26.35 reaches no lock a host wait holds.
+//
+// Ownership. The word's allocation belongs to the unified cache, which lets it go at teardown, after its queues
+// drained, on the tearing-down thread. A job holds only the cpu_job_input_marker_word below, so a worker that drops
+// the last reference to one frees no driver memory. The cache sets abandoned before it lets the allocation go, and a
+// waiter reads that flag before each load of the word, as the ring's halves make no driver call once their ring is
+// shut down: a job still waiting then stops waiting.
+//
+// An unarmed marker is passed at once: a job with no input events, or one whose arm was refused, after which the
+// submitting thread waited the inputs itself.
+struct cpu_job_input_marker_word {
+    uint32_t *        word = nullptr;      // host-pinned, written by the device: a view of the cache's allocation
+    std::atomic<bool> abandoned{ false };  // set before that allocation goes: the device writes it no more
+};
+
+struct cpu_job_input_marker {
+    std::shared_ptr<const cpu_job_input_marker_word> word;
+    uint32_t                                         serial = 0;  // the inputs are complete once the word reaches it
+
+    bool armed() const { return word != nullptr; }
+};
+
+// How many pauses the waiter makes before it starts yielding the core instead.
+constexpr uint32_t cpu_job_input_marker_pause_spins = 2048;
+
+inline void cpu_job_input_marker_pause() {
+#if (defined(__x86_64__) || defined(__i386__)) && !defined(__SYCL_DEVICE_ONLY__)
+    __builtin_ia32_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+
+// Whether the word written `seen` has reached `serial`, modulo 2^32: true while fewer than 2^31 arms separate them.
+inline bool cpu_job_input_marker_reached(uint32_t seen, uint32_t serial) {
+    return static_cast<int32_t>(seen - serial) >= 0;
+}
+
+// True once the job's inputs are complete, or the marker is unarmed or abandoned. Acquire loads only.
+inline bool cpu_job_input_marker_seen(const cpu_job_input_marker & m) {
+    if (!m.armed() || m.word->abandoned.load(std::memory_order_acquire)) {
+        return true;
+    }
+    return cpu_job_input_marker_reached(__atomic_load_n(m.word->word, __ATOMIC_ACQUIRE), m.serial);
+}
+
+// Returns once cpu_job_input_marker_seen(m). On the pool worker: it never sleeps, takes no lock and makes no driver
+// call. It does not tick the SYCL watchdog either, so a marker that never arrives shows as the watchdog firing.
+inline void cpu_job_input_marker_wait(const cpu_job_input_marker & m) {
+    for (uint32_t spins = 0; !cpu_job_input_marker_seen(m);) {
+        if (spins < cpu_job_input_marker_pause_spins) {
+            ++spins;
+            cpu_job_input_marker_pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+}
 
 // Signals every acquired entry of every live ring. For the paths that end the process (the ggml abort callback the
 // rings install, and the SYCL watchdog's exit), so no device command stays parked on a job that will never signal.

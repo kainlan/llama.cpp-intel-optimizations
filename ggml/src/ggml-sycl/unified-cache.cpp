@@ -6887,6 +6887,7 @@ bool unified_cache::ensure_planned_arena_zones() {
 // llama.cpp-qwn5: shuts the cache's CPU expert job signal ring down (after the queues drained) or abandons it (SYCL
 // already gone); defined with the ring below.
 static void cpu_job_signal_ring_end(const std::shared_ptr<cpu_job_signal_ring> & ring, bool sycl_gone) noexcept;
+static void cpu_job_input_marker_end(std::shared_ptr<cpu_job_input_marker_word> & word, mem_handle & owner) noexcept;
 
 unified_cache::~unified_cache() {
     if (!shutdown_resources()) {
@@ -7050,6 +7051,12 @@ bool unified_cache::shutdown_resources() {
             std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
             cpu_job_signal_ring_end(cpu_job_signal_ring_, /*sycl_gone=*/true);
         }
+        // llama.cpp-42zj: no device write will come; a job still waiting stops, and the word's release is
+        // shutdown-safe (mem_handle).
+        {
+            std::lock_guard<std::mutex> lock(cpu_job_input_marker_mutex_);
+            cpu_job_input_marker_end(cpu_job_input_marker_word_, cpu_job_input_marker_owner_);
+        }
         // llama.cpp-0oxf: onednn_graph_scratch_reuse_pool_
         // is not touched here, unlike the owner members just above -- it does
         // not need to be. Its entries are destroyed the same way any other
@@ -7105,6 +7112,12 @@ bool unified_cache::shutdown_resources() {
             std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
             cpu_job_signal_ring_end(cpu_job_signal_ring_, /*sycl_gone=*/true);
         }
+        // llama.cpp-42zj: no device write will come; a job still waiting stops, and the word's release is
+        // shutdown-safe (mem_handle).
+        {
+            std::lock_guard<std::mutex> lock(cpu_job_input_marker_mutex_);
+            cpu_job_input_marker_end(cpu_job_input_marker_word_, cpu_job_input_marker_owner_);
+        }
         // llama.cpp-0oxf: same reasoning as the
         // g_sycl_shutting_down branch above -- onednn_graph_scratch_reuse_pool_'s
         // entries are mem_handles, whose own destructor is already
@@ -7126,6 +7139,11 @@ bool unified_cache::shutdown_resources() {
     {
         std::lock_guard<std::mutex> lock(cpu_job_signal_mutex_);
         cpu_job_signal_ring_end(cpu_job_signal_ring_, /*sycl_gone=*/false);
+    }
+    // llama.cpp-42zj: after the drain every armed input marker has been written, so the word can go.
+    {
+        std::lock_guard<std::mutex> lock(cpu_job_input_marker_mutex_);
+        cpu_job_input_marker_end(cpu_job_input_marker_word_, cpu_job_input_marker_owner_);
     }
 
 #if GGML_SYCL_DNNL
@@ -17387,7 +17405,123 @@ std::shared_ptr<cpu_job_gate_list> unified_cache_cpu_job_gates(sycl::queue & str
     return std::shared_ptr<cpu_job_gate_list>(ring, &ring->gates());
 }
 
+// --- CPU expert job input markers (llama.cpp-42zj); see cpu-job-signal.hpp ---
+
+// The marker's device task: once every event in `after` has completed (and, on the in-order `q`, every command
+// submitted before it), it makes the device's earlier writes visible to the host and stores `serial` into `word`.
+// Discrete BMG has no host-USM atomics, so the store is a plain one after a system-scope release fence, and the host
+// reads it with an acquire load. Throws what submit throws.
+static void cpu_job_input_marker_submit(sycl::queue &                    q,
+                                        uint32_t *                       word,
+                                        uint32_t                         serial,
+                                        const std::vector<sycl::event> & after) {
+    q.submit([&](sycl::handler & cgh) {
+        cgh.depends_on(after);
+        cgh.single_task([word, serial]() {
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            *word = serial;
+        });
+    });
+}
+
+// A job still waiting on the word stops (abandoned is set before the allocation goes), and the cache's allocation is
+// released here, on the tearing-down thread. The jobs keep only the view and the flag.
+static void cpu_job_input_marker_end(std::shared_ptr<cpu_job_input_marker_word> & word, mem_handle & owner) noexcept {
+    if (word) {
+        word->abandoned.store(true, std::memory_order_release);
+        word.reset();
+    }
+    owner = {};
+}
+
+bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & after,
+                                             cpu_job_input_marker *           out,
+                                             const char **                    why) {
+    std::lock_guard<std::mutex> lock(cpu_job_input_marker_mutex_);
+    if (!cpu_job_input_marker_word_) {
+        if (cpu_job_input_marker_tried_) {
+            *why = "its host-pinned word could not be made, or was let go at teardown";
+            return false;
+        }
+        cpu_job_input_marker_tried_ = true;
+        if (!queue_.has_property<sycl::property::queue::in_order>()) {
+            *why = "the stream is not in order, so its markers could be written out of serial order";
+            return false;
+        }
+        const int     device = get_device_id_from_queue(queue_);
+        alloc_request req{};
+        req.queue                               = &queue_;
+        req.device                              = device;
+        // A cache line of its own: the device's write shares it with no host data.
+        req.size                                = 64;
+        req.intent.role                         = alloc_role::CONTROL;
+        req.intent.category                     = runtime_category::CONTROL;
+        req.intent.cohort_id                    = "cpu_job_input_marker";
+        req.intent.constraints.must_host_pinned = true;
+        allocation_result allocation            = unified_allocate_owner(req);
+        if (!allocation) {
+            *why = "allocating its host-pinned word failed";
+            return false;
+        }
+        mem_handle owner    = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = owner.resolve(device);
+        if (!resolved.ptr || resolved.on_device) {
+            *why = "its word did not resolve to host memory";
+            return false;
+        }
+        auto word                   = std::make_shared<cpu_job_input_marker_word>();
+        word->word                  = static_cast<uint32_t *>(resolved.ptr);
+        *word->word                 = 0;
+        cpu_job_input_marker_owner_ = std::move(owner);
+        cpu_job_input_marker_word_  = std::move(word);
+        GGML_LOG_INFO(
+            "[MOE-INPUT-MARKER] CPU expert jobs wait their inputs on a device-written word on device %d "
+            "(llama.cpp-42zj)\n",
+            device);
+    }
+    const uint32_t serial = cpu_job_input_marker_serial_ + 1;
+    try {
+        cpu_job_input_marker_submit(queue_, cpu_job_input_marker_word_->word, serial, after);
+    } catch (const sycl::exception & e) {
+        GGML_LOG_WARN("[MOE-INPUT-MARKER] submitting a CPU expert job's input marker threw: %s (llama.cpp-42zj)\n",
+                      e.what());
+        *why = "submitting its device task threw";
+        return false;
+    }
+    cpu_job_input_marker_serial_ = serial;
+    out->word                    = cpu_job_input_marker_word_;
+    out->serial                  = serial;
+    return true;
+}
+
+bool unified_cache_cpu_job_input_marker_arm(sycl::queue &                    stream,
+                                            const std::vector<sycl::event> & after,
+                                            cpu_job_input_marker *           out,
+                                            const char **                    why) {
+    unified_cache * cache = moe_join_queue_cache_of(stream);
+    if (!cache) {
+        *why = "the stream is not a cache's compute stream";
+        return false;
+    }
+    return cache->arm_cpu_job_input_marker(after, out, why);
+}
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+bool cpu_job_input_marker_arm_for_testing(sycl::queue &                                      q,
+                                          const std::shared_ptr<cpu_job_input_marker_word> & word,
+                                          uint32_t                                           serial,
+                                          const std::vector<sycl::event> &                   after,
+                                          cpu_job_input_marker *                             out) {
+    try {
+        cpu_job_input_marker_submit(q, word->word, serial, after);
+    } catch (const sycl::exception &) {
+        return false;
+    }
+    out->word   = word;
+    out->serial = serial;
+    return true;
+}
+
 std::shared_ptr<cpu_job_signal_ring> cpu_job_signal_ring_create_for_testing(sycl::queue & q) {
     const char * why = "unknown";
     auto         r   = cpu_job_signal_ring::create(q, &why);

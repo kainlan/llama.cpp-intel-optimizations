@@ -341,7 +341,9 @@ CACHE_FROM_LEGACY_SITES = Counter({
     ("out = std::make_shared<mem_handle>(detail::", "std::move(moe_owner)"): 1,  # moe_preallocate_inference_buffers
 })
 CACHE_OWNER_FIRST_SITES = Counter({
-    ("allocation_result allocation =", "req"): 7,
+    # The eighth (llama.cpp-42zj) is unified_cache::arm_cpu_job_input_marker's word: a CONTROL request with
+    # must_host_pinned and no private token, so section 3.1 classifies it CACHE_SUBALLOCATION, a pinned-pool slice.
+    ("allocation_result allocation =", "req"): 8,
     ("allocation_result host_allocation =", "host_req"): 1,
     ("allocation_result result =", "req"): 1,  # unified_cache_zone_alloc
     ("allocation_result", "const alloc_request & req"): 1,  # the definition of unified_allocate_owner itself

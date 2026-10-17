@@ -16,8 +16,9 @@ THE CONTRACT.  With comments blanked:
      with std::make_shared<cpu_expert_job_stamps> and stamped with t_submit_ns,
      both inside `if (trace)`: no allocation and no clock read while tracing is off.
   R. (ggml-sycl.cpp moe_cpu_job_wait_inputs) the prologue calls
-     cpu_expert_pool_trace_stamp_inputs_ready() after sycl::event::wait(inputs.events),
-     inside `if (moe_hostpath_waits_enabled())`; and (cpu-expert-pool.cpp) that
+     cpu_expert_pool_trace_stamp_inputs_ready() after cpu_job_input_marker_wait(marker),
+     its wait for the job's inputs (llama.cpp-42zj), inside
+     `if (moe_hostpath_waits_enabled())`; and (cpu-expert-pool.cpp) that
      function writes t_inputs_ready_ns only through the worker's current-job pointer,
      inside an `if` on that pointer.
   K. (cpu-dispatch.cpp) t_compute_start_ns and t_compute_end_ns are written inside
@@ -206,9 +207,9 @@ def check_submit(pool: str) -> None:
 def check_inputs(pool: str, backend: str) -> None:
     bcode = blank_comments(backend)
     body, off = body_of(bcode, WAIT_INPUTS_SIG, "R")
-    w = re.search(r"sycl::event::wait\s*\(\s*inputs\.events\s*\)", body)
+    w = re.search(r"\bcpu_job_input_marker_wait\s*\(\s*marker\s*\)", body)
     if not w:
-        fail("R", "moe_cpu_job_wait_inputs no longer waits for inputs.events")
+        fail("R", "moe_cpu_job_wait_inputs no longer waits for its input marker")
     calls = list(re.finditer(r"\bcpu_expert_pool_trace_stamp_inputs_ready\s*\(\s*\)", body))
     if not calls:
         fail("R", "moe_cpu_job_wait_inputs does not stamp t_inputs_ready after its input wait")
@@ -378,7 +379,7 @@ def self_test(s: dict) -> int:
              r"ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready",
              r"{\1\n\2ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready")),
         ("R", "backend", "inputs-ready stamped before the wait",
-         sub(r"(if \(!inputs\.events\.empty\(\)\) \{)",
+         sub(r"(ggml_sycl::cpu_job_input_marker_wait\(marker\);)",
              r"ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready();\n    \1")),
         ("R", "pool", "current-job pointer not tested",
          sub(r"if \(g_pool_current_job\) \{\n(\s*)g_pool_current_job->t_inputs_ready_ns",

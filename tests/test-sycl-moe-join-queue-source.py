@@ -548,9 +548,12 @@ def self_test(s: dict) -> int:
         ("F", "backend", "join queue while the backend records",
          sub(r"return moe_join_queue_enabled\(\) && !ggml_sycl_graph_recording_active\(\) &&",
              "return moe_join_queue_enabled() &&")),
+        # Anchored on the join predicate's own return: the CPU job's device-signal and input-marker predicates
+        # (llama.cpp-qwn5, llama.cpp-42zj) end in the same recording test.
         ("F", "backend", "join queue while the stream itself records",
-         sub(r"&&\s*stream\.ext_oneapi_get_state\(\) != sycl::ext::oneapi::experimental::queue_state::recording;",
-             ";")),
+         sub(r"(return moe_join_queue_enabled\(\) && !ggml_sycl_graph_recording_active\(\))\s*&&\s*"
+             r"stream\.ext_oneapi_get_state\(\) != sycl::ext::oneapi::experimental::queue_state::recording;",
+             r"\1;")),
         ("F", "backend", "knob not consulted",
          sub(r"return moe_join_queue_enabled\(\) && !ggml_sycl_graph_recording_active\(\)",
              "return !ggml_sycl_graph_recording_active()")),

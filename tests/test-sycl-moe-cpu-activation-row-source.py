@@ -63,7 +63,8 @@ scatter events and was rejected for that reason).  It is DISJOINT REGIONS:
  10. CROSS-OP safety is by ORDERING, not by the ring (entry offsets scale with each op's own K/N
      and a top-K pool restarts at entry 0, so different ops DO alias).  The premises pinned since
      llama.cpp-z4kd moved the waits off the submitting thread: the job's prologue
-     (moe_cpu_job_wait_inputs) waits every input event and only then zeroes the out region, and
+     (moe_cpu_job_wait_inputs) waits for the job's input marker, which the device writes once every
+     input event has completed (llama.cpp-42zj), and only then zeroes the out region, and
      dispatch_cpu_compute zeroes nothing itself (pin W1: with an extra conjunct on the wait, or the
      memset first, the zeroing and the CPU read run before the D2H lands); every job form -- the
      CpuExpertPool worker and both std::async forms -- runs that prologue before its kernel, and the
@@ -358,8 +359,8 @@ def check_gather(code: str, lam_at: int, hostpath_src: str) -> None:
 DISPATCH_MARKER = "auto do_cpu_dispatch = [&]("
 POOL_CPP = ROOT / "ggml/src/ggml-sycl/pinned-buffer-pool.cpp"
 EXPERT_POOL_CPP = ROOT / "ggml/src/ggml-sycl/cpu-expert-pool.cpp"
-WAIT_INPUTS_DEF = "static void moe_cpu_job_wait_inputs(const moe_cpu_job_inputs & inputs) "
-PROLOGUE_DEF = "static std::function<void()> moe_cpu_job_prologue(moe_cpu_job_inputs inputs) "
+WAIT_INPUTS_DEF = "static void moe_cpu_job_wait_inputs(const ggml_sycl::cpu_job_input_marker & marker,"
+PROLOGUE_DEF = "static std::function<void()> moe_cpu_job_prologue("
 SLOT_FLUSH_DEF = "static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) "
 
 
@@ -534,8 +535,8 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
 
     # 8. (I2, llama.cpp-z4kd) the job's input waits and the out-region memset that depends on them run
     #    on the pool worker, in the job's prologue, never on the submitting thread.  W1: the prologue
-    #    waits every input event and only then zeroes, and dispatch_cpu_compute never zeroes the region
-    #    itself.  W2: every way the job can run (pool worker, recipe std::async, inactive-pool std::async)
+    #    waits for the job's input marker (every input event, llama.cpp-42zj) and only then zeroes, and
+    #    dispatch_cpu_compute never zeroes the region itself.  W2: every way the job can run (pool worker, recipe std::async, inactive-pool std::async)
     #    runs the prologue before the kernel.  W3: the zeroing is requested on every path that needs it.
     #    W4: every activation-copy branch hands its copy events to the prologue, unconditionally.
     def one_body(sig: str, pin: str) -> str:
@@ -544,17 +545,20 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
         return squash(brace_block_from(code, code.find(sig)))
 
     wait_body = one_body(WAIT_INPUTS_DEF, "W1")
-    # Between the wait and the zeroing sits only the trace's inputs-ready stamp (llama.cpp-j6jf), which reads
-    # the clock and writes the pool job's record; it neither waits nor touches the output span.
-    if wait_body != ("{ if (!inputs.events.empty()) { sycl::event::wait(inputs.events); } "
+    # Between the wait and the zeroing sit only the SYCL watchdog's tick (llama.cpp-ff00, llama.cpp-42zj) and the
+    # trace's inputs-ready stamp (llama.cpp-j6jf); neither waits nor touches the output span.
+    if wait_body != ("{ ggml_sycl::cpu_job_input_marker_wait(marker); ggml_sycl_watchdog_heartbeat(); "
                      "if (moe_hostpath_waits_enabled()) { ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready(); } "
-                     "if (inputs.zero_out && inputs.zero_bytes > 0) { std::memset(inputs.zero_out, 0, inputs.zero_bytes); } }"):
+                     "if (zero_out && zero_bytes > 0) { std::memset(zero_out, 0, zero_bytes); } }"):
         raise ContractError(
-            "FAIL [pin W1]: moe_cpu_job_wait_inputs is not exactly `wait every input event, then zero the output "
+            "FAIL [pin W1]: moe_cpu_job_wait_inputs is not exactly `wait the input marker, then zero the output "
             "span`; zeroing before the activation copy lands can clear a region an earlier scatter's H2D has not "
-            "read yet (llama.cpp-4hg7, llama.cpp-z4kd)"
+            "read yet (llama.cpp-4hg7, llama.cpp-z4kd, llama.cpp-42zj)"
         )
-    if one_body(PROLOGUE_DEF, "W1") != "{ return [inputs = std::move(inputs)]() { moe_cpu_job_wait_inputs(inputs); }; }":
+    # The arm and the refused arm's wait on the submitting thread are test-sycl-cpu-job-input-wait-source.py's W4.
+    if not one_body(PROLOGUE_DEF, "W1").endswith(
+            "return [marker = std::move(marker), zero_out = inputs.zero_out, zero_bytes = inputs.zero_bytes]() "
+            "{ moe_cpu_job_wait_inputs(marker, zero_out, zero_bytes); }; }"):
         raise ContractError(
             "FAIL [pin W1]: moe_cpu_job_prologue is not exactly a closure that runs moe_cpu_job_wait_inputs; the "
             "job's input waits would not run, or would run on the submitting thread (llama.cpp-z4kd)"
@@ -565,7 +569,7 @@ def check_hot_cold(code: str, hostpath_src: str | None = None, expert_pool_src: 
             "prologue, after the job's input events (llama.cpp-4hg7, llama.cpp-z4kd)"
         )
 
-    prologue_def = "std::function<void()> job_prologue = moe_cpu_job_prologue(std::move(job_inputs));"
+    prologue_def = "std::function<void()> job_prologue = moe_cpu_job_prologue(*stream, std::move(job_inputs), src0);"
     submits = (
         "prologue = std::move(job_prologue)]() mutable { GGML_UNUSED(workspace_owner); prologue(); "
         "for (const cpu_moe_host_aos_task & task : tasks) {",
@@ -938,22 +942,17 @@ def self_test(backend_src: str) -> int:
         "const bool zero_out_after_act_wait = from_pool || !out_owner.valid();\n"
         "                if (zero_out_after_act_wait) { std::memset(out_pinned, 0, n_cpu * static_cast<size_t>(N) * sizeof(float)); }"),
         None, "W1")
-    stamp_inputs = ("    // The job's inputs-ready stamp (llama.cpp-j6jf); a no-op off a traced pool job.\n"
-                    "    if (moe_hostpath_waits_enabled()) {\n"
-                    "        ggml_sycl::cpu_expert_pool_trace_stamp_inputs_ready();\n    }\n")
-    wait_then_zero = ("    if (!inputs.events.empty()) {\n        sycl::event::wait(inputs.events);\n    }\n" + stamp_inputs +
-                      "    if (inputs.zero_out && inputs.zero_bytes > 0) {\n        std::memset(inputs.zero_out, 0, inputs.zero_bytes);\n    }\n")
-    zero_then_wait = ("    if (inputs.zero_out && inputs.zero_bytes > 0) {\n        std::memset(inputs.zero_out, 0, inputs.zero_bytes);\n    }\n"
-                      "    if (!inputs.events.empty()) {\n        sycl::event::wait(inputs.events);\n    }\n" + stamp_inputs)
+    marker_wait = "    ggml_sycl::cpu_job_input_marker_wait(marker);\n"
+    zero_span = "    if (zero_out && zero_bytes > 0) {\n        std::memset(zero_out, 0, zero_bytes);\n    }\n"
     # W1: the prologue zeroes before it waits the activation copy.
-    expect_fail("prologue-zeroes-before-wait", sub(wait_then_zero, zero_then_wait, in_lambda=False, after=WAIT_INPUTS_DEF),
-                None, "W1")
-    # W1 (I2(c) analogue): the prologue's wait gains a conjunct, so a one-event job skips it.
-    expect_fail("prologue-wait-needs-two-events", sub("if (!inputs.events.empty()) {", "if (inputs.events.size() > 1) {",
-                                                      in_lambda=False, after=WAIT_INPUTS_DEF), None, "W1")
+    expect_fail("prologue-zeroes-before-wait", sub(marker_wait, zero_span + marker_wait, in_lambda=False,
+                                                   after=WAIT_INPUTS_DEF), None, "W1")
+    # W1 (I2(c) analogue): the prologue's wait gains a condition, so some jobs skip it.
+    expect_fail("prologue-wait-conditional", sub(marker_wait, "    if (zero_bytes > 4096) {\n    " + marker_wait + "    }\n",
+                                                 in_lambda=False, after=WAIT_INPUTS_DEF), None, "W1")
     # W1: the closure no longer runs the waits.
-    expect_fail("prologue-closure-empty", sub("() {\n        moe_cpu_job_wait_inputs(inputs);\n    };", "() {};",
-                                              in_lambda=False, after=PROLOGUE_DEF), None, "W1")
+    expect_fail("prologue-closure-empty", sub("() {\n        moe_cpu_job_wait_inputs(marker, zero_out, zero_bytes);\n    };",
+                                              "() {};", in_lambda=False, after=PROLOGUE_DEF), None, "W1")
     # W2: one job form stops running the prologue, or the pool submission drops it.
     expect_fail("fallback-skips-prologue", sub(
         "prologue();\n                        ggml_sycl_cpu_expert_mul_mat_batched", "ggml_sycl_cpu_expert_mul_mat_batched"),
