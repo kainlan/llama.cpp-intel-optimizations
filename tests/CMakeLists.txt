@@ -541,6 +541,15 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-kv-cache-tensor-name PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# oneDNN SDPA query-row chunking (llama.cpp-jwjz): one execute's Graph scratch is H_q x rows x n_kv x 6 bytes,
+# so the route splits an op's query rows to keep every execute under a budget. ggml-sycl/fattn-onednn-chunk.hpp
+# includes only <cstddef>/<cstdint>, so the test needs no device.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-fattn-onednn-chunk.cpp)
+    set_tests_properties(test-sycl-fattn-onednn-chunk PROPERTIES LABELS "sycl;onednn;hostonly")
+    target_include_directories(test-sycl-fattn-onednn-chunk PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
 # WOQ-MXFP4 capability spike: does this device's oneDNN build a matmul with
 # f16 src, f4_e2m1 weights, and e8m0 grouped-{32,1} scales directly (perf-
 # recovery epic, track C gate, llama.cpp-4m9p)? Unlike test-sycl-route-table-
