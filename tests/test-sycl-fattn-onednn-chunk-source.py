@@ -120,7 +120,7 @@ def check(srcs):
     ))
     results["the last chunk runs the tail partition"] = (
         "const bool is_tail = (c == chunks.n_chunks - 1);" in loop
-        and "const sdpa_compiled_entry & part = is_tail ? *tail_entry : *entry;" in loop
+        and "sdpa_compiled_entry & part = is_tail ? *tail_entry : *entry;" in loop
         and "sycl_interop::execute(part.cp," in loop)
     results["both partitions are acquired before any chunk is submitted"] = (
         loop_pos >= 0

@@ -1383,9 +1383,9 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
         // leaves dst partly written; the native kernel the caller falls back
         // to rewrites all of it on the same queue.
         for (int64_t c = 0; c < chunks.n_chunks; ++c) {
-            const bool                  is_tail = (c == chunks.n_chunks - 1);
-            const sdpa_compiled_entry & part    = is_tail ? *tail_entry : *entry;
-            const int64_t               r0      = c * chunks.rows;
+            const bool            is_tail = (c == chunks.n_chunks - 1);
+            sdpa_compiled_entry & part    = is_tail ? *tail_entry : *entry;
+            const int64_t         r0      = c * chunks.rows;
 
             // Row r0 of each row-indexed operand: Q and the mask by their row
             // strides, dst by its dense H_q x D row (batch is 1 on this path).
