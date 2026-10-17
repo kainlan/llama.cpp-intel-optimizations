@@ -890,6 +890,14 @@ if (Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-job-device-signal-source.py --self-test)
     set_tests_properties(test-sycl-moe-cpu-job-device-signal-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # A returning whole-queue wait of the graph code, every CPU expert batch and every host-recipe expert task tick
+    # the [SYCL-WATCHDOG], so a slow prompt graph is not stopped while it advances (llama.cpp-ff00). Run WITH
+    # --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-watchdog-progress-tick-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-watchdog-progress-tick-source.py --self-test)
+    set_tests_properties(test-sycl-watchdog-progress-tick-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
     # The per-op source chain skips the ready events its own in-order stream produced, behind
     # GGML_SYCL_CHAIN_SAME_QUEUE_SKIP, and queries every other one as before (llama.cpp-wfsl). Run WITH
     # --self-test so each pin is proven to catch its mutant.

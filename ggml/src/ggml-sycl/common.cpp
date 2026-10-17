@@ -669,9 +669,11 @@ static void ggml_sycl_cleanup_host_allocations() {
 // A few consecutive resets leave Level Zero in an unrecoverable state that
 // requires a reboot. This watchdog fires *before* the driver's cascade:
 // callers sprinkle ggml_sycl_watchdog_heartbeat() at natural progress points
-// (graph_compute exit, per-layer prestage loops, persistent TG dispatch), a
-// polling thread checks elapsed time since the last heartbeat, and if it
-// exceeds GGML_SYCL_OP_TIMEOUT_MS the process is _Exit(1)'d with a diagnostic.
+// (graph_compute exit, every whole-queue wait of the graph code that returns,
+// every CPU expert batch and host-recipe task, per-layer prestage loops,
+// persistent TG dispatch), a polling thread checks elapsed time since the last
+// heartbeat, and if it exceeds GGML_SYCL_OP_TIMEOUT_MS the process is _Exit(1)'d
+// with a diagnostic.
 //
 // Heartbeat cost is one relaxed atomic store (~1ns). The polling thread wakes
 // every 500ms so detection latency is bounded by a half-second on top of the
@@ -748,9 +750,9 @@ static void watchdog_thread_fn(int64_t timeout_ms) {
             }
             fprintf(stderr,
                     "[SYCL-WATCHDOG] No GPU progress for %lld ms (timeout %lld ms, %d devices known).\n"
-                    "[SYCL-WATCHDOG] Most likely a SYCL submit is hung inside the Level Zero driver;\n"
-                    "[SYCL-WATCHDOG] the xe driver would otherwise reset the GT engine in ~10 s and\n"
-                    "[SYCL-WATCHDOG] accumulate state that requires a reboot. Forcing cleanup + _Exit(1).\n"
+                    "[SYCL-WATCHDOG] No queue wait of the graph code returned and no CPU expert matmul finished\n"
+                    "[SYCL-WATCHDOG] in that time: a hung submit, or one command or graph segment slower than\n"
+                    "[SYCL-WATCHDOG] the timeout. Forcing cleanup + _Exit(1).\n"
                     "[SYCL-WATCHDOG] Set GGML_SYCL_OP_TIMEOUT_MS=0 to disable, or raise the value for\n"
                     "[SYCL-WATCHDOG] known-slow workloads (large model prestage, cold warmup).\n",
                     elapsed_ms, (long long) timeout_ms, n_devices);
