@@ -15,17 +15,18 @@ The fix this gate pins:
   With half the cap a full chunk's buffer and the shorter last chunk's buffer fit under the cap together, so no
   chunk takes the oversized early-out and every chunk goes through the outstanding-bytes wait.
 - The cap it reads is the allocator's: the accessor makes the same cache lookup as the allocator callback, and the
-  member computes the cap from the same plan snapshot as the allocator's headroom wait.
+  cache computes the cap in one place, unified_cache::onednn_graph_scratch_direct_cap(), which the allocator's
+  headroom wait calls too.
 - Every execute runs inside the chunk loop, each chunk offsets Q, the mask and dst by its first row, the last chunk
   runs the tail partition, both partitions are acquired before the loop, and the terminal event is the last chunk's.
-- The planner counts the score and probability cells per row and keeps every full chunk within the budget.
 
-The planner's arithmetic is proved by test-sycl-fattn-onednn-chunk (host C++), and the chunked execute's numerics
-by test-sycl-fattn-onednn-descriptors-chunked (device). This gate proves the production dispatcher actually uses the
-planner at the cap-derived budget, without a build.
+This gate is about the dispatcher's wiring only. The planner's arithmetic is proved behaviourally by
+test-sycl-fattn-onednn-chunk (host C++), and the chunked execute's numerics and its scratch bound by
+test-sycl-fattn-onednn-descriptors-chunked (device). This gate proves, without a build, that the production
+dispatcher uses the planner at the cap-derived budget.
 
-Run with --self-test to prove every check fires against a mutant of the thing it requires. Point --onednn, --chunk
-and --cache at another tree's files to score that tree (a missing file reads as empty, so every check fails).
+Run with --self-test to prove every check fires against a mutant of the thing it requires. Point --onednn and
+--cache at another tree's files to score that tree (a missing file reads as empty, so every check fails).
 """
 import argparse
 import re
@@ -37,7 +38,6 @@ sycl = root / "ggml/src/ggml-sycl"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--onednn", default=str(sycl / "fattn-onednn.cpp"))
-parser.add_argument("--chunk", default=str(sycl / "fattn-onednn-chunk.hpp"))
 parser.add_argument("--cache", default=str(sycl / "unified-cache.cpp"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
@@ -45,11 +45,12 @@ args = parser.parse_args()
 DISPATCH_SIGNATURE = "bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fattn_params & params)"
 CHUNK_LOOP = "for (int64_t c = 0; c < chunks.n_chunks; ++c) {"
 EXECUTE_CALL = "dnnl::graph::sycl_interop::execute("
-# The cap expression the allocator's headroom wait and the accessor's member must share.
+# The one place the cache turns its plan snapshot into the DIRECT cap, and the call every other site makes.
 CAP_FROM_SNAPSHOT = (
     "onednn_graph_scratch_direct_cap_bytes( "
     "onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire))"
 )
+CAP_MEMBER_CALL = "const size_t cap = onednn_graph_scratch_direct_cap();"
 
 
 def strip_comments(source):
@@ -94,9 +95,7 @@ def check(srcs):
     malloc_cb = squash(function_body(
         cache_code, "void * onednn_graph_sycl_malloc(size_t size, size_t alignment, const void * dev, const void * ctx)"))
     headroom = squash(function_body(cache_code, "bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked("))
-    chunk_code = strip_comments(srcs["chunk"])
-    scratch_fn = squash(function_body(chunk_code, "inline uint64_t onednn_fa_graph_scratch_bytes("))
-    planner = squash(function_body(chunk_code, "inline onednn_fa_row_chunks onednn_fa_plan_row_chunks("))
+    cache_squashed = squash(cache_code)
 
     results = {}
     results["the per-execute budget is half the allocator's DIRECT cap"] = (
@@ -133,20 +132,10 @@ def check(srcs):
         "get_existing_unified_cache_for_device(device_id)" in accessor
         and "->onednn_graph_scratch_direct_cap()" in accessor
         and "get_existing_unified_cache_for_device(device_id)" in malloc_cb)
-    results["the cap member and the allocator's headroom wait compute the cap from the same snapshot"] = (
-        CAP_FROM_SNAPSHOT in member and CAP_FROM_SNAPSHOT in headroom)
-    results["the planner counts the score and probability cells per row"] = (
-        "const uint64_t cell_bytes = sizeof(float) + static_cast<uint64_t>(q_elem_size);" in scratch_fn
-        and "static_cast<uint64_t>(H_q) * static_cast<uint64_t>(rows) * static_cast<uint64_t>(ne11) * cell_bytes"
-        in scratch_fn
-        and "const uint64_t per_row = onednn_fa_graph_scratch_bytes(H_q, 1, ne11, q_elem_size);" in planner)
-    results["the planner keeps every full chunk within the budget"] = all(term in planner for term in (
-        "const int64_t rows_max = std::max<int64_t>(1, static_cast<int64_t>(budget_bytes / per_row));",
-        "int64_t n_chunks = (ncols + rows_max - 1) / rows_max;",
-        "const int64_t rows = (ncols + n_chunks - 1) / n_chunks;",
-        "n_chunks = (ncols + rows - 1) / rows;",
-        "plan.tail_rows = ncols - (n_chunks - 1) * rows;",
-    ))
+    results["the cache computes the cap in one member, and the allocator's headroom wait calls it"] = (
+        CAP_FROM_SNAPSHOT in member
+        and cache_squashed.count(CAP_FROM_SNAPSHOT) == 1
+        and CAP_MEMBER_CALL in headroom)
     return results
 
 
@@ -162,7 +151,7 @@ def mutate(text, old, new):
     return out
 
 
-sources = {"onednn": read(args.onednn), "chunk": read(args.chunk), "cache": read(args.cache)}
+sources = {"onednn": read(args.onednn), "cache": read(args.cache)}
 results = check(sources)
 
 if args.self_test:
@@ -208,19 +197,15 @@ if args.self_test:
         ("the cap accessor makes the allocator callback's cache lookup", "cache",
          "const unified_cache * cache = get_existing_unified_cache_for_device(device_id);",
          "const unified_cache * cache = get_unified_cache_for_device(device_id);"),
-        ("the cap member and the allocator's headroom wait compute the cap from the same snapshot", "cache",
+        ("the cache computes the cap in one member, and the allocator's headroom wait calls it", "cache",
          "size_t unified_cache::onednn_graph_scratch_direct_cap() const { return onednn_graph_scratch_direct_cap_bytes("
          " onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire));",
          "size_t unified_cache::onednn_graph_scratch_direct_cap() const { return size_t(1) << 30;"),
-        ("the planner counts the score and probability cells per row", "chunk",
-         "sizeof(float) + static_cast<uint64_t>(q_elem_size);", "static_cast<uint64_t>(q_elem_size);"),
-        ("the planner counts the score and probability cells per row", "chunk",
-         "onednn_fa_graph_scratch_bytes(H_q, 1, ne11, q_elem_size);",
-         "onednn_fa_graph_scratch_bytes(1, 1, ne11, q_elem_size);"),
-        ("the planner keeps every full chunk within the budget", "chunk",
-         "static_cast<int64_t>(budget_bytes / per_row)", "static_cast<int64_t>(2 * budget_bytes / per_row)"),
-        ("the planner keeps every full chunk within the budget", "chunk",
-         "const int64_t rows = (ncols + n_chunks - 1) / n_chunks;", "const int64_t rows = ncols / n_chunks + 1;"),
+        # The headroom wait computing its own cap again (the second spelling this check replaced).
+        ("the cache computes the cap in one member, and the allocator's headroom wait calls it", "cache",
+         "const size_t cap = onednn_graph_scratch_direct_cap();",
+         "const size_t cap = onednn_graph_scratch_direct_cap_bytes("
+         " onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire));"),
     ]
     covered = {name for name, *_ in mutants}
     dead = [name for name in results if name not in covered]

@@ -13787,8 +13787,7 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
                                                                          std::unique_lock<std::mutex> & lock,
                                                                          bool & out_was_oversized) {
     out_was_oversized = false;
-    const size_t cap  = onednn_graph_scratch_direct_cap_bytes(
-        onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire));
+    const size_t cap  = onednn_graph_scratch_direct_cap();
 
     // llama.cpp-c6ah: entry point of this call -- the timing reference the
     // poll loop's deadline below is computed from.
@@ -14184,10 +14183,7 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
                 "so a one-off spike is not refused pre-emptively; unified_alloc() below still fails loudly rather "
                 "than handing oneDNN a null scratch pointer.\n",
                 size / (1024.0 * 1024.0), onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0),
-                onednn_graph_scratch_direct_cap_bytes(
-                    onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire)) /
-                    (1024.0 * 1024.0),
-                onednn_graph_scratch_direct_wait_count_);
+                onednn_graph_scratch_direct_cap() / (1024.0 * 1024.0), onednn_graph_scratch_direct_wait_count_);
         }
     }
 
@@ -14267,10 +14263,8 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
             "hand oneDNN a null scratch pointer for this request -- see llama.cpp-0oxf for the GPU "
             "page-fault/segfault this used to cause. Aborting instead.\n",
             size / (1024.0 * 1024.0), onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0),
-            onednn_graph_scratch_direct_cap_bytes(
-                onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire)) /
-                (1024.0 * 1024.0),
-            onednn_graph_scratch_direct_wait_count_, zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
+            onednn_graph_scratch_direct_cap() / (1024.0 * 1024.0), onednn_graph_scratch_direct_wait_count_,
+            zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
             zone_used(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
             onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa,
                                                       shape.n_ubatch, shape.n_ctx) /
@@ -14558,7 +14552,8 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
         return;
     }
 
-    // Zone-backed suballocation, TP inactive: return it to the ONEDNN zone's
+    // Zone-backed suballocation, every consumer on one in-order queue (TP
+    // inactive and the cache queue in-order): return it to the ONEDNN zone's
     // TLSF free list IMMEDIATELY, with no event wait or completion check of
     // any kind. Safe by construction, not by omission: the ONLY consumer of
     // a Graph-scratch buffer is a dnnl::graph::sycl_interop::execute() call
@@ -14603,8 +14598,12 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
     // reserve_onednn_scratch's own defer_published_zone_release already uses
     // for the same "zone pointer, need an event-gated release" shape).
     //
-    // onednn_graph_scratch_consumers_in_order() is that check, and the DIRECT
-    // pool's in-order reuse reads the same predicate (llama.cpp-jwjz).
+    // A cache queue without the in_order property breaks it the same way:
+    // nothing then orders the next consumer after the previous one.
+    //
+    // onednn_graph_scratch_consumers_in_order() is that check (TP inactive
+    // and the queue in-order), and the DIRECT pool's in-order reuse reads the
+    // same predicate (llama.cpp-jwjz).
     if (!onednn_graph_scratch_consumers_in_order()) {
         const size_t deferred_size = zone_it->second;
         note_onednn_graph_scratch_free_locked(deferred_size);
@@ -14625,15 +14624,17 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
             // the map entry above is already erased, so this block is no
             // longer tracked as ours either way; the difference is whether
             // its bytes go back to the TLSF free list where a same-race
-            // zone_alloc() could hand them to a new TP consumer (zone_free,
-            // reopening exactly the race this branch exists to close) or
-            // stay held out of the zone until arena teardown (leak). A
-            // permanently smaller ONEDNN zone degrades gracefully -- future
-            // requests that no longer fit it fall through to the DIRECT path
-            // above -- corrupting a TP consumer's in-flight read does not.
+            // zone_alloc() could hand them to a new, unordered consumer
+            // (zone_free, reopening exactly the race this branch exists to
+            // close) or stay held out of the zone until arena teardown
+            // (leak). A permanently smaller ONEDNN zone degrades gracefully
+            // -- future requests that no longer fit it fall through to the
+            // DIRECT path above -- corrupting an unordered consumer's
+            // in-flight read does not.
             GGML_LOG_WARN(
-                "[UNIFIED-CACHE] oneDNN Graph allocator: TP active for device %d and no event/barrier available "
-                "to defer ptr=%p -- leaking rather than risking a race with an in-flight TP consumer\n",
+                "[UNIFIED-CACHE] oneDNN Graph allocator: consumers not on one in-order queue for device %d (TP "
+                "active, or the cache queue is not in-order) and no event/barrier available to defer ptr=%p -- "
+                "leaking rather than risking a race with an in-flight consumer\n",
                 ggml_sycl_get_device_id_from_queue(queue_), ptr);
         }
         return;
