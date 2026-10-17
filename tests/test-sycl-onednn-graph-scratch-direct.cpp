@@ -163,14 +163,21 @@
 //       gates reuse on completion, where the request is a fresh miss.
 //       CONTRACT: this relies on the buffer's previous and next consumers
 //       submitting on the same in-order queue, the cache's own, so that the
-//       queue orders them. (i) pins the other side of that contract.
+//       queue orders them. (i) checks the per-request tag the allocator
+//       uses to enforce it.
 //
 //   (i) NO CROSS-QUEUE REUSE IN FLIGHT: an entry last used on a different
 //       queue is not handed to a cache-queue request while its release is
 //       pending, and a request from a different queue does not take an
 //       entry still in flight on the cache queue. Both are fresh misses
 //       with no wait, and the first entry is reused once its release
-//       completes. Added by llama.cpp-jwjz.
+//       completes. Added by llama.cpp-jwjz. Production never hands the
+//       allocator another queue (onednn_graph_sycl_malloc() always passes
+//       the cache's queue), so (i) proves the per-request tag logic, not a
+//       production path; in production the TP predicate covers an execute
+//       on another queue. RED only against 71a778f5f's per-cache policy,
+//       where both requests are hits. GREEN on 4041f1ff2 too, where every
+//       reuse waits for completion.
 //
 // RED-FIRST NOTE. Three of these nine properties, (a)-(c), are RED against
 // the pre-0oxf code: (a) and (b) have no pool, cap, or wait at all (every
@@ -2008,7 +2015,10 @@ void test_in_flight_entry_is_reused_in_order(unified_cache * cache, int device) 
 // queues, so an entry last used on another queue must wait for its release
 // like any other, and a request from another queue must not take an entry
 // still in flight. Both directions are checked with a second in-order queue
-// on the same device and context:
+// on the same device and context. Production never passes the allocator a
+// queue other than the cache's, so this proves the per-request tag
+// (onednn_graph_scratch_alloc()'s requester_in_order and the entry's
+// in_order), not a production path:
 //   A. a buffer handed out on the other queue and parked behind a slow
 //      kernel there is NOT handed to a cache-queue request while in flight
 //      (a fresh miss, no wait), and is reused once its release completes;

@@ -8,7 +8,10 @@
 //   - the chunk plan for the shapes the failing bench produces;
 //   - the plan's invariants over a grid of shapes and budgets.
 //
-// Host-only: the header includes <cstddef>/<cstdint> alone.
+// RED at b4f40634a, where onednn_fa_plan_row_chunks() was a stub that always returned one chunk: the
+// scratch-formula checks pass there and the chunk-plan and invariant checks fail. GREEN from 637223175.
+//
+// Host-only: the header includes standard headers only (<algorithm>, <cstddef>, <cstdint>).
 #include "ggml-sycl/fattn-onednn-chunk.hpp"
 
 #include <cstdint>
