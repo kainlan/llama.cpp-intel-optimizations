@@ -1978,20 +1978,40 @@ void test_in_flight_entry_is_reused_in_order(unified_cache * cache, int device) 
     // then frees it. That re-park happens while the slow kernel still runs,
     // so the previous marker on the returned slot is still pending when the
     // free list hands the same slot out again (it is LIFO).
-    std::vector<unsigned char> host(kProbeBytes, 0);
-    sycl::event                new_write = q.memset(ptr2, 0x22, kProbeBytes);
-    sycl::event                readback  = q.memcpy(host.data(), ptr2, kProbeBytes);
+    //
+    // The readback lands in host USM. A copy into pageable memory blocks the
+    // host until the in-order queue drains, slow kernel included, so the
+    // re-park would land after the previous marker completed and property 4's
+    // premise would never hold.
+    unsigned char * host = sycl::malloc_host<unsigned char>(kProbeBytes, q);
+    check(host != nullptr, "the host USM readback buffer was allocated");
+    if (!host) {
+        old_write.wait();
+        cache->onednn_graph_scratch_free(ptr2, nullptr);
+        unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown (in-order reuse)");
+        return;
+    }
+    std::fill(host, host + kProbeBytes, static_cast<unsigned char>(0));
+    sycl::event     new_write   = q.memset(ptr2, 0x22, kProbeBytes);
+    sycl::event     readback    = q.memcpy(host, ptr2, kProbeBytes);
+    const long long readback_ms = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - submit_start).count());
     cache->onednn_graph_scratch_free(ptr2, &readback);
     const long long repark_ms = static_cast<long long>(
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - submit_start).count());
-    check(repark_ms < slow.duration_ms / 3,
+    printf(
+        "    (handed back %lld ms, readback enqueued %lld ms, re-parked %lld ms after the slow kernel was submitted)\n",
+        reuse_ms, readback_ms, repark_ms);
+    const bool marker_pending = repark_ms < slow.duration_ms / 3;
+    const bool same_slot      = cache->onednn_graph_scratch_pool_entry_flag_slot_for_test(kSizeInOrder) == first_slot;
+    check(marker_pending,
           "the re-park happened while the previous consumer's kernel, and so its marker, was still pending");
-    check(cache->onednn_graph_scratch_pool_entry_flag_slot_for_test(kSizeInOrder) == first_slot,
-          "the re-park armed the slot the early exit returned, so both markers target one slot");
+    check(same_slot, "the re-park armed the slot the early exit returned, so both markers target one slot");
 
     readback.wait();
-    check(std::all_of(host.begin(), host.end(), [](unsigned char b) { return b == 0x22; }),
+    check(std::all_of(host, host + kProbeBytes, [](unsigned char b) { return b == 0x22; }),
           "the handed-back buffer holds the new consumer's write, not the previous consumer's");
+    sycl::free(host, q);
     try {
         const uint64_t old_end   = old_write.get_profiling_info<sycl::info::event_profiling::command_end>();
         const uint64_t new_start = new_write.get_profiling_info<sycl::info::event_profiling::command_start>();
@@ -2000,9 +2020,16 @@ void test_in_flight_entry_is_reused_in_order(unified_cache * cache, int device) 
         printf("    (profiling timestamps unavailable: %s)\n", e.what());
         check(false, "the cache queue reports profiling timestamps for the ordering check");
     }
-    check(poll_flag_true(cache, kSizeInOrder),
-          "the re-parked entry reads complete once its own release ends, although its slot's previous marker "
-          "was still pending when the slot was armed again");
+    // Property 4 holds only if the re-park armed the returned slot while its
+    // previous marker was still pending. Without that premise a complete flag
+    // proves nothing, so the check fails and says the property went unexercised.
+    const bool re_parked_complete = poll_flag_true(cache, kSizeInOrder);
+    check(marker_pending && same_slot && re_parked_complete,
+          marker_pending && same_slot ?
+              "the re-parked entry reads complete once its own release ends, although its slot's previous marker "
+              "was still pending when the slot was armed again" :
+              "the re-parked entry's completion was not tested against a still-pending previous marker on its slot: "
+              "the re-park landed late or armed another slot, so this property went unexercised");
 
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown (in-order reuse)");
 }
