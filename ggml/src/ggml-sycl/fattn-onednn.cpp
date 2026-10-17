@@ -10,6 +10,7 @@
 
 #    include "common.hpp"
 #    include "fattn-common.hpp"
+#    include "fattn-onednn-chunk.hpp"
 
 #    include <cmath>
 #    include <cstdio>
@@ -1165,10 +1166,45 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
         active_params.nb03   = q_nb3;
     }
 
+    // llama.cpp-kx2a: with the Graph allocator on, every execute draws its scratch from this device's unified
+    // cache. Without a cache the allocator refuses and returns nullptr, and oneDNN does not check that return:
+    // it launches the partition with a null scratch pointer, which faults the device. Only a DIRECT op can
+    // arrive here with no cache, because materializing K/V or Q allocates through the cache and creates it.
+    // That is why the guard follows both materialize blocks: placed earlier, it would decline a DIRECT op with an
+    // F32 Q whose own materialize would have created the cache.
+    // Decline before any partition is compiled or executed. The decline keeps the op away from the allocator, so
+    // the allocator's once-only warning no longer fires; warn once here instead, at WARN so a default-verbosity
+    // run shows a device that reached SDPA dispatch with no cache.
+    if (ggml_sycl::onednn_graph_allocator_enabled() &&
+        ggml_sycl::get_existing_unified_cache_for_device(ctx.device) == nullptr) {
+        static std::atomic<bool> warned{ false };
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            GGML_LOG_WARN(
+                "[SYCL] fattn: oneDNN SDPA declined on device %d: the device has no unified_cache to serve "
+                "the Graph allocator's scratch, so the op falls back to native FA (only logged once)\n",
+                ctx.device);
+        }
+        if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+            fprintf(stderr, "[SYCL] fattn: oneDNN declined: no_unified_cache device=%d\n", ctx.device);
+        }
+        return decline("no_unified_cache");
+    }
+
+    // llama.cpp-jwjz: one execute's Graph scratch grows with rows x ne11 (fattn-onednn-chunk.hpp), and
+    // the allocator serves a request above its DIRECT cap outside the arena regardless. At ubatch 2048
+    // and n_kv >= 4096 that overcommitted both cards once per layer. Split the op's query rows so every
+    // execute stays within half the cap: a full chunk's buffer and the last chunk's buffer then fit
+    // under the cap together. Each row's softmax and probability-times-V product depend only on that
+    // row, so the chunks reproduce the single execute exactly. An op that already fits stays one
+    // execute.
+    const size_t chunk_budget = ggml_sycl::unified_cache_onednn_graph_scratch_direct_cap_bytes(ctx.device) / 2;
+    const ggml_sycl::onednn_fa_row_chunks chunks = ggml_sycl::onednn_fa_plan_row_chunks(
+        active_params.ne01, active_params.ne11, H_q, ggml_type_size(active_params.Q_type), chunk_budget);
+
     sdpa_shape_key key;
     key.device_id = ctx.device;
     key.D         = D;
-    key.ncols     = active_params.ne01;
+    key.ncols     = (int) chunks.rows;
     key.ne11      = active_params.ne11;
     key.H_q       = H_q;
     key.H_kv      = H_kv;
@@ -1194,10 +1230,17 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     key.m_nb2 = key.has_mask ? active_params.nb32 : 0;
     key.m_nb3 = key.has_mask ? active_params.nb33 : 0;
 
+    // The last chunk differs only in its row count. The strides stay the op's own: a chunk is a row
+    // range of the same tensors, reached by offsetting the base pointers below.
+    sdpa_shape_key tail_key = key;
+    tail_key.ncols          = (int) chunks.tail_rows;
+
     sdpa_partition_cache * cache = get_or_create_cache(ctx);
     if (layout_plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT && std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
-        fprintf(stderr, "[SYCL] fattn: oneDNN DIRECT D=%d ne01=%d ne11=%d H_q=%d H_kv=%d\n", D, active_params.ne01,
-                active_params.ne11, H_q, H_kv);
+        fprintf(stderr,
+                "[SYCL] fattn: oneDNN DIRECT D=%d ne01=%d ne11=%d H_q=%d H_kv=%d chunks=%lld rows=%lld tail=%lld\n", D,
+                active_params.ne01, active_params.ne11, H_q, H_kv, (long long) chunks.n_chunks, (long long) chunks.rows,
+                (long long) chunks.tail_rows);
     }
 
     // ------------------------------------------------------------------
@@ -1216,28 +1259,40 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     // cache during the first few prefill calls) so this serialisation is
     // bounded and amortised. The alternative (per-key promise/future) is
     // meaningfully more complex for a one-time cost.
+    //
+    // Both partitions are acquired before any chunk is submitted, so a shape
+    // that cannot compile declines before any chunk has run.
     std::shared_ptr<sdpa_compiled_entry> entry;
+    std::shared_ptr<sdpa_compiled_entry> tail_entry;
     {
         // lock_guard, not unique_lock: we never unlock manually, move, or wait
         // on a condition_variable. lock_guard is lighter (no owns_lock flag)
         // and makes the "scope-bound lock" intent explicit.
         std::lock_guard<std::mutex> lock(cache->m);
 
-        // Negative cache — previous compile for this shape failed; fall through fast.
-        if (cache->negative.count(key)) {
-            return decline("negative_cache");
-        }
+        const sdpa_shape_key *                 keys[2]  = { &key, &tail_key };
+        std::shared_ptr<sdpa_compiled_entry> * slots[2] = { &entry, &tail_entry };
+        const int                              n_keys   = (tail_key.ncols != key.ncols) ? 2 : 1;
+        for (int i = 0; i < n_keys; ++i) {
+            const sdpa_shape_key & k = *keys[i];
 
-        auto it = cache->hits.find(key);
-        if (it != cache->hits.end()) {
-            entry = it->second;  // shared_ptr copy; keeps the entry alive past unlock.
-        } else {
+            // Negative cache — previous compile for this shape failed; fall through fast.
+            if (cache->negative.count(k)) {
+                return decline("negative_cache");
+            }
+
+            auto it = cache->hits.find(k);
+            if (it != cache->hits.end()) {
+                *slots[i] = it->second;  // shared_ptr copy; keeps the entry alive past unlock.
+                continue;
+            }
+
             // Cache miss — compile while holding the lock. oneDNN JIT is slow
             // (10-100ms) only on the first call for a new shape; subsequent
             // calls hit the fast-path above.
             dnnl::engine eng = ctx.engine_dnnl(stream);
             try {
-                build_result r   = build_and_compile_sdpa(key, eng, stream);
+                build_result r   = build_and_compile_sdpa(k, eng, stream);
                 auto         ent = std::make_shared<sdpa_compiled_entry>();
                 ent->cp          = std::move(r.cp);
                 ent->in_ports    = std::move(r.in_ports);
@@ -1247,26 +1302,29 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
                 // releases the allocation when the last shared_ptr drops.
                 ent->scale_owner = std::move(r.scale_owner);
                 ent->scale_usm   = r.scale_usm;
-                ent->scale       = key.scale;
+                ent->scale       = k.scale;
                 r.scale_usm      = nullptr;
                 // Store under the key, retain our own shared_ptr copy for use
                 // below (entry survives any future cache mutation).
-                cache->hits[key] = ent;
-                entry            = std::move(ent);
+                cache->hits[k]   = ent;
+                *slots[i]        = std::move(ent);
             } catch (std::exception & e) {
                 fprintf(stderr, "[SYCL] oneDNN SDPA compile failed for D=%d ncols=%d ne11=%d H_q=%d H_kv=%d: %s\n", D,
-                        active_params.ne01, active_params.ne11, H_q, H_kv, e.what());
-                cache->negative[key] = true;
+                        k.ncols, k.ne11, H_q, H_kv, e.what());
+                cache->negative[k] = true;
                 return decline("compile_failed");
             }
         }
+        if (n_keys == 1) {
+            tail_entry = entry;
+        }
     }
     // ------------------------------------------------------------------
-    // Lock released. `entry` is a shared_ptr — the compiled partition,
-    // port lists, and per-shape `scale_usm` live as long as this local.
-    // `scale_usm` was populated exactly once inside build_and_compile_sdpa
-    // (under the cache mutex) and is never written again; the execute
-    // path only READS it. No race.
+    // Lock released. `entry` and `tail_entry` are shared_ptrs — the compiled
+    // partition, port lists, and per-shape `scale_usm` live as long as these
+    // locals. `scale_usm` was populated exactly once inside
+    // build_and_compile_sdpa (under the cache mutex) and is never written
+    // again; the execute path only READS it. No race.
     // ------------------------------------------------------------------
 
     // ---- Wrap USM pointers as dnnl::graph::tensor ----------------------------
@@ -1287,43 +1345,9 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     if (active_params.scale == 0.0f || !std::isfinite(active_params.scale)) {
         return decline("scale_guard");  // the planner gate should have rejected this already; defensive only
     }
-    GGML_ASSERT(active_params.scale == entry->scale &&
+    GGML_ASSERT(active_params.scale == entry->scale && active_params.scale == tail_entry->scale &&
                 "oneDNN SDPA: cached partition's baked scale does not match the runtime scale (cache key/scale "
                 "mismatch)");
-
-    const auto & in_ports  = entry->in_ports;
-    const auto & out_ports = entry->out_ports;
-
-    // in_ports order: Q, K, scale, [mask], V
-    size_t port_idx = 0;
-
-    dnnl::graph::tensor t_q(in_ports[port_idx++], eng, const_cast<void *>(static_cast<const void *>(active_params.Q)));
-    dnnl::graph::tensor t_k(in_ports[port_idx++], eng, const_cast<void *>(static_cast<const void *>(active_params.K)));
-    dnnl::graph::tensor t_scale(in_ports[port_idx++], eng, entry->scale_usm);
-
-    dnnl::graph::tensor t_mask;
-    if (key.has_mask) {
-        t_mask = dnnl::graph::tensor(in_ports[port_idx++], eng,
-                                     const_cast<void *>(static_cast<const void *>(active_params.mask)));
-    }
-
-    // V pointer: same element layout as K
-    dnnl::graph::tensor t_v(in_ports[port_idx++], eng, const_cast<void *>(static_cast<const void *>(active_params.V)));
-
-    // Output is f32 directly into params.dst — no intermediate buffer needed.
-    dnnl::graph::tensor t_out(out_ports[0], eng, active_params.dst);
-
-    // Assemble input/output tensor lists
-    std::vector<dnnl::graph::tensor> in_tensors;
-    in_tensors.push_back(t_q);
-    in_tensors.push_back(t_k);
-    in_tensors.push_back(t_scale);
-    if (key.has_mask) {
-        in_tensors.push_back(t_mask);
-    }
-    in_tensors.push_back(t_v);
-
-    std::vector<dnnl::graph::tensor> out_tensors = { t_out };
 
     try {
         dnnl::stream dnnl_stream = ctx.stream_dnnl(stream);
@@ -1367,17 +1391,73 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
         if (ggml_sycl_kernel_profile_enabled()) {
             profile_metadata = "D=" + std::to_string(D) + ";ne01=" + std::to_string(active_params.ne01) +
                                ";ne11=" + std::to_string(active_params.ne11) + ";H_q=" + std::to_string(H_q) +
-                               ";H_kv=" + std::to_string(H_kv);
+                               ";H_kv=" + std::to_string(H_kv) + ";chunks=" + std::to_string(chunks.n_chunks);
             profile_label.metadata = profile_metadata.c_str();
         }
         profile_label.device = ctx.device;
 
-        sycl::event exec_event = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue &) {
-            return dnnl::graph::sycl_interop::execute(entry->cp, dnnl_stream, in_tensors, out_tensors, deps);
-        });
+        // Every chunk runs on this same in-order queue, so chunk c's kernels
+        // follow chunk c-1's: the last chunk's event is the terminal event for
+        // the materialized buffers, and the Graph allocator's in-order reuse
+        // argument (unified_cache::onednn_graph_scratch_free) covers the
+        // scratch each chunk hands back. Under TP the execute runs on the TP
+        // queue and the allocator's pool stays completion-gated, so
+        // consecutive chunks miss the pool and lock-step at the DIRECT cap in
+        // 200 ms polls: bounded, but slow. A throw after some chunks ran
+        // leaves dst partly written; the native kernel the caller falls back
+        // to rewrites all of it on the same queue.
+        for (int64_t c = 0; c < chunks.n_chunks; ++c) {
+            const bool            is_tail = (c == chunks.n_chunks - 1);
+            sdpa_compiled_entry & part    = is_tail ? *tail_entry : *entry;
+            const int64_t         r0      = c * chunks.rows;
 
-        release_guard.terminal      = exec_event;
-        release_guard.have_terminal = true;
+            // Row r0 of each row-indexed operand: Q and the mask by their row
+            // strides, dst by its dense H_q x D row (batch is 1 on this path).
+            const char * q_rows    = active_params.Q + r0 * (int64_t) active_params.nb01;
+            const char * mask_rows = key.has_mask ? active_params.mask + r0 * (int64_t) active_params.nb31 : nullptr;
+            float *      dst_rows  = active_params.dst + r0 * (int64_t) H_q * (int64_t) D;
+
+            // in_ports order: Q, K, scale, [mask], V
+            size_t port_idx = 0;
+
+            dnnl::graph::tensor t_q(part.in_ports[port_idx++], eng,
+                                    const_cast<void *>(static_cast<const void *>(q_rows)));
+            dnnl::graph::tensor t_k(part.in_ports[port_idx++], eng,
+                                    const_cast<void *>(static_cast<const void *>(active_params.K)));
+            dnnl::graph::tensor t_scale(part.in_ports[port_idx++], eng, part.scale_usm);
+
+            dnnl::graph::tensor t_mask;
+            if (key.has_mask) {
+                t_mask = dnnl::graph::tensor(part.in_ports[port_idx++], eng,
+                                             const_cast<void *>(static_cast<const void *>(mask_rows)));
+            }
+
+            // V pointer: same element layout as K
+            dnnl::graph::tensor t_v(part.in_ports[port_idx++], eng,
+                                    const_cast<void *>(static_cast<const void *>(active_params.V)));
+
+            // Output is f32 directly into params.dst — no intermediate buffer needed.
+            dnnl::graph::tensor t_out(part.out_ports[0], eng, dst_rows);
+
+            // Assemble input/output tensor lists
+            std::vector<dnnl::graph::tensor> in_tensors;
+            in_tensors.push_back(t_q);
+            in_tensors.push_back(t_k);
+            in_tensors.push_back(t_scale);
+            if (key.has_mask) {
+                in_tensors.push_back(t_mask);
+            }
+            in_tensors.push_back(t_v);
+
+            std::vector<dnnl::graph::tensor> out_tensors = { t_out };
+
+            sycl::event exec_event = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue &) {
+                return dnnl::graph::sycl_interop::execute(part.cp, dnnl_stream, in_tensors, out_tensors, deps);
+            });
+
+            release_guard.terminal      = exec_event;
+            release_guard.have_terminal = true;
+        }
         ggml_sycl::unified_cache_dump_counter_add(ggml_sycl::dump_counter::onednn_sdpa_executed, ctx.device);
     } catch (std::exception & e) {
         fprintf(stderr, "[SYCL] oneDNN SDPA execute failed: %s\n", e.what());

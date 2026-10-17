@@ -541,6 +541,16 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-kv-cache-tensor-name PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# oneDNN SDPA query-row chunking (llama.cpp-jwjz): one execute's Graph scratch is H_q x rows x n_kv x 6 bytes,
+# so the route splits an op's query rows to keep every execute under a budget. ggml-sycl/fattn-onednn-chunk.hpp
+# includes only standard headers, so the test needs no device. test-sycl-fattn-onednn-chunk-source (registered
+# with the other oneDNN source gates below) pins that the dispatcher uses it at half the DIRECT cap.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-fattn-onednn-chunk.cpp)
+    set_tests_properties(test-sycl-fattn-onednn-chunk PROPERTIES LABELS "sycl;onednn;hostonly")
+    target_include_directories(test-sycl-fattn-onednn-chunk PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
 # WOQ-MXFP4 capability spike: does this device's oneDNN build a matmul with
 # f16 src, f4_e2m1 weights, and e8m0 grouped-{32,1} scales directly (perf-
 # recovery epic, track C gate, llama.cpp-4m9p)? Unlike test-sycl-route-table-
@@ -2435,6 +2445,14 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert;onednn;allocator"
         TIMEOUT 120
     )
+    # llama.cpp-jwjz: the oneDNN SDPA dispatcher splits an op's query rows into executes whose Graph scratch fits
+    # half the allocator's own DIRECT cap, so no chunk takes the allocator's oversized early-out. Host-only, needs
+    # no build. Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-fattn-onednn-chunk-source
+        COMMAND ${LLAMA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fattn-onednn-chunk-source.py --self-test
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-sycl-fattn-onednn-chunk-source PROPERTIES
+        LABELS "sycl;python;source-assert;onednn;hostonly" TIMEOUT 120)
     # llama.cpp-o3a0: keeps src/llama-model.cpp's replicated oneDNN SDPA
     # head-dim eligibility rule (it cannot include the SYCL-only
     # fattn-onednn.cpp to share the real predicate) in sync with the rule it
