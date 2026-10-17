@@ -98574,6 +98574,10 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
 // queue, and the list is found only for that queue, so the queue wait already waited for every job it sleeps on.
 // The sleep sits right before each queue wait, after the trace's begin line, so wait_ms still times the whole wait
 // and a sleep that does not end still shows as a begin line with no end. Both are counted under B9.
+// A queue wait that returns ticks the [SYCL-WATCHDOG]: everything submitted before it has finished, which is the
+// progress the watchdog watches for. A prompt graph otherwise ticks only once, at its end, so a graph slower than
+// the timeout was stopped while its device kept finishing work (llama.cpp-ff00). The tick follows the wait, never
+// precedes it, so a wait that never returns still never ticks.
 static void ggml_sycl_trace_queue_wait(queue_ptr           q,
                                        const char *        reason,
                                        int                 device,
@@ -98611,6 +98615,7 @@ static void ggml_sycl_trace_queue_wait(queue_ptr           q,
         const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*q);
         q->wait();
         ggml_sycl_cpu_job_gates_clear_queue_wait(gate_sleep);
+        ggml_sycl_watchdog_heartbeat();
         return;
     }
 
@@ -98622,6 +98627,7 @@ static void ggml_sycl_trace_queue_wait(queue_ptr           q,
     q->wait();
     ggml_sycl_cpu_job_gates_clear_queue_wait(gate_sleep);
     const auto   t1      = std::chrono::high_resolution_clock::now();
+    ggml_sycl_watchdog_heartbeat();
     const double wait_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     fprintf(stderr, "[SYCL-WAIT] end reason=%s device=%d node=%d wait_ms=%.3f\n", safe_reason, device, node_idx,
             wait_ms);
