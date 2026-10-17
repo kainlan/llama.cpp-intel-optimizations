@@ -277,7 +277,7 @@ static void case_record_carries_ring_gates(sycl::queue & q) {
     const int released = g_records_released.load();
     {
         ggml_sycl::mem_handle owner = make_record_owner(256);
-        expect("an owner is made for the control record", static_cast<bool>(owner));
+        expect("an owner is made for the control record", owner.valid());
         ggml_sycl::retain_handles_until_event({ owner }, sycl::event{});
     }
     expect("with no gate outstanding the worker finishes the record",
@@ -288,7 +288,7 @@ static void case_record_carries_ring_gates(sycl::queue & q) {
     expect("the snapshot holds the ring's one gate", ggml_sycl::cpu_job_signal_gates_outstanding().size() == 1);
     {
         ggml_sycl::mem_handle owner = make_record_owner(256);
-        expect("an owner is made for the gated record", static_cast<bool>(owner));
+        expect("an owner is made for the gated record", owner.valid());
         ggml_sycl::retain_handles_until_event({ owner }, sycl::event{});
     }
     // A bound on a wait for an outcome, not an ordering: the record's event is complete.
