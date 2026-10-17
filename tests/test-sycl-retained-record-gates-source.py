@@ -20,8 +20,9 @@ sources: the host waits read the rings' gate lists, the drain worker read the pu
 THE CONTRACT.  With comments blanked:
   G1. One source, every record.  publish_handles_until_event declares its record's gates as
       `std::vector<std::shared_future<void>> gates = cpu_job_signal_gates_outstanding();`, once, at the top level of
-      its body, after the graph-lifetime return and before the store lock; it assigns or changes them nowhere else,
-      and moves them into the one record it pushes under that lock.  No other source exists: no ggml-sycl source
+      its body, after the graph-lifetime return and before the store lock, and names them once more, to move them
+      into the one record it pushes under that lock: no other use, so nothing can assign, change or move them away
+      before the push.  No other source exists: no ggml-sycl source
       names retained_handle_gate_scope or g_retained_handle_gates (comments included, since they would describe a
       source that is gone), the backend never names ws.gates, and moe_host_scatter_workspace has no gates member.
   G2. Every drained record is built there.  In mem-handle.cpp state.queue grows only by two push_back calls: the
@@ -39,6 +40,10 @@ THE CONTRACT.  With comments blanked:
       has entries, and the two constants agree (max_gates >= max_events): one gate is pushed per wrapped entry and a
       recycle clears its entries' gates, so the list's drop of its oldest gate never runs.  The refuted claim that a
       gate decides only how a host thread waits, "never whether", is gone from cpu-job-signal.hpp.
+  G6. Every ring is in the registry the snapshot reads.  cpu_job_signal_ring::create is the only place a ring is
+      constructed (one `new cpu_job_signal_ring(` in ggml-sycl, no make_shared), its one successful return comes
+      right after cpu_job_signal_registry_add(ring), and that function pushes the ring under the registry's lock. A
+      ring left out of the registry would hold gates no record takes.
 
 --self-test applies one mutant per row, requires each to fail on its own pin, and requires the unmodified tree to
 pass.
@@ -156,6 +161,10 @@ SNAP_SIG = r"std::vector<std::shared_future<void>>\s+cpu_job_signal_gates_outsta
 GATE_LIST_SIG = r"class\s+cpu_job_gate_list\s*\{"
 APPEND_SIG = r"void\s+append_outstanding\s*\(\s*std::vector<std::shared_future<void>>\s*\*\s*out\s*\)\s*const\s*\{"
 WORKSPACE_SIG = r"struct\s+moe_host_scatter_workspace\s*\{"
+CREATE_SIG = (r"static\s+std::shared_ptr<cpu_job_signal_ring>\s+create\s*\(\s*const\s+sycl::queue\s*&\s*q\s*,"
+              r"\s*const\s+char\s*\*\*\s*why\s*\)\s*\{")
+REG_ADD_SIG = (r"static\s+void\s+cpu_job_signal_registry_add\s*\(\s*const\s+std::shared_ptr<cpu_job_signal_ring>\s*&"
+               r"\s*ring\s*\)\s*\{")
 
 SNAP_STMT = "std::vector<std::shared_future<void>> gates = cpu_job_signal_gates_outstanding();"
 GRAPH_RETURN = "retain_handles_for_current_graph(std::move(handles)); return; }"
@@ -197,9 +206,9 @@ def check_publish(s: dict) -> None:
     g, r, lk = f.find(SNAP_STMT), f.find(GRAPH_RETURN), f.find(STORE_LOCK)
     if r < 0 or lk < 0 or not (r < g < lk):
         fail("G1", "the gate snapshot is not taken after the graph-lifetime return and before the store lock")
-    if len(re.findall(r"\bgates\s*=(?!=)", f)) != 1 or \
-            re.search(r"\bgates\s*(?:\.\s*(?:clear|assign|swap|resize|erase|pop_back|push_back|insert)\s*\(|\+=)", f):
-        fail("G1", "the publication's gates are assigned or changed after the snapshot")
+    if len(re.findall(r"\bgates\b", strip_strings(body))) != 2:
+        fail("G1", "the publication names its gates other than in the snapshot's declaration and the record's push, so "
+                   "they can be assigned, changed or moved away before the push")
     if f.count(PUSH_PREFIX) != 1 or f.find(PUSH_PREFIX) < lk:
         fail("G1", "the record pushed under the store lock does not carry the snapshot's gates")
 
@@ -288,6 +297,29 @@ def check_complete(s: dict) -> None:
         fail("G5", "cpu-job-signal.hpp still says a gate decides only how a host thread waits, never whether")
 
 
+def check_registered(s: dict) -> None:
+    cc = blank_comments(s["cache_cpp"])
+    body, _ = body_of(cc, CREATE_SIG, "G6")
+    f = flat(body).strip()
+    if not f.endswith("cpu_job_signal_registry_add(ring); return ring;") or f.count("return ring;") != 1:
+        fail("G6", "cpu_job_signal_ring::create can return a ring it did not add to the registry")
+    sites = []
+    named = [(p.name, s[k]) for k, p in (("backend", BACKEND), ("mem_cpp", MEM_CPP), ("mem_hpp", MEM_HPP),
+                                         ("signal_hpp", SIGNAL_HPP), ("cache_cpp", CACHE_CPP))]
+    for name, text in sorted(list(s["others"].items()) + named):
+        code = strip_strings(blank_comments(text))
+        sites += [name] * len(re.findall(r"\bnew\s+cpu_job_signal_ring\s*\(", code))
+        if re.search(r"\b(?:make_shared|make_unique|allocate_shared)\s*<\s*cpu_job_signal_ring\s*>", code):
+            fail("G6", f"{name} makes a ring outside cpu_job_signal_ring::create")
+    if sites != ["unified-cache.cpp"] or not re.search(r"\bnew\s+cpu_job_signal_ring\s*\(", body):
+        fail("G6", f"a ring is constructed outside cpu_job_signal_ring::create ({sites})")
+    ab, _ = body_of(cc, REG_ADD_SIG, "G6")
+    af = flat(ab)
+    lk, push = af.find("std::lock_guard<std::timed_mutex> lock(r.mutex);"), af.find("r.rings.push_back(ring);")
+    if lk < 0 or push < lk:
+        fail("G6", "cpu_job_signal_registry_add does not push the ring under the registry's lock")
+
+
 def read_sources(root: Path) -> dict:
     s = {}
     for key, path in (("backend", BACKEND), ("mem_cpp", MEM_CPP), ("mem_hpp", MEM_HPP), ("signal_hpp", SIGNAL_HPP),
@@ -310,6 +342,7 @@ def check(s: dict) -> None:
     check_snapshot(s)
     check_append(s)
     check_complete(s)
+    check_registered(s)
 
 
 def self_test(s: dict) -> int:
@@ -336,6 +369,21 @@ def self_test(s: dict) -> int:
         ("G1", "backend", "the flush's workspace keeps gates again",
          sub(r"(std::vector<sycl::event>\s+joins;  // each slot's CPU job join \(llama\.cpp-z4kd\))",
              r"\1\n    std::vector<std::shared_future<void>>   gates;")),
+        ("G1", "mem_cpp", "the record ships an emptied vector",
+         sub(r"(\n(\s*)std::vector<std::shared_future<void>> gates = cpu_job_signal_gates_outstanding\(\);)",
+             r"\1\n\2auto stolen = std::move(gates);")),
+        ("G6", "cache_cpp", "a ring is made but not registered",
+         sub(r"\n\s*cpu_job_signal_registry_add\(ring\);\n(\s*return ring;)", r"\n\1")),
+        ("G6", "cache_cpp", "the registry does not keep the ring",
+         sub(r"\n\s*r\.rings\.push_back\(ring\);\n", "\n")),
+        ("G6", "signal_hpp", "a header makes a ring",
+         sub(r"(\nstd::vector<std::shared_future<void>> cpu_job_signal_gates_outstanding\(\);)",
+             r"\1\ninline std::shared_ptr<cpu_job_signal_ring> cpu_job_signal_ring_make_unregistered() "
+             r"{ return std::make_shared<cpu_job_signal_ring>(); }")),
+        ("G6", "cache_cpp", "a ring is constructed outside create",
+         sub(r"(\n(\s*)auto\s+r\s+= cpu_job_signal_ring::create\(q, &why\);)",
+             r"\n\2(void) std::shared_ptr<cpu_job_signal_ring>(new cpu_job_signal_ring(q.get_context(), nullptr, "
+             r"cpu_job_signal_l0_get()));\1")),
         ("G2", "mem_cpp", "a record is queued outside the publication",
          sub(r"(\nvoid retain_handles_until_event\(std::vector<mem_handle> handles, sycl::event event\) \{\n)",
              r"\1    if (handles.empty()) {\n        auto & state = *g_retained_handles_state;\n"
