@@ -51,6 +51,10 @@ CAP_FROM_SNAPSHOT = (
     "onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire))"
 )
 CAP_MEMBER_CALL = "const size_t cap = onednn_graph_scratch_direct_cap();"
+# Any read of the snapshot through the cap formula, whatever its memory order, counted with ALL whitespace removed:
+# squash() keeps the space a line-wrapped call leaves after "(", so a count of squashed text misses the same
+# expression re-inlined on one line and the one-member check fails open.
+CAP_SNAPSHOT_READ = "onednn_graph_scratch_direct_cap_bytes(onednn_graph_scratch_direct_cap_plan_snapshot_bytes_"
 
 
 def strip_comments(source):
@@ -60,6 +64,10 @@ def strip_comments(source):
 
 def squash(source):
     return " ".join(source.split())
+
+
+def despace(source):
+    return "".join(source.split())
 
 
 def function_body(source, signature):
@@ -95,7 +103,6 @@ def check(srcs):
     malloc_cb = squash(function_body(
         cache_code, "void * onednn_graph_sycl_malloc(size_t size, size_t alignment, const void * dev, const void * ctx)"))
     headroom = squash(function_body(cache_code, "bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked("))
-    cache_squashed = squash(cache_code)
 
     results = {}
     results["the per-execute budget is half the allocator's DIRECT cap"] = (
@@ -133,8 +140,8 @@ def check(srcs):
         and "->onednn_graph_scratch_direct_cap()" in accessor
         and "get_existing_unified_cache_for_device(device_id)" in malloc_cb)
     results["the cache computes the cap in one member, and the allocator's headroom wait calls it"] = (
-        CAP_FROM_SNAPSHOT in member
-        and cache_squashed.count(CAP_FROM_SNAPSHOT) == 1
+        despace(CAP_FROM_SNAPSHOT) in despace(member)
+        and despace(cache_code).count(CAP_SNAPSHOT_READ) == 1
         and CAP_MEMBER_CALL in headroom)
     return results
 
@@ -206,6 +213,17 @@ if args.self_test:
          "const size_t cap = onednn_graph_scratch_direct_cap();",
          "const size_t cap = onednn_graph_scratch_direct_cap_bytes("
          " onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire));"),
+        # The overflow WARN re-inlining the expression on one line: no space after "(", so only a whitespace-free
+        # count sees it.
+        ("the cache computes the cap in one member, and the allocator's headroom wait calls it", "cache",
+         "onednn_graph_scratch_direct_cap() / (1024.0 * 1024.0), onednn_graph_scratch_direct_wait_count_);",
+         "onednn_graph_scratch_direct_cap_bytes(onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load("
+         "std::memory_order_acquire)) / (1024.0 * 1024.0), onednn_graph_scratch_direct_wait_count_);"),
+        # The abort log re-inlining it with another memory order: the count keys on the snapshot read, not the order.
+        ("the cache computes the cap in one member, and the allocator's headroom wait calls it", "cache",
+         "onednn_graph_scratch_direct_cap() / (1024.0 * 1024.0), onednn_graph_scratch_direct_wait_count_,",
+         "onednn_graph_scratch_direct_cap_bytes(onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load("
+         "std::memory_order_relaxed)) / (1024.0 * 1024.0), onednn_graph_scratch_direct_wait_count_,"),
     ]
     covered = {name for name, *_ in mutants}
     dead = [name for name in results if name not in covered]

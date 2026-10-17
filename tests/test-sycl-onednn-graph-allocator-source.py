@@ -549,8 +549,11 @@ CONSUMERS_IN_ORDER_GUARD = "if (!queue_.has_property<sycl::property::queue::in_o
 CONSUMERS_TP_RETURN = "return ggml_sycl_get_tp_queue(ggml_sycl_get_device_id_from_queue(queue_)) == nullptr;"
 # free()'s marker chain: each marker depends on the slot's previous one, and
 # the slot then records this marker as its last. Without the update the
-# dependency never names anything and the chain is inert.
-LAST_MARKER_DEPENDS = "depends_on(*last_marker)"
+# dependency never names anything and the chain is inert. The edge is pinned
+# with its guard: a bare depends_on(*last_marker) also matches the inverted
+# guard, which dereferences an empty optional on a slot's first park and
+# never chains afterwards.
+LAST_MARKER_GUARDED_EDGE = "if (last_marker) { h.depends_on(*last_marker); }"
 LAST_MARKER_UPDATE = "last_marker = std::move(marker);"
 # try_reuse_pool_locked()'s RESOLVE_FAILED release: the leaving owner waits
 # on that entry's own release event, not on any event.
@@ -569,10 +572,10 @@ def _consumers_in_order_predicate_ok(body: str) -> bool:
 
 def _marker_chain_is_live(body: str) -> bool:
     """llama.cpp-jwjz: true iff free() makes each marker depend on the slot's
-    previous marker AND then records the new marker as the slot's last, in
-    that order."""
+    previous marker when there is one, AND then records the new marker as the
+    slot's last, in that order."""
     code = normalize_ws(strip_literals(body))
-    depends = code.find(LAST_MARKER_DEPENDS)
+    depends = code.find(LAST_MARKER_GUARDED_EDGE)
     update = code.find(LAST_MARKER_UPDATE)
     return "onednn_graph_scratch_flag_slot_last_marker_" in code and 0 <= depends < update
 
@@ -1204,16 +1207,23 @@ def test_consumers_in_order_predicate_check_has_a_mutation_witness() -> None:
 
 def test_marker_chain_and_resolve_failed_release_checks_have_mutation_witnesses() -> None:
     """Mutation witness for llama.cpp-jwjz: deleting the slot's last-marker
-    update leaves the chain inert, and a RESOLVE_FAILED release that waits on
-    some other event could free a buffer still in use. Both passed the
-    earlier name-only checks."""
+    update leaves the chain inert, inverting its guard dereferences an empty
+    optional on a slot's first park and never chains afterwards, and a
+    RESOLVE_FAILED release that waits on some other event could free a buffer
+    still in use. Each passed a check that pinned names or the bare edge."""
     free_code = normalize_ws(strip_literals(FREE_BODY_CODE))
     assert _marker_chain_is_live(free_code), "the real free() should keep the chain live"
     dropped_update = free_code.replace(LAST_MARKER_UPDATE, "", 1)
     assert dropped_update != free_code, "mutation target not found -- update this witness"
     assert not _marker_chain_is_live(dropped_update), "mutation witness is broken: the dropped update was not detected"
-    dropped_edge = free_code.replace(LAST_MARKER_DEPENDS, "depends_on(*event)", 1)
+    dropped_edge = free_code.replace(LAST_MARKER_GUARDED_EDGE, "", 1)
+    assert dropped_edge != free_code, "mutation target not found -- update this witness"
     assert not _marker_chain_is_live(dropped_edge), "mutation witness is broken: the dropped edge was not detected"
+    inverted_guard = free_code.replace("if (last_marker) {", "if (!last_marker) {", 1)
+    assert inverted_guard != free_code, "mutation target not found -- update this witness"
+    assert not _marker_chain_is_live(inverted_guard), (
+        "mutation witness is broken: the inverted last-marker guard was not detected"
+    )
 
     reuse_code = normalize_ws(strip_literals(TRY_REUSE_POOL_BODY_CODE))
     assert RESOLVE_FAILED_RELEASE in reuse_code, "mutation target not found -- update this witness"
