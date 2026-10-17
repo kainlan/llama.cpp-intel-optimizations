@@ -466,7 +466,7 @@ static int run_descriptor_tests(bool chunked) {
         ggml_backend_sycl_context & ctx = owner.context();
         // llama.cpp-kx2a: the DIRECT cases draw their Graph scratch from this device's unified cache, which only
         // the materialize cases below would create, and later; without it the dispatcher declines them.
-        if (ggml_sycl::get_unified_cache(*ctx.stream()) == nullptr) {
+        if (ggml_sycl::get_unified_cache_for_device(ctx.device) == nullptr) {
             std::fprintf(stderr, "FAIL: no unified cache for the test device\n");
             return 1;
         }

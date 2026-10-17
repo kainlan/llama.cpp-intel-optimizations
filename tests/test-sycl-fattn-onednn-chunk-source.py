@@ -21,7 +21,9 @@ The fix this gate pins:
   runs the tail partition, both partitions are acquired before the loop, and the terminal event is the last chunk's.
 - llama.cpp-kx2a: before any partition is compiled or executed, the dispatcher declines ("no_unified_cache") when the
   Graph allocator is on and the device has no unified cache. The allocator refuses there and returns nullptr, and
-  oneDNN does not check the return: it launched with a null scratch and faulted the B50.
+  oneDNN does not check the return: it launched with a null scratch and faulted the B50. The decline keeps the op
+  away from the allocator, whose own once-only warning then never fires, so the guard warns once itself, at WARN
+  because a default-verbosity run drops INFO, and on every decline under GGML_SYCL_FA_DISPATCH_DEBUG.
 
 This gate is about the dispatcher's wiring only. The planner's arithmetic is proved behaviourally by
 test-sycl-fattn-onednn-chunk (host C++), and the chunked execute's numerics and its scratch bound by
@@ -55,14 +57,24 @@ CAP_FROM_SNAPSHOT = (
 )
 CAP_MEMBER_CALL = "const size_t cap = onednn_graph_scratch_direct_cap();"
 # llama.cpp-kx2a: without a unified cache the Graph allocator returns nullptr and oneDNN launches with that null
-# scratch, so the dispatcher must decline first. The whole guard block, as squash() spells it.
-NO_CACHE_GUARD = (
+# scratch, so the dispatcher must decline first. The guard's parts, as squash() spells them.
+NO_CACHE_TEST = (
     "if (ggml_sycl::onednn_graph_allocator_enabled() && "
-    "ggml_sycl::get_existing_unified_cache_for_device(ctx.device) == nullptr) { "
-    "if (std::getenv(\"GGML_SYCL_FA_DISPATCH_DEBUG\")) { "
-    "fprintf(stderr, \"[SYCL] fattn: oneDNN declined: no_unified_cache device=%d\\n\", ctx.device); } "
-    "return decline(\"no_unified_cache\"); }"
+    "ggml_sycl::get_existing_unified_cache_for_device(ctx.device) == nullptr) {"
 )
+NO_CACHE_WARN = (
+    "static std::atomic<bool> warned{ false }; "
+    "if (!warned.exchange(true, std::memory_order_relaxed)) { GGML_LOG_WARN( "
+    "\"[SYCL] fattn: oneDNN SDPA declined on device %d: the device has no unified_cache to serve \" "
+    "\"the Graph allocator's scratch, so the op falls back (only logged once)\\n\", ctx.device); }"
+)
+NO_CACHE_DEBUG = (
+    "if (std::getenv(\"GGML_SYCL_FA_DISPATCH_DEBUG\")) { "
+    "fprintf(stderr, \"[SYCL] fattn: oneDNN declined: no_unified_cache device=%d\\n\", ctx.device); }"
+)
+NO_CACHE_DECLINE = "return decline(\"no_unified_cache\"); }"
+# The whole guard block, which the self-test's drop and move mutants cut out.
+NO_CACHE_GUARD = " ".join((NO_CACHE_TEST, NO_CACHE_WARN, NO_CACHE_DEBUG, NO_CACHE_DECLINE))
 PARTITION_CACHE_ACQUIRE = "sdpa_partition_cache * cache = get_or_create_cache(ctx);"
 # Any read of the snapshot through the cap formula, whatever its memory order, counted with ALL whitespace removed:
 # squash() keeps the space a line-wrapped call leaves after "(", so a count of squashed text misses the same
@@ -118,9 +130,13 @@ def check(srcs):
     headroom = squash(function_body(cache_code, "bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked("))
 
     results = {}
-    guard_pos = dispatch.find(NO_CACHE_GUARD)
+    guard_pos = dispatch.find(NO_CACHE_TEST)
+    guard = function_body(dispatch[guard_pos:], NO_CACHE_TEST) if guard_pos >= 0 else ""
     results["the dispatcher declines before any compile or execute when the device has no unified cache"] = (
-        0 <= guard_pos < dispatch.find(PARTITION_CACHE_ACQUIRE) and guard_pos < loop_pos)
+        0 <= guard_pos < dispatch.find(PARTITION_CACHE_ACQUIRE) and guard_pos < loop_pos
+        and guard.endswith(NO_CACHE_DECLINE))
+    results["the no-cache decline warns once at WARN, and on every decline under GGML_SYCL_FA_DISPATCH_DEBUG"] = (
+        NO_CACHE_WARN in guard and NO_CACHE_DEBUG in guard)
     results["the per-execute budget is half the allocator's DIRECT cap"] = (
         "const size_t chunk_budget = ggml_sycl::unified_cache_onednn_graph_scratch_direct_cap_bytes(ctx.device) / 2;"
         in dispatch)
@@ -254,6 +270,16 @@ if args.self_test:
          "ggml_sycl::unified_cache_dump_counter_add(ggml_sycl::dump_counter::onednn_sdpa_executed, ctx.device);",
          NO_CACHE_GUARD
          + " ggml_sycl::unified_cache_dump_counter_add(ggml_sycl::dump_counter::onednn_sdpa_executed, ctx.device);"),
+        # The no-cache WARN dropped, demoted to INFO (which a default-verbosity run drops), its latch made
+        # per-call so it warns on every decline, and the debug line dropped.
+        ("the no-cache decline warns once at WARN, and on every decline under GGML_SYCL_FA_DISPATCH_DEBUG", "onednn",
+         NO_CACHE_WARN, ""),
+        ("the no-cache decline warns once at WARN, and on every decline under GGML_SYCL_FA_DISPATCH_DEBUG", "onednn",
+         "GGML_LOG_WARN( \"[SYCL] fattn: oneDNN SDPA declined", "GGML_LOG_INFO( \"[SYCL] fattn: oneDNN SDPA declined"),
+        ("the no-cache decline warns once at WARN, and on every decline under GGML_SYCL_FA_DISPATCH_DEBUG", "onednn",
+         "static std::atomic<bool> warned{ false };", "std::atomic<bool> warned{ false };"),
+        ("the no-cache decline warns once at WARN, and on every decline under GGML_SYCL_FA_DISPATCH_DEBUG", "onednn",
+         NO_CACHE_DEBUG, ""),
     ]
     covered = {name for name, *_ in mutants}
     dead = [name for name in results if name not in covered]
