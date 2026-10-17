@@ -28,6 +28,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
@@ -74,10 +75,7 @@ inline onednn_fa_row_chunks onednn_fa_plan_row_chunks(int64_t ncols,
         return plan;
     }
 
-    int64_t rows_max = static_cast<int64_t>(budget_bytes / per_row);
-    if (rows_max < 1) {
-        rows_max = 1;
-    }
+    const int64_t rows_max = std::max<int64_t>(1, static_cast<int64_t>(budget_bytes / per_row));
     // The fewest chunks that fit, then the most even row count for that many chunks. Recounting the
     // chunks from the evened rows keeps the last chunk in (0, rows].
     int64_t       n_chunks = (ncols + rows_max - 1) / rows_max;
