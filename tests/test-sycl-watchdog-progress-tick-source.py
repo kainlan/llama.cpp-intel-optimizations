@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The [SYCL-WATCHDOG] ticks where work completes inside a graph (llama.cpp-ff00).
 
-THE DEFECT.  The watchdog (common.cpp) judges one host timestamp, and only while a graph
-or a load-time event wait is in flight.  A prompt graph ticked it once, at
+THE DEFECT.  The watchdog (common.cpp) judges one host timestamp, and only while a graph,
+an S1 preload event wait or a retained-handle reaper wait is in flight.  A prompt graph ticked it once, at
 record_completion, and its exit is a whole-queue wait.  So a prompt graph whose wall
 exceeded GGML_SYCL_OP_TIMEOUT_MS (default 30 s) was stopped with _Exit(1) while its device
 kept finishing work: Qwen3.5-9B at -d 32768 on both cards (2048- and 1024-token graphs at
@@ -16,18 +16,22 @@ THE CONTRACT.  With comments blanked:
       wait, tick, wait, tick.  The untraced branch ticks after its gate clear and before
       its return.  A wait that never returns therefore never ticks, which is the hang the
       watchdog exists for.
-  W2. (cpu-dispatch.cpp cpu_expert_mul_mat_batched_run, which every CPU expert producer
-      runs: the pool, std::async, inline) the last statement is the tick, after both row
-      executors, and it is the function's only tick.  So it ticks once per batch, never
-      inside rows_body, the hot loop.
+  W2. (cpu-dispatch.cpp cpu_expert_mul_mat_batched_run, the batched executor, which the
+      pool, the plain std::async producer and the inline sites run) the last statement is
+      the tick, and it is the function's only tick.  So it ticks once per batch, after both
+      row executors, never inside rows_body, the hot loop.
   W3. (ggml_sycl_cpu_expert_mul_mat_adaptive) the reduced-precision loop, which does not
       go through W2's function, ticks after it when it ran.
+  W6. (ggml_sycl_cpu_moe_host_aos_execute, the Q1_0/NVFP4 host-recipe executor, which the
+      batched executor refuses and a std::async producer loops once per task) the success
+      path ticks once, after the output copy and before `return true`, never inside the
+      row loop.  It is the single-threaded CPU expert producer, so the slowest one.
   W4. No polling and no knob.  watchdog_thread_fn waits on nothing and queries no event,
       the heartbeat stays one relaxed store, and neither W1's nor W2's function gains a
       getenv.
-  W5. The catalog row of GGML_SYCL_OP_TIMEOUT_MS names the tick points and the residual
-      limit.  The banner keeps its first line, which scripts count, and no longer claims
-      a hung submit is the likely cause.
+  W5. The catalog row of GGML_SYCL_OP_TIMEOUT_MS names the tick points, the drain interval's
+      knob, the reaper window and the residual limit.  The banner keeps its first line,
+      which scripts count, and no longer claims a hung submit is the likely cause.
 
 NOT VACUOUS.  --self-test runs the gate on in-memory mutants of the real sources; each must
 fail on its own pin.  On the unmodified base the gate fails W1.
@@ -48,6 +52,7 @@ DOC = "docs/backend/sycl-env-vars.md"
 TICK = "ggml_sycl_watchdog_heartbeat();"
 QUEUE_WAIT_SIG = r"static\s+void\s+ggml_sycl_trace_queue_wait\s*\(\s*queue_ptr\s+q\s*,[^)]*\)\s*\{"
 RUN_SIG = r"static\s+void\s+cpu_expert_mul_mat_batched_run\s*\([^)]*\)\s*\{"
+RECIPE_SIG = r"bool\s+ggml_sycl_cpu_moe_host_aos_execute\s*\([^)]*\)\s*\{"
 ADAPTIVE_SIG = r"void\s+ggml_sycl_cpu_expert_mul_mat_adaptive\s*\([^)]*\)\s*\{"
 THREAD_SIG = r"static\s+void\s+watchdog_thread_fn\s*\([^)]*\)\s*\{"
 HEARTBEAT_SIG = r"void\s+ggml_sycl_watchdog_heartbeat\s*\(\s*\)\s*\{"
@@ -119,9 +124,11 @@ def check_batched(dispatch: str) -> None:
     run = flat(body_of(code, RUN_SIG, "W2"))
     if run.count(TICK) != 1 or not run.endswith(TICK):
         fail("W2", "the batched row loop does not end with its one watchdog tick (once per batch, not per row)")
-    last_executor = max(run.rfind("row_workers->run("), run.rfind("parallel_for("))
-    if last_executor < 0 or run.rfind(TICK) < last_executor:
-        fail("W2", "the batched row loop ticks before its row executors ran")
+    recipe = flat(body_of(code, RECIPE_SIG, "W6"))
+    tail = (r"std::memcpy\(task\.output, output, rows \* static_cast<size_t>\(N\) \* sizeof\(float\)\); "
+            + re.escape(TICK) + r" if \(reject\) \*reject = moe_batch_reject_reason::NONE; return true;$")
+    if recipe.count(TICK) != 1 or not re.search(tail, recipe):
+        fail("W6", "the host-recipe expert executor does not tick once after its output copy and before it returns")
     adaptive = flat(body_of(code, ADAPTIVE_SIG, "W3"))
     want = ("for (int i = 0; i < n_reduced; i++) { cpu_expert_mul_mat_int4(tasks[n_full + i]); } "
             "if (n_reduced > 0) { " + TICK + " }")
@@ -144,7 +151,8 @@ def check_no_polling(backend: str, dispatch: str, common: str) -> None:
 
 def check_doc_and_banner(doc: str, common: str) -> None:
     rows = [ln for ln in doc.splitlines() if ln.startswith("| `GGML_SYCL_OP_TIMEOUT_MS=<N>`")]
-    need = ("`ggml_sycl_trace_queue_wait`", "CPU expert batch", "llama.cpp-ff00", "command graph", "llama.cpp-4lnb")
+    need = ("`ggml_sycl_trace_queue_wait`", "CPU expert batch", "host-recipe", "`GGML_SYCL_DRAIN_INTERVAL`",
+            "reaper", "llama.cpp-ff00", "command graph", "llama.cpp-4lnb")
     if len(rows) != 1 or not all(n in rows[0] for n in need):
         fail("W5", "the catalog row of GGML_SYCL_OP_TIMEOUT_MS does not name the tick points and the residual limit")
     if BANNER_FIRST not in common:
@@ -160,7 +168,7 @@ def read_sources(root: Path) -> dict:
 
 def check(s: dict) -> None:
     check_queue_wait(s["backend"])
-    check_batched(s["dispatch"])
+    check_batched(s["dispatch"])  # W2, W6, W3
     check_no_polling(s["backend"], s["dispatch"], s["common"])
     check_doc_and_banner(s["doc"], s["common"])
 
@@ -195,6 +203,15 @@ def self_test(s: dict) -> int:
          lambda t: re.sub(r"(\n\s*if \(row_workers\) \{)", "\n    ggml_sycl_watchdog_heartbeat();\\1",
                           re.sub(r"\n\s*ggml_sycl_watchdog_heartbeat\(\);\n\}\n(\s*void ggml_sycl_cpu_expert_mul_mat_batched\()",
                                  r"\n}\n\1", t, count=1), count=1), "W2"),
+        ("recipe executor no tick", "dispatch",
+         sub(r"(std::memcpy\(task\.output, output, [^\n]*\n(?:\s*//[^\n]*\n)*)\s*ggml_sycl_watchdog_heartbeat\(\);\n", r"\1"), "W6"),
+        ("recipe executor ticks per row", "dispatch",
+         sub(r"(\n(\s*)output\[m \* N \+ n\] = dot;\n)", r"\1\2ggml_sycl_watchdog_heartbeat();\n"), "W6"),
+        ("recipe executor ticks before its rows", "dispatch",
+         lambda t: re.sub(r"(\n(\s*)const size_t qrow = ggml_row_size\(traits->vec_dot_type, K\);\n)",
+                          r"\n\2ggml_sycl_watchdog_heartbeat();\1",
+                          re.sub(r"(std::memcpy\(task\.output, output, [^\n]*\n(?:\s*//[^\n]*\n)*)\s*ggml_sycl_watchdog_heartbeat\(\);\n",
+                                 r"\1", t, count=1), count=1), "W6"),
         ("reduced loop no tick", "dispatch",
          sub(r"\n\s*if \(n_reduced > 0\) \{\n\s*ggml_sycl_watchdog_heartbeat\(\);[^\n]*\n\s*\}", ""), "W3"),
         ("watchdog thread polls an event", "common",
@@ -205,9 +222,10 @@ def self_test(s: dict) -> int:
          sub(QW_UNTRACED_HEAD, r"\1        static const bool tick = std::getenv(\"GGML_SYCL_X\") != nullptr;\n\2"),
          "W4"),
         ("catalog row not updated", "doc", sub(r" Progress is a host tick, judged only[^|]*\(llama\.cpp-4lnb\)\.", ""), "W5"),
+        ("catalog row loses the drain knob", "doc", sub(r"`GGML_SYCL_DRAIN_INTERVAL`", "the drain interval"), "W5"),
         ("banner first line changed", "common", sub(r"No GPU progress for %lld ms", "No progress for %lld ms"), "W5"),
         ("banner still blames a hung submit", "common",
-         sub(r"No queue wait of the graph code returned and no CPU expert batch finished", BANNER_OLD), "W5"),
+         sub(r"No queue wait of the graph code returned and no CPU expert matmul finished", BANNER_OLD), "W5"),
     ]
     bad = 0
     for name, key, mutate, pin in mutants:
@@ -247,7 +265,7 @@ def main() -> int:
         if bad:
             print(f"FAIL: {bad} self-test mutant(s) not caught on their own pin {TAG}")
             return 1
-    print(f"PASS: the watchdog ticks after each returning queue wait and each CPU expert batch {TAG}")
+    print(f"PASS: the watchdog ticks after each returning queue wait and each CPU expert batch or recipe task {TAG}")
     return 0
 
 

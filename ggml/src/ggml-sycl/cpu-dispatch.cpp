@@ -920,6 +920,10 @@ bool ggml_sycl_cpu_moe_host_aos_execute(const cpu_moe_host_aos_task & task,
         }
     }
     std::memcpy(task.output, output, rows * static_cast<size_t>(N) * sizeof(float));
+    // The task's rows are written: host progress for the [SYCL-WATCHDOG] (llama.cpp-ff00). Q1_0/NVFP4 experts never
+    // reach cpu_expert_mul_mat_batched_run, and their producer runs this one task at a time on one thread, so it is
+    // the slowest CPU expert producer. Once per task, never per row.
+    ggml_sycl_watchdog_heartbeat();
     if (reject) *reject = moe_batch_reject_reason::NONE;
     return true;
 }
@@ -1558,9 +1562,10 @@ static void cpu_expert_mul_mat_batched_run(const cpu_expert_task *    tasks,
     GGML_SYCL_DEBUG("[EXPERT-CPU] Batched expert mul_mat: %d tasks, %d total_rows, %d unique activations\n", n_tasks,
                     total_rows, (int) act_q_map.size());
     // The rows are written: host progress for the [SYCL-WATCHDOG], which a prompt graph's host-tiered experts
-    // otherwise show only when the graph ends (llama.cpp-ff00). Every producer (the pool, std::async, inline) runs
-    // this function. It ticks once per batch, never per row: rows_body is the hot loop. A batch runs only on inputs
-    // the device already produced, so a stalled device stops these ticks within one batch.
+    // otherwise show only when the graph ends (llama.cpp-ff00). The pool, the plain std::async producer and the inline
+    // sites run this function; Q1_0/NVFP4 experts run ggml_sycl_cpu_moe_host_aos_execute instead, which ticks per
+    // task. It ticks once per batch, never per row: rows_body is the hot loop. A batch runs only on inputs the device
+    // already produced, so a stalled device stops these ticks within one batch.
     ggml_sycl_watchdog_heartbeat();
 }
 
