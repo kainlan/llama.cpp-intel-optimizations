@@ -24551,7 +24551,7 @@ struct cpu_dispatch_result {
 //    events after its last write, and its scatter H2D copies depend on a fresh
 //    wrapper of that event, which the device waits itself (llama.cpp-qwn5);
 //  - a job the device may not wait (a graph records, the knob
-//    GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL=0, no entry) is joined by a host_task
+//    GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL unset or 0, no entry) is joined by a host_task
 //    on the op's in-order queue, and its scatter H2D copies depend on that
 //    host_task's event.
 // No cycle: a prologue waits only for queue work submitted before its job, a
@@ -24686,13 +24686,14 @@ static sycl::event moe_cpu_job_join_on_queue(sycl::queue &                      
     return join;
 }
 
-// GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL, read once (llama.cpp-qwn5): unset or non-zero lets a CPU expert pool job's
-// scatter wait on a host-signalled Level Zero event the job signals after its last write; 0 joins every job with a
-// host task as before.
+// GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL, read once (llama.cpp-qwn5): unset or 0 joins every CPU expert pool job with a
+// host task; non-zero lets the job's scatter wait on a host-signalled Level Zero event the job signals after its last
+// write. Default off (llama.cpp-m5v8) because the device wait hangs the Qwen3.8-Flash-Next first prompt graph: the
+// pool worker's input wait blocks on a Level Zero mutex the retained-handle drain worker holds (llama.cpp-42zj).
 static bool moe_cpu_job_device_signal_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL");
-        return env == nullptr || std::atoi(env) != 0;
+        return env != nullptr && std::atoi(env) != 0;
     }();
     return enabled;
 }
