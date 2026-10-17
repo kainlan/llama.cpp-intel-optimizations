@@ -108,20 +108,26 @@
 //       llama.cpp-pqgl's review, not part of the original 0oxf RED-FIRST
 //       set below.
 //
-//   (f) IN-FLIGHT ENTRIES ARE SKIPPED, NOT WAITED ON: the reuse pool's
-//       completion checks must not BLOCK a calling thread on a pooled
-//       entry's release_event -- event_complete()'s bare
-//       command_execution_status query does exactly that on any
-//       profiling-enabled queue, which every backend stream is. Parking an
-//       entry with a slow, unwaited release event and immediately
-//       re-requesting the identical size must return a fresh allocation
-//       (miss, not hit) in well under the release delay, leaving the
-//       in-flight entry pooled and un-evicted; the same must hold for the
-//       cap-eviction sweep when a DIFFERENT, already-complete entry alone
-//       supplies the needed headroom. A test-only hook forces the pre-fix
-//       blocking query as a positive control within this same (fixed)
-//       binary. Added by llama.cpp-c6ah, not part of the original 0oxf
-//       RED-FIRST set below.
+//   (f) IN-FLIGHT ENTRIES ARE SKIPPED, NOT WAITED ON, under the
+//       completion-gated policy (see POLICY below; forced here, applied by
+//       the cache under TP). The reuse pool's completion checks must not
+//       BLOCK a calling thread on a pooled entry's release_event --
+//       event_complete()'s bare command_execution_status query does exactly
+//       that on any profiling-enabled queue, which every backend stream is.
+//       Parking an entry with a slow, unwaited release event and
+//       immediately re-requesting the identical size must return a fresh
+//       allocation (miss, not hit) in well under the release delay, leaving
+//       the in-flight entry pooled and un-evicted; the same must hold for
+//       the cap-eviction sweep when a DIFFERENT, already-complete entry
+//       alone supplies the needed headroom. A test-only hook forces the
+//       pre-fix blocking query as a positive control within this same
+//       (fixed) binary. Added by llama.cpp-c6ah, not part of the original
+//       0oxf RED-FIRST set below. Under the in-order default (no TP) the
+//       same request gets the in-flight entry back instead:
+//       test_in_flight_entry_is_skipped_not_waited's "fresh miss" reverses
+//       to test_in_flight_entry_is_reused_in_order's "hit" (h), and that is
+//       correct only because both consumers share the cache's in-order
+//       queue (llama.cpp-jwjz).
 //
 //   (g) IN-FLIGHT RECLAIM RETIRES THE SLOT, NOT THE ENTRY: reclaiming the
 //       pool while a pooled entry's completion marker is still in flight
@@ -142,7 +148,10 @@
 //   onednn_graph_scratch_force_completion_gated_reuse_for_test(). Without
 //   TP the pool hands an in-flight entry straight back instead, which (h)
 //   pins (llama.cpp-jwjz). Eviction and the pool clear wait for completion
-//   under both policies.
+//   under both policies. This process has no TP, so the TP negative runs
+//   only through that force hook. The predicate's own TP and in_order
+//   branches (onednn_graph_scratch_consumers_in_order()) are pinned
+//   statically by tests/test-sycl-onednn-graph-allocator-source.py.
 //
 //   (h) IN-ORDER REUSE OF AN IN-FLIGHT ENTRY: with every consumer on the
 //       cache's in-order queue (TP inactive), a same-size request must get
@@ -1321,8 +1330,9 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
 
     check(ptr2 != nullptr, "the immediate same-size re-request succeeds");
     check(ptr2 != ptr1,
-          "...as a genuinely FRESH allocation, not the still in-flight entry handed back (that would be a "
-          "USE-AFTER-FREE-shaped bug: ptr1's SDPA kernel may still be running)");
+          "...as a genuinely FRESH allocation, not the still in-flight entry handed back: under the forced "
+          "completion-gated (TP) policy that would race ptr1's still-running kernel; the in-order default's "
+          "reuse of it is test_in_flight_entry_is_reused_in_order");
     check(cache->onednn_graph_scratch_pool_miss_count() == misses_before + 1,
           "onednn_graph_scratch_pool_miss_count() increased -- served by a fresh allocation, not the pool");
     check(cache->onednn_graph_scratch_pool_hit_count() == hits_before,
@@ -2221,7 +2231,9 @@ int main(int, char ** argv) {
 
     // llama.cpp-jwjz: (a)-(g) pin the completion-gated pool, the policy the
     // cache applies under TP. This process has no TP, so force that policy
-    // for them, then restore the default in-order policy for (h).
+    // for them, then restore the default in-order policy for (h) and (i).
+    // The force hook is the only way this binary reaches the TP policy; the
+    // predicate's TP branch is pinned by the allocator source gate.
     cache->onednn_graph_scratch_force_completion_gated_reuse_for_test(true);
     test_pool_reuse(cache);
     test_bounded_eviction(cache, device);
