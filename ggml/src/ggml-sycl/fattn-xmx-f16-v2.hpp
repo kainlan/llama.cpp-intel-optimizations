@@ -398,6 +398,13 @@ struct fattn_xmx_v2_device_cache {
     size_t                       split_partial_elems     = 0;
     size_t                       split_partial_out_elems = 0;
     int                          split_partial_device    = -1;
+
+    // DPAS split-K workspace (fattn-dpas.cpp): sized once per context, never resized
+    ggml_sycl::mem_handle dpas_parts_handle;
+    ggml_sycl::mem_handle dpas_meta_handle;
+    size_t                dpas_parts_elems     = 0;
+    size_t                dpas_meta_elems      = 0;
+    int                   dpas_workspace_state = 0;  // 0 not tried, 1 allocated, -1 allocation failed
 };
 
 // Bytes of SLM required for the fallback leaf's worst case (D=256, NCOLS=32).

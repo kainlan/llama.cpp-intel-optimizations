@@ -9,6 +9,7 @@
 #include "common.hpp"
 #include "e2e-profile.hpp"
 #include "fattn-debug.hpp"
+#include "fattn-dpas.hpp"
 #include "fattn-esimd-f16.hpp"
 #include "fattn-mma.hpp"
 #include "fattn-onednn.hpp"
@@ -20,6 +21,7 @@
 #include "fattn-vec.hpp"
 #include "fattn-xmx-f16-v2.hpp"
 #include "fattn-xmx-f16.hpp"
+#include "gpu-arch.hpp"
 #include "kv-cache-quant.hpp"
 #include "l144i-probe.hpp"
 #include "mem-ops.hpp"
@@ -2468,6 +2470,230 @@ static bool ggml_sycl_fattn_d512_tile_admissible(const ggml_tensor * dst) {
     return true;
 }
 
+// =============================================================================
+// q4_0 / q8_0 KV: Torchit1's DPAS kernel (fattn-dpas.cpp)
+// =============================================================================
+
+// GGML_SYCL_FA_DPAS=1 (default OFF) admits FLASH_ATTN_EXT over a q4_0 / q8_0 KV cache to the DPAS kernel; without it
+// such an op is declined here and runs on ggml-cpu. Read once. ggml_sycl_flash_attn_ext_supported() takes only the op,
+// so supports_op cannot ask which device would run it: the route opens only when every SYCL GPU this process sees is a
+// Battlemage card, and stays closed, said once at WARN, when any other GPU (the Arrow Lake iGPU, an Alchemist card) is
+// visible. The walk is over total_gpu_count, every GPU the selector left: the scheduler collapses device_count to 1
+// when several GPUs are visible, which would hide the iGPU from this check.
+static bool ggml_sycl_fa_dpas_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_FA_DPAS");
+        if (env == nullptr || std::atoi(env) == 0) {
+            return false;
+        }
+#ifdef GGML_SYCL_FA_DPAS_NO_KERNELS
+        GGML_LOG_WARN("[SYCL] GGML_SYCL_FA_DPAS=1 ignored: this build compiled the DPAS flash-attention kernels out\n");
+        return false;
+#else
+        const int n_gpus = std::min(ggml_sycl_info().total_gpu_count, GGML_SYCL_MAX_DEVICES);
+        if (n_gpus <= 0) {
+            GGML_LOG_WARN("[SYCL] GGML_SYCL_FA_DPAS=1 ignored: no SYCL GPU is visible\n");
+            return false;
+        }
+        for (int i = 0; i < n_gpus; ++i) {
+            const sycl::device & dev = ggml_sycl_get_device(i);
+            if (ggml_sycl::family_from_device(dev) != ggml_sycl::sycl_gpu_family::ARC_BATTLEMAGE) {
+                GGML_LOG_WARN(
+                    "[SYCL] GGML_SYCL_FA_DPAS=1 ignored: SYCL GPU %d (%s) is not a Battlemage card, and supports_op "
+                    "cannot tell which device would run the op\n",
+                    i, dev.get_info<sycl::info::device::name>().c_str());
+                return false;
+            }
+        }
+        GGML_LOG_WARN(
+            "[SYCL] GGML_SYCL_FA_DPAS=1: flash attention over a q4_0 / q8_0 KV runs on the DPAS kernel (%d Battlemage "
+            "GPU(s))\n",
+            n_gpus);
+        return true;
+#endif
+    }();
+    return enabled;
+}
+
+// Names the clause that declined a q4_0 / q8_0 op, under GGML_SYCL_FA_DISPATCH_DEBUG. A declined op runs on ggml-cpu,
+// where a quantized KV meets this build's f16 Q and aborts, so the line tells that abort from a kernel fault. It
+// returns false, for the predicate to return.
+static bool ggml_sycl_fattn_dpas_decline(const ggml_tensor * dst, const char * clause) {
+    static std::atomic<int> decline_debug_count{ 0 };
+    if (ggml_sycl_fattn_dispatch_debug_env()) {
+        const int n     = decline_debug_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        const int limit = ggml_sycl_fattn_dispatch_debug_limit();
+        if (n <= limit) {
+            fprintf(stderr, "[SYCL] fattn DPAS declined [%d/%d] %s: %s (kv=%s D=%lld ne01=%lld ne02=%lld ne12=%lld)\n",
+                    n, limit, dst->name, clause, ggml_type_name(dst->src[1]->type), (long long) dst->src[0]->ne[0],
+                    (long long) dst->src[0]->ne[1], (long long) dst->src[0]->ne[2], (long long) dst->src[1]->ne[2]);
+        }
+    }
+    return false;
+}
+
+// The ops the DPAS kernel runs, from metadata alone. It is placement-blind: supports_op settles a host-tier KV before
+// asking (declined, or under GGML_SYCL_ATTN_HOST_DISPATCH sent to the host dispatcher), and its capability count asks
+// the same question with placement declines off. There is no query-row cap,
+// because an op declined here runs on ggml-cpu, whose flash attention takes only an F32 Q while this build casts Q to
+// f16; so prefill runs on the kernel too. Past the knob and the K type, every refusal names its clause.
+static bool ggml_sycl_fattn_dpas_supported(const ggml_tensor * dst) {
+    if (!ggml_sycl_fa_dpas_enabled()) {
+        return false;
+    }
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    if (Q == nullptr || K == nullptr || V == nullptr) {
+        return false;
+    }
+    // only a q4_0 / q8_0 K makes this a DPAS op; any other K was never a candidate, so nothing is named
+    if (K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    if (V->type != K->type) {
+        return ggml_sycl_fattn_dpas_decline(dst, "V type differs from K");
+    }
+    // GGML_SYCL_F16 builds cast Q to f16 for every head size but 512 (llama-graph.cpp)
+    if (Q->type != GGML_TYPE_F32 && Q->type != GGML_TYPE_F16) {
+        return ggml_sycl_fattn_dpas_decline(dst, "Q is neither F32 nor F16");
+    }
+    if (Q->nb[0] != ggml_type_size(Q->type) || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) {
+        return ggml_sycl_fattn_dpas_decline(dst, "Q elements not packed, or dst not a contiguous F32");
+    }
+    if (sinks != nullptr && sinks->type != GGML_TYPE_F32) {
+        return ggml_sycl_fattn_dpas_decline(dst, "sinks not F32");
+    }
+    if (!ggml_sycl_fattn_dpas_head_ok(K->ne[0]) || V->ne[0] != K->ne[0] || Q->ne[0] != K->ne[0]) {
+        return ggml_sycl_fattn_dpas_decline(dst, "no kernel for this head size, or Q/K/V head sizes differ");
+    }
+    if (Q->ne[1] < 1 || K->ne[1] < 1 || V->ne[1] != K->ne[1]) {
+        return ggml_sycl_fattn_dpas_decline(dst, "no query or key rows, or K/V lengths differ");
+    }
+    if (K->ne[2] < 1 || V->ne[2] != K->ne[2] || Q->ne[2] % K->ne[2] != 0 ||
+        Q->ne[2] / K->ne[2] > GGML_SYCL_FATTN_DPAS_MAX_G) {
+        return ggml_sycl_fattn_dpas_decline(dst, "GQA ratio not whole, or above GGML_SYCL_FATTN_DPAS_MAX_G");
+    }
+    if (Q->ne[3] != K->ne[3] || V->ne[3] != K->ne[3]) {
+        return ggml_sycl_fattn_dpas_decline(dst, "Q/K/V sequence counts differ");
+    }
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return ggml_sycl_fattn_dpas_decline(dst, "ALiBi or logit softcap");
+    }
+    if (mask != nullptr && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->nb[0] != sizeof(sycl::half))) {
+        return ggml_sycl_fattn_dpas_decline(dst, "mask not a single-plane F16");
+    }
+    if (ggml_sycl_fattn_d512_has_paged_or_multiseq_sources(dst)) {
+        return ggml_sycl_fattn_dpas_decline(dst, "paged or multi-sequence K/V");
+    }
+    // q4_0 / q8_0 rows are read as dwords from the dword at or before the row start, so rows must start on 2-byte
+    // bounds (head sizes with an odd block count, e.g. 96, put every other head 2 bytes into a dword). The dispatch
+    // checks the resolved pointers too.
+    for (const ggml_tensor * t : { K, V }) {
+        if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % 2 != 0 || t->nb[2] % 2 != 0 || t->nb[3] % 2 != 0 ||
+            t->view_offs % 2 != 0) {
+            return ggml_sycl_fattn_dpas_decline(dst, "K/V row not on a 2-byte bound");
+        }
+    }
+    return true;
+}
+
+#ifdef GGML_SYCL_FA_DPAS_NO_KERNELS
+// With the kernels compiled out the dispatch only aborts; its first declaration tells the compiler so.
+[[noreturn]] static void ggml_sycl_fattn_dpas_dispatch(ggml_backend_sycl_context & ctx,
+                                                       const fattn_params &        params,
+                                                       const ggml_tensor *         dst);
+#endif
+
+// Runs an op ggml_sycl_fattn_dpas_supported() admitted. The split-K workspace is sized once per context to the bound
+// every launch fits (ggml_sycl_fattn_dpas_parts_capacity), so it is never resized and nothing waits for a launch in
+// flight; each split launch retains it until its event. A failed allocation leaves the keys unsplit, said once.
+static void ggml_sycl_fattn_dpas_dispatch(ggml_backend_sycl_context & ctx,
+                                          const fattn_params &        params,
+                                          const ggml_tensor *         dst) {
+#ifdef GGML_SYCL_FA_DPAS_NO_KERNELS
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(params);
+    GGML_ABORT("[SYCL] fattn DPAS: %s was admitted, but this build compiled the DPAS kernels out", dst->name);
+#else
+    // supports_op screened the strides and view offsets from metadata; the resolved rows must start on 2-byte bounds
+    // too, or the kernel reads the wrong dwords
+    if (params.Q == nullptr || params.K == nullptr || params.V == nullptr || params.dst == nullptr ||
+        (((uintptr_t) params.K | (uintptr_t) params.V) & 1) != 0) {
+        GGML_ABORT("[SYCL] fattn DPAS: %s has an unresolved or odd-addressed operand that supports_op admitted",
+                   dst->name);
+    }
+    dpct::queue_ptr stream   = ctx.stream();
+    // this fork's nsm is the compute-unit count, 8 per Xe2 core
+    const int       xe_cores = std::max(1, ggml_sycl_info().devices[ctx.device].nsm / 8);
+
+    fattn_xmx_v2_device_cache * cache = fattn_xmx_v2_get_or_create_cache(ctx);
+    if (cache->dpas_workspace_state == 0) {
+        const size_t parts_elems = ggml_sycl_fattn_dpas_parts_capacity(xe_cores);
+        const size_t meta_elems  = ggml_sycl_fattn_dpas_meta_capacity(xe_cores);
+        if (ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer(stream, ctx.device, parts_elems * sizeof(float),
+                                                                "fattn_dpas_split_parts", &cache->dpas_parts_handle) &&
+            ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer(stream, ctx.device, meta_elems * sizeof(sycl::float2),
+                                                                "fattn_dpas_split_meta", &cache->dpas_meta_handle)) {
+            cache->dpas_parts_elems     = parts_elems;
+            cache->dpas_meta_elems      = meta_elems;
+            cache->dpas_workspace_state = 1;
+        } else {
+            cache->dpas_parts_handle    = {};
+            cache->dpas_meta_handle     = {};
+            cache->dpas_workspace_state = -1;
+            GGML_LOG_WARN("[SYCL] fattn DPAS: split-K workspace allocation failed on device %d; keys run unsplit\n",
+                          ctx.device);
+        }
+    }
+    float *        parts = nullptr;
+    sycl::float2 * meta  = nullptr;
+    if (cache->dpas_workspace_state == 1) {
+        parts = static_cast<float *>(cache->dpas_parts_handle.resolve(ctx.device).ptr);
+        meta  = static_cast<sycl::float2 *>(cache->dpas_meta_handle.resolve(ctx.device).ptr);
+    }
+
+    const size_t parts_capacity = parts ? cache->dpas_parts_elems : 0;
+    const size_t meta_capacity  = meta ? cache->dpas_meta_elems : 0;
+
+    ggml_sycl_fattn_dpas_launch_info info{};
+    const sycl::event ev = ggml_sycl_fattn_dpas_launch(stream, ctx.device, params, parts, meta, parts_capacity,
+                                                       meta_capacity, xe_cores, &info);
+    if (info.nsplit > 1) {
+        ggml_sycl::retain_handles_until_event({ cache->dpas_parts_handle, cache->dpas_meta_handle }, ev);
+    }
+
+    // decode-shape observation for the SYCL-graph gate: "dpas" is not on its verified allowlist, so it classifies
+    // OTHER and keeps graph AUTO off for this context
+    if (params.ne01 <= 1) {
+        ctx.fa_decode_kernel_obs.observe("dpas");
+    }
+    static std::atomic<int> dpas_debug_count{ 0 };
+    if (ggml_sycl_fattn_dispatch_debug_env()) {
+        const int n     = dpas_debug_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        const int limit = ggml_sycl_fattn_dispatch_debug_limit();
+        if (n <= limit) {
+            fprintf(stderr,
+                    "[SYCL] fattn selected [%d/%d] DPAS kv=%s D=%d ne01=%d ne11=%d ne02=%d ne12=%d G=%d q=%s "
+                    "mask=%d sinks=%d nsplit=%d nr16=%d st=%d lg=%d\n",
+                    n, limit, ggml_type_name(params.K_type), params.ne00, params.ne01, params.ne11, params.ne02,
+                    params.ne12, params.ne02 / params.ne12, ggml_type_name(params.Q_type),
+                    (int) (params.mask != nullptr), (int) (params.sinks != nullptr), info.nsplit, info.nr16, info.st,
+                    (int) info.lg);
+        }
+    }
+    if (ggml_sycl::e2e_tg_profile_enabled()) {
+        ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::ATTENTION, "dpas", 0.0, 0.0, 0, 1);
+    }
+#endif
+}
+
 // Check if flash attention is supported for the given operation
 bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     // Enabled by default; allow explicit disable for debugging/regressions.
@@ -2480,6 +2706,11 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     }();
     if (!fa_ext_enabled) {
         return false;
+    }
+
+    // q4_0 / q8_0 K/V: admitted only through the DPAS route, which carries its own type, shape and device screen
+    if (ggml_sycl_fattn_dpas_supported(dst)) {
+        return true;
     }
 
     const ggml_tensor * Q    = dst->src[0];
@@ -3481,9 +3712,12 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         probe("fa/src4_sinks", sinks);
     }
 
+    // a q4_0 / q8_0 KV reaches this function only through the DPAS route, on the predicate supports_op admitted it by
+    const bool use_dpas = ggml_sycl_fattn_dpas_supported(dst);
+
     GGML_ASSERT(Q->type == GGML_TYPE_F32 || Q->type == GGML_TYPE_F16);
-    GGML_ASSERT(K->type == GGML_TYPE_F16 || ggml_sycl_type_is_fp8_e4m3(K->type));  // FP16 or FP8 KV cache
-    GGML_ASSERT(V->type == GGML_TYPE_F16 || ggml_sycl_type_is_fp8_e4m3(V->type));  // FP16 or FP8 KV cache
+    GGML_ASSERT(use_dpas || K->type == GGML_TYPE_F16 || ggml_sycl_type_is_fp8_e4m3(K->type));  // FP16 or FP8 KV cache
+    GGML_ASSERT(use_dpas || V->type == GGML_TYPE_F16 || ggml_sycl_type_is_fp8_e4m3(V->type));  // FP16 or FP8 KV cache
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     // Extract scale, max_bias, and logit_softcap from op_params
@@ -3851,6 +4085,13 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     params.kv_base_pos        = 0;
 
     const int D = Q->ne[0];
+
+    // q4_0 / q8_0 KV: Torchit1's DPAS kernel (fattn-dpas.cpp). It comes before every route below, none of which
+    // reads a block-quantized row, and is chosen from the operand types alone, so it never competes with them.
+    if (use_dpas) {
+        ggml_sycl_fattn_dpas_dispatch(ctx, params, dst);
+        return;
+    }
 
     // ==========================================================================
     // D=512 route: oneDNN-if-admissible, else ESIMD-decode-tier-if-admissible
