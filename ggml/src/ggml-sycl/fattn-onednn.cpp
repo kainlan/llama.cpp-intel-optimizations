@@ -1170,6 +1170,8 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     // cache. Without a cache the allocator refuses and returns nullptr, and oneDNN does not check that return:
     // it launches the partition with a null scratch pointer, which faults the device. Only a DIRECT op can
     // arrive here with no cache, because materializing K/V or Q allocates through the cache and creates it.
+    // That is why the guard follows both materialize blocks: placed earlier, it would decline a DIRECT op with an
+    // F32 Q whose own materialize would have created the cache.
     // Decline before any partition is compiled or executed. The decline keeps the op away from the allocator, so
     // the allocator's once-only warning no longer fires; warn once here instead, at WARN so a default-verbosity
     // run shows a device that reached SDPA dispatch with no cache.
@@ -1179,7 +1181,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
         if (!warned.exchange(true, std::memory_order_relaxed)) {
             GGML_LOG_WARN(
                 "[SYCL] fattn: oneDNN SDPA declined on device %d: the device has no unified_cache to serve "
-                "the Graph allocator's scratch, so the op falls back (only logged once)\n",
+                "the Graph allocator's scratch, so the op falls back to native FA (only logged once)\n",
                 ctx.device);
         }
         if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {

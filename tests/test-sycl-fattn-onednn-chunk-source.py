@@ -23,7 +23,9 @@ The fix this gate pins:
   Graph allocator is on and the device has no unified cache. The allocator refuses there and returns nullptr, and
   oneDNN does not check the return: it launched with a null scratch and faulted the B50. The decline keeps the op
   away from the allocator, whose own once-only warning then never fires, so the guard warns once itself, at WARN
-  because a default-verbosity run drops INFO, and on every decline under GGML_SYCL_FA_DISPATCH_DEBUG.
+  because a default-verbosity run drops INFO, and prints a debug line on every decline under
+  GGML_SYCL_FA_DISPATCH_DEBUG. The guard follows the F32 Q materialize, which allocates through the cache and so
+  creates it: placed earlier, it would decline a DIRECT op with an F32 Q whose own materialize would create it.
 
 This gate is about the dispatcher's wiring only. The planner's arithmetic is proved behaviourally by
 test-sycl-fattn-onednn-chunk (host C++), and the chunked execute's numerics and its scratch bound by
@@ -66,13 +68,19 @@ NO_CACHE_WARN = (
     "static std::atomic<bool> warned{ false }; "
     "if (!warned.exchange(true, std::memory_order_relaxed)) { GGML_LOG_WARN( "
     "\"[SYCL] fattn: oneDNN SDPA declined on device %d: the device has no unified_cache to serve \" "
-    "\"the Graph allocator's scratch, so the op falls back (only logged once)\\n\", ctx.device); }"
+    "\"the Graph allocator's scratch, so the op falls back to native FA (only logged once)\\n\", ctx.device); }"
 )
 NO_CACHE_DEBUG = (
     "if (std::getenv(\"GGML_SYCL_FA_DISPATCH_DEBUG\")) { "
     "fprintf(stderr, \"[SYCL] fattn: oneDNN declined: no_unified_cache device=%d\\n\", ctx.device); }"
 )
 NO_CACHE_DECLINE = "return decline(\"no_unified_cache\"); }"
+NO_CACHE_REPORT_CHECK = (
+    "the no-cache decline warns once at WARN, and prints a debug line on every decline under GGML_SYCL_FA_DISPATCH_DEBUG"
+)
+# The F32 Q materialize block, which allocates through the cache and so creates it for a DIRECT op.
+Q_F32_MATERIALIZE = "if (active_params.Q_type == GGML_TYPE_F32) {"
+Q_F32_MATERIALIZE_CALL = "ggml_sycl_flash_attn_ext_onednn_materialize_q_f32("
 # The whole guard block, which the self-test's drop and move mutants cut out.
 NO_CACHE_GUARD = " ".join((NO_CACHE_TEST, NO_CACHE_WARN, NO_CACHE_DEBUG, NO_CACHE_DECLINE))
 PARTITION_CACHE_ACQUIRE = "sdpa_partition_cache * cache = get_or_create_cache(ctx);"
@@ -135,8 +143,11 @@ def check(srcs):
     results["the dispatcher declines before any compile or execute when the device has no unified cache"] = (
         0 <= guard_pos < dispatch.find(PARTITION_CACHE_ACQUIRE) and guard_pos < loop_pos
         and guard.endswith(NO_CACHE_DECLINE))
-    results["the no-cache decline warns once at WARN, and on every decline under GGML_SYCL_FA_DISPATCH_DEBUG"] = (
-        NO_CACHE_WARN in guard and NO_CACHE_DEBUG in guard)
+    results[NO_CACHE_REPORT_CHECK] = NO_CACHE_WARN in guard and NO_CACHE_DEBUG in guard
+    q_pos = dispatch.find(Q_F32_MATERIALIZE)
+    q_block = function_body(dispatch[q_pos:], Q_F32_MATERIALIZE) if q_pos >= 0 else ""
+    results["the no-cache guard follows the F32 Q materialize, which creates the cache for a DIRECT op"] = (
+        Q_F32_MATERIALIZE_CALL in q_block and 0 <= q_pos + len(q_block) <= guard_pos)
     results["the per-execute budget is half the allocator's DIRECT cap"] = (
         "const size_t chunk_budget = ggml_sycl::unified_cache_onednn_graph_scratch_direct_cap_bytes(ctx.device) / 2;"
         in dispatch)
@@ -194,7 +205,7 @@ sources = {"onednn": read(args.onednn), "cache": read(args.cache)}
 results = check(sources)
 
 if args.self_test:
-    # (check it must trip, source, text to replace, replacement)
+    # (check it must trip, source, then one or more text-to-replace/replacement pairs)
     mutants = [
         ("the per-execute budget is half the allocator's DIRECT cap", "onednn",
          "unified_cache_onednn_graph_scratch_direct_cap_bytes(ctx.device) / 2;",
@@ -272,14 +283,18 @@ if args.self_test:
          + " ggml_sycl::unified_cache_dump_counter_add(ggml_sycl::dump_counter::onednn_sdpa_executed, ctx.device);"),
         # The no-cache WARN dropped, demoted to INFO (which a default-verbosity run drops), its latch made
         # per-call so it warns on every decline, and the debug line dropped.
-        ("the no-cache decline warns once at WARN, and on every decline under GGML_SYCL_FA_DISPATCH_DEBUG", "onednn",
+        (NO_CACHE_REPORT_CHECK, "onednn",
          NO_CACHE_WARN, ""),
-        ("the no-cache decline warns once at WARN, and on every decline under GGML_SYCL_FA_DISPATCH_DEBUG", "onednn",
+        (NO_CACHE_REPORT_CHECK, "onednn",
          "GGML_LOG_WARN( \"[SYCL] fattn: oneDNN SDPA declined", "GGML_LOG_INFO( \"[SYCL] fattn: oneDNN SDPA declined"),
-        ("the no-cache decline warns once at WARN, and on every decline under GGML_SYCL_FA_DISPATCH_DEBUG", "onednn",
+        (NO_CACHE_REPORT_CHECK, "onednn",
          "static std::atomic<bool> warned{ false };", "std::atomic<bool> warned{ false };"),
-        ("the no-cache decline warns once at WARN, and on every decline under GGML_SYCL_FA_DISPATCH_DEBUG", "onednn",
+        (NO_CACHE_REPORT_CHECK, "onednn",
          NO_CACHE_DEBUG, ""),
+        # The guard moved to just before the F32 Q materialize: it still precedes every compile and execute, so
+        # only the placement check sees it.
+        ("the no-cache guard follows the F32 Q materialize, which creates the cache for a DIRECT op", "onednn",
+         NO_CACHE_GUARD, "", Q_F32_MATERIALIZE, NO_CACHE_GUARD + " " + Q_F32_MATERIALIZE),
     ]
     covered = {name for name, *_ in mutants}
     dead = [name for name in results if name not in covered]

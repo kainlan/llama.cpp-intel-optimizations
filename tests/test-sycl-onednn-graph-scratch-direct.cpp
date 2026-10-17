@@ -1932,6 +1932,21 @@ void test_in_flight_entry_is_reused_in_order(unified_cache * cache, int device) 
         return;
     }
 
+    // The new consumer reads the handed-back buffer back into host USM. A copy
+    // into pageable memory blocks the host until the in-order queue drains,
+    // slow kernel included, so the re-park would land after the previous
+    // marker completed and property 4's premise would never hold. The buffer
+    // is allocated here, before the timed window opens, so its allocation
+    // does not count against the re-park.
+    unsigned char * host = sycl::malloc_host<unsigned char>(kProbeBytes, q);
+    check(host != nullptr, "the host USM readback buffer was allocated");
+    if (!host) {
+        cache->onednn_graph_scratch_free(ptr1, nullptr);
+        unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown (in-order reuse)");
+        return;
+    }
+    std::fill(host, host + kProbeBytes, static_cast<unsigned char>(0));
+
     // The previous consumer: a slow kernel, then a write through ptr1. The
     // release event is that write, the way oneDNN passes the event of the
     // last command that touches the buffer.
@@ -1970,6 +1985,7 @@ void test_in_flight_entry_is_reused_in_order(unified_cache * cache, int device) 
             cache->onednn_graph_scratch_free(ptr2, nullptr);
         }
         old_write.wait();
+        sycl::free(host, q);
         unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown (in-order reuse)");
         return;
     }
@@ -1978,20 +1994,6 @@ void test_in_flight_entry_is_reused_in_order(unified_cache * cache, int device) 
     // then frees it. That re-park happens while the slow kernel still runs,
     // so the previous marker on the returned slot is still pending when the
     // free list hands the same slot out again (it is LIFO).
-    //
-    // The readback lands in host USM. A copy into pageable memory blocks the
-    // host until the in-order queue drains, slow kernel included, so the
-    // re-park would land after the previous marker completed and property 4's
-    // premise would never hold.
-    unsigned char * host = sycl::malloc_host<unsigned char>(kProbeBytes, q);
-    check(host != nullptr, "the host USM readback buffer was allocated");
-    if (!host) {
-        old_write.wait();
-        cache->onednn_graph_scratch_free(ptr2, nullptr);
-        unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown (in-order reuse)");
-        return;
-    }
-    std::fill(host, host + kProbeBytes, static_cast<unsigned char>(0));
     sycl::event     new_write   = q.memset(ptr2, 0x22, kProbeBytes);
     sycl::event     readback    = q.memcpy(host, ptr2, kProbeBytes);
     const long long readback_ms = static_cast<long long>(
