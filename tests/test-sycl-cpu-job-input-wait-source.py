@@ -40,7 +40,8 @@ THE CONTRACT.  With comments and string literals blanked:
       event-chained hybrid route builds its prologue before its table copy and its device-expert kernel, so the
       in-order marker does not wait for that kernel and the CPU and GPU halves still overlap.
   W6. The pool's job lambda (cpu-expert-pool.cpp), and every closure ggml-sycl.cpp hands to submit_batch as a job's
-      resolve step (it runs on the worker after the prologue, before the signal), names nothing in sycl:: and makes
+      resolve step, on whatever receiver expression (it runs on the worker after the prologue, before the signal),
+      names nothing in sycl:: and makes
       no wait, status query, submission or ze/ur call of its own, template calls such as get_info<...>() included:
       the job's one driver call is its device signal.  At least one resolve closure is read, so the scan is not
       vacuous.
@@ -57,8 +58,14 @@ THE CONTRACT.  With comments and string literals blanked:
       it allocates; zeroes the word before it publishes it; takes the next serial as the last plus one; submits every
       marker on queue_, before it records the new serial; and takes its word from the unified cache as a host-pinned
       allocation.  unified_cache_cpu_job_input_marker_arm reaches the cache through moe_join_queue_cache_of(stream),
-      which returns only the cache whose queue_ is that stream.  shutdown_resources ends the marker word on every
-      branch that ends the signal ring, and on the normal branch only after the queues drained.
+      which returns only the cache whose queue_ is that stream.  The owner, the word's allocation, is assigned only
+      by the arm's one publish and released only through cpu_job_input_marker_end, in unified-cache.cpp and in
+      unified-cache.hpp's inline code alike: a release anywhere else would let the allocation go without the
+      abandon, under a waiter's load.  shutdown_resources, in each of its three branches (the SYCL runtime already
+      shutting down, an invalid context, and the normal one after the queues drained), ends the signal ring once and
+      then the word once, and ends neither anywhere else: the ring is no longer live once ended, so a job the
+      abandon releases signals it without a driver call, and on the two SYCL-gone branches no driver call could
+      succeed.
   W8. The signal ring (cpu_job_signal_ring, unified-cache.cpp) makes no driver call that may block under mutex_, the
       lock the job's own signal takes: a host wait on another thread may hold the driver's device lock behind that
       job.  wrap makes its event and recycle resets its events outside every mutex_ scope, each call counted in
@@ -89,7 +96,9 @@ RED for W8 alone, on the commit that added W1-W7:
 RED for the readers drain and the slow-wait report, on 2b5fb934a (the commit that added W8):
   FAIL [pin W7]: cpu_job_input_marker_seen does not count itself in readers (seq_cst), then test abandoned ...
 The resolve-step scan (W6), the arm's serial, zeroing, in-order refusal, queue and cache (W7) and W9 were gaps: on
-2b5fb934a each of their mutants passes the pin as it stood, and fails it here.
+2b5fb934a each of their mutants passes the pin as it stood, and fails it here.  So were a resolve step handed to
+submit_batch on a call expression (W6), the owner's other writers and the order inside each shutdown branch (W7): on
+4b162ae16 each of their mutants passes the pin as it stood.
 """
 
 from __future__ import annotations
@@ -199,6 +208,7 @@ BACKEND_REL = Path("ggml") / "src" / "ggml-sycl" / "ggml-sycl.cpp"
 POOL_REL = Path("ggml") / "src" / "ggml-sycl" / "cpu-expert-pool.cpp"
 HEADER_REL = Path("ggml") / "src" / "ggml-sycl" / "cpu-job-signal.hpp"
 CACHE_REL = Path("ggml") / "src" / "ggml-sycl" / "unified-cache.cpp"
+CACHE_HPP_REL = Path("ggml") / "src" / "ggml-sycl" / "unified-cache.hpp"
 
 WAIT_SIG = r"static\s+void\s+moe_cpu_job_wait_inputs\s*\(([^)]*)\)\s*\{"
 PROLOGUE_SIG = r"static\s+std::function<void\(\)>\s+moe_cpu_job_prologue\s*\(([^)]*)\)\s*\{"
@@ -242,7 +252,8 @@ def read_sources(root: Path) -> dict[str, str]:
     return {"backend": blank_comments((root / BACKEND_REL).read_text()),
             "pool": blank_comments((root / POOL_REL).read_text()),
             "header": blank_comments((root / HEADER_REL).read_text()),
-            "cache": blank_comments((root / CACHE_REL).read_text())}
+            "cache": blank_comments((root / CACHE_REL).read_text()),
+            "cache_hpp": blank_comments((root / CACHE_HPP_REL).read_text())}
 
 
 def check_wait_inputs(s: dict[str, str]) -> None:
@@ -392,9 +403,10 @@ def lambda_body(code: str, open_bracket: int, pin: str) -> str:
 
 
 def submit_batch_resolves(code: str) -> list[tuple[int, str]]:
-    """(line, body) of every closure ggml-sycl.cpp hands to submit_batch as its resolve argument (the third)."""
+    """(line, body) of every closure ggml-sycl.cpp hands to submit_batch as its resolve argument (the third), whatever
+    the receiver expression: `cpu_pool.`, `pool->`, `get_pool().` and the like."""
     out = []
-    for m in re.finditer(r"\b\w+\s*(?:\.|->)\s*submit_batch\s*\(", code):
+    for m in re.finditer(r"(?:\.|->)\s*submit_batch\s*\(", code):
         line = code.count("\n", 0, m.start()) + 1
         args = top_level_args(code[m.end() : matching_paren(code, m.end() - 1)])
         if len(args) < 3:
@@ -548,16 +560,84 @@ def check_helpers(s: dict[str, str]) -> None:
     if bad or re.search(r"\bsycl\s*::", rep_body) or not re.search(r"\bGGML_LOG_WARN\s*\(", rep_body):
         fail("W7", "cpu_job_input_marker_report_slow runs on the pool worker and does more than log one WARN: " +
                    (", ".join(bad) if bad else "no WARN, or something in sycl::"))
+    check_marker_owner(s)
+    check_shutdown_branches(cache)
+
+
+OWNER_PUBLISH = r"\bcpu_job_input_marker_owner_\s*=\s*std::move\s*\(\s*owner\s*\)\s*;"
+OWNER_END = r"\bcpu_job_input_marker_end\s*\(\s*cpu_job_input_marker_word_\s*,\s*cpu_job_input_marker_owner_\s*\)"
+
+
+def check_marker_owner(s: dict[str, str]) -> None:
+    """W7: the owner is assigned by the arm's one publish and released only through cpu_job_input_marker_end."""
+    cache = s["cache"]
+    m, arm = definition(cache, ARM_METHOD_SIG, "W7")
+    arm_at = cache.index("{", m.end() - 1) + 1
+    allowed = []
+    pubs = [arm_at + p.start() for p in re.finditer(OWNER_PUBLISH, arm)]
+    if len(pubs) != 1:
+        fail("W7", f"unified_cache::arm_cpu_job_input_marker assigns cpu_job_input_marker_owner_ {len(pubs)} times, "
+                   "not once, when it publishes the word")
+    allowed.append(pubs[0])
+    allowed.extend(e.start() + e.group(0).index("cpu_job_input_marker_owner_") for e in re.finditer(OWNER_END, cache))
+    for u in re.finditer(r"\bcpu_job_input_marker_owner_\b", cache):
+        if u.start() in allowed:
+            continue
+        line = cache.count("\n", 0, u.start()) + 1
+        fail("W7", f"unified-cache.cpp:{line} uses cpu_job_input_marker_owner_ outside the arm's publish and "
+                   "cpu_job_input_marker_end: the word's allocation would go without the abandon, under a waiter's "
+                   "load of the word")
+    hpp = s["cache_hpp"]
+    uses = [u.start() for u in re.finditer(r"\bcpu_job_input_marker_owner_\b", hpp)]
+    decl = re.search(r"\bmem_handle\s+cpu_job_input_marker_owner_\s*;", hpp)
+    if len(uses) != 1 or not decl or decl.start() > uses[0] or uses[0] >= decl.end():
+        fail("W7", f"unified-cache.hpp names cpu_job_input_marker_owner_ {len(uses)} times; only its declaration may: "
+                   "inline code there could release the word's allocation without the abandon")
+
+
+SHUTDOWN_BRANCHES = (
+    ("the branch for a SYCL runtime already shutting down",
+     r"\bif\s*\(\s*g_sycl_shutting_down\s*\.\s*load\s*\(\s*\)\s*\)\s*\{"),
+    ("the branch for an invalid context",
+     r"\(\s*void\s*\)\s*queue_\s*\.\s*get_context\s*\(\s*\)\s*;\s*\}\s*catch\s*\(\s*\.\.\.\s*\)\s*\{"),
+)
+RING_END = r"\bcpu_job_signal_ring_end\s*\(\s*cpu_job_signal_ring_\b"
+MARKER_END = r"\bcpu_job_input_marker_end\s*\("
+
+
+def check_shutdown_branches(cache: str) -> None:
+    """W7: each branch of shutdown_resources ends the signal ring once and then the word once."""
     _, shut = definition(cache, SHUTDOWN_SIG, "W7")
-    rings = [m.start() for m in re.finditer(r"\bcpu_job_signal_ring_end\s*\(\s*cpu_job_signal_ring_\b", shut)]
-    ends = [m.start() for m in re.finditer(r"\bcpu_job_input_marker_end\s*\(", shut)]
-    if len(ends) != len(rings) or not rings:
-        fail("W7", f"shutdown_resources ends the CPU job signal ring {len(rings)} times and the input-marker word "
-                   f"{len(ends)} times; every branch that ends one ends the other")
-    drain = re.search(r"\bdrain_all_queues_noexcept\s*\(", shut)
-    if not drain or not any(e > drain.start() for e in ends):
-        fail("W7", "shutdown_resources lets the input-marker word go before its queues drained: a marker still queued "
-                   "would write freed memory")
+    regions = []
+    for what, opener in SHUTDOWN_BRANCHES:
+        found = list(re.finditer(opener, shut))
+        if len(found) != 1:
+            fail("W7", f"shutdown_resources has {len(found)} of {what}, not 1")
+        body, start = block_at(shut, found[0].end() - 1, "W7")
+        regions.append((what, start, body, True))
+    drain = list(re.finditer(r"\bif\s*\(\s*!\s*drain_all_queues_noexcept\s*\(\s*\)\s*\)\s*return\s+false\s*;", shut))
+    if len(drain) != 1:
+        fail("W7", "shutdown_resources does not return false on a failed drain_all_queues_noexcept, once")
+    regions.append(("the normal branch, after the queues drained", drain[0].end(), shut[drain[0].end() :], False))
+    counted = 0
+    for what, start, body, returns in regions:
+        rings = [r.start() for r in re.finditer(RING_END, body)]
+        ends = [e.start() for e in re.finditer(MARKER_END, body)]
+        if len(rings) != 1 or len(ends) != 1:
+            fail("W7", f"{what} of shutdown_resources ends the CPU job signal ring {len(rings)} times and the "
+                       f"input-marker word {len(ends)} times; each branch ends each once")
+        if ends[0] < rings[0]:
+            fail("W7", f"{what} of shutdown_resources ends the input-marker word before the signal ring: a job the "
+                       "abandon releases would signal a ring still live, a driver call (on a branch where SYCL is "
+                       "gone, one that cannot succeed)")
+        ret = re.search(r"\breturn\s+true\s*;", body)
+        if returns and (not ret or ret.start() < ends[0]):
+            fail("W7", f"{what} of shutdown_resources returns before it ends the input-marker word")
+        counted += 2
+    total = len(re.findall(RING_END, shut)) + len(re.findall(MARKER_END, shut))
+    if total != counted:
+        fail("W7", f"shutdown_resources ends the signal ring or the input-marker word {total - counted} more times "
+                   "outside its three branches: before the drain, a marker still queued would write freed memory")
 
 
 RING_CLASS = r"class\s+cpu_job_signal_ring\s*\{"
@@ -673,7 +753,7 @@ def move(pattern: str, before: str):
     return apply
 
 
-def self_test(s: dict[str, str]) -> int:
+def mutants() -> list:
     marker_wait = r"(\n(\s*)ggml_sycl::cpu_job_input_marker_wait\(marker\);)"
     tick = r"(ggml_sycl::cpu_job_input_marker_wait\(marker\);)\n(\s*)ggml_sycl_watchdog_heartbeat\(\);"
     arm_call = r"!ggml_sycl::unified_cache_cpu_job_input_marker_arm\(stream, inputs\.events, &marker, &why\)"
@@ -681,7 +761,7 @@ def self_test(s: dict[str, str]) -> int:
     site1 = r"\n    std::function<void\(\)> job_prologue = moe_cpu_job_prologue\(\*stream, std::move\(job_inputs\), src0\);"
     end_call = (r"\n(\s*)\{\n\s*std::lock_guard<std::mutex> lock\(cpu_job_input_marker_mutex_\);\n"
                 r"\s*cpu_job_input_marker_end\(cpu_job_input_marker_word_, cpu_job_input_marker_owner_\);\n\s*\}")
-    mutants = [
+    return [
         ("W1", "backend", "the worker waits an event natively again",
          sub(marker_wait, r"\1\n\2sycl::event().wait();")),
         ("W1", "backend", "the worker queries an event's status",
@@ -730,7 +810,8 @@ def self_test(s: dict[str, str]) -> int:
          sub(r"(\n(\s*)if \(prologue\) \{)", r"\n\2sycl::event().wait();\1")),
         ("W6", "pool", "the job lambda queries the driver",
          sub(r"(\n(\s*)if \(prologue\) \{)", r"\n\2(void) zeEventQueryStatus(nullptr);\1")),
-        # M2: the resolve step runs on the worker before the signal (llama.cpp-42zj).
+        # The decode route's resolve step runs on the pool worker after the prologue and before the job signals: a
+        # status query or a wait there can take the driver's device lock behind this very job.
         ("W6", "backend", "the decode resolve step queries an event's status",
          sub(r"(\n(\s*)if \(record_warmup\) \{\n\s*g_moe_warmup\.record\()",
              r"\n\2(void) record->ready.get_info<command_execution_status>();\1")),
@@ -738,7 +819,14 @@ def self_test(s: dict[str, str]) -> int:
          sub(r"(\n(\s*)if \(record_warmup\) \{\n\s*g_moe_warmup\.record\()", r"\n\2record->ready.wait();\1")),
         ("W6", "backend", "the decode resolve step calls Level Zero",
          sub(r"(\n(\s*)if \(record_warmup\) \{\n\s*g_moe_warmup\.record\()", r"\n\2(void) zeEventQueryStatus(nullptr);\1")),
-        # M5 (llama.cpp-42zj).
+        # The decode route's site stays as it is, so the scan is not vacuous; a second site hands over a resolve step
+        # through a receiver that is a call.
+        ("W6", "backend", "a resolve step handed to submit_batch on a call expression queries the driver",
+         sub(r"cpu_pool\.submit_batch\(std::move\(batch_tasks\), \{\}, \{\},",
+             r"moe_cpu_pool_of(ctx).submit_batch(std::move(batch_tasks), {}, "
+             r"[]() { (void) zeEventQueryStatus(nullptr); },")),
+        # A refused arm waits exactly the job's inputs on the submitting thread: without the leases' barrier among
+        # them, the job would read host weights still being written.
         ("W9", "backend", "the decode route's job does not wait the leases' barrier",
          sub(r"\n\s*job_inputs\.events\.push_back\(record->ready\);", "")),
         ("W9", "backend", "the decode route takes the leases' barrier after its prologue",
@@ -760,7 +848,8 @@ def self_test(s: dict[str, str]) -> int:
              r"w.abandoned.load(std::memory_order_seq_cst);")),
         ("W7", "header", "seen reads the word relaxed",
          sub(r"__atomic_load_n\(w\.word, __ATOMIC_ACQUIRE\)", r"__atomic_load_n(w.word, __ATOMIC_RELAXED)")),
-        # M3: the readers drain (llama.cpp-42zj).
+        # The word's allocation never goes under a load: a waiter counts itself before it tests the flag and loads the
+        # word, and the abandon sets the flag and then waits for that count.
         ("W7", "header", "seen does not count itself in readers",
          sub(r"\n\s*w\.readers\.fetch_add\(1, std::memory_order_seq_cst\);", "")),
         ("W7", "header", "seen uncounts itself before its load",
@@ -774,12 +863,12 @@ def self_test(s: dict[str, str]) -> int:
              r"std::memory_order_seq_cst\) != 0\) \{\n\s*std::this_thread::yield\(\);\n\s*\})", r"\2\1")),
         ("W7", "header", "the abandon sets the flag with release only",
          sub(r"w\.abandoned\.store\(true, std::memory_order_seq_cst\)", r"w.abandoned.store(true, std::memory_order_release)")),
-        # M4b: the modulo compare (llama.cpp-42zj).
+        # The word is compared modulo 2^32: any other compare releases a job early at the wrap, or never.
         ("W7", "header", "the compare does not wrap",
          sub(r"return static_cast<int32_t>\(seen - serial\) >= 0;", r"return seen >= serial;")),
         ("W7", "header", "the compare is off by one",
          sub(r"return static_cast<int32_t>\(seen - serial\) >= 0;", r"return static_cast<int32_t>(seen - serial) > 0;")),
-        # M4a: the slow-wait report (llama.cpp-42zj).
+        # With the SYCL watchdog off, a marker that never arrives is a silent spin unless the wait reports it, once.
         ("W7", "header", "a slow wait is reported on every pass", sub(r"if \(!told && m\.word->slow\) \{", r"if (m.word->slow) {")),
         ("W7", "header", "a slow wait is never reported",
          sub(r"\n\s*m\.word->slow\(\*m\.word, m\.serial, std::chrono::duration<double>\(now - since\)\.count\(\)\);", "")),
@@ -799,7 +888,8 @@ def self_test(s: dict[str, str]) -> int:
          sub(r"(cohort_id\s*= \"cpu_job_input_marker\";\n\s*)req\.intent\.constraints\.must_host_pinned = true;",
              r"\1req.intent.constraints.must_device = true;")),
         ("W7", "cache", "a teardown branch keeps the word", sub(end_call, "")),
-        # M1: the arm's mechanics (llama.cpp-42zj).
+        # Each of these lets a job pass on a marker that does not follow its inputs: a serial that does not advance, a
+        # word not zeroed before a job sees it, an out-of-order stream, or a marker on another queue or cache.
         ("W7", "cache", "every arm takes serial 1",
          sub(r"const uint32_t serial = cpu_job_input_marker_serial_ \+ 1;", r"const uint32_t serial = 1;")),
         ("W7", "cache", "the word is not zeroed", sub(r"\n\s*\*word->word\s*= 0;", "")),
@@ -815,7 +905,8 @@ def self_test(s: dict[str, str]) -> int:
              r"unified_cache * cache = get_existing_unified_cache_for_device(0);\n\1if (!cache) {\n\2*why")),
         ("W7", "cache", "the stream's cache is any cache of its device",
          sub(r"return cache && cache->get_queue\(\) == q \? cache : nullptr;", r"return cache;")),
-        # M3, M4a on the cache's side (llama.cpp-42zj).
+        # The cache's half of the drain and of the slow-wait report: the end waits out the readers, and the arm
+        # installs a reporter that only logs.
         ("W7", "cache", "the end sets the flag without draining the readers",
          sub(r"cpu_job_input_marker_abandon\(\*word\);", r"word->abandoned.store(true, std::memory_order_release);")),
         ("W7", "cache", "the slow-wait reporter is not installed",
@@ -827,6 +918,23 @@ def self_test(s: dict[str, str]) -> int:
          move(r"\n    \{\n\s*std::lock_guard<std::mutex> lock\(cpu_job_input_marker_mutex_\);\n"
               r"\s*cpu_job_input_marker_end\(cpu_job_input_marker_word_, cpu_job_input_marker_owner_\);\n    \}",
               r"\n\s*if \(!drain_all_queues_noexcept\(\)\) return false;")),
+        # Comments are blanked, so these anchor on code: an 8-space block is in a SYCL-gone branch, the first one in
+        # the branch for a runtime already shutting down; the normal branch's blocks are at 4 spaces.
+        ("W7", "cache", "the SYCL-gone branch's word end moves to the normal branch",
+         move(r"\n        \{\n\s*std::lock_guard<std::mutex> lock\(cpu_job_input_marker_mutex_\);\n"
+              r"\s*cpu_job_input_marker_end\(cpu_job_input_marker_word_, cpu_job_input_marker_owner_\);\n        \}",
+              r"\n    \{\n\s*std::lock_guard<std::mutex> lock\(cpu_job_input_marker_mutex_\);")),
+        ("W7", "cache", "the SYCL-gone branch ends the word before the ring",
+         sub(r"(\n        \{\n\s*std::lock_guard<std::mutex> lock\(cpu_job_signal_mutex_\);\n"
+             r"\s*cpu_job_signal_ring_end\([^;]*\);\n        \})(\s*)"
+             r"(\n        \{\n\s*std::lock_guard<std::mutex> lock\(cpu_job_input_marker_mutex_\);\n"
+             r"\s*cpu_job_input_marker_end\([^;]*\);\n        \})", r"\3\2\1")),
+        ("W7", "cache", "a shutdown branch releases the owner beside the other owners",
+         sub(r"(\n(        )staging_                          = nullptr;\n\s*staging_owner_\s*= \{\};)",
+             r"\1\n\2cpu_job_input_marker_owner_ = {};")),
+        ("W7", "cache_hpp", "inline code in the header releases the owner",
+         sub(r"(\n(\s*)mem_handle(\s+)cpu_job_input_marker_owner_;)",
+             r"\1\n\2void drop_cpu_job_input_marker_owner() { cpu_job_input_marker_owner_ = {}; }")),
         # W8: the signal ring's driver calls and the lock its job's signal takes (llama.cpp-42zj).
         ("W8", "cache", "the ring makes its event under mutex_",
          sub(re.escape("        sycl::event ev;\n        std::string failure;"),
@@ -848,8 +956,11 @@ def self_test(s: dict[str, str]) -> int:
         ("W8", "cache", "shutdown destroys under a driver call",
          sub(re.escape("if (outside_calls_ == 0) {"), "if (true) {")),
     ]
+
+
+def self_test(s: dict[str, str]) -> int:
     failures, caught = [], 0
-    for pin, key, name, mutate in mutants:
+    for pin, key, name, mutate in mutants():
         m = dict(s)
         m[key] = mutate(s[key])
         if m[key] == s[key]:

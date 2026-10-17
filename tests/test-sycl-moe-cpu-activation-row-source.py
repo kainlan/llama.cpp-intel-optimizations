@@ -947,7 +947,7 @@ def self_test(backend_src: str) -> int:
     # W1: the prologue zeroes before it waits the activation copy.
     expect_fail("prologue-zeroes-before-wait", sub(marker_wait, zero_span + marker_wait, in_lambda=False,
                                                    after=WAIT_INPUTS_DEF), None, "W1")
-    # W1 (I2(c) analogue): the prologue's wait gains a condition, so some jobs skip it.
+    # W1: the prologue's wait gains a condition, so some jobs read their inputs before they land.
     expect_fail("prologue-wait-conditional", sub(marker_wait, "    if (zero_bytes > 4096) {\n    " + marker_wait + "    }\n",
                                                  in_lambda=False, after=WAIT_INPUTS_DEF), None, "W1")
     # W1: the closure no longer runs the waits.
