@@ -24,8 +24,9 @@ The fix this gate pins:
   oneDNN does not check the return: it launched with a null scratch and faulted the B50. The decline keeps the op
   away from the allocator, whose own once-only warning then never fires, so the guard warns once itself, at WARN
   because a default-verbosity run drops INFO, and prints a debug line on every decline under
-  GGML_SYCL_FA_DISPATCH_DEBUG. The guard follows the F32 Q materialize, which allocates through the cache and so
-  creates it: placed earlier, it would decline a DIRECT op with an F32 Q whose own materialize would create it.
+  GGML_SYCL_FA_DISPATCH_DEBUG. The guard follows both materialize blocks, the K/V one and the F32 Q one. Each
+  allocates through the cache and so creates it, so a guard placed before either would decline an op whose own
+  materialize would have created the cache. The guard's comment claims both positions, so the gate pins both.
 
 This gate is about the dispatcher's wiring only. The planner's arithmetic is proved behaviourally by
 test-sycl-fattn-onednn-chunk (host C++), and the chunked execute's numerics and its scratch bound by
@@ -78,7 +79,10 @@ NO_CACHE_DECLINE = "return decline(\"no_unified_cache\"); }"
 NO_CACHE_REPORT_CHECK = (
     "the no-cache decline warns once at WARN, and prints a debug line on every decline under GGML_SYCL_FA_DISPATCH_DEBUG"
 )
-# The F32 Q materialize block, which allocates through the cache and so creates it for a DIRECT op.
+# The two materialize blocks, each of which allocates through the cache and so creates it. The guard's comment says
+# the guard follows both, so the gate pins both positions.
+KV_MATERIALIZE = "if (layout_plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED) {"
+KV_MATERIALIZE_CALL = "ggml_sycl_flash_attn_ext_onednn_materialize_kv("
 Q_F32_MATERIALIZE = "if (active_params.Q_type == GGML_TYPE_F32) {"
 Q_F32_MATERIALIZE_CALL = "ggml_sycl_flash_attn_ext_onednn_materialize_q_f32("
 # The whole guard block, which the self-test's drop and move mutants cut out.
@@ -144,6 +148,10 @@ def check(srcs):
         0 <= guard_pos < dispatch.find(PARTITION_CACHE_ACQUIRE) and guard_pos < loop_pos
         and guard.endswith(NO_CACHE_DECLINE))
     results[NO_CACHE_REPORT_CHECK] = NO_CACHE_WARN in guard and NO_CACHE_DEBUG in guard
+    kv_pos = dispatch.find(KV_MATERIALIZE)
+    kv_block = function_body(dispatch[kv_pos:], KV_MATERIALIZE) if kv_pos >= 0 else ""
+    results["the no-cache guard follows the K/V materialize, which creates the cache for a materialized op"] = (
+        KV_MATERIALIZE_CALL in kv_block and 0 <= kv_pos + len(kv_block) <= guard_pos)
     q_pos = dispatch.find(Q_F32_MATERIALIZE)
     q_block = function_body(dispatch[q_pos:], Q_F32_MATERIALIZE) if q_pos >= 0 else ""
     results["the no-cache guard follows the F32 Q materialize, which creates the cache for a DIRECT op"] = (
@@ -291,8 +299,10 @@ if args.self_test:
          "static std::atomic<bool> warned{ false };", "std::atomic<bool> warned{ false };"),
         (NO_CACHE_REPORT_CHECK, "onednn",
          NO_CACHE_DEBUG, ""),
-        # The guard moved to just before the F32 Q materialize: it still precedes every compile and execute, so
-        # only the placement check sees it.
+        # The guard moved to just before the K/V materialize, and to just before the F32 Q materialize. Either way it
+        # still precedes every compile and execute, so only the placement checks see it.
+        ("the no-cache guard follows the K/V materialize, which creates the cache for a materialized op", "onednn",
+         NO_CACHE_GUARD, "", KV_MATERIALIZE, NO_CACHE_GUARD + " " + KV_MATERIALIZE),
         ("the no-cache guard follows the F32 Q materialize, which creates the cache for a DIRECT op", "onednn",
          NO_CACHE_GUARD, "", Q_F32_MATERIALIZE, NO_CACHE_GUARD + " " + Q_F32_MATERIALIZE),
     ]
