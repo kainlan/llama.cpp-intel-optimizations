@@ -10,8 +10,13 @@
 // whole run: past it, every ring is signalled and the test fails, so a regression parks nothing past the deadline.
 // Nothing here queries the status of a parked command (on a profiling queue the driver busy-waits such a query);
 // whether a command ran is read from the host memory it writes.
+//
+// A retained-handle record published while a ring holds a job's gate carries that gate, with no scope and whether or
+// not its own event stands behind the job, and the drain worker holds the record's handles until the gate opens
+// (llama.cpp-42zj).
 
 #include "cpu-expert-pool.hpp"
+#include "mem-handle.hpp"
 #include "unified-cache.hpp"
 
 #include <sys/resource.h>
@@ -24,10 +29,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <future>
 #include <stdexcept>
 #include <string>
 #include <sycl/sycl.hpp>
 #include <thread>
+#include <vector>
 
 using ggml_sycl::cpu_job_signal;
 using ggml_sycl::cpu_job_signal_mark;
@@ -220,6 +227,84 @@ static void case_unwaited_stream_keeps_its_entries(sycl::queue & q1, sycl::queue
     ggml_sycl::cpu_job_signal_ring_shutdown_for_testing(r2);
 }
 
+// --- retained-handle records take the rings' gates (llama.cpp-42zj) ----------------------------------------------
+
+static std::atomic<int> g_records_released{ 0 };
+
+static ggml_sycl::release_attempt count_record_release(const ggml_sycl::alloc_metadata &, void *) noexcept {
+    g_records_released.fetch_add(1);
+    return { ggml_sycl::release_attempt_status::RELEASED };
+}
+
+// An owner handle over a fresh owner control with an injected release in place of a physical free, so "released"
+// below is the owner's last reference going.
+static ggml_sycl::mem_handle make_record_owner(size_t size) {
+    static std::vector<std::vector<unsigned char>> backing;
+    static uint64_t                                next_id = 4200;
+    backing.emplace_back(size);
+    const uint64_t            id = next_id++;
+    ggml_sycl::alloc_metadata metadata{};
+    metadata.ptr      = backing.back().data();
+    metadata.size     = size;
+    metadata.device   = 0;
+    metadata.id       = id;
+    metadata.alloc_id = id;
+    metadata.epoch_id = 1;
+    metadata.tier     = ggml_sycl::alloc_tier::HOST_PINNED;
+    auto fixture      = ggml_sycl::allocation_owner_test_create(metadata, count_record_release, nullptr);
+    if (!fixture.result) {
+        return ggml_sycl::mem_handle{};
+    }
+    return ggml_sycl::mem_handle::from_owned_alloc(std::move(fixture.result.owner));
+}
+
+// The record's event is complete, as a device command's is once it ran, and stands behind no job: a worker that waited
+// the event alone would release the handle at once. This one must hold it until the ring's gate opens.
+static void case_record_carries_ring_gates(sycl::queue & q) {
+    std::shared_ptr<cpu_job_signal_ring> ring = ggml_sycl::cpu_job_signal_ring_create_for_testing(q);
+    if (!ring) {
+        expect("a ring is made for the record-gates case", false);
+        return;
+    }
+    cpu_job_signal     job;
+    cpu_job_signal_ref ref;
+    expect("acquire for the record-gates case", ggml_sycl::cpu_job_signal_acquire_for_testing(ring, &job, &ref));
+    cpu_job_signal_mark mark;
+    sycl::event         gate_event;
+    expect("wrap for the record-gates case", ggml_sycl::cpu_job_signal_wrap(ref, mark, &gate_event));
+
+    // Control: with no gate outstanding, a published record is released as soon as the worker reaches it.
+    const int released = g_records_released.load();
+    {
+        ggml_sycl::mem_handle owner = make_record_owner(256);
+        expect("an owner is made for the control record", static_cast<bool>(owner));
+        ggml_sycl::retain_handles_until_event({ owner }, sycl::event{});
+    }
+    expect("with no gate outstanding the worker finishes the record",
+           ggml_sycl::drain_retained_handles(true, 10000) && g_records_released.load() - released == 1);
+
+    std::promise<void> job_done;
+    ggml_sycl::cpu_job_signal_gate_push(mark, job_done.get_future().share());
+    expect("the snapshot holds the ring's one gate", ggml_sycl::cpu_job_signal_gates_outstanding().size() == 1);
+    {
+        ggml_sycl::mem_handle owner = make_record_owner(256);
+        expect("an owner is made for the gated record", static_cast<bool>(owner));
+        ggml_sycl::retain_handles_until_event({ owner }, sycl::event{});
+    }
+    // A bound on a wait for an outcome, not an ordering: the record's event is complete.
+    expect("the worker does not finish a record while a ring's gate is shut",
+           !ggml_sycl::drain_retained_handles(true, 500));
+    expect("the record's handle is held while the gate is shut", g_records_released.load() - released == 1);
+    job_done.set_value();
+    expect("the worker finishes the record once the gate opens",
+           ggml_sycl::drain_retained_handles(true, 10000) && g_records_released.load() - released == 2);
+
+    job.signal();
+    ggml_sycl::cpu_job_signal_recycle(mark);
+    expect("the recycle clears the ring's gate", ggml_sycl::cpu_job_signal_gates_outstanding().empty());
+    ggml_sycl::cpu_job_signal_ring_shutdown_for_testing(ring);
+}
+
 // --- child arms: a throw on the thread that holds the job half ---------------------------------------------------
 
 static int * g_child_flag = nullptr;
@@ -352,6 +437,7 @@ int main(int argc, char ** argv) {
     case_abandoned_job_half(q1, flag1);
     case_signal_all(q1, flag1);
     case_unwaited_stream_keeps_its_entries(q1, q2, flag1, flag2);
+    case_record_carries_ring_gates(q1);
     case_throwing_job("/proc/self/exe");
 
     sycl::free(flag1, q1);

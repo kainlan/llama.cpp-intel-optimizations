@@ -9,7 +9,8 @@
 //
 // The gate list (llama.cpp-qwn5) is the jobs' futures, which a host wait on the device sleeps on first. Its cases
 // check that a waiter sleeps rather than spins, that it holds no lock a producer needs while it sleeps, that a job
-// that failed or was destroyed unrun still lets it go, and which gates a wait and a clear cover.
+// that failed or was destroyed unrun still lets it go, and which gates a wait and a clear cover. The copy a
+// retained-handle record takes (append_outstanding, llama.cpp-42zj) waits on none and keeps every gate.
 //
 // ggml-sycl/cpu-job-signal.hpp includes only the standard library, so this test links nothing and opens no device.
 
@@ -390,7 +391,36 @@ static void test_gate_cover() {
     expect_eq("clear empties the list", gates.size(), 0);
 }
 
-// Past max_gates a push drops the oldest gate, never the new one.
+// append_outstanding copies every gate onto what *out already holds, in push order, waits on none and keeps the list as
+// it was; an empty list appends nothing and so allocates nothing, and a cleared gate is not copied (llama.cpp-42zj).
+static void test_gate_append() {
+    cpu_job_gate_list                     gates;
+    std::vector<std::shared_future<void>> out;
+    gates.append_outstanding(&out);
+    expect_eq("an empty list appends nothing", out.size(), 0);
+    expect_eq("and allocates nothing", out.capacity(), 0);
+    std::promise<void> first;
+    std::promise<void> second;
+    const uint64_t     s1 = gates.push(first.get_future().share());
+    gates.push(second.get_future().share());
+    out.push_back(ready_gate());
+    expect_returns_within(
+        "append_outstanding does not wait a shut gate", [&] { gates.append_outstanding(&out); }, 2000);
+    expect_eq("every gate is appended after what *out held", out.size(), 3);
+    expect_eq("and the list keeps them", gates.size(), 2);
+    first.set_value();
+    expect_true("the gates are appended in push order",
+                out.size() == 3 && out[1].wait_for(std::chrono::seconds(0)) == std::future_status::ready &&
+                    out[2].wait_for(std::chrono::seconds(0)) != std::future_status::ready);
+    second.set_value();
+    gates.clear_upto(s1);
+    out.clear();
+    gates.append_outstanding(&out);
+    expect_eq("a cleared gate is not appended", out.size(), 1);
+}
+
+// Past max_gates a push drops the oldest gate, never the new one. The ring never lets it come to that (a gate per
+// entry in use, and max_gates is at least a ring's entries); the drop only bounds a list that stops clearing.
 static void test_gate_cap() {
     cpu_job_gate_list gates;
     const size_t      n = cpu_job_gate_list::max_gates + 3;
@@ -419,6 +449,7 @@ int main() {
     test_gate_sleeps();
     test_gate_failed_job();
     test_gate_cover();
+    test_gate_append();
     test_gate_cap();
     if (g_failures != 0) {
         std::printf("test-sycl-cpu-job-signal-book: %d failure(s)\n", g_failures);
