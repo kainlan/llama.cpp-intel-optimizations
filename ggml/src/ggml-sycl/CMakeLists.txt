@@ -5836,6 +5836,15 @@ if (NOT GGML_BACKEND_DL AND GGML_SYCL_DNNL)
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
     )
+    # llama.cpp-jwjz: the same cases with the DIRECT Graph-scratch cap at 1 MiB, so the dispatcher splits
+    # the production-scale ops into query-row chunks; plus two cases whose last chunk is shorter.
+    add_test(NAME test-sycl-fattn-onednn-descriptors-chunked COMMAND test-sycl-fattn-onednn-descriptors --chunked)
+    set_tests_properties(test-sycl-fattn-onednn-descriptors-chunked PROPERTIES
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        LABELS "sycl;gpu;onednn;fattn;descriptors"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+    )
 endif()
 
 if (NOT GGML_BACKEND_DL)

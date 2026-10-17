@@ -1,4 +1,5 @@
 #include "ggml-backend-impl.h"
+#include "ggml-sycl/fattn-onednn-chunk.hpp"
 #include "ggml-sycl/fattn-onednn.hpp"
 #include "sycl-selector-fallback.hpp"
 #include "test-skip.h"
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -361,7 +363,27 @@ static bool run_case(ggml_backend_sycl_context & ctx, const case_shape & sh) {
     return true;
 }
 
-static int run_descriptor_tests() {
+// llama.cpp-jwjz: the --chunked mode lowers the DIRECT Graph-scratch cap to 1 MiB, so the dispatcher's
+// per-execute budget (half the cap) is 512 KiB and the production-scale cases split their query rows into
+// several executes. Same CPU reference, same tolerance: a chunk that read or wrote the wrong rows fails here.
+static constexpr const char * kChunkedCapMiB = "1";
+static constexpr size_t       kChunkedBudget = 512ull * 1024ull;
+
+// Positive control for --chunked: the planner the dispatcher calls must split this shape, or the mode's
+// green proves nothing about chunking. `want_ragged` also requires a last chunk shorter than the others,
+// so the second compiled partition is exercised.
+static bool expect_split(const char * name, int H_q, int n_q, int n_kv, bool want_ragged) {
+    const ggml_sycl::onednn_fa_row_chunks p =
+        ggml_sycl::onednn_fa_plan_row_chunks(n_q, n_kv, H_q, sizeof(sycl::half), kChunkedBudget);
+    std::printf("%s chunks=%lld rows=%lld tail=%lld\n", name, (long long) p.n_chunks, (long long) p.rows,
+                (long long) p.tail_rows);
+    TEST_ASSERT(p.n_chunks >= 2, (std::string(name) + " is not split at the --chunked budget").c_str());
+    TEST_ASSERT(!want_ragged || p.tail_rows != p.rows,
+                (std::string(name) + " has no shorter last chunk at the --chunked budget").c_str());
+    return true;
+}
+
+static int run_descriptor_tests(bool chunked) {
     // Keep progress/final markers deterministic even when CTest redirects output.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -374,6 +396,15 @@ static int run_descriptor_tests() {
         return 1;
     }
     std::printf("Bounded runtime: VRAM arena disabled, pinned chunks capped at 16 MiB\n");
+    // Before the backend exists: the cap is read once per process.
+    if (chunked) {
+        if (setenv("GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB", kChunkedCapMiB, 1) != 0) {
+            std::fprintf(stderr, "FAIL: could not set the --chunked DIRECT cap\n");
+            return 1;
+        }
+        std::printf("Chunked: DIRECT Graph-scratch cap %s MiB, per-execute budget %zu KiB\n", kChunkedCapMiB,
+                    kChunkedBudget / 1024);
+    }
 
     std::vector<sycl::device> gpus;
     try {
@@ -450,6 +481,16 @@ static int run_descriptor_tests() {
         // in tests/test-sycl-fattn-onednn-gates.cpp.
         ok &= run_case(ctx, { "GQA-prod-dense", 32, 8, 128, 16, 256, 128, 128, 240, fill_profile::PRODUCTION });
         ok &= run_case(ctx, { "GQA-prod-strided", 32, 8, 128, 16, 256, 131, 133, 240, fill_profile::PRODUCTION });
+
+        if (chunked) {
+            // The two production cases above split into two executes of 8 rows at this budget. The two
+            // below add a last chunk shorter than the rest, on the GQA (5-D) and the MHA (4-D) layouts.
+            ok &= expect_split("GQA-prod-dense", 32, 16, 256, false);
+            ok &= expect_split("GQA-prod-ragged", 32, 37, 256, true);
+            ok &= run_case(ctx, { "GQA-prod-ragged", 32, 8, 128, 37, 256, 128, 128, 219, fill_profile::PRODUCTION });
+            ok &= expect_split("MHA-prod-ragged", 8, 46, 512, true);
+            ok &= run_case(ctx, { "MHA-prod-ragged", 8, 8, 64, 46, 512, 64, 64, 466, fill_profile::PRODUCTION });
+        }
         ctx.stream()->wait_and_throw();
     } catch (const sycl::exception & e) {
         std::fprintf(stderr, "FAIL: SYCL exception: %s\n", e.what());
@@ -462,8 +503,10 @@ static int run_descriptor_tests() {
     return ok ? 0 : 1;
 }
 
-int main(int, char ** argv) {
+int main(int argc, char ** argv) {
     sycl_test_selector_fallback(argv, "level_zero:0");
+
+    const bool chunked = argc > 1 && std::strcmp(argv[1], "--chunked") == 0;
 
     // Run SYCL in a fresh child so waitpid gives an unambiguous mutation proof:
     // the numerical failure must be WIFEXITED with status 1, never a signal.
@@ -476,7 +519,7 @@ int main(int, char ** argv) {
         // Return normally from main after run_descriptor_tests has destroyed
         // its backend owner. This also exercises child static/TLS/atexit
         // teardown; _exit would hide failures in exactly that lifetime tail.
-        return run_descriptor_tests();
+        return run_descriptor_tests(chunked);
     }
 
     int status = 0;

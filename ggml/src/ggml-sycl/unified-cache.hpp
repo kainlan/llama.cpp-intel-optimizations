@@ -4409,6 +4409,13 @@ class unified_cache {
     // already finished. Zero if the allocator was never used this process.
     size_t onednn_graph_scratch_high_water_bytes() const { return onednn_graph_scratch_high_water_bytes_; }
 
+    // llama.cpp-jwjz: the cap on outstanding DIRECT Graph-scratch bytes that
+    // onednn_graph_scratch_alloc() enforces for this cache, read the same way
+    // the allocator reads it. The oneDNN SDPA dispatcher sizes its query-row
+    // chunks to half of it (fattn-onednn-chunk.hpp), so a full chunk's buffer
+    // and the last chunk's buffer fit under it together.
+    size_t onednn_graph_scratch_direct_cap() const;
+
     // llama.cpp-0oxf: how many times the DIRECT Graph-scratch path had to
     // wait for headroom to free up under the cap before it was allowed to
     // allocate -- polling until one of three exit conditions is met: a
@@ -8249,6 +8256,13 @@ void unified_cache_dump_note_armed(bool armed) noexcept;
 // Draws the oneDNN Graph allocator callback has made and not yet freed, process-wide. The SDPA compile
 // brackets it so a draw that outlives compile() is counted (onednn_graph_compile_live_draws).
 int64_t unified_cache_onednn_graph_live_draws() noexcept;
+
+#if GGML_SYCL_DNNL
+// llama.cpp-jwjz: unified_cache::onednn_graph_scratch_direct_cap() for the cache the oneDNN Graph
+// allocator callback resolves for `device_id`. A device with no cache yet reports the allocator's
+// unplanned default.
+size_t unified_cache_onednn_graph_scratch_direct_cap_bytes(int device_id);
+#endif
 
 // === G0 report lines (GGML_SYCL_COUNTER_DUMP=1) ===
 //

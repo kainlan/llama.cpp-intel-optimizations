@@ -13264,6 +13264,18 @@ static size_t onednn_graph_scratch_direct_cap_bytes(size_t plan_time_available_b
     return std::min(kOneGiB, plan_time_available_bytes / 4);
 }
 
+size_t unified_cache::onednn_graph_scratch_direct_cap() const {
+    return onednn_graph_scratch_direct_cap_bytes(
+        onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire));
+}
+
+size_t unified_cache_onednn_graph_scratch_direct_cap_bytes(int device_id) {
+    // The same cache lookup onednn_graph_sycl_malloc() makes, so the bound matches the allocator that
+    // serves the request.
+    const unified_cache * cache = get_existing_unified_cache_for_device(device_id);
+    return cache ? cache->onednn_graph_scratch_direct_cap() : onednn_graph_scratch_direct_cap_bytes(0);
+}
+
 static constexpr uint32_t kOnednnGraphDirectFailureDrainTimeoutMs = 2000;
 static constexpr uint32_t kOnednnGraphDirectWaitPollTimeoutMs     = 200;
 // llama.cpp-me60: this 5 s budget is measured from wait_loop_entry,

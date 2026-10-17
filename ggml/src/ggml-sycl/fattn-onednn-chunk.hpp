@@ -61,18 +61,32 @@ inline onednn_fa_row_chunks onednn_fa_plan_row_chunks(int64_t ncols,
                                                       int64_t H_q,
                                                       size_t  q_elem_size,
                                                       size_t  budget_bytes) {
-    (void) ne11;
-    (void) H_q;
-    (void) q_elem_size;
-    (void) budget_bytes;
     onednn_fa_row_chunks plan;
     if (ncols <= 0) {
         return plan;
     }
-    // Not yet bounded: one execute over every query row, which is what the dispatcher does today.
     plan.rows      = ncols;
     plan.n_chunks  = 1;
     plan.tail_rows = ncols;
+
+    const uint64_t per_row = onednn_fa_graph_scratch_bytes(H_q, 1, ne11, q_elem_size);
+    if (budget_bytes == 0 || per_row == 0 || per_row * static_cast<uint64_t>(ncols) <= budget_bytes) {
+        return plan;
+    }
+
+    int64_t rows_max = static_cast<int64_t>(budget_bytes / per_row);
+    if (rows_max < 1) {
+        rows_max = 1;
+    }
+    // The fewest chunks that fit, then the most even row count for that many chunks. Recounting the
+    // chunks from the evened rows keeps the last chunk in (0, rows].
+    int64_t       n_chunks = (ncols + rows_max - 1) / rows_max;
+    const int64_t rows     = (ncols + n_chunks - 1) / n_chunks;
+    n_chunks               = (ncols + rows - 1) / rows;
+
+    plan.rows      = rows;
+    plan.n_chunks  = n_chunks;
+    plan.tail_rows = ncols - (n_chunks - 1) * rows;
     return plan;
 }
 
