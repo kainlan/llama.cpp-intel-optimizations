@@ -29,7 +29,8 @@ override switch and pick_kernel_for_layout all ask. The head comes from one clas
 (ggml_sycl_weight_is_output_head). The arm converts from the layout the weight is loaded in and refuses by name a
 layout it has no converter for; the converter table answers nullptr for a (type, layout) pair it cannot decode
 (llama.cpp-pzu9), and the router asks it. The router also keeps on MMQ an op that asks for F32 accumulation and a
-weight in a row-split buffer: either would take the arm's fp32 branch, whose f32 weight copy no plan reserves. The
+weight in a row-split buffer: either would take the arm's fp32 branch, whose f32 weight copy no plan reserves. A
+weight in a tensor-parallel buffer is refused with the row-split one, as the BF16 route refuses both. The
 selector's node parameter has no default, so a caller cannot drop the node without a compile error. Case 14l proves
 the list, the claim and the plan arithmetic.
 
@@ -73,7 +74,7 @@ WALK_SOA = ("ggml_sycl_select_preferred_kernel's priority walk: ONEDNN_SOA admit
             "beside the Q8_0 term")
 OVERRIDE_SOA = "ggml_sycl_select_preferred_kernel's override switch: ONEDNN_SOA accepts the same op"
 PICK_SOA = "UnifiedMatmulOrchestrator::select's pick_kernel_for_layout: the SOA case answers ONEDNN_SOA for the same op"
-SPLIT = "the router helper refuses a weight in a row-split buffer"
+SPLIT = "the router helper refuses a weight in a row-split or a tensor-parallel buffer"
 NODE_REQUIRED = "the selector's node parameter has no default, so a call that forgets it does not compile"
 
 
@@ -234,9 +235,11 @@ def check(srcs):
     results["the router helper refuses an op that asks for F32 accumulation, and a call without the op"] = (
         nows("if (!dst || dst->op_params[0] != GGML_PREC_DEFAULT) {") in nows(serves))
     # The f16 branch also needs every row of the weight: a row-split weight hands each device a slice, which takes the
-    # same fp32 branch. The split predicate dereferences the buffer, so the term asks for one first.
-    results[SPLIT] = (
-        nows("if (src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer)) { return false; }") in nows(serves))
+    # same fp32 branch. A tensor-parallel weight is refused with it, as the BF16 route refuses both. The split
+    # predicate dereferences the buffer, so the term asks for one first.
+    results[SPLIT] = nows(
+        "if (src0->buffer && (ggml_backend_buffer_is_sycl_split(src0->buffer) || "
+        "ggml_backend_buffer_is_sycl_tp(src0->buffer))) { return false; }") in nows(serves)
     results["the router helper exists only in a build with the f16 dequant arm"] = (
         nows(serves).startswith(nows("{ #if GGML_SYCL_DEQUANT_F16_ARM")))
     results[WALK_MMQ] = (
@@ -440,7 +443,11 @@ if args.self_test:
         ("the router helper refuses an op that asks for F32 accumulation, and a call without the op", "backend",
          "if (!dst || dst->op_params[0] != GGML_PREC_DEFAULT) {", "if (!dst) {"),
         (SPLIT, "backend",
-         "if (src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer)) { return false; }", ""),
+         "(ggml_backend_buffer_is_sycl_split(src0->buffer) || ggml_backend_buffer_is_sycl_tp(src0->buffer))",
+         "ggml_backend_buffer_is_sycl_tp(src0->buffer)"),
+        (SPLIT, "backend",
+         "(ggml_backend_buffer_is_sycl_split(src0->buffer) || ggml_backend_buffer_is_sycl_tp(src0->buffer))",
+         "ggml_backend_buffer_is_sycl_split(src0->buffer)"),
         ("the router helper exists only in a build with the f16 dequant arm", "backend",
          "#if GGML_SYCL_DEQUANT_F16_ARM if (!src0 || !src1 ||", "if (!src0 || !src1 ||"),
         (WALK_MMQ, "backend",

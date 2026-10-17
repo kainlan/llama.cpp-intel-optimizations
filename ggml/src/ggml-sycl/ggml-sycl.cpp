@@ -31426,6 +31426,7 @@ static bool ggml_sycl_onednn_pp_candidate(
 }
 
 static bool ggml_backend_buffer_is_sycl_split(ggml_backend_buffer_t buffer);  // defined with the split buffer type
+static bool ggml_backend_buffer_is_sycl_tp(ggml_backend_buffer_t buffer);     // defined with the TP buffer type
 
 // llama.cpp-h9c8: whether the oneDNN f16 dequant arm is this op's PP route when its weight is materialized in
 // `layout`, for the MMQ types dense_pp_route_prefers_f16_dequant_arm lists. The priority walk's MMQ_AOS and
@@ -31437,7 +31438,9 @@ static bool ggml_backend_buffer_is_sycl_split(ggml_backend_buffer_t buffer);  //
 //     under SQRT_SOFTPLUS gating (llama-graph.cpp). A call that does not name the op cannot be answered and keeps
 //     MMQ too;
 //   - every row of the weight: the f16 branch converts the whole weight, and a weight in a row-split buffer hands
-//     each device a slice, which would take the fp32 branch's unplanned f32 copy. It keeps MMQ, which runs a slice;
+//     each device a slice, which would take the fp32 branch's unplanned f32 copy. It keeps MMQ, which runs a slice.
+//     A weight in a tensor-parallel buffer is refused with it, as the BF16 route refuses both: whether one reaches
+//     the arm with fewer rows is not established, and MMQ is the route it had;
 //   - the claim the zone planner asks (the head by the same classifier, the expert role, a 2-D weight, a type the
 //     router can dequantize), so the weight sent to the arm is a weight the plan reserved the buffers for;
 //   - a converter for `layout`: convert.cpp answers nullptr for a (type, layout) pair it cannot decode;
@@ -31455,7 +31458,8 @@ static bool ggml_sycl_dense_f16_arm_serves_pp(const ggml_tensor * src0,
     if (!dst || dst->op_params[0] != GGML_PREC_DEFAULT) {
         return false;
     }
-    if (src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer)) {
+    if (src0->buffer &&
+        (ggml_backend_buffer_is_sycl_split(src0->buffer) || ggml_backend_buffer_is_sycl_tp(src0->buffer))) {
         return false;
     }
     const bool quantized = ggml_is_quantized(src0->type);
@@ -50446,7 +50450,7 @@ static void ggml_sycl_dequant_f16_from_loaded_layout(ggml_backend_sycl_context &
     // no resolved layout the orchestrator enforces none, and ggml_sycl_can_use_layout_for_kernel accepts any layout
     // for an evictable weight in a host buffer, so the walk may have chosen ONEDNN_SOA. This arm follows the
     // resolver: a resolved layout it has no converter for is refused by name below, and an unresolved one is read
-    // as AOS, so that case rests on the op handing over the plain buffer.
+    // as AOS, so that case rests on the op handing over the plain buffer (llama.cpp-imwa: refuse it by name instead).
     const layout_mode             layout = loaded ? loaded.layout : GGML_LAYOUT_AOS;
 
     // Every refusal names the weight, its type and its loaded layout, then fails the op.
