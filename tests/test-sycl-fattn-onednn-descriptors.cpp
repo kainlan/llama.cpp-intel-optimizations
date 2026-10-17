@@ -383,6 +383,34 @@ static bool expect_split(const char * name, int H_q, int n_q, int n_kv, bool wan
     return true;
 }
 
+// expect_split() proves only that the PLANNER splits at kChunkedBudget. The dispatcher takes its budget
+// from the allocator's cap, so pin that the two agree: otherwise the cases run at some other budget and
+// the planner check describes nothing that executed.
+static bool expect_dispatch_budget(int device) {
+    const size_t budget = ggml_sycl::unified_cache_onednn_graph_scratch_direct_cap_bytes(device) / 2;
+    std::printf("dispatch budget=%zu KiB (half the DIRECT cap)\n", budget / 1024);
+    TEST_ASSERT(budget == kChunkedBudget, "the dispatcher's per-execute budget is not the --chunked budget");
+    return true;
+}
+
+// An unsplit dispatcher still passes the numerics: a request above the cap takes the allocator's
+// oversized early-out, is allocated anyway, executes and matches the CPU reference. What it cannot hide
+// is the live Graph scratch. With every execute within the budget, at most two buffers are live together
+// (a chunk's and the shorter last chunk's), so the high water stays within twice the budget. Unsplit, the
+// ragged cases ask for 1.73 MiB and 1.08 MiB in one request each.
+static bool expect_bounded_high_water(int device) {
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+    TEST_ASSERT(cache != nullptr, "no unified cache for the test device");
+    const size_t high_water = cache->onednn_graph_scratch_high_water_bytes();
+    std::printf("Graph-scratch high water=%zu KiB (bound %zu KiB)\n", high_water / 1024, 2 * kChunkedBudget / 1024);
+    // Positive control: zero would mean the cases never reached the Graph allocator, and the bound below
+    // would hold vacuously.
+    TEST_ASSERT(high_water > 0, "the oneDNN Graph allocator served no scratch, so the bound proves nothing");
+    TEST_ASSERT(high_water <= 2 * kChunkedBudget,
+                "the Graph-scratch high water exceeds two chunk budgets: some execute was not chunked");
+    return true;
+}
+
 static int run_descriptor_tests(bool chunked) {
     // Keep progress/final markers deterministic even when CTest redirects output.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -490,8 +518,12 @@ static int run_descriptor_tests(bool chunked) {
             ok &= run_case(ctx, { "GQA-prod-ragged", 32, 8, 128, 37, 256, 128, 128, 219, fill_profile::PRODUCTION });
             ok &= expect_split("MHA-prod-ragged", 8, 46, 512, true);
             ok &= run_case(ctx, { "MHA-prod-ragged", 8, 8, 64, 46, 512, 64, 64, 466, fill_profile::PRODUCTION });
+            ok &= expect_dispatch_budget(ctx.device);
         }
         ctx.stream()->wait_and_throw();
+        if (chunked) {
+            ok &= expect_bounded_high_water(ctx.device);
+        }
     } catch (const sycl::exception & e) {
         std::fprintf(stderr, "FAIL: SYCL exception: %s\n", e.what());
         ok = false;
