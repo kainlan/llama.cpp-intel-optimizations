@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
@@ -524,6 +525,13 @@ class mem_handle {
     // Never a release decision: release happens only through a handle.
     uint32_t owner_use_count() const noexcept;
 
+    // Copies the retained allocation owner's metadata into *out and answers
+    // true: tier, device, host zone, role and category as the allocator fixed
+    // them, which is the allocation's provenance, never something read off the
+    // pointer. Answers false and leaves *out alone when the handle retains no
+    // owner (from_direct, from_chunk_ptr).
+    bool owner_metadata(alloc_metadata * out) const;
+
     // Identity of the allocation owner control this handle retains: the one
     // from_owned_alloc() adopted, shared by every copy and slice of it. It is
     // minted once per control and never reused, so it cannot name a later
@@ -907,6 +915,47 @@ void retain_handles_until_event(std::vector<mem_handle> handles, sycl::event eve
 // caller can drain the exact submission queue before releasing its owners.
 void retain_handles_until_event_transactional(std::vector<mem_handle> handles, sycl::event event,
                                               retained_handle_publish_ticket & ticket);
+
+// While a scope is open, every record this thread publishes for event retention also carries `gates`: the futures of
+// the CPU expert jobs whose own device events the record's work waits behind (llama.cpp-qwn5). The drain worker sleeps
+// on each gate before it waits the record's event, so its wait in the driver covers only the device work after the
+// jobs, not the jobs' whole length; a record without gates is waited as before. A gate decides only how the worker
+// waits: the event wait after it is what releases the handles. wait() on a gate returns once the job's promise holds a
+// value or an exception, a broken promise included; the worker never calls get() on one. A job whose pool worker
+// was detached (CpuExpertPool::stop_workers) may never end, and its gate never opens; the device command parked on
+// that job's event does not end either. The scope is the current thread's because it names that thread's
+// publications only: the flush that opens it publishes on its own thread. Scopes nest; `gates` must outlive the scope
+// and stay unchanged while it is open.
+class retained_handle_gate_scope {
+  public:
+    explicit retained_handle_gate_scope(const std::vector<std::shared_future<void>> & gates) noexcept;
+    // The scope keeps a pointer to `gates`, which a temporary would leave dangling.
+    retained_handle_gate_scope(const std::vector<std::shared_future<void>> &&) = delete;
+    ~retained_handle_gate_scope() noexcept;
+
+    retained_handle_gate_scope(const retained_handle_gate_scope &)             = delete;
+    retained_handle_gate_scope & operator=(const retained_handle_gate_scope &) = delete;
+
+  private:
+    const std::vector<std::shared_future<void>> * saved_;
+};
+
+// The drain worker's waits since the last take (llama.cpp-qwn5), for the hybrid MoE decode trace's per-token waits
+// line: the records it waited, the gates those records carried, its time asleep on the gates and its time in the
+// record events' waits after them.
+struct retained_handle_drain_census {
+    uint64_t records       = 0;
+    uint64_t gate_waits    = 0;
+    double   gate_sleep_us = 0.0;
+    double   driver_us     = 0.0;
+};
+
+// Starts the census. The trace (GGML_SYCL_MOE_IDS_COPY_TRACE) calls it once when it is on; until then the drain worker
+// reads no clock.
+void retained_handle_drain_census_enable() noexcept;
+
+// The census since the last take, which it zeroes.
+retained_handle_drain_census retained_handle_drain_census_take() noexcept;
 
 // Central resolve-to-submit handoff. Copies any authority carried by resolved
 // fallback pointers, appends explicit owners (scratch/staging), and publishes

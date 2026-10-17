@@ -296,7 +296,8 @@ static void pool_trace_record_job(size_t                                        
 std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task>                        tasks,
                                               std::function<void()>                               prologue,
                                               std::function<void(std::vector<cpu_expert_task> &)> resolve,
-                                              cpu_expert_job_trace *                              job_trace) {
+                                              cpu_expert_job_trace *                              job_trace,
+                                              cpu_job_signal                                      device_signal) {
     auto promise = std::make_shared<std::promise<void>>();
     auto future  = promise->get_future();
 
@@ -315,6 +316,13 @@ std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task>      
         }
     }
 
+    // std::function needs a copyable callable, and the job half is move-only. A job destroyed unrun signals through
+    // this box's destructor.
+    std::shared_ptr<cpu_job_signal> signal_box;
+    if (device_signal) {
+        signal_box = std::make_shared<cpu_job_signal>(std::move(device_signal));
+    }
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         // Move the tasks vector into the lambda so that storage is owned
@@ -329,35 +337,65 @@ std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task>      
         // covers the kernel only. resolve, after the prologue, builds the tasks of a job
         // submitted before they were known (llama.cpp-7pvo).
         // The prologue stamps the job's inputs-ready time through g_pool_current_job.
+        // The job's device event is signalled after the kernel, ahead of the trace bookkeeping and the promise
+        // (llama.cpp-qwn5). The two handlers rethrow everything; see `device_signal` in the header for why they exist.
         work_queue_.push([this, tasks = std::move(tasks), prologue = std::move(prologue), resolve = std::move(resolve),
-                          promise, trace, t_submit, stamps = std::move(stamps)]() mutable {
-            const pool_trace_clock::time_point t_start = trace ? pool_trace_clock::now() : t_submit;
-            if (stamps) {
-                g_pool_current_job = stamps.get();
-            }
-            if (prologue) {
-                prologue();
-            }
-            if (stamps) {
-                g_pool_current_job = nullptr;
-                if (stamps->t_inputs_ready_ns == 0) {
-                    // No prologue input wait: the inputs were ready when the worker picked the job up.
-                    stamps->t_inputs_ready_ns = pool_trace_ns(t_start);
+                          promise, trace, t_submit, signal_box, stamps = std::move(stamps)]() mutable {
+            try {
+                // A local of this try block, so a throw destroys it, and it signals, on the way to the handlers.
+                cpu_job_signal job_signal;
+                if (signal_box) {
+                    job_signal = std::move(*signal_box);
                 }
+                const pool_trace_clock::time_point t_start = trace ? pool_trace_clock::now() : t_submit;
+                if (stamps) {
+                    g_pool_current_job = stamps.get();
+                }
+                if (prologue) {
+                    prologue();
+                }
+                if (stamps) {
+                    g_pool_current_job = nullptr;
+                    if (stamps->t_inputs_ready_ns == 0) {
+                        // No prologue input wait: the inputs were ready when the worker picked the job up.
+                        stamps->t_inputs_ready_ns = pool_trace_ns(t_start);
+                    }
+                }
+                if (resolve) {
+                    resolve(tasks);
+                }
+                cpu_expert_pool_overlap_ticket ticket;
+                if (trace) {
+                    ticket = cpu_expert_pool_overlap_begin(g_pool_trace_overlap);
+                }
+                ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()), row_workers_);
+                bool                         overlapped = false;
+                pool_trace_clock::time_point t_done;
+                if (trace) {
+                    overlapped = cpu_expert_pool_overlap_end(g_pool_trace_overlap, ticket);
+                    t_done     = pool_trace_clock::now();
+                }
+                if (job_signal) {
+                    if (stamps) {
+                        stamps->t_signal_ns = pool_trace_ns(pool_trace_clock::now());
+                    }
+                    job_signal.signal();
+                }
+                if (trace) {
+                    pool_trace_record_job(tasks.size(), t_submit, t_start, t_done, overlapped, stamps);
+                }
+                promise->set_value();
+                // A throw above signals the job half while it unwinds to the handlers, and both rethrow it.
+                // worker_thread has no handler, so std::terminate runs ggml's terminate handler (a gdb backtrace,
+                // then abort) without unwinding further: the promise is neither set nor broken. The device may then
+                // copy the job's partial output, but no token is sampled from it. Every logits read synchronizes the
+                // backend first, and the synchronize sleeps on the job's gate (cpu_job_gate_list) until the abort; a
+                // job with no device event holds the device itself, since its join waits the same unset future.
+            } catch (const ggml_sycl_fallback_error &) {
+                throw;
+            } catch (...) {
+                throw;
             }
-            if (resolve) {
-                resolve(tasks);
-            }
-            cpu_expert_pool_overlap_ticket ticket;
-            if (trace) {
-                ticket = cpu_expert_pool_overlap_begin(g_pool_trace_overlap);
-            }
-            ggml_sycl_cpu_expert_mul_mat_batched(tasks.data(), static_cast<int>(tasks.size()), row_workers_);
-            if (trace) {
-                const bool overlapped = cpu_expert_pool_overlap_end(g_pool_trace_overlap, ticket);
-                pool_trace_record_job(tasks.size(), t_submit, t_start, pool_trace_clock::now(), overlapped, stamps);
-            }
-            promise->set_value();
         });
     }
     cv_.notify_one();
@@ -375,7 +413,18 @@ void CpuExpertPool::stop_workers() {
         if (t.joinable()) {
             auto future = std::async(std::launch::async, [&t] { t.join(); });
             if (future.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
-                GGML_LOG_WARN("[CPU-EXPERT-POOL] Worker thread did not exit within 5s\n");
+                // Its job's device event is not signalled here (llama.cpp-qwn5). The job may still be writing the
+                // outputs that a device copy waiting on the event reads, and teardown frees those buffers once the
+                // queues drain. The job signals when it ends, which is when a host_task join would have returned.
+                // A process killed while teardown waits leaves that copy parked; probed on the B50, such a process
+                // is reaped at once and the card and its other tenants keep working. Its future stays unset too, so
+                // the job's gate (cpu_job_gate_list) stays shut: a host wait that sleeps on it first does not return
+                // until the job ends, as the device wait behind it would not. Every other job completes its future,
+                // save one that throws (cpu_job_gate_list's hazard): a worker drains the queue before it exits, and a
+                // job still queued when the pool is destroyed breaks its promise.
+                GGML_LOG_WARN(
+                    "[CPU-EXPERT-POOL] Worker thread did not exit within 5s; a device copy waiting on its job "
+                    "stays parked until the job ends\n");
                 t.detach();
             }
         }

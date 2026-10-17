@@ -11,7 +11,9 @@
 // hands, and a reap on another thread is known to be waiting on it when
 // retained_reap_test_yielding() says so -- no case orders threads by sleeping.
 // Every owner release, and every log line, checks that its thread does not
-// hold the retained-store mutex. Nothing here touches a GPU (the registration pins the selector to
+// hold the retained-store mutex. One case covers the CPU expert job gates a
+// record carries (retained_handle_gate_scope): the worker sleeps on them before
+// it waits the record's event. Nothing here touches a GPU (the registration pins the selector to
 // the OpenCL CPU device).
 //
 // Usage:
@@ -28,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <string>
 #include <sycl/sycl.hpp>
 #include <thread>
@@ -613,6 +616,36 @@ void test_backstop(sycl::queue & q) {
     CHECK(only_reference(blocker), "backstop: blocker drained");
 }
 
+// A record published while a retained_handle_gate_scope is open carries the
+// scope's job gates, and the worker sleeps on them before it waits the record's
+// event (llama.cpp-qwn5). The job gate here is an unset promise, as a CPU expert
+// job's is while the job runs; the record's event is complete, as a device
+// command's is once it ran. A worker that waited the event alone would release
+// the lease at once; this one must hold it until the promise is set.
+void test_job_gate_holds_lease() {
+    std::promise<void>                          job;
+    const std::vector<std::shared_future<void>> job_gates{ job.get_future().share() };
+    const int                                   released = g_released.load();
+    retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_AFTER_POP);
+    {
+        mem_handle                       a = make_owner(1200);
+        const retained_handle_gate_scope scope(job_gates);
+        retain_handles_until_event({ a }, sycl::event{});
+    }
+    // The record holds the owner's last reference, and the worker holds the
+    // record before any wait.
+    wait_parked(true);
+    retained_drain_test_hold(RETAINED_DRAIN_TEST_POINT_NONE);
+    wait_parked(false);
+    // A bound on a wait for an outcome, not an ordering: the worker is past its
+    // pause, and the record's event is complete.
+    CHECK(!drain_retained_handles(true, 500), "job gate: the worker did not finish a record whose job gate is shut");
+    CHECK_EQ(g_released.load() - released, 0, "job gate: the lease is held while its job gate is shut");
+    job.set_value();
+    CHECK(drain_retained_handles(true, 10000), "job gate: the worker finished the record once its job gate opened");
+    CHECK_EQ(g_released.load() - released, 1, "job gate: the lease is released once its job gate opens");
+}
+
 // Under GGML_SYCL_STRICT_LEASES=1 the same backstop aborts.
 int strict_child(sycl::queue & q) {
     mem_handle blocker = hold_worker();
@@ -686,6 +719,7 @@ int main(int argc, char ** argv) {
     test_in_hand_backstop(q);
     test_seq_bound(q);
     test_backstop(q);
+    test_job_gate_holds_lease();
     test_strict_aborts(argv[0], "strict-child", "[CONTEXT-PLAN-BUG] retained-reap backstop");
     test_strict_aborts(argv[0], "strict-ownerless-child", "has no owner control");
     // Every owner released above, by the worker, a reap or the test, was

@@ -755,6 +755,9 @@ static void watchdog_thread_fn(int64_t timeout_ms) {
                     "[SYCL-WATCHDOG] known-slow workloads (large model prestage, cold warmup).\n",
                     elapsed_ms, (long long) timeout_ms, n_devices);
             fflush(stderr);
+            // llama.cpp-qwn5: _Exit runs no destructor, so a CPU expert job's event would stay unsignalled and a
+            // device command parked on it would outlive the process; the xe job timeout does not end such a wait.
+            ggml_sycl::cpu_job_signal_signal_all();
             ggml_sycl_cleanup_host_allocations();
             // _Exit bypasses atexit, so the zone-reset audit's exit report would
             // never run on exactly the runs most worth auditing. Flush it here.

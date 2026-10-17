@@ -448,8 +448,8 @@ MUTANTS = [
     ("H2 host-host record moved after the memcpy", MEMOPS,
      "        if (mem_copy_site_census_enabled()) {\n"
      "            mem_copy_site_census_record(profile_name, mem_copy_site_dir::H2H, size, file, line, function);\n"
-     "        }\n        wait_deps(deps);\n        std::memcpy(dst_ptr, src_ptr, size);\n",
-     "        wait_deps(deps);\n        std::memcpy(dst_ptr, src_ptr, size);\n"
+     "        }\n        staged_wait_deps(deps, MEM_COPY_STAGED_WAIT_KIND_H2H_DEPS, file, line);\n        std::memcpy(dst_ptr, src_ptr, size);\n",
+     "        staged_wait_deps(deps, MEM_COPY_STAGED_WAIT_KIND_H2H_DEPS, file, line);\n        std::memcpy(dst_ptr, src_ptr, size);\n"
      "        if (mem_copy_site_census_enabled()) {\n"
      "            mem_copy_site_census_record(profile_name, mem_copy_site_dir::H2H, size, file, line, function);\n"
      "        }\n"),

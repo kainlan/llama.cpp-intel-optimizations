@@ -352,7 +352,12 @@ inline bool moe_glu_input_host_produced(const ggml_tensor * op, moe_weight_on_ho
 //   B5  join of a down CPU job at a flush
 //   B6  wait for an earlier scatter H2D (flush prologue, sibling join)
 //   B7  any of the above inside the graph-boundary flush or drain
-// The classes are the waits the path paid before its CPU jobs were event-chained
+//   B8  the backend's synchronize: its sleep on the CPU expert jobs' gates and
+//       its stream wait (llama.cpp-qwn5), on the thread that synchronizes
+//   B9  the whole-queue waits of the backend's graph code (ggml_sycl_trace_queue_wait:
+//       the periodic drain, the graph-compute exit wait and the rest): their sleep on
+//       the gates and the queue wait (llama.cpp-qwn5)
+// B1..B7 are the waits the path paid before its CPU jobs were event-chained
 // (llama.cpp-z4kd).  Only B1 and the graph-boundary B7 still wait on the
 // submitting thread; B2..B6 read 0, and a change that brings one of those waits
 // back shows in its class.
@@ -372,6 +377,8 @@ enum moe_hostpath_wait_class : int {
     MOE_WAIT_B5,
     MOE_WAIT_B6,
     MOE_WAIT_B7,
+    MOE_WAIT_B8,
+    MOE_WAIT_B9,
     MOE_WAIT_COUNT,
 };
 

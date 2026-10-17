@@ -146,6 +146,11 @@ with gate('fattn-failure-atomicity'):
 # round-tripped 25->27->26, but the comment-blind count never moved off 25. Bisected
 # with `git log -S'<token>(' -- ggml/src/ggml-sycl/ggml-sycl.cpp`; verified per-commit
 # with `git show <sha>:ggml/src/ggml-sycl/ggml-sycl.cpp | grep -o '<token>(' | wc -l`.
+# llama.cpp-qwn5 retired one more legacy pair: the MoE ids cache entry's persistent
+# pinned stage became a per-call alloc_pinned_stage_handle_terminal() stage, because
+# mem_copy_async now copies pinned-pool memory in place and a stage shared across
+# calls would be rewritten under a pending H2D -- 54->53 unified_alloc( and
+# 42->41 from_legacy_owned_alloc( code sites.
 RUNTIME_CODE     = _blank_comments(RUNTIME)
 COMMON_CODE      = _blank_comments(COMMON)
 COMMON_IMPL_CODE = _blank_comments(COMMON_IMPL)
@@ -270,7 +275,7 @@ with gate("every named owner-first site in ggml-sycl.cpp is a guarded, owner-fir
         RUNTIME_PRODUCTION_CODE.count("unified_allocate_owner(") + len(_spans)
 
 for _label, _code, _pins in (
-    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (54, 42, OWNER_FIRST_BASELINE_SITES)),
+    ("ggml-sycl.cpp", RUNTIME_PRODUCTION_CODE, (53, 41, OWNER_FIRST_BASELINE_SITES)),
     ("common.hpp", COMMON_CODE, (3, 4, 3)),
     ("common.cpp", COMMON_IMPL_CODE, (8, 8, 4)),
 ):
@@ -967,7 +972,10 @@ with gate('segment-boundary-flush'):
     _rcall = SEG_FLUSH_CALLS["record"]
     _pcall = SEG_FLUSH_CALLS["replay"]
     _kcall = SEG_FLUSH_CALLS["keyed record"]
-    _record_flush = "        " + _rcall + "\n        const size_t retained_baseline"
+    # The record path drains its stream between the flush and the recording (moe_graph_segment_record_drain); the
+    # flush controls below drop or move only the flush and keep the drain where it is.
+    _record_drain = "        moe_graph_segment_record_drain(*stream);\n"
+    _record_flush = "        " + _rcall + "\n" + _record_drain + "        const size_t retained_baseline"
     _replay_flush = "                " + _pcall + "\n                ggml_sycl::graph_exec_submit(*stream, *seg.exec_graph);"
     # The legacy replay is the first of the two replay sites; the keyed replay is the second.
     assert RUNTIME_CODE.count(_record_flush) == 1 and RUNTIME_CODE.count(_replay_flush) == 2
@@ -992,8 +1000,8 @@ with gate('segment-boundary-flush'):
                    "    wait_pending_secondary_scatter_events(flush_pending_secondary_scatter());\n"
                    "    flush_pending_attn_dispatch(device);\n")
     controls = {
-        "record flush dropped": RUNTIME_CODE.replace(_record_flush, "        const size_t retained_baseline"),
-        "record flush inside the recording": RUNTIME_CODE.replace(_record_flush, "        const size_t retained_baseline")
+        "record flush dropped": RUNTIME_CODE.replace(_record_flush, _record_drain + "        const size_t retained_baseline"),
+        "record flush inside the recording": RUNTIME_CODE.replace(_record_flush, _record_drain + "        const size_t retained_baseline")
             .replace(_begin, _begin + "            " + _rcall + "\n"),
         "record flush covers the wrong nodes": RUNTIME_CODE.replace(
             _rcall, _rcall.replace("seg.start, seg.end", "seg.start, seg.start + 1"), 1),

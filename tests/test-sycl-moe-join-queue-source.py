@@ -64,6 +64,9 @@ THE CONTRACT.  With comments blanked:
      until joins[k], and a flush that places no rows puts a barrier on the stream behind
      the joins while they may be off it (the selector's own predicate), so the stream's
      later commands still follow them and GGML_SYCL_MOE_JOIN_QUEUE=0 adds no command.
+     This covers the members that are joined.  A member the device waits on its job's
+     own event takes no join (llama.cpp-qwn5); test-sycl-moe-cpu-job-device-signal-source.py
+     pins that path, its retention and its empty flush.
   C. (docs/backend/sycl-env-vars.md) the GGML_SYCL_MOE_JOIN_QUEUE row states the
      mechanism, the guard and fallbacks, the joinq= field, the atoi parse, and the
      oneAPI 2026.1 / driver 26.35 caveat.
@@ -460,7 +463,7 @@ def check_trace(backend: str) -> None:
     if not fmt.startswith("[MOE-HOSTPATH-WAITS]") or not fmt.endswith(" joinq=%d\\n"):
         fail("W", "the [MOE-HOSTPATH-WAITS] line does not end with joinq=")
     if "const int joinq = w.joins_join_queue > 0 && w.joins_stream == 0 ? 1 : 0;" not in flat or \
-            not re.search(r"rq\.pending_us, joinq\);", flat):
+            not re.search(r", joinq\);", flat):
         fail("W", "joinq= is not 1 exactly when every join of the token went on the join queue")
     if not re.search(r"w\.joins_join_queue\s*=\s*0;", flat) or not re.search(r"w\.joins_stream\s*=\s*0;", flat):
         fail("W", "the join counts are not reset with the token's other counts")

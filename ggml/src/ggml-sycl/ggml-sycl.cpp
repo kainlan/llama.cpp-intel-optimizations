@@ -23957,7 +23957,8 @@ struct pending_cpu_scatter {
     ggml_sycl::mem_handle weight_handle;         // Optional host-pinned weight staging
     // A buffer the CPU job reads that the slot does not otherwise own: the
     // shared decode activation staging, which ensure() may replace while the
-    // job still reads it (llama.cpp-z4kd).  Retained until the job's join event.
+    // job still reads it (llama.cpp-z4kd).  Retained until the job's join event,
+    // or the flush's last event when the device waited the job (llama.cpp-qwn5).
     ggml_sycl::mem_handle act_keepalive;
 
     // Per-expert scatter metadata
@@ -24024,13 +24025,21 @@ struct pending_cpu_scatter {
     // is freed here; the graph boundary waits these events
     // (pending_cpu_scatter_wait_prev_events, llama.cpp-z4kd).  A scatter is
     // still owed that wait while the list is not empty.
+    // signal_mark names the device waits that flush made on its jobs' events (llama.cpp-qwn5); the graph boundary
+    // recycles them after it has waited scatter_events (cpu_job_signal_recycle).
     struct prev_scatter_state {
-        std::vector<sycl::event> scatter_events;
+        std::vector<sycl::event>       scatter_events;
+        ggml_sycl::cpu_job_signal_mark signal_mark;
     } prev_scatter;
 
     // The pool job's stamp record while GGML_SYCL_MOE_IDS_COPY_TRACE is set, else empty; handed to the job's join
     // host_task beside `future` (llama.cpp-j6jf).
     std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> job_stamps;
+
+    // The pending half of the job's device event, when its producer took one (llama.cpp-qwn5): the flush makes the
+    // scatter wait on that event, which the job signals after its last write, instead of joining `future` with a
+    // host task. Empty for a job joined by a host task.
+    ggml_sycl::cpu_job_signal_ref device_signal;
 
     pending_cpu_scatter() :
         out_pinned(nullptr),
@@ -24070,7 +24079,7 @@ static void pending_cpu_scatter_bind_scratch(pending_cpu_scatter & slot, ggml_ba
 // ---------------------------------------------------------------------------
 // Submitting-thread wait census for the host-expert MoE decode path
 // (llama.cpp-z4kd).  Under GGML_SYCL_MOE_IDS_COPY_TRACE, one WARN line per
-// decode token reports, for each wait class (B1..B7, listed with the
+// decode token reports, for each wait class (B1..B8, listed with the
 // classifiers in moe-decode-hostpath.hpp), how many times this thread blocked
 // and for how long.
 // A token's line is printed when the next token's first id readback arrives
@@ -24088,6 +24097,8 @@ static void pending_cpu_scatter_bind_scratch(pending_cpu_scatter & slot, ggml_ba
 using ggml_sycl::MOE_WAIT_B1;
 using ggml_sycl::MOE_WAIT_B4B;
 using ggml_sycl::MOE_WAIT_B7;
+using ggml_sycl::MOE_WAIT_B8;
+using ggml_sycl::MOE_WAIT_B9;
 using ggml_sycl::MOE_WAIT_COUNT;
 using ggml_sycl::MOE_WAIT_NONE;
 
@@ -24106,6 +24117,24 @@ struct moe_hostpath_wait_census {
     // CPU expert job joins by the queue they went on (llama.cpp-wfsl): the join-only queue or the compute stream.
     uint64_t joins_join_queue      = 0;
     uint64_t joins_stream          = 0;
+    // CPU expert jobs the device waited on their own event, with no join host task (llama.cpp-qwn5).
+    uint64_t joins_device_signal   = 0;
+    // The B8 synchronizes split (llama.cpp-qwn5): the CPU expert job gates they slept on, the time asleep on them,
+    // and the time in the stream wait after them.
+    uint64_t gate_waits            = 0;
+    double   gate_sleep_us         = 0.0;
+    double   driver_us             = 0.0;
+    // The graph-boundary drain's part of B7, split the same way (llama.cpp-qwn5): the gates of each slot's last flush
+    // it slept on before it waited that slot's last scatter, the time asleep on them, and the time in the event waits
+    // after them.
+    uint64_t drain_gate_waits      = 0;
+    double   drain_gate_sleep_us   = 0.0;
+    double   drain_driver_us       = 0.0;
+    // The B9 queue waits split the same way (llama.cpp-qwn5): the gates they slept on, the time asleep on them,
+    // and the time in the queue waits after them.
+    uint64_t queue_gate_waits      = 0;
+    double   queue_gate_sleep_us   = 0.0;
+    double   queue_driver_us       = 0.0;
 };
 
 static thread_local moe_hostpath_wait_census g_moe_hostpath_waits;
@@ -24113,7 +24142,12 @@ static thread_local moe_hostpath_wait_census g_moe_hostpath_waits;
 static bool moe_hostpath_waits_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_IDS_COPY_TRACE");
-        return env && std::atoi(env) != 0;
+        const bool   on  = env && std::atoi(env) != 0;
+        if (on) {
+            // The retained-handle drain worker's waits join the line (llama.cpp-qwn5).
+            ggml_sycl::retained_handle_drain_census_enable();
+        }
+        return on;
     }();
     return enabled;
 }
@@ -24189,6 +24223,95 @@ static void moe_hostpath_waits_join(bool on_join_queue) {
     }
 }
 
+// Counts one CPU expert job the device waited on its own event, which no host task joined (llama.cpp-qwn5).
+static void moe_hostpath_waits_device_signal() {
+    if (!moe_hostpath_waits_enabled()) {
+        return;
+    }
+    g_moe_hostpath_waits.joins_device_signal += 1;
+}
+
+// One queue wait's sleep on the CPU expert job gates of its queue (llama.cpp-qwn5), in the backend's synchronize or in
+// ggml_sycl_trace_queue_wait: the device's gate list, the newest gate the sleep covered, how many it waited, and the
+// census's clock stamps (zero with the trace off).
+struct ggml_sycl_cpu_job_gate_sleep {
+    std::shared_ptr<ggml_sycl::cpu_job_gate_list> gates;
+    uint64_t                                      newest = 0;
+    size_t                                        waited = 0;
+    moe_hostpath_clock::time_point                t_begin;
+    moe_hostpath_clock::time_point                t_slept;
+};
+
+// Before a whole-queue wait, in the backend's synchronize and in the graph code's queue waits
+// (ggml_sycl_trace_queue_wait): sleeps on the gates of the CPU expert jobs the device waits on their own events
+// (cpu_job_gate_list), so the driver wait after it polls only for the device work after those jobs, not for the jobs'
+// whole length. This adds no wait: the queue wait already waited for those jobs, through the device commands that
+// wait on their events. The list is found only for the unified cache's queue and is the device's, so a wait on that
+// queue from any thread sleeps; no lock is held while it does.
+static ggml_sycl_cpu_job_gate_sleep ggml_sycl_cpu_job_gates_sleep(sycl::queue & stream) {
+    ggml_sycl_cpu_job_gate_sleep sleep;
+    sleep.t_begin = moe_hostpath_wait_begin();
+    sleep.gates   = ggml_sycl::unified_cache_cpu_job_gates(stream);
+    if (sleep.gates) {
+        sleep.waited = sleep.gates->wait_all(&sleep.newest);
+    }
+    sleep.t_slept = moe_hostpath_wait_begin();
+    return sleep;
+}
+
+// After the synchronize's stream wait: drops the gates the sleep waited, whose jobs have ended, and counts the
+// synchronize under B8, split into the sleep and the stream wait. The stream wait is timed from the sleep's end to this
+// call, before the clear, so driver_us is the wait itself.
+static void ggml_sycl_cpu_job_gates_clear(const ggml_sycl_cpu_job_gate_sleep & sleep) {
+    const moe_hostpath_clock::time_point t_waited = moe_hostpath_wait_begin();
+    if (sleep.gates && sleep.newest != 0) {
+        sleep.gates->clear_upto(sleep.newest);
+    }
+    if (!moe_hostpath_waits_enabled()) {
+        return;
+    }
+    moe_hostpath_wait_census & w = g_moe_hostpath_waits;
+    w.gate_waits += sleep.waited;
+    w.gate_sleep_us += std::chrono::duration<double, std::micro>(sleep.t_slept - sleep.t_begin).count();
+    w.driver_us += std::chrono::duration<double, std::micro>(t_waited - sleep.t_slept).count();
+    moe_hostpath_wait_end(MOE_WAIT_B8, sleep.t_begin);
+}
+
+// After a whole-queue wait of the backend's graph code (ggml_sycl_trace_queue_wait): drops the gates the sleep
+// waited, as ggml_sycl_cpu_job_gates_clear does after the synchronize, and counts the wait under B9, split the same
+// way. The queue wait is timed from the sleep's end to this call, before the clear, so queue_driver_us is the wait
+// itself.
+static void ggml_sycl_cpu_job_gates_clear_queue_wait(const ggml_sycl_cpu_job_gate_sleep & sleep) {
+    const moe_hostpath_clock::time_point t_waited = moe_hostpath_wait_begin();
+    if (sleep.gates && sleep.newest != 0) {
+        sleep.gates->clear_upto(sleep.newest);
+    }
+    if (!moe_hostpath_waits_enabled()) {
+        return;
+    }
+    moe_hostpath_wait_census & w = g_moe_hostpath_waits;
+    w.queue_gate_waits += sleep.waited;
+    w.queue_gate_sleep_us += std::chrono::duration<double, std::micro>(sleep.t_slept - sleep.t_begin).count();
+    w.queue_driver_us += std::chrono::duration<double, std::micro>(t_waited - sleep.t_slept).count();
+    moe_hostpath_wait_end(MOE_WAIT_B9, sleep.t_begin);
+}
+
+// After the graph-boundary drain's event wait: counts its sleep on the slot's gates and the event wait after it, as
+// ggml_sycl_cpu_job_gates_clear counts the synchronize's. The event wait is timed from the sleep's end to this call,
+// which comes before the recycle clears the gates, so drain_driver_us is the wait itself.
+static void moe_hostpath_waits_drain(size_t                         gate_waits,
+                                     moe_hostpath_clock::time_point t_begin,
+                                     moe_hostpath_clock::time_point t_slept) {
+    const moe_hostpath_clock::time_point t_waited = moe_hostpath_wait_begin();
+    if (!moe_hostpath_waits_enabled()) {
+        return;
+    }
+    moe_hostpath_wait_census & w = g_moe_hostpath_waits;
+    w.drain_gate_waits += gate_waits;
+    w.drain_gate_sleep_us += std::chrono::duration<double, std::micro>(t_slept - t_begin).count();
+    w.drain_driver_us += std::chrono::duration<double, std::micro>(t_waited - t_slept).count();
+}
+
 // Called at each expert-id readback.  A layer id lower than the last one starts a new token, so the
 // previous token's line is printed and the counts restart.  `async` names an ids copy this thread
 // enqueued and did not wait for: the event-chained hybrid decode route's (llama.cpp-7pvo), one per op.
@@ -24198,7 +24321,9 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
     }
     moe_hostpath_wait_census & w = g_moe_hostpath_waits;
     if (w.last_layer >= 0 && layer < w.last_layer) {
-        static const char * const names[MOE_WAIT_COUNT] = { "B1", "B2", "B3", "B4", "B4b", "B5", "B6", "B7" };
+        static const char * const names[MOE_WAIT_COUNT] = {
+            "B1", "B2", "B3", "B4", "B4b", "B5", "B6", "B7", "B8", "B9"
+        };
         char                      line[512];
         int                       at       = 0;
         uint64_t                  total_n  = 0;
@@ -24209,6 +24334,16 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
             }
             at += snprintf(line + at, sizeof(line) - at, " %s=%llu/%.0fus", names[c], (unsigned long long) w.count[c],
                            w.us[c]);
+            if (c == MOE_WAIT_B7 && at < (int) sizeof(line)) {
+                at += snprintf(line + at, sizeof(line) - at,
+                               " drain_gate_waits=%llu drain_gate_sleep_us=%.0f drain_driver_us=%.0f",
+                               (unsigned long long) w.drain_gate_waits, w.drain_gate_sleep_us, w.drain_driver_us);
+            }
+            if (c == MOE_WAIT_B9 && at < (int) sizeof(line)) {
+                at += snprintf(line + at, sizeof(line) - at,
+                               " queue_gate_waits=%llu queue_gate_sleep_us=%.0f queue_driver_us=%.0f",
+                               (unsigned long long) w.queue_gate_waits, w.queue_gate_sleep_us, w.queue_driver_us);
+            }
             total_n += w.count[c];
             total_us += w.us[c];
         }
@@ -24230,33 +24365,51 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
         if (other_at == 0) {
             snprintf(other_sites, sizeof(other_sites), "none");
         }
-        // joinq=1 when every CPU expert job join of the token went on the join-only queue.
+        // The synchronous waits mem_copy_submit made on this thread, by kind and by the copy's caller, and the copies
+        // that took a staged branch (llama.cpp-qwn5).
+        ggml_sycl::mem_copy_staged_wait_census & sw = ggml_sycl::mem_copy_staged_wait_census_this_thread();
+        ggml_sycl::mem_copy_staged_wait_text     st;
+        ggml_sycl::mem_copy_staged_wait_census_format(sw, st);
+        // joinq=1 when every CPU expert job join of the token went on the join-only queue; devsig= counts the jobs
+        // the device waited on their own event instead, which took no join (llama.cpp-qwn5).
         const int joinq = w.joins_join_queue > 0 && w.joins_stream == 0 ? 1 : 0;
+        // B8 splits into the gates its synchronizes slept on and the stream waits after them, the graph-boundary
+        // drain's part of B7 (printed after B7=) into its gate sleeps and event waits, B9 (printed after B9=) into
+        // its gate sleeps and queue waits; reaper= is the retained-handle drain worker's record waits since the last
+        // line, split the same way (llama.cpp-qwn5).
+        const ggml_sycl::retained_handle_drain_census rd    = ggml_sycl::retained_handle_drain_census_take();
         GGML_LOG_WARN(
-            "[MOE-HOSTPATH-WAITS] token=%llu readbacks=%d async=%d%s total=%llu/%.0fus ready_queries=%llu "
-            "ready_skipped=%llu ready_queries_other=%s ready_query_us=%.0f joinq=%d\n",
+            "[MOE-HOSTPATH-WAITS] token=%llu readbacks=%d async=%d%s total=%llu/%.0fus gate_waits=%llu "
+            "gate_sleep_us=%.0f driver_us=%.0f reaper=%llu/%.0fus reaper_gate_waits=%llu reaper_gate_sleep_us=%.0f "
+            "reaper_driver_us=%.0f ready_queries=%llu "
+            "ready_skipped=%llu ready_queries_other=%s ready_query_us=%.0f staged_copies=%s staged_waits=%s "
+            "staged_sites=%s devsig=%llu joinq=%d\n",
             (unsigned long long) w.token, w.readbacks, w.readbacks_async, line, (unsigned long long) total_n, total_us,
+            (unsigned long long) w.gate_waits, w.gate_sleep_us, w.driver_us, (unsigned long long) rd.records,
+            rd.gate_sleep_us + rd.driver_us, (unsigned long long) rd.gate_waits, rd.gate_sleep_us, rd.driver_us,
             (unsigned long long) w.ready_queries, (unsigned long long) w.ready_skipped, other_sites, rq.pending_us,
-            joinq);
+            st.copies, st.waits, st.sites, (unsigned long long) w.joins_device_signal, joinq);
         // The same token's CpuExpertPool jobs (llama.cpp-b2jc): how many, and where each
         // job's time went between its submit and its result.
         ggml_sycl::cpu_expert_pool_trace_totals pt;
         ggml_sycl::cpu_expert_pool_trace_take(pt);
         // Then the per-token sums of the jobs' critical-path stamps (llama.cpp-j6jf); stamped counts the jobs
-        // with a record, stamped_joined those whose join host_task had run by now.  inputs_wait, pre_compute,
-        // compute, join_lat and join_wake add up to the jobs' spans; chain_gap and join_waited_us overlap them
+        // with a record, stamped_joined those whose join host_task had run by now, signalled those never joined
+        // whose span ended at their device event's signal (llama.cpp-qwn5).  inputs_wait, pre_compute, compute,
+        // join_lat, join_wake and signal_lat add up to the jobs' spans; chain_gap and join_waited_us overlap them
         // (cpu_expert_job_stamp_sums).
         const ggml_sycl::cpu_expert_job_stamp_sums js = ggml_sycl::cpu_expert_job_stamps_sum(pt.job_stamps);
         GGML_LOG_WARN(
             "[CPU-EXPERT-POOL-TRACE] token=%llu jobs=%llu tasks=%llu rows=%llu threads=%llu wake=%.0fus "
             "quant=%.0fus setup=%.0fus fanout=%.0fus compute=%.0fus wall=%.0fus joins=%llu joins_ready=%llu "
             "stamped=%llu stamped_joined=%llu inputs_wait=%.0fus chain_gap=%.0fus join_lat=%.0fus "
-            "join_waited_us=%.0fus join_wake=%.0fus pre_compute=%.0fus\n",
+            "join_waited_us=%.0fus join_wake=%.0fus pre_compute=%.0fus signalled=%llu signal_lat=%.0fus\n",
             (unsigned long long) w.token, (unsigned long long) pt.jobs, (unsigned long long) pt.tasks,
             (unsigned long long) pt.rows, (unsigned long long) pt.threads, pt.wake_us, pt.quant_us, pt.setup_us,
             pt.fanout_us, pt.compute_us, pt.wall_us, (unsigned long long) pt.joins, (unsigned long long) pt.joins_ready,
             (unsigned long long) js.jobs, (unsigned long long) js.joined, js.inputs_wait_us, js.chain_gap_us,
-            js.join_lat_us, js.join_waited_us, js.join_wake_us, js.pre_compute_us);
+            js.join_lat_us, js.join_waited_us, js.join_wake_us, js.pre_compute_us, (unsigned long long) js.signalled,
+            js.signal_lat_us);
         if (moe_hostpath_trace_level() >= 2) {
             // Each job's stamps relative to the token's first submit, in submission order.
             const int64_t t0 = pt.job_stamps.empty() ? 0 : pt.job_stamps.front().t_submit_ns;
@@ -24279,7 +24432,18 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
         w.ready_skipped    = 0;
         w.joins_join_queue = 0;
         w.joins_stream     = 0;
+        w.joins_device_signal = 0;
+        w.gate_waits          = 0;
+        w.gate_sleep_us       = 0.0;
+        w.driver_us           = 0.0;
+        w.drain_gate_waits    = 0;
+        w.drain_gate_sleep_us = 0.0;
+        w.drain_driver_us     = 0.0;
+        w.queue_gate_waits    = 0;
+        w.queue_gate_sleep_us = 0.0;
+        w.queue_driver_us     = 0.0;
         rq                 = ggml_sycl_ready_query_census{};
+        sw                 = ggml_sycl::mem_copy_staged_wait_census{};
         ++w.token;
     }
     w.last_layer = layer;
@@ -24367,7 +24531,8 @@ struct cpu_dispatch_result {
     uint64_t                                        act_serial        = 0;
     bool                                            shares_activation = false;
 
-    std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> job_stamps;  // see pending_cpu_scatter
+    std::shared_ptr<ggml_sycl::cpu_expert_job_stamps> job_stamps;     // see pending_cpu_scatter
+    ggml_sycl::cpu_job_signal_ref                     device_signal;  // see pending_cpu_scatter
 };
 
 // ---------------------------------------------------------------------------
@@ -24382,15 +24547,22 @@ struct cpu_dispatch_result {
 // Now the ids readback is the one host block per layer:
 //  - a job's input waits (and the zeroing of its output span, which must follow
 //    them) run on the pool worker, in the closure moe_cpu_job_prologue builds;
-//  - a job is joined by a host_task on the op's in-order queue, and its scatter
-//    H2D copies depend on that host_task's event.
+//  - a job signals its entry of the stream's ring of host-signalled device
+//    events after its last write, and its scatter H2D copies depend on a fresh
+//    wrapper of that event, which the device waits itself (llama.cpp-qwn5);
+//  - a job the device may not wait (a graph records, the knob
+//    GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL=0, no entry) is joined by a host_task
+//    on the op's in-order queue, and its scatter H2D copies depend on that
+//    host_task's event.
 // No cycle: a prologue waits only for queue work submitted before its job, a
-// join only for a job submitted before it, and the pool runs jobs in order, so
-// every wait points back in submission order (one pool worker and one SYCL
-// host-task thread are enough).
+// join or a device wait only for a job submitted before it, and the pool runs
+// jobs in order, so every wait points back in submission order (one pool worker
+// and one SYCL host-task thread are enough).
 // Lifetime: nothing here waits, so nothing here may free.  Every buffer a
 // pending job reads or writes (output, activation and weight staging, the
-// activation keepalive) is retained by handle until the job's join event, and every
+// activation keepalive) is retained by handle until the job's join event, or,
+// for a job the device waited, until the last event of the flush that placed
+// its rows, which follows every command that waited on it; and every
 // scatter H2D retains its source and destination handles until its own event
 // (mem_copy_async).  The raw pointers a job uses are transient views of those
 // handles and are never held past them.
@@ -24512,6 +24684,36 @@ static sycl::event moe_cpu_job_join_on_queue(sycl::queue &                      
         ggml_sycl::unified_cache_note_host_task(queue, join);
     }
     return join;
+}
+
+// GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL, read once (llama.cpp-qwn5): unset or non-zero lets a CPU expert pool job's
+// scatter wait on a host-signalled Level Zero event the job signals after its last write; 0 joins every job with a
+// host task as before.
+static bool moe_cpu_job_device_signal_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Whether the scatter on `stream` may wait on a CPU job's own event (llama.cpp-qwn5): the knob is on, and neither the
+// backend nor `stream` records a command graph, since a recorded scatter cannot depend on an event outside the graph.
+// The same recording test as moe_cpu_job_join_may_leave_stream. Asked at submit and again at the flush.
+static bool moe_cpu_job_device_signal_may(sycl::queue & stream) {
+    return moe_cpu_job_device_signal_enabled() && !ggml_sycl_graph_recording_active() &&
+           stream.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording;
+}
+
+// The two halves of a pool job's device event (llama.cpp-qwn5): *job goes to submit_batch, *ref to the pending slot.
+// Both stay empty when the device may not wait on the job or the ring has no entry; the flush then joins the job with
+// a host task.
+static void moe_cpu_job_device_signal_acquire(sycl::queue &                   stream,
+                                              ggml_sycl::cpu_job_signal *     job,
+                                              ggml_sycl::cpu_job_signal_ref * ref) {
+    if (moe_cpu_job_device_signal_may(stream)) {
+        (void) ggml_sycl::unified_cache_cpu_job_signal_acquire(stream, job, ref);
+    }
 }
 
 // Fills `req` with the pool job's trace label and returns it while tracing, else
@@ -25906,13 +26108,31 @@ static bool ggml_sycl_moe_fusion_enabled() {
 // earlier join and CPU job on that in-order queue, which is what the graph
 // boundary needs before the host zones are reset.  This is a host wait, so it
 // is only called from ggml_sycl_cpu_tg_flush_pending(), never from a flush.
+// Once the slot's last scatter is waited, the device has executed every command that waited on a job event of that
+// flush or an earlier one on its stream, so those events may be reset and reused (llama.cpp-qwn5).
 static void pending_cpu_scatter_wait_prev_events(pending_cpu_scatter & slot) {
     std::vector<sycl::event> & events = slot.prev_scatter.scatter_events;
     if (!events.empty()) {
         moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
+        // The flush's events run after the jobs the device waits on their own events, so this thread first sleeps on
+        // those jobs' gates (cpu_job_gate_list), and the event wait polls the driver only for the device work after
+        // them; the recycle below clears the gates (llama.cpp-qwn5). The sleep adds no wait but changes how this
+        // existing one waits: it covers only the gates up to the slot's mark, whose jobs the slot's last scatter
+        // already stands behind on the in-order stream, and a job sets its promise just after it signals its event,
+        // so the sleep ends just after a signal that the event wait has to outlast anyway.
+        const moe_hostpath_clock::time_point t_begin    = moe_hostpath_wait_begin();
+        size_t                               gate_waits = 0;
+        if (const std::shared_ptr<ggml_sycl::cpu_job_gate_list> gates =
+                ggml_sycl::cpu_job_signal_gates(slot.prev_scatter.signal_mark)) {
+            gate_waits = gates->wait_upto(slot.prev_scatter.signal_mark.gate_serial);
+        }
+        const moe_hostpath_clock::time_point t_slept = moe_hostpath_wait_begin();
         sycl::event::wait(events);
+        moe_hostpath_waits_drain(gate_waits, t_begin, t_slept);
         events.clear();
+        ggml_sycl::cpu_job_signal_recycle(slot.prev_scatter.signal_mark);
     }
+    slot.prev_scatter.signal_mark = {};
 }
 
 // Everything one host-expert scatter flush builds, kept across flushes so a decode token's flushes need no new
@@ -25929,6 +26149,10 @@ struct moe_host_scatter_workspace {
     std::vector<sycl::event>                copied;
     std::vector<sycl::event>                events;
     std::vector<sycl::event>                joins;  // each slot's CPU job join (llama.cpp-z4kd)
+    // The futures of the jobs the device waits on their own events, for the records the flush publishes
+    // (retained_handle_gate_scope, llama.cpp-qwn5). Cleared at the start and the end of each flush, so the workspace
+    // keeps no job's future past its flush.
+    std::vector<std::shared_future<void>>   gates;
 
     void release_handles() {
         srcs.clear();
@@ -26201,11 +26425,17 @@ static void moe_host_scatter_submit_flagged(const pending_cpu_scatter &      slo
 // has waited for either; the flush retained every buffer the job uses until that join, so clearing the slot frees
 // nothing still in use.  prev_scatter keeps only the scatter's events, which the graph boundary waits
 // (pending_cpu_scatter_wait_prev_events).
-static void pending_cpu_scatter_retire(pending_cpu_scatter & slot, const std::vector<sycl::event> & scatter_events) {
+static void pending_cpu_scatter_retire(pending_cpu_scatter &                  slot,
+                                       const std::vector<sycl::event> &       scatter_events,
+                                       const ggml_sycl::cpu_job_signal_mark & signal_mark) {
     slot.prev_scatter.scatter_events = scatter_events;
+    // Replaced even when this flush made no device wait: a mark is recycled only after the boundary waited events of
+    // its own flush, and a dropped one leaves its entries for the next mark of their ring (llama.cpp-qwn5).
+    slot.prev_scatter.signal_mark    = signal_mark;
 
     slot.future = {};
     slot.job_stamps.reset();
+    slot.device_signal.reset();
     slot.entries.clear();
     slot.tasks.clear();
     slot.out_pinned    = nullptr;
@@ -26266,6 +26496,10 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
 
     moe_host_scatter_workspace & ws = g_moe_host_scatter_ws;
     ws.events.clear();
+    // Which members the device waits on their own event (llama.cpp-qwn5), and the flush's mark of those waits.
+    bool                           native[2] = { false, false };
+    int                            n_native  = 0;
+    ggml_sycl::cpu_job_signal_mark signal_mark;
     try {
         // Both producers of an active pending scatter set a stream, an output buffer and the CPU job's
         // future.  A pending scatter without them used to be skipped quietly, which loses its host-expert
@@ -26276,17 +26510,46 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
                         "dropped (llama.cpp-93tw)");
         }
 
-        // Join each CPU job with a host task instead of on this thread (llama.cpp-z4kd), on the cache's join-only
-        // queue or on the stream (moe_cpu_job_join_on_queue, llama.cpp-wfsl).  The scatter below depends on the
-        // join events, so it reads the staging only after the jobs wrote it, and the GPU work that follows on the
-        // stream sees the rows.  This thread goes on submitting.
+        // A job whose producer took a device event is waited by the device itself: the dependency is a fresh wrapper
+        // of the event the job signals after its last write, so no host task stands between the job and the
+        // scatter (llama.cpp-qwn5).  Any other job is joined with a host task instead of on this thread
+        // (llama.cpp-z4kd), on the cache's join-only queue or on the stream (moe_cpu_job_join_on_queue,
+        // llama.cpp-wfsl).  The scatter below depends on these events, so it reads the staging only after the jobs
+        // wrote it, and the GPU work that follows on the stream sees the rows.  This thread goes on submitting.
         std::vector<sycl::event> & joins = ws.joins;
         joins.clear();
+        ws.gates.clear();
+        const bool may_signal = moe_cpu_job_device_signal_may(*slot.stream);
         for (int k = 0; k < n_group; ++k) {
+            sycl::event device_wait;
+            if (may_signal && group[k]->device_signal &&
+                ggml_sycl::cpu_job_signal_wrap(group[k]->device_signal, signal_mark, &device_wait)) {
+                native[k] = true;
+                ++n_native;
+                moe_hostpath_waits_device_signal();
+                // The job's future is the gate a host wait behind this job sleeps on first: the backend's synchronize,
+                // the graph code's queue waits (ggml_sycl_trace_queue_wait) and the graph boundary through the ring's
+                // gates, the retained-handle reaper through the records this flush publishes (llama.cpp-qwn5). Only a
+                // pool producer's job has a device event, so the future is a promise's, whose last copy never blocks
+                // when it is dropped.
+                std::shared_future<void> gate = group[k]->future.share();
+                ggml_sycl::cpu_job_signal_gate_push(signal_mark, gate);
+                ws.gates.push_back(std::move(gate));
+                joins.push_back(std::move(device_wait));
+                continue;
+            }
             joins.push_back(moe_cpu_job_join_on_queue(*slot.stream, group[k]->future.share(), group[k]->job_stamps));
         }
 
         auto t1 = hrc::now();  // After the join submissions (no wait)
+
+        // Every record published from here to the retention carries the gates of the jobs the device waits on their
+        // own events, and the reaper sleeps on them before it waits the record's event (llama.cpp-qwn5). The scatter's
+        // commands depend on the joins, so their records sit behind those jobs; a flush that places no rows has none.
+        // The members' buffers are published last, member 0 first. Those of a natively waited member wait the flush's
+        // last event, which runs behind its job. Those of a host-task-joined member wait its own join, which the gates
+        // do not cover, so that record also sleeps on the other members' jobs: it is released later, never earlier.
+        const ggml_sycl::retained_handle_gate_scope gate_scope(ws.gates);
 
         // Scatter results H2D, submitted on the in-order stream and depending on the join events wherever the
         // joins went.  Later GPU kernels on the stream run after the scatter (in-order guarantee).
@@ -26342,16 +26605,26 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
         // A flush with no rows to place still leaves its joins for the graph boundary to wait.  When the joins may
         // be on the join-only queue (moe_cpu_job_join_on_queue), a barrier keeps this stream's later commands
         // behind them, as when they were on it; when they cannot be, the stream is left as it was without it.
+        // When the device waits a member's own event, the barrier is that member's only edge to the stream, so it
+        // is always submitted, and its event, never a wrapper, is what the boundary and the next job wait: a wrapper
+        // must not outlive this flush, since its event is reset once recycled (llama.cpp-qwn5).
         if (ws.events.empty()) {
-            ws.events.insert(ws.events.end(), joins.begin(), joins.end());
-            if (moe_cpu_job_join_may_leave_stream(*slot.stream)) {
-                slot.stream->ext_oneapi_submit_barrier(joins);
+            if (n_native == 0) {
+                ws.events.insert(ws.events.end(), joins.begin(), joins.end());
+                if (moe_cpu_job_join_may_leave_stream(*slot.stream)) {
+                    slot.stream->ext_oneapi_submit_barrier(joins);
+                }
+            } else {
+                ws.events.push_back(slot.stream->ext_oneapi_submit_barrier(joins));
             }
         }
 
         // A job reads its activation buffers and writes its output until its join completes; the copies
         // above retain only what they read.  Retain everything each job touches until its own join, so
-        // retiring the slots below frees nothing a running job still uses.
+        // retiring the slots below frees nothing a running job still uses.  A job the device waited on its own
+        // event is retained until the flush's last event instead (llama.cpp-qwn5): that command ran after the
+        // device passed the wait on the job's event, so after the job's last write, and it is the stream's own
+        // event, which a recycle never resets.
         for (int k = 0; k < n_group; ++k) {
             const pending_cpu_scatter &        s = *group[k];
             std::vector<ggml_sycl::mem_handle> job_buffers;
@@ -26361,11 +26634,18 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
                     job_buffers.push_back(*h);
                 }
             }
-            if (!job_buffers.empty()) {
+            if (job_buffers.empty()) {
+                continue;
+            }
+            if (native[k]) {
+                ggml_sycl::retain_handles_until_event(std::move(job_buffers), ws.events.back());
+            } else {
                 ggml_sycl::retain_handles_until_event(std::move(job_buffers), joins[k]);
             }
         }
         ws.release_handles();
+        // The wrappers were for the commands above only (cpu_job_signal_wrap).
+        joins.clear();
 
         auto t2 = hrc::now();  // After memcpy submissions
 
@@ -26382,6 +26662,8 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
         GGML_ABORT("[CPU-TG] Deferred scatter failed: %s; its host-expert rows would be dropped (llama.cpp-93tw)",
                    ex.what());
     }
+    // The gate scope closed with the try block; the ring and the records keep their own copies.
+    ws.gates.clear();
 
     // What a later CPU job may have to order its pool writes after (moe_cpu_job_order_decide), and what
     // the graph boundary waits for.  A group advanced the serial once per slot, so a job whose activation
@@ -26394,7 +26676,7 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
     g_cpu_scatter_last_flush.row_n     = slot.row_n;
 
     for (int k = 0; k < n_group; ++k) {
-        pending_cpu_scatter_retire(*group[k], ws.events);
+        pending_cpu_scatter_retire(*group[k], ws.events, signal_mark);
     }
 }
 
@@ -26412,6 +26694,7 @@ static void move_pending_cpu_scatter_to_sibling() {
     GGML_ASSERT(from.active && !to.active && "sibling CPU scatter slot is occupied (llama.cpp-yx28)");
     to.future                = std::move(from.future);
     to.job_stamps            = std::move(from.job_stamps);
+    to.device_signal         = std::move(from.device_signal);
     to.out_pinned            = from.out_pinned;
     to.act_pinned            = from.act_pinned;
     to.weight_pinned         = from.weight_pinned;
@@ -48458,15 +48741,12 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
         }
     }
 
-    // Release cached MoE ids buffers (device + pinned host staging).
+    // Release cached MoE ids device buffers.
     for (auto & pair : moe_ids_cache) {
-        auto & entry         = pair.second;
-        entry.device_handle  = {};
-        entry.device_ids     = nullptr;
-        entry.device_bytes   = 0;
-        entry.staging_handle = {};
-        entry.staging_ids    = nullptr;
-        entry.staging_bytes  = 0;
+        auto & entry        = pair.second;
+        entry.device_handle = {};
+        entry.device_ids    = nullptr;
+        entry.device_bytes  = 0;
     }
     moe_ids_cache.clear();
 
@@ -62524,9 +62804,6 @@ static const int32_t * ggml_sycl_get_moe_ids_device_ptr_exact(ggml_backend_sycl_
             if (entry.device_handle.valid()) {
                 ctx.graph_retained_handles.push_back(entry.device_handle);
             }
-            if (entry.staging_handle.valid()) {
-                ctx.graph_retained_handles.push_back(entry.staging_handle);
-            }
         }
     };
 
@@ -62575,48 +62852,35 @@ static const int32_t * ggml_sycl_get_moe_ids_device_ptr_exact(ggml_backend_sycl_
     const bool need_staging = (ptr_type != sycl::usm::alloc::device);
 
     if (need_staging) {
-        // Use pinned host staging buffer for non-device sources
-        if (!entry.staging_ids || entry.staging_bytes < ids_bytes) {
-            const auto alloc_t0 = ids_stage_now();
-            if (entry.staging_ids) {
-                entry.staging_handle = {};
-                entry.staging_ids    = nullptr;
-            }
-            ggml_sycl::alloc_request req{};
-            req.queue                               = stream;
-            req.device                              = ctx.device;
-            req.size                                = ids_bytes;
-            req.intent.role                         = ggml_sycl::alloc_role::STAGING;
-            req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
-            req.intent.constraints.must_host_pinned = true;
-            req.intent.constraints.use_pinned_pool  = true;
-            ggml_sycl::alloc_handle staging_owner{};
-            if (ggml_sycl::unified_alloc(req, &staging_owner) && staging_owner.ptr) {
-                entry.staging_handle =
-                    ggml_sycl::detail::from_legacy_owned_alloc(std::move(staging_owner), GGML_LAYOUT_AOS);
-            }
-            entry.staging_ids   = entry.staging_ids_ptr(ctx.device);
-            entry.staging_bytes = ids_bytes;
-            if (!entry.staging_ids) {
-                return nullptr;
-            }
-            ids_stage_alloc_us += ids_stage_us(alloc_t0, ids_stage_now());
-        }
-
-        ggml_sycl::mem_handle ids_staging_handle = entry.staging_handle;
-        if (!ids_staging_handle.valid()) {
+        // A fresh pinned stage per call, never one kept on the cache entry. The
+        // H2D below reads the stage in place: it is pinned-pool host USM, which
+        // mem_copy_async copies directly. On the async return that copy may still
+        // be pending when the next call (gate, up and down share this ids
+        // entry) writes its ids, so a stage shared across calls would be
+        // rewritten under a pending DMA. mem_copy_async retains this handle until
+        // the copy's event completes, and the terminal helper keeps the stage a
+        // standalone USM base while a graph is recording.
+        const auto            alloc_t0 = ids_stage_now();
+        ggml_sycl::mem_handle ids_staging_handle;
+        if (!ggml_sycl::alloc_pinned_stage_handle_terminal(ids_bytes, *stream, ctx.device, "moe-ids-stage",
+                                                           /*require_host_usm_base=*/false, &ids_staging_handle)) {
             return nullptr;
         }
+        const auto ids_stage = ids_staging_handle.resolve(ctx.device);
+        if (!ids_stage.ptr || ids_stage.on_device) {
+            return nullptr;
+        }
+        ids_stage_alloc_us += ids_stage_us(alloc_t0, ids_stage_now());
 
         // IDs are tiny control tensors on a hot MoE path.  Keep the host leg as
         // a plain CPU copy into pinned staging and submit one raw H2D memcpy,
         // matching the fast path before the smart-handle refactor.
         const auto host_t0 = ids_stage_now();
         if (ids->nb[1] == static_cast<int64_t>(row_bytes)) {
-            std::memcpy(entry.staging_ids, ids_base, ids_bytes);
+            std::memcpy(ids_stage.ptr, ids_base, ids_bytes);
         } else {
             for (int64_t row = 0; row < n_tokens; ++row) {
-                std::memcpy(static_cast<char *>(entry.staging_ids) + row * row_bytes, ids_base + row * ids->nb[1],
+                std::memcpy(static_cast<char *>(ids_stage.ptr) + row * row_bytes, ids_base + row * ids->nb[1],
                             row_bytes);
             }
         }
@@ -77474,8 +77738,11 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
         }
     };
     ggml_sycl::cpu_expert_job_trace job_trace;
+    ggml_sycl::cpu_job_signal       job_signal;
+    ggml_sycl::cpu_job_signal_ref   job_signal_ref;
+    moe_cpu_job_device_signal_acquire(*stream, &job_signal, &job_signal_ref);
     std::future<void> job = cpu_pool.submit_batch({}, moe_cpu_job_prologue(std::move(job_inputs)), std::move(resolve),
-                                                  moe_cpu_job_trace_request(job_trace, src0));
+                                                  moe_cpu_job_trace_request(job_trace, src0), std::move(job_signal));
     if (record_warmup && g_moe_warmup.tick_epoch()) {
         moe_periodic_rerank();
     }
@@ -77492,6 +77759,7 @@ static bool ggml_sycl_moe_hybrid_decode_event_chained(ggml_backend_sycl_context 
     pending_cpu_scatter & slot = g_pending_scatter;
     slot.future                = std::move(job);
     slot.job_stamps            = std::move(job_trace.stamps);
+    slot.device_signal         = std::move(job_signal_ref);
     slot.out_pinned            = out_rows;
     slot.act_pinned            = act_rows;
     slot.weight_pinned         = nullptr;
@@ -81974,8 +82242,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     });
                 } else if (cpu_pool.is_active()) {
                     ggml_sycl::cpu_expert_job_trace job_trace;
-                    result.future     = cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue), {},
-                                                              moe_cpu_job_trace_request(job_trace, src0));
+                    ggml_sycl::cpu_job_signal       job_signal;
+                    moe_cpu_job_device_signal_acquire(*stream, &job_signal, &result.device_signal);
+                    result.future =
+                        cpu_pool.submit_batch(std::move(batch_tasks), std::move(job_prologue), {},
+                                              moe_cpu_job_trace_request(job_trace, src0), std::move(job_signal));
                     result.job_stamps = std::move(job_trace.stamps);
                 } else {
                     result.future = std::async(std::launch::async, [tasks    = std::move(batch_tasks),
@@ -82063,6 +82334,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 g_pending_scatter.row_n             = r.row_n;
                 g_pending_scatter.act_serial        = r.act_serial;
                 g_pending_scatter.job_stamps        = std::move(r.job_stamps);
+                g_pending_scatter.device_signal     = std::move(r.device_signal);
                 g_pending_scatter.shares_activation = r.shares_activation;
                 pending_cpu_scatter_bind_scratch(g_pending_scatter, ctx);
             };
@@ -83421,8 +83693,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 auto &                          cpu_pool = g_cpu_expert_pools[ctx.device];
                 ggml_sycl::cpu_expert_job_trace job_trace;
                 if (cpu_pool.is_active()) {
-                    g_pending_scatter.future = cpu_pool.submit_batch(std::move(batch_tasks), {}, {},
-                                                                     moe_cpu_job_trace_request(job_trace, src0));
+                    ggml_sycl::cpu_job_signal job_signal;
+                    moe_cpu_job_device_signal_acquire(*stream, &job_signal, &g_pending_scatter.device_signal);
+                    g_pending_scatter.future =
+                        cpu_pool.submit_batch(std::move(batch_tasks), {}, {},
+                                              moe_cpu_job_trace_request(job_trace, src0), std::move(job_signal));
                 } else {
                     g_pending_scatter.future =
                         std::async(std::launch::async, [tasks = std::move(batch_tasks)]() mutable {
@@ -90475,10 +90750,14 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {
         if (!ggml_sycl_cpu_tg_synchronize_flush_skipped_for_test()) {
             ggml_sycl_cpu_tg_flush_pending();
         }
+        // The jobs the device waits on their own events sleep this thread first, so the wait below polls the driver
+        // only for the device work after them (llama.cpp-qwn5).
+        const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*stream);
         const bool use_deferred_decode_event =
             sycl_ctx->last_graph_event.has_value() && sycl_ctx->last_graph_event_deferred_decode;
         auto err = use_deferred_decode_event ? CHECK_TRY_ERROR(sycl_ctx->last_graph_event->wait_and_throw()) :
                                                CHECK_TRY_ERROR(stream->wait_and_throw());
+        ggml_sycl_cpu_job_gates_clear(gate_sleep);
         if (err != 0) {
             // The throwing drain is the outer async-failure boundary. Exact
             // recovery observes terminal success/quiescence and leaves failed
@@ -98288,6 +98567,13 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
     }
 }
 
+// Every whole-queue wait of the backend's graph code: the periodic drain, the graph-compute exit wait and the rest.
+// Before each queue wait, this thread sleeps on the gates of the CPU expert jobs the device waits on their own
+// events (cpu_job_gate_list), so the queue wait polls the driver only for the device work after those jobs
+// (llama.cpp-qwn5). That adds no wait: a gate is pushed by the flush that submits its job's scatter on the cache's
+// queue, and the list is found only for that queue, so the queue wait already waited for every job it sleeps on.
+// The sleep sits right before each queue wait, after the trace's begin line, so wait_ms still times the whole wait
+// and a sleep that does not end still shows as a begin line with no end. Both are counted under B9.
 static void ggml_sycl_trace_queue_wait(queue_ptr           q,
                                        const char *        reason,
                                        int                 device,
@@ -98322,15 +98608,19 @@ static void ggml_sycl_trace_queue_wait(queue_ptr           q,
     }
 
     if (!enabled) {
+        const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*q);
         q->wait();
+        ggml_sycl_cpu_job_gates_clear_queue_wait(gate_sleep);
         return;
     }
 
     fprintf(stderr, "[SYCL-WAIT] begin reason=%s device=%d node=%d op=%s name=%s recording=%d\n", safe_reason, device,
             node_idx, op_name, node_name, g_ggml_sycl_graph_recording ? 1 : 0);
     fflush(stderr);
-    const auto t0 = std::chrono::high_resolution_clock::now();
+    const auto                         t0         = std::chrono::high_resolution_clock::now();
+    const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*q);
     q->wait();
+    ggml_sycl_cpu_job_gates_clear_queue_wait(gate_sleep);
     const auto   t1      = std::chrono::high_resolution_clock::now();
     const double wait_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     fprintf(stderr, "[SYCL-WAIT] end reason=%s device=%d node=%d wait_ms=%.3f\n", safe_reason, device, node_idx,
@@ -103384,9 +103674,10 @@ static bool moe_graph_try_sequence_graphlet_for_node(ggml_backend_sycl_context *
 // pinned-pool H2D (and a host join) into the graph. So the same per-node checks run here, on the host, for every
 // node of the segment before it is recorded and before it is replayed: exactly the slots one of its nodes reads
 // are published, in node order, and the rest stay deferred (a shared-expert run after the MoE section keeps
-// overlapping the CPU experts). Nothing the segment reads is then pending while it records. The H2D copies go to
-// the same in-order queue the segment is submitted to, which orders them ahead of it without a host wait on the
-// device. Direct segments and MoE boundary nodes keep the per-node flushes and do not call this.
+// overlapping the CPU experts). Nothing the segment reads is then deferred while it records. The H2D copies go to
+// the same in-order queue the segment is submitted to, which orders them ahead of a replay without a host wait on
+// the device. A recording needs more than that order: moe_graph_segment_record_drain, below, on the record path
+// only. Direct segments and MoE boundary nodes keep the per-node flushes and do not call this.
 static void moe_graph_segment_boundary_flush(const ggml_cgraph * cgraph, int start, int end, int device) {
     for (int i = start; i < end; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
@@ -103397,6 +103688,26 @@ static void moe_graph_segment_boundary_flush(const ggml_cgraph * cgraph, int sta
         flush_pending_secondary_scatter_if_consumed(node, device);
         flush_pending_attn_if_consumed(node, device);
     }
+}
+
+// Before a segment records, everything earlier on its stream must be complete (llama.cpp-qwn5). A recorded graph
+// cannot depend on an event from outside itself: while a graph records, a source whose ready event is still pending
+// is chained (ggml_sycl_should_add_dependency keeps in-flight events then), the graph API rejects an edge to a
+// command outside the graph, and the segment runs directly on every later token. No such edge is needed either:
+// a recorded segment, a keyed slot's or the slotless recorder's, replays on the stream it recorded on, after a
+// boundary flush that republishes what the segment reads on that stream. That stream is in-order, so its order
+// carries every pre-record command at replay: the backend makes its compute streams with default_queue_properties()
+// (common.hpp), and dpct's default queue, the one used before a cache exists, is its in-order queue. The host
+// scatter checks the property only where its own form needs it: the flagged form (moe_host_scatter_submit_flagged)
+// aborts on any other queue, and the compact form (moe_host_scatter_submit_compact) declines there, so the flush
+// submits one copy per run instead. The record-time state must therefore be "everything earlier on this stream is
+// complete", which the boundary flush's H2D used to provide as a side effect while it took mem_copy_submit's staged
+// branch, whose host wait covered the copy and, the queue being in-order, everything before it. Waiting the stream also
+// covers what the flushed scatter depends on: the join host tasks, or the CPU jobs' own device events (llama.cpp-qwn5).
+// This is a setup wait, once per segment recording: a replay, and a token that records nothing, reach no wait and
+// submit no command.
+static void moe_graph_segment_record_drain(sycl::queue & stream) {
+    stream.wait_and_throw();
 }
 
 // A segmented record or replay bypasses compute_impl, so it owns the per-graph work compute_impl does at its
@@ -103875,8 +104186,9 @@ static void moe_graph_record_segment_slot(ggml_backend_sycl_context *           
             continue;
         }
 
-        // Publish what the segment reads before the queue enters recording mode.
+        // Publish what the segment reads before the queue enters recording mode, and let it land (see the drain).
         moe_graph_segment_boundary_flush(cgraph, item.start, item.end, sycl_ctx->device);
+        moe_graph_segment_record_drain(*stream);
         // The recording quantizes its own activations: no hit on a Q8 buffer some other dispatch filled.
         sycl_ctx->mmvq_q8_activation_cache.invalidate();
         const size_t                                     retained_baseline = slot.retained_handles.size();
@@ -104177,8 +104489,9 @@ static bool moe_graph_record_segments(ggml_backend_sycl_context * sycl_ctx,
             continue;
         }
 
-        // Publish what the segment reads before the queue enters recording mode (see the helper).
+        // Publish what the segment reads before the queue enters recording mode, and let it land (see the helpers).
         moe_graph_segment_boundary_flush(cgraph, seg.start, seg.end, sycl_ctx->device);
+        moe_graph_segment_record_drain(*stream);
         const size_t retained_baseline = sycl_ctx->graph_retained_handles.size();
         bool segment_submitted = false;
         struct recording_depth_owner {

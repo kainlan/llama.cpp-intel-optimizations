@@ -485,6 +485,17 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     set_tests_properties(test-sycl-cpu-expert-pool-stamps PROPERTIES LABELS "sycl;moe;hostonly" TIMEOUT 30)
 endif()
 
+# The book of the CPU expert job signal ring (llama.cpp-qwn5): an entry's host-signalled device event is reset and
+# reused only after its job signalled it, the pending scatter's half is gone, and the host waited a flush at least as
+# late as the one that made the device wait on it. ggml-sycl/cpu-job-signal.hpp includes only the standard library,
+# so the test links nothing: no SYCL runtime is loaded and no device is opened.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-cpu-job-signal-book test-sycl-cpu-job-signal-book.cpp)
+    target_include_directories(test-sycl-cpu-job-signal-book PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    add_test(NAME test-sycl-cpu-job-signal-book COMMAND test-sycl-cpu-job-signal-book)
+    set_tests_properties(test-sycl-cpu-job-signal-book PROPERTIES LABELS "sycl;moe;hostonly" TIMEOUT 30)
+endif()
+
 # Host-expert MoE result scatter (llama.cpp-cre6): the compact form (one copy into the planned scratch, one kernel
 # placing rows by slot) against the per-run copies it replaces, on synthetic routings. ggml-sycl/moe-host-scatter.hpp
 # includes only the standard library, so this needs no device.
@@ -871,6 +882,14 @@ if (Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-join-queue-source.py --self-test)
     set_tests_properties(test-sycl-moe-join-queue-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # The host-expert scatter waits on the CPU job's own device event where the device may, every way a job ends
+    # signals it, and no wrapper outlives its flush or is reset before its stream was waited (llama.cpp-qwn5). Run
+    # WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-moe-cpu-job-device-signal-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-job-device-signal-source.py --self-test)
+    set_tests_properties(test-sycl-moe-cpu-job-device-signal-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # The per-op source chain skips the ready events its own in-order stream produced, behind
     # GGML_SYCL_CHAIN_SAME_QUEUE_SKIP, and queries every other one as before (llama.cpp-wfsl). Run WITH
     # --self-test so each pin is proven to catch its mutant.
@@ -878,6 +897,22 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-chain-same-queue-source.py --self-test)
     set_tests_properties(test-sycl-chain-same-queue-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # Every synchronous wait mem_copy_submit makes is counted by kind and by the copy's caller under the MoE trace,
+    # and the [MOE-HOSTPATH-WAITS] line prints the census (llama.cpp-qwn5). Run WITH --self-test so each pin is
+    # proven to catch its mutant.
+    add_test(NAME test-sycl-mem-ops-staged-wait-census-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mem-ops-staged-wait-census-source.py --self-test)
+    set_tests_properties(test-sycl-mem-ops-staged-wait-census-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # mem_copy_submit asks a host endpoint's retained owner whether it is host USM before the pointer registry,
+    # which never sees pinned-pool chunks, and the MoE ids stage is fresh per call because its H2D now reads it in
+    # place (llama.cpp-qwn5). Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-mem-ops-host-provenance-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mem-ops-host-provenance-source.py --self-test)
+    set_tests_properties(test-sycl-mem-ops-host-provenance-source PROPERTIES
         LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
     # Host MoE experts must read the activation row of their own slot, not row 0
     # (llama.cpp-4hg7: GPT-OSS down-projection decode garbage under host-tiered
