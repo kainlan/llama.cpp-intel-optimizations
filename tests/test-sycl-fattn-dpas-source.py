@@ -159,8 +159,8 @@ def hook_violations(src: dict[str, str]) -> list[str]:
     if v2 >= 0 and v2 < hook:
         found.append("the paged V2 block comes before the DPAS hook")
     for operand in ("K", "V"):
-        needle = "GGML_ASSERT(use_dpas || %s->type == GGML_TYPE_F16 || ggml_sycl_type_is_fp8_e4m3(%s->type));" % (operand,
-                                                                                                         operand)
+        needle = ("GGML_ASSERT(use_dpas || %s->type == GGML_TYPE_F16 || ggml_sycl_type_is_fp8_e4m3(%s->type));"
+                  % (operand, operand))
         if needle not in body:
             found.append("the %s type assert does not admit a quantized KV only through use_dpas" % operand)
     return found
@@ -241,6 +241,14 @@ def predicate_violations(src: dict[str, str]) -> list[str]:
         ("require K and V of one quantized type", "if ((K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_Q8_0) || V->type != K->type) {"),
         ("decline paged and multi-sequence sources", "ggml_sycl_fattn_d512_has_paged_or_multiseq_sources(dst)"),
         ("take its head list from fattn-dpas.hpp", "ggml_sycl_fattn_dpas_head_ok("),
+        ("keep K/V rows on 2-byte bounds (even strides and view offset: the kernel reads dwords)",
+         "for (const ggml_tensor * t : { K, V }) { if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % 2 != 0 || "
+         "t->nb[2] % 2 != 0 || t->nb[3] % 2 != 0 || t->view_offs % 2 != 0) { return false; } }"),
+        ("decline ALiBi and logit softcap (the kernel applies neither)",
+         "if (max_bias != 0.0f || logit_softcap != 0.0f) { return false; }"),
+        ("take only a single-plane F16 mask (the kernel reads one mask plane with a half stride)",
+         "if (mask != nullptr && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || "
+         "mask->nb[0] != sizeof(sycl::half))) { return false; }"),
     ):
         if needle not in pred:
             found.append("ggml_sycl_fattn_dpas_supported does not %s" % label)
@@ -266,7 +274,10 @@ def memory_violations(src: dict[str, str]) -> list[str]:
         return found + ["ggml_sycl_fattn_dpas_dispatch not found in fattn.cpp"]
     for label, needle in (("allocate its workspace through the unified-cache split-workspace helper",
                            "ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer("),
-                          ("retain the workspace until the launch's event", "ggml_sycl::retain_handles_until_event(")):
+                          ("retain the workspace until the launch's event", "ggml_sycl::retain_handles_until_event("),
+                          ("retain it for every split launch (nsplit > 1 is when the kernel writes it)",
+                           "if (info.nsplit > 1) { ggml_sycl::retain_handles_until_event({ cache->dpas_parts_handle, "
+                           "cache->dpas_meta_handle }, ev); }")):
         if needle not in disp:
             found.append("ggml_sycl_fattn_dpas_dispatch does not %s" % label)
     for needle in ("wait_and_throw", ".wait()"):
@@ -414,6 +425,17 @@ def test_mutations_are_witnessed() -> None:
          predicate_violations, "FA_DPAS_MAX_Q"),
         ("pool allocation in the kernel TU", _append(src, "dpas", "static ggml_sycl_pool_alloc<float> zz_parts;"),
          memory_violations, "ggml_sycl_pool_alloc"),
+        ("odd K/V view offset admitted",
+         _replace(src, "fattn", "t->nb[3] % 2 != 0 ||\n            t->view_offs % 2 != 0) {", "t->nb[3] % 2 != 0) {"),
+         predicate_violations, "2-byte bounds"),
+        ("ALiBi admitted",
+         _replace(src, "fattn", "if (max_bias != 0.0f || logit_softcap != 0.0f) {", "if (logit_softcap != 0.0f) {"),
+         predicate_violations, "ALiBi"),
+        ("multi-plane mask admitted", _replace(src, "fattn", "mask->ne[2] != 1 || ", ""), predicate_violations,
+         "single-plane F16 mask"),
+        ("a two-way split launch left unretained",
+         _replace(src, "fattn", "if (info.nsplit > 1) {", "if (info.nsplit > 2) {"), memory_violations,
+         "every split launch"),
         ("tensor->data read in the kernel TU", _append(src, "dpas", "static const void * zz(const ggml_tensor * t) { return t->data; }"),
          memory_violations, "->data"),
         ("host wait in the dispatch",

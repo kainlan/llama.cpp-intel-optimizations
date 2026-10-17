@@ -22,6 +22,9 @@
 //   file, and the 256-register mode is instantiated only where it is launched.
 // - GGML_SYCL_FA_DPAS_NO_KERNELS compiles the kernels out and leaves a launcher that aborts; fattn.cpp then never
 //   admits the route, so the knob and the hook stay in place.
+// - The GGML_SYCL_XMX_AOT_SG build guard (GGML_SYCL_FA_DPAS_BUILD 0 for a sub-group-8 or mixed AOT list) is dropped.
+//   No such macro exists here. This fork's AOT targets are bmg_g21 and bmg_g31, both sub-group 16, beside the spir64
+//   JIT image, and the fattn.cpp gate admits only Battlemage. Each kernel carries its sub_group_size<16> property.
 //
 
 #include "fattn-dpas.hpp"

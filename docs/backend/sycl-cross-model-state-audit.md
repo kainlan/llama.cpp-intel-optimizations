@@ -88,7 +88,7 @@ removing a same-named `clear()`/`reset()`/`store(false)` elsewhere in the same
 input can reclassify a row without touching its declaration. Review such a row and
 regenerate; it is the unscoped scan being honest about what it saw.
 
-A change that adds, removes or reclassifies a static in any of the five inputs
+A change that adds, removes or reclassifies a static in any of the six inputs
 must regenerate the CSV in the same change. The gate parses the **working
 tree**, not a commit, so in a shared checkout an uncommitted edit that adds or
 reclassifies a static (anyone's) turns it red until that edit is committed
@@ -107,7 +107,7 @@ in a multi-object declaration becomes its own row. Actual
 function declarations are excluded by declarator binding shape, while
 pointer/reference-to-function and pointer-to-member function/data objects
 (including arrays) remain census objects. This is deliberately **not a general
-C++ frontend**: alias handling is a bounded proof for the five inputs listed
+C++ frontend**: alias handling is a bounded proof for the six inputs listed
 below. It records declaration positions and lexical namespace/class/function/
 block identities, chooses the first nearest candidate and then its newest
 visible declaration, and treats relevant ordinary-name hiding conservatively.
@@ -138,9 +138,13 @@ static/thread-local objects, and 7 class static declarations. Per-file rows are 
 (`ggml-sycl.cpp`), 280 (`unified-cache.cpp`), 16 (`unified-cache.hpp`), 51
 (`fattn.cpp`), and 2 (`layer-streaming.cpp`). The script prints SHA-256 for
 every input so this result can be tied to exact source bytes.
+`fattn-dpas.cpp` (the DPAS flash-attention kernels, llama.cpp-2szs) became the
+sixth input after that commit. It adds 3 rows, its three namespace-scope
+`constexpr` constants, and its 6 recovery nodes are all
+`function-body-storage-proven`.
 
 Regenerate from a **clean** tree. The census is bound to committed bytes: a
-generation run reads the working tree, so uncommitted edits to any of the five
+generation run reads the working tree, so uncommitted edits to any of the six
 inputs produce per-file SHA-256 values that name blobs reachable from nobody's
 git history. When the checkout is dirty, extract the inputs at the audited
 commit into a scratch tree and pass `--repo` at it.

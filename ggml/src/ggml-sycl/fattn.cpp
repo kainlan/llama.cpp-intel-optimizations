@@ -2583,6 +2583,13 @@ static bool ggml_sycl_fattn_dpas_supported(const ggml_tensor * dst) {
     return true;
 }
 
+#ifdef GGML_SYCL_FA_DPAS_NO_KERNELS
+// With the kernels compiled out the dispatch only aborts; its first declaration tells the compiler so.
+[[noreturn]] static void ggml_sycl_fattn_dpas_dispatch(ggml_backend_sycl_context & ctx,
+                                                       const fattn_params &        params,
+                                                       const ggml_tensor *         dst);
+#endif
+
 // Runs an op ggml_sycl_fattn_dpas_supported() admitted. The split-K workspace is sized once per context to the bound
 // every launch fits (ggml_sycl_fattn_dpas_parts_capacity), so it is never resized and nothing waits for a launch in
 // flight; each split launch retains it until its event. A failed allocation leaves the keys unsplit, said once.
