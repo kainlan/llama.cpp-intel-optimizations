@@ -54,6 +54,8 @@ FLASH_SIG = "void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml
 SUPPORTED_SIG = "bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {"
 PRED_SIG = "static bool ggml_sycl_fattn_dpas_supported(const ggml_tensor * dst) {"
 KNOB_SIG = "static bool ggml_sycl_fa_dpas_enabled() {"
+DECLINE_SIG = "static bool ggml_sycl_fattn_dpas_decline(const ggml_tensor * dst, const char * clause) {"
+HEAD_OK_SIG = "inline bool ggml_sycl_fattn_dpas_head_ok(int64_t d) {"
 DISPATCH_SIG = ("static void ggml_sycl_fattn_dpas_dispatch(ggml_backend_sycl_context & ctx, const fattn_params & params, "
                 "const ggml_tensor * dst) {")
 CLASSIFY_SIG = "static kernel_family classify(const char * kernel) {"
@@ -237,21 +239,60 @@ def predicate_violations(src: dict[str, str]) -> list[str]:
         return ["ggml_sycl_fattn_dpas_supported not found in fattn.cpp"]
     for label, needle in (
         ("admit an F16 Q (this build casts Q to f16 for D != 512)",
-         "if (Q->type != GGML_TYPE_F32 && Q->type != GGML_TYPE_F16) { return false; }"),
-        ("require K and V of one quantized type", "if ((K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_Q8_0) || V->type != K->type) {"),
+         "if (Q->type != GGML_TYPE_F32 && Q->type != GGML_TYPE_F16) {"),
+        ("take only a q4_0 / q8_0 K as a DPAS op", "if (K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_Q8_0) { return false; }"),
+        ("require V of K's type", "if (V->type != K->type) {"),
+        ("require packed Q elements and a contiguous F32 dst (the kernel writes dense rows)",
+         "if (Q->nb[0] != ggml_type_size(Q->type) || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) {"),
+        ("take only F32 sinks (the kernel reads them as float)", "if (sinks != nullptr && sinks->type != GGML_TYPE_F32) {"),
         ("decline paged and multi-sequence sources", "ggml_sycl_fattn_d512_has_paged_or_multiseq_sources(dst)"),
         ("take its head list from fattn-dpas.hpp", "ggml_sycl_fattn_dpas_head_ok("),
+        ("cap the query heads per KV head at GGML_SYCL_FATTN_DPAS_MAX_G",
+         "Q->ne[2] % K->ne[2] != 0 || Q->ne[2] / K->ne[2] > GGML_SYCL_FATTN_DPAS_MAX_G) {"),
+        ("require one sequence count for Q, K and V (the kernel maps sequences one to one)",
+         "if (Q->ne[3] != K->ne[3] || V->ne[3] != K->ne[3]) {"),
         ("keep K/V rows on 2-byte bounds (even strides and view offset: the kernel reads dwords)",
          "for (const ggml_tensor * t : { K, V }) { if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % 2 != 0 || "
-         "t->nb[2] % 2 != 0 || t->nb[3] % 2 != 0 || t->view_offs % 2 != 0) { return false; } }"),
+         "t->nb[2] % 2 != 0 || t->nb[3] % 2 != 0 || t->view_offs % 2 != 0) {"),
         ("decline ALiBi and logit softcap (the kernel applies neither)",
-         "if (max_bias != 0.0f || logit_softcap != 0.0f) { return false; }"),
+         "if (max_bias != 0.0f || logit_softcap != 0.0f) {"),
         ("take only a single-plane F16 mask (the kernel reads one mask plane with a half stride)",
          "if (mask != nullptr && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || "
-         "mask->nb[0] != sizeof(sycl::half))) { return false; }"),
+         "mask->nb[0] != sizeof(sycl::half))) {"),
     ):
         if needle not in pred:
             found.append("ggml_sycl_fattn_dpas_supported does not %s" % label)
+    # The order matters as much as the clauses: an early admission skips every clause after it.
+    if pred.count("return true;") != 1 or not pred.endswith("return true; }"):
+        found.append("ggml_sycl_fattn_dpas_supported has a return true other than its last statement, its only return true")
+    # Silent refusals are the knob, the null operands and a K that was never a DPAS op; every other one is named, or a
+    # quantized-KV op falls to ggml-cpu (and its lhmy abort) with nothing saying which clause sent it there.
+    if pred.count("return false;") != 3:
+        found.append("ggml_sycl_fattn_dpas_supported has %d silent refusals, not 3: every refusal past the K type "
+                     "names its clause through ggml_sycl_fattn_dpas_decline" % pred.count("return false;"))
+    decline = function_or_none(code(src["fattn"]), DECLINE_SIG)
+    if decline is None:
+        found.append("ggml_sycl_fattn_dpas_decline not found in fattn.cpp")
+    else:
+        for label, needle in (("gate on GGML_SYCL_FA_DISPATCH_DEBUG", "if (ggml_sycl_fattn_dispatch_debug_env()) {"),
+                              ("bound it by GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT", "ggml_sycl_fattn_dispatch_debug_limit()"),
+                              ("print the declining clause", '"[SYCL] fattn DPAS declined [%d/%d] %s: %s'),
+                              ("return false for the predicate", "return false; }")):
+            if needle not in decline:
+                found.append("ggml_sycl_fattn_dpas_decline does not %s" % label)
+        if "] DPAS kv=" in decline:
+            found.append("ggml_sycl_fattn_dpas_decline prints \"] DPAS kv=\", which the G1 probe counts as a DPAS launch")
+    hpp = code(src["dpas_hpp"])
+    # The kernel's largest row tile is RMAX = 16 * NR16 = 32 rows (NR16 <= 2); a larger G overruns its SLM rows.
+    if "#define GGML_SYCL_FATTN_DPAS_MAX_G 32 " not in hpp + " ":
+        found.append("fattn-dpas.hpp does not cap GGML_SYCL_FATTN_DPAS_MAX_G at 32, the kernel's largest row tile")
+    head = function_or_none(hpp, HEAD_OK_SIG)
+    heads = re.fullmatch(r".*\{ return d == \d+(?: \|\| d == \d+)*; \}", head or "")
+    listed = sorted(int(x) for x in re.findall(r"d == (\d+)", head or "")) if heads else []
+    compiled = sorted(int(x) for x in re.findall(r"FATTN_DPAS_D\((\d+), \d+\)", code(src["dpas"])))
+    if not listed or listed != compiled:
+        found.append("fattn-dpas.hpp's head list %s is not the dispatch's compiled heads %s: supports_op would admit "
+                     "a head the dispatch aborts on" % (listed, compiled))
     for name in ("fattn", "dpas", "dpas_hpp"):
         if "FA_DPAS_MAX_Q" in code(src[name]):
             found.append("%s caps the query rows (FA_DPAS_MAX_Q): every ne01 runs on DPAS, a declined op aborts on the "
@@ -436,6 +477,32 @@ def test_mutations_are_witnessed() -> None:
         ("a two-way split launch left unretained",
          _replace(src, "fattn", "if (info.nsplit > 1) {", "if (info.nsplit > 2) {"), memory_violations,
          "every split launch"),
+        ("G cap raised to 64",
+         _replace(src, "dpas_hpp", "#define GGML_SYCL_FATTN_DPAS_MAX_G 32", "#define GGML_SYCL_FATTN_DPAS_MAX_G 64"),
+         predicate_violations, "largest row tile"),
+        ("head list admits 80", _replace(src, "dpas_hpp", "d == 64 || d == 96", "d == 64 || d == 80 || d == 96"),
+         predicate_violations, "compiled heads"),
+        ("early admission after the K type",
+         _replace(src, "fattn", "    if (V->type != K->type) {\n", "    return true;\n    if (V->type != K->type) {\n"),
+         predicate_violations, "only return true"),
+        ("sinks F32 check dropped",
+         _replace(src, "fattn", "    if (sinks != nullptr && sinks->type != GGML_TYPE_F32) {\n"
+                  "        return ggml_sycl_fattn_dpas_decline(dst, \"sinks not F32\");\n    }\n", ""),
+         predicate_violations, "F32 sinks"),
+        ("dst contiguity check dropped",
+         _replace(src, "fattn", "dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) {", "dst->type != GGML_TYPE_F32) {"),
+         predicate_violations, "contiguous F32 dst"),
+        ("sequence-count equality dropped",
+         _replace(src, "fattn", "    if (Q->ne[3] != K->ne[3] || V->ne[3] != K->ne[3]) {\n"
+                  "        return ggml_sycl_fattn_dpas_decline(dst, \"Q/K/V sequence counts differ\");\n    }\n", ""),
+         predicate_violations, "one sequence count"),
+        ("a refusal left unnamed",
+         _replace(src, "fattn", "return ggml_sycl_fattn_dpas_decline(dst, \"sinks not F32\");", "return false;"),
+         predicate_violations, "names its clause"),
+        ("decline line counted by the G1 probe",
+         _replace(src, "fattn", "\"[SYCL] fattn DPAS declined [%d/%d] %s: %s (kv=%s",
+                  "\"[SYCL] fattn DPAS declined [%d/%d] %s: %s] DPAS kv=%s"),
+         predicate_violations, "G1 probe"),
         ("tensor->data read in the kernel TU", _append(src, "dpas", "static const void * zz(const ggml_tensor * t) { return t->data; }"),
          memory_violations, "->data"),
         ("host wait in the dispatch",

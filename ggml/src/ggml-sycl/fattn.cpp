@@ -2515,11 +2515,28 @@ static bool ggml_sycl_fa_dpas_enabled() {
     return enabled;
 }
 
+// Names the clause that declined a q4_0 / q8_0 op, under GGML_SYCL_FA_DISPATCH_DEBUG. A declined op runs on ggml-cpu,
+// where a quantized KV meets this build's f16 Q and aborts, so the line tells that abort from a kernel fault. It
+// returns false, for the predicate to return.
+static bool ggml_sycl_fattn_dpas_decline(const ggml_tensor * dst, const char * clause) {
+    static std::atomic<int> decline_debug_count{ 0 };
+    if (ggml_sycl_fattn_dispatch_debug_env()) {
+        const int n     = decline_debug_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        const int limit = ggml_sycl_fattn_dispatch_debug_limit();
+        if (n <= limit) {
+            fprintf(stderr, "[SYCL] fattn DPAS declined [%d/%d] %s: %s (kv=%s D=%lld ne01=%lld ne02=%lld ne12=%lld)\n",
+                    n, limit, dst->name, clause, ggml_type_name(dst->src[1]->type), (long long) dst->src[0]->ne[0],
+                    (long long) dst->src[0]->ne[1], (long long) dst->src[0]->ne[2], (long long) dst->src[1]->ne[2]);
+        }
+    }
+    return false;
+}
+
 // The ops the DPAS kernel runs, from metadata alone. It is placement-blind: supports_op settles a host-tier KV before
 // asking (declined, or under GGML_SYCL_ATTN_HOST_DISPATCH sent to the host dispatcher), and its capability count asks
 // the same question with placement declines off. There is no query-row cap,
 // because an op declined here runs on ggml-cpu, whose flash attention takes only an F32 Q while this build casts Q to
-// f16; so prefill runs on the kernel too.
+// f16; so prefill runs on the kernel too. Past the knob and the K type, every refusal names its clause.
 static bool ggml_sycl_fattn_dpas_supported(const ggml_tensor * dst) {
     if (!ggml_sycl_fa_dpas_enabled()) {
         return false;
@@ -2532,44 +2549,48 @@ static bool ggml_sycl_fattn_dpas_supported(const ggml_tensor * dst) {
     if (Q == nullptr || K == nullptr || V == nullptr) {
         return false;
     }
-    if ((K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_Q8_0) || V->type != K->type) {
+    // only a q4_0 / q8_0 K makes this a DPAS op; any other K was never a candidate, so nothing is named
+    if (K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_Q8_0) {
         return false;
+    }
+    if (V->type != K->type) {
+        return ggml_sycl_fattn_dpas_decline(dst, "V type differs from K");
     }
     // GGML_SYCL_F16 builds cast Q to f16 for every head size but 512 (llama-graph.cpp)
     if (Q->type != GGML_TYPE_F32 && Q->type != GGML_TYPE_F16) {
-        return false;
+        return ggml_sycl_fattn_dpas_decline(dst, "Q is neither F32 nor F16");
     }
     if (Q->nb[0] != ggml_type_size(Q->type) || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) {
-        return false;
+        return ggml_sycl_fattn_dpas_decline(dst, "Q elements not packed, or dst not a contiguous F32");
     }
     if (sinks != nullptr && sinks->type != GGML_TYPE_F32) {
-        return false;
+        return ggml_sycl_fattn_dpas_decline(dst, "sinks not F32");
     }
     if (!ggml_sycl_fattn_dpas_head_ok(K->ne[0]) || V->ne[0] != K->ne[0] || Q->ne[0] != K->ne[0]) {
-        return false;
+        return ggml_sycl_fattn_dpas_decline(dst, "no kernel for this head size, or Q/K/V head sizes differ");
     }
     if (Q->ne[1] < 1 || K->ne[1] < 1 || V->ne[1] != K->ne[1]) {
-        return false;
+        return ggml_sycl_fattn_dpas_decline(dst, "no query or key rows, or K/V lengths differ");
     }
     if (K->ne[2] < 1 || V->ne[2] != K->ne[2] || Q->ne[2] % K->ne[2] != 0 ||
         Q->ne[2] / K->ne[2] > GGML_SYCL_FATTN_DPAS_MAX_G) {
-        return false;
+        return ggml_sycl_fattn_dpas_decline(dst, "GQA ratio not whole, or above GGML_SYCL_FATTN_DPAS_MAX_G");
     }
     if (Q->ne[3] != K->ne[3] || V->ne[3] != K->ne[3]) {
-        return false;
+        return ggml_sycl_fattn_dpas_decline(dst, "Q/K/V sequence counts differ");
     }
     float max_bias      = 0.0f;
     float logit_softcap = 0.0f;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
     if (max_bias != 0.0f || logit_softcap != 0.0f) {
-        return false;
+        return ggml_sycl_fattn_dpas_decline(dst, "ALiBi or logit softcap");
     }
     if (mask != nullptr && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->nb[0] != sizeof(sycl::half))) {
-        return false;
+        return ggml_sycl_fattn_dpas_decline(dst, "mask not a single-plane F16");
     }
     if (ggml_sycl_fattn_d512_has_paged_or_multiseq_sources(dst)) {
-        return false;
+        return ggml_sycl_fattn_dpas_decline(dst, "paged or multi-sequence K/V");
     }
     // q4_0 / q8_0 rows are read as dwords from the dword at or before the row start, so rows must start on 2-byte
     // bounds (head sizes with an odd block count, e.g. 96, put every other head 2 bytes into a dword). The dispatch
@@ -2577,7 +2598,7 @@ static bool ggml_sycl_fattn_dpas_supported(const ggml_tensor * dst) {
     for (const ggml_tensor * t : { K, V }) {
         if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % 2 != 0 || t->nb[2] % 2 != 0 || t->nb[3] % 2 != 0 ||
             t->view_offs % 2 != 0) {
-            return false;
+            return ggml_sycl_fattn_dpas_decline(dst, "K/V row not on a 2-byte bound");
         }
     }
     return true;

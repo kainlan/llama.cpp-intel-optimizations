@@ -162,21 +162,22 @@ historical 329 figure because it likewise lacks a source SHA and method.
 ### Parse coverage and fail-closed behavior
 
 Tree-sitter reports 50 raw recovery/missing nodes in `ggml-sycl.cpp`, 10 in
-`fattn.cpp`, 5 in `unified-cache.hpp`, and 2 in `unified-cache.cpp` (one
-function signature, one function body); `layer-streaming.cpp` parses without
-recovery. The `ggml-sycl.cpp` sites are
+`fattn.cpp`, 6 in `fattn-dpas.cpp` (all in function bodies), 5 in
+`unified-cache.hpp`, and 2 in `unified-cache.cpp` (one function signature, one
+function body); `layer-streaming.cpp` parses without recovery. The `ggml-sycl.cpp` sites are
 from nested preprocessor alternatives, declaration-prefix macros
 (`GGML_API`, `__dpct_inline__`), conditional `else` arms, and formatting-macro
 tokens such as `PRId64`; the `fattn.cpp` ones are dispatch macro invocations and a label
 next to a conditional compilation boundary; the five `unified-cache.hpp` sites are
 defaulted const-reference parameters, which grammar ABI 15 misparses.
 These are **explicit raw-parser recovery sites**, not silently discarded
-regions. Each of the 67 nodes must receive a structural proof category. In the
+regions. Each of the 73 nodes must receive a structural proof category. In the
 current inputs, 24 are confined to parsed function signature/storage spans,
-35 are in parsed or unambiguously recovered function bodies, 5 are the
+41 are in parsed or unambiguously recovered function bodies, 5 are the
 defaulted const-reference parameter shape, which is proved by an anchored
 spelling match and fails closed on every near miss, and 3 are
-preprocessor-condition non-declarations. Recovered function
+preprocessor-condition non-declarations. The totals were 67 and 35 until 6e92e2e5e made
+`fattn-dpas.cpp` an input and added its 6 function-body nodes. Recovered function
 regions end at the lexically balanced closing brace (with comments and literals
 masked); an oversized `ERROR` node's tail must independently consist of parsed
 top-level constructs or the census fails. Parsed `function_definition` and `lambda_expression` nodes receive the same
