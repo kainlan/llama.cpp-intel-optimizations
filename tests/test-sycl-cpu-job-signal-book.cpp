@@ -332,22 +332,23 @@ static void test_gate_sleeps() {
     expect_true("a later gate has a larger serial", s2 > s1);
 }
 
-// A job destroyed unrun breaks its promise, and a job that threw stores its exception: either way the gate opens,
-// and the waiter returns without throwing.
+// A job destroyed unrun breaks its promise, so its gate opens and the waiter returns without throwing. A future that
+// holds an exception opens it the same way. CpuExpertPool never stores one: a job that throws ends the process with
+// its promise unset (cpu_job_gate_list's hazard), so that half pins the list's contract for any producer that does.
 static void test_gate_failed_job() {
     cpu_job_gate_list gates;
     {
         std::promise<void> unrun;
         gates.push(unrun.get_future().share());
     }
-    std::promise<void> threw;
-    gates.push(threw.get_future().share());
-    threw.set_exception(std::make_exception_ptr(std::runtime_error("job failed")));
+    std::promise<void> stored;
+    gates.push(stored.get_future().share());
+    stored.set_exception(std::make_exception_ptr(std::runtime_error("job failed")));
     bool     thrown = false;
     size_t   waited = 0;
     uint64_t newest = 0;
     expect_returns_within(
-        "a waiter returns from a broken promise and from a job's exception",
+        "a waiter returns from a broken promise and from a stored exception",
         [&] {
             try {
                 waited = gates.wait_all(&newest);
@@ -356,7 +357,7 @@ static void test_gate_failed_job() {
             }
         },
         2000);
-    expect_true("the wait does not throw the job's failure", !thrown);
+    expect_true("the wait does not throw the stored exception", !thrown);
     expect_eq("both gates were waited", waited, 2);
 }
 

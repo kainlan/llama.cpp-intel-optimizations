@@ -21,15 +21,17 @@ host waited a command of its own stream that ran after every command that waited
 
 THE GATES.  With the device waiting a job's event itself, a host wait on the stream
 behind the job is a wait inside the driver, which polls for the job's whole length.  At
--ngl 40 on the B70 two threads polled there: the one running the backend's synchronize
-(the scheduler's, before each cross-backend input of a single-device run) and the
+-ngl 40 on the B70 two threads polled there: the submitting thread, in the graph code's
+whole-queue waits (ggml_sycl_trace_queue_wait: the periodic drain and the rest), and the
 retained-handle reaper.  Both took CPU from the job's own row threads.  So the flush keeps
 the job's future as a gate, and
 those waits sleep on it first; the device wait after it still orders the host, so a gate
 changes how the host waits, never whether.  A gate is only a shared_future: wait() on it
 returns for a value, an exception or a broken promise, never throws, and runs with no
-lock held.  A worker that CpuExpertPool::stop_workers detaches leaves its job's gate shut,
-as it leaves the job's event unsignalled.
+lock held.  Two paths leave a gate shut.  A job that throws: the pool's handlers rethrow
+into a worker with no handler, so the process aborts with the promise unset, and a waiter
+sleeps until that abort.  And a worker that CpuExpertPool::stop_workers detaches, as it
+leaves the job's event unsignalled.
 
 THE CONTRACT.  With comments blanked:
   A. (ggml-sycl.cpp flush_pending_cpu_scatter_slot) a member whose wrap succeeds pushes
@@ -79,10 +81,12 @@ THE CONTRACT.  With comments blanked:
      keeps it in ws.gates, before its wrapper becomes its dependency; ws.gates is cleared
      before the member loop and after the try block, so no flush keeps another's.
   J2. (ggml_backend_sycl_synchronize) the gate sleep is one unconditional statement after
-     the CPU-expert flush and before both stream-wait branches, the only call of
-     ggml_sycl_cpu_job_gates_sleep, and the statement right after the stream wait clears
+     the CPU-expert flush and before both stream-wait branches, and no site but the
+     synchronize and the graph code's queue wait (B9) calls ggml_sycl_cpu_job_gates_sleep;
+     the statement right after the stream wait clears
      what it slept on; the sleep asks the device's list (unified_cache_cpu_job_gates) and
-     waits all of it.
+     waits all of it; that lookup reads the device's existing ring
+     (existing_cpu_job_signal_ring) and never get_cpu_job_signal_ring, which would make one.
   J3. Clears: the synchronize clears up to the newest gate it slept on before the trace
      check, so an untraced run clears too; the boundary (pending_cpu_scatter_wait_prev_events)
      sleeps on its mark's gates up to the mark's gate serial, inside `if (!events.empty())`,
@@ -93,7 +97,8 @@ THE CONTRACT.  With comments blanked:
      wait_until() call; the list's only wait is the future.wait() of its static sleep_on,
      which wait_all and wait_upto call on a snapshot their lock_guard does not outlive; the
      reaper's gate wait sits directly in its try block, outside every store lock, and no
-     lock is taken in the synchronize before its sleep.
+     lock is taken in the synchronize before its sleep, nor anywhere in the graph code's
+     queue wait.
   J5. (reaper) a record publication copies the open retained_handle_gate_scope's gates
      into the record; the scope saves and restores the thread's pointer; the reaper waits
      each valid gate with wait() inside the watchdog guard, right before the record's event
@@ -101,7 +106,32 @@ THE CONTRACT.  With comments blanked:
      scatter submission, in the block that also runs the retention.
   B8. The [MOE-HOSTPATH-WAITS] line names B8 after B7 and prints gate_waits=,
      gate_sleep_us= and driver_us= right after total=, reset with the token's counts; the
-     catalog's trace row names B8 and the three fields, and its knob row the gates.
+     catalog's trace row names B8 and the three fields, and its knob row the gates.  The
+     sleep stamps its start before the lookup and its end after the sleep, and the clear
+     stamps the stream wait's end as its first statement, before clear_upto, so driver_us
+     is the stream wait alone.
+  B7D. The graph-boundary drain's split of B7: the drain stamps its start before the gate
+     lookup, keeps wait_upto's count, stamps the sleep's end right before its event wait,
+     and calls moe_hostpath_waits_drain (its one caller) right after the event wait and
+     before the recycle clears the gates; the helper stamps the wait's end first and, under
+     the trace only, adds the count, the sleep and the wait to the token's drain fields; the
+     waits line prints drain_gate_waits=, drain_gate_sleep_us= and drain_driver_us= right
+     after B7=, reset with the token's counts; the catalog's trace row names them.
+  B9. The graph code's whole-queue waits (ggml_sycl_trace_queue_wait): each of its two
+     q->wait() calls, the untraced one and the traced one, comes right after the gate
+     sleep on *q and right before ggml_sycl_cpu_job_gates_clear_queue_wait, whose only
+     callers they are.  The traced one sleeps after its begin line and between t0 and t1,
+     so GGML_SYCL_WAIT_TRACE prints as before and its wait_ms includes the sleep.  The
+     clear stamps the queue wait's end first, clears what the sleep waited before the
+     trace check, and under the trace only adds the count, the sleep and the wait to the
+     token's queue fields and counts the whole under B9.  The class enum has B9 right
+     after B8; the waits line names B9 after B8 and prints queue_gate_waits=,
+     queue_gate_sleep_us= and queue_driver_us= right after B9=, reset with the token's
+     counts; the catalog's trace row names B1..B9 and the three fields, and its knob row
+     the queue waits.  Its J4 half (no lock of any form, guard or raw lock() call, anywhere
+     in the queue wait's body) runs before the B9 shape checks: a lock inserted into that
+     body always breaks one of those shapes too, and a lock there is the hazard to report
+     (a sleep under a lock its job may need never ends), whatever else it moved.
   R.  The reaper's census, trace only: the trace's enable turns it on and is its one
      caller; the reaper's timer reads no clock while it is off, stamps the gate sleep's end,
      and its waited(), right after the event wait, is the only place the four counters
@@ -112,9 +142,13 @@ THE CONTRACT.  With comments blanked:
 NOT VACUOUS.  --self-test runs the gate on in-memory mutants of the real sources and
 requires each to FAIL on its own pin, then requires the unmodified tree to pass.
 
-GATE RUNTIME.  Comment blanking is memoized, and the two scans over every backend source
-skip a file that does not contain the name the scan looks for (cpu_job_signal_recycle, or
-the knob): blanking only removes text, so such a file cannot match either way.
+GATE RUNTIME.  Comment blanking is one regular-expression pass and, like string
+stripping, memoized; pin E finds the recycle's enclosing block within the drain's body
+rather than the whole backend; the scans of the backend for a name drop the leading \b,
+which keeps the regex engine from skipping ahead to the name, and test the boundary on
+each match (word_matches); and the two scans over every backend source skip a file that
+does not contain the name the scan looks for (cpu_job_signal_recycle, or the knob):
+blanking only removes text, so such a file cannot match either way.
 
 RED on the tree before the change:
   FAIL [pin A]: the flush does not wrap a member's device event under
@@ -140,6 +174,7 @@ MEM_CPP = SYCL / "mem-handle.cpp"
 SIGNAL_HPP = SYCL / "cpu-job-signal.hpp"
 CACHE_CPP = SYCL / "unified-cache.cpp"
 COMMON_CPP = SYCL / "common.cpp"
+HOSTPATH_HPP = SYCL / "moe-decode-hostpath.hpp"
 DOC = ROOT / "docs" / "backend" / "sycl-env-vars.md"
 TAG = "(llama.cpp-qwn5)"
 KNOB = "GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL"
@@ -153,48 +188,41 @@ def fail(pin: str, msg: str) -> None:
     raise ContractError(f"FAIL [pin {pin}]: {msg} {TAG}")
 
 
+# One token at a time, leftmost first: a // or /* */ comment (an unterminated one runs to the end), or a string or
+# character literal, which is kept so that a comment marker inside it stays. A quote right after a letter or digit is a
+# digit separator, not a literal.
+_BLANK_TOKEN = re.compile(r'//[^\n]*|/\*.*?(?:\*/|\Z)|"(?:\\.|[^"\\])*(?:"|\Z)|(?<![^\W_])\'(?:\\.|[^\'\\])*(?:\'|\Z)', re.S)
+_NOT_NEWLINE = re.compile(r"[^\n]")
+
+
+def _blank_token(m: re.Match) -> str:
+    t = m.group(0)
+    if t[0] != "/":
+        return t
+    return " " * len(t) if t[1] == "/" else _NOT_NEWLINE.sub(" ", t)
+
+
 # Every check blanks the same few large sources again; one check per mutant reads at most six of them.
 @functools.lru_cache(maxsize=8)
 def blank_comments(src: str) -> str:
-    """Blank // and /* */ comments, keeping string literals and offsets."""
-    out = []
-    i, n = 0, len(src)
-    while i < n:
-        two = src[i : i + 2]
-        if two == "//":
-            j = src.find("\n", i)
-            j = n if j < 0 else j
-            out.append(" " * (j - i))
-            i = j
-        elif two == "/*":
-            j = src.find("*/", i + 2)
-            j = n if j < 0 else j + 2
-            out.append("".join("\n" if c == "\n" else " " for c in src[i:j]))
-            i = j
-        elif src[i] == '"':
-            j = i + 1
-            while j < n and src[j] != '"':
-                if src[j] == "\\":
-                    j += 1
-                j += 1
-            out.append(src[i : j + 1])
-            i = j + 1
-        elif src[i] == "'" and not (i > 0 and src[i - 1].isalnum()):
-            j = i + 1
-            while j < n and src[j] != "'":
-                if src[j] == "\\":
-                    j += 1
-                j += 1
-            out.append(src[i : j + 1])
-            i = j + 1
-        else:
-            out.append(src[i])
-            i += 1
-    return "".join(out)
+    """Blank // and /* */ comments, keeping string literals, line breaks and offsets."""
+    return _BLANK_TOKEN.sub(_blank_token, src)
 
 
+# block_at strips the whole source it is handed, once per body it finds.
+@functools.lru_cache(maxsize=16)
 def strip_strings(src: str) -> str:
     return re.sub(r'"(?:\\.|[^"\\])*"', lambda m: '"' + " " * (len(m.group(0)) - 2) + '"', src)
+
+
+_WORD_CHAR = re.compile(r"\w")
+
+
+def word_matches(pattern: str, text: str) -> list[re.Match]:
+    """re.finditer(r"\\b" + pattern, text) for a pattern that starts with a word.  Without the leading \\b the
+    regex engine skips ahead to the pattern's literal start, about ten times faster over the backend's 6 MB; the
+    boundary is checked on each match instead."""
+    return [m for m in re.finditer(pattern, text) if m.start() == 0 or not _WORD_CHAR.match(text, m.start() - 1)]
 
 
 def block_at(code: str, brace: int, pin: str) -> tuple[str, int]:
@@ -327,10 +355,10 @@ def check_predicate(backend: str) -> None:
     if flat(body).strip() != ("if (moe_cpu_job_device_signal_may(stream)) { "
                               "(void) ggml_sycl::unified_cache_cpu_job_signal_acquire(stream, job, ref); }"):
         fail("B", "the acquire helper asks the cache without asking moe_cpu_job_device_signal_may first")
-    takes = [m.start() for m in re.finditer(r"\bunified_cache_cpu_job_signal_acquire\s*\(", code)]
+    takes = [m.start() for m in word_matches(r"unified_cache_cpu_job_signal_acquire\s*\(", code)]
     if len(takes) != 1:
         fail("B", f"{len(takes)} sites in ggml-sycl.cpp take a ring entry; want only the acquire helper")
-    calls = [m for m in re.finditer(r"\bmoe_cpu_job_device_signal_acquire\s*\(\s*\*stream\s*,\s*&job_signal\s*,", code)]
+    calls = word_matches(r"moe_cpu_job_device_signal_acquire\s*\(\s*\*stream\s*,\s*&job_signal\s*,", code)
     if len(calls) != 3:
         fail("B", f"{len(calls)} producers acquire a device event through the helper; want the three pool producers")
     for m in calls:
@@ -371,7 +399,7 @@ def check_worker(pool: str, signal_hpp: str) -> None:
 
 def check_recycle(backend: str, sources: dict) -> None:
     code = blank_comments(backend)
-    sites = [m.start() for m in re.finditer(r"\bcpu_job_signal_recycle\s*\(", code)]
+    sites = [m.start() for m in word_matches(r"cpu_job_signal_recycle\s*\(", code)]
     if len(sites) != 1:
         fail("E", f"{len(sites)} calls of cpu_job_signal_recycle in ggml-sycl.cpp; want one")
     for name, src in sources.items():
@@ -384,10 +412,10 @@ def check_recycle(backend: str, sources: dict) -> None:
     w = re.search(r"sycl::event::wait\s*\(\s*events\s*\)\s*;", body)
     if not w or sites[0] - off < w.end():
         fail("E", "the slot's events are not waited before its mark is recycled")
-    heads = enclosing_headers(code, sites[0])
+    heads = enclosing_headers(body, sites[0] - off)
     if not heads or heads[0] != "if (!events.empty())":
         fail("E", "the mark is recycled outside `if (!events.empty())`, without a wait")
-    pair = [m.start() for m in re.finditer(r"\bpending_cpu_scatter_wait_prev_events\s*\(\s*\)\s*;", code)]
+    pair = [m.start() for m in word_matches(r"pending_cpu_scatter_wait_prev_events\s*\(\s*\)\s*;", code)]
     tg, tg_off = body_of(code, TG_FLUSH_SIG, "E")
     if not pair or any(not (tg_off <= s < tg_off + len(tg)) for s in pair):
         fail("E", "the boundary waits of both slots are called outside ggml_sycl_cpu_tg_flush_pending")
@@ -530,13 +558,52 @@ GATE_POLLS = ((r"\.\s*get\s*\(\s*\)", "takes a value (`.get()`)"),
               (r"\bwait_for\s*\(", "polls (`wait_for`)"),
               (r"\bwait_until\s*\(", "polls (`wait_until`)"))
 LOCKS = r"\b(?:lock_guard|unique_lock|scoped_lock|retained_store_lock)\b"
+# The queue wait holds no lock at all, so any lock form counts there: a guard of any kind or a raw lock() call.
+QUEUE_LOCKS = (r"\b(?:lock_guard|unique_lock|scoped_lock|shared_lock|retained_store_lock)\b"
+               r"|\.\s*(?:lock|lock_shared|try_lock)\s*\(")
 WAIT_TIMER_SIG = r"struct\s+retained_drain_wait_timer\s*\{"
 CENSUS_ENABLE_SIG = r"void\s+retained_handle_drain_census_enable\s*\(\s*\)\s*noexcept\s*\{"
 CENSUS_TAKE_SIG = r"retained_handle_drain_census\s+retained_handle_drain_census_take\s*\(\s*\)\s*noexcept\s*\{"
 WAITS_ENABLED_SIG = r"static\s+bool\s+moe_hostpath_waits_enabled\s*\(\s*\)\s*\{"
+DRAIN_COUNT_SIG = r"static\s+void\s+moe_hostpath_waits_drain\s*\(\s*size_t\s+gate_waits\s*,[^)]*\)\s*\{"
+DRAIN_COUNT_BODY = ("const moe_hostpath_clock::time_point t_waited = moe_hostpath_wait_begin(); "
+                    "if (!moe_hostpath_waits_enabled()) { return; } moe_hostpath_wait_census & w = g_moe_hostpath_waits; "
+                    "w.drain_gate_waits += gate_waits; "
+                    "w.drain_gate_sleep_us += std::chrono::duration<double, std::micro>(t_slept - t_begin).count(); "
+                    "w.drain_driver_us += std::chrono::duration<double, std::micro>(t_waited - t_slept).count();")
+DRAIN_LOOKUP = ("if (const std::shared_ptr<ggml_sycl::cpu_job_gate_list> gates = "
+                "ggml_sycl::cpu_job_signal_gates(slot.prev_scatter.signal_mark)) {")
+DRAIN_SEQ = ("const moe_hostpath_clock::time_point t_begin = moe_hostpath_wait_begin(); size_t gate_waits = 0; " +
+             DRAIN_LOOKUP + " gate_waits = gates->wait_upto(slot.prev_scatter.signal_mark.gate_serial); } "
+             "const moe_hostpath_clock::time_point t_slept = moe_hostpath_wait_begin(); sycl::event::wait(events); "
+             "moe_hostpath_waits_drain(gate_waits, t_begin, t_slept); events.clear(); "
+             "ggml_sycl::cpu_job_signal_recycle(slot.prev_scatter.signal_mark);")
+DRAIN_PRINT = ('at += snprintf(line + at, sizeof(line) - at, " %s=%llu/%.0fus", names[c], '
+               '(unsigned long long) w.count[c], w.us[c]); '
+               'if (c == MOE_WAIT_B7 && at < (int) sizeof(line)) { at += snprintf(line + at, sizeof(line) - at, '
+               '" drain_gate_waits=%llu drain_gate_sleep_us=%.0f drain_driver_us=%.0f", (unsigned long long) '
+               'w.drain_gate_waits, w.drain_gate_sleep_us, w.drain_driver_us); }')
 REAPER_COUNTERS = ("records", "gates", "gate_sleep_ns", "driver_ns")
 GATE_SLEEP_STMT = "const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*stream);"
 SCOPE_STMT = "const ggml_sycl::retained_handle_gate_scope gate_scope(ws.gates);"
+READBACK_SIG = r"static\s+void\s+moe_hostpath_waits_readback\s*\(\s*int\s+layer\s*,\s*bool\s+async[^)]*\)\s*\{"
+QUEUE_WAIT_SIG = r"static\s+void\s+ggml_sycl_trace_queue_wait\s*\(\s*queue_ptr\s+q\s*,[^)]*\)\s*\{"
+QUEUE_CLEAR_SIG = (r"static\s+void\s+ggml_sycl_cpu_job_gates_clear_queue_wait\s*\(\s*const\s+"
+                   r"ggml_sycl_cpu_job_gate_sleep\s*&\s*sleep\s*\)\s*\{")
+QUEUE_CLEAR_BODY = ("const moe_hostpath_clock::time_point t_waited = moe_hostpath_wait_begin(); "
+                    "if (sleep.gates && sleep.newest != 0) { sleep.gates->clear_upto(sleep.newest); } "
+                    "if (!moe_hostpath_waits_enabled()) { return; } "
+                    "moe_hostpath_wait_census & w = g_moe_hostpath_waits; "
+                    "w.queue_gate_waits += sleep.waited; "
+                    "w.queue_gate_sleep_us += std::chrono::duration<double, std::micro>(sleep.t_slept - sleep.t_begin)"
+                    ".count(); "
+                    "w.queue_driver_us += std::chrono::duration<double, std::micro>(t_waited - sleep.t_slept).count(); "
+                    "moe_hostpath_wait_end(MOE_WAIT_B9, sleep.t_begin);")
+QUEUE_SEQ = ("const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*q); q->wait(); "
+             "ggml_sycl_cpu_job_gates_clear_queue_wait(gate_sleep);")
+QUEUE_PRINT = ('if (c == MOE_WAIT_B9 && at < (int) sizeof(line)) { at += snprintf(line + at, sizeof(line) - at, '
+               '" queue_gate_waits=%llu queue_gate_sleep_us=%.0f queue_driver_us=%.0f", (unsigned long long) '
+               'w.queue_gate_waits, w.queue_gate_sleep_us, w.queue_driver_us); }')
 
 
 def no_gate_polls(text: str, where: str) -> None:
@@ -559,7 +626,7 @@ def check_gates(s: dict) -> None:
     if want not in native:
         fail("J1", "the natively waited member does not share its future into a gate, push it to the ring's gates and "
                    "keep it for the flush's records before its wrapper becomes its dependency")
-    if len(re.findall(r"\bcpu_job_signal_gate_push\s*\(", code)) != 1:
+    if len(word_matches(r"cpu_job_signal_gate_push\s*\(", code)) != 1:
         fail("J1", "cpu_job_signal_gate_push is called outside the flush's native branch")
     loop = f.find("for (int k = 0; k < n_group; ++k) { sycl::event device_wait;")
     if loop < 0 or f.rfind("ws.gates.clear();", 0, loop) < 0:
@@ -593,8 +660,13 @@ def check_gates(s: dict) -> None:
     if sleep_at < 0 or flush_at < 0 or not (flush_at < sleep_at) or any(w < 0 or w < sleep_at for w in waits):
         fail("J2", "the synchronize does not sleep on the gates after its CPU-expert flush and before both stream "
                    "waits")
-    if len(re.findall(r"\bggml_sycl_cpu_job_gates_sleep\s*\(", code)) != 2:
-        fail("J2", "ggml_sycl_cpu_job_gates_sleep is called outside the synchronize")
+    qb, qoff = body_of(code, QUEUE_WAIT_SIG, "J2")
+    _, soff = body_of(code, SYNC_SIG, "J2")
+    rest = code[:soff] + code[soff + len(sync):]
+    rest = rest.replace(qb, "", 1)
+    if len(word_matches(r"ggml_sycl_cpu_job_gates_sleep\s*\(", rest)) != 1 or \
+            len(word_matches(r"ggml_sycl_cpu_job_gates_sleep\s*\(", sync)) != 1:
+        fail("J2", "ggml_sycl_cpu_job_gates_sleep is called outside the synchronize and the graph code's queue wait")
     sraw = sync.find("const ggml_sycl_cpu_job_gate_sleep gate_sleep")
     heads = enclosing_headers(sync, sraw) if sraw >= 0 else []
     if heads[:1] != ["try"]:
@@ -605,6 +677,12 @@ def check_gates(s: dict) -> None:
     if "sleep.gates = ggml_sycl::unified_cache_cpu_job_gates(stream);" not in flat(gs) or \
             "sleep.waited = sleep.gates->wait_all(&sleep.newest);" not in flat(gs):
         fail("J2", "the gate sleep does not wait every gate of its device's list")
+    cc = blank_comments(s["cache_cpp"])
+    cg, _ = body_of(cc, CACHE_GATES_SIG, "J2")
+    if "std::shared_ptr<cpu_job_signal_ring> ring = cache->existing_cpu_job_signal_ring();" not in flat(cg) or \
+            re.search(r"\bget_cpu_job_signal_ring\s*\(", cg):
+        fail("J2", "the synchronize's gate lookup may make a ring: unified_cache_cpu_job_gates does not read the "
+                   "device's existing ring only")
     # J3: the clears.
     gc, _ = body_of(code, GATES_CLEAR_SIG, "J3")
     gcf = flat(gc)
@@ -615,14 +693,15 @@ def check_gates(s: dict) -> None:
                    "never clear")
     wb, _ = body_of(code, WAIT_SLOT_SIG, "J3")
     wf = flat(wb).strip()
-    g = wf.find("(void) gates->wait_upto(slot.prev_scatter.signal_mark.gate_serial);")
+    look = wf.find(DRAIN_LOOKUP)
+    g = wf.find("gates->wait_upto(slot.prev_scatter.signal_mark.gate_serial);")
     e = wf.find("sycl::event::wait(events);")
-    if g < 0 or e < 0 or g > e or not wf.startswith("std::vector<sycl::event> & events = slot.prev_scatter.scatter_events; "
-                                                      "if (!events.empty()) { moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7); "
-                                                      "if (const std::shared_ptr<ggml_sycl::cpu_job_gate_list> gates = "
-                                                      "ggml_sycl::cpu_job_signal_gates(slot.prev_scatter.signal_mark)) {"):
+    lraw = wb.find("if (const std::shared_ptr<ggml_sycl::cpu_job_gate_list> gates")
+    lheads = enclosing_headers(wb, lraw) if lraw >= 0 else []
+    if look < 0 or g < look or e < 0 or g > e or lheads[:1] != ["if (!events.empty())"] or \
+            not wf.startswith("std::vector<sycl::event> & events = slot.prev_scatter.scatter_events; "
+                              "if (!events.empty()) { moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7); "):
         fail("J3", "the boundary does not sleep on its mark's gates, inside its B7 timer, before its event wait")
-    cc = blank_comments(s["cache_cpp"])
     rb, _ = body_of(cc, RECYCLE_SIG, "J3")
     if flat(rb).strip() != ("if (mark) { (void) mark.ring->recycle(mark.serial); "
                             "mark.ring->gates().clear_upto(mark.gate_serial); } mark = cpu_job_signal_mark{};"):
@@ -651,7 +730,6 @@ def check_gates(s: dict) -> None:
     pre = sf[:sleep_at] if sleep_at >= 0 else sf
     if re.search(LOCKS, pre):
         fail("J4", "the synchronize takes a lock before its gate sleep")
-    cg, _ = body_of(cc, CACHE_GATES_SIG, "J4")
     if re.search(LOCKS, cg):
         fail("J4", "unified_cache_cpu_job_gates holds a lock it would return under")
     mem = blank_comments(s["mem_cpp"])
@@ -683,7 +761,7 @@ def check_gates(s: dict) -> None:
     rb_body, _ = body_of(code, r"static\s+void\s+moe_hostpath_waits_readback\s*\(\s*int\s+layer\s*,\s*bool\s+async[^)]*\)\s*\{",
                          "B8")
     rbf = flat(rb_body)
-    if '"B7", "B8" };' not in rbf:
+    if '"B7", "B8"' not in rbf:
         fail("B8", "the [MOE-HOSTPATH-WAITS] line does not name B8 after B7")
     m = re.search(r'GGML_LOG_WARN\(\s*((?:"[^"]*"\s*)+)', rbf)
     fmt = "".join(re.findall(r'"([^"]*)"', m.group(1))) if m else ""
@@ -695,10 +773,37 @@ def check_gates(s: dict) -> None:
             fail("B8", f"w.{field.split()[0]} is not reset with the token's counts")
     trace = [ln for ln in s["doc"].splitlines() if ln.startswith("| `GGML_SYCL_MOE_IDS_COPY_TRACE=1")]
     knob = [ln for ln in s["doc"].splitlines() if ln.startswith(f"| `{KNOB}=0`")]
-    if len(trace) != 1 or not all(f in trace[0] for f in ("B1..B8", "`gate_waits=`", "`gate_sleep_us=`", "`driver_us=`")):
+    if len(trace) != 1 or not all(f in trace[0] for f in ("`B8`", "`gate_waits=`", "`gate_sleep_us=`", "`driver_us=`")):
         fail("B8", "the catalog's trace row does not name B8 and its gate_waits=, gate_sleep_us= and driver_us= split")
     if len(knob) != 1 or "gate" not in knob[0]:
         fail("B8", f"the catalog's {KNOB}=0 row does not say that the host waits sleep on the jobs' gates")
+    gsf = flat(gs).strip()
+    if not gsf.startswith("ggml_sycl_cpu_job_gate_sleep sleep; sleep.t_begin = moe_hostpath_wait_begin(); "
+                          "sleep.gates = ") or \
+            not gsf.endswith("} sleep.t_slept = moe_hostpath_wait_begin(); return sleep;"):
+        fail("B8", "the synchronize's gate sleep is not stamped before its lookup and after its sleep")
+    if not gcf.strip().startswith("const moe_hostpath_clock::time_point t_waited = moe_hostpath_wait_begin(); "
+                                  "if (sleep.gates && sleep.newest != 0) { sleep.gates->clear_upto(sleep.newest); }") or \
+            "w.driver_us += std::chrono::duration<double, std::micro>(t_waited - sleep.t_slept).count();" not in gcf:
+        fail("B8", "driver_us is not the stream wait alone: the clear does not stamp its end first, before clear_upto, "
+                   "and count it from the sleep's end")
+    # B7D: the graph-boundary drain's split of B7.
+    dc, _ = body_of(code, DRAIN_COUNT_SIG, "B7D")
+    if flat(dc).strip() != DRAIN_COUNT_BODY:
+        fail("B7D", "moe_hostpath_waits_drain does not stamp the event wait's end first and add the drain's gate count, "
+                    "sleep and event wait, under the trace only")
+    if DRAIN_SEQ not in wf or len(word_matches(r"moe_hostpath_waits_drain\s*\(", code)) != 2:
+        fail("B7D", "the drain does not stamp its start before the gate lookup and its sleep's end before the event "
+                    "wait, and count once, right after the event wait and before the recycle")
+    if DRAIN_PRINT not in rbf:
+        fail("B7D", "the [MOE-HOSTPATH-WAITS] line does not print drain_gate_waits=, drain_gate_sleep_us= and "
+                    "drain_driver_us= right after B7=")
+    for field in ("drain_gate_waits = 0;", "drain_gate_sleep_us = 0.0;", "drain_driver_us = 0.0;"):
+        if not re.search(r"\bw\." + re.escape(field).replace("\\ ", r"\s*"), rbf):
+            fail("B7D", f"w.{field.split()[0]} is not reset with the token's counts")
+    if not all(f in trace[0] for f in ("`drain_gate_waits=`", "`drain_gate_sleep_us=`", "`drain_driver_us=`")):
+        fail("B7D", "the catalog's trace row does not name the drain's drain_gate_waits=, drain_gate_sleep_us= and "
+                    "drain_driver_us= split")
     # R: the reaper's census.
     if "record.event.wait_and_throw(); wait_timer.waited();" not in dlf:
         fail("R", "the reaper does not count a record's wait right after its event wait returns")
@@ -722,10 +827,10 @@ def check_gates(s: dict) -> None:
         fail("R", "the census is not turned on by its enable, or its take does not zero every counter")
     en, _ = body_of(code, WAITS_ENABLED_SIG, "R")
     if "const bool on = env && std::atoi(env) != 0; if (on) { ggml_sycl::retained_handle_drain_census_enable(); } " \
-            "return on;" not in flat(en) or len(re.findall(r"\bretained_handle_drain_census_enable\s*\(", code)) != 1:
+            "return on;" not in flat(en) or len(word_matches(r"retained_handle_drain_census_enable\s*\(", code)) != 1:
         fail("R", "the trace does not turn the reaper's census on exactly when it is on, and only there")
     take = "const ggml_sycl::retained_handle_drain_census rd = ggml_sycl::retained_handle_drain_census_take();"
-    if rbf.count(take) != 1 or len(re.findall(r"\bretained_handle_drain_census_take\s*\(", code)) != 1 or \
+    if rbf.count(take) != 1 or len(word_matches(r"retained_handle_drain_census_take\s*\(", code)) != 1 or \
             "driver_us=%.0f reaper=%llu/%.0fus reaper_gate_waits=%llu reaper_gate_sleep_us=%.0f reaper_driver_us=%.0f " \
             "ready_queries=" not in fmt or \
             "w.driver_us, (unsigned long long) rd.records, rd.gate_sleep_us + rd.driver_us, " \
@@ -739,10 +844,58 @@ def check_gates(s: dict) -> None:
                   "and reaper_driver_us= split")
 
 
+
+def check_queue_waits(s: dict) -> None:
+    code = blank_comments(s["backend"])
+    qb, _ = body_of(code, QUEUE_WAIT_SIG, "B9")
+    qf = flat(qb)
+    if re.search(QUEUE_LOCKS, strip_strings(qb)):
+        fail("J4", "the graph code's queue wait takes a lock it would sleep under")
+    if qf.count(QUEUE_SEQ) != 2 or len(re.findall(r"\bq->wait\(\);", qf)) != 2:
+        fail("B9", "a queue wait of the graph code does not sleep on the gates right before it and clear them right "
+                   "after it")
+    if not re.search(r"if \(!enabled\) \{ " + re.escape(QUEUE_SEQ) + r" return; \}", qf):
+        fail("B9", "the untraced queue wait does not sleep on the gates first")
+    begin = qf.find('fprintf(stderr, "[SYCL-WAIT] begin reason=')
+    traced = ("fflush(stderr); const auto t0 = std::chrono::high_resolution_clock::now(); " + QUEUE_SEQ +
+              " const auto t1 = std::chrono::high_resolution_clock::now();")
+    if begin < 0 or qf.find(traced) < begin:
+        fail("B9", "the traced queue wait does not sleep after its begin line and inside its wait_ms")
+    qc, _ = body_of(code, QUEUE_CLEAR_SIG, "B9")
+    no_gate_polls(qc, "the queue wait's gate clear")
+    if flat(qc).strip() != QUEUE_CLEAR_BODY:
+        fail("B9", "the queue wait's clear does not stamp the wait's end first, clear what the sleep waited before "
+                   "the trace check, and count the sleep and the queue wait under B9, under the trace only")
+    if len(word_matches(r"ggml_sycl_cpu_job_gates_clear_queue_wait\s*\(", code)) != 3:
+        fail("B9", "ggml_sycl_cpu_job_gates_clear_queue_wait is called outside the graph code's queue waits")
+    hpp = flat(blank_comments(s["hostpath_hpp"]))
+    if "MOE_WAIT_B8, MOE_WAIT_B9, MOE_WAIT_COUNT," not in hpp:
+        fail("B9", "moe_hostpath_wait_class has no B9 right after B8")
+    rb_body, _ = body_of(code, READBACK_SIG, "B9")
+    rbf = flat(rb_body)
+    if '"B8", "B9" };' not in rbf:
+        fail("B9", "the [MOE-HOSTPATH-WAITS] line does not name B9 after B8")
+    if DRAIN_PRINT + " " + QUEUE_PRINT not in rbf:
+        fail("B9", "the [MOE-HOSTPATH-WAITS] line does not print queue_gate_waits=, queue_gate_sleep_us= and "
+                   "queue_driver_us= right after B9=")
+    for field in ("queue_gate_waits = 0;", "queue_gate_sleep_us = 0.0;", "queue_driver_us = 0.0;"):
+        if not re.search(r"\bw\." + re.escape(field).replace("\\ ", r"\s*"), rbf):
+            fail("B9", f"w.{field.split()[0]} is not reset with the token's counts")
+    trace = [ln for ln in s["doc"].splitlines() if ln.startswith("| `GGML_SYCL_MOE_IDS_COPY_TRACE=1")]
+    knob = [ln for ln in s["doc"].splitlines() if ln.startswith(f"| `{KNOB}=0`")]
+    if len(trace) != 1 or not all(f in trace[0] for f in ("B1..B9", "`B9`", "`queue_gate_waits=`",
+                                                          "`queue_gate_sleep_us=`", "`queue_driver_us=`")):
+        fail("B9", "the catalog's trace row does not name B9 and its queue_gate_waits=, queue_gate_sleep_us= and "
+                   "queue_driver_us= split")
+    if len(knob) != 1 or "`ggml_sycl_trace_queue_wait`" not in knob[0]:
+        fail("B9", f"the catalog's {KNOB}=0 row does not say that the graph code's queue waits sleep on the gates")
+
+
 def read_sources(root: Path) -> dict:
     s = {}
     for key, path in (("backend", BACKEND), ("pool", POOL), ("signal_hpp", SIGNAL_HPP), ("cache_cpp", CACHE_CPP),
-                      ("common_cpp", COMMON_CPP), ("doc", DOC), ("mem_cpp", MEM_CPP)):
+                      ("common_cpp", COMMON_CPP), ("doc", DOC), ("mem_cpp", MEM_CPP),
+                      ("hostpath_hpp", HOSTPATH_HPP)):
         p = root / path.relative_to(ROOT)
         s[key] = p.read_text(encoding="utf-8") if p.exists() else ""
     others = {}
@@ -768,6 +921,7 @@ def check(s: dict) -> None:
     check_knob(s["backend"], getenvs, s["doc"])
     check_no_host_wait(s["backend"], s["cache_cpp"])
     check_gates(s)
+    check_queue_waits(s)
 
 
 def self_test(s: dict) -> int:
@@ -823,10 +977,10 @@ def self_test(s: dict) -> int:
          sub(r"pending_cpu_scatter_retire\(\*group\[k\], ws\.events, signal_mark\);",
              "pending_cpu_scatter_retire(*group[k], ws.events, {});")),
         ("E", "backend", "recycle before the wait",
-         sub(r"(\s*)sycl::event::wait\(events\);\n(\s*)events\.clear\(\);\n(\s*)"
-             r"ggml_sycl::cpu_job_signal_recycle\(slot\.prev_scatter\.signal_mark\);",
+         sub(r"(\s*)sycl::event::wait\(events\);\n(\s*)moe_hostpath_waits_drain\(gate_waits, t_begin, t_slept\);"
+             r"\n(\s*)events\.clear\(\);\n(\s*)ggml_sycl::cpu_job_signal_recycle\(slot\.prev_scatter\.signal_mark\);",
              r"\1ggml_sycl::cpu_job_signal_recycle(slot.prev_scatter.signal_mark);\1sycl::event::wait(events);"
-             r"\n\2events.clear();")),
+             r"\n\2moe_hostpath_waits_drain(gate_waits, t_begin, t_slept);\n\3events.clear();")),
         ("E", "backend", "recycle with nothing waited",
          sub(r"\n(\s*)slot\.prev_scatter\.signal_mark = \{\};\n\}",
              r"\n\1ggml_sycl::cpu_job_signal_recycle(slot.prev_scatter.signal_mark);\n}")),
@@ -890,7 +1044,7 @@ def self_test(s: dict) -> int:
         ("I", "cache_cpp", "a signal bypasses the fence",
          sub(r"(if \(book_\.signal\(id, generation\) && live_\) \{\n\s*)signal_native_locked\(id\);",
              r"\1(void) l0_->host_signal(events_[id]);")),
-        # The gates (J1-J5, B8).
+        # The gates (J1-J5, B8, B7D).
         ("J1", "backend", "the native member pushes no gate",
          sub(r"\n\s*ggml_sycl::cpu_job_signal_gate_push\(signal_mark, gate\);", "")),
         ("J1", "backend", "the native member's records get no gate",
@@ -935,10 +1089,25 @@ def self_test(s: dict) -> int:
         ("J3", "backend", "the boundary sleeps after its event wait",
          sub(r"(\n\s*if \(const std::shared_ptr<ggml_sycl::cpu_job_gate_list> gates =\n\s*"
              r"ggml_sycl::cpu_job_signal_gates\(slot\.prev_scatter\.signal_mark\)\) \{\n\s*"
-             r"\(void\) gates->wait_upto\(slot\.prev_scatter\.signal_mark\.gate_serial\);\n\s*\})"
-             r"(\n\s*sycl::event::wait\(events\);)", r"\2\1")),
+             r"gate_waits = gates->wait_upto\(slot\.prev_scatter\.signal_mark\.gate_serial\);\n\s*\})"
+             r"(\n\s*const moe_hostpath_clock::time_point t_slept = moe_hostpath_wait_begin\(\);)"
+             r"(\n\s*sycl::event::wait\(events\);)", r"\2\3\1")),
         ("J3", "backend", "the boundary does not sleep",
-         sub(r"\(void\) gates->wait_upto\(slot\.prev_scatter\.signal_mark\.gate_serial\);", "(void) gates;")),
+         sub(r"gate_waits = gates->wait_upto\(slot\.prev_scatter\.signal_mark\.gate_serial\);", "(void) gates;")),
+        ("J3", "backend", "the boundary sleeps outside its non-empty branch",
+         lambda t: re.sub(r"(\n(\s*)std::vector<sycl::event> & events = slot\.prev_scatter\.scatter_events;)",
+                          r"\1\n\2if (const std::shared_ptr<ggml_sycl::cpu_job_gate_list> gates =\n\2        "
+                          r"ggml_sycl::cpu_job_signal_gates(slot.prev_scatter.signal_mark)) {\n\2    "
+                          r"(void) gates->wait_upto(slot.prev_scatter.signal_mark.gate_serial);\n\2}",
+                          re.sub(r"\n\s*if \(const std::shared_ptr<ggml_sycl::cpu_job_gate_list> gates =\n\s*"
+                                 r"ggml_sycl::cpu_job_signal_gates\(slot\.prev_scatter\.signal_mark\)\) \{\n\s*"
+                                 r"gate_waits = gates->wait_upto\(slot\.prev_scatter\.signal_mark\.gate_serial\);"
+                                 r"\n\s*\}", "", t, count=1), count=1)),
+        ("J2", "backend", "a third site sleeps on the gates",
+         lambda t: t + ("\nstatic void extra_gate_sleep(sycl::queue & q) {\n"
+                        "    (void) ggml_sycl_cpu_job_gates_sleep(q);\n}\n")),
+        ("J2", "cache_cpp", "the synchronize's gate lookup makes a ring",
+         sub(r"ring = cache->existing_cpu_job_signal_ring\(\);", "ring = cache->get_cpu_job_signal_ring();")),
         ("J3", "cache_cpp", "the recycle keeps the gates",
          sub(r"\n\s*mark\.ring->gates\(\)\.clear_upto\(mark\.gate_serial\);", "")),
         ("J3", "cache_cpp", "the shutdown keeps the gates",
@@ -977,11 +1146,101 @@ def self_test(s: dict) -> int:
                                  r"if \(gate\.valid\(\)\) \{\n\s*gate\.wait\(\);\n\s*\}\n\s*\}", "", t, count=1),
                           count=1)),
         ("B8", "backend", "the line loses gate_sleep_us", sub(r'"gate_sleep_us=%\.0f ', '"')),
-        ("B8", "backend", "B8 is not named", sub(r'"B7", "B8" \};', '"B7", "B7" };')),
+        ("B8", "backend", "B8 is not named", sub(r'"B7",(\s+)"B8",(\s+)"B9"(\s*)\};', r'"B7",\1"B7",\2"B9"\3};')),
         ("B8", "backend", "driver_us is not reset", sub(r"\n\s*w\.driver_us\s*= 0\.0;", "")),
+        ("B8", "backend", "the synchronize stamps its stream wait after the clear",
+         sub(r"(\n    const moe_hostpath_clock::time_point t_waited = moe_hostpath_wait_begin\(\);)"
+             r"(\n    if \(sleep\.gates && sleep\.newest != 0\) \{\n        sleep\.gates->clear_upto\(sleep\.newest\);"
+             r"\n    \})", r"\2\1")),
+        ("B8", "backend", "the synchronize stamps its sleep's end before the sleep",
+         sub(r"(\n    if \(sleep\.gates\) \{\n        sleep\.waited = sleep\.gates->wait_all\(&sleep\.newest\);\n    \})"
+             r"(\n    sleep\.t_slept = moe_hostpath_wait_begin\(\);)", r"\2\1")),
+        ("B7D", "backend", "the drain stamps its sleep's end after the event wait",
+         sub(r"(\n\s*const moe_hostpath_clock::time_point t_slept = moe_hostpath_wait_begin\(\);)"
+             r"(\n\s*sycl::event::wait\(events\);)", r"\2\1")),
+        ("B7D", "backend", "the drain counts after the recycle",
+         sub(r"(\n\s*moe_hostpath_waits_drain\(gate_waits, t_begin, t_slept\);)(\n\s*events\.clear\(\);"
+             r"\n\s*ggml_sycl::cpu_job_signal_recycle\(slot\.prev_scatter\.signal_mark\);)", r"\2\1")),
+        ("B7D", "backend", "the drain's event wait is timed from its start",
+         sub(r"\(t_waited - t_slept\)", "(t_waited - t_begin)")),
+        ("B7D", "backend", "the drain drops its gate count",
+         sub(r"gate_waits = gates->wait_upto\(", "(void) gates->wait_upto(")),
+        ("B7D", "backend", "the drain counts with the trace off",
+         sub(r"(moe_hostpath_waits_drain\([^{]*\{\n\s*const moe_hostpath_clock::time_point t_waited = "
+             r"moe_hostpath_wait_begin\(\);)\n\s*if \(!moe_hostpath_waits_enabled\(\)\) \{\n\s*return;\n\s*\}", r"\1")),
+        ("B7D", "backend", "the drain's split is printed after B8",
+         sub(r"c == MOE_WAIT_B7 && at", "c == MOE_WAIT_B8 && at")),
+        ("B7D", "backend", "the line loses drain_driver_us", sub(r' drain_driver_us=%\.0f"', '"')),
+        ("B7D", "backend", "drain_gate_sleep_us is not reset", sub(r"\n\s*w\.drain_gate_sleep_us\s*= 0\.0;", "")),
+        ("B7D", "doc", "the trace row loses drain_gate_sleep_us",
+         lambda t: "\n".join(ln.replace("`drain_gate_sleep_us=`", "`drain_sleep_us=`")
+                             if ln.startswith("| `GGML_SYCL_MOE_IDS_COPY_TRACE=1") else ln for ln in t.split("\n"))),
         ("B8", "doc", "the trace row loses driver_us",
          lambda t: "\n".join(ln.replace("`driver_us=`", "`driver=`") if ln.startswith("| `GGML_SYCL_MOE_IDS_COPY_TRACE=1")
                              else ln for ln in t.split("\n"))),
+        # The graph code's queue waits (B9).
+        ("B9", "backend", "the untraced queue wait does not sleep",
+         sub(r"(if \(!enabled\) \{\n)\s*const ggml_sycl_cpu_job_gate_sleep gate_sleep = "
+             r"ggml_sycl_cpu_job_gates_sleep\(\*q\);\n(\s*q->wait\(\);\n)\s*"
+             r"ggml_sycl_cpu_job_gates_clear_queue_wait\(gate_sleep\);\n", r"\1\2")),
+        ("B9", "backend", "the traced queue wait does not sleep",
+         sub(r"(high_resolution_clock::now\(\);\n)\s*const ggml_sycl_cpu_job_gate_sleep gate_sleep = "
+             r"ggml_sycl_cpu_job_gates_sleep\(\*q\);\n(\s*q->wait\(\);\n)\s*"
+             r"ggml_sycl_cpu_job_gates_clear_queue_wait\(gate_sleep\);\n", r"\1\2")),
+        ("B9", "backend", "the untraced queue wait sleeps after it waits",
+         sub(r"(if \(!enabled\) \{\n)(\s*const ggml_sycl_cpu_job_gate_sleep gate_sleep = "
+             r"ggml_sycl_cpu_job_gates_sleep\(\*q\);\n)(\s*q->wait\(\);\n)", r"\1\3\2")),
+        ("B9", "backend", "the untraced queue wait keeps its gates",
+         sub(r"(if \(!enabled\) \{\n\s*const ggml_sycl_cpu_job_gate_sleep gate_sleep = "
+             r"ggml_sycl_cpu_job_gates_sleep\(\*q\);\n\s*q->wait\(\);\n)\s*"
+             r"ggml_sycl_cpu_job_gates_clear_queue_wait\(gate_sleep\);\n", r"\1        (void) gate_sleep;\n")),
+        ("B9", "backend", "the trace's wait_ms leaves out the sleep",
+         sub(r"(\n\s*const auto\s+t0\s+= std::chrono::high_resolution_clock::now\(\);)"
+             r"(\n\s*const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep\(\*q\);)",
+             r"\2\1")),
+        ("B9", "backend", "the traced queue wait sleeps before its begin line",
+         lambda t: re.sub(r"(\n(\s*)fprintf\(stderr, \"\[SYCL-WAIT\] begin reason=)",
+                          r"\n\2const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*q);\1",
+                          re.sub(r"(high_resolution_clock::now\(\);)\n\s*const ggml_sycl_cpu_job_gate_sleep "
+                                 r"gate_sleep = ggml_sycl_cpu_job_gates_sleep\(\*q\);", r"\1", t, count=1),
+                          count=1)),
+        ("B9", "backend", "the queue clear stamps its wait after the clear",
+         sub(r"(ggml_sycl_cpu_job_gates_clear_queue_wait\(const ggml_sycl_cpu_job_gate_sleep & sleep\) \{)"
+             r"(\n    const moe_hostpath_clock::time_point t_waited = moe_hostpath_wait_begin\(\);)"
+             r"(\n    if \(sleep\.gates && sleep\.newest != 0\) \{\n        sleep\.gates->clear_upto\(sleep\.newest\);"
+             r"\n    \})", r"\1\3\2")),
+        ("B9", "backend", "the queue waits count under B8",
+         sub(r"moe_hostpath_wait_end\(MOE_WAIT_B9, sleep\.t_begin\);",
+             "moe_hostpath_wait_end(MOE_WAIT_B8, sleep.t_begin);")),
+        ("B9", "backend", "the queue waits count into the synchronize's split",
+         sub(r"w\.queue_driver_us \+=", "w.driver_us +=")),
+        ("B9", "backend", "a fourth site clears the queue gates",
+         lambda t: t + "\nstatic void extra_gate_clear(const ggml_sycl_cpu_job_gate_sleep & s) {\n"
+                       "    ggml_sycl_cpu_job_gates_clear_queue_wait(s);\n}\n"),
+        ("J4", "backend", "the queue wait sleeps under a lock",
+         sub(r"(if \(!enabled\) \{\n)(\s*const ggml_sycl_cpu_job_gate_sleep gate_sleep = "
+             r"ggml_sycl_cpu_job_gates_sleep\(\*q\);)",
+             r"\1        std::lock_guard<std::mutex> held(g_execution_backend_binding_mutex);\n\2")),
+        ("J4", "backend", "the queue wait takes a raw lock around its traced sleep",
+         sub(r"(\n(\s*)const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep\(\*q\);\n"
+             r"\s*q->wait\(\);\n\s*ggml_sycl_cpu_job_gates_clear_queue_wait\(gate_sleep\);\n)"
+             r"(\s*const auto\s+t1)",
+             r"\n\2g_execution_backend_binding_mutex.lock();\1\2g_execution_backend_binding_mutex.unlock();\n\3")),
+        ("B9", "backend", "B9 is not named", sub(r'"B8",(\s+)"B9"(\s*)\};', r'"B8",\1"B8"\2};')),
+        ("B9", "backend", "the queue split is printed after B8",
+         sub(r"c == MOE_WAIT_B9 && at", "c == MOE_WAIT_B8 && at")),
+        ("B9", "backend", "the line loses queue_driver_us", sub(r' queue_driver_us=%\.0f"', '"')),
+        ("B9", "backend", "queue_gate_sleep_us is not reset", sub(r"\n\s*w\.queue_gate_sleep_us\s*= 0\.0;", "")),
+        ("B9", "hostpath_hpp", "no B9 class", sub(r"\n    MOE_WAIT_B9,", "")),
+        ("B9", "doc", "the trace row loses queue_gate_sleep_us",
+         lambda t: "\n".join(ln.replace("`queue_gate_sleep_us=`", "`queue_sleep_us=`")
+                             if ln.startswith("| `GGML_SYCL_MOE_IDS_COPY_TRACE=1") else ln for ln in t.split("\n"))),
+        ("B9", "doc", "the trace row still counts B1..B8",
+         lambda t: "\n".join(ln.replace("B1..B9", "B1..B8") if ln.startswith("| `GGML_SYCL_MOE_IDS_COPY_TRACE=1")
+                             else ln for ln in t.split("\n"))),
+        ("B9", "doc", "the knob row does not name the queue waits",
+         lambda t: "\n".join(ln.replace("`ggml_sycl_trace_queue_wait`", "the queue waits")
+                             if ln.startswith(f"| `{KNOB}=0`") else ln for ln in t.split("\n"))),
         ("R", "mem_cpp", "the reaper times its waits untraced",
          sub(r"bool(\s+)on(\s+)= g_retained_drain_census_on\.load\(std::memory_order_relaxed\);", "bool on = true;")),
         ("R", "mem_cpp", "the reaper never counts a wait", sub(r"\n\s*wait_timer\.waited\(\);", "")),

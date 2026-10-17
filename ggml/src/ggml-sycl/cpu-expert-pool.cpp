@@ -385,10 +385,12 @@ std::future<void> CpuExpertPool::submit_batch(std::vector<cpu_expert_task>      
                     pool_trace_record_job(tasks.size(), t_submit, t_start, t_done, overlapped, stamps);
                 }
                 promise->set_value();
-                // A throw above signals the job half while it unwinds, and both handlers rethrow it. worker_thread
-                // has no handler, so std::terminate runs ggml's terminate handler (a gdb backtrace, then abort). In
-                // that window the device can scatter the job's stale staging and one token can be sampled before
-                // the abort; the exit is abnormal, so no silent wrong answer persists.
+                // A throw above signals the job half while it unwinds to the handlers, and both rethrow it.
+                // worker_thread has no handler, so std::terminate runs ggml's terminate handler (a gdb backtrace,
+                // then abort) without unwinding further: the promise is neither set nor broken. The device may then
+                // copy the job's partial output, but no token is sampled from it. Every logits read synchronizes the
+                // backend first, and the synchronize sleeps on the job's gate (cpu_job_gate_list) until the abort; a
+                // job with no device event holds the device itself, since its join waits the same unset future.
             } catch (const ggml_sycl_fallback_error &) {
                 throw;
             } catch (...) {
@@ -417,9 +419,9 @@ void CpuExpertPool::stop_workers() {
                 // A process killed while teardown waits leaves that copy parked; probed on the B50, such a process
                 // is reaped at once and the card and its other tenants keep working. Its future stays unset too, so
                 // the job's gate (cpu_job_gate_list) stays shut: a host wait that sleeps on it first does not return
-                // until the job ends, as the device wait behind it would not. Every other job completes its future:
-                // a worker drains the queue before it exits, and a job still queued when the pool is destroyed breaks
-                // its promise.
+                // until the job ends, as the device wait behind it would not. Every other job completes its future,
+                // save one that throws (cpu_job_gate_list's hazard): a worker drains the queue before it exits, and a
+                // job still queued when the pool is destroyed breaks its promise.
                 GGML_LOG_WARN(
                     "[CPU-EXPERT-POOL] Worker thread did not exit within 5s; a device copy waiting on its job "
                     "stays parked until the job ends\n");

@@ -929,6 +929,8 @@ void retain_handles_until_event_transactional(std::vector<mem_handle> handles, s
 class retained_handle_gate_scope {
   public:
     explicit retained_handle_gate_scope(const std::vector<std::shared_future<void>> & gates) noexcept;
+    // The scope keeps a pointer to `gates`, which a temporary would leave dangling.
+    retained_handle_gate_scope(const std::vector<std::shared_future<void>> &&) = delete;
     ~retained_handle_gate_scope() noexcept;
 
     retained_handle_gate_scope(const retained_handle_gate_scope &)             = delete;

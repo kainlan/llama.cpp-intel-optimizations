@@ -24098,6 +24098,7 @@ using ggml_sycl::MOE_WAIT_B1;
 using ggml_sycl::MOE_WAIT_B4B;
 using ggml_sycl::MOE_WAIT_B7;
 using ggml_sycl::MOE_WAIT_B8;
+using ggml_sycl::MOE_WAIT_B9;
 using ggml_sycl::MOE_WAIT_COUNT;
 using ggml_sycl::MOE_WAIT_NONE;
 
@@ -24123,6 +24124,17 @@ struct moe_hostpath_wait_census {
     uint64_t gate_waits            = 0;
     double   gate_sleep_us         = 0.0;
     double   driver_us             = 0.0;
+    // The graph-boundary drain's part of B7, split the same way (llama.cpp-qwn5): the gates of each slot's last flush
+    // it slept on before it waited that slot's last scatter, the time asleep on them, and the time in the event waits
+    // after them.
+    uint64_t drain_gate_waits      = 0;
+    double   drain_gate_sleep_us   = 0.0;
+    double   drain_driver_us       = 0.0;
+    // The B9 queue waits split the same way (llama.cpp-qwn5): the gates they slept on, the time asleep on them,
+    // and the time in the queue waits after them.
+    uint64_t queue_gate_waits      = 0;
+    double   queue_gate_sleep_us   = 0.0;
+    double   queue_driver_us       = 0.0;
 };
 
 static thread_local moe_hostpath_wait_census g_moe_hostpath_waits;
@@ -24264,6 +24276,41 @@ static void ggml_sycl_cpu_job_gates_clear(const ggml_sycl_cpu_job_gate_sleep & s
     moe_hostpath_wait_end(MOE_WAIT_B8, sleep.t_begin);
 }
 
+// After a whole-queue wait of the backend's graph code (ggml_sycl_trace_queue_wait): drops the gates the sleep
+// waited, as ggml_sycl_cpu_job_gates_clear does after the synchronize, and counts the wait under B9, split the same
+// way. The queue wait is timed from the sleep's end to this call, before the clear, so queue_driver_us is the wait
+// itself.
+static void ggml_sycl_cpu_job_gates_clear_queue_wait(const ggml_sycl_cpu_job_gate_sleep & sleep) {
+    const moe_hostpath_clock::time_point t_waited = moe_hostpath_wait_begin();
+    if (sleep.gates && sleep.newest != 0) {
+        sleep.gates->clear_upto(sleep.newest);
+    }
+    if (!moe_hostpath_waits_enabled()) {
+        return;
+    }
+    moe_hostpath_wait_census & w = g_moe_hostpath_waits;
+    w.queue_gate_waits += sleep.waited;
+    w.queue_gate_sleep_us += std::chrono::duration<double, std::micro>(sleep.t_slept - sleep.t_begin).count();
+    w.queue_driver_us += std::chrono::duration<double, std::micro>(t_waited - sleep.t_slept).count();
+    moe_hostpath_wait_end(MOE_WAIT_B9, sleep.t_begin);
+}
+
+// After the graph-boundary drain's event wait: counts its sleep on the slot's gates and the event wait after it, as
+// ggml_sycl_cpu_job_gates_clear counts the synchronize's. The event wait is timed from the sleep's end to this call,
+// which comes before the recycle clears the gates, so drain_driver_us is the wait itself.
+static void moe_hostpath_waits_drain(size_t                         gate_waits,
+                                     moe_hostpath_clock::time_point t_begin,
+                                     moe_hostpath_clock::time_point t_slept) {
+    const moe_hostpath_clock::time_point t_waited = moe_hostpath_wait_begin();
+    if (!moe_hostpath_waits_enabled()) {
+        return;
+    }
+    moe_hostpath_wait_census & w = g_moe_hostpath_waits;
+    w.drain_gate_waits += gate_waits;
+    w.drain_gate_sleep_us += std::chrono::duration<double, std::micro>(t_slept - t_begin).count();
+    w.drain_driver_us += std::chrono::duration<double, std::micro>(t_waited - t_slept).count();
+}
+
 // Called at each expert-id readback.  A layer id lower than the last one starts a new token, so the
 // previous token's line is printed and the counts restart.  `async` names an ids copy this thread
 // enqueued and did not wait for: the event-chained hybrid decode route's (llama.cpp-7pvo), one per op.
@@ -24273,7 +24320,9 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
     }
     moe_hostpath_wait_census & w = g_moe_hostpath_waits;
     if (w.last_layer >= 0 && layer < w.last_layer) {
-        static const char * const names[MOE_WAIT_COUNT] = { "B1", "B2", "B3", "B4", "B4b", "B5", "B6", "B7", "B8" };
+        static const char * const names[MOE_WAIT_COUNT] = {
+            "B1", "B2", "B3", "B4", "B4b", "B5", "B6", "B7", "B8", "B9"
+        };
         char                      line[512];
         int                       at       = 0;
         uint64_t                  total_n  = 0;
@@ -24284,6 +24333,16 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
             }
             at += snprintf(line + at, sizeof(line) - at, " %s=%llu/%.0fus", names[c], (unsigned long long) w.count[c],
                            w.us[c]);
+            if (c == MOE_WAIT_B7 && at < (int) sizeof(line)) {
+                at += snprintf(line + at, sizeof(line) - at,
+                               " drain_gate_waits=%llu drain_gate_sleep_us=%.0f drain_driver_us=%.0f",
+                               (unsigned long long) w.drain_gate_waits, w.drain_gate_sleep_us, w.drain_driver_us);
+            }
+            if (c == MOE_WAIT_B9 && at < (int) sizeof(line)) {
+                at += snprintf(line + at, sizeof(line) - at,
+                               " queue_gate_waits=%llu queue_gate_sleep_us=%.0f queue_driver_us=%.0f",
+                               (unsigned long long) w.queue_gate_waits, w.queue_gate_sleep_us, w.queue_driver_us);
+            }
             total_n += w.count[c];
             total_us += w.us[c];
         }
@@ -24313,8 +24372,10 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
         // joinq=1 when every CPU expert job join of the token went on the join-only queue; devsig= counts the jobs
         // the device waited on their own event instead, which took no join (llama.cpp-qwn5).
         const int joinq = w.joins_join_queue > 0 && w.joins_stream == 0 ? 1 : 0;
-        // B8 splits into the gates its synchronizes slept on and the stream waits after them; reaper= is the
-        // retained-handle drain worker's record waits since the last line, split the same way (llama.cpp-qwn5).
+        // B8 splits into the gates its synchronizes slept on and the stream waits after them, the graph-boundary
+        // drain's part of B7 (printed after B7=) into its gate sleeps and event waits, B9 (printed after B9=) into
+        // its gate sleeps and queue waits; reaper= is the retained-handle drain worker's record waits since the last
+        // line, split the same way (llama.cpp-qwn5).
         const ggml_sycl::retained_handle_drain_census rd    = ggml_sycl::retained_handle_drain_census_take();
         GGML_LOG_WARN(
             "[MOE-HOSTPATH-WAITS] token=%llu readbacks=%d async=%d%s total=%llu/%.0fus gate_waits=%llu "
@@ -24374,6 +24435,12 @@ static void moe_hostpath_waits_readback(int layer, bool async = false) {
         w.gate_waits          = 0;
         w.gate_sleep_us       = 0.0;
         w.driver_us           = 0.0;
+        w.drain_gate_waits    = 0;
+        w.drain_gate_sleep_us = 0.0;
+        w.drain_driver_us     = 0.0;
+        w.queue_gate_waits    = 0;
+        w.queue_gate_sleep_us = 0.0;
+        w.queue_driver_us     = 0.0;
         rq                 = ggml_sycl_ready_query_census{};
         sw                 = ggml_sycl::mem_copy_staged_wait_census{};
         ++w.token;
@@ -26048,12 +26115,19 @@ static void pending_cpu_scatter_wait_prev_events(pending_cpu_scatter & slot) {
         moe_hostpath_wait_timer wait_timer(MOE_WAIT_B7);
         // The flush's events run after the jobs the device waits on their own events, so this thread first sleeps on
         // those jobs' gates (cpu_job_gate_list), and the event wait polls the driver only for the device work after
-        // them; the recycle below clears the gates (llama.cpp-qwn5).
+        // them; the recycle below clears the gates (llama.cpp-qwn5). The sleep adds no wait but changes how this
+        // existing one waits: it covers only the gates up to the slot's mark, whose jobs the slot's last scatter
+        // already stands behind on the in-order stream, and a job sets its promise just after it signals its event,
+        // so the sleep ends just after a signal that the event wait has to outlast anyway.
+        const moe_hostpath_clock::time_point t_begin    = moe_hostpath_wait_begin();
+        size_t                               gate_waits = 0;
         if (const std::shared_ptr<ggml_sycl::cpu_job_gate_list> gates =
                 ggml_sycl::cpu_job_signal_gates(slot.prev_scatter.signal_mark)) {
-            (void) gates->wait_upto(slot.prev_scatter.signal_mark.gate_serial);
+            gate_waits = gates->wait_upto(slot.prev_scatter.signal_mark.gate_serial);
         }
+        const moe_hostpath_clock::time_point t_slept = moe_hostpath_wait_begin();
         sycl::event::wait(events);
+        moe_hostpath_waits_drain(gate_waits, t_begin, t_slept);
         events.clear();
         ggml_sycl::cpu_job_signal_recycle(slot.prev_scatter.signal_mark);
     }
@@ -26467,11 +26541,12 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
 
         auto t1 = hrc::now();  // After the join submissions (no wait)
 
-        // Every command from here to the retention depends on the joins, so each record it publishes for the
-        // retained-handle reaper waits behind the jobs the device waits on their own events: the reaper sleeps on their
-        // gates before it waits the record's event (llama.cpp-qwn5). A host-task-joined member's buffers wait its own
-        // join, which the gates do not cover; the reaper reaches that record only after the records of this flush's
-        // commands, which do wait behind those jobs.
+        // Every record published from here to the retention carries the gates of the jobs the device waits on their
+        // own events, and the reaper sleeps on them before it waits the record's event (llama.cpp-qwn5). The scatter's
+        // commands depend on the joins, so their records sit behind those jobs; a flush that places no rows has none.
+        // The members' buffers are published last, member 0 first. Those of a natively waited member wait the flush's
+        // last event, which runs behind its job. Those of a host-task-joined member wait its own join, which the gates
+        // do not cover, so that record also sleeps on the other members' jobs: it is released later, never earlier.
         const ggml_sycl::retained_handle_gate_scope gate_scope(ws.gates);
 
         // Scatter results H2D, submitted on the in-order stream and depending on the join events wherever the
@@ -98490,6 +98565,13 @@ static void moe_layer_scan_graph_topology(ggml_backend_sycl_context & sycl_ctx,
     }
 }
 
+// Every whole-queue wait of the backend's graph code: the periodic drain, the graph-compute exit wait and the rest.
+// Before each queue wait, this thread sleeps on the gates of the CPU expert jobs the device waits on their own
+// events (cpu_job_gate_list), so the queue wait polls the driver only for the device work after those jobs
+// (llama.cpp-qwn5). That adds no wait: a gate is pushed by the flush that submits its job's scatter on the cache's
+// queue, and the list is found only for that queue, so the queue wait already waited for every job it sleeps on.
+// The sleep sits right before each queue wait, after the trace's begin line, so wait_ms still times the whole wait
+// and a sleep that does not end still shows as a begin line with no end. Both are counted under B9.
 static void ggml_sycl_trace_queue_wait(queue_ptr           q,
                                        const char *        reason,
                                        int                 device,
@@ -98524,15 +98606,19 @@ static void ggml_sycl_trace_queue_wait(queue_ptr           q,
     }
 
     if (!enabled) {
+        const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*q);
         q->wait();
+        ggml_sycl_cpu_job_gates_clear_queue_wait(gate_sleep);
         return;
     }
 
     fprintf(stderr, "[SYCL-WAIT] begin reason=%s device=%d node=%d op=%s name=%s recording=%d\n", safe_reason, device,
             node_idx, op_name, node_name, g_ggml_sycl_graph_recording ? 1 : 0);
     fflush(stderr);
-    const auto t0 = std::chrono::high_resolution_clock::now();
+    const auto                         t0         = std::chrono::high_resolution_clock::now();
+    const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep(*q);
     q->wait();
+    ggml_sycl_cpu_job_gates_clear_queue_wait(gate_sleep);
     const auto   t1      = std::chrono::high_resolution_clock::now();
     const double wait_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     fprintf(stderr, "[SYCL-WAIT] end reason=%s device=%d node=%d wait_ms=%.3f\n", safe_reason, device, node_idx,

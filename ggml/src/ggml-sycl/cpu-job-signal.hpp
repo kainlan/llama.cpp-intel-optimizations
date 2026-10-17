@@ -195,24 +195,33 @@ class cpu_job_signal_book {
 // a host thread about to wait on the device behind such a job first sleeps until the job is done.
 //
 // Why. With the job's event waited by the device itself, a host wait on the stream behind the job is a wait inside the
-// driver, which polls for the job's whole length. On the B70 at -ngl 40 two threads polled there: the one running the
-// backend's synchronize, which the scheduler calls for every cross-backend input of a single-device run (by the code
-// path about 196 times a token), and the retained-handle reaper. Both took CPU from the job's own row threads. Sleeping
-// on the job's future first leaves the driver only the device work after the job.
+// driver, which polls for the job's whole length. On the B70 at -ngl 40 two threads polled there: the submitting
+// thread, in the whole-queue waits of the backend's graph code (ggml_sycl_trace_queue_wait; the periodic drain runs
+// one every GGML_SYCL_DRAIN_INTERVAL nodes of a directly executed split), and the retained-handle reaper. Both took
+// CPU from the job's own row threads. Sleeping on the job's future first leaves the driver only the device work after
+// the job. The backend's synchronize, which the scheduler calls for every cross-backend input of a single-device run,
+// sleeps the same way, though its stream wait was short there: its own CPU-expert flush runs the graph-boundary drain
+// first, and that drain sleeps on the gates and drops them.
 //
 // A gate decides only how a host thread waits, never whether: the device wait after it is what orders the host. So a
-// gate dropped early (past max_gates, or cleared by a serial that covers it) costs only that sleep.
+// gate dropped early (past max_gates, or cleared by a serial that covers it) costs only that sleep. The one exception
+// is a job that throws (below), where a gate holds the host until an abort that is already under way.
 //
 // A gate holds only the job's shared_future: no job, no buffer, no event. wait() returns once the job's promise holds a
 // value or an exception, a broken promise included, and never throws; nothing calls get(), wait_for() or wait_until()
 // on a gate. The waits run on a snapshot taken under the list's lock and released before the first wait, so a producer
 // pushing a gate never blocks behind a sleeper; a caller holds no other lock across them either.
 //
-// The hazard. A gate opens when its job ends, and every path that ends a job reaches that (the worker after the kernel,
-// a throw that unwinds the job, the job destroyed unrun), except one: CpuExpertPool::stop_workers detaches a worker
-// that did not join within 5 s, and that worker's job may never end. Its gate then never opens, and a waiter that
-// reaches it sleeps for good. The device command parked on that job's event does not end either, so the device wait
-// the gate stands in front of would not have returned.
+// The hazard. A gate opens when its job's promise is set, by the worker after the kernel, or broken, by a job destroyed
+// unrun. Two paths leave it shut. A job that throws signals its event while it unwinds to the worker's handlers, which
+// rethrow; worker_thread has no handler, so std::terminate aborts the process without unwinding further, and the
+// promise is neither set nor broken (CpuExpertPool::submit_batch). A waiter on that gate sleeps until the abort, where
+// the device wait alone would have returned once the device had copied the job's partial output. And
+// CpuExpertPool::stop_workers detaches a worker that did not join within 5 s, whose job may never end: its gate never
+// opens, and a waiter that reaches it sleeps for good. The device command parked on that job's event does not end
+// either, so the device wait the gate stands in front of would not have returned. A process killed in that state is
+// reaped: on the B50, 13 SIGKILLs with a copy and a kernel parked on an unsignalled event were each reaped in 29-47 ms,
+// none in D-state, and the card and a co-tenant kept working.
 class cpu_job_gate_list {
   public:
     // Past this many gates something is not clearing; a push then drops the oldest.
