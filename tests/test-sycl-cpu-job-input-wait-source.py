@@ -796,7 +796,8 @@ def self_test(s: dict[str, str]) -> int:
         ("W7", "cache", "the serial is consumed before the submit",
          move(r"\n\s*cpu_job_input_marker_serial_ = serial;", r"\n\s*try \{\n\s*cpu_job_input_marker_submit\(")),
         ("W7", "cache", "the word is not host-pinned",
-         sub(r"req\.intent\.constraints\.must_host_pinned = true;", r"req.intent.constraints.must_device = true;")),
+         sub(r"(cohort_id\s*= \"cpu_job_input_marker\";\n\s*)req\.intent\.constraints\.must_host_pinned = true;",
+             r"\1req.intent.constraints.must_device = true;")),
         ("W7", "cache", "a teardown branch keeps the word", sub(end_call, "")),
         # M1: the arm's mechanics (llama.cpp-42zj).
         ("W7", "cache", "every arm takes serial 1",
@@ -805,7 +806,8 @@ def self_test(s: dict[str, str]) -> int:
         ("W7", "cache", "the word is zeroed after it is published",
          move(r"\n\s*\*word->word\s*= 0;", r"\n\s*GGML_LOG_INFO\(\n\s*\"\[MOE-INPUT-MARKER\] CPU expert jobs wait")),
         ("W7", "cache", "an out-of-order stream is not refused",
-         sub(r"\n\s*if \(!queue_\.has_property<sycl::property::queue::in_order>\(\)\) \{\n[^}]*\}", "")),
+         sub(r"\n\s*if \(!queue_\.has_property<sycl::property::queue::in_order>\(\)\) \{\n\s*\*why = \"the stream is not "
+             r"in order[^}]*\}", "")),
         ("W7", "cache", "the marker goes on the DMA queue",
          sub(r"cpu_job_input_marker_submit\(queue_,", r"cpu_job_input_marker_submit(*dma_queue_,")),
         ("W7", "cache", "the arm reaches device 0's cache",
