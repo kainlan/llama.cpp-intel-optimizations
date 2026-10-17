@@ -15,8 +15,10 @@
 //
 // The input marker (llama.cpp-42zj) is how a CPU expert job's worker waits for its inputs without the driver. Its
 // cases check that an unarmed marker is passed at once, that an armed one holds the waiter until the word reaches its
-// serial and lets it go promptly then, that the comparison survives the 32-bit word wrapping, and that a word the
-// cache abandoned lets the waiter go. Here a host thread stands in for the device's store.
+// serial and lets it go promptly then, that the comparison survives the 32-bit word wrapping, that a word the cache
+// abandoned lets the waiter go, that the abandon does not return while a waiter may still load the word (the cache
+// releases the word's allocation right after it), and that a wait outlasting the word's slow_after is reported once.
+// Here a host thread stands in for the device's store.
 //
 // ggml-sycl/cpu-job-signal.hpp includes only the standard library, so this test links nothing and opens no device.
 
@@ -565,6 +567,7 @@ static void test_marker_waits_for_serial() {
     f.store(9);
     expect_true("a word past the serial is seen (a later job's marker was written)",
                 ggml_sycl::cpu_job_input_marker_seen(f.marker));
+    expect_eq("every waiter left the reader count it joined", f.word->readers.load(), 0);
 }
 
 // Once the word reaches its serial the waiter returns promptly, every time: the loop pauses and yields, it does not
@@ -612,7 +615,9 @@ static void test_marker_abandoned() {
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     expect_true("the waiter waits on a live word below its serial", !returned);
-    f.word->abandoned.store(true, std::memory_order_release);
+    expect_returns_within(
+        "the abandon returns once no waiter is between its test of abandoned and its load of the word",
+        [&] { ggml_sycl::cpu_job_input_marker_abandon(*f.word); }, 2000);
     for (int i = 0; i < 2000 && !returned; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
@@ -623,6 +628,102 @@ static void test_marker_abandoned() {
     }
     waiter.join();
     expect_true("an abandoned marker is seen whatever its word holds", ggml_sycl::cpu_job_input_marker_seen(f.marker));
+}
+
+// The cache releases the word's allocation as soon as cpu_job_input_marker_abandon returns, and no job holds it, so the
+// abandon must set abandoned first and then hold while any waiter is between its test of that flag and its load of the
+// word. The reader counted here stands for such a waiter, caught between the two.
+static void test_marker_abandon_waits_for_readers() {
+    marker_fixture f(0, 1);
+    f.word->readers.fetch_add(1);
+    std::atomic<bool> returned{ false };
+    std::thread       abandoner([&] {
+        ggml_sycl::cpu_job_input_marker_abandon(*f.word);
+        returned = true;
+    });
+    for (int i = 0; i < 2000 && !f.word->abandoned.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!f.word->abandoned.load()) {
+        // Without the flag, the null word below would be loaded.
+        std::printf("FAIL: the abandon does not set abandoned before it waits for the readers\n");
+        std::fflush(stdout);
+        std::_Exit(1);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    expect_true("the abandon does not return while a waiter may still load the word", !returned);
+    // A waiter that arrives now sees the flag and does not load the word: a null word would fault.
+    f.word->word = nullptr;
+    expect_true("a waiter arriving during the abandon is released without loading the word",
+                ggml_sycl::cpu_job_input_marker_seen(f.marker));
+    expect_eq("that waiter leaves the reader count as it found it", f.word->readers.load(), 1);
+    f.word->readers.fetch_sub(1);
+    for (int i = 0; i < 2000 && !returned; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!returned) {
+        std::printf("FAIL: the abandon did not return within 2 s of the last reader leaving\n");
+        std::fflush(stdout);
+        std::_Exit(1);
+    }
+    abandoner.join();
+}
+
+// What the slow-wait report was told.
+static std::atomic<int>      g_slow_calls{ 0 };
+static std::atomic<uint32_t> g_slow_serial{ 0 };
+static std::atomic<int>      g_slow_device{ 0 };
+static std::atomic<double>   g_slow_waited_s{ 0.0 };
+
+static void record_slow(const cpu_job_input_marker_word & w, uint32_t serial, double waited_s) {
+    g_slow_serial   = serial;
+    g_slow_device   = w.device;
+    g_slow_waited_s = waited_s;
+    g_slow_calls.fetch_add(1);
+}
+
+// A wait that outlasts the word's slow_after is reported once, with its serial, the word's device and how long it has
+// waited, and goes on waiting; a wait that ends sooner is not reported. Without the report, a marker that never
+// arrives with the SYCL watchdog off is a silent spin.
+static void test_marker_slow_wait_reported_once() {
+    g_slow_calls = 0;
+    marker_fixture f(0, 5);
+    f.word->device     = 3;
+    f.word->slow       = record_slow;
+    f.word->slow_after = std::chrono::milliseconds(30);
+    std::atomic<bool> returned{ false };
+    std::thread       waiter([&] {
+        ggml_sycl::cpu_job_input_marker_wait(f.marker);
+        returned = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    expect_true("a slow wait goes on waiting after its report", !returned);
+    expect_eq("a wait ten times past its slow_after is reported once", g_slow_calls.load(), 1);
+    expect_eq("the report names the marker's serial", g_slow_serial.load(), 5);
+    expect_eq("the report names the word's device", static_cast<unsigned long long>(g_slow_device.load()), 3);
+    expect_true("the report says how long the wait has lasted, at least slow_after",
+                g_slow_waited_s.load() >= 0.03 && g_slow_waited_s.load() < 10.0);
+    f.store(5);
+    for (int i = 0; i < 2000 && !returned; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!returned) {
+        std::printf("FAIL: a reported wait did not return within 2 s of the word reaching its serial\n");
+        std::fflush(stdout);
+        std::_Exit(1);
+    }
+    waiter.join();
+    expect_eq("a reported wait is reported no more", g_slow_calls.load(), 1);
+
+    g_slow_calls = 0;
+    marker_fixture g(0, 1);
+    g.word->slow       = record_slow;
+    g.word->slow_after = std::chrono::milliseconds(2000);
+    std::thread prompt([&] { ggml_sycl::cpu_job_input_marker_wait(g.marker); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    g.store(1);
+    prompt.join();
+    expect_eq("a wait shorter than its slow_after is not reported", g_slow_calls.load(), 0);
 }
 
 int main() {
@@ -647,6 +748,8 @@ int main() {
     test_marker_returns_promptly();
     test_marker_wraps();
     test_marker_abandoned();
+    test_marker_abandon_waits_for_readers();
+    test_marker_slow_wait_reported_once();
     if (g_failures != 0) {
         std::printf("test-sycl-cpu-job-signal-book: %d failure(s)\n", g_failures);
         return 1;

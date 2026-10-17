@@ -37,6 +37,7 @@
 // gate list and the input marker's wait without a device.
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -481,21 +482,36 @@ class cpu_job_signal_ref {
 // owns (unified_cache_cpu_job_input_marker_arm). Discrete BMG has no host-USM atomics, so the device side is a fence
 // and a plain store. Each arm on that stream takes the next serial, and the in-order stream runs the tasks in that
 // order, so the word only advances: a word at or past a job's serial means its inputs are complete. The word is 32
-// bits, which the device stores in one write, and it is compared modulo 2^32, so the serial may wrap. The worker reads
-// the word with acquire loads, pausing and then yielding between them: no sleep, no lock and no driver call. Its job's
-// one driver call is its signal (zeEventHostSignal), which on driver 26.35 reaches no lock a host wait holds.
+// bits, which the device stores in one write, and it is compared modulo 2^32, so the serial may wrap (see
+// cpu_job_input_marker_reached for why the compare holds). The worker reads the word with acquire loads, pausing and
+// then yielding between them: no sleep, no lock and no driver call. Its job's one driver call is its signal
+// (zeEventHostSignal), which on driver 26.35 reaches no lock a host wait holds.
 //
 // Ownership. The word's allocation belongs to the unified cache, which lets it go at teardown, after its queues
 // drained, on the tearing-down thread. A job holds only the cpu_job_input_marker_word below, so a worker that drops
-// the last reference to one frees no driver memory. The cache sets abandoned before it lets the allocation go, and a
-// waiter reads that flag before each load of the word, as the ring's halves make no driver call once their ring is
-// shut down: a job still waiting then stops waiting.
+// the last reference to one frees no driver memory. A job does not hold the allocation either, so before the cache
+// lets it go it abandons the word (cpu_job_input_marker_abandon): it sets abandoned, then waits until no waiter is
+// between its test of that flag and its load of the word. A waiter counts itself in readers for exactly that span, so
+// no load of the word can follow its release, and a job still waiting then stops waiting, as the ring's halves make no
+// driver call once their ring is shut down.
 //
 // An unarmed marker is passed at once: a job with no input events, or one whose arm was refused, after which the
 // submitting thread waited the inputs itself.
+struct cpu_job_input_marker_word;
+
+// Told, on the waiting thread and once per wait, that a wait on `w`'s marker `serial` has lasted `waited_s` seconds.
+// It must make no driver call: it runs where the wait runs.
+using cpu_job_input_marker_slow_fn = void (*)(const cpu_job_input_marker_word & w, uint32_t serial, double waited_s);
+
 struct cpu_job_input_marker_word {
-    uint32_t *        word = nullptr;      // host-pinned, written by the device: a view of the cache's allocation
-    std::atomic<bool> abandoned{ false };  // set before that allocation goes: the device writes it no more
+    uint32_t *                    word = nullptr;      // host-pinned, device-written: a view of the cache's allocation
+    std::atomic<bool>             abandoned{ false };  // set before that allocation goes: the device writes it no more
+    mutable std::atomic<uint32_t> readers{ 0 };        // waiters between their test of abandoned and their word load
+    int                           device     = -1;     // the cache's device, for the slow-wait report
+    // A wait still yielding after slow_after is reported once through slow (unset: never). With the SYCL watchdog off
+    // (GGML_SYCL_OP_TIMEOUT_MS=0) a marker that never arrives is otherwise a silent spin on one core.
+    cpu_job_input_marker_slow_fn  slow       = nullptr;
+    std::chrono::milliseconds     slow_after = std::chrono::milliseconds(10000);
 };
 
 struct cpu_job_input_marker {
@@ -516,29 +532,69 @@ inline void cpu_job_input_marker_pause() {
 #endif
 }
 
-// Whether the word written `seen` has reached `serial`, modulo 2^32: true while fewer than 2^31 arms separate them.
+// Whether the word written `seen` has reached `serial`, modulo 2^32: the signed distance from `serial` to `seen`.
+//
+// The invariant the compare needs: fewer than 2^31 serials separate the word from a waiter's serial. Below the serial,
+// the word trails it only by the markers queued ahead of it on the stream and not yet run, far fewer than 2^31, so the
+// compare never says reached early, which would let a job read inputs that have not landed. Past the serial, the word
+// leads it only by the markers armed and run since; a waiter that slept through 2^31 of those would read not reached
+// and wait on until the word came round again: a late return, never an early one.
 inline bool cpu_job_input_marker_reached(uint32_t seen, uint32_t serial) {
     return static_cast<int32_t>(seen - serial) >= 0;
 }
 
-// True once the job's inputs are complete, or the marker is unarmed or abandoned. Acquire loads only.
+// True once the job's inputs are complete, or the marker is unarmed or abandoned. The waiter counts itself in readers
+// before it tests abandoned and out after its load of the word, which it makes only when the word is not abandoned:
+// cpu_job_input_marker_abandon waits for that count, so the word's allocation is never let go under the load. The
+// count and the flag are sequentially consistent on both sides (the waiter counts, then tests; the abandoner sets,
+// then reads the count), so either the abandoner sees the waiter counted or the waiter sees the flag set. Atomic loads
+// and read-modify-writes only.
 inline bool cpu_job_input_marker_seen(const cpu_job_input_marker & m) {
-    if (!m.armed() || m.word->abandoned.load(std::memory_order_acquire)) {
+    if (!m.armed()) {
         return true;
     }
-    return cpu_job_input_marker_reached(__atomic_load_n(m.word->word, __ATOMIC_ACQUIRE), m.serial);
+    const cpu_job_input_marker_word & w = *m.word;
+    w.readers.fetch_add(1, std::memory_order_seq_cst);
+    const bool seen = w.abandoned.load(std::memory_order_seq_cst) ||
+                      cpu_job_input_marker_reached(__atomic_load_n(w.word, __ATOMIC_ACQUIRE), m.serial);
+    w.readers.fetch_sub(1, std::memory_order_release);
+    return seen;
+}
+
+// Abandons `w`: sets abandoned, then returns once no waiter is between its test of abandoned and its load of the word,
+// after which the word's allocation may go. A waiter stays there for a few instructions, so this yields until it
+// leaves: no lock and no driver call.
+inline void cpu_job_input_marker_abandon(cpu_job_input_marker_word & w) {
+    w.abandoned.store(true, std::memory_order_seq_cst);
+    while (w.readers.load(std::memory_order_seq_cst) != 0) {
+        std::this_thread::yield();
+    }
 }
 
 // Returns once cpu_job_input_marker_seen(m). On the pool worker: it never sleeps, takes no lock and makes no driver
-// call. It does not tick the SYCL watchdog either, so a marker that never arrives shows as the watchdog firing.
+// call. It does not tick the SYCL watchdog either, so a marker that never arrives shows as the watchdog firing, and as
+// one call of the word's slow once the wait has yielded for its slow_after.
 inline void cpu_job_input_marker_wait(const cpu_job_input_marker & m) {
-    for (uint32_t spins = 0; !cpu_job_input_marker_seen(m);) {
+    uint32_t                              spins = 0;
+    bool                                  told  = false;
+    std::chrono::steady_clock::time_point since;
+    while (!cpu_job_input_marker_seen(m)) {
         if (spins < cpu_job_input_marker_pause_spins) {
             ++spins;
             cpu_job_input_marker_pause();
-        } else {
-            std::this_thread::yield();
+            continue;
         }
+        if (!told && m.word->slow) {
+            const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+            if (spins == cpu_job_input_marker_pause_spins) {
+                ++spins;
+                since = now;
+            } else if (now - since >= m.word->slow_after) {
+                told = true;
+                m.word->slow(*m.word, m.serial, std::chrono::duration<double>(now - since).count());
+            }
+        }
+        std::this_thread::yield();
     }
 }
 

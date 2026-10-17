@@ -39,22 +39,37 @@ THE CONTRACT.  With comments and string literals blanked:
   W5. Every prologue is built with its stream: each moe_cpu_job_prologue call passes the op's stream first, and the
       event-chained hybrid route builds its prologue before its table copy and its device-expert kernel, so the
       in-order marker does not wait for that kernel and the CPU and GPU halves still overlap.
-  W6. The pool's job lambda (cpu-expert-pool.cpp) names nothing in sycl:: and makes no wait, status query, submission
-      or ze/ur call of its own: the job's one driver call is its device signal.
+  W6. The pool's job lambda (cpu-expert-pool.cpp), and every closure ggml-sycl.cpp hands to submit_batch as a job's
+      resolve step (it runs on the worker after the prologue, before the signal), names nothing in sycl:: and makes
+      no wait, status query, submission or ze/ur call of its own, template calls such as get_info<...>() included:
+      the job's one driver call is its device signal.  At least one resolve closure is read, so the scan is not
+      vacuous.
   W7. The marker itself (cpu-job-signal.hpp, unified-cache.cpp).  The header's wait helpers call nothing but each
-      other, the pause and yield, and the acquire load; none sleeps, locks, ticks the watchdog or names sycl::.  The
-      seen test reads `abandoned` before the word, both with acquire loads.  The device task depends on the job's
-      inputs, then fences (release, system scope) before it stores the serial.  The arm takes the cache's marker
-      mutex for the whole arm, submits before it records the new serial, and takes its word from the unified cache
-      as a host-pinned allocation.  shutdown_resources ends the marker word on every branch that ends the signal
-      ring, and on the normal branch only after the queues drained.
+      other, the pause and yield, the clock, the word's slow report, and the atomic loads and read-modify-writes;
+      none sleeps, locks, ticks the watchdog or names sycl::.  The seen test counts itself in the word's readers
+      (seq_cst), then reads `abandoned` (seq_cst) and only when it is clear the word (acquire), then uncounts itself;
+      the abandon sets `abandoned` (seq_cst) and then yields until readers is 0; cpu_job_input_marker_end abandons
+      the word before it releases the owner, so no waiter's load can follow the release.  The compare is the signed
+      32-bit distance (the modulo-2^32 invariant is stated beside it).  The wait reports a slow wait at most once,
+      through the word's slow, once it has yielded for slow_after; the arm installs the cache's reporter, which only
+      logs.  The device task depends on the job's inputs, then fences (release, system scope) before it stores the
+      serial.  The arm takes the cache's marker mutex for the whole arm; refuses a stream that is not in order before
+      it allocates; zeroes the word before it publishes it; takes the next serial as the last plus one; submits every
+      marker on queue_, before it records the new serial; and takes its word from the unified cache as a host-pinned
+      allocation.  unified_cache_cpu_job_input_marker_arm reaches the cache through moe_join_queue_cache_of(stream),
+      which returns only the cache whose queue_ is that stream.  shutdown_resources ends the marker word on every
+      branch that ends the signal ring, and on the normal branch only after the queues drained.
   W8. The signal ring (cpu_job_signal_ring, unified-cache.cpp) makes no driver call that may block under mutex_, the
       lock the job's own signal takes: a host wait on another thread may hold the driver's device lock behind that
       job.  wrap makes its event and recycle resets its events outside every mutex_ scope, each call counted in
       outside_calls_ (raised before it and lowered after it); the book (consume, begin_flush, recycle_begin,
       recycle_finish) and outside_calls_ change only under mutex_; recycle does not use the book's one-lock recycle;
       and shutdown destroys native objects only inside `if (outside_calls_ == 0)`.  grow_locked, which creates pools
-      and events under mutex_, is outside this pin.
+      and events under mutex_, is outside this pin (llama.cpp-q0xu).
+  W9. The event-chained hybrid route's job waits for its experts' leases: when record->has_ready, the job's inputs
+      take record->ready, the barrier over the leases' producer events, before the prologue is built.  Its marker
+      would follow that barrier on the in-order stream anyway, but a refused arm waits exactly the inputs on the
+      submitting thread, and without it the job would read host weights still being written.
 
 WHAT THIS DOES NOT PROVE.  It reads source text.  It does not show that zeEventHostSignal stays clear of the driver's
 device lock on another driver (that is the disassembly above, for 26.35 only), that the device writes the marker
@@ -71,6 +86,10 @@ RED on 1bc3bbb1e (the base before this fix):
   sycl::event::wait; the worker's input wait may call only cpu_expert_pool_trace_stamp_inputs_ready, ...
 RED for W8 alone, on the commit that added W1-W7:
   FAIL [pin W8]: cpu_job_signal_ring::wrap makes its event under mutex_ ...
+RED for the readers drain and the slow-wait report, on 2b5fb934a (the commit that added W8):
+  FAIL [pin W7]: cpu_job_input_marker_seen does not count itself in readers (seq_cst), then test abandoned ...
+The resolve-step scan (W6), the arm's serial, zeroing, in-order refusal, queue and cache (W7) and W9 were gaps: on
+2b5fb934a each of their mutants passes the pin as it stood, and fails it here.
 """
 
 from __future__ import annotations
@@ -197,9 +216,13 @@ ARM = r"\bunified_cache_cpu_job_input_marker_arm\s*\("
 # W7: what the header's marker helpers may call. None may sleep, lock, tick the watchdog or name sycl::.
 HELPERS = {
     "cpu_job_input_marker_wait": (r"inline\s+void\s+cpu_job_input_marker_wait\s*\(([^)]*)\)\s*\{",
-                                  {"cpu_job_input_marker_seen", "cpu_job_input_marker_pause", "yield"}),
+                                  {"cpu_job_input_marker_seen", "cpu_job_input_marker_pause", "yield", "now", "slow",
+                                   "count"}),
     "cpu_job_input_marker_seen": (r"inline\s+bool\s+cpu_job_input_marker_seen\s*\(([^)]*)\)\s*\{",
-                                  {"armed", "load", "__atomic_load_n", "cpu_job_input_marker_reached"}),
+                                  {"armed", "fetch_add", "load", "__atomic_load_n", "cpu_job_input_marker_reached",
+                                   "fetch_sub"}),
+    "cpu_job_input_marker_abandon": (r"inline\s+void\s+cpu_job_input_marker_abandon\s*\(([^)]*)\)\s*\{",
+                                     {"store", "load", "yield"}),
     "cpu_job_input_marker_pause": (r"inline\s+void\s+cpu_job_input_marker_pause\s*\(([^)]*)\)\s*\{",
                                    {"__builtin_ia32_pause", "yield"}),
     "cpu_job_input_marker_reached": (r"inline\s+bool\s+cpu_job_input_marker_reached\s*\(([^)]*)\)\s*\{", set()),
@@ -207,6 +230,10 @@ HELPERS = {
 HELPER_FORBIDDEN = re.compile(r"\b(?:sleep_for|sleep_until|usleep|nanosleep|lock_guard|unique_lock|scoped_lock|"
                               r"mutex|ggml_sycl_watchdog_heartbeat|wait_for|wait_until)\b|\bsycl\s*::")
 SUBMIT_SIG = r"static\s+void\s+cpu_job_input_marker_submit\s*\(([^)]*)\)\s*\{"
+END_SIG = r"static\s+void\s+cpu_job_input_marker_end\s*\(([^)]*)\)\s*noexcept\s*\{"
+REPORT_SIG = r"static\s+void\s+cpu_job_input_marker_report_slow\s*\(([^)]*)\)\s*\{"
+ARM_FN_SIG = r"bool\s+unified_cache_cpu_job_input_marker_arm\s*\(([^)]*)\)\s*\{"
+CACHE_OF_SIG = r"static\s+unified_cache\s*\*\s*moe_join_queue_cache_of\s*\(([^)]*)\)\s*\{"
 ARM_METHOD_SIG = r"bool\s+unified_cache::arm_cpu_job_input_marker\s*\(([^)]*)\)\s*\{"
 SHUTDOWN_SIG = r"bool\s+unified_cache::shutdown_resources\s*\(([^)]*)\)\s*(?:noexcept\s*)?\{"
 
@@ -322,21 +349,132 @@ def check_wait_inputs(s: dict[str, str]) -> None:
                    "it instead of running alongside it")
 
 
+_DRIVER_USE = re.compile(r"\b(wait|wait_and_throw|wait_for|throw_asynchronous|get_info|get_profiling_info|submit|"
+                         r"single_task|parallel_for|memcpy|memset_async|fill|copy|depends_on|ext_oneapi_\w+|"
+                         r"ze[A-Z]\w*|ur[A-Z]\w*|mem_copy\w*|event_complete\w*)\s*(?:<[^;{}()]*>)?\s*\(")
+
+
+def driver_uses(body: str) -> list[str]:
+    """Driver-facing calls in `body`, template calls (get_info<...>()) included; std:: host helpers left out."""
+    flat = strip_strings(body)
+    out = set()
+    for m in _DRIVER_USE.finditer(flat):
+        if re.search(r"\bstd\s*::\s*$", flat[max(0, m.start() - 8) : m.start()]):
+            continue
+        out.add(m.group(1))
+    return sorted(out)
+
+
+def top_level_args(text: str) -> list[str]:
+    args, depth, start = [], 0, 0
+    flat = strip_strings(text)
+    for i, c in enumerate(flat):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            args.append(text[start:i])
+            start = i + 1
+    args.append(text[start:])
+    return [a.strip() for a in args]
+
+
+def lambda_body(code: str, open_bracket: int, pin: str) -> str:
+    """The body of the lambda whose capture list opens at `open_bracket`."""
+    close = code.index("]", open_bracket)
+    params = re.match(r"\s*\(", code[close + 1 :])
+    if not params:
+        fail(pin, "a lambda without a parameter list")
+    end = matching_paren(code, close + 1 + params.end() - 1)
+    body, _ = block_at(code, code.index("{", end), pin)
+    return body
+
+
+def submit_batch_resolves(code: str) -> list[tuple[int, str]]:
+    """(line, body) of every closure ggml-sycl.cpp hands to submit_batch as its resolve argument (the third)."""
+    out = []
+    for m in re.finditer(r"\b\w+\s*(?:\.|->)\s*submit_batch\s*\(", code):
+        line = code.count("\n", 0, m.start()) + 1
+        args = top_level_args(code[m.end() : matching_paren(code, m.end() - 1)])
+        if len(args) < 3:
+            fail("W6", f"ggml-sycl.cpp:{line} calls submit_batch with {len(args)} arguments, so its resolve step "
+                       "cannot be read")
+        arg = args[2]
+        if arg in ("{}", "nullptr"):
+            continue
+        named = re.fullmatch(r"std\s*::\s*move\s*\(\s*(\w+)\s*\)|(\w+)", arg)
+        if named:
+            name = named.group(1) or named.group(2)
+            defs = list(re.finditer(r"\bauto\s+" + name + r"\s*=\s*\[", code[: m.start()]))
+            if not defs:
+                fail("W6", f"ggml-sycl.cpp:{line} hands submit_batch the resolve step `{name}`, which is not an "
+                           "`auto {name} = [...](...) {{...}}` closure the pin can read")
+            out.append((line, lambda_body(code, defs[-1].end() - 1, "W6")))
+        elif arg.startswith("["):
+            out.append((line, lambda_body(code, m.end() + code[m.end() :].index(arg), "W6")))
+        else:
+            fail("W6", f"ggml-sycl.cpp:{line} hands submit_batch the resolve step `{arg}`, which the pin cannot read")
+    return out
+
+
 def check_pool_lambda(s: dict[str, str]) -> None:
     code = s["pool"]
     m = re.search(r"work_queue_\.push\(\s*\[[^\]]*\]\s*\(\s*\)\s*mutable\s*\{", code, re.S)
     if not m:
         fail("W6", "no job lambda pushed onto the pool's work queue")
     body, _ = block_at(code, code.index("{", m.end() - 1), "W6")
-    bad = sorted({q for q, n in calls(body) if DRIVER_CALL.match(n)})
+    bad = driver_uses(body)
     if bad or re.search(r"\bsycl\s*::", body):
         fail("W6", "the pool's job lambda makes driver-facing calls of its own: " +
                    (", ".join(bad) if bad else "something in sycl::") +
                    "; its one driver call is the job's device signal")
+    resolves = submit_batch_resolves(s["backend"])
+    if not resolves:
+        fail("W6", "no closure handed to submit_batch as a resolve step was found, so their scan would pass vacuously")
+    for line, body in resolves:
+        bad = driver_uses(body)
+        if bad or re.search(r"\bsycl\s*::", body):
+            fail("W6", f"the resolve step handed to submit_batch at ggml-sycl.cpp:{line} runs on the pool worker before "
+                       "the job signals, and makes driver-facing calls: " +
+                       (", ".join(bad) if bad else "something in sycl::") +
+                       "; a status query or a wait there may take the driver's device lock behind this very job")
 
 
 def check_helpers(s: dict[str, str]) -> None:
     hdr = s["header"]
+    _, seen = definition(hdr, HELPERS["cpu_job_input_marker_seen"][0], "W7")
+    inc = re.search(r"\breaders\s*\.\s*fetch_add\s*\(\s*1\s*,\s*std::memory_order_seq_cst\s*\)", seen)
+    ab = re.search(r"\babandoned\s*\.\s*load\s*\(\s*std::memory_order_seq_cst\s*\)\s*\|\|\s*"
+                   r"cpu_job_input_marker_reached\s*\(\s*__atomic_load_n\s*\([^;]*__ATOMIC_ACQUIRE\s*\)", seen)
+    dec = re.search(r"\breaders\s*\.\s*fetch_sub\s*\(\s*1\s*,\s*std::memory_order_(?:release|seq_cst)\s*\)", seen)
+    if not inc or not ab or not dec or not (inc.start() < ab.start() < dec.start()) or \
+       re.search(r"\breturn\b", seen[inc.start() : dec.start()]):
+        fail("W7", "cpu_job_input_marker_seen does not count itself in readers (seq_cst), then test abandoned (seq_cst) "
+                   "and load the word (acquire) only when it is clear, and then uncount itself on its one path: the "
+                   "cache could release the word's allocation under the load, or the inputs be read before the word")
+    _, aban = definition(hdr, HELPERS["cpu_job_input_marker_abandon"][0], "W7")
+    st = re.search(r"\babandoned\s*\.\s*store\s*\(\s*true\s*,\s*std::memory_order_seq_cst\s*\)", aban)
+    drain = re.search(r"\bwhile\s*\(\s*w\s*\.\s*readers\s*\.\s*load\s*\(\s*std::memory_order_seq_cst\s*\)\s*!=\s*0\s*\)",
+                      aban)
+    if not st or not drain or st.start() > drain.start():
+        fail("W7", "cpu_job_input_marker_abandon does not set abandoned (seq_cst) and then wait until readers is 0: the "
+                   "word's allocation could go while a waiter is between its test of the flag and its load")
+    _, reached = definition(hdr, HELPERS["cpu_job_input_marker_reached"][0], "W7")
+    if not re.fullmatch(r"\s*return\s+static_cast<int32_t>\s*\(\s*seen\s*-\s*serial\s*\)\s*>=\s*0\s*;\s*", reached):
+        fail("W7", "cpu_job_input_marker_reached is not the signed 32-bit distance `static_cast<int32_t>(seen - serial) "
+                   ">= 0`: the word is compared modulo 2^32, and any other compare releases a job early at the wrap or "
+                   "never")
+    _, wait = definition(hdr, HELPERS["cpu_job_input_marker_wait"][0], "W7")
+    told = re.search(r"\bif\s*\(\s*!\s*told\s*&&\s*m\s*\.\s*word\s*->\s*slow\s*\)", wait)
+    late = re.search(r"\bnow\s*-\s*since\s*>=\s*m\s*\.\s*word\s*->\s*slow_after\b", wait)
+    once = re.search(r"\btold\s*=\s*true\s*;\s*m\s*\.\s*word\s*->\s*slow\s*\(\s*\*\s*m\s*\.\s*word\s*,\s*m\s*\.\s*serial\s*,",
+                     wait)
+    if not told or not late or not once or not (told.start() < late.start() < once.start()):
+        fail("W7", "cpu_job_input_marker_wait does not report a wait once, through the word's slow and with its "
+                   "serial, after it has yielded for slow_after: with the SYCL watchdog off a marker that never "
+                   "arrives would be a silent spin")
+
     for name, (sig, allowed) in HELPERS.items():
         _, body = definition(hdr, sig, "W7")
         bad = sorted({q for q, n in calls(body) if n not in allowed})
@@ -347,13 +485,6 @@ def check_helpers(s: dict[str, str]) -> None:
         if f:
             fail("W7", f"{name} (cpu-job-signal.hpp) uses {f.group(0).strip()}: the marker wait never sleeps, locks, "
                        "ticks the watchdog or enters SYCL")
-    _, seen = definition(hdr, HELPERS["cpu_job_input_marker_seen"][0], "W7")
-    ab = re.search(r"abandoned\s*\.\s*load\s*\(\s*std::memory_order_acquire\s*\)", seen)
-    ld = re.search(r"__atomic_load_n\s*\([^;]*__ATOMIC_ACQUIRE\s*\)", seen)
-    if not ab or not ld or ab.start() > ld.start():
-        fail("W7", "cpu_job_input_marker_seen does not read abandoned, then the word, with acquire loads: a word whose "
-                   "allocation the cache let go would be read, or the job's inputs read before the word is")
-
     cache = s["cache"]
     _, sub = definition(cache, SUBMIT_SIG, "W7")
     dep = re.search(r"\bdepends_on\s*\(\s*after\s*\)", sub)
@@ -376,6 +507,47 @@ def check_helpers(s: dict[str, str]) -> None:
     if not (re.search(r"\bmust_host_pinned\s*=\s*true\s*;", arm) and re.search(r"\bunified_allocate_owner\s*\(", arm)):
         fail("W7", "unified_cache::arm_cpu_job_input_marker does not take its word from the unified cache as a "
                    "host-pinned owner")
+    if not re.search(r"\bconst\s+uint32_t\s+serial\s*=\s*cpu_job_input_marker_serial_\s*\+\s*1\s*;", arm):
+        fail("W7", "unified_cache::arm_cpu_job_input_marker does not take the last serial plus one: a serial that does "
+                   "not advance lets a later job pass on an earlier job's marker")
+    alloc = re.search(r"\bunified_allocate_owner\s*\(", arm)
+    io = re.search(r"\bif\s*\(\s*!\s*queue_\s*\.\s*has_property\s*<\s*sycl::property::queue::in_order\s*>\s*\(\s*\)\s*\)\s*\{", arm)
+    if not io or io.start() > alloc.start() or not re.search(r"\breturn\s+false\s*;",
+                                                            block_at(arm, io.end() - 1, "W7")[0]):
+        fail("W7", "unified_cache::arm_cpu_job_input_marker does not refuse a stream that is not in order before it "
+                   "allocates: markers could run out of serial order and the word go backwards")
+    zero = re.search(r"\*\s*word\s*->\s*word\s*=\s*0\s*;", arm)
+    pub = re.search(r"\bcpu_job_input_marker_word_\s*=\s*std::move\s*\(\s*word\s*\)\s*;", arm)
+    slow = re.search(r"\bword\s*->\s*slow\s*=\s*cpu_job_input_marker_report_slow\s*;", arm)
+    if not zero or not pub or zero.start() > pub.start():
+        fail("W7", "unified_cache::arm_cpu_job_input_marker does not zero its word before it publishes it: a reused "
+                   "block may hold a value at or past a serial, and that job would read inputs before they land")
+    if not slow or slow.start() > pub.start():
+        fail("W7", "unified_cache::arm_cpu_job_input_marker does not install the cache's slow-wait reporter before it "
+                   "publishes the word: a marker that never arrives would be a silent spin with the watchdog off")
+    queues = [q.group(1) for q in re.finditer(r"\bcpu_job_input_marker_submit\s*\(\s*([^,]*?)\s*,", arm)]
+    if not queues or any(q != "queue_" for q in queues):
+        fail("W7", "unified_cache::arm_cpu_job_input_marker submits a marker on " + ", ".join(queues or ["nothing"]) +
+                   ", not on queue_, the in-order stream its serials are ordered on")
+    _, armfn = definition(cache, ARM_FN_SIG, "W7")
+    if not re.search(r"\bunified_cache\s*\*\s*cache\s*=\s*moe_join_queue_cache_of\s*\(\s*stream\s*\)\s*;", armfn) or \
+       not re.search(r"\bcache\s*->\s*arm_cpu_job_input_marker\s*\(", armfn):
+        fail("W7", "unified_cache_cpu_job_input_marker_arm does not reach the cache through "
+                   "moe_join_queue_cache_of(stream): a marker on another cache's queue would not follow the job's inputs")
+    _, cof = definition(cache, CACHE_OF_SIG, "W7")
+    if not re.search(r"\bcache\s*->\s*get_queue\s*\(\s*\)\s*==\s*q\b", cof):
+        fail("W7", "moe_join_queue_cache_of returns a cache whose queue_ is not the stream it was given")
+    _, end = definition(cache, END_SIG, "W7")
+    ab_at = re.search(r"\bcpu_job_input_marker_abandon\s*\(\s*\*\s*word\s*\)", end)
+    rel = re.search(r"\bowner\s*=\s*\{\s*\}", end)
+    if not ab_at or not rel or ab_at.start() > rel.start() or re.search(r"\babandoned\s*\.\s*store\b", end):
+        fail("W7", "cpu_job_input_marker_end does not abandon the word (cpu_job_input_marker_abandon) before it "
+                   "releases the owner: a waiter's load of the word could follow the release of its allocation")
+    _, rep_body = definition(cache, REPORT_SIG, "W7")
+    bad = sorted({q for q, n in calls(rep_body) if n != "GGML_LOG_WARN"})
+    if bad or re.search(r"\bsycl\s*::", rep_body) or not re.search(r"\bGGML_LOG_WARN\s*\(", rep_body):
+        fail("W7", "cpu_job_input_marker_report_slow runs on the pool worker and does more than log one WARN: " +
+                   (", ".join(bad) if bad else "no WARN, or something in sycl::"))
     _, shut = definition(cache, SHUTDOWN_SIG, "W7")
     rings = [m.start() for m in re.finditer(r"\bcpu_job_signal_ring_end\s*\(\s*cpu_job_signal_ring_\b", shut)]
     ends = [m.start() for m in re.finditer(r"\bcpu_job_input_marker_end\s*\(", shut)]
@@ -462,11 +634,22 @@ def check_ring_locks(s: dict[str, str]) -> None:
                        "or a recycle still in a driver call would use a destroyed event")
 
 
+def check_chained_inputs(s: dict[str, str]) -> None:
+    _, cbody = definition(s["backend"], CHAINED_SIG, "W9")
+    ready = re.search(r"\bif\s*\(\s*record\s*->\s*has_ready\s*\)\s*\{\s*job_inputs\s*\.\s*events\s*\.\s*push_back\s*\(\s*"
+                      r"record\s*->\s*ready\s*\)\s*;\s*\}", cbody)
+    pro = re.search(r"\bmoe_cpu_job_prologue\s*\(", cbody)
+    if not ready or not pro or ready.start() > pro.start():
+        fail("W9", "the event-chained hybrid route's job inputs do not take record->ready before its prologue is built: "
+                   "a refused arm waits exactly those inputs, and the job would read host weights still being written")
+
+
 def check(s: dict[str, str]) -> None:
     check_wait_inputs(s)
     check_pool_lambda(s)
     check_helpers(s)
     check_ring_locks(s)
+    check_chained_inputs(s)
 
 
 def sub(pattern: str, repl: str, count: int = 1):
@@ -547,8 +730,22 @@ def self_test(s: dict[str, str]) -> int:
          sub(r"(\n(\s*)if \(prologue\) \{)", r"\n\2sycl::event().wait();\1")),
         ("W6", "pool", "the job lambda queries the driver",
          sub(r"(\n(\s*)if \(prologue\) \{)", r"\n\2(void) zeEventQueryStatus(nullptr);\1")),
+        # M2: the resolve step runs on the worker before the signal (llama.cpp-42zj).
+        ("W6", "backend", "the decode resolve step queries an event's status",
+         sub(r"(\n(\s*)if \(record_warmup\) \{\n\s*g_moe_warmup\.record\()",
+             r"\n\2(void) record->ready.get_info<command_execution_status>();\1")),
+        ("W6", "backend", "the decode resolve step waits an event",
+         sub(r"(\n(\s*)if \(record_warmup\) \{\n\s*g_moe_warmup\.record\()", r"\n\2record->ready.wait();\1")),
+        ("W6", "backend", "the decode resolve step calls Level Zero",
+         sub(r"(\n(\s*)if \(record_warmup\) \{\n\s*g_moe_warmup\.record\()", r"\n\2(void) zeEventQueryStatus(nullptr);\1")),
+        # M5 (llama.cpp-42zj).
+        ("W9", "backend", "the decode route's job does not wait the leases' barrier",
+         sub(r"\n\s*job_inputs\.events\.push_back\(record->ready\);", "")),
+        ("W9", "backend", "the decode route takes the leases' barrier after its prologue",
+         move(r"\n    if \(record->has_ready\) \{\n\s*job_inputs\.events\.push_back\(record->ready\);\n    \}",
+              r"\n    if \(!record->all_host\) \{\n\s*const sycl::event table_h2d")),
         ("W7", "header", "the marker wait sleeps",
-         sub(r"(\n\s*\} else \{\n\s*)std::this_thread::yield\(\);(\n\s*\}\n\s*\}\n\})",
+         sub(r"(\n        \}\n        )std::this_thread::yield\(\);(\n    \}\n\})",
              r"\1std::this_thread::sleep_for(std::chrono::microseconds(100));\2")),
         ("W7", "header", "the marker wait ticks the watchdog",
          sub(r"(\n(\s*)\+\+spins;)", r"\1\n\2ggml_sycl_watchdog_heartbeat();")),
@@ -557,11 +754,36 @@ def self_test(s: dict[str, str]) -> int:
         ("W7", "header", "the marker wait enters SYCL",
          sub(r"(\n(\s*)\+\+spins;)", r"\1\n\2(void) sycl::event().get_info<sycl::info::event::command_execution_status>();")),
         ("W7", "header", "seen reads the word before abandoned",
-         sub(r"if \(!m\.armed\(\) \|\| m\.word->abandoned\.load\(std::memory_order_acquire\)\) \{",
-             r"if (!m.armed() || (__atomic_load_n(m.word->word, __ATOMIC_ACQUIRE) && "
-             r"m.word->abandoned.load(std::memory_order_acquire))) {")),
+         sub(r"w\.abandoned\.load\(std::memory_order_seq_cst\) \|\|\n(\s*)cpu_job_input_marker_reached\(__atomic_load_n\(w\.word, "
+             r"__ATOMIC_ACQUIRE\), m\.serial\);",
+             r"cpu_job_input_marker_reached(__atomic_load_n(w.word, __ATOMIC_ACQUIRE), m.serial) ||\n\1"
+             r"w.abandoned.load(std::memory_order_seq_cst);")),
         ("W7", "header", "seen reads the word relaxed",
-         sub(r"__atomic_load_n\(m\.word->word, __ATOMIC_ACQUIRE\)", r"__atomic_load_n(m.word->word, __ATOMIC_RELAXED)")),
+         sub(r"__atomic_load_n\(w\.word, __ATOMIC_ACQUIRE\)", r"__atomic_load_n(w.word, __ATOMIC_RELAXED)")),
+        # M3: the readers drain (llama.cpp-42zj).
+        ("W7", "header", "seen does not count itself in readers",
+         sub(r"\n\s*w\.readers\.fetch_add\(1, std::memory_order_seq_cst\);", "")),
+        ("W7", "header", "seen uncounts itself before its load",
+         move(r"\n\s*w\.readers\.fetch_sub\(1, std::memory_order_release\);", r"\n\s*const bool seen = ")),
+        ("W7", "header", "seen tests abandoned with acquire only",
+         sub(r"w\.abandoned\.load\(std::memory_order_seq_cst\)", r"w.abandoned.load(std::memory_order_acquire)")),
+        ("W7", "header", "the abandon does not wait for the readers",
+         sub(r"\n\s*while \(w\.readers\.load\(std::memory_order_seq_cst\) != 0\) \{\n\s*std::this_thread::yield\(\);\n\s*\}", "")),
+        ("W7", "header", "the abandon waits before it sets the flag",
+         sub(r"(\n\s*w\.abandoned\.store\(true, std::memory_order_seq_cst\);)(\n\s*while \(w\.readers\.load\("
+             r"std::memory_order_seq_cst\) != 0\) \{\n\s*std::this_thread::yield\(\);\n\s*\})", r"\2\1")),
+        ("W7", "header", "the abandon sets the flag with release only",
+         sub(r"w\.abandoned\.store\(true, std::memory_order_seq_cst\)", r"w.abandoned.store(true, std::memory_order_release)")),
+        # M4b: the modulo compare (llama.cpp-42zj).
+        ("W7", "header", "the compare does not wrap",
+         sub(r"return static_cast<int32_t>\(seen - serial\) >= 0;", r"return seen >= serial;")),
+        ("W7", "header", "the compare is off by one",
+         sub(r"return static_cast<int32_t>\(seen - serial\) >= 0;", r"return static_cast<int32_t>(seen - serial) > 0;")),
+        # M4a: the slow-wait report (llama.cpp-42zj).
+        ("W7", "header", "a slow wait is reported on every pass", sub(r"if \(!told && m\.word->slow\) \{", r"if (m.word->slow) {")),
+        ("W7", "header", "a slow wait is never reported",
+         sub(r"\n\s*m\.word->slow\(\*m\.word, m\.serial, std::chrono::duration<double>\(now - since\)\.count\(\)\);", "")),
+        ("W7", "header", "a slow wait is reported at once", sub(r"\} else if \(now - since >= m\.word->slow_after\) \{", r"} else {")),
         ("W7", "cache", "the device task does not depend on the inputs", sub(r"\n\s*cgh\.depends_on\(after\);", "")),
         ("W7", "cache", "the device task stores before its fence",
          move(r"\n\s*\*word = serial;", r"\n\s*sycl::atomic_fence\(sycl::memory_order::release, sycl::memory_scope::system\);")),
@@ -576,6 +798,29 @@ def self_test(s: dict[str, str]) -> int:
         ("W7", "cache", "the word is not host-pinned",
          sub(r"req\.intent\.constraints\.must_host_pinned = true;", r"req.intent.constraints.must_device = true;")),
         ("W7", "cache", "a teardown branch keeps the word", sub(end_call, "")),
+        # M1: the arm's mechanics (llama.cpp-42zj).
+        ("W7", "cache", "every arm takes serial 1",
+         sub(r"const uint32_t serial = cpu_job_input_marker_serial_ \+ 1;", r"const uint32_t serial = 1;")),
+        ("W7", "cache", "the word is not zeroed", sub(r"\n\s*\*word->word\s*= 0;", "")),
+        ("W7", "cache", "the word is zeroed after it is published",
+         move(r"\n\s*\*word->word\s*= 0;", r"\n\s*GGML_LOG_INFO\(\n\s*\"\[MOE-INPUT-MARKER\] CPU expert jobs wait")),
+        ("W7", "cache", "an out-of-order stream is not refused",
+         sub(r"\n\s*if \(!queue_\.has_property<sycl::property::queue::in_order>\(\)\) \{\n[^}]*\}", "")),
+        ("W7", "cache", "the marker goes on the DMA queue",
+         sub(r"cpu_job_input_marker_submit\(queue_,", r"cpu_job_input_marker_submit(*dma_queue_,")),
+        ("W7", "cache", "the arm reaches device 0's cache",
+         sub(r"unified_cache \* cache = moe_join_queue_cache_of\(stream\);\n(\s*)if \(!cache\) \{\n(\s*)\*why",
+             r"unified_cache * cache = get_existing_unified_cache_for_device(0);\n\1if (!cache) {\n\2*why")),
+        ("W7", "cache", "the stream's cache is any cache of its device",
+         sub(r"return cache && cache->get_queue\(\) == q \? cache : nullptr;", r"return cache;")),
+        # M3, M4a on the cache's side (llama.cpp-42zj).
+        ("W7", "cache", "the end sets the flag without draining the readers",
+         sub(r"cpu_job_input_marker_abandon\(\*word\);", r"word->abandoned.store(true, std::memory_order_release);")),
+        ("W7", "cache", "the slow-wait reporter is not installed",
+         sub(r"\n\s*word->slow\s*= cpu_job_input_marker_report_slow;", "")),
+        ("W7", "cache", "the slow-wait reporter queries the driver",
+         sub(r"(\n(\s*)GGML_LOG_WARN\(\n\s*\"\[MOE-INPUT-MARKER\] CPU expert job %u on device %d)",
+             r"\n\2(void) zeEventQueryStatus(nullptr);\1")),
         ("W7", "cache", "the word goes before the drain",
          move(r"\n    \{\n\s*std::lock_guard<std::mutex> lock\(cpu_job_input_marker_mutex_\);\n"
               r"\s*cpu_job_input_marker_end\(cpu_job_input_marker_word_, cpu_job_input_marker_owner_\);\n    \}",

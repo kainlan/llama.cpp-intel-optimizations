@@ -16919,7 +16919,7 @@ static void cpu_job_signal_registry_prune();
 // The job's own signal takes mutex_, so a driver call that may block must not run under it: a host wait on another
 // thread may hold the driver's device lock behind that very job (llama.cpp-42zj). wrap() makes its event and recycle()
 // resets its events with mutex_ released, counted in outside_calls_; grow_locked() still creates pools and events
-// under it. gates_ holds the futures of the jobs whose events the
+// under it (llama.cpp-q0xu). gates_ holds the futures of the jobs whose events the
 // device waits (cpu_job_gate_list) under its own lock, so a host thread sleeping on one never holds mutex_ and never
 // keeps a job's own signal from taking it.
 class cpu_job_signal_ring {
@@ -17482,14 +17482,25 @@ static void cpu_job_input_marker_submit(sycl::queue &                    q,
     });
 }
 
-// A job still waiting on the word stops (abandoned is set before the allocation goes), and the cache's allocation is
-// released here, on the tearing-down thread. The jobs keep only the view and the flag.
+// A job still waiting on the word stops, and the cache's allocation is released here, on the tearing-down thread. The
+// jobs keep only the view and the flag, and hold no handle, so the word is abandoned first: no waiter's load of it can
+// follow the release (cpu_job_input_marker_abandon).
 static void cpu_job_input_marker_end(std::shared_ptr<cpu_job_input_marker_word> & word, mem_handle & owner) noexcept {
     if (word) {
-        word->abandoned.store(true, std::memory_order_release);
+        cpu_job_input_marker_abandon(*word);
         word.reset();
     }
     owner = {};
+}
+
+// The word's slow-wait report (cpu_job_input_marker_word::slow): one WARN, on the pool worker, and no driver call.
+// A job is named by its marker's serial, which is unique on its device.
+static void cpu_job_input_marker_report_slow(const cpu_job_input_marker_word & w, uint32_t serial, double waited_s) {
+    GGML_LOG_WARN(
+        "[MOE-INPUT-MARKER] CPU expert job %u on device %d has waited %.0f s for its inputs' marker; the SYCL watchdog "
+        "fires if it never arrives, and with GGML_SYCL_OP_TIMEOUT_MS=0 the job spins on one core until it does "
+        "(llama.cpp-42zj)\n",
+        serial, w.device, waited_s);
 }
 
 bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & after,
@@ -17527,8 +17538,12 @@ bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & af
             *why = "its word did not resolve to host memory";
             return false;
         }
+        // The word is zeroed before any arm: a reused block may hold any value, and one at or past a serial would
+        // release that job before its inputs land.
         auto word                   = std::make_shared<cpu_job_input_marker_word>();
         word->word                  = static_cast<uint32_t *>(resolved.ptr);
+        word->device                = device;
+        word->slow                  = cpu_job_input_marker_report_slow;
         *word->word                 = 0;
         cpu_job_input_marker_owner_ = std::move(owner);
         cpu_job_input_marker_word_  = std::move(word);
