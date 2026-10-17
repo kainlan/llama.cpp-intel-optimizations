@@ -2817,8 +2817,10 @@ its f16 copy would size the whole plan. The MMQ claim alone is restricted to 2-D
 SOA-resident weight only as a whole tensor and a 3-D dense operand is dispatched per plane on row slices.
 
 The MMQ claim is the one whose router twin can refuse a weight the plan reserved for, so its terms are composed in one
-function, `mmq_dequant_f16_plan_claims`, which both sides call with the same head, expert, 2-D and dequant flags. The
-router then narrows it with what only it knows: the oneDNN PP candidate (batch at or above
+function, `mmq_dequant_f16_plan_claims`, which both sides call with the same head, expert, 2-D and dequant flags, and
+its admission in another, `ggml_sycl_onednn_pp_mmq_types_admitted` (`GGML_SYCL_ONEDNN_PP_MMQ_TYPES` and the oneDNN PP
+type admission), which both sides call too. The router asks the type list before either, so a type it does not name
+pays for no name scan. The router then narrows it with what only it knows: the oneDNN PP candidate (batch at or above
 `GGML_SYCL_ONEDNN_PP_MIN_BATCH`, the oneDNN PP and placement admissions), the node's accumulator precision (an op
 `ggml_prec_set_acc` set to F32 keeps MMQ, because the arm's F32 branch would draw an unplanned f32 copy;
 `llama.cpp-4bu9`), a weight in a row-split buffer (the arm's f16 branch converts a whole weight, and a split slice would

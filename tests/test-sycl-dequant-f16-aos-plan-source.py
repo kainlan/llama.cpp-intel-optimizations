@@ -34,6 +34,13 @@ weight in a tensor-parallel buffer is refused with the row-split one, as the BF1
 selector's node parameter has no default, so a caller cannot drop the node without a compile error. Case 14l proves
 the list, the claim and the plan arithmetic.
 
+The router helper asks the type list before anything else, so a type it does not name (Q4_0, Q8_0) pays for no name
+scan, and it admits through the planner's own function (ggml_sycl_onednn_pp_mmq_types_admitted). Each refusal of the
+loaded-layout helper is checked on its own and must precede the conversion it protects; one check that some refusal
+exists passes with any of them deleted. The SOA plane's lease is released by a barrier submitted after its conversion.
+With GGML_SYCL_ONEDNN_PP_TRACE=1 the arm prints one WARN line per conversion
+("[ONEDNN-PP-TRACE] f16-dequant-arm served"), the witness that a weight took the arm.
+
 Run with --self-test to prove every check fires against a mutant of the thing it requires.
 """
 import argparse
@@ -76,6 +83,45 @@ OVERRIDE_SOA = "ggml_sycl_select_preferred_kernel's override switch: ONEDNN_SOA 
 PICK_SOA = "UnifiedMatmulOrchestrator::select's pick_kernel_for_layout: the SOA case answers ONEDNN_SOA for the same op"
 SPLIT = "the router helper refuses a weight in a row-split or a tensor-parallel buffer"
 NODE_REQUIRED = "the selector's node parameter has no default, so a call that forgets it does not compile"
+TYPE_FIRST = ("the router helper asks the type list first, so a type the list does not name pays for no name "
+              "scan")
+ADMISSION = ("the router helper admits through the planner's one admission function and takes the batch from the one "
+             "PP admission, once each, and compares no batch itself")
+# The loaded-layout helper's refusals, each with the conversion it must precede: a refusal deleted or moved past its
+# conversion lets the arm decode bytes it cannot read (llama.cpp-pzu9).
+AOS_CONVERT = "to_fp16(src0_dd_i, dst_f16, ne, stream);"
+SOA_CONVERT = "to_fp16(plane, dst_f16, ne, stream);"
+REFUSAL_AOS_NULL = 'if (to_fp16 == nullptr) { refuse("f16 dequant arm: no AOS f16 converter for this type"); }'
+REFUSAL_LAYOUT = ('if (layout != GGML_LAYOUT_SOA) { '
+                  'refuse("f16 dequant arm: no f16 converter for the layout this weight is loaded in"); }')
+REFUSAL_ROWS = ('if (row_low != 0 || row_diff != ggml_nrows(src0)) { '
+                'refuse("f16 dequant arm: an SOA weight converts only as a whole tensor"); }')
+REFUSAL_SOA_NULL = 'if (to_fp16 == nullptr) { refuse("f16 dequant arm: no SOA f16 converter for this type"); }'
+REFUSAL_PLANE = 'if (plane == nullptr) { refuse("f16 dequant arm: the SOA plane is not staged on this device"); }'
+REFUSAL_RESIDENT = ('if (ptr_type != sycl::usm::alloc::device && ptr_type != sycl::usm::alloc::shared) { '
+                    'refuse("f16 dequant arm: the SOA plane is not device-resident"); }')
+REFUSALS = (
+    ("an AOS weight of a type with no AOS converter", REFUSAL_AOS_NULL, AOS_CONVERT),
+    ("a weight loaded in a layout other than AOS and SOA", REFUSAL_LAYOUT, SOA_CONVERT),
+    ("an SOA weight handed over as a row slice", REFUSAL_ROWS, SOA_CONVERT),
+    ("an SOA weight of a type with no SOA converter", REFUSAL_SOA_NULL, SOA_CONVERT),
+    ("an SOA plane that is not staged on this device", REFUSAL_PLANE, SOA_CONVERT),
+    ("an SOA plane that is not device-resident", REFUSAL_RESIDENT, SOA_CONVERT),
+)
+READ_DONE_EXPR = ("sycl::event read_done = g_ggml_sycl_graph_recording ? sycl::event{} : "
+                  "stream->ext_oneapi_submit_barrier();")
+RETAIN = "ggml_sycl::retain_handles_until_event({ std::move(owner) }, std::move(read_done));"
+READ_DONE = ("the SOA plane's lease is released by a barrier submitted after its conversion (an empty event only while "
+             "a graph records)")
+WITNESS_CALL = ('if (ggml_sycl_onednn_pp_trace_enabled()) { GGML_LOG_WARN("[ONEDNN-PP-TRACE] f16-dequant-arm served '
+                'tensor=%s type=%s layout=%s rows=%lld device=%d\\n",')
+WITNESS = ("the f16 dequant arm prints one WARN witness line per conversion under GGML_SYCL_ONEDNN_PP_TRACE, after "
+           "each conversion")
+TRACE_ROW = "GGML_SYCL_ONEDNN_PP_TRACE has a catalog row that names the witness line"
+
+
+def refusal_check(what):
+    return f"the loaded-layout helper refuses {what}, before it converts"
 
 
 def strip_comments(source):
@@ -223,9 +269,9 @@ def check(srcs):
     results["the router helper asks for a converter for the layout it is given"] = (
         nows("ggml_get_to_fp16_sycl_for_layout(src0->type, layout) == nullptr") in nows(serves))
     # The batch question has one source (llama.cpp-je3b): the helper hands it to the PP admission and compares none.
-    results["the router helper takes the knob and the batch from the one PP admission, once, and compares no batch "
-            "itself"] = (
-        nows(serves).count("ggml_sycl_onednn_pp_mmq_types_enabled()") == 1
+    results[ADMISSION] = (
+        nows(serves).count(nows("ggml_sycl_onednn_pp_mmq_types_admitted(src0->type)")) == 1
+        and "ggml_sycl_onednn_pp_mmq_types_enabled()" not in serves
         and nows(serves).count("ggml_sycl_onednn_pp_candidate(") == 1
         and nows("return ggml_sycl_onednn_pp_candidate(src0, src1, dst, device);") in nows(serves)
         and "ne[1]" not in serves and "min_batch" not in serves)
@@ -242,6 +288,11 @@ def check(srcs):
         "ggml_backend_buffer_is_sycl_tp(src0->buffer))) { return false; }") in nows(serves)
     results["the router helper exists only in a build with the f16 dequant arm"] = (
         nows(serves).startswith(nows("{ #if GGML_SYCL_DEQUANT_F16_ARM")))
+    # The claim's arguments scan the weight's name twice (the head classifier, the expert role). The router asks the
+    # helper for every PP MUL_MAT that reaches MMQ_AOS, Q4_0 and Q8_0 included, so the type list answers first.
+    results[TYPE_FIRST] = nows(serves).startswith(nows(
+        "{ #if GGML_SYCL_DEQUANT_F16_ARM if (!src0 || !src1 || "
+        "!ggml_sycl::dense_pp_route_prefers_f16_dequant_arm(src0->type) ||"))
     results[WALK_MMQ] = (
         nows("if (use_mmq && !") + serves_aos + ")" in nows(kernel_case(loop_part, "MMQ_AOS")))
     results[WALK_SOA] = (
@@ -289,6 +340,22 @@ def check(srcs):
                 "ggml_get_to_fp16_sycl_for_layout(src0->type, GGML_LAYOUT_SOA)",
                 "ggml_sycl::mem_handle owner = ggml_sycl_acquire_weight_layout(src0, ctx.device, GGML_LAYOUT_SOA);",
                 "ggml_sycl::retain_handles_until_event({ std::move(owner) }, std::move(read_done));"))
+    for what, guard, conversion in REFUSALS:
+        guard_at = nows(loaded).find(nows(guard))
+        results[refusal_check(what)] = 0 <= guard_at < nows(loaded).find(nows(conversion))
+    # A barrier submitted after the conversion covers its reads; an empty event outside recording would release the
+    # lease while the kernel may still read the plane.
+    convert_at = nows(loaded).find(nows(SOA_CONVERT))
+    read_done_at = nows(loaded).find(nows(READ_DONE_EXPR))
+    results[READ_DONE] = 0 <= convert_at < read_done_at < nows(loaded).find(nows(RETAIN))
+    # The witness: WARN, because INFO is dropped at default verbosity, and after each of the two conversions.
+    results[WITNESS] = (
+        nows(WITNESS_CALL) in nows(loaded)
+        and nows(loaded).count(nows("witness();")) == 2
+        and nows(AOS_CONVERT + " witness(); return;") in nows(loaded)
+        and nows(loaded).endswith(nows(RETAIN + " witness(); }")))
+    trace_row = re.search(r"^\| `GGML_SYCL_ONEDNN_PP_TRACE=1` \|[^\n]*", srcs["catalog"], re.M)
+    results[TRACE_ROW] = trace_row is not None and "[ONEDNN-PP-TRACE] f16-dequant-arm served" in trace_row.group(0)
     results["convert.cpp has no reordered-layout converter for the AOS-only listed types"] = all(
         nows(type_case(to_fp16, t)).startswith(nows(f"case GGML_TYPE_{t}: if (layout != GGML_LAYOUT_AOS) {{ "
                                                     f"return nullptr; }}"))
@@ -432,14 +499,21 @@ if args.self_test:
          "src0->ne[2] == 1 && src0->ne[3] == 1,", "true,"),
         ("the router helper asks for a converter for the layout it is given", "backend",
          "if (ggml_get_to_fp16_sycl_for_layout(src0->type, layout) == nullptr) { return false; }", ""),
-        ("the router helper takes the knob and the batch from the one PP admission, once, and compares no batch "
-         "itself", "backend",
+        (ADMISSION, "backend",
          "return ggml_sycl_onednn_pp_candidate(src0, src1, dst, device); #else",
          "return src1->ne[1] >= 16; #else"),
-        ("the router helper takes the knob and the batch from the one PP admission, once, and compares no batch "
-         "itself", "backend",
-         "if (!src0 || !src1 || !ggml_sycl_onednn_pp_mmq_types_enabled()) {",
-         "if (!src0 || !src1) {"),
+        # The bare knob, as before the admission was one function: the type admission then comes only from the
+        # candidate.
+        (ADMISSION, "backend",
+         "!ggml_sycl_onednn_pp_mmq_types_admitted(src0->type)", "!ggml_sycl_onednn_pp_mmq_types_enabled()"),
+        (ADMISSION, "backend", "|| !ggml_sycl_onednn_pp_mmq_types_admitted(src0->type)", ""),
+        (TYPE_FIRST, "backend", "!ggml_sycl::dense_pp_route_prefers_f16_dequant_arm(src0->type) ||", ""),
+        # The same term asked after the claim's name scans.
+        (TYPE_FIRST, "backend", [
+            ("!ggml_sycl::dense_pp_route_prefers_f16_dequant_arm(src0->type) ||", ""),
+            ("if (ggml_get_to_fp16_sycl_for_layout(src0->type, layout) == nullptr) {",
+             "if (!ggml_sycl::dense_pp_route_prefers_f16_dequant_arm(src0->type) || "
+             "ggml_get_to_fp16_sycl_for_layout(src0->type, layout) == nullptr) {")], None),
         ("the router helper refuses an op that asks for F32 accumulation, and a call without the op", "backend",
          "if (!dst || dst->op_params[0] != GGML_PREC_DEFAULT) {", "if (!dst) {"),
         (SPLIT, "backend",
@@ -490,6 +564,31 @@ if args.self_test:
          "reads complete", "backend",
          "ggml_sycl::retain_handles_until_event({ std::move(owner) }, std::move(read_done));",
          "GGML_UNUSED(read_done);"),
+        # one mutant per refusal deletes that guard, and two move guards past their conversion
+        (refusal_check(REFUSALS[0][0]), "backend", REFUSAL_AOS_NULL, ""),
+        (refusal_check(REFUSALS[1][0]), "backend", REFUSAL_LAYOUT, ""),
+        (refusal_check(REFUSALS[2][0]), "backend", REFUSAL_ROWS, ""),
+        (refusal_check(REFUSALS[3][0]), "backend", REFUSAL_SOA_NULL, ""),
+        (refusal_check(REFUSALS[4][0]), "backend", REFUSAL_PLANE, ""),
+        (refusal_check(REFUSALS[5][0]), "backend", REFUSAL_RESIDENT, ""),
+        (refusal_check(REFUSALS[0][0]), "backend", REFUSAL_AOS_NULL + " " + AOS_CONVERT,
+         AOS_CONVERT + " " + REFUSAL_AOS_NULL),
+        (refusal_check(REFUSALS[5][0]), "backend", REFUSAL_RESIDENT + " " + SOA_CONVERT,
+         SOA_CONVERT + " " + REFUSAL_RESIDENT),
+        # The expression has a twin at another site, so the conversion before it anchors the mutant.
+        (READ_DONE, "backend", SOA_CONVERT + " " + READ_DONE_EXPR,
+         SOA_CONVERT + " sycl::event read_done = sycl::event{};"),
+        (READ_DONE, "backend", SOA_CONVERT + " " + READ_DONE_EXPR, READ_DONE_EXPR + " " + SOA_CONVERT),
+        (WITNESS, "backend", 'GGML_LOG_WARN("[ONEDNN-PP-TRACE] f16-dequant-arm served',
+         'GGML_LOG_INFO("[ONEDNN-PP-TRACE] f16-dequant-arm served'),
+        (WITNESS, "backend", AOS_CONVERT + " witness(); return;", AOS_CONVERT + " return;"),
+        (WITNESS, "backend", AOS_CONVERT + " witness(); return;", "witness(); " + AOS_CONVERT + " return;"),
+        (WITNESS, "backend", RETAIN + " witness(); }", RETAIN + " }"),
+        (WITNESS, "backend",
+         'if (ggml_sycl_onednn_pp_trace_enabled()) { GGML_LOG_WARN("[ONEDNN-PP-TRACE] f16-dequant-arm',
+         'if (true) { GGML_LOG_WARN("[ONEDNN-PP-TRACE] f16-dequant-arm'),
+        (TRACE_ROW, "catalog", "| `GGML_SYCL_ONEDNN_PP_TRACE=1` |", "| `GGML_SYCL_ONEDNN_PP_TRACE_RENAMED=1` |"),
+        (TRACE_ROW, "catalog", "`[ONEDNN-PP-TRACE] f16-dequant-arm served", "`[ONEDNN-PP-TRACE] served"),
         ("convert.cpp has no reordered-layout converter for the AOS-only listed types", "convert",
          "case GGML_TYPE_Q5_K: if (layout != GGML_LAYOUT_AOS) { return nullptr; }", "case GGML_TYPE_Q5_K:"),
         ("convert.cpp has no reordered-layout converter for the AOS-only listed types", "convert",
@@ -514,7 +613,8 @@ if args.self_test:
     dead = [name for name in results if name not in covered]
     for name, which, old, new in mutants:
         mutated = dict(sources)
-        mutated[which] = mutate(mutated[which], old, new)
+        for old_text, new_text in (old if isinstance(old, list) else [(old, new)]):
+            mutated[which] = mutate(mutated[which], old_text, new_text)
         if check(mutated)[name]:
             dead.append(name)
     for name in dead:

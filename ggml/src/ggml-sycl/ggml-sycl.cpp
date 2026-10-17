@@ -17033,8 +17033,10 @@ static size_t get_system_memory_bytes() {
 // llama.cpp-kpjw: whether this build can reach the f16 dequant arm of ggml_sycl_op_mul_mat_sycl at all. Its walk and
 // its dispatch arm are compiled only with oneDNN and GGML_SYCL_F16; without them nothing ever draws the planned f16
 // buffers, so planning them would reserve RUNTIME bytes for nothing. Where it is true, whether a given model draws
-// them is the zone adapter's candidate set (dense Q8_0 weights, and Q4_0 / MXFP4 weights the oneDNN PP scratch
-// will not supply) and the route at run time.
+// them is the zone adapter's candidate set and the route at run time. The adapter claims four kinds of dense weight,
+// listed under "Who the dense f16 dequant plan covers" in docs/backend/sycl-memory-design.md: Q8_0; Q4_0 and MXFP4
+// when the oneDNN PP scratch will not supply them; the quantized types no MMQ, coalesced or unified kernel serves;
+// and the MMQ types dense_pp_route_prefers_f16_dequant_arm lists.
 // ONE source for that condition: the planning site reads the constexpr below, and the f16 walk and both acquisitions
 // of the planned f16 buffers in the dispatch arm (ggml_sycl_op_mul_mat_sycl) are compiled under the same macro, so
 // they cannot drift apart. (The arm itself is also gated at run time by use_fp16, which is GGML_SYCL_F16.)
@@ -31288,8 +31290,8 @@ bool ggml_sycl_onednn_pp_type_admitted(ggml_type type) {
 
 // llama.cpp-h9c8: GGML_SYCL_ONEDNN_PP_MMQ_TYPES (default 1). With 0 the MMQ types
 // dense_pp_route_prefers_f16_dequant_arm lists keep MMQ at PP batch and the planner reserves nothing for them, because
-// the router's helper (ggml_sycl_dense_f16_arm_serves_pp) and the plan-time admission below both read this one
-// accessor. Read once.
+// the router's helper (ggml_sycl_dense_f16_arm_serves_pp) and the planner both admit through the one function below,
+// which reads this accessor. Read once.
 static bool ggml_sycl_onednn_pp_mmq_types_enabled() {
     static const bool mmq_types = []() {
         const bool on = get_sycl_env("GGML_SYCL_ONEDNN_PP_MMQ_TYPES", 1) != 0;
@@ -31303,8 +31305,9 @@ static bool ggml_sycl_onednn_pp_mmq_types_enabled() {
     return mmq_types;
 }
 
-// The plan-time half of that admission: the knob AND the oneDNN PP type admission the op's candidate also takes.
-// Non-static and declared in common.hpp because the planner cannot see this TU's statics.
+// That admission, for the planner and the router's helper alike: the knob AND the oneDNN PP type admission, which
+// the op's candidate asks again, as it does for every oneDNN PP arm. Non-static and declared in common.hpp because
+// the planner cannot see this TU's statics.
 bool ggml_sycl_onednn_pp_mmq_types_admitted(ggml_type type) {
     return ggml_sycl_onednn_pp_mmq_types_enabled() && ggml_sycl_onednn_pp_type_admitted(type);
 }
@@ -31431,7 +31434,13 @@ static bool ggml_backend_buffer_is_sycl_tp(ggml_backend_buffer_t buffer);     //
 // llama.cpp-h9c8: whether the oneDNN f16 dequant arm is this op's PP route when its weight is materialized in
 // `layout`, for the MMQ types dense_pp_route_prefers_f16_dequant_arm lists. The priority walk's MMQ_AOS and
 // ONEDNN_SOA entries, the override switch and pick_kernel_for_layout all ask it, so a forced layout, a layout mismatch
-// and the walk give one answer. Every term of the arm's f16 branch is asked here:
+// and the walk give one answer. Every term of the arm's f16 branch is asked here, in this order:
+//   - the build: the f16 branch exists only with oneDNN and GGML_SYCL_F16 (GGML_SYCL_DEQUANT_F16_ARM; the branch's
+//     use_fp16 is GGML_SYCL_F16), and without them this answers false;
+//   - a type the list names, first: the walk asks this for every PP MUL_MAT that reaches MMQ_AOS, Q4_0 and Q8_0
+//     included, and the claim below scans the weight's name twice, so an unlisted type answers before any scan;
+//   - the admission the planner asks too, ggml_sycl_onednn_pp_mmq_types_admitted (GGML_SYCL_ONEDNN_PP_MMQ_TYPES and
+//     the oneDNN PP type admission), so the router and the plan admit through one function;
 //   - the default accumulator precision: an op that asks for F32 accumulation takes the arm's fp32 branch, whose f32
 //     weight copy no plan reserves, so it keeps MMQ until a planned path exists (llama.cpp-4bu9). The setters that
 //     reach a 2-D weight are ffn_down and attn_output of GLM4, GLM4_MOE and JAIS2, and a quantized ffn_gate_inp
@@ -31444,15 +31453,17 @@ static bool ggml_backend_buffer_is_sycl_tp(ggml_backend_buffer_t buffer);     //
 //   - the claim the zone planner asks (the head by the same classifier, the expert role, a 2-D weight, a type the
 //     router can dequantize), so the weight sent to the arm is a weight the plan reserved the buffers for;
 //   - a converter for `layout`: convert.cpp answers nullptr for a (type, layout) pair it cannot decode;
-//   - the oneDNN PP admission, the one source of the batch floor, the env gates and the placement refusals
-//     (llama.cpp-je3b). It runs last, so decode and the cheap type terms never reach it.
+//   - the oneDNN PP candidate, the one source of the batch floor, the oneDNN PP env gates, f32 activations and
+//     output, a contiguous quantized weight (the f16 branch's ggml_is_contiguous(src0)) and the placement refusals
+//     (llama.cpp-je3b). It runs last, so decode and the cheap terms never reach it.
 static bool ggml_sycl_dense_f16_arm_serves_pp(const ggml_tensor * src0,
                                               const ggml_tensor * src1,
                                               const ggml_tensor * dst,
                                               int                 device,
                                               layout_mode         layout) {
 #if GGML_SYCL_DEQUANT_F16_ARM
-    if (!src0 || !src1 || !ggml_sycl_onednn_pp_mmq_types_enabled()) {
+    if (!src0 || !src1 || !ggml_sycl::dense_pp_route_prefers_f16_dequant_arm(src0->type) ||
+        !ggml_sycl_onednn_pp_mmq_types_admitted(src0->type)) {
         return false;
     }
     if (!dst || dst->op_params[0] != GGML_PREC_DEFAULT) {
@@ -50459,6 +50470,15 @@ static void ggml_sycl_dequant_f16_from_loaded_layout(ggml_backend_sycl_context &
                        ggml_type_name(src0->type), ggml_sycl_layout_mode_name(layout), reason);
         throw ggml_sycl_fallback_error(reason);
     };
+    // GGML_SYCL_ONEDNN_PP_TRACE=1: one line per conversion this arm submits, the witness that a weight took the arm.
+    // WARN, because INFO is dropped at default verbosity.
+    auto witness = [&]() {
+        if (ggml_sycl_onednn_pp_trace_enabled()) {
+            GGML_LOG_WARN("[ONEDNN-PP-TRACE] f16-dequant-arm served tensor=%s type=%s layout=%s rows=%lld device=%d\n",
+                          src0->name, ggml_type_name(src0->type), ggml_sycl_layout_mode_name(layout),
+                          (long long) row_diff, ctx.device);
+        }
+    };
     // AOS blocks are independent rows, so the op's row slice is valid input.
     if (layout == GGML_LAYOUT_AOS) {
         const to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl_for_layout(src0->type, GGML_LAYOUT_AOS);
@@ -50466,6 +50486,7 @@ static void ggml_sycl_dequant_f16_from_loaded_layout(ggml_backend_sycl_context &
             refuse("f16 dequant arm: no AOS f16 converter for this type");
         }
         to_fp16(src0_dd_i, dst_f16, ne, stream);
+        witness();
         return;
     }
     if (layout != GGML_LAYOUT_SOA) {
@@ -50494,6 +50515,7 @@ static void ggml_sycl_dequant_f16_from_loaded_layout(ggml_backend_sycl_context &
     to_fp16(plane, dst_f16, ne, stream);
     sycl::event read_done = g_ggml_sycl_graph_recording ? sycl::event{} : stream->ext_oneapi_submit_barrier();
     ggml_sycl::retain_handles_until_event({ std::move(owner) }, std::move(read_done));
+    witness();
 }
 #endif  // GGML_SYCL_DNNL
 
@@ -67331,8 +67353,9 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_select_preferred_kernel(
 #if GGML_SYCL_DNNL
                 // llama.cpp-pktr: eligible by default; see
                 // ggml_sycl_q8_0_onednn_soa_enabled() (GGML_SYCL_Q8_ONEDNN_SOA).
-                // llama.cpp-h9c8: and an SOA weight of an MMQ type the f16 dequant arm serves (Q6_K), which
-                // reaches this entry ahead of MMQ_SOA.
+                // llama.cpp-h9c8: and an SOA weight of an MMQ type the f16 dequant arm serves (Q4_K, Q6_K: the
+                // listed types with an SOA layout and an SOA f16 converter), which reaches this entry ahead of
+                // MMQ_SOA.
                 if ((src0->type == GGML_TYPE_Q8_0 && ggml_sycl_layout_supports_soa(src0->type) &&
                      ggml_sycl_q8_0_onednn_soa_enabled()) ||
                     ggml_sycl_dense_f16_arm_serves_pp(src0, src1, dst, device, GGML_LAYOUT_SOA)) {
