@@ -1166,6 +1166,19 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
         active_params.nb03   = q_nb3;
     }
 
+    // llama.cpp-kx2a: with the Graph allocator on, every execute draws its scratch from this device's unified
+    // cache. Without a cache the allocator refuses and returns nullptr, and oneDNN does not check that return:
+    // it launches the partition with a null scratch pointer, which faults the device. Only a DIRECT op can
+    // arrive here with no cache, because materializing K/V or Q allocates through the cache and creates it.
+    // Decline before any partition is compiled or executed.
+    if (ggml_sycl::onednn_graph_allocator_enabled() &&
+        ggml_sycl::get_existing_unified_cache_for_device(ctx.device) == nullptr) {
+        if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+            fprintf(stderr, "[SYCL] fattn: oneDNN declined: no_unified_cache device=%d\n", ctx.device);
+        }
+        return decline("no_unified_cache");
+    }
+
     // llama.cpp-jwjz: one execute's Graph scratch grows with rows x ne11 (fattn-onednn-chunk.hpp), and
     // the allocator serves a request above its DIRECT cap outside the arena regardless. At ubatch 2048
     // and n_kv >= 4096 that overcommitted both cards once per layer. Split the op's query rows so every

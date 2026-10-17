@@ -19,6 +19,9 @@ The fix this gate pins:
   headroom wait calls too.
 - Every execute runs inside the chunk loop, each chunk offsets Q, the mask and dst by its first row, the last chunk
   runs the tail partition, both partitions are acquired before the loop, and the terminal event is the last chunk's.
+- llama.cpp-kx2a: before any partition is compiled or executed, the dispatcher declines ("no_unified_cache") when the
+  Graph allocator is on and the device has no unified cache. The allocator refuses there and returns nullptr, and
+  oneDNN does not check the return: it launched with a null scratch and faulted the B50.
 
 This gate is about the dispatcher's wiring only. The planner's arithmetic is proved behaviourally by
 test-sycl-fattn-onednn-chunk (host C++), and the chunked execute's numerics and its scratch bound by
@@ -51,6 +54,16 @@ CAP_FROM_SNAPSHOT = (
     "onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire))"
 )
 CAP_MEMBER_CALL = "const size_t cap = onednn_graph_scratch_direct_cap();"
+# llama.cpp-kx2a: without a unified cache the Graph allocator returns nullptr and oneDNN launches with that null
+# scratch, so the dispatcher must decline first. The whole guard block, as squash() spells it.
+NO_CACHE_GUARD = (
+    "if (ggml_sycl::onednn_graph_allocator_enabled() && "
+    "ggml_sycl::get_existing_unified_cache_for_device(ctx.device) == nullptr) { "
+    "if (std::getenv(\"GGML_SYCL_FA_DISPATCH_DEBUG\")) { "
+    "fprintf(stderr, \"[SYCL] fattn: oneDNN declined: no_unified_cache device=%d\\n\", ctx.device); } "
+    "return decline(\"no_unified_cache\"); }"
+)
+PARTITION_CACHE_ACQUIRE = "sdpa_partition_cache * cache = get_or_create_cache(ctx);"
 # Any read of the snapshot through the cap formula, whatever its memory order, counted with ALL whitespace removed:
 # squash() keeps the space a line-wrapped call leaves after "(", so a count of squashed text misses the same
 # expression re-inlined on one line and the one-member check fails open.
@@ -105,6 +118,9 @@ def check(srcs):
     headroom = squash(function_body(cache_code, "bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked("))
 
     results = {}
+    guard_pos = dispatch.find(NO_CACHE_GUARD)
+    results["the dispatcher declines before any compile or execute when the device has no unified cache"] = (
+        0 <= guard_pos < dispatch.find(PARTITION_CACHE_ACQUIRE) and guard_pos < loop_pos)
     results["the per-execute budget is half the allocator's DIRECT cap"] = (
         "const size_t chunk_budget = ggml_sycl::unified_cache_onednn_graph_scratch_direct_cap_bytes(ctx.device) / 2;"
         in dispatch)
@@ -224,12 +240,28 @@ if args.self_test:
          "onednn_graph_scratch_direct_cap() / (1024.0 * 1024.0), onednn_graph_scratch_direct_wait_count_,",
          "onednn_graph_scratch_direct_cap_bytes(onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load("
          "std::memory_order_relaxed)) / (1024.0 * 1024.0), onednn_graph_scratch_direct_wait_count_,"),
+        # llama.cpp-kx2a: the no-cache guard dropped, its null test dropped, its decline turned into a
+        # fallthrough, and the guard moved past the chunk loop (a second replacement re-inserts it there).
+        ("the dispatcher declines before any compile or execute when the device has no unified cache", "onednn",
+         NO_CACHE_GUARD, ""),
+        ("the dispatcher declines before any compile or execute when the device has no unified cache", "onednn",
+         "ggml_sycl::get_existing_unified_cache_for_device(ctx.device) == nullptr) {",
+         "ggml_sycl::get_existing_unified_cache_for_device(ctx.device)) {"),
+        ("the dispatcher declines before any compile or execute when the device has no unified cache", "onednn",
+         'return decline("no_unified_cache"); }', "}"),
+        ("the dispatcher declines before any compile or execute when the device has no unified cache", "onednn",
+         NO_CACHE_GUARD, "",
+         "ggml_sycl::unified_cache_dump_counter_add(ggml_sycl::dump_counter::onednn_sdpa_executed, ctx.device);",
+         NO_CACHE_GUARD
+         + " ggml_sycl::unified_cache_dump_counter_add(ggml_sycl::dump_counter::onednn_sdpa_executed, ctx.device);"),
     ]
     covered = {name for name, *_ in mutants}
     dead = [name for name in results if name not in covered]
-    for name, which, old, new in mutants:
+    for name, which, *edits in mutants:
         mutated = dict(sources)
-        mutated[which] = mutate(mutated[which], old, new)
+        # Each mutant is one or more (old, new) replacements, applied in order.
+        for i in range(0, len(edits), 2):
+            mutated[which] = mutate(mutated[which], edits[i], edits[i + 1])
         if check(mutated)[name]:
             dead.append(name)
     for name in dead:
