@@ -10552,6 +10552,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
+    // SYCL sends a dense 2-D weight of these MMQ types to its oneDNN f16 dequant arm instead of MMQ at
+    // prompt-processing batch (src1 columns >= GGML_SYCL_ONEDNN_PP_MIN_BATCH, default 16). n = 16 is the first batch
+    // the arm takes, 129 an odd count past a power of two, and k = 14336 the FFN width of a 7B model. n = 15 (below
+    // the floor) and a {3, 2}-batched src0 are the shapes that stay on MMQ, so the same types are compared on both
+    // routes.
+    for (ggml_type type_a : { GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+                              GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+        for (int64_t k : { 1024, 14336 }) {
+            for (int64_t n : { 15, 16, 32, 64, 129 }) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, n, k, { 1, 1 }, { 1, 1 }));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64, 32, 1024, { 3, 2 }, { 1, 1 }));
+    }
+
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
