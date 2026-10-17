@@ -26149,10 +26149,6 @@ struct moe_host_scatter_workspace {
     std::vector<sycl::event>                copied;
     std::vector<sycl::event>                events;
     std::vector<sycl::event>                joins;  // each slot's CPU job join (llama.cpp-z4kd)
-    // The futures of the jobs the device waits on their own events, for the records the flush publishes
-    // (retained_handle_gate_scope, llama.cpp-qwn5). Cleared at the start and the end of each flush, so the workspace
-    // keeps no job's future past its flush.
-    std::vector<std::shared_future<void>>   gates;
 
     void release_handles() {
         srcs.clear();
@@ -26518,7 +26514,6 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
         // wrote it, and the GPU work that follows on the stream sees the rows.  This thread goes on submitting.
         std::vector<sycl::event> & joins = ws.joins;
         joins.clear();
-        ws.gates.clear();
         const bool may_signal = moe_cpu_job_device_signal_may(*slot.stream);
         for (int k = 0; k < n_group; ++k) {
             sycl::event device_wait;
@@ -26529,12 +26524,12 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
                 moe_hostpath_waits_device_signal();
                 // The job's future is the gate a host wait behind this job sleeps on first: the backend's synchronize,
                 // the graph code's queue waits (ggml_sycl_trace_queue_wait) and the graph boundary through the ring's
-                // gates, the retained-handle reaper through the records this flush publishes (llama.cpp-qwn5). Only a
-                // pool producer's job has a device event, so the future is a promise's, whose last copy never blocks
-                // when it is dropped.
-                std::shared_future<void> gate = group[k]->future.share();
-                ggml_sycl::cpu_job_signal_gate_push(signal_mark, gate);
-                ws.gates.push_back(std::move(gate));
+                // gates (llama.cpp-qwn5), and the retained-handle reaper through every record published while the job
+                // may run, each of which takes the ring's gates (llama.cpp-42zj). Pushed before the scatter that waits
+                // the job's event is submitted, so before any record behind the job is published. Only a pool
+                // producer's job has a device event, so the future is a promise's, whose last copy never blocks when
+                // it is dropped.
+                ggml_sycl::cpu_job_signal_gate_push(signal_mark, group[k]->future.share());
                 joins.push_back(std::move(device_wait));
                 continue;
             }
@@ -26542,14 +26537,6 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
         }
 
         auto t1 = hrc::now();  // After the join submissions (no wait)
-
-        // Every record published from here to the retention carries the gates of the jobs the device waits on their
-        // own events, and the reaper sleeps on them before it waits the record's event (llama.cpp-qwn5). The scatter's
-        // commands depend on the joins, so their records sit behind those jobs; a flush that places no rows has none.
-        // The members' buffers are published last, member 0 first. Those of a natively waited member wait the flush's
-        // last event, which runs behind its job. Those of a host-task-joined member wait its own join, which the gates
-        // do not cover, so that record also sleeps on the other members' jobs: it is released later, never earlier.
-        const ggml_sycl::retained_handle_gate_scope gate_scope(ws.gates);
 
         // Scatter results H2D, submitted on the in-order stream and depending on the join events wherever the
         // joins went.  Later GPU kernels on the stream run after the scatter (in-order guarantee).
@@ -26662,8 +26649,6 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
         GGML_ABORT("[CPU-TG] Deferred scatter failed: %s; its host-expert rows would be dropped (llama.cpp-93tw)",
                    ex.what());
     }
-    // The gate scope closed with the try block; the ring and the records keep their own copies.
-    ws.gates.clear();
 
     // What a later CPU job may have to order its pool writes after (moe_cpu_job_order_decide), and what
     // the graph boundary waits for.  A group advanced the serial once per slot, so a job whose activation

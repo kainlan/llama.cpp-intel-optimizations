@@ -203,9 +203,19 @@ class cpu_job_signal_book {
 // sleeps the same way, though its stream wait was short there: its own CPU-expert flush runs the graph-boundary drain
 // first, and that drain sleeps on the gates and drops them.
 //
-// A gate decides only how a host thread waits, never whether: the device wait after it is what orders the host. So a
-// gate dropped early (past max_gates, or cleared by a serial that covers it) costs only that sleep. The one exception
-// is a job that throws (below), where a gate holds the host until an abort that is already under way.
+// A gate also decides whether such a host wait returns at all. The job's prologue checks its input events through
+// the same driver path that a host wait on an event behind the job may take, and on the B70 that path holds a
+// device-level lock while it polls the device: a host thread waiting there before the job has started keeps the job
+// from starting, and the wait never returns (llama.cpp-42zj). So every host wait on an event that may stand behind a
+// running job sleeps on that job's gate first, the retained-handle drain worker's included: each record it drains
+// carries the gates of every live ring (cpu_job_signal_gates_outstanding). And a gate leaves its list only once its job
+// is known to have ended: cleared by a serial that covers it after a sleep that waited it, or by a recycle, which the
+// boundary's sleep on the same gates precedes, or with its ring's shutdown, after which no device command waits on the
+// ring's events. The list's drop of its oldest gate never runs: one gate is pushed per wrapped entry and a recycle
+// clears its entries' gates, so a list holds no more gates than its ring has entries in use, and max_gates is at least
+// that (a static_assert after the ring's definition). Past that, a sleep on a gate lasts no longer than the device
+// wait behind it would have. The one exception is a job that throws (below), where a gate holds the host until an
+// abort that is already under way.
 //
 // A gate holds only the job's shared_future: no job, no buffer, no event. wait() returns once the job's promise holds a
 // value or an exception, a broken promise included, and never throws; nothing calls get(), wait_for() or wait_until()
@@ -225,7 +235,8 @@ class cpu_job_signal_book {
 // (llama.cpp-qwn5 c-a8ea).
 class cpu_job_gate_list {
   public:
-    // Past this many gates something is not clearing; a push then drops the oldest.
+    // At least a ring's entries (asserted after the ring's definition), so a push never drops the oldest gate. A dropped
+    // gate could leave a host wait in front of a job that has not started.
     static constexpr size_t max_gates = 1024;
 
     // Adds a job's future and returns its serial, which grows with each push. An empty future is not kept: 0.
@@ -268,6 +279,17 @@ class cpu_job_gate_list {
     size_t size() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return gates_.size();
+    }
+
+    // Appends every gate's future to *out, in push order, copied under the lock; waits on none. One reserve per call,
+    // and none past *out's capacity for an empty list, so an empty list allocates nothing. For a retained-handle record
+    // (cpu_job_signal_gates_outstanding).
+    void append_outstanding(std::vector<std::shared_future<void>> * out) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        out->reserve(out->size() + gates_.size());
+        for (const gate & g : gates_) {
+            out->push_back(g.future);
+        }
     }
 
   private:
@@ -414,5 +436,12 @@ class cpu_job_signal_ref {
 // Takes each lock with a bounded wait and skips a ring it cannot lock: it must not deadlock an abort raised while that
 // lock is held.
 void cpu_job_signal_signal_all() noexcept;
+
+// The futures of every gate of every live ring, in each ring's push order: every CPU expert job a device command may
+// still wait on. A retained-handle record takes them when it is published, and the drain worker sleeps on them before
+// its driver wait, so a record behind none of those jobs waits for them too (llama.cpp-42zj). Holds the registry lock
+// only to copy the live rings, and each gate list's lock only to copy its gates; waits on nothing and makes no driver
+// call. A ring with no gate adds nothing.
+std::vector<std::shared_future<void>> cpu_job_signal_gates_outstanding();
 
 }  // namespace ggml_sycl

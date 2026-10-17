@@ -17159,6 +17159,11 @@ class cpu_job_signal_ring {
     cpu_job_gate_list                   gates_;
 };
 
+// One gate per wrapped entry, and a recycle clears its entries' gates: at most max_events gates, so the list never
+// drops one a host wait still needs (llama.cpp-42zj).
+static_assert(cpu_job_gate_list::max_gates >= cpu_job_signal_ring::max_events,
+              "a gate list must hold a gate for every entry its ring can have in use");
+
 // The live rings, for cpu_job_signal_signal_all(), and the ggml abort callback they install. Made once and never
 // destroyed: a ring can be released during static destruction (a CPU expert pool, a static of ggml-sycl.cpp, can still
 // hold a job's half then), after this TU's statics would be gone.
@@ -17233,6 +17238,28 @@ void cpu_job_signal_signal_all() noexcept {
     for (const std::shared_ptr<cpu_job_signal_ring> & ring : live) {
         (void) ring->signal_all();
     }
+}
+
+std::vector<std::shared_future<void>> cpu_job_signal_gates_outstanding() {
+    cpu_job_signal_registry & r = cpu_job_signal_registry_get();
+
+    // Released after the registry lock: dropping the last owner of a ring prunes the registry under that lock. A cache
+    // shuts its ring down before it lets go of it, so a last owner dropped here makes no driver call.
+    std::vector<std::shared_ptr<cpu_job_signal_ring>> live;
+    {
+        std::lock_guard<std::timed_mutex> lock(r.mutex);
+        live.reserve(r.rings.size());
+        for (const std::weak_ptr<cpu_job_signal_ring> & w : r.rings) {
+            if (std::shared_ptr<cpu_job_signal_ring> ring = w.lock()) {
+                live.push_back(std::move(ring));
+            }
+        }
+    }
+    std::vector<std::shared_future<void>> gates;
+    for (const std::shared_ptr<cpu_job_signal_ring> & ring : live) {
+        ring->gates().append_outstanding(&gates);
+    }
+    return gates;
 }
 
 static void cpu_job_signal_ring_end(const std::shared_ptr<cpu_job_signal_ring> & ring, bool sycl_gone) noexcept {
