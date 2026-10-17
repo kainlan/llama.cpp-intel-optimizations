@@ -5138,7 +5138,13 @@ class unified_cache {
     // the free list while its marker is still pending, so the next marker on
     // that slot also depends on this one; see
     // onednn_graph_scratch_pool_entry::flag_slot. Accessed only under
-    // onednn_graph_scratch_mutex_.
+    // onednn_graph_scratch_mutex_. std::optional, not a default-constructed
+    // sycl::event for "no marker yet": that event is complete, but SYCL 2020
+    // constructs it as if from a default-constructed queue, so it carries the
+    // default device's default context, while the watch queue runs in this
+    // cache queue's own context (ensure_single_device_context_queue() builds
+    // queue_ on a fresh sycl::context(dev)). Depending on it would be a
+    // cross-context dependency on a slot's first park.
     std::vector<std::optional<sycl::event>> onednn_graph_scratch_flag_slot_last_marker_;
     // llama.cpp-jwjz: set only through
     // onednn_graph_scratch_force_completion_gated_reuse_for_test().
@@ -5679,12 +5685,15 @@ class unified_cache {
 
     // llama.cpp-jwjz: true when every consumer of a Graph-scratch buffer
     // submits on this cache's own queue_ and queue_ is in-order: TP is
-    // inactive for this device (under TP, ctx.stream() is the TP
-    // shared-context queue, not queue_), and queue_ carries the in_order
-    // property. A buffer freed with a pending release event can then go to
-    // the next request at once, because the next consumer's kernels queue
-    // behind the previous consumer's. The ONEDNN zone free and the DIRECT
-    // pool's reuse both read this one predicate.
+    // inactive for this device, and queue_ carries the in_order property.
+    // The queue a device's kernels go to is
+    // ggml_sycl_execution_queue_for_device() (common.hpp), which
+    // ggml_backend_sycl_context::stream() caches: the TP shared-context queue
+    // when TP is enabled, else this cache's queue_. A buffer freed with a
+    // pending release event can then go to the next request at once, because
+    // the next consumer's kernels queue behind the previous consumer's. The
+    // ONEDNN zone free and the DIRECT pool's reuse both read this one
+    // predicate.
     bool onednn_graph_scratch_consumers_in_order() const;
 
     // llama.cpp-jwjz: whether the DIRECT pool may hand back an entry whose

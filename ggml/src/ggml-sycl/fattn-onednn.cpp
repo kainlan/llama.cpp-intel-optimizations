@@ -1376,9 +1376,12 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
         // follow chunk c-1's: the last chunk's event is the terminal event for
         // the materialized buffers, and the Graph allocator's in-order reuse
         // argument (unified_cache::onednn_graph_scratch_free) covers the
-        // scratch each chunk hands back. A throw after some chunks ran leaves
-        // dst partly written; the native kernel the caller falls back to
-        // rewrites all of it on the same queue.
+        // scratch each chunk hands back. Under TP the execute runs on the TP
+        // queue and the allocator's pool stays completion-gated, so
+        // consecutive chunks miss the pool and lock-step at the DIRECT cap in
+        // 200 ms polls: bounded, but slow. A throw after some chunks ran
+        // leaves dst partly written; the native kernel the caller falls back
+        // to rewrites all of it on the same queue.
         for (int64_t c = 0; c < chunks.n_chunks; ++c) {
             const bool                  is_tail = (c == chunks.n_chunks - 1);
             const sdpa_compiled_entry & part    = is_tail ? *tail_entry : *entry;
