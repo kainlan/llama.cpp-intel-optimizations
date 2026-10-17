@@ -543,7 +543,8 @@ endif()
 
 # oneDNN SDPA query-row chunking (llama.cpp-jwjz): one execute's Graph scratch is H_q x rows x n_kv x 6 bytes,
 # so the route splits an op's query rows to keep every execute under a budget. ggml-sycl/fattn-onednn-chunk.hpp
-# includes only <cstddef>/<cstdint>, so the test needs no device.
+# includes only standard headers, so the test needs no device. test-sycl-fattn-onednn-chunk-source (registered
+# with the other oneDNN source gates below) pins that the dispatcher uses it at half the DIRECT cap.
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-sycl-fattn-onednn-chunk.cpp)
     set_tests_properties(test-sycl-fattn-onednn-chunk PROPERTIES LABELS "sycl;onednn;hostonly")
@@ -2444,6 +2445,14 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert;onednn;allocator"
         TIMEOUT 120
     )
+    # llama.cpp-jwjz: the oneDNN SDPA dispatcher splits an op's query rows into executes whose Graph scratch fits
+    # half the allocator's own DIRECT cap, so no chunk takes the allocator's oversized early-out. Host-only, needs
+    # no build. Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-fattn-onednn-chunk-source
+        COMMAND ${LLAMA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fattn-onednn-chunk-source.py --self-test
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-sycl-fattn-onednn-chunk-source PROPERTIES
+        LABELS "sycl;python;source-assert;onednn;hostonly" TIMEOUT 120)
     # llama.cpp-o3a0: keeps src/llama-model.cpp's replicated oneDNN SDPA
     # head-dim eligibility rule (it cannot include the SYCL-only
     # fattn-onednn.cpp to share the real predicate) in sync with the rule it
