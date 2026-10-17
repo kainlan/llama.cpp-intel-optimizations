@@ -1557,6 +1557,11 @@ static void cpu_expert_mul_mat_batched_run(const cpu_expert_task *    tasks,
 
     GGML_SYCL_DEBUG("[EXPERT-CPU] Batched expert mul_mat: %d tasks, %d total_rows, %d unique activations\n", n_tasks,
                     total_rows, (int) act_q_map.size());
+    // The rows are written: host progress for the [SYCL-WATCHDOG], which a prompt graph's host-tiered experts
+    // otherwise show only when the graph ends (llama.cpp-ff00). Every producer (the pool, std::async, inline) runs
+    // this function. It ticks once per batch, never per row: rows_body is the hot loop. A batch runs only on inputs
+    // the device already produced, so a stalled device stops these ticks within one batch.
+    ggml_sycl_watchdog_heartbeat();
 }
 
 void ggml_sycl_cpu_expert_mul_mat_batched(const cpu_expert_task * tasks, int n_tasks, int n_threads) {
@@ -1698,6 +1703,9 @@ void ggml_sycl_cpu_expert_mul_mat_adaptive(const cpu_expert_task * tasks, int n_
     // yield CPU to GPU work
     for (int i = 0; i < n_reduced; i++) {
         cpu_expert_mul_mat_int4(tasks[n_full + i]);
+    }
+    if (n_reduced > 0) {
+        ggml_sycl_watchdog_heartbeat();  // the reduced batch is written too (see cpu_expert_mul_mat_batched_run)
     }
 
     GGML_SYCL_DEBUG(

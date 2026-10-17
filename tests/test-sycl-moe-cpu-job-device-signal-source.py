@@ -860,7 +860,9 @@ def check_queue_waits(s: dict) -> None:
     if qf.count(QUEUE_SEQ) != 2 or len(re.findall(r"\bq->wait\(\);", qf)) != 2:
         fail("B9", "a queue wait of the graph code does not sleep on the gates right before it and clear them right "
                    "after it")
-    if not re.search(r"if \(!enabled\) \{ " + re.escape(QUEUE_SEQ) + r" return; \}", qf):
+    # The watchdog tick after the clear is test-sycl-watchdog-progress-tick-source.py's contract (llama.cpp-ff00).
+    if not re.search(r"if \(!enabled\) \{ " + re.escape(QUEUE_SEQ) + r"(?: ggml_sycl_watchdog_heartbeat\(\);)? "
+                     r"return; \}", qf):
         fail("B9", "the untraced queue wait does not sleep on the gates first")
     begin = qf.find('fprintf(stderr, "[SYCL-WAIT] begin reason=')
     traced = ("fflush(stderr); const auto t0 = std::chrono::high_resolution_clock::now(); " + QUEUE_SEQ +
