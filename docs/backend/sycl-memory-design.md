@@ -584,9 +584,17 @@ ticket reproduced on:
   ONEDNN zone free already relies on, and
   `onednn_graph_scratch_consumers_in_order()` is now the one predicate both
   read: TP inactive for the device, and the queue carries the `in_order`
-  property. Under it, `onednn_graph_scratch_entry_usable_locked()` makes no
-  completion query, so a same-size request gets the parked buffer back at
-  once and its kernels queue behind the previous consumer's. Gating reuse on
+  property. The decision is per request and per entry, not per cache.
+  `onednn_graph_scratch_alloc()` tags the request in-order when its queue is
+  the cache's queue and the predicate holds, and the buffer it hands out
+  carries that tag into the pool when it is freed. Only when both tags hold
+  does `onednn_graph_scratch_entry_usable_locked()` skip the completion
+  query, so a same-size request gets the parked buffer back at once and its
+  kernels queue behind the previous consumer's. A buffer last used on
+  another queue, or a request from another queue, waits for the release as
+  under TP. The oneDNN allocator callback always passes the cache's queue,
+  so in production the predicate's TP check is what covers an execute on
+  another queue. Gating reuse on
   completion made each oneDNN SDPA execute of a repeated shape allocate a
   second buffer, and the next one wait at the cap in 200 ms polls (Mistral
   `-d 8192` at ubatch 2048). Only reuse relaxes. Eviction, the per-size

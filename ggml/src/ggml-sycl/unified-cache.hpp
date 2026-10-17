@@ -5394,9 +5394,16 @@ class unified_cache {
     // onednn_graph_scratch_direct_outstanding_bytes_ by, so those bytes
     // stayed charged forever. A single map makes that state unreachable by
     // construction: an entry is found with its size or not found at all.
+    //
+    // in_order (llama.cpp-jwjz): the buffer was handed out to a request on
+    // this cache's own queue while every consumer shared that in-order queue.
+    // free() copies it onto the pool entry, and only such an entry may be
+    // reused while its release is still pending, and only by a request that
+    // satisfies the same condition (see onednn_graph_scratch_alloc()).
     struct onednn_graph_scratch_direct_entry {
         mem_handle owner;
-        size_t     size = 0;
+        size_t     size     = 0;
+        bool       in_order = false;
     };
 
     std::unordered_map<void *, onednn_graph_scratch_direct_entry> onednn_graph_scratch_direct_owners_;
@@ -5585,6 +5592,10 @@ class unified_cache {
         // one instead of a host_task.
         int32_t     flag_slot       = -1;
         uint32_t    flag_generation = 0;
+        // llama.cpp-jwjz: copied from onednn_graph_scratch_direct_entry::in_order
+        // at park time. False for a buffer last used on any other queue, which
+        // then waits for its release like under TP.
+        bool        in_order        = false;
     };
 
     std::unordered_map<size_t, std::vector<onednn_graph_scratch_pool_entry>> onednn_graph_scratch_reuse_pool_;
@@ -5679,7 +5690,10 @@ class unified_cache {
     // llama.cpp-jwjz: whether the DIRECT pool may hand back an entry whose
     // release has not completed. It is onednn_graph_scratch_consumers_in_order(),
     // unless a test forced completion-gated reuse
-    // (onednn_graph_scratch_force_completion_gated_reuse_for_test()). Only
+    // (onednn_graph_scratch_force_completion_gated_reuse_for_test()).
+    // onednn_graph_scratch_alloc() evaluates it once per request and also
+    // requires the request to be on this cache's queue; the result is the
+    // `requester_in_order` the pool lookups below take. Only
     // REUSE relaxes. A real release (eviction under the cap, the per-size
     // depth overflow, the pool clear) still waits for completion, because it
     // returns the bytes to the general allocator, whose next owner may run
@@ -5748,14 +5762,16 @@ class unified_cache {
     // request -- a caller must NOT query completion on the same entry
     // itself first; doubling the query here would double that cost per
     // candidate entry for no benefit, since EVENT_PENDING already reports
-    // exactly that outcome. When in-order reuse is allowed
-    // (onednn_graph_scratch_in_order_reuse_allowed(), llama.cpp-jwjz) it
-    // makes no completion query at all. Callers must hold
+    // exactly that outcome. It makes no completion query at all when both
+    // `requester_in_order` and entry.in_order hold (llama.cpp-jwjz): the
+    // entry's previous consumer and this request then share the cache's
+    // in-order queue, which orders them. Callers must hold
     // onednn_graph_scratch_mutex_.
     onednn_graph_scratch_entry_fit onednn_graph_scratch_entry_usable_locked(
         const onednn_graph_scratch_pool_entry & entry,
         size_t                                  alignment,
         int                                     device_id,
+        bool                                    requester_in_order,
         resolved_ptr *                          out_resolved = nullptr) const;
 
     // Try to serve `size` bytes from onednn_graph_scratch_reuse_pool_: if a
@@ -5776,6 +5792,7 @@ class unified_cache {
     bool onednn_graph_scratch_try_reuse_pool_locked(size_t       size,
                                                     size_t       alignment,
                                                     int          device_id,
+                                                    bool         requester_in_order,
                                                     mem_handle * out_owner,
                                                     void **      out_ptr);
 
@@ -5793,7 +5810,10 @@ class unified_cache {
     // through onednn_graph_scratch_entry_usable_locked()) -- see that
     // function's comment for why a laxer peek is a silent fail-open of the
     // DIRECT cap. Callers must hold onednn_graph_scratch_mutex_.
-    bool onednn_graph_scratch_pool_size_ready_locked(size_t size, size_t alignment, int device_id) const;
+    bool onednn_graph_scratch_pool_size_ready_locked(size_t size,
+                                                     size_t alignment,
+                                                     int    device_id,
+                                                     bool   requester_in_order) const;
 
     // Single entry point for a DIRECT request's pool lookup: looks up
     // `size`/`alignment` for `device_id` via onednn_graph_scratch_try_reuse_pool_locked()
@@ -5814,7 +5834,7 @@ class unified_cache {
     // miss. Miss accounting lives at
     // onednn_graph_scratch_alloc_direct_locked()'s own tail, past every
     // re-check, not here. Callers must hold onednn_graph_scratch_mutex_.
-    void * onednn_graph_scratch_try_pool_locked(size_t size, size_t alignment, int device_id);
+    void * onednn_graph_scratch_try_pool_locked(size_t size, size_t alignment, int device_id, bool requester_in_order);
 
     // The DIRECT (non-arena) allocation tail of onednn_graph_scratch_alloc()
     // -- request setup, the forced-fail test hook, the unlock/drain/relock/
@@ -5828,6 +5848,7 @@ class unified_cache {
                                                     size_t                         alignment,
                                                     sycl::queue *                  q,
                                                     int                            device_id,
+                                                    bool                           requester_in_order,
                                                     std::unique_lock<std::mutex> & lock);
 
     // Evict completed (onednn_graph_scratch_pool_entry_release_complete()
@@ -5856,6 +5877,7 @@ class unified_cache {
     // onednn_graph_scratch_pool_size_ready_locked()'s per-iteration peek --
     // see that function's comment for why a peek that ignored them could
     // report "ready" for an entry the post-wait re-check would still miss.
+    // `requester_in_order` is threaded the same way (llama.cpp-jwjz).
     // `out_was_oversized` is set true only when the returned false came from
     // the size>cap early-out (no wait was attempted -- that branch already
     // logs its own latched WARN), false in every other case including a
@@ -5865,6 +5887,7 @@ class unified_cache {
     bool onednn_graph_scratch_wait_for_direct_headroom_locked(size_t                         size,
                                                               size_t                         alignment,
                                                               int                            device_id,
+                                                              bool                           requester_in_order,
                                                               std::unique_lock<std::mutex> & lock,
                                                               bool &                         out_was_oversized);
 

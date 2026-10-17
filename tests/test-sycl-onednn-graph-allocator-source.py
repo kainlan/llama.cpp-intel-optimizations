@@ -532,6 +532,23 @@ CONSUMERS_IN_ORDER_BODY_CODE = extract_function_body(
 IN_ORDER_REUSE_BODY_CODE = extract_function_body(
     CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_in_order_reuse_allowed("
 )
+# llama.cpp-jwjz: a pool hit's hand-out site, where the buffer takes the
+# request's in-order tag.
+TRY_POOL_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "void * unified_cache::onednn_graph_scratch_try_pool_locked(")
+# The per-request tag onednn_graph_scratch_alloc() computes once, and the
+# condition under which entry_usable_locked() may skip the completion query.
+REQUESTER_IN_ORDER_INIT = "const bool requester_in_order = (*q == queue_) && " + IN_ORDER_REUSE_CALL + ");"
+IN_ORDER_SKIP_CONDITION = "!(requester_in_order && entry.in_order) && !" + RELEASE_COMPLETE_CALL + "entry)"
+
+
+def _entry_usable_requires_both_tags(body: str) -> bool:
+    """llama.cpp-jwjz: true iff `body` skips the completion query only when
+    BOTH the request and the entry's previous consumer were on the cache's
+    in-order queue, and does not consult the reuse policy itself (the
+    request's tag already carries it). Dropping either half of the
+    conjunction would hand an in-flight buffer across queues."""
+    code = normalize_ws(strip_literals(body))
+    return IN_ORDER_SKIP_CONDITION in code and IN_ORDER_REUSE_CALL not in code
 
 
 def _real_release_stays_completion_gated(body: str) -> bool:
@@ -717,9 +734,9 @@ def test_onednn_graph_allocator_source_contract() -> None:
     checks["pool_size_ready_locked() body calls the shared usability predicate"] = (
         "onednn_graph_scratch_entry_usable_locked(" in POOL_SIZE_READY_BODY_CODE
     )
-    checks["pool_size_ready_locked() declaration still takes alignment and device_id"] = (
-        "onednn_graph_scratch_pool_size_ready_locked(size_t size, size_t alignment, int device_id) const;"
-        in normalize_ws(CACHE_HPP_CODE)
+    checks["pool_size_ready_locked() declaration still takes alignment, device_id and the request's in-order tag"] = (
+        "onednn_graph_scratch_pool_size_ready_locked(size_t size, size_t alignment, int device_id, "
+        "bool requester_in_order) const;" in normalize_ws(CACHE_HPP_CODE)
     )
     # llama.cpp-0oxf round-6 finding H3: onednn_graph_scratch_entry_usable_locked()'s
     # own declaration now says callers must NOT call event_complete() on an
@@ -1077,8 +1094,27 @@ def test_onednn_graph_allocator_source_contract() -> None:
     checks["in-order reuse policy reads the shared consumer predicate"] = (
         CONSUMERS_IN_ORDER_CALL in IN_ORDER_REUSE_BODY_CODE
     )
-    checks["entry_usable_locked() skips the completion query only through the in-order reuse policy"] = (
-        IN_ORDER_REUSE_CALL in ENTRY_USABLE_BODY_CODE
+    # The skip needs both tags: the request's (computed once in alloc() from
+    # the queue identity and the policy) and the entry's (recorded when the
+    # buffer was handed out, copied at park). A DIRECT entry last used on
+    # another queue is never handed back while its release is pending.
+    checks["entry_usable_locked() skips the completion query only when the request and the entry are both in-order"] = (
+        _entry_usable_requires_both_tags(ENTRY_USABLE_BODY_CODE)
+    )
+    checks["alloc() derives the request's in-order tag from its queue and the reuse policy"] = (
+        REQUESTER_IN_ORDER_INIT in normalize_ws(strip_literals(ALLOC_BODY_CODE))
+    )
+    checks["DIRECT and pool entries both carry an in_order tag"] = (
+        normalize_ws(CACHE_HPP_CODE).count("bool in_order = false;") >= 2
+    )
+    checks["a pool hit records the request's in-order tag"] = (
+        "{ std::move(pooled_owner), size, requester_in_order }" in normalize_ws(TRY_POOL_BODY_CODE)
+    )
+    checks["a fresh DIRECT allocation records the request's in-order tag"] = (
+        "{ std::move(owner), size, requester_in_order }" in normalize_ws(DIRECT_BODY_CODE)
+    )
+    checks["free() copies the entry's in-order tag onto the parked pool entry"] = (
+        "flag_slot, flag_generation, entry.in_order }" in normalize_ws(FREE_BODY_CODE)
     )
     checks["evict_pool_until_fits_locked() stays completion-gated"] = _real_release_stays_completion_gated(
         EVICT_UNTIL_FITS_BODY_CODE
@@ -1111,6 +1147,31 @@ def test_real_release_completion_gate_check_has_a_mutation_witness() -> None:
     )
     assert not _real_release_stays_completion_gated(mutated), (
         "mutation witness is broken: the injected in-order reuse call was not detected"
+    )
+
+
+def test_cross_queue_reuse_check_has_a_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-jwjz: proves the "both in-order" check
+    above would catch the skip losing the entry's half, which would let a
+    request on the cache's queue take a buffer whose previous consumer ran
+    on another queue and may still be using it."""
+    assert IN_ORDER_SKIP_CONDITION in normalize_ws(strip_literals(ENTRY_USABLE_BODY_CODE)), (
+        "mutation target string not found -- update this witness"
+    )
+    assert _entry_usable_requires_both_tags(ENTRY_USABLE_BODY_CODE), (
+        "the real, unmutated entry_usable_locked() should require both tags"
+    )
+    dropped_entry_half = normalize_ws(ENTRY_USABLE_BODY_CODE).replace(
+        "!(requester_in_order && entry.in_order)", "!requester_in_order", 1
+    )
+    assert not _entry_usable_requires_both_tags(dropped_entry_half), (
+        "mutation witness is broken: dropping the entry's tag was not detected"
+    )
+    per_cache_policy = normalize_ws(ENTRY_USABLE_BODY_CODE).replace(
+        "!(requester_in_order && entry.in_order)", "!" + IN_ORDER_REUSE_CALL + ")", 1
+    )
+    assert not _entry_usable_requires_both_tags(per_cache_policy), (
+        "mutation witness is broken: the per-cache policy form (before the cross-queue fix) was not detected"
     )
 
 
