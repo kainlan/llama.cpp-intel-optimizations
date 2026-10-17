@@ -64,8 +64,9 @@ THE CONTRACT.  With comments blanked:
      job's outputs, which teardown frees once the queues drain, so the job signals itself
      when it ends.
   H. GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL is read once, into a function-local static,
-     default off (llama.cpp-m5v8), and is the only getenv of that name; the catalog row documents =1; the
-     [MOE-HOSTPATH-WAITS] line prints devsig=, counted under the trace only.
+     default off (llama.cpp-m5v8), and is the only getenv of that name; the catalog
+     row documents =1; the [MOE-HOSTPATH-WAITS] line prints devsig=, counted under
+     the trace only.
   I. No host waits on the new events.  The flush body and the ring section of
      unified-cache.cpp (from its section comment to the testing hooks' #endif) call no
      wait, wait_and_throw, wait_for or wait_until, no get_info<...> and name neither
