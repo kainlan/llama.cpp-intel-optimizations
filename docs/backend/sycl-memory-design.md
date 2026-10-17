@@ -466,9 +466,14 @@ ticket reproduced on:
   (`onednn_graph_scratch_reuse_pool_`: `size -> {mem_handle, release event}`
   entries) instead of handing it to the shared background drain worker via
   `retain_handles_until_event()`, and `onednn_graph_scratch_alloc()` checks
-  that pool (for a completion-confirmed entry of the EXACT requested size --
-  see the completion-flag bullet below for what "confirmed" means)
-  before ever falling to a fresh `unified_alloc()`. This serves the common
+  that pool for an entry of the EXACT requested size before ever falling to
+  a fresh `unified_alloc()`. Which entries qualify depends on the queues.
+  When the request and the entry's previous consumer are both on the cache's
+  in-order queue and TP is inactive (the default), an entry qualifies while
+  its release is still in flight (see the in-order reuse bullet below,
+  llama.cpp-jwjz). Under TP, or for any other pairing of queues, only a
+  completion-confirmed entry qualifies (see the completion-flag bullet below
+  for what "confirmed" means). This serves the common
   case for free: SDPA calls of a fixed `(n_head, ncols, ne11)` shape repeat
   across `-r N` benchmark reps and across decode steps at a stable KV length.
   A pooled-but-idle entry's bytes stay charged against
@@ -506,6 +511,18 @@ ticket reproduced on:
   under any circumstance. `onednn_graph_scratch_direct_wait_count()` and
   `onednn_graph_scratch_pool_hit_count()` report how often a run actually had
   to wait, and how often it was served from the pool instead, respectively.
+- **The oneDNN SDPA execute is chunked to half the cap (llama.cpp-jwjz).**
+  One SDPA execute asks for `H_q x rows x n_kv x 6` bytes of Graph scratch,
+  1536 MB on Mistral at ubatch 2048 and n_kv 4096. That is above the 1 GiB
+  cap, so it took the oversized early-out above once per layer.
+  `ggml_sycl_flash_attn_ext_onednn()` now splits the op's query rows into
+  executes whose scratch fits half of
+  `unified_cache_onednn_graph_scratch_direct_cap_bytes()`, the cap this
+  allocator enforces (`fattn-onednn-chunk.hpp`). A full chunk's buffer and
+  the shorter last chunk's buffer then fit under the cap together, so each
+  chunk goes through the bounded wait rather than the early-out. The
+  early-out stays reachable when one query row alone exceeds the cap, and
+  at a cap of 0.
 - **Pool completion checks go through a host-visible flag written by a
   device marker kernel, not a direct SYCL event query, and not a
   host_task either (llama.cpp-c6ah).** `event_complete()`'s bare
