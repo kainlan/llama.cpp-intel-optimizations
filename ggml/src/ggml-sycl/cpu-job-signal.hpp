@@ -504,7 +504,7 @@ struct cpu_job_input_marker_word;
 using cpu_job_input_marker_slow_fn = void (*)(const cpu_job_input_marker_word & w, uint32_t serial, double waited_s);
 
 struct cpu_job_input_marker_word {
-    uint32_t *                    word = nullptr;      // host-pinned, device-written: a view of the cache's allocation
+    uint32_t *                    ptr = nullptr;       // host-pinned, device-written: a view of the cache's allocation
     std::atomic<bool>             abandoned{ false };  // set before that allocation goes: the device writes it no more
     mutable std::atomic<uint32_t> readers{ 0 };        // waiters between their test of abandoned and their word load
     int                           device     = -1;     // the cache's device, for the slow-wait report
@@ -556,7 +556,7 @@ inline bool cpu_job_input_marker_seen(const cpu_job_input_marker & m) {
     const cpu_job_input_marker_word & w = *m.word;
     w.readers.fetch_add(1, std::memory_order_seq_cst);
     const bool seen = w.abandoned.load(std::memory_order_seq_cst) ||
-                      cpu_job_input_marker_reached(__atomic_load_n(w.word, __ATOMIC_ACQUIRE), m.serial);
+                      cpu_job_input_marker_reached(__atomic_load_n(w.ptr, __ATOMIC_ACQUIRE), m.serial);
     w.readers.fetch_sub(1, std::memory_order_release);
     return seen;
 }

@@ -24575,12 +24575,19 @@ struct moe_cpu_job_inputs {
     size_t                   zero_bytes = 0;
 };
 
-// Whether a CPU job's input marker may be armed on `stream` (llama.cpp-42zj): neither the backend nor `stream` records
-// a command graph, since a recorded marker is written only when the graph replays, and the job would wait until then.
-// The same recording test as moe_cpu_job_device_signal_may.
+// Whether a command graph records on `stream`: the backend's flag or the stream's own state. Work submitted then is
+// recorded and runs only when the graph replays, so a CPU job's input marker, its join off the stream and the
+// scatter's wait on its event each refuse then (moe_cpu_job_input_marker_may, moe_cpu_job_join_may_leave_stream,
+// moe_cpu_job_device_signal_may), each for the reason its own comment gives (llama.cpp-42zj).
+static bool moe_cpu_job_stream_recording(sycl::queue & stream) {
+    return ggml_sycl_graph_recording_active() ||
+           stream.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording;
+}
+
+// Whether a CPU job's input marker may be armed on `stream` (llama.cpp-42zj): no command graph records there, since a
+// recorded marker is written only when the graph replays, and the job would wait until then.
 static bool moe_cpu_job_input_marker_may(sycl::queue & stream) {
-    return !ggml_sycl_graph_recording_active() &&
-           stream.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording;
+    return !moe_cpu_job_stream_recording(stream);
 }
 
 // Set by the first CPU expert job whose input marker was not armed; that job is logged, the later ones are not.
@@ -24680,8 +24687,7 @@ static bool moe_join_queue_enabled() {
 // neither the backend nor `stream` itself records a command graph, since the scatter would record a dependency on
 // a join outside the graph.  When this is false every join is on the stream, exactly as without the join queue.
 static bool moe_cpu_job_join_may_leave_stream(sycl::queue & stream) {
-    return moe_join_queue_enabled() && !ggml_sycl_graph_recording_active() &&
-           stream.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording;
+    return moe_join_queue_enabled() && !moe_cpu_job_stream_recording(stream);
 }
 
 // The queue a CPU job's join goes on instead of `stream`, or null to join on `stream` (llama.cpp-wfsl).  A host
@@ -24736,10 +24742,9 @@ static bool moe_cpu_job_device_signal_enabled() {
 
 // Whether the scatter on `stream` may wait on a CPU job's own event (llama.cpp-qwn5): the knob is on, and neither the
 // backend nor `stream` records a command graph, since a recorded scatter cannot depend on an event outside the graph.
-// The same recording test as moe_cpu_job_join_may_leave_stream. Asked at submit and again at the flush.
+// Asked at submit and again at the flush.
 static bool moe_cpu_job_device_signal_may(sycl::queue & stream) {
-    return moe_cpu_job_device_signal_enabled() && !ggml_sycl_graph_recording_active() &&
-           stream.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording;
+    return moe_cpu_job_device_signal_enabled() && !moe_cpu_job_stream_recording(stream);
 }
 
 // The two halves of a pool job's device event (llama.cpp-qwn5): *job goes to submit_batch, *ref to the pending slot.

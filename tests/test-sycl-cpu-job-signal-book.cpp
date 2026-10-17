@@ -490,7 +490,7 @@ struct marker_fixture {
 
     marker_fixture(uint32_t start, uint32_t serial) {
         storage       = start;
-        word->word    = &storage;
+        word->ptr     = &storage;
         marker.word   = word;
         marker.serial = serial;
     }
@@ -653,7 +653,7 @@ static void test_marker_abandon_waits_for_readers() {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     expect_true("the abandon does not return while a waiter may still load the word", !returned);
     // A waiter that arrives now sees the flag and does not load the word: a null word would fault.
-    f.word->word = nullptr;
+    f.word->ptr = nullptr;
     expect_true("a waiter arriving during the abandon is released without loading the word",
                 ggml_sycl::cpu_job_input_marker_seen(f.marker));
     expect_eq("that waiter leaves the reader count as it found it", f.word->readers.load(), 1);

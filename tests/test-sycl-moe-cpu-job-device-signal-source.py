@@ -41,7 +41,8 @@ THE CONTRACT.  With comments blanked:
      host-task join; moe_cpu_job_join_on_queue is called only after that branch.
   B. The device waits a job only when moe_cpu_job_device_signal_may() holds: the knob is
      on and neither the backend's recording flag nor the stream's own state records a
-     graph.  The flush asks it for the slot's stream; the one acquire helper asks it
+     graph (moe_cpu_job_stream_recording, the recording test the CPU job's three decisions
+     share).  The flush asks it for the slot's stream; the one acquire helper asks it
      before it asks the cache; the three CpuExpertPool producers acquire through that
      helper and hand the job half to submit_batch; nothing else takes an entry.
   C. (cpu-expert-pool.cpp submit_batch) the worker lambda's body is one try block whose
@@ -275,6 +276,7 @@ def enclosing_headers(code: str, pos: int) -> list[str]:
 
 FLUSH_SIG = r"static\s+void\s+flush_pending_cpu_scatter_slot\s*\(\s*pending_cpu_scatter\s*&\s*slot\s*\)\s*\{"
 MAY_SIG = r"static\s+bool\s+moe_cpu_job_device_signal_may\s*\(\s*sycl::queue\s*&\s*stream\s*\)\s*\{"
+REC_SIG = r"static\s+bool\s+moe_cpu_job_stream_recording\s*\(\s*sycl::queue\s*&\s*stream\s*\)\s*\{"
 ACQ_SIG = r"static\s+void\s+moe_cpu_job_device_signal_acquire\s*\([^)]*\)\s*\{"
 KNOB_SIG = r"static\s+bool\s+moe_cpu_job_device_signal_enabled\s*\(\s*\)\s*\{"
 WAIT_SLOT_SIG = r"static\s+void\s+pending_cpu_scatter_wait_prev_events\s*\(\s*pending_cpu_scatter\s*&\s*slot\s*\)\s*\{"
@@ -351,10 +353,13 @@ def check_flush(backend: str) -> None:
 def check_predicate(backend: str) -> None:
     code = blank_comments(backend)
     body, _ = body_of(code, MAY_SIG, "B")
-    want = ("return moe_cpu_job_device_signal_enabled() && !ggml_sycl_graph_recording_active() && "
-            "stream.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording;")
-    if flat(body).strip() != want:
-        fail("B", "moe_cpu_job_device_signal_may is not the knob and the two recording tests")
+    want = "return moe_cpu_job_device_signal_enabled() && !moe_cpu_job_stream_recording(stream);"
+    rec, _ = body_of(code, REC_SIG, "B")
+    rec_want = ("return ggml_sycl_graph_recording_active() || "
+                "stream.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording;")
+    if flat(body).strip() != want or flat(rec).strip() != rec_want:
+        fail("B", "moe_cpu_job_device_signal_may is not the knob and the two recording tests "
+                  "(moe_cpu_job_stream_recording: the backend's flag or the stream's state)")
     body, _ = body_of(code, ACQ_SIG, "B")
     if flat(body).strip() != ("if (moe_cpu_job_device_signal_may(stream)) { "
                               "(void) ggml_sycl::unified_cache_cpu_job_signal_acquire(stream, job, ref); }"):
@@ -909,12 +914,16 @@ def self_test(s: dict) -> int:
         ("A", "backend", "no native branch", sub(r"may_signal && group\[k\]->device_signal &&", "false &&")),
         ("B", "backend", "the flush asks for another stream",
          sub(r"moe_cpu_job_device_signal_may\(\*slot\.stream\);", "moe_cpu_job_device_signal_enabled();")),
+        # The recording test is moe_cpu_job_stream_recording, which the join and input-marker predicates share.
         ("B", "backend", "native under the backend's recording",
-         sub(r"return moe_cpu_job_device_signal_enabled\(\) && !ggml_sycl_graph_recording_active\(\) &&",
-             "return moe_cpu_job_device_signal_enabled() &&")),
+         sub(r"return ggml_sycl_graph_recording_active\(\) \|\|\s*stream\.", "return stream.")),
         ("B", "backend", "native while the stream records",
-         sub(r"(return moe_cpu_job_device_signal_enabled\(\) && !ggml_sycl_graph_recording_active\(\)) &&\n\s*"
-             r"stream\.ext_oneapi_get_state\(\) != sycl::ext::oneapi::experimental::queue_state::recording;", r"\1;")),
+         sub(r"return ggml_sycl_graph_recording_active\(\) \|\|\s*"
+             r"stream\.ext_oneapi_get_state\(\) == sycl::ext::oneapi::experimental::queue_state::recording;",
+             "return ggml_sycl_graph_recording_active();")),
+        ("B", "backend", "the device-signal predicate skips the recording test",
+         sub(r"return moe_cpu_job_device_signal_enabled\(\) && !moe_cpu_job_stream_recording\(stream\);",
+             "return moe_cpu_job_device_signal_enabled();")),
         ("B", "backend", "acquire without the predicate",
          sub(r"if \(moe_cpu_job_device_signal_may\(stream\)\) \{", "if (moe_cpu_job_device_signal_enabled()) {")),
         ("B", "backend", "a producer keeps its job half",

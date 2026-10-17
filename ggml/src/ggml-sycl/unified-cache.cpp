@@ -17541,10 +17541,10 @@ bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & af
         // The word is zeroed before any arm: a reused block may hold any value, and one at or past a serial would
         // release that job before its inputs land.
         auto word                   = std::make_shared<cpu_job_input_marker_word>();
-        word->word                  = static_cast<uint32_t *>(resolved.ptr);
+        word->ptr                   = static_cast<uint32_t *>(resolved.ptr);
         word->device                = device;
         word->slow                  = cpu_job_input_marker_report_slow;
-        *word->word                 = 0;
+        *word->ptr                  = 0;
         cpu_job_input_marker_owner_ = std::move(owner);
         cpu_job_input_marker_word_  = std::move(word);
         GGML_LOG_INFO(
@@ -17554,7 +17554,7 @@ bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & af
     }
     const uint32_t serial = cpu_job_input_marker_serial_ + 1;
     try {
-        cpu_job_input_marker_submit(queue_, cpu_job_input_marker_word_->word, serial, after);
+        cpu_job_input_marker_submit(queue_, cpu_job_input_marker_word_->ptr, serial, after);
     } catch (const sycl::exception & e) {
         GGML_LOG_WARN("[MOE-INPUT-MARKER] submitting a CPU expert job's input marker threw: %s (llama.cpp-42zj)\n",
                       e.what());
@@ -17586,7 +17586,7 @@ bool cpu_job_input_marker_arm_for_testing(sycl::queue &                         
                                           const std::vector<sycl::event> &                   after,
                                           cpu_job_input_marker *                             out) {
     try {
-        cpu_job_input_marker_submit(q, word->word, serial, after);
+        cpu_job_input_marker_submit(q, word->ptr, serial, after);
     } catch (const sycl::exception &) {
         return false;
     }

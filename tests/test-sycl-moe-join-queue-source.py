@@ -33,8 +33,9 @@ THE CONTRACT.  With comments blanked:
   F. (ggml-sycl.cpp moe_cpu_job_join_may_leave_stream, moe_cpu_job_join_queue) the
      selector returns nullptr, so the join goes on the stream, unless the knob is on
      and neither the backend's recording flag nor the stream's own queue state says a
-     command graph records; it asks that one predicate before it asks the cache for
-     the join queue.
+     command graph records (moe_cpu_job_stream_recording, the recording test the CPU
+     job's three decisions share); it asks that one predicate before it asks the cache
+     for the join queue.
   Q. (ggml-sycl.cpp moe_cpu_job_join_on_queue) submits the join on the queue the
      selector returns, else on `queue`, with the host_task text unchanged; nothing is
      submitted on `queue` directly.
@@ -183,6 +184,7 @@ def line_of(code: str, pos: int) -> int:
 
 KNOB_SIG = r"static\s+bool\s+moe_join_queue_enabled\s*\(\s*\)\s*\{"
 LEAVE_SIG = r"static\s+bool\s+moe_cpu_job_join_may_leave_stream\s*\(\s*sycl::queue\s*&\s*stream\s*\)\s*\{"
+STREAM_RECORDING_SIG = r"static\s+bool\s+moe_cpu_job_stream_recording\s*\(\s*sycl::queue\s*&\s*stream\s*\)\s*\{"
 SELECT_SIG = r"static\s+sycl::queue\s*\*\s*moe_cpu_job_join_queue\s*\([^)]*\)\s*\{"
 RECORDING = r"ext_oneapi_get_state\s*\(\s*\)\s*{op}\s*sycl::ext::oneapi::experimental::queue_state::recording"
 JOIN_ON_QUEUE_SIG = r"static\s+sycl::event\s+moe_cpu_job_join_on_queue\s*\([^)]*\)\s*\{"
@@ -226,8 +228,12 @@ def check_knob(backend: str, sources: dict) -> None:
 def check_select(backend: str) -> None:
     code = blank_comments(backend)
     leave, _ = body_of(code, LEAVE_SIG, "F")
-    pred = re.fullmatch(r"\s*return\s+moe_join_queue_enabled\s*\(\s*\)\s*&&\s*!\s*ggml_sycl_graph_recording_active\s*\(\s*\)"
-                        r"\s*&&\s*stream\." + RECORDING.format(op="!=") + r"\s*;\s*", leave)
+    pred = re.fullmatch(r"\s*return\s+moe_join_queue_enabled\s*\(\s*\)\s*&&\s*!\s*moe_cpu_job_stream_recording\s*\("
+                        r"\s*stream\s*\)\s*;\s*", leave)
+    rec, _ = body_of(code, STREAM_RECORDING_SIG, "F")
+    if not re.fullmatch(r"\s*return\s+ggml_sycl_graph_recording_active\s*\(\s*\)\s*\|\|\s*stream\." +
+                        RECORDING.format(op="==") + r"\s*;\s*", rec):
+        pred = None
     if not pred:
         fail("F", "moe_cpu_job_join_may_leave_stream is not: the knob is on, the backend does not record, and the "
                   "stream's own queue state is not recording")
@@ -545,18 +551,20 @@ def self_test(s: dict) -> int:
         ("K", "dispatch", "a second read of the knob",
          sub(r"(static inline void cpu_wait_chain_event\(\) \{)",
              r'\1\n    (void) std::getenv("GGML_SYCL_MOE_JOIN_QUEUE");')),
+        # The recording test is moe_cpu_job_stream_recording, which the CPU job's device-signal and input-marker
+        # predicates (llama.cpp-qwn5, llama.cpp-42zj) share, so a mutant of it breaks all three.
         ("F", "backend", "join queue while the backend records",
-         sub(r"return moe_join_queue_enabled\(\) && !ggml_sycl_graph_recording_active\(\) &&",
-             "return moe_join_queue_enabled() &&")),
-        # Anchored on the join predicate's own return: the CPU job's device-signal and input-marker predicates
-        # (llama.cpp-qwn5, llama.cpp-42zj) end in the same recording test.
+         sub(r"return ggml_sycl_graph_recording_active\(\) \|\|\s*stream\.", "return stream.")),
         ("F", "backend", "join queue while the stream itself records",
-         sub(r"(return moe_join_queue_enabled\(\) && !ggml_sycl_graph_recording_active\(\))\s*&&\s*"
-             r"stream\.ext_oneapi_get_state\(\) != sycl::ext::oneapi::experimental::queue_state::recording;",
-             r"\1;")),
+         sub(r"return ggml_sycl_graph_recording_active\(\) \|\|\s*"
+             r"stream\.ext_oneapi_get_state\(\) == sycl::ext::oneapi::experimental::queue_state::recording;",
+             "return ggml_sycl_graph_recording_active();")),
         ("F", "backend", "knob not consulted",
-         sub(r"return moe_join_queue_enabled\(\) && !ggml_sycl_graph_recording_active\(\)",
-             "return !ggml_sycl_graph_recording_active()")),
+         sub(r"return moe_join_queue_enabled\(\) && !moe_cpu_job_stream_recording\(stream\);",
+             "return !moe_cpu_job_stream_recording(stream);")),
+        ("F", "backend", "the join predicate skips the recording test",
+         sub(r"return moe_join_queue_enabled\(\) && !moe_cpu_job_stream_recording\(stream\);",
+             "return moe_join_queue_enabled();")),
         ("F", "backend", "selector skips the predicate",
          sub(r"if \(!moe_cpu_job_join_may_leave_stream\(stream\)\) \{", "if (false) {")),
         ("Q", "backend", "join submitted on the stream",

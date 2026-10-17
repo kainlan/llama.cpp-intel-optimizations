@@ -343,7 +343,7 @@ static int case_input_marker_beside_a_native_wait(sycl::queue & q, sycl::queue &
     uint32_t * word_mem = sycl::malloc_host<uint32_t>(1, q);
     *word_mem           = 0;
     auto word           = std::make_shared<ggml_sycl::cpu_job_input_marker_word>();
-    word->word          = word_mem;
+    word->ptr           = word_mem;
     ggml_sycl::cpu_job_input_marker marker;
     if (!native) {
         expect("the input marker is armed behind the job's input",

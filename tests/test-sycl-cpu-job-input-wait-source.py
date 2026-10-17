@@ -34,8 +34,8 @@ THE CONTRACT.  With comments and string literals blanked:
       the stream and, outside its closure, calls unified_cache_cpu_job_input_marker_arm once, as the condition of an
       `if` that first asks `!moe_cpu_job_input_marker_may(stream) ||`; that branch holds
       `sycl::event::wait(inputs.events)`, and every wait outside the closure sits in it.  moe_cpu_job_input_marker_may
-      refuses while the backend or the stream records a command graph (a recorded marker would be written only at
-      replay).
+      is `!moe_cpu_job_stream_recording(stream)`, the one recording test the CPU job's three decisions share: the
+      backend's flag or the stream's own state (a recorded marker would be written only at replay).
   W5. Every prologue is built with its stream: each moe_cpu_job_prologue call passes the op's stream first, and the
       event-chained hybrid route builds its prologue before its table copy and its device-expert kernel, so the
       in-order marker does not wait for that kernel and the CPU and GPU halves still overlap.
@@ -213,6 +213,7 @@ CACHE_HPP_REL = Path("ggml") / "src" / "ggml-sycl" / "unified-cache.hpp"
 WAIT_SIG = r"static\s+void\s+moe_cpu_job_wait_inputs\s*\(([^)]*)\)\s*\{"
 PROLOGUE_SIG = r"static\s+std::function<void\(\)>\s+moe_cpu_job_prologue\s*\(([^)]*)\)\s*\{"
 MAY_SIG = r"static\s+bool\s+moe_cpu_job_input_marker_may\s*\(([^)]*)\)\s*\{"
+STREAM_RECORDING_SIG = r"static\s+bool\s+moe_cpu_job_stream_recording\s*\(\s*sycl::queue\s*&\s*stream\s*\)\s*\{"
 CHAINED_SIG = r"static\s+bool\s+ggml_sycl_moe_hybrid_decode_event_chained\s*\(([^)]*)\)\s*\{"
 WAIT_ALLOWED = {"cpu_job_input_marker_wait", "ggml_sycl_watchdog_heartbeat", "moe_hostpath_waits_enabled",
                 "cpu_expert_pool_trace_stamp_inputs_ready", "memset"}
@@ -336,10 +337,13 @@ def check_wait_inputs(s: dict[str, str]) -> None:
             fail("W4", "moe_cpu_job_prologue waits on the submitting thread outside the arm's refusal branch; a host "
                        "wait there is only the fallback for a marker that was not armed")
     _, maybody = definition(code, MAY_SIG, "W4")
-    if not (re.search(r"!\s*ggml_sycl_graph_recording_active\s*\(\s*\)", maybody) and
-            re.search(r"ext_oneapi_get_state\s*\(\s*\)\s*!=\s*sycl::ext::oneapi::experimental::queue_state::recording",
-                      maybody)):
-        fail("W4", "moe_cpu_job_input_marker_may does not refuse while the backend or the stream records a graph")
+    _, recbody = definition(code, STREAM_RECORDING_SIG, "W4")
+    if not re.fullmatch(r"\s*return\s*!\s*moe_cpu_job_stream_recording\s*\(\s*stream\s*\)\s*;\s*", maybody) or \
+       not re.fullmatch(r"\s*return\s+ggml_sycl_graph_recording_active\s*\(\s*\)\s*\|\|\s*stream\s*\.\s*"
+                        r"ext_oneapi_get_state\s*\(\s*\)\s*==\s*sycl::ext::oneapi::experimental::queue_state::recording"
+                        r"\s*;\s*", recbody):
+        fail("W4", "moe_cpu_job_input_marker_may does not refuse while the backend or the stream records a graph "
+                   "(`!moe_cpu_job_stream_recording(stream)`, that helper the backend's flag or the stream's state)")
 
     # W5: every prologue is built with its stream, and the event-chained route arms before its device half.
     sites = [m for m in re.finditer(r"\bmoe_cpu_job_prologue\s*\(", code) if not re.search(
@@ -528,7 +532,7 @@ def check_helpers(s: dict[str, str]) -> None:
                                                             block_at(arm, io.end() - 1, "W7")[0]):
         fail("W7", "unified_cache::arm_cpu_job_input_marker does not refuse a stream that is not in order before it "
                    "allocates: markers could run out of serial order and the word go backwards")
-    zero = re.search(r"\*\s*word\s*->\s*word\s*=\s*0\s*;", arm)
+    zero = re.search(r"\*\s*word\s*->\s*ptr\s*=\s*0\s*;", arm)
     pub = re.search(r"\bcpu_job_input_marker_word_\s*=\s*std::move\s*\(\s*word\s*\)\s*;", arm)
     slow = re.search(r"\bword\s*->\s*slow\s*=\s*cpu_job_input_marker_report_slow\s*;", arm)
     if not zero or not pub or zero.start() > pub.start():
@@ -799,8 +803,13 @@ def mutants() -> list:
         ("W4", "backend", "the prologue also waits the inputs when the marker is armed",
          sub(r"(\n(\s*)return \[marker = std::move\(marker\),)", r"\n\2sycl::event::wait(inputs.events);\1")),
         ("W4", "backend", "the recording test misses a recording stream",
-         sub(r"return !ggml_sycl_graph_recording_active\(\) &&\s*stream\.ext_oneapi_get_state\(\) != "
-             r"sycl::ext::oneapi::experimental::queue_state::recording;", r"return !ggml_sycl_graph_recording_active();")),
+         sub(r"return ggml_sycl_graph_recording_active\(\) \|\|\s*stream\.ext_oneapi_get_state\(\) == "
+             r"sycl::ext::oneapi::experimental::queue_state::recording;", r"return ggml_sycl_graph_recording_active();")),
+        ("W4", "backend", "the recording test misses the backend's flag",
+         sub(r"return ggml_sycl_graph_recording_active\(\) \|\|\s*stream\.", r"return stream.")),
+        ("W4", "backend", "the marker predicate skips the recording test",
+         sub(r"(static bool moe_cpu_job_input_marker_may\(sycl::queue & stream\) \{\n\s*)"
+             r"return !moe_cpu_job_stream_recording\(stream\);", r"\1return true;")),
         ("W5", "backend", "a site builds its prologue without the stream",
          sub(r"moe_cpu_job_prologue\(\*stream, std::move\(job_inputs\), src0\)",
              r"moe_cpu_job_prologue(std::move(job_inputs), src0)")),
@@ -842,12 +851,12 @@ def mutants() -> list:
         ("W7", "header", "the marker wait enters SYCL",
          sub(r"(\n(\s*)\+\+spins;)", r"\1\n\2(void) sycl::event().get_info<sycl::info::event::command_execution_status>();")),
         ("W7", "header", "seen reads the word before abandoned",
-         sub(r"w\.abandoned\.load\(std::memory_order_seq_cst\) \|\|\n(\s*)cpu_job_input_marker_reached\(__atomic_load_n\(w\.word, "
+         sub(r"w\.abandoned\.load\(std::memory_order_seq_cst\) \|\|\n(\s*)cpu_job_input_marker_reached\(__atomic_load_n\(w\.ptr, "
              r"__ATOMIC_ACQUIRE\), m\.serial\);",
-             r"cpu_job_input_marker_reached(__atomic_load_n(w.word, __ATOMIC_ACQUIRE), m.serial) ||\n\1"
+             r"cpu_job_input_marker_reached(__atomic_load_n(w.ptr, __ATOMIC_ACQUIRE), m.serial) ||\n\1"
              r"w.abandoned.load(std::memory_order_seq_cst);")),
         ("W7", "header", "seen reads the word relaxed",
-         sub(r"__atomic_load_n\(w\.word, __ATOMIC_ACQUIRE\)", r"__atomic_load_n(w.word, __ATOMIC_RELAXED)")),
+         sub(r"__atomic_load_n\(w\.ptr, __ATOMIC_ACQUIRE\)", r"__atomic_load_n(w.ptr, __ATOMIC_RELAXED)")),
         # The word's allocation never goes under a load: a waiter counts itself before it tests the flag and loads the
         # word, and the abandon sets the flag and then waits for that count.
         ("W7", "header", "seen does not count itself in readers",
@@ -892,9 +901,9 @@ def mutants() -> list:
         # word not zeroed before a job sees it, an out-of-order stream, or a marker on another queue or cache.
         ("W7", "cache", "every arm takes serial 1",
          sub(r"const uint32_t serial = cpu_job_input_marker_serial_ \+ 1;", r"const uint32_t serial = 1;")),
-        ("W7", "cache", "the word is not zeroed", sub(r"\n\s*\*word->word\s*= 0;", "")),
+        ("W7", "cache", "the word is not zeroed", sub(r"\n\s*\*word->ptr\s*= 0;", "")),
         ("W7", "cache", "the word is zeroed after it is published",
-         move(r"\n\s*\*word->word\s*= 0;", r"\n\s*GGML_LOG_INFO\(\n\s*\"\[MOE-INPUT-MARKER\] CPU expert jobs wait")),
+         move(r"\n\s*\*word->ptr\s*= 0;", r"\n\s*GGML_LOG_INFO\(\n\s*\"\[MOE-INPUT-MARKER\] CPU expert jobs wait")),
         ("W7", "cache", "an out-of-order stream is not refused",
          sub(r"\n\s*if \(!queue_\.has_property<sycl::property::queue::in_order>\(\)\) \{\n\s*\*why = \"the stream is not "
              r"in order[^}]*\}", "")),
