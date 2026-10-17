@@ -24231,8 +24231,9 @@ static void moe_hostpath_waits_device_signal() {
     g_moe_hostpath_waits.joins_device_signal += 1;
 }
 
-// One synchronize's sleep on the CPU expert job gates of its stream (llama.cpp-qwn5): the device's gate list, the
-// newest gate the sleep covered, how many it waited, and the census's clock stamps (zero with the trace off).
+// One queue wait's sleep on the CPU expert job gates of its queue (llama.cpp-qwn5), in the backend's synchronize or in
+// ggml_sycl_trace_queue_wait: the device's gate list, the newest gate the sleep covered, how many it waited, and the
+// census's clock stamps (zero with the trace off).
 struct ggml_sycl_cpu_job_gate_sleep {
     std::shared_ptr<ggml_sycl::cpu_job_gate_list> gates;
     uint64_t                                      newest = 0;
@@ -24241,12 +24242,12 @@ struct ggml_sycl_cpu_job_gate_sleep {
     moe_hostpath_clock::time_point                t_slept;
 };
 
-// Before the backend's synchronize waits its stream: sleeps on the gates of the CPU expert jobs the device waits on
-// their own events (cpu_job_gate_list), so the stream wait after it polls the driver only for the device work after
-// those jobs, not for the jobs' whole length. The scheduler synchronizes before every cross-backend input of a
-// single-device run, and each such wait used to spin a core that the jobs' row threads needed. This adds no wait: the
-// stream wait already waited for those jobs, through the device commands that wait on their events. The gate list is
-// the device's, so a synchronize from any thread sleeps; no lock is held while it does.
+// Before a whole-queue wait, in the backend's synchronize and in the graph code's queue waits
+// (ggml_sycl_trace_queue_wait): sleeps on the gates of the CPU expert jobs the device waits on their own events
+// (cpu_job_gate_list), so the driver wait after it polls only for the device work after those jobs, not for the jobs'
+// whole length. This adds no wait: the queue wait already waited for those jobs, through the device commands that
+// wait on their events. The list is found only for the unified cache's queue and is the device's, so a wait on that
+// queue from any thread sleeps; no lock is held while it does.
 static ggml_sycl_cpu_job_gate_sleep ggml_sycl_cpu_job_gates_sleep(sycl::queue & stream) {
     ggml_sycl_cpu_job_gate_sleep sleep;
     sleep.t_begin = moe_hostpath_wait_begin();
@@ -26526,10 +26527,11 @@ static void flush_pending_cpu_scatter_slot(pending_cpu_scatter & slot) {
                 native[k] = true;
                 ++n_native;
                 moe_hostpath_waits_device_signal();
-                // The job's future is the gate a host wait behind this job sleeps on first: the backend's synchronize
-                // and the graph boundary through the ring's gates, the retained-handle reaper through the records
-                // this flush publishes (llama.cpp-qwn5). Only a pool producer's job has a device event, so the future
-                // is a promise's, whose last copy never blocks when it is dropped.
+                // The job's future is the gate a host wait behind this job sleeps on first: the backend's synchronize,
+                // the graph code's queue waits (ggml_sycl_trace_queue_wait) and the graph boundary through the ring's
+                // gates, the retained-handle reaper through the records this flush publishes (llama.cpp-qwn5). Only a
+                // pool producer's job has a device event, so the future is a promise's, whose last copy never blocks
+                // when it is dropped.
                 std::shared_future<void> gate = group[k]->future.share();
                 ggml_sycl::cpu_job_signal_gate_push(signal_mark, gate);
                 ws.gates.push_back(std::move(gate));

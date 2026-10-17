@@ -96,8 +96,10 @@ THE CONTRACT.  With comments blanked:
      gate helpers, the boundary wait or the reaper loop is a get(), wait_for() or
      wait_until() call; the list's only wait is the future.wait() of its static sleep_on,
      which wait_all and wait_upto call on a snapshot their lock_guard does not outlive; the
-     reaper's gate wait sits directly in its try block, outside every store lock, and no
-     lock is taken in the synchronize before its sleep, nor anywhere in the graph code's
+     reaper's gate wait sits directly in its try block, outside every store lock; and no
+     lock of any form (a guard of any kind, a raw lock(), lock_shared() or try_lock() call
+     through . or ->, or std::lock()) is taken in the synchronize before its sleep, in the
+     gate sleep the synchronize and the queue wait share, or anywhere in the graph code's
      queue wait.
   J5. (reaper) a record publication copies the open retained_handle_gate_scope's gates
      into the record; the scope saves and restores the thread's pointer; the reaper waits
@@ -128,10 +130,11 @@ THE CONTRACT.  With comments blanked:
      after B8; the waits line names B9 after B8 and prints queue_gate_waits=,
      queue_gate_sleep_us= and queue_driver_us= right after B9=, reset with the token's
      counts; the catalog's trace row names B1..B9 and the three fields, and its knob row
-     the queue waits.  Its J4 half (no lock of any form, guard or raw lock() call, anywhere
-     in the queue wait's body) runs before the B9 shape checks: a lock inserted into that
-     body always breaks one of those shapes too, and a lock there is the hazard to report
-     (a sleep under a lock its job may need never ends), whatever else it moved.
+     the queue waits.  Its J4 half (no lock of any form anywhere in the queue wait's body)
+     runs before the B9 shape checks, so every lock there fails as J4, the hazard to
+     report (a sleep under a lock its job may need never ends).  A lock around the sleep
+     and the wait also breaks a B9 shape, but a lock taken before the traced begin line
+     breaks none, so only J4 can catch it.
   R.  The reaper's census, trace only: the trace's enable turns it on and is its one
      caller; the reaper's timer reads no clock while it is off, stamps the gate sleep's end,
      and its waited(), right after the event wait, is the only place the four counters
@@ -558,9 +561,11 @@ GATE_POLLS = ((r"\.\s*get\s*\(\s*\)", "takes a value (`.get()`)"),
               (r"\bwait_for\s*\(", "polls (`wait_for`)"),
               (r"\bwait_until\s*\(", "polls (`wait_until`)"))
 LOCKS = r"\b(?:lock_guard|unique_lock|scoped_lock|retained_store_lock)\b"
-# The queue wait holds no lock at all, so any lock form counts there: a guard of any kind or a raw lock() call.
-QUEUE_LOCKS = (r"\b(?:lock_guard|unique_lock|scoped_lock|shared_lock|retained_store_lock)\b"
-               r"|\.\s*(?:lock|lock_shared|try_lock)\s*\(")
+# Where a gate is waited, or about to be, no lock may be held at all, so any lock form counts: a guard of any kind,
+# a raw lock(), lock_shared() or try_lock() call through . or ->, or std::lock().
+ANY_LOCKS = (r"\b(?:lock_guard|unique_lock|scoped_lock|shared_lock|retained_store_lock)\b"
+             r"|(?:\.|->)\s*(?:lock|lock_shared|try_lock)\s*\("
+             r"|\bstd\s*::\s*lock\s*\(")
 WAIT_TIMER_SIG = r"struct\s+retained_drain_wait_timer\s*\{"
 CENSUS_ENABLE_SIG = r"void\s+retained_handle_drain_census_enable\s*\(\s*\)\s*noexcept\s*\{"
 CENSUS_TAKE_SIG = r"retained_handle_drain_census\s+retained_handle_drain_census_take\s*\(\s*\)\s*noexcept\s*\{"
@@ -728,8 +733,10 @@ def check_gates(s: dict) -> None:
             not in flat(gl):
         fail("J4", "a gate list wait is not sleep_on() over a snapshot whose lock is released before the wait")
     pre = sf[:sleep_at] if sleep_at >= 0 else sf
-    if re.search(LOCKS, pre):
+    if re.search(ANY_LOCKS, strip_strings(pre)):
         fail("J4", "the synchronize takes a lock before its gate sleep")
+    if re.search(ANY_LOCKS, strip_strings(gs)):
+        fail("J4", "the gate sleep takes a lock it would hold across the gates' wait")
     if re.search(LOCKS, cg):
         fail("J4", "unified_cache_cpu_job_gates holds a lock it would return under")
     mem = blank_comments(s["mem_cpp"])
@@ -844,12 +851,11 @@ def check_gates(s: dict) -> None:
                   "and reaper_driver_us= split")
 
 
-
 def check_queue_waits(s: dict) -> None:
     code = blank_comments(s["backend"])
     qb, _ = body_of(code, QUEUE_WAIT_SIG, "B9")
     qf = flat(qb)
-    if re.search(QUEUE_LOCKS, strip_strings(qb)):
+    if re.search(ANY_LOCKS, strip_strings(qb)):
         fail("J4", "the graph code's queue wait takes a lock it would sleep under")
     if qf.count(QUEUE_SEQ) != 2 or len(re.findall(r"\bq->wait\(\);", qf)) != 2:
         fail("B9", "a queue wait of the graph code does not sleep on the gates right before it and clear them right "
@@ -1128,7 +1134,7 @@ def self_test(s: dict) -> int:
              r"\{\n\s*gate\.wait\(\);\n\s*\}\n\s*\})",
              r"\1{\1    retained_store_lock gate_lock(*g_retained_handles_state);\1    \3\1}")),
         ("J4", "backend", "the synchronize sleeps under a lock",
-         sub(r"(\n(\s*))(const ggml_sycl_cpu_job_gate_sleep gate_sleep)",
+         sub(r"(\n(\s*))(const ggml_sycl_cpu_job_gate_sleep gate_sleep = ggml_sycl_cpu_job_gates_sleep\(\*stream\);)",
              r"\1std::lock_guard<std::mutex> held(g_execution_backend_binding_mutex);\1\3")),
         ("J5", "mem_cpp", "a publication drops the scope's gates",
          sub(r"std::move\(ids\), std::move\(gates\) \}\);", "std::move(ids) });")),
@@ -1226,6 +1232,32 @@ def self_test(s: dict) -> int:
              r"\s*q->wait\(\);\n\s*ggml_sycl_cpu_job_gates_clear_queue_wait\(gate_sleep\);\n)"
              r"(\s*const auto\s+t1)",
              r"\n\2g_execution_backend_binding_mutex.lock();\1\2g_execution_backend_binding_mutex.unlock();\n\3")),
+        ("J4", "backend", "the queue wait takes an arrow-form lock around its untraced sleep",
+         sub(r"(if \(!enabled\) \{\n)(\s*)(const ggml_sycl_cpu_job_gate_sleep gate_sleep = "
+             r"ggml_sycl_cpu_job_gates_sleep\(\*q\);\n)",
+             r"\1\2g_execution_backend_binding_mutex_ptr->lock();\n"
+             r"\2\3\2g_execution_backend_binding_mutex_ptr->unlock();\n")),
+        ("J4", "backend", "the queue wait takes std::lock() around its untraced sleep",
+         sub(r"(if \(!enabled\) \{\n)(\s*)(const ggml_sycl_cpu_job_gate_sleep gate_sleep = "
+             r"ggml_sycl_cpu_job_gates_sleep\(\*q\);\n)",
+             r"\1\2std::lock(g_a_mutex, g_b_mutex);\n\2\3\2g_a_mutex.unlock();\n\2g_b_mutex.unlock();\n")),
+        ("J4", "backend", "the queue wait takes a lock_guard before its begin line",
+         sub(r"(\n(\s*)fprintf\(stderr, \"\[SYCL-WAIT\] begin reason=)",
+             r"\n\2std::lock_guard<std::mutex> held(g_execution_backend_binding_mutex);\1")),
+        ("J4", "backend", "the queue wait takes an arrow-form lock before its begin line",
+         lambda t: re.sub(r"(wait_ms=%\.3f\\n\", safe_reason, device, node_idx,\n\s*wait_ms\);\n"
+                          r"\s*fflush\(stderr\);\n)",
+                          r"\1    g_execution_backend_binding_mutex_ptr->unlock();\n",
+                          re.sub(r"(\n(\s*)fprintf\(stderr, \"\[SYCL-WAIT\] begin reason=)",
+                                 r"\n\2g_execution_backend_binding_mutex_ptr->lock();\1", t, count=1), count=1)),
+        ("J4", "backend", "the gate sleep holds a lock_guard across its wait",
+         sub(r"(\n    sleep\.gates   = ggml_sycl::unified_cache_cpu_job_gates\(stream\);\n)",
+             r"\1    std::lock_guard<std::mutex> held(g_execution_backend_binding_mutex);\n")),
+        ("J4", "backend", "the synchronize takes an arrow-form lock across its sleep",
+         sub(r"(\n(\s*))(const ggml_sycl_cpu_job_gate_sleep gate_sleep = "
+             r"ggml_sycl_cpu_job_gates_sleep\(\*stream\);\n)",
+             r"\1g_execution_backend_binding_mutex_ptr->lock();"
+             r"\1\3\2g_execution_backend_binding_mutex_ptr->unlock();\n")),
         ("B9", "backend", "B9 is not named", sub(r'"B8",(\s+)"B9"(\s*)\};', r'"B8",\1"B8"\2};')),
         ("B9", "backend", "the queue split is printed after B8",
          sub(r"c == MOE_WAIT_B9 && at", "c == MOE_WAIT_B8 && at")),

@@ -220,8 +220,9 @@ class cpu_job_signal_book {
 // CpuExpertPool::stop_workers detaches a worker that did not join within 5 s, whose job may never end: its gate never
 // opens, and a waiter that reaches it sleeps for good. The device command parked on that job's event does not end
 // either, so the device wait the gate stands in front of would not have returned. A process killed in that state is
-// reaped: on the B50, 13 SIGKILLs with a copy and a kernel parked on an unsignalled event were each reaped in 29-47 ms,
-// none in D-state, and the card and a co-tenant kept working.
+// reaped: on the B50, 8 SIGKILLs with a copy and a kernel parked on an unsignalled event were reaped in 30-47 ms, none
+// in D-state. The first drew one per-context Engine reset in the kernel log; the card and a co-tenant kept working
+// (llama.cpp-qwn5 c-a8ea).
 class cpu_job_gate_list {
   public:
     // Past this many gates something is not clearing; a push then drops the oldest.
