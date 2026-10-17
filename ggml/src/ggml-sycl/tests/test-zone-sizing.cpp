@@ -994,9 +994,10 @@ int main() {
     }
 
     // ---- Case 14k: a quantized type no kernel but the f16 dequant arm serves takes it as its PP route (llama.cpp-gldu) ----
-    // The router walks its priority list: a type an MMQ kernel serves is taken by MMQ at PP batch, a type with a
-    // coalesced layout by its coalesced / unified kernel, and what is left (the IQ family) has only the oneDNN dequant
-    // arm. The planner asks the SAME two type lists the router's eligibility terms are built from
+    // The router walks its priority list: a type an MMQ kernel serves is taken by MMQ at PP batch unless the MMQ claim
+    // moves it to the arm (Case 14l), a type with a coalesced layout by its coalesced / unified kernel, and what is
+    // left (the IQ family) has only the oneDNN dequant arm. The planner asks the SAME two type lists the router's
+    // eligibility terms are built from
     // (unified-types.hpp), so it claims exactly that remainder; claiming an MMQ type sized the whole plan from the
     // 1.2 GB f16 copy of a Q5_K LM head on a device run.
     {
@@ -1009,7 +1010,8 @@ int main() {
                                         GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K };
         for (ggml_type ty : mmq_types) {
             CHECK(ggml_sycl::mmq_capable_type(ty), "the MMQ list carries the type the router's use_mmq asks about");
-            CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(ty), "an MMQ type is taken by MMQ at PP batch");
+            CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(ty),
+                  "an MMQ type is not the AOS claim's (the MMQ claim of Case 14l covers the measured ones)");
         }
         CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q8_0), "Q8_0 keeps its own unconditional mark");
         CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(GGML_TYPE_Q4_0), "Q4_0 keeps the unified-kernel mark");
@@ -1076,6 +1078,100 @@ int main() {
             marked("per_layer_token_embd.weight", GGML_TYPE_IQ4_NL, 160, 320001536, per_layer_embd_w, true));
         CHECK(zone_scoped_maxima(with_embd).dequant_f16_weight_bytes == layer_w,
               "a gather-only IQ4_NL table never sizes the dequant plan");
+    }
+
+    // ---- Case 14l: the MMQ types the oneDNN f16 dequant arm serves at PP batch (llama.cpp-h9c8) ------------------
+    // At PP batch the MMQ kernel ran these types at ~3.8 TOPS where the oneDNN f16 GEMM runs the same shapes at
+    // ~133 TFLOPS, so they take the arm. The planner and the router ask ONE list and ONE claim (unified-types.hpp),
+    // so the plan reserves what the arm draws. The list is explicit rather than "MMQ minus Q4_0 / Q8_0": a type added
+    // to the MMQ list later does not join the arm before it is measured.
+    {
+        auto prefers = [](ggml_type ty) {
+            return ggml_sycl::dense_pp_route_prefers_f16_dequant_arm(ty);
+        };
+        const ggml_type listed[] = { GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q2_K,
+                                     GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K };
+        for (ggml_type ty : listed) {
+            CHECK(prefers(ty), "a measured MMQ type is listed");
+        }
+        int n_listed = 0;
+        for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+            const ggml_type ty = static_cast<ggml_type>(t);
+            if (!prefers(ty)) {
+                continue;
+            }
+            n_listed++;
+            CHECK(ggml_sycl::mmq_capable_type(ty), "a listed type is one an MMQ kernel serves");
+            CHECK(ggml_sycl::dense_mul_mat_type_supported(ty), "a listed type is a dense MUL_MAT SYCL executes");
+            CHECK(!ggml_sycl::dense_pp_route_is_f16_dequant_arm(ty), "the list is disjoint from the AOS claim's types");
+            CHECK(!ggml_sycl::unified_kernel_serves_type(ty), "the list is disjoint from the unified kernel's types");
+        }
+        CHECK(n_listed == 8, "exactly the eight measured types are listed");
+        CHECK(!prefers(GGML_TYPE_Q4_0) && !prefers(GGML_TYPE_Q8_0) && !prefers(GGML_TYPE_MXFP4),
+              "Q4_0, Q8_0 and MXFP4 keep their own oneDNN routes and plan marks");
+        CHECK(!prefers(GGML_TYPE_IQ4_XS) && !prefers(GGML_TYPE_IQ2_XXS) && !prefers(GGML_TYPE_F16) &&
+                  !prefers(GGML_TYPE_F32),
+              "the IQ family (the AOS claim's) and the float types are not listed");
+
+        // The composition the adapter and the router helper call.
+        auto claims = [](ggml_type ty, bool head, bool expert, bool matrix, bool dequant) {
+            return ggml_sycl::mmq_dequant_f16_plan_claims(ty, true, head, expert, matrix, dequant);
+        };
+        for (ggml_type ty : listed) {
+            CHECK(claims(ty, false, false, true, true), "a dense 2-D weight of a listed type is claimed");
+        }
+        CHECK(!claims(GGML_TYPE_Q6_K, true, false, true, true), "the LM head stays on MMQ and is not claimed");
+        CHECK(!claims(GGML_TYPE_Q4_K, false, true, true, true), "an expert stack is not claimed");
+        CHECK(!claims(GGML_TYPE_Q4_K, false, false, false, true), "a 3-D weight stays on MMQ and is not claimed");
+        CHECK(!claims(GGML_TYPE_Q5_K, false, false, true, false), "a type the router cannot dequantize is not claimed");
+        CHECK(!ggml_sycl::mmq_dequant_f16_plan_claims(GGML_TYPE_Q4_K, false, false, false, true, true),
+              "a non-quantized operand is not claimed");
+        CHECK(!claims(GGML_TYPE_Q4_0, false, false, true, true) && !claims(GGML_TYPE_Q8_0, false, false, true, true) &&
+                  !claims(GGML_TYPE_MXFP4, false, false, true, true) &&
+                  !claims(GGML_TYPE_IQ4_XS, false, false, true, true),
+              "a type the list leaves out is not claimed");
+        for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+            const ggml_type ty = static_cast<ggml_type>(t);
+            CHECK(!(claims(ty, false, false, true, true) &&
+                    ggml_sycl::aos_dequant_f16_plan_claims(ty, true, false, false, true)),
+                  "no weight is claimed by both the AOS claim and the MMQ claim");
+        }
+
+        // Mistral 7B Q4_K_M as the adapter marks it: the claim decides, the adapter's own arithmetic sizes the marks,
+        // and by default the scratch is not enabled for these types, so every mark is planned. Two layers suffice: the
+        // plan is a maximum over the marked weights, not a sum.
+        auto marked = [&](const char * name, ggml_type type, int64_t ne0, int64_t ne1, bool head) {
+            zone_tensor_desc d = desc(name, 1000, type, ne0, ne1, 1, 1);
+            size_t           w = 0;
+            size_t           s = 0;
+            if (claims(type, head, false, true, true) && ggml_sycl::zone_dequant_f16_weight_bytes(ne0, ne1, &w) &&
+                ggml_sycl::zone_dequant_f16_src1_bytes_per_token(ne0, 1, 1, &s)) {
+                d.dequant_f16_if_unsupplied_weight_bytes         = w;
+                d.dequant_f16_if_unsupplied_src1_bytes_per_token = s;
+            }
+            d.pp_scratch_type_enabled = false;
+            return d;
+        };
+        std::vector<zone_tensor_desc> mistral;
+        for (int il = 0; il < 2; il++) {
+            mistral.push_back(marked("blk.N.attn_q.weight", GGML_TYPE_Q4_K, 4096, 4096, false));
+            mistral.push_back(marked("blk.N.attn_k.weight", GGML_TYPE_Q4_K, 4096, 1024, false));
+            mistral.push_back(marked("blk.N.attn_v.weight", GGML_TYPE_Q6_K, 4096, 1024, false));
+            mistral.push_back(marked("blk.N.attn_output.weight", GGML_TYPE_Q4_K, 4096, 4096, false));
+            mistral.push_back(marked("blk.N.ffn_gate.weight", GGML_TYPE_Q4_K, 4096, 14336, false));
+            mistral.push_back(marked("blk.N.ffn_up.weight", GGML_TYPE_Q4_K, 4096, 14336, false));
+            mistral.push_back(marked("blk.N.ffn_down.weight", GGML_TYPE_Q6_K, 14336, 4096, false));
+        }
+        std::vector<zone_tensor_desc> with_head = mistral;
+        mistral.push_back(marked("output.weight", GGML_TYPE_Q6_K, 4096, 32000, true));
+        const path_scoped_maxima plan = zone_scoped_maxima(mistral);
+        CHECK(plan.dequant_f16_weight_bytes == 117440512, "the plan is the largest FFN weight's f16 copy (112 MiB)");
+        CHECK(plan.dequant_f16_src1_bytes_per_token == 28672,
+              "the activation row per token is ffn_down's 14336-wide input in f16");
+        // Had the head been claimed, its f16 copy (250 MiB) would have sized the whole plan.
+        with_head.push_back(marked("output.weight", GGML_TYPE_Q6_K, 4096, 32000, false));
+        CHECK(zone_scoped_maxima(with_head).dequant_f16_weight_bytes == 262144000,
+              "a claimed head would size the plan, which is why the claim leaves it out");
     }
 
     // ---- Case 14h: the figures a zone is described by outlive a later plan (llama.cpp-8ony) -----------------------

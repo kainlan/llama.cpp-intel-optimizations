@@ -2478,8 +2478,9 @@ prompt, the last chunk of a long one), `GGML_SYCL_ONEDNN_PP=0`, and any node the
 GPU run on Qwen3.6-27B showed it (`cohort=mul-mat-dequant-f16-src0 uses=48`). Where the f16 arm is *unreachable* the plan
 is zero, and then the hold, the fit check and the ring's pending RUNTIME demand all count nothing, because all three read
 the same planned figures: a build without oneDNN or `GGML_SYCL_F16` plans no f16 bytes
-(`ggml_sycl_dequant_f16_scratch_drawable()`), and a model with no dense Q8_0 weight has no f16 candidate in the zone
-adapter. Where it is reachable all three count it.
+(`ggml_sycl_dequant_f16_scratch_drawable()`), and a model with no weight the zone adapter claims has no f16 candidate
+(the claimants are listed under "Who the dense f16 dequant plan covers" below). Where it is reachable all three count
+it.
 
 A compute buffer that the RUNTIME zone will not serve lands in the arena's KV zone, not in raw device memory. The
 zone is a fixed 512 MB by default (`GGML_SYCL_RUNTIME_ARENA_MB`, raised only to the planned PP/MoE/dense requirement),
@@ -2794,6 +2795,36 @@ is a table lookup, and a per-node cache would need per-graph storage on this pat
 Host tests: `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` Case 14 pins the arithmetic and Case 15 the held-back branch,
 the route after a decline and the merged inputs;
 `tests/test-sycl-mmq-src1-plan-source.py` pins the wiring, with a mutation witness per check.
+
+### Who the dense f16 dequant plan covers (`llama.cpp-gldu`, `llama.cpp-h9c8`)
+
+The two f16 dequant buffers are sized from per-weight marks that `unified_cache_adapt_zone_inventory` sets; the plan is
+the maximum over the marked weights, not a sum. The planner has no graph node, no batch and no resolved layout, so each
+mark is a type-level claim built from the router's own type lists in `ggml/src/ggml-sycl/unified-types.hpp`, and each
+claim has a router-side twin that asks the same function. A weight the router sends to the arm without a mark is still
+found by the graph-entry walk, which grows the buffer inside the RUNTIME zone or refuses by name.
+
+| claimant | types | when marked | router side |
+|---|---|---|---|
+| Q8_0 (`llama.cpp-479i`) | Q8_0 | always | `ONEDNN_SOA` / `ONEDNN_COALESCED`, selected whatever `GGML_SYCL_ONEDNN_PP` says |
+| unified kernel (`llama.cpp-8ony`) | Q4_0, MXFP4 | oneDNN PP type admission | the unified kernel's oneDNN f16 route |
+| AOS claim (`llama.cpp-gldu`) | quantized types no MMQ, coalesced or unified kernel serves (the IQ family) | always | `ONEDNN_AOS`, the only PP route they have |
+| MMQ claim (`llama.cpp-h9c8`) | Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K | `GGML_SYCL_ONEDNN_PP_MMQ_TYPES` and the oneDNN PP type admission | `ggml_sycl_dense_f16_arm_serves_pp`, asked before `MMQ_AOS` and at `ONEDNN_SOA` |
+
+All four exclude expert stacks (`MUL_MAT_ID` keeps its own workspace). The AOS and MMQ claims also exclude the LM head
+(`ggml_sycl_weight_is_output_head`): a completion runs it on one row per ubatch, so it never reaches the arm there, and
+its f16 copy would size the whole plan. The MMQ claim alone is restricted to 2-D weights, because the arm converts an
+SOA-resident weight only as a whole tensor and a 3-D dense operand is dispatched per plane on row slices.
+
+The MMQ claim is the one whose router twin can refuse a weight the plan reserved for, so its terms are composed in one
+function, `mmq_dequant_f16_plan_claims`, which both sides call with the same head, expert, 2-D and dequant flags. The
+router then narrows it with what only it knows: the oneDNN PP candidate (batch at or above
+`GGML_SYCL_ONEDNN_PP_MIN_BATCH`, the oneDNN PP and placement admissions), the node's accumulator precision (an op
+`ggml_prec_set_acc` set to F32 keeps MMQ, because the arm's F32 branch would draw an unplanned f32 copy), and a
+converter for the layout the weight is loaded in. `ggml_get_to_fp16_sycl_for_layout` returns no converter for a layout
+it has no kernel for, so a weight in such a layout keeps MMQ rather than being dequantized as if it were AOS
+(`llama.cpp-pzu9`). Mistral 7B Q4_K_M plans 112.0 MB of f16 weights (one `ffn_down`, 14336 x 4096) and 28 KB of f16
+activations per token; a claimed head would have been 250 MB (`test-zone-sizing`, Case 14l).
 
 ### A load-time consumer: the measured compute term (`llama.cpp-p6i0`)
 

@@ -2119,6 +2119,13 @@ inline tensor_usage infer_tensor_usage(const char * name) {
     return tensor_usage::UNKNOWN;
 }
 
+// The LM head as the f16 dequant arm's planner and router both see it: the output weight by usage, or a tied
+// embedding that is also the head. The zone planner's adapter leaves its f16 copy out of the plan and the router keeps
+// it on MMQ, so the two must ask the same function (llama.cpp-h9c8).
+inline bool ggml_sycl_weight_is_output_head(const char * name) {
+    return infer_tensor_usage(name) == tensor_usage::OUTPUT_WEIGHT || ggml_sycl_is_canonical_tied_embedding_name(name);
+}
+
 // Resolve usage from registered metadata (if available), else fall back to name inference.
 tensor_usage ggml_sycl_get_tensor_usage(const ggml_tensor * tensor);
 struct ggml_tensor_extra_gpu;
@@ -2589,6 +2596,9 @@ bool   ggml_sycl_dense_woq_alternate_eligible(ggml_type type, bool is_contiguous
 // and GGML_SYCL_SKIP_ONEDNN_Q4_0). Defined next to ggml_sycl_onednn_pp_candidate, which asks the same two gates; the
 // planner calls it because it cannot see that TU's statics.
 bool   ggml_sycl_onednn_pp_type_admitted(ggml_type type);
+// llama.cpp-h9c8: the plan-time admission of the MMQ types the f16 dequant arm serves at PP batch
+// (GGML_SYCL_ONEDNN_PP_MMQ_TYPES AND the admission above). Defined beside it; the router's helper reads the same knob.
+bool   ggml_sycl_onednn_pp_mmq_types_admitted(ggml_type type);
 // llama.cpp-84ck: whether this build can execute the MoE MMID direct route at all. Defined in ggml-sycl.cpp from the
 // same constants the admission gate reads; the planner charges and re-plans the MMID workspace pools only when it holds.
 bool   ggml_sycl_moe_mmid_route_reachable_in_build();

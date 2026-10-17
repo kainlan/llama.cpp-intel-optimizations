@@ -37,14 +37,18 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_parse_force_kernel();
 //   src1: Activation tensor (typically F32)
 //   device: Device ID for the operation
 //   force_kernel: Optional override from env var or benchmark
+//   dst: The MUL_MAT node, when the caller has it. The oneDNN f16 dequant arm serves the MMQ types it takes at PP
+//        batch only at the node's default accumulator precision (llama.cpp-h9c8), so without the node those types
+//        keep MMQ. Every production caller passes it.
 //
 // Returns:
 //   The preferred kernel, or nullopt if no eligible kernel found
 std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_select_preferred_kernel(
-    const ggml_tensor * src0,
-    const ggml_tensor * src1,
-    int device,
-    std::optional<ggml_sycl_mul_mat_kernel> force_kernel = std::nullopt);
+    const ggml_tensor *                     src0,
+    const ggml_tensor *                     src1,
+    int                                     device,
+    std::optional<ggml_sycl_mul_mat_kernel> force_kernel = std::nullopt,
+    const ggml_tensor *                     dst          = nullptr);
 
 // Get the kernel name as a string (for debugging/logging)
 const char * ggml_sycl_mul_mat_kernel_name(ggml_sycl_mul_mat_kernel kernel);

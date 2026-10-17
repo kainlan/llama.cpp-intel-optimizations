@@ -30650,7 +30650,8 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // whatever GGML_SYCL_ONEDNN_PP says, so they were the consumer observed minting per-op copies. Q4_0 and MXFP4
         // are planned CONDITIONALLY, in the next block (llama.cpp-8ony), as is a quantized type no MMQ, coalesced or
         // unified kernel serves, the IQ family (llama.cpp-gldu): at PP batch the router has no kernel for it but this
-        // arm, so for it the arm is the planned route and not a fallback. A mis-predicted node is still found by the
+        // arm, so for it the arm is the planned route and not a fallback. So are the MMQ types the router moves to the
+        // arm at PP batch (llama.cpp-h9c8). A mis-predicted node is still found by the
         // graph-entry walk from the graph's own nodes, which grows the buffer inside the RUNTIME zone or refuses by
         // name. Experts are excluded by the same role function as above.
         if (item.has_shape() && item.type == GGML_TYPE_Q8_0 &&
@@ -30684,9 +30685,10 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // a type SYCL executes as a dense MUL_MAT, not an expert stack, not the LM head; ggml_sycl_supports_mmq,
         // is_coalesced_supported and ggml_sycl_mul_mat_type_supported read the same lists). The one term a SYCL-free
         // header cannot compute is whether the router can dequantize the type at all, so it is asked here through the
-        // function the router asks (onednn_woq::supports_dequant_fp16). The head is recognised by its usage
-        // classification (infer_tensor_usage) and the tied-embedding classifier, the same two the layout planner uses,
-        // not by a name of its own. Unlike the unified kernel's types this mark does not need the PP admission to reach
+        // function the router asks (onednn_woq::supports_dequant_fp16). The head is recognised by
+        // ggml_sycl_weight_is_output_head (its usage classification and the tied-embedding classifier, the same two the
+        // layout planner uses), which the router's helper asks too, not by a name of its own. Unlike the unified
+        // kernel's types this mark does not need the PP admission to reach
         // the arm: the legacy oneDNN kernel runs with GGML_SYCL_ONEDNN_PP=0 too. The scratch supplies its copies only
         // when the PP admission holds AND the scratch is enabled for the type, so that is what pp_scratch_type_enabled
         // says (for the unified kernel's types the admission already held, so their answer is unchanged). The loader's
@@ -30696,13 +30698,26 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // The unified kernel's types carry no expert exclusion of their own (the claim below does), so it is here.
         const bool unified_dequant_type = shaped && !is_expert && unified_kernel_serves_type(item.type) &&
                                           ggml_sycl_onednn_pp_type_admitted(item.type);
-        const bool lm_head = infer_tensor_usage(item.name.c_str()) == tensor_usage::OUTPUT_WEIGHT ||
-                             ggml_sycl_is_canonical_tied_embedding_name(item.name.c_str());
+        const bool lm_head           = ggml_sycl_weight_is_output_head(item.name.c_str());
         const bool quantized         = shaped && ggml_is_quantized(item.type);
         const bool dequant_supported = quantized && onednn_woq::supports_dequant_fp16(item.type);
         const bool aos_dequant_type =
             aos_dequant_f16_plan_claims(item.type, quantized, lm_head, is_expert, dequant_supported);
-        if (unified_dequant_type || aos_dequant_type) {
+        // llama.cpp-h9c8: the MMQ types dense_pp_route_prefers_f16_dequant_arm lists take the arm at PP batch too. The
+        // claim is the one the router's helper (ggml_sycl_dense_f16_arm_serves_pp) asks, with the same head, expert,
+        // 2-D and dequant terms, so the weight the router sends to the arm is one this plan reserved for. Its
+        // admission is GGML_SYCL_ONEDNN_PP_MMQ_TYPES AND the oneDNN PP type admission, the gates the router's helper
+        // and the op's candidate take: unlike the IQ family, these types keep MMQ when oneDNN PP is off, so nothing
+        // would draw the buffers. By default the oneDNN PP scratch is not enabled for them
+        // (onednn_pp_unified_scratch_enabled; GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH=1 enables it for every type), so
+        // pp_scratch_type_enabled below is false and the classifier plans them; with the scratch enabled they are
+        // planned only where it cannot supply the pair, as for the other marks. 2-D only: a 3-D operand stays on MMQ
+        // (ne[2] / ne[3] are 0 when the inventory gave no extent, hence <= 1).
+        const bool is_matrix = item.ne[2] <= 1 && item.ne[3] <= 1;
+        const bool mmq_dequant_type =
+            mmq_dequant_f16_plan_claims(item.type, quantized, lm_head, is_expert, is_matrix, dequant_supported) &&
+            ggml_sycl_onednn_pp_mmq_types_admitted(item.type);
+        if (unified_dequant_type || aos_dequant_type || mmq_dequant_type) {
             size_t weight_bytes = 0;
             size_t src1_bytes   = 0;
             if (zone_dequant_f16_weight_bytes(item.ne[0], item.ne[1] > 0 ? item.ne[1] : 1, &weight_bytes) &&

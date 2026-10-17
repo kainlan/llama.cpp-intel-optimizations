@@ -98,10 +98,12 @@ inline bool dense_mul_mat_type_supported(ggml_type type) {
 // (llama.cpp-gldu). The caller has already established that the type is quantized and the operand a dense weight.
 //
 // The router walks k_mul_mat_priority (ggml-sycl.cpp): a type an MMQ kernel serves is taken by it at PP batch (MMQ_AOS
-// precedes ONEDNN_AOS, and use_mmq holds up to MMQ_MAX_BATCH_SIZE), a type with a coalesced layout is taken by its
-// coalesced kernel, the oneDNN coalesced/SOA arm (Q8_0, which has its own unconditional plan mark) or the unified kernel
-// (Q4_0 / MXFP4, which have the unified-kernel plan mark). A quantized type left after those lists, the IQ family, has
-// no kernel but the dequant arm at PP batch, so for it the arm is the planned route and not a fallback.
+// precedes ONEDNN_AOS, and use_mmq holds up to MMQ_MAX_BATCH_SIZE) unless dense_pp_route_prefers_f16_dequant_arm below
+// lists it, a type with a coalesced layout is taken by its coalesced kernel, the oneDNN coalesced/SOA arm (Q8_0, which
+// has its own unconditional plan mark) or the unified kernel (Q4_0 / MXFP4, which have the unified-kernel plan mark).
+// A quantized type left after those lists, the IQ family, has no kernel but the dequant arm at PP batch, so for it the
+// arm is the planned route and not a fallback. The MMQ types that list names reach the same arm through their own
+// claim (mmq_dequant_f16_plan_claims), so this predicate keeps requiring !mmq and the two claims stay disjoint.
 //
 // The planner cannot ask the router: it has no graph node, no batch and no resolved layout, so it asks the two type
 // lists the router's own eligibility terms are built from. The answer is a type-level superset the router can only
@@ -132,6 +134,46 @@ inline bool aos_dequant_f16_plan_claims(ggml_type type,
                                         bool      dequant_supported) {
     return quantized && !is_head && !is_expert && dequant_supported && dense_mul_mat_type_supported(type) &&
            dense_pp_route_is_f16_dequant_arm(type);
+}
+
+// The MMQ types whose PP route is the oneDNN f16 dequant arm (llama.cpp-h9c8). At PP batch the MMQ kernel ran them at
+// ~3.8 TOPS on Mistral's FFN shapes, where the oneDNN f16 GEMM runs the same shapes at ~133 TFLOPS, so the dequant
+// plus GEMM wins although it materializes an f16 copy per call. Q4_0, Q8_0 and MXFP4 are left out: each already has
+// its own oneDNN route and plan mark. The list is explicit, not "every MMQ type but those", so a type added to the
+// MMQ list later does not join the arm before it is measured. The router's helper (ggml_sycl_dense_f16_arm_serves_pp)
+// and the zone planner's adapter both ask it, through mmq_dequant_f16_plan_claims below.
+inline bool dense_pp_route_prefers_f16_dequant_arm(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Whether a weight of a listed MMQ type is one the f16 dequant arm serves at PP batch, so the planner reserves the
+// dense f16 dequant buffers for it (llama.cpp-h9c8). The same terms as aos_dequant_f16_plan_claims, plus:
+//   - is_matrix: a 2-D weight. A 3-D dense operand (the MLA wk_b / wv_b) is dispatched per plane on row slices, and
+//     the arm converts an SOA weight only as a whole tensor, so 3-D weights stay on MMQ;
+//   - mmq_capable_type and the list above, in place of the AOS claim's !mmq predicate, which keeps the two disjoint.
+// The head is excluded for the same reason as there; it stays on MMQ. The router's helper asks this function with
+// the same flags, so the weight the plan claims is the weight the router sends to the arm. The batch, the layout and
+// the placement are the router's questions, not the planner's: it has no graph node.
+inline bool mmq_dequant_f16_plan_claims(ggml_type type,
+                                        bool      quantized,
+                                        bool      is_head,
+                                        bool      is_expert,
+                                        bool      is_matrix,
+                                        bool      dequant_supported) {
+    return quantized && !is_head && !is_expert && is_matrix && dequant_supported &&
+           dense_mul_mat_type_supported(type) && mmq_capable_type(type) && dense_pp_route_prefers_f16_dequant_arm(type);
 }
 
 }  // namespace ggml_sycl

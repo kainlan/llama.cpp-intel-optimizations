@@ -2753,6 +2753,14 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl_for_layout(ggml_type type, layout_mode layo
     // No kernel below decodes any other layout (XMX_TILED, ONEDNN_WOQ, ...). Returning
     // the AOS kernel for those would read the bytes wrong without saying so; nullptr
     // tells the caller there is no dequant for what it holds.
+    //
+    // The same holds per type, for the same reason (llama.cpp-pzu9): Q4_1, Q5_0, Q5_1,
+    // Q2_K, Q3_K and Q5_K have an AOS kernel only, and Q4_K and Q6_K add SOA but have no
+    // COALESCED one, so those cases answer nullptr for a layout they cannot decode. The
+    // oneDNN f16 dequant arm's router asks this table whether a converter exists for the
+    // layout a weight is loaded in (llama.cpp-h9c8), so the answer must be the truth.
+    // Q8_0's case is the documented exception below: its callers special-case its
+    // reordered layouts before they reach this table.
     if (layout != GGML_LAYOUT_AOS && layout != GGML_LAYOUT_SOA && layout != GGML_LAYOUT_COALESCED) {
         return nullptr;
     }
@@ -2773,10 +2781,19 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl_for_layout(ggml_type type, layout_mode layo
                 return dequantize_block_sycl<QK4_0, QR4_0, dequantize_q4_0>;
             }
         case GGML_TYPE_Q4_1:
+            if (layout != GGML_LAYOUT_AOS) {
+                return nullptr;
+            }
             return dequantize_block_sycl<QK4_1, QR4_1, dequantize_q4_1>;
         case GGML_TYPE_Q5_0:
+            if (layout != GGML_LAYOUT_AOS) {
+                return nullptr;
+            }
             return dequantize_block_sycl<QK5_0, QR5_0, dequantize_q5_0>;
         case GGML_TYPE_Q5_1:
+            if (layout != GGML_LAYOUT_AOS) {
+                return nullptr;
+            }
             return dequantize_block_sycl<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             // llama.cpp-dkw0: dequantize_q8_0 assumes the classic AOS block
@@ -2812,19 +2829,32 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl_for_layout(ggml_type type, layout_mode layo
             // the plain kernel is correct here, unconditionally.
             return dequantize_block_sycl<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_Q2_K:
+            if (layout != GGML_LAYOUT_AOS) {
+                return nullptr;
+            }
             return dequantize_row_q2_K_sycl;
         case GGML_TYPE_Q3_K:
+            if (layout != GGML_LAYOUT_AOS) {
+                return nullptr;
+            }
             return dequantize_row_q3_K_sycl;
         case GGML_TYPE_Q4_K:
-            if (use_reorder) {
+            if (use_coalesced) {
+                return nullptr;
+            } else if (use_reorder) {
                 return dequantize_row_q4_K_sycl_reorder;
             } else {
                 return dequantize_row_q4_K_sycl;
             }
         case GGML_TYPE_Q5_K:
+            if (layout != GGML_LAYOUT_AOS) {
+                return nullptr;
+            }
             return dequantize_row_q5_K_sycl;
         case GGML_TYPE_Q6_K:
-            if (use_reorder) {
+            if (use_coalesced) {
+                return nullptr;
+            } else if (use_reorder) {
                 return dequantize_row_q6_K_sycl_reorder;
             } else {
                 return dequantize_row_q6_K_sycl;
