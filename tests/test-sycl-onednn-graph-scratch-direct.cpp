@@ -137,6 +137,13 @@
 //       kernel finally finishes too. Added by llama.cpp-c6ah, not part of
 //       the original 0oxf RED-FIRST set below.
 //
+//   POLICY. (a)-(g) run with the pool forced to completion-gated reuse,
+//   the policy it applies under TP, through
+//   onednn_graph_scratch_force_completion_gated_reuse_for_test(). Without
+//   TP the pool hands an in-flight entry straight back instead, which (h)
+//   pins (llama.cpp-jwjz). Eviction and the pool clear wait for completion
+//   under both policies.
+//
 //   (h) IN-ORDER REUSE OF AN IN-FLIGHT ENTRY: with every consumer on the
 //       cache's in-order queue (TP inactive), a same-size request must get
 //       a parked entry back at once, while its release is still pending:
@@ -2107,6 +2114,10 @@ int main(int, char ** argv) {
     // submit_slow_release() call) is load-bearing, not stylistic.
     ensure_slow_release_calibrated(cache->get_queue());
 
+    // llama.cpp-jwjz: (a)-(g) pin the completion-gated pool, the policy the
+    // cache applies under TP. This process has no TP, so force that policy
+    // for them, then restore the default in-order policy for (h).
+    cache->onednn_graph_scratch_force_completion_gated_reuse_for_test(true);
     test_pool_reuse(cache);
     test_bounded_eviction(cache, device);
     test_loud_failure(cache);
@@ -2114,6 +2125,7 @@ int main(int, char ** argv) {
     test_oversized_request_skips_wait_loop(cache, device);
     test_in_flight_entry_is_skipped_not_waited(cache, device);
     test_reclaim_while_in_flight_retires_the_slot(cache, device);
+    cache->onednn_graph_scratch_force_completion_gated_reuse_for_test(false);
     test_in_flight_entry_is_reused_in_order(cache, device);
 
     // llama.cpp-c6ah: LAST, deliberately -- see this

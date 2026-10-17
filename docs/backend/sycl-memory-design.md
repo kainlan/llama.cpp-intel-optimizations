@@ -578,6 +578,27 @@ ticket reproduced on:
   less either way. Every real pool release event in production is
   device-kernel-produced (oneDNN's own free callback), matching the case
   that actually blocks.
+- **Without TP, a parked entry is reused while its release is still in
+  flight (llama.cpp-jwjz).** Every Graph-scratch consumer submits on the
+  cache's own in-order queue when TP is inactive. That is the fact the
+  ONEDNN zone free already relies on, and
+  `onednn_graph_scratch_consumers_in_order()` is now the one predicate both
+  read: TP inactive for the device, and the queue carries the `in_order`
+  property. Under it, `onednn_graph_scratch_entry_usable_locked()` makes no
+  completion query, so a same-size request gets the parked buffer back at
+  once and its kernels queue behind the previous consumer's. Gating reuse on
+  completion made each oneDNN SDPA execute of a repeated shape allocate a
+  second buffer, and the next one wait at the cap in 200 ms polls (Mistral
+  `-d 8192` at ubatch 2048). Only reuse relaxes. Eviction, the per-size
+  depth overflow and the pool clear still wait for completion, because they
+  return the bytes to the general allocator, whose next owner may run on any
+  queue. An early exit returns the entry's flag slot to the free list while
+  its marker may still be pending. Each marker therefore also depends on its
+  slot's previous marker (`onednn_graph_scratch_flag_slot_last_marker_`),
+  so the out-of-order watch queue cannot leave an older generation in the
+  slot. Under TP the pool keeps the completion-gated policy, and the device
+  test forces that policy for its older properties through
+  `onednn_graph_scratch_force_completion_gated_reuse_for_test()`.
 - **The pool is bounded per size, and reclaimed at every point that could
   otherwise leave it stale.** Nothing but the byte cap bounds how many
   buffers of ONE size the pool could hold, so `onednn_graph_scratch_free()`

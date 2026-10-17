@@ -7445,6 +7445,10 @@ bool unified_cache::shutdown_resources() {
         std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
         onednn_graph_scratch_flag_slab_ = nullptr;
         onednn_graph_scratch_flag_slot_free_list_.clear();
+        // llama.cpp-jwjz: every marker has completed after the drain above.
+        // The two abandon paths leave these events to member destruction,
+        // the same as the pool entries' own release events.
+        onednn_graph_scratch_flag_slot_last_marker_.clear();
         onednn_graph_scratch_flag_slab_owner_ = {};
     }
 #endif
@@ -13399,6 +13403,28 @@ bool unified_cache::onednn_graph_scratch_pool_entry_release_complete(
     return event_complete(entry.release_event);
 }
 
+// llama.cpp-jwjz: see the declaration's comment in unified-cache.hpp.
+bool unified_cache::onednn_graph_scratch_consumers_in_order() const {
+    if (!queue_.has_property<sycl::property::queue::in_order>()) {
+        return false;
+    }
+    return ggml_sycl_get_tp_queue(ggml_sycl_get_device_id_from_queue(queue_)) == nullptr;
+}
+
+bool unified_cache::onednn_graph_scratch_in_order_reuse_allowed() const {
+    if (onednn_graph_scratch_force_completion_gated_reuse_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    return onednn_graph_scratch_consumers_in_order();
+}
+
+void unified_cache::onednn_graph_scratch_force_completion_gated_reuse_for_test(bool force) {
+    if (!onednn_graph_scratch_test_hooks_enabled()) {
+        return;
+    }
+    onednn_graph_scratch_force_completion_gated_reuse_.store(force, std::memory_order_release);
+}
+
 // llama.cpp-c6ah: lazily allocates the host-USM slab backing
 // every pooled entry's completion flag_slot. See the declaration's own
 // comment in unified-cache.hpp for the fixed-capacity/never-reallocated
@@ -13466,6 +13492,7 @@ bool unified_cache::onednn_graph_scratch_ensure_flag_slab_locked() {
     for (size_t i = kOnednnGraphScratchFlagSlabCapacity; i > 0; --i) {
         onednn_graph_scratch_flag_slot_free_list_.push_back(static_cast<uint32_t>(i - 1));
     }
+    onednn_graph_scratch_flag_slot_last_marker_.assign(kOnednnGraphScratchFlagSlabCapacity, std::nullopt);
     return true;
 }
 
@@ -13614,7 +13641,10 @@ unified_cache::onednn_graph_scratch_entry_fit unified_cache::onednn_graph_scratc
     size_t                                  alignment,
     int                                     device_id,
     resolved_ptr *                          out_resolved) const {
-    if (!onednn_graph_scratch_pool_entry_release_complete(entry)) {
+    // llama.cpp-jwjz: when every consumer shares the in-order queue, this
+    // buffer's next consumer queues behind its previous one, so the release
+    // need not have completed and no completion query is made.
+    if (!onednn_graph_scratch_in_order_reuse_allowed() && !onednn_graph_scratch_pool_entry_release_complete(entry)) {
         return onednn_graph_scratch_entry_fit::EVENT_PENDING;
     }
     const auto resolved = entry.owner.resolve(device_id);
@@ -13674,16 +13704,20 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
             case onednn_graph_scratch_entry_fit::RESOLVE_FAILED:
                 break;
         }
-        mem_handle    owner             = std::move(bucket[i].owner);
+        mem_handle    owner                 = std::move(bucket[i].owner);
         // llama.cpp-c6ah: capture the LEAVING entry's slot
         // before the move-assign below overwrites bucket[i] with a
         // DIFFERENT entry (bucket.back()) -- reading bucket[i].flag_slot
         // after that assignment would return the wrong entry's slot. The
         // entry is leaving the pool either way here (reused below, or
-        // destructed via the RESOLVE_FAILED branch further down), so its
-        // slot (if any) always returns to the free list.
-        const int32_t leaving_flag_slot = bucket[i].flag_slot;
-        bucket[i]                       = std::move(bucket.back());
+        // released via the RESOLVE_FAILED branch further down), so its
+        // slot (if any) always returns to the free list. Under in-order
+        // reuse its marker may still be pending; the next marker armed on
+        // the slot depends on it (llama.cpp-jwjz, see
+        // onednn_graph_scratch_flag_slot_last_marker_).
+        const int32_t leaving_flag_slot     = bucket[i].flag_slot;
+        sycl::event   leaving_release_event = std::move(bucket[i].release_event);
+        bucket[i]                           = std::move(bucket.back());
         bucket.pop_back();
         if (leaving_flag_slot >= 0) {
             onednn_graph_scratch_flag_slot_free_list_.push_back(static_cast<uint32_t>(leaving_flag_slot));
@@ -13695,11 +13729,14 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
         // it is checked out again).
         onednn_graph_scratch_pool_bytes_ -= std::min(size, onednn_graph_scratch_pool_bytes_);
         if (fit == onednn_graph_scratch_entry_fit::RESOLVE_FAILED) {
-            // Should not happen for a still-owned handle -- fall through and
-            // let `owner` destruct here (a real, immediate release), same as
-            // any other unusable resolution. Do not retry another bucket
-            // entry: something is wrong with this specific handle, not with
-            // pooling in general.
+            // Should not happen for a still-owned handle -- release `owner`
+            // for real, same as any other unusable resolution. The release
+            // waits on the entry's own event, because under in-order reuse
+            // (llama.cpp-jwjz) the entry may still be in flight; for a
+            // completed event the drain worker releases it at once. Do not
+            // retry another bucket entry: something is wrong with this
+            // specific handle, not with pooling in general.
+            retain_handles_until_event({ std::move(owner) }, std::move(leaving_release_event));
             onednn_graph_scratch_direct_outstanding_bytes_ -=
                 std::min(size, onednn_graph_scratch_direct_outstanding_bytes_);
             // A real release, same as the cap-eviction and depth-limit
@@ -14398,18 +14435,32 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
                             // entry's own check cannot spuriously read
                             // complete before its own marker kernel has run.
                             // Same system-scope atomic_ref as every other
-                            // slab access (never a plain store); relaxed
-                            // suffices here specifically because this slot
-                            // could only have been popped from the free
-                            // list after its previous occupant's marker was
-                            // already observed complete, under this same
-                            // mutex, so no reader can be racing this write.
+                            // slab access (never a plain store). Relaxed
+                            // suffices: no reader compares this slot against
+                            // any generation but `gen` from here on, because
+                            // the previous occupant has left the pool. Under
+                            // in-order reuse (llama.cpp-jwjz) that
+                            // occupant's marker may still be pending and can
+                            // store its older generation after this reset.
+                            // Either order leaves a value other than `gen`
+                            // until this park's own marker, chained after
+                            // that one below, stores `gen`.
                             sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::system>
                                 flag_reset_atomic(onednn_graph_scratch_flag_slab_[slot]);
                             flag_reset_atomic.store(0, sycl::memory_order::relaxed);
-                            int32_t * flag_ptr = onednn_graph_scratch_flag_slab_ + slot;
-                            watch_q->submit([&](sycl::handler & h) {
+                            int32_t *                    flag_ptr = onednn_graph_scratch_flag_slab_ + slot;
+                            std::optional<sycl::event> & last_marker =
+                                onednn_graph_scratch_flag_slot_last_marker_[slot];
+                            sycl::event marker = watch_q->submit([&](sycl::handler & h) {
                                 h.depends_on(*event);
+                                // llama.cpp-jwjz: the watch queue is
+                                // out-of-order, so without this edge the
+                                // slot's previous marker could run after
+                                // this one and leave its older generation in
+                                // the slot for good.
+                                if (last_marker) {
+                                    h.depends_on(*last_marker);
+                                }
                                 // System-scope release store, paired with
                                 // the host-side acquire load in
                                 // onednn_graph_scratch_pool_entry_release_complete().
@@ -14436,6 +14487,7 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
                             onednn_graph_scratch_flag_slot_free_list_.pop_back();
                             flag_slot       = static_cast<int32_t>(slot);
                             flag_generation = gen;
+                            last_marker     = std::move(marker);
                         } catch (const sycl::exception & e) {
                             // Leave flag_slot at -1: onednn_graph_scratch_pool_entry_release_complete()
                             // falls back to the old (blocking, but correct)
@@ -14525,8 +14577,10 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
     // have; enqueue_deferred_zone_free() is the primitive
     // reserve_onednn_scratch's own defer_published_zone_release already uses
     // for the same "zone pointer, need an event-gated release" shape).
-    const int device_id_for_tp_check = ggml_sycl_get_device_id_from_queue(queue_);
-    if (ggml_sycl_get_tp_queue(device_id_for_tp_check) != nullptr) {
+    //
+    // onednn_graph_scratch_consumers_in_order() is that check, and the DIRECT
+    // pool's in-order reuse reads the same predicate (llama.cpp-jwjz).
+    if (!onednn_graph_scratch_consumers_in_order()) {
         const size_t deferred_size = zone_it->second;
         note_onednn_graph_scratch_free_locked(deferred_size);
         onednn_graph_scratch_zone_sizes_.erase(zone_it);
@@ -14555,7 +14609,7 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
             GGML_LOG_WARN(
                 "[UNIFIED-CACHE] oneDNN Graph allocator: TP active for device %d and no event/barrier available "
                 "to defer ptr=%p -- leaking rather than risking a race with an in-flight TP consumer\n",
-                device_id_for_tp_check, ptr);
+                ggml_sycl_get_device_id_from_queue(queue_), ptr);
         }
         return;
     }

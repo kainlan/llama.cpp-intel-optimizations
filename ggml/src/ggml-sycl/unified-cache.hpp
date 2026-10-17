@@ -38,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -4398,8 +4399,12 @@ class unified_cache {
     // symmetric: ONEDNN-zone with TP inactive reclaims immediately
     // (in-order-queue safety), ONEDNN-zone with TP active defers via
     // enqueue_deferred_zone_free() (the in-order-queue argument does not
-    // hold under TP), and DIRECT-fallback always defers via
-    // retain_handles_until_event().
+    // hold under TP), and DIRECT-fallback parks in the reuse pool (a real
+    // release past the per-size depth goes through
+    // retain_handles_until_event()). A parked DIRECT entry is reusable at
+    // once under the same in-order-queue argument, and only after its
+    // release completes otherwise (llama.cpp-jwjz; see
+    // onednn_graph_scratch_in_order_reuse_allowed()).
     void   onednn_graph_scratch_free(void * ptr, const sycl::event * event);
 
     // Peak bytes concurrently outstanding across every onednn_graph_scratch_alloc()
@@ -4515,6 +4520,12 @@ class unified_cache {
     // return) to the free list, rather than inferring it from whether a
     // later park happened to get armed.
     size_t   onednn_graph_scratch_flag_slot_free_list_size_for_test();
+    // llama.cpp-jwjz: makes this cache's DIRECT pool hand back only entries
+    // whose release has completed, the policy it applies under TP, so a test
+    // on a TP-less process can still exercise the skip-an-in-flight-entry
+    // paths. A no-op unless GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS is set, like
+    // every other hook in this file.
+    void     onednn_graph_scratch_force_completion_gated_reuse_for_test(bool force);
 
     // Public, self-locking entry point: releases (for real) every pooled
     // DIRECT Graph-scratch buffer, then logs the pool summary -- clear
@@ -5121,6 +5132,18 @@ class unified_cache {
     uint32_t                     onednn_graph_scratch_flag_generation_counter_     = 0;
     bool                         onednn_graph_scratch_flag_slab_warned_            = false;
     bool                         onednn_graph_scratch_flag_slots_exhausted_warned_ = false;
+
+    // llama.cpp-jwjz: the last marker kernel armed on each slab slot, sized
+    // with the slab and cleared with it. In-order reuse can return a slot to
+    // the free list while its marker is still pending, so the next marker on
+    // that slot also depends on this one; see
+    // onednn_graph_scratch_pool_entry::flag_slot. Accessed only under
+    // onednn_graph_scratch_mutex_.
+    std::vector<std::optional<sycl::event>> onednn_graph_scratch_flag_slot_last_marker_;
+    // llama.cpp-jwjz: set only through
+    // onednn_graph_scratch_force_completion_gated_reuse_for_test().
+    std::atomic<bool>                       onednn_graph_scratch_force_completion_gated_reuse_{ false };
+
     // llama.cpp-c6ah: see the public accessor's own comment above.
     // Incremented only in onednn_graph_scratch_clear_pool_locked(), the one
     // removal site that can retire an armed-but-incomplete entry's slot.
@@ -5490,9 +5513,11 @@ class unified_cache {
     // onednn_graph_scratch_free() releases is no longer hoisted back into
     // the general unified_alloc() pool via retain_handles_until_event(). It
     // is instead PARKED HERE, bucketed by its exact size and gated on its
-    // release event, so a future request of the identical size (the common
-    // case across ubatches within one generation, and across `-r N` reps of
-    // the same benchmark) is served by reuse instead of a fresh
+    // release event (not under in-order reuse, llama.cpp-jwjz: see
+    // onednn_graph_scratch_in_order_reuse_allowed()), so a future request of
+    // the identical size (the common case across ubatches within one
+    // generation, and across `-r N` reps of the same benchmark) is served
+    // by reuse instead of a fresh
     // unified_alloc()/zeMemAllocDevice round trip. Implicitly bounded by
     // onednn_graph_scratch_direct_outstanding_bytes_'s cap: a pooled entry's
     // bytes stay charged against that cap (see the field's own comment
@@ -5529,14 +5554,17 @@ class unified_cache {
         // pool_entry_release_complete() compares the slab's CURRENT value
         // against THIS entry's own generation, so a stale write carrying
         // an older generation cannot be misread as a newer entry's
-        // completion. In the current design a slot is only ever returned
-        // to the free list once its own marker kernel has ALREADY fired
-        // (see onednn_graph_scratch_try_reuse_pool_locked(),
-        // onednn_graph_scratch_evict_pool_until_fits_locked(), and
-        // onednn_graph_scratch_clear_pool_locked(), which retires an
-        // incomplete entry's slot permanently rather than returning it),
-        // so this pairing is defense-in-depth against a future change to
-        // that invariant, not something normal operation exercises today.
+        // completion. In-order reuse (llama.cpp-jwjz) does exercise that:
+        // onednn_graph_scratch_try_reuse_pool_locked() can hand an entry
+        // back while its marker is still pending, and returns the slot to
+        // the free list then. The generation pairing alone is not enough
+        // for that, because the out-of-order watch queue could run the
+        // stale marker AFTER the next occupant's and leave the older value
+        // in the slot. onednn_graph_scratch_flag_slot_last_marker_ closes
+        // it: every marker on a slot also depends on that slot's previous
+        // marker. Eviction returns a slot only once its entry is complete,
+        // and onednn_graph_scratch_clear_pool_locked() still retires an
+        // incomplete entry's slot rather than returning it.
         //
         // History: an earlier version of this design armed a
         // std::shared_ptr<std::atomic<bool>> flag via a host_task instead.
@@ -5572,8 +5600,8 @@ class unified_cache {
     size_t onednn_graph_scratch_pool_hit_count_      = 0;
     // How many times a DIRECT request found no entry of its exact size in
     // the pool that onednn_graph_scratch_entry_usable_locked() reported
-    // USABLE (event complete, device-resident, and correctly aligned -- not
-    // merely event-complete) -- the request then went through the
+    // USABLE (reusable, device-resident, and correctly aligned -- not
+    // merely reusable) -- the request then went through the
     // cap/eviction path and, ultimately, a real allocation. Logged at
     // teardown alongside the hit count so a run's log answers "how well is
     // the pool actually working" without extra instrumentation.
@@ -5638,6 +5666,26 @@ class unified_cache {
     // member functions, which cannot call a non-const one on `this`.
     bool onednn_graph_scratch_pool_entry_release_complete(const onednn_graph_scratch_pool_entry & entry) const;
 
+    // llama.cpp-jwjz: true when every consumer of a Graph-scratch buffer
+    // submits on this cache's own queue_ and queue_ is in-order: TP is
+    // inactive for this device (under TP, ctx.stream() is the TP
+    // shared-context queue, not queue_), and queue_ carries the in_order
+    // property. A buffer freed with a pending release event can then go to
+    // the next request at once, because the next consumer's kernels queue
+    // behind the previous consumer's. The ONEDNN zone free and the DIRECT
+    // pool's reuse both read this one predicate.
+    bool onednn_graph_scratch_consumers_in_order() const;
+
+    // llama.cpp-jwjz: whether the DIRECT pool may hand back an entry whose
+    // release has not completed. It is onednn_graph_scratch_consumers_in_order(),
+    // unless a test forced completion-gated reuse
+    // (onednn_graph_scratch_force_completion_gated_reuse_for_test()). Only
+    // REUSE relaxes. A real release (eviction under the cap, the per-size
+    // depth overflow, the pool clear) still waits for completion, because it
+    // returns the bytes to the general allocator, whose next owner may run
+    // on any queue.
+    bool onednn_graph_scratch_in_order_reuse_allowed() const;
+
     // llama.cpp-c6ah: lazily allocates
     // onednn_graph_scratch_flag_slab_ (a plain already-allocated check, NOT
     // std::call_once like get_event_watch_queue()'s own lazy pattern --
@@ -5666,11 +5714,15 @@ class unified_cache {
     // owner would not resolve -- an anomaly worth a hard stop") without a
     // second, redundant event_complete() query -- see the function's own
     // comment.
+    //
+    // "Reusable" below means the release completed, or in-order reuse is
+    // allowed (onednn_graph_scratch_in_order_reuse_allowed()), in which case
+    // the completion query is skipped and EVENT_PENDING is never returned.
     enum class onednn_graph_scratch_entry_fit {
-        USABLE,              // event complete, resolves on device, and aligned -- ready to reuse
+        USABLE,              // reusable, resolves on device, and aligned -- ready to reuse
         EVENT_PENDING,       // release_event has not completed yet (resolve() was not attempted)
-        RESOLVE_FAILED,      // event complete, but owner.resolve() did not return a device-resident pointer
-        ALIGNMENT_MISMATCH,  // event complete and resolved fine, but not at the requested alignment
+        RESOLVE_FAILED,      // reusable, but owner.resolve() did not return a device-resident pointer
+        ALIGNMENT_MISMATCH,  // reusable and resolved fine, but not at the requested alignment
     };
 
     // Tests pool entry `entry` against a request of `alignment` bytes on
@@ -5696,7 +5748,9 @@ class unified_cache {
     // request -- a caller must NOT query completion on the same entry
     // itself first; doubling the query here would double that cost per
     // candidate entry for no benefit, since EVENT_PENDING already reports
-    // exactly that outcome. Callers must hold
+    // exactly that outcome. When in-order reuse is allowed
+    // (onednn_graph_scratch_in_order_reuse_allowed(), llama.cpp-jwjz) it
+    // makes no completion query at all. Callers must hold
     // onednn_graph_scratch_mutex_.
     onednn_graph_scratch_entry_fit onednn_graph_scratch_entry_usable_locked(
         const onednn_graph_scratch_pool_entry & entry,

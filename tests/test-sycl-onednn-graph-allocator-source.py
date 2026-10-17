@@ -521,6 +521,31 @@ CLEAR_POOL_BODY_CODE = extract_function_body(
 RELEASE_COMPLETE_BODY_CODE = extract_function_body(
     CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_pool_entry_release_complete("
 )
+# llama.cpp-jwjz: the one predicate for "every Graph-scratch consumer submits
+# on the cache's in-order queue", which the ONEDNN zone free and the DIRECT
+# pool's reuse both read, and the DIRECT reuse policy built on it.
+CONSUMERS_IN_ORDER_CALL = "onednn_graph_scratch_consumers_in_order("
+IN_ORDER_REUSE_CALL = "onednn_graph_scratch_in_order_reuse_allowed("
+CONSUMERS_IN_ORDER_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_consumers_in_order("
+)
+IN_ORDER_REUSE_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_in_order_reuse_allowed("
+)
+
+
+def _real_release_stays_completion_gated(body: str) -> bool:
+    """llama.cpp-jwjz: true iff `body` checks completion through the choke
+    point and never consults the in-order reuse policy. In-order reuse only
+    relaxes REUSE: a real release hands the bytes back to the general
+    allocator, whose next owner may run on any queue, so it must still wait
+    for the release to complete."""
+    code = strip_literals(body)
+    return (
+        RELEASE_COMPLETE_CALL in code
+        and IN_ORDER_REUSE_CALL not in code
+        and CONSUMERS_IN_ORDER_CALL not in code
+    )
 
 
 def test_onednn_graph_allocator_source_contract() -> None:
@@ -825,8 +850,13 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # ctx.stream() returns the TP shared-context queue ahead of the cache's
     # own queue, so the in-order-queue argument above no longer names the
     # real consumer and immediate zone reclaim would race a TP consumer.
+    # llama.cpp-jwjz: the TP query now lives in
+    # onednn_graph_scratch_consumers_in_order(), the predicate the zone free
+    # shares with the DIRECT pool's in-order reuse, so the check follows it.
     checks["TP-active free path checked and deferred"] = (
-        "ggml_sycl_get_tp_queue(" in FREE_BODY_CODE and "enqueue_deferred_zone_free(" in FREE_BODY_CODE
+        CONSUMERS_IN_ORDER_CALL in FREE_BODY_CODE
+        and "ggml_sycl_get_tp_queue(" in CONSUMERS_IN_ORDER_BODY_CODE
+        and "enqueue_deferred_zone_free(" in FREE_BODY_CODE
     )
 
     # reserve_onednn_scratch's growth guard must compare total_needed (the
@@ -1035,8 +1065,53 @@ def test_onednn_graph_allocator_source_contract() -> None:
         _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_body_code)
     )
 
+    # llama.cpp-jwjz: a parked DIRECT entry is reusable while its release is
+    # still pending only when every consumer shares the in-order queue, and
+    # only for reuse. Eviction and the pool clear stay completion-gated, a
+    # RESOLVE_FAILED release waits on the entry's event, and a marker armed
+    # on a slot returned early is ordered after that slot's previous marker.
+    checks["in-order consumer predicate checks TP and the in_order queue property"] = (
+        "ggml_sycl_get_tp_queue(" in CONSUMERS_IN_ORDER_BODY_CODE
+        and "sycl::property::queue::in_order" in CONSUMERS_IN_ORDER_BODY_CODE
+    )
+    checks["in-order reuse policy reads the shared consumer predicate"] = (
+        CONSUMERS_IN_ORDER_CALL in IN_ORDER_REUSE_BODY_CODE
+    )
+    checks["entry_usable_locked() skips the completion query only through the in-order reuse policy"] = (
+        IN_ORDER_REUSE_CALL in ENTRY_USABLE_BODY_CODE
+    )
+    checks["evict_pool_until_fits_locked() stays completion-gated"] = _real_release_stays_completion_gated(
+        EVICT_UNTIL_FITS_BODY_CODE
+    )
+    checks["clear_pool_locked() stays completion-gated"] = _real_release_stays_completion_gated(CLEAR_POOL_BODY_CODE)
+    checks["try_reuse_pool_locked() RESOLVE_FAILED release waits on the entry's event"] = (
+        "retain_handles_until_event(" in TRY_REUSE_POOL_BODY_CODE
+    )
+    checks["free() orders each slot's marker after that slot's previous marker"] = (
+        "onednn_graph_scratch_flag_slot_last_marker_" in FREE_BODY_CODE
+        and "depends_on(*last_marker)" in normalize_ws(strip_literals(FREE_BODY_CODE))
+    )
+
     failed = [name for name, ok in checks.items() if not ok]
     assert not failed, "onednn graph allocator source contract failed: " + ", ".join(failed)
+
+
+def test_real_release_completion_gate_check_has_a_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-jwjz: proves the two "stays
+    completion-gated" checks above would catch the in-order reuse relaxation
+    leaking into a real release -- the eviction sweep consulting the reuse
+    policy, and so returning an entry that is still in flight to the general
+    allocator."""
+    anchor = RELEASE_COMPLETE_CALL + "bucket[i])"
+    assert anchor in EVICT_UNTIL_FITS_BODY_CODE, "mutation target string not found -- update this witness"
+    mutated = EVICT_UNTIL_FITS_BODY_CODE.replace(anchor, IN_ORDER_REUSE_CALL + ") || " + anchor, 1)
+    assert mutated != EVICT_UNTIL_FITS_BODY_CODE
+    assert _real_release_stays_completion_gated(EVICT_UNTIL_FITS_BODY_CODE), (
+        "the real, unmutated eviction sweep should check completion and never consult the in-order reuse policy"
+    )
+    assert not _real_release_stays_completion_gated(mutated), (
+        "mutation witness is broken: the injected in-order reuse call was not detected"
+    )
 
 
 def test_no_blocking_wait_check_has_a_mutation_witness() -> None:
