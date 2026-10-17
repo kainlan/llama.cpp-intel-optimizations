@@ -44,7 +44,7 @@
 // sites item (d) below enumerates, so a pooled buffer cannot outlive the
 // context it belongs to.
 //
-// This test asserts eight properties:
+// This test asserts nine properties:
 //
 //   (a) POOL REUSE: freeing a DIRECT buffer and immediately requesting the
 //       SAME size again must be served from the pool -- no fresh
@@ -152,8 +152,18 @@
 //       the entry's flag slot must go back to the free list and stay usable
 //       for the next park. Added by llama.cpp-jwjz; RED against a pool that
 //       gates reuse on completion, where the request is a fresh miss.
+//       CONTRACT: this relies on the buffer's previous and next consumers
+//       submitting on the same in-order queue, the cache's own, so that the
+//       queue orders them. (i) pins the other side of that contract.
 //
-// RED-FIRST NOTE. Three of these eight properties, (a)-(c), are RED against
+//   (i) NO CROSS-QUEUE REUSE IN FLIGHT: an entry last used on a different
+//       queue is not handed to a cache-queue request while its release is
+//       pending, and a request from a different queue does not take an
+//       entry still in flight on the cache queue. Both are fresh misses
+//       with no wait, and the first entry is reused once its release
+//       completes. Added by llama.cpp-jwjz.
+//
+// RED-FIRST NOTE. Three of these nine properties, (a)-(c), are RED against
 // the pre-0oxf code: (a) and (b) have no pool, cap, or wait at all (every
 // DIRECT allocation is a fresh unified_alloc() with no bound), and (c) had
 // no abort hook to suppress -- the pre-fix function simply returned nullptr
@@ -1980,6 +1990,101 @@ void test_in_flight_entry_is_reused_in_order(unified_cache * cache, int device) 
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown (in-order reuse)");
 }
 
+// --- (i) an in-flight entry never crosses queues (llama.cpp-jwjz) ---------
+//
+// (h) rests on one contract: the buffer's previous consumer and its next one
+// submit on the same in-order queue, the cache's own. Then the queue orders
+// them and the release need not have completed. Nothing orders two different
+// queues, so an entry last used on another queue must wait for its release
+// like any other, and a request from another queue must not take an entry
+// still in flight. Both directions are checked with a second in-order queue
+// on the same device and context:
+//   A. a buffer handed out on the other queue and parked behind a slow
+//      kernel there is NOT handed to a cache-queue request while in flight
+//      (a fresh miss, no wait), and is reused once its release completes;
+//   B. a buffer parked behind a slow kernel on the cache queue is NOT handed
+//      to a request from the other queue while in flight.
+void test_in_flight_entry_does_not_cross_queues(unified_cache * cache, int device) {
+    printf("DIRECT path in-flight entry is not handed across queues:\n");
+
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup (cross-queue)");
+
+    sycl::queue & q = cache->get_queue();
+    sycl::queue   other(q.get_context(), q.get_device(), sycl::property_list{ sycl::property::queue::in_order{} });
+
+    // Two of these fit under the cap, so a miss below is a fresh allocation,
+    // not a cap wait.
+    constexpr size_t kSizeCross  = 300ull * 1024 * 1024;
+    constexpr size_t kProbeBytes = 4096;
+    static_assert(kSizeCross > kZoneFloorBytes, "the size must exceed the zone floor to take the DIRECT path");
+    static_assert(2 * kSizeCross <= kCapBytes, "a second buffer of this size must fit under the cap");
+
+    // --- A: last used on the other queue, requested from the cache queue.
+    void * ptr_other = cache->onednn_graph_scratch_alloc(kSizeCross, 256, &other);
+    check(ptr_other != nullptr, "case A setup allocation on the other queue succeeds");
+    if (ptr_other) {
+        const auto          start_a      = std::chrono::steady_clock::now();
+        slow_release_result slow_a       = submit_slow_release(other);
+        sycl::event         last_write_a = other.memset(ptr_other, 0x33, kProbeBytes);
+        cache->onednn_graph_scratch_free(ptr_other, &last_write_a);
+
+        const size_t    hits_before   = cache->onednn_graph_scratch_pool_hit_count();
+        const size_t    misses_before = cache->onednn_graph_scratch_pool_miss_count();
+        void *          ptr_cache     = cache->onednn_graph_scratch_alloc(kSizeCross, 256, &q);
+        const long long elapsed_a     = static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_a).count());
+        printf("    (case A: request returned %lld ms after the other queue's slow kernel was submitted)\n", elapsed_a);
+
+        check(ptr_cache != nullptr && ptr_cache != ptr_other,
+              "case A: an entry last used on another queue is not handed to a cache-queue request while in flight");
+        check(cache->onednn_graph_scratch_pool_miss_count() == misses_before + 1 &&
+                  cache->onednn_graph_scratch_pool_hit_count() == hits_before,
+              "case A: the request counted as a miss, not a hit");
+        check(elapsed_a < slow_a.duration_ms / 3, "case A: the request skipped the in-flight entry without waiting");
+        if (ptr_cache) {
+            cache->onednn_graph_scratch_free(ptr_cache, nullptr);
+        }
+
+        last_write_a.wait();
+        const bool reused_after = poll_for_pool_hit(cache, q, kSizeCross, ptr_other);
+        check(reused_after, "case A: once its release completes, the entry is reused from the cache queue");
+        if (reused_after) {
+            cache->onednn_graph_scratch_free(ptr_other, nullptr);
+        }
+    }
+
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup (cross-queue case B)");
+
+    // --- B: last used on the cache queue, requested from the other queue.
+    void * ptr_cache_b = cache->onednn_graph_scratch_alloc(kSizeCross, 256, &q);
+    check(ptr_cache_b != nullptr, "case B setup allocation on the cache queue succeeds");
+    if (ptr_cache_b) {
+        const auto          start_b      = std::chrono::steady_clock::now();
+        slow_release_result slow_b       = submit_slow_release(q);
+        sycl::event         last_write_b = q.memset(ptr_cache_b, 0x44, kProbeBytes);
+        cache->onednn_graph_scratch_free(ptr_cache_b, &last_write_b);
+
+        const size_t    misses_before = cache->onednn_graph_scratch_pool_miss_count();
+        void *          ptr_other_b   = cache->onednn_graph_scratch_alloc(kSizeCross, 256, &other);
+        const long long elapsed_b     = static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_b).count());
+        printf("    (case B: request returned %lld ms after the cache queue's slow kernel was submitted)\n", elapsed_b);
+
+        check(ptr_other_b != nullptr && ptr_other_b != ptr_cache_b,
+              "case B: a request from another queue does not take an entry still in flight on the cache queue");
+        check(cache->onednn_graph_scratch_pool_miss_count() == misses_before + 1,
+              "case B: the request counted as a miss");
+        check(elapsed_b < slow_b.duration_ms / 3, "case B: the request skipped the in-flight entry without waiting");
+        if (ptr_other_b) {
+            cache->onednn_graph_scratch_free(ptr_other_b, nullptr);
+        }
+        last_write_b.wait();
+    }
+
+    other.wait();
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown (cross-queue)");
+}
+
 // llama.cpp-c6ah: standalone t_flag/t_wait diagnostic, moved out of
 // test_bounded_eviction() (its original home) after that placement was
 // found to consume the ~1500 ms delay that test's own cap-wait bound
@@ -2127,6 +2232,7 @@ int main(int, char ** argv) {
     test_reclaim_while_in_flight_retires_the_slot(cache, device);
     cache->onednn_graph_scratch_force_completion_gated_reuse_for_test(false);
     test_in_flight_entry_is_reused_in_order(cache, device);
+    test_in_flight_entry_does_not_cross_queues(cache, device);
 
     // llama.cpp-c6ah: LAST, deliberately -- see this
     // function's own comment for why.
