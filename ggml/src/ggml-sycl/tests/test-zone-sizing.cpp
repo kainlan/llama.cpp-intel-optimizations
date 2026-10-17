@@ -1172,6 +1172,22 @@ int main() {
         with_head.push_back(marked("output.weight", GGML_TYPE_Q6_K, 4096, 32000, false));
         CHECK(zone_scoped_maxima(with_head).dequant_f16_weight_bytes == 262144000,
               "a claimed head would size the plan, which is why the claim leaves it out");
+
+        // Negative controls, so the two figures above are read from the inventory and not passed by any plan. A
+        // claimed weight one row wider than ffn_up is still claimed (the claim asks for a 2-D weight, not a shape) and
+        // moves the plan off 112 MiB; the head marked as the adapter marks it carries no mark and sizes nothing.
+        std::vector<zone_tensor_desc> wider = mistral;
+        wider.push_back(marked("blk.N.ffn_up.weight", GGML_TYPE_Q4_K, 4096, 14337, false));
+        const size_t wider_w = zone_scoped_maxima(wider).dequant_f16_weight_bytes;
+        CHECK(wider_w != 117440512 && wider_w == 4096ull * 14337ull * F16_BYTES,
+              "a one-row-wider FFN weight moves the plan off the 112 MiB figure");
+        const zone_tensor_desc head = marked("output.weight", GGML_TYPE_Q6_K, 4096, 32000, true);
+        CHECK(head.dequant_f16_if_unsupplied_weight_bytes == 0 &&
+                  head.dequant_f16_if_unsupplied_src1_bytes_per_token == 0,
+              "the head as the adapter marks it carries no dequant mark");
+        CHECK(zone_scoped_maxima({ head }).dequant_f16_weight_bytes == 0 &&
+                  zone_scoped_maxima({ head }).dequant_f16_src1_bytes_per_token == 0,
+              "an inventory of only the head plans nothing");
     }
 
     // ---- Case 14h: the figures a zone is described by outlive a later plan (llama.cpp-8ony) -----------------------

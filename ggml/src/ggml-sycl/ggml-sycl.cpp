@@ -31425,15 +31425,21 @@ static bool ggml_sycl_onednn_pp_candidate(
 #endif
 }
 
+static bool ggml_backend_buffer_is_sycl_split(ggml_backend_buffer_t buffer);  // defined with the split buffer type
+
 // llama.cpp-h9c8: whether the oneDNN f16 dequant arm is this op's PP route when its weight is materialized in
 // `layout`, for the MMQ types dense_pp_route_prefers_f16_dequant_arm lists. The priority walk's MMQ_AOS and
 // ONEDNN_SOA entries, the override switch and pick_kernel_for_layout all ask it, so a forced layout, a layout mismatch
 // and the walk give one answer. Every term of the arm's f16 branch is asked here:
+//   - the default accumulator precision: an op that asks for F32 accumulation takes the arm's fp32 branch, whose f32
+//     weight copy no plan reserves, so it keeps MMQ until a planned path exists (llama.cpp-4bu9). The setters that
+//     reach a 2-D weight are ffn_down and attn_output of GLM4, GLM4_MOE and JAIS2, and a quantized ffn_gate_inp
+//     under SQRT_SOFTPLUS gating (llama-graph.cpp). A call that does not name the op cannot be answered and keeps
+//     MMQ too;
+//   - every row of the weight: the f16 branch converts the whole weight, and a weight in a row-split buffer hands
+//     each device a slice, which would take the fp32 branch's unplanned f32 copy. It keeps MMQ, which runs a slice;
 //   - the claim the zone planner asks (the head by the same classifier, the expert role, a 2-D weight, a type the
 //     router can dequantize), so the weight sent to the arm is a weight the plan reserved the buffers for;
-//   - the default accumulator precision: an op that asks for F32 accumulation (GLM4's ffn_down, every KQ) takes the
-//     arm's fp32 branch, whose f32 weight copy no plan reserves, so it keeps MMQ. A call that does not name the op
-//     cannot be answered and keeps MMQ too;
 //   - a converter for `layout`: convert.cpp answers nullptr for a (type, layout) pair it cannot decode;
 //   - the oneDNN PP admission, the one source of the batch floor, the env gates and the placement refusals
 //     (llama.cpp-je3b). It runs last, so decode and the cheap type terms never reach it.
@@ -31447,6 +31453,9 @@ static bool ggml_sycl_dense_f16_arm_serves_pp(const ggml_tensor * src0,
         return false;
     }
     if (!dst || dst->op_params[0] != GGML_PREC_DEFAULT) {
+        return false;
+    }
+    if (src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer)) {
         return false;
     }
     const bool quantized = ggml_is_quantized(src0->type);
@@ -50433,7 +50442,11 @@ static void ggml_sycl_dequant_f16_from_loaded_layout(ggml_backend_sycl_context &
                                                      const queue_ptr &           stream) {
     const int64_t                 ne     = row_diff * src0->ne[0];
     const ggml_sycl::resolved_ptr loaded = ggml_sycl_resolve(src0, ctx.device);
-    // A tensor the resolver does not know is a plain buffer, which is what the router assumes of it too.
+    // A tensor the resolver does not know is converted as a plain AOS buffer. The router does not promise that: with
+    // no resolved layout the orchestrator enforces none, and ggml_sycl_can_use_layout_for_kernel accepts any layout
+    // for an evictable weight in a host buffer, so the walk may have chosen ONEDNN_SOA. This arm follows the
+    // resolver: a resolved layout it has no converter for is refused by name below, and an unresolved one is read
+    // as AOS, so that case rests on the op handing over the plain buffer.
     const layout_mode             layout = loaded ? loaded.layout : GGML_LAYOUT_AOS;
 
     // Every refusal names the weight, its type and its loaded layout, then fails the op.

@@ -521,8 +521,8 @@ if (BUILD_TESTING)
     # llama.cpp-h9c8: the MMQ types dense_pp_route_prefers_f16_dequant_arm lists (Q4_1..Q5_1, Q2_K..Q6_K) are moved to
     # the same arm at PP batch by the router's helper, and the planner reserves for them through the claim that helper
     # asks. test-zone-sizing Cases 14k and 14l prove the arithmetic and the claims' truth tables; this gate proves the
-    # adapter and the router ask the claims, the router's precision and converter refusals, the arm's loaded-layout
-    # conversion and the knob's catalog row.
+    # adapter and the router ask the claims, the router's precision, row-split and converter refusals, the selector's
+    # required node, the arm's loaded-layout conversion and the knob's catalog row.
     add_test(NAME sycl-dequant-f16-aos-plan-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-dequant-f16-aos-plan-source.py
             --self-test)

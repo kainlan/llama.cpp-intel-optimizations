@@ -2820,11 +2820,12 @@ The MMQ claim is the one whose router twin can refuse a weight the plan reserved
 function, `mmq_dequant_f16_plan_claims`, which both sides call with the same head, expert, 2-D and dequant flags. The
 router then narrows it with what only it knows: the oneDNN PP candidate (batch at or above
 `GGML_SYCL_ONEDNN_PP_MIN_BATCH`, the oneDNN PP and placement admissions), the node's accumulator precision (an op
-`ggml_prec_set_acc` set to F32 keeps MMQ, because the arm's F32 branch would draw an unplanned f32 copy), and a
-converter for the layout the weight is loaded in. `ggml_get_to_fp16_sycl_for_layout` returns no converter for a layout
-it has no kernel for, so a weight in such a layout keeps MMQ rather than being dequantized as if it were AOS
-(`llama.cpp-pzu9`). Mistral 7B Q4_K_M plans 112.0 MB of f16 weights (one `ffn_down`, 14336 x 4096) and 28 KB of f16
-activations per token; a claimed head would have been 250 MB (`test-zone-sizing`, Case 14l).
+`ggml_prec_set_acc` set to F32 keeps MMQ, because the arm's F32 branch would draw an unplanned f32 copy;
+`llama.cpp-4bu9`), a weight in a row-split buffer (the arm's f16 branch converts a whole weight, and a split slice would
+take the same F32 branch), and a converter for the layout the weight is loaded in. `ggml_get_to_fp16_sycl_for_layout`
+returns no converter for a layout it has no kernel for, so a weight in such a layout keeps MMQ rather than being
+dequantized as if it were AOS (`llama.cpp-pzu9`). Mistral 7B Q4_K_M plans 112.0 MB of f16 weights (one `ffn_down`, 14336
+x 4096) and 28 KB of f16 activations per token; a claimed head would have been 250 MB (`test-zone-sizing`, Case 14l).
 
 ### A load-time consumer: the measured compute term (`llama.cpp-p6i0`)
 

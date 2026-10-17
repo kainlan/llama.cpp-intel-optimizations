@@ -28,7 +28,10 @@ by the adapter AND by the router's one helper (ggml_sycl_dense_f16_arm_serves_pp
 override switch and pick_kernel_for_layout all ask. The head comes from one classifier both sides call
 (ggml_sycl_weight_is_output_head). The arm converts from the layout the weight is loaded in and refuses by name a
 layout it has no converter for; the converter table answers nullptr for a (type, layout) pair it cannot decode
-(llama.cpp-pzu9), and the router asks it. Case 14l proves the list, the claim and the plan arithmetic.
+(llama.cpp-pzu9), and the router asks it. The router also keeps on MMQ an op that asks for F32 accumulation and a
+weight in a row-split buffer: either would take the arm's fp32 branch, whose f32 weight copy no plan reserves. The
+selector's node parameter has no default, so a caller cannot drop the node without a compile error. Case 14l proves
+the list, the claim and the plan arithmetic.
 
 Run with --self-test to prove every check fires against a mutant of the thing it requires.
 """
@@ -47,6 +50,7 @@ parser.add_argument("--cache", default=str(sycl / "unified-cache.cpp"))
 parser.add_argument("--backend", default=str(sycl / "ggml-sycl.cpp"))
 parser.add_argument("--convert", default=str(sycl / "convert.cpp"))
 parser.add_argument("--catalog", default=str(root / "docs/backend/sycl-env-vars.md"))
+parser.add_argument("--selection", default=str(sycl / "kernel-selection.hpp"))
 parser.add_argument("--self-test", action="store_true")
 args = parser.parse_args()
 
@@ -63,6 +67,14 @@ KNOB_SIG = "static bool ggml_sycl_onednn_pp_mmq_types_enabled() {"
 ADMITTED_SIG = "bool ggml_sycl_onednn_pp_mmq_types_admitted(ggml_type type) {"
 TO_FP16_SIG = "to_fp16_sycl_t ggml_get_to_fp16_sycl_for_layout(ggml_type type, layout_mode layout) {"
 KNOB_LITERAL = '"GGML_SYCL_ONEDNN_PP_MMQ_TYPES"'
+# The four router sites that ask the helper, named by the function each lives in.
+WALK_MMQ = "ggml_sycl_select_preferred_kernel's priority walk: MMQ_AOS declines an op the f16 arm serves from AOS"
+WALK_SOA = ("ggml_sycl_select_preferred_kernel's priority walk: ONEDNN_SOA admits an op the f16 arm serves from SOA, "
+            "beside the Q8_0 term")
+OVERRIDE_SOA = "ggml_sycl_select_preferred_kernel's override switch: ONEDNN_SOA accepts the same op"
+PICK_SOA = "UnifiedMatmulOrchestrator::select's pick_kernel_for_layout: the SOA case answers ONEDNN_SOA for the same op"
+SPLIT = "the router helper refuses a weight in a row-split buffer"
+NODE_REQUIRED = "the selector's node parameter has no default, so a call that forgets it does not compile"
 
 
 def strip_comments(source):
@@ -217,25 +229,36 @@ def check(srcs):
         and nows("return ggml_sycl_onednn_pp_candidate(src0, src1, dst, device);") in nows(serves)
         and "ne[1]" not in serves and "min_batch" not in serves)
     # The arm's f16 branch runs only at the default accumulator precision (ggml_sycl_op_mul_mat_sycl): an op that
-    # asks for F32 accumulation (GLM4's ffn_down, every KQ) takes the fp32 branch, whose weight copy is not planned.
+    # asks for F32 accumulation (ffn_down and attn_output of GLM4, GLM4_MOE and JAIS2; a quantized ffn_gate_inp
+    # under SQRT_SOFTPLUS gating) takes the fp32 branch, whose weight copy is not planned (llama.cpp-4bu9).
     results["the router helper refuses an op that asks for F32 accumulation, and a call without the op"] = (
         nows("if (!dst || dst->op_params[0] != GGML_PREC_DEFAULT) {") in nows(serves))
+    # The f16 branch also needs every row of the weight: a row-split weight hands each device a slice, which takes the
+    # same fp32 branch. The split predicate dereferences the buffer, so the term asks for one first.
+    results[SPLIT] = (
+        nows("if (src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer)) { return false; }") in nows(serves))
     results["the router helper exists only in a build with the f16 dequant arm"] = (
         nows(serves).startswith(nows("{ #if GGML_SYCL_DEQUANT_F16_ARM")))
-    results["R1: the priority walk's MMQ_AOS declines an op the f16 arm serves from AOS"] = (
+    results[WALK_MMQ] = (
         nows("if (use_mmq && !") + serves_aos + ")" in nows(kernel_case(loop_part, "MMQ_AOS")))
-    results["R2: the priority walk's ONEDNN_SOA admits an op the f16 arm serves from SOA, beside the Q8_0 term"] = (
+    results[WALK_SOA] = (
         "||" + serves_soa in nows(kernel_case(loop_part, "ONEDNN_SOA"))
         and "src0->type==GGML_TYPE_Q8_0" in nows(kernel_case(loop_part, "ONEDNN_SOA")))
-    results["R3: the override switch's ONEDNN_SOA accepts the same op"] = (
+    results[OVERRIDE_SOA] = (
         "&&!" + serves_soa in nows(kernel_case(override_part, "ONEDNN_SOA"))
         and "src0->type!=GGML_TYPE_Q8_0" in nows(kernel_case(override_part, "ONEDNN_SOA")))
-    results["R4: pick_kernel_for_layout's SOA case answers ONEDNN_SOA for the same op"] = (
+    results[PICK_SOA] = (
         "||" + nows("ggml_sycl_dense_f16_arm_serves_pp(src0, src1, dst, ctx_.device, GGML_LAYOUT_SOA)")
         in nows(pick_soa))
     selector_calls = re.findall(r"ggml_sycl_select_preferred_kernel\(([^;{]*)\);", backend_code)
     results["the selector is given the op at every call"] = bool(selector_calls) and all(
         nows(call).endswith(",dst") for call in selector_calls)
+    selection_code = strip_comments(srcs["selection"])
+    decl_at = selection_code.find(SELECT_SIG)
+    decl = selection_code[decl_at:selection_code.find(";", decl_at)] if decl_at >= 0 else ""
+    results[NODE_REQUIRED] = (
+        nows("std::optional<ggml_sycl_mul_mat_kernel> force_kernel, const ggml_tensor * dst)") in nows(decl)
+        and "=" not in decl)
     results["set_decision labels ONEDNN_SOA WoQ only for Q8_0"] = nows(
         "decision.onednn_path = (src0->type == GGML_TYPE_Q8_0 && ggml_sycl_onednn_woq_q8_enabled()) ? "
         "OneDnnPath::WoQ : OneDnnPath::DequantFp16;") in nows(backend_code)
@@ -305,6 +328,7 @@ sources = {
     "backend": Path(args.backend).read_text(),
     "convert": Path(args.convert).read_text(),
     "catalog": Path(args.catalog).read_text(),
+    "selection": Path(args.selection).read_text(),
 }
 results = check(sources)
 
@@ -415,23 +439,27 @@ if args.self_test:
          "if (!src0 || !src1) {"),
         ("the router helper refuses an op that asks for F32 accumulation, and a call without the op", "backend",
          "if (!dst || dst->op_params[0] != GGML_PREC_DEFAULT) {", "if (!dst) {"),
+        (SPLIT, "backend",
+         "if (src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer)) { return false; }", ""),
         ("the router helper exists only in a build with the f16 dequant arm", "backend",
          "#if GGML_SYCL_DEQUANT_F16_ARM if (!src0 || !src1 ||", "if (!src0 || !src1 ||"),
-        ("R1: the priority walk's MMQ_AOS declines an op the f16 arm serves from AOS", "backend",
+        (WALK_MMQ, "backend",
          "if (use_mmq && !ggml_sycl_dense_f16_arm_serves_pp(src0, src1, dst, device, GGML_LAYOUT_AOS)) {",
          "if (use_mmq) {"),
-        ("R2: the priority walk's ONEDNN_SOA admits an op the f16 arm serves from SOA, beside the Q8_0 term",
-         "backend",
+        (WALK_SOA, "backend",
          "|| ggml_sycl_dense_f16_arm_serves_pp(src0, src1, dst, device, GGML_LAYOUT_SOA)) { return kernel;",
          ") { return kernel;"),
-        ("R3: the override switch's ONEDNN_SOA accepts the same op", "backend",
+        (OVERRIDE_SOA, "backend",
          "&& !ggml_sycl_dense_f16_arm_serves_pp(src0, src1, dst, device, GGML_LAYOUT_SOA)) { override_ok = false;",
          ") { override_ok = false;"),
-        ("R4: pick_kernel_for_layout's SOA case answers ONEDNN_SOA for the same op", "backend",
+        (PICK_SOA, "backend",
          "|| ggml_sycl_dense_f16_arm_serves_pp(src0, src1, dst, ctx_.device, GGML_LAYOUT_SOA)", ""),
         ("the selector is given the op at every call", "backend",
          "ggml_sycl_select_preferred_kernel(src0, src1, ctx_.device, kernel_override, dst);",
          "ggml_sycl_select_preferred_kernel(src0, src1, ctx_.device, kernel_override);"),
+        (NODE_REQUIRED, "selection",
+         "std::optional<ggml_sycl_mul_mat_kernel> force_kernel, const ggml_tensor * dst);",
+         "std::optional<ggml_sycl_mul_mat_kernel> force_kernel = std::nullopt, const ggml_tensor * dst = nullptr);"),
         ("set_decision labels ONEDNN_SOA WoQ only for Q8_0", "backend",
          "decision.onednn_path = (src0->type == GGML_TYPE_Q8_0 && ggml_sycl_onednn_woq_q8_enabled()) ?",
          "decision.onednn_path = ggml_sycl_onednn_woq_q8_enabled() ?"),
