@@ -5,7 +5,8 @@
 // wait on a host-signalled event), and an entry reused while still signalled lets the next job's scatter read its
 // outputs before the job wrote them. So the book frees an entry only when the job has signalled it, the pending
 // scatter's half is gone, and the host has waited an event of a flush at least as late as the one that made the device
-// wait on it. Each case below breaks one of those conditions.
+// wait on it. Each case below breaks one of those conditions. The ring resets the native events with its lock released
+// (llama.cpp-42zj), so a recycle runs in two phases, and between them its entries belong to no one else.
 //
 // The gate list (llama.cpp-qwn5) is the jobs' futures, which a host wait on the device sleeps on first. Its cases
 // check that a waiter sleeps rather than spins, that it holds no lock a producer needs while it sleeps, that a job
@@ -229,6 +230,40 @@ static void test_failed_reset_retires() {
     expect_eq("a later recycle does not free it", recycle_all_reset(b, UINT64_MAX - 1), 0);
     uint32_t id2 = 0, gen2 = 0;
     expect_true("and it is never acquired again", !b.acquire(&id2, &gen2));
+}
+
+// Between a recycle's two phases an entry is RESETTING: no other recycle, acquire or signal_all takes it, and only
+// finishing it frees it (its reset done) or retires it (its reset failed). Finishing anything else does nothing.
+static void test_recycle_two_phase() {
+    cpu_job_signal_book b;
+    b.add(2);
+    uint32_t a = 0, ga = 0, c = 0, gc = 0;
+    b.acquire(&a, &ga);
+    b.signal(a, ga);
+    b.drop(a, ga);
+    b.acquire(&c, &gc);
+    b.signal(c, gc);
+    b.drop(c, gc);
+    std::vector<uint32_t> ids;
+    expect_eq("the first phase takes both entries", b.recycle_begin(0, &ids), 2);
+    expect_true("and lists them", ids.size() == 2);
+    expect_true("both are RESETTING",
+                b.at(a).state == entry_state::RESETTING && b.at(c).state == entry_state::RESETTING);
+    expect_eq("the book counts them as resetting", b.count().resetting, 2);
+    std::vector<uint32_t> again;
+    expect_eq("a second recycle takes neither", b.recycle_begin(UINT64_MAX - 1, &again), 0);
+    uint32_t x = 0, gx = 0;
+    expect_true("no acquire takes a resetting entry", !b.acquire(&x, &gx));
+    expect_eq("signal_all leaves them alone", b.signal_all([](uint32_t) {}), 0);
+    expect_true("an entry whose reset is done is freed", b.recycle_finish(a, true));
+    expect_true("under a new generation", b.at(a).state == entry_state::FREE && b.at(a).generation != ga);
+    expect_true("an entry whose reset failed is not freed", !b.recycle_finish(c, false));
+    expect_true("it is retired",
+                b.at(c).state == entry_state::SIGNALLED && b.at(c).serial == cpu_job_signal_book::retired);
+    expect_true("finishing an entry that is not resetting does nothing",
+                !b.recycle_finish(a, true) && !b.recycle_finish(c, true) && b.count().free == 1);
+    expect_true("the freed entry is acquired again", b.acquire(&x, &gx) && x == a);
+    expect_true("the retired one never", !b.acquire(&x, &gx));
 }
 
 // signal_all signals each acquired entry once, and leaves signalled and free entries alone.
@@ -600,6 +635,7 @@ int main() {
     test_consume_rules();
     test_stale_generation_after_recycle();
     test_failed_reset_retires();
+    test_recycle_two_phase();
     test_signal_all();
     test_gate_sleeps();
     test_gate_failed_job();

@@ -48,6 +48,13 @@ THE CONTRACT.  With comments and string literals blanked:
       mutex for the whole arm, submits before it records the new serial, and takes its word from the unified cache
       as a host-pinned allocation.  shutdown_resources ends the marker word on every branch that ends the signal
       ring, and on the normal branch only after the queues drained.
+  W8. The signal ring (cpu_job_signal_ring, unified-cache.cpp) makes no driver call that may block under mutex_, the
+      lock the job's own signal takes: a host wait on another thread may hold the driver's device lock behind that
+      job.  wrap makes its event and recycle resets its events outside every mutex_ scope, each call counted in
+      outside_calls_ (raised before it and lowered after it); the book (consume, begin_flush, recycle_begin,
+      recycle_finish) and outside_calls_ change only under mutex_; recycle does not use the book's one-lock recycle;
+      and shutdown destroys native objects only inside `if (outside_calls_ == 0)`.  grow_locked, which creates pools
+      and events under mutex_, is outside this pin.
 
 WHAT THIS DOES NOT PROVE.  It reads source text.  It does not show that zeEventHostSignal stays clear of the driver's
 device lock on another driver (that is the disassembly above, for 26.35 only), that the device writes the marker
@@ -62,6 +69,8 @@ pin it names.
 RED on 1bc3bbb1e (the base before this fix):
   FAIL [pin W1]: moe_cpu_job_wait_inputs runs on the CPU expert pool worker and calls inputs.events.empty,
   sycl::event::wait; the worker's input wait may call only cpu_expert_pool_trace_stamp_inputs_ready, ...
+RED for W8 alone, on the commit that added W1-W7:
+  FAIL [pin W8]: cpu_job_signal_ring::wrap makes its event under mutex_ ...
 """
 
 from __future__ import annotations
@@ -379,10 +388,85 @@ def check_helpers(s: dict[str, str]) -> None:
                    "would write freed memory")
 
 
+RING_CLASS = r"class\s+cpu_job_signal_ring\s*\{"
+RING_WRAP_SIG = (r"bool\s+wrap\s*\(\s*uint32_t\s+id\s*,\s*uint32_t\s+generation\s*,\s*uint64_t\s*\*\s*serial\s*,"
+                 r"\s*sycl::event\s*\*\s*out\s*\)\s*\{")
+RING_RECYCLE_SIG = r"size_t\s+recycle\s*\(\s*uint64_t\s+upto\s*\)\s*noexcept\s*\{"
+RING_SHUTDOWN_SIG = r"void\s+shutdown\s*\(\s*\)\s*noexcept\s*\{"
+_RING_LOCK = re.compile(r"std::(?:lock_guard|unique_lock|scoped_lock)\s*<[^>]*>\s+\w+\s*\(\s*mutex_\b")
+
+
+def lock_spans(body: str) -> list[tuple[int, int]]:
+    """Each mutex_ lock in `body`, from the lock to the end of the innermost block that holds it."""
+    spans = []
+    for m in _RING_LOCK.finditer(body):
+        open_at = enclosing_brace(body, m.start())
+        if open_at < 0:
+            spans.append((m.start(), len(body)))
+        else:
+            block, start = block_at(body, open_at, "W8")
+            spans.append((m.start(), start + len(block)))
+    return spans
+
+
+def under_lock(spans: list[tuple[int, int]], pos: int) -> bool:
+    return any(a <= pos < b for a, b in spans)
+
+
+def check_ring_call_outside(name: str, body: str, call: str, what: str) -> None:
+    spans = lock_spans(body)
+    hits = [m.start() for m in re.finditer(call, body)]
+    if len(hits) != 1 or under_lock(spans, hits[0]):
+        fail("W8", f"cpu_job_signal_ring::{name} {what} under mutex_ ({len(hits)} call(s)): the job's own signal takes "
+                   "mutex_, and a driver call may block behind a host wait that waits for that job")
+    up = [m.start() for m in re.finditer(r"\boutside_calls_\s*\+=\s*1\s*;", body)]
+    down = [m.start() for m in re.finditer(r"\boutside_calls_\s*-=\s*1\s*;", body)]
+    if len(up) != 1 or len(down) != 1 or not (up[0] < hits[0] < down[0]):
+        fail("W8", f"cpu_job_signal_ring::{name} does not count its driver call in outside_calls_, raised before it and "
+                   "lowered after it: a shutdown meanwhile would destroy the event under it")
+
+
+def check_ring_book_locked(name: str, body: str, pattern: str) -> None:
+    spans = lock_spans(body)
+    hits = [m.start() for m in re.finditer(pattern, body)]
+    if not hits or any(not under_lock(spans, h) for h in hits):
+        fail("W8", f"cpu_job_signal_ring::{name} changes the book or outside_calls_ outside mutex_ (`{pattern}`)")
+
+
+def check_ring_locks(s: dict[str, str]) -> None:
+    cache = s["cache"]
+    found = list(re.finditer(RING_CLASS, cache))
+    if len(found) != 1:
+        fail("W8", f"{len(found)} definitions of cpu_job_signal_ring, not 1")
+    ring, _ = block_at(cache, cache.index("{", found[0].end() - 1), "W8")
+    _, wrap = definition(ring, RING_WRAP_SIG, "W8")
+    check_ring_call_outside("wrap", wrap, r"\bmake_event\s*<", "makes its event")
+    for pattern in (r"\bbook_\s*\.\s*consume\s*\(", r"\bbook_\s*\.\s*begin_flush\s*\(",
+                    r"\boutside_calls_\s*[-+]="):
+        check_ring_book_locked("wrap", wrap, pattern)
+    _, rec = definition(ring, RING_RECYCLE_SIG, "W8")
+    check_ring_call_outside("recycle", rec, r"\bhost_reset\s*\(", "resets its events")
+    for pattern in (r"\bbook_\s*\.\s*recycle_begin\s*\(", r"\bbook_\s*\.\s*recycle_finish\s*\(",
+                    r"\boutside_calls_\s*[-+]="):
+        check_ring_book_locked("recycle", rec, pattern)
+    if re.search(r"\bbook_\s*\.\s*recycle\s*\(", rec):
+        fail("W8", "cpu_job_signal_ring::recycle runs the book's one-lock recycle, whose resets run under mutex_")
+    _, shut = definition(ring, RING_SHUTDOWN_SIG, "W8")
+    for m in re.finditer(r"\b(?:event_destroy|pool_destroy)\s*\(", shut):
+        guarded, b = False, enclosing_brace(shut, m.start())
+        while b >= 0 and not guarded:
+            guarded = re.search(r"\bif\s*\(\s*outside_calls_\s*==\s*0\s*\)\s*$", shut[:b]) is not None
+            b = enclosing_brace(shut, b)
+        if not guarded:
+            fail("W8", "cpu_job_signal_ring::shutdown destroys native objects outside `if (outside_calls_ == 0)`: a wrap "
+                       "or a recycle still in a driver call would use a destroyed event")
+
+
 def check(s: dict[str, str]) -> None:
     check_wait_inputs(s)
     check_pool_lambda(s)
     check_helpers(s)
+    check_ring_locks(s)
 
 
 def sub(pattern: str, repl: str, count: int = 1):
@@ -496,6 +580,26 @@ def self_test(s: dict[str, str]) -> int:
          move(r"\n    \{\n\s*std::lock_guard<std::mutex> lock\(cpu_job_input_marker_mutex_\);\n"
               r"\s*cpu_job_input_marker_end\(cpu_job_input_marker_word_, cpu_job_input_marker_owner_\);\n    \}",
               r"\n\s*if \(!drain_all_queues_noexcept\(\)\) return false;")),
+        # W8: the signal ring's driver calls and the lock its job's signal takes (llama.cpp-42zj).
+        ("W8", "cache", "the ring makes its event under mutex_",
+         sub(re.escape("        sycl::event ev;\n        std::string failure;"),
+             "        std::lock_guard<std::timed_mutex> held(mutex_);\n        sycl::event ev;\n        std::string failure;")),
+        ("W8", "cache", "the ring resets its events under mutex_",
+         sub(re.escape("        std::vector<ze_result_t> results("),
+             "        std::lock_guard<std::timed_mutex> held(mutex_);\n        std::vector<ze_result_t> results(")),
+        ("W8", "cache", "recycle goes back to the book's one-lock recycle",
+         sub(re.escape("if (book_.recycle_begin(upto, &ids) == 0) {"),
+             "if (book_.recycle(upto, [](uint32_t) { return true; }) == 0) {")),
+        ("W8", "cache", "recycle finishes the book outside mutex_",
+         sub(re.escape("        std::lock_guard<std::timed_mutex> lock(mutex_);\n        outside_calls_ -= 1;\n        size_t n = 0;"),
+             "        outside_calls_ -= 1;\n        size_t n = 0;")),
+        ("W8", "cache", "wrap consumes the entry outside mutex_",
+         sub(re.escape("        std::lock_guard<std::timed_mutex> lock(mutex_);\n        outside_calls_ -= 1;\n        if (!made) {"),
+             "        outside_calls_ -= 1;\n        if (!made) {")),
+        ("W8", "cache", "wrap's driver call is not counted",
+         sub(re.escape("native = events_[id];\n            outside_calls_ += 1;"), "native = events_[id];")),
+        ("W8", "cache", "shutdown destroys under a driver call",
+         sub(re.escape("if (outside_calls_ == 0) {"), "if (true) {")),
     ]
     failures, caught = [], 0
     for pin, key, name, mutate in mutants:

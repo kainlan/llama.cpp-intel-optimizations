@@ -56,10 +56,12 @@ THE CONTRACT.  With comments blanked:
      pending_cpu_scatter_wait_prev_events(slot), after its sycl::event::wait(events);
      the slot-pair wait is called only from ggml_sycl_cpu_tg_flush_pending.
   F. (unified-cache.cpp cpu_job_signal_ring::wrap) each wrap makes a fresh
-     sycl::make_event with ownership::keep; nothing the ring class declares outside its
-     function bodies and parameter lists names sycl::event, so no member holds a wrapper,
-     bare or in a container; the flush clears its dependency list after the retention,
-     and the wrap's out-parameter is a local of the member loop.
+     sycl::make_event with ownership::keep, from the entry's native event that it copied
+     under the lock (it makes the event with the lock released, llama.cpp-42zj); nothing
+     the ring class declares outside its function bodies and parameter lists names
+     sycl::event, so no member holds a wrapper, bare or in a container; the flush clears
+     its dependency list after the retention, and the wrap's out-parameter is a local of
+     the member loop.
   G. The abort callback signals every ring before it calls the previous callback, and
      the SYCL watchdog signals every ring before it frees host allocations and exits.
      The pool's stop_workers signals nothing: a worker it detaches may still write the
@@ -448,8 +450,11 @@ def check_ring(cache_cpp: str) -> None:
         fail("F", "cpu_job_signal_ring has no wrap(id, ...) member")
     wrap, _ = block_at(cls, cls.index("{", m.end() - 1), "F")
     wf = flat(wrap)
-    if not re.search(r"ev = sycl::make_event<sycl::backend::ext_oneapi_level_zero>\( \{ events_\[id\], "
-                     r"sycl::ext::oneapi::level_zero::ownership::keep \}, \*ctx_\);", wf):
+    # wrap copies the entry's native event under mutex_ and makes the wrapper from that copy with mutex_ released
+    # (llama.cpp-42zj); test-sycl-cpu-job-input-wait-source.py W8 pins where the lock is.
+    if "native = events_[id];" not in wf or not re.search(
+            r"ev = sycl::make_event<sycl::backend::ext_oneapi_level_zero>\( \{ native, "
+            r"sycl::ext::oneapi::level_zero::ownership::keep \}, \*ctx_\);", wf):
         fail("F", "wrap does not make a fresh wrapper with ownership::keep for each use")
     if "*out = std::move(ev);" not in wf:
         fail("F", "wrap does not hand the fresh wrapper to its caller")
@@ -996,9 +1001,8 @@ def self_test(s: dict) -> int:
         ("I", "backend", "the flush gets a job's future",
          sub(r"\n(\s*)auto t1 = hrc::now\(\);", r"\n\1group[0]->future.share().get();\n\1auto t1 = hrc::now();")),
         ("I", "cache_cpp", "wrap host-synchronizes the event",
-         sub(r"\n(\s*)sycl::event ev;\n(\s*)try \{\n(\s*)ev = sycl::make_event",
-             r"\n\1(void) zeEventHostSynchronize(events_[id], UINT64_MAX);\n\1sycl::event ev;\n\2try {\n\3"
-             r"ev = sycl::make_event")),
+         sub(r"\n(\s*)sycl::event ev;\n((?:\s*[^\n]*;\n){0,2}\s*try \{\n\s*ev = sycl::make_event)",
+             r"\n\1(void) zeEventHostSynchronize(native, UINT64_MAX);\n\1sycl::event ev;\n\2")),
         ("I", "cache_cpp", "the ring resolves a status query",
          sub(r'(\n(\s*)f\.host_reset    = reinterpret_cast<decltype\(&zeEventHostReset\)>\(dlsym\(lib, '
              r'"zeEventHostReset"\)\);)',

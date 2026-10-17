@@ -54,6 +54,7 @@ class cpu_job_signal_book {
         FREE,
         ACQUIRED,
         SIGNALLED,
+        RESETTING,  // between a recycle's two phases: its native event is being reset with the ring's lock released
     };
 
     struct entry {
@@ -71,6 +72,7 @@ class cpu_job_signal_book {
         size_t free      = 0;
         size_t acquired  = 0;
         size_t signalled = 0;
+        size_t resetting = 0;
     };
 
     // Adds n FREE entries and returns the index of the first.
@@ -131,26 +133,54 @@ class cpu_job_signal_book {
         }
     }
 
-    // Frees every SIGNALLED entry whose slot half is gone and whose device wait, if it had one, was in a flush with
-    // serial <= upto. `reset(id)` runs for each before it is freed (the native event reset) and returns whether it
-    // reset the event. An entry it could not reset is retired, never freed: reused still signalled, it would let the
-    // next job's device commands run before that job wrote anything. Returns how many were freed.
-    template <typename F> size_t recycle(uint64_t upto, F && reset) {
+    // A recycle frees every SIGNALLED entry whose slot half is gone and whose device wait, if it had one, was in a flush
+    // with serial <= upto, once its native event is reset. It runs in two phases because the ring resets the events
+    // with its lock released (llama.cpp-42zj): a driver call may block, and the job's own signal takes that lock.
+    //
+    // Phase one marks each such entry RESETTING and appends its id to *ids; no other recycle, acquire or signal_all
+    // takes a RESETTING entry. Returns how many.
+    size_t recycle_begin(uint64_t upto, std::vector<uint32_t> * ids) {
         size_t n = 0;
         for (uint32_t i = 0; i < entries_.size(); ++i) {
             entry & e = entries_[i];
             if (e.state != entry_state::SIGNALLED || e.ref_live || e.serial > upto) {
                 continue;
             }
-            if (!reset(i)) {
-                e.serial = retired;
-                continue;
-            }
-            e.state  = entry_state::FREE;
-            e.serial = 0;
-            e.generation += 1;
-            free_.push_back(i);
+            e.state = entry_state::RESETTING;
+            ids->push_back(i);
             n += 1;
+        }
+        return n;
+    }
+
+    // Phase two, for one RESETTING entry: freed, under a new generation, when its native event was reset. One that
+    // could not be reset is retired, never freed: reused still signalled, it would let the next job's device commands
+    // run before that job wrote anything. True when it was freed; an entry that is not RESETTING is left alone.
+    bool recycle_finish(uint32_t id, bool reset) {
+        if (id >= entries_.size() || entries_[id].state != entry_state::RESETTING) {
+            return false;
+        }
+        entry & e = entries_[id];
+        if (!reset) {
+            e.state  = entry_state::SIGNALLED;
+            e.serial = retired;
+            return false;
+        }
+        e.state  = entry_state::FREE;
+        e.serial = 0;
+        e.generation += 1;
+        free_.push_back(id);
+        return true;
+    }
+
+    // Both phases, with `reset(id)` (the native reset, returning whether it reset the event) between them. Returns how
+    // many were freed.
+    template <typename F> size_t recycle(uint64_t upto, F && reset) {
+        std::vector<uint32_t> ids;
+        recycle_begin(upto, &ids);
+        size_t n = 0;
+        for (uint32_t id : ids) {
+            n += recycle_finish(id, reset(id)) ? 1 : 0;
         }
         return n;
     }
@@ -175,6 +205,7 @@ class cpu_job_signal_book {
             c.free += e.state == entry_state::FREE ? 1 : 0;
             c.acquired += e.state == entry_state::ACQUIRED ? 1 : 0;
             c.signalled += e.state == entry_state::SIGNALLED ? 1 : 0;
+            c.resetting += e.state == entry_state::RESETTING ? 1 : 0;
         }
         return c;
     }
