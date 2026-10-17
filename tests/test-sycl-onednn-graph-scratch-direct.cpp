@@ -44,7 +44,7 @@
 // sites item (d) below enumerates, so a pooled buffer cannot outlive the
 // context it belongs to.
 //
-// This test asserts seven properties:
+// This test asserts eight properties:
 //
 //   (a) POOL REUSE: freeing a DIRECT buffer and immediately requesting the
 //       SAME size again must be served from the pool -- no fresh
@@ -137,7 +137,16 @@
 //       kernel finally finishes too. Added by llama.cpp-c6ah, not part of
 //       the original 0oxf RED-FIRST set below.
 //
-// RED-FIRST NOTE. Three of these seven properties, (a)-(c), are RED against
+//   (h) IN-ORDER REUSE OF AN IN-FLIGHT ENTRY: with every consumer on the
+//       cache's in-order queue (TP inactive), a same-size request must get
+//       a parked entry back at once, while its release is still pending:
+//       same pointer, a hit, no new outstanding bytes. The new consumer's
+//       write must start after the previous consumer's last write ends, and
+//       the entry's flag slot must go back to the free list and stay usable
+//       for the next park. Added by llama.cpp-jwjz; RED against a pool that
+//       gates reuse on completion, where the request is a fresh miss.
+//
+// RED-FIRST NOTE. Three of these eight properties, (a)-(c), are RED against
 // the pre-0oxf code: (a) and (b) have no pool, cap, or wait at all (every
 // DIRECT allocation is a fresh unified_alloc() with no bound), and (c) had
 // no abort hook to suppress -- the pre-fix function simply returned nullptr
@@ -182,6 +191,7 @@ int main() {
 #    include <chrono>
 #    include <mutex>
 #    include <thread>
+#    include <vector>
 
 using ggml_sycl::get_unified_cache_for_device;
 using ggml_sycl::ggml_sycl_test_onednn_graph_scratch_abort_triggered;
@@ -1842,6 +1852,127 @@ void test_reclaim_while_in_flight_retires_the_slot(unified_cache * cache, int de
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown (reclaim retirement)");
 }
 
+// --- (h) an in-flight entry is handed straight back on the in-order queue
+//         (llama.cpp-jwjz) ------------------------------------------------
+//
+// With TP inactive, every Graph-scratch consumer submits on the cache's own
+// in-order queue. The ONEDNN zone free already relies on that fact. A DIRECT
+// buffer freed with a pending release event can therefore go to the next
+// same-size request at once, because that request's kernels queue behind the
+// previous consumer's. Gating reuse on completion instead made each oneDNN
+// SDPA execute of a repeated shape miss the pool and allocate a second
+// buffer. Once two were in flight, the next request waited at the cap in
+// 200 ms polls (llama.cpp-jwjz, Mistral -d 8192 at ubatch 2048).
+//
+// The test parks a buffer behind a slow kernel and a write, then asks for
+// the same size while that kernel still runs. It checks four things:
+//   1. the request is a pool hit at once: same pointer, hit +1, miss and
+//      outstanding bytes unchanged, well inside the release delay;
+//   2. the new consumer's write starts after the previous consumer's last
+//      write ends, so the queue order is what protects the reuse;
+//   3. the early exit returns the entry's flag slot to the free list
+//      instead of retiring it;
+//   4. re-parking on that slot while its previous marker is still pending
+//      still reads complete once the new release ends.
+void test_in_flight_entry_is_reused_in_order(unified_cache * cache, int device) {
+    printf("DIRECT path in-flight entry is reused at once on the in-order queue:\n");
+
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup (in-order reuse)");
+
+    sycl::queue & q = cache->get_queue();
+
+    // Two of these fit under the cap. On a tree that gates reuse on
+    // completion, the request below is then a fresh miss, not a cap wait, so
+    // that arm fails on the pointer and the counters rather than a timeout.
+    constexpr size_t kSizeInOrder = 300ull * 1024 * 1024;
+    constexpr size_t kProbeBytes  = 4096;
+    static_assert(kSizeInOrder > kZoneFloorBytes, "the size must exceed the zone floor to take the DIRECT path");
+    static_assert(2 * kSizeInOrder <= kCapBytes, "a second buffer of this size must fit under the cap");
+
+    const size_t misses_before_setup = cache->onednn_graph_scratch_pool_miss_count();
+    void *       ptr1                = cache->onednn_graph_scratch_alloc(kSizeInOrder, 256, &q);
+    check(ptr1 != nullptr, "in-order reuse setup allocation succeeds");
+    check(cache->onednn_graph_scratch_pool_miss_count() == misses_before_setup + 1,
+          "the setup allocation was a DIRECT-path pool miss, not served from the ONEDNN zone");
+    if (!ptr1) {
+        return;
+    }
+
+    // The previous consumer: a slow kernel, then a write through ptr1. The
+    // release event is that write, the way oneDNN passes the event of the
+    // last command that touches the buffer.
+    const auto          submit_start = std::chrono::steady_clock::now();
+    slow_release_result slow         = submit_slow_release(q);
+    sycl::event         old_write    = q.memset(ptr1, 0x11, kProbeBytes);
+    cache->onednn_graph_scratch_free(ptr1, &old_write);
+    const int32_t first_slot      = cache->onednn_graph_scratch_pool_entry_flag_slot_for_test(kSizeInOrder);
+    const size_t  free_after_park = cache->onednn_graph_scratch_flag_slot_free_list_size_for_test();
+    check(first_slot >= 0, "the park armed a completion flag slot");
+
+    const size_t    hits_before        = cache->onednn_graph_scratch_pool_hit_count();
+    const size_t    misses_before      = cache->onednn_graph_scratch_pool_miss_count();
+    const size_t    outstanding_before = cache->onednn_graph_scratch_direct_outstanding_bytes();
+    void *          ptr2               = cache->onednn_graph_scratch_alloc(kSizeInOrder, 256, &q);
+    const long long reuse_ms           = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - submit_start).count());
+    printf("    (handed back %lld ms after the slow kernel was submitted, release duration (calibrated)=%lld ms)\n",
+           reuse_ms, slow.duration_ms);
+
+    check(ptr2 == ptr1, "the in-flight entry was handed straight back: same pointer");
+    check(cache->onednn_graph_scratch_pool_hit_count() == hits_before + 1, "the request counted as a pool hit");
+    check(cache->onednn_graph_scratch_pool_miss_count() == misses_before, "the request did not count as a miss");
+    check(cache->onednn_graph_scratch_direct_outstanding_bytes() == outstanding_before,
+          "no second buffer was allocated for the same shape: outstanding DIRECT bytes are unchanged");
+    check(reuse_ms < slow.duration_ms / 3,
+          "the entry was handed back while the previous consumer's kernel still ran, without waiting for it");
+    check(cache->onednn_graph_scratch_flag_slot_free_list_size_for_test() == free_after_park + 1,
+          "the early exit returned the entry's flag slot to the free list instead of retiring it");
+
+    if (ptr2 != ptr1) {
+        // The completion-gated arm: ptr2 is a fresh buffer. Release it and
+        // let the slow kernel finish so the next test starts on an idle
+        // queue.
+        if (ptr2) {
+            cache->onednn_graph_scratch_free(ptr2, nullptr);
+        }
+        old_write.wait();
+        unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown (in-order reuse)");
+        return;
+    }
+
+    // The new consumer writes and reads back through the handed-back buffer,
+    // then frees it. That re-park happens while the slow kernel still runs,
+    // so the previous marker on the returned slot is still pending when the
+    // free list hands the same slot out again (it is LIFO).
+    std::vector<unsigned char> host(kProbeBytes, 0);
+    sycl::event                new_write = q.memset(ptr2, 0x22, kProbeBytes);
+    sycl::event                readback  = q.memcpy(host.data(), ptr2, kProbeBytes);
+    cache->onednn_graph_scratch_free(ptr2, &readback);
+    const long long repark_ms = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - submit_start).count());
+    check(repark_ms < slow.duration_ms / 3,
+          "the re-park happened while the previous consumer's kernel, and so its marker, was still pending");
+    check(cache->onednn_graph_scratch_pool_entry_flag_slot_for_test(kSizeInOrder) == first_slot,
+          "the re-park armed the slot the early exit returned, so both markers target one slot");
+
+    readback.wait();
+    check(std::all_of(host.begin(), host.end(), [](unsigned char b) { return b == 0x22; }),
+          "the handed-back buffer holds the new consumer's write, not the previous consumer's");
+    try {
+        const uint64_t old_end   = old_write.get_profiling_info<sycl::info::event_profiling::command_end>();
+        const uint64_t new_start = new_write.get_profiling_info<sycl::info::event_profiling::command_start>();
+        check(new_start >= old_end, "the new consumer's write started after the previous consumer's last write ended");
+    } catch (const sycl::exception & e) {
+        printf("    (profiling timestamps unavailable: %s)\n", e.what());
+        check(false, "the cache queue reports profiling timestamps for the ordering check");
+    }
+    check(poll_flag_true(cache, kSizeInOrder),
+          "the re-parked entry reads complete once its own release ends, although its slot's previous marker "
+          "was still pending when the slot was armed again");
+
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown (in-order reuse)");
+}
+
 // llama.cpp-c6ah: standalone t_flag/t_wait diagnostic, moved out of
 // test_bounded_eviction() (its original home) after that placement was
 // found to consume the ~1500 ms delay that test's own cap-wait bound
@@ -1983,6 +2114,7 @@ int main(int, char ** argv) {
     test_oversized_request_skips_wait_loop(cache, device);
     test_in_flight_entry_is_skipped_not_waited(cache, device);
     test_reclaim_while_in_flight_retires_the_slot(cache, device);
+    test_in_flight_entry_is_reused_in_order(cache, device);
 
     // llama.cpp-c6ah: LAST, deliberately -- see this
     // function's own comment for why.
