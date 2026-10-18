@@ -34,7 +34,7 @@
 //   event completes after every earlier command, so no command still waits on the entry when its native event is reset.
 //
 // This header includes only the standard library, so tests/test-sycl-cpu-job-signal-book.cpp checks the book, the
-// gate list and the input marker's wait without a device.
+// ring's growth, the gate list and the input marker's wait without a device.
 
 #include <atomic>
 #include <chrono>
@@ -85,6 +85,22 @@ class cpu_job_signal_book {
         }
         return first;
     }
+
+    // A growth (llama.cpp-q0xu). The ring makes a new block's native events with its lock released, so it reserves the
+    // growth under the lock first: at most one is in flight, so two acquirers never both grow and the book stays
+    // within the ring's max. True when the caller now owns the growth: none was in flight and n more entries stay
+    // within max. grow_end() lets it go, whether the block was added or not.
+    bool grow_begin(uint32_t n, uint32_t max) {
+        if (growing_ || entries_.size() + n > max) {
+            return false;
+        }
+        growing_ = true;
+        return true;
+    }
+
+    void grow_end() { growing_ = false; }
+
+    bool growing() const { return growing_; }
 
     // Takes a FREE entry: ACQUIRED, with a live slot half and no device wait. False when none is free.
     bool acquire(uint32_t * id, uint32_t * generation) {
@@ -222,8 +238,75 @@ class cpu_job_signal_book {
 
     std::vector<entry>    entries_;
     std::vector<uint32_t> free_;
-    uint64_t              serial_ = 0;
+    uint64_t              serial_  = 0;
+    bool                  growing_ = false;  // a growth is reserved and its block is being made (grow_begin)
 };
+
+enum class cpu_job_signal_grow_result {
+    GREW,    // the block was made and its entries added; the lock was not let go since
+    FULL,    // n more entries would pass the ring's max
+    BUSY,    // another growth is in flight; this caller neither starts one nor waits for it
+    FAILED,  // making the block failed, and the reservation is let go
+    GONE,    // the ring stopped being live while the block was made: publish() refused it
+};
+
+// Grows `book` by one block of n entries for its ring (llama.cpp-q0xu). `lock` is the std::unique_lock that holds the
+// ring's lock; it holds it on entry and again on return, a throw included.
+//
+// Why. The job's own signal takes the ring's lock, and making a block calls the driver (zeEventPoolCreate and
+// zeEventCreate), which may block behind a host wait on another thread that holds the driver's device lock behind
+// that very job: the llama.cpp-42zj cycle, with the acquiring thread in it. So make() runs with the lock released, as
+// the ring's wrap() and recycle() make their driver calls. Before it, under the lock, the growth is reserved in the
+// book, so an acquirer arriving meanwhile gets BUSY rather than a second growth or a wait, and *outside (the ring's
+// count of its driver calls with the lock released) is raised, so a shutdown meanwhile destroys no native object.
+// After it the lock is taken again and *outside lowered; publish() then adds the block's native objects to the ring
+// and returns whether it did (false when the ring is no longer live), and only then does the book gain the n entries,
+// so no entry exists without its native event.
+template <typename Lock, typename Make, typename Publish>
+cpu_job_signal_grow_result cpu_job_signal_grow(Lock &                lock,
+                                               cpu_job_signal_book & book,
+                                               uint32_t *            outside,
+                                               uint32_t              n,
+                                               uint32_t              max,
+                                               Make &&               make,
+                                               Publish &&            publish) {
+    if (book.growing()) {
+        return cpu_job_signal_grow_result::BUSY;
+    }
+    if (!book.grow_begin(n, max)) {
+        return cpu_job_signal_grow_result::FULL;
+    }
+    *outside += 1;
+    lock.unlock();
+    bool made = false;
+    try {
+        made = make();
+    } catch (...) {
+        lock.lock();
+        *outside -= 1;
+        book.grow_end();
+        throw;
+    }
+    lock.lock();
+    *outside -= 1;
+    if (!made) {
+        book.grow_end();
+        return cpu_job_signal_grow_result::FAILED;
+    }
+    bool published = false;
+    try {
+        published = publish();
+    } catch (...) {
+        book.grow_end();
+        throw;
+    }
+    book.grow_end();
+    if (!published) {
+        return cpu_job_signal_grow_result::GONE;
+    }
+    (void) book.add(n);
+    return cpu_job_signal_grow_result::GREW;
+}
 
 // The gates of one ring (llama.cpp-qwn5): the future of each CPU expert job the device waits on its own event, so that
 // a host thread about to wait on the device behind such a job first sleeps until the job is done.

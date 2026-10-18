@@ -92,8 +92,16 @@ THE CONTRACT.  With comments and string literals blanked:
       job.  wrap makes its event and recycle resets its events outside every mutex_ scope, each call counted in
       outside_calls_ (raised before it and lowered after it); the book (consume, begin_flush, recycle_begin,
       recycle_finish) and outside_calls_ change only under mutex_; recycle does not use the book's one-lock recycle;
-      and shutdown destroys native objects only inside `if (outside_calls_ == 0)`.  grow_locked, which creates pools
-      and events under mutex_, is outside this pin (llama.cpp-q0xu).
+      and shutdown destroys native objects only inside `if (outside_calls_ == 0)`.  The ring grows the same way
+      (llama.cpp-q0xu): every pool_create and event_create of the ring sits in the make lambda its one
+      grow(std::unique_lock<std::timed_mutex> &) hands to cpu_job_signal_grow (cpu-job-signal.hpp), with
+      &outside_calls_, block_events and max_events; that lambda takes no mutex_ and touches no lock, and the publish
+      lambda first returns false when the ring is not live_.  cpu_job_signal_grow answers BUSY to a growth in flight
+      and reserves its own (book.grow_begin, which refuses while growing_) before anything else; raises *outside once,
+      before it releases the lock; releases it once, before its one make(), and takes it again only after; lowers
+      *outside right after each lock.lock(); publishes only after the last lock.lock() and adds the entries to the
+      book (book.add, once) only after the publish; and every way out after *outside is raised, a throw included, lets
+      the reservation go (book.grow_end) in its own block or in an enclosing one before it.
   W9. The event-chained hybrid route's job waits for its experts' leases: when record->has_ready, the job's inputs
       take record->ready, the barrier over the leases' producer events, before the prologue is built.  Its marker
       would follow that barrier on the in-order stream anyway, but a refused arm waits exactly the inputs on the
@@ -123,6 +131,8 @@ RED on 1bc3bbb1e (the base before this fix):
   sycl::event::wait; the worker's input wait may call only cpu_expert_pool_trace_stamp_inputs_ready, ...
 RED for W8 alone, on the commit that added W1-W7:
   FAIL [pin W8]: cpu_job_signal_ring::wrap makes its event under mutex_ ...
+RED for the growth (W8, llama.cpp-q0xu) on 8b5946b53, whose grow_locked creates the pool and events under mutex_:
+  FAIL [pin W8]: cpu_job_signal_ring creates pools or events (2 pool_create/event_create call(s)) outside a grow ...
 RED for the readers drain and the slow-wait report, on 2b5fb934a (the commit that added W8):
   FAIL [pin W7]: cpu_job_input_marker_seen does not count itself in readers (seq_cst), then test abandoned ...
 The resolve-step scan (W6), the arm's serial, zeroing, in-order refusal, queue and cache (W7) and W9 were gaps: on
@@ -868,6 +878,147 @@ def check_ring_locks(s: dict[str, str]) -> None:
         if not guarded:
             fail("W8", "cpu_job_signal_ring::shutdown destroys native objects outside `if (outside_calls_ == 0)`: a wrap "
                        "or a recycle still in a driver call would use a destroyed event")
+    check_ring_growth(s, ring)
+
+
+GROW_SIG = r"cpu_job_signal_grow_result\s+cpu_job_signal_grow\s*\("
+GROW_BEGIN_SIG = r"bool\s+grow_begin\s*\(\s*uint32_t\s+n\s*,\s*uint32_t\s+max\s*\)\s*\{"
+RING_GROW_SIG = (r"cpu_job_signal_grow_result\s+grow\s*\(\s*std::unique_lock\s*<\s*std::timed_mutex\s*>\s*&\s*lock\s*\)"
+                 r"\s*\{")
+_CREATE = re.compile(r"\b(?:pool_create|event_create)\s*\(")
+
+
+def top_level_arg_spans(code: str, open_paren: int) -> list[tuple[int, int]]:
+    """(start, end) in `code` of each top-level argument of the call whose `(` is at open_paren."""
+    close = matching_paren(code, open_paren)
+    spans, depth, start = [], 0, open_paren + 1
+    flat = strip_strings(code)
+    for i in range(open_paren + 1, close):
+        c = flat[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            spans.append((start, i))
+            start = i + 1
+    spans.append((start, close))
+    return spans
+
+
+def lambda_span(code: str, start: int, end: int, pin: str) -> tuple[int, int]:
+    """(start, end) in `code` of the body of the lambda written between start and end."""
+    at = start + len(code[start:end]) - len(code[start:end].lstrip())
+    if code[at] != "[":
+        fail(pin, "an argument that should be a lambda is not one")
+    close = code.index("]", at)
+    params = re.match(r"\s*\(", code[close + 1 :])
+    if not params:
+        fail(pin, "a lambda without a parameter list")
+    brace = code.index("{", matching_paren(code, close + 1 + params.end() - 1))
+    body, body_start = block_at(code, brace, pin)
+    return body_start, body_start + len(body)
+
+
+def level_text(code: str, start: int, end: int) -> str:
+    """code[start:end] without the blocks nested in it."""
+    flat, out, depth = strip_strings(code), [], 0
+    for i in range(start, end):
+        c = flat[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        elif depth == 0:
+            out.append(code[i])
+    return "".join(out)
+
+
+def released_on_the_way_out(g: str, exit_at: int, reserved_at: int) -> bool:
+    """Whether book.grow_end() runs before the exit at exit_at, in its block or an enclosing one, after the
+    reservation."""
+    pos = exit_at
+    while True:
+        open_at = enclosing_brace(g, pos)
+        start = max(open_at + 1 if open_at >= 0 else 0, reserved_at)
+        if re.search(r"\bbook\s*\.\s*grow_end\s*\(", level_text(g, start, pos)):
+            return True
+        if open_at < 0 or open_at < reserved_at:
+            return False
+        pos = open_at
+
+
+def check_ring_growth(s: dict[str, str], ring: str) -> None:
+    """W8, the ring's growth (llama.cpp-q0xu): the driver calls that make a block run with mutex_ released."""
+    created = [m.start() for m in _CREATE.finditer(ring)]
+    found = list(re.finditer(RING_GROW_SIG, ring))
+    if len(found) != 1:
+        fail("W8", f"cpu_job_signal_ring creates pools or events ({len(created)} pool_create/event_create call(s)) "
+                   "outside a grow(std::unique_lock<std::timed_mutex> &) that hands them to cpu_job_signal_grow: they "
+                   "run under mutex_, which the job's own signal takes (llama.cpp-q0xu)")
+    body, base = block_at(ring, ring.index("{", found[0].end() - 1), "W8")
+    grows = list(re.finditer(r"\bcpu_job_signal_grow\s*\(", body))
+    if len(grows) != 1:
+        fail("W8", f"cpu_job_signal_ring::grow calls cpu_job_signal_grow {len(grows)} times, not once (llama.cpp-q0xu)")
+    spans = [(base + a, base + b) for a, b in top_level_arg_spans(body, grows[0].end() - 1)]
+    args = [nospace(ring[a:b]) for a, b in spans]
+    if len(args) != 7 or args[0] != "lock" or args[1] != "book_" or args[2] != "&outside_calls_" or \
+            args[3] != "block_events" or args[4] != "max_events":
+        fail("W8", "cpu_job_signal_ring::grow does not call cpu_job_signal_grow(lock, book_, &outside_calls_, "
+                   "block_events, max_events, make, publish): the growth would not be counted where shutdown looks, "
+                   "or would not keep the ring's capacity (llama.cpp-q0xu)")
+    make_a, make_b = lambda_span(ring, spans[5][0], spans[5][1], "W8")
+    if not created or any(not (make_a <= c < make_b) for c in created) or \
+            not re.search(r"\bpool_create\s*\(", ring[make_a:make_b]) or \
+            not re.search(r"\bevent_create\s*\(", ring[make_a:make_b]):
+        fail("W8", "cpu_job_signal_ring creates a pool or an event outside the make lambda of its growth, the one "
+                   "place that runs with mutex_ released (llama.cpp-q0xu)")
+    make = ring[make_a:make_b]
+    if _RING_LOCK.search(make) or re.search(r"\bmutex_\b|\block\b", make):
+        fail("W8", "cpu_job_signal_ring::grow's make lambda takes mutex_ or touches the lock: the block's driver "
+                   "calls would run under the lock the job's own signal takes (llama.cpp-q0xu)")
+    pub_a, _ = lambda_span(ring, spans[6][0], spans[6][1], "W8")
+    if not re.match(r"\s*if\s*\(\s*!\s*live_\s*\)\s*\{\s*return\s+false\s*;\s*\}", ring[pub_a:]):
+        fail("W8", "cpu_job_signal_ring::grow's publish lambda does not first refuse a ring that is no longer live: a "
+                   "block made while the ring was shut down would be published into it (llama.cpp-q0xu)")
+
+    hdr = s["header"]
+    _, g = definition(hdr, GROW_SIG, "W8")
+    unlock = [m.start() for m in re.finditer(r"\block\s*\.\s*unlock\s*\(\s*\)\s*;", g)]
+    relock = [m.start() for m in re.finditer(r"\block\s*\.\s*lock\s*\(\s*\)\s*;", g)]
+    makes = [m.start() for m in re.finditer(r"\bmake\s*\(\s*\)", g)]
+    if len(unlock) != 1 or len(makes) != 1 or not relock or not (unlock[0] < makes[0] < min(relock)):
+        fail("W8", "cpu_job_signal_grow does not release the ring's lock once, before its one make(), and take it "
+                   "again only after: the driver calls that make a block would run under mutex_ (llama.cpp-q0xu)")
+    busy = re.search(r"\bif\s*\(\s*book\s*\.\s*growing\s*\(\s*\)\s*\)\s*\{\s*return\s+"
+                     r"cpu_job_signal_grow_result\s*::\s*BUSY\s*;\s*\}", g)
+    begin = [m.start() for m in re.finditer(r"\bbook\s*\.\s*grow_begin\s*\(", g)]
+    up = [m.start() for m in re.finditer(r"\*\s*outside\s*\+=\s*1\s*;", g)]
+    if not busy or len(begin) != 1 or len(up) != 1 or not (busy.start() < begin[0] < up[0] < unlock[0]):
+        fail("W8", "cpu_job_signal_grow does not answer BUSY to a growth in flight, then reserve its own (grow_begin), "
+                   "then raise *outside, all before it releases the lock: two acquirers could both grow, one could "
+                   "wait on the other's driver calls, or a shutdown meanwhile could destroy objects under the "
+                   "creation (llama.cpp-q0xu)")
+    _, gb = definition(hdr, GROW_BEGIN_SIG, "W8")
+    if not re.search(r"\bif\s*\(\s*growing_\s*\|\|", gb):
+        fail("W8", "cpu_job_signal_book::grow_begin reserves a growth while another is in flight (llama.cpp-q0xu)")
+    down = [m.start() for m in re.finditer(r"\*\s*outside\s*-=\s*1\s*;", g)]
+    lowered = [re.match(r"\s*\*\s*outside\s*-=\s*1\s*;", g[g.index(";", r) + 1 :]) is not None for r in relock]
+    if len(down) != len(relock) or not all(lowered):
+        fail("W8", "cpu_job_signal_grow does not lower *outside right after each lock.lock(): a path back under the "
+                   "lock would leave the ring's driver calls counted, and shutdown would leak for good "
+                   "(llama.cpp-q0xu)")
+    publish = [m.start() for m in re.finditer(r"\bpublish\s*\(\s*\)", g)]
+    adds = [m.start() for m in re.finditer(r"\bbook\s*\.\s*add\s*\(", g)]
+    if len(publish) != 1 or len(adds) != 1 or not (max(relock) < publish[0] < adds[0]):
+        fail("W8", "cpu_job_signal_grow does not publish the block with the lock held again and only then add its "
+                   "entries to the book: an entry could exist without its native event (llama.cpp-q0xu)")
+    # The reservation holds from the statement after grow_begin's refusal, whose first step raises *outside.
+    for m in re.finditer(r"\b(?:return\b[^;]*|throw\s*);", g):
+        exit_text = re.sub(r"\s+", " ", m.group(0))
+        if m.start() > up[0] and not released_on_the_way_out(g, m.start(), up[0]):
+            fail("W8", f"cpu_job_signal_grow leaves through `{exit_text}` with its growth still reserved: "
+                       "every later acquirer would be told BUSY for good (llama.cpp-q0xu)")
 
 
 def nospace(text: str) -> str:
@@ -1303,6 +1454,46 @@ def mutants() -> list:
          sub(re.escape("native = events_[id];\n            outside_calls_ += 1;"), "native = events_[id];")),
         ("W8", "cache", "shutdown destroys under a driver call",
          sub(re.escape("if (outside_calls_ == 0) {"), "if (true) {")),
+        # W8: the ring's growth makes its block with mutex_ released (llama.cpp-q0xu).
+        ("W8", "header", "the growth makes its block under the lock",
+         sub(re.escape("    lock.unlock();\n    bool made = false;"), "    bool made = false;")),
+        ("W8", "header", "the growth releases the lock only after make",
+         sub(re.escape("    lock.unlock();\n    bool made = false;\n    try {\n        made = make();"),
+             "    bool made = false;\n    try {\n        made = make();\n        lock.unlock();")),
+        ("W8", "header", "the growth is not counted outside",
+         sub(re.escape("    *outside += 1;\n"), "")),
+        ("W8", "header", "the growth raises the count after it released the lock",
+         sub(re.escape("    *outside += 1;\n    lock.unlock();"), "    lock.unlock();\n    *outside += 1;")),
+        ("W8", "header", "a throwing make leaves the count raised",
+         sub(re.escape("        lock.lock();\n        *outside -= 1;\n        book.grow_end();\n        throw;"),
+             "        lock.lock();\n        book.grow_end();\n        throw;")),
+        ("W8", "header", "a second acquirer is not told BUSY",
+         sub(r"\n    if \(book\.growing\(\)\) \{\n\s*return cpu_job_signal_grow_result::BUSY;\n    \}", "")),
+        ("W8", "header", "the book reserves over a growth in flight",
+         sub(re.escape("if (growing_ || entries_.size() + n > max) {"), "if (entries_.size() + n > max) {")),
+        ("W8", "header", "the entries are added before the block is published",
+         sub(re.escape("    *outside += 1;\n    lock.unlock();"),
+             "    (void) book.add(n);\n    *outside += 1;\n    lock.unlock();")),
+        ("W8", "header", "a block that was not made keeps its reservation",
+         sub(re.escape("    if (!made) {\n        book.grow_end();\n"), "    if (!made) {\n")),
+        ("W8", "header", "a refused block keeps its reservation",
+         sub(re.escape("    book.grow_end();\n    if (!published) {"), "    if (!published) {")),
+        ("W8", "header", "a throwing publish keeps its reservation",
+         sub(re.escape("        published = publish();\n    } catch (...) {\n        book.grow_end();\n        throw;"),
+             "        published = publish();\n    } catch (...) {\n        throw;")),
+        ("W8", "cache", "the ring creates a pool outside its growth",
+         sub(re.escape("if (ring->grow(lock) != cpu_job_signal_grow_result::GREW) {"),
+             "if (l0.pool_create(zctx, nullptr, 0, nullptr, nullptr) != ZE_RESULT_SUCCESS ||\n"
+             "                ring->grow(lock) != cpu_job_signal_grow_result::GREW) {")),
+        ("W8", "cache", "the ring's make lambda takes mutex_",
+         sub(re.escape("[this, &pool, &made]() {\n                made.reserve(block_events);"),
+             "[this, &pool, &made]() {\n                std::lock_guard<std::timed_mutex> held(mutex_);\n"
+             "                made.reserve(block_events);")),
+        ("W8", "cache", "the growth is counted somewhere shutdown does not look",
+         sub(re.escape("&outside_calls_, block_events"), "&growth_calls_, block_events")),
+        ("W8", "cache", "the growth publishes into a ring no longer live",
+         sub(r"\[this, &pool, &made\]\(\) \{\n\s*if \(!live_\) \{\n\s*return false;\n\s*\}",
+             "[this, &pool, &made]() {")),
     ]
 
 
