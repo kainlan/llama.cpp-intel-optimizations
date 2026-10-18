@@ -20,13 +20,14 @@ reaches neither G nor 0x37fd10 (a direct-call walk that does find G from hostSyn
 so a job that makes no other driver call cannot join the cycle.
 
 THE MARKER FOLLOWS THE KNOB (llama.cpp-nqbe).  The hang needs device work that waits on a CPU job's own signal, which
-only GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL=1 submits (llama.cpp-m5v8); with the knob off the worker's native wait never
+only GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL on submits (llama.cpp-m5v8); with the knob off the worker's native wait never
 hung.  So the marker is in play only with the knob on; with it off the prologue arms, refuses, logs and waits nothing,
 and the worker waits a job's inputs natively, as it did before the marker (W10).  The marker once cost Qwen3.8 IQ3_XXS
 decode on the B70 without -c 2.8 t/s against 9.7, with the knob off as with it on: its word sat in the host STAGING
 zone, which every graph boundary checks for emptiness, so every boundary refused and walked the allocation registry.
 The word is now a persistent owner in the WEIGHT host zone (test-sycl-host-zone-boundary-owner-source.py), and with
-the knob on the B70 then decoded at 10.10 t/s without -c, against 2.68 before and 9.28 with it off (2026-10-18).
+the knob on the B70 then decoded at 10.10 t/s without -c, against 2.68 before and 9.28 with it off (2026-10-18), so
+the knob is on by default again and =0 turns it off.
 
 THE CONTRACT.  With comments and string literals blanked:
   W1. The worker's input wait is driver-free.  moe_cpu_job_wait_inputs calls only cpu_job_input_marker_wait,
@@ -131,7 +132,7 @@ per reason (W4), and the arm's throw report outside the mutex and once per proce
 each of their mutants passes the pin as it stood on f60cc2636, with only its lock pattern widened to the
 unique_lock the arm now takes.
 RED for W10 on eaafb5b83, which arms the marker whatever the knob (Qwen3.8 decode without -c measured 2.79 t/s there
-with the knob unset, against 9.69 and 9.65 on master), while the pin as it stood passes that tree:
+with the knob unset, which was off there, against 9.69 and 9.65 on master), while the pin as it stood passes that tree:
   FAIL [pin W10]: moe_cpu_job_prologue arms the input marker whatever GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL says: ...
 """
 

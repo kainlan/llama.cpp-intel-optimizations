@@ -24557,9 +24557,9 @@ struct cpu_dispatch_result {
 //    events after its last write, and its scatter H2D copies depend on a fresh
 //    wrapper of that event, which the device waits itself (llama.cpp-qwn5);
 //  - a job the device may not wait (a graph records, the knob
-//    GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL unset or 0, no entry) is joined by a
-//    host_task on the op's in-order queue, and its scatter H2D copies depend on
-//    that host_task's event.
+//    GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL=0, no entry) is joined by a host_task
+//    on the op's in-order queue, and its scatter H2D copies depend on that
+//    host_task's event.
 // No cycle: a prologue waits only for queue work submitted before its job, a
 // join or a device wait only for a job submitted before it, and the pool runs
 // jobs in order, so every wait points back in submission order (one pool worker
@@ -24784,19 +24784,18 @@ static sycl::event moe_cpu_job_join_on_queue(sycl::queue &                      
     return join;
 }
 
-// GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL, read once (llama.cpp-qwn5): unset or 0 joins every CPU expert pool job with a
-// host task; non-zero lets the job's scatter wait on a host-signalled Level Zero event the job signals after its last
-// write, and puts the job's input marker in play (moe_cpu_job_input_marker_in_play). Default off (llama.cpp-nqbe): with
-// it on, Qwen3.8 IQ3_XXS decode on the B70 without -c (12 KV layers on the host, direct path) fell to 2.7 t/s from 9.7,
-// while at -c 4096 it rose to 13.3 from 9.0. The loss was the marker's word in the boundary-checked host STAGING zone,
-// which made every graph boundary walk the allocation registry (see moe_cpu_job_input_marker_in_play). With the word
-// in the WEIGHT host zone, the knob on measured 10.10 t/s without -c against 2.68 before and 9.28 off, and 13.15 at
-// -c 4096 against 8.94 off (2026-10-18). The first prompt graph hang that first turned it off (llama.cpp-m5v8) is
-// fixed by the input marker (llama.cpp-42zj).
+// GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL, read once (llama.cpp-qwn5): unset or non-zero lets a CPU expert pool job's
+// scatter wait on a host-signalled Level Zero event the job signals after its last write, and puts the job's input
+// marker in play (moe_cpu_job_input_marker_in_play); 0 joins every job with a host task, as before. Default on
+// (llama.cpp-nqbe): Qwen3.8 IQ3_XXS decode on the B70 (12 KV layers on the host without -c, direct path) measured
+// 10.10 t/s with it on against 9.28 off without -c, and 13.15 against 8.94 at -c 4096 (2026-10-18). It was off while
+// the marker's word sat in the boundary-checked host STAGING zone, which made every graph boundary walk the allocation
+// registry (2.68 t/s with it on, see moe_cpu_job_input_marker_in_play). The first prompt graph hang that first turned
+// it off (llama.cpp-m5v8) is fixed by the input marker (llama.cpp-42zj).
 static bool moe_cpu_job_device_signal_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL");
-        return env != nullptr && std::atoi(env) != 0;
+        return env == nullptr || std::atoi(env) != 0;
     }();
     return enabled;
 }
