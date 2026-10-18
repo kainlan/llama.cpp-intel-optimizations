@@ -57,21 +57,22 @@ THE CONTRACT.  With comments and string literals blanked:
       32-bit distance (the modulo-2^32 invariant is stated beside it).  The wait reports a slow wait at most once,
       through the word's slow, once it has yielded for slow_after; the arm installs the cache's reporter, which only
       logs.  The device task depends on the job's inputs, then fences (release, system scope) before it stores the
-      serial.  The arm takes the cache's marker mutex first and releases it only in the submit's catch, which then
-      touches no marker member and logs the throw, once per process, so no arm waits on the log's lock behind
-      another; every refusal of the arm and of unified_cache_cpu_job_input_marker_arm names its reason right before
-      it returns, since the caller's log flag is chosen by it; the arm refuses a stream that is not in order before
-      it allocates; zeroes the word before it publishes it; takes the next serial as the last plus one; submits every
+      serial.  The arm takes the cache's marker mutex first and releases it once in the submit's catch and once on the
+      way out, after it records the serial; after either release it touches no marker member, and only after one does
+      it log: the word's creation, through cpu_job_input_marker_report_made (which only logs, at INFO, and is handed
+      the word this arm made), and in the catch the throw, once per process, so no arm waits on the log's lock behind
+      another; every refusal of the arm and of unified_cache_cpu_job_input_marker_arm names its reason right before it
+      returns, since the caller's log flag is chosen by it; the arm refuses a stream that is not in order before it
+      allocates; zeroes the word before it publishes it; takes the next serial as the last plus one; submits every
       marker on queue_, before it records the new serial; and takes its word from the unified cache as a host-pinned
       allocation.  unified_cache_cpu_job_input_marker_arm reaches the cache through moe_join_queue_cache_of(stream),
-      which returns only the cache whose queue_ is that stream.  The owner, the word's allocation, is assigned only
-      by the arm's one publish and released only through cpu_job_input_marker_end, in unified-cache.cpp and in
-      unified-cache.hpp's inline code alike: a release anywhere else would let the allocation go without the
-      abandon, under a waiter's load.  shutdown_resources, in each of its three branches (the SYCL runtime already
-      shutting down, an invalid context, and the normal one after the queues drained), ends the signal ring once and
-      then the word once, and ends neither anywhere else: the ring is no longer live once ended, so a job the
-      abandon releases signals it without a driver call, and on the two SYCL-gone branches no driver call could
-      succeed.
+      which returns only the cache whose queue_ is that stream.  The owner, the word's allocation, is assigned only by
+      the arm's one publish and released only through cpu_job_input_marker_end, in unified-cache.cpp and in
+      unified-cache.hpp's inline code alike: a release anywhere else would let the allocation go without the abandon,
+      under a waiter's load.  shutdown_resources, in each of its three branches (the SYCL runtime already shutting
+      down, an invalid context, and the normal one after the queues drained), ends the signal ring once and then the
+      word once, and ends neither anywhere else: the ring is no longer live once ended, so a job the abandon releases
+      signals it without a driver call, and on the two SYCL-gone branches no driver call could succeed.
   W8. The signal ring (cpu_job_signal_ring, unified-cache.cpp) makes no driver call that may block under mutex_, the
       lock the job's own signal takes: a host wait on another thread may hold the driver's device lock behind that
       job.  wrap makes its event and recycle resets its events outside every mutex_ scope, each call counted in
@@ -263,6 +264,7 @@ HELPER_FORBIDDEN = re.compile(r"\b(?:sleep_for|sleep_until|usleep|nanosleep|lock
 SUBMIT_SIG = r"static\s+void\s+cpu_job_input_marker_submit\s*\(([^)]*)\)\s*\{"
 END_SIG = r"static\s+void\s+cpu_job_input_marker_end\s*\(([^)]*)\)\s*noexcept\s*\{"
 REPORT_SIG = r"static\s+void\s+cpu_job_input_marker_report_slow\s*\(([^)]*)\)\s*\{"
+MADE_SIG = r"static\s+void\s+cpu_job_input_marker_report_made\s*\(([^)]*)\)\s*\{"
 ARM_FN_SIG = r"bool\s+unified_cache_cpu_job_input_marker_arm\s*\(([^)]*)\)\s*\{"
 CACHE_OF_SIG = r"static\s+unified_cache\s*\*\s*moe_join_queue_cache_of\s*\(([^)]*)\)\s*\{"
 ARM_METHOD_SIG = r"bool\s+unified_cache::arm_cpu_job_input_marker\s*\(([^)]*)\)\s*\{"
@@ -610,37 +612,60 @@ def check_helpers(s: dict[str, str]) -> None:
     if bad or re.search(r"\bsycl\s*::", rep_body) or not re.search(r"\bGGML_LOG_WARN\s*\(", rep_body):
         fail("W7", "cpu_job_input_marker_report_slow runs on the pool worker and does more than log one WARN: " +
                    (", ".join(bad) if bad else "no WARN, or something in sycl::"))
+    _, made_body = definition(cache, MADE_SIG, "W7")
+    bad = sorted({q for q, n in calls(made_body) if n != "GGML_LOG_INFO"})
+    if bad or re.search(r"\bsycl\s*::", made_body) or not re.search(r"\bGGML_LOG_INFO\s*\(", made_body):
+        fail("W7", "cpu_job_input_marker_report_made does more than log the word's creation at INFO: " +
+                   (", ".join(bad) if bad else "no INFO, or something in sycl::"))
     check_marker_owner(s)
     check_shutdown_branches(cache)
 
 
 def check_arm_unlock(cache: str, arm: str, lock: re.Match) -> None:
-    """W7: the arm releases its mutex only in the submit's catch, which then touches no marker member, and logs the
-    throw there, once per process."""
-    unlocks = list(re.finditer(r"\b" + lock.group(1) + r"\s*\.\s*unlock\s*\(\s*\)\s*;", arm))
+    """W7: the arm releases its mutex once in the submit's catch and once on the way out, after it records the serial;
+    after either release it touches no marker member, and it logs only after one: the word's creation, through
+    cpu_job_input_marker_report_made with the word it made, and in the catch the throw, once per process."""
+    unlocks = [m.start() for m in re.finditer(r"\b" + lock.group(1) + r"\s*\.\s*unlock\s*\(\s*\)\s*;", arm)]
     catch = list(re.finditer(r"\bcatch\s*\(\s*const\s+sycl::exception\s*&\s*\w+\s*\)\s*\{", arm))
     warns = [m.start() for m in re.finditer(r"\bGGML_LOG_WARN\s*\(", arm)]
-    if len(catch) != 1 or len(unlocks) > 1:
-        fail("W7", f"unified_cache::arm_cpu_job_input_marker has {len(catch)} catch(const sycl::exception &) blocks "
-                   f"and releases its mutex {len(unlocks)} times; it catches its submit's throw once and releases "
-                   "the mutex there at most once")
+    if len(catch) != 1:
+        fail("W7", f"unified_cache::arm_cpu_job_input_marker has {len(catch)} catch(const sycl::exception &) blocks; "
+                   "it catches its submit's throw once")
     body, start = block_at(arm, catch[0].end() - 1, "W7")
     end = start + len(body)
-    held_until = unlocks[0].start() if unlocks else len(arm)
-    if unlocks and not (start <= held_until < end):
-        fail("W7", "unified_cache::arm_cpu_job_input_marker releases cpu_job_input_marker_mutex_ outside its submit's "
-                   "catch: the serial and the submit must stay under it")
-    if not warns or any(w < held_until or w >= end for w in warns):
-        fail("W7", "unified_cache::arm_cpu_job_input_marker logs a WARN with cpu_job_input_marker_mutex_ held, or "
-                   "outside its submit's catch: an arm on another thread would wait on the log's lock behind it")
+    took = re.search(r"\bcpu_job_input_marker_serial_\s*=\s*serial\s*;", arm)
+    inside = [u for u in unlocks if start <= u < end]
+    outside = [u for u in unlocks if not start <= u < end]
+    if len(inside) != 1 or len(outside) != 1 or not took or outside[0] < took.end():
+        fail("W7", "unified_cache::arm_cpu_job_input_marker releases cpu_job_input_marker_mutex_ "
+                   f"{len(inside)} time(s) in its submit's catch and {len(outside)} time(s) elsewhere; it releases it "
+                   "once in the catch and once after it records the serial, so the serial and the submit stay under it")
+    released = ((inside[0], end), (outside[0], len(arm)))
+    for m in re.finditer(r"\bGGML_LOG_\w+\s*\(|\bcpu_job_input_marker_report_made\s*\(", arm):
+        if not any(a <= m.start() < b for a, b in released):
+            fail("W7", f"unified_cache::arm_cpu_job_input_marker calls {m.group(0).rstrip('( ')} with "
+                       "cpu_job_input_marker_mutex_ held: an arm on another thread would wait on the log's lock "
+                       "behind it")
+    if not warns or any(not inside[0] <= w < end for w in warns):
+        fail("W7", "unified_cache::arm_cpu_job_input_marker logs a WARN outside its submit's catch, or none there")
+    reports = [m.start() for m in re.finditer(r"\bcpu_job_input_marker_report_made\s*\(", arm)]
+    made = re.search(r"\bmade\s*=\s*word\s*;", arm)
+    pub = re.search(r"\bcpu_job_input_marker_word_\s*=\s*std::move\s*\(\s*word\s*\)\s*;", arm)
+    if not all(any(a <= r < b for r in reports) for a, b in released) or not made or not pub or \
+       made.start() > pub.start() or \
+       any(not re.match(r"cpu_job_input_marker_report_made\s*\(\s*made\s*\.\s*get\s*\(\s*\)\s*\)", arm[r:])
+           for r in reports):
+        fail("W7", "unified_cache::arm_cpu_job_input_marker does not hand cpu_job_input_marker_report_made the word "
+                   "it made after each release: the word's creation would go unlogged")
     early = re.search(r"\bcpu_job_input_marker_\w+_\b", arm[: lock.start()])
     if early:
         fail("W7", f"unified_cache::arm_cpu_job_input_marker uses {early.group(0)} before it takes "
                    "cpu_job_input_marker_mutex_")
-    late = re.search(r"\bcpu_job_input_marker_\w+_\b", arm[held_until:end])
-    if late:
-        fail("W7", f"unified_cache::arm_cpu_job_input_marker uses {late.group(0)} after it released "
-                   "cpu_job_input_marker_mutex_")
+    for a, b in released:
+        late = re.search(r"\bcpu_job_input_marker_\w+_\b", arm[a:b])
+        if late:
+            fail("W7", f"unified_cache::arm_cpu_job_input_marker uses {late.group(0)} after it released "
+                       "cpu_job_input_marker_mutex_")
     latched = False
     for m in re.finditer(r"\bif\s*\(\s*!\s*(\w+)\s*\.\s*exchange\s*\(\s*true\b[^)]*\)\s*\)\s*\{", body):
         b, s0 = block_at(body, m.end() - 1, "W7")
@@ -856,6 +881,11 @@ def chain(*steps):
 
 def mutants() -> list:
     marker_wait = r"(\n(\s*)ggml_sycl::cpu_job_input_marker_wait\(marker\);)"
+    # The arm's two releases, each followed by the word's creation report: in the catch, then the throw's latch; on
+    # the way out, then the return.
+    catch_tail = (r"\n\s*cpu_job_input_marker_report_made\(made\.get\(\)\);"
+                  r"\n\s*if \(!g_cpu_job_input_marker_submit_threw_logged")
+    out_tail = r"\n\s*cpu_job_input_marker_report_made\(made\.get\(\)\);\n\s*return true;"
     tick = r"(ggml_sycl::cpu_job_input_marker_wait\(marker\);)\n(\s*)ggml_sycl_watchdog_heartbeat\(\);"
     arm_call = r"!ggml_sycl::unified_cache_cpu_job_input_marker_arm\(stream, inputs\.events, &marker, &why\)"
     fallback = r"\n\s*sycl::event::wait\(inputs\.events\);"
@@ -999,9 +1029,8 @@ def mutants() -> list:
          sub(r"sycl::atomic_fence\(sycl::memory_order::release, sycl::memory_scope::system\)",
              r"sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device)")),
         ("W7", "cache", "the serial is submitted outside the lock",
-         sub(r"\n(\s*)std::unique_lock<std::mutex> lock\(cpu_job_input_marker_mutex_\);\n(\s*)if \(!cpu_job_input_marker_word_\)",
-             r"\n\1{\n\1    std::unique_lock<std::mutex> lock(cpu_job_input_marker_mutex_);\n\1}\n\2"
-             r"if (!cpu_job_input_marker_word_)")),
+         sub(r"\n(\s*)std::unique_lock<std::mutex> lock\(cpu_job_input_marker_mutex_\);\n",
+             r"\n\1{\n\1    std::unique_lock<std::mutex> lock(cpu_job_input_marker_mutex_);\n\1}\n")),
         ("W7", "cache", "the serial is consumed before the submit",
          move(r"\n\s*cpu_job_input_marker_serial_ = serial;", r"\n\s*try \{\n\s*cpu_job_input_marker_submit\(")),
         ("W7", "cache", "the word is not host-pinned",
@@ -1014,27 +1043,47 @@ def mutants() -> list:
          sub(r"const uint32_t serial = cpu_job_input_marker_serial_ \+ 1;", r"const uint32_t serial = 1;")),
         ("W7", "cache", "the word is not zeroed", sub(r"\n\s*\*word->ptr\s*= 0;", "")),
         ("W7", "cache", "the word is zeroed after it is published",
-         move(r"\n\s*\*word->ptr\s*= 0;", r"\n\s*GGML_LOG_INFO\(\n\s*\"\[MOE-INPUT-MARKER\] CPU expert jobs wait")),
+         move(r"\n\s*\*word->ptr\s*= 0;", r"\n\s*\}\n\s*const uint32_t serial = cpu_job_input_marker_serial_ \+ 1;")),
         ("W7", "cache", "an out-of-order stream is not refused",
          sub(r"\n\s*if \(!queue_\.has_property<sycl::property::queue::in_order>\(\)\) \{\n\s*"
              r"\*why = CPU_JOB_INPUT_MARKER_REFUSAL_NOT_IN_ORDER;[^}]*\}", "")),
         # A throwing submit is logged with the mutex released, once per process, and every refusal names its reason.
         ("W7", "cache", "the throw is logged with the mutex held",
-         sub(r"\n\s*lock\.unlock\(\);(\n\s*if \(!g_cpu_job_input_marker_submit_threw_logged)", r"\1")),
+         sub(r"\n\s*lock\.unlock\(\);(" + catch_tail + r")", r"\1")),
         ("W7", "cache", "the throw is logged before the mutex is released",
-         move(r"\n\s*lock\.unlock\(\);(?=\n\s*if \(!g_cpu_job_input_marker_submit_threw_logged)",
+         move(r"\n\s*lock\.unlock\(\);(?=" + catch_tail + r")",
               r"\n\s*\*why = CPU_JOB_INPUT_MARKER_REFUSAL_SUBMIT_THREW;")),
         ("W7", "cache", "every throw is logged",
          sub(r"if \(!g_cpu_job_input_marker_submit_threw_logged\.exchange\(true, std::memory_order_acq_rel\)\)", r"if (true)")),
         ("W7", "cache", "the arm releases its mutex before the submit",
-         move(r"\n\s*lock\.unlock\(\);(?=\n\s*if \(!g_cpu_job_input_marker_submit_threw_logged)",
+         move(r"\n\s*lock\.unlock\(\);(?=" + catch_tail + r")",
               r"\n\s*try \{\n\s*cpu_job_input_marker_submit\(")),
         ("W7", "cache", "the arm reads a member before it locks",
          sub(r"(\n(\s*)std::unique_lock<std::mutex> lock\(cpu_job_input_marker_mutex_\);)",
              r"\n\2(void) cpu_job_input_marker_serial_;\1")),
         ("W7", "cache", "the catch reads a member after the release",
-         sub(r"(\n(\s*)lock\.unlock\(\);)(\n\s*if \(!g_cpu_job_input_marker_submit_threw_logged)",
+         sub(r"(\n(\s*)lock\.unlock\(\);)(" + catch_tail + r")",
              r"\1\n\2cpu_job_input_marker_tried_ = false;\3")),
+        # The word's creation is logged after a release too, through the report, with the word this arm made.
+        ("W7", "cache", "the word's creation is logged with the mutex held",
+         chain(sub(r"\n\s*made\s*= word;", ""),
+               sub(r"(\n(\s*)cpu_job_input_marker_word_  = std::move\(word\);)",
+                   r'\1\n\2GGML_LOG_INFO("[MOE-INPUT-MARKER] CPU expert jobs wait their inputs on a '
+                   r'device-written word on device %d (llama.cpp-42zj)\\n", device);'))),
+        ("W7", "cache", "the way out reports the word before the release",
+         move(r"\n\s*lock\.unlock\(\);(?=" + out_tail + r")",
+              r"(?<=cpu_job_input_marker_report_made\(made\.get\(\)\);)\n\s*return true;")),
+        ("W7", "cache", "the catch reports the word before the release",
+         sub(r"(\n\s*lock\.unlock\(\);)(\n\s*cpu_job_input_marker_report_made\(made\.get\(\)\);)"
+             r"(?=\n\s*if \(!g_cpu_job_input_marker_submit_threw_logged)", r"\2\1")),
+        ("W7", "cache", "the way out reads a member after the release",
+         sub(r"(\n(\s*)lock\.unlock\(\);)(" + out_tail + r")",
+             r"\1\n\2(void) cpu_job_input_marker_serial_;\3")),
+        ("W7", "cache", "the way out does not report the word",
+         sub(r"\n\s*cpu_job_input_marker_report_made\(made\.get\(\)\);(?=\n\s*return true;)", "")),
+        ("W7", "cache", "the report is never handed the word", sub(r"\n\s*made\s*= word;", "")),
+        ("W7", "cache", "the report logs more than its INFO",
+         sub(r"(\n(\s*)w->device\);)", r"\1\n\2(void) sycl::queue{};")),
         ("W7", "cache", "a failed allocation does not name its reason",
          sub(r"\n\s*\*why = CPU_JOB_INPUT_MARKER_REFUSAL_ALLOC_FAILED;", "")),
         ("W7", "cache", "a stream that is not a cache's does not name its reason",

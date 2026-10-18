@@ -3498,7 +3498,7 @@ class unified_cache {
     // made on first use; the serial is the next one, and the marker's device task is submitted under the same lock,
     // so on the in-order queue_ the word only advances. False, leaving *out unarmed and *why naming the reason, when
     // queue_ is not in order, the word cannot be made (tried once) or was let go at teardown, or the submit throws;
-    // the first throw in the process is logged once the lock is released. Never waits.
+    // the word's creation and the first throw in the process are logged once the lock is released. Never waits.
     // Reached through unified_cache_cpu_job_input_marker_arm().
     bool arm_cpu_job_input_marker(const std::vector<sycl::event> & after,
                                   cpu_job_input_marker *           out,

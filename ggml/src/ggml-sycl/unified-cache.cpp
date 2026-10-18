@@ -17505,6 +17505,18 @@ static void cpu_job_input_marker_report_slow(const cpu_job_input_marker_word & w
         serial, w.device, waited_s);
 }
 
+// The word's creation report, made by the arm that made it (w is that word) once the arm has released
+// cpu_job_input_marker_mutex_: a log callback may take a lock of its own, and an arm on another thread would wait on it
+// behind the mutex. Null when the arm made no word.
+static void cpu_job_input_marker_report_made(const cpu_job_input_marker_word * w) {
+    if (w) {
+        GGML_LOG_INFO(
+            "[MOE-INPUT-MARKER] CPU expert jobs wait their inputs on a device-written word on device %d "
+            "(llama.cpp-42zj)\n",
+            w->device);
+    }
+}
+
 // Set by the first input marker whose submit threw, in any cache: that throw is logged, the later ones are not.
 static std::atomic<bool> g_cpu_job_input_marker_submit_threw_logged{ false };
 
@@ -17512,6 +17524,8 @@ bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & af
                                              cpu_job_input_marker *           out,
                                              cpu_job_input_marker_refusal *   why) {
     std::unique_lock<std::mutex> lock(cpu_job_input_marker_mutex_);
+    // The word this arm makes, if it makes one, reported once the mutex is released.
+    std::shared_ptr<cpu_job_input_marker_word> made;
     if (!cpu_job_input_marker_word_) {
         if (cpu_job_input_marker_tried_) {
             *why = CPU_JOB_INPUT_MARKER_REFUSAL_NO_WORD;
@@ -17550,12 +17564,9 @@ bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & af
         word->device                = device;
         word->slow                  = cpu_job_input_marker_report_slow;
         *word->ptr                  = 0;
+        made                        = word;
         cpu_job_input_marker_owner_ = std::move(owner);
         cpu_job_input_marker_word_  = std::move(word);
-        GGML_LOG_INFO(
-            "[MOE-INPUT-MARKER] CPU expert jobs wait their inputs on a device-written word on device %d "
-            "(llama.cpp-42zj)\n",
-            device);
     }
     const uint32_t serial = cpu_job_input_marker_serial_ + 1;
     try {
@@ -17564,6 +17575,7 @@ bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & af
         // Logged with the mutex released, so an arm on another thread does not wait on the log's lock, and once per
         // process: a stream that throws once throws on every job.
         lock.unlock();
+        cpu_job_input_marker_report_made(made.get());
         if (!g_cpu_job_input_marker_submit_threw_logged.exchange(true, std::memory_order_acq_rel)) {
             GGML_LOG_WARN(
                 "[MOE-INPUT-MARKER] submitting a CPU expert job's input marker threw: %s; later throws are not "
@@ -17576,6 +17588,8 @@ bool unified_cache::arm_cpu_job_input_marker(const std::vector<sycl::event> & af
     cpu_job_input_marker_serial_ = serial;
     out->word                    = cpu_job_input_marker_word_;
     out->serial                  = serial;
+    lock.unlock();
+    cpu_job_input_marker_report_made(made.get());
     return true;
 }
 
