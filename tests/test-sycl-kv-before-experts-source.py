@@ -135,7 +135,7 @@ INVENTORY_STRUCT = "struct ggml_sycl_tensor_inventory {"
 
 DENSE_LOOP = "for (const auto & [layer_id, indices] : dense_layer_indices) {"
 LAYER_KV_CALL = "plan_single_device_layer_kv(plan, kv_info, layer_has_attention, device_id, remaining);"
-ROOM_CALL = "room = hold_kv_context_room(plan, kv_info, device_id, n_experts, remaining);"
+ROOM_CALL = "room = hold_kv_context_room(plan, kv_info, device_id, n_experts, room_expert_rate, remaining);"
 EXPERT_PASS = "auto moe_groups = build_moe_triplet_groups(plan, moe_indices, &hotness_source);"
 WEIGHTS_ONLY = "on_device = weight_charge <= remaining; target = on_device ? device_id : -1; kv_on_device = false;"
 
@@ -336,7 +336,8 @@ def claim_api_carries_the_hint(llama_h: str, model: str) -> bool:
 
 
 COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_params & params)"
-COMMON_HINT = "mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : LLAMA_N_CTX_HINT_DEFAULT;"
+COMMON_HINT = ("mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : "
+               "params.n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;")
 COMMON_FIT = "common_fit_params(params.model.path.c_str(), &mparams, &cparams,"
 FIT_REFRESH = "mparams.n_ctx_hint = cparams.n_ctx;"
 COMMON_FIT_REFRESH = "if (cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
@@ -344,9 +345,10 @@ COMMON_LOAD = "llama_model * model = llama_model_load_from_file(params.model.pat
 
 
 def claim_common_hands_the_requested_context(common: str) -> bool:
-    """common passes -c as the hint, and without -c the model's default context (llama.cpp-7fmt). After a fit, which
-    may shrink a requested context or resolve the default one itself, the hint is the context the fit left in
-    cparams, before the model loads; a fit that resolved none (the SYCL build's fit is a no-op) keeps the default."""
+    """common passes -c as the hint, without -c (or with -c 0) the model's default context, and for a negative -c no
+    room (llama.cpp-7fmt). After a fit, which may shrink a requested context or resolve the default one itself, the
+    hint is the context the fit left in cparams, before the model loads; a fit that resolved none (the SYCL build's
+    fit is a no-op) keeps the default."""
     n = norm(common)
     b = body(n, COMMON_SIG)
     return (bool(b) and COMMON_HINT in b and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD)
@@ -535,7 +537,7 @@ def test_mutant_room_line_only_info_fails():
 
 
 def test_mutant_no_room_line_missing_fails():
-    """A run without -c says nothing, so the gate cannot tell it held no room."""
+    """A load with no request (hint 0) says nothing, so the gate cannot tell it held no room."""
     assert not claim_room_line_is_visible_and_names_its_source(_once(CACHE, NO_ROOM, ""))
 
 

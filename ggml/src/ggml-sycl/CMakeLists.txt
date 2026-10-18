@@ -2224,6 +2224,25 @@ set_tests_properties(sycl-layer-streaming-gate PROPERTIES
     TIMEOUT 60
 )
 
+# KV context room cost (llama.cpp-w013, llama.cpp-7fmt): kv-room-cost.hpp is the
+# per-layer arithmetic hold_kv_context_room weighs with, plus the measured CPU
+# expert rates and the split mapping. Header-only; it includes ggml.h for
+# ggml_type and calls nothing in ggml-base, so the test needs no -fsycl and links
+# nothing. It pins the measured GPT-OSS and Qwen3.8 shapes against the measured
+# decode verdicts (ticket comments c-ncj4, c-plz8).
+add_executable(test-kv-room-cost
+    tests/test-kv-room-cost.cpp
+)
+target_include_directories(test-kv-room-cost PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+add_test(NAME sycl-kv-room-cost COMMAND test-kv-room-cost)
+set_tests_properties(sycl-kv-room-cost PROPERTIES
+    LABELS "sycl;kv;planner;hostonly"
+    TIMEOUT 60
+)
+
 # TKV-13 (B2) step 1: the DAG-consumption check that will let the SYCL
 # backend defer a pending host-computed demoted-layer attention result
 # instead of blocking on it (docs/plans/2026-08-27-tkv13-b2-addendum.md

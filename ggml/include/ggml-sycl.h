@@ -355,7 +355,7 @@ struct ggml_sycl_tensor_inventory {
     // context the caller is about to create (llama_model_params::n_ctx_hint), padded as llama_context pads n_ctx for
     // a single sequence; a caller that names no n_ctx asks for the model's default context, n_ctx_train
     // (n_ctx_context_is_default, llama.cpp-7fmt). 0 = no request reached the load: no room is held. libllama and
-    // libggml-sycl must be rebuilt together for the planner to see it (see kv_idx_k_width_per_layer for the layout).
+    // libggml-sycl must be rebuilt together for the planner to see it (see n_ctx_context_is_default for the layout).
     uint32_t                       n_ctx_context;
     // llama.cpp-8ecj: the key width of each layer's indexer key cache (llama_memory_hybrid_idx, qwen4exp: one key head
     // of indexer_head_size, no V) [kv_layer_count]; 0 where a layer has none. NULL and an all-zero array both mean no
@@ -368,11 +368,14 @@ struct ggml_sycl_tensor_inventory {
     // widths. libllama and libggml-sycl must be rebuilt together.
     const uint32_t *               kv_idx_k_width_per_layer;
     // llama.cpp-7fmt: n_ctx_context above is the model's default context (the training context, which a caller that
-    // names no n_ctx creates) rather than one the caller named. libllama resolves the hint; the backend only reads
-    // this to say, in the KV context room line, where the room's context came from. false is a named context, so a
-    // zero-initialised inventory keeps the line's wording. Appended: the struct grew from 184 to 192 bytes, which
-    // ggml-sycl.cpp pins with static_asserts; a libllama built before this field passes a 184-byte object, and
-    // libggml-sycl would read this byte past its end. libllama and libggml-sycl must be rebuilt together.
+    // names no n_ctx creates) rather than one the caller named. libllama resolves the hint. The backend says so in the
+    // KV context room line, and the decision uses it in one direction only: for the default context a routed-expert
+    // type with no measured CPU rate refuses the room instead of being priced at the fallback rate. It never makes a
+    // room held. false is a named context, so a zero-initialised inventory keeps the line's wording and the fallback
+    // rate. Appended: the struct grew from 176 to 184 bytes with kv_idx_k_width_per_layer (llama.cpp-8ecj) and from
+    // 184 to 192 with this field (llama.cpp-7fmt), which ggml-sycl.cpp pins with static_asserts. A libllama built
+    // before this field passes a 184-byte object, and libggml-sycl would read this byte past its end. libllama and
+    // libggml-sycl must be rebuilt together.
     bool                           n_ctx_context_is_default;
 };
 

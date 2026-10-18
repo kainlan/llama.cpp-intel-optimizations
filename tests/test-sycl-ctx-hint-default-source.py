@@ -12,16 +12,26 @@ creates, so it is the requested context in the sense of llama.cpp-ak0p.
 The fix this gate pins:
   - include/llama.h defines LLAMA_N_CTX_HINT_DEFAULT (0xFFFFFFFFu, distinct from 0, which keeps its meaning: no
     request, no room), and the n_ctx_hint field documents it;
-  - common asks for it when -c is absent (common_model_params_to_llama); after a fit the hint is the context the fit
-    left in cparams, and stays the default when the fit resolved none (the SYCL build's fit is a no-op); the draft
-    model of speculative decoding asks for the context its draft context is created with;
+  - common asks for it when -c is absent or 0 (common_model_params_to_llama), and for no room (0) when -c is negative;
+    after a fit the hint is the context the fit left in cparams, and stays the default when the fit resolved none (the
+    SYCL build's fit is a no-op); the draft model of speculative decoding asks for the context its draft context is
+    created with;
   - src/llama-n-ctx-hint.h resolves the hint in one place: the default to n_ctx_train padded to 256, as llama_context
     resolves n_ctx 0 to n_ctx_train and pads it; 0 to no room; any other hint padded the same way; and it says
     whether the result is the default. src/llama-model.cpp calls it once, where it fills the SYCL inventory. No C/C++
-    source outside include/llama.h, the resolver and common/common.cpp names the sentinel, so no backend sees it;
+    source outside include/llama.h, the resolver and common/common.cpp names the sentinel, so no backend sees it, and
+    no backend statement compares the hint or the context against its value spelled another way (an all-ones
+    literal, UINT32_MAX, std::numeric_limits<uint32_t>::max(), ~0u), and the backend's 0xFFFFFFFF literals are the
+    six named slot and mask constants;
   - the inventory carries the provenance (n_ctx_context_is_default, appended, with the size pins moved), the backend
-    copies it into its KV inputs next to n_ctx_context, and both KV context room lines say when n_ctx_context is the
-    model's default context, so a log reader sees why a training-context-sized room was weighed.
+    copies it into its KV inputs next to n_ctx_context, and every KV context room line says when n_ctx_context is the
+    model's default context, so a log reader sees why a training-context-sized room was weighed;
+  - the provenance enters the room's decision in one direction only: for the default context, a routed-expert type
+    with no measured CPU rate leaves the room unpriced (kv_room_expert_rate_for, kv-room-cost.hpp), and an unpriced
+    room is refused for every layer, which is the placement a load with no requested context makes. The planner reads
+    the flag for that call and for the line's note, and nowhere else in the backend reads it, so it can never make a
+    room held. Commit 1 alone weighed the default context like a named one, which held GPT-OSS 20B's room on the B50
+    and cost decode 2.4x (llama.cpp-7fmt comment c-ncj4).
 
 Every claim is checked on COMMENT-STRIPPED, whitespace-normalized text with adjacent string literals joined, and has a
 mutant that must make it fail. `--self-test` runs every mutant and names the claim each one turned red.
@@ -77,6 +87,8 @@ SYCL_H_REL = "ggml/include/ggml-sycl.h"
 SYCL_REL = "ggml/src/ggml-sycl/ggml-sycl.cpp"
 CACHE_REL = "ggml/src/ggml-sycl/unified-cache.cpp"
 CACHE_HPP_REL = "ggml/src/ggml-sycl/unified-cache.hpp"
+ROOM_COST_REL = "ggml/src/ggml-sycl/kv-room-cost.hpp"
+FATTN_REL = "ggml/src/ggml-sycl/fattn.cpp"
 BENCH_REL = "tools/llama-bench/llama-bench.cpp"
 
 
@@ -95,6 +107,14 @@ SYCL_H = read(SYCL_H_REL)
 SYCL = read(SYCL_REL)
 CACHE = read(CACHE_REL)
 CACHE_HPP = read(CACHE_HPP_REL)
+ROOM_COST = read_or_empty(ROOM_COST_REL)
+# Every C/C++ source of the SYCL backend, by path from the repository root: where a second reader of the provenance
+# would hide.
+BACKEND_TREE = {
+    p.relative_to(ROOT).as_posix(): p.read_text(errors="replace")
+    for p in sorted((ROOT / "ggml/src/ggml-sycl").rglob("*"))
+    if p.is_file() and p.suffix in (".c", ".cpp", ".h", ".hpp")
+}
 
 SENTINEL = "LLAMA_N_CTX_HINT_DEFAULT"
 # Every C/C++ source outside tests/, by path from the repository root: where a second reader of the sentinel would
@@ -185,16 +205,19 @@ def claim_api_defines_the_default(llama_h: str) -> bool:
 
 
 COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_params & params)"
-COMMON_HINT = "mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : LLAMA_N_CTX_HINT_DEFAULT;"
+COMMON_HINT = ("mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : "
+               "params.n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;")
 COMMON_FIT = "common_fit_params(params.model.path.c_str(), &mparams, &cparams,"
 COMMON_FIT_REFRESH = "if (cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
 COMMON_LOAD = "llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);"
 
 
 def claim_common_asks_for_the_default(common: str) -> bool:
-    """Without -c common asks for the model's default context. After a fit the hint is the context the fit left in
-    cparams (it is what the context is created with); a fit that resolved none (cparams.n_ctx still 0, as in the SYCL
-    build, whose fit is a no-op) keeps the default instead of overwriting it with 0. Those are the only two setters."""
+    """Without -c (or with -c 0, which the parser documents as "loaded from model") common asks for the model's
+    default context, and a negative -c, which names no context, asks for no room. After a fit the hint is the context
+    the fit left in cparams (it is what the context is created with); a fit that resolved none (cparams.n_ctx still
+    0, as in the SYCL build, whose fit is a no-op) keeps the default instead of overwriting it with 0. Those are the
+    only two setters."""
     n = norm(common)
     b = body(n, COMMON_SIG)
     return (bool(b) and COMMON_HINT in b and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD)
@@ -260,14 +283,58 @@ def claim_loader_resolves_once(model: str) -> bool:
 
 
 SENTINEL_OWNERS = {LLAMA_H_REL: 1, RESOLVER_REL: 1, COMMON_REL: 1}
+# The backend's sources outside its tests, and the public SYCL header: where the sentinel's value could be read without
+# its name.
+VALUE_TREE = {rel: text for rel, text in BACKEND_TREE.items() if not rel.startswith("ggml/src/ggml-sycl/tests/")}
+VALUE_TREE[SYCL_H_REL] = SYCL_H
+# Every spelling of 0xFFFFFFFF a backend statement could compare the hint against.
+ALL_ONES_RE = re.compile(r"\b0[xX][fF]{8}(?![0-9a-fA-F])|\bUINT32_MAX\b|std::numeric_limits<uint32_t>::max\(\)"
+                         r"|~0[uU]\b|~uint32_t\b")
+HEX_ALL_ONES_RE = re.compile(r"\b0[xX][fF]{8}(?![0-9a-fA-F])")
+CTX_NAMES_RE = re.compile(r"\bn_ctx_(?:hint|context)\b")
+# The backend's 0xFFFFFFFF literals, by file and the text before the literal: three "no model slot" values, the
+# pending-range mask of every term, and topk's sign flip. A sixth constant with this value would be a way to read the
+# sentinel by another name.
+ALL_ONES_SITES = {
+    (SYCL_H_REL, "#define GGML_SYCL_MODEL_SLOT_NONE"),
+    ("ggml/src/ggml-sycl/layer-stream-owner.hpp", "static constexpr uint32_t layer_stream_owner_slot_none ="),
+    ("ggml/src/ggml-sycl/moe-discovery-state.hpp", "static constexpr uint32_t moe_owner_slot_none ="),
+    ("ggml/src/ggml-sycl/pending-range.hpp", "constexpr pending_term_mask PENDING_TERM_ALL ="),
+    ("ggml/src/ggml-sycl/topk.cpp", "return bits ^ ((bits >> 31) ?"),
+    (CACHE_HPP_REL, "constexpr uint32_t MODEL_SLOT_NONE ="),
+}
 
 
-def claim_sentinel_has_one_reader(tree: dict[str, str]) -> bool:
+def statements(text: str) -> list[str]:
+    """The comment-stripped, whitespace-normalized statements of a source: text between ';', '{' and '}', with each
+    preprocessor line a statement of its own."""
+    lines = [";" + line + ";" if line.lstrip().startswith("#") else line for line in strip_comments(text).splitlines()]
+    flat = re.sub(r"\s+", " ", "\n".join(lines))
+    return [s.strip() for s in re.split(r"[;{}]", flat) if s.strip()]
+
+
+def backend_never_spells_the_value(value_tree: dict[str, str]) -> bool:
+    """No backend statement names the hint or the context next to an all-ones value, and every 0xFFFFFFFF literal is
+    one of the named sites, each found once."""
+    found = []
+    for rel, text in value_tree.items():
+        for s in statements(text):
+            if ALL_ONES_RE.search(s) and CTX_NAMES_RE.search(s):
+                return False
+            for m in HEX_ALL_ONES_RE.finditer(s):
+                found.append((rel, s[:m.start()].strip()))
+    return sorted(found) == sorted(ALL_ONES_SITES)
+
+
+def claim_sentinel_has_one_reader(tree: dict[str, str], value_tree: dict[str, str]) -> bool:
     """Outside tests, the sentinel is spelled by its definition, the one comparison in the resolver and the one setter
-    in common, and nowhere else: no backend, tool or second libllama site reads or sets it (one fact, one source)."""
+    in common, and nowhere else: no backend, tool or second libllama site reads or sets it (one fact, one source). Nor
+    does the backend read it by value: no statement there compares n_ctx_hint or n_ctx_context with 0xFFFFFFFF in any
+    spelling, and the backend's 0xFFFFFFFF literals are the named slot and mask constants. A constant defined from
+    UINT32_MAX and compared later is not seen; the inventory carries the provenance, so the backend has no reason to."""
     counts = {rel: norm(text).count(SENTINEL) for rel, text in tree.items()}
     counts = {rel: c for rel, c in counts.items() if c > 0}
-    return counts == SENTINEL_OWNERS
+    return counts == SENTINEL_OWNERS and backend_never_spells_the_value(value_tree)
 
 
 # ---- the backend ----------------------------------------------------------------------------------------------------
@@ -303,9 +370,11 @@ def claim_backend_carries_the_source(sycl_h: str, sycl: str, cache_hpp: str) -> 
 
 
 ROOM_LOG_SIG = "static void log_kv_context_room(const kv_context_room & room,"
-NOTE = " (the model's default, training context: the caller named no n_ctx)"
+NOTE = " (n_ctx_context is the model's default, training context: the caller named no n_ctx)"
 SOURCE_NOTE = f'const char * ctx_source = kv_info.n_ctx_context_is_default ? "{NOTE}" : "";'
 ROOM_EMPTY = "if (room.n_layers == 0) { return; }"
+UNPRICED = "if (!room.expert_rate.priced && room.n_held == 0) {"
+UNPRICED_ARGS = "kv_info.n_ctx_context, kv_info.n_ctx, ctx_source, kv_info.cpu_expert_gbps);"
 ALL_REFUSED = "if (room.n_held == 0) {"
 REFUSED_SLOT = "for n_ctx_context=%u over planner n_ctx=%u%s is held"
 REFUSED_ARGS = "room.refused / mb, kv_info.n_ctx_context, kv_info.n_ctx, ctx_source,"
@@ -314,17 +383,53 @@ HELD_ARGS = "kv_info.n_ctx_context, kv_info.n_ctx, ctx_source, short_note,"
 
 
 def claim_room_lines_name_the_default(cache: str) -> bool:
-    """Both KV context room lines (the all-refused WARN and the held line) print, right after the context they
-    weighed, a note that says it is the model's default (training) context, chosen by the provenance flag alone; the
-    note is empty for a context the caller named, and the no-room line (n_ctx_context 0) is left as it was."""
+    """Every KV context room line (the unpriced WARN, the all-refused WARN and the held line) prints, right after the
+    context it weighed, a note that says it is the model's default (training) context, chosen by the provenance flag
+    alone; the note is empty for a context the caller named, and the no-room line (n_ctx_context 0) is left as it
+    was."""
     b = body(norm(cache), ROOM_LOG_SIG)
-    if not b or b.count(SOURCE_NOTE) != 1 or not ordered(b, ROOM_EMPTY, SOURCE_NOTE, ALL_REFUSED):
+    if not b or b.count(SOURCE_NOTE) != 1 or not ordered(b, ROOM_EMPTY, SOURCE_NOTE, UNPRICED, ALL_REFUSED):
         return False
+    up = b.find(UNPRICED)
+    unpriced = body(b[up:], UNPRICED[:-2])
     at = b.find(ALL_REFUSED)
     refused = body(b[at:], ALL_REFUSED[:-2])
     rest = b[at + len(ALL_REFUSED) - 1 + len(refused):] if refused else ""
-    return (bool(rest) and REFUSED_SLOT in refused and REFUSED_ARGS in refused
-            and HELD_SLOT in rest and HELD_ARGS in rest and b.count("ctx_source") == 3)
+    return (bool(unpriced) and REFUSED_SLOT in unpriced and UNPRICED_ARGS in unpriced
+            and bool(rest) and REFUSED_SLOT in refused and REFUSED_ARGS in refused
+            and HELD_SLOT in rest and HELD_ARGS in rest and b.count("ctx_source") == 4)
+
+
+FLAG = "n_ctx_context_is_default"
+PLAN_SIG = "placement_plan compute_placement_plan(const std::vector<placement_tensor_info> & tensor_inventory,"
+RATE_CALL = ("const kv_room_expert_rate room_expert_rate = kv_room_expert_rate_for(room_expert_types, "
+             "kv_info.cpu_expert_gbps, kv_info.cpu_expert_gbps_set, kv_info.n_ctx_context_is_default);")
+RATE_SIG = ("static inline kv_room_expert_rate kv_room_expert_rate_for(const kv_room_expert_types & types, "
+            "double cpu_expert_gbps, bool cpu_expert_gbps_set, bool n_ctx_context_is_default)")
+RATE_RULE = "if (types.unmeasured_mask != 0 && n_ctx_context_is_default) { rate.priced = false; return rate; }"
+WEIGH_SIG = "static inline kv_room_cost_terms kv_room_weigh(const kv_room_cost_inputs & in)"
+HOLD_IFF = "cost.held = !moe || (in.priced && cost.host_attn_us > cost.expert_us);"
+# The backend files that may spell the flag, and how often (comments stripped; tests/ excluded): the copy (both sides)
+# and the offset pin with its message, the KV input, the planner's two reads (the line's note and the rate call), and
+# the rate rule's parameter and its one test.
+FLAG_OWNERS = {SYCL_REL: 4, CACHE_HPP_REL: 1, CACHE_REL: 2, ROOM_COST_REL: 2}
+
+
+def claim_default_only_refuses(tree: dict[str, str]) -> bool:
+    """The provenance reaches the room's decision through one call and one rule, and the rule can only refuse: the
+    planner passes it to kv_room_expert_rate_for once, where a default context with an unmeasured expert type
+    leaves the room unpriced and returns, and kv_room_weigh lets an unpriced room only lose a hold. No other backend
+    source reads it."""
+    backend = {rel: text for rel, text in tree.items() if not rel.startswith("ggml/src/ggml-sycl/tests/")}
+    counts = {rel: norm(text).count(FLAG) for rel, text in backend.items()}
+    counts = {rel: c for rel, c in counts.items() if c > 0}
+    if counts != FLAG_OWNERS:
+        return False
+    cache = norm(tree[CACHE_REL])
+    cost = norm(tree[ROOM_COST_REL])
+    rate = body(cost, RATE_SIG)
+    return (RATE_CALL in body(cache, PLAN_SIG) and SOURCE_NOTE in cache and rate.count(FLAG) == 1
+            and RATE_RULE in rate and HOLD_IFF in body(cost, WEIGH_SIG) and body(cost, WEIGH_SIG).count("priced") == 1)
 
 
 # ---- the claims hold on the tree ------------------------------------------------------------------------------------
@@ -351,7 +456,7 @@ def test_loader_resolves_once():
 
 
 def test_sentinel_has_one_reader():
-    assert claim_sentinel_has_one_reader(TREE)
+    assert claim_sentinel_has_one_reader(TREE, VALUE_TREE)
 
 
 def test_backend_carries_the_source():
@@ -360,6 +465,10 @@ def test_backend_carries_the_source():
 
 def test_room_lines_name_the_default():
     assert claim_room_lines_name_the_default(CACHE)
+
+
+def test_default_only_refuses():
+    assert claim_default_only_refuses(BACKEND_TREE)
 
 
 # ---- mutants: each must turn its claim red --------------------------------------------------------------------------
@@ -407,6 +516,14 @@ def test_mutant_common_keeps_zero_without_c_fails():
     """master's line: without -c the hint is 0 and no room is held for the context llama then creates."""
     assert not claim_common_asks_for_the_default(
         _once(COMMON, COMMON_HINT, "mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : 0;"))
+
+
+def test_mutant_common_negative_c_asks_for_the_default_fails():
+    """A negative -c, which names no context, asks for the default: the load would hold the training context's room
+    for a context llama_context cannot create."""
+    assert not claim_common_asks_for_the_default(
+        _once(COMMON, COMMON_HINT,
+              "mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : LLAMA_N_CTX_HINT_DEFAULT;"))
 
 
 def test_mutant_common_fit_refresh_unguarded_fails():
@@ -526,12 +643,12 @@ def test_mutant_backend_reads_the_sentinel_fails():
     """The backend compares the sentinel itself: the fact would have a second source past the dlopen boundary."""
     rel = CACHE_REL
     text = CACHE + "\nstatic bool ggml_sycl_ctx_is_default(uint32_t n) { return n == LLAMA_N_CTX_HINT_DEFAULT; }\n"
-    assert not claim_sentinel_has_one_reader(_tree_with(rel, text))
+    assert not claim_sentinel_has_one_reader(_tree_with(rel, text), VALUE_TREE)
 
 
 def test_mutant_model_reads_the_sentinel_fails():
     text = MODEL + "\nstatic bool llama_model_hint_is_default(uint32_t n) { return n == LLAMA_N_CTX_HINT_DEFAULT; }\n"
-    assert not claim_sentinel_has_one_reader(_tree_with(MODEL_REL, text))
+    assert not claim_sentinel_has_one_reader(_tree_with(MODEL_REL, text), VALUE_TREE)
 
 
 def test_mutant_bench_asks_for_the_default_fails():
@@ -539,14 +656,40 @@ def test_mutant_bench_asks_for_the_default_fails():
     bench = read(BENCH_REL)
     assert "mparams.n_ctx_hint = n_ctx();" in bench
     text = bench.replace("mparams.n_ctx_hint = n_ctx();", "mparams.n_ctx_hint = LLAMA_N_CTX_HINT_DEFAULT;", 1)
-    assert not claim_sentinel_has_one_reader(_tree_with(BENCH_REL, text))
+    assert not claim_sentinel_has_one_reader(_tree_with(BENCH_REL, text), VALUE_TREE)
 
 
 def test_mutant_resolver_without_the_sentinel_fails():
     """The resolver stops spelling the sentinel (it resolves nothing): the owner set no longer matches."""
     tree = dict(TREE)
     tree.pop(RESOLVER_REL, None)
-    assert not claim_sentinel_has_one_reader(tree)
+    assert not claim_sentinel_has_one_reader(tree, VALUE_TREE)
+
+
+def _value_tree_with(rel: str, text: str) -> dict[str, str]:
+    tree = dict(VALUE_TREE)
+    tree[rel] = text
+    return tree
+
+
+def test_mutant_backend_compares_the_context_to_all_ones_fails():
+    """The planner recognises the default by its value: the inventory's flag would have a second source."""
+    text = CACHE + ("\nstatic bool g_7fmt_mutant(const ggml_sycl::placement_kv_info & k) "
+                    "{ return k.n_ctx_context == 0xFFFFFFFFu; }\n")
+    assert not claim_sentinel_has_one_reader(TREE, _value_tree_with(CACHE_REL, text))
+
+
+def test_mutant_backend_compares_the_hint_to_uint32_max_fails():
+    """The same comparison spelled UINT32_MAX, in the backend TU that copies the inventory in."""
+    text = SYCL + ("\nstatic bool g_7fmt_mutant(const ggml_sycl_tensor_inventory * inv) "
+                   "{ return inv->n_ctx_context ==\n    UINT32_MAX; }\n")
+    assert not claim_sentinel_has_one_reader(TREE, _value_tree_with(SYCL_REL, text))
+
+
+def test_mutant_backend_names_the_value_fails():
+    """A new all-ones constant, which a later comparison could read the sentinel by."""
+    text = CACHE_HPP + "\nconstexpr uint32_t PLACEMENT_N_CTX_DEFAULT = 0xFFFFFFFFu;\n"
+    assert not claim_sentinel_has_one_reader(TREE, _value_tree_with(CACHE_HPP_REL, text))
 
 
 def test_mutant_backend_drops_the_provenance_fails():
@@ -583,9 +726,65 @@ def test_mutant_held_line_drops_the_note_fails():
     assert not claim_room_lines_name_the_default(n.replace(HELD_ARGS, HELD_ARGS.replace(" ctx_source,", ""), 1))
 
 
+def _log_block_mutant(head: str, old: str, new: str) -> str:
+    """CACHE (normalized) with `old` replaced by `new` once inside the room line's block that opens with `head`."""
+    n = norm(CACHE)
+    b = body(n, ROOM_LOG_SIG)
+    at = b.find(head)
+    assert at >= 0, f"block not found: {head!r}"
+    block = body(b[at:], head[:-2])
+    assert block.count(old) == 1 and n.count(block) == 1, f"mutant anchor must match once in the block: {old!r}"
+    return n.replace(block, block.replace(old, new, 1), 1)
+
+
 def test_mutant_refused_line_drops_the_note_fails():
-    n = _once(CACHE, REFUSED_SLOT, REFUSED_SLOT.replace("n_ctx=%u%s is", "n_ctx=%u is"))
+    n = _log_block_mutant(ALL_REFUSED, REFUSED_SLOT, REFUSED_SLOT.replace("n_ctx=%u%s is", "n_ctx=%u is"))
     assert not claim_room_lines_name_the_default(n.replace(REFUSED_ARGS, REFUSED_ARGS.replace(" ctx_source,", ""), 1))
+
+
+def test_mutant_unpriced_line_drops_the_note_fails():
+    """The unpriced WARN, which only a default context can print, says nothing about where its context came from."""
+    n = _log_block_mutant(UNPRICED, REFUSED_SLOT, REFUSED_SLOT.replace("n_ctx=%u%s is", "n_ctx=%u is"))
+    assert not claim_room_lines_name_the_default(n.replace(UNPRICED_ARGS, UNPRICED_ARGS.replace(" ctx_source,", ""), 1))
+
+
+def _backend_with(rel: str, text: str) -> dict[str, str]:
+    tree = dict(BACKEND_TREE)
+    tree[rel] = text
+    return tree
+
+
+def test_mutant_default_holds_every_room_fails():
+    """The default context holds its room whatever the cost: commit 1 alone, which held GPT-OSS 20B's room on the B50
+    (9.9 against 23.5 t/s)."""
+    mutant = _once(CACHE, "if (cost.held) {", "if (cost.held || kv_info.n_ctx_context_is_default) {")
+    assert not claim_default_only_refuses(_backend_with(CACHE_REL, mutant))
+
+
+def test_mutant_rule_never_fires_fails():
+    """The planner passes false for the provenance: an unmeasured type is weighed at the fallback for the default
+    context too."""
+    mutant = _once(CACHE, RATE_CALL, RATE_CALL.replace("kv_info.n_ctx_context_is_default);", "false);"))
+    assert not claim_default_only_refuses(_backend_with(CACHE_REL, mutant))
+
+
+def test_mutant_default_prices_instead_of_refusing_fails():
+    """For the default context an unmeasured type is priced at a made-up rate instead of refusing the room."""
+    mutant = _once(ROOM_COST, RATE_RULE, RATE_RULE.replace("rate.priced = false;", "rate.gbps = 1e9;"))
+    assert not claim_default_only_refuses(_backend_with(ROOM_COST_REL, mutant))
+
+
+def test_mutant_unpriced_room_forced_held_fails():
+    """An unpriced room made held instead of refused: the provenance would then hold rooms."""
+    mutant = _once(ROOM_COST, HOLD_IFF, "cost.held = !moe || !in.priced || cost.host_attn_us > cost.expert_us;")
+    assert not claim_default_only_refuses(_backend_with(ROOM_COST_REL, mutant))
+
+
+def test_mutant_second_backend_reader_fails():
+    """The flash-attention TU reads the provenance: a second way into a decision, past the one rule."""
+    text = BACKEND_TREE[FATTN_REL] + "\nstatic bool g_7fmt_mutant(const ggml_sycl::placement_kv_info & k) " \
+        "{ return k.n_ctx_context_is_default; }\n"
+    assert not claim_default_only_refuses(_backend_with(FATTN_REL, text))
 
 
 def test_mutant_note_unconditional_fails():
