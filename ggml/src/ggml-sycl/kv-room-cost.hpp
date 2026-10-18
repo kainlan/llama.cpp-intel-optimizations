@@ -65,11 +65,13 @@ constexpr uint32_t placement_host_attn_splits(bool has_indexer) {
 }
 
 // Every rate the table holds is 0 (not measured) with no source, or finite and positive with the measurement it came
-// from, since each divides and the room's line names it; a NaN, an inf or an unnamed entry fails the build.
+// from, since each divides and the room's line names it; a NaN, an inf or an unnamed entry fails the build. An empty
+// source is as unnamed as a null one: the line would print "mxfp4 via " (llama.cpp-7fmt).
 constexpr bool placement_cpu_expert_rates_valid() {
     for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
-        const placement_cpu_expert_rate r = placement_cpu_expert_rate_measured(static_cast<ggml_type>(t));
-        if (r.source == nullptr ? r.gbps != 0.0 : !(r.gbps > 0.0 && r.gbps <= std::numeric_limits<double>::max())) {
+        const placement_cpu_expert_rate r       = placement_cpu_expert_rate_measured(static_cast<ggml_type>(t));
+        const bool                      unnamed = r.source == nullptr || r.source[0] == '\0';
+        if (unnamed ? r.gbps != 0.0 : !(r.gbps > 0.0 && r.gbps <= std::numeric_limits<double>::max())) {
             return false;
         }
     }

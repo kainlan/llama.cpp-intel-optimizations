@@ -21,8 +21,9 @@ The fix this gate pins:
     through a NaN;
   - the device's expert rate (llama.cpp-7fmt) is the byte-weighted harmonic mean over its routed-expert tensors of each
     type's measured rate (a constexpr table whose every entry names the measurement it came from, checked at compile
-    time: finite, positive and named), a type with none counting at cpu_expert_gbps; the seven Qwen3.8 GSQ-RCO types
-    carry the one rate their mix was measured at, and the catalog row gives the mix's shares;
+    time: finite, positive and named, a null or empty source being unnamed), a type with none counting at
+    cpu_expert_gbps; the seven Qwen3.8 GSQ-RCO types carry the one rate their mix was measured at, and the catalog row
+    gives the mix's shares;
     GGML_SYCL_PLAN_CPU_EXPERT_GBPS, when set, prices every type; for the model's default context a type with no measured
     rate leaves the room unpriced, so every layer's room is refused unweighed and one WARN names the types and the
     override; the rate is computed once, before the room is held;
@@ -326,8 +327,10 @@ TABLE_GROUP_RE = re.compile(r'((?:case GGML_TYPE_\w+: )+)return \{ ([0-9.]+), "(
 TABLE_VALID = ('static_assert(placement_cpu_expert_rates_valid(), '
                '"a measured CPU expert rate must be finite and positive and name its measurement");')
 VALID_SIG = "constexpr bool placement_cpu_expert_rates_valid()"
+VALID_UNNAMED = "r.source == nullptr || r.source[0] == '\\0'"
 VALID_TEST = ("const placement_cpu_expert_rate r = placement_cpu_expert_rate_measured(static_cast<ggml_type>(t)); "
-              "if (r.source == nullptr ? r.gbps != 0.0 : !(r.gbps > 0.0 && "
+              f"const bool unnamed = {VALID_UNNAMED}; "
+              "if (unnamed ? r.gbps != 0.0 : !(r.gbps > 0.0 && "
               "r.gbps <= std::numeric_limits<double>::max())) { return false; }")
 
 
@@ -352,7 +355,7 @@ def table_of(room_cost: str) -> dict[str, tuple[float, str]] | None:
 def claim_expert_rate_table(room_cost: str) -> bool:
     """The table holds exactly the measured rates, each with the measurement it came from, every other type is
     unmeasured (0, no source), and a compile-time check rejects an entry that is not finite and positive or that
-    has a rate and no source."""
+    has a rate and no source, a null or an empty one."""
     n = norm(room_cost)
     return table_of(room_cost) == TABLE and TABLE_VALID in n and VALID_TEST in body(n, VALID_SIG)
 
@@ -1043,7 +1046,13 @@ def test_mutant_table_unchecked_fails():
 def test_mutant_table_check_accepts_an_unnamed_rate_fails():
     """The check passes a rate with no source: an entry the line cannot attribute would build."""
     assert not claim_expert_rate_table(
-        _once(ROOM_COST, "if (r.source == nullptr ? r.gbps != 0.0 :", "if (r.gbps == 0.0 ? false :"))
+        _once(ROOM_COST, "if (unnamed ? r.gbps != 0.0 :", "if (r.gbps == 0.0 ? false :"))
+
+
+def test_mutant_table_check_accepts_an_empty_source_fails():
+    """The check without its empty-string clause, r.source[0] == '\\0' in VALID_UNNAMED: an entry { 5.6, "" } would
+    build, and the room's line would print "mxfp4 via "."""
+    assert not claim_expert_rate_table(_once(ROOM_COST, VALID_UNNAMED, "r.source == nullptr"))
 
 
 def test_mutant_unmeasured_rule_inverted_fails():

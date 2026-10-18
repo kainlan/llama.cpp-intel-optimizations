@@ -340,7 +340,7 @@ COMMON_HINT = ("mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx 
                "params.n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;")
 COMMON_FIT = "common_fit_params(params.model.path.c_str(), &mparams, &cparams,"
 FIT_REFRESH = "mparams.n_ctx_hint = cparams.n_ctx;"
-COMMON_FIT_REFRESH = "if (cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
+COMMON_FIT_REFRESH = "if (params.n_ctx >= 0 && cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
 COMMON_LOAD = "llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);"
 
 
@@ -348,7 +348,7 @@ def claim_common_hands_the_requested_context(common: str) -> bool:
     """common passes -c as the hint, without -c (or with -c 0) the model's default context, and for a negative -c no
     room (llama.cpp-7fmt). After a fit, which may shrink a requested context or resolve the default one itself, the
     hint is the context the fit left in cparams, before the model loads; a fit that resolved none (the SYCL build's
-    fit is a no-op) keeps the default."""
+    fit is a no-op) keeps the default, and a negative -c keeps no room."""
     n = norm(common)
     b = body(n, COMMON_SIG)
     return (bool(b) and COMMON_HINT in b and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD)

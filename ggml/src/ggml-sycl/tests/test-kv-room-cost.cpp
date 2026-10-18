@@ -119,7 +119,8 @@ const model_shape QWEN38_Q4K = {
       },
 };
 
-// GPT-OSS 20B's attention with half its expert bytes in iq3_xxs: two measurements in one source field.
+// GPT-OSS 20B's attention with half its expert bytes in iq3_xxs: two measurements in one source field, and two
+// rates whose harmonic and arithmetic means decide a room differently.
 const model_shape TWO_SOURCES = {
     "mxfp4+iq3_xxs-experts",
     2048,
@@ -311,6 +312,15 @@ void test_expert_rates() {
     const placement_cpu_expert_rate q4k = placement_cpu_expert_rate_measured(GGML_TYPE_Q4_K);
     expect_true("q4_K is not measured and names no measurement", q4k.gbps == 0.0 && q4k.source == nullptr);
 
+    // The room's line prints each measurement after the types it priced, so an empty one would read "mxfp4 via ". The
+    // constexpr check rejects a null or empty source at build time; this reads the table again without it.
+    bool every_rate_named = true;
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const placement_cpu_expert_rate r = placement_cpu_expert_rate_measured(static_cast<ggml_type>(t));
+        every_rate_named = every_rate_named && (r.gbps == 0.0 || (r.source != nullptr && r.source[0] != '\0'));
+    }
+    expect_true("every measured rate names a non-empty measurement", every_rate_named);
+
     const weighed gptoss = weigh(GPTOSS_20B, arm_default(GPTOSS_20B));
     expect_true("gpt-oss-20b's experts are read at mxfp4's rate", near(gptoss.rate.gbps, 5.6, 1e-9));
     expect_true("gpt-oss-20b's experts are all measured",
@@ -324,6 +334,14 @@ void test_expert_rates() {
     const weighed mixed = weigh(MIXED_EXPERTS, arm_explicit(131072));
     expect_true("a mixed device's rate is the byte-weighted harmonic mean",
                 near(mixed.rate.gbps, 1.0 / (0.5 / 5.6 + 0.5 / 40.0), 1e-9));
+
+    // A room the two means decide differently. Half the bytes at 5.6 and half at 22 read at the harmonic mean,
+    // 8.93 GB/s, and at a 30 % fill the default room is refused (A 2934.3 < B 3743.85); at the arithmetic mean,
+    // 13.8 GB/s, B would be 2422.0 and the room held.
+    arm thirty      = arm_default(TWO_SOURCES);
+    thirty.fill_pct = 30.0;
+    expect("two measured types at their harmonic mean refuse a room their arithmetic mean would hold", TWO_SOURCES,
+           thirty, false, 2934.3, 3743.85);
 
     kv_room_expert_types untyped;
     untyped.add(GGML_TYPE_COUNT, 1000);

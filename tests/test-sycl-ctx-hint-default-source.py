@@ -14,8 +14,8 @@ The fix this gate pins:
     request, no room), and the n_ctx_hint field documents it;
   - common asks for it when -c is absent or 0 (common_model_params_to_llama), and for no room (0) when -c is negative;
     after a fit the hint is the context the fit left in cparams, and stays the default when the fit resolved none (the
-    SYCL build's fit is a no-op); the draft model of speculative decoding asks for the context its draft context is
-    created with;
+    SYCL build's fit is a no-op), and a negative -c keeps no room through a fit; the draft model of speculative
+    decoding asks for the context its draft context is created with;
   - src/llama-n-ctx-hint.h resolves the hint in one place: the default to n_ctx_train padded to 256, as llama_context
     resolves n_ctx 0 to n_ctx_train and pads it; 0 to no room; any other hint padded the same way; and it says
     whether the result is the default. src/llama-model.cpp calls it once, where it fills the SYCL inventory. No C/C++
@@ -208,7 +208,7 @@ COMMON_SIG = "struct llama_model_params common_model_params_to_llama(common_para
 COMMON_HINT = ("mparams.n_ctx_hint = params.n_ctx > 0 ? (uint32_t) params.n_ctx : "
                "params.n_ctx == 0 ? LLAMA_N_CTX_HINT_DEFAULT : 0;")
 COMMON_FIT = "common_fit_params(params.model.path.c_str(), &mparams, &cparams,"
-COMMON_FIT_REFRESH = "if (cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
+COMMON_FIT_REFRESH = "if (params.n_ctx >= 0 && cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"
 COMMON_LOAD = "llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);"
 
 
@@ -216,8 +216,9 @@ def claim_common_asks_for_the_default(common: str) -> bool:
     """Without -c (or with -c 0, which the parser documents as "loaded from model") common asks for the model's
     default context, and a negative -c, which names no context, asks for no room. After a fit the hint is the context
     the fit left in cparams (it is what the context is created with); a fit that resolved none (cparams.n_ctx still
-    0, as in the SYCL build, whose fit is a no-op) keeps the default instead of overwriting it with 0. Those are the
-    only two setters."""
+    0, as in the SYCL build, whose fit is a no-op) keeps the default instead of overwriting it with 0, and a negative
+    -c keeps no room through a fit: cparams.n_ctx holds its unsigned wrap (-1 wraps to the sentinel's value), so the
+    signed -c gates the refresh. Those are the only two setters."""
     n = norm(common)
     b = body(n, COMMON_SIG)
     return (bool(b) and COMMON_HINT in b and ordered(n, COMMON_FIT, COMMON_FIT_REFRESH, COMMON_LOAD)
@@ -538,6 +539,14 @@ def test_mutant_common_fit_refresh_on_c_only_fails():
     carried, so the load would plan for n_ctx_train while the context opens at the fit's size."""
     assert not claim_common_asks_for_the_default(
         _once(COMMON, COMMON_FIT_REFRESH, "if (params.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"))
+
+
+def test_mutant_common_fit_refresh_unsigned_only_fails():
+    """Guarded on the unsigned cparams.n_ctx alone: with -fit on and -c -1, cparams.n_ctx is the wrap of -1, which is
+    LLAMA_N_CTX_HINT_DEFAULT, so the hint becomes the default and the load holds the default context's room for a -c
+    that asked for none (any other negative -c becomes a named context of nearly 2^32 cells)."""
+    assert not claim_common_asks_for_the_default(
+        _once(COMMON, COMMON_FIT_REFRESH, "if (cparams.n_ctx > 0) { mparams.n_ctx_hint = cparams.n_ctx; }"))
 
 
 def test_mutant_common_second_setter_fails():

@@ -1286,11 +1286,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // may shrink a requested context, and without -c it resolves the default context itself (n_ctx_train per
         // sequence, possibly shrunk). A fit that resolved none (cparams.n_ctx still 0; the SYCL build's fit is a
         // no-op) keeps LLAMA_N_CTX_HINT_DEFAULT from common_model_params_to_llama rather than overwriting it with 0,
-        // so the load still holds the default context's room (llama.cpp-7fmt, llama.cpp-ak0p). On a non-SYCL build
-        // with an active fit, a default context the fit resolved arrives as a number, so the load reads it as named
-        // (n_ctx_context_is_default false); under GGML_USE_SYCL the fit returns before it touches cparams, so the
-        // flag is exact on the one backend that reads it.
-        if (cparams.n_ctx > 0) {
+        // so the load still holds the default context's room (llama.cpp-7fmt, llama.cpp-ak0p). A negative -c keeps the
+        // 0 it asked for: cparams.n_ctx holds its unsigned wrap (-1 wraps to LLAMA_N_CTX_HINT_DEFAULT itself), so the
+        // signed -c gates the refresh. On a non-SYCL build with an active fit, a default context the fit resolved
+        // arrives as a number, so the load reads it as named (n_ctx_context_is_default false); under GGML_USE_SYCL the
+        // fit returns before it touches cparams, so the flag is exact on the one backend that reads it.
+        if (params.n_ctx >= 0 && cparams.n_ctx > 0) {
             mparams.n_ctx_hint = cparams.n_ctx;
         }
     }
