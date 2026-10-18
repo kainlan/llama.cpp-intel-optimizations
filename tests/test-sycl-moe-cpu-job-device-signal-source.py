@@ -69,20 +69,18 @@ THE CONTRACT.  With comments blanked:
      job's outputs, which teardown frees once the queues drain, so the job signals itself
      when it ends.
   H. GGML_SYCL_MOE_CPU_JOB_DEVICE_SIGNAL is read once, into a function-local static,
-     default on (llama.cpp-nqbe: with it on, which also puts the input marker in
-     play, Qwen3.8 IQ3_XXS decode on the B70, traced with
-     GGML_SYCL_MOE_IDS_COPY_TRACE=1 (about 8% below untraced), measured 10.10 t/s
-     without -c against 9.28 off, and 13.15 against 8.94 at -c 4096, 2026-10-18.
-     It was off while the
-     marker's word sat in the host STAGING zone that every graph boundary checks
-     for emptiness, so every boundary refused and walked the allocation registry,
-     2.68 t/s with it on; the word is now a persistent owner in the WEIGHT host
-     zone.  The llama.cpp-m5v8 hang on that path is fixed by the input marker,
-     llama.cpp-42zj), and is the only getenv of that name; the catalog row
-     documents =0, its default, its default's reason (the boundary-checked zone,
-     the persistent owner, and the traced measurement after the move) and the
-     atoi parse; the
-     [MOE-HOSTPATH-WAITS] line prints devsig=, counted under the trace only.
+     default on (llama.cpp-nqbe: with it on, which also puts the input marker in play,
+     Qwen3.8 IQ3_XXS decode on the B70, traced with GGML_SYCL_MOE_IDS_COPY_TRACE=1
+     (about 8% below untraced), measured 10.10 t/s without -c against 9.28 off, and
+     13.15 against 8.94 at -c 4096, 2026-10-18.  It was off while the marker's word sat
+     in the host STAGING zone that every graph boundary checks for emptiness, so every
+     boundary refused and walked the allocation registry, 2.68 t/s with it on; the word
+     is now a persistent owner in the WEIGHT host zone.  The llama.cpp-m5v8 hang on
+     that path is fixed by the input marker, llama.cpp-42zj), and is the only getenv of
+     that name; the catalog row documents =0, its default, its default's reason (the
+     boundary-checked zone, the persistent owner, and the traced measurement after the
+     move) and the atoi parse; the [MOE-HOSTPATH-WAITS] line prints devsig=, counted
+     under the trace only.
   I. No host waits on the new events.  The flush body and the ring section of
      unified-cache.cpp (from its section comment to the testing hooks' #endif) call no
      wait, wait_and_throw, wait_for or wait_until, no get_info<...> and name neither

@@ -56,13 +56,13 @@ THE CONTRACT.  With comments and string literals blanked:
 NOT COVERED: this reads text.  The decision table itself runs in test-sycl-runtime-registry-containment (host-only, the
 hook allocation_registry_test_host_zone_refusals), and a device run is what shows the boundary no longer refuses: on
 2026-10-18 the B70 run without -c and with the knob on, traced (GGML_SYCL_MOE_IDS_COPY_TRACE=1, about 8% below
-untraced), logged no refusal and decoded at 10.10 t/s, against 8 refusals and 2.68 t/s on master 6f8cb1a5b.  Z5
-sees writes spelled through the member name; a write through a reference or pointer bound to the field, or through
-std::exchange or a whole-struct copy from a constraints object that has it set, is not seen, nor is positional
-aggregate initialisation of alloc_constraints, which sets the field without naming it (unlikely: it would have to
-spell out every field declared before it), and a write inside a
-constructor with a member initialiser list is named by its last initialiser, which fails closed.  Nor is this a census of
-the process-lifetime CONTROL owners that do not set the flag: those still land in STAGING (llama.cpp-bvq7 is one).
+untraced), logged no refusal and decoded at 10.10 t/s, against 8 refusals and 2.68 t/s on master 6f8cb1a5b.  Z5 sees
+writes spelled through the member name; a write through a reference or pointer bound to the field, or through
+std::exchange or a whole-struct copy from a constraints object that has it set, is not seen, nor is positional aggregate
+initialisation of alloc_constraints, which sets the field without naming it (unlikely: it would have to spell out every
+field declared before it), and a write inside a constructor with a member initialiser list is named by its last
+initialiser, which fails closed.  Nor is this a census of the process-lifetime CONTROL owners that do not set the flag:
+those still land in STAGING (llama.cpp-bvq7 is one).
 
 Run with --self-test: each mutant is written to a copy of the sources in a temporary directory and must fail on its
 own pin, and the unmodified tree must pass.  --root DIR checks another tree (the directory holding ggml/).
