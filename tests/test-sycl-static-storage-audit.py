@@ -32,6 +32,7 @@ INPUTS = (
     "ggml/src/ggml-sycl/unified-cache.cpp",
     "ggml/src/ggml-sycl/unified-cache.hpp",
     "ggml/src/ggml-sycl/fattn.cpp",
+    "ggml/src/ggml-sycl/fattn-dpas.cpp",
     "ggml/src/ggml-sycl/layer-streaming.cpp",
 )
 INVENTORY = "docs/backend/sycl-static-storage-inventory.csv"

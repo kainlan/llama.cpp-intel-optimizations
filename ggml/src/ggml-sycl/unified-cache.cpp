@@ -7465,6 +7465,10 @@ bool unified_cache::shutdown_resources() {
         std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
         onednn_graph_scratch_flag_slab_ = nullptr;
         onednn_graph_scratch_flag_slot_free_list_.clear();
+        // llama.cpp-jwjz: every marker has completed after the drain above.
+        // The two abandon paths leave these events to member destruction,
+        // the same as the pool entries' own release events.
+        onednn_graph_scratch_flag_slot_last_marker_.clear();
         onednn_graph_scratch_flag_slab_owner_ = {};
     }
 #endif
@@ -13284,6 +13288,18 @@ static size_t onednn_graph_scratch_direct_cap_bytes(size_t plan_time_available_b
     return std::min(kOneGiB, plan_time_available_bytes / 4);
 }
 
+size_t unified_cache::onednn_graph_scratch_direct_cap() const {
+    return onednn_graph_scratch_direct_cap_bytes(
+        onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire));
+}
+
+size_t unified_cache_onednn_graph_scratch_direct_cap_bytes(int device_id) {
+    // The same cache lookup onednn_graph_sycl_malloc() makes, so the bound matches the allocator that
+    // serves the request.
+    const unified_cache * cache = get_existing_unified_cache_for_device(device_id);
+    return cache ? cache->onednn_graph_scratch_direct_cap() : onednn_graph_scratch_direct_cap_bytes(0);
+}
+
 static constexpr uint32_t kOnednnGraphDirectFailureDrainTimeoutMs = 2000;
 static constexpr uint32_t kOnednnGraphDirectWaitPollTimeoutMs     = 200;
 // llama.cpp-me60: this 5 s budget is measured from wait_loop_entry,
@@ -13407,6 +13423,28 @@ bool unified_cache::onednn_graph_scratch_pool_entry_release_complete(
     return event_complete(entry.release_event);
 }
 
+// llama.cpp-jwjz: see the declaration's comment in unified-cache.hpp.
+bool unified_cache::onednn_graph_scratch_consumers_in_order() const {
+    if (!queue_.has_property<sycl::property::queue::in_order>()) {
+        return false;
+    }
+    return ggml_sycl_get_tp_queue(ggml_sycl_get_device_id_from_queue(queue_)) == nullptr;
+}
+
+bool unified_cache::onednn_graph_scratch_in_order_reuse_allowed() const {
+    if (onednn_graph_scratch_force_completion_gated_reuse_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    return onednn_graph_scratch_consumers_in_order();
+}
+
+void unified_cache::onednn_graph_scratch_force_completion_gated_reuse_for_test(bool force) {
+    if (!onednn_graph_scratch_test_hooks_enabled()) {
+        return;
+    }
+    onednn_graph_scratch_force_completion_gated_reuse_.store(force, std::memory_order_release);
+}
+
 // llama.cpp-c6ah: lazily allocates the host-USM slab backing
 // every pooled entry's completion flag_slot. See the declaration's own
 // comment in unified-cache.hpp for the fixed-capacity/never-reallocated
@@ -13474,6 +13512,7 @@ bool unified_cache::onednn_graph_scratch_ensure_flag_slab_locked() {
     for (size_t i = kOnednnGraphScratchFlagSlabCapacity; i > 0; --i) {
         onednn_graph_scratch_flag_slot_free_list_.push_back(static_cast<uint32_t>(i - 1));
     }
+    onednn_graph_scratch_flag_slot_last_marker_.assign(kOnednnGraphScratchFlagSlabCapacity, std::nullopt);
     return true;
 }
 
@@ -13621,8 +13660,13 @@ unified_cache::onednn_graph_scratch_entry_fit unified_cache::onednn_graph_scratc
     const onednn_graph_scratch_pool_entry & entry,
     size_t                                  alignment,
     int                                     device_id,
+    bool                                    requester_in_order,
     resolved_ptr *                          out_resolved) const {
-    if (!onednn_graph_scratch_pool_entry_release_complete(entry)) {
+    // llama.cpp-jwjz: when this request and the entry's previous consumer
+    // were both on the cache's in-order queue, the next consumer queues
+    // behind the previous one, so the release need not have completed and no
+    // completion query is made. Any other pairing waits for the release.
+    if (!(requester_in_order && entry.in_order) && !onednn_graph_scratch_pool_entry_release_complete(entry)) {
         return onednn_graph_scratch_entry_fit::EVENT_PENDING;
     }
     const auto resolved = entry.owner.resolve(device_id);
@@ -13641,6 +13685,7 @@ unified_cache::onednn_graph_scratch_entry_fit unified_cache::onednn_graph_scratc
 bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size,
                                                                size_t       alignment,
                                                                int          device_id,
+                                                               bool         requester_in_order,
                                                                mem_handle * out_owner,
                                                                void **      out_ptr) {
     auto pool_it = onednn_graph_scratch_reuse_pool_.find(size);
@@ -13659,7 +13704,7 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
         // block rather than poll.
         resolved_ptr                         resolved{};
         const onednn_graph_scratch_entry_fit fit =
-            onednn_graph_scratch_entry_usable_locked(bucket[i], alignment, device_id, &resolved);
+            onednn_graph_scratch_entry_usable_locked(bucket[i], alignment, device_id, requester_in_order, &resolved);
         // switch over every enumerator, no default: a fifth
         // onednn_graph_scratch_entry_fit value added later without a case
         // here warns under -Wswitch instead of silently falling through to
@@ -13682,16 +13727,20 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
             case onednn_graph_scratch_entry_fit::RESOLVE_FAILED:
                 break;
         }
-        mem_handle    owner             = std::move(bucket[i].owner);
+        mem_handle    owner                 = std::move(bucket[i].owner);
         // llama.cpp-c6ah: capture the LEAVING entry's slot
         // before the move-assign below overwrites bucket[i] with a
         // DIFFERENT entry (bucket.back()) -- reading bucket[i].flag_slot
         // after that assignment would return the wrong entry's slot. The
         // entry is leaving the pool either way here (reused below, or
-        // destructed via the RESOLVE_FAILED branch further down), so its
-        // slot (if any) always returns to the free list.
-        const int32_t leaving_flag_slot = bucket[i].flag_slot;
-        bucket[i]                       = std::move(bucket.back());
+        // released via the RESOLVE_FAILED branch further down), so its
+        // slot (if any) always returns to the free list. Under in-order
+        // reuse its marker may still be pending; the next marker armed on
+        // the slot depends on it (llama.cpp-jwjz, see
+        // onednn_graph_scratch_flag_slot_last_marker_).
+        const int32_t leaving_flag_slot     = bucket[i].flag_slot;
+        sycl::event   leaving_release_event = std::move(bucket[i].release_event);
+        bucket[i]                           = std::move(bucket.back());
         bucket.pop_back();
         if (leaving_flag_slot >= 0) {
             onednn_graph_scratch_flag_slot_free_list_.push_back(static_cast<uint32_t>(leaving_flag_slot));
@@ -13703,11 +13752,14 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
         // it is checked out again).
         onednn_graph_scratch_pool_bytes_ -= std::min(size, onednn_graph_scratch_pool_bytes_);
         if (fit == onednn_graph_scratch_entry_fit::RESOLVE_FAILED) {
-            // Should not happen for a still-owned handle -- fall through and
-            // let `owner` destruct here (a real, immediate release), same as
-            // any other unusable resolution. Do not retry another bucket
-            // entry: something is wrong with this specific handle, not with
-            // pooling in general.
+            // Should not happen for a still-owned handle -- release `owner`
+            // for real, same as any other unusable resolution. The release
+            // waits on the entry's own event, because under in-order reuse
+            // (llama.cpp-jwjz) the entry may still be in flight; for a
+            // completed event the drain worker releases it at once. Do not
+            // retry another bucket entry: something is wrong with this
+            // specific handle, not with pooling in general.
+            retain_handles_until_event({ std::move(owner) }, std::move(leaving_release_event));
             onednn_graph_scratch_direct_outstanding_bytes_ -=
                 std::min(size, onednn_graph_scratch_direct_outstanding_bytes_);
             // A real release, same as the cap-eviction and depth-limit
@@ -13731,13 +13783,16 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
     return false;
 }
 
-bool unified_cache::onednn_graph_scratch_pool_size_ready_locked(size_t size, size_t alignment, int device_id) const {
+bool unified_cache::onednn_graph_scratch_pool_size_ready_locked(size_t size,
+                                                                size_t alignment,
+                                                                int    device_id,
+                                                                bool   requester_in_order) const {
     auto it = onednn_graph_scratch_reuse_pool_.find(size);
     if (it == onednn_graph_scratch_reuse_pool_.end()) {
         return false;
     }
     for (const auto & entry : it->second) {
-        if (onednn_graph_scratch_entry_usable_locked(entry, alignment, device_id) ==
+        if (onednn_graph_scratch_entry_usable_locked(entry, alignment, device_id, requester_in_order) ==
             onednn_graph_scratch_entry_fit::USABLE) {
             return true;
         }
@@ -13745,14 +13800,14 @@ bool unified_cache::onednn_graph_scratch_pool_size_ready_locked(size_t size, siz
     return false;
 }
 
-bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t                         size,
-                                                                         size_t                         alignment,
-                                                                         int                            device_id,
+bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t size,
+                                                                         size_t alignment,
+                                                                         int    device_id,
+                                                                         bool   requester_in_order,
                                                                          std::unique_lock<std::mutex> & lock,
                                                                          bool & out_was_oversized) {
     out_was_oversized = false;
-    const size_t cap  = onednn_graph_scratch_direct_cap_bytes(
-        onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire));
+    const size_t cap  = onednn_graph_scratch_direct_cap();
 
     // llama.cpp-c6ah: entry point of this call -- the timing reference the
     // poll loop's deadline below is computed from.
@@ -13837,7 +13892,7 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
         // OTHER sizes' pool entries for no reason. The caller's post-wait
         // re-check (onednn_graph_scratch_try_pool_locked()) is what actually
         // consumes this entry -- this is only "does the wait get to stop".
-        fits = onednn_graph_scratch_pool_size_ready_locked(size, alignment, device_id) ||
+        fits = onednn_graph_scratch_pool_size_ready_locked(size, alignment, device_id, requester_in_order) ||
                onednn_graph_scratch_evict_pool_until_fits_locked(size, cap);
     } while (!fits && std::chrono::steady_clock::now() < deadline);
     return fits;
@@ -13958,13 +14013,19 @@ void unified_cache::onednn_graph_scratch_log_pool_summary_locked(const char * co
 // onednn_graph_scratch_alloc_direct_locked()'s own miss-counting site for
 // where the miss half of that invariant is kept. Callers must hold
 // onednn_graph_scratch_mutex_.
-void * unified_cache::onednn_graph_scratch_try_pool_locked(size_t size, size_t alignment, int device_id) {
+void * unified_cache::onednn_graph_scratch_try_pool_locked(size_t size,
+                                                           size_t alignment,
+                                                           int    device_id,
+                                                           bool   requester_in_order) {
     mem_handle pooled_owner;
     void *     pooled_ptr = nullptr;
-    if (!onednn_graph_scratch_try_reuse_pool_locked(size, alignment, device_id, &pooled_owner, &pooled_ptr)) {
+    if (!onednn_graph_scratch_try_reuse_pool_locked(size, alignment, device_id, requester_in_order, &pooled_owner,
+                                                    &pooled_ptr)) {
         return nullptr;
     }
-    onednn_graph_scratch_direct_owners_[pooled_ptr] = { std::move(pooled_owner), size };
+    // llama.cpp-jwjz: the buffer's consumer is now this request, so it takes
+    // this request's in-order tag.
+    onednn_graph_scratch_direct_owners_[pooled_ptr] = { std::move(pooled_owner), size, requester_in_order };
     ++onednn_graph_scratch_pool_hit_count_;
     note_onednn_graph_scratch_alloc_locked(size);
     // Gated on the FIRST hit for THIS size, not print_this_request in the
@@ -14073,6 +14134,15 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
     // request device).
     const int device_id = ggml_sycl_get_device_id_from_queue(*q);
 
+    // llama.cpp-jwjz: evaluated once per request, like device_id. A pool
+    // entry whose release is still in flight may be handed back only when
+    // its previous consumer and this request share the cache's in-order
+    // queue_. onednn_graph_sycl_malloc() always passes queue_; the
+    // TP-active case, where the execute runs on another queue, is caught by
+    // onednn_graph_scratch_in_order_reuse_allowed(). A caller that passes
+    // any other queue gets completion-gated reuse only.
+    const bool requester_in_order = (*q == queue_) && onednn_graph_scratch_in_order_reuse_allowed();
+
     // llama.cpp-0oxf: try the size-bucketed reuse pool BEFORE the cap-wait
     // mechanism below -- reusing an already-resident buffer needs no
     // headroom check at all (its bytes are already charged against
@@ -14083,11 +14153,11 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
     // counted on a miss here -- see onednn_graph_scratch_try_pool_locked()'s
     // own comment for why miss accounting waits until every re-check has
     // also had its chance.
-    if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id)) {
+    if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id, requester_in_order)) {
         return p;
     }
 
-    return onednn_graph_scratch_alloc_direct_locked(size, alignment, q, device_id, lock);
+    return onednn_graph_scratch_alloc_direct_locked(size, alignment, q, device_id, requester_in_order, lock);
 }
 
 // llama.cpp-0oxf: the DIRECT (non-arena) allocation tail of
@@ -14104,6 +14174,7 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
                                                                size_t                         alignment,
                                                                sycl::queue *                  q,
                                                                int                            device_id,
+                                                               bool                           requester_in_order,
                                                                std::unique_lock<std::mutex> & lock) {
     // llama.cpp-0oxf: bound outstanding DIRECT bytes before allocating
     // another one -- see onednn_graph_scratch_wait_for_direct_headroom_locked()
@@ -14121,7 +14192,8 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
     // this ERROR describing a wait that never actually happened for that
     // call (llama.cpp-pqgl).
     bool was_oversized = false;
-    if (!onednn_graph_scratch_wait_for_direct_headroom_locked(size, alignment, device_id, lock, was_oversized) &&
+    if (!onednn_graph_scratch_wait_for_direct_headroom_locked(size, alignment, device_id, requester_in_order, lock,
+                                                              was_oversized) &&
         !was_oversized) {
         if (!onednn_graph_scratch_gave_up_waiting_logged_) {
             onednn_graph_scratch_gave_up_waiting_logged_ = true;
@@ -14131,10 +14203,7 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
                 "so a one-off spike is not refused pre-emptively; unified_alloc() below still fails loudly rather "
                 "than handing oneDNN a null scratch pointer.\n",
                 size / (1024.0 * 1024.0), onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0),
-                onednn_graph_scratch_direct_cap_bytes(
-                    onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire)) /
-                    (1024.0 * 1024.0),
-                onednn_graph_scratch_direct_wait_count_);
+                onednn_graph_scratch_direct_cap() / (1024.0 * 1024.0), onednn_graph_scratch_direct_wait_count_);
         }
     }
 
@@ -14143,7 +14212,7 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
     // could have parked (or, on the depth-overflow path, evicted and thereby
     // freed room for) this exact size while the lock was released. Check the
     // pool once more before paying for a fresh unified_alloc().
-    if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id)) {
+    if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id, requester_in_order)) {
         return p;
     }
 
@@ -14197,7 +14266,7 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
         // Re-check the pool after reacquiring the lock: a concurrent
         // onednn_graph_scratch_free() could have parked an entry of this
         // exact size while it was dropped.
-        if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id)) {
+        if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id, requester_in_order)) {
             return p;
         }
 
@@ -14214,10 +14283,8 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
             "hand oneDNN a null scratch pointer for this request -- see llama.cpp-0oxf for the GPU "
             "page-fault/segfault this used to cause. Aborting instead.\n",
             size / (1024.0 * 1024.0), onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0),
-            onednn_graph_scratch_direct_cap_bytes(
-                onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire)) /
-                (1024.0 * 1024.0),
-            onednn_graph_scratch_direct_wait_count_, zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
+            onednn_graph_scratch_direct_cap() / (1024.0 * 1024.0), onednn_graph_scratch_direct_wait_count_,
+            zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
             zone_used(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
             onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa,
                                                       shape.n_ubatch, shape.n_ctx) /
@@ -14242,7 +14309,7 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
         GGML_ABORT("oneDNN Graph scratch DIRECT allocation resolved off-device");
     }
     void * direct_ptr                               = resolved.ptr;
-    onednn_graph_scratch_direct_owners_[direct_ptr] = { std::move(owner), size };
+    onednn_graph_scratch_direct_owners_[direct_ptr] = { std::move(owner), size, requester_in_order };
     onednn_graph_scratch_direct_outstanding_bytes_ += size;
     note_onednn_graph_scratch_alloc_locked(size);
     // The ONE place this request's outcome is counted as a miss: every pool
@@ -14406,18 +14473,32 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
                             // entry's own check cannot spuriously read
                             // complete before its own marker kernel has run.
                             // Same system-scope atomic_ref as every other
-                            // slab access (never a plain store); relaxed
-                            // suffices here specifically because this slot
-                            // could only have been popped from the free
-                            // list after its previous occupant's marker was
-                            // already observed complete, under this same
-                            // mutex, so no reader can be racing this write.
+                            // slab access (never a plain store). Relaxed
+                            // suffices: no reader compares this slot against
+                            // any generation but `gen` from here on, because
+                            // the previous occupant has left the pool. Under
+                            // in-order reuse (llama.cpp-jwjz) that
+                            // occupant's marker may still be pending and can
+                            // store its older generation after this reset.
+                            // Either order leaves a value other than `gen`
+                            // until this park's own marker, chained after
+                            // that one below, stores `gen`.
                             sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::system>
                                 flag_reset_atomic(onednn_graph_scratch_flag_slab_[slot]);
                             flag_reset_atomic.store(0, sycl::memory_order::relaxed);
-                            int32_t * flag_ptr = onednn_graph_scratch_flag_slab_ + slot;
-                            watch_q->submit([&](sycl::handler & h) {
+                            int32_t *                    flag_ptr = onednn_graph_scratch_flag_slab_ + slot;
+                            std::optional<sycl::event> & last_marker =
+                                onednn_graph_scratch_flag_slot_last_marker_[slot];
+                            sycl::event marker = watch_q->submit([&](sycl::handler & h) {
                                 h.depends_on(*event);
+                                // llama.cpp-jwjz: the watch queue is
+                                // out-of-order, so without this edge the
+                                // slot's previous marker could run after
+                                // this one and leave its older generation in
+                                // the slot for good.
+                                if (last_marker) {
+                                    h.depends_on(*last_marker);
+                                }
                                 // System-scope release store, paired with
                                 // the host-side acquire load in
                                 // onednn_graph_scratch_pool_entry_release_complete().
@@ -14444,6 +14525,7 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
                             onednn_graph_scratch_flag_slot_free_list_.pop_back();
                             flag_slot       = static_cast<int32_t>(slot);
                             flag_generation = gen;
+                            last_marker     = std::move(marker);
                         } catch (const sycl::exception & e) {
                             // Leave flag_slot at -1: onednn_graph_scratch_pool_entry_release_complete()
                             // falls back to the old (blocking, but correct)
@@ -14475,7 +14557,8 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
         // these bytes for as long as they sit in the pool -- see that
         // field's own comment for why (it is still real resident VRAM).
         auto & bucket = onednn_graph_scratch_reuse_pool_[freed_size];
-        bucket.push_back({ std::move(entry.owner), std::move(release_event_copy), flag_slot, flag_generation });
+        bucket.push_back(
+            { std::move(entry.owner), std::move(release_event_copy), flag_slot, flag_generation, entry.in_order });
         onednn_graph_scratch_pool_bytes_ += freed_size;
         if (onednn_graph_scratch_pool_bytes_ > onednn_graph_scratch_pool_peak_bytes_) {
             onednn_graph_scratch_pool_peak_bytes_ = onednn_graph_scratch_pool_bytes_;
@@ -14489,7 +14572,8 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
         return;
     }
 
-    // Zone-backed suballocation, TP inactive: return it to the ONEDNN zone's
+    // Zone-backed suballocation, every consumer on one in-order queue (TP
+    // inactive and the cache queue in-order): return it to the ONEDNN zone's
     // TLSF free list IMMEDIATELY, with no event wait or completion check of
     // any kind. Safe by construction, not by omission: the ONLY consumer of
     // a Graph-scratch buffer is a dnnl::graph::sycl_interop::execute() call
@@ -14533,8 +14617,14 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
     // have; enqueue_deferred_zone_free() is the primitive
     // reserve_onednn_scratch's own defer_published_zone_release already uses
     // for the same "zone pointer, need an event-gated release" shape).
-    const int device_id_for_tp_check = ggml_sycl_get_device_id_from_queue(queue_);
-    if (ggml_sycl_get_tp_queue(device_id_for_tp_check) != nullptr) {
+    //
+    // A cache queue without the in_order property breaks it the same way:
+    // nothing then orders the next consumer after the previous one.
+    //
+    // onednn_graph_scratch_consumers_in_order() is that check (TP inactive
+    // and the queue in-order), and the DIRECT pool's in-order reuse reads the
+    // same predicate (llama.cpp-jwjz).
+    if (!onednn_graph_scratch_consumers_in_order()) {
         const size_t deferred_size = zone_it->second;
         note_onednn_graph_scratch_free_locked(deferred_size);
         onednn_graph_scratch_zone_sizes_.erase(zone_it);
@@ -14554,16 +14644,18 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
             // the map entry above is already erased, so this block is no
             // longer tracked as ours either way; the difference is whether
             // its bytes go back to the TLSF free list where a same-race
-            // zone_alloc() could hand them to a new TP consumer (zone_free,
-            // reopening exactly the race this branch exists to close) or
-            // stay held out of the zone until arena teardown (leak). A
-            // permanently smaller ONEDNN zone degrades gracefully -- future
-            // requests that no longer fit it fall through to the DIRECT path
-            // above -- corrupting a TP consumer's in-flight read does not.
+            // zone_alloc() could hand them to a new, unordered consumer
+            // (zone_free, reopening exactly the race this branch exists to
+            // close) or stay held out of the zone until arena teardown
+            // (leak). A permanently smaller ONEDNN zone degrades gracefully
+            // -- future requests that no longer fit it fall through to the
+            // DIRECT path above -- corrupting an unordered consumer's
+            // in-flight read does not.
             GGML_LOG_WARN(
-                "[UNIFIED-CACHE] oneDNN Graph allocator: TP active for device %d and no event/barrier available "
-                "to defer ptr=%p -- leaking rather than risking a race with an in-flight TP consumer\n",
-                device_id_for_tp_check, ptr);
+                "[UNIFIED-CACHE] oneDNN Graph allocator: consumers not on one in-order queue for device %d (TP "
+                "active, or the cache queue is not in-order) and no event/barrier available to defer ptr=%p -- "
+                "leaking rather than risking a race with an in-flight consumer\n",
+                ggml_sycl_get_device_id_from_queue(queue_), ptr);
         }
         return;
     }
@@ -30910,7 +31002,8 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // whatever GGML_SYCL_ONEDNN_PP says, so they were the consumer observed minting per-op copies. Q4_0 and MXFP4
         // are planned CONDITIONALLY, in the next block (llama.cpp-8ony), as is a quantized type no MMQ, coalesced or
         // unified kernel serves, the IQ family (llama.cpp-gldu): at PP batch the router has no kernel for it but this
-        // arm, so for it the arm is the planned route and not a fallback. A mis-predicted node is still found by the
+        // arm, so for it the arm is the planned route and not a fallback. So are the MMQ types the router moves to the
+        // arm at PP batch (llama.cpp-h9c8). A mis-predicted node is still found by the
         // graph-entry walk from the graph's own nodes, which grows the buffer inside the RUNTIME zone or refuses by
         // name. Experts are excluded by the same role function as above.
         if (item.has_shape() && item.type == GGML_TYPE_Q8_0 &&
@@ -30944,9 +31037,10 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // a type SYCL executes as a dense MUL_MAT, not an expert stack, not the LM head; ggml_sycl_supports_mmq,
         // is_coalesced_supported and ggml_sycl_mul_mat_type_supported read the same lists). The one term a SYCL-free
         // header cannot compute is whether the router can dequantize the type at all, so it is asked here through the
-        // function the router asks (onednn_woq::supports_dequant_fp16). The head is recognised by its usage
-        // classification (infer_tensor_usage) and the tied-embedding classifier, the same two the layout planner uses,
-        // not by a name of its own. Unlike the unified kernel's types this mark does not need the PP admission to reach
+        // function the router asks (onednn_woq::supports_dequant_fp16). The head is recognised by
+        // ggml_sycl_weight_is_output_head (its usage classification and the tied-embedding classifier, the same two the
+        // layout planner uses), which the router's helper asks too, not by a name of its own. Unlike the unified
+        // kernel's types this mark does not need the PP admission to reach
         // the arm: the legacy oneDNN kernel runs with GGML_SYCL_ONEDNN_PP=0 too. The scratch supplies its copies only
         // when the PP admission holds AND the scratch is enabled for the type, so that is what pp_scratch_type_enabled
         // says (for the unified kernel's types the admission already held, so their answer is unchanged). The loader's
@@ -30956,13 +31050,26 @@ std::vector<zone_tensor_desc> unified_cache_adapt_zone_inventory(const std::vect
         // The unified kernel's types carry no expert exclusion of their own (the claim below does), so it is here.
         const bool unified_dequant_type = shaped && !is_expert && unified_kernel_serves_type(item.type) &&
                                           ggml_sycl_onednn_pp_type_admitted(item.type);
-        const bool lm_head = infer_tensor_usage(item.name.c_str()) == tensor_usage::OUTPUT_WEIGHT ||
-                             ggml_sycl_is_canonical_tied_embedding_name(item.name.c_str());
+        const bool lm_head           = ggml_sycl_weight_is_output_head(item.name.c_str());
         const bool quantized         = shaped && ggml_is_quantized(item.type);
         const bool dequant_supported = quantized && onednn_woq::supports_dequant_fp16(item.type);
         const bool aos_dequant_type =
             aos_dequant_f16_plan_claims(item.type, quantized, lm_head, is_expert, dequant_supported);
-        if (unified_dequant_type || aos_dequant_type) {
+        // llama.cpp-h9c8: the MMQ types dense_pp_route_prefers_f16_dequant_arm lists take the arm at PP batch too. The
+        // claim is the one the router's helper (ggml_sycl_dense_f16_arm_serves_pp) asks, with the same head, expert,
+        // 2-D and dequant terms, so the weight the router sends to the arm is one this plan reserved for. Its
+        // admission is GGML_SYCL_ONEDNN_PP_MMQ_TYPES AND the oneDNN PP type admission, the gates the router's helper
+        // and the op's candidate take: unlike the IQ family, these types keep MMQ when oneDNN PP is off, so nothing
+        // would draw the buffers. By default the oneDNN PP scratch is not enabled for them
+        // (onednn_pp_unified_scratch_enabled; GGML_SYCL_ONEDNN_PP_UNIFIED_SCRATCH=1 enables it for every type), so
+        // pp_scratch_type_enabled below is false and the classifier plans them; with the scratch enabled they are
+        // planned only where it cannot supply the pair, as for the other marks. 2-D only: a 3-D operand stays on MMQ
+        // (ne[2] / ne[3] are 0 when the inventory gave no extent, hence <= 1).
+        const bool is_matrix = item.ne[2] <= 1 && item.ne[3] <= 1;
+        const bool mmq_dequant_type =
+            mmq_dequant_f16_plan_claims(item.type, quantized, lm_head, is_expert, is_matrix, dequant_supported) &&
+            ggml_sycl_onednn_pp_mmq_types_admitted(item.type);
+        if (unified_dequant_type || aos_dequant_type || mmq_dequant_type) {
             size_t weight_bytes = 0;
             size_t src1_bytes   = 0;
             if (zone_dequant_f16_weight_bytes(item.ne[0], item.ne[1] > 0 ? item.ne[1] : 1, &weight_bytes) &&

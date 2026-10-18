@@ -466,9 +466,14 @@ ticket reproduced on:
   (`onednn_graph_scratch_reuse_pool_`: `size -> {mem_handle, release event}`
   entries) instead of handing it to the shared background drain worker via
   `retain_handles_until_event()`, and `onednn_graph_scratch_alloc()` checks
-  that pool (for a completion-confirmed entry of the EXACT requested size --
-  see the completion-flag bullet below for what "confirmed" means)
-  before ever falling to a fresh `unified_alloc()`. This serves the common
+  that pool for an entry of the EXACT requested size before ever falling to
+  a fresh `unified_alloc()`. Which entries qualify depends on the queues.
+  When the request and the entry's previous consumer are both on the cache's
+  in-order queue and TP is inactive (the default), an entry qualifies while
+  its release is still in flight (see the in-order reuse bullet below,
+  llama.cpp-jwjz). Under TP, or for any other pairing of queues, only a
+  completion-confirmed entry qualifies (see the completion-flag bullet below
+  for what "confirmed" means). This serves the common
   case for free: SDPA calls of a fixed `(n_head, ncols, ne11)` shape repeat
   across `-r N` benchmark reps and across decode steps at a stable KV length.
   A pooled-but-idle entry's bytes stay charged against
@@ -506,6 +511,18 @@ ticket reproduced on:
   under any circumstance. `onednn_graph_scratch_direct_wait_count()` and
   `onednn_graph_scratch_pool_hit_count()` report how often a run actually had
   to wait, and how often it was served from the pool instead, respectively.
+- **The oneDNN SDPA execute is chunked to half the cap (llama.cpp-jwjz).**
+  One SDPA execute asks for `H_q x rows x n_kv x 6` bytes of Graph scratch,
+  1536 MB on Mistral at ubatch 2048 and n_kv 4096. That is above the 1 GiB
+  cap, so it took the oversized early-out above once per layer.
+  `ggml_sycl_flash_attn_ext_onednn()` now splits the op's query rows into
+  executes whose scratch fits half of
+  `unified_cache_onednn_graph_scratch_direct_cap_bytes()`, the cap this
+  allocator enforces (`fattn-onednn-chunk.hpp`). A full chunk's buffer and
+  the shorter last chunk's buffer then fit under the cap together, so each
+  chunk goes through the bounded wait rather than the early-out. The
+  early-out stays reachable when one query row alone exceeds the cap, and
+  at a cap of 0.
 - **Pool completion checks go through a host-visible flag written by a
   device marker kernel, not a direct SYCL event query, and not a
   host_task either (llama.cpp-c6ah).** `event_complete()`'s bare
@@ -578,6 +595,35 @@ ticket reproduced on:
   less either way. Every real pool release event in production is
   device-kernel-produced (oneDNN's own free callback), matching the case
   that actually blocks.
+- **Without TP, a parked entry is reused while its release is still in
+  flight (llama.cpp-jwjz).** Every Graph-scratch consumer submits on the
+  cache's own in-order queue when TP is inactive. That is the fact the
+  ONEDNN zone free already relies on, and
+  `onednn_graph_scratch_consumers_in_order()` is now the one predicate both
+  read: TP inactive for the device, and the queue carries the `in_order`
+  property. The decision is per request and per entry, not per cache.
+  `onednn_graph_scratch_alloc()` tags the request in-order when its queue is
+  the cache's queue and the predicate holds, and the buffer it hands out
+  carries that tag into the pool when it is freed. Only when both tags hold
+  does `onednn_graph_scratch_entry_usable_locked()` skip the completion
+  query, so a same-size request gets the parked buffer back at once and its
+  kernels queue behind the previous consumer's. A buffer last used on
+  another queue, or a request from another queue, waits for the release as
+  under TP. The oneDNN allocator callback always passes the cache's queue,
+  so in production the predicate's TP check is what covers an execute on
+  another queue. Gating reuse on
+  completion made each oneDNN SDPA execute of a repeated shape allocate a
+  second buffer, and the next one wait at the cap in 200 ms polls (Mistral
+  `-d 8192` at ubatch 2048). Only reuse relaxes. Eviction, the per-size
+  depth overflow and the pool clear still wait for completion, because they
+  return the bytes to the general allocator, whose next owner may run on any
+  queue. An early exit returns the entry's flag slot to the free list while
+  its marker may still be pending. Each marker therefore also depends on its
+  slot's previous marker (`onednn_graph_scratch_flag_slot_last_marker_`),
+  so the out-of-order watch queue cannot leave an older generation in the
+  slot. Under TP the pool keeps the completion-gated policy, and the device
+  test forces that policy for its older properties through
+  `onednn_graph_scratch_force_completion_gated_reuse_for_test()`.
 - **The pool is bounded per size, and reclaimed at every point that could
   otherwise leave it stale.** Nothing but the byte cap bounds how many
   buffers of ONE size the pool could hold, so `onednn_graph_scratch_free()`
@@ -2478,8 +2524,9 @@ prompt, the last chunk of a long one), `GGML_SYCL_ONEDNN_PP=0`, and any node the
 GPU run on Qwen3.6-27B showed it (`cohort=mul-mat-dequant-f16-src0 uses=48`). Where the f16 arm is *unreachable* the plan
 is zero, and then the hold, the fit check and the ring's pending RUNTIME demand all count nothing, because all three read
 the same planned figures: a build without oneDNN or `GGML_SYCL_F16` plans no f16 bytes
-(`ggml_sycl_dequant_f16_scratch_drawable()`), and a model with no dense Q8_0 weight has no f16 candidate in the zone
-adapter. Where it is reachable all three count it.
+(`ggml_sycl_dequant_f16_scratch_drawable()`), and a model with no weight the zone adapter claims has no f16 candidate
+(the claimants are listed under "Who the dense f16 dequant plan covers" below). Where it is reachable all three count
+it.
 
 A compute buffer that the RUNTIME zone will not serve lands in the arena's KV zone, not in raw device memory. The
 zone is a fixed 512 MB by default (`GGML_SYCL_RUNTIME_ARENA_MB`, raised only to the planned PP/MoE/dense requirement),
@@ -2794,6 +2841,42 @@ is a table lookup, and a per-node cache would need per-graph storage on this pat
 Host tests: `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp` Case 14 pins the arithmetic and Case 15 the held-back branch,
 the route after a decline and the merged inputs;
 `tests/test-sycl-mmq-src1-plan-source.py` pins the wiring, with a mutation witness per check.
+
+### Who the dense f16 dequant plan covers (`llama.cpp-gldu`, `llama.cpp-h9c8`)
+
+The two f16 dequant buffers are sized from per-weight marks that `unified_cache_adapt_zone_inventory` sets; the plan is
+the maximum over the marked weights, not a sum. The planner has no graph node, no batch and no resolved layout, so each
+mark is a type-level claim built from the router's own type lists in `ggml/src/ggml-sycl/unified-types.hpp`, and each
+claim has a router-side twin that asks the same function. A weight the router sends to the arm without a mark is still
+found by the graph-entry walk, which grows the buffer inside the RUNTIME zone or refuses by name.
+
+| claimant | types | when marked | router side |
+|---|---|---|---|
+| Q8_0 (`llama.cpp-479i`) | Q8_0 | always | `ONEDNN_SOA` / `ONEDNN_COALESCED`, selected whatever `GGML_SYCL_ONEDNN_PP` says |
+| unified kernel (`llama.cpp-8ony`) | Q4_0, MXFP4 | oneDNN PP type admission | the unified kernel's oneDNN f16 route |
+| AOS claim (`llama.cpp-gldu`) | quantized types no MMQ, coalesced or unified kernel serves (the IQ family) | always | `ONEDNN_AOS`, the only PP route they have |
+| MMQ claim (`llama.cpp-h9c8`) | Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K | `GGML_SYCL_ONEDNN_PP_MMQ_TYPES` and the oneDNN PP type admission | `ggml_sycl_dense_f16_arm_serves_pp`, asked before `MMQ_AOS` and at `ONEDNN_SOA` |
+
+All four exclude expert stacks (`MUL_MAT_ID` keeps its own workspace). The AOS and MMQ claims also exclude the LM head
+(`ggml_sycl_weight_is_output_head`): a completion runs it on one row per ubatch, so it never reaches the arm there, and
+its f16 copy would size the whole plan. The MMQ claim alone is restricted to 2-D weights, because the arm converts an
+SOA-resident weight only as a whole tensor and a 3-D dense operand is dispatched per plane on row slices.
+
+The MMQ claim is the one whose router twin can refuse a weight the plan reserved for, so its terms are composed in one
+function, `mmq_dequant_f16_plan_claims`, which both sides call with the same head, expert, 2-D and dequant flags, and
+its admission in another, `ggml_sycl_onednn_pp_mmq_types_admitted` (`GGML_SYCL_ONEDNN_PP_MMQ_TYPES` and the oneDNN PP
+type admission), which both sides call too. The router asks the type list before either, so a type it does not name
+pays for no name scan. The router then narrows it with what only it knows: the oneDNN PP candidate (batch at or above
+`GGML_SYCL_ONEDNN_PP_MIN_BATCH`, the oneDNN PP and placement admissions), the node's accumulator precision (an op
+`ggml_prec_set_acc` set to F32 keeps MMQ, because the arm's F32 branch would draw an unplanned f32 copy;
+`llama.cpp-4bu9`), a weight in a row-split buffer (the arm's f16 branch converts a whole weight, and a split slice would
+take the same F32 branch) or a tensor-parallel one (refused with it, as the BF16 route refuses both), and a converter
+for the layout the weight is loaded in. `ggml_get_to_fp16_sycl_for_layout` returns no converter for a layout it has no
+kernel for, so a weight in such a layout keeps MMQ rather than being dequantized as if it were AOS (`llama.cpp-pzu9`).
+The arm takes the layout from the resolver and refuses by name a resolved layout it cannot convert; a weight the
+resolver does not know is converted as AOS, which rests on the op handing over the plain buffer (`llama.cpp-imwa` would
+refuse it by name). Mistral 7B Q4_K_M plans 112.0 MB of f16 weights (one `ffn_down`, 14336 x 4096) and 28 KB of f16
+activations per token; a claimed head would have been 250 MB (`test-zone-sizing`, Case 14l).
 
 ### A load-time consumer: the measured compute term (`llama.cpp-p6i0`)
 

@@ -516,10 +516,13 @@ if (BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-onednn-pp-scratch-plan-source.py
             --self-test)
     set_tests_properties(sycl-onednn-pp-scratch-plan-source PROPERTIES LABELS "sycl;memory;planner;host;source-contract;python")
-    # llama.cpp-gldu: a quantized type with no coalesced layout (IQ family, Q5_K, Q4_K) is materialized AOS and takes the
-    # oneDNN f16 dequant arm as its PP route, so the planner reserves the dequant buffers for it from the type predicate
-    # the layout policy's coalesced list is also built from. test-zone-sizing Case 14k proves the arithmetic and the
-    # get_rows_only exclusion; this gate proves the adapter asks the predicate and excludes expert stacks.
+    # llama.cpp-gldu: a quantized type no MMQ, coalesced or unified kernel serves (the IQ family) takes the oneDNN f16
+    # dequant arm as its PP route, so the planner reserves the dequant buffers for it from the router's own type lists.
+    # llama.cpp-h9c8: the MMQ types dense_pp_route_prefers_f16_dequant_arm lists (Q4_1..Q5_1, Q2_K..Q6_K) are moved to
+    # the same arm at PP batch by the router's helper, and the planner reserves for them through the claim that helper
+    # asks. test-zone-sizing Cases 14k and 14l prove the arithmetic and the claims' truth tables; this gate proves the
+    # adapter and the router ask the claims, the router's precision, row-split, tensor-parallel and converter refusals,
+    # the selector's required node, the arm's loaded-layout conversion and the knob's catalog row.
     add_test(NAME sycl-dequant-f16-aos-plan-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-dequant-f16-aos-plan-source.py
             --self-test)
@@ -5837,6 +5840,17 @@ if (NOT GGML_BACKEND_DL AND GGML_SYCL_DNNL)
     set_tests_properties(test-sycl-fattn-onednn-descriptors PROPERTIES
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         LABELS "sycl;sycl-restored;gpu;onednn;fattn;descriptors;restored"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+    )
+    # llama.cpp-jwjz: the same cases with the DIRECT Graph-scratch cap at 1 MiB, so the dispatcher splits
+    # the production-scale ops into query-row chunks; plus two cases whose last chunk is shorter. The mode
+    # asserts the dispatcher's budget (half the cap) is the one the planner check uses, and that the
+    # Graph-scratch high water stays within two budgets, which an unsplit execute would exceed.
+    add_test(NAME test-sycl-fattn-onednn-descriptors-chunked COMMAND test-sycl-fattn-onednn-descriptors --chunked)
+    set_tests_properties(test-sycl-fattn-onednn-descriptors-chunked PROPERTIES
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        LABELS "sycl;gpu;onednn;fattn;descriptors"
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
     )

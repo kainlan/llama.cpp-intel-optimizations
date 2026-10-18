@@ -541,6 +541,16 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-kv-cache-tensor-name PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# oneDNN SDPA query-row chunking (llama.cpp-jwjz): one execute's Graph scratch is H_q x rows x n_kv x 6 bytes,
+# so the route splits an op's query rows to keep every execute under a budget. ggml-sycl/fattn-onednn-chunk.hpp
+# includes only standard headers, so the test needs no device. test-sycl-fattn-onednn-chunk-source (registered
+# with the other oneDNN source gates below) pins that the dispatcher uses it at half the DIRECT cap.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-fattn-onednn-chunk.cpp)
+    set_tests_properties(test-sycl-fattn-onednn-chunk PROPERTIES LABELS "sycl;onednn;hostonly")
+    target_include_directories(test-sycl-fattn-onednn-chunk PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
 # WOQ-MXFP4 capability spike: does this device's oneDNN build a matmul with
 # f16 src, f4_e2m1 weights, and e8m0 grouped-{32,1} scales directly (perf-
 # recovery epic, track C gate, llama.cpp-4m9p)? Unlike test-sycl-route-table-
@@ -890,6 +900,14 @@ if (Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-job-device-signal-source.py --self-test)
     set_tests_properties(test-sycl-moe-cpu-job-device-signal-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # A returning whole-queue wait of the graph code, every CPU expert batch and every host-recipe expert task tick
+    # the [SYCL-WATCHDOG], so a slow prompt graph is not stopped while it advances (llama.cpp-ff00). Run WITH
+    # --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-watchdog-progress-tick-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-watchdog-progress-tick-source.py --self-test)
+    set_tests_properties(test-sycl-watchdog-progress-tick-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
     # Every retained-handle record takes the gates of every live ring's CPU expert jobs from one snapshot that waits on
     # nothing, and a gate list cannot drop a running job's gate: the drain worker must not reach a driver wait in front
     # of a job that has not started (llama.cpp-42zj). Run WITH --self-test so each pin is proven to catch its mutant.
@@ -2443,6 +2461,14 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert;onednn;allocator"
         TIMEOUT 120
     )
+    # llama.cpp-jwjz: the oneDNN SDPA dispatcher splits an op's query rows into executes whose Graph scratch fits
+    # half the allocator's own DIRECT cap, so no chunk takes the allocator's oversized early-out. Host-only, needs
+    # no build. Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-fattn-onednn-chunk-source
+        COMMAND ${LLAMA_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fattn-onednn-chunk-source.py --self-test
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(test-sycl-fattn-onednn-chunk-source PROPERTIES
+        LABELS "sycl;python;source-assert;onednn;hostonly" TIMEOUT 120)
     # llama.cpp-o3a0: keeps src/llama-model.cpp's replicated oneDNN SDPA
     # head-dim eligibility rule (it cannot include the SYCL-only
     # fattn-onednn.cpp to share the real predicate) in sync with the rule it
@@ -2775,6 +2801,13 @@ if (NOT WIN32)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fa-decode-kernel-allowlist-source.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;python;source-assert;graph;fa;mutation"
+        TIMEOUT 120
+    )
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fattn-dpas-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;fa;mutation"
         TIMEOUT 120
     )
     llama_test_pytest(
